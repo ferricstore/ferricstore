@@ -193,10 +193,12 @@ defmodule Ferricstore.Store.Shard do
     standalone_waiting_count: 0,
     standalone_waiting_bytes: 0,
     standalone_waiting_keys: MapSet.new(),
+    standalone_barrier_waiting: {[], []},
+    standalone_barrier_waiting_count: 0,
+    standalone_barrier_waiting_bytes: 0,
     standalone_write_barrier: false,
-    cross_shard_locks: %{},
-    cross_shard_lock_expiries: {0, nil},
-    cross_shard_intents: %{}
+    fetch_or_compute_locks: %{},
+    fetch_or_compute_lock_expiries: {0, nil}
   ]
 
   # -------------------------------------------------------------------

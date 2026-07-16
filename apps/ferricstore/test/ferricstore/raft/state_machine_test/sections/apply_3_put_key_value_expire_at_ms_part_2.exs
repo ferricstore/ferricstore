@@ -358,265 +358,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           assert [] == :ets.lookup(ets, "embedded_time_ratelimit")
         end
 
-        test "rejects cross-shard intents without the current watch-token contract", %{
-          state: state
-        } do
-          owner = make_ref()
-
-          malformed_intent = %{
-            command: :rename,
-            keys: %{source: "source", dest: "destination"},
-            status: :executing,
-            created_at: Ferricstore.HLC.now_ms()
-          }
-
-          assert {unchanged_state, {:error, :invalid_cross_shard_intent}} =
-                   StateMachine.apply(
-                     %{system_time: Ferricstore.HLC.now_ms()},
-                     {:cross_shard_intent, owner, malformed_intent},
-                     state
-                   )
-
-          assert unchanged_state.cross_shard_intents == %{}
-        end
-
-        test "uses raft meta system_time when acquiring cross-shard locks", %{state: state} do
-          local_now = Ferricstore.HLC.now_ms()
-          apply_now = local_now - 20_000
-          existing_lock_expiry = apply_now + 10_000
-          existing_owner = make_ref()
-
-          locked_state = %{
-            state
-            | cross_shard_locks: %{
-                "meta_time_lock_conflict" => {existing_owner, existing_lock_expiry}
-              }
-          }
-
-          {new_state, result} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:lock_keys, ["meta_time_lock_conflict"], make_ref(), apply_now + 30_000},
-              locked_state
-            )
-
-          assert {:error, :keys_locked} = result
-
-          assert %{"meta_time_lock_conflict" => {^existing_owner, ^existing_lock_expiry}} =
-                   new_state.cross_shard_locks
-        end
-
-        @tag :cross_shard_expiry_index
-        test "maintains an ordered expiry index for cross-shard locks", %{state: state} do
-          apply_now = Ferricstore.HLC.now_ms()
-          expire_at = apply_now + 30_000
-          owner = "ordered-expiry-owner"
-
-          {locked_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:lock_keys, ["indexed-a", "indexed-b"], owner, expire_at},
-              state
-            )
-
-          assert {:value, ^owner} =
-                   :gb_trees.lookup(
-                     {expire_at, "indexed-a"},
-                     locked_state.cross_shard_lock_expiries
-                   )
-
-          {unlocked_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:unlock_keys, ["indexed-a"], owner},
-              locked_state
-            )
-
-          assert :none =
-                   :gb_trees.lookup(
-                     {expire_at, "indexed-a"},
-                     unlocked_state.cross_shard_lock_expiries
-                   )
-
-          assert {:value, ^owner} =
-                   :gb_trees.lookup(
-                     {expire_at, "indexed-b"},
-                     unlocked_state.cross_shard_lock_expiries
-                   )
-        end
-
-        @tag :strict_key_lock_renewal
-        test "renews every live owned lock and replaces its expiry index entry", %{state: state} do
-          apply_now = Ferricstore.HLC.now_ms()
-          old_expiry = apply_now + 1_000
-          new_expiry = apply_now + 30_000
-          owner = "renew-owner"
-
-          {locked_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:lock_keys, ["renew-a", "renew-b"], owner, old_expiry},
-              state
-            )
-
-          {renewed_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now + 1},
-              {:renew_key_locks, ["renew-a", "renew-b"], owner, new_expiry},
-              locked_state
-            )
-
-          assert renewed_state.cross_shard_locks["renew-a"] == {owner, new_expiry}
-          assert renewed_state.cross_shard_locks["renew-b"] == {owner, new_expiry}
-
-          for key <- ["renew-a", "renew-b"] do
-            assert :none =
-                     :gb_trees.lookup({old_expiry, key}, renewed_state.cross_shard_lock_expiries)
-
-            assert {:value, ^owner} =
-                     :gb_trees.lookup({new_expiry, key}, renewed_state.cross_shard_lock_expiries)
-          end
-        end
-
-        @tag :strict_key_lock_renewal
-        test "rejects an expired owned lock without changing any requested lock", %{state: state} do
-          apply_now = Ferricstore.HLC.now_ms()
-          owner = "expired-renew-owner"
-          old_expiry = apply_now + 10
-
-          {locked_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:lock_keys, ["expired-renew-a", "expired-renew-b"], owner, old_expiry},
-              state
-            )
-
-          {rejected_state, {:error, :not_lock_owner}} =
-            StateMachine.apply(
-              %{system_time: old_expiry},
-              {:renew_key_locks, ["expired-renew-a", "expired-renew-b"], owner,
-               old_expiry + 30_000},
-              locked_state
-            )
-
-          assert rejected_state.cross_shard_locks == locked_state.cross_shard_locks
-
-          assert rejected_state.cross_shard_lock_expiries ==
-                   locked_state.cross_shard_lock_expiries
-        end
-
-        @tag :strict_key_lock_renewal
-        test "rejects mixed ownership atomically", %{state: state} do
-          apply_now = Ferricstore.HLC.now_ms()
-          expiry = apply_now + 30_000
-
-          {first_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:lock_keys, ["mixed-renew-a"], "owner-a", expiry},
-              state
-            )
-
-          {locked_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:lock_keys, ["mixed-renew-b"], "owner-b", expiry},
-              first_state
-            )
-
-          {rejected_state, {:error, :not_lock_owner}} =
-            StateMachine.apply(
-              %{system_time: apply_now + 1},
-              {:renew_key_locks, ["mixed-renew-a", "mixed-renew-b"], "owner-a", expiry + 1_000},
-              locked_state
-            )
-
-          assert rejected_state.cross_shard_locks == locked_state.cross_shard_locks
-
-          assert rejected_state.cross_shard_lock_expiries ==
-                   locked_state.cross_shard_lock_expiries
-        end
-
-        @tag :strict_key_lock_renewal
-        test "rejects a missing requested lock atomically", %{state: state} do
-          apply_now = Ferricstore.HLC.now_ms()
-          expiry = apply_now + 30_000
-          owner = "missing-renew-owner"
-
-          {locked_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:lock_keys, ["present-renew"], owner, expiry},
-              state
-            )
-
-          {rejected_state, {:error, :not_lock_owner}} =
-            StateMachine.apply(
-              %{system_time: apply_now + 1},
-              {:renew_key_locks, ["present-renew", "missing-renew"], owner, expiry + 1_000},
-              locked_state
-            )
-
-          assert rejected_state.cross_shard_locks == locked_state.cross_shard_locks
-
-          assert rejected_state.cross_shard_lock_expiries ==
-                   locked_state.cross_shard_lock_expiries
-        end
-
-        @tag :cross_shard_expiry_index
-        test "reacquires an expired requested lock after a bounded expiry prune", %{state: state} do
-          apply_now = Ferricstore.HLC.now_ms()
-
-          expired =
-            Map.new(1..300, fn index ->
-              {"expired-#{index}", {"old-owner-#{index}", apply_now - 2}}
-            end)
-            |> Map.put("target", {"stale-target-owner", apply_now - 1})
-
-          expiry_index =
-            Enum.reduce(expired, :gb_trees.empty(), fn {key, {owner, expire_at}}, index ->
-              :gb_trees.enter({expire_at, key}, owner, index)
-            end)
-
-          indexed_state = %{
-            state
-            | cross_shard_locks: expired,
-              cross_shard_lock_expiries: expiry_index
-          }
-
-          {locked_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:lock_keys, ["target"], "new-owner", apply_now + 30_000},
-              indexed_state
-            )
-
-          assert {"new-owner", new_expiry} = locked_state.cross_shard_locks["target"]
-          assert new_expiry > apply_now
-
-          assert {:value, "new-owner"} =
-                   :gb_trees.lookup(
-                     {new_expiry, "target"},
-                     locked_state.cross_shard_lock_expiries
-                   )
-
-          assert map_size(locked_state.cross_shard_locks) > 1
-        end
-
-        @tag :cross_shard_expiry_index
-        test "cross-shard lock acquisition does not rebuild the full lock map" do
-          source =
-            File.read!(
-              Path.expand(
-                "lib/ferricstore/raft/state_machine/sections/data_mutations.ex",
-                File.cwd!()
-              )
-            )
-
-          refute source =~ "Map.reject(locks",
-                 "lock acquisition must prune through the ordered expiry index, not scan every lock"
-        end
-
         @tag :fetch_or_compute_state_machine
         test "publishing a fetch-or-compute value consumes the lease atomically", %{
           state: state,
@@ -641,7 +382,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               locked_state
             )
 
-          refute Map.has_key?(published_state.cross_shard_locks, key)
+          refute Map.has_key?(published_state.fetch_or_compute_locks, key)
           assert [{^key, "first", 0, _, _, _, _}] = :ets.lookup(ets, key)
 
           {replayed_state, {:error, :key_not_locked}} =
@@ -651,8 +392,83 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               published_state
             )
 
-          assert replayed_state.cross_shard_locks == published_state.cross_shard_locks
+          assert replayed_state.fetch_or_compute_locks == published_state.fetch_or_compute_locks
           assert [{^key, "first", 0, _, _, _, _}] = :ets.lookup(ets, key)
+        end
+
+        @tag :fetch_or_compute_state_machine
+        test "fetch-or-compute release removes the exact lease and expiry entry", %{state: state} do
+          apply_now = Ferricstore.HLC.now_ms()
+          key = "fetch-or-compute-release"
+          owner = "fetch-or-compute-release-owner"
+          expire_at = apply_now + 30_000
+          outcome_key = Ferricstore.FetchOrCompute.Outcome.key(key)
+
+          {locked_state, :ok} =
+            StateMachine.apply(
+              %{system_time: apply_now},
+              {:fetch_or_compute_lock, key, outcome_key, owner, expire_at},
+              state
+            )
+
+          assert {:value, ^owner} =
+                   :gb_trees.lookup(
+                     {expire_at, key},
+                     locked_state.fetch_or_compute_lock_expiries
+                   )
+
+          {unchanged_state, {:error, :not_lock_owner}} =
+            StateMachine.apply(
+              %{system_time: apply_now + 1},
+              {:fetch_or_compute_release, key, "other-owner"},
+              locked_state
+            )
+
+          assert unchanged_state.fetch_or_compute_locks == locked_state.fetch_or_compute_locks
+
+          {released_state, :ok} =
+            StateMachine.apply(
+              %{system_time: apply_now + 2},
+              {:fetch_or_compute_release, key, owner},
+              locked_state
+            )
+
+          refute Map.has_key?(released_state.fetch_or_compute_locks, key)
+
+          assert :none =
+                   :gb_trees.lookup(
+                     {expire_at, key},
+                     released_state.fetch_or_compute_lock_expiries
+                   )
+        end
+
+        @tag :fetch_or_compute_state_machine
+        test "a fetch-or-compute lease does not disable unrelated put batches", %{
+          state: state,
+          ets: ets
+        } do
+          apply_now = Ferricstore.HLC.now_ms()
+          locked_key = "fetch-or-compute-locked"
+          owner = "fetch-or-compute-batch-owner"
+          outcome_key = Ferricstore.FetchOrCompute.Outcome.key(locked_key)
+
+          {locked_state, :ok} =
+            StateMachine.apply(
+              %{system_time: apply_now},
+              {:fetch_or_compute_lock, locked_key, outcome_key, owner, apply_now + 30_000},
+              state
+            )
+
+          {written_state, {:ok, [:ok, :ok]}} =
+            StateMachine.apply(
+              %{system_time: apply_now + 1},
+              {:put_batch, [{"unrelated-a", "a", 0}, {"unrelated-b", "b", 0}]},
+              locked_state
+            )
+
+          assert [{_, "a", 0, _, _, _, _}] = :ets.lookup(ets, "unrelated-a")
+          assert [{_, "b", 0, _, _, _, _}] = :ets.lookup(ets, "unrelated-b")
+          assert {^owner, _expire_at} = written_state.fetch_or_compute_locks[locked_key]
         end
 
         @tag :fetch_or_compute_state_machine
@@ -680,7 +496,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               locked_state
             )
 
-          refute Map.has_key?(failed_state.cross_shard_locks, key)
+          refute Map.has_key?(failed_state.fetch_or_compute_locks, key)
 
           assert [{^outcome_key, ^encoded_error, outcome_expire_at, _, _, _, _}] =
                    :ets.lookup(ets, outcome_key)
@@ -725,7 +541,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             )
 
           assert [] = :ets.lookup(ets, outcome_key)
-          assert {^next_owner, _expire_at_ms} = next_locked_state.cross_shard_locks[key]
+          assert {^next_owner, _expire_at_ms} = next_locked_state.fetch_or_compute_locks[key]
         end
 
         @tag :fetch_or_compute_state_machine
@@ -750,7 +566,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               state
             )
 
-          refute Map.has_key?(unchanged_state.cross_shard_locks, key)
+          refute Map.has_key?(unchanged_state.fetch_or_compute_locks, key)
 
           assert [{^unrelated_key, "preserve-me", 0, _, _, _, 11}] =
                    :ets.lookup(ets, unrelated_key)
@@ -783,7 +599,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               locked_state
             )
 
-          assert {^owner, _expire_at_ms} = unchanged_state.cross_shard_locks[key]
+          assert {^owner, _expire_at_ms} = unchanged_state.fetch_or_compute_locks[key]
           assert [] = :ets.lookup(ets, unrelated_key)
         end
 
@@ -811,48 +627,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               locked_state
             )
 
-          assert {^owner, _expire_at_ms} = unchanged_state.cross_shard_locks[key]
+          assert {^owner, _expire_at_ms} = unchanged_state.fetch_or_compute_locks[key]
           assert [] = :ets.lookup(ets, outcome_key)
-        end
-
-        test "cross-shard control commands maintain current lock and intent state", %{
-          state: state
-        } do
-          apply_now = Ferricstore.HLC.now_ms()
-          owner = make_ref()
-          key = "current_lock"
-
-          {locked_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:lock_keys, [key], owner, apply_now + 30_000},
-              state
-            )
-
-          assert %{^key => {^owner, _expires_at}} = locked_state.cross_shard_locks
-
-          intent = %{
-            command: :test,
-            keys: %{target: key},
-            value_hashes: %{key => nil},
-            status: :executing,
-            created_at: apply_now
-          }
-
-          {intent_state, :ok} =
-            StateMachine.apply(
-              %{system_time: apply_now},
-              {:cross_shard_intent, owner, intent},
-              locked_state
-            )
-
-          assert %{^owner => ^intent} = intent_state.cross_shard_intents
-
-          {cleared_state, :ok} =
-            StateMachine.apply(%{system_time: apply_now}, {:clear_locks}, intent_state)
-
-          assert cleared_state.cross_shard_locks == %{}
-          assert cleared_state.cross_shard_intents == %{}
         end
 
         test "uses raft meta system_time for standalone read-modify-write TTL checks", %{

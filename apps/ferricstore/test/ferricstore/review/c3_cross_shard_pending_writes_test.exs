@@ -1,7 +1,7 @@
 defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
   @moduledoc """
-  Proves cross-shard transaction pending writes land in the correct shard's
-  Bitcask files.
+  Proves transaction pending writes remain shard-local and independent Raft
+  groups fail closed before any mutation.
   """
 
   use ExUnit.Case, async: false
@@ -18,13 +18,23 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
     on_exit(fn -> ShardHelpers.wait_shards_alive() end)
 
     ctx = FerricStore.Instance.get(:default)
-    # Generate unique keys on different shards
     uid = System.unique_integer([:positive])
     {k0, k1} = find_unique_keys_on_different_shards(ctx, uid)
-    shard0 = Router.shard_for(FerricStore.Instance.get(:default), k0)
-    shard1 = Router.shard_for(FerricStore.Instance.get(:default), k1)
+    same0 = "{c3:#{uid}}:a"
+    same1 = "{c3:#{uid}}:b"
+    shard0 = Router.shard_for(ctx, k0)
+    shard1 = Router.shard_for(ctx, k1)
+    same_shard = Router.shard_for(ctx, same0)
 
-    %{k0: k0, k1: k1, shard0: shard0, shard1: shard1}
+    %{
+      k0: k0,
+      k1: k1,
+      shard0: shard0,
+      shard1: shard1,
+      same0: same0,
+      same1: same1,
+      same_shard: same_shard
+    }
   end
 
   defp find_unique_keys_on_different_shards(ctx, uid) do
@@ -72,21 +82,22 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
     end
   end
 
-  describe "cross-shard tx pending writes isolation" do
-    test "writes land in the correct shard's Bitcask files, not the anchor shard's",
-         %{k0: k0, k1: k1, shard0: shard0, shard1: shard1} do
-      assert shard0 != shard1
+  describe "transaction pending writes isolation" do
+    test "same-slot writes land in their owning shard's Bitcask files",
+         %{same0: same0, same1: same1, same_shard: same_shard} do
+      ctx = FerricStore.Instance.get(:default)
+      assert Router.shard_for(ctx, same1) == same_shard
 
-      queue = [{"SET", [k0, "val_shard0"]}, {"SET", [k1, "val_shard1"]}]
+      queue = [{"SET", [same0, "first"]}, {"SET", [same1, "second"]}]
       result = Coordinator.execute(queue, %{}, nil)
       assert result == [:ok, :ok]
 
       ShardHelpers.eventually(
         fn ->
-          assert Router.get(FerricStore.Instance.get(:default), k0) == "val_shard0"
-          assert Router.get(FerricStore.Instance.get(:default), k1) == "val_shard1"
+          assert Router.get(ctx, same0) == "first"
+          assert Router.get(ctx, same1) == "second"
         end,
-        "cross-shard values should be readable",
+        "same-slot values should be readable",
         10,
         100
       )
@@ -96,42 +107,33 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
       # Wait for disk writes to settle
       ShardHelpers.eventually(
         fn ->
-          MapSet.member?(keys_on_disk(shard0), k0) and MapSet.member?(keys_on_disk(shard1), k1)
+          disk_keys = keys_on_disk(same_shard)
+          MapSet.member?(disk_keys, same0) and MapSet.member?(disk_keys, same1)
         end,
         "keys not on disk after flush",
         30,
         100
       )
 
-      disk_keys_shard0 = keys_on_disk(shard0)
-      disk_keys_shard1 = keys_on_disk(shard1)
-
-      assert MapSet.member?(disk_keys_shard0, k0),
-             "key #{inspect(k0)} (shard #{shard0}) missing from shard #{shard0}'s Bitcask files"
-
-      refute MapSet.member?(disk_keys_shard1, k0),
-             "key #{inspect(k0)} was written to wrong shard"
-
-      assert MapSet.member?(disk_keys_shard1, k1),
-             "key #{inspect(k1)} (shard #{shard1}) missing from shard #{shard1}'s Bitcask files"
-
-      refute MapSet.member?(disk_keys_shard0, k1),
-             "key #{inspect(k1)} was written to wrong shard"
+      disk_keys = keys_on_disk(same_shard)
+      assert MapSet.member?(disk_keys, same0)
+      assert MapSet.member?(disk_keys, same1)
     end
 
-    test "sm_pending_writes buffer is empty during cross-shard dispatch (no stale writes)",
+    test "independent Raft groups are rejected without partial or stale writes",
          %{k0: k0, k1: k1, shard0: shard0, shard1: shard1} do
       assert shard0 != shard1
 
-      Router.put(FerricStore.Instance.get(:default), k0, "before_0", 0)
-      Router.put(FerricStore.Instance.get(:default), k1, "before_1", 0)
+      ctx = FerricStore.Instance.get(:default)
+      Router.put(ctx, k0, "before_0", 0)
+      Router.put(ctx, k1, "before_1", 0)
 
       queue = [{"SET", [k0, "after_0"]}, {"SET", [k1, "after_1"]}]
       result = Coordinator.execute(queue, %{}, nil)
-      assert result == [:ok, :ok]
+      assert result == {:error, "CROSSSLOT Keys in request don't hash to the same slot"}
 
-      assert Router.get(FerricStore.Instance.get(:default), k0) == "after_0"
-      assert Router.get(FerricStore.Instance.get(:default), k1) == "after_1"
+      assert Router.get(ctx, k0) == "before_0"
+      assert Router.get(ctx, k1) == "before_1"
     end
   end
 end

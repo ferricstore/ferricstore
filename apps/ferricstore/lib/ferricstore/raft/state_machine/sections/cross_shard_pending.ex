@@ -459,9 +459,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
               send(pid, {:remove_promoted_after_commit, redis_key})
             end)
 
-            Process.get(:sm_pending_compound_promotions, MapSet.new())
-            |> Enum.each(fn {redis_key, compound_key} ->
-              send(pid, {:maybe_promote_after_commit, redis_key, compound_key})
+            Process.get(:sm_pending_compound_promotions, %{})
+            |> Enum.each(fn {redis_key, {compound_key, threshold}} ->
+              send(pid, {:maybe_promote_after_commit, redis_key, compound_key, threshold})
             end)
 
           nil ->

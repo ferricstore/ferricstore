@@ -192,8 +192,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
     end
 
     test "WATCH on multiple keys — one modified aborts entire transaction" do
-      key_a = "r2m11:multi_a_#{System.unique_integer([:positive])}"
-      key_b = "r2m11:multi_b_#{System.unique_integer([:positive])}"
+      {key_a, key_b} = ShardHelpers.keys_on_same_shard()
 
       Router.put(FerricStore.Instance.get(:default), key_a, "a_orig", 0)
       Router.put(FerricStore.Instance.get(:default), key_b, "b_orig", 0)

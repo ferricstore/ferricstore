@@ -459,10 +459,6 @@ defmodule Ferricstore.Store.Router.Part11 do
             fn unified_store ->
               checked_lmove(key, destination, unified_store, from_dir, to_dir)
             end,
-            intent: %{command: :lmove, keys: %{source: key, dest: destination}},
-            tx_entry:
-              {"LMOVE", [key, destination, Atom.to_string(from_dir), Atom.to_string(to_dir)],
-               {:lmove, key, destination, from_dir, to_dir}},
             instance: ctx
           )
         end
@@ -472,9 +468,13 @@ defmodule Ferricstore.Store.Router.Part11 do
         idx = shard_for(ctx, key)
 
         if ListOps.read_operation?(operation) do
-          case safe_read_call(ctx, idx, {:list_read, key, operation}) do
-            {:ok, result} -> result
-            :unavailable -> ReadResult.failure(:shard_unavailable) |> ReadResult.command_error()
+          if selected_waraft_ctx?(ctx) do
+            ListOps.execute(key, ctx, operation)
+          else
+            case safe_read_call(ctx, idx, {:list_read, key, operation}) do
+              {:ok, result} -> result
+              :unavailable -> ReadResult.failure(:shard_unavailable) |> ReadResult.command_error()
+            end
           end
         else
           raft_write(ctx, idx, key, {:list_op, key, operation})

@@ -38,12 +38,16 @@ defmodule Ferricstore.Store.Promotion do
 
       config :ferricstore, :promotion_threshold, 100
 
+  The value is captured in the instance apply context and replicated to every
+  shard before it affects promotion decisions.
+
   Set to `0` to disable automatic promotion entirely (no collections will
   ever be promoted).
   """
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
+  alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.{AppendResult, BlobRef, BlobValue, CompoundKey, LFU}
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -58,21 +62,11 @@ defmodule Ferricstore.Store.Promotion do
   @max_log_value_size 512 * 1024 * 1024
   @tombstone_value_size 0xFFFFFFFF
 
-  @spec threshold() :: non_neg_integer()
-  def threshold do
-    :persistent_term.get(:ferricstore_promotion_threshold, 100)
-  rescue
-    ArgumentError -> Application.get_env(:ferricstore, :promotion_threshold, 100)
-  end
-
-  @doc "Returns the promotion threshold from instance ctx."
+  @doc "Returns the immutable promotion threshold captured by an instance."
   @spec threshold(FerricStore.Instance.t()) :: non_neg_integer()
-  def threshold(_ctx) do
-    # The promotion threshold is not yet stored on the Instance struct,
-    # so delegate to the global version. This ctx variant exists for
-    # API consistency and can be updated when the field is added.
-    threshold()
-  end
+  def threshold(%{apply_context: %{promotion_threshold: threshold}})
+      when is_integer(threshold) and threshold >= 0,
+      do: threshold
 
   @spec dedicated_path(binary(), non_neg_integer(), atom(), binary()) :: binary()
   def dedicated_path(data_dir, shard_index, type, redis_key) do
@@ -359,7 +353,9 @@ defmodule Ferricstore.Store.Promotion do
         keydir,
         type_key,
         prefix,
-        now
+        now,
+        instance_ctx,
+        shard_index
       )
 
     entries =
@@ -501,17 +497,21 @@ defmodule Ferricstore.Store.Promotion do
          keydir,
          type_key,
          prefix,
-         now
+         now,
+         instance_ctx,
+         shard_index
        ) do
+    location_ctx = {shard_data_path, instance_ctx, shard_index}
+
     with {:ok, type_row} <- promotion_type_row(keydir, type_key),
-         {:ok, initial} <- collect_promotion_row(type_row, {:ok, []}, shard_data_path, now) do
+         {:ok, initial} <- collect_promotion_row(type_row, {:ok, []}, location_ctx, now) do
       case CompoundMemberIndex.reduce_rows_while(
              member_index,
              %{keydir: keydir},
              prefix,
              initial,
              fn row, acc ->
-               case collect_promotion_row(row, {:ok, acc}, shard_data_path, now) do
+               case collect_promotion_row(row, {:ok, acc}, location_ctx, now) do
                  {:ok, next_acc} -> {:cont, next_acc}
                  {:error, _reason} = error -> {:halt, error}
                end
@@ -554,12 +554,12 @@ defmodule Ferricstore.Store.Promotion do
   defp collect_promotion_row(
          {key, value, exp, _lfu, fid, off, _vsize},
          {:ok, acc},
-         shard_data_path,
+         location_ctx,
          now
        )
        when is_binary(key) and is_integer(exp) and exp >= 0 do
     if exp == 0 or exp > now do
-      case promotion_entry_value(shard_data_path, key, value, fid, off) do
+      case promotion_entry_value(location_ctx, key, value, fid, off) do
         {:ok, live_value} -> {:ok, [{key, live_value, exp} | acc]}
         {:error, reason} -> {:error, {key, reason}}
       end
@@ -568,7 +568,7 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  defp collect_promotion_row(row, {:ok, _acc}, _shard_data_path, _now),
+  defp collect_promotion_row(row, {:ok, _acc}, _location_ctx, _now),
     do: {:error, {:invalid_keydir_row, row}}
 
   defp run_before_shared_tombstones_hook do
@@ -1951,10 +1951,28 @@ defmodule Ferricstore.Store.Promotion do
   defp compound_prefix_for(:set, redis_key), do: CompoundKey.set_prefix(redis_key)
   defp compound_prefix_for(:zset, redis_key), do: CompoundKey.zset_prefix(redis_key)
 
-  defp promotion_entry_value(_shard_data_path, _key, value, _fid, _off) when value != nil,
+  defp promotion_entry_value(_location_ctx, _key, value, _fid, _off) when value != nil,
     do: {:ok, value}
 
-  defp promotion_entry_value(shard_data_path, key, nil, fid, off)
+  defp promotion_entry_value(
+         {_shard_data_path, instance_ctx, shard_index},
+         key,
+         nil,
+         {tag, index} = file_id,
+         off
+       )
+       when is_map(instance_ctx) and is_integer(shard_index) and shard_index >= 0 and
+              tag in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+              is_integer(index) and index > 0 and is_integer(off) and off >= 0 do
+    case WARaftSegmentReader.read_value_from_location(instance_ctx, shard_index, file_id, key) do
+      {:ok, value} when is_binary(value) -> {:ok, value}
+      :not_found -> {:error, :record_not_found}
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:unexpected_waraft_segment_read_result, other}}
+    end
+  end
+
+  defp promotion_entry_value({shard_data_path, _instance_ctx, _shard_index}, key, nil, fid, off)
        when is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 do
     file_path =
       Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
@@ -1968,7 +1986,7 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  defp promotion_entry_value(_shard_data_path, _key, _value, fid, off),
+  defp promotion_entry_value(_location_ctx, _key, _value, fid, off),
     do: {:error, {:invalid_cold_location, fid, off}}
 
   defp read_cold_async(path, offset, key) do

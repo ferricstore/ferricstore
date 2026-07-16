@@ -279,8 +279,6 @@ defmodule Ferricstore.Commands.Set do
       fn unified_store ->
         do_smove(source, destination, member, unified_store)
       end,
-      intent: %{command: :smove, keys: %{source: source, dest: destination}, value_hashes: %{}},
-      tx_entry: {"SMOVE", [source, destination, member], {:smove, source, destination, member}},
       store: store
     )
   end
@@ -307,12 +305,6 @@ defmodule Ferricstore.Commands.Set do
           Destination.store_set_at(destination, result, unified_store)
         end
       end,
-      intent: %{
-        command: :sdiffstore,
-        keys: %{dest: destination, sources: keys},
-        value_hashes: %{}
-      },
-      tx_entry: {"SDIFFSTORE", [destination | keys], {:sdiffstore, [destination | keys]}},
       store: store
     )
   end
@@ -337,12 +329,6 @@ defmodule Ferricstore.Commands.Set do
           Destination.store_set_at(destination, result, unified_store)
         end
       end,
-      intent: %{
-        command: :sinterstore,
-        keys: %{dest: destination, sources: keys},
-        value_hashes: %{}
-      },
-      tx_entry: {"SINTERSTORE", [destination | keys], {:sinterstore, [destination | keys]}},
       store: store
     )
   end
@@ -369,12 +355,6 @@ defmodule Ferricstore.Commands.Set do
           Destination.store_set_at(destination, result, unified_store)
         end
       end,
-      intent: %{
-        command: :sunionstore,
-        keys: %{dest: destination, sources: keys},
-        value_hashes: %{}
-      },
-      tx_entry: {"SUNIONSTORE", [destination | keys], {:sunionstore, [destination | keys]}},
       store: store
     )
   end
@@ -637,14 +617,12 @@ defmodule Ferricstore.Commands.Set do
       fn unified_store ->
         do_smove(source, destination, member, unified_store)
       end,
-      intent: %{command: :smove, keys: %{source: source, dest: destination}, value_hashes: %{}},
-      tx_entry: {"SMOVE", [source, destination, member], {:smove, source, destination, member}},
       store: store
     )
   end
 
   defp sdiffstore_args([destination | [_ | _] = keys], store) do
-    store_result_at(destination, keys, :sdiffstore, store, fn source_keys, unified_store ->
+    store_result_at(destination, keys, store, fn source_keys, unified_store ->
       with {:ok, [first_set | rest_sets]} <- get_member_sets(source_keys, unified_store) do
         {:ok, Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))}
       end
@@ -655,7 +633,7 @@ defmodule Ferricstore.Commands.Set do
     do: {:error, "ERR wrong number of arguments for 'sdiffstore' command"}
 
   defp sinterstore_args([destination | [_ | _] = keys], store) do
-    store_result_at(destination, keys, :sinterstore, store, fn source_keys, unified_store ->
+    store_result_at(destination, keys, store, fn source_keys, unified_store ->
       Intersection.sinter_set(source_keys, unified_store)
     end)
   end
@@ -664,7 +642,7 @@ defmodule Ferricstore.Commands.Set do
     do: {:error, "ERR wrong number of arguments for 'sinterstore' command"}
 
   defp sunionstore_args([destination | [_ | _] = keys], store) do
-    store_result_at(destination, keys, :sunionstore, store, fn source_keys, unified_store ->
+    store_result_at(destination, keys, store, fn source_keys, unified_store ->
       with {:ok, sets} <- get_member_sets(source_keys, unified_store) do
         {:ok, Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))}
       end
@@ -674,7 +652,7 @@ defmodule Ferricstore.Commands.Set do
   defp sunionstore_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'sunionstore' command"}
 
-  defp store_result_at(destination, keys, command, store, result_fun) do
+  defp store_result_at(destination, keys, store, result_fun) do
     keys_with_roles =
       [{destination, :write}] ++ Enum.map(keys, fn key -> {key, :read} end)
 
@@ -686,19 +664,8 @@ defmodule Ferricstore.Commands.Set do
           Destination.store_set_at(destination, result, unified_store)
         end
       end,
-      intent: %{
-        command: command,
-        keys: %{dest: destination, sources: keys},
-        value_hashes: %{}
-      },
-      tx_entry: store_result_tx_entry(command, destination, keys),
       store: store
     )
-  end
-
-  defp store_result_tx_entry(command, destination, keys) do
-    name = command |> Atom.to_string() |> String.upcase()
-    {name, [destination | keys], {command, [destination | keys]}}
   end
 
   defp srandmember_one(key, store) do

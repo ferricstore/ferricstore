@@ -77,13 +77,25 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     live_flow_workers_payload(data)
   end
 
+  def live_payload("flow/workers?" <> _query, opts) do
+    data = Browse.collect_workers_page(DashboardAccess.flow_acl_opts(opts))
+    live_flow_workers_payload(data)
+  end
+
   def live_payload("flow/due", opts) do
+    data = Browse.collect_due_page(DashboardAccess.flow_acl_opts(opts))
+    live_flow_due_payload(data)
+  end
+
+  def live_payload("flow/due?" <> _query, opts) do
     data = Browse.collect_due_page(DashboardAccess.flow_acl_opts(opts))
     live_flow_due_payload(data)
   end
 
   def live_payload("flow/signals", opts), do: live_flow_signals_payload("", opts)
   def live_payload("flow/signals?" <> query, opts), do: live_flow_signals_payload(query, opts)
+  def live_payload("flow/projections", _opts), do: :not_found
+  def live_payload("flow/projections?" <> _query, _opts), do: :not_found
   def live_payload("flow/value?" <> query, opts), do: live_flow_value_payload(query, opts)
   def live_payload("flow/value", opts), do: live_flow_value_payload("", opts)
 
@@ -237,7 +249,17 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     |> live_flow_workers_payload()
   end
 
+  def live_payload("flow/workers?" <> _query) do
+    Browse.collect_workers_page()
+    |> live_flow_workers_payload()
+  end
+
   def live_payload("flow/due") do
+    Browse.collect_due_page()
+    |> live_flow_due_payload()
+  end
+
+  def live_payload("flow/due?" <> _query) do
     Browse.collect_due_page()
     |> live_flow_due_payload()
   end
@@ -245,6 +267,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   def live_payload("flow/signals"), do: live_flow_signals_payload("")
   def live_payload("flow/signals?" <> query), do: live_flow_signals_payload(query)
   def live_payload("flow/projections"), do: :not_found
+  def live_payload("flow/projections?" <> _query), do: :not_found
   def live_payload("flow/value?" <> query), do: live_flow_value_payload(query)
   def live_payload("flow/value"), do: live_flow_value_payload("")
 

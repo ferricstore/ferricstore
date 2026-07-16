@@ -148,9 +148,9 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesServerTest do
   # ===========================================================================
 
   describe "FLUSHDB edge cases (not covered elsewhere)" do
-    test "FLUSHDB with lowercase flag returns error" do
+    test "FLUSHDB accepts lowercase flags case-insensitively" do
       store = MockStore.make(%{"a" => {"1", 0}})
-      assert {:error, _} = Server.handle("FLUSHDB", ["async"], store)
+      assert :ok = Server.handle("FLUSHDB", ["async"], store)
     end
 
     test "FLUSHDB with multiple flags returns error" do

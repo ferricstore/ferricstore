@@ -63,6 +63,19 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   end
 
   describe "single-shard transactions" do
+    test "backend exits return a typed transaction error", %{same1: key} do
+      Process.put(:ferricstore_tx_backend_write_hook, fn _shard_idx, _command ->
+        exit({:timeout, :synthetic_backend_timeout})
+      end)
+
+      on_exit(fn -> Process.delete(:ferricstore_tx_backend_write_hook) end)
+
+      assert {:ok, prepared} = PreparedCommand.prepare("SET", [key, "value"])
+
+      assert {:error, "ERR transaction raft unavailable: :pipeline_rejected"} =
+               Ferricstore.Transaction.Coordinator.execute([prepared], %{}, nil)
+    end
+
     test "production coordinator rejects queue entries without a prepared AST", %{same1: key} do
       assert {:error, "ERR invalid transaction command"} =
                Ferricstore.Transaction.Coordinator.execute([{"GET", [key]}], %{}, nil)

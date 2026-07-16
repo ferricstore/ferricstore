@@ -9,7 +9,7 @@ defmodule Ferricstore.Raft.BlobCommand do
   """
 
   alias Ferricstore.Raft.BlobCommand.{FlowAttrs, PayloadWriter}
-  alias Ferricstore.Store.{BlobRef, BlobStore, BlobValue, CompoundKey}
+  alias Ferricstore.Store.{BlobRef, BlobStore, BlobValue}
 
   @flow_blob_value_ref_tag :ferricstore_flow_blob_value_ref
   @protection_key :ferricstore_blob_command_protection
@@ -20,7 +20,6 @@ defmodule Ferricstore.Raft.BlobCommand do
           | {:getset, binary(), binary()}
           | {:setrange, binary(), non_neg_integer(), binary()}
           | {:cas, binary(), binary(), binary(), non_neg_integer() | nil}
-          | {:locked_put, binary(), binary(), non_neg_integer(), term()}
           | {:fetch_or_compute_publish, binary(), binary(), non_neg_integer(), binary()}
           | {:compound_put, binary(), binary(), non_neg_integer()}
           | {:compound_batch_put, binary(), [{binary(), binary(), non_neg_integer()}]}
@@ -181,30 +180,6 @@ defmodule Ferricstore.Raft.BlobCommand do
 
       {:error, _reason} = error ->
         error
-    end
-  end
-
-  defp prepare_enabled(
-         %{data_dir: data_dir},
-         shard_index,
-         threshold,
-         {:locked_put, key, value, expire_at_ms, owner_ref}
-       )
-       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
-              is_binary(key) and is_binary(value) do
-    if locked_put_blob_side_channel_key?(key) do
-      case prepare_value(data_dir, shard_index, threshold, value) do
-        {:ok, {^value, :value}} ->
-          {:ok, {:locked_put, key, value, expire_at_ms, owner_ref}}
-
-        {:ok, {encoded_ref, :blob_ref}} ->
-          {:ok, {:locked_put_blob_ref, key, encoded_ref, expire_at_ms, owner_ref}}
-
-        {:error, _reason} = error ->
-          error
-      end
-    else
-      {:ok, {:locked_put, key, value, expire_at_ms, owner_ref}}
     end
   end
 
@@ -394,11 +369,6 @@ defmodule Ferricstore.Raft.BlobCommand do
     externalize?(new_value, threshold)
   end
 
-  defp command_candidate?({:locked_put, key, value, _expire_at_ms, _owner_ref}, threshold)
-       when is_binary(key) and is_binary(value) do
-    locked_put_blob_side_channel_key?(key) and externalize?(value, threshold)
-  end
-
   defp command_candidate?(
          {:fetch_or_compute_publish, key, value, _expire_at_ms, owner_ref},
          threshold
@@ -557,16 +527,6 @@ defmodule Ferricstore.Raft.BlobCommand do
           {:cont, {:ok, [marker | acc], [new_value | external_payloads]}}
         else
           {:cont, {:ok, [{:cas, key, expected, new_value, ttl_ms} | acc], external_payloads}}
-        end
-
-      {:locked_put, key, value, expire_at_ms, owner_ref}, {:ok, acc, external_payloads}
-      when is_binary(key) and is_binary(value) ->
-        if locked_put_blob_side_channel_key?(key) and externalize?(value, threshold) do
-          marker = {:locked_put_external, key, expire_at_ms, owner_ref}
-          {:cont, {:ok, [marker | acc], [value | external_payloads]}}
-        else
-          {:cont,
-           {:ok, [{:locked_put, key, value, expire_at_ms, owner_ref} | acc], external_payloads}}
         end
 
       {:compound_put, compound_key, value, expire_at_ms}, {:ok, acc, external_payloads}
@@ -758,9 +718,6 @@ defmodule Ferricstore.Raft.BlobCommand do
         {:cas_external, key, expected, ttl_ms}, [ref | rest] ->
           {{:cas_blob_ref, key, expected, BlobRef.encode!(ref), ttl_ms}, rest}
 
-        {:locked_put_external, key, expire_at_ms, owner_ref}, [ref | rest] ->
-          {{:locked_put_blob_ref, key, BlobRef.encode!(ref), expire_at_ms, owner_ref}, rest}
-
         {:compound_put_external, compound_key, expire_at_ms}, [ref | rest] ->
           {{:compound_put_blob_ref, compound_key, BlobRef.encode!(ref), expire_at_ms}, rest}
 
@@ -852,8 +809,4 @@ defmodule Ferricstore.Raft.BlobCommand do
   defp compound_blob_side_channel_key?(<<"L:", _rest::binary>>), do: true
   defp compound_blob_side_channel_key?(<<"X:", _rest::binary>>), do: true
   defp compound_blob_side_channel_key?(_key), do: false
-
-  defp locked_put_blob_side_channel_key?(key) do
-    compound_blob_side_channel_key?(key) or not CompoundKey.internal_key?(key)
-  end
 end

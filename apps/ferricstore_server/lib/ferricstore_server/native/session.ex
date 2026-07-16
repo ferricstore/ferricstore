@@ -74,8 +74,8 @@ defmodule FerricstoreServer.Native.Session do
         case InternalKey.authorize_command(prepared.command, prepared.acl_keys) do
           :ok ->
             with :ok <- ConnAuth.check_command_cached(state.acl_cache, acl_cmd),
-                 :ok <- authorize_channels(prepared.command, prepared.args, state),
-                 :ok <- ConnAuth.check_keys_cached(state.acl_cache, prepared) do
+                 :ok <-
+                   ConnAuth.check_prepared_resources_cached(state.acl_cache, prepared) do
               :ok
             else
               {:error, reason} ->
@@ -576,12 +576,6 @@ defmodule FerricstoreServer.Native.Session do
 
   defp subscription_entry_bytes(value),
     do: byte_size(value) + @subscription_entry_overhead_bytes
-
-  defp authorize_channels(cmd, args, state)
-       when cmd in ["SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE"],
-       do: ConnAuth.check_channels_cached(state.acl_cache, args)
-
-  defp authorize_channels(_cmd, _args, _state), do: :ok
 
   defp log_acl_denial(state, command) do
     Protection.log_command_denied(

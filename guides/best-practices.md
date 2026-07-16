@@ -77,18 +77,23 @@ cache:product:2
 cache:product:3
 ```
 
-**Cross-entity operations** — if you need to atomically update keys belonging to different entities, hash tags won't help (they'd force all entities to one shard). FerricStore handles this with cross-shard operations, but it's slower. Consider whether you truly need atomicity across entities.
+**Cross-entity operations** — durable atomic mutations across independent Raft
+groups are rejected. Model the workflow explicitly, or colocate only the keys
+that truly share an atomicity boundary.
 
 ### Cross-shard operations
 
-When keys span multiple shards, FerricStore uses a mini-percolator protocol: lock keys in shard order, write intent, execute, unlock. This is correct but slower than single-shard operations because it requires multiple Raft round-trips.
-
-Some multi-key commands require all keys to live on one shard. If keys span shards for one of those commands, FerricStore returns a `CROSSSLOT` error with guidance:
+Durable multi-key mutations must stay within one Raft group. FerricStore returns
+`CROSSSLOT` before reading or mutating any key when a command would span
+independent groups:
 
 ```
-CROSSSLOT Keys in request don't hash to the same slot.
-Use hash tags {tag} to colocate keys.
+CROSSSLOT Keys in request don't hash to the same slot
 ```
+
+Standalone non-Raft instances can coordinate local shards with their durable
+compensation journal. That local mechanism is not a distributed transaction
+protocol and does not change the durable Raft boundary.
 
 ### Hash tag rules
 

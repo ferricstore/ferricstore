@@ -50,7 +50,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           # Add one more field to cross the threshold
           Hash.handle("HSET", [key, "extra_field", "extra_value"], store)
 
-          assert promoted?(key)
+          assert_promoted(key)
         end
 
         test "promoted hash has dedicated directory on disk" do
@@ -59,7 +59,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
 
           populate_hash(store, key, @test_threshold + 1)
 
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Verify the dedicated directory exists
           data_dir = Application.fetch_env!(:ferricstore, :data_dir)
@@ -77,7 +77,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("promote_restart_type")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
           assert {:simple, "hash"} = Strings.handle("TYPE", [key], store)
 
           ShardHelpers.flush_all_shards()
@@ -91,7 +91,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           assert_receive {:DOWN, ^ref, :process, ^old_pid, :killed}, 2_000
           ShardHelpers.wait_shards_alive()
 
-          assert promoted?(key)
+          assert_promoted(key)
           assert {:simple, "hash"} = Strings.handle("TYPE", [key], store)
           assert {:error, "WRONGTYPE" <> _} = Set.handle("SADD", [key, "member"], store)
           assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
@@ -108,7 +108,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hget_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # All original fields should be readable
           for i <- 1..(@test_threshold + 1) do
@@ -121,7 +121,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hset_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Add more fields after promotion
           assert 1 == Hash.handle("HSET", [key, "new_field", "new_value"], store)
@@ -134,7 +134,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           large_value = String.duplicate("x", 70_000)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
           shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
@@ -175,7 +175,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           large_value = String.duplicate("x", 70_000)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           ctx = FerricStore.Instance.get(:default)
           shard_idx = Router.shard_for(ctx, key)
@@ -208,7 +208,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hset_update_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Update an existing field
           assert 0 == Hash.handle("HSET", [key, "field_1", "updated"], store)
@@ -220,7 +220,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hget_miss_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert nil == Hash.handle("HGET", [key, "nonexistent"], store)
         end
@@ -232,7 +232,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           compound_key = CompoundKey.hash_field(key, field)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           past = HLC.now_ms() - 1_000
           :ok = store.compound_put.(key, compound_key, "expired_value", past)
@@ -258,7 +258,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           compound_key = CompoundKey.hash_field(key, "field_1")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
           :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
@@ -281,7 +281,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           keydir = elem(ctx.keydir_refs, idx)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           before_bytes = :atomics.get(ctx.keydir_binary_bytes, idx + 1)
           expired_at = HLC.now_ms() - 1
@@ -308,7 +308,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           compound_key = CompoundKey.hash_field(key, "field_1")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
           :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
@@ -343,7 +343,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
             end)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert [1, 1, :ok] =
                    GenServer.call(
@@ -388,7 +388,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
             end)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert [1, :ok] =
                    GenServer.call(
@@ -419,7 +419,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
             end)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           unchanged_token = Router.watch_token(ctx, key)
           refute match?({:error, _reason}, unchanged_token)
@@ -460,7 +460,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
             end)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
           :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
@@ -493,7 +493,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
             end)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert {:error, "CROSSSLOT Keys in request don't hash to the same slot"} =
                    FerricStore.multi(fn tx ->
@@ -524,7 +524,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
             end)
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert {:error, "CROSSSLOT Keys in request don't hash to the same slot"} ==
                    Ferricstore.Test.PreparedTransactionCoordinator.execute(
@@ -551,7 +551,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hdel_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 1 == Hash.handle("HDEL", [key, "field_1"], store)
           assert nil == Hash.handle("HGET", [key, "field_1"], store)
@@ -562,7 +562,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hdel_miss_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 0 == Hash.handle("HDEL", [key, "nonexistent"], store)
         end
@@ -572,7 +572,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hdel_multi_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 2 == Hash.handle("HDEL", [key, "field_1", "field_2"], store)
           assert nil == Hash.handle("HGET", [key, "field_1"], store)
@@ -590,7 +590,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("del_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # DEL the key
           Strings.handle("DEL", [key], store)
@@ -613,7 +613,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           n = @test_threshold + 1
 
           populate_hash(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           result = Hash.handle("HGETALL", [key], store)
 
@@ -647,7 +647,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           :ets.insert(keydir, {cold_field_key, nil, exp, lfu, fid, off, vsize})
 
           assert 1 == Hash.handle("HSET", [key, "extra_field", "extra_value"], store)
-          assert promoted?(key)
+          assert_promoted(key)
 
           result =
             Hash.handle("HGETALL", [key], store)
@@ -685,7 +685,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           )
 
           assert 1 == Hash.handle("HSET", [key, "extra_field", "extra_value"], store)
-          assert promoted?(key)
+          assert_promoted(key)
 
           result =
             Hash.handle("HGETALL", [key], store)
@@ -708,7 +708,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           n = @test_threshold + 1
 
           populate_hash(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert n == Hash.handle("HLEN", [key], store)
         end
@@ -719,7 +719,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           n = @test_threshold + 1
 
           populate_hash(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           Hash.handle("HSET", [key, "extra", "val"], store)
           assert n + 1 == Hash.handle("HLEN", [key], store)
@@ -731,7 +731,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           n = @test_threshold + 1
 
           populate_hash(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           Hash.handle("HDEL", [key, "field_1"], store)
           assert n - 1 == Hash.handle("HLEN", [key], store)
@@ -749,7 +749,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           n = @test_threshold + 1
 
           populate_hash(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           keys = Hash.handle("HKEYS", [key], store)
           assert length(keys) == n
@@ -764,7 +764,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           n = @test_threshold + 1
 
           populate_hash(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           vals = Hash.handle("HVALS", [key], store)
           assert length(vals) == n
@@ -784,7 +784,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hexists_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 1 == Hash.handle("HEXISTS", [key, "field_1"], store)
         end
@@ -794,7 +794,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hexists_miss_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 0 == Hash.handle("HEXISTS", [key, "nonexistent"], store)
         end
@@ -811,7 +811,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           n = @test_threshold + 1
 
           populate_hash(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Delete fields to go below threshold
           for i <- 1..n do
@@ -829,14 +829,14 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           n = @test_threshold + 1
 
           populate_hash(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Delete most fields, keep 2
           for i <- 3..n do
             Hash.handle("HDEL", [key, "field_#{i}"], store)
           end
 
-          assert promoted?(key)
+          assert_promoted(key)
           assert 2 == Hash.handle("HLEN", [key], store)
           assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
         end
@@ -852,7 +852,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hsetnx_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 1 == Hash.handle("HSETNX", [key, "new_field", "new_val"], store)
           assert "new_val" == Hash.handle("HGET", [key, "new_field"], store)
@@ -863,7 +863,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hsetnx_noop_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 0 == Hash.handle("HSETNX", [key, "field_1", "new_val"], store)
           assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
@@ -880,7 +880,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hincrby_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Set a numeric field
           Hash.handle("HSET", [key, "counter", "10"], store)
@@ -899,7 +899,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           key = ukey("hmget_promoted")
 
           populate_hash(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           result = Hash.handle("HMGET", [key, "field_1", "field_2", "nonexistent"], store)
           assert ["value_1", "value_2", nil] == result

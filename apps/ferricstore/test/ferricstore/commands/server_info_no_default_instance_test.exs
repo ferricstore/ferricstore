@@ -53,4 +53,21 @@ defmodule Ferricstore.Commands.ServerInfoNoDefaultInstanceTest do
     assert result =~ "# Clients"
     assert result =~ "# Stats"
   end
+
+  test "INFO resolves auto shard count without emitting negative shard indexes" do
+    previous_shard_count = Application.get_env(:ferricstore, :shard_count)
+    Application.put_env(:ferricstore, :shard_count, 0)
+
+    on_exit(fn ->
+      case previous_shard_count do
+        nil -> Application.delete_env(:ferricstore, :shard_count)
+        count -> Application.put_env(:ferricstore, :shard_count, count)
+      end
+    end)
+
+    result = Server.handle("INFO", ["bitcask"], MockStore.make())
+
+    assert result =~ "shard_0_data_file_count:"
+    refute result =~ "shard_-1_"
+  end
 end

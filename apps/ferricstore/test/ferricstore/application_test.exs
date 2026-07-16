@@ -206,6 +206,75 @@ defmodule Ferricstore.ApplicationTest do
       end
     end
 
+    test "exceptional startup failure clears WARaft backend and default instance context" do
+      server_started? = application_started?(:ferricstore_server)
+      previous_shard_count = Application.get_env(:ferricstore, :shard_count)
+
+      try do
+        stop_app_if_started(:ferricstore_server)
+        assert :ok = Application.stop(:ferricstore)
+        Application.put_env(:ferricstore, :shard_count, :invalid)
+
+        assert {:error, {:ferricstore, _reason}} = Application.ensure_all_started(:ferricstore)
+        assert Ferricstore.Raft.Backend.running() == :undefined
+
+        assert_raise ArgumentError, fn ->
+          FerricStore.Instance.get(:default)
+        end
+
+        assert Process.whereis(Ferricstore.Raft.WARaftBackend.RuntimeSupervisor) == nil
+      after
+        stop_app_if_started(:ferricstore)
+        restore_env(:shard_count, previous_shard_count)
+        ensure_ferricstore_ready!()
+
+        if server_started? do
+          {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+        end
+      end
+    end
+
+    test "WARaft initialization failures are not mislabeled as election failures" do
+      server_started? = application_started?(:ferricstore_server)
+      previous_data_dir = Application.get_env(:ferricstore, :data_dir)
+      previous_shard_count = Application.get_env(:ferricstore, :shard_count)
+
+      previous_fsync_hook =
+        Application.get_env(:ferricstore, :waraft_storage_metadata_fsync_file_hook)
+
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-application-start-failure-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        stop_app_if_started(:ferricstore_server)
+        assert :ok = Application.stop(:ferricstore)
+        Application.put_env(:ferricstore, :data_dir, root)
+        Application.put_env(:ferricstore, :shard_count, 1)
+
+        Application.put_env(:ferricstore, :waraft_storage_metadata_fsync_file_hook, fn _path ->
+          {:error, :forced_application_start_fsync_failure}
+        end)
+
+        assert {:error, {:ferricstore, reason}} = Application.ensure_all_started(:ferricstore)
+        assert inspect(reason) =~ "waraft_start_failed"
+        refute inspect(reason) =~ "raft_election_failed"
+      after
+        stop_app_if_started(:ferricstore)
+        restore_env(:data_dir, previous_data_dir)
+        restore_env(:shard_count, previous_shard_count)
+        restore_env(:waraft_storage_metadata_fsync_file_hook, previous_fsync_hook)
+        File.rm_rf!(root)
+        ensure_ferricstore_ready!()
+
+        if server_started? do
+          {:ok, _} = Application.ensure_all_started(:ferricstore_server)
+        end
+      end
+    end
+
     test "prep_stop uses runtime shard count when config shard_count is auto" do
       original_shard_count = Application.get_env(:ferricstore, :shard_count)
       original_ready = Ferricstore.Health.ready?()

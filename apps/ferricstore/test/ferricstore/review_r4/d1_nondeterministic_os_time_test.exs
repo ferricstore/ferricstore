@@ -21,8 +21,8 @@ defmodule Ferricstore.ReviewR4.D1NondeterministicOsTimeTest do
       assert is_integer(meta[:system_time])
     end
 
-    test "check_key_lock calls System.os_time — non-deterministic across replicas" do
-      # The function check_key_lock/3 at line 1637 calls System.os_time(:millisecond).
+    test "fetch-or-compute lock checks require deterministic apply time" do
+      # Fetch-or-compute lease checks must use the replicated apply timestamp.
       # On leader, now=T1. On follower replaying 500ms later, now=T1+500.
       # A lock with expire_at = T1+200 would be:
       #   - ACTIVE on leader  (T1 < T1+200)
@@ -38,10 +38,7 @@ defmodule Ferricstore.ReviewR4.D1NondeterministicOsTimeTest do
       # expires 100ms from now
       expire_at = now + 100
 
-      state = %{
-        cross_shard_locks: %{"mykey" => {make_ref(), expire_at}},
-        cross_shard_intents: %{}
-      }
+      state = %{fetch_or_compute_locks: %{"mykey" => {make_ref(), expire_at}}}
 
       # Right now, the lock is active (not expired)
       # check_key_lock uses System.os_time internally, so result depends on when called
@@ -49,36 +46,35 @@ defmodule Ferricstore.ReviewR4.D1NondeterministicOsTimeTest do
       # This is the core of the non-determinism bug.
 
       # We verify the lock map structure is as expected
-      assert map_size(state.cross_shard_locks) == 1
-      {_ref, exp} = state.cross_shard_locks["mykey"]
+      assert map_size(state.fetch_or_compute_locks) == 1
+      {_ref, exp} = state.fetch_or_compute_locks["mykey"]
       assert exp == expire_at
     end
 
-    test "do_lock_keys calls System.os_time — non-deterministic lock expiry pruning" do
-      # do_lock_keys at line 1592 calls System.os_time(:millisecond).
+    test "fetch-or-compute expiry pruning requires deterministic apply time" do
+      # Fetch-or-compute expiry pruning must use the replicated apply timestamp.
       # It uses `now` for two purposes:
       #   1. Checking if conflicting locks are expired: `exp > now`
       #   2. Pruning expired locks: `Map.reject(locks, fn {_k, {_ref, exp}} -> exp <= now end)`
       #
       # On different replicas at different real times, different locks will be
-      # pruned, leading to divergent cross_shard_locks maps in the Raft state.
+      # pruned, leading to divergent fetch_or_compute_locks maps in the Raft state.
 
       now = System.os_time(:millisecond)
 
       state = %{
-        cross_shard_locks: %{
+        fetch_or_compute_locks: %{
           # expired
           "key_a" => {make_ref(), now - 1},
           # active
           "key_b" => {make_ref(), now + 5000}
-        },
-        cross_shard_intents: %{}
+        }
       }
 
       # On leader (now=T), key_a is expired, will be pruned.
       # On follower replaying 6 seconds later (now=T+6000), BOTH keys are expired.
-      # The resulting cross_shard_locks maps diverge.
-      assert map_size(state.cross_shard_locks) == 2
+      # The resulting fetch_or_compute_locks maps diverge.
+      assert map_size(state.fetch_or_compute_locks) == 2
     end
 
     test "ets_lookup calls System.os_time — non-deterministic expiry checks" do

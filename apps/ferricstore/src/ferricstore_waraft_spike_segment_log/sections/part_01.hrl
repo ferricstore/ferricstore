@@ -499,6 +499,32 @@ write_projection_batches_sync(RootDir, Batches) when is_list(Batches) ->
             {error, {ensure_projection_batch_dir, Reason}}
     end.
 
+compact_apply_projection(RootDir, TrimIndex, RetainedBatches)
+  when is_integer(TrimIndex), TrimIndex >= 0, is_list(RetainedBatches) ->
+    Dir = fold_disk_segment_dir(RootDir),
+    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+        ok ->
+            case segment_append_kind(Dir) of
+                apply_projection ->
+                    case projection_batch_records(RetainedBatches, []) of
+                        {ok, Records} ->
+                            compact_apply_projection_records(
+                                Dir,
+                                TrimIndex,
+                                normalize_projection_batch_records(Records)
+                            );
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                Kind ->
+                    {error, {not_apply_projection_log, Kind}}
+            end;
+        {error, Reason} ->
+            {error, {ensure_apply_projection_compaction_dir, Reason}}
+    end;
+compact_apply_projection(_RootDir, TrimIndex, _RetainedBatches) ->
+    {error, {bad_apply_projection_compaction_trim_index, TrimIndex}}.
+
 write_projection_batch_records(Dir, Records, Mode) ->
     Normalized = normalize_projection_batch_records(Records),
     case segment_append_kind(Dir) of

@@ -89,6 +89,11 @@ Code.require_file(
 )
 
 Code.require_file(
+  "waraft_backend_test/sections/direct_waraft_shard_reads_preserve_typed_failures.exs",
+  __DIR__
+)
+
+Code.require_file(
   "waraft_backend_test/sections/backend_add_member_retries_staged_participant_after_failed_transfer.exs",
   __DIR__
 )
@@ -249,6 +254,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest do
   use Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutationsSurviveWaraftRestart
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.NumericAppendExpiringStringCommandsSurviveWaraftRestart
+
+  use Ferricstore.Raft.WARaftBackendTest.Sections.DirectWaraftShardReadsPreserveTypedFailures
 
   use Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRecoversAfterLeaderOsProcessKillDuring
 

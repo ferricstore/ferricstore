@@ -4,8 +4,6 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalDataTest do
   alias FerricstoreServer.Health.Dashboard.Data.Operational
   alias FerricstoreServer.Health.Dashboard.StorageSnapshotCache
 
-  @legacy_cache_key {Operational, :storage_summary_cache}
-
   setup do
     data_dir =
       Path.join(
@@ -57,11 +55,6 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalDataTest do
   end
 
   test "storage refresh replaces one supervised ETS cache entry", %{data_dir: data_dir} do
-    legacy_cache = :persistent_term.get(@legacy_cache_key, :missing)
-    :persistent_term.erase(@legacy_cache_key)
-
-    on_exit(fn -> restore_persistent_term(@legacy_cache_key, legacy_cache) end)
-
     Application.put_env(:ferricstore, :dashboard_storage_summary_ttl_ms, 0)
     file = Path.join(data_dir, "000001.log")
     File.write!(file, "one")
@@ -86,8 +79,6 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalDataTest do
     assert [
              {:snapshot, {^data_dir, _shard_count}, _cached_at_ms, %{total_disk_bytes: 13}}
            ] = :ets.tab2list(table)
-
-    assert :persistent_term.get(@legacy_cache_key, :missing) == :missing
   end
 
   test "storage refresh visits shard files once", %{data_dir: data_dir} do
@@ -165,7 +156,4 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalDataTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
-
-  defp restore_persistent_term(key, :missing), do: :persistent_term.erase(key)
-  defp restore_persistent_term(key, value), do: :persistent_term.put(key, value)
 end

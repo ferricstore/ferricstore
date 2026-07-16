@@ -10,6 +10,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       alias Ferricstore.Raft.CommandStamp
       alias Ferricstore.Raft.WARaftBackend.Batcher, as: NamespaceBatcher
       alias Ferricstore.Raft.WARaftBackend.BatcherSupervisor, as: NamespaceBatcherSupervisor
+      alias Ferricstore.Raft.WARaftBackend.RuntimeSupervisor
       alias Ferricstore.Raft.WARaftBackend.SyncGate
 
       defguardp is_storage_unknown_outcome_reason(reason)
@@ -96,10 +97,28 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
           :ok
         end)
 
-        profile_startup_phase(:ensure_data_layout, %{shard_count: ctx.shard_count}, fn ->
-          Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
-        end)
+        case profile_startup_phase(
+               :ensure_storage_runtime,
+               %{shard_count: ctx.shard_count},
+               fn -> RuntimeSupervisor.ensure_started() end
+             ) do
+          :ok -> start_after_storage_runtime(ctx, opts, config)
+          {:error, _reason} = error -> cleanup_failed_start(error)
+        end
+      end
 
+      defp start_after_storage_runtime(ctx, opts, config) do
+        case profile_startup_phase(
+               :ensure_data_layout,
+               %{shard_count: ctx.shard_count},
+               fn -> ensure_backend_data_layout(ctx) end
+             ) do
+          :ok -> start_after_data_layout(ctx, opts, config)
+          {:error, _reason} = error -> cleanup_failed_start(error)
+        end
+      end
+
+      defp start_after_data_layout(ctx, opts, config) do
         profile_startup_phase(:active_file_init, %{shard_count: ctx.shard_count}, fn ->
           Ferricstore.Store.ActiveFile.init(ctx.shard_count)
         end)
@@ -143,6 +162,44 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
         end
       end
 
+      defp ensure_backend_data_layout(ctx) do
+        with :ok <- validate_waraft_segment_log_dirs(ctx) do
+          Ferricstore.DataDir.ensure_layout!(ctx.data_dir, ctx.shard_count)
+        end
+      rescue
+        error in File.Error ->
+          {:error, {:data_layout_failed, error.reason}}
+      end
+
+      defp validate_waraft_segment_log_dirs(ctx) do
+        Enum.reduce_while(1..ctx.shard_count, :ok, fn partition, :ok ->
+          path =
+            Path.join([
+              ctx.data_dir,
+              "waraft",
+              "#{@table}.#{partition}",
+              "segment_log"
+            ])
+
+          case File.lstat(path) do
+            {:ok, %{type: :directory}} ->
+              {:cont, :ok}
+
+            {:ok, %{type: :symlink}} ->
+              {:halt, {:error, {:unsafe_segment_log_dir, path}}}
+
+            {:ok, %{type: type}} ->
+              {:halt, {:error, {:invalid_segment_log_dir, path, type}}}
+
+            {:error, :enoent} ->
+              {:cont, :ok}
+
+            {:error, reason} ->
+              {:halt, {:error, {:segment_log_dir_stat_failed, path, reason}}}
+          end
+        end)
+      end
+
       @spec stop() :: :ok
       def stop do
         shard_count = registered_partition_count()
@@ -159,6 +216,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
         SyncGate.clear_shards(shard_count)
         erase_cached_voter_nodes(shard_count)
         :persistent_term.erase(@shard_count_key)
+        RuntimeSupervisor.stop()
         :ok
       end
 

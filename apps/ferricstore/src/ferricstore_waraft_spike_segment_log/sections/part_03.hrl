@@ -131,6 +131,86 @@ rewrite_projection_upsert_records_atomic(Dir, Records, RecordsPerSegment) ->
             Error
     end.
 
+compact_apply_projection_records(Dir, TrimIndex, Records) ->
+    case validate_apply_projection_compaction_records(Records, TrimIndex) of
+        ok ->
+            case validate_segment_log_dir(Dir) of
+                ok ->
+                    case recover_rewrite(Dir) of
+                        ok ->
+                            case close_writers_for_dir(Dir) of
+                                ok ->
+                                    case records_per_segment(Dir) of
+                                        {ok, RecordsPerSegment} ->
+                                            KeepFun = fun(Index) -> Index >= TrimIndex end,
+                                            rewrite_projection_filtered_records_atomic(
+                                                Dir,
+                                                KeepFun,
+                                                Records,
+                                                RecordsPerSegment
+                                            );
+                                        {error, _Reason} = Error ->
+                                            Error
+                                    end;
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+validate_apply_projection_compaction_records([], _TrimIndex) ->
+    ok;
+validate_apply_projection_compaction_records(
+    [{Index, {0, {ferricstore_segment_apply_projection_batch, _Position, Entries}}} | Rest],
+    TrimIndex
+) when is_integer(Index), Index > 0, Index < TrimIndex, is_list(Entries) ->
+    validate_apply_projection_compaction_records(Rest, TrimIndex);
+validate_apply_projection_compaction_records([Record | _Rest], TrimIndex) ->
+    {error, {bad_apply_projection_compaction_record, TrimIndex, Record}}.
+
+rewrite_projection_filtered_records_atomic(Dir, KeepFun, Records, RecordsPerSegment) ->
+    Paths = rewrite_paths(Dir),
+    Staging = maps:get(staging, Paths),
+    Backup = maps:get(backup, Paths),
+    case prepare_projection_upsert_stage(
+        Staging,
+        Dir,
+        KeepFun,
+        Records,
+        RecordsPerSegment
+    ) of
+        ok ->
+            case write_rewrite_marker(Dir, Paths) of
+                ok ->
+                    case swap_rewrite_dirs(Dir, Staging, Backup) of
+                        ok ->
+                            case finish_rewrite(Dir, Backup) of
+                                ok ->
+                                    rebuild_offset_registry(Dir);
+                                {error, _Reason} = Error ->
+                                    _ = rollback_rewrite(Dir, Paths),
+                                    Error
+                            end;
+                        {error, _Reason} = Error ->
+                            _ = rollback_rewrite(Dir, Paths),
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    _ = remove_tree(Staging),
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            _ = remove_tree(Staging),
+            Error
+    end.
+
 prepare_rewrite_stage(Staging, Records, RecordsPerSegment) ->
     case remove_tree(Staging) of
         ok ->

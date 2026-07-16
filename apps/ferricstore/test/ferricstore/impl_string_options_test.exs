@@ -124,6 +124,19 @@ defmodule Ferricstore.ImplStringOptionsTest do
     assert {:ok, "value"} = FerricStore.Impl.hget(ctx, key, "field")
   end
 
+  test "optimized string reads reject stream keys", %{ctx: ctx} do
+    key = "impl:typed-stream"
+
+    assert "1-0" =
+             Ferricstore.Commands.Stream.handle_ast(
+               {:xadd, key, {{:explicit, 1, 0}, ["field", "value"], nil, false}},
+               ctx
+             )
+
+    assert {:error, "WRONGTYPE" <> _} = FerricStore.Impl.get(ctx, key)
+    assert {:error, "WRONGTYPE" <> _} = FerricStore.Impl.strlen(ctx, key)
+  end
+
   test "set variants replace compound values while setnx leaves them intact", %{ctx: ctx} do
     assert {:ok, 1} = FerricStore.Impl.hset(ctx, "set:typed", %{"field" => "value"})
     assert {:ok, false} = FerricStore.Impl.setnx(ctx, "set:typed", "ignored")

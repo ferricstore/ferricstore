@@ -5,7 +5,7 @@ defmodule Ferricstore.Cluster.JoinIdentityTest do
 
   @target :"node2@127.0.0.1"
 
-  test "accepts copied data when local and target cluster ids match" do
+  test "accepts snapshot target data when local and target cluster ids match" do
     assert :ok =
              JoinIdentity.validate(
                {:ok, %{cluster_id: "cluster-a", replication_mode: :raft}},
@@ -32,7 +32,7 @@ defmodule Ferricstore.Cluster.JoinIdentityTest do
              )
   end
 
-  test "rejects copied target data when local marker is missing" do
+  test "rejects snapshot target data when local marker is missing" do
     assert {:error, {:local_cluster_state_missing, @target}} =
              JoinIdentity.validate(
                {:error, :enoent},
@@ -41,7 +41,7 @@ defmodule Ferricstore.Cluster.JoinIdentityTest do
              )
   end
 
-  test "rejects copied target data without a marker when local has a marker" do
+  test "rejects snapshot target data without a marker when local has a marker" do
     assert {:error, {:target_cluster_state_missing, @target}} =
              JoinIdentity.validate(
                {:ok, %{cluster_id: "cluster-a"}},
@@ -50,7 +50,7 @@ defmodule Ferricstore.Cluster.JoinIdentityTest do
              )
   end
 
-  test "rejects copied target data from another cluster" do
+  test "rejects snapshot target data from another cluster" do
     assert {:error, {:target_cluster_id_mismatch, @target, "cluster-a", "cluster-b"}} =
              JoinIdentity.validate(
                {:ok, %{cluster_id: "cluster-a"}},

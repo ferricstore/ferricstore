@@ -309,6 +309,27 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01 do
         |> Path.wildcard()
       end
 
+      defp apply_projection_segment_bytes(apply_projection_root) do
+        apply_projection_root
+        |> apply_projection_segment_files()
+        |> Enum.reduce(0, fn path, bytes -> bytes + File.stat!(path).size end)
+      end
+
+      defp apply_projection_disk_record_counts(apply_projection_root) do
+        assert {:ok, counts} =
+                 :ferricstore_waraft_spike_segment_log.fold_disk(
+                   to_charlist(apply_projection_root),
+                   fn index,
+                      {0, {:ferricstore_segment_apply_projection_batch, _position, _entries}},
+                      acc ->
+                     Map.update(acc, index, 1, &(&1 + 1))
+                   end,
+                   %{}
+                 )
+
+        counts
+      end
+
       defp clear_apply_projection_cache! do
         case :ets.whereis(:ferricstore_waraft_apply_projection_cache) do
           :undefined -> :ok
@@ -449,7 +470,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01 do
         end)
       end
 
-      defp setup_cross_shard_flow_child(
+      defp setup_flow_child(
              ctx,
              parent_id,
              child_id,
@@ -503,12 +524,12 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01 do
         claimed
       end
 
-      defp setup_cross_shard_child_for_many!(ctx, parent_id, child_id, group_id, opts \\ []) do
+      defp setup_colocated_child_for_many!(ctx, parent_id, child_id, group_id, opts \\ []) do
         parent_partition = flow_partition_for_shard(ctx, parent_id, 0)
-        child_partition = flow_partition_for_shard(ctx, child_id, 1)
+        child_partition = parent_partition
 
         assert {:ok, _waiting_parent} =
-                 setup_cross_shard_flow_child(
+                 setup_flow_child(
                    ctx,
                    parent_id,
                    child_id,

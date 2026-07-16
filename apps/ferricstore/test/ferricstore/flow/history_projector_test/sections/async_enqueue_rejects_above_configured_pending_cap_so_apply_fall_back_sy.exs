@@ -441,14 +441,19 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAbov
         assert Ferricstore.Flow.HistoryProjectedIndex.read(dir) == 100
       end
 
+      @tag :history_projected_index_durability
       test "projected index marker persistence fsyncs tmp file and parent directory" do
         source = File.read!("lib/ferricstore/flow/history_projected_index.ex")
+        native_source = File.read!("native/ferricstore_bitcask/src/fs_nif.rs")
 
-        assert source =~ "NIF.v2_fsync(tmp_path)",
-               "projected marker must fsync tmp contents before rename"
+        assert source =~ "Ferricstore.FS.atomic_replace_nofollow(",
+               "projected marker must use the durable no-follow replace primitive"
 
-        assert source =~ "NIF.v2_fsync_dir(shard_data_path)",
-               "projected marker must fsync the directory after rename"
+        assert Regex.match?(
+                 ~r/fn atomic_replace_nofollow.*?temp_file\.sync_all\(\)\?.*?rename_nofollow.*?sync_directory_nofollow\(parent\)/s,
+                 native_source
+               ),
+               "atomic replace must fsync tmp contents before rename and the directory after rename"
       end
 
       test "pending_count fails closed when projector is not started" do

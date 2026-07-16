@@ -4,12 +4,72 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard
 
+  test "cross-shard barrier release is scoped to the acquiring operation" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    owner = make_ref()
+    other = make_ref()
+
+    assert :ok =
+             GenServer.call(pid, {:standalone_cross_shard_barrier_acquire, owner})
+
+    pending =
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit, {:put, "queue:barrier-owner", "value", 0}}
+      )
+
+    assert %{waiting_count: 1} = GenServer.call(pid, :standalone_commit_debug)
+
+    assert {:error, :standalone_cross_shard_barrier_not_owner} =
+             GenServer.call(pid, {:standalone_cross_shard_barrier_release, other})
+
+    assert %{waiting_count: 1} = GenServer.call(pid, :standalone_commit_debug)
+    assert :ok = GenServer.call(pid, {:standalone_cross_shard_barrier_release, owner})
+    assert {:reply, :ok} = :gen_server.receive_response(pending, 5_000)
+    assert "value" == Router.get(ctx, "queue:barrier-owner")
+  end
+
+  test "cross-shard participant releases its barrier when the coordinator dies" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    owner_token = make_ref()
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        result =
+          GenServer.call(pid, {:standalone_cross_shard_barrier_acquire, owner_token})
+
+        send(parent, {:barrier_acquired, result})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:barrier_acquired, :ok}, 1_000
+
+    pending =
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit, {:put, "queue:barrier-owner-down", "value", 0}}
+      )
+
+    assert %{waiting_count: 1} = GenServer.call(pid, :standalone_commit_debug)
+    Process.exit(owner, :kill)
+
+    assert {:reply, :ok} = :gen_server.receive_response(pending, 5_000)
+    assert "value" == Router.get(ctx, "queue:barrier-owner-down")
+  end
+
   test "waiting commits are bounded without changing FIFO apply order" do
     {pid, ctx, data_dir} = start_shard(standalone_commit_max_queued_ops: 2)
+    barrier_owner = make_ref()
 
     on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
 
-    assert :ok = GenServer.call(pid, :standalone_cross_shard_barrier_acquire)
+    assert :ok =
+             GenServer.call(pid, {:standalone_cross_shard_barrier_acquire, barrier_owner})
 
     first = :gen_server.send_request(pid, {:standalone_commit, {:put, "queue:key", "first", 0}})
 
@@ -25,7 +85,10 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
              :gen_server.receive_response(rejected, 500)
 
     assert %{waiting_count: 2} = GenServer.call(pid, :standalone_commit_debug)
-    assert :ok = GenServer.call(pid, :standalone_cross_shard_barrier_release)
+
+    assert :ok =
+             GenServer.call(pid, {:standalone_cross_shard_barrier_release, barrier_owner})
+
     assert {:reply, :ok} = :gen_server.receive_response(first, 5_000)
     assert {:reply, :ok} = :gen_server.receive_response(second, 5_000)
 
@@ -106,7 +169,10 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
 
     on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
 
-    assert :ok = GenServer.call(pid, :standalone_cross_shard_barrier_acquire)
+    barrier_owner = make_ref()
+
+    assert :ok =
+             GenServer.call(pid, {:standalone_cross_shard_barrier_acquire, barrier_owner})
 
     requests =
       for index <- 1..5 do
@@ -117,7 +183,9 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
       end
 
     assert %{waiting_count: 5} = GenServer.call(pid, :standalone_commit_debug)
-    assert :ok = GenServer.call(pid, :standalone_cross_shard_barrier_release)
+
+    assert :ok =
+             GenServer.call(pid, {:standalone_cross_shard_barrier_release, barrier_owner})
 
     assert_receive {:durability_batch, first_worker, 2}, 1_000
     assert %{batch_count: 3, inflight_count: 2} = GenServer.call(pid, :standalone_commit_debug)
@@ -228,6 +296,22 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
     assert "first" == Router.get(ctx, "queue:nx")
   end
 
+  test "a conditional no-op does not advance the standalone WATCH version" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    key = "queue:watch-version:nx"
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: true, xx: false}
+    before = Router.get_version(ctx, key)
+
+    assert :ok = Router.set(ctx, key, "first", opts)
+    committed = Router.get_version(ctx, key)
+    assert committed > before
+
+    assert nil == Router.set(ctx, key, "second", opts)
+    assert committed == Router.get_version(ctx, key)
+  end
+
   test "nested batches and disjoint writes receive their own exact result slices" do
     {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 100)
     on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
@@ -269,7 +353,12 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
              GenServer.call(pid, {:list_op, "queue:paused:list", {:rpush, ["value"]}})
 
     assert {:error, "ERR shard writes paused for sync"} =
-             GenServer.call(pid, {:locked_put, "queue:paused:key", "value", 0, make_ref()})
+             GenServer.call(
+               pid,
+               {:fetch_or_compute_lock, "queue:paused:key",
+                Ferricstore.FetchOrCompute.Outcome.key("queue:paused:key"), "owner",
+                Ferricstore.HLC.now_ms() + 5_000}
+             )
   end
 
   test "pause reports a prior flush failure instead of claiming a clean sync boundary" do

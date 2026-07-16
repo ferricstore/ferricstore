@@ -3,6 +3,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
 
   alias Ferricstore.Flow.{Hibernation, MutationAttrs, RetryPolicy}
   alias Ferricstore.Raft.{ApplyContext, StateMachine}
+  alias Ferricstore.Store.Promotion
 
   test "history hot limits cannot exceed the total history maximum" do
     context =
@@ -36,12 +37,15 @@ defmodule Ferricstore.Raft.ApplyContextTest do
   ]
 
   setup do
-    original = Map.new(@runtime_keys, &{&1, Application.get_env(:ferricstore, &1)})
+    runtime_snapshot =
+      Map.new(@runtime_keys, fn key ->
+        {key, Application.fetch_env(:ferricstore, key)}
+      end)
 
     on_exit(fn ->
-      Enum.each(original, fn
-        {key, nil} -> Application.delete_env(:ferricstore, key)
-        {key, value} -> Application.put_env(:ferricstore, key, value)
+      Enum.each(runtime_snapshot, fn
+        {key, :error} -> Application.delete_env(:ferricstore, key)
+        {key, {:ok, value}} -> Application.put_env(:ferricstore, key, value)
       end)
 
       Hibernation.refresh_config!()
@@ -96,6 +100,21 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     assert :sys.get_state(shard).apply_context == captured
   end
 
+  test "isolated instances accept an explicit promotion threshold" do
+    Application.put_env(:ferricstore, :promotion_threshold, 999)
+
+    ctx =
+      Ferricstore.Test.IsolatedInstance.checkout(
+        shard_count: 1,
+        promotion_threshold: 7
+      )
+
+    on_exit(fn -> Ferricstore.Test.IsolatedInstance.checkin(ctx) end)
+
+    assert ctx.apply_context.promotion_threshold == 7
+    assert :sys.get_state(elem(ctx.shard_names, 0)).apply_context.promotion_threshold == 7
+  end
+
   test "captured cleanup and hibernation limits are flat immutable data" do
     context =
       ApplyContext.new(
@@ -130,6 +149,21 @@ defmodule Ferricstore.Raft.ApplyContextTest do
       |> Tuple.delete_at(tuple_size(ApplyContext.encode(context)) - 3)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(old_shape)
+  end
+
+  @tag :replicated_promotion_threshold
+  test "promotion threshold has no process-global runtime API" do
+    context = ApplyContext.new(promotion_threshold: 7)
+
+    Application.put_env(:ferricstore, :promotion_threshold, 999)
+
+    refute function_exported?(Promotion, :threshold, 0)
+    assert Promotion.threshold(%{apply_context: context}) == 7
+
+    application_source =
+      File.read!(Path.expand("lib/ferricstore/application.ex", File.cwd!()))
+
+    refute application_source =~ ":ferricstore_promotion_threshold"
   end
 
   @tag :replicated_promotion_threshold
@@ -497,13 +531,14 @@ defmodule Ferricstore.Raft.ApplyContextTest do
       release_cursor_interval: 1_000,
       apply_context: local,
       apply_context_encoded: ApplyContext.encode(local),
-      cross_shard_intents: %{}
+      fetch_or_compute_locks: %{},
+      fetch_or_compute_lock_expiries: :gb_trees.empty()
     }
 
     command =
-      {:ferricstore_apply_context, ApplyContext.encode(leader), {:get_intents}}
+      {:ferricstore_apply_context, ApplyContext.encode(leader), {:clear_key_locks}}
 
-    assert {next_state, %{}} =
+    assert {next_state, :ok} =
              StateMachine.apply(%{}, command, state)
 
     assert next_state.apply_context == leader

@@ -265,6 +265,11 @@ defmodule Ferricstore.Store.Shard.Compound do
   def maybe_promote(state, redis_key, compound_key),
     do: Promoted.maybe_promote(state, redis_key, compound_key)
 
+  @spec maybe_promote(map(), binary(), binary(), non_neg_integer()) :: map()
+  @doc false
+  def maybe_promote(state, redis_key, compound_key, threshold),
+    do: Promoted.maybe_promote(state, redis_key, compound_key, threshold)
+
   @spec detect_compound_type(binary(), binary()) :: {atom(), binary()} | nil
   @doc false
   def detect_compound_type(redis_key, compound_key),

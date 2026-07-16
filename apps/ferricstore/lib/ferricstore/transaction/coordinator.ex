@@ -64,7 +64,7 @@ defmodule Ferricstore.Transaction.Coordinator do
     command = {:tx_execute, queue, sandbox_namespace, watched_keys}
 
     try do
-      case Backend.write(shard_idx, command) do
+      case backend_write(shard_idx, command) do
         {:error, :noproc} ->
           raft_unavailable(:noproc)
 
@@ -81,6 +81,16 @@ defmodule Ferricstore.Transaction.Coordinator do
     catch
       :exit, {:noproc, _} ->
         raft_unavailable(:noproc)
+
+      :exit, _reason ->
+        raft_unavailable(:pipeline_rejected)
+    end
+  end
+
+  defp backend_write(shard_idx, command) do
+    case Process.get(:ferricstore_tx_backend_write_hook) do
+      hook when is_function(hook, 2) -> hook.(shard_idx, command)
+      _no_hook -> Backend.write(shard_idx, command)
     end
   end
 

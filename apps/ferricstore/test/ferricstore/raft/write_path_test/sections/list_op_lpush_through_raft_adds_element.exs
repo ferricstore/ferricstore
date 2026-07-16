@@ -502,7 +502,7 @@ defmodule Ferricstore.Raft.WritePathTest.Sections.ListOpLpushThroughRaftAddsElem
 
           locked_state = %{
             state
-            | cross_shard_locks: %{
+            | fetch_or_compute_locks: %{
                 "hotbatch:locked" => {owner, Ferricstore.HLC.now_ms() + 60_000}
               }
           }

@@ -20,6 +20,7 @@ defmodule Ferricstore.Store.Ops.Flush do
     flush_epoch = Ferricstore.HLC.now()
 
     with :ok <- SharedRefBackfill.invalidate_verified!(ctx.name, ctx.shard_count),
+         :ok <- validate_internal_keydirs(ctx),
          :ok <- flush_replicated_shards(ctx, flush_epoch),
          :ok <- clear_promoted_storage(ctx),
          :ok <- clear_flow_projection_storage(ctx) do
@@ -27,6 +28,26 @@ defmodule Ferricstore.Store.Ops.Flush do
       NativeFlowIndex.reset_all(ctx.name, ctx.shard_count)
       :ok
     end
+  end
+
+  defp validate_internal_keydirs(ctx) do
+    shard_indexes(ctx.shard_count)
+    |> Enum.reduce_while(:ok, fn shard_index, :ok ->
+      keydir = elem(ctx.keydir_refs, shard_index)
+
+      try do
+        case :ets.info(keydir, :size) do
+          size when is_integer(size) and size >= 0 ->
+            {:cont, :ok}
+
+          _unavailable ->
+            raise ArgumentError, "keydir table is unavailable"
+        end
+      rescue
+        error in ArgumentError ->
+          {:halt, {:error, {:flush_internal_keydir_unavailable, error}}}
+      end
+    end)
   end
 
   defp with_writes_paused(ctx, fun) when is_function(fun, 0) do

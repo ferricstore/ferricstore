@@ -54,6 +54,8 @@ defmodule Ferricstore.Application do
     mark_starting()
 
     try do
+      :ok = stop_standalone_waraft_runtime()
+
       data_dir = Application.get_env(:ferricstore, :data_dir, "data")
       :ok = Ferricstore.Raft.Backend.put_running!(:waraft)
 
@@ -134,11 +136,6 @@ defmodule Ferricstore.Application do
       # a uniform 1024-slot -> shard mapping and stores it in persistent_term.
       # Also sets :ferricstore_shard_count.
       Ferricstore.Store.SlotMap.init(shard_count)
-
-      :persistent_term.put(
-        :ferricstore_promotion_threshold,
-        Application.get_env(:ferricstore, :promotion_threshold, 100)
-      )
 
       :persistent_term.put(
         :ferricstore_read_sample_rate,
@@ -242,6 +239,12 @@ defmodule Ferricstore.Application do
               id: Ferricstore.Store.BlobStore.TableHeir
             ),
             Ferricstore.Store.BlobStore.TableOwner,
+            Supervisor.child_spec(
+              {Ferricstore.Store.ETSTableHeir,
+               name: Ferricstore.Raft.WARaftSegmentReader.TableHeir},
+              id: Ferricstore.Raft.WARaftSegmentReader.TableHeir
+            ),
+            Ferricstore.Raft.WARaftSegmentReader.TableOwner,
             Ferricstore.Raft.WARaftBackend.BatcherSupervisor,
             Supervisor.child_spec(
               {Ferricstore.Store.ETSTableHeir,
@@ -295,13 +298,21 @@ defmodule Ferricstore.Application do
             {:error, reason} ->
               stop_started_supervisor(pid)
               cleanup_failed_start()
-              {:error, {:raft_election_failed, reason}}
+              {:error, {:waraft_start_failed, reason}}
           end
 
         result ->
           cleanup_failed_start()
           result
       end
+    rescue
+      error ->
+        cleanup_failed_start()
+        reraise(error, __STACKTRACE__)
+    catch
+      kind, reason ->
+        cleanup_failed_start()
+        :erlang.raise(kind, reason, __STACKTRACE__)
     after
       clear_starting()
     end
@@ -319,6 +330,19 @@ defmodule Ferricstore.Application do
       commit_batch_interval_ms: Ferricstore.Raft.WARaftBackend.default_commit_batch_interval_ms(),
       commit_batch_max: Ferricstore.Raft.WARaftBackend.default_commit_batch_max()
     ]
+  end
+
+  defp stop_standalone_waraft_runtime do
+    case Process.whereis(Ferricstore.Raft.WARaftBackend.RuntimeSupervisor) do
+      nil ->
+        :ok
+
+      _runtime ->
+        # WARaft uses one VM-global backend name. Application startup replaces
+        # any standalone backend anyway, so stop it before app-owned table
+        # heirs/owners are started and would collide with the kernel runtime.
+        Ferricstore.Raft.WARaftBackend.stop()
+    end
   end
 
   defp mark_starting do

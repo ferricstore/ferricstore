@@ -354,6 +354,23 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
         error -> {:error, {:fsync_file_exception, path, error}}
       end
 
+      defp with_stable_flow_projection_snapshot(
+             %{ctx: ctx, shard_index: shard_index} = handle,
+             fun
+           )
+           when is_function(fun, 0) do
+        case HistoryProjector.flush(ctx, shard_index, snapshot_compaction_drain_timeout_ms()) do
+          :ok ->
+            with_flow_lmdb_snapshot_install(handle, fun)
+
+          {:error, reason} ->
+            {:error, {:flow_history_snapshot_flush_failed, reason}}
+
+          other ->
+            {:error, {:flow_history_snapshot_flush_failed, other}}
+        end
+      end
+
       defp copy_shard_dirs_to_snapshot(snapshot_path, handle) do
         Enum.reduce_while(shard_dir_specs(handle), :ok, fn {kind, source}, :ok ->
           dest = Path.join(snapshot_path, Atom.to_string(kind))
@@ -389,6 +406,44 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
           apply_projection_snapshot_spill_chunk_entries()
         )
       end
+
+      defp copy_compacted_storage_dirs_to_snapshot(
+             snapshot_path,
+             %{
+               ctx: ctx,
+               root_dir: root_dir,
+               shard_index: shard_index,
+               position: position
+             } = handle
+           ) do
+        Ferricstore.Raft.WARaftSegmentReader.with_apply_projection_disk_lock(
+          ctx.data_dir,
+          shard_index,
+          fn ->
+            with :ok <- flush_apply_projection_snapshot_payload(handle),
+                 :ok <-
+                   compact_apply_projection_log(
+                     root_dir,
+                     ctx,
+                     shard_index,
+                     apply_projection_snapshot_trim_index(position),
+                     snapshot_flow_lmdb_path(snapshot_path)
+                   ),
+                 :ok <- copy_storage_dirs_to_snapshot(snapshot_path, handle) do
+              :ok
+            end
+          end
+        )
+      end
+
+      defp snapshot_flow_lmdb_path(snapshot_path),
+        do: snapshot_path |> Path.join("data") |> FlowLMDB.path()
+
+      defp apply_projection_snapshot_trim_index({:raft_log_pos, index, _term})
+           when is_integer(index) and index >= 0,
+           do: index + 1
+
+      defp apply_projection_snapshot_trim_index(_position), do: 1
 
       defp flush_apply_projection_snapshot_payload(data_dir, shard_index, chunk_entries) do
         case Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(

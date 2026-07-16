@@ -642,9 +642,17 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
                    log_module: :ferricstore_waraft_spike_segment_log
                  )
 
-        payload_ref = "f:{snapshot-apply-projection}:v:p:payload:1"
+        payload_ref =
+          Ferricstore.Flow.Keys.value_key(
+            "snapshot-apply-projection-payload",
+            :payload,
+            1,
+            "snapshot-apply-projection"
+          )
+
         payload = :binary.copy("snapshot-apply-projection-payload", 128)
         encoded_payload = Ferricstore.Flow.encode_value(payload)
+        assert Ferricstore.Flow.Keys.value_key?(payload_ref)
 
         {_log, value_index} =
           append_waraft_fence!("snapshot-apply-projection:fence", "v")
@@ -672,7 +680,46 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
                    ])
                  )
 
+        assert {:ok, ^encoded_payload} =
+                 Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                   source_ctx,
+                   0,
+                   {:waraft_apply_projection, value_index},
+                   payload_ref
+                 )
+
+        assert {:ok, %{^payload_ref => ^encoded_payload}} =
+                 Ferricstore.Raft.WARaftSegmentReader.read_values_from_location(
+                   source_ctx,
+                   0,
+                   {:waraft_apply_projection, value_index},
+                   [payload_ref]
+                 )
+
+        assert {:ok, locator_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, payload_ref)
+
+        assert {:ok, {{:waraft_apply_projection, ^value_index}, ^value_offset, ^value_size}} =
+                 Ferricstore.Flow.LMDB.decode_value_locator(
+                   locator_blob,
+                   System.system_time(:millisecond)
+                 )
+
         :ets.delete(elem(source_ctx.keydir_refs, 0), payload_ref)
+
+        assert {:ok, [{:ok, ^locator_blob}]} =
+                 Ferricstore.Flow.LMDB.get_many(lmdb_path, [payload_ref])
+
+        assert {:ok, ^encoded_payload} =
+                 Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                   source_ctx,
+                   0,
+                   {:waraft_apply_projection, value_index},
+                   payload_ref
+                 )
+
+        assert [^encoded_payload] =
+                 Ferricstore.Flow.ValueStore.raw_mget(source_ctx, [payload_ref])
+
         assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(source_ctx, [payload_ref])
 
         assert {:ok, {:raft_log_pos, index, term} = position} = WARaftBackend.create_snapshot(0)

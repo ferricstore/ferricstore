@@ -119,9 +119,6 @@ defmodule Ferricstore.Commands.Generic do
           fn unified_store ->
             do_copy(source, destination, replace?, unified_store)
           end,
-          intent: %{command: :copy, keys: %{source: source, dest: destination}, value_hashes: %{}},
-          tx_entry:
-            {"COPY", [source, destination | opts], {:copy, source, destination, replace?}},
           store: store
         )
 
@@ -225,8 +222,6 @@ defmodule Ferricstore.Commands.Generic do
       fn unified_store ->
         do_copy(source, destination, replace?, unified_store)
       end,
-      intent: %{command: :copy, keys: %{source: source, dest: destination}, value_hashes: %{}},
-      tx_entry: {"COPY", [source, destination], {:copy, source, destination, replace?}},
       store: store
     )
   end
@@ -298,8 +293,6 @@ defmodule Ferricstore.Commands.Generic do
             end
         end
       end,
-      intent: %{command: :rename, keys: %{source: key, dest: newkey}, value_hashes: %{}},
-      tx_entry: {"RENAME", [key, newkey], {:rename, key, newkey}},
       store: store
     )
   end
@@ -344,8 +337,6 @@ defmodule Ferricstore.Commands.Generic do
             end
         end
       end,
-      intent: %{command: :renamenx, keys: %{source: key, dest: newkey}, value_hashes: %{}},
-      tx_entry: {"RENAMENX", [key, newkey], {:renamenx, key, newkey}},
       store: store
     )
   end
@@ -509,18 +500,18 @@ defmodule Ferricstore.Commands.Generic do
     case object_exists?(store, key) do
       {:ok, true} ->
         case Ops.object_lfu(store, key) do
-        {:error, {:storage_read_failed, _reason}} = failure ->
-          ReadResult.command_error(failure)
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
 
-        packed_lfu when is_integer(packed_lfu) ->
+          packed_lfu when is_integer(packed_lfu) ->
             {ldt, _counter} = Ferricstore.Store.LFU.unpack(packed_lfu)
             now_min = Ferricstore.Store.LFU.now_minutes()
             elapsed = Ferricstore.Store.LFU.elapsed_minutes(now_min, ldt)
             elapsed * 60
 
-        _ ->
-          0
-      end
+          _ ->
+            0
+        end
 
       {:ok, false} ->
         {:error, "ERR no such key"}

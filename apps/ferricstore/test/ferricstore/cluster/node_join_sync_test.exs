@@ -4,7 +4,7 @@ Code.require_file("node_join_sync_test/sections/leader_failover_during_sync.exs"
 defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   @moduledoc """
   Tests that a new node joining the cluster receives a complete, consistent
-  copy of all data — even while writes continue during the sync.
+  WARaft snapshot even while writes continue during replication.
 
   Validates:
     1. Writes continue on the cluster while a new node is syncing
@@ -13,7 +13,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     4. No writes are lost during the sync process
     5. The new node can serve reads for all keys (including those written during sync)
 
-  Requires: multi-node Raft (Phase 1) + ClusterManager + DataSync
+  Requires: multi-node WARaft snapshot replication and ClusterManager.
   """
 
   use ExUnit.Case, async: false

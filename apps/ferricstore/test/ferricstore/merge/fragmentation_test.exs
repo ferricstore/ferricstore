@@ -392,14 +392,12 @@ defmodule Ferricstore.Merge.FragmentationTest do
     @tag :slow
     @tag :skip
     test "promoted instance includes byte tracking fields after promotion" do
-      original_pt =
-        try do
-          :persistent_term.get(:ferricstore_promotion_threshold)
-        rescue
-          ArgumentError -> :not_set
-        end
+      apply_context_snapshot =
+        ShardHelpers.replace_default_apply_context(promotion_threshold: 5)
 
-      :persistent_term.put(:ferricstore_promotion_threshold, 5)
+      on_exit(fn ->
+        ShardHelpers.restore_default_apply_context(apply_context_snapshot)
+      end)
 
       redis_key = "prom_bytes_#{:rand.uniform(10_000_000)}"
       shard_index = Router.shard_for(FerricStore.Instance.get(:default), redis_key)
@@ -444,11 +442,6 @@ defmodule Ferricstore.Merge.FragmentationTest do
         %{path: _path} ->
           # May have legacy format if upgrade path triggered, that's OK
           :ok
-      end
-
-      case original_pt do
-        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
-        val -> :persistent_term.put(:ferricstore_promotion_threshold, val)
       end
     end
   end

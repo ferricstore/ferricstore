@@ -87,8 +87,8 @@ defmodule FerricstoreServer.Health.Endpoint do
   @doc """
   Returns the actual TCP port for the isolated liveness/readiness listener.
 
-  Use this port for orchestrator probes. `port/0` intentionally continues to
-  return the legacy combined dashboard and metrics listener port.
+  Use this port for orchestrator probes. `port/0` returns the primary dashboard
+  and metrics listener port.
   """
   @spec probe_port() :: :inet.port_number()
   def probe_port do
@@ -991,7 +991,29 @@ defmodule FerricstoreServer.Health.Endpoint do
     DashboardHandlers.handle_flow_workers_page(socket, transport, peer, headers)
   end
 
+  defp dispatch_request(
+         socket,
+         transport,
+         "GET",
+         "/dashboard/flow/workers?" <> _query,
+         peer,
+         headers
+       ) do
+    DashboardHandlers.handle_flow_workers_page(socket, transport, peer, headers)
+  end
+
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/due", peer, headers) do
+    DashboardHandlers.handle_flow_due_page(socket, transport, peer, headers)
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "GET",
+         "/dashboard/flow/due?" <> _query,
+         peer,
+         headers
+       ) do
     DashboardHandlers.handle_flow_due_page(socket, transport, peer, headers)
   end
 
@@ -1125,7 +1147,41 @@ defmodule FerricstoreServer.Health.Endpoint do
     end
   end
 
+  defp dispatch_request(
+         socket,
+         transport,
+         "GET",
+         "/dashboard/flow/config?" <> _query,
+         peer,
+         headers
+       ) do
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+
+      true ->
+        send_redirect_response(socket, transport, "/dashboard/config")
+    end
+  end
+
   defp dispatch_request(socket, transport, "GET", "/dashboard/flow/projections", peer, headers) do
+    case Auth.observability_authorized?(peer, headers) do
+      false ->
+        send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
+
+      true ->
+        send_redirect_response(socket, transport, "/dashboard/flow")
+    end
+  end
+
+  defp dispatch_request(
+         socket,
+         transport,
+         "GET",
+         "/dashboard/flow/projections?" <> _query,
+         peer,
+         headers
+       ) do
     case Auth.observability_authorized?(peer, headers) do
       false ->
         send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))

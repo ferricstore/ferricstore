@@ -559,6 +559,14 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
         first_size = File.stat!(first_path).size
         overwrite_segment_payload!(root, 0, first_ref, :binary.copy("x", 400))
 
+        Process.put(:ferricstore_blob_store_ls_hook, fn path ->
+          with {:ok, names} <- Ferricstore.FS.ls(path) do
+            {:ok, Enum.reverse(names)}
+          end
+        end)
+
+        on_exit(fn -> Process.delete(:ferricstore_blob_store_ls_hook) end)
+
         assert {:error, {:corrupt_immutable_blob_segment, ^first_path}} =
                  BlobStore.recover_shard(root, 0)
 

@@ -207,8 +207,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
               _max_history_hot, _max_history, _cleanup_keys, _cleanup_bytes, _history_scan,
               _value_scan, _hibernation_enabled, _hot_window_ms, _safety_margin_ms,
               _promote_window_ms, _late_promote_window_ms, _flow_max_batch_items,
-              _promotion_threshold,
-              _compound_delete_member_budget, _max_value_size} = encoded
+              _promotion_threshold, _compound_delete_member_budget, _max_value_size} = encoded
            ) do
         case Ferricstore.Raft.ApplyContext.decode(encoded) do
           {:ok, context} -> context
@@ -636,7 +635,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       defp write_apply_projection_value_pins(_root_dir, []), do: :ok
 
       defp write_apply_projection_value_pins(root_dir, relocations) do
-        relocations = Enum.reject(relocations, &Map.get(&1, :stale?, false))
+        relocations =
+          Enum.filter(relocations, fn
+            %{stale?: true} ->
+              false
+
+            %{source_file_id: {:waraft_segment, index}} when is_integer(index) and index > 0 ->
+              true
+
+            _other ->
+              false
+          end)
 
         if relocations == [] do
           :ok
@@ -668,6 +677,284 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
             other -> {:error, {:write_apply_projection_value_pins_failed, other}}
           end
         end
+      end
+
+      defp compact_apply_projection_log(root_dir, ctx, shard_index, trim_index) do
+        compact_apply_projection_log(
+          root_dir,
+          ctx,
+          shard_index,
+          trim_index,
+          flow_lmdb_path(ctx, shard_index)
+        )
+      end
+
+      defp compact_apply_projection_log(
+             root_dir,
+             ctx,
+             shard_index,
+             trim_index,
+             retention_lmdb_path
+           ) do
+        with {:ok, retained_batches} <-
+               collect_apply_projection_retention_batches(
+                 ctx,
+                 shard_index,
+                 trim_index,
+                 retention_lmdb_path
+               ) do
+          case :ferricstore_waraft_spike_segment_log.compact_apply_projection(
+                 root_dir
+                 |> apply_projection_root()
+                 |> to_charlist(),
+                 trim_index,
+                 retained_batches
+               ) do
+            :ok -> :ok
+            {:error, reason} -> {:error, {:compact_apply_projection_log_failed, reason}}
+            other -> {:error, {:compact_apply_projection_log_failed, other}}
+          end
+        end
+      rescue
+        error -> {:error, {:compact_apply_projection_log_failed, error}}
+      end
+
+      defp collect_apply_projection_retention_batches(
+             ctx,
+             shard_index,
+             trim_index,
+             retention_lmdb_path
+           ) do
+        with {:ok, keydir_entries} <-
+               collect_apply_projection_keydir_retention(ctx, shard_index, trim_index),
+             {:ok, pin_entries} <-
+               collect_apply_projection_pin_retention(
+                 ctx,
+                 shard_index,
+                 trim_index,
+                 retention_lmdb_path
+               ),
+             {:ok, entries_by_ref} <-
+               merge_apply_projection_retention_entries(keydir_entries, pin_entries) do
+          batches =
+            entries_by_ref
+            |> Enum.group_by(fn {{index, _key}, _entry} -> index end)
+            |> Enum.sort_by(fn {index, _entries} -> index end)
+            |> Enum.map(fn {index, entries} ->
+              retained_entries =
+                entries
+                |> Enum.map(fn {_ref, entry} -> entry end)
+                |> Enum.sort_by(&elem(&1, 0))
+
+              {{:raft_log_pos, index, 0}, retained_entries}
+            end)
+
+          {:ok, batches}
+        end
+      end
+
+      defp collect_apply_projection_keydir_retention(ctx, shard_index, trim_index) do
+        keydir = elem(ctx.keydir_refs, shard_index)
+        now = HLC.now_ms()
+
+        case reduce_keydir_rows_while(keydir, [], fn
+               {key, value, expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
+                _value_size},
+               acc
+               when is_binary(key) and is_integer(index) and index > 0 and index < trim_index ->
+                 if live_expire_at?(expire_at_ms, now) do
+                   case apply_projection_retention_entry(
+                          ctx,
+                          shard_index,
+                          index,
+                          key,
+                          value,
+                          expire_at_ms
+                        ) do
+                     {:ok, entry} -> {:cont, [{{index, key}, entry} | acc]}
+                     {:error, reason} -> {:halt, {:error, reason}}
+                   end
+                 else
+                   {:cont, acc}
+                 end
+
+               _row, acc ->
+                 {:cont, acc}
+             end) do
+          {:ok, entries} -> {:ok, Enum.reverse(entries)}
+          :unavailable -> {:error, {:segment_keydir_unavailable, shard_index}}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp collect_apply_projection_pin_retention(
+             ctx,
+             shard_index,
+             trim_index,
+             lmdb_path
+           ) do
+        do_collect_apply_projection_pin_retention(
+          ctx,
+          shard_index,
+          lmdb_path,
+          trim_index,
+          <<>>,
+          []
+        )
+      end
+
+      defp do_collect_apply_projection_pin_retention(
+             ctx,
+             shard_index,
+             lmdb_path,
+             trim_index,
+             after_key,
+             acc
+           ) do
+        case FlowLMDB.segment_value_pin_entries_before_page(
+               lmdb_path,
+               trim_index,
+               after_key,
+               @segment_value_pin_scan_limit
+             ) do
+          {:ok, pins, next_after_key, done?} ->
+            case collect_apply_projection_pin_retention_page(
+                   ctx,
+                   shard_index,
+                   lmdb_path,
+                   pins,
+                   acc
+                 ) do
+              {:ok, next_acc} when done? ->
+                {:ok, Enum.reverse(next_acc)}
+
+              {:ok, next_acc} ->
+                do_collect_apply_projection_pin_retention(
+                  ctx,
+                  shard_index,
+                  lmdb_path,
+                  trim_index,
+                  next_after_key,
+                  next_acc
+                )
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          {:error, reason} ->
+            {:error, {:collect_apply_projection_pin_retention_failed, reason}}
+        end
+      end
+
+      defp collect_apply_projection_pin_retention_page(
+             ctx,
+             shard_index,
+             lmdb_path,
+             pins,
+             acc
+           ) do
+        Enum.reduce_while(pins, {:ok, acc}, fn
+          %{
+            key: key,
+            expire_at_ms: expire_at_ms,
+            file_id: {:waraft_apply_projection, index} = file_id,
+            offset: offset,
+            value_size: value_size
+          },
+          {:ok, entries}
+          when is_binary(key) and is_integer(index) and index > 0 and is_integer(offset) and
+                 offset >= 0 and is_integer(value_size) and value_size >= 0 ->
+            case current_segment_value_pin_locator(
+                   lmdb_path,
+                   key,
+                   file_id,
+                   offset,
+                   value_size
+                 ) do
+              :current ->
+                case apply_projection_retention_entry(
+                       ctx,
+                       shard_index,
+                       index,
+                       key,
+                       nil,
+                       expire_at_ms
+                     ) do
+                  {:ok, entry} -> {:cont, {:ok, [{{index, key}, entry} | entries]}}
+                  {:error, reason} -> {:halt, {:error, reason}}
+                end
+
+              :changed_or_deleted ->
+                {:cont, {:ok, entries}}
+
+              {:error, reason} ->
+                {:halt, {:error, reason}}
+            end
+
+          %{file_id: {:waraft_segment, _index}} = pin, _entries ->
+            {:halt, {:error, {:unrelocated_segment_value_pin, pin}}}
+
+          _invalid, entries ->
+            {:cont, entries}
+        end)
+      end
+
+      defp apply_projection_retention_entry(
+             _ctx,
+             _shard_index,
+             _index,
+             key,
+             value,
+             expire_at_ms
+           )
+           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms),
+           do: {:ok, {key, value, expire_at_ms}}
+
+      defp apply_projection_retention_entry(
+             ctx,
+             shard_index,
+             index,
+             key,
+             _value,
+             expire_at_ms
+           )
+           when is_binary(key) and is_integer(index) and index > 0 and
+                  is_integer(expire_at_ms) do
+        case WARaftSegmentReader.read_value_from_location_including_expired(
+               ctx,
+               shard_index,
+               {:waraft_apply_projection, index},
+               key
+             ) do
+          {:ok, value} when is_binary(value) ->
+            {:ok, {key, value, expire_at_ms}}
+
+          :not_found ->
+            {:error, {:apply_projection_retention_value_missing, key, index}}
+
+          {:error, reason} ->
+            {:error, {:apply_projection_retention_read_failed, key, index, reason}}
+        end
+      end
+
+      defp merge_apply_projection_retention_entries(left, right) do
+        Enum.reduce_while(left ++ right, {:ok, %{}}, fn
+          {ref, entry}, {:ok, acc} ->
+            case Map.fetch(acc, ref) do
+              :error ->
+                {:cont, {:ok, Map.put(acc, ref, entry)}}
+
+              {:ok, ^entry} ->
+                {:cont, {:ok, acc}}
+
+              {:ok, existing} ->
+                {:halt, {:error, {:conflicting_apply_projection_retention, ref, existing, entry}}}
+            end
+
+          invalid, _acc ->
+            {:halt, {:error, {:bad_apply_projection_retention_entry, invalid}}}
+        end)
       end
 
       defp relocate_segment_projection_keydir(_ctx, _shard_index, _projection_root, []), do: :ok
@@ -787,19 +1074,22 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                  source_offset,
                  source_value_size
                ) do
-          target_file_id = apply_projection_pin_target(source_file_id)
+          case source_file_id do
+            {:waraft_apply_projection, index} when is_integer(index) and index > 0 ->
+              {:ok, []}
 
-          {:ok,
-           [
-             {:put, key,
-              FlowLMDB.encode_value_locator(
-                expire_at_ms,
-                target_file_id,
-                apply_projection_pin_target_offset(source_file_id, source_offset),
-                source_value_size
-              )},
-             {:delete, source_pin_key}
-           ]}
+            {:waraft_segment, index} when is_integer(index) and index > 0 ->
+              target =
+                {key, expire_at_ms, {:waraft_apply_projection, index},
+                 apply_projection_pin_target_offset(source_file_id, source_offset),
+                 source_value_size}
+
+              {:ok,
+               FlowLMDB.segment_value_pin_batch_put_ops([target]) ++ [{:delete, source_pin_key}]}
+
+            _other ->
+              {:error, {:unsupported_segment_value_pin_source, source_file_id}}
+          end
         else
           :changed_or_deleted ->
             {:ok, [{:delete, source_pin_key}]}
@@ -808,14 +1098,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
             error
         end
       end
-
-      defp apply_projection_pin_target({:waraft_segment, index}),
-        do: {:waraft_apply_projection, index}
-
-      defp apply_projection_pin_target({:waraft_apply_projection, index}),
-        do: {:waraft_apply_projection, index}
-
-      defp apply_projection_pin_target(file_id), do: file_id
 
       defp apply_projection_pin_target_offset({:waraft_segment, _index}, _source_offset), do: 0
 

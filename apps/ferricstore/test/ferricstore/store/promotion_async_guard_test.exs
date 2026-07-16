@@ -39,6 +39,22 @@ defmodule Ferricstore.Store.PromotionAsyncGuardTest do
            "committed writes must hand promotion work to the shard after flush"
   end
 
+  test "replicated apply coalesces promotion hints by collection" do
+    source =
+      [@state_machine_path | Path.wildcard(Path.join(@state_machine_sections, "*.ex"))]
+      |> Enum.map_join("\n", &File.read!/1)
+
+    assert source =~ "sm_pending_compound_promotions: %{}",
+           "pending promotion state must hold one entry per collection"
+
+    assert source =~
+             "Map.put(pending, redis_key, {compound_key, threshold})",
+           "later writes to one collection must replace its existing hint"
+
+    refute source =~ "sm_pending_compound_promotions: MapSet.new()",
+           "member-keyed hints can enqueue redundant shard messages for one collection"
+  end
+
   test "shard promotion is monitored worker work backed by the exact member index" do
     promoted_source = File.read!(@promoted_path)
     info_source = File.read!(@shard_info_path)

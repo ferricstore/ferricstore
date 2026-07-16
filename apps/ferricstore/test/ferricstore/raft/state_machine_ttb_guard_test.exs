@@ -35,10 +35,10 @@ defmodule Ferricstore.Raft.StateMachineTTBGuardTest do
              CommandStamp.decode_ttb(:erlang.term_to_binary({:put, "key", "value", 0}))
   end
 
-  test "WARaft blocks replay-position advancement for invalid or unknown commands" do
+  test "WARaft blocks malformed encodings but advances deterministic command errors" do
     source = Ferricstore.Test.SourceFiles.waraft_storage_source()
 
     assert source =~ "storage_apply_failure_reason?(:invalid_preencoded_command)"
-    assert source =~ "storage_apply_failure_reason?({:unknown_command, _command})"
+    refute source =~ "storage_apply_failure_reason?({:unknown_command, _command})"
   end
 end

@@ -25,7 +25,7 @@ defmodule Ferricstore.Test.ClusterHelper do
 
   `start_node/1` starts a standalone peer that is NOT part of any initial
   cluster. It can be added later via `Ferricstore.Cluster.Manager.add_node/2`
-  for testing dynamic membership changes (node join + data sync).
+  for testing dynamic membership changes and WARaft snapshot joins.
 
   ## Usage
 
@@ -549,7 +549,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   Stops the WARaft runtime on a peer node while leaving the FerricStore app up.
 
   Tests use this to model a node whose local consensus runtime is unavailable
-  without reaching into a legacy consensus implementation.
+  without reaching into removed consensus internals.
   """
   @spec stop_consensus(atom()) :: :ok | term()
   def stop_consensus(node_name) do

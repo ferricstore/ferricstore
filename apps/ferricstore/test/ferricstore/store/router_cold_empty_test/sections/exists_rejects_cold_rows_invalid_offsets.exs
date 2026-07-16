@@ -51,16 +51,21 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.ExistsRejectsColdRowsIn
         assert [{^key, nil, 0, ^lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
       end
 
-      test "key enumeration preserves rows whose expiry cannot be classified", %{
+      test "key enumeration fails closed without deleting rows whose expiry is invalid", %{
         ctx: ctx,
         keydir: keydir
       } do
         key = "invalid_expiry_keys:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         before_size = Router.dbsize(ctx)
-        row = {key, nil, -1, LFU.initial(), 0, :pending_offset, 5}
+        assert :ok = Router.put(ctx, key, "value", 0)
+
+        [{^key, value, 0, lfu, file_id, offset, value_size}] = :ets.lookup(keydir, key)
+        row = {key, value, -1, lfu, file_id, offset, value_size}
         :ets.insert(keydir, row)
 
-        assert key in Router.keys(ctx)
+        assert {:error, {:storage_read_failed, {:invalid_keydir_entry, ^key, [^row]}}} =
+                 Router.keys(ctx)
+
         assert before_size + 1 == Router.dbsize(ctx)
         assert [^row] = :ets.lookup(keydir, key)
       end

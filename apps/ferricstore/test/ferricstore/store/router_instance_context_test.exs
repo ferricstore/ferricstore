@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.CrossShardOp
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Promotion
@@ -63,9 +64,90 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
     assert groups >= 2
 
-    assert_receive {:standalone_tx_log, [:ferricstore, :standalone_tx_log, :commit],
-                    %{count: 1}, %{status: :ok}},
+    assert_receive {:standalone_tx_log, [:ferricstore, :standalone_tx_log, :commit], %{count: 1},
+                    %{status: :ok}},
                    1_000
+  end
+
+  test "client death during cross-shard execution does not strand participant barriers", %{
+    ctx: ctx
+  } do
+    {source, destination} = different_shard_keys(ctx)
+    parent = self()
+
+    caller =
+      spawn(fn ->
+        CrossShardOp.execute(
+          [{source, :write}, {destination, :write}],
+          fn store ->
+            send(parent, {:cross_shard_execute_entered, self()})
+
+            receive do
+              :continue_cross_shard_execute ->
+                store.put.(source, "transaction", 0)
+            end
+          end,
+          instance: ctx
+        )
+      end)
+
+    assert_receive {:cross_shard_execute_entered, coordinator_pid}, 1_000
+
+    pending_write =
+      Task.async(fn -> Router.put(ctx, destination, "after-client-exit", 0) end)
+
+    refute Task.yield(pending_write, 50)
+    Process.exit(caller, :kill)
+    send(coordinator_pid, :continue_cross_shard_execute)
+
+    assert {:ok, :ok} = Task.yield(pending_write, 2_000)
+    assert "transaction" == Router.get(ctx, source)
+    assert "after-client-exit" == Router.get(ctx, destination)
+  end
+
+  test "client death during delayed participant acquire still releases the protocol", %{ctx: ctx} do
+    {source, destination} = different_shard_keys(ctx)
+    participant_index = max(Router.shard_for(ctx, source), Router.shard_for(ctx, destination))
+    participant = ctx |> Router.shard_name(participant_index) |> Process.whereis()
+    parent = self()
+
+    :ok = :sys.suspend(participant)
+
+    on_exit(fn ->
+      if Process.alive?(participant) do
+        try do
+          :sys.resume(participant)
+        catch
+          :exit, _reason -> :ok
+        end
+      end
+    end)
+
+    caller =
+      spawn(fn ->
+        CrossShardOp.execute(
+          [{source, :write}, {destination, :write}],
+          fn _store ->
+            send(parent, {:delayed_cross_shard_acquire_entered, self()})
+
+            receive do
+              :continue_delayed_cross_shard_execute -> :ok
+            end
+          end,
+          instance: ctx
+        )
+      end)
+
+    assert :ok = wait_for_barrier_acquire_message(participant, 100)
+    Process.exit(caller, :kill)
+    :ok = :sys.resume(participant)
+
+    assert_receive {:delayed_cross_shard_acquire_entered, coordinator_pid}, 1_000
+    send(coordinator_pid, :continue_delayed_cross_shard_execute)
+
+    pending_write = Task.async(fn -> Router.put(ctx, destination, "after-delayed-acquire", 0) end)
+    assert {:ok, :ok} = Task.yield(pending_write, 2_000)
+    assert "after-delayed-acquire" == Router.get(ctx, destination)
   end
 
   test "cross-shard journal rolls back a coordinator crash between shard fsyncs", %{ctx: ctx} do
@@ -117,6 +199,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
     assert_receive {:EXIT, _pid, :kill}, 1_000
     assert Process.whereis(coordinator_name) == nil
+
     assert :persistent_term.get(
              {Ferricstore.Store.StandaloneTxLog, Path.expand(ctx.data_dir)},
              false
@@ -271,5 +354,25 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
             do: {source, destination}
       end)
     end)
+  end
+
+  defp wait_for_barrier_acquire_message(_pid, 0), do: {:error, :barrier_acquire_not_queued}
+
+  defp wait_for_barrier_acquire_message(pid, attempts_left) do
+    queued? =
+      pid
+      |> Process.info(:messages)
+      |> elem(1)
+      |> Enum.any?(fn
+        {:"$gen_call", _from, {:standalone_cross_shard_barrier_acquire, _owner}} -> true
+        _message -> false
+      end)
+
+    if queued? do
+      :ok
+    else
+      Process.sleep(10)
+      wait_for_barrier_acquire_message(pid, attempts_left - 1)
+    end
   end
 end

@@ -166,11 +166,7 @@ defmodule Ferricstore.Commands.List do
         fn unified_store ->
           checked_lmove(source, destination, unified_store, from_dir, to_dir)
         end,
-        store: store,
-        intent: %{command: :lmove, keys: %{source: source, dest: destination}},
-        tx_entry:
-          {"LMOVE", [source, destination, from_str, to_str],
-           {:lmove, source, destination, from_dir, to_dir}}
+        store: store
       )
     else
       :error -> {:error, "ERR syntax error"}
@@ -315,11 +311,7 @@ defmodule Ferricstore.Commands.List do
       fn unified_store ->
         checked_lmove(source, destination, unified_store, from_dir, to_dir)
       end,
-      store: store,
-      intent: %{command: :lmove, keys: %{source: source, dest: destination}},
-      tx_entry:
-        {"LMOVE", [source, destination, Atom.to_string(from_dir), Atom.to_string(to_dir)],
-         {:lmove, source, destination, from_dir, to_dir}}
+      store: store
     )
   end
 

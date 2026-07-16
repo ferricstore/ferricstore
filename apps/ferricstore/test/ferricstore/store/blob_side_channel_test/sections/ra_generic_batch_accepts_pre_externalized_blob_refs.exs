@@ -610,7 +610,8 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         assert payload == Router.get(ctx, key)
       end
 
-      test "transaction apply preserves successful commands when later blob persistence fails", %{
+      @tag :blob_transaction_atomicity
+      test "transaction apply rolls back all commands when blob persistence fails", %{
         ctx: ctx,
         keydir: keydir
       } do
@@ -636,7 +637,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
 
         try do
           assert_state_machine_result(
-            [:ok, {:error, {:blob_externalize_failed, :eio}}],
+            {:error, {:blob_externalize_failed, :eio}},
             StateMachine.apply(
               %{index: 1, system_time: 1_000},
               {:tx_execute,
@@ -648,13 +649,14 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
             )
           )
 
-          assert [{^small_key, "small", 0, _, _, _, _}] = :ets.lookup(keydir, small_key)
+          assert [] == :ets.lookup(keydir, small_key)
           assert [] == :ets.lookup(keydir, large_key)
         after
           Process.delete(:ferricstore_blob_store_fsync_dir_hook)
         end
       end
 
+      @tag promotion_threshold: 1_000_000
       test "shared compound cold batch reads materialize blob refs", %{
         ctx: ctx,
         keydir: keydir
@@ -664,28 +666,22 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         field_b = CompoundKey.hash_field(redis_key, "b")
         payload_a = :binary.copy("A", 1024)
         payload_b = :binary.copy("B", 1536)
-        previous_threshold = :persistent_term.get(:ferricstore_promotion_threshold)
-        :persistent_term.put(:ferricstore_promotion_threshold, 1_000_000)
 
-        try do
-          assert :ok = Router.compound_put(ctx, redis_key, field_a, payload_a, 0)
-          assert :ok = Router.compound_put(ctx, redis_key, field_b, payload_b, 0)
+        assert :ok = Router.compound_put(ctx, redis_key, field_a, payload_a, 0)
+        assert :ok = Router.compound_put(ctx, redis_key, field_b, payload_b, 0)
 
-          assert {:ok, _encoded_ref_a, ref_a} = raw_disk_blob_ref(ctx, keydir, field_a)
-          assert {:ok, _encoded_ref_b, ref_b} = raw_disk_blob_ref(ctx, keydir, field_b)
-          assert {:ok, ^payload_a} = BlobStore.get(ctx.data_dir, 0, ref_a)
-          assert {:ok, ^payload_b} = BlobStore.get(ctx.data_dir, 0, ref_b)
+        assert {:ok, _encoded_ref_a, ref_a} = raw_disk_blob_ref(ctx, keydir, field_a)
+        assert {:ok, _encoded_ref_b, ref_b} = raw_disk_blob_ref(ctx, keydir, field_b)
+        assert {:ok, ^payload_a} = BlobStore.get(ctx.data_dir, 0, ref_a)
+        assert {:ok, ^payload_b} = BlobStore.get(ctx.data_dir, 0, ref_b)
 
-          assert payload_a == Router.compound_get(ctx, redis_key, field_a)
+        assert payload_a == Router.compound_get(ctx, redis_key, field_a)
 
-          assert [payload_a, payload_b] ==
-                   Router.compound_batch_get(ctx, redis_key, [field_a, field_b])
+        assert [payload_a, payload_b] ==
+                 Router.compound_batch_get(ctx, redis_key, [field_a, field_b])
 
-          assert [{^payload_a, 0}, {^payload_b, 0}] =
-                   Router.compound_batch_get_meta(ctx, redis_key, [field_a, field_b])
-        after
-          :persistent_term.put(:ferricstore_promotion_threshold, previous_threshold)
-        end
+        assert [{^payload_a, 0}, {^payload_b, 0}] =
+                 Router.compound_batch_get_meta(ctx, redis_key, [field_a, field_b])
       end
 
       test "direct native list writes persist large elements as blob refs", %{

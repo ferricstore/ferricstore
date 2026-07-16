@@ -21,16 +21,22 @@ defmodule Ferricstore.Commands.Server.Info do
     "cpu",
     "namespace_config",
     "raft",
-    "bitcask",
     "ferricstore"
   ]
-  @all_sections @default_sections ++ ["keydir_analysis"]
+  @inventory_sections ["bitcask", "keydir_analysis"]
+  @all_sections @default_sections ++ @inventory_sections
 
   defp shard_count(%FerricStore.Instance{shard_count: count})
        when is_integer(count) and count > 0,
        do: count
 
-  defp shard_count(_ctx), do: Application.get_env(:ferricstore, :shard_count, 4)
+  defp shard_count(_ctx) do
+    case Application.get_env(:ferricstore, :shard_count, 0) do
+      0 -> System.schedulers_online()
+      count when is_integer(count) and count > 0 -> count
+      _invalid -> 4
+    end
+  end
 
   def info_string(section, store) when section in ["all", "everything"] do
     @default_sections

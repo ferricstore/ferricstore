@@ -91,8 +91,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
         end
       end
 
-      test "Flow cross-shard terminal many commands resolve parents through WARaft", %{root: root} do
-        ctx = build_ctx(Path.join(root, "flow-cross-terminal-many"), shard_count: 2)
+      test "Flow colocated terminal many commands resolve parents through WARaft", %{root: root} do
+        ctx = build_ctx(Path.join(root, "flow-colocated-terminal-many"), shard_count: 2)
         complete_parent = "router-flow-many-parent-complete-#{System.unique_integer([:positive])}"
         complete_child = "router-flow-many-child-complete-#{System.unique_integer([:positive])}"
         retry_parent = "router-flow-many-parent-retry-#{System.unique_integer([:positive])}"
@@ -106,7 +106,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
           {complete_parent_partition, complete_child_partition} =
-            setup_cross_shard_child_for_many!(
+            setup_colocated_child_for_many!(
               ctx,
               complete_parent,
               complete_child,
@@ -142,7 +142,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
                    "completed"
 
           {retry_parent_partition, retry_child_partition} =
-            setup_cross_shard_child_for_many!(ctx, retry_parent, retry_child, "many-retry",
+            setup_colocated_child_for_many!(ctx, retry_parent, retry_child, "many-retry",
               on_child_failed: :fail_parent
             )
 
@@ -171,7 +171,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
           assert retry_failed.child_groups["many-retry"]["children"][retry_child] == "failed"
 
           {fail_parent_partition, fail_child_partition} =
-            setup_cross_shard_child_for_many!(ctx, fail_parent, fail_child, "many-fail",
+            setup_colocated_child_for_many!(ctx, fail_parent, fail_child, "many-fail",
               on_child_failed: :fail_parent
             )
 
@@ -200,7 +200,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
           assert fail_done.child_groups["many-fail"]["children"][fail_child] == "failed"
 
           {cancel_parent_partition, cancel_child_partition} =
-            setup_cross_shard_child_for_many!(ctx, cancel_parent, cancel_child, "many-cancel",
+            setup_colocated_child_for_many!(ctx, cancel_parent, cancel_child, "many-cancel",
               on_parent_closed: :cancel_children
             )
 

@@ -309,6 +309,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
               )
 
             _reset = CompoundMemberIndex.reset(Map.get(new_state, :compound_member_index_name))
+
             _reset =
               LogicalKeyIndex.reset(
                 Map.get(new_state, :logical_key_index_name),
@@ -571,13 +572,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         if index > 0 do
           file_id = {:waraft_apply_projection, index}
 
-          :ok =
-            WARaftSegmentReader.put_apply_projection(
-              sm_state.instance_ctx.data_dir,
-              sm_state.shard_index,
-              index,
-              apply_projection_entries(batch)
-            )
+          :ok = cache_apply_projection_batch(sm_state, index, batch)
 
           :ok =
             Ferricstore.FaultInjection.maybe_pause(:after_waraft_apply_projection_write, %{
@@ -590,6 +585,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         else
           {:error, {:bad_waraft_projection_position, position}}
         end
+      end
+
+      defp cache_apply_projection_batch(sm_state, index, batch) do
+        WARaftSegmentReader.put_apply_projection(
+          sm_state.instance_ctx.data_dir,
+          sm_state.shard_index,
+          index,
+          apply_projection_entries(batch)
+        )
       end
 
       defp recover_apply_projection_value_locators!(sm_state, root_dir) do
@@ -815,7 +819,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         Enum.flat_map(batch, fn
           {:put, key, value, expire_at_ms}
           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) ->
-            if generated_flow_value_ref?(key), do: [{key, value, expire_at_ms}], else: []
+            [{key, value, expire_at_ms}]
 
           {:put_cold, key, value, expire_at_ms, _lfu}
           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) ->

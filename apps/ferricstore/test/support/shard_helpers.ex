@@ -10,11 +10,93 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
 
   alias Ferricstore.Flow.Governance.LimitCache
+  alias Ferricstore.Raft.{ApplyContext, WARaftBackend}
   alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.Router
 
   @test_max_memory_bytes 1_073_741_824
   @test_keydir_max_ram 64 * 1024 * 1024
+  @default_waraft_context_key {{WARaftBackend, :context}, :ferricstore_waraft_backend}
+
+  @doc """
+  Replaces and replicates the immutable apply context for the default test instance.
+
+  Returns an opaque snapshot for `restore_default_apply_context/1`.
+  """
+  @spec replace_default_apply_context(keyword() | map()) :: map()
+  def replace_default_apply_context(overrides) when is_list(overrides) or is_map(overrides) do
+    wait_shards_alive()
+    instance_key = {FerricStore.Instance, :default}
+    original_instance = FerricStore.Instance.get(:default)
+    original_backend = :persistent_term.get(@default_waraft_context_key)
+
+    apply_context =
+      original_instance.apply_context
+      |> Map.from_struct()
+      |> Map.merge(Map.new(overrides))
+      |> ApplyContext.new()
+
+    updated_instance = %{
+      original_instance
+      | apply_context: apply_context,
+        max_value_size: apply_context.max_value_size
+    }
+
+    updated_backend =
+      original_backend
+      |> Map.put(:apply_context, apply_context)
+      |> Map.put(:max_value_size, apply_context.max_value_size)
+
+    :persistent_term.put(instance_key, updated_instance)
+    :persistent_term.put(@default_waraft_context_key, updated_backend)
+
+    case rollout_default_apply_context(updated_instance, apply_context) do
+      :ok ->
+        %{
+          instance_key: instance_key,
+          original_instance: original_instance,
+          original_backend: original_backend
+        }
+
+      {:error, reason} ->
+        :persistent_term.put(instance_key, original_instance)
+        :persistent_term.put(@default_waraft_context_key, original_backend)
+        _ = rollout_default_apply_context(original_instance, original_instance.apply_context)
+        raise "failed to replicate test apply context: #{inspect(reason)}"
+    end
+  end
+
+  @doc """
+  Restores a snapshot returned by `replace_default_apply_context/1`.
+  """
+  @spec restore_default_apply_context(map()) :: :ok
+  def restore_default_apply_context(%{
+        instance_key: instance_key,
+        original_instance: original_instance,
+        original_backend: original_backend
+      }) do
+    wait_shards_alive()
+    :persistent_term.put(instance_key, original_instance)
+    :persistent_term.put(@default_waraft_context_key, original_backend)
+
+    case rollout_default_apply_context(original_instance, original_instance.apply_context) do
+      :ok -> :ok
+      {:error, reason} -> raise "failed to restore test apply context: #{inspect(reason)}"
+    end
+  end
+
+  defp rollout_default_apply_context(instance, apply_context) do
+    ApplyContext.rollout(apply_context, instance.shard_count, fn shard_index, command ->
+      shard_index
+      |> WARaftBackend.apply_context_control_redirected(command, 0)
+      |> normalize_apply_context_rollout_result()
+    end)
+  end
+
+  defp normalize_apply_context_rollout_result({:waraft_applied_at, _position, {:ok, encoded}}),
+    do: {:ok, encoded}
+
+  defp normalize_apply_context_rollout_result(result), do: result
 
   @doc """
   Synchronously flushes all pending async writes on all application-supervised
@@ -141,14 +223,14 @@ defmodule Ferricstore.Test.ShardHelpers do
       delete_keys_on_shard(i, keys)
     end)
 
-    # Clear cross-shard locks and intents through WARaft so tests start clean.
+    # Clear fetch-or-compute ownership locks through WARaft so tests start clean.
     Enum.each(0..(shard_count - 1), fn i ->
-      case clear_locks_strict(i) do
+      case clear_key_locks_strict(i) do
         :ok ->
           :ok
 
         {:error, reason} ->
-          raise "Shard #{i} clear_locks failed during cleanup: #{inspect(reason)}"
+          raise "Shard #{i} clear_key_locks failed during cleanup: #{inspect(reason)}"
       end
     end)
 
@@ -271,8 +353,8 @@ defmodule Ferricstore.Test.ShardHelpers do
     end
   end
 
-  defp clear_locks_strict(shard_index) do
-    case Ferricstore.Raft.Backend.write(shard_index, {:clear_locks}) do
+  defp clear_key_locks_strict(shard_index) do
+    case Ferricstore.Raft.Backend.write(shard_index, {:clear_key_locks}) do
       :ok -> :ok
       {:ok, :ok} -> :ok
       {:ok, {:applied_at, _index, :ok}} -> :ok
@@ -294,7 +376,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   defp wait_waraft_shard_ready(shard_index, deadline) do
     result =
       try do
-        Ferricstore.Raft.Backend.write(shard_index, {:clear_locks})
+        Ferricstore.Raft.Backend.write(shard_index, {:clear_key_locks})
       catch
         :exit, reason -> {:error, reason}
       end
@@ -430,14 +512,27 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   defp ensure_default_waraft_started do
-    try do
-      ctx = FerricStore.Instance.get(:default)
-      Ferricstore.Raft.WARaftBackend.start(ctx)
-    rescue
-      _ -> :ok
-    catch
-      _, _ -> :ok
+    ctx = FerricStore.Instance.get(:default)
+
+    if default_waraft_backend_active?(ctx) do
+      :ok
+    else
+      case WARaftBackend.start(ctx) do
+        :ok -> :ok
+        {:error, reason} -> raise "failed to start default WARaft backend: #{inspect(reason)}"
+      end
     end
+  end
+
+  defp default_waraft_backend_active?(ctx) do
+    active_ctx = WARaftBackend.context!(:ferricstore_waraft_backend)
+    supervisor = :wa_raft_sup.default_name(:ferricstore_waraft_backend)
+    identity_fields = [:name, :data_dir_expanded, :shard_count, :keydir_refs]
+
+    is_pid(Process.whereis(supervisor)) and
+      Map.take(active_ctx, identity_fields) == Map.take(ctx, identity_fields)
+  catch
+    :error, :badarg -> false
   end
 
   @doc """

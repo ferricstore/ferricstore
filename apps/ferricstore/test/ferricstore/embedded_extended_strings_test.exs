@@ -452,6 +452,16 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert {:ok, "existing"} = FerricStore.get("mnx:{existing}:c")
       assert {:ok, nil} = FerricStore.get("mnx:{existing}:d")
     end
+
+    test "rejects keys that belong to independent Raft groups" do
+      [first, second] = Ferricstore.Test.ShardHelpers.keys_on_different_shards(2)
+
+      assert {:error, "CROSSSLOT Keys in request don't hash to the same slot"} =
+               FerricStore.msetnx(%{first => "one", second => "two"})
+
+      assert {:ok, nil} = FerricStore.get(first)
+      assert {:ok, nil} = FerricStore.get(second)
+    end
   end
 
   # ===========================================================================

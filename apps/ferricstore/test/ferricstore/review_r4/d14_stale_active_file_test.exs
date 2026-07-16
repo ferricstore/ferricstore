@@ -112,14 +112,11 @@ defmodule Ferricstore.ReviewR4.D14StaleActiveFileTest do
       # :incr, :incr_float, :append, :getset, :getdel, :getex,
       # :setrange, :cas, :lock, :unlock, :extend,
       # :ratelimit_add (5-arg), :ratelimit_add (6-arg),
-      # :lock_keys, :unlock_keys, :cross_shard_intent,
-      # :delete_intent, :get_intents, :get_lock_count,
-      # :clear_locks, :locked_put, :locked_delete,
-      # :locked_delete_prefix, HLC-wrapped commands.
+      # fetch-or-compute ownership commands, HLC-wrapped commands.
       #
       # NONE of these update state.active_file_id or state.active_file_path.
-      # The only state mutation is on applied_count, cross_shard_locks,
-      # and cross_shard_intents.
+      # Control commands only mutate their owned state such as applied_count
+      # and fetch_or_compute_locks.
 
       assert true, "No :rotate_file or :update_active_file command exists"
     end

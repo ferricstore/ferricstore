@@ -449,8 +449,8 @@ defmodule Ferricstore.Store.CompoundKey do
   For type metadata keys like `T:myset`, returns `"myset"`.
   For plain (non-compound) keys, returns the key as-is.
 
-  Used by the cross-shard lock checking logic to determine which Redis key
-  a compound Raft write affects.
+  Used by fetch-or-compute ownership fencing to determine which Redis key a
+  compound Raft write affects.
 
   ## Examples
 

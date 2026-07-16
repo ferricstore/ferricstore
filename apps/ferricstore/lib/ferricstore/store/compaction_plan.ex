@@ -405,6 +405,8 @@ defmodule Ferricstore.Store.CompactionPlan do
           true ->
             {:halt, {:error, {:invalid_lmdb_value, current}}}
         end
+      else
+        {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
     |> case do

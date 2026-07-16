@@ -262,6 +262,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRec
 
       @tag :cluster
       @tag :shard_kill
+      @tag :persisted_peer_recovery
       test "three peer backend cluster rejects writes without quorum after two OS kills and recovers" do
         unless Ferricstore.Test.ClusterHelper.peer_available?() do
           flunk(":peer is required for WARaft backend cluster test")
@@ -333,6 +334,17 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRec
         end)
 
         start_peer_runtime_apps!(restarted_first.name)
+
+        # A fresh VM must receive the trusted static membership before storage
+        # decodes persisted peer atoms. Offline peers cannot be learned through
+        # distribution, and persisted metadata must not intern arbitrary names.
+        assert :ok =
+                 :rpc.call(restarted_first.name, Application, :put_env, [
+                   :ferricstore,
+                   :cluster_nodes,
+                   names
+                 ])
+
         :rpc.call(restarted_first.name, Node, :connect, [leader])
         :rpc.call(leader, Node, :connect, [restarted_first.name])
 
@@ -361,6 +373,13 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRec
         end)
 
         start_peer_runtime_apps!(restarted_second.name)
+
+        assert :ok =
+                 :rpc.call(restarted_second.name, Application, :put_env, [
+                   :ferricstore,
+                   :cluster_nodes,
+                   names
+                 ])
 
         for live <- quorum_names do
           :rpc.call(restarted_second.name, Node, :connect, [live])

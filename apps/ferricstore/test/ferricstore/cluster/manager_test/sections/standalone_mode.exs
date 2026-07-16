@@ -6,6 +6,25 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
       alias Ferricstore.Cluster.Manager
 
       describe "standalone mode" do
+        test "init resolves automatic shard count to the published runtime value" do
+          previous_shard_count = Application.get_env(:ferricstore, :shard_count)
+          Application.put_env(:ferricstore, :shard_count, 0)
+
+          on_exit(fn ->
+            case previous_shard_count do
+              nil -> Application.delete_env(:ferricstore, :shard_count)
+              count -> Application.put_env(:ferricstore, :shard_count, count)
+            end
+          end)
+
+          expected =
+            :persistent_term.get(:ferricstore_shard_count, System.schedulers_online())
+
+          assert {:ok, state} = Manager.init([])
+          assert state.shard_count == expected
+          assert state.shard_count > 0
+        end
+
         test "mode/0 returns :standalone when no cluster_nodes configured" do
           assert Manager.mode() == :standalone
         end
@@ -43,6 +62,51 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
           assert is_map(status.shards)
         end
 
+        test "node_status probes shards concurrently" do
+          parent = self()
+
+          Process.put(:ferricstore_cluster_manager_node_status_members_hook, fn shard_idx,
+                                                                                _timeout ->
+            send(parent, {:membership_probe, shard_idx})
+            Process.sleep(80)
+            {:ok, [{:member, shard_idx}], {:leader, shard_idx}}
+          end)
+
+          on_exit(fn ->
+            Process.delete(:ferricstore_cluster_manager_node_status_members_hook)
+          end)
+
+          state = %{
+            mode: :cluster,
+            role: :voter,
+            cluster_nodes: [],
+            remove_delay_ms: 60_000,
+            known_nodes: MapSet.new(),
+            remove_timers: %{},
+            sync_status: :synced,
+            shard_sync_status: %{},
+            shard_count: 4
+          }
+
+          started_at = System.monotonic_time(:millisecond)
+
+          assert {:reply, status, ^state} =
+                   Manager.handle_call(
+                     {:node_status, 1_000},
+                     {self(), make_ref()},
+                     state
+                   )
+
+          elapsed_ms = System.monotonic_time(:millisecond) - started_at
+
+          assert elapsed_ms < 220
+          assert status.shards[3] == %{members: [{:member, 3}], leader: {:leader, 3}}
+
+          for shard_idx <- 0..3 do
+            assert_received {:membership_probe, ^shard_idx}
+          end
+        end
+
         test "node_status/0 shard entries contain members and leader" do
           status = Manager.node_status()
 
@@ -75,17 +139,38 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
           assert Manager.add_node(node(), :voter, replace: true) == :ok
         end
 
-        test "failed remote join does not poison known_nodes for retry" do
-          target = :"missing_join_target@127.0.0.1"
-
+        test "add_node rejects unsupported roles without crashing the manager" do
           state = %{
-            mode: :cluster,
+            mode: :standalone,
             role: :voter,
             cluster_nodes: [],
             remove_delay_ms: 60_000,
             known_nodes: MapSet.new(),
             remove_timers: %{},
-            sync_status: :synced,
+            sync_status: :not_started,
+            shard_sync_status: %{},
+            shard_count: 1
+          }
+
+          assert {:reply, {:error, {:invalid_cluster_role, :observer}}, ^state} =
+                   Manager.handle_call(
+                     {:add_node, :"candidate@127.0.0.1", :observer, []},
+                     {self(), make_ref()},
+                     state
+                   )
+        end
+
+        test "failed remote join does not poison known_nodes for retry" do
+          target = :"missing_join_target@127.0.0.1"
+
+          state = %{
+            mode: :standalone,
+            role: :voter,
+            cluster_nodes: [],
+            remove_delay_ms: 60_000,
+            known_nodes: MapSet.new(),
+            remove_timers: %{},
+            sync_status: :not_started,
             shard_sync_status: %{},
             shard_count: 1
           }
@@ -112,20 +197,15 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
             {:ok, %{0 => false}}
           end)
 
-          Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-            send(parent, :legacy_direct_sync_called)
-            {:error, :legacy_direct_sync_called}
-          end)
-
           Process.put(:ferricstore_cluster_manager_stop_raft_on_target_hook, fn ^target, 1 ->
-            send(parent, :legacy_stop_raft_called)
+            send(parent, :target_raft_stop_called)
             :ok
           end)
 
           Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target,
                                                                                  1,
                                                                                  _idx ->
-            send(parent, :legacy_start_raft_called)
+            send(parent, :target_raft_start_called)
             :ok
           end)
 
@@ -149,7 +229,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
           on_exit(fn ->
             Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
             Process.delete(:ferricstore_cluster_manager_target_membership_hook)
-            Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
             Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
             Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
             Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
@@ -158,13 +237,13 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
           end)
 
           state = %{
-            mode: :cluster,
+            mode: :standalone,
             role: :voter,
             cluster_nodes: [],
             remove_delay_ms: 60_000,
             known_nodes: MapSet.new(),
             remove_timers: %{},
-            sync_status: :synced,
+            sync_status: :not_started,
             shard_sync_status: %{},
             shard_count: 1
           }
@@ -179,10 +258,11 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
           assert_receive :backend_add_called
           assert_receive :backend_barrier_called
           assert_receive :marker_written
-          refute_received :legacy_direct_sync_called
-          refute_received :legacy_stop_raft_called
-          refute_received :legacy_start_raft_called
+          refute_received :target_raft_stop_called
+          refute_received :target_raft_start_called
           assert MapSet.member?(new_state.known_nodes, target)
+          assert new_state.mode == :cluster
+          assert new_state.sync_status == :synced
         end
 
         test "WARaft partial add rolls back only shards added by this failed attempt" do
@@ -246,35 +326,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
           refute MapSet.member?(new_state.known_nodes, target)
         end
 
-        test "direct sync index extraction fails closed for wal-bridgeable unreadable target" do
-          target = :"missing_index_target@127.0.0.1"
-
-          assert {:error, {:target_index_read_failed, ^target, :context, _reason}} =
-                   Manager.__extract_direct_sync_indices_for_test__(target, %{
-                     0 => {:synced, :wal_bridgeable}
-                   })
-        end
-
-        test "direct sync index extraction rejects unknown sync details instead of using zero" do
-          target = :"unknown_sync_detail_target@127.0.0.1"
-
-          assert {:error,
-                  {:target_index_read_failed, ^target, 0, {:unknown_sync_detail, :unknown_detail}}} =
-                   Manager.__extract_direct_sync_indices_for_test__(target, %{
-                     0 => {:synced, :unknown_detail}
-                   })
-        end
-
-        test "direct sync index extraction accepts explicit raft indices" do
-          target = :"explicit_index_target@127.0.0.1"
-
-          assert {:ok, %{0 => 12, 1 => 13}} =
-                   Manager.__extract_direct_sync_indices_for_test__(target, %{
-                     0 => {:synced, 12},
-                     1 => {:synced, 13}
-                   })
-        end
-
         test "target data probe treats blob side-channel files as existing shard data" do
           root =
             Path.join(
@@ -316,7 +367,7 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
 
           File.write!(Path.join([root, "blob", "shard_0", "aa", "payload.blob"]), "blob")
           File.write!(Path.join([root, "prob", "shard_0", "filter:abc", "00000.log"]), "prob")
-          File.write!(Path.join([root, "ra", "server", "state"]), "legacy-ra")
+          File.write!(Path.join([root, "ra", "server", "state"]), "stale-ra")
 
           File.write!(
             Path.join([root, "waraft", "ferricstore_waraft_backend.1", "state"]),
@@ -342,17 +393,56 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
           refute File.exists?(Ferricstore.ReplicationMode.marker_path(root) <> ".tmp")
         end
 
-        test "unknown target data state aborts join before identity bypass or sync" do
+        test "target cleanup rejects intermediate symlinks without deleting outside data" do
+          root =
+            Path.join(
+              System.tmp_dir!(),
+              "cluster_manager_symlink_cleanup_#{System.unique_integer([:positive])}"
+            )
+
+          outside = root <> "_outside"
+          sentinel = Path.join([outside, "shard_0", "sentinel"])
+
+          on_exit(fn ->
+            File.rm_rf!(root)
+            File.rm_rf!(outside)
+          end)
+
+          File.mkdir_p!(Path.dirname(sentinel))
+          File.write!(sentinel, "keep")
+          File.mkdir_p!(root)
+          File.ln_s!(outside, Path.join(root, "data"))
+
+          assert {:error, {:target_cleanup_failed, unsafe_path, _reason}} =
+                   Manager.__cleanup_target_data_dir_for_test__(node(), root, 1)
+
+          assert unsafe_path == Ferricstore.DataDir.shard_data_path(root, 0)
+          assert File.read!(sentinel) == "keep"
+        end
+
+        test "target cleanup fails when the replication marker cannot be removed" do
+          root =
+            Path.join(
+              System.tmp_dir!(),
+              "cluster_manager_marker_cleanup_#{System.unique_integer([:positive])}"
+            )
+
+          marker_path = Ferricstore.ReplicationMode.marker_path(root)
+
+          on_exit(fn -> File.rm_rf!(root) end)
+
+          File.mkdir_p!(marker_path)
+
+          assert {:error, {:target_cleanup_failed, ^marker_path, _reason}} =
+                   Manager.__cleanup_target_data_dir_for_test__(node(), root, 1)
+        end
+
+        test "unknown target data state aborts join before identity or snapshot mutation" do
           target = :"unknown_target_data@127.0.0.1"
           parent = self()
 
           Process.put(:ferricstore_cluster_manager_target_has_data_hook, fn ^target, 1 ->
             {:error, {:target_data_probe_failed, target, :simulated_eacces}}
-          end)
-
-          Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-            send(parent, :direct_sync)
-            {:ok, %{0 => 1}}
           end)
 
           Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
@@ -367,7 +457,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
 
           on_exit(fn ->
             Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
-            Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
             Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
             Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
           end)
@@ -392,7 +481,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
                      state
                    )
 
-          refute_received :direct_sync
           refute_received :raft_add
           refute_received :target_raft_stop
           refute MapSet.member?(new_state.known_nodes, target)
@@ -417,16 +505,10 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
             :ok
           end)
 
-          Process.put(:ferricstore_cluster_manager_read_target_indices_hook, fn ^target, 1 ->
-            send(parent, :target_indices_read)
-            {:ok, %{0 => 7}}
-          end)
-
           on_exit(fn ->
             Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
             Process.delete(:ferricstore_cluster_manager_read_target_cluster_state_hook)
             Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
-            Process.delete(:ferricstore_cluster_manager_read_target_indices_hook)
           end)
 
           state = %{
@@ -452,7 +534,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
                    )
 
           refute_received :target_raft_stop
-          refute_received :target_indices_read
           refute MapSet.member?(new_state.known_nodes, target)
         end
 
@@ -475,16 +556,10 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
             :ok
           end)
 
-          Process.put(:ferricstore_cluster_manager_read_target_indices_hook, fn ^target, 1 ->
-            send(parent, :target_indices_read)
-            {:ok, %{0 => 7}}
-          end)
-
           on_exit(fn ->
             Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
             Process.delete(:ferricstore_cluster_manager_read_target_cluster_state_hook)
             Process.delete(:ferricstore_cluster_manager_stop_raft_on_target_hook)
-            Process.delete(:ferricstore_cluster_manager_read_target_indices_hook)
           end)
 
           state = %{
@@ -509,7 +584,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
                    )
 
           refute_received :target_raft_stop
-          refute_received :target_indices_read
           refute MapSet.member?(new_state.known_nodes, target)
         end
 
@@ -677,11 +751,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
             {:ok, false}
           end)
 
-          Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-            send(parent, :direct_sync)
-            {:ok, %{0 => 7}}
-          end)
-
           Process.put(:ferricstore_cluster_manager_start_raft_on_target_hook, fn ^target,
                                                                                  1,
                                                                                  %{0 => 7} ->
@@ -720,7 +789,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
 
           on_exit(fn ->
             Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
-            Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
             Process.delete(:ferricstore_cluster_manager_start_raft_on_target_hook)
             Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
             Process.delete(:ferricstore_cluster_manager_write_target_marker_hook)
@@ -751,7 +819,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
                      state
                    )
 
-          refute_received :direct_sync
           refute_received :raft_add
           refute_received :target_raft_stop
           refute_received :target_data_cleanup

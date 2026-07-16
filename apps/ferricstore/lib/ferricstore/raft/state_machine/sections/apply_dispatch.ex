@@ -110,7 +110,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
           result =
-            case check_key_lock(state, redis_key, nil) do
+            case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
                 with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
 
@@ -340,7 +340,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
           result =
-            case check_key_lock(state, redis_key, nil) do
+            case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
                 with_pending_writes(state, fn -> do_set(state, key, value, expire_at_ms, opts) end)
 
@@ -365,7 +365,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
           result =
-            case check_key_lock(state, redis_key, nil) do
+            case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
                 with_pending_writes(state, fn -> do_delete(state, key) end)
 
@@ -393,7 +393,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                    expected_expire_at_ms > 0 and expected_expire_at_ms <= now_ms ->
               redis_key = CompoundKey.extract_redis_key(key)
 
-              case {:ets.lookup(state.ets, key), check_key_lock(state, redis_key, nil)} do
+              case {:ets.lookup(state.ets, key),
+                    check_fetch_or_compute_lock(state, redis_key, nil)} do
                 {[{^key, _value, ^expected_expire_at_ms, _lfu, _file_id, _offset, _value_size}],
                  :ok} ->
                   MapSet.put(acc, key)
@@ -550,9 +551,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       defp abort_flush_shard_transactions(state) do
         state
-        |> Map.put(:cross_shard_locks, %{})
-        |> Map.put(:cross_shard_intents, %{})
-        |> Map.put(:cross_shard_lock_expiries, {0, nil})
+        |> Map.put(:fetch_or_compute_locks, %{})
+        |> Map.put(:fetch_or_compute_lock_expiries, {0, nil})
       end
 
       defp apply_flush_shard_pages(_state, :"$end_of_table", deleted), do: {:ok, deleted}
@@ -750,7 +750,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           when is_binary(redis_key) and type in [:hash, :list, :set, :zset, :stream] do
         with_apply_time(meta, fn ->
           result =
-            case check_key_lock(state, redis_key, nil) do
+            case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
                 with_pending_writes(state, fn ->
                   TypeRegistry.serialized_claim_status(
@@ -775,7 +775,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
           result =
-            case check_key_lock(state, redis_key, nil) do
+            case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
                 with_pending_writes(state, fn ->
                   do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
@@ -830,7 +830,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
           result =
-            case check_key_lock(state, redis_key, nil) do
+            case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
                 with_pending_writes(state, fn ->
                   do_compound_delete(state, redis_key, compound_key)
@@ -865,7 +865,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
 
           result =
-            case check_key_lock(state, redis_key, nil) do
+            case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
                 with_pending_writes(state, fn ->
                   do_compound_delete_prefix(state, redis_key, prefix)
@@ -1006,26 +1006,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       end
 
       # ---------------------------------------------------------------------------
-      # Cross-shard operation commands (mini-percolator)
-      #
-      # These commands support the CrossShardOp protocol: per-key locking through
-      # Raft consensus, intent records for crash recovery, and locked writes.
+      # Fetch-or-compute ownership fencing
       # ---------------------------------------------------------------------------
-
-      def apply(meta, {:lock_keys, keys, owner_ref, expire_at_ms}, state) do
-        with_apply_time(meta, fn ->
-          {new_state, result} = do_lock_keys(state, keys, owner_ref, expire_at_ms)
-          old_count = state.applied_count
-          new_state = %{new_state | applied_count: old_count + 1}
-          maybe_release_cursor(meta, old_count, new_state, result)
-        end)
-      end
-
-      def apply(meta, {:renew_key_locks, keys, owner_ref, expire_at_ms}, state) do
-        apply_control_with_time(meta, state, fn ->
-          do_renew_key_locks(state, keys, owner_ref, expire_at_ms)
-        end)
-      end
 
       def apply(
             meta,
@@ -1117,108 +1099,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
-      def apply(meta, {:unlock_keys, keys, owner_ref}, state) do
-        apply_control_with_time(meta, state, fn -> do_unlock_keys(state, keys, owner_ref) end)
-      end
-
-      def apply(meta, {:unlock_keys_owned, keys, owner_ref}, state) do
+      def apply(meta, {:fetch_or_compute_release, key, owner_ref}, state)
+          when is_binary(key) and is_binary(owner_ref) and byte_size(owner_ref) <= 512 do
         apply_control_with_time(meta, state, fn ->
-          do_unlock_keys_owned(state, keys, owner_ref)
+          do_release_fetch_or_compute_locks_owned(state, [key], owner_ref)
         end)
       end
 
-      def apply(meta, {:cross_shard_intent, owner_ref, intent_map}, state) do
+      def apply(meta, {:fetch_or_compute_release, _key, _owner_ref}, state) do
         apply_control_with_time(meta, state, fn ->
-          do_write_intent(state, owner_ref, intent_map)
+          {state, {:error, "ERR invalid fetch_or_compute release command"}}
         end)
       end
 
-      def apply(meta, {:delete_intent, owner_ref}, state) do
-        apply_control_with_time(meta, state, fn -> do_delete_intent(state, owner_ref) end)
-      end
-
-      def apply(meta, {:get_intents}, state) do
-        apply_control_with_time(meta, state, fn -> {state, do_get_intents(state)} end)
-      end
-
-      def apply(meta, {:get_lock_count}, state) do
-        apply_control_with_time(meta, state, fn ->
-          {state, map_size(Map.get(state, :cross_shard_locks, %{}))}
-        end)
-      end
-
-      def apply(meta, {:clear_locks}, state) do
+      def apply(meta, {:clear_key_locks}, state) do
         apply_control_with_time(meta, state, fn ->
           {
             state
-            |> Map.put(:cross_shard_locks, %{})
-            |> Map.put(:cross_shard_lock_expiries, :gb_trees.empty())
-            |> Map.put(:cross_shard_intents, %{}),
+            |> Map.put(:fetch_or_compute_locks, %{})
+            |> Map.put(:fetch_or_compute_lock_expiries, :gb_trees.empty()),
             :ok
           }
-        end)
-      end
-
-      def apply(meta, {:locked_put, key, value, expire_at_ms, owner_ref}, state) do
-        with_apply_time(meta, fn ->
-          redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-
-          result =
-            case check_key_lock(state, redis_key, owner_ref) do
-              :ok ->
-                with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
-
-              {:error, _} = err ->
-                err
-            end
-
-          old_count = state.applied_count
-          new_state = %{state | applied_count: old_count + 1}
-          maybe_release_cursor(meta, old_count, new_state, result)
-        end)
-      end
-
-      def apply(meta, {:locked_put_blob_ref, key, encoded_ref, expire_at_ms, owner_ref}, state) do
-        apply_pending_with_time(meta, state, fn ->
-          do_locked_put_blob_ref(state, key, encoded_ref, expire_at_ms, owner_ref)
-        end)
-      end
-
-      def apply(meta, {:locked_delete, key, owner_ref}, state) do
-        with_apply_time(meta, fn ->
-          redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
-
-          result =
-            case check_key_lock(state, redis_key, owner_ref) do
-              :ok ->
-                with_pending_writes(state, fn -> do_delete(state, key) end)
-
-              {:error, _} = err ->
-                err
-            end
-
-          old_count = state.applied_count
-          new_state = %{state | applied_count: old_count + 1}
-          maybe_release_cursor(meta, old_count, new_state, result)
-        end)
-      end
-
-      def apply(meta, {:locked_delete_prefix, prefix, owner_ref}, state) do
-        with_apply_time(meta, fn ->
-          redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
-
-          result =
-            case check_key_lock(state, redis_key, owner_ref) do
-              :ok ->
-                with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
-
-              {:error, _} = err ->
-                err
-            end
-
-          old_count = state.applied_count
-          new_state = %{state | applied_count: old_count + 1}
-          maybe_release_cursor(meta, old_count, new_state, result)
         end)
       end
 

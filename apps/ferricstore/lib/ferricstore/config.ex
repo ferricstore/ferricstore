@@ -97,9 +97,9 @@ defmodule Ferricstore.Config do
                              "noeviction"
                            ])
 
-  # Legacy read-write parameters that are stored but do not have special
-  # validation or side-effects beyond updating the config map.
-  @legacy_rw_defaults %{
+  # Redis-compatible parameters retained for CONFIG round trips. Parameters
+  # without a dedicated side effect are stored in the runtime config map.
+  @redis_compatible_defaults %{
     "timeout" => "0",
     "tcp-keepalive" => "300",
     "databases" => "1",
@@ -348,7 +348,7 @@ defmodule Ferricstore.Config do
             {:reply, {:error, reason}, state}
         end
 
-      Map.has_key?(@legacy_rw_defaults, key) ->
+      Map.has_key?(@redis_compatible_defaults, key) ->
         publish_config_change(key, value, state)
 
       true ->
@@ -597,7 +597,7 @@ defmodule Ferricstore.Config do
         Integer.to_string(Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536))
     }
 
-    Map.merge(@legacy_rw_defaults, Map.merge(read_only, read_write))
+    Map.merge(@redis_compatible_defaults, Map.merge(read_only, read_write))
   end
 
   defp refresh_read_only(state) do

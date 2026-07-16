@@ -232,7 +232,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
           config: nil
         }
 
-        assert {:error, {:decode_snapshot_metadata, %ArgumentError{}}} =
+        assert {:error, {:decode_snapshot_metadata, :invalid_external_term}} =
                  Ferricstore.Raft.WARaftStorage.open_snapshot(
                    snapshot_path,
                    {:raft_log_pos, 10, 1},

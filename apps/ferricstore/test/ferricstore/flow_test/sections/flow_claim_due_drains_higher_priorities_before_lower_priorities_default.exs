@@ -745,10 +745,11 @@ defmodule Ferricstore.FlowTest.Sections.FlowClaimDueDrainsHigherPrioritiesBefore
         assert retry_fields["retry_exhausted_to"] == "failed"
       end
 
-      test "flow_retry terminal exhaustion updates cross-shard parent child group" do
+      test "flow_retry terminal exhaustion updates colocated parent child group" do
         parent = uid("flow-retry-parent-cross")
         child = uid("flow-retry-child-cross")
-        {partition, _same_partition, other_partition} = mixed_partition_keys()
+        {partition, _same_partition, _other_partition} = mixed_partition_keys()
+        child_partition = partition
 
         assert {:ok, created_parent} =
                  flow_create_and_get(parent,
@@ -760,7 +761,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowClaimDueDrainsHigherPrioritiesBefore
         assert {:ok, waiting} =
                  flow_spawn_children_and_get(
                    parent,
-                   [%{id: child, type: "child", partition_key: other_partition}],
+                   [%{id: child, type: "child", partition_key: child_partition}],
                    group_id: "retry-fanout",
                    wait: :all,
                    wait_state: "waiting_children",
@@ -773,11 +774,11 @@ defmodule Ferricstore.FlowTest.Sections.FlowClaimDueDrainsHigherPrioritiesBefore
                  )
 
         assert waiting.state == "waiting_children"
-        claimed = create_claimed_flow_child(child, other_partition, "worker-retry-cross")
+        claimed = create_claimed_flow_child(child, child_partition, "worker-retry-cross")
 
         assert {:ok, exhausted_child} =
                  flow_retry_and_get(child, claimed.lease_token,
-                   partition_key: other_partition,
+                   partition_key: child_partition,
                    fencing_token: claimed.fencing_token,
                    now_ms: 2_000,
                    retry: [max_retries: 0, exhausted_to: "failed"]

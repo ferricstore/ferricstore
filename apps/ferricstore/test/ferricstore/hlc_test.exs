@@ -129,11 +129,34 @@ defmodule Ferricstore.HLCTest do
 
     test "ignores remote timestamps that do not fit the packed clock" do
       assert :ok = HLC.update({Bitwise.bsl(1, 48), 0})
-      assert :ok = HLC.update({System.os_time(:millisecond), Bitwise.bsl(1, 16)})
 
       {physical, logical} = HLC.now()
       assert physical < Bitwise.bsl(1, 48)
       assert logical < Bitwise.bsl(1, 16)
+    end
+
+    test "ignores logical counters that exceed the remaining packed range" do
+      ref = :persistent_term.get(:ferricstore_hlc_ref)
+      :atomics.put(ref, 1, 0)
+
+      assert :ok = HLC.update({0, Bitwise.bsl(1, 64)})
+      assert :atomics.get(ref, 1) == 0
+    end
+
+    test "normalizes remote logical overflow into the physical component" do
+      remote_physical = System.os_time(:millisecond) + 50
+      remote_timestamp = {remote_physical, Bitwise.bsl(1, 16)}
+
+      assert :ok = HLC.update(remote_timestamp)
+
+      timestamp = HLC.now()
+      assert HLC.compare(timestamp, remote_timestamp) == :gt
+      assert elem(timestamp, 0) > remote_physical
+      assert elem(timestamp, 1) < Bitwise.bsl(1, 16)
+    end
+
+    test "preserves causal ordering when normalized remote time ties the wall clock" do
+      assert_normalized_remote_wall_tie(20)
     end
 
     test "with a future remote timestamp advances the local clock" do
@@ -178,6 +201,27 @@ defmodule Ferricstore.HLCTest do
       if new_phys == local_phys do
         assert new_log > 999
       end
+    end
+  end
+
+  defp assert_normalized_remote_wall_tie(0) do
+    flunk("wall clock advanced during every normalized remote timestamp attempt")
+  end
+
+  defp assert_normalized_remote_wall_tie(attempts) do
+    ref = :persistent_term.get(:ferricstore_hlc_ref)
+    :atomics.put(ref, 1, 0)
+
+    wall = System.os_time(:millisecond)
+    assert :ok = HLC.update({wall - 1, Bitwise.bsl(1, 16)})
+    wall_after = System.os_time(:millisecond)
+
+    if wall_after == wall do
+      packed = :atomics.get(ref, 1)
+      assert Bitwise.bsr(packed, 16) == wall
+      assert Bitwise.band(packed, Bitwise.bsl(1, 16) - 1) == 1
+    else
+      assert_normalized_remote_wall_tie(attempts - 1)
     end
   end
 

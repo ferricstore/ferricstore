@@ -141,10 +141,11 @@ defmodule Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionB
                  FerricStore.flow_get(other_flow.id, partition_key: other)
       end
 
-      test "flow_retry_many terminal exhaustion updates cross-shard parent child group" do
+      test "flow_retry_many terminal exhaustion updates colocated parent child group" do
         parent = uid("flow-retry-many-parent-cross")
         child = uid("flow-retry-many-child-cross")
-        {partition, _same_partition, other_partition} = mixed_partition_keys()
+        {partition, _same_partition, _other_partition} = mixed_partition_keys()
+        child_partition = partition
 
         assert {:ok, created_parent} =
                  flow_create_and_get(parent,
@@ -156,7 +157,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionB
         assert {:ok, waiting} =
                  flow_spawn_children_and_get(
                    parent,
-                   [%{id: child, type: "child", partition_key: other_partition}],
+                   [%{id: child, type: "child", partition_key: child_partition}],
                    group_id: "retry-many-fanout",
                    wait: :all,
                    wait_state: "waiting_children",
@@ -169,7 +170,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionB
                  )
 
         assert waiting.state == "waiting_children"
-        claimed = create_claimed_flow_child(child, other_partition, "worker-retry-many-cross")
+        claimed = create_claimed_flow_child(child, child_partition, "worker-retry-many-cross")
 
         assert {:ok, [exhausted_child]} =
                  flow_retry_many_and_get(
@@ -177,7 +178,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionB
                    [
                      %{
                        id: child,
-                       partition_key: other_partition,
+                       partition_key: child_partition,
                        lease_token: claimed.lease_token,
                        fencing_token: claimed.fencing_token
                      }
@@ -660,7 +661,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionB
       test "flow_transition rejects terminal states so terminal hooks stay centralized" do
         parent = uid("flow-terminal-transition-parent")
         child = uid("flow-terminal-transition-child")
-        {partition, _same_partition, other_partition} = mixed_partition_keys()
+        {partition, _same_partition, _other_partition} = mixed_partition_keys()
+        child_partition = partition
 
         assert {:ok, created_parent} =
                  flow_create_and_get(parent,
@@ -672,7 +674,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionB
         assert {:ok, waiting} =
                  flow_spawn_children_and_get(
                    parent,
-                   [%{id: child, type: "child", partition_key: other_partition}],
+                   [%{id: child, type: "child", partition_key: child_partition}],
                    group_id: "fanout",
                    wait: :all,
                    wait_state: "waiting_children",
@@ -685,12 +687,14 @@ defmodule Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionB
                  )
 
         assert waiting.state == "waiting_children"
-        claimed = create_claimed_flow_child(child, other_partition, "worker-terminal-transition")
+
+        claimed =
+          create_claimed_flow_child(child, child_partition, "worker-terminal-transition")
 
         assert {:error,
                 "ERR terminal flow state requires FLOW.COMPLETE, FLOW.FAIL, or FLOW.CANCEL"} =
                  flow_transition_and_get(child, "running", "completed",
-                   partition_key: other_partition,
+                   partition_key: child_partition,
                    lease_token: claimed.lease_token,
                    fencing_token: claimed.fencing_token,
                    run_at_ms: 2_000

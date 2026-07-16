@@ -132,22 +132,6 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, ^new_value} = BlobStore.get(root, 0, ref)
   end
 
-  test "prepares large locked put as a pre-externalized blob ref", %{ctx: ctx, root: root} do
-    payload = :binary.copy("K", 1024)
-    owner_ref = make_ref()
-
-    assert {:ok, {:locked_put_blob_ref, "k", encoded_ref, 0, ^owner_ref}} =
-             BlobCommand.prepare(
-               ctx,
-               0,
-               {:locked_put, "k", payload, 0, owner_ref},
-               single_member?: true
-             )
-
-    assert {:ok, ref} = BlobRef.decode(encoded_ref)
-    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
-  end
-
   test "prepares large fetch-or-compute publish without losing lease consumption", %{
     ctx: ctx,
     root: root
@@ -165,16 +149,6 @@ defmodule Ferricstore.Raft.BlobCommandTest do
 
     assert {:ok, ref} = BlobRef.decode(encoded_ref)
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
-  end
-
-  test "leaves zset locked puts inline", %{ctx: ctx} do
-    payload = :binary.copy("9", 1024)
-    compound_key = CompoundKey.zset_member("zset", "member")
-    owner_ref = make_ref()
-    command = {:locked_put, compound_key, payload, 0, owner_ref}
-
-    assert {:ok, ^command} = BlobCommand.prepare(ctx, 0, command, single_member?: true)
-    refute BlobCommand.side_channel_candidate?(ctx, command)
   end
 
   test "prepares large compound put as a pre-externalized blob ref", %{
@@ -271,8 +245,6 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     append_suffix = :binary.copy("A", 1024)
     setrange_patch = :binary.copy("R", 1024)
     cas_value = :binary.copy("C", 1024)
-    locked_value = :binary.copy("K", 1024)
-    owner_ref = make_ref()
     hash_value = :binary.copy("H", 1024)
     hash_field = CompoundKey.hash_field("hash", "field")
     opts = %{nx: true, xx: false, get: false, keepttl: false}
@@ -287,7 +259,6 @@ defmodule Ferricstore.Raft.BlobCommandTest do
                {:append_blob_ref, "a", append_encoded_ref},
                {:setrange_blob_ref, "r", 4, setrange_encoded_ref},
                {:cas_blob_ref, "c", "old", cas_encoded_ref, nil},
-               {:locked_put_blob_ref, "lk", locked_encoded_ref, 0, ^owner_ref},
                {:compound_put_blob_ref, ^hash_field, hash_encoded_ref, 0}
              ]}} =
              BlobCommand.prepare(
@@ -302,7 +273,6 @@ defmodule Ferricstore.Raft.BlobCommandTest do
                   {:append, "a", append_suffix},
                   {:setrange, "r", 4, setrange_patch},
                   {:cas, "c", "old", cas_value, nil},
-                  {:locked_put, "lk", locked_value, 0, owner_ref},
                   {:compound_put, hash_field, hash_value, 0}
                 ]},
                single_member?: true
@@ -314,7 +284,6 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, append_ref} = BlobRef.decode(append_encoded_ref)
     assert {:ok, setrange_ref} = BlobRef.decode(setrange_encoded_ref)
     assert {:ok, cas_ref} = BlobRef.decode(cas_encoded_ref)
-    assert {:ok, locked_ref} = BlobRef.decode(locked_encoded_ref)
     assert {:ok, hash_ref} = BlobRef.decode(hash_encoded_ref)
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
     assert {:ok, ^set_payload} = BlobStore.get(root, 0, set_ref)
@@ -322,7 +291,6 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, ^append_suffix} = BlobStore.get(root, 0, append_ref)
     assert {:ok, ^setrange_patch} = BlobStore.get(root, 0, setrange_ref)
     assert {:ok, ^cas_value} = BlobStore.get(root, 0, cas_ref)
-    assert {:ok, ^locked_value} = BlobStore.get(root, 0, locked_ref)
     assert {:ok, ^hash_value} = BlobStore.get(root, 0, hash_ref)
   end
 
@@ -536,10 +504,9 @@ defmodule Ferricstore.Raft.BlobCommandTest do
 
   test "candidate check only selects commands that can externalize", %{ctx: ctx} do
     ref_shaped =
-      BlobRef.encode!(%BlobRef{
-        size: 1,
-        checksum: :binary.copy(<<1>>, 32)
-      })
+      "x"
+      |> BlobRef.from_segment(0, 0)
+      |> BlobRef.encode!()
 
     refute BlobCommand.side_channel_candidate?(ctx, {:put, "small", "v", 0})
     assert BlobCommand.side_channel_candidate?(ctx, {:put, "large", :binary.copy("L", 1024), 0})
@@ -563,11 +530,6 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert BlobCommand.side_channel_candidate?(
              ctx,
              {:cas, "large", "old", :binary.copy("C", 1024), nil}
-           )
-
-    assert BlobCommand.side_channel_candidate?(
-             ctx,
-             {:locked_put, "large", :binary.copy("K", 1024), 0, make_ref()}
            )
 
     assert BlobCommand.side_channel_candidate?(

@@ -3,7 +3,6 @@ defmodule Ferricstore.Cluster.Manager.Target do
 
   require Logger
 
-  alias Ferricstore.Cluster.DataSync
   alias Ferricstore.Cluster.JoinIdentity
   alias Ferricstore.Cluster.TargetMarker
   alias Ferricstore.Bitcask.NIF
@@ -203,12 +202,28 @@ defmodule Ferricstore.Cluster.Manager.Target do
   def reduce_target_data_probe({:error, _reason} = error), do: {:halt, error}
 
   def probe_target_bitcask_logs(target_node, shard_path) do
-    case :erpc.call(target_node, File, :ls, [shard_path], 5_000) do
-      {:ok, files} ->
-        probe_target_log_files(target_node, shard_path, files)
+    case target_lstat(target_node, shard_path) do
+      {:ok, %{type: :directory}} ->
+        list_target_bitcask_logs(target_node, shard_path)
+
+      {:ok, %{type: :symlink}} ->
+        {:error, {:target_data_probe_failed, target_node, {:symlink, shard_path}}}
+
+      {:ok, %{type: type}} ->
+        {:error, {:target_data_probe_failed, target_node, {:not_a_directory, shard_path, type}}}
 
       {:error, :enoent} ->
         {:ok, false}
+
+      {:error, reason} ->
+        {:error, {:target_data_probe_failed, target_node, {:lstat, shard_path, reason}}}
+    end
+  end
+
+  defp list_target_bitcask_logs(target_node, shard_path) do
+    case :erpc.call(target_node, File, :ls, [shard_path], 5_000) do
+      {:ok, files} ->
+        probe_target_log_files(target_node, shard_path, files)
 
       {:error, reason} ->
         {:error, {:target_data_probe_failed, target_node, {:ls, shard_path, reason}}}
@@ -216,6 +231,9 @@ defmodule Ferricstore.Cluster.Manager.Target do
       other ->
         {:error, {:target_data_probe_failed, target_node, {:ls, shard_path, other}}}
     end
+  catch
+    kind, reason ->
+      {:error, {:target_data_probe_failed, target_node, {:ls, shard_path, {kind, reason}}}}
   end
 
   def probe_target_log_files(target_node, shard_path, files) do
@@ -298,12 +316,28 @@ defmodule Ferricstore.Cluster.Manager.Target do
   end
 
   def probe_target_file_tree(target_node, path) do
-    case :erpc.call(target_node, File, :ls, [path], 5_000) do
-      {:ok, files} ->
-        probe_target_file_tree_entries(target_node, path, files)
+    case target_lstat(target_node, path) do
+      {:ok, %{type: :directory}} ->
+        list_target_file_tree(target_node, path)
+
+      {:ok, %{type: :symlink}} ->
+        {:error, {:target_data_probe_failed, target_node, {:symlink, path}}}
+
+      {:ok, %{type: type}} ->
+        {:error, {:target_data_probe_failed, target_node, {:not_a_directory, path, type}}}
 
       {:error, :enoent} ->
         {:ok, false}
+
+      {:error, reason} ->
+        {:error, {:target_data_probe_failed, target_node, {:lstat, path, reason}}}
+    end
+  end
+
+  defp list_target_file_tree(target_node, path) do
+    case :erpc.call(target_node, File, :ls, [path], 5_000) do
+      {:ok, files} ->
+        probe_target_file_tree_entries(target_node, path, files)
 
       {:error, reason} ->
         {:error, {:target_data_probe_failed, target_node, {:ls, path, reason}}}
@@ -311,19 +345,25 @@ defmodule Ferricstore.Cluster.Manager.Target do
       other ->
         {:error, {:target_data_probe_failed, target_node, {:ls, path, other}}}
     end
+  catch
+    kind, reason ->
+      {:error, {:target_data_probe_failed, target_node, {:ls, path, {kind, reason}}}}
   end
 
   def probe_target_file_tree_entries(target_node, path, files) do
     Enum.reduce_while(files, {:ok, false}, fn file, {:ok, false} ->
       entry_path = Path.join(path, file)
 
-      case :erpc.call(target_node, File, :stat, [entry_path], 5_000) do
+      case target_lstat(target_node, entry_path) do
         {:ok, %{type: :directory}} ->
           case probe_target_file_tree(target_node, entry_path) do
             {:ok, true} -> {:halt, {:ok, true}}
             {:ok, false} -> {:cont, {:ok, false}}
             {:error, _reason} = error -> {:halt, error}
           end
+
+        {:ok, %{type: :symlink}} ->
+          {:halt, {:error, {:target_data_probe_failed, target_node, {:symlink, entry_path}}}}
 
         {:ok, %{type: :regular, size: size}} when size > 0 ->
           {:halt, {:ok, true}}
@@ -332,12 +372,16 @@ defmodule Ferricstore.Cluster.Manager.Target do
           {:cont, {:ok, false}}
 
         {:error, reason} ->
-          {:halt, {:error, {:target_data_probe_failed, target_node, {:stat, entry_path, reason}}}}
-
-        other ->
-          {:halt, {:error, {:target_data_probe_failed, target_node, {:stat, entry_path, other}}}}
+          {:halt,
+           {:error, {:target_data_probe_failed, target_node, {:lstat, entry_path, reason}}}}
       end
     end)
+  end
+
+  defp target_lstat(target_node, path) do
+    :erpc.call(target_node, File, :lstat, [path], 5_000)
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   def validate_target_data_identity(_target_node, _ctx, false, _replace?), do: :ok
@@ -408,37 +452,57 @@ defmodule Ferricstore.Cluster.Manager.Target do
     end
   end
 
-  def cleanup_target_data_dir(target_node, data_dir, shard_count) do
-    Enum.each(0..(shard_count - 1), fn i ->
-      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
-      :erpc.call(target_node, File, :rm_rf!, [shard_path], 30_000)
-    end)
+  def cleanup_target_data_dir(target_node, data_dir, shard_count)
+      when is_atom(target_node) and is_binary(data_dir) and is_integer(shard_count) and
+             shard_count >= 0 do
+    shard_paths =
+      shard_count
+      |> shard_indexes()
+      |> Enum.map(&Ferricstore.DataDir.shard_data_path(data_dir, &1))
 
-    # REPLACE join must remove every shard-owned side store. Leaving an old
-    # blob tree behind could make future large-value refs resolve to unrelated
-    # target data after the new cluster baseline is copied.
-    Enum.each(["dedicated", "blob", "prob"], fn dir ->
-      :erpc.call(target_node, File, :rm_rf!, [Path.join(data_dir, dir)], 30_000)
-    end)
-
-    # WARaft replacement/failure cleanup must also remove backend-local state
-    # and durable mode markers. Otherwise a target can restart with stale Raft
-    # identity or a marker from an unrelated cluster before the new baseline is
-    # copied.
-    Enum.each(["ra", "waraft"], fn dir ->
-      :erpc.call(target_node, File, :rm_rf!, [Path.join(data_dir, dir)], 30_000)
-    end)
+    tree_paths =
+      shard_paths ++
+        Enum.map(["dedicated", "blob", "prob", "ra", "waraft"], &Path.join(data_dir, &1))
 
     marker_path = Ferricstore.ReplicationMode.marker_path(data_dir)
-    :erpc.call(target_node, File, :rm, [marker_path], 30_000)
-    :erpc.call(target_node, File, :rm, [marker_path <> ".tmp"], 30_000)
 
-    :ok
+    with :ok <- remove_target_trees(target_node, tree_paths),
+         :ok <- remove_target_files(target_node, [marker_path, marker_path <> ".tmp"]) do
+      :ok
+    end
   end
 
-  @doc false
-  def __extract_direct_sync_indices_for_test__(target_node, sync_results) do
-    extract_direct_sync_indices(target_node, sync_results)
+  def cleanup_target_data_dir(_target_node, data_dir, shard_count),
+    do: {:error, {:target_cleanup_failed, data_dir, {:invalid_shard_count, shard_count}}}
+
+  defp shard_indexes(0), do: []
+  defp shard_indexes(shard_count), do: 0..(shard_count - 1)
+
+  defp remove_target_trees(target_node, paths) do
+    Enum.reduce_while(paths, :ok, fn path, :ok ->
+      case target_fs_call(target_node, :rm_rf, [path]) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:target_cleanup_failed, path, reason}}}
+        other -> {:halt, {:error, {:target_cleanup_failed, path, {:unexpected_result, other}}}}
+      end
+    end)
+  end
+
+  defp remove_target_files(target_node, paths) do
+    Enum.reduce_while(paths, :ok, fn path, :ok ->
+      case target_fs_call(target_node, :rm, [path]) do
+        :ok -> {:cont, :ok}
+        {:error, {:not_found, _reason}} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:target_cleanup_failed, path, reason}}}
+        other -> {:halt, {:error, {:target_cleanup_failed, path, {:unexpected_result, other}}}}
+      end
+    end)
+  end
+
+  defp target_fs_call(target_node, function, args) do
+    :erpc.call(target_node, Ferricstore.FS, function, args, 30_000)
+  catch
+    kind, reason -> {:error, {:rpc_failed, kind, reason}}
   end
 
   @doc false
@@ -451,46 +515,6 @@ defmodule Ferricstore.Cluster.Manager.Target do
     cleanup_target_data_dir(target_node, data_dir, shard_count)
   end
 
-  def extract_direct_sync_indices(target_node, sync_results) when is_map(sync_results) do
-    with {:ok, target_data_dir} <-
-           maybe_target_data_dir_for_wal_bridgeable(target_node, sync_results) do
-      Enum.reduce_while(sync_results, {:ok, %{}}, fn
-        {shard_idx, {:synced, :wal_bridgeable}}, {:ok, acc} ->
-          case read_target_shard_index(target_node, target_data_dir, shard_idx) do
-            {:ok, idx} -> {:cont, {:ok, Map.put(acc, shard_idx, idx)}}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-
-        {shard_idx, {:synced, raft_idx}}, {:ok, acc}
-        when is_integer(raft_idx) and raft_idx >= 0 ->
-          {:cont, {:ok, Map.put(acc, shard_idx, raft_idx)}}
-
-        {shard_idx, {:synced, detail}}, {:ok, _acc} ->
-          {:halt,
-           {:error,
-            {:target_index_read_failed, target_node, shard_idx, {:unknown_sync_detail, detail}}}}
-
-        {shard_idx, other}, {:ok, _acc} ->
-          {:halt,
-           {:error,
-            {:target_index_read_failed, target_node, shard_idx, {:unexpected_sync_result, other}}}}
-      end)
-    end
-  end
-
-  def extract_direct_sync_indices(target_node, sync_results) do
-    {:error,
-     {:target_index_read_failed, target_node, :sync_results, {:unexpected_result, sync_results}}}
-  end
-
-  def maybe_target_data_dir_for_wal_bridgeable(target_node, sync_results) do
-    if Enum.any?(sync_results, fn {_shard_idx, result} -> result == {:synced, :wal_bridgeable} end) do
-      target_data_dir(target_node)
-    else
-      {:ok, nil}
-    end
-  end
-
   # Auto-join: triggered by :nodeup, runs in a spawned process so
   # handle_info returns immediately. Routes through GenServer.call
   # so the dedup guard in handle_call prevents concurrent joins.
@@ -499,7 +523,11 @@ defmodule Ferricstore.Cluster.Manager.Target do
 
     case wait_for_remote_app(target_node) do
       :ok ->
-        case GenServer.call(Ferricstore.Cluster.Manager, {:add_node, target_node, role}, 120_000) do
+        case GenServer.call(
+               Ferricstore.Cluster.Manager,
+               {:add_node, target_node, role},
+               :infinity
+             ) do
           :ok ->
             Logger.info("ClusterManager: auto-join complete for #{target_node}")
 
@@ -539,58 +567,4 @@ defmodule Ferricstore.Cluster.Manager.Target do
   # ---------------------------------------------------------------------------
   # Private: add/remove/leave operations
   # ---------------------------------------------------------------------------
-  @doc false
-  def read_target_indices(target_node, shard_count) do
-    case Process.get(:ferricstore_cluster_manager_read_target_indices_hook) do
-      hook when is_function(hook, 2) ->
-        hook.(target_node, shard_count)
-
-      _ ->
-        do_read_target_indices(target_node, shard_count)
-    end
-  end
-
-  def do_read_target_indices(target_node, shard_count) do
-    with {:ok, target_data_dir} <- target_data_dir(target_node) do
-      Enum.reduce_while(0..(shard_count - 1), {:ok, %{}}, fn shard_idx, {:ok, acc} ->
-        case read_target_shard_index(target_node, target_data_dir, shard_idx) do
-          {:ok, idx} -> {:cont, {:ok, Map.put(acc, shard_idx, idx)}}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
-      end)
-    end
-  end
-
-  def target_data_dir(target_node) do
-    target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
-
-    if is_map(target_ctx) and is_binary(Map.get(target_ctx, :data_dir)) do
-      {:ok, target_ctx.data_dir}
-    else
-      {:error,
-       {:target_index_read_failed, target_node, :context, {:invalid_target_context, target_ctx}}}
-    end
-  catch
-    kind, reason ->
-      {:error, {:target_index_read_failed, target_node, :context, {kind, reason}}}
-  end
-
-  def read_target_shard_index(target_node, target_data_dir, shard_idx) do
-    case :erpc.call(
-           target_node,
-           DataSync,
-           :read_last_applied_from_disk,
-           [target_data_dir, shard_idx],
-           5_000
-         ) do
-      idx when is_integer(idx) and idx >= 0 ->
-        {:ok, idx}
-
-      other ->
-        {:error, {:target_index_read_failed, target_node, shard_idx, {:unexpected_result, other}}}
-    end
-  catch
-    kind, reason ->
-      {:error, {:target_index_read_failed, target_node, shard_idx, {kind, reason}}}
-  end
 end

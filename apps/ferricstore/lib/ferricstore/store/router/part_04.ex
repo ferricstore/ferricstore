@@ -639,7 +639,7 @@ defmodule Ferricstore.Store.Router.Part04 do
             when exp > now and valid_pending_value_size(vsize) ->
               vsize
 
-            [{^key, nil, exp, _lfu, _fid, _off, vsize}]
+            [{^key, nil, exp, _lfu, _fid, :pending_offset, vsize}]
             when is_integer(exp) and (exp == 0 or exp > now) and is_integer(vsize) and
                    vsize >= 0 ->
               vsize
@@ -652,8 +652,8 @@ defmodule Ferricstore.Store.Router.Part04 do
             [] ->
               nil
 
-            [_malformed_live_entry] ->
-              nil
+            [malformed_live_entry] ->
+              ReadResult.failure({:invalid_keydir_entry, malformed_live_entry})
           end
         rescue
           ArgumentError -> keydir_unavailable(ctx, idx, :value_size, nil)

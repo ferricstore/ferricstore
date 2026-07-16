@@ -1,7 +1,7 @@
 defmodule Ferricstore.Cluster.Manager do
   @moduledoc """
   Manages cluster membership: monitors node connections, orchestrates join/leave
-  flows, and coordinates data sync for new followers.
+  flows, and coordinates WARaft snapshot joins for new followers.
 
   Subscribes to :net_kernel nodeup/nodedown events. When a new node connects
   (via libcluster or manual Node.connect), checks if it needs to be added to
@@ -57,23 +57,17 @@ defmodule Ferricstore.Cluster.Manager do
   """
   @spec node_status(:default | non_neg_integer()) :: map()
   def node_status(membership_timeout) do
-    call_timeout =
-      case membership_timeout do
-        timeout when is_integer(timeout) and timeout >= 0 -> max(5_000, timeout + 1_000)
-        _ -> 5_000
-      end
-
-    GenServer.call(__MODULE__, {:node_status, membership_timeout}, call_timeout)
+    GenServer.call(__MODULE__, {:node_status, membership_timeout}, :infinity)
   end
 
   @doc """
-  Adds a node to the cluster. Triggers data sync if needed.
+  Adds a node to the cluster. WARaft transfers snapshots when needed.
 
   The node must be reachable via Erlang distribution (Node.connect or libcluster).
   """
   @spec add_node(node(), atom(), keyword()) :: :ok | {:error, term()}
   def add_node(node, role \\ :voter, opts \\ []) do
-    GenServer.call(__MODULE__, {:add_node, node, role, opts}, 120_000)
+    GenServer.call(__MODULE__, {:add_node, node, role, opts}, :infinity)
   end
 
   @doc """
@@ -83,13 +77,13 @@ defmodule Ferricstore.Cluster.Manager do
   """
   @spec remove_node(node()) :: :ok | {:error, term()}
   def remove_node(node) do
-    GenServer.call(__MODULE__, {:remove_node, node}, 30_000)
+    GenServer.call(__MODULE__, {:remove_node, node}, :infinity)
   end
 
   @doc "Gracefully leaves the cluster (called on the departing node)."
   @spec leave() :: :ok | {:error, term()}
   def leave do
-    GenServer.call(__MODULE__, :leave, 30_000)
+    GenServer.call(__MODULE__, :leave, :infinity)
   end
 
   # ---------------------------------------------------------------------------
@@ -133,7 +127,7 @@ defmodule Ferricstore.Cluster.Manager do
       remove_timers: %{},
       sync_status: if(mode == :cluster, do: :synced, else: :not_started),
       shard_sync_status: %{},
-      shard_count: Application.get_env(:ferricstore, :shard_count, 4)
+      shard_count: runtime_shard_count()
     }
 
     {:ok, state}
@@ -161,31 +155,46 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   def handle_call({:add_node, target_node, role, opts}, _from, state) do
-    if MapSet.member?(state.known_nodes, target_node) do
-      Logger.info("ClusterManager: #{target_node} already known, skipping join")
-      {:reply, :ok, state}
-    else
-      membership = role_to_membership(role)
+    case role_to_membership(role) do
+      {:ok, membership} ->
+        if MapSet.member?(state.known_nodes, target_node) do
+          Logger.info("ClusterManager: #{target_node} already known, skipping join")
+          {:reply, :ok, state}
+        else
+          result =
+            try do
+              do_join_node(target_node, membership, state, opts)
+            catch
+              kind, reason ->
+                Logger.error(
+                  "ClusterManager: join failed for #{target_node}: #{inspect(kind)} #{inspect(reason)}"
+                )
 
-      result =
-        try do
-          do_join_node(target_node, membership, state, opts)
-        catch
-          kind, reason ->
-            Logger.error(
-              "ClusterManager: join failed for #{target_node}: #{inspect(kind)} #{inspect(reason)}"
-            )
+                {:error, {kind, reason}}
+            end
 
-            {:error, {kind, reason}}
+          state =
+            case result do
+              :ok when target_node == node() ->
+                state
+
+              :ok ->
+                %{
+                  state
+                  | mode: :cluster,
+                    sync_status: :synced,
+                    known_nodes: MapSet.put(state.known_nodes, target_node)
+                }
+
+              _ ->
+                state
+            end
+
+          {:reply, result, state}
         end
 
-      state =
-        case result do
-          :ok -> %{state | known_nodes: MapSet.put(state.known_nodes, target_node)}
-          _ -> state
-        end
-
-      {:reply, result, state}
+      {:error, _reason} = error ->
+        {:reply, error, state}
     end
   end
 
@@ -214,16 +223,39 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   defp build_node_status(state, membership_timeout) do
-    status =
-      for shard_idx <- 0..(state.shard_count - 1), into: %{} do
-        case RaftCluster.members(shard_idx, membership_timeout) do
-          {:ok, members, leader} ->
-            {shard_idx, %{members: members, leader: leader}}
+    shard_indexes = cluster_shard_indexes(state.shard_count)
+    timeout = node_status_membership_timeout(membership_timeout)
+    members_fun = node_status_members_fun()
 
-          {:error, reason} ->
-            {shard_idx, %{error: reason}}
-        end
-      end
+    max_concurrency =
+      shard_indexes
+      |> length()
+      |> min(min(System.schedulers_online(), 16))
+      |> max(1)
+
+    status =
+      shard_indexes
+      |> Task.async_stream(
+        fn shard_idx -> safe_node_status_members(members_fun, shard_idx, timeout) end,
+        max_concurrency: max_concurrency,
+        ordered: true,
+        timeout: max(timeout + 250, 500),
+        on_timeout: :kill_task
+      )
+      |> then(&Enum.zip(shard_indexes, &1))
+      |> Map.new(fn
+        {shard_idx, {:ok, {:ok, members, leader}}} ->
+          {shard_idx, %{members: members, leader: leader}}
+
+        {shard_idx, {:ok, {:error, reason}}} ->
+          {shard_idx, %{error: reason}}
+
+        {shard_idx, {:ok, other}} ->
+          {shard_idx, %{error: {:unexpected_members_result, other}}}
+
+        {shard_idx, {:exit, reason}} ->
+          {shard_idx, %{error: {:membership_probe_exit, reason}}}
+      end)
 
     %{
       mode: state.mode,
@@ -235,6 +267,42 @@ defmodule Ferricstore.Cluster.Manager do
       shard_sync_status: state.shard_sync_status,
       shards: status
     }
+  end
+
+  defp node_status_members_fun do
+    case Process.get(:ferricstore_cluster_manager_node_status_members_hook) do
+      hook when is_function(hook, 2) -> hook
+      _other -> &RaftCluster.members/2
+    end
+  end
+
+  defp safe_node_status_members(members_fun, shard_idx, timeout) do
+    members_fun.(shard_idx, timeout)
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp node_status_membership_timeout(:default), do: @membership_probe_timeout_ms
+
+  defp node_status_membership_timeout(timeout) when is_integer(timeout) and timeout >= 0,
+    do: timeout
+
+  defp node_status_membership_timeout(_invalid), do: @membership_probe_timeout_ms
+
+  defp cluster_shard_indexes(0), do: []
+  defp cluster_shard_indexes(shard_count), do: Enum.to_list(0..(shard_count - 1))
+
+  defp runtime_shard_count do
+    case :persistent_term.get(:ferricstore_shard_count, :undefined) do
+      count when is_integer(count) and count > 0 ->
+        count
+
+      _not_published ->
+        case Application.get_env(:ferricstore, :shard_count, 0) do
+          count when is_integer(count) and count > 0 -> count
+          _auto_or_invalid -> System.schedulers_online()
+        end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -370,16 +438,12 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   # ---------------------------------------------------------------------------
-  # Private: join flow (data sync + WARaft membership — used by both auto and manual)
+  # Private: WARaft snapshot join used by both auto and manual membership changes.
   # ---------------------------------------------------------------------------
 
-  # Full join: sync data FIRST, then add to WARaft groups.
-  # Order matters: if we add to membership first, the new node's local
-  # consensus runtime can conflict with the cluster's leaders.
-  # By syncing data first, the new node receives the cluster's Bitcask files.
-  # Then, when added to WARaft, replication starts from the sync point.
-  #
-  # This is the single code path for both :nodeup auto-join and CLUSTER.JOIN.
+  # Prepare an empty snapshot target before adding it to WARaft groups. Once
+  # membership changes, WARaft snapshot replication is the only data-transfer
+  # path. This is shared by :nodeup auto-join and CLUSTER.JOIN.
   defp do_join_node(target_node, membership, state, opts) do
     if target_node == node() do
       Logger.info("ClusterManager: ignoring self-join for #{target_node}")
@@ -999,27 +1063,18 @@ defmodule Ferricstore.Cluster.Manager do
     end
   end
 
-  false
-
-  def __extract_direct_sync_indices_for_test__(target_node, sync_results),
-    do: Target.__extract_direct_sync_indices_for_test__(target_node, sync_results)
-
-  false
+  @doc false
 
   def __target_shard_has_data_for_test__(target_node, data_dir, shard_idx),
     do: Target.__target_shard_has_data_for_test__(target_node, data_dir, shard_idx)
 
-  false
+  @doc false
 
   def __cleanup_target_data_dir_for_test__(target_node, data_dir, shard_count),
     do: Target.__cleanup_target_data_dir_for_test__(target_node, data_dir, shard_count)
 
-  false
-
-  def read_target_indices(target_node, shard_count),
-    do: Target.read_target_indices(target_node, shard_count)
-
-  defp role_to_membership(:voter), do: :voter
-  defp role_to_membership(:replica), do: :promotable
-  defp role_to_membership(:readonly), do: :non_voter
+  defp role_to_membership(:voter), do: {:ok, :voter}
+  defp role_to_membership(:replica), do: {:ok, :promotable}
+  defp role_to_membership(:readonly), do: {:ok, :non_voter}
+  defp role_to_membership(role), do: {:error, {:invalid_cluster_role, role}}
 end

@@ -86,7 +86,29 @@ defmodule FerricstoreServer.PreparedCommandAclTest do
     assert :ok = Auth.check_keys_cached(read_write, hset)
   end
 
+  test "prepared Pub/Sub access checks channel patterns without requiring key patterns" do
+    assert {:ok, prepared} =
+             Dispatcher.prepare_raw("PUBLISH", ["tenant:events", "payload"])
+
+    allowed = %{
+      enabled: true,
+      keys: [],
+      channels: [channel_pattern("tenant:*")]
+    }
+
+    denied = %{
+      enabled: true,
+      keys: :all,
+      channels: [channel_pattern("other:*")]
+    }
+
+    assert :ok = Auth.check_prepared_resources_cached(allowed, prepared)
+    assert {:error, reason} = Auth.check_prepared_resources_cached(denied, prepared)
+    assert reason =~ "channels mentioned"
+  end
+
   defp cache(patterns), do: %{enabled: true, keys: patterns}
 
   defp pattern(glob, access), do: {glob, access, Acl.compile_glob(glob)}
+  defp channel_pattern(glob), do: {glob, Acl.compile_glob(glob)}
 end

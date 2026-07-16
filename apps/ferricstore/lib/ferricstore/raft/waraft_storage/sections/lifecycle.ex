@@ -184,26 +184,32 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           case lookup_segment_projection_context(root_dir) do
             {:ok, context} ->
               with :ok <- validate_segment_projection_trim_position(context.position, trim_index) do
-                case prepare_segment_projection_from_checkpoint(
-                       root_dir,
-                       projection_root,
-                       context,
-                       trim_index
-                     ) do
-                  :ok ->
-                    :ok
+                WARaftSegmentReader.with_apply_projection_disk_lock(
+                  context.ctx.data_dir,
+                  context.shard_index,
+                  fn ->
+                    case prepare_segment_projection_from_checkpoint(
+                           root_dir,
+                           projection_root,
+                           context,
+                           trim_index
+                         ) do
+                      :ok ->
+                        :ok
 
-                  :not_available ->
-                    rebuild_segment_projection_for_trim(
-                      root_dir,
-                      projection_root,
-                      context,
-                      trim_index
-                    )
+                      :not_available ->
+                        rebuild_segment_projection_for_trim(
+                          root_dir,
+                          projection_root,
+                          context,
+                          trim_index
+                        )
 
-                  {:error, _reason} = error ->
-                    error
-                end
+                      {:error, _reason} = error ->
+                        error
+                    end
+                  end
+                )
               end
 
             {:error, reason}
@@ -283,6 +289,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
                  relocations
                ),
              :ok <-
+               compact_apply_projection_log(
+                 root_dir,
+                 context.ctx,
+                 context.shard_index,
+                 trim_index
+               ),
+             :ok <-
                prune_apply_projection_cache_after_segment_projection(
                  context.ctx,
                  context.shard_index,
@@ -329,6 +342,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
                  context.shard_index,
                  projection_root,
                  relocations
+               ),
+             :ok <-
+               compact_apply_projection_log(
+                 root_dir,
+                 context.ctx,
+                 context.shard_index,
+                 trim_index
                ),
              :ok <-
                prune_apply_projection_cache_after_segment_projection(
@@ -395,6 +415,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       end
 
       def info(
+            {:DOWN, monitor, :process, pid, reason},
+            %{apply_projection_cache_compaction: %{monitor: monitor, pid: pid}} = handle
+          )
+          when is_reference(monitor) and is_pid(pid) do
+        finish_apply_projection_cache_compaction_down(monitor, pid, reason, handle)
+      end
+
+      def info(
             {:ferricstore_waraft_flush_replay_dependencies, reply_to, ref},
             %{blocked_error: reason} = handle
           )
@@ -430,11 +458,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
       def create_snapshot(snapshot_path, handle) do
         snapshot_path = to_path(snapshot_path)
 
+        with_stable_flow_projection_snapshot(handle, fn ->
+          do_create_snapshot(snapshot_path, handle)
+        end)
+      end
+
+      defp do_create_snapshot(snapshot_path, handle) do
         with :ok <- reset_dir(snapshot_path),
              :ok <- copy_shard_dirs_to_snapshot(snapshot_path, handle),
              :ok <- drain_apply_projection_cache_compaction_for_snapshot(handle),
-             :ok <- flush_apply_projection_snapshot_payload(handle),
-             :ok <- copy_storage_dirs_to_snapshot(snapshot_path, handle),
+             :ok <- copy_compacted_storage_dirs_to_snapshot(snapshot_path, handle),
              {:ok, segment_projection} <-
                maybe_write_snapshot_segment_projection(snapshot_path, handle),
              :ok <- write_snapshot_metadata(snapshot_path, handle, segment_projection),
@@ -731,13 +764,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
 
           :unsupported ->
             :unsupported
-        end
-      end
-
-      defp segment_projection_locks_present?(sm_state) do
-        case Map.get(sm_state, :cross_shard_locks, %{}) do
-          locks when is_map(locks) -> map_size(locks) > 0
-          _other -> false
         end
       end
     end

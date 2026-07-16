@@ -30,6 +30,7 @@
     write_projection_batch/3,
     write_projection_batches/2,
     write_projection_batches_sync/2,
+    compact_apply_projection/3,
     close_process_writers/1
 ]).
 

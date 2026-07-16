@@ -220,7 +220,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
       end
     end
 
-    test "init fails closed when existing log files cannot be counted" do
+    test "init fails closed when the shard directory cannot be inspected" do
       data_dir =
         Path.join(
           System.tmp_dir!(),
@@ -232,7 +232,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
       File.write!(shard_dir, "not a directory")
 
       try do
-        assert {:stop, {:merge_log_file_count_failed, 0, {_kind, _message}}} =
+        assert {:stop, {:merge_manifest_recovery_failed, 0, {_kind, _message}}} =
                  Scheduler.init(
                    shard_index: 0,
                    data_dir: data_dir,
@@ -342,8 +342,8 @@ defmodule Ferricstore.Merge.SchedulerTest do
   describe "merge decision" do
     test "cooldown decisions use monotonic elapsed time" do
       source = File.read!(@scheduler_path)
-      [_before, rest] = String.split(source, "defp should_merge?", parts: 2)
-      [body | _after] = String.split(rest, "\n  defp mode_allows_merge?", parts: 2)
+      [_before, rest] = String.split(source, "defp cooldown_remaining_ms(state)", parts: 2)
+      [body | _after] = String.split(rest, "\n  defp schedule_age_retry", parts: 2)
 
       assert body =~ "System.monotonic_time(:millisecond)"
       refute body =~ "System.system_time(:millisecond)"

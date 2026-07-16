@@ -985,9 +985,15 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   @spec maybe_promote(map(), binary(), binary()) :: map()
   @doc false
   def maybe_promote(state, redis_key, compound_key) do
-    alias Ferricstore.Store.CompoundKey
+    threshold = Map.fetch!(state, :apply_context).promotion_threshold
+    maybe_promote(state, redis_key, compound_key, threshold)
+  end
 
-    threshold = Promotion.threshold()
+  @spec maybe_promote(map(), binary(), binary(), non_neg_integer()) :: map()
+  @doc false
+  def maybe_promote(state, redis_key, compound_key, threshold)
+      when is_integer(threshold) and threshold >= 0 do
+    alias Ferricstore.Store.CompoundKey
 
     if threshold == 0 or Map.has_key?(state.promoted_instances, redis_key) do
       state

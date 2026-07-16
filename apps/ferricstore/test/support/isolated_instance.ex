@@ -44,6 +44,12 @@ defmodule Ferricstore.Test.IsolatedInstance do
         hot_cache_max_value_size: Keyword.get(opts, :hot_cache_max_value_size, 65_536),
         blob_side_channel_threshold_bytes:
           Keyword.get(opts, :blob_side_channel_threshold_bytes, 0),
+        promotion_threshold:
+          Keyword.get(
+            opts,
+            :promotion_threshold,
+            Application.get_env(:ferricstore, :promotion_threshold, 100)
+          ),
         max_active_file_size: 64 * 1024 * 1024,
         read_sample_rate: Keyword.get(opts, :read_sample_rate, 1),
         lfu_decay_time: 1,

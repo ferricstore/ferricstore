@@ -52,7 +52,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
           end
         end
 
-        test "cross-shard control apply does not inherit stale pending state", %{
+        test "fetch-or-compute control apply does not inherit stale pending state", %{
           store: _store,
           ets: ets
         } do
@@ -72,14 +72,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
             assert {new_state, _result, _effects} =
                      StateMachine.apply(
                        %{index: 1},
-                       {:cross_shard_intent, make_ref(),
-                        %{
-                          command: :test,
-                          keys: %{target: "release-cursor-control"},
-                          value_hashes: %{"release-cursor-control" => nil},
-                          status: :executing,
-                          created_at: 1
-                        }},
+                       {:clear_key_locks},
                        state
                      )
 

@@ -30,32 +30,13 @@ defmodule Ferricstore.Review.H3PromotedExpiryTest do
   end
 
   setup do
-    original = Application.get_env(:ferricstore, :promotion_threshold)
-
-    original_pt =
-      try do
-        :persistent_term.get(:ferricstore_promotion_threshold)
-      rescue
-        ArgumentError -> :not_set
-      end
-
-    Application.put_env(:ferricstore, :promotion_threshold, @test_threshold)
-    :persistent_term.put(:ferricstore_promotion_threshold, @test_threshold)
+    apply_context_snapshot =
+      ShardHelpers.replace_default_apply_context(promotion_threshold: @test_threshold)
 
     ShardHelpers.flush_all_keys()
 
     on_exit(fn ->
-      if original do
-        Application.put_env(:ferricstore, :promotion_threshold, original)
-      else
-        Application.delete_env(:ferricstore, :promotion_threshold)
-      end
-
-      case original_pt do
-        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
-        val -> :persistent_term.put(:ferricstore_promotion_threshold, val)
-      end
-
+      ShardHelpers.restore_default_apply_context(apply_context_snapshot)
       ShardHelpers.wait_shards_alive()
     end)
   end
@@ -161,7 +142,11 @@ defmodule Ferricstore.Review.H3PromotedExpiryTest do
 
       # 1. Create a promoted hash (> threshold fields).
       populate_hash(store, key, @test_threshold + 1)
-      assert promoted?(key)
+
+      ShardHelpers.eventually(
+        fn -> promoted?(key) end,
+        "hash should be promoted before setting field expiry"
+      )
 
       # 2. Set a per-field TTL on field_1 via HEXPIRE.
       ttl_str = Integer.to_string(@ttl_seconds)

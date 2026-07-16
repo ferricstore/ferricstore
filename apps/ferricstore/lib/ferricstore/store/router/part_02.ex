@@ -955,7 +955,15 @@ defmodule Ferricstore.Store.Router.Part02 do
         )
       end
 
-      defp do_batch_get(ctx, keys, byte_limit) do
+      defp do_batch_get(ctx, keys, byte_limit),
+        do: do_batch_get(ctx, keys, byte_limit, nil)
+
+      defp do_batch_get_from_shard(ctx, idx, keys, byte_limit)
+           when is_integer(idx) and idx >= 0 do
+        do_batch_get(ctx, keys, byte_limit, idx)
+      end
+
+      defp do_batch_get(ctx, keys, byte_limit, fixed_shard_index) do
         now = HLC.now_ms()
         bookkeeping = hot_read_bookkeeping_start(ctx)
 
@@ -966,7 +974,11 @@ defmodule Ferricstore.Store.Router.Part02 do
             fn key,
                {results, cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping,
                 response_bytes} ->
-              idx = shard_for(ctx, key)
+              idx =
+                if is_integer(fixed_shard_index),
+                  do: fixed_shard_index,
+                  else: shard_for(ctx, key)
+
               keydir = resolve_keydir(ctx, idx)
 
               {result, cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping,

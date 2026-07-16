@@ -533,7 +533,7 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest.Sections.ReadOnlyParamMaxmemor
           assert "notify-keyspace-events" in keys
         end
 
-        test "CONFIG GET * includes legacy parameters", %{store: store} do
+        test "CONFIG GET * includes Redis-compatible parameters", %{store: store} do
           result = Server.handle("CONFIG", ["GET", "*"], store)
           keys = every_other(result, 0)
 

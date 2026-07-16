@@ -132,7 +132,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
 
       defp flow_create_fast_staged_put_batch?(state) do
         not cross_shard_pending_active?() and not standalone_staged_apply?() and
-          Map.get(state, :cross_shard_locks, %{}) == %{} and
           Process.get(:sm_pending_writes, []) == [] and
           Process.get(:sm_pending_values, %{}) == %{}
       end

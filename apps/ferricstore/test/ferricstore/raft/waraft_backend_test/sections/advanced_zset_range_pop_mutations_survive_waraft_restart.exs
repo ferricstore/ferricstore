@@ -93,6 +93,37 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
 
           assert 3 = Ferricstore.Commands.List.handle_ast({:rpush, [key, "a", "b", "c"]}, ctx)
 
+          list_prefix = CompoundKey.list_prefix(key)
+
+          projected_list_rows =
+            ctx.keydir_refs
+            |> elem(0)
+            |> :ets.tab2list()
+            |> Enum.filter(fn
+              {compound_key, value, _expire_at_ms, _lfu, {tag, _index}, _offset, _value_size}
+              when is_binary(value) and
+                     tag in [:waraft_segment, :waraft_projection, :waraft_apply_projection] ->
+                String.starts_with?(compound_key, list_prefix)
+
+              _row ->
+                false
+            end)
+
+          assert length(projected_list_rows) == 3
+
+          Enum.each(projected_list_rows, fn
+            {compound_key, expected, _expire_at_ms, _lfu, file_id, _offset, _value_size} ->
+              assert {:ok, value} =
+                       Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                         ctx,
+                         0,
+                         file_id,
+                         compound_key
+                       )
+
+              assert value == expected
+          end)
+
           assert ["a", "b", "c"] =
                    Ferricstore.Commands.List.handle_ast({:lrange, key, 0, -1}, ctx)
 
@@ -117,6 +148,102 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
           assert ["b", "c"] =
                    Ferricstore.Commands.List.handle_ast({:lrange, key, 0, -1}, restarted_ctx)
         after
+        end
+      end
+
+      @tag :apply_projection_owner_lifecycle
+      test "one shard storage crash preserves another shard apply projection cache", %{
+        root: root
+      } do
+        ctx = build_ctx(Path.join(root, "apply-projection-owner"), shard_count: 2)
+
+        previous_entry_limit =
+          Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_entries)
+
+        previous_byte_limit =
+          Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_bytes)
+
+        try do
+          Application.put_env(
+            :ferricstore,
+            :waraft_apply_projection_cache_max_entries,
+            :infinity
+          )
+
+          Application.put_env(
+            :ferricstore,
+            :waraft_apply_projection_cache_max_bytes,
+            :infinity
+          )
+
+          clear_apply_projection_cache!()
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          shard0_key = key_for_shard(ctx, 0, "apply-projection-owner")
+          shard1_key = key_for_shard(ctx, 1, "apply-projection-owner")
+
+          assert 1 =
+                   Ferricstore.Commands.List.handle_ast(
+                     {:rpush, [shard0_key, "shard-zero"]},
+                     ctx
+                   )
+
+          assert 1 =
+                   Ferricstore.Commands.List.handle_ast(
+                     {:rpush, [shard1_key, "shard-one"]},
+                     ctx
+                   )
+
+          shard1_prefix = CompoundKey.list_prefix(shard1_key)
+
+          assert [
+                   {compound_key, expected, _expire_at_ms, _lfu, file_id, _offset, _value_size}
+                 ] =
+                   ctx.keydir_refs
+                   |> elem(1)
+                   |> :ets.tab2list()
+                   |> Enum.filter(fn
+                     {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, _index},
+                      _offset, _value_size} ->
+                       String.starts_with?(key, shard1_prefix)
+
+                     _row ->
+                       false
+                   end)
+
+          table = :ets.whereis(:ferricstore_waraft_apply_projection_cache)
+          table_owner = Process.whereis(Ferricstore.Raft.WARaftSegmentReader.TableOwner)
+          shard0_storage = :wa_raft_storage.registered_name(:ferricstore_waraft_backend, 1)
+          shard0_storage_pid = Process.whereis(shard0_storage)
+
+          assert is_reference(table)
+          assert is_pid(table_owner)
+          assert :ets.info(table, :owner) == table_owner
+          assert is_pid(shard0_storage_pid)
+
+          monitor = Process.monitor(shard0_storage_pid)
+          Process.exit(shard0_storage_pid, :kill)
+          assert_receive {:DOWN, ^monitor, :process, ^shard0_storage_pid, :killed}, 5_000
+
+          assert table == :ets.whereis(:ferricstore_waraft_apply_projection_cache)
+          assert :ets.info(table, :owner) == table_owner
+
+          assert {:ok, ^expected} =
+                   Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                     ctx,
+                     1,
+                     file_id,
+                     compound_key
+                   )
+
+          assert ["shard-one"] ==
+                   Ferricstore.Commands.List.handle_ast({:lrange, shard1_key, 0, -1}, ctx)
+        after
+          restore_env(:waraft_apply_projection_cache_max_entries, previous_entry_limit)
+          restore_env(:waraft_apply_projection_cache_max_bytes, previous_byte_limit)
+          FerricStore.Instance.cleanup(ctx.name)
         end
       end
 
@@ -845,7 +972,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
                      ctx
                    )
 
-          assert 1 =
+          assert {:error, "CROSSSLOT Keys in request don't hash to the same slot"} =
                    Ferricstore.Commands.Strings.handle_ast(
                      {:msetnx, [msetnx_a, "v0", msetnx_b, "v1"]},
                      ctx
@@ -866,8 +993,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
           assert "ttl-me" == Router.get(restarted_ctx, getex_key)
           assert Ferricstore.Commands.Expiry.handle_ast({:pttl, getex_key}, restarted_ctx) > 0
           assert "Hello Redis" == Router.get(restarted_ctx, setrange_key)
-          assert "v0" == Router.get(restarted_ctx, msetnx_a)
-          assert "v1" == Router.get(restarted_ctx, msetnx_b)
+          assert nil == Router.get(restarted_ctx, msetnx_a)
+          assert nil == Router.get(restarted_ctx, msetnx_b)
         after
           WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)

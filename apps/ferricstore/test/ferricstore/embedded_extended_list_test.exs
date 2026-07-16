@@ -143,23 +143,23 @@ defmodule Ferricstore.EmbeddedExtendedListTest do
 
   describe "lmove/4" do
     test "moves element from source left to destination right" do
-      FerricStore.rpush("lm:src", ["a", "b", "c"])
-      FerricStore.rpush("lm:dst", ["x"])
-      assert {:ok, "a"} = FerricStore.lmove("lm:src", "lm:dst", :left, :right)
-      assert {:ok, ["b", "c"]} = FerricStore.lrange("lm:src", 0, -1)
-      assert {:ok, ["x", "a"]} = FerricStore.lrange("lm:dst", 0, -1)
+      FerricStore.rpush("lm:{left}:src", ["a", "b", "c"])
+      FerricStore.rpush("lm:{left}:dst", ["x"])
+      assert {:ok, "a"} = FerricStore.lmove("lm:{left}:src", "lm:{left}:dst", :left, :right)
+      assert {:ok, ["b", "c"]} = FerricStore.lrange("lm:{left}:src", 0, -1)
+      assert {:ok, ["x", "a"]} = FerricStore.lrange("lm:{left}:dst", 0, -1)
     end
 
     test "moves element from source right to destination left" do
-      FerricStore.rpush("lm:src2", ["a", "b", "c"])
-      FerricStore.rpush("lm:dst2", ["x"])
-      assert {:ok, "c"} = FerricStore.lmove("lm:src2", "lm:dst2", :right, :left)
-      assert {:ok, ["a", "b"]} = FerricStore.lrange("lm:src2", 0, -1)
-      assert {:ok, ["c", "x"]} = FerricStore.lrange("lm:dst2", 0, -1)
+      FerricStore.rpush("lm:{right}:src", ["a", "b", "c"])
+      FerricStore.rpush("lm:{right}:dst", ["x"])
+      assert {:ok, "c"} = FerricStore.lmove("lm:{right}:src", "lm:{right}:dst", :right, :left)
+      assert {:ok, ["a", "b"]} = FerricStore.lrange("lm:{right}:src", 0, -1)
+      assert {:ok, ["c", "x"]} = FerricStore.lrange("lm:{right}:dst", 0, -1)
     end
 
     test "returns nil when source is empty" do
-      assert {:ok, nil} = FerricStore.lmove("lm:empty", "lm:dst3", :left, :right)
+      assert {:ok, nil} = FerricStore.lmove("lm:{empty}:src", "lm:{empty}:dst", :left, :right)
     end
   end
 

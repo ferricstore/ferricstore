@@ -37,12 +37,27 @@ defmodule Ferricstore.Commands.Strings.MSet do
   end
 
   defp msetnx_validated_args(args, %FerricStore.Instance{} = store) do
-    Router.atomic_msetnx(store, mset_pairs(args))
+    keys = extract_keys(args)
+
+    if keys_on_one_shard?(keys, store) do
+      Router.atomic_msetnx(store, mset_pairs(args))
+    else
+      if Router.durable_context?(store) do
+        msetnx_coordinated(args, keys, store)
+      else
+        with :ok <- Router.admit_string_batch(store, mset_pairs(args)) do
+          msetnx_coordinated(args, keys, store)
+        end
+      end
+    end
   end
 
   defp msetnx_validated_args(args, store) do
     keys = extract_keys(args)
+    msetnx_coordinated(args, keys, store)
+  end
 
+  defp msetnx_coordinated(args, keys, store) do
     CrossShardOp.execute(
       Enum.map(keys, &{&1, :write}),
       fn unified_store ->
@@ -60,15 +75,20 @@ defmodule Ferricstore.Commands.Strings.MSet do
             ReadResult.command_error(failure)
         end
       end,
-      intent: %{command: :msetnx, keys: %{targets: keys}},
-      tx_entry: {"MSETNX", args, {:msetnx, args}},
       store: store
     )
   end
 
+  defp keys_on_one_shard?([first | rest], store) do
+    shard_index = Router.shard_for(store, first)
+    Enum.all?(rest, &(Router.shard_for(store, &1) == shard_index))
+  end
+
+  defp keys_on_one_shard?([], _store), do: true
+
   defp mset_validate([]), do: :ok
 
-  defp mset_validate([k, _v | rest]) do
+  defp mset_validate([k, _value | rest]) do
     if k == "" or byte_size(k) > @max_key_bytes do
       {:error, "ERR key too large or empty"}
     else

@@ -356,20 +356,15 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     test "wrapped command with high logical counter merges correctly", %{state: state} do
       # Simulate a remote leader with a very high logical counter.
       # This tests that the HLC merge handles high logical values.
-      wall = System.os_time(:millisecond)
-      hlc_ts = {wall, 99_999}
+      remote_physical = System.os_time(:millisecond) + 50
+      hlc_ts = {remote_physical, 99_999}
       stamped = {{:put, "high_log_key", "val", 0}, %{hlc_ts: hlc_ts}}
 
       {_new_state, :ok} = StateMachine.apply(%{}, stamped, state)
 
-      {after_phys, after_log} = HLC.now()
-      assert after_phys >= wall
-
-      # If the physical component is the same as the remote, the logical
-      # should be higher than the remote's 99_999.
-      if after_phys == wall do
-        assert after_log > 99_999
-      end
+      after_timestamp = HLC.now()
+      assert HLC.compare(after_timestamp, hlc_ts) == :gt
+      assert elem(after_timestamp, 0) > remote_physical
     end
   end
 

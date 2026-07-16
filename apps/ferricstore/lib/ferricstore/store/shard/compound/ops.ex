@@ -709,7 +709,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
           |> Enum.reduce(
             %{new_state | pending: new_pending, pending_count: length(new_pending)},
             fn compound_key, acc ->
-            ZSetIndex.apply_delete(acc, redis_key, compound_key)
+              ZSetIndex.apply_delete(acc, redis_key, compound_key)
             end
           )
           |> Map.update!(:write_version, &(&1 + length(compound_keys)))
@@ -727,7 +727,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
          redis_key,
          compound_keys,
          {:promoted, dedicated_path},
-       state
+         state
        ) do
     Promotion.await_compaction_latch(state, redis_key)
 
@@ -801,7 +801,7 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
             new_state = cleanup_promoted_prefix!(new_state, redis_key, cleanup_target)
 
             new_state =
-              %{new_state | write_version: new_state.write_version + 1}
+              %{new_state | write_version: state.write_version + 1}
               |> compound_member_index_delete_prefix(prefix)
               |> ZSetIndex.clear_ready_key(redis_key)
 

@@ -175,6 +175,17 @@ defmodule FerricstoreServer.Connection.Auth do
     end
   end
 
+  @spec check_prepared_resources_cached(
+          map() | :full_access | :denied | nil,
+          PreparedCommand.t()
+        ) :: :ok | {:error, binary()}
+  def check_prepared_resources_cached(cache, %PreparedCommand{} = prepared) do
+    with :ok <- ensure_acl_projection_ready(),
+         :ok <- do_check_channels_cached(cache, prepared.channel_keys) do
+      do_check_keys_cached(cache, prepared)
+    end
+  end
+
   @spec check_channels_cached(map() | :full_access | :denied | nil, [binary()]) ::
           :ok | {:error, binary()}
   def check_channels_cached(cache, channels) do

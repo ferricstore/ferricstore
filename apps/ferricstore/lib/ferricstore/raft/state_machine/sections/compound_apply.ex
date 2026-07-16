@@ -90,25 +90,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp apply_delete_batch_keys(state, keys) do
-        case Map.get(state, :cross_shard_locks, %{}) do
-          locks when map_size(locks) == 0 ->
-            case apply_delete_batch_keys_fast(state, keys) do
-              :fallback ->
-                Enum.map(keys, fn key -> do_delete(state, key) end)
-
-              results ->
-                results
-            end
-
-          _locks ->
+        case apply_delete_batch_keys_fast(state, keys) do
+          :fallback ->
             Enum.map(keys, fn key ->
               redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
-              case check_key_lock(state, redis_key, nil) do
+              case check_fetch_or_compute_lock(state, redis_key, nil) do
                 :ok -> do_delete(state, key)
                 {:error, :key_locked} -> {:error, :key_locked}
               end
             end)
+
+          results ->
+            results
         end
       end
 
@@ -117,22 +111,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
           not compound_put_entries_for_key?(redis_key, entries) ->
             {:error, :compound_batch_cross_key}
 
-          Map.get(state, :cross_shard_locks, %{}) != %{} ->
-            compound_batch_lock_checked_results(state, redis_key, entries, fn ->
+          true ->
+            compound_batch_checked_results(state, redis_key, entries, fn ->
               do_apply_compound_batch_put_entries_unlocked(state, redis_key, entries)
             end)
-
-          true ->
-            case check_key_lock(state, redis_key, nil) do
-              :ok ->
-                case do_apply_compound_batch_put_entries_unlocked(state, redis_key, entries) do
-                  :ok -> List.duplicate(:ok, length(entries))
-                  {:error, _reason} = error -> error
-                end
-
-              {:error, :key_locked} = error ->
-                List.duplicate(error, length(entries))
-            end
         end
       end
 
@@ -171,24 +153,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         with true <- compound_blob_put_entries_for_key?(redis_key, entries),
              :ok <- validate_raw_compound_blob_batch_target(state, redis_key, entries),
              {:ok, prepared_entries} <- prepare_compound_blob_batch_entries(state, entries) do
-          cond do
-            Map.get(state, :cross_shard_locks, %{}) != %{} ->
-              compound_batch_lock_checked_results(state, redis_key, entries, fn ->
-                do_compound_blob_batch_put(state, redis_key, prepared_entries)
-              end)
-
-            true ->
-              case check_key_lock(state, redis_key, nil) do
-                :ok ->
-                  case do_compound_blob_batch_put(state, redis_key, prepared_entries) do
-                    :ok -> List.duplicate(:ok, length(entries))
-                    {:error, _reason} = error -> error
-                  end
-
-                {:error, :key_locked} = error ->
-                  List.duplicate(error, length(entries))
-              end
-          end
+          compound_batch_checked_results(state, redis_key, entries, fn ->
+            do_compound_blob_batch_put(state, redis_key, prepared_entries)
+          end)
         else
           false -> {:error, :compound_batch_cross_key}
           {:error, _reason} = error -> error
@@ -453,27 +420,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
           not compound_delete_keys_for_key?(redis_key, compound_keys) ->
             {:error, :compound_batch_cross_key}
 
-          Map.get(state, :cross_shard_locks, %{}) != %{} ->
-            compound_batch_lock_checked_results(state, redis_key, compound_keys, fn ->
+          true ->
+            compound_batch_checked_results(state, redis_key, compound_keys, fn ->
               do_compound_batch_delete(state, redis_key, compound_keys)
             end)
-
-          true ->
-            case check_key_lock(state, redis_key, nil) do
-              :ok ->
-                case do_compound_batch_delete(state, redis_key, compound_keys) do
-                  :ok -> List.duplicate(:ok, length(compound_keys))
-                  {:error, _reason} = error -> error
-                end
-
-              {:error, :key_locked} = error ->
-                List.duplicate(error, length(compound_keys))
-            end
         end
       end
 
-      defp compound_batch_lock_checked_results(state, redis_key, items, fun) do
-        case check_key_lock(state, redis_key, nil) do
+      defp compound_batch_checked_results(state, redis_key, items, fun) do
+        case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok ->
             case fun.() do
               :ok -> List.duplicate(:ok, length(items))

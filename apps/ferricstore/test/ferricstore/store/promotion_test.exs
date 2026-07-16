@@ -28,40 +28,22 @@ defmodule Ferricstore.Store.PromotionTest do
 
   setup_all do
     ShardHelpers.wait_shards_alive()
+
+    apply_context_snapshot =
+      ShardHelpers.replace_default_apply_context(promotion_threshold: @test_threshold)
+
+    on_exit(fn ->
+      ShardHelpers.restore_default_apply_context(apply_context_snapshot)
+      ShardHelpers.wait_shards_alive()
+    end)
+
     :ok
   end
 
   setup do
-    # Store the original threshold (if any) and set a low one for tests.
-    original = Application.get_env(:ferricstore, :promotion_threshold)
-
-    original_pt =
-      try do
-        :persistent_term.get(:ferricstore_promotion_threshold)
-      rescue
-        ArgumentError -> :not_set
-      end
-
-    Application.put_env(:ferricstore, :promotion_threshold, @test_threshold)
-    :persistent_term.put(:ferricstore_promotion_threshold, @test_threshold)
-
     ShardHelpers.flush_all_keys()
-
-    on_exit(fn ->
-      # Restore original threshold.
-      if original do
-        Application.put_env(:ferricstore, :promotion_threshold, original)
-      else
-        Application.delete_env(:ferricstore, :promotion_threshold)
-      end
-
-      case original_pt do
-        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
-        val -> :persistent_term.put(:ferricstore_promotion_threshold, val)
-      end
-
-      ShardHelpers.wait_shards_alive()
-    end)
+    on_exit(fn -> ShardHelpers.wait_shards_alive() end)
+    :ok
   end
 
   use Ferricstore.Store.PromotionTest.Sections.PromotionBatchesSharedTombstonesAfterDedicatedCopy
@@ -170,6 +152,13 @@ defmodule Ferricstore.Store.PromotionTest do
       )
 
     GenServer.call(shard, {:promoted?, redis_key})
+  end
+
+  defp assert_promoted(redis_key) do
+    ShardHelpers.eventually(
+      fn -> promoted?(redis_key) end,
+      "expected #{inspect(redis_key)} to finish promotion"
+    )
   end
 
   defp promoted_state(shard, redis_key, attempts \\ 50)

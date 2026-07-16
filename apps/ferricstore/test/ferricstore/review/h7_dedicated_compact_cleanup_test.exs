@@ -16,32 +16,13 @@ defmodule Ferricstore.Review.H7DedicatedCompactCleanupTest do
   @test_threshold 5
 
   setup do
-    original = Application.get_env(:ferricstore, :promotion_threshold)
-
-    original_pt =
-      try do
-        :persistent_term.get(:ferricstore_promotion_threshold)
-      rescue
-        ArgumentError -> :not_set
-      end
-
-    Application.put_env(:ferricstore, :promotion_threshold, @test_threshold)
-    :persistent_term.put(:ferricstore_promotion_threshold, @test_threshold)
+    apply_context_snapshot =
+      ShardHelpers.replace_default_apply_context(promotion_threshold: @test_threshold)
 
     ShardHelpers.flush_all_keys()
 
     on_exit(fn ->
-      if original do
-        Application.put_env(:ferricstore, :promotion_threshold, original)
-      else
-        Application.delete_env(:ferricstore, :promotion_threshold)
-      end
-
-      case original_pt do
-        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
-        val -> :persistent_term.put(:ferricstore_promotion_threshold, val)
-      end
-
+      ShardHelpers.restore_default_apply_context(apply_context_snapshot)
       ShardHelpers.wait_shards_alive()
     end)
   end
@@ -139,7 +120,11 @@ defmodule Ferricstore.Review.H7DedicatedCompactCleanupTest do
     Hash.handle("HSET", [key | pairs], store)
 
     dir = dedicated_dir(key)
-    assert File.exists?(dir)
+
+    ShardHelpers.eventually(
+      fn -> File.exists?(dir) end,
+      "hash should be promoted before compact cleanup setup"
+    )
 
     # Create a fake leftover compact file
     compact_file = Path.join(dir, "compact_0.log")

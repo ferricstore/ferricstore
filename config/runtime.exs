@@ -317,6 +317,8 @@ if config_env() == :prod do
         limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MAX_ETS_ENTRIES"),
       waraft_segment_log_min_ets_entries:
         limit_env.("FERRICSTORE_WARAFT_SEGMENT_LOG_MIN_ETS_ENTRIES"),
+      waraft_apply_projection_cache_max_bytes:
+        limit_env.("FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_BYTES"),
       waraft_apply_projection_cache_max_entries:
         limit_env.("FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_ENTRIES")
     ]

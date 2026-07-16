@@ -23,10 +23,16 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
 
         test "redirects removed Flow config page to global config" do
           port = HealthEndpoint.port()
-          response = http_get(port, "/dashboard/flow/config")
 
-          assert response =~ "HTTP/1.1 302 Found"
-          assert response =~ "Location: /dashboard/config"
+          for path <- [
+                "/dashboard/flow/config",
+                "/dashboard/flow/config?source=flow-sidebar"
+              ] do
+            response = http_get(port, path)
+
+            assert response =~ "HTTP/1.1 302 Found"
+            assert response =~ "Location: /dashboard/config"
+          end
         end
 
         test "returns 200 with Flow detail page HTML" do
@@ -151,7 +157,9 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
           for {path, title} <- [
                 {"/dashboard/flow/states", "Flow States"},
                 {"/dashboard/flow/workers", "Flow Workers"},
+                {"/dashboard/flow/workers?refresh=1", "Flow Workers"},
                 {"/dashboard/flow/due", "Due / Scheduled"},
+                {"/dashboard/flow/due?refresh=1", "Due / Scheduled"},
                 {"/dashboard/flow/failures", "Flow Failures"},
                 {"/dashboard/flow/lineage", "Flow Lineage"},
                 {"/dashboard/flow/query", "Flow Query Explorer"},
@@ -165,6 +173,24 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
             assert response =~ "HTTP/1.1 200 OK"
             assert response =~ "text/html"
             assert response |> extract_body() |> String.contains?(title)
+          end
+        end
+
+        test "Flow workers and due live endpoints preserve their route with query strings" do
+          port = HealthEndpoint.port()
+
+          for {path, component} <- [
+                {"/dashboard/api/flow/workers?refresh=1", "flow_workers"},
+                {"/dashboard/api/flow/due?refresh=1", "flow_due_now"}
+              ] do
+            response = http_get(port, path)
+
+            assert response =~ "HTTP/1.1 200 OK"
+            assert response =~ "application/json"
+
+            decoded = response |> extract_body() |> Jason.decode!()
+            assert is_binary(decoded["components"][component])
+            refute Map.has_key?(decoded["components"], "flow_detail")
           end
         end
 
@@ -188,10 +214,16 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.HttpFlowRoutes do
 
         test "redirects removed Flow projections page back to overview" do
           port = HealthEndpoint.port()
-          response = http_get(port, "/dashboard/flow/projections")
 
-          assert response =~ "HTTP/1.1 302 Found"
-          assert response =~ "Location: /dashboard/flow"
+          for path <- [
+                "/dashboard/flow/projections",
+                "/dashboard/flow/projections?partition_key=tenant-a"
+              ] do
+            response = http_get(port, path)
+
+            assert response =~ "HTTP/1.1 302 Found"
+            assert response =~ "Location: /dashboard/flow"
+          end
         end
 
         test "POST /dashboard/flow/policies creates policy and redirects with status" do

@@ -375,8 +375,6 @@ defmodule Ferricstore.QuorumMetrics do
           :put,
           :put_blob_ref,
           :delete,
-          :locked_put,
-          :locked_delete,
           :compound_put,
           :compound_delete,
           :put_batch,
@@ -480,8 +478,6 @@ defmodule Ferricstore.QuorumMetrics do
         enum_label(Map.get(metadata, :command_shape), [
           :put,
           :put_blob_ref,
-          :locked_put,
-          :locked_delete,
           :compound_put,
           :compound_delete,
           :put_batch,

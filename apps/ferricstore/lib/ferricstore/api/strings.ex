@@ -651,8 +651,12 @@ defmodule FerricStore.API.Strings do
 
   """
   @spec msetnx(%{key() => value()}) :: {:ok, boolean()}
+  def msetnx(pairs) when map_size(pairs) == 0, do: {:ok, true}
+
   def msetnx(pairs) when is_map(pairs) do
-    case Router.atomic_msetnx(default_ctx(), Map.to_list(pairs)) do
+    args = Enum.flat_map(pairs, fn {key, value} -> [key, value] end)
+
+    case Strings.handle_ast({:msetnx, args}, default_ctx()) do
       {:error, _} = err -> err
       1 -> {:ok, true}
       0 -> {:ok, false}

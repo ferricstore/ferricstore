@@ -1158,7 +1158,7 @@ defmodule Ferricstore.Store.Router.Part09 do
                ctx,
                shard_for(ctx, key),
                key,
-               {:unlock_keys_owned, [key], owner}
+               {:fetch_or_compute_release, key, owner}
              ) do
           :ok -> :ok
           {:error, reason} -> fetch_or_compute_owner_error(reason)

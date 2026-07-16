@@ -107,6 +107,15 @@ defmodule Ferricstore.Test.ShardHelpersTest do
     assert ShardHelpers.wait_default_pipeline_ready(5_000) == :ok
   end
 
+  test "flush_all_keys does not restart a healthy WARaft backend" do
+    server_name = :wa_raft_server.registered_name(:ferricstore_waraft_backend, 1)
+    server_pid = Process.whereis(server_name)
+
+    assert is_pid(server_pid)
+    assert :ok = ShardHelpers.flush_all_keys()
+    assert Process.whereis(server_name) == server_pid
+  end
+
   test "wait_default_quorum_writable clears leaked write pressure before probing" do
     ctx = FerricStore.Instance.get(:default)
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)

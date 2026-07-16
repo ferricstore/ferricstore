@@ -69,8 +69,11 @@ defmodule Ferricstore.Store.Shard.Info do
         end
       end
 
-      def handle_info({:maybe_promote_after_commit, redis_key, compound_key}, state) do
-        {:noreply, ShardCompound.maybe_promote(state, redis_key, compound_key)}
+      def handle_info(
+            {:maybe_promote_after_commit, redis_key, compound_key, threshold},
+            state
+          ) do
+        {:noreply, ShardCompound.maybe_promote(state, redis_key, compound_key, threshold)}
       end
 
       def handle_info({:start_compound_promotion, redis_key, type}, state) do
@@ -352,6 +355,18 @@ defmodule Ferricstore.Store.Shard.Info do
           |> maybe_start_pending_promoted_compaction()
 
         {:noreply, state}
+      end
+
+      def handle_info(
+            {:DOWN, monitor_ref, :process, owner_pid, _reason},
+            %{
+              standalone_write_barrier: %{
+                monitor_ref: monitor_ref,
+                owner_pid: owner_pid
+              }
+            } = state
+          ) do
+        {:noreply, release_standalone_write_barrier(state)}
       end
 
       def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do

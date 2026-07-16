@@ -40,8 +40,15 @@ defmodule Ferricstore.Flow.Governance.ApprovalCatalogRepair do
     with {:ok, {cursor, persisted?}} <- load_progress(ctx, progress_key, :source) do
       case Catalog.page(ctx, :approval, cursor, @page_size) do
         {:ok, %{keys: keys, next_cursor: next_cursor}} ->
-          with :ok <- reconcile_source(ctx, keys, source_targets) do
-            persist_source_progress(ctx, progress_key, next_cursor, persisted?)
+          with {:ok, last_retained} <- reconcile_source(ctx, keys, source_targets) do
+            persist_source_progress(
+              ctx,
+              progress_key,
+              cursor,
+              next_cursor,
+              last_retained,
+              persisted?
+            )
           end
 
         {:error, @catalog_changed} ->
@@ -85,27 +92,28 @@ defmodule Ferricstore.Flow.Governance.ApprovalCatalogRepair do
   end
 
   defp reconcile_source(ctx, keys, source_targets) do
-    Enum.reduce_while(keys, :ok, fn key, :ok ->
-      operation =
+    Enum.reduce_while(keys, {:ok, nil}, fn key, {:ok, last_retained} ->
+      {operation, next_last_retained} =
         case source_targets.(key) do
           {:ok, catalog_keys} when is_list(catalog_keys) ->
-            ensure_catalogs_present(ctx, key, catalog_keys)
+            {ensure_catalogs_present(ctx, key, catalog_keys), key}
 
           :missing ->
-            Catalog.unregister_key(ctx, Keys.governance_catalog_key(:approval), key)
+            {Catalog.unregister_key(ctx, Keys.governance_catalog_key(:approval), key),
+             last_retained}
 
           :skip ->
-            :ok
+            {:ok, key}
 
           {:error, _reason} = error ->
-            error
+            {error, last_retained}
 
           _invalid ->
-            {:error, "ERR flow approval catalog repair source is invalid"}
+            {{:error, "ERR flow approval catalog repair source is invalid"}, last_retained}
         end
 
       case operation do
-        :ok -> {:cont, :ok}
+        :ok -> {:cont, {:ok, next_last_retained}}
         {:error, _reason} = error -> {:halt, error}
       end
     end)
@@ -179,14 +187,23 @@ defmodule Ferricstore.Flow.Governance.ApprovalCatalogRepair do
     end
   end
 
-  defp persist_source_progress(ctx, progress_key, nil, true),
+  defp persist_source_progress(ctx, progress_key, _cursor, nil, _last_retained, true),
     do: Router.delete(ctx, progress_key)
 
-  defp persist_source_progress(_ctx, _progress_key, nil, false), do: :ok
+  defp persist_source_progress(_ctx, _progress_key, _cursor, nil, _last_retained, false),
+    do: :ok
 
-  defp persist_source_progress(ctx, progress_key, next_cursor, _persisted?)
-       when is_binary(next_cursor),
-       do: persist_progress(ctx, progress_key, :source, next_cursor)
+  defp persist_source_progress(
+         ctx,
+         progress_key,
+         cursor,
+         next_cursor,
+         last_retained,
+         _persisted?
+       )
+       when is_binary(next_cursor) do
+    persist_progress(ctx, progress_key, :source, last_retained || cursor)
+  end
 
   defp load_progress(ctx, progress_key, identity) do
     case Router.get(ctx, progress_key) do

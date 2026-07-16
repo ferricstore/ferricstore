@@ -372,11 +372,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.RoleMembershipMappingPart2 do
             {:error, :simulated_cleanup_failure}
           end)
 
-          Process.put(:ferricstore_cluster_manager_direct_sync_hook, fn ^target, _ctx ->
-            send(parent, :direct_sync)
-            {:ok, %{0 => 1}}
-          end)
-
           Process.put(:ferricstore_cluster_manager_do_add_node_hook, fn ^target, :voter, _state ->
             send(parent, :raft_add)
             {:ok, %{0 => :ok}}
@@ -386,7 +381,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.RoleMembershipMappingPart2 do
             Process.delete(:ferricstore_cluster_manager_target_has_data_hook)
             Process.delete(:ferricstore_cluster_manager_read_target_cluster_state_hook)
             Process.delete(:ferricstore_cluster_manager_cleanup_target_data_hook)
-            Process.delete(:ferricstore_cluster_manager_direct_sync_hook)
             Process.delete(:ferricstore_cluster_manager_do_add_node_hook)
           end)
 
@@ -412,7 +406,6 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.RoleMembershipMappingPart2 do
                    )
 
           refute_received :target_data_cleanup
-          refute_received :direct_sync
           refute_received :raft_add
           refute MapSet.member?(new_state.known_nodes, target)
         end

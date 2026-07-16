@@ -433,9 +433,9 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
         refute_receive {:retention_command, :terminal, _other_command}, 100
 
         assert :ok = Ferricstore.Raft.WARaftBackend.start(ctx)
-        assert :ok = Ferricstore.Raft.Backend.write(0, {:clear_locks})
+        assert :ok = Ferricstore.Raft.Backend.write(0, {:clear_key_locks})
         assert :ok = Ferricstore.Raft.WARaftBackend.start(ctx)
-        assert :ok = Ferricstore.Raft.Backend.write(0, {:clear_locks})
+        assert :ok = Ferricstore.Raft.Backend.write(0, {:clear_key_locks})
       end
 
       test "terminal cleanup requires trusted backfill verification and the exact watermark" do
@@ -673,13 +673,12 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
                  FerricStore.flow_get(expired_id, partition_key: partition_key)
       end
 
-      test "claim_due defers an expired child whose parent is on another shard" do
+      test "spawn rejects max-active child dependencies across independent groups" do
         parent = uid("flow-active-timeout-claim-parent")
         child = uid("flow-active-timeout-claim-child")
         type = uid("active-timeout-claim-child-type")
         {parent_partition, _same_partition, child_partition} = mixed_partition_keys()
         create_now = System.system_time(:millisecond) + 60_000
-        timeout_now = create_now + 100
 
         assert {:ok, created_parent} =
                  flow_create_and_get(parent,
@@ -690,8 +689,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
                    now_ms: create_now
                  )
 
-        assert {:ok, _waiting} =
-                 flow_spawn_children_and_get(
+        assert {:error, "CROSSSLOT Flow dependency keys must hash to the same shard"} =
+                 FerricStore.flow_spawn_children(
                    parent,
                    [
                      %{
@@ -714,37 +713,15 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
                    now_ms: create_now
                  )
 
-        assert {:ok, []} =
-                 FerricStore.flow_claim_due(type,
-                   worker: "worker-active-timeout",
-                   partition_key: child_partition,
-                   now_ms: timeout_now
-                 )
-
-        assert {:ok, %{state: "queued"}} =
-                 FerricStore.flow_get(child, partition_key: child_partition)
-
-        assert {:ok, waiting_parent} =
+        assert {:ok, unchanged_parent} =
                  FerricStore.flow_get(parent, partition_key: parent_partition)
 
-        assert waiting_parent.state == "waiting_children"
-
-        assert waiting_parent.child_groups["timeout-claim-cross-group"]["children"][child] ==
-                 "running"
-
-        assert {:ok, %{active_timeouts: 1}} =
-                 FerricStore.flow_retention_cleanup(limit: 10, now_ms: timeout_now)
-
-        assert {:ok, %{state: "failed"}} =
-                 FerricStore.flow_get(child, partition_key: child_partition)
-
-        assert {:ok, failed_parent} =
-                 FerricStore.flow_get(parent, partition_key: parent_partition)
-
-        assert failed_parent.state == "children_failed"
+        assert unchanged_parent.state == "dispatch"
+        assert unchanged_parent.fencing_token == created_parent.fencing_token
+        assert {:ok, nil} = FerricStore.flow_get(child, partition_key: child_partition)
       end
 
-      test "deferred cross-shard timeouts do not starve a later eligible claim" do
+      test "rejected cross-shard timeout dependencies do not starve an eligible claim" do
         parent = uid("flow-active-timeout-claim-many-parent")
         type = uid("active-timeout-claim-many-child-type")
         {parent_partition, _same_partition, child_partition} = mixed_partition_keys()
@@ -771,8 +748,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
                    now_ms: create_now
                  )
 
-        assert {:ok, _waiting} =
-                 flow_spawn_children_and_get(
+        assert {:error, "CROSSSLOT Flow dependency keys must hash to the same shard"} =
+                 FerricStore.flow_spawn_children(
                    parent,
                    children,
                    group_id: "timeout-claim-many-cross-group",
@@ -849,7 +826,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
                    now_ms: timeout_now
                  )
 
-        assert {:ok, %{state: "queued"}} =
+        assert {:ok, nil} =
                  FerricStore.flow_get(hd(children).id, partition_key: child_partition)
       end
 
@@ -953,11 +930,12 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
         assert failed.error == %{reason: "max_active_ms", max_active_ms: 100}
       end
 
-      test "complete enforces max_active_ms for a child whose parent is on another shard" do
+      test "complete enforces max_active_ms for a colocated child and parent" do
         parent = uid("flow-active-timeout-complete-parent")
         child = uid("flow-active-timeout-complete-child")
         type = uid("active-timeout-complete-child-type")
-        {parent_partition, _same_partition, child_partition} = mixed_partition_keys()
+        {parent_partition, _same_partition, _other_partition} = mixed_partition_keys()
+        child_partition = parent_partition
         create_now = System.system_time(:millisecond) + 60_000
         timeout_now = create_now + 100
 
@@ -1201,11 +1179,12 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
                  )
       end
 
-      test "timeout cleanup propagates a child failure to a parent on another shard" do
+      test "timeout cleanup propagates a child failure to a colocated parent" do
         ctx = FerricStore.Instance.get(:default)
         parent = uid("flow-active-timeout-cross-parent")
         child = uid("flow-active-timeout-cross-child")
-        {parent_partition, _same_partition, child_partition} = mixed_partition_keys()
+        {parent_partition, _same_partition, _other_partition} = mixed_partition_keys()
+        child_partition = parent_partition
         now = System.system_time(:millisecond) + 60_000
 
         assert {:ok, created_parent} =
@@ -1241,7 +1220,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
                    now_ms: now
                  )
 
-        assert shard_for(Ferricstore.Flow.Keys.state_key(parent, parent_partition)) !=
+        assert shard_for(Ferricstore.Flow.Keys.state_key(parent, parent_partition)) ==
                  shard_for(Ferricstore.Flow.Keys.state_key(child, child_partition))
 
         assert {:ok, %{active_timeouts: 1}} =
@@ -1257,9 +1236,9 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
         assert failed_parent.child_groups["timeout-cross-group"]["children"][child] == "failed"
 
         assert :ok = Ferricstore.Raft.WARaftBackend.start(ctx)
-        assert :ok = Ferricstore.Raft.Backend.write(0, {:clear_locks})
+        assert :ok = Ferricstore.Raft.Backend.write(0, {:clear_key_locks})
         assert :ok = Ferricstore.Raft.WARaftBackend.start(ctx)
-        assert :ok = Ferricstore.Raft.Backend.write(0, {:clear_locks})
+        assert :ok = Ferricstore.Raft.Backend.write(0, {:clear_key_locks})
       end
 
       test "max active deadlines are projected into a bounded hot index" do

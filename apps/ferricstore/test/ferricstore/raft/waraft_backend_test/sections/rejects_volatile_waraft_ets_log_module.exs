@@ -500,7 +500,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         end
       end
 
-      test "unified segment fast paths route through lock-aware apply when keys are locked", %{
+      test "unified segment fast paths check exact fetch-or-compute locks", %{
         ctx: ctx
       } do
         previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
@@ -510,7 +510,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
 
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
-          owner = make_ref()
+          owner = "segment-lock-owner"
           expires_at = Ferricstore.HLC.now_ms() + 60_000
 
           put_key = "segment-lock:put"
@@ -530,13 +530,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
             assert :ok = WARaftBackend.write(0, {:put, key, "old", 0})
           end
 
-          assert :ok =
-                   WARaftBackend.write(0, {
-                     :lock_keys,
-                     [put_key, delete_key, batch_put_locked, batch_delete_locked],
-                     owner,
-                     expires_at
-                   })
+          for key <- [put_key, delete_key, batch_put_locked, batch_delete_locked] do
+            assert :ok =
+                     WARaftBackend.write(
+                       0,
+                       {:fetch_or_compute_lock, key, Ferricstore.FetchOrCompute.Outcome.key(key),
+                        owner, expires_at}
+                     )
+          end
 
           assert {:error, :key_locked} = WARaftBackend.write(0, {:put, put_key, "new", 0})
           assert {:error, :key_locked} = WARaftBackend.write(0, {:delete, delete_key})
@@ -567,7 +568,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         end
       end
 
-      test "unified segment fast path stays enabled for keys unrelated to active locks", %{
+      test "unified segment fast path stays enabled for unrelated fetch-or-compute locks", %{
         ctx: ctx
       } do
         previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
@@ -577,12 +578,18 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
 
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
-          owner = make_ref()
+          owner = "segment-unrelated-owner"
           expires_at = Ferricstore.HLC.now_ms() + 60_000
           locked_key = "segment-lock:unrelated-locked"
           free_key = "segment-lock:unrelated-free"
 
-          assert :ok = WARaftBackend.write(0, {:lock_keys, [locked_key], owner, expires_at})
+          assert :ok =
+                   WARaftBackend.write(
+                     0,
+                     {:fetch_or_compute_lock, locked_key,
+                      Ferricstore.FetchOrCompute.Outcome.key(locked_key), owner, expires_at}
+                   )
+
           assert :ok = WARaftBackend.write(0, {:put, free_key, "free", 0})
 
           assert [{^free_key, _value, 0, _lfu, {:waraft_segment, _index}, _offset, _size}] =
@@ -594,7 +601,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         end
       end
 
-      test "unified segment lock expiry uses stamped command time on replay", %{ctx: ctx} do
+      test "fetch-or-compute lock expiry uses stamped command time on replay", %{ctx: ctx} do
         previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
 
         try do
@@ -603,7 +610,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
           key = "segment-lock:stamped-expiry"
-          owner = make_ref()
+          owner = "segment-stamped-owner"
           local_now = Ferricstore.HLC.now_ms()
           stamped_now = local_now - 20_000
           expires_after_stamp_before_local_now = stamped_now + 10_000
@@ -611,12 +618,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
           assert :ok = WARaftBackend.write(0, {:put, key, "old", 0})
 
           assert :ok =
-                   WARaftBackend.write(0, {
-                     :lock_keys,
-                     [key],
-                     owner,
-                     expires_after_stamp_before_local_now
-                   })
+                   WARaftBackend.write(
+                     0,
+                     {:fetch_or_compute_lock, key, Ferricstore.FetchOrCompute.Outcome.key(key),
+                      owner, expires_after_stamp_before_local_now}
+                   )
 
           assert {:error, :key_locked} =
                    WARaftBackend.write(0, {

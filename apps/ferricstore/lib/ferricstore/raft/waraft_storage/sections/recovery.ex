@@ -107,8 +107,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           [:ferricstore, :waraft, :apply_projection_cache, :compact],
           %{
             count: Map.get(metadata, :count, 0),
-            limit: Map.get(metadata, :limit, 0),
+            limit: apply_projection_cache_measurement(Map.get(metadata, :limit, 0)),
             spill_count: Map.get(metadata, :spill_count, 0),
+            bytes: Map.get(metadata, :bytes, 0),
+            byte_limit: apply_projection_cache_measurement(Map.get(metadata, :byte_limit, 0)),
+            spill_bytes: Map.get(metadata, :spill_bytes, 0),
             duration_us: duration_us
           },
           %{
@@ -132,6 +135,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       defp apply_projection_cache_compaction_reason({:ok, _removed}), do: nil
       defp apply_projection_cache_compaction_reason({:error, reason}), do: reason
       defp apply_projection_cache_compaction_reason(other), do: other
+
+      defp apply_projection_cache_measurement(value)
+           when is_integer(value) and value >= 0,
+           do: value
+
+      defp apply_projection_cache_measurement(_infinity_or_invalid), do: 0
 
       defp build_sm_state(ctx, shard_index, persisted_apply_context \\ nil) do
         data_dir = ctx.data_dir
@@ -520,7 +529,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
             meta_from_position(position),
             sm_state,
             fn batch ->
-              recover_segment_projection_batch(position, batch)
+              recover_segment_projection_batch(sm_state, position, batch)
             end
           )
 
@@ -535,11 +544,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         end
       end
 
-      defp recover_segment_projection_batch(position, batch) do
+      defp recover_segment_projection_batch(sm_state, position, batch) do
         index = position_index(position)
 
         if index > 0 do
-          {:ok, {:waraft_segment, index}, apply_projection_locations(batch, 0)}
+          :ok = cache_apply_projection_batch(sm_state, index, batch)
+          {:ok, {:waraft_apply_projection, index}, apply_projection_locations(batch, 0)}
         else
           {:error, {:bad_waraft_recovery_projection_position, position}}
         end

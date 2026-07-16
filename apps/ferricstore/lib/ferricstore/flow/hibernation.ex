@@ -1501,7 +1501,7 @@ defmodule Ferricstore.Flow.Hibernation do
        when is_map(park) do
     Locator.valid?(locator) and
       bounded_binary?(locator.flow_id) and
-      u64?(Map.get(park, :due_at_ms)) and
+      optional_u64?(Map.get(park, :due_at_ms)) and
       Map.get(park, :locator, locator) == locator and
       optional_bounded_binary?(Map.get(row, :park_key)) and
       optional_bounded_binary?(Map.get(row, :due_key))

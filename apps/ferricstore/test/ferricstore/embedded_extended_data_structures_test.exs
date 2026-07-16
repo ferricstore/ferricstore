@@ -222,55 +222,49 @@ defmodule Ferricstore.EmbeddedExtendedDataStructuresTest do
 
   describe "embedded value size limits" do
     test "set rejects value larger than max_value_size" do
-      original = Application.get_env(:ferricstore, :max_value_size)
-      Application.put_env(:ferricstore, :max_value_size, 100)
+      snapshot =
+        Ferricstore.Test.ShardHelpers.replace_default_apply_context(max_value_size: 100)
 
-      try do
-        large_value = :binary.copy("x", 101)
-        assert {:error, msg} = FerricStore.set("valsize:big", large_value)
-        assert msg =~ "value too large"
-        assert msg =~ "101 bytes"
-        assert msg =~ "max 100 bytes"
-      after
-        if original,
-          do: Application.put_env(:ferricstore, :max_value_size, original),
-          else: Application.delete_env(:ferricstore, :max_value_size)
-      end
+      on_exit(fn ->
+        Ferricstore.Test.ShardHelpers.restore_default_apply_context(snapshot)
+      end)
+
+      large_value = :binary.copy("x", 101)
+      assert {:error, msg} = FerricStore.set("valsize:big", large_value)
+      assert msg =~ "value too large"
+      assert msg =~ "101 bytes"
+      assert msg =~ "max 100 bytes"
     end
 
     test "set accepts value exactly at max_value_size" do
-      original = Application.get_env(:ferricstore, :max_value_size)
-      Application.put_env(:ferricstore, :max_value_size, 100)
+      snapshot =
+        Ferricstore.Test.ShardHelpers.replace_default_apply_context(max_value_size: 100)
 
-      try do
-        exact_value = :binary.copy("x", 100)
-        assert :ok = FerricStore.set("valsize:exact", exact_value)
-        assert {:ok, ^exact_value} = FerricStore.get("valsize:exact")
-      after
-        if original,
-          do: Application.put_env(:ferricstore, :max_value_size, original),
-          else: Application.delete_env(:ferricstore, :max_value_size)
-      end
+      on_exit(fn ->
+        Ferricstore.Test.ShardHelpers.restore_default_apply_context(snapshot)
+      end)
+
+      exact_value = :binary.copy("x", 100)
+      assert :ok = FerricStore.set("valsize:exact", exact_value)
+      assert {:ok, ^exact_value} = FerricStore.get("valsize:exact")
     end
 
     test "set uses default 1MB limit when no config is set" do
-      original = Application.get_env(:ferricstore, :max_value_size)
-      Application.delete_env(:ferricstore, :max_value_size)
+      snapshot =
+        Ferricstore.Test.ShardHelpers.replace_default_apply_context(max_value_size: 1_048_576)
 
-      try do
-        # 1 MB should succeed
-        mb_value = :binary.copy("y", 1_048_576)
-        assert :ok = FerricStore.set("valsize:1mb", mb_value)
+      on_exit(fn ->
+        Ferricstore.Test.ShardHelpers.restore_default_apply_context(snapshot)
+      end)
 
-        # 1 MB + 1 byte should fail
-        over_value = :binary.copy("z", 1_048_577)
-        assert {:error, msg} = FerricStore.set("valsize:over1mb", over_value)
-        assert msg =~ "value too large"
-      after
-        if original,
-          do: Application.put_env(:ferricstore, :max_value_size, original),
-          else: Application.delete_env(:ferricstore, :max_value_size)
-      end
+      # 1 MB should succeed
+      mb_value = :binary.copy("y", 1_048_576)
+      assert :ok = FerricStore.set("valsize:1mb", mb_value)
+
+      # 1 MB + 1 byte should fail
+      over_value = :binary.copy("z", 1_048_577)
+      assert {:error, msg} = FerricStore.set("valsize:over1mb", over_value)
+      assert msg =~ "value too large"
     end
   end
 end

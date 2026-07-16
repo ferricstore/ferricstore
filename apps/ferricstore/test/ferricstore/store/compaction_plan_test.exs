@@ -152,6 +152,32 @@ defmodule Ferricstore.Store.CompactionPlanTest do
     assert :not_found = LMDB.get(lmdb_path, new_reverse)
   end
 
+  test "cold relocation returns a structured error for malformed park metadata", %{
+    shard_path: shard_path,
+    lmdb_path: lmdb_path
+  } do
+    locator = locator(offset: 10, value_size: 50)
+    park_key = LMDB.cold_park_key_for_state_key("flow/state/malformed")
+
+    park = %{
+      locator: locator,
+      state_key: "flow/state/malformed",
+      due_at_ms: "invalid"
+    }
+
+    assert {:ok, writer} = CompactionPlan.create(shard_path, 0)
+
+    assert :ok =
+             CompactionPlan.append(writer, [
+               {:cold, "flow/state/malformed", 10, 110, 60, park_key, park}
+             ])
+
+    assert {:ok, plan_path} = CompactionPlan.finish(writer)
+
+    assert {:error, :invalid_cold_row} =
+             CompactionPlan.relocate_cold(plan_path, lmdb_path, :forward)
+  end
+
   defp locator(overrides) do
     defaults = [
       flow_id: "flow-1",

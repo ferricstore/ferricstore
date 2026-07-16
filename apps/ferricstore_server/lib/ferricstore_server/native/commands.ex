@@ -2322,7 +2322,7 @@ defmodule FerricstoreServer.Native.Commands do
           ConnAuth.acl_command_name(prepared.command, prepared.args, prepared.ast)
 
         with :ok <- ConnAuth.check_command_cached(state.acl_cache, acl_command),
-             :ok <- ConnAuth.check_keys_cached(state.acl_cache, prepared) do
+             :ok <- ConnAuth.check_prepared_resources_cached(state.acl_cache, prepared) do
           :ok
         else
           {:error, reason} ->

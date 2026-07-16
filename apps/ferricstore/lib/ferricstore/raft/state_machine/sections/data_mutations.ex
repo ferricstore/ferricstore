@@ -890,28 +890,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       end
 
       # ---------------------------------------------------------------------------
-      # Private: cross-shard key locking (mini-percolator)
+      # Private: fetch-or-compute ownership locking
       # ---------------------------------------------------------------------------
 
-      @cross_shard_lock_prune_batch 256
+      @fetch_or_compute_lock_prune_batch 256
 
       # Locks all keys atomically. If any key is already locked by a different
       # owner (and not expired), rejects the entire batch.
       # Returns {new_state, result} — locks are persisted in Raft state.
-      defp do_lock_keys(state, keys, owner_ref, expire_at_ms) do
-        locks = Map.get(state, :cross_shard_locks, %{})
-        {state, expiry_index} = ensure_cross_shard_lock_expiry_index(state, locks)
+      defp do_acquire_fetch_or_compute_locks(state, keys, owner_ref, expire_at_ms) do
+        locks = Map.get(state, :fetch_or_compute_locks, %{})
+        {state, expiry_index} = ensure_fetch_or_compute_lock_expiry_index(state, locks)
         now = apply_now_ms()
 
         {locks, expiry_index} =
-          prune_cross_shard_lock_expiries(
+          prune_fetch_or_compute_lock_expiries(
             locks,
             expiry_index,
             now,
-            @cross_shard_lock_prune_batch
+            @fetch_or_compute_lock_prune_batch
           )
 
-        indexed_state = put_cross_shard_lock_state(state, locks, expiry_index)
+        indexed_state = put_fetch_or_compute_lock_state(state, locks, expiry_index)
 
         conflict =
           Enum.find(keys, fn key ->
@@ -927,7 +927,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         else
           {new_locks, new_expiry_index} =
             Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
-              index_acc = remove_cross_shard_lock_expiry(index_acc, key, Map.get(lock_acc, key))
+              index_acc =
+                remove_fetch_or_compute_lock_expiry(index_acc, key, Map.get(lock_acc, key))
 
               {
                 Map.put(lock_acc, key, {owner_ref, expire_at_ms}),
@@ -935,49 +936,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
               }
             end)
 
-          {put_cross_shard_lock_state(state, new_locks, new_expiry_index), :ok}
-        end
-      end
-
-      # Renews all requested locks only when the owner still has one continuous,
-      # live lease over every key. Validation is read-only so a failed batch
-      # cannot partially move either the lock map or its ordered expiry index.
-      defp do_renew_key_locks(state, keys, owner_ref, expire_at_ms) do
-        locks = Map.get(state, :cross_shard_locks, %{})
-        {indexed_state, expiry_index} = ensure_cross_shard_lock_expiry_index(state, locks)
-        now = apply_now_ms()
-
-        owns_all? =
-          Enum.all?(keys, fn key ->
-            case Map.get(locks, key) do
-              {^owner_ref, current_expiry} when current_expiry > now -> true
-              _missing_expired_or_other_owner -> false
-            end
-          end)
-
-        if owns_all? do
-          {new_locks, new_expiry_index} =
-            Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
-              current_lock = Map.fetch!(lock_acc, key)
-              index_acc = remove_cross_shard_lock_expiry(index_acc, key, current_lock)
-
-              {
-                Map.put(lock_acc, key, {owner_ref, expire_at_ms}),
-                :gb_trees.enter({expire_at_ms, key}, owner_ref, index_acc)
-              }
-            end)
-
-          {put_cross_shard_lock_state(indexed_state, new_locks, new_expiry_index), :ok}
-        else
-          {state, {:error, :not_lock_owner}}
+          {put_fetch_or_compute_lock_state(state, new_locks, new_expiry_index), :ok}
         end
       end
 
       # Unlocks keys owned by the given owner_ref.
       # Returns {new_state, :ok}.
-      defp do_unlock_keys(state, keys, owner_ref) do
-        locks = Map.get(state, :cross_shard_locks, %{})
-        {state, expiry_index} = ensure_cross_shard_lock_expiry_index(state, locks)
+      defp do_release_fetch_or_compute_locks(state, keys, owner_ref) do
+        locks = Map.get(state, :fetch_or_compute_locks, %{})
+        {state, expiry_index} = ensure_fetch_or_compute_lock_expiry_index(state, locks)
 
         {new_locks, new_expiry_index} =
           Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
@@ -985,7 +952,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
               {^owner_ref, _exp} = lock ->
                 {
                   Map.delete(lock_acc, key),
-                  remove_cross_shard_lock_expiry(index_acc, key, lock)
+                  remove_fetch_or_compute_lock_expiry(index_acc, key, lock)
                 }
 
               _missing_or_other_owner ->
@@ -993,12 +960,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             end
           end)
 
-        {put_cross_shard_lock_state(state, new_locks, new_expiry_index), :ok}
+        {put_fetch_or_compute_lock_state(state, new_locks, new_expiry_index), :ok}
       end
 
-      defp do_unlock_keys_owned(state, keys, owner_ref) do
-        locks = Map.get(state, :cross_shard_locks, %{})
-        {state, expiry_index} = ensure_cross_shard_lock_expiry_index(state, locks)
+      defp do_release_fetch_or_compute_locks_owned(state, keys, owner_ref) do
+        locks = Map.get(state, :fetch_or_compute_locks, %{})
+        {state, expiry_index} = ensure_fetch_or_compute_lock_expiry_index(state, locks)
         now = apply_now_ms()
 
         owns_all? =
@@ -1016,18 +983,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
               {
                 Map.delete(lock_acc, key),
-                remove_cross_shard_lock_expiry(index_acc, key, lock)
+                remove_fetch_or_compute_lock_expiry(index_acc, key, lock)
               }
             end)
 
-          {put_cross_shard_lock_state(state, new_locks, new_expiry_index), :ok}
+          {put_fetch_or_compute_lock_state(state, new_locks, new_expiry_index), :ok}
         else
           {state, {:error, :not_lock_owner}}
         end
       end
 
-      defp ensure_cross_shard_lock_expiry_index(state, locks) do
-        case Map.fetch(state, :cross_shard_lock_expiries) do
+      defp ensure_fetch_or_compute_lock_expiry_index(state, locks) do
+        case Map.fetch(state, :fetch_or_compute_lock_expiries) do
           {:ok, expiry_index} ->
             {state, expiry_index}
 
@@ -1037,14 +1004,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                 :gb_trees.enter({expire_at_ms, key}, owner_ref, acc)
               end)
 
-            {Map.put(state, :cross_shard_lock_expiries, expiry_index), expiry_index}
+            {Map.put(state, :fetch_or_compute_lock_expiries, expiry_index), expiry_index}
         end
       end
 
-      defp prune_cross_shard_lock_expiries(locks, expiry_index, _now, 0),
+      defp prune_fetch_or_compute_lock_expiries(locks, expiry_index, _now, 0),
         do: {locks, expiry_index}
 
-      defp prune_cross_shard_lock_expiries(locks, expiry_index, now, remaining) do
+      defp prune_fetch_or_compute_lock_expiries(locks, expiry_index, now, remaining) do
         if :gb_trees.is_empty(expiry_index) do
           {locks, expiry_index}
         else
@@ -1061,26 +1028,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                 _missing_or_renewed -> locks
               end
 
-            prune_cross_shard_lock_expiries(locks, expiry_index, now, remaining - 1)
+            prune_fetch_or_compute_lock_expiries(locks, expiry_index, now, remaining - 1)
           end
         end
       end
 
-      defp remove_cross_shard_lock_expiry(expiry_index, _key, nil), do: expiry_index
+      defp remove_fetch_or_compute_lock_expiry(expiry_index, _key, nil), do: expiry_index
 
-      defp remove_cross_shard_lock_expiry(expiry_index, key, {_owner_ref, expire_at_ms}) do
+      defp remove_fetch_or_compute_lock_expiry(expiry_index, key, {_owner_ref, expire_at_ms}) do
         :gb_trees.delete_any({expire_at_ms, key}, expiry_index)
       end
 
-      defp put_cross_shard_lock_state(state, locks, expiry_index) do
+      defp put_fetch_or_compute_lock_state(state, locks, expiry_index) do
         state
-        |> Map.put(:cross_shard_locks, locks)
-        |> Map.put(:cross_shard_lock_expiries, expiry_index)
+        |> Map.put(:fetch_or_compute_locks, locks)
+        |> Map.put(:fetch_or_compute_lock_expiries, expiry_index)
       end
 
       defp do_fetch_or_compute_lock(state, key, outcome_key, owner_ref, expire_at_ms) do
         with :ok <- validate_fetch_or_compute_outcome_key(key, outcome_key) do
-          case do_lock_keys(state, [key], owner_ref, expire_at_ms) do
+          case do_acquire_fetch_or_compute_locks(state, [key], owner_ref, expire_at_ms) do
             {locked_state, :ok} ->
               case clear_fetch_or_compute_outcome(locked_state, outcome_key) do
                 :ok -> {locked_state, :ok}
@@ -1105,11 +1072,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
            ) do
         with :ok <- validate_fetch_or_compute_outcome_key(key, outcome_key),
              {:ok, _error} <- FetchOrComputeOutcome.decode_error(encoded_error),
-             :ok <- check_key_lock(state, key, owner_ref) do
+             :ok <- check_fetch_or_compute_lock(state, key, owner_ref) do
           case with_pending_writes(state, fn ->
                  do_put(state, outcome_key, encoded_error, outcome_expire_at_ms)
                end) do
-            :ok -> do_unlock_keys(state, [key], owner_ref)
+            :ok -> do_release_fetch_or_compute_locks(state, [key], owner_ref)
             {:error, _reason} = error -> {state, error}
             other -> {state, {:error, {:invalid_fetch_or_compute_write_result, other}}}
           end
@@ -1119,9 +1086,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       end
 
       defp do_fetch_or_compute_publish(state, key, value, expire_at_ms, owner_ref) do
-        with :ok <- check_key_lock(state, key, owner_ref) do
+        with :ok <- check_fetch_or_compute_lock(state, key, owner_ref) do
           case with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end) do
-            :ok -> do_unlock_keys(state, [key], owner_ref)
+            :ok -> do_release_fetch_or_compute_locks(state, [key], owner_ref)
             {:error, _reason} = error -> {state, error}
             other -> {state, {:error, {:invalid_fetch_or_compute_write_result, other}}}
           end
@@ -1154,8 +1121,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
       # Ordinary mutations may proceed when no live lock exists. Fenced
       # mutations must prove that their exact owner still holds a live lock.
-      defp check_key_lock(state, key, nil) do
-        locks = Map.get(state, :cross_shard_locks, %{})
+      defp check_fetch_or_compute_lock(state, key, nil) do
+        locks = Map.get(state, :fetch_or_compute_locks, %{})
         now = apply_now_ms()
 
         case Map.get(locks, key) do
@@ -1165,8 +1132,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
-      defp check_key_lock(state, key, owner_ref) do
-        locks = Map.get(state, :cross_shard_locks, %{})
+      defp check_fetch_or_compute_lock(state, key, owner_ref) do
+        locks = Map.get(state, :fetch_or_compute_locks, %{})
         now = apply_now_ms()
 
         case Map.get(locks, key) do
@@ -1185,29 +1152,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           {_other_owner, _expire_at_ms} ->
             {:error, :key_locked}
         end
-      end
-
-      # Writes an intent record. Returns {new_state, :ok}.
-      defp do_write_intent(state, owner_ref, intent_map) do
-        case Ferricstore.CrossShardOp.Intent.validate(owner_ref, intent_map) do
-          {:ok, _keys} ->
-            intents = state.cross_shard_intents
-            {%{state | cross_shard_intents: Map.put(intents, owner_ref, intent_map)}, :ok}
-
-          {:error, :invalid_cross_shard_intent} = error ->
-            {state, error}
-        end
-      end
-
-      # Deletes an intent record. Returns {new_state, :ok}.
-      defp do_delete_intent(state, owner_ref) do
-        intents = Map.get(state, :cross_shard_intents, %{})
-        {Map.put(state, :cross_shard_intents, Map.delete(intents, owner_ref)), :ok}
-      end
-
-      # Returns all intent records.
-      defp do_get_intents(state) do
-        Map.get(state, :cross_shard_intents, %{})
       end
 
       # ---------------------------------------------------------------------------

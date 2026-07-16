@@ -33,8 +33,8 @@ defmodule Ferricstore.Commands.KeyInfoTest do
   # Generates a unique key to prevent cross-test interference.
   defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
 
-  # Dummy store map -- KEY_INFO calls Router directly, ignoring the store.
-  defp dummy_store, do: %{}
+  # KEY_INFO resolves types through the injected command store.
+  defp dummy_store, do: custom_store(FerricStore.Instance.get(:default))
 
   # Parses the flat key-value list returned by KEY_INFO into a map.
   defp parse_info(result) when is_list(result) do
@@ -304,7 +304,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       assert Map.has_key?(info, "last_write_shard")
     end
 
-    test "KEY_INFO falls back instead of exiting while shard is unavailable" do
+    test "KEY_INFO fails closed without exiting while shard is unavailable" do
       original_ctx = FerricStore.Instance.get(:default)
       unavailable_ctx = unavailable_default_ctx()
       handler_id = {__MODULE__, make_ref()}
@@ -324,17 +324,13 @@ defmodule Ferricstore.Commands.KeyInfoTest do
         :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
       end)
 
-      result = Native.handle("KEY_INFO", ["ki_restart_missing"], dummy_store())
-      info = parse_info(result)
-
-      assert info["type"] == "none"
-      assert info["ttl_ms"] == "-2"
-      assert info["value_size"] == "0"
+      assert {:error, "ERR storage read failed"} =
+               Native.handle("KEY_INFO", ["ki_restart_missing"], dummy_store())
 
       assert_receive {:telemetry_event, [:ferricstore, :store, :shard_unavailable], %{count: 1},
                       %{
                         instance: :default,
-                        request: :compound_get,
+                        request: :get,
                         reason: :noproc,
                         shard_index: 0
                       }}

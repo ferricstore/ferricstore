@@ -714,6 +714,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.V2AppendBatchNosyncNif do
           refute Enum.any?(records, &match?({^other_field, _off, 0, 0, true}, &1))
         end
 
+        @tag :promoted_prefix_write_version
         test "direct promoted compound_delete_prefix increments write version" do
           {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
           on_exit(fn -> cleanup_shard(pid, ctx, dir) end)

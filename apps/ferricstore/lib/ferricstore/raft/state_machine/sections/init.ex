@@ -215,11 +215,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
           # that are already in Bitcask + ETS. Entries at or below this index are
           # no-ops — the data was recovered from disk via recover_keydir.
           skip_below_index: Map.get(config, :skip_below_index, 0),
-          # Cross-shard operation locks and intents — persisted in Raft state
-          # so they survive shard restarts, snapshots, and leader failovers.
-          cross_shard_locks: %{},
-          cross_shard_lock_expiries: :gb_trees.empty(),
-          cross_shard_intents: %{}
+          # Fetch-or-compute ownership locks are persisted in Raft state.
+          fetch_or_compute_locks: %{},
+          fetch_or_compute_lock_expiries: :gb_trees.empty()
         }
         |> ensure_flow_native_index_registered()
       end
@@ -297,7 +295,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
 
       Returns `{new_state, result}` or `{new_state, result, effects}`.
       """
-      # Skip entries that are already in Bitcask + ETS from a data sync copy.
+      # Skip entries already present in Bitcask + ETS after snapshot install.
       # When a node joins with pre-existing data (copied at raft_index N),
       # entries at or below N are no-ops — avoid redundant ETS overwrites
       # and Bitcask appends.

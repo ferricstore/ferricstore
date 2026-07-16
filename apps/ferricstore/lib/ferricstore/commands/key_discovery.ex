@@ -6,7 +6,9 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   @type result :: {:ok, [binary()]} | :not_dynamic
   @type access :: :read | :write | :rw
   @type description :: %{
+          command_keys: [binary()],
           acl_keys: [binary()],
+          channel_keys: [binary()],
           routing_scope: :none | :keys | :coordinated,
           routing_keys: [binary()],
           read_keys: [binary()],
@@ -17,7 +19,9 @@ defmodule Ferricstore.Commands.KeyDiscovery do
           command: binary(),
           args: [binary()],
           ast: term(),
+          command_keys: [binary()],
           acl_keys: [binary()],
+          channel_keys: [binary()],
           routing_scope: :none | :keys | :coordinated,
           routing_keys: [binary()],
           read_keys: [binary()],
@@ -101,6 +105,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
     FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA
   )
+  @channel_acl_commands ~w(PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE)
 
   @structured_native_commands MapSet.new(~w(
     FLOW.STEP_CONTINUE FLOW.START_AND_CLAIM FLOW.RUN_STEPS_MANY
@@ -133,7 +138,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
       when unknown_command == command ->
         prepare_extension(command, parsed_args)
 
-      {:ok, command, parsed_args, ast, acl_keys} ->
+      {:ok, command, parsed_args, ast, discovered_keys} ->
         prepared_ast =
           if MapSet.member?(@structured_native_commands, command) do
             {:structured_native_command, command}
@@ -141,7 +146,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
             ast
           end
 
-        {:ok, describe_prepared(command, parsed_args, prepared_ast, acl_keys)}
+        {:ok, describe_prepared(command, parsed_args, prepared_ast, discovered_keys)}
 
       {:error, _reason} = error ->
         error
@@ -165,7 +170,9 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     end
   end
 
-  defp describe_prepared(command, args, ast, acl_keys) do
+  defp describe_prepared(command, args, ast, discovered_keys) do
+    {acl_keys, channel_keys} = acl_resources(command, discovered_keys)
+
     {read_keys, write_keys, routing_scope, routing_keys, transaction_mode} =
       discovery_metadata(command, ast, acl_keys)
 
@@ -173,7 +180,9 @@ defmodule Ferricstore.Commands.KeyDiscovery do
       command: command,
       args: args,
       ast: ast,
+      command_keys: command_keys(command, ast, discovered_keys),
       acl_keys: acl_keys,
+      channel_keys: channel_keys,
       routing_scope: routing_scope,
       routing_keys: routing_keys,
       read_keys: read_keys,
@@ -181,6 +190,17 @@ defmodule Ferricstore.Commands.KeyDiscovery do
       transaction_mode: transaction_mode
     }
   end
+
+  defp command_keys(command, {tag, id, opts}, _acl_keys)
+       when command in ["FLOW.GET", "FLOW.HISTORY"] and
+              tag in [:flow_get, :flow_history] and is_binary(id) and is_list(opts) do
+    case Keyword.get(opts, :partition_key) do
+      partition when is_binary(partition) and partition != "" -> [partition]
+      _none -> [id]
+    end
+  end
+
+  defp command_keys(_command, _ast, discovered_keys), do: discovered_keys
 
   @spec extract(binary(), [binary()]) :: result()
   def extract(command, args)
@@ -244,19 +264,24 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   def extract(_command, _args), do: :not_dynamic
 
   @spec describe(binary(), [binary()]) :: description()
-  def describe(command, acl_keys) when is_binary(command) and is_list(acl_keys) do
-    describe(command, nil, acl_keys)
+  def describe(command, discovered_keys)
+      when is_binary(command) and is_list(discovered_keys) do
+    describe(command, nil, discovered_keys)
   end
 
   @spec describe(binary(), term(), [binary()]) :: description()
-  def describe(command, ast, acl_keys) when is_binary(command) and is_list(acl_keys) do
+  def describe(command, ast, discovered_keys)
+      when is_binary(command) and is_list(discovered_keys) do
     command = String.upcase(command)
+    {acl_keys, channel_keys} = acl_resources(command, discovered_keys)
 
     {read_keys, write_keys, routing_scope, routing_keys, transaction_mode} =
       discovery_metadata(command, ast, acl_keys)
 
     %{
+      command_keys: command_keys(command, ast, discovered_keys),
       acl_keys: acl_keys,
+      channel_keys: channel_keys,
       routing_scope: routing_scope,
       routing_keys: routing_keys,
       read_keys: read_keys,
@@ -264,6 +289,11 @@ defmodule Ferricstore.Commands.KeyDiscovery do
       transaction_mode: transaction_mode
     }
   end
+
+  defp acl_resources(command, discovered_keys) when command in @channel_acl_commands,
+    do: {[], discovered_keys}
+
+  defp acl_resources(_command, discovered_keys), do: {discovered_keys, []}
 
   defp discovery_metadata(command, ast, acl_keys) do
     {read_keys, write_keys} = footprint(command, ast, acl_keys)

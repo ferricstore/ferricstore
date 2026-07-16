@@ -68,8 +68,12 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
 
   alias Ferricstore.Test.IsolatedInstance
 
-  setup do
-    ctx = IsolatedInstance.checkout(shard_count: 1, start_shards: false)
+  setup test_context do
+    checkout_opts =
+      [shard_count: 1, start_shards: false]
+      |> maybe_put_promotion_threshold(test_context)
+
+    ctx = IsolatedInstance.checkout(checkout_opts)
     {:ok, heir} = ETSTableHeir.start_link(name: KeydirTableOwner.table_heir_name(ctx))
     {:ok, owner} = KeydirTableOwner.start_link(instance_ctx: ctx)
 
@@ -217,17 +221,13 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     end
   end
 
+  @tag promotion_threshold: 1
   test "promoted hash enumeration remains complete after a standalone shard restart", %{ctx: ctx} do
     redis_key = "catalog-promoted-restart:#{System.unique_integer([:positive])}"
     type_key = CompoundKey.type_key(redis_key)
     first = CompoundKey.hash_field(redis_key, "first")
     second = CompoundKey.hash_field(redis_key, "second")
     shard_name = elem(ctx.shard_names, 0)
-    previous_threshold = persistent_promotion_threshold()
-
-    :persistent_term.put(:ferricstore_promotion_threshold, 1)
-
-    on_exit(fn -> restore_promotion_threshold(previous_threshold) end)
 
     assert :ok = Router.compound_put(ctx, redis_key, type_key, "hash", 0)
     assert :ok = Router.compound_put(ctx, redis_key, first, "one", 0)
@@ -258,17 +258,13 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
              |> Map.new(fn [field, value] -> {field, value} end)
   end
 
+  @tag promotion_threshold: 1
   test "deleting a promoted hash removes its durable instance before restart", %{ctx: ctx} do
     redis_key = "catalog-promoted-delete:#{System.unique_integer([:positive])}"
     type_key = CompoundKey.type_key(redis_key)
     first = CompoundKey.hash_field(redis_key, "first")
     second = CompoundKey.hash_field(redis_key, "second")
     shard_name = elem(ctx.shard_names, 0)
-    previous_threshold = persistent_promotion_threshold()
-
-    :persistent_term.put(:ferricstore_promotion_threshold, 1)
-
-    on_exit(fn -> restore_promotion_threshold(previous_threshold) end)
 
     assert :ok = Router.compound_put(ctx, redis_key, type_key, "hash", 0)
     assert :ok = Router.compound_put(ctx, redis_key, first, "one", 0)
@@ -309,15 +305,8 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     refute Map.has_key?(:sys.get_state(shard_name).promoted_instances, redis_key)
   end
 
-  defp persistent_promotion_threshold do
-    {:set, :persistent_term.get(:ferricstore_promotion_threshold)}
-  rescue
-    ArgumentError -> :unset
-  end
+  defp maybe_put_promotion_threshold(opts, %{promotion_threshold: threshold}),
+    do: Keyword.put(opts, :promotion_threshold, threshold)
 
-  defp restore_promotion_threshold({:set, value}),
-    do: :persistent_term.put(:ferricstore_promotion_threshold, value)
-
-  defp restore_promotion_threshold(:unset),
-    do: :persistent_term.erase(:ferricstore_promotion_threshold)
+  defp maybe_put_promotion_threshold(opts, _test_context), do: opts
 end

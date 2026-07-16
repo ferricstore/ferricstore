@@ -573,7 +573,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
         if result == :ok do
           if dedicated_path == nil do
-            queue_compound_promotion_after_flush(redis_key, compound_key)
+            queue_compound_promotion_after_flush(state, redis_key, compound_key)
           end
 
           zset_index_put(state, redis_key, compound_key, value)
@@ -638,7 +638,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         if compound_shared_fast_path?(state) do
           case List.last(entries) do
             {compound_key, _value, _expire_at_ms} ->
-              queue_compound_promotion_after_flush(redis_key, compound_key)
+              queue_compound_promotion_after_flush(state, redis_key, compound_key)
 
             nil ->
               :ok
@@ -669,13 +669,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
       # Promotion is structural maintenance, not replicated state-machine work.
       # Keep only one lightweight hint per collection and dispatch it after the
-      # durable write batch succeeds.
-      defp queue_compound_promotion_after_flush(redis_key, compound_key) do
+      # durable write batch succeeds. Carry the exact replicated threshold that
+      # admitted the write so the async worker cannot observe newer process state.
+      defp queue_compound_promotion_after_flush(state, redis_key, compound_key) do
+        threshold = Map.fetch!(state, :apply_context).promotion_threshold
+
         case Process.get(:sm_pending_compound_promotions) do
-          %MapSet{} = pending ->
+          %{} = pending ->
             Process.put(
               :sm_pending_compound_promotions,
-              MapSet.put(pending, {redis_key, compound_key})
+              Map.put(pending, redis_key, {compound_key, threshold})
             )
 
           _not_in_apply ->

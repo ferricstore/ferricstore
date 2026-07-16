@@ -166,7 +166,7 @@ defmodule Ferricstore.Commands.ConfigTest do
       assert "slowlog-max-len" in keys
       assert "hz" in keys
 
-      # Legacy params should also be present
+      # Redis-compatible params should also be present.
       assert "requirepass" in keys
       assert "bind" in keys
       assert "timeout" in keys

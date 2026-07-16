@@ -64,6 +64,7 @@ defmodule Ferricstore.MemoryBudget do
                 :waraft_segment_log_max_ets_bytes,
                 :waraft_segment_log_max_ets_entries,
                 :waraft_segment_log_min_ets_entries,
+                :waraft_apply_projection_cache_max_bytes,
                 :waraft_apply_projection_cache_max_entries
               ])
 
@@ -74,6 +75,7 @@ defmodule Ferricstore.MemoryBudget do
           | :waraft_segment_log_max_ets_bytes
           | :waraft_segment_log_max_ets_entries
           | :waraft_segment_log_min_ets_entries
+          | :waraft_apply_projection_cache_max_bytes
           | :waraft_apply_projection_cache_max_entries
 
   @doc """
@@ -144,6 +146,8 @@ defmodule Ferricstore.MemoryBudget do
       waraft_segment_log_max_ets_bytes: segment_per_shard,
       waraft_segment_log_min_ets_entries: min(min_segment_entries, max_segment_entries),
       waraft_segment_log_max_ets_entries: max_segment_entries,
+      waraft_apply_projection_cache_max_bytes:
+        apply_projection_cache_entries * @apply_projection_cache_entry_bytes,
       waraft_apply_projection_cache_max_entries: apply_projection_cache_entries,
       flow_history_projector_max_pending_entries:
         adaptive_queue_limit(

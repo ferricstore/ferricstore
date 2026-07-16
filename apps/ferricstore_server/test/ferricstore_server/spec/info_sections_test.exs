@@ -5,8 +5,8 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
     * INFO raft         -- per-shard Raft state (role, term, commit_index, etc.)
     * INFO bitcask      -- per-shard Bitcask storage stats
     * INFO ferricstore  -- native FerricStore aggregate metrics
-    * INFO keydir_analysis -- per-prefix keydir breakdown
-    * INFO all          -- must include all new sections
+    * INFO keydir_analysis -- opt-in per-prefix keydir breakdown
+    * INFO all          -- excludes full keyspace and filesystem inventories
 
   Also includes a stress test: 1000 INFO calls must not crash.
   """
@@ -383,11 +383,11 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
   end
 
   # =========================================================================
-  # INFO all includes new sections
+  # INFO all includes bounded sections
   # =========================================================================
 
   describe "INFO all" do
-    test "includes all new sections" do
+    test "includes bounded operational sections" do
       store = build_real_store()
       result = Server.handle("INFO", ["all"], store)
 
@@ -397,14 +397,14 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       assert "Raft" in headers,
              "INFO all must include Raft section, got: #{inspect(headers)}"
 
-      assert "Bitcask" in headers,
-             "INFO all must include Bitcask section, got: #{inspect(headers)}"
-
       assert "Ferricstore" in headers,
              "INFO all must include Ferricstore section, got: #{inspect(headers)}"
 
-      assert "Keydir_Analysis" in headers,
-             "INFO all must include Keydir_Analysis section, got: #{inspect(headers)}"
+      refute "Bitcask" in headers,
+             "INFO all must keep the filesystem-wide Bitcask inventory opt-in"
+
+      refute "Keydir_Analysis" in headers,
+             "INFO all must keep the full-keyspace Keydir_Analysis scan opt-in"
     end
 
     test "includes original sections alongside new ones" do
@@ -428,15 +428,15 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       end
     end
 
-    test "INFO everything includes all sections too" do
+    test "INFO everything keeps full-keyspace analysis opt-in" do
       store = build_real_store()
       result = Server.handle("INFO", ["everything"], store)
       headers = section_headers(result)
 
       assert "Raft" in headers
-      assert "Bitcask" in headers
       assert "Ferricstore" in headers
-      assert "Keydir_Analysis" in headers
+      refute "Bitcask" in headers
+      refute "Keydir_Analysis" in headers
     end
   end
 

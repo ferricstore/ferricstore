@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.WARaftSegmentReader
+  alias Ferricstore.Store.BlobValue
   alias Ferricstore.TermCodec
 
   @default_source_pending_retries 100
@@ -25,6 +26,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       terminal_values: %{},
       terminal_reverse_values: %{},
       active_reverse_values: %{},
+      pending_terminal_count_put_news: MapSet.new(),
       terminal_count_inits: state.terminal_count_inits,
       terminal_atomic_write?: false
     }
@@ -319,7 +321,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
           read_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
 
         _ when is_binary(cached_value) ->
-          source_read_result({:ok, cached_value}, expire_at_ms)
+          source_read_result(state, {:ok, cached_value}, expire_at_ms)
 
         _ ->
           read_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
@@ -374,14 +376,14 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     state.shard_data_path
     |> bitcask_file_path(file_id)
     |> NIF.v2_pread_at(offset)
-    |> source_read_result(expire_at_ms)
+    |> then(&source_read_result(state, &1, expire_at_ms))
   end
 
   def read_source_location(_state, _key, _cached_value, _expire_at_ms, :deleted, _offset),
     do: :not_found
 
   def read_source_location(
-        %{instance_ctx: ctx, shard_index: shard_index},
+        %{instance_ctx: ctx, shard_index: shard_index} = state,
         key,
         _cached_value,
         expire_at_ms,
@@ -390,11 +392,11 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       ) do
     ctx
     |> WARaftSegmentReader.read_value_from_location(shard_index, file_id, key)
-    |> source_segment_read_result(expire_at_ms)
+    |> then(&source_segment_read_result(state, &1, expire_at_ms))
   end
 
   def read_source_location(
-        %{instance_ctx: ctx, shard_index: shard_index},
+        %{instance_ctx: ctx, shard_index: shard_index} = state,
         key,
         _cached_value,
         expire_at_ms,
@@ -404,24 +406,43 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       when kind in [:waraft_projection, :waraft_apply_projection] do
     ctx
     |> WARaftSegmentReader.read_value_from_location(shard_index, file_id, key)
-    |> source_segment_read_result(expire_at_ms)
+    |> then(&source_segment_read_result(state, &1, expire_at_ms))
   end
 
   def read_source_location(_state, _key, _cached_value, _expire_at_ms, file_id, _offset),
     do: {:error, {:source_location_unavailable, file_id}}
 
-  def source_read_result({:ok, value}, expire_at_ms) when is_binary(value),
-    do: {:ok, value, expire_at_ms}
+  def source_read_result(state, {:ok, value}, expire_at_ms) when is_binary(value) do
+    case materialize_source_value(state, value) do
+      {:ok, materialized} -> {:ok, materialized, expire_at_ms}
+      {:error, _reason} = error -> error
+    end
+  end
 
-  def source_read_result({:error, reason}, _expire_at_ms), do: {:error, reason}
-  def source_read_result(other, _expire_at_ms), do: {:error, {:bad_source_read, other}}
+  def source_read_result(_state, {:error, reason}, _expire_at_ms), do: {:error, reason}
 
-  def source_segment_read_result({:ok, value}, expire_at_ms) when is_binary(value),
-    do: {:ok, value, expire_at_ms}
+  def source_read_result(_state, other, _expire_at_ms),
+    do: {:error, {:bad_source_read, other}}
 
-  def source_segment_read_result(:not_found, _expire_at_ms), do: :not_found
-  def source_segment_read_result({:error, reason}, _expire_at_ms), do: {:error, reason}
-  def source_segment_read_result(other, _expire_at_ms), do: {:error, {:bad_source_read, other}}
+  def source_segment_read_result(_state, :not_found, _expire_at_ms), do: :not_found
+
+  def source_segment_read_result(state, result, expire_at_ms),
+    do: source_read_result(state, result, expire_at_ms)
+
+  defp materialize_source_value(
+         %{instance_ctx: %{data_dir: data_dir} = ctx, shard_index: shard_index},
+         value
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    BlobValue.maybe_materialize(
+      data_dir,
+      shard_index,
+      BlobValue.threshold(ctx),
+      value
+    )
+  end
+
+  defp materialize_source_value(_state, value), do: {:ok, value}
 
   def bitcask_file_path(shard_data_path, file_id) do
     Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
@@ -759,18 +780,28 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       if MapSet.member?(acc.terminal_count_inits, init_key) do
         acc
       else
-        count_ops =
+        count_keys =
           Enum.map(@terminal_states, fn terminal_state ->
             state_index_key =
               Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
 
-            count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+            Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+          end)
 
+        count_ops =
+          Enum.map(count_keys, fn count_key ->
             {:put_new, count_key, Ferricstore.Flow.LMDB.encode_count(0)}
           end)
 
+        pending_count_keys = MapSet.new(count_keys)
+
         acc
         |> Map.update!(:terminal_count_inits, &MapSet.put(&1, init_key))
+        |> Map.update(
+          :pending_terminal_count_put_news,
+          pending_count_keys,
+          &MapSet.union(&1, pending_count_keys)
+        )
         |> prepend_ops(count_ops)
       end
     else
@@ -842,9 +873,21 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         end
 
       :error ->
-        path
-        |> Ferricstore.Flow.LMDB.get(count_key)
-        |> terminal_count_result(count_key, acc)
+        case Ferricstore.Flow.LMDB.get(path, count_key) do
+          :not_found -> missing_terminal_count_result(count_key, acc)
+          result -> terminal_count_result(result, count_key, acc)
+        end
+    end
+  end
+
+  defp missing_terminal_count_result(count_key, acc) do
+    pending = Map.get(acc, :pending_terminal_count_put_news, MapSet.new())
+
+    if MapSet.member?(pending, count_key) do
+      value = Ferricstore.Flow.LMDB.encode_count(0)
+      {:ok, 0, put_terminal_count_state(acc, count_key, 0, value)}
+    else
+      terminal_count_result(:not_found, count_key, acc)
     end
   end
 
@@ -972,8 +1015,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     {:ok, {:compare, reverse_key, terminal_key}}
   end
 
-  defp terminal_reverse_delete_compare_op(_state_key, _terminal_key, nil),
-    do: {:error, :missing_terminal_reverse}
+  defp terminal_reverse_delete_compare_op(state_key, _terminal_key, nil) do
+    {:ok, {:compare_missing, Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)}}
+  end
 
   defp terminal_reverse_delete_compare_op(_state_key, _terminal_key, _other),
     do: {:error, :terminal_reverse_mismatch}

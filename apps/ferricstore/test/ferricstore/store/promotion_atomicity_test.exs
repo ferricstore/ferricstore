@@ -516,8 +516,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       {:ok, dedicated_path} =
         Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
 
-      File.rm!(ctx.active_path)
-      File.mkdir!(ctx.active_path)
+      File.chmod!(ctx.active_path, 0o400)
 
       assert_raise RuntimeError, ~r/promotion cleanup marker fence failed/, fn ->
         Promotion.cleanup_promoted!(

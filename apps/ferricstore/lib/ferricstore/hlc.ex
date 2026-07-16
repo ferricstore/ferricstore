@@ -429,18 +429,32 @@ defmodule Ferricstore.HLC do
 
   defp hlc_update_packed({remote_phys, remote_log})
        when is_integer(remote_phys) and remote_phys >= 0 and
-              remote_phys <= @max_physical_ms and is_integer(remote_log) and remote_log >= 0 and
-              remote_log <= @logical_mask do
-    case atomics_ref() do
-      nil ->
-        :ok
+              remote_phys <= @max_physical_ms and is_integer(remote_log) and remote_log >= 0 do
+    with {:ok, {remote_phys, remote_log}} <-
+           normalize_remote_timestamp(remote_phys, remote_log) do
+      case atomics_ref() do
+        nil ->
+          :ok
 
-      ref ->
-        hlc_update_packed(ref, remote_phys, remote_log)
+        ref ->
+          hlc_update_packed(ref, remote_phys, remote_log)
+      end
+    else
+      :error -> :ok
     end
   end
 
   defp hlc_update_packed(_remote_ts), do: :ok
+
+  defp normalize_remote_timestamp(remote_phys, remote_log) do
+    max_remote_log = @max_packed - bsl(remote_phys, @logical_bits)
+
+    if remote_log <= max_remote_log do
+      {:ok, remote_phys |> pack(remote_log) |> unpack()}
+    else
+      :error
+    end
+  end
 
   defp hlc_update_packed(ref, remote_phys, remote_log) do
     current = :atomics.get(ref, @slot)

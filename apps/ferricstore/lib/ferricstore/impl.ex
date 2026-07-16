@@ -2,8 +2,7 @@ defmodule FerricStore.Impl do
   @moduledoc "Elixir-native implementation of all FerricStore data-type operations, delegating to Router and command handlers."
 
   alias Ferricstore.EmbeddedStringValidation
-  alias Ferricstore.Store.ReadResult
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{ReadResult, Router, TypeRegistry}
 
   alias Ferricstore.Commands.{
     Bloom,
@@ -59,10 +58,26 @@ defmodule FerricStore.Impl do
 
   @spec get(FerricStore.Instance.t(), binary(), keyword()) ::
           {:ok, binary() | nil} | ReadResult.failure()
-  def get(ctx, key, _opts \\ []) do
-    ctx
-    |> then(&Strings.handle_ast({:get, key}, &1))
-    |> wrap_result()
+  def get(ctx, key, opts \\ [])
+
+  def get(_ctx, "", _opts), do: {:error, "ERR empty key"}
+  def get(_ctx, key, _opts) when byte_size(key) > 65_535, do: {:error, "ERR key too large"}
+
+  def get(ctx, key, _opts) do
+    case Router.get(ctx, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      nil ->
+        case TypeRegistry.get_type(key, build_store(ctx)) do
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+          type when type in ["none", "string"] -> {:ok, nil}
+          _compound_type -> wrongtype_error()
+        end
+
+      value ->
+        {:ok, value}
+    end
   end
 
   @spec del(FerricStore.Instance.t(), [binary()]) :: {:ok, non_neg_integer()} | {:error, term()}
@@ -123,9 +138,20 @@ defmodule FerricStore.Impl do
   @spec strlen(FerricStore.Instance.t(), binary()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def strlen(ctx, key) do
-    ctx
-    |> then(&Strings.handle_ast({:strlen, key}, &1))
-    |> wrap_result()
+    case Router.value_size(ctx, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      nil ->
+        case TypeRegistry.get_type(key, build_store(ctx)) do
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+          type when type in ["none", "string"] -> {:ok, 0}
+          _compound_type -> wrongtype_error()
+        end
+
+      size ->
+        {:ok, size}
+    end
   end
 
   @spec getset(FerricStore.Instance.t(), binary(), binary()) ::
@@ -984,6 +1010,10 @@ defmodule FerricStore.Impl do
   # ---------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------
+
+  defp wrongtype_error do
+    {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+  end
 
   defp build_store(ctx) do
     %{

@@ -38,22 +38,21 @@ defmodule Ferricstore.Raft.FlushShardApplyTest do
     assert length(tombstones) == length(keys)
   end
 
-  test "replicated shard flush aborts prepared locks before deleting their rows" do
+  test "replicated shard flush clears fetch-or-compute locks before deleting rows" do
     %{state: state, keydir: keydir} = start_state()
     key = "flush-shard:locked"
     true = :ets.insert(keydir, {key, "value", 0, LFU.initial(), 0, 0, 5})
 
     locked_state = %{
       state
-      | cross_shard_locks: %{key => {make_ref(), Ferricstore.HLC.now_ms() + 60_000}}
+      | fetch_or_compute_locks: %{key => {make_ref(), Ferricstore.HLC.now_ms() + 60_000}}
     }
 
     assert {new_state, {:ok, 1}} =
              StateMachine.apply(%{}, {:flush_shard, {1, 0}}, locked_state)
 
     assert new_state.applied_count == locked_state.applied_count + 1
-    assert new_state.cross_shard_locks == %{}
-    assert new_state.cross_shard_intents == %{}
+    assert new_state.fetch_or_compute_locks == %{}
     assert [] == :ets.lookup(keydir, key)
   end
 

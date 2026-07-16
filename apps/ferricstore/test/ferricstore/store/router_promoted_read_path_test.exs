@@ -6,19 +6,12 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
-    original_env = Application.get_env(:ferricstore, :promotion_threshold)
-
-    original_pt =
-      try do
-        :persistent_term.get(:ferricstore_promotion_threshold)
-      rescue
-        ArgumentError -> :not_set
-      end
-
-    Application.put_env(:ferricstore, :promotion_threshold, 1)
-    :persistent_term.put(:ferricstore_promotion_threshold, 1)
-
-    ctx = IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1)
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1,
+        promotion_threshold: 1
+      )
 
     handler_id = {:router_promoted_read_path, self(), make_ref()}
     parent = self()
@@ -36,16 +29,6 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
     on_exit(fn ->
       :telemetry.detach(handler_id)
       IsolatedInstance.checkin(ctx)
-
-      case original_env do
-        nil -> Application.delete_env(:ferricstore, :promotion_threshold)
-        value -> Application.put_env(:ferricstore, :promotion_threshold, value)
-      end
-
-      case original_pt do
-        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
-        value -> :persistent_term.put(:ferricstore_promotion_threshold, value)
-      end
     end)
 
     {:ok, ctx: ctx}

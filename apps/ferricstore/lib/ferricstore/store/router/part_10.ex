@@ -771,9 +771,22 @@ defmodule Ferricstore.Store.Router.Part10 do
         request =
           {:compound_scan_page, redis_key, prefix, cursor, count, match_pattern, fields_only}
 
-        case safe_read_call(ctx, idx, request) do
-          {:ok, result} -> result
-          :unavailable -> ReadResult.failure(:shard_unavailable)
+        if selected_waraft_ctx?(ctx) do
+          direct_compound_scan_page(
+            ctx,
+            idx,
+            redis_key,
+            prefix,
+            cursor,
+            count,
+            match_pattern,
+            fields_only
+          )
+        else
+          case safe_read_call(ctx, idx, request) do
+            {:ok, result} -> result
+            :unavailable -> ReadResult.failure(:shard_unavailable)
+          end
         end
       end
 
@@ -823,6 +836,58 @@ defmodule Ferricstore.Store.Router.Part10 do
         ctx
         |> direct_compound_read_state(idx)
         |> Ferricstore.Store.Shard.ETS.prefix_scan_fields(prefix)
+      end
+
+      defp direct_compound_scan_page(
+             ctx,
+             idx,
+             redis_key,
+             prefix,
+             cursor,
+             count,
+             match_pattern,
+             fields_only
+           ) do
+        state = direct_compound_read_state(ctx, idx)
+        index = state.compound_member_index
+
+        case Ferricstore.Store.Shard.CompoundMemberIndex.scan_page(
+               index,
+               state,
+               prefix,
+               cursor,
+               count,
+               match_pattern
+             ) do
+          {:ok, {next_cursor, members}} when fields_only ->
+            {:ok, {next_cursor, Enum.map(members, &{&1, nil})}}
+
+          {:ok, {next_cursor, members}} ->
+            compound_keys = Enum.map(members, &(prefix <> &1))
+            values = compound_batch_get(ctx, redis_key, compound_keys)
+
+            cond do
+              not is_list(values) or length(values) != length(members) ->
+                ReadResult.failure(:invalid_compound_scan_page_reply)
+
+              failure = ReadResult.first_failure(values) ->
+                failure
+
+              true ->
+                pairs =
+                  members
+                  |> Enum.zip(values)
+                  |> Enum.reject(fn {_member, value} -> is_nil(value) end)
+
+                {:ok, {next_cursor, pairs}}
+            end
+
+          {:error, reason} ->
+            ReadResult.failure({:compound_scan_page_failed, reason})
+
+          :unavailable ->
+            ReadResult.failure(:compound_member_index_unavailable)
+        end
       end
 
       defp direct_compound_read_state(ctx, idx) do

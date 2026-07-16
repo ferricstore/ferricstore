@@ -95,9 +95,23 @@ defmodule Ferricstore.Store.Router.Part01 do
         keydir = resolve_keydir(ctx, idx)
 
         case ets_get_full(ctx, idx, keydir, key, HLC.now_ms()) do
-          {:hit, value, _lfu} -> {:ok, value}
-          result when result in [:miss, :expired] -> {:ok, nil}
-          _cold_or_unavailable -> safe_read_call(ctx, idx, {:get, key})
+          {:hit, value, _lfu} ->
+            {:ok, value}
+
+          result when result in [:miss, :expired] ->
+            {:ok, nil}
+
+          _cold_or_unavailable ->
+            if selected_waraft_ctx?(ctx) do
+              {:ok, [value]} = do_batch_get_from_shard(ctx, idx, [key], :unlimited)
+
+              case value do
+                {:error, {:storage_read_failed, _reason}} = failure -> failure
+                value -> {:ok, value}
+              end
+            else
+              safe_read_call(ctx, idx, {:get, key})
+            end
         end
       end
 
@@ -112,14 +126,29 @@ defmodule Ferricstore.Store.Router.Part01 do
                @shard_batch_read_max_key_bytes do
           deadline_ms = System.monotonic_time(:millisecond) + @shard_batch_read_deadline_ms
 
-          case safe_read_call(
-                 ctx,
-                 idx,
-                 {:get_many, keys, deadline_ms},
-                 @shard_batch_read_call_timeout_ms
-               ) do
+          read_result =
+            if selected_waraft_ctx?(ctx) do
+              {:ok, values} = do_batch_get_from_shard(ctx, idx, keys, :unlimited)
+
+              case ReadResult.first_failure(values) do
+                nil -> {:ok, values}
+                failure -> failure
+              end
+            else
+              safe_read_call(
+                ctx,
+                idx,
+                {:get_many, keys, deadline_ms},
+                @shard_batch_read_call_timeout_ms
+              )
+            end
+
+          case read_result do
             {:ok, values} when is_list(values) and length(values) == length(keys) ->
               {:ok, values}
+
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              failure
 
             :unavailable ->
               :unavailable
@@ -136,7 +165,7 @@ defmodule Ferricstore.Store.Router.Part01 do
         do: {:error, "ERR invalid shard batch read request"}
 
       defp safe_write_call(ctx, idx, request) do
-        GenServer.call(resolve_shard(ctx, idx), request)
+        GenServer.call(resolve_shard(ctx, idx), {:standalone_barrier_write, request})
       catch
         :exit, {:noproc, _} ->
           emit_shard_unavailable(ctx, idx, request, :noproc)
@@ -353,7 +382,10 @@ defmodule Ferricstore.Store.Router.Part01 do
             true ->
               # Custom embedded instances are local/direct. The default application
               # instance owns Raft durability.
-              GenServer.call(elem(ctx.shard_names, idx), command)
+              GenServer.call(
+                elem(ctx.shard_names, idx),
+                {:standalone_barrier_write, command}
+              )
           end
         end
       end

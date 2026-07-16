@@ -108,15 +108,9 @@ defmodule Ferricstore.Commands.Catalog do
   """
   @spec get_keys_upper(binary(), [binary()]) :: {:ok, [binary()]} | {:error, binary()}
   def get_keys_upper("FLOW." <> _rest = name, args) when is_list(args) do
-    case Ferricstore.Commands.NativeAstParser.parse(name, args) do
-      {:ok, ^name, _parsed_args, {:unknown, ^name, _unknown_args}, _keys} ->
-        extension_keys(name, args)
-
-      {:ok, ^name, _parsed_args, _ast, keys} ->
-        {:ok, keys}
-
-      {:error, reason} ->
-        {:error, reason}
+    case KeyDiscovery.prepare(name, args) do
+      {:ok, %{command_keys: keys}} -> {:ok, keys}
+      {:error, reason} -> {:error, reason}
     end
   end
 

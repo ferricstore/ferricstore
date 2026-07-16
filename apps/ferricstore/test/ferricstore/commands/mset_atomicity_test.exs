@@ -4,6 +4,8 @@ defmodule Ferricstore.Commands.MSetAtomicityTest do
   @moduletag :global_state
 
   alias Ferricstore.Commands.Strings
+  alias Ferricstore.MemoryGuard
+  alias Ferricstore.Store.DiskPressure
   alias Ferricstore.Store.PublicationEpoch
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
@@ -53,11 +55,56 @@ defmodule Ferricstore.Commands.MSetAtomicityTest do
     assert "two" == Router.get(ctx, second)
   end
 
-  test "MSETNX rejects cross-slot pairs before either write" do
+  test "MSETNX rejects independent Raft groups before either write" do
     ctx = FerricStore.Instance.get(:default)
     [first, second] = ShardHelpers.keys_on_different_shards(2)
 
     assert @crossslot == Strings.handle("MSETNX", [first, "one", second, "two"], ctx)
+    assert nil == Router.get(ctx, first)
+    assert nil == Router.get(ctx, second)
+  end
+
+  test "durable cross-group MSETNX rejects topology before validating values" do
+    snapshot = ShardHelpers.replace_default_apply_context(max_value_size: 4)
+    on_exit(fn -> ShardHelpers.restore_default_apply_context(snapshot) end)
+
+    ctx = FerricStore.Instance.get(:default)
+    [first, second] = ShardHelpers.keys_on_different_shards(2)
+
+    assert @crossslot == Strings.handle("MSETNX", [first, "okay", second, "large"], ctx)
+
+    assert nil == Router.get(ctx, first)
+    assert nil == Router.get(ctx, second)
+  end
+
+  test "durable cross-group MSETNX rejects topology before keydir pressure" do
+    ctx = FerricStore.Instance.get(:default)
+    [first, second] = ShardHelpers.keys_on_different_shards(2)
+
+    MemoryGuard.set_keydir_full(true)
+    MemoryGuard.set_reject_writes(true)
+
+    on_exit(fn ->
+      MemoryGuard.set_keydir_full(false)
+      MemoryGuard.set_reject_writes(false)
+    end)
+
+    assert @crossslot == Strings.handle("MSETNX", [first, "one", second, "two"], ctx)
+
+    assert nil == Router.get(ctx, first)
+    assert nil == Router.get(ctx, second)
+  end
+
+  test "durable cross-group MSETNX rejects topology before shard disk pressure" do
+    ctx = FerricStore.Instance.get(:default)
+    [first, second] = ShardHelpers.keys_on_different_shards(2)
+    pressured_shard = Router.shard_for(ctx, second)
+
+    DiskPressure.set(ctx, pressured_shard)
+    on_exit(fn -> DiskPressure.clear(ctx, pressured_shard) end)
+
+    assert @crossslot == Strings.handle("MSETNX", [first, "one", second, "two"], ctx)
+
     assert nil == Router.get(ctx, first)
     assert nil == Router.get(ctx, second)
   end

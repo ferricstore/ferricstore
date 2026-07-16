@@ -20,12 +20,32 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     assert spec.command == "SET"
     assert spec.args == ["key", "value", "GET"]
     assert spec.ast == {:set, "key", "value", [:get]}
+    assert spec.command_keys == ["key"]
     assert spec.acl_keys == ["key"]
     assert spec.routing_scope == :keys
     assert spec.routing_keys == ["key"]
     assert spec.read_keys == ["key"]
     assert spec.write_keys == ["key"]
     assert spec.transaction_mode == :local
+  end
+
+  test "Flow preparation separates COMMAND GETKEYS data keys from conservative ACL scope" do
+    assert {:ok, unpartitioned} = KeyDiscovery.prepare("FLOW.GET", ["flow-1"])
+    assert unpartitioned.command_keys == ["flow-1"]
+    assert unpartitioned.acl_keys == ["*"]
+
+    assert {:ok, partitioned} =
+             KeyDiscovery.prepare("FLOW.GET", ["flow-1", "PARTITION", "tenant-a"])
+
+    assert partitioned.command_keys == ["tenant-a"]
+    assert partitioned.acl_keys == ["tenant-a"]
+  end
+
+  test "KeyDiscovery describe keeps the command key contract" do
+    description = KeyDiscovery.describe("FLOW.GET", {:flow_get, "flow-1", []}, ["*"])
+
+    assert description.command_keys == ["flow-1"]
+    assert description.acl_keys == ["*"]
   end
 
   @tag :shared_command_spec
@@ -174,6 +194,18 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     refute PreparedCommand.cross_shard?(prepared, fn _key -> flunk("unexpected routing") end)
   end
 
+  test "Pub/Sub preparation separates channel ACLs from data-key ACLs" do
+    assert {:ok, prepared} = Dispatcher.prepare_raw("PUBLISH", ["tenant:events", "payload"])
+
+    assert prepared.command_keys == ["tenant:events"]
+    assert prepared.channel_keys == ["tenant:events"]
+    assert prepared.acl_keys == []
+    assert prepared.routing_scope == :none
+    assert prepared.routing_keys == []
+    assert prepared.read_keys == []
+    assert prepared.write_keys == []
+  end
+
   test "prepared commands identify deterministic transaction-local execution" do
     for {command, args} <- [
           {"PING", []},
@@ -268,7 +300,7 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
   end
 
   @tag :transaction_native_local_apply
-  test "deterministic native mutations execute transaction-locally" do
+  test "native mutations remain request-scoped until their apply contract is admitted" do
     for {command, args} <- [
           {"CAS", ["native:key", "old", "new"]},
           {"LOCK", ["native:key", "owner", "1000"]},
@@ -277,8 +309,8 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
           {"RATELIMIT.ADD", ["native:key", "1000", "10", "1"]}
         ] do
       assert {:ok, prepared} = Dispatcher.prepare_raw(command, args)
-      assert prepared.transaction_mode == :local
-      assert PreparedCommand.transaction_safe?(prepared)
+      assert prepared.transaction_mode == :request
+      refute PreparedCommand.transaction_safe?(prepared)
     end
   end
 

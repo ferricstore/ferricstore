@@ -71,15 +71,15 @@ defmodule Ferricstore.Store.Shard.Routing do
                 Map.get(sm_state, :flow_due_catalog),
                 state.flow_due_catalog
               ),
-            cross_shard_locks: Map.get(sm_state, :cross_shard_locks, state.cross_shard_locks),
-            cross_shard_lock_expiries:
+            promoted_instances: Map.get(sm_state, :promoted_instances, state.promoted_instances),
+            fetch_or_compute_locks:
+              Map.get(sm_state, :fetch_or_compute_locks, state.fetch_or_compute_locks),
+            fetch_or_compute_lock_expiries:
               Map.get(
                 sm_state,
-                :cross_shard_lock_expiries,
-                state.cross_shard_lock_expiries
-              ),
-            cross_shard_intents:
-              Map.get(sm_state, :cross_shard_intents, state.cross_shard_intents)
+                :fetch_or_compute_lock_expiries,
+                state.fetch_or_compute_lock_expiries
+              )
         }
       end
 
@@ -101,19 +101,21 @@ defmodule Ferricstore.Store.Shard.Routing do
           apply_context_encoded: state.apply_context_encoded,
           applied_count: 0,
           release_cursor_interval: state.release_cursor_interval,
-          cross_shard_locks: state.cross_shard_locks,
-          cross_shard_lock_expiries: state.cross_shard_lock_expiries,
-          cross_shard_intents: state.cross_shard_intents,
+          fetch_or_compute_locks: state.fetch_or_compute_locks,
+          fetch_or_compute_lock_expiries: state.fetch_or_compute_lock_expiries,
           instance_ctx: state.instance_ctx,
           instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
           compound_member_index_name: state.compound_member_index,
           zset_score_index_name: state.zset_score_index,
           zset_score_lookup_name: state.zset_score_lookup,
+          logical_key_index_name: state.logical_key_index,
+          logical_key_slots_name: state.logical_key_slots,
           flow_index_name: state.flow_index,
           flow_lookup_name: state.flow_lookup,
           flow_due_catalog: direct_flow_due_catalog(state.flow_due_catalog, DueCatalog.new()),
           flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path),
-          flow_async_history: state.flow_async_history
+          flow_async_history: state.flow_async_history,
+          promoted_instances: state.promoted_instances
         }
       end
 
@@ -143,7 +145,7 @@ defmodule Ferricstore.Store.Shard.Routing do
           else
             entry = {from, command, standalone_command_keys(command), command_bytes}
 
-            if state.standalone_write_barrier or
+            if standalone_write_barrier_active?(state) or
                  standalone_entry_conflicts?(entry, state.standalone_inflight_keys) or
                  standalone_entry_conflicts?(entry, state.standalone_batch_keys) or
                  standalone_entry_conflicts?(entry, state.standalone_waiting_keys) do
@@ -163,13 +165,42 @@ defmodule Ferricstore.Store.Shard.Routing do
         end
       end
 
+      defp enqueue_standalone_barrier_write(state, from, request) do
+        request_bytes = :erlang.external_size(request)
+
+        cond do
+          standalone_queued_count(state) >= state.standalone_commit_max_queued_ops ->
+            GenServer.reply(from, {:error, "BUSY standalone commit queue is full"})
+            state
+
+          standalone_retained_bytes(state) + request_bytes >
+              state.standalone_commit_max_queued_bytes ->
+            GenServer.reply(from, {:error, "BUSY standalone commit queue is full"})
+            state
+
+          true ->
+            %{
+              state
+              | standalone_barrier_waiting:
+                  :queue.in(
+                    {from, request, request_bytes},
+                    state.standalone_barrier_waiting
+                  ),
+                standalone_barrier_waiting_count: state.standalone_barrier_waiting_count + 1,
+                standalone_barrier_waiting_bytes:
+                  state.standalone_barrier_waiting_bytes + request_bytes
+            }
+        end
+      end
+
       defp standalone_queued_count(state) do
-        state.standalone_batch_count + state.standalone_waiting_count
+        state.standalone_batch_count + state.standalone_waiting_count +
+          state.standalone_barrier_waiting_count
       end
 
       defp standalone_retained_bytes(state) do
         state.standalone_batch_bytes + state.standalone_waiting_bytes +
-          state.standalone_flush_bytes
+          state.standalone_flush_bytes + state.standalone_barrier_waiting_bytes
       end
 
       defp enqueue_ready_standalone_commit(state, entry) do
@@ -326,8 +357,18 @@ defmodule Ferricstore.Store.Shard.Routing do
 
         case result do
           {:ok, new_sm_state, results} ->
-            state = apply_direct_sm_state(state, new_sm_state)
-            reply_standalone_results(entries, results)
+            reply_result = reply_standalone_results(entries, results)
+
+            mutation_count =
+              case reply_result do
+                {:ok, replies} -> standalone_mutation_count(entries, replies)
+                :mismatch -> length(entries)
+              end
+
+            state =
+              state
+              |> apply_direct_sm_state(new_sm_state)
+              |> bump_standalone_write_version(mutation_count)
 
             state
             |> drain_standalone_waiting()
@@ -374,7 +415,332 @@ defmodule Ferricstore.Store.Shard.Routing do
       defp flush_ready_standalone_batch(%{standalone_batch_count: 0} = state), do: state
       defp flush_ready_standalone_batch(state), do: flush_standalone_batch(state)
 
-      defp clear_standalone_write_barrier(state), do: %{state | standalone_write_barrier: false}
+      defp coordinate_standalone_cross_shard(participant_indices, execute_fn, state) do
+        state = drain_standalone_commits_for_sync(state)
+
+        cond do
+          standalone_write_barrier_active?(state) ->
+            {{:error, {:standalone_cross_shard_busy, :coordinator_barrier_busy}}, state}
+
+          state.writes_paused ->
+            {{:error,
+              {:standalone_cross_shard_busy,
+               {:standalone_durability_failed, :prior_standalone_write_failed}}}, state}
+
+          state.last_flush_error != nil ->
+            {{:error,
+              {:standalone_cross_shard_busy,
+               {:standalone_durability_failed, state.last_flush_error}}},
+             %{state | writes_paused: true}}
+
+          not valid_standalone_participants?(participant_indices, state) ->
+            {{:error, {:standalone_cross_shard_busy, :invalid_participant_order}}, state}
+
+          true ->
+            owner_token = make_ref()
+
+            state =
+              install_standalone_write_barrier(state, owner_token, self(), false)
+
+            case acquire_standalone_participant_barriers(
+                   state.instance_ctx,
+                   participant_indices,
+                   owner_token,
+                   []
+                 ) do
+              {:ok, acquired} ->
+                {reply, state} = apply_standalone_cross_shard(execute_fn, state)
+                log_standalone_barrier_release_errors(state, acquired, owner_token)
+                state = maybe_bump_cross_shard_write_versions(state, participant_indices, reply)
+                {reply, release_standalone_write_barrier(state)}
+
+              {:error, reason, acquired} ->
+                log_standalone_barrier_release_errors(state, acquired, owner_token)
+
+                {{:error, {:standalone_cross_shard_busy, reason}},
+                 release_standalone_write_barrier(state)}
+            end
+        end
+      end
+
+      defp valid_standalone_participants?(participant_indices, state) do
+        participant_indices == Enum.sort(Enum.uniq(participant_indices)) and
+          Enum.all?(participant_indices, fn
+            index when is_integer(index) -> index > state.index
+            _invalid -> false
+          end) and not is_nil(state.instance_ctx)
+      end
+
+      defp acquire_standalone_participant_barriers(
+             _ctx,
+             [],
+             _owner_token,
+             acquired
+           ),
+           do: {:ok, acquired}
+
+      defp acquire_standalone_participant_barriers(
+             ctx,
+             [shard_index | rest],
+             owner_token,
+             acquired
+           ) do
+        result =
+          try do
+            ctx
+            |> Router.shard_name(shard_index)
+            |> GenServer.call(
+              {:standalone_cross_shard_barrier_acquire, owner_token},
+              :infinity
+            )
+          catch
+            :exit, reason -> {:error, reason}
+          end
+
+        case result do
+          :ok ->
+            acquire_standalone_participant_barriers(
+              ctx,
+              rest,
+              owner_token,
+              [shard_index | acquired]
+            )
+
+          {:error, reason} ->
+            {:error, reason, acquired}
+
+          other ->
+            {:error, {:unexpected_barrier_reply, other}, acquired}
+        end
+      end
+
+      defp log_standalone_barrier_release_errors(state, acquired, owner_token) do
+        errors =
+          Enum.reduce(acquired, [], fn shard_index, errors ->
+            result =
+              try do
+                state.instance_ctx
+                |> Router.shard_name(shard_index)
+                |> GenServer.call(
+                  {:standalone_cross_shard_barrier_release, owner_token},
+                  :infinity
+                )
+              catch
+                :exit, reason -> {:error, reason}
+              end
+
+            case result do
+              :ok -> errors
+              {:error, reason} -> [{shard_index, reason} | errors]
+              other -> [{shard_index, {:unexpected_barrier_reply, other}} | errors]
+            end
+          end)
+
+        if errors != [] do
+          Logger.error(
+            "Shard #{state.index}: standalone cross-shard barrier release failed: " <>
+              inspect(Enum.reverse(errors))
+          )
+        end
+
+        :ok
+      end
+
+      defp apply_standalone_cross_shard(execute_fn, state) do
+        sm_state = direct_sm_state(state)
+
+        case Ferricstore.Raft.StateMachine.apply_standalone_cross_shard(execute_fn, sm_state) do
+          {result, %{} = new_sm_state} ->
+            {result, apply_direct_sm_state(state, new_sm_state)}
+
+          {:error, reason, new_sm_state} ->
+            state =
+              state
+              |> apply_direct_sm_state(new_sm_state)
+              |> Map.put(:writes_paused, true)
+              |> Map.put(:last_flush_error, reason)
+
+            {{:error, {:standalone_durability_failed, reason}}, state}
+
+          {:error, reason} ->
+            state =
+              state
+              |> Map.put(:writes_paused, true)
+              |> Map.put(:last_flush_error, reason)
+
+            {{:error, {:standalone_durability_failed, reason}}, state}
+        end
+      end
+
+      defp standalone_write_barrier_active?(state),
+        do: state.standalone_write_barrier != false
+
+      defp standalone_write_barrier_owner?(
+             %{
+               standalone_write_barrier: %{
+                 token: owner_token,
+                 owner_pid: owner_pid
+               }
+             },
+             owner_token,
+             owner_pid
+           ),
+           do: true
+
+      defp standalone_write_barrier_owner?(_state, _owner_token, _owner_pid), do: false
+
+      defp install_standalone_write_barrier(
+             state,
+             owner_token,
+             owner_pid,
+             monitor_owner?
+           ) do
+        monitor_ref = if monitor_owner?, do: Process.monitor(owner_pid), else: nil
+
+        %{
+          state
+          | standalone_write_barrier: %{
+              token: owner_token,
+              owner_pid: owner_pid,
+              monitor_ref: monitor_ref
+            }
+        }
+      end
+
+      defp release_standalone_write_barrier(state) do
+        state = clear_standalone_write_barrier(state)
+
+        cond do
+          state.writes_paused ->
+            state
+            |> reject_barrier_waiting_writes(
+              {:standalone_durability_failed, :prior_standalone_write_failed}
+            )
+            |> reject_queued_standalone_commits(
+              {:standalone_durability_failed, :prior_standalone_write_failed}
+            )
+
+          state.last_flush_error != nil ->
+            state
+            |> reject_barrier_waiting_writes(
+              {:standalone_durability_failed, state.last_flush_error}
+            )
+            |> reject_queued_standalone_commits(
+              {:standalone_durability_failed, state.last_flush_error}
+            )
+            |> Map.put(:writes_paused, true)
+
+          true ->
+            state
+            |> drain_standalone_barrier_waiting()
+            |> drain_standalone_waiting()
+            |> flush_ready_standalone_batch()
+        end
+      end
+
+      defp drain_standalone_barrier_waiting(state) do
+        case :queue.out(state.standalone_barrier_waiting) do
+          {{:value, {from, request, request_bytes}}, remaining} ->
+            state = %{
+              state
+              | standalone_barrier_waiting: remaining,
+                standalone_barrier_waiting_count: state.standalone_barrier_waiting_count - 1,
+                standalone_barrier_waiting_bytes:
+                  state.standalone_barrier_waiting_bytes - request_bytes
+            }
+
+            state =
+              case handle_call(request, from, state) do
+                {:reply, reply, new_state} ->
+                  GenServer.reply(from, reply)
+                  new_state
+
+                {:noreply, new_state} ->
+                  new_state
+
+                {:stop, reason, reply, new_state} ->
+                  GenServer.reply(from, {:error, {:standalone_write_failed, reason, reply}})
+                  new_state
+
+                {:stop, reason, new_state} ->
+                  GenServer.reply(from, {:error, {:standalone_write_failed, reason}})
+                  new_state
+              end
+
+            drain_standalone_barrier_waiting(state)
+
+          {:empty, _queue} ->
+            %{
+              state
+              | standalone_barrier_waiting_count: 0,
+                standalone_barrier_waiting_bytes: 0
+            }
+        end
+      end
+
+      defp reject_barrier_waiting_writes(state, reason) do
+        state.standalone_barrier_waiting
+        |> :queue.to_list()
+        |> Enum.each(fn {from, _request, _request_bytes} ->
+          GenServer.reply(from, {:error, reason})
+        end)
+
+        %{
+          state
+          | standalone_barrier_waiting: :queue.new(),
+            standalone_barrier_waiting_count: 0,
+            standalone_barrier_waiting_bytes: 0
+        }
+      end
+
+      defp clear_standalone_write_barrier(
+             %{standalone_write_barrier: %{monitor_ref: monitor_ref}} = state
+           ) do
+        if is_reference(monitor_ref) do
+          Process.demonitor(monitor_ref, [:flush])
+        end
+
+        %{state | standalone_write_barrier: false}
+      end
+
+      defp clear_standalone_write_barrier(state),
+        do: %{state | standalone_write_barrier: false}
+
+      defp bump_standalone_write_version(state, delta) when is_integer(delta) and delta > 0 do
+        state = %{state | write_version: state.write_version + delta}
+        bump_shared_write_version(state, delta)
+        state
+      end
+
+      defp bump_standalone_write_version(state, _delta), do: state
+
+      defp maybe_bump_cross_shard_write_versions(state, _participant_indices, {:error, _reason}),
+        do: state
+
+      defp maybe_bump_cross_shard_write_versions(state, participant_indices, _result) do
+        state = bump_standalone_write_version(state, 1)
+
+        Enum.each(participant_indices, fn shard_index ->
+          bump_instance_write_version(state.instance_ctx, shard_index, 1)
+        end)
+
+        state
+      end
+
+      defp bump_instance_write_version(
+             %{write_version: write_version},
+             shard_index,
+             delta
+           )
+           when is_integer(shard_index) and shard_index >= 0 and is_integer(delta) and delta > 0 do
+        size = :counters.info(write_version).size
+        if shard_index < size, do: :counters.add(write_version, shard_index + 1, delta)
+        :ok
+      rescue
+        _ -> :ok
+      end
+
+      defp bump_instance_write_version(_ctx, _shard_index, _delta), do: :ok
 
       defp reject_queued_standalone_commits(state, reason) do
         if timer = state.standalone_batch_timer do
@@ -419,7 +785,9 @@ defmodule Ferricstore.Store.Shard.Routing do
         |> await_standalone_flush()
       end
 
-      defp drain_standalone_waiting(%{standalone_write_barrier: true} = state), do: state
+      defp drain_standalone_waiting(%{standalone_write_barrier: barrier} = state)
+           when barrier != false,
+           do: state
 
       defp drain_standalone_waiting(%{standalone_waiting_count: 0} = state) do
         %{state | standalone_waiting_bytes: 0, standalone_waiting_keys: MapSet.new()}
@@ -596,11 +964,6 @@ defmodule Ferricstore.Store.Shard.Routing do
         standalone_lock_keys([destination | sources])
       end
 
-      defp standalone_command_keys({:lock_keys, keys, _owner_ref, _expire_at_ms})
-           when is_list(keys) do
-        standalone_lock_keys(keys)
-      end
-
       defp standalone_command_keys(
              {:fetch_or_compute_lock, key, outcome_key, _owner_ref, _expire_at_ms}
            ) do
@@ -625,24 +988,8 @@ defmodule Ferricstore.Store.Shard.Routing do
         MapSet.new([standalone_lock_key(key)])
       end
 
-      defp standalone_command_keys({:unlock_keys, keys, _owner_ref}) when is_list(keys) do
-        standalone_lock_keys(keys)
-      end
-
-      defp standalone_command_keys({:unlock_keys_owned, keys, _owner_ref}) when is_list(keys) do
-        standalone_lock_keys(keys)
-      end
-
-      defp standalone_command_keys({:locked_put, key, _value, _expire_at_ms, _owner_ref}) do
+      defp standalone_command_keys({:fetch_or_compute_release, key, _owner_ref}) do
         MapSet.new([standalone_lock_key(key)])
-      end
-
-      defp standalone_command_keys({:locked_delete, key, _owner_ref}) do
-        MapSet.new([standalone_lock_key(key)])
-      end
-
-      defp standalone_command_keys({:locked_delete_prefix, prefix, _owner_ref}) do
-        MapSet.new([standalone_lock_key(prefix)])
       end
 
       defp standalone_command_keys(
@@ -799,10 +1146,44 @@ defmodule Ferricstore.Store.Shard.Routing do
               GenServer.reply(from, reply)
             end)
 
+            {:ok, replies}
+
           :mismatch ->
             reply_standalone_error(entries, {:standalone_result_mismatch, length(results)})
+            :mismatch
         end
       end
+
+      defp standalone_mutation_count(entries, replies) do
+        entries
+        |> Enum.zip(replies)
+        |> Enum.count(fn {{_from, command, _keys, _bytes}, reply} ->
+          standalone_command_mutated?(command, reply)
+        end)
+      end
+
+      defp standalone_command_mutated?(_command, {:error, _reason}), do: false
+      defp standalone_command_mutated?({:msetnx, _args}, 0), do: false
+
+      defp standalone_command_mutated?(
+             {:set, _key, _value, _expire_at_ms, %{get: false, nx: nx, xx: xx}},
+             nil
+           )
+           when nx or xx,
+           do: false
+
+      defp standalone_command_mutated?({:expire_if_batch, _entries}, results)
+           when is_list(results),
+           do: Enum.any?(results, &(&1 == true))
+
+      defp standalone_command_mutated?({:batch, commands}, {:ok, replies})
+           when is_list(commands) and is_list(replies) do
+        commands
+        |> Enum.zip(replies)
+        |> Enum.any?(fn {command, reply} -> standalone_command_mutated?(command, reply) end)
+      end
+
+      defp standalone_command_mutated?(_command, _reply), do: true
 
       defp partition_standalone_results([], [], replies),
         do: {:ok, Enum.reverse(replies)}

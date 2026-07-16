@@ -48,7 +48,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           # Add one more member to cross the threshold
           Set.handle("SADD", [key, "extra_member"], store)
 
-          assert promoted?(key)
+          assert_promoted(key)
         end
 
         test "promoted set has dedicated directory on disk" do
@@ -57,7 +57,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
 
           populate_set(store, key, @test_threshold + 1)
 
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Verify the dedicated directory exists
           data_dir = Application.fetch_env!(:ferricstore, :data_dir)
@@ -79,7 +79,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           n = @test_threshold + 1
 
           populate_set(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           members = Set.handle("SMEMBERS", [key], store)
           assert length(members) == n
@@ -99,7 +99,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           key = ukey("sismember_promoted")
 
           populate_set(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 1 == Set.handle("SISMEMBER", [key, "member_1"], store)
         end
@@ -109,7 +109,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           key = ukey("sismember_miss_promoted")
 
           populate_set(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 0 == Set.handle("SISMEMBER", [key, "nonexistent"], store)
         end
@@ -125,7 +125,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           key = ukey("srem_promoted")
 
           populate_set(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 1 == Set.handle("SREM", [key, "member_1"], store)
           assert 0 == Set.handle("SISMEMBER", [key, "member_1"], store)
@@ -136,7 +136,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           key = ukey("srem_miss_promoted")
 
           populate_set(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 0 == Set.handle("SREM", [key, "nonexistent"], store)
         end
@@ -153,7 +153,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           n = @test_threshold + 1
 
           populate_set(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert n == Set.handle("SCARD", [key], store)
         end
@@ -164,7 +164,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           n = @test_threshold + 1
 
           populate_set(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           Set.handle("SADD", [key, "extra"], store)
           assert n + 1 == Set.handle("SCARD", [key], store)
@@ -176,7 +176,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           n = @test_threshold + 1
 
           populate_set(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           Set.handle("SREM", [key, "member_1"], store)
           assert n - 1 == Set.handle("SCARD", [key], store)
@@ -193,7 +193,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           key = ukey("sadd_promoted")
 
           populate_set(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 1 == Set.handle("SADD", [key, "new_member"], store)
           assert 1 == Set.handle("SISMEMBER", [key, "new_member"], store)
@@ -204,7 +204,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           key = ukey("sadd_existing_promoted")
 
           populate_set(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 0 == Set.handle("SADD", [key, "member_1"], store)
         end
@@ -220,7 +220,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           key = ukey("del_promoted_set")
 
           populate_set(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # DEL the key
           Strings.handle("DEL", [key], store)
@@ -250,14 +250,14 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSetStaysInSharedBitcask 
           n = @test_threshold + 1
 
           populate_set(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Delete most members, keep 2
           for i <- 3..n do
             Set.handle("SREM", [key, "member_#{i}"], store)
           end
 
-          assert promoted?(key)
+          assert_promoted(key)
           assert 2 == Set.handle("SCARD", [key], store)
           assert 1 == Set.handle("SISMEMBER", [key, "member_1"], store)
         end

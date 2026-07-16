@@ -392,7 +392,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AckedWritesSurviveWaraftSe
         refute recovery_source =~ "file:read_file(",
                "segment recovery must not materialize a full segment file in BEAM memory"
 
-        assert recovery_source =~ "file:open(Path, [read, raw, binary])"
+        assert recovery_source =~ "open_verified_segment_file(Path, [read, raw, binary])"
         assert recovery_source =~ "file:read(Fd, ?RECORD_HEADER_SIZE)"
       end
 

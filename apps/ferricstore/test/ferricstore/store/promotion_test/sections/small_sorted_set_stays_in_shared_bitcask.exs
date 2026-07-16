@@ -48,7 +48,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           # Add one more member to cross the threshold
           SortedSet.handle("ZADD", [key, "999.0", "extra_member"], store)
 
-          assert promoted?(key)
+          assert_promoted(key)
         end
 
         test "promoted zset has dedicated directory on disk" do
@@ -57,7 +57,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
 
           populate_zset(store, key, @test_threshold + 1)
 
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Verify the dedicated directory exists
           data_dir = Application.fetch_env!(:ferricstore, :data_dir)
@@ -82,7 +82,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           n = @test_threshold + 1
 
           populate_zset(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           members = SortedSet.handle("ZRANGE", [key, "0", "-1"], store)
           assert length(members) == n
@@ -98,7 +98,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           n = @test_threshold + 1
 
           populate_zset(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           result = SortedSet.handle("ZRANGE", [key, "0", "-1", "WITHSCORES"], store)
           # Result is [member1, score1, member2, score2, ...]
@@ -120,7 +120,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           key = ukey("zscore_promoted")
 
           populate_zset(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           score = SortedSet.handle("ZSCORE", [key, "member_3"], store)
           assert score == "3.0"
@@ -131,7 +131,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           key = ukey("zscore_miss_promoted")
 
           populate_zset(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert nil == SortedSet.handle("ZSCORE", [key, "nonexistent"], store)
         end
@@ -147,7 +147,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           key = ukey("zrem_promoted")
 
           populate_zset(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 1 == SortedSet.handle("ZREM", [key, "member_1"], store)
           assert nil == SortedSet.handle("ZSCORE", [key, "member_1"], store)
@@ -158,7 +158,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           key = ukey("zrem_miss_promoted")
 
           populate_zset(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 0 == SortedSet.handle("ZREM", [key, "nonexistent"], store)
         end
@@ -175,7 +175,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           n = @test_threshold + 1
 
           populate_zset(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert n == SortedSet.handle("ZCARD", [key], store)
         end
@@ -186,7 +186,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           n = @test_threshold + 1
 
           populate_zset(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           SortedSet.handle("ZADD", [key, "999.0", "extra"], store)
           assert n + 1 == SortedSet.handle("ZCARD", [key], store)
@@ -198,7 +198,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           n = @test_threshold + 1
 
           populate_zset(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           SortedSet.handle("ZREM", [key, "member_1"], store)
           assert n - 1 == SortedSet.handle("ZCARD", [key], store)
@@ -215,7 +215,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           key = ukey("zadd_promoted")
 
           populate_zset(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 1 == SortedSet.handle("ZADD", [key, "42.5", "new_member"], store)
           assert "42.5" == SortedSet.handle("ZSCORE", [key, "new_member"], store)
@@ -226,7 +226,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           key = ukey("zadd_update_promoted")
 
           populate_zset(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           assert 0 == SortedSet.handle("ZADD", [key, "99.9", "member_1"], store)
           score = SortedSet.handle("ZSCORE", [key, "member_1"], store)
@@ -245,7 +245,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           key = ukey("zrank_promoted")
 
           populate_zset(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # member_1 has score 1.0, should be rank 0 (lowest)
           assert 0 == SortedSet.handle("ZRANK", [key, "member_1"], store)
@@ -262,7 +262,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           key = ukey("del_promoted_zset")
 
           populate_zset(store, key, @test_threshold + 1)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # DEL the key
           Strings.handle("DEL", [key], store)
@@ -295,14 +295,14 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallSortedSetStaysInSharedBi
           n = @test_threshold + 1
 
           populate_zset(store, key, n)
-          assert promoted?(key)
+          assert_promoted(key)
 
           # Delete most members, keep 2
           for i <- 3..n do
             SortedSet.handle("ZREM", [key, "member_#{i}"], store)
           end
 
-          assert promoted?(key)
+          assert_promoted(key)
           assert 2 == SortedSet.handle("ZCARD", [key], store)
           assert "1.0" == SortedSet.handle("ZSCORE", [key, "member_1"], store)
         end

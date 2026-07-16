@@ -907,13 +907,18 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               "password" => "secret"
             })
 
-          response =
-            http_get(HealthEndpoint.port(), "/dashboard/api/flow/projections", [
-              {"Cookie", dashboard_session_cookie(login)}
-            ])
+          for path <- [
+                "/dashboard/api/flow/projections",
+                "/dashboard/api/flow/projections?partition_key=tenant-a"
+              ] do
+            response =
+              http_get(HealthEndpoint.port(), path, [
+                {"Cookie", dashboard_session_cookie(login)}
+              ])
 
-          assert extract_status_code(response) == 404
-          assert Jason.decode!(extract_body(response)) == %{"error" => "not found"}
+            assert extract_status_code(response) == 404
+            assert Jason.decode!(extract_body(response)) == %{"error" => "not found"}
+          end
 
           :ok =
             FerricstoreServer.Acl.set_user("no-flow-list", [
@@ -1083,6 +1088,25 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           assert String.contains?(html, "read-write")
           assert String.contains?(html, "read-only")
           assert String.contains?(html, "node-local")
+          assert String.contains?(html, "Redis-compatible")
+
+          assert Enum.all?(
+                   data.config_parameters,
+                   &(&1.scope in ["runtime", "Redis-compatible", "current node"])
+                 )
+        end
+
+        test "config sub-page does not advertise unsupported runtime parameters" do
+          data = Dashboard.collect_config_page()
+
+          runtime_parameters =
+            Enum.reject(data.config_parameters, &(&1.scope == "current node"))
+
+          for %{parameter: parameter} <- runtime_parameters do
+            assert [{^parameter, _value}] = Ferricstore.Config.get(parameter)
+          end
+
+          refute Enum.any?(runtime_parameters, &(&1.parameter == "port"))
         end
 
         test "shows built-in defaults message when no namespaces configured" do

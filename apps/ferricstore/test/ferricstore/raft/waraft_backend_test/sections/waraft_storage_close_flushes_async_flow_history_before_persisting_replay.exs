@@ -143,6 +143,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
+      @tag :apply_projection_cache_compaction
       test "Flow WARaft apply projection cache compacts when the row budget is exceeded", %{
         root: root,
         ctx: ctx
@@ -175,6 +176,259 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
           assert eventually(fn -> apply_projection_cache_rows(root, 0) == 0 end)
         after
           restore_env(:waraft_apply_projection_cache_max_entries, previous_limit)
+        end
+      end
+
+      @tag :apply_projection_cache_compaction
+      @tag :apply_projection_byte_budget
+      test "WARaft apply projection cache compacts oversized values by byte budget", %{
+        root: root,
+        ctx: ctx
+      } do
+        previous_entry_limit =
+          Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_entries)
+
+        previous_byte_limit =
+          Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_bytes)
+
+        key = "router:list-byte-compact-#{System.unique_integer([:positive])}"
+        large_value = :binary.copy("large-inline-value-", 6_000)
+
+        try do
+          Application.put_env(
+            :ferricstore,
+            :waraft_apply_projection_cache_max_entries,
+            :infinity
+          )
+
+          Application.put_env(:ferricstore, :waraft_apply_projection_cache_max_bytes, 1_024)
+          clear_apply_projection_cache!()
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          assert 2 =
+                   Ferricstore.Commands.List.handle_ast(
+                     {:rpush, [key, large_value, "tail"]},
+                     ctx
+                   )
+
+          assert eventually(fn ->
+                   Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_bytes(root, 0) <=
+                     512
+                 end)
+
+          assert [large_value, "tail"] ==
+                   Ferricstore.Commands.List.handle_ast({:lrange, key, 0, -1}, ctx)
+
+          list_prefix = CompoundKey.list_prefix(key)
+
+          projected_rows =
+            ctx.keydir_refs
+            |> elem(0)
+            |> :ets.tab2list()
+            |> Enum.filter(fn
+              {compound_key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, _index},
+               _offset, _value_size} ->
+                String.starts_with?(compound_key, list_prefix)
+
+              _row ->
+                false
+            end)
+
+          assert length(projected_rows) == 2
+
+          Enum.each(projected_rows, fn
+            {compound_key, _cached, _expire_at_ms, _lfu, file_id, _offset, _value_size} ->
+              assert {:ok, value} =
+                       Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                         ctx,
+                         0,
+                         file_id,
+                         compound_key
+                       )
+
+              assert is_binary(value)
+          end)
+        after
+          restore_env(:waraft_apply_projection_cache_max_entries, previous_entry_limit)
+          restore_env(:waraft_apply_projection_cache_max_bytes, previous_byte_limit)
+        end
+      end
+
+      @tag :apply_projection_cache_compaction
+      test "WARaft apply projection cache drains writes that arrive during an active spill", %{
+        root: root,
+        ctx: ctx
+      } do
+        previous_entry_limit =
+          Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_entries)
+
+        previous_byte_limit =
+          Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_bytes)
+
+        previous_spill_hook =
+          Application.get_env(:ferricstore, :waraft_apply_projection_spill_hook)
+
+        spill_calls = :atomics.new(1, signed: false)
+        parent = self()
+        first_key = "router:list-byte-spill-first-#{System.unique_integer([:positive])}"
+        second_key = "router:list-byte-spill-second-#{System.unique_integer([:positive])}"
+        first_value = :binary.copy("first-inline-value-", 6_000)
+        second_value = :binary.copy("second-inline-value-", 6_000)
+
+        spill_hook = fn _batches ->
+          case :atomics.add_get(spill_calls, 1, 1) do
+            1 ->
+              send(parent, {:first_apply_projection_spill_selected, self()})
+
+              receive do
+                :release_first_apply_projection_spill -> :ok
+              after
+                5_000 -> :ok
+              end
+
+            _later_spill ->
+              :ok
+          end
+        end
+
+        try do
+          Application.put_env(
+            :ferricstore,
+            :waraft_apply_projection_cache_max_entries,
+            :infinity
+          )
+
+          Application.put_env(:ferricstore, :waraft_apply_projection_cache_max_bytes, 1_024)
+          Application.put_env(:ferricstore, :waraft_apply_projection_spill_hook, spill_hook)
+          clear_apply_projection_cache!()
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          assert 1 =
+                   Ferricstore.Commands.List.handle_ast(
+                     {:rpush, [first_key, first_value]},
+                     ctx
+                   )
+
+          assert_receive {:first_apply_projection_spill_selected, first_spill_pid}, 1_000
+
+          assert 1 =
+                   Ferricstore.Commands.List.handle_ast(
+                     {:rpush, [second_key, second_value]},
+                     ctx
+                   )
+
+          assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_bytes(root, 0) >
+                   1_024
+
+          send(first_spill_pid, :release_first_apply_projection_spill)
+
+          assert eventually(fn ->
+                   Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_bytes(root, 0) <=
+                     512
+                 end)
+
+          assert :atomics.get(spill_calls, 1) >= 2
+
+          assert [first_value] ==
+                   Ferricstore.Commands.List.handle_ast({:lrange, first_key, 0, -1}, ctx)
+
+          assert [second_value] ==
+                   Ferricstore.Commands.List.handle_ast({:lrange, second_key, 0, -1}, ctx)
+        after
+          restore_env(:waraft_apply_projection_cache_max_entries, previous_entry_limit)
+          restore_env(:waraft_apply_projection_cache_max_bytes, previous_byte_limit)
+          restore_env(:waraft_apply_projection_spill_hook, previous_spill_hook)
+        end
+      end
+
+      @tag :apply_projection_cache_compaction
+      test "WARaft apply projection cache retries after an unlinked compactor dies", %{
+        root: root,
+        ctx: ctx
+      } do
+        previous_entry_limit =
+          Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_entries)
+
+        previous_byte_limit =
+          Application.get_env(:ferricstore, :waraft_apply_projection_cache_max_bytes)
+
+        previous_compact_hook =
+          Application.get_env(:ferricstore, :waraft_apply_projection_cache_compact_hook)
+
+        compact_calls = :atomics.new(1, signed: false)
+        parent = self()
+        first_key = "router:list-dead-compactor-first-#{System.unique_integer([:positive])}"
+        second_key = "router:list-dead-compactor-second-#{System.unique_integer([:positive])}"
+
+        compact_hook = fn
+          :before_spill, _metadata ->
+            case :atomics.add_get(compact_calls, 1, 1) do
+              1 ->
+                send(parent, {:apply_projection_compactor_will_die, self()})
+                Process.exit(self(), :kill)
+
+              _retry ->
+                :ok
+            end
+
+          _phase, _metadata ->
+            :ok
+        end
+
+        try do
+          Application.put_env(:ferricstore, :waraft_apply_projection_cache_max_entries, 0)
+
+          Application.put_env(
+            :ferricstore,
+            :waraft_apply_projection_cache_max_bytes,
+            :infinity
+          )
+
+          Application.put_env(
+            :ferricstore,
+            :waraft_apply_projection_cache_compact_hook,
+            compact_hook
+          )
+
+          clear_apply_projection_cache!()
+
+          assert :ok =
+                   WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          assert 1 =
+                   Ferricstore.Commands.List.handle_ast({:rpush, [first_key, "first"]}, ctx)
+
+          assert_receive {:apply_projection_compactor_will_die, _compactor_pid}, 1_000
+
+          assert eventually(fn ->
+                   case WARaftBackend.storage_status(0) do
+                     {:ok, status} ->
+                       Keyword.get(status, :apply_projection_cache_compaction_pending?) == false
+
+                     _other ->
+                       false
+                   end
+                 end)
+
+          assert 1 =
+                   Ferricstore.Commands.List.handle_ast({:rpush, [second_key, "second"]}, ctx)
+
+          assert eventually(fn -> apply_projection_cache_rows(root, 0) == 0 end)
+          assert :atomics.get(compact_calls, 1) >= 2
+
+          assert ["first"] ==
+                   Ferricstore.Commands.List.handle_ast({:lrange, first_key, 0, -1}, ctx)
+
+          assert ["second"] ==
+                   Ferricstore.Commands.List.handle_ast({:lrange, second_key, 0, -1}, ctx)
+        after
+          restore_env(:waraft_apply_projection_cache_max_entries, previous_entry_limit)
+          restore_env(:waraft_apply_projection_cache_max_bytes, previous_byte_limit)
+          restore_env(:waraft_apply_projection_cache_compact_hook, previous_compact_hook)
         end
       end
 
@@ -656,8 +910,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
-      test "Flow cross-shard spawn_children uses WARaft as the selected backend", %{root: root} do
-        ctx = build_ctx(Path.join(root, "flow-cross-shard"), shard_count: 2)
+      test "Flow rejects dependencies across independent WARaft groups", %{root: root} do
+        ctx = build_ctx(Path.join(root, "flow-cross-group-rejection"), shard_count: 2)
         parent_id = "router-flow-parent-#{System.unique_integer([:positive])}"
         child_id = "router-flow-child-#{System.unique_integer([:positive])}"
         parent_partition = flow_partition_for_shard(ctx, parent_id, 0)
@@ -677,7 +931,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
           assert {:ok, created_parent} =
                    Ferricstore.Flow.get(ctx, parent_id, partition_key: parent_partition)
 
-          assert :ok =
+          assert {:error, "CROSSSLOT Flow dependency keys must hash to the same shard"} =
                    Ferricstore.Flow.spawn_children(
                      ctx,
                      parent_id,
@@ -694,35 +948,32 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
                      now_ms: 1_010
                    )
 
-          assert {:ok, waiting_parent} =
+          assert {:ok, unchanged_parent} =
                    Ferricstore.Flow.get(ctx, parent_id, partition_key: parent_partition)
 
-          assert waiting_parent.state == "waiting_children"
-          assert waiting_parent.child_groups["fanout"]["children"][child_id] == "running"
+          assert unchanged_parent.state == "dispatch"
+          assert unchanged_parent.child_groups == %{}
 
-          assert {:ok, child} =
-                   Ferricstore.Flow.get(ctx, child_id, partition_key: child_partition)
-
-          assert child.parent_flow_id == parent_id
-          assert child.parent_partition_key == parent_partition
-          assert child.partition_key == child_partition
+          child_key = Ferricstore.Flow.Keys.state_key(child_id, child_partition)
+          child_shard = Router.shard_for(ctx, child_key)
+          assert [] == :ets.lookup(elem(ctx.keydir_refs, child_shard), child_key)
         after
           FerricStore.Instance.cleanup(ctx.name)
         end
       end
 
-      test "Flow cross-shard child completion resolves parent through WARaft", %{root: root} do
-        ctx = build_ctx(Path.join(root, "flow-cross-shard-complete"), shard_count: 2)
+      test "Flow colocated child completion resolves parent through WARaft", %{root: root} do
+        ctx = build_ctx(Path.join(root, "flow-colocated-complete"), shard_count: 2)
         parent_id = "router-flow-parent-complete-#{System.unique_integer([:positive])}"
         child_id = "router-flow-child-complete-#{System.unique_integer([:positive])}"
         parent_partition = flow_partition_for_shard(ctx, parent_id, 0)
-        child_partition = flow_partition_for_shard(ctx, child_id, 1)
+        child_partition = parent_partition
 
         try do
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
           assert {:ok, _waiting_parent} =
-                   setup_cross_shard_flow_child(
+                   setup_flow_child(
                      ctx,
                      parent_id,
                      child_id,
@@ -757,18 +1008,18 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
-      test "Flow cross-shard retry exhaustion resolves parent through WARaft", %{root: root} do
-        ctx = build_ctx(Path.join(root, "flow-cross-shard-retry"), shard_count: 2)
+      test "Flow colocated retry exhaustion resolves parent through WARaft", %{root: root} do
+        ctx = build_ctx(Path.join(root, "flow-colocated-retry"), shard_count: 2)
         parent_id = "router-flow-parent-retry-#{System.unique_integer([:positive])}"
         child_id = "router-flow-child-retry-#{System.unique_integer([:positive])}"
         parent_partition = flow_partition_for_shard(ctx, parent_id, 0)
-        child_partition = flow_partition_for_shard(ctx, child_id, 1)
+        child_partition = parent_partition
 
         try do
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
           assert {:ok, _waiting_parent} =
-                   setup_cross_shard_flow_child(
+                   setup_flow_child(
                      ctx,
                      parent_id,
                      child_id,
@@ -804,24 +1055,24 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
         end
       end
 
-      test "Flow cross-shard fail and cancel propagate parent policy through WARaft", %{
+      test "Flow colocated fail and cancel propagate parent policy through WARaft", %{
         root: root
       } do
-        ctx = build_ctx(Path.join(root, "flow-cross-shard-fail-cancel"), shard_count: 2)
+        ctx = build_ctx(Path.join(root, "flow-colocated-fail-cancel"), shard_count: 2)
         fail_parent = "router-flow-parent-fail-#{System.unique_integer([:positive])}"
         fail_child = "router-flow-child-fail-#{System.unique_integer([:positive])}"
         cancel_parent = "router-flow-parent-cancel-#{System.unique_integer([:positive])}"
         cancel_child = "router-flow-child-cancel-#{System.unique_integer([:positive])}"
         parent_partition = flow_partition_for_shard(ctx, fail_parent, 0)
-        child_partition = flow_partition_for_shard(ctx, fail_child, 1)
+        child_partition = parent_partition
         cancel_parent_partition = flow_partition_for_shard(ctx, cancel_parent, 0)
-        cancel_child_partition = flow_partition_for_shard(ctx, cancel_child, 1)
+        cancel_child_partition = cancel_parent_partition
 
         try do
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
           assert {:ok, _waiting_parent} =
-                   setup_cross_shard_flow_child(
+                   setup_flow_child(
                      ctx,
                      fail_parent,
                      fail_child,
@@ -848,7 +1099,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
           assert failed_parent.child_groups["fail-fanout"]["children"][fail_child] == "failed"
 
           assert {:ok, waiting_cancel_parent} =
-                   setup_cross_shard_flow_child(
+                   setup_flow_child(
                      ctx,
                      cancel_parent,
                      cancel_child,

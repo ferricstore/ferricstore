@@ -148,12 +148,29 @@ defmodule Ferricstore.Store.Shard.Calls do
         end
       end
 
-      def handle_call(:standalone_cross_shard_barrier_acquire, _from, state) do
+      def handle_call({:standalone_barrier_write, request}, from, state)
+          when is_tuple(request) do
+        if standalone_write_barrier_active?(state) do
+          {:noreply, enqueue_standalone_barrier_write(state, from, request)}
+        else
+          handle_call(request, from, state)
+        end
+      end
+
+      def handle_call(
+            {:standalone_cross_shard_barrier_acquire, owner_token},
+            {owner_pid, _reply_tag},
+            state
+          )
+          when is_reference(owner_token) and is_pid(owner_pid) do
         state = drain_standalone_commits_for_sync(state)
 
         cond do
-          state.standalone_write_barrier ->
+          standalone_write_barrier_active?(state) ->
             {:reply, {:error, :standalone_cross_shard_barrier_busy}, state}
+
+          not Process.alive?(owner_pid) ->
+            {:reply, {:error, :standalone_cross_shard_barrier_owner_down}, state}
 
           state.writes_paused ->
             {:reply, {:error, :prior_standalone_write_failed}, state}
@@ -162,67 +179,33 @@ defmodule Ferricstore.Store.Shard.Calls do
             {:reply, {:error, state.last_flush_error}, %{state | writes_paused: true}}
 
           true ->
-            {:reply, :ok, %{state | standalone_write_barrier: true}}
+            {:reply, :ok, install_standalone_write_barrier(state, owner_token, owner_pid, true)}
         end
-      end
-
-      def handle_call(:standalone_cross_shard_barrier_release, _from, state) do
-        state =
-          cond do
-            state.writes_paused ->
-              state
-              |> clear_standalone_write_barrier()
-              |> reject_queued_standalone_commits(
-                {:standalone_durability_failed, :prior_standalone_write_failed}
-              )
-
-            state.last_flush_error != nil ->
-              state
-              |> clear_standalone_write_barrier()
-              |> reject_queued_standalone_commits(
-                {:standalone_durability_failed, state.last_flush_error}
-              )
-              |> Map.put(:writes_paused, true)
-
-            true ->
-              state
-              |> clear_standalone_write_barrier()
-              |> drain_standalone_waiting()
-              |> flush_ready_standalone_batch()
-          end
-
-        {:reply, :ok, state}
       end
 
       def handle_call(
-            {:standalone_cross_shard_execute, execute_fn},
-            _from,
-            %{standalone_write_barrier: true} = state
+            {:standalone_cross_shard_barrier_release, owner_token},
+            {owner_pid, _reply_tag},
+            state
           )
-          when is_function(execute_fn, 1) do
-        sm_state = direct_sm_state(state)
-
-        case Ferricstore.Raft.StateMachine.apply_standalone_cross_shard(execute_fn, sm_state) do
-          {result, %{} = new_sm_state} ->
-            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
-
-          {:error, reason, new_sm_state} ->
-            {:reply, {:error, {:standalone_durability_failed, reason}},
-             state
-             |> apply_direct_sm_state(new_sm_state)
-             |> Map.put(:writes_paused, true)
-             |> Map.put(:last_flush_error, reason)}
-
-          {:error, reason} ->
-            {:reply, {:error, {:standalone_durability_failed, reason}},
-             state
-             |> Map.put(:writes_paused, true)
-             |> Map.put(:last_flush_error, reason)}
+          when is_reference(owner_token) and is_pid(owner_pid) do
+        if standalone_write_barrier_owner?(state, owner_token, owner_pid) do
+          {:reply, :ok, release_standalone_write_barrier(state)}
+        else
+          {:reply, {:error, :standalone_cross_shard_barrier_not_owner}, state}
         end
       end
 
-      def handle_call({:standalone_cross_shard_execute, _execute_fn}, _from, state) do
-        {:reply, {:error, :standalone_cross_shard_barrier_required}, state}
+      def handle_call(
+            {:standalone_cross_shard_execute, participant_indices, execute_fn},
+            _from,
+            state
+          )
+          when is_list(participant_indices) and is_function(execute_fn, 1) do
+        {reply, state} =
+          coordinate_standalone_cross_shard(participant_indices, execute_fn, state)
+
+        {:reply, reply, state}
       end
 
       def handle_call(
@@ -273,11 +256,13 @@ defmodule Ferricstore.Store.Shard.Calls do
            batch_bytes: state.standalone_batch_bytes,
            waiting_count: state.standalone_waiting_count,
            waiting_bytes: state.standalone_waiting_bytes,
+           barrier_waiting_count: state.standalone_barrier_waiting_count,
+           barrier_waiting_bytes: state.standalone_barrier_waiting_bytes,
            inflight_count: length(state.standalone_flush_entries),
            inflight_bytes: state.standalone_flush_bytes,
            retained_bytes:
              state.standalone_batch_bytes + state.standalone_waiting_bytes +
-               state.standalone_flush_bytes,
+               state.standalone_flush_bytes + state.standalone_barrier_waiting_bytes,
            inflight_keys: MapSet.to_list(state.standalone_inflight_keys)
          }, state}
       end
@@ -292,6 +277,8 @@ defmodule Ferricstore.Store.Shard.Calls do
            standalone_batch_bytes: state.standalone_batch_bytes,
            standalone_waiting_count: state.standalone_waiting_count,
            standalone_waiting_bytes: state.standalone_waiting_bytes,
+           standalone_barrier_waiting_count: state.standalone_barrier_waiting_count,
+           standalone_barrier_waiting_bytes: state.standalone_barrier_waiting_bytes,
            standalone_flush_bytes: state.standalone_flush_bytes,
            standalone_flush_inflight: state.standalone_flush_ref != nil
          }, state}
@@ -790,7 +777,7 @@ defmodule Ferricstore.Store.Shard.Calls do
       end
 
       # -------------------------------------------------------------------
-      # handle_call — pause/resume writes (cluster data sync)
+      # handle_call — pause/resume writes for global flush barriers
       # -------------------------------------------------------------------
       def handle_call({:pause_writes}, _from, state) do
         state = drain_standalone_commits_for_sync(state)

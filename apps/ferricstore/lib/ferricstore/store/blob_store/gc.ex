@@ -21,7 +21,8 @@ defmodule Ferricstore.Store.BlobStore.GC do
         clear_segment_dir_cache(data_dir, shard_index)
         shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
 
-        with {:ok, paths} <- segment_files(shard_path) do
+        with {:ok, paths} <- segment_files(shard_path),
+             {:ok, paths} <- order_segment_paths_for_recovery(paths) do
           latest_path = List.last(paths)
 
           result =
@@ -485,6 +486,35 @@ defmodule Ferricstore.Store.BlobStore.GC do
         segment_directory_files(shard_path, ".bloblog")
       end
 
+      defp order_segment_paths_for_recovery(paths) do
+        paths
+        |> Enum.reduce_while({:ok, %{}}, fn path, {:ok, paths_by_id} ->
+          case segment_id_from_path(path) do
+            {:ok, id} ->
+              if Map.has_key?(paths_by_id, id) do
+                {:halt, {:error, {:duplicate_blob_segment_id, id}}}
+              else
+                {:cont, {:ok, Map.put(paths_by_id, id, path)}}
+              end
+
+            {:error, _reason} = error ->
+              {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, paths_by_id} ->
+            paths =
+              paths_by_id
+              |> Enum.sort_by(&elem(&1, 0))
+              |> Enum.map(&elem(&1, 1))
+
+            {:ok, paths}
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
       defp blob_tmp_files(shard_path) do
         segment_directory_files(shard_path, ".tmp")
       end
@@ -494,7 +524,7 @@ defmodule Ferricstore.Store.BlobStore.GC do
 
         with {:ok, %File.Stat{type: :directory}} <- File.lstat(shard_path),
              {:ok, %File.Stat{type: :directory}} <- File.lstat(segment_path),
-             {:ok, names} <- Ferricstore.FS.ls(segment_path) do
+             {:ok, names} <- blob_segment_directory_ls(segment_path) do
           {:ok,
            names
            |> Enum.filter(&String.ends_with?(&1, suffix))
@@ -506,6 +536,13 @@ defmodule Ferricstore.Store.BlobStore.GC do
         end
       rescue
         error -> {:error, {:blob_tmp_list_failed, error}}
+      end
+
+      defp blob_segment_directory_ls(path) do
+        case Process.get(:ferricstore_blob_store_ls_hook) do
+          fun when is_function(fun, 1) -> fun.(path)
+          _other -> Ferricstore.FS.ls(path)
+        end
       end
 
       defp sweep_blob_paths(shard_path, paths, live_paths, protected_paths) do

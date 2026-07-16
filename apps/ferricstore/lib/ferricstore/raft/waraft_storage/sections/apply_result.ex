@@ -92,7 +92,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
       defp storage_apply_failure_reason?(:active_file_unavailable), do: true
       defp storage_apply_failure_reason?(:invalid_preencoded_command), do: true
-      defp storage_apply_failure_reason?({:unknown_command, _command}), do: true
       defp storage_apply_failure_reason?({:bitcask_append_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:bitcask_append_result_mismatch, _reason}), do: true
       defp storage_apply_failure_reason?({:bitcask_writer_flush_failed, _reason}), do: true
@@ -163,16 +162,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp tag_applied_result(_position, result), do: result
 
       defp maybe_compact_apply_projection_cache(handle) do
-        limit = apply_projection_cache_max_entries()
+        entry_limit = normalize_apply_projection_cache_limit(apply_projection_cache_max_entries())
+        byte_limit = normalize_apply_projection_cache_limit(apply_projection_cache_max_bytes())
 
         cond do
           Map.has_key?(handle, :apply_projection_cache_compaction) ->
             {:ok, handle}
 
-          limit == :infinity ->
-            {:ok, handle}
-
-          not (is_integer(limit) and limit >= 0) ->
+          entry_limit == :infinity and byte_limit == :infinity ->
             {:ok, handle}
 
           true ->
@@ -182,8 +179,25 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
                 handle.shard_index
               )
 
-            if count > limit do
-              start_apply_projection_cache_compaction(handle, count, limit)
+            bytes =
+              Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_bytes(
+                handle.ctx.data_dir,
+                handle.shard_index
+              )
+
+            spill_count = apply_projection_cache_spill_amount(count, entry_limit)
+            spill_bytes = apply_projection_cache_spill_amount(bytes, byte_limit)
+
+            if spill_count > 0 or spill_bytes > 0 do
+              start_apply_projection_cache_compaction(
+                handle,
+                count,
+                bytes,
+                entry_limit,
+                byte_limit,
+                spill_count,
+                spill_bytes
+              )
             else
               {:ok, handle}
             end
@@ -191,18 +205,45 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       end
 
       defp start_apply_projection_cache_compaction(
-             %{position: position} = handle,
+             handle,
              count,
              limit
            ) do
+        entry_limit = normalize_apply_projection_cache_limit(limit)
+
+        bytes =
+          Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_bytes(
+            handle.ctx.data_dir,
+            handle.shard_index
+          )
+
+        start_apply_projection_cache_compaction(
+          handle,
+          count,
+          bytes,
+          entry_limit,
+          :infinity,
+          apply_projection_cache_spill_amount(count, entry_limit),
+          0
+        )
+      end
+
+      defp start_apply_projection_cache_compaction(
+             %{position: position} = handle,
+             count,
+             bytes,
+             entry_limit,
+             byte_limit,
+             spill_count,
+             spill_bytes
+           ) do
         index = position_index(position)
-        spill_count = apply_projection_cache_spill_count(count, limit)
 
         cond do
           index <= 0 ->
             {:ok, handle}
 
-          spill_count <= 0 ->
+          spill_count <= 0 and spill_bytes <= 0 ->
             {:ok, handle}
 
           true ->
@@ -215,8 +256,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
               position: position,
               root_dir: handle.root_dir,
               count: count,
-              limit: limit,
-              spill_count: spill_count
+              bytes: bytes,
+              limit: entry_limit,
+              byte_limit: byte_limit,
+              spill_count: spill_count,
+              spill_bytes: spill_bytes
             }
 
             case Task.start(fn ->
@@ -225,6 +269,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
                        handle.ctx.data_dir,
                        handle.shard_index,
                        spill_count,
+                       spill_bytes,
                        metadata
                      )
 
@@ -235,14 +280,21 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
                    )
                  end) do
               {:ok, pid} ->
+                monitor = Process.monitor(pid)
+
                 {:ok,
                  Map.put(handle, :apply_projection_cache_compaction, %{
                    ref: ref,
                    pid: pid,
+                   monitor: monitor,
                    started_at: started_at,
+                   metadata: metadata,
                    count: count,
-                   limit: limit,
-                   spill_count: spill_count
+                   bytes: bytes,
+                   limit: entry_limit,
+                   byte_limit: byte_limit,
+                   spill_count: spill_count,
+                   spill_bytes: spill_bytes
                  })}
 
               {:error, reason} ->
@@ -258,29 +310,45 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
         end
       end
 
-      defp apply_projection_cache_spill_count(count, limit)
-           when is_integer(count) and is_integer(limit) and count > 0 and limit <= 0,
-           do: count
+      defp normalize_apply_projection_cache_limit(:infinity), do: :infinity
 
-      defp apply_projection_cache_spill_count(count, limit)
-           when is_integer(count) and is_integer(limit) and count > 0 do
-        target_count = div(limit, 2)
-        max(count - target_count, 1)
+      defp normalize_apply_projection_cache_limit(limit)
+           when is_integer(limit) and limit >= 0,
+           do: limit
+
+      defp normalize_apply_projection_cache_limit(_invalid), do: :infinity
+
+      defp apply_projection_cache_spill_amount(_current, :infinity), do: 0
+
+      defp apply_projection_cache_spill_amount(current, limit)
+           when is_integer(current) and current > limit and is_integer(limit) and limit >= 0 do
+        max(current - div(limit, 2), 1)
       end
 
-      defp apply_projection_cache_spill_count(_count, _limit), do: 0
+      defp apply_projection_cache_spill_amount(_current, _limit), do: 0
 
       defp apply_projection_cache_max_entries do
         Ferricstore.MemoryBudget.limit(:waraft_apply_projection_cache_max_entries, 16_384)
       end
 
-      defp run_apply_projection_cache_compaction(data_dir, shard_index, spill_count, metadata) do
+      defp apply_projection_cache_max_bytes do
+        Ferricstore.MemoryBudget.limit(:waraft_apply_projection_cache_max_bytes, 8_388_608)
+      end
+
+      defp run_apply_projection_cache_compaction(
+             data_dir,
+             shard_index,
+             spill_count,
+             spill_bytes,
+             metadata
+           ) do
         call_apply_projection_cache_compact_hook(:before_spill, metadata)
 
         Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(
           data_dir,
           shard_index,
-          spill_count
+          spill_count,
+          spill_bytes
         )
       rescue
         error -> {:error, {:apply_projection_cache_compact_failed, error}}
@@ -297,10 +365,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
         handle =
           handle
-          |> Map.delete(:apply_projection_cache_compaction)
+          |> clear_apply_projection_cache_compaction()
           |> update_apply_projection_cache_compaction_error(result)
 
-        {:ok, handle}
+        maybe_continue_apply_projection_cache_compaction(handle, result)
       end
 
       defp finish_apply_projection_cache_compaction(
@@ -313,6 +381,58 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       end
 
       defp finish_apply_projection_cache_compaction(_ref, _result, handle), do: {:ok, handle}
+
+      defp finish_apply_projection_cache_compaction_down(
+             monitor,
+             pid,
+             reason,
+             %{
+               apply_projection_cache_compaction: %{
+                 monitor: monitor,
+                 pid: pid,
+                 started_at: started_at,
+                 metadata: metadata
+               }
+             } = handle
+           ) do
+        result = {:error, {:task_down, reason}}
+        emit_apply_projection_cache_compaction(metadata, started_at, result)
+
+        handle =
+          handle
+          |> clear_apply_projection_cache_compaction()
+          |> update_apply_projection_cache_compaction_error(result)
+
+        {:ok, handle}
+      end
+
+      defp finish_apply_projection_cache_compaction_down(
+             _monitor,
+             _pid,
+             _reason,
+             handle
+           ),
+           do: {:ok, handle}
+
+      defp clear_apply_projection_cache_compaction(handle) do
+        case Map.get(handle, :apply_projection_cache_compaction) do
+          %{monitor: monitor} when is_reference(monitor) ->
+            Process.demonitor(monitor, [:flush])
+
+          _missing_or_legacy ->
+            :ok
+        end
+
+        Map.delete(handle, :apply_projection_cache_compaction)
+      end
+
+      defp maybe_continue_apply_projection_cache_compaction(handle, :ok),
+        do: maybe_compact_apply_projection_cache(handle)
+
+      defp maybe_continue_apply_projection_cache_compaction(handle, {:ok, _removed}),
+        do: maybe_compact_apply_projection_cache(handle)
+
+      defp maybe_continue_apply_projection_cache_compaction(handle, _failed), do: {:ok, handle}
 
       defp update_apply_projection_cache_compaction_error(handle, :ok),
         do: Map.delete(handle, :apply_projection_cache_last_error)

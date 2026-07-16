@@ -147,6 +147,25 @@ defmodule Ferricstore.Observability.LoggingNoiseGuardTest do
     end)
   end
 
+  test "prod runtime exposes an independent WARaft apply-projection byte cap" do
+    with_env("FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_BYTES", nil, fn ->
+      refute Keyword.has_key?(
+               runtime_ferricstore_memory_overrides(),
+               :waraft_apply_projection_cache_max_bytes
+             )
+    end)
+
+    with_env("FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_BYTES", "off", fn ->
+      assert runtime_ferricstore_memory_overrides()[:waraft_apply_projection_cache_max_bytes] ==
+               :infinity
+    end)
+
+    with_env("FERRICSTORE_WARAFT_APPLY_PROJECTION_CACHE_MAX_BYTES", "8388608", fn ->
+      assert runtime_ferricstore_memory_overrides()[:waraft_apply_projection_cache_max_bytes] ==
+               8_388_608
+    end)
+  end
+
   test "runtime library telemetry handlers use named callbacks" do
     offenders =
       @lib_root
@@ -220,6 +239,7 @@ defmodule Ferricstore.Observability.LoggingNoiseGuardTest do
       :waraft_segment_log_max_ets_bytes,
       :waraft_segment_log_max_ets_entries,
       :waraft_segment_log_min_ets_entries,
+      :waraft_apply_projection_cache_max_bytes,
       :waraft_apply_projection_cache_max_entries
     ])
   end

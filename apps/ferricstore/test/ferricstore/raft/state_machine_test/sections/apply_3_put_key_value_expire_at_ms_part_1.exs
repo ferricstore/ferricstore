@@ -105,7 +105,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           assert [] == :ets.lookup(ets, "nested_transaction_key")
         end
 
-        test "uses raft meta system_time when checking cross-shard lock expiry", %{
+        test "uses raft meta system_time when checking fetch-or-compute lock expiry", %{
           state: state,
           ets: ets
         } do
@@ -115,7 +115,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
 
           locked_state = %{
             state
-            | cross_shard_locks: %{
+            | fetch_or_compute_locks: %{
                 "meta_time_locked" => {make_ref(), lock_expires_after_apply_time}
               }
           }
@@ -142,7 +142,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
 
           locked_state = %{
             state
-            | cross_shard_locks: %{
+            | fetch_or_compute_locks: %{
                 "hlc_time_locked" => {make_ref(), lock_expires_between_meta_and_hlc}
               }
           }

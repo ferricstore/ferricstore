@@ -11,33 +11,15 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
-    original = Application.get_env(:ferricstore, :promotion_threshold)
-
-    original_pt =
-      try do
-        :persistent_term.get(:ferricstore_promotion_threshold)
-      rescue
-        ArgumentError -> :not_set
-      end
-
-    Application.put_env(:ferricstore, :promotion_threshold, 1)
-    :persistent_term.put(:ferricstore_promotion_threshold, 1)
-
-    ctx = IsolatedInstance.checkout(shard_count: 1, hot_cache_max_value_size: 1_000_000)
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 1,
+        hot_cache_max_value_size: 1_000_000,
+        promotion_threshold: 1
+      )
 
     on_exit(fn ->
       IsolatedInstance.checkin(ctx)
-
-      if original do
-        Application.put_env(:ferricstore, :promotion_threshold, original)
-      else
-        Application.delete_env(:ferricstore, :promotion_threshold)
-      end
-
-      case original_pt do
-        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
-        val -> :persistent_term.put(:ferricstore_promotion_threshold, val)
-      end
     end)
 
     {:ok, ctx: ctx}

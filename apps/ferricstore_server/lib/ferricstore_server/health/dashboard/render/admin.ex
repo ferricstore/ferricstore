@@ -275,16 +275,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
       {"require-tls", "Whether cleartext client connections are rejected."}
     ]
 
-    legacy = [
-      {"timeout", "Legacy setting accepted as a no-op or mapped config value."},
-      {"tcp-keepalive", "Legacy setting accepted as a no-op or mapped config value."},
-      {"databases", "Legacy setting accepted as a no-op or mapped config value."},
-      {"bind", "Legacy setting accepted as a no-op or mapped config value."},
-      {"port", "Legacy setting accepted as a no-op or mapped config value."},
-      {"save", "Legacy setting accepted as a no-op or mapped config value."},
-      {"appendonly", "Legacy setting accepted as a no-op or mapped config value."},
-      {"loglevel", "Legacy setting accepted as a no-op or mapped config value."},
-      {"requirepass", "Legacy setting accepted as a no-op or mapped config value."}
+    redis_compatible = [
+      {"timeout", "Redis-compatible CONFIG value retained for client tooling."},
+      {"tcp-keepalive", "Redis-compatible CONFIG value retained for client tooling."},
+      {"databases", "Redis-compatible CONFIG value retained for client tooling."},
+      {"bind", "Redis-compatible CONFIG value retained for client tooling."},
+      {"save", "Redis-compatible CONFIG value retained for client tooling."},
+      {"appendonly", "Redis-compatible CONFIG value retained for client tooling."},
+      {"loglevel", "Redis-compatible CONFIG value retained for client tooling."},
+      {"requirepass", "Default-user password used by AUTH and protected-mode checks."}
     ]
 
     local = [
@@ -293,7 +292,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
     Enum.map(read_write, &config_parameter_entry(&1, "runtime", "read-write")) ++
       Enum.map(read_only, &config_parameter_entry(&1, "runtime", "read-only")) ++
-      Enum.map(legacy, &config_parameter_entry(&1, "legacy", "read-write")) ++
+      Enum.map(redis_compatible, &config_parameter_entry(&1, "Redis-compatible", "read-write")) ++
       Enum.map(local, &config_parameter_entry(&1, "current node", "node-local"))
   end
 

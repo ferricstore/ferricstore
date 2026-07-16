@@ -38,37 +38,18 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
   @router_source_path Path.expand("../../../lib/ferricstore/store/router/blob_gc.ex", __DIR__)
 
-  setup do
+  setup test_context do
+    promotion_threshold = Map.get(test_context, :promotion_threshold, 1)
+
     ctx =
       IsolatedInstance.checkout(
         shard_count: 1,
         hot_cache_max_value_size: 64,
-        blob_side_channel_threshold_bytes: 128
+        blob_side_channel_threshold_bytes: 128,
+        promotion_threshold: promotion_threshold
       )
 
-    original_threshold = Application.get_env(:ferricstore, :promotion_threshold)
-
-    original_persistent_threshold =
-      try do
-        :persistent_term.get(:ferricstore_promotion_threshold)
-      rescue
-        ArgumentError -> :not_set
-      end
-
-    Application.put_env(:ferricstore, :promotion_threshold, 1)
-    :persistent_term.put(:ferricstore_promotion_threshold, 1)
-
     on_exit(fn ->
-      case original_threshold do
-        nil -> Application.delete_env(:ferricstore, :promotion_threshold)
-        value -> Application.put_env(:ferricstore, :promotion_threshold, value)
-      end
-
-      case original_persistent_threshold do
-        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
-        value -> :persistent_term.put(:ferricstore_promotion_threshold, value)
-      end
-
       IsolatedInstance.checkin(ctx)
     end)
 
@@ -241,7 +222,10 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
   defp await_promoted_instance(shard, redis_key, 0) do
     state = :sys.get_state(shard)
-    flunk("expected #{inspect(redis_key)} to be promoted, got #{inspect(state.promoted_instances)}")
+
+    flunk(
+      "expected #{inspect(redis_key)} to be promoted, got #{inspect(state.promoted_instances)}"
+    )
   end
 
   defp assert_state_machine_result(expected, result)

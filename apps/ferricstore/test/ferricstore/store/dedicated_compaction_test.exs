@@ -14,6 +14,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   alias Ferricstore.Commands.Hash
   alias Ferricstore.Store.{CompoundKey, LFU, Promotion, Router}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Test.ShardHelpers
 
   # Low threshold so we can trigger promotion in tests
@@ -26,32 +27,13 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   end
 
   setup do
-    original_promo = Application.get_env(:ferricstore, :promotion_threshold)
-
-    original_pt =
-      try do
-        :persistent_term.get(:ferricstore_promotion_threshold)
-      rescue
-        ArgumentError -> :not_set
-      end
-
-    Application.put_env(:ferricstore, :promotion_threshold, @test_threshold)
-    :persistent_term.put(:ferricstore_promotion_threshold, @test_threshold)
+    apply_context_snapshot =
+      ShardHelpers.replace_default_apply_context(promotion_threshold: @test_threshold)
 
     ShardHelpers.flush_all_keys()
 
     on_exit(fn ->
-      if original_promo do
-        Application.put_env(:ferricstore, :promotion_threshold, original_promo)
-      else
-        Application.delete_env(:ferricstore, :promotion_threshold)
-      end
-
-      case original_pt do
-        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
-        val -> :persistent_term.put(:ferricstore_promotion_threshold, val)
-      end
-
+      ShardHelpers.restore_default_apply_context(apply_context_snapshot)
       ShardHelpers.flush_all_keys()
       ShardHelpers.wait_shards_alive()
     end)
@@ -142,7 +124,19 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       end)
 
     Hash.handle("HSET", [key | pairs], store)
+
+    ShardHelpers.eventually(
+      fn -> promoted?(key) end,
+      "hash should be promoted before dedicated compaction"
+    )
+
     key
+  end
+
+  defp promoted?(key) do
+    ctx = FerricStore.Instance.get(:default)
+    shard_idx = Router.shard_for(ctx, key)
+    GenServer.call(Router.shard_name(ctx, shard_idx), {:promoted?, key})
   end
 
   defp dedicated_dir(key) do
@@ -439,17 +433,17 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       test_pid = self()
 
       Process.put(:ferricstore_promoted_compaction_after_collect_hook, fn ^key, live_entries ->
-        assert Enum.any?(live_entries, fn {entry_key, value, _exp} ->
-                 entry_key == compound_key and value == "value_1"
-               end)
+        if Enum.any?(live_entries, fn {entry_key, value, _exp, _source_row} ->
+             entry_key == compound_key and value == "value_1"
+           end) do
+          task =
+            Task.async(fn ->
+              Hash.handle("HSET", [key, "field_1", "newer_value"], store)
+            end)
 
-        task =
-          Task.async(fn ->
-            Hash.handle("HSET", [key, "field_1", "newer_value"], store)
-          end)
-
-        send(test_pid, {:promoted_compaction_race_task, task})
-        Process.sleep(50)
+          send(test_pid, {:promoted_compaction_race_task, task})
+          Process.sleep(50)
+        end
       end)
 
       try do
@@ -483,6 +477,8 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
         {missing_compound_key, nil, 0, LFU.initial(), 99, 0, 128}
       )
 
+      :ok = CompoundMemberIndex.put(state.compound_member_index, missing_compound_key)
+
       assert log_files(dedicated_path) == ["00000.log"]
 
       attach_dedicated_compaction_failed_handler()
@@ -504,8 +500,8 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       assert File.exists?(Path.join(dedicated_path, "00000.log")),
              "old dedicated log must stay until every live cold row was copied"
 
-      refute File.exists?(Path.join(dedicated_path, "00001.log")),
-             "failed compaction must roll back the newly touched target log"
+      assert File.exists?(Path.join(dedicated_path, "00001.log")),
+             "failed compaction must retain an already-published metadata page"
     end
   end
 

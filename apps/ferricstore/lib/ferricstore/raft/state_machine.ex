@@ -174,7 +174,7 @@ defmodule Ferricstore.Raft.StateMachine do
     sm_pending_flow_native_ops: [],
     sm_pending_flow_native_flush?: false,
     sm_pending_zset_index_ops: [],
-    sm_pending_compound_promotions: MapSet.new(),
+    sm_pending_compound_promotions: %{},
     sm_pending_compound_promotion_removals: MapSet.new(),
     sm_pending_promoted_maintenance: %{},
     sm_pending_compound_revision_ops: [],

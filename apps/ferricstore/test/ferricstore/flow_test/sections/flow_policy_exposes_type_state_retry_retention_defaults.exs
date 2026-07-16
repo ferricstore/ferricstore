@@ -86,14 +86,20 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
 
         key = Ferricstore.Flow.Keys.state_key(attrs.id, attrs.partition_key)
 
-        assert {:ok, {:flow_create, ^key, stamped}} =
+        assert {:ok,
+                {:flow_policy_fence, [{^policy_key, create_policy_value, 0}],
+                 {:flow_create, ^key, stamped}}} =
                  Ferricstore.Flow.PolicyCommand.stamp(ctx, {:flow_create, key, attrs})
+
+        assert {:ok, {2, %{type: ^type, version: "customer-v2"}}} =
+                 Ferricstore.Flow.RetryPolicy.decode_flow_policy_entry(create_policy_value)
 
         assert %{type: ^type, generation: 2, digest: digest} = stamped.policy_ref
 
         assert {:ok, encoded_policy} =
                  Ferricstore.Store.Router.read_shard_value(ctx, 0, policy_key)
 
+        assert create_policy_value == encoded_policy
         assert digest == :crypto.hash(:sha256, encoded_policy)
         refute Map.has_key?(stamped, :policy_generation)
         refute Map.has_key?(stamped, :policy_snapshot)
@@ -114,8 +120,13 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
              partition_key: attrs.partition_key
            }}
 
-        assert {:ok, {:flow_transition, ^key, stamped_transition}} =
+        assert {:ok,
+                {:flow_policy_fence, [{^policy_key, transition_policy_value, 0}],
+                 {:flow_transition, ^key, stamped_transition}}} =
                  Ferricstore.Flow.PolicyCommand.stamp(ctx, transition)
+
+        assert {:ok, {2, %{type: ^type, version: "customer-v2"}}} =
+                 Ferricstore.Flow.RetryPolicy.decode_flow_policy_entry(transition_policy_value)
 
         assert %{type: ^type, generation: 2, digest: <<_::256>>} =
                  stamped_transition.policy_ref

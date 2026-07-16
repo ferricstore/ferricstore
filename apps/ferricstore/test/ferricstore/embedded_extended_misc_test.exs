@@ -14,6 +14,8 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
+  @crossslot {:error, "CROSSSLOT Keys in request don't hash to the same slot"}
+
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
     :ok
@@ -25,109 +27,120 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
 
   describe "copy/3" do
     test "copies value to new key" do
-      FerricStore.set("cp:src", "value")
-      assert {:ok, true} = FerricStore.copy("cp:src", "cp:dst")
-      assert {:ok, "value"} = FerricStore.get("cp:dst")
+      FerricStore.set("cp:{basic}:src", "value")
+      assert {:ok, true} = FerricStore.copy("cp:{basic}:src", "cp:{basic}:dst")
+      assert {:ok, "value"} = FerricStore.get("cp:{basic}:dst")
       # source still exists
-      assert {:ok, "value"} = FerricStore.get("cp:src")
+      assert {:ok, "value"} = FerricStore.get("cp:{basic}:src")
     end
 
     test "does not overwrite existing destination without replace" do
-      FerricStore.set("cp:s2", "src_val")
-      FerricStore.set("cp:d2", "dst_val")
-      assert {:ok, false} = FerricStore.copy("cp:s2", "cp:d2")
-      assert {:ok, "dst_val"} = FerricStore.get("cp:d2")
+      FerricStore.set("cp:{no-replace}:src", "src_val")
+      FerricStore.set("cp:{no-replace}:dst", "dst_val")
+      assert {:ok, false} = FerricStore.copy("cp:{no-replace}:src", "cp:{no-replace}:dst")
+      assert {:ok, "dst_val"} = FerricStore.get("cp:{no-replace}:dst")
     end
 
     test "overwrites existing destination with replace option" do
-      FerricStore.set("cp:s3", "src_val")
-      FerricStore.set("cp:d3", "dst_val")
-      assert {:ok, true} = FerricStore.copy("cp:s3", "cp:d3", replace: true)
-      assert {:ok, "src_val"} = FerricStore.get("cp:d3")
+      FerricStore.set("cp:{replace}:src", "src_val")
+      FerricStore.set("cp:{replace}:dst", "dst_val")
+      assert {:ok, true} = FerricStore.copy("cp:{replace}:src", "cp:{replace}:dst", replace: true)
+      assert {:ok, "src_val"} = FerricStore.get("cp:{replace}:dst")
     end
 
     test "copies hash fields and TTL" do
-      assert :ok = FerricStore.hset("cp:hash:src", %{"f1" => "v1", "f2" => "v2"})
-      assert {:ok, true} = FerricStore.expire("cp:hash:src", 60_000)
+      assert :ok = FerricStore.hset("cp:{hash}:src", %{"f1" => "v1", "f2" => "v2"})
+      assert {:ok, true} = FerricStore.expire("cp:{hash}:src", 60_000)
 
-      assert {:ok, true} = FerricStore.copy("cp:hash:src", "cp:hash:dst")
+      assert {:ok, true} = FerricStore.copy("cp:{hash}:src", "cp:{hash}:dst")
 
-      assert {:ok, "v1"} = FerricStore.hget("cp:hash:dst", "f1")
-      assert {:ok, "v2"} = FerricStore.hget("cp:hash:dst", "f2")
-      assert {:ok, ms} = FerricStore.ttl("cp:hash:dst")
+      assert {:ok, "v1"} = FerricStore.hget("cp:{hash}:dst", "f1")
+      assert {:ok, "v2"} = FerricStore.hget("cp:{hash}:dst", "f2")
+      assert {:ok, ms} = FerricStore.ttl("cp:{hash}:dst")
       assert is_integer(ms) and ms > 0
-      assert {:ok, "v1"} = FerricStore.hget("cp:hash:src", "f1")
+      assert {:ok, "v1"} = FerricStore.hget("cp:{hash}:src", "f1")
     end
 
     test "replaces existing compound destination" do
-      assert :ok = FerricStore.hset("cp:hash:replace:src", %{"new" => "value"})
-      assert :ok = FerricStore.hset("cp:hash:replace:dst", %{"old" => "value"})
+      assert :ok = FerricStore.hset("cp:{hash-replace}:src", %{"new" => "value"})
+      assert :ok = FerricStore.hset("cp:{hash-replace}:dst", %{"old" => "value"})
 
       assert {:ok, true} =
-               FerricStore.copy("cp:hash:replace:src", "cp:hash:replace:dst", replace: true)
+               FerricStore.copy("cp:{hash-replace}:src", "cp:{hash-replace}:dst", replace: true)
 
-      assert {:ok, "value"} = FerricStore.hget("cp:hash:replace:dst", "new")
-      assert {:ok, nil} = FerricStore.hget("cp:hash:replace:dst", "old")
+      assert {:ok, "value"} = FerricStore.hget("cp:{hash-replace}:dst", "new")
+      assert {:ok, nil} = FerricStore.hget("cp:{hash-replace}:dst", "old")
     end
   end
 
   describe "rename/2" do
     test "renames existing key" do
-      FerricStore.set("rn:old", "value")
-      assert :ok = FerricStore.rename("rn:old", "rn:new")
-      assert {:ok, nil} = FerricStore.get("rn:old")
-      assert {:ok, "value"} = FerricStore.get("rn:new")
+      FerricStore.set("rn:{basic}:old", "value")
+      assert :ok = FerricStore.rename("rn:{basic}:old", "rn:{basic}:new")
+      assert {:ok, nil} = FerricStore.get("rn:{basic}:old")
+      assert {:ok, "value"} = FerricStore.get("rn:{basic}:new")
     end
 
     test "returns error for nonexistent key" do
-      assert {:error, _} = FerricStore.rename("rn:missing", "rn:dst")
+      assert {:error, _} = FerricStore.rename("rn:{missing}:source", "rn:{missing}:dest")
     end
 
     test "renames list data and removes old name" do
-      assert {:ok, 2} = FerricStore.rpush("rn:list:old", ["a", "b"])
+      assert {:ok, 2} = FerricStore.rpush("rn:{list}:old", ["a", "b"])
 
-      assert :ok = FerricStore.rename("rn:list:old", "rn:list:new")
+      assert :ok = FerricStore.rename("rn:{list}:old", "rn:{list}:new")
 
-      assert {:ok, 0} = FerricStore.llen("rn:list:old")
-      assert {:ok, ["a", "b"]} = FerricStore.lrange("rn:list:new", 0, -1)
+      assert {:ok, 0} = FerricStore.llen("rn:{list}:old")
+      assert {:ok, ["a", "b"]} = FerricStore.lrange("rn:{list}:new", 0, -1)
     end
 
     test "overwrites existing compound destination" do
-      assert :ok = FerricStore.hset("rn:hash:src", %{"new" => "value"})
-      assert :ok = FerricStore.hset("rn:hash:dst", %{"old" => "value"})
+      assert :ok = FerricStore.hset("rn:{hash}:src", %{"new" => "value"})
+      assert :ok = FerricStore.hset("rn:{hash}:dst", %{"old" => "value"})
 
-      assert :ok = FerricStore.rename("rn:hash:src", "rn:hash:dst")
+      assert :ok = FerricStore.rename("rn:{hash}:src", "rn:{hash}:dst")
 
-      assert {:ok, "value"} = FerricStore.hget("rn:hash:dst", "new")
-      assert {:ok, nil} = FerricStore.hget("rn:hash:dst", "old")
-      assert {:ok, nil} = FerricStore.hget("rn:hash:src", "new")
+      assert {:ok, "value"} = FerricStore.hget("rn:{hash}:dst", "new")
+      assert {:ok, nil} = FerricStore.hget("rn:{hash}:dst", "old")
+      assert {:ok, nil} = FerricStore.hget("rn:{hash}:src", "new")
     end
   end
 
   describe "renamenx/2" do
     test "renames when destination does not exist" do
-      FerricStore.set("rnx:old", "value")
-      assert {:ok, true} = FerricStore.renamenx("rnx:old", "rnx:new")
-      assert {:ok, "value"} = FerricStore.get("rnx:new")
+      FerricStore.set("rnx:{basic}:old", "value")
+      assert {:ok, true} = FerricStore.renamenx("rnx:{basic}:old", "rnx:{basic}:new")
+      assert {:ok, "value"} = FerricStore.get("rnx:{basic}:new")
     end
 
     test "does not rename when destination exists" do
-      FerricStore.set("rnx:src", "src_val")
-      FerricStore.set("rnx:dst", "dst_val")
-      assert {:ok, false} = FerricStore.renamenx("rnx:src", "rnx:dst")
-      assert {:ok, "dst_val"} = FerricStore.get("rnx:dst")
+      FerricStore.set("rnx:{exists}:src", "src_val")
+      FerricStore.set("rnx:{exists}:dst", "dst_val")
+      assert {:ok, false} = FerricStore.renamenx("rnx:{exists}:src", "rnx:{exists}:dst")
+      assert {:ok, "dst_val"} = FerricStore.get("rnx:{exists}:dst")
     end
 
     test "does not rename when compound destination exists" do
-      assert :ok = FerricStore.hset("rnx:hash:src", %{"src" => "value"})
-      assert :ok = FerricStore.hset("rnx:hash:dst", %{"dst" => "value"})
+      assert :ok = FerricStore.hset("rnx:{hash}:src", %{"src" => "value"})
+      assert :ok = FerricStore.hset("rnx:{hash}:dst", %{"dst" => "value"})
 
-      assert {:ok, false} = FerricStore.renamenx("rnx:hash:src", "rnx:hash:dst")
+      assert {:ok, false} = FerricStore.renamenx("rnx:{hash}:src", "rnx:{hash}:dst")
 
-      assert {:ok, "value"} = FerricStore.hget("rnx:hash:src", "src")
-      assert {:ok, "value"} = FerricStore.hget("rnx:hash:dst", "dst")
-      assert {:ok, nil} = FerricStore.hget("rnx:hash:dst", "src")
+      assert {:ok, "value"} = FerricStore.hget("rnx:{hash}:src", "src")
+      assert {:ok, "value"} = FerricStore.hget("rnx:{hash}:dst", "dst")
+      assert {:ok, nil} = FerricStore.hget("rnx:{hash}:dst", "src")
     end
+  end
+
+  test "key transfer APIs reject independent Raft groups without mutation" do
+    [source, destination] = Ferricstore.Test.ShardHelpers.keys_on_different_shards(2)
+
+    assert :ok = FerricStore.set(source, "value")
+    assert @crossslot = FerricStore.copy(source, destination)
+    assert @crossslot = FerricStore.rename(source, destination)
+    assert @crossslot = FerricStore.renamenx(source, destination)
+    assert {:ok, "value"} = FerricStore.get(source)
+    assert {:ok, nil} = FerricStore.get(destination)
   end
 
   # ===========================================================================

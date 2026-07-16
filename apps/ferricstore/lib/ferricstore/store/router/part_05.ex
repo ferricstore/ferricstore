@@ -256,6 +256,22 @@ defmodule Ferricstore.Store.Router.Part05 do
         end
       end
 
+      @doc false
+      @spec admit_string_batch(FerricStore.Instance.t(), [{binary(), binary()}]) ::
+              :ok | {:error, term()}
+      def admit_string_batch(_ctx, []), do: :ok
+
+      def admit_string_batch(ctx, kv_pairs) when is_list(kv_pairs) do
+        max_value_size = configured_max_value_size(ctx)
+
+        Enum.reduce_while(kv_pairs, :ok, fn entry, :ok ->
+          case admit_batch_put_entry(ctx, entry, max_value_size, true) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
       defp prepare_atomic_string_batch(ctx, [{key, value} | rest]) do
         with :ok <- validate_atomic_string_entry(ctx, key, value) do
           slot = SlotMap.slot_for_key(key)
