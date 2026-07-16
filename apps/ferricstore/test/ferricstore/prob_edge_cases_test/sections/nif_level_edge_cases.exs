@@ -76,10 +76,10 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           File.write!(path, header)
 
           assert {:error, reason} = NIF.bloom_file_exists(path, "hot")
-          assert reason =~ "truncated"
+          assert reason =~ "file size mismatch"
         end
 
-        test "bloom_file_add rejects count overflow without wrapping header" do
+        test "bloom_file_add rejects an impossible count header without mutation" do
           dir = make_prob_dir("nif_bloom_count_overflow")
           path = Path.join(dir, "overflow.bloom")
           max_u64 = 18_446_744_073_709_551_615
@@ -89,11 +89,12 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           File.write!(path, prefix <> <<max_u64::little-unsigned-64>> <> rest)
 
           assert {:error, reason} = NIF.bloom_file_add(path, "hot")
-          assert reason =~ "overflow"
-          assert {:ok, ^max_u64} = NIF.bloom_file_card(path)
+          assert reason =~ "count must not exceed num_bits"
+          assert {:error, card_reason} = NIF.bloom_file_card(path)
+          assert card_reason =~ "count must not exceed num_bits"
         end
 
-        test "bloom_file_madd rejects count overflow without applying pending bits" do
+        test "bloom_file_madd rejects an impossible count header without applying pending bits" do
           dir = make_prob_dir("nif_bloom_madd_count_overflow")
           path = Path.join(dir, "overflow.bloom")
           max_u64 = 18_446_744_073_709_551_615
@@ -104,9 +105,11 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           File.write!(path, prefix <> <<near_max::little-unsigned-64>> <> rest)
 
           assert {:error, reason} = NIF.bloom_file_madd(path, ["hot-a", "hot-b"])
-          assert reason =~ "overflow"
-          assert {:ok, ^near_max} = NIF.bloom_file_card(path)
-          assert {:ok, [0, 0]} = NIF.bloom_file_mexists(path, ["hot-a", "hot-b"])
+          assert reason =~ "count must not exceed num_bits"
+          assert {:error, card_reason} = NIF.bloom_file_card(path)
+          assert card_reason =~ "count must not exceed num_bits"
+          assert {:error, exists_reason} = NIF.bloom_file_mexists(path, ["hot-a", "hot-b"])
+          assert exists_reason =~ "count must not exceed num_bits"
         end
 
         test "cms_file_create and query roundtrip" do
@@ -144,7 +147,7 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           File.write!(path, header)
 
           assert {:error, reason} = NIF.cms_file_query(path, ["hot"])
-          assert reason =~ "truncated"
+          assert reason =~ "file size mismatch"
         end
 
         test "cms_file_info returns correct metadata" do
@@ -217,10 +220,10 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           File.write!(path, header)
 
           assert {:error, reason} = NIF.cuckoo_file_exists(path, "hot")
-          assert reason =~ "truncated"
+          assert reason =~ "file size mismatch"
         end
 
-        test "cuckoo_file_add rejects item counter overflow without inserting" do
+        test "cuckoo_file_add rejects an impossible item count without inserting" do
           dir = make_prob_dir("nif_cuckoo_add_count_overflow")
           path = Path.join(dir, "overflow.cuckoo")
           max_u64 = 18_446_744_073_709_551_615
@@ -230,12 +233,14 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           File.write!(path, prefix <> <<max_u64::little-unsigned-64>> <> rest)
 
           assert {:error, reason} = NIF.cuckoo_file_add(path, "hot")
-          assert reason =~ "overflow"
-          assert {:ok, 0} = NIF.cuckoo_file_exists(path, "hot")
-          assert {:ok, {_, _, _, ^max_u64, 0, _, _}} = NIF.cuckoo_file_info(path)
+          assert reason =~ "num_items must not exceed total slots"
+          assert {:error, exists_reason} = NIF.cuckoo_file_exists(path, "hot")
+          assert exists_reason =~ "num_items must not exceed total slots"
+          assert {:error, info_reason} = NIF.cuckoo_file_info(path)
+          assert info_reason =~ "num_items must not exceed total slots"
         end
 
-        test "cuckoo_file_addnx rejects item counter overflow without inserting" do
+        test "cuckoo_file_addnx rejects an impossible item count without inserting" do
           dir = make_prob_dir("nif_cuckoo_addnx_count_overflow")
           path = Path.join(dir, "overflow.cuckoo")
           max_u64 = 18_446_744_073_709_551_615
@@ -245,9 +250,11 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           File.write!(path, prefix <> <<max_u64::little-unsigned-64>> <> rest)
 
           assert {:error, reason} = NIF.cuckoo_file_addnx(path, "hot")
-          assert reason =~ "overflow"
-          assert {:ok, 0} = NIF.cuckoo_file_exists(path, "hot")
-          assert {:ok, {_, _, _, ^max_u64, 0, _, _}} = NIF.cuckoo_file_info(path)
+          assert reason =~ "num_items must not exceed total slots"
+          assert {:error, exists_reason} = NIF.cuckoo_file_exists(path, "hot")
+          assert exists_reason =~ "num_items must not exceed total slots"
+          assert {:error, info_reason} = NIF.cuckoo_file_info(path)
+          assert info_reason =~ "num_items must not exceed total slots"
         end
 
         test "cuckoo_file_del removes element" do
@@ -362,7 +369,7 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           File.write!(path, header)
 
           assert {:error, reason} = NIF.topk_file_count_v2(path, ["hot"])
-          assert reason =~ "truncated"
+          assert reason =~ "file size mismatch"
         end
 
         test "topk_file_list_v2 on empty topk returns empty list" do

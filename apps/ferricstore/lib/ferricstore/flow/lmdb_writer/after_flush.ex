@@ -387,9 +387,45 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   def delete_apply_projection_cache_for_row(_data_dir, _shard_index, _row), do: :ok
 
   def flow_record_from_keydir(data_dir, shard_index, ets, state_key) do
+    do_flow_record_from_keydir(
+      data_dir,
+      shard_index,
+      ets,
+      state_key,
+      ProjectionOps.source_pending_retries(),
+      ProjectionOps.source_pending_sleep_ms()
+    )
+  end
+
+  defp do_flow_record_from_keydir(
+         data_dir,
+         shard_index,
+         ets,
+         state_key,
+         pending_retries,
+         pending_sleep_ms
+       ) do
     case :ets.lookup(ets, state_key) do
-      [row] -> flow_record_from_keydir_row(data_dir, shard_index, state_key, row)
-      _ -> :not_found
+      [row] ->
+        case flow_record_from_keydir_row(data_dir, shard_index, state_key, row) do
+          {:error, {:source_pending, ^state_key}} when pending_retries > 0 ->
+            Process.sleep(pending_sleep_ms)
+
+            do_flow_record_from_keydir(
+              data_dir,
+              shard_index,
+              ets,
+              state_key,
+              pending_retries - 1,
+              pending_sleep_ms
+            )
+
+          result ->
+            result
+        end
+
+      _missing ->
+        :not_found
     end
   rescue
     ArgumentError -> {:error, :source_keydir_unavailable}
@@ -403,6 +439,34 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
       )
       when is_binary(value) do
     decode_keydir_flow_value(data_dir, shard_index, value)
+  end
+
+  def flow_record_from_keydir_row(
+        _data_dir,
+        _shard_index,
+        state_key,
+        {state_key, _value, _expire_at_ms, _lfu, :pending, _offset, _value_size}
+      ),
+      do: {:error, {:source_pending, state_key}}
+
+  def flow_record_from_keydir_row(
+        data_dir,
+        shard_index,
+        state_key,
+        {state_key, nil, _expire_at_ms, _lfu, {kind, _index} = file_id, _offset, _value_size}
+      )
+      when kind in [:waraft_segment, :waraft_projection, :waraft_apply_projection] do
+    ctx = %{data_dir: data_dir}
+
+    with {:ok, value} <-
+           Ferricstore.Raft.WARaftSegmentReader.read_value_from_location_including_expired(
+             ctx,
+             shard_index,
+             file_id,
+             state_key
+           ) do
+      decode_keydir_flow_value(data_dir, shard_index, value)
+    end
   end
 
   def flow_record_from_keydir_row(

@@ -37,10 +37,10 @@ defmodule Ferricstore.Store.CompactionJournal do
       not regular_file?(transaction.plan) ->
         {:error, {:plan_missing, transaction.plan}}
 
-      File.exists?(transaction.journal) ->
+      Ferricstore.FS.exists?(transaction.journal) ->
         {:error, {:journal_exists, transaction.journal}}
 
-      File.exists?(transaction.backup) ->
+      Ferricstore.FS.exists?(transaction.backup) ->
         {:error, {:backup_exists, transaction.backup}}
 
       true ->

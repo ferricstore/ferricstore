@@ -1596,12 +1596,12 @@ defmodule Ferricstore.Flow.ReadAPI do
 
         case :binary.match(rest, <<0>>) do
           {value_size, 1} ->
-            value =
-              rest
-              |> binary_part(0, value_size)
-              |> Attributes.decode_index_value()
+            encoded_value = binary_part(rest, 0, value_size)
 
-            {:ok, value}
+            case Keys.decode_index_component(encoded_value) do
+              {:ok, index_value} -> {:ok, Attributes.decode_index_value(index_value)}
+              :error -> :error
+            end
 
           :nomatch ->
             :error

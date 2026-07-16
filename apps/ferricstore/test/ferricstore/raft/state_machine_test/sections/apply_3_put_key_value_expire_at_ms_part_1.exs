@@ -274,7 +274,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             StateMachine.apply(%{}, {:compound_put, durable_meta_key, "durable-meta", 0}, state2)
 
           Ferricstore.Commands.Stream.ensure_meta_table()
-          cached_meta = {key, 1, "1-0", "1-0", 1, 0}
+          cache_key = {:default, key}
+          cached_meta = {cache_key, 1, "1-0", "1-0", 1, 0}
           :ets.insert(Ferricstore.Stream.Meta, cached_meta)
 
           previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
@@ -291,7 +292,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             end
 
             if :ets.whereis(Ferricstore.Stream.Meta) != :undefined do
-              :ets.delete(Ferricstore.Stream.Meta, key)
+              :ets.delete(Ferricstore.Stream.Meta, cache_key)
             end
           end)
 
@@ -308,7 +309,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             )
 
           assert {:error, {:bitcask_append_failed, :enospc}} = result
-          assert [cached_meta] == :ets.lookup(Ferricstore.Stream.Meta, key)
+          assert [cached_meta] == :ets.lookup(Ferricstore.Stream.Meta, cache_key)
           assert [{^type_key, "stream", 0, _, _, _, _}] = :ets.lookup(ets, type_key)
 
           assert [{^durable_meta_key, "durable-meta", 0, _, _, _, _}] =
@@ -326,7 +327,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               failed_state
             )
 
-          assert [] == :ets.lookup(Ferricstore.Stream.Meta, key)
+          assert [] == :ets.lookup(Ferricstore.Stream.Meta, cache_key)
           assert [] == :ets.lookup(ets, type_key)
           assert [] == :ets.lookup(ets, durable_meta_key)
         end
@@ -514,67 +515,27 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           assert [] == :ets.lookup(ets, "tx_mset_blob")
         end
 
-        test "transaction CAS reads and writes through the local Raft apply store", %{
-          state: state,
-          ets: ets
-        } do
-          {_new_state, [:ok, 1, "after"]} =
-            StateMachine.apply(
-              %{system_time: 1_000},
-              {:tx_execute,
-               [
-                 {"SET", ["tx_cas", "before"]},
-                 {"CAS", ["tx_cas", "before", "after"]},
-                 {"GET", ["tx_cas"]}
-               ], nil},
-              state
-            )
+        test "request-scoped commands cannot enter replicated transaction apply", %{ets: ets} do
+          commands = [
+            {"CAS", ["tx_cas", "before", "after"], "tx_cas"},
+            {"LOCK", ["tx_lock", "owner", "5000"], "tx_lock"},
+            {"EXTEND", ["tx_lock", "owner", "9000"], "tx_lock"},
+            {"UNLOCK", ["tx_lock", "owner"], "tx_lock"},
+            {"RATELIMIT.ADD", ["tx_rate", "1000", "2", "1"], "tx_rate"}
+          ]
 
-          assert [{"tx_cas", "after", 0, _, _, _, _}] = :ets.lookup(ets, "tx_cas")
-        end
+          Enum.each(commands, fn {command, args, key} ->
+            assert {:ok, prepared} =
+                     Ferricstore.Commands.PreparedCommand.prepare(command, args)
 
-        test "transaction lock operations use replicated time and local pending state", %{
-          state: state,
-          ets: ets
-        } do
-          {_new_state, [:ok, 5_000, 1, 9_000, 1, nil]} =
-            StateMachine.apply(
-              %{system_time: 10_000},
-              {:tx_execute,
-               [
-                 {"LOCK", ["tx_lock", "owner", "5000"]},
-                 {"PTTL", ["tx_lock"]},
-                 {"EXTEND", ["tx_lock", "owner", "9000"]},
-                 {"PTTL", ["tx_lock"]},
-                 {"UNLOCK", ["tx_lock", "owner"]},
-                 {"GET", ["tx_lock"]}
-               ], nil},
-              state
-            )
+            expected_error =
+              "ERR command '#{String.downcase(command)}' is not supported inside transactions"
 
-          assert [] = :ets.lookup(ets, "tx_lock")
-        end
+            assert {:error, ^expected_error} =
+                     Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
 
-        test "transaction rate limiting uses replicated time without nested routing", %{
-          state: state,
-          ets: ets
-        } do
-          {_new_state,
-           [
-             ["allowed", 1, 1, 1_000],
-             ["denied", 1, 1, 1_000]
-           ]} =
-            StateMachine.apply(
-              %{system_time: 1_000},
-              {:tx_execute,
-               [
-                 {"RATELIMIT.ADD", ["tx_rate", "1000", "2", "1"]},
-                 {"RATELIMIT.ADD", ["tx_rate", "1000", "2", "2"]}
-               ], nil},
-              state
-            )
-
-          assert [{"tx_rate", _encoded, 3_000, _, _, _, _}] = :ets.lookup(ets, "tx_rate")
+            assert [] = :ets.lookup(ets, key)
+          end)
         end
 
         test "probabilistic commands cannot enter replicated transaction apply", %{ets: ets} do

@@ -47,10 +47,10 @@ defmodule Ferricstore.Store.RouterListReadDispatchTest do
 
   test "list mutations remain on the shard write path", %{ctx: ctx} do
     operation = {:lset, 0, "updated"}
+    request = {:standalone_barrier_write, {:list_op, "list", operation}}
 
-    assert {:probe_reply, {:list_op, "list", ^operation}} =
-             Router.list_op(ctx, "list", operation)
+    assert {:probe_reply, ^request} = Router.list_op(ctx, "list", operation)
 
-    assert_receive {:shard_request, {:list_op, "list", ^operation}}
+    assert_receive {:shard_request, ^request}
   end
 end

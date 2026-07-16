@@ -188,4 +188,27 @@ defmodule Ferricstore.Test.ShardHelpersTest do
     assert Map.take(active_ctx, identity_fields) == Map.take(default_ctx, identity_fields)
     assert :ok = ShardHelpers.wait_default_pipeline_ready(5_000)
   end
+
+  test "failed distribution startup restores the default application runtime" do
+    original_ctx = FerricStore.Instance.get(:default)
+
+    assert_raise RuntimeError, "forced distribution startup failure", fn ->
+      ShardHelpers.ensure_distribution_started!(:forced_distribution_failure,
+        force?: true,
+        start_fun: fn _node_name ->
+          raise "forced distribution startup failure"
+        end
+      )
+    end
+
+    restored_ctx = FerricStore.Instance.get(:default)
+
+    assert restored_ctx.data_dir == original_ctx.data_dir
+    assert :ets.whereis(:ferricstore_waiters) != :undefined
+    assert :ets.whereis(:ferricstore_flow_claim_waiters) != :undefined
+    assert :ets.whereis(:ferricstore_waraft_apply_projection_cache) != :undefined
+    assert is_pid(Process.whereis(Ferricstore.Waiters.Monitor))
+    assert is_pid(Process.whereis(Ferricstore.Raft.WARaftSegmentReader.TableOwner))
+    assert :ok = ShardHelpers.wait_default_pipeline_ready(30_000)
+  end
 end

@@ -93,6 +93,14 @@ defmodule Ferricstore.ProbEdgeCasesTest do
     %{
       prob_dir: fn -> dir end,
       exists?: fn key -> Agent.get(pid, &Map.has_key?(&1, key)) end,
+      get: fn key ->
+        Agent.get(pid, fn values ->
+          case Map.get(values, key) do
+            {value, _ttl} -> value
+            nil -> nil
+          end
+        end)
+      end,
       put: fn key, value, ttl ->
         Agent.update(pid, &Map.put(&1, key, {value, ttl}))
         :ok

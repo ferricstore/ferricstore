@@ -391,7 +391,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
         end
       end
 
-      test "cross-shard list and set mutations survive WARaft restart", %{root: root} do
+      @tag :crossslot_restart_contract
+      test "cross-shard list and set mutations reject without partial state across restart", %{
+        root: root
+      } do
         ctx = build_ctx(Path.join(root, "compound-cross-shard"), shard_count: 2)
 
         list_src = key_for_shard(ctx, 0, "router:list-cross:src")
@@ -407,21 +410,32 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
           assert 2 = Ferricstore.Commands.List.handle_ast({:rpush, [list_src, "a", "b"]}, ctx)
           assert 1 = Ferricstore.Commands.List.handle_ast({:rpush, [list_dst, "x"]}, ctx)
 
-          assert "b" =
+          assert {:error, lmove_error} =
                    Ferricstore.Commands.List.handle_ast(
                      {:lmove, list_src, list_dst, :right, :left},
                      ctx
                    )
 
+          assert lmove_error =~ "CROSSSLOT"
+
           assert 2 = Ferricstore.Commands.Set.handle_ast({:sadd, [set_src, "a", "b"]}, ctx)
           assert 1 = Ferricstore.Commands.Set.handle_ast({:sadd, [set_dst, "x"]}, ctx)
-          assert 1 = Ferricstore.Commands.Set.handle_ast({:smove, set_src, set_dst, "b"}, ctx)
 
-          assert 3 =
+          assert {:error, smove_error} =
+                   Ferricstore.Commands.Set.handle_ast(
+                     {:smove, set_src, set_dst, "b"},
+                     ctx
+                   )
+
+          assert smove_error =~ "CROSSSLOT"
+
+          assert {:error, union_error} =
                    Ferricstore.Commands.Set.handle_ast(
                      {:sunionstore, [set_union_dst, set_src, set_dst]},
                      ctx
                    )
+
+          assert union_error =~ "CROSSSLOT"
 
           assert :ok = WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
@@ -433,35 +447,33 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
                      log_module: :ferricstore_waraft_spike_segment_log
                    )
 
-          assert ["a"] =
+          assert ["a", "b"] =
                    Ferricstore.Commands.List.handle_ast({:lrange, list_src, 0, -1}, restarted_ctx)
 
-          assert ["b", "x"] =
+          assert ["x"] =
                    Ferricstore.Commands.List.handle_ast({:lrange, list_dst, 0, -1}, restarted_ctx)
 
-          assert 0 =
+          assert 1 =
                    Ferricstore.Commands.Set.handle_ast({:sismember, set_src, "b"}, restarted_ctx)
 
-          assert 1 =
+          assert 0 =
                    Ferricstore.Commands.Set.handle_ast({:sismember, set_dst, "b"}, restarted_ctx)
 
-          assert ["a", "b", "x"] =
-                   {:smembers, set_union_dst}
-                   |> Ferricstore.Commands.Set.handle_ast(restarted_ctx)
-                   |> Enum.sort()
+          assert 0 = Ferricstore.Commands.Set.handle_ast({:scard, set_union_dst}, restarted_ctx)
         after
           WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
         end
       end
 
+      @tag :crossslot_restart_contract
       test "blocking list immediate mutations survive WARaft restart", %{root: root} do
         ctx = build_ctx(Path.join(root, "blocking-list"), shard_count: 2)
 
         blpop_key = key_for_shard(ctx, 0, "router:blocking:blpop")
         brpop_key = key_for_shard(ctx, 0, "router:blocking:brpop")
         move_src = key_for_shard(ctx, 0, "router:blocking:move-src")
-        move_dst = key_for_shard(ctx, 1, "router:blocking:move-dst")
+        move_dst = key_for_shard(ctx, 0, "router:blocking:move-dst")
 
         try do
           assert :ok =
@@ -718,7 +730,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
         end
       end
 
-      test "cross-shard generic key mutations survive WARaft restart", %{root: root} do
+      @tag :crossslot_restart_contract
+      test "cross-shard generic key mutations reject without partial state across restart", %{
+        root: root
+      } do
         ctx = build_ctx(Path.join(root, "generic-cross-shard"), shard_count: 2)
 
         source = key_for_shard(ctx, 0, "router:generic-cross:source")
@@ -733,17 +748,21 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
           assert :ok = Router.put(ctx, source, "source-value", 0)
           assert :ok = Router.put(ctx, rename_src, "rename-value", 0)
 
-          assert 1 =
+          assert {:error, copy_error} =
                    Ferricstore.Commands.Generic.handle_ast(
                      {:copy, source, copy_dest, false},
                      ctx
                    )
 
-          assert :ok =
+          assert copy_error =~ "CROSSSLOT"
+
+          assert {:error, rename_error} =
                    Ferricstore.Commands.Generic.handle_ast(
                      {:rename, rename_src, renamed},
                      ctx
                    )
+
+          assert rename_error =~ "CROSSSLOT"
 
           assert :ok = WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
@@ -756,25 +775,26 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
                    )
 
           assert "source-value" == Router.get(restarted_ctx, source)
-          assert "source-value" == Router.get(restarted_ctx, copy_dest)
-          assert nil == Router.get(restarted_ctx, rename_src)
-          assert "rename-value" == Router.get(restarted_ctx, renamed)
+          assert nil == Router.get(restarted_ctx, copy_dest)
+          assert "rename-value" == Router.get(restarted_ctx, rename_src)
+          assert nil == Router.get(restarted_ctx, renamed)
         after
           WARaftBackend.stop()
           FerricStore.Instance.cleanup(ctx.name)
         end
       end
 
-      test "cross-shard generic key mutations preserve blob-backed values after WARaft restart",
+      @tag :crossslot_restart_contract
+      test "same-group generic key mutations preserve blob-backed values after WARaft restart",
            %{
              root: root
            } do
         ctx = build_ctx(Path.join(root, "generic-cross-shard-blob"), shard_count: 2)
 
         copy_source = key_for_shard(ctx, 0, "router:generic-cross-blob:copy-source")
-        copy_dest = key_for_shard(ctx, 1, "router:generic-cross-blob:copy-dest")
+        copy_dest = key_for_shard(ctx, 0, "router:generic-cross-blob:copy-dest")
         rename_source = key_for_shard(ctx, 0, "router:generic-cross-blob:rename-source")
-        rename_dest = key_for_shard(ctx, 1, "router:generic-cross-blob:rename-dest")
+        rename_dest = key_for_shard(ctx, 0, "router:generic-cross-blob:rename-dest")
 
         copy_payload = :binary.copy("copy-blob-payload", 30_000)
         rename_payload = :binary.copy("rename-blob-payload", 30_000)
@@ -817,10 +837,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
           assert rename_payload == Router.get(restarted_ctx, rename_dest)
 
           assert [{_, nil, 0, _lfu, copy_fid, _copy_off, copy_value_size}] =
-                   :ets.lookup(elem(restarted_ctx.keydir_refs, 1), copy_dest)
+                   :ets.lookup(elem(restarted_ctx.keydir_refs, 0), copy_dest)
 
           assert [{_, nil, 0, _lfu, rename_fid, _rename_off, rename_value_size}] =
-                   :ets.lookup(elem(restarted_ctx.keydir_refs, 1), rename_dest)
+                   :ets.lookup(elem(restarted_ctx.keydir_refs, 0), rename_dest)
 
           assert copy_value_size == byte_size(copy_payload)
           assert rename_value_size == byte_size(rename_payload)
@@ -828,7 +848,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
           assert {:ok, copy_encoded_ref} =
                    Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
                      restarted_ctx,
-                     1,
+                     0,
                      copy_fid,
                      copy_dest
                    )
@@ -836,7 +856,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AdvancedZsetRangePopMutati
           assert {:ok, rename_encoded_ref} =
                    Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
                      restarted_ctx,
-                     1,
+                     0,
                      rename_fid,
                      rename_dest
                    )

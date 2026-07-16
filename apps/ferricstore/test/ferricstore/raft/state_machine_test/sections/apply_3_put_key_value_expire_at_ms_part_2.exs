@@ -238,7 +238,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               state
             )
 
-          assert [{:error, "ERR value too large (5 bytes, max 4 bytes)"}] = result
+          assert {:error, "ERR value too large (5 bytes, max 4 bytes)"} = result
           assert [] == :ets.lookup(ets, key)
         end
 

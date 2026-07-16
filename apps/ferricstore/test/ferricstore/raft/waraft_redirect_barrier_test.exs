@@ -45,4 +45,17 @@ defmodule Ferricstore.Raft.WARaftRedirectBarrierTest do
              {:raft_log_pos, 150, 5}
            )
   end
+
+  test "redirected connection loss preserves unknown write outcome semantics" do
+    redirect_failure =
+      WARaftBackend.__redirect_write_failure_for_test__(
+        :exit,
+        {:erpc, :noconnection}
+      )
+
+    assert {:error, :timeout} == redirect_failure
+
+    assert ErrorReasons.write_timeout_unknown() ==
+             WARaftBackend.__normalize_commit_result_for_test__(redirect_failure)
+  end
 end

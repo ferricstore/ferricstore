@@ -410,6 +410,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
         end
       end
 
+      @tag :terminal_projection_cache_entry
       test "Flow terminal LMDB flush prunes WARaft apply projection cache", %{ctx: ctx} do
         flow_type = "router-flow-terminal-projection-prune-#{System.unique_integer([:positive])}"
         flow_id = "router-flow-terminal-projection-prune-id-#{System.unique_integer([:positive])}"
@@ -448,16 +449,20 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
         state_key = Ferricstore.Flow.Keys.state_key(flow_id, partition)
 
         assert [
-                 {^state_key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, _index},
-                  _offset, _value_size}
+                 {^state_key, _value, _expire_at_ms, _lfu,
+                  {:waraft_apply_projection, projection_index}, _offset, _value_size}
                ] =
                  :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
         assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), state_key)
 
-        assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, 0) ==
-                 0
+        refute apply_projection_cache_contains?(
+                 ctx.data_dir,
+                 0,
+                 projection_index,
+                 state_key
+               )
       end
 
       test "Flow projection copies generated values to history log before dropping apply cache",
@@ -553,6 +558,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
                end)
       end
 
+      @tag :empty_generated_projection_cache
       test "Flow history projection materializes empty generated values without pinning WARaft apply cache",
            %{ctx: ctx} do
         flow_type =
@@ -617,12 +623,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
 
         assert {:ok, [<<>>]} = Ferricstore.Flow.value_mget(ctx, [created.payload_ref])
 
-        assert eventually(fn ->
-                 Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(
-                   ctx.data_dir,
-                   0
-                 ) == 0
-               end)
+        refute apply_projection_cache_contains_key?(ctx.data_dir, 0, created.payload_ref)
       end
 
       test "Flow create_many and transition_many use WARaft as the selected backend", %{ctx: ctx} do

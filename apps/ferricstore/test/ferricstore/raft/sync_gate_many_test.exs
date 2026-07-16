@@ -67,4 +67,31 @@ defmodule Ferricstore.Raft.SyncGateManyTest do
     assert_receive {:blocked_enter_result, {:ok, token}}, 1_000
     SyncGate.leave(token)
   end
+
+  test "multi-shard admission releases every claim before waiting on a paused shard" do
+    first = System.unique_integer([:positive]) + 200_000
+    second = first + 1
+
+    on_exit(fn -> SyncGate.resume_many([first, second], 1_000) end)
+
+    assert {:ok, second_pause} = SyncGate.pause_many([second])
+    assert :ok = SyncGate.await_many_drained(second_pause, 1_000)
+
+    entrant =
+      Task.async(fn ->
+        SyncGate.enter_many([first, second])
+      end)
+
+    refute Task.yield(entrant, 50)
+
+    assert {:ok, first_pause} = SyncGate.pause_many([first])
+    assert :ok = SyncGate.await_many_drained(first_pause, 1_000)
+
+    assert :ok = SyncGate.resume_many([second], 1_000)
+    refute Task.yield(entrant, 50)
+
+    assert :ok = SyncGate.resume_many([first], 1_000)
+    assert {:ok, {:ok, tokens}} = Task.yield(entrant, 1_000)
+    Enum.each(tokens, &SyncGate.leave/1)
+  end
 end

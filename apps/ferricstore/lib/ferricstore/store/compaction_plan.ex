@@ -36,10 +36,10 @@ defmodule Ferricstore.Store.CompactionPlan do
     temp_path = plan_path <> ".tmp"
 
     cond do
-      File.exists?(plan_path) ->
+      Ferricstore.FS.exists?(plan_path) ->
         {:error, {:plan_exists, plan_path}}
 
-      File.exists?(temp_path) ->
+      Ferricstore.FS.exists?(temp_path) ->
         {:error, {:plan_temp_exists, temp_path}}
 
       true ->
@@ -58,7 +58,7 @@ defmodule Ferricstore.Store.CompactionPlan do
 
               {:error, reason} ->
                 :ok = :file.close(file)
-                _ = File.rm(temp_path)
+                _ = Ferricstore.FS.rm(temp_path)
                 {:error, {:plan_header_write_failed, reason}}
             end
 
@@ -94,8 +94,8 @@ defmodule Ferricstore.Store.CompactionPlan do
 
       {:error, _reason} = error ->
         _ = :file.close(writer.file)
-        _ = File.rm(writer.temp_path)
-        _ = File.rm(writer.path)
+        _ = Ferricstore.FS.rm(writer.temp_path)
+        _ = Ferricstore.FS.rm(writer.path)
         error
     end
   end
@@ -103,8 +103,8 @@ defmodule Ferricstore.Store.CompactionPlan do
   @spec abort(writer()) :: :ok
   def abort(%{} = writer) do
     _ = :file.close(writer.file)
-    _ = File.rm(writer.temp_path)
-    _ = File.rm(writer.path)
+    _ = Ferricstore.FS.rm(writer.temp_path)
+    _ = Ferricstore.FS.rm(writer.path)
     :ok
   end
 

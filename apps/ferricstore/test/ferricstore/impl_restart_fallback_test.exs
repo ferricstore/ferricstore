@@ -1,7 +1,7 @@
 defmodule Ferricstore.ImplRestartFallbackTest do
   use ExUnit.Case, async: true
 
-  test "compound reads through Impl fallback instead of exiting while shard is unavailable" do
+  test "compound reads fail closed without exiting while shard is unavailable" do
     ctx = unavailable_ctx()
     handler_id = {__MODULE__, make_ref()}
 
@@ -15,7 +15,8 @@ defmodule Ferricstore.ImplRestartFallbackTest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
-    assert {:ok, nil} = FerricStore.Impl.hget(ctx, "impl_restart_hash", "field")
+    assert {:error, "ERR storage read failed"} =
+             FerricStore.Impl.hget(ctx, "impl_restart_hash", "field")
 
     assert_receive {:telemetry_event, [:ferricstore, :store, :shard_unavailable], %{count: 1},
                     %{

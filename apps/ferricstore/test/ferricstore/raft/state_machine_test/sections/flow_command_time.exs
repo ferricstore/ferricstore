@@ -1062,17 +1062,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         test "uses stamped apply time when Flow attrs omit now_ms", %{state: state} do
-          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-          :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
-
-          on_exit(fn ->
-            safe_delete_ets(state.zset_score_index_name)
-            safe_delete_ets(state.zset_score_lookup_name)
-            safe_delete_ets(state.flow_index_name)
-            safe_delete_ets(state.flow_lookup_name)
-          end)
+          setup_flow_indexes(state)
 
           id = "flow-command-time"
           type = "command-time"
@@ -1183,17 +1173,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         } do
           start_flow_history_projector!(state)
 
-          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-          :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
-
-          on_exit(fn ->
-            safe_delete_ets(state.zset_score_index_name)
-            safe_delete_ets(state.zset_score_lookup_name)
-            safe_delete_ets(state.flow_index_name)
-            safe_delete_ets(state.flow_lookup_name)
-          end)
+          setup_flow_indexes(state)
 
           handler_id = {:flow_create_many_append_batch, self(), make_ref()}
 
@@ -1255,17 +1235,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         } do
           start_flow_history_projector!(state)
 
-          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-          :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
-
-          on_exit(fn ->
-            safe_delete_ets(state.zset_score_index_name)
-            safe_delete_ets(state.zset_score_lookup_name)
-            safe_delete_ets(state.flow_index_name)
-            safe_delete_ets(state.flow_lookup_name)
-          end)
+          setup_flow_indexes(state)
 
           handler_id = {:flow_batch_append_per_command_results, self(), make_ref()}
 
@@ -1505,17 +1475,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           state: state,
           shard_index: shard_index
         } do
-          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-          :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
-
-          on_exit(fn ->
-            safe_delete_ets(state.zset_score_index_name)
-            safe_delete_ets(state.zset_score_lookup_name)
-            safe_delete_ets(state.flow_index_name)
-            safe_delete_ets(state.flow_lookup_name)
-          end)
+          setup_flow_indexes(state)
 
           partition_key = "tenant-claim-append"
           type = "claim-append"
@@ -1606,17 +1566,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         test "claim_due bulk index plan keeps metadata and reclaimed running indexes correct", %{
           state: state
         } do
-          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-          :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
-
-          on_exit(fn ->
-            safe_delete_ets(state.zset_score_index_name)
-            safe_delete_ets(state.zset_score_lookup_name)
-            safe_delete_ets(state.flow_index_name)
-            safe_delete_ets(state.flow_lookup_name)
-          end)
+          setup_flow_indexes(state)
 
           id = "flow-claim-bulk-index"
           type = "claim-bulk-index"
@@ -1798,10 +1748,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
           state = %{state | flow_lmdb_mirror?: true}
 
-          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-          :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+          setup_flow_indexes(state)
 
           {:ok, writer_pid} =
             Ferricstore.Flow.LMDBWriter.start_link(
@@ -1817,10 +1764,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               :exit, _ -> :ok
             end
 
-            safe_delete_ets(state.zset_score_index_name)
-            safe_delete_ets(state.zset_score_lookup_name)
-            safe_delete_ets(state.flow_index_name)
-            safe_delete_ets(state.flow_lookup_name)
             restore_env(:flow_lmdb_mode, old_mode)
             restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
             restore_env(:flow_lmdb_max_batch_ops, old_max_ops)
@@ -1907,10 +1850,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
           state = %{state | flow_lmdb_mirror?: true}
 
-          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-          :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+          setup_flow_indexes(state)
 
           {:ok, writer_pid} =
             Ferricstore.Flow.LMDBWriter.start_link(
@@ -1940,10 +1880,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               :exit, _ -> :ok
             end
 
-            safe_delete_ets(state.zset_score_index_name)
-            safe_delete_ets(state.zset_score_lookup_name)
-            safe_delete_ets(state.flow_index_name)
-            safe_delete_ets(state.flow_lookup_name)
             restore_env(:flow_lmdb_mode, old_mode)
             restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
             restore_env(:flow_lmdb_max_batch_ops, old_max_ops)
@@ -2029,10 +1965,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           Application.put_env(:ferricstore, :flow_lmdb_max_batch_ops, 10_000)
           state = %{state | flow_lmdb_mirror?: true}
 
-          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-          :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
+          setup_flow_indexes(state)
 
           writer_name = Ferricstore.Flow.LMDBWriter.name(state.instance_name, shard_index)
           assert Process.whereis(writer_name) == nil
@@ -2063,10 +1996,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           on_exit(fn ->
             :telemetry.detach(backlog_handler_id)
             :telemetry.detach(degraded_handler_id)
-            safe_delete_ets(state.zset_score_index_name)
-            safe_delete_ets(state.zset_score_lookup_name)
-            safe_delete_ets(state.flow_index_name)
-            safe_delete_ets(state.flow_lookup_name)
             restore_env(:flow_lmdb_mode, old_mode)
             restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
             restore_env(:flow_lmdb_max_batch_ops, old_max_ops)

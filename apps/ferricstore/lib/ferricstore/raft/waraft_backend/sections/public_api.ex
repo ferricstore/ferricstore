@@ -245,6 +245,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       end
 
       @doc false
+      def __normalize_commit_result_for_test__(result) do
+        normalize_commit_result(result)
+      end
+
+      @doc false
       def __redirectable_write_error_for_test__(error) do
         redirectable_write_error?(error)
       end
@@ -326,9 +331,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       def write_many([]), do: []
 
       def write_many(shard_commands) when is_list(shard_commands) do
-        shard_commands
-        |> Enum.map(&submit_write_many_entry_after_pause/1)
-        |> Enum.map(&await_write_many_entry/1)
+        with_sync_write_many(shard_commands, fn ->
+          shard_commands
+          |> Enum.map(&submit_write_many_entry/1)
+          |> Enum.map(&await_write_many_entry/1)
+        end)
       end
 
       def write_many(shard_commands), do: {:error, {:invalid_write_many_entries, shard_commands}}

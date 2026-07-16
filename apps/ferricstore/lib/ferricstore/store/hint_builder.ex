@@ -50,7 +50,7 @@ defmodule Ferricstore.Store.HintBuilder do
       :ok
     else
       {:error, :source_changed} = error ->
-        _ = File.rm(hint_path)
+        _ = Ferricstore.FS.rm(hint_path)
         _ = HintMetadata.remove(hint_path)
         _ = NIF.v2_fsync_dir(shard_path)
         error

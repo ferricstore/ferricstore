@@ -15,6 +15,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.ThreePeerBackendClusterRec
       alias Ferricstore.Raft.WARaftBackendTest.LabelCounter
       alias Ferricstore.Raft.WARaftBackendTest.OversizedLabel
 
+      @tag :cluster
+      @tag :shard_kill
       test "three peer backend cluster recovers after leader OS process kill during active write load" do
         unless Ferricstore.Test.ClusterHelper.peer_available?() do
           flunk(":peer is required for WARaft backend cluster test")

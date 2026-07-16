@@ -361,6 +361,61 @@ defmodule Ferricstore.Raft.StateMachineTest do
     assert [] = :ets.lookup(ets, "local-key")
   end
 
+  @tag :terminal_expire_apply_guard
+  test "signaling a terminal schedule with a missing old retention marker does not crash apply",
+       %{
+         state: state,
+         ets: ets
+       } do
+    setup_flow_indexes(state)
+
+    id = "__ferricstore_schedule__:terminal-expire-guard"
+    type = "__ferricstore_schedule"
+    partition_key = "__ferricstore_schedule__:0"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    assert {_created_state, :ok} =
+             StateMachine.apply(
+               %{system_time: 1_000},
+               {:flow_create, state_key,
+                %{
+                  id: id,
+                  type: type,
+                  state: "completed",
+                  partition_key: partition_key,
+                  now_ms: 1_000
+                }},
+               state
+             )
+
+    completed = flow_record!(state, state_key)
+    malformed = %{completed | terminal_retention_until_ms: nil}
+    encoded = Ferricstore.Flow.encode_record(malformed)
+
+    :ets.insert(
+      ets,
+      {state_key, encoded, 0, LFU.initial(), 0, 0, byte_size(encoded)}
+    )
+
+    assert {_signaled_state, :ok} =
+             StateMachine.apply(
+               %{system_time: 1_001},
+               {:flow_signal, state_key,
+                %{
+                  id: id,
+                  signal: "schedule_fired",
+                  partition_key: partition_key,
+                  now_ms: 1_001
+                }},
+               state
+             )
+
+    signaled = flow_record!(state, state_key)
+    assert signaled.version == completed.version + 1
+    assert signaled.state == "completed"
+    assert is_integer(signaled.terminal_retention_until_ms)
+  end
+
   use Ferricstore.Raft.StateMachineTest.Sections.CoalescesConsecutiveFlowNativeIndexOpsCrossingOrderingBarriers
 
   use Ferricstore.Raft.StateMachineTest.Sections.FlowGovernanceReleaseOutbox
@@ -392,6 +447,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       version: 1,
       run_at_ms: now_ms,
       due_at_ms: nil,
+      created_at_ms: now_ms,
       updated_at_ms: now_ms,
       terminal_retention_until_ms: expire_at_ms
     }

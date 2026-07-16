@@ -816,7 +816,9 @@ defmodule Ferricstore.Flow.Keys do
     end
   end
 
-  defp decode_index_component(encoded) do
+  @doc false
+  @spec decode_index_component(binary()) :: {:ok, binary()} | :error
+  def decode_index_component(encoded) when is_binary(encoded) do
     with {:ok, decoded} <- Base.url_decode64(encoded, padding: false),
          true <- index_component(decoded) == encoded do
       {:ok, decoded}
@@ -824,6 +826,8 @@ defmodule Ferricstore.Flow.Keys do
       _invalid -> :error
     end
   end
+
+  def decode_index_component(_encoded), do: :error
 
   defp valid_flow_tag?("f"), do: true
 

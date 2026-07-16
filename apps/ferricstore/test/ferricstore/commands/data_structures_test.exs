@@ -5,7 +5,17 @@ defmodule Ferricstore.Commands.DataStructuresTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Bitmap, Dispatcher, Hash, List, Set, SortedSet, Strings}
+  alias Ferricstore.Commands.{
+    Bitmap,
+    Dispatcher,
+    Hash,
+    HyperLogLog,
+    List,
+    Set,
+    SortedSet,
+    Strings
+  }
+
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
@@ -59,54 +69,25 @@ defmodule Ferricstore.Commands.DataStructuresTest do
       assert {:error, _} = Strings.handle("TYPE", [], MockStore.make())
     end
 
-    test "TYPE ignores orphan list metadata without a type marker" do
+    test "string commands ignore orphan list metadata without a type marker" do
       store = MockStore.make()
 
-      :ok =
-        store.compound_put.(
-          "orphan",
-          CompoundKey.list_meta_key("orphan"),
-          :erlang.term_to_binary({1, 0, 1}),
-          0
-        )
+      Enum.each(["orphan_bitmap", "orphan_hll"], fn key ->
+        :ok =
+          store.compound_put.(
+            key,
+            CompoundKey.list_meta_key(key),
+            :erlang.term_to_binary({1, 0, 1}),
+            0
+          )
 
-      :ok = store.compound_put.("orphan", CompoundKey.list_element("orphan", 0), "value", 0)
+        :ok = store.compound_put.(key, CompoundKey.list_element(key, 0), "value", 0)
 
-      assert {:simple, "none"} == Strings.handle("TYPE", ["orphan"], store)
-      assert 0 == Bitmap.handle("GETBIT", ["orphan", "0"], store)
-    end
+        assert {:simple, "none"} == Strings.handle("TYPE", [key], store)
+      end)
 
-    test "read paths do not use list metadata as a fallback type marker" do
-      # LM:key is list payload metadata. Only T:key is a type marker, so read
-      # commands must not probe LM:key as a shortcut for WRONGTYPE detection.
-      checks = [
-        {"lib/ferricstore/store/type_registry.ex", ~r/def get_type.*?case Ops\.get/s},
-        {"lib/ferricstore/commands/bitmap/destination.ex",
-         ~r/defp compound_type_marker\?.*?end/s},
-        {"lib/ferricstore/commands/hyperloglog.ex", ~r/defp compound_type_marker\?.*?end/s}
-      ]
-
-      findings =
-        checks
-        |> Enum.flat_map(fn {path, pattern} ->
-          source = File.read!(app_path(path))
-
-          case Regex.run(pattern, source) do
-            [body] ->
-              if body =~ "list_meta_key" do
-                [path]
-              else
-                []
-              end
-
-            nil ->
-              [path <> " missing expected function body"]
-          end
-        end)
-
-      assert findings == [],
-             "read paths must rely on T:key only, found LM fallback probes in:\n" <>
-               Enum.join(findings, "\n")
+      assert 0 == Bitmap.handle("GETBIT", ["orphan_bitmap", "0"], store)
+      assert 1 == HyperLogLog.handle("PFADD", ["orphan_hll", "member"], store)
     end
 
     test "TYPE does not deserialize plain values to infer type" do

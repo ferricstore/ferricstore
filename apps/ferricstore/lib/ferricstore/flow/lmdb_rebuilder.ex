@@ -1379,6 +1379,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          ^version <- Map.get(current, :version),
          true <- LMDB.terminal_state?(Map.get(current, :state)) do
       track_binary_remove(keydir, shard_index, key, instance_ctx)
+      delete_apply_projection_cache_for_row(instance_ctx, shard_index, row)
       :ets.delete(keydir, key)
     end
 
@@ -1386,6 +1387,25 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   rescue
     ArgumentError -> :ok
   end
+
+  defp delete_apply_projection_cache_for_row(
+         %{data_dir: data_dir},
+         shard_index,
+         {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
+          _value_size}
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(key) and is_integer(index) and index > 0 do
+    Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(data_dir, shard_index, [
+      {index, key}
+    ])
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp delete_apply_projection_cache_for_row(_instance_ctx, _shard_index, _row), do: :ok
 
   defp prune_terminal_keydir_record(
          {key, value, expire_at_ms, _lfu, _fid, _off, _vsize},

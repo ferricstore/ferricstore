@@ -245,7 +245,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.InvalidWaraftInFlightBytes
         assert {:error, :timeout} ==
                  WARaftBackend.__redirect_write_failure_for_test__(:exit, {:erpc, :timeout})
 
-        assert {:error, :leader_unavailable} ==
+        assert {:error, :timeout} ==
                  WARaftBackend.__redirect_write_failure_for_test__(:exit, {:erpc, :noconnection})
 
         assert Ferricstore.ErrorReasons.write_timeout_unknown() ==

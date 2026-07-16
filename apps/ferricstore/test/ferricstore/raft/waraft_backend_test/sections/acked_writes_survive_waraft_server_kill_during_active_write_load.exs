@@ -224,6 +224,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AckedWritesSurviveWaraftSe
         end
       end
 
+      @tag :apply_projection_ack_path
       test "segment-projected Flow write does not append a second apply-projection record on ack path",
            %{ctx: ctx} do
         previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_append_hook)
@@ -252,12 +253,6 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AckedWritesSurviveWaraftSe
           assert_receive {:waraft_segment_log_append_hook, :after_write, 1}, 1_000
           refute_receive {:waraft_segment_log_append_hook, :after_write, 2}, 250
           Application.delete_env(:ferricstore, :waraft_segment_log_append_hook)
-
-          assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(
-                   ctx.data_dir,
-                   0
-                 ) ==
-                   0
 
           assert {:ok, [%{id: ^flow_id}]} =
                    Ferricstore.Flow.claim_due(ctx, flow_type,

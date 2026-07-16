@@ -144,6 +144,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
       end
 
       @tag :apply_projection_cache_compaction
+      @tag :apply_projection_zero_drain
       test "Flow WARaft apply projection cache compacts when the row budget is exceeded", %{
         root: root,
         ctx: ctx
@@ -346,6 +347,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageCloseFlushesA
       end
 
       @tag :apply_projection_cache_compaction
+      @tag :apply_projection_zero_drain
       test "WARaft apply projection cache retries after an unlinked compactor dies", %{
         root: root,
         ctx: ctx

@@ -97,7 +97,7 @@ defmodule Ferricstore.Store.HintFile do
          source_snapshot
        ) do
     result =
-      with :ok <- File.rename(temp_path, hint_path),
+      with :ok <- Ferricstore.FS.rename(temp_path, hint_path),
            :ok <-
              HintMetadata.publish(
                log_path,
@@ -161,7 +161,7 @@ defmodule Ferricstore.Store.HintFile do
   end
 
   defp cleanup_error(temp_path, reason) do
-    _ = File.rm(temp_path)
+    _ = Ferricstore.FS.rm(temp_path)
     {:error, reason}
   end
 end

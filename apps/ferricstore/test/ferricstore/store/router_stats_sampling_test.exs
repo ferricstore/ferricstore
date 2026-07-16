@@ -112,7 +112,7 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
       |> Code.string_to_quoted!()
 
     for {name, arity} <- [
-          {:do_batch_get, 3},
+          {:do_batch_get, 4},
           {:do_batch_get_with_file_refs, 4},
           {:compound_batch_get, 3}
         ] do
@@ -126,6 +126,11 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
                   contains_call?(body, :hot_read_bookkeeping_finish, 2)),
              "#{name}/#{arity} must use batched hot-read bookkeeping"
     end
+
+    bounded_body = find_function_body!(ast, :do_batch_get, 3)
+
+    assert contains_call?(bounded_body, :do_batch_get, 4),
+           "do_batch_get/3 must delegate to the shared batched-read implementation"
 
     batch_body = find_function_body!(ast, :batch_get, 2)
 

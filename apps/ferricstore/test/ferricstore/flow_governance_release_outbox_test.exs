@@ -487,7 +487,8 @@ defmodule Ferricstore.FlowGovernanceReleaseOutboxTest do
 
     cold_ctx = %{
       ctx
-      | keydir_refs: put_elem(ctx.keydir_refs, shard_index, make_ref()),
+      | name: :release_outbox_batch_read_probe,
+        keydir_refs: put_elem(ctx.keydir_refs, shard_index, make_ref()),
         shard_names: put_elem(ctx.shard_names, shard_index, reader)
     }
 

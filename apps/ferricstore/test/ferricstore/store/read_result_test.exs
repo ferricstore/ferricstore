@@ -464,6 +464,7 @@ defmodule Ferricstore.Store.ReadResultTest do
     on_exit(fn -> Stream.Meta.cleanup_local(trim_key) end)
 
     trim_store = %{
+      get: fn _key -> nil end,
       compound_get: fn _key, _compound_key -> nil end,
       compound_scan: fn _key, _prefix -> failure end,
       compound_batch_delete: fn _key, _compound_keys ->

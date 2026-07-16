@@ -59,6 +59,92 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushTest do
              AfterFlush.apply_after_flush(action)
   end
 
+  test "terminal source decoding waits for pending rows and reads expired WARaft projections" do
+    state_key = "flow:{flow:after-flush-waraft}:state:a"
+
+    pending_row =
+      {state_key, nil, 1, 0, :pending, 0, 0}
+
+    assert {:error, {:source_pending, ^state_key}} =
+             AfterFlush.flow_record_from_keydir_row(
+               "/data",
+               0,
+               state_key,
+               pending_row
+             )
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-after-flush-waraft-#{System.unique_integer([:positive])}"
+      )
+
+    projection_index = 17
+
+    record = %{
+      id: "after-flush-waraft",
+      type: "cleanup",
+      state: "completed",
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 1,
+      updated_at_ms: 2,
+      next_run_at_ms: nil,
+      priority: 0,
+      ttl_ms: nil,
+      history_hot_max_events: nil,
+      history_max_events: nil,
+      retention_ttl_ms: nil,
+      max_active_ms: nil,
+      terminal_retention_until_ms: 1,
+      partition_key: nil,
+      payload_ref: nil,
+      parent_flow_id: nil,
+      parent_partition_key: nil,
+      root_flow_id: "after-flush-waraft",
+      correlation_id: nil,
+      result_ref: nil,
+      error_ref: nil,
+      lease_owner: nil,
+      lease_token: nil,
+      lease_deadline_ms: 0,
+      run_state: nil,
+      child_groups: %{}
+    }
+
+    encoded = Ferricstore.Flow.encode_record(record)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+               data_dir,
+               0,
+               projection_index,
+               [{state_key, encoded, 1}]
+             )
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(
+        data_dir,
+        0,
+        [{projection_index, state_key}]
+      )
+    end)
+
+    row =
+      {state_key, nil, 1, 0, {:waraft_apply_projection, projection_index}, 0, byte_size(encoded)}
+
+    assert {:ok, %{id: "after-flush-waraft", state: "completed"}} =
+             AfterFlush.flow_record_from_keydir_row(data_dir, 0, state_key, row)
+
+    assert 1 =
+             Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(
+               data_dir,
+               0,
+               [{projection_index, state_key}]
+             )
+  end
+
   test "terminal prune reports a vanished hot zset index" do
     ets = :ets.new(:after_flush_terminal_source, [:set])
     zset_index = :ets.new(:after_flush_terminal_zset, [:ordered_set])

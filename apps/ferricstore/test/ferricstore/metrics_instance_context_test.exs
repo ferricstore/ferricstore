@@ -28,10 +28,15 @@ defmodule Ferricstore.MetricsInstanceContextTest do
   end
 
   test "scrape uses the immutable instance topology", %{keydir: keydir} do
+    bytes_before = :ets.info(keydir, :memory) * :erlang.system_info(:wordsize)
     text = Ferricstore.Metrics.scrape()
-    expected_bytes = :ets.info(keydir, :memory) * :erlang.system_info(:wordsize)
+    bytes_after = :ets.info(keydir, :memory) * :erlang.system_info(:wordsize)
 
-    assert text =~ "ferricstore_keydir_used_bytes #{expected_bytes}\n"
+    assert [_, encoded_bytes] =
+             Regex.run(~r/^ferricstore_keydir_used_bytes (\d+)$/m, text)
+
+    reported_bytes = String.to_integer(encoded_bytes)
+    assert reported_bytes in min(bytes_before, bytes_after)..max(bytes_before, bytes_after)
     assert text =~ ~s(ferricstore_bitcask_last_applied_index{shard_index="0"})
     refute text =~ ~s(ferricstore_bitcask_last_applied_index{shard_index="1"})
 

@@ -42,6 +42,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
       alias Ferricstore.Store.Shard.ZSetIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+
+      @flow_lmdb_max_u64 18_446_744_073_709_551_615
       alias Ferricstore.Transaction.Ast, as: TxAst
 
       defp queue_pending_lmdb_flow_state_projection(state_key, value, expire_at_ms)
@@ -119,14 +121,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
       end
 
       defp maybe_queue_terminal_lmdb_expire_delete(record, terminal_key) do
-        case Ferricstore.Flow.LMDB.terminal_expire_key(
-               Map.get(record, :terminal_retention_until_ms),
-               terminal_key
-             ) do
-          expire_key when is_binary(expire_key) ->
-            queue_pending_lmdb_mirror_delete(expire_key)
+        case Map.get(record, :terminal_retention_until_ms) do
+          expire_at_ms
+          when is_integer(expire_at_ms) and expire_at_ms > 0 and
+                 expire_at_ms <= @flow_lmdb_max_u64 ->
+            expire_at_ms
+            |> Ferricstore.Flow.LMDB.terminal_expire_key(terminal_key)
+            |> queue_pending_lmdb_mirror_delete()
 
-          nil ->
+          _missing_or_invalid ->
+            # :terminal_delete derives the exact marker from the persisted index value.
             :ok
         end
       end
@@ -135,14 +139,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         partition_key = Map.get(record, :partition_key)
         history_key = FlowKeys.history_key(Map.fetch!(record, :id), partition_key)
 
-        case Ferricstore.Flow.LMDB.history_flow_expire_key(
-               Map.get(record, :terminal_retention_until_ms),
-               history_key
-             ) do
-          expire_key when is_binary(expire_key) ->
-            queue_pending_lmdb_mirror_delete(expire_key)
+        case Map.get(record, :terminal_retention_until_ms) do
+          expire_at_ms
+          when is_integer(expire_at_ms) and expire_at_ms > 0 and
+                 expire_at_ms <= @flow_lmdb_max_u64 ->
+            expire_at_ms
+            |> Ferricstore.Flow.LMDB.history_flow_expire_key(history_key)
+            |> queue_pending_lmdb_mirror_delete()
 
-          nil ->
+          _missing_or_invalid ->
             :ok
         end
       end

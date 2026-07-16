@@ -113,6 +113,57 @@ defmodule Ferricstore.Store.KeydirConcurrencyTest do
     end
   end
 
+  test "exact expiry deletion releases its WARaft apply-projection cache entry" do
+    keydir = new_keydir()
+    compound_index = :ets.new(:keydir_apply_projection_delete, [:ordered_set, :public])
+    :ok = CompoundMemberIndex.reset(compound_index)
+
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-keydir-apply-projection-#{System.unique_integer([:positive])}"
+      )
+
+    key = "keydir-apply-projection-expired"
+    projection_index = 41
+
+    expired =
+      {key, nil, 1, LFU.initial(), {:waraft_apply_projection, projection_index}, 0, 3}
+
+    state = %{
+      keydir: keydir,
+      index: 0,
+      instance_ctx: %{data_dir: data_dir},
+      compound_member_index: compound_index
+    }
+
+    try do
+      :ok =
+        Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+          data_dir,
+          0,
+          projection_index,
+          [{key, "old", 1}]
+        )
+
+      true = :ets.insert(keydir, expired)
+      assert 1 == Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(data_dir, 0)
+
+      assert ShardETS.delete_exact_entry(state, expired)
+      assert [] == :ets.lookup(keydir, key)
+      assert 0 == Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(data_dir, 0)
+    after
+      Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(
+        data_dir,
+        0,
+        [{projection_index, key}]
+      )
+
+      :ets.delete(compound_index)
+      :ets.delete(keydir)
+    end
+  end
+
   test "compound member counting cannot erase a replacement renewed during expiry cleanup" do
     keydir = new_keydir()
     index = :ets.new(:keydir_compound_count_race, [:ordered_set, :public])

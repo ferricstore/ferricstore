@@ -469,7 +469,8 @@ defmodule Ferricstore.Store.Router.Part11 do
 
         if ListOps.read_operation?(operation) do
           if selected_waraft_ctx?(ctx) do
-            ListOps.execute(key, ctx, operation)
+            with :ok <- TypeRegistry.command_check_type(key, :list, ctx),
+                 do: ListOps.execute(key, ctx, operation)
           else
             case safe_read_call(ctx, idx, {:list_read, key, operation}) do
               {:ok, result} -> result

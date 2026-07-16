@@ -708,11 +708,11 @@ defmodule Ferricstore.Store.Shard.Flush do
   end
 
   defp cleanup_rotation_candidate(path) do
-    case File.rm(path) do
+    case Ferricstore.FS.rm(path) do
       :ok ->
         :ok
 
-      {:error, :enoent} ->
+      {:error, {:not_found, _message}} ->
         :ok
 
       {:error, reason} ->

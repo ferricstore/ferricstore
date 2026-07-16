@@ -400,7 +400,7 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
         _offset
       )
       when is_tuple(file_id) do
-    Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+    Ferricstore.Raft.WARaftSegmentReader.read_value_from_location_including_expired(
       instance_ctx,
       shard_index,
       file_id,

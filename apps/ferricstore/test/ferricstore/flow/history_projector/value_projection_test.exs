@@ -41,4 +41,45 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjectionTest do
                ref
              )
   end
+
+  test "projected value reads retain expired WARaft apply values for history materialization" do
+    unique = System.unique_integer([:positive])
+    data_dir = Path.join(System.tmp_dir!(), "ferricstore_expired_projection_#{unique}")
+    keydir = :ets.new(:"history_projector_expired_value_source_#{unique}", [:set, :public])
+    shard_index = 0
+    index = unique
+    ref = Ferricstore.Flow.Keys.value_key("expired-source", :result, 1)
+    value = "expired-value"
+    ctx = %{data_dir: data_dir}
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(
+        data_dir,
+        shard_index
+      )
+    end)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+               data_dir,
+               shard_index,
+               index,
+               [{ref, value, 1}]
+             )
+
+    :ets.insert(
+      keydir,
+      {ref, nil, 1, Ferricstore.Store.LFU.initial(), {:waraft_apply_projection, index}, 0,
+       byte_size(value)}
+    )
+
+    assert {:ok, %{key: ^ref, value: ^value}} =
+             ValueProjection.projected_flow_value_source(
+               ctx,
+               shard_index,
+               data_dir,
+               keydir,
+               ref
+             )
+  end
 end

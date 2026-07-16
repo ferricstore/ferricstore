@@ -961,33 +961,52 @@ defmodule Ferricstore.Test.ShardHelpers do
   this helper has to start distribution, it stops FerricStore first and restarts
   it after the node name is stable.
   """
-  @spec ensure_distribution_started!(atom() | binary()) :: :ok
-  def ensure_distribution_started!(prefix \\ :ferric_runner) do
-    case Node.self() do
-      :nonode@nohost ->
-        server_started? = application_started?(:ferricstore_server)
-        store_started? = application_started?(:ferricstore)
-        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+  @spec ensure_distribution_started!(atom() | binary(), keyword()) :: :ok
+  def ensure_distribution_started!(prefix \\ :ferric_runner, opts \\ []) when is_list(opts) do
+    if Node.self() == :nonode@nohost or Keyword.get(opts, :force?, false) do
+      start_fun = Keyword.get(opts, :start_fun, &start_distribution!/1)
+      true = is_function(start_fun, 1)
 
-        stop_app_if_started(:ferricstore_server)
-        stop_app_if_started(:ferricstore)
-        Ferricstore.Raft.WARaftBackend.stop()
+      server_started? = application_started?(:ferricstore_server)
+      store_started? = application_started?(:ferricstore)
+      data_dir = Application.get_env(:ferricstore, :data_dir, "data")
 
-        prefix = prefix |> to_string() |> String.trim_leading(":")
-        node_name = :"#{prefix}_#{:erlang.unique_integer([:positive])}"
-        start_distribution!(node_name)
+      stop_app_if_started(:ferricstore_server)
+      stop_app_if_started(:ferricstore)
+      Ferricstore.Raft.WARaftBackend.stop()
 
-        if store_started? do
-          restart_with_data_dir(data_dir, server_started?,
-            clean?: clean_restart_data_dir?(data_dir)
-          )
-        end
+      prefix = prefix |> to_string() |> String.trim_leading(":")
+      node_name = :"#{prefix}_#{:erlang.unique_integer([:positive])}"
 
-        :ok
+      try do
+        start_fun.(node_name)
+      rescue
+        error ->
+          restore_after_distribution_start_failure(store_started?, data_dir, server_started?)
+          reraise error, __STACKTRACE__
+      catch
+        kind, reason ->
+          stacktrace = __STACKTRACE__
+          restore_after_distribution_start_failure(store_started?, data_dir, server_started?)
+          :erlang.raise(kind, reason, stacktrace)
+      end
 
-      _node ->
-        :ok
+      if store_started? do
+        restart_with_data_dir(data_dir, server_started?,
+          clean?: clean_restart_data_dir?(data_dir)
+        )
+      end
+
+      :ok
+    else
+      :ok
     end
+  end
+
+  defp restore_after_distribution_start_failure(false, _data_dir, _server_started?), do: :ok
+
+  defp restore_after_distribution_start_failure(true, data_dir, server_started?) do
+    restart_with_data_dir(data_dir, server_started?, clean?: false)
   end
 
   defp clean_restart_data_dir?(data_dir) do
@@ -1098,6 +1117,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   defp start_distribution!(node_name) do
+    start_epmd()
     task = Task.async(fn -> Node.start(node_name, :shortnames) end)
 
     case Task.yield(task, 10_000) || Task.shutdown(task, :brutal_kill) do
@@ -1111,6 +1131,19 @@ defmodule Ferricstore.Test.ShardHelpers do
       _ ->
         raise "Node.start timed out after 10s. " <>
                 "Run with: elixir --sname test -S mix test"
+    end
+  end
+
+  defp start_epmd do
+    case System.find_executable("epmd") do
+      nil ->
+        :ok
+
+      executable ->
+        case System.cmd(executable, ["-daemon"], stderr_to_stdout: true) do
+          {_output, 0} -> :ok
+          {output, status} -> raise "Failed to start epmd (status #{status}): #{output}"
+        end
     end
   end
 end

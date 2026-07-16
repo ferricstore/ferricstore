@@ -196,10 +196,9 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
     @tag :durability
     test "4. RENAME survives shard crash" do
-      # Use keys on the same shard to avoid cross-shard issues
-      {src_base, dst_base} = ShardHelpers.keys_on_same_shard()
-      src = "dct_ren_src_#{src_base}"
-      dst = "dct_ren_dst_#{dst_base}"
+      tag = "dct-ren-#{System.unique_integer([:positive])}"
+      src = "dct_ren:{#{tag}}:src"
+      dst = "dct_ren:{#{tag}}:dst"
 
       :ok = FerricStore.set(src, "val")
       :ok = FerricStore.rename(src, dst)

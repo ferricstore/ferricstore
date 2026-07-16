@@ -305,9 +305,9 @@ defmodule Ferricstore.Commands.KeyInfoTest do
     end
 
     test "KEY_INFO fails closed without exiting while shard is unavailable" do
-      original_ctx = FerricStore.Instance.get(:default)
-      unavailable_ctx = unavailable_default_ctx()
+      unavailable_ctx = unavailable_ctx()
       handler_id = {__MODULE__, make_ref()}
+      store = %{__instance_ctx__: unavailable_ctx, get: &Router.get(unavailable_ctx, &1)}
 
       :ok =
         :telemetry.attach(
@@ -317,19 +317,16 @@ defmodule Ferricstore.Commands.KeyInfoTest do
           self()
         )
 
-      :persistent_term.put({FerricStore.Instance, :default}, unavailable_ctx)
-
       on_exit(fn ->
         :telemetry.detach(handler_id)
-        :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
       end)
 
       assert {:error, "ERR storage read failed"} =
-               Native.handle("KEY_INFO", ["ki_restart_missing"], dummy_store())
+               Native.handle("KEY_INFO", ["ki_restart_missing"], store)
 
       assert_receive {:telemetry_event, [:ferricstore, :store, :shard_unavailable], %{count: 1},
                       %{
-                        instance: :default,
+                        instance: :key_info_unavailable,
                         request: :get,
                         reason: :noproc,
                         shard_index: 0
@@ -510,12 +507,12 @@ defmodule Ferricstore.Commands.KeyInfoTest do
     send(parent, {:telemetry_event, event, measurements, metadata})
   end
 
-  defp unavailable_default_ctx do
+  defp unavailable_ctx do
     keydir = :ets.new(:"key_info_restart_fallback_#{System.unique_integer([:positive])}", [:set])
     :ets.delete(keydir)
 
     %FerricStore.Instance{
-      name: :default,
+      name: :key_info_unavailable,
       data_dir: System.tmp_dir!(),
       data_dir_expanded: System.tmp_dir!(),
       shard_count: 1,

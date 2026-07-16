@@ -11,6 +11,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
+  alias Ferricstore.Store.ReadResult
 
   @threshold 128
 
@@ -207,7 +208,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
                GenServer.call(shard, {:compound_scan, redis_key, prefix})
     end
 
-    test "raw prefix helper skips pending cold entries instead of crashing",
+    test "raw prefix helper fails closed on an unresolved pending cold entry",
          %{keydir: keydir, ctx: ctx} do
       prefix = "H:raw_pending" <> <<0>>
       field_key = prefix <> "field"
@@ -215,7 +216,8 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
 
       :ets.insert(keydir, {field_key, nil, 0, 1, :pending, 0, 0})
 
-      assert [] == ShardETS.prefix_scan_entries(keydir, prefix, shard_path)
+      assert ReadResult.failure({:invalid_prefix_scan_location, field_key}) ==
+               ShardETS.prefix_scan_entries(keydir, prefix, shard_path)
     end
 
     test "scan without pending cold entries does not checkpoint dirty data",

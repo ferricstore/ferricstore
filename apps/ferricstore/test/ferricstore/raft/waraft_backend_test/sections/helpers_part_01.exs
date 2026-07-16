@@ -354,6 +354,22 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01 do
         ArgumentError -> false
       end
 
+      defp apply_projection_cache_contains_key?(root, shard_index, key) do
+        case :ets.whereis(:ferricstore_waraft_apply_projection_cache) do
+          :undefined ->
+            false
+
+          table ->
+            root = waraft_storage_root(root, shard_index)
+
+            :ets.select_count(table, [
+              {{{root, :_, key}, :_, :_}, [], [true]}
+            ]) > 0
+        end
+      rescue
+        ArgumentError -> false
+      end
+
       defp apply_projection_cache_value_bytes(root, shard_index, index) do
         case :ets.whereis(:ferricstore_waraft_apply_projection_cache) do
           :undefined ->

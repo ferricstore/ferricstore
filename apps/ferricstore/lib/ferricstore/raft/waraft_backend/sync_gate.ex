@@ -53,6 +53,19 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   def enter(shard_index), do: {:error, {:invalid_shard_index, shard_index}}
 
+  @spec enter_many([non_neg_integer()]) :: {:ok, [token()]} | {:error, term()}
+  def enter_many(shard_indexes) when is_list(shard_indexes) do
+    indexes = Enum.uniq(shard_indexes)
+
+    if Enum.all?(indexes, &(is_integer(&1) and &1 >= 0)) do
+      do_enter_many(indexes)
+    else
+      {:error, {:invalid_shard_indexes, shard_indexes}}
+    end
+  end
+
+  def enter_many(shard_indexes), do: {:error, {:invalid_shard_indexes, shard_indexes}}
+
   @spec leave(token()) :: :ok
   def leave({shard_index, counters})
       when is_integer(shard_index) and shard_index >= 0 do
@@ -65,6 +78,69 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   end
 
   def leave(_token), do: :ok
+
+  defp do_enter_many([]), do: {:ok, []}
+
+  defp do_enter_many(shard_indexes) do
+    with {:ok, tokens} <- claim_many(shard_indexes) do
+      case active_pauses(tokens) do
+        [] ->
+          {:ok, tokens}
+
+        pauses ->
+          Enum.each(tokens, &leave/1)
+
+          case await_pauses(pauses) do
+            :ok -> do_enter_many(shard_indexes)
+            {:error, _reason} = error -> error
+          end
+      end
+    end
+  end
+
+  defp claim_many(shard_indexes) do
+    shard_indexes
+    |> Enum.reduce_while({:ok, []}, fn shard_index, {:ok, tokens} ->
+      case claim(shard_index) do
+        {:ok, token} ->
+          {:cont, {:ok, [token | tokens]}}
+
+        {:error, _reason} = error ->
+          Enum.each(tokens, &leave/1)
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, tokens} -> {:ok, Enum.reverse(tokens)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp claim(shard_index) do
+    counters = ensure_state(shard_index)
+    :atomics.add(counters, @active_index, 1)
+    {:ok, {shard_index, counters}}
+  catch
+    :error, reason -> {:error, {:sync_gate_enter_failed, reason}}
+  end
+
+  defp active_pauses(tokens) do
+    Enum.flat_map(tokens, fn {shard_index, _counters} ->
+      case pause_pid(shard_index) do
+        nil -> []
+        pid -> [{shard_index, pid}]
+      end
+    end)
+  end
+
+  defp await_pauses(pauses) do
+    Enum.reduce_while(pauses, :ok, fn {_shard_index, pid}, :ok ->
+      case await(pid, :infinity) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
 
   @spec pause(non_neg_integer()) :: {:ok, pid()} | {:error, term()}
   def pause(shard_index) when is_integer(shard_index) and shard_index >= 0 do

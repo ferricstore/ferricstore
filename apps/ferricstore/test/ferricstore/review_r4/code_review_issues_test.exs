@@ -26,19 +26,22 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
 
   describe "E1: RENAME on hash key does not move compound sub-keys" do
     test "RENAME hash: HGET on new name should return the field values" do
+      source = "e1:{compound-rename}:src"
+      destination = "e1:{compound-rename}:dst"
+
       # Create a hash with fields
-      :ok = FerricStore.hset("e1_src", %{"f1" => "v1", "f2" => "v2"})
+      :ok = FerricStore.hset(source, %{"f1" => "v1", "f2" => "v2"})
 
       # Verify the hash works
-      {:ok, "v1"} = FerricStore.hget("e1_src", "f1")
+      {:ok, "v1"} = FerricStore.hget(source, "f1")
 
       # Rename the key
-      :ok = FerricStore.rename("e1_src", "e1_dst")
+      :ok = FerricStore.rename(source, destination)
 
       # The field data should be accessible via the new name.
       # BUG: If RENAME only moves the plain key value (nil for hashes),
       # HGET on the new name will return nil.
-      result = FerricStore.hget("e1_dst", "f1")
+      result = FerricStore.hget(destination, "f1")
 
       assert result == {:ok, "v1"},
              "E1 BUG: RENAME did not move hash compound sub-keys. " <>
@@ -46,11 +49,14 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
     end
 
     test "RENAME hash: old key should no longer have the fields" do
-      :ok = FerricStore.hset("e1_old", %{"field" => "value"})
-      :ok = FerricStore.rename("e1_old", "e1_new")
+      source = "e1:{compound-rename-old}:src"
+      destination = "e1:{compound-rename-old}:dst"
+
+      :ok = FerricStore.hset(source, %{"field" => "value"})
+      :ok = FerricStore.rename(source, destination)
 
       # Old key should not have data
-      result = FerricStore.hget("e1_old", "field")
+      result = FerricStore.hget(source, "field")
 
       assert result == {:ok, nil},
              "After RENAME, old key still has field data: #{inspect(result)}"

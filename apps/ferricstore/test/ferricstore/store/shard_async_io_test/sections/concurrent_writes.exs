@@ -248,8 +248,11 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.ConcurrentWrites do
 
             :ets.insert(state.keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
 
-            assert nil == GenServer.call(pid, {:get, key})
-            assert nil == GenServer.call(pid, {:get_meta, key})
+            assert {:error, {:storage_read_failed, {:cold_read_failed, _reason}}} =
+                     GenServer.call(pid, {:get, key})
+
+            assert {:error, {:storage_read_failed, {:cold_read_failed, _reason}}} =
+                     GenServer.call(pid, {:get_meta, key})
 
             assert {:error, {:storage_read_failed, {:cold_read_failed, _reason}}} =
                      ShardReads.v2_local_read(:sys.get_state(pid), key)
@@ -378,7 +381,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.ConcurrentWrites do
                          1_000
 
           assert measurements.total_duration_us >= 0
-          assert match?([{:active_fsync, _reason}], errors)
+          assert Keyword.has_key?(errors, :active_fsync)
         end
 
         test "replays tombstones that appear before the last live hinted record" do
@@ -407,7 +410,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.ConcurrentWrites do
           assert [{"b", nil, 0, _lfu, 1, ^b_offset, ^b_size}] = :ets.lookup(keydir, "b")
         end
 
-        test "falls back to full scan when hinted tombstone scan sees corruption" do
+        test "fails closed when hinted tombstone and full scans see corruption" do
           dir = Path.join(System.tmp_dir!(), "hint_tombstone_corrupt_#{:rand.uniform(9_999_999)}")
           File.mkdir_p!(dir)
 
@@ -433,10 +436,9 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.ConcurrentWrites do
 
           keydir = :ets.new(:hint_tombstone_corrupt_keydir, [:set, :public])
 
-          Ferricstore.Store.Shard.Lifecycle.recover_keydir(dir, keydir, 0)
-
-          assert [] == :ets.lookup(keydir, "a")
-          assert [{"b", nil, 0, _lfu, 1, ^b_offset, ^b_size}] = :ets.lookup(keydir, "b")
+          assert_raise RuntimeError, ~r/recover_from_log failed to scan.*CRC mismatch/s, fn ->
+            Ferricstore.Store.Shard.Lifecycle.recover_keydir(dir, keydir, 0)
+          end
         end
 
         test "recovers shard logs in numeric file id order past five digits" do

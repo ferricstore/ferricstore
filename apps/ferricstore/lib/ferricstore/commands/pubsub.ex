@@ -52,7 +52,21 @@ defmodule Ferricstore.Commands.PubSub do
   end
 
   # PUBSUB subcommand dispatch
-  def handle("PUBSUB", [subcommand | args]) do
+  def handle("PUBSUB", args) when is_list(args), do: handle_pubsub(args)
+
+  @spec handle_ast(term()) :: term()
+  def handle_ast({:publish, [channel, message]}), do: publish_message(channel, message)
+
+  def handle_ast({:publish, _args}),
+    do: {:error, "ERR wrong number of arguments for 'publish' command"}
+
+  def handle_ast({:pubsub, args}) when is_list(args), do: handle_pubsub(args)
+
+  # ---------------------------------------------------------------------------
+  # PUBSUB subcommand handlers
+  # ---------------------------------------------------------------------------
+
+  defp handle_pubsub([subcommand | args]) do
     case String.upcase(subcommand) do
       "CHANNELS" -> handle_channels(args)
       "NUMSUB" -> handle_numsub(args)
@@ -61,21 +75,9 @@ defmodule Ferricstore.Commands.PubSub do
     end
   end
 
-  def handle("PUBSUB", []) do
+  defp handle_pubsub([]) do
     {:error, "ERR wrong number of arguments for 'pubsub' command"}
   end
-
-  @spec handle_ast(term()) :: term()
-  def handle_ast({:publish, [channel, message]}), do: publish_message(channel, message)
-
-  def handle_ast({:publish, _args}),
-    do: {:error, "ERR wrong number of arguments for 'publish' command"}
-
-  def handle_ast({:pubsub, args}) when is_list(args), do: handle("PUBSUB", args)
-
-  # ---------------------------------------------------------------------------
-  # PUBSUB subcommand handlers
-  # ---------------------------------------------------------------------------
 
   defp publish_message(channel, message), do: PubSub.publish(channel, message)
 

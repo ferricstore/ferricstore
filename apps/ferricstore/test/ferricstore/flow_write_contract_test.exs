@@ -54,8 +54,18 @@ defmodule Ferricstore.FlowWriteContractTest do
   test "router flow pipeline results use ordered tuples instead of index maps" do
     source = Ferricstore.Test.SourceFiles.router_source()
 
-    assert source =~ "flow_result_tuple(count)"
-    assert source =~ "put_elem(results, index, result)"
+    result_tuple_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(source, "flow_result_tuple")
+
+    expansion_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "expand_flow_pipeline_results"
+      )
+
+    assert result_tuple_source =~ ":erlang.make_tuple(count"
+    assert expansion_source =~ "flow_result_tuple(count, rejected)"
+    assert expansion_source =~ "put_elem(results, index, result)"
   end
 
   test "flow create fast apply inserts due lifecycle indexes once" do
@@ -1487,10 +1497,20 @@ defmodule Ferricstore.FlowWriteContractTest do
              recovery_source
            )
 
-    assert Regex.match?(
-             ~r/force_full_reconcile\?: true.*?active_file_size: recovery_file_size\(sm_state.active_file_path\)/s,
-             recovery_source
-           )
+    rebuild_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        recovery_source,
+        "rebuild_indexes_from_segment_keydir"
+      )
+
+    assert rebuild_source =~ "force_full_reconcile?: true"
+
+    assert rebuild_source =~
+             "Map.put(:active_file_size, recovery_file_size(sm_state.active_file_path))"
+
+    {reconcile_pos, _length} = :binary.match(rebuild_source, "reconcile_startup_shard")
+    {size_refresh_pos, _length} = :binary.match(rebuild_source, "Map.put(:active_file_size")
+    assert reconcile_pos < size_refresh_pos
   end
 
   test "state_meta policy reindex enqueues durable bounded migration work" do

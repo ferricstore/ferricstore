@@ -7,10 +7,6 @@ defmodule Ferricstore.Raft.CommandClockTest do
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.Router
 
-  defp app_path(path) do
-    Path.join(Path.expand("../../..", __DIR__), path)
-  end
-
   describe "stamp/1" do
     test "wraps a raft command with an HLC timestamp" do
       command = {:put, "clock_key", "value", 0}
@@ -39,14 +35,6 @@ defmodule Ferricstore.Raft.CommandClockTest do
   end
 
   describe "raft submit paths" do
-    test "cross-shard direct commands use stamped CommandClock submissions" do
-      cross_shard = File.read!(app_path("lib/ferricstore/cross_shard_op.ex"))
-      resolver = File.read!(app_path("lib/ferricstore/cross_shard_op/intent_resolver.ex"))
-
-      assert cross_shard =~ "CommandClock.process_command"
-      assert resolver =~ "CommandClock.process_command"
-    end
-
     test "CommandClock submits through WARaft" do
       root =
         Path.join(

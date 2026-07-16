@@ -73,6 +73,20 @@ defmodule Ferricstore.Flow.ReadAPITest do
              )
   end
 
+  test "attribute discovery decodes typed values inside query-index key components" do
+    attribute_value = "blue\0north"
+    {raw_prefix, key} = discovery_query_key(attribute_value)
+    value = LMDB.encode_query_index_value("flow-1", 1, 0)
+
+    assert {:ok, %{^attribute_value => 1}} =
+             ReadAPI.__attribute_value_counts_from_chunks_for_test__(
+               [{"unused", [{key, value}]}],
+               raw_prefix,
+               10,
+               fn _path, _ops -> flunk("live values must not be deleted") end
+             )
+  end
+
   test "attribute discovery propagates expired query-index deletion failures" do
     {raw_prefix, key} = discovery_query_key("blue")
     value = LMDB.encode_query_index_value("flow-1", 1, 1)

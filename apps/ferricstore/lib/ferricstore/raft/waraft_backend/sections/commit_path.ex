@@ -14,36 +14,43 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       alias Ferricstore.Raft.WARaftBackend.SyncGate
       require Ferricstore.LatencyTrace
 
-      defp submit_write_many_entry_after_pause({shard_index, command} = entry)
-           when valid_shard_index_shape(shard_index) do
+      defp with_sync_write_many(shard_commands, fun) when is_function(fun, 0) do
+        shard_indexes =
+          Enum.flat_map(shard_commands, fn
+            {shard_index, _command} when valid_shard_index_shape(shard_index) ->
+              [shard_index]
+
+            _invalid_entry ->
+              []
+          end)
+
         enter_result =
           Ferricstore.LatencyTrace.maybe_span "server_waraft_sync_gate_us" do
-            SyncGate.enter(shard_index)
+            SyncGate.enter_many(shard_indexes)
           end
 
         case enter_result do
-          {:ok, token} ->
+          {:ok, tokens} ->
             try do
-              case submit_write_many_entry(entry) do
-                {^shard_index, ^command, submission} ->
-                  {shard_index, command, submission, token}
-
-                other ->
-                  SyncGate.leave(token)
-                  other
-              end
-            catch
-              kind, reason ->
-                SyncGate.leave(token)
-                :erlang.raise(kind, reason, __STACKTRACE__)
+              fun.()
+            after
+              Enum.each(tokens, &SyncGate.leave/1)
             end
 
           {:error, _reason} = error ->
-            {shard_index, command, {:immediate, error}}
+            Enum.map(shard_commands, &write_many_gate_error(&1, error))
         end
       end
 
-      defp submit_write_many_entry_after_pause(entry), do: submit_write_many_entry(entry)
+      defp write_many_gate_error({shard_index, _command}, error)
+           when valid_shard_index_shape(shard_index),
+           do: error
+
+      defp write_many_gate_error(entry, _error) do
+        entry
+        |> submit_write_many_entry()
+        |> await_write_many_entry()
+      end
 
       defp submit_write_many_entry({shard_index, command}) do
         {shard_index, command, submit_commit_async(shard_index, command)}
@@ -53,14 +60,6 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
 
       defp await_write_many_entry({:invalid, entry}),
         do: {:error, {:invalid_write_many_entry, entry}}
-
-      defp await_write_many_entry({shard_index, command, submission, sync_token}) do
-        try do
-          await_write_many_entry({shard_index, command, submission})
-        after
-          SyncGate.leave(sync_token)
-        end
-      end
 
       defp await_write_many_entry({shard_index, command, submission}) do
         submission
@@ -776,12 +775,15 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       defp redirect_write_failure(_kind, {:erpc, :timeout}), do: {:error, :timeout}
 
       defp redirect_write_failure(_kind, {:erpc, :noconnection}),
-        do: {:error, :leader_unavailable}
+        do: {:error, :timeout}
 
       defp redirect_write_failure(_kind, _reason), do: {:error, :leader_unavailable}
 
       defp redirect_membership_failure(_kind, {:erpc, :timeout}),
         do: ErrorReasons.write_timeout_unknown()
+
+      defp redirect_membership_failure(_kind, {:erpc, :noconnection}),
+        do: {:error, :leader_unavailable}
 
       defp redirect_membership_failure(_kind, reason), do: redirect_write_failure(:exit, reason)
 

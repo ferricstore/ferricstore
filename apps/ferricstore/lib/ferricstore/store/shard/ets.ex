@@ -459,6 +459,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @doc false
   def delete_exact_entry(state, entry) do
     if Keydir.delete_exact(state.keydir, entry) do
+      delete_apply_projection_cache_entry(state, entry)
       maybe_run_after_exact_keydir_delete_hook(state, entry)
       Accounting.track_binary_delete_entry(state, entry)
       key = elem(entry, 0)
@@ -470,6 +471,24 @@ defmodule Ferricstore.Store.Shard.ETS do
       false
     end
   end
+
+  defp delete_apply_projection_cache_entry(
+         %{index: shard_index, instance_ctx: %{data_dir: data_dir}},
+         {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
+          _value_size}
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(key) and is_integer(index) and index > 0 do
+    Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(data_dir, shard_index, [
+      {index, key}
+    ])
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp delete_apply_projection_cache_entry(_state, _entry), do: :ok
 
   defp maybe_run_after_exact_keydir_delete_hook(state, entry) do
     case Process.get(:ferricstore_after_exact_keydir_delete_hook) do

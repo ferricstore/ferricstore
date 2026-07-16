@@ -63,11 +63,14 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
       assert {:error, {:compaction_failed, failures}} =
                GenServer.call(shard, {:run_compaction, [missing_file_id]})
 
-      assert [{^missing_file_id, {:copy_failed, _reason}}] = failures
+      assert [
+               {^missing_file_id, {:compaction_plan_failed, {:source_scan_failed, _reason}}}
+             ] = failures
+
       assert [{^key, nil, 0, 0, ^missing_file_id, 0, 16}] = :ets.lookup(keydir, key)
     end
 
-    test "copy failure reports temp cleanup failure", %{shard: shard} do
+    test "planning reports temp cleanup failure", %{shard: shard} do
       assert :ok = GenServer.call(shard, {:put, "copy_cleanup_key", "value_1", 0})
       assert :ok = GenServer.call(shard, :flush)
 
@@ -79,15 +82,15 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
 
       log =
         capture_log(fn ->
-          assert {:error, {:compaction_failed, [{0, {:copy_failed, _reason}}]}} =
+          assert {:error, {:compaction_failed, [{0, {:compaction_plan_failed, _reason}}]}} =
                    GenServer.call(shard, {:run_compaction, [0]})
         end)
 
-      assert log =~ "failed to remove compaction temp file"
+      assert log =~ "compaction planning failed"
       assert File.dir?(compact_tmp_dir)
     end
 
-    test "compaction returns stale hint cleanup failure", %{shard: shard} do
+    test "publication returns stale hint cleanup failure", %{shard: shard} do
       assert :ok = GenServer.call(shard, {:put, "hint_cleanup_key", "value_1", 0})
       assert :ok = GenServer.call(shard, :flush)
 
@@ -99,7 +102,9 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
 
       log =
         capture_log(fn ->
-          assert {:error, {:compaction_failed, [{0, {:hint_remove_failed, _reason}}]}} =
+          assert {:error,
+                  {:compaction_failed,
+                   [{0, :compaction_publication_failed, {^hint_dir, _reason}}]}} =
                    GenServer.call(shard, {:run_compaction, [0]})
         end)
 
