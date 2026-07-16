@@ -38,7 +38,10 @@ defmodule FerricStore.Impl do
 
   defp set_command_options(parsed) do
     []
-    |> maybe_add_set_option(parsed.has_expiry, {:pxat, parsed.expire_at_ms})
+    |> maybe_add_set_option(
+      parsed.has_expiry and not parsed.keepttl,
+      {:pxat, parsed.expire_at_ms}
+    )
     |> maybe_add_set_option(parsed.nx, :nx)
     |> maybe_add_set_option(parsed.xx, :xx)
     |> maybe_add_set_option(parsed.get, :get)

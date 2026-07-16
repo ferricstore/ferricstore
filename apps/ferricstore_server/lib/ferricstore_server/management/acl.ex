@@ -518,10 +518,10 @@ defmodule FerricstoreServer.Management.ACL do
   end
 
   defp catalog_replacement_mutations(current, desired) do
-    updates =
-      Enum.reduce(desired, [], fn {username, value}, acc ->
-        if Map.get(current, username) == value, do: acc, else: [{username, value} | acc]
-      end)
+    # Snapshot replacement is also an authentication invalidation boundary.
+    # Rewrite unchanged users so every loaded account receives a fresh catalog
+    # version and existing authenticated sessions cannot retain stale grants.
+    updates = Enum.map(desired, fn {username, value} -> {username, value} end)
 
     deletes =
       Enum.reduce(current, [], fn {username, _value}, acc ->

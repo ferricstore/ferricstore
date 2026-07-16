@@ -569,9 +569,9 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
                "Results sample: #{inspect(Enum.take(results, 5))}"
     end
 
-    test "after KEYDIR_FULL, deleting keys and rechecking allows new writes" do
+    test "after KEYDIR_FULL, restoring a valid budget allows new writes" do
       # Trigger KEYDIR_FULL
-      MemoryGuard.reconfigure(%{keydir_max_ram: 1})
+      assert :ok = MemoryGuard.reconfigure(%{keydir_max_ram: 1})
       MemoryGuard.force_check()
 
       ShardHelpers.eventually(
@@ -587,7 +587,7 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       assert {:error, _} = Router.put(FerricStore.Instance.get(:default), unique_key, "value", 0)
 
       # Restore generous budget
-      MemoryGuard.reconfigure(%{keydir_max_ram: 1_073_741_824})
+      assert :ok = MemoryGuard.reconfigure(%{keydir_max_ram: @default_keydir_max_ram})
       MemoryGuard.force_check()
 
       ShardHelpers.eventually(
