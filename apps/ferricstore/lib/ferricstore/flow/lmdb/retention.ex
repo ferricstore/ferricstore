@@ -14,14 +14,10 @@ defmodule Ferricstore.Flow.LMDB.Retention do
              IndexCodec.terminal_expire_prefix(),
              limit
            ),
-         {:ok, write_ops, counts, swept} <-
+         {:ok, write_ops, _counts, swept} <-
            terminal_sweep_write_plan(path, entries, now_ms) do
       case Access.write_batch(path, write_ops) do
         :ok ->
-          Enum.each(counts, fn {count_key, {count, _original_value}} ->
-            Ferricstore.Flow.LMDB.TerminalCounts.put_cached_count_key(path, count_key, count)
-          end)
-
           {:ok, swept}
 
         {:error, _reason} = error ->

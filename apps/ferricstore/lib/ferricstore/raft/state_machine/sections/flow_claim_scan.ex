@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
       alias Ferricstore.Commands.HyperLogLog
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
+      alias Ferricstore.Flow.DueCatalog
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Locator
@@ -344,9 +345,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
         if flow_due_any_index_enabled?() do
           Enum.map(partition_keys, &FlowKeys.due_any_key(type, priority, &1))
         else
-          Enum.flat_map(partition_keys, fn partition_key ->
-            flow_claim_due_matching_keys(state, type, :any, partition_key, priority)
-          end)
+          flow_claim_due_matching_keys(state, type, :any, partition_keys, priority)
         end
       end
 
@@ -361,9 +360,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
         if flow_due_any_index_enabled?() do
           Enum.map(partition_keys, &FlowKeys.due_any_key(type, priority, &1))
         else
-          Enum.flat_map(partition_keys, fn partition_key ->
-            flow_claim_due_matching_keys(state, type, state_filter, partition_key, priority)
-          end)
+          flow_claim_due_matching_keys(state, type, state_filter, partition_keys, priority)
         end
       end
 
@@ -418,68 +415,63 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
       end
 
       defp flow_claim_due_matching_keys(state, type, state_filter, partition_key, priority) do
-        state
-        |> flow_claim_index_count_keys()
-        |> Enum.filter(&flow_due_key_matches?(&1, type, state_filter, partition_key, priority))
-      end
+        catalog =
+          apply_state_get(
+            :flow_due_catalog,
+            Map.get(state, :flow_due_catalog, DueCatalog.new())
+          )
 
-      defp flow_due_key_matches?(key, type, state_filter, partition_key, priority)
-           when is_binary(key) do
-        String.starts_with?(key, "f:{f") and
-          flow_due_key_partition_match?(key, partition_key) and
-          flow_due_key_state_match?(key, type, state_filter) and
-          String.ends_with?(key, ":p" <> Integer.to_string(priority))
-      end
-
-      defp flow_due_key_matches?(_key, _type, _state_filter, _partition_key, _priority), do: false
-
-      defp flow_due_key_partition_match?(_key, :any), do: true
-
-      defp flow_due_key_partition_match?(key, :auto) do
-        String.starts_with?(key, "f:{fa:") and
-          (String.contains?(key, "}:d:") or String.contains?(key, "}:da:"))
-      end
-
-      defp flow_due_key_partition_match?(key, partition_keys) when is_list(partition_keys) do
-        Enum.any?(partition_keys, &flow_due_key_partition_match?(key, &1))
-      end
-
-      defp flow_due_key_partition_match?(key, partition_key) do
-        tag = FlowKeys.tag(partition_key)
-
-        String.starts_with?(key, "f:" <> tag <> ":d:") or
-          String.starts_with?(key, "f:" <> tag <> ":da:")
-      end
-
-      defp flow_due_key_state_match?(key, type, :any) do
-        encoded_type = FlowKeys.index_component(type)
-
-        if flow_due_any_index_enabled?() do
-          String.contains?(key, "}:da:" <> encoded_type <> ":p")
-        else
-          String.contains?(key, "}:d:" <> encoded_type <> ":")
+        case DueCatalog.start_selection(
+               catalog,
+               type,
+               priority,
+               partition_key,
+               state_filter
+             ) do
+          {:ok, selection} -> selection
+          {:error, _reason} -> []
         end
       end
 
-      defp flow_due_key_state_match?(key, type, {:exclude, state_filter, _exclude_states}) do
-        flow_due_key_state_match?(key, type, state_filter)
-      end
-
-      defp flow_due_key_state_match?(key, type, states) when is_list(states) do
-        Enum.any?(states, &flow_due_key_state_match?(key, type, &1))
-      end
-
-      defp flow_due_key_state_match?(key, type, state) when is_binary(state) do
-        String.contains?(
-          key,
-          "}:d:" <>
-            FlowKeys.index_component(type) <> ":" <> FlowKeys.index_component(state) <> ":p"
-        )
-      end
-
-      defp flow_due_key_state_match?(_key, _type, _state), do: false
-
       defp flow_claim_due_scan(
+             state,
+             due_key,
+             type,
+             expected_state,
+             worker,
+             lease_ms,
+             now_ms,
+             partition_key,
+             limit,
+             max_scan,
+             scanned,
+             claimed_count,
+             claimed
+           ) do
+        case flow_claim_due_scan_status(
+               state,
+               due_key,
+               type,
+               expected_state,
+               worker,
+               lease_ms,
+               now_ms,
+               partition_key,
+               limit,
+               max_scan,
+               scanned,
+               claimed_count,
+               claimed
+             ) do
+          {:error, _reason} = error ->
+            error
+
+          {next_claimed, next_count, _exhausted?, _scanned} ->
+            {next_claimed, next_count}
+        end
+      end
+
+      defp flow_claim_due_scan_status(
              _state,
              _due_key,
              _type,
@@ -490,15 +482,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              _partition_key,
              limit,
              _max_scan,
-             _scanned,
+             scanned,
              claimed_count,
              claimed
            )
            when claimed_count >= limit do
-        {claimed, claimed_count}
+        {claimed, claimed_count, false, scanned}
       end
 
-      defp flow_claim_due_scan(
+      defp flow_claim_due_scan_status(
              _state,
              _due_key,
              _type,
@@ -514,10 +506,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              claimed
            )
            when scanned >= max_scan do
-        {claimed, claimed_count}
+        {claimed, claimed_count, false, scanned}
       end
 
-      defp flow_claim_due_scan(
+      defp flow_claim_due_scan_status(
              state,
              due_key,
              type,
@@ -555,7 +547,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
           )
 
         if candidates == [] do
-          {claimed, claimed_count}
+          _ =
+            flow_after_due_catalog_mutation(
+              state,
+              [due_key],
+              flow_native_ops_queued?()
+            )
+
+          {claimed, claimed_count, true, scanned}
         else
           case flow_claim_candidate_batch(
                  state,
@@ -575,24 +574,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
               error
 
             {next_claimed_count, next_claimed} ->
-              if standalone_staged_apply?() or length(candidates) < batch_size do
-                {next_claimed, next_claimed_count}
-              else
-                flow_claim_due_scan(
-                  state,
-                  due_key,
-                  type,
-                  expected_state,
-                  worker,
-                  lease_ms,
-                  now_ms,
-                  partition_key,
-                  limit,
-                  max_scan,
-                  scanned + length(candidates),
-                  next_claimed_count,
-                  next_claimed
-                )
+              next_scanned = scanned + length(candidates)
+
+              cond do
+                next_claimed_count >= limit ->
+                  {next_claimed, next_claimed_count, false, next_scanned}
+
+                length(candidates) < batch_size ->
+                  {next_claimed, next_claimed_count, true, next_scanned}
+
+                standalone_staged_apply?() ->
+                  {next_claimed, next_claimed_count, false, next_scanned}
+
+                true ->
+                  flow_claim_due_scan_status(
+                    state,
+                    due_key,
+                    type,
+                    expected_state,
+                    worker,
+                    lease_ms,
+                    now_ms,
+                    partition_key,
+                    limit,
+                    max_scan,
+                    next_scanned,
+                    next_claimed_count,
+                    next_claimed
+                  )
               end
           end
         end

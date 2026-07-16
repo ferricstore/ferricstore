@@ -8,6 +8,7 @@ defmodule FerricstoreServer.Acl.Rules do
   @max_password_bytes Password.max_password_bytes()
   @max_patterns 4_096
   @max_pattern_bytes 4_096
+  @max_rule_tokens 16_384
 
   @type user :: map()
 
@@ -22,6 +23,10 @@ defmodule FerricstoreServer.Acl.Rules do
   @doc false
   @spec max_pattern_bytes() :: pos_integer()
   def max_pattern_bytes, do: @max_pattern_bytes
+
+  @doc false
+  @spec max_rule_tokens() :: pos_integer()
+  def max_rule_tokens, do: @max_rule_tokens
 
   @spec validate_username(term()) :: :ok | {:error, binary()}
   def validate_username(username) when is_binary(username) do
@@ -42,10 +47,14 @@ defmodule FerricstoreServer.Acl.Rules do
   @doc false
   @spec validate_rule_limits([term()]) :: :ok | {:error, binary()}
   def validate_rule_limits(rules) when is_list(rules) do
-    Enum.reduce_while(rules, {:ok, 0, 0}, &validate_rule_limit/2)
-    |> case do
-      {:ok, _key_count, _channel_count} -> :ok
-      {:error, _reason} = error -> error
+    if list_within_limit?(rules, @max_rule_tokens) do
+      Enum.reduce_while(rules, {:ok, 0, 0}, &validate_rule_limit/2)
+      |> case do
+        {:ok, _key_count, _channel_count} -> :ok
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, "ERR ACL rules contain more than #{@max_rule_tokens} rule tokens"}
     end
   end
 
@@ -134,6 +143,14 @@ defmodule FerricstoreServer.Acl.Rules do
     do: patterns_within_limit?(rest, remaining - 1)
 
   defp patterns_within_limit?(_invalid, _remaining), do: false
+
+  defp list_within_limit?([], _remaining), do: true
+  defp list_within_limit?([_item | _rest], 0), do: false
+
+  defp list_within_limit?([_item | rest], remaining) when remaining > 0,
+    do: list_within_limit?(rest, remaining - 1)
+
+  defp list_within_limit?(_invalid, _remaining), do: false
 
   defp apply_rules(user, [], pending_key_patterns),
     do: {:ok, flush_pending_key_patterns(user, pending_key_patterns)}

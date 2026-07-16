@@ -90,6 +90,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
                ]
       end
 
+      @tag :terminal_count_reconcile_startup
       test "startup rebuild recovers terminal LMDB mirror when writer dies before flush" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
         old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
@@ -190,7 +191,11 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
 
         assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
         assert {:ok, 1} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, completed_index_key)
-        assert {:ok, 0} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, failed_index_key)
+        assert :not_found = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, failed_index_key)
+
+        assert {:ok, [0]} =
+                 Ferricstore.Flow.LMDB.terminal_counts(lmdb_path, [failed_index_key])
+
         assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, root_prefix)
         assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, correlation_prefix)
 

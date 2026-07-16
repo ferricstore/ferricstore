@@ -1354,6 +1354,153 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           end
         end
 
+        @tag :flow_due_catalog_page
+        test "claim_due pages past 256 stale due indexes without hiding an eligible job", %{
+          state: state
+        } do
+          setup_flow_indexes(state)
+
+          type = "claim-due-catalog-page"
+          partition_key = "eligible-partition"
+          id = "eligible-flow"
+          state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+          {state, :ok} =
+            StateMachine.apply(
+              %{system_time: 1_000},
+              {:flow_create, state_key,
+               %{
+                 id: id,
+                 type: type,
+                 state: "waiting",
+                 partition_key: partition_key,
+                 now_ms: 1_000,
+                 run_at_ms: 1_000
+               }},
+              state
+            )
+
+          native =
+            Ferricstore.Flow.NativeOrderedIndex.get(
+              state.flow_index_name,
+              state.flow_lookup_name
+            )
+
+          stale_entries =
+            for number <- 0..255 do
+              stale_partition =
+                "stale-#{String.pad_leading(Integer.to_string(number), 3, "0")}"
+
+              {
+                Ferricstore.Flow.Keys.due_key(type, "waiting", 0, stale_partition),
+                "missing-flow-#{number}",
+                number
+              }
+            end
+
+          assert :ok =
+                   Ferricstore.Flow.NativeOrderedIndex.put_new_entries(native, stale_entries)
+
+          empty_due_key =
+            Ferricstore.Flow.Keys.due_key(type, "waiting", 0, "empty-stale-partition")
+
+          catalog =
+            Enum.reduce(stale_entries, state.flow_due_catalog, fn {due_key, _id, score},
+                                                                  catalog ->
+              Ferricstore.Flow.DueCatalog.put(catalog, due_key, score)
+            end)
+            |> Ferricstore.Flow.DueCatalog.put(empty_due_key, 0)
+
+          state = %{state | flow_due_catalog: catalog}
+
+          {claimed_state, {:ok, [claimed]}} =
+            StateMachine.apply(
+              %{system_time: 2_000},
+              {:flow_claim_due, nil,
+               %{
+                 type: type,
+                 state: :any,
+                 exclude_states: ["running"],
+                 worker: "catalog-page-worker",
+                 lease_ms: 30_000,
+                 limit: 1,
+                 priority: 0,
+                 partition_key: :any,
+                 now_ms: 2_000
+               }},
+              state
+            )
+
+          assert claimed.id == id
+          assert claimed.state == "running"
+
+          running_due_key =
+            Ferricstore.Flow.Keys.due_key(type, "running", 0, partition_key)
+
+          assert {:ok, %{keys: [^running_due_key]}} =
+                   Ferricstore.Flow.DueCatalog.select(
+                     claimed_state.flow_due_catalog,
+                     type,
+                     0,
+                     :any,
+                     :any,
+                     2
+                   )
+
+          assert {:ok, %{keys: []}} =
+                   Ferricstore.Flow.DueCatalog.select(
+                     claimed_state.flow_due_catalog,
+                     type,
+                     0,
+                     :any,
+                     "waiting",
+                     1
+                   )
+
+          orphan_type = "claim-due-empty-catalog-repair"
+
+          orphan_due_key =
+            Ferricstore.Flow.Keys.due_key(orphan_type, "waiting", 0, "orphan-partition")
+
+          orphan_state = %{
+            claimed_state
+            | flow_due_catalog:
+                Ferricstore.Flow.DueCatalog.put(
+                  claimed_state.flow_due_catalog,
+                  orphan_due_key,
+                  0
+                )
+          }
+
+          {repaired_state, {:ok, []}} =
+            StateMachine.apply(
+              %{system_time: 3_000},
+              {:flow_claim_due, nil,
+               %{
+                 type: orphan_type,
+                 state: :any,
+                 exclude_states: [],
+                 worker: "catalog-repair-worker",
+                 lease_ms: 30_000,
+                 limit: 1,
+                 priority: 0,
+                 partition_key: :any,
+                 now_ms: 3_000
+               }},
+              orphan_state
+            )
+
+          assert {:ok, %{keys: []}} =
+                   Ferricstore.Flow.DueCatalog.select(
+                     repaired_state.flow_due_catalog,
+                     orphan_type,
+                     0,
+                     :any,
+                     :any,
+                     1
+                   )
+        end
+
         test "claim_due stages claimed state records into one append batch", %{
           state: state,
           shard_index: shard_index

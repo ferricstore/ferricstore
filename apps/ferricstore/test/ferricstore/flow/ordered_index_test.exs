@@ -95,6 +95,90 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
 
     assert source =~
              ~r/#\[rustler::nif\(schedule = "DirtyCpu"\)\]\s+pub fn flow_index_range_slice\b/
+
+    assert source =~
+             ~r/#\[rustler::nif\(schedule = "DirtyCpu"\)\]\s+pub fn flow_index_range_after_slice\b/
+  end
+
+  test "all range requests page forward and reverse across tied scores after an offset" do
+    native = NativeOrderedIndex.new()
+
+    entries =
+      for number <- 1..4_100 do
+        member = "flow-#{String.pad_leading(Integer.to_string(number), 5, "0")}"
+        {"state:paged", member, 10}
+      end
+
+    assert :ok = NativeOrderedIndex.put_entries(native, entries)
+
+    forward =
+      NativeOrderedIndex.range_slice(
+        native,
+        "state:paged",
+        :neg_inf,
+        :inf,
+        false,
+        3,
+        :all
+      )
+
+    reverse =
+      NativeOrderedIndex.range_slice(
+        native,
+        "state:paged",
+        :neg_inf,
+        :inf,
+        true,
+        3,
+        :all
+      )
+
+    assert length(forward) == 4_097
+    assert List.first(forward) == {"flow-00004", 10.0}
+    assert List.last(forward) == {"flow-04100", 10.0}
+    assert length(reverse) == 4_097
+    assert List.first(reverse) == {"flow-04097", 10.0}
+    assert List.last(reverse) == {"flow-00001", 10.0}
+
+    assert [] =
+             Ferricstore.Bitcask.NIF.flow_index_range_slice(
+               native,
+               "state:paged",
+               0,
+               0.0,
+               0,
+               0.0,
+               false,
+               0,
+               0
+             )
+
+    assert 4_096 =
+             native
+             |> Ferricstore.Bitcask.NIF.flow_index_range_slice(
+               "state:paged",
+               0,
+               0.0,
+               0,
+               0.0,
+               false,
+               0,
+               4_096
+             )
+             |> length()
+
+    assert {:error, _reason} =
+             Ferricstore.Bitcask.NIF.flow_index_range_slice(
+               native,
+               "state:paged",
+               0,
+               0.0,
+               0,
+               0.0,
+               false,
+               0,
+               4_097
+             )
   end
 
   test "normal scheduler index NIFs never wait on the shared index lock" do
@@ -128,8 +212,8 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
           flow_index_claim_due_candidates
           flow_index_due_keys_present
           flow_index_count_many
-          flow_index_count_keys
-          flow_index_due_count_keys
+          flow_index_count_keys_page
+          flow_index_due_count_keys_page
           flow_index_apply_claim_entries
           flow_index_rollback_claim_entries
         ) do
@@ -166,6 +250,22 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert_receive {:retry_sleep, 8}
     assert_receive {:retry_sleep, 8}
     refute_receive {:retry_sleep, _delay_ms}
+  end
+
+  test "every native page fetch uses the capped busy retry contract" do
+    source =
+      File.read!(Path.expand("../../../lib/ferricstore/flow/native_ordered_index.ex", __DIR__))
+
+    for function <- ~w(
+          flow_index_count_keys_page
+          flow_index_due_count_keys_page
+          flow_index_range_slice
+          flow_index_range_cursor_slice
+          flow_index_range_after_slice
+        ) do
+      assert source =~
+               Regex.compile!("retry_busy\\(fn ->\\s+NIF\\.#{function}\\(")
+    end
   end
 
   test "bulk put entries are parsed once before lock retries" do
@@ -559,10 +659,10 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert :ok = OrderedIndex.delete_members(index, lookup, "worker:empty", ["flow-1"])
 
     assert 0 = OrderedIndex.count_all(lookup, "worker:empty")
-    assert [] = OrderedIndex.count_keys(lookup)
+    assert [] = OrderedIndex.count_keys_page(lookup, nil, 4_096)
   end
 
-  test "due_count_keys returns only positive due keys", %{
+  test "due count key pages return only positive due keys", %{
     index: index,
     lookup: lookup
   } do
@@ -574,16 +674,83 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert :ok = OrderedIndex.put_members(index, lookup, due_b, [{"flow-2", 2}])
     assert :ok = OrderedIndex.put_members(index, lookup, non_due, [{"flow-3", 3}])
 
-    assert MapSet.new([due_a, due_b, non_due]) == MapSet.new(OrderedIndex.count_keys(lookup))
+    assert MapSet.new([due_a, due_b, non_due]) ==
+             MapSet.new(OrderedIndex.count_keys_page(lookup, nil, 4_096))
 
-    assert MapSet.new([due_a, due_b]) == MapSet.new(OrderedIndex.due_count_keys(lookup))
+    assert MapSet.new([due_a, due_b]) ==
+             MapSet.new(OrderedIndex.due_count_keys_page(lookup, nil, 4_096))
 
     assert :ok = OrderedIndex.delete_members(index, lookup, due_a, ["flow-1"])
 
-    assert [due_b] == OrderedIndex.due_count_keys(lookup)
+    assert [due_b] == OrderedIndex.due_count_keys_page(lookup, nil, 4_096)
   end
 
-  test "due_count_keys filters positive native counts", %{
+  test "count key cursor pages are ordered and resume after the last key" do
+    native = NativeOrderedIndex.new()
+    due_a = "f:{flow:a}:d:email:queued:p0"
+    due_b = "f:{flow:b}:d:email:queued:p0"
+
+    assert :ok = NativeOrderedIndex.restore_count(native, "plain:b", 1)
+    assert :ok = NativeOrderedIndex.restore_count(native, due_b, 1)
+    assert :ok = NativeOrderedIndex.restore_count(native, "plain:a", 1)
+    assert :ok = NativeOrderedIndex.restore_count(native, due_a, 1)
+
+    assert [^due_a, ^due_b] = NativeOrderedIndex.count_keys_page(native, nil, 2)
+    assert ["plain:a", "plain:b"] = NativeOrderedIndex.count_keys_page(native, due_b, 2)
+    assert [^due_a] = NativeOrderedIndex.due_count_keys_page(native, nil, 1)
+    assert [^due_b] = NativeOrderedIndex.due_count_keys_page(native, due_a, 1)
+
+    assert [] = Ferricstore.Bitcask.NIF.flow_index_count_keys_page(native, nil, 0)
+    assert 4 = length(Ferricstore.Bitcask.NIF.flow_index_count_keys_page(native, nil, 4_096))
+
+    assert {:error, _reason} =
+             Ferricstore.Bitcask.NIF.flow_index_count_keys_page(native, nil, 4_097)
+
+    native_source =
+      File.read!(Path.expand("../../../native/ferricstore_bitcask/src/flow_index.rs", __DIR__))
+
+    facade_source =
+      File.read!(Path.expand("../../../lib/ferricstore/flow/native_ordered_index.ex", __DIR__))
+
+    ordered_source =
+      File.read!(Path.expand("../../../lib/ferricstore/flow/ordered_index.ex", __DIR__))
+
+    refute native_source =~ "pub fn flow_index_count_keys<'a>"
+    refute native_source =~ "pub fn flow_index_due_count_keys<'a>"
+    refute facade_source =~ ~r/^\s*def count_keys\(/m
+    refute facade_source =~ ~r/^\s*def due_count_keys\(/m
+    refute ordered_source =~ ~r/^\s*def count_keys\(/m
+    refute ordered_source =~ ~r/^\s*def due_count_keys\(/m
+  end
+
+  test "due count key reducer consumes and discards bounded pages" do
+    native = NativeOrderedIndex.new()
+
+    entries =
+      for number <- 1..4_097 do
+        key = "f:{flow:#{String.pad_leading(Integer.to_string(number), 5, "0")}}:d:t:q:p0"
+        {key, "flow", 1}
+      end
+
+    assert :ok = NativeOrderedIndex.put_entries(native, entries)
+
+    assert {[4_096, 1], 4_097} =
+             NativeOrderedIndex.reduce_due_count_key_pages(
+               native,
+               {[], 0},
+               fn page, {sizes, total} ->
+                 {:cont, {[length(page) | sizes], total + length(page)}}
+               end
+             )
+             |> then(fn {sizes, total} -> {Enum.reverse(sizes), total} end)
+
+    assert {:stopped, 4_096} =
+             NativeOrderedIndex.reduce_due_count_key_pages(native, :initial, fn page, :initial ->
+               {:halt, {:stopped, length(page)}}
+             end)
+  end
+
+  test "due count key pages filter positive native counts", %{
     index: index,
     lookup: lookup
   } do
@@ -594,7 +761,7 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert :ok = NativeOrderedIndex.restore_count(native, due_key, 2)
     assert :ok = NativeOrderedIndex.restore_count(native, non_due_key, 2)
 
-    assert [due_key] == OrderedIndex.due_count_keys(lookup)
+    assert [due_key] == OrderedIndex.due_count_keys_page(lookup, nil, 4_096)
   end
 
   test "move_entries moves members across keys and keeps counters consistent", %{
@@ -713,7 +880,7 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert [{<<"flow-1">>, 1.0}] =
              NativeOrderedIndex.range_slice(native, due_key, :neg_inf, :inf, false, 0, 10)
 
-    assert [due_key] == NativeOrderedIndex.due_count_keys(native)
+    assert [due_key] == NativeOrderedIndex.due_count_keys_page(native, nil, 4_096)
   end
 
   test "native claim entries mutate and rollback due index" do
@@ -860,9 +1027,21 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
   end
 
   defp assert_index_invariants(index, lookup) do
-    Enum.each(OrderedIndex.count_keys(lookup), fn key ->
+    Enum.each(collect_count_key_pages(lookup, nil, []), fn key ->
       members = OrderedIndex.range_slice(index, key, :neg_inf, :inf, false, 0, :all)
       assert length(members) == OrderedIndex.count_all(lookup, key)
     end)
+  end
+
+  defp collect_count_key_pages(lookup, cursor, pages) do
+    case OrderedIndex.count_keys_page(lookup, cursor, 4_096) do
+      [] ->
+        pages
+        |> Enum.reverse()
+        |> :lists.append()
+
+      keys ->
+        collect_count_key_pages(lookup, List.last(keys), [keys | pages])
+    end
   end
 end

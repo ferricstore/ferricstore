@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       alias Ferricstore.Commands.HyperLogLog
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
+      alias Ferricstore.Flow.DueCatalog
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Locator
@@ -275,6 +276,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
                                     :flow_due_any_index,
                                     false
                                   )
+      @flow_due_catalog_page_size 256
+      @flow_due_catalog_min_key_budget 512
+      @flow_due_catalog_max_key_budget 4_096
+      @flow_due_catalog_max_candidate_budget 16_384
       @flow_hibernation_recent_scan_pages 16
       @flow_hibernation_recent_scan_entries 128
       @flow_hibernation_backfill_scan_pages 64
@@ -1000,7 +1005,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
 
           native ->
             entries = flow_hot_cold_index_entries(record)
-            NativeFlowIndex.apply_batch(native, [{:put_entries, entries}])
+
+            with :ok <- NativeFlowIndex.apply_batch(native, [{:put_entries, entries}]) do
+              flow_after_due_catalog_mutation(
+                state,
+                Enum.map(entries, fn {key, _member, _score} -> key end),
+                false
+              )
+            end
         end
       end
 
@@ -1036,6 +1048,269 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
 
           _ ->
             entries
+        end
+      end
+
+      defp flow_claim_due_scan_keys(
+             state,
+             %DueCatalog.Selection{} = selection,
+             type,
+             state_filter,
+             worker,
+             lease_ms,
+             now_ms,
+             partition_key,
+             limit,
+             claimed
+           ) do
+        remaining = max(limit - length(claimed), 0)
+
+        max_key_scan =
+          remaining
+          |> max(@flow_due_catalog_min_key_budget)
+          |> min(@flow_due_catalog_max_key_budget)
+
+        max_candidate_scan =
+          remaining
+          |> Kernel.*(16)
+          |> max(remaining + @flow_due_catalog_min_key_budget)
+          |> min(@flow_due_catalog_max_candidate_budget)
+
+        flow_claim_due_scan_catalog_pages(
+          state,
+          selection,
+          type,
+          state_filter,
+          worker,
+          lease_ms,
+          now_ms,
+          partition_key,
+          limit,
+          claimed,
+          0,
+          max_key_scan,
+          0,
+          max_candidate_scan
+        )
+      end
+
+      defp flow_claim_due_scan_catalog_pages(
+             state,
+             selection,
+             type,
+             state_filter,
+             worker,
+             lease_ms,
+             now_ms,
+             partition_key,
+             limit,
+             claimed,
+             scanned_keys,
+             max_key_scan,
+             scanned_candidates,
+             max_candidate_scan
+           ) do
+        page_size =
+          min(
+            @flow_due_catalog_page_size,
+            max(max_key_scan - scanned_keys, 0)
+          )
+
+        if page_size == 0 or scanned_candidates >= max_candidate_scan do
+          claimed
+        else
+          flow_claim_due_scan_catalog_page(
+            state,
+            selection,
+            type,
+            state_filter,
+            worker,
+            lease_ms,
+            now_ms,
+            partition_key,
+            limit,
+            claimed,
+            scanned_keys,
+            max_key_scan,
+            scanned_candidates,
+            max_candidate_scan,
+            page_size
+          )
+        end
+      end
+
+      defp flow_claim_due_scan_catalog_page(
+             state,
+             selection,
+             type,
+             state_filter,
+             worker,
+             lease_ms,
+             now_ms,
+             partition_key,
+             limit,
+             claimed,
+             scanned_keys,
+             max_key_scan,
+             scanned_candidates,
+             max_candidate_scan,
+             page_size
+           ) do
+        case DueCatalog.take_due_page(selection, now_ms, page_size) do
+          {:error, _reason} = error ->
+            error
+
+          {:ok, %{keys: [], done?: true}} ->
+            claimed
+
+          {:ok, %{keys: due_keys} = page} ->
+            case flow_claim_due_scan_catalog_page_keys(
+                   state,
+                   due_keys,
+                   type,
+                   state_filter,
+                   worker,
+                   lease_ms,
+                   now_ms,
+                   partition_key,
+                   limit,
+                   claimed,
+                   scanned_keys,
+                   max_key_scan,
+                   scanned_candidates,
+                   max_candidate_scan
+                 ) do
+              {:error, _reason} = error ->
+                error
+
+              {next_claimed, page_exhausted?, next_scanned_keys, next_scanned_candidates} ->
+                cond do
+                  length(next_claimed) >= limit ->
+                    next_claimed
+
+                  not page_exhausted? ->
+                    next_claimed
+
+                  page.done? ->
+                    next_claimed
+
+                  true ->
+                    flow_claim_due_scan_catalog_pages(
+                      state,
+                      page.continuation,
+                      type,
+                      state_filter,
+                      worker,
+                      lease_ms,
+                      now_ms,
+                      partition_key,
+                      limit,
+                      next_claimed,
+                      next_scanned_keys,
+                      max_key_scan,
+                      next_scanned_candidates,
+                      max_candidate_scan
+                    )
+                end
+            end
+        end
+      end
+
+      defp flow_claim_due_scan_catalog_page_keys(
+             _state,
+             [],
+             _type,
+             _state_filter,
+             _worker,
+             _lease_ms,
+             _now_ms,
+             _partition_key,
+             _limit,
+             claimed,
+             scanned_keys,
+             _max_key_scan,
+             scanned_candidates,
+             _max_candidate_scan
+           ),
+           do: {claimed, true, scanned_keys, scanned_candidates}
+
+      defp flow_claim_due_scan_catalog_page_keys(
+             state,
+             [due_key | rest],
+             type,
+             state_filter,
+             worker,
+             lease_ms,
+             now_ms,
+             partition_key,
+             limit,
+             claimed,
+             scanned_keys,
+             max_key_scan,
+             scanned_candidates,
+             max_candidate_scan
+           ) do
+        if scanned_keys >= max_key_scan or scanned_candidates >= max_candidate_scan do
+          {claimed, false, scanned_keys, scanned_candidates}
+        else
+          claimed_count = length(claimed)
+
+          case flow_claim_due_scan_status(
+                 state,
+                 due_key,
+                 type,
+                 state_filter,
+                 worker,
+                 lease_ms,
+                 now_ms,
+                 partition_key,
+                 limit,
+                 max_candidate_scan,
+                 scanned_candidates,
+                 claimed_count,
+                 claimed
+               ) do
+            {:error, _reason} = error ->
+              error
+
+            {next_claimed, next_count, exhausted?, next_scanned_candidates} ->
+              next_scanned_keys = scanned_keys + 1
+
+              if exhausted? and next_scanned_candidates == scanned_candidates do
+                _ =
+                  flow_after_due_catalog_mutation(
+                    state,
+                    [due_key],
+                    flow_native_ops_queued?()
+                  )
+              end
+
+              cond do
+                next_count >= limit ->
+                  {next_claimed, false, next_scanned_keys, next_scanned_candidates}
+
+                not exhausted? ->
+                  {next_claimed, false, next_scanned_keys, next_scanned_candidates}
+
+                true ->
+                  flow_claim_due_scan_catalog_page_keys(
+                    state,
+                    rest,
+                    type,
+                    state_filter,
+                    worker,
+                    lease_ms,
+                    now_ms,
+                    partition_key,
+                    limit,
+                    next_claimed,
+                    next_scanned_keys,
+                    max_key_scan,
+                    next_scanned_candidates,
+                    max_candidate_scan
+                  )
+              end
+          end
         end
       end
 

@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   @registry_key {__MODULE__, :resource}
   @busy_retry_initial_ms 1
   @busy_retry_max_ms 8
+  @native_page_size 4_096
 
   @type resource :: reference()
   @type score_input :: binary() | integer() | float()
@@ -144,24 +145,25 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         offset,
         count
       )
-      when is_binary(cursor_member) do
-    {min_kind, min_score} = encode_min_bound(min_bound)
-    {max_kind, max_score} = encode_max_bound({:inclusive, cursor_score})
-    count_arg = if count == :all, do: -1, else: count
-
+      when is_binary(cursor_member) and
+             (count == :all or (is_integer(count) and count >= 0)) do
     case parse_score(cursor_score) do
       {:ok, parsed_cursor_score} ->
-        NIF.flow_index_range_cursor_slice(
+        {min_kind, min_score} = encode_min_bound(min_bound)
+        {max_kind, max_score} = encode_max_bound({:inclusive, parsed_cursor_score})
+
+        collect_range_pages(
           resource,
           key,
           min_kind,
           min_score,
           max_kind,
           max_score,
-          parsed_cursor_score,
-          cursor_member,
+          true,
           offset,
-          count_arg
+          count,
+          {parsed_cursor_score, cursor_member},
+          []
         )
 
       :error ->
@@ -169,12 +171,12 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
     end
   end
 
-  def range_slice(resource, key, min_bound, max_bound, reverse?, offset, count) do
+  def range_slice(resource, key, min_bound, max_bound, reverse?, offset, count)
+      when count == :all or (is_integer(count) and count >= 0) do
     {min_kind, min_score} = encode_min_bound(min_bound)
     {max_kind, max_score} = encode_max_bound(max_bound)
-    count_arg = if count == :all, do: -1, else: count
 
-    NIF.flow_index_range_slice(
+    collect_range_pages(
       resource,
       key,
       min_kind,
@@ -183,7 +185,9 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
       max_score,
       reverse?,
       offset,
-      count_arg
+      count,
+      nil,
+      []
     )
   end
 
@@ -223,11 +227,28 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
     |> Enum.map(&max(&1, 0))
   end
 
-  @spec count_keys(resource()) :: [binary()]
-  def count_keys(resource), do: NIF.flow_index_count_keys(resource)
+  @spec reduce_due_count_key_pages(
+          resource(),
+          term(),
+          ([binary()], term() -> {:cont, term()} | {:halt, term()})
+        ) :: term()
+  def reduce_due_count_key_pages(resource, acc, reducer) when is_function(reducer, 2) do
+    reduce_count_key_pages(resource, true, nil, acc, reducer)
+  end
 
-  @spec due_count_keys(resource()) :: [binary()]
-  def due_count_keys(resource), do: NIF.flow_index_due_count_keys(resource)
+  @spec count_keys_page(resource(), binary() | nil, pos_integer()) :: [binary()]
+  def count_keys_page(resource, cursor, limit)
+      when (is_nil(cursor) or is_binary(cursor)) and is_integer(limit) and limit > 0 and
+             limit <= @native_page_size do
+    retry_busy(fn -> NIF.flow_index_count_keys_page(resource, cursor, limit) end)
+  end
+
+  @spec due_count_keys_page(resource(), binary() | nil, pos_integer()) :: [binary()]
+  def due_count_keys_page(resource, cursor, limit)
+      when (is_nil(cursor) or is_binary(cursor)) and is_integer(limit) and limit > 0 and
+             limit <= @native_page_size do
+    retry_busy(fn -> NIF.flow_index_due_count_keys_page(resource, cursor, limit) end)
+  end
 
   @spec earliest_due_score(resource(), [binary()], [binary()], [binary()]) ::
           float() | nil | {:error, term()}
@@ -274,7 +295,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
       parse_reversed_entry_groups(put_entries),
       parse_reversed_entry_groups(put_new_entries),
       parse_reversed_move_groups(move_entries),
-      Enum.reverse(delete_entries),
+      parse_reversed_delete_groups(delete_entries),
       prepend_reversed_groups(claim_entries)
     )
   end
@@ -452,6 +473,155 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
     end
   end
 
+  defp reduce_count_key_pages(resource, due_only, cursor, acc, reducer) do
+    page =
+      if due_only do
+        due_count_keys_page(resource, cursor, @native_page_size)
+      else
+        count_keys_page(resource, cursor, @native_page_size)
+      end
+
+    case page do
+      [] ->
+        acc
+
+      keys when is_list(keys) ->
+        case reducer.(keys, acc) do
+          {:cont, next_acc} ->
+            reduce_count_key_pages(resource, due_only, List.last(keys), next_acc, reducer)
+
+          {:halt, result} ->
+            result
+
+          invalid ->
+            raise ArgumentError,
+                  "invalid native Flow count-key page reducer result: #{inspect(invalid)}"
+        end
+    end
+  end
+
+  defp collect_range_pages(
+         resource,
+         key,
+         min_kind,
+         min_score,
+         max_kind,
+         max_score,
+         reverse?,
+         offset,
+         remaining,
+         cursor,
+         pages
+       ) do
+    page_limit =
+      if remaining == :all, do: @native_page_size, else: min(remaining, @native_page_size)
+
+    page =
+      case {reverse?, cursor} do
+        {_reverse?, nil} ->
+          retry_busy(fn ->
+            NIF.flow_index_range_slice(
+              resource,
+              key,
+              min_kind,
+              min_score,
+              max_kind,
+              max_score,
+              reverse?,
+              offset,
+              page_limit
+            )
+          end)
+
+        {true, {cursor_score, cursor_member}} ->
+          retry_busy(fn ->
+            NIF.flow_index_range_cursor_slice(
+              resource,
+              key,
+              min_kind,
+              min_score,
+              max_kind,
+              max_score,
+              cursor_score,
+              cursor_member,
+              offset,
+              page_limit
+            )
+          end)
+
+        {false, {cursor_score, cursor_member}} ->
+          retry_busy(fn ->
+            NIF.flow_index_range_after_slice(
+              resource,
+              key,
+              min_kind,
+              min_score,
+              max_kind,
+              max_score,
+              cursor_score,
+              cursor_member,
+              offset,
+              page_limit
+            )
+          end)
+      end
+
+    append_range_page_or_continue(
+      page,
+      page_limit,
+      resource,
+      key,
+      min_kind,
+      min_score,
+      max_kind,
+      max_score,
+      reverse?,
+      remaining,
+      pages
+    )
+  end
+
+  defp append_range_page_or_continue(
+         page,
+         page_limit,
+         resource,
+         key,
+         min_kind,
+         min_score,
+         max_kind,
+         max_score,
+         reverse?,
+         remaining,
+         pages
+       )
+       when is_list(page) do
+    page_count = length(page)
+    pages = if page == [], do: pages, else: [page | pages]
+    next_remaining = if remaining == :all, do: :all, else: remaining - page_count
+
+    if page_count < page_limit or next_remaining == 0 do
+      pages
+      |> Enum.reverse()
+      |> :lists.append()
+    else
+      {cursor_member, cursor_score} = List.last(page)
+
+      collect_range_pages(
+        resource,
+        key,
+        min_kind,
+        min_score,
+        max_kind,
+        max_score,
+        reverse?,
+        0,
+        next_remaining,
+        {cursor_score, cursor_member},
+        pages
+      )
+    end
+  end
+
   defp parse_member_score_pairs(key, member_score_pairs)
        when is_binary(key) and is_list(member_score_pairs) do
     Enum.map(member_score_pairs, fn
@@ -519,6 +689,25 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
       | prepend_parsed_move_entries(rest, acc)
     ]
   end
+
+  defp parse_reversed_delete_groups(groups) do
+    Enum.reduce(groups, [], fn
+      {key, members}, acc when is_binary(key) and is_list(members) ->
+        prepend_delete_members(key, members, acc)
+
+      invalid, _acc ->
+        raise ArgumentError, "invalid native Flow index delete: #{inspect(invalid)}"
+    end)
+  end
+
+  defp prepend_delete_members(_key, [], acc), do: acc
+
+  defp prepend_delete_members(key, [member | rest], acc)
+       when is_binary(key) and is_binary(member),
+       do: [{key, member} | prepend_delete_members(key, rest, acc)]
+
+  defp prepend_delete_members(_key, [invalid | _rest], _acc),
+    do: raise(ArgumentError, "invalid native Flow index member: #{inspect(invalid)}")
 
   defp prepend_reversed_groups(groups) do
     Enum.reduce(groups, [], &prepend_group_entries/2)

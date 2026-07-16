@@ -2,82 +2,206 @@ defmodule FerricstoreServer.Acl.FileParser do
   @moduledoc false
 
   alias FerricstoreServer.Acl.CommandCategories
+  alias FerricstoreServer.Acl.Limits
   alias FerricstoreServer.Acl.Password
   alias FerricstoreServer.Acl.Rules
 
-  @max_line_length 1_048_576
+  @default_max_line_bytes Limits.max_file_line_bytes()
+  @max_file_size 50_000_000
+  @default_max_users Limits.default_max_users()
+  @default_max_lines Limits.max_file_lines(@default_max_users)
+  @default_max_rule_tokens Rules.max_rule_tokens()
   @type user :: map()
 
   @spec parse(binary()) :: {:ok, [{binary(), user()}]} | {:error, binary()}
-  def parse(contents) when is_binary(contents) do
-    if String.valid?(contents) do
-      parse_utf8(contents)
+  def parse(contents), do: parse(contents, [])
+
+  @doc false
+  @spec parse(binary(), keyword()) :: {:ok, [{binary(), user()}]} | {:error, binary()}
+  def parse(contents, opts) when is_binary(contents) and is_list(opts) do
+    with true <- Keyword.keyword?(opts),
+         {:ok, max_file_bytes} <-
+           parse_limit(Keyword.get(opts, :max_file_bytes, @max_file_size)),
+         {:ok, max_users} <-
+           parse_limit(Keyword.get(opts, :max_users, @default_max_users)),
+         {:ok, max_line_bytes} <-
+           parse_limit(Keyword.get(opts, :max_line_bytes, @default_max_line_bytes)),
+         {:ok, max_lines} <-
+           parse_limit(Keyword.get(opts, :max_lines, @default_max_lines)),
+         {:ok, max_rule_tokens} <-
+           parse_limit(Keyword.get(opts, :max_rule_tokens, @default_max_rule_tokens)) do
+      cond do
+        byte_size(contents) > max_file_bytes ->
+          {:error, "ERR ACL file too large (#{byte_size(contents)} bytes, max #{max_file_bytes})"}
+
+        String.valid?(contents) ->
+          parse_utf8(contents, max_users, max_line_bytes, max_lines, max_rule_tokens)
+
+        true ->
+          {:error, "ERR Invalid ACL file: contents must be valid UTF-8"}
+      end
     else
-      {:error, "ERR Invalid ACL file: contents must be valid UTF-8"}
+      _invalid -> {:error, "ERR Invalid ACL parser limits"}
     end
   end
 
-  def parse(_contents), do: {:error, "ERR Invalid ACL file contents"}
+  def parse(_contents, _opts), do: {:error, "ERR Invalid ACL file contents"}
 
-  defp parse_utf8(contents) do
+  defp parse_utf8(contents, max_users, max_line_bytes, max_lines, max_rule_tokens) do
     contents = strip_bom(contents)
 
-    lines =
-      contents
-      |> String.split(~r/\r?\n/)
-      |> Enum.with_index(1)
+    parse_lines(
+      contents,
+      1,
+      %{},
+      max_users,
+      max_line_bytes,
+      max_lines,
+      max_rule_tokens
+    )
+  end
 
-    result =
-      Enum.reduce_while(lines, {:ok, %{}}, fn {line, line_num}, {:ok, acc} ->
-        line = String.trim_trailing(line)
+  defp parse_lines(
+         "",
+         _line_num,
+         users,
+         _max_users,
+         _max_line_bytes,
+         _max_lines,
+         _max_rule_tokens
+       ),
+       do: {:ok, Enum.to_list(users)}
 
-        cond do
-          line == "" ->
-            {:cont, {:ok, acc}}
+  defp parse_lines(
+         _contents,
+         line_num,
+         _users,
+         _max_users,
+         _max_line_bytes,
+         max_lines,
+         _max_rule_tokens
+       )
+       when line_num > max_lines do
+    {:error, "ERR Invalid ACL line #{line_num}: maximum line count exceeded (#{max_lines})"}
+  end
 
-          String.starts_with?(line, "#") ->
-            {:cont, {:ok, acc}}
+  defp parse_lines(
+         contents,
+         line_num,
+         users,
+         max_users,
+         max_line_bytes,
+         max_lines,
+         max_rule_tokens
+       ) do
+    case :binary.match(contents, "\n") do
+      {newline_at, 1} ->
+        line = binary_part(contents, 0, newline_at)
+        rest_at = newline_at + 1
+        rest = binary_part(contents, rest_at, byte_size(contents) - rest_at)
 
-          byte_size(line) > @max_line_length ->
-            {:halt, {:error, "ERR Invalid ACL line #{line_num}: line exceeds maximum length"}}
-
-          true ->
-            case parse_acl_line(line, line_num) do
-              {:ok, {username, user_map}} ->
-                if Map.has_key?(acc, username) do
-                  {:halt,
-                   {:error, "ERR Invalid ACL line #{line_num}: duplicate user '#{username}'"}}
-                else
-                  {:cont, {:ok, Map.put(acc, username, user_map)}}
-                end
-
-              {:error, _} = err ->
-                {:halt, err}
-            end
+        with {:ok, users} <-
+               parse_line(
+                 line,
+                 line_num,
+                 users,
+                 max_users,
+                 max_line_bytes,
+                 max_rule_tokens
+               ) do
+          parse_lines(
+            rest,
+            line_num + 1,
+            users,
+            max_users,
+            max_line_bytes,
+            max_lines,
+            max_rule_tokens
+          )
         end
-      end)
 
-    case result do
-      {:ok, users_map} -> {:ok, Enum.to_list(users_map)}
-      {:error, _} = err -> err
+      :nomatch ->
+        case parse_line(
+               contents,
+               line_num,
+               users,
+               max_users,
+               max_line_bytes,
+               max_rule_tokens
+             ) do
+          {:ok, users} -> {:ok, Enum.to_list(users)}
+          {:error, _reason} = error -> error
+        end
     end
   end
 
-  defp parse_acl_line(line, line_num) do
-    tokens = String.split(line, ~r/\s+/, trim: true)
+  defp parse_line(line, line_num, users, max_users, max_line_bytes, max_rule_tokens) do
+    cond do
+      byte_size(line) > max_line_bytes ->
+        {:error, "ERR Invalid ACL line #{line_num}: line exceeds maximum length"}
 
-    case tokens do
-      ["user", username | rule_tokens] ->
-        parse_acl_user(username, rule_tokens, line_num)
+      true ->
+        parse_trimmed_line(
+          String.trim_trailing(line),
+          line_num,
+          users,
+          max_users,
+          max_rule_tokens
+        )
+    end
+  end
 
-      ["user64", "b" <> encoded_username | rule_tokens] ->
-        case Base.url_decode64(encoded_username, padding: false) do
-          {:ok, username} -> parse_acl_user(username, rule_tokens, line_num)
-          :error -> {:error, "ERR Invalid ACL line #{line_num}: invalid encoded username"}
+  defp parse_trimmed_line(line, line_num, users, max_users, max_rule_tokens) do
+    cond do
+      line == "" ->
+        {:ok, users}
+
+      String.starts_with?(line, "#") ->
+        {:ok, users}
+
+      true ->
+        case parse_acl_line(line, line_num, max_rule_tokens) do
+          {:ok, {username, user_map}} ->
+            cond do
+              Map.has_key?(users, username) ->
+                {:error, "ERR Invalid ACL line #{line_num}: duplicate user '#{username}'"}
+
+              map_size(users) >= max_users ->
+                {:error, "ERR Invalid ACL line #{line_num}: max ACL users reached (#{max_users})"}
+
+              true ->
+                {:ok, Map.put(users, username, user_map)}
+            end
+
+          {:error, _reason} = error ->
+            error
         end
+    end
+  end
 
-      _ ->
-        {:error, "ERR Invalid ACL line #{line_num}: expected 'user <username> <rules...>'"}
+  defp parse_limit(limit) when is_integer(limit) and limit >= 0, do: {:ok, limit}
+  defp parse_limit(_invalid), do: :error
+
+  defp parse_acl_line(line, line_num, max_rule_tokens) do
+    max_tokens = max_rule_tokens + 2
+    tokens = String.split(line, ~r/\s+/, trim: true, parts: max_tokens + 1)
+
+    if length(tokens) > max_tokens do
+      {:error, "ERR Invalid ACL line #{line_num}: more than #{max_rule_tokens} rule tokens"}
+    else
+      case tokens do
+        ["user", username | rule_tokens] ->
+          parse_acl_user(username, rule_tokens, line_num)
+
+        ["user64", "b" <> encoded_username | rule_tokens] ->
+          case Base.url_decode64(encoded_username, padding: false) do
+            {:ok, username} -> parse_acl_user(username, rule_tokens, line_num)
+            :error -> {:error, "ERR Invalid ACL line #{line_num}: invalid encoded username"}
+          end
+
+        _ ->
+          {:error, "ERR Invalid ACL line #{line_num}: expected 'user <username> <rules...>'"}
+      end
     end
   end
 

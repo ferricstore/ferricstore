@@ -331,7 +331,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
               after_flow_native_apply_batch_hook(native, batch_ops)
             end)
 
-            :ok
+            flow_flush_pending_due_catalog_keys(state)
 
           _ ->
             :ok

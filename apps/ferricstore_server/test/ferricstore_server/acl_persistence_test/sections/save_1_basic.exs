@@ -583,7 +583,8 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           assert Acl.get_user("alice") != nil
         end
 
-        test "duplicate user definitions: last wins", %{tmp_dir: dir} do
+        @tag :acl_persistence_duplicate_user
+        test "duplicate user definitions are rejected", %{tmp_dir: dir} do
           # Create a valid hash for both definitions
           assert :ok = Acl.set_user("alice", ["on", ">firstpass"])
           first_hash = Acl.get_user("alice").password
@@ -599,12 +600,10 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           """)
 
           Acl.reset!()
-          assert :ok = Acl.load(dir)
-
-          user = Acl.get_user("alice")
-          # Last definition should win
-          assert user.enabled == false
-          assert user.password == second_hash
+          assert {:error, message} = Acl.load(dir)
+          assert message =~ "line 3"
+          assert message =~ "duplicate user 'alice'"
+          assert Acl.get_user("alice") == nil
         end
 
         test "handles multiple whitespace between tokens", %{tmp_dir: dir} do
@@ -648,9 +647,16 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           refute contents =~ ">MySecretPass123!"
         end
 
+        @tag :acl_persistence_line_limit
         test "file with extremely long line is rejected", %{tmp_dir: dir} do
           path = Acl.acl_file_path(dir)
-          long_line = "user default on nopass ~* &* +@all" <> String.duplicate("x", 2_000_000)
+
+          long_line =
+            String.duplicate(
+              "x",
+              FerricstoreServer.Acl.Limits.max_file_line_bytes() + 1
+            )
+
           File.write!(path, long_line <> "\n")
 
           assert {:error, msg} = Acl.load(dir)

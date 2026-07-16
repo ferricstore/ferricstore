@@ -117,18 +117,29 @@ defmodule Ferricstore.Flow.OrderedIndex do
     |> NativeOrderedIndex.count_all(key)
   end
 
-  @spec count_keys(table_ref()) :: [binary()]
-  def count_keys(lookup_table) do
+  @spec count_keys_page(table_ref(), binary() | nil, pos_integer()) :: [binary()]
+  def count_keys_page(lookup_table, cursor, limit) do
     lookup_table
     |> resource_from_lookup!()
-    |> NativeOrderedIndex.count_keys()
+    |> NativeOrderedIndex.count_keys_page(cursor, limit)
   end
 
-  @spec due_count_keys(table_ref()) :: [binary()]
-  def due_count_keys(lookup_table) do
+  @spec due_count_keys_page(table_ref(), binary() | nil, pos_integer()) :: [binary()]
+  def due_count_keys_page(lookup_table, cursor, limit) do
     lookup_table
     |> resource_from_lookup!()
-    |> NativeOrderedIndex.due_count_keys()
+    |> NativeOrderedIndex.due_count_keys_page(cursor, limit)
+  end
+
+  @spec reduce_due_count_key_pages(
+          table_ref(),
+          term(),
+          ([binary()], term() -> {:cont, term()} | {:halt, term()})
+        ) :: term()
+  def reduce_due_count_key_pages(lookup_table, acc, reducer) when is_function(reducer, 2) do
+    lookup_table
+    |> resource_from_lookup!()
+    |> NativeOrderedIndex.reduce_due_count_key_pages(acc, reducer)
   end
 
   @spec restore_count(table_ref(), binary(), integer()) :: :ok

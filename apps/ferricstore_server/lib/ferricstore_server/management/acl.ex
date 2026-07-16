@@ -9,7 +9,7 @@ defmodule FerricstoreServer.Management.ACL do
 
   @behaviour FerricStore.Management.ACL
 
-  alias FerricstoreServer.Acl.{CommandCategories, Password, Persistence, Rules}
+  alias FerricstoreServer.Acl.{CommandCategories, Limits, Password, Persistence, Rules}
   alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.Router
   alias Ferricstore.TermCodec
@@ -31,6 +31,7 @@ defmodule FerricstoreServer.Management.ACL do
 
     with :ok <- Rules.validate_username(username),
          {:ok, user} <- Rules.apply_rules(base, rules),
+         :ok <- Persistence.validate_user_line({username, user}),
          {:ok, canonical} <- encode_catalog_user(user) do
       encoded = TermCodec.encode(canonical)
 
@@ -852,12 +853,7 @@ defmodule FerricstoreServer.Management.ACL do
     :exit, _reason -> {:error, :acl_catalog_projection_unavailable}
   end
 
-  defp configured_max_users do
-    case Application.get_env(:ferricstore, :max_acl_users, 10_000) do
-      max when is_integer(max) and max >= 1 -> {:ok, max}
-      _invalid -> {:error, "ERR invalid max ACL users configuration"}
-    end
-  end
+  defp configured_max_users, do: Limits.configured_max_users()
 
   defp mutation_store(opts) when is_list(opts) do
     case Keyword.fetch(opts, :store) do

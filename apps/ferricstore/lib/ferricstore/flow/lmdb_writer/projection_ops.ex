@@ -14,7 +14,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   @terminal_states ["completed", "failed", "cancelled"]
 
   def expand_ops(state, []) do
-    {:ok, [], Map.put(state, :terminal_count_cache, empty_terminal_count_cache())}
+    {:ok, [], Map.put(state, :terminal_atomic_write?, false)}
   end
 
   def expand_ops(state, ops) do
@@ -26,7 +26,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       terminal_reverse_values: %{},
       active_reverse_values: %{},
       terminal_count_inits: state.terminal_count_inits,
-      terminal_count_cache: empty_terminal_count_cache()
+      terminal_atomic_write?: false
     }
 
     Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
@@ -40,12 +40,12 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
        %{
          ops: expanded,
          terminal_count_inits: terminal_count_inits,
-         terminal_count_cache: terminal_count_cache
+         terminal_atomic_write?: terminal_atomic_write?
        }} ->
         state =
           state
           |> Map.put(:terminal_count_inits, terminal_count_inits)
-          |> Map.put(:terminal_count_cache, terminal_count_cache)
+          |> Map.put(:terminal_atomic_write?, terminal_atomic_write?)
 
         {:ok, Enum.reverse(expanded), state}
 
@@ -53,8 +53,6 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         error
     end
   end
-
-  def empty_terminal_count_cache, do: %{puts: %{}, refresh: MapSet.new()}
 
   def expand_op(state, {:project_kv_from_source, key}, acc) when is_binary(key) do
     case read_source_value(state, key) do
@@ -223,6 +221,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
             acc =
               acc
               |> put_terminal_reverse_state(state_key, nil)
+              |> Map.put(:terminal_atomic_write?, true)
               |> prepend_ops([
                 {:compare, reverse_key, terminal_key},
                 {:delete, reverse_key}
@@ -474,7 +473,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         |> put_terminal_count_state(count_key, count, count_value)
         |> put_terminal_reverse_state(state_key, terminal_key)
         |> put_in([:terminal_values, terminal_key], value)
-        |> put_in([:terminal_count_cache, :puts, count_key], count)
+        |> Map.put(:terminal_atomic_write?, true)
         |> prepend_ops(ops)
 
       {:ok, acc}
@@ -509,7 +508,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         acc
         |> put_terminal_count_state(count_key, count, count_value)
         |> put_in([:terminal_values, terminal_key], value)
-        |> put_in([:terminal_count_cache, :puts, count_key], count)
+        |> Map.put(:terminal_atomic_write?, true)
         |> prepend_ops(ops)
 
       {:ok, acc}
@@ -680,7 +679,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         acc
         |> put_terminal_reverse_state(state_key, nil)
         |> put_in([:terminal_values, terminal_key], nil)
-        |> put_in([:terminal_count_cache, :puts, count_key], count)
+        |> Map.put(:terminal_atomic_write?, true)
         |> prepend_ops(ops)
 
       acc =
@@ -728,7 +727,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       acc =
         acc
         |> put_in([:terminal_values, terminal_key], nil)
-        |> put_in([:terminal_count_cache, :puts, count_key], count)
+        |> Map.put(:terminal_atomic_write?, true)
         |> prepend_ops(ops)
 
       acc =
@@ -772,11 +771,6 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
         acc
         |> Map.update!(:terminal_count_inits, &MapSet.put(&1, init_key))
-        |> update_in([:terminal_count_cache, :refresh], fn refresh ->
-          Enum.reduce(count_ops, refresh, fn {:put_new, count_key, _value}, refresh ->
-            MapSet.put(refresh, count_key)
-          end)
-        end)
         |> prepend_ops(count_ops)
       end
     else
@@ -1004,21 +998,6 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     else
       _invalid -> {:error, :invalid_terminal_index_value}
     end
-  end
-
-  def cache_terminal_counts(path, %{puts: puts, refresh: refresh}) do
-    Enum.each(puts, fn {count_key, count} ->
-      Ferricstore.Flow.LMDB.put_cached_terminal_count_key(path, count_key, count)
-    end)
-
-    Enum.each(refresh, fn count_key ->
-      case Map.has_key?(puts, count_key) do
-        true -> :ok
-        false -> Ferricstore.Flow.LMDB.refresh_terminal_count_key(path, count_key)
-      end
-    end)
-
-    :ok
   end
 
   def prepend_ops(acc, ops), do: %{acc | ops: :lists.reverse(ops, acc.ops)}

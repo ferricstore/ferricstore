@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.Shard.Routing do
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Bitcask.NIF
+      alias Ferricstore.Flow.DueCatalog
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.LMDB
       alias Ferricstore.Flow.Locator
@@ -65,6 +66,11 @@ defmodule Ferricstore.Store.Shard.Routing do
             apply_context: Map.get(sm_state, :apply_context, state.apply_context),
             apply_context_encoded:
               Map.get(sm_state, :apply_context_encoded, state.apply_context_encoded),
+            flow_due_catalog:
+              direct_flow_due_catalog(
+                Map.get(sm_state, :flow_due_catalog),
+                state.flow_due_catalog
+              ),
             cross_shard_locks: Map.get(sm_state, :cross_shard_locks, state.cross_shard_locks),
             cross_shard_lock_expiries:
               Map.get(
@@ -105,9 +111,14 @@ defmodule Ferricstore.Store.Shard.Routing do
           zset_score_lookup_name: state.zset_score_lookup,
           flow_index_name: state.flow_index,
           flow_lookup_name: state.flow_lookup,
+          flow_due_catalog: direct_flow_due_catalog(state.flow_due_catalog, DueCatalog.new()),
           flow_lmdb_path: Ferricstore.Flow.LMDB.path(state.shard_data_path),
           flow_async_history: state.flow_async_history
         }
+      end
+
+      defp direct_flow_due_catalog(catalog, fallback) do
+        if DueCatalog.valid?(catalog), do: catalog, else: fallback
       end
 
       defp flow_async_history_enabled? do

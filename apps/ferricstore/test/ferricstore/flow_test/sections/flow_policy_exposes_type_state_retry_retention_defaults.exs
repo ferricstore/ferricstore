@@ -178,6 +178,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
       end
 
       @tag :flow_policy_generation
+      @tag :flow_due_catalog_standalone_restart
       test "standalone restart rebuilds stored policy and retry uses it" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
         Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)

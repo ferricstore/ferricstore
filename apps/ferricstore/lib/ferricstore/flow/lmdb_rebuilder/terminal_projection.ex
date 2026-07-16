@@ -180,78 +180,136 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
   end
 
   defp do_persist_terminal_counts(stats, counts, lmdb_path) do
-    case existing_terminal_count_keys(lmdb_path) do
-      {:ok, existing_count_keys} ->
-        count_keys = MapSet.union(existing_count_keys, MapSet.new(Map.keys(counts)))
+    page_size = terminal_count_reconcile_page_size()
 
-        ops =
-          Enum.map(count_keys, fn count_key ->
-            {:put, count_key, LMDB.encode_count(Map.get(counts, count_key, 0))}
-          end)
+    scan_fun = fn page_fun ->
+      scan_existing_terminal_count_pages(lmdb_path, page_size, page_fun)
+    end
 
-        case LMDB.write_batch(lmdb_path, ops) do
-          :ok ->
-            Enum.each(count_keys, fn count_key ->
-              LMDB.put_cached_terminal_count_key(
-                lmdb_path,
-                count_key,
-                Map.get(counts, count_key, 0)
-              )
-            end)
+    write_fun = fn ops -> LMDB.write_batch(lmdb_path, ops) end
 
-            stats
-
-          {:error, _reason} ->
-            %{stats | lmdb_errors: stats.lmdb_errors + 1}
-        end
+    case reconcile_terminal_counts(counts, page_size, scan_fun, write_fun) do
+      :ok ->
+        stats
 
       {:error, _reason} ->
         %{stats | lmdb_errors: stats.lmdb_errors + 1}
     end
   end
 
-  defp existing_terminal_count_keys(lmdb_path) do
-    page_size =
-      :ferricstore
-      |> Application.get_env(
-        :flow_lmdb_rebuild_count_key_page_size,
-        @default_scan_page_size
-      )
-      |> normalize_scan_page_size()
+  @doc false
+  def __reconcile_terminal_counts_for_test__(counts, page_size, scan_fun, write_fun),
+    do: reconcile_terminal_counts(counts, page_size, scan_fun, write_fun)
 
+  defp reconcile_terminal_counts(counts, page_size, scan_fun, write_fun)
+       when is_map(counts) and is_integer(page_size) and page_size > 0 and
+              is_function(scan_fun, 1) and is_function(write_fun, 1) do
+    with :ok <- write_desired_terminal_count_pages(counts, page_size, write_fun),
+         :ok <- delete_stale_terminal_count_pages(counts, scan_fun, write_fun) do
+      :ok
+    end
+  end
+
+  defp write_desired_terminal_count_pages(counts, page_size, write_fun) do
+    counts
+    |> Stream.map(fn {count_key, count} ->
+      {:put, count_key, LMDB.encode_count(count)}
+    end)
+    |> Stream.chunk_every(page_size)
+    |> Enum.reduce_while(:ok, fn ops, :ok ->
+      case write_terminal_count_batch(ops, write_fun) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp delete_stale_terminal_count_pages(counts, scan_fun, write_fun) do
+    case scan_fun.(fn entries ->
+           with {:ok, ops} <-
+                  stale_terminal_count_delete_ops_result({:ok, entries}, counts),
+                :ok <- write_terminal_count_batch(ops, write_fun) do
+             :ok
+           end
+         end) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      invalid -> {:error, {:invalid_terminal_count_scan, invalid}}
+    end
+  end
+
+  defp scan_existing_terminal_count_pages(lmdb_path, page_size, page_fun) do
     LMDB.reduce_prefix_entries(
       lmdb_path,
       LMDB.terminal_count_prefix(),
       page_size,
-      MapSet.new(),
-      fn entries, keys ->
-        case existing_terminal_count_keys_result({:ok, entries}) do
-          {:ok, page_keys} -> {:ok, MapSet.union(keys, page_keys)}
+      :ok,
+      fn entries, :ok ->
+        case page_fun.(entries) do
+          :ok -> {:ok, :ok}
           {:error, _reason} = error -> error
+          invalid -> {:error, {:invalid_terminal_count_page_result, invalid}}
         end
       end
     )
-  end
-
-  @doc false
-  def __existing_terminal_count_keys_result_for_test__(result),
-    do: existing_terminal_count_keys_result(result)
-
-  defp existing_terminal_count_keys_result({:ok, entries}) when is_list(entries) do
-    if Enum.all?(entries, fn
-         {key, value} when is_binary(key) and is_binary(value) -> true
-         _invalid -> false
-       end) do
-      {:ok, MapSet.new(entries, fn {key, _value} -> key end)}
-    else
-      {:error, :invalid_terminal_count_scan_entry}
+    |> case do
+      {:ok, :ok} -> :ok
+      {:error, _reason} = error -> error
+      invalid -> {:error, {:invalid_terminal_count_scan, invalid}}
     end
   end
 
-  defp existing_terminal_count_keys_result({:error, _reason} = error), do: error
+  @doc false
+  def __stale_terminal_count_delete_ops_result_for_test__(result, counts),
+    do: stale_terminal_count_delete_ops_result(result, counts)
 
-  defp existing_terminal_count_keys_result(invalid),
+  defp stale_terminal_count_delete_ops_result({:ok, entries}, counts)
+       when is_list(entries) and is_map(counts) do
+    entries
+    |> Enum.reduce_while({:ok, []}, fn
+      {key, value}, {:ok, reversed_ops} when is_binary(key) and is_binary(value) ->
+        if Map.has_key?(counts, key) do
+          {:cont, {:ok, reversed_ops}}
+        else
+          {:cont, {:ok, [{:delete, key} | reversed_ops]}}
+        end
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_terminal_count_scan_entry}}
+    end)
+    |> case do
+      {:ok, reversed_ops} -> {:ok, Enum.reverse(reversed_ops)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp stale_terminal_count_delete_ops_result(
+         {:error, _reason} = error,
+         _counts
+       ),
+       do: error
+
+  defp stale_terminal_count_delete_ops_result(invalid, _counts),
     do: {:error, {:invalid_terminal_count_scan, invalid}}
+
+  defp write_terminal_count_batch([], _write_fun), do: :ok
+
+  defp write_terminal_count_batch(ops, write_fun) do
+    case write_fun.(ops) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      invalid -> {:error, {:invalid_terminal_count_write, invalid}}
+    end
+  end
+
+  defp terminal_count_reconcile_page_size do
+    :ferricstore
+    |> Application.get_env(
+      :flow_lmdb_rebuild_count_key_page_size,
+      @default_scan_page_size
+    )
+    |> normalize_scan_page_size()
+  end
 
   defp cleanup_stale_terminal_ops_by_id(lmdb_path, state_key, %{id: id, type: type} = record)
        when is_binary(id) and is_binary(type) do

@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
       alias Ferricstore.Commands.HyperLogLog
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
+      alias Ferricstore.Flow.DueCatalog
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Locator
@@ -679,21 +680,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
              %{flow_index_name: index, flow_lookup_name: lookup} = state
            )
            when index != nil and lookup != nil do
-        case NativeFlowIndex.get(index, lookup) do
-          nil -> NativeFlowIndex.register(index, lookup, NativeFlowIndex.new())
-          _native -> :ok
-        end
+        native =
+          case NativeFlowIndex.get(index, lookup) do
+            nil ->
+              resource = NativeFlowIndex.new()
+              :ok = NativeFlowIndex.register(index, lookup, resource)
+              resource
 
-        state
+            native ->
+              native
+          end
+
+        Map.put(state, :flow_due_catalog, flow_due_catalog_from_native(native))
       end
 
       defp ensure_flow_native_index_registered(state), do: state
 
-      defp flow_claim_index_count_keys(state) do
+      @doc false
+      def __flow_due_catalog_from_native_for_recovery__(state) do
         case flow_native_index(state) do
-          nil -> []
-          native -> NativeFlowIndex.due_count_keys(native)
+          nil -> Map.put(state, :flow_due_catalog, DueCatalog.new())
+          native -> Map.put(state, :flow_due_catalog, flow_due_catalog_from_native(native))
         end
+      end
+
+      @doc false
+      def __flow_sync_due_catalog_for_test__(catalog, native, keys) do
+        flow_sync_due_catalog_keys(catalog, native, keys)
       end
 
       defp flow_index_rank_range(state, key, start_idx, stop_idx, reverse?) do
@@ -737,7 +750,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
       end
 
       defp flow_index_put_members(state, key, member_score_pairs) do
-        flow_native_put_members(state, key, member_score_pairs)
+        queued? = flow_native_ops_queued?()
+
+        with :ok <- flow_native_put_members(state, key, member_score_pairs) do
+          flow_after_due_catalog_mutation(state, [key], queued?)
+        end
       end
 
       defp flow_index_put_new_members(state, key, member_score_pairs) do
@@ -745,33 +762,69 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
       end
 
       defp flow_index_put_new_lifecycle_members(state, key, member_score_pairs) do
-        flow_native_put_new_members(state, key, member_score_pairs)
+        queued? = flow_native_ops_queued?()
+
+        with :ok <- flow_native_put_new_members(state, key, member_score_pairs) do
+          flow_after_due_catalog_mutation(state, [key], queued?)
+        end
       end
 
       defp flow_index_put_new_entries(state, key_member_score_triples) do
-        flow_native_put_new_entries(state, key_member_score_triples)
+        queued? = flow_native_ops_queued?()
+
+        with :ok <- flow_native_put_new_entries(state, key_member_score_triples) do
+          flow_after_due_catalog_entry_mutation(state, key_member_score_triples, queued?)
+        end
       end
 
       defp flow_index_move_entries(state, key_key_member_score_quads) do
-        flow_native_move_entries(state, key_key_member_score_quads)
+        queued? = flow_native_ops_queued?()
+
+        with :ok <- flow_native_move_entries(state, key_key_member_score_quads) do
+          flow_after_due_catalog_mutation(
+            state,
+            flow_due_catalog_move_keys(key_key_member_score_quads),
+            queued?
+          )
+        end
       end
 
       defp flow_index_move_lifecycle_entries(state, [
              {_from_key, _to_key, _member, _score} = entry
            ]) do
-        flow_native_move_entries(state, [entry])
+        queued? = flow_native_ops_queued?()
+
+        with :ok <- flow_native_move_entries(state, [entry]) do
+          flow_after_due_catalog_mutation(state, flow_due_catalog_move_keys([entry]), queued?)
+        end
       end
 
       defp flow_index_move_lifecycle_entries(state, key_key_member_score_quads) do
-        flow_native_move_entries(state, key_key_member_score_quads)
+        queued? = flow_native_ops_queued?()
+
+        with :ok <- flow_native_move_entries(state, key_key_member_score_quads) do
+          flow_after_due_catalog_mutation(
+            state,
+            flow_due_catalog_move_keys(key_key_member_score_quads),
+            queued?
+          )
+        end
       end
 
       defp flow_index_delete_members(state, key, members) do
-        flow_native_delete_members(state, key, members)
+        queued? = flow_native_ops_queued?()
+
+        with :ok <- flow_native_delete_members(state, key, members) do
+          flow_after_due_catalog_mutation(state, [key], queued?)
+        end
       end
 
       defp flow_index_delete_lifecycle_members(state, key, members) do
-        flow_native_delete_members(state, key, members)
+        queued? = flow_native_ops_queued?()
+
+        with :ok <- flow_native_delete_members(state, key, members) do
+          flow_after_due_catalog_mutation(state, [key], queued?)
+        end
       end
 
       defp flow_native_put_members(_state, _key, []), do: :ok
@@ -836,9 +889,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
       defp flow_native_apply_claim_entries(_state, []), do: :ok
 
       defp flow_native_apply_claim_entries(state, entries) do
+        queued? = flow_native_ops_queued?()
+
         case flow_native_index(state) do
-          nil -> {:error, :flow_native_index_unavailable}
-          native -> flow_native_apply_or_queue(native, {:apply_claim_entries, entries})
+          nil ->
+            {:error, :flow_native_index_unavailable}
+
+          native ->
+            with :ok <- flow_native_apply_or_queue(native, {:apply_claim_entries, entries}) do
+              flow_after_due_catalog_mutation(
+                state,
+                flow_due_catalog_claim_entry_keys(entries),
+                queued?
+              )
+            end
         end
       end
 
@@ -852,6 +916,161 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
         end
 
         :ok
+      end
+
+      defp flow_native_ops_queued? do
+        is_list(Process.get(:sm_pending_flow_native_ops, :undefined))
+      end
+
+      defp flow_native_ops_pending? do
+        match?([_operation | _rest], Process.get(:sm_pending_flow_native_ops, :undefined))
+      end
+
+      defp flow_after_due_catalog_mutation(state, keys, queued?) do
+        tracked? = flow_track_due_catalog_keys(keys)
+
+        if tracked? and (not queued? or not flow_native_ops_pending?()),
+          do: flow_flush_pending_due_catalog_keys(state),
+          else: :ok
+      end
+
+      defp flow_track_due_catalog_keys(keys) do
+        {due_keys, tracked?} =
+          Enum.reduce(
+            keys,
+            {Process.get(:sm_pending_flow_due_catalog_keys, MapSet.new()), false},
+            fn key, acc -> flow_track_due_catalog_key(key, acc) end
+          )
+
+        Process.put(:sm_pending_flow_due_catalog_keys, due_keys)
+        tracked?
+      end
+
+      defp flow_after_due_catalog_entry_mutation(state, entries, queued?) do
+        {due_keys, tracked?} =
+          Enum.reduce(
+            entries,
+            {Process.get(:sm_pending_flow_due_catalog_keys, MapSet.new()), false},
+            fn
+              {key, _member, _score}, acc -> flow_track_due_catalog_key(key, acc)
+              _invalid, acc -> acc
+            end
+          )
+
+        Process.put(:sm_pending_flow_due_catalog_keys, due_keys)
+
+        if queued? or not tracked?,
+          do: :ok,
+          else: flow_flush_pending_due_catalog_keys(state)
+      end
+
+      defp flow_track_due_catalog_key(key, {due_keys, tracked?}) when is_binary(key) do
+        case FlowKeys.decode_due_key(key) do
+          {:ok, _metadata} -> {MapSet.put(due_keys, key), true}
+          :error -> {due_keys, tracked?}
+        end
+      end
+
+      defp flow_track_due_catalog_key(_key, acc), do: acc
+
+      defp flow_flush_pending_due_catalog_keys(state) do
+        case Process.put(:sm_pending_flow_due_catalog_keys, MapSet.new()) do
+          %MapSet{} = keys ->
+            if MapSet.size(keys) == 0 do
+              :ok
+            else
+              case flow_native_index(state) do
+                nil ->
+                  {:error, :flow_native_index_unavailable}
+
+                native ->
+                  catalog =
+                    apply_state_get(
+                      :flow_due_catalog,
+                      Map.get(state, :flow_due_catalog, DueCatalog.new())
+                    )
+
+                  apply_state_put(
+                    :flow_due_catalog,
+                    flow_sync_due_catalog_keys(catalog, native, MapSet.to_list(keys))
+                  )
+
+                  :ok
+              end
+            end
+
+          _invalid ->
+            :ok
+        end
+      end
+
+      defp flow_sync_due_catalog_keys(catalog, native, keys) do
+        if DueCatalog.valid?(catalog) do
+          case flow_sync_due_catalog_keys_checked(catalog, native, keys) do
+            {:ok, next_catalog} -> next_catalog
+            {:error, :invalid_due_catalog} -> flow_due_catalog_from_native(native)
+          end
+        else
+          flow_due_catalog_from_native(native)
+        end
+      end
+
+      defp flow_sync_due_catalog_keys_checked(catalog, native, keys) do
+        Enum.reduce_while(keys, {:ok, catalog}, fn key, {:ok, acc} ->
+          result =
+            case NativeFlowIndex.rank_range(native, key, 0, 0, false) do
+              [{_member, score}] when is_number(score) ->
+                DueCatalog.put_checked(acc, key, score)
+
+              [] ->
+                DueCatalog.delete_checked(acc, key)
+
+              _invalid ->
+                DueCatalog.delete_checked(acc, key)
+            end
+
+          case result do
+            {:ok, next_catalog} -> {:cont, {:ok, next_catalog}}
+            {:error, :invalid_due_catalog} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp flow_due_catalog_from_native(native) do
+        NativeFlowIndex.reduce_due_count_key_pages(
+          native,
+          DueCatalog.new(),
+          fn keys, catalog ->
+            next_catalog =
+              Enum.reduce(keys, catalog, fn key, acc ->
+                case NativeFlowIndex.rank_range(native, key, 0, 0, false) do
+                  [{_member, score}] when is_number(score) -> DueCatalog.put(acc, key, score)
+                  _missing_or_invalid -> DueCatalog.delete(acc, key)
+                end
+              end)
+
+            {:cont, next_catalog}
+          end
+        )
+      end
+
+      defp flow_due_catalog_move_keys(entries) do
+        Enum.flat_map(entries, fn
+          {from_key, to_key, _member, _score} -> [from_key, to_key]
+          _invalid -> []
+        end)
+      end
+
+      defp flow_due_catalog_claim_entry_keys(entries) do
+        Enum.flat_map(entries, fn
+          {_id, from_due_key, _from_due_score, to_due_key, _to_due_score, _from_state_key,
+           _from_state_score, _to_state_key, _to_state_score, _inflight_key, _worker_key,
+           _lease_score} ->
+            [from_due_key, to_due_key]
+
+          _invalid ->
+            []
+        end)
       end
 
       defp rollback_pending_flow_indexes(state) do
@@ -868,16 +1087,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
            when index != nil and lookup != nil do
         NativeFlowIndex.reset(index, lookup)
 
-        Ferricstore.Flow.LMDBRebuilder.rebuild_active_indexes_from_keydir(
-          state.shard_data_path,
-          state.ets,
-          state.shard_index,
-          Map.get(state, :instance_ctx),
-          nil,
-          nil,
-          index,
-          lookup
-        )
+        case Ferricstore.Flow.LMDBRebuilder.rebuild_active_indexes_from_keydir(
+               state.shard_data_path,
+               state.ets,
+               state.shard_index,
+               Map.get(state, :instance_ctx),
+               nil,
+               nil,
+               index,
+               lookup
+             ) do
+          :ok ->
+            apply_state_put(
+              :flow_due_catalog,
+              flow_due_catalog_from_native(flow_native_index(state))
+            )
+
+            :ok
+
+          other ->
+            other
+        end
       end
 
       defp reset_flow_native_index_from_keydir(_state), do: :ok

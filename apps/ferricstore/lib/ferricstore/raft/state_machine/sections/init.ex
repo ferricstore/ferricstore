@@ -179,6 +179,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
               Ferricstore.Flow.LMDB.path(config.shard_data_path)
             end),
           flow_lmdb_mirror?: false,
+          flow_due_catalog: Ferricstore.Flow.DueCatalog.new(),
           flow_hibernation_promotion_cursor: nil,
           active_file_size:
             Map.get_lazy(config, :active_file_size, fn ->

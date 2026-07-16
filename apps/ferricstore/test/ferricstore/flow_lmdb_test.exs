@@ -361,13 +361,6 @@ defmodule Ferricstore.Flow.LMDBTest do
     Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(ctx.data_dir, shard_index)
   end
 
-  defp terminal_count_cache_member?(path, state_index_key) do
-    table = :ets.whereis(:ferricstore_flow_lmdb_terminal_count_cache)
-    count_key = Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
-
-    table != :undefined and :ets.member(table, {path, count_key})
-  end
-
   defp readable_locator?(file_id, offset, value_size)
        when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
               is_integer(value_size) and value_size >= 0,

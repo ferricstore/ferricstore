@@ -123,8 +123,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       counts: %{},
       terminal_values: %{},
       active_reverse_values: %{},
-      terminal_count_inits: MapSet.new(),
-      terminal_count_cache: ProjectionOps.empty_terminal_count_cache()
+      terminal_count_inits: MapSet.new()
     }
 
     assert {:error, :busy} =
@@ -160,8 +159,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       counts: %{},
       terminal_values: %{},
       active_reverse_values: %{state_key => "corrupt"},
-      terminal_count_inits: MapSet.new(),
-      terminal_count_cache: ProjectionOps.empty_terminal_count_cache()
+      terminal_count_inits: MapSet.new()
     }
 
     assert {:error, :invalid_active_index_reverse} =
@@ -203,8 +201,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       counts: %{},
       terminal_values: %{},
       active_reverse_values: %{},
-      terminal_count_inits: MapSet.new(),
-      terminal_count_cache: ProjectionOps.empty_terminal_count_cache()
+      terminal_count_inits: MapSet.new()
     }
 
     assert {:error, {:active_index_reverse_state_mismatch, ^active_key}} =
@@ -272,8 +269,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       counts: %{},
       terminal_values: %{},
       active_reverse_values: %{},
-      terminal_count_inits: MapSet.new(),
-      terminal_count_cache: ProjectionOps.empty_terminal_count_cache()
+      terminal_count_inits: MapSet.new()
     }
 
     assert {:error, :invalid_terminal_count_value} =
@@ -323,6 +319,30 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
     assert {:error, {:compare_failed, ^count_key}} = LMDB.write_batch(path, ops)
     assert LMDB.get(path, terminal_key) == :not_found
     assert {:ok, ^replacement_count} = LMDB.get(path, count_key)
+  end
+
+  test "terminal expansion uses a bounded atomic-write marker instead of count-cache state" do
+    path = tmp_lmdb_path("terminal_atomic_marker")
+    state_index_key = "state:completed"
+    terminal_key = LMDB.terminal_index_key(state_index_key, "flow-1", 10)
+    count_key = LMDB.terminal_count_key(state_index_key)
+    value = LMDB.encode_terminal_index_value("flow-1", 10, 0, nil, count_key)
+    state = %{path: path, terminal_count_inits: MapSet.new()}
+
+    assert {:ok, _ops, terminal_state} =
+             ProjectionOps.expand_ops(
+               state,
+               [{:terminal_put, terminal_key, value, nil, count_key}]
+             )
+
+    assert terminal_state.terminal_atomic_write?
+    refute Map.has_key?(terminal_state, :terminal_count_cache)
+
+    assert {:ok, _ops, nonterminal_state} =
+             ProjectionOps.expand_ops(state, [{:put, "ordinary-key", "ordinary-value"}])
+
+    refute nonterminal_state.terminal_atomic_write?
+    refute Map.has_key?(nonterminal_state, :terminal_count_cache)
   end
 
   test "terminal puts reject mismatched prepared-command identity" do
@@ -514,8 +534,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       counts: %{},
       terminal_values: %{},
       active_reverse_values: %{},
-      terminal_count_inits: MapSet.new(),
-      terminal_count_cache: ProjectionOps.empty_terminal_count_cache()
+      terminal_count_inits: MapSet.new()
     }
 
     assert {:error, :invalid_flow_state_projection} =

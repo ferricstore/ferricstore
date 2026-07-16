@@ -200,8 +200,6 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   def clear(path) when is_binary(path) do
-    clear_cached_terminal_counts_for_path(path)
-
     if Ferricstore.FS.dir?(path) do
       with :ok <- release_detached_env(path) do
         NIF.lmdb_clear(path, map_size())
@@ -821,7 +819,6 @@ defmodule Ferricstore.Flow.LMDB do
       when is_binary(path) and is_binary(terminal_key) do
     with {:ok, ops} <- strict_terminal_index_delete_ops_result(path, terminal_key, state_key),
          :ok <- write_batch(path, ops) do
-      refresh_terminal_count_cache_after_delete(path, terminal_count_key_from_delete_ops(ops))
       :ok
     end
   end
@@ -999,16 +996,6 @@ defmodule Ferricstore.Flow.LMDB do
        ),
        do: ops
 
-  defp terminal_count_key_from_delete_ops(ops) do
-    case Enum.find(ops, fn
-           {:put, _count_key, _value} -> true
-           _other -> false
-         end) do
-      {:put, count_key, _value} -> {:ok, count_key}
-      nil -> :missing
-    end
-  end
-
   def encode_terminal_index_value(id, updated_at_ms, expire_at_ms, state_key, count_key),
     do:
       Ferricstore.Flow.LMDB.IndexCodec.encode_terminal_index_value(
@@ -1039,18 +1026,6 @@ defmodule Ferricstore.Flow.LMDB do
 
   def terminal_counts(path, state_index_keys),
     do: Ferricstore.Flow.LMDB.TerminalCounts.terminal_counts(path, state_index_keys)
-
-  def refresh_terminal_count_key(path, count_key),
-    do: Ferricstore.Flow.LMDB.TerminalCounts.refresh_count_key(path, count_key)
-
-  def put_cached_terminal_count_key(path, count_key, count),
-    do: Ferricstore.Flow.LMDB.TerminalCounts.put_cached_count_key(path, count_key, count)
-
-  def delete_cached_terminal_count_key(path, count_key),
-    do: Ferricstore.Flow.LMDB.TerminalCounts.delete_cached_count_key(path, count_key)
-
-  def clear_cached_terminal_counts_for_path(path),
-    do: Ferricstore.Flow.LMDB.TerminalCounts.clear_cached_for_path(path)
 
   def put_terminal_count(path, state_index_key, count),
     do: Ferricstore.Flow.LMDB.TerminalCounts.put_terminal_count(path, state_index_key, count)
@@ -1157,13 +1132,6 @@ defmodule Ferricstore.Flow.LMDB do
 
   def terminal_index_count_key(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.terminal_index_count_key(blob)
-
-  defp refresh_terminal_count_cache_after_delete(path, {:ok, count_key}) do
-    Ferricstore.Flow.LMDB.TerminalCounts.refresh_after_delete(path, {:ok, count_key})
-  end
-
-  defp refresh_terminal_count_cache_after_delete(path, :missing),
-    do: Ferricstore.Flow.LMDB.TerminalCounts.refresh_after_delete(path, :missing)
 
   def history_index_delete_ops_result(path, history_index_key)
       when is_binary(path) and is_binary(history_index_key) do

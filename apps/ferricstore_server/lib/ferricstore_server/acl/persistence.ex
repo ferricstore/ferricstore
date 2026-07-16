@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Acl.Persistence do
   alias FerricstoreServer.Acl.FileParser
   alias FerricstoreServer.Acl.Formatter
   alias FerricstoreServer.Acl.AuthEpoch
+  alias FerricstoreServer.Acl.Limits
   alias FerricstoreServer.Acl.Tables
 
   @acl_filename "acl.conf"
@@ -41,6 +42,9 @@ defmodule FerricstoreServer.Acl.Persistence do
     else
       {:error, {:too_large, bytes, max_bytes}} ->
         {:error, "ERR ACL file too large (#{bytes} bytes, max #{max_bytes})"}
+
+      {:error, {:line_too_large, bytes, max_bytes}} ->
+        {:error, "ERR ACL user line too large (#{bytes} bytes, max #{max_bytes})"}
 
       {:error, reason} ->
         _ = Ferricstore.FS.rm(tmp)
@@ -95,9 +99,16 @@ defmodule FerricstoreServer.Acl.Persistence do
     if byte_size(contents) > @max_file_size do
       {:error, "ERR ACL file too large (#{byte_size(contents)} bytes, max #{@max_file_size})"}
     else
-      with {:ok, users} <- FileParser.parse(contents),
-           :ok <- validate_default_user(users),
-           :ok <- validate_user_limit(users) do
+      with {:ok, max_users} <- Limits.configured_max_users(),
+           {:ok, users} <-
+             FileParser.parse(
+               contents,
+               max_file_bytes: @max_file_size,
+               max_users: max_users,
+               max_line_bytes: Limits.max_file_line_bytes(),
+               max_lines: Limits.max_file_lines(max_users)
+             ),
+           :ok <- validate_default_user(users) do
         {:ok, users}
       end
     end
@@ -111,7 +122,10 @@ defmodule FerricstoreServer.Acl.Persistence do
           non_neg_integer(),
           binary(),
           non_neg_integer()
-        ) :: {:ok, iodata()} | {:error, {:too_large, non_neg_integer(), non_neg_integer()}}
+        ) ::
+          {:ok, iodata()}
+          | {:error, {:too_large, non_neg_integer(), non_neg_integer()}}
+          | {:error, {:line_too_large, non_neg_integer(), non_neg_integer()}}
   def build_contents(entries, auth_epoch, generated_at, max_bytes)
       when is_list(entries) and is_integer(auth_epoch) and auth_epoch >= 0 and
              is_binary(generated_at) and is_integer(max_bytes) and max_bytes >= 0 do
@@ -147,18 +161,46 @@ defmodule FerricstoreServer.Acl.Persistence do
                                                   {:ok, chunks, bytes} ->
       separator = if index == 0, do: [], else: "\n"
 
-      rendered = [
-        separator,
-        AuthEpoch.user_metadata(username, user),
-        "\n",
-        Formatter.format_user_for_file(entry)
-      ]
+      case bounded_user_line(entry) do
+        {:ok, user_line} ->
+          rendered = [
+            separator,
+            AuthEpoch.user_metadata(username, user),
+            "\n",
+            user_line
+          ]
 
-      case append_bounded(chunks, bytes, rendered, max_bytes) do
-        {:ok, _chunks, _bytes} = next -> {:cont, next}
-        {:error, _reason} = error -> {:halt, error}
+          case append_bounded(chunks, bytes, rendered, max_bytes) do
+            {:ok, _chunks, _bytes} = next -> {:cont, next}
+            {:error, _reason} = error -> {:halt, error}
+          end
+
+        {:error, _reason} = error ->
+          {:halt, error}
       end
     end)
+  end
+
+  @doc false
+  @spec validate_user_line({binary(), map()}) :: :ok | {:error, binary()}
+  def validate_user_line(entry) do
+    case bounded_user_line(entry) do
+      {:ok, _line} ->
+        :ok
+
+      {:error, {:line_too_large, bytes, max_bytes}} ->
+        {:error, "ERR ACL user line too large (#{bytes} bytes, max #{max_bytes})"}
+    end
+  end
+
+  defp bounded_user_line(entry) do
+    line = Formatter.format_user_for_file(entry)
+    bytes = byte_size(line)
+    max_bytes = Limits.max_file_line_bytes()
+
+    if bytes <= max_bytes,
+      do: {:ok, line},
+      else: {:error, {:line_too_large, bytes, max_bytes}}
   end
 
   defp append_bounded(chunks, bytes, chunk, max_bytes) do
@@ -168,17 +210,6 @@ defmodule FerricstoreServer.Acl.Persistence do
       {:ok, [chunk | chunks], next_bytes}
     else
       {:error, {:too_large, next_bytes, max_bytes}}
-    end
-  end
-
-  defp validate_user_limit(users) when is_list(users) do
-    max = Application.get_env(:ferricstore, :max_acl_users, 10_000)
-    max = if is_integer(max) and max >= 0, do: max, else: 10_000
-
-    if length(users) <= max do
-      :ok
-    else
-      {:error, "ERR max ACL users reached (#{max})"}
     end
   end
 

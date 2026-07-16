@@ -235,7 +235,6 @@ defmodule Ferricstore.Application do
             Ferricstore.QuorumMetrics,
             Ferricstore.PrefixMetricsCache,
             Ferricstore.Waiters.Monitor,
-            Ferricstore.Flow.LMDB.TerminalCountCacheOwner,
             Ferricstore.Flow.HistoryProjector.TableOwner,
             Ferricstore.Flow.Governance.LimitCache,
             Supervisor.child_spec(

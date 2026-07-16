@@ -605,7 +605,7 @@ mod lmdb_cache_architecture_tests {
 
         assert!(declarations.contains("LmdbStoreCell"));
         assert!(lmdb_store.contains("get_or_init"));
-        assert!(lmdb_store.find("std::fs::create_dir_all").unwrap()
+        assert!(lmdb_store.find("create_dir_all_nofollow").unwrap()
             < lmdb_store.find("stores.lock()").unwrap());
         assert!(lmdb_store.find("std::fs::canonicalize").unwrap()
             < lmdb_store.find("stores.lock()").unwrap());
@@ -815,14 +815,15 @@ mod nif_scheduler_tests {
                         .iter()
                         .find(|candidate| candidate.trim_start().starts_with("pub fn "))
                         .unwrap_or_else(|| panic!("{path}:{} missing NIF function", line_idx + 1));
-                    let is_async = function.contains("_async");
+                    let valid_scheduler = if function.contains("_async") {
+                        line.contains("Normal") || line.contains("DirtyCpu")
+                    } else {
+                        line.contains("DirtyIo")
+                    };
+
                     assert!(
-                        if is_async {
-                            line.contains("Normal")
-                        } else {
-                            line.contains("DirtyIo")
-                        },
-                        "{path}:{} synchronous file I/O must use DirtyIo and async dispatch must use Normal: {line} before {function}",
+                        valid_scheduler && !(function.contains("_async") && line.contains("DirtyIo")),
+                        "{path}:{} synchronous file I/O must use DirtyIo; async dispatch may use Normal or DirtyCpu for bounded input staging, never DirtyIo: {line} before {function}",
                         line_idx + 1
                     );
                 }
@@ -930,12 +931,10 @@ mod lmdb_cache_tests {
 
     #[cfg(unix)]
     #[test]
-    fn lmdb_store_reuses_canonical_path_for_aliases() {
+    fn lmdb_store_reuses_canonical_path_for_non_symlink_aliases() {
         let dir = tempfile::TempDir::new().unwrap();
         let real = dir.path().join("db");
-        let alias_root = dir.path().join("alias");
-        std::os::unix::fs::symlink(dir.path(), &alias_root).unwrap();
-        let alias = alias_root.join("db");
+        let alias = dir.path().join("unused").join("..").join("db");
 
         let first = lmdb_store(real.to_str().unwrap(), 64 * 1024 * 1024).unwrap();
         let second = lmdb_store(alias.to_str().unwrap(), 64 * 1024 * 1024).unwrap();

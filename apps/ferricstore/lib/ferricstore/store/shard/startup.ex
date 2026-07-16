@@ -223,6 +223,13 @@ defmodule Ferricstore.Store.Shard.Startup do
             :ok
           end)
 
+          flow_due_catalog =
+            profile_startup_phase(index, :flow_due_catalog_rebuild, fn ->
+              %{flow_index_name: flow_index, flow_lookup_name: flow_lookup}
+              |> Ferricstore.Raft.StateMachine.__flow_due_catalog_from_native_for_recovery__()
+              |> Map.fetch!(:flow_due_catalog)
+            end)
+
           active_file_size = startup_file_size(active_file_path)
 
           keydir = publish_startup_keydir(keydir, keydir_name, ctx)
@@ -307,6 +314,7 @@ defmodule Ferricstore.Store.Shard.Startup do
              zset_score_lookup: zset_score_lookup,
              flow_index: flow_index,
              flow_lookup: flow_lookup,
+             flow_due_catalog: flow_due_catalog,
              zset_index_ready: MapSet.new()
            }, {:continue, {:flush_interval, flush_ms}}}
         catch

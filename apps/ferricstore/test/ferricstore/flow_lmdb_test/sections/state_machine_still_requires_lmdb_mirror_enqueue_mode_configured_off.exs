@@ -521,6 +521,27 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StateMachineStillRequiresLmdbMirror
                    instance_name,
                    shard_index
                  )
+
+        writer =
+          Process.whereis(Ferricstore.Flow.LMDBWriter.name(instance_name, shard_index))
+
+        :sys.replace_state(writer, &Map.put(&1, :terminal_atomic_write?, true))
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.prepare_snapshot_install(
+                   instance_name,
+                   shard_index
+                 )
+
+        reset_state = :sys.get_state(writer)
+        refute reset_state.terminal_atomic_write?
+        refute Map.has_key?(reset_state, :terminal_count_cache)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.resume_after_snapshot_install(
+                   instance_name,
+                   shard_index
+                 )
       end
 
       test "mirror writer persists replay-safe marker with no pending ops" do

@@ -174,6 +174,7 @@ defmodule Ferricstore.Store.Shard do
     zset_score_lookup: nil,
     flow_index: nil,
     flow_lookup: nil,
+    flow_due_catalog: nil,
     zset_index_ready: MapSet.new(),
     standalone_batch: {[], []},
     standalone_batch_count: 0,

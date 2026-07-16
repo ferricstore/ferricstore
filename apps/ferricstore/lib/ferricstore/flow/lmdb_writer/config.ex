@@ -54,7 +54,7 @@ defmodule Ferricstore.Flow.LMDBWriter.Config do
       durable_index: 0,
       requested_index: 0,
       terminal_count_inits: MapSet.new(),
-      terminal_count_cache: %{puts: %{}, refresh: MapSet.new()},
+      terminal_atomic_write?: false,
       lmdb_ready: false,
       suspended?: false,
       projection_dirty?: false,

@@ -658,16 +658,6 @@ defmodule Ferricstore.Store.Shard.Calls do
         {:reply, reply, state}
       end
 
-      def handle_call(:flow_due_count_keys, _from, state) do
-        reply =
-          case native_flow_index_for_read(state) do
-            {:ok, native} -> {:ok, NativeFlowIndex.due_count_keys(native)}
-            :unavailable -> :unavailable
-          end
-
-        {:reply, reply, state}
-      end
-
       def handle_call(
             {:flow_earliest_due_score, prefixes, needles, suffixes},
             _from,

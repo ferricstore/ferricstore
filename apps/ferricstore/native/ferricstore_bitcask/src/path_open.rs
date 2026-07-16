@@ -58,11 +58,12 @@ fn openat2_nofollow(
     mode: libc::mode_t,
 ) -> io::Result<Option<std::fs::File>> {
     let path = component_name(path.as_os_str())?;
-    let how = libc::open_how {
-        flags: flags as u64,
-        mode: u64::from(mode),
-        resolve: libc::RESOLVE_NO_SYMLINKS,
-    };
+    // `open_how` is non-exhaustive on Linux libc targets, so initialize the
+    // kernel ABI struct to zero before setting the fields this syscall uses.
+    let mut how = unsafe { std::mem::zeroed::<libc::open_how>() };
+    how.flags = flags as u64;
+    how.mode = u64::from(mode);
+    how.resolve = libc::RESOLVE_NO_SYMLINKS;
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,

@@ -68,28 +68,6 @@ defmodule Ferricstore.Store.Router.Part11 do
       end
 
       @doc false
-      @spec flow_due_count_keys(FerricStore.Instance.t()) :: {:ok, [binary()]} | :unavailable
-      def flow_due_count_keys(ctx) do
-        shard_count = max(1, Map.get(ctx, :shard_count, 1))
-
-        0..(shard_count - 1)//1
-        |> Enum.reduce_while({:ok, []}, fn idx, {:ok, acc} ->
-          case flow_due_count_keys(ctx, idx) do
-            {:ok, keys} when is_list(keys) -> {:cont, {:ok, [keys | acc]}}
-            :unavailable -> {:halt, :unavailable}
-            _other -> {:halt, :unavailable}
-          end
-        end)
-        |> case do
-          {:ok, key_groups} ->
-            {:ok, key_groups |> Enum.reverse() |> List.flatten() |> Enum.uniq()}
-
-          :unavailable ->
-            :unavailable
-        end
-      end
-
-      @doc false
       @spec flow_earliest_due_score(
               FerricStore.Instance.t(),
               [binary()],
@@ -278,16 +256,6 @@ defmodule Ferricstore.Store.Router.Part11 do
 
           :unavailable ->
             :unavailable
-        end
-      end
-
-      defp flow_due_count_keys(ctx, idx) do
-        if selected_waraft_ctx?(ctx) do
-          direct_flow_index_read(ctx, idx, &NativeFlowIndex.due_count_keys/1)
-        else
-          ctx
-          |> safe_read_call(idx, :flow_due_count_keys)
-          |> unwrap_zset_index_reply()
         end
       end
 

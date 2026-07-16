@@ -53,7 +53,7 @@ defmodule Ferricstore.Bitcask.NIF do
           [{binary(), binary(), float()}],
           [{binary(), binary(), float()}],
           [{binary(), binary(), binary(), float()}],
-          [{binary(), [binary()]}],
+          [{binary(), binary()}],
           [flow_index_claim_entry()]
         ) :: :ok
   def flow_index_apply_batch(
@@ -79,7 +79,7 @@ defmodule Ferricstore.Bitcask.NIF do
           float(),
           boolean(),
           non_neg_integer(),
-          integer()
+          non_neg_integer()
         ) :: [{binary(), float()}]
   def flow_index_range_slice(
         _resource,
@@ -104,9 +104,35 @@ defmodule Ferricstore.Bitcask.NIF do
           float(),
           binary(),
           non_neg_integer(),
-          integer()
+          non_neg_integer()
         ) :: [{binary(), float()}]
   def flow_index_range_cursor_slice(
+        _resource,
+        _key,
+        _min_kind,
+        _min_score,
+        _max_kind,
+        _max_score,
+        _cursor_score,
+        _cursor_member,
+        _offset,
+        _count
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_range_after_slice(
+          flow_index_resource(),
+          binary(),
+          non_neg_integer(),
+          float(),
+          non_neg_integer(),
+          float(),
+          float(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: [{binary(), float()}]
+  def flow_index_range_after_slice(
         _resource,
         _key,
         _min_kind,
@@ -149,11 +175,21 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec flow_index_count_many(flow_index_resource(), [binary()]) :: [non_neg_integer()]
   def flow_index_count_many(_resource, _keys), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec flow_index_count_keys(flow_index_resource()) :: [binary()]
-  def flow_index_count_keys(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  @spec flow_index_count_keys_page(
+          flow_index_resource(),
+          binary() | nil,
+          non_neg_integer()
+        ) :: [binary()]
+  def flow_index_count_keys_page(_resource, _cursor, _limit),
+    do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec flow_index_due_count_keys(flow_index_resource()) :: [binary()]
-  def flow_index_due_count_keys(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  @spec flow_index_due_count_keys_page(
+          flow_index_resource(),
+          binary() | nil,
+          non_neg_integer()
+        ) :: [binary()]
+  def flow_index_due_count_keys_page(_resource, _cursor, _limit),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec flow_index_earliest_due_score(
           flow_index_resource(),

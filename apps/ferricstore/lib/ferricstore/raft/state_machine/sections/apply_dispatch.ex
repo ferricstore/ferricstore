@@ -534,6 +534,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               {:ok, deleted} ->
                 _reset = CompoundMemberIndex.reset(Map.get(state, :compound_member_index_name))
                 _state = ZSetIndex.reset(state)
+                apply_state_put(:flow_due_catalog, Ferricstore.Flow.DueCatalog.new())
                 {:ok, deleted}
 
               {:error, _reason} = error ->

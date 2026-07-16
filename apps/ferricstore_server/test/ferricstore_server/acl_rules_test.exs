@@ -26,4 +26,9 @@ defmodule FerricstoreServer.Acl.RulesTest do
     assert Rules.user_channels(%{}) == []
     assert Rules.user_channels(%{channels: :invalid}) == []
   end
+
+  test "rule validation rejects excessive non-pattern modifiers before repeated processing" do
+    assert {:error, reason} = Rules.validate_rule_limits(List.duplicate("on", 16_385))
+    assert reason =~ "more than 16384 rule tokens"
+  end
 end

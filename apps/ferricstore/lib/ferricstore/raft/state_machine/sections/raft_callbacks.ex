@@ -872,6 +872,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
           end
 
         state =
+          case apply_state_pop(:flow_due_catalog, :unchanged) do
+            :unchanged ->
+              state
+
+            catalog ->
+              if Ferricstore.Flow.DueCatalog.valid?(catalog),
+                do: Map.put(state, :flow_due_catalog, catalog),
+                else: Map.put(state, :flow_due_catalog, Ferricstore.Flow.DueCatalog.new())
+          end
+
+        state =
           case apply_state_pop(:flow_hibernation_promotion_cursor, :unchanged) do
             :unchanged ->
               state
@@ -1035,6 +1046,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
 
       defp clear_stale_pending_state do
         Process.delete(@sm_apply_state_key)
+        Process.delete(:sm_pending_flow_due_catalog_keys)
         :ok
       end
 

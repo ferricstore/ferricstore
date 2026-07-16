@@ -520,6 +520,40 @@ defmodule Ferricstore.Flow.Keys do
       ":da:" <> index_component(type) <> ":p" <> Integer.to_string(priority)
   end
 
+  @spec decode_due_key(binary()) ::
+          {:ok,
+           %{
+             type: binary(),
+             state: binary(),
+             priority: integer(),
+             tag_prefix: binary(),
+             auto_partition?: boolean()
+           }}
+          | :error
+  def decode_due_key(key) when is_binary(key) do
+    with {:ok, tag_prefix, remainder} <- split_internal_flow_key(key, "}:d:"),
+         [encoded_type, encoded_state_priority] <- :binary.split(remainder, ":"),
+         [encoded_state, encoded_priority] <- :binary.split(encoded_state_priority, ":p"),
+         true <- encoded_type != "" and encoded_state != "" and encoded_priority != "",
+         {:ok, type} <- decode_index_component(encoded_type),
+         {:ok, state} <- decode_index_component(encoded_state),
+         {priority, ""} <- Integer.parse(encoded_priority),
+         true <- encoded_priority == Integer.to_string(priority) do
+      {:ok,
+       %{
+         type: type,
+         state: state,
+         priority: priority,
+         tag_prefix: tag_prefix,
+         auto_partition?: String.starts_with?(tag_prefix, "f:{fa:")
+       }}
+    else
+      _invalid -> :error
+    end
+  end
+
+  def decode_due_key(_key), do: :error
+
   def state_index_key(type, state, partition_key \\ nil) do
     "f:" <>
       tag(partition_key) <>

@@ -284,7 +284,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           active_file_path: sm_state.active_file_path
         )
 
-        %{sm_state | active_file_size: recovery_file_size(sm_state.active_file_path)}
+        sm_state
+        |> Map.put(:active_file_size, recovery_file_size(sm_state.active_file_path))
+        |> StateMachine.__flow_due_catalog_from_native_for_recovery__()
       end
 
       defp rebuild_logical_key_index!(ordered, slots, keydir, shard_index) do

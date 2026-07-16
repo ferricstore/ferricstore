@@ -584,6 +584,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         last_enqueue_at: nil,
         timer_ref: nil,
         projection_dirty?: false,
+        terminal_atomic_write?: false,
         processed_enqueue_seq: processed,
         processed_enqueue_gaps: MapSet.new(),
         flush_waiters: []
@@ -611,7 +612,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         last_enqueue_at: nil,
         timer_ref: nil,
         terminal_count_inits: MapSet.new(),
-        terminal_count_cache: ProjectionOps.empty_terminal_count_cache(),
+        terminal_atomic_write?: false,
         lmdb_ready: false,
         suspended?: suspended?,
         projection_dirty?: false,
@@ -886,7 +887,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
         count: 0,
         first_pending_at: nil,
         last_enqueue_at: nil,
-        timer_ref: nil
+        timer_ref: nil,
+        terminal_atomic_write?: false
     }
   end
 
@@ -908,7 +910,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
                requested_index: state.requested_index
              }),
            :ok <- write_ops_chunked(state, ops),
-           :ok <- ProjectionOps.cache_terminal_counts(state.path, state.terminal_count_cache),
            {:ok, state} <- persist_requested(state, started_at) do
         {:ok, state, length(ops)}
       else
@@ -943,10 +944,9 @@ defmodule Ferricstore.Flow.LMDBWriter do
       length(ops) <= chunk_ops ->
         write_ops(state.path, ops)
 
-      not terminal_count_cache_empty?(Map.get(state, :terminal_count_cache)) ->
-        # Terminal count cache updates are the public consistency boundary for
-        # terminal queries. Keep those flushes in one LMDB transaction until the
-        # count cache can move into the same expanded op batch.
+      Map.get(state, :terminal_atomic_write?, false) ->
+        # Terminal row, count, expiry, and reverse CAS operations form one
+        # transaction. The marker is a bounded per-flush signal, not per-key state.
         write_ops(state.path, ops)
 
       true ->
@@ -963,12 +963,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
        do: chunk_ops
 
   defp flush_chunk_ops(_state), do: Config.default_flush_chunk_ops()
-
-  defp terminal_count_cache_empty?(%{puts: puts, refresh: refresh}) do
-    map_size(puts) == 0 and MapSet.size(refresh) == 0
-  end
-
-  defp terminal_count_cache_empty?(_cache), do: true
 
   defp write_op_chunks(state, ops, chunk_ops) do
     ops

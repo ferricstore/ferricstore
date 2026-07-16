@@ -20,6 +20,18 @@ defmodule Ferricstore.Flow.ClaimWaiterSchedulerTest do
     refute source =~ "Router.flow_due_count_keys"
   end
 
+  test "unbounded due-count-key router and shard endpoints are not compiled" do
+    router_source =
+      File.read!(Path.expand("../../../lib/ferricstore/store/router/part_11.ex", __DIR__))
+
+    shard_source =
+      File.read!(Path.expand("../../../lib/ferricstore/store/shard/calls.ex", __DIR__))
+
+    refute router_source =~ "def flow_due_count_keys("
+    refute router_source =~ ":flow_due_count_keys"
+    refute shard_source =~ "handle_call(:flow_due_count_keys"
+  end
+
   test "broad cold scheduling stays correct when a bucket exceeds the scan limit" do
     data_dir =
       Path.join(

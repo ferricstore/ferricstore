@@ -313,7 +313,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
         assert :error = Ferricstore.Flow.LMDB.decode_history_flow_expire_value(history_expiry)
       end
 
-      test "terminal_counts batches count reads without caching missing counts" do
+      test "terminal_counts batches exact reads without process-local caching" do
         path =
           Path.join(
             System.tmp_dir!(),
@@ -328,16 +328,14 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
         assert {:ok, [0, 0]} =
                  Ferricstore.Flow.LMDB.terminal_counts(path, [completed_key, failed_key])
 
-        refute terminal_count_cache_member?(path, completed_key)
-        refute terminal_count_cache_member?(path, failed_key)
+        assert :ets.whereis(:ferricstore_flow_lmdb_terminal_count_cache) == :undefined
 
         assert :ok = Ferricstore.Flow.LMDB.put_terminal_count(path, completed_key, 7)
 
         assert {:ok, [7, 0]} =
                  Ferricstore.Flow.LMDB.terminal_counts(path, [completed_key, failed_key])
 
-        assert terminal_count_cache_member?(path, completed_key)
-        refute terminal_count_cache_member?(path, failed_key)
+        assert :ets.whereis(:ferricstore_flow_lmdb_terminal_count_cache) == :undefined
       end
 
       test "terminal index keys preserve numeric timestamp order in bounded prefix reads" do

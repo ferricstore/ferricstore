@@ -66,6 +66,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ConfigTest do
     assert state.pending_after_flush == []
     assert state.flush_waiters == []
     assert state.flush_chunk_ops == 5_000
+    refute state.terminal_atomic_write?
+    refute Map.has_key?(state, :terminal_count_cache)
   end
 
   test "initial_state normalizes malformed runtime limits" do
