@@ -778,6 +778,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         assert List.last(chunks).total_active == 4097
       end
 
+      @tag :startup_rebuild_limiter
       test "startup active LMDB rebuilds are concurrency bounded" do
         limit = Ferricstore.Flow.LMDBRebuilder.__startup_active_rebuild_concurrency_for_test__()
         task_count = max(limit * 3, 4)
@@ -809,6 +810,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         assert max_seen <= limit
       end
 
+      @tag :startup_rebuild_limiter
       test "startup active LMDB rebuild limit survives the limiter creator exiting" do
         parent = self()
 
@@ -864,6 +866,44 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         assert Enum.map(holders, &Task.await(&1, 1_000)) == List.duplicate(:ok, limit)
         assert_receive :startup_rebuild_waiter_entered, 1_000
         send(waiter.pid, :release_startup_rebuild_waiter)
+        assert :ok = Task.await(waiter, 1_000)
+      end
+
+      @tag :startup_rebuild_kill_reclaim
+      @tag :startup_rebuild_limiter
+      test "startup active LMDB rebuild reclaims slots from killed holders" do
+        parent = self()
+        limit = Ferricstore.Flow.LMDBRebuilder.__startup_active_rebuild_concurrency_for_test__()
+
+        holders =
+          for index <- 1..limit do
+            spawn_monitor(fn ->
+              Ferricstore.Flow.LMDBRebuilder.__with_startup_active_rebuild_slot_for_test__(fn ->
+                send(parent, {:startup_rebuild_kill_slot_held, index})
+                Process.sleep(:infinity)
+              end)
+            end)
+          end
+
+        for index <- 1..limit do
+          assert_receive {:startup_rebuild_kill_slot_held, ^index}, 1_000
+        end
+
+        Enum.each(holders, fn {pid, _monitor_ref} -> Process.exit(pid, :kill) end)
+
+        Enum.each(holders, fn {pid, monitor_ref} ->
+          assert_receive {:DOWN, ^monitor_ref, :process, ^pid, :killed}, 1_000
+        end)
+
+        waiter =
+          Task.async(fn ->
+            Ferricstore.Flow.LMDBRebuilder.__with_startup_active_rebuild_slot_for_test__(fn ->
+              send(parent, :startup_rebuild_entered_after_killed_holders)
+              :ok
+            end)
+          end)
+
+        assert_receive :startup_rebuild_entered_after_killed_holders, 1_000
         assert :ok = Task.await(waiter, 1_000)
       end
 

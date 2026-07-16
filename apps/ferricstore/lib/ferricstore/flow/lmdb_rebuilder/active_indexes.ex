@@ -64,12 +64,12 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
 
   def with_startup_active_rebuild_slot(fun) when is_function(fun, 0) do
     ref = :persistent_term.get(@startup_active_rebuild_slots_key)
-    acquire_startup_active_rebuild_slot(ref, startup_active_rebuild_concurrency())
+    lease = acquire_startup_active_rebuild_slot(ref, startup_active_rebuild_concurrency())
 
     try do
       fun.()
     after
-      release_startup_active_rebuild_slot(ref)
+      release_startup_active_rebuild_slot(lease)
     end
   end
 
@@ -153,22 +153,91 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
   end
 
   defp acquire_startup_active_rebuild_slot(ref, limit) do
+    owner = self()
+    token = make_ref()
+
+    # The guardian owns the counter lease so an untrappable owner exit still releases it.
+    {guardian, monitor_ref} =
+      spawn_monitor(fn ->
+        startup_active_rebuild_slot_guardian(owner, token, ref, limit)
+      end)
+
+    receive do
+      {:startup_active_rebuild_slot_acquired, ^guardian, ^token} ->
+        {guardian, monitor_ref, token}
+
+      {:DOWN, ^monitor_ref, :process, ^guardian, reason} ->
+        raise "startup active LMDB rebuild slot acquisition failed: #{inspect(reason)}"
+    end
+  end
+
+  defp startup_active_rebuild_slot_guardian(owner, token, ref, limit) do
+    owner_monitor = Process.monitor(owner)
+
+    case guardian_acquire_startup_active_rebuild_slot(ref, limit, owner, owner_monitor) do
+      :acquired ->
+        send(owner, {:startup_active_rebuild_slot_acquired, self(), token})
+        guardian_await_startup_active_rebuild_release(ref, owner, owner_monitor, token)
+
+      :owner_down ->
+        :ok
+    end
+  end
+
+  defp guardian_acquire_startup_active_rebuild_slot(ref, limit, owner, owner_monitor) do
+    receive do
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        :owner_down
+    after
+      0 ->
+        guardian_try_startup_active_rebuild_slot(ref, limit, owner, owner_monitor)
+    end
+  end
+
+  defp guardian_try_startup_active_rebuild_slot(ref, limit, owner, owner_monitor) do
     count = :atomics.get(ref, 1)
 
     cond do
       count >= limit ->
-        Process.sleep(10)
-        acquire_startup_active_rebuild_slot(ref, limit)
+        receive do
+          {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+            :owner_down
+        after
+          10 -> guardian_acquire_startup_active_rebuild_slot(ref, limit, owner, owner_monitor)
+        end
 
       :atomics.compare_exchange(ref, 1, count, count + 1) == :ok ->
-        :ok
+        :acquired
 
       true ->
-        acquire_startup_active_rebuild_slot(ref, limit)
+        guardian_acquire_startup_active_rebuild_slot(ref, limit, owner, owner_monitor)
     end
   end
 
-  defp release_startup_active_rebuild_slot(ref) do
+  defp guardian_await_startup_active_rebuild_release(ref, owner, owner_monitor, token) do
+    receive do
+      {:release_startup_active_rebuild_slot, ^owner, ^token} ->
+        Process.demonitor(owner_monitor, [:flush])
+        release_startup_active_rebuild_counter(ref)
+
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        release_startup_active_rebuild_counter(ref)
+    end
+  end
+
+  defp release_startup_active_rebuild_slot({guardian, monitor_ref, token}) do
+    send(guardian, {:release_startup_active_rebuild_slot, self(), token})
+
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^guardian, :normal} ->
+        :ok
+
+      {:DOWN, ^monitor_ref, :process, ^guardian, reason} ->
+        raise "startup active LMDB rebuild slot release failed: #{inspect(reason)}"
+    end
+  end
+
+  defp release_startup_active_rebuild_counter(ref) do
     case :atomics.sub_get(ref, 1, 1) do
       count when count >= 0 ->
         :ok
@@ -179,7 +248,6 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     end
   rescue
     ArgumentError ->
-      # An unsigned counter can only underflow after a mismatched release.
       raise "startup active LMDB rebuild slot released without a matching acquire"
   end
 
