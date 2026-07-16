@@ -1223,6 +1223,32 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert retried.next_run_at_ms == now_ms + 1_000
   end
 
+  test "flow run_steps_many defaults persisted timestamps to the cluster clock" do
+    ref = :persistent_term.get(:ferricstore_hlc_ref)
+    previous = :atomics.get(ref, 1)
+
+    on_exit(fn ->
+      :atomics.put(:persistent_term.get(:ferricstore_hlc_ref), 1, previous)
+    end)
+
+    future_ms = System.system_time(:millisecond) + 60_000
+    :atomics.put(ref, 1, Bitwise.bsl(future_ms, 16))
+    suffix = System.unique_integer([:positive, :monotonic])
+    id = "contract-run-steps-hlc-#{suffix}"
+    partition = "contract-run-steps-hlc-partition-#{suffix}"
+
+    assert :ok =
+             FerricStore.flow_run_steps_many(
+               [%{id: id, partition_key: partition}],
+               type: "contract-run-steps-hlc-type-#{suffix}",
+               states: ["completed"],
+               worker: "contract-run-steps-hlc-worker"
+             )
+
+    assert {:ok, record} = FerricStore.flow_get(id, partition_key: partition)
+    assert record.updated_at_ms >= future_ms + 1
+  end
+
   test "flow run_steps_many runs deterministic step chains in one public command" do
     now_ms = System.system_time(:millisecond)
     suffix = System.unique_integer([:positive, :monotonic])

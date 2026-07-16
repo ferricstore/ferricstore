@@ -190,7 +190,7 @@ defmodule Ferricstore.Flow do
   defp run_steps_many_now_ms(opts) do
     case Keyword.fetch(opts, :now_ms) do
       {:ok, now_ms} when is_integer(now_ms) and now_ms >= 0 -> {:ok, now_ms}
-      :error -> {:ok, System.system_time(:millisecond)}
+      :error -> {:ok, now_ms()}
       _ -> {:error, "ERR flow now_ms must be a non-negative integer"}
     end
   end
