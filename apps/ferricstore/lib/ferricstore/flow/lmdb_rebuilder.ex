@@ -77,7 +77,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           %{shard_index: shard_index}
         )
 
-        :ok
+        case stats.cold_read_errors do
+          0 -> :ok
+          count -> {:error, {:cold_read_errors, count}}
+        end
       end
     after
       Process.delete(:flow_lmdb_rebuild_cold_read_errors)

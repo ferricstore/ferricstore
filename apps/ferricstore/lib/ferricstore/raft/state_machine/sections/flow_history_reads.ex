@@ -1105,8 +1105,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
 
             :ok
 
+          {:error, reason} ->
+            raise "flow native index rollback failed: #{inspect(reason)}"
+
           other ->
-            other
+            raise "flow native index rollback returned: #{inspect(other)}"
         end
       end
 

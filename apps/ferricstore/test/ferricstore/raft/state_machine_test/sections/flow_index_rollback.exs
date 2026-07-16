@@ -56,6 +56,64 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowIndexRollback do
           assert Ferricstore.Flow.OrderedIndex.count_all(state.flow_lookup_name, state_index_key) ==
                    0
         end
+
+        test "fails closed when native Flow index rollback cannot decode existing state", %{
+          state: state,
+          ets: ets
+        } do
+          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+
+          on_exit(fn ->
+            safe_delete_ets(state.zset_score_index_name)
+            safe_delete_ets(state.zset_score_lookup_name)
+          end)
+
+          corrupt_key =
+            Ferricstore.Flow.Keys.state_key(
+              "flow-index-corrupt-existing",
+              "tenant-index-corrupt-existing"
+            )
+
+          :ets.insert(
+            ets,
+            {corrupt_key, "corrupt", 0, LFU.initial(), :memory, 0, byte_size("corrupt")}
+          )
+
+          state_key =
+            Ferricstore.Flow.Keys.state_key(
+              "flow-index-rollback-trigger",
+              "tenant-index-rollback-trigger"
+            )
+
+          Process.put(:ferricstore_state_machine_after_flow_native_apply_batch_hook, fn _native,
+                                                                                        _ops ->
+            raise "injected post-native failure"
+          end)
+
+          try do
+            assert_raise RuntimeError,
+                         ~r/flow native index rollback failed.*cold_read_errors/,
+                         fn ->
+                           StateMachine.apply(
+                             %{system_time: 1_000},
+                             {:flow_create, state_key,
+                              %{
+                                id: "flow-index-rollback-trigger",
+                                type: "index-rollback-trigger",
+                                state: "queued",
+                                partition_key: "tenant-index-rollback-trigger"
+                              }},
+                             state
+                           )
+                         end
+          after
+            Process.delete(:ferricstore_state_machine_after_flow_native_apply_batch_hook)
+          end
+
+          assert [{^corrupt_key, "corrupt", 0, _lfu, :memory, 0, 7}] =
+                   :ets.lookup(ets, corrupt_key)
+        end
       end
 
       describe "promoted compound prefix delete" do
