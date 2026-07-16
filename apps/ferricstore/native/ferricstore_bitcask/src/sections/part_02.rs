@@ -18,9 +18,8 @@ fn available_disk_space_for_path(path: &std::path::Path) -> Result<u64, String> 
         }
 
         let stat = unsafe { stat.assume_init() };
-        (stat.f_bavail as u64)
-            .checked_mul(stat.f_frsize)
-            .ok_or_else(|| "available disk space overflow".to_owned())
+        u64::try_from(u128::from(stat.f_bavail) * u128::from(stat.f_frsize))
+            .map_err(|_| "available disk space overflow".to_owned())
     }
 
     #[cfg(not(unix))]

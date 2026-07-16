@@ -84,7 +84,7 @@ fn openat2_nofollow(
     match error.raw_os_error() {
         // Old kernels and restrictive container profiles fall back to the
         // portable descriptor-walk below.
-        Some(code) if matches!(code, libc::ENOSYS | libc::EINVAL | libc::EPERM) => Ok(None),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EPERM) => Ok(None),
         _other => Err(error),
     }
 }
