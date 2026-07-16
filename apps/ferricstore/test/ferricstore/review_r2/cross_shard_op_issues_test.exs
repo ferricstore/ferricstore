@@ -108,7 +108,10 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       intent_map = %{
         command: :rename,
         keys: %{source: k1, dest: k2},
-        value_hashes: %{k1 => :erlang.phash2(nil)},
+        value_hashes: %{
+          k1 => :erlang.phash2(nil),
+          k2 => Router.watch_token(FerricStore.Instance.get(:default), k2)
+        },
         status: :executing,
         created_at: System.os_time(:millisecond)
       }
@@ -235,7 +238,10 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
         created_at: System.os_time(:millisecond),
         command: :test,
         keys: %{a: k1, b: k2},
-        value_hashes: %{}
+        value_hashes: %{
+          k1 => Router.watch_token(FerricStore.Instance.get(:default), k1),
+          k2 => Router.watch_token(FerricStore.Instance.get(:default), k2)
+        }
       }
 
       # write_intent goes through Ferricstore.Raft.CommandClock.process_command -- verify it returns a value
@@ -354,7 +360,10 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       intent_map = %{
         command: :rename,
         keys: %{source: k1, dest: k2},
-        value_hashes: %{k1 => :erlang.phash2(nil)},
+        value_hashes: %{
+          k1 => :erlang.phash2(nil),
+          k2 => Router.watch_token(FerricStore.Instance.get(:default), k2)
+        },
         status: :executing,
         created_at: now - 20_000
       }

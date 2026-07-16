@@ -1,13 +1,12 @@
 defmodule Ferricstore.Commands.Stream.Entries do
   @moduledoc false
 
-  alias Ferricstore.Store.{CompoundKey, Ops}
-
-  @sep <<0>>
+  alias Ferricstore.Store.{CompoundKey, Ops, ReadResult}
+  alias Ferricstore.TermCodec
 
   @spec entry_key(binary(), binary()) :: binary()
   def entry_key(stream_key, id_str) do
-    "X:#{stream_key}" <> @sep <> id_str
+    CompoundKey.stream_prefix(stream_key) <> id_str
   end
 
   @spec delete_keys(binary(), [binary()]) :: [binary()]
@@ -38,11 +37,14 @@ defmodule Ferricstore.Commands.Stream.Entries do
 
   @spec batch_get(map(), binary(), [binary()]) :: [term()]
   def batch_get(store, stream_key, compound_keys) do
-    if Ops.has_compound?(store) do
-      Ops.compound_batch_get(store, stream_key, compound_keys)
-    else
-      Ops.batch_get(store, compound_keys)
-    end
+    values =
+      if Ops.has_compound?(store) do
+        Ops.compound_batch_get(store, stream_key, compound_keys)
+      else
+        Ops.batch_get(store, compound_keys)
+      end
+
+    normalize_batch_cardinality(values, compound_keys)
   end
 
   @spec delete(map(), binary(), [binary()]) :: :ok | {:error, term()}
@@ -61,22 +63,22 @@ defmodule Ferricstore.Commands.Stream.Entries do
     end
   end
 
-  @spec scan(map(), binary()) :: [term()]
+  @spec scan(map(), binary()) :: [term()] | ReadResult.failure()
   def scan(store, stream_key) do
     Ops.compound_scan(store, stream_key, prefix(stream_key))
   end
 
-  @spec ids_for(map(), binary()) :: [binary()]
+  @spec ids_for(map(), binary()) :: [binary()] | ReadResult.failure()
   def ids_for(store, stream_key) do
     fields_for(store, stream_key)
   end
 
-  @spec fields_for(map(), binary()) :: [binary()]
+  @spec fields_for(map(), binary()) :: [binary()] | ReadResult.failure()
   def fields_for(store, stream_key) do
     Ops.compound_fields(store, stream_key, prefix(stream_key))
   end
 
-  @spec count(map(), binary()) :: non_neg_integer()
+  @spec count(map(), binary()) :: non_neg_integer() | ReadResult.failure()
   def count(store, stream_key) do
     Ops.compound_count(store, stream_key, prefix(stream_key))
   end
@@ -91,19 +93,24 @@ defmodule Ferricstore.Commands.Stream.Entries do
     end
   end
 
-  @spec decode_indexed([{binary(), binary()}], binary(), map()) :: [[binary()]]
+  @spec decode_indexed([{binary(), binary()}], binary(), map()) ::
+          [[binary()]] | {:error, binary()}
   def decode_indexed([], _stream_key, _store), do: []
 
   def decode_indexed(index_entries, stream_key, store) do
     {compound_keys, ids} = indexed_keys_and_ids(index_entries, [], [])
-    raw_values = Ops.compound_batch_get(store, stream_key, compound_keys)
-    decode_indexed_raw(ids, raw_values, [])
+    raw_values = batch_get(store, stream_key, compound_keys)
+
+    case ReadResult.first_failure(raw_values) do
+      nil -> decode_indexed_raw(ids, raw_values, [])
+      failure -> ReadResult.command_error(failure)
+    end
   end
 
   @spec decode_fields(term()) :: {:ok, [binary()]} | :error
   def decode_fields(raw) when is_binary(raw) do
     case Ferricstore.Flow.decode_history_fields(raw) do
-      [_ | _] = fields -> {:ok, fields}
+      [_ | _] = fields -> decode_field_list(fields)
       _ -> decode_term_fields(raw)
     end
   end
@@ -138,11 +145,41 @@ defmodule Ferricstore.Commands.Stream.Entries do
   end
 
   defp decode_term_fields(raw) do
-    case :erlang.binary_to_term(raw, [:safe]) do
-      fields when is_list(fields) -> {:ok, fields}
+    case TermCodec.decode(raw) do
+      {:ok, fields} when is_list(fields) -> decode_field_list(fields)
       _other -> :error
     end
-  rescue
-    _ -> :error
   end
+
+  defp decode_field_list([_field, _value | _rest] = fields) do
+    if valid_field_pairs?(fields), do: {:ok, fields}, else: :error
+  end
+
+  defp decode_field_list(_fields), do: :error
+
+  defp normalize_batch_cardinality(values, compound_keys) when is_list(values) do
+    if same_length?(values, compound_keys) do
+      values
+    else
+      batch_cardinality_failures(compound_keys)
+    end
+  end
+
+  defp normalize_batch_cardinality(_values, compound_keys),
+    do: batch_cardinality_failures(compound_keys)
+
+  defp batch_cardinality_failures(compound_keys) do
+    List.duplicate(ReadResult.failure(:batch_result_length_mismatch), length(compound_keys))
+  end
+
+  defp same_length?([], []), do: true
+  defp same_length?([_ | values], [_ | keys]), do: same_length?(values, keys)
+  defp same_length?(_values, _keys), do: false
+
+  defp valid_field_pairs?([]), do: true
+
+  defp valid_field_pairs?([field, value | rest]) when is_binary(field) and is_binary(value),
+    do: valid_field_pairs?(rest)
+
+  defp valid_field_pairs?(_fields), do: false
 end

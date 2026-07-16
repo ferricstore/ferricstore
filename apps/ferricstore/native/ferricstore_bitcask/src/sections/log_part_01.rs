@@ -158,6 +158,18 @@ impl LogWriter {
         Ok(start)
     }
 
+    /// Append and fsync one live record as a single rollback-capable transaction.
+    pub fn write_sync(&mut self, key: &[u8], value: &[u8], expire_at_ms: u64) -> Result<u64> {
+        validate_kv_sizes(key, value).map_err(LogError)?;
+        let record = encode_record(key, value, expire_at_ms);
+        let start = self
+            .backend
+            .append_and_sync(&record)
+            .map_err(|e| LogError(e.to_string()))?;
+        self.offset = self.backend.offset();
+        Ok(start)
+    }
+
     /// Append a tombstone record (logical delete).
     ///
     /// # Errors
@@ -169,6 +181,18 @@ impl LogWriter {
         let start = self
             .backend
             .append(&record)
+            .map_err(|e| LogError(e.to_string()))?;
+        self.offset = self.backend.offset();
+        Ok(start)
+    }
+
+    /// Append and fsync one tombstone as a single rollback-capable transaction.
+    pub fn write_tombstone_sync(&mut self, key: &[u8]) -> Result<u64> {
+        validate_kv_sizes(key, &[]).map_err(LogError)?;
+        let record = encode_tombstone(key);
+        let start = self
+            .backend
+            .append_and_sync(&record)
             .map_err(|e| LogError(e.to_string()))?;
         self.offset = self.backend.offset();
         Ok(start)
@@ -194,14 +218,6 @@ impl LogWriter {
         Ok(start)
     }
 
-    /// Advance the write offset without writing data. Used by the async
-    /// `io_uring` path to reserve file space that will be written by an
-    /// `AsyncUringBackend`.
-    pub fn advance_offset(&mut self, bytes: u64) {
-        self.backend.advance_offset(bytes);
-        self.offset += bytes;
-    }
-
     /// Flush the write buffer and fsync the file to durable storage.
     ///
     /// # Errors
@@ -209,6 +225,14 @@ impl LogWriter {
     /// Returns a `LogError` if the flush or fsync fails.
     pub fn sync(&mut self) -> Result<()> {
         self.backend.sync().map_err(|e| LogError(e.to_string()))
+    }
+
+    fn rollback_to(&mut self, offset: u64) -> Result<()> {
+        self.backend
+            .rollback_to(offset)
+            .map_err(|error| LogError(error.to_string()))?;
+        self.offset = offset;
+        Ok(())
     }
 
     /// Write multiple records in a single batch and fsync once.
@@ -286,30 +310,29 @@ impl LogWriter {
                 .ok_or_else(|| LogError("batch record length overflow".into()))
         })?;
         let mut combined = Vec::with_capacity(total_len);
-        let mut offsets = Vec::with_capacity(entries.len());
-        let mut running = self.backend.offset();
 
         for (key, value, expire_at_ms) in entries {
-            offsets.push(running);
             encode_record_into(&mut combined, key, value, *expire_at_ms);
-            running += record_len(key.len(), value.len()) as u64;
         }
 
-        self.backend
-            .append(&combined)
-            .map_err(|e| LogError(e.to_string()))?;
+        let append_start = match self.backend.append(&combined) {
+            Ok(offset) => offset,
+            Err(cause) => {
+                self.offset = self.backend.offset();
+                return Err(LogError(cause.to_string()));
+            }
+        };
 
-        // Flush the BufWriter to the OS page cache (but NOT fsync to disk).
-        // This ensures the data is visible to subsequent reads via pread.
-        self.backend
-            .flush_no_sync()
-            .map_err(|e| LogError(e.to_string()))?;
         self.offset = self.backend.offset();
 
-        Ok(offsets
-            .into_iter()
-            .zip(entries.iter())
-            .map(|(off, (_, value, _))| (off, value.len()))
+        let mut running = append_start;
+        Ok(entries
+            .iter()
+            .map(|(key, value, _)| {
+                let offset = running;
+                running += record_len(key.len(), value.len()) as u64;
+                (offset, value.len())
+            })
             .collect())
     }
 
@@ -346,25 +369,8 @@ impl LogWriter {
                 .ok_or_else(|| LogError("batch record length overflow".into()))
         })?;
         let mut combined = Vec::with_capacity(total_len);
-        let mut results = Vec::with_capacity(entries.len());
-        let mut running = self.backend.offset();
 
         for entry in entries {
-            match entry {
-                BatchWrite::Put { value, .. } => {
-                    results.push(BatchWriteResult::Put {
-                        offset: running,
-                        value_len: value.len(),
-                    });
-                }
-                BatchWrite::Delete { key } => {
-                    results.push(BatchWriteResult::Delete {
-                        offset: running,
-                        record_size: HEADER_SIZE + key.len(),
-                    });
-                }
-            }
-
             match entry {
                 BatchWrite::Put {
                     key,
@@ -372,25 +378,40 @@ impl LogWriter {
                     expire_at_ms,
                 } => {
                     encode_record_into(&mut combined, key, value, *expire_at_ms);
-                    running += record_len(key.len(), value.len()) as u64;
                 }
                 BatchWrite::Delete { key } => {
                     encode_tombstone_into(&mut combined, key);
-                    running += tombstone_len(key.len()) as u64;
                 }
             }
         }
 
-        self.backend
-            .append(&combined)
-            .map_err(|e| LogError(e.to_string()))?;
+        let append_start = match self.backend.append(&combined) {
+            Ok(offset) => offset,
+            Err(cause) => {
+                self.offset = self.backend.offset();
+                return Err(LogError(cause.to_string()));
+            }
+        };
 
-        self.backend
-            .flush_no_sync()
-            .map_err(|e| LogError(e.to_string()))?;
         self.offset = self.backend.offset();
 
-        Ok(results)
+        Ok(batch_write_results(entries, append_start))
+    }
+
+    /// Write a mixed put/delete batch and fsync it as one rollback-capable transaction.
+    pub fn write_ops_batch(&mut self, entries: &[BatchWrite<'_>]) -> Result<Vec<BatchWriteResult>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        validate_batch_writes(entries)?;
+        let combined = encode_batch_writes(entries)?;
+        let start = self
+            .backend
+            .append_and_sync(&combined)
+            .map_err(|e| LogError(e.to_string()))?;
+        self.offset = self.backend.offset();
+        Ok(batch_write_results(entries, start))
     }
 
     /// Write pre-encoded record buffers and fsync. Returns the file offset
@@ -414,3 +435,64 @@ impl LogWriter {
     }
 }
 
+fn validate_batch_writes(entries: &[BatchWrite<'_>]) -> Result<()> {
+    for entry in entries {
+        match entry {
+            BatchWrite::Put { key, value, .. } => {
+                validate_kv_sizes(key, value).map_err(LogError)?;
+            }
+            BatchWrite::Delete { key } => {
+                validate_kv_sizes(key, &[]).map_err(LogError)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_batch_writes(entries: &[BatchWrite<'_>]) -> Result<Vec<u8>> {
+    let total_len = entries.iter().try_fold(0usize, |acc, entry| {
+        let len = match entry {
+            BatchWrite::Put { key, value, .. } => record_len(key.len(), value.len()),
+            BatchWrite::Delete { key } => tombstone_len(key.len()),
+        };
+        acc.checked_add(len)
+            .ok_or_else(|| LogError("batch record length overflow".into()))
+    })?;
+
+    let mut combined = Vec::with_capacity(total_len);
+    for entry in entries {
+        match entry {
+            BatchWrite::Put {
+                key,
+                value,
+                expire_at_ms,
+            } => encode_record_into(&mut combined, key, value, *expire_at_ms),
+            BatchWrite::Delete { key } => encode_tombstone_into(&mut combined, key),
+        }
+    }
+    Ok(combined)
+}
+
+fn batch_write_results(entries: &[BatchWrite<'_>], start: u64) -> Vec<BatchWriteResult> {
+    let mut running = start;
+    entries
+        .iter()
+        .map(|entry| {
+            let result = match entry {
+                BatchWrite::Put { value, .. } => BatchWriteResult::Put {
+                    offset: running,
+                    value_len: value.len(),
+                },
+                BatchWrite::Delete { key } => BatchWriteResult::Delete {
+                    offset: running,
+                    record_size: HEADER_SIZE + key.len(),
+                },
+            };
+            running += match entry {
+                BatchWrite::Put { key, value, .. } => record_len(key.len(), value.len()) as u64,
+                BatchWrite::Delete { key } => tombstone_len(key.len()) as u64,
+            };
+            result
+        })
+        .collect()
+}

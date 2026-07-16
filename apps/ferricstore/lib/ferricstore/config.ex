@@ -54,6 +54,11 @@ defmodule Ferricstore.Config do
 
   use GenServer
 
+  @max_config_file_bytes 1_048_576
+  @max_param_name_bytes 128
+  @max_param_value_bytes 65_536
+  @valid_notification_flags MapSet.new(~c"KEg$hlsztxA")
+
   require Logger
 
   # Read-only parameters whose values are derived from Application env
@@ -288,13 +293,13 @@ defmodule Ferricstore.Config do
 
   @impl true
   def init(:ok) do
-    # Create a public ETS table for lock-free reads via get_value/1.
+    # Create a protected ETS table for lock-free reads via get_value/1.
     # Connection processes read `requirepass` on every command; routing
     # through GenServer.call serialized all connections through this process.
     if :ets.whereis(:ferricstore_config) == :undefined do
       :ets.new(:ferricstore_config, [
         :set,
-        :public,
+        :protected,
         :named_table,
         {:read_concurrency, true}
       ])
@@ -322,29 +327,29 @@ defmodule Ferricstore.Config do
 
   def handle_call({:set, key, value}, _from, state) do
     cond do
+      not is_binary(key) or not is_binary(value) ->
+        {:reply, {:error, "ERR CONFIG parameter and value must be strings"}, state}
+
+      byte_size(key) > @max_param_name_bytes ->
+        {:reply, {:error, "ERR CONFIG parameter name is too large"}, state}
+
+      byte_size(value) > @max_param_value_bytes ->
+        {:reply, {:error, "ERR CONFIG value is too large"}, state}
+
       MapSet.member?(@read_only_params, key) ->
         {:reply, {:error, "ERR Unsupported CONFIG parameter: #{key} (read-only)"}, state}
 
       MapSet.member?(@read_write_params, key) ->
         case validate_param(key, value) do
           :ok ->
-            old_value = Map.get(state, key, "")
-            new_state = Map.put(state, key, value)
-            apply_side_effect(key, value)
-            emit_config_changed(key, value, old_value)
-            sync_ets_key(key, value)
-            {:reply, :ok, new_state}
+            publish_config_change(key, value, state)
 
           {:error, reason} ->
             {:reply, {:error, reason}, state}
         end
 
       Map.has_key?(@legacy_rw_defaults, key) ->
-        old_value = Map.get(state, key, "")
-        new_state = Map.put(state, key, value)
-        emit_config_changed(key, value, old_value)
-        sync_ets_key(key, value)
-        {:reply, :ok, new_state}
+        publish_config_change(key, value, state)
 
       true ->
         {:reply, {:error, "ERR Unsupported CONFIG parameter: #{key}"}, state}
@@ -369,9 +374,22 @@ defmodule Ferricstore.Config do
 
     # Read existing file content (if any)
     existing_lines =
-      case File.read(path) do
-        {:ok, content} -> String.split(content, "\n")
-        {:error, _} -> []
+      case Ferricstore.FS.read_nofollow(path, @max_config_file_bytes) do
+        {:ok, content} ->
+          if String.valid?(content) do
+            String.split(content, "\n")
+          else
+            throw({:error, "ERR config file must be valid UTF-8"})
+          end
+
+        {:error, {:not_found, _reason}} ->
+          []
+
+        {:error, {:too_large, _reason}} ->
+          throw({:error, "ERR config file exceeds #{@max_config_file_bytes} bytes"})
+
+        {:error, reason} ->
+          throw({:error, "ERR failed to read config file: #{inspect(reason)}"})
       end
 
     # Track which keys from state have been written
@@ -408,11 +426,32 @@ defmodule Ferricstore.Config do
 
     content = Enum.join(all_lines, "\n") <> "\n"
 
+    if byte_size(content) > @max_config_file_bytes do
+      throw({:error, "ERR rewritten config exceeds #{@max_config_file_bytes} bytes"})
+    end
+
     # Atomic write: write to tmp then rename
     result = atomic_write_file(path, content)
     {:reply, result, state}
   catch
     {:error, _reason} = error -> {:reply, error, state}
+  end
+
+  defp publish_config_change(key, value, state) do
+    case safe_apply_side_effect(key, value) do
+      :ok ->
+        old_value = Map.get(state, key, "")
+        new_state = Map.put(state, key, value)
+        emit_config_changed(key, value, old_value)
+        sync_ets_key(key, value)
+        {:reply, :ok, new_state}
+
+      {:error, reason} ->
+        message =
+          "ERR failed to apply CONFIG parameter '#{key}': #{format_reason(reason)}"
+
+        {:reply, {:error, message}, state}
+    end
   end
 
   defp rewrite_config_line(line, state, lines_acc, written_acc) do
@@ -667,9 +706,12 @@ defmodule Ferricstore.Config do
     end
   end
 
-  defp validate_param("notify-keyspace-events", _value) do
-    # Any string of flags is accepted (K, E, g, $, x, A, or empty to disable).
-    :ok
+  defp validate_param("notify-keyspace-events", value) do
+    if Enum.all?(:binary.bin_to_list(value), &MapSet.member?(@valid_notification_flags, &1)) do
+      :ok
+    else
+      {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'notify-keyspace-events'"}
+    end
   end
 
   defp validate_param("slowlog-log-slower-than", value) do
@@ -754,8 +796,10 @@ defmodule Ferricstore.Config do
         "noeviction" -> :noeviction
       end
 
-    Application.put_env(:ferricstore, :eviction_policy, atom)
-    reconfigure_memory_guard("maxmemory-policy", %{eviction_policy: atom})
+    with :ok <- reconfigure_memory_guard("maxmemory-policy", %{eviction_policy: atom}) do
+      Application.put_env(:ferricstore, :eviction_policy, atom)
+      :ok
+    end
   end
 
   defp apply_side_effect("slowlog-log-slower-than", value) do
@@ -770,20 +814,29 @@ defmodule Ferricstore.Config do
 
   defp apply_side_effect("keydir-max-ram", value) do
     {n, ""} = Integer.parse(value)
-    Application.put_env(:ferricstore, :keydir_max_ram, n)
-    reconfigure_memory_guard("keydir-max-ram", %{keydir_max_ram: n})
+
+    with :ok <- reconfigure_memory_guard("keydir-max-ram", %{keydir_max_ram: n}) do
+      Application.put_env(:ferricstore, :keydir_max_ram, n)
+      :ok
+    end
   end
 
   defp apply_side_effect("hot-cache-max-ram", value) do
     {n, ""} = Integer.parse(value)
-    Application.put_env(:ferricstore, :hot_cache_max_ram, n)
-    reconfigure_memory_guard("hot-cache-max-ram", %{hot_cache_max_ram: n})
+
+    with :ok <- reconfigure_memory_guard("hot-cache-max-ram", %{hot_cache_max_ram: n}) do
+      Application.put_env(:ferricstore, :hot_cache_max_ram, n)
+      :ok
+    end
   end
 
   defp apply_side_effect("hot-cache-min-ram", value) do
     {n, ""} = Integer.parse(value)
-    Application.put_env(:ferricstore, :hot_cache_min_ram, n)
-    reconfigure_memory_guard("hot-cache-min-ram", %{hot_cache_min_ram: n})
+
+    with :ok <- reconfigure_memory_guard("hot-cache-min-ram", %{hot_cache_min_ram: n}) do
+      Application.put_env(:ferricstore, :hot_cache_min_ram, n)
+      :ok
+    end
   end
 
   defp apply_side_effect("hot-cache-max-value-size", value) do
@@ -799,19 +852,45 @@ defmodule Ferricstore.Config do
 
   defp apply_side_effect(_key, _value), do: :ok
 
+  defp safe_apply_side_effect(key, value) do
+    apply_side_effect(key, value)
+  rescue
+    exception ->
+      emit_side_effect_failed(key, :apply, :error, exception)
+      {:error, exception}
+  catch
+    kind, reason ->
+      emit_side_effect_failed(key, :apply, kind, reason)
+      {:error, reason}
+  end
+
   defp reconfigure_memory_guard(param, params) do
     try do
-      memory_guard_reconfigure(params)
+      case memory_guard_reconfigure(params) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          emit_side_effect_failed(param, :memory_guard_reconfigure, :return, reason)
+          {:error, reason}
+
+        other ->
+          emit_side_effect_failed(param, :memory_guard_reconfigure, :return, other)
+          {:error, {:unexpected_memory_guard_result, other}}
+      end
     rescue
       exception ->
         emit_side_effect_failed(param, :memory_guard_reconfigure, :error, exception)
-        :ok
+        {:error, exception}
     catch
       kind, reason ->
         emit_side_effect_failed(param, :memory_guard_reconfigure, kind, reason)
-        :ok
+        {:error, reason}
     end
   end
+
+  defp format_reason(reason) when is_binary(reason), do: reason
+  defp format_reason(reason), do: inspect(reason, limit: 10, printable_limit: 256)
 
   defp memory_guard_reconfigure(params) do
     case Application.get_env(:ferricstore, :config_memory_guard_reconfigure_hook) do

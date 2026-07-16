@@ -48,6 +48,16 @@ defmodule Ferricstore.Store.CompoundKeyTest do
       key = CompoundKey.hash_field("key", "")
       assert key == <<"H:key", 0>>
     end
+
+    test "does not alias a NUL in the logical key with a NUL in the field" do
+      refute CompoundKey.hash_field(<<"{slot}a", 0, "b">>, "c") ==
+               CompoundKey.hash_field("{slot}a", <<"b", 0, "c">>)
+    end
+
+    test "keeps escaped-looking logical keys distinct from binary logical keys" do
+      refute CompoundKey.hash_field("key%00suffix", "field") ==
+               CompoundKey.hash_field(<<"key", 0, "suffix">>, "field")
+    end
   end
 
   describe "hash_prefix/1" do
@@ -189,6 +199,40 @@ defmodule Ferricstore.Store.CompoundKeyTest do
       assert key == CompoundKey.extract_redis_key(CompoundKey.type_key(key))
       assert key == CompoundKey.extract_redis_key(CompoundKey.list_meta_key(key))
       assert key == CompoundKey.extract_redis_key("PM:" <> key)
+    end
+
+    test "round-trips binary logical keys through every physical-key family" do
+      key = <<"percent%", 0, 255, "key">>
+
+      physical_keys = [
+        CompoundKey.hash_field(key, <<0, "%field">>),
+        CompoundKey.list_element(key, 1),
+        CompoundKey.set_member(key, <<0, "%member">>),
+        CompoundKey.zset_member(key, <<0, "%member">>),
+        CompoundKey.stream_prefix(key) <> "1-0",
+        CompoundKey.stream_group(key, <<0, "%group">>),
+        CompoundKey.type_key(key),
+        CompoundKey.list_meta_key(key),
+        CompoundKey.stream_meta_key(key),
+        CompoundKey.promotion_marker_key(key)
+      ]
+
+      assert Enum.all?(physical_keys, &(CompoundKey.extract_redis_key(&1) == key))
+    end
+
+    test "physical prefixes contain exactly one delimiter before the subkey" do
+      key = <<"a", 0, "b%00c">>
+
+      for prefix <- [
+            CompoundKey.hash_prefix(key),
+            CompoundKey.list_prefix(key),
+            CompoundKey.set_prefix(key),
+            CompoundKey.zset_prefix(key),
+            CompoundKey.stream_prefix(key),
+            CompoundKey.stream_group_prefix(key)
+          ] do
+        assert [_encoded_key, ""] = :binary.split(prefix, <<0>>, [:global])
+      end
     end
   end
 

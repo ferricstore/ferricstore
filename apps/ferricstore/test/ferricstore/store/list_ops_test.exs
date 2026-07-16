@@ -25,6 +25,18 @@ defmodule Ferricstore.Store.ListOpsTest do
     assert ListOps.decode_meta("not-erlang-term") == nil
   end
 
+  test "list metadata codec rejects non-canonical and oversized external terms" do
+    meta = {3, -1, 2}
+    encoded = ListOps.encode_meta(meta)
+    huge = :binary.decode_unsigned(:binary.copy(<<1>>, 4_096))
+    compressed = :erlang.term_to_binary({huge, huge, huge}, compressed: 9)
+    assert <<131, 80, _rest::binary>> = compressed
+
+    assert ListOps.decode_meta(encoded <> <<0>>) == nil
+    assert ListOps.decode_meta(compressed) == nil
+    assert ListOps.decode_meta(:erlang.term_to_binary({huge, huge, huge})) == nil
+  end
+
   test "RPUSH returns write error when element append fails" do
     store = failing_put_store()
 
@@ -107,6 +119,74 @@ defmodule Ferricstore.Store.ListOpsTest do
     assert_received {:compound_batch_delete, deleted_keys}
     assert length(deleted_keys) == 2
     refute_received {:compound_batch_delete, _}
+  end
+
+  test "LPOP count reads only the bounded left window" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+
+    store = %{
+      compound_get: fn "list", ^meta_key ->
+        ListOps.encode_meta({100, -1_000_000_000, 100_000_000_000})
+      end,
+      compound_scan_slice: fn "list", _prefix, start, count, total ->
+        send(parent, {:slice, start, count, total})
+
+        [
+          {CompoundKey.encode_position(0), "a"},
+          {CompoundKey.encode_position(1_000_000_000), "b"}
+        ]
+      end,
+      compound_scan: fn _redis_key, _prefix -> flunk("LPOP count must not scan the full list") end,
+      compound_batch_delete: fn "list", keys ->
+        send(parent, {:deleted, keys})
+        :ok
+      end,
+      compound_put: fn "list", ^meta_key, encoded_meta, 0 ->
+        send(parent, {:meta, ListOps.decode_meta(encoded_meta)})
+        :ok
+      end
+    }
+
+    assert ["a", "b"] == ListOps.execute("list", store, {:lpop, 2})
+    assert_received {:slice, 0, 2, 100}
+    assert_received {:deleted, deleted}
+    assert length(deleted) == 2
+    assert_received {:meta, {98, 1_000_000_000, 100_000_000_000}}
+  end
+
+  test "RPOP count reads only the bounded right window" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+
+    store = %{
+      compound_get: fn "list", ^meta_key ->
+        ListOps.encode_meta({100, -1_000_000_000, 100_000_000_000})
+      end,
+      compound_scan_slice: fn "list", _prefix, start, count, total ->
+        send(parent, {:slice, start, count, total})
+
+        [
+          {CompoundKey.encode_position(98_000_000_000), "y"},
+          {CompoundKey.encode_position(99_000_000_000), "z"}
+        ]
+      end,
+      compound_scan: fn _redis_key, _prefix -> flunk("RPOP count must not scan the full list") end,
+      compound_batch_delete: fn "list", keys ->
+        send(parent, {:deleted, keys})
+        :ok
+      end,
+      compound_put: fn "list", ^meta_key, encoded_meta, 0 ->
+        send(parent, {:meta, ListOps.decode_meta(encoded_meta)})
+        :ok
+      end
+    }
+
+    assert ["z", "y"] == ListOps.execute("list", store, {:rpop, 2})
+    assert_received {:slice, 98, 2, 100}
+    assert_received {:deleted, deleted}
+    assert length(deleted) == 2
+    assert_received {:meta, {98, -1_000_000_000, 98_000_000_000}}
   end
 
   test "single LPOP uses metadata boundary without scanning the list" do
@@ -327,7 +407,9 @@ defmodule Ferricstore.Store.ListOpsTest do
         "src", ^meta_key -> :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
         _redis_key, _compound_key -> nil
       end,
-      compound_batch_delete: fn "src", [^element_key] -> {:error, "disk full"} end,
+      compound_batch_delete: fn "src", [^element_key, ^meta_key] ->
+        {:error, "disk full"}
+      end,
       compound_delete: fn _redis_key, _compound_key -> {:error, "disk full"} end,
       compound_put: fn redis_key, compound_key, _value, _expire_at_ms ->
         flunk(
@@ -344,26 +426,17 @@ defmodule Ferricstore.Store.ListOpsTest do
 
   test "LMOVE returns error when destination element write fails" do
     src_meta_key = CompoundKey.list_meta_key("src")
+    src_element_key = CompoundKey.list_element("src", 0)
 
     store = %{
       compound_get: fn
         "src", ^src_meta_key -> :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
         _redis_key, _compound_key -> nil
       end,
-      compound_batch_delete: fn "src", [_element_key] -> :ok end,
-      compound_delete: fn "src", ^src_meta_key -> :ok end,
-      compound_put: fn
-        "src", <<"L:src", _rest::binary>>, "a", 0 ->
-          :ok
-
-        "src", ^src_meta_key, _meta, 0 ->
-          :ok
-
-        "dst", <<"L:dst", _rest::binary>>, "a", 0 ->
-          {:error, "disk full"}
-
-        "dst", <<"LM:dst">>, _meta, 0 ->
-          flunk("LMOVE must not write destination metadata after element write failure")
+      compound_batch_delete: fn "src", [^src_element_key, ^src_meta_key] -> :ok end,
+      compound_batch_put: fn
+        "dst", _entries -> {:error, "disk full"}
+        "src", _entries -> :ok
       end,
       compound_scan: fn "src", _prefix ->
         [{CompoundKey.encode_position(0), "a"}]
@@ -371,6 +444,75 @@ defmodule Ferricstore.Store.ListOpsTest do
     }
 
     assert {:error, "disk full"} == ListOps.execute_lmove("src", "dst", store, :left, :right)
+  end
+
+  test "LMOVE writes the destination element and metadata in one batch" do
+    parent = self()
+    src_meta_key = CompoundKey.list_meta_key("src")
+    dst_meta_key = CompoundKey.list_meta_key("dst")
+    src_element_key = CompoundKey.list_element("src", 0)
+    dst_element_key = CompoundKey.list_element("dst", 0)
+
+    store = %{
+      compound_get: fn
+        "src", ^src_meta_key -> :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
+        _redis_key, _compound_key -> nil
+      end,
+      compound_batch_delete: fn "src", [^src_element_key, ^src_meta_key] ->
+        send(parent, :source_batch_deleted)
+        :ok
+      end,
+      compound_batch_put: fn
+        "dst",
+        [
+          {^dst_element_key, "a", 0},
+          {^dst_meta_key, encoded_meta, 0}
+        ] ->
+          assert {1, -1_000_000_000, 1_000_000_000} == ListOps.decode_meta(encoded_meta)
+          send(parent, :destination_batch_written)
+          :ok
+      end,
+      compound_scan: fn "src", _prefix ->
+        [{CompoundKey.encode_position(0), "a"}]
+      end
+    }
+
+    assert "a" == ListOps.execute_lmove("src", "dst", store, :left, :right)
+    assert_received :source_batch_deleted
+    assert_received :destination_batch_written
+  end
+
+  test "LMOVE reports a failed source restore after a destination failure" do
+    src_meta_key = CompoundKey.list_meta_key("src")
+    src_element_key = CompoundKey.list_element("src", 0)
+
+    store = %{
+      compound_get: fn
+        "src", ^src_meta_key -> :erlang.term_to_binary({1, -1_000_000_000, 1_000_000_000})
+        _redis_key, _compound_key -> nil
+      end,
+      compound_batch_delete: fn
+        "src", [^src_element_key] -> :ok
+        "src", [^src_element_key, ^src_meta_key] -> :ok
+      end,
+      compound_delete: fn "src", ^src_meta_key -> :ok end,
+      compound_put: fn
+        "dst", _compound_key, "a", 0 -> {:error, :disk_full}
+        "src", ^src_element_key, "a", 0 -> {:error, :restore_failed}
+        "src", ^src_meta_key, _meta, 0 -> :ok
+      end,
+      compound_batch_put: fn
+        "dst", _entries -> {:error, :disk_full}
+        "src", _entries -> {:error, :restore_failed}
+      end,
+      compound_scan: fn "src", _prefix ->
+        [{CompoundKey.encode_position(0), "a"}]
+      end
+    }
+
+    assert {:error,
+            {:lmove_source_rollback_failed, {:error, :disk_full}, {:error, :restore_failed}}} ==
+             ListOps.execute_lmove("src", "dst", store, :left, :right)
   end
 
   test "LSET returns element write errors" do
@@ -416,9 +558,18 @@ defmodule Ferricstore.Store.ListOpsTest do
   test "LINSERT rebalance returns delete errors before rewriting positions" do
     meta_key = CompoundKey.list_meta_key("list")
     old_keys = [CompoundKey.list_element("list", 0), CompoundKey.list_element("list", 1)]
+    [old_first, old_second] = old_keys
 
     store = %{
       compound_get: fn "list", ^meta_key -> :erlang.term_to_binary({2, -1, 2}) end,
+      compound_batch_get_meta: fn "list", compound_keys ->
+        Enum.map(compound_keys, fn
+          ^old_first -> {"a", 0}
+          ^old_second -> {"b", 0}
+          ^meta_key -> {:erlang.term_to_binary({2, -1, 2}), 0}
+          _new_key -> nil
+        end)
+      end,
       compound_batch_delete: fn "list", ^old_keys -> {:error, "disk full"} end,
       compound_batch_put: fn "list", _entries ->
         flunk("LINSERT rebalance must not rewrite positions after delete failure")
@@ -447,13 +598,22 @@ defmodule Ferricstore.Store.ListOpsTest do
              ListOps.execute("list", store, {:linsert, :after, "a", "x"})
   end
 
-  test "LINSERT rebalance batches position rewrite before inserting new element" do
+  test "LINSERT rebalance fallback batches the complete replacement" do
     parent = self()
     meta_key = CompoundKey.list_meta_key("list")
     old_keys = [CompoundKey.list_element("list", 0), CompoundKey.list_element("list", 1)]
+    [old_first, old_second] = old_keys
 
     store = %{
       compound_get: fn "list", ^meta_key -> :erlang.term_to_binary({2, -1, 2}) end,
+      compound_batch_get_meta: fn "list", compound_keys ->
+        Enum.map(compound_keys, fn
+          ^old_first -> {"a", 0}
+          ^old_second -> {"b", 0}
+          ^meta_key -> {:erlang.term_to_binary({2, -1, 2}), 0}
+          _new_key -> nil
+        end)
+      end,
       compound_batch_delete: fn "list", ^old_keys ->
         send(parent, {:rebalance_delete, old_keys})
         :ok
@@ -488,25 +648,184 @@ defmodule Ferricstore.Store.ListOpsTest do
     assert_received {:rebalance_delete, ^old_keys}
     assert_received {:rebalance_put, entries}
 
-    assert [
-             {_, "a", 0},
-             {_, "b", 0}
-           ] = entries
+    assert {^meta_key, encoded_meta, 0} = List.keyfind(entries, meta_key, 0)
+    assert {3, -1_000_000_000, 2_000_000_000} == ListOps.decode_meta(encoded_meta)
+
+    values =
+      entries
+      |> Enum.reject(fn {compound_key, _value, _expire_at_ms} -> compound_key == meta_key end)
+      |> Enum.map(fn {_compound_key, value, _expire_at_ms} -> value end)
+
+    assert Enum.sort(values) == ["a", "b", "x"]
 
     refute_received {:rebalance_delete, _}
     refute_received {:rebalance_put, _}
   end
 
-  test "read-only commands treat corrupt persisted metadata as missing list" do
-    store = corrupt_meta_store(<<131, 100, 0, 12, "made_up_atom">>)
+  test "LINSERT rebalance commits deletes, rewritten positions, element, and metadata together" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+    old_keys = [CompoundKey.list_element("list", 0), CompoundKey.list_element("list", 1)]
 
-    assert 0 = ListOps.execute("list", store, :llen)
+    store = %{
+      compound_get: fn "list", ^meta_key -> ListOps.encode_meta({2, -1, 2}) end,
+      compound_batch_mutate: fn "list", deletes, puts ->
+        send(parent, {:compound_batch_mutate, deletes, puts})
+        :ok
+      end,
+      compound_batch_delete: fn _redis_key, _keys ->
+        flunk("rebalance must use one mixed mutation")
+      end,
+      compound_batch_put: fn _redis_key, _entries ->
+        flunk("rebalance must use one mixed mutation")
+      end,
+      compound_put: fn _redis_key, _compound_key, _value, _expire_at_ms ->
+        flunk("rebalance must use one mixed mutation")
+      end,
+      compound_scan: fn "list", _prefix ->
+        [
+          {CompoundKey.encode_position(0), "a"},
+          {CompoundKey.encode_position(1), "b"}
+        ]
+      end
+    }
+
+    assert 3 == ListOps.execute("list", store, {:linsert, :after, "a", "x"})
+    assert_received {:compound_batch_mutate, ^old_keys, puts}
+
+    assert {^meta_key, encoded_meta, 0} = List.keyfind(puts, meta_key, 0)
+    assert {3, -1_000_000_000, 2_000_000_000} == ListOps.decode_meta(encoded_meta)
+
+    values =
+      puts
+      |> Enum.reject(fn {key, _value, _expire_at_ms} -> key == meta_key end)
+      |> Enum.map(fn {_key, value, _expire_at_ms} -> value end)
+
+    assert Enum.sort(values) == ["a", "b", "x"]
+    refute_received {:compound_batch_mutate, _, _}
   end
 
-  test "read-only commands treat wrong-shape persisted metadata as missing list" do
+  test "LINDEX reads only the requested catalog rank" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+
+    store = %{
+      compound_get: fn "list", ^meta_key ->
+        ListOps.encode_meta({100, -1_000_000_000, 100_000_000_000})
+      end,
+      compound_scan_slice: fn "list", _prefix, start, count, total ->
+        send(parent, {:slice, start, count, total})
+        [{CompoundKey.encode_position(50_000_000_000), "target"}]
+      end,
+      compound_scan: fn _redis_key, _prefix -> flunk("LINDEX must not scan the full list") end
+    }
+
+    assert "target" == ListOps.execute("list", store, {:lindex, 50})
+    assert_received {:slice, 50, 1, 100}
+  end
+
+  test "small LRANGE materializes only its requested window" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+
+    store = %{
+      compound_get: fn "list", ^meta_key ->
+        ListOps.encode_meta({100, -1_000_000_000, 100_000_000_000})
+      end,
+      compound_scan_slice: fn "list", _prefix, start, count, total ->
+        send(parent, {:slice, start, count, total})
+
+        Enum.map(10..12, fn rank ->
+          {CompoundKey.encode_position(rank * 1_000_000_000), "v#{rank}"}
+        end)
+      end,
+      compound_scan: fn _redis_key, _prefix -> flunk("LRANGE must not scan the full list") end
+    }
+
+    assert ["v10", "v11", "v12"] == ListOps.execute("list", store, {:lrange, 10, 12})
+    assert_received {:slice, 10, 3, 100}
+  end
+
+  test "LSET resolves only the target catalog rank" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+    element_key = CompoundKey.list_element("list", 50_000_000_000)
+
+    store = %{
+      compound_get: fn "list", ^meta_key ->
+        ListOps.encode_meta({100, -1_000_000_000, 100_000_000_000})
+      end,
+      compound_scan_slice: fn "list", _prefix, 50, 1, 100 ->
+        [{CompoundKey.encode_position(50_000_000_000), "old"}]
+      end,
+      compound_put: fn "list", ^element_key, "new", 0 ->
+        send(parent, :updated_target)
+        :ok
+      end,
+      compound_scan: fn _redis_key, _prefix -> flunk("LSET must not scan the full list") end
+    }
+
+    assert :ok == ListOps.execute("list", store, {:lset, 50, "new"})
+    assert_received :updated_target
+  end
+
+  test "LPOS MAXLEN reads only the bounded search window" do
+    parent = self()
+    meta_key = CompoundKey.list_meta_key("list")
+
+    store = %{
+      compound_get: fn "list", ^meta_key ->
+        ListOps.encode_meta({100, -1_000_000_000, 100_000_000_000})
+      end,
+      compound_scan_slice: fn "list", _prefix, start, count, total ->
+        send(parent, {:slice, start, count, total})
+
+        ["a", "b", "target", "c", "d"]
+        |> Enum.with_index(start)
+        |> Enum.map(fn {value, rank} ->
+          {CompoundKey.encode_position(rank * 1_000_000_000), value}
+        end)
+      end,
+      compound_scan: fn _redis_key, _prefix ->
+        flunk("LPOS MAXLEN must not scan the full list")
+      end
+    }
+
+    assert 2 == ListOps.execute("list", store, {:lpos, "target", 1, nil, 5})
+    assert_received {:slice, 0, 5, 100}
+  end
+
+  test "read-only commands report corrupt persisted metadata" do
+    store = corrupt_meta_store(<<131, 100, 0, 12, "made_up_atom">>)
+
+    assert {:error, "ERR storage read failed"} = ListOps.execute("list", store, :llen)
+  end
+
+  test "read-only commands report wrong-shape persisted metadata" do
     store = corrupt_meta_store(:erlang.term_to_binary({:not_a_list_meta, "x"}))
 
-    assert [] = ListOps.execute("list", store, {:lrange, 0, -1})
+    assert {:error, "ERR storage read failed"} =
+             ListOps.execute("list", store, {:lrange, 0, -1})
+  end
+
+  test "list scans report corrupt persisted position keys instead of raising" do
+    meta_key = CompoundKey.list_meta_key("list")
+
+    store = %{
+      compound_get: fn "list", ^meta_key ->
+        ListOps.encode_meta({2, -1_000_000_000, 2_000_000_000})
+      end,
+      compound_scan: fn "list", _prefix -> [{"corrupt-position", "a"}] end,
+      compound_scan_slice: fn "list", _prefix, _start, _count, _total ->
+        [{"P00000000000000000000.bad", "a"}]
+      end
+    }
+
+    assert {:error, "ERR storage read failed"} =
+             ListOps.execute("list", store, {:lrange, 0, -1})
+
+    assert {:error, "ERR storage read failed"} =
+             ListOps.execute("list", store, {:lrem, 0, "a"})
   end
 
   defp failing_put_store do

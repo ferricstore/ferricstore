@@ -177,6 +177,21 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           assert s2.applied_count == 2
           assert s3.applied_count == 3
         end
+
+        @tag :skip_marker_jump_cleanup
+        test "clears a replay skip marker when the next index jumps past it", %{
+          state: state,
+          ets: ets
+        } do
+          state = %{state | skip_below_index: 10}
+
+          {next_state, {:applied_at, 11, :ok}, _effects} =
+            StateMachine.apply(%{index: 11}, {:put, "after-skip", "value", 0}, state)
+
+          assert next_state.skip_below_index == 0
+          assert [{"after-skip", "value", 0, _lfu, _fid, _off, _vsize}] =
+                   :ets.lookup(ets, "after-skip")
+        end
       end
     end
   end

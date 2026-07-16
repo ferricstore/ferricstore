@@ -121,7 +121,7 @@ defmodule Ferricstore.Store.Router.Part06 do
 
       @doc false
       def __forwarded_batch_quorum_put_entries__(ctx, entries, origin_node) do
-        do_batch_quorum_put_entries(ctx, entries, origin_node)
+        batch_quorum_put(ctx, entries, origin_node)
       end
 
       @doc false
@@ -147,22 +147,12 @@ defmodule Ferricstore.Store.Router.Part06 do
       @spec put(FerricStore.Instance.t(), binary(), binary(), non_neg_integer()) ::
               :ok | {:error, binary()}
       def put(ctx, key, value, expire_at_ms \\ 0) do
-        cond do
-          byte_size(key) > @max_key_size ->
-            {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        case admit_string_write(ctx, key, value) do
+          {:ok, shard_index} ->
+            raft_write(ctx, shard_index, key, {:put, key, value, expire_at_ms})
 
-          is_binary(value) and byte_size(value) >= @max_value_size ->
-            {:error, "ERR value too large (max #{@max_value_size} bytes)"}
-
-          true ->
-            case check_keydir_full(ctx, key) do
-              :ok ->
-                idx = shard_for(ctx, key)
-                raft_write(ctx, idx, key, {:put, key, value, expire_at_ms})
-
-              {:error, _} = err ->
-                err
-            end
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -178,12 +168,26 @@ defmodule Ferricstore.Store.Router.Part06 do
           true ->
             case check_keydir_full(ctx, key) do
               :ok ->
-                anchor_idx = 0
-                command = flow_policy_put_all_command(ctx, key, value, expire_at_ms)
+                case raft_write(
+                       ctx,
+                       0,
+                       key,
+                       {:flow_policy_allocate, key, value, expire_at_ms}
+                     ) do
+                  {:ok, versioned_value} when is_binary(versioned_value) ->
+                    flow_policy_install_remaining_shards(
+                      ctx,
+                      key,
+                      versioned_value,
+                      expire_at_ms
+                    )
 
-                ctx
-                |> raft_write(anchor_idx, "f:{flow-policy}:tx", command)
-                |> flow_policy_put_all_result(ctx, anchor_idx)
+                  {:error, _reason} = error ->
+                    error
+
+                  _other ->
+                    {:error, "ERR flow policy allocation failed"}
+                end
 
               {:error, _} = err ->
                 err
@@ -191,37 +195,42 @@ defmodule Ferricstore.Store.Router.Part06 do
         end
       end
 
-      defp flow_policy_put_all_command(ctx, key, value, expire_at_ms) do
-        shard_batches =
-          0..(ctx.shard_count - 1)
-          |> Enum.map(fn shard_idx ->
-            entry = {:flow_cross_policy_put, shard_idx, key, value, expire_at_ms}
-            {shard_idx, [{shard_idx, entry}], nil}
-          end)
+      defp flow_policy_install_remaining_shards(%{shard_count: 1}, _key, _value, _expire_at_ms),
+        do: :ok
 
-        {:cross_shard_tx, shard_batches}
+      defp flow_policy_install_remaining_shards(ctx, key, value, expire_at_ms) do
+        shard_indices = Enum.to_list(1..(ctx.shard_count - 1))
+
+        shard_indices
+        |> Task.async_stream(
+          fn shard_index ->
+            {shard_index,
+             raft_write(
+               ctx,
+               shard_index,
+               key,
+               {:flow_policy_put, key, value, expire_at_ms}
+             )}
+          end,
+          max_concurrency: min(length(shard_indices), max(System.schedulers_online(), 1)),
+          ordered: false,
+          timeout: 15_000,
+          on_timeout: :kill_task
+        )
+        |> Enum.reduce_while(:ok, fn
+          {:ok, {_shard_index, :ok}}, :ok ->
+            {:cont, :ok}
+
+          {:ok, {_shard_index, {:error, _reason} = error}}, :ok ->
+            {:halt, error}
+
+          {:ok, {_shard_index, _unexpected}}, :ok ->
+            {:halt, {:error, "ERR flow policy propagation failed"}}
+
+          {:exit, _reason}, :ok ->
+            {:halt, {:error, "ERR flow policy propagation failed"}}
+        end)
       end
-
-      defp flow_policy_put_all_result(results, ctx, anchor_idx) when is_map(results) do
-        expected_shards = Enum.to_list(0..(ctx.shard_count - 1))
-        exact_shards? = results |> Map.keys() |> Enum.sort() == expected_shards
-
-        if exact_shards? and Enum.all?(expected_shards, &(Map.get(results, &1) == [:ok])) do
-          Enum.each(expected_shards, fn
-            ^anchor_idx -> :ok
-            shard_idx -> bump_write_version(ctx, shard_idx)
-          end)
-
-          :ok
-        else
-          {:error, "ERR flow policy transaction returned incomplete shard results"}
-        end
-      end
-
-      defp flow_policy_put_all_result({:error, _reason} = error, _ctx, _anchor_idx), do: error
-
-      defp flow_policy_put_all_result(_other, _ctx, _anchor_idx),
-        do: {:error, "ERR flow policy transaction failed"}
 
       @doc false
       def flow_policy_attribute_catalog_repair_request(ctx, name)
@@ -927,18 +936,22 @@ defmodule Ferricstore.Store.Router.Part06 do
 
           valid = Enum.reverse(valid)
 
-          valid_results = flow_transition_batch_valid_results(ctx, valid)
-
-          indexed_results =
-            valid
-            |> Enum.map(fn {idx, _key, _cmd} -> idx end)
-            |> Enum.zip(valid_results)
-            |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+          valid_results = flow_create_batch_valid_results(ctx, valid)
+          indexed_results = merge_flow_batch_results(valid, indexed_results, valid_results)
 
           for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
         else
           Enum.map(attrs_list, &flow_create(ctx, &1))
         end
+      end
+
+      defp flow_create_batch_valid_results(_ctx, []), do: []
+
+      defp flow_create_batch_valid_results(ctx, valid) do
+        attrs_list =
+          Enum.map(valid, fn {_idx, _key, {:flow_create, _command_key, attrs}} -> attrs end)
+
+        flow_create_pipeline_batch(ctx, attrs_list)
       end
 
       @doc false
@@ -1017,36 +1030,8 @@ defmodule Ferricstore.Store.Router.Part06 do
 
       defp flow_keys_cross_shard?(_ctx, _keys), do: false
 
-      defp flow_cross_shard_tx(ctx, keys, entry) do
-        _route_keys = keys
-
-        command = flow_cross_shard_tx_command(ctx, entry)
-        anchor_idx = 0
-
-        result =
-          raft_write(ctx, anchor_idx, "f:{flow-cross-shard}:tx", command)
-
-        case result do
-          %{^anchor_idx => [reply]} -> reply
-          {:error, _reason} = error -> error
-          other -> other
-        end
-      end
-
-      defp flow_cross_shard_tx_command(ctx, entry) do
-        # Flow child closure can discover additional child shards while applying
-        # parent terminal policies, so take a conservative all-shard transaction.
-        shards = Enum.to_list(0..(ctx.shard_count - 1))
-        anchor_idx = hd(shards)
-
-        shard_batches =
-          Enum.map(shards, fn
-            ^anchor_idx -> {anchor_idx, [{0, entry}], nil}
-            shard_idx -> {shard_idx, [], nil}
-          end)
-
-        {:cross_shard_tx, shard_batches}
-      end
+      defp flow_cross_shard_tx(_ctx, _keys, _entry),
+        do: {:error, "CROSSSLOT Flow dependency keys must hash to the same shard"}
 
       defp flow_many_by_shard(ctx, attrs_list, command, _batch_id)
            when command in [
@@ -1171,24 +1156,39 @@ defmodule Ferricstore.Store.Router.Part06 do
         end)
       end
 
+      @doc false
+      def __expand_flow_many_results_for_test__(count, groups, group_results),
+        do: expand_flow_many_results(count, groups, group_results)
+
       defp expand_flow_many_results(count, groups, group_results) do
-        if Enum.all?(group_results, &(&1 == :ok)) do
+        grouped_results = zip_batch_groups_with_results(groups, group_results)
+
+        if same_list_length?(groups, group_results) and
+             Enum.all?(group_results, &(&1 == :ok)) do
           :ok
         else
           expanded =
-            group_results
-            |> Enum.zip(groups)
+            grouped_results
             |> Enum.reduce(%{}, fn
-              {{:ok, records}, {_shard_idx, _key, indices, _cmd}}, acc when is_list(records) ->
-                indices
-                |> Enum.zip(records)
-                |> Enum.reduce(acc, fn {idx, record}, next -> Map.put(next, idx, record) end)
+              {{_shard_idx, _key, indices, _cmd}, {:ok, records}}, acc
+              when is_list(records) ->
+                if same_list_length?(indices, records) do
+                  indices
+                  |> Enum.zip(records)
+                  |> Enum.reduce(acc, fn {idx, record}, next -> Map.put(next, idx, record) end)
+                else
+                  put_flow_many_group_result(
+                    acc,
+                    indices,
+                    ErrorReasons.write_timeout_unknown()
+                  )
+                end
 
-              {{:error, _reason} = error, {_shard_idx, _key, indices, _cmd}}, acc ->
-                Enum.reduce(indices, acc, fn idx, next -> Map.put(next, idx, error) end)
+              {{_shard_idx, _key, indices, _cmd}, {:error, _reason} = error}, acc ->
+                put_flow_many_group_result(acc, indices, error)
 
-              {other, {_shard_idx, _key, indices, _cmd}}, acc ->
-                Enum.reduce(indices, acc, fn idx, next -> Map.put(next, idx, other) end)
+              {{_shard_idx, _key, indices, _cmd}, other}, acc ->
+                put_flow_many_group_result(acc, indices, other)
             end)
 
           results =
@@ -1199,6 +1199,10 @@ defmodule Ferricstore.Store.Router.Part06 do
 
           {:ok, results}
         end
+      end
+
+      defp put_flow_many_group_result(results, indices, result) do
+        Enum.reduce(indices, results, fn index, acc -> Map.put(acc, index, result) end)
       end
     end
   end

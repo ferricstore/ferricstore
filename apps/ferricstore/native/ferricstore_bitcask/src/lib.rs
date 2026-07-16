@@ -60,15 +60,13 @@
 pub mod async_io;
 pub mod bloom;
 pub mod cms;
-pub mod compaction;
 pub mod cuckoo;
 pub mod flow_index;
 pub mod fs_nif;
 pub mod hint;
 pub mod io_backend;
-pub mod keydir;
 pub mod log;
-pub mod store;
+mod path_open;
 pub mod tdigest;
 pub mod topk;
 pub mod tracking_alloc;

@@ -25,6 +25,31 @@ defmodule Ferricstore.Bitcask.AsyncTest do
              )
   end
 
+  test "await supports completion-bound waits" do
+    assert {:ok, :ok} =
+             Async.await(
+               fn proxy, corr_id ->
+                 send(proxy, {:tokio_complete, corr_id, :ok})
+                 :ok
+               end,
+               :infinity
+             )
+  end
+
+  test "recursive removal waits for a definitive native completion" do
+    source =
+      __DIR__
+      |> Path.join("../../../lib/ferricstore/fs.ex")
+      |> Path.expand()
+      |> File.read!()
+
+    refute source =~ "@rm_rf_timeout_ms",
+           "rm_rf must not return an indeterminate timeout while native deletion continues"
+
+    assert source =~ ~r/Async\.await\([\s\S]*?:infinity[\s\S]*?\)/,
+           "rm_rf must wait until the destructive operation has definitively completed"
+  end
+
   test "await returns submit errors" do
     assert {:error, :closed} =
              Async.await(
@@ -33,6 +58,20 @@ defmodule Ferricstore.Bitcask.AsyncTest do
                end,
                100
              )
+  end
+
+  test "await reports submit exceptions without waiting for the operation timeout" do
+    started_at = System.monotonic_time(:millisecond)
+
+    assert {:error, {:submit_failed, :error, %RuntimeError{message: "submit exploded"}}} =
+             Async.await(fn _proxy, _corr_id -> raise "submit exploded" end, 1_000)
+
+    assert System.monotonic_time(:millisecond) - started_at < 200
+  end
+
+  test "await rejects invalid submit results without timing out" do
+    assert {:error, {:invalid_submit_result, :queued}} =
+             Async.await(fn _proxy, _corr_id -> :queued end, 100)
   end
 
   test "await does not leak late completion into caller mailbox after timeout" do

@@ -8,11 +8,13 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.SpopRemovesTypeMarkerFinalS
       alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
       alias Ferricstore.Store.BitcaskWriter
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
 
       test "SPOP removes the type marker when the final set member is popped", %{
         state: state,
         ets: ets
       } do
+        setup_pop_indexes(state)
         key = "spop:type-marker"
         type_key = CompoundKey.type_key(key)
         member_key = CompoundKey.set_member(key, "only")
@@ -28,6 +30,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.SpopRemovesTypeMarkerFinalS
         })
 
         :ets.insert(ets, {member_key, "1", 0, LFU.initial(), 0, 0, 1})
+        CompoundMemberIndex.put(state.compound_member_index_name, member_key)
 
         result = apply_result_value(StateMachine.apply(%{index: 1}, {:spop, key, 1}, state))
 
@@ -40,6 +43,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.SpopRemovesTypeMarkerFinalS
         state: state,
         ets: ets
       } do
+        setup_pop_indexes(state)
         key = "zpop:type-marker"
         type_key = CompoundKey.type_key(key)
         member_key = CompoundKey.zset_member(key, "only")
@@ -55,12 +59,175 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.SpopRemovesTypeMarkerFinalS
         })
 
         :ets.insert(ets, {member_key, "1.0", 0, LFU.initial(), 0, 0, byte_size("1.0")})
+        CompoundMemberIndex.put(state.compound_member_index_name, member_key)
+
+        assert :ok =
+                 ZSetIndex.rebuild_key(
+                   state.zset_score_index_name,
+                   state.zset_score_lookup_name,
+                   key,
+                   [{"only", "1.0"}]
+                 )
 
         result = apply_result_value(StateMachine.apply(%{index: 1}, {:zpop, key, 1, :min}, state))
 
         assert result == ["only", "1.0"]
         assert [] == :ets.lookup(ets, member_key)
         assert [] == :ets.lookup(ets, type_key)
+      end
+
+      test "SPOP count zero does not inspect set members", %{state: state, ets: ets} do
+        setup_pop_indexes(state)
+        key = "spop:zero"
+        type_key = CompoundKey.type_key(key)
+        member_key = CompoundKey.set_member(key, "broken")
+        index_key = {CompoundKey.set_prefix(key), "broken"}
+
+        :ets.insert(
+          ets,
+          {type_key, CompoundKey.encode_type(:set), 0, LFU.initial(), 0, 0, 3}
+        )
+
+        :ets.insert(ets, {member_key, nil, 0, LFU.initial(), :invalid, -1, -1})
+        CompoundMemberIndex.put(state.compound_member_index_name, member_key)
+
+        assert [] = apply_result_value(StateMachine.apply(%{index: 7}, {:spop, key, 0}, state))
+
+        assert [{^index_key, ^member_key}] =
+                 :ets.lookup(state.compound_member_index_name, index_key)
+
+        assert [_row] = :ets.lookup(ets, member_key)
+      end
+
+      test "SPOP rejects malformed member metadata without mutation", %{state: state, ets: ets} do
+        setup_pop_indexes(state)
+        key = "spop:malformed"
+        type_key = CompoundKey.type_key(key)
+        member_key = CompoundKey.set_member(key, "broken")
+
+        :ets.insert(
+          ets,
+          {type_key, CompoundKey.encode_type(:set), 0, LFU.initial(), 0, 0, 3}
+        )
+
+        :ets.insert(ets, {member_key, nil, 0, LFU.initial(), :invalid, -1, -1})
+        CompoundMemberIndex.put(state.compound_member_index_name, member_key)
+
+        result =
+          apply_result_value(StateMachine.apply(%{index: 8}, {:spop, key, 1}, state))
+
+        assert {:error, {:state_read_failed, _reason}} = result
+        assert [_row] = :ets.lookup(ets, member_key)
+        assert [_row] = :ets.lookup(ets, type_key)
+      end
+
+      @tag :compound_member_index_readiness
+      test "SPOP refuses an unready partial member catalog without mutation", %{
+        state: state,
+        ets: ets
+      } do
+        setup_pop_indexes(state)
+        key = "spop:partial-catalog"
+        type_key = CompoundKey.type_key(key)
+        indexed_key = CompoundKey.set_member(key, "indexed")
+        missing_key = CompoundKey.set_member(key, "missing")
+        index = state.compound_member_index_name
+
+        :ets.insert(
+          ets,
+          {type_key, CompoundKey.encode_type(:set), 0, LFU.initial(), 0, 0, 3}
+        )
+
+        :ets.insert(ets, {indexed_key, "1", 0, LFU.initial(), 0, 0, 1})
+        :ets.insert(ets, {missing_key, "1", 0, LFU.initial(), 0, 0, 1})
+
+        :ets.delete_all_objects(index)
+        CompoundMemberIndex.put(index, indexed_key)
+
+        result = apply_result_value(StateMachine.apply(%{index: 11}, {:spop, key, 1}, state))
+
+        assert {:error, {:state_read_failed, :compound_member_index_unavailable}} = result
+        assert [_row] = :ets.lookup(ets, type_key)
+        assert [_row] = :ets.lookup(ets, indexed_key)
+        assert [_row] = :ets.lookup(ets, missing_key)
+      end
+
+      test "ready ZPOPMIN pops a cold member without reading its value", %{state: state, ets: ets} do
+        setup_pop_indexes(state)
+        key = "zpop:cold-ready"
+        type_key = CompoundKey.type_key(key)
+        member_key = CompoundKey.zset_member(key, "cold")
+
+        :ets.insert(
+          ets,
+          {type_key, CompoundKey.encode_type(:zset), 0, LFU.initial(), 0, 0, 4}
+        )
+
+        :ets.insert(ets, {member_key, nil, 0, LFU.initial(), 999_999, 123, 3})
+        CompoundMemberIndex.put(state.compound_member_index_name, member_key)
+
+        assert :ok =
+                 ZSetIndex.rebuild_key(
+                   state.zset_score_index_name,
+                   state.zset_score_lookup_name,
+                   key,
+                   [{"cold", "2.0"}]
+                 )
+
+        result = apply_result_value(StateMachine.apply(%{index: 9}, {:zpop, key, 1, :min}, state))
+
+        assert ["cold", "2.0"] = result
+        assert [] = :ets.lookup(ets, member_key)
+        assert [] = :ets.lookup(ets, type_key)
+      end
+
+      test "lazy ZPOPMIN rebuild preserves data when a cold score is unavailable", %{
+        state: state,
+        ets: ets
+      } do
+        setup_pop_indexes(state)
+        key = "zpop:cold-rebuild"
+        type_key = CompoundKey.type_key(key)
+        member_key = CompoundKey.zset_member(key, "cold")
+
+        :ets.insert(
+          ets,
+          {type_key, CompoundKey.encode_type(:zset), 0, LFU.initial(), 0, 0, 4}
+        )
+
+        :ets.insert(ets, {member_key, nil, 0, LFU.initial(), 999_999, 123, 3})
+        CompoundMemberIndex.put(state.compound_member_index_name, member_key)
+
+        result =
+          apply_result_value(StateMachine.apply(%{index: 10}, {:zpop, key, 1, :min}, state))
+
+        assert {:error, {:state_read_failed, _reason}} = result
+        assert [_row] = :ets.lookup(ets, member_key)
+        assert [_row] = :ets.lookup(ets, type_key)
+        refute ZSetIndex.ready?(state.zset_score_lookup_name, key)
+      end
+
+      defp setup_pop_indexes(state) do
+        CompoundMemberIndex.ensure_table!(state.compound_member_index_name)
+        CompoundMemberIndex.reset(state.compound_member_index_name)
+        ensure_pop_index_table(state.zset_score_index_name, :ordered_set)
+        ensure_pop_index_table(state.zset_score_lookup_name, :set)
+        :ets.delete_all_objects(state.zset_score_index_name)
+        :ets.delete_all_objects(state.zset_score_lookup_name)
+
+        on_exit(fn ->
+          safe_delete_ets(state.compound_member_index_name)
+          safe_delete_ets(state.zset_score_index_name)
+          safe_delete_ets(state.zset_score_lookup_name)
+        end)
+      end
+
+      defp ensure_pop_index_table(table, type) do
+        if :ets.whereis(table) == :undefined do
+          :ets.new(table, [type, :public, :named_table])
+        end
+
+        table
       end
 
       test "standalone sync append reports NIF errors instead of raising case clauses" do

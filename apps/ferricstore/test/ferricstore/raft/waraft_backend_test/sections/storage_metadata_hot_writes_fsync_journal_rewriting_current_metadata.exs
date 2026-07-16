@@ -619,7 +619,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageMetadataHotWritesFs
         refute source =~ "File.read(journal_path)",
                "metadata journal recovery must not materialize the full journal in BEAM memory"
 
-        assert source =~ "File.open(journal_path, [:read, :binary])"
+        assert source =~ "open_verified_metadata_journal(journal_path, [:read, :binary])"
         assert source =~ "read_metadata_journal_record"
       end
 

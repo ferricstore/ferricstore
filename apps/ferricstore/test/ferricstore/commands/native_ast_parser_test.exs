@@ -7,6 +7,29 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
   @protocol_control_commands ~w(PIPELINE)
   @not_implemented_redis_commands ~w(DUMP MIGRATE RESTORE SHUTDOWN SORT)
 
+  test "rejects nonconvertible command arguments without raising" do
+    for invalid <- [%{}, {:tuple, "value"}, [0xD800]] do
+      assert {:error, "ERR protocol error"} = NativeAstParser.parse("GET", [invalid])
+    end
+  end
+
+  test "rejects float arguments outside the VM float range without raising" do
+    huge = String.duplicate("9", 1_000)
+
+    for {command, args} <- [
+          {"INCRBYFLOAT", ["key", huge]},
+          {"HINCRBYFLOAT", ["hash", "field", huge]},
+          {"ZINCRBY", ["zset", huge, "member"]},
+          {"ZADD", ["zset", huge, "member"]},
+          {"BF.RESERVE", ["bloom", huge, "100"]},
+          {"TDIGEST.TRIMMED_MEAN", ["digest", huge, "1"]},
+          {"BLMPOP", [huge, "1", "list", "LEFT"]}
+        ] do
+      assert {:ok, ^command, _parsed_args, ast, _keys} = NativeAstParser.parse(command, args)
+      assert ast_contains_error?(ast), "expected #{command} to contain a numeric parse error"
+    end
+  end
+
   test "native AST parser covers every ACL-visible command family" do
     supported = NativeAstParser.supported_command_names()
 
@@ -36,6 +59,20 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     end
   end
 
+  test "collection scan cursors decode to seek boundaries" do
+    for command <- ~w(HSCAN SSCAN ZSCAN) do
+      tag = command |> String.downcase() |> String.to_atom()
+
+      assert {:ok, ^command, _args, {^tag, "collection", {:after, "member-b"}, []},
+              ["collection"]} =
+               NativeAstParser.parse(command, ["collection", "~bWVtYmVyLWI"])
+
+      assert {:ok, ^command, _args, {^tag, "collection", {:error, "ERR invalid cursor"}, []},
+              ["collection"]} =
+               NativeAstParser.parse(command, ["collection", "999999"])
+    end
+  end
+
   test "every Flow command has a non-empty ACL scope" do
     commands =
       CommandCategories.categories()
@@ -61,6 +98,21 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              ])
   end
 
+  @tag :xreadgroup_acl_streams_operand
+  test "XREADGROUP ACL extraction ignores STREAMS in group and consumer operands" do
+    for {group, consumer} <- [{"STREAMS", "consumer"}, {"workers", "STREAMS"}] do
+      assert {:ok, "XREADGROUP", _args, _ast, ["actual-stream"]} =
+               NativeAstParser.parse("XREADGROUP", [
+                 "GROUP",
+                 group,
+                 consumer,
+                 "STREAMS",
+                 "actual-stream",
+                 ">"
+               ])
+    end
+  end
+
   test "Flow batch ACL extraction preserves mixed item partitions" do
     assert {:ok, "FLOW.CANCEL_MANY", _args,
             {:flow_cancel_many, nil,
@@ -75,12 +127,18 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              ])
   end
 
-  test "generic Flow command families expose their unambiguous ACL scopes" do
+  test "generic Flow command families expose their effective ACL scopes" do
     for {command, args, expected_keys} <- [
           {"FLOW.STEP_CONTINUE", ["tenant:a:flow"], ["tenant:a:flow"]},
           {"FLOW.START_AND_CLAIM", ["tenant:a:flow"], ["tenant:a:flow"]},
-          {"FLOW.SCHEDULE.GET", ["tenant:a:schedule"], ["tenant:a:schedule"]},
-          {"FLOW.APPROVAL.GET", ["tenant:a:approval"], ["tenant:a:approval"]},
+          {"FLOW.SCHEDULE.GET", ["tenant:a:schedule"], ["*"]},
+          {"FLOW.SCHEDULE.FIRE", ["tenant:a:schedule"], ["*"]},
+          {"FLOW.SCHEDULE.PAUSE", ["tenant:a:schedule"], ["*"]},
+          {"FLOW.SCHEDULE.RESUME", ["tenant:a:schedule"], ["*"]},
+          {"FLOW.SCHEDULE.DELETE", ["tenant:a:schedule"], ["*"]},
+          {"FLOW.APPROVAL.GET", ["tenant:a:approval"], ["*"]},
+          {"FLOW.APPROVAL.APPROVE", ["tenant:a:approval", "admin"], ["*"]},
+          {"FLOW.APPROVAL.REJECT", ["tenant:a:approval", "admin"], ["*"]},
           {"FLOW.EFFECT.GET", ["tenant:a:flow"], ["tenant:a:flow"]},
           {"FLOW.GOVERNANCE.LEDGER", ["tenant:a:flow"], ["tenant:a:flow"]},
           {"FLOW.CIRCUIT.OPEN", ["tenant:a:scope"], ["tenant:a:scope"]},
@@ -123,6 +181,9 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     assert {:ok, "HGETEX", _args, {:hgetex, "h", :persist, ["f"]}, ["h"]} =
              NativeAstParser.parse("hgetex", ["h", "PERSIST", "FIELDS", "1", "f"])
 
+    assert {:ok, "HGETEX", _args, {:hgetex, "h", :none, ["f"]}, ["h"]} =
+             NativeAstParser.parse("hgetex", ["h", "FIELDS", "1", "f"])
+
     assert {:ok, "HSETEX", _args, {:hsetex, "h", 5, ["f", "v"]}, ["h"]} =
              NativeAstParser.parse("hsetex", ["h", "5", "f", "v"])
 
@@ -145,6 +206,21 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
 
     assert {:ok, "BF.RESERVE", _args, {:bf_reserve, "bf", 0.01, 1000}, ["bf"]} =
              NativeAstParser.parse("bf.reserve", ["bf", "0.01", "1000"])
+  end
+
+  test "TDigest quantile domains are validated while preparing commands" do
+    for {command, args} <- [
+          {"TDIGEST.QUANTILE", ["digest", "-0.1"]},
+          {"TDIGEST.QUANTILE", ["digest", "1.1"]},
+          {"TDIGEST.TRIMMED_MEAN", ["digest", "-0.1", "0.5"]},
+          {"TDIGEST.TRIMMED_MEAN", ["digest", "0.5", "0.5"]},
+          {"TDIGEST.TRIMMED_MEAN", ["digest", "0.7", "0.6"]}
+        ] do
+      assert {:ok, ^command, _parsed_args, ast, ["digest"]} =
+               NativeAstParser.parse(command, args)
+
+      assert ast_contains_error?(ast), "expected #{command} to contain a domain error"
+    end
   end
 
   test "merge commands expose destination and every source key" do
@@ -172,13 +248,31 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              ])
   end
 
+  @tag :prepared_unlink_keys
   test "counted and variadic commands expose every data key" do
     for {command, args, expected_keys} <- [
           {"SINTERCARD", ["2", "set:one", "set:two", "LIMIT", "1"], ["set:one", "set:two"]},
-          {"PFCOUNT", ["hll:one", "hll:two"], ["hll:one", "hll:two"]}
+          {"PFCOUNT", ["hll:one", "hll:two"], ["hll:one", "hll:two"]},
+          {"UNLINK", ["cache:one", "cache:two"], ["cache:one", "cache:two"]}
         ] do
       assert {:ok, ^command, _parsed_args, _ast, ^expected_keys} =
                NativeAstParser.parse(command, args)
+    end
+  end
+
+  test "SINTERCARD validates its counted key list and LIMIT in the prepared parser" do
+    assert {:ok, "SINTERCARD", _args, {:sintercard, ["set:one"], 1}, ["set:one"]} =
+             NativeAstParser.parse("SINTERCARD", ["1", "set:one", "limit", "1"])
+
+    for {args, reason} <- [
+          {["0", "set:one"], "ERR numkeys can't be non-positive value"},
+          {["2", "set:one"], "ERR Number of keys can't be greater than number of args"},
+          {["invalid", "set:one"], "ERR numkeys can't be non-positive value"},
+          {["1", "set:one", "LIMIT", "-1"], "ERR value is not an integer or out of range"},
+          {["1", "set:one", "unexpected"], "ERR syntax error"}
+        ] do
+      assert {:ok, "SINTERCARD", _parsed_args, {:sintercard, {:error, ^reason}}, _keys} =
+               NativeAstParser.parse("SINTERCARD", args)
     end
   end
 
@@ -204,8 +298,8 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
           {"KEY_INFO", ["native:key"]},
           {"FERRICSTORE.KEY_INFO", ["native:key"]},
           {"FETCH_OR_COMPUTE", ["native:key", "100", "hint"]},
-          {"FETCH_OR_COMPUTE_RESULT", ["native:key", "value", "100"]},
-          {"FETCH_OR_COMPUTE_ERROR", ["native:key", "error"]}
+          {"FETCH_OR_COMPUTE_RESULT", ["native:key", "token", "value", "100"]},
+          {"FETCH_OR_COMPUTE_ERROR", ["native:key", "token", "error"]}
         ] do
       assert {:ok, ^command, _parsed_args, _ast, ["native:key"]} =
                NativeAstParser.parse(command, args)
@@ -303,12 +397,15 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
             ["tenant:a"]} =
              NativeAstParser.parse("flow.get", ["flow-1", "PARTITION", "tenant:a"])
 
-    assert {:ok, "FLOW.GET", _args, {:flow_get, "flow-1", []}, ["flow-1"]} =
+    assert {:ok, "FLOW.GET", _args, {:flow_get, "flow-1", []}, ["*"]} =
              NativeAstParser.parse("flow.get", ["flow-1"])
 
     assert {:ok, "FLOW.HISTORY", _args, {:flow_history, "flow-1", [partition_key: "tenant:a"]},
             ["tenant:a"]} =
              NativeAstParser.parse("flow.history", ["flow-1", "PARTITION", "tenant:a"])
+
+    assert {:ok, "FLOW.HISTORY", _args, {:flow_history, "flow-1", []}, ["*"]} =
+             NativeAstParser.parse("flow.history", ["flow-1"])
 
     assert {:ok, "FLOW.LIST", _args, {:flow_list, "checkout", [partition_key: "tenant:a"]},
             ["tenant:a"]} =
@@ -365,6 +462,16 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     assert {:ok, "FLOW.ATTRIBUTE_VALUES", _args,
             {:flow_attribute_values, "checkout", "tenant", []}, ["*"]} =
              NativeAstParser.parse("flow.attribute_values", ["checkout", "tenant"])
+  end
+
+  test "TOPK.RESERVE omits the unsupported decay field" do
+    assert {:ok, "TOPK.RESERVE", _args, {:topk_reserve, "tracker", 10, 20, 5}, ["tracker"]} =
+             NativeAstParser.parse("topk.reserve", ["tracker", "10", "20", "5"])
+
+    assert {:ok, "TOPK.RESERVE", _args, {:topk_reserve, {:error, message}}, ["tracker"]} =
+             NativeAstParser.parse("topk.reserve", ["tracker", "10", "20", "5", "0.9"])
+
+    assert message =~ "wrong number of arguments"
   end
 
   test "parses Flow policy indexed attributes through native AST" do
@@ -479,6 +586,17 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
   defp native_parser_covers?(command, supported) do
     MapSet.member?(supported, command) or command_parent_supported?(command, supported)
   end
+
+  defp ast_contains_error?({:error, message}) when is_binary(message), do: true
+
+  defp ast_contains_error?(tuple) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.any?(&ast_contains_error?/1)
+  end
+
+  defp ast_contains_error?(list) when is_list(list), do: Enum.any?(list, &ast_contains_error?/1)
+  defp ast_contains_error?(_term), do: false
 
   defp command_parent_supported?(command, supported) do
     case String.split(command, ".", parts: 2) do

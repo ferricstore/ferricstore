@@ -2,7 +2,7 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
   @moduledoc false
 
   alias Ferricstore.CommandTime
-  alias Ferricstore.Store.{CompoundKey, Ops, TypeRegistry}
+  alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
 
   @spec set_pairs([binary()], binary(), map(), term()) :: non_neg_integer() | {:error, term()}
   def set_pairs(field_value_pairs, key, store, type_status) do
@@ -22,8 +22,9 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
 
   @spec expire_fields(binary(), [binary()], integer(), map()) :: [integer()] | {:error, term()}
   def expire_fields(key, fields, expire_at_ms, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      {unique_fields, compound_keys, metas_by_field} = batch_field_metas(fields, key, store)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, {unique_fields, compound_keys, metas_by_field}} <-
+           batch_field_metas(fields, key, store) do
       entries = existing_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
 
       case Ops.compound_batch_put(store, key, entries) do
@@ -44,9 +45,10 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
   @spec ttl_fields(binary(), [binary()], :seconds | :milliseconds, map()) ::
           [integer()] | {:error, term()}
   def ttl_fields(key, fields, unit, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, {_unique_fields, _compound_keys, metas_by_field}} <-
+           batch_field_metas(fields, key, store) do
       now = CommandTime.now_ms()
-      {_unique_fields, _compound_keys, metas_by_field} = batch_field_metas(fields, key, store)
 
       Enum.map(fields, fn field ->
         case Map.fetch!(metas_by_field, field) do
@@ -71,8 +73,9 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
 
   @spec persist_fields(binary(), [binary()], map()) :: [integer()] | {:error, term()}
   def persist_fields(key, fields, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      {unique_fields, compound_keys, metas_by_field} = batch_field_metas(fields, key, store)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, {unique_fields, compound_keys, metas_by_field}} <-
+           batch_field_metas(fields, key, store) do
       entries = persistent_field_entries(unique_fields, compound_keys, metas_by_field, [])
 
       case Ops.compound_batch_put(store, key, entries) do
@@ -93,9 +96,9 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
 
   @spec expiretime_fields(binary(), [binary()], map()) :: [integer()] | {:error, term()}
   def expiretime_fields(key, fields, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      {_unique_fields, _compound_keys, metas_by_field} = batch_field_metas(fields, key, store)
-
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, {_unique_fields, _compound_keys, metas_by_field}} <-
+           batch_field_metas(fields, key, store) do
       Enum.map(fields, fn field ->
         case Map.fetch!(metas_by_field, field) do
           nil -> -2
@@ -108,14 +111,16 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
 
   @spec getdel_fields(binary(), [binary()], map()) :: [binary() | nil] | {:error, term()}
   def getdel_fields(key, fields, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_keys =
-        fields
-        |> Enum.uniq()
-        |> Enum.map(&CompoundKey.hash_field(key, &1))
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, {unique_fields, compound_keys, metas_by_field}} <-
+           batch_field_metas(fields, key, store) do
+      metas_by_key =
+        unique_fields
+        |> Enum.zip(compound_keys)
+        |> Map.new(fn {field, compound_key} ->
+          {compound_key, Map.fetch!(metas_by_field, field)}
+        end)
 
-      metas = Ops.compound_batch_get_meta(store, key, compound_keys)
-      metas_by_key = metas_by_key(compound_keys, metas, %{})
       {results, deleted_entries} = getdel_results(fields, key, metas_by_key, [], %{}, [])
       deleted_count = length(deleted_entries)
 
@@ -128,7 +133,7 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
   @spec getex_parsed(binary(), [binary()], integer(), map()) ::
           [binary() | nil] | {:error, term()}
   def getex_parsed(key, fields, expire_at_ms, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
       getex_fields(fields, key, store, expire_at_ms)
     end
   end
@@ -136,20 +141,22 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
   @spec getex_fields([binary()], binary(), map(), integer()) ::
           [binary() | nil] | {:error, term()}
   def getex_fields(fields, key, store, expire_at_ms) do
-    {unique_fields, compound_keys, metas_by_field} = batch_field_metas(fields, key, store)
-    entries = existing_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
+    with {:ok, {unique_fields, compound_keys, metas_by_field}} <-
+           batch_field_metas(fields, key, store) do
+      entries = existing_field_entries(unique_fields, compound_keys, metas_by_field, expire_at_ms)
 
-    case Ops.compound_batch_put(store, key, entries) do
-      :ok ->
-        Enum.map(fields, fn field ->
-          case Map.fetch!(metas_by_field, field) do
-            nil -> nil
-            {value, _old_expire} -> value
-          end
-        end)
+      case Ops.compound_batch_put(store, key, entries) do
+        :ok ->
+          Enum.map(fields, fn field ->
+            case Map.fetch!(metas_by_field, field) do
+              nil -> nil
+              {value, _old_expire} -> value
+            end
+          end)
 
-      {:error, _} = err ->
-        err
+        {:error, _} = err ->
+          err
+      end
     end
   end
 
@@ -182,34 +189,60 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
     compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
     existing_values = Ops.compound_batch_get(store, key, compound_keys)
 
-    {added, entries} =
-      put_entries(fields, compound_keys, existing_values, values_by_field, expire_at_ms)
+    case checked_batch(existing_values, length(compound_keys)) do
+      {:ok, existing_values} ->
+        {added, entries} =
+          put_entries(fields, compound_keys, existing_values, values_by_field, expire_at_ms)
 
-    case Ops.compound_batch_put(store, key, entries) do
-      :ok -> added
-      {:error, _} = err -> rollback_new_hash_type_marker(key, store, type_status, err)
+        case Ops.compound_batch_put(store, key, entries) do
+          :ok -> added
+          {:error, _} = err -> rollback_new_hash_type_marker(key, store, type_status, err)
+        end
+
+      {:error, _reason} = error ->
+        rollback_new_hash_type_marker(key, store, type_status, error)
     end
   end
 
   defp batch_field_metas(fields, key, store) do
     unique_fields = Enum.uniq(fields)
     compound_keys = Enum.map(unique_fields, &CompoundKey.hash_field(key, &1))
-    metas = Ops.compound_batch_get_meta(store, key, compound_keys)
-    metas_by_field = metas_by_field(unique_fields, metas, %{})
-    {unique_fields, compound_keys, metas_by_field}
+
+    with {:ok, metas} <- checked_batch_meta(store, key, compound_keys) do
+      metas_by_field = metas_by_field(unique_fields, metas, %{})
+      {:ok, {unique_fields, compound_keys, metas_by_field}}
+    end
   end
+
+  defp checked_batch_meta(store, key, compound_keys) do
+    store
+    |> Ops.compound_batch_get_meta(key, compound_keys)
+    |> checked_batch(length(compound_keys))
+  end
+
+  defp checked_batch(values, expected_count) when is_list(values) do
+    cond do
+      length(values) != expected_count ->
+        {:error, "ERR storage read failed"}
+
+      failure = ReadResult.first_failure(values) ->
+        ReadResult.command_error(failure)
+
+      true ->
+        {:ok, values}
+    end
+  end
+
+  defp checked_batch({:error, {:storage_read_failed, _reason}} = failure, _expected_count),
+    do: ReadResult.command_error(failure)
+
+  defp checked_batch(_invalid, _expected_count), do: {:error, "ERR storage read failed"}
 
   defp metas_by_field([field | fields], [meta | metas], acc) do
     metas_by_field(fields, metas, Map.put(acc, field, meta))
   end
 
   defp metas_by_field(_fields, _metas, acc), do: acc
-
-  defp metas_by_key([compound_key | compound_keys], [meta | metas], acc) do
-    metas_by_key(compound_keys, metas, Map.put(acc, compound_key, meta))
-  end
-
-  defp metas_by_key(_compound_keys, _metas, acc), do: acc
 
   defp getdel_results([], _key, _metas_by_key, results, _deleted, deleted_entries) do
     {Enum.reverse(results), Enum.reverse(deleted_entries)}
@@ -244,10 +277,19 @@ defmodule Ferricstore.Commands.Hash.FieldOps do
   defp maybe_cleanup_empty_hash(key, _deleted, store) do
     prefix = CompoundKey.hash_prefix(key)
 
-    if Ops.compound_count(store, key, prefix) == 0 do
-      TypeRegistry.delete_type(key, store)
-    else
-      :ok
+    case Ops.compound_count(store, key, prefix) do
+      0 ->
+        TypeRegistry.delete_type(key, store)
+
+      count when is_integer(count) and count > 0 ->
+        :ok
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      invalid ->
+        ReadResult.failure({:invalid_compound_count_result, invalid})
+        |> ReadResult.command_error()
     end
   end
 

@@ -66,16 +66,33 @@ defmodule Ferricstore.Flow.LMDBWriter do
       is_pid(pid = Process.whereis(name(instance_name, shard_index))) ->
         op_count = length(ops)
 
-        case EnqueueControl.enqueue_guard(pid, op_count) do
-          :ok ->
-            try do
-              case GenServer.call(pid, {:enqueue, ops, after_flush}, 5_000) do
-                :ok -> :ok
-                {:error, _reason} = error -> error
+        case EnqueueControl.enqueue_guard(instance_name, shard_index, pid, op_count) do
+          {:ok, reservation} ->
+            if EnqueueControl.current_generation?(
+                 instance_name,
+                 shard_index,
+                 pid,
+                 reservation
+               ) do
+              try do
+                case GenServer.call(pid, {:enqueue, ops, after_flush, reservation}, 5_000) do
+                  :ok -> :ok
+                  {:error, _reason} = error -> error
+                end
+              catch
+                :exit, reason ->
+                  writer_unavailable(:enqueue, instance_name, shard_index, reason, op_count)
               end
-            catch
-              :exit, reason ->
-                writer_unavailable(:enqueue, instance_name, shard_index, reason, op_count)
+            else
+              _ = EnqueueControl.release_queued_ops(reservation)
+
+              writer_unavailable(
+                :enqueue,
+                instance_name,
+                shard_index,
+                :writer_restarted,
+                op_count
+              )
             end
 
           {:error, reason} ->
@@ -115,10 +132,27 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
       is_pid(pid = Process.whereis(name(instance_name, shard_index))) ->
         case EnqueueControl.enqueue_async_guard(instance_name, shard_index, op_count) do
-          :ok ->
-            seq = EnqueueControl.reserve_enqueue_seq(instance_name, shard_index)
-            GenServer.cast(pid, {:enqueue, seq, ops, after_flush})
-            :ok
+          {:ok, reservation} ->
+            if EnqueueControl.current_generation?(
+                 instance_name,
+                 shard_index,
+                 pid,
+                 reservation
+               ) do
+              seq = EnqueueControl.reserve_enqueue_seq(reservation)
+              GenServer.cast(pid, {:enqueue, seq, ops, after_flush, reservation})
+              :ok
+            else
+              _ = EnqueueControl.release_queued_ops(reservation)
+
+              writer_unavailable(
+                :enqueue,
+                instance_name,
+                shard_index,
+                :writer_restarted,
+                op_count
+              )
+            end
 
           {:error, reason} ->
             writer_unavailable(:enqueue, instance_name, shard_index, reason, op_count)
@@ -131,13 +165,38 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def enqueue_projection_outbox(instance_name, shard_index, entries)
       when is_atom(instance_name) and is_integer(shard_index) and is_list(entries) do
-    entries = normalize_projection_outbox_entries(entries)
     entry_count = length(entries)
 
-    cond do
-      entries == [] ->
-        :ok
+    case normalize_projection_outbox_entries(entries) do
+      {:ok, normalized} ->
+        enqueue_normalized_projection_outbox(
+          instance_name,
+          shard_index,
+          normalized,
+          entry_count
+        )
 
+      {:error, reason} ->
+        writer_unavailable(
+          :projection_outbox_enqueue,
+          instance_name,
+          shard_index,
+          reason,
+          entry_count
+        )
+    end
+  end
+
+  defp enqueue_normalized_projection_outbox(_instance_name, _shard_index, [], _entry_count),
+    do: :ok
+
+  defp enqueue_normalized_projection_outbox(
+         instance_name,
+         shard_index,
+         entries,
+         entry_count
+       ) do
+    cond do
       instance_suspended?(instance_name) ->
         writer_unavailable(
           :projection_outbox_enqueue,
@@ -159,9 +218,20 @@ defmodule Ferricstore.Flow.LMDBWriter do
             )
 
           tid ->
-            :ets.insert(tid, projection_outbox_rows(entries))
-            GenServer.cast(pid, :projection_outbox_available)
-            :ok
+            case insert_projection_outbox_rows(tid, projection_outbox_rows(entries)) do
+              :ok ->
+                GenServer.cast(pid, :projection_outbox_available)
+                :ok
+
+              {:error, reason} ->
+                writer_unavailable(
+                  :projection_outbox_enqueue,
+                  instance_name,
+                  shard_index,
+                  reason,
+                  entry_count
+                )
+            end
         end
 
       true ->
@@ -173,6 +243,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
           entry_count
         )
     end
+  end
+
+  defp insert_projection_outbox_rows(tid, rows) do
+    if :ets.insert(tid, rows), do: :ok, else: {:error, :projection_outbox_insert_failed}
+  rescue
+    ArgumentError -> {:error, :projection_outbox_not_started}
   end
 
   def mark_projection_dirty(instance_name, shard_index)
@@ -335,8 +411,10 @@ defmodule Ferricstore.Flow.LMDBWriter do
       clear_instance_suspended(instance_name)
     end
 
-    lost_enqueue = EnqueueControl.lost_unprocessed_enqueue(instance_name, shard_index)
-    enqueue_seq = :atomics.new(2, signed: false)
+    previous_generation =
+      EnqueueControl.previous_writer_generation(instance_name, shard_index)
+
+    enqueue_seq = :atomics.new(3, signed: false)
     EnqueueControl.publish_enqueue_seq(instance_name, shard_index, enqueue_seq)
 
     state = Config.initial_state(opts, instance_name, shard_index, data_dir, enqueue_seq)
@@ -346,7 +424,17 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
     state = %{state | durable_index: durable_index, requested_index: durable_index}
 
-    EnqueueControl.maybe_mark_lost_enqueue(state.instance_ctx, shard_index, lost_enqueue)
+    EnqueueControl.mark_previous_writer_generation(
+      state.instance_ctx,
+      shard_index,
+      previous_generation
+    )
+
+    state =
+      case previous_generation do
+        :none -> state
+        _reason -> ensure_timer_with_delay(%{state | projection_dirty?: true}, 1)
+      end
 
     {:ok, state}
   end
@@ -354,8 +442,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
   def enqueue_ops_capacity(op_count), do: EnqueueControl.enqueue_ops_capacity(op_count)
 
   @impl true
-  def handle_cast({:enqueue, seq, ops, after_flush}, state)
-      when is_integer(seq) and seq >= 0 and is_list(ops) and is_list(after_flush) do
+  def handle_cast(
+        {:enqueue, seq, ops, after_flush, {reservation_ref, reserved_ops} = reservation},
+        state
+      )
+      when is_integer(seq) and seq >= 0 and is_list(ops) and is_list(after_flush) and
+             is_reference(reservation_ref) and is_integer(reserved_ops) and reserved_ops >= 0 do
     state =
       if state.suspended? do
         mark_mirror_degraded(state.instance_ctx, state.shard_index, :enqueue_after_suspend)
@@ -364,20 +456,14 @@ defmodule Ferricstore.Flow.LMDBWriter do
         enqueue_and_maybe_flush(ops, after_flush, state)
       end
 
+    release_enqueue_reservation(state, reservation)
+
     state =
       state
       |> EnqueueControl.mark_enqueue_processed(seq)
       |> EnqueueControl.maybe_reply_flush_waiters()
 
     {:noreply, state}
-  end
-
-  def handle_cast({:enqueue, ops, after_flush}, state) do
-    if state.suspended? do
-      {:noreply, state}
-    else
-      handle_enqueue(ops, after_flush, state)
-    end
   end
 
   def handle_cast(:projection_outbox_available, state) do
@@ -415,12 +501,22 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   @impl true
-  def handle_call({:enqueue, ops, after_flush}, _from, state) do
-    if writer_suspended?(state) do
-      {:reply, {:error, :writer_suspended}, state}
-    else
-      {:reply, :ok, enqueue_without_flush(ops, after_flush, state)}
-    end
+  def handle_call(
+        {:enqueue, ops, after_flush, {reservation_ref, reserved_ops} = reservation},
+        _from,
+        state
+      )
+      when is_list(ops) and is_list(after_flush) and is_reference(reservation_ref) and
+             is_integer(reserved_ops) and reserved_ops >= 0 do
+    {reply, state} =
+      if writer_suspended?(state) do
+        {{:error, :writer_suspended}, state}
+      else
+        {:ok, enqueue_without_flush(ops, after_flush, state)}
+      end
+
+    release_enqueue_reservation(state, reservation)
+    {:reply, reply, state}
   end
 
   def handle_call(:flush, from, state) do
@@ -467,8 +563,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   def handle_call(:suspend, _from, state) do
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
-    {state, _reply} = flush_pending_with_reply(%{state | timer_ref: nil})
-    {:reply, :ok, %{state | timer_ref: nil, suspended?: true}}
+    {state, reply} = flush_pending_with_reply(%{state | timer_ref: nil})
+    {:reply, reply, %{state | timer_ref: nil, suspended?: true}}
   end
 
   def handle_call(:discard, _from, state) do
@@ -528,10 +624,6 @@ defmodule Ferricstore.Flow.LMDBWriter do
     state
   end
 
-  defp handle_enqueue(ops, after_flush, state) do
-    {:noreply, enqueue_and_maybe_flush(ops, after_flush, state)}
-  end
-
   def enqueue_and_maybe_flush(ops, after_flush, state) do
     now = System.monotonic_time()
 
@@ -589,12 +681,48 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   def handle_info({:apply_after_flush, action}, state) do
-    apply_after_flush(action)
-    {:noreply, state}
+    case apply_after_flush(action) do
+      :ok ->
+        {:noreply, state}
+
+      {:error, reason} ->
+        error = {:after_flush_failed, reason}
+        record_flush_failure(state.instance_ctx, state.shard_index)
+        mark_mirror_degraded(state.instance_ctx, state.shard_index, error)
+
+        state =
+          state
+          |> Map.put(:projection_dirty?, true)
+          |> ensure_projection_outbox_timer()
+
+        {:noreply, state}
+    end
   end
 
   defp writer_suspended?(state) do
     state.suspended? or instance_suspended?(state.instance_name)
+  end
+
+  defp release_enqueue_reservation(state, {reservation_ref, _reserved_ops} = reservation) do
+    case EnqueueControl.release_queued_ops(reservation) do
+      :ok ->
+        if reservation_ref == state.enqueue_seq do
+          :ok
+        else
+          mark_mirror_degraded(
+            state.instance_ctx,
+            state.shard_index,
+            :enqueue_reservation_generation_mismatch
+          )
+        end
+
+      {:error, reason} ->
+        mark_mirror_degraded(
+          state.instance_ctx,
+          state.shard_index,
+          {:enqueue_reservation_release_failed, reason}
+        )
+    end
   end
 
   defp ensure_timer(%{timer_ref: nil, flush_interval_ms: interval} = state) do
@@ -647,9 +775,22 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   def flush_pending_with_reply(state) do
-    state = Outbox.drain_projection_outbox(state, :no_flush)
+    {state, projection_outbox_pending?} = Outbox.drain_projection_outbox(state)
     {state, reply} = do_flush_pending_with_reply(state)
-    Outbox.maybe_reconcile_dirty_projection_with_reply(state, reply)
+    {state, reply} = Outbox.maybe_reconcile_dirty_projection_with_reply(state, reply)
+
+    projection_work_pending? =
+      projection_outbox_pending? or Map.get(state, :projection_dirty?, false)
+
+    state =
+      if projection_work_pending? and not writer_suspended?(state) do
+        delay_ms = if reply == :ok, do: 1, else: max(Map.get(state, :flush_interval_ms, 1), 1)
+        ensure_timer_with_delay(state, delay_ms)
+      else
+        state
+      end
+
+    {state, reply}
   end
 
   defp do_flush_pending_with_reply(
@@ -682,41 +823,71 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
     case flush_ops_and_marker(state, ops, started_at) do
       {:ok, state, expanded_op_count} ->
-        Enum.each(after_flush, &apply_after_flush/1)
-        emit_flush(:ok, state, started_at, op_count, expanded_op_count, pending_age_us)
+        case AfterFlush.apply_actions(after_flush) do
+          :ok ->
+            emit_flush(:ok, state, started_at, op_count, expanded_op_count, pending_age_us)
 
-        state = %{
-          state
-          | pending: [],
-            pending_after_flush: [],
-            count: 0,
-            first_pending_at: nil,
-            last_enqueue_at: nil,
-            timer_ref: nil
-        }
+            state = clear_flushed_pending(state)
+            publish_backlog(state, 0)
 
-        publish_backlog(state, 0)
+            {state, :ok}
 
-        {state, :ok}
+          {:error, reason} ->
+            error = {:after_flush_failed, reason}
+            record_flush_failure(state.instance_ctx, state.shard_index)
+            mark_mirror_degraded(state.instance_ctx, state.shard_index, error)
+
+            emit_flush(
+              {:error, error},
+              state,
+              started_at,
+              op_count,
+              expanded_op_count,
+              pending_age_us
+            )
+
+            state =
+              state
+              |> clear_flushed_pending()
+              |> Map.put(:projection_dirty?, true)
+
+            publish_backlog(state, 0)
+            {state, {:error, error}}
+        end
 
       {:error, reason, state} ->
-        if instance_suspended?(state.instance_name) do
-          {%{state | timer_ref: nil, suspended?: true}, :ok}
-        else
-          record_persist_failure(state.instance_ctx, state.shard_index)
-          record_flush_failure(state.instance_ctx, state.shard_index)
-          mark_mirror_degraded(state.instance_ctx, state.shard_index, reason)
-          publish_backlog(state, pending_age_us)
-          emit_persist({:error, reason}, state, state.requested_index, started_at)
-          emit_flush({:error, reason}, state, started_at, op_count, 0, pending_age_us)
+        record_persist_failure(state.instance_ctx, state.shard_index)
+        record_flush_failure(state.instance_ctx, state.shard_index)
+        mark_mirror_degraded(state.instance_ctx, state.shard_index, reason)
+        publish_backlog(state, pending_age_us)
+        emit_persist({:error, reason}, state, state.requested_index, started_at)
+        emit_flush({:error, reason}, state, started_at, op_count, 0, pending_age_us)
 
-          Logger.warning(
-            "Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}"
-          )
+        Logger.warning(
+          "Flow LMDB writer shard #{state.shard_index} flush failed: #{inspect(reason)}"
+        )
 
-          {ensure_timer(%{state | timer_ref: nil}), {:error, reason}}
-        end
+        state =
+          if instance_suspended?(state.instance_name) do
+            %{state | timer_ref: nil, suspended?: true}
+          else
+            ensure_timer(%{state | timer_ref: nil})
+          end
+
+        {state, {:error, reason}}
     end
+  end
+
+  defp clear_flushed_pending(state) do
+    %{
+      state
+      | pending: [],
+        pending_after_flush: [],
+        count: 0,
+        first_pending_at: nil,
+        last_enqueue_at: nil,
+        timer_ref: nil
+    }
   end
 
   defp flush_ops_and_marker(state, ops, started_at) do

@@ -20,6 +20,16 @@ defmodule Ferricstore.CommandTimeTest do
     assert CommandTime.with_now_ms(stamped_now, fn -> CommandTime.now_ms() end) == stamped_now
   end
 
+  test "preserves a zero timestamp inside raft apply" do
+    assert CommandTime.with_now_ms(0, fn -> CommandTime.now_ms() end) == 0
+  end
+
+  test "rejects negative raft apply timestamps" do
+    assert_raise FunctionClauseError, fn ->
+      CommandTime.with_now_ms(-1, fn -> :unreachable end)
+    end
+  end
+
   test "restores previous apply time after nested scopes" do
     outer = HLC.now_ms() - 20_000
     inner = outer + 5_000

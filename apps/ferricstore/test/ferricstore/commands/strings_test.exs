@@ -37,6 +37,42 @@ defmodule Ferricstore.Commands.StringsTest do
                )
     end
 
+    test "Rust SET AST rejects conflicting options before touching storage" do
+      store =
+        MockStore.make()
+        |> Map.put(:put, fn _key, _value, _expire_at_ms ->
+          flunk("invalid SET options must not write")
+        end)
+        |> Map.put(:set, fn _key, _value, _opts ->
+          flunk("invalid SET options must not write")
+        end)
+
+      assert {:error, "ERR XX and NX options at the same time are not compatible"} =
+               Strings.handle_ast({:set, "key", "value", [:nx, :xx]}, store)
+
+      assert {:error, "ERR syntax error"} =
+               Strings.handle_ast({:set, "key", "value", [{:ex, 1}, {:px, 1}]}, store)
+
+      assert {:error, "ERR syntax error"} =
+               Strings.handle_ast({:set, "key", "value", [:keepttl, {:ex, 1}]}, store)
+    end
+
+    test "Rust SET AST rejects nonpositive expiry values before touching storage" do
+      store =
+        MockStore.make()
+        |> Map.put(:put, fn _key, _value, _expire_at_ms ->
+          flunk("invalid SET expiry must not write")
+        end)
+        |> Map.put(:set, fn _key, _value, _opts ->
+          flunk("invalid SET expiry must not write")
+        end)
+
+      for option <- [{:ex, 0}, {:px, -1}, {:exat, 0}, {:pxat, -1}] do
+        assert {:error, "ERR invalid expire time in 'set' command"} =
+                 Strings.handle_ast({:set, "key", "value", [option]}, store)
+      end
+    end
+
     test "SET with EX sets expiry in seconds" do
       store = MockStore.make()
       assert :ok = Strings.handle("SET", ["key", "value", "EX", "10"], store)
@@ -180,6 +216,21 @@ defmodule Ferricstore.Commands.StringsTest do
     end
   end
 
+  describe "GETEX prepared AST validation" do
+    test "rejects nonpositive expiry values before touching storage" do
+      store =
+        MockStore.make(%{"key" => {"value", 0}})
+        |> Map.put(:getex, fn _key, _expire_at_ms ->
+          flunk("invalid GETEX expiry must not mutate storage")
+        end)
+
+      for option <- [{:ex, 0}, {:px, -1}, {:exat, 0}, {:pxat, -1}] do
+        assert {:error, "ERR invalid expire time in 'getex' command"} =
+                 Strings.handle_ast({:getex, "key", option}, store)
+      end
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # GET
   # ---------------------------------------------------------------------------
@@ -306,6 +357,34 @@ defmodule Ferricstore.Commands.StringsTest do
       assert {:error, :disk_full} == Strings.handle("DEL", ["s"], store)
       assert 1 == Stream.handle("XLEN", ["s"], base)
       assert [_] = base.compound_scan.("s", "X:s" <> <<0>>)
+    end
+
+    @tag :transaction_stream_cache_commit
+    test "DEL defers stream cache cleanup for transactional stores" do
+      Stream.ensure_meta_table()
+      base = MockStore.make()
+      key = "stream_deferred_del_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        if :ets.whereis(Ferricstore.Stream.Meta) != :undefined do
+          :ets.delete(Ferricstore.Stream.Meta, key)
+        end
+      end)
+
+      assert "1-0" == Stream.handle("XADD", [key, "1-0", "f", "v"], base)
+      assert [{^key, 1, "1-0", "1-0", 1, 0}] = :ets.lookup(Ferricstore.Stream.Meta, key)
+
+      test_pid = self()
+
+      store =
+        Map.put(base, :defer_stream_cleanup, fn deferred_key ->
+          send(test_pid, {:stream_cleanup_deferred, deferred_key})
+          :ok
+        end)
+
+      assert 1 == Strings.handle("DEL", [key], store)
+      assert_receive {:stream_cleanup_deferred, ^key}
+      assert [{^key, 1, "1-0", "1-0", 1, 0}] = :ets.lookup(Ferricstore.Stream.Meta, key)
     end
   end
 
@@ -472,6 +551,28 @@ defmodule Ferricstore.Commands.StringsTest do
       assert "old2" == Hash.handle("HGET", ["k2", "field"], base)
     end
 
+    test "MSET aborts before mutation when rollback metadata cannot be read" do
+      base = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["k1", "field", "old"], base)
+      failure = Ferricstore.Store.ReadResult.failure(:missing_file)
+
+      store =
+        base
+        |> Map.put(:get_meta, fn _key -> failure end)
+        |> Map.put(:put, fn _key, _value, _expire_at_ms ->
+          flunk("MSET must not write without a complete rollback snapshot")
+        end)
+        |> Map.put(:compound_delete, fn _redis_key, _compound_key ->
+          flunk("MSET must not delete without a complete rollback snapshot")
+        end)
+        |> Map.put(:compound_delete_prefix, fn _redis_key, _prefix ->
+          flunk("MSET must not delete without a complete rollback snapshot")
+        end)
+
+      assert {:error, "ERR storage read failed"} == Strings.handle("MSET", ["k1", "new"], store)
+      assert "old" == Hash.handle("HGET", ["k1", "field"], base)
+    end
+
     test "MSET with single pair stores the pair" do
       store = MockStore.make()
       assert :ok = Strings.handle("MSET", ["k", "v"], store)
@@ -490,6 +591,28 @@ defmodule Ferricstore.Commands.StringsTest do
   # ---------------------------------------------------------------------------
 
   describe "SET edge cases" do
+    test "SET aborts when the compound type marker cannot be read" do
+      base = MockStore.make()
+      assert 1 == Hash.handle("HSET", ["key", "field", "old"], base)
+      failure = Ferricstore.Store.ReadResult.failure(:missing_file)
+
+      store =
+        base
+        |> Map.put(:compound_get, fn _redis_key, _compound_key -> failure end)
+        |> Map.put(:put, fn _key, _value, _expire_at_ms ->
+          flunk("SET must not write after a failed type-marker read")
+        end)
+        |> Map.put(:compound_delete, fn _redis_key, _compound_key ->
+          flunk("SET must not delete after a failed type-marker read")
+        end)
+        |> Map.put(:compound_delete_prefix, fn _redis_key, _prefix ->
+          flunk("SET must not delete after a failed type-marker read")
+        end)
+
+      assert {:error, "ERR storage read failed"} == Strings.handle("SET", ["key", "new"], store)
+      assert "old" == Hash.handle("HGET", ["key", "field"], base)
+    end
+
     test "SET with PX -1 returns error" do
       assert {:error, msg} =
                Strings.handle("SET", ["key", "val", "PX", "-1"], MockStore.make())
@@ -633,6 +756,19 @@ defmodule Ferricstore.Commands.StringsTest do
   # ---------------------------------------------------------------------------
 
   describe "INCRBYFLOAT edge cases" do
+    test "INCRBYFLOAT rejects integer-shaped values outside the float range without raising" do
+      store =
+        MockStore.make()
+        |> Map.put(:incr_float, fn _key, _delta ->
+          flunk("an invalid float must not reach storage")
+        end)
+
+      huge = String.duplicate("9", 1_000)
+
+      assert {:error, "ERR value is not a valid float"} =
+               Strings.handle("INCRBYFLOAT", ["k", huge], store)
+    end
+
     test "INCRBYFLOAT with 'inf' string returns error" do
       store = MockStore.make()
       assert {:error, msg} = Strings.handle("INCRBYFLOAT", ["k", "inf"], store)

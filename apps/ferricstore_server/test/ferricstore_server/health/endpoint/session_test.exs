@@ -3,6 +3,33 @@ defmodule FerricstoreServer.Health.Endpoint.SessionTest do
 
   alias FerricstoreServer.Health.Endpoint.Session
 
+  @tag :dashboard_session_secret_config
+  test "remote dashboards require an explicit strong shared session secret" do
+    old_remote_access = Application.get_env(:ferricstore, :dashboard_remote_access)
+    old_session_secret = Application.get_env(:ferricstore, :dashboard_session_secret)
+
+    on_exit(fn ->
+      restore_env(:dashboard_remote_access, old_remote_access)
+      restore_env(:dashboard_session_secret, old_session_secret)
+    end)
+
+    Application.put_env(:ferricstore, :dashboard_remote_access, true)
+    Application.delete_env(:ferricstore, :dashboard_session_secret)
+
+    assert_raise ArgumentError, ~r/dashboard_session_secret/, fn ->
+      Session.initialize_secret!()
+    end
+
+    Application.put_env(:ferricstore, :dashboard_session_secret, "too-short")
+
+    assert_raise ArgumentError, ~r/at least 32 bytes/, fn ->
+      Session.initialize_secret!()
+    end
+
+    Application.put_env(:ferricstore, :dashboard_session_secret, String.duplicate("s", 32))
+    assert :ok = Session.initialize_secret!()
+  end
+
   test "session_cookie emits scoped http-only dashboard cookie" do
     cookie = Session.session_cookie("admin")
 

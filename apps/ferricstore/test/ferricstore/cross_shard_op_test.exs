@@ -231,6 +231,46 @@ defmodule Ferricstore.CrossShardOpTest do
   # ---------------------------------------------------------------------------
 
   describe "lock timeout/expiry" do
+    test "non-exception coordinator exits release every acquired lock immediately" do
+      ctx = default_ctx()
+      [k1, k2] = ShardHelpers.keys_on_different_shards(2)
+
+      assert :coordinator_throw =
+               catch_throw(
+                 CrossShardOp.execute(
+                   [{k1, :write}, {k2, :write}],
+                   fn _store -> throw(:coordinator_throw) end,
+                   intent: %{
+                     command: :rename,
+                     keys: %{source: k1, dest: k2},
+                     value_hashes: %{}
+                   }
+                 )
+               )
+
+      next_owner = make_ref()
+      expires_at = System.os_time(:millisecond) + 10_000
+
+      Enum.each([k1, k2], fn key ->
+        shard_id =
+          ctx
+          |> Router.shard_for(key)
+          |> Ferricstore.Raft.Cluster.shard_server_id()
+
+        assert {:ok, {:applied_at, _, :ok}, _} =
+                 Ferricstore.Raft.CommandClock.process_command(
+                   shard_id,
+                   {:lock_keys, [key], next_owner, expires_at}
+                 )
+
+        assert {:ok, {:applied_at, _, :ok}, _} =
+                 Ferricstore.Raft.CommandClock.process_command(
+                   shard_id,
+                   {:unlock_keys, [key], next_owner}
+                 )
+      end)
+    end
+
     test "locks expire after TTL allowing subsequent operations" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
@@ -345,7 +385,10 @@ defmodule Ferricstore.CrossShardOpTest do
       intent_map = %{
         command: :rename,
         keys: %{source: k1, dest: k2},
-        value_hashes: %{k1 => :erlang.phash2("stale_value")},
+        value_hashes: %{
+          k1 => :erlang.phash2("stale_value"),
+          k2 => Router.watch_token(FerricStore.Instance.get(:default), k2)
+        },
         status: :executing,
         created_at: System.os_time(:millisecond) - 30_000
       }
@@ -663,7 +706,10 @@ defmodule Ferricstore.CrossShardOpTest do
       intent_map = %{
         command: :rename,
         keys: %{source: k1, dest: k2},
-        value_hashes: %{k1 => :erlang.phash2("intent_hash_test")},
+        value_hashes: %{
+          k1 => :erlang.phash2("intent_hash_test"),
+          k2 => Router.watch_token(FerricStore.Instance.get(:default), k2)
+        },
         status: :executing,
         created_at: System.os_time(:millisecond) - 30_000
       }
@@ -703,7 +749,10 @@ defmodule Ferricstore.CrossShardOpTest do
       intent_map = %{
         command: :rename,
         keys: %{source: k1, dest: k2},
-        value_hashes: %{k1 => :erlang.phash2("old_different_value")},
+        value_hashes: %{
+          k1 => :erlang.phash2("old_different_value"),
+          k2 => Router.watch_token(FerricStore.Instance.get(:default), k2)
+        },
         status: :executing,
         created_at: System.os_time(:millisecond) - 30_000
       }

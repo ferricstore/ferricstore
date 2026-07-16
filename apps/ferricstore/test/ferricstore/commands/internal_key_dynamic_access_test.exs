@@ -4,7 +4,7 @@ defmodule Ferricstore.Commands.InternalKeyDynamicAccessTest do
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Test.MockStore
 
-  @error "ERR access to internal Flow keys is not allowed"
+  @error "ERR access to internal keys is not allowed"
   @state_key "f:{f}:s:flow-1"
 
   test "dynamic multi-key commands reject a reserved source before store access" do
@@ -48,8 +48,8 @@ defmodule Ferricstore.Commands.InternalKeyDynamicAccessTest do
           {"RATELIMIT.ADD", [@state_key, "invalid-window", "10"]},
           {"KEY_INFO", [@state_key]},
           {"FETCH_OR_COMPUTE", [@state_key, "invalid-ttl"]},
-          {"FETCH_OR_COMPUTE_RESULT", [@state_key, "value", "invalid-ttl"]},
-          {"FETCH_OR_COMPUTE_ERROR", [@state_key, "error", "unexpected-extra-arg"]}
+          {"FETCH_OR_COMPUTE_RESULT", [@state_key, "token", "value", "invalid-ttl"]},
+          {"FETCH_OR_COMPUTE_ERROR", [@state_key, "token", "error"]}
         ] do
       assert {:error, @error} = Dispatcher.dispatch(command, args, store)
     end

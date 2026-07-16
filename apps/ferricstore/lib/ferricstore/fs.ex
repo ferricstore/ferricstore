@@ -8,9 +8,9 @@ defmodule Ferricstore.FS do
       so callers using `with` / `case` can pattern-match on the stable
       atom kinds.
 
-  All ops run on BEAM's Normal scheduler via a Rust NIF — NOT on the
-  `:prim_file` async-thread pool. This keeps dirty-scheduler accounting
-  out of our crash dumps and makes scheduler-utilization observable.
+  Metadata ops and bounded file reads run on DirtyIo, while recursive removal
+  runs on Tokio's blocking pool. This keeps filesystem work off Normal
+  schedulers.
 
   For potentially long operations (`rm_rf` of a large tree), the caller
   owns the waiting: `fs_rm_rf_async` returns immediately and delivers a
@@ -30,6 +30,7 @@ defmodule Ferricstore.FS do
           | :directory_not_empty
           | :invalid_path
           | :symlink
+          | :too_large
           | :other
 
   @type fs_error :: {:error, {err_kind(), binary()}}
@@ -59,8 +60,23 @@ defmodule Ferricstore.FS do
   @spec ls(binary()) :: {:ok, [binary()]} | fs_error()
   def ls(path), do: NIF.fs_ls(path)
 
-  @spec read_nofollow(binary()) :: {:ok, binary()} | fs_error()
-  def read_nofollow(path), do: NIF.fs_read_nofollow(path)
+  @spec read_nofollow(binary(), non_neg_integer()) :: {:ok, binary()} | fs_error()
+  def read_nofollow(path, max_bytes), do: NIF.fs_read_nofollow(path, max_bytes)
+
+  @spec copy_sync_nofollow(binary(), binary()) :: :ok | fs_error()
+  def copy_sync_nofollow(source, dest), do: NIF.fs_copy_sync_nofollow(source, dest)
+
+  @spec append_sync_nofollow(binary(), binary()) :: :ok | fs_error()
+  def append_sync_nofollow(path, payload), do: NIF.fs_append_sync_nofollow(path, payload)
+
+  @spec append_sync_nofollow_bounded(binary(), binary(), non_neg_integer()) ::
+          :ok | fs_error()
+  def append_sync_nofollow_bounded(path, payload, max_bytes),
+    do: NIF.fs_append_sync_nofollow_bounded(path, payload, max_bytes)
+
+  @spec atomic_replace_nofollow(binary(), binary(), non_neg_integer()) :: :ok | fs_error()
+  def atomic_replace_nofollow(path, payload, max_bytes),
+    do: NIF.fs_atomic_replace_nofollow(path, payload, max_bytes)
 
   # -------------------------------------------------------------------
   # Bang variants: raise on error, matching File.*!/n
@@ -119,8 +135,6 @@ defmodule Ferricstore.FS do
   # rm_rf — async NIF + blocking wait
   # -------------------------------------------------------------------
 
-  @rm_rf_timeout_ms 30_000
-
   @doc """
   Recursive remove, blocking the caller until the async NIF completes.
 
@@ -131,10 +145,9 @@ defmodule Ferricstore.FS do
   def rm_rf(path) do
     case Async.await(
            fn proxy, corr -> NIF.fs_rm_rf_async(proxy, corr, path) end,
-           @rm_rf_timeout_ms
+           :infinity
          ) do
       {:ok, :ok} -> :ok
-      {:error, :timeout} -> {:error, {:other, "rm_rf timed out"}}
       {:error, _reason} = err -> err
     end
   end

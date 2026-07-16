@@ -12,4 +12,51 @@ defmodule Ferricstore.ApplicationShutdownGuardTest do
     refute source =~ ":ferricstore_active_file_path",
            "shutdown_fsync_bitcask/2 must not use the retired persistent_term active-file key"
   end
+
+  test "zero-shard shutdown does not probe descending shard indices" do
+    unexpected = fn _ -> flunk("zero shards must not perform filesystem work") end
+
+    assert :ok =
+             Ferricstore.Application.fsync_bitcask_for_shutdown(0, "/unused",
+               active_file_path: unexpected,
+               exists?: unexpected,
+               fsync: unexpected,
+               list_log_files: unexpected
+             )
+  end
+
+  test "flow projection shutdown reports one suspend exit without retrying" do
+    calls = :atomics.new(1, signed: false)
+
+    suspend = fn _shard_count, _opts ->
+      :atomics.add(calls, 1, 1)
+      exit(:writer_unavailable)
+    end
+
+    assert {:error, :writer_unavailable} =
+             Ferricstore.Application.__shutdown_flow_lmdb_for_test__(4, suspend)
+
+    assert :atomics.get(calls, 1) == 1
+  end
+
+  test "lifecycle telemetry uses elapsed monotonic time" do
+    assert Ferricstore.Application.__elapsed_ms_for_test__(100, 145) == 45
+    assert Ferricstore.Application.__elapsed_ms_for_test__(145, 100) == 0
+  end
+
+  test "large-value diagnostics do not block application startup" do
+    parent = self()
+
+    check = fn _shard_count ->
+      send(parent, {:large_value_check_started, self()})
+
+      receive do
+        :release -> :ok
+      end
+    end
+
+    assert :ok = Ferricstore.Application.schedule_large_value_check(4, check)
+    assert_receive {:large_value_check_started, task}
+    send(task, :release)
+  end
 end

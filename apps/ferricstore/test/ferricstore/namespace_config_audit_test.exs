@@ -236,4 +236,23 @@ defmodule Ferricstore.NamespaceConfigAuditTest do
       assert entry.changed_by =~ ~r/^task:\d+$/
     end
   end
+
+  describe "INFO framing" do
+    test "namespace metadata cannot inject additional INFO fields" do
+      :ok =
+        NamespaceConfig.set(
+          "safe\r\nspoofed:1",
+          "window_ms",
+          "10",
+          "client\r\nforged:1"
+        )
+
+      result = Server.handle("INFO", ["namespace_config"], MockStore.make())
+
+      refute result =~ "\r\nspoofed:1"
+      refute result =~ "\r\nforged:1"
+      assert result =~ "ns_safe%0D%0Aspoofed%3A1_window_ms:10"
+      assert result =~ "client%0D%0Aforged:1"
+    end
+  end
 end

@@ -37,22 +37,33 @@ defmodule Ferricstore.Flow.LMDBMirror do
 
     case Map.get(ctx, :flow_lmdb_mirror_degraded) do
       ref when is_reference(ref) ->
-        flag_idx <= :atomics.info(ref).size and :atomics.get(ref, flag_idx) == 1
+        try do
+          size = :atomics.info(ref).size
+
+          if flag_idx >= 1 and flag_idx <= size do
+            :atomics.get(ref, flag_idx) == 1
+          else
+            true
+          end
+        rescue
+          _ -> true
+        end
 
       _ ->
         false
     end
-  rescue
-    _ -> false
   end
 
-  def shard_paths(data_dir, shard_count) do
+  def shard_paths(data_dir, shard_count)
+      when is_binary(data_dir) and is_integer(shard_count) and shard_count > 0 do
     Enum.map(0..(shard_count - 1), fn shard_index ->
       data_dir
       |> Ferricstore.DataDir.shard_data_path(shard_index)
       |> Ferricstore.Flow.LMDB.path()
     end)
   end
+
+  def shard_paths(_data_dir, _shard_count), do: []
 
   def paths_for_index(ctx, _index_key, nil) do
     shard_paths(ctx.data_dir, ctx.shard_count)

@@ -19,13 +19,36 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     {source, destination} = same_shard_keys(ctx)
 
     assert 2 = Router.list_op(ctx, source, {:rpush, ["first", "second"]})
+    assert ["first", "second"] = Router.list_op(ctx, source, {:lrange, 0, -1})
+    version_before_move = Router.get_version(ctx, source)
 
     assert "first" = Router.list_op(ctx, source, {:lmove, destination, :left, :right})
+    assert Router.get_version(ctx, source) > version_before_move
     assert ["second"] = Router.list_op(ctx, source, {:lrange, 0, -1})
     assert ["first"] = Router.list_op(ctx, destination, {:lrange, 0, -1})
   end
 
   test "Router cross-shard LMOVE works inside a non-Raft instance", %{ctx: ctx} do
+    handler_id =
+      "standalone-cross-shard-journal-#{System.unique_integer([:positive, :monotonic])}"
+
+    parent = self()
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        [
+          [:ferricstore, :standalone_tx_log, :prepare],
+          [:ferricstore, :standalone_tx_log, :commit]
+        ],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:standalone_tx_log, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     {source, destination} = different_shard_keys(ctx)
 
     assert 2 = Router.list_op(ctx, source, {:rpush, ["first", "second"]})
@@ -33,6 +56,85 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert "first" = Router.list_op(ctx, source, {:lmove, destination, :left, :right})
     assert ["second"] = Router.list_op(ctx, source, {:lrange, 0, -1})
     assert ["first"] = Router.list_op(ctx, destination, {:lrange, 0, -1})
+
+    assert_receive {:standalone_tx_log, [:ferricstore, :standalone_tx_log, :prepare],
+                    %{groups: groups}, %{status: :ok}},
+                   1_000
+
+    assert groups >= 2
+
+    assert_receive {:standalone_tx_log, [:ferricstore, :standalone_tx_log, :commit],
+                    %{count: 1}, %{status: :ok}},
+                   1_000
+  end
+
+  test "cross-shard journal rolls back a coordinator crash between shard fsyncs", %{ctx: ctx} do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    handler_id = "standalone-recovery-#{System.unique_integer([:positive, :monotonic])}"
+    parent = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :standalone_tx_log, :recover],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:standalone_recovery, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    {source, destination} = different_shard_keys(ctx)
+    coordinator = min(Router.shard_for(ctx, source), Router.shard_for(ctx, destination))
+    coordinator_name = elem(ctx.shard_names, coordinator)
+
+    assert 2 = Router.list_op(ctx, source, {:rpush, ["first", "second"]})
+
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+    calls = :atomics.new(1, signed: false)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, _batch ->
+      case :atomics.add_get(calls, 1, 1) do
+        1 -> :passthrough
+        2 -> exit(:kill)
+        _later -> :passthrough
+      end
+    end)
+
+    on_exit(fn ->
+      if previous_hook do
+        Application.put_env(:ferricstore, :standalone_durability_hook, previous_hook)
+      else
+        Application.delete_env(:ferricstore, :standalone_durability_hook)
+      end
+    end)
+
+    assert {:error, {:standalone_cross_shard_failed, _reason}} =
+             Router.list_op(ctx, source, {:lmove, destination, :left, :right})
+
+    assert_receive {:EXIT, _pid, :kill}, 1_000
+    assert Process.whereis(coordinator_name) == nil
+    assert :persistent_term.get(
+             {Ferricstore.Store.StandaloneTxLog, Path.expand(ctx.data_dir)},
+             false
+           ) == false
+
+    assert {:ok, _pid} =
+             Ferricstore.Store.Shard.start_link(
+               index: coordinator,
+               data_dir: ctx.data_dir,
+               instance_ctx: ctx
+             )
+
+    assert_receive {:standalone_recovery, [:ferricstore, :standalone_tx_log, :recover],
+                    %{pending: 1, replayed: 1}, %{status: :ok}},
+                   1_000
+
+    assert ["first", "second"] = Router.list_op(ctx, source, {:lrange, 0, -1})
+    assert [] = Router.list_op(ctx, destination, {:lrange, 0, -1})
   end
 
   test "direct list creation stamps type metadata before later compound commands", %{ctx: ctx} do

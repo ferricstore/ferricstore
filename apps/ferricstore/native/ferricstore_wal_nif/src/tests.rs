@@ -42,6 +42,23 @@ mod integration {
     }
 
     #[test]
+    fn generic_reopen_appends_after_existing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopen.wal").to_str().unwrap().to_string();
+
+        let first = WalHandle::open(path.clone(), 0, 0, 1024).unwrap();
+        first.buffer_write(b"first").unwrap();
+        first.close().unwrap();
+
+        let second = WalHandle::open(path.clone(), 0, 0, 1024).unwrap();
+        assert_eq!(second.file_size(), 5);
+        second.buffer_write(b"second").unwrap();
+        second.close().unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b"firstsecond");
+    }
+
+    #[test]
     fn test_open_nonexistent_directory() {
         let result = WalHandle::open(
             "/nonexistent/path/test.wal".to_string(),
@@ -359,7 +376,7 @@ mod integration {
     }
 
     #[test]
-    fn test_backpressure_allows_single_oversized_write_on_empty_buffer() {
+    fn test_backpressure_rejects_single_oversized_write_on_empty_buffer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir
             .path()
@@ -371,8 +388,8 @@ mod integration {
         let handle = WalHandle::open(path, 0, 0, 100).unwrap();
         let data = vec![0u8; 101];
 
-        handle.buffer_write(&data).unwrap();
-        assert!(handle.buffer_write(b"x").is_err());
+        assert!(handle.buffer_write(&data).is_err());
+        handle.buffer_write(b"x").unwrap();
 
         handle.close().unwrap();
     }

@@ -40,6 +40,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       }
 
       alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.LogicalKeyIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -71,11 +72,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         ref = keydir_binary_ref(state)
 
         Enum.each(successful_groups, fn {_idx, _file_path, file_id, keydir, entries, locations} ->
-          publish_cross_shard_pending_locations(ref, keydir, file_id, entries, locations)
+          publish_cross_shard_pending_locations(
+            state,
+            ref,
+            keydir,
+            file_id,
+            entries,
+            locations
+          )
         end)
       end
 
-      defp publish_cross_shard_pending_locations(ref, keydir, file_id, entries, locations) do
+      defp publish_cross_shard_pending_locations(
+             state,
+             ref,
+             keydir,
+             file_id,
+             entries,
+             locations
+           ) do
         Enum.zip(entries, locations)
         |> only_latest_cross_shard_entries()
         |> Enum.each(fn
@@ -83,11 +98,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
            {:put, offset, value_size}} ->
             track_cross_shard_keydir_binary_publish(ref, keydir, idx, key, ets_value)
             :ets.insert(keydir, {key, ets_value, exp, LFU.initial(), file_id, offset, value_size})
+            {logical_keys, logical_slots} = logical_key_index_tables(state, idx)
+            :ok = LogicalKeyIndex.put(logical_keys, logical_slots, key, ets_value, exp)
 
           {{:delete, idx, ^keydir, _file_path, ^file_id, key}, {:delete, _offset, _record_size}} ->
             track_cross_shard_keydir_binary_publish(ref, keydir, idx, key, nil)
             :ets.delete(keydir, key)
+            {logical_keys, logical_slots} = logical_key_index_tables(state, idx)
+            :ok = LogicalKeyIndex.delete(logical_keys, logical_slots, key)
         end)
+      end
+
+      defp logical_key_index_tables(state, shard_index) do
+        LogicalKeyIndex.table_names(Map.get(state, :instance_name, :default), shard_index)
       end
 
       defp track_cross_shard_keydir_binary_publish(nil, _keydir, _shard_index, _key, _new_value),
@@ -368,7 +391,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         started_at = System.monotonic_time()
 
         try do
-          result = fun.()
+          command_result = fun.()
+
+          result = state_storage_failure_result(command_result)
 
           if pending_write_error_result?(result) do
             rollback_pending_writes(state)
@@ -380,7 +405,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
 
             case flush_result do
               :ok ->
-                state = run_pending_compound_promotions(state)
+                publish_pending_compound_revisions(state)
+                dispatch_pending_compound_promotions(state)
 
                 case publish_pending_flow_history_projections(state) do
                   :ok ->
@@ -420,9 +446,112 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         Enum.each(@sm_pending_write_keys, &Process.delete/1)
       end
 
+      defp dispatch_pending_compound_promotions(state) do
+        case promotion_shard_pid(state) do
+          pid when is_pid(pid) ->
+            Process.get(:sm_pending_promoted_maintenance, %{})
+            |> Enum.each(fn {redis_key, maintenance} ->
+              send(pid, {:promoted_maintenance_after_commit, redis_key, maintenance})
+            end)
+
+            Process.get(:sm_pending_compound_promotion_removals, MapSet.new())
+            |> Enum.each(fn redis_key ->
+              send(pid, {:remove_promoted_after_commit, redis_key})
+            end)
+
+            Process.get(:sm_pending_compound_promotions, MapSet.new())
+            |> Enum.each(fn {redis_key, compound_key} ->
+              send(pid, {:maybe_promote_after_commit, redis_key, compound_key})
+            end)
+
+          nil ->
+            :ok
+        end
+
+        :ok
+      end
+
+      defp publish_pending_compound_revisions(state) do
+        table = Map.get(state, :compound_revision_index_name)
+
+        Process.get(:sm_pending_compound_revision_ops, [])
+        |> Enum.reverse()
+        |> Enum.each(fn
+          {:put, key, revision} ->
+            Ferricstore.Store.Shard.CompoundRevisionIndex.put(table, key, revision)
+
+          {:delete, key} ->
+            Ferricstore.Store.Shard.CompoundRevisionIndex.delete(table, key)
+        end)
+
+        :ok
+      end
+
+      defp promotion_shard_pid(state) do
+        ctx =
+          case Map.get(state, :instance_ctx) do
+            %FerricStore.Instance{} = instance_ctx ->
+              instance_ctx
+
+            _missing ->
+              FerricStore.Instance.get(Map.get(state, :instance_name, :default))
+          end
+
+        shard_index = Map.get(state, :shard_index)
+
+        case ctx do
+          %FerricStore.Instance{shard_names: shard_names}
+          when is_tuple(shard_names) and is_integer(shard_index) and shard_index >= 0 and
+                 shard_index < tuple_size(shard_names) ->
+            case Router.shard_name(ctx, shard_index) do
+              pid when is_pid(pid) -> if Process.alive?(pid), do: pid
+              name when is_atom(name) -> Process.whereis(name)
+              _invalid_name -> nil
+            end
+
+          _invalid_context ->
+            nil
+        end
+      rescue
+        _error -> nil
+      catch
+        :exit, _reason -> nil
+      end
+
       defp pending_write_error_result?({:error, _reason}), do: true
       defp pending_write_error_result?({:error, _reason, _state}), do: true
       defp pending_write_error_result?(_result), do: false
+
+      defp record_state_read_failure(reason) do
+        case Process.get(:sm_state_read_failure, :outside_apply) do
+          nil -> Process.put(:sm_state_read_failure, reason)
+          _first_failure_or_outside_apply -> :ok
+        end
+
+        :miss
+      end
+
+      defp record_state_write_failure(reason) do
+        case Process.get(:sm_state_write_failure, :outside_apply) do
+          nil -> Process.put(:sm_state_write_failure, reason)
+          _first_failure_or_outside_apply -> :ok
+        end
+
+        :ok
+      end
+
+      defp state_storage_failure_result(command_result) do
+        case Process.get(:sm_state_read_failure) do
+          nil ->
+            case Process.get(:sm_state_write_failure) do
+              nil -> command_result
+              reason -> {:error, reason}
+            end
+
+          reason ->
+            {:error, {:state_read_failed, reason}}
+        end
+      end
 
       defp do_flow_create(state, %{id: id} = attrs) do
         partition_key = Map.get(attrs, :partition_key)
@@ -532,7 +661,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
              _override?
            ) do
         value_version = flow_named_value_next_version(existing)
-        ref = FlowKeys.value_key(id <> ":" <> name, :shared, value_version, partition_key)
+        ref = FlowKeys.named_shared_value_key(id, name, value_version, partition_key)
         entry = %{ref: ref, version: value_version, digest: digest}
         value_refs = Map.put(refs, name, entry)
 
@@ -638,6 +767,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
              :ok <- flow_signal_idempotency_check(state, record, attrs),
              :ok <- flow_signal_transition_allowed?(record, attrs),
              {:ok, next} <- flow_signal_next_record(record, attrs, now_ms),
+             next = flow_stamp_state_enter_seq_on_change(state, record, next),
+             next = flow_refresh_indexed_attributes(state, next),
+             :ok <- flow_require_fifo_entry(state, attrs, next, true),
              :ok <- flow_validate_record_keys(next),
              :ok <- flow_put_record_values(state, next, attrs),
              :ok <- flow_transition_move_indexes(state, [{record, next}]),
@@ -1212,7 +1344,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
              running_index_entries: running_index_entries,
              metadata_index_entries: metadata_index_entries
            }) do
-        with :ok <- flow_validate_key_size(state_key),
+        with :ok <-
+               flow_validate_shared_value_ref_locality(
+                 record,
+                 flow_record_shared_value_refs(record)
+               ),
+             :ok <- flow_validate_key_size(state_key),
              :ok <- flow_validate_key_size(history_key),
              :ok <- flow_validate_key_size(state_index_key),
              :ok <-

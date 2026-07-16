@@ -1,6 +1,7 @@
 defmodule Ferricstore.Flow.PipelineClaimDue do
   @moduledoc false
 
+  alias Ferricstore.BatchResult
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.Router
 
@@ -139,16 +140,31 @@ defmodule Ferricstore.Flow.PipelineClaimDue do
         {key, {:flow_claim_due, key, claim.attrs}}
       end)
 
-    results = Router.pipeline_write_batch(ctx, keyed_commands)
+    results = pipeline_write_batch(ctx, keyed_commands, callbacks)
 
     indexed_results =
-      indexed_claims
-      |> Enum.zip(results)
-      |> Enum.reduce(indexed_results, fn {{idx, claim}, result}, acc ->
-        Map.put(acc, idx, hydrated_result(ctx, claim, result, callbacks))
-      end)
+      case BatchResult.map_exact(indexed_claims, results, fn {idx, claim}, result ->
+             {idx, hydrated_result(ctx, claim, result, callbacks)}
+           end) do
+        {:ok, pairs} ->
+          Enum.reduce(pairs, indexed_results, fn {idx, result}, acc ->
+            Map.put(acc, idx, result)
+          end)
+
+        {:error, _reason} ->
+          Enum.reduce(indexed_claims, indexed_results, fn {idx, _claim}, acc ->
+            Map.put(acc, idx, {:error, "ERR pipeline claim batch result mismatch"})
+          end)
+      end
 
     {indexed_results, %{stats | groups: stats.groups + 1, batched_calls: stats.batched_calls + 1}}
+  end
+
+  defp pipeline_write_batch(ctx, keyed_commands, callbacks) do
+    case callbacks do
+      %{pipeline_write_batch: fun} when is_function(fun, 2) -> fun.(ctx, keyed_commands)
+      _other -> Router.pipeline_write_batch(ctx, keyed_commands)
+    end
   end
 
   defp router_required?(%{attrs: %{partition_keys: [_ | _]}}), do: true

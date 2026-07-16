@@ -8,6 +8,10 @@ defmodule Ferricstore.Flow.LMDBWriter.Config do
   @default_lagged_max_ops 25_000
   @default_flush_chunk_ops 5_000
   @default_lagged_flush_chunk_pause_ms 1
+  @max_timer_ms 4_294_967_295
+  @max_batch_ops 1_000_000
+  @max_flush_chunk_ops 100_000
+  @max_flush_chunk_pause_ms 60_000
 
   def instance_name_from_opts(opts) do
     case {Keyword.get(opts, :instance_name), Keyword.get(opts, :instance_ctx)} do
@@ -22,7 +26,7 @@ defmodule Ferricstore.Flow.LMDBWriter.Config do
 
   def default_flush_interval_ms, do: @default_lagged_flush_interval_ms
   def default_max_ops, do: @default_lagged_max_ops
-  def default_flush_on_max_ops(_mode), do: false
+  def default_flush_on_max_ops(_mode), do: true
   def default_flush_jitter_ms, do: @default_lagged_flush_jitter_ms
   def default_flush_quiet_ms, do: @default_lagged_flush_quiet_ms
   def default_flush_max_lag_ms, do: @default_lagged_flush_max_lag_ms
@@ -59,32 +63,69 @@ defmodule Ferricstore.Flow.LMDBWriter.Config do
       processed_enqueue_gaps: MapSet.new(),
       flush_waiters: [],
       flush_interval_ms:
-        Application.get_env(
-          :ferricstore,
+        positive_config(
           :flow_lmdb_flush_interval_ms,
-          default_flush_interval_ms()
+          default_flush_interval_ms(),
+          @max_timer_ms
         ),
       flush_jitter_ms:
-        Application.get_env(:ferricstore, :flow_lmdb_flush_jitter_ms, default_flush_jitter_ms()),
+        non_negative_config(
+          :flow_lmdb_flush_jitter_ms,
+          default_flush_jitter_ms(),
+          @max_timer_ms
+        ),
       flush_quiet_ms:
-        Application.get_env(:ferricstore, :flow_lmdb_flush_quiet_ms, default_flush_quiet_ms()),
+        non_negative_config(
+          :flow_lmdb_flush_quiet_ms,
+          default_flush_quiet_ms(),
+          @max_timer_ms
+        ),
       flush_max_lag_ms:
-        Application.get_env(:ferricstore, :flow_lmdb_flush_max_lag_ms, default_flush_max_lag_ms()),
-      max_ops: Application.get_env(:ferricstore, :flow_lmdb_max_batch_ops, default_max_ops()),
+        non_negative_config(
+          :flow_lmdb_flush_max_lag_ms,
+          default_flush_max_lag_ms(),
+          @max_timer_ms
+        ),
+      max_ops: positive_config(:flow_lmdb_max_batch_ops, default_max_ops(), @max_batch_ops),
       flush_on_max_ops?:
-        Application.get_env(
+        boolean_config(
           :ferricstore,
           :flow_lmdb_flush_on_max_ops,
           default_flush_on_max_ops(mode)
         ),
       flush_chunk_ops:
-        Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops, default_flush_chunk_ops()),
+        positive_config(
+          :flow_lmdb_flush_chunk_ops,
+          default_flush_chunk_ops(),
+          @max_flush_chunk_ops
+        ),
       flush_chunk_pause_ms:
-        Application.get_env(
-          :ferricstore,
+        non_negative_config(
           :flow_lmdb_flush_chunk_pause_ms,
-          default_flush_chunk_pause_ms()
+          default_flush_chunk_pause_ms(),
+          @max_flush_chunk_pause_ms
         )
     }
+  end
+
+  defp positive_config(key, default, max_value) do
+    case Application.get_env(:ferricstore, key, default) do
+      value when is_integer(value) and value > 0 -> min(value, max_value)
+      _invalid -> default
+    end
+  end
+
+  defp non_negative_config(key, default, max_value) do
+    case Application.get_env(:ferricstore, key, default) do
+      value when is_integer(value) and value >= 0 -> min(value, max_value)
+      _invalid -> default
+    end
+  end
+
+  defp boolean_config(app, key, default) do
+    case Application.get_env(app, key, default) do
+      value when is_boolean(value) -> value
+      _invalid -> default
+    end
   end
 end

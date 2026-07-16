@@ -17,8 +17,12 @@ defmodule Ferricstore.Store.Router.Part02 do
       alias Ferricstore.Store.BlobValue
       alias Ferricstore.Store.CompoundCommand
       alias Ferricstore.Store.CompoundKey
+      alias Ferricstore.Store.ExpiryTracker
+      alias Ferricstore.Store.Keydir
       alias Ferricstore.Store.LFU
       alias Ferricstore.Store.ListOps
+      alias Ferricstore.Store.PublicationEpoch
+      alias Ferricstore.Store.ReadResult
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
@@ -112,6 +116,9 @@ defmodule Ferricstore.Store.Router.Part02 do
             # writes and return a file ref before falling back to materialization.
             shard_file_ref_or_value(ctx, idx, key)
 
+          {:invalid, entry} ->
+            ReadResult.failure({:invalid_keydir_entry, entry})
+
           :expired ->
             record_keyspace_miss(ctx, key)
             :miss
@@ -191,8 +198,11 @@ defmodule Ferricstore.Store.Router.Part02 do
 
       defp bitcask_file_ref_from_location(path, offset, key, value_size) do
         case validated_file_ref(path, offset, key, value_size) do
-          {^path, value_offset, ^value_size} -> {:ok, {path, value_offset, value_size}}
-          nil -> nil
+          {file_ref_path, value_offset, ^value_size} ->
+            {:ok, {file_ref_path, value_offset, value_size}}
+
+          nil ->
+            nil
         end
       end
 
@@ -211,13 +221,26 @@ defmodule Ferricstore.Store.Router.Part02 do
       end
 
       defp validated_file_ref(path, record_offset, key, value_size) do
-        case Ferricstore.Bitcask.NIF.v2_validate_value_ref(path, record_offset, key, value_size) do
-          {:ok, {value_offset, ^value_size}} ->
-            {path, value_offset, value_size}
+        case validate_file_ref_at_path(path, record_offset, key, value_size) do
+          {_path, _value_offset, _value_size} = file_ref ->
+            file_ref
 
-          _ ->
+          nil ->
             maybe_run_validate_file_ref_miss_hook()
-            nil
+
+            path
+            |> Ferricstore.Store.ColdRead.compaction_backup_path()
+            |> case do
+              nil -> nil
+              backup -> validate_file_ref_at_path(backup, record_offset, key, value_size)
+            end
+        end
+      end
+
+      defp validate_file_ref_at_path(path, record_offset, key, value_size) do
+        case Ferricstore.Bitcask.NIF.v2_validate_value_ref(path, record_offset, key, value_size) do
+          {:ok, {value_offset, ^value_size}} -> {path, value_offset, value_size}
+          _ -> nil
         end
       end
 
@@ -229,6 +252,56 @@ defmodule Ferricstore.Store.Router.Part02 do
              original_location,
              now,
              validate_blob_ref? \\ true
+           ) do
+        case retry_changed_file_ref_raw(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               validate_blob_ref?,
+               :miss
+             ) do
+          {:read_error, _reason} -> :miss
+          result -> result
+        end
+      end
+
+      defp retry_changed_file_ref_result(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             exhausted_failure,
+             validate_blob_ref? \\ true
+           ) do
+        case retry_changed_file_ref_raw(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               validate_blob_ref?,
+               exhausted_failure
+             ) do
+          {:read_error, reason} -> storage_read_failure(:cold_file_ref_unavailable, reason)
+          result -> result
+        end
+      end
+
+      defp retry_changed_file_ref_raw(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             validate_blob_ref?,
+             exhausted_result
            ) do
         case retry_changed_file_ref_once(
                ctx,
@@ -252,7 +325,8 @@ defmodule Ferricstore.Store.Router.Part02 do
                   validate_blob_ref?
                 )
               end,
-              cold_retry_metadata(ctx, idx, key, :file_ref)
+              cold_retry_metadata(ctx, idx, key, :file_ref),
+              exhausted_result
             )
 
           result ->
@@ -284,7 +358,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                 {:cold_ref, file_ref_path, value_offset, size}
 
               nil ->
-                :miss
+                {:read_error, :invalid_cold_file_ref}
             end
 
           {:cold, file_id, offset, value_size}
@@ -299,8 +373,8 @@ defmodule Ferricstore.Store.Router.Part02 do
                 warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
                 {:hot, value}
 
-              _ ->
-                :miss
+              read_error ->
+                {:read_error, storage_read_reason(read_error)}
             end
 
           {:cold, file_id, offset, value_size}
@@ -313,8 +387,20 @@ defmodule Ferricstore.Store.Router.Part02 do
                  {file_id, offset, value_size} == original_location ->
             :unchanged_cold
 
-          _ ->
+          {:invalid, entry} ->
+            {:read_error, {:invalid_keydir_entry, entry}}
+
+          :no_table ->
+            {:read_error, :keydir_unavailable}
+
+          :expired ->
             :miss
+
+          :miss ->
+            :miss
+
+          {:cold, file_id, offset, value_size} ->
+            {:read_error, {:invalid_cold_location, file_id, offset, value_size}}
         end
       end
 
@@ -409,10 +495,14 @@ defmodule Ferricstore.Store.Router.Part02 do
             [{^key, nil, exp, _lfu, :pending, off, vsize}] when exp > now ->
               {:cold, :pending, off, vsize}
 
-            [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
-              track_keydir_binary_delete_known(ctx, idx, key, value)
-              :ets.delete(keydir, key)
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize} = expired_entry]
+            when is_integer(exp) and exp > 0 and exp <= now ->
+              delete_observed_keydir_entry(ctx, idx, keydir, expired_entry)
+
               :expired
+
+            [entry] ->
+              {:invalid, entry}
 
             [] ->
               :miss
@@ -445,10 +535,14 @@ defmodule Ferricstore.Store.Router.Part02 do
             [{^key, nil, exp, _lfu, :pending, off, vsize}] when exp == 0 or exp > now ->
               {:cold, :pending, off, vsize, exp}
 
-            [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
-              track_keydir_binary_delete_known(ctx, idx, key, value)
-              :ets.delete(keydir, key)
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize} = expired_entry]
+            when is_integer(exp) and exp > 0 and exp <= now ->
+              delete_observed_keydir_entry(ctx, idx, keydir, expired_entry)
+
               :expired
+
+            [entry] ->
+              {:invalid, entry}
 
             [] ->
               :miss
@@ -470,7 +564,7 @@ defmodule Ferricstore.Store.Router.Part02 do
       (Bitcask fallback) in `Ferricstore.Stats` for the `FERRICSTORE.HOTNESS`
       command and the `INFO stats` hot/cold fields.
       """
-      @spec get(FerricStore.Instance.t(), binary()) :: binary() | nil
+      @spec get(FerricStore.Instance.t(), binary()) :: binary() | nil | ReadResult.failure()
       def get(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
@@ -496,14 +590,17 @@ defmodule Ferricstore.Store.Router.Part02 do
                 warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
                 value
 
-              _ ->
-                case retry_changed_cold_value(
+              read_error ->
+                failure = storage_read_failure(:cold_value_unavailable, read_error)
+
+                case retry_changed_cold_value_result(
                        ctx,
                        idx,
                        keydir,
                        key,
                        {file_id, offset, value_size},
-                       now
+                       now,
+                       failure
                      ) do
                   {:cold, value, retry_file_id, retry_offset} ->
                     Stats.record_cold_read(ctx, key)
@@ -526,6 +623,9 @@ defmodule Ferricstore.Store.Router.Part02 do
                   :miss ->
                     record_keyspace_miss(ctx, key)
                     nil
+
+                  {:error, {:storage_read_failed, _reason}} = failure ->
+                    failure
                 end
             end
 
@@ -537,42 +637,34 @@ defmodule Ferricstore.Store.Router.Part02 do
                 warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
                 value
 
-              :not_found ->
-                retry_changed_waraft_segment_value_result(
+              :not_found = read_error ->
+                retry_changed_waraft_segment_value_read_result(
                   ctx,
                   idx,
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now
+                  now,
+                  read_error
                 )
 
-              {:error, _reason} ->
-                retry_changed_waraft_segment_value_result(
+              {:error, _reason} = read_error ->
+                retry_changed_waraft_segment_value_read_result(
                   ctx,
                   idx,
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now
+                  now,
+                  read_error
                 )
             end
 
-          {:cold, _file_id, _offset, _value_size} ->
-            # Cold entry but invalid file ref — ask GenServer.
-            result =
-              case safe_read_call(ctx, idx, {:get, key}) do
-                {:ok, value} -> value
-                :unavailable -> nil
-              end
+          {:cold, file_id, offset, value_size} ->
+            ReadResult.failure({:invalid_cold_location, {file_id, offset, value_size}})
 
-            if result != nil do
-              Stats.record_cold_read(ctx, key)
-            else
-              record_keyspace_miss(ctx, key)
-            end
-
-            result
+          {:invalid, entry} ->
+            ReadResult.failure({:invalid_keydir_entry, entry})
 
           :expired ->
             record_keyspace_miss(ctx, key)
@@ -585,21 +677,28 @@ defmodule Ferricstore.Store.Router.Part02 do
 
           :no_table ->
             # ETS table unavailable (shard restarting). Fall back to GenServer.
-            result =
-              case safe_read_call(ctx, idx, {:get, key}) do
-                {:ok, value} -> value
-                :unavailable -> nil
-              end
+            case safe_read_call(ctx, idx, {:get, key}) do
+              {:ok, value} ->
+                if value != nil do
+                  Stats.record_cold_read(ctx, key)
+                else
+                  record_keyspace_miss(ctx, key)
+                end
 
-            if result != nil do
-              Stats.record_cold_read(ctx, key)
-            else
-              record_keyspace_miss(ctx, key)
+                value
+
+              :unavailable ->
+                ReadResult.failure(:keydir_unavailable)
             end
-
-            result
         end
       end
+
+      defp storage_read_failure(operation, read_result) do
+        ReadResult.failure({operation, storage_read_reason(read_result)})
+      end
+
+      defp storage_read_reason({:error, reason}), do: reason
+      defp storage_read_reason(reason), do: reason
 
       @doc false
       @spec get_with_deferred_blob_file_ref(FerricStore.Instance.t(), binary()) ::
@@ -610,110 +709,389 @@ defmodule Ferricstore.Store.Router.Part02 do
               | :miss
       def get_with_deferred_blob_file_ref(ctx, key), do: do_get_with_file_ref(ctx, key, false)
 
-      @spec batch_get(FerricStore.Instance.t(), [binary()]) :: [binary() | nil]
+      @spec batch_get(FerricStore.Instance.t(), [binary()]) ::
+              [binary() | nil | ReadResult.failure()]
       def batch_get(ctx, keys) do
+        PublicationEpoch.read(ctx, publication_shards(ctx, keys), fn ->
+          {:ok, values} = do_batch_get(ctx, keys, :unlimited)
+          values
+        end)
+      end
+
+      @doc false
+      @spec get_bounded(FerricStore.Instance.t(), binary(), non_neg_integer() | :unlimited) ::
+              {:ok, binary() | nil} | {:error, :response_byte_limit} | ReadResult.failure()
+      def get_bounded(ctx, key, :unlimited) when is_binary(key) do
+        case get(ctx, key) do
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+          value -> {:ok, value}
+        end
+      end
+
+      def get_bounded(ctx, key, max_value_bytes)
+          when is_binary(key) and is_integer(max_value_bytes) and max_value_bytes >= 0 do
+        case batch_get_bounded(ctx, [key], max_value_bytes) do
+          {:ok, [value]} -> {:ok, value}
+          {:error, :response_byte_limit} = error -> error
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+        end
+      end
+
+      @doc false
+      @spec batch_get_bounded(FerricStore.Instance.t(), [binary()], non_neg_integer()) ::
+              {:ok, [binary() | nil]} | {:error, :response_byte_limit} | ReadResult.failure()
+      def batch_get_bounded(ctx, keys, max_value_bytes)
+          when is_list(keys) and is_integer(max_value_bytes) and max_value_bytes >= 0 do
+        PublicationEpoch.read(ctx, publication_shards(ctx, keys), fn ->
+          read_plan = do_batch_get_with_file_refs(ctx, keys, 0, :bounded)
+
+          with {:ok, _planned_reads?} <- batch_get_preflight(read_plan, max_value_bytes) do
+            values = materialize_bounded_batch_values(read_plan)
+
+            case batch_get_preflight(values, max_value_bytes) do
+              {:ok, _file_refs?} -> {:ok, values}
+              {:error, :response_byte_limit} = error -> error
+              {:error, {:storage_read_failed, _reason}} = failure -> failure
+            end
+          end
+        end)
+      end
+
+      @doc false
+      @spec batch_get_each_bounded(FerricStore.Instance.t(), [binary()], non_neg_integer()) ::
+              {:ok, [binary() | nil]} | {:error, :response_byte_limit} | ReadResult.failure()
+      def batch_get_each_bounded(ctx, keys, max_value_bytes)
+          when is_list(keys) and is_integer(max_value_bytes) and max_value_bytes >= 0 do
+        PublicationEpoch.read(ctx, publication_shards(ctx, keys), fn ->
+          read_plan = do_batch_get_with_file_refs(ctx, keys, 0, :bounded)
+
+          with :ok <- batch_get_each_preflight(read_plan, max_value_bytes) do
+            values = materialize_bounded_batch_values(read_plan)
+
+            case batch_get_each_preflight(values, max_value_bytes) do
+              :ok -> {:ok, values}
+              {:error, :response_byte_limit} = error -> error
+              {:error, {:storage_read_failed, _reason}} = failure -> failure
+            end
+          end
+        end)
+      end
+
+      defp publication_shards(ctx, keys), do: Enum.map(keys, &shard_for(ctx, &1))
+
+      defp batch_get_each_preflight(values, max_value_bytes) do
+        Enum.reduce_while(values, :ok, fn value, :ok ->
+          case value do
+            {:error, {:storage_read_failed, _reason}} ->
+              {:cont, :ok}
+
+            _value ->
+              {value_bytes, _file_ref?} = batch_get_preflight_value(value)
+
+              if value_bytes > max_value_bytes,
+                do: {:halt, {:error, :response_byte_limit}},
+                else: {:cont, :ok}
+          end
+        end)
+      end
+
+      defp batch_get_preflight(values, max_value_bytes) do
+        Enum.reduce_while(values, {:ok, 0, false}, fn value, {:ok, bytes, file_refs?} ->
+          case value do
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              {:halt, failure}
+
+            _value ->
+              {value_bytes, file_ref?} = batch_get_preflight_value(value)
+              next_bytes = bytes + value_bytes
+
+              if next_bytes > max_value_bytes do
+                {:halt, {:error, :response_byte_limit}}
+              else
+                {:cont, {:ok, next_bytes, file_refs? or file_ref?}}
+              end
+          end
+        end)
+        |> case do
+          {:ok, _bytes, file_refs?} -> {:ok, file_refs?}
+          {:error, :response_byte_limit} = error -> error
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+        end
+      end
+
+      defp batch_get_preflight_value({:file_ref, _path, _offset, size})
+           when is_integer(size) and size >= 0,
+           do: {size, true}
+
+      defp batch_get_preflight_value(
+             {:bounded_cold, {_ctx, _idx, _keydir, _key, _path, _file_id, _offset, value_size}}
+           )
+           when is_integer(value_size) and value_size >= 0,
+           do: {value_size, true}
+
+      defp batch_get_preflight_value(
+             {:bounded_waraft, {_ctx, _idx, _keydir, _key, _file_id, _offset, value_size}}
+           )
+           when is_integer(value_size) and value_size >= 0,
+           do: {value_size, true}
+
+      defp batch_get_preflight_value(
+             {:bounded_blob, _ctx, _idx, _keydir, _key, _file_id, _offset, _value_size,
+              %BlobRef{size: blob_size}}
+           )
+           when is_integer(blob_size) and blob_size >= 0,
+           do: {blob_size, true}
+
+      defp batch_get_preflight_value(value) when is_binary(value), do: {byte_size(value), false}
+      defp batch_get_preflight_value(nil), do: {0, false}
+
+      defp materialize_bounded_batch_values(read_plan) do
+        now = HLC.now_ms()
+
+        {cold_plans, blob_plans} =
+          read_plan
+          |> Enum.with_index()
+          |> Enum.reduce({[], []}, fn
+            {{:bounded_cold, entry}, index}, {cold_plans, blob_plans} ->
+              {[{index, entry} | cold_plans], blob_plans}
+
+            {{:bounded_blob, _ctx, _idx, _keydir, _key, _file_id, _offset, _value_size,
+              %BlobRef{}} = plan, index},
+            {cold_plans, blob_plans} ->
+              {cold_plans, [{index, plan} | blob_plans]}
+
+            {_value, _index}, plans ->
+              plans
+          end)
+
+        waraft_plans =
+          read_plan
+          |> Enum.with_index()
+          |> Enum.flat_map(fn
+            {{:bounded_waraft, entry}, index} -> [{index, entry}]
+            {_value, _index} -> []
+          end)
+
+        cold_results = materialize_bounded_cold_plans(Enum.reverse(cold_plans), now)
+        waraft_results = materialize_bounded_waraft_plans(waraft_plans)
+        blob_results = materialize_bounded_blob_plans(Enum.reverse(blob_plans), now)
+
+        read_plan
+        |> Enum.with_index()
+        |> Enum.map(fn
+          {{:bounded_cold, _entry}, index} ->
+            Map.fetch!(cold_results, index)
+
+          {{:bounded_waraft, _entry}, index} ->
+            Map.fetch!(waraft_results, index)
+
+          {{:bounded_blob, _ctx, _idx, _keydir, _key, _file_id, _offset, _value_size, _ref},
+           index} ->
+            Map.fetch!(blob_results, index)
+
+          {value, _index} ->
+            value
+        end)
+      end
+
+      defp materialize_bounded_cold_plans([], _now), do: %{}
+
+      defp materialize_bounded_cold_plans(indexed_entries, now) do
+        {indexes, entries} = Enum.unzip(indexed_entries)
+        values = read_cold_batch_async(entries, now)
+        indexes |> Enum.zip(values) |> Map.new()
+      end
+
+      defp materialize_bounded_waraft_plans([]), do: %{}
+
+      defp materialize_bounded_waraft_plans(indexed_entries) do
+        {indexes, entries} = Enum.unzip(indexed_entries)
+        values = read_waraft_segment_batch_materialized(entries)
+        indexes |> Enum.zip(values) |> Map.new()
+      end
+
+      defp materialize_bounded_blob_plans([], _now), do: %{}
+
+      defp materialize_bounded_blob_plans(indexed_plans, now) do
+        indexed_plans
+        |> Enum.group_by(fn
+          {_index, {:bounded_blob, ctx, idx, _keydir, _key, _file_id, _offset, _value_size, _ref}} ->
+            {ctx.data_dir, idx}
+        end)
+        |> Enum.reduce(%{}, fn {{data_dir, idx}, group}, results_by_index ->
+          refs = Enum.map(group, fn {_index, plan} -> elem(plan, 8) end)
+          loaded = BlobStore.get_many(data_dir, idx, refs)
+
+          group
+          |> Enum.zip(loaded)
+          |> Enum.reduce(results_by_index, fn {{index, plan}, result}, acc ->
+            Map.put(acc, index, bounded_blob_result(plan, result, now))
+          end)
+        end)
+      end
+
+      defp bounded_blob_result(
+             {:bounded_blob, ctx, idx, keydir, key, file_id, offset, _value_size, _ref},
+             {:ok, value},
+             _now
+           )
+           when is_binary(value) do
+        warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
+        value
+      end
+
+      defp bounded_blob_result(
+             {:bounded_blob, ctx, idx, keydir, key, file_id, offset, value_size, _ref},
+             _error,
+             now
+           ) do
+        retry_cold_batch_materialized_value(
+          ctx,
+          idx,
+          keydir,
+          key,
+          {file_id, offset, value_size},
+          now
+        )
+      end
+
+      defp do_batch_get(ctx, keys, byte_limit) do
         now = HLC.now_ms()
         bookkeeping = hot_read_bookkeeping_start(ctx)
 
-        {results, {cold_entries, _cold_count, waraft_entries, _waraft_count, bookkeeping}} =
-          Enum.map_reduce(keys, {[], 0, [], 0, bookkeeping}, fn key,
-                                                                {cold_entries, cold_count,
-                                                                 waraft_entries, waraft_count,
-                                                                 bookkeeping} ->
-            idx = shard_for(ctx, key)
-            keydir = resolve_keydir(ctx, idx)
+        plan =
+          Enum.reduce_while(
+            keys,
+            {[], [], 0, [], 0, bookkeeping, 0},
+            fn key,
+               {results, cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping,
+                response_bytes} ->
+              idx = shard_for(ctx, key)
+              keydir = resolve_keydir(ctx, idx)
 
-            case ets_get_full(ctx, idx, keydir, key, now) do
-              {:hit, value, lfu} ->
-                bookkeeping = hot_read_bookkeeping_add(bookkeeping, keydir, key, lfu)
+              {result, cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping,
+               value_bytes} =
+                case ets_get_full(ctx, idx, keydir, key, now) do
+                  {:hit, value, lfu} ->
+                    bookkeeping = hot_read_bookkeeping_add(bookkeeping, keydir, key, lfu)
 
-                {{:value, value},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
+                    {{:value, value}, cold_entries, cold_count, waraft_entries, waraft_count,
+                     bookkeeping, batch_get_value_bytes(value)}
 
-              {:cold, file_id, offset, value_size}
-              when valid_cold_location(file_id, offset, value_size) ->
-                path = cold_file_path(ctx, idx, file_id)
+                  {:cold, file_id, offset, value_size}
+                  when valid_cold_location(file_id, offset, value_size) ->
+                    path = cold_file_path(ctx, idx, file_id)
+                    entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
 
-                entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
+                    {{:cold, cold_count}, [entry | cold_entries], cold_count + 1, waraft_entries,
+                     waraft_count, bookkeeping, value_size}
 
-                {{:cold, cold_count},
-                 {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count,
-                  bookkeeping}}
+                  {:cold, file_id, offset, value_size}
+                  when valid_waraft_segment_location(file_id, offset, value_size) ->
+                    entry = {ctx, idx, keydir, key, file_id, offset, value_size}
 
-              {:cold, file_id, offset, value_size}
-              when valid_waraft_segment_location(file_id, offset, value_size) ->
-                entry = {ctx, idx, keydir, key, file_id, offset, value_size}
+                    {{:waraft, waraft_count}, cold_entries, cold_count, [entry | waraft_entries],
+                     waraft_count + 1, bookkeeping, value_size}
 
-                {{:waraft, waraft_count},
-                 {cold_entries, cold_count, [entry | waraft_entries], waraft_count + 1,
-                  bookkeeping}}
+                  {:cold, _file_id, _offset, _value_size} ->
+                    result = batch_get_fallback_value(ctx, idx, key)
 
-              {:cold, _file_id, _offset, _value_size} ->
-                result =
-                  case safe_read_call(ctx, idx, {:get, key}) do
-                    {:ok, value} -> value
-                    :unavailable -> nil
-                  end
+                    {{:value, result}, cold_entries, cold_count, waraft_entries, waraft_count,
+                     bookkeeping, batch_get_value_bytes(result)}
 
-                if result != nil do
-                  Stats.record_cold_read(ctx, key)
-                else
-                  record_keyspace_miss(ctx, key)
+                  {:invalid, entry} ->
+                    failure = ReadResult.failure({:invalid_keydir_entry, entry})
+
+                    {{:value, failure}, cold_entries, cold_count, waraft_entries, waraft_count,
+                     bookkeeping, 0}
+
+                  :expired ->
+                    record_keyspace_miss(ctx, key)
+
+                    {{:value, nil}, cold_entries, cold_count, waraft_entries, waraft_count,
+                     bookkeeping, 0}
+
+                  :miss ->
+                    record_keyspace_miss(ctx, key)
+
+                    {{:value, nil}, cold_entries, cold_count, waraft_entries, waraft_count,
+                     bookkeeping, 0}
+
+                  :no_table ->
+                    result = batch_get_fallback_value(ctx, idx, key)
+
+                    {{:value, result}, cold_entries, cold_count, waraft_entries, waraft_count,
+                     bookkeeping, batch_get_value_bytes(result)}
                 end
 
-                {{:value, result},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
+              next_response_bytes = response_bytes + value_bytes
 
-              :expired ->
-                record_keyspace_miss(ctx, key)
-
-                {{:value, nil},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
-
-              :miss ->
-                record_keyspace_miss(ctx, key)
-
-                {{:value, nil},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
-
-              :no_table ->
-                result =
-                  case safe_read_call(ctx, idx, {:get, key}) do
-                    {:ok, value} -> value
-                    :unavailable -> nil
-                  end
-
-                if result != nil do
-                  Stats.record_cold_read(ctx, key)
-                else
-                  record_keyspace_miss(ctx, key)
-                end
-
-                {{:value, result},
-                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
+              if batch_get_byte_limit_exceeded?(byte_limit, next_response_bytes) do
+                {:halt, {:byte_limit, bookkeeping}}
+              else
+                {:cont,
+                 {[result | results], cold_entries, cold_count, waraft_entries, waraft_count,
+                  bookkeeping, next_response_bytes}}
+              end
             end
-          end)
+          )
 
-        hot_read_bookkeeping_finish(ctx, bookkeeping)
+        case plan do
+          {:byte_limit, bookkeeping} ->
+            hot_read_bookkeeping_finish(ctx, bookkeeping)
+            {:error, :response_byte_limit}
 
-        cold_values =
-          cold_entries
-          |> Enum.reverse()
-          |> read_cold_batch_async(now)
-          |> List.to_tuple()
+          {results, cold_entries, _cold_count, waraft_entries, _waraft_count, bookkeeping,
+           _response_bytes} ->
+            hot_read_bookkeeping_finish(ctx, bookkeeping)
 
-        waraft_values =
-          waraft_entries
-          |> Enum.reverse()
-          |> read_waraft_segment_batch_materialized()
-          |> List.to_tuple()
+            cold_values =
+              cold_entries
+              |> Enum.reverse()
+              |> read_cold_batch_async(now)
+              |> List.to_tuple()
 
-        Enum.map(results, fn
-          {:value, value} -> value
-          {:cold, index} -> elem(cold_values, index)
-          {:waraft, index} -> elem(waraft_values, index)
-        end)
+            waraft_values =
+              waraft_entries
+              |> Enum.reverse()
+              |> read_waraft_segment_batch_materialized()
+              |> List.to_tuple()
+
+            values =
+              results
+              |> Enum.reverse()
+              |> Enum.map(fn
+                {:value, value} -> value
+                {:cold, index} -> elem(cold_values, index)
+                {:waraft, index} -> elem(waraft_values, index)
+              end)
+
+            {:ok, values}
+        end
       end
+
+      defp batch_get_fallback_value(ctx, idx, key) do
+        result =
+          case safe_read_call(ctx, idx, {:get, key}) do
+            {:ok, value} -> value
+            :unavailable -> ReadResult.failure(:shard_unavailable)
+          end
+
+        case result do
+          {:error, {:storage_read_failed, _reason}} -> :ok
+          nil -> record_keyspace_miss(ctx, key)
+          _value -> Stats.record_cold_read(ctx, key)
+        end
+
+        result
+      end
+
+      defp batch_get_value_bytes(value) when is_binary(value), do: byte_size(value)
+      defp batch_get_value_bytes(nil), do: 0
+      defp batch_get_value_bytes({:error, {:storage_read_failed, _reason}}), do: 0
+
+      defp batch_get_byte_limit_exceeded?(:unlimited, _response_bytes), do: false
+      defp batch_get_byte_limit_exceeded?(limit, response_bytes), do: response_bytes > limit
 
       @doc false
       @spec batch_get_on_route_keys(FerricStore.Instance.t(), [{binary(), binary()}]) :: [
@@ -831,31 +1209,34 @@ defmodule Ferricstore.Store.Router.Part02 do
                   waraft_entries,
                   waraft_count,
                   bookkeeping,
-                  now
+                  now,
+                  validate_blob_ref?
                 )
 
               {:cold, file_id, offset, value_size}
               when valid_waraft_segment_location(file_id, offset, value_size) ->
                 entry = {ctx, idx, keydir, key, file_id, offset, value_size}
 
-                {{:waraft, waraft_count},
-                 {cold_entries, cold_count, [entry | waraft_entries], waraft_count + 1,
-                  bookkeeping}}
-
-              {:cold, _file_id, _offset, _value_size} ->
-                result =
-                  case safe_read_call(ctx, idx, {:get, key}) do
-                    {:ok, value} -> value
-                    :unavailable -> nil
-                  end
-
-                if result != nil do
-                  Stats.record_cold_read(ctx, key)
+                if validate_blob_ref? == :bounded and
+                     not blob_ref_candidate?(ctx, value_size) do
+                  {{:bounded_waraft, entry},
+                   {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
                 else
-                  record_keyspace_miss(ctx, key)
+                  {{:waraft, waraft_count},
+                   {cold_entries, cold_count, [entry | waraft_entries], waraft_count + 1,
+                    bookkeeping}}
                 end
 
+              {:cold, _file_id, _offset, _value_size} ->
+                result = batch_get_fallback_value(ctx, idx, key)
+
                 {{:value, result},
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
+
+              {:invalid, entry} ->
+                failure = ReadResult.failure({:invalid_keydir_entry, entry})
+
+                {{:value, failure},
                  {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               :expired ->
@@ -871,17 +1252,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                  {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
               :no_table ->
-                result =
-                  case safe_read_call(ctx, idx, {:get, key}) do
-                    {:ok, value} -> value
-                    :unavailable -> nil
-                  end
-
-                if result != nil do
-                  Stats.record_cold_read(ctx, key)
-                else
-                  record_keyspace_miss(ctx, key)
-                end
+                result = batch_get_fallback_value(ctx, idx, key)
 
                 {{:value, result},
                  {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
@@ -908,6 +1279,8 @@ defmodule Ferricstore.Store.Router.Part02 do
         Enum.map(results, fn
           {:value, value} -> value
           {:file_ref, path, offset, size} -> {:file_ref, path, offset, size}
+          {:bounded_cold, entry} -> {:bounded_cold, entry}
+          {:bounded_waraft, entry} -> {:bounded_waraft, entry}
           {:cold, index} -> elem(cold_values, index)
           {:waraft, index} -> elem(waraft_values, index)
         end)

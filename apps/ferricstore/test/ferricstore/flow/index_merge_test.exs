@@ -22,8 +22,18 @@ defmodule Ferricstore.Flow.IndexMergeTest do
 
     assert IndexMerge.ids_from_scored_entries(ram_entries, lmdb_entries, 3, true) == [
              "b",
-             "dup",
-             "a"
+             "a",
+             "dup"
+           ]
+  end
+
+  test "RAM scores replace stale LMDB scores before ordering" do
+    ram_entries = [{"dup", 50}]
+    lmdb_entries = [{"dup", 10}, {"middle", 20}]
+
+    assert IndexMerge.ids_from_scored_entries(ram_entries, lmdb_entries, 2, false) == [
+             "middle",
+             "dup"
            ]
   end
 

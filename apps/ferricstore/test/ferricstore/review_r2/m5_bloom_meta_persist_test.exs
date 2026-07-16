@@ -41,9 +41,8 @@ defmodule Ferricstore.ReviewR2.M5BloomMetaPersistTest do
       result = Bloom.handle("BF.RESERVE", [key, "0.01", "1000"], store)
       assert result == :ok
 
-      safe = Base.url_encode64(key, padding: false)
       prob_dir = store.prob_dir.()
-      path = Path.join(prob_dir, "#{safe}.bloom")
+      path = Ferricstore.ProbFile.path(prob_dir, key, "bloom")
       assert File.exists?(path)
     end
 

@@ -14,7 +14,6 @@ defmodule Ferricstore.Store.Shard.Writes do
   """
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -22,6 +21,8 @@ defmodule Ferricstore.Store.Shard.Writes do
 
   # Maximum pending entries before triggering a synchronous flush.
   @max_pending_size 10_000
+  @int64_max 9_223_372_036_854_775_807
+  @int64_min -9_223_372_036_854_775_808
 
   # -------------------------------------------------------------------
   # WRITE-PATH handlers (return {:reply, result, state} or {:noreply, state})
@@ -50,74 +51,15 @@ defmodule Ferricstore.Store.Shard.Writes do
         new_version = state.write_version + 1
         {:noreply, %{state | write_version: new_version}}
       else
-        ShardETS.ets_insert(state, key, value, expire_at_ms, existing)
-        new_pending = [{key, value, expire_at_ms} | state.pending]
-        new_count = state.pending_count + 1
-        new_version = state.write_version + 1
+        case persist_direct_value(state, key, value, expire_at_ms, existing) do
+          {:ok, new_state} ->
+            {:reply, :ok, new_state}
 
-        state =
-          if new_count > @max_pending_size do
-            s = %{state | pending: new_pending, pending_count: new_count}
-            s = ShardFlush.await_in_flight(s)
-            ShardFlush.flush_pending_sync(s)
-          else
-            %{state | pending: new_pending, pending_count: new_count}
-          end
-
-        new_state = %{state | write_version: new_version}
-
-        if state.flush_in_flight == nil do
-          flushed_state = ShardFlush.flush_pending(new_state)
-
-          case Map.get(flushed_state, :last_flush_error) do
-            nil ->
-              {:reply, :ok, flushed_state}
-
-            reason ->
-              rolled_back = rollback_failed_direct_put(flushed_state, key, existing)
-              {:reply, {:error, reason}, rolled_back}
-          end
-        else
-          {:reply, :ok, new_state}
+          {:error, reason, rolled_back_state} ->
+            {:reply, {:error, reason}, rolled_back_state}
         end
       end
     end
-  end
-
-  defp rollback_failed_direct_put(state, key, existing) do
-    ShardETS.ets_delete_key(state, key)
-
-    case existing do
-      [{^key, old_value, old_exp, _old_lfu, old_fid, old_off, old_vsize}]
-      when is_integer(old_fid) and old_fid >= 0 and is_integer(old_off) and old_off >= 0 and
-             is_integer(old_vsize) and old_vsize >= 0 ->
-        ShardETS.ets_insert_with_location(
-          state,
-          key,
-          old_value,
-          old_exp,
-          old_fid,
-          old_off,
-          old_vsize
-        )
-
-      [{^key, old_value, old_exp, _old_lfu, :pending, old_fid, old_vsize}] ->
-        :ets.insert(
-          state.keydir,
-          {key, old_value, old_exp, LFU.initial(), :pending, old_fid, old_vsize}
-        )
-
-      _ ->
-        :ok
-    end
-
-    new_pending =
-      Enum.reject(state.pending, fn {pending_key, _value, _exp} -> pending_key == key end)
-
-    state
-    |> Map.put(:pending, new_pending)
-    |> Map.put(:pending_count, length(new_pending))
-    |> Map.delete(:last_flush_error)
   end
 
   @spec handle_delete(binary(), GenServer.from(), map()) ::
@@ -131,10 +73,10 @@ defmodule Ferricstore.Store.Shard.Writes do
     else
       state = ShardFlush.await_in_flight(state)
       state = ShardFlush.flush_pending_sync(state)
-      state = ShardFlush.track_delete_dead_bytes(state, key)
 
       case NIF.v2_append_tombstone(state.active_file_path, key) do
         {:ok, _} ->
+          state = ShardFlush.track_delete_dead_bytes(state, key)
           ShardETS.ets_delete_key(state, key)
 
           new_pending =
@@ -144,7 +86,14 @@ defmodule Ferricstore.Store.Shard.Writes do
             end
 
           new_version = state.write_version + 1
-          {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
+
+          {:reply, :ok,
+           %{
+             state
+             | pending: new_pending,
+               pending_count: length(new_pending),
+               write_version: new_version
+           }}
 
         {:error, reason} ->
           # Do NOT delete from ETS if the tombstone write failed —
@@ -177,86 +126,33 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_incr_direct(key, delta, state) do
-    case ShardETS.ets_lookup_warm(state, key) do
-      {:hit, value, expire_at_ms} ->
-        case ShardETS.coerce_integer(value) do
-          {:ok, int_val} ->
-            new_val = int_val + delta
-            ShardETS.ets_insert(state, key, new_val, expire_at_ms)
-            new_pending = [{key, new_val, expire_at_ms} | state.pending]
-            new_version = state.write_version + 1
-            new_state = %{state | pending: new_pending, write_version: new_version}
+    case resolve_direct_rmw(state, key) do
+      {:error, state} ->
+        {:reply, {:error, "ERR cold read failed"}, state}
 
-            new_state =
-              if state.flush_in_flight == nil,
-                do: ShardFlush.flush_pending(new_state),
-                else: new_state
-
-            {:reply, {:ok, new_val}, new_state}
-
+      {:ok, value, expire_at_ms, state} ->
+        with {:ok, int_val} <- direct_integer_value(value),
+             new_val = int_val + delta,
+             true <- int64?(new_val),
+             {:ok, new_state} <- persist_direct_value(state, key, new_val, expire_at_ms) do
+          {:reply, {:ok, new_val}, new_state}
+        else
           :error ->
             {:reply, {:error, "ERR value is not an integer or out of range"}, state}
-        end
 
-      :expired ->
-        ShardETS.ets_insert(state, key, delta, 0)
-        new_pending = [{key, delta, 0} | state.pending]
-        new_version = state.write_version + 1
-        new_state = %{state | pending: new_pending, write_version: new_version}
+          false ->
+            {:reply, {:error, "ERR increment or decrement would overflow"}, state}
 
-        new_state =
-          if state.flush_in_flight == nil,
-            do: ShardFlush.flush_pending(new_state),
-            else: new_state
-
-        {:reply, {:ok, delta}, new_state}
-
-      :miss ->
-        state = ShardFlush.await_in_flight(state)
-        state = ShardFlush.flush_pending_sync(state)
-
-        case Ferricstore.Store.Shard.Reads.do_get(state, key) do
-          nil ->
-            ShardETS.ets_insert(state, key, delta, 0)
-            new_pending = [{key, delta, 0} | state.pending]
-            new_version = state.write_version + 1
-            new_state = %{state | pending: new_pending, write_version: new_version}
-
-            new_state =
-              if state.flush_in_flight == nil,
-                do: ShardFlush.flush_pending(new_state),
-                else: new_state
-
-            {:reply, {:ok, delta}, new_state}
-
-          value ->
-            expire_at_ms =
-              case Ferricstore.Store.Shard.Reads.do_get_meta(state, key) do
-                {_, exp} -> exp
-                nil -> 0
-              end
-
-            case ShardETS.coerce_integer(value) do
-              {:ok, int_val} ->
-                new_val = int_val + delta
-                ShardETS.ets_insert(state, key, new_val, expire_at_ms)
-                new_pending = [{key, new_val, expire_at_ms} | state.pending]
-                new_version = state.write_version + 1
-                new_state = %{state | pending: new_pending, write_version: new_version}
-
-                new_state =
-                  if state.flush_in_flight == nil,
-                    do: ShardFlush.flush_pending(new_state),
-                    else: new_state
-
-                {:reply, {:ok, new_val}, new_state}
-
-              :error ->
-                {:reply, {:error, "ERR value is not an integer or out of range"}, state}
-            end
+          {:error, reason, rolled_back_state} ->
+            {:reply, {:error, reason}, rolled_back_state}
         end
     end
   end
+
+  defp direct_integer_value(nil), do: {:ok, 0}
+  defp direct_integer_value(value), do: ShardETS.coerce_integer(value)
+
+  defp int64?(value), do: value >= @int64_min and value <= @int64_max
 
   @spec handle_incr_float(binary(), float(), GenServer.from(), map()) ::
           {:reply, term(), map()} | {:noreply, map()}
@@ -275,84 +171,27 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_incr_float_direct(key, delta, state) do
-    case ShardETS.ets_lookup_warm(state, key) do
-      {:hit, value, expire_at_ms} ->
-        case ShardETS.coerce_float(value) do
-          {:ok, float_val} ->
-            new_val = float_val + delta
-            ShardETS.ets_insert(state, key, new_val, expire_at_ms)
-            new_pending = [{key, new_val, expire_at_ms} | state.pending]
-            new_state = %{state | pending: new_pending}
+    case resolve_direct_rmw(state, key) do
+      {:error, state} ->
+        {:reply, {:error, "ERR cold read failed"}, state}
 
-            new_state =
-              if state.flush_in_flight == nil,
-                do: ShardFlush.flush_pending(new_state),
-                else: new_state
-
-            {:reply, {:ok, new_val}, new_state}
-
+      {:ok, value, expire_at_ms, state} ->
+        with {:ok, float_val} <- direct_float_value(value),
+             new_val = float_val + delta,
+             {:ok, new_state} <- persist_direct_value(state, key, new_val, expire_at_ms) do
+          {:reply, {:ok, new_val}, new_state}
+        else
           :error ->
             {:reply, {:error, "ERR value is not a valid float"}, state}
-        end
 
-      :expired ->
-        new_val = delta * 1.0
-        ShardETS.ets_insert(state, key, new_val, 0)
-        new_pending = [{key, new_val, 0} | state.pending]
-        new_state = %{state | pending: new_pending}
-
-        new_state =
-          if state.flush_in_flight == nil,
-            do: ShardFlush.flush_pending(new_state),
-            else: new_state
-
-        {:reply, {:ok, new_val}, new_state}
-
-      :miss ->
-        state = ShardFlush.await_in_flight(state)
-        state = ShardFlush.flush_pending_sync(state)
-
-        case Ferricstore.Store.Shard.Reads.do_get(state, key) do
-          nil ->
-            new_val = delta * 1.0
-            ShardETS.ets_insert(state, key, new_val, 0)
-            new_pending = [{key, new_val, 0} | state.pending]
-            new_state = %{state | pending: new_pending}
-
-            new_state =
-              if state.flush_in_flight == nil,
-                do: ShardFlush.flush_pending(new_state),
-                else: new_state
-
-            {:reply, {:ok, new_val}, new_state}
-
-          value ->
-            expire_at_ms =
-              case Ferricstore.Store.Shard.Reads.do_get_meta(state, key) do
-                {_, exp} -> exp
-                nil -> 0
-              end
-
-            case ShardETS.coerce_float(value) do
-              {:ok, float_val} ->
-                new_val = float_val + delta
-                ShardETS.ets_insert(state, key, new_val, expire_at_ms)
-                new_pending = [{key, new_val, expire_at_ms} | state.pending]
-                new_state = %{state | pending: new_pending}
-
-                new_state =
-                  if state.flush_in_flight == nil,
-                    do: ShardFlush.flush_pending(new_state),
-                    else: new_state
-
-                {:reply, {:ok, new_val}, new_state}
-
-              :error ->
-                {:reply, {:error, "ERR value is not a valid float"}, state}
-            end
+          {:error, reason, rolled_back_state} ->
+            {:reply, {:error, reason}, rolled_back_state}
         end
     end
   end
+
+  defp direct_float_value(nil), do: {:ok, 0.0}
+  defp direct_float_value(value), do: ShardETS.coerce_float(value)
 
   @spec handle_append(binary(), binary(), GenServer.from(), map()) ::
           {:reply, term(), map()} | {:noreply, map()}
@@ -371,53 +210,21 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_append_direct(key, suffix, state) do
-    case ShardETS.ets_lookup_warm(state, key) do
-      {:hit, value, expire_at_ms} ->
-        new_val = ShardETS.to_disk_binary(value) <> suffix
-        ShardETS.ets_insert(state, key, new_val, expire_at_ms)
-        new_pending = [{key, new_val, expire_at_ms} | state.pending]
-        new_state = %{state | pending: new_pending}
+    case resolve_direct_rmw(state, key) do
+      {:error, state} ->
+        {:reply, {:error, "ERR cold read failed"}, state}
 
-        new_state =
-          if state.flush_in_flight == nil,
-            do: ShardFlush.flush_pending(new_state),
-            else: new_state
-
-        {:reply, {:ok, byte_size(new_val)}, new_state}
-
-      :expired ->
-        ShardETS.ets_insert(state, key, suffix, 0)
-        new_pending = [{key, suffix, 0} | state.pending]
-        new_state = %{state | pending: new_pending}
-
-        new_state =
-          if state.flush_in_flight == nil,
-            do: ShardFlush.flush_pending(new_state),
-            else: new_state
-
-        {:reply, {:ok, byte_size(suffix)}, new_state}
-
-      :miss ->
-        state = ShardFlush.await_in_flight(state)
-        state = ShardFlush.flush_pending_sync(state)
-
-        {old_val, expire_at_ms} =
-          case Ferricstore.Store.Shard.Reads.do_get_meta(state, key) do
-            {v, exp} -> {ShardETS.to_disk_binary(v), exp}
-            nil -> {"", 0}
-          end
-
+      {:ok, value, expire_at_ms, state} ->
+        old_val = if is_nil(value), do: "", else: ShardETS.to_disk_binary(value)
         new_val = old_val <> suffix
-        ShardETS.ets_insert(state, key, new_val, expire_at_ms)
-        new_pending = [{key, new_val, expire_at_ms} | state.pending]
-        new_state = %{state | pending: new_pending}
 
-        new_state =
-          if state.flush_in_flight == nil,
-            do: ShardFlush.flush_pending(new_state),
-            else: new_state
+        case persist_direct_value(state, key, new_val, expire_at_ms) do
+          {:ok, new_state} ->
+            {:reply, {:ok, byte_size(new_val)}, new_state}
 
-        {:reply, {:ok, byte_size(new_val)}, new_state}
+          {:error, reason, rolled_back_state} ->
+            {:reply, {:error, reason}, rolled_back_state}
+        end
     end
   end
 
@@ -438,30 +245,19 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_getset_direct(key, new_value, state) do
-    {old, state} =
-      case ShardETS.ets_lookup_warm(state, key) do
-        {:hit, value, _expire_at_ms} ->
-          {value, state}
+    case resolve_direct_rmw(state, key) do
+      {:error, state} ->
+        {:reply, {:error, "ERR cold read failed"}, state}
 
-        :expired ->
-          {nil, state}
+      {:ok, old, _expire_at_ms, state} ->
+        case persist_direct_value(state, key, new_value, 0) do
+          {:ok, new_state} ->
+            {:reply, old, new_state}
 
-        :miss ->
-          state = ShardFlush.await_in_flight(state)
-          state = ShardFlush.flush_pending_sync(state)
-          {Ferricstore.Store.Shard.Reads.do_get(state, key), state}
-      end
-
-    ShardETS.ets_insert(state, key, new_value, 0)
-    new_pending = [{key, new_value, 0} | state.pending]
-    new_state = %{state | pending: new_pending}
-
-    new_state =
-      if state.flush_in_flight == nil,
-        do: ShardFlush.flush_pending(new_state),
-        else: new_state
-
-    {:reply, old, new_state}
+          {:error, reason, rolled_back_state} ->
+            {:reply, {:error, reason}, rolled_back_state}
+        end
+    end
   end
 
   @spec handle_getdel(binary(), GenServer.from(), map()) ::
@@ -481,46 +277,43 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_getdel_direct(key, state) do
-    {old, state} =
-      case ShardETS.ets_lookup_warm(state, key) do
-        {:hit, value, _expire_at_ms} ->
-          {value, state}
+    case resolve_direct_rmw(state, key) do
+      {:error, state} ->
+        {:reply, {:error, "ERR cold read failed"}, state}
 
-        :expired ->
-          {nil, state}
+      {:ok, nil, _expire_at_ms, state} ->
+        {:reply, nil, state}
 
-        :miss ->
-          state = ShardFlush.await_in_flight(state)
-          state = ShardFlush.flush_pending_sync(state)
-          {Ferricstore.Store.Shard.Reads.do_get(state, key), state}
-      end
+      {:ok, old, _expire_at_ms, state} ->
+        state = ShardFlush.await_in_flight(state)
+        state = ShardFlush.flush_pending_sync(state)
 
-    if old != nil do
-      state = ShardFlush.await_in_flight(state)
-      state = ShardFlush.flush_pending_sync(state)
-      state = ShardFlush.track_delete_dead_bytes(state, key)
+        case NIF.v2_append_tombstone(state.active_file_path, key) do
+          {:ok, _} ->
+            state = ShardFlush.track_delete_dead_bytes(state, key)
+            ShardETS.ets_delete_key(state, key)
 
-      case NIF.v2_append_tombstone(state.active_file_path, key) do
-        {:ok, _} ->
-          ShardETS.ets_delete_key(state, key)
+            new_pending =
+              case state.pending do
+                [] -> []
+                pending -> Enum.reject(pending, fn {k, _, _} -> k == key end)
+              end
 
-          new_pending =
-            case state.pending do
-              [] -> []
-              pending -> Enum.reject(pending, fn {k, _, _} -> k == key end)
-            end
+            {:reply, old,
+             %{
+               state
+               | pending: new_pending,
+                 pending_count: length(new_pending),
+                 write_version: state.write_version + 1
+             }}
 
-          {:reply, old, %{state | pending: new_pending}}
+          {:error, reason} ->
+            Logger.error(
+              "Shard #{state.index}: tombstone write failed for GETDEL: #{inspect(reason)}"
+            )
 
-        {:error, reason} ->
-          Logger.error(
-            "Shard #{state.index}: tombstone write failed for GETDEL: #{inspect(reason)}"
-          )
-
-          {:reply, {:error, reason}, state}
-      end
-    else
-      {:reply, nil, state}
+            {:reply, {:error, reason}, state}
+        end
     end
   end
 
@@ -541,42 +334,21 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_getex_direct(key, expire_at_ms, state) do
-    case ShardETS.ets_lookup_warm(state, key) do
-      {:hit, value, _old_exp} ->
-        ShardETS.ets_insert(state, key, value, expire_at_ms)
-        new_pending = [{key, value, expire_at_ms} | state.pending]
-        new_state = %{state | pending: new_pending}
+    case resolve_direct_rmw(state, key) do
+      {:error, state} ->
+        {:reply, {:error, "ERR cold read failed"}, state}
 
-        new_state =
-          if state.flush_in_flight == nil,
-            do: ShardFlush.flush_pending(new_state),
-            else: new_state
-
-        {:reply, value, new_state}
-
-      :expired ->
-        {:reply, nil, state}
-
-      :miss ->
-        state = ShardFlush.await_in_flight(state)
-        state = ShardFlush.flush_pending_sync(state)
-
-        case Ferricstore.Store.Shard.Reads.do_get(state, key) do
-          nil ->
-            {:reply, nil, state}
-
-          value ->
-            ShardETS.ets_insert(state, key, value, expire_at_ms)
-            new_pending = [{key, value, expire_at_ms} | state.pending]
-            new_state = %{state | pending: new_pending}
-
-            new_state =
-              if state.flush_in_flight == nil,
-                do: ShardFlush.flush_pending(new_state),
-                else: new_state
-
+      {:ok, value, _old_exp, state} when value != nil ->
+        case persist_direct_value(state, key, value, expire_at_ms) do
+          {:ok, new_state} ->
             {:reply, value, new_state}
+
+          {:error, reason, rolled_back_state} ->
+            {:reply, {:error, reason}, rolled_back_state}
         end
+
+      {:ok, nil, _old_exp, state} ->
+        {:reply, nil, state}
     end
   end
 
@@ -602,50 +374,37 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_setrange_direct(key, offset, value, state) do
-    {old_val, expire_at_ms} =
-      case ShardETS.ets_lookup_warm(state, key) do
-        {:hit, v, exp} ->
-          {ShardETS.to_disk_binary(v), exp}
+    case resolve_direct_rmw(state, key) do
+      {:error, state} ->
+        {:reply, {:error, "ERR cold read failed"}, state}
 
-        :expired ->
-          {"", 0}
+      {:ok, old, expire_at_ms, state} ->
+        old_val = if old == nil, do: "", else: ShardETS.to_disk_binary(old)
+        new_val = apply_setrange(old_val, offset, value)
 
-        :miss ->
-          state = ShardFlush.await_in_flight(state)
-          state = ShardFlush.flush_pending_sync(state)
+        case persist_direct_value(state, key, new_val, expire_at_ms) do
+          {:ok, new_state} ->
+            {:reply, {:ok, byte_size(new_val)}, new_state}
 
-          case Ferricstore.Store.Shard.Reads.do_get_meta(state, key) do
-            {v, exp} -> {ShardETS.to_disk_binary(v), exp}
-            nil -> {"", 0}
-          end
-      end
-
-    new_val = apply_setrange(old_val, offset, value)
-    ShardETS.ets_insert(state, key, new_val, expire_at_ms)
-    new_pending = [{key, new_val, expire_at_ms} | state.pending]
-    new_state = %{state | pending: new_pending}
-
-    new_state =
-      if state.flush_in_flight == nil,
-        do: ShardFlush.flush_pending(new_state),
-        else: new_state
-
-    {:reply, {:ok, byte_size(new_val)}, new_state}
+          {:error, reason, rolled_back_state} ->
+            {:reply, {:error, reason}, rolled_back_state}
+        end
+    end
   end
 
   @spec handle_delete_prefix(binary(), map()) :: {:reply, :ok, map()}
   @doc false
   def handle_delete_prefix(prefix, state) do
-    keys_to_delete = ShardETS.prefix_collect_keys(state.keydir, prefix)
-
     if state.raft? do
-      Enum.each(keys_to_delete, fn key ->
-        Ferricstore.Raft.Batcher.write(state.index, {:delete, key})
-      end)
+      :ok =
+        ShardETS.prefix_each_key(state.keydir, prefix, fn key ->
+          Ferricstore.Raft.Batcher.write(state.index, {:delete, key})
+        end)
 
       new_version = state.write_version + 1
       {:reply, :ok, %{state | write_version: new_version}}
     else
+      keys_to_delete = ShardETS.prefix_collect_keys(state.keydir, prefix)
       state = ShardFlush.await_in_flight(state)
       state = ShardFlush.flush_pending_sync(state)
 
@@ -664,31 +423,168 @@ defmodule Ferricstore.Store.Shard.Writes do
   # Helpers
   # -------------------------------------------------------------------
 
+  defp persist_direct_value(state, key, value, expire_at_ms) do
+    persist_direct_value(state, key, value, expire_at_ms, :ets.lookup(state.keydir, key))
+  end
+
+  defp persist_direct_value(state, key, value, expire_at_ms, previous_entry) do
+    previous_pending = state.pending
+    previous_pending_count = Map.get(state, :pending_count, length(previous_pending))
+    previous_write_version = state.write_version
+
+    ShardETS.ets_insert(state, key, value, expire_at_ms, previous_entry)
+
+    staged_state = %{
+      state
+      | pending: [{key, value, expire_at_ms} | previous_pending],
+        pending_count: previous_pending_count + 1,
+        write_version: previous_write_version + 1
+    }
+
+    {flush_attempted?, flushed_state} =
+      cond do
+        staged_state.pending_count > @max_pending_size ->
+          flushed_state =
+            staged_state
+            |> ShardFlush.await_in_flight()
+            |> ShardFlush.flush_pending_sync()
+
+          {true, flushed_state}
+
+        state.flush_in_flight == nil ->
+          {true, ShardFlush.flush_pending(staged_state)}
+
+        true ->
+          {false, staged_state}
+      end
+
+    if flush_attempted? do
+      case Map.get(flushed_state, :last_flush_error) do
+        nil ->
+          {:ok, flushed_state}
+
+        reason ->
+          rolled_back_state =
+            rollback_direct_value(
+              flushed_state,
+              key,
+              previous_entry,
+              previous_pending,
+              previous_pending_count,
+              previous_write_version
+            )
+
+          {:error, reason, rolled_back_state}
+      end
+    else
+      {:ok, flushed_state}
+    end
+  end
+
+  defp rollback_direct_value(
+         state,
+         key,
+         previous_entry,
+         previous_pending,
+         previous_pending_count,
+         previous_write_version
+       ) do
+    restore_direct_entry(state, key, previous_entry)
+
+    state
+    |> Map.put(:pending, previous_pending)
+    |> Map.put(:pending_count, previous_pending_count)
+    |> Map.put(:write_version, previous_write_version)
+    |> Map.delete(:last_flush_error)
+  end
+
+  defp restore_direct_entry(state, key, []) do
+    ShardETS.ets_delete_key(state, key)
+  end
+
+  defp restore_direct_entry(
+         state,
+         key,
+         [{key, value, expire_at_ms, _lfu, file_id, offset, value_size}]
+       )
+       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+              is_integer(value_size) and value_size >= 0 do
+    ShardETS.ets_insert_with_location(
+      state,
+      key,
+      value,
+      expire_at_ms,
+      file_id,
+      offset,
+      value_size
+    )
+  end
+
+  defp restore_direct_entry(
+         state,
+         key,
+         [{key, value, expire_at_ms, lfu, :pending, old_file_id, old_value_size}]
+       ) do
+    ShardETS.ets_insert(state, key, value, expire_at_ms)
+
+    :ets.insert(
+      state.keydir,
+      {key, value, expire_at_ms, lfu, :pending, old_file_id, old_value_size}
+    )
+  end
+
+  defp restore_direct_entry(state, key, [entry]) do
+    ShardETS.ets_delete_key(state, key)
+    :ets.insert(state.keydir, entry)
+  end
+
+  defp resolve_direct_rmw(state, key) do
+    case ShardETS.ets_lookup_warm_result(state, key) do
+      {:hit, value, expire_at_ms} ->
+        {:ok, value, expire_at_ms, state}
+
+      :expired ->
+        {:ok, nil, 0, state}
+
+      :miss ->
+        state = ShardFlush.await_in_flight(state)
+        state = ShardFlush.flush_pending_sync(state)
+
+        case Ferricstore.Store.Shard.Reads.do_get_meta(state, key) do
+          {:error, {:storage_read_failed, _reason}} -> {:error, state}
+          {value, expire_at_ms} -> {:ok, value, expire_at_ms, state}
+          nil -> {:ok, nil, 0, state}
+        end
+
+      {:error, :cold_read_failed} ->
+        {:error, state}
+    end
+  end
+
   defp tombstone_and_delete_keys(state, []), do: {:ok, state}
 
   defp tombstone_and_delete_keys(state, keys) do
-    next_state =
-      Enum.reduce(keys, state, fn key, acc_state ->
-        ShardFlush.track_delete_dead_bytes(acc_state, key)
-      end)
-
-    case append_tombstone_batch_sync(next_state.active_file_path, keys) do
+    case append_tombstone_batch_sync(state.active_file_path, keys) do
       {:ok, _locations} ->
+        next_state =
+          Enum.reduce(keys, state, fn key, acc_state ->
+            ShardFlush.track_delete_dead_bytes(acc_state, key)
+          end)
+
         Enum.each(keys, fn key -> ShardETS.ets_delete_key(next_state, key) end)
         {:ok, next_state}
 
       {:error, reason} ->
-        {{:error, reason}, next_state}
+        {{:error, reason}, state}
     end
   end
 
   defp append_tombstone_batch_sync(path, keys) do
     ops = Enum.map(keys, &{:delete, &1})
 
-    case NIF.v2_append_ops_batch_nosync(path, ops) do
+    case NIF.v2_append_ops_batch(path, ops) do
       {:ok, locations} ->
-        with :ok <- validate_tombstone_locations(locations, length(keys)),
-             :ok <- NIF.v2_fsync(path) do
+        with :ok <- validate_tombstone_locations(locations, length(keys)) do
           {:ok, locations}
         end
 

@@ -4,55 +4,82 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
   alias Ferricstore.Flow.LMDBWriter
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
 
-  def drain_projection_outbox(state, mode) when mode in [:maybe_flush, :no_flush] do
-    case take_projection_outbox_entries(state) do
-      [] ->
-        state
+  @projection_outbox_batch_size 1_024
+  @end_of_table :"$end_of_table"
 
-      entries ->
-        {ops, after_flush} = projection_outbox_items(state, entries)
+  def drain_projection_outbox(state) do
+    capacity = max(@projection_outbox_batch_size - Map.get(state, :count, 0), 0)
+    entries = take_projection_outbox_entries(state, capacity)
 
-        cond do
-          ops == [] and after_flush == [] ->
-            state
+    state =
+      case projection_outbox_items(state, entries) do
+        {[], []} ->
+          state
 
-          mode == :maybe_flush ->
-            LMDBWriter.enqueue_and_maybe_flush(ops, after_flush, state)
+        {ops, after_flush} ->
+          now = System.monotonic_time()
+          state = LMDBWriter.enqueue_ops(ops, after_flush, state, now)
+          LMDBWriter.emit_backlog(state, now)
+          state
+      end
 
-          true ->
-            now = System.monotonic_time()
-            state = LMDBWriter.enqueue_ops(ops, after_flush, state, now)
-
-            LMDBWriter.emit_backlog(state, now)
-            state
-        end
-    end
+    {state, projection_outbox_pending?(state)}
   end
 
   def take_projection_outbox_entries(state) do
+    take_projection_outbox_entries(state, @projection_outbox_batch_size)
+  end
+
+  def projection_outbox_pending?(state) do
     table = LMDBWriter.projection_outbox_name(state.instance_name, state.shard_index)
 
     case :ets.whereis(table) do
-      :undefined ->
-        []
+      :undefined -> false
+      tid -> first_projection_entry_key(tid) != @end_of_table
+    end
+  rescue
+    ArgumentError -> false
+  end
 
-      tid ->
-        tid
-        |> :ets.tab2list()
-        |> Enum.flat_map(fn
-          {seq, _state_key, _version} ->
-            case :ets.take(tid, seq) do
-              [entry] -> [entry]
-              _ -> []
-            end
+  defp take_projection_outbox_entries(_state, limit) when limit <= 0, do: []
 
-          _marker ->
-            []
-        end)
-        |> Enum.sort_by(fn {seq, _state_key, _version} -> seq end)
+  defp take_projection_outbox_entries(state, limit) do
+    table = LMDBWriter.projection_outbox_name(state.instance_name, state.shard_index)
+
+    case :ets.whereis(table) do
+      :undefined -> []
+      tid -> take_projection_entries(tid, first_projection_entry_key(tid), limit, [])
     end
   rescue
     ArgumentError -> []
+  end
+
+  defp take_projection_entries(_tid, @end_of_table, _remaining, acc), do: Enum.reverse(acc)
+  defp take_projection_entries(_tid, _key, 0, acc), do: Enum.reverse(acc)
+
+  defp take_projection_entries(tid, key, remaining, acc) do
+    next_key = next_projection_entry_key(tid, key)
+
+    case :ets.take(tid, key) do
+      [{^key, _state_key, _version} = entry] ->
+        take_projection_entries(tid, next_key, remaining - 1, [entry | acc])
+
+      _other ->
+        take_projection_entries(tid, next_key, remaining, acc)
+    end
+  end
+
+  defp first_projection_entry_key(tid), do: find_projection_entry_key(tid, :ets.first(tid))
+
+  defp next_projection_entry_key(tid, key) do
+    find_projection_entry_key(tid, :ets.next(tid, key))
+  end
+
+  defp find_projection_entry_key(_tid, @end_of_table), do: @end_of_table
+  defp find_projection_entry_key(_tid, key) when is_integer(key), do: key
+
+  defp find_projection_entry_key(tid, marker) do
+    find_projection_entry_key(tid, :ets.next(tid, marker))
   end
 
   def projection_outbox_items(state, entries) do
@@ -84,7 +111,7 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
           Ferricstore.Flow.NativeOrderedIndex.table_names(state.instance_name, state.shard_index)
 
         {:defer_after_flush, LMDBWriter.terminal_hot_ttl_ms(),
-         {:prune_terminal_flow_from_source_v1, state.data_dir, state.shard_index, ets, zset_index,
+         {:prune_terminal_flow_from_source, state.data_dir, state.shard_index, ets, zset_index,
           zset_lookup, flow_index, flow_lookup, state_key, version}}
     end
   end

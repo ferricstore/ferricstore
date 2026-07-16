@@ -32,7 +32,9 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Raft.StateMachine
+  alias Ferricstore.Stats
   alias Ferricstore.Test.IsolatedInstance
+  alias Ferricstore.Transaction.ExecutionEntry
 
   @router_source_path Path.expand("../../../lib/ferricstore/store/router/blob_gc.ex", __DIR__)
 
@@ -78,6 +80,77 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
   use Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnoresExpiredBlobRefsStillPresentInKeydir
 
+  test "bounded batch GET charges the logical size of cold blob values", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "blob:bounded-batch-get"
+    payload = :binary.copy("B", 1536)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+    state =
+      StateMachine.init(%{
+        shard_index: 0,
+        shard_data_path: shard_path,
+        active_file_id: 0,
+        active_file_path: ShardETS.file_path(shard_path, 0),
+        ets: keydir,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx,
+        instance_name: ctx.name
+      })
+
+    assert_state_machine_result(
+      :ok,
+      StateMachine.apply(%{index: 1}, {:put, key, payload, 0}, state)
+    )
+
+    assert [{^key, nil, 0, _lfu, _file_id, _offset, stored_size}] = :ets.lookup(keydir, key)
+    assert stored_size == BlobRef.encoded_size()
+
+    assert {:error, :response_byte_limit} =
+             Router.batch_get_bounded(ctx, [key], BlobRef.encoded_size() + 1)
+
+    cold_reads_before = Stats.total_cold_reads(ctx)
+    assert {:ok, [^payload]} = Router.batch_get_bounded(ctx, [key], byte_size(payload))
+    assert Stats.total_cold_reads(ctx) - cold_reads_before == 1
+  end
+
+  test "bounded batch GET defers ordinary cold reads until size admission", %{
+    ctx: ctx,
+    keydir: keydir
+  } do
+    key = "cold:bounded-batch-get"
+    payload = :binary.copy("C", 96)
+    shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
+
+    state =
+      StateMachine.init(%{
+        shard_index: 0,
+        shard_data_path: shard_path,
+        active_file_id: 0,
+        active_file_path: ShardETS.file_path(shard_path, 0),
+        ets: keydir,
+        data_dir: ctx.data_dir,
+        instance_ctx: ctx,
+        instance_name: ctx.name
+      })
+
+    assert_state_machine_result(
+      :ok,
+      StateMachine.apply(%{index: 1}, {:put, key, payload, 0}, state)
+    )
+
+    assert [{^key, nil, 0, _lfu, _file_id, _offset, 96}] = :ets.lookup(keydir, key)
+
+    cold_reads_before = Stats.total_cold_reads(ctx)
+    assert {:error, :response_byte_limit} = Router.batch_get_bounded(ctx, [key], 95)
+    assert Stats.total_cold_reads(ctx) == cold_reads_before
+
+    assert {:ok, [^payload]} = Router.batch_get_bounded(ctx, [key], 96)
+    assert Stats.total_cold_reads(ctx) - cold_reads_before == 1
+  end
+
   defp force_rotate_active_file(shard) do
     :sys.replace_state(shard, fn state ->
       new_id = state.active_file_id + 1
@@ -106,7 +179,8 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
 
   defp prepared_tx_entry(command, args) do
     {:ok, prepared} = PreparedCommand.prepare(command, args)
-    {prepared.command, prepared.args, prepared.ast}
+    {:ok, entry} = ExecutionEntry.from_prepared(prepared)
+    entry
   end
 
   defp raw_disk_blob_ref(ctx, keydir, key) do
@@ -138,7 +212,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
   end
 
   defp promoted_disk_blob_ref(shard, keydir, redis_key, compound_key) do
-    state = :sys.get_state(shard)
+    state = await_promoted_instance(shard, redis_key)
     dedicated_path = state.promoted_instances[redis_key].path
 
     with [{^compound_key, _value, _exp, _lfu, fid, off, _vsize}] <-
@@ -150,6 +224,24 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     else
       other -> {:error, {:unexpected_promoted_blob_ref, other}}
     end
+  end
+
+  defp await_promoted_instance(shard, redis_key, attempts \\ 200)
+
+  defp await_promoted_instance(shard, redis_key, attempts) when attempts > 0 do
+    state = :sys.get_state(shard)
+
+    if Map.has_key?(state.promoted_instances, redis_key) do
+      state
+    else
+      Process.sleep(10)
+      await_promoted_instance(shard, redis_key, attempts - 1)
+    end
+  end
+
+  defp await_promoted_instance(shard, redis_key, 0) do
+    state = :sys.get_state(shard)
+    flunk("expected #{inspect(redis_key)} to be promoted, got #{inspect(state.promoted_instances)}")
   end
 
   defp assert_state_machine_result(expected, result)
@@ -181,13 +273,6 @@ defmodule Ferricstore.Store.BlobSideChannelTest do
     )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
-  end
-
-  defp write_legacy_blob!(data_dir, shard_index, %BlobRef{} = ref, payload) do
-    path = BlobRef.path(data_dir, shard_index, ref)
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, payload)
-    path
   end
 
   defp overwrite_segment_payload!(data_dir, shard_index, ref, payload) do

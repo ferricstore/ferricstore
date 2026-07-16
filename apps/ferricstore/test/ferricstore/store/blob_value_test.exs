@@ -98,6 +98,22 @@ defmodule Ferricstore.Store.BlobValueTest do
     refute_received :blob_loaded
   end
 
+  test "batch loader cardinality mismatches fail every requested ref closed" do
+    ref_a = BlobRef.from_segment("a", 0, 48)
+    ref_b = BlobRef.from_segment("b", 48, 48)
+    encoded_a = BlobRef.encode!(ref_a)
+    encoded_b = BlobRef.encode!(ref_b)
+
+    assert %{
+             ^encoded_a => {:error, :blob_batch_result_count_mismatch},
+             ^encoded_b => {:error, :blob_batch_result_count_mismatch}
+           } =
+             BlobValue.__load_materialize_results_for_test__(
+               [{encoded_a, ref_a}, {encoded_b, ref_b}],
+               [{:ok, "a"}]
+             )
+  end
+
   test "maybe_materialize_many default loader batches append-segment reads", %{root: root} do
     payloads = [
       :binary.copy("a", 512),

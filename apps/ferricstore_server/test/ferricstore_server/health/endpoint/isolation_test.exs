@@ -6,6 +6,14 @@ defmodule FerricstoreServer.Health.Endpoint.IsolationTest do
   alias FerricstoreServer.Health.Endpoint
   alias FerricstoreServer.Health.ProbeEndpoint
 
+  @tag :probe_socket_buffer
+  test "probe listener bounds its transport buffer to the request ceiling" do
+    %{start: {:ranch_embedded_sup, :start_link, [_ref, _transport, transport_opts | _rest]}} =
+      ProbeEndpoint.child_spec(0)
+
+    assert Keyword.fetch!(transport_opts.socket_opts, :buffer) == 1_024
+  end
+
   test "dashboard connection exhaustion does not starve liveness or readiness probes" do
     listener = Endpoint.ref()
     previous_max_connections = :ranch.get_max_connections(listener)

@@ -554,7 +554,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
           max_active_ms: max_active_ms
         }
 
-        with :ok <- flow_maybe_queue_hibernated_timeout_cleanup(state, state_key),
+        with :ok <- flow_maybe_queue_hibernated_timeout_cleanup(state, state_key, record),
              :ok <- flow_put_record_values(state, next, attrs),
              :ok <- flow_transition_move_indexes(state, [{record, next}]),
              :ok <-
@@ -571,49 +571,146 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         end
       end
 
-      defp flow_maybe_queue_hibernated_timeout_cleanup(state, state_key) do
-        case :ets.lookup(state.ets, state_key) do
-          [] -> flow_queue_hibernated_timeout_cleanup(state, state_key)
+      defp flow_maybe_queue_hibernated_timeout_cleanup(state, state_key, record) do
+        hot_lookup =
+          try do
+            :ets.lookup(state.ets, state_key)
+          rescue
+            ArgumentError -> :unavailable
+          end
+
+        case hot_lookup do
+          [] -> flow_queue_hibernated_timeout_cleanup(state, state_key, record)
           _present -> :ok
         end
-      rescue
-        ArgumentError -> :ok
       end
 
-      defp flow_queue_hibernated_timeout_cleanup(state, state_key) do
+      defp flow_queue_hibernated_timeout_cleanup(state, state_key, record) do
         park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key(state_key)
 
-        with {:ok, park_blob} <- Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), park_key),
-             {:ok, %{locator: %Locator{} = locator} = park} <-
-               Ferricstore.Flow.LMDB.decode_cold_park(park_blob) do
-          row =
-            park
-            |> Map.put(:park_key, park_key)
-            |> flow_hibernated_timeout_due_key(locator)
+        park_result =
+          with {:ok, park_blob} <-
+                 Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), park_key),
+               {:ok, %{locator: %Locator{} = locator} = park} <-
+                 Ferricstore.Flow.LMDB.decode_cold_park(park_blob) do
+            {:ok, park, locator}
+          else
+            _missing_or_invalid -> :skip
+          end
 
-          active_index_ops = flow_hibernated_timeout_active_index_delete_ops(state, state_key)
+        case park_result do
+          {:ok, park, locator} ->
+            row =
+              park
+              |> Map.put(:park_key, park_key)
+              |> flow_hibernated_timeout_due_key(locator)
 
-          with_lmdb_mirror_shard(state, fn ->
-            (Hibernation.cleanup_ops(row) ++ active_index_ops)
-            |> Enum.each(&queue_pending_lmdb_mirror_op/1)
-          end)
+            with {:ok, active_index_ops} <-
+                   flow_hibernated_timeout_active_index_delete_ops(
+                     state,
+                     state_key,
+                     record
+                   ) do
+              with_lmdb_mirror_shard(state, fn ->
+                (Hibernation.cleanup_ops(row) ++ active_index_ops)
+                |> Enum.each(&queue_pending_lmdb_mirror_op/1)
+              end)
+
+              :ok
+            end
+
+          :skip ->
+            :ok
         end
-
-        :ok
       end
 
-      defp flow_hibernated_timeout_active_index_delete_ops(state, state_key) do
+      defp flow_hibernated_timeout_active_index_delete_ops(state, state_key, record) do
+        with {:ok, deadline_ms} <- flow_hibernated_timeout_deadline(record) do
+          state
+          |> flow_lmdb_record_path()
+          |> Ferricstore.Flow.LMDB.active_index_delete_ops_result(state_key)
+          |> flow_hibernated_timeout_active_index_delete_ops_result(state_key, deadline_ms)
+        end
+      end
+
+      defp flow_hibernated_timeout_deadline(record) do
+        case {Map.get(record, :created_at_ms), Map.get(record, :max_active_ms)} do
+          {created_at_ms, max_active_ms}
+          when is_integer(created_at_ms) and created_at_ms >= 0 and is_integer(max_active_ms) and
+                 max_active_ms > 0 and
+                 created_at_ms + max_active_ms <= 18_446_744_073_709_551_615 ->
+            {:ok, created_at_ms + max_active_ms}
+
+          _invalid ->
+            {:error, :invalid_active_timeout_deadline}
+        end
+      end
+
+      defp flow_hibernated_timeout_active_index_delete_ops_result(
+             {:ok, ops},
+             state_key,
+             deadline_ms
+           ) do
         reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
 
-        case Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), reverse_key) do
-          {:ok, reverse_value} ->
-            Ferricstore.Flow.LMDB.active_index_delete_ops_from_reverse(
-              state_key,
-              reverse_value
-            )
+        active_key =
+          Ferricstore.Flow.LMDB.active_index_key(
+            FlowKeys.active_timeout_index_key(),
+            state_key,
+            deadline_ms
+          )
 
-          _missing ->
-            []
+        case ops do
+          [
+            {:compare, ^reverse_key, reverse_value},
+            {:compare, ^active_key, active_value},
+            {:delete, ^reverse_key},
+            {:delete, ^active_key}
+          ]
+          when is_binary(reverse_value) and is_binary(active_value) ->
+            {:ok, ops}
+
+          [{:compare_missing, ^reverse_key}] ->
+            {:error, :missing_active_index_reverse}
+
+          _invalid ->
+            {:error, :invalid_active_index_reverse}
+        end
+      end
+
+      defp flow_hibernated_timeout_active_index_delete_ops_result(
+             {:error, :invalid_active_index_reverse},
+             _state_key,
+             _deadline_ms
+           ),
+           do: {:error, :invalid_active_index_reverse}
+
+      defp flow_hibernated_timeout_active_index_delete_ops_result(
+             {:error, _reason},
+             _state_key,
+             _deadline_ms
+           ),
+           do: {:error, :active_index_reverse_read_failed}
+
+      defp flow_hibernated_timeout_active_index_delete_ops_result(
+             _invalid,
+             _state_key,
+             _deadline_ms
+           ),
+           do: {:error, :active_index_reverse_read_failed}
+
+      if Mix.env() == :test do
+        @doc false
+        def __flow_hibernated_timeout_active_index_delete_ops_result_for_test__(
+              state_key,
+              deadline_ms,
+              result
+            ) do
+          flow_hibernated_timeout_active_index_delete_ops_result(
+            result,
+            state_key,
+            deadline_ms
+          )
         end
       end
 
@@ -905,9 +1002,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
             Map.get(record, :partition_key)
           )
 
-        refs = flow_shared_value_ref_registry(state, registry_key)
-
-        with :ok <- flow_retention_enqueue_released_shared_refs(refs),
+        with {:ok, refs} <- flow_shared_value_ref_registry(state, registry_key),
+             :ok <- flow_retention_enqueue_released_shared_refs(refs),
              :ok <- flow_decrement_shared_value_ref_counts(state, refs),
              :ok <- do_delete(state, registry_key) do
           :ok
@@ -937,18 +1033,39 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         Enum.reduce_while(refs, :ok, fn ref, :ok ->
           count_key = FlowKeys.shared_value_ref_count_key(ref, state.shard_index)
 
-          result =
-            case flow_shared_value_ref_count(state, count_key) do
-              count when count > 1 ->
-                flow_put_hot_value(state, count_key, :erlang.term_to_binary(count - 1), 0)
+          case flow_retention_shared_value_ref_count(state, ref) do
+            {:ok, count} ->
+              result =
+                case count do
+                  count when count > 1 ->
+                    flow_put_hot_value(
+                      state,
+                      count_key,
+                      Ferricstore.TermCodec.encode(count - 1),
+                      0
+                    )
 
-              _last_or_missing ->
-                do_delete(state, count_key)
-            end
+                  _last_or_missing ->
+                    do_delete(state, count_key)
+                end
 
-          case result do
-            :ok -> {:cont, :ok}
-            {:error, _reason} = error -> {:halt, error}
+              case result do
+                :ok ->
+                  counts = Process.get(:flow_retention_shared_value_ref_counts, %{})
+
+                  Process.put(
+                    :flow_retention_shared_value_ref_counts,
+                    Map.put(counts, ref, max(count - 1, 0))
+                  )
+
+                  {:cont, :ok}
+
+                {:error, _reason} = error ->
+                  {:halt, error}
+              end
+
+            {:error, _reason} = error ->
+              {:halt, error}
           end
         end)
       end
@@ -965,37 +1082,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
           |> Enum.sort()
 
         Enum.reduce_while(refs, {:ok, 0}, fn ref, {:ok, deleted} ->
-          target_state = flow_retention_shared_value_owner_state(anchor_state, orphans, ref)
-          count = flow_retention_shared_value_ref_count(anchor_state, ref)
+          target_state = anchor_state
           owner_expired? = Map.has_key?(orphans, ref)
           orphaned? = flow_retention_shared_value_orphaned?(target_state, ref)
 
-          cond do
-            count == 0 and (owner_expired? or orphaned?) ->
-              case flow_retention_delete_shared_value(target_state, ref) do
-                :ok -> {:cont, {:ok, deleted + 1}}
-                {:error, _reason} = error -> {:halt, error}
+          case flow_retention_shared_value_ref_count(anchor_state, ref) do
+            {:ok, count} ->
+              cond do
+                count == 0 and (owner_expired? or orphaned?) ->
+                  case flow_retention_delete_shared_value(target_state, ref) do
+                    :ok -> {:cont, {:ok, deleted + 1}}
+                    {:error, _reason} = error -> {:halt, error}
+                  end
+
+                owner_expired? ->
+                  marker_key = FlowKeys.shared_value_orphan_key(ref)
+                  :ok = flow_put_hot_value(target_state, marker_key, ref, 0)
+                  {:cont, {:ok, deleted}}
+
+                true ->
+                  {:cont, {:ok, deleted}}
               end
 
-            owner_expired? ->
-              marker_key = FlowKeys.shared_value_orphan_key(ref)
-              :ok = flow_put_hot_value(target_state, marker_key, ref, 0)
-              {:cont, {:ok, deleted}}
-
-            true ->
-              {:cont, {:ok, deleted}}
+            {:error, _reason} = error ->
+              {:halt, error}
           end
         end)
-      end
-
-      defp flow_retention_shared_value_owner_state(anchor_state, orphans, ref) do
-        case Map.get(orphans, ref) do
-          shard_index when is_integer(shard_index) and shard_index >= 0 ->
-            cross_shard_state_for_index(anchor_state, shard_index)
-
-          _released_reference ->
-            cross_shard_state_for_key(anchor_state, ref)
-        end
       end
 
       defp flow_retention_shared_value_orphaned?(state, ref) do
@@ -1017,18 +1129,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
       end
 
       defp flow_retention_shared_value_ref_count(anchor_state, ref) do
-        shard_count =
-          case instance_ctx_for_state(anchor_state) do
-            %{shard_count: count} when is_integer(count) and count > 0 -> count
-            _missing -> 1
-          end
+        case Process.get(:flow_retention_shared_value_ref_counts, %{}) do
+          %{^ref => count} when is_integer(count) and count >= 0 ->
+            {:ok, count}
 
-        0..(shard_count - 1)
-        |> Enum.reduce(0, fn shard_index, total ->
-          state = cross_shard_state_for_index(anchor_state, shard_index)
-          count_key = FlowKeys.shared_value_ref_count_key(ref, shard_index)
-          total + flow_shared_value_ref_count(state, count_key)
-        end)
+          _not_released_in_this_apply ->
+            count_key = FlowKeys.shared_value_ref_count_key(ref, anchor_state.shard_index)
+            flow_shared_value_ref_count(anchor_state, count_key)
+        end
       end
 
       defp flow_retention_lmdb_projection_state(state) do

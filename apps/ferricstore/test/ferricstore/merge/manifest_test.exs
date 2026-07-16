@@ -77,6 +77,53 @@ defmodule Ferricstore.Merge.ManifestTest do
       File.write!(path, "not a valid erlang term")
       assert {:error, :corrupt_manifest} = Manifest.read(dir)
     end
+
+    test "rejects noncanonical or structurally invalid manifests", %{dir: dir} do
+      path = Path.join(dir, "merge_manifest.bin")
+
+      invalid_terms = [
+        :not_a_plan,
+        %{version: 1, shard_index: -1, input_file_ids: [1], started_at: 1},
+        %{version: 1, shard_index: 0, input_file_ids: [:bad], started_at: 1}
+      ]
+
+      Enum.each(invalid_terms, fn term ->
+        File.write!(path, :erlang.term_to_binary(term))
+        assert {:error, :corrupt_manifest} = Manifest.read(dir)
+      end)
+
+      valid = %{version: 1, shard_index: 0, input_file_ids: [1], started_at: 1}
+      File.write!(path, :erlang.term_to_binary(valid) <> <<0>>)
+      assert {:error, :corrupt_manifest} = Manifest.read(dir)
+
+      compressed =
+        :erlang.term_to_binary(Map.put(valid, :padding, String.duplicate("x", 4_096)),
+          compressed: 9
+        )
+
+      assert <<131, 80, _::binary>> = compressed
+      File.write!(path, compressed)
+      assert {:error, :corrupt_manifest} = Manifest.read(dir)
+    end
+
+    test "bounds manifest reads and rejects symlinks", %{dir: dir} do
+      path = Path.join(dir, "merge_manifest.bin")
+      target = Path.join(dir, "manifest-target")
+
+      File.write!(
+        target,
+        :erlang.term_to_binary(%{version: 1, shard_index: 0, input_file_ids: [1], started_at: 1})
+      )
+
+      case File.ln_s(target, path) do
+        :ok -> assert {:error, :corrupt_manifest} = Manifest.read(dir)
+        {:error, :enotsup} -> :ok
+      end
+
+      File.rm(path)
+      File.write!(path, :binary.copy(<<0>>, 65 * 1_024))
+      assert {:error, :corrupt_manifest} = Manifest.read(dir)
+    end
   end
 
   describe "delete/1" do

@@ -927,17 +927,57 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
         end)
       end
 
-      defp do_flow_retention_cleanup(state, attrs) do
+      defp do_flow_retention_cleanup(state, %{active_candidates: candidates} = attrs)
+           when is_list(candidates) do
         now_ms = flow_attrs_now_ms(attrs)
 
-        attrs
-        |> Map.get(:terminal_candidates, [])
-        |> Enum.reduce_while(flow_retention_zero_counts(), fn candidate, {:ok, acc} ->
-          case flow_retention_apply_terminal_candidate(state, candidate, now_ms) do
-            {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
-            {:error, _reason} = error -> {:halt, error}
-          end
+        Enum.reduce_while(candidates, flow_retention_zero_counts(), fn
+          %{shard_index: shard_index} = candidate, {:ok, acc}
+          when shard_index == state.shard_index ->
+            case flow_retention_apply_active_candidate(state, candidate, now_ms) do
+              {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+
+          _remote_or_invalid, _acc ->
+            {:halt, {:error, "ERR invalid flow retention candidate shard"}}
         end)
+      end
+
+      defp do_flow_retention_cleanup(state, attrs) do
+        now_ms = flow_attrs_now_ms(attrs)
+        previous_orphans = Process.get(:flow_retention_shared_value_orphans)
+        previous_released = Process.get(:flow_retention_released_shared_refs)
+        previous_counts = Process.get(:flow_retention_shared_value_ref_counts)
+        Process.put(:flow_retention_shared_value_orphans, %{})
+        Process.put(:flow_retention_released_shared_refs, MapSet.new())
+        Process.put(:flow_retention_shared_value_ref_counts, %{})
+
+        try do
+          result =
+            attrs
+            |> Map.get(:terminal_candidates, [])
+            |> Enum.reduce_while(flow_retention_zero_counts(), fn
+              %{shard_index: shard_index} = candidate, {:ok, acc}
+              when shard_index == state.shard_index ->
+                case flow_retention_apply_terminal_candidate(state, candidate, now_ms) do
+                  {:ok, counts} -> {:cont, {:ok, flow_retention_merge_counts(acc, counts)}}
+                  {:error, _reason} = error -> {:halt, error}
+                end
+
+              _remote_or_invalid, _acc ->
+                {:halt, {:error, "ERR invalid flow retention candidate shard"}}
+            end)
+
+          with {:ok, counts} <- result,
+               {:ok, deleted_values} <- flow_retention_finalize_shared_value_orphans(state) do
+            {:ok, Map.update!(counts, :values, &(&1 + deleted_values))}
+          end
+        after
+          flow_restore_process_value(:flow_retention_shared_value_orphans, previous_orphans)
+          flow_restore_process_value(:flow_retention_released_shared_refs, previous_released)
+          flow_restore_process_value(:flow_retention_shared_value_ref_counts, previous_counts)
+        end
       end
 
       defp do_flow_cross_terminal_retention_cleanup(

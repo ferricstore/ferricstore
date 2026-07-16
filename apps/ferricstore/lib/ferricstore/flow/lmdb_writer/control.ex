@@ -88,16 +88,16 @@ defmodule Ferricstore.Flow.LMDBWriter.Control do
     mark_instance_suspended(instance_name)
     flush? = Keyword.get(opts, :flush, true)
 
-    Enum.each(Shards.indexes(shard_count), fn shard_index ->
-      _ =
+    Enum.reduce(Shards.indexes(shard_count), :ok, fn shard_index, acc ->
+      result =
         if flush? do
           suspend(instance_name, shard_index)
         else
           suspend_without_flush(instance_name, shard_index)
         end
-    end)
 
-    :ok
+      merge_control_result(result, acc)
+    end)
   end
 
   def suspend(instance_name, shard_index)
@@ -106,13 +106,13 @@ defmodule Ferricstore.Flow.LMDBWriter.Control do
 
     case Process.whereis(name(instance_name, shard_index)) do
       pid when is_pid(pid) ->
-        GenServer.call(pid, :suspend, 5_000)
+        normalize_control_reply(:suspend, GenServer.call(pid, :suspend, 5_000))
 
       nil ->
         :ok
     end
   catch
-    :exit, _reason -> :ok
+    :exit, reason -> {:error, {:lmdb_writer_suspend_failed, reason}}
   end
 
   def suspend_without_flush(instance_name, shard_index)
@@ -153,21 +153,22 @@ defmodule Ferricstore.Flow.LMDBWriter.Control do
 
   def discard_all(instance_name, shard_count)
       when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 do
-    Enum.each(Shards.indexes(shard_count), fn shard_index ->
-      _ = discard(instance_name, shard_index)
+    Enum.reduce(Shards.indexes(shard_count), :ok, fn shard_index, acc ->
+      merge_control_result(discard(instance_name, shard_index), acc)
     end)
-
-    :ok
   end
 
   def discard(instance_name, shard_index)
       when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 do
     case Process.whereis(name(instance_name, shard_index)) do
-      pid when is_pid(pid) -> GenServer.call(pid, :discard, 5_000)
-      nil -> :ok
+      pid when is_pid(pid) ->
+        normalize_control_reply(:discard, GenServer.call(pid, :discard, 5_000))
+
+      nil ->
+        :ok
     end
   catch
-    :exit, _reason -> :ok
+    :exit, reason -> {:error, {:lmdb_writer_discard_failed, reason}}
   end
 
   def prepare_snapshot_install(instance_name, shard_index)
@@ -206,6 +207,16 @@ defmodule Ferricstore.Flow.LMDBWriter.Control do
 
   defp clear_instance_suspended(instance_name) when is_atom(instance_name),
     do: Registry.clear_instance_suspended(instance_name)
+
+  defp normalize_control_reply(_operation, :ok), do: :ok
+  defp normalize_control_reply(_operation, {:error, _reason} = error), do: error
+
+  defp normalize_control_reply(operation, reply),
+    do: {:error, {:unexpected_lmdb_writer_reply, operation, reply}}
+
+  defp merge_control_result(:ok, acc), do: acc
+  defp merge_control_result({:error, _reason} = error, :ok), do: error
+  defp merge_control_result({:error, _reason}, acc), do: acc
 
   defp writer_unavailable(operation, instance_name, shard_index, reason, op_count),
     do: Telemetry.writer_unavailable(operation, instance_name, shard_index, reason, op_count)

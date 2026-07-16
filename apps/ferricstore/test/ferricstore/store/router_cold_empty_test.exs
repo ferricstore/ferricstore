@@ -42,6 +42,18 @@ defmodule Ferricstore.Store.RouterColdEmptyTest do
 
   use Ferricstore.Store.RouterColdEmptyTest.Sections.ExistsRejectsColdRowsInvalidOffsets
 
+  test "value_size reports unreadable live blob references", %{ctx: ctx, keydir: keydir} do
+    ctx = %{ctx | blob_side_channel_threshold_bytes: 1}
+    key = "router:blob-size-error:#{System.unique_integer([:positive])}"
+    entry = {key, nil, 0, LFU.initial(), 99_999, 0, Ferricstore.Store.BlobRef.encoded_size()}
+    :ets.insert(keydir, entry)
+
+    assert {:error, {:storage_read_failed, {:cold_read_failed, _reason}}} =
+             Router.value_size(ctx, key)
+
+    assert [^entry] = :ets.lookup(keydir, key)
+  end
+
   defp attach_pread_corrupt_handler(callback \\ fn -> :ok end) do
     parent = self()
     handler_id = {__MODULE__, make_ref()}

@@ -197,6 +197,65 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  )
       end
 
+      test "lineage before_id cursor requires an explicit reverse timestamp boundary" do
+        partition = uid("lineage-cursor-validation")
+        parent = uid("lineage-cursor-parent")
+
+        assert {:error, "ERR flow before_id requires rev: true and to_ms"} =
+                 FerricStore.flow_by_parent(parent,
+                   partition_key: partition,
+                   before_id: "child"
+                 )
+
+        assert {:error, "ERR flow before_id requires rev: true and to_ms"} =
+                 FerricStore.flow_by_parent(parent,
+                   partition_key: partition,
+                   rev: true,
+                   before_id: "child"
+                 )
+
+        assert {:error, "ERR flow before_id must be a non-empty string"} =
+                 FerricStore.flow_by_parent(parent,
+                   partition_key: partition,
+                   rev: true,
+                   to_ms: 1_000,
+                   before_id: ""
+                 )
+      end
+
+      test "lineage before_id cursor paginates equal timestamps without duplicates" do
+        partition = uid("lineage-cursor")
+        parent = uid("lineage-cursor-parent")
+
+        for id <- ["cursor-a", "cursor-b", "cursor-c"] do
+          assert {:ok, %{id: ^id}} =
+                   flow_create_and_get(id,
+                     type: "lineage-cursor",
+                     partition_key: partition,
+                     parent_flow_id: parent,
+                     now_ms: 2_000,
+                     run_at_ms: 2_000
+                   )
+        end
+
+        assert {:ok, [%{id: "cursor-c"}, %{id: "cursor-b"}]} =
+                 FerricStore.flow_by_parent(parent,
+                   partition_key: partition,
+                   rev: true,
+                   to_ms: 2_000,
+                   count: 2
+                 )
+
+        assert {:ok, [%{id: "cursor-a"}]} =
+                 FerricStore.flow_by_parent(parent,
+                   partition_key: partition,
+                   rev: true,
+                   to_ms: 2_000,
+                   before_id: "cursor-b",
+                   count: 2
+                 )
+      end
+
       test "cold lineage query seeks to filtered time window instead of sampling prefix head" do
         previous_limit = Application.get_env(:ferricstore, :flow_lmdb_query_scan_limit)
 

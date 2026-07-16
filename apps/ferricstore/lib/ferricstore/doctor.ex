@@ -16,6 +16,8 @@ defmodule Ferricstore.Doctor do
   alias Ferricstore.Flow.{LMDB, LMDBRebuilder, LMDBWriter}
 
   @default_scopes [:bitcask, :blob_refs, :flow_lmdb]
+  @max_running_jobs 4
+  @max_retained_jobs 64
   @scope_names %{
     "ALL" => :all,
     "BITCASK" => :bitcask,
@@ -112,32 +114,10 @@ defmodule Ferricstore.Doctor do
 
   @impl true
   def handle_call({:start, kind, ctx, scopes}, _from, state) do
-    {job_id, state} = next_job_id(state)
-    parent = self()
-
-    {pid, ref} =
-      spawn_monitor(fn ->
-        result = run_job(kind, ctx, scopes)
-        send(parent, {:doctor_job_done, job_id, result})
-      end)
-
-    now = now_ms()
-
-    job = %{
-      id: job_id,
-      kind: kind,
-      scopes: scopes,
-      status: :running,
-      pid: pid,
-      monitor: ref,
-      created_at_ms: now,
-      updated_at_ms: now,
-      result: nil,
-      error: nil
-    }
-
-    state = put_job(%{state | monitors: Map.put(state.monitors, ref, job_id)}, job)
-    {:reply, job_summary(job), state}
+    case validate_job_start(state, kind, ctx.name) do
+      :ok -> start_job_process(kind, ctx, scopes, state)
+      {:error, _reason} = error -> {:reply, error, state}
+    end
   end
 
   def handle_call({:status, job_id}, _from, state) do
@@ -148,7 +128,7 @@ defmodule Ferricstore.Doctor do
     jobs =
       state.jobs
       |> Map.values()
-      |> Enum.sort_by(& &1.created_at_ms, :desc)
+      |> Enum.sort_by(&{&1.created_at_ms, &1.id}, :desc)
       |> Enum.map(&job_summary/1)
 
     {:reply, %{"jobs" => jobs}, state}
@@ -191,6 +171,36 @@ defmodule Ferricstore.Doctor do
     {:reply, :ok, %{seq: 0, jobs: %{}, monitors: %{}}}
   end
 
+  defp start_job_process(kind, ctx, scopes, state) do
+    {job_id, state} = next_job_id(state)
+    parent = self()
+
+    {pid, ref} =
+      spawn_monitor(fn ->
+        result = run_job(kind, ctx, scopes)
+        send(parent, {:doctor_job_done, job_id, result})
+      end)
+
+    now = now_ms()
+
+    job = %{
+      id: job_id,
+      kind: kind,
+      instance: ctx.name,
+      scopes: scopes,
+      status: :running,
+      pid: pid,
+      monitor: ref,
+      created_at_ms: now,
+      updated_at_ms: now,
+      result: nil,
+      error: nil
+    }
+
+    state = put_job(%{state | monitors: Map.put(state.monitors, ref, job_id)}, job)
+    {:reply, job_summary(job), state}
+  end
+
   @impl true
   def handle_info({:doctor_job_done, job_id, {:ok, result}}, state) do
     {:noreply, finish_job(state, job_id, :done, result, nil)}
@@ -231,7 +241,50 @@ defmodule Ferricstore.Doctor do
     {"doctor-#{next}-#{suffix}", %{state | seq: next}}
   end
 
-  defp put_job(state, %{id: id} = job), do: %{state | jobs: Map.put(state.jobs, id, job)}
+  defp put_job(state, %{id: id} = job) do
+    state
+    |> Map.put(:jobs, Map.put(state.jobs, id, job))
+    |> prune_terminal_jobs()
+  end
+
+  defp validate_job_start(state, :repair_projections, instance) do
+    if Enum.any?(state.jobs, fn
+         {_id, %{kind: :repair_projections, instance: ^instance, status: :running}} -> true
+         _other -> false
+       end) do
+      {:error, "ERR doctor projection repair is already running for this instance"}
+    else
+      validate_running_job_limit(state)
+    end
+  end
+
+  defp validate_job_start(state, _kind, _instance), do: validate_running_job_limit(state)
+
+  defp validate_running_job_limit(state) do
+    running = Enum.count(state.jobs, fn {_id, job} -> job.status == :running end)
+
+    if running < @max_running_jobs do
+      :ok
+    else
+      {:error, "ERR too many doctor jobs are already running"}
+    end
+  end
+
+  defp prune_terminal_jobs(%{jobs: jobs} = state) when map_size(jobs) <= @max_retained_jobs,
+    do: state
+
+  defp prune_terminal_jobs(state) do
+    remove_count = map_size(state.jobs) - @max_retained_jobs
+
+    removable_ids =
+      state.jobs
+      |> Enum.reject(fn {_id, job} -> job.status == :running end)
+      |> Enum.sort_by(fn {id, job} -> {job.updated_at_ms, job.created_at_ms, id} end)
+      |> Enum.take(remove_count)
+      |> Enum.map(&elem(&1, 0))
+
+    %{state | jobs: Map.drop(state.jobs, removable_ids)}
+  end
 
   defp finish_job(state, job_id, status, result, error) do
     case Map.get(state.jobs, job_id) do
@@ -457,12 +510,17 @@ defmodule Ferricstore.Doctor do
   end
 
   defp parse_scope_list(scopes) do
-    Enum.reduce_while(scopes, {:ok, []}, fn scope, {:ok, acc} ->
+    scopes
+    |> Enum.reduce_while({:ok, []}, fn scope, {:ok, reversed} ->
       case parse_scope(scope) do
-        {:ok, parsed} -> {:cont, {:ok, acc ++ parsed}}
+        {:ok, parsed} -> {:cont, {:ok, Enum.reverse(parsed, reversed)}}
         error -> {:halt, error}
       end
     end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      error -> error
+    end
   end
 
   defp normalize_scope_list(scopes) do

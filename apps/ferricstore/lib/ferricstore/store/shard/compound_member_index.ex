@@ -5,6 +5,9 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @separator <<0>>
+  @ready_key :"$ferricstore_compound_member_index_ready"
+
+  @waraft_location_tags [:waraft_segment, :waraft_projection, :waraft_apply_projection]
 
   @type table_ref :: atom() | :ets.tid() | nil
 
@@ -34,8 +37,13 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   def reset(table) do
     case table_ref(table) do
-      :undefined -> :ok
-      tid -> :ets.delete_all_objects(tid)
+      :undefined ->
+        :ok
+
+      tid ->
+        :ets.delete_all_objects(tid)
+        :ets.insert(tid, {@ready_key, true})
+        :ok
     end
   end
 
@@ -65,8 +73,29 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
           :ok,
           keydir
         )
+
+        :ets.insert(index, {@ready_key, true})
+        :ok
     end
   end
+
+  @doc false
+  @spec ready?(table_ref()) :: boolean()
+  def ready?(table) do
+    ready_table_ref(table) != :undefined
+  rescue
+    ArgumentError -> false
+  end
+
+  @doc false
+  @spec supports_prefix?(term()) :: boolean()
+  def supports_prefix?(<<"H:", _rest::binary>> = prefix), do: member_prefix?(prefix)
+  def supports_prefix?(<<"L:", _rest::binary>> = prefix), do: member_prefix?(prefix)
+  def supports_prefix?(<<"S:", _rest::binary>> = prefix), do: member_prefix?(prefix)
+  def supports_prefix?(<<"Z:", _rest::binary>> = prefix), do: member_prefix?(prefix)
+  def supports_prefix?(<<"X:", _rest::binary>> = prefix), do: member_prefix?(prefix)
+  def supports_prefix?(<<"XG:", _rest::binary>> = prefix), do: member_prefix?(prefix)
+  def supports_prefix?(_prefix), do: false
 
   @spec put(table_ref(), binary()) :: :ok
   def put(nil, _compound_key), do: :ok
@@ -162,7 +191,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   @spec any_live?(table_ref(), map(), binary(), map() | MapSet.t()) :: boolean() | :unavailable
   def any_live?(table, state, prefix, ignored_keys) when is_binary(prefix) do
-    case table_ref(table) do
+    case ready_table_ref(table) do
       :undefined ->
         :unavailable
 
@@ -173,9 +202,25 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   def any_live?(_table, _state, _prefix, _ignored_keys), do: :unavailable
 
+  @spec count_live(table_ref(), map(), binary()) ::
+          {:ok, non_neg_integer()} | {:error, term()} | :unavailable
+  def count_live(table, state, prefix) when is_binary(prefix) do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        do_count_live(tid, lookup_state(state), prefix, first_key(tid, prefix), 0)
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def count_live(_table, _state, _prefix), do: :unavailable
+
   @spec scan_entries(table_ref(), map(), binary()) :: {:ok, [{binary(), binary()}]} | :unavailable
   def scan_entries(table, state, prefix) when is_binary(prefix) do
-    case table_ref(table) do
+    case ready_table_ref(table) do
       :undefined ->
         :unavailable
 
@@ -196,12 +241,15 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
               {:cold, _fid, _off, _vsize, _expire_at_ms} ->
                 {:halt, :unavailable}
 
+              {:error, :invalid_keydir_entry} ->
+                {:halt, :unavailable}
+
               :expired ->
-                delete(tid, compound_key)
+                delete_stale_member(tid, lookup_state, compound_key)
                 {:cont, acc}
 
               :miss ->
-                delete(tid, compound_key)
+                delete_stale_member(tid, lookup_state, compound_key)
                 {:cont, acc}
             end
           end)
@@ -215,6 +263,257 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   def scan_entries(_table, _state, _prefix), do: :unavailable
 
+  @doc false
+  @spec keys_for_prefix(table_ref(), binary()) :: {:ok, [binary()]} | :unavailable
+  def keys_for_prefix(table, prefix) when is_binary(prefix) do
+    case ready_table_ref(table) do
+      :undefined -> :unavailable
+      tid -> {:ok, scan_keys(tid, prefix)}
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def keys_for_prefix(_table, _prefix), do: :unavailable
+
+  @doc false
+  @spec keys_for_prefix(table_ref(), binary(), non_neg_integer()) ::
+          {:ok, [binary()]} | {:error, :limit_exceeded} | :unavailable
+  def keys_for_prefix(table, prefix, limit)
+      when is_binary(prefix) and is_integer(limit) and limit >= 0 do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        do_scan_keys_bounded(tid, prefix, first_key(tid, prefix), limit, [])
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def keys_for_prefix(_table, _prefix, _limit), do: :unavailable
+
+  @doc false
+  @spec scan_rows(table_ref(), map(), binary()) ::
+          {:ok, [tuple()]} | {:error, term()} | :unavailable
+  def scan_rows(table, state, prefix) when is_binary(prefix) do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        case reduce_rows_while(tid, state, prefix, [], fn row, acc -> {:cont, [row | acc]} end) do
+          {:ok, rows} -> {:ok, Enum.reverse(rows)}
+          other -> other
+        end
+    end
+  rescue
+    ArgumentError -> :unavailable
+    KeyError -> :unavailable
+  end
+
+  def scan_rows(_table, _state, _prefix), do: :unavailable
+
+  @doc false
+  @spec reduce_rows_while(table_ref(), map(), binary(), term(), function()) ::
+          {:ok, term()} | {:halt, term()} | {:error, term()} | :unavailable
+  def reduce_rows_while(table, state, prefix, acc, reducer)
+      when is_binary(prefix) and is_function(reducer, 2) do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        keydir = state |> lookup_state() |> Map.fetch!(:keydir)
+        do_reduce_rows_while(tid, keydir, prefix, first_key(tid, prefix), acc, reducer)
+    end
+  rescue
+    ArgumentError -> :unavailable
+    KeyError -> :unavailable
+  end
+
+  def reduce_rows_while(_table, _state, _prefix, _acc, _reducer), do: :unavailable
+
+  @spec member_slice(
+          table_ref(),
+          map(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          map() | MapSet.t()
+        ) :: {:ok, [binary()]} | {:error, term()} | :unavailable
+  def member_slice(_table, _state, _prefix, _start_member, 0, _now_ms, _pending_values),
+    do: {:ok, []}
+
+  def member_slice(table, state, prefix, start_member, count, now_ms, pending_values)
+      when is_binary(prefix) and is_binary(start_member) and is_integer(count) and count > 0 and
+             is_integer(now_ms) and now_ms >= 0 do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        start_key = {prefix, start_member}
+        first = first_key_at_or_after(tid, prefix, start_member)
+
+        with {:ok, acc, remaining} <-
+               collect_member_slice(
+                 tid,
+                 state,
+                 prefix,
+                 first,
+                 count,
+                 now_ms,
+                 pending_values,
+                 :to_end,
+                 []
+               ),
+             {:ok, acc, _remaining} <-
+               collect_member_slice(
+                 tid,
+                 state,
+                 prefix,
+                 first_key(tid, prefix),
+                 remaining,
+                 now_ms,
+                 pending_values,
+                 {:before, start_key},
+                 acc
+               ) do
+          {:ok, Enum.reverse(acc)}
+        end
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def member_slice(_table, _state, _prefix, _start_member, _count, _now_ms, _pending_values),
+    do: {:error, :invalid_member_slice}
+
+  @doc false
+  @spec row_slice(
+          table_ref(),
+          map(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: {:ok, [tuple()]} | {:error, term()} | :unavailable
+  def row_slice(_table, _state, _prefix, _start, 0, _total), do: {:ok, []}
+
+  def row_slice(table, state, prefix, start, count, total)
+      when is_binary(prefix) and is_integer(start) and start >= 0 and is_integer(count) and
+             count > 0 and is_integer(total) and total >= 0 do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        requested = min(count, max(total - start, 0))
+
+        if requested == 0 do
+          {:ok, []}
+        else
+          keydir = state |> lookup_state() |> Map.fetch!(:keydir)
+          tail = max(total - start - requested, 0)
+
+          if start <= tail do
+            case collect_row_slice(
+                   tid,
+                   keydir,
+                   prefix,
+                   first_key(tid, prefix),
+                   :forward,
+                   start,
+                   requested,
+                   []
+                 ) do
+              {:ok, rows} -> {:ok, Enum.reverse(rows)}
+              other -> other
+            end
+          else
+            collect_row_slice(
+              tid,
+              keydir,
+              prefix,
+              last_key(tid, prefix),
+              :backward,
+              tail,
+              requested,
+              []
+            )
+          end
+        end
+    end
+  rescue
+    ArgumentError -> :unavailable
+    KeyError -> :unavailable
+  end
+
+  def row_slice(_table, _state, _prefix, _start, _count, _total),
+    do: {:error, :invalid_row_slice}
+
+  @doc false
+  @spec scan_page(
+          table_ref(),
+          map(),
+          binary(),
+          0 | {:after, binary()},
+          pos_integer(),
+          binary() | nil
+        ) :: {:ok, {0 | {:after, binary()}, [binary()]}} | {:error, term()} | :unavailable
+  def scan_page(table, state, prefix, cursor, count, match_pattern)
+      when is_binary(prefix) and
+             (cursor == 0 or
+                (is_tuple(cursor) and tuple_size(cursor) == 2 and elem(cursor, 0) == :after and
+                   is_binary(elem(cursor, 1)))) and is_integer(count) and count > 0 and
+             (is_binary(match_pattern) or is_nil(match_pattern)) do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        lookup_state = lookup_state(state)
+        now_ms = HLC.now_ms()
+        first = scan_page_start_key(tid, prefix, cursor)
+
+        case collect_scan_page(
+               tid,
+               lookup_state,
+               prefix,
+               first,
+               count,
+               match_pattern,
+               now_ms,
+               [],
+               nil
+             ) do
+          {:ok, members, last_inspected, next_key} ->
+            next_cursor = scan_page_next_cursor(prefix, last_inspected, next_key)
+            {:ok, {next_cursor, Enum.reverse(members)}}
+
+          {:error, _reason} = error ->
+            error
+        end
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def scan_page(_table, _state, _prefix, _cursor, _count, _match_pattern),
+    do: {:error, :invalid_scan_page}
+
+  defp scan_page_start_key(tid, prefix, 0), do: first_key(tid, prefix)
+  defp scan_page_start_key(tid, prefix, {:after, member}), do: :ets.next(tid, {prefix, member})
+
+  defp scan_page_next_cursor(prefix, last_inspected, {prefix, _next_member})
+       when is_binary(last_inspected),
+       do: {:after, last_inspected}
+
+  defp scan_page_next_cursor(_prefix, _last_inspected, _next_key), do: 0
+
   defp table_ref(nil), do: :undefined
   defp table_ref(table) when is_reference(table), do: table
 
@@ -225,12 +524,26 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
     end
   end
 
+  defp ready_table_ref(table) do
+    case table_ref(table) do
+      :undefined ->
+        :undefined
+
+      tid ->
+        if :ets.lookup(tid, @ready_key) == [{@ready_key, true}], do: tid, else: :undefined
+    end
+  rescue
+    ArgumentError -> :undefined
+  end
+
   defp writable_table_ref(table) when is_atom(table) do
     ensure_table!(table)
     table_ref(table)
   end
 
   defp writable_table_ref(table), do: table_ref(table)
+
+  defp member_prefix?(prefix), do: :binary.last(prefix) == 0
 
   defp live_keydir_entry?(_value, expire_at_ms, _file_id, now)
        when is_integer(expire_at_ms) and expire_at_ms != 0 and expire_at_ms <= now,
@@ -268,6 +581,489 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
     end
   end
 
+  defp first_key_at_or_after(table, prefix, member) do
+    case :ets.lookup(table, {prefix, member}) do
+      [{{^prefix, ^member}, _compound_key}] -> {prefix, member}
+      _ -> :ets.next(table, {prefix, member})
+    end
+  end
+
+  defp last_key(table, prefix), do: :ets.prev(table, {prefix <> <<0>>, <<>>})
+
+  defp collect_row_slice(
+         _table,
+         _keydir,
+         _prefix,
+         _index_key,
+         _direction,
+         _skip,
+         0,
+         acc
+       ),
+       do: {:ok, acc}
+
+  defp collect_row_slice(
+         _table,
+         _keydir,
+         _prefix,
+         :"$end_of_table",
+         _direction,
+         _skip,
+         _remaining,
+         acc
+       ),
+       do: {:ok, acc}
+
+  defp collect_row_slice(
+         table,
+         keydir,
+         prefix,
+         {prefix, _member} = index_key,
+         direction,
+         skip,
+         remaining,
+         acc
+       ) do
+    next_key = row_slice_next_key(table, index_key, direction)
+
+    case :ets.lookup(table, index_key) do
+      [{^index_key, compound_key}] ->
+        case :ets.lookup(keydir, compound_key) do
+          [_row] when skip > 0 ->
+            collect_row_slice(
+              table,
+              keydir,
+              prefix,
+              next_key,
+              direction,
+              skip - 1,
+              remaining,
+              acc
+            )
+
+          [row] ->
+            collect_row_slice(
+              table,
+              keydir,
+              prefix,
+              next_key,
+              direction,
+              0,
+              remaining - 1,
+              [row | acc]
+            )
+
+          [] ->
+            delete_stale_member(table, %{keydir: keydir}, compound_key)
+
+            collect_row_slice(
+              table,
+              keydir,
+              prefix,
+              next_key,
+              direction,
+              skip,
+              remaining,
+              acc
+            )
+
+          malformed ->
+            {:error, {:invalid_indexed_member, compound_key, malformed}}
+        end
+
+      _missing ->
+        collect_row_slice(
+          table,
+          keydir,
+          prefix,
+          next_key,
+          direction,
+          skip,
+          remaining,
+          acc
+        )
+    end
+  end
+
+  defp collect_row_slice(
+         _table,
+         _keydir,
+         _prefix,
+         _other_key,
+         _direction,
+         _skip,
+         _remaining,
+         acc
+       ),
+       do: {:ok, acc}
+
+  defp row_slice_next_key(table, index_key, :forward), do: :ets.next(table, index_key)
+  defp row_slice_next_key(table, index_key, :backward), do: :ets.prev(table, index_key)
+
+  defp collect_member_slice(
+         _table,
+         _state,
+         _prefix,
+         _index_key,
+         0,
+         _now_ms,
+         _pending_values,
+         _boundary,
+         acc
+       ),
+       do: {:ok, acc, 0}
+
+  defp collect_member_slice(
+         _table,
+         _state,
+         _prefix,
+         :"$end_of_table",
+         remaining,
+         _now_ms,
+         _pending_values,
+         _boundary,
+         acc
+       ),
+       do: {:ok, acc, remaining}
+
+  defp collect_member_slice(
+         table,
+         state,
+         prefix,
+         {prefix, member} = index_key,
+         remaining,
+         now_ms,
+         pending_values,
+         boundary,
+         acc
+       ) do
+    if member_slice_boundary?(index_key, boundary) do
+      next_key = :ets.next(table, index_key)
+
+      case :ets.lookup(table, index_key) do
+        [{^index_key, compound_key}] ->
+          case indexed_member_status(state, compound_key, now_ms, pending_values) do
+            :live ->
+              collect_member_slice(
+                table,
+                state,
+                prefix,
+                next_key,
+                remaining - 1,
+                now_ms,
+                pending_values,
+                boundary,
+                [member | acc]
+              )
+
+            :pending_skip ->
+              collect_member_slice(
+                table,
+                state,
+                prefix,
+                next_key,
+                remaining,
+                now_ms,
+                pending_values,
+                boundary,
+                acc
+              )
+
+            :stale ->
+              delete_stale_member(table, state, compound_key, now_ms)
+
+              collect_member_slice(
+                table,
+                state,
+                prefix,
+                next_key,
+                remaining,
+                now_ms,
+                pending_values,
+                boundary,
+                acc
+              )
+
+            {:error, _reason} = error ->
+              error
+          end
+
+        _missing ->
+          collect_member_slice(
+            table,
+            state,
+            prefix,
+            next_key,
+            remaining,
+            now_ms,
+            pending_values,
+            boundary,
+            acc
+          )
+      end
+    else
+      {:ok, acc, remaining}
+    end
+  end
+
+  defp collect_member_slice(
+         _table,
+         _state,
+         _prefix,
+         _other_key,
+         remaining,
+         _now_ms,
+         _pending_values,
+         _boundary,
+         acc
+       ),
+       do: {:ok, acc, remaining}
+
+  defp member_slice_boundary?(_index_key, :to_end), do: true
+  defp member_slice_boundary?(index_key, {:before, start_key}), do: index_key < start_key
+
+  defp collect_scan_page(
+         _table,
+         _state,
+         _prefix,
+         index_key,
+         0,
+         _match_pattern,
+         _now_ms,
+         acc,
+         last_inspected
+       ),
+       do: {:ok, acc, last_inspected, index_key}
+
+  defp collect_scan_page(
+         _table,
+         _state,
+         _prefix,
+         :"$end_of_table",
+         _remaining,
+         _match_pattern,
+         _now_ms,
+         acc,
+         last_inspected
+       ),
+       do: {:ok, acc, last_inspected, :"$end_of_table"}
+
+  defp collect_scan_page(
+         table,
+         state,
+         prefix,
+         {prefix, member} = index_key,
+         remaining,
+         match_pattern,
+         now_ms,
+         acc,
+         _last_inspected
+       ) do
+    next_key = :ets.next(table, index_key)
+    remaining = remaining - 1
+
+    case :ets.lookup(table, index_key) do
+      [{^index_key, compound_key}] ->
+        case keydir_member_status(state, compound_key, now_ms) do
+          :live ->
+            cond do
+              not scan_member_matches?(member, match_pattern) ->
+                collect_scan_page(
+                  table,
+                  state,
+                  prefix,
+                  next_key,
+                  remaining,
+                  match_pattern,
+                  now_ms,
+                  acc,
+                  member
+                )
+
+              true ->
+                collect_scan_page(
+                  table,
+                  state,
+                  prefix,
+                  next_key,
+                  remaining,
+                  match_pattern,
+                  now_ms,
+                  [member | acc],
+                  member
+                )
+            end
+
+          :stale ->
+            delete_stale_member(table, state, compound_key, now_ms)
+
+            collect_scan_page(
+              table,
+              state,
+              prefix,
+              next_key,
+              remaining,
+              match_pattern,
+              now_ms,
+              acc,
+              member
+            )
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      _missing ->
+        collect_scan_page(
+          table,
+          state,
+          prefix,
+          next_key,
+          remaining,
+          match_pattern,
+          now_ms,
+          acc,
+          member
+        )
+    end
+  end
+
+  defp collect_scan_page(
+         _table,
+         _state,
+         _prefix,
+         other_key,
+         _remaining,
+         _match_pattern,
+         _now_ms,
+         acc,
+         last_inspected
+       ),
+       do: {:ok, acc, last_inspected, other_key}
+
+  defp scan_member_matches?(_member, nil), do: true
+  defp scan_member_matches?(member, pattern), do: Ferricstore.GlobMatcher.match?(member, pattern)
+
+  defp indexed_member_status(state, compound_key, now_ms, pending_values) do
+    case pending_member_status(pending_values, compound_key, now_ms) do
+      :not_pending -> keydir_member_status(state, compound_key, now_ms)
+      status -> status
+    end
+  end
+
+  defp pending_member_status(%MapSet{} = pending_values, compound_key, _now_ms) do
+    if MapSet.member?(pending_values, compound_key), do: :pending_skip, else: :not_pending
+  end
+
+  defp pending_member_status(pending_values, compound_key, now_ms) when is_map(pending_values) do
+    case Map.fetch(pending_values, compound_key) do
+      {:ok, :deleted} ->
+        :pending_skip
+
+      {:ok, {_value, expire_at_ms}} ->
+        if live_expiration?(expire_at_ms, now_ms), do: :live, else: :pending_skip
+
+      {:ok, invalid} ->
+        {:error, {:invalid_pending_value, compound_key, invalid}}
+
+      :error ->
+        :not_pending
+    end
+  end
+
+  defp pending_member_status(_pending_values, _compound_key, _now_ms), do: :not_pending
+
+  defp keydir_member_status(state, compound_key, now_ms) do
+    keydir = Map.get(state, :keydir) || Map.get(state, :ets)
+
+    case :ets.lookup(keydir, compound_key) do
+      [{^compound_key, value, expire_at_ms, _lfu, file_id, offset, value_size}]
+      when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+        cond do
+          not live_expiration?(expire_at_ms, now_ms) ->
+            :stale
+
+          value != nil ->
+            :live
+
+          valid_cold_location?(file_id, offset, value_size) ->
+            :live
+
+          true ->
+            {:error, {:invalid_cold_location, compound_key, {file_id, offset, value_size}}}
+        end
+
+      [] ->
+        :stale
+
+      invalid ->
+        {:error, {:invalid_keydir_entry, compound_key, invalid}}
+    end
+  rescue
+    ArgumentError -> {:error, :keydir_unavailable}
+  end
+
+  defp delete_stale_member(table, state, compound_key, now_ms \\ HLC.now_ms()) do
+    delete(table, compound_key)
+
+    case keydir_member_status(lookup_state(state), compound_key, now_ms) do
+      :live -> put(table, compound_key)
+      _missing_stale_or_invalid -> :ok
+    end
+  end
+
+  defp live_expiration?(0, _now_ms), do: true
+  defp live_expiration?(expire_at_ms, now_ms), do: expire_at_ms > now_ms
+
+  defp valid_cold_location?(file_id, offset, value_size)
+       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
+              is_integer(value_size) and value_size >= 0,
+       do: true
+
+  defp valid_cold_location?({tag, file_id}, offset, value_size)
+       when tag in @waraft_location_tags and is_integer(file_id) and file_id > 0 and
+              is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0,
+       do: true
+
+  defp valid_cold_location?(_file_id, _offset, _value_size), do: false
+
+  defp do_reduce_rows_while(_table, _keydir, _prefix, :"$end_of_table", acc, _reducer),
+    do: {:ok, acc}
+
+  defp do_reduce_rows_while(table, keydir, prefix, {prefix, _member} = index_key, acc, reducer) do
+    next_key = :ets.next(table, index_key)
+
+    case :ets.lookup(table, index_key) do
+      [{^index_key, compound_key}] ->
+        case :ets.lookup(keydir, compound_key) do
+          [row] ->
+            case reducer.(row, acc) do
+              {:cont, next_acc} ->
+                do_reduce_rows_while(table, keydir, prefix, next_key, next_acc, reducer)
+
+              {:halt, result} ->
+                {:halt, result}
+
+              invalid ->
+                {:error, {:invalid_row_reducer_result, invalid}}
+            end
+
+          [] ->
+            delete_stale_member(table, %{keydir: keydir}, compound_key)
+            do_reduce_rows_while(table, keydir, prefix, next_key, acc, reducer)
+
+          malformed ->
+            {:error, {:invalid_indexed_member, compound_key, malformed}}
+        end
+
+      _missing ->
+        do_reduce_rows_while(table, keydir, prefix, next_key, acc, reducer)
+    end
+  end
+
+  defp do_reduce_rows_while(_table, _keydir, _prefix, _other_key, acc, _reducer),
+    do: {:ok, acc}
+
   defp do_scan_keys(_table, _prefix, :"$end_of_table", acc), do: Enum.reverse(acc)
 
   defp do_scan_keys(table, prefix, {prefix, _member} = index_key, acc) do
@@ -281,6 +1077,31 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   end
 
   defp do_scan_keys(_table, _prefix, _other_key, acc), do: Enum.reverse(acc)
+
+  defp do_scan_keys_bounded(_table, _prefix, :"$end_of_table", _remaining, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp do_scan_keys_bounded(_table, prefix, {prefix, _member}, 0, _acc),
+    do: {:error, :limit_exceeded}
+
+  defp do_scan_keys_bounded(table, prefix, {prefix, _member} = index_key, remaining, acc) do
+    {remaining, acc} =
+      case :ets.lookup(table, index_key) do
+        [{^index_key, compound_key}] -> {remaining - 1, [compound_key | acc]}
+        _missing -> {remaining, acc}
+      end
+
+    do_scan_keys_bounded(
+      table,
+      prefix,
+      :ets.next(table, index_key),
+      remaining,
+      acc
+    )
+  end
+
+  defp do_scan_keys_bounded(_table, _prefix, _other_key, _remaining, acc),
+    do: {:ok, Enum.reverse(acc)}
 
   defp do_scan_index_keys(_table, _prefix, :"$end_of_table", acc), do: Enum.reverse(acc)
 
@@ -299,17 +1120,20 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
         if ignored_key?(ignored_keys, compound_key) do
           do_any_live?(table, state, prefix, next_key, ignored_keys)
         else
-          case ShardETS.ets_lookup_warm(state, compound_key) do
+          case ShardETS.ets_lookup_warm_result(state, compound_key) do
             {:hit, _value, _expire_at_ms} ->
               true
 
             :expired ->
-              delete(table, compound_key)
+              delete_stale_member(table, state, compound_key)
               do_any_live?(table, state, prefix, next_key, ignored_keys)
 
             :miss ->
-              delete(table, compound_key)
+              delete_stale_member(table, state, compound_key)
               do_any_live?(table, state, prefix, next_key, ignored_keys)
+
+            {:error, :cold_read_failed} ->
+              true
           end
         end
 
@@ -319,6 +1143,32 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   end
 
   defp do_any_live?(_table, _state, _prefix, _other_key, _ignored_keys), do: false
+
+  defp do_count_live(_table, _state, _prefix, :"$end_of_table", count), do: {:ok, count}
+
+  defp do_count_live(table, state, prefix, {prefix, _member} = index_key, count) do
+    next_key = :ets.next(table, index_key)
+
+    case :ets.lookup(table, index_key) do
+      [{^index_key, compound_key}] ->
+        case ShardETS.ets_lookup_metadata(state, compound_key) do
+          {:live, _entry, _location} ->
+            do_count_live(table, state, prefix, next_key, count + 1)
+
+          status when status in [:expired, :miss] ->
+            delete_stale_member(table, state, compound_key)
+            do_count_live(table, state, prefix, next_key, count)
+
+          {:error, reason} ->
+            {:error, {:invalid_indexed_member, compound_key, reason}}
+        end
+
+      _missing ->
+        do_count_live(table, state, prefix, next_key, count)
+    end
+  end
+
+  defp do_count_live(_table, _state, _prefix, _other_key, count), do: {:ok, count}
 
   defp ignored_key?(%MapSet{} = ignored_keys, compound_key),
     do: MapSet.member?(ignored_keys, compound_key)

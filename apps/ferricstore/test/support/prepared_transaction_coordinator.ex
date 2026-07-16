@@ -25,8 +25,8 @@ defmodule Ferricstore.Test.PreparedTransactionCoordinator do
 
   defp prepare_entry(%PreparedCommand{} = prepared), do: {:ok, prepared}
 
-  defp prepare_entry({command, args, ast}) when is_binary(command) and is_list(args),
-    do: {:ok, {command, args, ast}}
+  defp prepare_entry({command, args, _ast}) when is_binary(command) and is_list(args),
+    do: PreparedCommand.prepare(command, args)
 
   defp prepare_entry({command, args}) when is_binary(command) and is_list(args),
     do: PreparedCommand.prepare(command, args)

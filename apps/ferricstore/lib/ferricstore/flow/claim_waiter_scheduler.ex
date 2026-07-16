@@ -106,25 +106,12 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
          priority_filter,
          partition_filter
        ) do
-    with {:ok, due_keys} <- Router.flow_due_count_keys(ctx),
-         matched_keys =
-           Enum.filter(
-             due_keys,
-             &due_key_matches?(
-               &1,
-               type,
-               state_filter,
-               priority_filter,
-               partition_filter
-             )
-           ),
-         true <- matched_keys != [],
-         {:ok, results} <-
-           Router.flow_index_rank_range_many(
-             ctx,
-             Enum.map(matched_keys, &{&1, 0, 0, false})
-           ),
-         due_at when is_integer(due_at) <- earliest_score(results) do
+    with {:ok, prefixes, needles, suffixes} <-
+           hot_due_matchers(type, state_filter, priority_filter, partition_filter),
+         {:ok, score} when is_float(score) <-
+           Router.flow_earliest_due_score(ctx, prefixes, needles, suffixes) do
+      due_at = round(score)
+
       for state <- notify_states(state_filter),
           partition_key <- notify_partitions(partition_filter) do
         ClaimWaiters.schedule_ready(type, state, priority_filter, partition_key, due_at, 1)
@@ -139,6 +126,70 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
   catch
     _kind, _reason -> :ok
   end
+
+  defp hot_due_matchers(type, state_filter, priority_filter, partition_filter) do
+    with {:ok, prefixes} <- hot_due_prefixes(partition_filter),
+         {:ok, needles} <- hot_due_needles(type, state_filter),
+         {:ok, suffixes} <- hot_due_suffixes(priority_filter) do
+      {:ok, prefixes, needles, suffixes}
+    end
+  end
+
+  defp hot_due_prefixes(partition_filter) when partition_filter in [nil, :any], do: {:ok, []}
+  defp hot_due_prefixes(:auto), do: {:ok, ["f:{fa:"]}
+
+  defp hot_due_prefixes(partition_keys) when is_list(partition_keys) do
+    case schedule_binary_list(partition_keys) do
+      {:ok, values} -> {:ok, values |> Enum.map(&hot_due_partition_prefix/1) |> Enum.uniq()}
+      :unsupported -> :unsupported
+    end
+  end
+
+  defp hot_due_prefixes(partition_key) when is_binary(partition_key),
+    do: {:ok, [hot_due_partition_prefix(partition_key)]}
+
+  defp hot_due_prefixes(_unsupported), do: :unsupported
+
+  defp hot_due_partition_prefix(partition_key),
+    do: "f:" <> Ferricstore.Flow.Keys.tag(partition_key) <> ":"
+
+  defp hot_due_needles(type, state_filter) do
+    encoded_type = Ferricstore.Flow.Keys.index_component(type)
+
+    case state_filter do
+      state when state in [nil, :any] ->
+        {:ok, ["}:d:" <> encoded_type <> ":", "}:da:" <> encoded_type <> ":p"]}
+
+      state when is_binary(state) ->
+        {:ok,
+         ["}:d:" <> encoded_type <> ":" <> Ferricstore.Flow.Keys.index_component(state) <> ":p"]}
+
+      states when is_list(states) ->
+        case schedule_binary_list(states) do
+          {:ok, values} ->
+            {:ok,
+             values
+             |> Enum.map(fn state ->
+               "}:d:" <>
+                 encoded_type <> ":" <> Ferricstore.Flow.Keys.index_component(state) <> ":p"
+             end)
+             |> Enum.uniq()}
+
+          :unsupported ->
+            :unsupported
+        end
+
+      _unsupported ->
+        :unsupported
+    end
+  end
+
+  defp hot_due_suffixes(nil), do: {:ok, []}
+
+  defp hot_due_suffixes(priority) when is_integer(priority),
+    do: {:ok, [":p" <> Integer.to_string(priority)]}
+
+  defp hot_due_suffixes(_unsupported), do: :unsupported
 
   defp schedule_next_cold_due(
          ctx,
@@ -188,8 +239,7 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
     ctx
     |> cold_lmdb_paths()
     |> Enum.reduce(nil, fn path, earliest ->
-      path
-      |> cold_bucket_prefixes(
+      cold_bucket_prefixes(
         type,
         state_filter,
         priority_filter,
@@ -197,40 +247,27 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
         now_ms,
         cold_horizon_ms
       )
-      |> Enum.reduce_while(earliest, fn prefix, current ->
-        case Ferricstore.Flow.LMDB.prefix_entries(
-               path,
-               prefix,
-               @claim_due_cold_schedule_scan_limit
-             ) do
-          {:ok, entries} ->
-            next =
-              entries
-              |> Enum.reduce(current, fn {_due_key, park_key}, acc ->
-                case cold_due_at(
-                       path,
-                       park_key,
-                       type,
-                       state_filter,
-                       priority_filter,
-                       partition_filter
-                     ) do
-                  due_at when is_integer(due_at) ->
-                    if is_integer(acc), do: min(acc, due_at), else: due_at
+      |> Enum.reduce_while(earliest, fn {bucket_ms, prefixes}, current ->
+        if is_integer(current) and bucket_ms >= current do
+          {:halt, current}
+        else
+          bucket_due =
+            earliest_cold_bucket_due(
+              path,
+              prefixes,
+              bucket_ms,
+              type,
+              state_filter,
+              priority_filter,
+              partition_filter
+            )
 
-                  _ ->
-                    acc
-                end
-              end)
-
-            if is_integer(next) and next <= now_ms do
-              {:halt, next}
-            else
-              {:cont, next}
-            end
-
-          _other ->
+          if is_integer(bucket_due) do
+            next = if is_integer(current), do: min(current, bucket_due), else: bucket_due
+            {:halt, next}
+          else
             {:cont, current}
+          end
         end
       end)
     end)
@@ -251,7 +288,6 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
   defp cold_lmdb_paths(_ctx), do: []
 
   defp cold_bucket_prefixes(
-         path,
          type,
          state_filter,
          priority_filter,
@@ -268,35 +304,87 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
         if priorities == [] do
           cold_type_prefixes(buckets, type)
         else
-          for bucket_ms <- buckets,
-              state <- states,
-              partition_key <- partitions,
-              priority <- priorities do
-            Ferricstore.Flow.LMDB.cold_due_claim_prefix(
-              bucket_ms: bucket_ms,
-              type: type,
-              state: state,
-              partition_key: partition_key,
-              priority: priority
-            )
-          end
+          Stream.map(buckets, fn bucket_ms ->
+            prefixes =
+              for state <- states,
+                  partition_key <- partitions,
+                  priority <- priorities do
+                {
+                  Ferricstore.Flow.LMDB.cold_due_claim_prefix(
+                    bucket_ms: bucket_ms,
+                    type: type,
+                    state: state,
+                    partition_key: partition_key,
+                    priority: priority
+                  ),
+                  false
+                }
+              end
+
+            {bucket_ms, prefixes}
+          end)
         end
 
       _broad_filter ->
         cold_type_prefixes(buckets, type)
     end
-    |> Enum.filter(&cold_prefix_present?(path, &1))
   end
 
   defp cold_type_prefixes(buckets, type) do
-    Enum.map(buckets, &Ferricstore.Flow.LMDB.cold_due_type_bucket_prefix(&1, type))
+    Stream.map(buckets, fn bucket_ms ->
+      {bucket_ms, [{Ferricstore.Flow.LMDB.cold_due_type_bucket_prefix(bucket_ms, type), true}]}
+    end)
   end
 
-  defp cold_prefix_present?(path, prefix) do
-    case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, 1) do
-      {:ok, [_ | _]} -> true
-      _ -> false
-    end
+  defp earliest_cold_bucket_due(
+         path,
+         prefixes,
+         bucket_ms,
+         type,
+         state_filter,
+         priority_filter,
+         partition_filter
+       ) do
+    Enum.reduce(prefixes, nil, fn {prefix, _broad?}, current ->
+      case Ferricstore.Flow.LMDB.prefix_entries(
+             path,
+             prefix,
+             @claim_due_cold_schedule_scan_limit + 1
+           ) do
+        {:ok, entries} ->
+          entries
+          |> Enum.take(@claim_due_cold_schedule_scan_limit)
+          |> Enum.reduce(current, fn {_due_key, park_key}, acc ->
+            case cold_due_at(
+                   path,
+                   park_key,
+                   type,
+                   state_filter,
+                   priority_filter,
+                   partition_filter
+                 ) do
+              due_at when is_integer(due_at) ->
+                if is_integer(acc), do: min(acc, due_at), else: due_at
+
+              _missing_or_stale ->
+                acc
+            end
+          end)
+          |> conservative_truncated_due(
+            bucket_ms,
+            length(entries) > @claim_due_cold_schedule_scan_limit
+          )
+
+        _unavailable ->
+          current
+      end
+    end)
+  end
+
+  defp conservative_truncated_due(current, _bucket_ms, false), do: current
+
+  defp conservative_truncated_due(current, bucket_ms, true) do
+    if is_integer(current), do: min(current, bucket_ms), else: bucket_ms
   end
 
   defp cold_horizon_ms(value) when is_integer(value) and value >= 0 do
@@ -313,7 +401,6 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
     first
     |> Stream.iterate(&(&1 + @claim_due_cold_schedule_bucket_ms))
     |> Stream.take_while(&(&1 <= last))
-    |> Enum.to_list()
   end
 
   defp cold_due_at(
@@ -381,7 +468,7 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
        do: true
 
   defp cold_partition_match?(partition, :auto) when is_binary(partition),
-    do: String.starts_with?(partition, "__flow_auto__:")
+    do: Ferricstore.Flow.Keys.auto_partition_key?(partition)
 
   defp cold_partition_match?(partition, partitions)
        when is_binary(partition) and is_list(partitions),
@@ -390,21 +477,9 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
   defp cold_partition_match?(partition, partition), do: true
   defp cold_partition_match?(_partition, _filter), do: false
 
-  defp earliest_score(results) when is_list(results) do
-    results
-    |> Enum.reduce(nil, fn
-      [{_id, score} | _], nil when is_number(score) ->
-        round(score)
-
-      [{_id, score} | _], current when is_number(score) ->
-        min(current, round(score))
-
-      _other, current ->
-        current
-    end)
-  end
-
-  defp earliest_score(_results), do: nil
+  @doc false
+  def __cold_partition_match_for_test__(partition, filter),
+    do: cold_partition_match?(partition, filter)
 
   defp notify_states(states) when is_list(states) do
     states
@@ -429,58 +504,6 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
 
   defp notify_partitions(partition) when is_binary(partition), do: [partition]
   defp notify_partitions(partition), do: [partition]
-
-  defp due_key_matches?(key, type, state_filter, priority_filter, partition_filter)
-       when is_binary(key) and is_binary(type) do
-    due_key?(key) and
-      partition_match?(key, partition_filter) and
-      state_match?(key, type, state_filter) and
-      priority_match?(key, priority_filter)
-  end
-
-  defp due_key_matches?(_key, _type, _state_filter, _priority, _partition),
-    do: false
-
-  defp due_key?(key) do
-    String.starts_with?(key, "f:{") and
-      (:binary.match(key, "}:d:") != :nomatch or :binary.match(key, "}:da:") != :nomatch)
-  end
-
-  defp partition_match?(_key, nil), do: true
-  defp partition_match?(_key, :any), do: true
-
-  defp partition_match?(key, :auto),
-    do: String.starts_with?(key, "f:{fa:") and due_key?(key)
-
-  defp partition_match?(key, partitions) when is_list(partitions),
-    do: Enum.any?(partitions, &partition_match?(key, &1))
-
-  defp partition_match?(key, partition_key) do
-    tag = Ferricstore.Flow.Keys.tag(partition_key)
-
-    String.starts_with?(key, "f:" <> tag <> ":d:") or
-      String.starts_with?(key, "f:" <> tag <> ":da:")
-  end
-
-  defp state_match?(key, type, state_filter) when state_filter in [nil, :any] do
-    String.contains?(key, "}:d:" <> type <> ":") or
-      String.contains?(key, "}:da:" <> type <> ":p")
-  end
-
-  defp state_match?(key, type, states) when is_list(states),
-    do: Enum.any?(states, &state_match?(key, type, &1))
-
-  defp state_match?(key, type, state) when is_binary(state),
-    do: String.contains?(key, "}:d:" <> type <> ":" <> state <> ":p")
-
-  defp state_match?(_key, _type, _state), do: false
-
-  defp priority_match?(_key, nil), do: true
-
-  defp priority_match?(key, priority) when is_integer(priority),
-    do: String.ends_with?(key, ":p" <> Integer.to_string(priority))
-
-  defp priority_match?(_key, _priority), do: false
 
   defp schedule_next_due_key(ctx, type, state, priority, partition_key) do
     key = Ferricstore.Flow.Keys.due_key(type, state, priority, partition_key)

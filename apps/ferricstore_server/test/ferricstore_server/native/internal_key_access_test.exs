@@ -1,16 +1,18 @@
 defmodule FerricstoreServer.Native.InternalKeyAccessTest do
   use ExUnit.Case, async: false
 
+  alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Native.{Commands, Session}
 
-  @error "ERR access to internal Flow keys is not allowed"
+  @error "ERR access to internal keys is not allowed"
   @op_pipeline 0x000E
   @op_get 0x0101
   @op_set 0x0102
   @op_mset 0x0105
   @op_hset 0x0110
   @op_flow_create 0x0201
+  @op_flow_value_mget 0x020C
 
   setup do
     ctx = FerricStore.Instance.get(:default)
@@ -40,6 +42,39 @@ defmodule FerricstoreServer.Native.InternalKeyAccessTest do
              )
 
     assert nil == Router.get(context.ctx, context.reserved)
+  end
+
+  test "typed reads and writes cannot access the durable server catalog", context do
+    namespace = "native-security-#{System.unique_integer([:positive, :monotonic])}"
+    key = ServerCatalog.revision_key(namespace)
+    encoded_revision = ServerCatalog.encode_revision(9)
+    assert :ok = Router.put(context.ctx, key, encoded_revision, 0)
+    on_exit(fn -> Router.delete(context.ctx, key) end)
+
+    command_state = state(context.ctx)
+    assert {:error, @error, _state} = Commands.execute(@op_get, %{"key" => key}, command_state)
+
+    assert {:error, @error, _state} =
+             Commands.execute(@op_set, %{"key" => key, "value" => "forged"}, command_state)
+
+    assert encoded_revision == Router.get(context.ctx, key)
+  end
+
+  test "Flow value reads cannot bypass native key boundaries", context do
+    namespace = "native-flow-value-#{System.unique_integer([:positive, :monotonic])}"
+    catalog_key = ServerCatalog.revision_key(namespace)
+    encoded_revision = ServerCatalog.encode_revision(12)
+
+    assert :ok = Router.put(context.ctx, context.ordinary, "ordinary-secret", 0)
+    assert :ok = Router.put(context.ctx, catalog_key, encoded_revision, 0)
+    on_exit(fn -> Router.delete(context.ctx, catalog_key) end)
+
+    assert {:ok, [nil, nil], _state} =
+             Commands.execute(
+               @op_flow_value_mget,
+               %{"refs" => [context.ordinary, catalog_key]},
+               state(context.ctx)
+             )
   end
 
   test "typed multi-key and data-structure writes reject before mutation", context do
@@ -124,8 +159,10 @@ defmodule FerricstoreServer.Native.InternalKeyAccessTest do
       multi_state: :none,
       multi_queue: [],
       multi_queue_count: 0,
+      multi_queue_bytes: 0,
       multi_error: false,
       watched_keys: %{},
+      watched_key_bytes: 0,
       pubsub_channels: nil,
       pubsub_patterns: nil
     })

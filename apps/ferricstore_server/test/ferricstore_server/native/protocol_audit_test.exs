@@ -31,6 +31,11 @@ defmodule FerricstoreServer.Native.ProtocolAuditTest do
     assert is_integer(Application.get_env(:ferricstore, :native_port))
   end
 
+  test "Ranch listener capacity matches the configured global maxclients gate" do
+    assert :ranch.get_max_connections(FerricstoreServer.Native.Listener.ref()) ==
+             Application.get_env(:ferricstore, :maxclients, 10_000)
+  end
+
   test "application and test source do not reference deleted text protocol modules" do
     files =
       Path.wildcard("apps/*/{lib,test}/**/*.{ex,exs}")

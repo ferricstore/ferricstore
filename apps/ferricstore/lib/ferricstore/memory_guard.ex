@@ -110,7 +110,7 @@ defmodule Ferricstore.MemoryGuard do
     * `:memory_guard_interval_ms` -- check interval (default: 100ms)
     * `:max_memory_bytes` -- maximum total memory budget
     * `:keydir_max_ram` -- maximum ETS keydir memory
-    * `:eviction_policy` -- eviction policy atom (default: `:volatile_lfu`)
+    * `:eviction_policy` -- eviction policy atom (default: `:volatile_lru`)
   """
 
   use GenServer
@@ -125,6 +125,21 @@ defmodule Ferricstore.MemoryGuard do
   @warning_threshold 0.70
   @pressure_threshold 0.85
   @reject_threshold 0.95
+  @reconfigure_keys [
+    :keydir_max_ram,
+    :hot_cache_max_ram,
+    :hot_cache_min_ram,
+    :max_memory_bytes,
+    :eviction_policy
+  ]
+  @eviction_policies [
+    :volatile_lfu,
+    :allkeys_lfu,
+    :volatile_lru,
+    :allkeys_lru,
+    :volatile_ttl,
+    :noeviction
+  ]
 
   @type pressure_level :: :ok | :warning | :pressure | :reject
 
@@ -142,6 +157,7 @@ defmodule Ferricstore.MemoryGuard do
     # Effective memory limit: cgroup limit or host RAM.
     # Used for RSS-based pressure detection.
     :memory_limit,
+    hot_cache_max_mode: :auto,
     last_pressure_level: :ok,
     last_hot_cache_budget: nil,
     keydir_pressure_level: :ok
@@ -259,7 +275,7 @@ defmodule Ferricstore.MemoryGuard do
     * `:max_memory_bytes` -- total memory budget
     * `:eviction_policy` -- eviction policy atom
   """
-  @spec reconfigure(map()) :: :ok
+  @spec reconfigure(map()) :: :ok | {:error, binary()}
   def reconfigure(params) when is_map(params) do
     GenServer.call(__MODULE__, {:reconfigure, params})
   end
@@ -296,6 +312,16 @@ defmodule Ferricstore.MemoryGuard do
     keydir_max_ram = Keyword.get(opts, :keydir_max_ram, default_keydir_max_ram())
     hot_cache_min_ram = Application.get_env(:ferricstore, :hot_cache_min_ram, 0)
 
+    hot_cache_setting =
+      Keyword.get(
+        opts,
+        :hot_cache_max_ram,
+        Application.get_env(:ferricstore, :hot_cache_max_ram, :auto)
+      )
+
+    {hot_cache_max_ram, hot_cache_max_mode} =
+      initial_hot_cache_max(hot_cache_setting, max_memory_bytes, keydir_max_ram)
+
     initial_budget = hot_cache_budget(max_memory_bytes, :ok)
 
     memory_limit = detect_memory_limit()
@@ -306,7 +332,8 @@ defmodule Ferricstore.MemoryGuard do
       eviction_policy: eviction_policy,
       shard_count: shard_count,
       keydir_max_ram: keydir_max_ram,
-      hot_cache_max_ram: max_memory_bytes - keydir_max_ram,
+      hot_cache_max_ram: hot_cache_max_ram,
+      hot_cache_max_mode: hot_cache_max_mode,
       hot_cache_min_ram: hot_cache_min_ram,
       memory_limit: memory_limit,
       last_pressure_level: :ok,
@@ -331,26 +358,10 @@ defmodule Ferricstore.MemoryGuard do
   end
 
   def handle_call({:reconfigure, params}, _from, state) do
-    new_state =
-      state
-      |> maybe_update(:keydir_max_ram, Map.get(params, :keydir_max_ram))
-      |> maybe_update(:hot_cache_min_ram, Map.get(params, :hot_cache_min_ram))
-      |> maybe_update(:max_memory_bytes, Map.get(params, :max_memory_bytes))
-      |> maybe_update(:eviction_policy, Map.get(params, :eviction_policy))
-
-    new_state =
-      case Map.get(params, :hot_cache_max_ram) do
-        nil ->
-          %{new_state | hot_cache_max_ram: new_state.max_memory_bytes - new_state.keydir_max_ram}
-
-        :auto ->
-          %{new_state | hot_cache_max_ram: new_state.max_memory_bytes - new_state.keydir_max_ram}
-
-        val ->
-          %{new_state | hot_cache_max_ram: val}
-      end
-
-    {:reply, :ok, new_state}
+    case reconfigured_state(state, params) do
+      {:ok, new_state} -> {:reply, :ok, new_state}
+      {:error, _reason} = error -> {:reply, error, state}
+    end
   end
 
   def handle_call(:force_check, _from, state) do
@@ -558,24 +569,27 @@ defmodule Ferricstore.MemoryGuard do
         binary_ref = keydir_binary_bytes_ref()
 
         {evict_count, bytes_freed} =
-          Enum.reduce_while(sorted, {0, 0}, fn {key, _exp, _lfu, vsize}, {cnt, freed} ->
+          Enum.reduce_while(sorted, {0, 0}, fn {key, _exp, _lfu, _vsize}, {cnt, freed} ->
             if freed >= deficit do
               {:halt, {cnt, freed}}
             else
-              # Track off-heap binary bytes removed by eviction (value -> nil)
-              if binary_ref do
-                case :ets.lookup(keydir, key) do
-                  [{^key, val, _, _, _, _, _}] when val != nil ->
-                    val_bytes = evict_offheap_size(val)
-                    if val_bytes > 0, do: :atomics.sub(binary_ref, shard_index + 1, val_bytes)
+              case :ets.lookup(keydir, key) do
+                [entry = {^key, val, _, _, _, _, _}] when val != nil ->
+                  case coldify_candidate(keydir, entry) do
+                    {:evicted, val_bytes, current_vsize} ->
+                      if binary_ref && val_bytes > 0 do
+                        :atomics.sub(binary_ref, shard_index + 1, val_bytes)
+                      end
 
-                  _ ->
-                    :ok
-                end
+                      {:cont, {cnt + 1, freed + current_vsize}}
+
+                    :stale ->
+                      {:cont, {cnt, freed}}
+                  end
+
+                _missing_or_cold ->
+                  {:cont, {cnt, freed}}
               end
-
-              :ets.update_element(keydir, key, {2, nil})
-              {:cont, {cnt + 1, freed + vsize}}
             end
           end)
 
@@ -587,6 +601,39 @@ defmodule Ferricstore.MemoryGuard do
       _, _ -> {0, 0}
     end
   end
+
+  @doc false
+  @spec coldify_candidate(:ets.tid() | atom(), tuple()) ::
+          {:evicted, non_neg_integer(), non_neg_integer()} | :stale
+  def coldify_candidate(table, {key, value, exp, lfu, fid, offset, value_size})
+      when is_integer(value_size) and value_size >= 0 do
+    guards = [
+      {:"=:=", :"$1", {:const, key}},
+      {:"=:=", :"$2", {:const, value}},
+      {:"=:=", :"$3", {:const, exp}},
+      {:"=:=", :"$4", {:const, lfu}},
+      {:"=:=", :"$5", {:const, fid}},
+      {:"=:=", :"$6", {:const, offset}},
+      {:"=:=", :"$7", {:const, value_size}}
+    ]
+
+    match_spec = [
+      {
+        {:"$1", :"$2", :"$3", :"$4", :"$5", :"$6", :"$7"},
+        guards,
+        [{{:"$1", nil, :"$3", :"$4", :"$5", :"$6", :"$7"}}]
+      }
+    ]
+
+    case :ets.select_replace(table, match_spec) do
+      1 -> {:evicted, evict_offheap_size(value), value_size}
+      0 -> :stale
+    end
+  rescue
+    ArgumentError -> :stale
+  end
+
+  def coldify_candidate(_table, _entry), do: :stale
 
   defp compute_stats(state) do
     # Off-heap binary bytes tracked by insert/delete hooks in state machine + router.
@@ -865,6 +912,103 @@ defmodule Ferricstore.MemoryGuard do
 
   defp default_keydir_max_ram,
     do: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)
+
+  defp reconfigured_state(state, params) do
+    with :ok <- validate_reconfigure_keys(params),
+         :ok <- validate_positive_param(params, :max_memory_bytes),
+         :ok <- validate_positive_param(params, :keydir_max_ram),
+         :ok <- validate_non_negative_param(params, :hot_cache_min_ram),
+         :ok <- validate_hot_cache_max(params),
+         :ok <- validate_eviction_policy(params) do
+      updated =
+        state
+        |> maybe_update(:keydir_max_ram, Map.get(params, :keydir_max_ram))
+        |> maybe_update(:hot_cache_min_ram, Map.get(params, :hot_cache_min_ram))
+        |> maybe_update(:max_memory_bytes, Map.get(params, :max_memory_bytes))
+        |> maybe_update(:eviction_policy, Map.get(params, :eviction_policy))
+
+      {hot_cache_max_ram, hot_cache_max_mode} =
+        reconfigured_hot_cache_max(state, updated, params)
+
+      if updated.hot_cache_min_ram <= hot_cache_max_ram do
+        {:ok,
+         %{
+           updated
+           | hot_cache_max_ram: hot_cache_max_ram,
+             hot_cache_max_mode: hot_cache_max_mode
+         }}
+      else
+        {:error, "ERR hot_cache_min_ram must not exceed hot_cache_max_ram"}
+      end
+    end
+  end
+
+  defp validate_reconfigure_keys(params) do
+    if Enum.all?(Map.keys(params), &(&1 in @reconfigure_keys)) do
+      :ok
+    else
+      {:error, "ERR unknown memory guard configuration key"}
+    end
+  end
+
+  defp validate_positive_param(params, key) do
+    case Map.get(params, key) do
+      nil -> :ok
+      value when is_integer(value) and value > 0 -> :ok
+      _invalid -> {:error, "ERR #{key} must be a positive integer"}
+    end
+  end
+
+  defp validate_non_negative_param(params, key) do
+    case Map.get(params, key) do
+      nil -> :ok
+      value when is_integer(value) and value >= 0 -> :ok
+      _invalid -> {:error, "ERR #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp validate_hot_cache_max(params) do
+    case Map.get(params, :hot_cache_max_ram) do
+      nil -> :ok
+      :auto -> :ok
+      value when is_integer(value) and value >= 0 -> :ok
+      _invalid -> {:error, "ERR hot_cache_max_ram must be :auto or a non-negative integer"}
+    end
+  end
+
+  defp validate_eviction_policy(params) do
+    case Map.get(params, :eviction_policy) do
+      nil -> :ok
+      policy when policy in @eviction_policies -> :ok
+      _invalid -> {:error, "ERR invalid memory guard eviction policy"}
+    end
+  end
+
+  defp initial_hot_cache_max(value, _max_memory_bytes, _keydir_max_ram)
+       when is_integer(value) and value >= 0,
+       do: {value, :explicit}
+
+  defp initial_hot_cache_max(_auto_or_invalid, max_memory_bytes, keydir_max_ram),
+    do: {max(max_memory_bytes - keydir_max_ram, 0), :auto}
+
+  defp reconfigured_hot_cache_max(_state, updated, %{hot_cache_max_ram: :auto}) do
+    {max(updated.max_memory_bytes - updated.keydir_max_ram, 0), :auto}
+  end
+
+  defp reconfigured_hot_cache_max(_state, _updated, %{hot_cache_max_ram: value})
+       when is_integer(value),
+       do: {value, :explicit}
+
+  defp reconfigured_hot_cache_max(%{hot_cache_max_mode: :auto}, updated, params) do
+    if Map.has_key?(params, :max_memory_bytes) or Map.has_key?(params, :keydir_max_ram) do
+      {max(updated.max_memory_bytes - updated.keydir_max_ram, 0), :auto}
+    else
+      {updated.hot_cache_max_ram, :auto}
+    end
+  end
+
+  defp reconfigured_hot_cache_max(state, _updated, _params),
+    do: {state.hot_cache_max_ram, :explicit}
 
   defp maybe_update(state, _key, nil), do: state
   defp maybe_update(state, key, value), do: Map.put(state, key, value)

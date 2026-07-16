@@ -11,7 +11,7 @@ defmodule Ferricstore.Store.CompoundKey do
 
   Each compound key has the format:
 
-      PREFIX:redis_key\\0sub_key
+      PREFIX:encoded_redis_key\\0sub_key
 
   Where:
 
@@ -22,15 +22,14 @@ defmodule Ferricstore.Store.CompoundKey do
       - `Z` for Sorted Set entries
       - `T` for Type metadata (no sub_key)
 
-    * `redis_key` is the user-facing Redis key name
+    * `encoded_redis_key` is the binary-safe escaped user-facing Redis key name
 
     * `\\0` (null byte) is the separator between the Redis key and sub-key
 
     * `sub_key` is the type-specific sub-key (field name, position, member, etc.)
 
-  The null byte separator is safe because Redis keys in normal use do not
-  contain null bytes (and the wire protocol does not transmit them within
-  key strings in standard client libraries).
+  Redis keys are binary-safe, so the logical key component escapes `%` and
+  null bytes before the null delimiter is appended. Sub-keys remain untouched.
 
   ## Type Metadata
 
@@ -41,6 +40,9 @@ defmodule Ferricstore.Store.CompoundKey do
   """
 
   @separator <<0>>
+  @escape "%"
+  @escaped_escape "%25"
+  @escaped_separator "%00"
 
   alias Ferricstore.Flow.InternalKey
 
@@ -60,7 +62,11 @@ defmodule Ferricstore.Store.CompoundKey do
 
   """
   @spec type_key(binary()) :: binary()
-  def type_key(redis_key), do: "T:" <> redis_key
+  def type_key(redis_key), do: "T:" <> encode_redis_key(redis_key)
+
+  @doc false
+  @spec promotion_marker_key(binary()) :: binary()
+  def promotion_marker_key(redis_key), do: "PM:" <> encode_redis_key(redis_key)
 
   @doc """
   Encodes a data type atom to its stored string representation.
@@ -109,7 +115,7 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec hash_field(binary(), binary()) :: binary()
   def hash_field(redis_key, field) do
-    "H:" <> redis_key <> @separator <> field
+    hash_prefix(redis_key) <> field
   end
 
   @doc """
@@ -123,7 +129,7 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec hash_prefix(binary()) :: binary()
   def hash_prefix(redis_key) do
-    "H:" <> redis_key <> @separator
+    compound_prefix("H:", redis_key)
   end
 
   # -------------------------------------------------------------------
@@ -134,7 +140,7 @@ defmodule Ferricstore.Store.CompoundKey do
   Builds the metadata compound key for a list.
   """
   @spec list_meta_key(binary()) :: binary()
-  def list_meta_key(redis_key), do: "LM:" <> redis_key
+  def list_meta_key(redis_key), do: "LM:" <> encode_redis_key(redis_key)
 
   @doc """
   Builds a compound key for a list element at a given float64 position.
@@ -153,7 +159,7 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec list_element(binary(), float()) :: binary()
   def list_element(redis_key, position) when is_number(position) do
-    "L:" <> redis_key <> @separator <> encode_position(position)
+    list_prefix(redis_key) <> encode_position(position)
   end
 
   @doc """
@@ -167,7 +173,7 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec list_prefix(binary()) :: binary()
   def list_prefix(redis_key) do
-    "L:" <> redis_key <> @separator
+    compound_prefix("L:", redis_key)
   end
 
   @doc """
@@ -241,21 +247,50 @@ defmodule Ferricstore.Store.CompoundKey do
 
   """
   @spec decode_position(binary()) :: number()
-  def decode_position("P" <> rest) do
-    [int_str, frac_str] = String.split(rest, ".", parts: 2)
-    int_part = String.to_integer(int_str)
-    frac_part = String.to_integer(frac_str)
-    if frac_part == 0, do: int_part, else: int_part + frac_part / 100_000_000_000_000_000
+  def decode_position(encoded) do
+    case decode_position_safe(encoded) do
+      {:ok, position} -> position
+      :error -> raise ArgumentError, "invalid encoded list position"
+    end
   end
 
-  def decode_position("N" <> rest) do
-    [int_str, frac_str] = String.split(rest, ".", parts: 2)
-    comp_int = String.to_integer(int_str)
-    comp_frac = String.to_integer(frac_str)
+  @doc false
+  @spec decode_position_safe(term()) :: {:ok, number()} | :error
+  def decode_position_safe(<<sign, int_str::binary-size(20), ?., frac_str::binary-size(17)>>)
+      when sign in [?P, ?N] do
+    if decimal_digits?(int_str) and decimal_digits?(frac_str) do
+      decode_position_parts(
+        sign,
+        :erlang.binary_to_integer(int_str),
+        :erlang.binary_to_integer(frac_str)
+      )
+    else
+      :error
+    end
+  end
+
+  def decode_position_safe(_encoded), do: :error
+
+  defp decode_position_parts(?P, int_part, frac_part) do
+    position =
+      if frac_part == 0, do: int_part, else: int_part + frac_part / 100_000_000_000_000_000
+
+    {:ok, position}
+  end
+
+  defp decode_position_parts(?N, comp_int, comp_frac) do
     int_part = 99_999_999_999_999_999_999 - comp_int
     frac_part = 99_999_999_999_999_999 - comp_frac
-    if frac_part == 0, do: -int_part, else: -(int_part + frac_part / 100_000_000_000_000_000)
+
+    position =
+      if frac_part == 0, do: -int_part, else: -(int_part + frac_part / 100_000_000_000_000_000)
+
+    {:ok, position}
   end
+
+  defp decimal_digits?(<<>>), do: true
+  defp decimal_digits?(<<digit, rest::binary>>) when digit in ?0..?9, do: decimal_digits?(rest)
+  defp decimal_digits?(_binary), do: false
 
   # -------------------------------------------------------------------
   # Set compound keys
@@ -274,7 +309,7 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec set_member(binary(), binary()) :: binary()
   def set_member(redis_key, member) do
-    "S:" <> redis_key <> @separator <> member
+    set_prefix(redis_key) <> member
   end
 
   @doc """
@@ -288,7 +323,7 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec set_prefix(binary()) :: binary()
   def set_prefix(redis_key) do
-    "S:" <> redis_key <> @separator
+    compound_prefix("S:", redis_key)
   end
 
   # -------------------------------------------------------------------
@@ -308,7 +343,7 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec zset_member(binary(), binary()) :: binary()
   def zset_member(redis_key, member) do
-    "Z:" <> redis_key <> @separator <> member
+    zset_prefix(redis_key) <> member
   end
 
   @doc """
@@ -322,7 +357,7 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec zset_prefix(binary()) :: binary()
   def zset_prefix(redis_key) do
-    "Z:" <> redis_key <> @separator
+    compound_prefix("Z:", redis_key)
   end
 
   @doc """
@@ -330,21 +365,21 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec stream_prefix(binary()) :: binary()
   def stream_prefix(redis_key) do
-    "X:" <> redis_key <> @separator
+    compound_prefix("X:", redis_key)
   end
 
   @doc """
   Builds the durable metadata key for a stream's length and last-generated-id.
   """
   @spec stream_meta_key(binary()) :: binary()
-  def stream_meta_key(redis_key), do: "XM:" <> redis_key
+  def stream_meta_key(redis_key), do: "XM:" <> encode_redis_key(redis_key)
 
   @doc """
   Builds the durable consumer-group metadata key for a stream group.
   """
   @spec stream_group(binary(), binary()) :: binary()
   def stream_group(redis_key, group) do
-    "XG:" <> redis_key <> @separator <> group
+    stream_group_prefix(redis_key) <> group
   end
 
   @doc """
@@ -352,7 +387,7 @@ defmodule Ferricstore.Store.CompoundKey do
   """
   @spec stream_group_prefix(binary()) :: binary()
   def stream_group_prefix(redis_key) do
-    "XG:" <> redis_key <> @separator
+    compound_prefix("XG:", redis_key)
   end
 
   # -------------------------------------------------------------------
@@ -404,6 +439,7 @@ defmodule Ferricstore.Store.CompoundKey do
   def internal_key?(<<"VM:", _rest::binary>>), do: true
   def internal_key?(<<"PM:", _rest::binary>>), do: true
   def internal_key?(<<"LM:", _rest::binary>>), do: true
+  def internal_key?(<<"FC:", _rest::binary>>), do: true
   def internal_key?(_), do: false
 
   @doc """
@@ -437,20 +473,36 @@ defmodule Ferricstore.Store.CompoundKey do
   def extract_redis_key(<<"S:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(<<"Z:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(<<"X:", rest::binary>>), do: extract_before_separator(rest)
-  def extract_redis_key(<<"XM:", rest::binary>>), do: rest
+  def extract_redis_key(<<"XM:", rest::binary>>), do: decode_redis_key(rest)
   def extract_redis_key(<<"XG:", rest::binary>>), do: extract_before_separator(rest)
-  def extract_redis_key(<<"T:", rest::binary>>), do: rest
-  def extract_redis_key(<<"LM:", rest::binary>>), do: rest
+  def extract_redis_key(<<"T:", rest::binary>>), do: decode_redis_key(rest)
+  def extract_redis_key(<<"LM:", rest::binary>>), do: decode_redis_key(rest)
   def extract_redis_key(<<"VM:", rest::binary>>), do: extract_before_separator(rest)
-  def extract_redis_key(<<"PM:", rest::binary>>), do: rest
+  def extract_redis_key(<<"PM:", rest::binary>>), do: decode_redis_key(rest)
   def extract_redis_key(<<"V:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(key), do: key
 
   defp extract_before_separator(rest) do
     case :binary.split(rest, @separator) do
-      [redis_key, _sub_key] -> redis_key
-      [redis_key] -> redis_key
+      [redis_key, _sub_key] -> decode_redis_key(redis_key)
+      [redis_key] -> decode_redis_key(redis_key)
     end
+  end
+
+  defp compound_prefix(prefix, redis_key) do
+    prefix <> encode_redis_key(redis_key) <> @separator
+  end
+
+  defp encode_redis_key(redis_key) do
+    redis_key
+    |> :binary.replace(@escape, @escaped_escape, [:global])
+    |> :binary.replace(@separator, @escaped_separator, [:global])
+  end
+
+  defp decode_redis_key(encoded_key) do
+    encoded_key
+    |> :binary.replace(@escaped_separator, @separator, [:global])
+    |> :binary.replace(@escaped_escape, @escape, [:global])
   end
 
   @doc """
@@ -474,7 +526,7 @@ defmodule Ferricstore.Store.CompoundKey do
     {type_keys, other_keys} =
       Enum.reduce(raw_keys, {[], []}, fn key, {tk, ok} ->
         case key do
-          <<"T:", logical::binary>> -> {[logical | tk], ok}
+          <<"T:", _logical::binary>> -> {[extract_redis_key(key) | tk], ok}
           _ -> {tk, [key | ok]}
         end
       end)

@@ -162,6 +162,27 @@ defmodule Ferricstore.Stats.HotnessTest do
   # ---------------------------------------------------------------------------
 
   describe "hotness_top/1" do
+    test "caps the complete hotness table including the overflow bucket" do
+      Stats.reset_hotness()
+
+      for index <- 1..1_001 do
+        Stats.record_hot_read("prefix-#{index}:key")
+      end
+
+      assert :ets.info(:ferricstore_hotness, :size) <= 1_000
+
+      assert Enum.any?(Stats.hotness_top(1_000), fn {prefix, _hot, _cold, _pct} ->
+               prefix == "_other"
+             end)
+
+      Stats.reset()
+      Stats.record_hot_read("after-reset:key")
+
+      assert Enum.any?(Stats.hotness_top(10), fn {prefix, _hot, _cold, _pct} ->
+               prefix == "after-reset"
+             end)
+    end
+
     test "returns empty list when no reads recorded" do
       assert Stats.hotness_top(5) == []
     end
@@ -221,6 +242,22 @@ defmodule Ferricstore.Stats.HotnessTest do
   # ---------------------------------------------------------------------------
 
   describe "reset_hotness/0" do
+    test "serializes first-prefix allocation with reset" do
+      server = Process.whereis(Stats)
+      :ok = :sys.suspend(server)
+      task = Task.async(fn -> Stats.record_hot_read("serialized-prefix:key") end)
+
+      yielded =
+        try do
+          Task.yield(task, 50)
+        after
+          :ok = :sys.resume(server)
+        end
+
+      assert yielded == nil
+      assert Task.await(task) == :ok
+    end
+
     test "clears global hot/cold counters" do
       Stats.record_hot_read("k:1")
       Stats.record_cold_read("k:2")

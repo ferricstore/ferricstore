@@ -48,6 +48,13 @@ defmodule Ferricstore.Commands.ServerInfoTest do
       assert result =~ "# Replication"
       assert result =~ "# CPU"
     end
+
+    test "default INFO keeps full-keyspace analysis opt-in" do
+      store = MockStore.make()
+
+      refute Server.handle("INFO", [], store) =~ "# Keydir_Analysis"
+      assert Server.handle("INFO", ["keydir_analysis"], store) =~ "# Keydir_Analysis"
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -295,6 +302,45 @@ defmodule Ferricstore.Commands.ServerInfoTest do
       assert {:error, msg} = Server.handle("SAVE", [], store)
       assert msg =~ "save failed"
       assert msg =~ "fsync_failed"
+    end
+
+    test "BGSAVE rejects concurrent persistence barriers for the same instance" do
+      parent = self()
+
+      barrier = fn ->
+        send(parent, {:save_barrier_entered, self()})
+
+        receive do
+          :release_save_barrier -> :ok
+        end
+      end
+
+      store = %{
+        persistence_barrier: barrier,
+        __instance_ctx__: %FerricStore.Instance{name: make_ref()}
+      }
+
+      assert {:simple, "Background saving started"} = Server.handle("BGSAVE", [], store)
+      assert_receive {:save_barrier_entered, first_pid}
+
+      second_result = Server.handle("BGSAVE", [], store)
+
+      second_pid =
+        receive do
+          {:save_barrier_entered, pid} -> pid
+        after
+          100 -> nil
+        end
+
+      pids = [first_pid | List.wrap(second_pid)]
+      monitors = Enum.map(pids, &Process.monitor/1)
+      Enum.each(pids, &send(&1, :release_save_barrier))
+
+      for {pid, monitor} <- Enum.zip(pids, monitors) do
+        assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+      end
+
+      assert {:error, "ERR background save already in progress"} = second_result
     end
   end
 

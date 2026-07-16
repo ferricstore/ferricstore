@@ -161,7 +161,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AckedWritesSurviveWaraftSe
           assert {:ok, pre_write_position} = WARaftBackend.storage_position(0)
 
           payload = "apply-fail:v"
-          {encoded_ref, ref} = missing_legacy_blob_ref(payload)
+          {encoded_ref, ref} = missing_blob_ref(payload)
 
           assert Ferricstore.ErrorReasons.write_timeout_unknown() ==
                    WARaftBackend.write(0, {:put_blob_ref, "apply-fail:k", encoded_ref, 0})
@@ -170,7 +170,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.AckedWritesSurviveWaraftSe
           assert {:ok, ^pre_write_position} = WARaftBackend.storage_position(0)
 
           assert :ok = WARaftBackend.stop()
-          write_legacy_blob!(ctx, 0, ref, payload)
+          write_blob_segment!(ctx, 0, ref, payload)
           FerricStore.Instance.cleanup(ctx.name)
 
           restarted_ctx = build_ctx(root)

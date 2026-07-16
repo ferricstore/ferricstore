@@ -85,6 +85,49 @@ defmodule Ferricstore.FlowCodecTest do
     end
   end
 
+  test "record decoders reject semantically invalid required fields" do
+    invalid_records = [
+      Map.put(base_record(), :id, ""),
+      Map.put(base_record(), :type, nil),
+      Map.put(base_record(), :state, ""),
+      Map.put(base_record(), :version, nil),
+      Map.put(base_record(), :created_at_ms, -1),
+      Map.put(base_record(), :updated_at_ms, nil)
+    ]
+
+    Enum.each(invalid_records, fn record ->
+      encoded = Flow.encode_record_elixir(record)
+
+      assert_raise ArgumentError, "invalid flow record", fn -> Flow.decode_record(encoded) end
+      assert_raise ArgumentError, "invalid flow record", fn -> Flow.decode_record_elixir(encoded) end
+      assert_raise ArgumentError, "invalid flow record", fn -> Flow.decode_record_meta(encoded) end
+    end)
+  end
+
+  test "record decoders reject malformed reserved sidecar fields" do
+    invalid_sidecars = [
+      %{"__value_refs__" => %{"payload" => %{"ref" => ""}}},
+      %{"__attributes__" => %{"" => "invalid"}},
+      %{"__indexed_attributes__" => ["a", "b", "c", "d"]},
+      %{"__state_meta__" => %{"" => %{"version" => 1}}},
+      %{"__indexed_state_meta__" => %{"invalid" => true}},
+      %{"__incarnation__" => -1},
+      %{"__state_enter_seq__" => "1"},
+      %{"__governance_limit__" => %{"scope" => "missing-required-fields"}}
+    ]
+
+    Enum.each(invalid_sidecars, fn child_groups ->
+      encoded =
+        base_record()
+        |> Map.put(:child_groups, child_groups)
+        |> Flow.encode_record_elixir()
+
+      assert_raise ArgumentError, fn -> Flow.decode_record(encoded) end
+      assert_raise ArgumentError, fn -> Flow.decode_record_elixir(encoded) end
+      assert_raise ArgumentError, fn -> Flow.decode_record_meta(encoded) end
+    end)
+  end
+
   test "record codec omits redundant immutable defaults from every state version" do
     record =
       base_record()
@@ -268,6 +311,15 @@ defmodule Ferricstore.FlowCodecTest do
              Flow.decode_history_fields_elixir(elixir_encoded, record)
   end
 
+  test "history metadata normalization ignores unsupported compound values" do
+    assert Support.normalize_history_meta(%{
+             "float" => 1.5,
+             "map" => %{nested: true},
+             "list" => ["nested"],
+             "tuple" => {:nested, true}
+           }) == [{"float", "1.5"}]
+  end
+
   test "value codec stores normal binaries raw and escapes magic-prefixed binaries" do
     assert Flow.encode_value("payload-bytes") == "payload-bytes"
     assert Flow.decode_value("payload-bytes") == "payload-bytes"
@@ -284,6 +336,24 @@ defmodule Ferricstore.FlowCodecTest do
 
     map_payload = %{kind: "typed"}
     assert Flow.decode_value(Flow.encode_value(map_payload)) == map_payload
+  end
+
+  test "typed values reject non-canonical external terms without deserializing them" do
+    payload = %{kind: String.duplicate("typed", 1_024)}
+    assert <<"FSV2", 2, encoded::binary>> = Flow.encode_value(payload)
+
+    trailing = "FSV2" <> <<2>> <> encoded <> <<0>>
+    assert Flow.decode_value(trailing) == encoded <> <<0>>
+
+    assert Flow.decode_value_with_user_size(trailing) ==
+             {encoded <> <<0>>, byte_size(encoded) + 1}
+
+    compressed = "FSV2" <> <<2>> <> :erlang.term_to_binary(payload, compressed: 9)
+    refute Flow.decode_value(compressed) == payload
+  end
+
+  test "child group decoding rejects the unsupported external-term format" do
+    assert :error = Support.decode_child_groups_payload(:erlang.term_to_binary(%{"group" => 1}))
   end
 
   defp base_record do

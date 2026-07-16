@@ -86,10 +86,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           when valid_waraft_segment_location(fid, off, vsize) ->
             warm_from_waraft_segment(state, key, 0, fid, off, vsize)
 
-          [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
-            track_keydir_binary_remove_known(state, key, nil)
-            safe_ets_delete(state.ets, key)
-            :miss
+          [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
+            record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
 
           _ ->
             # :pending fid or truly missing -- cannot warm from disk.
@@ -112,10 +110,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           when valid_waraft_segment_location(fid, off, vsize) ->
             warm_from_waraft_segment(state, key, exp, fid, off, vsize)
 
-          [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
-            track_keydir_binary_remove_known(state, key, nil)
-            safe_ets_delete(state.ets, key)
-            :miss
+          [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
+            record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
 
           _ ->
             # :pending fid or truly missing -- cannot warm from disk.
@@ -148,28 +144,53 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               {:ok, materialized} ->
                 {:hit, materialized, expire_at_ms}
 
-              {:error, _reason} ->
+              {:error, reason} ->
                 retry_warm_from_changed_cold_location(
                   state,
                   key,
                   original_location,
-                  @cold_location_retry_attempts
+                  @cold_location_retry_attempts,
+                  {:blob_ref_unavailable, reason}
                 )
             end
 
-          _ ->
+          {:error, reason} ->
             retry_warm_from_changed_cold_location(
               state,
               key,
               original_location,
-              @cold_location_retry_attempts
+              @cold_location_retry_attempts,
+              reason
+            )
+
+          other ->
+            retry_warm_from_changed_cold_location(
+              state,
+              key,
+              original_location,
+              @cold_location_retry_attempts,
+              {:invalid_cold_read_result, other}
             )
         end
       end
 
-      defp retry_warm_from_changed_cold_location(_state, _key, _original_location, 0), do: :miss
+      defp retry_warm_from_changed_cold_location(
+             _state,
+             _key,
+             original_location,
+             0,
+             reason
+           ) do
+        record_state_read_failure({:cold_value_unavailable, original_location, reason})
+      end
 
-      defp retry_warm_from_changed_cold_location(state, key, original_location, attempts_left) do
+      defp retry_warm_from_changed_cold_location(
+             state,
+             key,
+             original_location,
+             attempts_left,
+             reason
+           ) do
         maybe_run_cold_location_miss_hook()
         Process.sleep(@cold_location_retry_sleep_ms)
         now = apply_now_ms()
@@ -186,7 +207,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
                 state,
                 key,
                 original_location,
-                attempts_left - 1
+                attempts_left - 1,
+                reason
               )
             else
               warm_from_disk(state, key, exp, fid, off, vsize)
@@ -199,7 +221,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
                 state,
                 key,
                 original_location,
-                attempts_left - 1
+                attempts_left - 1,
+                reason
               )
             else
               warm_from_waraft_segment(state, key, exp, fid, off, vsize)
@@ -235,21 +258,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               {:ok, materialized} ->
                 {:hit, materialized, expire_at_ms}
 
-              {:error, _reason} ->
+              {:error, reason} ->
                 retry_warm_from_changed_cold_location(
                   state,
                   key,
                   original_location,
-                  @cold_location_retry_attempts
+                  @cold_location_retry_attempts,
+                  {:blob_ref_unavailable, reason}
                 )
             end
 
-          _ ->
+          {:error, reason} ->
             retry_warm_from_changed_cold_location(
               state,
               key,
               original_location,
-              @cold_location_retry_attempts
+              @cold_location_retry_attempts,
+              reason
+            )
+
+          other ->
+            retry_warm_from_changed_cold_location(
+              state,
+              key,
+              original_location,
+              @cold_location_retry_attempts,
+              {:invalid_waraft_read_result, other}
             )
         end
       end
@@ -317,6 +351,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             {0, _, _} ->
               nil
 
+            {:error, _reason} = error ->
+              error
+
             _meta ->
               with :ok <- Ferricstore.Store.TypeRegistry.check_or_set(destination, :list, store) do
                 ListOps.execute_lmove(source, destination, store, from_dir, to_dir)
@@ -376,34 +413,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         HyperLogLog.handle_ast({:pfmerge, [dest_key | source_keys]}, store)
       end
 
-      # Builds a compound store for list/hash/set operations inside the state
-      # machine. Uses do_put/do_delete/do_get directly (already inside apply context,
-      # writes accumulate in pending_writes buffer for batch NIF flush).
+      # Shared collections retain the pending-write fast path; promoted
+      # collections are resolved to their dedicated log before any access.
       defp build_compound_store(state) do
         %{
-          compound_get: fn _redis_key, compound_key ->
-            do_get(state, compound_key)
+          compound_get: fn redis_key, compound_key ->
+            sm_store_compound_get(state, redis_key, compound_key)
           end,
-          compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-            do_put(state, compound_key, value, expire_at_ms)
+          compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+            do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
           end,
-          compound_batch_put: fn _redis_key, entries ->
-            Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
-              :ok = do_put(state, compound_key, value, expire_at_ms)
-            end)
-
-            :ok
+          compound_batch_put: fn redis_key, entries ->
+            do_compound_batch_put(state, redis_key, entries)
           end,
-          compound_delete: fn _redis_key, compound_key ->
-            do_delete(state, compound_key)
+          compound_delete: fn redis_key, compound_key ->
+            do_compound_delete(state, redis_key, compound_key)
           end,
-          compound_batch_delete: fn _redis_key, compound_keys ->
-            Enum.reduce_while(compound_keys, :ok, fn compound_key, :ok ->
-              case do_delete(state, compound_key) do
-                :ok -> {:cont, :ok}
-                {:error, _} = error -> {:halt, error}
-              end
-            end)
+          compound_batch_delete: fn redis_key, compound_keys ->
+            do_compound_batch_delete(state, redis_key, compound_keys)
+          end,
+          compound_batch_mutate: fn redis_key, compound_keys, entries ->
+            with :ok <- do_compound_batch_delete(state, redis_key, compound_keys),
+                 :ok <- do_compound_batch_put(state, redis_key, entries) do
+              :ok
+            end
           end,
           compound_scan: fn redis_key, prefix ->
             data_path =
@@ -415,7 +448,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               prefix,
               data_path
             )
-            |> Enum.sort_by(fn {field, _} -> field end)
+            |> Ferricstore.Store.ReadResult.map_success(
+              &Enum.sort_by(&1, fn {field, _} -> field end)
+            )
+          end,
+          compound_scan_slice: fn redis_key, prefix, start, count, total ->
+            data_path =
+              Ferricstore.Store.Shard.Compound.Promoted.promoted_store(state, redis_key) ||
+                state.shard_data_path
+
+            Ferricstore.Store.Shard.ETS.prefix_scan_entries_slice(
+              shard_ets_state(state),
+              prefix,
+              data_path,
+              start,
+              count,
+              total
+            )
           end,
           compound_count: fn _redis_key, prefix ->
             Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix)
@@ -430,7 +479,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         %{
           build_compound_store(state)
           | compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-              case do_put(state, compound_key, value, expire_at_ms) do
+              case do_compound_put(state, redis_key, compound_key, value, expire_at_ms) do
                 :ok ->
                   maybe_queue_zset_ready_empty_after_flush(state, redis_key, compound_key, value)
                   :ok
@@ -452,7 +501,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       end
 
       defp shard_ets_state(state) do
-        %{keydir: state.ets, index: state.shard_index, instance_ctx: state.instance_ctx}
+        %{
+          keydir: state.ets,
+          index: state.shard_index,
+          instance_ctx: state.instance_ctx,
+          compound_member_index: Map.get(state, :compound_member_index_name)
+        }
       end
 
       defp live_key?(state, key) do
@@ -464,16 +518,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         end
       end
 
-      # ---------------------------------------------------------------------------
-      # Private: compound delete prefix (scan + batch delete)
-      # ---------------------------------------------------------------------------
-
-      # Scans ETS for all keys matching the given prefix and deletes each from
-      # both ETS and Bitcask. Used by DEL on hashes, sets, and sorted sets to
-      # remove all compound fields belonging to a data structure.
-      #
-      # Uses :ets.select with a match spec for O(matching) prefix lookup instead
-      # of :ets.foldl which would scan every key in the entire keydir.
       defp do_delete_prefix(state, prefix) do
         prefix_len = byte_size(prefix)
 
@@ -486,13 +530,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
            ], [:"$1"]}
         ]
 
-        keys_to_delete = :ets.select(state.ets, match_spec)
-
-        Enum.each(keys_to_delete, fn key ->
-          do_delete(state, key)
+        state.ets
+        |> :ets.select(match_spec)
+        |> Enum.reduce_while(:ok, fn key, :ok ->
+          case do_delete(state, key) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
         end)
+      end
 
-        :ok
+      # Collection deletion must use the exact ordered catalog. Falling back to
+      # the keydir would turn one collection delete into a full-shard apply stall.
+      defp do_compound_member_prefix_delete(state, redis_key, prefix) do
+        case CompoundMemberIndex.keys_for_prefix(
+               Map.get(state, :compound_member_index_name),
+               prefix,
+               state.apply_context.compound_delete_member_budget
+             ) do
+          {:ok, compound_keys} ->
+            do_compound_batch_delete(state, redis_key, compound_keys)
+
+          {:error, :limit_exceeded} ->
+            {:error, :compound_delete_budget_exceeded}
+
+          :unavailable ->
+            {:error, :compound_member_index_unavailable}
+        end
       end
 
       defp do_compound_put(state, redis_key, compound_key, value, expire_at_ms) do
@@ -509,13 +573,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
         if result == :ok do
           if dedicated_path == nil do
-            maybe_queue_compound_promotion_after_flush(state, redis_key, compound_key, 1)
+            queue_compound_promotion_after_flush(redis_key, compound_key)
           end
 
           zset_index_put(state, redis_key, compound_key, value)
         end
 
         result
+      end
+
+      defp sm_store_compound_get(state, redis_key, compound_key) do
+        case sm_store_compound_get_meta(state, redis_key, compound_key) do
+          {value, _expire_at_ms} -> value
+          nil -> nil
+        end
       end
 
       defp do_compound_batch_put(_state, _redis_key, []), do: :ok
@@ -529,7 +600,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             do_promoted_compound_batch_put(state, redis_key, entries, dedicated_path)
 
           :mixed ->
-            do_compound_batch_put_generic(state, redis_key, entries)
+            {:error, :mixed_compound_batch_targets}
         end
       end
 
@@ -567,12 +638,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         if compound_shared_fast_path?(state) do
           case List.last(entries) do
             {compound_key, _value, _expire_at_ms} ->
-              maybe_queue_compound_promotion_after_flush(
-                state,
-                redis_key,
-                compound_key,
-                length(entries)
-              )
+              queue_compound_promotion_after_flush(redis_key, compound_key)
 
             nil ->
               :ok
@@ -601,119 +667,187 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         not cross_shard_pending_active?() and not standalone_staged_apply?()
       end
 
-      defp maybe_queue_compound_promotion_after_flush(state, redis_key, compound_key, write_count) do
-        threshold = Promotion.threshold(state.instance_ctx)
+      # Promotion is structural maintenance, not replicated state-machine work.
+      # Keep only one lightweight hint per collection and dispatch it after the
+      # durable write batch succeeds.
+      defp queue_compound_promotion_after_flush(redis_key, compound_key) do
+        case Process.get(:sm_pending_compound_promotions) do
+          %MapSet{} = pending ->
+            Process.put(
+              :sm_pending_compound_promotions,
+              MapSet.put(pending, {redis_key, compound_key})
+            )
 
-        if threshold > 0 and
-             compound_promotion_candidate?(state, redis_key, compound_key, write_count) do
-          pending = Process.get(:sm_pending_compound_promotions, MapSet.new())
-
-          Process.put(
-            :sm_pending_compound_promotions,
-            MapSet.put(pending, {redis_key, compound_key})
-          )
+          _not_in_apply ->
+            :ok
         end
 
         :ok
       end
 
-      defp compound_promotion_candidate?(state, redis_key, compound_key, write_count) do
-        case compound_prefix_from_key(redis_key, compound_key) do
-          nil ->
-            false
+      defp promoted_put_maintenance(state, compound_key, disk_value)
+           when is_binary(compound_key) and is_binary(disk_value) do
+        new_record_size =
+          @bitcask_record_header_size + byte_size(compound_key) + byte_size(disk_value)
 
-          prefix ->
-            threshold = Promotion.threshold(state.instance_ctx)
+        %{
+          appended_bytes: new_record_size,
+          reclaimable_bytes: promoted_existing_record_size(state, compound_key),
+          writes: 1
+        }
+      end
 
-            Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix) +
-              write_count > threshold
+      defp promoted_batch_put_maintenance(state, disk_entries) do
+        {maintenance, _latest_sizes} =
+          Enum.reduce(disk_entries, {empty_promoted_maintenance(), %{}}, fn
+            {compound_key, disk_value, _expire_at_ms}, {maintenance, latest_sizes} ->
+              old_record_size =
+                Map.get_lazy(latest_sizes, compound_key, fn ->
+                  promoted_existing_record_size(state, compound_key)
+                end)
+
+              new_record_size =
+                @bitcask_record_header_size + byte_size(compound_key) + byte_size(disk_value)
+
+              {
+                add_promoted_maintenance(
+                  maintenance,
+                  new_record_size,
+                  old_record_size,
+                  1
+                ),
+                Map.put(latest_sizes, compound_key, new_record_size)
+              }
+          end)
+
+        maintenance
+      end
+
+      defp promoted_delete_maintenance(state, compound_key) when is_binary(compound_key) do
+        tombstone_size = @bitcask_record_header_size + byte_size(compound_key)
+
+        %{
+          appended_bytes: tombstone_size,
+          reclaimable_bytes: promoted_existing_record_size(state, compound_key) + tombstone_size,
+          writes: 1
+        }
+      end
+
+      defp promoted_batch_delete_maintenance(state, compound_keys) do
+        {maintenance, _deleted} =
+          Enum.reduce(compound_keys, {empty_promoted_maintenance(), MapSet.new()}, fn
+            compound_key, {maintenance, deleted} ->
+              tombstone_size = @bitcask_record_header_size + byte_size(compound_key)
+
+              old_record_size =
+                if MapSet.member?(deleted, compound_key),
+                  do: 0,
+                  else: promoted_existing_record_size(state, compound_key)
+
+              {
+                add_promoted_maintenance(
+                  maintenance,
+                  tombstone_size,
+                  old_record_size + tombstone_size,
+                  1
+                ),
+                MapSet.put(deleted, compound_key)
+              }
+          end)
+
+        maintenance
+      end
+
+      defp promoted_existing_record_size(state, compound_key) do
+        case safe_ets_lookup(state.ets, compound_key) do
+          [{^compound_key, _value, _expire_at_ms, _lfu, _file_id, _offset, value_size}]
+          when is_integer(value_size) and value_size >= 0 ->
+            @bitcask_record_header_size + byte_size(compound_key) + value_size
+
+          _other ->
+            0
         end
       end
 
-      defp run_pending_compound_promotions(state) do
-        promotions = Process.get(:sm_pending_compound_promotions, MapSet.new())
-
-        Enum.reduce(promotions, state, fn {redis_key, compound_key}, acc ->
-          maybe_promote_compound_collection(acc, redis_key, compound_key)
-        end)
+      defp empty_promoted_maintenance do
+        %{appended_bytes: 0, reclaimable_bytes: 0, writes: 0}
       end
 
-      defp maybe_promote_compound_collection(state, redis_key, compound_key) do
-        threshold = Promotion.threshold(state.instance_ctx)
+      defp add_promoted_maintenance(
+             maintenance,
+             appended_bytes,
+             reclaimable_bytes,
+             writes
+           ) do
+        %{
+          appended_bytes: maintenance.appended_bytes + appended_bytes,
+          reclaimable_bytes: maintenance.reclaimable_bytes + reclaimable_bytes,
+          writes: maintenance.writes + writes
+        }
+      end
 
-        cond do
-          threshold == 0 ->
-            state
+      defp queue_promoted_maintenance_after_flush(redis_key, maintenance) do
+        case Process.get(:sm_pending_promoted_maintenance) do
+          pending when is_map(pending) ->
+            merged =
+              Map.update(pending, redis_key, maintenance, fn current ->
+                add_promoted_maintenance(
+                  current,
+                  maintenance.appended_bytes,
+                  maintenance.reclaimable_bytes,
+                  maintenance.writes
+                )
+              end)
 
-          promoted_compound_path(state, redis_key, compound_key) != nil ->
-            state
+            Process.put(:sm_pending_promoted_maintenance, merged)
 
-          true ->
-            case {compound_type_from_key(compound_key),
-                  compound_prefix_from_key(redis_key, compound_key)} do
-              {nil, _prefix} ->
-                state
-
-              {_type, nil} ->
-                state
-
-              {type, prefix} ->
-                if Ferricstore.Store.Shard.ETS.prefix_count_entries(
-                     shard_ets_state(state),
-                     prefix
-                   ) >
-                     threshold do
-                  promote_compound_collection!(state, redis_key, type)
-                else
-                  state
-                end
-            end
+          _not_in_apply ->
+            :ok
         end
+
+        :ok
       end
 
-      defp promote_compound_collection!(state, redis_key, type) do
-        {:ok, dedicated_store} =
-          Promotion.promote_collection!(
-            type,
-            redis_key,
-            state.shard_data_path,
-            state.ets,
-            promoted_data_dir(state),
-            state.shard_index,
-            state.instance_ctx
-          )
+      defp queue_promoted_revision_puts_after_flush(keys) when is_list(keys) do
+        revision = promoted_logical_revision()
+        ops = Process.get(:sm_pending_compound_revision_ops, [])
 
-        total_bytes = Ferricstore.Store.Shard.Compound.promoted_dir_size(dedicated_store)
-
-        promoted_instances =
-          Map.put(Map.get(state, :promoted_instances, %{}), redis_key, %{
-            path: dedicated_store,
-            writes: 0,
-            total_bytes: total_bytes,
-            dead_bytes: 0,
-            last_compacted_at: nil
-          })
-
-        pending_state = apply_state_get(:pending_state, state)
-
-        apply_state_put(
-          :pending_state,
-          Map.put(pending_state, :promoted_instances, promoted_instances)
+        Process.put(
+          :sm_pending_compound_revision_ops,
+          Enum.reduce(keys, ops, fn key, acc -> [{:put, key, revision} | acc] end)
         )
 
-        Map.put(state, :promoted_instances, promoted_instances)
+        :ok
       end
 
-      defp compound_prefix_from_key(redis_key, <<"H:", _rest::binary>>),
-        do: CompoundKey.hash_prefix(redis_key)
+      defp queue_promoted_revision_put_after_flush(key),
+        do: queue_promoted_revision_puts_after_flush([key])
 
-      defp compound_prefix_from_key(redis_key, <<"S:", _rest::binary>>),
-        do: CompoundKey.set_prefix(redis_key)
+      defp queue_promoted_revision_deletes_after_flush(keys) when is_list(keys) do
+        ops = Process.get(:sm_pending_compound_revision_ops, [])
 
-      defp compound_prefix_from_key(redis_key, <<"Z:", _rest::binary>>),
-        do: CompoundKey.zset_prefix(redis_key)
+        Process.put(
+          :sm_pending_compound_revision_ops,
+          Enum.reduce(keys, ops, fn key, acc -> [{:delete, key} | acc] end)
+        )
 
-      defp compound_prefix_from_key(_redis_key, _compound_key), do: nil
+        :ok
+      end
+
+      defp queue_promoted_revision_delete_after_flush(key),
+        do: queue_promoted_revision_deletes_after_flush([key])
+
+      defp promoted_logical_revision do
+        current_ra_index() ||
+          Process.get(:sm_compound_revision_fallback) ||
+          promoted_fallback_revision()
+      end
+
+      defp promoted_fallback_revision do
+        revision = :erlang.unique_integer([:monotonic, :positive])
+        Process.put(:sm_compound_revision_fallback, revision)
+        revision
+      end
 
       defp do_promoted_compound_batch_put(state, redis_key, entries, dedicated_path) do
         Promotion.await_compaction_latch(state, redis_key)
@@ -725,6 +859,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
             {compound_key, to_disk_binary(value), expire_at_ms}
           end)
+
+        maintenance = promoted_batch_put_maintenance(state, disk_entries)
 
         case NIF.v2_append_batch(active, disk_entries) do
           {:ok, locations} when length(locations) == length(entries) ->
@@ -752,6 +888,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
               zset_index_put(state, redis_key, compound_key, disk_val)
             end)
+
+            queue_promoted_maintenance_after_flush(redis_key, maintenance)
+
+            queue_promoted_revision_puts_after_flush(
+              Enum.map(entries, fn {compound_key, _value, _expire_at_ms} -> compound_key end)
+            )
 
             :ok
 
@@ -783,23 +925,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       defp do_compound_batch_delete(_state, _redis_key, []), do: :ok
 
       defp do_compound_batch_delete(state, redis_key, compound_keys) do
-        compound_keys
-        |> Enum.chunk_by(&promoted_compound_path(state, redis_key, &1))
-        |> Enum.reduce_while(:ok, fn keys, :ok ->
-          result =
-            case promoted_compound_path(state, redis_key, hd(keys)) do
-              nil ->
-                do_shared_compound_batch_delete(state, redis_key, keys)
+        first_path = promoted_compound_path(state, redis_key, hd(compound_keys))
 
-              dedicated_path ->
-                do_promoted_compound_batch_delete(state, redis_key, keys, dedicated_path)
-            end
+        if Enum.all?(compound_keys, fn compound_key ->
+             promoted_compound_path(state, redis_key, compound_key) == first_path
+           end) do
+          case first_path do
+            nil ->
+              do_shared_compound_batch_delete(state, redis_key, compound_keys)
 
-          case result do
-            :ok -> {:cont, :ok}
-            {:error, _} = error -> {:halt, error}
+            dedicated_path ->
+              do_promoted_compound_batch_delete(
+                state,
+                redis_key,
+                compound_keys,
+                dedicated_path
+              )
           end
-        end)
+        else
+          {:error, :mixed_compound_batch_targets}
+        end
       end
 
       defp do_shared_compound_batch_delete(state, redis_key, compound_keys) do
@@ -814,7 +959,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
       defp do_shared_compound_batch_delete_fast(state, redis_key, compound_keys) do
         with true <- compound_shared_fast_path?(state),
-             {:ok, prepared} <- maybe_prepare_delete_batch_fast(state, compound_keys),
+             {:ok, prepared} <- maybe_prepare_compound_delete_batch_fast(state, compound_keys),
              true <- Process.get(:sm_pending_writes, []) == [],
              true <- Process.get(:sm_pending_values, %{}) == %{} do
           Enum.each(Enum.reverse(prepared), fn {compound_key, _prob_path} ->
@@ -827,6 +972,41 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         else
           _ -> :fallback
         end
+      end
+
+      defp maybe_prepare_compound_delete_batch_fast(state, keys) do
+        now_ms = apply_now_ms()
+
+        Enum.reduce_while(keys, {:ok, []}, fn key, {:ok, acc} ->
+          case safe_ets_lookup(state.ets, key) do
+            [{^key, _value, _expire_at_ms, _lfu, :pending, _offset, _value_size}] ->
+              {:halt, :fallback}
+
+            [{^key, _value, expire_at_ms, _lfu, _file_id, _offset, _value_size}]
+            when expire_at_ms != 0 and expire_at_ms <= now_ms ->
+              {:halt, :fallback}
+
+            [{^key, nil, _expire_at_ms, _lfu, file_id, offset, value_size}]
+            when valid_cold_location(file_id, offset, value_size) or
+                   valid_waraft_segment_location(file_id, offset, value_size) ->
+              {:cont, {:ok, [{key, nil} | acc]}}
+
+            [{^key, nil, _expire_at_ms, _lfu, file_id, offset, value_size}] ->
+              record_state_read_failure({:invalid_cold_location, {file_id, offset, value_size}})
+              {:halt, {:error, :invalid_cold_location}}
+
+            [{^key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}]
+            when is_binary(value) ->
+              {:cont, {:ok, [{key, nil} | acc]}}
+
+            [] ->
+              {:cont, {:ok, [{key, nil} | acc]}}
+
+            invalid ->
+              record_state_read_failure({:invalid_keydir_entry, key, invalid})
+              {:halt, {:error, :invalid_keydir_entry}}
+          end
+        end)
       end
 
       defp do_shared_compound_batch_delete_generic(state, redis_key, compound_keys) do
@@ -847,11 +1027,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
         active = Promotion.find_active(dedicated_path)
         ops = Enum.map(compound_keys, &{:delete, &1})
+        maintenance = promoted_batch_delete_maintenance(state, compound_keys)
 
-        case NIF.v2_append_ops_batch_nosync(active, ops) do
+        case NIF.v2_append_ops_batch(active, ops) do
           {:ok, locations} ->
-            with :ok <- validate_promoted_tombstone_batch(locations, length(compound_keys)),
-                 :ok <- NIF.v2_fsync(active) do
+            with :ok <- validate_promoted_tombstone_batch(locations, length(compound_keys)) do
               deleted =
                 Enum.reduce(compound_keys, Process.get(:tx_deleted_keys, MapSet.new()), fn
                   compound_key, acc ->
@@ -869,6 +1049,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
                 end)
 
               Process.put(:tx_deleted_keys, deleted)
+              queue_promoted_maintenance_after_flush(redis_key, maintenance)
+              queue_promoted_revision_deletes_after_flush(compound_keys)
               :ok
             end
 
@@ -896,52 +1078,60 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
       defp valid_promoted_tombstone_location?(_location), do: false
 
-      defp maybe_delete_empty_compound_type_key_after_pop(
-             _state,
-             _redis_key,
-             _total_member_count,
-             0
-           ),
-           do: :ok
-
-      defp maybe_delete_empty_compound_type_key_after_pop(
-             state,
-             redis_key,
-             total_member_count,
-             selected_count
-           ) do
-        if selected_count >= total_member_count do
-          do_compound_delete(state, redis_key, CompoundKey.type_key(redis_key))
-        else
-          :ok
-        end
-      end
-
       defp do_compound_delete_prefix(state, redis_key, prefix) do
-        result =
-          case promoted_compound_path(state, redis_key, prefix) do
-            nil ->
-              do_delete_prefix(state, prefix)
-
-            _dedicated_path ->
-              Promotion.await_compaction_latch(state, redis_key)
-              delete_compound_prefix_from_ets(state, prefix)
-
-              Promotion.cleanup_promoted!(
-                redis_key,
-                state.shard_data_path,
-                state.ets,
-                state.data_dir,
-                state.shard_index,
-                Map.get(state, :instance_ctx) || Map.get(state, :instance_name)
-              )
-          end
+        cleanup_target = promoted_prefix_cleanup_target(state, redis_key, prefix)
+        result = do_compound_member_prefix_delete(state, redis_key, prefix)
 
         if result == :ok do
+          cleanup_promoted_prefix!(state, redis_key, cleanup_target)
           zset_index_clear(state, redis_key)
         end
 
         result
+      end
+
+      defp promoted_prefix_cleanup_target(state, redis_key, prefix) do
+        with type when type in [:hash, :set, :zset] <-
+               exact_compound_prefix_type(redis_key, prefix),
+             dedicated_path when is_binary(dedicated_path) <-
+               promoted_compound_path(state, redis_key, prefix) do
+          {type, dedicated_path}
+        else
+          _not_an_exact_promoted_prefix -> nil
+        end
+      end
+
+      defp exact_compound_prefix_type(redis_key, prefix) do
+        cond do
+          prefix == CompoundKey.hash_prefix(redis_key) -> :hash
+          prefix == CompoundKey.set_prefix(redis_key) -> :set
+          prefix == CompoundKey.zset_prefix(redis_key) -> :zset
+          true -> nil
+        end
+      end
+
+      defp cleanup_promoted_prefix!(_state, _redis_key, nil), do: :ok
+
+      defp cleanup_promoted_prefix!(state, redis_key, {type, dedicated_path}) do
+        :ok =
+          Promotion.cleanup_promoted!(
+            redis_key,
+            type,
+            dedicated_path,
+            state.shard_data_path,
+            state.ets,
+            state.data_dir,
+            state.shard_index,
+            state.instance_ctx
+          )
+
+        record_promoted_instance_removal(redis_key)
+        queue_compound_promotion_removal_after_flush(Promotion.marker_key(redis_key))
+      end
+
+      defp record_promoted_instance_removal(redis_key) do
+        removals = apply_state_get(:promoted_instance_removals, MapSet.new())
+        apply_state_put(:promoted_instance_removals, MapSet.put(removals, redis_key))
       end
 
       defp do_promoted_compound_put(
@@ -958,6 +1148,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         disk_val = to_disk_binary(value)
         active = Promotion.find_active(dedicated_path)
         fid = parse_fid_from_path(active)
+        maintenance = promoted_put_maintenance(state, compound_key, disk_val)
 
         case NIF.v2_append_record(active, compound_key, disk_val, expire_at_ms) do
           {:ok, {offset, _record_size}} ->
@@ -977,6 +1168,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             if MapSet.member?(deleted, compound_key) do
               Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
             end
+
+            queue_promoted_maintenance_after_flush(redis_key, maintenance)
+            queue_promoted_revision_put_after_flush(compound_key)
 
             :ok
 

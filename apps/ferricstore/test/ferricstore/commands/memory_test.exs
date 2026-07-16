@@ -44,6 +44,26 @@ defmodule Ferricstore.Commands.MemoryTest do
       assert result > 0
     end
 
+    test "SAMPLES is case-insensitive and accepts zero" do
+      store = MockStore.make(%{"mykey" => {"value", 0}})
+
+      assert is_integer(Memory.handle("USAGE", ["mykey", "samples", "0"], store))
+    end
+
+    test "rejects malformed options before reading the key" do
+      store = %{value_size: fn _key -> flunk("invalid options must not read storage") end}
+
+      for args <- [
+            ["mykey", "SAMPLES"],
+            ["mykey", "SAMPLES", "-1"],
+            ["mykey", "SAMPLES", "nope"],
+            ["mykey", "UNKNOWN", "5"],
+            ["mykey", "SAMPLES", "5", "extra"]
+          ] do
+        assert {:error, _message} = Memory.handle("USAGE", args, store)
+      end
+    end
+
     test "uses stored value size without loading cold value" do
       store = %{
         value_size: fn "cold" -> 10_000 end,

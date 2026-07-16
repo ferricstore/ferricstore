@@ -47,11 +47,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp do_promoted_compound_delete(state, redis_key, compound_key, dedicated_path) do
         Promotion.await_compaction_latch(state, redis_key)
 
-        track_keydir_binary_remove(state, compound_key)
         active = Promotion.find_active(dedicated_path)
+        maintenance = promoted_delete_maintenance(state, compound_key)
 
         case NIF.v2_append_tombstone(active, compound_key) do
           {:ok, _offset} ->
+            track_keydir_binary_remove(state, compound_key)
             :ets.delete(state.ets, compound_key)
 
             CompoundMemberIndex.delete(
@@ -62,6 +63,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
             sm_tx_drop_pending(compound_key)
             deleted = Process.get(:tx_deleted_keys, MapSet.new())
             Process.put(:tx_deleted_keys, MapSet.put(deleted, compound_key))
+            queue_promoted_maintenance_after_flush(redis_key, maintenance)
+            queue_promoted_revision_delete_after_flush(compound_key)
             :ok
 
           {:error, _reason} = err ->
@@ -128,6 +131,47 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp queue_zset_index_delete_after_flush(_state, _redis_key, _key), do: :ok
+
+      defp queue_compound_indexes_put_after_flush(state, redis_key, compound_key, value) do
+        _ = queue_compound_member_index_op(state, {:put, compound_key})
+        _ = maybe_queue_zset_ready_empty_after_flush(state, redis_key, compound_key, value)
+        _ = queue_zset_index_put_after_flush(state, redis_key, compound_key, value)
+        :ok
+      end
+
+      defp queue_compound_indexes_delete_after_flush(state, redis_key, compound_key) do
+        _ = queue_compound_member_index_op(state, {:delete, compound_key})
+        _ = queue_zset_index_delete_after_flush(state, redis_key, compound_key)
+        :ok
+      end
+
+      defp queue_compound_member_index_op(
+             %{compound_member_index_name: index},
+             {operation, compound_key}
+           )
+           when index != nil and operation in [:put, :delete] do
+        pending = Process.get(:sm_pending_compound_member_index_ops, [])
+
+        Process.put(:sm_pending_compound_member_index_ops, [
+          {operation, index, compound_key} | pending
+        ])
+
+        :ok
+      end
+
+      defp queue_compound_member_index_op(_state, _operation), do: :ok
+
+      defp flush_pending_compound_member_indexes do
+        :sm_pending_compound_member_index_ops
+        |> Process.put([])
+        |> Enum.reverse()
+        |> Enum.each(fn
+          {:put, index, compound_key} -> CompoundMemberIndex.put(index, compound_key)
+          {:delete, index, compound_key} -> CompoundMemberIndex.delete(index, compound_key)
+        end)
+
+        :ok
+      end
 
       defp maybe_queue_zset_ready_empty_after_flush(state, redis_key, compound_key, value) do
         if compound_key == CompoundKey.type_key(redis_key) and to_disk_binary(value) == "zset" do
@@ -205,6 +249,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
+      defp queue_stream_cache_cleanup({_scope, key} = cache_key) when is_binary(key) do
+        pending = Process.get(:sm_pending_stream_cache_cleanups, MapSet.new())
+        Process.put(:sm_pending_stream_cache_cleanups, MapSet.put(pending, cache_key))
+        :ok
+      end
+
+      defp flush_pending_stream_cache_cleanups do
+        pending = Process.put(:sm_pending_stream_cache_cleanups, MapSet.new())
+
+        Enum.each(pending, fn {scope, key} ->
+          Ferricstore.Commands.Strings.Delete.cleanup_stream_metadata(key, %{cache_scope: scope})
+        end)
+
+        :ok
+      end
+
       defp apply_pending_zset_index_op({:put, index, lookup, redis_key, key, value}) do
         apply_zset_index_put(index, lookup, redis_key, key, value)
       end
@@ -266,34 +326,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
-      defp delete_compound_prefix_from_ets(state, prefix) do
-        prefix_len = byte_size(prefix)
-
-        match_spec = [
-          {{:"$1", :_, :_, :_, :_, :_, :_},
-           [
-             {:andalso, {:is_binary, :"$1"},
-              {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
-           ], [:"$1"]}
-        ]
-
-        state.ets
-        |> :ets.select(match_spec)
-        |> Enum.each(fn key ->
-          track_keydir_binary_remove(state, key)
-          :ets.delete(state.ets, key)
-          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
-          sm_tx_drop_pending(key)
-          deleted = Process.get(:tx_deleted_keys, MapSet.new())
-          Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
-        end)
-
-        :ok
-      end
-
       defp maybe_clear_compound_data_structure_for_string_put(state, key) do
-        unless Ferricstore.Store.CompoundKey.internal_key?(key) do
+        if Ferricstore.Store.CompoundKey.internal_key?(key) do
+          :ok
+        else
           type_key = Ferricstore.Store.CompoundKey.type_key(key)
 
           case string_put_compound_marker(state, type_key) do
@@ -301,12 +337,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
               :ok
 
             type ->
-              clear_compound_prefix_for_string_put(state, key, type)
-              do_delete(state, type_key)
+              with :ok <- clear_compound_prefix_for_string_put(state, key, type) do
+                do_delete(state, type_key)
+              end
           end
         end
-
-        :ok
       end
 
       defp string_put_compound_marker(state, type_key) do
@@ -340,18 +375,39 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp clear_compound_prefix_for_string_put(state, key, "hash"),
-        do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.hash_prefix(key))
+        do:
+          do_compound_delete_prefix(
+            state,
+            key,
+            Ferricstore.Store.CompoundKey.hash_prefix(key)
+          )
 
       defp clear_compound_prefix_for_string_put(state, key, "list") do
-        do_delete_prefix(state, Ferricstore.Store.CompoundKey.list_prefix(key))
-        do_delete(state, Ferricstore.Store.CompoundKey.list_meta_key(key))
+        with :ok <-
+               do_compound_delete_prefix(
+                 state,
+                 key,
+                 Ferricstore.Store.CompoundKey.list_prefix(key)
+               ) do
+          do_compound_delete(state, key, Ferricstore.Store.CompoundKey.list_meta_key(key))
+        end
       end
 
       defp clear_compound_prefix_for_string_put(state, key, "set"),
-        do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.set_prefix(key))
+        do:
+          do_compound_delete_prefix(
+            state,
+            key,
+            Ferricstore.Store.CompoundKey.set_prefix(key)
+          )
 
       defp clear_compound_prefix_for_string_put(state, key, "zset"),
-        do: do_delete_prefix(state, Ferricstore.Store.CompoundKey.zset_prefix(key))
+        do:
+          do_compound_delete_prefix(
+            state,
+            key,
+            Ferricstore.Store.CompoundKey.zset_prefix(key)
+          )
 
       defp clear_compound_prefix_for_string_put(_state, _key, _type), do: :ok
 
@@ -582,12 +638,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
-      # Returns the file path for a probabilistic data structure file.
-      # Uses Base64 URL-safe encoding to handle arbitrary key bytes.
       defp prob_path(state, key, ext) do
-        safe = Base.url_encode64(key, padding: false)
-        prob_dir = prob_dir(state)
-        Path.join(prob_dir, "#{safe}.#{ext}")
+        Ferricstore.ProbFile.path(prob_dir(state), key, ext)
       end
 
       defp cms_source_paths(state, src_keys) do
@@ -595,8 +647,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp prob_path_for_key(state, key, ext) do
-        safe = Base.url_encode64(key, padding: false)
-
         prob_dir =
           case instance_ctx_for_state(state) do
             %FerricStore.Instance{} = ctx ->
@@ -608,7 +658,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
               prob_dir(state)
           end
 
-        Path.join(prob_dir, "#{safe}.#{ext}")
+        Ferricstore.ProbFile.path(prob_dir, key, ext)
       end
 
       # Returns the prob directory for this shard.
@@ -666,7 +716,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
                  path,
                  NIF.bloom_file_create(path, num_bits, num_hashes)
                ) do
-          do_put(state, key, :erlang.term_to_binary(bloom_meta_with_path(prob_meta, path)), 0)
+          do_put(
+            state,
+            key,
+            Ferricstore.TermCodec.encode(bloom_meta_with_path(prob_meta, path)),
+            0
+          )
+
           :ok
         end
       end
@@ -683,7 +739,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         with :ok <- ensure_prob_dir(state),
              :ok <- prob_create_and_fsync(state, path, NIF.cms_file_create(path, width, depth)) do
           meta_val = {:cms_meta, %{width: width, depth: depth}}
-          do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+          do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
           :ok
         end
       end
@@ -701,7 +757,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
                    NIF.cms_file_create(dst_path, width, depth)
                  ) do
             meta_val = {:cms_meta, %{width: width, depth: depth}}
-            do_put(state, dst_key, :erlang.term_to_binary(meta_val), 0)
+            do_put(state, dst_key, Ferricstore.TermCodec.encode(meta_val), 0)
             :ok
           end
         end
@@ -718,12 +774,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
                  NIF.cuckoo_file_create(path, capacity, bucket_size)
                ) do
           meta_val = {:cuckoo_meta, %{capacity: capacity}}
-          do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+          do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
           :ok
         end
       end
 
-      defp create_topk_metadata(state, key, k, width, depth, decay) do
+      defp create_topk_metadata(state, key, k, width, depth) do
         path = prob_path(state, key, "topk")
 
         with :ok <- ensure_prob_dir(state),
@@ -731,10 +787,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
                prob_create_and_fsync(
                  state,
                  path,
-                 NIF.topk_file_create_v2(path, k, width, depth, decay)
+                 NIF.topk_file_create_v2(path, k, width, depth)
                ) do
-          meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
-          do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+          meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth}}
+          do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
           :ok
         end
       end
@@ -808,7 +864,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
 
             with :ok <- prob_create_and_fsync(state, path, NIF.bloom_file_create(path, nb, nh)) do
               meta_val = {:bloom_meta, Map.merge(auto_create_params, %{path: path})}
-              do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+              do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
               :ok
             end
 
@@ -836,7 +892,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
 
             with :ok <- prob_create_and_fsync(state, path, NIF.cuckoo_file_create(path, cap, bs)) do
               meta_val = {:cuckoo_meta, %{capacity: cap}}
-              do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+              do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
               :ok
             end
 
@@ -853,17 +909,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
             nil
 
           value when is_binary(value) ->
-            try do
-              case :erlang.binary_to_term(value, [:safe]) do
-                {:bloom_meta, %{path: path}} -> path
-                {:cms_meta, _} -> prob_path(state, key, "cms")
-                {:cuckoo_meta, _} -> prob_path(state, key, "cuckoo")
-                {:topk_meta, %{path: path}} -> path
-                _ -> nil
-              end
-            rescue
-              _ -> nil
-            end
+            prob_file_path_from_delete_value(state, key, value)
 
           _ ->
             nil

@@ -40,6 +40,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
       }
 
       alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.LogicalKeyIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -98,6 +99,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
               end
           end
 
+        {default_logical_key_index, default_logical_key_slots} =
+          LogicalKeyIndex.table_names(
+            Map.get(config, :instance_name, :default),
+            config.shard_index
+          )
+
+        logical_key_index_name =
+          Map.get(config, :logical_key_index_name, default_logical_key_index)
+
+        logical_key_slots_name =
+          Map.get(config, :logical_key_slots_name, default_logical_key_slots)
+
+        LogicalKeyIndex.ensure_tables!(logical_key_index_name, logical_key_slots_name)
+
         %{
           shard_index: config.shard_index,
           shard_data_path: config.shard_data_path,
@@ -108,6 +123,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
           data_dir: data_dir,
           data_dir_expanded: Path.expand(data_dir),
           instance_ctx: instance_ctx,
+          promoted_instances: Map.get(config, :promoted_instances, %{}),
           apply_context: apply_context,
           apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(apply_context),
           instance_name: Map.get(config, :instance_name, :default),
@@ -137,6 +153,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
                 Map.get(config, :instance_name, :default),
                 config.shard_index
               ),
+          compound_revision_index_name: compound_revision_index_name(config),
+          logical_key_index_name: logical_key_index_name,
+          logical_key_slots_name: logical_key_slots_name,
           flow_index_name:
             Map.get(config, :flow_index_name) ||
               elem(
@@ -160,6 +179,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
               Ferricstore.Flow.LMDB.path(config.shard_data_path)
             end),
           flow_lmdb_mirror?: false,
+          flow_hibernation_promotion_cursor: nil,
           active_file_size:
             Map.get_lazy(config, :active_file_size, fn ->
               file_size_or_zero(config.active_file_path)
@@ -197,9 +217,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
           # Cross-shard operation locks and intents — persisted in Raft state
           # so they survive shard restarts, snapshots, and leader failovers.
           cross_shard_locks: %{},
+          cross_shard_lock_expiries: :gb_trees.empty(),
           cross_shard_intents: %{}
         }
         |> ensure_flow_native_index_registered()
+      end
+
+      defp compound_revision_index_name(config) do
+        table =
+          Map.get(config, :compound_revision_index_name) ||
+            Ferricstore.Store.Shard.CompoundRevisionIndex.table_name(
+              Map.get(config, :instance_name, :default),
+              config.shard_index
+            )
+
+        Ferricstore.Store.Shard.CompoundRevisionIndex.ensure_table!(table)
       end
 
       @doc """

@@ -27,7 +27,7 @@ defmodule FerricStore.API.Bitmap do
   @spec setbit(key(), non_neg_integer(), 0 | 1) :: {:ok, 0 | 1} | {:error, binary()}
   def setbit(key, offset, bit_value) when bit_value in [0, 1] do
     cond do
-      offset < 0 ->
+      not is_integer(offset) or offset < 0 ->
         {:error, "ERR bit offset is not an integer or out of range"}
 
       offset > 4_294_967_295 ->

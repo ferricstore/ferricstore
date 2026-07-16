@@ -23,6 +23,12 @@ struct FrameSlice<'a> {
     body: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactClaimMode {
+    Base,
+    State,
+}
+
 // One pass may still copy one configured max-size frame, which can exceed a normal scheduler slice.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn decode_frames<'a>(
@@ -110,7 +116,7 @@ fn encode_frame<'a>(
     Ok(Binary::from_owned(out, env).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn encode_compact_claim_jobs_response_frame<'a>(
     env: Env<'a>,
     opcode: u16,
@@ -126,7 +132,7 @@ fn encode_compact_claim_jobs_response_frame<'a>(
     Ok(Binary::from_owned(frame, env).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn encode_compact_ok_list_response_frame<'a>(
     env: Env<'a>,
     opcode: u16,
@@ -142,7 +148,7 @@ fn encode_compact_ok_list_response_frame<'a>(
     Ok(Binary::from_owned(frame, env).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn encode_compact_kv_get_response_frame<'a>(
     env: Env<'a>,
     opcode: u16,
@@ -294,6 +300,7 @@ fn build_compact_claim_jobs_response_frame<'a>(
     payload.extend_from_slice(&0u32.to_be_bytes());
 
     let mut count = 0u32;
+    let mut mode: Option<CompactClaimMode> = None;
 
     for job in &mut jobs_iter {
         let mut fields: ListIterator<'a> = job.decode().ok()?;
@@ -301,9 +308,20 @@ fn build_compact_claim_jobs_response_frame<'a>(
         let partition = fields.next()?.decode::<Option<Binary<'a>>>().ok()?;
         let lease = fields.next()?.decode::<Binary<'a>>().ok()?;
         let fencing = fields.next()?.decode::<i64>().ok()?;
-
+        let (run_state, job_mode) = match fields.next() {
+            Some(value) => (
+                Some(value.decode::<Option<Binary<'a>>>().ok()?),
+                CompactClaimMode::State,
+            ),
+            None => (None, CompactClaimMode::Base),
+        };
         if fields.next().is_some() {
             return None;
+        }
+        match mode {
+            Some(expected) if expected != job_mode => return None,
+            None => mode = Some(job_mode),
+            _ => {}
         }
 
         append_compact_binary(&mut payload, id.as_slice())?;
@@ -313,6 +331,12 @@ fn build_compact_claim_jobs_response_frame<'a>(
         )?;
         append_compact_binary(&mut payload, lease.as_slice())?;
         payload.extend_from_slice(&fencing.to_be_bytes());
+        if let Some(run_state) = run_state {
+            append_compact_optional_binary(
+                &mut payload,
+                run_state.as_ref().map(|value| value.as_slice()),
+            )?;
+        }
         count = count.checked_add(1)?;
     }
 

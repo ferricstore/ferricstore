@@ -30,7 +30,10 @@ defmodule Ferricstore.Merge.Manifest do
 
   require Logger
 
+  alias Ferricstore.TermCodec
+
   @manifest_filename "merge_manifest.bin"
+  @max_manifest_bytes 64 * 1_024
 
   @type merge_plan :: %{
           shard_index: non_neg_integer(),
@@ -70,7 +73,7 @@ defmodule Ferricstore.Merge.Manifest do
         version: 1
       })
 
-    binary = :erlang.term_to_binary(term)
+    binary = TermCodec.encode(term)
 
     with :ok <- File.write(tmp_path, binary),
          :ok <- Ferricstore.FS.rename(tmp_path, manifest_path),
@@ -106,22 +109,39 @@ defmodule Ferricstore.Merge.Manifest do
   def read(data_dir) do
     path = manifest_path(data_dir)
 
-    if Ferricstore.FS.exists?(path) do
-      case File.read(path) do
-        {:ok, binary} ->
-          try do
-            {:ok, :erlang.binary_to_term(binary, [:safe])}
-          rescue
-            ArgumentError -> {:error, :corrupt_manifest}
-          end
+    case Ferricstore.FS.read_nofollow(path, @max_manifest_bytes) do
+      {:ok, binary} ->
+        with {:ok, plan} <- TermCodec.decode(binary),
+             true <- valid_plan?(plan) do
+          {:ok, plan}
+        else
+          _invalid -> {:error, :corrupt_manifest}
+        end
 
-        {:error, reason} ->
-          {:error, reason}
-      end
-    else
-      :none
+      {:error, {:not_found, _message}} ->
+        :none
+
+      {:error, {kind, _message}} when kind in [:symlink, :too_large] ->
+        {:error, :corrupt_manifest}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
+
+  defp valid_plan?(%{
+         version: 1,
+         shard_index: shard_index,
+         input_file_ids: input_file_ids,
+         started_at: started_at
+       })
+       when is_integer(shard_index) and shard_index >= 0 and is_list(input_file_ids) and
+              input_file_ids != [] and is_integer(started_at) and started_at >= 0 do
+    Enum.all?(input_file_ids, &(is_integer(&1) and &1 >= 0)) and
+      length(input_file_ids) == length(Enum.uniq(input_file_ids))
+  end
+
+  defp valid_plan?(_plan), do: false
 
   @doc """
   Removes the merge manifest file. Called after a merge completes successfully

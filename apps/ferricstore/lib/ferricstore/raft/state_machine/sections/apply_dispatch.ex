@@ -15,6 +15,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
       alias Ferricstore.Raft.BlobCommand
+      alias Ferricstore.Raft.CommandStamp
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
@@ -22,7 +23,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.RetryPolicy
+      alias Ferricstore.Flow.SharedRefBackfill
       alias Ferricstore.HLC
+      alias Ferricstore.ServerCatalog
 
       alias Ferricstore.Store.{
         BitcaskWriter,
@@ -36,13 +39,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         ListOps,
         Promotion,
         Router,
+        TypeRegistry,
         ValueCodec
       }
 
       alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
+
+      @flush_shard_page_size 512
 
       def apply(%{index: idx} = meta, _command, %{skip_below_index: skip} = state)
           when skip > 0 and idx <= skip do
@@ -56,9 +63,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         maybe_release_cursor(meta, old_count, new_state, :ok)
       end
 
+      def apply(%{index: idx} = meta, command, %{skip_below_index: skip} = state)
+          when skip > 0 and idx > skip do
+        __MODULE__.apply(meta, command, %{state | skip_below_index: 0})
+      end
+
       # Unwrap pre-serialized commands produced by the write Batcher.
       def apply(meta, {:ttb, binary}, state) when is_binary(binary) do
-        __MODULE__.apply(meta, :erlang.binary_to_term(binary, [:safe]), state)
+        case CommandStamp.decode_ttb(binary) do
+          {:ok, decoded} -> __MODULE__.apply(meta, decoded, state)
+          {:error, :invalid_preencoded_command} = error -> {state, error}
+        end
       end
 
       def apply(meta, {:ferricstore_latency_trace, inner_command}, state) do
@@ -115,6 +130,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:flow_policy_allocate, key, value, expire_at_ms}, state) do
+        apply_flow_pending_with_time(meta, state, :flow_policy_allocate, %{items: 1}, fn ->
+          do_flow_policy_allocate(state, key, value, expire_at_ms)
+        end)
+      end
+
+      def apply(meta, {:flow_policy_fence, installs, command}, state)
+          when is_list(installs) and is_tuple(command) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_flow_policy_fence(state, installs, command)
+        end)
+      end
+
       def apply(meta, {:flow_policy_attribute_catalog_repair_request, key, name}, state) do
         apply_flow_pending_with_time(
           meta,
@@ -137,7 +165,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       end
 
       def apply(meta, {:flow_policy_migration_step, plan}, state) when is_map(plan) do
-        item_count = plan |> Map.get(:catalog_entries, []) |> length()
+        item_count = telemetry_list_size(Map.get(plan, :catalog_entries, []))
 
         apply_flow_pending_with_time(
           meta,
@@ -216,7 +244,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:flow_policy_catalog_backfill_step, request}, state)
           when is_map(request) do
-        item_count = request |> Map.get(:candidates, []) |> length()
+        item_count = telemetry_list_size(Map.get(request, :candidates, []))
 
         apply_flow_pending_with_time(
           meta,
@@ -351,6 +379,64 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:expire_if_batch, entries}, state) when is_list(entries) do
+        apply_pending_with_time(meta, state, fn ->
+          do_expire_if_batch(state, entries, apply_now_ms())
+        end)
+      end
+
+      defp do_expire_if_batch(state, entries, now_ms) do
+        matched_keys =
+          Enum.reduce(entries, MapSet.new(), fn
+            {key, expected_expire_at_ms}, acc
+            when is_binary(key) and is_integer(expected_expire_at_ms) and
+                   expected_expire_at_ms > 0 and expected_expire_at_ms <= now_ms ->
+              redis_key = CompoundKey.extract_redis_key(key)
+
+              case {:ets.lookup(state.ets, key), check_key_lock(state, redis_key, nil)} do
+                {[{^key, _value, ^expected_expire_at_ms, _lfu, _file_id, _offset, _value_size}],
+                 :ok} ->
+                  MapSet.put(acc, key)
+
+                _stale_or_locked ->
+                  acc
+              end
+
+            _invalid, acc ->
+              acc
+          end)
+
+        with :ok <- expire_matching_plain_keys(state, matched_keys),
+             :ok <- expire_matching_compound_keys(state, matched_keys) do
+          Enum.map(entries, fn {key, _expire_at_ms} -> MapSet.member?(matched_keys, key) end)
+        end
+      end
+
+      defp expire_matching_plain_keys(state, matched_keys) do
+        Enum.reduce_while(matched_keys, :ok, fn key, :ok ->
+          if CompoundKey.internal_key?(key) do
+            {:cont, :ok}
+          else
+            case do_delete(state, key) do
+              :ok -> {:cont, :ok}
+              {:error, _reason} = error -> {:halt, error}
+            end
+          end
+        end)
+      end
+
+      defp expire_matching_compound_keys(state, matched_keys) do
+        matched_keys
+        |> Enum.filter(&CompoundKey.internal_key?/1)
+        |> Enum.group_by(&CompoundKey.extract_redis_key/1)
+        |> Enum.reduce_while(:ok, fn {redis_key, keys}, :ok ->
+          case do_compound_batch_delete(state, redis_key, keys) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
       def apply(meta, {:put_batch, entries}, state) when is_list(entries) do
         with_apply_time(meta, fn ->
           old_count = state.applied_count
@@ -361,6 +447,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
             end)
 
           finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
+        end)
+      end
+
+      def apply(meta, {:mset, entries}, state) when is_list(entries) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_atomic_string_batch(state, entries, :mset, :plain)
+        end)
+      end
+
+      def apply(meta, {:mset_blob_batch, entries}, state) when is_list(entries) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_atomic_string_batch(state, entries, :mset, :blob)
+        end)
+      end
+
+      def apply(meta, {:msetnx, entries}, state) when is_list(entries) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_atomic_string_batch(state, entries, :msetnx, :plain)
+        end)
+      end
+
+      def apply(meta, {:msetnx_blob_batch, entries}, state) when is_list(entries) do
+        apply_pending_with_time(meta, state, fn ->
+          apply_atomic_string_batch(state, entries, :msetnx, :blob)
         end)
       end
 
@@ -377,6 +487,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:flush_shard, {physical_ms, logical}}, state)
+          when is_integer(physical_ms) and physical_ms >= 0 and is_integer(logical) and
+                 logical >= 0 do
+        with_apply_time(meta, fn ->
+          old_count = state.applied_count
+          flush_state = abort_flush_shard_transactions(state)
+          result = apply_flush_shard(flush_state)
+
+          new_state =
+            case result do
+              {:ok, _deleted} -> flush_state
+              {:error, _reason} -> state
+            end
+            |> Map.put(:applied_count, old_count + 1)
+
+          maybe_release_cursor(meta, old_count, new_state, result)
+        end)
+      end
+
       def apply(meta, {:delete_batch, keys}, state) when is_list(keys) do
         with_apply_time(meta, fn ->
           old_count = state.applied_count
@@ -390,6 +519,76 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      defp apply_flush_shard(state) do
+        try do
+          :ets.safe_fixtable(state.ets, true)
+
+          try do
+            match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
+
+            case apply_flush_shard_pages(
+                   state,
+                   :ets.select(state.ets, match_spec, @flush_shard_page_size),
+                   0
+                 ) do
+              {:ok, deleted} ->
+                _reset = CompoundMemberIndex.reset(Map.get(state, :compound_member_index_name))
+                _state = ZSetIndex.reset(state)
+                {:ok, deleted}
+
+              {:error, _reason} = error ->
+                error
+            end
+          after
+            :ets.safe_fixtable(state.ets, false)
+          end
+        rescue
+          error in ArgumentError -> {:error, {:flush_shard_keydir_unavailable, error}}
+        end
+      end
+
+      defp abort_flush_shard_transactions(state) do
+        state
+        |> Map.put(:cross_shard_locks, %{})
+        |> Map.put(:cross_shard_intents, %{})
+        |> Map.put(:cross_shard_lock_expiries, {0, nil})
+      end
+
+      defp apply_flush_shard_pages(_state, :"$end_of_table", deleted), do: {:ok, deleted}
+
+      defp apply_flush_shard_pages(state, {keys, continuation}, deleted) do
+        delete_keys = Enum.reject(keys, &flush_shard_preserved_key?(state, &1))
+
+        with {:ok, page_deleted} <- apply_flush_shard_page(state, delete_keys) do
+          apply_flush_shard_pages(state, :ets.select(continuation), deleted + page_deleted)
+        end
+      end
+
+      defp apply_flush_shard_page(_state, []), do: {:ok, 0}
+
+      defp apply_flush_shard_page(state, keys) do
+        case with_pending_writes(state, fn -> apply_delete_batch_keys(state, keys) end) do
+          results when is_list(results) ->
+            if length(results) == length(keys) and Enum.all?(results, &(&1 == :ok)) do
+              {:ok, length(keys)}
+            else
+              {:error, {:flush_shard_delete_failed, results}}
+            end
+
+          {:error, _reason} = error ->
+            error
+
+          other ->
+            {:error, {:flush_shard_delete_failed, other}}
+        end
+      end
+
+      defp flush_shard_preserved_key?(state, key) do
+        ServerCatalog.internal_key?(key) or
+          key == FlowKeys.shared_value_ref_backfill_key(state.shard_index) or
+          key == SharedRefBackfill.progress_key(state.shard_index)
+      end
+
       def apply(meta, {:delete_prefix, prefix}, state) when is_binary(prefix) do
         with_apply_time(meta, fn ->
           result = with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
@@ -400,7 +599,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
-      def apply(meta, {:batch, commands}, state) do
+      def apply(meta, {:batch, commands}, state) when is_list(commands) do
         with_apply_time(meta, fn ->
           commands = normalize_generic_batch_commands(commands)
           old_count = state.applied_count
@@ -409,23 +608,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           # All commands in a batch share one pending-writes buffer so they
           # are flushed in a single v2_append_batch_nosync NIF call.
           write_result =
-            case prepare_apply_blob_command(state, {:batch, commands}) do
-              {:ok, {:batch, prepared_commands}} ->
-                with_pending_writes(state, fn ->
-                  Enum.map_reduce(prepared_commands, old_count, fn cmd, count ->
-                    result = apply_single(state, cmd)
-                    {result, count + 1}
-                  end)
-                end)
+            case generic_batch_barrier_kind(commands) do
+              nil ->
+                case prepare_apply_blob_command(state, {:batch, commands}) do
+                  {:ok, {:batch, prepared_commands}} ->
+                    with_pending_writes(state, fn ->
+                      Enum.map_reduce(prepared_commands, old_count, fn cmd, count ->
+                        result = apply_single(state, cmd)
+                        {result, count + 1}
+                      end)
+                    end)
 
-              {:ok, prepared_command} ->
-                with_pending_writes(state, fn ->
-                  result = apply_single(state, prepared_command)
-                  {List.wrap(result), old_count + applied_increment}
-                end)
+                  {:ok, prepared_command} ->
+                    with_pending_writes(state, fn ->
+                      result = apply_single(state, prepared_command)
+                      {List.wrap(result), old_count + applied_increment}
+                    end)
 
-              {:error, _reason} = error ->
-                error
+                  {:error, _reason} = error ->
+                    error
+                end
+
+              barrier_kind ->
+                {:error, {:batch_barrier_command, barrier_kind}}
             end
 
           case write_result do
@@ -440,12 +645,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
-      def apply(meta, {:cross_shard_tx, shard_batches, watched_keys}, state)
-          when is_map(watched_keys) do
-        apply_cross_shard_tx(meta, shard_batches, watched_keys, state)
+      defp generic_batch_barrier_kind(commands) do
+        Enum.find_value(commands, &Ferricstore.Raft.CommandBatching.barrier_kind/1)
       end
 
-      def apply(meta, {:cross_shard_tx, shard_batches}, state) do
+      defp telemetry_list_size(items) when is_list(items), do: length(items)
+      defp telemetry_list_size(_invalid), do: 0
+
+      def apply(meta, {:cross_shard_tx, shard_batches}, state) when is_list(shard_batches) do
         apply_cross_shard_tx(meta, shard_batches, %{}, state)
       end
 
@@ -457,10 +664,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         {state, Ferricstore.LatencyTrace.wrap_result(result, trace), effects}
       end
 
-      # Legacy: list operations used to be sent as a single {:list_op} Raft entry
-      # containing the entire operation. Now lists use compound keys (L:key\0pos)
-      # and individual {:put}/{:delete} entries. This handler remains for WAL
-      # replay of entries written before the compound-key migration.
+      # Router.list_op/3 submits this canonical Raft command. Apply translates
+      # the logical operation into compound list rows inside one pending-write scope.
       def apply(meta, {:list_op, key, operation}, state) do
         with_apply_time(meta, fn ->
           result = with_pending_writes(state, fn -> do_checked_list_op(state, key, operation) end)
@@ -537,6 +742,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       def apply(meta, {:zrem_single, key, member}, state) do
         apply_pending_with_time(meta, state, fn ->
           apply_single(state, {:zrem_single, key, member})
+        end)
+      end
+
+      def apply(meta, {:compound_type_claim, redis_key, type}, state)
+          when is_binary(redis_key) and type in [:hash, :list, :set, :zset, :stream] do
+        with_apply_time(meta, fn ->
+          result =
+            case check_key_lock(state, redis_key, nil) do
+              :ok ->
+                with_pending_writes(state, fn ->
+                  TypeRegistry.serialized_claim_status(
+                    redis_key,
+                    type,
+                    build_compound_store(state)
+                  )
+                end)
+
+              {:error, :key_locked} ->
+                {:error, :key_locked}
+            end
+
+          old_count = state.applied_count
+          new_state = %{state | applied_count: old_count + 1}
+          maybe_release_cursor(meta, old_count, new_state, result)
         end)
       end
 
@@ -771,16 +1000,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:ratelimit_add, key, window_ms, max, count}, state) do
         apply_pending_with_time(meta, state, fn ->
-          do_ratelimit_add(state, key, window_ms, max, count, nil)
-        end)
-      end
-
-      # Legacy 6-tuple variant: older submitters embedded now_ms before commands
-      # were HLC-stamped at the Raft boundary. Stamped wrappers normalize this back
-      # to the 5-tuple so the single log-entry timestamp wins.
-      def apply(meta, {:ratelimit_add, key, window_ms, max, count, now_ms}, state) do
-        apply_pending_with_time(meta, state, fn ->
-          do_ratelimit_add(state, key, window_ms, max, count, now_ms)
+          do_ratelimit_add(state, key, window_ms, max, count)
         end)
       end
 
@@ -800,8 +1020,110 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:renew_key_locks, keys, owner_ref, expire_at_ms}, state) do
+        apply_control_with_time(meta, state, fn ->
+          do_renew_key_locks(state, keys, owner_ref, expire_at_ms)
+        end)
+      end
+
+      def apply(
+            meta,
+            {:fetch_or_compute_lock, key, outcome_key, owner_ref, expire_at_ms},
+            state
+          )
+          when is_binary(key) and is_binary(outcome_key) and is_binary(owner_ref) and
+                 byte_size(owner_ref) <= 512 and is_integer(expire_at_ms) and expire_at_ms > 0 do
+        apply_control_with_time(meta, state, fn ->
+          do_fetch_or_compute_lock(state, key, outcome_key, owner_ref, expire_at_ms)
+        end)
+      end
+
+      def apply(
+            meta,
+            {:fetch_or_compute_lock, _key, _outcome_key, _owner_ref, _expire_at_ms},
+            state
+          ) do
+        apply_control_with_time(meta, state, fn ->
+          {state, {:error, "ERR invalid fetch_or_compute lock command"}}
+        end)
+      end
+
+      def apply(
+            meta,
+            {:fetch_or_compute_fail, key, outcome_key, encoded_error, outcome_expire_at_ms,
+             owner_ref},
+            state
+          )
+          when is_binary(key) and is_binary(outcome_key) and is_binary(encoded_error) and
+                 byte_size(encoded_error) <= 65_541 and is_integer(outcome_expire_at_ms) and
+                 outcome_expire_at_ms > 0 and is_binary(owner_ref) and byte_size(owner_ref) <= 512 do
+        apply_control_with_time(meta, state, fn ->
+          do_fetch_or_compute_fail(
+            state,
+            key,
+            outcome_key,
+            encoded_error,
+            outcome_expire_at_ms,
+            owner_ref
+          )
+        end)
+      end
+
+      def apply(
+            meta,
+            {:fetch_or_compute_fail, _key, _outcome_key, _encoded_error, _outcome_expire_at_ms,
+             _owner_ref},
+            state
+          ) do
+        apply_control_with_time(meta, state, fn ->
+          {state, {:error, "ERR invalid fetch_or_compute failure command"}}
+        end)
+      end
+
+      def apply(meta, {:fetch_or_compute_publish, key, value, expire_at_ms, owner_ref}, state)
+          when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
+                 expire_at_ms >= 0 and is_binary(owner_ref) and byte_size(owner_ref) <= 512 do
+        apply_control_with_time(meta, state, fn ->
+          do_fetch_or_compute_publish(state, key, value, expire_at_ms, owner_ref)
+        end)
+      end
+
+      def apply(
+            meta,
+            {:fetch_or_compute_publish, _key, _value, _expire_at_ms, _owner_ref},
+            state
+          ) do
+        apply_control_with_time(meta, state, fn ->
+          {state, {:error, "ERR invalid fetch_or_compute publish command"}}
+        end)
+      end
+
+      def apply(
+            meta,
+            {:fetch_or_compute_publish_blob_ref, key, encoded_ref, expire_at_ms, owner_ref},
+            state
+          )
+          when is_binary(key) and is_binary(encoded_ref) and is_integer(expire_at_ms) and
+                 expire_at_ms >= 0 and is_binary(owner_ref) and byte_size(owner_ref) <= 512 do
+        apply_control_with_time(meta, state, fn ->
+          do_fetch_or_compute_publish_blob_ref(
+            state,
+            key,
+            encoded_ref,
+            expire_at_ms,
+            owner_ref
+          )
+        end)
+      end
+
       def apply(meta, {:unlock_keys, keys, owner_ref}, state) do
         apply_control_with_time(meta, state, fn -> do_unlock_keys(state, keys, owner_ref) end)
+      end
+
+      def apply(meta, {:unlock_keys_owned, keys, owner_ref}, state) do
+        apply_control_with_time(meta, state, fn ->
+          do_unlock_keys_owned(state, keys, owner_ref)
+        end)
       end
 
       def apply(meta, {:cross_shard_intent, owner_ref, intent_map}, state) do
@@ -826,7 +1148,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:clear_locks}, state) do
         apply_control_with_time(meta, state, fn ->
-          {state |> Map.put(:cross_shard_locks, %{}) |> Map.put(:cross_shard_intents, %{}), :ok}
+          {
+            state
+            |> Map.put(:cross_shard_locks, %{})
+            |> Map.put(:cross_shard_lock_expiries, :gb_trees.empty())
+            |> Map.put(:cross_shard_intents, %{}),
+            :ok
+          }
         end)
       end
 
@@ -1008,9 +1336,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       # -- TopK --
 
-      def apply(meta, {:topk_create, key, k, width, depth, decay}, state) do
+      def apply(meta, {:topk_create, key, k, width, depth}, state) do
         apply_prob_with_time(meta, state, fn ->
-          create_topk_metadata(state, key, k, width, depth, decay)
+          create_topk_metadata(state, key, k, width, depth)
         end)
       end
 
@@ -1029,9 +1357,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       end
 
       def apply(meta, {:tx_execute, queue, sandbox_namespace}, state) when is_list(queue) do
-        apply_pending_with_time(meta, state, fn ->
-          do_tx_execute(state, queue, sandbox_namespace)
-        end)
+        apply_tx_execute(meta, queue, sandbox_namespace, %{}, state)
+      end
+
+      def apply(meta, {:tx_execute, queue, sandbox_namespace, watched_keys}, state)
+          when is_list(queue) and is_map(watched_keys) do
+        apply_tx_execute(meta, queue, sandbox_namespace, watched_keys, state)
+      end
+
+      def apply(meta, {:watch_token, key}, state) when is_binary(key) do
+        apply_pending_with_time(meta, state, fn -> transaction_watch_token(state, key) end)
+      end
+
+      def apply(meta, {:watch_tokens, keys}, state) when is_list(keys) do
+        apply_pending_with_time(meta, state, fn -> transaction_watch_tokens(state, keys) end)
       end
 
       # -- Flow --
@@ -1240,9 +1579,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       # same log-entry timestamp on every replica.
       # ---------------------------------------------------------------------------
 
-      # Generic server command hook — allows server apps to replicate their own
-      # commands through Raft without the library knowing what they are.
-      # The server registers a raft_apply_hook callback on the Instance struct.
       def apply(meta, {:ferricstore_apply_context_barrier, expected_encoded}, state) do
         with_apply_time(meta, fn ->
           if Map.get(state, :apply_context_encoded) == expected_encoded do
@@ -1281,12 +1617,395 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
-      def apply(meta, {:server_command, command}, state) do
+      def apply(
+            meta,
+            {:server_catalog_mutate, namespace, subject, expected_encoded, expected_revision,
+             value, max_live_entries},
+            state
+          ) do
         with_apply_time(meta, fn ->
-          hook = raft_apply_hook(state)
-          result = if hook, do: hook.(command), else: {:error, :no_hook}
+          result =
+            apply_server_catalog_mutation(
+              meta,
+              state,
+              namespace,
+              subject,
+              expected_encoded,
+              expected_revision,
+              value,
+              max_live_entries
+            )
+
           bump_applied(meta, state, result)
         end)
+      end
+
+      def apply(
+            meta,
+            {:server_catalog_replace, namespace, expected_revision, mutations,
+             expected_live_count, max_live_entries},
+            state
+          ) do
+        with_apply_time(meta, fn ->
+          result =
+            apply_server_catalog_replacement(
+              meta,
+              state,
+              namespace,
+              expected_revision,
+              mutations,
+              expected_live_count,
+              max_live_entries
+            )
+
+          bump_applied(meta, state, result)
+        end)
+      end
+
+      defp apply_server_catalog_mutation(
+             meta,
+             %{shard_index: 0} = state,
+             namespace,
+             subject,
+             expected_encoded,
+             expected_revision,
+             value,
+             max_live_entries
+           )
+           when is_binary(namespace) and is_binary(subject) and
+                  (is_nil(expected_encoded) or is_binary(expected_encoded)) and
+                  (is_nil(expected_revision) or is_binary(expected_revision)) and
+                  (is_binary(value) or value == :deleted) and
+                  is_integer(max_live_entries) and max_live_entries >= 0 do
+        with :ok <- validate_server_catalog_expected(expected_encoded),
+             :ok <- validate_server_catalog_revision(expected_revision),
+             {:ok, key, revision_key, count_key, encoded, revision} <-
+               encode_server_catalog_mutation(meta, state, namespace, subject, value) do
+          with_pending_writes(state, fn ->
+            apply_server_catalog_cas(
+              state,
+              key,
+              revision_key,
+              count_key,
+              expected_encoded,
+              expected_revision,
+              encoded,
+              revision,
+              value,
+              max_live_entries
+            )
+          end)
+        end
+      end
+
+      defp apply_server_catalog_mutation(
+             _meta,
+             _state,
+             _namespace,
+             _subject,
+             _expected_encoded,
+             _expected_revision,
+             _value,
+             _max_live_entries
+           ),
+           do: {:error, :invalid_server_catalog_mutation}
+
+      defp apply_server_catalog_replacement(
+             meta,
+             %{shard_index: 0} = state,
+             namespace,
+             expected_revision,
+             mutations,
+             expected_live_count,
+             max_live_entries
+           )
+           when is_binary(namespace) and
+                  (is_nil(expected_revision) or is_binary(expected_revision)) and
+                  is_list(mutations) and is_integer(expected_live_count) and
+                  expected_live_count >= 0 and is_integer(max_live_entries) and
+                  max_live_entries >= 0 do
+        with :ok <- validate_server_catalog_revision(expected_revision) do
+          with_pending_writes(state, fn ->
+            apply_server_catalog_replacement_cas(
+              meta,
+              state,
+              namespace,
+              expected_revision,
+              mutations,
+              expected_live_count,
+              max_live_entries
+            )
+          end)
+        end
+      end
+
+      defp apply_server_catalog_replacement(
+             _meta,
+             _state,
+             _namespace,
+             _expected_revision,
+             _mutations,
+             _expected_live_count,
+             _max_live_entries
+           ),
+           do: {:error, :invalid_server_catalog_replacement}
+
+      defp apply_server_catalog_replacement_cas(
+             meta,
+             state,
+             namespace,
+             expected_revision,
+             mutations,
+             expected_live_count,
+             max_live_entries
+           ) do
+        revision_key = Ferricstore.ServerCatalog.revision_key(namespace)
+        count_key = Ferricstore.ServerCatalog.live_count_key(namespace)
+        current_revision = do_get(state, revision_key)
+
+        if current_revision != expected_revision do
+          {:error, :stale_server_catalog_revision}
+        else
+          version = server_catalog_version(meta, state)
+          revision = Ferricstore.ServerCatalog.encode_revision(version)
+
+          with {:ok, current_count} <-
+                 decode_server_catalog_live_count(do_get(state, count_key), current_revision),
+               {:ok, prepared, next_count} <-
+                 prepare_server_catalog_replacements(
+                   state,
+                   namespace,
+                   mutations,
+                   current_count,
+                   version
+                 ),
+               :ok <-
+                 validate_server_catalog_replacement_count(
+                   next_count,
+                   expected_live_count,
+                   max_live_entries
+                 ),
+               :ok <- write_server_catalog_replacements(state, prepared),
+               :ok <- raw_put(state, revision_key, revision, 0),
+               :ok <-
+                 raw_put(
+                   state,
+                   count_key,
+                   Ferricstore.ServerCatalog.encode_live_count(next_count),
+                   0
+                 ) do
+            {:ok, revision}
+          end
+        end
+      rescue
+        ArgumentError -> {:error, :invalid_server_catalog_replacement}
+      end
+
+      defp prepare_server_catalog_replacements(
+             state,
+             namespace,
+             mutations,
+             current_count,
+             version
+           ) do
+        mutations
+        |> Enum.reduce_while({:ok, [], current_count, MapSet.new()}, fn
+          {subject, value}, {:ok, prepared, count, seen}
+          when is_binary(subject) and (is_binary(value) or value == :deleted) ->
+            if MapSet.member?(seen, subject) do
+              {:halt, {:error, :invalid_server_catalog_replacement}}
+            else
+              key = Ferricstore.ServerCatalog.entry_key(namespace, subject)
+
+              with {:ok, current_live?} <- server_catalog_entry_live?(do_get(state, key)) do
+                next_live? = is_binary(value)
+                next_count = count + live_count_delta(current_live?, next_live?)
+
+                if next_count < 0 do
+                  {:halt, {:error, :invalid_server_catalog_state}}
+                else
+                  encoded =
+                    if next_live?,
+                      do: Ferricstore.ServerCatalog.encode_entry(version, value),
+                      else: nil
+
+                  {:cont,
+                   {:ok, [{key, encoded, value} | prepared], next_count,
+                    MapSet.put(seen, subject)}}
+                end
+              else
+                {:error, _reason} = error -> {:halt, error}
+              end
+            end
+
+          _invalid, _acc ->
+            {:halt, {:error, :invalid_server_catalog_replacement}}
+        end)
+        |> case do
+          {:ok, prepared, next_count, _seen} ->
+            {:ok, Enum.reverse(prepared), next_count}
+
+          {:error, _reason} = error ->
+            error
+        end
+      rescue
+        ArgumentError -> {:error, :invalid_server_catalog_replacement}
+      end
+
+      defp validate_server_catalog_replacement_count(
+             next_count,
+             expected_live_count,
+             max_live_entries
+           ) do
+        cond do
+          next_count != expected_live_count ->
+            {:error, :invalid_server_catalog_replacement}
+
+          next_count > max_live_entries ->
+            {:error, {:server_catalog_limit_reached, max_live_entries}}
+
+          true ->
+            :ok
+        end
+      end
+
+      defp write_server_catalog_replacements(state, prepared) do
+        Enum.reduce_while(prepared, :ok, fn {key, encoded, value}, :ok ->
+          case write_server_catalog_entry(state, key, encoded, value) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp apply_server_catalog_cas(
+             state,
+             key,
+             revision_key,
+             count_key,
+             expected_encoded,
+             expected_revision,
+             encoded,
+             revision,
+             value,
+             max_live_entries
+           ) do
+        current_revision = do_get(state, revision_key)
+        current_encoded = do_get(state, key)
+
+        cond do
+          current_revision != expected_revision ->
+            {:error, :stale_server_catalog_revision}
+
+          current_encoded != expected_encoded ->
+            {:error, :stale_server_catalog_entry}
+
+          true ->
+            with {:ok, current_count} <-
+                   decode_server_catalog_live_count(do_get(state, count_key), current_revision),
+                 {:ok, current_live?} <- server_catalog_entry_live?(current_encoded),
+                 {:ok, next_count} <-
+                   next_server_catalog_live_count(
+                     current_count,
+                     current_live?,
+                     is_binary(value),
+                     max_live_entries
+                   ),
+                 :ok <- write_server_catalog_entry(state, key, encoded, value),
+                 :ok <- raw_put(state, revision_key, revision, 0),
+                 :ok <-
+                   raw_put(
+                     state,
+                     count_key,
+                     Ferricstore.ServerCatalog.encode_live_count(next_count),
+                     0
+                   ) do
+              {:ok, encoded}
+            end
+        end
+      end
+
+      defp decode_server_catalog_live_count(nil, nil), do: {:ok, 0}
+
+      defp decode_server_catalog_live_count(encoded, _revision) when is_binary(encoded) do
+        case Ferricstore.ServerCatalog.decode_live_count(encoded) do
+          {:ok, count} -> {:ok, count}
+          {:error, _invalid} -> {:error, :invalid_server_catalog_state}
+        end
+      end
+
+      defp decode_server_catalog_live_count(_encoded, _revision),
+        do: {:error, :invalid_server_catalog_state}
+
+      defp server_catalog_entry_live?(nil), do: {:ok, false}
+
+      defp server_catalog_entry_live?(encoded) when is_binary(encoded) do
+        case Ferricstore.ServerCatalog.decode_entry(encoded) do
+          {:ok, %{value: :deleted}} -> {:ok, false}
+          {:ok, %{value: value}} when is_binary(value) -> {:ok, true}
+          _invalid -> {:error, :invalid_server_catalog_state}
+        end
+      end
+
+      defp next_server_catalog_live_count(count, current_live?, next_live?, max_live_entries) do
+        next_count = count + live_count_delta(current_live?, next_live?)
+
+        cond do
+          next_count < 0 ->
+            {:error, :invalid_server_catalog_state}
+
+          not current_live? and next_live? and next_count > max_live_entries ->
+            {:error, {:server_catalog_limit_reached, max_live_entries}}
+
+          true ->
+            {:ok, next_count}
+        end
+      end
+
+      defp live_count_delta(false, true), do: 1
+      defp live_count_delta(true, false), do: -1
+      defp live_count_delta(_current_live?, _next_live?), do: 0
+
+      defp write_server_catalog_entry(state, key, _encoded, :deleted), do: do_delete(state, key)
+
+      defp write_server_catalog_entry(state, key, encoded, _value),
+        do: raw_put(state, key, encoded, 0)
+
+      defp validate_server_catalog_expected(nil), do: :ok
+
+      defp validate_server_catalog_expected(encoded) do
+        case Ferricstore.ServerCatalog.decode_entry(encoded) do
+          {:ok, _entry} -> :ok
+          {:error, :invalid_server_catalog_entry} -> {:error, :invalid_server_catalog_mutation}
+        end
+      end
+
+      defp validate_server_catalog_revision(nil), do: :ok
+
+      defp validate_server_catalog_revision(encoded) do
+        case Ferricstore.ServerCatalog.decode_revision(encoded) do
+          {:ok, _revision} -> :ok
+          {:error, _invalid} -> {:error, :invalid_server_catalog_mutation}
+        end
+      end
+
+      defp encode_server_catalog_mutation(meta, state, namespace, subject, value) do
+        version = server_catalog_version(meta, state)
+
+        {:ok, Ferricstore.ServerCatalog.entry_key(namespace, subject),
+         Ferricstore.ServerCatalog.revision_key(namespace),
+         Ferricstore.ServerCatalog.live_count_key(namespace),
+         Ferricstore.ServerCatalog.encode_entry(version, value),
+         Ferricstore.ServerCatalog.encode_revision(version)}
+      rescue
+        ArgumentError -> {:error, :invalid_server_catalog_mutation}
+      end
+
+      defp server_catalog_version(meta, state) do
+        case Map.get(meta, :index) do
+          index when is_integer(index) and index >= 0 -> index
+          _missing -> Map.get(state, :applied_count, 0) + 1
+        end
       end
 
       def apply(meta, {inner_command, %{hlc_ts: {physical_ms, _logical} = remote_ts}}, state)
@@ -1295,7 +2014,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
         __MODULE__.apply(
           Map.put(meta, :system_time, physical_ms),
-          normalize_stamped_command(inner_command),
+          inner_command,
           state
         )
       end

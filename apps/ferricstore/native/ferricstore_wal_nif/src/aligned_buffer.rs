@@ -105,6 +105,7 @@ impl AlignedBuffer {
             ptr: old_ptr,
             logical_len: old_len,
             padded_len,
+            allocation_size: self.capacity,
         }
     }
 
@@ -154,6 +155,8 @@ pub struct TakenBuffer {
     pub logical_len: usize,
     /// Length padded to ALIGNMENT for O_DIRECT writes.
     pub padded_len: usize,
+    /// Exact layout size used to allocate `ptr`.
+    allocation_size: usize,
 }
 
 unsafe impl Send for TakenBuffer {}
@@ -164,6 +167,7 @@ impl TakenBuffer {
             ptr: ptr::null_mut(),
             logical_len: 0,
             padded_len: 0,
+            allocation_size: 0,
         }
     }
 
@@ -192,11 +196,8 @@ impl TakenBuffer {
 
 impl Drop for TakenBuffer {
     fn drop(&mut self) {
-        if !self.ptr.is_null() && self.padded_len > 0 {
-            free_aligned(
-                self.ptr,
-                round_up(self.padded_len, ALIGNMENT).max(ALIGNMENT),
-            );
+        if !self.ptr.is_null() && self.allocation_size > 0 {
+            free_aligned(self.ptr, self.allocation_size);
         }
     }
 }
@@ -270,6 +271,8 @@ mod tests {
         let taken = buf.take();
         assert_eq!(taken.logical_len, 9);
         assert!(taken.padded_len >= 9);
+        assert_eq!(taken.allocation_size, INITIAL_CAPACITY);
+        assert!(taken.padded_len < taken.allocation_size);
         assert_eq!(taken.padded_len % ALIGNMENT, 0);
         assert_eq!(&taken.as_padded_slice()[..9], b"test data");
         // Buffer should be empty after take

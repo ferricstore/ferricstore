@@ -180,19 +180,21 @@ defmodule FerricStore.Instance.Supervisor do
         flow_lmdb_writer_children ++
         [
           Supervisor.child_spec(
-            {Ferricstore.Store.KeydirTableOwner, instance_ctx: ctx},
-            id: :"#{name}.KeydirTableOwner"
+            {Ferricstore.Store.ETSTableHeir,
+             name: Ferricstore.Store.KeydirTableOwner.table_heir_name(ctx)},
+            id: :"#{name}.KeydirTableHeir"
           ),
-          # Stats and MemoryGuard are global application processes today. The
-          # instance context owns isolated counters/flags, but these GenServers are
-          # not instance-scoped yet, so embedded instances must not start duplicates.
-          {Ferricstore.Store.ShardSupervisor,
-           [
-             name: :"#{name}.ShardSupervisor",
-             data_dir: ctx.data_dir,
-             shard_count: ctx.shard_count,
-             instance_ctx: ctx
-           ]}
+          Supervisor.child_spec(
+            {Ferricstore.Store.KeydirRuntimeSupervisor,
+             [
+               name: :"#{name}.KeydirRuntimeSupervisor",
+               shard_supervisor_name: :"#{name}.ShardSupervisor",
+               data_dir: ctx.data_dir,
+               shard_count: ctx.shard_count,
+               instance_ctx: ctx
+             ]},
+            id: :"#{name}.KeydirRuntimeSupervisor"
+          )
         ] ++
         retention_sweeper_children ++
         limit_reconciler_children ++

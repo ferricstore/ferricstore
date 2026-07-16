@@ -63,8 +63,10 @@ defmodule Ferricstore.Stats do
 
   @hotness_table :ferricstore_hotness
   @max_tracked_prefixes 1000
+  @max_named_prefixes @max_tracked_prefixes - 1
   @keyspace_hit_sample_acc {__MODULE__, :keyspace_hit_sample_acc}
   @keyspace_miss_sample_acc {__MODULE__, :keyspace_miss_sample_acc}
+  @sample_epoch_key {__MODULE__, :sample_epoch}
   @cache_tracking_disabled {__MODULE__, :cache_tracking_disabled}
 
   # ---------------------------------------------------------------------------
@@ -339,7 +341,7 @@ defmodule Ferricstore.Stats do
         {:exact, 0}
       else
         key = {@keyspace_hit_sample_acc, ctx.stats_counter}
-        previous = Process.get(key, 0)
+        {_epoch, previous} = sample_remainder(key)
         next_sample_offset = rate - previous
 
         if max_hits < next_sample_offset do
@@ -366,21 +368,26 @@ defmodule Ferricstore.Stats do
     incr_keyspace_hits(ctx, count)
   end
 
-  def finish_keyspace_hit_batch(ctx, {:sampled_no_touch, rate, previous, count}) do
+  def finish_keyspace_hit_batch(ctx, {:sampled_no_touch, rate, _previous, count}) do
     key = {@keyspace_hit_sample_acc, ctx.stats_counter}
-    Process.put(key, rem(previous + count, rate))
+    {epoch, current_previous} = sample_remainder(key)
+    Process.put(key, {epoch, rem(current_previous + count, rate)})
     :ok
   end
 
-  def finish_keyspace_hit_batch(ctx, {:sampled_touch, rate, previous, count, _next_sample_offset}) do
-    sampled = div(previous + count, rate)
+  def finish_keyspace_hit_batch(
+        ctx,
+        {:sampled_touch, rate, _previous, count, _next_sample_offset}
+      ) do
+    key = {@keyspace_hit_sample_acc, ctx.stats_counter}
+    {epoch, current_previous} = sample_remainder(key)
+    sampled = div(current_previous + count, rate)
 
     if sampled > 0 do
       incr_keyspace_hits(ctx, sampled)
     end
 
-    key = {@keyspace_hit_sample_acc, ctx.stats_counter}
-    Process.put(key, rem(previous + count, rate))
+    Process.put(key, {epoch, rem(current_previous + count, rate)})
     :ok
   end
 
@@ -623,11 +630,7 @@ defmodule Ferricstore.Stats do
     :counters.put(FerricStore.Instance.get(:default).stats_counter, @counter_hot_reads, 0)
     :counters.put(FerricStore.Instance.get(:default).stats_counter, @counter_cold_reads, 0)
 
-    try do
-      :ets.delete_all_objects(@hotness_table)
-    rescue
-      ArgumentError -> :ok
-    end
+    reset_hotness_table()
 
     :ok
   end
@@ -664,6 +667,7 @@ defmodule Ferricstore.Stats do
   """
   @spec reset() :: :ok
   def reset do
+    bump_sample_epoch()
     ref = FerricStore.Instance.get(:default).stats_counter
     :counters.put(ref, @counter_connections, 0)
     :counters.put(ref, @counter_commands, 0)
@@ -674,11 +678,7 @@ defmodule Ferricstore.Stats do
     :counters.put(ref, @counter_expired_keys, 0)
     :counters.put(ref, @counter_evicted_keys, 0)
 
-    try do
-      :ets.delete_all_objects(@hotness_table)
-    rescue
-      ArgumentError -> :ok
-    end
+    reset_hotness_table()
 
     :ok
   end
@@ -723,6 +723,7 @@ defmodule Ferricstore.Stats do
     # run_id and start_time are server-level metadata, not per-instance
     :persistent_term.put({__MODULE__, :run_id}, run_id)
     :persistent_term.put({__MODULE__, :start_time}, start_time)
+    :persistent_term.put(@sample_epoch_key, :atomics.new(1, signed: false))
 
     # Create the per-prefix hotness table if it does not already exist.
     # The table is :public so any process (Router, Shard) can write to it
@@ -742,7 +743,31 @@ defmodule Ferricstore.Stats do
         :ets.delete_all_objects(@hotness_table)
     end
 
-    {:ok, %{}}
+    {:ok, %{hotness_slots: 0}}
+  end
+
+  @impl true
+  def handle_call({:resolve_hotness_prefix, prefix}, _from, state) do
+    case :ets.lookup(@hotness_table, prefix) do
+      [{^prefix, _, _}] ->
+        {:reply, prefix, state}
+
+      [] when state.hotness_slots < @max_named_prefixes ->
+        if :ets.insert_new(@hotness_table, {prefix, 0, 0}) do
+          {:reply, prefix, %{state | hotness_slots: state.hotness_slots + 1}}
+        else
+          {:reply, prefix, state}
+        end
+
+      [] ->
+        {:reply, "_other", state}
+    end
+  end
+
+  @impl true
+  def handle_call(:reset_hotness_table, _from, state) do
+    :ets.delete_all_objects(@hotness_table)
+    {:reply, :ok, %{state | hotness_slots: 0}}
   end
 
   # ---------------------------------------------------------------------------
@@ -766,7 +791,8 @@ defmodule Ferricstore.Stats do
       incr_keyspace_misses(ctx, count)
     else
       key = {@keyspace_miss_sample_acc, ctx.stats_counter}
-      total = Process.get(key, 0) + count
+      {epoch, previous} = sample_remainder(key)
+      total = previous + count
       sampled = div(total, rate)
       remainder = rem(total, rate)
 
@@ -774,7 +800,7 @@ defmodule Ferricstore.Stats do
         incr_keyspace_misses(ctx, sampled)
       end
 
-      Process.put(key, remainder)
+      Process.put(key, {epoch, remainder})
       :ok
     end
   end
@@ -787,7 +813,8 @@ defmodule Ferricstore.Stats do
       count
     else
       key = {@keyspace_hit_sample_acc, ctx.stats_counter}
-      total = Process.get(key, 0) + count
+      {epoch, previous} = sample_remainder(key)
+      total = previous + count
       sampled = div(total, rate)
       remainder = rem(total, rate)
 
@@ -795,9 +822,40 @@ defmodule Ferricstore.Stats do
         incr_keyspace_hits(ctx, sampled)
       end
 
-      Process.put(key, remainder)
+      Process.put(key, {epoch, remainder})
       sampled
     end
+  end
+
+  defp sample_remainder(key) do
+    epoch = sample_epoch()
+
+    case Process.get(key) do
+      {^epoch, remainder} when is_integer(remainder) and remainder >= 0 ->
+        {epoch, remainder}
+
+      _stale_or_missing ->
+        Process.put(key, {epoch, 0})
+        {epoch, 0}
+    end
+  end
+
+  defp sample_epoch do
+    case :persistent_term.get(@sample_epoch_key, nil) do
+      nil -> 0
+      epoch_ref -> :atomics.get(epoch_ref, 1)
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  defp bump_sample_epoch do
+    case :persistent_term.get(@sample_epoch_key, nil) do
+      nil -> :ok
+      epoch_ref -> :atomics.add(epoch_ref, 1, 1)
+    end
+  rescue
+    ArgumentError -> :ok
   end
 
   defp flow_internal_key?(<<"f:{", _rest::binary>>), do: true
@@ -809,28 +867,39 @@ defmodule Ferricstore.Stats do
     Ferricstore.Store.CompoundKey.internal_key?(key)
   end
 
-  # Resolves the prefix to track: if the hotness table already has this prefix
-  # or the table has room, use the prefix as-is. Otherwise bucket into "_other".
+  # Resolves the prefix to track. Known prefixes stay on the direct ETS path;
+  # only first-prefix allocation is serialized with reset through the owner.
   @spec resolve_prefix(binary()) :: binary()
   defp resolve_prefix(prefix) do
     try do
       case :ets.lookup(@hotness_table, prefix) do
         [{^prefix, _, _}] ->
-          # Already tracked — use it directly.
           prefix
 
         [] ->
-          # New prefix. Check if we have room.
-          size = :ets.info(@hotness_table, :size)
-
-          if size < @max_tracked_prefixes do
-            prefix
-          else
-            "_other"
-          end
+          GenServer.call(__MODULE__, {:resolve_hotness_prefix, prefix})
       end
     rescue
       ArgumentError -> "_other"
+    catch
+      :exit, _reason -> "_other"
+    end
+  end
+
+  defp reset_hotness_table do
+    case Process.whereis(__MODULE__) do
+      nil ->
+        try do
+          :ets.delete_all_objects(@hotness_table)
+        rescue
+          ArgumentError -> :ok
+        end
+
+      pid when pid == self() ->
+        :ets.delete_all_objects(@hotness_table)
+
+      _pid ->
+        GenServer.call(__MODULE__, :reset_hotness_table)
     end
   end
 

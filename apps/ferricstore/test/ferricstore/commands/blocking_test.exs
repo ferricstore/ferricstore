@@ -64,6 +64,25 @@ defmodule Ferricstore.Commands.BlockingTest do
       assert {:error, _} = Blocking.parse_blpop_args(["mylist", "abc"])
     end
 
+    test "rejects timeouts outside the VM timer range for every blocking list command" do
+      oversized_seconds = "4294968"
+
+      assert {:error, "ERR timeout is not a float or out of range"} =
+               Blocking.parse_blpop_args(["list", oversized_seconds])
+
+      assert {:error, "ERR timeout is not a float or out of range"} =
+               Blocking.parse_blmove_args([
+                 "source",
+                 "destination",
+                 "LEFT",
+                 "RIGHT",
+                 oversized_seconds
+               ])
+
+      assert {:error, "ERR timeout is not a float or out of range"} =
+               Blocking.parse_blmpop_args([oversized_seconds, "1", "list", "LEFT"])
+    end
+
     test "rejects empty args" do
       assert {:error, _} = Blocking.parse_blpop_args([])
     end

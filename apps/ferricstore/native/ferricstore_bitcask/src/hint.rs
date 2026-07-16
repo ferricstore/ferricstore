@@ -12,14 +12,12 @@
 //! The CRC covers: `file_id || offset || value_size || expire_at_ms || key_size || key`
 //! (everything after the `crc32` field).
 //!
-//! Reading hint files rebuilds the full keydir in milliseconds on startup —
-//! no need to scan the entire value log.
+//! Streaming hint pages rebuild the BEAM-owned keydir without scanning value
+//! payloads from the corresponding log.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-
-use crate::keydir::{KeyDir, KeyEntry};
 
 /// CRC32 field size prepended to every hint entry.
 const CRC_SIZE: usize = 4;
@@ -31,6 +29,8 @@ const HINT_BODY_HEADER_SIZE: usize = 30;
 /// Total header bytes per hint record (before the key bytes):
 /// `crc32`(4) + `file_id`(8) + `offset`(8) + `value_size`(4) + `expire_at_ms`(8) + `key_size`(2) = 34
 pub const HINT_HEADER_SIZE: usize = CRC_SIZE + HINT_BODY_HEADER_SIZE;
+const MAX_HINT_PAGE_ENTRIES: usize = 65_536;
+const MAX_HINT_PAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct HintError(pub String);
@@ -88,11 +88,7 @@ impl HintWriter {
     /// Returns a `HintError` if the temporary file cannot be created or opened.
     pub fn open(path: &Path) -> Result<Self> {
         let tmp_path = path.with_extension("hint.tmp");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)?;
+        let file = crate::create_truncate_nofollow(&tmp_path)?;
         Ok(Self {
             writer: BufWriter::new(file),
             tmp_path,
@@ -104,21 +100,25 @@ impl HintWriter {
     ///
     /// Returns a `HintError` if the entry cannot be written to disk.
     pub fn write_entry(&mut self, entry: &HintEntry) -> Result<()> {
-        #[allow(clippy::cast_possible_truncation)]
-        let key_size = entry.key.len() as u16;
+        let key_size = u16::try_from(entry.key.len()).map_err(|_| {
+            HintError(format!(
+                "hint key too large: {} bytes (max {})",
+                entry.key.len(),
+                u16::MAX
+            ))
+        })?;
 
-        // Build the body first so we can compute the CRC over it.
-        let mut body = Vec::with_capacity(HINT_BODY_HEADER_SIZE + entry.key.len());
-        body.extend_from_slice(&entry.file_id.to_le_bytes());
-        body.extend_from_slice(&entry.offset.to_le_bytes());
-        body.extend_from_slice(&entry.value_size.to_le_bytes());
-        body.extend_from_slice(&entry.expire_at_ms.to_le_bytes());
-        body.extend_from_slice(&key_size.to_le_bytes());
-        body.extend_from_slice(&entry.key);
+        let mut header = [0u8; HINT_BODY_HEADER_SIZE];
+        header[0..8].copy_from_slice(&entry.file_id.to_le_bytes());
+        header[8..16].copy_from_slice(&entry.offset.to_le_bytes());
+        header[16..20].copy_from_slice(&entry.value_size.to_le_bytes());
+        header[20..28].copy_from_slice(&entry.expire_at_ms.to_le_bytes());
+        header[28..30].copy_from_slice(&key_size.to_le_bytes());
 
-        let crc = crc32(&body);
+        let crc = crc32_parts(&header, &entry.key);
         self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(&body)?;
+        self.writer.write_all(&header)?;
+        self.writer.write_all(&entry.key)?;
         Ok(())
     }
 
@@ -148,6 +148,9 @@ impl HintWriter {
         // rotation's dir-fsync step already covers that.
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
+        #[cfg(unix)]
+        crate::path_open::rename_nofollow(&self.tmp_path, &self.final_path)?;
+        #[cfg(not(unix))]
         std::fs::rename(&self.tmp_path, &self.final_path)?;
         Ok(())
     }
@@ -159,11 +162,14 @@ impl Drop for HintWriter {
     /// to fail silently: after a successful `commit` the file has already been
     /// renamed away, so `remove_file` will return `NotFound`, which is harmless.
     fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = crate::path_open::remove_file_nofollow(&self.tmp_path);
+        #[cfg(not(unix))]
         let _ = std::fs::remove_file(&self.tmp_path);
     }
 }
 
-/// Reads hint entries and reconstructs the keydir.
+/// Reads persisted hint entries.
 pub struct HintReader {
     file: File,
 }
@@ -173,42 +179,16 @@ impl HintReader {
     ///
     /// Returns a `HintError` if the file cannot be opened.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
+        let file = crate::open_random_read(path)?;
         Ok(Self { file })
     }
 
-    /// Load all entries from the hint file into `keydir`.
-    /// Tombstones (`value_size` == 0) are skipped -- they represent deleted keys.
+    /// Collect all hint entries.
     ///
     /// # Errors
     ///
     /// Returns a `HintError` if the hint file cannot be read or is malformed.
-    pub fn load_into(&mut self, keydir: &mut KeyDir) -> Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
-        while let Some(entry) = read_hint_entry(&mut self.file)? {
-            if entry.value_size == 0 {
-                keydir.delete(&entry.key);
-            } else {
-                keydir.put(
-                    entry.key.clone(),
-                    KeyEntry {
-                        file_id: entry.file_id,
-                        offset: entry.offset,
-                        value_size: entry.value_size,
-                        expire_at_ms: entry.expire_at_ms,
-                        ref_bit: false,
-                    },
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Collect all hint entries (used in tests and compaction).
-    ///
-    /// # Errors
-    ///
-    /// Returns a `HintError` if the hint file cannot be read or is malformed.
+    #[cfg(test)]
     pub fn read_all(&mut self) -> Result<Vec<HintEntry>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut entries = Vec::new();
@@ -217,16 +197,68 @@ impl HintReader {
         }
         Ok(entries)
     }
+
+    /// Read a bounded page starting at an exact hint-file byte offset.
+    ///
+    /// At least one entry is returned when the offset is not at EOF, even when
+    /// that entry alone exceeds `max_bytes`. This guarantees cursor progress
+    /// while keeping memory bounded by one maximum-sized key plus the requested
+    /// page budget.
+    pub fn read_page(
+        &mut self,
+        offset: u64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<HintEntry>, u64, bool)> {
+        if max_entries == 0 || max_bytes == 0 {
+            return Err(HintError("hint page limits must be positive".to_string()));
+        }
+        if max_entries > MAX_HINT_PAGE_ENTRIES {
+            return Err(HintError(format!(
+                "hint page entries exceed maximum {MAX_HINT_PAGE_ENTRIES}"
+            )));
+        }
+        if max_bytes > MAX_HINT_PAGE_BYTES {
+            return Err(HintError(format!(
+                "hint page bytes exceed maximum {MAX_HINT_PAGE_BYTES}"
+            )));
+        }
+
+        self.file.seek(SeekFrom::Start(offset))?;
+        let file_size = self.file.metadata()?.len();
+        let mut entries = Vec::with_capacity(max_entries.min(4_096));
+        let mut bytes = 0usize;
+
+        while entries.len() < max_entries && (entries.is_empty() || bytes < max_bytes) {
+            if let Some(entry) = read_hint_entry(&mut self.file)? {
+                bytes = bytes.saturating_add(HINT_HEADER_SIZE + entry.key.len());
+                entries.push(entry);
+            } else {
+                let next_offset = self.file.stream_position()?;
+                return Ok((entries, next_offset, true));
+            }
+        }
+
+        let next_offset = self.file.stream_position()?;
+        Ok((entries, next_offset, next_offset >= file_size))
+    }
 }
 
 fn read_hint_entry(reader: &mut impl Read) -> Result<Option<HintEntry>> {
-    // Read the CRC32 (4 bytes). A clean EOF here means the file ended normally.
+    // A zero-byte read before the CRC is clean EOF. Once any CRC byte exists,
+    // the remaining prefix must be present or the hint is corrupt.
     let mut crc_buf = [0u8; CRC_SIZE];
-    match reader.read_exact(&mut crc_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    loop {
+        match reader.read(&mut crc_buf[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_read) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
+    reader
+        .read_exact(&mut crc_buf[1..])
+        .map_err(|error| HintError(format!("truncated hint CRC: {error}")))?;
     let stored_crc = u32::from_le_bytes(crc_buf);
 
     // Read the fixed-size body header (30 bytes).
@@ -262,11 +294,7 @@ fn read_hint_entry(reader: &mut impl Read) -> Result<Option<HintEntry>> {
     let mut key = vec![0u8; key_size];
     reader.read_exact(&mut key).map_err(HintError::from)?;
 
-    // Validate CRC over body (header + key).
-    let mut body = Vec::with_capacity(HINT_BODY_HEADER_SIZE + key.len());
-    body.extend_from_slice(&header);
-    body.extend_from_slice(&key);
-    let computed_crc = crc32(&body);
+    let computed_crc = crc32_parts(&header, &key);
 
     if computed_crc != stored_crc {
         return Err(HintError(format!(
@@ -290,8 +318,16 @@ fn read_hint_entry(reader: &mut impl Read) -> Result<Option<HintEntry>> {
 /// `crc32fast::hash()`. Both use the same CRC-32/ISO-HDLC polynomial
 /// (0xEDB88320), so existing hint files remain compatible with no
 /// migration needed.
+#[cfg(test)]
 fn crc32(data: &[u8]) -> u32 {
     crc32fast::hash(data)
+}
+
+fn crc32_parts(header: &[u8], key: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(header);
+    hasher.update(key);
+    hasher.finalize()
 }
 
 #[cfg(test)]

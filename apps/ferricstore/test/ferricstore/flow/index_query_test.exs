@@ -70,4 +70,23 @@ defmodule Ferricstore.Flow.IndexQueryTest do
              @terminal_states
            )
   end
+
+  test "cursor tie-breaking filters records and RAM index entries by timestamp and id" do
+    query = Map.merge(@base_query, %{rev?: true, to_ms: 10, before_id: "flow-050"})
+
+    assert IndexQuery.record_matches?(
+             %{id: "flow-049", state: "queued", updated_at_ms: 10},
+             query,
+             @terminal_states
+           )
+
+    refute IndexQuery.record_matches?(
+             %{id: "flow-050", state: "queued", updated_at_ms: 10},
+             query,
+             @terminal_states
+           )
+
+    refute IndexQuery.entry_before_cursor?({"flow-051", 10}, query)
+    assert IndexQuery.entry_before_cursor?({"flow-999", 9}, query)
+  end
 end

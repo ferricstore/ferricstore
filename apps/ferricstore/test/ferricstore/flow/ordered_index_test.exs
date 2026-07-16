@@ -14,6 +14,13 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     {:ok, index: index, lookup: lookup}
   end
 
+  test "registry identifiers stay off the global atom table" do
+    assert {
+             {NativeOrderedIndex, :index, :default, 987_654_321},
+             {NativeOrderedIndex, :lookup, :default, 987_654_321}
+           } = NativeOrderedIndex.table_names(:default, 987_654_321)
+  end
+
   test "native range slice stays isolated by key with offset and reverse", %{
     index: index,
     lookup: lookup
@@ -52,6 +59,150 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
              {"a-2", 2.0},
              {"a-3", 3.0}
            ]
+  end
+
+  test "reverse range cursor seeks before an exact score and member", %{
+    index: index,
+    lookup: lookup
+  } do
+    native = NativeOrderedIndex.get(index, lookup)
+
+    tied =
+      for number <- 1..200 do
+        {"state:tied", "flow-#{String.pad_leading(Integer.to_string(number), 3, "0")}", 10}
+      end
+
+    :ok = NativeOrderedIndex.put_entries(native, [{"state:tied", "older", 9} | tied])
+
+    assert NativeOrderedIndex.range_slice(
+             native,
+             "state:tied",
+             :neg_inf,
+             {:cursor_before, 10, "flow-050"},
+             true,
+             0,
+             10
+           ) ==
+             for(
+               number <- 49..40//-1,
+               do: {"flow-#{String.pad_leading(Integer.to_string(number), 3, "0")}", 10.0}
+             )
+  end
+
+  test "range slice NIF runs on a dirty CPU scheduler" do
+    source =
+      File.read!(Path.expand("../../../native/ferricstore_bitcask/src/flow_index.rs", __DIR__))
+
+    assert source =~
+             ~r/#\[rustler::nif\(schedule = "DirtyCpu"\)\]\s+pub fn flow_index_range_slice\b/
+  end
+
+  test "normal scheduler index NIFs never wait on the shared index lock" do
+    source =
+      File.read!(Path.expand("../../../native/ferricstore_bitcask/src/flow_index.rs", __DIR__))
+
+    assert source =~ ~r/use std::sync::\{[^}]*RwLock/
+    refute source =~ "std::sync::Mutex"
+    refute source =~ ".lock()"
+
+    for function <- ~w(
+          flow_index_score_of
+          flow_index_count_all
+          flow_index_restore_count
+          flow_index_delete_count
+        ) do
+      assert source =~
+               Regex.compile!(
+                 "#\\[rustler::nif\\(schedule = \"Normal\"\\)\\]\\s+pub fn #{function}\\b[\\s\\S]*?try_(?:read|write)_index"
+               )
+    end
+
+    for function <- ~w(
+          flow_index_put_entries
+          flow_index_put_new_entries
+          flow_index_move_entries
+          flow_index_delete_members
+          flow_index_delete_entries
+          flow_index_apply_batch
+          flow_index_take_due
+          flow_index_claim_due_candidates
+          flow_index_due_keys_present
+          flow_index_count_many
+          flow_index_count_keys
+          flow_index_due_count_keys
+          flow_index_apply_claim_entries
+          flow_index_rollback_claim_entries
+        ) do
+      assert source =~
+               Regex.compile!(
+                 "#\\[rustler::nif\\(schedule = \"DirtyCpu\"\\)\\]\\s+pub fn #{function}\\b"
+               )
+    end
+  end
+
+  test "busy retries use capped exponential sleeps instead of spinning" do
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+    test_pid = self()
+
+    result =
+      NativeOrderedIndex.__retry_busy_for_test__(
+        fn ->
+          Agent.get_and_update(attempts, fn attempt ->
+            next_attempt = attempt + 1
+            result = if next_attempt <= 6, do: :busy, else: :ok
+            {result, next_attempt}
+          end)
+        end,
+        fn delay_ms -> send(test_pid, {:retry_sleep, delay_ms}) end
+      )
+
+    assert result == :ok
+    assert Agent.get(attempts, & &1) == 7
+
+    assert_receive {:retry_sleep, 1}
+    assert_receive {:retry_sleep, 2}
+    assert_receive {:retry_sleep, 4}
+    assert_receive {:retry_sleep, 8}
+    assert_receive {:retry_sleep, 8}
+    assert_receive {:retry_sleep, 8}
+    refute_receive {:retry_sleep, _delay_ms}
+  end
+
+  test "bulk put entries are parsed once before lock retries" do
+    source =
+      File.read!(Path.expand("../../../lib/ferricstore/flow/native_ordered_index.ex", __DIR__))
+
+    assert source =~
+             ~r/def put_entries\(resource, entries\) do\s+native_entries = parse_entries\(entries\)\s+retry_busy\(fn -> NIF\.flow_index_put_entries\(resource, native_entries\) end\)\s+end/
+
+    assert source =~
+             ~r/def put_new_entries\(resource, entries\) do\s+native_entries = parse_entries\(entries\)\s+retry_busy\(fn -> NIF\.flow_index_put_new_entries\(resource, native_entries\) end\)\s+end/
+  end
+
+  test "bulk writes reject invalid scores before mutating the index" do
+    native = NativeOrderedIndex.new()
+
+    assert_raise ArgumentError, fn ->
+      NativeOrderedIndex.put_entries(native, [
+        {"state:queued", "flow-1", 1},
+        {"state:queued", "flow-2", :invalid}
+      ])
+    end
+
+    assert [] = NativeOrderedIndex.rank_range(native, "state:queued", 0, 10, false)
+  end
+
+  test "grouped writes reject unknown operations before mutating the index" do
+    native = NativeOrderedIndex.new()
+
+    assert_raise ArgumentError, fn ->
+      NativeOrderedIndex.apply_batch(native, [
+        {:put_entries, [{"state:queued", "flow-1", 1}]},
+        {:unknown_operation, "state:queued"}
+      ])
+    end
+
+    assert [] = NativeOrderedIndex.rank_range(native, "state:queued", 0, 10, false)
   end
 
   test "native bulk delete removes members across keys in one call", %{

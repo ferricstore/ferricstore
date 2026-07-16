@@ -700,6 +700,14 @@ defmodule Ferricstore.InstanceTest do
       assert :ok = FerricStore.Impl.tdigest_add(ctx, "impl_td", [1, 2, 3, 4, 5])
     end
 
+    test "tdigest preserves custom integer compression through the instance API" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "impl_td_custom_#{System.unique_integer([:positive])}"
+
+      assert :ok = FerricStore.Impl.tdigest_create(ctx, key, compression: 200)
+      assert {:ok, ["Compression", 200 | _rest]} = FerricStore.Impl.tdigest_info(ctx, key)
+    end
+
     test "keys and dbsize" do
       ctx = FerricStore.Instance.get(:default)
       FerricStore.Impl.set(ctx, "impl_k1", "v1")
@@ -715,6 +723,21 @@ defmodule Ferricstore.InstanceTest do
       assert {:ok, "val"} = FerricStore.Impl.get(ctx, "impl_flush")
       :ok = FerricStore.Impl.flushdb(ctx)
       assert {:ok, nil} = FerricStore.Impl.get(ctx, "impl_flush")
+    end
+
+    test "flushdb preserves durable server control-plane records" do
+      ctx = FerricStore.Instance.get(:default)
+      namespace = "flush-control-plane-#{System.unique_integer([:positive, :monotonic])}"
+      key = Ferricstore.ServerCatalog.revision_key(namespace)
+      value = Ferricstore.ServerCatalog.encode_revision(17)
+
+      assert :ok = Ferricstore.Store.Router.put(ctx, key, value, 0)
+      assert :ok = FerricStore.Impl.set(ctx, "impl_flush_user_data", "value")
+      on_exit(fn -> Ferricstore.Store.Router.delete(ctx, key) end)
+
+      assert :ok = FerricStore.Impl.flushdb(ctx)
+      assert value == Ferricstore.Store.Router.get(ctx, key)
+      assert {:ok, nil} = FerricStore.Impl.get(ctx, "impl_flush_user_data")
     end
 
     test "flushdb uses quorum deletes after async pressure path removal" do

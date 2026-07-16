@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.CompoundCommandTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.ErrorReasons
   alias Ferricstore.Store.CompoundCommand
 
   @cross_shard_path Path.expand(
@@ -28,16 +29,23 @@ defmodule Ferricstore.Store.CompoundCommandTest do
   end
 
   test "normalizes compound batch Raft replies consistently" do
-    assert CompoundCommand.normalize_batch_reply(:ok) == :ok
-    assert CompoundCommand.normalize_batch_reply({:ok, [:ok, :ok]}) == :ok
+    assert CompoundCommand.normalize_batch_reply(:ok, 2) == :ok
+    assert CompoundCommand.normalize_batch_reply({:ok, [:ok, :ok]}, 2) == :ok
 
-    assert CompoundCommand.normalize_batch_reply({:ok, [:ok, {:error, :disk_full}]}) ==
+    assert CompoundCommand.normalize_batch_reply({:ok, [:ok, {:error, :disk_full}]}, 2) ==
              {:error, :disk_full}
 
-    assert CompoundCommand.normalize_batch_reply({:error, :unavailable}) ==
+    assert CompoundCommand.normalize_batch_reply({:error, :unavailable}, 2) ==
              {:error, :unavailable}
 
-    assert CompoundCommand.normalize_batch_reply(:unexpected) == {:error, :unexpected}
+    assert CompoundCommand.normalize_batch_reply(:unexpected, 2) == {:error, :unexpected}
+
+    unknown = ErrorReasons.write_timeout_unknown()
+
+    assert CompoundCommand.normalize_batch_reply({:ok, [:ok]}, 2) == unknown
+    assert CompoundCommand.normalize_batch_reply({:ok, [:ok, :ok, :ok]}, 2) == unknown
+    assert CompoundCommand.normalize_batch_reply({:ok, :invalid}, 2) == unknown
+    assert CompoundCommand.normalize_batch_reply({:ok, [:ok, :invalid]}, 2) == unknown
   end
 
   test "cross-shard LocalTxStore routes compound prefix delete through Router" do

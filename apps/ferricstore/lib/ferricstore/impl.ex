@@ -1,7 +1,8 @@
 defmodule FerricStore.Impl do
   @moduledoc "Elixir-native implementation of all FerricStore data-type operations, delegating to Router and command handlers."
 
-  alias Ferricstore.HLC
+  alias Ferricstore.EmbeddedStringValidation
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
 
   alias Ferricstore.Commands.{
@@ -22,68 +23,48 @@ defmodule FerricStore.Impl do
   # ---------------------------------------------------------------
 
   @spec set(FerricStore.Instance.t(), binary(), binary(), keyword()) ::
-          :ok | {:ok, binary() | nil} | {:ok, boolean()} | {:error, term()}
+          :ok | nil | {:ok, binary() | nil} | {:ok, boolean()} | {:error, term()}
   def set(ctx, key, value, opts \\ []) do
-    ttl = Keyword.get(opts, :ttl, 0)
-    nx = Keyword.get(opts, :nx, false)
-    xx = Keyword.get(opts, :xx, false)
-    get = Keyword.get(opts, :get, false)
-    keepttl = Keyword.get(opts, :keepttl, false)
-    exat = Keyword.get(opts, :exat)
-    pxat = Keyword.get(opts, :pxat)
-
-    expire_at_ms = resolve_expire_at(keepttl, pxat, exat, ttl)
-    do_set(ctx, key, value, expire_at_ms, get, nx, xx)
-  end
-
-  defp resolve_expire_at(true, _pxat, _exat, _ttl), do: :keepttl
-  defp resolve_expire_at(_kttl, pxat, _exat, _ttl) when pxat != nil, do: pxat
-  defp resolve_expire_at(_kttl, _pxat, exat, _ttl) when exat != nil, do: exat * 1000
-  defp resolve_expire_at(_kttl, _pxat, _exat, ttl) when ttl > 0, do: HLC.now_ms() + ttl
-  defp resolve_expire_at(_kttl, _pxat, _exat, _ttl), do: 0
-
-  defp do_set(ctx, key, value, expire_at_ms, true, nx, xx) do
-    old = Router.get(ctx, key)
-
-    if (nx and old != nil) or (xx and old == nil) do
-      {:ok, old}
-    else
-      case Router.put(ctx, key, value, expire_at_ms) do
-        :ok -> {:ok, old}
-        {:error, _reason} = error -> error
-      end
+    with {:ok, parsed} <- EmbeddedStringValidation.parse_set_options(opts),
+         :ok <- EmbeddedStringValidation.validate_value_size(ctx, value) do
+      set_inner(ctx, key, value, parsed)
     end
   end
 
-  defp do_set(ctx, key, value, expire_at_ms, _get, true, _xx) do
-    if Router.exists?(ctx, key) do
-      {:ok, false}
-    else
-      case Router.put(ctx, key, value, expire_at_ms) do
-        :ok -> {:ok, true}
-        {:error, _reason} = error -> error
-      end
-    end
+  defp set_inner(ctx, key, value, parsed) do
+    result = Strings.handle_ast({:set, key, value, set_command_options(parsed)}, ctx)
+    normalize_set_result(result, parsed.get, parsed.nx)
   end
 
-  defp do_set(ctx, key, value, expire_at_ms, _get, _nx, true) do
-    if Router.exists?(ctx, key) do
-      Router.put(ctx, key, value, expire_at_ms)
-    else
-      :ok
-    end
+  defp set_command_options(parsed) do
+    []
+    |> maybe_add_set_option(parsed.has_expiry, {:pxat, parsed.expire_at_ms})
+    |> maybe_add_set_option(parsed.nx, :nx)
+    |> maybe_add_set_option(parsed.xx, :xx)
+    |> maybe_add_set_option(parsed.get, :get)
+    |> maybe_add_set_option(parsed.keepttl, :keepttl)
   end
 
-  defp do_set(ctx, key, value, expire_at_ms, _get, _nx, _xx) do
-    Router.put(ctx, key, value, expire_at_ms)
-  end
+  defp maybe_add_set_option(options, true, option), do: [option | options]
+  defp maybe_add_set_option(options, false, _option), do: options
 
-  @spec get(FerricStore.Instance.t(), binary(), keyword()) :: {:ok, binary() | nil}
+  defp normalize_set_result({:error, _reason} = error, _get, _nx), do: error
+  defp normalize_set_result(result, true, _nx), do: {:ok, result}
+  defp normalize_set_result(:ok, false, true), do: {:ok, true}
+  defp normalize_set_result(nil, false, true), do: {:ok, false}
+  defp normalize_set_result(result, false, _nx), do: result
+
+  @spec get(FerricStore.Instance.t(), binary(), keyword()) ::
+          {:ok, binary() | nil} | ReadResult.failure()
   def get(ctx, key, _opts \\ []) do
-    {:ok, Router.get(ctx, key)}
+    ctx
+    |> then(&Strings.handle_ast({:get, key}, &1))
+    |> wrap_result()
   end
 
   @spec del(FerricStore.Instance.t(), [binary()]) :: {:ok, non_neg_integer()} | {:error, term()}
+  def del(_ctx, []), do: {:ok, 0}
+
   def del(ctx, keys) when is_list(keys) do
     ctx
     |> build_store()
@@ -99,104 +80,119 @@ defmodule FerricStore.Impl do
   @spec incr(FerricStore.Instance.t(), binary(), integer()) ::
           {:ok, integer()} | {:error, binary()}
   def incr(ctx, key, delta) do
-    Router.incr(ctx, key, delta)
+    Strings.handle_ast({:incrby, key, delta}, ctx)
   end
 
   @spec incr_float(FerricStore.Instance.t(), binary(), float()) ::
           {:ok, binary()} | {:error, binary()}
   def incr_float(ctx, key, delta) do
-    Router.incr_float(ctx, key, delta)
+    Strings.handle_ast({:incrbyfloat, key, delta / 1}, ctx)
   end
 
-  @spec mget(FerricStore.Instance.t(), [binary()]) :: {:ok, [binary() | nil]}
+  @spec mget(FerricStore.Instance.t(), [binary()]) ::
+          {:ok, [binary() | nil]} | ReadResult.failure()
   def mget(ctx, keys) do
     results = Router.batch_get(ctx, keys)
-    {:ok, results}
+
+    case ReadResult.first_failure(results) do
+      nil -> {:ok, results}
+      failure -> failure
+    end
   end
 
-  @spec mset(FerricStore.Instance.t(), [{binary(), binary()}]) :: :ok | {:error, term()}
-  def mset(ctx, pairs) do
-    Router.batch_quorum_put_status(ctx, pairs)
+  @spec mset(FerricStore.Instance.t(), %{binary() => binary()} | [{binary(), binary()}]) ::
+          :ok | {:error, term()}
+  def mset(ctx, pairs) when is_map(pairs) do
+    Router.atomic_mset(ctx, Map.to_list(pairs))
+  end
+
+  def mset(ctx, pairs) when is_list(pairs) do
+    Router.atomic_mset(ctx, pairs)
   end
 
   @spec append(FerricStore.Instance.t(), binary(), binary()) :: {:ok, non_neg_integer()}
   def append(ctx, key, suffix) do
-    Router.append(ctx, key, suffix)
+    ctx
+    |> then(&Strings.handle_ast({:append, key, suffix}, &1))
+    |> wrap_result()
   end
 
-  @spec strlen(FerricStore.Instance.t(), binary()) :: {:ok, non_neg_integer()}
+  @spec strlen(FerricStore.Instance.t(), binary()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
   def strlen(ctx, key) do
-    case Router.get(ctx, key) do
-      nil -> {:ok, 0}
-      val when is_binary(val) -> {:ok, byte_size(val)}
-      val -> {:ok, byte_size(to_string(val))}
-    end
+    ctx
+    |> then(&Strings.handle_ast({:strlen, key}, &1))
+    |> wrap_result()
   end
 
-  @spec getset(FerricStore.Instance.t(), binary(), binary()) :: {:ok, binary() | nil}
+  @spec getset(FerricStore.Instance.t(), binary(), binary()) ::
+          {:ok, binary() | nil} | {:error, term()}
   def getset(ctx, key, value) do
-    old = Router.getset(ctx, key, value)
-    {:ok, old}
+    ctx
+    |> then(&Strings.handle_ast({:getset, key, value}, &1))
+    |> wrap_result()
   end
 
-  @spec getdel(FerricStore.Instance.t(), binary()) :: {:ok, binary() | nil}
+  @spec getdel(FerricStore.Instance.t(), binary()) ::
+          {:ok, binary() | nil} | {:error, term()}
   def getdel(ctx, key) do
-    old = Router.getdel(ctx, key)
-    {:ok, old}
+    ctx
+    |> then(&Strings.handle_ast({:getdel, key}, &1))
+    |> wrap_result()
   end
 
-  @spec getex(FerricStore.Instance.t(), binary(), keyword()) :: {:ok, binary() | nil}
+  @spec getex(FerricStore.Instance.t(), binary(), keyword()) ::
+          {:ok, binary() | nil} | {:error, term()}
   def getex(ctx, key, opts) do
-    ttl = Keyword.get(opts, :ttl, 0)
-    expire_at_ms = if ttl > 0, do: HLC.now_ms() + ttl, else: 0
-    val = Router.getex(ctx, key, expire_at_ms)
-    {:ok, val}
+    with {:ok, expire_at_ms} <- EmbeddedStringValidation.parse_getex_options(opts) do
+      command =
+        case expire_at_ms do
+          nil -> {:getex, key}
+          0 -> {:getex, key, :persist}
+          expire_at_ms -> {:getex, key, {:pxat, expire_at_ms}}
+        end
+
+      ctx
+      |> then(&Strings.handle_ast(command, &1))
+      |> wrap_result()
+    end
   end
 
   @spec setnx(FerricStore.Instance.t(), binary(), binary()) :: {:ok, boolean()} | {:error, term()}
-  def setnx(ctx, key, value) do
-    if Router.exists?(ctx, key) do
-      {:ok, false}
-    else
-      case Router.put(ctx, key, value, 0) do
-        :ok -> {:ok, true}
-        {:error, _reason} = error -> error
-      end
-    end
-  end
+  def setnx(ctx, key, value), do: set(ctx, key, value, nx: true)
 
   @spec setex(FerricStore.Instance.t(), binary(), pos_integer(), binary()) ::
           :ok | {:error, term()}
   def setex(ctx, key, seconds, value) do
-    expire_at_ms = HLC.now_ms() + seconds * 1000
-    Router.put(ctx, key, value, expire_at_ms)
+    with :ok <- EmbeddedStringValidation.validate_positive_expiry(seconds, "setex"),
+         :ok <- EmbeddedStringValidation.validate_value_size(ctx, value) do
+      Strings.handle_ast({:setex, key, seconds, value}, ctx)
+    end
   end
 
   @spec psetex(FerricStore.Instance.t(), binary(), pos_integer(), binary()) ::
           :ok | {:error, term()}
   def psetex(ctx, key, milliseconds, value) do
-    expire_at_ms = HLC.now_ms() + milliseconds
-    Router.put(ctx, key, value, expire_at_ms)
+    with :ok <- EmbeddedStringValidation.validate_positive_expiry(milliseconds, "psetex"),
+         :ok <- EmbeddedStringValidation.validate_value_size(ctx, value) do
+      Strings.handle_ast({:psetex, key, milliseconds, value}, ctx)
+    end
   end
 
-  @spec getrange(FerricStore.Instance.t(), binary(), integer(), integer()) :: {:ok, binary()}
+  @spec getrange(FerricStore.Instance.t(), binary(), integer(), integer()) ::
+          {:ok, binary()} | {:error, term()}
   def getrange(ctx, key, start, stop) do
-    case Router.get(ctx, key) do
-      nil ->
-        {:ok, ""}
-
-      val ->
-        len = byte_size(val)
-        s = if start < 0, do: max(len + start, 0), else: min(start, len)
-        e = if stop < 0, do: max(len + stop, 0), else: min(stop, len - 1)
-        if s > e, do: {:ok, ""}, else: {:ok, binary_part(val, s, e - s + 1)}
-    end
+    ctx
+    |> then(&Strings.handle_ast({:getrange, key, start, stop}, &1))
+    |> wrap_result()
   end
 
   @spec setrange(FerricStore.Instance.t(), binary(), non_neg_integer(), binary()) ::
           {:ok, non_neg_integer()}
   def setrange(ctx, key, offset, value) do
-    Router.setrange(ctx, key, offset, value)
+    ctx
+    |> then(&Strings.handle_ast({:setrange, key, offset, value}, &1))
+    |> wrap_result()
   end
 
   # ---------------------------------------------------------------
@@ -215,11 +211,12 @@ defmodule FerricStore.Impl do
     Expiry.handle_ast({:pexpire, key, milliseconds}, store)
   end
 
-  @spec ttl(FerricStore.Instance.t(), binary()) :: {:ok, integer()}
+  @spec ttl(FerricStore.Instance.t(), binary()) :: {:ok, integer()} | {:error, term()}
   def ttl(ctx, key) do
     store = build_store(ctx)
 
     case Expiry.handle_ast({:pttl, key}, store) do
+      {:error, _reason} = error -> error
       ms when is_integer(ms) and ms > 0 -> {:ok, ms}
       -1 -> {:ok, -1}
       -2 -> {:ok, -2}
@@ -227,7 +224,7 @@ defmodule FerricStore.Impl do
     end
   end
 
-  @spec pttl(FerricStore.Instance.t(), binary()) :: {:ok, integer()}
+  @spec pttl(FerricStore.Instance.t(), binary()) :: {:ok, integer()} | {:error, term()}
   def pttl(ctx, key) do
     ttl(ctx, key)
   end
@@ -846,7 +843,7 @@ defmodule FerricStore.Impl do
           :ok | {:error, binary()}
   def topk_reserve(ctx, key, k) do
     store = build_prob_store(ctx, key)
-    TopK.handle_ast({:topk_reserve, key, k, 8, 7, 0.9}, store)
+    TopK.handle_ast({:topk_reserve, key, k, 8, 7}, store)
   end
 
   @spec topk_add(FerricStore.Instance.t(), binary(), [binary()]) ::
@@ -887,11 +884,7 @@ defmodule FerricStore.Impl do
   def tdigest_create(ctx, key, opts \\ []) do
     store = build_store(ctx)
 
-    compression =
-      case Keyword.get(opts, :compression) do
-        nil -> nil
-        c -> c * 1.0
-      end
+    compression = Keyword.get(opts, :compression)
 
     Router.with_key_latch(ctx, key, fn ->
       TDigest.handle_ast({:tdigest_create, key, compression}, store)
@@ -957,15 +950,25 @@ defmodule FerricStore.Impl do
   # Server / utility
   # ---------------------------------------------------------------
 
-  @spec keys(FerricStore.Instance.t(), keyword()) :: {:ok, [binary()]}
+  @spec keys(FerricStore.Instance.t(), keyword()) ::
+          {:ok, [binary()]} | Ferricstore.Store.ReadResult.failure()
   def keys(ctx, _opts \\ []) do
-    {:ok, ctx |> Router.keys() |> Ferricstore.Store.CompoundKey.user_visible_keys()}
+    case Router.keys(ctx) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      keys ->
+        {:ok, Ferricstore.Store.CompoundKey.user_visible_keys(keys)}
+    end
   end
 
-  @spec dbsize(FerricStore.Instance.t()) :: {:ok, non_neg_integer()}
+  @spec dbsize(FerricStore.Instance.t()) ::
+          {:ok, non_neg_integer()} | Ferricstore.Store.ReadResult.failure()
   def dbsize(ctx) do
-    {:ok, keys} = keys(ctx)
-    {:ok, length(keys)}
+    case Router.dbsize(ctx) do
+      size when is_integer(size) and size >= 0 -> {:ok, size}
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+    end
   end
 
   @spec flushdb(FerricStore.Instance.t()) :: :ok | {:error, term()}

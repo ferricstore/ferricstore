@@ -10,16 +10,19 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   alias Ferricstore.Flow.NativeOrderedIndex
   alias Ferricstore.Flow.RetentionCleanupMember
   alias Ferricstore.Flow.RetentionGuard
+  alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
+  alias Ferricstore.TermCodec
 
   @version 2
   @default_batch_size 512
   @default_batch_bytes 4 * 1_024 * 1_024
   @cold_read_timeout_ms 30_000
+  @default_fsync_timeout_ms 30_000
   @staging_root "__ferricstore:shared-ref-backfill:v2:"
 
   defguardp valid_waraft_location(file_id, offset, value_size)
@@ -72,6 +75,8 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       lmdb_path: LMDB.path(shard_path),
       batch_size: positive_opt(opts, :batch_size, @default_batch_size),
       batch_bytes: positive_opt(opts, :batch_bytes, @default_batch_bytes),
+      fsync_async: fsync_async_opt(opts),
+      fsync_timeout_ms: positive_opt(opts, :fsync_timeout_ms, @default_fsync_timeout_ms),
       active_file_id: Keyword.get(opts, :active_file_id),
       active_file_path: Keyword.get(opts, :active_file_path)
     }
@@ -115,6 +120,8 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       lmdb_path: LMDB.path(shard_path),
       batch_size: positive_opt(opts, :batch_size, @default_batch_size),
       batch_bytes: positive_opt(opts, :batch_bytes, @default_batch_bytes),
+      fsync_async: fsync_async_opt(opts),
+      fsync_timeout_ms: positive_opt(opts, :fsync_timeout_ms, @default_fsync_timeout_ms),
       active_file_id: Keyword.get(opts, :active_file_id),
       active_file_path: Keyword.get(opts, :active_file_path)
     }
@@ -144,16 +151,26 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
   defp require_empty_keydir!(keydir, shard_index) do
     case :ets.info(keydir, :size) do
-      0 ->
-        :ok
-
-      size when is_integer(size) and size <= 2 ->
+      size when is_integer(size) ->
         allowed = [
           Keys.shared_value_ref_backfill_key(shard_index),
           progress_key(shard_index)
         ]
 
-        if Enum.count(allowed, &:ets.member(keydir, &1)) == size do
+        only_metadata_or_server_catalog? =
+          :ets.foldl(
+            fn
+              {key, _value, _exp, _lfu, _file_id, _offset, _value_size}, true ->
+                key in allowed or ServerCatalog.internal_key?(key)
+
+              _entry, _allowed? ->
+                false
+            end,
+            true,
+            keydir
+          )
+
+        if only_metadata_or_server_catalog? do
           :ok
         else
           raise "shared-ref backfill empty-shard finalization requires an empty keydir"
@@ -161,9 +178,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
       :undefined ->
         raise "shared-ref backfill empty-shard finalization requires an available keydir"
-
-      _nonempty ->
-        raise "shared-ref backfill empty-shard finalization requires an empty keydir"
     end
   rescue
     error in ArgumentError ->
@@ -174,6 +188,13 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     case Keyword.get(opts, key, default) do
       value when is_integer(value) and value > 0 -> value
       _invalid -> default
+    end
+  end
+
+  defp fsync_async_opt(opts) do
+    case Keyword.get(opts, :fsync_async) do
+      fun when is_function(fun, 3) -> fun
+      _missing_or_invalid -> &NIF.v2_fsync_async/3
     end
   end
 
@@ -590,30 +611,72 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   end
 
   defp completion_certificate_run_id(ctx) do
-    case lmdb_get!(ctx, completion_key(ctx.shard_index)) do
-      {:ok, certificate} ->
-        case safe_binary_to_term(certificate) do
-          {:shared_ref_backfill_complete, @version, shard_index, run_id}
-          when shard_index == ctx.shard_index and is_binary(run_id) and run_id != "" ->
-            {:ok, run_id}
+    with {:ok, certificate} <-
+           completion_proof_value(ctx, completion_key(ctx.shard_index), :certificate),
+         {:ok, run_id} <- decode_completion_certificate(ctx, certificate),
+         {:ok, progress_value} <-
+           lookup_primary_value!(ctx, progress_key(ctx.shard_index)),
+         true <- complete_progress?(progress_value, run_id),
+         {:ok, ready_value} <-
+           completion_proof_value(ctx, ready_key(ctx.shard_index), :ready),
+         true <- ready_value == ready_proof(ctx, run_id),
+         {:ok, cleanup_value} <-
+           completion_proof_value(ctx, cleanup_proof_key(ctx.shard_index), :cleanup),
+         true <- cleanup_value == cleanup_proof(ctx, run_id),
+         {:ok, progress_proof} <-
+           completion_proof_value(ctx, progress_proof_key(ctx.shard_index), :progress),
+         true <- progress_proof == progress_value do
+      {:ok, run_id}
+    else
+      :not_found -> :missing_or_invalid
+      :missing_or_invalid -> :missing_or_invalid
+      false -> :missing_or_invalid
+      {:ok, _mismatched} -> :missing_or_invalid
+    end
+  end
 
-          _invalid ->
-            :missing_or_invalid
-        end
+  defp decode_completion_certificate(ctx, certificate) do
+    case safe_binary_to_term(certificate) do
+      {:shared_ref_backfill_complete, @version, shard_index, run_id}
+      when shard_index == ctx.shard_index and is_binary(run_id) and run_id != "" ->
+        if certificate == completion_certificate(shard_index, run_id),
+          do: {:ok, run_id},
+          else: :missing_or_invalid
+
+      _invalid ->
+        :missing_or_invalid
+    end
+  end
+
+  defp complete_progress?(encoded, run_id) when is_binary(encoded) and is_binary(run_id) do
+    case safe_binary_to_term(encoded) do
+      {:shared_ref_backfill_progress, @version, ^run_id, :complete, <<>>, processed}
+      when is_integer(processed) and processed >= 0 ->
+        encoded == encode_progress(progress(run_id, :complete, <<>>, processed))
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp completion_proof_value(ctx, key, proof) do
+    case lmdb_get!(ctx, key) do
+      {:ok, value} when is_binary(value) ->
+        {:ok, value}
 
       :not_found ->
         :missing_or_invalid
 
       {:error, reason} ->
-        raise "shared-ref backfill completion certificate read failed: #{inspect(reason)}"
+        raise "shared-ref backfill completion #{proof} read failed: #{inspect(reason)}"
 
       other ->
-        raise "shared-ref backfill completion certificate read returned #{inspect(other)}"
+        raise "shared-ref backfill completion #{proof} read returned #{inspect(other)}"
     end
   end
 
   defp completion_certificate(shard_index, run_id) do
-    :erlang.term_to_binary({:shared_ref_backfill_complete, @version, shard_index, run_id})
+    TermCodec.encode({:shared_ref_backfill_complete, @version, shard_index, run_id})
   end
 
   defp ready_key(shard_index),
@@ -626,10 +689,10 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     do: "__ferricstore:shared-ref-backfill:progress:v2:" <> Integer.to_string(shard_index)
 
   defp ready_proof(ctx, run_id),
-    do: :erlang.term_to_binary({:shared_ref_backfill_ready, @version, ctx.shard_index, run_id})
+    do: TermCodec.encode({:shared_ref_backfill_ready, @version, ctx.shard_index, run_id})
 
   defp cleanup_proof(ctx, run_id),
-    do: :erlang.term_to_binary({:shared_ref_backfill_clean, @version, ctx.shard_index, run_id})
+    do: TermCodec.encode({:shared_ref_backfill_clean, @version, ctx.shard_index, run_id})
 
   defp verified_key(instance_name, shard_index),
     do: {__MODULE__, :verified_complete, instance_name, shard_index}
@@ -675,7 +738,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
           if migration_primary_key?(ctx, key) or not migration_candidate_key?(key) do
             []
           else
-            [{:put, work_key(run_id, key), :erlang.term_to_binary({:key, key})}]
+            [{:put, work_key(run_id, key), TermCodec.encode({:key, key})}]
           end
 
         {:invalid} ->
@@ -821,11 +884,11 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
     lmdb_write_batch!(ctx, [
       {:put, registry_snapshot_key(run_id, registry_key),
-       :erlang.term_to_binary({:registry_snapshot, registry_key, registry_digest})}
+       TermCodec.encode({:registry_snapshot, registry_key, registry_digest})}
     ])
 
     lmdb_write_stream_bounded!(ctx, :contributions, refs, fn ref ->
-      value = :erlang.term_to_binary({:shared_ref, ref, registry_key, registry_digest})
+      value = TermCodec.encode({:shared_ref, ref, registry_key, registry_digest})
       {:put, contribution_key(run_id, ref, registry_key), value}
     end)
   end
@@ -876,9 +939,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
          true <- canonical == value,
          {:ok, snapshot} <- lmdb_get!(ctx, registry_snapshot_key(run_id, registry_key)) do
       snapshot ==
-        :erlang.term_to_binary(
-          {:registry_snapshot, registry_key, :crypto.hash(:sha256, canonical)}
-        )
+        TermCodec.encode({:registry_snapshot, registry_key, :crypto.hash(:sha256, canonical)})
     else
       :not_found ->
         false
@@ -954,14 +1015,14 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
     lmdb_write_batch!(ctx, [
       {:put, count_result_key(run_id, count_key),
-       :erlang.term_to_binary({:count_result, count_key, count})}
+       TermCodec.encode({:count_result, count_key, count})}
     ])
   end
 
   defp stage_existing_count!(ctx, run_id, count_key) do
     lmdb_write_batch!(ctx, [
       {:put, existing_count_key(run_id, count_key),
-       :erlang.term_to_binary({:existing_count, count_key})}
+       TermCodec.encode({:existing_count, count_key})}
     ])
   end
 
@@ -981,7 +1042,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
       :not_found -> :ok
     end
 
-    persist_puts!(ctx, %{count_key => :erlang.term_to_binary(count)})
+    persist_puts!(ctx, %{count_key => TermCodec.encode(count)})
   end
 
   defp orphan_count_key!(ctx, run_id, encoded) do
@@ -1086,17 +1147,14 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
           _missing -> :not_owned
         end
 
-      {:shared_value, tag, remainder} ->
-        with {:ok, ref_id, version} <- split_versioned_ref(remainder),
-             {:ok, info} <-
-               find_shared_value_owner_info(ctx, tag, ref_id, version, key) do
-          {:ok, info, []}
-        else
-          _missing -> :not_owned
-        end
+      {:shared_value, _tag, _remainder} ->
+        :not_owned
 
-      {:shared_link, tag, remainder} ->
-        shared_link_owner_info(ctx, tag, remainder, key, value)
+      {:named_shared_value, tag, _remainder} ->
+        named_shared_value_owner_info(ctx, tag, key)
+
+      {:shared_link, tag, _remainder} ->
+        shared_link_owner_info(ctx, tag, key, value)
 
       {:governance_effect, _tag, _remainder} ->
         governance_owner_info(ctx, :effect, key, value)
@@ -1112,80 +1170,58 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     end
   end
 
-  defp find_shared_value_owner_info(ctx, tag, ref_id, version, ref) do
-    Enum.reduce_while(owner_candidates(ref_id), :not_found, fn id, :not_found ->
+  defp named_shared_value_owner_info(ctx, tag, key) do
+    with {:ok, id, name, version} <- Keys.named_shared_value_parts(key) do
       state_key = "f:" <> tag <> ":s:" <> id
 
       case lookup_record!(ctx, state_key) do
         {:ok, %{id: ^id} = record} ->
-          if shared_value_link_matches?(ctx, tag, id, ref_id, version, ref) do
-            {:halt, {:ok, record_info(record)}}
-          else
-            {:cont, :not_found}
+          link_key =
+            Keys.shared_value_link_key(id, name, version, Map.get(record, :partition_key))
+
+          case lookup_primary_value!(ctx, link_key) do
+            {:ok, ^key} -> {:ok, record_info(record), []}
+            _missing_or_changed -> :not_owned
           end
 
         {:ok, _mismatched} ->
           raise "shared-ref backfill found mismatched state identity"
 
         :not_found ->
-          {:cont, :not_found}
+          :not_owned
       end
-    end)
+    else
+      :error -> raise "shared-ref backfill found corrupt named shared-value key #{inspect(key)}"
+    end
   end
 
-  defp shared_link_owner_info(ctx, tag, remainder, key, value) do
+  defp shared_link_owner_info(ctx, tag, key, value) do
     unless is_binary(value) and Keys.shared_value_ref?(value) do
       raise "shared-ref backfill found corrupt shared-value link #{inspect(key)}"
     end
 
-    result =
-      Enum.reduce_while(owner_candidates(remainder), :not_found, fn id, :not_found ->
-        state_key = "f:" <> tag <> ":s:" <> id
+    with {:ok, id, name, version} <- Keys.shared_value_link_parts(key) do
+      state_key = "f:" <> tag <> ":s:" <> id
 
-        case lookup_record!(ctx, state_key) do
-          {:ok, %{id: ^id} = record} ->
-            if shared_link_matches_owner?(key, value, remainder, record) do
-              {:halt, {:ok, record_info(record)}}
-            else
-              {:cont, :not_found}
-            end
+      case lookup_record!(ctx, state_key) do
+        {:ok, %{id: ^id} = record} ->
+          expected_ref =
+            Keys.named_shared_value_key(id, name, version, Map.get(record, :partition_key))
 
-          {:ok, _mismatched} ->
-            raise "shared-ref backfill found mismatched state identity"
+          if value == expected_ref do
+            {:ok, record_info(record), [value]}
+          else
+            raise "shared-ref backfill found mismatched shared-value link"
+          end
 
-          :not_found ->
-            {:cont, :not_found}
-        end
-      end)
+        {:ok, _mismatched} ->
+          raise "shared-ref backfill found mismatched state identity"
 
-    case result do
-      {:ok, info} -> {:ok, info, [value]}
-      :not_found -> :not_owned
-    end
-  end
-
-  defp shared_link_matches_owner?(key, value, remainder, record) do
-    id = Map.fetch!(record, :id)
-    prefix = id <> ":"
-
-    with true <- String.starts_with?(remainder, prefix),
-         name_version <-
-           binary_part(remainder, byte_size(prefix), byte_size(remainder) - byte_size(prefix)),
-         {:ok, name, version} <- split_versioned_ref(name_version),
-         expected_link <-
-           Keys.shared_value_link_prefix(id, Map.get(record, :partition_key)) <>
-             name <> ":" <> version,
-         {version_number, ""} <- Integer.parse(version),
-         expected_ref <-
-           Keys.value_key(
-             id <> ":" <> name,
-             :shared,
-             version_number,
-             Map.get(record, :partition_key)
-           ) do
-      key == expected_link and value == expected_ref
+        :not_found ->
+          :not_owned
+      end
     else
-      _invalid -> false
+      :error -> raise "shared-ref backfill found corrupt shared-value link key #{inspect(key)}"
     end
   end
 
@@ -1266,22 +1302,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
       _empty_or_invalid ->
         :not_owned
-    end
-  end
-
-  defp shared_value_link_matches?(ctx, tag, owner_id, ref_id, version, ref) do
-    prefix = owner_id <> ":"
-
-    if String.starts_with?(ref_id, prefix) do
-      name = binary_part(ref_id, byte_size(prefix), byte_size(ref_id) - byte_size(prefix))
-      link_key = "f:" <> tag <> ":svl:" <> owner_id <> ":" <> name <> ":" <> version
-
-      case lookup_primary_value!(ctx, link_key) do
-        {:ok, ^ref} -> true
-        _missing_or_changed -> false
-      end
-    else
-      false
     end
   end
 
@@ -1393,7 +1413,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     raise "shared-ref backfill found corrupt registry #{inspect(key)}"
   end
 
-  defp encode_registry(refs), do: refs |> Enum.sort() |> :erlang.term_to_binary()
+  defp encode_registry(refs), do: refs |> Enum.sort() |> TermCodec.encode()
 
   defp decode_count!(value, key) when is_binary(value) do
     case safe_binary_to_term(value) do
@@ -1425,9 +1445,10 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   end
 
   defp safe_binary_to_term(value) do
-    :erlang.binary_to_term(value, [:safe])
-  rescue
-    _ -> :invalid
+    case TermCodec.decode(value) do
+      {:ok, term} -> term
+      {:error, :invalid_external_term} -> :invalid
+    end
   end
 
   defp record_info(record) do
@@ -1466,34 +1487,33 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     id = Map.fetch!(record, :id)
     partition_key = Map.get(record, :partition_key)
 
-    Enum.any?([:payload, :result, :error, :shared], fn kind ->
-      prefix = owned_value_prefix(id, kind, partition_key)
+    named_shared_value_owned_by?(ref, id, partition_key) or
+      Enum.any?([:payload, :result, :error, :shared], fn kind ->
+        prefix = owned_value_prefix(id, kind, partition_key)
 
-      if String.starts_with?(ref, prefix) do
-        suffix = binary_part(ref, byte_size(prefix), byte_size(ref) - byte_size(prefix))
-        owned_value_suffix?(suffix, kind)
-      else
+        if String.starts_with?(ref, prefix) do
+          suffix = binary_part(ref, byte_size(prefix), byte_size(ref) - byte_size(prefix))
+          owned_value_suffix?(suffix, kind)
+        else
+          false
+        end
+      end)
+  end
+
+  defp named_shared_value_owned_by?(ref, id, partition_key) do
+    case Keys.named_shared_value_parts(ref) do
+      {:ok, ^id, name, version} ->
+        ref == Keys.named_shared_value_key(id, name, version, partition_key)
+
+      _not_owned ->
         false
-      end
-    end)
+    end
   end
 
   defp owned_value_prefix(id, kind, partition_key) do
     key = Keys.value_key(id, kind, 0, partition_key)
     {position, 1} = key |> :binary.matches(":") |> List.last()
     binary_part(key, 0, position + 1)
-  end
-
-  defp owned_value_suffix?(suffix, :shared) do
-    value_version?(suffix) or
-      case :binary.matches(suffix, ":") do
-        [] ->
-          false
-
-        matches ->
-          {position, 1} = List.last(matches)
-          value_version?(binary_part(suffix, position + 1, byte_size(suffix) - position - 1))
-      end
   end
 
   defp owned_value_suffix?(suffix, _kind), do: value_version?(suffix)
@@ -1513,6 +1533,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
           {":v:r:", :private_value},
           {":v:e:", :private_value},
           {":v:s:", :shared_value},
+          {":v:n:", :named_shared_value},
           {":svl:", :shared_link},
           {":gov:e:", :governance_effect},
           {":gov:l:", :governance_ledger},
@@ -1587,18 +1608,6 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
         version = binary_part(remainder, position + 1, byte_size(remainder) - position - 1)
         if id != "" and value_version?(version), do: {:ok, id, version}, else: :error
     end
-  end
-
-  defp owner_candidates(remainder) do
-    prefixes =
-      remainder
-      |> :binary.matches(":")
-      |> Enum.reverse()
-      |> Enum.map(fn {position, 1} -> binary_part(remainder, 0, position) end)
-
-    [remainder | prefixes]
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.uniq()
   end
 
   defp history_entry_key?(key), do: match?({:ok, _state_key}, history_state_key(key))
@@ -1957,7 +1966,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     {_file_id, file_path} = active_file(ctx)
     correlation_id = System.unique_integer([:positive])
 
-    case NIF.v2_fsync_async(self(), correlation_id, file_path) do
+    case ctx.fsync_async.(self(), correlation_id, file_path) do
       :ok ->
         receive do
           {:tokio_complete, ^correlation_id, :ok, _result} ->
@@ -1965,6 +1974,9 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
           {:tokio_complete, ^correlation_id, :error, reason} ->
             raise "shared-ref backfill fsync failed: #{inspect(reason)}"
+        after
+          ctx.fsync_timeout_ms ->
+            raise "shared-ref backfill fsync timed out after #{ctx.fsync_timeout_ms}ms"
         end
 
       {:error, reason} ->
@@ -2149,7 +2161,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   end
 
   defp encode_progress(progress) do
-    :erlang.term_to_binary(
+    TermCodec.encode(
       {:shared_ref_backfill_progress, @version, progress.run_id, progress.phase, progress.cursor,
        progress.processed}
     )
@@ -2168,7 +2180,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   end
 
   defp encode_count_cursor(after_key, ref, count) do
-    :erlang.term_to_binary({after_key, ref, count})
+    TermCodec.encode({after_key, ref, count})
   end
 
   defp decode_count_cursor!(encoded) do

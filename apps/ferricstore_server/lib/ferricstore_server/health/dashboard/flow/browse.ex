@@ -4,6 +4,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
   alias FerricstoreServer.Health.Dashboard.Flow.Fifo
   alias FerricstoreServer.Health.Dashboard.Flow.Projection
+  alias FerricstoreServer.Health.QueryDecoder
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
   import FerricstoreServer.Health.Dashboard.Flow.Sample
@@ -48,7 +49,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
 
   @spec overview_opts_from_query(binary()) :: keyword()
   def overview_opts_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     []
     |> maybe_put_query_opt(
@@ -111,7 +112,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
 
   @spec states_opts_from_query(binary()) :: keyword()
   def states_opts_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     []
     |> maybe_put_query_opt(:type, normalize_flow_type_filter(Map.get(params, "type")))

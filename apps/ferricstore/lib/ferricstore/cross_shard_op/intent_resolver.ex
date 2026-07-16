@@ -2,20 +2,20 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
   @moduledoc """
   Resolves stale intents left by crashed cross-shard operation coordinators.
 
-  On startup (or on-demand), scans all shards for intent records with
+  On startup (or on-demand), scans all shards for current intent records with
   status `:executing`. For each stale intent:
 
     * Checks if the intent is old enough to be considered stale (>10s)
-    * Reads current lightweight watch tokens for involved keys
-    * Compares tokens with the intent snapshot
-    * If token matches: data unchanged, safe to clean up the intent
-    * If token doesn't match: someone wrote new data, clean up intent (don't re-execute)
-    * If key doesn't exist: already completed or expired, clean up intent
+    * Uses the flat watch-token key set to release owner-matched locks
+    * Deletes the cleanup record without re-executing a non-idempotent command
 
   Intent records are self-describing: they contain the command type, involved
-  keys, and expected value hashes.
+  keys, and a non-empty watch-token map. Token values are retained for
+  diagnostics; recovery never performs extra reads because token comparison
+  cannot make arbitrary command re-execution safe.
   """
 
+  alias Ferricstore.CrossShardOp.Intent
   alias Ferricstore.HLC
   alias Ferricstore.Raft.Cluster
   alias Ferricstore.Raft.CommandClock
@@ -66,74 +66,68 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
   end
 
   defp resolve_single_intent(shard_idx, owner_ref, intent) do
-    now = HLC.now_ms()
-    created_at = Map.get(intent, :created_at, 0)
-
-    if now - created_at > @stale_threshold_ms do
-      # Intent is old enough to be considered stale. Check value hashes
-      # to determine the state of the data.
-      value_hashes = Map.get(intent, :value_hashes, %{})
-      keys_map = Map.get(intent, :keys, %{})
-
-      should_cleanup =
-        if map_size(value_hashes) == 0 do
-          # No hashes stored — legacy intent or no keys tracked.
-          # Clean up based on age alone.
-          true
-        else
-          # Check each key's current token against the stored token.
-          check_value_hashes(value_hashes, keys_map)
-        end
-
-      if should_cleanup do
-        shard_id = Cluster.shard_server_id(shard_idx)
-        CommandClock.process_command(shard_id, {:delete_intent, owner_ref})
-
-        # Also unlock any keys associated with this intent on their respective shards
-        unlock_intent_keys(keys_map, owner_ref)
-      end
+    delete_intent = fn owner_ref ->
+      shard_idx
+      |> Cluster.shard_server_id()
+      |> CommandClock.process_command({:delete_intent, owner_ref})
+      |> command_ok()
     end
 
-    :ok
+    resolve_stale_intent(
+      owner_ref,
+      intent,
+      HLC.now_ms(),
+      &unlock_intent_keys/2,
+      delete_intent
+    )
   end
 
-  # Checks current values of involved keys against stored tokens.
-  # Returns true if the intent should be cleaned up (always true — whether
-  # data matches or not, the intent is stale and should be removed).
-  #
-  # The distinction matters for logging/observability but the action is the
-  # same: stale intents are always cleaned up. Re-execution is not safe
-  # because we can't guarantee idempotency of arbitrary commands.
-  defp check_value_hashes(value_hashes, _keys_map) do
-    Enum.all?(value_hashes, fn {key, stored_token} ->
-      current_token = read_current_token(key)
+  defp resolve_stale_intent(owner_ref, intent, now_ms, unlock, delete_intent) do
+    case Intent.validate(owner_ref, intent) do
+      {:ok, keys} ->
+        if now_ms - intent.created_at > @stale_threshold_ms do
+          with :ok <- unlock.(keys, owner_ref),
+               :ok <- delete_intent.(owner_ref) do
+            :ok
+          end
+        else
+          :ok
+        end
 
-      # Whether the token matches or not, the intent is stale.
-      # Token match means data is unchanged (operation may not have executed).
-      # Token mismatch means someone wrote new data (don't re-execute).
-      # Missing token means key was deleted or expired (already completed or cleaned up).
-      # In all cases, cleaning up the intent is the correct action.
-      _matches = current_token == stored_token
-      true
-    end)
+      {:error, :invalid_cross_shard_intent} ->
+        :ok
+    end
   end
 
-  # Unlocks keys listed in the intent's keys map on their respective shards.
-  defp unlock_intent_keys(keys_map, owner_ref) do
-    keys_map
-    |> Map.values()
-    |> Enum.uniq()
-    |> Enum.each(fn key ->
-      ctx = FerricStore.Instance.get(:default)
-      shard_idx = Router.shard_for(ctx, key)
-      shard_id = Cluster.shard_server_id(shard_idx)
-      CommandClock.process_command(shard_id, {:unlock_keys, [key], owner_ref})
-    end)
-  end
-
-  # Reads the current watch token of a key through the Router.
-  defp read_current_token(key) do
+  defp unlock_intent_keys(keys, owner_ref) do
     ctx = FerricStore.Instance.get(:default)
-    Router.watch_token(ctx, key)
+
+    keys
+    |> Enum.group_by(&Router.shard_for(ctx, &1))
+    |> Enum.reduce_while(:ok, fn {shard_idx, shard_keys}, :ok ->
+      result =
+        shard_idx
+        |> Cluster.shard_server_id()
+        |> CommandClock.process_command({:unlock_keys, shard_keys, owner_ref})
+        |> command_ok()
+
+      case result do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp command_ok({:ok, {:applied_at, _index, :ok}, _leader}), do: :ok
+  defp command_ok({:ok, :ok, _leader}), do: :ok
+  defp command_ok({:ok, {:applied_at, _index, {:error, reason}}, _leader}), do: {:error, reason}
+  defp command_ok({:ok, {:error, reason}, _leader}), do: {:error, reason}
+  defp command_ok({:error, reason}), do: {:error, reason}
+  defp command_ok(other), do: {:error, {:unexpected_command_result, other}}
+
+  @doc false
+  def __resolve_stale_intent_for_test__(owner_ref, intent, now_ms, unlock, delete_intent)
+      when is_function(unlock, 2) and is_function(delete_intent, 1) do
+    resolve_stale_intent(owner_ref, intent, now_ms, unlock, delete_intent)
   end
 end

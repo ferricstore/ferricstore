@@ -253,15 +253,7 @@ defmodule Ferricstore.Cluster.Manager do
       # Fresh nodes with cluster_nodes config should wait for the existing
       # cluster to add them via Case 2, not try to add existing nodes to themselves.
       node in state.cluster_nodes ->
-        new_known = MapSet.put(state.known_nodes, node)
-
-        has_leaders =
-          Enum.any?(0..(state.shard_count - 1), fn i ->
-            case RaftCluster.members(i, @membership_probe_timeout_ms) do
-              {:ok, members, _leader} -> length(members) > 1
-              _ -> false
-            end
-          end)
+        has_leaders = established_cluster?(state.shard_count)
 
         if has_leaders do
           spawn(fn ->
@@ -286,7 +278,7 @@ defmodule Ferricstore.Cluster.Manager do
           )
         end
 
-        {:noreply, %{state | known_nodes: new_known, mode: :cluster}}
+        {:noreply, %{state | mode: :cluster}}
 
       # Case 2: We don't know this node, but it might want to join us.
       # Check if the remote node's cluster_nodes includes us. The joiner's
@@ -363,24 +355,14 @@ defmodule Ferricstore.Cluster.Manager do
     Logger.warning("ClusterManager: node disconnected: #{node}")
 
     # Start a delayed removal timer — don't remove immediately (could be transient)
-    timer_ref = Process.send_after(self(), {:remove_timeout, node}, state.remove_delay_ms)
-    new_timers = Map.put(state.remove_timers, node, timer_ref)
-
-    {:noreply, %{state | remove_timers: new_timers}}
+    {:noreply, state |> cancel_remove_timer(node) |> schedule_remove_timer(node)}
   end
 
-  def handle_info({:remove_timeout, node}, state) do
-    if node not in Node.list() do
-      Logger.warning(
-        "ClusterManager: node #{node} still down after #{state.remove_delay_ms}ms, removing from Raft groups"
-      )
-
-      do_remove_node(node, state)
+  def handle_info({:remove_timeout, node, token}, state) do
+    case Map.get(state.remove_timers, node) do
+      {_timer_ref, ^token} -> handle_current_remove_timeout(node, state)
+      _stale_or_cancelled -> {:noreply, state}
     end
-
-    new_timers = Map.delete(state.remove_timers, node)
-    new_known = MapSet.delete(state.known_nodes, node)
-    {:noreply, %{state | remove_timers: new_timers, known_nodes: new_known}}
   end
 
   def handle_info(_msg, state) do
@@ -933,15 +915,67 @@ defmodule Ferricstore.Cluster.Manager do
   # Private: helpers
   # ---------------------------------------------------------------------------
 
+  defp handle_current_remove_timeout(node, state) do
+    state = %{state | remove_timers: Map.delete(state.remove_timers, node)}
+
+    if node in Node.list() do
+      {:noreply, state}
+    else
+      Logger.warning(
+        "ClusterManager: node #{node} still down after #{state.remove_delay_ms}ms, removing from Raft groups"
+      )
+
+      case do_remove_node(node, state) do
+        :ok ->
+          {:noreply, %{state | known_nodes: MapSet.delete(state.known_nodes, node)}}
+
+        {:error, reason} ->
+          Logger.error(
+            "ClusterManager: delayed removal failed for #{node}, retrying: #{inspect(reason)}"
+          )
+
+          {:noreply, schedule_remove_timer(state, node)}
+
+        other ->
+          Logger.error(
+            "ClusterManager: delayed removal returned an invalid result for #{node}, retrying: #{inspect(other)}"
+          )
+
+          {:noreply, schedule_remove_timer(state, node)}
+      end
+    end
+  end
+
+  defp schedule_remove_timer(state, node) do
+    token = make_ref()
+    timer_ref = Process.send_after(self(), {:remove_timeout, node, token}, state.remove_delay_ms)
+    %{state | remove_timers: Map.put(state.remove_timers, node, {timer_ref, token})}
+  end
+
   defp cancel_remove_timer(state, node) do
     case Map.pop(state.remove_timers, node) do
       {nil, _timers} ->
         state
 
-      {timer_ref, new_timers} ->
+      {{timer_ref, _token}, new_timers} ->
         Process.cancel_timer(timer_ref)
         Logger.info("ClusterManager: cancelled removal timer for #{node} (reconnected)")
         %{state | remove_timers: new_timers}
+    end
+  end
+
+  defp established_cluster?(shard_count) do
+    case Process.get(:ferricstore_cluster_manager_established_cluster_hook) do
+      hook when is_function(hook, 1) ->
+        hook.(shard_count)
+
+      _missing_hook ->
+        Enum.any?(0..(shard_count - 1), fn i ->
+          case RaftCluster.members(i, @membership_probe_timeout_ms) do
+            {:ok, members, _leader} -> length(members) > 1
+            _ -> false
+          end
+        end)
     end
   end
 

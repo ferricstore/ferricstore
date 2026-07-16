@@ -2,6 +2,8 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
   @moduledoc false
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Acl.Formatter
+  alias FerricstoreServer.Health.Dashboard.Access
   alias FerricstoreServer.Health.Endpoint.RouteRequirements
 
   @dashboard_routes [
@@ -37,8 +39,8 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
 
   @spec collect_page(keyword() | map()) :: map()
   def collect_page(opts \\ []) do
+    current_user = Access.keyspace_acl_username(opts)
     params = normalize_params(opts)
-    current_user = blank_to_nil(Map.get(params, "acl_username"))
     users = acl_user_summaries()
 
     %{
@@ -65,18 +67,9 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
 
   defp normalize_params(_params), do: %{}
 
-  defp normalize_value(value) when is_binary(value), do: String.trim(value)
+  defp normalize_value(value) when is_binary(value), do: value
   defp normalize_value(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_value(value), do: to_string(value || "")
-
-  defp blank_to_nil(value) when is_binary(value) do
-    case String.trim(value) do
-      "" -> nil
-      trimmed -> trimmed
-    end
-  end
-
-  defp blank_to_nil(_value), do: nil
 
   defp safe_boolean(fun) do
     fun.()
@@ -96,23 +89,23 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
   end
 
   defp parse_acl_rule(rule) when is_binary(rule) do
-    case String.split(rule, " ", parts: 4) do
-      ["user", username, state, rest] ->
-        %{username: username, state: state, rule: rule, summary: rest}
+    case Formatter.split_user_rule(rule) do
+      {:ok, {username, state, summary}} ->
+        %{username: username, state: state, rule: rule, summary: summary}
 
-      _ ->
+      :error ->
         %{username: "unknown", state: "unknown", rule: rule, summary: rule}
     end
   end
 
   defp collect_tester(params, current_user) do
-    user = blank_to_nil(Map.get(params, "user")) || current_user || "default"
-    command = params |> Map.get("command", "") |> String.upcase()
+    user = Map.get_lazy(params, "user", fn -> current_user || "default" end)
+    command = params |> Map.get("command", "") |> String.trim() |> String.upcase()
     key = Map.get(params, "key", "")
     key_access = normalize_key_access(Map.get(params, "key_access", "read"))
     channel = Map.get(params, "channel", "")
-    route_path = Map.get(params, "route_path", "")
-    route_method = params |> Map.get("route_method", "GET") |> String.upcase()
+    route_path = params |> Map.get("route_path", "") |> String.trim()
+    route_method = params |> Map.get("route_method", "GET") |> String.trim() |> String.upcase()
 
     %{
       input: %{
@@ -131,8 +124,12 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
     }
   end
 
-  defp normalize_key_access("write"), do: :write
   defp normalize_key_access(:write), do: :write
+
+  defp normalize_key_access(value) when is_binary(value) do
+    if String.downcase(String.trim(value)) == "write", do: :write, else: :read
+  end
+
   defp normalize_key_access(_value), do: :read
 
   defp check_command(_user, ""), do: idle_result("Command not checked")
@@ -184,8 +181,8 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
           denied_result("Channel denied", "channel does not match any ACL channel pattern")
         end
 
-      _user ->
-        allowed_result("Channel allowed", "&*")
+      _invalid_user ->
+        denied_result("Channel denied", "invalid ACL user state")
     end
   rescue
     _ -> denied_result("Channel denied", "ACL lookup failed")

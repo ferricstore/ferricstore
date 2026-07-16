@@ -297,6 +297,35 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
         assert shard_payload_present?(restarted_ctx, 0)
       end
 
+      @tag :snapshot_boundary_mismatch
+      test "restart fails closed when snapshot boundary differs from storage position", %{
+        root: root,
+        ctx: ctx
+      } do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+        assert :ok = WARaftBackend.write(0, {:put, "metadata:bad-boundary", "value", 0})
+        assert :ok = WARaftBackend.stop()
+
+        metadata = waraft_storage_metadata(root, 0)
+        {:raft_log_pos, index, term} = metadata.position
+
+        metadata
+        |> Map.put(:snapshot_boundary_position, {:raft_log_pos, index + 1, term})
+        |> then(&:erlang.term_to_binary/1)
+        |> then(&File.write!(waraft_storage_metadata_path(root, 0), &1))
+
+        FerricStore.Instance.cleanup(ctx.name)
+        restarted_ctx = build_ctx(root)
+
+        assert {:error, reason} =
+                 WARaftBackend.start(restarted_ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log
+                 )
+
+        assert inspect(reason) =~ "snapshot_boundary_position_mismatch"
+        assert shard_payload_present?(restarted_ctx, 0)
+      end
+
       test "restart fails closed on storage metadata missing position", %{root: root, ctx: ctx} do
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
         assert :ok = WARaftBackend.write(0, {:put, "metadata:missing-position", "value", 0})
@@ -637,13 +666,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
         assert :ok =
                  Ferricstore.Flow.LMDB.write_batch(
                    lmdb_path,
-                   Ferricstore.Flow.LMDB.segment_value_pin_put_ops(
-                     payload_ref,
-                     0,
-                     {:waraft_apply_projection, value_index},
-                     value_offset,
-                     value_size
-                   )
+                   Ferricstore.Flow.LMDB.segment_value_pin_batch_put_ops([
+                     {payload_ref, 0, {:waraft_apply_projection, value_index}, value_offset,
+                      value_size}
+                   ])
                  )
 
         :ets.delete(elem(source_ctx.keydir_refs, 0), payload_ref)
@@ -885,6 +911,52 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
                  )
 
         assert "old" == Router.get(recovered_ctx, "snapshot:keep")
+      end
+
+      @tag :waraft_noncanonical_snapshot_metadata
+      test "storage rejects noncanonical snapshot metadata terms", %{
+        root: root,
+        ctx: ctx
+      } do
+        position = {:raft_log_pos, 10, 1}
+
+        metadata = %{
+          version: 1,
+          position: position,
+          label: nil,
+          config: nil,
+          apply_context: ctx.apply_context
+        }
+
+        canonical = :erlang.term_to_binary(metadata, [:deterministic])
+
+        encodings = [
+          :erlang.term_to_binary(metadata, compressed: 9),
+          canonical <> <<0>>
+        ]
+
+        handle = %{
+          ctx: ctx,
+          shard_index: 0,
+          root_dir: Path.join([root, "waraft", "ferricstore_waraft_backend.1"]),
+          sm_state: nil,
+          position: {:raft_log_pos, 2, 1},
+          label: nil,
+          config: nil
+        }
+
+        Enum.with_index(encodings, fn encoded, index ->
+          snapshot_path = Path.join(root, "noncanonical-snapshot-#{index}")
+          File.mkdir_p!(snapshot_path)
+          File.write!(Path.join(snapshot_path, "ferricstore_snapshot.term"), encoded)
+
+          assert {:error, {:decode_snapshot_metadata, _reason}} =
+                   Ferricstore.Raft.WARaftStorage.open_snapshot(
+                     snapshot_path,
+                     position,
+                     handle
+                   )
+        end)
       end
 
       test "storage recreates missing snapshot dirs declared empty during install", %{

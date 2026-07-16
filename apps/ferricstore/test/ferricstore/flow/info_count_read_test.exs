@@ -1,5 +1,5 @@
 defmodule Ferricstore.Flow.InfoCountReadTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
   @moduletag :flow
 
   alias Ferricstore.Flow.InfoCountRead
@@ -30,5 +30,25 @@ defmodule Ferricstore.Flow.InfoCountReadTest do
              false,
              ["completed"]
            ) == {:ok, %{}}
+  end
+
+  test "terminal sweep limit rejects invalid configuration instead of disabling cleanup" do
+    previous = Application.get_env(:ferricstore, :flow_lmdb_terminal_sweep_limit)
+
+    on_exit(fn ->
+      if is_nil(previous) do
+        Application.delete_env(:ferricstore, :flow_lmdb_terminal_sweep_limit)
+      else
+        Application.put_env(:ferricstore, :flow_lmdb_terminal_sweep_limit, previous)
+      end
+    end)
+
+    Application.put_env(:ferricstore, :flow_lmdb_terminal_sweep_limit, 17)
+    assert InfoCountRead.terminal_lmdb_sweep_limit() == 17
+
+    for invalid <- [0, -1, "invalid", nil] do
+      Application.put_env(:ferricstore, :flow_lmdb_terminal_sweep_limit, invalid)
+      assert InfoCountRead.terminal_lmdb_sweep_limit() == 10_000
+    end
   end
 end

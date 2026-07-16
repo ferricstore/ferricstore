@@ -4,43 +4,71 @@ defmodule Ferricstore.Store.Shard.Transaction do
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Transaction.Ast, as: TxAst
+  alias Ferricstore.Transaction.ExecutionEntry
 
   # -------------------------------------------------------------------
   # Transaction execution handler
   # -------------------------------------------------------------------
 
   @spec handle_tx_execute([TxAst.queue_entry()], binary() | nil, map()) ::
-          {:reply, [term()], map()}
+          {:reply, [term()] | {:error, binary()}, map()}
   @doc false
   def handle_tx_execute(queue, sandbox_namespace, state) do
-    Process.put(:tx_deleted_keys, MapSet.new())
-    Process.put(:tx_pending_values, %{})
-    store = LocalTxStore.new(state)
+    results = execute(queue, sandbox_namespace, LocalTxStore.new(state))
+    {:reply, results, state}
+  end
 
-    results =
+  @spec execute([TxAst.queue_entry()], binary() | nil, map()) ::
+          [term()] | {:error, binary()}
+  @doc false
+  def execute(queue, sandbox_namespace, store) when is_list(queue) and is_map(store) do
+    with :ok <- validate_queue(queue) do
+      Process.put(:tx_deleted_keys, MapSet.new())
+      Process.put(:tx_pending_values, %{})
+
       try do
-        Enum.map(queue, fn entry ->
-          ast =
-            entry
-            |> TxAst.command_ast()
-            |> TxAst.namespace_first_key(sandbox_namespace)
-
-          try do
-            Dispatcher.dispatch_ast(ast, store)
-          catch
-            :exit, {:noproc, _} ->
-              {:error, "ERR server not ready, shard process unavailable"}
-
-            :exit, {reason, _} ->
-              {:error, "ERR internal error: #{inspect(reason)}"}
-          end
-        end)
+        dispatch_queue(queue, sandbox_namespace, store)
       after
         Process.delete(:tx_deleted_keys)
         Process.delete(:tx_pending_values)
       end
+    end
+  end
 
-    {:reply, results, state}
+  defp validate_queue(queue) do
+    if Enum.all?(queue, &ExecutionEntry.valid?/1) do
+      :ok
+    else
+      {:error, "ERR invalid transaction command"}
+    end
+  end
+
+  defp dispatch_queue(queue, sandbox_namespace, store) do
+    queue
+    |> Enum.reduce_while([], fn entry, results ->
+      ast =
+        entry
+        |> TxAst.command_ast()
+        |> TxAst.namespace_ast_keys(sandbox_namespace)
+
+      case dispatch_entry(ast, store) do
+        {:ok, result} -> {:cont, [result | results]}
+        {:fatal, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:error, _reason} = error -> error
+      results -> Enum.reverse(results)
+    end
+  end
+
+  defp dispatch_entry(ast, store) do
+    {:ok, Dispatcher.dispatch_ast(ast, store)}
+  rescue
+    _error -> {:fatal, "ERR transaction command failed during replicated apply"}
+  catch
+    :throw, {:transaction_store_failure, reason} -> {:fatal, reason}
+    _kind, _reason -> {:fatal, "ERR transaction command failed during replicated apply"}
   end
 
   # -------------------------------------------------------------------

@@ -6,19 +6,34 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
   alias Ferricstore.Store.Router
 
   @default_max_retries 16
+  @max_retries 128
+  @max_encoded_bytes 900_000
 
   def mutate(ctx, key, decode, encode, init, mutate, opts \\ [])
+
+  def mutate(ctx, key, decode, encode, init, mutate, opts)
       when is_binary(key) and is_function(decode, 1) and is_function(encode, 1) and
              is_function(init, 0) and is_function(mutate, 1) and is_list(opts) do
-    max_retries = Keyword.get(opts, :max_retries, @default_max_retries)
+    if Keyword.keyword?(opts) do
+      max_retries = Keyword.get(opts, :max_retries, @default_max_retries)
 
-    write_opts = %{
-      retention_owner: Keyword.get(opts, :flow_retention_owner),
-      catalog_kind: Keyword.get(opts, :catalog_kind)
-    }
+      if is_integer(max_retries) and max_retries > 0 and max_retries <= @max_retries do
+        write_opts = %{
+          retention_owner: Keyword.get(opts, :flow_retention_owner),
+          catalog_kind: Keyword.get(opts, :catalog_kind)
+        }
 
-    do_mutate(ctx, key, decode, encode, init, mutate, max_retries, write_opts)
+        do_mutate(ctx, key, decode, encode, init, mutate, max_retries, write_opts)
+      else
+        {:error, "ERR invalid governance atomic record options"}
+      end
+    else
+      {:error, "ERR invalid governance atomic record options"}
+    end
   end
+
+  def mutate(_ctx, _key, _decode, _encode, _init, _mutate, _opts),
+    do: {:error, "ERR invalid governance atomic record options"}
 
   defp do_mutate(_ctx, _key, _decode, _encode, _init, _mutate, retries_left, _write_opts)
        when retries_left <= 0 do
@@ -90,17 +105,18 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
         reply
 
       {:write, updated, reply} ->
-        set_opts = %{
-          expire_at_ms: 0,
-          nx: true,
-          xx: false,
-          get: false,
-          keepttl: false,
-          flow_retention_owner: write_opts.retention_owner
-        }
+        with {:ok, encoded} <- encode_record(encode, updated),
+             :ok <- Catalog.register(ctx, write_opts.catalog_kind, key) do
+          set_opts = %{
+            expire_at_ms: 0,
+            nx: true,
+            xx: false,
+            get: false,
+            keepttl: false,
+            flow_retention_owner: write_opts.retention_owner
+          }
 
-        with :ok <- Catalog.register(ctx, write_opts.catalog_kind, key) do
-          case Router.set(ctx, key, encode.(updated), set_opts) do
+          case Router.set(ctx, key, encoded, set_opts) do
             :ok ->
               reply
 
@@ -140,38 +156,57 @@ defmodule Ferricstore.Flow.Governance.AtomicRecord do
         reply
 
       {:write, updated, reply} ->
-        case Router.cas(ctx, key, expected, encode.(updated), nil) do
-          1 ->
-            reply
+        with {:ok, encoded} <- encode_record(encode, updated) do
+          case Router.cas(ctx, key, expected, encoded, nil) do
+            1 ->
+              reply
 
-          0 ->
-            do_mutate(
-              ctx,
-              key,
-              decode,
-              encode,
-              init,
-              mutate,
-              retries_left - 1,
-              write_opts
-            )
+            0 ->
+              do_mutate(
+                ctx,
+                key,
+                decode,
+                encode,
+                init,
+                mutate,
+                retries_left - 1,
+                write_opts
+              )
 
-          nil ->
-            do_mutate(
-              ctx,
-              key,
-              decode,
-              encode,
-              init,
-              mutate,
-              retries_left - 1,
-              write_opts
-            )
+            nil ->
+              do_mutate(
+                ctx,
+                key,
+                decode,
+                encode,
+                init,
+                mutate,
+                retries_left - 1,
+                write_opts
+              )
 
-          {:error, _reason} = error ->
-            error
+            {:error, _reason} = error ->
+              error
+          end
         end
     end
+  end
+
+  defp encode_record(encode, record) do
+    case encode.(record) do
+      encoded when is_binary(encoded) and byte_size(encoded) <= @max_encoded_bytes ->
+        {:ok, encoded}
+
+      encoded when is_binary(encoded) ->
+        {:error, "ERR governance record exceeds #{@max_encoded_bytes}-byte durable limit"}
+
+      _invalid ->
+        {:error, "ERR governance record encoder returned an invalid value"}
+    end
+  rescue
+    _error -> {:error, "ERR governance record encoder failed"}
+  catch
+    _kind, _reason -> {:error, "ERR governance record encoder failed"}
   end
 
   defp mutation_result({:ok, updated}), do: {:write, updated, {:ok, updated}}

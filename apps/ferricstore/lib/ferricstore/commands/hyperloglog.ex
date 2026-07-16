@@ -1,7 +1,7 @@
 defmodule Ferricstore.Commands.HyperLogLog do
-  alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Commands.Strings.Compound
   alias Ferricstore.Store.Ops
-  alias Ferricstore.Store.TypeRegistry
+  alias Ferricstore.Store.ReadResult
 
   @moduledoc """
   Handles Redis HyperLogLog commands: PFADD, PFCOUNT, PFMERGE.
@@ -85,6 +85,9 @@ defmodule Ferricstore.Commands.HyperLogLog do
     case ensure_not_compound_key(key, store) do
       :ok ->
         case hll_size_state(key, store) do
+          {:error, _reason} = error ->
+            error
+
           :missing ->
             write_sketch(store, key, HLL.new(), 1)
 
@@ -98,8 +101,8 @@ defmodule Ferricstore.Commands.HyperLogLog do
             pfadd_no_elements_from_value(key, store)
         end
 
-      @wrongtype_error ->
-        @wrongtype_error
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -131,6 +134,9 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   defp pfadd_no_elements_from_value(key, store) do
     case Ops.get(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         write_sketch(store, key, HLL.new(), 1)
 
@@ -190,6 +196,9 @@ defmodule Ferricstore.Commands.HyperLogLog do
     case ensure_not_compound_key(key, store) do
       :ok ->
         case hll_size_state(key, store) do
+          {:error, _reason} = error ->
+            error
+
           :missing ->
             HLL.new()
 
@@ -197,36 +206,49 @@ defmodule Ferricstore.Commands.HyperLogLog do
             @wrongtype_error
 
           :valid_size ->
-            Ops.get(store, key) || HLL.new()
+            read_sketch_or_new(store, key)
 
           :unknown ->
-            Ops.get(store, key) || HLL.new()
+            read_sketch_or_new(store, key)
         end
 
-      @wrongtype_error ->
-        @wrongtype_error
+      {:error, _reason} = error ->
+        error
     end
   end
 
   defp read_sketches(keys, store) do
     with :ok <- ensure_not_compound_keys(keys, store),
          :ok <- ensure_hll_candidate_sizes(keys, store) do
-      store
-      |> Ops.batch_get(keys)
-      |> Enum.map(fn
-        nil ->
-          HLL.new()
+      values = Ops.batch_get(store, keys)
 
-        value ->
-          value
-      end)
-      |> validate_sketches()
+      case ReadResult.first_failure(values) do
+        nil ->
+          values
+          |> Enum.map(fn
+            nil -> HLL.new()
+            value -> value
+          end)
+          |> validate_sketches()
+
+        failure ->
+          ReadResult.command_error(failure)
+      end
+    end
+  end
+
+  defp read_sketch_or_new(store, key) do
+    case Ops.get(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      nil -> HLL.new()
+      value -> value
     end
   end
 
   defp ensure_hll_candidate_sizes(keys, store) do
     Enum.reduce_while(keys, :ok, fn key, :ok ->
       case hll_size_state(key, store) do
+        {:error, _reason} = error -> {:halt, error}
         :invalid_size -> {:halt, @wrongtype_error}
         _ -> {:cont, :ok}
       end
@@ -235,6 +257,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
   defp hll_size_state(key, store) do
     case metadata_value_size(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       nil -> :missing
       @sketch_size -> :valid_size
       size when is_integer(size) -> :invalid_size
@@ -256,28 +279,12 @@ defmodule Ferricstore.Commands.HyperLogLog do
     Enum.reduce_while(keys, :ok, fn key, :ok ->
       case ensure_not_compound_key(key, store) do
         :ok -> {:cont, :ok}
-        @wrongtype_error -> {:halt, @wrongtype_error}
+        {:error, _reason} = error -> {:halt, error}
       end
     end)
   end
 
-  defp ensure_not_compound_key(key, store) do
-    if compound_data_structure_key?(key, store) do
-      @wrongtype_error
-    else
-      :ok
-    end
-  end
-
-  defp compound_data_structure_key?(key, store) do
-    Ops.has_compound?(store) and
-      compound_type_marker?(key, store) and
-      TypeRegistry.get_type(key, store) != "none"
-  end
-
-  defp compound_type_marker?(key, store) do
-    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil
-  end
+  defp ensure_not_compound_key(key, store), do: Compound.ensure_string_key(key, store)
 
   # Validates that a binary is the right size for an HLL sketch.
   # Protects against corrupted or non-HLL values being used with HLL commands.

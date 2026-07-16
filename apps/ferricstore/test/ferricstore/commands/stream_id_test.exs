@@ -14,6 +14,7 @@ defmodule Ferricstore.Commands.StreamIdTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.Stream
+  alias Ferricstore.Commands.Stream.ID
   alias Ferricstore.Test.MockStore
 
   defp ustream, do: "sid_#{System.unique_integer([:positive, :monotonic])}"
@@ -134,6 +135,24 @@ defmodule Ferricstore.Commands.StreamIdTest do
   # ===========================================================================
 
   describe "explicit IDs" do
+    test "rejects negative and overflowing unsigned components" do
+      max_u64 = 18_446_744_073_709_551_615
+
+      assert {:ok, {^max_u64, ^max_u64}} = ID.parse_full_id("#{max_u64}-#{max_u64}")
+
+      for invalid <- ["1--1", "#{max_u64 + 1}-0", "0-#{max_u64 + 1}"] do
+        assert {:error, "ERR Invalid stream ID specified as stream command argument"} =
+                 ID.parse_full_id(invalid)
+      end
+    end
+
+    test "auto and partial IDs do not overflow the sequence component" do
+      max_u64 = 18_446_744_073_709_551_615
+
+      assert {:error, _message} = ID.resolve(:auto, max_u64, max_u64)
+      assert {:error, _message} = ID.resolve({:partial, max_u64}, max_u64, max_u64)
+    end
+
     test "explicit ID greater than last is accepted" do
       store = MockStore.make()
       key = ustream()

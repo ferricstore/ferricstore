@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
   alias FerricstoreServer.Health.Dashboard.Flow.Schedules
   alias FerricstoreServer.Health.Endpoint.FlowPaths
+  alias FerricstoreServer.Health.QueryDecoder
 
   @type requirement :: {binary(), keyword()}
 
@@ -35,10 +36,10 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/doctor" -> {"FERRICSTORE.DOCTOR", []}
       "/dashboard/keyspace" -> keyspace_requirement(query)
       "/dashboard/commands" -> {"INFO", []}
-      "/dashboard/reads" -> {"INFO", []}
+      "/dashboard/reads" -> {"INFO", key: {"*", :read}}
       "/dashboard/streams" -> {"XINFO", []}
       "/dashboard/pubsub" -> {"PUBSUB", []}
-      "/dashboard/prefixes" -> {"SCAN", []}
+      "/dashboard/prefixes" -> {"SCAN", key: {"*", :read}}
       "/dashboard/flow" -> {"FLOW.LIST", []}
       "/dashboard/flow/lookup" -> flow_lookup_requirement(query)
       "/dashboard/flow/states" -> {"FLOW.LIST", []}
@@ -69,10 +70,10 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/api/storage" -> {"INFO", []}
       "/dashboard/api/keyspace" -> keyspace_requirement(query)
       "/dashboard/api/commands" -> {"INFO", []}
-      "/dashboard/api/reads" -> {"INFO", []}
+      "/dashboard/api/reads" -> {"INFO", key: {"*", :read}}
       "/dashboard/api/streams" -> {"XINFO", []}
       "/dashboard/api/pubsub" -> {"PUBSUB", []}
-      "/dashboard/api/prefixes" -> {"SCAN", []}
+      "/dashboard/api/prefixes" -> {"SCAN", key: {"*", :read}}
       _ -> flow_detail_or_default_requirement(clean_path, query)
     end
   end
@@ -130,12 +131,11 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   @spec flow_schedule_form_requirement(map()) :: requirement()
   def flow_schedule_form_requirement(params) do
     command = Schedules.form_command(params)
-    id = params |> Map.get("id", "") |> String.trim()
 
-    if id == "" do
+    if command == "FLOW.SCHEDULE.GET" do
       {command, []}
     else
-      {command, key: {id, :write}}
+      {command, key: {"*", :write}}
     end
   end
 
@@ -216,7 +216,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   defp flow_lookup_requirement(query) do
     id =
       query
-      |> URI.decode_query()
+      |> QueryDecoder.decode()
       |> Map.get("id", "")
       |> String.trim()
 
@@ -237,12 +237,12 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   end
 
   defp flow_detail_or_default_requirement("/dashboard/flow/" <> encoded_id, query) do
-    id = URI.decode(encoded_id)
+    id = decoded_component_or_empty(encoded_id)
     {"FLOW.GET", key: {flow_acl_key_from_query(id, query), :read}}
   end
 
   defp flow_detail_or_default_requirement("/dashboard/api/flow/" <> encoded_id, query) do
-    id = URI.decode(encoded_id)
+    id = decoded_component_or_empty(encoded_id)
     {"FLOW.GET", key: {flow_acl_key_from_query(id, query), :read}}
   end
 
@@ -251,7 +251,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   defp flow_value_requirement(query) do
     flow_id =
       query
-      |> URI.decode_query()
+      |> QueryDecoder.decode()
       |> Map.get("flow", "")
       |> String.trim()
 
@@ -274,7 +274,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   defp keyspace_requirement(query) do
     key =
       query
-      |> URI.decode_query()
+      |> QueryDecoder.decode()
       |> Map.get("key", "")
       |> String.trim()
 
@@ -290,7 +290,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   defp flow_lineage_requirement(query) do
     mode =
       query
-      |> URI.decode_query()
+      |> QueryDecoder.decode()
       |> Map.get("mode", "root")
 
     command =
@@ -309,7 +309,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   end
 
   defp flow_query_requirement(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
     kind = Map.get(params, "kind", "list")
     command = flow_query_command_requirement(kind)
     partition_key = flow_partition_key_from_query(query)
@@ -327,7 +327,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   end
 
   defp flow_index_view_requirement(command, query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     partition_key =
       params
@@ -407,7 +407,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
   defp flow_partition_key_from_query(query) do
     query
-    |> URI.decode_query()
+    |> QueryDecoder.decode()
     |> Map.get("partition_key", "")
     |> String.trim()
   rescue
@@ -418,6 +418,13 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     case String.split(path, "?", parts: 2) do
       [clean_path, query] -> {clean_path, query}
       [clean_path] -> {clean_path, ""}
+    end
+  end
+
+  defp decoded_component_or_empty(encoded) do
+    case QueryDecoder.decode_component(encoded) do
+      {:ok, decoded} -> decoded
+      :error -> ""
     end
   end
 end

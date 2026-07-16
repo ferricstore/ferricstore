@@ -13,6 +13,11 @@ defmodule Ferricstore.Commands.Extension do
 
   @type access :: :read | :write | :rw
 
+  @type prepared :: %{
+          ast: {:extension_command, module(), binary(), [binary()], access()},
+          keys: [binary()]
+        }
+
   @type command_entry :: %{
           required(:name) => binary(),
           optional(:arity) => integer(),
@@ -112,48 +117,48 @@ defmodule Ferricstore.Commands.Extension do
   @spec command?(binary()) :: boolean()
   def command?(command) when is_binary(command), do: lookup(command) != :error
 
-  @doc "Builds the dispatcher AST for a configured command."
-  @spec ast(binary(), [binary()]) :: {:extension_command, binary(), [binary()]}
-  def ast(command, args), do: {:extension_command, String.upcase(command), args}
+  @doc "Resolves one immutable provider snapshot for preparation and dispatch."
+  @spec prepare(binary(), [binary()]) :: {:ok, prepared()} | {:error, :invalid_keys} | :error
+  def prepare(command, args) when is_binary(command) and is_list(args) do
+    upper = String.upcase(command)
+
+    if match?({:ok, _entry}, Entries.lookup_upper(upper)) do
+      :error
+    else
+      prepare_from_modules(modules(), upper, args)
+    end
+  end
 
   @doc "Extracts key arguments for a configured command."
   @spec keys(binary(), [binary()]) :: {:ok, [binary()]} | :error
   def keys(command, args) when is_binary(command) and is_list(args) do
     upper = String.upcase(command)
 
-    case handler_module(upper) do
-      {:ok, module} ->
-        extension_keys(module, upper, args)
-
-      :error ->
-        metadata_keys(command, args)
-    end
-  end
-
-  defp extension_keys(module, command, args) do
-    if function_exported?(module, :keys, 2) do
-      case module.keys(command, args) do
-        {:ok, keys} when is_list(keys) -> {:ok, keys}
-        :error -> metadata_keys(command, args)
-        _other -> :error
-      end
-    else
-      metadata_keys(command, args)
-    end
-  end
-
-  defp metadata_keys(command, args) do
-    case lookup(command) do
-      {:ok, %{first_key: 0}} ->
-        {:ok, []}
-
-      {:ok, %{first_key: first, last_key: last, step: step}} ->
-        {:ok, extract_keys(first, last, step, args)}
+    case handler(upper) do
+      {:ok, module, entry} ->
+        extension_keys(module, upper, args, entry)
 
       :error ->
         :error
     end
   end
+
+  defp extension_keys(module, command, args, entry) do
+    if function_exported?(module, :keys, 2) do
+      case module.keys(command, args) do
+        {:ok, keys} when is_list(keys) -> {:ok, keys}
+        :error -> {:ok, metadata_keys(entry, args)}
+        _other -> :error
+      end
+    else
+      {:ok, metadata_keys(entry, args)}
+    end
+  end
+
+  defp metadata_keys(%{first_key: 0}, _args), do: []
+
+  defp metadata_keys(%{first_key: first, last_key: last, step: step}, args),
+    do: extract_keys(first, last, step, args)
 
   @doc "Returns the key access type for a configured command."
   @spec command_access_type(binary()) :: access() | nil
@@ -169,13 +174,24 @@ defmodule Ferricstore.Commands.Extension do
   def handle(command, args, store) when is_binary(command) and is_list(args) do
     upper = String.upcase(command)
 
-    case handler_module(upper) do
-      {:ok, module} -> module.handle(upper, args, store)
+    case handler(upper) do
+      {:ok, module, _entry} -> module.handle(upper, args, store)
       :error -> :not_found
     end
   end
 
   def handle(_command, _args, _store), do: :not_found
+
+  @doc false
+  @spec handle_prepared(module(), binary(), [binary()], map()) :: term()
+  def handle_prepared(module, command, args, store)
+      when is_atom(module) and is_binary(command) and is_list(args) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :handle, 3) do
+      module.handle(command, args, store)
+    else
+      {:error, "ERR prepared extension provider is unavailable"}
+    end
+  end
 
   @doc """
   Returns trusted request context attached by the server protocol layer.
@@ -275,17 +291,50 @@ defmodule Ferricstore.Commands.Extension do
     Enum.reverse(commands)
   end
 
-  defp handler_module(upper_command) do
+  defp prepare_from_modules([], _upper, _args), do: :error
+
+  defp prepare_from_modules([module | rest], upper, args) do
+    case provider_entry(module, upper) do
+      {:ok, entry} ->
+        case extension_keys(module, upper, args, entry) do
+          {:ok, keys} ->
+            if Enum.all?(keys, &is_binary/1) do
+              {:ok,
+               %{
+                 ast: {:extension_command, module, upper, args, entry.access},
+                 keys: keys
+               }}
+            else
+              {:error, :invalid_keys}
+            end
+
+          :error ->
+            {:error, :invalid_keys}
+        end
+
+      :error ->
+        prepare_from_modules(rest, upper, args)
+    end
+  end
+
+  defp handler(upper_command) do
     Enum.find_value(modules(), :error, fn module ->
-      if provider_handles?(module, upper_command), do: {:ok, module}, else: nil
+      case provider_entry(module, upper_command) do
+        {:ok, entry} -> {:ok, module, entry}
+        :error -> nil
+      end
     end)
   end
 
-  defp provider_handles?(module, upper_command) do
-    Code.ensure_loaded?(module) and function_exported?(module, :handle, 3) and
-      module
-      |> module_commands()
-      |> Enum.any?(&(String.upcase(&1.name) == upper_command))
+  defp provider_entry(module, upper_command) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :handle, 3) do
+      case Enum.find(module_commands(module), &(String.upcase(&1.name) == upper_command)) do
+        nil -> :error
+        entry -> {:ok, entry}
+      end
+    else
+      :error
+    end
   end
 
   defp builtin_command?(command) do
@@ -294,16 +343,24 @@ defmodule Ferricstore.Commands.Extension do
 
   defp extract_keys(first, last, step, args) do
     first_idx = max(first - 1, 0)
-    last_idx = if last == -1, do: length(args) - 1, else: last - 1
+    last_idx = if last == -1, do: :last, else: last - 1
     step = max(step, 1)
 
-    if last_idx < first_idx do
-      []
-    else
-      first_idx..last_idx//step
-      |> Enum.map(&Enum.at(args, &1))
-      |> Enum.reject(&is_nil/1)
-      |> Enum.filter(&is_binary/1)
-    end
+    positional_keys(args, 0, first_idx, last_idx, step, [])
+  end
+
+  defp positional_keys([], _index, _first, _last, _step, acc), do: Enum.reverse(acc)
+
+  defp positional_keys(_args, index, _first, last, _step, acc)
+       when is_integer(last) and index > last,
+       do: Enum.reverse(acc)
+
+  defp positional_keys([arg | rest], index, first, last, step, acc) do
+    acc =
+      if index >= first and rem(index - first, step) == 0 and is_binary(arg),
+        do: [arg | acc],
+        else: acc
+
+    positional_keys(rest, index + 1, first, last, step, acc)
   end
 end

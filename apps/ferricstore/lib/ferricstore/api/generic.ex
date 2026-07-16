@@ -3,7 +3,7 @@ defmodule FerricStore.API.Generic do
 
   import FerricStore.API.Store
   alias Ferricstore.Commands.{Expiry, Generic, Strings}
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{ReadResult, Router}
 
   @type key :: FerricStore.key()
   @type value :: FerricStore.value()
@@ -43,7 +43,8 @@ defmodule FerricStore.API.Generic do
       {:ok, false}
 
   """
-  @spec cas(key(), binary(), binary(), cas_opts()) :: {:ok, true | false | nil}
+  @spec cas(key(), binary(), binary(), cas_opts()) ::
+          {:ok, true | false | nil} | {:error, term()}
   def cas(key, expected, new_value, opts \\ []) do
     ctx = default_ctx()
     ttl_ms = Keyword.get(opts, :ttl)
@@ -52,6 +53,7 @@ defmodule FerricStore.API.Generic do
       1 -> {:ok, true}
       0 -> {:ok, false}
       nil -> {:ok, nil}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -59,11 +61,11 @@ defmodule FerricStore.API.Generic do
   Cache-aside pattern with stampede (thundering herd) protection.
 
   Checks whether `key` has a cached value. If it does, returns
-  `{:ok, {:hit, value}}`. If not, returns `{:ok, {:compute, hint}}` to
+  `{:ok, {:hit, value}}`. If not, returns `{:ok, {:compute, hint, token}}` to
   indicate that the caller should compute the value and store it via
   `fetch_or_compute_result/3`.
 
-  Only one caller at a time receives `{:compute, hint}` for a given key --
+  Only one caller at a time receives `{:compute, hint, token}` for a given key --
   all other concurrent callers block until the winner stores the computed
   value. This prevents N concurrent cache misses from triggering N
   identical expensive computations (the "stampede" problem).
@@ -71,13 +73,13 @@ defmodule FerricStore.API.Generic do
   ## Options
 
     * `:ttl` (required) - TTL in milliseconds for the cached value.
-    * `:hint` - An opaque string passed back in `{:compute, hint}`. Defaults
+    * `:hint` - An opaque string passed back in `{:compute, hint, token}`. Defaults
       to `""`.
 
   ## Returns
 
     * `{:ok, {:hit, value}}` if the value is cached.
-    * `{:ok, {:compute, hint}}` if the caller should compute the value.
+    * `{:ok, {:compute, hint, token}}` if the caller should compute the value.
     * `{:error, reason}` on failure.
 
   ## Examples
@@ -86,16 +88,19 @@ defmodule FerricStore.API.Generic do
         {:ok, {:hit, cached}} ->
           Jason.decode!(cached)
 
-        {:ok, {:compute, _hint}} ->
+        {:ok, {:compute, _hint, token}} ->
           stats = DashboardService.compute_stats()
           encoded = Jason.encode!(stats)
-          FerricStore.fetch_or_compute_result("dashboard:stats:today", encoded, ttl: 30_000)
+          FerricStore.fetch_or_compute_result("dashboard:stats:today", encoded,
+            token: token,
+            ttl: 30_000
+          )
           stats
       end
 
   """
   @spec fetch_or_compute(key(), fetch_or_compute_opts()) ::
-          {:ok, {:hit, binary()} | {:compute, binary()}} | {:error, binary()}
+          {:ok, {:hit, binary()} | {:compute, binary(), binary()}} | {:error, term()}
   def fetch_or_compute(key, opts) do
     ttl_ms = Keyword.fetch!(opts, :ttl)
     hint = Keyword.get(opts, :hint, "")
@@ -103,7 +108,7 @@ defmodule FerricStore.API.Generic do
     case Ferricstore.FetchOrCompute.fetch_or_compute(key, ttl_ms, hint) do
       {:hit, value} -> {:ok, {:hit, value}}
       {:ok, value} -> {:ok, {:hit, value}}
-      {:compute, compute_hint} -> {:ok, {:compute, compute_hint}}
+      {:compute, compute_hint, token} -> {:ok, {:compute, compute_hint, token}}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -111,12 +116,14 @@ defmodule FerricStore.API.Generic do
   @doc """
   Stores the computed value for a `fetch_or_compute/2` cache miss and unblocks waiters.
 
-  Must be called after receiving `{:ok, {:compute, hint}}` from `fetch_or_compute/2`.
+  Must be called after receiving `{:ok, {:compute, hint, token}}` from
+  `fetch_or_compute/2`.
   Stores the value in the cache and wakes all concurrent callers that were blocked
   waiting for the computation to complete.
 
   ## Options
 
+    * `:token` (required) - opaque compute lease token returned by `fetch_or_compute/2`.
     * `:ttl` (required) - TTL in milliseconds for the cached value.
 
   ## Returns
@@ -125,14 +132,28 @@ defmodule FerricStore.API.Generic do
 
   ## Examples
 
-      iex> FerricStore.fetch_or_compute_result("dashboard:stats:today", "cached_value", ttl: 30_000)
+      iex> FerricStore.fetch_or_compute_result("dashboard:stats:today", "cached_value", token: token, ttl: 30_000)
       :ok
 
   """
-  @spec fetch_or_compute_result(key(), binary(), keyword()) :: :ok | {:error, binary()}
+  @spec fetch_or_compute_result(key(), binary(), keyword()) :: :ok | {:error, term()}
   def fetch_or_compute_result(key, value, opts) do
+    token = Keyword.fetch!(opts, :token)
     ttl_ms = Keyword.fetch!(opts, :ttl)
-    Ferricstore.FetchOrCompute.fetch_or_compute_result(key, value, ttl_ms)
+    Ferricstore.FetchOrCompute.fetch_or_compute_result(key, value, token, ttl_ms)
+  end
+
+  @doc """
+  Reports a failed `fetch_or_compute/2` computation and releases its fenced lease.
+
+  The `:token` option is required and must be the token returned with
+  `{:compute, hint, token}`. Concurrent waiters on this node receive
+  `{:error, message}`.
+  """
+  @spec fetch_or_compute_error(key(), binary(), keyword()) :: :ok | {:error, term()}
+  def fetch_or_compute_error(key, message, opts) do
+    token = Keyword.fetch!(opts, :token)
+    Ferricstore.FetchOrCompute.fetch_or_compute_error(key, token, message)
   end
 
   # ---------------------------------------------------------------------------
@@ -153,9 +174,13 @@ defmodule FerricStore.API.Generic do
       false
 
   """
-  @spec exists(key()) :: boolean()
+  @spec exists(key()) :: boolean() | {:error, term()}
   def exists(key) do
-    Strings.handle_ast({:exists, [key]}, build_compound_store(key)) == 1
+    case Strings.handle_ast({:exists, [key]}, build_compound_store(key)) do
+      1 -> true
+      0 -> false
+      {:error, _reason} = error -> error
+    end
   end
 
   @doc """
@@ -188,19 +213,22 @@ defmodule FerricStore.API.Generic do
     ctx = default_ctx()
     alias Ferricstore.Store.CompoundKey
 
-    all_keys = Router.keys(ctx)
-    match_all? = pattern == "*"
+    case Router.keys(ctx) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
 
-    visible = CompoundKey.user_visible_keys(all_keys)
+      all_keys ->
+        visible = CompoundKey.user_visible_keys(all_keys)
 
-    results =
-      if match_all? do
-        visible
-      else
-        Enum.filter(visible, &Ferricstore.GlobMatcher.match?(&1, pattern))
-      end
+        results =
+          if pattern == "*" do
+            visible
+          else
+            Enum.filter(visible, &Ferricstore.GlobMatcher.match?(&1, pattern))
+          end
 
-    {:ok, results}
+        {:ok, results}
+    end
   end
 
   @doc """
@@ -220,10 +248,12 @@ defmodule FerricStore.API.Generic do
       true
 
   """
-  @spec dbsize() :: {:ok, non_neg_integer()}
+  @spec dbsize() :: {:ok, non_neg_integer()} | Ferricstore.Store.ReadResult.failure()
   def dbsize do
-    {:ok, matched_keys} = keys()
-    {:ok, length(matched_keys)}
+    case Router.dbsize(default_ctx()) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      count when is_integer(count) and count >= 0 -> {:ok, count}
+    end
   end
 
   @doc """
@@ -296,11 +326,12 @@ defmodule FerricStore.API.Generic do
       {:ok, nil}
 
   """
-  @spec ttl(key()) :: {:ok, non_neg_integer() | nil}
+  @spec ttl(key()) :: {:ok, non_neg_integer() | nil} | {:error, term()}
   def ttl(key) do
     case Expiry.handle_ast({:pttl, key}, build_compound_store(key)) do
-      ttl_ms when ttl_ms < 0 -> {:ok, nil}
-      ttl_ms -> {:ok, ttl_ms}
+      {:error, _reason} = error -> error
+      ttl_ms when is_integer(ttl_ms) and ttl_ms < 0 -> {:ok, nil}
+      ttl_ms when is_integer(ttl_ms) -> {:ok, ttl_ms}
     end
   end
 
@@ -431,44 +462,44 @@ defmodule FerricStore.API.Generic do
   @spec type(key()) :: {:ok, binary()}
   def type(key) do
     ctx = default_ctx()
-
-    # Check compound key type registry first (for hash/set/zset stored via compound keys)
     store = build_compound_store(key)
+
+    case type_from_catalog(ctx, store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      type -> {:ok, type}
+    end
+  end
+
+  defp type_from_catalog(ctx, store, key) do
     type_key = Ferricstore.Store.CompoundKey.type_key(key)
-    compound_type = store.compound_get.(key, type_key)
 
-    cond do
-      compound_type != nil ->
-        {:ok, compound_type}
+    case store.compound_get.(key, type_key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
 
-      # Check for list metadata key (lists use compound keys, no type marker)
-      store.compound_get.(key, Ferricstore.Store.CompoundKey.list_meta_key(key)) != nil ->
-        {:ok, "list"}
+      type when is_binary(type) ->
+        type
 
-      true ->
+      nil ->
+        type_without_catalog_marker(ctx, store, key)
+    end
+  end
+
+  defp type_without_catalog_marker(ctx, store, key) do
+    list_meta_key = Ferricstore.Store.CompoundKey.list_meta_key(key)
+
+    case store.compound_get.(key, list_meta_key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      list_meta when is_binary(list_meta) ->
+        "list"
+
+      nil ->
         case Ferricstore.Stats.with_cache_tracking_disabled(fn -> Router.get(ctx, key) end) do
-          nil ->
-            {:ok, "none"}
-
-          value when is_binary(value) ->
-            detected =
-              try do
-                case :erlang.binary_to_term(value, [:safe]) do
-                  {:list, _} -> "list"
-                  _ -> nil
-                end
-              rescue
-                ArgumentError -> nil
-              end
-
-            if detected do
-              {:ok, detected}
-            else
-              {:ok, "string"}
-            end
-
-          _ ->
-            {:ok, "string"}
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+          nil -> "none"
+          _value -> "string"
         end
     end
   end
@@ -491,13 +522,12 @@ defmodule FerricStore.API.Generic do
       {:ok, nil}
 
   """
-  @spec randomkey() :: {:ok, key() | nil}
+  @spec randomkey() :: {:ok, key() | nil} | Ferricstore.Store.ReadResult.failure()
   def randomkey do
-    {:ok, all_keys} = keys()
-
-    case all_keys do
-      [] -> {:ok, nil}
-      _ -> {:ok, Enum.random(all_keys)}
+    case keys() do
+      {:ok, []} -> {:ok, nil}
+      {:ok, all_keys} -> {:ok, Enum.random(all_keys)}
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
     end
   end
 
@@ -630,9 +660,10 @@ defmodule FerricStore.API.Generic do
       {:ok, -2}
 
   """
-  @spec expiretime(key()) :: {:ok, integer()}
+  @spec expiretime(key()) :: {:ok, integer()} | {:error, term()}
   def expiretime(key) do
-    {:ok, Generic.handle_ast({:expiretime, key}, build_compound_store(key))}
+    Generic.handle_ast({:expiretime, key}, build_compound_store(key))
+    |> wrap_result()
   end
 
   @doc """
@@ -658,9 +689,10 @@ defmodule FerricStore.API.Generic do
       {:ok, -2}
 
   """
-  @spec pexpiretime(key()) :: {:ok, integer()}
+  @spec pexpiretime(key()) :: {:ok, integer()} | {:error, term()}
   def pexpiretime(key) do
-    {:ok, Generic.handle_ast({:pexpiretime, key}, build_compound_store(key))}
+    Generic.handle_ast({:pexpiretime, key}, build_compound_store(key))
+    |> wrap_result()
   end
 
   @doc """

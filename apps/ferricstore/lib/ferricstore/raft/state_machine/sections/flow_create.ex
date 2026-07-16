@@ -252,6 +252,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
            ) do
         partition_key = Map.get(attrs, :partition_key)
         retention = Map.fetch!(lifecycle, :retention)
+        incarnation = flow_next_state_enter_seq(state)
 
         %{
           id: id,
@@ -264,7 +265,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           updated_at_ms: now_ms,
           next_run_at_ms: run_at_ms,
           priority: priority,
-          state_enter_seq: flow_next_state_enter_seq(state),
+          incarnation: incarnation,
+          state_enter_seq: incarnation,
           ttl_ms: nil,
           retention_ttl_ms: Map.fetch!(retention, :ttl_ms),
           max_active_ms: Map.get(lifecycle, :max_active_ms),
@@ -699,7 +701,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
               true ->
                 next_version = flow_named_value_next_version(existing)
-                ref = FlowKeys.value_key(id <> ":" <> name, :shared, next_version, partition_key)
+
+                ref =
+                  FlowKeys.named_shared_value_key(id, name, next_version, partition_key)
 
                 {:cont,
                  {:ok, Map.put(acc, name, %{ref: ref, version: next_version, digest: digest})}}
@@ -816,6 +820,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         end
       end
 
+      defp do_flow_policy_allocate(state, key, value, expire_at_ms) do
+        case FlowKeys.policy_type(key) do
+          {:ok, type} ->
+            case RetryPolicy.decode_flow_policy_entry(value) do
+              {:ok, {0, %{type: ^type} = policy}} ->
+                with {:ok, {stored_generation, _stored_value}} <-
+                       flow_stored_policy_generation_strict(state, key),
+                     {:ok, migration_generation} <-
+                       flow_policy_strict_migration_high_water(state, type),
+                     high_water <- max(stored_generation, migration_generation),
+                     {:ok, generation} <-
+                       Ferricstore.Flow.PolicyMigration.next_generation(high_water),
+                     encoded <- RetryPolicy.encode_flow_policy(policy, generation),
+                     :ok <- do_flow_policy_put(state, key, encoded, expire_at_ms) do
+                  {:ok, encoded}
+                end
+
+              _invalid ->
+                {:error, "ERR invalid flow policy value"}
+            end
+
+          :error ->
+            {:error, "ERR invalid flow policy key"}
+        end
+      end
+
       defp flow_apply_versioned_policy_put(
              state,
              key,
@@ -825,47 +855,52 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
              policy_generation,
              new_policy
            ) do
-        {stored_generation, stored_value} = flow_stored_policy_generation(state, key)
+        with {:ok, {stored_generation, stored_value}} <-
+               flow_stored_policy_generation_strict(state, key),
+             {:ok, migration_generation} <-
+               flow_policy_strict_migration_high_water(state, type) do
+          high_water = max(stored_generation, migration_generation)
 
-        high_water =
-          max(stored_generation, flow_policy_migration_marker_generation(state, type))
+          cond do
+            stored_generation == policy_generation and stored_value == value ->
+              :ok
 
-        cond do
-          policy_generation == 0 and stored_generation > 0 ->
-            {:error, "ERR stale flow policy generation"}
+            policy_generation == 0 and stored_generation > 0 ->
+              {:error, "ERR stale flow policy generation"}
 
-          policy_generation > 0 and high_water > policy_generation ->
-            :ok
+            policy_generation > 0 and high_water > policy_generation ->
+              :ok
 
-          policy_generation > 0 and stored_generation == policy_generation and
-            is_binary(stored_value) and stored_value != value ->
-            {:error, "ERR conflicting flow policy generation"}
+            policy_generation > 0 and stored_generation == policy_generation and
+              is_binary(stored_value) and stored_value != value ->
+              {:error, "ERR conflicting flow policy generation"}
 
-          true ->
-            old_indexed_key = flow_stored_policy_indexed_state_meta(stored_value)
-            new_indexed_key = RetryPolicy.indexed_state_meta(new_policy)
-            old_indexed_attributes = flow_stored_policy_indexed_attributes(stored_value)
-            new_indexed_attributes = RetryPolicy.indexed_attributes(new_policy)
+            true ->
+              old_indexed_key = flow_stored_policy_indexed_state_meta(stored_value)
+              new_indexed_key = RetryPolicy.indexed_state_meta(new_policy)
+              old_indexed_attributes = flow_stored_policy_indexed_attributes(stored_value)
+              new_indexed_attributes = RetryPolicy.indexed_attributes(new_policy)
 
-            with :ok <- do_put(state, key, value, expire_at_ms),
-                 :ok <-
-                   flow_update_policy_indexed_attribute_counts(
-                     state,
-                     type,
-                     old_indexed_attributes,
-                     new_indexed_attributes
-                   ) do
-              if old_indexed_key == new_indexed_key do
-                :ok
-              else
-                flow_enqueue_policy_migration(
-                  state,
-                  type,
-                  policy_generation,
-                  new_indexed_key
-                )
+              with :ok <- do_put(state, key, value, expire_at_ms),
+                   :ok <-
+                     flow_update_policy_indexed_attribute_counts(
+                       state,
+                       type,
+                       old_indexed_attributes,
+                       new_indexed_attributes
+                     ) do
+                if old_indexed_key == new_indexed_key do
+                  :ok
+                else
+                  flow_enqueue_policy_migration(
+                    state,
+                    type,
+                    policy_generation,
+                    new_indexed_key
+                  )
+                end
               end
-            end
+          end
         end
       end
 
@@ -1065,6 +1100,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
 
           _missing ->
             {0, nil}
+        end
+      end
+
+      defp flow_stored_policy_generation_strict(state, key) do
+        case ets_lookup(state, key) do
+          {:hit, value, _expire_at_ms} when is_binary(value) ->
+            case RetryPolicy.decode_flow_policy_entry(value) do
+              {:ok, {generation, _policy}} -> {:ok, {generation, value}}
+              :error -> {:error, "ERR corrupt flow policy high-water"}
+            end
+
+          {:hit, _invalid, _expire_at_ms} ->
+            {:error, "ERR corrupt flow policy high-water"}
+
+          _missing ->
+            {:ok, {0, nil}}
         end
       end
 

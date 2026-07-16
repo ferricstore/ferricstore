@@ -9,11 +9,13 @@ defmodule Ferricstore.Flow.InfoCountRead do
   alias Ferricstore.Flow.LMDBWriter
   alias Ferricstore.Store.Router
 
+  @default_terminal_lmdb_sweep_limit 10_000
+
   def zset_count_many(_ctx, []), do: {:ok, []}
 
   def zset_count_many(ctx, keys) do
     case Router.flow_index_count_all_many(ctx, keys) do
-      {:ok, counts} -> {:ok, counts}
+      {:ok, counts} -> InfoCounts.validate_counts(keys, counts)
       :unavailable -> zcard_many_fallback(ctx, keys)
     end
   end
@@ -45,6 +47,7 @@ defmodule Ferricstore.Flow.InfoCountRead do
           |> lmdb_paths_for_index(first_key, partition_key)
           |> Enum.reduce_while({:ok, Map.new(terminal_keys, &{&1, 0})}, fn path, {:ok, acc} ->
             with {:ok, counts} <- LMDB.terminal_counts(path, terminal_keys),
+                 {:ok, counts} <- InfoCounts.validate_counts(terminal_keys, counts),
                  {:ok, counts} <-
                    maybe_sweep_terminal_lmdb_counts(
                      path,
@@ -52,8 +55,8 @@ defmodule Ferricstore.Flow.InfoCountRead do
                      counts,
                      now_ms,
                      sweep_limit
-                   ) do
-              merged = InfoCounts.merge_terminal_counts(acc, terminal_keys, counts)
+                   ),
+                 {:ok, merged} <- InfoCounts.merge_terminal_counts(acc, terminal_keys, counts) do
               {:cont, {:ok, merged}}
             else
               {:error, _reason} = error -> {:halt, error}
@@ -71,7 +74,7 @@ defmodule Ferricstore.Flow.InfoCountRead do
       end
     end)
     |> case do
-      {:ok, counts} -> {:ok, Enum.reverse(counts)}
+      {:ok, counts} -> InfoCounts.validate_counts(keys, Enum.reverse(counts))
       {:error, _reason} = error -> error
     end
   end
@@ -107,7 +110,15 @@ defmodule Ferricstore.Flow.InfoCountRead do
     LMDBMirror.paths_for_index(ctx, index_key, partition_key)
   end
 
-  defp terminal_lmdb_sweep_limit do
-    Application.get_env(:ferricstore, :flow_lmdb_terminal_sweep_limit, 10_000)
+  @doc false
+  def terminal_lmdb_sweep_limit do
+    case Application.get_env(
+           :ferricstore,
+           :flow_lmdb_terminal_sweep_limit,
+           @default_terminal_lmdb_sweep_limit
+         ) do
+      value when is_integer(value) and value > 0 -> value
+      _invalid -> @default_terminal_lmdb_sweep_limit
+    end
   end
 end

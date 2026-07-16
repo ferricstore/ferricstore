@@ -18,6 +18,7 @@ defmodule FerricstoreServer.Application do
   use Application
 
   alias FerricstoreServer.Native.Connection.FrameBuffer
+  alias FerricstoreServer.Health.Endpoint.Session
 
   require Logger
 
@@ -33,15 +34,20 @@ defmodule FerricstoreServer.Application do
     |> Application.get_env(:native_max_frame_bytes, 16 * 1024 * 1024)
     |> FrameBuffer.validate_max_frame_bytes!()
 
+    Session.initialize_secret!()
     configure_management_adapters()
     FerricstoreServer.Connection.Registry.init_table()
+    FerricstoreServer.Native.Admission.init_table()
 
     children =
       [
         FerricstoreServer.Acl,
-        FerricstoreServer.AuthRateLimiter,
-        FerricstoreServer.Health.Dashboard.StorageSnapshotCache,
         pg_child_spec(),
+        FerricstoreServer.Acl.CatalogProjector,
+        FerricstoreServer.AuthRateLimiter,
+        FerricstoreServer.Native.Admission,
+        FerricstoreServer.Native.ResourceBudget,
+        FerricstoreServer.Health.Dashboard.StorageSnapshotCache,
         native_listener_spec(native_port)
       ] ++
         native_tls_listener_children() ++
@@ -51,7 +57,7 @@ defmodule FerricstoreServer.Application do
         ]
 
     opts = [
-      strategy: :one_for_one,
+      strategy: :rest_for_one,
       name: FerricstoreServer.Supervisor,
       max_restarts: 20,
       max_seconds: 10
@@ -111,8 +117,7 @@ defmodule FerricstoreServer.Application do
           native_port: native_port
         }
         |> maybe_put_native_tls_port()
-      end,
-      raft_apply_hook: FerricstoreServer.RaftApplyHook.compose_current(:default)
+      end
     )
   end
 
@@ -195,14 +200,8 @@ defmodule FerricstoreServer.Application do
     nodelay = Application.get_env(:ferricstore, :tcp_nodelay, true)
 
     transport_opts = %{
-      socket_opts: [
-        port: port,
-        nodelay: nodelay,
-        recbuf: Application.get_env(:ferricstore, :tcp_recbuf, 131_072),
-        sndbuf: Application.get_env(:ferricstore, :tcp_sndbuf, 131_072),
-        backlog: 1024,
-        keepalive: true
-      ]
+      max_connections: FerricstoreServer.Native.Listener.max_connections(),
+      socket_opts: FerricstoreServer.Native.Listener.socket_opts(port, nodelay: nodelay)
     }
 
     protocol_opts = %{

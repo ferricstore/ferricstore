@@ -2,15 +2,22 @@ defmodule FerricstoreServer.Native.Session do
   @moduledoc false
 
   alias Ferricstore.PubSub, as: PS
-  alias Ferricstore.Commands.PreparedCommand
+  alias Ferricstore.Commands.{PreparedCommand, TransactionPolicy}
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.Coordinator, as: TxCoordinator
   alias FerricstoreServer.Acl.Protection
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
+  alias FerricstoreServer.Native.ResourceBudget
 
   @max_subscriptions 100_000
   @max_multi_queue_size 100_000
+  @default_multi_queue_byte_limit 32 * 1024 * 1024
+  @default_watch_key_limit 10_000
+  @default_watch_key_byte_limit 16 * 1024 * 1024
+  @watched_key_overhead_bytes 64
+  @subscription_entry_overhead_bytes 64
+  @default_subscription_byte_limit 16 * 1024 * 1024
 
   @session_commands MapSet.new(~w(
     SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
@@ -54,14 +61,6 @@ defmodule FerricstoreServer.Native.Session do
     end
   end
 
-  @spec authorize_command(binary(), [binary()], term(), [binary()], map()) ::
-          :ok | {:error, atom(), binary()}
-  def authorize_command(cmd, args, ast, keys, state) do
-    cmd
-    |> PreparedCommand.from_parsed(args, ast, keys)
-    |> authorize_command(state)
-  end
-
   @spec authorize_command(PreparedCommand.t(), map()) :: :ok | {:error, atom(), binary()}
   def authorize_command(%PreparedCommand{} = prepared, state) do
     cond do
@@ -96,13 +95,26 @@ defmodule FerricstoreServer.Native.Session do
 
     state
     |> clear_transaction()
-    |> Map.merge(%{pubsub_channels: nil, pubsub_patterns: nil})
+    |> Map.merge(%{
+      pubsub_channels: nil,
+      pubsub_patterns: nil,
+      pubsub_subscription_bytes: 0,
+      pubsub_subscription_token: nil
+    })
   end
 
   @spec cleanup_pubsub(map()) :: :ok
   def cleanup_pubsub(state) do
     if Map.get(state, :pubsub_channels) != nil or Map.get(state, :pubsub_patterns) != nil do
       PS.cleanup(self())
+    end
+
+    case Map.get(state, :pubsub_subscription_token) do
+      token when is_reference(token) ->
+        ResourceBudget.release(Map.get(state, :resource_budget, ResourceBudget), token)
+
+      _none ->
+        :ok
     end
 
     :ok
@@ -164,7 +176,14 @@ defmodule FerricstoreServer.Native.Session do
 
   defp execute_session_command("MULTI", _args, _ast, _keys, state) do
     {:ok, "OK",
-     %{state | multi_state: :queuing, multi_queue: [], multi_queue_count: 0, multi_error: false}}
+     %{
+       state
+       | multi_state: :queuing,
+         multi_queue: [],
+         multi_queue_count: 0,
+         multi_queue_bytes: 0,
+         multi_error: false
+     }}
   end
 
   defp execute_session_command("EXEC", _args, _ast, _keys, %{multi_state: :none} = state),
@@ -182,10 +201,14 @@ defmodule FerricstoreServer.Native.Session do
     with :ok <- reauthorize_transaction(ordered, state) do
       entries = Enum.map(ordered, &transaction_entry/1)
 
-      result =
-        TxCoordinator.execute(entries, state.watched_keys, Map.get(state, :sandbox_namespace))
-
-      {:ok, native_tx_result(result), clear_transaction(state)}
+      case TxCoordinator.execute(
+             entries,
+             state.watched_keys,
+             Map.get(state, :sandbox_namespace)
+           ) do
+        {:error, reason} -> {:error, reason, clear_transaction(state)}
+        result -> {:ok, native_tx_result(result), clear_transaction(state)}
+      end
     else
       {:error, reason} -> {:noperm, reason, clear_transaction(state)}
     end
@@ -204,20 +227,51 @@ defmodule FerricstoreServer.Native.Session do
     do: {:bad_request, "ERR wrong number of arguments for 'watch' command", state}
 
   defp execute_session_command("WATCH", keys, _ast, _acl_keys, state) do
-    watched =
-      Enum.reduce(keys, state.watched_keys, fn key, acc ->
-        watched_key = namespace_key(Map.get(state, :sandbox_namespace), key)
-        Map.put(acc, watched_key, Router.watch_token(state.instance_ctx, watched_key))
+    watched_keys =
+      keys
+      |> Enum.map(&namespace_key(Map.get(state, :sandbox_namespace), &1))
+      |> Enum.uniq()
+
+    new_keys = Enum.reject(watched_keys, &Map.has_key?(state.watched_keys, &1))
+    resulting_key_count = map_size(state.watched_keys) + length(new_keys)
+
+    added_bytes =
+      Enum.reduce(new_keys, 0, fn key, total ->
+        total + byte_size(key) + @watched_key_overhead_bytes
       end)
 
-    {:ok, "OK", %{state | watched_keys: watched}}
+    resulting_key_bytes = Map.get(state, :watched_key_bytes, 0) + added_bytes
+    key_limit = Map.get(state, :watch_key_limit, @default_watch_key_limit)
+    byte_limit = Map.get(state, :watch_key_byte_limit, @default_watch_key_byte_limit)
+
+    cond do
+      resulting_key_count > key_limit ->
+        {:error, "ERR WATCH key limit exceeded (max #{key_limit})", state}
+
+      resulting_key_bytes > byte_limit ->
+        {:error, "ERR WATCH byte limit exceeded (max #{byte_limit} bytes)", state}
+
+      true ->
+        case Router.watch_tokens(state.instance_ctx, watched_keys) do
+          %{} = tokens ->
+            {:ok, "OK",
+             %{
+               state
+               | watched_keys: Map.merge(state.watched_keys, tokens),
+                 watched_key_bytes: resulting_key_bytes
+             }}
+
+          {:error, reason} ->
+            {:error, "ERR WATCH unavailable: #{inspect(reason)}", state}
+        end
+    end
   catch
     :exit, {reason, _} ->
       {:error, "ERR server not ready: #{inspect(reason)}", state}
   end
 
   defp execute_session_command("UNWATCH", _args, _ast, _keys, state),
-    do: {:ok, "OK", %{state | watched_keys: %{}}}
+    do: {:ok, "OK", %{state | watched_keys: %{}, watched_key_bytes: 0}}
 
   defp execute_session_command(_cmd, _args, _ast, _keys, state),
     do: {:bad_request, "ERR native command is not a session command", state}
@@ -236,16 +290,35 @@ defmodule FerricstoreServer.Native.Session do
         {:error, "ERR coordinated command is not supported inside a transaction",
          %{state | multi_error: true}}
 
+      not PreparedCommand.transaction_safe?(prepared) ->
+        {:error, reason} = TransactionPolicy.error(prepared.command)
+        {:error, reason, %{state | multi_error: true}}
+
       transaction_ast_error(prepared.ast) != nil ->
         {:error, transaction_ast_error(prepared.ast), %{state | multi_error: true}}
 
       true ->
-        {:ok, "QUEUED",
-         %{
-           state
-           | multi_queue: [prepared | state.multi_queue],
-             multi_queue_count: state.multi_queue_count + 1
-         }}
+        queue_transaction_command_within_byte_limit(prepared, state)
+    end
+  end
+
+  defp queue_transaction_command_within_byte_limit(prepared, state) do
+    command_bytes = :erlang.external_size(prepared)
+    queued_bytes = Map.get(state, :multi_queue_bytes, 0)
+    byte_limit = Map.get(state, :multi_queue_byte_limit, @default_multi_queue_byte_limit)
+
+    if queued_bytes + command_bytes > byte_limit do
+      {:error,
+       "ERR MULTI queue byte limit exceeded (max #{byte_limit} bytes), transaction discarded",
+       clear_transaction(state)}
+    else
+      {:ok, "QUEUED",
+       %{
+         state
+         | multi_queue: [prepared | state.multi_queue],
+           multi_queue_count: state.multi_queue_count + 1,
+           multi_queue_bytes: queued_bytes + command_bytes
+       }}
     end
   end
 
@@ -255,8 +328,10 @@ defmodule FerricstoreServer.Native.Session do
       | multi_state: :none,
         multi_queue: [],
         multi_queue_count: 0,
+        multi_queue_bytes: 0,
         multi_error: false,
-        watched_keys: %{}
+        watched_keys: %{},
+        watched_key_bytes: 0
     }
   end
 
@@ -281,23 +356,13 @@ defmodule FerricstoreServer.Native.Session do
   defp transaction_prepared(%PreparedCommand{} = prepared), do: prepared
 
   defp subscribe_channels(channels, state) do
-    state = ensure_pubsub_sets(state)
-    unique = MapSet.new(channels)
-    new_channels = MapSet.difference(unique, state.pubsub_channels)
-
-    if subscription_count(state) + MapSet.size(new_channels) > @max_subscriptions do
-      {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached", state}
-    else
-      new_channels |> MapSet.to_list() |> PS.subscribe_many(self())
-
-      {acks, state} =
-        Enum.map_reduce(channels, state, fn channel, acc ->
-          acc = %{acc | pubsub_channels: MapSet.put(acc.pubsub_channels, channel)}
-          {["subscribe", channel, subscription_count(acc)], acc}
-        end)
-
-      {:ok, acks, state}
-    end
+    subscribe_values(
+      channels,
+      state,
+      :pubsub_channels,
+      &PS.subscribe_many/2,
+      "subscribe"
+    )
   end
 
   defp unsubscribe_channels([], state) do
@@ -311,36 +376,23 @@ defmodule FerricstoreServer.Native.Session do
   end
 
   defp unsubscribe_channels(channels, state) do
-    state = ensure_pubsub_sets(state)
-    PS.unsubscribe_many(channels, self())
-
-    {acks, state} =
-      Enum.map_reduce(channels, state, fn channel, acc ->
-        acc = %{acc | pubsub_channels: MapSet.delete(acc.pubsub_channels, channel)}
-        {["unsubscribe", channel, subscription_count(acc)], acc}
-      end)
-
-    {:ok, acks, state}
+    unsubscribe_values(
+      channels,
+      state,
+      :pubsub_channels,
+      &PS.unsubscribe_many/2,
+      "unsubscribe"
+    )
   end
 
   defp subscribe_patterns(patterns, state) do
-    state = ensure_pubsub_sets(state)
-    unique = MapSet.new(patterns)
-    new_patterns = MapSet.difference(unique, state.pubsub_patterns)
-
-    if subscription_count(state) + MapSet.size(new_patterns) > @max_subscriptions do
-      {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached", state}
-    else
-      new_patterns |> MapSet.to_list() |> PS.psubscribe_many(self())
-
-      {acks, state} =
-        Enum.map_reduce(patterns, state, fn pattern, acc ->
-          acc = %{acc | pubsub_patterns: MapSet.put(acc.pubsub_patterns, pattern)}
-          {["psubscribe", pattern, subscription_count(acc)], acc}
-        end)
-
-      {:ok, acks, state}
-    end
+    subscribe_values(
+      patterns,
+      state,
+      :pubsub_patterns,
+      &PS.psubscribe_many/2,
+      "psubscribe"
+    )
   end
 
   defp unsubscribe_patterns([], state) do
@@ -354,17 +406,176 @@ defmodule FerricstoreServer.Native.Session do
   end
 
   defp unsubscribe_patterns(patterns, state) do
+    unsubscribe_values(
+      patterns,
+      state,
+      :pubsub_patterns,
+      &PS.punsubscribe_many/2,
+      "punsubscribe"
+    )
+  end
+
+  defp subscribe_values(values, state, set_key, subscribe_fun, ack_kind) do
     state = ensure_pubsub_sets(state)
-    PS.punsubscribe_many(patterns, self())
+    current = Map.fetch!(state, set_key)
+    new_values = values |> MapSet.new() |> MapSet.difference(current)
+
+    cond do
+      subscription_count(state) + MapSet.size(new_values) > @max_subscriptions ->
+        {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached", state}
+
+      true ->
+        added_bytes = subscription_set_bytes(new_values)
+
+        case reserve_subscription_bytes(state, added_bytes) do
+          {:ok, reserved_state} ->
+            detached = Map.new(new_values, &{&1, :binary.copy(&1)})
+            detached_values = Map.values(detached)
+
+            case safe_pubsub_update(subscribe_fun, detached_values) do
+              :ok ->
+                {acks, updated_state} =
+                  Enum.map_reduce(values, reserved_state, fn value, acc ->
+                    retained = Map.fetch!(acc, set_key)
+
+                    acc =
+                      case {MapSet.member?(retained, value), Map.fetch(detached, value)} do
+                        {false, {:ok, detached_value}} ->
+                          Map.put(acc, set_key, MapSet.put(retained, detached_value))
+
+                        _existing_or_duplicate ->
+                          acc
+                      end
+
+                    {[ack_kind, value, subscription_count(acc)], acc}
+                  end)
+
+                {:ok, acks, updated_state}
+
+              {:error, reason} ->
+                rollback_subscription_bytes(reserved_state, state)
+                {:error, "ERR pubsub subscription failed: #{inspect(reason)}", state}
+            end
+
+          {:error, reason} ->
+            {:error, reason, state}
+        end
+    end
+  end
+
+  defp unsubscribe_values(values, state, set_key, unsubscribe_fun, ack_kind) do
+    state = ensure_pubsub_sets(state)
+    unsubscribe_fun.(values, self())
 
     {acks, state} =
-      Enum.map_reduce(patterns, state, fn pattern, acc ->
-        acc = %{acc | pubsub_patterns: MapSet.delete(acc.pubsub_patterns, pattern)}
-        {["punsubscribe", pattern, subscription_count(acc)], acc}
+      Enum.map_reduce(values, state, fn value, acc ->
+        retained = Map.fetch!(acc, set_key)
+
+        acc =
+          if MapSet.member?(retained, value) do
+            acc
+            |> Map.put(set_key, MapSet.delete(retained, value))
+            |> Map.update!(:pubsub_subscription_bytes, fn bytes ->
+              max(bytes - subscription_entry_bytes(value), 0)
+            end)
+          else
+            acc
+          end
+
+        {[ack_kind, value, subscription_count(acc)], acc}
       end)
 
-    {:ok, acks, state}
+    {:ok, acks, sync_subscription_lease(state)}
   end
+
+  defp reserve_subscription_bytes(state, 0), do: {:ok, state}
+
+  defp reserve_subscription_bytes(state, added_bytes) do
+    current_bytes = Map.get(state, :pubsub_subscription_bytes, 0)
+    total_bytes = current_bytes + added_bytes
+
+    max_bytes =
+      Map.get(state, :max_pubsub_subscription_bytes, @default_subscription_byte_limit)
+
+    if total_bytes > max_bytes do
+      {:error, "ERR native subscription byte limit (#{max_bytes}) reached"}
+    else
+      budget = Map.get(state, :resource_budget, ResourceBudget)
+
+      case Map.get(state, :pubsub_subscription_token) do
+        token when is_reference(token) ->
+          case ResourceBudget.resize(budget, token, total_bytes) do
+            :ok -> {:ok, %{state | pubsub_subscription_bytes: total_bytes}}
+            {:error, _reason} -> {:error, "ERR native global subscription byte limit reached"}
+          end
+
+        _none ->
+          case ResourceBudget.acquire(budget, :subscription_bytes, self(), total_bytes) do
+            {:ok, token} ->
+              {:ok,
+               state
+               |> Map.put(:pubsub_subscription_bytes, total_bytes)
+               |> Map.put(:pubsub_subscription_token, token)}
+
+            {:error, _reason} ->
+              {:error, "ERR native global subscription byte limit reached"}
+          end
+      end
+    end
+  end
+
+  defp sync_subscription_lease(state) do
+    bytes = Map.get(state, :pubsub_subscription_bytes, 0)
+    token = Map.get(state, :pubsub_subscription_token)
+    budget = Map.get(state, :resource_budget, ResourceBudget)
+
+    cond do
+      not is_reference(token) ->
+        state
+
+      bytes == 0 ->
+        ResourceBudget.release(budget, token)
+        Map.put(state, :pubsub_subscription_token, nil)
+
+      true ->
+        _result = ResourceBudget.resize(budget, token, bytes)
+        state
+    end
+  end
+
+  defp rollback_subscription_bytes(reserved_state, previous_state) do
+    budget = Map.get(reserved_state, :resource_budget, ResourceBudget)
+    previous_bytes = Map.get(previous_state, :pubsub_subscription_bytes, 0)
+
+    case {Map.get(reserved_state, :pubsub_subscription_token),
+          Map.get(previous_state, :pubsub_subscription_token)} do
+      {token, previous_token} when is_reference(token) and token == previous_token ->
+        _result = ResourceBudget.resize(budget, token, previous_bytes)
+
+      {token, _none} when is_reference(token) ->
+        ResourceBudget.release(budget, token)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp safe_pubsub_update(fun, values) do
+    case fun.(values, self()) do
+      :ok -> :ok
+      other -> {:error, other}
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp subscription_set_bytes(values),
+    do: Enum.reduce(values, 0, &(subscription_entry_bytes(&1) + &2))
+
+  defp subscription_entry_bytes(value),
+    do: byte_size(value) + @subscription_entry_overhead_bytes
 
   defp authorize_channels(cmd, args, state)
        when cmd in ["SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE"],
@@ -385,10 +596,20 @@ defmodule FerricstoreServer.Native.Session do
   defp format_peer({ip, port}), do: "#{:inet.ntoa(ip)}:#{port}"
   defp format_peer(peer), do: inspect(peer)
 
-  defp ensure_pubsub_sets(%{pubsub_channels: nil} = state),
-    do: %{state | pubsub_channels: MapSet.new(), pubsub_patterns: MapSet.new()}
+  defp ensure_pubsub_sets(state) do
+    state =
+      if Map.get(state, :pubsub_channels) == nil do
+        state
+        |> Map.put(:pubsub_channels, MapSet.new())
+        |> Map.put(:pubsub_patterns, MapSet.new())
+      else
+        state
+      end
 
-  defp ensure_pubsub_sets(state), do: state
+    state
+    |> Map.put_new(:pubsub_subscription_bytes, 0)
+    |> Map.put_new(:pubsub_subscription_token, nil)
+  end
 
   defp subscription_count(state),
     do: MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
@@ -431,17 +652,30 @@ defmodule FerricstoreServer.Native.Session do
     end
   end
 
-  defp raw_command_args(%{"args" => args}) when is_list(args),
-    do: {:ok, Enum.map(args, &native_arg/1)}
+  defp raw_command_args(%{"args" => args}) when is_list(args), do: native_args(args, [])
 
   defp raw_command_args(%{"args" => _args}),
     do: {:error, "ERR native COMMAND_EXEC args must be a list"}
 
   defp raw_command_args(_payload), do: {:ok, []}
 
-  defp native_arg(value) when is_binary(value), do: value
-  defp native_arg(value) when is_integer(value), do: Integer.to_string(value)
-  defp native_arg(value) when is_float(value), do: :erlang.float_to_binary(value, [:compact])
-  defp native_arg(value) when is_atom(value), do: value |> Atom.to_string() |> String.upcase()
-  defp native_arg(value), do: to_string(value)
+  defp native_args([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp native_args([value | rest], acc) do
+    case native_arg(value) do
+      {:ok, value} -> native_args(rest, [value | acc])
+      :error -> {:error, "ERR native field args contains an unsupported value"}
+    end
+  end
+
+  defp native_arg(value) when is_binary(value), do: {:ok, value}
+  defp native_arg(value) when is_integer(value), do: {:ok, Integer.to_string(value)}
+
+  defp native_arg(value) when is_float(value),
+    do: {:ok, :erlang.float_to_binary(value, [:compact])}
+
+  defp native_arg(value) when is_atom(value),
+    do: {:ok, value |> Atom.to_string() |> String.upcase()}
+
+  defp native_arg(_value), do: :error
 end

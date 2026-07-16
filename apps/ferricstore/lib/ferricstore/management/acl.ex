@@ -12,9 +12,11 @@ defmodule FerricStore.Management.ACL do
 
   @callback set_user(username(), [acl_rule()], keyword()) :: result()
   @callback del_user(username(), keyword()) :: result()
+  @callback del_users([username()], keyword()) :: result()
   @callback get_user(username(), keyword()) :: result()
   @callback list_users(keyword()) :: result()
   @callback save(keyword()) :: result()
+  @callback load(keyword()) :: result()
 
   @spec set_user(username(), [acl_rule()], keyword()) :: result()
   def set_user(username, rules, opts \\ []),
@@ -22,6 +24,9 @@ defmodule FerricStore.Management.ACL do
 
   @spec del_user(username(), keyword()) :: result()
   def del_user(username, opts \\ []), do: implementation(opts).del_user(username, opts)
+
+  @spec del_users([username()], keyword()) :: result()
+  def del_users(usernames, opts \\ []), do: implementation(opts).del_users(usernames, opts)
 
   @spec get_user(username(), keyword()) :: result()
   def get_user(username, opts \\ []), do: implementation(opts).get_user(username, opts)
@@ -31,6 +36,9 @@ defmodule FerricStore.Management.ACL do
 
   @spec save(keyword()) :: result()
   def save(opts \\ []), do: implementation(opts).save(opts)
+
+  @spec load(keyword()) :: result()
+  def load(opts \\ []), do: implementation(opts).load(opts)
 
   @doc false
   @spec implementation(keyword()) :: module()
@@ -52,6 +60,9 @@ defmodule FerricStore.Management.ACL.Unsupported do
   def del_user(_username, _opts), do: {:error, :unsupported}
 
   @impl true
+  def del_users(_usernames, _opts), do: {:error, :unsupported}
+
+  @impl true
   def get_user(_username, _opts), do: {:error, :unsupported}
 
   @impl true
@@ -59,4 +70,7 @@ defmodule FerricStore.Management.ACL.Unsupported do
 
   @impl true
   def save(_opts), do: {:error, :unsupported}
+
+  @impl true
+  def load(_opts), do: {:error, :unsupported}
 end

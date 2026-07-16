@@ -1,6 +1,11 @@
 defmodule Ferricstore.Commands.Set.Random do
   @moduledoc false
 
+  @max_replacement_count 10_000
+
+  def select_random_members(_members, count) when count < -@max_replacement_count,
+    do: {:error, "ERR count exceeds maximum allowed response size"}
+
   def select_random_members(members, count) do
     cond do
       count == 0 ->

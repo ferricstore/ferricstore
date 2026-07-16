@@ -134,11 +134,16 @@ defmodule FerricstoreServer.Commands.Client do
     {{:error, "ERR syntax error"}, conn_state}
   end
 
-  def handle("PAUSE", _args, conn_state, _store), do: {:ok, conn_state}
-  def handle("UNPAUSE", _args, conn_state, _store), do: {:ok, conn_state}
+  def handle("PAUSE", _args, conn_state, _store) do
+    {{:error, "ERR CLIENT PAUSE is not supported by the native protocol"}, conn_state}
+  end
+
+  def handle("UNPAUSE", _args, conn_state, _store) do
+    {{:error, "ERR CLIENT UNPAUSE is not supported by the native protocol"}, conn_state}
+  end
 
   def handle("NO-EVICT", [flag], conn_state, _store) when flag in ~w(ON OFF on off) do
-    {:ok, conn_state}
+    {{:error, "ERR CLIENT NO-EVICT is not supported by the native protocol"}, conn_state}
   end
 
   def handle("NO-EVICT", _args, conn_state, _store) do
@@ -146,7 +151,7 @@ defmodule FerricstoreServer.Commands.Client do
   end
 
   def handle("NO-TOUCH", [flag], conn_state, _store) when flag in ~w(ON OFF on off) do
-    {:ok, conn_state}
+    {{:error, "ERR CLIENT NO-TOUCH is not supported by the native protocol"}, conn_state}
   end
 
   def handle("NO-TOUCH", _args, conn_state, _store) do

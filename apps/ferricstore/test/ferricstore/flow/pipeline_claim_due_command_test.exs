@@ -52,4 +52,53 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommandTest do
                callbacks()
              )
   end
+
+  test "rejects claim filters whose state and partition product exceeds the bound" do
+    states = Enum.map(1..9, &"state-#{&1}")
+    partition_keys = Enum.map(1..8, &"partition-#{&1}")
+
+    assert {:error, "ERR flow claim filter footprint exceeds maximum 64"} =
+             PipelineClaimDueCommand.command(
+               {:claim_due, "email",
+                [worker: "worker-a", states: states, partition_keys: partition_keys]},
+               callbacks()
+             )
+  end
+
+  test "rejects internal keys that exceed the limit only after component encoding" do
+    type = String.duplicate("t", 30_000)
+    state = String.duplicate("s", 25_000)
+
+    assert {:error, "ERR key too large (max 65535 bytes)"} =
+             PipelineClaimDueCommand.command(
+               {:claim_due, type, [worker: "worker-a", state: state, partition_key: "partition"]},
+               callbacks()
+             )
+  end
+
+  test "rejects lease durations that cannot produce exact Flow index deadlines" do
+    assert {:error, "ERR flow lease_ms exceeds maximum 9007199254740991"} =
+             PipelineClaimDueCommand.command(
+               {:claim_due, "email",
+                [worker: "worker-a", lease_ms: 9_007_199_254_740_992]},
+               callbacks()
+             )
+  end
+
+  test "rejects claim deadlines that leave the exact Flow timestamp range" do
+    assert {:error, "ERR flow lease_ms deadline exceeds maximum 9007199254740991"} =
+             PipelineClaimDueCommand.command(
+               {:claim_due, "email",
+                [worker: "worker-a", now_ms: 9_007_199_254_740_991, lease_ms: 1]},
+               callbacks()
+             )
+  end
+
+  test "rejects blocking claims because pipelines cannot wait" do
+    assert {:error, "ERR flow block_ms is not supported in pipelines"} =
+             PipelineClaimDueCommand.command(
+               {:claim_due, "email", [worker: "worker-a", block_ms: 1]},
+               callbacks()
+             )
+  end
 end

@@ -11,15 +11,27 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
   alias Ferricstore.Flow.Governance.View
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
+
+  @max_assignees 1_000
+  @max_exact_integer 9_007_199_254_740_991
+  @max_dimension_bytes 65_535
+  @max_field_bytes 262_144
+  @max_record_bytes 900_000
 
   def request(ctx, id, opts \\ [])
 
   def request(ctx, id, opts) when is_binary(id) and id != "" and is_list(opts) do
     result =
-      with {:ok, flow_id} <- required_binary(opts, :flow_id),
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- approval_key(id),
+           {:ok, flow_id} <- required_binary(opts, :flow_id),
            {:ok, scope} <- required_binary(opts, :scope),
+           :ok <- validate_catalog_dimensions(scope, flow_id),
            {:ok, now_ms} <- optional_now_ms(opts),
            {:ok, assignees} <- optional_string_list(opts, :assignees),
+           {:ok, reason} <- optional_binary(opts, :reason),
+           {:ok, requested_by} <- optional_binary(opts, :requested_by),
            {:ok, policy_hash} <- optional_binary(opts, :policy_hash),
            {:ok, policy_version} <- optional_policy_version(opts),
            {:ok, expires_at_ms} <- optional_expires_at_ms(opts, now_ms),
@@ -27,18 +39,18 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
              Approval.request(id,
                flow_id: flow_id,
                scope: scope,
-               reason: Keyword.get(opts, :reason),
-               requested_by: Keyword.get(opts, :requested_by),
+               reason: reason,
+               requested_by: requested_by,
                assignees: assignees,
                policy_hash: policy_hash,
                policy_version: policy_version,
                expires_at_ms: expires_at_ms,
                now_ms: now_ms
              ),
-           key = Keys.governance_approval_key(id),
+           {:ok, encoded} <- encode_for_write(approval),
            :ok <- Catalog.register(ctx, :approval, key),
            set_result <-
-             Router.set(ctx, key, encode(approval), %{
+             Router.set(ctx, key, encoded, %{
                expire_at_ms: 0,
                nx: true,
                xx: false,
@@ -56,12 +68,15 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
           {:error, _reason} = error ->
             error
         end
+      else
+        false -> {:error, "ERR flow approval opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:approval_request, result, %{
       approval_id: id,
-      flow_id: Keyword.get(opts, :flow_id),
-      scope: Keyword.get(opts, :scope)
+      flow_id: safe_option(opts, :flow_id),
+      scope: safe_option(opts, :scope)
     })
   end
 
@@ -89,15 +104,21 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
   def get(ctx, id, opts \\ [])
 
   def get(ctx, id, opts) when is_binary(id) and id != "" and is_list(opts) do
-    case Router.get(ctx, Keys.governance_approval_key(id)) do
-      nil ->
-        {:ok, nil}
+    with true <- Keyword.keyword?(opts),
+         {:ok, key} <- approval_key(id) do
+      case Router.get(ctx, key) do
+        nil ->
+          {:ok, nil}
 
-      value when is_binary(value) ->
-        with {:ok, approval} <- decode(value), do: {:ok, View.public(approval)}
+        value when is_binary(value) ->
+          with {:ok, approval} <- decode(value), do: {:ok, View.public(approval)}
 
-      _other ->
-        {:error, "ERR flow approval record is corrupt"}
+        _other ->
+          {:error, "ERR flow approval record is corrupt"}
+      end
+    else
+      false -> {:error, "ERR flow approval opts must be a keyword list"}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -107,13 +128,17 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
   def list(ctx, opts \\ [])
 
   def list(ctx, opts) when is_list(opts) do
-    with {:ok, limit} <- optional_limit(opts),
+    with true <- Keyword.keyword?(opts),
+         {:ok, limit} <- optional_limit(opts),
          {:ok, status} <- optional_status(opts),
          {:ok, scopes} <- optional_scope_filters(opts),
          {:ok, flow_id} <- optional_filter_binary(opts, :flow_id),
          {:ok, approvals} <-
            collect_list_approvals(ctx, status, scopes, flow_id, limit) do
       {:ok, approvals}
+    else
+      false -> {:error, "ERR flow approval opts must be a keyword list"}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -121,29 +146,42 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
 
   defp collect_list_approvals(ctx, status, scopes, flow_id, limit)
        when is_binary(flow_id) do
-    collect_approval_catalog(
-      ctx,
-      Keys.governance_approval_flow_catalog_key(flow_id),
-      {:flow, flow_id},
-      status,
-      scopes,
-      flow_id,
-      limit
-    )
+    catalog_key = Keys.governance_approval_flow_catalog_key(flow_id)
+
+    with :ok <- validate_dimension_size(flow_id),
+         :ok <- validate_key_size(catalog_key) do
+      collect_approval_catalog(
+        ctx,
+        catalog_key,
+        {:flow, flow_id},
+        status,
+        scopes,
+        flow_id,
+        limit
+      )
+    end
   end
 
   defp collect_list_approvals(ctx, status, scopes, nil, limit) when is_list(scopes) do
     scopes
     |> Enum.reduce_while({:ok, []}, fn scope, {:ok, approvals} ->
-      case collect_approval_catalog(
-             ctx,
-             Keys.governance_approval_scope_catalog_key(scope),
-             {:scope, scope},
-             status,
-             scopes,
-             nil,
-             limit
-           ) do
+      catalog_key = Keys.governance_approval_scope_catalog_key(scope)
+
+      result =
+        with :ok <- validate_dimension_size(scope),
+             :ok <- validate_key_size(catalog_key) do
+          collect_approval_catalog(
+            ctx,
+            catalog_key,
+            {:scope, scope},
+            status,
+            scopes,
+            nil,
+            limit
+          )
+        end
+
+      case result do
         {:ok, page} -> {:cont, {:ok, merge_approval_results(approvals, page, limit)}}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -196,37 +234,65 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
   end
 
   defp load_list_approval(ctx, key, status, scopes, flow_id) do
-    with value when is_binary(value) <- Router.get(ctx, key),
-         {:ok, approval} <- decode(value),
-         approval = View.public(approval),
-         true <- matches_status?(approval, status),
-         true <- matches_scope?(approval, scopes),
-         true <- matches_binary?(approval, :flow_id, flow_id) do
-      {:ok, approval}
-    else
-      _missing_corrupt_or_filtered -> :skip
+    case Router.get(ctx, key) do
+      nil ->
+        :skip
+
+      value when is_binary(value) ->
+        with {:ok, approval} <- decode(value) do
+          approval = View.public(approval)
+
+          if matches_status?(approval, status) and matches_scope?(approval, scopes) and
+               matches_binary?(approval, :flow_id, flow_id),
+             do: {:ok, approval},
+             else: :skip
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _other ->
+        {:error, "ERR flow approval record is corrupt"}
     end
   end
 
   defp approval_catalog_member?(ctx, key, {dimension, expected}) do
-    with value when is_binary(value) <- Router.get(ctx, key),
-         {:ok, approval} <- decode(value) do
-      Map.get(approval, dimension_to_field(dimension)) == expected
-    else
-      _missing_or_corrupt -> false
+    case Router.get(ctx, key) do
+      nil ->
+        false
+
+      value when is_binary(value) ->
+        with {:ok, approval} <- decode(value) do
+          Map.get(approval, dimension_to_field(dimension)) == expected
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _invalid ->
+        {:error, "ERR flow approval record is corrupt"}
     end
   end
 
   defp approval_catalog_targets(ctx, key) do
-    with value when is_binary(value) <- Router.get(ctx, key),
-         {:ok, approval} <- decode(value) do
-      {:ok,
-       [
-         Keys.governance_approval_scope_catalog_key(approval.scope),
-         Keys.governance_approval_flow_catalog_key(approval.flow_id)
-       ]}
-    else
-      _missing_or_corrupt -> :skip
+    case Router.get(ctx, key) do
+      nil ->
+        :missing
+
+      value when is_binary(value) ->
+        case decode(value) do
+          {:ok, approval} ->
+            approval_catalog_keys(approval.scope, approval.flow_id)
+
+          {:error, _reason} ->
+            :skip
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _invalid ->
+        {:error, "ERR flow approval record is corrupt"}
     end
   end
 
@@ -235,26 +301,33 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
 
   defp decide(ctx, id, action, opts) when is_binary(id) and id != "" and is_list(opts) do
     result =
-      with {:ok, now_ms} <- optional_now_ms(opts),
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- approval_key(id),
+           {:ok, now_ms} <- optional_now_ms(opts),
            {:ok, approver} <- required_binary(opts, :approver),
+           {:ok, reason} <- optional_binary(opts, :reason),
            update_opts = [
              approver: approver,
-             reason: Keyword.get(opts, :reason),
+             reason: reason,
              now_ms: now_ms
            ] do
         AtomicRecord.mutate(
           ctx,
-          Keys.governance_approval_key(id),
+          key,
           &decode/1,
           &encode/1,
           fn -> {:error, "ERR flow approval not found"} end,
           fn approval ->
             case apply_decision(approval, action, update_opts) do
               {:ok, updated} -> {:ok, updated, View.public(updated)}
+              {:error, reason, updated} -> {:error, reason, updated}
               {:error, _reason} = error -> error
             end
           end
         )
+      else
+        false -> {:error, "ERR flow approval opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(approval_action_name(action), result, approval_metadata(id, result))
@@ -266,36 +339,81 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
   defp apply_decision(approval, :approve, opts), do: Approval.approve(approval, opts)
   defp apply_decision(approval, :reject, opts), do: Approval.reject(approval, opts)
 
-  defp encode(approval), do: :erlang.term_to_binary({:flow_governance_approval_v1, approval})
+  defp safe_option(opts, key) do
+    if Keyword.keyword?(opts), do: Keyword.get(opts, key), else: nil
+  end
+
+  defp encode(approval), do: TermCodec.encode({:flow_governance_approval_v1, approval})
+
+  defp encode_for_write(approval) do
+    encoded = encode(approval)
+
+    if byte_size(encoded) <= @max_record_bytes do
+      {:ok, encoded}
+    else
+      {:error, "ERR flow approval record exceeds #{@max_record_bytes}-byte durable limit"}
+    end
+  end
 
   defp decode(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {:flow_governance_approval_v1, %Approval{} = approval} -> {:ok, approval}
-      _other -> {:error, "ERR flow approval record is corrupt"}
+    case TermCodec.decode(value) do
+      {:ok, {:flow_governance_approval_v1, %Approval{} = approval}} ->
+        if Approval.valid?(approval),
+          do: {:ok, approval},
+          else: {:error, "ERR flow approval record is corrupt"}
+
+      _other ->
+        {:error, "ERR flow approval record is corrupt"}
     end
-  rescue
-    _ -> {:error, "ERR flow approval record is corrupt"}
   end
 
   defp required_binary(opts, key) do
     case Keyword.get(opts, key) do
-      value when is_binary(value) and value != "" -> {:ok, value}
-      _other -> {:error, "ERR flow approval #{key} must be a non-empty string"}
+      value when is_binary(value) and value != "" and byte_size(value) <= @max_field_bytes ->
+        {:ok, value}
+
+      value when is_binary(value) and value != "" ->
+        {:error, "ERR flow approval #{key} must be at most #{@max_field_bytes} bytes"}
+
+      _other ->
+        {:error, "ERR flow approval #{key} must be a non-empty string"}
     end
   end
 
   defp optional_now_ms(opts) do
     case Keyword.get(opts, :now_ms, CommandTime.now_ms()) do
-      value when is_integer(value) and value >= 0 -> {:ok, value}
+      value when is_integer(value) and value >= 0 and value <= @max_exact_integer -> {:ok, value}
       _other -> {:error, "ERR flow approval now_ms must be a non-negative integer"}
     end
   end
 
   defp optional_expires_at_ms(opts, now_ms) do
     case Keyword.fetch(opts, :timeout_ms) do
-      {:ok, value} when is_integer(value) and value > 0 -> {:ok, now_ms + value}
-      {:ok, _other} -> {:error, "ERR flow approval timeout_ms must be a positive integer"}
-      :error -> optional_non_negative_integer(opts, :expires_at_ms)
+      {:ok, value}
+      when is_integer(value) and value > 0 and value <= @max_exact_integer - now_ms ->
+        {:ok, now_ms + value}
+
+      {:ok, _other} ->
+        {:error, "ERR flow approval timeout_ms must be a positive integer"}
+
+      :error ->
+        optional_absolute_expiry(opts, now_ms)
+    end
+  end
+
+  defp optional_absolute_expiry(opts, now_ms) do
+    case Keyword.get(opts, :expires_at_ms) do
+      nil ->
+        {:ok, nil}
+
+      value when is_integer(value) and value > now_ms and value <= @max_exact_integer ->
+        {:ok, value}
+
+      value when is_integer(value) and value >= 0 ->
+        {:error, "ERR flow approval expires_at_ms must be greater than now_ms"}
+
+      _other ->
+        {:error, "ERR flow approval expires_at_ms must be a non-negative integer"}
     end
   end
 
@@ -308,12 +426,26 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
 
   defp optional_status(opts) do
     case Keyword.get(opts, :status) do
-      nil -> {:ok, nil}
-      value when value in [:pending, :approved, :rejected] -> {:ok, value}
-      "pending" -> {:ok, :pending}
-      "approved" -> {:ok, :approved}
-      "rejected" -> {:ok, :rejected}
-      _other -> {:error, "ERR flow approval status must be pending, approved, or rejected"}
+      nil ->
+        {:ok, nil}
+
+      value when value in [:pending, :approved, :rejected, :expired] ->
+        {:ok, value}
+
+      "pending" ->
+        {:ok, :pending}
+
+      "approved" ->
+        {:ok, :approved}
+
+      "rejected" ->
+        {:ok, :rejected}
+
+      "expired" ->
+        {:ok, :expired}
+
+      _other ->
+        {:error, "ERR flow approval status must be pending, approved, rejected, or expired"}
     end
   end
 
@@ -327,9 +459,17 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
 
   defp optional_binary(opts, key) do
     case Keyword.get(opts, key) do
-      nil -> {:ok, nil}
-      value when is_binary(value) and value != "" -> {:ok, value}
-      _other -> {:error, "ERR flow approval #{key} must be a non-empty string"}
+      nil ->
+        {:ok, nil}
+
+      value when is_binary(value) and value != "" and byte_size(value) <= @max_field_bytes ->
+        {:ok, value}
+
+      value when is_binary(value) and value != "" ->
+        {:error, "ERR flow approval #{key} must be at most #{@max_field_bytes} bytes"}
+
+      _other ->
+        {:error, "ERR flow approval #{key} must be a non-empty string"}
     end
   end
 
@@ -338,10 +478,13 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
       nil ->
         {:ok, nil}
 
-      value when is_binary(value) and value != "" ->
+      value when is_binary(value) and value != "" and byte_size(value) <= @max_field_bytes ->
         {:ok, value}
 
-      value when is_integer(value) and value >= 0 ->
+      value when is_binary(value) and value != "" ->
+        {:error, "ERR flow approval policy_version must be at most #{@max_field_bytes} bytes"}
+
+      value when is_integer(value) and value >= 0 and value <= @max_exact_integer ->
         {:ok, value}
 
       _other ->
@@ -354,28 +497,26 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
     case Keyword.get(opts, key, []) do
       values when is_list(values) ->
         values
-        |> Enum.reduce_while({:ok, []}, fn
-          value, {:ok, acc} when is_binary(value) and value != "" ->
-            {:cont, {:ok, [value | acc]}}
+        |> Enum.reduce_while({:ok, [], MapSet.new(), 0}, fn
+          value, {:ok, acc, seen, count}
+          when is_binary(value) and value != "" and byte_size(value) <= @max_dimension_bytes and
+                 count < @max_assignees ->
+            if MapSet.member?(seen, value) do
+              {:cont, {:ok, acc, seen, count + 1}}
+            else
+              {:cont, {:ok, [value | acc], MapSet.put(seen, value), count + 1}}
+            end
 
           _value, _acc ->
             {:halt, {:error, "ERR flow approval #{key} must be a list of non-empty strings"}}
         end)
         |> case do
-          {:ok, values} -> {:ok, values |> Enum.reverse() |> Enum.uniq()}
+          {:ok, values, _seen, _count} -> {:ok, Enum.reverse(values)}
           {:error, _reason} = error -> error
         end
 
       _other ->
         {:error, "ERR flow approval #{key} must be a list of non-empty strings"}
-    end
-  end
-
-  defp optional_non_negative_integer(opts, key) do
-    case Keyword.get(opts, key) do
-      nil -> {:ok, nil}
-      value when is_integer(value) and value >= 0 -> {:ok, value}
-      _other -> {:error, "ERR flow approval #{key} must be a non-negative integer"}
     end
   end
 
@@ -423,4 +564,45 @@ defmodule Ferricstore.Flow.Governance.ApprovalStore do
   end
 
   defp approval_metadata(id, _result), do: %{approval_id: id}
+
+  defp approval_key(id) do
+    key = Keys.governance_approval_key(id)
+
+    with :ok <- validate_key_size(key), do: {:ok, key}
+  end
+
+  defp validate_catalog_dimensions(scope, flow_id) do
+    with :ok <- validate_dimension_size(scope),
+         :ok <- validate_dimension_size(flow_id),
+         {:ok, _catalog_keys} <- approval_catalog_keys(scope, flow_id),
+         do: :ok
+  end
+
+  defp approval_catalog_keys(scope, flow_id) do
+    keys = [
+      Keys.governance_approval_scope_catalog_key(scope),
+      Keys.governance_approval_flow_catalog_key(flow_id)
+    ]
+
+    with :ok <- validate_dimension_size(scope),
+         :ok <- validate_dimension_size(flow_id),
+         true <- Enum.all?(keys, &(validate_key_size(&1) == :ok)) do
+      {:ok, keys}
+    else
+      false -> {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_dimension_size(value) do
+    if byte_size(value) <= Router.max_key_size(),
+      do: :ok,
+      else: {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+  end
+
+  defp validate_key_size(key) do
+    if byte_size(key) <= Router.max_key_size(),
+      do: :ok,
+      else: {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+  end
 end

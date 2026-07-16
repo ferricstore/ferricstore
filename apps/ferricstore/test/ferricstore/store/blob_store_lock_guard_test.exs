@@ -107,7 +107,7 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
       source
       |> String.split("  defp segment_path(data_dir, shard_index, segment_id) do", parts: 2)
       |> List.last()
-      |> String.split("  defp stat_regular_size", parts: 2)
+      |> String.split("  defp stat_regular_min_size", parts: 2)
       |> List.first()
 
     refute segment_path =~ "%BlobRef{",
@@ -193,6 +193,64 @@ defmodule Ferricstore.Store.BlobStoreLockGuardTest do
 
     refute section =~ "get_open_segment_ref(",
            "get_many/3 should not fall back to one full header+payload read per blob ref"
+  end
+
+  test "hardened protection reconciliation does not materialize every ETS row" do
+    source = source()
+
+    ids_section =
+      source_section!(
+        source,
+        "  def hardened_protection_ids(data_dir, shard_index, limit",
+        "  @spec hardened_protection_stats(binary())"
+      )
+
+    stats_section =
+      source_section!(
+        source,
+        "  def hardened_protection_stats(data_dir, shard_index)",
+        "  defp protect_refs(data_dir, shard_index, refs)"
+      )
+
+    refute ids_section =~ ":ets.match_object",
+           "a limited reconciliation page must not copy every matching row before taking the limit"
+
+    assert ids_section =~ ":ets.foldl",
+           "oldest hardened IDs should be selected with memory bounded by the requested limit"
+
+    refute stats_section =~ ":ets.match_object",
+           "hardened protection stats should aggregate in constant memory"
+
+    assert stats_section =~ ":ets.foldl"
+  end
+
+  test "blob GC builds its protected path set without copying matching ETS rows first" do
+    section =
+      source()
+      |> source_section!(
+        "  defp protected_relative_paths(data_dir, shard_index) do",
+        "  defp protection_deadline_ms do"
+      )
+
+    refute section =~ ":ets.match_object",
+           "GC should fold protection rows directly into its required path set"
+
+    refute section =~ "new_shape ++ old_shape",
+           "GC should not retain and concatenate both protection row formats"
+
+    assert section =~ ":ets.foldl"
+  end
+
+  test "blob GC and stats enumerate storage without recursive wildcard traversal" do
+    gc_source =
+      @sources
+      |> Enum.find(&String.ends_with?(&1, "/blob_store/gc.ex"))
+      |> File.read!()
+
+    refute gc_source =~ "Path.wildcard",
+           "wildcard traversal can follow intermediate symlink directories outside the data root"
+
+    assert gc_source =~ "Ferricstore.FS.ls"
   end
 
   defp raw_source do

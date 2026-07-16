@@ -1,29 +1,227 @@
 defmodule Ferricstore.Store.Ops.Flush do
   @moduledoc false
 
-  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.Governance.LimitCache
-  alias Ferricstore.Flow.{InternalKey, Keys, SharedRefBackfill}
-  alias Ferricstore.Store.CompoundKey
-  alias Ferricstore.Store.Ops.Compound, as: CompoundOps
-  alias Ferricstore.Store.Ops.Delete, as: DeleteOps
+  alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+  alias Ferricstore.Flow.SharedRefBackfill
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
 
-  @internal_delete_batch_size 512
+  @pause_timeout_ms 30_000
+  @resume_timeout_ms 5_000
 
   def flush(ctx) do
-    LimitCache.with_drained_cache(ctx, fn -> do_flush(ctx) end)
+    LimitCache.with_drained_cache(ctx, fn ->
+      with_writes_paused(ctx, fn -> do_flush(ctx) end)
+    end)
   end
 
   defp do_flush(ctx) do
+    flush_epoch = Ferricstore.HLC.now()
+
     with :ok <- SharedRefBackfill.invalidate_verified!(ctx.name, ctx.shard_count),
-         :ok <- flush_keys(ctx, Router.keys(ctx)),
-         :ok <- flush_internal_keys(ctx),
+         :ok <- flush_replicated_shards(ctx, flush_epoch),
+         :ok <- clear_promoted_storage(ctx),
          :ok <- clear_flow_projection_storage(ctx) do
-      clear_stream_tables()
+      clear_stream_tables(ctx)
       NativeFlowIndex.reset_all(ctx.name, ctx.shard_count)
       :ok
     end
+  end
+
+  defp with_writes_paused(ctx, fun) when is_function(fun, 0) do
+    case pause_all_writes(ctx) do
+      {:ok, pause_token} ->
+        run_while_paused(ctx, pause_token, fun)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp run_while_paused(ctx, pause_token, fun) do
+    try do
+      result = fun.()
+      merge_resume_result(result, resume_all_writes(ctx, pause_token))
+    rescue
+      error ->
+        _ = resume_all_writes(ctx, pause_token)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        _ = resume_all_writes(ctx, pause_token)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  defp merge_resume_result(result, :ok), do: result
+
+  defp merge_resume_result(:ok, {:error, reason}),
+    do: {:error, {:flush_resume_failed, reason}}
+
+  defp merge_resume_result({:error, flush_reason}, {:error, resume_reason}),
+    do: {:error, {:flush_failed_and_resume_failed, flush_reason, resume_reason}}
+
+  defp merge_resume_result(result, {:error, resume_reason}),
+    do: {:error, {:flush_result_and_resume_failed, result, resume_reason}}
+
+  defp pause_all_writes(ctx) do
+    if Router.durable_context?(ctx) do
+      pause_durable_writes(ctx)
+    else
+      pause_standalone_writes(ctx)
+    end
+  end
+
+  defp pause_durable_writes(ctx) do
+    durable_nodes()
+    |> Enum.reduce_while({:ok, []}, fn target_node, {:ok, paused_nodes} ->
+      case call_durable_pause(target_node, ctx.shard_count) do
+        :ok ->
+          {:cont, {:ok, [target_node | paused_nodes]}}
+
+        {:error, reason} ->
+          _ = resume_durable_nodes(Enum.reverse(paused_nodes), ctx.shard_count)
+          {:halt, {:error, {:flush_pause_failed, target_node, reason}}}
+
+        other ->
+          _ = resume_durable_nodes(Enum.reverse(paused_nodes), ctx.shard_count)
+          {:halt, {:error, {:flush_pause_failed, target_node, other}}}
+      end
+    end)
+    |> case do
+      {:ok, paused_nodes} -> {:ok, {:durable, Enum.reverse(paused_nodes)}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp call_durable_pause(target_node, shard_count) when target_node == node() do
+    Batcher.pause_writes_for_sync_all(shard_count, @pause_timeout_ms)
+  end
+
+  defp call_durable_pause(target_node, shard_count) do
+    :erpc.call(
+      target_node,
+      Batcher,
+      :pause_writes_for_sync_all,
+      [shard_count, @pause_timeout_ms],
+      @pause_timeout_ms + 1_000
+    )
+  catch
+    kind, reason -> {:error, {:remote_pause_failed, kind, reason}}
+  end
+
+  defp pause_standalone_writes(ctx) do
+    ctx.shard_names
+    |> Tuple.to_list()
+    |> Enum.reduce_while({:ok, []}, fn shard, {:ok, paused_shards} ->
+      case call_standalone_shard(shard, {:pause_writes}, @pause_timeout_ms) do
+        :ok ->
+          {:cont, {:ok, [shard | paused_shards]}}
+
+        {:error, reason} ->
+          _ = resume_standalone_shards(Enum.reverse(paused_shards))
+          {:halt, {:error, {:flush_pause_failed, shard, reason}}}
+
+        other ->
+          _ = resume_standalone_shards(Enum.reverse(paused_shards))
+          {:halt, {:error, {:flush_pause_failed, shard, other}}}
+      end
+    end)
+    |> case do
+      {:ok, paused_shards} -> {:ok, {:standalone, Enum.reverse(paused_shards)}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp resume_all_writes(ctx, {:durable, paused_nodes}) do
+    resume_durable_nodes(paused_nodes, ctx.shard_count)
+  end
+
+  defp resume_all_writes(_ctx, {:standalone, paused_shards}) do
+    resume_standalone_shards(paused_shards)
+  end
+
+  defp resume_durable_nodes(nodes, shard_count) do
+    failures =
+      Enum.reduce(nodes, [], fn target_node, failures ->
+        case call_durable_resume(target_node, shard_count) do
+          :ok -> failures
+          other -> [{target_node, other} | failures]
+        end
+      end)
+
+    case Enum.reverse(failures) do
+      [] -> :ok
+      failures -> {:error, {:durable_resume_failed, failures}}
+    end
+  end
+
+  defp call_durable_resume(target_node, shard_count) when target_node == node() do
+    Batcher.resume_writes_for_sync_all(shard_count, @resume_timeout_ms)
+  end
+
+  defp call_durable_resume(target_node, shard_count) do
+    :erpc.call(
+      target_node,
+      Batcher,
+      :resume_writes_for_sync_all,
+      [shard_count, @resume_timeout_ms],
+      @resume_timeout_ms + 1_000
+    )
+  catch
+    kind, reason -> {:error, {:remote_resume_failed, kind, reason}}
+  end
+
+  defp resume_standalone_shards(shards) do
+    failures =
+      Enum.reduce(shards, [], fn shard, failures ->
+        case call_standalone_shard(shard, {:resume_writes}, @resume_timeout_ms) do
+          :ok -> failures
+          other -> [{shard, other} | failures]
+        end
+      end)
+
+    case Enum.reverse(failures) do
+      [] -> :ok
+      failures -> {:error, {:standalone_resume_failed, failures}}
+    end
+  end
+
+  defp call_standalone_shard(shard, command, timeout) do
+    GenServer.call(shard, command, timeout)
+  catch
+    :exit, reason -> {:error, {:shard_call_failed, reason}}
+  end
+
+  defp durable_nodes do
+    [node() | Node.list()]
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp flush_replicated_shards(ctx, flush_epoch) do
+    shard_indexes(ctx.shard_count)
+    |> Enum.reduce_while(:ok, fn shard_index, :ok ->
+      case flush_replicated_shard(ctx, shard_index, flush_epoch) do
+        {:ok, deleted} when is_integer(deleted) and deleted >= 0 -> {:cont, :ok}
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:flush_shard_failed, shard_index, reason}}}
+        other -> {:halt, {:error, {:flush_shard_failed, shard_index, other}}}
+      end
+    end)
+  end
+
+  defp flush_replicated_shard(ctx, shard_index, flush_epoch) do
+    if Router.durable_context?(ctx) do
+      Batcher.write_flush_shard_paused(shard_index, flush_epoch)
+    else
+      ctx.shard_names
+      |> elem(shard_index)
+      |> GenServer.call({:flush_shard_paused, flush_epoch}, :infinity)
+    end
+  catch
+    :exit, reason -> {:error, {:flush_shard_call_failed, reason}}
   end
 
   defp clear_flow_projection_storage(ctx) do
@@ -42,6 +240,33 @@ defmodule Ferricstore.Store.Ops.Flush do
     end
   end
 
+  defp clear_promoted_storage(ctx) do
+    dedicated_root = Path.join(ctx.data_dir, "dedicated")
+
+    if Ferricstore.FS.exists?(dedicated_root) do
+      with :ok <- remove_promoted_storage(dedicated_root),
+           :ok <- fsync_promoted_storage_parent(ctx.data_dir) do
+        :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp remove_promoted_storage(dedicated_root) do
+    case Ferricstore.FS.rm_rf(dedicated_root) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:flush_promoted_storage_failed, dedicated_root, reason}}
+    end
+  end
+
+  defp fsync_promoted_storage_parent(data_dir) do
+    case Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:flush_promoted_storage_fsync_failed, data_dir, reason}}
+    end
+  end
+
   defp discard_flow_lmdb_writers(%{name: name, shard_count: shard_count})
        when is_atom(name) and is_integer(shard_count) and shard_count >= 0 do
     Ferricstore.Flow.LMDBWriter.discard_all(name, shard_count)
@@ -50,7 +275,7 @@ defmodule Ferricstore.Store.Ops.Flush do
   defp discard_flow_lmdb_writers(_ctx), do: :ok
 
   defp discard_flow_history_projectors(ctx) do
-    0..max(ctx.shard_count - 1, -1)//1
+    shard_indexes(ctx.shard_count)
     |> Enum.reduce_while(:ok, fn shard_index, :ok ->
       case Ferricstore.Flow.HistoryProjector.discard(ctx, shard_index, 5_000) do
         :ok -> {:cont, :ok}
@@ -60,7 +285,7 @@ defmodule Ferricstore.Store.Ops.Flush do
   end
 
   defp clear_flow_history_dirs(ctx) do
-    0..max(ctx.shard_count - 1, -1)//1
+    shard_indexes(ctx.shard_count)
     |> Enum.reduce_while(:ok, fn shard_index, :ok ->
       history_dir =
         ctx.data_dir
@@ -74,80 +299,8 @@ defmodule Ferricstore.Store.Ops.Flush do
     end)
   end
 
-  defp flush_keys(store, keys) do
-    keys
-    |> CompoundKey.storage_logical_keys()
-    |> Enum.reject(&backfill_metadata_key?(store, &1))
-    |> Enum.reduce_while(:ok, fn key, :ok ->
-      case flush_key(store, key) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-        other -> {:halt, {:error, {:flush_key_failed, key, other}}}
-      end
-    end)
-  end
-
-  defp flush_internal_keys(ctx) do
-    Enum.reduce_while(0..max(ctx.shard_count - 1, -1)//1, :ok, fn shard_index, :ok ->
-      keydir = elem(ctx.keydir_refs, shard_index)
-      :ets.safe_fixtable(keydir, true)
-
-      result =
-        try do
-          match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
-
-          flush_internal_key_pages(
-            shard_index,
-            keydir,
-            :ets.select(keydir, match_spec, @internal_delete_batch_size)
-          )
-        after
-          :ets.safe_fixtable(keydir, false)
-        end
-
-      case result do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-  rescue
-    error in ArgumentError -> {:error, {:flush_internal_keydir_unavailable, error}}
-  end
-
-  defp flush_internal_key_pages(_shard_index, _keydir, :"$end_of_table"), do: :ok
-
-  defp flush_internal_key_pages(shard_index, keydir, {keys, continuation}) do
-    batch =
-      keys
-      |> Enum.filter(&InternalKey.reserved?/1)
-      |> Enum.reject(&backfill_metadata_key?(shard_index, &1))
-
-    with :ok <- flush_internal_key_batch(shard_index, batch) do
-      flush_internal_key_pages(shard_index, keydir, :ets.select(continuation))
-    end
-  end
-
-  defp flush_internal_key_batch(_shard_index, []), do: :ok
-
-  defp flush_internal_key_batch(shard_index, batch) do
-    case Ferricstore.Raft.Backend.write_delete_batch(shard_index, batch) do
-      {:ok, results} when is_list(results) ->
-        if length(results) == length(batch) and Enum.all?(results, &(&1 == :ok)) do
-          :ok
-        else
-          {:error, {:flush_internal_keys_failed, shard_index, results}}
-        end
-
-      {:error, _reason} = error ->
-        error
-
-      other ->
-        {:error, {:flush_internal_keys_failed, shard_index, other}}
-    end
-  end
-
   defp finalize_empty_flow_shards(ctx) do
-    0..max(ctx.shard_count - 1, -1)//1
+    shard_indexes(ctx.shard_count)
     |> Enum.reduce_while(:ok, fn shard_index, :ok ->
       keydir = elem(ctx.keydir_refs, shard_index)
       {file_id, file_path, shard_path} = Ferricstore.Store.ActiveFile.get(ctx, shard_index)
@@ -170,78 +323,8 @@ defmodule Ferricstore.Store.Ops.Flush do
     end)
   end
 
-  defp backfill_metadata_key?(%{shard_count: shard_count}, key) do
-    Enum.any?(0..max(shard_count - 1, -1)//1, &backfill_metadata_key?(&1, key))
-  end
+  defp shard_indexes(0), do: []
+  defp shard_indexes(shard_count), do: 0..(shard_count - 1)
 
-  defp backfill_metadata_key?(shard_index, key) do
-    key == Keys.shared_value_ref_backfill_key(shard_index) or
-      key == SharedRefBackfill.progress_key(shard_index)
-  end
-
-  defp flush_key(store, key) do
-    type_key = CompoundKey.type_key(key)
-
-    case CompoundOps.compound_get(store, key, type_key) do
-      "hash" ->
-        run_flush_steps(key, [
-          fn -> CompoundOps.compound_delete_prefix(store, key, CompoundKey.hash_prefix(key)) end,
-          fn -> CompoundOps.compound_delete(store, key, type_key) end
-        ])
-
-      "list" ->
-        run_flush_steps(key, [
-          fn -> CompoundOps.compound_delete_prefix(store, key, CompoundKey.list_prefix(key)) end,
-          fn -> CompoundOps.compound_delete(store, key, CompoundKey.list_meta_key(key)) end,
-          fn -> CompoundOps.compound_delete(store, key, type_key) end,
-          fn -> DeleteOps.delete(store, key) end
-        ])
-
-      "set" ->
-        run_flush_steps(key, [
-          fn -> CompoundOps.compound_delete_prefix(store, key, CompoundKey.set_prefix(key)) end,
-          fn -> CompoundOps.compound_delete(store, key, type_key) end
-        ])
-
-      "zset" ->
-        run_flush_steps(key, [
-          fn -> CompoundOps.compound_delete_prefix(store, key, CompoundKey.zset_prefix(key)) end,
-          fn -> CompoundOps.compound_delete(store, key, type_key) end
-        ])
-
-      "stream" ->
-        run_flush_steps(key, [
-          fn -> CompoundOps.compound_delete_prefix(store, key, "X:" <> key <> <<0>>) end,
-          fn ->
-            CompoundOps.compound_delete_prefix(store, key, CompoundKey.stream_group_prefix(key))
-          end,
-          fn -> CompoundOps.compound_delete(store, key, CompoundKey.stream_meta_key(key)) end,
-          fn -> CompoundOps.compound_delete(store, key, type_key) end,
-          fn -> DeleteOps.delete(store, key) end
-        ])
-
-      nil ->
-        DeleteOps.delete(store, key)
-
-      _unknown ->
-        run_flush_steps(key, [
-          fn -> CompoundOps.compound_delete(store, key, type_key) end,
-          fn -> DeleteOps.delete(store, key) end
-        ])
-    end
-  end
-
-  defp run_flush_steps(key, steps) do
-    Enum.reduce_while(steps, :ok, fn step, :ok ->
-      case step.() do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-        other -> {:halt, {:error, {:flush_key_failed, key, other}}}
-      end
-    end)
-  end
-
-  defp clear_stream_tables do
-    Ferricstore.Stream.LocalState.clear()
-  end
+  defp clear_stream_tables(ctx), do: Ferricstore.Stream.LocalState.clear(ctx)
 end

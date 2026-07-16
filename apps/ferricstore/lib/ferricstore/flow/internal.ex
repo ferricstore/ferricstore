@@ -2,12 +2,30 @@ defmodule Ferricstore.Flow.Internal do
   @moduledoc false
 
   @internal_option :__ferricstore_internal__
+  @capability_key {__MODULE__, :capability}
   @schedule_type "__ferricstore_schedule"
   @schedule_id_prefix "__ferricstore_schedule__:"
 
-  def put(opts) when is_list(opts), do: Keyword.put(opts, @internal_option, true)
+  @on_load :init_capability
 
-  def allowed?(opts) when is_list(opts), do: Keyword.get(opts, @internal_option) == true
+  def init_capability do
+    case :persistent_term.get(@capability_key, :missing) do
+      :missing -> :persistent_term.put(@capability_key, make_ref())
+      _capability -> :ok
+    end
+
+    :ok
+  end
+
+  def put(opts) when is_list(opts), do: Keyword.put(opts, @internal_option, capability())
+
+  def allowed?(opts) when is_list(opts) do
+    case Keyword.fetch(opts, @internal_option) do
+      {:ok, token} when is_reference(token) -> token === capability()
+      _other -> false
+    end
+  end
+
   def allowed?(_opts), do: false
 
   def reserved_type?(@schedule_type), do: true
@@ -31,4 +49,6 @@ defmodule Ferricstore.Flow.Internal do
       :ok
     end
   end
+
+  defp capability, do: :persistent_term.get(@capability_key)
 end

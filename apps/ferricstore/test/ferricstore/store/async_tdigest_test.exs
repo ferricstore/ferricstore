@@ -26,6 +26,7 @@ defmodule Ferricstore.Store.AsyncTDigestTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
+  alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Test.ShardHelpers
 
   setup do
@@ -107,6 +108,25 @@ defmodule Ferricstore.Store.AsyncTDigestTest do
   # ---------------------------------------------------------------------------
 
   describe "concurrent tdigest_add" do
+    @tag :dispatcher_tdigest_concurrency
+    test "prepared Dispatcher adds serialize the full read-modify-write cycle" do
+      key = ukey("dispatcher_concurrent_add")
+      ctx = FerricStore.Instance.get(:default)
+      assert :ok = Dispatcher.dispatch_raw("TDIGEST.CREATE", [key], ctx)
+
+      tasks =
+        for _ <- 1..50 do
+          Task.async(fn ->
+            values = for i <- 1..10, do: Integer.to_string(i)
+            Dispatcher.dispatch_raw("TDIGEST.ADD", [key | values], ctx)
+          end)
+        end
+
+      results = Task.await_many(tasks, 30_000)
+      assert Enum.all?(results, &(&1 == :ok))
+      assert total_weight(key) == 500.0
+    end
+
     test "50 concurrent tdigest_add calls of 10 values each sum to 500" do
       key = ukey("concurrent_add")
       :ok = FerricStore.tdigest_create(key)

@@ -5,6 +5,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAbov
     quote do
       alias Ferricstore.Bitcask.NIF
       alias Ferricstore.Flow.HistoryProjector
+      alias Ferricstore.Flow.Keys
       alias Ferricstore.Flow.NativeOrderedIndex
       alias Ferricstore.Flow.OrderedIndex
 
@@ -360,8 +361,8 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAbov
       end
 
       test "projected Flow value refs use apply-stamped refs without decoding history payload" do
-        generated_ref = "f:{flow-fast-ref}:v:p:flow-fast-ref:2"
-        generated_shared_ref = "f:{flow-fast-ref}:v:s:flow-fast-ref:doc:1"
+        generated_ref = Keys.value_key("flow-fast-ref", :payload, 2)
+        generated_shared_ref = Keys.named_shared_value_key("flow-fast-ref", "doc", 1)
         external_ref = "external-payload-ref"
 
         refs =

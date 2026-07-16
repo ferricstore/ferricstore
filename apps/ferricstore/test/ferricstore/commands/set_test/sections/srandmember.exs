@@ -605,12 +605,12 @@ defmodule Ferricstore.Commands.SetTest.Sections.Srandmember do
           assert {:error, "ERR invalid cursor"} = Set.handle_ast({:sscan, "myset", -1, []}, store)
         end
 
-        test "SSCAN with very large cursor returns cursor 0 and empty list" do
+        test "SSCAN rejects numeric offset cursors" do
           store = MockStore.make()
           Set.handle("SADD", ["myset", "a"], store)
-          [cursor, elements] = Set.handle("SSCAN", ["myset", "999999"], store)
-          assert cursor == "0"
-          assert elements == []
+
+          assert {:error, "ERR invalid cursor"} =
+                   Set.handle("SSCAN", ["myset", "999999"], store)
         end
 
         test "SSCAN with unknown option returns error" do

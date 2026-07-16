@@ -1,5 +1,5 @@
 defmodule Ferricstore.Commands.Memory do
-  alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.{Ops, ReadResult}
 
   @moduledoc """
   Handles Redis MEMORY subcommands.
@@ -40,12 +40,20 @@ defmodule Ferricstore.Commands.Memory do
   # MEMORY USAGE key [SAMPLES count]
   # ---------------------------------------------------------------------------
 
-  def handle("USAGE", [key | _opts], store) do
-    case Ops.value_size(store, key) do
-      nil -> nil
-      value_size -> @key_overhead_bytes + byte_size(key) + value_size
+  def handle("USAGE", [key], store), do: memory_usage(key, store)
+
+  def handle("USAGE", [key, option, count], store) do
+    if String.upcase(option) == "SAMPLES" do
+      case Integer.parse(count) do
+        {samples, ""} when samples >= 0 -> memory_usage(key, store)
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
+    else
+      {:error, "ERR syntax error"}
     end
   end
+
+  def handle("USAGE", [_key | _invalid_options], _store), do: {:error, "ERR syntax error"}
 
   def handle("USAGE", [], _store) do
     {:error, "ERR wrong number of arguments for 'memory|usage' command"}
@@ -160,5 +168,13 @@ defmodule Ferricstore.Commands.Memory do
 
   def handle(subcmd, _args, _store) do
     {:error, "ERR unknown subcommand '#{String.downcase(subcmd)}'. Try MEMORY HELP."}
+  end
+
+  defp memory_usage(key, store) do
+    case Ops.value_size(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      nil -> nil
+      value_size -> @key_overhead_bytes + byte_size(key) + value_size
+    end
   end
 end

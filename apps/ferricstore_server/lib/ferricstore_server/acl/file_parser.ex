@@ -9,7 +9,17 @@ defmodule FerricstoreServer.Acl.FileParser do
   @type user :: map()
 
   @spec parse(binary()) :: {:ok, [{binary(), user()}]} | {:error, binary()}
-  def parse(contents) do
+  def parse(contents) when is_binary(contents) do
+    if String.valid?(contents) do
+      parse_utf8(contents)
+    else
+      {:error, "ERR Invalid ACL file: contents must be valid UTF-8"}
+    end
+  end
+
+  def parse(_contents), do: {:error, "ERR Invalid ACL file contents"}
+
+  defp parse_utf8(contents) do
     contents = strip_bom(contents)
 
     lines =
@@ -33,8 +43,16 @@ defmodule FerricstoreServer.Acl.FileParser do
 
           true ->
             case parse_acl_line(line, line_num) do
-              {:ok, {username, user_map}} -> {:cont, {:ok, Map.put(acc, username, user_map)}}
-              {:error, _} = err -> {:halt, err}
+              {:ok, {username, user_map}} ->
+                if Map.has_key?(acc, username) do
+                  {:halt,
+                   {:error, "ERR Invalid ACL line #{line_num}: duplicate user '#{username}'"}}
+                else
+                  {:cont, {:ok, Map.put(acc, username, user_map)}}
+                end
+
+              {:error, _} = err ->
+                {:halt, err}
             end
         end
       end)
@@ -50,15 +68,71 @@ defmodule FerricstoreServer.Acl.FileParser do
 
     case tokens do
       ["user", username | rule_tokens] ->
-        if Enum.any?(rule_tokens, &String.starts_with?(&1, ">")) do
-          {:error,
-           "ERR Invalid ACL line #{line_num}: plaintext passwords (>) are not allowed in ACL files, use #<hash>"}
-        else
-          parse_file_rules(username, rule_tokens, line_num)
+        parse_acl_user(username, rule_tokens, line_num)
+
+      ["user64", "b" <> encoded_username | rule_tokens] ->
+        case Base.url_decode64(encoded_username, padding: false) do
+          {:ok, username} -> parse_acl_user(username, rule_tokens, line_num)
+          :error -> {:error, "ERR Invalid ACL line #{line_num}: invalid encoded username"}
         end
 
       _ ->
         {:error, "ERR Invalid ACL line #{line_num}: expected 'user <username> <rules...>'"}
+    end
+  end
+
+  defp parse_acl_user(username, rule_tokens, line_num) do
+    with {:ok, rule_tokens} <- decode_file_rule_tokens(rule_tokens, line_num),
+         :ok <- Rules.validate_username(username),
+         :ok <- Rules.validate_rule_limits(rule_tokens) do
+      if Enum.any?(rule_tokens, &String.starts_with?(&1, ">")) do
+        {:error,
+         "ERR Invalid ACL line #{line_num}: plaintext passwords (>) are not allowed in ACL files, use #<hash>"}
+      else
+        parse_file_rules(username, rule_tokens, line_num)
+      end
+    end
+  end
+
+  defp decode_file_rule_tokens(tokens, line_num) do
+    Enum.reduce_while(tokens, {:ok, []}, fn token, {:ok, acc} ->
+      case decode_file_rule_token(token) do
+        {:ok, decoded} ->
+          {:cont, {:ok, [decoded | acc]}}
+
+        :not_encoded ->
+          {:cont, {:ok, [token | acc]}}
+
+        :error ->
+          {:halt, {:error, "ERR Invalid ACL line #{line_num}: invalid encoded pattern token"}}
+      end
+    end)
+    |> case do
+      {:ok, decoded} -> {:ok, Enum.reverse(decoded)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp decode_file_rule_token("key64:rw:b" <> encoded),
+    do: decode_pattern_token(encoded, "~")
+
+  defp decode_file_rule_token("key64:read:b" <> encoded),
+    do: decode_pattern_token(encoded, "%R~")
+
+  defp decode_file_rule_token("key64:write:b" <> encoded),
+    do: decode_pattern_token(encoded, "%W~")
+
+  defp decode_file_rule_token("channel64:b" <> encoded),
+    do: decode_pattern_token(encoded, "&")
+
+  defp decode_file_rule_token("key64:" <> _invalid), do: :error
+  defp decode_file_rule_token("channel64:" <> _invalid), do: :error
+  defp decode_file_rule_token(_token), do: :not_encoded
+
+  defp decode_pattern_token(encoded, prefix) do
+    case Base.url_decode64(encoded, padding: false) do
+      {:ok, pattern} -> {:ok, prefix <> pattern}
+      :error -> :error
     end
   end
 
@@ -172,18 +246,22 @@ defmodule FerricstoreServer.Acl.FileParser do
   defp parse_file_token(user, "+" <> command) do
     cmd = Rules.normalize_acl_command_name(command)
 
-    case user.commands do
-      :all -> {:ok, %{user | denied_commands: MapSet.delete(user.denied_commands, cmd)}}
-      cmds -> {:ok, %{user | commands: MapSet.put(cmds, cmd)}}
+    with :ok <- Rules.validate_acl_command_rule("+" <> command, command, cmd) do
+      case user.commands do
+        :all -> {:ok, %{user | denied_commands: MapSet.delete(user.denied_commands, cmd)}}
+        cmds -> {:ok, %{user | commands: MapSet.put(cmds, cmd)}}
+      end
     end
   end
 
   defp parse_file_token(user, "-" <> command) do
     cmd = Rules.normalize_acl_command_name(command)
 
-    case user.commands do
-      :all -> {:ok, %{user | denied_commands: MapSet.put(user.denied_commands, cmd)}}
-      cmds -> {:ok, %{user | commands: MapSet.delete(cmds, cmd)}}
+    with :ok <- Rules.validate_acl_command_rule("-" <> command, command, cmd) do
+      case user.commands do
+        :all -> {:ok, %{user | denied_commands: MapSet.put(user.denied_commands, cmd)}}
+        cmds -> {:ok, %{user | commands: MapSet.delete(cmds, cmd)}}
+      end
     end
   end
 

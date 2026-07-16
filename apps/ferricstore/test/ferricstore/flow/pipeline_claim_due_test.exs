@@ -86,4 +86,44 @@ defmodule Ferricstore.Flow.PipelineClaimDueTest do
     assert results == [{:ok, [%{id: "job-1"}]}, {:ok, [%{id: "job-1"}]}]
     assert next_stats.groups == 2
   end
+
+  test "routed singleton batches fail every claim on a partial router result" do
+    claim = %{
+      type: "email",
+      opts: [limit: 1],
+      limit: 1,
+      key: :first,
+      queue_key: :first_queue,
+      groupable?: true,
+      attrs: %{state: "queued", limit: 1, partition_key: "p1", type: "email", priority: 0},
+      payload_return: %{enabled?: false},
+      return_mode: :records,
+      named_values: nil,
+      reclaim_expired?: false,
+      reclaim_ratio: 0
+    }
+
+    second = %{
+      claim
+      | key: :second,
+        queue_key: :second_queue,
+        attrs: %{claim.attrs | partition_key: "p2"}
+    }
+
+    callbacks = Map.put(callbacks(), :pipeline_write_batch, fn _ctx, _commands -> [:partial] end)
+
+    assert {results, next_stats} =
+             PipelineClaimDue.results(
+               [{:ok, claim}, {:ok, second}],
+               :ctx,
+               [],
+               stats(),
+               callbacks
+             )
+
+    assert results ==
+             List.duplicate({:error, "ERR pipeline claim batch result mismatch"}, 2)
+
+    assert next_stats.batched_calls == 1
+  end
 end

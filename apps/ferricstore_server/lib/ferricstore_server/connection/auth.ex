@@ -8,6 +8,7 @@ defmodule FerricstoreServer.Connection.Auth do
   """
 
   alias Ferricstore.Commands.{KeyDiscovery, PreparedCommand}
+  alias FerricstoreServer.Acl.CatalogProjector
   alias FerricstoreServer.Acl.CommandCategories
 
   @acl_pg_group :ferricstore_acl_connections
@@ -19,58 +20,81 @@ defmodule FerricstoreServer.Connection.Auth do
 
   @spec user_requires_auth?(binary()) :: boolean()
   def user_requires_auth?(username) do
-    case FerricstoreServer.Acl.get_user(username) do
-      %{password: password} when is_binary(password) -> true
-      _ -> false
+    if CatalogProjector.ready?() do
+      case FerricstoreServer.Acl.get_user(username) do
+        %{password: password} when is_binary(password) -> true
+        _ -> false
+      end
+    else
+      true
     end
   end
 
   @spec build_acl_cache(binary()) :: map() | :full_access | :denied
   def build_acl_cache(username) do
-    case FerricstoreServer.Acl.get_user(username) do
-      nil ->
-        if username == "default", do: :full_access, else: :denied
+    if CatalogProjector.ready?() do
+      case FerricstoreServer.Acl.get_user(username) do
+        nil ->
+          :denied
 
-      user ->
-        denied = Map.get(user, :denied_commands, MapSet.new())
-        channels = Map.get(user, :channels, :all)
+        user ->
+          denied = Map.get(user, :denied_commands, MapSet.new())
+          channels = Map.get(user, :channels, :all)
 
-        if user.enabled and user.commands == :all and MapSet.size(denied) == 0 and
-             user.keys == :all and channels == :all do
-          :full_access
-        else
-          %{
-            commands: user.commands,
-            denied_commands: denied,
-            keys: user.keys,
-            channels: channels,
-            enabled: user.enabled
-          }
-        end
+          if user.enabled and user.commands == :all and MapSet.size(denied) == 0 and
+               user.keys == :all and channels == :all do
+            :full_access
+          else
+            %{
+              commands: user.commands,
+              denied_commands: denied,
+              keys: user.keys,
+              channels: channels,
+              enabled: user.enabled
+            }
+          end
+      end
+    else
+      :denied
+    end
+  end
+
+  @spec ensure_acl_projection_ready() :: :ok | {:error, binary()}
+  def ensure_acl_projection_ready do
+    if CatalogProjector.ready?() do
+      :ok
+    else
+      {:error, "NOPERM ACL catalog projection unavailable"}
     end
   end
 
   @spec check_command_cached(map() | :full_access | :denied | nil, binary()) ::
           :ok | {:error, binary()}
-  def check_command_cached(:full_access, "ACL.WHOAMI"), do: :ok
-  def check_command_cached(%{enabled: true}, "ACL.WHOAMI"), do: :ok
+  def check_command_cached(cache, command) do
+    with :ok <- ensure_acl_projection_ready() do
+      do_check_command_cached(cache, command)
+    end
+  end
 
-  def check_command_cached(:denied, _cmd),
+  defp do_check_command_cached(:full_access, "ACL.WHOAMI"), do: :ok
+  defp do_check_command_cached(%{enabled: true}, "ACL.WHOAMI"), do: :ok
+
+  defp do_check_command_cached(:denied, _cmd),
     do: {:error, "NOPERM user session expired or user was deleted"}
 
-  def check_command_cached(nil, _cmd),
+  defp do_check_command_cached(nil, _cmd),
     do: {:error, "NOPERM user session expired or user was deleted"}
 
-  def check_command_cached(:full_access, _cmd), do: :ok
+  defp do_check_command_cached(:full_access, _cmd), do: :ok
 
-  def check_command_cached(
-        %{commands: :all, denied_commands: %MapSet{map: denied_map}, enabled: true},
-        _cmd
-      )
-      when map_size(denied_map) == 0,
-      do: :ok
+  defp do_check_command_cached(
+         %{commands: :all, denied_commands: %MapSet{map: denied_map}, enabled: true},
+         _cmd
+       )
+       when map_size(denied_map) == 0,
+       do: :ok
 
-  def check_command_cached(cache, cmd) do
+  defp do_check_command_cached(cache, cmd) do
     cond do
       not cache.enabled ->
         noperm_command(cmd)
@@ -92,16 +116,22 @@ defmodule FerricstoreServer.Connection.Auth do
 
   @spec check_keys_cached(map() | :full_access | :denied | nil, binary(), [binary()]) ::
           :ok | {:error, binary()}
-  def check_keys_cached(:denied, _cmd, _keys),
+  def check_keys_cached(cache, command, keys) do
+    with :ok <- ensure_acl_projection_ready() do
+      do_check_keys_cached(cache, command, keys)
+    end
+  end
+
+  defp do_check_keys_cached(:denied, _cmd, _keys),
     do: {:error, "NOPERM user session expired or user was deleted"}
 
-  def check_keys_cached(nil, _cmd, _keys),
+  defp do_check_keys_cached(nil, _cmd, _keys),
     do: {:error, "NOPERM user session expired or user was deleted"}
 
-  def check_keys_cached(:full_access, _cmd, _keys), do: :ok
-  def check_keys_cached(%{keys: :all}, _cmd, _keys), do: :ok
+  defp do_check_keys_cached(:full_access, _cmd, _keys), do: :ok
+  defp do_check_keys_cached(%{keys: :all}, _cmd, _keys), do: :ok
 
-  def check_keys_cached(%{keys: patterns}, cmd, []) when is_list(patterns) do
+  defp do_check_keys_cached(%{keys: patterns}, cmd, []) when is_list(patterns) do
     if global_keyspace_enumeration_command?(cmd) and not unrestricted_read_key_patterns?(patterns) do
       noperm_key()
     else
@@ -109,7 +139,7 @@ defmodule FerricstoreServer.Connection.Auth do
     end
   end
 
-  def check_keys_cached(%{keys: patterns}, cmd, keys) when is_list(keys) do
+  defp do_check_keys_cached(%{keys: patterns}, cmd, keys) when is_list(keys) do
     {read_keys, write_keys} = KeyDiscovery.access_keys(cmd, keys)
 
     with :ok <- check_all_keys(read_keys, :read, patterns) do
@@ -119,19 +149,25 @@ defmodule FerricstoreServer.Connection.Auth do
 
   @spec check_keys_cached(map() | :full_access | :denied | nil, PreparedCommand.t()) ::
           :ok | {:error, binary()}
-  def check_keys_cached(:denied, %PreparedCommand{}),
+  def check_keys_cached(cache, %PreparedCommand{} = prepared) do
+    with :ok <- ensure_acl_projection_ready() do
+      do_check_keys_cached(cache, prepared)
+    end
+  end
+
+  defp do_check_keys_cached(:denied, %PreparedCommand{}),
     do: {:error, "NOPERM user session expired or user was deleted"}
 
-  def check_keys_cached(nil, %PreparedCommand{}),
+  defp do_check_keys_cached(nil, %PreparedCommand{}),
     do: {:error, "NOPERM user session expired or user was deleted"}
 
-  def check_keys_cached(:full_access, %PreparedCommand{}), do: :ok
-  def check_keys_cached(%{keys: :all}, %PreparedCommand{}), do: :ok
+  defp do_check_keys_cached(:full_access, %PreparedCommand{}), do: :ok
+  defp do_check_keys_cached(%{keys: :all}, %PreparedCommand{}), do: :ok
 
-  def check_keys_cached(%{keys: patterns} = cache, %PreparedCommand{} = prepared)
-      when is_list(patterns) do
+  defp do_check_keys_cached(%{keys: patterns} = cache, %PreparedCommand{} = prepared)
+       when is_list(patterns) do
     if prepared.acl_keys == [] do
-      check_keys_cached(cache, prepared.command, [])
+      do_check_keys_cached(cache, prepared.command, [])
     else
       with :ok <- check_all_keys(prepared.read_keys, :read, patterns) do
         check_all_keys(prepared.write_keys, :write, patterns)
@@ -141,18 +177,24 @@ defmodule FerricstoreServer.Connection.Auth do
 
   @spec check_channels_cached(map() | :full_access | :denied | nil, [binary()]) ::
           :ok | {:error, binary()}
-  def check_channels_cached(:denied, _channels),
+  def check_channels_cached(cache, channels) do
+    with :ok <- ensure_acl_projection_ready() do
+      do_check_channels_cached(cache, channels)
+    end
+  end
+
+  defp do_check_channels_cached(:denied, _channels),
     do: {:error, "NOPERM user session expired or user was deleted"}
 
-  def check_channels_cached(nil, _channels),
+  defp do_check_channels_cached(nil, _channels),
     do: {:error, "NOPERM user session expired or user was deleted"}
 
-  def check_channels_cached(:full_access, _channels), do: :ok
-  def check_channels_cached(%{channels: :all}, _channels), do: :ok
-  def check_channels_cached(%{channels: patterns}, []) when is_list(patterns), do: :ok
+  defp do_check_channels_cached(:full_access, _channels), do: :ok
+  defp do_check_channels_cached(%{channels: :all}, _channels), do: :ok
+  defp do_check_channels_cached(%{channels: patterns}, []) when is_list(patterns), do: :ok
 
-  def check_channels_cached(%{channels: patterns}, channels)
-      when is_list(patterns) and is_list(channels) do
+  defp do_check_channels_cached(%{channels: patterns}, channels)
+       when is_list(patterns) and is_list(channels) do
     if Enum.all?(channels, &FerricstoreServer.Acl.channel_matches_any?(&1, patterns)) do
       :ok
     else
@@ -193,6 +235,16 @@ defmodule FerricstoreServer.Connection.Auth do
 
   @spec broadcast_acl_invalidation(binary() | :all) :: :ok
   def broadcast_acl_invalidation(username) do
+    broadcast_acl_invalidation_message({:acl_invalidate, username})
+  end
+
+  @spec broadcast_acl_invalidation(binary() | :all, non_neg_integer()) :: :ok
+  def broadcast_acl_invalidation(username, revision)
+      when is_integer(revision) and revision >= 0 do
+    broadcast_acl_invalidation_message({:acl_invalidate, username, revision})
+  end
+
+  defp broadcast_acl_invalidation_message(message) do
     members =
       try do
         :pg.get_members(@acl_pg_group, @acl_pg_group)
@@ -200,7 +252,7 @@ defmodule FerricstoreServer.Connection.Auth do
         :error, _ -> []
       end
 
-    for pid <- members, pid != self(), do: send(pid, {:acl_invalidate, username})
+    for pid <- members, pid != self(), do: send(pid, message)
     :ok
   end
 

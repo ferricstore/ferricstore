@@ -427,6 +427,8 @@ defmodule Ferricstore.Commands.ConfigTest do
       )
 
       old_hook = Application.get_env(:ferricstore, :config_memory_guard_reconfigure_hook)
+      old_config = Config.get_value("keydir-max-ram")
+      old_env = Application.get_env(:ferricstore, :keydir_max_ram)
 
       Application.put_env(
         :ferricstore,
@@ -443,9 +445,21 @@ defmodule Ferricstore.Commands.ConfigTest do
           nil -> Application.delete_env(:ferricstore, :config_memory_guard_reconfigure_hook)
           hook -> Application.put_env(:ferricstore, :config_memory_guard_reconfigure_hook, hook)
         end
+
+        if is_binary(old_config), do: Config.set("keydir-max-ram", old_config)
+
+        case old_env do
+          nil -> Application.delete_env(:ferricstore, :keydir_max_ram)
+          value -> Application.put_env(:ferricstore, :keydir_max_ram, value)
+        end
       end)
 
-      assert :ok = Server.handle("CONFIG", ["SET", "keydir-max-ram", "12345"], MockStore.make())
+      assert {:error, message} =
+               Server.handle("CONFIG", ["SET", "keydir-max-ram", "12345"], MockStore.make())
+
+      assert message =~ "failed to apply"
+      assert Config.get_value("keydir-max-ram") == old_config
+      assert Application.get_env(:ferricstore, :keydir_max_ram) == old_env
 
       assert_receive {:config_side_effect_failed, [:ferricstore, :config, :side_effect_failed],
                       %{count: 1},
@@ -565,6 +579,27 @@ defmodule Ferricstore.Commands.ConfigTest do
                        1_000
       after
         :telemetry.detach(handler_id)
+        File.rm_rf(dir)
+      end
+    end
+
+    test "CONFIG REWRITE rejects an oversized existing config without loading it" do
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-config-rewrite-large-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(dir)
+      Application.put_env(:ferricstore, :data_dir, dir)
+      path = Ferricstore.Config.config_file_path()
+      File.write!(path, :binary.copy("x", 1_048_577))
+
+      try do
+        assert {:error, reason} = Server.handle("CONFIG", ["REWRITE"], MockStore.make())
+        assert reason =~ "config file exceeds"
+        assert File.stat!(path).size == 1_048_577
+      after
         File.rm_rf(dir)
       end
     end

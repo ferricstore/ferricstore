@@ -51,6 +51,24 @@ defmodule Ferricstore.Bugs.LinsertNegativeIndexTest do
                "List: #{inspect(Enum.take(result, 5))} ... #{inspect(Enum.take(result, -5))}"
     end
 
+    test "rebalance keeps boundary metadata valid for later appends" do
+      key = "linbug:rebalance-append"
+      assert {:ok, 2} = FerricStore.rpush(key, ["a", "b"])
+
+      for i <- 1..55 do
+        expected_length = i + 2
+        assert {:ok, ^expected_length} = FerricStore.linsert(key, :after, "a", "m#{i}")
+      end
+
+      assert {:ok, 58} = FerricStore.rpush(key, ["tail"])
+      assert {:ok, 58} = FerricStore.llen(key)
+      assert {:ok, ["tail"]} = FerricStore.lrange(key, -1, -1)
+
+      assert {:ok, values} = FerricStore.lrange(key, 0, -1)
+      assert length(values) == 58
+      assert Enum.sort(values) == Enum.sort(["a", "b", "tail" | Enum.map(1..55, &"m#{&1}")])
+    end
+
     test "LINSERT BEFORE first element repeatedly preserves all elements" do
       FerricStore.rpush("linbug:prepend", ["anchor"])
 

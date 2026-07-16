@@ -71,9 +71,7 @@ defmodule Ferricstore.Flow.Governance.Catalog do
   def collect_key(ctx, catalog_key, limit, loader, sort_by, direction)
       when is_binary(catalog_key) and is_integer(limit) and limit > 0 and is_function(loader, 1) and
              is_function(sort_by, 1) and direction in [:asc, :desc] do
-    reduce_key_pages(ctx, catalog_key, [], fn keys, acc ->
-      collect_keys_page(keys, acc, limit, loader, sort_by, direction)
-    end)
+    do_collect_key(ctx, catalog_key, nil, [], limit, loader, sort_by, direction)
   end
 
   def collect_keys(keys, limit, loader, sort_by, direction \\ :asc)
@@ -81,7 +79,7 @@ defmodule Ferricstore.Flow.Governance.Catalog do
   def collect_keys(keys, limit, loader, sort_by, direction)
       when is_list(keys) and is_integer(limit) and limit > 0 and is_function(loader, 1) and
              is_function(sort_by, 1) and direction in [:asc, :desc] do
-    {:ok, collect_keys_page(keys, [], limit, loader, sort_by, direction)}
+    collect_keys_page(keys, [], limit, loader, sort_by, direction)
   end
 
   def reduce_pages(ctx, kind, acc, reducer)
@@ -167,18 +165,38 @@ defmodule Ferricstore.Flow.Governance.Catalog do
     end
   end
 
-  defp collect_keys_page(keys, acc, limit, loader, sort_by, direction) do
-    page =
-      Enum.reduce(keys, [], fn key, records ->
-        case loader.(key) do
-          {:ok, record} -> [record | records]
-          _skip_or_error -> records
-        end
-      end)
+  defp do_collect_key(ctx, catalog_key, cursor, acc, limit, loader, sort_by, direction) do
+    with {:ok, %{keys: keys, next_cursor: next_cursor}} <-
+           page_key(ctx, catalog_key, cursor, @page_size),
+         {:ok, acc} <- collect_keys_page(keys, acc, limit, loader, sort_by, direction) do
+      if is_nil(next_cursor) do
+        {:ok, acc}
+      else
+        do_collect_key(ctx, catalog_key, next_cursor, acc, limit, loader, sort_by, direction)
+      end
+    end
+  end
 
-    page
-    |> Kernel.++(acc)
-    |> Enum.sort_by(sort_by, direction)
-    |> Enum.take(limit)
+  defp collect_keys_page(keys, acc, limit, loader, sort_by, direction) do
+    keys
+    |> Enum.reduce_while({:ok, []}, fn key, {:ok, records} ->
+      case loader.(key) do
+        {:ok, record} -> {:cont, {:ok, [record | records]}}
+        :skip -> {:cont, {:ok, records}}
+        {:error, _reason} = error -> {:halt, error}
+        _invalid -> {:halt, {:error, "ERR flow governance catalog loader is invalid"}}
+      end
+    end)
+    |> case do
+      {:ok, page} ->
+        {:ok,
+         page
+         |> Kernel.++(acc)
+         |> Enum.sort_by(sort_by, direction)
+         |> Enum.take(limit)}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 end

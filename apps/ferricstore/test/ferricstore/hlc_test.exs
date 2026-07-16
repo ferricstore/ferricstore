@@ -17,7 +17,7 @@ defmodule Ferricstore.HLCTest do
     # slate. Physical and logical are packed into a single 64-bit value.
     ref = :persistent_term.get(:ferricstore_hlc_ref)
     :atomics.put(ref, 1, 0)
-    %{hlc: Ferricstore.HLC}
+    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -25,6 +25,14 @@ defmodule Ferricstore.HLCTest do
   # ---------------------------------------------------------------------------
 
   describe "now/0" do
+    test "does not expose server-argument compatibility overloads" do
+      refute function_exported?(HLC, :now, 1)
+      refute function_exported?(HLC, :now_ms, 1)
+      refute function_exported?(HLC, :update, 2)
+      refute function_exported?(HLC, :drift_ms, 1)
+      refute function_exported?(HLC, :drift_exceeded?, 1)
+    end
+
     test "returns a 2-tuple {physical_ms, logical}" do
       {physical, logical} = HLC.now()
 
@@ -73,30 +81,6 @@ defmodule Ferricstore.HLCTest do
   end
 
   # ---------------------------------------------------------------------------
-  # now/1 -- backward-compatible arity-1 variant
-  # ---------------------------------------------------------------------------
-
-  describe "now/1" do
-    test "returns a 2-tuple when called with a server argument", %{hlc: hlc} do
-      {physical, logical} = HLC.now(hlc)
-
-      assert is_integer(physical)
-      assert is_integer(logical)
-      assert physical > 0
-      assert logical >= 0
-    end
-
-    test "returns monotonically increasing values via arity-1", %{hlc: hlc} do
-      ts1 = HLC.now(hlc)
-      ts2 = HLC.now(hlc)
-      ts3 = HLC.now(hlc)
-
-      assert HLC.compare(ts2, ts1) == :gt
-      assert HLC.compare(ts3, ts2) == :gt
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # now_ms/0 -- monotonic millisecond convenience (lock-free)
   # ---------------------------------------------------------------------------
 
@@ -129,25 +113,7 @@ defmodule Ferricstore.HLCTest do
   end
 
   # ---------------------------------------------------------------------------
-  # now_ms/1 -- backward-compatible arity-1 variant
-  # ---------------------------------------------------------------------------
-
-  describe "now_ms/1" do
-    test "returns a single integer when called with server argument", %{hlc: hlc} do
-      ms = HLC.now_ms(hlc)
-      assert is_integer(ms)
-      assert ms > 0
-    end
-
-    test "returns monotonically increasing values via arity-1", %{hlc: hlc} do
-      ms1 = HLC.now_ms(hlc)
-      ms2 = HLC.now_ms(hlc)
-      assert ms2 >= ms1
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # update/1 and update/2 -- merging remote timestamps
+  # update/1 -- merging remote timestamps
   # ---------------------------------------------------------------------------
 
   describe "update/1" do
@@ -159,6 +125,15 @@ defmodule Ferricstore.HLCTest do
 
       assert update_source =~ "hlc_update_packed(remote_ts)"
       refute update_source =~ "GenServer.call"
+    end
+
+    test "ignores remote timestamps that do not fit the packed clock" do
+      assert :ok = HLC.update({Bitwise.bsl(1, 48), 0})
+      assert :ok = HLC.update({System.os_time(:millisecond), Bitwise.bsl(1, 16)})
+
+      {physical, logical} = HLC.now()
+      assert physical < Bitwise.bsl(1, 48)
+      assert logical < Bitwise.bsl(1, 16)
     end
 
     test "with a future remote timestamp advances the local clock" do
@@ -206,36 +181,6 @@ defmodule Ferricstore.HLCTest do
     end
   end
 
-  describe "update/2" do
-    test "with a future remote timestamp advances the local clock", %{hlc: hlc} do
-      {local_phys, _} = HLC.now()
-      remote_ts = {local_phys + 1_000, 5}
-      :ok = HLC.update(hlc, remote_ts)
-
-      {new_phys, _new_log} = HLC.now()
-      assert new_phys >= local_phys + 1_000
-    end
-
-    test "with a past remote timestamp does not go backward", %{hlc: hlc} do
-      ts_before = HLC.now()
-      :ok = HLC.update(hlc, {1_000_000, 0})
-      ts_after = HLC.now()
-      assert HLC.compare(ts_after, ts_before) == :gt
-    end
-
-    test "with equal physical time picks the higher logical counter", %{hlc: hlc} do
-      {local_phys, _} = HLC.now()
-      :ok = HLC.update(hlc, {local_phys, 999})
-
-      {new_phys, new_log} = HLC.now()
-      assert new_phys >= local_phys
-
-      if new_phys == local_phys do
-        assert new_log > 999
-      end
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # drift_ms/0 -- wall clock drift detection (lock-free)
   # ---------------------------------------------------------------------------
@@ -258,17 +203,14 @@ defmodule Ferricstore.HLCTest do
       assert drift >= 1_900
       assert drift <= 2_100
     end
-  end
 
-  # ---------------------------------------------------------------------------
-  # drift_ms/1 -- backward-compatible arity-1 variant
-  # ---------------------------------------------------------------------------
+    test "does not reject an idle HLC that is behind the advancing wall clock" do
+      ref = :persistent_term.get(:ferricstore_hlc_ref)
+      stale_physical = System.os_time(:millisecond) - 2_000
+      :atomics.put(ref, 1, Bitwise.bsl(stale_physical, 16))
 
-  describe "drift_ms/1" do
-    test "returns near-zero drift when called with server argument", %{hlc: hlc} do
-      _ts = HLC.now()
-      drift = HLC.drift_ms(hlc)
-      assert drift < 10
+      assert HLC.drift_ms() == 0
+      refute HLC.drift_exceeded?()
     end
   end
 

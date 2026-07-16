@@ -2,17 +2,16 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
   @moduledoc false
 
   alias Ferricstore.Flow.Codec
-  alias Ferricstore.Flow.{InfoAPI, ReadAPI}
+  alias Ferricstore.Flow.{HistoryAPI, InfoAPI, PayloadReturn, ReadAPI}
   alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Store.Router
 
-  @default_max_count 10_000
-  @default_payload_return_max_bytes 64 * 1024
+  @corrupt_record_error {:error, "ERR flow record is corrupt"}
 
   def command(_ctx, {:get, id, opts}) when is_binary(id) and is_list(opts) do
     with :ok <- validate_id(id),
          :ok <- validate_opts(opts),
-         {:ok, payload_return} <- payload_return_opts(opts, false),
+         {:ok, payload_return} <- PayloadReturn.options(opts, false),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)) do
       {:get, id, partition_key, payload_return}
@@ -141,11 +140,11 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
   def decode_get(value) when is_binary(value) do
     {:ok, value |> Codec.decode_record() |> RecordProjection.public()}
   rescue
-    _ -> {:ok, nil}
+    _ -> @corrupt_record_error
   end
 
   def decode_get({:error, _reason} = error), do: error
-  def decode_get(_other), do: {:ok, nil}
+  def decode_get(_other), do: @corrupt_record_error
 
   def history_results(history_ops, ctx) do
     Ferricstore.Flow.PipelineHistoryRead.results(history_ops, ctx, %{
@@ -182,13 +181,16 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
     |> Map.new()
   end
 
-  defp decode_context_value(value, id) when is_binary(value) do
+  @doc false
+  def decode_context_value(value, _id) when is_binary(value) do
     Codec.decode_record(value)
   rescue
-    _ -> %{id: id}
+    _ -> @corrupt_record_error
   end
 
-  defp decode_context_value(_value, id), do: %{id: id}
+  def decode_context_value(nil, id), do: %{id: id}
+  def decode_context_value({:error, _reason} = error, _id), do: error
+  def decode_context_value(_invalid, _id), do: @corrupt_record_error
 
   defp prepare_consistent_history(_ctx, []), do: :ok
 
@@ -245,18 +247,7 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
   defp read_result(key, read_fun), do: {:other, key, read_fun}
 
   defp history_query_attrs(id, opts) do
-    with :ok <- validate_opts(opts),
-         :ok <- validate_id(id),
-         {:ok, partition_key} <- optional_partition_key(opts),
-         history_key = Ferricstore.Flow.Keys.history_key(id, partition_key),
-         :ok <- validate_key_size(history_key),
-         {:ok, count} <- flow_count(opts),
-         {:ok, include_cold?} <- optional_boolean(opts, :include_cold, true),
-         {:ok, consistent?} <- optional_boolean(opts, :consistent_projection, true),
-         {:ok, value_return} <- history_value_return_opts(opts),
-         {:ok, query} <- flow_history_query_opts(opts, count) do
-      {:ok, {partition_key, history_key, query, include_cold?, consistent?, value_return}}
-    end
+    HistoryAPI.prepare(id, opts)
   end
 
   defp validate_opts(opts) do
@@ -274,130 +265,12 @@ defmodule Ferricstore.Flow.PipelineReadCommand do
     end
   end
 
-  defp flow_count(opts) do
-    case Keyword.get(opts, :count, 100) do
-      value when is_integer(value) and value > 0 ->
-        max_count = flow_max_count()
-
-        if value <= max_count do
-          {:ok, value}
-        else
-          {:error, "ERR flow count exceeds maximum #{max_count}"}
-        end
-
-      _ ->
-        {:error, "ERR flow count must be a positive integer"}
-    end
-  end
-
-  defp flow_max_count do
-    case Application.get_env(:ferricstore, :flow_max_count, @default_max_count) do
-      value when is_integer(value) and value > 0 -> value
-      _ -> @default_max_count
-    end
-  end
-
-  defp payload_return_opts(opts, default_enabled?) do
-    with {:ok, full?} <- optional_boolean(opts, :full, default_enabled?),
-         {:ok, enabled?} <- optional_boolean(opts, :payload, full?),
-         {:ok, max_bytes} <-
-           optional_non_neg_integer(
-             opts,
-             :payload_max_bytes,
-             flow_payload_return_max_bytes()
-           ) do
-      {:ok, %{enabled?: enabled?, max_bytes: max_bytes}}
-    end
-  end
-
-  defp history_value_return_opts(opts) do
-    with {:ok, enabled?} <- optional_boolean(opts, :values, false),
-         {:ok, max_bytes} <-
-           optional_non_neg_integer(
-             opts,
-             :payload_max_bytes,
-             flow_payload_return_max_bytes()
-           ) do
-      {:ok, %{enabled?: enabled?, max_bytes: max_bytes}}
-    end
-  end
-
-  defp flow_payload_return_max_bytes do
-    case Application.get_env(
-           :ferricstore,
-           :flow_payload_return_max_bytes,
-           @default_payload_return_max_bytes
-         ) do
-      value when is_integer(value) and value >= 0 -> value
-      _ -> @default_payload_return_max_bytes
-    end
-  end
-
-  defp flow_history_query_opts(opts, count) do
-    with {:ok, from_event} <- optional_binary_or_nil(opts, :from_event, nil),
-         {:ok, to_event} <- optional_binary_or_nil(opts, :to_event, nil),
-         {:ok, from_ms} <- optional_non_neg_integer(opts, :from_ms, nil),
-         {:ok, to_ms} <- optional_non_neg_integer(opts, :to_ms, nil),
-         {:ok, from_version} <- optional_non_neg_integer(opts, :from_version, nil),
-         {:ok, to_version} <- optional_non_neg_integer(opts, :to_version, nil),
-         {:ok, rev?} <- optional_boolean(opts, :rev, false),
-         {:ok, event} <- optional_binary_or_nil(opts, :event, nil),
-         {:ok, worker} <- optional_binary_or_nil(opts, :worker, nil),
-         :ok <- Ferricstore.Flow.HistoryQuery.validate_ms_range(from_ms, to_ms),
-         :ok <- Ferricstore.Flow.HistoryQuery.validate_version_range(from_version, to_version),
-         :ok <-
-           Ferricstore.Flow.HistoryQuery.validate_event_range(
-             from_event,
-             to_event,
-             &Ferricstore.Flow.HistoryEvent.ms/1
-           ) do
-      {:ok,
-       %{
-         count: count,
-         from_event: from_event,
-         to_event: to_event,
-         from_ms: from_ms,
-         to_ms: to_ms,
-         from_version: from_version,
-         to_version: to_version,
-         rev?: rev?,
-         event: event,
-         worker: worker
-       }}
-    end
-  end
-
   defp optional_partition_key(opts) do
     case Keyword.get(opts, :partition_key, nil) do
       nil -> {:ok, nil}
       :global -> {:ok, nil}
       value when is_binary(value) and value != "" -> {:ok, value}
       _ -> {:error, "ERR flow partition_key must be a non-empty string or :global"}
-    end
-  end
-
-  defp optional_binary_or_nil(opts, key, default) do
-    case Keyword.get(opts, key, default) do
-      nil -> {:ok, nil}
-      value when is_binary(value) -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a string"}
-    end
-  end
-
-  defp optional_boolean(opts, key, default) do
-    case Keyword.get(opts, key, default) do
-      value when is_boolean(value) -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a boolean"}
-    end
-  end
-
-  defp optional_non_neg_integer(opts, key, default) do
-    case Keyword.fetch(opts, key) do
-      {:ok, value} when is_integer(value) and value >= 0 -> {:ok, value}
-      {:ok, _} -> {:error, "ERR flow #{key} must be a non-negative integer"}
-      :error when is_integer(default) and default >= 0 -> {:ok, default}
-      :error when is_nil(default) -> {:ok, nil}
-      :error -> {:error, "ERR flow #{key} must be a non-negative integer"}
     end
   end
 end

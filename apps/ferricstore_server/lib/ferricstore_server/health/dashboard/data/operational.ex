@@ -13,6 +13,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     only: [config_command_reference: 0, runtime_config_parameter_reference: 0]
 
   @default_storage_summary_ttl_ms 30_000
+  @dashboard_client_limit 500
 
   def collect_dashboard(flow_summary) do
     %{
@@ -53,7 +54,15 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   end
 
   def collect_clients_page do
-    %{clients: collect_client_list(), connections: collect_connections()}
+    snapshot = collect_client_snapshot()
+
+    connections =
+      collect_connections()
+      |> Map.put(:pubsub, snapshot.pubsub)
+      |> Map.put(:transactions, snapshot.transactions)
+      |> Map.put(:oldest_age_seconds, snapshot.oldest_age_seconds)
+
+    %{clients: snapshot.clients, connections: connections}
   end
 
   def collect_storage_page do
@@ -380,7 +389,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     notify_storage_scan(observer, {:path, path})
     current_shard = Map.get(shard_roots, path, current_shard)
 
-    case File.stat(path) do
+    case File.lstat(path) do
       {:ok, %{type: :regular, size: size}} ->
         file = Path.basename(path)
         data_files = if String.ends_with?(file, ".log"), do: 1, else: 0
@@ -477,7 +486,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   def scan_shard_dir(shard_dir), do: scan_storage_tree(shard_dir)
 
   def scan_storage_tree(path) when is_binary(path) do
-    case File.stat(path) do
+    case File.lstat(path) do
       {:ok, %{type: :regular, size: size}} ->
         file = Path.basename(path)
 
@@ -540,16 +549,34 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   end
 
   def collect_client_list do
-    try do
-      summaries = FerricstoreServer.Connection.Registry.summaries()
+    collect_client_snapshot().clients
+  end
 
-      if summaries != [] do
-        collect_client_list_from_registry(summaries)
+  defp collect_client_snapshot do
+    try do
+      snapshot = FerricstoreServer.Connection.Registry.snapshot(@dashboard_client_limit)
+
+      if snapshot.registered_count > 0 do
+        now = System.monotonic_time(:millisecond)
+
+        %{
+          clients: collect_client_list_from_registry(snapshot.clients),
+          pubsub: snapshot.pubsub_count,
+          transactions: snapshot.transaction_count,
+          oldest_age_seconds: max(0, div(now - (snapshot.oldest_created_at_ms || now), 1_000))
+        }
       else
-        collect_client_list_from_ranch()
+        ranch_clients = collect_client_list_from_ranch()
+
+        %{
+          clients: Enum.take(ranch_clients, @dashboard_client_limit),
+          pubsub: Enum.count(ranch_clients, &String.contains?(&1.flags, "S")),
+          transactions: Enum.count(ranch_clients, &String.contains?(&1.flags, "M")),
+          oldest_age_seconds: ranch_clients |> Enum.map(& &1.age_seconds) |> Enum.max(fn -> 0 end)
+        }
       end
     catch
-      _, _ -> []
+      _, _ -> %{clients: [], pubsub: 0, transactions: 0, oldest_age_seconds: 0}
     end
   end
 

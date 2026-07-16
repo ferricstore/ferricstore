@@ -42,8 +42,8 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionHydratesS
         projection_index = 42
         id_a = "flow-apply-projection-a"
         id_b = "flow-apply-projection-b"
-        value_key_a = "f:{flow-apply-projection-a}:v:p:#{id_a}:1"
-        value_key_b = "f:{flow-apply-projection-b}:v:p:#{id_b}:1"
+        value_key_a = Ferricstore.Flow.Keys.value_key(id_a, :payload, 1)
+        value_key_b = Ferricstore.Flow.Keys.value_key(id_b, :payload, 1)
         source_value_a = Ferricstore.Flow.encode_value("payload-a")
         source_value_b = Ferricstore.Flow.encode_value("payload-b")
 
@@ -329,9 +329,9 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionHydratesS
       test "value projection filters absent keydir refs before LMDB live checks" do
         unique = System.unique_integer([:positive])
         keydir = :ets.new(:"history_projector_value_refs_#{unique}", [:set, :public])
-        present_ref = "f:{flow-present}:v:p:flow-present:1"
-        absent_ref = "f:{flow-absent}:v:p:flow-absent:1"
-        stale_ref = "f:{flow-stale}:v:p:flow-stale:1"
+        present_ref = Ferricstore.Flow.Keys.value_key("flow-present", :payload, 1)
+        absent_ref = Ferricstore.Flow.Keys.value_key("flow-absent", :payload, 1)
+        stale_ref = Ferricstore.Flow.Keys.value_key("flow-stale", :payload, 1)
 
         :ets.insert(
           keydir,
@@ -397,7 +397,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionHydratesS
 
         projection_index = 4242
         id = "flow-copy-projection"
-        value_key = "f:{flow-copy-projection}:v:p:#{id}:1"
+        value_key = Ferricstore.Flow.Keys.value_key(id, :payload, 1)
         source_value = Ferricstore.Flow.encode_value("payload-copy")
 
         assert :ok =
@@ -491,7 +491,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionHydratesS
         }
 
         id = "flow-stale-locator"
-        value_key = "f:{flow-stale-locator}:v:p:#{id}:2"
+        value_key = Ferricstore.Flow.Keys.value_key(id, :payload, 2)
         lmdb_path = Ferricstore.Flow.LMDB.path(dir)
 
         stale_locator =

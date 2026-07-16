@@ -37,6 +37,28 @@ defmodule Ferricstore.Merge.SemaphoreTest do
       assert {:error, :not_holder} = Semaphore.release(1, sem)
     end
 
+    test "does not let another process release the holder's shard", %{semaphore: sem} do
+      parent = self()
+
+      holder =
+        spawn(fn ->
+          :ok = Semaphore.acquire(7, sem)
+          send(parent, :holder_acquired)
+
+          receive do
+            :release -> send(parent, {:holder_release, Semaphore.release(7, sem)})
+          end
+        end)
+
+      assert_receive :holder_acquired
+      assert {:error, :not_holder} = Semaphore.release(7, sem)
+      assert {:held, 7} = Semaphore.status(sem)
+
+      send(holder, :release)
+      assert_receive {:holder_release, :ok}
+      assert :free = Semaphore.status(sem)
+    end
+
     test "returns error when nothing is held", %{semaphore: sem} do
       assert {:error, :not_holder} = Semaphore.release(0, sem)
     end

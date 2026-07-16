@@ -22,29 +22,19 @@ defmodule Ferricstore.Store.BlobStore.Protection do
 
         Enum.each(relative_paths, fn relative_path ->
           key = {data_dir, shard_index, relative_path}
-
-          case :ets.lookup(@protected_table, key) do
-            [{^key, count, deadline_ms}] when is_integer(count) and count > 1 ->
-              :ets.insert(@protected_table, {key, count - 1, deadline_ms})
-
-            [{^key, _count, _deadline_ms}] ->
-              :ets.delete(@protected_table, key)
-
-            [{^key, count}] when is_integer(count) and count > 1 ->
-              :ets.update_counter(@protected_table, key, {2, -1})
-
-            [{^key, _count}] ->
-              :ets.delete(@protected_table, key)
-
-            [] ->
-              :ok
-          end
+          unprotect_ref_path(key)
         end)
 
         :ok
       end
 
       def unprotect(_token), do: :ok
+
+      @doc false
+      def __protect_relative_path_for_test__(data_dir, shard_index, relative_path, deadline_ms) do
+        ensure_protected_table()
+        protect_ref_path({data_dir, shard_index, relative_path}, deadline_ms)
+      end
 
       @doc false
       @spec harden_protection(protection_token()) :: :ok
@@ -67,17 +57,7 @@ defmodule Ferricstore.Store.BlobStore.Protection do
 
         Enum.each(relative_paths, fn relative_path ->
           key = {data_dir, shard_index, relative_path}
-
-          case :ets.lookup(@protected_table, key) do
-            [{^key, count, _deadline_ms}] when is_integer(count) and count > 0 ->
-              :ets.insert(@protected_table, {key, count, :infinity})
-
-            [{^key, count}] when is_integer(count) and count > 0 ->
-              :ets.insert(@protected_table, {key, count, :infinity})
-
-            [] ->
-              :ets.insert(@protected_table, {key, 1, :infinity})
-          end
+          harden_protection_path(key)
         end)
 
         register_hardened_protection(data_dir, shard_index, relative_paths, metadata)
@@ -96,13 +76,23 @@ defmodule Ferricstore.Store.BlobStore.Protection do
                  is_integer(limit) and limit >= 0 do
         ensure_hardened_table()
 
-        @hardened_table
-        |> :ets.match_object({:_, data_dir, shard_index, :_, :_, :_})
-        |> Enum.sort_by(fn {_id, _dir, _shard, _paths, hardened_at_ms, _metadata} ->
-          hardened_at_ms
-        end)
-        |> Enum.take(limit)
-        |> Enum.map(fn {id, _dir, _shard, _paths, _hardened_at_ms, _metadata} -> id end)
+        if limit == 0 do
+          []
+        else
+          :ets.foldl(
+            fn
+              {id, ^data_dir, ^shard_index, _paths, hardened_at_ms, _metadata}, selected ->
+                bounded_oldest_hardened_insert(selected, {hardened_at_ms, id}, limit)
+
+              _other, selected ->
+                selected
+            end,
+            :gb_sets.empty(),
+            @hardened_table
+          )
+          |> :gb_sets.to_list()
+          |> Enum.map(&elem(&1, 1))
+        end
       end
 
       @doc false
@@ -126,20 +116,27 @@ defmodule Ferricstore.Store.BlobStore.Protection do
 
         now_ms = System.monotonic_time(:millisecond)
 
-        rows =
-          case shard_index do
-            :all -> :ets.match_object(@hardened_table, {:_, data_dir, :_, :_, :_, :_})
-            idx -> :ets.match_object(@hardened_table, {:_, data_dir, idx, :_, :_, :_})
-          end
+        {count, oldest_at} =
+          :ets.foldl(
+            fn
+              {_id, ^data_dir, row_shard_index, _paths, hardened_at_ms, _metadata},
+              {count, oldest_at}
+              when shard_index == :all or row_shard_index == shard_index ->
+                oldest_at =
+                  cond do
+                    not is_integer(hardened_at_ms) -> oldest_at
+                    is_nil(oldest_at) -> hardened_at_ms
+                    true -> min(oldest_at, hardened_at_ms)
+                  end
 
-        oldest_at =
-          Enum.reduce(rows, nil, fn {_id, _dir, _shard, _paths, hardened_at_ms, _metadata}, acc ->
-            cond do
-              not is_integer(hardened_at_ms) -> acc
-              is_nil(acc) -> hardened_at_ms
-              true -> min(acc, hardened_at_ms)
-            end
-          end)
+                {count + 1, oldest_at}
+
+              _other, acc ->
+                acc
+            end,
+            {0, nil},
+            @hardened_table
+          )
 
         oldest_age_ms =
           case oldest_at do
@@ -147,7 +144,17 @@ defmodule Ferricstore.Store.BlobStore.Protection do
             hardened_at_ms -> max(now_ms - hardened_at_ms, 0)
           end
 
-        %{count: length(rows), oldest_age_ms: oldest_age_ms}
+        %{count: count, oldest_age_ms: oldest_age_ms}
+      end
+
+      defp bounded_oldest_hardened_insert(selected, entry, limit) do
+        selected = :gb_sets.add(entry, selected)
+
+        if :gb_sets.size(selected) > limit do
+          :gb_sets.delete(:gb_sets.largest(selected), selected)
+        else
+          selected
+        end
       end
 
       defp protect_refs(data_dir, shard_index, refs) do
@@ -180,18 +187,106 @@ defmodule Ferricstore.Store.BlobStore.Protection do
       end
 
       defp protect_ref_path(key, deadline_ms) do
-        case :ets.lookup(@protected_table, key) do
-          [{^key, count, existing_deadline}] when is_integer(count) ->
-            :ets.insert(
-              @protected_table,
-              {key, count + 1, max_deadline(existing_deadline, deadline_ms)}
-            )
+        _count = :ets.update_counter(@protected_table, key, {2, 1}, {key, 0, deadline_ms})
+        maybe_run_protect_counter_hook(key)
+        extend_protection_deadline(key, deadline_ms)
+      end
 
-          [{^key, count}] when is_integer(count) ->
-            :ets.insert(@protected_table, {key, count + 1, deadline_ms})
+      defp maybe_run_protect_counter_hook(key) do
+        case Process.get(:ferricstore_blob_protect_counter_hook) do
+          fun when is_function(fun, 1) -> fun.(key)
+          _other -> :ok
+        end
+      end
+
+      defp extend_protection_deadline(key, deadline_ms) do
+        case :ets.lookup(@protected_table, key) do
+          [{^key, count, existing_deadline}] when is_integer(count) and count > 0 ->
+            next_deadline = max_deadline(existing_deadline, deadline_ms)
+
+            if next_deadline == existing_deadline or
+                 :ets.select_replace(@protected_table, [
+                   {{key, count, existing_deadline}, [], [{:const, {key, count, next_deadline}}]}
+                 ]) == 1 do
+              :ok
+            else
+              extend_protection_deadline(key, deadline_ms)
+            end
+
+          [{^key, count}] when is_integer(count) and count > 0 ->
+            if :ets.select_replace(@protected_table, [
+                 {{key, count}, [], [{:const, {key, count, deadline_ms}}]}
+               ]) == 1 do
+              :ok
+            else
+              extend_protection_deadline(key, deadline_ms)
+            end
+
+          _missing_or_invalid ->
+            :ok
+        end
+      end
+
+      defp unprotect_ref_path(key) do
+        case :ets.lookup(@protected_table, key) do
+          [{^key, count, _deadline_ms}] when is_integer(count) and count > 0 ->
+            decrement_protection_count(key)
+
+          [{^key, count}] when is_integer(count) and count > 0 ->
+            decrement_protection_count(key)
+
+          _missing_or_invalid ->
+            :ok
+        end
+      rescue
+        ArgumentError -> :ok
+      end
+
+      defp decrement_protection_count(key) do
+        remaining = :ets.update_counter(@protected_table, key, {2, -1})
+
+        if remaining <= 0 do
+          :ets.select_delete(@protected_table, [
+            {{key, remaining}, [], [true]},
+            {{key, remaining, :_}, [], [true]}
+          ])
+        end
+
+        :ok
+      end
+
+      defp harden_protection_path(key) do
+        case :ets.lookup(@protected_table, key) do
+          [{^key, count, :infinity}] when is_integer(count) and count > 0 ->
+            :ok
+
+          [{^key, count, deadline_ms}] when is_integer(count) and count > 0 ->
+            if :ets.select_replace(@protected_table, [
+                 {{key, count, deadline_ms}, [], [{:const, {key, count, :infinity}}]}
+               ]) == 1 do
+              :ok
+            else
+              harden_protection_path(key)
+            end
+
+          [{^key, count}] when is_integer(count) and count > 0 ->
+            if :ets.select_replace(@protected_table, [
+                 {{key, count}, [], [{:const, {key, count, :infinity}}]}
+               ]) == 1 do
+              :ok
+            else
+              harden_protection_path(key)
+            end
 
           [] ->
-            :ets.insert(@protected_table, {key, 1, deadline_ms})
+            if :ets.insert_new(@protected_table, {key, 1, :infinity}) do
+              :ok
+            else
+              harden_protection_path(key)
+            end
+
+          _invalid ->
+            :ok
         end
       end
 
@@ -245,14 +340,17 @@ defmodule Ferricstore.Store.BlobStore.Protection do
         ensure_hardened_table()
 
         Enum.reduce(hardened_ids, 0, fn id, released ->
-          case :ets.lookup(@hardened_table, id) do
+          case :ets.take(@hardened_table, id) do
             [{^id, ^data_dir, ^shard_index, relative_paths, _hardened_at_ms, _metadata}]
             when is_list(relative_paths) ->
-              :ets.delete(@hardened_table, id)
               unprotect({:blob_store_protection, data_dir, shard_index, relative_paths})
               released + 1
 
-            _missing_or_other_shard ->
+            [row] ->
+              :ets.insert(@hardened_table, row)
+              released
+
+            [] ->
               released
           end
         end)
@@ -262,31 +360,28 @@ defmodule Ferricstore.Store.BlobStore.Protection do
         ensure_protected_table()
         now_ms = System.monotonic_time(:millisecond)
 
-        new_shape =
-          :ets.match_object(@protected_table, {{data_dir, shard_index, :_}, :_, :_})
+        :ets.foldl(
+          fn
+            {{^data_dir, ^shard_index, relative_path} = _key, count, deadline_ms} = row, acc
+            when is_binary(relative_path) and is_integer(count) and count > 0 ->
+              if protection_expired?(deadline_ms, now_ms) do
+                :ets.delete_object(@protected_table, row)
+                acc
+              else
+                MapSet.put(acc, relative_path)
+              end
 
-        old_shape =
-          :ets.match_object(@protected_table, {{data_dir, shard_index, :_}, :_})
-
-        Enum.reduce(new_shape ++ old_shape, MapSet.new(), fn
-          {{^data_dir, ^shard_index, relative_path} = key, count, deadline_ms}, acc
-          when is_binary(relative_path) and is_integer(count) and count > 0 ->
-            if protection_expired?(deadline_ms, now_ms) do
-              :ets.delete(@protected_table, key)
+            {{^data_dir, ^shard_index, relative_path}, count} = row, acc
+            when is_binary(relative_path) and is_integer(count) and count > 0 ->
+              :ets.delete_object(@protected_table, row)
               acc
-            else
-              MapSet.put(acc, relative_path)
-            end
 
-          {{^data_dir, ^shard_index, relative_path}, count}, acc
-          when is_binary(relative_path) and is_integer(count) and count > 0 ->
-            key = {data_dir, shard_index, relative_path}
-            :ets.delete(@protected_table, key)
-            acc
-
-          _other, acc ->
-            acc
-        end)
+            _other, acc ->
+              acc
+          end,
+          MapSet.new(),
+          @protected_table
+        )
       end
 
       defp protection_deadline_ms do

@@ -11,11 +11,21 @@ defmodule FerricstoreServer.Native.Connection do
 
   @behaviour :ranch_protocol
 
-  alias Ferricstore.Stats
+  alias Ferricstore.Commands.PreparedCommand
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Connection.Send
-  alias FerricstoreServer.Native.{Blocking, Codec, Commands, Lane, Session}
-  alias FerricstoreServer.Native.Connection.{Chunks, FrameBuffer, Responses}
+
+  alias FerricstoreServer.Native.{
+    Admission,
+    Blocking,
+    Codec,
+    Commands,
+    Lane,
+    ResourceBudget,
+    Session
+  }
+
+  alias FerricstoreServer.Native.Connection.{Chunks, FrameBuffer, InboundBudget, Responses}
 
   @op_goaway 0x000A
   @op_command_exec 0x0100
@@ -32,6 +42,8 @@ defmodule FerricstoreServer.Native.Connection do
                              ),
                              @flag_more_chunks
                            )
+  @cleanup_state_key :native_connection_cleanup_state
+  @cleanup_done_key :native_connection_cleanup_done
 
   defstruct [
     :socket,
@@ -47,18 +59,30 @@ defmodule FerricstoreServer.Native.Connection do
     :lane_max_queue,
     :max_inflight_per_connection,
     :max_inflight_per_lane,
+    :max_queued_request_bytes_per_connection,
+    :max_queued_request_bytes_per_lane,
     :response_chunk_bytes,
     :max_pending_chunks,
     :max_pending_chunk_bytes,
+    :max_response_bytes,
     :response_coalesce_max,
     :response_coalesce_bytes,
     :command_state,
     :idle_timeout_ms,
+    :resource_budget,
+    :preauth_max_frame_bytes,
+    :frame_assembly_timeout_ms,
+    :frame_assembly_deadline_ms,
+    :chunk_assembly_deadline_ms,
+    :inbound_buffer_token,
     compression: :none,
     buffer: %FrameBuffer{},
     lanes: %{},
     chunk_buffers: %{},
     pending_chunk_bytes: 0,
+    decoded_retained_bytes: 0,
+    queued_request_bytes: 0,
+    lane_queued_request_bytes: %{},
     inflight_total: 0,
     lane_inflight: %{},
     event_subscriptions: MapSet.new(),
@@ -66,11 +90,19 @@ defmodule FerricstoreServer.Native.Connection do
     multi_state: :none,
     multi_queue: [],
     multi_queue_count: 0,
+    multi_queue_bytes: 0,
+    multi_queue_byte_limit: 32 * 1024 * 1024,
     multi_error: false,
     watched_keys: %{},
+    watched_key_bytes: 0,
+    watch_key_limit: 10_000,
+    watch_key_byte_limit: 16 * 1024 * 1024,
     sandbox_namespace: nil,
     pubsub_channels: nil,
     pubsub_patterns: nil,
+    pubsub_subscription_bytes: 0,
+    pubsub_subscription_token: nil,
+    max_pubsub_subscription_bytes: 16 * 1024 * 1024,
     blocked_requests: %{},
     authenticated: false,
     require_auth: false,
@@ -79,7 +111,6 @@ defmodule FerricstoreServer.Native.Connection do
     decode_pending: false,
     username: "default",
     acl_cache: nil,
-    active_mode: 100,
     close_after_reply: false
   ]
 
@@ -100,106 +131,183 @@ defmodule FerricstoreServer.Native.Connection do
         "ERR TLS required: plaintext connections are not permitted"
       )
 
-      transport.close(socket)
+      safe_close(transport, socket)
     else
-      active_mode = Application.get_env(:ferricstore, :socket_active_mode, 100)
+      case Admission.acquire() do
+        {:ok, token} ->
+          Process.delete(@cleanup_done_key)
+          Process.delete(@cleanup_state_key)
 
-      max_frame_bytes =
-        Map.get(opts, :max_frame_bytes) ||
-          Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024)
-
-      max_frame_bytes = FrameBuffer.validate_max_frame_bytes!(max_frame_bytes)
-
-      response_chunk_bytes =
-        Codec.effective_response_chunk_bytes(
-          Application.get_env(:ferricstore, :native_response_chunk_bytes, 0),
-          max_frame_bytes
-        )
-
-      :ok = transport.setopts(socket, active: active_mode)
-
-      Stats.incr_connections()
-
-      peer =
-        case transport.peername(socket) do
-          {:ok, addr} -> addr
-          _ -> nil
-        end
-
-      case FerricstoreServer.Acl.check_protected_mode(peer) do
-        {:error, reason} ->
-          send_native_error(socket, transport, reason)
-          Stats.decr_connections()
-          transport.close(socket)
-
-        :ok ->
-          if Responses.maxclients_exceeded?() do
-            send_native_error(socket, transport, "ERR max number of clients reached")
-            Stats.decr_connections()
-            transport.close(socket)
-          else
-            ctx = FerricStore.Instance.get(:default)
-
-            state =
-              %__MODULE__{
-                socket: socket,
-                transport: transport,
-                client_id: Responses.generate_client_id(),
-                client_name: nil,
-                created_at: System.monotonic_time(:millisecond),
-                peer: peer,
-                instance_ctx: ctx,
-                stats_counter: ctx.stats_counter,
-                require_auth: Commands.default_requires_auth?(),
-                acl_cache: FerricstoreServer.Connection.Auth.build_acl_cache("default"),
-                active_mode: active_mode,
-                max_frame_bytes: max_frame_bytes,
-                max_lanes:
-                  Map.get(opts, :max_lanes) ||
-                    Application.get_env(:ferricstore, :native_max_lanes_per_connection, 1024),
-                lane_max_queue:
-                  Map.get(opts, :lane_max_queue) ||
-                    Application.get_env(:ferricstore, :native_lane_max_queue, 1024),
-                max_inflight_per_connection:
-                  Application.get_env(:ferricstore, :native_max_inflight_per_connection, 4096),
-                max_inflight_per_lane:
-                  Application.get_env(:ferricstore, :native_max_inflight_per_lane, 1024),
-                response_chunk_bytes: response_chunk_bytes,
-                max_pending_chunks:
-                  Application.get_env(:ferricstore, :native_max_pending_chunks, 1024),
-                max_pending_chunk_bytes:
-                  Application.get_env(
-                    :ferricstore,
-                    :native_max_pending_chunk_bytes,
-                    64 * 1024 * 1024
-                  ),
-                response_coalesce_max:
-                  max(1, Application.get_env(:ferricstore, :native_response_coalesce_max, 64)),
-                response_coalesce_bytes:
-                  Application.get_env(
-                    :ferricstore,
-                    :native_response_coalesce_bytes,
-                    8 * 1024 * 1024
-                  ),
-                idle_timeout_ms:
-                  Application.get_env(:ferricstore, :native_idle_timeout_ms, 90_000)
-              }
-              |> refresh_command_state()
-
-            Responses.join_acl_invalidation_group()
-            ConnRegistry.register(state.client_id, self(), Commands.summary(state))
-            loop(state)
+          try do
+            initialize_connection(socket, transport, opts)
+          after
+            cleanup_latest_connection()
+            Admission.release(token)
+            safe_close(transport, socket)
           end
+
+        {:error, _reason} ->
+          send_native_error(socket, transport, "ERR max number of clients reached")
+          safe_close(transport, socket)
       end
     end
   end
 
-  def loop(%__MODULE__{socket: socket, transport: transport, active_mode: active_mode} = state) do
-    if active_mode == :once and not state.decode_paused do
+  defp initialize_connection(socket, transport, opts) do
+    max_frame_bytes =
+      Map.get(opts, :max_frame_bytes) ||
+        Application.get_env(:ferricstore, :native_max_frame_bytes, 16 * 1024 * 1024)
+
+    max_frame_bytes = FrameBuffer.validate_max_frame_bytes!(max_frame_bytes)
+
+    preauth_max_frame_bytes =
+      opts
+      |> Map.get(
+        :preauth_max_frame_bytes,
+        Application.get_env(:ferricstore, :native_unauthenticated_max_frame_bytes, 64 * 1024)
+      )
+      |> FrameBuffer.validate_max_frame_bytes!()
+      |> min(max_frame_bytes)
+
+    frame_assembly_timeout_ms =
+      positive_timeout!(
+        Application.get_env(:ferricstore, :native_frame_assembly_timeout_ms, 15_000),
+        :native_frame_assembly_timeout_ms
+      )
+
+    response_chunk_bytes =
+      Codec.effective_response_chunk_bytes(
+        Application.get_env(:ferricstore, :native_response_chunk_bytes, 0),
+        max_frame_bytes
+      )
+
+    :ok = transport.setopts(socket, active: :once)
+
+    peer =
+      case transport.peername(socket) do
+        {:ok, addr} -> addr
+        _ -> nil
+      end
+
+    case FerricstoreServer.Acl.check_protected_mode(peer) do
+      {:error, reason} ->
+        send_native_error(socket, transport, reason)
+
+      :ok ->
+        ctx = FerricStore.Instance.get(:default)
+
+        state =
+          %__MODULE__{
+            socket: socket,
+            transport: transport,
+            client_id: Responses.generate_client_id(),
+            client_name: nil,
+            created_at: System.monotonic_time(:millisecond),
+            peer: peer,
+            instance_ctx: ctx,
+            stats_counter: ctx.stats_counter,
+            require_auth: Commands.default_requires_auth?(),
+            acl_cache: FerricstoreServer.Connection.Auth.build_acl_cache("default"),
+            max_frame_bytes: max_frame_bytes,
+            resource_budget: Map.get(opts, :resource_budget, ResourceBudget),
+            preauth_max_frame_bytes: preauth_max_frame_bytes,
+            frame_assembly_timeout_ms: frame_assembly_timeout_ms,
+            multi_queue_byte_limit: min(max_frame_bytes * 2, 32 * 1024 * 1024),
+            watch_key_byte_limit: min(max_frame_bytes, 16 * 1024 * 1024),
+            max_pubsub_subscription_bytes:
+              positive_timeout!(
+                Map.get(opts, :max_pubsub_subscription_bytes) ||
+                  Application.get_env(
+                    :ferricstore,
+                    :native_max_pubsub_subscription_bytes_per_connection,
+                    16 * 1024 * 1024
+                  ),
+                :native_max_pubsub_subscription_bytes_per_connection
+              ),
+            max_lanes:
+              Map.get(opts, :max_lanes) ||
+                Application.get_env(:ferricstore, :native_max_lanes_per_connection, 1024),
+            lane_max_queue:
+              Map.get(opts, :lane_max_queue) ||
+                Application.get_env(:ferricstore, :native_lane_max_queue, 1024),
+            max_inflight_per_connection:
+              Application.get_env(:ferricstore, :native_max_inflight_per_connection, 4096),
+            max_inflight_per_lane:
+              Application.get_env(:ferricstore, :native_max_inflight_per_lane, 1024),
+            max_queued_request_bytes_per_connection:
+              positive_timeout!(
+                Map.get(opts, :max_queued_request_bytes_per_connection) ||
+                  Application.get_env(
+                    :ferricstore,
+                    :native_max_queued_request_bytes_per_connection,
+                    max(FrameBuffer.frame_bytes(max_frame_bytes), 64 * 1024 * 1024)
+                  ),
+                :native_max_queued_request_bytes_per_connection
+              ),
+            max_queued_request_bytes_per_lane:
+              positive_timeout!(
+                Map.get(opts, :max_queued_request_bytes_per_lane) ||
+                  Application.get_env(
+                    :ferricstore,
+                    :native_max_queued_request_bytes_per_lane,
+                    max(FrameBuffer.frame_bytes(max_frame_bytes), 32 * 1024 * 1024)
+                  ),
+                :native_max_queued_request_bytes_per_lane
+              ),
+            response_chunk_bytes: response_chunk_bytes,
+            max_pending_chunks:
+              Application.get_env(:ferricstore, :native_max_pending_chunks, 1024),
+            max_pending_chunk_bytes:
+              Application.get_env(
+                :ferricstore,
+                :native_max_pending_chunk_bytes,
+                64 * 1024 * 1024
+              ),
+            max_response_bytes:
+              positive_timeout!(
+                Application.get_env(
+                  :ferricstore,
+                  :native_max_response_bytes,
+                  64 * 1024 * 1024
+                ),
+                :native_max_response_bytes
+              ),
+            response_coalesce_max:
+              max(1, Application.get_env(:ferricstore, :native_response_coalesce_max, 64)),
+            response_coalesce_bytes:
+              Application.get_env(
+                :ferricstore,
+                :native_response_coalesce_bytes,
+                8 * 1024 * 1024
+              ),
+            idle_timeout_ms: Application.get_env(:ferricstore, :native_idle_timeout_ms, 90_000)
+          }
+          |> refresh_command_state()
+          |> remember_connection_state()
+
+        Responses.join_acl_invalidation_group()
+        ConnRegistry.register(state.client_id, self(), Commands.summary(state))
+        loop(state)
+    end
+  end
+
+  def loop(%__MODULE__{} = state) do
+    state = remember_connection_state(state)
+
+    if connection_deadline_expired?(state) do
+      cleanup_connection(state)
+      state.transport.close(state.socket)
+    else
+      receive_connection_messages(state)
+    end
+  end
+
+  defp receive_connection_messages(%__MODULE__{socket: socket, transport: transport} = state) do
+    if not state.decode_paused do
       transport.setopts(socket, active: :once)
     end
 
-    idle_timeout = idle_receive_timeout(state)
+    receive_timeout = connection_receive_timeout(state)
 
     receive do
       {:tcp, ^socket, data} ->
@@ -256,7 +364,8 @@ defmodule FerricstoreServer.Native.Connection do
       {:pubsub_message, channel, message} ->
         native_send(
           state,
-          Codec.encode_event(
+          Responses.encode_event(
+            state,
             Commands.event_opcode(),
             %{
               "event" => "PUBSUB_MESSAGE",
@@ -272,7 +381,8 @@ defmodule FerricstoreServer.Native.Connection do
       {:pubsub_pmessage, pattern, channel, message} ->
         native_send(
           state,
-          Codec.encode_event(
+          Responses.encode_event(
+            state,
             Commands.event_opcode(),
             %{
               "event" => "PUBSUB_MESSAGE",
@@ -285,52 +395,64 @@ defmodule FerricstoreServer.Native.Connection do
 
         loop(state)
 
-      {:native_blocking_response, meta, pid, status, value} ->
-        state = remove_blocked_request(state, pid)
+      {:native_blocking_response, _meta, pid, status, value} ->
+        case take_blocked_request(state, pid) do
+          {nil, state} ->
+            loop(state)
 
-        native_send(
-          state,
-          Responses.encode_response(
-            state,
-            meta.opcode,
-            meta.lane_id,
-            meta.request_id,
-            status,
-            value
-          ),
-          :response
-        )
+          {request, state} ->
+            Process.demonitor(request.monitor_ref, [:flush])
+            state = finish_inflight(state, request.lane_id)
+            maybe_send_blocking_response(state, request, status, value)
+            loop(state)
+        end
 
-        loop(state)
+      {:DOWN, monitor_ref, :process, pid, reason} ->
+        case Map.get(state.blocked_requests, pid) do
+          %{monitor_ref: ^monitor_ref} ->
+            {request, state} = take_blocked_request(state, pid)
+            state = finish_inflight(state, request.lane_id)
+
+            maybe_send_blocking_response(
+              state,
+              request,
+              :error,
+              "ERR native blocking command terminated: #{inspect(reason)}"
+            )
+
+            loop(state)
+
+          _missing_or_stale ->
+            loop(state)
+        end
+
+      {:acl_invalidate, username, revision} ->
+        _status = FerricstoreServer.Acl.CatalogProjector.require_revision(revision)
+        handle_acl_invalidation(state, username)
 
       {:acl_invalidate, username} ->
-        refreshed_state =
-          FerricstoreServer.Connection.Auth.maybe_refresh_acl_cache(state, username)
+        handle_acl_invalidation(state, username)
 
-        ConnRegistry.update(refreshed_state.client_id, self(), Commands.summary(refreshed_state))
-
-        if Responses.acl_invalidation_affects_session?(state, username) do
-          maybe_send_event(refreshed_state, "AUTH_INVALIDATED", %{
-            username: Responses.invalidated_username(username),
-            session_username: refreshed_state.username,
-            authenticated: refreshed_state.authenticated,
-            reconnect: true
-          })
-
-          cleanup_connection(refreshed_state)
-          transport.close(socket)
-        else
-          loop(refreshed_state)
-        end
+      {:native_lane_response, lane_id, iodata, request_bytes} ->
+        loop(send_lane_responses(state, lane_id, iodata, 1, request_bytes))
 
       {:native_lane_response, lane_id, iodata} ->
         loop(send_lane_responses(state, lane_id, iodata))
 
+      {:native_lane_responses, lane_id, iodata_list, done_count, request_bytes} ->
+        loop(send_lane_responses(state, lane_id, iodata_list, done_count, request_bytes))
+
       {:native_lane_responses, lane_id, iodata_list, done_count} ->
         loop(send_lane_responses(state, lane_id, iodata_list, done_count))
 
+      {:native_lane_done, lane_id, request_bytes} ->
+        loop(finish_inflight(state, lane_id, 1, request_bytes))
+
       {:native_lane_done, lane_id} ->
         loop(finish_inflight(state, lane_id))
+
+      {:native_lane_done_many, lane_id, done_count, request_bytes} ->
+        loop(finish_inflight(state, lane_id, done_count, request_bytes))
 
       {:native_lane_done_many, lane_id, done_count} ->
         loop(finish_inflight(state, lane_id, done_count))
@@ -338,11 +460,14 @@ defmodule FerricstoreServer.Native.Connection do
       _other ->
         loop(state)
     after
-      idle_timeout ->
+      receive_timeout ->
         cleanup_connection(state)
         transport.close(socket)
     end
   end
+
+  defp idle_receive_timeout(%__MODULE__{inflight_total: inflight}) when inflight > 0,
+    do: :infinity
 
   defp idle_receive_timeout(%__MODULE__{idle_timeout_ms: timeout})
        when is_integer(timeout) and timeout > 0,
@@ -350,18 +475,80 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp idle_receive_timeout(_state), do: :infinity
 
+  defp connection_receive_timeout(state) do
+    state
+    |> frame_assembly_timeout()
+    |> min_timeout(chunk_assembly_timeout(state))
+    |> min_timeout(idle_receive_timeout(state))
+  end
+
+  defp frame_assembly_timeout(%{frame_assembly_deadline_ms: deadline})
+       when is_integer(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
+  end
+
+  defp frame_assembly_timeout(_state), do: :infinity
+
+  defp chunk_assembly_timeout(%{chunk_assembly_deadline_ms: deadline})
+       when is_integer(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
+  end
+
+  defp chunk_assembly_timeout(_state), do: :infinity
+
+  defp connection_deadline_expired?(state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    deadline_expired?(state.frame_assembly_deadline_ms, now_ms) or
+      deadline_expired?(state.chunk_assembly_deadline_ms, now_ms)
+  end
+
+  defp deadline_expired?(deadline, now_ms) when is_integer(deadline), do: deadline <= now_ms
+  defp deadline_expired?(_deadline, _now_ms), do: false
+
+  defp min_timeout(:infinity, timeout), do: timeout
+  defp min_timeout(timeout, :infinity), do: timeout
+  defp min_timeout(left, right), do: min(left, right)
+
+  defp handle_acl_invalidation(state, username) do
+    refreshed_state =
+      FerricstoreServer.Connection.Auth.maybe_refresh_acl_cache(state, username)
+
+    ConnRegistry.update(refreshed_state.client_id, self(), Commands.summary(refreshed_state))
+
+    if Responses.acl_invalidation_affects_session?(state, username) do
+      maybe_send_event(refreshed_state, "AUTH_INVALIDATED", %{
+        username: Responses.invalidated_username(username),
+        session_username: refreshed_state.username,
+        authenticated: refreshed_state.authenticated,
+        reconnect: true
+      })
+
+      cleanup_connection(refreshed_state)
+      state.transport.close(state.socket)
+    else
+      loop(refreshed_state)
+    end
+  end
+
   defp handle_data(state, data) do
     case FrameBuffer.append(
            state.buffer,
            data,
            state.max_frame_bytes,
-           FrameBuffer.max_buffer_bytes()
+           inbound_buffer_limit(state)
          ) do
       {:incomplete, buffer} ->
-        loop(%{state | buffer: buffer})
+        case put_inbound_buffer(state, buffer) do
+          {:ok, state} -> loop(state)
+          {:error, _reason} -> close_for_inbound_budget(state)
+        end
 
       {:ready, buffer} ->
-        decode_buffer(%{state | buffer: buffer})
+        case put_inbound_buffer(state, buffer) do
+          {:ok, state} -> decode_buffer(state)
+          {:error, _reason} -> close_for_inbound_budget(state)
+        end
 
       {:error, :buffer_limit} ->
         send_native_error(
@@ -382,24 +569,29 @@ defmodule FerricstoreServer.Native.Connection do
     case Codec.decode_frames(buffer, state.max_frame_bytes) do
       {:ok, frames, rest, continuation} ->
         decode_us = monotonic_us() - decode_started_us
+        next_buffer = FrameBuffer.from_binary(rest, state.max_frame_bytes)
+        decoded_bytes = Enum.reduce(frames, 0, &(frame_memory_bytes(&1) + &2))
+        state = %{state | decoded_retained_bytes: state.decoded_retained_bytes + decoded_bytes}
 
-        state =
-          state
-          |> Map.put(:buffer, FrameBuffer.from_binary(rest, state.max_frame_bytes))
-          |> update_decode_backpressure(continuation)
+        case put_inbound_buffer(state, next_buffer) do
+          {:error, _reason} ->
+            close_for_inbound_budget(state)
 
-        {responses, state} = dispatch_frames(frames, state, [], decode_us)
+          {:ok, state} ->
+            state = update_decode_backpressure(state, continuation)
+            {responses, state} = dispatch_frames(frames, state, [], decode_us)
 
-        case responses do
-          [] -> :ok
-          _ -> native_send(state, Enum.reverse(responses), :response)
-        end
+            case responses do
+              [] -> :ok
+              _ -> native_send(state, Enum.reverse(responses), :response)
+            end
 
-        if state.close_after_reply do
-          cleanup_connection(state)
-          state.transport.close(state.socket)
-        else
-          loop(state)
+            if state.close_after_reply do
+              cleanup_connection(state)
+              state.transport.close(state.socket)
+            else
+              loop(state)
+            end
         end
 
       {:error, reason} ->
@@ -430,19 +622,84 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp resume_input(%{decode_paused: false} = state), do: state
-
-  defp resume_input(%{active_mode: :once} = state), do: %{state | decode_paused: false}
-
-  defp resume_input(state) do
-    state.transport.setopts(state.socket, active: state.active_mode)
-    %{state | decode_paused: false}
-  end
+  defp resume_input(state), do: %{state | decode_paused: false}
 
   defp maybe_reactivate_input(%{decode_paused: true} = state), do: state
+  defp maybe_reactivate_input(state), do: state
 
-  defp maybe_reactivate_input(state) do
-    state.transport.setopts(state.socket, active: state.active_mode)
-    state
+  defp inbound_buffer_limit(%{require_auth: true, authenticated: false} = state) do
+    min(FrameBuffer.max_buffer_bytes(), FrameBuffer.frame_bytes(state.preauth_max_frame_bytes))
+  end
+
+  defp inbound_buffer_limit(_state), do: FrameBuffer.max_buffer_bytes()
+
+  defp put_inbound_buffer(state, buffer) do
+    stats = FrameBuffer.stats(buffer)
+    deadline = next_frame_assembly_deadline(state, stats)
+    state = %{state | buffer: buffer, frame_assembly_deadline_ms: deadline}
+
+    case InboundBudget.resize(
+           state.resource_budget,
+           state.inbound_buffer_token,
+           retained_inbound_bytes(state, stats)
+         ) do
+      {:ok, token} ->
+        {:ok, %{state | inbound_buffer_token: token}}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp resize_inbound_accounting(state) do
+    stats = FrameBuffer.stats(state.buffer)
+
+    case InboundBudget.resize(
+           state.resource_budget,
+           state.inbound_buffer_token,
+           retained_inbound_bytes(state, stats)
+         ) do
+      {:ok, token} -> {:ok, %{state | inbound_buffer_token: token}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp retained_inbound_bytes(state, buffer_stats) do
+    buffer_stats.buffered_bytes + state.decoded_retained_bytes + state.queued_request_bytes
+  end
+
+  defp discard_decoded_frame(state, decoded_bytes) do
+    state = %{
+      state
+      | decoded_retained_bytes: max(state.decoded_retained_bytes - decoded_bytes, 0)
+    }
+
+    case resize_inbound_accounting(state) do
+      {:ok, state} -> state
+      {:error, _reason} -> state
+    end
+  end
+
+  defp next_frame_assembly_deadline(_state, %{buffered_bytes: 0}), do: nil
+  defp next_frame_assembly_deadline(_state, %{complete?: true}), do: nil
+
+  defp next_frame_assembly_deadline(%{frame_assembly_deadline_ms: deadline}, _stats)
+       when is_integer(deadline),
+       do: deadline
+
+  defp next_frame_assembly_deadline(state, _stats) do
+    System.monotonic_time(:millisecond) + state.frame_assembly_timeout_ms
+  end
+
+  defp close_for_inbound_budget(state) do
+    send_native_error(
+      state.socket,
+      state.transport,
+      "ERR native global inbound buffer limit exceeded"
+    )
+
+    cleanup_connection(state)
+    state.transport.close(state.socket)
   end
 
   defp dispatch_frames(frames, state, responses, decode_us) do
@@ -454,8 +711,10 @@ defmodule FerricstoreServer.Native.Connection do
     {responses, state}
   end
 
-  defp dispatch_frames([frame | rest], state, responses, decode_us, lane_batches) do
-    case prepare_frame(frame, state) do
+  defp dispatch_frames([raw_frame | rest], state, responses, decode_us, lane_batches) do
+    decoded_bytes = frame_memory_bytes(raw_frame)
+
+    case prepare_frame(raw_frame, state) do
       {:ok, frame, state} ->
         cond do
           state.multi_state == :queuing and opcode(frame) != @op_command_exec ->
@@ -469,15 +728,35 @@ defmodule FerricstoreServer.Native.Connection do
                 "ERR native MULTI requires COMMAND_EXEC frames until EXEC or DISCARD"
               )
 
-            dispatch_frames(rest, state, [response | responses], decode_us, lane_batches)
+            dispatch_frames(
+              rest,
+              discard_decoded_frame(state, decoded_bytes),
+              maybe_prepend_response(frame, response, responses),
+              decode_us,
+              lane_batches
+            )
 
           Commands.control_opcode?(opcode(frame)) ->
             flush_lane_batches(lane_batches)
-            dispatch_control_frame(frame, rest, state, responses, decode_us)
+
+            dispatch_control_frame(
+              frame,
+              rest,
+              discard_decoded_frame(state, decoded_bytes),
+              responses,
+              decode_us
+            )
 
           native_session_frame?(frame, state) ->
             flush_lane_batches(lane_batches)
-            dispatch_native_session_frame(frame, rest, state, responses, decode_us)
+
+            dispatch_native_session_frame(
+              frame,
+              rest,
+              discard_decoded_frame(state, decoded_bytes),
+              responses,
+              decode_us
+            )
 
           lane_id(frame) == @control_lane ->
             response =
@@ -490,27 +769,53 @@ defmodule FerricstoreServer.Native.Connection do
                 "ERR native data commands cannot use control lane 0"
               )
 
-            dispatch_frames(rest, state, [response | responses], decode_us, lane_batches)
+            dispatch_frames(
+              rest,
+              discard_decoded_frame(state, decoded_bytes),
+              maybe_prepend_response(frame, response, responses),
+              decode_us,
+              lane_batches
+            )
 
           true ->
-            dispatch_data_frame(frame, rest, state, responses, decode_us, lane_batches)
+            dispatch_data_frame(
+              frame,
+              rest,
+              state,
+              responses,
+              decode_us,
+              decoded_bytes,
+              lane_batches
+            )
         end
 
       {:error, reason, state} ->
         response =
           Responses.encode_response(
             state,
-            opcode(frame),
-            lane_id(frame),
-            request_id(frame),
+            opcode(raw_frame),
+            lane_id(raw_frame),
+            request_id(raw_frame),
             :bad_request,
             reason
           )
 
-        dispatch_frames(rest, state, [response | responses], decode_us, lane_batches)
+        dispatch_frames(
+          rest,
+          discard_decoded_frame(state, decoded_bytes),
+          maybe_prepend_response(raw_frame, response, responses),
+          decode_us,
+          lane_batches
+        )
 
       {:pending, state} ->
-        dispatch_frames(rest, state, responses, decode_us, lane_batches)
+        dispatch_frames(
+          rest,
+          discard_decoded_frame(state, decoded_bytes),
+          responses,
+          decode_us,
+          lane_batches
+        )
     end
   end
 
@@ -580,7 +885,11 @@ defmodule FerricstoreServer.Native.Connection do
                 value
               )
 
-            dispatch_frames(rest, state, [response | responses], decode_us)
+            if no_reply?(frame) do
+              dispatch_frames(rest, state, responses, decode_us)
+            else
+              dispatch_frames(rest, state, [response | responses], decode_us)
+            end
 
           {:blocked, state} ->
             state = refresh_command_state_and_lanes(state)
@@ -598,7 +907,11 @@ defmodule FerricstoreServer.Native.Connection do
             reason
           )
 
-        dispatch_frames(rest, state, [response | responses], decode_us)
+        if no_reply?(frame) do
+          dispatch_frames(rest, state, responses, decode_us)
+        else
+          dispatch_frames(rest, state, [response | responses], decode_us)
+        end
     end
   end
 
@@ -607,26 +920,33 @@ defmodule FerricstoreServer.Native.Connection do
       {:ok, prepared} ->
         cond do
           state.multi_state == :queuing ->
-            {status, value, state} = Session.execute_prepared(prepared, state)
+            {status, value, state} = execute_native_session_prepared(prepared, state)
             {:reply, status, value, state}
 
           Blocking.blocking_command?(prepared.command) ->
-            meta = %{
-              opcode: opcode(frame),
-              lane_id: lane_id(frame),
-              request_id: request_id(frame)
-            }
+            case reserve_inflight(state, lane_id(frame)) do
+              {:ok, state} ->
+                meta = %{
+                  opcode: opcode(frame),
+                  lane_id: lane_id(frame),
+                  request_id: request_id(frame),
+                  no_reply: no_reply?(frame)
+                }
 
-            case Blocking.start_prepared(prepared, state, meta) do
-              {:ok, pid} ->
-                {:blocked, put_blocked_request(state, pid, meta)}
+                case Blocking.start_prepared(prepared, state, meta) do
+                  {:ok, pid, monitor_ref} ->
+                    {:blocked, put_blocked_request(state, pid, monitor_ref, meta)}
 
-              {:error, status, reason} ->
-                {:reply, status, reason, state}
+                  {:error, status, reason} ->
+                    {:reply, status, reason, finish_inflight(state, lane_id(frame))}
+                end
+
+              {:error, reason} ->
+                {:reply, :busy, reason, state}
             end
 
           Session.session_command?(prepared.command) ->
-            {status, value, state} = Session.execute_prepared(prepared, state)
+            {status, value, state} = execute_native_session_prepared(prepared, state)
             {:reply, status, value, state}
 
           true ->
@@ -640,14 +960,44 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp no_reply?(frame), do: Bitwise.band(flags(frame), @flag_no_reply) != 0
 
+  defp execute_native_session_prepared(
+         %PreparedCommand{command: command} = prepared,
+         state
+       )
+       when command in ["EXEC", "WATCH"] do
+    budget = state.resource_budget
+
+    case ResourceBudget.acquire(budget, :executions, self(), 1) do
+      {:ok, token} ->
+        try do
+          Session.execute_prepared(prepared, state)
+        after
+          ResourceBudget.release_async(budget, token)
+        end
+
+      {:error, {:limit, :executions}} ->
+        {:busy, "ERR native global execution limit exceeded", state}
+
+      {:error, _reason} ->
+        {:busy, "ERR native resource budget unavailable", state}
+    end
+  end
+
+  defp execute_native_session_prepared(%PreparedCommand{} = prepared, state),
+    do: Session.execute_prepared(prepared, state)
+
+  defp maybe_prepend_response(frame, response, responses) do
+    if no_reply?(frame), do: responses, else: [response | responses]
+  end
+
   defp native_session_frame?(frame, state) do
     opcode(frame) == @op_command_exec and
       (state.multi_state == :queuing or native_session_payload?(frame))
   end
 
   defp native_session_payload?(frame) do
-    case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
-      {:ok, %{"command" => command}} when is_binary(command) ->
+    case Codec.peek_command_name(flags(frame), body(frame)) do
+      {:ok, command} ->
         command = String.upcase(command)
         Blocking.blocking_command?(command) or Session.session_command?(command)
 
@@ -656,7 +1006,15 @@ defmodule FerricstoreServer.Native.Connection do
     end
   end
 
-  defp dispatch_data_frame(frame, rest, state, responses, decode_us, lane_batches) do
+  defp dispatch_data_frame(
+         frame,
+         rest,
+         state,
+         responses,
+         decode_us,
+         decoded_bytes,
+         lane_batches
+       ) do
     route_started_us = trace_started_us(frame)
 
     case reserve_inflight(state, lane_id(frame)) do
@@ -671,7 +1029,13 @@ defmodule FerricstoreServer.Native.Connection do
             reason
           )
 
-        dispatch_frames(rest, state, [response | responses], decode_us, lane_batches)
+        dispatch_frames(
+          rest,
+          discard_decoded_frame(state, decoded_bytes),
+          maybe_prepend_response(frame, response, responses),
+          decode_us,
+          lane_batches
+        )
 
       {:ok, state} ->
         dispatch_data_frame_reserved(
@@ -681,6 +1045,7 @@ defmodule FerricstoreServer.Native.Connection do
           responses,
           decode_us,
           route_started_us,
+          decoded_bytes,
           lane_batches
         )
     end
@@ -693,6 +1058,7 @@ defmodule FerricstoreServer.Native.Connection do
          responses,
          decode_us,
          route_started_us,
+         decoded_bytes,
          lane_batches
        ) do
     case ensure_lane(state, lane_id(frame)) do
@@ -716,21 +1082,50 @@ defmodule FerricstoreServer.Native.Connection do
 
           dispatch_frames(
             rest,
-            finish_inflight(state, lane_id(frame)),
-            [response | responses],
+            state
+            |> discard_decoded_frame(decoded_bytes)
+            |> finish_inflight(lane_id(frame)),
+            maybe_prepend_response(frame, response, responses),
             decode_us,
             lane_batches
           )
         else
-          lane_batches =
-            add_lane_batch(
-              lane_batches,
-              lane_id(frame),
-              lane_pid,
-              maybe_trace_frame(frame, decode_us, route_started_us)
-            )
+          case reserve_queued_request(state, frame, decoded_bytes) do
+            {:ok, state, request_bytes} ->
+              accounted_frame =
+                frame
+                |> maybe_trace_frame(decode_us, route_started_us)
+                |> Lane.account_frame(request_bytes)
 
-          dispatch_frames(rest, state, responses, decode_us, lane_batches)
+              lane_batches =
+                add_lane_batch(
+                  lane_batches,
+                  lane_id(frame),
+                  lane_pid,
+                  accounted_frame
+                )
+
+              dispatch_frames(rest, state, responses, decode_us, lane_batches)
+
+            {:error, reason, state} ->
+              response =
+                Responses.encode_response(
+                  state,
+                  opcode(frame),
+                  lane_id(frame),
+                  request_id(frame),
+                  :busy,
+                  reason
+                )
+
+              dispatch_frames(
+                rest,
+                finish_inflight(state, lane_id(frame)),
+                maybe_prepend_response(frame, response, responses),
+                decode_us,
+                lane_batches
+              )
+          end
         end
 
       {:error, reason} ->
@@ -746,8 +1141,10 @@ defmodule FerricstoreServer.Native.Connection do
 
         dispatch_frames(
           rest,
-          finish_inflight(state, lane_id(frame)),
-          [response | responses],
+          state
+          |> discard_decoded_frame(decoded_bytes)
+          |> finish_inflight(lane_id(frame)),
+          maybe_prepend_response(frame, response, responses),
           decode_us,
           lane_batches
         )
@@ -764,6 +1161,65 @@ defmodule FerricstoreServer.Native.Connection do
     Enum.each(lane_batches, fn {_lane_id, {lane_pid, frames}} ->
       Lane.enqueue_many(lane_pid, Enum.reverse(frames))
     end)
+  end
+
+  defp reserve_queued_request(state, frame, decoded_bytes) do
+    request_bytes = frame_memory_bytes(frame)
+    lane_id = lane_id(frame)
+    lane_bytes = Map.get(state.lane_queued_request_bytes, lane_id, 0)
+
+    cond do
+      state.queued_request_bytes + request_bytes >
+          state.max_queued_request_bytes_per_connection ->
+        {:error, queued_request_limit_error(:connection, lane_id),
+         discard_decoded_frame(state, decoded_bytes)}
+
+      lane_bytes + request_bytes > state.max_queued_request_bytes_per_lane ->
+        {:error, queued_request_limit_error(:lane, lane_id),
+         discard_decoded_frame(state, decoded_bytes)}
+
+      true ->
+        next_state = %{
+          state
+          | decoded_retained_bytes: max(state.decoded_retained_bytes - decoded_bytes, 0),
+            queued_request_bytes: state.queued_request_bytes + request_bytes,
+            lane_queued_request_bytes:
+              Map.put(state.lane_queued_request_bytes, lane_id, lane_bytes + request_bytes)
+        }
+
+        case resize_inbound_accounting(next_state) do
+          {:ok, next_state} ->
+            {:ok, next_state, request_bytes}
+
+          {:error, _reason} ->
+            {:error, queued_request_limit_error(:server, lane_id),
+             discard_decoded_frame(state, decoded_bytes)}
+        end
+    end
+  end
+
+  defp queued_request_limit_error(scope, lane_id) do
+    {code, message, retry_after_ms} =
+      case scope do
+        :connection ->
+          {"queued_request_bytes_exceeded",
+           "ERR native connection queued request byte limit exceeded", 10}
+
+        :lane ->
+          {"queued_request_bytes_exceeded", "ERR native lane queued request byte limit exceeded",
+           10}
+
+        :server ->
+          {"global_inbound_bytes_exceeded", "ERR native global inbound byte limit exceeded", 10}
+      end
+
+    %{
+      "code" => code,
+      "message" => message,
+      "scope" => Atom.to_string(scope),
+      "lane_id" => lane_id,
+      "retry_after_ms" => retry_after_ms
+    }
   end
 
   defp prepare_frame(frame, state) do
@@ -804,26 +1260,76 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp cleanup_connection(state) do
-    Session.cleanup_pubsub(state)
-    Ferricstore.Flow.ClaimWaiters.cleanup(self())
-    Ferricstore.Commands.Stream.cleanup_stream_waiters(self())
-    Enum.each(state.blocked_requests, fn {_pid, %{pid: pid}} -> Process.exit(pid, :shutdown) end)
-    Enum.each(state.lanes, fn {_lane_id, pid} -> Lane.stop(pid) end)
-    ConnRegistry.unregister(state.client_id, self())
-    Stats.decr_connections()
+    unless Process.get(@cleanup_done_key, false) do
+      Process.put(@cleanup_done_key, true)
+      Session.cleanup_pubsub(state)
+      Ferricstore.Flow.ClaimWaiters.cleanup(self())
+      Ferricstore.Commands.Stream.cleanup_stream_waiters(self())
+      InboundBudget.release(state.resource_budget, state.inbound_buffer_token)
+
+      Enum.each(state.blocked_requests, fn {_pid, %{pid: pid}} ->
+        Process.exit(pid, :shutdown)
+      end)
+
+      Enum.each(state.lanes, fn {_lane_id, pid} -> Lane.stop(pid) end)
+      ConnRegistry.unregister(state.client_id, self())
+    end
+
     :ok
   end
 
-  defp put_blocked_request(state, pid, meta) do
-    put_in(state.blocked_requests[pid], Map.put(meta, :pid, pid))
+  defp cleanup_latest_connection do
+    case Process.get(@cleanup_state_key) do
+      %__MODULE__{} = state -> cleanup_connection(state)
+      _missing -> :ok
+    end
   end
 
-  defp remove_blocked_request(state, pid) do
-    %{state | blocked_requests: Map.delete(state.blocked_requests, pid)}
+  defp remember_connection_state(%__MODULE__{} = state) do
+    Process.put(@cleanup_state_key, state)
+    state
+  end
+
+  defp put_blocked_request(state, pid, monitor_ref, meta) do
+    request = meta |> Map.put(:pid, pid) |> Map.put(:monitor_ref, monitor_ref)
+
+    state
+    |> put_in([Access.key(:blocked_requests), pid], request)
+    |> remember_connection_state()
+  end
+
+  defp take_blocked_request(state, pid) do
+    {request, blocked_requests} = Map.pop(state.blocked_requests, pid)
+    {request, %{state | blocked_requests: blocked_requests}}
+  end
+
+  defp maybe_send_blocking_response(_state, %{no_reply: true}, _status, _value), do: :ok
+
+  defp maybe_send_blocking_response(state, request, status, value) do
+    native_send(
+      state,
+      Responses.encode_response(
+        state,
+        request.opcode,
+        request.lane_id,
+        request.request_id,
+        status,
+        value
+      ),
+      :response
+    )
   end
 
   defp send_native_error(socket, transport, reason) do
     native_send(socket, transport, Codec.encode_response(0, 0, 0, :error, reason), :error)
+  end
+
+  defp safe_close(transport, socket) do
+    transport.close(socket)
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
   end
 
   defp native_send(%__MODULE__{} = state, iodata, phase) do
@@ -839,6 +1345,7 @@ defmodule FerricstoreServer.Native.Connection do
   defp request_id({_lane_id, _opcode, request_id, _flags, _body}), do: request_id
   defp flags({_lane_id, _opcode, _request_id, flags, _body}), do: flags
   defp body({_lane_id, _opcode, _request_id, _flags, body}), do: body
+  defp frame_memory_bytes(frame), do: FrameBuffer.frame_bytes(byte_size(body(frame)))
 
   defp trace?(frame), do: Bitwise.band(flags(frame), @flag_trace) != 0
 
@@ -864,6 +1371,12 @@ defmodule FerricstoreServer.Native.Connection do
 
   defp monotonic_us, do: System.monotonic_time(:microsecond)
 
+  defp positive_timeout!(timeout, _name) when is_integer(timeout) and timeout > 0, do: timeout
+
+  defp positive_timeout!(timeout, name) do
+    raise ArgumentError, "#{name} must be a positive integer, got: #{inspect(timeout)}"
+  end
+
   defp ensure_lane(state, lane_id) do
     case Map.fetch(state.lanes, lane_id) do
       {:ok, pid} ->
@@ -879,8 +1392,29 @@ defmodule FerricstoreServer.Native.Connection do
          }}
 
       :error ->
-        {:ok, pid} = Lane.start_link(self(), lane_id, state.command_state)
-        {:ok, pid, %{state | lanes: Map.put(state.lanes, lane_id, pid)}}
+        case Lane.start_link(self(), lane_id, state.command_state) do
+          {:ok, pid} ->
+            state = %{state | lanes: Map.put(state.lanes, lane_id, pid)}
+            {:ok, pid, remember_connection_state(state)}
+
+          {:error, {:limit, :lanes}} ->
+            {:error,
+             %{
+               "code" => "global_lane_limit_exceeded",
+               "message" => "ERR native global lane limit exceeded",
+               "scope" => "server",
+               "retry_after_ms" => 10
+             }}
+
+          {:error, _reason} ->
+            {:error,
+             %{
+               "code" => "resource_budget_unavailable",
+               "message" => "ERR native resource budget unavailable",
+               "scope" => "server",
+               "retry_after_ms" => 10
+             }}
+        end
     end
   end
 
@@ -919,15 +1453,25 @@ defmodule FerricstoreServer.Native.Connection do
       multi_state: state.multi_state,
       multi_queue: state.multi_queue,
       multi_queue_count: state.multi_queue_count,
+      multi_queue_bytes: state.multi_queue_bytes,
+      multi_queue_byte_limit: state.multi_queue_byte_limit,
       multi_error: state.multi_error,
       watched_keys: state.watched_keys,
+      watched_key_bytes: state.watched_key_bytes,
+      watch_key_limit: state.watch_key_limit,
+      watch_key_byte_limit: state.watch_key_byte_limit,
       sandbox_namespace: state.sandbox_namespace,
       pubsub_channels: state.pubsub_channels,
       pubsub_patterns: state.pubsub_patterns,
+      pubsub_subscription_bytes: state.pubsub_subscription_bytes,
+      pubsub_subscription_token: state.pubsub_subscription_token,
+      max_pubsub_subscription_bytes: state.max_pubsub_subscription_bytes,
       compression: state.compression,
       compact_flow_responses: state.compact_flow_responses,
       max_frame_bytes: state.max_frame_bytes,
       response_chunk_bytes: state.response_chunk_bytes,
+      max_response_bytes: state.max_response_bytes,
+      resource_budget: state.resource_budget,
       close_after_reply: false
     }
 
@@ -968,8 +1512,9 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp finish_inflight(state, lane_id), do: finish_inflight(state, lane_id, 1)
+  defp finish_inflight(state, lane_id, count), do: finish_inflight(state, lane_id, count, 0)
 
-  defp finish_inflight(state, lane_id, count) do
+  defp finish_inflight(state, lane_id, count, request_bytes) do
     lane_count = max(Map.get(state.lane_inflight, lane_id, 0) - count, 0)
 
     lane_inflight =
@@ -977,18 +1522,55 @@ defmodule FerricstoreServer.Native.Connection do
         do: Map.delete(state.lane_inflight, lane_id),
         else: Map.put(state.lane_inflight, lane_id, lane_count)
 
-    %{state | inflight_total: max(state.inflight_total - count, 0), lane_inflight: lane_inflight}
+    state = %{
+      state
+      | inflight_total: max(state.inflight_total - count, 0),
+        lane_inflight: lane_inflight
+    }
+
+    release_queued_request_bytes(state, lane_id, request_bytes)
+  end
+
+  defp release_queued_request_bytes(state, _lane_id, 0), do: state
+
+  defp release_queued_request_bytes(state, lane_id, request_bytes)
+       when is_integer(request_bytes) and request_bytes > 0 do
+    lane_bytes = Map.get(state.lane_queued_request_bytes, lane_id, 0)
+    released_bytes = min(request_bytes, lane_bytes)
+    remaining_lane_bytes = lane_bytes - released_bytes
+
+    lane_queued_request_bytes =
+      if remaining_lane_bytes == 0 do
+        Map.delete(state.lane_queued_request_bytes, lane_id)
+      else
+        Map.put(state.lane_queued_request_bytes, lane_id, remaining_lane_bytes)
+      end
+
+    state = %{
+      state
+      | queued_request_bytes: max(state.queued_request_bytes - released_bytes, 0),
+        lane_queued_request_bytes: lane_queued_request_bytes
+    }
+
+    case resize_inbound_accounting(state) do
+      {:ok, state} -> state
+      {:error, _reason} -> state
+    end
   end
 
   defp maybe_send_event(state, event, payload) do
     if MapSet.member?(state.event_subscriptions, event) do
       native_send(
         state,
-        Codec.encode_event(Commands.event_opcode(), %{
-          event: event,
-          payload: payload,
-          at_ms: System.system_time(:millisecond)
-        }),
+        Responses.encode_event(
+          state,
+          Commands.event_opcode(),
+          %{
+            event: event,
+            payload: payload,
+            at_ms: System.system_time(:millisecond)
+          }
+        ),
         :event
       )
     end
@@ -997,11 +1579,15 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp send_lane_responses(state, lane_id, iodata) do
-    send_lane_responses(state, lane_id, [iodata], 1)
+    send_lane_responses(state, lane_id, [iodata], 1, 0)
   end
 
   defp send_lane_responses(state, lane_id, iodata_list, done_count) do
-    state = finish_inflight(state, lane_id, done_count)
+    send_lane_responses(state, lane_id, iodata_list, done_count, 0)
+  end
+
+  defp send_lane_responses(state, lane_id, iodata_list, done_count, request_bytes) do
+    state = finish_inflight(state, lane_id, done_count, request_bytes)
     responses = Enum.reverse(iodata_list)
 
     {state, responses} =
@@ -1026,6 +1612,16 @@ defmodule FerricstoreServer.Native.Connection do
 
       true ->
         receive do
+          {:native_lane_response, lane_id, iodata, request_bytes} ->
+            state = finish_inflight(state, lane_id, 1, request_bytes)
+
+            collect_ready_lane_responses(
+              state,
+              [iodata | acc],
+              scanned + 1,
+              Responses.coalesce_add_iodata_size(state, bytes, iodata)
+            )
+
           {:native_lane_response, lane_id, iodata} ->
             state = finish_inflight(state, lane_id)
 
@@ -1034,6 +1630,16 @@ defmodule FerricstoreServer.Native.Connection do
               [iodata | acc],
               scanned + 1,
               Responses.coalesce_add_iodata_size(state, bytes, iodata)
+            )
+
+          {:native_lane_responses, lane_id, iodata_list, done_count, request_bytes} ->
+            state = finish_inflight(state, lane_id, done_count, request_bytes)
+
+            collect_ready_lane_responses(
+              state,
+              Enum.reverse(iodata_list) ++ acc,
+              scanned + done_count,
+              Responses.coalesce_add_iodata_size(state, bytes, iodata_list)
             )
 
           {:native_lane_responses, lane_id, iodata_list, done_count} ->
@@ -1046,9 +1652,17 @@ defmodule FerricstoreServer.Native.Connection do
               Responses.coalesce_add_iodata_size(state, bytes, iodata_list)
             )
 
+          {:native_lane_done, lane_id, request_bytes} ->
+            state = finish_inflight(state, lane_id, 1, request_bytes)
+            collect_ready_lane_responses(state, acc, scanned + 1, bytes)
+
           {:native_lane_done, lane_id} ->
             state = finish_inflight(state, lane_id)
             collect_ready_lane_responses(state, acc, scanned + 1, bytes)
+
+          {:native_lane_done_many, lane_id, done_count, request_bytes} ->
+            state = finish_inflight(state, lane_id, done_count, request_bytes)
+            collect_ready_lane_responses(state, acc, scanned + done_count, bytes)
 
           {:native_lane_done_many, lane_id, done_count} ->
             state = finish_inflight(state, lane_id, done_count)

@@ -454,7 +454,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
             copy_dir(source, dest)
 
           {:ok, %{type: :regular}} ->
-            case File.cp(source, dest) do
+            case Ferricstore.FS.copy_sync_nofollow(source, dest) do
               :ok -> :ok
               {:error, reason} -> {:error, {:copy_file, source, reason}}
             end

@@ -105,7 +105,11 @@ defmodule Ferricstore.Merge.Scheduler do
     # File IDs flagged by the shard as having high fragmentation.
     fragmentation_candidates: [],
     # Timer ref for retry after semaphore busy. Prevents stacking retries.
-    retry_ref: nil
+    retry_ref: nil,
+    # Compaction runs outside the scheduler mailbox. The scheduler retains
+    # completion accounting while the worker owns the node-level semaphore.
+    merge_worker: nil,
+    fragmentation_generation: 0
   ]
 
   # -------------------------------------------------------------------
@@ -231,33 +235,36 @@ defmodule Ferricstore.Merge.Scheduler do
     semaphore = Keyword.get(opts, :semaphore, Semaphore)
     instance_ctx = Keyword.get(opts, :instance_ctx)
 
-    config = build_config(merge_config)
-    shard_data_dir = Ferricstore.DataDir.shard_data_path(data_dir, index)
+    with {:ok, config} <- build_config(merge_config) do
+      shard_data_dir = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
-    # Recover from any interrupted merge on startup. Fail closed if recovery
-    # cannot prove partial files were cleaned up; starting the scheduler with
-    # an unknown merge state can make later compactions act on stale files.
-    case Manifest.recover_if_needed(shard_data_dir, index) do
-      :ok ->
-        case count_existing_log_files(shard_data_dir) do
-          {:ok, file_count} ->
-            state = %__MODULE__{
-              shard_index: index,
-              config: config,
-              data_dir: shard_data_dir,
-              semaphore: semaphore,
-              instance_ctx: instance_ctx,
-              file_count: file_count
-            }
+      # Recover from any interrupted merge on startup. Fail closed if recovery
+      # cannot prove partial files were cleaned up; starting the scheduler with
+      # an unknown merge state can make later compactions act on stale files.
+      case Manifest.recover_if_needed(shard_data_dir, index) do
+        :ok ->
+          case count_existing_log_files(shard_data_dir) do
+            {:ok, file_count} ->
+              state = %__MODULE__{
+                shard_index: index,
+                config: config,
+                data_dir: shard_data_dir,
+                semaphore: semaphore,
+                instance_ctx: instance_ctx,
+                file_count: file_count
+              }
 
-            {:ok, state}
+              {:ok, state}
 
-          {:error, reason} ->
-            {:stop, {:merge_log_file_count_failed, index, reason}}
-        end
+            {:error, reason} ->
+              {:stop, {:merge_log_file_count_failed, index, reason}}
+          end
 
-      {:error, reason} ->
-        {:stop, {:merge_manifest_recovery_failed, index, reason}}
+        {:error, reason} ->
+          {:stop, {:merge_manifest_recovery_failed, index, reason}}
+      end
+    else
+      {:error, reason} -> {:stop, reason}
     end
   end
 
@@ -292,7 +299,13 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   def handle_cast({:fragmentation, candidate_file_ids, file_count}, state) do
-    state = %{state | fragmentation_candidates: candidate_file_ids, file_count: file_count}
+    state = %{
+      state
+      | fragmentation_candidates: candidate_file_ids,
+        file_count: file_count,
+        fragmentation_generation: state.fragmentation_generation + 1
+    }
+
     new_state = maybe_merge(state)
     {:noreply, new_state}
   end
@@ -302,6 +315,28 @@ defmodule Ferricstore.Merge.Scheduler do
     state = %{state | retry_ref: nil}
     new_state = maybe_merge(state)
     {:noreply, new_state}
+  end
+
+  def handle_info(
+        {:merge_finished, work_ref, result},
+        %{merge_worker: %{work_ref: work_ref} = worker} = state
+      ) do
+    Process.demonitor(worker.monitor_ref, [:flush])
+    {:noreply, finish_merge(state, worker, result)}
+  end
+
+  def handle_info(
+        {:DOWN, monitor_ref, :process, pid, reason},
+        %{merge_worker: %{monitor_ref: monitor_ref, pid: pid}} = state
+      ) do
+    Logger.error("Shard #{state.shard_index}: merge worker failed — #{inspect(reason)}")
+
+    state = %{state | merging: false, merge_worker: nil}
+
+    # An unexpected worker exit can leave a manifest or partial output behind.
+    # Restart the scheduler so init performs fail-closed manifest recovery
+    # before another compaction is attempted.
+    {:stop, {:merge_worker_failed, state.shard_index, reason}, state}
   end
 
   def handle_info(_msg, state) do
@@ -318,27 +353,91 @@ defmodule Ferricstore.Merge.Scheduler do
     if should_merge?(state) do
       attempt_merge(state)
     else
-      state
+      maybe_schedule_deferred_merge(state)
     end
   end
 
   defp should_merge?(state) do
-    cooldown_ok =
-      state.last_merge_completed_mono_at == nil or
-        System.monotonic_time(:millisecond) - state.last_merge_completed_mono_at >=
-          state.config.merge_cooldown_ms
-
-    has_trigger =
-      state.file_count >= state.config.min_files_for_merge or
-        state.fragmentation_candidates != []
-
-    cooldown_ok and has_trigger and mode_allows_merge?(state.config) and
+    cooldown_remaining_ms(state) == 0 and merge_triggered?(state) and
+      mode_allows_merge?(state.config) and
       age_mode_has_mergeable_files?(state)
+  end
+
+  defp maybe_schedule_deferred_merge(state) do
+    cond do
+      not merge_triggered?(state) ->
+        state
+
+      cooldown_remaining_ms(state) > 0 ->
+        schedule_retry_after(state, cooldown_remaining_ms(state))
+
+      not mode_allows_merge?(state.config) ->
+        schedule_retry(state)
+
+      state.config.mode == :age ->
+        schedule_age_retry(state)
+
+      true ->
+        state
+    end
+  end
+
+  defp merge_triggered?(state) do
+    state.file_count >= state.config.min_files_for_merge or
+      state.fragmentation_candidates != []
+  end
+
+  defp cooldown_remaining_ms(%{last_merge_completed_mono_at: nil}), do: 0
+
+  defp cooldown_remaining_ms(state) do
+    elapsed_ms =
+      System.monotonic_time(:millisecond) - state.last_merge_completed_mono_at
+
+    max(state.config.merge_cooldown_ms - elapsed_ms, 0)
+  end
+
+  defp schedule_age_retry(state) do
+    case next_age_retry_delay_ms(state) do
+      {:ok, delay_ms} ->
+        state
+        |> cancel_retry()
+        |> schedule_retry_after(delay_ms)
+
+      {:error, _reason} ->
+        schedule_retry(state)
+
+      :none ->
+        state
+    end
+  end
+
+  defp next_age_retry_delay_ms(state) do
+    with {:ok, file_mtimes} <- log_file_ids_with_mtime_ms(state.data_dir),
+         [_ | _] <- file_mtimes do
+      {active_fid, _mtime_ms} = Enum.max_by(file_mtimes, fn {fid, _mtime_ms} -> fid end)
+      now_ms = System.system_time(:millisecond)
+
+      delays =
+        file_mtimes
+        |> Enum.reject(fn {fid, _mtime_ms} -> fid == active_fid end)
+        |> Enum.map(fn {_fid, mtime_ms} ->
+          mtime_ms + state.config.min_file_age_ms - now_ms
+        end)
+        |> Enum.filter(&(&1 > 0))
+
+      case delays do
+        [] -> :none
+        delays -> {:ok, max(Enum.min(delays), 1)}
+      end
+    else
+      [] -> :none
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp age_mode_has_mergeable_files?(%{config: %{mode: :age}} = state) do
     with {:ok, file_sizes} <- log_file_sizes(state.data_dir),
-         file_sizes <- filter_age_mode_files(file_sizes, state.data_dir, state.config),
+         {:ok, file_sizes} <- filter_age_mode_files(file_sizes, state.data_dir, state.config),
          {:ok, _mergeable} <-
            pick_mergeable_files(file_sizes, state.config, state.fragmentation_candidates) do
       true
@@ -376,25 +475,38 @@ defmodule Ferricstore.Merge.Scheduler do
   # -------------------------------------------------------------------
 
   defp attempt_merge(state) do
-    case Semaphore.acquire(state.shard_index, state.semaphore) do
-      :ok ->
-        state = cancel_retry(state)
-        state = %{state | merging: true}
-        do_merge(state)
+    state = cancel_retry(state)
+    parent = self()
+    work_ref = make_ref()
 
-      {:busy, _holder} ->
-        Logger.debug("Shard #{state.shard_index}: merge semaphore busy, scheduling retry")
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        result = run_merge_attempt(state)
+        send(parent, {:merge_finished, work_ref, result})
+      end)
 
-        schedule_retry(state)
-    end
+    worker = %{
+      pid: pid,
+      monitor_ref: monitor_ref,
+      work_ref: work_ref,
+      file_count: state.file_count,
+      fragmentation_generation: state.fragmentation_generation
+    }
+
+    %{state | merging: true, merge_worker: worker}
   end
 
   # Schedule a retry timer if one isn't already pending.
   defp schedule_retry(%{retry_ref: ref} = state) when ref != nil, do: state
 
   defp schedule_retry(state) do
-    interval = state.config.merge_retry_interval_ms
-    ref = Process.send_after(self(), :retry_merge, interval)
+    schedule_retry_after(state, state.config.merge_retry_interval_ms)
+  end
+
+  defp schedule_retry_after(%{retry_ref: ref} = state, _interval) when ref != nil, do: state
+
+  defp schedule_retry_after(state, interval) do
+    ref = Process.send_after(self(), :retry_merge, max(interval, 0))
     %{state | retry_ref: ref}
   end
 
@@ -406,18 +518,44 @@ defmodule Ferricstore.Merge.Scheduler do
     %{state | retry_ref: nil}
   end
 
-  defp do_merge(state) do
+  defp run_merge_attempt(state) do
+    case Semaphore.acquire(state.shard_index, state.semaphore) do
+      :ok ->
+        try do
+          result = merge_work(state)
+          _ = Manifest.delete(state.data_dir)
+          {:attempted, result}
+        after
+          _ = Semaphore.release(state.shard_index, state.semaphore)
+        end
+
+      {:busy, holder} ->
+        {:busy, holder}
+    end
+  end
+
+  defp merge_work(state) do
     ctx = state.instance_ctx || FerricStore.Instance.get(:default)
     shard_name = Router.shard_name(ctx, state.shard_index)
 
-    result =
-      with {:ok, file_ids} <- select_files_for_merge(state, shard_name),
-           :ok <- check_disk_space(state, shard_name, file_ids),
-           :ok <- write_manifest(state, file_ids),
-           {:ok, compaction_result} <- run_compaction(state, shard_name, file_ids) do
-        {:ok, compaction_result, file_ids}
-      end
+    with {:ok, file_ids} <- select_files_for_merge(state, shard_name),
+         :ok <- check_disk_space(state, shard_name, file_ids),
+         :ok <- write_manifest(state, file_ids),
+         {:ok, compaction_result} <- run_compaction(state, shard_name, file_ids) do
+      {:ok, compaction_result, file_ids}
+    end
+  end
 
+  defp finish_merge(state, _worker, {:busy, _holder}) do
+    Logger.debug("Shard #{state.shard_index}: merge semaphore busy, scheduling retry")
+
+    state
+    |> Map.put(:merging, false)
+    |> Map.put(:merge_worker, nil)
+    |> schedule_retry()
+  end
+
+  defp finish_merge(state, worker, {:attempted, result}) do
     case result do
       {:ok, {written, dropped, reclaimed}, _file_ids} ->
         Logger.info(
@@ -426,35 +564,54 @@ defmodule Ferricstore.Merge.Scheduler do
             "#{format_bytes(reclaimed)} reclaimed"
         )
 
-        Manifest.delete(state.data_dir)
-        Semaphore.release(state.shard_index, state.semaphore)
-
         now_ms = System.system_time(:millisecond)
         now_mono = System.monotonic_time(:millisecond)
 
-        %{
+        pending_fragmentation? =
+          state.fragmentation_generation != worker.fragmentation_generation
+
+        fragmentation_candidates =
+          if pending_fragmentation?, do: state.fragmentation_candidates, else: []
+
+        pending_rotation? = state.file_count != worker.file_count
+
+        next_state = %{
           state
           | merging: false,
+            merge_worker: nil,
             last_merge_at: now_ms,
             last_merge_completed_at: now_ms,
             last_merge_completed_mono_at: now_mono,
             merge_count: state.merge_count + 1,
             total_bytes_reclaimed: state.total_bytes_reclaimed + reclaimed,
-            fragmentation_candidates: []
+            fragmentation_candidates: fragmentation_candidates
         }
+
+        if pending_fragmentation? or pending_rotation? do
+          schedule_retry_after(next_state, state.config.merge_cooldown_ms)
+        else
+          next_state
+        end
 
       {:error, reason} ->
         Logger.error("Shard #{state.shard_index}: merge failed — #{inspect(reason)}")
 
-        Manifest.delete(state.data_dir)
-        Semaphore.release(state.shard_index, state.semaphore)
+        pending_fragmentation? =
+          state.fragmentation_generation != worker.fragmentation_generation
 
-        state = %{state | merging: false}
+        state = %{state | merging: false, merge_worker: nil}
 
         if retryable_merge_error?(reason) do
           schedule_retry(state)
         else
-          %{state | fragmentation_candidates: []}
+          state =
+            if pending_fragmentation?, do: state, else: %{state | fragmentation_candidates: []}
+
+          if pending_fragmentation? or state.file_count != worker.file_count do
+            schedule_retry_after(state, state.config.merge_cooldown_ms)
+          else
+            state
+          end
         end
     end
   end
@@ -466,7 +623,7 @@ defmodule Ferricstore.Merge.Scheduler do
 
   defp select_files_for_merge(state, _shard_name) do
     with {:ok, file_sizes} <- log_file_sizes(state.data_dir),
-         file_sizes <- filter_age_mode_files(file_sizes, state.data_dir, state.config),
+         {:ok, file_sizes} <- filter_age_mode_files(file_sizes, state.data_dir, state.config),
          {:ok, mergeable} <-
            pick_mergeable_files(file_sizes, state.config, state.fragmentation_candidates) do
       {:ok, mergeable}
@@ -577,8 +734,8 @@ defmodule Ferricstore.Merge.Scheduler do
   # Private: helpers
   # -------------------------------------------------------------------
 
-  defp build_config(overrides) do
-    %{
+  defp build_config(overrides) when is_map(overrides) do
+    config = %{
       mode: Map.get(overrides, :mode, app_config(:mode, @default_mode)),
       min_files_for_merge:
         Map.get(
@@ -637,64 +794,173 @@ defmodule Ferricstore.Merge.Scheduler do
           app_config(:merge_retry_interval_ms, @default_merge_retry_interval_ms)
         ),
       compaction_call_timeout_ms:
-        normalize_compaction_call_timeout(
-          Map.get(
-            overrides,
-            :compaction_call_timeout_ms,
-            app_config(:compaction_call_timeout_ms, @default_compaction_call_timeout_ms)
-          )
+        Map.get(
+          overrides,
+          :compaction_call_timeout_ms,
+          app_config(:compaction_call_timeout_ms, @default_compaction_call_timeout_ms)
         )
     }
+
+    with :ok <- validate_config(config) do
+      {:ok,
+       %{
+         config
+         | min_free_space_ratio: config.min_free_space_ratio * 1.0,
+           fragmentation_threshold: config.fragmentation_threshold * 1.0,
+           compaction_call_timeout_ms:
+             normalize_compaction_call_timeout(config.compaction_call_timeout_ms)
+       }}
+    end
   end
 
-  defp filter_age_mode_files(file_sizes, _data_dir, %{mode: mode}) when mode != :age,
-    do: file_sizes
+  defp build_config(overrides),
+    do: {:error, {:invalid_merge_config, :merge_config, overrides}}
 
-  defp filter_age_mode_files([], _data_dir, %{mode: :age}), do: []
+  defp validate_config(config) do
+    with :ok <- valid_config_value(:mode, config.mode, &(&1 in [:hot, :bulk, :age])),
+         :ok <-
+           valid_config_value(
+             :min_files_for_merge,
+             config.min_files_for_merge,
+             &(is_integer(&1) and &1 >= 2)
+           ),
+         :ok <-
+           valid_config_value(
+             :max_files_per_merge,
+             config.max_files_per_merge,
+             &(is_integer(&1) and &1 > 0)
+           ),
+         :ok <- valid_config_value(:merge_window, config.merge_window, &valid_merge_window?/1),
+         :ok <-
+           valid_config_value(
+             :min_free_space_ratio,
+             config.min_free_space_ratio,
+             &valid_ratio?(&1, true)
+           ),
+         :ok <-
+           valid_config_value(
+             :fragmentation_threshold,
+             config.fragmentation_threshold,
+             &valid_ratio?(&1, false)
+           ),
+         :ok <-
+           valid_config_value(
+             :dead_bytes_threshold,
+             config.dead_bytes_threshold,
+             &non_negative_integer?/1
+           ),
+         :ok <-
+           valid_config_value(
+             :merge_cooldown_ms,
+             config.merge_cooldown_ms,
+             &non_negative_integer?/1
+           ),
+         :ok <-
+           valid_config_value(
+             :min_file_age_ms,
+             config.min_file_age_ms,
+             &non_negative_integer?/1
+           ),
+         :ok <-
+           valid_config_value(
+             :small_file_threshold,
+             config.small_file_threshold,
+             &non_negative_integer?/1
+           ),
+         :ok <-
+           valid_config_value(
+             :merge_retry_interval_ms,
+             config.merge_retry_interval_ms,
+             &(is_integer(&1) and &1 > 0)
+           ),
+         :ok <-
+           valid_config_value(
+             :compaction_call_timeout_ms,
+             config.compaction_call_timeout_ms,
+             &(&1 == :infinity or (is_integer(&1) and &1 > 0))
+           ) do
+      :ok
+    end
+  end
+
+  defp valid_config_value(key, value, predicate) do
+    if predicate.(value), do: :ok, else: {:error, {:invalid_merge_config, key, value}}
+  end
+
+  defp valid_merge_window?({start_hour, end_hour}) do
+    is_integer(start_hour) and start_hour in 0..23 and is_integer(end_hour) and
+      end_hour in 0..24 and start_hour != end_hour
+  end
+
+  defp valid_merge_window?(_window), do: false
+
+  defp valid_ratio?(value, zero_allowed?) when is_number(value) do
+    lower_bound_ok = if zero_allowed?, do: value >= 0, else: value > 0
+    lower_bound_ok and value <= 1
+  end
+
+  defp valid_ratio?(_value, _zero_allowed?), do: false
+
+  defp non_negative_integer?(value), do: is_integer(value) and value >= 0
+
+  defp filter_age_mode_files(file_sizes, _data_dir, %{mode: mode}) when mode != :age,
+    do: {:ok, file_sizes}
+
+  defp filter_age_mode_files([], _data_dir, %{mode: :age}), do: {:ok, []}
 
   defp filter_age_mode_files(file_sizes, data_dir, %{mode: :age, min_file_age_ms: min_age_ms}) do
     {active_fid, _} = Enum.max_by(file_sizes, fn {fid, _size} -> fid end)
-    eligible = age_eligible_file_ids(data_dir, min_age_ms)
 
-    Enum.filter(file_sizes, fn {fid, _size} ->
-      fid == active_fid or MapSet.member?(eligible, fid)
-    end)
+    with {:ok, eligible} <- age_eligible_file_ids(data_dir, min_age_ms) do
+      {:ok,
+       Enum.filter(file_sizes, fn {fid, _size} ->
+         fid == active_fid or MapSet.member?(eligible, fid)
+       end)}
+    end
   end
 
   defp age_eligible_file_ids(shard_data_dir, min_age_ms) when min_age_ms <= 0 do
-    shard_data_dir
-    |> log_file_ids_with_mtime_ms()
-    |> Enum.map(fn {fid, _mtime_ms} -> fid end)
-    |> MapSet.new()
+    with {:ok, file_mtimes} <- log_file_ids_with_mtime_ms(shard_data_dir) do
+      {:ok, file_mtimes |> Enum.map(fn {fid, _mtime_ms} -> fid end) |> MapSet.new()}
+    end
   end
 
   defp age_eligible_file_ids(shard_data_dir, min_age_ms) do
     cutoff_ms = System.system_time(:millisecond) - min_age_ms
 
-    shard_data_dir
-    |> log_file_ids_with_mtime_ms()
-    |> Enum.filter(fn {_fid, mtime_ms} -> mtime_ms <= cutoff_ms end)
-    |> Enum.map(fn {fid, _mtime_ms} -> fid end)
-    |> MapSet.new()
+    with {:ok, file_mtimes} <- log_file_ids_with_mtime_ms(shard_data_dir) do
+      eligible =
+        file_mtimes
+        |> Enum.filter(fn {_fid, mtime_ms} -> mtime_ms <= cutoff_ms end)
+        |> Enum.map(fn {fid, _mtime_ms} -> fid end)
+        |> MapSet.new()
+
+      {:ok, eligible}
+    end
   end
 
   defp log_file_ids_with_mtime_ms(shard_data_dir) do
     case Ferricstore.FS.ls(shard_data_dir) do
       {:ok, entries} ->
-        Enum.flat_map(entries, fn name ->
-          path = Path.join(shard_data_dir, name)
+        Enum.reduce_while(entries, {:ok, []}, fn name, {:ok, acc} ->
+          if bitcask_log_file?(name) do
+            {file_id, ""} = name |> Path.rootname() |> Integer.parse()
+            path = Path.join(shard_data_dir, name)
 
-          with true <- bitcask_log_file?(name),
-               {file_id, ""} <- name |> Path.rootname() |> Integer.parse(),
-               {:ok, %{mtime: mtime_s}} <- File.stat(path, time: :posix) do
-            [{file_id, mtime_s * 1_000}]
+            case File.stat(path, time: :posix) do
+              {:ok, %{mtime: mtime_s}} ->
+                {:cont, {:ok, [{file_id, mtime_s * 1_000} | acc]}}
+
+              {:error, reason} ->
+                {:halt, {:error, {:log_file_stat_failed, path, reason}}}
+            end
           else
-            _ -> []
+            {:cont, {:ok, acc}}
           end
         end)
 
-      {:error, _reason} ->
-        []
+      {:error, reason} ->
+        {:error, {:log_file_list_failed, reason}}
     end
   end
 
@@ -728,26 +994,31 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   defp log_file_sizes(shard_data_dir) do
-    sizes =
-      case Ferricstore.FS.ls(shard_data_dir) do
-        {:ok, entries} ->
-          entries
-          |> Enum.filter(&bitcask_log_file?/1)
-          |> Enum.flat_map(&log_file_size(shard_data_dir, &1))
+    case Ferricstore.FS.ls(shard_data_dir) do
+      {:ok, entries} ->
+        Enum.reduce_while(entries, {:ok, []}, fn name, {:ok, acc} ->
+          if bitcask_log_file?(name) do
+            case log_file_size(shard_data_dir, name) do
+              {:ok, file_size} -> {:cont, {:ok, [file_size | acc]}}
+              {:error, reason} -> {:halt, {:error, reason}}
+            end
+          else
+            {:cont, {:ok, acc}}
+          end
+        end)
 
-        {:error, _reason} ->
-          []
-      end
-
-    {:ok, sizes}
+      {:error, reason} ->
+        {:error, {:log_file_list_failed, reason}}
+    end
   end
 
   defp log_file_size(shard_data_dir, name) do
-    with {file_id, ""} <- name |> Path.rootname() |> Integer.parse(),
-         {:ok, %{size: size}} <- File.stat(Path.join(shard_data_dir, name)) do
-      [{file_id, size}]
-    else
-      _ -> []
+    {file_id, ""} = name |> Path.rootname() |> Integer.parse()
+    path = Path.join(shard_data_dir, name)
+
+    case File.stat(path) do
+      {:ok, %{size: size}} -> {:ok, {file_id, size}}
+      {:error, reason} -> {:error, {:log_file_stat_failed, path, reason}}
     end
   end
 

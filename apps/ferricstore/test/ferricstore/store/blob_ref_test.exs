@@ -3,20 +3,13 @@ defmodule Ferricstore.Store.BlobRefTest do
 
   alias Ferricstore.Store.BlobRef
 
-  test "encodes a deterministic legacy content-addressed ref" do
-    payload = :binary.copy("payload", 100)
+  test "rejects the obsolete content-addressed encoding" do
+    checksum = :crypto.hash(:sha256, "payload")
+    encoded = <<0, "FSBLOB", 1, 7::unsigned-big-64, checksum::binary>>
 
-    ref = BlobRef.from_payload(payload)
-    encoded = BlobRef.encode!(ref)
-
-    assert BlobRef.encoded_size?(byte_size(encoded))
-    assert BlobRef.ref?(encoded)
-    assert {:ok, ^ref} = BlobRef.decode(encoded)
-    assert BlobRef.verify_payload?(ref, payload)
-    refute BlobRef.verify_payload?(ref, payload <> "!")
-
-    assert ref == BlobRef.from_payload(payload)
-    refute ref == BlobRef.from_payload(payload <> "!")
+    refute BlobRef.encoded_size?(byte_size(encoded))
+    refute BlobRef.ref?(encoded)
+    assert :error == BlobRef.decode(encoded)
   end
 
   test "encodes a fixed-size append segment ref" do
@@ -26,6 +19,8 @@ defmodule Ferricstore.Store.BlobRefTest do
     encoded = BlobRef.encode!(ref)
 
     assert byte_size(encoded) == BlobRef.encoded_size()
+    assert <<0, "FSBLOB", 1, _rest::binary>> = encoded
+    refute Map.has_key?(ref, :version)
     assert BlobRef.ref?(encoded)
     assert {:ok, ^ref} = BlobRef.decode(encoded)
     assert BlobRef.verify_payload?(ref, payload)
@@ -34,19 +29,18 @@ defmodule Ferricstore.Store.BlobRefTest do
 
   test "maps refs to canonical shard-local blob paths" do
     payload = "shared-once"
-    ref = BlobRef.from_payload(payload)
+    ref = BlobRef.from_segment(payload, 12, 4096)
 
     path = BlobRef.path("/tmp/ferricstore", 7, ref)
     relative = BlobRef.relative_path(ref)
-    checksum = Base.encode16(ref.checksum, case: :lower)
 
     assert path == Path.join(["/tmp/ferricstore", "blob", "shard_7", relative])
-    assert relative == Path.join([binary_part(checksum, 0, 2), checksum <> ".blob"])
+    assert relative == Path.join(["segments", "00000000000000000012.bloblog"])
     refute path =~ ".."
   end
 
   test "rejects malformed or forged refs" do
-    ref = BlobRef.from_payload("abc")
+    ref = BlobRef.from_segment("abc", 12, 4096)
     encoded = BlobRef.encode!(ref)
 
     assert :error == BlobRef.decode("abc")
@@ -57,7 +51,7 @@ defmodule Ferricstore.Store.BlobRefTest do
   end
 
   test "rejects invalid ref fields before writing them to Bitcask" do
-    good = BlobRef.from_payload("abc")
+    good = BlobRef.from_segment("abc", 12, 4096)
 
     assert_raise ArgumentError, fn ->
       BlobRef.encode!(%{good | size: -1})

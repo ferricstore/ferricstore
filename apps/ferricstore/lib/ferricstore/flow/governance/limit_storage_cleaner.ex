@@ -11,19 +11,27 @@ defmodule Ferricstore.Flow.Governance.LimitStorageCleaner do
   alias Ferricstore.Flow.Governance.LimitStore
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
 
   @default_interval_ms 1_000
   @default_pages_per_tick 16
   @max_pages_per_tick 64
   @max_consecutive_pages_per_scope 2
+  @max_exact_version 9_007_199_254_740_991
   @progress_tag :flow_governance_limit_cleanup_progress
   @catalog_changed "ERR flow governance catalog changed during traversal"
 
   def start_link(opts) when is_list(opts) do
-    ctx = Keyword.fetch!(opts, :instance_ctx)
-    name = Keyword.get(opts, :name, process_name(ctx))
-    GenServer.start_link(__MODULE__, ctx, name: name)
+    with true <- Keyword.keyword?(opts),
+         {:ok, ctx} <- Keyword.fetch(opts, :instance_ctx) do
+      name = Keyword.get(opts, :name, process_name(ctx))
+      GenServer.start_link(__MODULE__, ctx, name: name)
+    else
+      _invalid -> {:error, "ERR invalid flow limit storage cleaner options"}
+    end
   end
+
+  def start_link(_opts), do: {:error, "ERR invalid flow limit storage cleaner options"}
 
   @doc false
   def process_name(%{name: :default}), do: __MODULE__
@@ -53,40 +61,61 @@ defmodule Ferricstore.Flow.Governance.LimitStorageCleaner do
   end
 
   @doc false
-  def run_tick(ctx, opts \\ []) when is_list(opts) do
-    page_budget = Keyword.get(opts, :page_budget, cleanup_pages_per_tick())
-    now_ms = Keyword.get(opts, :now_ms, System.system_time(:millisecond))
+  def run_tick(ctx, opts \\ [])
 
-    if is_integer(page_budget) and page_budget > 0 and page_budget <= @max_pages_per_tick and
-         is_integer(now_ms) and now_ms >= 0 do
-      run_tick(ctx, now_ms, page_budget, page_budget * 4 + 4, %{
-        commands: 0,
-        caught_up?: false,
-        cycle_commands: 0,
-        cycle_deleted: 0,
-        deleted: 0,
-        errors: 0,
-        streak_key: nil,
-        streak_pages: 0,
-        wrapped?: false
-      })
+  def run_tick(ctx, opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      page_budget = Keyword.get(opts, :page_budget, cleanup_pages_per_tick())
+      now_ms = Keyword.get(opts, :now_ms, System.system_time(:millisecond))
+
+      cond do
+        not (is_integer(page_budget) and page_budget > 0 and
+                 page_budget <= @max_pages_per_tick) ->
+          {:error, "ERR invalid flow limit cleanup page budget"}
+
+        not (is_integer(now_ms) and now_ms >= 0 and now_ms <= @max_exact_version) ->
+          {:error, "ERR invalid flow limit cleanup time"}
+
+        true ->
+          run_tick(ctx, now_ms, page_budget, page_budget * 4 + 4, %{
+            commands: 0,
+            caught_up?: false,
+            cycle_commands: 0,
+            cycle_deleted: 0,
+            deleted: 0,
+            errors: 0,
+            streak_key: nil,
+            streak_pages: 0,
+            wrapped?: false
+          })
+      end
     else
-      %{commands: 0, deleted: 0, errors: 1}
+      {:error, "ERR invalid flow limit cleanup options"}
     end
   end
+
+  def run_tick(_ctx, _opts), do: {:error, "ERR invalid flow limit cleanup options"}
 
   @doc false
-  def run_once(ctx, opts \\ []) when is_list(opts) do
-    now_ms = Keyword.get(opts, :now_ms, System.system_time(:millisecond))
+  def run_once(ctx, opts \\ [])
 
-    if is_integer(now_ms) and now_ms >= 0 do
-      ctx
-      |> run_once_accounted(now_ms, :infinity, nil, 0, 1)
-      |> Map.fetch!(:reply)
+  def run_once(ctx, opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      now_ms = Keyword.get(opts, :now_ms, System.system_time(:millisecond))
+
+      if is_integer(now_ms) and now_ms >= 0 and now_ms <= @max_exact_version do
+        ctx
+        |> run_once_accounted(now_ms, :infinity, nil, 0, 1)
+        |> Map.fetch!(:reply)
+      else
+        {:error, "ERR invalid flow limit cleanup time"}
+      end
     else
-      {:error, "ERR invalid flow limit cleanup time"}
+      {:error, "ERR invalid flow limit cleanup options"}
     end
   end
+
+  def run_once(_ctx, _opts), do: {:error, "ERR invalid flow limit cleanup options"}
 
   defp run_once_accounted(ctx, now_ms, command_budget, streak_key, streak_pages, burst_limit) do
     case load_cursor(ctx) do
@@ -245,16 +274,14 @@ defmodule Ferricstore.Flow.Governance.LimitStorageCleaner do
         {:ok, nil, 0}
 
       value when is_binary(value) ->
-        case :erlang.binary_to_term(value, [:safe]) do
-          {@progress_tag, cursor} when is_nil(cursor) or is_binary(cursor) -> {:ok, cursor, 0}
+        case decode_cursor(value) do
+          {:ok, cursor} -> {:ok, cursor, 0}
           _invalid -> reset_corrupt_cursor(ctx)
         end
 
       _invalid ->
         reset_corrupt_cursor(ctx)
     end
-  rescue
-    _error -> reset_corrupt_cursor(ctx)
   end
 
   defp reset_corrupt_cursor(ctx) do
@@ -275,9 +302,34 @@ defmodule Ferricstore.Flow.Governance.LimitStorageCleaner do
   end
 
   defp put_cursor(ctx, cursor) when is_binary(cursor) do
-    value = :erlang.term_to_binary({@progress_tag, cursor})
-    Router.put(ctx, Keys.governance_limit_cleanup_progress_key(), value, 0)
+    if valid_cursor?(cursor) do
+      value = TermCodec.encode({@progress_tag, cursor})
+      Router.put(ctx, Keys.governance_limit_cleanup_progress_key(), value, 0)
+    else
+      {:error, "ERR invalid flow limit cleanup cursor"}
+    end
   end
+
+  defp decode_cursor(value) do
+    if byte_size(value) <= Router.max_key_size() + 128 do
+      case TermCodec.decode(value) do
+        {:ok, {@progress_tag, cursor}} ->
+          if valid_cursor?(cursor), do: {:ok, cursor}, else: :error
+
+        _invalid ->
+          :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp valid_cursor?(nil), do: true
+
+  defp valid_cursor?(cursor) when is_binary(cursor),
+    do: byte_size(cursor) <= Router.max_key_size()
+
+  defp valid_cursor?(_cursor), do: false
 
   defp finish_catalog_step(
          ctx,

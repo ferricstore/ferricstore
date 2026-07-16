@@ -145,9 +145,9 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
 
   describe "mset/1" do
     test "sets multiple key-value pairs" do
-      assert :ok = FerricStore.mset(%{"ms:a" => "1", "ms:b" => "2"})
-      assert {:ok, "1"} = FerricStore.get("ms:a")
-      assert {:ok, "2"} = FerricStore.get("ms:b")
+      assert :ok = FerricStore.mset(%{"ms:{batch}:a" => "1", "ms:{batch}:b" => "2"})
+      assert {:ok, "1"} = FerricStore.get("ms:{batch}:a")
+      assert {:ok, "2"} = FerricStore.get("ms:{batch}:b")
     end
 
     test "overwrites existing keys" do
@@ -433,16 +433,24 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
 
   describe "msetnx/1" do
     test "sets all keys when none exist" do
-      assert {:ok, true} = FerricStore.msetnx(%{"mnx:a" => "1", "mnx:b" => "2"})
-      assert {:ok, "1"} = FerricStore.get("mnx:a")
-      assert {:ok, "2"} = FerricStore.get("mnx:b")
+      assert {:ok, true} =
+               FerricStore.msetnx(%{"mnx:{batch}:a" => "1", "mnx:{batch}:b" => "2"})
+
+      assert {:ok, "1"} = FerricStore.get("mnx:{batch}:a")
+      assert {:ok, "2"} = FerricStore.get("mnx:{batch}:b")
     end
 
     test "sets nothing when any key exists" do
-      FerricStore.set("mnx:c", "existing")
-      assert {:ok, false} = FerricStore.msetnx(%{"mnx:c" => "new", "mnx:d" => "new"})
-      assert {:ok, "existing"} = FerricStore.get("mnx:c")
-      assert {:ok, nil} = FerricStore.get("mnx:d")
+      FerricStore.set("mnx:{existing}:c", "existing")
+
+      assert {:ok, false} =
+               FerricStore.msetnx(%{
+                 "mnx:{existing}:c" => "new",
+                 "mnx:{existing}:d" => "new"
+               })
+
+      assert {:ok, "existing"} = FerricStore.get("mnx:{existing}:c")
+      assert {:ok, nil} = FerricStore.get("mnx:{existing}:d")
     end
   end
 

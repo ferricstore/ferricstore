@@ -144,7 +144,8 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepStreams
         assert [{:file_ref, ^blob_path, ^blob_offset, 1024}] =
                  Router.batch_get_with_file_refs(ctx, [key], 64)
 
-        assert nil == Router.get(ctx, key)
+        assert {:error, {:storage_read_failed, {:cold_value_unavailable, :checksum_mismatch}}} =
+                 Router.get(ctx, key)
       end
 
       test "large duplicate values share one append segment file", %{
@@ -358,7 +359,9 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepStreams
         payload =
           BlobRef.encode!(%BlobRef{
             size: 123,
-            checksum: :binary.copy(<<1>>, 32)
+            checksum: :binary.copy(<<1>>, 32),
+            segment_id: 123,
+            offset: 48
           })
 
         assert byte_size(payload) < ctx.blob_side_channel_threshold_bytes
@@ -384,7 +387,9 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepStreams
         payload =
           BlobRef.encode!(%BlobRef{
             size: 123,
-            checksum: :binary.copy(<<2>>, 32)
+            checksum: :binary.copy(<<2>>, 32),
+            segment_id: 123,
+            offset: 48
           })
 
         assert :ok = Router.put(ctx, key, payload, 0)
@@ -572,7 +577,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepStreams
       } do
         key = "blob:auto:raft-ref-missing"
         payload = :binary.copy("M", 1536)
-        ref = BlobRef.from_payload(payload)
+        ref = BlobRef.from_segment(payload, 999_999, 48)
         encoded_ref = BlobRef.encode!(ref)
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
         active_file_path = ShardETS.file_path(shard_path, 0)
@@ -784,7 +789,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepStreams
         small_key = "blob:auto:raft-ref-batch-reject-small"
         blob_key = "blob:auto:raft-ref-batch-reject-large"
         payload = :binary.copy("X", 1536)
-        ref = BlobRef.from_payload(payload)
+        ref = BlobRef.from_segment(payload, 999_999, 48)
         encoded_ref = BlobRef.encode!(ref)
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
         active_file_path = ShardETS.file_path(shard_path, 0)

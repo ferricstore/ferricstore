@@ -6,6 +6,7 @@ defmodule Ferricstore.Commands.BitmapTest.Sections.BitopXor do
       alias Ferricstore.Commands.Bitmap
       alias Ferricstore.Commands.Hash
       alias Ferricstore.Commands.Set
+      alias Ferricstore.Commands.Stream
       alias Ferricstore.Store.CompoundKey
       alias Ferricstore.Test.MockStore
 
@@ -126,6 +127,57 @@ defmodule Ferricstore.Commands.BitmapTest.Sections.BitopXor do
           assert "old" == Hash.handle("HGET", ["dest", "field"], base)
         end
 
+        test "does not replace a compound destination whose type marker cannot be read" do
+          base = MockStore.make(%{"a" => {<<0xF0>>, 0}, "b" => {<<0x0F>>, 0}})
+          assert 1 == Hash.handle("HSET", ["dest", "field", "old"], base)
+          type_key = CompoundKey.type_key("dest")
+          failure = Ferricstore.Store.ReadResult.failure(:missing_file)
+
+          store =
+            base
+            |> Map.put(:compound_get, fn
+              "dest", ^type_key -> failure
+              key, compound_key -> base.compound_get.(key, compound_key)
+            end)
+            |> Map.put(:delete, fn _key ->
+              flunk("BITOP must not delete without a complete destination snapshot")
+            end)
+            |> Map.put(:compound_delete, fn _key, _compound_key ->
+              flunk("BITOP must not delete without a complete destination snapshot")
+            end)
+            |> Map.put(:compound_delete_prefix, fn _key, _prefix ->
+              flunk("BITOP must not delete without a complete destination snapshot")
+            end)
+            |> Map.put(:put, fn _key, _value, _expire_at_ms ->
+              flunk("BITOP must not write without a complete destination snapshot")
+            end)
+
+          assert {:error, "ERR storage read failed"} ==
+                   Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)
+
+          assert "old" == Hash.handle("HGET", ["dest", "field"], base)
+        end
+
+        @tag :stream_destination_cleanup
+        test "overwriting a stream destination clears its local stream cache" do
+          Stream.ensure_meta_table()
+          key = "bitop_stream_dest_#{System.unique_integer([:positive])}"
+          store = MockStore.make(%{"a" => {<<0xF0>>, 0}, "b" => {<<0x0F>>, 0}})
+
+          on_exit(fn ->
+            if :ets.whereis(Ferricstore.Stream.Meta) != :undefined do
+              :ets.delete(Ferricstore.Stream.Meta, key)
+            end
+          end)
+
+          assert "1-0" == Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+          assert [_] = :ets.lookup(Ferricstore.Stream.Meta, key)
+
+          assert 1 == Bitmap.handle("BITOP", ["OR", key, "a", "b"], store)
+          assert [] == :ets.lookup(Ferricstore.Stream.Meta, key)
+          assert [] == store.compound_scan.(key, CompoundKey.stream_prefix(key))
+        end
+
         test "returns compound cleanup errors before overwriting destination" do
           type_key = CompoundKey.type_key("dest")
 
@@ -137,11 +189,19 @@ defmodule Ferricstore.Commands.BitmapTest.Sections.BitopXor do
               "dest", ^type_key -> "set"
               _redis_key, _compound_key -> nil
             end,
+            compound_get_meta: fn
+              "dest", ^type_key -> {"set", 0}
+              _redis_key, _compound_key -> nil
+            end,
+            compound_scan: fn _redis_key, _prefix -> [] end,
+            compound_batch_get_meta: fn _redis_key, [] -> [] end,
+            compound_batch_put: fn "dest", [{^type_key, "set", 0}] -> :ok end,
             compound_delete: fn
               "dest", ^type_key -> {:error, :disk_full}
               "dest", _compound_key -> :ok
             end,
-            compound_delete_prefix: fn _redis_key, _prefix -> :ok end
+            compound_delete_prefix: fn _redis_key, _prefix -> :ok end,
+            delete: fn "dest" -> :ok end
           }
 
           assert {:error, :disk_full} == Bitmap.handle("BITOP", ["OR", "dest", "a", "b"], store)

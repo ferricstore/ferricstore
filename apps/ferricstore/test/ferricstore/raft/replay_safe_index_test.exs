@@ -12,6 +12,14 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     assert ReplaySafeIndex.read(dir) == 123
   end
 
+  test "persist never regresses an already durable replay-safe index" do
+    dir = tmp_dir()
+
+    assert :ok = ReplaySafeIndex.persist(dir, 200)
+    assert :ok = ReplaySafeIndex.persist(dir, 100)
+    assert ReplaySafeIndex.read(dir) == 200
+  end
+
   test "missing or invalid marker reads as zero" do
     dir = tmp_dir()
 
@@ -21,6 +29,37 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     File.write!(ReplaySafeIndex.path(dir), "bad\n")
 
     assert ReplaySafeIndex.read(dir) == 0
+  end
+
+  test "read rejects a symlinked replay-safe marker" do
+    dir = tmp_dir()
+    File.mkdir_p!(dir)
+    outside = dir <> "_outside"
+    File.write!(outside, "987\n")
+    File.ln_s!(outside, ReplaySafeIndex.path(dir))
+
+    on_exit(fn ->
+      File.rm_rf(dir)
+      File.rm(outside)
+    end)
+
+    assert ReplaySafeIndex.read(dir) == 0
+  end
+
+  test "persist does not follow a pre-created temporary symlink" do
+    dir = tmp_dir()
+    File.mkdir_p!(dir)
+    outside = dir <> "_outside"
+    File.write!(outside, "keep")
+    File.ln_s!(outside, ReplaySafeIndex.path(dir) <> ".tmp")
+
+    on_exit(fn ->
+      File.rm_rf(dir)
+      File.rm(outside)
+    end)
+
+    assert {:error, _reason} = ReplaySafeIndex.persist(dir, 654)
+    assert File.read!(outside) == "keep"
   end
 
   test "persist returns error when marker directory cannot be created" do
@@ -183,6 +222,36 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     assert :atomics.get(requested, 1) == 456
     assert :atomics.get(durable, 1) == 0
     assert :atomics.get(failures, 1) == 1
+
+    GenServer.stop(writer)
+  end
+
+  test "writer retries a transient marker persistence failure without another request" do
+    shard_index = 120_000 + System.unique_integer([:positive])
+    writer_name = ReplaySafeIndexWriter.process_name(shard_index, nil)
+    dir = tmp_dir()
+    File.mkdir_p!(dir)
+
+    outside = dir <> "_outside"
+    File.write!(outside, "keep")
+    File.ln_s!(outside, ReplaySafeIndex.path(dir) <> ".tmp")
+
+    on_exit(fn ->
+      File.rm_rf(dir)
+      File.rm(outside)
+    end)
+
+    {:ok, writer} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        name: writer_name,
+        retry_delay_ms: 10
+      )
+
+    assert :requested = ReplaySafeIndexWriter.request(nil, shard_index, dir, 512)
+    assert wait_until(fn -> ReplaySafeIndex.read(dir) == 512 end)
+    assert File.read!(outside) == "keep"
 
     GenServer.stop(writer)
   end

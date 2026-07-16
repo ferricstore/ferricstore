@@ -1,9 +1,9 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Strings do
-  alias Ferricstore.CommandTime
-  alias Ferricstore.Commands.Strings.{Delete, GetEx, MSet, Range, SetOptions}
-  alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Commands.ExpiryTime
+  alias Ferricstore.Commands.Strings.{Compound, Delete, GetEx, MSet, Range, SetOptions}
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.TypeRegistry
 
   @moduledoc """
@@ -20,7 +20,7 @@ defmodule Ferricstore.Commands.Strings do
     * `DEL key [key ...]` — deletes keys, returns count deleted
     * `EXISTS key [key ...]` — returns count of existing keys
     * `MGET key [key ...]` — returns list of values (nil for missing)
-    * `MSET key value [key value ...]` — sets multiple keys atomically
+    * `MSET key value [key value ...]` — atomically sets keys in one hash slot
     * `INCR key` — increment integer value by 1
     * `DECR key` — decrement integer value by 1
     * `INCRBY key increment` — increment integer value by given amount
@@ -65,7 +65,10 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("TYPE", [key], store) do
-    {:simple, Ferricstore.Store.TypeRegistry.get_type(key, store)}
+    case TypeRegistry.get_type(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      type -> {:simple, type}
+    end
   end
 
   def handle("TYPE", _args, _store) do
@@ -234,6 +237,7 @@ defmodule Ferricstore.Commands.Strings do
       {:value, value} -> value
       :missing -> nil
       @wrongtype_error -> @wrongtype_error
+      {:error, _reason} = error -> error
     end
   end
 
@@ -393,22 +397,27 @@ defmodule Ferricstore.Commands.Strings do
       {:value, value} -> value
       :missing -> nil
       @wrongtype_error -> @wrongtype_error
+      {:error, _reason} = error -> error
     end
   end
 
   def handle_ast({:getex, key, :persist}, store), do: GetEx.getex_parsed(key, 0, store)
 
-  def handle_ast({:getex, key, {:ex, secs}}, store) when is_integer(secs),
-    do: GetEx.getex_parsed(key, CommandTime.now_ms() + secs * 1_000, store)
+  def handle_ast({:getex, key, {:ex, secs}}, store) when is_integer(secs) and secs > 0,
+    do: getex_with_expiry(key, secs, 1_000, :relative, store)
 
-  def handle_ast({:getex, key, {:px, ms}}, store) when is_integer(ms),
-    do: GetEx.getex_parsed(key, CommandTime.now_ms() + ms, store)
+  def handle_ast({:getex, key, {:px, ms}}, store) when is_integer(ms) and ms > 0,
+    do: getex_with_expiry(key, ms, 1, :relative, store)
 
-  def handle_ast({:getex, key, {:exat, ts}}, store) when is_integer(ts),
-    do: GetEx.getex_parsed(key, ts * 1_000, store)
+  def handle_ast({:getex, key, {:exat, ts}}, store) when is_integer(ts) and ts > 0,
+    do: getex_with_expiry(key, ts, 1_000, :absolute, store)
 
-  def handle_ast({:getex, key, {:pxat, ts}}, store) when is_integer(ts),
-    do: GetEx.getex_parsed(key, ts, store)
+  def handle_ast({:getex, key, {:pxat, ts}}, store) when is_integer(ts) and ts > 0,
+    do: getex_with_expiry(key, ts, 1, :absolute, store)
+
+  def handle_ast({:getex, _key, {mode, value}}, _store)
+      when mode in [:ex, :px, :exat, :pxat] and is_integer(value),
+      do: {:error, "ERR invalid expire time in 'getex' command"}
 
   def handle_ast({:setex, key, seconds, value}, store) when is_integer(seconds) do
     if seconds > 0 do
@@ -473,6 +482,40 @@ defmodule Ferricstore.Commands.Strings do
       {:value, value} -> value
       :missing -> nil
       @wrongtype_error -> @wrongtype_error
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc false
+  @spec get_bounded(binary(), term(), non_neg_integer() | :unlimited) ::
+          {:ok, binary() | nil} | {:error, binary() | :response_byte_limit}
+  def get_bounded("", _store, _limit), do: {:error, "ERR empty key"}
+
+  def get_bounded(key, _store, _limit) when byte_size(key) > @max_key_bytes,
+    do: {:error, "ERR key too large"}
+
+  def get_bounded(key, store, limit) do
+    case Ops.get_bounded(store, key, limit) do
+      {:ok, nil} ->
+        case Compound.data_structure_status(key, store) do
+          :compound ->
+            @wrongtype_error
+
+          :plain ->
+            {:ok, nil}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+        end
+
+      {:ok, value} ->
+        {:ok, value}
+
+      {:error, :response_byte_limit} = error ->
+        error
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
     end
   end
 
@@ -492,19 +535,37 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp exists_keys(keys, store) do
-    Enum.reduce(keys, 0, fn key, acc ->
-      exists = Ops.exists?(store, key)
-      # Also check TypeRegistry for compound-key-based data structures
-      # (lists, hashes, sets, zsets) that don't use the plain key store.
-      exists =
-        exists or
-          (Ops.has_compound?(store) and TypeRegistry.get_type(key, store) != "none")
+    keys
+    |> Enum.reduce_while({:ok, 0}, fn key, {:ok, count} ->
+      cond do
+        Ops.exists?(store, key) ->
+          {:cont, {:ok, count + 1}}
 
-      if exists, do: acc + 1, else: acc
+        not Ops.has_compound?(store) ->
+          {:cont, {:ok, count}}
+
+        true ->
+          case TypeRegistry.get_type(key, store) do
+            {:error, {:storage_read_failed, _reason}} = failure -> {:halt, failure}
+            "none" -> {:cont, {:ok, count}}
+            _type -> {:cont, {:ok, count + 1}}
+          end
+      end
     end)
+    |> case do
+      {:ok, count} -> count
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+    end
   end
 
-  defp mget_keys(keys, store), do: Ops.batch_get(store, keys)
+  defp mget_keys(keys, store) do
+    values = Ops.batch_get(store, keys)
+
+    case ReadResult.first_failure(values) do
+      nil -> values
+      failure -> ReadResult.command_error(failure)
+    end
+  end
 
   defp mset_args(args, store), do: MSet.mset_args(args, store)
 
@@ -521,6 +582,9 @@ defmodule Ferricstore.Commands.Strings do
 
       @wrongtype_error ->
         @wrongtype_error
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -528,6 +592,7 @@ defmodule Ferricstore.Commands.Strings do
     case read_string_size(key, store) do
       :missing -> 0
       @wrongtype_error -> @wrongtype_error
+      {:error, _reason} = error -> error
       {:size, size} -> size
     end
   end
@@ -536,6 +601,7 @@ defmodule Ferricstore.Commands.Strings do
     case ensure_string_key(key, store) do
       :ok -> Ops.getset(store, key, value)
       @wrongtype_error -> @wrongtype_error
+      {:error, _reason} = error -> error
     end
   end
 
@@ -543,20 +609,26 @@ defmodule Ferricstore.Commands.Strings do
     case ensure_string_key(key, store) do
       :ok -> Ops.getdel(store, key)
       @wrongtype_error -> @wrongtype_error
+      {:error, _reason} = error -> error
     end
   end
 
   defp setnx_value(key, value, store) do
     opts = %{expire_at_ms: 0, nx: true, xx: false, get: false, keepttl: false}
 
-    if compound_data_structure_key?(key, store) do
-      0
-    else
-      case Ops.set(store, key, value, opts) do
-        :ok -> 1
-        nil -> 0
-        {:error, _} = err -> err
-      end
+    case Compound.data_structure_status(key, store) do
+      :compound ->
+        0
+
+      :plain ->
+        case Ops.set(store, key, value, opts) do
+          :ok -> 1
+          nil -> 0
+          {:error, _} = err -> err
+        end
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
     end
   end
 
@@ -568,10 +640,18 @@ defmodule Ferricstore.Commands.Strings do
 
   defp do_getex(key, opts, store), do: GetEx.do_getex(key, opts, store)
 
+  defp getex_with_expiry(key, value, multiplier, mode, store) do
+    case expiry_time(value, multiplier, mode) do
+      {:ok, expire_at_ms} -> GetEx.getex_parsed(key, expire_at_ms, store)
+      :error -> integer_range_error()
+    end
+  end
+
   defp incr_string_key(key, delta, store) do
     case ensure_string_key(key, store) do
       :ok -> Ops.incr(store, key, delta)
       @wrongtype_error -> @wrongtype_error
+      {:error, _reason} = error -> error
     end
   end
 
@@ -580,6 +660,7 @@ defmodule Ferricstore.Commands.Strings do
       case ensure_string_key(key, store) do
         :ok -> Ops.incr_float(store, key, delta)
         @wrongtype_error -> @wrongtype_error
+        {:error, _reason} = error -> error
       end
 
     case incr_result do
@@ -606,25 +687,12 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   defp parse_float_arg(str) do
-    # Try integer first (Redis considers "10" valid for INCRBYFLOAT)
-    case Integer.parse(str) do
-      {val, ""} ->
-        {:ok, val * 1.0}
-
-      _ ->
-        case Float.parse(str) do
-          {val, ""} ->
-            # Reject inf/nan
-            cond do
-              val == :infinity -> :error
-              val == :neg_infinity -> :error
-              true -> {:ok, val}
-            end
-
-          _ ->
-            :error
-        end
+    case Float.parse(str) do
+      {val, ""} when is_float(val) -> {:ok, val}
+      _ -> :error
     end
+  rescue
+    ArgumentError -> :error
   end
 
   # ---------------------------------------------------------------------------
@@ -640,14 +708,23 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp setex_parsed(key, secs, value, store) do
-    expire_at_ms = CommandTime.now_ms() + secs * 1_000
-    replace_string_key(key, value, expire_at_ms, store)
+    case ExpiryTime.relative(secs, 1_000) do
+      {:ok, expire_at_ms} -> replace_string_key(key, value, expire_at_ms, store)
+      :error -> integer_range_error()
+    end
   end
 
   defp psetex_parsed(key, ms, value, store) do
-    expire_at_ms = CommandTime.now_ms() + ms
-    replace_string_key(key, value, expire_at_ms, store)
+    case ExpiryTime.relative(ms, 1) do
+      {:ok, expire_at_ms} -> replace_string_key(key, value, expire_at_ms, store)
+      :error -> integer_range_error()
+    end
   end
+
+  defp expiry_time(value, multiplier, :relative), do: ExpiryTime.relative(value, multiplier)
+  defp expiry_time(value, multiplier, :absolute), do: ExpiryTime.absolute(value, multiplier)
+
+  defp integer_range_error, do: {:error, "ERR value is not an integer or out of range"}
 
   defp setrange_parsed(key, offset, value, store) do
     case ensure_string_key(key, store) do
@@ -659,24 +736,30 @@ defmodule Ferricstore.Commands.Strings do
 
       @wrongtype_error ->
         @wrongtype_error
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
   defp do_set_parsed(key, value, parsed, store) do
-    cond do
-      parsed.get and compound_data_structure_key?(key, store) ->
+    case Compound.data_structure_status(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      :compound when parsed.get ->
         @wrongtype_error
 
-      parsed.nx and compound_data_structure_key?(key, store) ->
+      :compound when parsed.nx ->
         nil
 
-      compound_data_structure_key?(key, store) ->
+      :compound ->
         replace_string_key(key, value, parsed.expire_at_ms, store)
 
-      parsed.nx or parsed.xx or parsed.get or parsed.keepttl ->
+      :plain when parsed.nx or parsed.xx or parsed.get or parsed.keepttl ->
         Ops.set(store, key, value, parsed)
 
-      true ->
+      :plain ->
         replace_string_key(key, value, parsed.expire_at_ms, store)
     end
   end
@@ -685,31 +768,26 @@ defmodule Ferricstore.Commands.Strings do
   # Private — MSET/MSETNX helpers (direct recursion, no chunked enumeration)
   # ---------------------------------------------------------------------------
 
-  defp compound_prefix_for_type(key, "hash"), do: CompoundKey.hash_prefix(key)
-  defp compound_prefix_for_type(key, "list"), do: CompoundKey.list_prefix(key)
-  defp compound_prefix_for_type(key, "set"), do: CompoundKey.set_prefix(key)
-  defp compound_prefix_for_type(key, "zset"), do: CompoundKey.zset_prefix(key)
-  defp compound_prefix_for_type(key, "stream"), do: CompoundKey.stream_prefix(key)
-  defp compound_prefix_for_type(_key, _type), do: nil
-
-  def compound_prefixes_for_type(key, "stream"),
-    do: [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)]
-
-  def compound_prefixes_for_type(key, type) do
-    case compound_prefix_for_type(key, type) do
-      nil -> []
-      prefix -> [prefix]
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # Private — type checking for GET
   # ---------------------------------------------------------------------------
 
   defp read_string_value(key, store) do
     case Ops.get(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
-        if compound_data_structure_key?(key, store), do: @wrongtype_error, else: :missing
+        case Compound.data_structure_status(key, store) do
+          :compound ->
+            @wrongtype_error
+
+          :plain ->
+            :missing
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+        end
 
       value when is_binary(value) ->
         {:value, value}
@@ -720,13 +798,25 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   def ensure_string_key(key, store) do
-    if compound_data_structure_key?(key, store), do: @wrongtype_error, else: :ok
+    Compound.ensure_string_key(key, store)
   end
 
   defp read_string_size(key, store) do
     case Ops.value_size(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
-        if compound_data_structure_key?(key, store), do: @wrongtype_error, else: :missing
+        case Compound.data_structure_status(key, store) do
+          :compound ->
+            @wrongtype_error
+
+          :plain ->
+            :missing
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+        end
 
       size ->
         {:size, size}
@@ -734,177 +824,6 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   def replace_string_key(key, value, expire_at_ms, store) do
-    with :ok <- clear_compound_data_structure(key, store) do
-      Ops.put(store, key, value, expire_at_ms)
-    end
-  end
-
-  def compound_data_structure_key?(key, store) do
-    Ops.has_compound?(store) and
-      compound_type_marker?(key, store) and
-      TypeRegistry.get_type(key, store) != "none"
-  end
-
-  defp compound_type_marker?(key, store) do
-    # Raw type markers can outlive all fields when the last field expires.
-    # Keep the cheap no-marker fast path, then let TypeRegistry clean stale markers.
-    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil
-  end
-
-  def clear_compound_data_structure(key, store) do
-    if Ops.has_compound?(store) do
-      type_key = CompoundKey.type_key(key)
-
-      case Ops.compound_get(store, key, type_key) do
-        nil ->
-          :ok
-
-        type ->
-          backup = compound_clear_backup(key, type, store)
-
-          case delete_compound_data_for_replacement(key, type, type_key, store) do
-            :ok -> :ok
-            {:error, _} = error -> restore_compound_clear_backup(key, backup, store, error)
-          end
-      end
-    else
-      :ok
-    end
-  end
-
-  defp delete_compound_data_for_replacement(key, type, type_key, store) do
-    with :ok <- clear_compound_prefix(key, type, store),
-         :ok <- Ops.compound_delete(store, key, type_key) do
-      if type == "stream", do: Delete.cleanup_stream_metadata(key)
-      :ok
-    end
-  end
-
-  defp clear_compound_prefix(key, "hash", store),
-    do: Ops.compound_delete_prefix(store, key, CompoundKey.hash_prefix(key))
-
-  defp clear_compound_prefix(key, "list", store) do
-    with :ok <- Ops.compound_delete_prefix(store, key, CompoundKey.list_prefix(key)),
-         :ok <- Ops.compound_delete(store, key, CompoundKey.list_meta_key(key)) do
-      :ok
-    end
-  end
-
-  defp clear_compound_prefix(key, "set", store),
-    do: Ops.compound_delete_prefix(store, key, CompoundKey.set_prefix(key))
-
-  defp clear_compound_prefix(key, "zset", store),
-    do: Ops.compound_delete_prefix(store, key, CompoundKey.zset_prefix(key))
-
-  defp clear_compound_prefix(key, "stream", store) do
-    with :ok <-
-           Enum.reduce_while(
-             [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)],
-             :ok,
-             fn prefix, :ok ->
-               case Ops.compound_delete_prefix(store, key, prefix) do
-                 :ok -> {:cont, :ok}
-                 {:error, _reason} = error -> {:halt, error}
-               end
-             end
-           ),
-         :ok <- Ops.compound_delete(store, key, CompoundKey.stream_meta_key(key)) do
-      :ok
-    end
-  end
-
-  defp clear_compound_prefix(_key, _type, _store), do: :ok
-
-  defp compound_clear_backup(key, type, store) do
-    if compound_backup_supported?(store) do
-      compound_clear_meta_entries(key, type, store) ++
-        compound_clear_member_entries(key, type, store)
-    else
-      :unsupported
-    end
-  end
-
-  defp compound_backup_supported?(%FerricStore.Instance{}), do: true
-  defp compound_backup_supported?(%Ferricstore.Store.LocalTxStore{}), do: true
-
-  defp compound_backup_supported?(store) when is_map(store) do
-    is_function(Map.get(store, :compound_scan), 2)
-  end
-
-  defp compound_clear_meta_entries(key, type, store) do
-    type_entries = compound_key_backup_entry(key, CompoundKey.type_key(key), store, type)
-
-    list_meta_entries =
-      if type == "list" do
-        compound_key_backup_entry(key, CompoundKey.list_meta_key(key), store)
-      else
-        []
-      end
-
-    stream_meta_entries =
-      if type == "stream" do
-        compound_key_backup_entry(key, CompoundKey.stream_meta_key(key), store)
-      else
-        []
-      end
-
-    type_entries ++ list_meta_entries ++ stream_meta_entries
-  end
-
-  defp compound_clear_member_entries(key, type, store) do
-    prefixes = compound_prefixes_for_type(key, type)
-
-    if prefixes == [] do
-      []
-    else
-      Enum.flat_map(prefixes, &compound_clear_member_entries_for_prefix(key, &1, store))
-    end
-  end
-
-  defp compound_clear_member_entries_for_prefix(key, prefix, store) do
-    pairs =
-      store
-      |> Ops.compound_scan(key, prefix)
-      |> Enum.map(fn {sub_key, _value} ->
-        compound_key = scanned_compound_key(prefix, sub_key)
-        {compound_key, compound_key}
-      end)
-
-    source_keys = Enum.map(pairs, fn {source_key, _destination_key} -> source_key end)
-    metas = Ops.compound_batch_get_meta(store, key, source_keys)
-
-    pairs
-    |> Enum.zip(metas)
-    |> Enum.flat_map(fn
-      {{_source_key, _destination_key}, nil} ->
-        []
-
-      {{_source_key, destination_key}, {value, expire_at_ms}} ->
-        [{destination_key, value, expire_at_ms}]
-    end)
-  end
-
-  defp compound_key_backup_entry(key, compound_key, store, fallback_value \\ nil) do
-    case Ops.compound_get_meta(store, key, compound_key) do
-      nil when fallback_value != nil -> [{compound_key, fallback_value, 0}]
-      nil -> []
-      {value, expire_at_ms} -> [{compound_key, value, expire_at_ms}]
-    end
-  end
-
-  defp restore_compound_clear_backup(_key, :unsupported, _store, error), do: error
-
-  defp restore_compound_clear_backup(key, backup, store, error) do
-    case Ops.compound_batch_put(store, key, backup) do
-      :ok ->
-        error
-
-      {:error, _} = restore_error ->
-        {:error, {:compound_clear_rollback_failed, error, restore_error}}
-    end
-  end
-
-  def scanned_compound_key(prefix, key) do
-    if String.starts_with?(key, prefix), do: key, else: prefix <> key
+    Compound.replace_string_key(key, value, expire_at_ms, store)
   end
 end

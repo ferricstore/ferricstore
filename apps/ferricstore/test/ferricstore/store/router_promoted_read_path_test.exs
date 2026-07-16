@@ -94,6 +94,58 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
     end)
   end
 
+  test "routed compound batches preserve order and use promoted cold storage", %{ctx: ctx} do
+    redis_key = unique_key("router-promoted-routed-batch-get")
+    type_key = CompoundKey.type_key(redis_key)
+    field = CompoundKey.hash_field(redis_key, "f2")
+    promote_hash(ctx, redis_key)
+    assert :ok = Router.compound_put(ctx, redis_key, field, "cc", 0)
+
+    without_shared_log(ctx, fn ->
+      assert ["hash", "cc", "hash"] ==
+               Router.compound_batch_get_on_route_keys(ctx, [
+                 {redis_key, type_key},
+                 {redis_key, field},
+                 {redis_key, type_key}
+               ])
+
+      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements,
+                       _metadata}
+    end)
+  end
+
+  test "compound scan pages read a bounded promoted cold window", %{ctx: ctx} do
+    redis_key = unique_key("router-promoted-scan-page")
+    promote_hash(ctx, redis_key)
+
+    without_shared_log(ctx, fn ->
+      assert {:ok, {{:after, "f1"}, [{"f1", "aa"}]}} =
+               Router.compound_scan_page(
+                 ctx,
+                 redis_key,
+                 CompoundKey.hash_prefix(redis_key),
+                 0,
+                 1,
+                 nil,
+                 false
+               )
+
+      assert {:ok, {0, [{"f2", "bb"}]}} =
+               Router.compound_scan_page(
+                 ctx,
+                 redis_key,
+                 CompoundKey.hash_prefix(redis_key),
+                 {:after, "f1"},
+                 1,
+                 nil,
+                 false
+               )
+
+      refute_received {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], _measurements,
+                       _metadata}
+    end)
+  end
+
   test "compound_batch_get_meta skips the shared-log cold probe for promoted data fields", %{
     ctx: ctx
   } do
@@ -116,6 +168,15 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
              Router.compound_put(
                ctx,
                redis_key,
+               CompoundKey.type_key(redis_key),
+               "hash",
+               0
+             )
+
+    assert :ok =
+             Router.compound_put(
+               ctx,
+               redis_key,
                CompoundKey.hash_field(redis_key, "f1"),
                "aa",
                0
@@ -131,7 +192,11 @@ defmodule Ferricstore.Store.RouterPromotedReadPathTest do
              )
 
     shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-    assert Map.has_key?(:sys.get_state(shard).promoted_instances, redis_key)
+
+    Ferricstore.Test.ShardHelpers.eventually(
+      fn -> Map.has_key?(:sys.get_state(shard).promoted_instances, redis_key) end,
+      "expected #{inspect(redis_key)} to be promoted"
+    )
   end
 
   defp without_shared_log(ctx, fun) do

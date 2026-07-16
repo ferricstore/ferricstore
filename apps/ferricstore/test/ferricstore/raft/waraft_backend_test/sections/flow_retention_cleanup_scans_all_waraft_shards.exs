@@ -232,6 +232,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
         end
       end
 
+      @tag :prob_waraft_sidecar
       test "file-backed probabilistic commands use WARaft as the selected backend", %{ctx: ctx} do
         try do
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
@@ -249,7 +250,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
                        ),
                        "prob"
                      ),
-                     "#{Base.url_encode64("router:bf", padding: false)}.bloom"
+                     Ferricstore.ProbFile.filename("router:bf", "bloom")
                    )
                  )
         after
@@ -293,7 +294,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
 
           assert :ok =
                    Ferricstore.Commands.TopK.handle_ast(
-                     {:topk_reserve, "router:topk", 3, 8, 4, 0.9},
+                     {:topk_reserve, "router:topk", 3, 8, 4},
                      ctx
                    )
 
@@ -335,6 +336,28 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
         end
       end
 
+      @tag :waraft_compound_miss
+      test "WARaft compound misses are authoritative without a shard fallback", %{ctx: ctx} do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+        redis_key = "router:missing-compound"
+        first = CompoundKey.type_key(redis_key)
+        second = CompoundKey.hash_field(redis_key, "field")
+
+        assert Router.compound_get(ctx, redis_key, first) == nil
+        assert Router.compound_batch_get(ctx, redis_key, [first, second]) == [nil, nil]
+        assert Router.compound_get_meta(ctx, redis_key, first) == nil
+        assert Router.compound_batch_get_meta(ctx, redis_key, [first, second]) == [nil, nil]
+
+        assert :ok =
+                 Ferricstore.Commands.Bloom.handle_ast(
+                   {:bf_reserve, redis_key, 0.01, 128},
+                   ctx
+                 )
+      end
+
+      @tag :prob_waraft_sidecar
+      @tag :prob_waraft_restart
       test "file-backed probabilistic commands survive WARaft restart", %{root: root, ctx: ctx} do
         suffix = System.unique_integer([:positive])
 
@@ -370,7 +393,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
 
           assert :ok =
                    Ferricstore.Commands.TopK.handle_ast(
-                     {:topk_reserve, topk_key, 3, 8, 4, 0.9},
+                     {:topk_reserve, topk_key, 3, 8, 4},
                      ctx
                    )
 

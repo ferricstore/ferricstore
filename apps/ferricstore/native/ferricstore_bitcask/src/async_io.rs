@@ -18,16 +18,74 @@
 //! The `OnceLock` ensures the runtime is created exactly once. The runtime
 //! is never shut down — it lives until the BEAM process exits.
 
-use std::sync::OnceLock;
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
+};
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
-static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
+static TOKIO_RT: OnceLock<Result<Runtime, String>> = OnceLock::new();
 const DEFAULT_MAX_BLOCKING_THREADS: usize = 16;
 const MIN_BLOCKING_THREADS: usize = 1;
 const MAX_BLOCKING_THREADS: usize = 256;
 const BLOCKING_THREADS_ENV: &str = "FERRICSTORE_TOKIO_BLOCKING_THREADS";
+const BLOCKING_ADMISSION_MULTIPLIER: usize = 4;
+const MAX_OUTSTANDING_BLOCKING_JOBS: usize = 4_096;
+pub const BLOCKING_OVERLOAD_ERROR: &str = "native async IO overloaded";
 
-/// Returns a reference to the global Tokio runtime, creating it on first call.
+struct BlockingAdmission {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+impl BlockingAdmission {
+    const fn new(limit: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    fn try_acquire(&self) -> Result<BlockingPermit<'_>, &'static str> {
+        let mut active = self.active.load(Ordering::Acquire);
+
+        loop {
+            if active >= self.limit {
+                return Err(BLOCKING_OVERLOAD_ERROR);
+            }
+
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(BlockingPermit { admission: self }),
+                Err(observed) => active = observed,
+            }
+        }
+    }
+}
+
+struct BlockingPermit<'a> {
+    admission: &'a BlockingAdmission,
+}
+
+impl Drop for BlockingPermit<'_> {
+    fn drop(&mut self) {
+        let previous = self.admission.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "blocking admission counter underflow");
+    }
+}
+
+static BLOCKING_ADMISSION: OnceLock<BlockingAdmission> = OnceLock::new();
+
+/// Creates the global Tokio runtime, returning the startup error without
+/// panicking when the operating system cannot create its worker threads.
 ///
 /// H-8 fix: limits worker threads to `min(4, num_cpus)` and blocking IO
 /// threads to a measured/configurable cap instead of Tokio's high default. The
@@ -38,13 +96,15 @@ const BLOCKING_THREADS_ENV: &str = "FERRICSTORE_TOKIO_BLOCKING_THREADS";
 /// `FERRICSTORE_TOKIO_BLOCKING_THREADS` is intentionally read once at runtime
 /// creation. Benchmark 16/32/64 by starting a fresh BEAM for each value.
 ///
-/// # Panics
-///
-/// Panics if the Tokio runtime cannot be created (e.g. OS thread limit
-/// reached). This is a fatal error since the NIF library cannot function
-/// without the runtime.
-pub fn runtime() -> &'static Runtime {
-    TOKIO_RT.get_or_init(|| {
+pub fn initialize() -> Result<&'static Runtime, &'static str> {
+    TOKIO_RT
+        .get_or_init(build_runtime)
+        .as_ref()
+        .map_err(String::as_str)
+}
+
+fn build_runtime() -> Result<Runtime, String> {
+    build_runtime_with(|| {
         let num_cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let workers = num_cpus.clamp(1, 4);
         let blocking_threads = blocking_thread_cap();
@@ -54,8 +114,48 @@ pub fn runtime() -> &'static Runtime {
             .thread_name("ferric-tokio")
             .enable_all()
             .build()
-            .expect("Failed to create Tokio runtime")
     })
+}
+
+fn build_runtime_with(builder: impl FnOnce() -> io::Result<Runtime>) -> Result<Runtime, String> {
+    builder().map_err(|error| format!("Failed to create Tokio runtime: {error}"))
+}
+
+/// Returns the runtime after NIF load has initialised it successfully.
+///
+/// # Panics
+///
+/// Panics only when called outside the loaded NIF lifecycle after runtime
+/// initialisation failed. The NIF load callback rejects that state.
+pub fn runtime() -> &'static Runtime {
+    initialize().expect("Tokio runtime was not initialised during NIF load")
+}
+
+/// Submits one blocking job only when the process-wide native IO budget has
+/// capacity. Tokio's blocking pool bounds active threads but not its waiting
+/// queue, so every async NIF must use this entry point to prevent unbounded
+/// closure and request-payload retention during overload.
+pub fn try_spawn_blocking<F, R>(job: F) -> Result<JoinHandle<R>, &'static str>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let permit = blocking_admission().try_acquire()?;
+    Ok(runtime().spawn_blocking(move || {
+        let _permit = permit;
+        job()
+    }))
+}
+
+fn blocking_admission() -> &'static BlockingAdmission {
+    BLOCKING_ADMISSION
+        .get_or_init(|| BlockingAdmission::new(blocking_admission_limit(blocking_thread_cap())))
+}
+
+fn blocking_admission_limit(blocking_threads: usize) -> usize {
+    blocking_threads
+        .saturating_mul(BLOCKING_ADMISSION_MULTIPLIER)
+        .clamp(MIN_BLOCKING_THREADS, MAX_OUTSTANDING_BLOCKING_JOBS)
 }
 
 fn blocking_thread_cap() -> usize {
@@ -80,6 +180,41 @@ mod tests {
         assert_eq!(blocking_thread_cap_from_env_value(Some("32")), 32);
         assert_eq!(blocking_thread_cap_from_env_value(Some("0")), 1);
         assert_eq!(blocking_thread_cap_from_env_value(Some("9999")), 256);
+    }
+
+    #[test]
+    fn blocking_admission_limit_bounds_the_active_pool_and_waiting_queue() {
+        assert_eq!(blocking_admission_limit(1), 4);
+        assert_eq!(blocking_admission_limit(16), 64);
+        assert_eq!(blocking_admission_limit(usize::MAX), 4_096);
+    }
+
+    #[test]
+    fn blocking_admission_rejects_overload_and_recovers_when_permits_drop() {
+        let admission = BlockingAdmission::new(2);
+        let first = admission.try_acquire().unwrap();
+        let second = admission.try_acquire().unwrap();
+
+        assert!(matches!(
+            admission.try_acquire(),
+            Err(BLOCKING_OVERLOAD_ERROR)
+        ));
+
+        drop(first);
+        let replacement = admission.try_acquire().unwrap();
+        drop(second);
+        drop(replacement);
+        assert_eq!(admission.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn runtime_builder_failure_is_returned_instead_of_panicking() {
+        let result = build_runtime_with(|| Err(std::io::Error::other("thread limit")));
+
+        assert_eq!(
+            result.unwrap_err(),
+            "Failed to create Tokio runtime: thread limit"
+        );
     }
 
     #[test]

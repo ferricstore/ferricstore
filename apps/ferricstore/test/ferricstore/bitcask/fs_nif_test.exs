@@ -199,12 +199,13 @@ defmodule Ferricstore.Bitcask.FsNifTest do
   # fs_ls
   # ---------------------------------------------------------------------------
 
-  describe "fs_read_nofollow/1" do
+  describe "fs_read_nofollow/2" do
     test "reads a regular file", %{tmp: tmp} do
       path = Path.join(tmp, "acl.conf")
       File.write!(path, "user default on nopass ~* &* +@all\n")
 
-      assert {:ok, "user default on nopass ~* &* +@all\n"} = NIF.fs_read_nofollow(path)
+      assert {:ok, "user default on nopass ~* &* +@all\n"} =
+               NIF.fs_read_nofollow(path, 1_024)
     end
 
     test "rejects symlink targets", %{tmp: tmp} do
@@ -213,7 +214,68 @@ defmodule Ferricstore.Bitcask.FsNifTest do
       File.write!(target, "user default on nopass ~* &* +@all\n")
       File.ln_s!(target, link)
 
-      assert {:error, {:symlink, _}} = NIF.fs_read_nofollow(link)
+      assert {:error, {:symlink, _}} = NIF.fs_read_nofollow(link, 1_024)
+    end
+
+    test "rejects oversized files before reading them", %{tmp: tmp} do
+      path = Path.join(tmp, "oversized.conf")
+      File.write!(path, "123456")
+
+      assert {:error, {:too_large, message}} = NIF.fs_read_nofollow(path, 5)
+      assert message =~ "6 bytes"
+      assert message =~ "max 5"
+    end
+  end
+
+  describe "fs_append_sync_nofollow_bounded/3" do
+    test "rejects growth past the cap without changing the file", %{tmp: tmp} do
+      path = Path.join(tmp, "standalone.txlog")
+      File.write!(path, "12345")
+
+      assert {:error, {:too_large, message}} =
+               NIF.fs_append_sync_nofollow_bounded(path, "6", 5)
+
+      assert message =~ "max 5"
+      assert File.read!(path) == "12345"
+    end
+
+    test "accepts an exact fit", %{tmp: tmp} do
+      path = Path.join(tmp, "standalone.txlog")
+      File.write!(path, "12")
+
+      assert :ok = NIF.fs_append_sync_nofollow_bounded(path, "345", 5)
+      assert File.read!(path) == "12345"
+    end
+  end
+
+  describe "fs_copy_sync_nofollow/2" do
+    test "copies a regular file without following either final path", %{tmp: tmp} do
+      source = Path.join(tmp, "source.log")
+      dest = Path.join(tmp, "dest.log")
+      File.write!(source, :binary.copy("payload", 1_024))
+
+      assert :ok = NIF.fs_copy_sync_nofollow(source, dest)
+      assert File.read!(dest) == File.read!(source)
+    end
+
+    test "rejects source and destination symlinks", %{tmp: tmp} do
+      source_target = Path.join(tmp, "source-target")
+      source_link = Path.join(tmp, "source-link")
+      dest_target = Path.join(tmp, "dest-target")
+      dest_link = Path.join(tmp, "dest-link")
+
+      File.write!(source_target, "source")
+      File.write!(dest_target, "keep")
+      File.ln_s!(source_target, source_link)
+      File.ln_s!(dest_target, dest_link)
+
+      assert {:error, {:symlink, _}} = NIF.fs_copy_sync_nofollow(source_link, dest_link)
+      assert File.read!(dest_target) == "keep"
+
+      assert {:error, {:already_exists, _}} =
+               NIF.fs_copy_sync_nofollow(source_target, dest_link)
+
+      assert File.read!(dest_target) == "keep"
     end
   end
 

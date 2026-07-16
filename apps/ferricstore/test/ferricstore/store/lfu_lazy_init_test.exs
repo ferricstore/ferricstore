@@ -23,4 +23,16 @@ defmodule Ferricstore.Store.LFULazyInitTest do
       end
     end
   end
+
+  test "initial/1 does not accept a minute published before its packed value" do
+    ref = :atomics.new(2, signed: false)
+    current_minute = LFU.now_minutes()
+    stale_minute = Bitwise.band(current_minute - 1, 0xFFFF)
+
+    :atomics.put(ref, 1, current_minute)
+    :atomics.put(ref, 2, LFU.pack(stale_minute, LFU.initial_counter()))
+
+    assert LFU.initial(%{lfu_initial_ref: ref}) ==
+             LFU.pack(current_minute, LFU.initial_counter())
+  end
 end

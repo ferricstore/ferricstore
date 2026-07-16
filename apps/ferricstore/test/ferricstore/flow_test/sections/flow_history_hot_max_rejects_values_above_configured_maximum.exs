@@ -575,6 +575,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
         assert nil == Ferricstore.Store.Router.get(ctx, created.payload_ref)
       end
 
+      @tag :flow_local_shared_retention
       test "retention cleanup reclaims unreferenced owner named shared values without scanning" do
         ctx = FerricStore.Instance.get(:default)
         id = uid("flow-retention-shared-value-lifecycle")
@@ -1039,6 +1040,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
         assert {:ok, ["shared-partial"]} = FerricStore.flow_value_mget([shared_ref])
       end
 
+      @tag :shared_ref_retention_race
       test "retention cleanup serializes with a racing shared value consumer" do
         ctx = FerricStore.Instance.get(:default)
         owner_id = uid("flow-retention-racing-shared-owner")
@@ -1095,45 +1097,33 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, owner_shard)
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
-        old_hook =
-          Application.get_env(:ferricstore, :flow_shared_value_ref_acquisition_hook)
+        old_plan_hook = Application.get_env(:ferricstore, :flow_retention_after_plan_hook)
 
         Application.put_env(
           :ferricstore,
-          :flow_shared_value_ref_acquisition_hook,
-          fn record, refs ->
-            if Map.get(record, :id) == consumer_id and shared_ref in refs do
-              send(parent, {:shared_ref_acquisition_paused, self(), release_ref})
+          :flow_retention_after_plan_hook,
+          fn
+            :terminal, candidates when is_list(candidates) ->
+              if Enum.any?(candidates, &(&1.record.id == owner_id)) do
+                send(parent, {:shared_ref_cleanup_planned, self(), release_ref})
 
-              receive do
-                {:release_shared_ref_acquisition, ^release_ref} -> :ok
-              after
-                10_000 -> {:error, :shared_ref_acquisition_hook_timeout}
+                receive do
+                  {:release_shared_ref_cleanup, ^release_ref} -> :ok
+                after
+                  10_000 -> {:error, :shared_ref_cleanup_plan_hook_timeout}
+                end
+              else
+                :ok
               end
-            else
+
+            _kind, _candidates ->
               :ok
-            end
           end
         )
 
         on_exit(fn ->
-          restore_env(:flow_shared_value_ref_acquisition_hook, old_hook)
+          restore_env(:flow_retention_after_plan_hook, old_plan_hook)
         end)
-
-        consumer_task =
-          Task.async(fn ->
-            flow_create_and_get(consumer_id,
-              type: "retention-racing-shared-consumer",
-              state: "queued",
-              partition_key: consumer_partition,
-              value_refs: %{"doc" => shared_ref},
-              run_at_ms: create_now,
-              retention_ttl_ms: 20,
-              now_ms: create_now + 3
-            )
-          end)
-
-        assert_receive {:shared_ref_acquisition_paused, apply_pid, ^release_ref}, 5_000
 
         cleanup_task =
           Task.async(fn ->
@@ -1143,23 +1133,28 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
             })
           end)
 
-        cleanup_while_consumer_paused = Task.yield(cleanup_task, 1_000)
-        send(apply_pid, {:release_shared_ref_acquisition, release_ref})
+        assert_receive {:shared_ref_cleanup_planned, cleanup_pid, ^release_ref}, 5_000
+        assert Task.yield(cleanup_task, 500) == nil
 
-        assert {:ok, consumer} = Task.await(consumer_task, 10_000)
+        assert {:ok, consumer} =
+                 flow_create_and_get(consumer_id,
+                   type: "retention-racing-shared-consumer",
+                   state: "queued",
+                   partition_key: consumer_partition,
+                   value_refs: %{"doc" => shared_ref},
+                   run_at_ms: create_now,
+                   retention_ttl_ms: 20,
+                   now_ms: create_now + 3
+                 )
+
         assert consumer.value_refs["doc"].ref == shared_ref
+        send(cleanup_pid, {:release_shared_ref_cleanup, release_ref})
 
-        cleanup_result =
-          case cleanup_while_consumer_paused do
-            nil -> Task.await(cleanup_task, 10_000)
-            {:ok, result} -> result
-          end
-
-        assert cleanup_while_consumer_paused == nil
-        assert {:ok, %{flows: 1}} = cleanup_result
+        assert {:ok, %{flows: 1}} = Task.await(cleanup_task, 10_000)
         assert {:ok, ["shared-doc"]} = FerricStore.flow_value_mget([shared_ref])
       end
 
+      @tag :shared_ref_retention_race
       test "retention cleanup serializes with same-shard child shared ref acquisition" do
         ctx = FerricStore.Instance.get(:default)
         owner_id = uid("flow-retention-spawn-shared-owner")
@@ -1229,56 +1224,33 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, owner_shard)
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
-        old_hook =
-          Application.get_env(:ferricstore, :flow_shared_value_ref_acquisition_hook)
+        old_plan_hook = Application.get_env(:ferricstore, :flow_retention_after_plan_hook)
 
         Application.put_env(
           :ferricstore,
-          :flow_shared_value_ref_acquisition_hook,
-          fn record, refs ->
-            if Map.get(record, :id) == child_id and shared_ref in refs do
-              send(parent, {:spawn_shared_ref_acquisition_paused, self(), release_ref})
+          :flow_retention_after_plan_hook,
+          fn
+            :terminal, candidates when is_list(candidates) ->
+              if Enum.any?(candidates, &(&1.record.id == owner_id)) do
+                send(parent, {:spawn_shared_ref_cleanup_planned, self(), release_ref})
 
-              receive do
-                {:release_spawn_shared_ref_acquisition, ^release_ref} -> :ok
-              after
-                10_000 -> {:error, :spawn_shared_ref_acquisition_hook_timeout}
+                receive do
+                  {:release_spawn_shared_ref_cleanup, ^release_ref} -> :ok
+                after
+                  10_000 -> {:error, :spawn_shared_ref_cleanup_plan_hook_timeout}
+                end
+              else
+                :ok
               end
-            else
+
+            _kind, _candidates ->
               :ok
-            end
           end
         )
 
         on_exit(fn ->
-          restore_env(:flow_shared_value_ref_acquisition_hook, old_hook)
+          restore_env(:flow_retention_after_plan_hook, old_plan_hook)
         end)
-
-        spawn_task =
-          Task.async(fn ->
-            FerricStore.flow_spawn_children(
-              parent_id,
-              [
-                %{
-                  id: child_id,
-                  type: "retention-spawn-shared-child",
-                  partition_key: child_partition,
-                  value_refs: %{"doc" => shared_ref},
-                  run_at_ms: create_now
-                }
-              ],
-              partition_key: parent_partition,
-              lease_token: parent_claim.lease_token,
-              fencing_token: parent_claim.fencing_token,
-              group_id: "retention-spawn-shared-group",
-              wait_state: "waiting_children",
-              success: "completed",
-              failure: "failed",
-              now_ms: create_now + 4
-            )
-          end)
-
-        assert_receive {:spawn_shared_ref_acquisition_paused, apply_pid, ^release_ref}, 5_000
 
         cleanup_task =
           Task.async(fn ->
@@ -1288,19 +1260,34 @@ defmodule Ferricstore.FlowTest.Sections.FlowHistoryHotMaxRejectsValuesAboveConfi
             })
           end)
 
-        cleanup_while_spawn_paused = Task.yield(cleanup_task, 1_000)
-        send(apply_pid, {:release_spawn_shared_ref_acquisition, release_ref})
+        assert_receive {:spawn_shared_ref_cleanup_planned, cleanup_pid, ^release_ref}, 5_000
+        assert Task.yield(cleanup_task, 500) == nil
 
-        assert :ok = Task.await(spawn_task, 10_000)
+        assert :ok =
+                 FerricStore.flow_spawn_children(
+                   parent_id,
+                   [
+                     %{
+                       id: child_id,
+                       type: "retention-spawn-shared-child",
+                       partition_key: child_partition,
+                       value_refs: %{"doc" => shared_ref},
+                       run_at_ms: create_now
+                     }
+                   ],
+                   partition_key: parent_partition,
+                   lease_token: parent_claim.lease_token,
+                   fencing_token: parent_claim.fencing_token,
+                   group_id: "retention-spawn-shared-group",
+                   wait_state: "waiting_children",
+                   success: "completed",
+                   failure: "failed",
+                   now_ms: create_now + 4
+                 )
 
-        cleanup_result =
-          case cleanup_while_spawn_paused do
-            nil -> Task.await(cleanup_task, 10_000)
-            {:ok, result} -> result
-          end
+        send(cleanup_pid, {:release_spawn_shared_ref_cleanup, release_ref})
 
-        assert cleanup_while_spawn_paused == nil
-        assert {:ok, %{flows: 1}} = cleanup_result
+        assert {:ok, %{flows: 1}} = Task.await(cleanup_task, 10_000)
         assert {:ok, ["shared-spawn"]} = FerricStore.flow_value_mget([shared_ref])
 
         assert {:ok, child} =

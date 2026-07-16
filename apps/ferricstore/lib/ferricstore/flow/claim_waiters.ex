@@ -9,6 +9,8 @@ defmodule Ferricstore.Flow.ClaimWaiters do
 
   @table :ferricstore_flow_claim_waiters
   @timer_table :ferricstore_flow_claim_waiter_timers
+  @capacity_lock_table :ferricstore_flow_claim_waiter_capacity_lock
+  @capacity_lock_key :registration
   @any_state :any_state
   @any_priority :any_priority
   @any_partition :any_partition
@@ -16,6 +18,7 @@ defmodule Ferricstore.Flow.ClaimWaiters do
   @max_wait_key_rows 64
   @default_max_waiter_rows 100_000
   @max_waiters_error "ERR max blocked claim_due waiters reached"
+  @max_wait_keys_error "ERR blocked claim_due waiter has too many keys"
   @scheduled_due_bucket_ms 10
   @scheduled_prune_page_size 64
   @capacity_prune_page_size 256
@@ -24,25 +27,10 @@ defmodule Ferricstore.Flow.ClaimWaiters do
 
   @spec init() :: :ok
   def init do
-    case :ets.whereis(@table) do
-      :undefined ->
-        :ets.new(@table, [
-          :duplicate_bag,
-          :public,
-          :named_table,
-          {:read_concurrency, true},
-          {:write_concurrency, :auto},
-          {:decentralized_counters, true}
-        ])
-
-        ensure_timer_table()
-
-        :ok
-
-      _tid ->
-        ensure_timer_table()
-        :ok
-    end
+    ensure_waiter_table()
+    ensure_timer_table()
+    ensure_capacity_lock_table()
+    :ok
   end
 
   @spec message() :: atom()
@@ -75,18 +63,25 @@ defmodule Ferricstore.Flow.ClaimWaiters do
 
   @spec register([waiter_key()], pid(), integer(), keyword()) :: :ok | {:error, binary()}
   def register(keys, pid, deadline_ms, opts \\ []) when is_list(keys) and is_pid(pid) do
-    keys = Enum.uniq(keys)
-
-    with :ok <- ensure_waiter_capacity(keys) do
-      Ferricstore.Waiters.Monitor.track(pid)
-      registered_at = System.monotonic_time(:microsecond)
+    with {:ok, keys} <- bounded_unique_waiter_keys(keys) do
+      registered_at = System.unique_integer([:monotonic])
       limit = waiter_limit(opts)
 
-      Enum.each(keys, fn key ->
-        :ets.insert(@table, {key, pid, deadline_ms, registered_at, limit})
-      end)
+      result =
+        with_capacity_lock(fn ->
+          with :ok <- ensure_waiter_capacity(keys) do
+            entries =
+              Enum.map(keys, fn key ->
+                {key, pid, deadline_ms, registered_at, limit}
+              end)
 
-      :ok
+            true = :ets.insert(@table, entries)
+            :ok
+          end
+        end)
+
+      if result == :ok, do: Ferricstore.Waiters.Monitor.track(pid)
+      result
     end
   end
 
@@ -170,12 +165,15 @@ defmodule Ferricstore.Flow.ClaimWaiters do
     else
       ensure_timer_table()
       timer_key = {type, state, priority, partition_key, due_at_ms}
+      pending_token = make_ref()
 
-      case :ets.insert_new(@timer_table, {timer_key, count}) do
+      case :ets.insert_new(@timer_table, {timer_key, count, {:pending, pending_token}}) do
         true ->
-          :timer.apply_after(max(due_at_ms - now_ms, 0), __MODULE__, :notify_scheduled_ready, [
-            timer_key
-          ])
+          start_scheduled_ready_timer(
+            timer_key,
+            pending_token,
+            max(due_at_ms - now_ms, 0)
+          )
 
           :ok
 
@@ -198,7 +196,7 @@ defmodule Ferricstore.Flow.ClaimWaiters do
     ensure_timer_table()
 
     case :ets.take(@timer_table, timer_key) do
-      [{^timer_key, count}] ->
+      [{^timer_key, count, _timer_ref}] ->
         case timer_key do
           {type, state, priority, partition_key, _due_at_ms} ->
             notify_ready(type, state, priority, partition_key, max(count, 1))
@@ -213,6 +211,10 @@ defmodule Ferricstore.Flow.ClaimWaiters do
   end
 
   def notify_scheduled_ready(_timer_key), do: 0
+
+  @doc false
+  @spec prune_scheduled_ready_for_cleanup() :: :ok
+  def prune_scheduled_ready_for_cleanup, do: prune_scheduled_ready_without_waiters()
 
   @spec scheduled_count() :: non_neg_integer()
   def scheduled_count do
@@ -402,6 +404,29 @@ defmodule Ferricstore.Flow.ClaimWaiters do
 
   defp waiter_limit(_opts), do: 1
 
+  defp bounded_unique_waiter_keys(keys) do
+    result =
+      Enum.reduce_while(keys, {[], MapSet.new()}, fn key, {unique, seen} ->
+        if MapSet.member?(seen, key) do
+          {:cont, {unique, seen}}
+        else
+          seen = MapSet.put(seen, key)
+          unique = [key | unique]
+
+          if MapSet.size(seen) > @max_wait_key_rows do
+            {:halt, :too_many}
+          else
+            {:cont, {unique, seen}}
+          end
+        end
+      end)
+
+    case result do
+      :too_many -> {:error, @max_wait_keys_error}
+      {unique, _seen} -> {:ok, Enum.reverse(unique)}
+    end
+  end
+
   defp ensure_waiter_capacity([]), do: :ok
 
   defp ensure_waiter_capacity(keys) do
@@ -510,7 +535,7 @@ defmodule Ferricstore.Flow.ClaimWaiters do
   end
 
   defp select_scheduled_ready_timer_keys(table, limit) do
-    :ets.select(table, [{{:"$1", :_}, [], [:"$1"]}], limit)
+    :ets.select(table, [{{:"$1", :_, :_}, [], [:"$1"]}], limit)
   rescue
     ArgumentError -> :"$end_of_table"
   end
@@ -532,7 +557,7 @@ defmodule Ferricstore.Flow.ClaimWaiters do
        )
        when is_binary(type) do
     unless scheduled_ready_has_waiters?(type, state, priority, partition_key) do
-      :ets.delete(@timer_table, timer_key)
+      cancel_scheduled_ready_timer(timer_key)
     end
   end
 
@@ -615,6 +640,153 @@ defmodule Ferricstore.Flow.ClaimWaiters do
   defp scheduled_due_at_ms(due_at_ms) when is_integer(due_at_ms) do
     bucket = @scheduled_due_bucket_ms
     div(due_at_ms + bucket - 1, bucket) * bucket
+  end
+
+  defp start_scheduled_ready_timer(timer_key, pending_token, delay_ms) do
+    case :timer.apply_after(delay_ms, __MODULE__, :notify_scheduled_ready, [timer_key]) do
+      {:ok, timer_ref} ->
+        unless publish_scheduled_timer_ref(timer_key, pending_token, timer_ref) do
+          cancel_timer(timer_ref)
+        end
+
+      {:error, _reason} ->
+        delete_pending_scheduled_timer(timer_key, pending_token)
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp publish_scheduled_timer_ref(timer_key, pending_token, timer_ref) do
+    match_spec = [
+      {
+        {timer_key, :"$1", {:pending, pending_token}},
+        [],
+        [{{{:const, timer_key}, :"$1", {:const, timer_ref}}}]
+      }
+    ]
+
+    :ets.select_replace(@timer_table, match_spec) == 1
+  end
+
+  defp delete_pending_scheduled_timer(timer_key, pending_token) do
+    match_spec = [
+      {{timer_key, :_, {:pending, pending_token}}, [], [true]}
+    ]
+
+    _deleted = :ets.select_delete(@timer_table, match_spec)
+    :ok
+  end
+
+  defp cancel_scheduled_ready_timer(timer_key) do
+    case :ets.take(@timer_table, timer_key) do
+      [{^timer_key, _count, {:pending, _token}}] -> :ok
+      [{^timer_key, _count, timer_ref}] -> cancel_timer(timer_ref)
+      [] -> :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp cancel_timer(timer_ref) do
+    _ = :timer.cancel(timer_ref)
+    :ok
+  catch
+    :exit, _reason -> :ok
+    :error, _reason -> :ok
+  end
+
+  defp with_capacity_lock(fun) when is_function(fun, 0) do
+    ensure_capacity_lock_table()
+    lock = {@capacity_lock_key, self(), make_ref()}
+    acquire_capacity_lock(lock)
+
+    try do
+      fun.()
+    after
+      delete_capacity_lock(lock)
+    end
+  end
+
+  defp acquire_capacity_lock(lock) do
+    case :ets.insert_new(@capacity_lock_table, lock) do
+      true ->
+        :ok
+
+      false ->
+        clear_stale_capacity_lock()
+
+        receive do
+        after
+          1 -> acquire_capacity_lock(lock)
+        end
+    end
+  rescue
+    ArgumentError ->
+      ensure_capacity_lock_table()
+      acquire_capacity_lock(lock)
+  end
+
+  defp clear_stale_capacity_lock do
+    case :ets.lookup(@capacity_lock_table, @capacity_lock_key) do
+      [{@capacity_lock_key, owner, _ref} = lock] when is_pid(owner) ->
+        unless Process.alive?(owner), do: :ets.delete_object(@capacity_lock_table, lock)
+
+      _other ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp delete_capacity_lock(lock) do
+    :ets.delete_object(@capacity_lock_table, lock)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp ensure_waiter_table do
+    case :ets.whereis(@table) do
+      :undefined ->
+        try do
+          :ets.new(@table, [
+            :duplicate_bag,
+            :public,
+            :named_table,
+            {:read_concurrency, true},
+            {:write_concurrency, :auto},
+            {:decentralized_counters, true}
+          ])
+        rescue
+          ArgumentError -> :ok
+        end
+
+        :ok
+
+      _tid ->
+        :ok
+    end
+  end
+
+  defp ensure_capacity_lock_table do
+    case :ets.whereis(@capacity_lock_table) do
+      :undefined ->
+        try do
+          :ets.new(@capacity_lock_table, [
+            :set,
+            :public,
+            :named_table,
+            {:write_concurrency, true}
+          ])
+        rescue
+          ArgumentError -> :ok
+        end
+
+        :ok
+
+      _tid ->
+        :ok
+    end
   end
 
   defp ensure_timer_table do

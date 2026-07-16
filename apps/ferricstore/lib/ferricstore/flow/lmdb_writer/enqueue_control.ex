@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.LMDBWriter.EnqueueControl do
   @default_max_enqueue_ops 100_000
   @enqueue_seq_queued 1
   @enqueue_seq_processed 2
+  @enqueue_ops_queued 3
 
   def publish_enqueue_seq(instance_name, shard_index, ref) when is_reference(ref) do
     Ferricstore.Flow.LMDBWriter.Registry.publish_enqueue_seq(instance_name, shard_index, ref)
@@ -20,16 +21,23 @@ defmodule Ferricstore.Flow.LMDBWriter.EnqueueControl do
     Ferricstore.Flow.LMDBWriter.Registry.reserve_enqueue_seq(instance_name, shard_index)
   end
 
-  def lost_unprocessed_enqueue(instance_name, shard_index) do
+  def reserve_enqueue_seq({ref, _reserved_ops}) when is_reference(ref) do
+    :atomics.add_get(ref, @enqueue_seq_queued, 1)
+  rescue
+    _ -> 0
+  end
+
+  def previous_writer_generation(instance_name, shard_index) do
     case :persistent_term.get(enqueue_seq_key(instance_name, shard_index), nil) do
       ref when is_reference(ref) ->
         queued = :atomics.get(ref, @enqueue_seq_queued)
         processed = :atomics.get(ref, @enqueue_seq_processed)
+        queued_ops = queued_ops(ref)
 
-        if queued > processed do
-          {:lost_async_enqueue, queued, processed}
+        if queued > processed or queued_ops > 0 do
+          {:writer_restarted_with_unprocessed_enqueues, queued, processed, queued_ops}
         else
-          :none
+          {:writer_restarted_with_volatile_state, queued, processed}
         end
 
       _other ->
@@ -39,22 +47,96 @@ defmodule Ferricstore.Flow.LMDBWriter.EnqueueControl do
     _ -> :none
   end
 
-  def maybe_mark_lost_enqueue(_instance_ctx, _shard_index, :none), do: :ok
+  def mark_previous_writer_generation(_instance_ctx, _shard_index, :none), do: :ok
 
-  def maybe_mark_lost_enqueue(instance_ctx, shard_index, reason) do
+  def mark_previous_writer_generation(instance_ctx, shard_index, reason) do
     LMDBWriter.mark_mirror_degraded(instance_ctx, shard_index, reason)
   end
 
-  def enqueue_guard(pid, op_count) do
-    with :ok <- enqueue_ops_capacity(op_count) do
-      enqueue_mailbox_capacity(pid)
+  def enqueue_guard(instance_name, shard_index, pid, op_count) do
+    with :ok <- enqueue_ops_capacity(op_count),
+         {:ok, reservation} <- reserve_queued_ops(instance_name, shard_index, op_count) do
+      case enqueue_mailbox_capacity(pid) do
+        :ok ->
+          {:ok, reservation}
+
+        {:error, _reason} = error ->
+          _ = release_queued_ops(reservation)
+          error
+      end
     end
   end
 
   def enqueue_async_guard(instance_name, shard_index, op_count) do
-    with :ok <- enqueue_ops_capacity(op_count) do
-      enqueue_async_mailbox_capacity(instance_name, shard_index)
+    with :ok <- enqueue_ops_capacity(op_count),
+         {:ok, reservation} <- reserve_queued_ops(instance_name, shard_index, op_count) do
+      case enqueue_async_mailbox_capacity(instance_name, shard_index) do
+        :ok ->
+          {:ok, reservation}
+
+        {:error, _reason} = error ->
+          _ = release_queued_ops(reservation)
+          error
+      end
     end
+  end
+
+  def reserve_queued_ops(instance_name, shard_index, 0) do
+    with {:ok, ref} <- enqueue_seq_ref(instance_name, shard_index) do
+      {:ok, {ref, 0}}
+    end
+  end
+
+  def reserve_queued_ops(instance_name, shard_index, op_count)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 and
+             is_integer(op_count) and op_count > 0 do
+    case Ferricstore.MemoryBudget.limit(
+           :flow_lmdb_writer_max_enqueue_ops,
+           @default_max_enqueue_ops
+         ) do
+      :infinity ->
+        with {:ok, ref} <- enqueue_seq_ref(instance_name, shard_index) do
+          {:ok, {ref, 0}}
+        end
+
+      max_ops when is_integer(max_ops) and max_ops >= 0 ->
+        with {:ok, ref} <- enqueue_seq_ref(instance_name, shard_index) do
+          do_reserve_queued_ops(ref, op_count, max_ops)
+        end
+    end
+  end
+
+  def release_queued_ops({ref, reserved_ops})
+      when is_reference(ref) and is_integer(reserved_ops) and reserved_ops >= 0,
+      do: release_queued_ops(ref, reserved_ops)
+
+  def release_queued_ops(_ref, 0), do: :ok
+
+  def release_queued_ops(ref, op_count)
+      when is_reference(ref) and is_integer(op_count) and op_count > 0 do
+    if :atomics.info(ref).size >= @enqueue_ops_queued do
+      case :atomics.sub_get(ref, @enqueue_ops_queued, op_count) do
+        remaining when remaining >= 0 ->
+          :ok
+
+        _negative ->
+          _ = :atomics.add_get(ref, @enqueue_ops_queued, op_count)
+          {:error, :invalid_queued_ops_release}
+      end
+    else
+      {:error, :invalid_enqueue_reservation_state}
+    end
+  rescue
+    _ -> {:error, :invalid_enqueue_reservation_state}
+  end
+
+  def current_generation?(instance_name, shard_index, pid, {ref, _reserved_ops})
+      when is_atom(instance_name) and is_integer(shard_index) and is_pid(pid) and
+             is_reference(ref) do
+    Process.whereis(Ferricstore.Flow.LMDBWriter.Registry.name(instance_name, shard_index)) == pid and
+      :persistent_term.get(enqueue_seq_key(instance_name, shard_index), nil) == ref
+  rescue
+    _ -> false
   end
 
   def enqueue_ops_capacity(op_count) do
@@ -110,7 +192,7 @@ defmodule Ferricstore.Flow.LMDBWriter.EnqueueControl do
         end
     end
   rescue
-    _ -> :ok
+    _ -> {:error, :writer_not_started}
   end
 
   def enqueue_seq_target(%{enqueue_seq: ref}) when is_reference(ref) do
@@ -169,6 +251,50 @@ defmodule Ferricstore.Flow.LMDBWriter.EnqueueControl do
   end
 
   def publish_processed_enqueue_seq(_ref, _processed), do: :ok
+
+  defp enqueue_seq_ref(instance_name, shard_index) do
+    case :persistent_term.get(enqueue_seq_key(instance_name, shard_index), nil) do
+      ref when is_reference(ref) ->
+        if :atomics.info(ref).size >= @enqueue_ops_queued do
+          {:ok, ref}
+        else
+          {:error, :invalid_enqueue_reservation_state}
+        end
+
+      _missing ->
+        {:error, :writer_not_started}
+    end
+  rescue
+    _ -> {:error, :writer_not_started}
+  end
+
+  defp do_reserve_queued_ops(ref, op_count, max_ops) do
+    current = :atomics.get(ref, @enqueue_ops_queued)
+
+    if current + op_count > max_ops do
+      {:error, :queue_full}
+    else
+      case :atomics.compare_exchange(
+             ref,
+             @enqueue_ops_queued,
+             current,
+             current + op_count
+           ) do
+        :ok -> {:ok, {ref, op_count}}
+        _actual -> do_reserve_queued_ops(ref, op_count, max_ops)
+      end
+    end
+  end
+
+  defp queued_ops(ref) do
+    if :atomics.info(ref).size >= @enqueue_ops_queued do
+      :atomics.get(ref, @enqueue_ops_queued)
+    else
+      0
+    end
+  rescue
+    _ -> 0
+  end
 
   def maybe_reply_flush_waiters(%{flush_waiters: []} = state), do: state
 

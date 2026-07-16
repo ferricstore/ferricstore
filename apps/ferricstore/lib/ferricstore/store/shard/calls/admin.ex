@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Bitcask.NIF
+      alias Ferricstore.Store.CompactionPlan
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       require Logger
 
@@ -16,29 +17,38 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
         sp = state.shard_data_path
         key_count = :ets.info(state.keydir, :size)
         # Compute file-level stats for merge scheduler
-        {total_bytes, live_bytes, dead_bytes, file_count} =
+        {total_bytes, dead_bytes, file_count} =
           case Ferricstore.FS.ls(sp) do
             {:ok, files} ->
-              log_files = Enum.filter(files, &String.ends_with?(&1, ".log"))
-              fc = length(log_files)
+              Enum.reduce(files, {0, 0, 0}, fn name, {total, dead, count} = acc ->
+                case admin_log_file_id(name) do
+                  nil ->
+                    acc
 
-              total =
-                Enum.reduce(log_files, 0, fn name, acc ->
-                  case File.stat(Path.join(sp, name)) do
-                    {:ok, %{size: s}} -> acc + s
-                    _ -> acc
-                  end
-                end)
+                  file_id ->
+                    case File.lstat(Path.join(sp, name)) do
+                      {:ok, %{type: :regular, size: size}} ->
+                        {_tracked_total, tracked_dead} =
+                          Map.get(Map.get(state, :file_stats, %{}), file_id, {size, 0})
 
-              # Estimate: live = total / file_count (single active), dead = total - live
-              live = if fc > 0, do: div(total, fc), else: 0
-              dead = total - live
-              {total, live, dead, fc}
+                        tracked_dead =
+                          if is_integer(tracked_dead),
+                            do: tracked_dead |> max(0) |> min(size),
+                            else: 0
+
+                        {total + size, dead + tracked_dead, count + 1}
+
+                      _ ->
+                        acc
+                    end
+                end
+              end)
 
             _ ->
-              {0, 0, 0, 0}
+              {0, 0, 0}
           end
 
+        live_bytes = total_bytes - dead_bytes
         frag = if total_bytes > 0, do: dead_bytes / total_bytes, else: 0.0
         {:reply, {:ok, {total_bytes, live_bytes, dead_bytes, file_count, key_count, frag}}, state}
       end
@@ -52,13 +62,16 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
           case Ferricstore.FS.ls(sp) do
             {:ok, files} ->
               files
-              |> Enum.filter(&String.ends_with?(&1, ".log"))
               |> Enum.flat_map(fn name ->
-                fid = name |> String.trim_trailing(".log") |> String.to_integer()
+                case admin_log_file_id(name) do
+                  nil ->
+                    []
 
-                case File.stat(Path.join(sp, name)) do
-                  {:ok, %{size: size}} -> [{fid, size}]
-                  {:error, _} -> []
+                  fid ->
+                    case File.lstat(Path.join(sp, name)) do
+                      {:ok, %{type: :regular, size: size}} -> [{fid, size}]
+                      _ -> []
+                    end
                 end
               end)
 
@@ -73,251 +86,316 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
         {:reply, {:error, "ERR shard writes paused for sync"}, state}
       end
 
+      def handle_call(
+            {:run_compaction, _file_ids},
+            _from,
+            %{compaction_worker: worker} = state
+          )
+          when worker != nil do
+        {:reply, {:error, :compaction_in_progress}, state}
+      end
+
       def handle_call({:run_compaction, file_ids}, _from, state) do
-        try do
-          state = await_in_flight(state)
-          state = sync_active_file_from_registry(state)
-          state = flush_pending_sync(state)
+        case prepare_compaction_state(state) do
+          {:ok, prepared_state} ->
+            start_compaction_worker(file_ids, _from, prepared_state)
+
+          {:error, reason, failed_state} ->
+            {:reply, {:error, reason}, failed_state}
+        end
+      end
+
+      defp prepare_compaction_state(state) do
+        state = await_in_flight(state)
+        state = sync_active_file_from_registry(state)
+        state = flush_pending_sync(state)
+
+        if Map.get(state, :last_flush_error) != nil do
+          {:error, {:pending_flush_failed, state.last_flush_error}, state}
+        else
           # Router async/RMW paths can leave small values queued in BitcaskWriter with
           # ETS file_id=:pending. Drain those writes before compaction snapshots ETS,
           # otherwise a source file can be removed while the writer still targets it.
           case Ferricstore.Store.BitcaskWriter.flush(state.instance_ctx, state.index) do
             :ok ->
-              :ok
+              {:ok, sync_active_file_from_registry(state)}
 
             {:error, reason} ->
               Logger.warning(
                 "Shard #{state.index}: compaction aborted because BitcaskWriter flush failed: #{inspect(reason)}"
               )
 
-              throw({:bitcask_writer_flush_failed, reason, state})
+              {:error, {:bitcask_writer_flush_failed, reason}, state}
+          end
+        end
+      end
+
+      defp start_compaction_worker(file_ids, from, state) do
+        parent = self()
+        job_ref = make_ref()
+
+        {pid, monitor_ref} =
+          :erlang.spawn_opt(
+            fn ->
+              result = run_compaction_worker(file_ids, state)
+              send(parent, {:shard_compaction_complete, job_ref, self(), result})
+            end,
+            [:link, :monitor]
+          )
+
+        worker = %{
+          file_ids: file_ids,
+          from: from,
+          job_ref: job_ref,
+          monitor_ref: monitor_ref,
+          pid: pid
+        }
+
+        {:noreply, %{state | compaction_worker: worker}}
+      end
+
+      defp run_compaction_worker(file_ids, state) do
+        sp = state.shard_data_path
+
+        {total_written, total_dropped, total_reclaimed, compacted_file_ids, skipped_file_ids,
+         failures} =
+          Enum.reduce(file_ids, {0, 0, 0, [], [], []}, fn fid,
+                                                          {written, dropped, reclaimed, compacted,
+                                                           skipped, failures} ->
+            if fid == state.active_file_id do
+              {written, dropped, reclaimed, compacted, skipped, failures}
+            else
+              case compact_inactive_segment(state, fid) do
+                {:ok, copied, reclaimed_bytes} ->
+                  {written + copied, dropped, reclaimed + reclaimed_bytes, [fid | compacted],
+                   skipped, failures}
+
+                :skipped ->
+                  {written, dropped, reclaimed, compacted, [fid | skipped], failures}
+
+                {:committed_error, copied, reclaimed_bytes, reason} ->
+                  failure = {fid, :compaction_finalize_failed, reason}
+
+                  {written + copied, dropped, reclaimed + reclaimed_bytes, [fid | compacted],
+                   skipped, [failure | failures]}
+
+                {:error, phase, reason} ->
+                  failure =
+                    case phase do
+                      :publication -> {fid, :compaction_publication_failed, reason}
+                      _other -> {fid, reason}
+                    end
+
+                  {written, dropped, reclaimed, compacted, skipped, [failure | failures]}
+              end
+            end
+          end)
+
+        # Dir fsync makes rename/rm entries durable so a kernel panic after
+        # compaction doesn't resurrect pre-merge filenames. If this fails, the
+        # namespace was changed in this running process, so keep file_stats in
+        # sync with reality but return an error to the scheduler/operator.
+        dir_fsync_failure =
+          if compacted_file_ids == [] do
+            nil
+          else
+            case compaction_fsync_dir(state, sp) do
+              :ok ->
+                nil
+
+              {:error, reason} ->
+                Logger.error(
+                  "Shard #{state.index}: compaction directory fsync failed for #{sp}: #{inspect(reason)}"
+                )
+
+                {:dir_fsync_failed, reason}
+            end
           end
 
-          state = sync_active_file_from_registry(state)
-          sp = state.shard_data_path
-          # v2 compaction: for each file_id, collect live key offsets from ETS,
-          # copy them to a new file, then replace the old file.
-          # Track statistics for the merge scheduler.
-          live_entries_by_fid = group_compaction_live_entries(state, file_ids)
-
-          {total_written, total_dropped, total_reclaimed, compacted_file_ids, skipped_file_ids,
-           failures} =
-            Enum.reduce(file_ids, {0, 0, 0, [], [], []}, fn fid,
-                                                            {written, dropped, reclaimed,
-                                                             compacted, skipped, failures} ->
-              source = file_path(sp, fid)
-              live_entries = Map.get(live_entries_by_fid, fid, [])
-
-              cond do
-                fid == state.active_file_id ->
-                  {written, dropped, reclaimed, compacted, skipped, failures}
-
-                live_entries != [] ->
-                  offsets = Enum.map(live_entries, &compaction_entry_offset/1)
-
-                  old_size =
-                    case File.stat(source) do
-                      {:ok, %{size: s}} -> s
-                      _ -> 0
-                    end
-
-                  dest = Path.join(sp, "compact_#{fid}.log")
-                  tombstone_offsets = needed_tombstone_offsets(sp, fid, source)
-
-                  copy_result =
-                    case prepare_compaction_temp(dest) do
-                      :ok ->
-                        if tombstone_offsets == [] do
-                          NIF.v2_copy_records(source, dest, offsets)
-                        else
-                          NIF.v2_copy_records_preserve_tombstones(
-                            source,
-                            dest,
-                            offsets,
-                            tombstone_offsets
-                          )
-                        end
-
-                      {:error, reason} ->
-                        {:error, {:temp_remove_failed, reason}}
-                    end
-
-                  case copy_result do
-                    {:ok, results} when length(results) == length(live_entries) ->
-                      case remove_hint_for_file(sp, fid) do
-                        :ok ->
-                          Ferricstore.FS.rename!(dest, source)
-                          update_compacted_ets_locations(state.keydir, fid, live_entries, results)
-
-                          cold_update =
-                            update_compacted_flow_cold_locations(state, live_entries, results)
-
-                          case cold_update do
-                            :ok ->
-                              new_size =
-                                case File.stat(source) do
-                                  {:ok, %{size: s}} -> s
-                                  _ -> 0
-                                end
-
-                              {written + length(live_entries), dropped,
-                               reclaimed + max(old_size - new_size, 0), [fid | compacted],
-                               skipped, failures}
-
-                            {:error, reason} ->
-                              failure = {fid, :cold_flow_locator_update_failed, reason}
-
-                              Logger.error(
-                                "Shard #{state.index}: compaction cold Flow locator update failed for #{source}: #{inspect(reason)}"
-                              )
-
-                              {written, dropped, reclaimed, compacted, skipped,
-                               [failure | failures]}
-                          end
-
-                        {:error, reason} ->
-                          remove_compaction_temp(state, dest)
-
-                          {written, dropped, reclaimed, compacted, skipped,
-                           [{fid, {:hint_remove_failed, reason}} | failures]}
-                      end
-
-                    {:ok, results} ->
-                      Logger.error(
-                        "Shard #{state.index}: compaction copy_records result mismatch for #{source}: expected #{length(live_entries)}, got #{length(results)}"
-                      )
-
-                      remove_compaction_temp(state, dest)
-
-                      failure =
-                        {fid, {:copy_result_mismatch, length(live_entries), length(results)}}
-
-                      {written, dropped, reclaimed, compacted, skipped, [failure | failures]}
-
-                    {:error, reason} ->
-                      maybe_emit_compaction_crc_mismatch(state, fid, source, dest, reason)
-
-                      Logger.error(
-                        "Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}"
-                      )
-
-                      remove_compaction_temp(state, dest)
-
-                      {written, dropped, reclaimed, compacted, skipped,
-                       [{fid, {:copy_failed, reason}} | failures]}
-                  end
-
-                true ->
-                  # Tombstones are not represented in ETS, but they can still be
-                  # semantically live because they suppress older values in lower file
-                  # ids. Per-file compaction cannot prove those older values are gone,
-                  # so keep tombstone-only files for correctness.
-                  old_size =
-                    case File.stat(source) do
-                      {:ok, %{size: s}} -> s
-                      _ -> 0
-                    end
-
-                  if tombstone_file?(source) do
-                    case remove_hint_for_file(sp, fid) do
-                      :ok ->
-                        if tombstone_file_still_needed?(sp, fid, source) do
-                          {written, dropped, reclaimed, compacted, [fid | skipped], failures}
-                        else
-                          case remove_compacted_source(state, source) do
-                            :ok ->
-                              {written, dropped, reclaimed + old_size, [fid | compacted], skipped,
-                               failures}
-
-                            {:error, reason} ->
-                              {written, dropped, reclaimed, compacted, skipped,
-                               [{fid, {:remove_failed, reason}} | failures]}
-                          end
-                        end
-
-                      {:error, reason} ->
-                        {written, dropped, reclaimed, compacted, skipped,
-                         [{fid, {:hint_remove_failed, reason}} | failures]}
-                    end
-                  else
-                    case remove_hint_for_file(sp, fid) do
-                      :ok ->
-                        case remove_compacted_source(state, source) do
-                          :ok ->
-                            {written, dropped, reclaimed + old_size, [fid | compacted], skipped,
-                             failures}
-
-                          {:error, reason} ->
-                            {written, dropped, reclaimed, compacted, skipped,
-                             [{fid, {:remove_failed, reason}} | failures]}
-                        end
-
-                      {:error, reason} ->
-                        {written, dropped, reclaimed, compacted, skipped,
-                         [{fid, {:hint_remove_failed, reason}} | failures]}
-                    end
-                  end
+        reply =
+          case {dir_fsync_failure, failures} do
+            {nil, []} ->
+              if compacted_file_ids == [] and skipped_file_ids != [] do
+                {:error, {:no_compactable_files, Enum.reverse(skipped_file_ids)}}
+              else
+                {:ok, {total_written, total_dropped, total_reclaimed}}
               end
-            end)
 
-          # Dir fsync makes rename/rm entries durable so a kernel panic after
-          # compaction doesn't resurrect pre-merge filenames. If this fails, the
-          # namespace was changed in this running process, so keep file_stats in
-          # sync with reality but return an error to the scheduler/operator.
-          dir_fsync_failure =
-            if compacted_file_ids == [] do
-              nil
-            else
-              case compaction_fsync_dir(state, sp) do
+            {nil, [_ | _]} ->
+              {:error, {:compaction_failed, Enum.reverse(failures)}}
+
+            {failure, []} ->
+              {:error, {:compaction_failed, [failure]}}
+
+            {failure, [_ | _]} ->
+              {:error, {:compaction_failed, Enum.reverse(failures, [failure])}}
+          end
+
+        {reply, compacted_file_ids}
+      end
+
+      defp compact_inactive_segment(state, fid) do
+        source = file_path(state.shard_data_path, fid)
+        dest = Path.join(state.shard_data_path, "compact_#{fid}.log")
+        old_size = compaction_file_size(source)
+
+        if match?({:ok, %File.Stat{type: :directory}}, File.lstat(source)) do
+          finalize_empty_compaction_segment(state, fid, source, old_size, 0)
+        else
+          case build_compaction_plan(state, fid, source, dest) do
+            {:ok, %{plan_path: plan_path, live_count: 0, tombstone_count: tombstone_count}} ->
+              remove_compaction_temp(state, dest)
+
+              with :ok <- CompactionPlan.remove(plan_path) do
+                finalize_empty_compaction_segment(
+                  state,
+                  fid,
+                  source,
+                  old_size,
+                  tombstone_count
+                )
+              else
+                {:error, reason} -> {:error, :planning, reason}
+              end
+
+            {:ok, %{plan_path: plan_path, live_count: live_count}} ->
+              case publish_compacted_segment(state, fid, source, dest, plan_path) do
                 :ok ->
-                  nil
+                  finalize_published_compaction(state, fid, source, old_size, live_count)
+
+                {:committed_error, reason} ->
+                  new_size = compaction_file_size(source)
+                  hint_result = remove_hint_for_file(state.shard_data_path, fid)
+
+                  combined_reason =
+                    case hint_result do
+                      :ok ->
+                        reason
+
+                      {:error, hint_reason} ->
+                        {reason, {:post_publish_hint_remove_failed, hint_reason}}
+                    end
+
+                  {:committed_error, live_count, max(old_size - new_size, 0), combined_reason}
 
                 {:error, reason} ->
+                  remove_compaction_temp(state, dest)
+                  _ = CompactionPlan.remove(plan_path)
+
                   Logger.error(
-                    "Shard #{state.index}: compaction directory fsync failed for #{sp}: #{inspect(reason)}"
+                    "Shard #{state.index}: compaction publication failed for #{source}: #{inspect(reason)}"
                   )
 
-                  {:dir_fsync_failed, reason}
+                  {:error, :publication, reason}
               end
-            end
 
-          # Reset file_stats for compacted files: dead bytes are now gone,
-          # total bytes reflect the new compacted file size.
-          new_file_stats =
-            Enum.reduce(compacted_file_ids, state.file_stats, fn fid, fs ->
-              case File.stat(file_path(sp, fid)) do
-                {:ok, %{size: new_size}} ->
-                  Map.put(fs, fid, {new_size, 0})
+            {:error, reason} ->
+              maybe_emit_compaction_crc_mismatch(state, fid, source, dest, reason)
 
-                _ ->
-                  # File was deleted entirely (all dead)
-                  Map.delete(fs, fid)
-              end
-            end)
+              Logger.error(
+                "Shard #{state.index}: compaction planning failed for #{source}: #{inspect(reason)}"
+              )
 
-          reply =
-            case {dir_fsync_failure, failures} do
-              {nil, []} ->
-                if compacted_file_ids == [] and skipped_file_ids != [] do
-                  {:error, {:no_compactable_files, Enum.reverse(skipped_file_ids)}}
-                else
-                  {:ok, {total_written, total_dropped, total_reclaimed}}
+              normalized_reason =
+                case reason do
+                  {:copy_failed, copy_reason} -> {:copy_failed, copy_reason}
+                  other -> {:compaction_plan_failed, other}
                 end
 
-              {nil, [_ | _]} ->
-                {:error, {:compaction_failed, Enum.reverse(failures)}}
+              {:error, :planning, normalized_reason}
+          end
+        end
+      end
 
-              {failure, []} ->
-                {:error, {:compaction_failed, [failure]}}
+      defp finalize_published_compaction(state, fid, source, old_size, live_count) do
+        new_size = compaction_file_size(source)
+        reclaimed = max(old_size - new_size, 0)
 
-              {failure, [_ | _]} ->
-                {:error, {:compaction_failed, Enum.reverse(failures, [failure])}}
+        case remove_hint_for_file(state.shard_data_path, fid) do
+          :ok ->
+            {:ok, live_count, reclaimed}
+
+          {:error, reason} ->
+            {:committed_error, live_count, reclaimed, {:post_publish_hint_remove_failed, reason}}
+        end
+      end
+
+      defp finalize_empty_compaction_segment(
+             state,
+             fid,
+             source,
+             old_size,
+             needed_tombstone_count
+           ) do
+        with :ok <- remove_hint_for_file(state.shard_data_path, fid) do
+          if needed_tombstone_count > 0 do
+            :skipped
+          else
+            case remove_compacted_source(state, source) do
+              :ok -> {:ok, 0, old_size}
+              {:error, reason} -> {:error, :removal, {:remove_failed, reason}}
             end
+          end
+        else
+          {:error, reason} -> {:error, :removal, {:hint_remove_failed, reason}}
+        end
+      end
 
-          {:reply, reply, %{state | file_stats: new_file_stats}}
-        catch
-          {:bitcask_writer_flush_failed, reason, abort_state} ->
-            {:reply, {:error, {:bitcask_writer_flush_failed, reason}}, abort_state}
+      defp compaction_file_size(path) do
+        case File.lstat(path) do
+          {:ok, %File.Stat{type: :regular, size: size}} -> size
+          _ -> 0
+        end
+      end
+
+      defp compaction_copy_records(state, source, dest, offsets, tombstone_offsets) do
+        case Map.get(state, :compaction_copy_fun) do
+          fun when is_function(fun, 4) ->
+            fun.(source, dest, offsets, tombstone_offsets)
+
+          _ when tombstone_offsets == [] ->
+            NIF.v2_copy_records(source, dest, offsets)
+
+          _ ->
+            NIF.v2_copy_records_preserve_tombstones(
+              source,
+              dest,
+              offsets,
+              tombstone_offsets
+            )
+        end
+      end
+
+      defp refresh_compacted_file_stats(state, file_ids) do
+        file_stats =
+          Enum.reduce(file_ids, state.file_stats, fn fid, file_stats ->
+            case File.lstat(file_path(state.shard_data_path, fid)) do
+              {:ok, %File.Stat{type: :regular, size: new_size}} ->
+                Map.put(file_stats, fid, {new_size, 0})
+
+              _ ->
+                Map.delete(file_stats, fid)
+            end
+          end)
+
+        %{state | file_stats: file_stats}
+      end
+
+      defp cancel_compaction_worker(%{compaction_worker: nil} = state), do: state
+
+      defp cancel_compaction_worker(%{compaction_worker: worker} = state) do
+        Process.unlink(worker.pid)
+        Process.exit(worker.pid, :kill)
+        await_compaction_worker_down(worker)
+        GenServer.reply(worker.from, {:error, :shard_stopping})
+        %{state | compaction_worker: nil}
+      end
+
+      defp await_compaction_worker_down(worker) do
+        receive do
+          {:DOWN, ref, :process, pid, _reason}
+          when ref == worker.monitor_ref and pid == worker.pid ->
+            :ok
         end
       end
 
@@ -348,14 +426,50 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
         {:reply, :ok, state}
       end
 
+      defp admin_log_file_id(name) when is_binary(name) do
+        with true <- String.ends_with?(name, ".log"),
+             false <- String.starts_with?(name, "compact_"),
+             stem <- String.trim_trailing(name, ".log"),
+             {fid, ""} <- Integer.parse(stem),
+             true <- fid >= 0 do
+          fid
+        else
+          _invalid -> nil
+        end
+      end
+
       # -------------------------------------------------------------------
       # handle_call — catch-all for unhandled commands
       #
       # MUST be the LAST handle_call clause.
       # -------------------------------------------------------------------
-      # Catch-all for commands not handled above (prob commands, server_command,
-      # raft_apply_hook, etc.). Routes through Batcher → Raft when Raft is
+      # Catch-all for commands not handled above. Routes through Batcher → Raft when Raft is
       # enabled, or directly to state machine when Raft is disabled.
+      def handle_call(
+            {:flush_shard_paused, flush_epoch},
+            _from,
+            %{writes_paused: true} = state
+          ) do
+        sm_state = direct_sm_state(state)
+
+        case Ferricstore.Raft.StateMachine.apply(%{}, {:flush_shard, flush_epoch}, sm_state) do
+          {new_sm_state, result} ->
+            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+
+          {new_sm_state, result, _effects} ->
+            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+        end
+      end
+
+      def handle_call({:flush_shard_paused, _flush_epoch}, _from, state) do
+        {:reply, {:error, :flush_shard_requires_paused_writes}, state}
+      end
+
+      def handle_call(command, _from, %{writes_paused: true} = state)
+          when is_tuple(command) do
+        {:reply, {:error, "ERR shard writes paused for sync"}, state}
+      end
+
       def handle_call(command, from, state) when is_tuple(command) do
         cond do
           default_waraft_write_state?(state) ->

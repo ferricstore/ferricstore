@@ -1,6 +1,8 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
   @moduledoc false
 
+  alias FerricstoreServer.Health.QueryDecoder
+
   import FerricstoreServer.Health.Dashboard.Flow.Calls,
     only: [
       bounded_dashboard_call: 3,
@@ -13,7 +15,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
   @state_meta_idle "Enter workflow type, metadata state, key, and value"
 
   def opts_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     [
       limit: normalize_limit(Map.get(params, "limit")),

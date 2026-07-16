@@ -188,14 +188,14 @@ defmodule Ferricstore.Cluster.DataSync do
   @spec sync_shard(non_neg_integer(), node(), FerricStore.Instance.t()) ::
           {:ok, :wal_bridgeable | non_neg_integer()} | {:error, term()}
   def sync_shard(shard_index, target_node, ctx) do
-    leader_node = find_leader_for(shard_index)
+    with {:ok, leader_node} <- find_leader_for(shard_index) do
+      case needs_resync?(shard_index, target_node, leader_node) do
+        :wal_bridgeable ->
+          {:ok, :wal_bridgeable}
 
-    case needs_resync?(shard_index, target_node, leader_node) do
-      :wal_bridgeable ->
-        {:ok, :wal_bridgeable}
-
-      :needs_resync ->
-        do_sync_shard(shard_index, target_node, leader_node, ctx)
+        :needs_resync ->
+          do_sync_shard(shard_index, target_node, leader_node, ctx)
+      end
     end
   end
 
@@ -212,7 +212,11 @@ defmodule Ferricstore.Cluster.DataSync do
   """
   @spec retry_sync_shard(non_neg_integer(), node(), FerricStore.Instance.t(), non_neg_integer()) ::
           {:ok, :wal_bridgeable | non_neg_integer()} | {:error, term()}
-  def retry_sync_shard(shard_index, target_node, ctx, max_retries \\ @default_max_retries) do
+  def retry_sync_shard(shard_index, target_node, ctx, max_retries \\ @default_max_retries)
+
+  def retry_sync_shard(_shard_index, _target_node, _ctx, 0), do: {:error, :not_attempted}
+
+  def retry_sync_shard(shard_index, target_node, ctx, max_retries) when max_retries > 0 do
     Enum.reduce_while(1..max_retries, {:error, :not_attempted}, fn attempt, _acc ->
       case sync_shard(shard_index, target_node, ctx) do
         {:ok, _} = ok ->
@@ -270,62 +274,92 @@ defmodule Ferricstore.Cluster.DataSync do
       # After copying all shard data, tell the target to rebuild keydirs
       # from the newly copied files. The target's shards started with empty
       # keydirs — now the Bitcask files are in place, so re-recovery populates ETS.
-      rebuild_keydirs_on_target(target_node, ctx.shard_count)
-      {:ok, results}
+      case rebuild_keydirs_on_target(target_node, ctx.shard_count) do
+        :ok -> {:ok, results}
+        {:error, reason} -> {:error, {:keydir_rebuild_failed, results, reason}}
+      end
     else
       {:error, {:partial_sync, results}}
     end
   end
 
   @doc false
+  def rebuild_keydirs_on_target(_target_node, 0), do: :ok
+
   def rebuild_keydirs_on_target(target_node, shard_count) do
     Logger.info("DataSync: rebuilding keydirs on #{target_node}")
 
-    for shard_idx <- 0..(shard_count - 1) do
-      try do
-        # Use the shard's GenServer to get its actual keydir ref and data path.
-        # This avoids ETS naming mismatches between Instance refs and actual tables.
-        shard_name = :"Ferricstore.Store.Shard.#{shard_idx}"
+    failures =
+      Enum.reduce(0..(shard_count - 1), %{}, fn shard_idx, failures ->
+        case rebuild_keydir_on_target(target_node, shard_idx) do
+          :ok -> failures
+          {:error, reason} -> Map.put(failures, shard_idx, reason)
+        end
+      end)
 
-        # Get the shard state via :sys.get_state to find the real keydir ref
-        shard_state = :erpc.call(target_node, :sys, :get_state, [shard_name])
-        keydir = shard_state.keydir
-        shard_data_path = shard_state.shard_data_path
-
-        # Clear existing entries and re-recover from copied Bitcask files
-        :erpc.call(target_node, :ets, :delete_all_objects, [keydir])
-
-        :erpc.call(target_node, Ferricstore.Store.Shard.Lifecycle, :recover_keydir, [
-          shard_data_path,
-          keydir,
-          shard_idx
-        ])
-
-        ets_size = :erpc.call(target_node, :ets, :info, [keydir, :size])
-
-        Logger.info(
-          "DataSync: shard #{shard_idx} keydir rebuilt on #{target_node} (#{ets_size} keys)"
-        )
-      catch
-        kind, reason ->
-          Logger.error(
-            "DataSync: failed to rebuild keydir for shard #{shard_idx} on #{target_node}: #{inspect({kind, reason})}"
-          )
-      end
+    if map_size(failures) == 0 do
+      :ok
+    else
+      {:error, {:target_keydir_rebuild_failed, target_node, failures}}
     end
+  end
+
+  defp rebuild_keydir_on_target(target_node, shard_idx) do
+    shard_name = :"Ferricstore.Store.Shard.#{shard_idx}"
+
+    shard_state = :erpc.call(target_node, :sys, :get_state, [shard_name])
+    keydir = shard_state.keydir
+    shard_data_path = shard_state.shard_data_path
+
+    :erpc.call(target_node, :ets, :delete_all_objects, [keydir])
+
+    :erpc.call(target_node, Ferricstore.Store.Shard.Lifecycle, :recover_keydir, [
+      shard_data_path,
+      keydir,
+      shard_idx
+    ])
+
+    ets_size = :erpc.call(target_node, :ets, :info, [keydir, :size])
+
+    Logger.info(
+      "DataSync: shard #{shard_idx} keydir rebuilt on #{target_node} (#{ets_size} keys)"
+    )
+
+    :ok
+  catch
+    kind, reason ->
+      failure = {kind, reason}
+
+      Logger.error(
+        "DataSync: failed to rebuild keydir for shard #{shard_idx} on #{target_node}: #{inspect(failure)}"
+      )
+
+      {:error, failure}
   end
 
   # ---------------------------------------------------------------------------
   # Private: leader resolution
   # ---------------------------------------------------------------------------
 
-  @spec find_leader_for(non_neg_integer()) :: node()
+  @spec find_leader_for(non_neg_integer(), (non_neg_integer(), timeout() -> term())) ::
+          {:ok, node()} | {:error, term()}
   @doc false
-  def find_leader_for(shard_index) do
-    case RaftCluster.members(shard_index, 5_000) do
-      {:ok, _members, {_name, leader_node}} -> leader_node
-      _ -> node()
+  def find_leader_for(
+        shard_index,
+        members_fun \\ fn index, timeout -> RaftCluster.members(index, timeout) end
+      ) do
+    case members_fun.(shard_index, 5_000) do
+      {:ok, _members, {_name, leader_node}} when is_atom(leader_node) ->
+        {:ok, leader_node}
+
+      {:error, reason} ->
+        {:error, {:leader_unavailable, reason}}
+
+      other ->
+        {:error, {:leader_unavailable, {:unexpected_members_result, other}}}
     end
+  catch
+    kind, reason -> {:error, {:leader_unavailable, {kind, reason}}}
   end
 
   # ---------------------------------------------------------------------------
@@ -560,30 +594,46 @@ defmodule Ferricstore.Cluster.DataSync do
         target_data_dir,
         shard_index
       ) do
-    source_shard_data = Ferricstore.DataDir.shard_data_path(source_data_dir, shard_index)
-    target_shard_data = Ferricstore.DataDir.shard_data_path(target_data_dir, shard_index)
-
-    :ok = copy_directory_from(source_node, source_shard_data, target_node, target_shard_data)
-
-    source_dedicated = dedicated_shard_path(source_data_dir, shard_index)
-    target_dedicated = dedicated_shard_path(target_data_dir, shard_index)
-
-    if remote_dir?(source_node, source_dedicated) do
-      copy_directory_from(source_node, source_dedicated, target_node, target_dedicated)
-    else
-      :ok
+    if source_node == target_node and
+         Path.expand(source_data_dir) == Path.expand(target_data_dir) do
+      raise ArgumentError, "source and target shard storage must be distinct"
     end
 
+    source_shard_data = Ferricstore.DataDir.shard_data_path(source_data_dir, shard_index)
+    target_shard_data = Ferricstore.DataDir.shard_data_path(target_data_dir, shard_index)
+    source_dedicated = dedicated_shard_path(source_data_dir, shard_index)
+    target_dedicated = dedicated_shard_path(target_data_dir, shard_index)
     source_blob = blob_shard_path(source_data_dir, shard_index)
     target_blob = blob_shard_path(target_data_dir, shard_index)
 
-    if remote_dir?(source_node, source_blob) do
-      copy_directory_from(source_node, source_blob, target_node, target_blob)
-    else
-      :ok
-    end
+    Enum.each([target_shard_data, target_dedicated, target_blob], fn path ->
+      replace_target_tree!(target_node, path)
+    end)
+
+    :ok = copy_directory_from(source_node, source_shard_data, target_node, target_shard_data)
+
+    if remote_dir?(source_node, source_dedicated),
+      do: copy_directory_from(source_node, source_dedicated, target_node, target_dedicated)
+
+    if remote_dir?(source_node, source_blob),
+      do: copy_directory_from(source_node, source_blob, target_node, target_blob)
 
     :ok
+  end
+
+  defp replace_target_tree!(target_node, path) do
+    case call_on(target_node, Ferricstore.FS, :rm_rf, [path]) do
+      :ok ->
+        parent = Path.dirname(path)
+        :erpc.call(target_node, File, :mkdir_p!, [parent])
+        sync_target_dir!(target_node, parent, :replace_target_tree, path)
+
+      {:error, reason} ->
+        raise "DataSync: failed to remove stale target tree #{path}: #{inspect(reason)}"
+
+      other ->
+        raise "DataSync: stale target tree removal returned #{inspect(other)} for #{path}"
+    end
   end
 
   defp dedicated_shard_path(data_dir, shard_index) do

@@ -33,7 +33,7 @@ defmodule FerricstoreServer.Health.ProbeEndpoint do
   @spec child_spec(:inet.port_number()) :: Supervisor.child_spec()
   def child_spec(port) do
     transport_opts = %{
-      socket_opts: [port: port],
+      socket_opts: [port: port, buffer: @max_request_bytes],
       num_acceptors: 2,
       max_connections: 64
     }
@@ -58,7 +58,7 @@ defmodule FerricstoreServer.Health.ProbeEndpoint do
   @spec init(term(), module(), map()) :: :ok
   def init(ref, transport, opts) do
     {:ok, socket} = :ranch.handshake(ref)
-    :ok = transport.setopts(socket, active: false)
+    :ok = transport.setopts(socket, active: false, buffer: @max_request_bytes)
 
     request_deadline = System.monotonic_time(:millisecond) + @request_timeout_ms
 

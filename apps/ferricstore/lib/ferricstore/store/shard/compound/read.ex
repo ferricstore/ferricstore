@@ -1,12 +1,13 @@
 defmodule Ferricstore.Store.Shard.Compound.Read do
   @moduledoc false
 
-  alias Ferricstore.Store.{BlobValue, ColdRead}
+  alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.Compound.{Promoted, Support}
 
   @cold_batch_read_timeout_ms 10_000
+  @storage_read_failure ReadResult.failure(:invalid_keydir_entry)
 
   @spec handle_compound_get(binary(), binary(), map()) :: {:reply, term(), map()}
   @doc false
@@ -54,6 +55,10 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
                {state, [entry | shared_entries], shared_count + 1, dedicated_entries,
                 dedicated_count}}
 
+            {:error, :invalid_keydir_entry} ->
+              {{:value, @storage_read_failure},
+               {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+
             :expired ->
               {{:value, nil},
                {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
@@ -82,6 +87,10 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
               {{:dedicated_cold, dedicated_count},
                {state, shared_entries, shared_count, [entry | dedicated_entries],
                 dedicated_count + 1}}
+
+            {:error, :invalid_keydir_entry} ->
+              {{:value, @storage_read_failure},
+               {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
 
             :expired ->
               {{:value, nil},
@@ -129,6 +138,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
             entry = {state, compound_key, file_path, fid, off, vsize, exp}
             {{:cold, cold_count}, {state, [entry | cold_entries], cold_count + 1}}
 
+          {:error, :invalid_keydir_entry} ->
+            {{:value, @storage_read_failure}, {state, cold_entries, cold_count}}
+
           :expired ->
             {{:value, nil}, {state, cold_entries, cold_count}}
 
@@ -170,6 +182,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
             file_path = Promoted.dedicated_file_path(dedicated_path, fid)
             entry = {state, compound_key, file_path, fid, off, vsize, exp}
             {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
+
+          {:error, :invalid_keydir_entry} ->
+            {{:value, @storage_read_failure}, {cold_entries, cold_count}}
 
           :expired ->
             {{:value, nil}, {cold_entries, cold_count}}
@@ -261,8 +276,8 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
         ShardETS.cold_read_warm_ets(state, compound_key, materialized, exp, fid, off, vsize)
         materialized
 
-      {_entry, _value} ->
-        nil
+      {_entry, {:error, reason}} ->
+        ReadResult.failure({:cold_read_failed, reason})
     end)
   end
 
@@ -280,8 +295,18 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
 
           {Map.update(groups, group_key, [item], &[item | &1]), indexed_results}
 
-        {_entry_value, index}, {groups, indexed_results} ->
-          {groups, Map.put(indexed_results, index, :skip)}
+        {{{_state, _compound_key, _file_path, _fid, _off, _vsize, _exp}, {:error, reason}}, index},
+        {groups, indexed_results} ->
+          {groups, Map.put(indexed_results, index, {:error, reason})}
+
+        {{{_state, _compound_key, _file_path, _fid, _off, _vsize, _exp}, nil}, index},
+        {groups, indexed_results} ->
+          {groups, Map.put(indexed_results, index, {:error, :missing_live_cold_entry})}
+
+        {{{_state, _compound_key, _file_path, _fid, _off, _vsize, _exp}, invalid}, index},
+        {groups, indexed_results} ->
+          {groups,
+           Map.put(indexed_results, index, {:error, {:invalid_cold_read_result, invalid}})}
       end)
 
     indexed_results =
@@ -317,9 +342,12 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
   defp compound_get_value(redis_key, compound_key, state) do
     case Promoted.promoted_store_for_compound(state, redis_key, compound_key) do
       nil ->
-        case ShardETS.ets_lookup_warm(state, compound_key) do
+        case ShardETS.ets_lookup_warm_result(state, compound_key) do
           {:hit, value, _exp} ->
             {value, state}
+
+          {:error, :cold_read_failed} ->
+            {@storage_read_failure, state}
 
           :expired ->
             {nil, state}
@@ -341,6 +369,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
           :expired ->
             {nil, state}
 
+          {:error, :invalid_keydir_entry} ->
+            {@storage_read_failure, state}
+
           _cold_or_miss ->
             case Promoted.promoted_read(dedicated_path, compound_key, state) do
               {:ok, nil} ->
@@ -358,8 +389,11 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
                 ShardETS.ets_insert(state, compound_key, value, 0)
                 {value, state}
 
-              _error ->
-                {nil, state}
+              {:error, reason} ->
+                {promoted_read_failure(reason), state}
+
+              invalid ->
+                {ReadResult.failure({:invalid_promoted_read_result, invalid}), state}
             end
         end
     end
@@ -400,6 +434,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
             entry = {state, compound_key, file_path, fid, off, vsize, exp}
             {{:cold, cold_count}, {state, [entry | cold_entries], cold_count + 1}}
 
+          {:error, :invalid_keydir_entry} ->
+            {{:value, @storage_read_failure}, {state, cold_entries, cold_count}}
+
           :expired ->
             {{:value, nil}, {state, cold_entries, cold_count}}
 
@@ -421,6 +458,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
       read_compound_cold_batch_async(cold_entries)
       |> Enum.zip(cold_entries)
       |> Enum.map(fn
+        {{:error, {:storage_read_failed, _reason}} = failure, _entry} ->
+          failure
+
         {nil, _entry} ->
           nil
 
@@ -450,6 +490,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
             entry = {state, compound_key, file_path, fid, off, vsize, exp}
             {{:cold, cold_count}, {[entry | cold_entries], cold_count + 1}}
 
+          {:error, :invalid_keydir_entry} ->
+            {{:value, @storage_read_failure}, {cold_entries, cold_count}}
+
           :expired ->
             {{:value, nil}, {cold_entries, cold_count}}
 
@@ -464,6 +507,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
       read_compound_cold_batch_async(cold_entries)
       |> Enum.zip(cold_entries)
       |> Enum.map(fn
+        {{:error, {:storage_read_failed, _reason}} = failure, _entry} ->
+          failure
+
         {nil, _entry} ->
           nil
 
@@ -484,9 +530,12 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
   defp compound_get_meta_value(redis_key, compound_key, state) do
     case Promoted.promoted_store(state, redis_key) do
       nil ->
-        case ShardETS.ets_lookup_warm(state, compound_key) do
+        case ShardETS.ets_lookup_warm_result(state, compound_key) do
           {:hit, value, expire_at_ms} ->
             {{value, expire_at_ms}, state}
+
+          {:error, :cold_read_failed} ->
+            {@storage_read_failure, state}
 
           :expired ->
             {nil, state}
@@ -508,6 +557,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
           :expired ->
             {nil, state}
 
+          {:error, :invalid_keydir_entry} ->
+            {@storage_read_failure, state}
+
           _cold_or_miss ->
             case Promoted.promoted_read(dedicated_path, compound_key, state) do
               {:ok, nil} ->
@@ -525,10 +577,16 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
                 ShardETS.ets_insert(state, compound_key, value, 0)
                 {{value, 0}, state}
 
-              _error ->
-                {nil, state}
+              {:error, reason} ->
+                {promoted_read_failure(reason), state}
+
+              invalid ->
+                {ReadResult.failure({:invalid_promoted_read_result, invalid}), state}
             end
         end
     end
   end
+
+  defp promoted_read_failure(:invalid_keydir_entry), do: @storage_read_failure
+  defp promoted_read_failure(reason), do: ReadResult.failure({:cold_read_failed, reason})
 end

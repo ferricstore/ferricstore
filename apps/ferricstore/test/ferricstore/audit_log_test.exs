@@ -56,6 +56,14 @@ defmodule Ferricstore.AuditLogTest do
       assert :ets.whereis(:ferricstore_audit_log) != :undefined
     end
 
+    test "uses ordered traversal instead of copying and sorting the complete ring" do
+      assert :ets.info(:ferricstore_audit_log, :type) == :ordered_set
+
+      source = File.read!(Path.expand("../../lib/ferricstore/audit_log.ex", __DIR__))
+      refute source =~ ":ets.tab2list"
+      refute source =~ "Enum.sort_by"
+    end
+
     test "responds to ping" do
       assert GenServer.call(AuditLog, :ping) == :pong
     end
@@ -441,6 +449,32 @@ defmodule Ferricstore.AuditLogTest do
       Application.delete_env(:ferricstore, :audit_log_max_entries)
       assert AuditLog.max_entries() == 128
     end
+
+    test "falls back safely for invalid values" do
+      for invalid <- [-1, "unbounded", nil] do
+        Application.put_env(:ferricstore, :audit_log_max_entries, invalid)
+        assert AuditLog.max_entries() == 128
+      end
+    end
+  end
+
+  test "copies and bounds binary metadata instead of retaining request buffers" do
+    request = :binary.copy("x", 1_000_000) <> "user"
+    username = binary_part(request, 1_000_000, 4)
+    AuditLog.log(:auth_success, %{username: username, payload: request})
+
+    ShardHelpers.eventually(
+      fn -> AuditLog.len() == 1 end,
+      "entry not recorded",
+      20,
+      10
+    )
+
+    [{_, _, :auth_success, details}] = AuditLog.get()
+    assert details.username == "user"
+    assert :binary.referenced_byte_size(details.username) == byte_size(details.username)
+    assert byte_size(details.payload) < 512
+    assert :binary.referenced_byte_size(details.payload) == byte_size(details.payload)
   end
 
   # ---------------------------------------------------------------------------

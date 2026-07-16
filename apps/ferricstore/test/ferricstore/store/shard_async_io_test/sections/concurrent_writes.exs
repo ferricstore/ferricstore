@@ -250,7 +250,9 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.ConcurrentWrites do
 
             assert nil == GenServer.call(pid, {:get, key})
             assert nil == GenServer.call(pid, {:get_meta, key})
-            assert {:ok, nil} == ShardReads.v2_local_read(:sys.get_state(pid), key)
+
+            assert {:error, {:storage_read_failed, {:cold_read_failed, _reason}}} =
+                     ShardReads.v2_local_read(:sys.get_state(pid), key)
           after
             cleanup_shard(pid, ctx, dir)
           end

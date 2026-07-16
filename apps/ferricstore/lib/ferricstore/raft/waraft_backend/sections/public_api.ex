@@ -26,6 +26,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
                             :blob_ref_unavailable,
                             :cross_shard_compensation_failed,
                             :flow_history_projection_failed,
+                            :state_read_failed,
                             :delete_prob_file_failed,
                             :storage_blocked,
                             :commit_call_failed_after_submit
@@ -228,6 +229,41 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
 
       def write(shard_index, _command), do: invalid_shard_index_error(shard_index)
 
+      @spec write_async(non_neg_integer(), tuple(), GenServer.from()) :: :ok | {:direct, term()}
+      def write_async(shard_index, _command, from) when invalid_shard_index_shape(shard_index) do
+        GenServer.reply(from, invalid_shard_index_error(shard_index))
+        :ok
+      end
+
+      def write_async(shard_index, command, from) when is_tuple(command) do
+        case SyncGate.enter(shard_index) do
+          {:ok, token} ->
+            try do
+              case NamespaceBatcher.write_single_async(shard_index, command, from, token) do
+                :ok ->
+                  :ok
+
+                {:direct, result} ->
+                  SyncGate.leave(token)
+                  {:direct, result}
+              end
+            catch
+              kind, reason ->
+                SyncGate.leave(token)
+                :erlang.raise(kind, reason, __STACKTRACE__)
+            end
+
+          {:error, _reason} = error ->
+            GenServer.reply(from, error)
+            :ok
+        end
+      end
+
+      def write_async(_shard_index, command, from) do
+        GenServer.reply(from, {:error, {:invalid_command, command}})
+        :ok
+      end
+
       @spec write_many([{non_neg_integer(), tuple()}]) :: [term()]
       def write_many([]), do: []
 
@@ -270,6 +306,48 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
 
       def write_batch(_shard_index, commands),
         do: {:error, {:invalid_command_batch, commands}}
+
+      @spec write_batch_async(non_neg_integer(), [tuple()], GenServer.from()) ::
+              :ok | {:direct, term()}
+      def write_batch_async(shard_index, _commands, from)
+          when invalid_shard_index_shape(shard_index) do
+        GenServer.reply(from, invalid_shard_index_error(shard_index))
+        :ok
+      end
+
+      def write_batch_async(_shard_index, [], from) do
+        GenServer.reply(from, {:ok, []})
+        :ok
+      end
+
+      def write_batch_async(shard_index, commands, from) when is_list(commands) do
+        case SyncGate.enter(shard_index) do
+          {:ok, token} ->
+            try do
+              case NamespaceBatcher.write_batch_async(shard_index, commands, from, token) do
+                :ok ->
+                  :ok
+
+                {:direct, result} ->
+                  SyncGate.leave(token)
+                  {:direct, result}
+              end
+            catch
+              kind, reason ->
+                SyncGate.leave(token)
+                :erlang.raise(kind, reason, __STACKTRACE__)
+            end
+
+          {:error, _reason} = error ->
+            GenServer.reply(from, error)
+            :ok
+        end
+      end
+
+      def write_batch_async(_shard_index, commands, from) do
+        GenServer.reply(from, {:error, {:invalid_command_batch, commands}})
+        :ok
+      end
 
       @doc false
       @spec __commit_batch_direct__(non_neg_integer(), [tuple()]) :: term()
@@ -440,6 +518,96 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
 
       def resume_writes_for_sync(shard_index, _timeout),
         do: invalid_shard_index_error(shard_index)
+
+      @spec pause_writes_for_sync_all(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+      def pause_writes_for_sync_all(shard_count, timeout \\ 30_000)
+
+      def pause_writes_for_sync_all(0, _timeout), do: :ok
+
+      def pause_writes_for_sync_all(shard_count, timeout)
+          when is_integer(shard_count) and shard_count > 0 do
+        shard_indexes = Enum.to_list(0..(shard_count - 1))
+        deadline = sync_pause_deadline(timeout)
+
+        with {:ok, pauses} <- SyncGate.pause_many(shard_indexes),
+             :ok <- flush_sync_pause_batchers(shard_indexes, deadline),
+             :ok <- SyncGate.await_many_drained(pauses, sync_pause_remaining(deadline)),
+             :ok <- flush_sync_pause_batchers(shard_indexes, deadline),
+             :ok <- run_sync_pause_barriers(shard_indexes) do
+          :ok
+        else
+          {:error, reason} = error ->
+            _ = SyncGate.resume_many(shard_indexes, 5_000)
+            emit_sync_pause_failed(:all, reason)
+            error
+        end
+      end
+
+      def pause_writes_for_sync_all(shard_count, _timeout),
+        do: {:error, {:invalid_shard_count, shard_count}}
+
+      @spec resume_writes_for_sync_all(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+      def resume_writes_for_sync_all(shard_count, timeout \\ 5_000)
+
+      def resume_writes_for_sync_all(0, _timeout), do: :ok
+
+      def resume_writes_for_sync_all(shard_count, timeout)
+          when is_integer(shard_count) and shard_count > 0 do
+        SyncGate.resume_many(Enum.to_list(0..(shard_count - 1)), timeout)
+      end
+
+      def resume_writes_for_sync_all(shard_count, _timeout),
+        do: {:error, {:invalid_shard_count, shard_count}}
+
+      @doc false
+      @spec write_flush_shard_paused(non_neg_integer(), {non_neg_integer(), non_neg_integer()}) ::
+              term()
+      def write_flush_shard_paused(shard_index, {physical_ms, logical} = flush_epoch)
+          when valid_shard_index_shape(shard_index) and is_integer(physical_ms) and
+                 physical_ms >= 0 and is_integer(logical) and logical >= 0 do
+        if SyncGate.paused?(shard_index) do
+          commit_or_redirect(shard_index, {:flush_shard, flush_epoch}, 2)
+        else
+          {:error, :flush_shard_requires_paused_writes}
+        end
+      end
+
+      def write_flush_shard_paused(shard_index, _flush_epoch),
+        do: invalid_shard_index_error(shard_index)
+
+      defp flush_sync_pause_batchers(shard_indexes, deadline) do
+        Enum.reduce_while(shard_indexes, :ok, fn shard_index, :ok ->
+          case NamespaceBatcher.flush(shard_index, sync_pause_remaining(deadline)) do
+            :ok ->
+              {:cont, :ok}
+
+            {:error, reason} ->
+              {:halt, {:error, {:sync_pause_batcher_flush_failed, shard_index, reason}}}
+          end
+        end)
+      end
+
+      defp run_sync_pause_barriers(shard_indexes) do
+        Enum.reduce_while(shard_indexes, :ok, fn shard_index, :ok ->
+          case sync_pause_barrier(shard_index) do
+            :ok ->
+              {:cont, :ok}
+
+            {:error, reason} ->
+              {:halt, {:error, {:sync_pause_barrier_failed, shard_index, reason}}}
+          end
+        end)
+      end
+
+      defp sync_pause_deadline(:infinity), do: :infinity
+
+      defp sync_pause_deadline(timeout) when is_integer(timeout) and timeout >= 0,
+        do: System.monotonic_time(:millisecond) + timeout
+
+      defp sync_pause_remaining(:infinity), do: :infinity
+
+      defp sync_pause_remaining(deadline),
+        do: max(deadline - System.monotonic_time(:millisecond), 0)
 
       @doc false
       @spec __commit_put_batch_direct__(

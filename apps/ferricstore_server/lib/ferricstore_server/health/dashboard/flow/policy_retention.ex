@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
 
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
   alias FerricstoreServer.Health.Dashboard.Data.Operational
+  alias FerricstoreServer.Health.QueryDecoder
 
   import FerricstoreServer.Health.Dashboard.Flow.Sample
   import FerricstoreServer.Health.Dashboard.FlowRecord
@@ -20,6 +21,11 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   def collect_policies_page(opts \\ []) when is_list(opts) do
     records = collect_flow_records_sample(@flow_dashboard_sample_limit)
     acl_username = DashboardAccess.keyspace_acl_username(opts)
+
+    visible_sampled =
+      records
+      |> DashboardAccess.filter_flow_records_for_acl(acl_username)
+      |> length()
 
     active_types =
       records
@@ -54,7 +60,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
       flash: Keyword.get(opts, :flash),
       active_types: active_types,
       configured_types: MapSet.size(configured_types),
-      total_sampled: length(records),
+      total_sampled: visible_sampled,
       sample_limit: @flow_dashboard_sample_limit,
       policy_scan: flow_policy_scan_metadata(policy_scan, acl_username),
       generated_at_ms: System.system_time(:millisecond)
@@ -91,7 +97,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   def apply_policy_form(_params), do: {:error, "ERR policy form must be a map"}
 
   def policy_flash_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     case Map.get(params, "status") do
       "ok" ->
@@ -197,7 +203,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.PolicyRetention do
   def apply_retention_form(_params), do: {:error, "ERR retention form must be a map"}
 
   def retention_flash_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     case Map.get(params, "status") do
       "dry_run" ->

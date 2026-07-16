@@ -326,7 +326,126 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
                    |> Map.get("field_1")
         end
 
-        test "cross-shard transaction HGET reads cold promoted field from dedicated storage" do
+        @tag :promotion_tx_mutation_support
+        test "transaction durably stages promoted hash mutations with shared writes" do
+          store = real_store()
+          key = ukey("tx_mutate_promoted")
+          field = "field_1"
+          new_field = "new_field"
+          ctx = FerricStore.Instance.get(:default)
+          idx = Router.shard_for(ctx, key)
+          shard = Router.shard_name(ctx, idx)
+
+          same_shard_key =
+            Enum.find_value(0..100_000, fn i ->
+              candidate = "tx_promoted_touch_#{System.unique_integer([:positive])}_#{i}"
+              if Router.shard_for(ctx, candidate) == idx, do: candidate
+            end)
+
+          populate_hash(store, key, @test_threshold + 1)
+          assert promoted?(key)
+
+          assert [1, 1, :ok] =
+                   GenServer.call(
+                     shard,
+                     {:tx_execute,
+                      [
+                        prepared_tx_entry("HSET", [key, new_field, "new_value"]),
+                        prepared_tx_entry("HDEL", [key, field]),
+                        prepared_tx_entry("SET", [same_shard_key, "committed"])
+                      ], nil}
+                   )
+
+          assert "new_value" == Hash.handle("HGET", [key, new_field], store)
+          assert nil == Hash.handle("HGET", [key, field], store)
+          assert @test_threshold + 1 == Hash.handle("HLEN", [key], store)
+          assert "committed" == Router.get(ctx, same_shard_key)
+
+          ShardHelpers.flush_all_shards()
+          old_pid = Process.whereis(shard)
+          ref = Process.monitor(old_pid)
+          Process.exit(old_pid, :kill)
+          assert_receive {:DOWN, ^ref, :process, ^old_pid, :killed}, 2_000
+          ShardHelpers.wait_shards_alive()
+
+          assert "new_value" == Hash.handle("HGET", [key, new_field], store)
+          assert nil == Hash.handle("HGET", [key, field], store)
+          assert "committed" == Router.get(ctx, same_shard_key)
+        end
+
+        @tag :promotion_tx_mutation_support
+        test "transaction deletes a promoted hash through its exact member catalog" do
+          store = real_store()
+          key = ukey("tx_delete_promoted")
+          ctx = FerricStore.Instance.get(:default)
+          idx = Router.shard_for(ctx, key)
+          shard = Router.shard_name(ctx, idx)
+
+          same_shard_key =
+            Enum.find_value(0..100_000, fn i ->
+              candidate = "tx_promoted_delete_touch_#{System.unique_integer([:positive])}_#{i}"
+              if Router.shard_for(ctx, candidate) == idx, do: candidate
+            end)
+
+          populate_hash(store, key, @test_threshold + 1)
+          assert promoted?(key)
+
+          assert [1, :ok] =
+                   GenServer.call(
+                     shard,
+                     {:tx_execute,
+                      [
+                        prepared_tx_entry("DEL", [key]),
+                        prepared_tx_entry("SET", [same_shard_key, "committed"])
+                      ], nil}
+                   )
+
+          assert 0 == Hash.handle("HLEN", [key], store)
+          assert {:simple, "none"} == Strings.handle("TYPE", [key], store)
+          assert "committed" == Router.get(ctx, same_shard_key)
+        end
+
+        @tag :promotion_tx_watch_support
+        test "WATCH accepts an unchanged promoted hash and aborts after a field mutation" do
+          store = real_store()
+          key = ukey("tx_watch_promoted")
+          ctx = FerricStore.Instance.get(:default)
+          idx = Router.shard_for(ctx, key)
+
+          same_shard_key =
+            Enum.find_value(0..100_000, fn i ->
+              candidate = "tx_promoted_watch_touch_#{System.unique_integer([:positive])}_#{i}"
+              if Router.shard_for(ctx, candidate) == idx, do: candidate
+            end)
+
+          populate_hash(store, key, @test_threshold + 1)
+          assert promoted?(key)
+
+          unchanged_token = Router.watch_token(ctx, key)
+          refute match?({:error, _reason}, unchanged_token)
+
+          assert [:ok] ==
+                   Ferricstore.Test.PreparedTransactionCoordinator.execute(
+                     [{"SET", [same_shard_key, "unchanged"]}],
+                     %{key => unchanged_token},
+                     nil
+                   )
+
+          changed_token = Router.watch_token(ctx, key)
+          assert 0 == Hash.handle("HSET", [key, "field_1", "value_1"], store)
+
+          assert nil ==
+                   Ferricstore.Test.PreparedTransactionCoordinator.execute(
+                     [{"SET", [same_shard_key, "must-not-commit"]}],
+                     %{key => changed_token},
+                     nil
+                   )
+
+          assert "unchanged" == Router.get(ctx, same_shard_key)
+        end
+
+        @tag :promotion_tx_crossslot
+        test "cross-shard transaction rejects cold promoted HGET without mutation" do
           store = real_store()
           key = ukey("cross_tx_hget_cold_promoted")
           ctx = FerricStore.Instance.get(:default)
@@ -346,15 +465,19 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
           :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
 
-          assert {:ok, ["value_1", :ok]} =
+          assert {:error, "CROSSSLOT Keys in request don't hash to the same slot"} =
                    FerricStore.multi(fn tx ->
                      tx
                      |> FerricStore.Tx.hget(key, "field_1")
                      |> FerricStore.Tx.set(other_key, "touch")
                    end)
+
+          assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
+          assert nil == Router.get(ctx, other_key)
         end
 
-        test "cross-shard transaction HSET writes promoted field to dedicated storage" do
+        @tag :promotion_tx_crossslot
+        test "cross-shard transaction rejects promoted HSET without mutation" do
           store = real_store()
           key = ukey("cross_tx_hset_promoted")
           field = "cross_field"
@@ -372,20 +495,20 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           populate_hash(store, key, @test_threshold + 1)
           assert promoted?(key)
 
-          assert {:ok, [1, :ok]} =
+          assert {:error, "CROSSSLOT Keys in request don't hash to the same slot"} =
                    FerricStore.multi(fn tx ->
                      tx
                      |> FerricStore.Tx.hset(key, %{field => "cross_value"})
                      |> FerricStore.Tx.set(other_key, "touch")
                    end)
 
-          [{^compound_key, _value, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, compound_key)
-          :ets.insert(keydir, {compound_key, nil, exp, lfu, fid, off, vsize})
-
-          assert "cross_value" == Hash.handle("HGET", [key, field], store)
+          assert [] == :ets.lookup(keydir, compound_key)
+          assert nil == Hash.handle("HGET", [key, field], store)
+          assert nil == Router.get(ctx, other_key)
         end
 
-        test "cross-shard transaction HDEL tombstones promoted field in dedicated storage" do
+        @tag :promotion_tx_crossslot
+        test "cross-shard transaction rejects promoted HDEL without mutation" do
           store = real_store()
           key = ukey("cross_tx_hdel_promoted")
           field = "field_1"
@@ -403,16 +526,18 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           populate_hash(store, key, @test_threshold + 1)
           assert promoted?(key)
 
-          assert [1, :ok] ==
+          assert {:error, "CROSSSLOT Keys in request don't hash to the same slot"} ==
                    Ferricstore.Test.PreparedTransactionCoordinator.execute(
                      [{"HDEL", [key, field]}, {"SET", [other_key, "touch"]}],
                      %{},
                      nil
                    )
 
-          :ets.delete(keydir, compound_key)
+          assert [{^compound_key, _value, _exp, _lfu, _fid, _off, _vsize}] =
+                   :ets.lookup(keydir, compound_key)
 
-          assert nil == Hash.handle("HGET", [key, field], store)
+          assert "value_1" == Hash.handle("HGET", [key, field], store)
+          assert nil == Router.get(ctx, other_key)
         end
       end
 

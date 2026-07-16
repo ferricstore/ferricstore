@@ -209,24 +209,29 @@ defmodule Ferricstore.Metrics do
 
   @spec keydir_used_bytes() :: non_neg_integer()
   defp keydir_used_bytes do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    case default_instance() do
+      %{keydir_refs: refs, shard_count: count} when is_tuple(refs) ->
+        count
+        |> shard_indexes()
+        |> Enum.reduce(0, fn shard, acc ->
+          acc + keydir_memory_bytes(refs, shard)
+        end)
 
-    Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
-      keydir = :"keydir_#{i}"
-
-      try do
-        case :ets.info(keydir, :memory) do
-          words when is_integer(words) ->
-            acc + words * :erlang.system_info(:wordsize)
-
-          _ ->
-            acc
-        end
-      rescue
-        ArgumentError -> acc
-      end
-    end)
+      _missing_instance ->
+        0
+    end
   end
+
+  defp keydir_memory_bytes(refs, shard) when shard < tuple_size(refs) do
+    case :ets.info(elem(refs, shard), :memory) do
+      words when is_integer(words) -> words * :erlang.system_info(:wordsize)
+      _undefined -> 0
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  defp keydir_memory_bytes(_refs, _shard), do: 0
 
   @spec safe_ets_size(atom()) :: non_neg_integer()
   defp safe_ets_size(table) do
@@ -446,7 +451,8 @@ defmodule Ferricstore.Metrics do
 
   defp checkpoint_metric_family(name, help, value_fun) when is_function(value_fun, 1) do
     samples =
-      0..(shard_count() - 1)
+      shard_count()
+      |> shard_indexes()
       |> Enum.map_join("\n", fn shard ->
         "#{name}{shard_index=\"#{shard}\"} #{safe_metric_value(value_fun, shard)}"
       end)
@@ -491,8 +497,14 @@ defmodule Ferricstore.Metrics do
   end
 
   defp shard_count do
-    Application.get_env(:ferricstore, :shard_count, 4)
+    case default_instance() do
+      %{shard_count: count} when is_integer(count) and count > 0 -> count
+      _missing_or_invalid -> 0
+    end
   end
+
+  defp shard_indexes(count) when is_integer(count) and count > 0, do: 0..(count - 1)
+  defp shard_indexes(_count), do: []
 
   defp default_instance do
     FerricStore.Instance.get(:default)

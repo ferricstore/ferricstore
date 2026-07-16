@@ -30,7 +30,7 @@ defmodule Ferricstore.Commands.TopKTest do
       right_dir = temp_prob_dir("topk_right_prob", suffix)
 
       key = "key_specific_topk_#{suffix}"
-      safe = Base.url_encode64(key, padding: false)
+      filename = Ferricstore.ProbFile.filename(key, "topk")
 
       store =
         MockStore.make()
@@ -39,8 +39,8 @@ defmodule Ferricstore.Commands.TopKTest do
 
       try do
         assert :ok = TopK.handle("TOPK.RESERVE", [key, "10"], store)
-        assert File.exists?(Path.join(right_dir, "#{safe}.topk"))
-        refute File.exists?(Path.join(wrong_dir, "#{safe}.topk"))
+        assert File.exists?(Path.join(right_dir, filename))
+        refute File.exists?(Path.join(wrong_dir, filename))
       after
         File.rm_rf!(wrong_dir)
         File.rm_rf!(right_dir)
@@ -51,7 +51,7 @@ defmodule Ferricstore.Commands.TopKTest do
       store = MockStore.make()
 
       assert :ok =
-               TopK.handle("TOPK.RESERVE", ["hot_keys", "10", "20", "5", "0.8"], store)
+               TopK.handle("TOPK.RESERVE", ["hot_keys", "10", "20", "5"], store)
 
       assert store.exists?.("hot_keys")
     end
@@ -59,9 +59,9 @@ defmodule Ferricstore.Commands.TopKTest do
     test "INFO reflects custom dimensions" do
       store = MockStore.make()
 
-      :ok = TopK.handle("TOPK.RESERVE", ["hot_keys", "10", "20", "5", "0.8"], store)
+      :ok = TopK.handle("TOPK.RESERVE", ["hot_keys", "10", "20", "5"], store)
 
-      assert ["k", 10, "width", 20, "depth", 5, "decay", 0.8] =
+      assert ["k", 10, "width", 20, "depth", 5] =
                TopK.handle("TOPK.INFO", ["hot_keys"], store)
     end
 
@@ -105,36 +105,13 @@ defmodule Ferricstore.Commands.TopKTest do
       assert msg =~ "not an integer"
     end
 
-    test "returns error with decay out of range" do
+    test "rejects the removed decay argument" do
       store = MockStore.make()
 
       assert {:error, msg} =
-               TopK.handle("TOPK.RESERVE", ["hot_keys", "10", "8", "7", "1.5"], store)
+               TopK.handle("TOPK.RESERVE", ["hot_keys", "10", "8", "7", "0.9"], store)
 
-      assert msg =~ "between 0 and 1"
-    end
-
-    test "returns error with negative decay" do
-      store = MockStore.make()
-
-      assert {:error, msg} =
-               TopK.handle("TOPK.RESERVE", ["hot_keys", "10", "8", "7", "-0.1"], store)
-
-      assert msg =~ "between 0 and 1"
-    end
-
-    test "accepts decay of exactly 0.0" do
-      store = MockStore.make()
-
-      assert :ok =
-               TopK.handle("TOPK.RESERVE", ["hot_keys", "10", "8", "7", "0.0"], store)
-    end
-
-    test "accepts decay of exactly 1.0" do
-      store = MockStore.make()
-
-      assert :ok =
-               TopK.handle("TOPK.RESERVE", ["hot_keys", "10", "8", "7", "1.0"], store)
+      assert msg =~ "wrong number of arguments"
     end
 
     test "returns error with wrong number of arguments" do
@@ -142,7 +119,7 @@ defmodule Ferricstore.Commands.TopKTest do
       assert {:error, _} = TopK.handle("TOPK.RESERVE", [], store)
       assert {:error, _} = TopK.handle("TOPK.RESERVE", ["key"], store)
 
-      # 3 args is invalid (need 2 or 5)
+      # 3 args is invalid (need 2 or 4)
       assert {:error, _} = TopK.handle("TOPK.RESERVE", ["key", "10", "20"], store)
     end
   end
@@ -436,12 +413,12 @@ defmodule Ferricstore.Commands.TopKTest do
   # ===========================================================================
 
   describe "TOPK.INFO" do
-    test "returns k, width, depth, decay for default-created tracker" do
+    test "returns k, width, and depth for default-created tracker" do
       store = MockStore.make()
       :ok = TopK.handle("TOPK.RESERVE", ["hot_keys", "10"], store)
 
       result = TopK.handle("TOPK.INFO", ["hot_keys"], store)
-      assert ["k", 10, "width", 8, "depth", 7, "decay", 0.9] = result
+      assert ["k", 10, "width", 8, "depth", 7] = result
     end
 
     test "returns error when key does not exist" do

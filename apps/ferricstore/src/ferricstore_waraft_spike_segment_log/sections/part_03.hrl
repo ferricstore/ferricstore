@@ -9,7 +9,7 @@ write_append_failure_marker(Dir, Reason) ->
     },
     case filelib:ensure_dir(MarkerPath) of
         ok ->
-            case write_file_sync(TmpPath, term_to_binary(Marker)) of
+            case write_file_sync(TmpPath, encode_external_term(Marker)) of
                 ok ->
                     case rename_path(TmpPath, MarkerPath) of
                         ok -> sync_dir(Dir);
@@ -232,7 +232,7 @@ stream_disk_segment_paths([{SourceOrdinal, Path} | Rest], DestDir, KeepFun, Reco
 stream_disk_segment_path(Path, DestDir, KeepFun, RecordsPerSegment, SourceOrdinal, Ordinal, RecordsRev, Rollbacks) ->
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case file:open(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
                     try stream_disk_segment_fd(
                         Fd,
@@ -451,17 +451,16 @@ recover_rewrite(Dir) ->
     MarkerPath = rewrite_marker_path(Dir),
     case read_segment_metadata_file(MarkerPath, rewrite_marker_file_too_large) of
         {ok, Binary} ->
-            try binary_to_term(Binary, [safe]) of
-                #{version := 1, dir := Dir, staging := Staging, backup := Backup} = Marker
+            case decode_external_term_exact(Binary) of
+                {ok, #{version := 1, dir := Dir, staging := Staging, backup := Backup} = Marker}
                   when is_list(Staging), is_list(Backup) ->
                     case validate_rewrite_marker_paths(Dir, Staging, Backup) of
                         ok -> rollback_rewrite(Dir, Marker);
                         {error, _Reason} = Error -> Error
                     end;
-                Other ->
-                    {error, {bad_rewrite_marker, Other}}
-            catch
-                _:Reason ->
+                {ok, Other} ->
+                    {error, {bad_rewrite_marker, Other}};
+                {error, Reason} ->
                     {error, {bad_rewrite_marker, Reason}}
             end;
         {error, enoent} ->
@@ -542,7 +541,7 @@ write_rewrite_marker(Dir, Paths) ->
     MarkerPath = rewrite_marker_path(Dir),
     TmpPath = MarkerPath ++ ".tmp." ++ unique_suffix(),
     Marker = Paths#{version => 1, dir => Dir},
-    case write_file_sync(TmpPath, term_to_binary(Marker)) of
+    case write_file_sync(TmpPath, encode_external_term(Marker)) of
         ok ->
             case rename_path(TmpPath, MarkerPath) of
                 ok -> sync_dir(filename:dirname(Dir));
@@ -846,7 +845,7 @@ read_disk_record(Dir, Index, RecordsPerSegment) ->
     Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case file:open(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
                     Result =
                         try read_disk_record_fd(Fd, Path, Index, 0, FileBytes, Ordinal, RecordsPerSegment) of

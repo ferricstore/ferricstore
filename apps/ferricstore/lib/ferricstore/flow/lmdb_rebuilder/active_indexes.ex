@@ -50,7 +50,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
         flow_lookup
       ) do
     if not LMDB.env_present?(lmdb_path) do
-      0
+      {:ok, 0}
     else
       do_rebuild_flow_indexes_from_lmdb(
         lmdb_path,
@@ -113,6 +113,15 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     now_ms = Ferricstore.CommandTime.now_ms()
 
     with_startup_active_rebuild_slot(fn ->
+      fetch_page = fn after_key ->
+        LMDB.prefix_entries_after(
+          lmdb_path,
+          LMDB.active_index_global_prefix(),
+          after_key,
+          @active_index_rebuild_batch_size
+        )
+      end
+
       rebuild_flow_indexes_from_lmdb_page(
         lmdb_path,
         zset_score_index,
@@ -121,9 +130,26 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
         flow_lookup,
         now_ms,
         <<>>,
-        0
+        0,
+        fetch_page
       )
     end)
+  end
+
+  @doc false
+  def __rebuild_flow_indexes_from_lmdb_pages_for_test__(fetch_page)
+      when is_function(fetch_page, 1) do
+    rebuild_flow_indexes_from_lmdb_page(
+      "test",
+      nil,
+      nil,
+      nil,
+      nil,
+      0,
+      <<>>,
+      0,
+      fetch_page
+    )
   end
 
   defp acquire_startup_active_rebuild_slot(ref, limit) do
@@ -165,71 +191,97 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
          flow_lookup,
          now_ms,
          after_key,
-         total_active
+         total_active,
+         fetch_page
        ) do
-    case LMDB.prefix_entries_after(
-           lmdb_path,
-           LMDB.active_index_global_prefix(),
-           after_key,
-           @active_index_rebuild_batch_size
-         ) do
+    case fetch_page.(after_key) do
       {:ok, []} ->
-        total_active
+        {:ok, total_active}
 
-      {:ok, entries} ->
-        active_entries =
-          Enum.flat_map(entries, fn {_key, blob} ->
-            case LMDB.decode_active_index_value(blob) do
-              {:ok, {index_key, id, score, expire_at_ms, _state_key}}
-              when expire_at_ms <= 0 or expire_at_ms > now_ms ->
-                [{index_key, id, score}]
-
-              _ ->
-                []
-            end
+      {:ok, entries} when is_list(entries) ->
+        with {:ok, active_entries} <- decode_active_index_page(entries, now_ms),
+             {:ok, last_key} <- active_index_page_last_key(entries),
+             :ok <- ensure_active_index_cursor_advanced(after_key, last_key) do
+          Enum.each(active_entries, fn {index_key, id, score} ->
+            rebuild_score_index_entry(
+              zset_score_index,
+              zset_score_lookup,
+              index_key,
+              id,
+              score
+            )
           end)
 
-        Enum.each(active_entries, fn {index_key, id, score} ->
-          rebuild_score_index_entry(
+          rebuild_flow_index_entries(flow_index, flow_lookup, active_entries)
+
+          next_total = total_active + length(active_entries)
+
+          :telemetry.execute(
+            [:ferricstore, :flow, :lmdb_startup_active_index_chunk],
+            %{
+              entries: length(entries),
+              active: length(active_entries),
+              total_active: next_total
+            },
+            %{path: lmdb_path}
+          )
+
+          rebuild_flow_indexes_from_lmdb_page(
+            lmdb_path,
             zset_score_index,
             zset_score_lookup,
-            index_key,
-            id,
-            score
+            flow_index,
+            flow_lookup,
+            now_ms,
+            last_key,
+            next_total,
+            fetch_page
           )
-        end)
+        end
 
-        rebuild_flow_index_entries(flow_index, flow_lookup, active_entries)
+      {:error, _reason} = error ->
+        error
 
-        next_total = total_active + length(active_entries)
-
-        :telemetry.execute(
-          [:ferricstore, :flow, :lmdb_startup_active_index_chunk],
-          %{
-            entries: length(entries),
-            active: length(active_entries),
-            total_active: next_total
-          },
-          %{path: lmdb_path}
-        )
-
-        {last_key, _last_value} = List.last(entries)
-
-        rebuild_flow_indexes_from_lmdb_page(
-          lmdb_path,
-          zset_score_index,
-          zset_score_lookup,
-          flow_index,
-          flow_lookup,
-          now_ms,
-          last_key,
-          next_total
-        )
-
-      _ ->
-        total_active
+      invalid ->
+        {:error, {:invalid_active_index_page, invalid}}
     end
   end
+
+  defp decode_active_index_page(entries, now_ms) do
+    Enum.reduce_while(entries, {:ok, []}, fn
+      {key, blob}, {:ok, acc} when is_binary(key) and is_binary(blob) ->
+        case LMDB.decode_active_index_value(blob) do
+          {:ok, {index_key, id, score, expire_at_ms, _state_key}}
+          when expire_at_ms <= 0 or expire_at_ms > now_ms ->
+            {:cont, {:ok, [{index_key, id, score} | acc]}}
+
+          {:ok, {_index_key, _id, _score, _expire_at_ms, _state_key}} ->
+            {:cont, {:ok, acc}}
+
+          :error ->
+            {:halt, {:error, {:invalid_active_index_value, key}}}
+        end
+
+      invalid, _acc ->
+        {:halt, {:error, {:invalid_active_index_entry, invalid}}}
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp active_index_page_last_key(entries) do
+    case List.last(entries) do
+      {last_key, _last_value} when is_binary(last_key) -> {:ok, last_key}
+      invalid -> {:error, {:invalid_active_index_entry, invalid}}
+    end
+  end
+
+  defp ensure_active_index_cursor_advanced(after_key, last_key) when last_key > after_key, do: :ok
+
+  defp ensure_active_index_cursor_advanced(after_key, last_key),
+    do: {:error, {:active_index_scan_stalled, after_key, last_key}}
 
   defp rebuild_flow_index_entries(nil, _flow_lookup, _entries), do: :ok
   defp rebuild_flow_index_entries(_flow_index, nil, _entries), do: :ok

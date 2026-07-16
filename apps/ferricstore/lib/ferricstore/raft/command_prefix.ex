@@ -1,11 +1,44 @@
 defmodule Ferricstore.Raft.CommandPrefix do
   @moduledoc false
 
+  alias Ferricstore.Raft.CommandStamp
+
   @spec extract(tuple()) :: binary()
+  def extract({:ttb, binary}) when is_binary(binary) do
+    case CommandStamp.decode_ttb(binary) do
+      {:ok, command} -> extract(command)
+      {:error, :invalid_preencoded_command} -> "_root"
+    end
+  end
+
+  def extract({:ferricstore_latency_trace, inner}) when is_tuple(inner), do: extract(inner)
+
+  def extract({:ferricstore_apply_context, _encoded, inner}) when is_tuple(inner),
+    do: extract(inner)
+
+  def extract({:flow_policy_fence, _installs, inner}) when is_tuple(inner), do: extract(inner)
+
+  def extract({:flow_shared_ref_write, _shard_index, inner}) when is_tuple(inner),
+    do: extract(inner)
+
+  def extract({:async, _origin, inner}) when is_tuple(inner), do: extract(inner)
+
+  def extract({inner, %{hlc_ts: {physical_ms, logical}}})
+      when is_tuple(inner) and is_integer(physical_ms) and is_integer(logical),
+      do: extract(inner)
+
   def extract(command) when is_tuple(command) do
     key =
       case command do
         {:put_batch, [{first_key, _value, _expire_at_ms} | _rest]} ->
+          first_key
+
+        {operation, [{first_key, _value, _expire_at_ms} | _rest]}
+        when operation in [:mset, :msetnx] ->
+          first_key
+
+        {operation, [{first_key, _value, _expire_at_ms, _representation} | _rest]}
+        when operation in [:mset_blob_batch, :msetnx_blob_batch] ->
           first_key
 
         {:delete_batch, [first_key | _rest]} ->

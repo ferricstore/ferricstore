@@ -1,7 +1,9 @@
 defmodule Ferricstore.Commands.Expiry do
   alias Ferricstore.CommandTime
+  alias Ferricstore.Commands.CompoundSnapshot
+  alias Ferricstore.Commands.ExpiryTime
   alias Ferricstore.Store.CompoundKey
-  alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.{Ops, ReadResult}
 
   @moduledoc """
   Handles Redis expiry commands: EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST.
@@ -153,94 +155,74 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp set_expiry_seconds(key, secs_str, flag, store) do
-    case Integer.parse(secs_str) do
-      {secs, ""} when secs <= 0 ->
-        delete_if_exists(key, store)
-
-      {secs, ""} ->
-        apply_expiry(key, CommandTime.now_ms() + secs * 1_000, flag, store)
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+    with {:ok, secs} <- ExpiryTime.parse_integer(secs_str),
+         {:ok, expire_at_ms} <- ExpiryTime.relative(secs, 1_000) do
+      apply_expiry(key, expire_at_ms, flag, store)
+    else
+      _invalid -> integer_range_error()
     end
   end
 
   defp set_expiry_ms(key, ms_str, flag, store) do
-    case Integer.parse(ms_str) do
-      {ms, ""} when ms <= 0 ->
-        delete_if_exists(key, store)
-
-      {ms, ""} ->
-        apply_expiry(key, CommandTime.now_ms() + ms, flag, store)
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+    with {:ok, ms} <- ExpiryTime.parse_integer(ms_str),
+         {:ok, expire_at_ms} <- ExpiryTime.relative(ms, 1) do
+      apply_expiry(key, expire_at_ms, flag, store)
+    else
+      _invalid -> integer_range_error()
     end
   end
 
-  defp set_expiry_seconds_parsed(key, secs, _flag, store) when secs <= 0,
-    do: delete_if_exists(key, store)
+  defp set_expiry_seconds_parsed(key, secs, flag, store) do
+    case ExpiryTime.relative(secs, 1_000) do
+      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
+      :error -> integer_range_error()
+    end
+  end
 
-  defp set_expiry_seconds_parsed(key, secs, flag, store),
-    do: apply_expiry(key, CommandTime.now_ms() + secs * 1_000, flag, store)
-
-  defp set_expiry_ms_parsed(key, ms, _flag, store) when ms <= 0,
-    do: delete_if_exists(key, store)
-
-  defp set_expiry_ms_parsed(key, ms, flag, store),
-    do: apply_expiry(key, CommandTime.now_ms() + ms, flag, store)
+  defp set_expiry_ms_parsed(key, ms, flag, store) do
+    case ExpiryTime.relative(ms, 1) do
+      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
+      :error -> integer_range_error()
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Private — EXPIREAT / PEXPIREAT (absolute)
   # ---------------------------------------------------------------------------
 
   defp set_expiry_at_seconds(key, ts_str, flag, store) do
-    case Integer.parse(ts_str) do
-      {ts, ""} ->
-        expire_at_ms = ts * 1_000
-
-        if expire_at_ms <= CommandTime.now_ms() do
-          delete_if_exists(key, store)
-        else
-          apply_expiry(key, expire_at_ms, flag, store)
-        end
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+    with {:ok, ts} <- ExpiryTime.parse_integer(ts_str),
+         {:ok, expire_at_ms} <- ExpiryTime.absolute(ts, 1_000) do
+      apply_expiry(key, expire_at_ms, flag, store)
+    else
+      _invalid -> integer_range_error()
     end
   end
 
   defp set_expiry_at_ms(key, ts_str, flag, store) do
-    case Integer.parse(ts_str) do
-      {ts, ""} ->
-        if ts <= CommandTime.now_ms() do
-          delete_if_exists(key, store)
-        else
-          apply_expiry(key, ts, flag, store)
-        end
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+    with {:ok, ts} <- ExpiryTime.parse_integer(ts_str),
+         {:ok, expire_at_ms} <- ExpiryTime.absolute(ts, 1) do
+      apply_expiry(key, expire_at_ms, flag, store)
+    else
+      _invalid -> integer_range_error()
     end
   end
 
   defp set_expiry_at_seconds_parsed(key, ts, flag, store) do
-    expire_at_ms = ts * 1_000
-
-    if expire_at_ms <= CommandTime.now_ms() do
-      delete_if_exists(key, store)
-    else
-      apply_expiry(key, expire_at_ms, flag, store)
+    case ExpiryTime.absolute(ts, 1_000) do
+      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
+      :error -> integer_range_error()
     end
   end
 
   defp set_expiry_at_ms_parsed(key, ts, flag, store) do
-    if ts <= CommandTime.now_ms() do
-      delete_if_exists(key, store)
-    else
-      apply_expiry(key, ts, flag, store)
+    case ExpiryTime.absolute(ts, 1) do
+      {:ok, expire_at_ms} -> apply_expiry(key, expire_at_ms, flag, store)
+      :error -> integer_range_error()
     end
   end
+
+  defp integer_range_error, do: {:error, "ERR value is not an integer or out of range"}
 
   # ---------------------------------------------------------------------------
   # Private — apply expiry to existing key
@@ -250,14 +232,32 @@ defmodule Ferricstore.Commands.Expiry do
     Ferricstore.Commands.Strings.handle_ast({:del, [key]}, store)
   end
 
-  defp apply_expiry(key, expire_at_ms, flag, store) do
+  defp apply_expiry(key, expire_at_ms, :none, store) do
+    if expire_at_ms <= CommandTime.now_ms() do
+      delete_if_exists(key, store)
+    else
+      apply_expiry_with_flag(key, expire_at_ms, :none, store)
+    end
+  end
+
+  defp apply_expiry(key, expire_at_ms, flag, store),
+    do: apply_expiry_with_flag(key, expire_at_ms, flag, store)
+
+  defp apply_expiry_with_flag(key, expire_at_ms, flag, store) do
     case ttl_expire_at_ms(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         0
 
       old_exp ->
         if flag_allows?(flag, old_exp, expire_at_ms) do
-          apply_expiry_after_flag_check(key, expire_at_ms, store)
+          if expire_at_ms <= CommandTime.now_ms() do
+            delete_if_exists(key, store)
+          else
+            apply_expiry_after_flag_check(key, expire_at_ms, store)
+          end
         else
           0
         end
@@ -266,6 +266,9 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp apply_expiry_after_flag_check(key, expire_at_ms, store) do
     case key_meta(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         0
 
@@ -278,7 +281,7 @@ defmodule Ferricstore.Commands.Expiry do
       {:compound, type, _old_exp} ->
         case expire_compound_key(key, type, expire_at_ms, store) do
           :ok -> 1
-          {:error, _} = error -> error
+          {:error, _} = error -> ReadResult.command_result(error)
         end
     end
   end
@@ -312,6 +315,7 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp get_ttl_seconds(key, store) do
     case ttl_expire_at_ms(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       nil -> -2
       0 -> -1
       exp -> max(0, div(exp - CommandTime.now_ms(), 1_000))
@@ -320,6 +324,7 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp get_ttl_ms(key, store) do
     case ttl_expire_at_ms(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       nil -> -2
       0 -> -1
       exp -> max(0, exp - CommandTime.now_ms())
@@ -332,6 +337,9 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp do_persist(key, store) do
     case ttl_expire_at_ms(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         0
 
@@ -345,6 +353,9 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp persist_after_ttl_check(key, store) do
     case key_meta(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         0
 
@@ -360,13 +371,14 @@ defmodule Ferricstore.Commands.Expiry do
       {:compound, type, _exp} ->
         case expire_compound_key(key, type, 0, store) do
           :ok -> 1
-          {:error, _} = error -> error
+          {:error, _} = error -> ReadResult.command_result(error)
         end
     end
   end
 
   defp key_meta(key, store) do
     case Ops.get_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
       nil -> compound_meta(key, store)
       {value, expire_at_ms} -> {:plain, value, expire_at_ms}
     end
@@ -374,8 +386,12 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp ttl_expire_at_ms(key, store) do
     case Ops.expire_at_ms(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
       nil ->
         case compound_meta(key, store) do
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
           nil -> nil
           {:compound, _type, expire_at_ms} -> expire_at_ms
         end
@@ -390,10 +406,14 @@ defmodule Ferricstore.Commands.Expiry do
       type_key = CompoundKey.type_key(key)
 
       case Ops.compound_get_meta(store, key, type_key) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          failure
+
         nil ->
           list_meta_key = CompoundKey.list_meta_key(key)
 
           case Ops.compound_get_meta(store, key, list_meta_key) do
+            {:error, {:storage_read_failed, _reason}} = failure -> failure
             nil -> nil
             {_meta, expire_at_ms} -> {:compound, "list", expire_at_ms}
           end
@@ -405,60 +425,13 @@ defmodule Ferricstore.Commands.Expiry do
   end
 
   defp expire_compound_key(key, type, expire_at_ms, store) do
-    type_key = CompoundKey.type_key(key)
+    with {:ok, entries} <- CompoundSnapshot.value_snapshot(key, type, store) do
+      expiring_entries =
+        Enum.map(entries, fn {compound_key, value, _old_expire_at_ms} ->
+          {compound_key, value, expire_at_ms}
+        end)
 
-    entries =
-      [{type_key, type, expire_at_ms}] ++
-        list_meta_ttl_entries(key, type, expire_at_ms, store) ++
-        stream_meta_ttl_entries(key, type, expire_at_ms, store) ++
-        compound_member_ttl_entries(compound_prefix(type, key), key, expire_at_ms, store) ++
-        stream_group_ttl_entries(key, type, expire_at_ms, store)
-
-    Ops.compound_batch_put(store, key, entries)
-  end
-
-  defp list_meta_ttl_entries(_key, type, _expire_at_ms, _store) when type != "list", do: []
-
-  defp list_meta_ttl_entries(key, "list", expire_at_ms, store) do
-    list_meta_key = CompoundKey.list_meta_key(key)
-
-    case Ops.compound_get(store, key, list_meta_key) do
-      nil -> []
-      meta -> [{list_meta_key, meta, expire_at_ms}]
+      Ops.compound_batch_put(store, key, expiring_entries)
     end
-  end
-
-  defp compound_prefix("hash", key), do: CompoundKey.hash_prefix(key)
-  defp compound_prefix("list", key), do: CompoundKey.list_prefix(key)
-  defp compound_prefix("set", key), do: CompoundKey.set_prefix(key)
-  defp compound_prefix("zset", key), do: CompoundKey.zset_prefix(key)
-  defp compound_prefix("stream", key), do: CompoundKey.stream_prefix(key)
-
-  defp stream_meta_ttl_entries(_key, type, _expire_at_ms, _store) when type != "stream", do: []
-
-  defp stream_meta_ttl_entries(key, "stream", expire_at_ms, store) do
-    meta_key = CompoundKey.stream_meta_key(key)
-
-    case Ops.compound_get(store, key, meta_key) do
-      nil -> []
-      meta -> [{meta_key, meta, expire_at_ms}]
-    end
-  end
-
-  defp stream_group_ttl_entries(_key, type, _expire_at_ms, _store) when type != "stream", do: []
-
-  defp stream_group_ttl_entries(key, "stream", expire_at_ms, store) do
-    compound_member_ttl_entries(CompoundKey.stream_group_prefix(key), key, expire_at_ms, store)
-  end
-
-  defp compound_member_ttl_entries(prefix, key, expire_at_ms, store) do
-    store
-    |> Ops.compound_scan(key, prefix)
-    |> Enum.map(fn {sub_key, value} ->
-      compound_key =
-        if String.starts_with?(sub_key, prefix), do: sub_key, else: prefix <> sub_key
-
-      {compound_key, value, expire_at_ms}
-    end)
   end
 end

@@ -108,11 +108,16 @@ defmodule Ferricstore.Store.DiskPressure do
     size = :atomics.info(ref).size
 
     if shard_index < size do
-      :atomics.get(ref, shard_index + 1) == 1 or operational_under_pressure?(shard_index)
+      :atomics.get(ref, shard_index + 1) == 1 or operational_under_pressure?(ctx, shard_index)
     else
       false
     end
   end
+
+  defp operational_under_pressure?(%{name: :default}, shard_index),
+    do: operational_under_pressure?(shard_index)
+
+  defp operational_under_pressure?(_custom_ctx, _shard_index), do: false
 
   defp operational_under_pressure?(shard_index) do
     ref = :persistent_term.get(@operational_pt_key, nil)

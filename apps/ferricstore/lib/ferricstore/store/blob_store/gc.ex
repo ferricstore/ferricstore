@@ -156,30 +156,17 @@ defmodule Ferricstore.Store.BlobStore.GC do
                %{
                  files: non_neg_integer(),
                  bytes: non_neg_integer(),
-                 legacy_files: non_neg_integer(),
-                 legacy_bytes: non_neg_integer(),
-                 segment_files: non_neg_integer(),
-                 segment_bytes: non_neg_integer(),
                  tmp_files: non_neg_integer(),
                  tmp_bytes: non_neg_integer()
                }}
               | {:error, term()}
       def storage_stats(data_dir) when is_binary(data_dir) do
-        blob_glob = Path.join([data_dir, "blob", "shard_*", "**", "*.blob"])
-        segment_glob = Path.join([data_dir, "blob", "shard_*", "segments", "*.bloblog"])
-        tmp_glob = Path.join([data_dir, "blob", "shard_*", "**", "*.tmp"])
-
-        with {:ok, blob_stats} <-
-               storage_stats_for_paths({Path.wildcard(blob_glob), Path.wildcard(segment_glob)}),
-             {:ok, tmp_stats} <- storage_stats_for_paths(Path.wildcard(tmp_glob, match_dot: true)) do
+        with {:ok, shard_paths} <- blob_shard_paths(data_dir),
+             {:ok, {blob_stats, tmp_stats}} <- storage_stats_for_shards(shard_paths) do
           {:ok,
            %{
              files: blob_stats.files,
              bytes: blob_stats.bytes,
-             legacy_files: blob_stats.legacy_files,
-             legacy_bytes: blob_stats.legacy_bytes,
-             segment_files: blob_stats.segment_files,
-             segment_bytes: blob_stats.segment_bytes,
              tmp_files: tmp_stats.files,
              tmp_bytes: tmp_stats.bytes
            }}
@@ -188,24 +175,68 @@ defmodule Ferricstore.Store.BlobStore.GC do
         error -> {:error, {:blob_storage_stats_failed, error}}
       end
 
-      defp storage_stats_for_paths({legacy_paths, segment_paths}) do
-        with {:ok, legacy_stats} <- storage_stats_for_paths(legacy_paths),
-             {:ok, segment_stats} <- storage_stats_for_paths(segment_paths) do
-          {:ok,
-           %{
-             files: legacy_stats.files + segment_stats.files,
-             bytes: legacy_stats.bytes + segment_stats.bytes,
-             legacy_files: legacy_stats.files,
-             legacy_bytes: legacy_stats.bytes,
-             segment_files: segment_stats.files,
-             segment_bytes: segment_stats.bytes
-           }}
+      defp blob_shard_paths(data_dir) do
+        blob_root = Path.join(data_dir, "blob")
+
+        case File.lstat(blob_root) do
+          {:ok, %File.Stat{type: :directory}} ->
+            case Ferricstore.FS.ls(blob_root) do
+              {:ok, names} ->
+                paths =
+                  Enum.reduce(names, [], fn name, paths ->
+                    path = Path.join(blob_root, name)
+
+                    if String.starts_with?(name, "shard_") and
+                         match?({:ok, %File.Stat{type: :directory}}, File.lstat(path)) do
+                      [path | paths]
+                    else
+                      paths
+                    end
+                  end)
+
+                {:ok, paths}
+
+              {:error, reason} ->
+                {:error, {:blob_storage_stats_list_failed, blob_root, reason}}
+            end
+
+          {:ok, _non_directory} ->
+            {:ok, []}
+
+          {:error, :enoent} ->
+            {:ok, []}
+
+          {:error, reason} ->
+            {:error, {:blob_storage_stats_stat_failed, blob_root, reason}}
         end
+      end
+
+      defp storage_stats_for_shards(shard_paths) do
+        empty = %{files: 0, bytes: 0}
+
+        Enum.reduce_while(shard_paths, {:ok, {empty, empty}}, fn shard_path,
+                                                                 {:ok, {blob_stats, tmp_stats}} ->
+          with {:ok, segment_paths} <- segment_files(shard_path),
+               {:ok, shard_blob_stats} <- storage_stats_for_paths(segment_paths),
+               {:ok, tmp_paths} <- blob_tmp_files(shard_path),
+               {:ok, shard_tmp_stats} <- storage_stats_for_paths(tmp_paths) do
+            {:cont,
+             {:ok,
+              {merge_storage_stats(blob_stats, shard_blob_stats),
+               merge_storage_stats(tmp_stats, shard_tmp_stats)}}}
+          else
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp merge_storage_stats(left, right) do
+        %{files: left.files + right.files, bytes: left.bytes + right.bytes}
       end
 
       defp storage_stats_for_paths(paths) when is_list(paths) do
         Enum.reduce_while(paths, {:ok, %{files: 0, bytes: 0}}, fn path, {:ok, acc} ->
-          case File.stat(path) do
+          case File.lstat(path) do
             {:ok, %{type: :regular, size: size}} ->
               {:cont, {:ok, %{files: acc.files + 1, bytes: acc.bytes + size}}}
 
@@ -222,7 +253,7 @@ defmodule Ferricstore.Store.BlobStore.GC do
         shard_path = Ferricstore.DataDir.blob_shard_path(data_dir, shard_index)
         live_paths = live_relative_paths(live_refs)
 
-        case blob_files(shard_path) do
+        case segment_files(shard_path) do
           {:ok, paths} ->
             pending_paths = protected_relative_paths(data_dir, shard_index)
 
@@ -293,7 +324,7 @@ defmodule Ferricstore.Store.BlobStore.GC do
         grace_ms = segment_gc_grace_ms()
 
         grace_ms > 0 and
-          case File.stat(path, time: :posix) do
+          case File.lstat(path, time: :posix) do
             {:ok, %{type: :regular, mtime: mtime}} when is_integer(mtime) ->
               age_ms = max(System.system_time(:second) - mtime, 0) * 1_000
               age_ms < grace_ms
@@ -363,11 +394,11 @@ defmodule Ferricstore.Store.BlobStore.GC do
       defp read_next_segment_id(segment_dir) do
         path = Path.join(segment_dir, @segment_next_id_filename)
 
-        case File.read(path) do
+        case Ferricstore.FS.read_nofollow(path, @max_segment_next_id_bytes) do
           {:ok, data} ->
             parse_next_segment_id(data, path)
 
-          {:error, :enoent} ->
+          {:error, {:not_found, _message}} ->
             {:ok, nil}
 
           {:error, reason} ->
@@ -388,8 +419,9 @@ defmodule Ferricstore.Store.BlobStore.GC do
         tmp_path = path <> ".tmp"
 
         result =
-          with :ok <- File.write(tmp_path, Integer.to_string(next_id) <> "\n", [:binary]),
-               :ok <- fsync_file(tmp_path),
+          with :ok <- remove_next_segment_id_temp(tmp_path),
+               :ok <-
+                 write_next_segment_id_temp(tmp_path, Integer.to_string(next_id) <> "\n"),
                :ok <- Ferricstore.FS.rename(tmp_path, path),
                :ok <- fsync_dir(segment_dir) do
             :ok
@@ -402,6 +434,36 @@ defmodule Ferricstore.Store.BlobStore.GC do
           {:error, reason} ->
             _ = Ferricstore.FS.rm(tmp_path)
             {:error, {:blob_segment_next_id_persist_failed, path, reason}}
+        end
+      end
+
+      defp remove_next_segment_id_temp(tmp_path) do
+        case Ferricstore.FS.rm(tmp_path) do
+          :ok -> :ok
+          {:error, {:not_found, _message}} -> :ok
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp write_next_segment_id_temp(tmp_path, data) do
+        case :file.open(String.to_charlist(tmp_path), [:write, :binary, :raw, :exclusive]) do
+          {:ok, io} ->
+            result =
+              with :ok <- :file.write(io, data),
+                   :ok <- :file.sync(io) do
+                :ok
+              end
+
+            close_result = :file.close(io)
+
+            case {result, close_result} do
+              {:ok, :ok} -> :ok
+              {{:error, reason}, _close_result} -> {:error, reason}
+              {:ok, {:error, reason}} -> {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
         end
       end
 
@@ -419,40 +481,28 @@ defmodule Ferricstore.Store.BlobStore.GC do
         end
       end
 
-      defp blob_files(shard_path) do
-        with {:ok, legacy_paths} <- legacy_blob_files(shard_path),
-             {:ok, segment_paths} <- segment_files(shard_path) do
-          {:ok, legacy_paths ++ segment_paths}
-        end
-      end
-
-      defp legacy_blob_files(shard_path) do
-        if Ferricstore.FS.dir?(shard_path) do
-          {:ok, Path.wildcard(Path.join(shard_path, "**/*.blob"))}
-        else
-          {:ok, []}
-        end
-      rescue
-        error -> {:error, {:blob_list_failed, error}}
-      end
-
       defp segment_files(shard_path) do
-        segment_path = Path.join(shard_path, "segments")
-
-        if Ferricstore.FS.dir?(segment_path) do
-          {:ok, Path.wildcard(Path.join(segment_path, "*.bloblog"))}
-        else
-          {:ok, []}
-        end
-      rescue
-        error -> {:error, {:blob_segment_list_failed, error}}
+        segment_directory_files(shard_path, ".bloblog")
       end
 
       defp blob_tmp_files(shard_path) do
-        if Ferricstore.FS.dir?(shard_path) do
-          {:ok, Path.wildcard(Path.join(shard_path, "**/*.tmp"), match_dot: true)}
+        segment_directory_files(shard_path, ".tmp")
+      end
+
+      defp segment_directory_files(shard_path, suffix) do
+        segment_path = Path.join(shard_path, "segments")
+
+        with {:ok, %File.Stat{type: :directory}} <- File.lstat(shard_path),
+             {:ok, %File.Stat{type: :directory}} <- File.lstat(segment_path),
+             {:ok, names} <- Ferricstore.FS.ls(segment_path) do
+          {:ok,
+           names
+           |> Enum.filter(&String.ends_with?(&1, suffix))
+           |> Enum.map(&Path.join(segment_path, &1))}
         else
-          {:ok, []}
+          {:error, :enoent} -> {:ok, []}
+          {:ok, %File.Stat{}} -> {:ok, []}
+          {:error, reason} -> {:error, {:blob_segment_list_failed, segment_path, reason}}
         end
       rescue
         error -> {:error, {:blob_tmp_list_failed, error}}
@@ -531,7 +581,7 @@ defmodule Ferricstore.Store.BlobStore.GC do
       end
 
       defp stale_tmp_file?(path) do
-        case File.stat(path, time: :posix) do
+        case File.lstat(path, time: :posix) do
           {:ok, %{type: :regular, mtime: mtime}} when is_integer(mtime) ->
             System.system_time(:second) - mtime >= @tmp_stale_after_seconds
 
@@ -542,7 +592,7 @@ defmodule Ferricstore.Store.BlobStore.GC do
 
       defp delete_blob_file(path) do
         size =
-          case File.stat(path) do
+          case File.lstat(path) do
             {:ok, %{type: :regular, size: size}} -> size
             _ -> 0
           end

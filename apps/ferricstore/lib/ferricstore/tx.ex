@@ -34,6 +34,8 @@ defmodule FerricStore.Tx do
 
   defstruct commands: []
 
+  alias Ferricstore.Commands.PreparedAccumulatorCommand
+
   @doc "Creates a new empty transaction."
   @spec new() :: t()
   def new, do: %__MODULE__{}
@@ -121,12 +123,8 @@ defmodule FerricStore.Tx do
   def execute(%__MODULE__{commands: []}), do: []
 
   def execute(%__MODULE__{commands: commands}) do
-    with :ok <- authorize_commands(commands) do
-      queue =
-        commands
-        |> Enum.reverse()
-        |> Enum.map(&to_resp_command/1)
-
+    with :ok <- authorize_commands(commands),
+         {:ok, queue} <- commands |> Enum.reverse() |> PreparedAccumulatorCommand.prepare_all() do
       Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
     end
   end
@@ -135,89 +133,5 @@ defmodule FerricStore.Tx do
     commands
     |> Enum.map(&elem(&1, 1))
     |> Ferricstore.Flow.InternalKey.authorize_public()
-  end
-
-  defp to_resp_command({:set, key, value, opts}) do
-    args = [key, value]
-    ast_opts = set_ast_options(opts)
-
-    args =
-      case Keyword.get(opts, :ex) do
-        nil -> args
-        seconds -> args ++ ["EX", Integer.to_string(seconds)]
-      end
-
-    args =
-      case Keyword.get(opts, :px) do
-        nil -> args
-        ms -> args ++ ["PX", Integer.to_string(ms)]
-      end
-
-    args =
-      if Keyword.get(opts, :nx, false), do: args ++ ["NX"], else: args
-
-    args =
-      if Keyword.get(opts, :xx, false), do: args ++ ["XX"], else: args
-
-    {"SET", args, {:set, key, value, ast_opts}}
-  end
-
-  defp to_resp_command({:get, key}), do: {"GET", [key], {:get, key}}
-  defp to_resp_command({:del, key}), do: {"DEL", [key], {:del, [key]}}
-  defp to_resp_command({:incr, key}), do: {"INCR", [key], {:incr, key}}
-
-  defp to_resp_command({:incr_by, key, amount}),
-    do: {"INCRBY", [key, Integer.to_string(amount)], {:incrby, key, amount}}
-
-  defp to_resp_command({:hset, key, fields}) do
-    flat = Enum.flat_map(fields, fn {k, v} -> [to_string(k), to_string(v)] end)
-    args = [key | flat]
-    {"HSET", args, {:hset, args}}
-  end
-
-  defp to_resp_command({:hget, key, field}), do: {"HGET", [key, field], {:hget, key, field}}
-
-  defp to_resp_command({:lpush, key, elements}),
-    do: {"LPUSH", [key | elements], {:lpush, [key | elements]}}
-
-  defp to_resp_command({:rpush, key, elements}),
-    do: {"RPUSH", [key | elements], {:rpush, [key | elements]}}
-
-  defp to_resp_command({:sadd, key, members}),
-    do: {"SADD", [key | members], {:sadd, [key | members]}}
-
-  defp to_resp_command({:zadd, key, pairs}) do
-    flat =
-      Enum.flat_map(pairs, fn {score, member} ->
-        [to_string(score), member]
-      end)
-
-    args = [key | flat]
-
-    {"ZADD", args,
-     {:zadd, key, [], Enum.map(pairs, fn {score, member} -> {score / 1, member} end)}}
-  end
-
-  defp to_resp_command({:expire, key, ttl_ms}) do
-    {"PEXPIRE", [key, Integer.to_string(ttl_ms)], {:pexpire, key, ttl_ms}}
-  end
-
-  defp set_ast_options(opts) do
-    []
-    |> maybe_add_set_expiry(opts)
-    |> maybe_add_set_flag(opts, :nx)
-    |> maybe_add_set_flag(opts, :xx)
-  end
-
-  defp maybe_add_set_expiry(acc, opts) do
-    cond do
-      Keyword.has_key?(opts, :ex) -> [{:ex, Keyword.fetch!(opts, :ex)} | acc]
-      Keyword.has_key?(opts, :px) -> [{:px, Keyword.fetch!(opts, :px)} | acc]
-      true -> acc
-    end
-  end
-
-  defp maybe_add_set_flag(acc, opts, flag) do
-    if Keyword.get(opts, flag, false), do: [flag | acc], else: acc
   end
 end

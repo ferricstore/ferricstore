@@ -3,8 +3,7 @@ Code.require_file("acl_persistence_test/sections/read_only_filesystem.exs", __DI
 
 defmodule FerricstoreServer.AclPersistenceTest do
   @moduledoc """
-  Tests for ACL file persistence: SAVE, LOAD, auto-load on startup,
-  auto-save on mutations, and comprehensive edge cases.
+  Tests for ACL file import/export, auto-save on mutations, and comprehensive edge cases.
 
   These tests use temporary directories to avoid interfering with the
   real data directory. Each test gets a fresh directory and a clean ACL

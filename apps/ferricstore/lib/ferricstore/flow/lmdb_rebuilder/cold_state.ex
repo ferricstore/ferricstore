@@ -62,6 +62,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
             [{key, materialized_value, expire_at_ms, record}]
 
           _ ->
+            observe_cold_read_error(1, :invalid_flow_state_record)
             []
         end
 
@@ -70,7 +71,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
         []
     end
   rescue
-    _ -> []
+    _ ->
+      observe_cold_read_error(1, :flow_state_decode_failed)
+      []
   end
 
   def cold_locations_for_state(shard_path, state_key, expire_at_ms, fid, off, vsize) do

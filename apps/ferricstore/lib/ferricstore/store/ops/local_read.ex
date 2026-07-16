@@ -1,16 +1,19 @@
 defmodule Ferricstore.Store.Ops.LocalRead do
   @moduledoc false
 
+  alias Ferricstore.BatchResult
   alias Ferricstore.HLC
   alias Ferricstore.Store.BlobRef
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.ColdRead
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.LocalTxStore
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.ZSetIndex
 
+  @cold_read_error {:error, "ERR cold read failed"}
   @cold_read_timeout_ms 10_000
 
   defguardp valid_cold_location(file_id, offset, value_size)
@@ -26,7 +29,10 @@ defmodule Ferricstore.Store.Ops.LocalRead do
                    is_integer(offset) and offset >= 0 and is_integer(value_size) and
                    value_size >= 0
 
-  def local?(tx, key), do: Router.shard_for(tx.instance_ctx, key) == tx.shard_index
+  def local?(%LocalTxStore{instance_ctx: nil}, _key), do: true
+
+  def local?(%LocalTxStore{} = tx, key),
+    do: Router.shard_for(tx.instance_ctx, key) == tx.shard_index
 
   def local_zset_index_read(%LocalTxStore{} = tx, redis_key, fun) do
     cond do
@@ -40,9 +46,10 @@ defmodule Ferricstore.Store.Ops.LocalRead do
         :unavailable
 
       true ->
-        redis_key
-        |> local_zset_index_state(tx)
-        |> fun.()
+        case local_zset_index_state(redis_key, tx) do
+          {:ok, state} -> fun.(state)
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+        end
     end
   end
 
@@ -131,6 +138,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
         case ShardETS.ets_lookup(tx.shard_state, key) do
           {:hit, _value, _exp} -> true
           {:cold, _fid, _off, _vsize, _exp} -> true
+          {:error, :invalid_keydir_entry} -> true
           :expired -> false
           :miss -> false
         end
@@ -185,6 +193,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
     tx
     |> local_batch_read_meta(keys, data_path)
     |> Enum.map(fn
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
       {value, _exp} -> normalize_get_value(value)
       nil -> nil
     end)
@@ -246,8 +255,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
             end
 
           {:error, reason} ->
-            ColdRead.emit_pread_error(path, reason)
-            vsize
+            ReadResult.failure({:cold_read_failed, reason})
         end
 
       true ->
@@ -257,32 +265,37 @@ defmodule Ferricstore.Store.Ops.LocalRead do
 
   def local_set(tx, key, value, opts) do
     get? = Map.get(opts, :get, false)
-    current = local_set_current_meta(tx, key, get?)
 
-    {old_value, effective_expire} =
-      case current do
-        nil ->
-          {nil, opts.expire_at_ms}
+    case local_set_current_meta(tx, key, get?) do
+      {:error, _reason} = error ->
+        error
 
-        {old_val, old_exp} ->
-          {old_val, if(opts.keepttl, do: old_exp, else: opts.expire_at_ms)}
-      end
+      current ->
+        {old_value, effective_expire} =
+          case current do
+            nil ->
+              {nil, opts.expire_at_ms}
 
-    skip? =
-      cond do
-        opts.nx and current != nil -> true
-        opts.xx and current == nil -> true
-        true -> false
-      end
+            {old_val, old_exp} ->
+              {old_val, if(opts.keepttl, do: old_exp, else: opts.expire_at_ms)}
+          end
 
-    if skip? do
-      if get?, do: old_value, else: nil
-    else
-      ShardETS.ets_insert(tx.shard_state, key, value, effective_expire)
-      tx_put_pending(key, value, effective_expire)
-      tx_undelete(key)
-      send(self(), {:tx_pending_write, key, value, effective_expire})
-      if get?, do: old_value, else: :ok
+        skip? =
+          cond do
+            opts.nx and current != nil -> true
+            opts.xx and current == nil -> true
+            true -> false
+          end
+
+        if skip? do
+          if get?, do: old_value, else: nil
+        else
+          ShardETS.ets_insert(tx.shard_state, key, value, effective_expire)
+          tx_put_pending(key, value, effective_expire)
+          tx_undelete(key)
+          send(self(), {:tx_pending_write, key, value, effective_expire})
+          if get?, do: old_value, else: :ok
+        end
     end
   end
 
@@ -307,7 +320,6 @@ defmodule Ferricstore.Store.Ops.LocalRead do
     end
   end
 
-  def shared_log_compound_key?(<<"T:", _rest::binary>>), do: true
   def shared_log_compound_key?(<<"PM:", _rest::binary>>), do: true
   def shared_log_compound_key?(_key), do: false
 
@@ -342,6 +354,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
   def local_promoted_read_value(tx, compound_key, dedicated_path) do
     case tx_pending_meta(compound_key) ||
            local_promoted_read_meta(tx, compound_key, dedicated_path) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
       {value, _exp} -> value
       nil -> nil
     end
@@ -421,29 +434,49 @@ defmodule Ferricstore.Store.Ops.LocalRead do
   end
 
   defp local_read_value_from_ets(tx, key) do
-    case ShardETS.ets_lookup_warm(tx.shard_state, key) do
+    case ShardETS.ets_lookup_warm_result(tx.shard_state, key) do
       {:hit, value, _exp} -> value
       :expired -> nil
       :miss -> nil
+      {:error, reason} -> ReadResult.failure(reason)
     end
   end
 
   defp local_read_meta_from_ets(tx, key) do
-    case ShardETS.ets_lookup_warm(tx.shard_state, key) do
+    case ShardETS.ets_lookup_warm_result(tx.shard_state, key) do
       {:hit, value, exp} -> {value, exp}
       :expired -> nil
       :miss -> nil
+      {:error, reason} -> ReadResult.failure(reason)
     end
   end
 
   defp local_batch_results([], results, _read_fun), do: results
 
   defp local_batch_results(entries, results, read_fun) do
-    entries
-    |> Enum.zip(read_fun.(entries))
-    |> Enum.reduce(results, fn {{index, _key}, value}, acc ->
-      Map.put(acc, index, value)
-    end)
+    merge_batch_results(entries, read_fun.(entries), results, &elem(&1, 0))
+  end
+
+  @doc false
+  def __merge_batch_results_for_test__(indexes, results, backend_results),
+    do: merge_batch_results(indexes, backend_results, results, & &1)
+
+  defp merge_batch_results(expected, backend_results, results, index_fun) do
+    case BatchResult.map_exact(expected, backend_results, fn entry, value ->
+           {index_fun.(entry), value}
+         end) do
+      {:ok, indexed_values} ->
+        Enum.reduce(indexed_values, results, fn {index, value}, acc ->
+          Map.put(acc, index, value)
+        end)
+
+      {:error, reason} ->
+        failure = ReadResult.failure(reason)
+
+        Enum.reduce(expected, results, fn entry, acc ->
+          Map.put(acc, index_fun.(entry), failure)
+        end)
+    end
   end
 
   defp normalize_get_value(nil), do: nil
@@ -480,38 +513,46 @@ defmodule Ferricstore.Store.Ops.LocalRead do
   defp local_promoted_batch_partition(results, tx, entries, data_path, read_fun) do
     partition_keys = Enum.map(entries, fn {key, _index} -> key end)
 
-    entries
-    |> Enum.zip(read_fun.(tx, partition_keys, data_path))
-    |> Enum.reduce(results, fn {{_key, index}, value}, acc -> Map.put(acc, index, value) end)
+    merge_batch_results(
+      entries,
+      read_fun.(tx, partition_keys, data_path),
+      results,
+      &elem(&1, 1)
+    )
   end
 
   defp local_batch_collect_ets(tx, key, index, data_path, now, results, cold) do
-    case :ets.lookup(tx.shard_state.keydir, key) do
-      [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-        {Map.put(results, index, {value, 0}), cold}
-
-      [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+    case ShardETS.ets_lookup_metadata(tx.shard_state, key, now) do
+      {:live, {^key, value, exp, _lfu, _fid, _off, _vsize}, :hot} ->
         {Map.put(results, index, {value, exp}), cold}
 
-      [{^key, nil, 0, _lfu, fid, off, vsize}]
+      {:live, {^key, nil, exp, _lfu, fid, off, vsize}, :cold}
       when valid_cold_location(fid, off, vsize) ->
-        path = ShardETS.file_path(data_path, fid)
-        {results, [{index, key, path, fid, off, vsize, 0} | cold]}
-
-      [{^key, nil, exp, _lfu, fid, off, vsize}]
-      when exp > now and valid_cold_location(fid, off, vsize) ->
         path = ShardETS.file_path(data_path, fid)
         {results, [{index, key, path, fid, off, vsize, exp} | cold]}
 
-      [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-        ShardETS.ets_delete_key(tx.shard_state, key)
-        {results, cold}
+      {:live, {^key, nil, _exp, _lfu, fid, _off, _vsize}, :cold} ->
+        {Map.put(
+           results,
+           index,
+           ReadResult.failure({:unsupported_local_cold_location, fid})
+         ), cold}
 
-      _ ->
+      {:live, _entry, :pending} ->
+        {Map.put(results, index, ReadResult.failure(:pending_cold_write)), cold}
+
+      {:live, _entry, :invalid} ->
+        {Map.put(results, index, ReadResult.failure(:invalid_keydir_entry)), cold}
+
+      {:error, :invalid_keydir_entry} ->
+        {Map.put(results, index, ReadResult.failure(:invalid_keydir_entry)), cold}
+
+      result when result in [:expired, :miss] ->
         {results, cold}
     end
   rescue
-    ArgumentError -> {results, cold}
+    ArgumentError ->
+      {Map.put(results, index, ReadResult.failure(:keydir_unavailable)), cold}
   end
 
   defp local_batch_read_cold(_tx, results, []), do: results
@@ -555,34 +596,78 @@ defmodule Ferricstore.Store.Ops.LocalRead do
   end
 
   defp read_unique_local_batch_cold(tx, cold_reads) do
-    locations =
-      Enum.map(cold_reads, fn {_index, key, path, _fid, off, _vsize, _exp} -> {path, off, key} end)
+    reads =
+      Enum.map(cold_reads, fn {_index, key, path, fid, off, vsize, exp} ->
+        {path, off, key, {Path.dirname(path), exp, fid, off, vsize}}
+      end)
 
-    case ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms) do
-      {:ok, values} when is_list(values) and length(values) == length(cold_reads) ->
-        cold_reads
-        |> Enum.zip(local_materialize_blob_values(tx, values))
+    case ColdRead.pread_batch_keyed_current(
+           reads,
+           fn key, token -> resolve_local_current_cold(tx, key, token) end,
+           @cold_read_timeout_ms
+         ) do
+      {:ok, current_results}
+      when is_list(current_results) and length(current_results) == length(cold_reads) ->
+        values = Enum.map(current_results, &local_current_read_value/1)
+        materialized_values = local_materialize_blob_values(tx, values)
+
+        [cold_reads, current_results, materialized_values]
+        |> Enum.zip()
         |> Enum.reduce(%{}, fn
-          {{index, key, _path, fid, off, vsize, exp}, {:ok, materialized}}, acc ->
+          {{index, key, _path, _fid, _off, _vsize, _exp},
+           {:value, _value, {_data_path, exp, fid, off, vsize}}, {:ok, materialized}},
+          acc ->
             ShardETS.cold_read_warm_ets(tx.shard_state, key, materialized, exp, fid, off, vsize)
             Map.put(acc, index, {materialized, exp})
 
-          {{_index, _key, path, _fid, _off, _vsize, _exp}, {:error, reason}}, acc ->
+          {{index, _key, path, _fid, _off, _vsize, _exp}, _current_result, {:error, reason}},
+          acc ->
             ColdRead.emit_pread_error(path, reason)
-            acc
+            Map.put(acc, index, ReadResult.failure({:cold_read_failed, reason}))
 
-          {_read, _missing_or_error}, acc ->
+          {_read, _current_result, _missing_or_error}, acc ->
             acc
         end)
 
-      {:ok, _bad_values} ->
+      {:ok, _bad_results} ->
         emit_local_batch_cold_errors(cold_reads, :batch_result_length_mismatch)
-        %{}
 
-      {:error, reason} ->
-        emit_local_batch_cold_errors(cold_reads, reason)
-        %{}
+        Map.new(cold_reads, fn {index, _key, _path, _fid, _off, _vsize, _exp} ->
+          {index, ReadResult.failure({:cold_read_failed, :batch_result_length_mismatch})}
+        end)
     end
+  end
+
+  defp local_current_read_value({:value, value, _token}), do: value
+  defp local_current_read_value({:error, reason}), do: {:error, reason}
+  defp local_current_read_value(:missing), do: nil
+
+  defp resolve_local_current_cold(tx, key, {data_path, _exp, _fid, _off, _vsize}) do
+    case ShardETS.ets_lookup_metadata(tx.shard_state, key) do
+      {:live, {^key, value, exp, _lfu, fid, off, vsize}, :hot} when is_binary(value) ->
+        {:hot, value, {data_path, exp, fid, off, vsize}}
+
+      {:live, {^key, nil, exp, _lfu, fid, off, vsize}, :cold}
+      when valid_cold_location(fid, off, vsize) ->
+        {:cold, ShardETS.file_path(data_path, fid), off, {data_path, exp, fid, off, vsize}}
+
+      {:live, _entry, :invalid} ->
+        {:error, :invalid_keydir_entry}
+
+      {:live, _entry, :pending} ->
+        {:error, :pending_cold_write}
+
+      {:live, _entry, _location} ->
+        {:error, :unsupported_local_cold_location}
+
+      {:error, :invalid_keydir_entry} ->
+        {:error, :invalid_keydir_entry}
+
+      result when result in [:expired, :miss] ->
+        :missing
+    end
+  rescue
+    ArgumentError -> {:error, :keydir_unavailable}
   end
 
   defp local_materialize_blob_values(tx, values) do
@@ -635,7 +720,12 @@ defmodule Ferricstore.Store.Ops.LocalRead do
     |> Enum.each(fn {path, count} -> ColdRead.emit_pread_error(path, reason, count) end)
   end
 
-  defp local_set_current_meta(tx, key, true), do: local_read_meta(tx, key)
+  defp local_set_current_meta(tx, key, true) do
+    case local_read_meta_for_rmw(tx, key) do
+      {nil, _expire_at_ms} -> nil
+      result -> result
+    end
+  end
 
   defp local_set_current_meta(tx, key, false) do
     if tx_deleted?(key) do
@@ -651,55 +741,69 @@ defmodule Ferricstore.Store.Ops.LocalRead do
   defp pending_expire_meta({_value, exp}), do: {nil, exp}
 
   defp ets_expire_meta(tx, key) do
-    case ShardETS.ets_lookup(tx.shard_state, key) do
-      {:hit, _value, exp} -> {nil, exp}
-      {:cold, _fid, _off, _vsize, exp} -> {nil, exp}
-      _ -> nil
+    case ShardETS.ets_lookup_metadata(tx.shard_state, key) do
+      {:live, {^key, _value, exp, _lfu, _fid, _off, _vsize}, location}
+      when location in [:hot, :cold, :pending] ->
+        {nil, exp}
+
+      {:live, _entry, :invalid} ->
+        @cold_read_error
+
+      {:error, :invalid_keydir_entry} ->
+        @cold_read_error
+
+      :expired ->
+        nil
+
+      :miss ->
+        nil
     end
   end
 
   defp local_read_meta_for_rmw_from_ets(tx, key) do
-    case ShardETS.ets_lookup_warm(tx.shard_state, key) do
+    case ShardETS.ets_lookup_warm_result(tx.shard_state, key) do
       {:hit, value, exp} -> {value, exp}
       :expired -> {nil, 0}
       :miss -> {nil, 0}
+      {:error, :cold_read_failed} -> @cold_read_error
     end
   end
 
   defp local_read_value_for_rmw_from_ets(tx, key) do
-    case ShardETS.ets_lookup_warm(tx.shard_state, key) do
+    case ShardETS.ets_lookup_warm_result(tx.shard_state, key) do
       {:hit, value, _exp} -> value
       :expired -> nil
       :miss -> nil
+      {:error, :cold_read_failed} -> @cold_read_error
     end
   end
 
   defp local_promoted_read_meta_from_ets(tx, compound_key, dedicated_path) do
-    now = HLC.now_ms()
-    keydir = tx.shard_state.keydir
-
-    case :ets.lookup(keydir, compound_key) do
-      [{^compound_key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-        {value, 0}
-
-      [{^compound_key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+    case ShardETS.ets_lookup_metadata(tx.shard_state, compound_key) do
+      {:live, {^compound_key, value, exp, _lfu, _fid, _off, _vsize}, :hot} ->
         {value, exp}
 
-      [{^compound_key, nil, 0, _lfu, fid, off, vsize}]
+      {:live, {^compound_key, nil, exp, _lfu, fid, off, vsize}, :cold}
       when valid_cold_location(fid, off, vsize) ->
-        read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, 0)
-
-      [{^compound_key, nil, exp, _lfu, fid, off, vsize}]
-      when exp > now and valid_cold_location(fid, off, vsize) ->
         read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, exp)
 
-      [{^compound_key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-        ShardETS.ets_delete_key(tx.shard_state, compound_key)
-        nil
+      {:live, {^compound_key, nil, _exp, _lfu, fid, _off, _vsize}, :cold} ->
+        ReadResult.failure({:unsupported_local_cold_location, fid})
 
-      _ ->
+      {:live, _entry, :pending} ->
+        ReadResult.failure(:pending_cold_write)
+
+      {:live, _entry, :invalid} ->
+        ReadResult.failure(:invalid_keydir_entry)
+
+      {:error, :invalid_keydir_entry} ->
+        ReadResult.failure(:invalid_keydir_entry)
+
+      result when result in [:expired, :miss] ->
         nil
     end
+  rescue
+    ArgumentError -> ReadResult.failure(:keydir_unavailable)
   end
 
   defp read_promoted_cold_value(tx, compound_key, dedicated_path, fid, off, vsize, exp) do
@@ -723,15 +827,14 @@ defmodule Ferricstore.Store.Ops.LocalRead do
 
           {:error, reason} ->
             ColdRead.emit_pread_error(path, reason)
-            nil
+            ReadResult.failure({:cold_read_failed, reason})
         end
 
       {:error, reason} ->
-        ColdRead.emit_pread_error(path, reason)
-        nil
+        ReadResult.failure({:cold_read_failed, reason})
 
-      _ ->
-        nil
+      invalid ->
+        ReadResult.failure({:cold_read_failed, {:invalid_read_result, invalid}})
     end
   end
 

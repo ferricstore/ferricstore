@@ -2,20 +2,26 @@ defmodule Ferricstore.Flow.InternalKey do
   @moduledoc false
 
   alias Ferricstore.Commands.Catalog.Entries
+  alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.CompoundKey
 
-  @error "ERR access to internal Flow keys is not allowed"
+  @error "ERR access to internal keys is not allowed"
 
   @spec error_message() :: binary()
   def error_message, do: @error
 
   @spec internal?(term()) :: boolean()
-  def internal?(<<"f:{", _rest::binary>> = key), do: match?({:ok, _, _}, split_flow_key(key))
-  def internal?(<<"X:f:{", _rest::binary>> = key), do: history_entry?(key)
+  def internal?(key) when is_binary(key) do
+    ServerCatalog.internal_key?(key) or flow_internal?(key)
+  end
+
   def internal?(_key), do: false
 
   @spec reserved?(term()) :: boolean()
-  def reserved?(key) when is_binary(key), do: internal?(key) or CompoundKey.internal_key?(key)
+  def reserved?(key) when is_binary(key) do
+    internal?(key) or CompoundKey.internal_key?(key)
+  end
+
   def reserved?(_key), do: false
 
   @spec authorize_public([term()]) :: :ok | {:error, binary()}
@@ -25,8 +31,21 @@ defmodule Ferricstore.Flow.InternalKey do
 
   @spec authorize_command(binary(), [term()]) :: :ok | {:error, binary()}
   def authorize_command(command, keys) when is_binary(command) and is_list(keys) do
-    if dedicated_flow_command?(command), do: :ok, else: authorize_public(keys)
+    if dedicated_flow_command?(command),
+      do: authorize_flow_command(keys),
+      else: authorize_public(keys)
   end
+
+  defp authorize_flow_command(keys) do
+    if Enum.any?(keys, &foreign_internal_key?/1), do: {:error, @error}, else: :ok
+  end
+
+  defp foreign_internal_key?(key) when is_binary(key) do
+    ServerCatalog.internal_key?(key) or
+      (CompoundKey.internal_key?(key) and not internal?(key))
+  end
+
+  defp foreign_internal_key?(_key), do: false
 
   defp dedicated_flow_command?(command) do
     case Entries.lookup_upper(String.upcase(command)) do
@@ -34,6 +53,12 @@ defmodule Ferricstore.Flow.InternalKey do
       _other -> false
     end
   end
+
+  defp flow_internal?(<<"f:{", _rest::binary>> = key),
+    do: match?({:ok, _, _}, split_flow_key(key))
+
+  defp flow_internal?(<<"X:f:{", _rest::binary>> = key), do: history_entry?(key)
+  defp flow_internal?(_key), do: false
 
   defp split_flow_key(<<"f:{", rest::binary>>) do
     case :binary.match(rest, "}") do

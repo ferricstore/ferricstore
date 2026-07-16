@@ -41,6 +41,22 @@ defmodule Ferricstore.Store.Shard.ETS.Accounting do
   def track_binary_delete(_, _, _), do: :ok
 
   @doc false
+  def track_binary_delete_entry(
+        %{instance_ctx: %{keydir_binary_bytes: ref}, index: idx} = state,
+        {key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size}
+      )
+      when ref != nil do
+    ExpiryTracker.adjust_for_state(state, expire_at_ms, 0)
+
+    bytes = offheap_size(key) + offheap_size(value)
+    if bytes > 0, do: :atomics.sub(ref, idx + 1, bytes)
+  end
+
+  def track_binary_delete_entry(state, {_key, _value, expire_at_ms, _lfu, _fid, _off, _vsize}) do
+    ExpiryTracker.adjust_for_state(state, expire_at_ms, 0)
+  end
+
+  @doc false
   def track_binary_add(shard_index, key, value, %{keydir_binary_bytes: ref}) when ref != nil do
     bytes = offheap_size(key) + offheap_size(value)
     if bytes > 0, do: :atomics.add(ref, shard_index + 1, bytes)

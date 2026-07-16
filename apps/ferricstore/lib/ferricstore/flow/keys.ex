@@ -10,6 +10,7 @@ defmodule Ferricstore.Flow.Keys do
   @partition_tag_prefix "{f:"
   @auto_partition_prefix "__flow_auto__:"
   @auto_partition_buckets 256
+  @max_exact_integer 9_007_199_254_740_991
   @auto_partition_tags 0..(@auto_partition_buckets - 1)
                        |> Enum.map(&("{fa:" <> Integer.to_string(&1) <> "}"))
                        |> List.to_tuple()
@@ -37,53 +38,31 @@ defmodule Ferricstore.Flow.Keys do
   end
 
   def state_key_from_due_key(due_key, id) when is_binary(due_key) and is_binary(id) do
-    case :binary.match(due_key, "}:d:") do
-      {pos, _len} when pos >= 2 ->
-        tag = binary_part(due_key, 2, pos + 1 - 2)
-        {:ok, "f:" <> tag <> ":s:" <> id}
-
-      :nomatch ->
-        :error
+    with {:ok, tag_prefix, remainder} <- split_internal_flow_key(due_key, "}:d:"),
+         true <- id != "" and remainder != "" do
+      {:ok, tag_prefix <> ":s:" <> id}
+    else
+      _invalid -> :error
     end
   end
 
   def state_key_from_registry_key(registry_key) when is_binary(registry_key) do
-    case :binary.match(registry_key, "}:r:") do
-      {pos, marker_size} when pos >= 2 ->
-        id_offset = pos + marker_size
-        id_size = byte_size(registry_key) - id_offset
-
-        if id_size > 0 do
-          tag = binary_part(registry_key, 2, pos + 1 - 2)
-          id = binary_part(registry_key, id_offset, id_size)
-          {:ok, "f:" <> tag <> ":s:" <> id}
-        else
-          :error
-        end
-
-      :nomatch ->
-        :error
+    with {:ok, tag_prefix, id} <- split_internal_flow_key(registry_key, "}:r:"),
+         true <- id != "" do
+      {:ok, tag_prefix <> ":s:" <> id}
+    else
+      _invalid -> :error
     end
   end
 
   def state_key_from_registry_key(_registry_key), do: :error
 
   def registry_key_from_state_key(state_key) when is_binary(state_key) do
-    case :binary.match(state_key, "}:s:") do
-      {pos, marker_size} when pos >= 2 ->
-        id_offset = pos + marker_size
-        id_size = byte_size(state_key) - id_offset
-
-        if id_size > 0 do
-          tag = binary_part(state_key, 2, pos + 1 - 2)
-          id = binary_part(state_key, id_offset, id_size)
-          {:ok, "f:" <> tag <> ":r:" <> id}
-        else
-          :error
-        end
-
-      :nomatch ->
-        :error
+    with {:ok, tag_prefix, id} <- split_internal_flow_key(state_key, "}:s:"),
+         true <- id != "" do
+      {:ok, tag_prefix <> ":r:" <> id}
+    else
+      _invalid -> :error
     end
   end
 
@@ -114,10 +93,49 @@ defmodule Ferricstore.Flow.Keys do
       ":v:" <> flow_value_kind(kind) <> ":" <> id <> ":" <> Integer.to_string(version)
   end
 
-  def shared_value_link_prefix(owner_flow_id, partition_key \\ nil)
-      when is_binary(owner_flow_id) do
-    "f:" <> tag(partition_key) <> ":svl:" <> owner_flow_id <> ":"
+  def named_shared_value_key(owner_flow_id, name, version, partition_key \\ nil)
+
+  def named_shared_value_key(owner_flow_id, name, version, nil)
+      when is_binary(owner_flow_id) and is_binary(name) and is_integer(version) do
+    named_shared_value_key(owner_flow_id, name, version, auto_partition_key(owner_flow_id))
   end
+
+  def named_shared_value_key(owner_flow_id, name, version, partition_key)
+      when is_binary(owner_flow_id) and is_binary(name) and is_integer(version) do
+    "f:" <>
+      tag(partition_key) <>
+      ":v:n:" <>
+      index_component(owner_flow_id) <>
+      ":" <> index_component(name) <> ":" <> Integer.to_string(version)
+  end
+
+  def shared_value_link_prefix(owner_flow_id, partition_key \\ nil)
+
+  def shared_value_link_prefix(owner_flow_id, nil) when is_binary(owner_flow_id) do
+    shared_value_link_prefix(owner_flow_id, auto_partition_key(owner_flow_id))
+  end
+
+  def shared_value_link_prefix(owner_flow_id, partition_key) when is_binary(owner_flow_id) do
+    "f:" <> tag(partition_key) <> ":svl:" <> index_component(owner_flow_id) <> ":"
+  end
+
+  def shared_value_link_key(owner_flow_id, name, version, partition_key \\ nil)
+      when is_binary(owner_flow_id) and is_binary(name) and is_integer(version) do
+    shared_value_link_prefix(owner_flow_id, partition_key) <>
+      index_component(name) <> ":" <> Integer.to_string(version)
+  end
+
+  def named_shared_value_parts(key) when is_binary(key) do
+    named_shared_key_parts(key, "}:v:n:")
+  end
+
+  def named_shared_value_parts(_key), do: :error
+
+  def shared_value_link_parts(key) when is_binary(key) do
+    named_shared_key_parts(key, "}:svl:")
+  end
+
+  def shared_value_link_parts(_key), do: :error
 
   def shared_value_ref_registry_key(flow_id, partition_key \\ nil) when is_binary(flow_id) do
     "f:" <> tag(partition_key) <> ":svr:" <> flow_id
@@ -162,19 +180,15 @@ defmodule Ferricstore.Flow.Keys do
 
   def shared_value_ref_backfill_key?(_key), do: false
 
-  def retention_cleanup_member?(<<"f:{", rest::binary>>),
-    do: :binary.match(rest, "}:rtm:") != :nomatch
+  def retention_cleanup_member?(key), do: internal_key_with_remainder?(key, "}:rtm:")
 
-  def retention_cleanup_member?(_key), do: false
-
-  def shared_value_ref?(<<"f:{", rest::binary>>),
-    do: :binary.match(rest, "}:v:s:") != :nomatch
-
-  def shared_value_ref?(_ref), do: false
+  def shared_value_ref?(ref), do: match?({:ok, kind} when kind in [?s, ?n], value_ref_kind(ref))
 
   def signal_idempotency_key(id, idempotency_key, partition_key \\ nil)
       when is_binary(id) and is_binary(idempotency_key) do
-    "f:" <> tag(partition_key) <> ":sig:" <> id <> ":" <> idempotency_key
+    "f:" <>
+      tag(partition_key) <>
+      ":sig:" <> index_component(id) <> ":" <> index_component(idempotency_key)
   end
 
   def policy_key(type) do
@@ -329,19 +343,19 @@ defmodule Ferricstore.Flow.Keys do
   def policy_type(_key), do: :error
 
   def governance_effect_key(id, effect_key, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":gov:e:" <> id <> ":" <> effect_key
+    governance_effect_key_prefix(id, partition_key) <> index_component(effect_key)
   end
 
   def governance_effect_key_prefix(id, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":gov:e:" <> id <> ":"
+    "f:" <> tag(partition_key) <> ":gov:e:" <> index_component(id) <> ":"
   end
 
   def governance_ledger_key(id, event_id, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":gov:l:" <> id <> ":" <> event_id
+    governance_ledger_key_prefix(id, partition_key) <> index_component(event_id)
   end
 
   def governance_ledger_key_prefix(id, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":gov:l:" <> id <> ":"
+    "f:" <> tag(partition_key) <> ":gov:l:" <> index_component(id) <> ":"
   end
 
   def governance_ledger_index_key(id, partition_key \\ nil) do
@@ -356,37 +370,25 @@ defmodule Ferricstore.Flow.Keys do
     "f:" <> tag(id) <> ":gov:a:" <> id
   end
 
-  def governance_approval_key?(<<"f:{", rest::binary>>),
-    do: :binary.match(rest, "}:gov:a:") != :nomatch
-
-  def governance_approval_key?(_key), do: false
+  def governance_approval_key?(key), do: internal_key_with_remainder?(key, "}:gov:a:")
 
   def governance_circuit_key(scope) when is_binary(scope) do
     "f:" <> tag(scope) <> ":gov:c:" <> scope
   end
 
-  def governance_circuit_key?(<<"f:{", rest::binary>>),
-    do: :binary.match(rest, "}:gov:c:") != :nomatch
-
-  def governance_circuit_key?(_key), do: false
+  def governance_circuit_key?(key), do: internal_key_with_remainder?(key, "}:gov:c:")
 
   def governance_budget_key(scope) when is_binary(scope) do
     "f:" <> tag(scope) <> ":gov:b:" <> scope
   end
 
-  def governance_budget_key?(<<"f:{", rest::binary>>),
-    do: :binary.match(rest, "}:gov:b:") != :nomatch
-
-  def governance_budget_key?(_key), do: false
+  def governance_budget_key?(key), do: internal_key_with_remainder?(key, "}:gov:b:")
 
   def governance_limit_key(scope) when is_binary(scope) do
     "f:" <> tag(scope) <> ":gov:limit:" <> scope
   end
 
-  def governance_limit_key?(<<"f:{", rest::binary>>),
-    do: :binary.match(rest, "}:gov:limit:") != :nomatch
-
-  def governance_limit_key?(_key), do: false
+  def governance_limit_key?(key), do: internal_key_with_remainder?(key, "}:gov:limit:")
 
   def governance_limit_reservation_prefix(scope, shard_id, epoch)
       when is_binary(scope) and is_integer(shard_id) and shard_id >= 0 and
@@ -500,26 +502,28 @@ defmodule Ferricstore.Flow.Keys do
     "f:" <> tag(scope) <> ":gov:limit-storage:" <> digest(scope)
   end
 
-  def value_key?(<<"f:{", rest::binary>>), do: :binary.match(rest, "}:v:") != :nomatch
-  def value_key?(_key), do: false
+  def value_key?(key), do: match?({:ok, _kind}, value_ref_kind(key))
 
-  def history_key?(<<"f:{", rest::binary>>), do: :binary.match(rest, "}:h:") != :nomatch
-  def history_key?(_key), do: false
+  def history_key?(key), do: internal_key_with_remainder?(key, "}:h:")
 
   def due_key(type, state, priority, partition_key \\ nil) do
     "f:" <>
       tag(partition_key) <>
-      ":d:" <> type <> ":" <> state <> ":p" <> Integer.to_string(priority)
+      ":d:" <>
+      index_component(type) <>
+      ":" <> index_component(state) <> ":p" <> Integer.to_string(priority)
   end
 
   def due_any_key(type, priority, partition_key \\ nil) do
     "f:" <>
       tag(partition_key) <>
-      ":da:" <> type <> ":p" <> Integer.to_string(priority)
+      ":da:" <> index_component(type) <> ":p" <> Integer.to_string(priority)
   end
 
   def state_index_key(type, state, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:s:" <> type <> ":" <> state
+    "f:" <>
+      tag(partition_key) <>
+      ":i:s:" <> index_component(type) <> ":" <> index_component(state)
   end
 
   def inflight_index_key(type, partition_key \\ nil) do
@@ -547,40 +551,72 @@ defmodule Ferricstore.Flow.Keys do
   end
 
   def attribute_index_key(type, state, name, value, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:a:" <> type <> ":" <> state <> ":" <> name <> "=" <> value
+    "f:" <>
+      tag(partition_key) <>
+      ":i:a:" <>
+      index_component(type) <>
+      ":" <>
+      index_component(state) <>
+      ":" <> index_component(name) <> "=" <> index_component(value)
   end
 
   def attribute_index_prefix(type, state, name, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:a:" <> type <> ":" <> state <> ":" <> name <> "="
+    "f:" <>
+      tag(partition_key) <>
+      ":i:a:" <>
+      index_component(type) <>
+      ":" <> index_component(state) <> ":" <> index_component(name) <> "="
   end
 
   def attribute_type_index_key(type, name, value, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:at:" <> type <> ":" <> name <> "=" <> value
+    "f:" <>
+      tag(partition_key) <>
+      ":i:at:" <>
+      index_component(type) <> ":" <> index_component(name) <> "=" <> index_component(value)
   end
 
   def attribute_type_index_prefix(type, name, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:at:" <> type <> ":" <> name <> "="
+    "f:" <>
+      tag(partition_key) <>
+      ":i:at:" <> index_component(type) <> ":" <> index_component(name) <> "="
   end
 
   def attribute_state_index_key(state, name, value, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:as:" <> state <> ":" <> name <> "=" <> value
+    "f:" <>
+      tag(partition_key) <>
+      ":i:as:" <>
+      index_component(state) <> ":" <> index_component(name) <> "=" <> index_component(value)
   end
 
   def attribute_state_index_prefix(state, name, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:as:" <> state <> ":" <> name <> "="
+    "f:" <>
+      tag(partition_key) <>
+      ":i:as:" <> index_component(state) <> ":" <> index_component(name) <> "="
   end
 
   def attribute_partition_index_key(name, value, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:ap:" <> name <> "=" <> value
+    "f:" <>
+      tag(partition_key) <>
+      ":i:ap:" <> index_component(name) <> "=" <> index_component(value)
   end
 
   def attribute_partition_index_prefix(name, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:ap:" <> name <> "="
+    "f:" <> tag(partition_key) <> ":i:ap:" <> index_component(name) <> "="
   end
 
   def state_meta_index_key(type, state, name, value, partition_key \\ nil) do
-    "f:" <> tag(partition_key) <> ":i:sm:" <> type <> ":" <> state <> ":" <> name <> "=" <> value
+    "f:" <>
+      tag(partition_key) <>
+      ":i:sm:" <>
+      index_component(type) <>
+      ":" <>
+      index_component(state) <>
+      ":" <> index_component(name) <> "=" <> index_component(value)
   end
+
+  @doc false
+  def index_component(value) when is_binary(value),
+    do: Base.url_encode64(value, padding: false)
 
   def stream_entry_key(id, event_id, partition_key \\ nil) do
     stream_entry_key_from_history_key(history_key(id, partition_key), event_id)
@@ -591,9 +627,7 @@ defmodule Ferricstore.Flow.Keys do
     "X:" <> history_key <> <<0>> <> event_id
   end
 
-  def state_key?(<<"f:{", rest::binary>>), do: :binary.match(rest, "}:s:") != :nomatch
-
-  def state_key?(_key), do: false
+  def state_key?(key), do: internal_key_with_remainder?(key, "}:s:")
 
   def retention_guard_key_from_state_key(state_key) when is_binary(state_key) do
     with {:ok, tag_prefix, id} <- split_internal_flow_key(state_key, "}:s:"),
@@ -606,9 +640,7 @@ defmodule Ferricstore.Flow.Keys do
 
   def retention_guard_key_from_state_key(_state_key), do: :error
 
-  def registry_key?(<<"f:{", rest::binary>>), do: :binary.match(rest, "}:r:") != :nomatch
-
-  def registry_key?(_key), do: false
+  def registry_key?(key), do: internal_key_with_remainder?(key, "}:r:")
 
   def tag(nil), do: @global_tag
   def tag(:global), do: @global_tag
@@ -686,6 +718,79 @@ defmodule Ferricstore.Flow.Keys do
 
   defp split_internal_flow_key(_key, _marker), do: :error
 
+  defp internal_key_with_remainder?(key, marker) do
+    case split_internal_flow_key(key, marker) do
+      {:ok, _tag_prefix, remainder} -> remainder != ""
+      :error -> false
+    end
+  end
+
+  defp value_ref_kind(key) do
+    case split_internal_flow_key(key, "}:v:") do
+      {:ok, _tag_prefix, <<kind, ?:, rest::binary>>}
+      when kind in [?p, ?r, ?e, ?s] ->
+        if valid_regular_value_ref_remainder?(rest), do: {:ok, kind}, else: :error
+
+      {:ok, _tag_prefix, <<?n, ?:, _rest::binary>>} ->
+        if match?({:ok, _owner, _name, _version}, named_shared_key_parts(key, "}:v:n:")),
+          do: {:ok, ?n},
+          else: :error
+
+      _invalid ->
+        :error
+    end
+  end
+
+  defp valid_regular_value_ref_remainder?(rest) when is_binary(rest) do
+    case :binary.matches(rest, ":") do
+      [] ->
+        false
+
+      matches ->
+        {version_separator, 1} = List.last(matches)
+        id = binary_part(rest, 0, version_separator)
+        version_offset = version_separator + 1
+        encoded_version = binary_part(rest, version_offset, byte_size(rest) - version_offset)
+
+        id != "" and canonical_non_neg_integer?(encoded_version)
+    end
+  end
+
+  defp canonical_non_neg_integer?(encoded) when is_binary(encoded) do
+    case Integer.parse(encoded) do
+      {value, ""} when value >= 0 and value <= @max_exact_integer ->
+        encoded == Integer.to_string(value)
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp named_shared_key_parts(key, marker) do
+    with {:ok, _tag_prefix, remainder} <- split_internal_flow_key(key, marker),
+         [encoded_owner, encoded_name, encoded_version] <-
+           :binary.split(remainder, ":", [:global]),
+         {:ok, owner_flow_id} <- decode_index_component(encoded_owner),
+         {:ok, name} <- decode_index_component(encoded_name),
+         true <- owner_flow_id != "" and name != "",
+         {version, ""} when version >= 0 and version <= @max_exact_integer <-
+           Integer.parse(encoded_version),
+         true <- encoded_version == Integer.to_string(version) do
+      {:ok, owner_flow_id, name, version}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decode_index_component(encoded) do
+    with {:ok, decoded} <- Base.url_decode64(encoded, padding: false),
+         true <- index_component(decoded) == encoded do
+      {:ok, decoded}
+    else
+      _invalid -> :error
+    end
+  end
+
   defp valid_flow_tag?("f"), do: true
 
   defp valid_flow_tag?(<<"fa:", bucket::binary>>) do
@@ -717,23 +822,29 @@ defmodule Ferricstore.Flow.Keys do
 
   def auto_partition_key?(_partition_key), do: false
 
-  defp auto_partition_bucket(bucket), do: auto_partition_bucket(bucket, 0, false)
+  defp auto_partition_bucket("0"), do: {:ok, 0}
 
-  defp auto_partition_bucket(<<>>, value, true) when value < @auto_partition_buckets,
+  defp auto_partition_bucket(<<digit, rest::binary>>) when digit >= ?1 and digit <= ?9 do
+    auto_partition_bucket_digits(rest, digit - ?0)
+  end
+
+  defp auto_partition_bucket(_bucket), do: :error
+
+  defp auto_partition_bucket_digits(<<>>, value) when value < @auto_partition_buckets,
     do: {:ok, value}
 
-  defp auto_partition_bucket(<<digit, rest::binary>>, value, _seen?)
+  defp auto_partition_bucket_digits(<<digit, rest::binary>>, value)
        when digit >= ?0 and digit <= ?9 do
     next = value * 10 + (digit - ?0)
 
     if next < @auto_partition_buckets do
-      auto_partition_bucket(rest, next, true)
+      auto_partition_bucket_digits(rest, next)
     else
       :error
     end
   end
 
-  defp auto_partition_bucket(_bucket, _value, _seen?), do: :error
+  defp auto_partition_bucket_digits(_bucket, _value), do: :error
 
   defp flow_value_kind(:payload), do: "p"
   defp flow_value_kind(:result), do: "r"

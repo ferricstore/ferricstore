@@ -19,18 +19,70 @@ defmodule Ferricstore.Store.Router.Part04 do
       alias Ferricstore.Store.CompoundKey
       alias Ferricstore.Store.LFU
       alias Ferricstore.Store.ListOps
+      alias Ferricstore.Store.ReadResult
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
 
+      @doc false
+      def __pread_file_range_for_test__(path, offset, count),
+        do: pread_file_range(path, offset, count)
+
       defp retry_changed_cold_value(ctx, idx, keydir, key, original_location, now) do
+        case retry_changed_cold_value_raw(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               :miss
+             ) do
+          {:read_error, _reason} -> :miss
+          result -> result
+        end
+      end
+
+      defp retry_changed_cold_value_result(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             exhausted_failure
+           ) do
+        case retry_changed_cold_value_raw(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               exhausted_failure
+             ) do
+          {:read_error, reason} -> storage_read_failure(:cold_value_unavailable, reason)
+          result -> result
+        end
+      end
+
+      defp retry_changed_cold_value_raw(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             exhausted_result
+           ) do
         case retry_changed_cold_value_once(ctx, idx, keydir, key, original_location, now) do
           :unchanged_cold ->
             retry_after_unchanged_cold_location(
               fn ->
                 retry_changed_cold_value_once(ctx, idx, keydir, key, original_location, now)
               end,
-              cold_retry_metadata(ctx, idx, key, :value)
+              cold_retry_metadata(ctx, idx, key, :value),
+              exhausted_result
             )
 
           result ->
@@ -51,7 +103,7 @@ defmodule Ferricstore.Store.Router.Part04 do
 
             case read_cold_materialized(ctx, idx, path, offset, key) do
               {:ok, value} when is_binary(value) -> {:cold, value, file_id, offset}
-              _ -> :miss
+              read_error -> {:read_error, storage_read_reason(read_error)}
             end
 
           {:cold, file_id, offset, value_size}
@@ -59,7 +111,7 @@ defmodule Ferricstore.Store.Router.Part04 do
                  {file_id, offset, value_size} != original_location ->
             case read_waraft_segment_materialized(ctx, idx, file_id, key) do
               {:ok, value} when is_binary(value) -> {:cold, value, file_id, offset}
-              _ -> :miss
+              read_error -> {:read_error, storage_read_reason(read_error)}
             end
 
           {:cold, file_id, offset, value_size}
@@ -71,6 +123,12 @@ defmodule Ferricstore.Store.Router.Part04 do
           when valid_waraft_segment_location(file_id, offset, value_size) and
                  {file_id, offset, value_size} == original_location ->
             :unchanged_cold
+
+          {:invalid, entry} ->
+            {:read_error, {:invalid_keydir_entry, entry}}
+
+          :no_table ->
+            {:read_error, :keydir_unavailable}
 
           _ ->
             :miss
@@ -99,14 +157,98 @@ defmodule Ferricstore.Store.Router.Part04 do
         end
       end
 
+      defp retry_changed_waraft_segment_value_read_result(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             read_error
+           ) do
+        failure = storage_read_failure(:waraft_value_unavailable, read_error)
+
+        case retry_changed_cold_value_result(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               failure
+             ) do
+          {:cold, value, retry_file_id, retry_offset} ->
+            Stats.record_cold_read(ctx, key)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, value, retry_file_id, retry_offset)
+            value
+
+          {:hot, value} ->
+            value
+
+          :miss ->
+            record_keyspace_miss(ctx, key)
+            nil
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
+        end
+      end
+
       defp retry_changed_cold_meta(ctx, idx, keydir, key, original_location, now) do
+        case retry_changed_cold_meta_raw(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               :miss
+             ) do
+          {:read_error, _reason} -> :miss
+          result -> result
+        end
+      end
+
+      defp retry_changed_cold_meta_result(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             exhausted_failure
+           ) do
+        case retry_changed_cold_meta_raw(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               exhausted_failure
+             ) do
+          {:read_error, reason} -> storage_read_failure(:cold_meta_unavailable, reason)
+          result -> result
+        end
+      end
+
+      defp retry_changed_cold_meta_raw(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             exhausted_result
+           ) do
         case retry_changed_cold_meta_once(ctx, idx, keydir, key, original_location, now) do
           :unchanged_cold ->
             retry_after_unchanged_cold_location(
               fn ->
                 retry_changed_cold_meta_once(ctx, idx, keydir, key, original_location, now)
               end,
-              cold_retry_metadata(ctx, idx, key, :meta)
+              cold_retry_metadata(ctx, idx, key, :meta),
+              exhausted_result
             )
 
           result ->
@@ -127,7 +269,7 @@ defmodule Ferricstore.Store.Router.Part04 do
 
             case read_cold_materialized(ctx, idx, path, offset, key) do
               {:ok, value} when is_binary(value) -> {:cold, value, expire_at_ms, file_id, offset}
-              _ -> :miss
+              read_error -> {:read_error, storage_read_reason(read_error)}
             end
 
           {:cold, file_id, offset, value_size, expire_at_ms}
@@ -135,7 +277,7 @@ defmodule Ferricstore.Store.Router.Part04 do
                  {file_id, offset, value_size} != original_location ->
             case read_waraft_segment_materialized(ctx, idx, file_id, key) do
               {:ok, value} when is_binary(value) -> {:cold, value, expire_at_ms, file_id, offset}
-              _ -> :miss
+              read_error -> {:read_error, storage_read_reason(read_error)}
             end
 
           {:cold, file_id, offset, value_size, _expire_at_ms}
@@ -147,6 +289,12 @@ defmodule Ferricstore.Store.Router.Part04 do
           when valid_waraft_segment_location(file_id, offset, value_size) and
                  {file_id, offset, value_size} == original_location ->
             :unchanged_cold
+
+          {:invalid, entry} ->
+            {:read_error, {:invalid_keydir_entry, entry}}
+
+          :no_table ->
+            {:read_error, :keydir_unavailable}
 
           _ ->
             :miss
@@ -168,23 +316,85 @@ defmodule Ferricstore.Store.Router.Part04 do
         end
       end
 
+      defp retry_changed_waraft_segment_meta_read_result(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             read_error
+           ) do
+        failure = storage_read_failure(:waraft_meta_unavailable, read_error)
+
+        case retry_changed_cold_meta_result(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               failure
+             ) do
+          {:cold, value, retry_expire_at_ms, retry_file_id, retry_offset} ->
+            Stats.record_cold_read(ctx, key)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, value, retry_file_id, retry_offset)
+            {value, retry_expire_at_ms}
+
+          {:hot, value, retry_expire_at_ms} ->
+            {value, retry_expire_at_ms}
+
+          :miss ->
+            record_keyspace_miss(ctx, key)
+            nil
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
+        end
+      end
+
       defp retry_after_unchanged_cold_location(retry_fun, metadata)
            when is_function(retry_fun, 0) do
-        retry_after_unchanged_cold_location(retry_fun, metadata, @cold_location_retry_attempts)
+        retry_after_unchanged_cold_location(retry_fun, metadata, :miss)
       end
 
-      defp retry_after_unchanged_cold_location(_retry_fun, metadata, 0) do
+      defp retry_after_unchanged_cold_location(retry_fun, metadata, exhausted_result)
+           when is_function(retry_fun, 0) do
+        retry_after_unchanged_cold_location(
+          retry_fun,
+          metadata,
+          exhausted_result,
+          @cold_location_retry_attempts
+        )
+      end
+
+      defp retry_after_unchanged_cold_location(
+             _retry_fun,
+             metadata,
+             exhausted_result,
+             0
+           ) do
         emit_cold_retry_exhausted(metadata)
-        :miss
+        exhausted_result
       end
 
-      defp retry_after_unchanged_cold_location(retry_fun, metadata, attempts_left) do
+      defp retry_after_unchanged_cold_location(
+             retry_fun,
+             metadata,
+             exhausted_result,
+             attempts_left
+           ) do
         maybe_run_cold_location_miss_hook()
         Process.sleep(@cold_location_retry_sleep_ms)
 
         case retry_fun.() do
           :unchanged_cold ->
-            retry_after_unchanged_cold_location(retry_fun, metadata, attempts_left - 1)
+            retry_after_unchanged_cold_location(
+              retry_fun,
+              metadata,
+              exhausted_result,
+              attempts_left - 1
+            )
 
           result ->
             result
@@ -225,7 +435,8 @@ defmodule Ferricstore.Store.Router.Part04 do
       Hot path: reads directly from ETS for cached keys. Each read is recorded
       as hot or cold in `Ferricstore.Stats`.
       """
-      @spec get_meta(FerricStore.Instance.t(), binary()) :: {binary(), non_neg_integer()} | nil
+      @spec get_meta(FerricStore.Instance.t(), binary()) ::
+              {binary(), non_neg_integer()} | nil | Ferricstore.Store.ReadResult.failure()
       def get_meta(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
@@ -247,14 +458,17 @@ defmodule Ferricstore.Store.Router.Part04 do
                 warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
                 {value, expire_at_ms}
 
-              _ ->
-                case retry_changed_cold_meta(
+              read_error ->
+                failure = storage_read_failure(:cold_meta_unavailable, read_error)
+
+                case retry_changed_cold_meta_result(
                        ctx,
                        idx,
                        keydir,
                        key,
                        {file_id, offset, value_size},
-                       now
+                       now,
+                       failure
                      ) do
                   {:cold, value, retry_expire_at_ms, retry_file_id, retry_offset} ->
                     Stats.record_cold_read(ctx, key)
@@ -277,6 +491,9 @@ defmodule Ferricstore.Store.Router.Part04 do
                   :miss ->
                     record_keyspace_miss(ctx, key)
                     nil
+
+                  {:error, {:storage_read_failed, _reason}} = failure ->
+                    failure
                 end
             end
 
@@ -288,42 +505,36 @@ defmodule Ferricstore.Store.Router.Part04 do
                 warm_ets_after_cold_read(ctx, idx, keydir, key, value, file_id, offset)
                 {value, expire_at_ms}
 
-              :not_found ->
-                retry_changed_waraft_segment_meta_result(
+              :not_found = read_error ->
+                retry_changed_waraft_segment_meta_read_result(
                   ctx,
                   idx,
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now
+                  now,
+                  read_error
                 )
 
-              {:error, _reason} ->
-                retry_changed_waraft_segment_meta_result(
+              {:error, _reason} = read_error ->
+                retry_changed_waraft_segment_meta_read_result(
                   ctx,
                   idx,
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now
+                  now,
+                  read_error
                 )
             end
 
-          {:cold, _file_id, _offset, _value_size, _expire_at_ms} ->
-            # Invalid file ref — ask GenServer.
-            result =
-              case safe_read_call(ctx, idx, {:get_meta, key}) do
-                {:ok, result} -> result
-                :unavailable -> nil
-              end
+          {:cold, file_id, offset, value_size, _expire_at_ms} ->
+            Ferricstore.Store.ReadResult.failure(
+              {:invalid_cold_location, {file_id, offset, value_size}}
+            )
 
-            if result != nil do
-              Stats.record_cold_read(ctx, key)
-            else
-              record_keyspace_miss(ctx, key)
-            end
-
-            result
+          {:invalid, entry} ->
+            Ferricstore.Store.ReadResult.failure({:invalid_keydir_entry, entry})
 
           :expired ->
             record_keyspace_miss(ctx, key)
@@ -334,19 +545,19 @@ defmodule Ferricstore.Store.Router.Part04 do
             nil
 
           :no_table ->
-            result =
-              case safe_read_call(ctx, idx, {:get_meta, key}) do
-                {:ok, result} -> result
-                :unavailable -> nil
-              end
+            case safe_read_call(ctx, idx, {:get_meta, key}) do
+              {:ok, result} ->
+                if result != nil do
+                  Stats.record_cold_read(ctx, key)
+                else
+                  record_keyspace_miss(ctx, key)
+                end
 
-            if result != nil do
-              Stats.record_cold_read(ctx, key)
-            else
-              record_keyspace_miss(ctx, key)
+                result
+
+              :unavailable ->
+                Ferricstore.Store.ReadResult.failure(:keydir_unavailable)
             end
-
-            result
         end
       end
 
@@ -364,42 +575,19 @@ defmodule Ferricstore.Store.Router.Part04 do
 
         try do
           case :ets.lookup(keydir, key) do
-            [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-              0
-
-            [{^key, nil, 0, _lfu, fid, off, vsize}]
-            when valid_cold_location(fid, off, vsize) ->
-              0
-
-            [{^key, nil, 0, _lfu, fid, off, vsize}]
-            when valid_waraft_segment_location(fid, off, vsize) ->
-              0
-
-            [{^key, nil, 0, _lfu, :pending, _off, vsize}]
-            when valid_pending_value_size(vsize) ->
-              0
-
-            [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize}]
+            when is_integer(exp) and (exp == 0 or exp > now) ->
               exp
 
-            [{^key, nil, exp, _lfu, fid, off, vsize}]
-            when exp > now and valid_cold_location(fid, off, vsize) ->
-              exp
-
-            [{^key, nil, exp, _lfu, fid, off, vsize}]
-            when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
-              exp
-
-            [{^key, nil, exp, _lfu, :pending, _off, vsize}]
-            when exp > now and valid_pending_value_size(vsize) ->
-              exp
-
-            [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
+            when is_integer(exp) and exp > 0 and exp <= now ->
+              delete_observed_keydir_entry(ctx, idx, keydir, entry)
               nil
 
             [] ->
+              nil
+
+            [_malformed_live_entry] ->
               nil
           end
         rescue
@@ -413,7 +601,8 @@ defmodule Ferricstore.Store.Router.Part04 do
       Hot entries use the in-memory value size; cold entries use the keydir
       `value_size` field populated by Bitcask append/recovery.
       """
-      @spec value_size(FerricStore.Instance.t(), binary()) :: non_neg_integer() | nil
+      @spec value_size(FerricStore.Instance.t(), binary()) ::
+              non_neg_integer() | nil | ReadResult.failure()
       def value_size(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
@@ -450,12 +639,20 @@ defmodule Ferricstore.Store.Router.Part04 do
             when exp > now and valid_pending_value_size(vsize) ->
               vsize
 
-            [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
+            [{^key, nil, exp, _lfu, _fid, _off, vsize}]
+            when is_integer(exp) and (exp == 0 or exp > now) and is_integer(vsize) and
+                   vsize >= 0 ->
+              vsize
+
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
+            when is_integer(exp) and exp > 0 and exp <= now ->
+              delete_observed_keydir_entry(ctx, idx, keydir, entry)
               nil
 
             [] ->
+              nil
+
+            [_malformed_live_entry] ->
               nil
           end
         rescue
@@ -472,41 +669,19 @@ defmodule Ferricstore.Store.Router.Part04 do
 
         try do
           case :ets.lookup(keydir, key) do
-            [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
+            [{^key, _value, exp, lfu, _fid, _off, _vsize}]
+            when is_integer(exp) and (exp == 0 or exp > now) and is_integer(lfu) and lfu >= 0 ->
               lfu
 
-            [{^key, nil, 0, lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-              lfu
-
-            [{^key, nil, 0, lfu, fid, off, vsize}]
-            when valid_waraft_segment_location(fid, off, vsize) ->
-              lfu
-
-            [{^key, nil, 0, lfu, :pending, _off, vsize}]
-            when valid_pending_value_size(vsize) ->
-              lfu
-
-            [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-              lfu
-
-            [{^key, nil, exp, lfu, fid, off, vsize}]
-            when exp > now and valid_cold_location(fid, off, vsize) ->
-              lfu
-
-            [{^key, nil, exp, lfu, fid, off, vsize}]
-            when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
-              lfu
-
-            [{^key, nil, exp, lfu, :pending, _off, vsize}]
-            when exp > now and valid_pending_value_size(vsize) ->
-              lfu
-
-            [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
+            when is_integer(exp) and exp > 0 and exp <= now ->
+              delete_observed_keydir_entry(ctx, idx, keydir, entry)
               nil
 
             [] ->
+              nil
+
+            [_malformed_live_entry] ->
               nil
           end
         rescue
@@ -521,7 +696,8 @@ defmodule Ferricstore.Store.Router.Part04 do
       location once, then read only the requested value bytes from the data file.
       Missing or expired keys return `nil`, matching `get/2`.
       """
-      @spec getrange(FerricStore.Instance.t(), binary(), integer(), integer()) :: binary() | nil
+      @spec getrange(FerricStore.Instance.t(), binary(), integer(), integer()) ::
+              binary() | nil | ReadResult.failure()
       def getrange(ctx, key, start_idx, end_idx) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
@@ -556,15 +732,37 @@ defmodule Ferricstore.Store.Router.Part04 do
                 range_from_value(value, start_idx, end_idx)
 
               :not_found ->
-                record_keyspace_miss(ctx, key)
-                nil
+                retry_getrange_after_ref_miss(
+                  ctx,
+                  idx,
+                  keydir,
+                  key,
+                  {file_id, offset, value_size},
+                  start_idx,
+                  end_idx,
+                  now,
+                  :not_found
+                )
 
-              {:error, _reason} ->
-                nil
+              {:error, reason} ->
+                retry_getrange_after_ref_miss(
+                  ctx,
+                  idx,
+                  keydir,
+                  key,
+                  {file_id, offset, value_size},
+                  start_idx,
+                  end_idx,
+                  now,
+                  reason
+                )
             end
 
           {:cold, _file_id, _offset, _value_size} ->
             fallback_getrange(ctx, idx, key, start_idx, end_idx)
+
+          {:invalid, entry} ->
+            ReadResult.failure({:invalid_keydir_entry, entry})
 
           :expired ->
             record_keyspace_miss(ctx, key)
@@ -622,7 +820,8 @@ defmodule Ferricstore.Store.Router.Part04 do
                 {file_id, offset, value_size},
                 start_idx,
                 end_idx,
-                now
+                now,
+                :blob_range_read_failed
               )
           end
         else
@@ -661,11 +860,11 @@ defmodule Ferricstore.Store.Router.Part04 do
             path = cold_file_path(ctx, idx, file_id)
 
             case validated_file_ref(path, offset, key, value_size) do
-              {^path, value_offset, ^value_size} ->
+              {read_path, value_offset, ^value_size} ->
                 case read_validated_value_range(
                        ctx,
                        key,
-                       path,
+                       read_path,
                        value_offset + relative_offset,
                        count
                      ) do
@@ -681,7 +880,8 @@ defmodule Ferricstore.Store.Router.Part04 do
                       {file_id, offset, value_size},
                       start_idx,
                       end_idx,
-                      now
+                      now,
+                      :range_pread_failed
                     )
                 end
 
@@ -694,7 +894,8 @@ defmodule Ferricstore.Store.Router.Part04 do
                   {file_id, offset, value_size},
                   start_idx,
                   end_idx,
-                  now
+                  now,
+                  :invalid_value_ref
                 )
             end
         end
@@ -724,9 +925,20 @@ defmodule Ferricstore.Store.Router.Part04 do
              original_location,
              start_idx,
              end_idx,
-             now
+             now,
+             read_error
            ) do
-        case retry_changed_file_ref(ctx, idx, keydir, key, original_location, now) do
+        exhausted_failure = storage_read_failure(:cold_range_unavailable, read_error)
+
+        case retry_changed_file_ref_result(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               exhausted_failure
+             ) do
           {:cold_ref, path, value_offset, value_size} ->
             case normalize_byte_range(value_size, start_idx, end_idx) do
               :empty ->
@@ -744,8 +956,7 @@ defmodule Ferricstore.Store.Router.Part04 do
                     value
 
                   :error ->
-                    record_keyspace_miss(ctx, key)
-                    nil
+                    storage_read_failure(:cold_range_unavailable, :range_pread_failed)
                 end
             end
 
@@ -755,6 +966,9 @@ defmodule Ferricstore.Store.Router.Part04 do
           :miss ->
             record_keyspace_miss(ctx, key)
             nil
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
         end
       end
 
@@ -779,36 +993,67 @@ defmodule Ferricstore.Store.Router.Part04 do
       end
 
       defp fallback_getrange(ctx, idx, key, start_idx, end_idx) do
-        result =
-          case safe_read_call(ctx, idx, {:get, key}) do
-            {:ok, value} -> value
-            :unavailable -> nil
-          end
+        case safe_read_call(ctx, idx, {:get, key}) do
+          {:ok, {:error, {:storage_read_failed, _reason}} = failure} ->
+            failure
 
-        if result != nil do
-          Stats.record_cold_read(ctx, key)
-          range_from_value(result, start_idx, end_idx)
-        else
-          record_keyspace_miss(ctx, key)
-          nil
+          {:ok, nil} ->
+            record_keyspace_miss(ctx, key)
+            nil
+
+          {:ok, value} ->
+            Stats.record_cold_read(ctx, key)
+            range_from_value(value, start_idx, end_idx)
+
+          :unavailable ->
+            ReadResult.failure(:shard_unavailable)
         end
       end
 
       defp pread_file_range(_path, _offset, 0), do: {:ok, ""}
 
       defp pread_file_range(path, offset, count) do
-        case :file.open(path, [:read, :raw, :binary]) do
-          {:ok, fd} ->
-            try do
-              case :file.pread(fd, offset, count) do
-                {:ok, value} when is_binary(value) and byte_size(value) == count -> {:ok, value}
-                _ -> :error
-              end
-            after
-              :file.close(fd)
+        with {:ok, %File.Stat{type: :regular} = expected_stat} <- File.lstat(path),
+             :ok <- maybe_run_cold_range_open_hook(),
+             {:ok, fd} <- :file.open(path, [:read, :raw, :binary]) do
+          try do
+            with :ok <- verify_cold_range_file_identity(fd, expected_stat),
+                 {:ok, value} when is_binary(value) and byte_size(value) == count <-
+                   :file.pread(fd, offset, count) do
+              {:ok, value}
+            else
+              _ -> :error
             end
+          after
+            :file.close(fd)
+          end
+        else
+          _ -> :error
+        end
+      end
 
-          {:error, _reason} ->
+      defp maybe_run_cold_range_open_hook do
+        case Process.get(:ferricstore_router_cold_range_open_hook) do
+          fun when is_function(fun, 0) -> fun.()
+          _ -> :ok
+        end
+      end
+
+      defp verify_cold_range_file_identity(
+             fd,
+             %File.Stat{
+               major_device: major_device,
+               minor_device: minor_device,
+               inode: inode
+             }
+           ) do
+        case :file.read_file_info(fd) do
+          {:ok, info}
+          when elem(info, 2) == :regular and elem(info, 9) == major_device and
+                 elem(info, 10) == minor_device and elem(info, 11) == inode ->
+            :ok
+
+          _ ->
             :error
         end
       end

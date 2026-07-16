@@ -135,6 +135,22 @@ defmodule Ferricstore.Commands.HashAtomicTest do
   # ---------------------------------------------------------------------------
 
   describe "HGETEX" do
+    test "without an expiry option reads fields and preserves their TTLs" do
+      store = MockStore.make()
+      Hash.handle("HSET", ["hash", "f1", "v1", "f2", "v2"], store)
+      Hash.handle("HEXPIRE", ["hash", "60", "FIELDS", "1", "f1"], store)
+
+      [ttl_before] = Hash.handle("HPTTL", ["hash", "FIELDS", "1", "f1"], store)
+
+      assert ["v1", "v2", nil] ==
+               Hash.handle("HGETEX", ["hash", "FIELDS", "3", "f1", "f2", "missing"], store)
+
+      [ttl_after] = Hash.handle("HPTTL", ["hash", "FIELDS", "1", "f1"], store)
+      assert ttl_after <= ttl_before
+      assert ttl_after >= ttl_before - 100
+      assert [-1] == Hash.handle("HTTL", ["hash", "FIELDS", "1", "f2"], store)
+    end
+
     test "with EX sets TTL in seconds" do
       store = MockStore.make()
       Hash.handle("HSET", ["hash", "f1", "v1", "f2", "v2"], store)

@@ -5,27 +5,36 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
   alias Ferricstore.DataDir
   alias Ferricstore.Store.Shard
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
 
-  test "get returns nil instead of exiting when ETS and shard are temporarily unavailable" do
+  test "get fails closed when ETS and shard are temporarily unavailable" do
     ctx = unavailable_ctx()
 
-    assert nil == Router.get(ctx, "restart:missing")
+    assert ReadResult.failure(:keydir_unavailable) == Router.get(ctx, "restart:missing")
   end
 
-  test "batch_get returns nil for unavailable shard fallback instead of exiting" do
+  test "batch_get fails closed for an unavailable shard" do
     ctx = unavailable_ctx()
 
-    assert [nil, nil] == Router.batch_get(ctx, ["restart:a", "restart:b"])
+    failure = ReadResult.failure(:shard_unavailable)
+    assert [^failure, ^failure] = Router.batch_get(ctx, ["restart:a", "restart:b"])
   end
 
-  test "get_meta returns nil instead of exiting when ETS and shard are temporarily unavailable" do
+  test "get_meta fails closed when ETS and shard are temporarily unavailable" do
     ctx = unavailable_ctx()
 
-    assert nil == Router.get_meta(ctx, "restart:meta")
+    assert ReadResult.failure(:keydir_unavailable) == Router.get_meta(ctx, "restart:meta")
   end
 
-  test "keys skips unavailable shard and reports telemetry" do
+  test "GETRANGE propagates an unavailable keydir instead of treating the failure as a value" do
+    ctx = unavailable_ctx()
+
+    assert {:error, "ERR storage read failed"} ==
+             FerricStore.Impl.getrange(ctx, "restart:range", 0, -1)
+  end
+
+  test "keys fails closed for an unavailable shard and reports telemetry" do
     ctx = unavailable_ctx()
     handler_id = {__MODULE__, make_ref()}
 
@@ -39,11 +48,11 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
-    assert [] == Router.keys(ctx)
+    assert ReadResult.failure(:shard_unavailable) == Router.keys(ctx)
     assert_unavailable_event(:keys)
   end
 
-  test "dbsize reports unavailable keydir fallback" do
+  test "dbsize fails closed for an unavailable keydir" do
     ctx = unavailable_ctx()
     handler_id = {__MODULE__, make_ref()}
 
@@ -57,10 +66,23 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
-    assert 0 == Router.dbsize(ctx)
+    assert ReadResult.failure(:keydir_unavailable) == Router.dbsize(ctx)
 
     assert_receive {:telemetry_event, [:ferricstore, :store, :shard_unavailable], %{count: 1},
                     %{request: :dbsize, reason: :keydir_unavailable, shard_index: 0}}
+  end
+
+  test "public enumeration APIs never turn storage outages into empty success" do
+    ctx = unavailable_ctx()
+
+    assert ReadResult.failure(:shard_unavailable) == FerricStore.Impl.keys(ctx)
+    assert ReadResult.failure(:keydir_unavailable) == FerricStore.Impl.dbsize(ctx)
+
+    assert {:error, "ERR storage read failed"} =
+             Ferricstore.Commands.Server.handle("KEYS", ["*"], ctx)
+
+    assert {:error, "ERR storage read failed"} =
+             Ferricstore.Commands.Server.handle("DBSIZE", [], ctx)
   end
 
   test "metadata-only reads report unavailable keydir fallbacks" do
@@ -121,9 +143,11 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
-    assert nil == Router.get(ctx, "restart:get")
-    assert [nil, nil] == Router.batch_get(ctx, ["restart:batch:a", "restart:batch:b"])
-    assert nil == Router.get_meta(ctx, "restart:meta")
+    assert ReadResult.failure(:keydir_unavailable) == Router.get(ctx, "restart:get")
+
+    failure = ReadResult.failure(:shard_unavailable)
+    assert [^failure, ^failure] = Router.batch_get(ctx, ["restart:batch:a", "restart:batch:b"])
+    assert ReadResult.failure(:keydir_unavailable) == Router.get_meta(ctx, "restart:meta")
 
     assert_unavailable_event(:get)
     assert_unavailable_event(:get)
@@ -199,7 +223,7 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
     end
   end
 
-  test "compound reads fallback and report unavailable shards" do
+  test "compound reads fail closed and report unavailable shards" do
     ctx = unavailable_ctx()
     redis_key = "restart:compound"
     compound_key = "H:" <> redis_key <> <<0>> <> "field"
@@ -216,12 +240,14 @@ defmodule Ferricstore.Store.RouterRestartFallbackTest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
-    assert nil == Router.compound_get(ctx, redis_key, compound_key)
-    assert [nil] == Router.compound_batch_get(ctx, redis_key, [compound_key])
-    assert nil == Router.compound_get_meta(ctx, redis_key, compound_key)
-    assert [nil] == Router.compound_batch_get_meta(ctx, redis_key, [compound_key])
-    assert [] == Router.compound_scan(ctx, redis_key, prefix)
-    assert 0 == Router.compound_count(ctx, redis_key, prefix)
+    failure = ReadResult.failure(:shard_unavailable)
+
+    assert ^failure = Router.compound_get(ctx, redis_key, compound_key)
+    assert [^failure] = Router.compound_batch_get(ctx, redis_key, [compound_key])
+    assert ^failure = Router.compound_get_meta(ctx, redis_key, compound_key)
+    assert [^failure] = Router.compound_batch_get_meta(ctx, redis_key, [compound_key])
+    assert ^failure = Router.compound_scan(ctx, redis_key, prefix)
+    assert ^failure = Router.compound_count(ctx, redis_key, prefix)
 
     assert_unavailable_event(:compound_get)
     assert_unavailable_event(:compound_batch_get)

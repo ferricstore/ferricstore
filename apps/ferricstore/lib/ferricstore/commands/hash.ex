@@ -25,15 +25,15 @@ defmodule Ferricstore.Commands.Hash do
   WRONGTYPE error is returned.
   """
 
+  alias Ferricstore.Commands.CollectionScan
   alias Ferricstore.Commands.Hash.FieldOps
   alias Ferricstore.Commands.Hash.Helpers
-  alias Ferricstore.CommandTime
   alias Ferricstore.Store.CompoundKey
-  alias Ferricstore.Store.Ops
-  alias Ferricstore.Store.TypeRegistry
+  alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
+  @max_random_replacement_count 10_000
   @overflow_error "ERR increment or decrement would overflow"
 
   @doc """
@@ -75,9 +75,9 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HGET", [key, field], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_key = CompoundKey.hash_field(key, field)
-      Ops.compound_get(store, key, compound_key)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, value} <- read_field(key, field, store) do
+      value
     end
   end
 
@@ -101,9 +101,9 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HMGET", [key | fields], store) when fields != [] do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
-      Ops.compound_batch_get(store, key, compound_keys)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, values} <- read_fields(key, fields, store) do
+      values
     end
   end
 
@@ -116,10 +116,8 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HGETALL", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
       # Return flat list [field1, value1, field2, value2, ...]
       Helpers.hash_pairs_to_flat_list(pairs)
     end
@@ -134,9 +132,9 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HLEN", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
       prefix = CompoundKey.hash_prefix(key)
-      Ops.compound_count(store, key, prefix)
+      store |> Ops.compound_count(key, prefix) |> ReadResult.command_result()
     end
   end
 
@@ -149,14 +147,9 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HEXISTS", [key, field], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_key = CompoundKey.hash_field(key, field)
-
-      if Ops.compound_get(store, key, compound_key) != nil do
-        1
-      else
-        0
-      end
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, value} <- read_field(key, field, store) do
+      if is_nil(value), do: 0, else: 1
     end
   end
 
@@ -169,9 +162,8 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HKEYS", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
       Enum.map(pairs, fn {field, _value} -> field end)
     end
   end
@@ -185,9 +177,8 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HVALS", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
       Enum.map(pairs, fn {_field, value} -> value end)
     end
   end
@@ -215,7 +206,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HINCRBY", [key, field, increment_str], store) do
     with {:ok, increment} <- parse_hincrby_increment(increment_str),
          type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :hash, store) do
+           TypeRegistry.command_check_or_set_status(key, :hash, store) do
       do_hincrby(key, field, increment, store, type_status)
     end
   end
@@ -231,7 +222,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HINCRBYFLOAT", [key, field, increment_str], store) do
     with {:ok, increment} <- parse_hincrbyfloat_increment(increment_str),
          type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :hash, store) do
+           TypeRegistry.command_check_or_set_status(key, :hash, store) do
       hincrbyfloat_field(key, field, increment, store, type_status)
     end
   end
@@ -248,9 +239,10 @@ defmodule Ferricstore.Commands.Hash do
   # Returns: 1 = expiry set, -2 = field/key does not exist.
   def handle("HEXPIRE", [key, seconds_str, "FIELDS", count_str | fields], store) do
     with {:ok, seconds} <- Helpers.parse_positive_integer(seconds_str, "seconds"),
+         {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000),
          {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
          :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.expire_fields(key, fields, CommandTime.now_ms() + seconds * 1000, store)
+      FieldOps.expire_fields(key, fields, expire_at_ms, store)
     end
   end
 
@@ -300,9 +292,10 @@ defmodule Ferricstore.Commands.Hash do
   # Returns: 1 = expiry set, -2 = field/key does not exist.
   def handle("HPEXPIRE", [key, ms_str, "FIELDS", count_str | fields], store) do
     with {:ok, ms} <- Helpers.parse_positive_integer(ms_str, "milliseconds"),
+         {:ok, expire_at_ms} <- Helpers.relative_expire_at(ms, 1),
          {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
          :ok <- Helpers.validate_field_count(count, fields) do
-      FieldOps.expire_fields(key, fields, CommandTime.now_ms() + ms, store)
+      FieldOps.expire_fields(key, fields, expire_at_ms, store)
     end
   end
 
@@ -366,13 +359,20 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   # Gets the values of the specified fields and optionally modifies their expiry.
+  def handle("HGETEX", [key, "FIELDS", count_str | fields], store) do
+    with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
+         :ok <- Helpers.validate_field_count(count, fields) do
+      hmget_args([key | fields], store)
+    end
+  end
+
   def handle("HGETEX", [key, mode | rest], store) when mode in ~w(EX PX EXAT PXAT) do
     case rest do
       [value_str, "FIELDS", count_str | fields] ->
         with {:ok, expire_at_ms} <- Helpers.parse_expiry_mode(mode, value_str),
              {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
              :ok <- Helpers.validate_field_count(count, fields) do
-          with :ok <- TypeRegistry.check_type(key, :hash, store) do
+          with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
             FieldOps.getex_fields(fields, key, store, expire_at_ms)
           end
         end
@@ -385,7 +385,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HGETEX", [key, "PERSIST", "FIELDS", count_str | fields], store) do
     with {:ok, count} <- Helpers.parse_positive_integer(count_str, "count"),
          :ok <- Helpers.validate_field_count(count, fields) do
-      with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
         FieldOps.getex_fields(fields, key, store, 0)
       end
     end
@@ -404,9 +404,9 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HSETEX", [key, seconds_str, _f, _v | _] = args, store) do
     [_, _ | field_value_pairs] = args
 
-    with {:ok, seconds} <- Helpers.parse_positive_integer(seconds_str, "seconds") do
+    with {:ok, seconds} <- Helpers.parse_positive_integer(seconds_str, "seconds"),
+         {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000) do
       if Helpers.even_length?(field_value_pairs) do
-        expire_at_ms = CommandTime.now_ms() + seconds * 1000
         hset_fields_with_ttl(key, field_value_pairs, store, expire_at_ms)
       else
         {:error, "ERR wrong number of arguments for 'hsetex' command"}
@@ -423,10 +423,9 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HSTRLEN", [key, field], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_key = CompoundKey.hash_field(key, field)
-
-      case Ops.compound_get(store, key, compound_key) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, value} <- read_field(key, field, store) do
+      case value do
         nil -> 0
         value -> byte_size(value)
       end
@@ -442,25 +441,20 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HSCAN", [key, cursor_str | opts], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store),
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
          {:ok, cursor} <- Helpers.parse_cursor(cursor_str),
-         {:ok, match_pattern, count} <- Helpers.parse_hscan_opts(opts) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-
-      filtered =
-        case match_pattern do
-          nil ->
-            pairs
-
-          pattern ->
-            Enum.filter(pairs, fn {field, _value} ->
-              Ferricstore.GlobMatcher.match?(field, pattern)
-            end)
-        end
-
-      {next_cursor, batch} = Helpers.paginate(filtered, cursor, count)
-      elements = Helpers.hash_pairs_to_flat_list(batch)
+         {:ok, match_pattern, count} <- Helpers.parse_hscan_opts(opts),
+         {:ok, {next_cursor, pairs}} <-
+           CollectionScan.page(
+             store,
+             key,
+             CompoundKey.hash_prefix(key),
+             cursor,
+             count,
+             match_pattern,
+             false
+           ) do
+      elements = Helpers.hash_pairs_to_flat_list(pairs)
       [next_cursor, elements]
     end
   end
@@ -478,10 +472,8 @@ defmodule Ferricstore.Commands.Hash do
   # ---------------------------------------------------------------------------
 
   def handle("HRANDFIELD", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
       case pairs do
         [] ->
           nil
@@ -494,7 +486,7 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   def handle("HRANDFIELD", [key, count_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
       case Integer.parse(count_str) do
         {count, ""} ->
           select_random_hash_fields(key, count, false, store)
@@ -509,7 +501,7 @@ defmodule Ferricstore.Commands.Hash do
     if String.upcase(withvalues_str) != "WITHVALUES" do
       {:error, "ERR syntax error"}
     else
-      with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
         case Integer.parse(count_str) do
           {count, ""} ->
             select_random_hash_fields(key, count, true, store)
@@ -550,7 +542,7 @@ defmodule Ferricstore.Commands.Hash do
 
   def handle_ast({:hincrby, key, field, increment}, store) when is_integer(increment) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :hash, store) do
+           TypeRegistry.command_check_or_set_status(key, :hash, store) do
       do_hincrby(key, field, increment, store, type_status)
     end
   end
@@ -559,7 +551,7 @@ defmodule Ferricstore.Commands.Hash do
 
   def handle_ast({:hincrbyfloat, key, field, increment}, store) when is_float(increment) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :hash, store) do
+           TypeRegistry.command_check_or_set_status(key, :hash, store) do
       hincrbyfloat_field(key, field, increment, store, type_status)
     end
   end
@@ -588,11 +580,15 @@ defmodule Ferricstore.Commands.Hash do
 
   def handle_ast({:hexpire, key, seconds, fields}, store)
       when is_integer(seconds) and is_list(fields) do
-    FieldOps.expire_fields(key, fields, CommandTime.now_ms() + seconds * 1000, store)
+    with {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000) do
+      FieldOps.expire_fields(key, fields, expire_at_ms, store)
+    end
   end
 
   def handle_ast({:hpexpire, key, ms, fields}, store) when is_integer(ms) and is_list(fields) do
-    FieldOps.expire_fields(key, fields, CommandTime.now_ms() + ms, store)
+    with {:ok, expire_at_ms} <- Helpers.relative_expire_at(ms, 1) do
+      FieldOps.expire_fields(key, fields, expire_at_ms, store)
+    end
   end
 
   def handle_ast({:httl, key, fields}, store) when is_list(fields),
@@ -610,32 +606,48 @@ defmodule Ferricstore.Commands.Hash do
   def handle_ast({:hgetdel, key, fields}, store) when is_list(fields),
     do: FieldOps.getdel_fields(key, fields, store)
 
+  def handle_ast({:hgetex, key, :none, fields}, store) when is_list(fields),
+    do: hmget_args([key | fields], store)
+
   def handle_ast({:hgetex, key, :persist, fields}, store) when is_list(fields),
     do: FieldOps.getex_parsed(key, fields, 0, store)
 
   def handle_ast({:hgetex, key, {:ex, seconds}, fields}, store)
-      when is_integer(seconds) and is_list(fields),
-      do: FieldOps.getex_parsed(key, fields, CommandTime.now_ms() + seconds * 1000, store)
+      when is_integer(seconds) and is_list(fields) do
+    with {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000) do
+      FieldOps.getex_parsed(key, fields, expire_at_ms, store)
+    end
+  end
 
   def handle_ast({:hgetex, key, {:px, ms}, fields}, store)
-      when is_integer(ms) and is_list(fields),
-      do: FieldOps.getex_parsed(key, fields, CommandTime.now_ms() + ms, store)
+      when is_integer(ms) and is_list(fields) do
+    with {:ok, expire_at_ms} <- Helpers.relative_expire_at(ms, 1) do
+      FieldOps.getex_parsed(key, fields, expire_at_ms, store)
+    end
+  end
 
   def handle_ast({:hgetex, key, {:exat, ts}, fields}, store)
-      when is_integer(ts) and is_list(fields),
-      do: FieldOps.getex_parsed(key, fields, ts * 1000, store)
+      when is_integer(ts) and is_list(fields) do
+    with {:ok, expire_at_ms} <- Helpers.absolute_expire_at(ts, 1_000) do
+      FieldOps.getex_parsed(key, fields, expire_at_ms, store)
+    end
+  end
 
   def handle_ast({:hgetex, key, {:pxat, ts}, fields}, store)
-      when is_integer(ts) and is_list(fields),
-      do: FieldOps.getex_parsed(key, fields, ts, store)
+      when is_integer(ts) and is_list(fields) do
+    with {:ok, expire_at_ms} <- Helpers.absolute_expire_at(ts, 1) do
+      FieldOps.getex_parsed(key, fields, expire_at_ms, store)
+    end
+  end
 
   def handle_ast({:hsetex, key, seconds, field_value_pairs}, store)
       when is_integer(seconds) and is_list(field_value_pairs) do
-    if Helpers.even_length?(field_value_pairs) do
-      expire_at_ms = CommandTime.now_ms() + seconds * 1000
-      hset_fields_with_ttl(key, field_value_pairs, store, expire_at_ms)
-    else
-      {:error, "ERR wrong number of arguments for 'hsetex' command"}
+    with {:ok, expire_at_ms} <- Helpers.relative_expire_at(seconds, 1_000) do
+      if Helpers.even_length?(field_value_pairs) do
+        hset_fields_with_ttl(key, field_value_pairs, store, expire_at_ms)
+      else
+        {:error, "ERR wrong number of arguments for 'hsetex' command"}
+      end
     end
   end
 
@@ -659,39 +671,39 @@ defmodule Ferricstore.Commands.Hash do
 
   defp hset_fields(key, field_value_pairs, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :hash, store) do
+           TypeRegistry.command_check_or_set_status(key, :hash, store) do
       FieldOps.set_pairs(field_value_pairs, key, store, type_status)
     end
   end
 
   defp hset_fields_with_ttl(key, field_value_pairs, store, expire_at_ms) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :hash, store) do
+           TypeRegistry.command_check_or_set_status(key, :hash, store) do
       FieldOps.set_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, type_status)
     end
   end
 
   defp hget_field(key, field, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_key = CompoundKey.hash_field(key, field)
-      Ops.compound_get(store, key, compound_key)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, value} <- read_field(key, field, store) do
+      value
     end
   end
 
   defp hdel_args([key | fields], store) when fields != [] do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
       compound_keys =
         fields
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.hash_field(key, &1))
 
-      metas = Ops.compound_batch_get_meta(store, key, compound_keys)
-      deleted_entries = hash_deleted_entries(compound_keys, metas, [])
+      with {:ok, metas} <- read_compound_metas(key, compound_keys, store) do
+        deleted_entries = hash_deleted_entries(compound_keys, metas, [])
+        deleted = length(deleted_entries)
 
-      deleted = length(deleted_entries)
-
-      with :ok <- FieldOps.delete_and_cleanup(key, deleted_entries, deleted, store) do
-        deleted
+        with :ok <- FieldOps.delete_and_cleanup(key, deleted_entries, deleted, store) do
+          deleted
+        end
       end
     end
   end
@@ -713,9 +725,9 @@ defmodule Ferricstore.Commands.Hash do
   defp hash_deleted_entries(_compound_keys, _metas, acc), do: Enum.reverse(acc)
 
   defp hmget_args([key | fields], store) when fields != [] do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
-      Ops.compound_batch_get(store, key, compound_keys)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, values} <- read_fields(key, fields, store) do
+      values
     end
   end
 
@@ -723,61 +735,62 @@ defmodule Ferricstore.Commands.Hash do
     do: {:error, "ERR wrong number of arguments for 'hmget' command"}
 
   defp hgetall_key(key, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
       Helpers.hash_pairs_to_flat_list(pairs)
     end
   end
 
   defp hlen_key(key, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
       prefix = CompoundKey.hash_prefix(key)
-      Ops.compound_count(store, key, prefix)
+      store |> Ops.compound_count(key, prefix) |> ReadResult.command_result()
     end
   end
 
   defp hexists_field(key, field, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_key = CompoundKey.hash_field(key, field)
-      if Ops.compound_get(store, key, compound_key) != nil, do: 1, else: 0
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, value} <- read_field(key, field, store) do
+      if is_nil(value), do: 0, else: 1
     end
   end
 
   defp hkeys_key(key, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
       Enum.map(pairs, fn {field, _value} -> field end)
     end
   end
 
   defp hvals_key(key, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
       Enum.map(pairs, fn {_field, value} -> value end)
     end
   end
 
   defp hsetnx_field(key, field, value, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :hash, store) do
+           TypeRegistry.command_check_or_set_status(key, :hash, store) do
       compound_key = CompoundKey.hash_field(key, field)
 
-      if Ops.compound_get(store, key, compound_key) != nil do
-        0
-      else
-        write_hash_field(store, key, compound_key, value, 1, type_status)
+      case read_compound_value(key, compound_key, store) do
+        {:ok, nil} ->
+          write_hash_field(store, key, compound_key, value, 1, type_status)
+
+        {:ok, _existing} ->
+          0
+
+        {:error, _reason} = error ->
+          FieldOps.rollback_new_type_marker(key, store, type_status, error)
       end
     end
   end
 
   defp hstrlen_field(key, field, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      compound_key = CompoundKey.hash_field(key, field)
-
-      case Ops.compound_get(store, key, compound_key) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, value} <- read_field(key, field, store) do
+      case value do
         nil -> 0
         value -> byte_size(value)
       end
@@ -785,10 +798,8 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   defp hrandfield_one(key, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+         {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
       case pairs do
         [] ->
           nil
@@ -800,38 +811,90 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
-  defp hscan_typed(key, cursor, opts, store) when is_integer(cursor) and cursor >= 0 do
-    with :ok <- TypeRegistry.check_type(key, :hash, store),
-         {:ok, match_pattern, count} <- typed_scan_opts(opts) do
-      prefix = CompoundKey.hash_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-
-      filtered =
-        case match_pattern do
-          nil ->
-            pairs
-
-          pattern ->
-            Enum.filter(pairs, fn {field, _value} ->
-              Ferricstore.GlobMatcher.match?(field, pattern)
-            end)
-        end
-
-      {next_cursor, batch} = Helpers.paginate(filtered, cursor, count)
-      elements = Helpers.hash_pairs_to_flat_list(batch)
-      [next_cursor, elements]
+  defp hscan_typed(key, cursor, opts, store) do
+    if CollectionScan.valid_cursor?(cursor) do
+      with :ok <- TypeRegistry.command_check_type(key, :hash, store),
+           {:ok, match_pattern, count} <- typed_scan_opts(opts),
+           {:ok, {next_cursor, pairs}} <-
+             CollectionScan.page(
+               store,
+               key,
+               CompoundKey.hash_prefix(key),
+               cursor,
+               count,
+               match_pattern,
+               false
+             ) do
+        elements = Helpers.hash_pairs_to_flat_list(pairs)
+        [next_cursor, elements]
+      end
+    else
+      {:error, "ERR invalid cursor"}
     end
   end
 
-  defp hscan_typed(_key, _cursor, _opts, _store), do: {:error, "ERR invalid cursor"}
-
   defp select_random_hash_fields(_key, 0, _with_values, _store), do: []
 
+  defp select_random_hash_fields(_key, count, _with_values, _store)
+       when count < -@max_random_replacement_count,
+       do: {:error, "ERR count exceeds maximum allowed response size"}
+
   defp select_random_hash_fields(key, count, with_values, store) do
-    prefix = CompoundKey.hash_prefix(key)
-    pairs = Ops.compound_scan(store, key, prefix)
-    Helpers.select_random_fields(pairs, count, with_values)
+    case scan_pairs(key, CompoundKey.hash_prefix(key), store) do
+      {:ok, pairs} -> Helpers.select_random_fields(pairs, count, with_values)
+      {:error, _reason} = error -> error
+    end
   end
+
+  defp scan_pairs(key, prefix, store) do
+    case Ops.compound_scan(store, key, prefix) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      pairs when is_list(pairs) -> {:ok, pairs}
+    end
+  end
+
+  defp read_field(key, field, store) do
+    read_compound_value(key, CompoundKey.hash_field(key, field), store)
+  end
+
+  defp read_compound_value(key, compound_key, store) do
+    case Ops.compound_get(store, key, compound_key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      value ->
+        {:ok, value}
+    end
+  end
+
+  defp read_fields(key, fields, store) do
+    compound_keys = Enum.map(fields, &CompoundKey.hash_field(key, &1))
+    values = Ops.compound_batch_get(store, key, compound_keys)
+    checked_batch_values(values, length(compound_keys))
+  end
+
+  defp read_compound_metas(key, compound_keys, store) do
+    values = Ops.compound_batch_get_meta(store, key, compound_keys)
+    checked_batch_values(values, length(compound_keys))
+  end
+
+  defp checked_batch_values(values, expected_count) when is_list(values) do
+    cond do
+      length(values) != expected_count ->
+        {:error, "ERR storage read failed"}
+
+      failure = ReadResult.first_failure(values) ->
+        ReadResult.command_error(failure)
+
+      true ->
+        {:ok, values}
+    end
+  end
+
+  defp checked_batch_values({:error, {:storage_read_failed, _reason}} = failure, _expected_count),
+    do: ReadResult.command_error(failure)
+
+  defp checked_batch_values(_invalid, _expected_count), do: {:error, "ERR storage read failed"}
 
   defp typed_scan_opts(opts), do: typed_scan_opts(opts, nil, 10)
 
@@ -860,50 +923,65 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   defp parse_hincrbyfloat_increment(increment_str) do
-    case Float.parse(increment_str) do
-      {increment, ""} -> {:ok, increment}
+    case Helpers.parse_float_value(increment_str) do
+      {:ok, increment} -> {:ok, increment}
       :error -> {:error, "ERR value is not a valid float"}
     end
   end
 
   defp do_hincrby(key, field, increment, store, type_status) do
     compound_key = CompoundKey.hash_field(key, field)
-    current = Ops.compound_get(store, key, compound_key)
 
-    case Helpers.parse_integer_value(current) do
-      {:ok, current_int} ->
-        case Helpers.checked_integer_add(current_int, increment) do
-          {:ok, new_val} ->
-            write_hash_field(
-              store,
-              key,
-              compound_key,
-              Integer.to_string(new_val),
-              new_val,
-              type_status
-            )
+    case read_compound_value(key, compound_key, store) do
+      {:ok, current} ->
+        case Helpers.parse_integer_value(current) do
+          {:ok, current_int} ->
+            case Helpers.checked_integer_add(current_int, increment) do
+              {:ok, new_val} ->
+                write_hash_field(
+                  store,
+                  key,
+                  compound_key,
+                  Integer.to_string(new_val),
+                  new_val,
+                  type_status
+                )
 
-          :overflow ->
-            {:error, @overflow_error}
+              :overflow ->
+                {:error, @overflow_error}
+            end
+
+          :error ->
+            {:error, "ERR hash value is not an integer"}
         end
 
-      :error ->
-        {:error, "ERR hash value is not an integer"}
+      {:error, _reason} = error ->
+        FieldOps.rollback_new_type_marker(key, store, type_status, error)
     end
   end
 
   defp hincrbyfloat_field(key, field, increment, store, type_status) do
     compound_key = CompoundKey.hash_field(key, field)
-    current = Ops.compound_get(store, key, compound_key)
 
-    case Helpers.parse_float_value(current) do
-      {:ok, current_float} ->
-        new_val = current_float + increment
-        result_str = Helpers.format_float(new_val)
-        write_hash_field(store, key, compound_key, result_str, result_str, type_status)
+    case read_compound_value(key, compound_key, store) do
+      {:ok, current} ->
+        case Helpers.parse_float_value(current) do
+          {:ok, current_float} ->
+            case Helpers.checked_float_add(current_float, increment) do
+              {:ok, new_val} ->
+                result_str = Helpers.format_float(new_val)
+                write_hash_field(store, key, compound_key, result_str, result_str, type_status)
 
-      :error ->
-        {:error, "ERR hash value is not a valid float"}
+              :overflow ->
+                {:error, "ERR increment would produce NaN or Infinity"}
+            end
+
+          :error ->
+            {:error, "ERR hash value is not a valid float"}
+        end
+
+      {:error, _reason} = error ->
+        FieldOps.rollback_new_type_marker(key, store, type_status, error)
     end
   end
 
@@ -924,7 +1002,7 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   defp hrandfield_parsed(key, count, with_values, store) do
-    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
       select_random_hash_fields(key, count, with_values, store)
     end
   end

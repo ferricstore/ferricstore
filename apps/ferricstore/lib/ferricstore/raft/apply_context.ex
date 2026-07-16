@@ -8,6 +8,8 @@ defmodule Ferricstore.Raft.ApplyContext do
   process configuration.
   """
 
+  alias Ferricstore.Raft.CommandStamp
+
   @version 1
   @max_retention_ttl_ms 31_536_000_000
   @max_history_hot_max_events 10_000
@@ -16,6 +18,9 @@ defmodule Ferricstore.Raft.ApplyContext do
   @max_retention_cleanup_byte_budget 64 * 1_024 * 1_024
   @max_lmdb_cleanup_scan_limit 1_000_000
   @max_hibernation_window_ms @max_retention_ttl_ms
+  @max_flow_batch_items 100_000
+  @max_value_size 512 * 1_024 * 1_024
+  @max_compound_delete_member_budget 100_000
 
   @default_retention_ttl_ms 604_800_000
   @default_history_hot_max_events 0
@@ -25,6 +30,9 @@ defmodule Ferricstore.Raft.ApplyContext do
   @default_retention_cleanup_key_budget 1_024
   @default_retention_cleanup_byte_budget 8 * 1_024 * 1_024
   @default_lmdb_cleanup_scan_limit 100_000
+  @default_flow_batch_items 1_000
+  @default_max_value_size 1_048_576
+  @default_promotion_threshold 100
 
   @flow_command_tags [
     :ferricstore_apply_context_barrier,
@@ -51,6 +59,7 @@ defmodule Ferricstore.Raft.ApplyContext do
     :flow_policy_attribute_catalog_repair,
     :flow_policy_attribute_catalog_repair_request,
     :flow_policy_migration_step,
+    :flow_policy_allocate,
     :flow_policy_put,
     :flow_reschedule,
     :flow_retention_cleanup,
@@ -77,6 +86,7 @@ defmodule Ferricstore.Raft.ApplyContext do
     :cross_shard_tx,
     :ferricstore_apply_context,
     :ferricstore_latency_trace,
+    :flow_policy_fence,
     :flow_shared_ref_write,
     :ttb
   ]
@@ -102,6 +112,11 @@ defmodule Ferricstore.Raft.ApplyContext do
                                                 :flow_hibernation_late_promote_window_ms,
                                                 5 * 60 * 1_000
                                               )
+  @default_compound_delete_member_budget Application.compile_env(
+                                           :ferricstore,
+                                           :compound_delete_member_budget,
+                                           4_096
+                                         )
 
   @enforce_keys [:version]
   defstruct version: @version,
@@ -118,7 +133,11 @@ defmodule Ferricstore.Raft.ApplyContext do
             flow_hibernation_hot_window_ms: @default_hibernation_hot_window_ms,
             flow_hibernation_safety_margin_ms: @default_hibernation_safety_margin_ms,
             flow_hibernation_promote_window_ms: @default_hibernation_promote_window_ms,
-            flow_hibernation_late_promote_window_ms: @default_hibernation_late_promote_window_ms
+            flow_hibernation_late_promote_window_ms: @default_hibernation_late_promote_window_ms,
+            flow_max_batch_items: @default_flow_batch_items,
+            promotion_threshold: @default_promotion_threshold,
+            compound_delete_member_budget: @default_compound_delete_member_budget,
+            max_value_size: @default_max_value_size
 
   @type t :: %__MODULE__{
           version: pos_integer(),
@@ -135,13 +154,18 @@ defmodule Ferricstore.Raft.ApplyContext do
           flow_hibernation_hot_window_ms: non_neg_integer(),
           flow_hibernation_safety_margin_ms: non_neg_integer(),
           flow_hibernation_promote_window_ms: non_neg_integer(),
-          flow_hibernation_late_promote_window_ms: non_neg_integer()
+          flow_hibernation_late_promote_window_ms: non_neg_integer(),
+          flow_max_batch_items: pos_integer(),
+          promotion_threshold: non_neg_integer(),
+          compound_delete_member_budget: pos_integer(),
+          max_value_size: pos_integer()
         }
 
   @type encoded ::
           {:flow_apply_context_v1, pos_integer(), pos_integer(), non_neg_integer(), pos_integer(),
            pos_integer(), pos_integer(), pos_integer(), pos_integer(), pos_integer(), boolean(),
-           non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}
+           non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer(),
+           pos_integer(), non_neg_integer(), pos_integer(), pos_integer()}
 
   @spec default() :: t()
   def default, do: new([])
@@ -253,7 +277,29 @@ defmodule Ferricstore.Raft.ApplyContext do
           @default_hibernation_late_promote_window_ms
         )
         |> non_negative(@default_hibernation_late_promote_window_ms)
-        |> min(@max_hibernation_window_ms)
+        |> min(@max_hibernation_window_ms),
+      flow_max_batch_items:
+        values
+        |> Keyword.get(:flow_max_batch_items, @default_flow_batch_items)
+        |> positive(@default_flow_batch_items)
+        |> min(@max_flow_batch_items),
+      promotion_threshold:
+        values
+        |> Keyword.get(:promotion_threshold, @default_promotion_threshold)
+        |> non_negative(@default_promotion_threshold),
+      compound_delete_member_budget:
+        values
+        |> Keyword.get(
+          :compound_delete_member_budget,
+          @default_compound_delete_member_budget
+        )
+        |> positive(@default_compound_delete_member_budget)
+        |> min(@max_compound_delete_member_budget),
+      max_value_size:
+        values
+        |> Keyword.get(:max_value_size, @default_max_value_size)
+        |> positive(@default_max_value_size)
+        |> min(@max_value_size)
     }
   end
 
@@ -288,14 +334,18 @@ defmodule Ferricstore.Raft.ApplyContext do
      context.flow_lmdb_history_cleanup_scan_limit, context.flow_lmdb_value_cleanup_scan_limit,
      context.flow_hibernation_enabled, context.flow_hibernation_hot_window_ms,
      context.flow_hibernation_safety_margin_ms, context.flow_hibernation_promote_window_ms,
-     context.flow_hibernation_late_promote_window_ms}
+     context.flow_hibernation_late_promote_window_ms, context.flow_max_batch_items,
+     context.promotion_threshold,
+     context.compound_delete_member_budget, context.max_value_size}
   end
 
   @spec decode(term()) :: {:ok, t()} | {:error, :invalid_apply_context}
   def decode(
         {:flow_apply_context_v1, retention_ttl_ms, history_hot, history_max, max_history_hot,
          max_history, cleanup_keys, cleanup_bytes, history_scan, value_scan, hibernation_enabled,
-         hot_window_ms, safety_margin_ms, promote_window_ms, late_promote_window_ms} = encoded
+         hot_window_ms, safety_margin_ms, promote_window_ms, late_promote_window_ms,
+         flow_max_batch_items, promotion_threshold, compound_delete_member_budget,
+         max_value_size} = encoded
       ) do
     context =
       new(
@@ -312,7 +362,11 @@ defmodule Ferricstore.Raft.ApplyContext do
         flow_hibernation_hot_window_ms: hot_window_ms,
         flow_hibernation_safety_margin_ms: safety_margin_ms,
         flow_hibernation_promote_window_ms: promote_window_ms,
-        flow_hibernation_late_promote_window_ms: late_promote_window_ms
+        flow_hibernation_late_promote_window_ms: late_promote_window_ms,
+        flow_max_batch_items: flow_max_batch_items,
+        promotion_threshold: promotion_threshold,
+        compound_delete_member_budget: compound_delete_member_budget,
+        max_value_size: max_value_size
       )
 
     if encode(context) == encoded do
@@ -465,7 +519,7 @@ defmodule Ferricstore.Raft.ApplyContext do
        do: {:ferricstore_apply_context, encode(context), invalid_inner}
 
   defp sanitize_reserved_wrappers({:ttb, binary}, context) when is_binary(binary) do
-    case decode_preencoded_command(binary) do
+    case CommandStamp.decode_ttb(binary) do
       {:ok, decoded} when is_tuple(decoded) ->
         sanitize_reserved_wrappers(decoded, context)
 
@@ -490,6 +544,17 @@ defmodule Ferricstore.Raft.ApplyContext do
     case sanitize_reserved_wrappers(inner, context) do
       ^inner -> command
       sanitized -> {:async, origin, sanitized}
+    end
+  end
+
+  defp sanitize_reserved_wrappers(
+         {:flow_policy_fence, installs, inner} = command,
+         context
+       )
+       when is_list(installs) and is_tuple(inner) do
+    case sanitize_reserved_wrappers(inner, context) do
+      ^inner -> command
+      sanitized -> {:flow_policy_fence, installs, sanitized}
     end
   end
 
@@ -526,31 +591,31 @@ defmodule Ferricstore.Raft.ApplyContext do
 
   defp sanitize_reserved_wrappers(command, _context), do: command
 
-  defp sanitize_command_list([], _context), do: {[], false}
+  defp sanitize_command_list(commands, context) do
+    case first_sanitized_change(commands, context, 0) do
+      :unchanged ->
+        {commands, false}
 
-  defp sanitize_command_list([command | rest] = commands, context) do
-    sanitized_command = sanitize_reserved_wrappers(command, context)
-    {sanitized_rest, rest_changed?} = sanitize_command_list(rest, context)
-
-    if sanitized_command == command and not rest_changed? do
-      {commands, false}
-    else
-      {[sanitized_command | sanitized_rest], true}
+      {index, sanitized_command} ->
+        {prefix, [_original | rest]} = Enum.split(commands, index)
+        sanitized_rest = Enum.map(rest, &sanitize_reserved_wrappers(&1, context))
+        {prefix ++ [sanitized_command | sanitized_rest], true}
     end
   end
 
-  defp decode_preencoded_command(binary) do
-    {:ok, :erlang.binary_to_term(binary, [:safe])}
-  rescue
-    ArgumentError -> :error
+  defp first_sanitized_change([], _context, _index), do: :unchanged
+
+  defp first_sanitized_change([command | rest], context, index) do
+    case sanitize_reserved_wrappers(command, context) do
+      ^command -> first_sanitized_change(rest, context, index + 1)
+      sanitized -> {index, sanitized}
+    end
   end
 
   defp flow_command?({:cross_shard_tx, shard_batches}), do: nested_flow_command?(shard_batches)
 
-  defp flow_command?({:cross_shard_tx, shard_batches, _watched_keys}),
-    do: nested_flow_command?(shard_batches)
-
   defp flow_command?({:ferricstore_latency_trace, inner}), do: flow_command?(inner)
+  defp flow_command?({:flow_policy_fence, _installs, inner}), do: flow_command?(inner)
   defp flow_command?({:async, _origin, inner}), do: flow_command?(inner)
 
   defp flow_command?({inner, %{hlc_ts: {physical_ms, logical}}})

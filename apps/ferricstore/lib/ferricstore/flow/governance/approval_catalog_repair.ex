@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.Governance.ApprovalCatalogRepair do
   alias Ferricstore.Flow.Governance.Catalog
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
 
   @page_size 64
   @progress_tag :flow_governance_approval_catalog_repair_v1
@@ -90,8 +91,14 @@ defmodule Ferricstore.Flow.Governance.ApprovalCatalogRepair do
           {:ok, catalog_keys} when is_list(catalog_keys) ->
             ensure_catalogs_present(ctx, key, catalog_keys)
 
+          :missing ->
+            Catalog.unregister_key(ctx, Keys.governance_catalog_key(:approval), key)
+
           :skip ->
             :ok
+
+          {:error, _reason} = error ->
+            error
 
           _invalid ->
             {:error, "ERR flow approval catalog repair source is invalid"}
@@ -130,6 +137,9 @@ defmodule Ferricstore.Flow.Governance.ApprovalCatalogRepair do
           :ok -> reconcile_target(ctx, target_catalog_key, rest, matcher, last_retained)
           {:error, _reason} = error -> error
         end
+
+      {:error, _reason} = error ->
+        error
 
       _invalid ->
         {:error, "ERR flow approval catalog repair matcher is invalid"}
@@ -194,19 +204,32 @@ defmodule Ferricstore.Flow.Governance.ApprovalCatalogRepair do
   end
 
   defp persist_progress(ctx, progress_key, identity, cursor) do
-    encoded = :erlang.term_to_binary({@progress_tag, identity, cursor})
-    Router.put(ctx, progress_key, encoded, 0)
+    if valid_cursor?(cursor) do
+      encoded = TermCodec.encode({@progress_tag, identity, cursor})
+      Router.put(ctx, progress_key, encoded, 0)
+    else
+      {:error, "ERR flow approval catalog repair progress is invalid"}
+    end
   end
 
   defp decode_progress(value, identity) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {@progress_tag, ^identity, cursor} when is_nil(cursor) or is_binary(cursor) ->
-        {:ok, cursor}
+    case TermCodec.decode(value) do
+      {:ok, {@progress_tag, ^identity, cursor}} ->
+        if valid_cursor?(cursor) do
+          {:ok, cursor}
+        else
+          {:error, "ERR flow approval catalog repair progress is corrupt"}
+        end
 
       _invalid ->
         {:error, "ERR flow approval catalog repair progress is corrupt"}
     end
-  rescue
-    _error -> {:error, "ERR flow approval catalog repair progress is corrupt"}
   end
+
+  defp valid_cursor?(nil), do: true
+
+  defp valid_cursor?(cursor) when is_binary(cursor),
+    do: byte_size(cursor) <= Router.max_key_size()
+
+  defp valid_cursor?(_cursor), do: false
 end

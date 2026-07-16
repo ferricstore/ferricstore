@@ -216,6 +216,32 @@ defmodule Ferricstore.WritePathNosyncTest do
   # =========================================================================
 
   describe "background BitcaskWriter" do
+    test "rejects obsolete untagged write messages without touching disk" do
+      shard_index = 49
+      dir = Path.join(System.tmp_dir!(), "bitcask_writer_shape_#{System.unique_integer([:positive])}")
+      path = Path.join(dir, "00000000000000000000.log")
+      File.mkdir_p!(dir)
+      File.touch!(path)
+
+      keydir = :ets.new(:bitcask_writer_shape, [:set, :public])
+      key = "obsolete-shape"
+      value = "must-not-persist"
+      :ets.insert(keydir, {key, value, 0, Ferricstore.Store.LFU.initial(), :pending, 0, 0})
+
+      {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
+
+      on_exit(fn ->
+        if Process.alive?(writer), do: GenServer.stop(writer)
+        File.rm_rf!(dir)
+      end)
+
+      GenServer.cast(writer, {path, 0, keydir, key, value, 0})
+      assert :ok = BitcaskWriter.flush(shard_index)
+
+      assert 0 == File.stat!(path).size
+      assert [{^key, ^value, 0, _, :pending, 0, 0}] = :ets.lookup(keydir, key)
+    end
+
     test "flush with no pending writes returns immediately" do
       # Should not hang or error
       assert :ok = BitcaskWriter.flush_all()

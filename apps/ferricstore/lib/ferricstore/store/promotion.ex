@@ -44,15 +44,19 @@ defmodule Ferricstore.Store.Promotion do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{CompoundKey, LFU}
+  alias Ferricstore.Store.{AppendResult, BlobRef, BlobValue, CompoundKey, LFU}
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   require Logger
 
-  @promotion_marker_prefix "PM:"
   @cold_read_timeout_ms 10_000
   @compaction_latch_sleep_ms 1
   @default_compaction_latch_timeout_ms 30_000
+  @default_recovery_scan_page_size 8_192
+  @log_header_size 26
+  @max_log_value_size 512 * 1024 * 1024
+  @tombstone_value_size 0xFFFFFFFF
 
   @spec threshold() :: non_neg_integer()
   def threshold do
@@ -78,7 +82,7 @@ defmodule Ferricstore.Store.Promotion do
   end
 
   @spec marker_key(binary()) :: binary()
-  def marker_key(redis_key), do: @promotion_marker_prefix <> redis_key
+  def marker_key(redis_key), do: CompoundKey.promotion_marker_key(redis_key)
 
   @doc """
   Runs `fun` while holding the per-promoted-key compaction latch.
@@ -90,19 +94,68 @@ defmodule Ferricstore.Store.Promotion do
   """
   @spec with_compaction_latch(map(), binary(), (-> term())) :: term()
   def with_compaction_latch(owner, redis_key, fun) when is_function(fun, 0) do
-    case compaction_latch(owner, redis_key) do
-      nil ->
+    case acquire_compaction_latch(owner, redis_key) do
+      :none ->
         fun.()
 
-      {tab, latch_key, shard_index} ->
-        acquire_compaction_latch(tab, latch_key, shard_index)
-
+      token ->
         try do
           fun.()
         after
-          :ets.take(tab, latch_key)
+          release_compaction_latch(token)
         end
     end
+  end
+
+  @doc false
+  @spec acquire_compaction_latch(map(), binary()) :: :none | {term(), term()}
+  def acquire_compaction_latch(owner, redis_key) do
+    case compaction_latch(owner, redis_key) do
+      nil ->
+        :none
+
+      {tab, latch_key, shard_index} ->
+        acquire_compaction_latch(tab, latch_key, shard_index)
+        {tab, latch_key}
+    end
+  end
+
+  @doc false
+  @spec acquire_shared_log_latch(map()) :: :none | {term(), term()}
+  def acquire_shared_log_latch(owner) do
+    case shared_log_latch(owner) do
+      nil ->
+        :none
+
+      {tab, latch_key, shard_index} ->
+        acquire_compaction_latch(tab, latch_key, shard_index)
+        {tab, latch_key}
+    end
+  end
+
+  @doc false
+  @spec try_acquire_shared_log_latch(map()) :: :none | :busy | {:ok, {term(), term()}}
+  def try_acquire_shared_log_latch(owner) do
+    case shared_log_latch(owner) do
+      nil ->
+        :none
+
+      {tab, latch_key, _shard_index} ->
+        try_acquire_latch(tab, latch_key)
+    end
+  rescue
+    ArgumentError -> :none
+  end
+
+  @doc false
+  @spec release_compaction_latch(:none | {term(), term()}) :: :ok
+  def release_compaction_latch(:none), do: :ok
+
+  def release_compaction_latch({tab, latch_key}) do
+    :ets.delete(tab, latch_key)
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   @doc """
@@ -112,9 +165,103 @@ defmodule Ferricstore.Store.Promotion do
   """
   @spec await_compaction_latch(map(), binary()) :: :ok
   def await_compaction_latch(owner, redis_key) do
-    case compaction_latch(owner, redis_key) do
+    owner
+    |> await_compaction_latch_clear(redis_key)
+    |> raise_if_compound_promotion_failed(owner, redis_key)
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc false
+  @spec record_compound_promotion_failure(map(), binary(), term()) :: :ok
+  def record_compound_promotion_failure(owner, redis_key, reason) do
+    record_compound_promotion_fence(owner, redis_key, {:error, reason})
+  end
+
+  @doc false
+  @spec record_compound_promotion_running(map(), binary()) :: :ok
+  def record_compound_promotion_running(owner, redis_key) do
+    record_compound_promotion_fence(owner, redis_key, :running)
+  end
+
+  @doc false
+  @spec record_compound_promotion_success(map(), binary()) :: :ok
+  def record_compound_promotion_success(owner, redis_key) do
+    record_compound_promotion_fence(owner, redis_key, :ok)
+  end
+
+  defp record_compound_promotion_fence(owner, redis_key, result) do
+    case failure_fence(owner, redis_key) do
       nil -> :ok
-      {tab, latch_key, shard_index} -> wait_compaction_latch_clear!(tab, latch_key, shard_index)
+      {tab, fence_key} -> true = :ets.insert(tab, {fence_key, result})
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc false
+  @spec clear_compound_promotion_fence(map(), binary()) :: :ok
+  def clear_compound_promotion_fence(owner, redis_key) do
+    case failure_fence(owner, redis_key) do
+      nil -> :ok
+      {tab, fence_key} -> :ets.delete(tab, fence_key)
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc false
+  @spec clear_compound_promotion_fences(map()) :: :ok
+  def clear_compound_promotion_fences(owner) do
+    case latch_table(owner) do
+      nil -> :ok
+      tab -> :ets.match_delete(tab, {{:compound_promotion_failure, :_}, :_})
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp await_compaction_latch_clear(owner, redis_key) do
+    case compaction_latch(owner, redis_key) do
+      nil ->
+        :ok
+
+      {tab, latch_key, shard_index} ->
+        case :ets.lookup(tab, latch_key) do
+          [{^latch_key, latch_owner}] when latch_owner == self() ->
+            :ok
+
+          _other ->
+            wait_compaction_latch_clear!(tab, latch_key, shard_index)
+        end
+    end
+  end
+
+  defp raise_if_compound_promotion_failed(:ok, owner, redis_key) do
+    case failure_fence(owner, redis_key) do
+      nil ->
+        :ok
+
+      {tab, fence_key} ->
+        case :ets.lookup(tab, fence_key) do
+          [{^fence_key, :ok}] ->
+            :ok
+
+          [{^fence_key, {:error, reason}}] ->
+            raise "compound promotion failed for #{inspect(redis_key)}: #{inspect(reason)}"
+
+          [{^fence_key, :running}] ->
+            raise "compound promotion failed for #{inspect(redis_key)}: worker exited before completion"
+
+          [] ->
+            :ok
+        end
     end
   end
 
@@ -165,20 +312,6 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  @spec promote_hash!(binary(), reference(), atom(), binary(), non_neg_integer(), term()) ::
-          {:ok, reference()} | {:error, term()}
-  def promote_hash!(redis_key, shared_store, keydir, data_dir, shard_index, instance_ctx \\ nil) do
-    promote_collection!(
-      :hash,
-      redis_key,
-      shared_store,
-      keydir,
-      data_dir,
-      shard_index,
-      instance_ctx
-    )
-  end
-
   @spec promote_collection!(
           atom(),
           binary(),
@@ -186,9 +319,23 @@ defmodule Ferricstore.Store.Promotion do
           atom(),
           binary(),
           non_neg_integer(),
-          term()
+          term(),
+          CompoundMemberIndex.table_ref()
         ) ::
           {:ok, reference()} | {:error, term()}
+  def promote_collection!(
+        _type,
+        _redis_key,
+        _shard_data_path,
+        _keydir,
+        _data_dir,
+        _shard_index,
+        _instance_ctx,
+        nil
+      ) do
+    raise ArgumentError, "compound member catalog is required for promotion"
+  end
+
   def promote_collection!(
         type,
         redis_key,
@@ -196,28 +343,35 @@ defmodule Ferricstore.Store.Promotion do
         keydir,
         data_dir,
         shard_index,
-        instance_ctx \\ nil
+        instance_ctx,
+        member_index
       ) do
     prefix = compound_prefix_for(type, redis_key)
+    type_key = CompoundKey.type_key(redis_key)
     type_str = CompoundKey.encode_type(type)
     type_label = type_label(type)
     now = HLC.now_ms()
 
-    entries =
-      :ets.foldl(
-        fn {key, value, exp, _lfu, fid, off, _vsize}, acc ->
-          if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-            case promotion_entry_value(shard_data_path, key, value, fid, off) do
-              nil -> acc
-              live_value -> [{key, live_value, exp} | acc]
-            end
-          else
-            acc
-          end
-        end,
-        [],
-        keydir
+    entries_result =
+      collect_promotion_entries(
+        member_index,
+        shard_data_path,
+        keydir,
+        type_key,
+        prefix,
+        now
       )
+
+    entries =
+      case entries_result do
+        {:ok, entries} ->
+          entries
+
+        {:error, {key, reason}} ->
+          raise "promotion copy read failed for #{inspect(key)}: #{inspect(reason)}"
+      end
+
+    validate_promotion_type!(entries, type_key, type_str)
 
     active_path = find_active(shard_data_path)
     mk = marker_key(redis_key)
@@ -279,10 +433,20 @@ defmodule Ferricstore.Store.Promotion do
 
       case NIF.v2_append_batch(dedicated_active, batch) do
         {:ok, locations} ->
-          Enum.zip(entries, locations)
-          |> Enum.each(fn {{k, _v, _exp}, {offset, value_size}} ->
-            :ets.update_element(keydir, k, [{5, dedicated_fid}, {6, offset}, {7, value_size}])
-          end)
+          case AppendResult.validate_locations(locations, length(entries)) do
+            :ok ->
+              Enum.zip(entries, locations)
+              |> Enum.each(fn {{k, _v, _exp}, {offset, value_size}} ->
+                :ets.update_element(keydir, k, [
+                  {5, dedicated_fid},
+                  {6, offset},
+                  {7, value_size}
+                ])
+              end)
+
+            {:error, reason} ->
+              raise "promotion dedicated write failed: #{inspect(reason)}"
+          end
 
         {:error, reason} ->
           Logger.error(
@@ -304,26 +468,22 @@ defmodule Ferricstore.Store.Promotion do
     if tombstone_ops != [] do
       run_before_shared_tombstones_hook()
 
-      case NIF.v2_append_ops_batch_nosync(active_path, tombstone_ops) do
-        {:ok, _locations} ->
-          case NIF.v2_fsync(active_path) do
+      case NIF.v2_append_ops_batch(active_path, tombstone_ops) do
+        {:ok, locations} ->
+          case AppendResult.validate_operation_locations(locations, tombstone_ops) do
             :ok ->
               :ok
 
             {:error, reason} ->
-              Logger.error(
-                "Promotion: tombstone batch fsync failed for #{inspect(redis_key)}: #{inspect(reason)}"
-              )
-
-              raise "promotion shared tombstone fsync failed: #{inspect(reason)}"
+              raise "promotion shared tombstone batch failed: #{inspect(reason)}"
           end
 
         {:error, reason} ->
           Logger.error(
-            "Promotion: tombstone batch write failed for #{inspect(redis_key)}: #{inspect(reason)}"
+            "Promotion: durable tombstone batch failed for #{inspect(redis_key)}: #{inspect(reason)}"
           )
 
-          raise "promotion shared tombstone write failed: #{inspect(reason)}"
+          raise "promotion shared tombstone batch failed: #{inspect(reason)}"
       end
     end
 
@@ -335,6 +495,82 @@ defmodule Ferricstore.Store.Promotion do
     {:ok, dedicated_path}
   end
 
+  defp collect_promotion_entries(
+         member_index,
+         shard_data_path,
+         keydir,
+         type_key,
+         prefix,
+         now
+       ) do
+    with {:ok, type_row} <- promotion_type_row(keydir, type_key),
+         {:ok, initial} <- collect_promotion_row(type_row, {:ok, []}, shard_data_path, now) do
+      case CompoundMemberIndex.reduce_rows_while(
+             member_index,
+             %{keydir: keydir},
+             prefix,
+             initial,
+             fn row, acc ->
+               case collect_promotion_row(row, {:ok, acc}, shard_data_path, now) do
+                 {:ok, next_acc} -> {:cont, next_acc}
+                 {:error, _reason} = error -> {:halt, error}
+               end
+             end
+           ) do
+        {:ok, entries} -> {:ok, entries}
+        {:halt, {:error, _reason} = error} -> error
+        {:error, reason} -> {:error, {prefix, {:member_index_failed, reason}}}
+        :unavailable -> {:error, {prefix, :compound_member_index_unavailable}}
+      end
+    else
+      {:error, reason} -> {:error, {type_key, reason}}
+    end
+  end
+
+  defp promotion_type_row(keydir, type_key) do
+    case :ets.lookup(keydir, type_key) do
+      [{^type_key, _value, _exp, _lfu, _fid, _off, _vsize} = row] -> {:ok, row}
+      [] -> {:error, :missing_type_metadata}
+      invalid -> {:error, {:invalid_type_metadata, invalid}}
+    end
+  rescue
+    ArgumentError -> {:error, :keydir_unavailable}
+  end
+
+  defp validate_promotion_type!(entries, type_key, expected_type) do
+    case Enum.find(entries, fn {key, _value, _expire_at_ms} -> key == type_key end) do
+      {^type_key, ^expected_type, _expire_at_ms} ->
+        :ok
+
+      {^type_key, actual_type, _expire_at_ms} ->
+        raise "promotion type metadata mismatch for #{inspect(type_key)}: " <>
+                "expected #{inspect(expected_type)}, got #{inspect(actual_type)}"
+
+      nil ->
+        raise "promotion copy read failed for #{inspect(type_key)}: :missing_type_metadata"
+    end
+  end
+
+  defp collect_promotion_row(
+         {key, value, exp, _lfu, fid, off, _vsize},
+         {:ok, acc},
+         shard_data_path,
+         now
+       )
+       when is_binary(key) and is_integer(exp) and exp >= 0 do
+    if exp == 0 or exp > now do
+      case promotion_entry_value(shard_data_path, key, value, fid, off) do
+        {:ok, live_value} -> {:ok, [{key, live_value, exp} | acc]}
+        {:error, reason} -> {:error, {key, reason}}
+      end
+    else
+      {:ok, acc}
+    end
+  end
+
+  defp collect_promotion_row(row, {:ok, _acc}, _shard_data_path, _now),
+    do: {:error, {:invalid_keydir_row, row}}
+
   defp run_before_shared_tombstones_hook do
     case Process.get(:ferricstore_promotion_before_shared_tombstones_hook) do
       fun when is_function(fun, 0) -> fun.()
@@ -344,14 +580,110 @@ defmodule Ferricstore.Store.Promotion do
 
   @spec recover_promoted(binary(), atom(), binary(), non_neg_integer(), term()) :: map()
   def recover_promoted(shard_data_path, keydir, data_dir, shard_index, instance_ctx \\ nil) do
-    # v2: promotion markers are recovered from ETS (populated by recover_keydir).
-    # Use :ets.select with a match spec bound to the "PM:" prefix instead of
-    # scanning every key in the keydir via :ets.foldl (memory audit L6).
+    recovery_plan = :ets.new(:promotion_recovery_plan, [:private, :ordered_set])
+    shared_index = :ets.new(:promotion_recovery_shared_index, [:private, :ordered_set])
+
+    try do
+      {all_markers, marker_actions} =
+        plan_recovery_markers!(shard_data_path, keydir, shard_index)
+
+      now = HLC.now_ms()
+      build_shared_recovery_index!(shared_index, keydir, shard_index, all_markers != [])
+
+      marker_actions_by_key = Enum.group_by(marker_actions, &elem(&1, 1))
+
+      {recovered, applied_marker_keys} =
+        Enum.reduce(all_markers, {%{}, MapSet.new()}, fn
+          {redis_key, type, marker_key, marker_state}, {recovered, applied_marker_keys} ->
+            # A plan can contain every live value in one collection. Release it
+            # before decoding the next collection so startup memory is bounded
+            # by the largest collection, rather than the whole shard.
+            :ets.delete_all_objects(recovery_plan)
+
+            shared_state =
+              shared_compound_recovery_state!(
+                shared_index,
+                keydir,
+                redis_key,
+                type,
+                now,
+                shard_index
+              )
+
+            collection_plan =
+              case marker_state do
+                :promoted ->
+                  plan_promoted_collection!(
+                    redis_key,
+                    type,
+                    marker_key,
+                    shared_state,
+                    shard_data_path,
+                    data_dir,
+                    shard_index,
+                    instance_ctx,
+                    now
+                  )
+
+                {:intent, :fallback} ->
+                  {:fallback, marker_key, redis_key, type,
+                   dedicated_path(data_dir, shard_index, type, redis_key)}
+
+                {:intent, :cleanup} ->
+                  {:cleanup, marker_key, redis_key, type,
+                   dedicated_path(data_dir, shard_index, type, redis_key), shared_state.all_keys}
+              end
+
+            true = :ets.insert(recovery_plan, {0, collection_plan})
+
+            apply_recovery_plan!(
+              Map.get(marker_actions_by_key, marker_key, []),
+              recovery_plan,
+              shard_data_path,
+              keydir,
+              shard_index,
+              instance_ctx
+            )
+
+            recovered =
+              case collection_plan do
+                {:promoted, _marker_key, ^redis_key, promoted, _row_actions} ->
+                  Map.put(recovered, redis_key, promoted)
+
+                _fallback_or_cleanup ->
+                  recovered
+              end
+
+            {recovered, MapSet.put(applied_marker_keys, marker_key)}
+        end)
+
+      remaining_marker_actions =
+        Enum.reject(marker_actions, fn action ->
+          MapSet.member?(applied_marker_keys, elem(action, 1))
+        end)
+
+      :ets.delete_all_objects(recovery_plan)
+
+      apply_recovery_plan!(
+        remaining_marker_actions,
+        recovery_plan,
+        shard_data_path,
+        keydir,
+        shard_index,
+        instance_ctx
+      )
+
+      recovered
+    after
+      :ets.delete(recovery_plan)
+      :ets.delete(shared_index)
+    end
+  end
+
+  defp plan_recovery_markers!(shard_data_path, keydir, shard_index) do
     pm_prefix = "PM:"
     pm_len = byte_size(pm_prefix)
 
-    # Match PM: keys with either a binary value (hot) or nil (cold, needs pread).
-    # After recover_keydir, PM: entries may be cold (value=nil, offset>0).
     match_spec = [
       {{:"$1", :"$2", :_, :_, :"$3", :"$4", :_},
        [
@@ -361,12 +693,10 @@ defmodule Ferricstore.Store.Promotion do
        ], [{{:"$1", :"$2", :"$3", :"$4"}}]}
     ]
 
-    all_markers =
-      :ets.select(keydir, match_spec)
-      |> Enum.flat_map(fn {full_key, value, fid, offset} ->
-        <<"PM:", redis_key::binary>> = full_key
-
-        # If value is nil (cold entry), read the type string from disk
+    {markers, actions} =
+      keydir
+      |> :ets.select(match_spec)
+      |> Enum.reduce({[], []}, fn {full_key, value, fid, offset}, {markers, actions} ->
         type_str =
           if is_binary(value) do
             value
@@ -377,156 +707,924 @@ defmodule Ferricstore.Store.Promotion do
                 "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
               )
 
-            case read_cold_async(file_path, offset, full_key) do
-              {:ok, v} when is_binary(v) -> v
-              _ -> nil
-            end
+            read_recovery_value!(file_path, offset, full_key, :read_marker, shard_index)
           end
 
-        if value == nil and is_binary(type_str) do
-          track_binary_insert(keydir, shard_index, full_key, type_str, instance_ctx)
-          :ets.update_element(keydir, full_key, {2, type_str})
-        end
+        case decode_recovery_marker(type_str) do
+          {:ok, type, marker_state} ->
+            redis_key = CompoundKey.extract_redis_key(full_key)
 
-        case decode_promoted_type(type_str) do
-          {:ok, type} ->
-            [{redis_key, type}]
-
-          :error ->
-            Logger.warning(
-              "Promotion recovery: ignoring invalid marker #{inspect(full_key)} with type #{inspect(type_str)}"
-            )
-
-            track_binary_delete(keydir, shard_index, full_key, instance_ctx)
-            :ets.delete(keydir, full_key)
-            []
-        end
-      end)
-      |> Enum.uniq_by(fn {redis_key, _} -> redis_key end)
-
-    marker_types = Map.new(all_markers)
-
-    shared_live_compound_keys = shared_live_compound_keys_by_marker(keydir, marker_types)
-
-    Enum.reduce(all_markers, %{}, fn {redis_key, type}, acc ->
-      {:ok, dedicated_path} = open_dedicated(data_dir, shard_index, type, redis_key)
-
-      log_files = list_log_files(dedicated_path)
-
-      final_state =
-        Enum.reduce(log_files, %{}, fn {fid, file_path}, acc ->
-          case NIF.v2_scan_file(file_path) do
-            {:ok, records} ->
-              Enum.reduce(records, acc, fn {key, offset, value_size, expire_at_ms, is_tombstone},
-                                           inner_acc ->
-                if is_tombstone do
-                  Map.put(inner_acc, key, :tombstone)
-                else
-                  Map.put(
-                    inner_acc,
-                    key,
-                    {:live, fid, file_path, offset, value_size, expire_at_ms}
-                  )
-                end
-              end)
-
-            _ ->
-              acc
-          end
-        end)
-
-      # Crash-safety fallback (the crash-safe promotion ordering):
-      #
-      # If the marker exists but the dedicated dir has no records at all,
-      # we crashed between step 1 (marker write) and step 2 (dedicated
-      # batch) of a marker-first promotion. In that case the compound keys
-      # in the SHARED log are still authoritative (step 3 tombstones hadn't
-      # run yet), and returning a promoted instance would route public reads
-      # to the empty dedicated dir.
-      #
-      # recover_keydir (called before us) has already re-mapped those
-      # compound keys back into the keydir from the shared log. We
-      # simply leave them in place — by NOT overwriting them with
-      # "missing from dedicated" we preserve the data.
-      dedicated_keys = final_state |> Map.keys() |> MapSet.new()
-
-      partial_dedicated? =
-        shared_uncovered_live_compound?(
-          Map.get(shared_live_compound_keys, redis_key, MapSet.new()),
-          dedicated_keys
-        )
-
-      dedicated_empty? = map_size(final_state) == 0
-
-      if not dedicated_empty? and not partial_dedicated? do
-        # Normal recovery path: dedicated has a complete final state. Apply it
-        # even when that state is tombstone-only so stale shared rows cannot
-        # survive restart.
-        hot_cache_threshold = recover_hot_cache_threshold(instance_ctx)
-
-        Enum.each(final_state, fn
-          {key, :tombstone} ->
-            track_binary_delete(keydir, shard_index, key, instance_ctx)
-            :ets.delete(keydir, key)
-
-          {key, {:live, fid, file_path, offset, value_size, expire_at_ms}} ->
-            disk_value =
-              case read_cold_async(file_path, offset, key) do
-                {:ok, v} when v != nil -> v
-                _ -> nil
+            actions =
+              if not is_binary(value) do
+                [{:hydrate_marker, full_key, type_str} | actions]
+              else
+                actions
               end
 
-            value = ShardETS.value_for_ets(disk_value, hot_cache_threshold)
-            track_binary_insert(keydir, shard_index, key, value, instance_ctx)
+            {[{redis_key, type, full_key, marker_state} | markers], actions}
 
-            :ets.insert(
-              keydir,
-              {key, value, expire_at_ms, LFU.initial(), fid, offset, value_size}
-            )
-        end)
-      end
+          :error ->
+            {markers, [{:delete_invalid_marker, full_key, type_str} | actions]}
+        end
+      end)
 
-      if dedicated_empty? or partial_dedicated? do
-        # Fallback path: marker exists, dedicated has no records. Compound
-        # keys in shared log (already in keydir via recover_keydir) are the
-        # source of truth, so do not include this key in promoted_instances.
-        Logger.info(
-          "Promotion recovery: marker for #{inspect(redis_key)} exists but dedicated " <>
-            "dir is incomplete; falling back to compound keys in shared log."
+    unique_markers =
+      markers
+      |> Enum.reverse()
+      |> Enum.uniq_by(fn {redis_key, _type, _marker_key, _marker_state} -> redis_key end)
+
+    {unique_markers, Enum.reverse(actions)}
+  end
+
+  defp plan_promoted_collection!(
+         redis_key,
+         type,
+         marker_key,
+         shared_state,
+         shard_data_path,
+         data_dir,
+         shard_index,
+         instance_ctx,
+         now
+       ) do
+    expected_path = dedicated_path(data_dir, shard_index, type, redis_key)
+
+    if not Ferricstore.FS.dir?(expected_path) and MapSet.size(shared_state.all_keys) == 0 do
+      fail_recovery!(:open_dedicated, redis_key, shard_index, :dedicated_directory_missing)
+    end
+
+    dedicated_path = open_recovery_dedicated!(data_dir, shard_index, type, redis_key)
+    log_files = recovery_log_files!(dedicated_path, shard_index)
+    active_fid = log_files |> List.last() |> elem(0)
+
+    final_state =
+      Enum.reduce(log_files, %{}, fn {fid, file_path}, state ->
+        recover_dedicated_log!(
+          file_path,
+          fid,
+          state,
+          shard_index,
+          redis_key,
+          type,
+          fid == active_fid,
+          shared_state.all_keys,
+          now
+        )
+      end)
+
+    dedicated_keys = final_state |> Map.keys() |> MapSet.new()
+
+    partial_dedicated? =
+      shared_uncovered_live_compound?(shared_state.live_keys, dedicated_keys)
+
+    dedicated_empty? = map_size(final_state) == 0
+    shared_live? = shared_collection_live?(shared_state)
+    shared_dead? = shared_collection_dead?(shared_state)
+    dedicated_live? = dedicated_collection_live?(final_state, redis_key, now)
+    dedicated_dead? = dedicated_collection_dead?(final_state, redis_key, now)
+
+    cond do
+      shared_live? and (dedicated_empty? or partial_dedicated? or not dedicated_live?) ->
+        validate_shared_recovery_type!(
+          shared_state,
+          redis_key,
+          type,
+          shard_data_path,
+          shard_index
         )
 
-        acc
-      else
-        total_bytes = dir_total_size(dedicated_path)
+        {:fallback, marker_key, redis_key, type, dedicated_path}
+
+      dedicated_dead? or (dedicated_empty? and shared_dead?) ->
+        {:cleanup, marker_key, redis_key, type, dedicated_path, shared_state.all_keys}
+
+      dedicated_empty? ->
+        fail_recovery!(:scan_dedicated_log, dedicated_path, shard_index, :dedicated_state_missing)
+
+      partial_dedicated? ->
+        fail_recovery!(
+          :scan_dedicated_log,
+          dedicated_path,
+          shard_index,
+          :incomplete_without_live_shared_source
+        )
+
+      true ->
+        require_live_recovered_type!(final_state, redis_key, dedicated_path, shard_index, now)
+        total_bytes = recovery_log_bytes!(log_files, shard_index)
+
+        row_actions =
+          plan_recovered_rows!(final_state, redis_key, type, shard_index, instance_ctx, now)
 
         live_bytes =
-          Enum.reduce(final_state, 0, fn {key, entry}, acc ->
-            case entry do
-              :tombstone ->
-                acc
+          Enum.reduce(final_state, 0, fn
+            {key, {:live, _fid, _path, _offset, value_size, expire_at_ms}}, total
+            when value_size > 0 and (expire_at_ms == 0 or expire_at_ms > now) ->
+              total + @log_header_size + byte_size(key) + value_size
 
-              {:live, _fid, _path, _off, _vs, _exp} ->
-                case :ets.lookup(keydir, key) do
-                  [{^key, _v, _exp, _lfu, _f, _o, vsize}] when vsize > 0 ->
-                    acc + 26 + byte_size(key) + vsize
-
-                  _ ->
-                    acc
-                end
-            end
+            {_key, _entry}, total ->
+              total
           end)
 
-        dead_bytes = max(total_bytes - live_bytes, 0)
-
-        Map.put(acc, redis_key, %{
+        promoted = %{
           path: dedicated_path,
           writes: 0,
           total_bytes: total_bytes,
-          dead_bytes: dead_bytes,
+          dead_bytes: max(total_bytes - live_bytes, 0),
           last_compacted_at: nil
-        })
+        }
+
+        {:promoted, marker_key, redis_key, promoted, row_actions}
+    end
+  end
+
+  defp require_live_recovered_type!(
+         final_state,
+         redis_key,
+         dedicated_path,
+         shard_index,
+         now
+       ) do
+    type_key = CompoundKey.type_key(redis_key)
+
+    case Map.get(final_state, type_key) do
+      {:live, _fid, _file_path, _offset, _value_size, expire_at_ms}
+      when expire_at_ms == 0 or expire_at_ms > now ->
+        :ok
+
+      _missing_or_tombstoned ->
+        fail_recovery!(
+          :scan_dedicated_log,
+          dedicated_path,
+          shard_index,
+          {:dedicated_type_missing, type_key}
+        )
+    end
+  end
+
+  defp dedicated_collection_live?(final_state, redis_key, now) do
+    type_key = CompoundKey.type_key(redis_key)
+
+    recovery_entry_live?(Map.get(final_state, type_key), now) and
+      Enum.any?(final_state, fn
+        {^type_key, _entry} -> false
+        {_key, entry} -> recovery_entry_live?(entry, now)
+      end)
+  end
+
+  defp dedicated_collection_dead?(final_state, redis_key, now) when map_size(final_state) > 0 do
+    type_key = CompoundKey.type_key(redis_key)
+    type_entry = Map.get(final_state, type_key)
+
+    live_member? =
+      Enum.any?(final_state, fn
+        {^type_key, _entry} -> false
+        {_key, entry} -> recovery_entry_live?(entry, now)
+      end)
+
+    cond do
+      recovery_entry_expired?(type_entry, now) -> true
+      recovery_entry_live?(type_entry, now) and not live_member? -> true
+      type_entry == :tombstone and not live_member? -> true
+      is_nil(type_entry) and not live_member? -> true
+      true -> false
+    end
+  end
+
+  defp dedicated_collection_dead?(_final_state, _redis_key, _now), do: false
+
+  defp recovery_entry_live?(
+         {:live, _fid, _file_path, _offset, _value_size, expire_at_ms},
+         now
+       ),
+       do: expire_at_ms == 0 or expire_at_ms > now
+
+  defp recovery_entry_live?(_entry, _now), do: false
+
+  defp recovery_entry_expired?(
+         {:live, _fid, _file_path, _offset, _value_size, expire_at_ms},
+         now
+       ),
+       do: expire_at_ms > 0 and expire_at_ms <= now
+
+  defp recovery_entry_expired?(_entry, _now), do: false
+
+  defp open_recovery_dedicated!(data_dir, shard_index, type, redis_key) do
+    case open_dedicated(data_dir, shard_index, type, redis_key) do
+      {:ok, path} ->
+        path
+
+      {:error, reason} ->
+        fail_recovery!(:open_dedicated, redis_key, shard_index, reason)
+
+      other ->
+        fail_recovery!(:open_dedicated, redis_key, shard_index, {:unexpected, other})
+    end
+  end
+
+  defp recover_dedicated_log!(
+         file_path,
+         fid,
+         state,
+         shard_index,
+         redis_key,
+         type,
+         active?,
+         shared_keys,
+         now
+       ) do
+    recover_dedicated_log_pages!(
+      file_path,
+      fid,
+      0,
+      recovery_scan_page_size(),
+      state,
+      shard_index,
+      redis_key,
+      type,
+      active?,
+      shared_keys,
+      now
+    )
+  end
+
+  defp recover_dedicated_log_pages!(
+         file_path,
+         fid,
+         offset,
+         page_size,
+         state,
+         shard_index,
+         redis_key,
+         type,
+         active?,
+         shared_keys,
+         now
+       ) do
+    case NIF.v2_scan_file_page(file_path, offset, page_size) do
+      {:ok, records, next_offset, done?}
+      when is_list(records) and is_integer(next_offset) and next_offset >= offset and
+             is_boolean(done?) ->
+        next_state =
+          Enum.reduce(records, state, fn
+            {key, _record_offset, _value_size, _expire_at_ms, true}, acc ->
+              validate_recovered_key!(key, redis_key, type, file_path, shard_index)
+
+              if key == CompoundKey.type_key(redis_key) or MapSet.member?(shared_keys, key) do
+                Map.put(acc, key, :tombstone)
+              else
+                Map.delete(acc, key)
+              end
+
+            {key, record_offset, value_size, expire_at_ms, false}, acc ->
+              validate_recovered_key!(key, redis_key, type, file_path, shard_index)
+
+              if expire_at_ms > 0 and expire_at_ms <= now and
+                   key != CompoundKey.type_key(redis_key) and
+                   not MapSet.member?(shared_keys, key) do
+                Map.delete(acc, key)
+              else
+                Map.put(
+                  acc,
+                  key,
+                  {:live, fid, file_path, record_offset, value_size, expire_at_ms}
+                )
+              end
+
+            invalid_record, _acc ->
+              fail_recovery!(
+                :scan_dedicated_log,
+                file_path,
+                shard_index,
+                {:invalid_record, invalid_record}
+              )
+          end)
+
+        run_recovery_state_hook(map_size(next_state))
+
+        cond do
+          done? ->
+            validate_scan_stop!(file_path, next_offset, active?, shard_index)
+            next_state
+
+          next_offset > offset ->
+            recover_dedicated_log_pages!(
+              file_path,
+              fid,
+              next_offset,
+              page_size,
+              next_state,
+              shard_index,
+              redis_key,
+              type,
+              active?,
+              shared_keys,
+              now
+            )
+
+          true ->
+            fail_recovery!(
+              :scan_dedicated_log,
+              file_path,
+              shard_index,
+              {:non_advancing_scan, offset}
+            )
+        end
+
+      {:error, reason} ->
+        fail_recovery!(:scan_dedicated_log, file_path, shard_index, reason)
+
+      other ->
+        fail_recovery!(
+          :scan_dedicated_log,
+          file_path,
+          shard_index,
+          {:unexpected, other}
+        )
+    end
+  end
+
+  defp run_recovery_state_hook(retained_rows) do
+    case Process.get(:ferricstore_promotion_recovery_state_hook) do
+      fun when is_function(fun, 1) -> fun.(retained_rows)
+      _ -> :ok
+    end
+  end
+
+  defp validate_recovered_key!(key, redis_key, type, file_path, shard_index) do
+    type_key = CompoundKey.type_key(redis_key)
+    prefix = compound_prefix_for(type, redis_key)
+
+    unless key == type_key or (is_binary(key) and String.starts_with?(key, prefix)) do
+      fail_recovery!(
+        :scan_dedicated_log,
+        file_path,
+        shard_index,
+        {:foreign_record, key, redis_key, type}
+      )
+    end
+  end
+
+  defp validate_scan_stop!(file_path, valid_end, active?, shard_index) do
+    case open_recovery_tail_file(file_path, active?) do
+      {:ok, file} ->
+        try do
+          validate_scan_stop_file!(file, file_path, valid_end, active?, shard_index)
+        after
+          :file.close(file)
+        end
+
+      {:error, reason} ->
+        fail_recovery!(:open_dedicated_tail, file_path, shard_index, reason)
+    end
+  end
+
+  defp open_recovery_tail_file(file_path, active?) do
+    modes = if active?, do: [:read, :write, :raw, :binary], else: [:read, :raw, :binary]
+
+    with {:ok, %File.Stat{type: :regular} = expected_stat} <- File.lstat(file_path),
+         :ok <- run_recovery_tail_open_hook(),
+         {:ok, file} <- :file.open(file_path, modes) do
+      case verify_recovery_file_identity(file, expected_stat) do
+        :ok ->
+          {:ok, file}
+
+        {:error, _reason} = error ->
+          :file.close(file)
+          error
+      end
+    else
+      {:ok, %File.Stat{type: type}} -> {:error, {:unsafe_file_type, type}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp run_recovery_tail_open_hook do
+    case Process.get(:ferricstore_promotion_recovery_tail_open_hook) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
+    end
+  end
+
+  defp verify_recovery_file_identity(
+         file,
+         %File.Stat{major_device: major_device, minor_device: minor_device, inode: inode}
+       ) do
+    case :file.read_file_info(file) do
+      {:ok, info}
+      when elem(info, 2) == :regular and elem(info, 9) == major_device and
+             elem(info, 10) == minor_device and elem(info, 11) == inode ->
+        :ok
+
+      _ ->
+        {:error, :file_identity_changed}
+    end
+  end
+
+  defp validate_scan_stop_file!(file, file_path, valid_end, active?, shard_index) do
+    case :file.read_file_info(file) do
+      {:ok, info} when elem(info, 1) == valid_end ->
+        :ok
+
+      {:ok, info} when elem(info, 1) > valid_end ->
+        file_size = elem(info, 1)
+
+        case classify_recovery_tail!(file, file_path, valid_end, file_size, shard_index) do
+          :torn when active? ->
+            repair_recovery_tail!(file, file_path, valid_end, shard_index)
+
+          :torn ->
+            fail_recovery!(
+              :scan_dedicated_log,
+              file_path,
+              shard_index,
+              {:torn_tail_in_sealed_log, valid_end, file_size}
+            )
+
+          :complete_record ->
+            fail_recovery!(
+              :scan_dedicated_log,
+              file_path,
+              shard_index,
+              {:complete_record_rejected, valid_end, file_size}
+            )
+        end
+
+      {:ok, info} ->
+        fail_recovery!(
+          :scan_dedicated_log,
+          file_path,
+          shard_index,
+          {:scan_past_file_end, valid_end, elem(info, 1)}
+        )
+
+      {:error, reason} ->
+        fail_recovery!(:stat_dedicated_log, file_path, shard_index, reason)
+    end
+  end
+
+  defp classify_recovery_tail!(file, file_path, valid_end, file_size, shard_index) do
+    remaining = file_size - valid_end
+
+    if remaining < @log_header_size do
+      :torn
+    else
+      header = read_recovery_header!(file, valid_end, shard_index)
+
+      <<_crc::little-unsigned-32, _timestamp::little-unsigned-64,
+        _expire_at_ms::little-unsigned-64, key_size::little-unsigned-16,
+        value_size::little-unsigned-32>> = header
+
+      record_size =
+        cond do
+          value_size == @tombstone_value_size ->
+            @log_header_size + key_size
+
+          value_size <= @max_log_value_size ->
+            @log_header_size + key_size + value_size
+
+          true ->
+            fail_recovery!(
+              :scan_dedicated_log,
+              file_path,
+              shard_index,
+              {:invalid_tail_value_size, value_size, valid_end}
+            )
+        end
+
+      if remaining < record_size, do: :torn, else: :complete_record
+    end
+  end
+
+  defp read_recovery_header!(file, offset, shard_index) do
+    case :file.pread(file, offset, @log_header_size) do
+      {:ok, header} when byte_size(header) == @log_header_size ->
+        header
+
+      other ->
+        fail_recovery!(
+          :read_dedicated_tail,
+          offset,
+          shard_index,
+          {:unexpected, other}
+        )
+    end
+  end
+
+  defp repair_recovery_tail!(file, file_path, valid_end, shard_index) do
+    truncate_result =
+      with {:ok, ^valid_end} <- :file.position(file, valid_end),
+           :ok <- :file.truncate(file) do
+        :file.sync(file)
+      end
+
+    case truncate_result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        fail_recovery!(:repair_dedicated_tail, file_path, shard_index, reason)
+
+      other ->
+        fail_recovery!(
+          :repair_dedicated_tail,
+          file_path,
+          shard_index,
+          {:unexpected, other}
+        )
+    end
+  end
+
+  defp plan_recovered_rows!(final_state, redis_key, type, shard_index, instance_ctx, now) do
+    hot_cache_threshold = recover_hot_cache_threshold(instance_ctx)
+    expected_type_key = CompoundKey.type_key(redis_key)
+    expected_type_value = CompoundKey.encode_type(type)
+
+    Enum.map(final_state, fn
+      {key, :tombstone} ->
+        {:delete, key}
+
+      {key, {:live, _fid, _file_path, _offset, _value_size, expire_at_ms}}
+      when expire_at_ms > 0 and expire_at_ms <= now ->
+        {:delete, key}
+
+      {key, {:live, fid, file_path, offset, value_size, expire_at_ms}} ->
+        disk_value =
+          read_recovery_value!(
+            file_path,
+            offset,
+            key,
+            :read_dedicated_record,
+            shard_index
+          )
+
+        if key == expected_type_key and disk_value != expected_type_value do
+          fail_recovery!(
+            :read_dedicated_record,
+            {file_path, offset, key},
+            shard_index,
+            {:type_value_mismatch, expected_type_value, disk_value}
+          )
+        end
+
+        value = recovered_value_for_ets(disk_value, hot_cache_threshold, instance_ctx)
+        {:put, key, value, expire_at_ms, fid, offset, value_size}
+    end)
+  end
+
+  defp apply_recovery_plan!(
+         marker_actions,
+         recovery_plan,
+         shard_data_path,
+         keydir,
+         shard_index,
+         instance_ctx
+       ) do
+    rollback_fallbacks!(recovery_plan, shard_data_path, shard_index)
+
+    rolled_back_markers =
+      :ets.foldl(
+        fn
+          {_sequence, {:fallback, marker_key, _redis_key, _type, _dedicated_path}}, markers ->
+            MapSet.put(markers, marker_key)
+
+          {_sequence, {:cleanup, marker_key, _redis_key, _type, _dedicated_path, _shared_keys}},
+          markers ->
+            MapSet.put(markers, marker_key)
+
+          {_sequence, {:promoted, _marker_key, _redis_key, _promoted, _row_actions}}, markers ->
+            markers
+        end,
+        MapSet.new(),
+        recovery_plan
+      )
+
+    Enum.each(marker_actions, fn
+      {:hydrate_marker, marker_key, type_str} ->
+        unless MapSet.member?(rolled_back_markers, marker_key) do
+          track_binary_insert(keydir, shard_index, marker_key, type_str, instance_ctx)
+
+          unless :ets.update_element(keydir, marker_key, {2, type_str}) do
+            fail_recovery!(
+              :apply_recovery_plan,
+              marker_key,
+              shard_index,
+              :marker_disappeared
+            )
+          end
+        end
+
+      {:delete_invalid_marker, marker_key, type_str} ->
+        Logger.warning(
+          "Promotion recovery: ignoring invalid marker #{inspect(marker_key)} with type #{inspect(type_str)}"
+        )
+
+        track_binary_delete(keydir, shard_index, marker_key, instance_ctx)
+        :ets.delete(keydir, marker_key)
+    end)
+
+    :ets.foldl(
+      fn
+        {_sequence, {:fallback, marker_key, redis_key, _type, _dedicated_path}}, :ok ->
+          track_binary_delete(keydir, shard_index, marker_key, instance_ctx)
+          :ets.delete(keydir, marker_key)
+
+          Logger.info(
+            "Promotion recovery: marker for #{inspect(redis_key)} exists but dedicated " <>
+              "dir is incomplete; falling back to compound keys in shared log."
+          )
+
+          :ok
+
+        {_sequence, {:cleanup, marker_key, redis_key, _type, _dedicated_path, shared_keys}},
+        :ok ->
+          Enum.each(shared_keys, fn key ->
+            track_binary_delete(keydir, shard_index, key, instance_ctx)
+            :ets.delete(keydir, key)
+          end)
+
+          track_binary_delete(keydir, shard_index, marker_key, instance_ctx)
+          :ets.delete(keydir, marker_key)
+
+          Logger.info(
+            "Promotion recovery: removing expired or empty promoted collection " <>
+              "#{inspect(redis_key)}."
+          )
+
+          :ok
+
+        {_sequence, {:promoted, _marker_key, _redis_key, _promoted, row_actions}}, :ok ->
+          Enum.each(row_actions, fn
+            {:delete, key} ->
+              track_binary_delete(keydir, shard_index, key, instance_ctx)
+              :ets.delete(keydir, key)
+
+            {:put, key, value, expire_at_ms, fid, offset, value_size} ->
+              track_binary_insert(keydir, shard_index, key, value, instance_ctx)
+
+              :ets.insert(
+                keydir,
+                {key, value, expire_at_ms, LFU.initial(), fid, offset, value_size}
+              )
+          end)
+
+          :ok
+      end,
+      :ok,
+      recovery_plan
+    )
+  end
+
+  defp rollback_fallbacks!(recovery_plan, shard_data_path, shard_index) do
+    :ets.foldl(
+      fn
+        {_sequence, {:fallback, marker_key, redis_key, type, dedicated_path}}, :ok ->
+          rollback_fallback!(
+            marker_key,
+            redis_key,
+            type,
+            dedicated_path,
+            shard_data_path,
+            shard_index
+          )
+
+        {_sequence, {:cleanup, marker_key, redis_key, type, dedicated_path, shared_keys}}, :ok ->
+          rollback_cleanup!(
+            marker_key,
+            redis_key,
+            type,
+            dedicated_path,
+            shared_keys,
+            shard_data_path,
+            shard_index
+          )
+
+        {_sequence, {:promoted, _marker_key, _redis_key, _promoted, _row_actions}}, :ok ->
+          :ok
+      end,
+      :ok,
+      recovery_plan
+    )
+  end
+
+  defp rollback_fallback!(
+         marker_key,
+         redis_key,
+         type,
+         dedicated_path,
+         shard_data_path,
+         shard_index
+       ) do
+    active_path = recovery_active_shared_path!(shard_data_path, shard_index)
+    persist_recovery_intent!(active_path, marker_key, redis_key, type, :fallback, shard_index)
+    remove_recovery_dedicated!(dedicated_path, redis_key, shard_index)
+
+    case NIF.v2_append_tombstone(active_path, marker_key) do
+      {:ok, _offset} ->
+        :ok
+
+      {:error, reason} ->
+        fail_recovery!(
+          :rollback_incomplete_dedicated,
+          redis_key,
+          shard_index,
+          {:tombstone_marker, reason}
+        )
+
+      other ->
+        fail_recovery!(
+          :rollback_incomplete_dedicated,
+          redis_key,
+          shard_index,
+          {:unexpected_tombstone_result, other}
+        )
+    end
+  end
+
+  defp rollback_cleanup!(
+         marker_key,
+         redis_key,
+         type,
+         dedicated_path,
+         shared_keys,
+         shard_data_path,
+         shard_index
+       ) do
+    active_path = recovery_active_shared_path!(shard_data_path, shard_index)
+    persist_recovery_intent!(active_path, marker_key, redis_key, type, :cleanup, shard_index)
+    remove_recovery_dedicated!(dedicated_path, redis_key, shard_index)
+
+    cleanup_ops =
+      shared_keys
+      |> Enum.sort()
+      |> Enum.map(&{:delete, &1})
+      |> Kernel.++([{:delete, marker_key}])
+
+    case NIF.v2_append_ops_batch(active_path, cleanup_ops) do
+      {:ok, _locations} ->
+        :ok
+
+      {:error, reason} ->
+        fail_recovery!(
+          :cleanup_expired_promoted,
+          redis_key,
+          shard_index,
+          {:tombstone_records, reason}
+        )
+
+      other ->
+        fail_recovery!(
+          :cleanup_expired_promoted,
+          redis_key,
+          shard_index,
+          {:unexpected_tombstone_result, other}
+        )
+    end
+  end
+
+  defp persist_recovery_intent!(
+         active_path,
+         marker_key,
+         redis_key,
+         type,
+         intent,
+         shard_index
+       ) do
+    intent_value = recovery_intent_value(intent, type)
+
+    case NIF.v2_append_record(active_path, marker_key, intent_value, 0) do
+      {:ok, {_offset, _value_size}} ->
+        :ok
+
+      {:error, reason} ->
+        fail_recovery!(
+          :persist_cleanup_intent,
+          redis_key,
+          shard_index,
+          {intent, reason}
+        )
+
+      other ->
+        fail_recovery!(
+          :persist_cleanup_intent,
+          redis_key,
+          shard_index,
+          {intent, {:unexpected, other}}
+        )
+    end
+  end
+
+  defp remove_recovery_dedicated!(dedicated_path, redis_key, shard_index) do
+    case Ferricstore.FS.rm_rf(dedicated_path) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        fail_recovery!(
+          :rollback_incomplete_dedicated,
+          redis_key,
+          shard_index,
+          {:remove_directory, reason}
+        )
+    end
+
+    case fsync_dir(Path.dirname(dedicated_path), :rollback_incomplete_dedicated) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        fail_recovery!(
+          :rollback_incomplete_dedicated,
+          redis_key,
+          shard_index,
+          reason
+        )
+    end
+
+    :ok
+  end
+
+  defp recovery_active_shared_path!(shard_data_path, shard_index) do
+    case list_log_files_result(shard_data_path) do
+      {:ok, []} ->
+        fail_recovery!(:list_shared_logs, shard_data_path, shard_index, :no_log_files)
+
+      {:ok, log_files} ->
+        log_files |> List.last() |> elem(1)
+
+      {:error, reason} ->
+        fail_recovery!(:list_shared_logs, shard_data_path, shard_index, reason)
+    end
+  end
+
+  defp recovery_scan_page_size do
+    case Application.get_env(
+           :ferricstore,
+           :recovery_scan_page_size,
+           @default_recovery_scan_page_size
+         ) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> @default_recovery_scan_page_size
+    end
+  end
+
+  defp read_recovery_value!(path, offset, key, operation, shard_index) do
+    result =
+      case Process.get(:ferricstore_promotion_recovery_read_hook) do
+        fun when is_function(fun, 3) -> fun.(path, offset, key)
+        _ -> read_cold_async(path, offset, key)
+      end
+
+    case result do
+      {:ok, value} when is_binary(value) ->
+        value
+
+      {:error, reason} ->
+        fail_recovery!(operation, {path, offset, key}, shard_index, reason)
+
+      {:ok, nil} ->
+        fail_recovery!(operation, {path, offset, key}, shard_index, :record_not_found)
+
+      other ->
+        fail_recovery!(operation, {path, offset, key}, shard_index, {:unexpected, other})
+    end
+  end
+
+  defp recovery_log_files!(dir, shard_index) do
+    case list_log_files_result(dir) do
+      {:ok, []} ->
+        fail_recovery!(:list_dedicated_logs, dir, shard_index, :no_log_files)
+
+      {:ok, files} ->
+        files
+
+      {:error, reason} ->
+        fail_recovery!(:list_dedicated_logs, dir, shard_index, reason)
+    end
+  end
+
+  defp recovery_log_bytes!(log_files, shard_index) do
+    Enum.reduce(log_files, 0, fn {_fid, path}, total ->
+      case File.lstat(path) do
+        {:ok, %File.Stat{type: :regular, size: size}} ->
+          total + size
+
+        {:ok, %File.Stat{type: type}} ->
+          fail_recovery!(:stat_dedicated_log, path, shard_index, {:unsafe_file_type, type})
+
+        {:error, reason} ->
+          fail_recovery!(:stat_dedicated_log, path, shard_index, reason)
       end
     end)
+  end
+
+  defp fail_recovery!(operation, subject, shard_index, reason) do
+    message =
+      "promotion recovery #{operation} failed for #{inspect(subject)} on shard " <>
+        "#{shard_index}: #{inspect(reason)}"
+
+    Logger.error(message)
+    raise message
   end
 
   defp recover_hot_cache_threshold(%{hot_cache_max_value_size: threshold})
@@ -535,114 +1633,312 @@ defmodule Ferricstore.Store.Promotion do
 
   defp recover_hot_cache_threshold(_instance_ctx), do: 65_536
 
-  defp shared_live_compound_keys_by_marker(keydir, marker_types) do
-    now = HLC.now_ms()
+  defp recovered_value_for_ets(disk_value, hot_cache_threshold, instance_ctx) do
+    if BlobValue.threshold(instance_ctx) > 0 and BlobRef.ref?(disk_value) do
+      nil
+    else
+      ShardETS.value_for_ets(disk_value, hot_cache_threshold)
+    end
+  end
+
+  defp build_shared_recovery_index!(_index, _keydir, _shard_index, false), do: :ok
+
+  defp build_shared_recovery_index!(index, keydir, shard_index, true) do
+    CompoundMemberIndex.reset(index)
 
     :ets.foldl(
       fn
-        {key, _value, exp, _lfu, _fid, _off, _vsize}, acc when is_binary(key) ->
-          if live_hash_set_or_zset_compound?(key, exp, now) do
-            redis_key = CompoundKey.extract_redis_key(key)
+        {key, _value, expire_at_ms, _lfu, _fid, _offset, _value_size}, :ok
+        when is_binary(key) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+          CompoundMemberIndex.put(index, key)
 
-            case Map.get(marker_types, redis_key) do
-              nil ->
-                acc
-
-              marker_type ->
-                if compound_key_type?(key, marker_type) do
-                  Map.update(acc, redis_key, MapSet.new([key]), &MapSet.put(&1, key))
-                else
-                  acc
-                end
-            end
-          else
-            acc
-          end
-
-        _entry, acc ->
-          acc
+        row, :ok ->
+          fail_recovery!(:index_shared_compound, keydir, shard_index, {:invalid_keydir_row, row})
       end,
-      %{},
+      :ok,
       keydir
     )
+  rescue
+    ArgumentError ->
+      fail_recovery!(:index_shared_compound, keydir, shard_index, :keydir_unavailable)
   end
 
-  defp live_hash_set_or_zset_compound?(key, exp, now) do
-    (exp == 0 or exp > now) and
-      (match?(<<"H:", _::binary>>, key) or match?(<<"S:", _::binary>>, key) or
-         match?(<<"Z:", _::binary>>, key))
+  defp shared_compound_recovery_state!(index, keydir, redis_key, type, now, shard_index) do
+    type_key = CompoundKey.type_key(redis_key)
+
+    state =
+      case :ets.lookup(keydir, type_key) do
+        [{^type_key, value, expire_at_ms, _lfu, fid, offset, _value_size}]
+        when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+          add_shared_recovery_key(
+            empty_shared_recovery_state(),
+            type_key,
+            expire_at_ms,
+            redis_key,
+            value,
+            fid,
+            offset,
+            now
+          )
+
+        [] ->
+          empty_shared_recovery_state()
+
+        invalid ->
+          fail_recovery!(
+            :index_shared_compound,
+            type_key,
+            shard_index,
+            {:invalid_keydir_entry, invalid}
+          )
+      end
+
+    prefix = compound_prefix_for(type, redis_key)
+
+    case CompoundMemberIndex.reduce_rows_while(
+           index,
+           %{keydir: keydir},
+           prefix,
+           state,
+           fn
+             {key, value, expire_at_ms, _lfu, fid, offset, _value_size}, acc
+             when is_binary(key) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+               {:cont,
+                add_shared_recovery_key(
+                  acc,
+                  key,
+                  expire_at_ms,
+                  redis_key,
+                  value,
+                  fid,
+                  offset,
+                  now
+                )}
+
+             row, _acc ->
+               fail_recovery!(
+                 :index_shared_compound,
+                 redis_key,
+                 shard_index,
+                 {:invalid_keydir_row, row}
+               )
+           end
+         ) do
+      {:ok, shared_state} ->
+        shared_state
+
+      {:error, reason} ->
+        fail_recovery!(:index_shared_compound, redis_key, shard_index, reason)
+
+      :unavailable ->
+        fail_recovery!(:index_shared_compound, redis_key, shard_index, :index_unavailable)
+
+      other ->
+        fail_recovery!(:index_shared_compound, redis_key, shard_index, {:unexpected, other})
+    end
+  rescue
+    ArgumentError ->
+      fail_recovery!(:index_shared_compound, redis_key, shard_index, :keydir_unavailable)
   end
 
-  defp compound_key_type?(<<"H:", _::binary>>, :hash), do: true
-  defp compound_key_type?(<<"S:", _::binary>>, :set), do: true
-  defp compound_key_type?(<<"Z:", _::binary>>, :zset), do: true
-  defp compound_key_type?(_key, _type), do: false
+  defp empty_shared_recovery_state do
+    %{
+      all_keys: MapSet.new(),
+      live_keys: MapSet.new(),
+      live_member_keys: MapSet.new(),
+      type_status: :missing,
+      type_record: nil
+    }
+  end
 
-  defp decode_promoted_type("hash"), do: {:ok, :hash}
-  defp decode_promoted_type("set"), do: {:ok, :set}
-  defp decode_promoted_type("zset"), do: {:ok, :zset}
-  defp decode_promoted_type(_type_str), do: :error
+  defp add_shared_recovery_key(
+         state,
+         key,
+         expire_at_ms,
+         redis_key,
+         value,
+         fid,
+         offset,
+         now
+       ) do
+    live? = expire_at_ms == 0 or expire_at_ms > now
+    state = %{state | all_keys: MapSet.put(state.all_keys, key)}
+
+    state =
+      if live? do
+        %{state | live_keys: MapSet.put(state.live_keys, key)}
+      else
+        state
+      end
+
+    if key == CompoundKey.type_key(redis_key) do
+      %{
+        state
+        | type_status: if(live?, do: :live, else: :expired),
+          type_record: {key, value, fid, offset}
+      }
+    else
+      if live? do
+        %{state | live_member_keys: MapSet.put(state.live_member_keys, key)}
+      else
+        state
+      end
+    end
+  end
+
+  defp validate_shared_recovery_type!(
+         shared_state,
+         redis_key,
+         type,
+         shard_data_path,
+         shard_index
+       ) do
+    expected_type = CompoundKey.encode_type(type)
+
+    actual_type =
+      case shared_state.type_record do
+        {_key, value, _fid, _offset} when is_binary(value) ->
+          value
+
+        {type_key, _value, fid, offset} ->
+          file_path =
+            Path.join(
+              shard_data_path,
+              "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log"
+            )
+
+          read_recovery_value!(
+            file_path,
+            offset,
+            type_key,
+            :read_shared_type,
+            shard_index
+          )
+
+        nil ->
+          fail_recovery!(
+            :validate_shared_type,
+            redis_key,
+            shard_index,
+            :shared_type_missing
+          )
+      end
+
+    if actual_type != expected_type do
+      fail_recovery!(
+        :validate_shared_type,
+        redis_key,
+        shard_index,
+        {:shared_type_mismatch, expected_type, actual_type}
+      )
+    end
+  end
+
+  defp shared_collection_live?(state) do
+    state.type_status == :live and MapSet.size(state.live_member_keys) > 0
+  end
+
+  defp shared_collection_dead?(state) do
+    MapSet.size(state.all_keys) > 0 and
+      (state.type_status == :expired or MapSet.size(state.live_member_keys) == 0)
+  end
+
+  defp decode_recovery_marker("hash"), do: {:ok, :hash, :promoted}
+  defp decode_recovery_marker("set"), do: {:ok, :set, :promoted}
+  defp decode_recovery_marker("zset"), do: {:ok, :zset, :promoted}
+  defp decode_recovery_marker("fallback:hash"), do: {:ok, :hash, {:intent, :fallback}}
+  defp decode_recovery_marker("fallback:set"), do: {:ok, :set, {:intent, :fallback}}
+  defp decode_recovery_marker("fallback:zset"), do: {:ok, :zset, {:intent, :fallback}}
+  defp decode_recovery_marker("cleanup:hash"), do: {:ok, :hash, {:intent, :cleanup}}
+  defp decode_recovery_marker("cleanup:set"), do: {:ok, :set, {:intent, :cleanup}}
+  defp decode_recovery_marker("cleanup:zset"), do: {:ok, :zset, {:intent, :cleanup}}
+  defp decode_recovery_marker(_type_str), do: :error
+
+  defp recovery_intent_value(intent, type) when intent in [:fallback, :cleanup] do
+    Atom.to_string(intent) <> ":" <> CompoundKey.encode_type(type)
+  end
 
   defp shared_uncovered_live_compound?(shared_keys, dedicated_keys) do
     Enum.any?(shared_keys, fn key -> not MapSet.member?(dedicated_keys, key) end)
   end
 
-  @spec cleanup_promoted!(binary(), binary(), atom(), binary(), non_neg_integer(), term()) :: :ok
+  @spec cleanup_promoted!(
+          binary(),
+          :hash | :set | :zset,
+          binary(),
+          binary(),
+          atom(),
+          binary(),
+          non_neg_integer(),
+          term()
+        ) :: :ok
   def cleanup_promoted!(
         redis_key,
+        type,
+        resolved_path,
         shard_data_path,
         keydir,
         data_dir,
         shard_index,
         instance_ctx \\ nil
-      ) do
+      )
+      when type in [:hash, :set, :zset] and is_binary(resolved_path) do
+    expected_path = dedicated_path(data_dir, shard_index, type, redis_key)
+
+    if Path.expand(resolved_path) != Path.expand(expected_path) do
+      raise ArgumentError,
+            "resolved promotion path mismatch: expected #{inspect(expected_path)}, got #{inspect(resolved_path)}"
+    end
+
     mk = marker_key(redis_key)
-
-    type =
-      case :ets.lookup(keydir, mk) do
-        [{^mk, type_str, _exp, _lfu, fid, off, _vsize}] ->
-          case promotion_entry_value(shard_data_path, mk, type_str, fid, off) do
-            type_str when is_binary(type_str) -> CompoundKey.decode_type(type_str)
-            _ -> :hash
-          end
-
-        _ ->
-          :hash
-      end
-
+    intent_value = recovery_intent_value(:cleanup, type)
     type_label = type_label(type)
+    active_path = recovery_active_shared_path!(shard_data_path, shard_index)
 
-    # v2: write tombstone for the marker key
-    active_path = find_active(shard_data_path)
+    # The intent makes directory-first cleanup retryable if the final marker
+    # tombstone fails after the dedicated state has already been removed.
+    case NIF.v2_append_record(active_path, mk, intent_value, 0) do
+      {:ok, {offset, value_size}} ->
+        marker_fid = file_id_from_path(active_path)
+        track_binary_insert(keydir, shard_index, mk, intent_value, instance_ctx)
 
-    case NIF.v2_append_tombstone(active_path, mk) do
-      {:ok, _} ->
-        :ok
+        :ets.insert(
+          keydir,
+          {mk, intent_value, 0, LFU.initial(), marker_fid, offset, value_size}
+        )
 
       {:error, reason} ->
         Logger.error(
-          "Promotion cleanup: tombstone write failed for marker #{inspect(mk)}: #{inspect(reason)}"
+          "Promotion cleanup: marker fence failed for #{inspect(mk)}: #{inspect(reason)}"
+        )
+
+        raise "promotion cleanup marker fence failed: #{inspect(reason)}"
+    end
+
+    case Ferricstore.FS.rm_rf(resolved_path) do
+      :ok -> :ok
+      {:error, reason} -> raise "promotion cleanup directory removal failed: #{inspect(reason)}"
+    end
+
+    case fsync_dir(Path.dirname(resolved_path), :remove_dedicated_dir) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise "promotion cleanup directory fsync failed: #{inspect(reason)}"
+    end
+
+    case NIF.v2_append_tombstone(active_path, mk) do
+      {:ok, _offset} ->
+        track_binary_delete(keydir, shard_index, mk, instance_ctx)
+        :ets.delete(keydir, mk)
+
+      {:error, reason} ->
+        Logger.error(
+          "Promotion cleanup: marker tombstone failed for #{inspect(mk)}: #{inspect(reason)}"
         )
 
         raise "promotion cleanup marker tombstone failed: #{inspect(reason)}"
-    end
-
-    track_binary_delete(keydir, shard_index, mk, instance_ctx)
-    :ets.delete(keydir, mk)
-
-    path = dedicated_path(data_dir, shard_index, type, redis_key)
-
-    if Ferricstore.FS.dir?(path) do
-      Ferricstore.FS.rm_rf!(path)
-      parent = Path.dirname(path)
-
-      case fsync_dir(parent, :remove_dedicated_dir) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          raise "promotion cleanup directory fsync failed: #{inspect(reason)}"
-      end
     end
 
     Logger.debug("Cleaned up promoted #{type_label} #{inspect(redis_key)} (shard #{shard_index})")
@@ -656,7 +1952,7 @@ defmodule Ferricstore.Store.Promotion do
   defp compound_prefix_for(:zset, redis_key), do: CompoundKey.zset_prefix(redis_key)
 
   defp promotion_entry_value(_shard_data_path, _key, value, _fid, _off) when value != nil,
-    do: value
+    do: {:ok, value}
 
   defp promotion_entry_value(shard_data_path, key, nil, fid, off)
        when is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 do
@@ -664,12 +1960,16 @@ defmodule Ferricstore.Store.Promotion do
       Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
 
     case read_cold_async(file_path, off, key) do
-      {:ok, value} when value != nil -> value
-      _ -> nil
+      {:ok, value} when value != nil -> {:ok, value}
+      {:ok, nil} -> {:error, :record_not_found}
+      {:error, reason} -> {:error, reason}
+      nil -> {:error, :record_not_found}
+      other -> {:error, {:unexpected_cold_read_result, other}}
     end
   end
 
-  defp promotion_entry_value(_shard_data_path, _key, _value, _fid, _off), do: nil
+  defp promotion_entry_value(_shard_data_path, _key, _value, fid, off),
+    do: {:error, {:invalid_cold_location, fid, off}}
 
   defp read_cold_async(path, offset, key) do
     Ferricstore.Store.ColdRead.pread_keyed(path, offset, key, @cold_read_timeout_ms)
@@ -691,12 +1991,34 @@ defmodule Ferricstore.Store.Promotion do
   end
 
   defp compaction_latch(owner, redis_key) do
+    latch(owner, {:promoted_compaction, redis_key})
+  end
+
+  defp shared_log_latch(owner) do
+    latch(owner, :compound_promotion_shared_log)
+  end
+
+  defp failure_fence(owner, redis_key) do
+    case latch_table(owner) do
+      nil -> nil
+      tab -> {tab, {:compound_promotion_failure, redis_key}}
+    end
+  end
+
+  defp latch_table(owner) do
     with %FerricStore.Instance{} = ctx <- latch_context(owner),
          idx when is_integer(idx) and idx >= 0 <- latch_index(owner),
          true <- idx < tuple_size(ctx.latch_refs) do
-      {elem(ctx.latch_refs, idx), {:promoted_compaction, redis_key}, idx}
+      elem(ctx.latch_refs, idx)
     else
       _ -> nil
+    end
+  end
+
+  defp latch(owner, latch_key) do
+    case {latch_table(owner), latch_index(owner)} do
+      {tab, idx} when tab != nil and is_integer(idx) -> {tab, latch_key, idx}
+      _missing -> nil
     end
   end
 
@@ -725,6 +2047,31 @@ defmodule Ferricstore.Store.Promotion do
       false ->
         wait_compaction_latch_clear!(tab, latch_key, shard_index)
         acquire_compaction_latch(tab, latch_key, shard_index)
+    end
+  end
+
+  defp try_acquire_latch(tab, latch_key) do
+    case :ets.insert_new(tab, {latch_key, self()}) do
+      true ->
+        {:ok, {tab, latch_key}}
+
+      false ->
+        case :ets.lookup(tab, latch_key) do
+          [{^latch_key, owner}] when is_pid(owner) ->
+            if Process.alive?(owner) do
+              :busy
+            else
+              :ets.delete_object(tab, {latch_key, owner})
+
+              case :ets.insert_new(tab, {latch_key, self()}) do
+                true -> {:ok, {tab, latch_key}}
+                false -> :busy
+              end
+            end
+
+          _other ->
+            :busy
+        end
     end
   end
 
@@ -774,7 +2121,7 @@ defmodule Ferricstore.Store.Promotion do
     if Process.alive?(owner) do
       Process.sleep(@compaction_latch_sleep_ms)
     else
-      :ets.take(tab, latch_key)
+      :ets.delete_object(tab, {latch_key, owner})
     end
 
     wait_compaction_latch_clear(tab, latch_key, shard_index, started_ms, timeout_ms)
@@ -817,52 +2164,44 @@ defmodule Ferricstore.Store.Promotion do
     |> String.to_integer()
   end
 
-  # Returns total size of all .log files in a directory.
-  defp dir_total_size(dir) do
-    case Ferricstore.FS.ls(dir) do
-      {:ok, files} ->
-        files
-        |> Enum.filter(&String.ends_with?(&1, ".log"))
-        |> Enum.reject(&String.starts_with?(&1, "compact_"))
-        |> Enum.reduce(0, fn name, acc ->
-          case File.stat(Path.join(dir, name)) do
-            {:ok, %{size: s}} -> acc + s
-            _ -> acc
-          end
-        end)
-
-      _ ->
-        0
-    end
-  end
-
   # Returns all .log files in a directory as [{file_id, full_path}], sorted by file_id.
   # Cleans up leftover compact_*.log temp files from crashed compaction.
   defp list_log_files(dir) do
+    case list_log_files_result(dir) do
+      {:ok, files} -> files
+      {:error, _reason} -> []
+    end
+  end
+
+  defp list_log_files_result(dir) do
     case Ferricstore.FS.ls(dir) do
       {:ok, files} ->
         cleanup_leftover_compaction_temp_files(dir, files)
 
-        files
-        |> Enum.flat_map(fn name ->
-          case numeric_log_file_id(name) do
-            {:ok, fid} -> [{fid, Path.join(dir, name)}]
-            :skip -> []
-          end
-        end)
-        |> Enum.sort_by(fn {fid, _} -> fid end)
+        log_files =
+          files
+          |> Enum.flat_map(fn name ->
+            case numeric_log_file_id(dir, name) do
+              {:ok, fid} -> [{fid, Path.join(dir, name)}]
+              :skip -> []
+            end
+          end)
+          |> Enum.sort_by(fn {fid, _} -> fid end)
 
-      _ ->
-        []
+        {:ok, log_files}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp numeric_log_file_id(name) do
+  defp numeric_log_file_id(dir, name) do
     with true <- String.ends_with?(name, ".log"),
          false <- String.starts_with?(name, "compact_"),
          stem <- String.trim_trailing(name, ".log"),
          {fid, ""} <- Integer.parse(stem),
-         true <- fid >= 0 do
+         true <- fid >= 0,
+         {:ok, %File.Stat{type: :regular}} <- File.lstat(Path.join(dir, name)) do
       {:ok, fid}
     else
       _ -> :skip

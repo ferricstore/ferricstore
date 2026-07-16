@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.LMDBWriter.Registry do
 
   @owner Ferricstore.Flow.LMDBWriter
   @enqueue_seq_queued 1
+  @max_exact_integer 9_007_199_254_740_991
 
   def name(shard_index), do: :"Ferricstore.Flow.LMDBWriter.#{shard_index}"
 
@@ -34,15 +35,25 @@ defmodule Ferricstore.Flow.LMDBWriter.Registry do
     end
   end
 
-  def normalize_projection_outbox_entries(entries) do
-    Enum.flat_map(entries, fn
-      {state_key, version} when is_binary(state_key) and is_integer(version) ->
-        [{state_key, version}]
+  def normalize_projection_outbox_entries(entries) when is_list(entries) do
+    entries
+    |> Enum.reduce_while({:ok, []}, fn
+      {state_key, version}, {:ok, acc}
+      when is_binary(state_key) and state_key != "" and is_integer(version) and version >= 0 and
+             version <= @max_exact_integer ->
+        {:cont, {:ok, [{state_key, version} | acc]}}
 
-      _other ->
-        []
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_projection_outbox_entries}}
     end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
   end
+
+  def normalize_projection_outbox_entries(_entries),
+    do: {:error, :invalid_projection_outbox_entries}
 
   def projection_outbox_rows(entries) do
     Enum.map(entries, fn {state_key, version} ->

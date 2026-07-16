@@ -4,12 +4,15 @@
 //! `File.rm`, `File.exists?`, `File.ls`) which run on the Erlang async-thread
 //! pool and surface as `erts_internal:dirty_nif_finalizer/1` in crash dumps.
 //!
-//! All ops here run on the **Normal** BEAM scheduler:
+//! Synchronous metadata ops run on **DirtyIo** schedulers:
 //!
 //! - **Sync metadata ops** (`fs_touch`, `fs_mkdir_p`, `fs_rename`, `fs_rm`,
-//!   `fs_exists`, `fs_is_dir`, `fs_ls`, `fs_read_nofollow`): single syscall
-//!   or bounded short file read. End with `consume_timeslice` so BEAM
-//!   scheduling stays accurate.
+//!   `fs_exists`, `fs_is_dir`, `fs_ls`) may block in the filesystem. Recursive
+//!   mkdir and directory enumeration are not bounded to one syscall.
+//!
+//! - **Bounded file reads and streaming copies** (`fs_read_nofollow`,
+//!   `fs_copy_sync_nofollow`) run on DirtyIo. Reads avoid an intermediate
+//!   `Vec`, and copies keep large snapshot payloads out of BEAM memory.
 //!
 //! - **Async long I/O** (`fs_rm_rf_async`): spawns on Tokio, sends
 //!   `{:tokio_complete, corr_id, :ok | :error, reason}` to the caller.
@@ -20,23 +23,21 @@
 //!   `:invalid_path`, `:symlink`. Anything else comes through as `:other` with a
 //!   message.
 //!
-//! **Design rule:** NEVER use `schedule = "DirtyIo"` or `"DirtyCpu"` here.
-//! The whole point of this module is to keep disk I/O off the dirty pool so
-//! BEAM scheduler accounting stays correct; long I/O goes through Tokio async.
+//! **Design rule:** synchronous filesystem work uses DirtyIo, and unbounded
+//! recursive tree removal goes through Tokio.
 
 #[cfg(unix)]
 use std::ffi::CString;
-use std::io;
+use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::io::Read;
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustler::schedule::consume_timeslice;
-use rustler::{Encoder, Env, LocalPid, NifResult, OwnedBinary, OwnedEnv, Term};
+use rustler::{Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, OwnedEnv, Term};
 
 use crate::async_io;
 use crate::atoms;
@@ -54,6 +55,7 @@ rustler::atoms! {
     directory_not_empty,
     invalid_path,
     symlink,
+    too_large,
     other,
 }
 
@@ -95,7 +97,12 @@ fn validate_path<'a>(env: Env<'a>, path: &str) -> Result<(), Term<'a>> {
 }
 
 fn remove_dir_all_idempotent(path: &Path) -> io::Result<()> {
-    match std::fs::remove_dir_all(path) {
+    #[cfg(unix)]
+    let result = crate::path_open::remove_dir_all_nofollow(path);
+    #[cfg(not(unix))]
+    let result = std::fs::remove_dir_all(path);
+
+    match result {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -103,32 +110,22 @@ fn remove_dir_all_idempotent(path: &Path) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Synchronous metadata NIFs (Normal scheduler)
+// Synchronous metadata NIFs (dirty I/O scheduler)
 // ---------------------------------------------------------------------------
 
 /// Creates an empty file if it does not exist. Idempotent on an existing
 /// file (does not truncate — matches `:file.write_file_info` touch-like
 /// semantics Elixir's `File.touch!/1` provides).
 ///
-/// Uses `create_new(true)` for atomicity — no TOCTOU window between an
-/// `exists?` check and the open. On `AlreadyExists` we return `:ok`
-/// because the caller's intent is "ensure this file exists", which is
-/// already satisfied.
-#[rustler::nif(schedule = "Normal")]
+/// Uses an atomic no-follow open so an existing regular file is preserved and
+/// a final-component symlink is rejected without a check/open race.
+#[rustler::nif(schedule = "DirtyIo")]
 fn fs_touch(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     if let Err(t) = validate_path(env, &path) {
         return Ok(t);
     }
 
-    let result = match std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-    {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
-    };
+    let result = touch_file_nofollow(Path::new(&path)).map(drop);
 
     let _ = consume_timeslice(env, 1);
     match result {
@@ -137,14 +134,35 @@ fn fs_touch(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     }
 }
 
+#[cfg(unix)]
+fn touch_file_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    crate::path_open::open_file_nofollow(path, libc::O_WRONLY | libc::O_CREAT, 0o666)
+}
+
+#[cfg(not(unix))]
+fn touch_file_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "final path component is a symlink",
+        )),
+        Ok(_metadata) => std::fs::OpenOptions::new().write(true).open(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path),
+        Err(error) => Err(error),
+    }
+}
+
 /// Recursive `mkdir -p`. Idempotent when the directory already exists.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn fs_mkdir_p(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     if let Err(t) = validate_path(env, &path) {
         return Ok(t);
     }
 
-    let result = std::fs::create_dir_all(&path);
+    let result = create_dir_all_nofollow(Path::new(&path));
     let _ = consume_timeslice(env, 1);
 
     match result {
@@ -153,10 +171,81 @@ fn fs_mkdir_p(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn create_dir_all_nofollow(path: &Path) -> io::Result<()> {
+    let start = if path.is_absolute() { "/" } else { "." };
+    let start = CString::new(start).expect("fixed directory path contains no null byte");
+    let start_fd = unsafe {
+        libc::open(
+            start.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if start_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut directory = unsafe { OwnedFd::from_raw_fd(start_fd) };
+    let mut allow_root_alias = path.is_absolute();
+
+    for component in path.components() {
+        use std::path::Component;
+
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => std::ffi::OsStr::new(".."),
+            Component::Normal(name) => name,
+            Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsupported path prefix",
+                ));
+            }
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
+
+        let mkdir_result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o777) };
+        if mkdir_result != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+
+        // Root-level aliases such as macOS `/tmp -> private/tmp` are protected
+        // by the root directory's permissions. Below that trusted component,
+        // every traversal is no-follow.
+        let nofollow = if allow_root_alias {
+            allow_root_alias = false;
+            0
+        } else {
+            libc::O_NOFOLLOW
+        };
+        let next_fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | nofollow,
+            )
+        };
+        if next_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        directory = unsafe { OwnedFd::from_raw_fd(next_fd) };
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn create_dir_all_nofollow(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
 /// Atomic rename. On POSIX, `rename` replaces the target atomically.
 /// Cross-device renames return `:other` — caller should fall back to
 /// copy+remove or handle specially.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn fs_rename(env: Env<'_>, old_path: String, new_path: String) -> NifResult<Term<'_>> {
     if let Err(t) = validate_path(env, &old_path) {
         return Ok(t);
@@ -165,6 +254,9 @@ fn fs_rename(env: Env<'_>, old_path: String, new_path: String) -> NifResult<Term
         return Ok(t);
     }
 
+    #[cfg(unix)]
+    let result = crate::path_open::rename_nofollow(Path::new(&old_path), Path::new(&new_path));
+    #[cfg(not(unix))]
     let result = std::fs::rename(&old_path, &new_path);
     let _ = consume_timeslice(env, 1);
 
@@ -175,12 +267,15 @@ fn fs_rename(env: Env<'_>, old_path: String, new_path: String) -> NifResult<Term
 }
 
 /// Remove a single file. Use `fs_rm_rf_async` for directories.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn fs_rm(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     if let Err(t) = validate_path(env, &path) {
         return Ok(t);
     }
 
+    #[cfg(unix)]
+    let result = crate::path_open::remove_file_nofollow(Path::new(&path));
+    #[cfg(not(unix))]
     let result = std::fs::remove_file(&path);
     let _ = consume_timeslice(env, 1);
 
@@ -192,7 +287,7 @@ fn fs_rm(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 
 /// Does the path exist? Follows symlinks (use `fs_exists_nofollow` if you
 /// need a broken-symlink-aware check).
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn fs_exists(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     if let Err(t) = validate_path(env, &path) {
         return Ok(t);
@@ -205,7 +300,7 @@ fn fs_exists(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 
 /// Is the path a directory? Follows symlinks. Returns `false` for missing
 /// paths rather than an error — matches Elixir's `File.dir?/1` semantics.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn fs_is_dir(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     if let Err(t) = validate_path(env, &path) {
         return Ok(t);
@@ -221,7 +316,7 @@ fn fs_is_dir(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 ///
 /// The NIF yields every 256 entries to keep reductions accurate on huge
 /// directories.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn fs_ls(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     if let Err(t) = validate_path(env, &path) {
         return Ok(t);
@@ -263,53 +358,421 @@ fn fs_ls(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 /// `lstat` check is not enough: another process can swap the file for a
 /// symlink between check and open. On Unix, `O_NOFOLLOW` makes the kernel
 /// reject that final-component symlink atomically.
-#[rustler::nif(schedule = "Normal")]
-fn fs_read_nofollow(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
+#[rustler::nif(schedule = "DirtyIo")]
+fn fs_read_nofollow(env: Env<'_>, path: String, max_bytes: u64) -> NifResult<Term<'_>> {
     if let Err(t) = validate_path(env, &path) {
         return Ok(t);
     }
 
-    let result = read_file_nofollow(&path);
-    let _ = consume_timeslice(env, 1);
+    let mut file = match open_file_nofollow(&path) {
+        Ok(file) => file,
+        Err(error) => return Ok(encode_error(env, &error)),
+    };
 
-    match result {
-        Ok(bytes) => Ok((atoms::ok(), binary_term(env, &bytes)?).encode(env)),
-        Err(e) => Ok(encode_error(env, &e)),
+    let size = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => return Ok(encode_error(env, &error)),
+    };
+
+    if size > max_bytes {
+        let message = format!("file is {size} bytes (max {max_bytes})");
+        return Ok((atoms::error(), (too_large(), message)).encode(env));
+    }
+
+    let size_usize = match usize::try_from(size) {
+        Ok(size) => size,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                (too_large(), "file size exceeds address space"),
+            )
+                .encode(env));
+        }
+    };
+
+    let mut binary = match OwnedBinary::new(size_usize) {
+        Some(binary) => binary,
+        None => {
+            return Ok((atoms::error(), (other(), "out of memory reading file")).encode(env));
+        }
+    };
+
+    if let Err(error) = file.read_exact(binary.as_mut_slice()) {
+        return Ok(encode_error(env, &error));
+    }
+
+    match file.metadata() {
+        Ok(metadata) if metadata.len() == size => {
+            let result = Binary::from_owned(binary, env);
+            Ok((atoms::ok(), result).encode(env))
+        }
+        Ok(metadata) => Ok((
+            atoms::error(),
+            (
+                other(),
+                format!(
+                    "file changed size while reading (before {size}, after {})",
+                    metadata.len()
+                ),
+            ),
+        )
+            .encode(env)),
+        Err(error) => Ok(encode_error(env, &error)),
     }
 }
 
-#[cfg(unix)]
-fn read_file_nofollow(path: &str) -> io::Result<Vec<u8>> {
-    let c_path = CString::new(Path::new(path).as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
-
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+/// Stream one regular file into a newly-created destination without following
+/// either final path component. The destination is synced before success.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fs_copy_sync_nofollow(env: Env<'_>, source: String, dest: String) -> NifResult<Term<'_>> {
+    if let Err(term) = validate_path(env, &source) {
+        return Ok(term);
+    }
+    if let Err(term) = validate_path(env, &dest) {
+        return Ok(term);
     }
 
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    let result = copy_sync_nofollow(Path::new(&source), Path::new(&dest));
+    let _ = consume_timeslice(env, 1);
+    match result {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(error) => Ok(encode_error(env, &error)),
+    }
+}
+
+fn copy_sync_nofollow(source: &Path, dest: &Path) -> io::Result<()> {
+    let mut source_file = open_file_nofollow(source.to_string_lossy().as_ref())?;
+    let source_metadata = source_file.metadata()?;
+    let mut dest_file = create_copy_destination_nofollow(dest)?;
+
+    let result = (|| {
+        let copied = io::copy(&mut source_file, &mut dest_file)?;
+        if copied != source_metadata.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "snapshot source changed while copying: expected {} bytes, copied {copied}",
+                    source_metadata.len()
+                ),
+            ));
+        }
+
+        dest_file.set_permissions(source_metadata.permissions())?;
+        dest_file.sync_all()?;
+        let parent = dest
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_directory_nofollow(parent)
+    })();
+
+    if result.is_err() {
+        drop(dest_file);
+        #[cfg(unix)]
+        let _ = crate::path_open::remove_file_nofollow(dest);
+        #[cfg(not(unix))]
+        let _ = std::fs::remove_file(dest);
+    }
+
+    result
+}
+
+fn create_copy_destination_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = crate::path_open::open_file_nofollow(
+        path,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o666,
+    )?;
+
+    #[cfg(not(unix))]
+    let file = {
+        reject_copy_destination_symlink(path)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?
+    };
+
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot copy destination is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(not(unix))]
-fn read_file_nofollow(path: &str) -> io::Result<Vec<u8>> {
-    std::fs::read(path)
+fn reject_copy_destination_symlink(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot copy destination is a symlink",
+        )),
+        Ok(_metadata) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
-fn binary_term<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
-    let mut binary =
-        OwnedBinary::new(bytes.len()).ok_or_else(|| rustler::Error::Term(Box::new("oom")))?;
-    binary.as_mut_slice().copy_from_slice(bytes);
-    Ok(binary.release(env).encode(env))
+/// Append one payload and make it durable without following a final symlink.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fs_append_sync_nofollow<'a>(
+    env: Env<'a>,
+    path: String,
+    payload: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    if let Err(term) = validate_path(env, &path) {
+        return Ok(term);
+    }
+
+    let result = append_sync_nofollow(Path::new(&path), payload.as_slice());
+    let _ = consume_timeslice(env, 1);
+    match result {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(error) => Ok(encode_error(env, &error)),
+    }
+}
+
+/// Append one payload durably only when the opened regular file remains within
+/// `max_bytes`. The descriptor lock covers both the size check and append, so
+/// cooperating writers cannot each pass the check and exceed the ceiling.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fs_append_sync_nofollow_bounded<'a>(
+    env: Env<'a>,
+    path: String,
+    payload: Binary<'a>,
+    max_bytes: u64,
+) -> NifResult<Term<'a>> {
+    if let Err(term) = validate_path(env, &path) {
+        return Ok(term);
+    }
+
+    let result = append_sync_nofollow_bounded(Path::new(&path), payload.as_slice(), max_bytes);
+    let _ = consume_timeslice(env, 1);
+    match result {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(BoundedAppendError::TooLarge {
+            current_bytes,
+            payload_bytes,
+            max_bytes,
+        }) => {
+            let attempted_bytes = current_bytes.checked_add(payload_bytes);
+            let message = match attempted_bytes {
+                Some(attempted_bytes) => format!(
+                    "append would grow file from {current_bytes} to {attempted_bytes} bytes (max {max_bytes})"
+                ),
+                None => format!(
+                    "append size overflow: current {current_bytes} bytes, payload {payload_bytes} bytes (max {max_bytes})"
+                ),
+            };
+            Ok((atoms::error(), (too_large(), message)).encode(env))
+        }
+        Err(BoundedAppendError::Io(error)) => Ok(encode_error(env, &error)),
+    }
+}
+
+/// Durably replace a file from one bounded payload using an exclusive
+/// same-directory temporary file and an atomic rename.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fs_atomic_replace_nofollow<'a>(
+    env: Env<'a>,
+    path: String,
+    payload: Binary<'a>,
+    max_bytes: u64,
+) -> NifResult<Term<'a>> {
+    if let Err(term) = validate_path(env, &path) {
+        return Ok(term);
+    }
+
+    let result = atomic_replace_nofollow(Path::new(&path), payload.as_slice(), max_bytes);
+    let _ = consume_timeslice(env, 1);
+    match result {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            Ok((atoms::error(), (too_large(), error.to_string())).encode(env))
+        }
+        Err(error) => Ok(encode_error(env, &error)),
+    }
+}
+
+fn append_sync_nofollow(path: &Path, payload: &[u8]) -> io::Result<()> {
+    let mut file = crate::open_append_nofollow(path)?;
+    let _lock = crate::lock_file_exclusive(&file)?;
+    file.write_all(payload)?;
+    file.sync_data()
+}
+
+#[derive(Debug)]
+enum BoundedAppendError {
+    TooLarge {
+        current_bytes: u64,
+        payload_bytes: u64,
+        max_bytes: u64,
+    },
+    Io(io::Error),
+}
+
+impl From<io::Error> for BoundedAppendError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+fn append_sync_nofollow_bounded(
+    path: &Path,
+    payload: &[u8],
+    max_bytes: u64,
+) -> Result<(), BoundedAppendError> {
+    let payload_bytes = u64::try_from(payload.len()).map_err(|_| BoundedAppendError::TooLarge {
+        current_bytes: 0,
+        payload_bytes: u64::MAX,
+        max_bytes,
+    })?;
+    if payload_bytes > max_bytes {
+        return Err(BoundedAppendError::TooLarge {
+            current_bytes: 0,
+            payload_bytes,
+            max_bytes,
+        });
+    }
+
+    let mut file = crate::open_append_nofollow(path)?;
+    let _lock = crate::lock_file_exclusive(&file)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(BoundedAppendError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "append target is not a regular file",
+        )));
+    }
+
+    let current_bytes = metadata.len();
+    let attempted_bytes = current_bytes.checked_add(payload_bytes);
+    if attempted_bytes.map_or(true, |attempted| attempted > max_bytes) {
+        return Err(BoundedAppendError::TooLarge {
+            current_bytes,
+            payload_bytes,
+            max_bytes,
+        });
+    }
+
+    file.write_all(payload)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+static ATOMIC_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_replace_nofollow(path: &Path, payload: &[u8], max_bytes: u64) -> io::Result<()> {
+    let payload_len = u64::try_from(payload.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "payload exceeds address space")
+    })?;
+    if payload_len > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("payload is {payload_len} bytes (max {max_bytes})"),
+        ));
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+
+    let (temp_path, mut temp_file) = create_atomic_temp(parent, file_name)?;
+    let result = (|| {
+        temp_file.write_all(payload)?;
+        temp_file.sync_all()?;
+        #[cfg(unix)]
+        crate::path_open::rename_nofollow(&temp_path, path)?;
+        #[cfg(not(unix))]
+        std::fs::rename(&temp_path, path)?;
+        sync_directory_nofollow(parent)
+    })();
+
+    if result.is_err() {
+        #[cfg(unix)]
+        let _ = crate::path_open::remove_file_nofollow(&temp_path);
+        #[cfg(not(unix))]
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn create_atomic_temp(
+    parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> io::Result<(std::path::PathBuf, std::fs::File)> {
+    for _ in 0..128 {
+        let sequence = ATOMIC_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_name = format!(
+            ".{}.ferric-tmp-{}-{sequence}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        );
+        let temp_path = parent.join(temp_name);
+
+        match crate::path_open::open_file_nofollow(
+            &temp_path,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate exclusive atomic-replace temporary file",
+    ))
+}
+
+#[cfg(unix)]
+fn sync_directory_nofollow(path: &Path) -> io::Result<()> {
+    crate::path_open::open_directory_nofollow(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory_nofollow(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(unix)]
+fn open_file_nofollow(path: &str) -> io::Result<std::fs::File> {
+    let file = crate::path_open::open_file_nofollow(Path::new(path), libc::O_RDONLY, 0)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "read target is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_file_nofollow(path: &str) -> io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "final path component is a symlink",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "read target is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------
@@ -333,13 +796,18 @@ fn fs_rm_rf_async(
         return Ok(t);
     }
 
+    let blocking_task = match async_io::try_spawn_blocking(move || {
+        let p = Path::new(&path);
+        remove_dir_all_idempotent(p)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), (other(), reason)).encode(env)),
+    };
+
     async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let p = Path::new(&path);
-            remove_dir_all_idempotent(p)
-        })
-        .await
-        .unwrap_or_else(|e| Err(io::Error::other(format!("spawn_blocking failed: {e}"))));
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(format!("spawn_blocking failed: {e}"))));
 
         let mut msg_env = OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -489,14 +957,57 @@ mod tests {
         assert_eq!(fs::read(&p).unwrap(), b"hello");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn touch_nofollow_rejects_symlink_without_mutating_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("active.log");
+        fs::write(&target, b"protected").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = touch_file_nofollow(&link).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        assert_eq!(fs::read(target).unwrap(), b"protected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn touch_nofollow_rejects_intermediate_directory_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        let inside = dir.path().join("inside");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&inside).unwrap();
+        std::os::unix::fs::symlink(&outside, inside.join("redirect")).unwrap();
+
+        let redirected = inside.join("redirect/touched");
+        assert!(touch_file_nofollow(&redirected).is_err());
+        assert!(!outside.join("touched").exists());
+    }
+
     #[test]
     fn mkdir_p_is_idempotent_for_existing_directory() {
         let dir = TempDir::new().unwrap();
         let nested = dir.path().join("a/b/c");
-        fs::create_dir_all(&nested).unwrap();
-        // Second call MUST NOT error — this is the contract File.mkdir_p!
-        // provides and that our callers rely on (e.g. ensure_prob_dir).
-        fs::create_dir_all(&nested).unwrap();
+        create_dir_all_nofollow(&nested).unwrap();
+        create_dir_all_nofollow(&nested).unwrap();
+        assert!(nested.is_dir());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mkdir_p_nofollow_allows_macos_root_tmp_alias() {
+        let dir = tempfile::Builder::new()
+            .prefix("ferric-mkdir-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let nested = dir.path().join("nested/path");
+
+        create_dir_all_nofollow(&nested).unwrap();
+
         assert!(nested.is_dir());
     }
 
@@ -506,7 +1017,7 @@ mod tests {
         let file_path = dir.path().join("blocker");
         File::create(&file_path).unwrap();
 
-        let err = fs::create_dir_all(&file_path).unwrap_err();
+        let err = create_dir_all_nofollow(&file_path).unwrap_err();
         // On most POSIX systems this surfaces as AlreadyExists or
         // NotADirectory depending on stdlib version; we just need it
         // to be an error.
@@ -517,6 +1028,25 @@ mod tests {
                 | io::ErrorKind::InvalidInput
                 | io::ErrorKind::NotADirectory
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mkdir_p_nofollow_rejects_intermediate_symlink_escape() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("redirect")).unwrap();
+
+        let error = create_dir_all_nofollow(&base.join("redirect/escaped")).unwrap_err();
+
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::ELOOP || code == libc::ENOTDIR
+        ));
+        assert!(!outside.join("escaped").exists());
     }
 
     #[test]
@@ -691,6 +1221,109 @@ mod tests {
         assert!(path.as_bytes().contains(&0u8));
     }
 
+    #[test]
+    fn append_sync_nofollow_rejects_a_final_symlink() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("log");
+        fs::write(&target, b"protected").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(append_sync_nofollow(&link, b"attack").is_err());
+        assert_eq!(fs::read(target).unwrap(), b"protected");
+    }
+
+    #[test]
+    fn append_sync_nofollow_appends_complete_payloads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log");
+
+        append_sync_nofollow(&path, b"one").unwrap();
+        append_sync_nofollow(&path, b"two").unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"onetwo");
+    }
+
+    #[test]
+    fn bounded_append_rejects_at_the_cap_without_growing_the_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bounded-log");
+        fs::write(&path, b"12345").unwrap();
+
+        let error = append_sync_nofollow_bounded(&path, b"6", 5).unwrap_err();
+
+        assert!(matches!(error, BoundedAppendError::TooLarge { .. }));
+        assert_eq!(fs::read(&path).unwrap(), b"12345");
+    }
+
+    #[test]
+    fn bounded_append_accepts_an_exact_fit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bounded-log");
+        fs::write(&path, b"12").unwrap();
+
+        append_sync_nofollow_bounded(&path, b"345", 5).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"12345");
+    }
+
+    #[test]
+    fn bounded_append_serializes_the_size_check_with_the_write() {
+        let dir = TempDir::new().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("bounded-log"));
+        fs::write(path.as_ref(), b"").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let handles = [b"aaaa".as_slice(), b"bbbb".as_slice()].map(|payload| {
+            let path = std::sync::Arc::clone(&path);
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                append_sync_nofollow_bounded(path.as_ref(), payload, 6)
+            })
+        });
+        barrier.wait();
+
+        let outcomes = handles.map(|handle| handle.join().unwrap());
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, Err(BoundedAppendError::TooLarge { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(fs::metadata(path.as_ref()).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn oversized_bounded_append_does_not_create_a_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bounded-log");
+
+        let error = append_sync_nofollow_bounded(&path, b"123", 2).unwrap_err();
+
+        assert!(matches!(error, BoundedAppendError::TooLarge { .. }));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn atomic_replace_is_bounded_and_replaces_a_symlink_not_its_target() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("metadata");
+        fs::write(&target, b"protected").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        atomic_replace_nofollow(&link, b"new", 3).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"protected");
+        assert_eq!(fs::read(&link).unwrap(), b"new");
+        assert!(!fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+
+        let error = atomic_replace_nofollow(&dir.path().join("bounded"), b"four", 3).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!dir.path().join("bounded").exists());
+    }
+
     // -----------------------------------------------------------------------
     // rm_rf semantics (this is what fs_rm_rf_async delegates to)
     // -----------------------------------------------------------------------
@@ -701,7 +1334,7 @@ mod tests {
         let sub = dir.path().join("empty");
         fs::create_dir(&sub).unwrap();
 
-        fs::remove_dir_all(&sub).unwrap();
+        remove_dir_all_idempotent(&sub).unwrap();
         assert!(!sub.exists());
     }
 
@@ -714,7 +1347,7 @@ mod tests {
         fs::write(root.join("a/b/file"), b"y").unwrap();
         fs::write(root.join("a/b/c/file"), b"z").unwrap();
 
-        fs::remove_dir_all(&root).unwrap();
+        remove_dir_all_idempotent(&root).unwrap();
         assert!(!root.exists());
     }
 
@@ -730,13 +1363,29 @@ mod tests {
         let link = root.join("pointer");
         std::os::unix::fs::symlink(&outside_file, &link).unwrap();
 
-        fs::remove_dir_all(&root).unwrap();
+        remove_dir_all_idempotent(&root).unwrap();
 
         assert!(!root.exists(), "tree must be removed");
         assert!(
             outside_file.exists(),
             "rm_rf must NOT follow symlinks that point outside the tree"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_rf_rejects_an_intermediate_directory_symlink() {
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        let inside = dir.path().join("inside");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&inside).unwrap();
+        fs::create_dir(outside.join("victim")).unwrap();
+        fs::write(outside.join("victim/protected"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, inside.join("redirect")).unwrap();
+
+        assert!(remove_dir_all_idempotent(&inside.join("redirect/victim")).is_err());
+        assert_eq!(fs::read(outside.join("victim/protected")).unwrap(), b"keep");
     }
 
     #[test]

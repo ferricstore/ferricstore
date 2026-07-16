@@ -106,6 +106,60 @@ defmodule Ferricstore.ReplicationModeTest do
     end
   end
 
+  test "marker reader rejects non-canonical outer and inner terms", %{dir: dir} do
+    ReplicationMode.write!(dir, %{
+      replication_mode: :raft,
+      shard_count: 4,
+      padding: String.duplicate("marker", 4_096)
+    })
+
+    path = ReplicationMode.marker_path(dir)
+    encoded = File.read!(path)
+
+    {:ferricstore_cluster_state_v1, payload, _checksum} =
+      :erlang.binary_to_term(encoded, [:safe])
+
+    outer_term = :erlang.binary_to_term(encoded, [:safe])
+    compressed_outer = :erlang.term_to_binary(outer_term, compressed: 9)
+    assert <<131, 80, _rest::binary>> = compressed_outer
+
+    for invalid <- [compressed_outer, encoded <> <<0>>] do
+      File.write!(path, invalid)
+      assert {:error, _reason} = ReplicationMode.read(dir)
+    end
+
+    compressed_payload =
+      payload
+      |> :erlang.binary_to_term([:safe])
+      |> :erlang.term_to_binary(compressed: 9)
+
+    assert <<131, 80, _rest::binary>> = compressed_payload
+
+    for invalid_payload <- [compressed_payload, payload <> <<0>>] do
+      checksum = :crypto.hash(:sha256, invalid_payload)
+
+      File.write!(
+        path,
+        :erlang.term_to_binary({:ferricstore_cluster_state_v1, invalid_payload, checksum})
+      )
+
+      assert {:error, _reason} = ReplicationMode.read(dir)
+    end
+  end
+
+  test "marker reader refuses symlinks and oversized files", %{dir: dir} do
+    path = ReplicationMode.marker_path(dir)
+    target = Path.join(dir, "marker-target")
+    File.write!(target, "not a marker")
+    File.ln_s!(target, path)
+
+    assert {:error, {:symlink, _reason}} = ReplicationMode.read(dir)
+
+    File.rm!(path)
+    File.write!(path, :binary.copy(<<0>>, 1_048_577))
+    assert {:error, {:too_large, _reason}} = ReplicationMode.read(dir)
+  end
+
   defp unknown_atom_payload(atom_name) when is_binary(atom_name) and byte_size(atom_name) < 256 do
     <<131, 119, byte_size(atom_name), atom_name::binary>>
   end

@@ -3,9 +3,10 @@ defmodule Ferricstore.Flow.LMDBWriter.Timer do
 
   @default_lagged_flush_quiet_ms 250
   @default_lagged_flush_max_lag_ms 30_000
+  @max_timer_ms 4_294_967_295
 
   def ensure_timer(%{timer_ref: nil, flush_interval_ms: interval} = state) do
-    delay = interval + timer_jitter_ms(Map.get(state, :flush_jitter_ms, 0))
+    delay = bounded_delay_ms(interval, timer_jitter_ms(Map.get(state, :flush_jitter_ms, 0)))
     %{state | timer_ref: Process.send_after(self(), :flush, delay)}
   end
 
@@ -94,18 +95,34 @@ defmodule Ferricstore.Flow.LMDBWriter.Timer do
     end
   end
 
+  @doc false
+  def __bounded_delay_for_test__(interval_ms, jitter_ms),
+    do: bounded_delay_ms(interval_ms, jitter_ms)
+
   defp elapsed_ms(started_at, now) when is_integer(started_at) and is_integer(now) do
     max(System.convert_time_unit(now - started_at, :native, :millisecond), 0)
   end
 
   defp timer_jitter_ms(jitter_ms) do
-    jitter_ms = normalize_non_negative_integer(jitter_ms, 0)
+    jitter_ms = normalize_bounded_timer_ms(jitter_ms, 0)
 
     if jitter_ms == 0 do
       0
     else
       :erlang.phash2({self(), System.unique_integer([:monotonic])}, jitter_ms + 1)
     end
+  end
+
+  defp bounded_delay_ms(interval_ms, jitter_ms) do
+    interval_ms = normalize_bounded_timer_ms(interval_ms, 0)
+    jitter_ms = normalize_bounded_timer_ms(jitter_ms, 0)
+    min(interval_ms + jitter_ms, @max_timer_ms)
+  end
+
+  defp normalize_bounded_timer_ms(value, default) do
+    value
+    |> normalize_non_negative_integer(default)
+    |> min(@max_timer_ms)
   end
 
   defp normalize_non_negative_integer(value, _default) when is_integer(value) and value >= 0,

@@ -117,6 +117,12 @@ defmodule Ferricstore.Commands.ServerTest do
       assert 0 == store.dbsize.()
     end
 
+    test "FLUSHDB mode is case-insensitive" do
+      store = MockStore.make(%{"a" => {"1", 0}})
+      assert :ok = Server.handle("FLUSHDB", ["async"], store)
+      assert 0 == store.dbsize.()
+    end
+
     test "FLUSHDB then KEYS * returns empty list" do
       store = MockStore.make(%{"a" => {"1", 0}, "b" => {"2", 0}})
       assert :ok = Server.handle("FLUSHDB", [], store)

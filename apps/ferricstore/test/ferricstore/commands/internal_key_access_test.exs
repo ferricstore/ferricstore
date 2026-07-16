@@ -2,9 +2,10 @@ defmodule Ferricstore.Commands.InternalKeyAccessTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.Dispatcher
+  alias Ferricstore.ServerCatalog
   alias Ferricstore.Test.MockStore
 
-  @error "ERR access to internal Flow keys is not allowed"
+  @error "ERR access to internal keys is not allowed"
   @state_key "f:{f}:s:flow-1"
   @history_entry "X:f:{f}:h:flow-1\0" <> "123-4"
 
@@ -68,11 +69,14 @@ defmodule Ferricstore.Commands.InternalKeyAccessTest do
   end
 
   test "generic key enumeration hides Flow state and history keys" do
+    catalog_key = ServerCatalog.revision_key("acl")
+
     store =
       MockStore.make(%{
         "ordinary" => {"value", 0},
         @state_key => {"secret", 0},
-        @history_entry => {"event", 0}
+        @history_entry => {"event", 0},
+        catalog_key => {ServerCatalog.encode_revision(4), 0}
       })
 
     assert ["ordinary"] == Dispatcher.dispatch("KEYS", ["*"], store)

@@ -2,22 +2,27 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
   @moduledoc false
 
   import FerricstoreServer.Health.Dashboard.FlowRecord
-  import FerricstoreServer.Health.Dashboard.QueryParams, only: [dashboard_param: 2]
 
-  def keyspace_acl_username(opts) do
-    case dashboard_param(opts, "acl_username") do
-      username when is_binary(username) ->
-        username
-        |> String.trim()
-        |> case do
-          "" -> nil
-          trimmed -> trimmed
-        end
-
-      _ ->
-        nil
+  def keyspace_acl_username(opts) when is_map(opts) do
+    cond do
+      Map.has_key?(opts, "acl_username") -> binary_acl_username(Map.get(opts, "acl_username"))
+      Map.has_key?(opts, :acl_username) -> binary_acl_username(Map.get(opts, :acl_username))
+      true -> nil
     end
   end
+
+  def keyspace_acl_username(opts) when is_list(opts) do
+    case Enum.find(opts, fn
+           {"acl_username", _value} -> true
+           {:acl_username, _value} -> true
+           _other -> false
+         end) do
+      {_key, username} -> binary_acl_username(username)
+      nil -> nil
+    end
+  end
+
+  def keyspace_acl_username(_opts), do: nil
 
   def keyspace_live_payload_opts(opts) do
     case keyspace_acl_username(opts) do
@@ -36,8 +41,15 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
   def filter_flow_records_for_acl(records, nil), do: records
 
   def filter_flow_records_for_acl(records, username) when is_list(records) do
-    Enum.filter(records, &flow_record_acl_allowed?(&1, username))
+    Enum.filter(records, &flow_record_allowed_for_acl?(&1, username))
   end
+
+  def flow_record_allowed_for_acl?(_record, nil), do: true
+
+  def flow_record_allowed_for_acl?(record, username) when is_binary(username),
+    do: flow_record_acl_allowed?(record, username)
+
+  def flow_record_allowed_for_acl?(_record, _username), do: false
 
   def flow_query_filter_result_for_acl(result, username),
     do: flow_query_filter_result_for_acl(result, username, "*")
@@ -60,7 +72,14 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
   def flow_lineage_filter_result_for_acl(result, nil), do: result
 
   def flow_lineage_filter_result_for_acl(result, username) when is_map(result) do
-    Map.update(result, :records, [], &filter_flow_records_for_acl(&1, username))
+    records =
+      result
+      |> Map.get(:records, [])
+      |> filter_flow_records_for_acl(username)
+
+    result
+    |> Map.put(:records, records)
+    |> Map.put(:message, "#{length(records)} visible record(s)")
   end
 
   def filter_keyspace_rows_for_acl(rows, nil), do: rows
@@ -167,4 +186,7 @@ defmodule FerricstoreServer.Health.Dashboard.Access do
       _other -> [flow_record_id(record)] |> Enum.filter(&(is_binary(&1) and &1 != ""))
     end
   end
+
+  defp binary_acl_username(username) when is_binary(username), do: username
+  defp binary_acl_username(_username), do: nil
 end

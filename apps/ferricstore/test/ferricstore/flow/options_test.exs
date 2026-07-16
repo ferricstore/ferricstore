@@ -42,6 +42,25 @@ defmodule Ferricstore.Flow.OptionsTest do
              {:error, "ERR flow payload must be a boolean"}
   end
 
+  test "integer options reject values above Flow's exact integer ceiling" do
+    max_exact_integer = 9_007_199_254_740_991
+
+    assert Options.required_non_neg_integer([fencing_token: max_exact_integer], :fencing_token) ==
+             {:ok, max_exact_integer}
+
+    assert Options.required_non_neg_integer(
+             [fencing_token: max_exact_integer + 1],
+             :fencing_token
+           ) ==
+             {:error, "ERR flow fencing_token exceeds maximum #{max_exact_integer}"}
+
+    assert Options.optional_non_neg_integer([to_ms: max_exact_integer], :to_ms, nil) ==
+             {:ok, max_exact_integer}
+
+    assert Options.optional_non_neg_integer([to_ms: max_exact_integer + 1], :to_ms, nil) ==
+             {:error, "ERR flow to_ms exceeds maximum #{max_exact_integer}"}
+  end
+
   test "ref size and put helpers preserve existing semantics" do
     assert Options.validate_ref_size(:payload_ref, nil) == :ok
     assert Options.validate_ref_size(:payload_ref, String.duplicate("x", 4_096)) == :ok

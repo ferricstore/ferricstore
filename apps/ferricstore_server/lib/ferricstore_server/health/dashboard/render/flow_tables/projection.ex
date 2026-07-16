@@ -79,7 +79,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowTables.Projection do
         |> then(fn row ->
           failures =
             Map.get(row, :persist_failures, 0) + Map.get(row, :enqueue_failures, 0) +
-              Map.get(row, :flush_failures, 0) + Map.get(row, :degraded, 0)
+              Map.get(row, :flush_failures, 0)
 
           %{row | failures: failures}
         end)

@@ -7,6 +7,10 @@ defmodule Ferricstore.Flow.PolicyCommand do
   alias Ferricstore.Store.Router
 
   @internal_keys [
+    :policy_ref,
+    :policy_refs,
+    :policy_guard,
+    :policy_reference_captured,
     :policy_generation,
     :policy_snapshot,
     :policy_snapshots,
@@ -22,9 +26,6 @@ defmodule Ferricstore.Flow.PolicyCommand do
     :flow_create,
     :flow_create_many,
     :flow_create_pipeline_batch,
-    :flow_cross_spawn_children,
-    :flow_cross_terminal,
-    :flow_cross_terminal_many,
     :flow_fail,
     :flow_fail_many,
     :flow_reschedule,
@@ -33,6 +34,8 @@ defmodule Ferricstore.Flow.PolicyCommand do
     :flow_rewind,
     :flow_run_steps_many,
     :flow_schedule_replace,
+    :flow_signal,
+    :flow_signal_many,
     :flow_spawn_children,
     :flow_start_and_claim,
     :flow_start_and_claim_pipeline_batch,
@@ -44,16 +47,6 @@ defmodule Ferricstore.Flow.PolicyCommand do
   ]
 
   @spec requires_stamp?(tuple()) :: boolean()
-  def requires_stamp?({:cross_shard_tx, shard_batches}) when is_list(shard_batches),
-    do: shard_batches_require_stamp?(shard_batches)
-
-  def requires_stamp?({:cross_shard_tx, shard_batches, _watched_keys})
-      when is_list(shard_batches),
-      do: shard_batches_require_stamp?(shard_batches)
-
-  def requires_stamp?({:flow_shared_ref_write, _shard_index, command}) when is_tuple(command),
-    do: requires_stamp?(command)
-
   def requires_stamp?(command) when is_tuple(command) and tuple_size(command) > 0,
     do: policy_sensitive_op?(elem(command, 0))
 
@@ -62,25 +55,6 @@ defmodule Ferricstore.Flow.PolicyCommand do
   @spec policy_sensitive_op?(term()) :: boolean()
   def policy_sensitive_op?(op) when op in @flow_commands, do: true
   def policy_sensitive_op?(_op), do: false
-
-  defp shard_batches_require_stamp?(shard_batches) do
-    Enum.any?(shard_batches, fn
-      {_shard_index, queue, _namespace} when is_list(queue) ->
-        Enum.any?(queue, &queue_entry_requires_stamp?/1)
-
-      _invalid ->
-        false
-    end)
-  end
-
-  defp queue_entry_requires_stamp?({index, command})
-       when is_integer(index) and is_tuple(command),
-       do: requires_stamp?(command)
-
-  defp queue_entry_requires_stamp?(command) when is_tuple(command),
-    do: requires_stamp?(command)
-
-  defp queue_entry_requires_stamp?(_entry), do: false
 
   @spec stamp(FerricStore.Instance.t(), tuple()) :: {:ok, tuple()} | {:error, binary()}
   def stamp(ctx, command) when is_tuple(command) do
@@ -91,23 +65,32 @@ defmodule Ferricstore.Flow.PolicyCommand do
     end
   end
 
+  def stamp(_ctx, _command), do: {:error, "ERR flow command must be a tuple"}
+
   defp do_stamp(ctx, command) do
-    with {:ok, stamped, _cache} <- stamp_command(ctx, command, %{}),
+    with {:ok, stamped, cache} <- stamp_command(ctx, command, %{}),
+         :ok <- validate_cached_policy_size(cache),
          :ok <- validate_stamped_snapshot_size(stamped),
-         :ok <- validate_stamped_snapshot_occurrence_size(stamped) do
-      {:ok, stamped}
+         fenced = fence_command(stamped, policy_installs(cache)),
+         :ok <- validate_stamped_snapshot_occurrence_size(fenced) do
+      {:ok, fenced}
     end
   end
 
   @spec stamp_many(FerricStore.Instance.t(), [{binary(), tuple()}]) ::
           {:ok, [{binary(), tuple()}]} | {:error, binary()}
   def stamp_many(ctx, keyed_commands) when is_list(keyed_commands) do
-    if Enum.any?(keyed_commands, fn {_key, command} -> requires_stamp?(command) end) do
-      do_stamp_many(ctx, keyed_commands)
-    else
-      {:ok, keyed_commands}
+    with :ok <- validate_keyed_commands(keyed_commands) do
+      if Enum.any?(keyed_commands, fn {_key, command} -> requires_stamp?(command) end) do
+        do_stamp_many(ctx, keyed_commands)
+      else
+        {:ok, keyed_commands}
+      end
     end
   end
+
+  def stamp_many(_ctx, _keyed_commands),
+    do: {:error, "ERR flow keyed commands must be a list"}
 
   defp do_stamp_many(ctx, keyed_commands) do
     keyed_commands
@@ -124,33 +107,17 @@ defmodule Ferricstore.Flow.PolicyCommand do
       end
     end)
     |> case do
-      {:ok, stamped, _cache} ->
+      {:ok, stamped, cache} ->
         stamped = Enum.reverse(stamped)
+        stamped = fence_keyed_commands(ctx, stamped, cache)
 
-        with :ok <- validate_stamped_batch_snapshot_size(stamped) do
+        with :ok <- validate_cached_policy_size(cache),
+             :ok <- validate_stamped_batch_snapshot_size(stamped) do
           {:ok, stamped}
         end
 
       {:error, _reason} = error ->
         error
-    end
-  end
-
-  defp stamp_command(ctx, {:cross_shard_tx, shard_batches}, cache) do
-    with {:ok, stamped, cache} <- stamp_shard_batches(ctx, shard_batches, cache) do
-      {:ok, {:cross_shard_tx, stamped}, cache}
-    end
-  end
-
-  defp stamp_command(ctx, {:cross_shard_tx, shard_batches, watched_keys}, cache) do
-    with {:ok, stamped, cache} <- stamp_shard_batches(ctx, shard_batches, cache) do
-      {:ok, {:cross_shard_tx, stamped, watched_keys}, cache}
-    end
-  end
-
-  defp stamp_command(ctx, {:flow_shared_ref_write, shard_index, command}, cache) do
-    with {:ok, stamped, cache} <- stamp_command(ctx, command, cache) do
-      {:ok, {:flow_shared_ref_write, shard_index, stamped}, cache}
     end
   end
 
@@ -161,83 +128,48 @@ defmodule Ferricstore.Flow.PolicyCommand do
     op = elem(command, 0)
     attrs = elem(command, tuple_size(command) - 1)
 
-    if policy_sensitive_op?(op) and is_map(attrs) do
-      with {:ok, attrs, cache} <- stamp_attrs(ctx, attrs, cache) do
-        attrs =
-          attrs
-          |> compact_nested_policy_snapshots()
-          |> Map.put(:policy_snapshot_captured, true)
+    if policy_sensitive_op?(op) do
+      if is_map(attrs) do
+        with {:ok, attrs, cache} <- stamp_attrs(ctx, attrs, cache) do
+          attrs =
+            attrs
+            |> compact_nested_policy_refs()
+            |> Map.put(:policy_reference_captured, true)
 
-        {:ok, put_elem(command, tuple_size(command) - 1, attrs), cache}
+          {:ok, put_elem(command, tuple_size(command) - 1, attrs), cache}
+        end
+      else
+        {:error, "ERR flow policy-sensitive command attrs must be a map"}
       end
     else
       {:ok, command, cache}
     end
   end
 
-  defp stamp_shard_batches(ctx, shard_batches, cache) when is_list(shard_batches) do
-    shard_batches
-    |> Enum.reduce_while({:ok, [], cache}, fn
-      {shard_index, queue, namespace}, {:ok, batches, cache} when is_list(queue) ->
-        case stamp_queue(ctx, queue, cache) do
-          {:ok, stamped, cache} ->
-            {:cont, {:ok, [{shard_index, stamped, namespace} | batches], cache}}
-
-          {:error, _reason} = error ->
-            {:halt, error}
-        end
-
-      _invalid, _acc ->
-        {:halt, {:error, "ERR invalid cross-shard Flow command"}}
-    end)
-    |> case do
-      {:ok, batches, cache} -> {:ok, Enum.reverse(batches), cache}
-      {:error, _reason} = error -> error
+  defp validate_keyed_commands(keyed_commands) do
+    if Enum.all?(keyed_commands, fn
+         {key, command} when is_binary(key) and is_tuple(command) -> true
+         _entry -> false
+       end) do
+      :ok
+    else
+      {:error, "ERR flow keyed command must be a {binary_key, tuple_command} pair"}
     end
   end
-
-  defp stamp_queue(ctx, queue, cache) do
-    queue
-    |> Enum.reduce_while({:ok, [], cache}, fn entry, {:ok, entries, cache} ->
-      case stamp_queue_entry(ctx, entry, cache) do
-        {:ok, stamped, cache} -> {:cont, {:ok, [stamped | entries], cache}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, entries, cache} -> {:ok, Enum.reverse(entries), cache}
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp stamp_queue_entry(ctx, {index, command}, cache)
-       when is_integer(index) and is_tuple(command) do
-    with {:ok, stamped, cache} <- stamp_command(ctx, command, cache) do
-      {:ok, {index, stamped}, cache}
-    end
-  end
-
-  defp stamp_queue_entry(ctx, command, cache) when is_tuple(command),
-    do: stamp_command(ctx, command, cache)
-
-  defp stamp_queue_entry(_ctx, entry, cache), do: {:ok, entry, cache}
 
   defp stamp_attrs(ctx, attrs, cache) do
     attrs = Map.drop(attrs, @internal_keys)
 
     with {:ok, attrs, cache} <- stamp_attrs_list(ctx, attrs, :records, cache),
          {:ok, attrs, cache} <- stamp_attrs_list(ctx, attrs, :children, cache),
-         {:ok, type} <- attrs_type(ctx, attrs) do
-      case type do
+         {:ok, target} <- attrs_policy_target(ctx, attrs) do
+      case target do
         nil ->
           {:ok, attrs, cache}
 
-        type ->
-          with {:ok, snapshot, cache} <- policy_snapshot(ctx, type, cache) do
-            stamped =
-              attrs
-              |> Map.put(:policy_generation, snapshot.generation)
-              |> Map.put(:policy_snapshot, snapshot.policy)
+        %{type: type} = target ->
+          with {:ok, policy_ref, cache} <- policy_reference(ctx, type, cache) do
+            stamped = attrs |> Map.put(:policy_ref, policy_ref) |> maybe_put_policy_guard(target)
 
             {:ok, stamped, cache}
           end
@@ -245,51 +177,49 @@ defmodule Ferricstore.Flow.PolicyCommand do
     end
   end
 
-  defp compact_nested_policy_snapshots(attrs) do
+  defp compact_nested_policy_refs(attrs) do
     if Enum.any?([:records, :children], fn key -> is_list(Map.get(attrs, key)) end) do
-      {attrs, snapshots} = extract_nested_policy_snapshots(attrs, %{})
+      {attrs, refs} = extract_nested_policy_refs(attrs, %{})
 
-      if map_size(snapshots) == 0 do
+      if map_size(refs) == 0 do
         attrs
       else
-        Map.put(attrs, :policy_snapshots, snapshots)
+        Map.put(attrs, :policy_refs, refs)
       end
     else
       attrs
     end
   end
 
-  defp extract_nested_policy_snapshots(attrs, snapshots) do
-    {attrs, snapshots} = extract_direct_policy_snapshot(attrs, snapshots)
+  defp extract_nested_policy_refs(attrs, refs) do
+    {attrs, refs} = extract_direct_policy_ref(attrs, refs)
 
-    Enum.reduce([:records, :children], {attrs, snapshots}, fn key, {attrs, snapshots} ->
+    Enum.reduce([:records, :children], {attrs, refs}, fn key, {attrs, refs} ->
       case Map.get(attrs, key) do
         entries when is_list(entries) ->
-          {entries, snapshots} =
-            Enum.map_reduce(entries, snapshots, fn
-              entry, acc when is_map(entry) -> extract_nested_policy_snapshots(entry, acc)
+          {entries, refs} =
+            Enum.map_reduce(entries, refs, fn
+              entry, acc when is_map(entry) -> extract_nested_policy_refs(entry, acc)
               entry, acc -> {entry, acc}
             end)
 
-          {Map.put(attrs, key, entries), snapshots}
+          {Map.put(attrs, key, entries), refs}
 
         _other ->
-          {attrs, snapshots}
+          {attrs, refs}
       end
     end)
   end
 
-  defp extract_direct_policy_snapshot(attrs, snapshots) do
-    case {Map.get(attrs, :policy_generation), Map.get(attrs, :policy_snapshot)} do
-      {generation, %{type: type} = policy}
-      when is_integer(generation) and generation >= 0 and is_binary(type) and type != "" ->
-        snapshot = %{generation: generation, policy: policy}
-
-        {Map.drop(attrs, [:policy_generation, :policy_snapshot]),
-         Map.put(snapshots, type, snapshot)}
+  defp extract_direct_policy_ref(attrs, refs) do
+    case Map.get(attrs, :policy_ref) do
+      %{type: type, generation: generation, digest: digest} = policy_ref
+      when is_binary(type) and type != "" and is_integer(generation) and generation >= 0 and
+             is_binary(digest) and byte_size(digest) == 32 ->
+        {Map.delete(attrs, :policy_ref), Map.put(refs, type, policy_ref)}
 
       _none ->
-        {attrs, snapshots}
+        {attrs, refs}
     end
   end
 
@@ -317,10 +247,13 @@ defmodule Ferricstore.Flow.PolicyCommand do
     end
   end
 
-  defp attrs_type(_ctx, %{type: type}) when is_binary(type) and type != "", do: {:ok, type}
+  defp attrs_policy_target(_ctx, %{type: type}) when is_binary(type) and type != "",
+    do: {:ok, %{type: type}}
 
-  defp attrs_type(ctx, %{id: id} = attrs) when is_binary(id) and id != "" do
-    case Router.flow_get_with_status(ctx, id, Map.get(attrs, :partition_key)) do
+  defp attrs_policy_target(ctx, %{id: id} = attrs) when is_binary(id) and id != "" do
+    partition_key = Map.get(attrs, :partition_key)
+
+    case Router.flow_get_with_status(ctx, id, partition_key) do
       nil ->
         {:ok, nil}
 
@@ -330,8 +263,23 @@ defmodule Ferricstore.Flow.PolicyCommand do
       value when is_binary(value) ->
         try do
           case Flow.decode_record(value) do
-            %{type: type} when is_binary(type) and type != "" -> {:ok, type}
-            _record -> {:error, "ERR stored flow type is invalid"}
+            %{type: type, incarnation: incarnation}
+            when is_binary(type) and type != "" and is_integer(incarnation) and incarnation >= 0 ->
+              {:ok,
+               %{
+                 type: type,
+                 guard: %{
+                   state_key: Keys.state_key(id, partition_key),
+                   type: type,
+                   incarnation: incarnation
+                 }
+               }}
+
+            %{type: type} when is_binary(type) and type != "" ->
+              {:error, "ERR stored flow incarnation is invalid"}
+
+            _record ->
+              {:error, "ERR stored flow type is invalid"}
           end
         rescue
           _error -> {:error, "ERR stored flow record is corrupt"}
@@ -342,29 +290,37 @@ defmodule Ferricstore.Flow.PolicyCommand do
     end
   end
 
-  defp attrs_type(_ctx, _attrs), do: {:ok, nil}
+  defp attrs_policy_target(_ctx, _attrs), do: {:ok, nil}
 
-  defp policy_snapshot(ctx, type, cache) do
+  defp maybe_put_policy_guard(attrs, %{guard: guard}) when is_map(guard),
+    do: Map.put(attrs, :policy_guard, guard)
+
+  defp maybe_put_policy_guard(attrs, _target), do: attrs
+
+  defp policy_reference(ctx, type, cache) do
     case Map.fetch(cache, type) do
-      {:ok, snapshot} ->
-        {:ok, snapshot, cache}
+      {:ok, %{ref: policy_ref}} ->
+        {:ok, policy_ref, cache}
 
       :error ->
-        with {:ok, snapshot} <- read_policy_snapshot(ctx, type) do
-          {:ok, snapshot, Map.put(cache, type, snapshot)}
+        with {:ok, policy_ref, policy, encoded} <- read_policy_reference(ctx, type) do
+          entry = %{ref: policy_ref, policy: policy, encoded: encoded}
+          {:ok, policy_ref, Map.put(cache, type, entry)}
         end
     end
   end
 
-  defp read_policy_snapshot(ctx, type) do
+  defp read_policy_reference(ctx, type) do
     case Router.read_shard_value(ctx, 0, Keys.policy_key(type)) do
       {:ok, nil} ->
-        {:ok, %{generation: 0, policy: %{type: type}}}
+        policy = %{type: type}
+        encoded = RetryPolicy.encode_flow_policy(policy, 0)
+        {:ok, build_policy_ref(type, 0, encoded), policy, encoded}
 
       {:ok, value} when is_binary(value) ->
         case RetryPolicy.decode_flow_policy_entry(value) do
           {:ok, {generation, %{type: ^type} = policy}} ->
-            {:ok, %{generation: generation, policy: policy}}
+            {:ok, build_policy_ref(type, generation, value), policy, value}
 
           _invalid ->
             {:error, "ERR flow policy is corrupt"}
@@ -378,9 +334,65 @@ defmodule Ferricstore.Flow.PolicyCommand do
     end
   end
 
+  defp build_policy_ref(type, generation, encoded) do
+    %{type: type, generation: generation, digest: :crypto.hash(:sha256, encoded)}
+  end
+
+  defp policy_installs(cache) do
+    cache
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(fn {type, %{encoded: encoded}} -> {Keys.policy_key(type), encoded, 0} end)
+  end
+
+  defp fence_command(command, []), do: command
+
+  defp fence_command(command, installs),
+    do: {:flow_policy_fence, installs, command}
+
+  defp fence_keyed_commands(ctx, keyed_commands, cache) do
+    {fenced, _seen} =
+      Enum.map_reduce(keyed_commands, MapSet.new(), fn {key, command}, seen ->
+        shard_index = policy_command_shard(ctx, key)
+
+        {installs, seen} =
+          command
+          |> stamped_policy_refs(%{})
+          |> Map.keys()
+          |> Enum.sort()
+          |> Enum.reduce({[], seen}, fn type, {installs, seen} ->
+            identity = {shard_index, type}
+
+            if MapSet.member?(seen, identity) do
+              {installs, seen}
+            else
+              encoded = cache |> Map.fetch!(type) |> Map.fetch!(:encoded)
+              install = {Keys.policy_key(type), encoded, 0}
+              {[install | installs], MapSet.put(seen, identity)}
+            end
+          end)
+
+        {{key, fence_command(command, Enum.reverse(installs))}, seen}
+      end)
+
+    fenced
+  end
+
+  defp policy_command_shard(%{slot_map: slot_map} = ctx, key)
+       when is_tuple(slot_map) and is_binary(key),
+       do: Router.shard_for(ctx, key)
+
+  defp policy_command_shard(_ctx, _key), do: 0
+
+  defp validate_cached_policy_size(cache) do
+    cache
+    |> Map.values()
+    |> Enum.map(& &1.policy)
+    |> RetryPolicy.validate_flow_policy_snapshots_size()
+  end
+
   defp validate_stamped_snapshot_size(command) do
     command
-    |> stamped_snapshot_policies(%{})
+    |> stamped_policy_refs(%{})
     |> Map.values()
     |> RetryPolicy.validate_flow_policy_snapshots_size()
   end
@@ -400,14 +412,10 @@ defmodule Ferricstore.Flow.PolicyCommand do
     |> RetryPolicy.validate_flow_policy_snapshot_batch_size()
   end
 
-  defp stamped_snapshot_occurrence_bytes({:cross_shard_tx, shard_batches}),
-    do: stamped_shard_batch_occurrence_bytes(shard_batches)
-
-  defp stamped_snapshot_occurrence_bytes({:cross_shard_tx, shard_batches, _watched_keys}),
-    do: stamped_shard_batch_occurrence_bytes(shard_batches)
-
-  defp stamped_snapshot_occurrence_bytes({:flow_shared_ref_write, _shard_index, command}),
-    do: stamped_snapshot_occurrence_bytes(command)
+  defp stamped_snapshot_occurrence_bytes({:flow_policy_fence, installs, command})
+       when is_list(installs) do
+    :erlang.external_size(installs) + stamped_snapshot_occurrence_bytes(command)
+  end
 
   defp stamped_snapshot_occurrence_bytes(command)
        when is_tuple(command) and tuple_size(command) > 0 do
@@ -419,39 +427,19 @@ defmodule Ferricstore.Flow.PolicyCommand do
 
   defp stamped_snapshot_occurrence_bytes(_command), do: 0
 
-  defp stamped_shard_batch_occurrence_bytes(shard_batches) when is_list(shard_batches) do
-    Enum.reduce(shard_batches, 0, fn
-      {_shard_index, queue, _namespace}, total when is_list(queue) ->
-        total +
-          Enum.reduce(queue, 0, fn
-            {_index, command}, acc when is_tuple(command) ->
-              acc + stamped_snapshot_occurrence_bytes(command)
-
-            command, acc when is_tuple(command) ->
-              acc + stamped_snapshot_occurrence_bytes(command)
-
-            _entry, acc ->
-              acc
-          end)
-
-      _invalid, total ->
-        total
-    end)
-  end
-
   defp stamped_attrs_occurrence_bytes(attrs) do
     direct_size =
-      case Map.get(attrs, :policy_snapshot) do
-        policy when is_map(policy) -> :erlang.external_size(policy)
+      case Map.get(attrs, :policy_ref) do
+        policy_ref when is_map(policy_ref) -> :erlang.external_size(policy_ref)
         _none -> 0
       end
 
     compact_size =
-      case Map.get(attrs, :policy_snapshots) do
-        snapshots when is_map(snapshots) ->
-          Enum.reduce(snapshots, 0, fn
-            {_type, %{policy: policy}}, total when is_map(policy) ->
-              total + :erlang.external_size(policy)
+      case Map.get(attrs, :policy_refs) do
+        refs when is_map(refs) ->
+          Enum.reduce(refs, 0, fn
+            {_type, policy_ref}, total when is_map(policy_ref) ->
+              total + :erlang.external_size(policy_ref)
 
             _invalid, total ->
               total
@@ -464,69 +452,38 @@ defmodule Ferricstore.Flow.PolicyCommand do
     direct_size + compact_size
   end
 
-  defp stamped_snapshot_policies({:cross_shard_tx, shard_batches}, policies),
-    do: stamped_shard_batch_policies(shard_batches, policies)
+  defp stamped_policy_refs({:flow_policy_fence, _installs, command}, refs),
+    do: stamped_policy_refs(command, refs)
 
-  defp stamped_snapshot_policies(
-         {:cross_shard_tx, shard_batches, _watched_keys},
-         policies
-       ),
-       do: stamped_shard_batch_policies(shard_batches, policies)
-
-  defp stamped_snapshot_policies(
-         {:flow_shared_ref_write, _shard_index, command},
-         policies
-       ),
-       do: stamped_snapshot_policies(command, policies)
-
-  defp stamped_snapshot_policies(command, policies)
+  defp stamped_policy_refs(command, refs)
        when is_tuple(command) and tuple_size(command) > 0 do
     case elem(command, tuple_size(command) - 1) do
-      attrs when is_map(attrs) -> stamped_attrs_policies(attrs, policies)
-      _other -> policies
+      attrs when is_map(attrs) -> stamped_attrs_policy_refs(attrs, refs)
+      _other -> refs
     end
   end
 
-  defp stamped_snapshot_policies(_command, policies), do: policies
+  defp stamped_policy_refs(_command, refs), do: refs
 
-  defp stamped_shard_batch_policies(shard_batches, policies) when is_list(shard_batches) do
-    Enum.reduce(shard_batches, policies, fn
-      {_shard_index, queue, _namespace}, acc when is_list(queue) ->
-        Enum.reduce(queue, acc, fn
-          {_index, command}, inner when is_tuple(command) ->
-            stamped_snapshot_policies(command, inner)
-
-          command, inner when is_tuple(command) ->
-            stamped_snapshot_policies(command, inner)
-
-          _entry, inner ->
-            inner
-        end)
-
-      _invalid, acc ->
-        acc
-    end)
-  end
-
-  defp stamped_attrs_policies(attrs, policies) do
-    policies =
-      case Map.get(attrs, :policy_snapshot) do
-        %{type: type} = policy when is_binary(type) and type != "" ->
-          Map.put(policies, type, policy)
+  defp stamped_attrs_policy_refs(attrs, refs) do
+    refs =
+      case Map.get(attrs, :policy_ref) do
+        %{type: type} = policy_ref when is_binary(type) and type != "" ->
+          Map.put(refs, type, policy_ref)
 
         _none ->
-          policies
+          refs
       end
 
-    case Map.get(attrs, :policy_snapshots) do
-      snapshots when is_map(snapshots) ->
-        Enum.reduce(snapshots, policies, fn
-          {type, %{policy: %{type: type} = policy}}, acc -> Map.put(acc, type, policy)
+    case Map.get(attrs, :policy_refs) do
+      policy_refs when is_map(policy_refs) ->
+        Enum.reduce(policy_refs, refs, fn
+          {type, %{type: type} = policy_ref}, acc -> Map.put(acc, type, policy_ref)
           _invalid, acc -> acc
         end)
 
       _none ->
-        policies
+        refs
     end
   end
 end

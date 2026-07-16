@@ -14,6 +14,7 @@ defmodule Ferricstore.PubSub.ActivityLog do
   @default_max_len 512
   @default_read_count 128
   @max_read_count 500
+  @max_metadata_bytes 256
 
   @type entry :: %{
           id: non_neg_integer(),
@@ -62,11 +63,7 @@ defmodule Ferricstore.PubSub.ActivityLog do
     count = bounded_count(count)
 
     if table_ready?() do
-      @table
-      |> :ets.tab2list()
-      |> Enum.sort_by(fn {id, _entry} -> id end, :desc)
-      |> Enum.take(count)
-      |> Enum.map(fn {id, entry} -> Map.put(entry, :id, id) end)
+      newest_entries(:ets.last(@table), count, [])
     else
       []
     end
@@ -181,6 +178,21 @@ defmodule Ferricstore.PubSub.ActivityLog do
     end
   end
 
+  defp newest_entries(:"$end_of_table", _remaining, acc), do: Enum.reverse(acc)
+  defp newest_entries(_id, 0, acc), do: Enum.reverse(acc)
+
+  defp newest_entries(id, remaining, acc) do
+    previous_id = :ets.prev(@table, id)
+
+    case :ets.lookup(@table, id) do
+      [{^id, entry}] ->
+        newest_entries(previous_id, remaining - 1, [Map.put(entry, :id, id) | acc])
+
+      [] ->
+        newest_entries(previous_id, remaining, acc)
+    end
+  end
+
   defp bounded_count(nil), do: @default_read_count
   defp bounded_count(count) when is_integer(count), do: count |> max(0) |> min(@max_read_count)
   defp bounded_count(_count), do: @default_read_count
@@ -192,6 +204,16 @@ defmodule Ferricstore.PubSub.ActivityLog do
     normalize_binary(target) <> suffix
   end
 
-  defp normalize_binary(value) when is_binary(value), do: value
-  defp normalize_binary(value), do: to_string(value)
+  defp normalize_binary(value) when not is_binary(value),
+    do: value |> to_string() |> normalize_binary()
+
+  defp normalize_binary(value) when byte_size(value) <= @max_metadata_bytes do
+    :binary.copy(value)
+  end
+
+  defp normalize_binary(value) do
+    omitted = byte_size(value) - @max_metadata_bytes
+    prefix = value |> binary_part(0, @max_metadata_bytes) |> :binary.copy()
+    prefix <> "...[#{omitted} more bytes]"
+  end
 end

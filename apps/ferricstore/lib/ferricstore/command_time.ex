@@ -28,7 +28,8 @@ defmodule Ferricstore.CommandTime do
   Runs `fun` with a stamped Raft apply time visible to command modules.
   """
   @spec with_now_ms(non_neg_integer(), (-> result)) :: result when result: term()
-  def with_now_ms(now_ms, fun) when is_integer(now_ms) and is_function(fun, 0) do
+  def with_now_ms(now_ms, fun)
+      when is_integer(now_ms) and now_ms >= 0 and is_function(fun, 0) do
     previous = Process.get(@apply_now_key, @apply_now_unset)
     Process.put(@apply_now_key, now_ms)
 

@@ -1,10 +1,13 @@
 defmodule Ferricstore.Commands.Generic do
+  alias Ferricstore.Commands.CompoundSnapshot
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.TypeRegistry
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
+  @max_scan_count 10_000
 
   @moduledoc """
   Handles Redis generic key commands: TYPE, UNLINK, RENAME, RENAMENX, COPY,
@@ -59,7 +62,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("TYPE", [key], store) do
-    {:simple, TypeRegistry.get_type(key, store)}
+    type_key(key, store)
   end
 
   def handle("TYPE", _args, _store) do
@@ -191,9 +194,12 @@ defmodule Ferricstore.Commands.Generic do
   # WAIT
   # ---------------------------------------------------------------------------
 
-  def handle("WAIT", [_numreplicas, _timeout], _store) do
-    # No replication support yet -- return 0 immediately.
-    0
+  def handle("WAIT", [numreplicas_str, timeout_str], _store) do
+    with {:ok, _numreplicas} <- parse_wait_integer(numreplicas_str),
+         {:ok, _timeout} <- parse_wait_integer(timeout_str) do
+      # Replica-offset tracking is not exposed at this command boundary yet.
+      0
+    end
   end
 
   def handle("WAIT", _args, _store) do
@@ -203,7 +209,7 @@ defmodule Ferricstore.Commands.Generic do
   @spec handle_ast(term(), map()) :: term()
   def handle_ast(ast, store)
 
-  def handle_ast({:type, key}, store), do: {:simple, TypeRegistry.get_type(key, store)}
+  def handle_ast({:type, key}, store), do: type_key(key, store)
 
   def handle_ast({:unlink, keys}, store) when is_list(keys) and keys != [] do
     Ferricstore.Commands.Strings.handle_ast({:del, keys}, store)
@@ -243,15 +249,33 @@ defmodule Ferricstore.Commands.Generic do
   def handle_ast({:object, :idletime, key}, store), do: do_object("IDLETIME", [key], store)
   def handle_ast({:object, :refcount, key}, store), do: do_object("REFCOUNT", [key], store)
   def handle_ast({:object, :help}, store), do: do_object("HELP", [], store)
-  def handle_ast({:wait, _numreplicas, _timeout}, _store), do: 0
+  def handle_ast({:wait, {:error, reason}, _timeout}, _store), do: {:error, reason}
+  def handle_ast({:wait, _numreplicas, {:error, reason}}, _store), do: {:error, reason}
+
+  def handle_ast({:wait, numreplicas, timeout}, _store)
+      when is_integer(numreplicas) and numreplicas >= 0 and is_integer(timeout) and timeout >= 0,
+      do: 0
+
+  def handle_ast({:wait, _numreplicas, _timeout}, _store),
+    do: {:error, "ERR value is not an integer or out of range"}
 
   def handle_ast(_ast, _store), do: {:error, "ERR unsupported generic command AST"}
+
+  defp type_key(key, store) do
+    case TypeRegistry.get_type(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      type -> {:simple, type}
+    end
+  end
 
   defp rename_key(key, newkey, store) do
     CrossShardOp.execute(
       [{key, :read_write}, {newkey, :write}],
       fn unified_store ->
         case key_meta(unified_store, key) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
           nil ->
             {:error, "ERR no such key"}
 
@@ -260,6 +284,9 @@ defmodule Ferricstore.Commands.Generic do
 
           _expire_at_ms ->
             case key_entry(unified_store, key) do
+              {:error, {:storage_read_failed, _reason}} = failure ->
+                ReadResult.command_error(failure)
+
               nil ->
                 {:error, "ERR no such key"}
 
@@ -282,6 +309,9 @@ defmodule Ferricstore.Commands.Generic do
       [{key, :read_write}, {newkey, :write}],
       fn unified_store ->
         case key_meta(unified_store, key) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
           nil ->
             {:error, "ERR no such key"}
 
@@ -290,19 +320,27 @@ defmodule Ferricstore.Commands.Generic do
             0
 
           _expire_at_ms ->
-            if key_exists?(unified_store, newkey) do
-              0
-            else
-              case key_entry(unified_store, key) do
-                nil ->
-                  {:error, "ERR no such key"}
+            case key_exists?(unified_store, newkey) do
+              {:error, {:storage_read_failed, _reason}} = failure ->
+                ReadResult.command_error(failure)
 
-                entry ->
-                  case rename_entry(key, newkey, entry, unified_store) do
-                    :ok -> 1
-                    {:error, _} = error -> error
-                  end
-              end
+              {:ok, true} ->
+                0
+
+              {:ok, false} ->
+                case key_entry(unified_store, key) do
+                  {:error, {:storage_read_failed, _reason}} = failure ->
+                    ReadResult.command_error(failure)
+
+                  nil ->
+                    {:error, "ERR no such key"}
+
+                  entry ->
+                    case rename_entry(key, newkey, entry, unified_store) do
+                      :ok -> 1
+                      {:error, _} = error -> error
+                    end
+                end
             end
         end
       end,
@@ -314,6 +352,7 @@ defmodule Ferricstore.Commands.Generic do
 
   defp key_meta(store, key) do
     case Ops.expire_at_ms(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
       nil -> compound_expire_at_ms(store, key)
       expire_at_ms -> expire_at_ms
     end
@@ -322,8 +361,12 @@ defmodule Ferricstore.Commands.Generic do
   defp compound_expire_at_ms(store, key) do
     if Ops.has_compound?(store) do
       case Ops.compound_get_meta(store, key, CompoundKey.type_key(key)) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          failure
+
         nil ->
           case Ops.compound_get_meta(store, key, CompoundKey.list_meta_key(key)) do
+            {:error, {:storage_read_failed, _reason}} = failure -> failure
             nil -> nil
             {_meta, expire_at_ms} -> live_compound_expire_at_ms(store, key, "list", expire_at_ms)
           end
@@ -335,20 +378,45 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp live_compound_expire_at_ms(store, key, expected_type, expire_at_ms) do
-    if TypeRegistry.get_type(key, store) == expected_type do
-      expire_at_ms
+    case TypeRegistry.get_type(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      ^expected_type -> expire_at_ms
+      _other -> nil
     end
   end
 
   defp random_key(store) do
-    case Ops.keys(store) |> CompoundKey.user_visible_keys() do
-      [] -> nil
-      keys -> Enum.random(keys)
+    case Ops.random_key(store) do
+      {:ok, key} ->
+        key
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      {:error, reason} ->
+        ReadResult.command_error(ReadResult.failure(reason))
+
+      :unsupported ->
+        random_key_from_full_key_list(store)
+    end
+  end
+
+  defp random_key_from_full_key_list(store) do
+    case Ops.keys(store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      keys ->
+        case CompoundKey.user_visible_keys(keys) do
+          [] -> nil
+          visible_keys -> Enum.random(visible_keys)
+        end
     end
   end
 
   defp expiretime_key(key, store) do
     case key_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       nil -> -2
       0 -> -1
       expire_at_ms -> div(expire_at_ms, 1_000)
@@ -357,6 +425,7 @@ defmodule Ferricstore.Commands.Generic do
 
   defp pexpiretime_key(key, store) do
     case key_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       nil -> -2
       0 -> -1
       expire_at_ms -> expire_at_ms
@@ -369,6 +438,9 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_object("ENCODING", [key], store) do
     case TypeRegistry.get_type(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       "none" ->
         {:error, "ERR no such key"}
 
@@ -412,41 +484,57 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_object("FREQ", [key], store) do
-    if object_exists?(store, key) do
-      case Ops.object_lfu(store, key) do
-        packed_lfu when is_integer(packed_lfu) ->
-          Ferricstore.Store.LFU.effective_counter(packed_lfu)
+    case object_exists?(store, key) do
+      {:ok, true} ->
+        case Ops.object_lfu(store, key) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
 
-        _ ->
-          0
-      end
-    else
-      {:error, "ERR no such key"}
+          packed_lfu when is_integer(packed_lfu) ->
+            Ferricstore.Store.LFU.effective_counter(packed_lfu)
+
+          _ ->
+            0
+        end
+
+      {:ok, false} ->
+        {:error, "ERR no such key"}
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
     end
   end
 
   defp do_object("IDLETIME", [key], store) do
-    if object_exists?(store, key) do
-      case Ops.object_lfu(store, key) do
+    case object_exists?(store, key) do
+      {:ok, true} ->
+        case Ops.object_lfu(store, key) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
         packed_lfu when is_integer(packed_lfu) ->
-          {ldt, _counter} = Ferricstore.Store.LFU.unpack(packed_lfu)
-          now_min = Ferricstore.Store.LFU.now_minutes()
-          elapsed = Ferricstore.Store.LFU.elapsed_minutes(now_min, ldt)
-          elapsed * 60
+            {ldt, _counter} = Ferricstore.Store.LFU.unpack(packed_lfu)
+            now_min = Ferricstore.Store.LFU.now_minutes()
+            elapsed = Ferricstore.Store.LFU.elapsed_minutes(now_min, ldt)
+            elapsed * 60
 
         _ ->
           0
       end
-    else
-      {:error, "ERR no such key"}
+
+      {:ok, false} ->
+        {:error, "ERR no such key"}
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
     end
   end
 
   defp do_object("REFCOUNT", [key], store) do
-    if object_exists?(store, key) do
-      1
-    else
-      {:error, "ERR no such key"}
+    case object_exists?(store, key) do
+      {:ok, true} -> 1
+      {:ok, false} -> {:error, "ERR no such key"}
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
     end
   end
 
@@ -457,22 +545,33 @@ defmodule Ferricstore.Commands.Generic do
 
   defp string_encoding(store, key) do
     case Ops.value_size(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       size when is_integer(size) and size > 44 ->
         "raw"
 
       _small_or_unknown ->
-        value = Ops.get(store, key)
+        case Ops.get(store, key) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
 
-        cond do
-          int_encoded_string?(value) -> "int"
-          value != nil and byte_size(value) <= 44 -> "embstr"
-          true -> "raw"
+          value ->
+            cond do
+              int_encoded_string?(value) -> "int"
+              value != nil and byte_size(value) <= 44 -> "embstr"
+              true -> "raw"
+            end
         end
     end
   end
 
   defp object_exists?(store, key) do
-    TypeRegistry.get_type(key, store) != "none"
+    case TypeRegistry.get_type(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      "none" -> {:ok, false}
+      _type -> {:ok, true}
+    end
   end
 
   defp int_encoded_string?(value) when is_binary(value) do
@@ -486,6 +585,13 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp int_encoded_string?(_value), do: false
+
+  defp parse_wait_integer(value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed >= 0 -> {:ok, parsed}
+      _invalid -> {:error, "ERR value is not an integer or out of range"}
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Private -- COPY helpers
@@ -507,32 +613,52 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_copy(source, destination, replace?, store) do
     case key_meta(store, source) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         0
 
       _expire_at_ms ->
-        if not replace? and key_exists?(store, destination) do
-          0
-        else
-          case key_entry(store, source) do
-            nil ->
-              0
+        destination_status = if replace?, do: {:ok, false}, else: key_exists?(store, destination)
 
-            entry ->
-              if source != destination do
-                copy_entry_for_copy(source, destination, entry, replace?, store)
-              else
-                1
-              end
-          end
+        case destination_status do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
+          {:ok, true} when not replace? ->
+            0
+
+          {:ok, _destination_exists} ->
+            case key_entry(store, source) do
+              {:error, {:storage_read_failed, _reason}} = failure ->
+                ReadResult.command_error(failure)
+
+              nil ->
+                0
+
+              entry ->
+                if source != destination do
+                  copy_entry_for_copy(source, destination, entry, replace?, store)
+                else
+                  1
+                end
+            end
         end
     end
   end
 
-  defp key_exists?(store, key), do: TypeRegistry.get_type(key, store) != "none"
+  defp key_exists?(store, key) do
+    case TypeRegistry.get_type(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      "none" -> {:ok, false}
+      _type -> {:ok, true}
+    end
+  end
 
   defp key_entry(store, key) do
     case Ops.get_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
       nil -> compound_entry(store, key)
       {value, expire_at_ms} -> {:plain, value, expire_at_ms}
     end
@@ -543,10 +669,14 @@ defmodule Ferricstore.Commands.Generic do
       type_key = CompoundKey.type_key(key)
 
       case Ops.compound_get_meta(store, key, type_key) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          failure
+
         nil ->
           list_meta_key = CompoundKey.list_meta_key(key)
 
           case Ops.compound_get_meta(store, key, list_meta_key) do
+            {:error, {:storage_read_failed, _reason}} = failure -> failure
             nil -> nil
             {_meta, expire_at_ms} -> live_compound_entry(store, key, "list", expire_at_ms)
           end
@@ -558,89 +688,113 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp live_compound_entry(store, key, expected_type, expire_at_ms) do
-    if TypeRegistry.get_type(key, store) == expected_type do
-      {:compound, expected_type, expire_at_ms}
+    case TypeRegistry.get_type(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      ^expected_type -> {:compound, expected_type, expire_at_ms}
+      _other -> nil
     end
   end
 
   defp rename_entry(source, destination, _entry, _store) when source == destination, do: :ok
 
-  defp rename_entry(source, destination, {:plain, value, expire_at_ms}, store) do
-    replace_entry_preserving_destination(
-      source,
-      destination,
-      {:plain, value, expire_at_ms},
-      store,
-      fn -> delete_key_result(source, store) end
-    )
-  end
-
   defp rename_entry(source, destination, entry, store) do
-    replace_entry_preserving_destination(source, destination, entry, store, fn ->
-      delete_key_result(source, store)
-    end)
+    case prepare_entry(source, destination, entry, store) do
+      {:ok, prepared} ->
+        replace_entry_preserving_destination(destination, prepared, store, fn ->
+          delete_key_result(source, store)
+        end)
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+    end
   end
 
   defp copy_entry_for_copy(_source, destination, {:plain, value, expire_at_ms}, true, store) do
-    result =
-      if compound_destination_exists?(destination, store) do
-        replace_entry_preserving_destination(
-          destination,
-          destination,
+    case compound_destination_exists?(destination, store) do
+      {:ok, true} ->
+        destination
+        |> replace_entry_preserving_destination(
           {:plain, value, expire_at_ms},
           store,
           fn -> :ok end
         )
-      else
-        Ops.put(store, destination, value, expire_at_ms)
-      end
+        |> copy_result()
 
-    case result do
-      :ok -> 1
-      {:error, _} = error -> error
+      {:ok, false} ->
+        store
+        |> Ops.put(destination, value, expire_at_ms)
+        |> copy_result()
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
     end
   end
 
   defp copy_entry_for_copy(source, destination, entry, true, store) do
-    case replace_entry_preserving_destination(source, destination, entry, store, fn -> :ok end) do
-      :ok -> 1
-      {:error, _} = error -> error
+    case prepare_entry(source, destination, entry, store) do
+      {:ok, prepared} ->
+        destination
+        |> replace_entry_preserving_destination(prepared, store, fn -> :ok end)
+        |> copy_result()
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
     end
   end
 
   defp copy_entry_for_copy(source, destination, entry, false, store) do
-    case copy_entry(source, destination, entry, store) do
-      :ok -> 1
-      {:error, _} = error -> error
+    case prepare_entry(source, destination, entry, store) do
+      {:ok, prepared} -> prepared |> write_prepared_entry(destination, store) |> copy_result()
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
     end
   end
 
   defp compound_destination_exists?(destination, store) do
-    Ops.has_compound?(store) and
-      (Ops.compound_get(store, destination, CompoundKey.type_key(destination)) != nil or
-         Ops.compound_get(store, destination, CompoundKey.list_meta_key(destination)) != nil)
+    if Ops.has_compound?(store) do
+      case Ops.compound_get(store, destination, CompoundKey.type_key(destination)) do
+        {:error, {:storage_read_failed, _reason}} = failure -> failure
+        nil -> {:ok, false}
+        _type -> {:ok, true}
+      end
+    else
+      {:ok, false}
+    end
   end
 
-  defp copy_entry(_source, destination, {:plain, value, expire_at_ms}, store) do
+  defp prepare_entry(_source, _destination, {:plain, _value, _expire_at_ms} = entry, _store),
+    do: {:ok, entry}
+
+  defp prepare_entry(source, destination, {:compound, type, _expire_at_ms}, store) do
+    case CompoundSnapshot.copy(source, destination, type, store) do
+      {:ok, entries} -> {:ok, {:compound, entries}}
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+    end
+  end
+
+  defp write_prepared_entry({:plain, value, expire_at_ms}, destination, store) do
     Ops.put(store, destination, value, expire_at_ms)
   end
 
-  defp copy_entry(source, destination, {:compound, type, _expire_at_ms}, store) do
-    entries = compound_copy_entries(source, destination, type, store)
+  defp write_prepared_entry({:compound, entries}, destination, store) do
     Ops.compound_batch_put(store, destination, entries)
   end
 
-  defp replace_entry_preserving_destination(source, destination, entry, store, after_write_fun) do
-    backup = key_backup(store, destination)
+  defp replace_entry_preserving_destination(destination, prepared, store, after_write_fun) do
+    case key_backup(store, destination) do
+      {:ok, backup} ->
+        replace_entry_from_backup(destination, prepared, backup, store, after_write_fun)
 
-    case write_replacement(source, destination, entry, backup, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+    end
+  end
+
+  defp replace_entry_from_backup(destination, prepared, backup, store, after_write_fun) do
+    case write_replacement(destination, prepared, backup, store) do
       :ok ->
         case after_write_fun.() do
-          :ok ->
-            :ok
-
-          {:error, _} = error ->
-            restore_backup_or_error(destination, backup, store, error)
+          :ok -> :ok
+          {:error, _} = error -> restore_backup_or_error(destination, backup, store, error)
         end
 
       {:error, _} = error ->
@@ -651,7 +805,7 @@ defmodule Ferricstore.Commands.Generic do
     end
   end
 
-  defp write_replacement(_source, destination, {:plain, value, expire_at_ms}, backup, store) do
+  defp write_replacement(destination, {:plain, value, expire_at_ms}, backup, store) do
     case backup do
       {:compound, _entries} ->
         with :ok <- delete_key_result(destination, store) do
@@ -666,34 +820,51 @@ defmodule Ferricstore.Commands.Generic do
     end
   end
 
-  defp write_replacement(
-         source,
-         destination,
-         {:compound, _type, _expire_at_ms} = entry,
-         backup,
-         store
-       ) do
+  defp write_replacement(destination, {:compound, _entries} = prepared, backup, store) do
     case backup do
       :missing ->
-        copy_entry(source, destination, entry, store)
+        write_prepared_entry(prepared, destination, store)
 
       _existing ->
         with :ok <- delete_key_result(destination, store) do
-          copy_entry(source, destination, entry, store)
+          write_prepared_entry(prepared, destination, store)
         end
     end
   end
 
   defp key_backup(store, key) do
-    case key_entry(store, key) do
+    case Ops.get_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      {value, expire_at_ms} ->
+        {:ok, {:plain, value, expire_at_ms}}
+
       nil ->
-        :missing
+        compound_key_backup(store, key)
+    end
+  end
 
-      {:plain, value, expire_at_ms} ->
-        {:plain, value, expire_at_ms}
+  defp compound_key_backup(store, key) do
+    if Ops.has_compound?(store) do
+      case Ops.compound_get_meta(store, key, CompoundKey.type_key(key)) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          failure
 
-      {:compound, type, _expire_at_ms} ->
-        {:compound, compound_copy_entries(key, key, type, store)}
+        nil ->
+          {:ok, :missing}
+
+        {type, _expire_at_ms} when type in ["hash", "list", "set", "zset", "stream"] ->
+          case CompoundSnapshot.snapshot(key, type, store) do
+            {:ok, entries} -> {:ok, {:compound, entries}}
+            {:error, {:storage_read_failed, _reason}} = failure -> failure
+          end
+
+        {type, _expire_at_ms} ->
+          ReadResult.failure({:unsupported_destination_type, type})
+      end
+    else
+      {:ok, :missing}
     end
   end
 
@@ -732,116 +903,8 @@ defmodule Ferricstore.Commands.Generic do
     end
   end
 
-  defp compound_copy_entries(source, destination, type, store) do
-    compound_meta_copy_entries(source, destination, type, store) ++
-      compound_member_copy_entries(source, destination, type, store)
-  end
-
-  defp compound_meta_copy_entries(source, destination, type, store) do
-    type_entries =
-      copy_compound_key_entries(
-        source,
-        CompoundKey.type_key(source),
-        CompoundKey.type_key(destination),
-        store,
-        type
-      )
-
-    list_meta_entries =
-      if type == "list" do
-        copy_compound_key_entries(
-          source,
-          CompoundKey.list_meta_key(source),
-          CompoundKey.list_meta_key(destination),
-          store
-        )
-      else
-        []
-      end
-
-    stream_meta_entries =
-      if type == "stream" do
-        copy_compound_key_entries(
-          source,
-          CompoundKey.stream_meta_key(source),
-          CompoundKey.stream_meta_key(destination),
-          store
-        )
-      else
-        []
-      end
-
-    type_entries ++ list_meta_entries ++ stream_meta_entries
-  end
-
-  defp compound_member_copy_entries(source, destination, "stream", store) do
-    compound_member_copy_entries_from_prefixes(
-      source,
-      store,
-      [
-        {CompoundKey.stream_prefix(source), CompoundKey.stream_prefix(destination)},
-        {CompoundKey.stream_group_prefix(source), CompoundKey.stream_group_prefix(destination)}
-      ]
-    )
-  end
-
-  defp compound_member_copy_entries(source, destination, type, store) do
-    compound_member_copy_entries_from_prefixes(
-      source,
-      store,
-      [{compound_prefix(type, source), compound_prefix(type, destination)}]
-    )
-  end
-
-  defp compound_member_copy_entries_from_prefixes(source, store, prefix_pairs) do
-    pairs =
-      Enum.flat_map(prefix_pairs, fn {source_prefix, destination_prefix} ->
-        store
-        |> Ops.compound_scan(source, source_prefix)
-        |> Enum.map(fn {sub_key, _value} ->
-          source_key = scanned_compound_key(source_prefix, sub_key)
-          destination_key = scanned_compound_key(destination_prefix, sub_key)
-          {source_key, destination_key}
-        end)
-      end)
-
-    source_keys = Enum.map(pairs, fn {source_key, _destination_key} -> source_key end)
-    metas = Ops.compound_batch_get_meta(store, source, source_keys)
-
-    pairs
-    |> Enum.zip(metas)
-    |> Enum.flat_map(fn
-      {{_source_key, _destination_key}, nil} ->
-        []
-
-      {{_source_key, destination_key}, {value, expire_at_ms}} ->
-        [{destination_key, value, expire_at_ms}]
-    end)
-  end
-
-  defp copy_compound_key_entries(
-         source,
-         source_key,
-         destination_key,
-         store,
-         fallback_value \\ nil
-       ) do
-    case Ops.compound_get_meta(store, source, source_key) do
-      nil when fallback_value != nil -> [{destination_key, fallback_value, 0}]
-      nil -> []
-      {value, expire_at_ms} -> [{destination_key, value, expire_at_ms}]
-    end
-  end
-
-  defp scanned_compound_key(prefix, key) do
-    if String.starts_with?(key, prefix), do: key, else: prefix <> key
-  end
-
-  defp compound_prefix("hash", key), do: CompoundKey.hash_prefix(key)
-  defp compound_prefix("list", key), do: CompoundKey.list_prefix(key)
-  defp compound_prefix("set", key), do: CompoundKey.set_prefix(key)
-  defp compound_prefix("zset", key), do: CompoundKey.zset_prefix(key)
-  defp compound_prefix("stream", key), do: CompoundKey.stream_prefix(key)
+  defp copy_result(:ok), do: 1
+  defp copy_result({:error, _} = error), do: error
 
   # ---------------------------------------------------------------------------
   # Private -- SCAN option parsing and execution
@@ -858,7 +921,7 @@ defmodule Ferricstore.Commands.Generic do
 
       "COUNT" ->
         case Integer.parse(value) do
-          {n, ""} when n > 0 ->
+          {n, ""} when n > 0 and n <= @max_scan_count ->
             parse_scan_opts(rest, match, n, type)
 
           _ ->
@@ -878,42 +941,79 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_scan(cursor_str, match_pattern, count, type_filter, store) do
-    alias Ferricstore.Store.CompoundKey
+    case Ops.scan_keys_page(store, cursor_str, count, match_pattern, type_filter) do
+      {:ok, {next_cursor, keys}} when is_binary(next_cursor) and is_list(keys) ->
+        [next_cursor, keys]
 
-    all_keys =
-      Ops.keys(store)
-      |> CompoundKey.user_visible_keys()
-      |> filter_by_type(type_filter, store)
-      |> filter_by_match(match_pattern)
-      |> Enum.sort()
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
-    # Cursor "0" means start from the beginning. Otherwise, cursor is the last
-    # key seen -- find the first key strictly after it alphabetically.
-    remaining =
-      if cursor_str == "0" do
-        all_keys
-      else
-        Enum.drop_while(all_keys, fn k -> k <= cursor_str end)
-      end
+      {:error, message} when is_binary(message) ->
+        {:error, message}
 
-    {batch, rest} = Enum.split(remaining, count)
+      {:error, reason} ->
+        ReadResult.command_error(ReadResult.failure(reason))
 
-    next_cursor =
-      case {batch, rest} do
-        {[], _} -> "0"
-        {_, []} -> "0"
-        _ -> List.last(batch)
-      end
-
-    [next_cursor, batch]
+      :unsupported ->
+        do_scan_from_full_key_list(cursor_str, match_pattern, count, type_filter, store)
+    end
   end
 
-  defp filter_by_type(keys, nil, _store), do: keys
+  defp do_scan_from_full_key_list(cursor_str, match_pattern, count, type_filter, store) do
+    alias Ferricstore.Store.CompoundKey
+
+    case Ops.keys(store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      keys ->
+        keys = CompoundKey.user_visible_keys(keys)
+
+        case filter_by_type(keys, type_filter, store) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
+          {:ok, typed_keys} ->
+            all_keys = typed_keys |> filter_by_match(match_pattern) |> Enum.sort()
+
+            # Cursor "0" means start from the beginning. Otherwise, cursor is the last
+            # key seen -- find the first key strictly after it alphabetically.
+            remaining =
+              if cursor_str == "0" do
+                all_keys
+              else
+                Enum.drop_while(all_keys, fn k -> k <= cursor_str end)
+              end
+
+            {batch, rest} = Enum.split(remaining, count)
+
+            next_cursor =
+              case {batch, rest} do
+                {[], _} -> "0"
+                {_, []} -> "0"
+                _ -> List.last(batch)
+              end
+
+            [next_cursor, batch]
+        end
+    end
+  end
+
+  defp filter_by_type(keys, nil, _store), do: {:ok, keys}
 
   defp filter_by_type(keys, type_filter, store) do
-    Enum.filter(keys, fn key ->
-      TypeRegistry.get_type(key, store) == type_filter
+    keys
+    |> Enum.reduce_while({:ok, []}, fn key, {:ok, matching} ->
+      case TypeRegistry.get_type(key, store) do
+        {:error, {:storage_read_failed, _reason}} = failure -> {:halt, failure}
+        ^type_filter -> {:cont, {:ok, [key | matching]}}
+        _other -> {:cont, {:ok, matching}}
+      end
     end)
+    |> case do
+      {:ok, matching} -> {:ok, Enum.reverse(matching)}
+      failure -> failure
+    end
   end
 
   defp filter_by_match(keys, nil), do: keys

@@ -5,6 +5,8 @@ defmodule Ferricstore.Flow.HistoryProjector.Config do
   @default_flush_interval_ms 1_000
   @default_chunk_interval_ms 1
   @default_max_pending_entries 100_000
+  @default_retry_interval_ms 50
+  @max_retry_interval_ms 5_000
 
   def default_batch_size, do: @default_batch_size
   def default_flush_interval_ms, do: @default_flush_interval_ms
@@ -32,6 +34,8 @@ defmodule Ferricstore.Flow.HistoryProjector.Config do
       flush_timer: nil,
       requested_index: nil,
       flushed_index: flushed_index,
+      retry_interval_ms: @default_retry_interval_ms,
+      retry_max_interval_ms: @max_retry_interval_ms,
       batch_size: app_env(:flow_history_projector_batch_size, @default_batch_size),
       max_pending_entries: max_pending_entries,
       flush_interval_ms:

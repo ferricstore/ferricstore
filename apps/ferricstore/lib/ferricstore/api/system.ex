@@ -86,10 +86,12 @@ defmodule FerricStore.API.System do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Batches multiple commands into a single group-commit entry.
+  Batches multiple commands into one ordered group-commit entry per shard.
 
   The provided function receives a `FerricStore.Pipe` accumulator and should
-  pipe commands into it. All commands are executed atomically on completion.
+  pipe commands into it. Commands targeting one shard execute atomically. A
+  cross-shard pipeline submits shard groups concurrently and is not atomic
+  across independent Raft groups.
 
   ## Examples
 
@@ -126,7 +128,12 @@ defmodule FerricStore.API.System do
   def batch_get(keys) when is_list(keys) do
     with :ok <- Ferricstore.Flow.InternalKey.authorize_public(keys) do
       ctx = FerricStore.Instance.get(:default)
-      Ferricstore.Store.Router.batch_get(ctx, keys)
+      values = Ferricstore.Store.Router.batch_get(ctx, keys)
+
+      case Ferricstore.Store.ReadResult.first_failure(values) do
+        nil -> values
+        failure -> Ferricstore.Store.ReadResult.command_error(failure)
+      end
     end
   end
 
@@ -142,21 +149,34 @@ defmodule FerricStore.API.System do
   """
   @spec packed_batch_get(binary()) :: binary() | write_error()
   def packed_batch_get(packed_keys) when is_binary(packed_keys) do
-    ctx = FerricStore.Instance.get(:default)
-    <<count::32, rest::binary>> = packed_keys
-    keys = unpack_keys(rest, count, [])
-
-    with :ok <- Ferricstore.Flow.InternalKey.authorize_public(keys) do
+    with {:ok, keys} <- decode_packed_keys(packed_keys),
+         :ok <- Ferricstore.Flow.InternalKey.authorize_public(keys) do
+      ctx = FerricStore.Instance.get(:default)
       values = Ferricstore.Store.Router.batch_get(ctx, keys)
-      pack_values(values, [])
+
+      case Ferricstore.Store.ReadResult.first_failure(values) do
+        nil -> pack_values(values, [])
+        failure -> Ferricstore.Store.ReadResult.command_error(failure)
+      end
     end
   end
 
-  defp unpack_keys(_rest, 0, acc), do: Enum.reverse(acc)
+  defp decode_packed_keys(<<count::32, rest::binary>>)
+       when count <= div(byte_size(rest), 2),
+       do: unpack_keys(rest, count, [])
 
-  defp unpack_keys(<<len::16, key::binary-size(len), rest::binary>>, n, acc) do
+  defp decode_packed_keys(_invalid), do: invalid_packed_batch_get()
+
+  defp unpack_keys(<<>>, 0, acc), do: {:ok, Enum.reverse(acc)}
+  defp unpack_keys(_trailing, 0, _acc), do: invalid_packed_batch_get()
+
+  defp unpack_keys(<<len::16, key::binary-size(len), rest::binary>>, n, acc) when n > 0 do
     unpack_keys(rest, n - 1, [key | acc])
   end
+
+  defp unpack_keys(_truncated, _remaining, _acc), do: invalid_packed_batch_get()
+
+  defp invalid_packed_batch_get(), do: {:error, "ERR invalid packed batch GET payload"}
 
   defp pack_values([], acc), do: IO.iodata_to_binary(Enum.reverse(acc))
 

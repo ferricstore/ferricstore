@@ -91,12 +91,12 @@ defmodule Ferricstore.Commands.HashTest.Sections.WrongtypeEnforcementEdgeCases d
           assert {:error, "ERR invalid cursor"} = Hash.handle("HSCAN", ["hash", "-1"], store)
         end
 
-        test "HSCAN with very large cursor beyond set size returns cursor 0 and empty list" do
+        test "HSCAN rejects numeric offset cursors" do
           store = MockStore.make()
           Hash.handle("HSET", ["hash", "f1", "v1"], store)
-          [cursor, elements] = Hash.handle("HSCAN", ["hash", "999999"], store)
-          assert cursor == "0"
-          assert elements == []
+
+          assert {:error, "ERR invalid cursor"} =
+                   Hash.handle("HSCAN", ["hash", "999999"], store)
         end
 
         test "HSCAN with odd trailing option returns error" do

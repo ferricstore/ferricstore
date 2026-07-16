@@ -424,6 +424,46 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     GenServer.stop(pid)
   end
 
+  test "worker polls shards in bounded round-robin sweeps" do
+    parent = self()
+
+    ctx = %{
+      name: :policy_migration_round_robin_test,
+      shard_count: 5
+    }
+
+    assert {:ok, pid} =
+             PolicyMigrationWorker.start_link(
+               instance_ctx: ctx,
+               name: :bounded_round_robin_policy_migration_worker,
+               enabled: true,
+               initial_delay_ms: 60_000,
+               interval_ms: 60_000,
+               catchup_delay_ms: 60_000,
+               shards_per_run: 2,
+               attribute_repair_fun: fn _ctx, shard_index ->
+                 send(parent, {:policy_migration_polled, shard_index})
+                 {:ok, %{processed: 1}}
+               end
+             )
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    for expected_shards <- [[0, 1], [2, 3], [4], [0, 1]] do
+      send(pid, :run)
+      :sys.get_state(pid)
+
+      assert Enum.map(expected_shards, fn shard_index ->
+               assert_receive {:policy_migration_polled, ^shard_index}
+               shard_index
+             end) == expected_shards
+
+      refute_receive {:policy_migration_polled, _other_shard}, 20
+    end
+  end
+
   test "explicit worker enabled option takes precedence over global configuration" do
     ctx = FerricStore.Instance.get(:default)
     previous_enabled = Application.get_env(:ferricstore, :flow_policy_migration_worker_enabled)
@@ -618,6 +658,169 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     snapshot_ref = Process.monitor(snapshot_pid)
     GenServer.stop(pid)
     assert_receive {:DOWN, ^snapshot_ref, :process, ^snapshot_pid, :shutdown}, 1_000
+  end
+
+  @tag :resumable_policy_snapshot
+  test "keydir snapshot pages persist their cursor and release the fixed table" do
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = 0
+    keydir = elem(ctx.keydir_refs, shard_index)
+    run_token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+
+    on_exit(fn -> PolicyMigration.cleanup_snapshot(ctx, shard_index, run_token) end)
+
+    first =
+      Task.async(fn ->
+        PolicyMigration.snapshot_primary_keydir_page(
+          ctx,
+          shard_index,
+          run_token,
+          1,
+          1_024
+        )
+      end)
+      |> Task.await(5_000)
+
+    assert {:ok, %{done?: false, scanned: 1}} = first
+    assert {:ok, first_cursor} = PolicyMigration.snapshot_progress(ctx, shard_index, run_token)
+    refute :ets.info(keydir, :safe_fixed)
+
+    second =
+      Task.async(fn ->
+        PolicyMigration.snapshot_primary_keydir_page(
+          ctx,
+          shard_index,
+          run_token,
+          1,
+          1_024
+        )
+      end)
+      |> Task.await(5_000)
+
+    assert {:ok, %{done?: false, scanned: 1}} = second
+    assert {:ok, second_cursor} = PolicyMigration.snapshot_progress(ctx, shard_index, run_token)
+    refute second_cursor == first_cursor
+    refute :ets.info(keydir, :safe_fixed)
+  end
+
+  @tag :resumable_policy_snapshot
+  test "keydir snapshot rejects a non-canonical durable continuation" do
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = 0
+    keydir = elem(ctx.keydir_refs, shard_index)
+    run_token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+    progress_key = <<0, "fpcp:1:", run_token::binary>>
+    path = flow_lmdb_path(ctx, shard_index)
+
+    on_exit(fn -> PolicyMigration.cleanup_snapshot(ctx, shard_index, run_token) end)
+
+    assert {:ok, %{done?: false}} =
+             PolicyMigration.snapshot_primary_keydir_page(
+               ctx,
+               shard_index,
+               run_token,
+               1,
+               1_024
+             )
+
+    assert {:ok, encoded} = LMDB.get(path, progress_key)
+    assert :ok = LMDB.write_batch(path, [{:put, progress_key, encoded <> <<0>>}])
+
+    assert {:error, :corrupt_policy_catalog_snapshot_progress} =
+             PolicyMigration.snapshot_primary_keydir_page(
+               ctx,
+               shard_index,
+               run_token,
+               1,
+               1_024
+             )
+
+    refute :ets.info(keydir, :safe_fixed)
+  end
+
+  @tag :snapshot_keydir_rebuild
+  test "keydir snapshot restarts safely when its ETS table is rebuilt" do
+    ctx = FerricStore.Instance.get(:default)
+    run_token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+    first_keydir = :ets.new(:policy_snapshot_keydir, [:set, :public])
+
+    on_exit(fn ->
+      PolicyMigration.cleanup_snapshot(ctx, 0, run_token)
+
+      for table <- [first_keydir, Process.get(:rebuilt_policy_snapshot_keydir)],
+          is_reference(table) and :ets.info(table) != :undefined do
+        :ets.delete(table)
+      end
+    end)
+
+    true =
+      :ets.insert(first_keydir, [
+        {Keys.state_key("snapshot-before-rebuild-1", @partition), <<>>, 0, nil, 0, 0, 0},
+        {Keys.state_key("snapshot-before-rebuild-2", @partition), <<>>, 0, nil, 0, 0, 0}
+      ])
+
+    snapshot_ctx = %{ctx | keydir_refs: {first_keydir}}
+
+    assert {:ok, %{done?: false, scanned: 1}} =
+             PolicyMigration.snapshot_primary_keydir_page(snapshot_ctx, 0, run_token, 1, 1_024)
+
+    :ets.delete(first_keydir)
+    rebuilt_keydir = :ets.new(:policy_snapshot_keydir, [:set, :public])
+    Process.put(:rebuilt_policy_snapshot_keydir, rebuilt_keydir)
+
+    true =
+      :ets.insert(
+        rebuilt_keydir,
+        {Keys.state_key("snapshot-after-rebuild", @partition), <<>>, 0, nil, 0, 0, 0}
+      )
+
+    rebuilt_ctx = %{ctx | keydir_refs: {rebuilt_keydir}}
+
+    assert {:ok, %{scanned: 1}} =
+             PolicyMigration.snapshot_primary_keydir_page(rebuilt_ctx, 0, run_token, 1, 1_024)
+
+    assert :ok = PolicyMigration.snapshot_primary_keydir(rebuilt_ctx, 0, run_token, 1, 1_024)
+    assert PolicyMigration.snapshot_complete?(ctx, 0, run_token)
+  end
+
+  @tag :snapshot_invalidated_cursor
+  test "keydir snapshot discards an invalidated continuation instead of retrying it forever" do
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = 0
+    keydir = elem(ctx.keydir_refs, shard_index)
+    run_token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+    progress_key = <<0, "fpcp:1:", run_token::binary>>
+    path = flow_lmdb_path(ctx, shard_index)
+
+    on_exit(fn -> PolicyMigration.cleanup_snapshot(ctx, shard_index, run_token) end)
+
+    assert {:ok, %{done?: false}} =
+             PolicyMigration.snapshot_primary_keydir_page(
+               ctx,
+               shard_index,
+               run_token,
+               1,
+               1_024
+             )
+
+    invalid_progress =
+      <<"FPS", 1>> <>
+        :erlang.term_to_binary({:ets.info(keydir, :id), {:invalid_continuation}}, [
+          :deterministic
+        ])
+
+    assert :ok = LMDB.write_batch(path, [{:put, progress_key, invalid_progress}])
+
+    assert {:ok, %{scanned: 1}} =
+             PolicyMigration.snapshot_primary_keydir_page(
+               ctx,
+               shard_index,
+               run_token,
+               1,
+               1_024
+             )
+
+    refute :ets.info(keydir, :safe_fixed)
   end
 
   test "worker does not repeat snapshot cleanup after the manifest is removed" do
@@ -1360,7 +1563,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
              Router.read_shard_value(ctx, shard_index, Keys.policy_migration_job_key(type))
   end
 
-  test "delayed older-policy mutation preserves migrated state meta and later current mutation converges attributes" do
+  test "delayed older-policy mutation is rejected and a current mutation converges attributes" do
     ctx = FerricStore.Instance.get(:default)
     type = unique_flow_id("delayed-policy-mutation")
     id = unique_flow_id("delayed-policy-mutation-flow")
@@ -1418,12 +1621,11 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
       partition_key: @partition,
       run_at_ms: 2_000,
       now_ms: 1_100,
-      policy_generation: 1,
-      policy_snapshot: policy_v1,
-      policy_snapshot_captured: true
+      policy_ref: policy_reference(policy_v1, 1),
+      policy_reference_captured: true
     }
 
-    assert :ok =
+    assert {:error, "ERR stale flow policy generation"} =
              Ferricstore.Raft.WARaftBackend.write(
                shard_index,
                {:flow_schedule_replace, state_key, delayed_attrs}
@@ -1437,8 +1639,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
       delayed_attrs
       | run_at_ms: 3_000,
         now_ms: 1_200,
-        policy_generation: 2,
-        policy_snapshot: policy_v2
+        policy_ref: policy_reference(policy_v2, 2)
     }
 
     assert :ok =
@@ -1741,6 +1942,16 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     ctx.data_dir
     |> Ferricstore.DataDir.shard_data_path(shard_index)
     |> LMDB.path()
+  end
+
+  defp policy_reference(policy, generation) do
+    encoded = RetryPolicy.encode_flow_policy(policy, generation)
+
+    %{
+      type: Map.fetch!(policy, :type),
+      generation: generation,
+      digest: :crypto.hash(:sha256, encoded)
+    }
   end
 
   defp replace_keydir_value(keydir, key, value) do

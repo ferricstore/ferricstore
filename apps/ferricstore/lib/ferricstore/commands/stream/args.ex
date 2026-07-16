@@ -1,6 +1,8 @@
 defmodule Ferricstore.Commands.Stream.Args do
   @moduledoc false
 
+  @max_timeout_ms 0xFFFFFFFF
+
   @spec parse_xadd_args([binary()]) ::
           {:ok, binary(), :auto | {:explicit, integer(), integer()} | {:partial, integer()},
            [
@@ -12,14 +14,21 @@ defmodule Ferricstore.Commands.Stream.Args do
 
     {nomkstream, rest} =
       case rest do
-        ["NOMKSTREAM" | r] -> {true, r}
+        [option | r] when is_binary(option) ->
+          if String.upcase(option) == "NOMKSTREAM", do: {true, r}, else: {false, rest}
+
         _ -> {false, rest}
       end
 
     {trim_opts, rest} =
       case rest do
-        ["MAXLEN" | r] -> parse_trim_maxlen(r)
-        ["MINID" | r] -> parse_trim_minid(r)
+        [option | r] when is_binary(option) ->
+          case String.upcase(option) do
+            "MAXLEN" -> parse_trim_maxlen(r)
+            "MINID" -> parse_trim_minid(r)
+            _ -> {nil, rest}
+          end
+
         _ -> {nil, rest}
       end
 
@@ -48,16 +57,11 @@ defmodule Ferricstore.Commands.Stream.Args do
   @spec parse_trim_opts([binary()]) :: {:ok, term()} | {:error, binary()}
   def parse_trim_opts(rest) do
     case rest do
-      ["MAXLEN" | r] ->
-        case parse_trim_maxlen(r) do
-          {{:error, _} = err, _} -> err
-          {opts, _remaining} -> {:ok, opts}
-        end
-
-      ["MINID" | r] ->
-        case parse_trim_minid(r) do
-          {{:error, _} = err, _} -> err
-          {opts, _remaining} -> {:ok, opts}
+      [option | r] when is_binary(option) ->
+        case String.upcase(option) do
+          "MAXLEN" -> normalize_trim_parse_result(parse_trim_maxlen(r))
+          "MINID" -> normalize_trim_parse_result(parse_trim_minid(r))
+          _ -> {:error, "ERR syntax error"}
         end
 
       _ ->
@@ -68,10 +72,14 @@ defmodule Ferricstore.Commands.Stream.Args do
   @spec parse_count_opt([binary()]) :: {:ok, non_neg_integer() | :infinity} | {:error, binary()}
   def parse_count_opt([]), do: {:ok, :infinity}
 
-  def parse_count_opt(["COUNT", n_str | _rest]) do
-    case Integer.parse(n_str) do
-      {n, ""} when n >= 0 -> {:ok, n}
-      _ -> {:error, "ERR value is not an integer or out of range"}
+  def parse_count_opt([option, n_str]) when is_binary(option) do
+    if String.upcase(option) == "COUNT" do
+      case Integer.parse(n_str) do
+        {n, ""} when n >= 0 -> {:ok, n}
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
+    else
+      {:error, "ERR syntax error"}
     end
   end
 
@@ -84,32 +92,9 @@ defmodule Ferricstore.Commands.Stream.Args do
            ]}
           | {:error, binary()}
   def parse_xread_args(args) do
-    # COUNT and BLOCK can appear in either order before STREAMS.
-    {count, rest} = parse_xread_count(args)
-    {block, rest} = parse_xread_block(rest)
-
-    # Handle BLOCK before COUNT: XREAD BLOCK 100 COUNT 2 STREAMS ...
-    {count, rest} =
-      if count == :infinity do
-        case parse_xread_count(rest) do
-          {:infinity, _} -> {count, rest}
-          {n, rest2} -> {n, rest2}
-        end
-      else
-        {count, rest}
-      end
-
-    case split_at_streams(rest) do
-      {:ok, keys, ids} when length(keys) == length(ids) and keys != [] ->
-        stream_ids = Enum.zip(keys, ids)
-        {:ok, count, block, stream_ids}
-
-      {:ok, _, _} ->
-        {:error,
-         "ERR Unbalanced XREAD list of streams: for each stream key an ID must be specified"}
-
-      :not_found ->
-        {:error, "ERR syntax error"}
+    with {:ok, count, block, operands} <- parse_xread_options(args, :infinity, :no_block),
+         {:ok, stream_ids} <- parse_stream_operands(operands, "XREAD") do
+      {:ok, count, block, stream_ids}
     end
   end
 
@@ -119,33 +104,15 @@ defmodule Ferricstore.Commands.Stream.Args do
           | {:error, binary()}
   def parse_xreadgroup_args(args) do
     case args do
-      ["GROUP", group, consumer | rest] ->
-        # COUNT and BLOCK can appear in either order before STREAMS.
-        {count, rest2} = parse_xread_count(rest)
-        {block, rest3} = parse_xread_block(rest2)
-
-        # Handle BLOCK before COUNT.
-        {count, rest3} =
-          if count == :infinity do
-            case parse_xread_count(rest3) do
-              {:infinity, _} -> {count, rest3}
-              {n, rest4} -> {n, rest4}
-            end
-          else
-            {count, rest3}
-          end
-
-        case split_at_streams(rest3) do
-          {:ok, keys, ids} when length(keys) == length(ids) and keys != [] ->
-            stream_ids = Enum.zip(keys, ids)
+      [group_option, group, consumer | rest] when is_binary(group_option) ->
+        if String.upcase(group_option) == "GROUP" do
+          with {:ok, count, block, operands} <-
+                 parse_xread_options(rest, :infinity, :no_block),
+               {:ok, stream_ids} <- parse_stream_operands(operands, "XREADGROUP") do
             {:ok, group, consumer, count, block, stream_ids}
-
-          {:ok, _, _} ->
-            {:error,
-             "ERR Unbalanced XREADGROUP list of streams: for each stream key an ID must be specified"}
-
-          :not_found ->
-            {:error, "ERR syntax error"}
+          end
+        else
+          {:error, "ERR syntax error"}
         end
 
       _ ->
@@ -205,35 +172,62 @@ defmodule Ferricstore.Commands.Stream.Args do
   defp consume_approx(["=" | rest]), do: {false, rest}
   defp consume_approx(rest), do: {false, rest}
 
-  defp parse_xread_count(["COUNT", n_str | rest]) do
-    case Integer.parse(n_str) do
-      {n, ""} when n >= 0 -> {n, rest}
-      _ -> {:infinity, rest}
+  defp parse_xread_options([], _count, _block), do: {:error, "ERR syntax error"}
+
+  defp parse_xread_options([token | rest], count, block) when is_binary(token) do
+    case String.upcase(token) do
+      "STREAMS" ->
+        {:ok, count, block, rest}
+
+      "COUNT" when count == :infinity ->
+        parse_xread_integer_option(rest, fn value, remaining ->
+          parse_xread_options(remaining, value, block)
+        end)
+
+      "BLOCK" when block == :no_block ->
+        parse_xread_integer_option(
+          rest,
+          fn value, remaining ->
+            parse_xread_options(remaining, count, {:block, value})
+          end,
+          @max_timeout_ms
+        )
+
+      _unknown_or_duplicate ->
+        {:error, "ERR syntax error"}
     end
   end
 
-  defp parse_xread_count(rest), do: {:infinity, rest}
+  defp parse_xread_options(_args, _count, _block), do: {:error, "ERR syntax error"}
 
-  defp parse_xread_block(["BLOCK", timeout_str | rest]) do
-    case Integer.parse(timeout_str) do
-      {n, ""} when n >= 0 -> {{:block, n}, rest}
-      _ -> {:no_block, ["BLOCK", timeout_str | rest]}
+  defp parse_xread_integer_option(args, continuation),
+    do: parse_xread_integer_option(args, continuation, :infinity)
+
+  defp parse_xread_integer_option([value | rest], continuation, max_value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed >= 0 and (max_value == :infinity or parsed <= max_value) ->
+        continuation.(parsed, rest)
+
+      _invalid -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
-  defp parse_xread_block(rest), do: {:no_block, rest}
+  defp parse_xread_integer_option([], _continuation, _max_value),
+    do: {:error, "ERR syntax error"}
 
-  defp split_at_streams(args) do
-    case Enum.find_index(args, &(String.upcase(&1) == "STREAMS")) do
-      nil ->
-        :not_found
+  defp normalize_trim_parse_result({{:error, _} = error, _remaining}), do: error
+  defp normalize_trim_parse_result({opts, []}), do: {:ok, opts}
+  defp normalize_trim_parse_result({_opts, _remaining}), do: {:error, "ERR syntax error"}
 
-      idx ->
-        _streams_token = Enum.at(args, idx)
-        after_streams = Enum.drop(args, idx + 1)
-        half = div(length(after_streams), 2)
-        {keys, ids} = Enum.split(after_streams, half)
-        {:ok, keys, ids}
+  defp parse_stream_operands(operands, command) do
+    operand_count = length(operands)
+
+    if operand_count > 0 and rem(operand_count, 2) == 0 do
+      {keys, ids} = Enum.split(operands, div(operand_count, 2))
+      {:ok, Enum.zip(keys, ids)}
+    else
+      {:error,
+       "ERR Unbalanced #{command} list of streams: for each stream key an ID must be specified"}
     end
   end
 end

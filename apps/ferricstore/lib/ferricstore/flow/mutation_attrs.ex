@@ -18,6 +18,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
   @max_history_max_events 1_000_000
   @max_active_ms 31_536_000_000
   @default_max_batch_items 1_000
+  @max_batch_items 100_000
+  @max_exact_integer 9_007_199_254_740_991
 
   def validate_opts(opts, allowed \\ []) do
     cond do
@@ -74,8 +76,11 @@ defmodule Ferricstore.Flow.MutationAttrs do
 
   def optional_now_ms(opts) do
     case Keyword.fetch(opts, :now_ms) do
-      {:ok, value} when is_integer(value) and value >= 0 ->
+      {:ok, value} when is_integer(value) and value >= 0 and value <= @max_exact_integer ->
         {:ok, value}
+
+      {:ok, value} when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow now_ms exceeds maximum #{@max_exact_integer}"}
 
       {:ok, _value} ->
         {:error, "ERR flow now_ms must be a non-negative integer"}
@@ -162,6 +167,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, correlation_id} <- optional_binary_or_nil(opts, :correlation_id, nil),
          :ok <- validate_ref_size(:correlation_id, correlation_id),
          {:ok, now} <- optional_now_ms(opts),
+         :ok <- validate_deadline(now, lease_ms, :lease_ms),
          {:ok, retention_ttl_ms} <- optional_retention_ttl_ms(opts),
          {:ok, max_active_ms} <- optional_max_active_ms(opts),
          {:ok, history_hot_max_events} <- optional_history_hot_max_events(opts),
@@ -253,6 +259,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_id(parent_id),
          :ok <- Internal.reject_reserved_id(parent_id, opts),
          :ok <- validate_children(children),
+         :ok <- validate_many_item_count(children),
          {:ok, partition_key} <- required_partition_key(Keyword.get(opts, :partition_key)),
          {:ok, group_id} <- required_binary(opts, :group_id),
          :ok <- validate_child_group_id(group_id),
@@ -368,6 +375,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
+         :ok <- validate_deadline(now, lease_ms, :lease_ms),
          {:ok, worker} <- optional_binary_or_nil(opts, :worker, nil),
          {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
          {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
@@ -476,6 +484,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
+         :ok <- validate_deadline(now, ttl_ms, :ttl_ms),
          {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
          {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
@@ -506,7 +515,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
-         {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms) do
+         {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
+         :ok <- validate_deadline(now, lease_ms, :lease_ms) do
       attrs =
         %{
           id: id,
@@ -558,6 +568,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
+         :ok <- validate_deadline(now, ttl_ms, :ttl_ms),
          {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
          {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
@@ -590,6 +601,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_key_size(Ferricstore.Flow.Keys.state_key(id, partition_key)),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
+         :ok <- validate_deadline(now, ttl_ms, :ttl_ms),
          :ok <- validate_cancel_reason_source(opts),
          {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
          {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
@@ -697,11 +709,24 @@ defmodule Ferricstore.Flow.MutationAttrs do
 
   def optional_non_neg_integer(opts, key, default) do
     case Keyword.fetch(opts, key) do
-      {:ok, value} when is_integer(value) and value >= 0 -> {:ok, value}
-      {:ok, _} -> {:error, "ERR flow #{key} must be a non-negative integer"}
-      :error when is_integer(default) and default >= 0 -> {:ok, default}
-      :error when is_nil(default) -> {:ok, nil}
-      :error -> {:error, "ERR flow #{key} must be a non-negative integer"}
+      {:ok, value} when is_integer(value) and value >= 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      {:ok, value} when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow #{key} exceeds maximum #{@max_exact_integer}"}
+
+      {:ok, _} ->
+        {:error, "ERR flow #{key} must be a non-negative integer"}
+
+      :error
+      when is_integer(default) and default >= 0 and default <= @max_exact_integer ->
+        {:ok, default}
+
+      :error when is_nil(default) ->
+        {:ok, nil}
+
+      :error ->
+        {:error, "ERR flow #{key} must be a non-negative integer"}
     end
   end
 
@@ -901,7 +926,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
 
   def flow_max_batch_items do
     case Application.get_env(:ferricstore, :flow_max_batch_items, @default_max_batch_items) do
-      value when is_integer(value) and value > 0 -> value
+      value when is_integer(value) and value > 0 -> min(value, @max_batch_items)
       _ -> @default_max_batch_items
     end
   end
@@ -942,17 +967,33 @@ defmodule Ferricstore.Flow.MutationAttrs do
 
   def optional_non_neg_integer_or_nil(opts, key) do
     case Keyword.get(opts, key, nil) do
-      nil -> {:ok, nil}
-      value when is_integer(value) and value >= 0 -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a non-negative integer"}
+      nil ->
+        {:ok, nil}
+
+      value when is_integer(value) and value >= 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      value when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow #{key} exceeds maximum #{@max_exact_integer}"}
+
+      _ ->
+        {:error, "ERR flow #{key} must be a non-negative integer"}
     end
   end
 
   def optional_pos_integer_or_nil(opts, key) do
     case Keyword.get(opts, key, nil) do
-      nil -> {:ok, nil}
-      value when is_integer(value) and value > 0 -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a positive integer"}
+      nil ->
+        {:ok, nil}
+
+      value when is_integer(value) and value > 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      value when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow #{key} exceeds maximum #{@max_exact_integer}"}
+
+      _ ->
+        {:error, "ERR flow #{key} must be a positive integer"}
     end
   end
 
@@ -1094,10 +1135,26 @@ defmodule Ferricstore.Flow.MutationAttrs do
 
   def optional_pos_integer(opts, key, default) do
     case Keyword.get(opts, key, default) do
-      value when is_integer(value) and value > 0 -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a positive integer"}
+      value when is_integer(value) and value > 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      value when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow #{key} exceeds maximum #{@max_exact_integer}"}
+
+      _ ->
+        {:error, "ERR flow #{key} must be a positive integer"}
     end
   end
+
+  defp validate_deadline(_now_ms, nil, _key), do: :ok
+  defp validate_deadline(nil, _duration_ms, _key), do: :ok
+
+  defp validate_deadline(now_ms, duration_ms, _key)
+       when now_ms <= @max_exact_integer - duration_ms,
+       do: :ok
+
+  defp validate_deadline(_now_ms, _duration_ms, key),
+    do: {:error, "ERR flow #{key} deadline exceeds maximum #{@max_exact_integer}"}
 
   def optional_partition_key(opts) do
     case Keyword.get(opts, :partition_key, nil) do

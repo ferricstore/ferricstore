@@ -12,7 +12,7 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
         encoded = BlobRef.encode!(ref)
 
         assert byte_size(encoded) == BlobRef.encoded_size()
-        assert %{version: 2, segment_id: 0, offset: offset} = ref
+        assert %{segment_id: 0, offset: offset} = ref
         assert offset > 0
         assert {:ok, {segment_path, ^offset, size}} = BlobStore.file_ref(root, 0, ref)
         assert size == byte_size(payload)
@@ -249,20 +249,20 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
 
       test "blob APIs reject malformed refs without raising", %{root: root} do
         invalid_segment_ref = %BlobRef{
-          version: 2,
           checksum: :binary.copy(<<0>>, 32),
           size: 1,
           segment_id: nil,
           offset: 48
         }
 
-        invalid_legacy_ref = %BlobRef{
-          version: 1,
+        invalid_checksum_ref = %BlobRef{
           checksum: "short",
-          size: 1
+          size: 1,
+          segment_id: 0,
+          offset: 48
         }
 
-        for ref <- [invalid_segment_ref, invalid_legacy_ref] do
+        for ref <- [invalid_segment_ref, invalid_checksum_ref] do
           assert {:error, :invalid_blob_ref} = BlobStore.get(root, 0, ref)
           assert {:error, :invalid_blob_ref} = BlobStore.verify(root, 0, ref)
           assert {:error, :invalid_blob_ref} = BlobStore.file_ref(root, 0, ref)
@@ -423,14 +423,6 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
 
         assert {:error, :checksum_mismatch} =
                  BlobStore.get_range(root, 0, ref, 0, byte_size(payload))
-      end
-
-      test "get_range rejects an oversized legacy blob file", %{root: root} do
-        payload = "legacy-payload"
-        ref = BlobRef.from_payload(payload)
-        write_legacy_blob!(root, 0, ref, payload <> "-trailing-corruption")
-
-        assert {:error, :size_mismatch} = BlobStore.get_range(root, 0, ref, 0, 6)
       end
 
       test "get_range rejects a segment ref whose header does not match", %{root: root} do
@@ -624,27 +616,6 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
         assert File.dir?(segment_dir)
       end
 
-      test "legacy content-addressed refs remain readable", %{root: root} do
-        payload = "complete-payload"
-        ref = BlobRef.from_payload(payload)
-
-        write_legacy_blob!(root, 0, ref, payload)
-
-        assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
-        assert {:ok, {path, 0, 16}} = BlobStore.file_ref(root, 0, ref)
-        assert path == BlobRef.path(root, 0, ref)
-      end
-
-      test "legacy content-addressed corrupt refs are rejected", %{root: root} do
-        payload = "complete-payload"
-        ref = BlobRef.from_payload(payload)
-
-        write_legacy_blob!(root, 0, ref, :binary.copy("x", byte_size(payload)))
-
-        assert {:error, :checksum_mismatch} = BlobStore.get(root, 0, ref)
-        assert {:error, :checksum_mismatch} = BlobStore.verify(root, 0, ref)
-      end
-
       test "get detects same-size corrupt blob bytes", %{root: root} do
         payload = "correct"
 
@@ -752,15 +723,16 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
       end
 
       test "sweep_unreferenced deletes only blobs absent from the live ref set", %{root: root} do
-        live_ref = BlobRef.from_payload("live-payload")
-        dead_ref = BlobRef.from_payload("dead-payload")
+        with_blob_segment_max_bytes(600)
+        with_blob_segment_gc_grace_ms(0)
+
+        assert {:ok, live_ref} = BlobStore.put(root, 0, :binary.copy("l", 400))
+        assert {:ok, dead_ref} = BlobStore.put(root, 0, :binary.copy("d", 400))
         live_path = BlobRef.path(root, 0, live_ref)
         dead_path = BlobRef.path(root, 0, dead_ref)
+        dead_bytes = File.stat!(dead_path).size
 
-        write_legacy_blob!(root, 0, live_ref, "live-payload")
-        write_legacy_blob!(root, 0, dead_ref, "dead-payload")
-
-        assert {:ok, %{deleted_files: 1, deleted_bytes: 12, kept_files: 1}} =
+        assert {:ok, %{deleted_files: 1, deleted_bytes: ^dead_bytes, kept_files: 1}} =
                  BlobStore.sweep_unreferenced(root, 0, MapSet.new([live_ref]))
 
         assert File.exists?(live_path)
@@ -774,7 +746,6 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
         assert {:ok, {segment_path, _offset, _size}} = BlobStore.file_ref(root, 0, ref)
 
         invalid_ref = %BlobRef{
-          version: 2,
           checksum: :binary.copy(<<0>>, 32),
           size: 1,
           segment_id: nil,
@@ -819,10 +790,13 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
         assert [] = BlobStore.hardened_protection_ids(root, 0, 10)
       end
 
-      test "sweep_unreferenced deletes stale atomic-write tmp files", %{root: root} do
-        ref = BlobRef.from_payload("crashed-write")
-        blob_path = BlobRef.path(root, 0, ref)
-        tmp_path = Path.join(Path.dirname(blob_path), ".#{Path.basename(blob_path)}.123.tmp")
+      test "sweep_unreferenced deletes stale segment metadata tmp files", %{root: root} do
+        tmp_path =
+          Path.join([
+            Ferricstore.DataDir.blob_shard_path(root, 0),
+            "segments",
+            "next_segment_id.tmp"
+          ])
 
         File.mkdir_p!(Path.dirname(tmp_path))
         File.write!(tmp_path, "partial-crashed-write")
@@ -836,10 +810,13 @@ defmodule Ferricstore.Store.BlobStoreTest.Sections.PutAppendsBlobSegmentRecordRe
         assert [] == tmp_files(root, 0)
       end
 
-      test "sweep_unreferenced preserves fresh atomic-write tmp files", %{root: root} do
-        ref = BlobRef.from_payload("active-write")
-        blob_path = BlobRef.path(root, 0, ref)
-        tmp_path = Path.join(Path.dirname(blob_path), ".#{Path.basename(blob_path)}.456.tmp")
+      test "sweep_unreferenced preserves fresh segment metadata tmp files", %{root: root} do
+        tmp_path =
+          Path.join([
+            Ferricstore.DataDir.blob_shard_path(root, 0),
+            "segments",
+            "next_segment_id.tmp"
+          ])
 
         File.mkdir_p!(Path.dirname(tmp_path))
         File.write!(tmp_path, "active-write-in-progress")

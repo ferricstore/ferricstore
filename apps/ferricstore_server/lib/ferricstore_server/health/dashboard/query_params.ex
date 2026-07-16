@@ -6,18 +6,13 @@ defmodule FerricstoreServer.Health.Dashboard.QueryParams do
   def dashboard_param(opts, key) when is_map(opts), do: Map.get(opts, key, "")
 
   def dashboard_param(opts, key) when is_list(opts) do
-    atom_key = String.to_atom(key)
-
-    cond do
-      Keyword.keyword?(opts) ->
-        Keyword.get(opts, atom_key, "")
-
-      match?({^key, _value}, List.keyfind(opts, key, 0)) ->
-        {_key, value} = List.keyfind(opts, key, 0)
-        value
-
-      true ->
-        ""
+    case Enum.find(opts, fn
+           {^key, _value} -> true
+           {atom_key, _value} when is_atom(atom_key) -> Atom.to_string(atom_key) == key
+           _other -> false
+         end) do
+      {_key, value} -> value
+      nil -> ""
     end
   end
 

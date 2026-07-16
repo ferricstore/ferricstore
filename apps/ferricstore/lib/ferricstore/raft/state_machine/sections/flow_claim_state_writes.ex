@@ -117,14 +117,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
             :fallback
 
           true ->
-            lmdb_mirror? = flow_lmdb_projection_enabled?(state)
-
             with {:ok, staged_entries} <-
-                   flow_claim_stage_native_state_record_entries(
-                     plans,
-                     lmdb_mirror?,
-                     []
-                   ) do
+                   flow_claim_stage_native_state_record_entries(plans, []) do
               original_originals = Process.get(:sm_pending_originals, %{})
               original_pending_writes = Process.get(:sm_pending_writes, [])
               original_pending_values = Process.get(:sm_pending_values, %{})
@@ -150,7 +144,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
                     maybe_queue_lmdb_policy_put(state_key, disk_val, 0)
 
-                    if lmdb_mirror? or flow_record_has_indexed_attributes?(next) do
+                    if flow_record_has_indexed_attributes?(next) do
                       maybe_queue_lmdb_indexes_for_state_record(
                         state,
                         state_key,
@@ -199,14 +193,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
             :fallback
 
           true ->
-            lmdb_mirror? = flow_lmdb_projection_enabled?(state)
-
             with {:ok, staged_entries} <-
-                   flow_claim_stage_native_state_record_entries(
-                     plans,
-                     lmdb_mirror?,
-                     []
-                   ) do
+                   flow_claim_stage_native_state_record_entries(plans, []) do
               original_originals = Process.get(:sm_pending_originals, %{})
               original_pending_writes = Process.get(:sm_pending_writes, [])
               original_pending_values = Process.get(:sm_pending_values, %{})
@@ -232,7 +220,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
                     maybe_queue_lmdb_policy_put(state_key, disk_val, 0)
 
-                    if lmdb_mirror? or flow_record_has_indexed_attributes?(next) do
+                    if flow_record_has_indexed_attributes?(next) do
                       maybe_queue_lmdb_indexes_for_state_record(
                         state,
                         state_key,
@@ -267,7 +255,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
       defp flow_claim_put_native_state_records_batch(_state, _plans), do: :fallback
 
-      defp flow_claim_stage_native_state_record_entries([], _lmdb_mirror?, acc),
+      defp flow_claim_stage_native_state_record_entries([], acc),
         do: {:ok, Enum.reverse(acc)}
 
       defp flow_claim_stage_native_state_record_entries(
@@ -275,19 +263,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                {:native_claim, next, _entry, state_key, next_value, _previous_history_ms}
                | rest
              ],
-             lmdb_mirror?,
              acc
            ) do
-        if lmdb_mirror? and Ferricstore.Flow.LMDB.terminal_state?(Map.get(next, :state)) do
-          :fallback
-        else
-          disk_val = to_disk_binary(next_value)
-          entry = {state_key, next_value, 0, LFU.initial(), :pending, 0, byte_size(disk_val)}
+        disk_val = to_disk_binary(next_value)
+        entry = {state_key, next_value, 0, LFU.initial(), :pending, 0, byte_size(disk_val)}
 
-          flow_claim_stage_native_state_record_entries(rest, lmdb_mirror?, [
-            {state_key, next, next_value, disk_val, entry} | acc
-          ])
-        end
+        flow_claim_stage_native_state_record_entries(rest, [
+          {state_key, next, next_value, disk_val, entry} | acc
+        ])
       end
 
       defp flow_claim_stage_native_state_record_entries(
@@ -296,22 +279,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                 _history_entry}
                | rest
              ],
-             lmdb_mirror?,
              acc
            ) do
-        if lmdb_mirror? and Ferricstore.Flow.LMDB.terminal_state?(Map.get(next, :state)) do
-          :fallback
-        else
-          disk_val = to_disk_binary(next_value)
-          entry = {state_key, next_value, 0, LFU.initial(), :pending, 0, byte_size(disk_val)}
+        disk_val = to_disk_binary(next_value)
+        entry = {state_key, next_value, 0, LFU.initial(), :pending, 0, byte_size(disk_val)}
 
-          flow_claim_stage_native_state_record_entries(rest, lmdb_mirror?, [
-            {state_key, next, next_value, disk_val, entry} | acc
-          ])
-        end
+        flow_claim_stage_native_state_record_entries(rest, [
+          {state_key, next, next_value, disk_val, entry} | acc
+        ])
       end
 
-      defp flow_claim_stage_native_state_record_entries(_plans, _lmdb_mirror?, _acc),
+      defp flow_claim_stage_native_state_record_entries(_plans, _acc),
         do: :fallback
 
       defp flow_claim_put_state_records_batch(state, plans) do
@@ -360,8 +338,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
              [{:native_claim, next, _entry, state_key, next_value, _previous_history_ms} | rest],
              cache
            ) do
-        flow_put_state_record_encoded(state, state_key, next_value, 0, next)
-        flow_claim_put_state_records_loop(state, rest, cache)
+        with :ok <- flow_put_state_record_encoded(state, state_key, next_value, 0, next) do
+          flow_claim_put_state_records_loop(state, rest, cache)
+        end
       end
 
       defp flow_claim_put_state_records_loop(
@@ -373,8 +352,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
              ],
              cache
            ) do
-        flow_put_state_record_encoded(state, state_key, next_value, 0, next)
-        flow_claim_put_state_records_loop(state, rest, cache)
+        with :ok <- flow_put_state_record_encoded(state, state_key, next_value, 0, next) do
+          flow_claim_put_state_records_loop(state, rest, cache)
+        end
       end
 
       defp flow_claim_put_state_records_loop(
@@ -383,8 +363,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
              cache
            ) do
         {key, cache} = flow_state_record_key(cache, next)
-        flow_put_state_record(state, key, next)
-        flow_claim_put_state_records_loop(state, rest, cache)
+
+        with :ok <- flow_put_state_record(state, key, next) do
+          flow_claim_put_state_records_loop(state, rest, cache)
+        end
       end
 
       defp flow_claim_put_state_records_loop(
@@ -393,14 +375,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
              cache
            ) do
         {key, cache} = flow_state_record_key(cache, next)
-        flow_put_state_record(state, key, next)
-        flow_claim_put_state_records_loop(state, rest, cache)
+
+        with :ok <- flow_put_state_record(state, key, next) do
+          flow_claim_put_state_records_loop(state, rest, cache)
+        end
       end
 
       defp flow_claim_put_state_records_loop(state, [{_record, next} | rest], cache) do
         {key, cache} = flow_state_record_key(cache, next)
-        flow_put_state_record(state, key, next)
-        flow_claim_put_state_records_loop(state, rest, cache)
+
+        with :ok <- flow_put_state_record(state, key, next) do
+          flow_claim_put_state_records_loop(state, rest, cache)
+        end
       end
 
       defp flow_state_record_key(cache, %{id: id} = record) do
@@ -421,15 +407,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
       defp flow_history_key_with_tag(tag, id), do: "f:" <> tag <> ":h:" <> id
 
       defp flow_due_key_with_tag(tag, type, flow_state, priority) do
-        "f:" <> tag <> ":d:" <> type <> ":" <> flow_state <> ":p" <> Integer.to_string(priority)
+        "f:" <>
+          tag <>
+          ":d:" <>
+          FlowKeys.index_component(type) <>
+          ":" <>
+          FlowKeys.index_component(flow_state) <> ":p" <> Integer.to_string(priority)
       end
 
       defp flow_due_any_key_with_tag(tag, type, priority) do
-        "f:" <> tag <> ":da:" <> type <> ":p" <> Integer.to_string(priority)
+        "f:" <>
+          tag <>
+          ":da:" <> FlowKeys.index_component(type) <> ":p" <> Integer.to_string(priority)
       end
 
       defp flow_state_index_key_with_tag(tag, type, flow_state) do
-        "f:" <> tag <> ":i:s:" <> type <> ":" <> flow_state
+        "f:" <>
+          tag <>
+          ":i:s:" <> FlowKeys.index_component(type) <> ":" <> FlowKeys.index_component(flow_state)
       end
 
       defp flow_inflight_index_key_with_tag(tag, type), do: "f:" <> tag <> ":i:r:" <> type
@@ -452,11 +447,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
             :ok
 
           :fallback ->
-            Enum.each(key_records, fn {key, record} ->
-              flow_put_new_state_record(state, key, record)
+            Enum.reduce_while(key_records, :ok, fn {key, record}, :ok ->
+              case flow_put_new_state_record(state, key, record) do
+                :ok -> {:cont, :ok}
+                {:error, _reason} = error -> {:halt, error}
+              end
             end)
 
-            :ok
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -468,11 +467,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
             :ok
 
           :fallback ->
-            Enum.each(key_records, fn {key, record} ->
-              flow_put_new_state_record(state, key, record)
+            Enum.reduce_while(key_records, :ok, fn {key, record}, :ok ->
+              case flow_put_new_state_record(state, key, record) do
+                :ok -> {:cont, :ok}
+                {:error, _reason} = error -> {:halt, error}
+              end
             end)
 
-            :ok
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -487,7 +490,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
             :fallback
 
           true ->
-            projection_enabled? = flow_lmdb_projection_enabled?(state)
             lagged_projection? = Ferricstore.Flow.LMDB.mode() == :lagged
             originals = Process.get(:sm_pending_originals, %{})
             pending_values = Process.get(:sm_pending_values, %{})
@@ -504,7 +506,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                        {:ok, :value, stored_value} ->
                          flow_stage_new_state_record_batch_entry(
                            state,
-                           projection_enabled?,
                            key,
                            record,
                            value,
@@ -522,7 +523,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                        {:ok, :blob_ref, stored_value, pending_value} ->
                          flow_stage_new_state_record_batch_entry(
                            state,
-                           projection_enabled?,
                            key,
                            record,
                            value,
@@ -551,8 +551,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                 Process.put(:sm_pending_fast_staged_put_batch, true)
 
                 safe_ets_insert(state.ets, entries)
-                flow_track_state_retention_metadata_batch(state, key_records)
-                flow_enqueue_governance_release_intents(state, key_records)
+
+                with :ok <- flow_track_state_retention_metadata_batch(state, key_records) do
+                  flow_enqueue_governance_release_intents(state, key_records)
+                end
 
               {:error, _reason} = error ->
                 error
@@ -571,7 +573,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
             :fallback
 
           true ->
-            projection_enabled? = flow_lmdb_projection_enabled?(state)
             lagged_projection? = Ferricstore.Flow.LMDB.mode() == :lagged
             originals = Process.get(:sm_pending_originals, %{})
             pending_values = Process.get(:sm_pending_values, %{})
@@ -589,7 +590,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                        {:ok, :value, stored_value} ->
                          flow_stage_state_record_batch_entry(
                            state,
-                           projection_enabled?,
                            key,
                            record,
                            value,
@@ -608,7 +608,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                        {:ok, :blob_ref, stored_value, pending_value} ->
                          flow_stage_state_record_batch_entry(
                            state,
-                           projection_enabled?,
                            key,
                            record,
                            value,
@@ -638,8 +637,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                 Process.put(:sm_pending_fast_staged_put_batch, true)
 
                 safe_ets_insert(state.ets, entries)
-                flow_track_state_retention_metadata_batch(state, key_records)
-                flow_enqueue_governance_release_intents(state, key_records)
+
+                with :ok <- flow_track_state_retention_metadata_batch(state, key_records) do
+                  flow_enqueue_governance_release_intents(state, key_records)
+                end
 
               {:error, _reason} = error ->
                 error
@@ -649,7 +650,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
       defp flow_stage_state_record_batch_entry(
              state,
-             projection_enabled?,
              key,
              record,
              encoded_record,
@@ -668,7 +668,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
         disk_val = to_disk_binary(stored_value)
         blob_ref? = stored_value != encoded_record
 
-        if (projection_enabled? and terminal?) or flow_record_has_indexed_attributes?(record) do
+        if flow_record_has_indexed_attributes?(record) do
           maybe_queue_lmdb_indexes_for_state_record(
             state,
             key,
@@ -689,10 +689,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                   else: LFU.initial()
 
               {nil, lfu, {:put_cold, key, disk_val, expire_at_ms, lfu}}
-
-            projection_enabled? and terminal? ->
-              lfu = flow_record_lfu(record, encoded_record)
-              {encoded_record, lfu, {:put, key, disk_val, expire_at_ms}}
 
             true ->
               maybe_queue_flow_hibernation_candidate(state, key, record, encoded_record)
@@ -716,7 +712,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
       defp flow_stage_new_state_record_batch_entry(
              state,
-             projection_enabled?,
              key,
              record,
              encoded_record,
@@ -735,7 +730,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
         blob_ref? = stored_value != encoded_record
         lfu = LFU.initial()
 
-        if (projection_enabled? and terminal?) or flow_record_has_indexed_attributes?(record) do
+        if flow_record_has_indexed_attributes?(record) do
           maybe_queue_lmdb_indexes_for_state_record(
             state,
             key,
@@ -756,10 +751,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
                   else: lfu
 
               {nil, lfu, {:put_cold, key, disk_val, expire_at_ms, lfu}}
-
-            projection_enabled? and terminal? ->
-              lfu = flow_record_lfu(record, encoded_record)
-              {encoded_record, lfu, {:put, key, disk_val, expire_at_ms}}
 
             true ->
               maybe_queue_flow_hibernation_candidate(state, key, record, encoded_record)

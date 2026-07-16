@@ -76,6 +76,7 @@ defmodule Ferricstore.ReviewR2.C2LocksPersistTest do
          %{
            command: :smove,
            keys: %{source: "a", dest: "b"},
+           value_hashes: %{"a" => nil, "b" => nil},
            status: :executing,
            created_at: System.os_time(:millisecond)
          }}

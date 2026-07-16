@@ -218,6 +218,36 @@ defmodule Ferricstore.Commands.SetStoreCommandsTest do
       assert Set.handle("SMEMBERS", ["dst"], store) == ["new"]
     end
 
+    test "aborts before replacing a destination whose type marker cannot be read" do
+      base = MockStore.make()
+      Set.handle("SADD", ["dst", "old"], base)
+      Set.handle("SADD", ["src", "new"], base)
+      failure = Ferricstore.Store.ReadResult.failure(:missing_file)
+      type_key = CompoundKey.type_key("dst")
+
+      store =
+        base
+        |> Map.put(:compound_get, fn redis_key, compound_key ->
+          if redis_key == "dst" and compound_key == type_key,
+            do: failure,
+            else: base.compound_get.(redis_key, compound_key)
+        end)
+        |> Map.put(:delete, fn _key ->
+          flunk("SUNIONSTORE must not delete without a complete destination snapshot")
+        end)
+        |> Map.put(:compound_delete, fn _redis_key, _compound_key ->
+          flunk("SUNIONSTORE must not delete without a complete destination snapshot")
+        end)
+        |> Map.put(:compound_delete_prefix, fn _redis_key, _prefix ->
+          flunk("SUNIONSTORE must not delete without a complete destination snapshot")
+        end)
+
+      assert {:error, "ERR storage read failed"} ==
+               Set.handle("SUNIONSTORE", ["dst", "src"], store)
+
+      assert ["old"] == Set.handle("SMEMBERS", ["dst"], base)
+    end
+
     test "all nonexistent sources gives empty set" do
       store = MockStore.make()
       assert 0 == Set.handle("SUNIONSTORE", ["dst", "nope1", "nope2"], store)

@@ -3,6 +3,42 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.SegmentLogCapsEtsTailWh
 
   defmacro __using__(_opts) do
     quote do
+      @tag :waraft_noncanonical_append_entry
+      test "segment log rejects noncanonical binary append entries" do
+        with_segment_log_memory_env(
+          max_bytes: 1_000_000,
+          max_entries: 10,
+          min_entries: 1,
+          records_per_segment: 64,
+          fun: fn _root, log, _log_name ->
+            assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+            assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+            view0 = {:log_view, log, 0, 0, :undefined}
+            entry = {1, {:cmd, :binary.copy("value", 4_096)}}
+            canonical = :erlang.term_to_binary(entry, [:deterministic])
+            compressed = :erlang.term_to_binary(entry, compressed: 9)
+
+            assert <<131, 80, _::binary>> = compressed
+
+            encodings = [
+              compressed,
+              canonical <> <<0>>
+            ]
+
+            Enum.each(encodings, fn encoded ->
+              assert {:error, {:bad_entry_term, _reason}} =
+                       :ferricstore_waraft_spike_segment_log.append(
+                         view0,
+                         [encoded],
+                         :strict,
+                         :low
+                       )
+            end)
+          end
+        )
+      end
+
       test "segment log caps ETS tail while disk-backed reads still see older entries" do
         with_segment_log_memory_env(
           max_bytes: 1_000,
@@ -58,6 +94,44 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.SegmentLogCapsEtsTailWh
                        segment_dir |> to_string() |> Path.dirname() |> to_charlist(),
                        2
                      )
+          end
+        )
+      end
+
+      @tag :waraft_memory_registry_recovery
+      test "segment log recovers durable boundaries after shared memory registry loss" do
+        with_segment_log_memory_env(
+          max_bytes: 1_000,
+          max_entries: 1,
+          min_entries: 1,
+          records_per_segment: 64,
+          fun: fn _root, log, _log_name ->
+            assert :ok = :ferricstore_waraft_spike_segment_log.init(log)
+            assert {:ok, _provider_state} = :ferricstore_waraft_spike_segment_log.open(log)
+
+            view0 = {:log_view, log, 0, 0, :undefined}
+            payload = :binary.copy("boundary", 256)
+
+            assert :ok =
+                     :ferricstore_waraft_spike_segment_log.append(
+                       view0,
+                       for(i <- 1..3, do: {1, {:cmd, payload <> Integer.to_string(i)}}),
+                       :strict,
+                       :low
+                     )
+
+            assert :ferricstore_waraft_spike_segment_log.first_index(log) == 1
+            assert :ferricstore_waraft_spike_segment_log.last_index(log) == 3
+
+            registry = :ferricstore_waraft_segment_log_memory_registry
+            assert :ets.info(registry) != :undefined
+            :ets.delete(registry)
+
+            assert :ferricstore_waraft_spike_segment_log.first_index(log) == 1
+            assert :ferricstore_waraft_spike_segment_log.last_index(log) == 3
+
+            assert %{disk_first_index: 1, disk_last_index: 3, ets_entries: 1} =
+                     :ferricstore_waraft_spike_segment_log.memory_status(log)
           end
         )
       end

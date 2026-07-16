@@ -33,9 +33,9 @@ defmodule Ferricstore.Commands.FetchOrComputeNoDefaultInstanceTest do
 
   test "result and error paths return bounded errors before init" do
     assert {:error, "instance not initialized"} =
-             FetchOrCompute.fetch_or_compute_result("foc:init", "value", 1_000)
+             FetchOrCompute.fetch_or_compute_result("foc:init", "value", "token", 1_000)
 
     assert {:error, "instance not initialized"} =
-             FetchOrCompute.fetch_or_compute_error("foc:init", "failed")
+             FetchOrCompute.fetch_or_compute_error("foc:init", "token", "failed")
   end
 end

@@ -134,6 +134,17 @@ defmodule Ferricstore.ApplicationTest do
         restore_env(:blob_side_channel_threshold_bytes, old_threshold)
       end
     end
+
+    test "large-value scan performs no shard work for a zero-shard topology" do
+      key = "zero-shard-large-value-#{System.unique_integer([:positive])}"
+      true = :ets.insert(:keydir_0, {key, "value", 0, 0, 0, 0, 5})
+
+      try do
+        assert Ferricstore.Application.scan_large_values(0, 0) == {0, nil, 0}
+      after
+        :ets.delete(:keydir_0, key)
+      end
+    end
   end
 
   describe "graceful shutdown" do

@@ -84,6 +84,37 @@ defmodule Ferricstore.FlowStateMetaTest do
            }
   end
 
+  test "claim preserves separator-bearing type and state index components" do
+    type = unique_flow_id("state:meta:type")
+    flow_state = "accept:manual"
+    id = unique_flow_id("state-meta-separators")
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: flow_state,
+               partition_key: @partition,
+               state_meta: %{"version" => 1},
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               states: [flow_state],
+               partition_key: @partition,
+               worker: "worker-separators",
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    assert claimed.id == id
+    assert claimed.type == type
+    assert claimed.state == "running"
+    assert claimed.run_state == flow_state
+    assert claimed.state_meta == %{flow_state => %{"version" => 1}}
+  end
+
   test "state_meta version is queryable only when policy indexes that metadata key" do
     type = unique_flow_id("state-meta-index-type")
     indexed_id = unique_flow_id("state-meta-indexed")

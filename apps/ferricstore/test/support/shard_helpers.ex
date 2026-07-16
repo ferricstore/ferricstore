@@ -10,6 +10,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
 
   alias Ferricstore.Flow.Governance.LimitCache
+  alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.Router
 
   @test_max_memory_bytes 1_073_741_824
@@ -111,13 +112,6 @@ defmodule Ferricstore.Test.ShardHelpers do
     flush_timeout = 30_000
     ready_timeout = min(flush_timeout, 10_000)
 
-    backfill_watermarks =
-      Map.new(0..(shard_count - 1), fn shard_index ->
-        key = Ferricstore.Flow.Keys.shared_value_ref_backfill_key(shard_index)
-
-        {shard_index, :ets.lookup(elem(ctx.keydir_refs, shard_index), key)}
-      end)
-
     # Flush background BitcaskWriter so deferred writes are on disk
     # before we snapshot keys for deletion.
     Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
@@ -139,7 +133,7 @@ defmodule Ferricstore.Test.ShardHelpers do
         try do
           shard
           |> GenServer.call(:keys, flush_timeout)
-          |> Enum.reject(&Ferricstore.Flow.Keys.shared_value_ref_backfill_key?/1)
+          |> Enum.reject(&preserve_during_test_flush?/1)
         catch
           :exit, _ -> []
         end
@@ -173,12 +167,10 @@ defmodule Ferricstore.Test.ShardHelpers do
     Enum.each(0..(shard_count - 1), fn i ->
       # Single-table keydir has 7-element tuples {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
       try do
-        :ets.select_delete(:"keydir_#{i}", [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [true]}])
+        delete_unpreserved_keydir_rows(:"keydir_#{i}", i)
       rescue
         ArgumentError -> :ok
       end
-
-      Enum.each(Map.get(backfill_watermarks, i, []), &:ets.insert(:"keydir_#{i}", &1))
     end)
 
     # Clear disk pressure flags. A previous test may have hit a transient
@@ -201,6 +193,30 @@ defmodule Ferricstore.Test.ShardHelpers do
     # command tests fail with KEYDIR_FULL despite empty ETS tables.
     reset_keydir_binary_counters(ctx, shard_count)
     reset_memory_guard_pressure()
+  end
+
+  defp preserve_during_test_flush?(key) do
+    Ferricstore.Flow.Keys.shared_value_ref_backfill_key?(key) or
+      ServerCatalog.internal_key?(key)
+  end
+
+  defp delete_unpreserved_keydir_rows(keydir, shard_index) do
+    backfill_key = Ferricstore.Flow.Keys.shared_value_ref_backfill_key(shard_index)
+    catalog_prefix = ServerCatalog.root_prefix()
+    prefix_size = byte_size(catalog_prefix)
+
+    catalog_key_guard =
+      {:andalso, {:is_binary, :"$1"},
+       {:andalso, {:>=, {:byte_size, :"$1"}, prefix_size},
+        {:==, {:binary_part, :"$1", 0, prefix_size}, catalog_prefix}}}
+
+    delete_guard =
+      {:not, {:orelse, {:==, :"$1", backfill_key}, catalog_key_guard}}
+
+    :ets.select_delete(
+      keydir,
+      [{{:"$1", :_, :_, :_, :_, :_, :_}, [delete_guard], [true]}]
+    )
   end
 
   def reset_server_auth_state do

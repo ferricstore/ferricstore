@@ -102,6 +102,12 @@ defmodule Ferricstore.NamespaceConfigTest do
       assert msg =~ "positive integer"
     end
 
+    test "rejects commit windows that can outlive the synchronous batch call" do
+      assert {:error, msg} = NamespaceConfig.set("rate", "window_ms", "30000")
+      assert msg =~ "at most 10000 milliseconds"
+      assert NamespaceConfig.window_for("rate") == NamespaceConfig.default_window_ms()
+    end
+
     test "rejects durability field regardless of value" do
       assert {:error, msg} = NamespaceConfig.set("rate", "durability", "sync")
       assert msg =~ "unknown namespace config field 'durability'"
@@ -110,6 +116,48 @@ defmodule Ferricstore.NamespaceConfigTest do
     test "rejects unknown field name" do
       assert {:error, msg} = NamespaceConfig.set("rate", "bogus_field", "10")
       assert msg =~ "unknown namespace config field"
+    end
+
+    test "enforces the configured entry limit under concurrent creators" do
+      old_limit = Application.get_env(:ferricstore, :namespace_config_max_entries)
+      Application.put_env(:ferricstore, :namespace_config_max_entries, 3)
+
+      on_exit(fn ->
+        if is_nil(old_limit) do
+          Application.delete_env(:ferricstore, :namespace_config_max_entries)
+        else
+          Application.put_env(:ferricstore, :namespace_config_max_entries, old_limit)
+        end
+      end)
+
+      results =
+        1..20
+        |> Task.async_stream(
+          fn index -> NamespaceConfig.set("limited-#{index}", "window_ms", "10") end,
+          max_concurrency: 20,
+          ordered: false
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert Enum.count(results, &(&1 == :ok)) == 3
+      assert length(NamespaceConfig.get_all()) == 3
+
+      assert Enum.all?(Enum.reject(results, &(&1 == :ok)), fn {:error, message} ->
+               message =~ "namespace config limit"
+             end)
+    end
+
+    test "rejects prefixes and audit identities that exceed metadata bounds" do
+      oversized = :binary.copy("x", 257)
+
+      assert {:error, prefix_error} = NamespaceConfig.set(oversized, "window_ms", "10")
+      assert prefix_error =~ "prefix exceeds"
+
+      assert {:error, identity_error} =
+               NamespaceConfig.set("safe", "window_ms", "10", oversized)
+
+      assert identity_error =~ "changed_by exceeds"
+      assert NamespaceConfig.get_all() == []
     end
   end
 
@@ -127,6 +175,14 @@ defmodule Ferricstore.NamespaceConfigTest do
       {:ok, entry} = NamespaceConfig.get("rate")
       assert entry.prefix == "rate"
       assert entry.window_ms == 10
+    end
+
+    test "normalizes trailing separators consistently for set, read, and reset" do
+      assert :ok = NamespaceConfig.set("rate::", "window_ms", "10")
+      assert {:ok, %{window_ms: 10}} = NamespaceConfig.get("rate:")
+      assert NamespaceConfig.window_for("rate::") == 10
+      assert :ok = NamespaceConfig.reset("rate:")
+      assert NamespaceConfig.window_for("rate") == 1
     end
   end
 

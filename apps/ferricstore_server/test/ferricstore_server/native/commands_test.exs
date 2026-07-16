@@ -2,27 +2,40 @@ defmodule FerricstoreServer.Native.CommandsTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
+  import ExUnit.CaptureLog
+
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Acl.CatalogProjector
   alias FerricstoreServer.AuthRateLimiter
   alias Ferricstore.Commands.PreparedCommand
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.Commands
   alias FerricstoreServer.Native.Session
+  alias Ferricstore.Stats
+  alias Ferricstore.Test.IsolatedInstance
 
   @op_hello 0x0001
   @op_auth 0x0002
+  @op_client_set_name 0x0004
   @op_route 0x0006
   @op_route_batch 0x000F
   @op_shards 0x0007
   @op_options 0x000B
+  @op_startup 0x000C
   @op_pipeline 0x000E
   @op_command_exec 0x0100
+  @op_get 0x0101
+  @op_mget 0x0104
   @op_set 0x0102
   @op_hset 0x0110
+  @op_hgetall 0x0113
+  @op_smembers 0x0132
+  @op_ferricstore_metrics 0x030F
   @op_flow_create 0x0201
   @op_flow_get 0x0202
   @op_flow_claim_due 0x0203
+  @op_flow_history 0x020A
   @op_flow_value_put 0x020B
   @op_flow_list 0x020E
   @op_flow_create_many 0x020F
@@ -36,6 +49,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_flow_start_and_claim 0x0223
   @op_flow_run_steps_many 0x0224
   @op_flow_schedule_create 0x0225
+  @op_flow_schedule_get 0x0226
   @op_flow_schedule_delete 0x0227
   @op_flow_schedule_fire 0x022A
   @op_flow_stats 0x022D
@@ -46,6 +60,79 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_flow_circuit_get 0x024C
   @op_flow_budget_reserve 0x024D
   @op_flow_limit_lease 0x024F
+
+  @tag :native_collection_preflight
+  test "compact collection pipelines reject over-limit counts before scanning" do
+    ctx = FerricStore.Instance.get(:default)
+    suffix = System.unique_integer([:positive])
+    set_key = "native:preflight:set:#{suffix}"
+    hash_key = "native:preflight:hash:#{suffix}"
+
+    assert {:ok, 2} = FerricStore.Impl.sadd(ctx, set_key, ["a", "b"])
+    assert {:ok, 2} = FerricStore.Impl.hset(ctx, hash_key, %{"a" => "1", "b" => "2"})
+    on_exit(fn -> FerricStore.del([set_key, hash_key]) end)
+
+    traced_pid = self()
+    tracer = spawn_link(fn -> forward_router_traces(traced_pid) end)
+    :erlang.trace_pattern({Ferricstore.Store.Router, :compound_scan_raw, 3}, true, [])
+    :erlang.trace(traced_pid, true, [:call, {:tracer, tracer}])
+
+    try do
+      for {mode, key} <- [{27, set_key}, {30, hash_key}] do
+        assert {:bad_request, message, _state} =
+                 Commands.execute(
+                   @op_pipeline,
+                   %{"return" => "pairs", "compact_pipeline" => {mode, [key]}},
+                   state(%{max_collection_response_items: 1})
+                 )
+
+        assert message =~ "collection response item limit"
+
+        refute_receive {:router_trace,
+                        {:trace, ^traced_pid, :call,
+                         {Ferricstore.Store.Router, :compound_scan_raw, _arguments}}}
+      end
+    after
+      :erlang.trace(traced_pid, false, [:call])
+      :erlang.trace_pattern({Ferricstore.Store.Router, :compound_scan_raw, 3}, false, [])
+      Process.exit(tracer, :normal)
+    end
+  end
+
+  @tag :native_compact_storage_failure
+  test "compact compound reads preserve shard failures" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    shard = elem(ctx.shard_names, 0)
+
+    try do
+      GenServer.stop(shard, :normal, 5_000)
+
+      native_state =
+        state(%{
+          instance_ctx: ctx,
+          stats_counter: ctx.stats_counter
+        })
+
+      for {mode, item} <- [
+            {18, {"missing-hash", "field"}},
+            {19, {"missing-set", "member"}},
+            {20, {"missing-list", 0, -1}},
+            {21, {"missing-zset-range", 0, -1, false}},
+            {27, "missing-set-members"},
+            {29, {"missing-zset", "member"}},
+            {30, "missing-hash-fields"}
+          ] do
+        assert {:ok, [["error", "ERR storage read failed"]], _state} =
+                 Commands.execute(
+                   @op_pipeline,
+                   %{"return" => "pairs", "compact_pipeline" => {mode, [item]}},
+                   native_state
+                 )
+      end
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
 
   defmodule TestExtension do
     @behaviour Ferricstore.Commands.Extension
@@ -124,6 +211,29 @@ defmodule FerricstoreServer.Native.CommandsTest do
     def handle("EXT.COUNTED", [key], _store), do: {:ok, key}
   end
 
+  defmodule RaisingExtension do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      [
+        %{
+          name: "EXT.RAISE",
+          arity: 1,
+          flags: ["readonly"],
+          first_key: 0,
+          last_key: 0,
+          step: 0,
+          access: :read,
+          summary: "Raises for command boundary tests"
+        }
+      ]
+    end
+
+    @impl true
+    def handle("EXT.RAISE", [], _store), do: raise("extension-internal-secret")
+  end
+
   setup do
     previous_extensions = Application.get_env(:ferricstore, :command_extensions)
 
@@ -175,6 +285,17 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload.multiplexing.request_id == true
     assert payload.multiplexing.concurrent_lanes == true
     assert payload.response_codecs.typed_value == true
+
+    assert payload.response_codecs.compact_response_opcodes == %{
+             "flow_claim_jobs_v1" => [0x0203],
+             "flow_record_list_v1" => [0x020E, 0x0217, 0x0218, 0x0219, 0x021A, 0x021B, 0x021D],
+             "flow_record_v1" => [0x0202],
+             "kv_get_v1" => [0x0101],
+             "kv_mget_v1" => [0x0104, 0x020C],
+             "ok_list_v1" => [0x0102, 0x0105, 0x020F, 0x0210, 0x0212, 0x0213, 0x0214],
+             "pipeline_v1" => [0x000E]
+           }
+
     assert "FLOW.CREATE" in schema_names(payload)
     assert "FLOW.CLAIM_DUE" in schema_names(payload)
     assert "FLOW.COMPLETE" in schema_names(payload)
@@ -196,6 +317,41 @@ defmodule FerricstoreServer.Native.CommandsTest do
         ] do
       assert "max_active_ms" in payload.schemas[command]["fields"]
     end
+
+    assert "parent_flow_id" in payload.schemas["FLOW.CREATE"]["fields"]
+    assert "root_flow_id" in payload.schemas["FLOW.CREATE"]["fields"]
+    refute "parent_id" in payload.schemas["FLOW.CREATE"]["fields"]
+    refute "root_id" in payload.schemas["FLOW.CREATE"]["fields"]
+    assert "rev" in payload.schemas["FLOW.SCHEDULE.LIST"]["fields"]
+
+    assert payload.schemas["FLOW.SIGNAL"]["required"] == ["id", "signal"]
+
+    for field <- [
+          "partition_key",
+          "idempotency_key",
+          "if_state",
+          "transition_to",
+          "run_at_ms",
+          "now_ms",
+          "values",
+          "value_refs",
+          "drop_values",
+          "override_values"
+        ] do
+      assert field in payload.schemas["FLOW.SIGNAL"]["fields"]
+    end
+
+    for command <- [
+          "FLOW.GET",
+          "FLOW.LIST",
+          "FLOW.HISTORY",
+          "FLOW.RETRY",
+          "FLOW.FAIL",
+          "FLOW.CANCEL",
+          "FLOW.POLICY.GET"
+        ] do
+      assert Map.has_key?(payload.schemas, command)
+    end
   end
 
   test "HELLO returns native route metadata only" do
@@ -210,6 +366,38 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload.route.endpoint.native_port == payload.route.native_port
     refute Map.has_key?(payload.route, String.to_atom("resp" <> "_port"))
     assert new_state.client_name == "sdk-a"
+  end
+
+  @tag :native_client_name_limit
+  test "HELLO bounds retained client names and requires UTF-8" do
+    max_name = String.duplicate("n", 1_024)
+
+    assert {:ok, _payload, %{client_name: ^max_name}} =
+             Commands.execute(@op_hello, %{"client_name" => max_name}, state())
+
+    assert {:bad_request, oversized_error, %{client_name: nil}} =
+             Commands.execute(
+               @op_hello,
+               %{"client_name" => max_name <> "n"},
+               state()
+             )
+
+    assert oversized_error =~ "client name exceeds 1024 bytes"
+
+    assert {:bad_request, utf8_error, %{client_name: nil}} =
+             Commands.execute(@op_hello, %{"client_name" => <<255>>}, state())
+
+    assert utf8_error =~ "valid UTF-8"
+
+    assert {:bad_request, startup_error, %{client_name: nil}} =
+             Commands.execute(@op_startup, %{"driver_name" => max_name <> "n"}, state())
+
+    assert startup_error =~ "driver name exceeds 1024 bytes"
+
+    assert {:bad_request, setname_error, %{client_name: nil}} =
+             Commands.execute(@op_client_set_name, %{"name" => <<255>>}, state())
+
+    assert setname_error =~ "valid UTF-8"
   end
 
   test "HELLO redacts native endpoints before authentication is complete" do
@@ -377,6 +565,62 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload == "PONG"
   end
 
+  test "native command exceptions are logged without exposing details to clients" do
+    Application.put_env(:ferricstore, :command_extensions, [RaisingExtension])
+
+    log =
+      capture_log(fn ->
+        assert {:error, "ERR internal server error", _state} =
+                 Commands.execute(
+                   @op_command_exec,
+                   %{"command" => "EXT.RAISE", "args" => []},
+                   state()
+                 )
+      end)
+
+    assert log =~ "native command execution failed"
+    assert log =~ "extension-internal-secret"
+  end
+
+  test "metrics exceptions return an error instead of empty success" do
+    metrics_handler = fn "FERRICSTORE.METRICS", [] -> raise("metrics-internal-secret") end
+    state = state(%{metrics_handler: metrics_handler})
+
+    log =
+      capture_log(fn ->
+        for {opcode, payload} <- [
+              {@op_ferricstore_metrics, %{}},
+              {@op_command_exec, %{"command" => "FERRICSTORE.METRICS", "args" => []}}
+            ] do
+          assert {:error, "ERR internal server error", _state} =
+                   Commands.execute(opcode, payload, state)
+        end
+      end)
+
+    assert log =~ "metrics-internal-secret"
+  end
+
+  test "metrics exits return an error instead of terminating the request" do
+    metrics_handler = fn "FERRICSTORE.METRICS", [] -> exit(:metrics_collector_unavailable) end
+
+    log =
+      capture_log(fn ->
+        assert {:error, "ERR internal server error", _state} =
+                 Commands.execute(
+                   @op_ferricstore_metrics,
+                   %{},
+                   state(%{metrics_handler: metrics_handler})
+                 )
+      end)
+
+    assert log =~ "metrics_collector_unavailable"
+  end
+
+  test "native admin args reject structured values without raising" do
+    assert {:bad_request, "ERR native field args contains an unsupported value", _state} =
+             Commands.execute(@op_ferricstore_metrics, %{"args" => [%{}]}, state())
+  end
+
   test "FLOW.POLICY.SET accepts indexed attributes through native opcode" do
     type = "native-policy-indexes-#{System.unique_integer([:positive, :monotonic])}"
 
@@ -465,6 +709,37 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
 
     assert started.max_active_ms == 30_000
+  end
+
+  test "native FLOW.CREATE preserves canonical lineage and creation semantics" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    id = "native-lineage-child-#{suffix}"
+    parent_id = "native-lineage-parent-#{suffix}"
+    root_id = "native-lineage-root-#{suffix}"
+
+    assert {:ok, "OK", _state} =
+             Commands.execute(
+               @op_flow_create,
+               %{
+                 "id" => id,
+                 "type" => "native-lineage",
+                 "parent_flow_id" => parent_id,
+                 "root_flow_id" => root_id,
+                 "idempotent" => true,
+                 "max_active_ms" => 60_000,
+                 "history_hot_max_events" => 100,
+                 "history_max_events" => 1_000,
+                 "now_ms" => 1_000
+               },
+               state()
+             )
+
+    assert {:ok, record} = FerricStore.flow_get(id)
+    assert record.parent_flow_id == parent_id
+    assert record.root_flow_id == root_id
+    assert record.max_active_ms == 60_000
+    assert record.history_hot_max_events == 100
+    assert record.history_max_events == 1_000
   end
 
   test "FLOW.SPAWN_CHILDREN accepts max_active_ms in child payloads" do
@@ -756,6 +1031,15 @@ defmodule FerricstoreServer.Native.CommandsTest do
            ] = payload
   end
 
+  test "PIPELINE rejects a structured atomicity value without crashing" do
+    assert {:bad_request, "ERR native field atomicity must be binary", _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{"commands" => [], "atomicity" => %{"mode" => "none"}},
+               state()
+             )
+  end
+
   test "COMMAND_EXEC authorizes extension command and key metadata" do
     Application.put_env(:ferricstore, :command_extensions, [TestExtension])
 
@@ -850,6 +1134,225 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert message =~ "multiple shards"
   end
 
+  @tag :native_response_byte_budget
+  test "GET rejects an oversized cold value before materializing it" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "native:get:cold-byte-budget:#{System.unique_integer([:positive])}"
+    value = String.duplicate("x", 128)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, shard_index)
+
+    assert :ok = FerricStore.set(key, value)
+    assert :ok = GenServer.call(elem(ctx.shard_names, shard_index), :flush, 5_000)
+    on_exit(fn -> FerricStore.del(key) end)
+
+    assert [{^key, ^value, expire_at_ms, lfu, file_id, offset, 128}] = :ets.lookup(keydir, key)
+    refute file_id == :pending
+    assert true = :ets.insert(keydir, {key, nil, expire_at_ms, lfu, file_id, offset, 128})
+
+    cold_reads_before = Stats.total_cold_reads(ctx)
+
+    for {opcode, payload} <- [
+          {@op_get, %{"key" => key}},
+          {@op_command_exec, %{"command" => "GET", "args" => [key]}}
+        ] do
+      assert {:bad_request, message, _state} =
+               Commands.execute(opcode, payload, state(%{max_response_bytes: 32}))
+
+      assert message =~ "response byte limit"
+      assert Stats.total_cold_reads(ctx) == cold_reads_before
+      assert [{^key, nil, ^expire_at_ms, ^lfu, ^file_id, ^offset, 128}] = :ets.lookup(keydir, key)
+    end
+  end
+
+  @tag :native_response_byte_budget
+  test "MGET rejects a response whose encoded bytes exceed the connection budget" do
+    suffix = System.unique_integer([:positive])
+    first = "native:mget:byte-budget:first:#{suffix}"
+    second = "native:mget:byte-budget:second:#{suffix}"
+
+    assert :ok = FerricStore.set(first, "12345678")
+    assert :ok = FerricStore.set(second, "abcdefgh")
+    on_exit(fn -> FerricStore.del([first, second]) end)
+
+    assert {:bad_request, message, _state} =
+             Commands.execute(
+               @op_mget,
+               %{"keys" => [first, second]},
+               state(%{max_response_bytes: 32})
+             )
+
+    assert message =~ "response byte limit"
+  end
+
+  @tag :native_response_byte_budget
+  test "pipeline GET fast paths reject oversized cold values before materializing them" do
+    ctx = FerricStore.Instance.get(:default)
+    suffix = System.unique_integer([:positive])
+    key = "native:pipeline:cold-byte-budget:#{suffix}"
+    set_key = "native:pipeline:cold-byte-budget:set:#{suffix}"
+    value = String.duplicate("x", 128)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, shard_index)
+
+    assert :ok = FerricStore.set(key, value)
+    assert :ok = GenServer.call(elem(ctx.shard_names, shard_index), :flush, 5_000)
+    on_exit(fn -> FerricStore.del([key, set_key]) end)
+
+    assert [{^key, ^value, expire_at_ms, lfu, file_id, offset, 128}] = :ets.lookup(keydir, key)
+    assert true = :ets.insert(keydir, {key, nil, expire_at_ms, lfu, file_id, offset, 128})
+    cold_reads_before = Stats.total_cold_reads(ctx)
+
+    payloads = [
+      %{
+        "commands" => [
+          %{"opcode" => @op_get, "request_id" => 1, "body" => %{"key" => key}}
+        ]
+      },
+      %{"compact_pipeline" => {2, [key]}},
+      %{"compact_pipeline" => {5, [{:get, key}, {:set, set_key, "written"}]}}
+    ]
+
+    for payload <- payloads do
+      assert {:bad_request, message, _state} =
+               Commands.execute(@op_pipeline, payload, state(%{max_response_bytes: 32}))
+
+      assert message =~ "response byte limit"
+      assert Stats.total_cold_reads(ctx) == cold_reads_before
+      assert [{^key, nil, ^expire_at_ms, ^lfu, ^file_id, ^offset, 128}] = :ets.lookup(keydir, key)
+    end
+
+    assert {:ok, "written"} == FerricStore.get(set_key)
+  end
+
+  @tag :native_response_byte_budget
+  test "collection reads reject oversized cold payloads before materializing members" do
+    ctx = FerricStore.Instance.get(:default)
+    suffix = System.unique_integer([:positive])
+    hash_key = "native:hgetall:cold-byte-budget:#{suffix}"
+    set_key = "native:smembers:cold-byte-budget:#{suffix}"
+    hash_field = "field"
+    set_member = String.duplicate("m", 128)
+    hash_value = String.duplicate("v", 128)
+    hash_compound_key = Ferricstore.Store.CompoundKey.hash_field(hash_key, hash_field)
+    set_compound_key = Ferricstore.Store.CompoundKey.set_member(set_key, set_member)
+
+    assert {:ok, 1} = FerricStore.Impl.hset(ctx, hash_key, %{hash_field => hash_value})
+    assert {:ok, 1} = FerricStore.Impl.sadd(ctx, set_key, [set_member])
+    on_exit(fn -> FerricStore.del([hash_key, set_key]) end)
+
+    [hash_key, set_key]
+    |> Enum.map(&Ferricstore.Store.Router.shard_for(ctx, &1))
+    |> Enum.uniq()
+    |> Enum.each(fn shard_index ->
+      assert :ok = GenServer.call(elem(ctx.shard_names, shard_index), :flush, 5_000)
+    end)
+
+    cold_rows =
+      Enum.map(
+        [{hash_key, hash_compound_key}, {set_key, set_compound_key}],
+        fn {logical_key, compound_key} ->
+          shard_index = Ferricstore.Store.Router.shard_for(ctx, logical_key)
+          keydir = elem(ctx.keydir_refs, shard_index)
+
+          assert [{^compound_key, value, expire_at_ms, lfu, file_id, offset, value_size}] =
+                   :ets.lookup(keydir, compound_key)
+
+          assert is_binary(value)
+          refute file_id == :pending
+
+          assert true =
+                   :ets.insert(
+                     keydir,
+                     {compound_key, nil, expire_at_ms, lfu, file_id, offset, value_size}
+                   )
+
+          {keydir, compound_key, expire_at_ms, lfu, file_id, offset, value_size}
+        end
+      )
+
+    requests = [
+      {@op_hgetall, %{"key" => hash_key}},
+      {@op_smembers, %{"key" => set_key}},
+      {@op_pipeline, %{"return" => "pairs", "compact_pipeline" => {30, [hash_key]}}},
+      {@op_pipeline, %{"return" => "pairs", "compact_pipeline" => {27, [set_key]}}}
+    ]
+
+    for {opcode, payload} <- requests do
+      assert {:bad_request, message, _state} =
+               Commands.execute(opcode, payload, state(%{max_response_bytes: 32}))
+
+      assert message =~ "response byte limit"
+
+      Enum.each(cold_rows, fn {keydir, compound_key, exp, lfu, fid, off, size} ->
+        assert [{^compound_key, nil, ^exp, ^lfu, ^fid, ^off, ^size}] =
+                 :ets.lookup(keydir, compound_key)
+      end)
+    end
+  end
+
+  @tag :compact_zrange_metadata
+  test "compact ZRANGE checks a cold string's metadata without reading its value" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "native:compact-zrange:cold-string:#{System.unique_integer([:positive])}"
+    value = String.duplicate("x", 128)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, shard_index)
+
+    assert :ok = FerricStore.set(key, value)
+    assert :ok = GenServer.call(elem(ctx.shard_names, shard_index), :flush, 5_000)
+    on_exit(fn -> FerricStore.del(key) end)
+
+    assert [{^key, ^value, expire_at_ms, lfu, file_id, offset, 128}] = :ets.lookup(keydir, key)
+    refute file_id == :pending
+    assert true = :ets.insert(keydir, {key, nil, expire_at_ms, lfu, file_id, offset, 128})
+
+    cold_reads_before = Stats.total_cold_reads(ctx)
+
+    assert {:ok, [["error", message]], _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{"return" => "pairs", "compact_pipeline" => {21, [{key, 0, -1, false}]}},
+               state()
+             )
+
+    assert message =~ "WRONGTYPE"
+    assert Stats.total_cold_reads(ctx) == cold_reads_before
+    assert [{^key, nil, ^expire_at_ms, ^lfu, ^file_id, ^offset, 128}] = :ets.lookup(keydir, key)
+  end
+
+  test "compact ZRANGE ignores a ready index after the type marker expires" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "native:compact-zrange:expired-index:#{System.unique_integer([:positive])}"
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, shard_index)
+    type_key = Ferricstore.Store.CompoundKey.type_key(key)
+
+    {index, lookup} =
+      Ferricstore.Store.Shard.ZSetIndex.table_names(ctx.name, shard_index)
+
+    :ok = Ferricstore.Store.Shard.ZSetIndex.mark_new_ready_empty(index, lookup, key)
+    :ok = Ferricstore.Store.Shard.ZSetIndex.put_member(index, lookup, key, "stale", "1")
+
+    true =
+      :ets.insert(
+        keydir,
+        {type_key, "zset", System.os_time(:millisecond) - 1, 1, 0, 0, byte_size("zset")}
+      )
+
+    on_exit(fn ->
+      Ferricstore.Store.Shard.ZSetIndex.clear_key(index, lookup, key)
+      :ets.delete(keydir, type_key)
+    end)
+
+    assert {:ok, [["ok", []]], _state} =
+             Commands.execute(
+               @op_pipeline,
+               %{"return" => "pairs", "compact_pipeline" => {21, [{key, 0, -1, false}]}},
+               state()
+             )
+  end
+
   @tag :prepared_flow_routing
   test "same_shard pipeline rejects coordinated COMMAND_EXEC Flow routing" do
     type = "prepared-flow-routing-#{System.unique_integer([:positive, :monotonic])}"
@@ -940,6 +1443,33 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload =~ "acl.setuser"
   end
 
+  test "COMMAND_EXEC ACL WHOAMI returns the authenticated session username" do
+    {status, payload, returned_state} =
+      Commands.execute(
+        @op_command_exec,
+        %{"command" => "ACL", "args" => ["WHOAMI"]},
+        state(%{username: "session-user"})
+      )
+
+    assert status == :ok
+    assert payload == "session-user"
+    assert returned_state.username == "session-user"
+  end
+
+  test "native full-access fast path fails closed while ACL projection is stale" do
+    on_exit(fn -> CatalogProjector.mark_ready() end)
+    :ok = CatalogProjector.mark_stale(:injected_projection_failure)
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_set,
+               %{"key" => "stale-acl-fast-path", "value" => "denied"},
+               state()
+             )
+
+    assert message =~ "ACL catalog projection unavailable"
+  end
+
   @tag :acl_command_exec_replication
   test "COMMAND_EXEC dispatches replicated ACL mutations and invalidates cached sessions" do
     join_acl_invalidation_group()
@@ -956,7 +1486,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload == "OK"
-    assert_receive {:acl_invalidate, "native-target"}
+    assert_receive {:acl_invalidate, "native-target", _revision}
 
     target_state = state_as("native-target")
     assert_native_get_ok("tenant:key", target_state)
@@ -980,7 +1510,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload == 1
-    assert_receive {:acl_invalidate, "native-target"}
+    assert_receive {:acl_invalidate, "native-target", _revision}
 
     target_state = ConnAuth.maybe_refresh_acl_cache(target_state, "native-target")
     assert_native_get_denied("tenant:key", target_state)
@@ -1058,6 +1588,24 @@ defmodule FerricstoreServer.Native.CommandsTest do
              Commands.execute(
                @op_command_exec,
                %{"command" => "SET", "args" => ["tenant:b:key", "value"]},
+               state
+             )
+
+    assert payload =~ "keys mentioned"
+  end
+
+  @tag :prepared_unlink_keys
+  test "COMMAND_EXEC authorizes every variadic UNLINK key" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    assert {:noperm, payload, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{
+                 "command" => "UNLINK",
+                 "args" => ["tenant:a:allowed", "tenant:b:forbidden"]
+               },
                state
              )
 
@@ -1167,6 +1715,57 @@ defmodule FerricstoreServer.Native.CommandsTest do
         ] do
       assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
       assert message =~ "keys mentioned"
+    end
+  end
+
+  test "FLOW.GET and FLOW.HISTORY without a partition require unrestricted read scope" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+    visible_id = "tenant:a:visible-flow"
+
+    for {opcode, payload} <- [
+          {@op_flow_get, %{"id" => visible_id}},
+          {@op_flow_history, %{"id" => visible_id}},
+          {@op_command_exec, %{"command" => "FLOW.GET", "args" => [visible_id]}},
+          {@op_command_exec, %{"command" => "FLOW.HISTORY", "args" => [visible_id]}}
+        ] do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
+      assert message =~ "keys mentioned"
+    end
+
+    for {mode, item} <- [
+          {9, {:flow_get, visible_id, []}},
+          {10, {:flow_history, visible_id, []}}
+        ] do
+      assert {:ok, [%{"status" => "noperm"}], _state} =
+               Commands.execute(
+                 @op_pipeline,
+                 %{"compact_pipeline" => {mode, [item]}},
+                 state
+               )
+    end
+  end
+
+  test "FLOW.GET and FLOW.HISTORY authorize an explicit effective partition" do
+    put_platform_scoped_user("platform_scoped")
+    state = state_as("platform_scoped")
+
+    for {opcode, payload} <- [
+          {@op_flow_get, %{"id" => "opaque-id", "partition_key" => "tenant:a:partition"}},
+          {@op_flow_history, %{"id" => "opaque-id", "partition_key" => "tenant:a:partition"}},
+          {@op_command_exec,
+           %{
+             "command" => "FLOW.GET",
+             "args" => ["opaque-id", "PARTITION", "tenant:a:partition"]
+           }},
+          {@op_command_exec,
+           %{
+             "command" => "FLOW.HISTORY",
+             "args" => ["opaque-id", "PARTITION", "tenant:a:partition"]
+           }}
+        ] do
+      {status, _payload, _state} = Commands.execute(opcode, payload, state)
+      refute status == :noperm
     end
   end
 
@@ -1494,6 +2093,24 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
 
     assert message =~ "keys mentioned"
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_flow_schedule_get,
+               %{"id" => "tenant:a:schedule"},
+               state
+             )
+
+    assert message =~ "keys mentioned"
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "FLOW.SCHEDULE.GET", "args" => ["tenant:a:schedule"]},
+               state
+             )
+
+    assert message =~ "keys mentioned"
   end
 
   test "approval ACLs ignore decoy partitions and protect requested flow scope" do
@@ -1503,7 +2120,16 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert {:noperm, message, _state} =
              Commands.execute(
                @op_flow_approval_get,
-               %{"id" => "tenant:b:approval", "partition_key" => "tenant:a:decoy"},
+               %{"id" => "tenant:a:approval", "partition_key" => "tenant:a:decoy"},
+               state
+             )
+
+    assert message =~ "keys mentioned"
+
+    assert {:noperm, message, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "FLOW.APPROVAL.GET", "args" => ["tenant:a:approval"]},
                state
              )
 
@@ -1617,8 +2243,77 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert executed_state.multi_queue == []
   end
 
+  test "native MULTI rejects retained command bytes before growing the queue" do
+    state =
+      "default"
+      |> session_state_as()
+      |> Map.put(:multi_queue_byte_limit, 256)
+
+    assert {:ok, "OK", multi_state} =
+             Session.execute(%{"command" => "MULTI", "args" => []}, state)
+
+    assert {:error, message, rejected_state} =
+             Session.execute(
+               %{"command" => "SET", "args" => ["bounded-multi", :binary.copy("x", 512)]},
+               multi_state
+             )
+
+    assert message =~ "byte limit"
+    assert rejected_state.multi_state == :none
+    assert rejected_state.multi_queue == []
+    assert rejected_state.multi_queue_count == 0
+    assert rejected_state.multi_queue_bytes == 0
+  end
+
+  test "native WATCH enforces connection limits before submitting Raft commands" do
+    tag = System.unique_integer([:positive, :monotonic])
+    keys = Enum.map(1..3, &"native-watch-limit:{#{tag}}:#{&1}")
+    ctx = FerricStore.Instance.get(:default)
+    [first | _] = keys
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, first)
+    before_position = raft_position(shard_index)
+
+    state =
+      "default"
+      |> session_state_as()
+      |> Map.merge(%{watch_key_limit: 2, watch_key_byte_limit: 1_024})
+
+    assert {:error, message, rejected_state} =
+             Session.execute(%{"command" => "WATCH", "args" => keys}, state)
+
+    assert message =~ "WATCH key limit"
+    assert rejected_state.watched_keys == %{}
+    assert rejected_state.watched_key_bytes == 0
+    assert raft_position(shard_index) == before_position
+  end
+
+  test "native WATCH batches same-shard tokens into one Raft entry" do
+    tag = System.unique_integer([:positive, :monotonic])
+    keys = ["native-watch-batch:{#{tag}}:one", "native-watch-batch:{#{tag}}:two"]
+    ctx = FerricStore.Instance.get(:default)
+    [first | _] = keys
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, first)
+    before_position = raft_position(shard_index)
+
+    assert {:ok, "OK", watched_state} =
+             Session.execute(
+               %{"command" => "WATCH", "args" => keys},
+               session_state_as("default")
+             )
+
+    assert map_size(watched_state.watched_keys) == 2
+    assert watched_state.watched_key_bytes > 0
+    assert raft_position(shard_index) == before_position + 1
+
+    assert {:ok, "OK", unwatched_state} =
+             Session.execute(%{"command" => "UNWATCH", "args" => []}, watched_state)
+
+    assert unwatched_state.watched_keys == %{}
+    assert unwatched_state.watched_key_bytes == 0
+  end
+
   @tag :prepared_multi_routing
-  test "native MULTI retains prepared multi-key routing through EXEC" do
+  test "native MULTI rejects prepared routing across Raft groups at EXEC" do
     ctx = FerricStore.Instance.get(:default)
     first = "native-multi-routing:#{System.unique_integer([:positive, :monotonic])}:one"
     first_idx = Ferricstore.Store.Router.shard_for(ctx, first)
@@ -1647,13 +2342,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert [%PreparedCommand{routing_keys: [^first, ^second]}] = queued_state.multi_queue
 
-    assert {:ok, ["OK"], _state} =
+    assert {:error, "CROSSSLOT Keys in request don't hash to the same slot", executed_state} =
              Session.execute(%{"command" => "EXEC", "args" => []}, queued_state)
 
-    assert Ferricstore.Store.Router.get(ctx, first) == "one"
-    assert Ferricstore.Store.Router.get(ctx, second) == "two"
-    assert Ferricstore.Store.WriteVersion.get(first_idx) == first_before + 1
-    assert Ferricstore.Store.WriteVersion.get(second_idx) == second_before + 1
+    assert executed_state.multi_state == :none
+    assert Ferricstore.Store.Router.get(ctx, first) == nil
+    assert Ferricstore.Store.Router.get(ctx, second) == nil
+    assert Ferricstore.Store.WriteVersion.get(first_idx) == first_before
+    assert Ferricstore.Store.WriteVersion.get(second_idx) == second_before
   end
 
   @tag :prepared_multi_routing
@@ -1677,6 +2373,29 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert abort_message =~ "EXECABORT"
     assert final_state.multi_state == :none
+  end
+
+  test "native MULTI rejects request-scoped commands before queueing" do
+    for {command, args} <- [
+          {"PUBLISH", ["tx-channel", "must-not-publish"]},
+          {"KEY_INFO", ["tx-key-info"]},
+          {"FETCH_OR_COMPUTE", ["tx-fetch", "1000"]},
+          {"SPOP", ["tx-random-set"]},
+          {"BF.ADD", ["tx-bloom", "member"]}
+        ] do
+      assert {:ok, "OK", multi_state} =
+               Session.execute(%{"command" => "MULTI", "args" => []}, session_state_as("default"))
+
+      assert {:error, message, rejected_state} =
+               Session.execute(%{"command" => command, "args" => args}, multi_state)
+
+      assert message ==
+               "ERR command '#{String.downcase(command)}' is not supported inside transactions"
+
+      assert rejected_state.multi_error
+      assert rejected_state.multi_queue == []
+      assert rejected_state.multi_queue_count == 0
+    end
   end
 
   @tag :prepared_multi_routing
@@ -1719,8 +2438,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert_native_get_ok("tenant:a:key", old_state)
     assert_native_get_ok("tenant:a:key", new_state)
 
-    assert :ok = apply_raft_acl({:acl_setuser, "platform_worker_old", ["off"]})
-    assert_receive {:acl_invalidate, "platform_worker_old"}
+    assert :ok = Acl.set_user("platform_worker_old", ["off"])
+    assert_receive {:acl_invalidate, "platform_worker_old", _revision}
 
     old_state = ConnAuth.maybe_refresh_acl_cache(old_state, "platform_worker_old")
     new_state = ConnAuth.maybe_refresh_acl_cache(new_state, "platform_worker_old")
@@ -1742,13 +2461,13 @@ defmodule FerricstoreServer.Native.CommandsTest do
                "~tenant:direct:*"
              ])
 
-    assert_receive {:acl_invalidate, "direct-revoke"}
+    assert_receive {:acl_invalidate, "direct-revoke", _revision}
 
     state = state_as("direct-revoke")
     assert_native_get_ok("tenant:direct:key", state)
 
     assert :ok = Acl.set_user("direct-revoke", ["off"])
-    assert_receive {:acl_invalidate, "direct-revoke"}
+    assert_receive {:acl_invalidate, "direct-revoke", _revision}
 
     state = ConnAuth.maybe_refresh_acl_cache(state, "direct-revoke")
     assert_native_get_denied("tenant:direct:key", state)
@@ -1769,8 +2488,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
     state = state_as("platform_revoke_abcd")
     assert_native_get_ok("tenant:revoke:key", state)
 
-    assert :ok = apply_raft_acl({:acl_deluser, "platform_revoke_abcd"})
-    assert_receive {:acl_invalidate, "platform_revoke_abcd"}
+    assert :ok = Acl.del_user("platform_revoke_abcd")
+    assert_receive {:acl_invalidate, "platform_revoke_abcd", _revision}
 
     state = ConnAuth.maybe_refresh_acl_cache(state, "platform_revoke_abcd")
     assert_native_get_denied("tenant:revoke:key", state)
@@ -1791,12 +2510,12 @@ defmodule FerricstoreServer.Native.CommandsTest do
     state = state_as("platform_other_abcd")
     assert_native_get_ok("tenant:other:key", state)
 
-    assert_receive {:acl_invalidate, "platform_other_abcd"}
+    assert_receive {:acl_invalidate, "platform_other_abcd", _revision}
 
     assert {:error, "ERR User 'platform_missing_abcd' does not exist"} =
-             apply_raft_acl({:acl_deluser, "platform_missing_abcd"})
+             Acl.del_user("platform_missing_abcd")
 
-    refute_receive {:acl_invalidate, _username}, 100
+    refute_receive {:acl_invalidate, _username, _revision}, 100
 
     state = ConnAuth.maybe_refresh_acl_cache(state, "platform_missing_abcd")
     assert_native_get_ok("tenant:other:key", state)
@@ -1861,12 +2580,21 @@ defmodule FerricstoreServer.Native.CommandsTest do
       peer: {{127, 0, 0, 1}, 12_345},
       created_at: System.monotonic_time(:millisecond),
       instance_ctx: FerricStore.Instance.get(:default),
+      stats_counter: FerricStore.Instance.get(:default).stats_counter,
       compression: :none,
       compact_flow_responses: false,
       subscribed_events: MapSet.new(),
       flow_wake_subscriptions: MapSet.new()
     }
     |> Map.merge(overrides)
+  end
+
+  defp forward_router_traces(parent) do
+    receive do
+      message ->
+        send(parent, {:router_trace, message})
+        forward_router_traces(parent)
+    end
   end
 
   defp state_as(username) do
@@ -1884,11 +2612,20 @@ defmodule FerricstoreServer.Native.CommandsTest do
       multi_state: :none,
       multi_queue: [],
       multi_queue_count: 0,
+      multi_queue_bytes: 0,
       multi_error: false,
       watched_keys: %{},
+      watched_key_bytes: 0,
       pubsub_channels: nil,
       pubsub_patterns: nil
     })
+  end
+
+  defp raft_position(shard_index) do
+    {:ok, {:raft_log_pos, index, _term}} =
+      Ferricstore.Raft.WARaftBackend.storage_position(shard_index)
+
+    index
   end
 
   defp join_acl_invalidation_group do
@@ -1902,11 +2639,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
         :error, _reason -> :ok
       end
     end)
-  end
-
-  defp apply_raft_acl(command) do
-    Task.async(fn -> Acl.handle_raft_command(command) end)
-    |> Task.await()
   end
 
   defp put_platform_scoped_user(username) do

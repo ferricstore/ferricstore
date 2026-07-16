@@ -5,8 +5,6 @@ defmodule Ferricstore.Flow.HistoryValues do
   alias Ferricstore.Flow.ValueStore
   alias Ferricstore.Store.Router
 
-  @value_bin_magic "FSV2"
-
   def hydrate(history, _ctx, %{enabled?: false}), do: history
   def hydrate([], _ctx, _value_return), do: []
 
@@ -39,6 +37,10 @@ defmodule Ferricstore.Flow.HistoryValues do
     end)
   end
 
+  @doc false
+  def __apply_value_result_for_test__(fields, kind, ref, value, max_bytes),
+    do: apply_value_result(fields, kind, ref, value, max_bytes)
+
   defp apply_value_result(fields, _kind, nil, _value, _max_bytes), do: fields
   defp apply_value_result(fields, _kind, "", _value, _max_bytes), do: fields
 
@@ -61,42 +63,45 @@ defmodule Ferricstore.Flow.HistoryValues do
   defp apply_value_result_for_valid_ref(
          fields,
          kind,
+         {:error, {:storage_read_failed, _reason}},
+         _max_bytes
+       ) do
+    Map.put(fields, kind <> "_error", "ERR storage read failed")
+  end
+
+  defp apply_value_result_for_valid_ref(
+         fields,
+         kind,
          {:file_ref, _path, _offset, size},
          _max_bytes
        ) do
     fields
     |> Map.put(kind <> "_omitted", true)
-    |> Map.put(kind <> "_size", value_user_size_from_file_size(size))
+    |> Map.put(kind <> "_size", size)
   end
 
   defp apply_value_result_for_valid_ref(fields, kind, encoded_value, max_bytes)
-       when is_binary(encoded_value) do
-    {decoded, size} = Codec.decode_value_with_user_size(encoded_value)
+       when is_binary(encoded_value) and byte_size(encoded_value) > max_bytes do
+    fields
+    |> Map.put(kind <> "_omitted", true)
+    |> Map.put(kind <> "_size", byte_size(encoded_value))
+  end
 
-    if size <= max_bytes do
-      fields
-      |> Map.put(kind, decoded)
-      |> Map.put(kind <> "_size", size)
-    else
-      fields
-      |> Map.put(kind <> "_omitted", true)
-      |> Map.put(kind <> "_size", size)
+  defp apply_value_result_for_valid_ref(fields, kind, encoded_value, _max_bytes)
+       when is_binary(encoded_value) do
+    case Codec.decode_value_result(encoded_value) do
+      {:ok, decoded} ->
+        fields
+        |> Map.put(kind, decoded)
+        |> Map.put(kind <> "_size", byte_size(encoded_value))
+
+      {:error, :invalid_flow_value} ->
+        Map.put(fields, kind <> "_error", "ERR invalid flow value")
     end
   end
 
   defp apply_value_result_for_valid_ref(fields, _kind, _value, _max_bytes), do: fields
 
   defp file_ref_payload_threshold(max_bytes) when max_bytes < 1, do: 1
-
-  defp file_ref_payload_threshold(max_bytes) do
-    max_bytes + value_codec_overhead_bytes() + 1
-  end
-
-  defp value_codec_overhead_bytes, do: byte_size(@value_bin_magic) + 1
-
-  defp value_user_size_from_file_size(size) when is_integer(size) and size >= 0 do
-    max(0, size - value_codec_overhead_bytes())
-  end
-
-  defp value_user_size_from_file_size(size), do: size
+  defp file_ref_payload_threshold(max_bytes), do: max_bytes + 1
 end

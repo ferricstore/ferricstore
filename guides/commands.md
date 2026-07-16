@@ -238,6 +238,10 @@ Sets multiple key-value pairs atomically. Never fails (always overwrites).
 
 **Validation:** Rejects empty keys and keys larger than 65,535 bytes.
 
+**Atomicity:** Every key must hash to the same slot. A cross-slot request returns
+`CROSSSLOT` before any mutation; an accepted request is applied as one replicated
+state-machine command.
+
 ### MSETNX
 
 Sets multiple keys only if NONE of the keys exist. Returns 0 if any key already exists (none are set).
@@ -249,6 +253,10 @@ Sets multiple keys only if NONE of the keys exist. Returns 0 if any key already 
 | **Return** | Integer -- `1` (all set) or `0` (none set) |
 | **Elixir return** | `{:ok, true}` or `{:ok, false}` |
 | **Status** | Supported |
+
+**Atomicity:** Every key must hash to the same slot. A cross-slot request returns
+`CROSSSLOT` before checking or writing any key. The existence check and all
+writes run in one replicated state-machine command.
 
 ### INCR / DECR / INCRBY / DECRBY
 
@@ -1037,12 +1045,12 @@ Backed by mmap NIF resources at `prob/shard_N/KEY.topk`. Uses Count-Min Sketch i
 
 | Command | Syntax | Return | Notes |
 |---------|--------|--------|-------|
-| `TOPK.RESERVE` | `TOPK.RESERVE key k [width depth decay]` | `+OK` | Defaults: width=8, depth=7, decay=0.9 |
+| `TOPK.RESERVE` | `TOPK.RESERVE key k [width depth]` | `+OK` | Defaults: width=8, depth=7 |
 | `TOPK.ADD` | `TOPK.ADD key element [element ...]` | Array (evicted items or nil) | |
 | `TOPK.INCRBY` | `TOPK.INCRBY key element count [element count ...]` | Array (evicted items or nil) | |
 | `TOPK.QUERY` | `TOPK.QUERY key element [element ...]` | Array of 1/0 | |
 | `TOPK.LIST` | `TOPK.LIST key [WITHCOUNT]` | Array of items (or interleaved items+counts) | |
-| `TOPK.INFO` | `TOPK.INFO key` | `[k, K, width, W, depth, D, decay, D]` | |
+| `TOPK.INFO` | `TOPK.INFO key` | `[k, K, width, W, depth, D]` | |
 
 **Status:** Uses FerricStoreBloom TopK module syntax.
 
@@ -1132,9 +1140,9 @@ Cache-aside with stampede protection. The first caller to a missing key is desig
 
 | Command | Syntax | Return |
 |---------|--------|--------|
-| `FETCH_OR_COMPUTE` | `FETCH_OR_COMPUTE key ttl_ms [hint]` | `["hit", value]` or `["compute", channel]` |
-| `FETCH_OR_COMPUTE_RESULT` | `FETCH_OR_COMPUTE_RESULT key value ttl_ms` | `+OK` |
-| `FETCH_OR_COMPUTE_ERROR` | `FETCH_OR_COMPUTE_ERROR key message` | `+OK` |
+| `FETCH_OR_COMPUTE` | `FETCH_OR_COMPUTE key ttl_ms [hint]` | `["hit", value]` or `["compute", hint, token]` |
+| `FETCH_OR_COMPUTE_RESULT` | `FETCH_OR_COMPUTE_RESULT key token value ttl_ms` | `+OK` |
+| `FETCH_OR_COMPUTE_ERROR` | `FETCH_OR_COMPUTE_ERROR key token message` | `+OK` |
 
 ### FERRICSTORE.KEY_INFO
 

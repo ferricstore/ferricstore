@@ -79,11 +79,19 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
         case metadata_journal_size(journal_path) do
           {:ok, previous_size} ->
             with :ok <- Ferricstore.FS.mkdir_p(Path.dirname(journal_path)),
-                 :ok <- File.write(journal_path, record, [:append, :binary]),
-                 :ok <- fsync_metadata_file(journal_path),
+                 :ok <- run_storage_metadata_fsync_hook(journal_path),
+                 :ok <-
+                   Ferricstore.FS.append_sync_nofollow_bounded(
+                     journal_path,
+                     record,
+                     @max_metadata_journal_bytes
+                   ),
                  :ok <- maybe_fsync_new_metadata_journal_dir(journal_path, new_file?) do
               :ok
             else
+              {:error, {:too_large, _reason}} ->
+                compact_storage_metadata(path, payload)
+
               {:error, _reason} = error ->
                 _ = rollback_metadata_journal_append(journal_path, new_file?, previous_size)
                 error
@@ -100,10 +108,21 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
 
       defp metadata_journal_size(journal_path) do
         case File.lstat(journal_path) do
-          {:ok, %{type: :regular, size: size}} -> {:ok, size}
-          {:ok, %{type: type}} -> {:error, {:unsafe_metadata_path, journal_path, type}}
-          {:error, :enoent} -> {:ok, 0}
-          {:error, reason} -> {:error, {:stat_metadata_journal, reason}}
+          {:ok, %{type: :regular, size: size}} when size <= @max_metadata_journal_bytes ->
+            {:ok, size}
+
+          {:ok, %{type: :regular, size: size}} ->
+            {:error,
+             {:metadata_journal_too_large, journal_path, size, @max_metadata_journal_bytes}}
+
+          {:ok, %{type: type}} ->
+            {:error, {:unsafe_metadata_path, journal_path, type}}
+
+          {:error, :enoent} ->
+            {:ok, 0}
+
+          {:error, reason} ->
+            {:error, {:stat_metadata_journal, reason}}
         end
       end
 
@@ -117,7 +136,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
 
       defp rollback_metadata_journal_append(journal_path, _new_file?, previous_size)
            when is_integer(previous_size) and previous_size >= 0 do
-        case File.open(journal_path, [:read, :write, :binary]) do
+        case open_verified_metadata_journal(journal_path, [:read, :write, :binary]) do
           {:ok, io} ->
             try do
               with {:ok, _pos} <- :file.position(io, previous_size),
@@ -125,7 +144,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
                 :ok
               end
             after
-              File.close(io)
+              :file.close(io)
             end
 
           {:error, :enoent} ->
@@ -154,26 +173,84 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
       defp read_latest_storage_metadata_journal(path) do
         journal_path = metadata_journal_path(path)
 
-        case File.lstat(journal_path) do
-          {:ok, %{type: :regular}} ->
-            case File.open(journal_path, [:read, :binary]) do
+        case metadata_journal_size(journal_path) do
+          {:ok, _size} ->
+            case open_verified_metadata_journal(journal_path, [:read, :binary]) do
               {:ok, io} ->
                 try do
                   read_metadata_journal_record(io, nil)
                 after
-                  File.close(io)
+                  :file.close(io)
                 end
 
               {:error, reason} ->
                 {:error, {:read_storage_metadata_journal, reason}}
             end
 
-          {:ok, %{type: type}} ->
-            {:error,
-             {:read_storage_metadata_journal, {:unsafe_metadata_path, journal_path, type}}}
-
           {:error, reason} ->
             {:error, {:read_storage_metadata_journal, reason}}
+        end
+      end
+
+      defp open_verified_metadata_journal(path, modes) do
+        case File.lstat(path) do
+          {:ok,
+           %File.Stat{
+             type: :regular,
+             major_device: major_device,
+             minor_device: minor_device,
+             inode: inode
+           }} ->
+            open_verified_metadata_journal_file(
+              path,
+              modes,
+              major_device,
+              minor_device,
+              inode
+            )
+
+          {:ok, %File.Stat{type: type}} ->
+            {:error, {:unsafe_metadata_path, path, type}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end
+
+      defp open_verified_metadata_journal_file(
+             path,
+             modes,
+             major_device,
+             minor_device,
+             inode
+           ) do
+        case :file.open(String.to_charlist(path), [:raw | modes]) do
+          {:ok, io} ->
+            case :file.read_file_info(io) do
+              {:ok,
+               {:file_info, size, :regular, _access, _atime, _mtime, _ctime, _mode, _links,
+                ^major_device, ^minor_device, ^inode, _uid, _gid}}
+              when size <= @max_metadata_journal_bytes ->
+                {:ok, io}
+
+              {:ok,
+               {:file_info, size, :regular, _access, _atime, _mtime, _ctime, _mode, _links,
+                ^major_device, ^minor_device, ^inode, _uid, _gid}} ->
+                :ok = :file.close(io)
+
+                {:error, {:metadata_journal_too_large, path, size, @max_metadata_journal_bytes}}
+
+              {:ok, _other} ->
+                :ok = :file.close(io)
+                {:error, {:metadata_journal_identity_mismatch, path}}
+
+              {:error, reason} ->
+                :ok = :file.close(io)
+                {:error, {:read_open_metadata_journal_info, reason}}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
         end
       end
 
@@ -261,8 +338,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
         _ -> :ok
       end
 
-      defp fsync_metadata_file(path) do
-        fsync_file(path, :waraft_storage_metadata_fsync_file_hook)
+      defp run_storage_metadata_fsync_hook(path) do
+        case Application.get_env(:ferricstore, :waraft_storage_metadata_fsync_file_hook) do
+          fun when is_function(fun, 1) ->
+            case fun.(path) do
+              :ok -> :ok
+              {:error, reason} -> {:error, {:fsync_file, path, reason}}
+              other -> {:error, {:fsync_file, path, other}}
+            end
+
+          _other ->
+            :ok
+        end
+      rescue
+        error -> {:error, {:fsync_file_exception, path, error}}
       end
 
       defp copy_shard_dirs_to_snapshot(snapshot_path, handle) do

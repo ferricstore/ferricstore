@@ -23,10 +23,6 @@ defmodule Ferricstore.Store.BlobGCSweeper do
   @zero_stats %{
     files: 0,
     bytes: 0,
-    legacy_files: 0,
-    legacy_bytes: 0,
-    segment_files: 0,
-    segment_bytes: 0,
     tmp_files: 0,
     tmp_bytes: 0
   }
@@ -178,27 +174,9 @@ defmodule Ferricstore.Store.BlobGCSweeper do
   end
 
   defp normalize_stats(stats) do
-    legacy_files =
-      if Map.has_key?(stats, :legacy_files) do
-        Map.get(stats, :legacy_files, 0)
-      else
-        Map.get(stats, :files, 0)
-      end
-
-    legacy_bytes =
-      if Map.has_key?(stats, :legacy_bytes) do
-        Map.get(stats, :legacy_bytes, 0)
-      else
-        Map.get(stats, :bytes, 0)
-      end
-
     %{
       files: Map.get(stats, :files, 0),
       bytes: Map.get(stats, :bytes, 0),
-      legacy_files: legacy_files,
-      legacy_bytes: legacy_bytes,
-      segment_files: Map.get(stats, :segment_files, 0),
-      segment_bytes: Map.get(stats, :segment_bytes, 0),
       tmp_files: Map.get(stats, :tmp_files, 0),
       tmp_bytes: Map.get(stats, :tmp_bytes, 0)
     }

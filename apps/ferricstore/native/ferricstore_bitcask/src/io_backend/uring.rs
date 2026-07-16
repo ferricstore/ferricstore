@@ -21,8 +21,7 @@
 #![allow(unsafe_code)]
 // SAFETY: see module-level doc comment.
 
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -30,7 +29,10 @@ use std::sync::{Arc, Mutex};
 
 use io_uring::{opcode, types, IoUring};
 
-use super::{append_lock_for_path, IoBackend};
+use super::{
+    append_lock_for_file, lock_append, validate_uring_batch_completions,
+    validate_uring_single_completion, IoBackend,
+};
 
 /// Ring capacity in submission-queue entries. Must be a power of two.
 ///
@@ -38,6 +40,30 @@ use super::{append_lock_for_path, IoBackend};
 /// batch window collecting writes over ~1 ms). Each slot occupies ~64 bytes
 /// in the ring, so this is ~4 KB of ring memory per store shard — negligible.
 const RING_SIZE: u32 = 64;
+
+fn uring_write_len(len: usize) -> io::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "io_uring write exceeds the kernel u32 length limit",
+        )
+    })
+}
+
+fn checked_write_end(offset: u64, len: usize) -> io::Result<u64> {
+    let len = u64::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "io_uring write length exceeds the file-offset domain",
+        )
+    })?;
+    offset.checked_add(len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "io_uring write offset overflow",
+        )
+    })
+}
 
 /// `io_uring`-backed append-only log writer.
 ///
@@ -72,16 +98,10 @@ impl UringBackend {
         // Open without O_APPEND so that explicit pwrite offsets (.offset() on
         // SQEs) are respected. On some kernel versions O_APPEND causes
         // IORING_OP_WRITE to ignore the provided offset and always write at
-        // EOF, which corrupts the log layout when advance_offset has logically
-        // reserved space that hasn't yet been physically written by an in-flight
-        // async batch.
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
+        // EOF and corrupt the explicit positioned-write layout.
+        let file = crate::open_rw_create_nofollow(path)?;
         let offset = file.metadata()?.len();
+        let append_lock = append_lock_for_file(path, &file)?;
 
         let ring = IoUring::builder()
             .build(RING_SIZE)
@@ -91,8 +111,18 @@ impl UringBackend {
             ring,
             file,
             offset,
-            append_lock: append_lock_for_path(path),
+            append_lock,
         })
+    }
+
+    fn submit_and_wait_retry(&mut self, completions: usize) -> io::Result<()> {
+        loop {
+            match self.ring.submit_and_wait(completions) {
+                Ok(_submitted) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Submit a single positioned write SQE and wait for one completion.
@@ -105,17 +135,15 @@ impl UringBackend {
     /// the thread until the kernel completes the I/O.
     fn submit_write_at(&mut self, data: &[u8], file_offset: u64) -> io::Result<()> {
         let fd = types::Fd(self.file.as_raw_fd());
+        let write_len = uring_write_len(data.len())?;
+        let _end = checked_write_end(file_offset, data.len())?;
 
         // Build a positioned-write SQE (equivalent to pwrite64).
         // SAFETY: `data` outlives this call — see method doc.
-        let sqe = opcode::Write::new(
-            fd,
-            data.as_ptr(),
-            u32::try_from(data.len()).unwrap_or(u32::MAX),
-        )
-        .offset(file_offset)
-        .build()
-        .user_data(0x01);
+        let sqe = opcode::Write::new(fd, data.as_ptr(), write_len)
+            .offset(file_offset)
+            .build()
+            .user_data(0x01);
 
         // SAFETY: buffer is valid for the duration of submit_and_wait.
         unsafe {
@@ -125,28 +153,13 @@ impl UringBackend {
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring: SQ full"))?;
         }
 
-        self.ring.submit_and_wait(1)?;
+        self.submit_and_wait_retry(1)?;
 
-        let cqe =
-            self.ring.completion().next().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "io_uring: no CQE after write")
-            })?;
-
-        let res = cqe.result();
-        if res < 0 {
-            return Err(io::Error::from_raw_os_error(-res));
-        }
-        if usize::try_from(res).ok() != Some(data.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                format!(
-                    "io_uring short write: expected {} B, wrote {} B",
-                    data.len(),
-                    res
-                ),
-            ));
-        }
-        Ok(())
+        let completions = self
+            .ring
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result()));
+        validate_uring_single_completion(completions, 0x01, data.len(), "write")
     }
 
     /// Submit a single fdatasync SQE and wait for one completion.
@@ -170,17 +183,19 @@ impl UringBackend {
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring: SQ full on fsync"))?;
         }
 
-        self.ring.submit_and_wait(1)?;
+        self.submit_and_wait_retry(1)?;
 
-        let cqe =
-            self.ring.completion().next().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "io_uring: no CQE after fsync")
-            })?;
+        let completions = self
+            .ring
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result()));
+        validate_uring_single_completion(completions, 0x02, 0, "fsync")
+    }
 
-        let res = cqe.result();
-        if res < 0 {
-            return Err(io::Error::from_raw_os_error(-res));
-        }
+    fn rollback_locked(&mut self, offset: u64) -> io::Result<()> {
+        self.file.set_len(offset)?;
+        self.file.sync_data()?;
+        self.offset = offset;
         Ok(())
     }
 }
@@ -188,12 +203,21 @@ impl UringBackend {
 impl IoBackend for UringBackend {
     fn append(&mut self, data: &[u8]) -> io::Result<u64> {
         let append_lock = Arc::clone(&self.append_lock);
-        let _guard = append_lock.lock().expect("append lock poisoned");
+        let _guard = lock_append(&append_lock)?;
 
         let start = self.file.metadata()?.len();
-        self.submit_write_at(data, start)?;
-        self.offset = start + data.len() as u64;
-        Ok(start)
+        let end = checked_write_end(start, data.len())?;
+
+        match self.submit_write_at(data, start) {
+            Ok(()) => {
+                self.offset = end;
+                Ok(start)
+            }
+            Err(cause) => match self.rollback_locked(start) {
+                Ok(()) => Err(cause),
+                Err(rollback) => Err(super::rollback_failure(cause, rollback)),
+            },
+        }
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -204,8 +228,10 @@ impl IoBackend for UringBackend {
         self.offset
     }
 
-    fn advance_offset(&mut self, bytes: u64) {
-        self.offset += bytes;
+    fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
+        let append_lock = Arc::clone(&self.append_lock);
+        let _guard = lock_append(&append_lock)?;
+        self.rollback_locked(offset)
     }
 
     fn flush_no_sync(&mut self) -> io::Result<()> {
@@ -232,115 +258,118 @@ impl IoBackend for UringBackend {
     /// failure never leaves `self.offset` pointing past un-confirmed bytes.
     fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
         let append_lock = Arc::clone(&self.append_lock);
-        let _guard = append_lock.lock().expect("append lock poisoned");
+        let _guard = lock_append(&append_lock)?;
 
         if buffers.is_empty() {
             return Ok(Vec::new());
         }
 
         let fd = types::Fd(self.file.as_raw_fd());
-        let mut all_offsets = Vec::with_capacity(buffers.len());
-        self.offset = self.file.metadata()?.len();
+        let mut all_offsets = Vec::new();
+        all_offsets.try_reserve_exact(buffers.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "io_uring offset allocation failed",
+            )
+        })?;
+        let start = self.file.metadata()?.len();
+        self.offset = start;
 
-        // Split into chunks that fit in the ring.
-        for chunk in buffers.chunks(RING_SIZE as usize) {
-            // Step 1: compute write offsets for this chunk from the CURRENT
-            // self.offset without advancing it yet.  If anything below fails,
-            // self.offset remains correct for the caller to retry or handle the
-            // error.
-            let mut chunk_offsets = Vec::with_capacity(chunk.len());
-            let mut running = self.offset;
-            for buf in chunk {
-                chunk_offsets.push(running);
-                running += buf.len() as u64;
-            }
-            let chunk_total_bytes: u64 = running - self.offset;
+        let mut final_end = start;
+        for buffer in buffers {
+            let _ = uring_write_len(buffer.len())?;
+            final_end = checked_write_end(final_end, buffer.len())?;
+        }
 
-            // Build a map from file-offset → expected byte count so we can
-            // validate each CQE by its user_data tag (which carries the file
-            // offset).  Using the file offset as the tag is safe because every
-            // buffer in a single chunk starts at a unique position.
-            let expected: HashMap<u64, usize> = chunk_offsets
-                .iter()
-                .zip(chunk.iter())
-                .map(|(&off, buf)| (off, buf.len()))
-                .collect();
-
-            // Step 2: push all SQEs for this chunk.
-            {
-                let mut sq = self.ring.submission();
-                for (buf, &file_offset) in chunk.iter().zip(chunk_offsets.iter()) {
-                    let sqe = opcode::Write::new(
-                        fd,
-                        buf.as_ptr(),
-                        u32::try_from(buf.len()).unwrap_or(u32::MAX),
+        let result = (|| {
+            // Split into chunks that fit in the ring.
+            for chunk in buffers.chunks(RING_SIZE as usize) {
+                // Step 1: compute write offsets for this chunk from the CURRENT
+                // self.offset without advancing it yet.  If anything below fails,
+                // self.offset remains correct for the caller to retry or handle the
+                // error.
+                let mut chunk_offsets = Vec::new();
+                chunk_offsets.try_reserve_exact(chunk.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "io_uring chunk offset allocation failed",
                     )
-                    .offset(file_offset)
-                    .build()
-                    // Store the file offset as user_data so we can look up
-                    // the expected length when draining completions.
-                    .user_data(file_offset);
+                })?;
+                let mut running = self.offset;
+                for buf in chunk {
+                    chunk_offsets.push(running);
+                    running = checked_write_end(running, buf.len())?;
+                }
 
-                    // SAFETY: `buf` is borrowed from the caller's `buffers`
-                    // slice, which lives for the entire duration of this method
-                    // call.  We call `submit_and_wait` immediately after this
-                    // loop (step 3), which blocks the thread until the kernel
-                    // signals completion for every SQE in this chunk.  The
-                    // buffer pointers therefore remain valid for as long as the
-                    // kernel needs them.
+                // Step 2: build all SQEs, then capacity-check and publish the
+                // chunk atomically to the userspace submission ring. A failed
+                // capacity check must not leave a subset of borrowed buffer
+                // pointers queued for a later submission.
+                let mut sqes = Vec::with_capacity(chunk.len());
+                for (index, (buf, &file_offset)) in
+                    chunk.iter().zip(chunk_offsets.iter()).enumerate()
+                {
+                    sqes.push(
+                        opcode::Write::new(fd, buf.as_ptr(), uring_write_len(buf.len())?)
+                            .offset(file_offset)
+                            .build()
+                            // A per-chunk index remains unique even when an empty
+                            // buffer shares its file offset with the next record.
+                            .user_data(index as u64),
+                    );
+                }
+
+                {
+                    let mut sq = self.ring.submission();
+                    // SAFETY: every buffer is borrowed from the caller for this
+                    // whole method. `push_multiple` first verifies the complete
+                    // chunk fits, so failure cannot queue only a prefix.
                     unsafe {
-                        sq.push(&sqe).map_err(|_| {
+                        sq.push_multiple(&sqes).map_err(|_| {
                             io::Error::new(io::ErrorKind::Other, "io_uring: SQ full in batch")
                         })?;
                     }
                 }
-            }
 
-            // Step 3: wait for all completions in this chunk.
-            let chunk_len = chunk.len();
-            self.ring.submit_and_wait(chunk_len)?;
+                // Step 3: wait for all completions in this chunk.
+                let chunk_len = chunk.len();
+                self.submit_and_wait_retry(chunk_len)?;
 
-            // Step 4: drain and validate every CQE.
-            // Check both error (res < 0) and short write (res != expected_len).
-            // If any CQE is invalid we return immediately WITHOUT advancing
-            // self.offset, preserving the offset invariant.
-            let mut completed = 0usize;
-            for cqe in self.ring.completion() {
-                let res = cqe.result();
-                if res < 0 {
-                    return Err(io::Error::from_raw_os_error(-res));
+                // Step 4: drain and validate every CQE.
+                // Check both error (res < 0) and short write (res != expected_len).
+                // If any CQE is invalid we return immediately WITHOUT advancing
+                // self.offset, preserving the offset invariant.
+                let mut expected_lengths = [0usize; RING_SIZE as usize];
+                for (slot, buffer) in expected_lengths.iter_mut().zip(chunk) {
+                    *slot = buffer.len();
                 }
-                let file_offset = cqe.user_data();
-                if let Some(&expected_len) = expected.get(&file_offset) {
-                    if usize::try_from(res).ok() != Some(expected_len) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            format!(
-                                "io_uring short write: expected {expected_len} B at offset {file_offset}, wrote {res} B"
-                            ),
-                        ));
-                    }
-                }
-                completed += 1;
+                let completions = self
+                    .ring
+                    .completion()
+                    .map(|cqe| (cqe.user_data(), cqe.result()));
+                validate_uring_batch_completions(completions, &expected_lengths[..chunk_len])?;
+
+                // Step 5: all CQEs validated — NOW advance self.offset and record
+                // the confirmed offsets for this chunk.
+                self.offset = running;
+                all_offsets.extend_from_slice(&chunk_offsets);
             }
 
-            if completed != chunk_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("io_uring batch: expected {chunk_len} completions, got {completed}"),
-                ));
-            }
+            // Single fsync after all chunks.
+            self.submit_fsync()?;
 
-            // Step 5: all CQEs validated — NOW advance self.offset and record
-            // the confirmed offsets for this chunk.
-            self.offset += chunk_total_bytes;
-            all_offsets.extend_from_slice(&chunk_offsets);
+            debug_assert_eq!(self.offset, final_end);
+
+            Ok(all_offsets)
+        })();
+
+        match result {
+            Ok(offsets) => Ok(offsets),
+            Err(cause) => match self.rollback_locked(start) {
+                Ok(()) => Err(cause),
+                Err(rollback) => Err(super::rollback_failure(cause, rollback)),
+            },
         }
-
-        // Single fsync after all chunks.
-        self.submit_fsync()?;
-
-        Ok(all_offsets)
     }
 }
 

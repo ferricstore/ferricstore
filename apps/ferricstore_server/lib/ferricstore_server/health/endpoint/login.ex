@@ -19,29 +19,22 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
           {:ok, binary(), non_neg_integer()} | {:error, binary()}
   def authenticate_session(username, password)
       when is_binary(username) and is_binary(password) do
-    case Acl.get_user(username) do
-      %{enabled: true, password: stored_hash} when is_binary(stored_hash) ->
-        case Acl.authenticate(username, password) do
-          {:ok, ^username} ->
-            auth_epoch =
-              case Acl.get_user(username) do
-                %{auth_epoch: epoch} when is_integer(epoch) and epoch >= 0 -> epoch
-                _missing_or_invalid -> 0
-              end
-
-            {:ok, username, auth_epoch}
-
-          {:error, _reason} ->
-            authentication_error()
-        end
-
-      _missing_disabled_or_passwordless ->
-        _verified = Password.verify(password, Password.dummy_hash())
-        authentication_error()
-    end
+    authenticate_session_with(username, password, fn -> Acl.authenticate(username, password) end)
   end
 
   def authenticate_session(_username, _password), do: authentication_error()
+
+  @doc false
+  @spec authenticate_session(binary(), binary(), (binary(), binary() -> boolean())) ::
+          {:ok, binary(), non_neg_integer()} | {:error, binary()}
+  def authenticate_session(username, password, verifier)
+      when is_binary(username) and is_binary(password) and is_function(verifier, 2) do
+    authenticate_session_with(username, password, fn ->
+      Acl.authenticate(username, password, verifier)
+    end)
+  end
+
+  def authenticate_session(_username, _password, _verifier), do: authentication_error()
 
   @doc false
   @spec peer_string(term()) :: binary()
@@ -128,6 +121,30 @@ defmodule FerricstoreServer.Health.Endpoint.Login do
   end
 
   defp html_escape(value), do: value |> to_string() |> html_escape()
+
+  defp authenticate_session_with(username, password, authenticate) do
+    case Acl.get_user(username) do
+      %{enabled: true, password: stored_hash, auth_epoch: initial_epoch}
+      when is_binary(stored_hash) and is_integer(initial_epoch) and initial_epoch >= 0 ->
+        case authenticate.() do
+          {:ok, ^username} ->
+            case Acl.get_user(username) do
+              %{enabled: true, auth_epoch: ^initial_epoch} ->
+                {:ok, username, initial_epoch}
+
+              _changed_during_authentication ->
+                authentication_error()
+            end
+
+          {:error, _reason} ->
+            authentication_error()
+        end
+
+      _missing_disabled_or_passwordless ->
+        _verified = Password.verify(password, Password.dummy_hash())
+        authentication_error()
+    end
+  end
 
   defp authentication_error, do: {:error, @authentication_error}
 end

@@ -143,6 +143,18 @@ defmodule Ferricstore.Test.MockStore do
           |> Enum.sort_by(fn {field, _} -> field end)
         end)
       end,
+      compound_scan_page: fn _redis_key, prefix, cursor, count, match_pattern, fields_only ->
+        Agent.get(pid, fn state ->
+          mock_compound_scan_page(
+            state,
+            prefix,
+            cursor,
+            count,
+            match_pattern,
+            fields_only
+          )
+        end)
+      end,
       compound_count: fn _redis_key, prefix ->
         Agent.get(pid, fn state ->
           now = System.os_time(:millisecond)
@@ -384,8 +396,72 @@ defmodule Ferricstore.Test.MockStore do
   end
 
   defp live_count(state) do
+    state
+    |> live_keys()
+    |> Ferricstore.Store.CompoundKey.user_visible_keys()
+    |> length()
+  end
+
+  defp mock_compound_scan_page(state, prefix, cursor, count, match_pattern, fields_only)
+       when (cursor == 0 or
+               (is_tuple(cursor) and tuple_size(cursor) == 2 and elem(cursor, 0) == :after and
+                  is_binary(elem(cursor, 1)))) and is_integer(count) and count > 0 and
+              (is_binary(match_pattern) or is_nil(match_pattern)) do
     now = System.os_time(:millisecond)
-    Enum.count(state, fn {_, {_, exp}} -> exp == 0 or exp > now end)
+
+    remaining =
+      state
+      |> Enum.flat_map(fn
+        {key, {value, expire_at_ms}}
+        when is_binary(key) and is_binary(value) and
+               (expire_at_ms == 0 or expire_at_ms > now) ->
+          if String.starts_with?(key, prefix) do
+            member = binary_part(key, byte_size(prefix), byte_size(key) - byte_size(prefix))
+            [{member, value}]
+          else
+            []
+          end
+
+        _other ->
+          []
+      end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> drop_scanned_members(cursor)
+
+    {inspected, rest} = Enum.split(remaining, count)
+
+    next_cursor =
+      case {List.last(inspected), rest} do
+        {{member, _value}, [_next | _]} -> {:after, member}
+        _end -> 0
+      end
+
+    pairs =
+      inspected
+      |> Enum.filter(fn {member, _value} ->
+        is_nil(match_pattern) or Ferricstore.GlobMatcher.match?(member, match_pattern)
+      end)
+      |> Enum.map(fn {member, value} ->
+        if fields_only, do: {member, nil}, else: {member, value}
+      end)
+
+    {:ok, {next_cursor, pairs}}
+  end
+
+  defp mock_compound_scan_page(
+         _state,
+         _prefix,
+         _cursor,
+         _count,
+         _match_pattern,
+         _fields_only
+       ),
+       do: Ferricstore.Store.ReadResult.failure(:invalid_compound_scan_page)
+
+  defp drop_scanned_members(entries, 0), do: entries
+
+  defp drop_scanned_members(entries, {:after, member}) do
+    Enum.drop_while(entries, fn {candidate, _value} -> candidate <= member end)
   end
 
   # Public so anonymous functions passed to Agent can use it.

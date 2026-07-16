@@ -1,6 +1,6 @@
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -166,8 +166,21 @@ fn cuckoo_read_header(file: &File) -> Result<CuckooFileHeader, String> {
     if max_kicks == 0 {
         return Err("max_kicks must be > 0".into());
     }
+    let total_slots = u64::from(num_buckets) * u64::from(bucket_size);
+    if num_items > total_slots {
+        return Err("cuckoo num_items must not exceed total slots".into());
+    }
 
-    let _ = cuckoo_bucket_bytes(num_buckets, bucket_size, fingerprint_size)?;
+    let expected_size = cuckoo_file_size(num_buckets, bucket_size, fingerprint_size)?;
+    let actual_size = file
+        .metadata()
+        .map_err(|error| format!("read cuckoo file metadata: {error}"))?
+        .len();
+    if actual_size != expected_size {
+        return Err(format!(
+            "cuckoo file size mismatch: expected {expected_size}, got {actual_size}"
+        ));
+    }
 
     Ok(CuckooFileHeader {
         num_buckets,
@@ -214,7 +227,19 @@ fn cuckoo_file_alternate_bucket(bucket: usize, fp: &[u8], num_buckets: u32) -> u
     let fp_hash = u64::from_le_bytes([
         hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
     ]);
-    ((bucket as u64) ^ fp_hash) as usize % (num_buckets as usize)
+    let modulus = u64::from(num_buckets);
+
+    // XOR followed by `% num_buckets` is only involutive when the bucket
+    // count is a power of two. Capacities are intentionally arbitrary, so use
+    // modular reflection: h - (h - bucket) == bucket (mod N).
+    ((fp_hash % modulus + modulus - bucket as u64) % modulus) as usize
+}
+
+fn cuckoo_file_candidate_buckets(
+    primary: usize,
+    alternate: usize,
+) -> impl Iterator<Item = usize> {
+    std::iter::once(primary).chain((alternate != primary).then_some(alternate))
 }
 
 /// Compute the byte offset in the file for a given bucket and slot.
@@ -359,8 +384,8 @@ enum FileOpenError {
 }
 
 /// Open a cuckoo file for reading only.
-fn cuckoo_file_open_read(path: &str) -> Result<File, FileOpenError> {
-    crate::open_random_read(Path::new(path)).map_err(|e| {
+fn cuckoo_file_open_read(path: &str) -> Result<crate::LockedFile, FileOpenError> {
+    crate::open_random_read_locked(Path::new(path)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             FileOpenError::NotFound
         } else {
@@ -370,8 +395,8 @@ fn cuckoo_file_open_read(path: &str) -> Result<File, FileOpenError> {
 }
 
 /// Open a cuckoo file for reading and writing.
-fn cuckoo_file_open_rw(path: &str) -> Result<File, FileOpenError> {
-    crate::open_random_rw(Path::new(path)).map_err(|e| {
+fn cuckoo_file_open_rw(path: &str) -> Result<crate::LockedFile, FileOpenError> {
+    crate::open_random_rw_locked(Path::new(path)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             FileOpenError::NotFound
         } else {
@@ -389,11 +414,11 @@ fn cuckoo_file_exists_in_open_file(
         cuckoo_file_fingerprint_and_bucket(element, hdr.fingerprint_size as usize, hdr.num_buckets);
     let b2 = cuckoo_file_alternate_bucket(b1, &fp, hdr.num_buckets);
 
-    for bucket in &[b1, b2] {
+    for bucket in cuckoo_file_candidate_buckets(b1, b2) {
         for slot in 0..hdr.bucket_size {
             let s = cuckoo_file_read_slot(
                 file,
-                *bucket,
+                bucket,
                 slot as usize,
                 hdr.bucket_size,
                 hdr.fingerprint_size,
@@ -414,4 +439,3 @@ fn encode_file_open_error(env: Env, err: FileOpenError) -> Term {
         FileOpenError::Other(msg) => (atoms::error(), msg).encode(env),
     }
 }
-

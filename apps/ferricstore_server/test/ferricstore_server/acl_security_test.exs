@@ -40,6 +40,14 @@ defmodule FerricstoreServer.AclSecurityTest do
     :ok
   end
 
+  @tag :acl_missing_default_fail_closed
+  test "a missing default ACL record never grants full access" do
+    assert FerricstoreServer.Acl.CatalogProjector.ready?()
+    assert true = :ets.delete(FerricstoreServer.Acl.Tables.active_table(), "default")
+
+    assert :denied = ConnAuth.build_acl_cache("default")
+  end
+
   # ---------------------------------------------------------------------------
   # Fix 1: Password hashing (PBKDF2-SHA256)
   # ---------------------------------------------------------------------------
@@ -106,7 +114,8 @@ defmodule FerricstoreServer.AclSecurityTest do
       assert :ok = Acl.set_user("alice", ["on", ">my_secret_password"])
 
       # Directly inspect the ETS table
-      [{_name, user}] = :ets.lookup(:ferricstore_acl, "alice")
+      [{_name, user}] =
+        :ets.lookup(FerricstoreServer.Acl.Tables.active_table(), "alice")
 
       refute user.password == "my_secret_password"
       assert is_binary(user.password)
@@ -151,8 +160,8 @@ defmodule FerricstoreServer.AclSecurityTest do
       assert {:error, _} = Acl.authenticate("alice", "notempty")
     end
 
-    test "very long password hashing works" do
-      long_pass = String.duplicate("x", 10_000)
+    test "maximum-length password hashing works" do
+      long_pass = String.duplicate("x", 4_096)
       assert :ok = Acl.set_user("alice", ["on", ">" <> long_pass])
       assert {:ok, "alice"} = Acl.authenticate("alice", long_pass)
       assert {:error, _} = Acl.authenticate("alice", "short")

@@ -61,10 +61,6 @@ defmodule Ferricstore.Store.BlobGCSweeperTest do
             %{
               files: 1,
               bytes: 4096,
-              legacy_files: 0,
-              legacy_bytes: 0,
-              segment_files: 1,
-              segment_bytes: 4096,
               tmp_files: 0,
               tmp_bytes: 0
             }}
@@ -80,7 +76,7 @@ defmodule Ferricstore.Store.BlobGCSweeperTest do
     assert_receive :blob_gc_stats_called, 1_000
     assert_receive :blob_gc_sweep_called, 1_000
 
-    assert %{last_sweep: %{status: :ok, files: 1, segment_files: 1, deleted_files: 1}} =
+    assert %{last_sweep: %{status: :ok, files: 1, deleted_files: 1}} =
              BlobGCSweeper.info(name)
   end
 
@@ -143,10 +139,6 @@ defmodule Ferricstore.Store.BlobGCSweeperTest do
             %{
               files: 1,
               bytes: 4096,
-              legacy_files: 1,
-              legacy_bytes: 4096,
-              segment_files: 0,
-              segment_bytes: 0,
               tmp_files: 0,
               tmp_bytes: 0
             }}

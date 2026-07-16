@@ -4,22 +4,25 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   alias Ferricstore.Bitcask.NIF
 
   @registry_key {__MODULE__, :resource}
+  @busy_retry_initial_ms 1
+  @busy_retry_max_ms 8
 
   @type resource :: reference()
   @type score_input :: binary() | integer() | float()
+  @type index_name ::
+          {__MODULE__, :index | :lookup, atom(), non_neg_integer()} | reference()
 
-  @spec table_names(atom(), non_neg_integer()) :: {atom(), atom()}
-  def table_names(instance_name, shard_index) do
+  @spec table_names(atom(), non_neg_integer()) :: {index_name(), index_name()}
+  def table_names(instance_name, shard_index)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 do
     {
-      :"ferricstore_flow_index_#{instance_name}_#{shard_index}",
-      :"ferricstore_flow_lookup_#{instance_name}_#{shard_index}"
+      {__MODULE__, :index, instance_name, shard_index},
+      {__MODULE__, :lookup, instance_name, shard_index}
     }
   end
 
   @spec new() :: resource()
   def new, do: NIF.flow_index_new()
-
-  @type index_name :: atom() | reference()
 
   @spec register(index_name(), index_name(), resource()) :: :ok
   def register(index_table, lookup_table, resource) do
@@ -66,27 +69,13 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
 
   @spec put_members(resource(), binary(), [{binary(), score_input()}]) :: :ok
   def put_members(resource, key, member_score_pairs) do
-    entries =
-      Enum.flat_map(member_score_pairs, fn {member, score_input} ->
-        case parse_score(score_input) do
-          {:ok, score} -> [{key, member, score}]
-          :error -> []
-        end
-      end)
-
+    entries = parse_member_score_pairs(key, member_score_pairs)
     put_entries(resource, entries)
   end
 
   @spec put_new_members(resource(), binary(), [{binary(), score_input()}]) :: :ok
   def put_new_members(resource, key, member_score_pairs) do
-    entries =
-      Enum.flat_map(member_score_pairs, fn {member, score_input} ->
-        case parse_score(score_input) do
-          {:ok, score} -> [{key, member, score}]
-          :error -> []
-        end
-      end)
-
+    entries = parse_member_score_pairs(key, member_score_pairs)
     put_new_entries(resource, entries)
   end
 
@@ -94,29 +83,24 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   def put_entries(_resource, []), do: :ok
 
   def put_entries(resource, entries) do
-    NIF.flow_index_put_entries(resource, parse_entries(entries))
+    native_entries = parse_entries(entries)
+    retry_busy(fn -> NIF.flow_index_put_entries(resource, native_entries) end)
   end
 
   @spec put_new_entries(resource(), [{binary(), binary(), score_input()}]) :: :ok
   def put_new_entries(_resource, []), do: :ok
 
   def put_new_entries(resource, entries) do
-    NIF.flow_index_put_new_entries(resource, parse_entries(entries))
+    native_entries = parse_entries(entries)
+    retry_busy(fn -> NIF.flow_index_put_new_entries(resource, native_entries) end)
   end
 
   @spec move_entries(resource(), [{binary(), binary(), binary(), score_input()}]) :: :ok
   def move_entries(_resource, []), do: :ok
 
   def move_entries(resource, entries) do
-    native_entries =
-      Enum.flat_map(entries, fn {from_key, to_key, member, score_input} ->
-        case parse_score(score_input) do
-          {:ok, score} -> [{from_key, to_key, member, score}]
-          :error -> []
-        end
-      end)
-
-    NIF.flow_index_move_entries(resource, native_entries)
+    native_entries = parse_move_entries(entries)
+    retry_busy(fn -> NIF.flow_index_move_entries(resource, native_entries) end)
   end
 
   @spec delete_member(resource(), binary(), binary()) :: :ok
@@ -126,18 +110,19 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   def delete_members(_resource, _key, []), do: :ok
 
   def delete_members(resource, key, members) do
-    NIF.flow_index_delete_members(resource, key, members)
+    retry_busy(fn -> NIF.flow_index_delete_members(resource, key, members) end)
   end
 
   @spec delete_entries(resource(), [{binary(), binary()}]) :: :ok
   def delete_entries(_resource, []), do: :ok
 
   def delete_entries(resource, entries) do
-    NIF.flow_index_delete_entries(resource, entries)
+    retry_busy(fn -> NIF.flow_index_delete_entries(resource, entries) end)
   end
 
   @spec score_of(resource(), binary(), binary()) :: {:ok, float()} | :miss
-  def score_of(resource, key, member), do: NIF.flow_index_score_of(resource, key, member)
+  def score_of(resource, key, member),
+    do: retry_busy(fn -> NIF.flow_index_score_of(resource, key, member) end)
 
   @spec range_slice(
           resource(),
@@ -149,6 +134,40 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
           non_neg_integer() | :all
         ) :: [{binary(), float()}]
   def range_slice(_resource, _key, _min_bound, _max_bound, _reverse?, _offset, 0), do: []
+
+  def range_slice(
+        resource,
+        key,
+        min_bound,
+        {:cursor_before, cursor_score, cursor_member},
+        true,
+        offset,
+        count
+      )
+      when is_binary(cursor_member) do
+    {min_kind, min_score} = encode_min_bound(min_bound)
+    {max_kind, max_score} = encode_max_bound({:inclusive, cursor_score})
+    count_arg = if count == :all, do: -1, else: count
+
+    case parse_score(cursor_score) do
+      {:ok, parsed_cursor_score} ->
+        NIF.flow_index_range_cursor_slice(
+          resource,
+          key,
+          min_kind,
+          min_score,
+          max_kind,
+          max_score,
+          parsed_cursor_score,
+          cursor_member,
+          offset,
+          count_arg
+        )
+
+      :error ->
+        []
+    end
+  end
 
   def range_slice(resource, key, min_bound, max_bound, reverse?, offset, count) do
     {min_kind, min_score} = encode_min_bound(min_bound)
@@ -189,14 +208,18 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   end
 
   @spec count_all(resource(), binary()) :: non_neg_integer()
-  def count_all(resource, key), do: max(NIF.flow_index_count_all(resource, key), 0)
+  def count_all(resource, key) do
+    resource
+    |> then(fn native -> retry_busy(fn -> NIF.flow_index_count_all(native, key) end) end)
+    |> max(0)
+  end
 
   @spec count_many(resource(), [binary()]) :: [non_neg_integer()]
   def count_many(_resource, []), do: []
 
   def count_many(resource, keys) when is_list(keys) do
     resource
-    |> NIF.flow_index_count_many(keys)
+    |> then(fn native -> retry_busy(fn -> NIF.flow_index_count_many(native, keys) end) end)
     |> Enum.map(&max(&1, 0))
   end
 
@@ -206,11 +229,20 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   @spec due_count_keys(resource()) :: [binary()]
   def due_count_keys(resource), do: NIF.flow_index_due_count_keys(resource)
 
+  @spec earliest_due_score(resource(), [binary()], [binary()], [binary()]) ::
+          float() | nil | {:error, term()}
+  def earliest_due_score(resource, prefixes, needles, suffixes)
+      when is_list(prefixes) and is_list(needles) and is_list(suffixes) do
+    NIF.flow_index_earliest_due_score(resource, prefixes, needles, suffixes)
+  end
+
   @spec restore_count(resource(), binary(), integer()) :: :ok
-  def restore_count(resource, key, count), do: NIF.flow_index_restore_count(resource, key, count)
+  def restore_count(resource, key, count),
+    do: retry_busy(fn -> NIF.flow_index_restore_count(resource, key, count) end)
 
   @spec delete_count(resource(), binary()) :: :ok
-  def delete_count(resource, key), do: NIF.flow_index_delete_count(resource, key)
+  def delete_count(resource, key),
+    do: retry_busy(fn -> NIF.flow_index_delete_count(resource, key) end)
 
   @spec apply_batch(resource(), [tuple()]) :: :ok
   def apply_batch(_resource, []), do: :ok
@@ -233,8 +265,8 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         {:apply_claim_entries, entries}, {puts, put_news, moves, deletes, claims} ->
           {puts, put_news, moves, deletes, [entries | claims]}
 
-        _other, acc ->
-          acc
+        invalid, _acc ->
+          raise ArgumentError, "invalid native Flow index operation: #{inspect(invalid)}"
       end)
 
     NIF.flow_index_apply_batch(
@@ -269,7 +301,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
 
   def due_keys_present(resource, keys, now_score) when is_list(keys) do
     case parse_score(now_score) do
-      {:ok, score} -> NIF.flow_index_due_keys_present(resource, keys, score)
+      {:ok, score} -> retry_busy(fn -> NIF.flow_index_due_keys_present(resource, keys, score) end)
       :error -> []
     end
   end
@@ -399,12 +431,63 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
 
   defp registry_key(index_table, lookup_table), do: {@registry_key, index_table, lookup_table}
 
+  @doc false
+  def __retry_busy_for_test__(fun, sleep_fun)
+      when is_function(fun, 0) and is_function(sleep_fun, 1) do
+    retry_busy(fun, sleep_fun, @busy_retry_initial_ms)
+  end
+
+  defp retry_busy(fun) do
+    retry_busy(fun, &Process.sleep/1, @busy_retry_initial_ms)
+  end
+
+  defp retry_busy(fun, sleep_fun, delay_ms) do
+    case fun.() do
+      :busy ->
+        sleep_fun.(delay_ms)
+        retry_busy(fun, sleep_fun, min(delay_ms * 2, @busy_retry_max_ms))
+
+      result ->
+        result
+    end
+  end
+
+  defp parse_member_score_pairs(key, member_score_pairs)
+       when is_binary(key) and is_list(member_score_pairs) do
+    Enum.map(member_score_pairs, fn
+      {member, score_input} when is_binary(member) ->
+        {key, member, parse_score!(score_input)}
+
+      invalid ->
+        raise ArgumentError, "invalid native Flow index member: #{inspect(invalid)}"
+    end)
+  end
+
+  defp parse_member_score_pairs(_key, member_score_pairs),
+    do:
+      raise(
+        ArgumentError,
+        "invalid native Flow index members: #{inspect(member_score_pairs)}"
+      )
+
   defp parse_entries(entries) do
-    Enum.flat_map(entries, fn {key, member, score_input} ->
-      case parse_score(score_input) do
-        {:ok, score} -> [{key, member, score}]
-        :error -> []
-      end
+    Enum.map(entries, fn
+      {key, member, score_input} when is_binary(key) and is_binary(member) ->
+        {key, member, parse_score!(score_input)}
+
+      invalid ->
+        raise ArgumentError, "invalid native Flow index entry: #{inspect(invalid)}"
+    end)
+  end
+
+  defp parse_move_entries(entries) when is_list(entries) do
+    Enum.map(entries, fn
+      {from_key, to_key, member, score_input}
+      when is_binary(from_key) and is_binary(to_key) and is_binary(member) ->
+        {from_key, to_key, member, parse_score!(score_input)}
+
+      invalid ->
+        raise ArgumentError, "invalid native Flow index move: #{inspect(invalid)}"
     end)
   end
 
@@ -414,12 +497,15 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
 
   defp prepend_parsed_entries([], acc), do: acc
 
-  defp prepend_parsed_entries([{key, member, score_input} | rest], acc) do
-    case parse_score(score_input) do
-      {:ok, score} -> [{key, member, score} | prepend_parsed_entries(rest, acc)]
-      :error -> prepend_parsed_entries(rest, acc)
-    end
-  end
+  defp prepend_parsed_entries(
+         [{key, member, score_input} | rest],
+         acc
+       )
+       when is_binary(key) and is_binary(member),
+       do: [{key, member, parse_score!(score_input)} | prepend_parsed_entries(rest, acc)]
+
+  defp prepend_parsed_entries([invalid | _rest], _acc),
+    do: raise(ArgumentError, "invalid native Flow index entry: #{inspect(invalid)}")
 
   defp parse_reversed_move_groups(groups) do
     Enum.reduce(groups, [], &prepend_parsed_move_entries/2)
@@ -428,13 +514,10 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   defp prepend_parsed_move_entries([], acc), do: acc
 
   defp prepend_parsed_move_entries([{from_key, to_key, member, score_input} | rest], acc) do
-    case parse_score(score_input) do
-      {:ok, score} ->
-        [{from_key, to_key, member, score} | prepend_parsed_move_entries(rest, acc)]
-
-      :error ->
-        prepend_parsed_move_entries(rest, acc)
-    end
+    [
+      {from_key, to_key, member, parse_score!(score_input)}
+      | prepend_parsed_move_entries(rest, acc)
+    ]
   end
 
   defp prepend_reversed_groups(groups) do
@@ -458,8 +541,20 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   defp encode_max_bound(:neg_inf), do: {3, 0.0}
   defp encode_max_bound(_other), do: {3, 0.0}
 
+  defp parse_score!(score) do
+    case parse_score(score) do
+      {:ok, parsed} -> parsed
+      :error -> raise ArgumentError, "invalid native Flow index score: #{inspect(score)}"
+    end
+  end
+
   defp parse_score(score) when is_float(score), do: {:ok, score}
-  defp parse_score(score) when is_integer(score), do: {:ok, score * 1.0}
+
+  defp parse_score(score) when is_integer(score) do
+    {:ok, score * 1.0}
+  rescue
+    ArithmeticError -> :error
+  end
 
   defp parse_score(score) when is_binary(score) do
     case Float.parse(score) do

@@ -15,4 +15,10 @@ defmodule Ferricstore.Flow.RetentionGuardTest do
       RetentionGuard.encode(%{version: 7, created_at_ms: 1_000})
     end
   end
+
+  test "rejects negative record versions that guard readers classify as corrupt" do
+    assert_raise ArgumentError, ~r/non-negative version/, fn ->
+      RetentionGuard.encode(%{version: -1, state_enter_seq: 1})
+    end
+  end
 end

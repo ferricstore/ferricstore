@@ -170,6 +170,448 @@ mod prob_fsync_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod nofollow_random_file_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn random_access_helpers_reject_final_component_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("sidecar");
+        std::fs::write(&target, b"protected").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            open_random_read(&link).unwrap_err().raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        assert_eq!(
+            open_random_rw(&link).unwrap_err().raw_os_error(),
+            Some(libc::ELOOP)
+        );
+    }
+
+    #[test]
+    fn nofollow_helpers_reject_intermediate_directory_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        let inside = dir.path().join("inside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&inside).unwrap();
+        std::fs::write(outside.join("existing"), b"protected").unwrap();
+        symlink(&outside, inside.join("redirect")).unwrap();
+
+        let redirected_existing = inside.join("redirect/existing");
+        let redirected_new = inside.join("redirect/new");
+        let redirected_truncate = inside.join("redirect/truncate");
+
+        assert!(open_random_read(&redirected_existing).is_err());
+        assert!(open_random_rw(&redirected_existing).is_err());
+        assert!(open_append_nofollow(&redirected_new).is_err());
+        assert!(create_truncate_nofollow(&redirected_truncate).is_err());
+
+        assert!(!outside.join("new").exists());
+        assert!(!outside.join("truncate").exists());
+        assert_eq!(std::fs::read(outside.join("existing")).unwrap(), b"protected");
+    }
+
+    #[test]
+    fn rename_and_unlink_reject_intermediate_directory_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        let inside = dir.path().join("inside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&inside).unwrap();
+        std::fs::write(outside.join("source"), b"protected").unwrap();
+        symlink(&outside, inside.join("redirect")).unwrap();
+
+        assert!(
+            crate::path_open::rename_nofollow(
+                &inside.join("redirect/source"),
+                &inside.join("redirect/renamed"),
+            )
+            .is_err()
+        );
+        assert!(
+            crate::path_open::remove_file_nofollow(&inside.join("redirect/source")).is_err()
+        );
+
+        assert_eq!(std::fs::read(outside.join("source")).unwrap(), b"protected");
+        assert!(!outside.join("renamed").exists());
+    }
+
+    #[test]
+    fn create_truncate_helper_rejects_symlink_without_touching_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("sidecar");
+        std::fs::write(&target, b"protected").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            create_truncate_nofollow(&link)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"protected");
+    }
+
+    #[test]
+    fn append_opener_rejects_a_fifo_without_waiting_for_a_reader() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let fifo = dir.path().join("append.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_path = fifo.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(open_append_nofollow(&worker_path).map(drop))
+                .unwrap();
+        });
+
+        let result = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Unblock the old behavior so a failing regression never leaks
+                // a thread or stalls TempDir cleanup.
+                let reader = unsafe {
+                    libc::open(
+                        fifo_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    )
+                };
+                assert!(reader >= 0);
+                let result = rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("blocked FIFO append opener did not recover");
+                unsafe { libc::close(reader) };
+                worker.join().unwrap();
+                panic!("append opener blocked on a FIFO and later returned {result:?}");
+            }
+            Err(error) => panic!("append opener channel failed: {error}"),
+        };
+
+        worker.join().unwrap();
+        assert!(result.is_err(), "append opener accepted a FIFO");
+    }
+
+    #[test]
+    fn random_read_opener_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let fifo = dir.path().join("read.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_path = fifo.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(open_random_read(&worker_path).map(drop)).unwrap();
+        });
+
+        let result = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Unblock the old behavior so a failing regression never leaks
+                // a thread or stalls TempDir cleanup.
+                let writer = unsafe {
+                    libc::open(
+                        fifo_c.as_ptr(),
+                        libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    )
+                };
+                assert!(writer >= 0);
+                let result = rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("blocked FIFO read opener did not recover");
+                unsafe { libc::close(writer) };
+                worker.join().unwrap();
+                panic!("random read opener blocked on a FIFO and later returned {result:?}");
+            }
+            Err(error) => panic!("random read opener channel failed: {error}"),
+        };
+
+        worker.join().unwrap();
+        assert!(result.is_err(), "random read opener accepted a FIFO");
+    }
+
+    #[test]
+    fn random_rw_opener_rejects_a_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let fifo = dir.path().join("rw.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        assert!(
+            open_random_rw(&fifo).is_err(),
+            "random read-write opener accepted a FIFO"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probabilistic_sidecar_locking_tests {
+    use super::*;
+
+    #[test]
+    fn exclusive_file_locks_serialize_independent_descriptors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sidecar");
+        std::fs::write(&path, b"sidecar").unwrap();
+
+        let first = open_random_rw(&path).unwrap();
+        let first_lock = lock_file_exclusive(&first).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let second = open_random_rw(&worker_path).unwrap();
+            ready_tx.send(()).unwrap();
+            let _second_lock = lock_file_exclusive(&second).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        assert_eq!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        drop(first_lock);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn probabilistic_sidecars_use_lock_aware_open_helpers() {
+        let production_sources = [
+            include_str!("../bloom.rs"),
+            include_str!("../cms.rs"),
+            include_str!("../topk.rs"),
+            include_str!("cuckoo_part_01.rs"),
+            include_str!("cuckoo_part_02.rs"),
+        ];
+        let combined = production_sources
+            .iter()
+            .map(|source| source.split("#[cfg(test)]").next().unwrap_or(source))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            combined.contains("open_random_read_locked"),
+            "sidecar reads must hold a shared advisory lock"
+        );
+        assert!(
+            combined.contains("open_random_rw_locked"),
+            "sidecar mutations must hold an exclusive advisory lock"
+        );
+        assert!(
+            combined.contains("create_staged_locked_nofollow"),
+            "sidecar creation must stage before atomic publication"
+        );
+        assert!(
+            !combined.contains("crate::open_random_read("),
+            "sidecar reads must not bypass the lock-aware helper"
+        );
+        assert!(
+            !combined.contains("crate::open_random_rw("),
+            "sidecar mutations must not bypass the lock-aware helper"
+        );
+        assert!(
+            !combined.contains("crate::create_truncate_nofollow("),
+            "sidecar creation must not truncate before acquiring its lock"
+        );
+    }
+
+    #[test]
+    fn staged_sidecar_is_invisible_until_atomic_publish() {
+        use std::io::Write;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sidecar");
+        let mut staged = create_staged_locked_nofollow(&path).unwrap();
+        staged.write_all(b"complete-layout").unwrap();
+
+        assert!(!path.exists());
+        staged.publish().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"complete-layout");
+    }
+
+    #[test]
+    fn opposing_merge_lock_sets_do_not_deadlock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        std::fs::write(&left, b"left").unwrap();
+        std::fs::write(&right, b"right").unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        for (destination, source) in [(left.clone(), right.clone()), (right, left)] {
+            let worker_barrier = std::sync::Arc::clone(&barrier);
+            let worker_tx = acquired_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                let sources = [source.as_path()];
+                let _files = open_random_merge_locked(&destination, &sources).unwrap();
+                worker_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }));
+        }
+
+        barrier.wait();
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_lock_set_deduplicates_destination_hardlink_aliases() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let destination = dir.path().join("destination");
+        let alias = dir.path().join("alias");
+        std::fs::write(&destination, b"sidecar").unwrap();
+        std::fs::hard_link(&destination, &alias).unwrap();
+
+        let sources = [alias.as_path()];
+        let files = open_random_merge_locked(&destination, &sources).unwrap();
+        assert_eq!(files.sources.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod io_backend_architecture_tests {
+    fn rust_sources(path: &std::path::Path, sources: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, sources);
+            } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
+                sources.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn unused_async_uring_backend_is_not_exported() {
+        let source = include_str!("../io_backend/mod.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+
+        assert!(!production.contains("mod async_uring"));
+        assert!(!production.contains("AsyncUringBackend"));
+    }
+
+    #[test]
+    fn active_uring_validates_kernel_lengths_offsets_and_completion_tags() {
+        let source = include_str!("../io_backend/uring.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+
+        assert!(production.contains("fn uring_write_len("));
+        assert!(production.contains("fn checked_write_end("));
+        assert!(!production.contains("unwrap_or(u32::MAX)"));
+        assert!(!production.contains(".user_data(file_offset)"));
+        assert!(production.contains(".user_data(index as u64)"));
+        assert!(production.contains("validate_uring_single_completion("));
+        assert!(production.contains("fn submit_and_wait_retry("));
+        assert!(
+            production.contains(".push_multiple(&sqes)"),
+            "batch SQEs must be capacity-checked before any borrowed buffer pointer is queued"
+        );
+    }
+
+    #[test]
+    fn native_code_uses_only_compile_time_atoms() {
+        let mut sources = Vec::new();
+        rust_sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+
+        let forbidden = [
+            ["Atom", "::from_str"].concat(),
+            ["Atom", "::from_bytes"].concat(),
+            ["enif_", "make_atom"].concat(),
+            ["make_", "existing_atom"].concat(),
+        ];
+
+        for path in sources {
+            let source = std::fs::read_to_string(&path).unwrap();
+            for pattern in &forbidden {
+                assert!(
+                    !source.contains(pattern),
+                    "runtime atom construction is forbidden in {}: {pattern}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn async_blocking_work_uses_central_bounded_admission() {
+        let sources = [
+            include_str!("part_03.rs"),
+            include_str!("part_05.rs"),
+            include_str!("../bloom.rs"),
+            include_str!("../cms.rs"),
+            include_str!("cuckoo_part_02.rs"),
+            include_str!("../topk.rs"),
+            include_str!("../fs_nif.rs"),
+        ];
+
+        for source in sources {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            assert!(
+                !production.contains("tokio::task::spawn_blocking(move ||"),
+                "async NIFs must submit through async_io::try_spawn_blocking"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lmdb_cache_architecture_tests {
+    #[test]
+    fn unrelated_lmdb_paths_do_not_open_under_the_global_cache_mutex() {
+        let declarations = include_str!("../sections/part_01.rs");
+        let implementation = include_str!("../sections/part_04.rs");
+        let lmdb_store = implementation
+            .split("fn lmdb_store(")
+            .nth(1)
+            .unwrap()
+            .split("#[rustler::nif")
+            .next()
+            .unwrap();
+
+        assert!(declarations.contains("LmdbStoreCell"));
+        assert!(lmdb_store.contains("get_or_init"));
+        assert!(lmdb_store.find("std::fs::create_dir_all").unwrap()
+            < lmdb_store.find("stores.lock()").unwrap());
+        assert!(lmdb_store.find("std::fs::canonicalize").unwrap()
+            < lmdb_store.find("stores.lock()").unwrap());
+    }
+}
+
 // ===========================================================================
 // fsync_dir edge-case tests
 // ---------------------------------------------------------------------------
@@ -226,10 +668,7 @@ mod fsync_dir_tests {
     }
 
     #[test]
-    fn path_to_regular_file_ok_or_well_formed_err() {
-        // On most systems, fsync on a regular file fd is legal and equivalent
-        // to v2_fsync on that file. We accept either Ok (file treated like a
-        // file) or a well-formed Err. What we DO NOT accept: a panic.
+    fn path_to_regular_file_is_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
         let fpath = dir.path().join("not_a_dir.txt");
         let mut f = File::create(&fpath).unwrap();
@@ -237,10 +676,22 @@ mod fsync_dir_tests {
         f.sync_all().unwrap();
 
         let result = fsync_dir(fpath.to_str().unwrap());
-        match result {
-            Ok(()) => {}
-            Err(msg) => assert!(!msg.is_empty()),
-        }
+        assert!(result.is_err(), "fsync_dir must reject a regular file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("redirect");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let result = fsync_dir(link.to_str().unwrap());
+        assert!(result.is_err(), "fsync_dir must not follow a symlink");
     }
 
     #[test]
@@ -347,16 +798,31 @@ mod fsync_dir_tests {
 #[cfg(test)]
 mod nif_scheduler_tests {
     #[test]
-    fn file_backed_probabilistic_nifs_do_not_run_on_dirty_schedulers() {
-        for path in ["src/bloom.rs", "src/cms.rs", "src/cuckoo.rs", "src/topk.rs"] {
+    fn file_backed_probabilistic_nifs_use_the_correct_scheduler_class() {
+        for path in [
+            "src/bloom.rs",
+            "src/cms.rs",
+            "src/sections/cuckoo_part_02.rs",
+            "src/topk.rs",
+        ] {
             let source =
                 std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
 
-            for (line_idx, line) in source.lines().enumerate() {
+            let lines = source.lines().collect::<Vec<_>>();
+            for (line_idx, line) in lines.iter().enumerate() {
                 if line.contains("#[rustler::nif") {
+                    let function = lines[line_idx + 1..]
+                        .iter()
+                        .find(|candidate| candidate.trim_start().starts_with("pub fn "))
+                        .unwrap_or_else(|| panic!("{path}:{} missing NIF function", line_idx + 1));
+                    let is_async = function.contains("_async");
                     assert!(
-                        !line.contains("DirtyIo") && !line.contains("DirtyCpu"),
-                        "{path}:{} file-backed probabilistic NIFs must stay off dirty schedulers; move long I/O to async workers instead: {line}",
+                        if is_async {
+                            line.contains("Normal")
+                        } else {
+                            line.contains("DirtyIo")
+                        },
+                        "{path}:{} synchronous file I/O must use DirtyIo and async dispatch must use Normal: {line} before {function}",
                         line_idx + 1
                     );
                 }
@@ -366,7 +832,13 @@ mod nif_scheduler_tests {
 
     #[test]
     fn file_backed_probabilistic_writes_go_through_write_all_at() {
-        for path in ["src/bloom.rs", "src/cms.rs", "src/cuckoo.rs", "src/topk.rs"] {
+        for path in [
+            "src/bloom.rs",
+            "src/cms.rs",
+            "src/sections/cuckoo_part_01.rs",
+            "src/sections/cuckoo_part_02.rs",
+            "src/topk.rs",
+        ] {
             let source =
                 std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
 
@@ -379,6 +851,75 @@ mod nif_scheduler_tests {
                     line_idx + 1
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_page_limit_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_scan_page_limit_is_bounded_at_the_native_boundary() {
+        assert_eq!(validate_scan_file_page_limit(1).unwrap(), 1);
+        assert_eq!(
+            validate_scan_file_page_limit(MAX_SCAN_FILE_PAGE_RECORDS).unwrap(),
+            MAX_SCAN_FILE_PAGE_RECORDS
+        );
+        assert!(validate_scan_file_page_limit(0).is_err());
+        assert!(validate_scan_file_page_limit(MAX_SCAN_FILE_PAGE_RECORDS + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retired_store_architecture_tests {
+    #[test]
+    fn resource_style_store_stack_is_not_compiled() {
+        let lib_source = include_str!("../lib.rs");
+        let hint_source = include_str!("../hint.rs");
+
+        for declaration in ["pub mod store;", "pub mod keydir;", "pub mod compaction;"] {
+            assert!(
+                !lib_source.contains(declaration),
+                "retired native module is still compiled: {declaration}"
+            );
+        }
+
+        assert!(
+            !hint_source.contains("pub fn load_into"),
+            "hint decoding must not retain the retired Rust KeyDir adapter"
+        );
+        assert!(
+            !hint_source.contains("crate::keydir"),
+            "hint decoding must not depend on the retired Rust KeyDir"
+        );
+    }
+
+    #[test]
+    fn full_materialization_nifs_are_not_compiled() {
+        let source = include_str!("part_02.rs");
+
+        for function in [
+            "fn v2_scan_file<'a>",
+            "fn v2_scan_file_from_offset<'a>",
+            "fn v2_scan_tombstones<'a>",
+            "fn v2_read_hint_file<'a>",
+        ] {
+            assert!(
+                !source.contains(function),
+                "unbounded full-materialization NIF is still compiled: {function}"
+            );
+        }
+
+        for function in [
+            "fn v2_scan_file_page",
+            "fn v2_scan_tombstones_page",
+            "fn v2_read_hint_file_page",
+        ] {
+            assert!(
+                source.contains(function),
+                "bounded streaming NIF is missing: {function}"
+            );
         }
     }
 }
@@ -397,7 +938,7 @@ mod lmdb_cache_tests {
         let alias = alias_root.join("db");
 
         let first = lmdb_store(real.to_str().unwrap(), 64 * 1024 * 1024).unwrap();
-        let second = lmdb_store(alias.to_str().unwrap(), 128 * 1024 * 1024).unwrap();
+        let second = lmdb_store(alias.to_str().unwrap(), 64 * 1024 * 1024).unwrap();
 
         assert!(
             Arc::ptr_eq(&first, &second),
@@ -421,4 +962,3 @@ mod lmdb_cache_tests {
         );
     }
 }
-

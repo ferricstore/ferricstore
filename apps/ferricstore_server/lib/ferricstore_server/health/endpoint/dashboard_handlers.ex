@@ -5,6 +5,7 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
   alias FerricstoreServer.Health.Endpoint.Auth
   alias FerricstoreServer.Health.Endpoint.FlowPaths
   alias FerricstoreServer.Health.Endpoint.Response
+  alias FerricstoreServer.Health.QueryDecoder
 
   def handle_slowlog_page(socket, transport, peer, headers) do
     render_static_page(
@@ -58,7 +59,7 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
       true ->
         data =
           query
-          |> URI.decode_query()
+          |> QueryDecoder.decode()
           |> Map.merge(Auth.dashboard_collect_opts(peer, headers))
           |> Dashboard.collect_security_page()
 
@@ -222,7 +223,7 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
       true ->
         data =
           query
-          |> URI.decode_query()
+          |> QueryDecoder.decode()
           |> Map.merge(Auth.dashboard_collect_opts(peer, headers))
           |> Dashboard.collect_keyspace_page()
 
@@ -239,7 +240,7 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
       true ->
         data =
           query
-          |> URI.decode_query()
+          |> QueryDecoder.decode()
           |> Dashboard.collect_doctor_page()
 
         body = Dashboard.render_doctor_page(data)
@@ -431,7 +432,7 @@ defmodule FerricstoreServer.Health.Endpoint.DashboardHandlers do
         Response.send_response(socket, transport, 403, "Forbidden", ~s({"error":"forbidden"}))
 
       true ->
-        decoded_query = URI.decode_query(query)
+        decoded_query = QueryDecoder.decode(query)
 
         id =
           decoded_query

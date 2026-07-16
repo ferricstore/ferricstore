@@ -9,8 +9,15 @@ defmodule Ferricstore.Commands.CMS do
 
   alias Ferricstore.Bitcask.{Async, NIF}
   alias Ferricstore.Commands.ProbType
+  alias Ferricstore.ProbFile
 
   @prob_read_timeout_ms 5_000
+  @max_cms_depth 1_024
+  @max_cms_counters 16_777_216
+  @max_merge_sources 10_000
+  @max_batch_items 10_000
+  @max_int64 9_223_372_036_854_775_807
+  @min_int64 -9_223_372_036_854_775_808
 
   # -------------------------------------------------------------------
   # Public command handler
@@ -21,7 +28,8 @@ defmodule Ferricstore.Commands.CMS do
   def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
 
   def handle_ast({:cms_initbydim, key, width, depth}, store) do
-    with :ok <- check_not_exists(key, store) do
+    with :ok <- validate_cms_dimensions(width, depth),
+         :ok <- check_not_exists(key, store) do
       result = do_prob_write(store, {:cms_create, key, width, depth})
 
       case result do
@@ -33,13 +41,14 @@ defmodule Ferricstore.Commands.CMS do
   end
 
   def handle_ast({:cms_initbyprob, key, error, prob}, store) do
-    width = ceil(:math.exp(1) / error)
-    depth = ceil(:math.log(1.0 / prob))
-    handle_ast({:cms_initbydim, key, width, depth}, store)
+    with {:ok, width, depth} <- cms_dimensions_for_probability(error, prob) do
+      handle_ast({:cms_initbydim, key, width, depth}, store)
+    end
   end
 
   def handle_ast({:cms_incrby, key, pairs}, store) do
-    with :ok <- ProbType.check_expected(key, :cms, store) do
+    with :ok <- validate_cms_pairs(pairs),
+         :ok <- ProbType.check_expected(key, :cms, store) do
       result = do_prob_write(store, {:cms_incrby, key, pairs})
       normalize_result(result)
     end
@@ -49,7 +58,8 @@ defmodule Ferricstore.Commands.CMS do
   def handle_ast({:cms_info, args}, store), do: cms_info_args(args, store)
 
   def handle_ast({:cms_merge, dst, src_keys, weights}, store) do
-    with :ok <- ProbType.check_expected(dst, :cms, store),
+    with :ok <- validate_cms_merge_args(src_keys, weights),
+         :ok <- ProbType.check_expected(dst, :cms, store),
          :ok <- check_source_types(src_keys, store),
          {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
          :ok <- validate_sketch_dims(store, src_keys, first_w, first_d) do
@@ -65,6 +75,7 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.INITBYDIM", [key, width_str, depth_str], store) do
     with {:ok, width} <- parse_pos_integer(width_str, "width"),
          {:ok, depth} <- parse_pos_integer(depth_str, "depth"),
+         :ok <- validate_cms_dimensions(width, depth),
          :ok <- check_not_exists(key, store) do
       result = do_prob_write(store, {:cms_create, key, width, depth})
 
@@ -82,9 +93,8 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.INITBYPROB", [key, error_str, prob_str], store) do
     with {:ok, error} <- parse_pos_float(error_str, "error"),
          {:ok, prob} <- parse_prob_float(prob_str, "probability"),
+         {:ok, width, depth} <- cms_dimensions_for_probability(error, prob),
          :ok <- check_not_exists(key, store) do
-      width = ceil(:math.exp(1) / error)
-      depth = ceil(:math.log(1.0 / prob))
       result = do_prob_write(store, {:cms_create, key, width, depth})
 
       case result do
@@ -99,7 +109,8 @@ defmodule Ferricstore.Commands.CMS do
     do: {:error, "ERR wrong number of arguments for 'cms.initbyprob' command"}
 
   def handle("CMS.INCRBY", [key | rest], store) when rest != [] do
-    with :ok <- ProbType.check_expected(key, :cms, store),
+    with :ok <- validate_raw_pair_batch(rest),
+         :ok <- ProbType.check_expected(key, :cms, store),
          {:ok, pairs} <- parse_element_count_pairs(rest) do
       result = do_prob_write(store, {:cms_incrby, key, pairs})
       normalize_result(result)
@@ -114,7 +125,9 @@ defmodule Ferricstore.Commands.CMS do
 
   def handle("CMS.MERGE", [dst, numkeys_str | rest], store) do
     with {:ok, numkeys} <- parse_pos_integer(numkeys_str, "numkeys"),
+         :ok <- validate_merge_source_count(numkeys),
          {:ok, src_keys, weights} <- parse_merge_args(rest, numkeys),
+         :ok <- validate_cms_merge_args(src_keys, weights),
          :ok <- ProbType.check_expected(dst, :cms, store),
          :ok <- check_source_types(src_keys, store),
          {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
@@ -132,6 +145,30 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.INFO", args, store), do: cms_info_args(args, store)
 
   defp cms_query_args([key | elements], store) when elements != [] do
+    with :ok <- validate_batch_count(length(elements)) do
+      case cms_read_status(key, store) do
+        :ok -> do_cms_query(key, elements, store)
+        :missing -> {:error, "ERR CMS: key does not exist"}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp cms_query_args(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cms.query' command"}
+
+  defp cms_info_args([key], store) do
+    case cms_read_status(key, store) do
+      :ok -> do_cms_info(key, store)
+      :missing -> {:error, "ERR CMS: key does not exist"}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp cms_info_args(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cms.info' command"}
+
+  defp do_cms_query(key, elements, store) do
     path = prob_path(store, key, "cms")
 
     case await_nif(fn proxy, corr_id ->
@@ -151,10 +188,7 @@ defmodule Ferricstore.Commands.CMS do
     end
   end
 
-  defp cms_query_args(_args, _store),
-    do: {:error, "ERR wrong number of arguments for 'cms.query' command"}
-
-  defp cms_info_args([key], store) do
+  defp do_cms_info(key, store) do
     path = prob_path(store, key, "cms")
 
     case await_nif(fn proxy, corr_id ->
@@ -173,9 +207,6 @@ defmodule Ferricstore.Commands.CMS do
         {:error, "ERR CMS info failed: #{reason}"}
     end
   end
-
-  defp cms_info_args(_args, _store),
-    do: {:error, "ERR wrong number of arguments for 'cms.info' command"}
 
   # ---------------------------------------------------------------------------
   # Deletion
@@ -199,16 +230,38 @@ defmodule Ferricstore.Commands.CMS do
   defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
 
   defp missing_or_wrongtype(key, store, missing_result) do
-    case ProbType.check_expected(key, :cms, store) do
+    case ProbType.check_create(key, :cms, store) do
       :ok -> missing_result
+      {:error, :exists} -> {:error, "ERR CMS sketch file is missing"}
       {:error, _} = error -> error
     end
   end
 
+  defp cms_read_status(key, store) do
+    case ProbType.check_create(key, :cms, store) do
+      {:error, :exists} ->
+        :ok
+
+      :ok ->
+        if file_only_cms_store?(store) and Ferricstore.FS.exists?(prob_path(store, key, "cms")) do
+          :ok
+        else
+          :missing
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp file_only_cms_store?(%{cms_registry: _} = store),
+    do: not is_function(Map.get(store, :prob_write), 1)
+
+  defp file_only_cms_store?(_store), do: false
+
   defp prob_path(store, key, ext) do
-    safe = Base.url_encode64(key, padding: false)
     prob_dir = resolve_prob_dir(store, key)
-    Path.join(prob_dir, "#{safe}.#{ext}")
+    ProbFile.path(prob_dir, key, ext)
   end
 
   defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
@@ -247,10 +300,13 @@ defmodule Ferricstore.Commands.CMS do
     dir = Path.dirname(path)
 
     with :ok <- ensure_prob_dir(dir),
-         {:ok, _resource} = result <- NIF.cms_file_create(path, width, depth),
-         :ok <- prob_fsync_dir(dir, :prob_file_dir),
-         :ok <- register_cms_meta(result, store, key, width, depth) do
-      result
+         {:ok, _resource} = result <- NIF.cms_file_create(path, width, depth) do
+      ProbType.finalize_created_file(path, result, fn ->
+        with :ok <- prob_fsync_dir(dir, :prob_file_dir),
+             :ok <- register_cms_meta(result, store, key, width, depth) do
+          :ok
+        end
+      end)
     end
   end
 
@@ -276,10 +332,16 @@ defmodule Ferricstore.Commands.CMS do
     else
       %{width: w, depth: d} = create_params
 
-      with {:ok, _resource} = result <- NIF.cms_file_create(dst_path, w, d),
-           :ok <- prob_fsync_dir(dir, :prob_file_dir),
-           :ok <- register_cms_meta(result, store, dst_key, w, d) do
-        :ok
+      with {:ok, _resource} = result <- NIF.cms_file_create(dst_path, w, d) do
+        case ProbType.finalize_created_file(dst_path, result, fn ->
+               with :ok <- prob_fsync_dir(dir, :prob_file_dir),
+                    :ok <- register_cms_meta(result, store, dst_key, w, d) do
+                 :ok
+               end
+             end) do
+          {:ok, _resource} -> :ok
+          {:error, _reason} = error -> error
+        end
       end
     end
   end
@@ -333,6 +395,101 @@ defmodule Ferricstore.Commands.CMS do
   defp normalize_result({:error, _} = err), do: err
   defp normalize_result(other), do: other
 
+  defp validate_cms_dimensions(width, depth)
+       when is_integer(width) and width > 0 and is_integer(depth) and depth > 0 do
+    cond do
+      depth > @max_cms_depth ->
+        {:error, "ERR depth must be <= #{@max_cms_depth}"}
+
+      width > div(@max_cms_counters, depth) ->
+        {:error, "ERR CMS counter count exceeds #{@max_cms_counters}"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_cms_dimensions(_width, _depth),
+    do: {:error, "ERR width and depth must be positive integers"}
+
+  defp cms_dimensions_for_probability(error, probability)
+       when is_float(error) and error > 0.0 and is_float(probability) and probability > 0.0 and
+              probability < 1.0 do
+    depth = ceil(-:math.log(probability))
+
+    with :ok <- validate_cms_dimensions(1, depth) do
+      max_width = div(@max_cms_counters, depth)
+
+      if error < :math.exp(1) / max_width do
+        {:error, "ERR CMS counter count exceeds #{@max_cms_counters}"}
+      else
+        width = ceil(:math.exp(1) / error)
+
+        case validate_cms_dimensions(width, depth) do
+          :ok -> {:ok, width, depth}
+          {:error, _} = error -> error
+        end
+      end
+    end
+  rescue
+    ArithmeticError -> {:error, "ERR CMS probability parameters are out of range"}
+  end
+
+  defp cms_dimensions_for_probability(_error, _probability),
+    do: {:error, "ERR CMS probability parameters are out of range"}
+
+  defp validate_cms_pairs([_ | _] = pairs) do
+    with :ok <- validate_batch_count(length(pairs)) do
+      if Enum.all?(pairs, fn
+           {element, count}
+           when is_binary(element) and is_integer(count) and count > 0 and count <= @max_int64 ->
+             true
+
+           _other ->
+             false
+         end) do
+        :ok
+      else
+        {:error, "ERR CMS: invalid element/count pairs"}
+      end
+    end
+  end
+
+  defp validate_cms_pairs(_pairs), do: {:error, "ERR CMS: invalid element/count pairs"}
+
+  defp validate_raw_pair_batch(args) do
+    validate_batch_count(div(length(args) + 1, 2))
+  end
+
+  defp validate_batch_count(count) when count <= @max_batch_items, do: :ok
+
+  defp validate_batch_count(_count),
+    do: {:error, "ERR CMS: batch exceeds maximum of #{@max_batch_items} items"}
+
+  defp validate_cms_merge_args([_ | _] = src_keys, weights) when is_list(weights) do
+    with :ok <- validate_merge_source_count(length(src_keys)) do
+      validate_cms_merge_pairs(src_keys, weights)
+    end
+  end
+
+  defp validate_cms_merge_args(_src_keys, _weights),
+    do: {:error, "ERR CMS: invalid merge arguments"}
+
+  defp validate_merge_source_count(count) when count <= @max_merge_sources, do: :ok
+
+  defp validate_merge_source_count(_count),
+    do: {:error, "ERR CMS: too many source keys (maximum #{@max_merge_sources})"}
+
+  defp validate_cms_merge_pairs([], []), do: :ok
+
+  defp validate_cms_merge_pairs([key | keys], [weight | weights])
+       when is_binary(key) and is_integer(weight) and weight >= @min_int64 and
+              weight <= @max_int64,
+       do: validate_cms_merge_pairs(keys, weights)
+
+  defp validate_cms_merge_pairs(_keys, _weights),
+    do: {:error, "ERR CMS: invalid merge arguments"}
+
   defp parse_pos_integer(str, label) do
     case Integer.parse(str) do
       {n, ""} when n > 0 -> {:ok, n}
@@ -347,6 +504,8 @@ defmodule Ferricstore.Commands.CMS do
       {_f, ""} -> {:error, "ERR #{label} must be a positive number"}
       _ -> {:error, "ERR #{label} is not a valid number"}
     end
+  rescue
+    ArgumentError -> {:error, "ERR #{label} is not a valid number"}
   end
 
   defp get_first_sketch_dims(store, src_keys) do
@@ -387,6 +546,8 @@ defmodule Ferricstore.Commands.CMS do
       {_f, ""} -> {:error, "ERR #{label} must be between 0 and 1 exclusive"}
       _ -> {:error, "ERR #{label} is not a valid number"}
     end
+  rescue
+    ArgumentError -> {:error, "ERR #{label} is not a valid number"}
   end
 
   defp parse_element_count_pairs(args) do
@@ -416,7 +577,7 @@ defmodule Ferricstore.Commands.CMS do
 
   defp parse_count(str) do
     case Integer.parse(str) do
-      {count, ""} when count >= 1 -> {:ok, count}
+      {count, ""} when count >= 1 and count <= @max_int64 -> {:ok, count}
       _ -> {:error, "ERR CMS: invalid count value"}
     end
   end
@@ -450,7 +611,7 @@ defmodule Ferricstore.Commands.CMS do
     weights =
       Enum.reduce_while(weight_strs, [], fn w_str, acc ->
         case Integer.parse(w_str) do
-          {w, ""} -> {:cont, [w | acc]}
+          {w, ""} when w >= @min_int64 and w <= @max_int64 -> {:cont, [w | acc]}
           _ -> {:halt, :error}
         end
       end)

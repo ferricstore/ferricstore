@@ -32,6 +32,10 @@ defmodule FerricstoreServer.Native.Connection.FrameBuffer do
   @spec max_buffer_bytes() :: pos_integer()
   def max_buffer_bytes, do: @max_buffer_bytes
 
+  @spec frame_bytes(non_neg_integer()) :: pos_integer()
+  def frame_bytes(body_bytes) when is_integer(body_bytes) and body_bytes >= 0,
+    do: @header_bytes + body_bytes
+
   @spec max_frame_body_bytes() :: pos_integer()
   def max_frame_body_bytes, do: @max_frame_body_bytes
 
@@ -83,6 +87,9 @@ defmodule FerricstoreServer.Native.Connection.FrameBuffer do
       |> classify_header(max_frame_bytes)
 
     cond do
+      declared_frame_exceeds_buffer?(buffer, max_buffer_bytes) ->
+        {:error, :buffer_limit}
+
       buffer.buffered_bytes <= max_buffer_bytes and complete?(buffer) ->
         {:ready, buffer}
 
@@ -176,4 +183,10 @@ defmodule FerricstoreServer.Native.Connection.FrameBuffer do
   end
 
   defp valid_complete_frame?(_buffer, _max_buffer_bytes), do: false
+
+  defp declared_frame_exceeds_buffer?(%__MODULE__{expected_bytes: expected}, max_buffer_bytes)
+       when is_integer(expected),
+       do: expected > max_buffer_bytes
+
+  defp declared_frame_exceeds_buffer?(_buffer, _max_buffer_bytes), do: false
 end

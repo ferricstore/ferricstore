@@ -2,13 +2,26 @@ defmodule Ferricstore.Flow.Governance.ReleaseOutbox do
   @moduledoc false
 
   alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.Governance.LimitRecord
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
 
   @meta_tag :flow_governance_release_outbox_meta_v1
   @intent_tag :flow_governance_release_outbox_intent_v1
   @cursor_prefix "v1:"
   @completed_marker "flow-governance-release-completed-v1"
   @max_page_size 256
+  @max_pending 65_536
+  @max_exact_version 9_007_199_254_740_991
+  @intent_keys MapSet.new([
+                 :flow_id,
+                 :partition_key,
+                 :scope,
+                 :shard_id,
+                 :reservation_id,
+                 :enforcement,
+                 :created_at_ms
+               ])
 
   @type meta :: %{head: pos_integer(), tail: non_neg_integer()}
 
@@ -16,16 +29,24 @@ defmodule Ferricstore.Flow.Governance.ReleaseOutbox do
 
   def append(%{head: head, tail: tail}, count)
       when is_integer(head) and head > 0 and is_integer(tail) and tail >= 0 and
-             is_integer(count) and count > 0 do
-    first = tail + 1
-    last = tail + count
-    {:ok, %{head: head, tail: last}, first..last}
+             head <= tail + 1 and tail <= @max_exact_version and is_integer(count) and count > 0 and
+             count <= @max_exact_version - tail do
+    pending = max(tail - head + 1, 0)
+
+    if count <= @max_pending - pending do
+      first = tail + 1
+      last = tail + count
+      {:ok, %{head: head, tail: last}, first..last}
+    else
+      {:error, "ERR flow governance release outbox backlog is full"}
+    end
   end
 
   def append(_meta, _count), do: {:error, "ERR flow governance release outbox is corrupt"}
 
   def acknowledge(%{head: head, tail: tail} = meta, expected_head, up_to)
       when is_integer(head) and head > 0 and is_integer(tail) and tail >= 0 and
+             head <= tail + 1 and head <= @max_exact_version + 1 and tail <= @max_exact_version and
              is_integer(expected_head) and expected_head > 0 and is_integer(up_to) and up_to > 0 do
     cond do
       up_to < head ->
@@ -50,17 +71,21 @@ defmodule Ferricstore.Flow.Governance.ReleaseOutbox do
     do: {:error, "ERR flow governance release outbox is corrupt"}
 
   def encode_meta(%{head: head, tail: tail})
-      when is_integer(head) and head > 0 and is_integer(tail) and tail >= 0 do
-    :erlang.term_to_binary({@meta_tag, head, tail})
+      when is_integer(head) and head > 0 and head <= @max_exact_version + 1 and is_integer(tail) and
+             tail >= 0 and tail <= @max_exact_version and head <= tail + 1 do
+    TermCodec.encode({@meta_tag, head, tail})
   end
+
+  def encode_meta(_meta),
+    do: raise(ArgumentError, "invalid Flow governance release outbox metadata")
 
   def decode_meta(nil), do: {:ok, empty_meta()}
 
   def decode_meta(value) when is_binary(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {@meta_tag, head, tail}
+    case TermCodec.decode(value) do
+      {:ok, {@meta_tag, head, tail}}
       when is_integer(head) and head > 0 and is_integer(tail) and tail >= 0 and
-             head <= tail + 1 ->
+             head <= tail + 1 and head <= @max_exact_version + 1 and tail <= @max_exact_version ->
         {:ok, %{head: head, tail: tail}}
 
       _other ->
@@ -72,11 +97,16 @@ defmodule Ferricstore.Flow.Governance.ReleaseOutbox do
 
   def decode_meta(_value), do: {:error, "ERR flow governance release outbox is corrupt"}
 
-  def encode_intent(%{} = intent), do: :erlang.term_to_binary({@intent_tag, intent})
+  def encode_intent(%{} = intent) do
+    case validate_intent(intent) do
+      {:ok, canonical} -> TermCodec.encode({@intent_tag, canonical})
+      {:error, _reason} -> raise ArgumentError, "invalid Flow governance release intent"
+    end
+  end
 
   def decode_intent(value) when is_binary(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {@intent_tag, intent} when is_map(intent) -> validate_intent(intent)
+    case TermCodec.decode(value) do
+      {:ok, {@intent_tag, intent}} when is_map(intent) -> validate_intent(intent)
       _other -> {:error, "ERR flow governance release intent is corrupt"}
     end
   rescue
@@ -221,7 +251,7 @@ defmodule Ferricstore.Flow.Governance.ReleaseOutbox do
 
   defp parse_positive_integer(encoded) do
     case Integer.parse(encoded) do
-      {value, ""} when value > 0 -> {:ok, value}
+      {value, ""} when value > 0 and value <= @max_exact_version -> {:ok, value}
       _invalid -> :error
     end
   end
@@ -290,11 +320,17 @@ defmodule Ferricstore.Flow.Governance.ReleaseOutbox do
               is_integer(shard_id) and shard_id >= 0 and is_binary(reservation_id) and
               reservation_id != "" do
     partition_key = Map.get(intent, :partition_key)
-    enforcement = Map.get(intent, :enforcement, :approximate_global)
+    enforcement = Map.get(intent, :enforcement)
+    created_at_ms = Map.get(intent, :created_at_ms)
 
-    if (is_nil(partition_key) or is_binary(partition_key)) and
-         enforcement in [:strict_global, :approximate_global] do
-      {:ok, Map.put(intent, :enforcement, enforcement)}
+    if MapSet.new(Map.keys(intent)) == @intent_keys and
+         byte_size(flow_id) <= Router.max_key_size() and byte_size(scope) <= Router.max_key_size() and
+         shard_id <= @max_exact_version and LimitRecord.valid_reservation_id?(reservation_id) and
+         (is_nil(partition_key) or
+            (is_binary(partition_key) and byte_size(partition_key) <= Router.max_key_size())) and
+         enforcement in [:strict_global, :approximate_global] and is_integer(created_at_ms) and
+         created_at_ms >= 0 and created_at_ms <= @max_exact_version do
+      {:ok, intent}
     else
       {:error, "ERR flow governance release intent is corrupt"}
     end

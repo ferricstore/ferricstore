@@ -101,8 +101,7 @@ defmodule Ferricstore.ProbEdgeCasesTest do
   end
 
   defp prob_file_path(dir, key, ext) do
-    safe = Base.url_encode64(key, padding: false)
-    Path.join(dir, "#{safe}.#{ext}")
+    Ferricstore.ProbFile.path(dir, key, ext)
   end
 
   # ===========================================================================

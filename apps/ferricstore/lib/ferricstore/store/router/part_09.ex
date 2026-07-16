@@ -11,6 +11,7 @@ defmodule Ferricstore.Store.Router.Part09 do
       alias Ferricstore.Flow.InternalKey
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+      alias Ferricstore.FetchOrCompute.Outcome, as: FetchOrComputeOutcome
       alias Ferricstore.Raft.ReplyAwaiter
       alias Ferricstore.Stats
       alias Ferricstore.Store.BlobRef
@@ -20,9 +21,14 @@ defmodule Ferricstore.Store.Router.Part09 do
       alias Ferricstore.Store.CompoundKey
       alias Ferricstore.Store.LFU
       alias Ferricstore.Store.ListOps
+      alias Ferricstore.Store.ReadResult
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
+      alias Ferricstore.Store.Shard.LogicalKeyIndex
+      alias Ferricstore.TermCodec
+
+      @max_logical_scan_cursor_bytes 88_000
 
       defp forced_single_key_quorum(ctx, key, command) do
         idx = shard_for(ctx, key)
@@ -81,24 +87,73 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec set(FerricStore.Instance.t(), binary(), binary(), map()) :: term()
       def set(ctx, key, value, opts) do
-        cond do
-          byte_size(key) > @max_key_size ->
-            {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+        with :ok <- validate_string_write(ctx, key, value) do
+          idx = shard_for(ctx, key)
 
-          is_binary(value) and byte_size(value) >= @max_value_size ->
-            {:error, "ERR value too large (max #{@max_value_size} bytes)"}
+          cond do
+            Ferricstore.Store.DiskPressure.under_pressure?(ctx, idx) ->
+              {:error, "ERR disk pressure on shard #{idx}, rejecting write"}
 
-          true ->
-            case check_keydir_full_for_set(ctx, key, opts) do
-              :ok ->
-                idx = shard_for(ctx, key)
-                raft_write(ctx, idx, key, {:set, key, value, opts.expire_at_ms, opts})
+            true ->
+              case check_keydir_full_for_set(ctx, key, opts) do
+                :ok ->
+                  command = {:set, key, value, opts.expire_at_ms, opts}
 
-              {:error, _} = err ->
-                err
-            end
+                  if durable_raft_ctx?(ctx) do
+                    raft_write(ctx, idx, key, command)
+                  else
+                    GenServer.call(elem(ctx.shard_names, idx), {:standalone_commit, command})
+                  end
+
+                {:error, _} = err ->
+                  err
+              end
+          end
         end
       end
+
+      @doc false
+      @spec expire_if_batch(
+              FerricStore.Instance.t(),
+              non_neg_integer(),
+              [{binary(), pos_integer()}]
+            ) :: [boolean()] | {:error, term()}
+      def expire_if_batch(_ctx, _shard_index, []), do: []
+
+      def expire_if_batch(ctx, shard_index, entries)
+          when is_integer(shard_index) and shard_index >= 0 and is_list(entries) do
+        valid? =
+          shard_index < ctx.shard_count and
+            Enum.all?(entries, fn
+              {key, expire_at_ms}
+              when is_binary(key) and is_integer(expire_at_ms) and
+                     expire_at_ms > 0 ->
+                shard_for(ctx, key) == shard_index
+
+              _invalid ->
+                false
+            end)
+
+        if valid? do
+          command = {:expire_if_batch, entries}
+          {route_key, _expire_at_ms} = hd(entries)
+
+          if durable_raft_ctx?(ctx) do
+            raft_write(ctx, shard_index, route_key, command)
+          else
+            GenServer.call(
+              elem(ctx.shard_names, shard_index),
+              {:standalone_commit, command}
+            )
+          end
+        else
+          {:error, :invalid_expiry_batch}
+        end
+      end
+
+      @doc false
+      @spec durable_context?(FerricStore.Instance.t()) :: boolean()
+      def durable_context?(ctx), do: durable_raft_ctx?(ctx)
 
       # Checks if the keydir is full. If so, only allows writes to existing keys.
       # Checks both `keydir_full?` (ETS-level memory guard) and `reject_writes?`
@@ -201,16 +256,127 @@ defmodule Ferricstore.Store.Router.Part09 do
         raft_write(ctx, idx, key, {:delete, key})
       end
 
-      @doc """
-      Submits a server command through Raft for replication to all nodes.
+      @doc false
+      @spec server_catalog_entry(FerricStore.Instance.t(), binary(), binary()) ::
+              {:ok, binary() | nil} | :unavailable | {:error, atom()}
+      def server_catalog_entry(ctx, namespace, subject) do
+        key = Ferricstore.ServerCatalog.entry_key(namespace, subject)
+        read_shard_value(ctx, 0, key)
+      rescue
+        ArgumentError -> {:error, :invalid_server_catalog_key}
+      end
 
-      Server commands are opaque to the library — the state machine dispatches
-      them via the `raft_apply_hook` callback on the Instance struct. Routed
-      through shard 0 for consistent ordering.
-      """
-      @spec server_command(FerricStore.Instance.t(), term()) :: term()
-      def server_command(ctx, command) do
-        raft_write(ctx, 0, "__server__", {:server_command, command})
+      @doc false
+      @spec server_catalog_revision(FerricStore.Instance.t(), binary()) ::
+              {:ok, binary() | nil} | :unavailable | {:error, atom()}
+      def server_catalog_revision(ctx, namespace) do
+        key = Ferricstore.ServerCatalog.revision_key(namespace)
+        read_shard_value(ctx, 0, key)
+      rescue
+        ArgumentError -> {:error, :invalid_server_catalog_key}
+      end
+
+      @doc false
+      @spec server_catalog_entries(FerricStore.Instance.t(), binary()) ::
+              {:ok, [{binary(), binary()}]} | :unavailable | {:error, atom()}
+      def server_catalog_entries(ctx, namespace) do
+        prefix = Ferricstore.ServerCatalog.prefix(namespace)
+
+        case safe_read_call(ctx, 0, {:scan_prefix, prefix}) do
+          {:ok, entries} when is_list(entries) ->
+            decode_server_catalog_subjects(namespace, entries)
+
+          :unavailable ->
+            :unavailable
+
+          _invalid ->
+            {:error, :invalid_server_catalog_scan}
+        end
+      rescue
+        ArgumentError -> {:error, :invalid_server_catalog_key}
+      end
+
+      @doc false
+      @spec server_catalog_mutate(
+              FerricStore.Instance.t(),
+              binary(),
+              binary(),
+              binary() | nil,
+              binary() | nil,
+              binary() | :deleted,
+              non_neg_integer()
+            ) :: term()
+      def server_catalog_mutate(
+            ctx,
+            namespace,
+            subject,
+            expected_encoded,
+            expected_revision,
+            value,
+            max_live_entries
+          ) do
+        key = Ferricstore.ServerCatalog.entry_key(namespace, subject)
+
+        raft_write(
+          ctx,
+          0,
+          key,
+          {:server_catalog_mutate, namespace, subject, expected_encoded, expected_revision, value,
+           max_live_entries}
+        )
+      rescue
+        ArgumentError -> {:error, :invalid_server_catalog_mutation}
+      end
+
+      @doc false
+      @spec server_catalog_replace(
+              FerricStore.Instance.t(),
+              binary(),
+              binary() | nil,
+              [{binary(), binary() | :deleted}],
+              non_neg_integer(),
+              non_neg_integer()
+            ) :: term()
+      def server_catalog_replace(
+            ctx,
+            namespace,
+            expected_revision,
+            mutations,
+            expected_live_count,
+            max_live_entries
+          ) do
+        key = Ferricstore.ServerCatalog.revision_key(namespace)
+
+        raft_write(
+          ctx,
+          0,
+          key,
+          {:server_catalog_replace, namespace, expected_revision, mutations, expected_live_count,
+           max_live_entries}
+        )
+      rescue
+        ArgumentError -> {:error, :invalid_server_catalog_replacement}
+      end
+
+      defp decode_server_catalog_subjects(namespace, entries) do
+        entries
+        |> Enum.reduce_while({:ok, []}, fn
+          {key, encoded}, {:ok, acc} when is_binary(key) and is_binary(encoded) ->
+            case Ferricstore.ServerCatalog.subject_from_key(namespace, key) do
+              {:ok, subject} ->
+                {:cont, {:ok, [{subject, encoded} | acc]}}
+
+              {:error, :invalid_server_catalog_key} ->
+                {:halt, {:error, :invalid_server_catalog_scan}}
+            end
+
+          _invalid, _acc ->
+            {:halt, {:error, :invalid_server_catalog_scan}}
+        end)
+        |> case do
+          {:ok, decoded} -> {:ok, Enum.reverse(decoded)}
+          {:error, _reason} = error -> error
+        end
       end
 
       @doc """
@@ -233,7 +399,7 @@ defmodule Ferricstore.Store.Router.Part09 do
       defp extract_prob_key({:cuckoo_add, key, _, _}), do: key
       defp extract_prob_key({:cuckoo_addnx, key, _, _}), do: key
       defp extract_prob_key({:cuckoo_del, key, _}), do: key
-      defp extract_prob_key({:topk_create, key, _, _, _, _}), do: key
+      defp extract_prob_key({:topk_create, key, _, _, _}), do: key
       defp extract_prob_key({:topk_add, key, _}), do: key
       defp extract_prob_key({:topk_incrby, key, _}), do: key
 
@@ -252,26 +418,20 @@ defmodule Ferricstore.Store.Router.Part09 do
 
         try do
           case :ets.lookup(keydir, key) do
-            [{^key, val, 0, _lfu, _fid, _off, _vsize}] when val != nil ->
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize}]
+            when is_integer(exp) and (exp == 0 or exp > now) ->
               true
 
-            [{^key, nil, 0, _lfu, fid, off, vsize}] when readable_cold_ref?(fid, off, vsize) ->
-              true
-
-            [{^key, val, exp, _lfu, _fid, _off, _vsize}] when exp > now and val != nil ->
-              true
-
-            [{^key, nil, exp, _lfu, fid, off, vsize}]
-            when exp > now and readable_cold_ref?(fid, off, vsize) ->
-              true
-
-            [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
+            when is_integer(exp) and exp > 0 and exp <= now ->
+              delete_observed_keydir_entry(ctx, idx, keydir, entry)
               false
 
             [] ->
               false
+
+            [_malformed_live_entry] ->
+              true
           end
         rescue
           ArgumentError -> keydir_unavailable(ctx, idx, :exists, false)
@@ -295,26 +455,20 @@ defmodule Ferricstore.Store.Router.Part09 do
 
         try do
           case :ets.lookup(keydir, key) do
-            [{^key, val, 0, _lfu, _fid, _off, _vsize}] when val != nil ->
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize}]
+            when is_integer(exp) and (exp == 0 or exp > now) ->
               true
 
-            [{^key, nil, 0, _lfu, fid, off, vsize}] when readable_cold_ref?(fid, off, vsize) ->
-              true
-
-            [{^key, val, exp, _lfu, _fid, _off, _vsize}] when exp > now and val != nil ->
-              true
-
-            [{^key, nil, exp, _lfu, fid, off, vsize}]
-            when exp > now and readable_cold_ref?(fid, off, vsize) ->
-              true
-
-            [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
+            when is_integer(exp) and exp > 0 and exp <= now ->
+              delete_observed_keydir_entry(ctx, idx, keydir, entry)
               false
 
             [] ->
               false
+
+            [_malformed_live_entry] ->
+              true
           end
         rescue
           ArgumentError -> false
@@ -351,9 +505,12 @@ defmodule Ferricstore.Store.Router.Part09 do
       If the key does not exist, it is created with value `suffix`.
       Returns `{:ok, new_byte_length}`.
       """
-      @spec append(FerricStore.Instance.t(), binary(), binary()) :: {:ok, non_neg_integer()}
+      @spec append(FerricStore.Instance.t(), binary(), binary()) ::
+              {:ok, non_neg_integer()} | {:error, binary()}
       def append(ctx, key, suffix) do
-        raft_write(ctx, shard_for(ctx, key), key, {:append, key, suffix})
+        with :ok <- validate_string_write(ctx, key, suffix) do
+          raft_write(ctx, shard_for(ctx, key), key, {:append, key, suffix})
+        end
       end
 
       @doc """
@@ -361,9 +518,12 @@ defmodule Ferricstore.Store.Router.Part09 do
 
       Returns the old value, or `nil` if the key did not exist.
       """
-      @spec getset(FerricStore.Instance.t(), binary(), binary()) :: binary() | nil
+      @spec getset(FerricStore.Instance.t(), binary(), binary()) ::
+              binary() | nil | {:error, binary()}
       def getset(ctx, key, value) do
-        raft_write(ctx, shard_for(ctx, key), key, {:getset, key, value})
+        with :ok <- validate_string_write(ctx, key, value) do
+          raft_write(ctx, shard_for(ctx, key), key, {:getset, key, value})
+        end
       end
 
       @doc """
@@ -395,9 +555,16 @@ defmodule Ferricstore.Store.Router.Part09 do
       Returns `{:ok, new_byte_length}`.
       """
       @spec setrange(FerricStore.Instance.t(), binary(), non_neg_integer(), binary()) ::
-              {:ok, non_neg_integer()}
+              {:ok, non_neg_integer()} | {:error, binary()}
       def setrange(ctx, key, offset, value) do
-        raft_write(ctx, shard_for(ctx, key), key, {:setrange, key, offset, value})
+        minimum_size =
+          Ferricstore.Raft.ApplyLimits.setrange_size(0, offset, byte_size(value))
+
+        with :ok <- validate_string_write(ctx, key, value),
+             :ok <-
+               Ferricstore.Raft.ApplyLimits.validate_instance_value_size(ctx, minimum_size) do
+          raft_write(ctx, shard_for(ctx, key), key, {:setrange, key, offset, value})
+        end
       end
 
       @doc """
@@ -406,9 +573,16 @@ defmodule Ferricstore.Store.Router.Part09 do
       necessary. Goes through Raft so concurrent SETBITs on the same key
       never lose updates — the state machine is the sole mutator.
       """
-      @spec setbit(FerricStore.Instance.t(), binary(), non_neg_integer(), 0 | 1) :: 0 | 1
+      @spec setbit(FerricStore.Instance.t(), binary(), non_neg_integer(), 0 | 1) ::
+              0 | 1 | {:error, binary()}
       def setbit(ctx, key, offset, bit_val) do
-        raft_write(ctx, shard_for(ctx, key), key, {:setbit, key, offset, bit_val})
+        minimum_size = Ferricstore.Raft.ApplyLimits.setbit_size(0, offset)
+
+        with :ok <- validate_string_write(ctx, key, <<>>),
+             :ok <-
+               Ferricstore.Raft.ApplyLimits.validate_instance_value_size(ctx, minimum_size) do
+          raft_write(ctx, shard_for(ctx, key), key, {:setbit, key, offset, bit_val})
+        end
       end
 
       @doc """
@@ -442,115 +616,242 @@ defmodule Ferricstore.Store.Router.Part09 do
         raft_write(ctx, shard_for(ctx, key), key, {:zincrby, key, increment, member})
       end
 
-      @doc "Returns all live (non-expired, non-deleted) keys across every shard."
-      @spec keys(FerricStore.Instance.t()) :: [binary()]
-      def keys(ctx) do
-        if selected_waraft_ctx?(ctx) do
-          waraft_live_keys(ctx)
+      @doc false
+      @spec scan_keys_page(
+              FerricStore.Instance.t(),
+              binary(),
+              pos_integer(),
+              binary() | nil,
+              binary() | nil
+            ) :: {:ok, {binary(), [binary()]}} | {:error, term()}
+      def scan_keys_page(ctx, cursor, count, match_pattern, type_filter) do
+        with {:ok, {shard_index, shard_cursor}} <- decode_logical_scan_cursor(cursor),
+             true <- shard_index < ctx.shard_count,
+             {ordered, _slots} <- LogicalKeyIndex.table_names(ctx.name, shard_index),
+             keydir <- resolve_keydir(ctx, shard_index),
+             {:ok, {next_shard_cursor, keys}} <-
+               LogicalKeyIndex.scan_page(
+                 ordered,
+                 keydir,
+                 shard_cursor,
+                 count,
+                 match_pattern,
+                 type_filter,
+                 HLC.now_ms()
+               ) do
+          next_cursor =
+            case next_shard_cursor do
+              0 when shard_index + 1 >= ctx.shard_count ->
+                "0"
+
+              0 ->
+                encode_logical_scan_cursor(shard_index + 1, 0)
+
+              {:after, _logical_key} = next ->
+                encode_logical_scan_cursor(shard_index, next)
+            end
+
+          {:ok, {next_cursor, keys}}
         else
-          shard_live_keys(ctx)
+          false -> {:ok, {"0", []}}
+          :unavailable -> ReadResult.failure(:logical_key_index_unavailable)
+          {:error, :invalid_scan_cursor} -> {:error, "ERR invalid cursor"}
+          {:error, _reason} = error -> error
+        end
+      rescue
+        ArgumentError -> ReadResult.failure(:logical_key_index_unavailable)
+      end
+
+      @doc false
+      @spec random_logical_key(FerricStore.Instance.t()) ::
+              binary() | nil | ReadResult.failure()
+      def random_logical_key(ctx) do
+        now_ms = HLC.now_ms()
+
+        candidates =
+          Enum.reduce_while(0..(ctx.shard_count - 1), [], fn shard_index, acc ->
+            {ordered, slots} = LogicalKeyIndex.table_names(ctx.name, shard_index)
+            keydir = resolve_keydir(ctx, shard_index)
+
+            case LogicalKeyIndex.count_live(
+                   ordered,
+                   slots,
+                   keydir,
+                   now_ms,
+                   &delete_expired_logical_entry(ctx, shard_index, keydir, &1)
+                 ) do
+              {:ok, 0} -> {:cont, acc}
+              {:ok, count} when count > 0 -> {:cont, [{shard_index, count} | acc]}
+              :unavailable -> {:halt, ReadResult.failure(:logical_key_index_unavailable)}
+              {:error, reason} -> {:halt, ReadResult.failure(reason)}
+            end
+          end)
+
+        case candidates do
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+          candidates -> weighted_random_logical_key(ctx, candidates)
         end
       end
 
-      defp shard_live_keys(ctx) do
-        sc = ctx.shard_count
+      defp weighted_random_logical_key(_ctx, []), do: nil
 
-        Enum.flat_map(0..(sc - 1), fn i ->
-          case safe_read_call(ctx, i, :keys) do
-            {:ok, keys} -> keys
-            :unavailable -> []
-          end
-        end)
+      defp weighted_random_logical_key(ctx, candidates) do
+        total = Enum.reduce(candidates, 0, fn {_shard_index, count}, acc -> acc + count end)
+        target = :rand.uniform(total)
+
+        {shard_index, _count} =
+          Enum.reduce_while(candidates, target, fn {shard_index, count} = candidate, remaining ->
+            if remaining <= count,
+              do: {:halt, candidate},
+              else: {:cont, remaining - count}
+          end)
+
+        {ordered, slots} = LogicalKeyIndex.table_names(ctx.name, shard_index)
+
+        case LogicalKeyIndex.random_key(
+               ordered,
+               slots,
+               resolve_keydir(ctx, shard_index)
+             ) do
+          {:ok, nil} ->
+            weighted_random_logical_key(ctx, List.keydelete(candidates, shard_index, 0))
+
+          {:ok, key} ->
+            key
+
+          :unavailable ->
+            ReadResult.failure(:logical_key_index_unavailable)
+
+          {:error, reason} ->
+            ReadResult.failure(reason)
+        end
       end
 
-      defp waraft_live_keys(ctx) do
+      defp decode_logical_scan_cursor("0"), do: {:ok, {0, 0}}
+
+      defp decode_logical_scan_cursor(encoded)
+           when is_binary(encoded) and byte_size(encoded) <= @max_logical_scan_cursor_bytes do
+        with {:ok, binary} <- Base.url_decode64(encoded, padding: false),
+             {:ok, {:ferricstore_scan_cursor, 1, shard_index, shard_cursor}} <-
+               TermCodec.decode(binary),
+             true <- is_integer(shard_index) and shard_index >= 0,
+             true <- valid_logical_scan_shard_cursor?(shard_cursor) do
+          {:ok, {shard_index, shard_cursor}}
+        else
+          _invalid -> {:error, :invalid_scan_cursor}
+        end
+      rescue
+        ArgumentError -> {:error, :invalid_scan_cursor}
+      end
+
+      defp decode_logical_scan_cursor(_invalid), do: {:error, :invalid_scan_cursor}
+
+      defp valid_logical_scan_shard_cursor?(0), do: true
+
+      defp valid_logical_scan_shard_cursor?({:after, key})
+           when is_binary(key) and byte_size(key) <= @max_key_size,
+           do: true
+
+      defp valid_logical_scan_shard_cursor?(_cursor), do: false
+
+      defp encode_logical_scan_cursor(shard_index, shard_cursor) do
+        {:ferricstore_scan_cursor, 1, shard_index, shard_cursor}
+        |> TermCodec.encode()
+        |> Base.url_encode64(padding: false)
+      end
+
+      @doc "Returns all live (non-expired, non-deleted) keys across every shard."
+      @spec keys(FerricStore.Instance.t()) :: [binary()] | ReadResult.failure()
+      def keys(ctx) do
         sc = ctx.shard_count
         now = HLC.now_ms()
 
-        Enum.flat_map(0..(sc - 1), fn i ->
-          live_keydir_keys(ctx, i, resolve_keydir(ctx, i), now)
+        Enum.reduce_while(0..(sc - 1), [], fn i, acc ->
+          {ordered, slots} = LogicalKeyIndex.table_names(ctx.name, i)
+          keydir = resolve_keydir(ctx, i)
+
+          if keydir_available?(keydir) do
+            with {:ok, _count} <-
+                   LogicalKeyIndex.count_live(
+                     ordered,
+                     slots,
+                     keydir,
+                     now,
+                     &delete_expired_logical_entry(ctx, i, keydir, &1)
+                   ),
+                 {:ok, keys} <- LogicalKeyIndex.all_live(ordered, keydir, now) do
+              {:cont, [keys | acc]}
+            else
+              :unavailable ->
+                emit_shard_unavailable(ctx, i, :keys, :logical_key_index_unavailable)
+                {:halt, ReadResult.failure(:logical_key_index_unavailable)}
+
+              {:error, reason} ->
+                emit_shard_unavailable(ctx, i, :keys, reason)
+                {:halt, ReadResult.failure(reason)}
+            end
+          else
+            case safe_read_call(ctx, i, :keys) do
+              {:ok, keys} -> {:cont, [keys | acc]}
+              :unavailable -> {:halt, ReadResult.failure(:shard_unavailable)}
+            end
+          end
         end)
-      end
-
-      defp live_keydir_keys(ctx, idx, keydir, now) do
-        {live_keys, expired_keys} =
-          :ets.foldl(
-            fn
-              {key, value, 0, _lfu, _fid, _off, _vsize}, {live, expired} when value != nil ->
-                {[key | live], expired}
-
-              {key, nil, 0, _lfu, fid, off, vsize}, {live, expired}
-              when readable_cold_ref?(fid, off, vsize) ->
-                {[key | live], expired}
-
-              {key, value, exp, _lfu, _fid, _off, _vsize}, {live, expired}
-              when exp > now and value != nil ->
-                {[key | live], expired}
-
-              {key, nil, exp, _lfu, fid, off, vsize}, {live, expired}
-              when exp > now and readable_cold_ref?(fid, off, vsize) ->
-                {[key | live], expired}
-
-              {key, _value, _exp, _lfu, _fid, _off, _vsize}, {live, expired} ->
-                {live, [key | expired]}
-            end,
-            {[], []},
-            keydir
-          )
-
-        Enum.each(expired_keys, fn key ->
-          track_keydir_binary_delete(ctx, idx, keydir, key)
-          :ets.delete(keydir, key)
-        end)
-
-        Enum.reject(live_keys, &InternalKey.internal?/1)
-      rescue
-        ArgumentError ->
-          keydir_unavailable(ctx, idx, :keys, [])
+        |> case do
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+          key_batches -> key_batches |> Enum.reverse() |> :lists.append()
+        end
       end
 
       @doc "Returns the count of all live keys across every shard."
-      @spec dbsize(FerricStore.Instance.t()) :: non_neg_integer()
+      @spec dbsize(FerricStore.Instance.t()) :: non_neg_integer() | ReadResult.failure()
       def dbsize(ctx) do
         sc = ctx.shard_count
         now = HLC.now_ms()
 
-        Enum.reduce(0..(sc - 1), 0, fn i, acc ->
-          acc + live_keydir_size(ctx, i, resolve_keydir(ctx, i), now)
+        Enum.reduce_while(0..(sc - 1), 0, fn i, acc ->
+          {ordered, slots} = LogicalKeyIndex.table_names(ctx.name, i)
+          keydir = resolve_keydir(ctx, i)
+
+          if keydir_available?(keydir) do
+            case LogicalKeyIndex.count_live(
+                   ordered,
+                   slots,
+                   keydir,
+                   now,
+                   &delete_expired_logical_entry(ctx, i, keydir, &1)
+                 ) do
+              {:ok, count} ->
+                {:cont, acc + count}
+
+              :unavailable ->
+                emit_shard_unavailable(ctx, i, :dbsize, :logical_key_index_unavailable)
+                {:halt, ReadResult.failure(:logical_key_index_unavailable)}
+
+              {:error, reason} ->
+                emit_shard_unavailable(ctx, i, :dbsize, reason)
+                {:halt, ReadResult.failure(reason)}
+            end
+          else
+            {:halt, keydir_unavailable(ctx, i, :dbsize)}
+          end
         end)
       end
 
-      defp live_keydir_size(ctx, idx, keydir, now) do
-        {count, expired_keys} =
-          :ets.foldl(
-            fn
-              {key, _value, 0, _lfu, _fid, _off, _vsize}, {count, expired_keys} ->
-                if InternalKey.internal?(key),
-                  do: {count, expired_keys},
-                  else: {count + 1, expired_keys}
+      defp delete_expired_logical_entry(ctx, shard_index, keydir, observed_entry) do
+        _deleted = delete_observed_keydir_entry(ctx, shard_index, keydir, observed_entry)
+        :ok
+      end
 
-              {key, _value, exp, _lfu, _fid, _off, _vsize}, {count, expired_keys}
-              when exp > now ->
-                if InternalKey.internal?(key),
-                  do: {count, expired_keys},
-                  else: {count + 1, expired_keys}
-
-              {key, _value, _exp, _lfu, _fid, _off, _vsize}, {count, expired_keys} ->
-                {count, [key | expired_keys]}
-            end,
-            {0, []},
-            keydir
-          )
-
-        Enum.each(expired_keys, fn key ->
-          track_keydir_binary_delete(ctx, idx, keydir, key)
-          :ets.delete(keydir, key)
-        end)
-
-        count
+      defp keydir_available?(keydir) do
+        :ets.info(keydir, :type) != :undefined
       rescue
-        ArgumentError ->
-          keydir_unavailable(ctx, idx, :dbsize, 0)
+        ArgumentError -> false
+      end
+
+      defp keydir_unavailable(ctx, idx, request) do
+        emit_shard_unavailable(ctx, idx, request, :keydir_unavailable)
+        ReadResult.failure(:keydir_unavailable)
       end
 
       defp keydir_unavailable(ctx, idx, request, fallback) do
@@ -585,75 +886,79 @@ defmodule Ferricstore.Store.Router.Part09 do
       end
 
       @doc """
-      Returns a lightweight WATCH token for `key`.
-
-      Hot keys use the value hash plus their live Bitcask location. Cold keys use
-      their live keydir location and expiry, avoiding a large Bitcask read just to
-      snapshot WATCH state. Pending entries fall back to the shard write version.
+      Returns a logical WATCH token for `key`, ordered by its owning Raft group.
       """
       @spec watch_token(FerricStore.Instance.t(), binary()) :: term()
       def watch_token(ctx, key) do
         idx = shard_for(ctx, key)
-        keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        watch_token_read(ctx, idx, {:watch_token, key})
+      end
 
-        try do
-          case :ets.lookup(keydir, key) do
-            [{^key, value, 0, _lfu, fid, off, vsize}]
-            when value != nil and valid_cold_location(fid, off, vsize) ->
-              {:hot, :erlang.phash2(value), fid, off, vsize, 0}
-
-            [{^key, value, 0, _lfu, fid, off, vsize}]
-            when value != nil and valid_waraft_segment_location(fid, off, vsize) ->
-              {:hot, :erlang.phash2(value), fid, off, vsize, 0}
-
-            [{^key, value, 0, _lfu, :pending, _off, _vsize}] when value != nil ->
-              {:version, get_version(ctx, key)}
-
-            [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-              {:cold, fid, off, vsize, 0}
-
-            [{^key, nil, 0, _lfu, fid, off, vsize}]
-            when valid_waraft_segment_location(fid, off, vsize) ->
-              {:cold, fid, off, vsize, 0}
-
-            [{^key, nil, 0, _lfu, :pending, _off, _vsize}] ->
-              {:version, get_version(ctx, key)}
-
-            [{^key, value, exp, _lfu, fid, off, vsize}]
-            when exp > now and value != nil and valid_cold_location(fid, off, vsize) ->
-              {:hot, :erlang.phash2(value), fid, off, vsize, exp}
-
-            [{^key, value, exp, _lfu, fid, off, vsize}]
-            when exp > now and value != nil and valid_waraft_segment_location(fid, off, vsize) ->
-              {:hot, :erlang.phash2(value), fid, off, vsize, exp}
-
-            [{^key, value, exp, _lfu, :pending, _off, _vsize}] when exp > now and value != nil ->
-              {:version, get_version(ctx, key)}
-
-            [{^key, nil, exp, _lfu, fid, off, vsize}]
-            when exp > now and valid_cold_location(fid, off, vsize) ->
-              {:cold, fid, off, vsize, exp}
-
-            [{^key, nil, exp, _lfu, fid, off, vsize}]
-            when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
-              {:cold, fid, off, vsize, exp}
-
-            [{^key, nil, exp, _lfu, :pending, _off, _vsize}] when exp > now ->
-              {:version, get_version(ctx, key)}
-
-            [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
-              :missing
-
-            [] ->
-              :missing
-          end
-        rescue
-          ArgumentError -> {:version, get_version(ctx, key)}
+      defp watch_token_read(ctx, idx, command) do
+        if durable_raft_ctx?(ctx) do
+          quorum_write(ctx, idx, command)
+        else
+          GenServer.call(elem(ctx.shard_names, idx), command)
         end
       end
+
+      @doc """
+      Returns logical WATCH tokens using at most one Raft command per owning shard.
+      """
+      @spec watch_tokens(FerricStore.Instance.t(), [binary()]) ::
+              %{binary() => term()} | {:error, term()}
+      def watch_tokens(_ctx, []), do: %{}
+
+      def watch_tokens(ctx, keys) when is_list(keys) do
+        shard_groups =
+          keys
+          |> Enum.group_by(&shard_for(ctx, &1))
+          |> Enum.sort_by(&elem(&1, 0))
+
+        commands =
+          Enum.map(shard_groups, fn {shard_index, shard_keys} ->
+            {shard_index, {:watch_tokens, shard_keys}}
+          end)
+
+        results = watch_token_read_many(ctx, commands)
+
+        merge_watch_token_results(shard_groups, results)
+      end
+
+      defp watch_token_read_many(_ctx, []), do: []
+
+      defp watch_token_read_many(ctx, [{shard_index, command}]) do
+        [watch_token_read(ctx, shard_index, command)]
+      end
+
+      defp watch_token_read_many(ctx, commands) do
+        if selected_waraft_ctx?(ctx) do
+          Ferricstore.Raft.Backend.write_many(commands)
+        else
+          Enum.map(commands, fn {shard_index, command} ->
+            GenServer.call(elem(ctx.shard_names, shard_index), command)
+          end)
+        end
+      end
+
+      defp merge_watch_token_results(shard_groups, results)
+           when is_list(results) and length(shard_groups) == length(results) do
+        shard_groups
+        |> Enum.zip(results)
+        |> Enum.reduce_while(%{}, fn
+          {{_shard_index, _keys}, %{} = tokens}, acc ->
+            {:cont, Map.merge(acc, tokens)}
+
+          {{_shard_index, _keys}, {:error, _reason} = error}, _acc ->
+            {:halt, error}
+
+          {{shard_index, _keys}, result}, _acc ->
+            {:halt, {:error, {:invalid_watch_token_result, shard_index, result}}}
+        end)
+      end
+
+      defp merge_watch_token_results(_shard_groups, results),
+        do: {:error, {:invalid_watch_token_results, results}}
 
       @doc """
       Returns the keydir disk location for a key, or `:miss`.
@@ -665,7 +970,9 @@ defmodule Ferricstore.Store.Router.Part09 do
       Used by sendfile zero-copy and STRLEN on cold keys.
       """
       @spec get_keydir_file_ref(FerricStore.Instance.t(), binary()) ::
-              {:ok, {term(), non_neg_integer(), non_neg_integer()}} | :miss
+              {:ok, {term(), non_neg_integer(), non_neg_integer()}}
+              | :miss
+              | ReadResult.failure()
       def get_keydir_file_ref(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
@@ -673,39 +980,33 @@ defmodule Ferricstore.Store.Router.Part09 do
 
         try do
           case :ets.lookup(keydir, key) do
-            [{_, _, 0, _, fid, off, vsize}] when readable_cold_ref?(fid, off, vsize) ->
+            [{^key, nil, exp, _lfu, fid, off, vsize}]
+            when is_integer(exp) and (exp == 0 or exp > now) and
+                   readable_cold_ref?(fid, off, vsize) ->
               {:ok, {fid, off, vsize}}
 
-            [{^key, nil, 0, _, fid, _off, _vsize}] when is_integer(fid) ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
+            [{^key, nil, exp, _lfu, :pending, _off, vsize}]
+            when is_integer(exp) and (exp == 0 or exp > now) and
+                   valid_pending_value_size(vsize) ->
               :miss
 
-            [{_, _, 0, _, _fid, _off, _vsize}] ->
+            [{^key, value, exp, _lfu, _fid, _off, _vsize}]
+            when value != nil and is_integer(exp) and (exp == 0 or exp > now) ->
               :miss
 
-            [{_, _, exp, _, fid, off, vsize}]
-            when exp > now and readable_cold_ref?(fid, off, vsize) ->
-              {:ok, {fid, off, vsize}}
-
-            [{^key, nil, exp, _, fid, _off, _vsize}] when exp > now and is_integer(fid) ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
-              :miss
-
-            [{_, _, exp, _, _fid, _off, _vsize}] when exp > now ->
-              :miss
-
-            [{^key, _, _exp, _, _fid, _off, _vsize}] ->
-              track_keydir_binary_delete(ctx, idx, keydir, key)
-              :ets.delete(keydir, key)
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
+            when is_integer(exp) and exp > 0 and exp <= now ->
+              delete_observed_keydir_entry(ctx, idx, keydir, entry)
               :miss
 
             [] ->
               :miss
+
+            [entry] ->
+              ReadResult.failure({:invalid_keydir_entry, entry})
           end
         rescue
-          ArgumentError -> :miss
+          ArgumentError -> ReadResult.failure(:keydir_unavailable)
         end
       end
 
@@ -809,6 +1110,115 @@ defmodule Ferricstore.Store.Router.Part09 do
         raft_write(ctx, shard_for(ctx, key), key, {:extend, key, owner, expire_at_ms})
       end
 
+      @spec fetch_or_compute_lock(FerricStore.Instance.t(), binary(), binary(), pos_integer()) ::
+              :ok | {:error, term()}
+      def fetch_or_compute_lock(ctx, key, owner, ttl_ms) do
+        expire_at_ms = HLC.now_ms() + ttl_ms
+        outcome_key = FetchOrComputeOutcome.key(key)
+
+        raft_write(
+          ctx,
+          shard_for(ctx, key),
+          key,
+          {:fetch_or_compute_lock, key, outcome_key, owner, expire_at_ms}
+        )
+      end
+
+      @spec fetch_or_compute_publish(
+              FerricStore.Instance.t(),
+              binary(),
+              binary(),
+              non_neg_integer(),
+              binary()
+            ) :: :ok | {:error, term()}
+      def fetch_or_compute_publish(ctx, key, value, ttl_ms, owner) do
+        expire_at_ms = if ttl_ms > 0, do: HLC.now_ms() + ttl_ms, else: 0
+
+        case raft_write(
+               ctx,
+               shard_for(ctx, key),
+               key,
+               {:fetch_or_compute_publish, key, value, expire_at_ms, owner}
+             ) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            fetch_or_compute_owner_error(reason)
+
+          other ->
+            other
+        end
+      end
+
+      @spec fetch_or_compute_release(FerricStore.Instance.t(), binary(), binary()) ::
+              :ok | {:error, term()}
+      def fetch_or_compute_release(ctx, key, owner) do
+        case raft_write(
+               ctx,
+               shard_for(ctx, key),
+               key,
+               {:unlock_keys_owned, [key], owner}
+             ) do
+          :ok -> :ok
+          {:error, reason} -> fetch_or_compute_owner_error(reason)
+          other -> other
+        end
+      end
+
+      @spec fetch_or_compute_fail(
+              FerricStore.Instance.t(),
+              binary(),
+              binary(),
+              binary(),
+              pos_integer()
+            ) :: :ok | {:error, term()}
+      def fetch_or_compute_fail(ctx, key, owner, error, outcome_ttl_ms) do
+        with {:ok, encoded_error} <- FetchOrComputeOutcome.encode_error(error) do
+          outcome_key = FetchOrComputeOutcome.key(key)
+          outcome_expire_at_ms = HLC.now_ms() + outcome_ttl_ms
+
+          case raft_write(
+                 ctx,
+                 shard_for(ctx, key),
+                 key,
+                 {:fetch_or_compute_fail, key, outcome_key, encoded_error, outcome_expire_at_ms,
+                  owner}
+               ) do
+            :ok -> :ok
+            {:error, reason} -> fetch_or_compute_owner_error(reason)
+            other -> other
+          end
+        end
+      end
+
+      @spec fetch_or_compute_outcome(FerricStore.Instance.t(), binary()) ::
+              :pending | {:failed, binary()} | {:error, term()}
+      def fetch_or_compute_outcome(ctx, key) do
+        case read_shard_value(ctx, shard_for(ctx, key), FetchOrComputeOutcome.key(key)) do
+          {:ok, nil} ->
+            :pending
+
+          {:ok, encoded_error} when is_binary(encoded_error) ->
+            case FetchOrComputeOutcome.decode_error(encoded_error) do
+              {:ok, error} -> {:failed, error}
+              {:error, _reason} = invalid -> invalid
+            end
+
+          :unavailable ->
+            {:error, :shard_unavailable}
+
+          other ->
+            {:error, {:invalid_fetch_or_compute_outcome_read, other}}
+        end
+      end
+
+      defp fetch_or_compute_owner_error(reason)
+           when reason in [:key_locked, :key_not_locked, :key_lock_expired, :not_lock_owner],
+           do: {:error, "ERR fetch_or_compute token is not the current lock owner"}
+
+      defp fetch_or_compute_owner_error(reason), do: {:error, reason}
+
       @spec ratelimit_add(
               FerricStore.Instance.t(),
               binary(),
@@ -829,7 +1239,8 @@ defmodule Ferricstore.Store.Router.Part09 do
       # Compound key operations
       # -------------------------------------------------------------------
 
-      @spec compound_get(FerricStore.Instance.t(), binary(), binary()) :: binary() | nil
+      @spec compound_get(FerricStore.Instance.t(), binary(), binary()) ::
+              binary() | nil | ReadResult.failure()
       def compound_get(ctx, redis_key, compound_key) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
@@ -882,7 +1293,24 @@ defmodule Ferricstore.Store.Router.Part09 do
                 )
             end
 
-          _ ->
+          terminal when terminal in [:miss, :expired] ->
+            if selected_waraft_ctx?(ctx) do
+              nil
+            else
+              fallback_compound_get(ctx, idx, redis_key, compound_key)
+            end
+
+          :no_table ->
+            if selected_waraft_ctx?(ctx) do
+              ReadResult.failure(:keydir_unavailable)
+            else
+              fallback_compound_get(ctx, idx, redis_key, compound_key)
+            end
+
+          {:invalid, entry} ->
+            ReadResult.failure({:invalid_keydir_entry, entry})
+
+          _other ->
             fallback_compound_get(ctx, idx, redis_key, compound_key)
         end
       end

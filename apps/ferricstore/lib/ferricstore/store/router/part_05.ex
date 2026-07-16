@@ -18,6 +18,8 @@ defmodule Ferricstore.Store.Router.Part05 do
       alias Ferricstore.Store.BlobValue
       alias Ferricstore.Store.CompoundCommand
       alias Ferricstore.Store.CompoundKey
+      alias Ferricstore.Store.DiskPressure
+      alias Ferricstore.Store.Keydir
       alias Ferricstore.Store.LFU
       alias Ferricstore.Store.ListOps
       alias Ferricstore.Store.Router
@@ -178,9 +180,15 @@ defmodule Ferricstore.Store.Router.Part05 do
 
           try do
             case :ets.lookup(keydir, key) do
-              [{^key, nil, expire_at_ms, _old_lfu, ^file_id, ^offset, value_size}] ->
-                :ets.insert(keydir, {key, value, expire_at_ms, lfu, file_id, offset, value_size})
-                track_keydir_binary_warm(ctx, idx, value)
+              [
+                {^key, nil, expire_at_ms, old_lfu, ^file_id, ^offset, value_size} = observed
+              ] ->
+                replacement =
+                  {key, value, expire_at_ms, lfu, file_id, offset, value_size}
+
+                if Keydir.replace_exact(keydir, observed, replacement) do
+                  track_keydir_binary_warm(ctx, idx, value)
+                end
 
               _other ->
                 :ok
@@ -222,6 +230,144 @@ defmodule Ferricstore.Store.Router.Part05 do
       @doc "Returns the maximum allowed value size in bytes."
       def max_value_size, do: @max_value_size
 
+      @crossslot_error {:error, "CROSSSLOT Keys in request don't hash to the same slot"}
+
+      @doc "Atomically writes one hash slot of string key-value pairs."
+      @spec atomic_mset(FerricStore.Instance.t(), [{binary(), binary()}]) ::
+              :ok | {:error, term()}
+      def atomic_mset(_ctx, []), do: :ok
+
+      def atomic_mset(ctx, kv_pairs) when is_list(kv_pairs) do
+        with {:ok, shard_index, entries} <- prepare_atomic_string_batch(ctx, kv_pairs),
+             :ok <- admit_atomic_string_batch(ctx, shard_index, entries) do
+          submit_atomic_string_batch(ctx, shard_index, {:mset, entries})
+        end
+      end
+
+      @doc "Atomically writes one hash slot only when every target key is absent."
+      @spec atomic_msetnx(FerricStore.Instance.t(), [{binary(), binary()}]) ::
+              0 | 1 | {:error, term()}
+      def atomic_msetnx(_ctx, []), do: 1
+
+      def atomic_msetnx(ctx, kv_pairs) when is_list(kv_pairs) do
+        with {:ok, shard_index, entries} <- prepare_atomic_string_batch(ctx, kv_pairs),
+             :ok <- admit_atomic_string_batch(ctx, shard_index, entries) do
+          submit_atomic_string_batch(ctx, shard_index, {:msetnx, entries})
+        end
+      end
+
+      defp prepare_atomic_string_batch(ctx, [{key, value} | rest]) do
+        with :ok <- validate_atomic_string_entry(ctx, key, value) do
+          slot = SlotMap.slot_for_key(key)
+          shard_index = elem(ctx.slot_map, slot)
+          prepare_atomic_string_batch(ctx, rest, slot, shard_index, [{key, value, 0}])
+        end
+      end
+
+      defp prepare_atomic_string_batch(_ctx, _invalid),
+        do: {:error, "ERR invalid key-value batch"}
+
+      defp prepare_atomic_string_batch(_ctx, [], _slot, shard_index, entries),
+        do: {:ok, shard_index, Enum.reverse(entries)}
+
+      defp prepare_atomic_string_batch(
+             ctx,
+             [{key, value} | rest],
+             slot,
+             shard_index,
+             entries
+           ) do
+        with :ok <- validate_atomic_string_entry(ctx, key, value) do
+          if SlotMap.slot_for_key(key) == slot do
+            prepare_atomic_string_batch(ctx, rest, slot, shard_index, [
+              {key, value, 0} | entries
+            ])
+          else
+            @crossslot_error
+          end
+        end
+      end
+
+      defp prepare_atomic_string_batch(_ctx, _invalid, _slot, _shard_index, _entries),
+        do: {:error, "ERR invalid key-value batch"}
+
+      defp validate_atomic_string_entry(ctx, key, value) do
+        with :ok <- validate_string_write(ctx, key, value) do
+          if key == "", do: {:error, "ERR key too large or empty"}, else: :ok
+        end
+      end
+
+      defp admit_atomic_string_batch(ctx, shard_index, entries) do
+        cond do
+          DiskPressure.under_pressure?(ctx, shard_index) ->
+            {:error, "ERR disk pressure on shard #{shard_index}, rejecting write"}
+
+          true ->
+            Enum.reduce_while(entries, :ok, fn {key, _value, _expire_at_ms}, :ok ->
+              case check_keydir_full(ctx, key) do
+                :ok -> {:cont, :ok}
+                {:error, _reason} = error -> {:halt, error}
+              end
+            end)
+        end
+      end
+
+      defp submit_atomic_string_batch(ctx, shard_index, command) do
+        {_, [{key, _value, _expire_at_ms} | _]} = {elem(command, 0), elem(command, 1)}
+
+        if durable_raft_ctx?(ctx) do
+          raft_write(ctx, shard_index, key, command)
+        else
+          GenServer.call(elem(ctx.shard_names, shard_index), {:standalone_commit, command})
+        end
+      end
+
+      defp configured_max_value_size(ctx) do
+        case Map.get(ctx, :max_value_size, 1_048_576) do
+          value when is_integer(value) and value > 0 -> min(value, @max_value_size)
+          _invalid -> min(1_048_576, @max_value_size)
+        end
+      end
+
+      defp validate_string_write(ctx, key, value) do
+        validate_string_write(ctx, key, value, configured_max_value_size(ctx))
+      end
+
+      defp validate_string_write(_ctx, key, value, max_value_size)
+           when is_binary(key) and is_binary(value) do
+        cond do
+          byte_size(key) > @max_key_size ->
+            {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+
+          byte_size(value) > max_value_size ->
+            {:error,
+             "ERR value too large (#{byte_size(value)} bytes, max #{max_value_size} bytes)"}
+
+          true ->
+            :ok
+        end
+      end
+
+      defp validate_string_write(_ctx, _key, _value, _max_value_size),
+        do: {:error, "ERR invalid key-value batch"}
+
+      defp admit_string_write(ctx, key, value) do
+        with :ok <- validate_string_write(ctx, key, value) do
+          shard_index = shard_for(ctx, key)
+
+          cond do
+            DiskPressure.under_pressure?(ctx, shard_index) ->
+              {:error, "ERR disk pressure on shard #{shard_index}, rejecting write"}
+
+            true ->
+              case check_keydir_full(ctx, key) do
+                :ok -> {:ok, shard_index}
+                {:error, _reason} = error -> error
+              end
+          end
+        end
+      end
+
       @doc """
       Batch PUT API with `:ok | {:error, _}` result shape.
 
@@ -231,13 +377,6 @@ defmodule Ferricstore.Store.Router.Part05 do
       """
       @spec batch_put(FerricStore.Instance.t(), [{binary(), binary()}]) ::
               :ok | {:error, binary()}
-      def batch_put(%{name: name} = ctx, kv_pairs) when name != :default do
-        case pressured_batch_shard(ctx, kv_pairs) do
-          nil -> batch_local_put(ctx, kv_pairs)
-          idx -> {:error, "ERR disk pressure on shard #{idx}, rejecting write"}
-        end
-      end
-
       def batch_put(ctx, kv_pairs) do
         case batch_quorum_put(ctx, kv_pairs) do
           results when is_list(results) ->
@@ -281,26 +420,6 @@ defmodule Ferricstore.Store.Router.Part05 do
         end
       end
 
-      defp batch_local_put(ctx, kv_pairs) do
-        # Embedded/custom instances are local/direct. They must not consult the
-        # default instance's Raft batchers; those global names are owned by the
-        # application instance and can be under unrelated backpressure.
-        Enum.reduce_while(kv_pairs, :ok, fn {key, value}, :ok ->
-          case put(ctx, key, value, 0) do
-            :ok -> {:cont, :ok}
-            {:error, _} = err -> {:halt, err}
-            other -> {:halt, {:error, inspect(other)}}
-          end
-        end)
-      end
-
-      defp pressured_batch_shard(ctx, kv_pairs) do
-        Enum.find_value(kv_pairs, fn {key, _value} ->
-          idx = shard_for(ctx, key)
-          if shard_under_disk_pressure?(ctx, idx), do: idx, else: nil
-        end)
-      end
-
       @doc """
       Batch quorum PUT for pipelined SET commands.
 
@@ -330,6 +449,10 @@ defmodule Ferricstore.Store.Router.Part05 do
       @doc false
       def __batch_result_status_for_test__(results), do: batch_results_status(results)
 
+      @doc false
+      def __normalize_batch_write_result_for_test__(result, expected_count),
+        do: normalize_batch_write_result(result, expected_count)
+
       defp batch_quorum_commands(ctx, keyed_commands) do
         batch_quorum_commands(ctx, keyed_commands, nil)
       end
@@ -345,7 +468,7 @@ defmodule Ferricstore.Store.Router.Part05 do
           # writes, stage disk records first and publish ETS only after append
           # succeeds.
           case direct_batch_command_shape(keyed_commands) do
-            {:put, entries} -> do_batch_quorum_put_entries(ctx, entries, nil)
+            {:put, entries} -> batch_quorum_put(ctx, entries, nil)
             {:delete, keys} -> do_batch_quorum_delete_keys(ctx, keys, nil)
             {:zadd_many_single, entries} -> batch_quorum_zadd_many_single(ctx, entries)
             :generic -> batch_quorum_commands(ctx, keyed_commands)
@@ -416,19 +539,25 @@ defmodule Ferricstore.Store.Router.Part05 do
            when not is_nil(origin_node),
            do: {:ok, keyed_commands}
 
-      defp maybe_stamp_flow_commands(ctx, keyed_commands, nil),
-        do: PolicyCommand.stamp_many(ctx, keyed_commands)
+      defp maybe_stamp_flow_commands(ctx, keyed_commands, nil) do
+        with :ok <- validate_flow_owned_batch_locality(ctx, keyed_commands) do
+          PolicyCommand.stamp_many(ctx, keyed_commands)
+        end
+      end
+
+      defp validate_flow_owned_batch_locality(ctx, keyed_commands) do
+        Enum.reduce_while(keyed_commands, :ok, fn {key, command}, :ok ->
+          idx = shard_for(ctx, key)
+
+          case validate_flow_owned_write_locality(ctx, idx, key, command) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
 
       defp do_batch_quorum_commands_dispatch(ctx, keyed_commands, origin_node) do
-        if Enum.any?(keyed_commands, fn {_key, command} ->
-             flow_shared_ref_acquisition_command?(command)
-           end) do
-          Enum.map(keyed_commands, fn {key, command} ->
-            raft_write(ctx, shard_for(ctx, key), key, command)
-          end)
-        else
-          do_batch_quorum_commands(ctx, keyed_commands, origin_node)
-        end
+        do_batch_quorum_commands(ctx, keyed_commands, origin_node)
       end
 
       defp batch_quorum_zadd_many_single(_ctx, []), do: []
@@ -464,8 +593,10 @@ defmodule Ferricstore.Store.Router.Part05 do
                     {shard_idx, {:zadd_many_single, shard_entries}}
                   end)
 
+                batch_results = Ferricstore.Raft.Backend.write_many(commands)
+
                 batches
-                |> Enum.zip(Ferricstore.Raft.Backend.write_many(commands))
+                |> zip_batch_groups_with_results(batch_results)
                 |> Enum.map(fn {{shard_idx, indices, _shard_entries}, result} ->
                   {shard_idx, indices, result}
                 end)
@@ -557,13 +688,129 @@ defmodule Ferricstore.Store.Router.Part05 do
       defp batch_quorum_put(_ctx, [], _origin_node), do: []
 
       defp batch_quorum_put(ctx, kv_pairs, origin_node) do
-        cond do
-          not durable_raft_ctx?(ctx) ->
-            local_batch_put_entries(ctx, kv_pairs)
+        case batch_put_admission(ctx, kv_pairs) do
+          :ok ->
+            execute_admitted_batch_put(ctx, kv_pairs, origin_node)
 
-          true ->
-            do_batch_quorum_put_entries(ctx, kv_pairs, origin_node)
+          {:partitioned, admitted, admitted_indices, rejected, count} ->
+            admitted_results = execute_admitted_batch_put(ctx, admitted, origin_node)
+
+            merge_batch_admission_results(
+              admitted_results,
+              admitted_indices,
+              rejected,
+              count
+            )
         end
+      end
+
+      defp execute_admitted_batch_put(ctx, kv_pairs, origin_node) do
+        if durable_raft_ctx?(ctx) do
+          do_batch_quorum_put_entries(ctx, kv_pairs, origin_node)
+        else
+          local_batch_put_entries(ctx, kv_pairs)
+        end
+      end
+
+      defp batch_put_admission(ctx, kv_pairs) do
+        max_value_size = configured_max_value_size(ctx)
+        pressure? = batch_write_pressure?(ctx)
+
+        case batch_put_entries_valid?(ctx, kv_pairs, max_value_size, pressure?) do
+          true -> :ok
+          false -> partition_batch_put_entries(ctx, kv_pairs, max_value_size)
+        end
+      end
+
+      defp batch_put_entries_valid?(ctx, entries, max_value_size, pressure?) do
+        Enum.reduce_while(entries, true, fn entry, true ->
+          case admit_batch_put_entry(ctx, entry, max_value_size, pressure?) do
+            :ok -> {:cont, true}
+            {:error, _reason} -> {:halt, false}
+          end
+        end)
+      end
+
+      defp partition_batch_put_entries(ctx, entries, max_value_size) do
+        {admitted, admitted_indices, rejected, count} =
+          Enum.reduce(entries, {[], [], %{}, 0}, fn entry, {admitted, indices, rejected, index} ->
+            case admit_batch_put_entry(ctx, entry, max_value_size, true) do
+              :ok ->
+                {[entry | admitted], [index | indices], rejected, index + 1}
+
+              {:error, _reason} = error ->
+                {admitted, indices, Map.put(rejected, index, error), index + 1}
+            end
+          end)
+
+        {:partitioned, Enum.reverse(admitted), Enum.reverse(admitted_indices), rejected, count}
+      end
+
+      defp admit_batch_put_entry(ctx, entry, max_value_size, pressure?) do
+        with {:ok, key, value, _expire_at_ms} <-
+               validate_batch_put_entry(ctx, entry, max_value_size) do
+          if pressure? do
+            shard_index = shard_for(ctx, key)
+
+            cond do
+              DiskPressure.under_pressure?(ctx, shard_index) ->
+                {:error, "ERR disk pressure on shard #{shard_index}, rejecting write"}
+
+              true ->
+                check_keydir_full(ctx, key)
+            end
+          else
+            :ok
+          end
+        end
+      end
+
+      defp validate_batch_put_entry(ctx, {key, value}, max_value_size) do
+        with :ok <- validate_string_write(ctx, key, value, max_value_size) do
+          {:ok, key, value, 0}
+        end
+      end
+
+      defp validate_batch_put_entry(ctx, {key, value, expire_at_ms}, max_value_size)
+           when is_integer(expire_at_ms) and expire_at_ms >= 0 do
+        with :ok <- validate_string_write(ctx, key, value, max_value_size) do
+          {:ok, key, value, expire_at_ms}
+        end
+      end
+
+      defp validate_batch_put_entry(_ctx, _entry, _max_value_size),
+        do: {:error, "ERR invalid key-value batch"}
+
+      defp batch_write_pressure?(ctx) do
+        :atomics.get(ctx.pressure_flags, 1) == 1 or
+          :atomics.get(ctx.pressure_flags, 2) == 1 or
+          Enum.any?(0..(ctx.shard_count - 1), &DiskPressure.under_pressure?(ctx, &1))
+      end
+
+      defp merge_batch_admission_results(admitted_results, indices, rejected, count) do
+        results =
+          Enum.reduce(rejected, :erlang.make_tuple(count, nil), fn {index, error}, results ->
+            put_elem(results, index, error)
+          end)
+
+        normalized_results =
+          case admitted_results do
+            results when is_list(results) and length(results) == length(indices) ->
+              results
+
+            {:error, _reason} = error ->
+              List.duplicate(error, length(indices))
+
+            invalid ->
+              List.duplicate({:error, {:invalid_batch_result, invalid}}, length(indices))
+          end
+
+        indices
+        |> Enum.zip(normalized_results)
+        |> Enum.reduce(results, fn {index, result}, results ->
+          put_elem(results, index, result)
+        end)
+        |> Tuple.to_list()
       end
 
       @doc false
@@ -893,12 +1140,12 @@ defmodule Ferricstore.Store.Router.Part05 do
 
             results
 
-          {:error, expected, actual} ->
+          {:error, _expected, _actual} ->
             merge_waraft_batch_results(
               ctx,
               shard_idx,
               indices,
-              {:error, {:batch_result_mismatch, expected, actual}},
+              {:ok, values},
               acc
             )
         end
@@ -915,10 +1162,36 @@ defmodule Ferricstore.Store.Router.Part05 do
             bump_write_version_if_needed(ctx, shard_idx, ok_count)
             :ok
 
-          {:error, error, ok_count} ->
-            bump_write_version_if_needed(ctx, shard_idx, ok_count)
+          {:error, {:error, {:batch_result_mismatch, _, _}} = error, _ok_count} ->
+            bump_write_version_if_needed(ctx, shard_idx, expected_count)
+            error
+
+          {:error, error, possible_write_count} ->
+            bump_write_version_if_needed(ctx, shard_idx, possible_write_count)
             error
         end
+      end
+
+      defp merge_waraft_hot_batch_status(
+             ctx,
+             shard_idx,
+             expected_count,
+             {:ok, _invalid}
+           ) do
+        bump_write_version_if_needed(ctx, shard_idx, expected_count)
+        ErrorReasons.write_timeout_unknown()
+      end
+
+      defp merge_waraft_hot_batch_status(
+             ctx,
+             shard_idx,
+             expected_count,
+             result
+           )
+           when result == {:error, {:timeout, :unknown_outcome}} or
+                  result == {:error, :write_timeout_unknown} do
+        bump_write_version_if_needed(ctx, shard_idx, expected_count)
+        result
       end
 
       defp merge_waraft_hot_batch_status(_ctx, _shard_idx, _expected_count, {:error, _} = error),
@@ -946,7 +1219,7 @@ defmodule Ferricstore.Store.Router.Part05 do
 
       defp put_waraft_hot_batch_results([index | indices], [value | values], acc, ok_count, seen) do
         ok_count =
-          if value == :ok or not match?({:error, _}, value) do
+          if batch_write_may_have_applied?(value) do
             ok_count + 1
           else
             ok_count
@@ -966,24 +1239,95 @@ defmodule Ferricstore.Store.Router.Part05 do
       end
 
       defp merge_waraft_batch_results(ctx, shard_idx, indices, result, acc) do
-        results =
-          case result do
-            {:ok, values} when is_list(values) -> values
-            {:error, _} = error -> List.duplicate(error, length(indices))
-            other -> List.duplicate(other, length(indices))
-          end
+        {results, possible_write_count} =
+          normalize_batch_write_result(result, length(indices))
 
-        ok_count =
-          Enum.count(results, fn value -> value == :ok or not match?({:error, _}, value) end)
-
-        if ok_count > 0 do
-          bump_write_version(ctx, shard_idx, ok_count)
+        if possible_write_count > 0 do
+          bump_write_version(ctx, shard_idx, possible_write_count)
         end
 
         indices
         |> Enum.zip(results)
         |> Enum.reduce(acc, fn {index, value}, results -> put_elem(results, index, value) end)
       end
+
+      defp normalize_batch_write_result({:ok, values}, expected_count)
+           when is_list(values) and is_integer(expected_count) and expected_count >= 0 do
+        case count_exact_batch_possible_writes(values, expected_count, 0) do
+          {:ok, possible_write_count} ->
+            {values, possible_write_count}
+
+          :mismatch ->
+            unknown_batch_write_result(expected_count)
+        end
+      end
+
+      defp normalize_batch_write_result({:ok, _invalid}, expected_count)
+           when is_integer(expected_count) and expected_count >= 0 do
+        unknown_batch_write_result(expected_count)
+      end
+
+      defp normalize_batch_write_result(result, expected_count)
+           when is_integer(expected_count) and expected_count >= 0 do
+        possible_write_count =
+          if batch_write_may_have_applied?(result), do: expected_count, else: 0
+
+        {List.duplicate(result, expected_count), possible_write_count}
+      end
+
+      defp count_exact_batch_possible_writes([], 0, possible_write_count),
+        do: {:ok, possible_write_count}
+
+      defp count_exact_batch_possible_writes([], _remaining, _possible_write_count),
+        do: :mismatch
+
+      defp count_exact_batch_possible_writes([_value | _rest], 0, _possible_write_count),
+        do: :mismatch
+
+      defp count_exact_batch_possible_writes(
+             [value | rest],
+             remaining,
+             possible_write_count
+           ) do
+        count_exact_batch_possible_writes(
+          rest,
+          remaining - 1,
+          if(batch_write_may_have_applied?(value),
+            do: possible_write_count + 1,
+            else: possible_write_count
+          )
+        )
+      end
+
+      defp unknown_batch_write_result(expected_count) do
+        {List.duplicate(ErrorReasons.write_timeout_unknown(), expected_count), expected_count}
+      end
+
+      defp batch_write_may_have_applied?(result)
+           when result == {:error, {:timeout, :unknown_outcome}} or
+                  result == {:error, :write_timeout_unknown},
+           do: true
+
+      defp batch_write_may_have_applied?({:error, _reason}), do: false
+      defp batch_write_may_have_applied?(_result), do: true
+
+      defp zip_batch_groups_with_results(groups, results) when is_list(results) do
+        if same_list_length?(groups, results) do
+          Enum.zip(groups, results)
+        else
+          unknown = ErrorReasons.write_timeout_unknown()
+          Enum.map(groups, &{&1, unknown})
+        end
+      end
+
+      defp zip_batch_groups_with_results(groups, _invalid) do
+        unknown = ErrorReasons.write_timeout_unknown()
+        Enum.map(groups, &{&1, unknown})
+      end
+
+      defp same_list_length?([], []), do: true
+      defp same_list_length?([_ | left], [_ | right]), do: same_list_length?(left, right)
+      defp same_list_length?(_left, _right), do: false
 
       defp new_waraft_result_tuple(count) when is_integer(count) and count >= 0 do
         :erlang.make_tuple(count, ErrorReasons.write_timeout_unknown())
@@ -992,18 +1336,27 @@ defmodule Ferricstore.Store.Router.Part05 do
       defp batch_quorum_put_status(_ctx, [], _origin_node), do: :ok
 
       defp batch_quorum_put_status(ctx, kv_pairs, origin_node) do
-        cond do
-          not durable_raft_ctx?(ctx) ->
-            ctx
-            |> local_batch_put_entries(kv_pairs)
-            |> batch_results_status()
+        case batch_put_admission(ctx, kv_pairs) do
+          :ok ->
+            cond do
+              not durable_raft_ctx?(ctx) ->
+                ctx
+                |> local_batch_put_entries(kv_pairs)
+                |> batch_results_status()
 
-          selected_waraft_ctx?(ctx) and is_nil(origin_node) ->
-            waraft_batch_put_entries_status(ctx, kv_pairs)
+              selected_waraft_ctx?(ctx) and is_nil(origin_node) ->
+                waraft_batch_put_entries_status(ctx, kv_pairs)
 
-          true ->
+              true ->
+                ctx
+                |> do_ra_batch_quorum_put_entries(kv_pairs, origin_node)
+                |> batch_results_status()
+            end
+
+          {:partitioned, admitted, admitted_indices, rejected, count} ->
             ctx
-            |> do_ra_batch_quorum_put_entries(kv_pairs, origin_node)
+            |> execute_admitted_batch_put(admitted, origin_node)
+            |> merge_batch_admission_results(admitted_indices, rejected, count)
             |> batch_results_status()
         end
       end
@@ -1039,7 +1392,7 @@ defmodule Ferricstore.Store.Router.Part05 do
         do: {:error, {:error, {:batch_result_mismatch, expected_count, seen}}, ok_count}
 
       defp batch_values_status([value | rest], expected_count, seen, ok_count, first_error) do
-        ok? = value == :ok or not match?({:error, _reason}, value)
+        possible_write? = batch_write_may_have_applied?(value)
 
         first_error =
           case {first_error, value} do
@@ -1051,7 +1404,7 @@ defmodule Ferricstore.Store.Router.Part05 do
           rest,
           expected_count,
           seen + 1,
-          if(ok?, do: ok_count + 1, else: ok_count),
+          if(possible_write?, do: ok_count + 1, else: ok_count),
           first_error
         )
       end
@@ -1230,7 +1583,9 @@ defmodule Ferricstore.Store.Router.Part05 do
       defp merge_forwarded(acc, by_shard, shard_idx, entries, leader_node, ctx) do
         {_, indices} = Map.fetch!(by_shard, shard_idx)
         indices = Enum.reverse(indices)
-        new_results = forward_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(entries))
+        result = forward_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(entries))
+        {new_results, possible_write_count} = normalize_forwarded_batch_result(result, indices)
+        bump_write_version_if_needed(ctx, shard_idx, possible_write_count)
 
         Enum.zip(indices, new_results)
         |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
@@ -1240,8 +1595,11 @@ defmodule Ferricstore.Store.Router.Part05 do
         {_, indices} = Map.fetch!(by_shard, shard_idx)
         indices = Enum.reverse(indices)
 
-        new_results =
+        result =
           forward_batch_commands_to_leader(ctx, leader_node, shard_idx, Enum.reverse(commands))
+
+        {new_results, possible_write_count} = normalize_forwarded_batch_result(result, indices)
+        bump_write_version_if_needed(ctx, shard_idx, possible_write_count)
 
         Enum.zip(indices, new_results)
         |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
@@ -1251,11 +1609,20 @@ defmodule Ferricstore.Store.Router.Part05 do
         {_, indices} = Map.fetch!(by_shard, shard_idx)
         indices = Enum.reverse(indices)
 
-        new_results =
-          forward_delete_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(keys))
+        result = forward_delete_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(keys))
+        {new_results, possible_write_count} = normalize_forwarded_batch_result(result, indices)
+        bump_write_version_if_needed(ctx, shard_idx, possible_write_count)
 
         Enum.zip(indices, new_results)
         |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
+      end
+
+      defp normalize_forwarded_batch_result(results, indices) when is_list(results) do
+        normalize_batch_write_result({:ok, results}, length(indices))
+      end
+
+      defp normalize_forwarded_batch_result(result, indices) do
+        normalize_batch_write_result(result, length(indices))
       end
 
       defp collect_shard_replies([], _wv_size, _ctx, acc, _start), do: acc
@@ -1274,29 +1641,16 @@ defmodule Ferricstore.Store.Router.Part05 do
         end)
       end
 
-      defp apply_shard_results({:ok, results}, indices, shard_idx, wv_size, ctx, acc)
-           when is_list(results) do
-        ok_count = Enum.count(results, fn r -> r == :ok or not match?({:error, _}, r) end)
+      defp apply_shard_results(result, indices, shard_idx, wv_size, ctx, acc) do
+        {results, possible_write_count} =
+          normalize_batch_write_result(result, length(indices))
 
-        if ok_count > 0 and shard_idx < wv_size do
-          :counters.add(ctx.write_version, shard_idx + 1, ok_count)
+        if possible_write_count > 0 and shard_idx < wv_size do
+          :counters.add(ctx.write_version, shard_idx + 1, possible_write_count)
         end
 
         Enum.zip(indices, results)
         |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
-      end
-
-      defp apply_shard_results(result, indices, shard_idx, wv_size, ctx, acc) do
-        case result do
-          {:error, _} ->
-            Enum.reduce(indices, acc, fn i, a -> Map.put(a, i, result) end)
-
-          _ ->
-            if shard_idx < wv_size,
-              do: :counters.add(ctx.write_version, shard_idx + 1, length(indices))
-
-            Enum.reduce(indices, acc, fn i, a -> Map.put(a, i, result) end)
-        end
       end
     end
   end

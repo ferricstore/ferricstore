@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Acl do
   @moduledoc """
   GenServer managing the Access Control List (ACL) for FerricStore.
 
-  Stores user accounts in a named ETS table (`:ferricstore_acl`). Each user
+  Stores user accounts in an atomically swappable ETS generation. Each user
   record has a username, enabled/disabled flag, an optional password hash,
   allowed commands, denied commands, allowed key patterns, and allowed Pub/Sub
   channel patterns.
@@ -35,7 +35,8 @@ defmodule FerricstoreServer.Acl do
 
   - **ACL SAVE** -- atomic write (tmp + fsync + rename), 0600 permissions
   - **ACL LOAD** -- all-or-nothing validation, rejects plaintext passwords
-  - **Auto-load on startup** -- loads from file if it exists
+  - **Explicit import** -- file state is loaded only when requested; the replicated catalog is
+    authoritative at startup
   - **Auto-save** -- configurable debounced save on ACL mutations
 
   ## Command categories
@@ -134,9 +135,9 @@ defmodule FerricstoreServer.Acl do
   @doc """
   Starts the ACL GenServer and creates the backing ETS table.
 
-  Initialises the "default" user with full access. If an ACL file exists
-  at `data_dir/acl.conf`, it is loaded on startup. If the file is invalid,
-  a warning is logged and the server starts with the default user only.
+  Initialises the "default" user with full access. The catalog projector
+  replaces this bootstrap state from the replicated ACL catalog before
+  network listeners start.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -183,7 +184,35 @@ defmodule FerricstoreServer.Acl do
   """
   @spec set_user(binary(), [binary()]) :: :ok | {:error, binary()}
   def set_user(username, rules) do
-    GenServer.call(__MODULE__, {:set_user, username, rules})
+    with {:ok, store} <- default_store() do
+      FerricstoreServer.Management.ACL.set_user(username, rules, store: store)
+    end
+  end
+
+  @doc false
+  @spec new_user() :: map()
+  def new_user do
+    %{
+      enabled: false,
+      password: nil,
+      commands: MapSet.new(),
+      denied_commands: MapSet.new(),
+      keys: [],
+      channels: []
+    }
+  end
+
+  @doc false
+  @spec default_user() :: map()
+  def default_user do
+    %{
+      enabled: true,
+      password: nil,
+      commands: :all,
+      denied_commands: MapSet.new(),
+      keys: :all,
+      channels: :all
+    }
   end
 
   @doc """
@@ -205,7 +234,12 @@ defmodule FerricstoreServer.Acl do
   """
   @spec del_user(binary()) :: :ok | {:error, binary()}
   def del_user(username) do
-    GenServer.call(__MODULE__, {:del_user, username})
+    with {:ok, store} <- default_store() do
+      case FerricstoreServer.Management.ACL.del_user(username, store: store) do
+        {:ok, 1} -> :ok
+        result -> result
+      end
+    end
   end
 
   @doc """
@@ -216,7 +250,12 @@ defmodule FerricstoreServer.Acl do
   """
   @spec del_users([binary()]) :: :ok | {:error, binary()}
   def del_users(usernames) when is_list(usernames) do
-    GenServer.call(__MODULE__, {:del_users, usernames})
+    with {:ok, store} <- default_store() do
+      case FerricstoreServer.Management.ACL.del_users(usernames, store: store) do
+        {:ok, _count} -> :ok
+        result -> result
+      end
+    end
   end
 
   @doc """
@@ -238,6 +277,10 @@ defmodule FerricstoreServer.Acl do
       [] -> nil
     end
   end
+
+  @doc false
+  @spec user_count() :: non_neg_integer()
+  def user_count, do: :ets.info(Tables.active_table(), :size)
 
   @doc """
   Returns a list of all users in Redis ACL LIST format.
@@ -325,6 +368,15 @@ defmodule FerricstoreServer.Acl do
   """
   @spec authenticate(binary(), binary()) :: {:ok, binary()} | {:error, binary()}
   def authenticate(username, password) do
+    if FerricstoreServer.Acl.CatalogProjector.ready?() do
+      do_authenticate(username, password)
+    else
+      verify_dummy_password(password, &Password.verify/2)
+      projection_authentication_error()
+    end
+  end
+
+  defp do_authenticate(username, password) do
     case get_user(username) do
       nil ->
         verify_dummy_password(password, &Password.verify/2)
@@ -352,6 +404,15 @@ defmodule FerricstoreServer.Acl do
   @spec authenticate(binary(), binary(), (binary(), binary() -> boolean())) ::
           {:ok, binary()} | {:error, binary()}
   def authenticate(username, password, verifier) when is_function(verifier, 2) do
+    if FerricstoreServer.Acl.CatalogProjector.ready?() do
+      do_authenticate(username, password, verifier)
+    else
+      verify_dummy_password(password, verifier)
+      projection_authentication_error()
+    end
+  end
+
+  defp do_authenticate(username, password, verifier) do
     case get_user(username) do
       nil ->
         verify_dummy_password(password, verifier)
@@ -401,10 +462,21 @@ defmodule FerricstoreServer.Acl do
     {:error, "WRONGPASS invalid username-password pair or user is disabled."}
   end
 
-  @doc """
-  Checks if the given user is allowed to run the given command (enabled check only).
+  defp projection_authentication_error do
+    {:error, "LOADING ACL catalog projection unavailable"}
+  end
 
-  Legacy v1 check. Prefer `check_command/2` for full ACL enforcement.
+  defp ensure_projection_access_ready do
+    if FerricstoreServer.Acl.CatalogProjector.ready?() do
+      :ok
+    else
+      {:error, "NOPERM ACL catalog projection unavailable"}
+    end
+  end
+
+  @doc """
+  Checks whether the user exists and is enabled. Use `check_command/2` when a
+  command-specific permission check is required.
 
   ## Parameters
 
@@ -418,15 +490,17 @@ defmodule FerricstoreServer.Acl do
   """
   @spec check_permission(binary(), binary()) :: :ok | {:error, binary()}
   def check_permission(username, _command) do
-    case get_user(username) do
-      nil ->
-        {:error, "NOPERM user '#{username}' does not exist"}
+    with :ok <- ensure_projection_access_ready() do
+      case get_user(username) do
+        nil ->
+          {:error, "NOPERM user '#{username}' does not exist"}
 
-      %{enabled: false} ->
-        {:error, "NOPERM user '#{username}' is disabled"}
+        %{enabled: false} ->
+          {:error, "NOPERM user '#{username}' is disabled"}
 
-      _ ->
-        :ok
+        _ ->
+          :ok
+      end
     end
   end
 
@@ -466,36 +540,38 @@ defmodule FerricstoreServer.Acl do
   def check_command(username, command) do
     cmd = Rules.normalize_acl_command_name(command)
 
-    case get_user(username) do
-      nil ->
-        {:error,
-         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-
-      %{enabled: false} ->
-        {:error,
-         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-
-      %{commands: :all, denied_commands: denied} ->
-        if Rules.command_denied?(denied, cmd) do
+    with :ok <- ensure_projection_access_ready() do
+      case get_user(username) do
+        nil ->
           {:error,
            "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-        else
-          :ok
-        end
 
-      %{commands: cmds, denied_commands: denied} ->
-        cond do
-          Rules.command_denied?(denied, cmd) ->
+        %{enabled: false} ->
+          {:error,
+           "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+
+        %{commands: :all, denied_commands: denied} ->
+          if Rules.command_denied?(denied, cmd) do
             {:error,
              "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-
-          Rules.command_allowed?(cmds, cmd) ->
+          else
             :ok
+          end
 
-          true ->
-            {:error,
-             "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-        end
+        %{commands: cmds, denied_commands: denied} ->
+          cond do
+            Rules.command_denied?(denied, cmd) ->
+              {:error,
+               "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+
+            Rules.command_allowed?(cmds, cmd) ->
+              :ok
+
+            true ->
+              {:error,
+               "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+          end
+      end
     end
   end
 
@@ -522,25 +598,27 @@ defmodule FerricstoreServer.Acl do
   """
   @spec check_key_access(binary(), binary(), :read | :write) :: :ok | {:error, binary()}
   def check_key_access(username, key, access_type) do
-    case get_user(username) do
-      nil ->
-        {:error,
-         "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
-
-      %{enabled: false} ->
-        {:error,
-         "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
-
-      %{keys: :all} ->
-        :ok
-
-      %{keys: patterns} ->
-        if key_matches_any?(key, access_type, patterns) do
-          :ok
-        else
+    with :ok <- ensure_projection_access_ready() do
+      case get_user(username) do
+        nil ->
           {:error,
            "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
-        end
+
+        %{enabled: false} ->
+          {:error,
+           "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+
+        %{keys: :all} ->
+          :ok
+
+        %{keys: patterns} ->
+          if key_matches_any?(key, access_type, patterns) do
+            :ok
+          else
+            {:error,
+             "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+          end
+      end
     end
   end
 
@@ -597,32 +675,101 @@ defmodule FerricstoreServer.Acl do
   """
   @spec reset!() :: :ok
   def reset! do
-    GenServer.call(__MODULE__, :reset)
+    with {:ok, store} <- default_store() do
+      FerricstoreServer.Management.ACL.replace_users([{"default", default_user()}], store: store)
+    end
   end
+
+  @doc false
+  @spec reset_projection!() :: :ok
+  def reset_projection!, do: GenServer.call(__MODULE__, :reset)
 
   # ---------------------------------------------------------------------------
   # Raft replication hook
   # ---------------------------------------------------------------------------
 
-  @doc """
-  Handles ACL commands replicated through Raft.
-
-  Called by the state machine's `:server_command` clause on all nodes.
-  This ensures ACL mutations are applied consistently across the cluster.
-  """
+  @doc false
   @spec handle_raft_command(term()) :: term()
-  def handle_raft_command({:acl_setuser, username, rules}), do: set_user(username, rules)
-
-  def handle_raft_command({:acl_deluser, username}), do: del_user(username)
-
-  def handle_raft_command({:acl_delusers, usernames}), do: del_users(usernames)
-
-  def handle_raft_command({:acl_reset}), do: reset!()
-
-  def handle_raft_command({:acl_load, contents}) when is_binary(contents),
-    do: load_contents(contents)
+  def handle_raft_command({"acl", username, encoded})
+      when is_binary(username) and is_binary(encoded) do
+    project_catalog_entry(username, encoded)
+  end
 
   def handle_raft_command(_unknown), do: {:error, :unknown_acl_command}
+
+  @doc false
+  @spec project_catalog_entry(binary(), binary()) :: :ok | {:error, atom()}
+  def project_catalog_entry(username, encoded) do
+    do_project_catalog_entry(username, encoded, :unknown)
+  end
+
+  @doc false
+  @spec project_catalog_entry(binary(), binary(), binary() | nil) :: :ok | {:error, atom()}
+  def project_catalog_entry(username, encoded, expected_revision)
+      when is_binary(username) and is_binary(encoded) and
+             (is_binary(expected_revision) or is_nil(expected_revision)) do
+    with {:ok, previous_revision} <- decode_projection_revision(expected_revision) do
+      do_project_catalog_entry(username, encoded, previous_revision)
+    end
+  end
+
+  defp do_project_catalog_entry(username, encoded, previous_revision)
+       when is_binary(username) and is_binary(encoded) and
+              (previous_revision == :unknown or
+                 (is_integer(previous_revision) and previous_revision >= -1)) do
+    with :ok <- validate_projected_username(username),
+         {:ok, %{version: version, value: value}} <-
+           Ferricstore.ServerCatalog.decode_entry(encoded) do
+      case value do
+        :deleted ->
+          GenServer.call(
+            __MODULE__,
+            {:project_catalog_delete, username, version, previous_revision}
+          )
+
+        value when is_binary(value) ->
+          with {:ok, user} <- FerricstoreServer.Management.ACL.decode_catalog_value(value) do
+            GenServer.call(
+              __MODULE__,
+              {:project_catalog_user, username, user, version, previous_revision}
+            )
+          end
+
+        _invalid ->
+          {:error, :invalid_acl_catalog_value}
+      end
+    end
+  end
+
+  defp validate_projected_username(username) do
+    case Rules.validate_username(username) do
+      :ok -> :ok
+      {:error, _reason} -> {:error, :invalid_acl_username}
+    end
+  end
+
+  defp decode_projection_revision(nil), do: {:ok, -1}
+
+  defp decode_projection_revision(encoded) when is_binary(encoded) do
+    case Ferricstore.ServerCatalog.decode_revision(encoded) do
+      {:ok, revision} -> {:ok, revision}
+      {:error, _reason} -> {:error, :invalid_acl_catalog_revision}
+    end
+  end
+
+  @doc false
+  @spec replace_catalog_snapshot([{binary(), map(), non_neg_integer()}], non_neg_integer()) ::
+          :ok | {:error, atom()}
+  def replace_catalog_snapshot(users, revision)
+      when is_list(users) and is_integer(revision) and revision >= 0 do
+    GenServer.call(__MODULE__, {:replace_catalog_snapshot, users, revision})
+  end
+
+  def replace_catalog_snapshot(_users, _revision), do: {:error, :invalid_acl_catalog_snapshot}
+
+  @doc false
+  @spec catalog_projection_revision() :: integer()
+  def catalog_projection_revision, do: GenServer.call(__MODULE__, :catalog_projection_revision)
 
   # ---------------------------------------------------------------------------
   # File persistence API (ACL SAVE / ACL LOAD)
@@ -668,7 +815,9 @@ defmodule FerricstoreServer.Acl do
   """
   @spec load() :: :ok | {:error, binary()}
   def load do
-    GenServer.call(__MODULE__, :acl_load)
+    with {:ok, store} <- default_store() do
+      FerricstoreServer.Management.ACL.load(store: store)
+    end
   end
 
   @doc """
@@ -678,7 +827,9 @@ defmodule FerricstoreServer.Acl do
   """
   @spec load(binary()) :: :ok | {:error, binary()}
   def load(data_dir) do
-    GenServer.call(__MODULE__, {:acl_load, data_dir})
+    with {:ok, store} <- default_store() do
+      FerricstoreServer.Management.ACL.load(store: store, data_dir: data_dir)
+    end
   end
 
   @doc """
@@ -709,7 +860,9 @@ defmodule FerricstoreServer.Acl do
   """
   @spec load_contents(binary()) :: :ok | {:error, binary()}
   def load_contents(contents) when is_binary(contents) do
-    GenServer.call(__MODULE__, {:acl_load_contents, contents})
+    with {:ok, store} <- default_store() do
+      FerricstoreServer.Management.ACL.import_contents(contents, store: store)
+    end
   end
 
   @doc """
@@ -760,107 +913,138 @@ defmodule FerricstoreServer.Acl do
 
   @impl true
   def init(_opts) do
-    Tables.cleanup_retired_tables()
-    Tables.cleanup_new_swap_table()
+    :ok = FerricstoreServer.Acl.CatalogProjector.mark_stale(:acl_projection_initializing)
 
     table = Tables.new_active_table()
     Tables.insert_default_user()
 
-    # Auto-load from file on startup (design doc section 7 startup sequence)
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    state = %{table: table, save_timer: nil, auth_epoch: 0}
-
-    state =
-      case Persistence.auto_load_from_file(data_dir, state.auth_epoch) do
-        {:ok, auth_epoch} ->
-          Logger.info("ACL loaded from #{acl_file_path(data_dir)}")
-          %{state | auth_epoch: auth_epoch}
-
-        {:error, :enoent} ->
-          # No file -- start with default user only (normal for fresh installs)
-          state
-
-        {:error, reason} ->
-          Logger.warning("ACL file load failed on startup, using defaults: #{reason}")
-          state
-      end
+    state = %{
+      table: table,
+      save_timer: nil,
+      auth_epoch: 0,
+      catalog_versions: %{},
+      catalog_revision: -1
+    }
 
     {:ok, state}
   end
 
   @impl true
-  def handle_call({:set_user, username, rules}, _from, state) do
-    existing = get_user(username)
-    table = Tables.active_table()
+  def handle_call(
+        {:project_catalog_user, username, user, version, expected_revision},
+        _from,
+        state
+      ) do
+    previous_version = max(Map.get(state.catalog_versions, username, -1), state.catalog_revision)
 
-    # Fix 4: max_acl_users -- check limit before creating a new user.
-    max = Application.get_env(:ferricstore, :max_acl_users, 10_000)
+    cond do
+      version <= previous_version ->
+        {:reply, :ok, state}
 
-    if existing == nil and :ets.info(table, :size) >= max do
-      {:reply, {:error, "ERR max ACL users reached (#{max})"}, state}
-    else
-      base =
-        if existing do
-          existing
+      projection_gap?(state, expected_revision) ->
+        :ok = FerricstoreServer.Acl.CatalogProjector.mark_stale(:acl_projection_revision_gap)
+        {:reply, {:error, :acl_catalog_projection_gap}, state}
+
+      true ->
+        user = Map.put(user, :auth_epoch, version)
+        :ets.insert(Tables.active_table(), {username, user})
+        :ok = Tables.update_configured_user_witness(username, user)
+
+        next_revision = next_catalog_projection_revision(state, expected_revision, version)
+
+        state = %{
+          state
+          | auth_epoch: max(state.auth_epoch, version),
+            catalog_versions: Map.put(state.catalog_versions, username, version),
+            catalog_revision: next_revision
+        }
+
+        :ok =
+          broadcast_catalog_projection_invalidation(
+            username,
+            expected_revision,
+            next_revision
+          )
+
+        maybe_mark_projection_ready(expected_revision)
+        {:reply, :ok, maybe_schedule_auto_save(state)}
+    end
+  end
+
+  def handle_call(
+        {:project_catalog_delete, "default", _version, _expected_revision},
+        _from,
+        state
+      ) do
+    {:reply, {:error, :cannot_delete_default_acl_user}, state}
+  end
+
+  def handle_call(
+        {:project_catalog_delete, username, version, expected_revision},
+        _from,
+        state
+      ) do
+    previous_version = max(Map.get(state.catalog_versions, username, -1), state.catalog_revision)
+
+    cond do
+      version <= previous_version ->
+        {:reply, :ok, state}
+
+      projection_gap?(state, expected_revision) ->
+        :ok = FerricstoreServer.Acl.CatalogProjector.mark_stale(:acl_projection_revision_gap)
+        {:reply, {:error, :acl_catalog_projection_gap}, state}
+
+      true ->
+        :ets.delete(Tables.active_table(), username)
+        :ok = Tables.remove_configured_user_witnesses([username])
+
+        next_revision = next_catalog_projection_revision(state, expected_revision, version)
+
+        state = %{
+          state
+          | auth_epoch: max(state.auth_epoch, version),
+            catalog_versions: Map.put(state.catalog_versions, username, version),
+            catalog_revision: next_revision
+        }
+
+        :ok =
+          broadcast_catalog_projection_invalidation(
+            username,
+            expected_revision,
+            next_revision
+          )
+
+        maybe_mark_projection_ready(expected_revision)
+        {:reply, :ok, maybe_schedule_auto_save(state)}
+    end
+  end
+
+  def handle_call(:catalog_projection_revision, _from, state) do
+    {:reply, state.catalog_revision, state}
+  end
+
+  def handle_call({:replace_catalog_snapshot, users, revision}, _from, state) do
+    case prepare_catalog_snapshot(users) do
+      {:ok, rows, versions, max_version} when max_version <= revision ->
+        if latest_catalog_projection_version(state) > revision do
+          {:reply, {:error, :stale_acl_catalog_snapshot}, state}
         else
-          %{
-            enabled: false,
-            password: nil,
-            commands: MapSet.new(),
-            denied_commands: MapSet.new(),
-            keys: [],
-            channels: []
+          :ok = Tables.replace_acl_snapshot(rows)
+
+          state = %{
+            state
+            | auth_epoch: max(state.auth_epoch, revision),
+              catalog_versions: versions,
+              catalog_revision: revision
           }
+
+          :ok = broadcast_acl_invalidation(:all, revision)
+          :ok = FerricstoreServer.Acl.CatalogProjector.mark_ready()
+          {:reply, :ok, maybe_schedule_auto_save(state)}
         end
 
-      case Rules.apply_rules(base, rules) do
-        {:ok, updated} ->
-          auth_epoch = state.auth_epoch + 1
-          updated = Map.put(updated, :auth_epoch, auth_epoch)
-          :ets.insert(table, {username, updated})
-          :ok = Tables.update_configured_user_witness(username, updated)
-          :ok = broadcast_acl_invalidation(username)
-          state = %{state | auth_epoch: auth_epoch}
-          {:reply, :ok, maybe_schedule_auto_save(state)}
-
-        {:error, _reason} = err ->
-          {:reply, err, state}
-      end
-    end
-  end
-
-  def handle_call({:del_user, "default"}, _from, state) do
-    {:reply, {:error, "ERR The 'default' user cannot be removed"}, state}
-  end
-
-  def handle_call({:del_user, username}, _from, state) do
-    table = Tables.active_table()
-
-    case :ets.lookup(table, username) do
-      [] ->
-        {:reply, {:error, "ERR User '#{username}' does not exist"}, state}
-
-      _ ->
-        :ets.delete(table, username)
-        :ok = Tables.remove_configured_user_witnesses([username])
-        :ok = broadcast_acl_invalidation(username)
-        state = %{state | auth_epoch: state.auth_epoch + 1}
-        {:reply, :ok, maybe_schedule_auto_save(state)}
-    end
-  end
-
-  def handle_call({:del_users, usernames}, _from, state) do
-    case validate_del_users(usernames) do
-      :ok ->
-        table = Tables.active_table()
-
-        usernames = Enum.uniq(usernames)
-        Enum.each(usernames, &:ets.delete(table, &1))
-        :ok = Tables.remove_configured_user_witnesses(usernames)
-        Enum.each(usernames, &broadcast_acl_invalidation/1)
-
-        state = %{state | auth_epoch: state.auth_epoch + length(usernames)}
-        {:reply, :ok, maybe_schedule_auto_save(state)}
+      {:ok, _rows, _versions, _max_version} ->
+        {:reply, {:error, :invalid_acl_catalog_snapshot}, state}
 
       {:error, _reason} = error ->
         {:reply, error, state}
@@ -873,7 +1057,9 @@ defmodule FerricstoreServer.Acl do
     :ok = Tables.clear_configured_user_witness()
     Tables.insert_default_user(auth_epoch)
     :ok = broadcast_acl_invalidation(:all)
-    {:reply, :ok, %{state | auth_epoch: auth_epoch}}
+    :ok = FerricstoreServer.Acl.CatalogProjector.mark_stale(:acl_projection_reset)
+
+    {:reply, :ok, %{state | auth_epoch: auth_epoch, catalog_versions: %{}, catalog_revision: -1}}
   end
 
   # --- ACL SAVE ---
@@ -885,28 +1071,6 @@ defmodule FerricstoreServer.Acl do
 
   def handle_call({:acl_save, data_dir}, _from, state) do
     {:reply, Persistence.save(data_dir, state.auth_epoch), state}
-  end
-
-  # --- ACL LOAD ---
-
-  def handle_call(:acl_load, _from, state) do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    load_acl_file(data_dir, state)
-  end
-
-  def handle_call({:acl_load, data_dir}, _from, state) do
-    load_acl_file(data_dir, state)
-  end
-
-  def handle_call({:acl_load_contents, contents}, _from, state) do
-    case Persistence.load_contents(contents, state.auth_epoch) do
-      {:ok, auth_epoch} ->
-        :ok = broadcast_acl_invalidation(:all)
-        {:reply, :ok, %{state | auth_epoch: auth_epoch}}
-
-      {:error, _reason} = error ->
-        {:reply, error, state}
-    end
   end
 
   @impl true
@@ -921,11 +1085,8 @@ defmodule FerricstoreServer.Acl do
     {:noreply, %{state | save_timer: nil}}
   end
 
-  def handle_info({:cleanup_acl_retired_table, table_name}, state) do
-    if Tables.retired_table?(table_name) do
-      Tables.cleanup_named_table(table_name)
-    end
-
+  def handle_info({:cleanup_acl_retired_table, table}, state) do
+    Tables.cleanup_retired_table(table)
     {:noreply, state}
   end
 
@@ -946,19 +1107,25 @@ defmodule FerricstoreServer.Acl do
     end
   end
 
-  defp load_acl_file(data_dir, state) do
-    case Persistence.load(data_dir, state.auth_epoch) do
-      {:ok, auth_epoch} ->
-        :ok = broadcast_acl_invalidation(:all)
-        {:reply, :ok, %{state | auth_epoch: auth_epoch}}
-
-      {:error, _reason} = error ->
-        {:reply, error, state}
-    end
-  end
-
   defp broadcast_acl_invalidation(username),
     do: FerricstoreServer.Connection.Auth.broadcast_acl_invalidation(username)
+
+  defp broadcast_acl_invalidation(username, revision),
+    do: FerricstoreServer.Connection.Auth.broadcast_acl_invalidation(username, revision)
+
+  defp broadcast_catalog_projection_invalidation(username, :unknown, _revision),
+    do: broadcast_acl_invalidation(username)
+
+  defp broadcast_catalog_projection_invalidation(username, _expected_revision, revision),
+    do: broadcast_acl_invalidation(username, revision)
+
+  defp default_store do
+    {:ok, FerricStore.Instance.get(:default)}
+  rescue
+    _error -> {:error, "ERR ACL catalog unavailable"}
+  catch
+    :exit, _reason -> {:error, "ERR ACL catalog unavailable"}
+  end
 
   defp ensure_active_table do
     table = Tables.active_table()
@@ -971,19 +1138,53 @@ defmodule FerricstoreServer.Acl do
     ArgumentError -> Tables.new_active_table()
   end
 
-  @spec validate_del_users([binary()]) :: :ok | {:error, binary()}
-  defp validate_del_users(usernames) do
-    table = Tables.active_table()
+  defp prepare_catalog_snapshot(users) do
+    result =
+      Enum.reduce_while(users, {:ok, [], %{}, MapSet.new(), 0}, fn
+        {username, user, version}, {:ok, rows, versions, usernames, max_version}
+        when is_binary(username) and is_map(user) and is_integer(version) and version >= 0 ->
+          if MapSet.member?(usernames, username) do
+            {:halt, {:error, :invalid_acl_catalog_snapshot}}
+          else
+            user = Map.put(user, :auth_epoch, version)
 
-    Enum.reduce_while(usernames, :ok, fn
-      "default", :ok ->
-        {:halt, {:error, "ERR The 'default' user cannot be removed"}}
+            {:cont,
+             {:ok, [{username, user} | rows], Map.put(versions, username, version),
+              MapSet.put(usernames, username), max(max_version, version)}}
+          end
 
-      username, :ok ->
-        case :ets.lookup(table, username) do
-          [] -> {:halt, {:error, "ERR User '#{username}' does not exist"}}
-          _ -> {:cont, :ok}
+        _invalid, _acc ->
+          {:halt, {:error, :invalid_acl_catalog_snapshot}}
+      end)
+
+    case result do
+      {:ok, rows, versions, usernames, max_version} ->
+        if MapSet.member?(usernames, "default") do
+          {:ok, Enum.reverse(rows), versions, max_version}
+        else
+          {:error, :missing_default_acl_user}
         end
-    end)
+
+      {:error, _reason} = error ->
+        error
+    end
   end
+
+  defp latest_catalog_projection_version(state) do
+    state.catalog_versions
+    |> Map.values()
+    |> Enum.max(fn -> state.catalog_revision end)
+    |> max(state.catalog_revision)
+  end
+
+  defp projection_gap?(_state, :unknown), do: false
+  defp projection_gap?(state, expected_revision), do: state.catalog_revision != expected_revision
+
+  defp next_catalog_projection_revision(state, :unknown, _version), do: state.catalog_revision
+  defp next_catalog_projection_revision(_state, _expected_revision, version), do: version
+
+  defp maybe_mark_projection_ready(:unknown), do: :ok
+
+  defp maybe_mark_projection_ready(_expected_revision),
+    do: FerricstoreServer.Acl.CatalogProjector.mark_ready()
 end

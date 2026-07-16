@@ -101,6 +101,44 @@
     }
 
     #[test]
+    fn drain_to_kernel_requeues_only_the_unwritten_suffix_after_partial_write() {
+        struct PartialThenFail {
+            writes: Vec<u8>,
+            calls: usize,
+        }
+
+        impl Write for PartialThenFail {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    self.writes.extend_from_slice(&buf[..2]);
+                    Ok(2)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::Other, "forced write failure"))
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Mutex::new(AlignedBuffer::new());
+        buffer.lock().unwrap().extend(b"entry");
+        let file_size = AtomicU64::new(WAL_HEADER_SIZE);
+        let mut writer = PartialThenFail {
+            writes: Vec::new(),
+            calls: 0,
+        };
+
+        assert!(drain_to_kernel_writer(&mut writer, &buffer, &file_size).is_err());
+
+        assert_eq!(writer.writes, b"en");
+        assert_eq!(file_size.load(Ordering::Acquire), WAL_HEADER_SIZE + 2);
+        assert_eq!(buffer.lock().unwrap().take().as_logical_slice(), b"try");
+    }
+
+    #[test]
     fn drain_to_kernel_restores_failed_bytes_before_concurrent_writes() {
         struct AppendThenFail {
             buffer: Arc<Mutex<AlignedBuffer>>,
@@ -232,6 +270,124 @@
         assert_eq!(sync_count.load(Ordering::Acquire), 1);
     }
 
+    #[test]
+    fn close_during_commit_delay_exits_the_worker_after_acknowledging_close() {
+        let (config, tx) = test_config(0);
+        let (flush_done_tx, _flush_done_rx) = crossbeam_channel::bounded(1);
+        let (close_result_tx, close_result_rx) = crossbeam_channel::bounded(1);
+        let handle = std::thread::spawn(move || thread_loop(config));
+
+        tx.send(ThreadMsg::Flush(test_flush(
+            flush_done_tx,
+            Duration::from_millis(250),
+        )))
+        .unwrap();
+        tx.send(ThreadMsg::Close(Some(close_result_tx))).unwrap();
+
+        assert_eq!(
+            close_result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Ok(())
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let exited_after_close = handle.is_finished();
+
+        drop(tx);
+        handle.join().unwrap();
+        assert!(
+            exited_after_close,
+            "worker acknowledged Close during commit delay but kept receiving messages"
+        );
+    }
+
+    #[test]
+    fn commit_deadline_rejects_an_unrepresentable_delay() {
+        let error = commit_deadline(Instant::now(), Duration::MAX).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn worker_panic_notifies_active_and_queued_flush_callers_and_close() {
+        let (config, tx) = test_config(0);
+        let (active_tx, active_rx) = crossbeam_channel::bounded(1);
+        let (queued_tx, queued_rx) = crossbeam_channel::bounded(1);
+        let (close_tx, close_rx) = crossbeam_channel::bounded(1);
+        let handle = std::thread::spawn(move || thread_loop(config));
+
+        tx.send(ThreadMsg::Flush(FlushCaller {
+            target: FlushTarget::TestResult(active_tx),
+            commit_delay: Duration::from_secs(1),
+        }))
+        .unwrap();
+        tx.send(ThreadMsg::Panic).unwrap();
+        tx.send(ThreadMsg::Flush(FlushCaller {
+            target: FlushTarget::TestResult(queued_tx),
+            commit_delay: Duration::ZERO,
+        }))
+        .unwrap();
+        tx.send(ThreadMsg::Close(Some(close_tx))).unwrap();
+
+        for result in [
+            active_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            queued_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ] {
+            let reason = result.unwrap_err();
+            assert!(reason.contains("WAL thread panicked"), "{reason}");
+        }
+
+        let close_reason = close_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(close_reason.contains("WAL thread panicked"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn panic_cleanup_waits_for_sync_admission_before_draining_the_queue() {
+        let admission = Arc::new(Mutex::new(()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        let guard = admission.lock().unwrap();
+
+        let panic_admission = Arc::clone(&admission);
+        let panic_alive = Arc::clone(&alive);
+        let cleanup = std::thread::spawn(move || {
+            let error = io::Error::new(io::ErrorKind::Other, "WAL thread panicked: forced");
+            let mut active_callers = Vec::new();
+
+            notify_thread_panic(
+                &panic_alive,
+                &panic_admission,
+                &mut active_callers,
+                &rx,
+                &error,
+            );
+        });
+
+        tx.send(ThreadMsg::Flush(FlushCaller {
+            target: FlushTarget::TestResult(result_tx),
+            commit_delay: Duration::ZERO,
+        }))
+        .unwrap();
+
+        drop(guard);
+        cleanup.join().unwrap();
+
+        assert!(!alive.load(Ordering::Acquire));
+        let reason = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(reason.contains("WAL thread panicked"));
+    }
+
     /// Helper: create a thread config for testing (no BEAM notifications).
     #[allow(dead_code)]
     fn test_config(commit_delay_us: u64) -> (ThreadConfig, crossbeam_channel::Sender<ThreadMsg>) {
@@ -246,6 +402,7 @@
             buffer: buffer.clone(),
             rx,
             alive: alive.clone(),
+            sync_admission: Arc::new(Mutex::new(())),
             file_size: file_size.clone(),
             commit_delay: Duration::from_micros(commit_delay_us),
             _use_o_direct: false,
@@ -272,9 +429,86 @@
         let path = dir.path().join("test.wal");
         let (file, _) = open_wal_file(path.to_str().unwrap(), 4096).unwrap();
         drop(file);
-        // On Linux with fallocate, file size would be 4096.
-        // On macOS, fallocate is skipped, file size is 0.
-        assert!(path.exists());
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn raw_append_open_truncates_stale_suffix_at_logical_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment.wal");
+        std::fs::write(&path, b"valid-stale-suffix").unwrap();
+
+        let (mut file, _) = open_raw_append_file(path.to_str().unwrap(), 5).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 5);
+
+        file.write_all(b"-new").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read(path).unwrap(), b"valid-new");
+    }
+
+    #[test]
+    fn raw_append_recovery_syncs_a_stale_suffix_truncation_before_seeking() {
+        #[derive(Default)]
+        struct TrackingRawFile {
+            len: u64,
+            position: u64,
+            operations: Vec<&'static str>,
+        }
+
+        impl Seek for TrackingRawFile {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                let SeekFrom::Start(position) = position else {
+                    panic!("raw append preparation must seek from start");
+                };
+                self.operations.push("seek");
+                self.position = position;
+                Ok(position)
+            }
+        }
+
+        impl SyncData for TrackingRawFile {
+            fn sync_data(&mut self) -> io::Result<()> {
+                self.operations.push("sync");
+                Ok(())
+            }
+        }
+
+        impl RawAppendFile for TrackingRawFile {
+            fn file_len(&self) -> io::Result<u64> {
+                Ok(self.len)
+            }
+
+            fn set_logical_len(&mut self, len: u64) -> io::Result<()> {
+                self.operations.push("truncate");
+                self.len = len;
+                Ok(())
+            }
+        }
+
+        let mut file = TrackingRawFile {
+            len: 19,
+            ..TrackingRawFile::default()
+        };
+
+        prepare_raw_append_file(&mut file, 5).unwrap();
+
+        assert_eq!(file.operations, ["truncate", "sync", "seek"]);
+        assert_eq!(file.len, 5);
+        assert_eq!(file.position, 5);
+    }
+
+    #[test]
+    fn raw_append_open_rejects_a_logical_end_beyond_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short-segment.wal");
+        std::fs::write(&path, b"valid").unwrap();
+
+        let error = open_raw_append_file(path.to_str().unwrap(), 6).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(std::fs::read(path).unwrap(), b"valid");
     }
 
     #[cfg(target_os = "linux")]
@@ -288,6 +522,79 @@
 
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"existing bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_open_helpers_reject_final_component_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.wal");
+        let link = dir.path().join("linked.wal");
+        std::fs::write(&target, b"protected").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            open_raw_append_file(link.to_str().unwrap(), 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        assert_eq!(
+            open_wal_file(link.to_str().unwrap(), 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"protected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_open_helpers_reject_a_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("wal.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        assert!(
+            open_rw_create_nofollow(fifo.to_str().unwrap()).is_err(),
+            "WAL read-write opener accepted a FIFO"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_path = fifo.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(open_read_nofollow(worker_path.to_str().unwrap()).map(drop))
+                .unwrap();
+        });
+
+        let result = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let writer = unsafe {
+                    libc::open(
+                        fifo_c.as_ptr(),
+                        libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    )
+                };
+                assert!(writer >= 0);
+                let result = rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("blocked WAL read opener did not recover");
+                unsafe { libc::close(writer) };
+                worker.join().unwrap();
+                panic!("WAL read opener blocked on a FIFO and later returned {result:?}");
+            }
+            Err(error) => panic!("WAL read opener channel failed: {error}"),
+        };
+
+        worker.join().unwrap();
+        assert!(result.is_err(), "WAL read opener accepted a FIFO");
     }
 
     #[test]
@@ -348,6 +655,28 @@
         let mut file = std::fs::File::open(&path).unwrap();
         let data = pread_from_file(&mut file, 0, 5).unwrap();
         assert_eq!(&data, b"hello");
+    }
+
+    #[test]
+    fn pread_range_rejects_oversized_and_overflowing_requests_before_allocation() {
+        assert_eq!(validated_pread_len(128, 64, 64).unwrap(), 64);
+
+        let oversized = validated_pread_len(
+            u64::MAX,
+            0,
+            MAX_PREAD_BYTES.saturating_add(1),
+        )
+        .unwrap_err();
+        assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
+
+        let overflow = validated_pread_len(u64::MAX, u64::MAX, 1).unwrap_err();
+        assert_eq!(overflow.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn pread_range_rejects_reads_past_the_current_file_length_before_allocation() {
+        let err = validated_pread_len(8, 4, 5).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -520,6 +849,7 @@
                     buffer: buf_clone,
                     rx,
                     alive: alive_clone,
+                    sync_admission: Arc::new(Mutex::new(())),
                     file_size: fs_clone,
                     commit_delay: Duration::ZERO,
                     _use_o_direct: false,
@@ -581,6 +911,7 @@
                     buffer: buf_clone,
                     rx,
                     alive: alive_clone,
+                    sync_admission: Arc::new(Mutex::new(())),
                     file_size: fs_clone,
                     commit_delay: Duration::ZERO,
                     _use_o_direct: false,
@@ -639,6 +970,7 @@
                     buffer: buf_clone,
                     rx,
                     alive: alive_clone,
+                    sync_admission: Arc::new(Mutex::new(())),
                     file_size: fs_clone,
                     commit_delay: Duration::from_millis(50), // 50ms delay
                     _use_o_direct: false,

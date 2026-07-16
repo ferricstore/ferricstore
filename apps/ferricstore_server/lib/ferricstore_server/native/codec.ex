@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Native.Codec do
   alias FerricstoreServer.Native.Connection.FrameBuffer
 
   @version 1
+  @response_direction 0x80
 
   @flag_trace 0x01
   @flag_custom_payload 0x02
@@ -39,6 +40,7 @@ defmodule FerricstoreServer.Native.Codec do
   @compact_flow_claim_jobs 0x80
   @compact_ok_list 0x81
   @compact_kv_get 0x82
+  @compact_kv_mget 0x83
   @compact_flow_record 0x84
   @compact_flow_record_list 0x85
   @compact_binary_list_list 0x86
@@ -60,6 +62,30 @@ defmodule FerricstoreServer.Native.Codec do
   @compact_flow_transition_many_ok_request 0x9C
   @compact_flow_value_mget_request 0x9D
   @compact_flow_list_request 0x9F
+
+  @compact_flow_claim_jobs_opcodes [0x0203]
+  @compact_flow_record_opcodes [0x0202]
+  @compact_flow_record_list_opcodes [0x020E, 0x0217, 0x0218, 0x0219, 0x021A, 0x021B, 0x021D]
+  @compact_kv_get_opcodes [0x0101]
+  @compact_kv_mget_opcodes [0x0104, 0x020C]
+  @compact_scalar_ok_list_opcodes [0x0102, 0x0105]
+  @compact_list_ok_list_opcodes [0x020F, 0x0210, 0x0212, 0x0213, 0x0214]
+  @compact_ok_list_opcodes @compact_scalar_ok_list_opcodes ++ @compact_list_ok_list_opcodes
+  @compact_pipeline_opcodes [0x000E]
+  @compact_always_response_opcodes [0x000E, 0x0101, 0x0102, 0x0104, 0x0105]
+
+  @doc false
+  def compact_response_opcodes do
+    %{
+      "flow_claim_jobs_v1" => @compact_flow_claim_jobs_opcodes,
+      "flow_record_list_v1" => @compact_flow_record_list_opcodes,
+      "flow_record_v1" => @compact_flow_record_opcodes,
+      "kv_get_v1" => @compact_kv_get_opcodes,
+      "kv_mget_v1" => @compact_kv_mget_opcodes,
+      "ok_list_v1" => @compact_ok_list_opcodes,
+      "pipeline_v1" => @compact_pipeline_opcodes
+    }
+  end
 
   @compact_flow_record_field_ids %{
     "id" => 1,
@@ -226,6 +252,17 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
+  @doc false
+  @spec peek_command_name(non_neg_integer(), binary()) ::
+          {:ok, binary()} | :not_found | {:error, binary()}
+  def peek_command_name(flags, body) when is_integer(flags) and is_binary(body) do
+    if Bitwise.band(flags, @flag_custom_payload) != 0 do
+      :not_found
+    else
+      peek_typed_command_name(body)
+    end
+  end
+
   @spec encode_response(
           non_neg_integer(),
           non_neg_integer(),
@@ -255,6 +292,7 @@ defmodule FerricstoreServer.Native.Codec do
           keyword()
         ) :: [binary()]
   def encode_response_frames(opcode, lane_id, request_id, status, value, opts \\ []) do
+    {status, value} = enforce_response_byte_limit(status, value, opts)
     extra_flags = Keyword.get(opts, :flags, 0)
     status_code = Map.fetch!(@status_codes, status)
     payload = encode_value(response_value(status, value))
@@ -280,28 +318,157 @@ defmodule FerricstoreServer.Native.Codec do
           keyword()
         ) :: [binary()]
   def encode_command_response_frames(opcode, lane_id, request_id, status, value, opts \\ []) do
-    if Keyword.get(opts, :compact_flow_responses, false) or compact_kv_opcode?(opcode) do
-      case compact_response_frame(opcode, lane_id, request_id, status, value, opts) do
-        frame when is_binary(frame) ->
-          [frame]
+    {status, value} = enforce_response_byte_limit(status, value, opts)
 
-        nil ->
-          case compact_response_payload(opcode, status, value) do
+    case streamed_compact_mget_frames(opcode, lane_id, request_id, status, value, opts) do
+      {:ok, frames} ->
+        frames
+
+      :fallback ->
+        if Keyword.get(opts, :compact_flow_responses, false) or compact_kv_opcode?(opcode) do
+          case compact_response_frame(opcode, lane_id, request_id, status, value, opts) do
+            frame when is_binary(frame) ->
+              [frame]
+
             nil ->
-              encode_response_frames(opcode, lane_id, request_id, status, value, opts)
+              case compact_response_payload(opcode, status, value) do
+                nil ->
+                  encode_response_frames(opcode, lane_id, request_id, status, value, opts)
 
-            payload ->
-              encode_compact_response_frames(opcode, lane_id, request_id, status, payload, opts)
+                payload ->
+                  encode_compact_response_frames(
+                    opcode,
+                    lane_id,
+                    request_id,
+                    status,
+                    payload,
+                    opts
+                  )
+              end
           end
-      end
-    else
-      encode_response_frames(opcode, lane_id, request_id, status, value, opts)
+        else
+          encode_response_frames(opcode, lane_id, request_id, status, value, opts)
+        end
     end
+  end
+
+  defp streamed_compact_mget_frames(opcode, lane_id, request_id, :ok, values, opts)
+       when opcode in @compact_kv_mget_opcodes and is_list(values) do
+    chunk_bytes = Keyword.get(opts, :chunk_bytes, 0)
+
+    if Keyword.get(opts, :compression, :none) == :none and is_integer(chunk_bytes) and
+         chunk_bytes > 0 and length(values) <= 0xFFFF_FFFF and
+         Enum.all?(values, &(is_binary(&1) or is_nil(&1))) do
+      segments = [
+        <<0::unsigned-16, @compact_kv_mget, length(values)::unsigned-32>> | mget_segments(values)
+      ]
+
+      chunks = chunk_binary_segments(segments, chunk_bytes)
+      flags = Bitwise.bor(Keyword.get(opts, :flags, 0), @flag_custom_payload)
+
+      {:ok, encode_iodata_response_chunks(opcode, lane_id, request_id, chunks, flags)}
+    else
+      :fallback
+    end
+  end
+
+  defp streamed_compact_mget_frames(
+         _opcode,
+         _lane_id,
+         _request_id,
+         _status,
+         _value,
+         _opts
+       ),
+       do: :fallback
+
+  defp mget_segments(values) do
+    Enum.flat_map(values, fn
+      nil -> [<<0>>]
+      value -> [<<1, byte_size(value)::unsigned-32>>, value]
+    end)
+  end
+
+  defp chunk_binary_segments(segments, chunk_bytes) do
+    segments
+    |> do_chunk_binary_segments(chunk_bytes, [], 0, [])
+    |> Enum.reverse()
+  end
+
+  defp do_chunk_binary_segments([], _chunk_bytes, [], 0, chunks), do: chunks
+
+  defp do_chunk_binary_segments([], _chunk_bytes, current, _current_bytes, chunks),
+    do: [Enum.reverse(current) | chunks]
+
+  defp do_chunk_binary_segments(["" | rest], chunk_bytes, current, current_bytes, chunks),
+    do: do_chunk_binary_segments(rest, chunk_bytes, current, current_bytes, chunks)
+
+  defp do_chunk_binary_segments(
+         [segment | rest],
+         chunk_bytes,
+         current,
+         current_bytes,
+         chunks
+       ) do
+    remaining = chunk_bytes - current_bytes
+
+    cond do
+      remaining == 0 ->
+        do_chunk_binary_segments(
+          [segment | rest],
+          chunk_bytes,
+          [],
+          0,
+          [Enum.reverse(current) | chunks]
+        )
+
+      byte_size(segment) <= remaining ->
+        do_chunk_binary_segments(
+          rest,
+          chunk_bytes,
+          [segment | current],
+          current_bytes + byte_size(segment),
+          chunks
+        )
+
+      true ->
+        <<prefix::binary-size(remaining), suffix::binary>> = segment
+
+        do_chunk_binary_segments(
+          [suffix | rest],
+          chunk_bytes,
+          [],
+          0,
+          [Enum.reverse([prefix | current]) | chunks]
+        )
+    end
+  end
+
+  defp encode_iodata_response_chunks(opcode, lane_id, request_id, chunks, flags) do
+    last_index = length(chunks) - 1
+
+    chunks
+    |> Enum.with_index()
+    |> Enum.map(fn {chunk, index} ->
+      frame_flags =
+        if index == last_index,
+          do: flags,
+          else: Bitwise.bor(flags, @flag_more_chunks)
+
+      body_bytes = IO.iodata_length(chunk)
+      FrameBuffer.validate_frame_body_bytes!(body_bytes)
+
+      header =
+        <<"FSNP", Bitwise.bor(@version, @response_direction), frame_flags, lane_id::unsigned-32,
+          opcode::unsigned-16, request_id::unsigned-64, body_bytes::unsigned-32>>
+
+      [header, chunk]
+    end)
   end
 
   @spec encode_compact_flow_claim_jobs(term()) :: binary() | nil
   def encode_compact_flow_claim_jobs(jobs) when is_list(jobs) do
-    case compact_claim_job_items(jobs, []) do
+    case compact_claim_job_items(jobs, [], nil) do
       {:ok, items} ->
         [<<@compact_flow_claim_jobs, length(items)::unsigned-32>>, items]
         |> IO.iodata_to_binary()
@@ -605,83 +772,107 @@ defmodule FerricstoreServer.Native.Codec do
     chunks(rest, chunk_bytes, [chunk | acc])
   end
 
-  defp compact_claim_job_items([], acc), do: {:ok, Enum.reverse(acc)}
+  defp compact_claim_job_items([], acc, _mode), do: {:ok, Enum.reverse(acc)}
 
-  defp compact_claim_job_items([job | rest], acc) do
-    case compact_claim_job_item(job) do
-      {:ok, item} -> compact_claim_job_items(rest, [item | acc])
-      :error -> :error
+  defp compact_claim_job_items([job | rest], acc, expected_mode) do
+    with {:ok, item} <- compact_claim_job_item(job),
+         mode when not is_nil(mode) <- compact_claim_job_mode(job),
+         true <- is_nil(expected_mode) or mode == expected_mode do
+      compact_claim_job_items(rest, [item | acc], mode)
+    else
+      _ -> :error
     end
   end
 
-  defp compact_response_payload(0x0203, :ok, value),
-    do: encode_compact_flow_claim_jobs(value)
+  defp compact_claim_job_mode([_id, _partition, _lease, _fencing]), do: :base
+
+  defp compact_claim_job_mode([_id, _partition, _lease, _fencing, attrs])
+       when is_map(attrs),
+       do: :attrs
+
+  defp compact_claim_job_mode([_id, _partition, _lease, _fencing, run_state])
+       when is_binary(run_state) or is_nil(run_state),
+       do: :state
+
+  defp compact_claim_job_mode([_id, _partition, _lease, _fencing, run_state, attrs])
+       when (is_binary(run_state) or is_nil(run_state)) and is_map(attrs),
+       do: :state_attrs
+
+  defp compact_claim_job_mode({_id, _partition, _lease, _fencing}), do: :base
+  defp compact_claim_job_mode(%{"id" => _id}), do: :state_attrs
+  defp compact_claim_job_mode(%{id: _id}), do: :state_attrs
+  defp compact_claim_job_mode(_job), do: nil
 
   defp compact_response_payload(opcode, :ok, value)
-       when opcode in [0x020F, 0x0210, 0x0212, 0x0213, 0x0214],
+       when opcode in @compact_flow_claim_jobs_opcodes,
+       do: encode_compact_flow_claim_jobs(value)
+
+  defp compact_response_payload(opcode, :ok, value)
+       when opcode in @compact_list_ok_list_opcodes,
        do: encode_compact_ok_list(value)
 
-  defp compact_response_payload(0x0202, :ok, value), do: encode_compact_flow_record(value)
+  defp compact_response_payload(opcode, :ok, value)
+       when opcode in @compact_flow_record_opcodes,
+       do: encode_compact_flow_record(value)
 
   defp compact_response_payload(opcode, :ok, value)
-       when opcode in [0x020E, 0x0217, 0x0218, 0x0219, 0x021A, 0x021B, 0x021D],
+       when opcode in @compact_flow_record_list_opcodes,
        do: encode_compact_flow_record_list(value)
 
-  defp compact_response_payload(0x0101, :ok, value), do: encode_compact_kv_get(value)
+  defp compact_response_payload(opcode, :ok, value) when opcode in @compact_kv_get_opcodes,
+    do: encode_compact_kv_get(value)
 
   defp compact_response_payload(opcode, :ok, value)
-       when opcode in [0x0102, 0x0105],
+       when opcode in @compact_scalar_ok_list_opcodes,
        do: encode_compact_ok_list([value])
 
-  defp compact_response_payload(0x0104, :ok, value), do: encode_compact_kv_mget(value)
+  defp compact_response_payload(opcode, :ok, value) when opcode in @compact_kv_mget_opcodes,
+    do: encode_compact_kv_mget(value)
 
-  defp compact_response_payload(0x020C, :ok, value), do: encode_compact_kv_mget(value)
-
-  defp compact_response_payload(0x000E, :ok, value) when is_binary(value), do: value
+  defp compact_response_payload(opcode, :ok, value)
+       when opcode in @compact_pipeline_opcodes and is_binary(value),
+       do: value
 
   defp compact_response_payload(_opcode, _status, _value), do: nil
 
-  defp compact_response_frame(0x0203, lane_id, request_id, :ok, value, opts) do
+  defp compact_response_frame(opcode, lane_id, request_id, :ok, value, opts)
+       when opcode in @compact_flow_claim_jobs_opcodes do
     if direct_compact_frame?(opts) do
-      NIF.encode_compact_claim_jobs_response_frame(0x0203, lane_id, request_id, value)
+      NIF.encode_compact_claim_jobs_response_frame(opcode, lane_id, request_id, value)
     end
   end
 
   defp compact_response_frame(opcode, lane_id, request_id, :ok, value, opts)
-       when opcode in [0x020F, 0x0210, 0x0212, 0x0213, 0x0214] do
+       when opcode in @compact_list_ok_list_opcodes do
     if direct_compact_frame?(opts) do
       NIF.encode_compact_ok_list_response_frame(opcode, lane_id, request_id, value)
     end
   end
 
-  defp compact_response_frame(0x0101, lane_id, request_id, :ok, value, opts) do
+  defp compact_response_frame(opcode, lane_id, request_id, :ok, value, opts)
+       when opcode in @compact_kv_get_opcodes do
     if direct_compact_frame?(opts) do
-      NIF.encode_compact_kv_get_response_frame(0x0101, lane_id, request_id, value)
+      NIF.encode_compact_kv_get_response_frame(opcode, lane_id, request_id, value)
     end
   end
 
   defp compact_response_frame(opcode, lane_id, request_id, :ok, value, opts)
-       when opcode in [0x0102, 0x0105] do
+       when opcode in @compact_scalar_ok_list_opcodes do
     if direct_compact_frame?(opts) do
       NIF.encode_compact_ok_list_response_frame(opcode, lane_id, request_id, [value])
     end
   end
 
-  defp compact_response_frame(0x0104, lane_id, request_id, :ok, value, opts) do
+  defp compact_response_frame(opcode, lane_id, request_id, :ok, value, opts)
+       when opcode in @compact_kv_mget_opcodes do
     if direct_compact_frame?(opts) do
-      NIF.encode_compact_kv_mget_response_frame(0x0104, lane_id, request_id, value)
-    end
-  end
-
-  defp compact_response_frame(0x020C, lane_id, request_id, :ok, value, opts) do
-    if direct_compact_frame?(opts) do
-      NIF.encode_compact_kv_mget_response_frame(0x020C, lane_id, request_id, value)
+      NIF.encode_compact_kv_mget_response_frame(opcode, lane_id, request_id, value)
     end
   end
 
   defp compact_response_frame(_opcode, _lane_id, _request_id, _status, _value, _opts), do: nil
 
-  defp compact_kv_opcode?(opcode), do: opcode in [0x000E, 0x0101, 0x0102, 0x0104, 0x0105]
+  defp compact_kv_opcode?(opcode), do: opcode in @compact_always_response_opcodes
 
   defp direct_compact_frame?(opts) do
     chunk_bytes = Keyword.get(opts, :chunk_bytes, 0)
@@ -712,6 +903,15 @@ defmodule FerricstoreServer.Native.Codec do
               is_map(attrs) do
     case compact_claim_job_item([id, partition_key, lease_token, fencing_token]) do
       {:ok, item} -> {:ok, [item, encode_value(attrs)]}
+      :error -> :error
+    end
+  end
+
+  defp compact_claim_job_item([id, partition_key, lease_token, fencing_token, run_state])
+       when is_binary(id) and is_binary(lease_token) and is_integer(fencing_token) and
+              (is_binary(run_state) or is_nil(run_state)) do
+    case compact_claim_job_item([id, partition_key, lease_token, fencing_token]) do
+      {:ok, item} -> {:ok, [item, compact_optional_binary(run_state)]}
       :error -> :error
     end
   end
@@ -960,7 +1160,8 @@ defmodule FerricstoreServer.Native.Codec do
     values_only? = Bitwise.band(mode, 0x80) != 0
     mode = Bitwise.band(mode, 0x7F)
 
-    with {:ok, items, ""} <- take_compact_pipeline_items(mode, count, rest, []) do
+    with :ok <- validate_compact_collection_count(count),
+         {:ok, items, ""} <- take_compact_pipeline_items(mode, count, rest, []) do
       payload =
         %{
           "atomicity" => "none",
@@ -972,6 +1173,7 @@ defmodule FerricstoreServer.Native.Codec do
       payload = if values_only?, do: Map.put(payload, "compact_values", true), else: payload
       {:ok, payload}
     else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact PIPELINE payload is invalid"}
     end
   end
@@ -980,8 +1182,11 @@ defmodule FerricstoreServer.Native.Codec do
          0x0105,
          <<@compact_pipeline_request, 1, count::unsigned-32, rest::binary>>
        ) do
-    case take_compact_pipeline_items(1, count, rest, []) do
-      {:ok, pairs, ""} -> {:ok, %{"pairs" => pairs, __wire_compact_validated__: true}}
+    with :ok <- validate_compact_collection_count(count),
+         {:ok, pairs, ""} <- take_compact_pipeline_items(1, count, rest, []) do
+      {:ok, %{"pairs" => pairs, __wire_compact_validated__: true}}
+    else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact MSET payload is invalid"}
     end
   end
@@ -991,8 +1196,11 @@ defmodule FerricstoreServer.Native.Codec do
          <<@compact_pipeline_request, mode, count::unsigned-32, rest::binary>>
        )
        when opcode == 0x0104 and mode == 2 do
-    case take_compact_pipeline_items(mode, count, rest, []) do
-      {:ok, keys, ""} -> {:ok, %{"keys" => keys, __wire_compact_validated__: true}}
+    with :ok <- validate_compact_collection_count(count),
+         {:ok, keys, ""} <- take_compact_pipeline_items(mode, count, rest, []) do
+      {:ok, %{"keys" => keys, __wire_compact_validated__: true}}
+    else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact MGET payload is invalid"}
     end
   end
@@ -1002,6 +1210,7 @@ defmodule FerricstoreServer.Native.Codec do
          {:ok, state, rest} <- take_compact_binary(rest),
          <<now_ms::signed-64, run_at_ms::signed-64, independent::unsigned-8,
            return_mode::unsigned-8, count::unsigned-32, rest::binary>> <- rest,
+         :ok <- validate_compact_collection_count(count),
          {:ok, items, ""} <- take_compact_create_items(count, rest, []) do
       payload =
         %{
@@ -1013,6 +1222,7 @@ defmodule FerricstoreServer.Native.Codec do
 
       {:ok, payload}
     else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact FLOW.CREATE_MANY payload is invalid"}
     end
   end
@@ -1026,6 +1236,7 @@ defmodule FerricstoreServer.Native.Codec do
          {:ok, partition_key, rest} <- take_compact_optional_binary(rest),
          <<now_ms::signed-64, run_at_ms::signed-64, independent::unsigned-8,
            return_mode::unsigned-8, count::unsigned-32, rest::binary>> <- rest,
+         :ok <- validate_compact_collection_count(count),
          {:ok, items, ""} <- take_compact_create_items(count, rest, []) do
       payload =
         %{
@@ -1038,6 +1249,7 @@ defmodule FerricstoreServer.Native.Codec do
 
       {:ok, payload}
     else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact FLOW.CREATE_MANY payload is invalid"}
     end
   end
@@ -1050,6 +1262,7 @@ defmodule FerricstoreServer.Native.Codec do
          {:ok, state, rest} <- take_compact_binary(rest),
          <<now_ms::signed-64, run_at_ms::signed-64, independent::unsigned-8,
            return_mode::unsigned-8, count::unsigned-32, rest::binary>> <- rest,
+         :ok <- validate_compact_collection_count(count),
          {:ok, items, ""} <- take_compact_create_mixed_items(count, rest, []) do
       payload =
         %{
@@ -1061,6 +1274,7 @@ defmodule FerricstoreServer.Native.Codec do
 
       {:ok, payload}
     else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact FLOW.CREATE_MANY payload is invalid"}
     end
   end
@@ -1099,13 +1313,15 @@ defmodule FerricstoreServer.Native.Codec do
          <<@compact_flow_value_mget_request, max_bytes::signed-64, count::unsigned-32,
            rest::binary>>
        ) do
-    with {:ok, refs, ""} <- take_compact_binary_items(count, rest, []) do
+    with :ok <- validate_compact_collection_count(count),
+         {:ok, refs, ""} <- take_compact_binary_items(count, rest, []) do
       payload =
         %{"refs" => refs}
         |> put_compact_i64_optional("max_bytes", max_bytes)
 
       {:ok, payload}
     else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact FLOW.VALUE.MGET payload is invalid"}
     end
   end
@@ -1213,14 +1429,13 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
-  defp take_compact_pipeline_items(28, count, rest, acc) when count > 0 do
-    with {:ok, key, rest} <- take_compact_binary(rest),
-         <<field_count::unsigned-32, rest::binary>> <- rest,
-         true <- field_count > 0,
-         {:ok, fields, rest} <- take_compact_binary_list(field_count, rest, []) do
-      take_compact_pipeline_items(28, count - 1, rest, [{key, fields} | acc])
+  defp take_compact_pipeline_items(28, count, rest, []) when count >= 0 do
+    max_items = native_value_limits().max_items
+
+    if count <= max_items do
+      take_compact_hmget_pipeline_items(count, rest, [], max_items - count)
     else
-      _ -> :error
+      {:error, "ERR native compact collection exceeds max items"}
     end
   end
 
@@ -1397,6 +1612,23 @@ defmodule FerricstoreServer.Native.Codec do
   end
 
   defp take_compact_pipeline_items(_mode, _count, _rest, _acc), do: :error
+
+  defp take_compact_hmget_pipeline_items(0, rest, acc, _remaining) do
+    {:ok, Enum.reverse(acc), rest}
+  end
+
+  defp take_compact_hmget_pipeline_items(count, rest, acc, remaining) when count > 0 do
+    with {:ok, key, rest} <- take_compact_binary(rest),
+         <<field_count::unsigned-32, rest::binary>> <- rest,
+         true <- field_count > 0,
+         {:ok, remaining} <- reserve_compact_collection_items(remaining, field_count),
+         {:ok, fields, rest} <- take_compact_binary_list(field_count, rest, []) do
+      take_compact_hmget_pipeline_items(count - 1, rest, [{key, fields} | acc], remaining)
+    else
+      {:error, _reason} = error -> error
+      _ -> :error
+    end
+  end
 
   defp take_compact_binary_list(0, rest, acc), do: {:ok, Enum.reverse(acc), rest}
 
@@ -1615,6 +1847,7 @@ defmodule FerricstoreServer.Native.Codec do
   defp decode_compact_flow_complete_many_request(rest, return_mode) do
     with {:ok, partition_key, rest} <- take_compact_optional_binary(rest),
          <<now_ms::signed-64, independent::unsigned-8, count::unsigned-32, rest::binary>> <- rest,
+         :ok <- validate_compact_collection_count(count),
          {:ok, items, ""} <- take_compact_claimed_items(count, rest, []) do
       payload =
         %{
@@ -1626,6 +1859,7 @@ defmodule FerricstoreServer.Native.Codec do
 
       {:ok, payload}
     else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact FLOW.COMPLETE_MANY payload is invalid"}
     end
   end
@@ -1634,6 +1868,7 @@ defmodule FerricstoreServer.Native.Codec do
     with {:ok, partition_key, rest} <- take_compact_optional_binary(rest),
          <<now_ms::signed-64, run_at_ms::signed-64, independent::unsigned-8, count::unsigned-32,
            rest::binary>> <- rest,
+         :ok <- validate_compact_collection_count(count),
          {:ok, items, ""} <- take_compact_claimed_items(count, rest, []) do
       payload =
         %{
@@ -1646,6 +1881,7 @@ defmodule FerricstoreServer.Native.Codec do
 
       {:ok, payload}
     else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact FLOW.RETRY_MANY payload is invalid"}
     end
   end
@@ -1653,6 +1889,7 @@ defmodule FerricstoreServer.Native.Codec do
   defp decode_compact_flow_cancel_many_request(rest, return_mode) do
     with {:ok, partition_key, rest} <- take_compact_optional_binary(rest),
          <<now_ms::signed-64, independent::unsigned-8, count::unsigned-32, rest::binary>> <- rest,
+         :ok <- validate_compact_collection_count(count),
          {:ok, items, ""} <- take_compact_fenced_items(count, rest, []) do
       payload =
         %{
@@ -1664,6 +1901,7 @@ defmodule FerricstoreServer.Native.Codec do
 
       {:ok, payload}
     else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact FLOW.CANCEL_MANY payload is invalid"}
     end
   end
@@ -1674,6 +1912,7 @@ defmodule FerricstoreServer.Native.Codec do
          {:ok, partition_key, rest} <- take_compact_optional_binary(rest),
          <<now_ms::signed-64, run_at_ms::signed-64, independent::unsigned-8, count::unsigned-32,
            rest::binary>> <- rest,
+         :ok <- validate_compact_collection_count(count),
          {:ok, items, ""} <- take_compact_transition_items(count, rest, []) do
       payload =
         %{
@@ -1688,6 +1927,7 @@ defmodule FerricstoreServer.Native.Codec do
 
       {:ok, payload}
     else
+      {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact FLOW.TRANSITION_MANY payload is invalid"}
     end
   end
@@ -1783,8 +2023,11 @@ defmodule FerricstoreServer.Native.Codec do
 
   defp take_compact_partitions(1, rest), do: take_compact_binary(rest)
 
-  defp take_compact_partitions(2, <<count::unsigned-32, rest::binary>>),
-    do: take_compact_partition_list(count, rest, [])
+  defp take_compact_partitions(2, <<count::unsigned-32, rest::binary>>) do
+    with :ok <- validate_compact_collection_count(count) do
+      take_compact_partition_list(count, rest, [])
+    end
+  end
 
   defp take_compact_partitions(_mode, _rest), do: :error
 
@@ -1927,36 +2170,65 @@ defmodule FerricstoreServer.Native.Codec do
   def encode_value(value),
     do: value |> inspect(limit: 50) |> encode_value()
 
+  @doc false
+  @spec encoded_value_fits?(term(), non_neg_integer()) :: boolean()
+  def encoded_value_fits?(value, max_bytes)
+      when is_integer(max_bytes) and max_bytes >= 0 do
+    match?({:ok, _remaining}, consume_encoded_value(value, max_bytes))
+  end
+
+  def encoded_value_fits?(_value, _max_bytes), do: false
+
   @spec decode_value(binary()) :: {:ok, term(), binary()} | {:error, binary()}
-  def decode_value(binary), do: decode_value(binary, native_value_limits(), 0)
+  def decode_value(binary) do
+    limits = native_value_limits()
 
-  defp decode_value(<<0, rest::binary>>, _limits, _depth), do: {:ok, nil, rest}
-  defp decode_value(<<1, rest::binary>>, _limits, _depth), do: {:ok, true, rest}
-  defp decode_value(<<2, rest::binary>>, _limits, _depth), do: {:ok, false, rest}
-
-  defp decode_value(<<3, value::signed-64, rest::binary>>, _limits, _depth),
-    do: {:ok, value, rest}
-
-  defp decode_value(<<4, len::unsigned-32, rest::binary>>, _limits, _depth) do
-    decode_binary(len, rest)
-  end
-
-  defp decode_value(<<5, count::unsigned-32, rest::binary>>, limits, depth) do
-    with :ok <- validate_value_container(count, limits, depth) do
-      decode_array(count, rest, [], limits, depth + 1)
+    case decode_value(binary, limits, 0, value_item_budget(limits)) do
+      {:ok, value, rest, _remaining_items} -> {:ok, value, rest}
+      {:error, _reason} = error -> error
     end
   end
 
-  defp decode_value(<<6, count::unsigned-32, rest::binary>>, limits, depth) do
-    with :ok <- validate_value_container(count, limits, depth) do
-      decode_map(count, rest, %{}, limits, depth + 1)
+  defp decode_value(<<0, rest::binary>>, _limits, _depth, remaining),
+    do: {:ok, nil, rest, remaining}
+
+  defp decode_value(<<1, rest::binary>>, _limits, _depth, remaining),
+    do: {:ok, true, rest, remaining}
+
+  defp decode_value(<<2, rest::binary>>, _limits, _depth, remaining),
+    do: {:ok, false, rest, remaining}
+
+  defp decode_value(<<3, value::signed-64, rest::binary>>, _limits, _depth, remaining),
+    do: {:ok, value, rest, remaining}
+
+  defp decode_value(<<4, len::unsigned-32, rest::binary>>, _limits, _depth, remaining) do
+    case decode_binary(len, rest) do
+      {:ok, value, next} -> {:ok, value, next, remaining}
+      {:error, _reason} = error -> error
     end
   end
 
-  defp decode_value(<<7, value::float-64, rest::binary>>, _limits, _depth), do: {:ok, value, rest}
-  defp decode_value(<<>>, _limits, _depth), do: {:error, "ERR native value is empty"}
+  defp decode_value(<<5, count::unsigned-32, rest::binary>>, limits, depth, remaining) do
+    with :ok <- validate_value_container(count, limits, depth),
+         {:ok, remaining} <- reserve_value_items(remaining, count) do
+      decode_array(count, rest, [], limits, depth + 1, remaining)
+    end
+  end
 
-  defp decode_value(_, _limits, _depth),
+  defp decode_value(<<6, count::unsigned-32, rest::binary>>, limits, depth, remaining) do
+    with :ok <- validate_value_container(count, limits, depth),
+         {:ok, remaining} <- reserve_value_items(remaining, count) do
+      decode_map(count, rest, %{}, limits, depth + 1, remaining)
+    end
+  end
+
+  defp decode_value(<<7, value::float-64, rest::binary>>, _limits, _depth, remaining),
+    do: {:ok, value, rest, remaining}
+
+  defp decode_value(<<>>, _limits, _depth, _remaining),
+    do: {:error, "ERR native value is empty"}
+
+  defp decode_value(_, _limits, _depth, _remaining),
     do: {:error, "ERR native value has unknown or truncated tag"}
 
   defp decode_binary(len, rest) when byte_size(rest) >= len do
@@ -1966,28 +2238,190 @@ defmodule FerricstoreServer.Native.Codec do
 
   defp decode_binary(_len, _rest), do: {:error, "ERR native binary value is truncated"}
 
-  defp decode_array(0, rest, acc, _limits, _depth), do: {:ok, Enum.reverse(acc), rest}
+  defp decode_array(0, rest, acc, _limits, _depth, remaining),
+    do: {:ok, Enum.reverse(acc), rest, remaining}
 
-  defp decode_array(count, rest, acc, limits, depth) do
-    case decode_value(rest, limits, depth) do
-      {:ok, value, next} -> decode_array(count - 1, next, [value | acc], limits, depth)
-      {:error, reason} -> {:error, reason}
+  defp decode_array(count, rest, acc, limits, depth, remaining) do
+    case decode_value(rest, limits, depth, remaining) do
+      {:ok, value, next, remaining} ->
+        decode_array(count - 1, next, [value | acc], limits, depth, remaining)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp decode_map(0, rest, acc, _limits, _depth), do: {:ok, acc, rest}
+  defp decode_map(0, rest, acc, _limits, _depth, remaining),
+    do: {:ok, acc, rest, remaining}
 
-  defp decode_map(count, <<key_len::unsigned-32, rest::binary>>, acc, limits, depth) do
+  defp decode_map(
+         count,
+         <<key_len::unsigned-32, rest::binary>>,
+         acc,
+         limits,
+         depth,
+         remaining
+       ) do
     with {:ok, key, after_key} <- decode_binary(key_len, rest),
-         {:ok, value, after_value} <- decode_value(after_key, limits, depth) do
-      decode_map(count - 1, after_value, Map.put(acc, key, value), limits, depth)
+         {:ok, value, after_value, remaining} <-
+           decode_value(after_key, limits, depth, remaining) do
+      decode_map(
+        count - 1,
+        after_value,
+        Map.put(acc, key, value),
+        limits,
+        depth,
+        remaining
+      )
     else
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp decode_map(_count, _rest, _acc, _limits, _depth),
+  defp decode_map(_count, _rest, _acc, _limits, _depth, _remaining),
     do: {:error, "ERR native map value is truncated"}
+
+  defp peek_typed_command_name("") do
+    :not_found
+  end
+
+  defp peek_typed_command_name(<<6, count::unsigned-32, rest::binary>>) do
+    limits = native_value_limits()
+
+    with :ok <- validate_value_container(count, limits, 0),
+         {:ok, remaining} <- reserve_value_items(value_item_budget(limits), count),
+         {:ok, command, rest, _remaining} <-
+           peek_command_map(count, rest, :not_found, limits, 1, remaining) do
+      case rest do
+        "" -> command
+        _trailing -> {:error, "ERR native frame body has trailing bytes"}
+      end
+    end
+  end
+
+  defp peek_typed_command_name(_non_map), do: :not_found
+
+  defp peek_command_map(0, rest, command, _limits, _depth, remaining),
+    do: {:ok, command, rest, remaining}
+
+  defp peek_command_map(
+         count,
+         <<key_len::unsigned-32, rest::binary>>,
+         command,
+         limits,
+         depth,
+         remaining
+       ) do
+    with {:ok, key, after_key} <- decode_binary(key_len, rest),
+         {:ok, command, after_value, remaining} <-
+           peek_command_value(key, after_key, command, limits, depth, remaining) do
+      peek_command_map(count - 1, after_value, command, limits, depth, remaining)
+    end
+  end
+
+  defp peek_command_map(_count, _rest, _command, _limits, _depth, _remaining),
+    do: {:error, "ERR native map value is truncated"}
+
+  defp peek_command_value(
+         "command",
+         <<4, len::unsigned-32, rest::binary>>,
+         _previous,
+         _limits,
+         _depth,
+         remaining
+       ) do
+    case decode_binary(len, rest) do
+      {:ok, command, next} -> {:ok, {:ok, command}, next, remaining}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp peek_command_value("command", body, _previous, limits, depth, remaining) do
+    with {:ok, next, remaining} <- skip_encoded_value(body, limits, depth, remaining) do
+      {:ok, :not_found, next, remaining}
+    end
+  end
+
+  defp peek_command_value(_key, body, command, limits, depth, remaining) do
+    with {:ok, next, remaining} <- skip_encoded_value(body, limits, depth, remaining) do
+      {:ok, command, next, remaining}
+    end
+  end
+
+  defp skip_encoded_value(<<tag, rest::binary>>, _limits, _depth, remaining)
+       when tag in [0, 1, 2],
+       do: {:ok, rest, remaining}
+
+  defp skip_encoded_value(
+         <<tag, _value::binary-size(8), rest::binary>>,
+         _limits,
+         _depth,
+         remaining
+       )
+       when tag in [3, 7],
+       do: {:ok, rest, remaining}
+
+  defp skip_encoded_value(<<4, len::unsigned-32, rest::binary>>, _limits, _depth, remaining) do
+    with {:ok, next} <- skip_binary(len, rest) do
+      {:ok, next, remaining}
+    end
+  end
+
+  defp skip_encoded_value(<<5, count::unsigned-32, rest::binary>>, limits, depth, remaining) do
+    with :ok <- validate_value_container(count, limits, depth),
+         {:ok, remaining} <- reserve_value_items(remaining, count) do
+      skip_encoded_array(count, rest, limits, depth + 1, remaining)
+    end
+  end
+
+  defp skip_encoded_value(<<6, count::unsigned-32, rest::binary>>, limits, depth, remaining) do
+    with :ok <- validate_value_container(count, limits, depth),
+         {:ok, remaining} <- reserve_value_items(remaining, count) do
+      skip_encoded_map(count, rest, limits, depth + 1, remaining)
+    end
+  end
+
+  defp skip_encoded_value(<<>>, _limits, _depth, _remaining),
+    do: {:error, "ERR native value is empty"}
+
+  defp skip_encoded_value(_body, _limits, _depth, _remaining),
+    do: {:error, "ERR native value has unknown or truncated tag"}
+
+  defp skip_encoded_array(0, rest, _limits, _depth, remaining),
+    do: {:ok, rest, remaining}
+
+  defp skip_encoded_array(count, body, limits, depth, remaining) do
+    with {:ok, next, remaining} <- skip_encoded_value(body, limits, depth, remaining) do
+      skip_encoded_array(count - 1, next, limits, depth, remaining)
+    end
+  end
+
+  defp skip_encoded_map(0, rest, _limits, _depth, remaining),
+    do: {:ok, rest, remaining}
+
+  defp skip_encoded_map(
+         count,
+         <<key_len::unsigned-32, rest::binary>>,
+         limits,
+         depth,
+         remaining
+       ) do
+    with {:ok, after_key} <- skip_binary(key_len, rest),
+         {:ok, after_value, remaining} <-
+           skip_encoded_value(after_key, limits, depth, remaining) do
+      skip_encoded_map(count - 1, after_value, limits, depth, remaining)
+    end
+  end
+
+  defp skip_encoded_map(_count, _rest, _limits, _depth, _remaining),
+    do: {:error, "ERR native map value is truncated"}
+
+  defp skip_binary(len, rest) when byte_size(rest) >= len do
+    <<_value::binary-size(len), next::binary>> = rest
+    {:ok, next}
+  end
+
+  defp skip_binary(_len, _rest), do: {:error, "ERR native binary value is truncated"}
 
   defp validate_value_container(_count, %{max_depth: max_depth}, depth)
        when is_integer(max_depth) and max_depth >= 0 and depth >= max_depth,
@@ -1999,18 +2433,137 @@ defmodule FerricstoreServer.Native.Codec do
 
   defp validate_value_container(_count, _limits, _depth), do: :ok
 
+  defp value_item_budget(%{max_items: max_items})
+       when is_integer(max_items) and max_items >= 0,
+       do: max_items
+
+  defp value_item_budget(_limits), do: :unlimited
+
+  defp reserve_value_items(:unlimited, _count), do: {:ok, :unlimited}
+
+  defp reserve_value_items(remaining, count) when count <= remaining,
+    do: {:ok, remaining - count}
+
+  defp reserve_value_items(_remaining, _count),
+    do: {:error, "ERR native value exceeds max total items"}
+
   defp native_value_limits do
     %{
-      max_items:
-        Application.get_env(:ferricstore, :native_max_value_items, @default_max_value_items),
-      max_depth:
-        Application.get_env(:ferricstore, :native_max_value_depth, @default_max_value_depth)
+      max_items: non_negative_native_limit(:native_max_value_items, @default_max_value_items),
+      max_depth: non_negative_native_limit(:native_max_value_depth, @default_max_value_depth)
     }
+  end
+
+  defp validate_compact_collection_count(count) when is_integer(count) and count >= 0 do
+    case native_value_limits().max_items do
+      max_items when count <= max_items -> :ok
+      _max_items -> {:error, "ERR native compact collection exceeds max items"}
+    end
+  end
+
+  defp reserve_compact_collection_items(remaining, count) when count <= remaining,
+    do: {:ok, remaining - count}
+
+  defp reserve_compact_collection_items(_remaining, _count),
+    do: {:error, "ERR native compact collection exceeds max items"}
+
+  defp non_negative_native_limit(key, default) do
+    case Application.get_env(:ferricstore, key, default) do
+      value when is_integer(value) and value >= 0 -> value
+      _invalid -> 0
+    end
   end
 
   defp encode_key(key) when is_binary(key), do: key
   defp encode_key(key) when is_atom(key), do: Atom.to_string(key)
   defp encode_key(key), do: to_string(key)
+
+  defp enforce_response_byte_limit(:ok, value, opts) do
+    case Keyword.get(opts, :max_response_bytes) do
+      limit when is_integer(limit) and limit > 0 ->
+        if limit >= 2 and encoded_value_fits?(value, limit - 2) do
+          {:ok, value}
+        else
+          {:bad_request, "ERR native response byte limit exceeded"}
+        end
+
+      _unbounded ->
+        {:ok, value}
+    end
+  end
+
+  defp enforce_response_byte_limit(status, value, _opts), do: {status, value}
+
+  defp consume_encoded_value(_value, remaining) when remaining < 0, do: :error
+  defp consume_encoded_value(nil, remaining), do: consume_encoded_bytes(remaining, 1)
+
+  defp consume_encoded_value(value, remaining) when is_boolean(value),
+    do: consume_encoded_bytes(remaining, 1)
+
+  defp consume_encoded_value(value, remaining) when is_integer(value),
+    do: consume_encoded_bytes(remaining, 9)
+
+  defp consume_encoded_value(value, remaining) when is_binary(value),
+    do: consume_encoded_bytes(remaining, 5 + byte_size(value))
+
+  defp consume_encoded_value(value, remaining) when is_atom(value),
+    do: consume_encoded_value(Atom.to_string(value), remaining)
+
+  defp consume_encoded_value(value, remaining) when is_float(value),
+    do: consume_encoded_bytes(remaining, 9)
+
+  defp consume_encoded_value(%_{} = struct, remaining),
+    do: consume_encoded_value(Map.from_struct(struct), remaining)
+
+  defp consume_encoded_value(values, remaining) when is_list(values) do
+    with {:ok, remaining} <- consume_encoded_bytes(remaining, 5) do
+      Enum.reduce_while(values, {:ok, remaining}, fn value, {:ok, available} ->
+        case consume_encoded_value(value, available) do
+          {:ok, _remaining} = result -> {:cont, result}
+          :error -> {:halt, :error}
+        end
+      end)
+    end
+  end
+
+  defp consume_encoded_value(values, remaining) when is_map(values) do
+    with {:ok, remaining} <- consume_encoded_bytes(remaining, 5) do
+      Enum.reduce_while(values, {:ok, remaining}, fn {key, value}, {:ok, available} ->
+        key = encode_key(key)
+
+        with {:ok, available} <- consume_encoded_bytes(available, 4 + byte_size(key)),
+             {:ok, _remaining} = result <- consume_encoded_value(value, available) do
+          {:cont, result}
+        else
+          :error -> {:halt, :error}
+        end
+      end)
+    end
+  end
+
+  defp consume_encoded_value(value, remaining) when is_tuple(value) do
+    with {:ok, remaining} <- consume_encoded_bytes(remaining, 5) do
+      consume_encoded_tuple(value, 0, tuple_size(value), remaining)
+    end
+  end
+
+  defp consume_encoded_value(value, remaining),
+    do: value |> inspect(limit: 50) |> consume_encoded_value(remaining)
+
+  defp consume_encoded_tuple(_tuple, index, size, remaining) when index == size,
+    do: {:ok, remaining}
+
+  defp consume_encoded_tuple(tuple, index, size, remaining) do
+    case consume_encoded_value(elem(tuple, index), remaining) do
+      {:ok, remaining} -> consume_encoded_tuple(tuple, index + 1, size, remaining)
+      :error -> :error
+    end
+  end
+
+  defp consume_encoded_bytes(remaining, bytes) when bytes <= remaining,
+    do: {:ok, remaining - bytes}
+
+  defp consume_encoded_bytes(_remaining, _bytes), do: :error
 
   defp response_value(:ok, value), do: value
 

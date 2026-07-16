@@ -143,10 +143,19 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
         in_flight? ->
           if ctx do
             :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
-            mark_checkpoint_in_flight(ctx, state.index, 0)
           end
 
-          :in_flight_retry
+          result =
+            case ActiveFile.get(ctx, state.index) do
+              {_fid, active_path, _sp} -> NIF.v2_fsync(active_path)
+            end
+
+          if ctx && result == :ok do
+            :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
+          end
+
+          mark_checkpoint_in_flight(ctx, state.index, 0)
+          result
 
         dirty? ->
           case ActiveFile.get(ctx, state.index) do

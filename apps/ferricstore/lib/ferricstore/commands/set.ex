@@ -15,9 +15,11 @@ defmodule Ferricstore.Commands.Set do
   holds a different type returns WRONGTYPE.
   """
 
+  alias Ferricstore.Commands.CollectionScan
   alias Ferricstore.Commands.Set.{Destination, Intersection, Random, Scan}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.TypeRegistry
   alias Ferricstore.CrossShardOp
 
@@ -67,10 +69,9 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SMEMBERS", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      prefix = CompoundKey.set_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-      Enum.map(pairs, fn {member, _} -> member end)
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, members} <- get_members_list(key, store) do
+      members
     end
   end
 
@@ -83,14 +84,9 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SISMEMBER", [key, member], store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      compound_key = CompoundKey.set_member(key, member)
-
-      if Ops.compound_get(store, key, compound_key) != nil do
-        1
-      else
-        0
-      end
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, present?} <- member_present?(key, member, store) do
+      if present?, do: 1, else: 0
     end
   end
 
@@ -103,12 +99,9 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SMISMEMBER", [key | members], store) when members != [] do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      compound_keys = Enum.map(members, &CompoundKey.set_member(key, &1))
-
-      store
-      |> Ops.compound_batch_get(key, compound_keys)
-      |> Enum.map(fn
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, values} <- member_values(key, members, store) do
+      Enum.map(values, fn
         nil -> 0
         _value -> 1
       end)
@@ -124,9 +117,9 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SCARD", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, store) do
       prefix = CompoundKey.set_prefix(key)
-      Ops.compound_count(store, key, prefix)
+      store |> Ops.compound_count(key, prefix) |> ReadResult.command_result()
     end
   end
 
@@ -139,10 +132,9 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SINTER", [_ | _] = keys, store) do
-    with :ok <- check_all_types(keys, store) do
-      keys
-      |> Intersection.sinter_set(store)
-      |> MapSet.to_list()
+    with :ok <- check_all_types(keys, store),
+         {:ok, result} <- Intersection.sinter_set(keys, store) do
+      MapSet.to_list(result)
     end
   end
 
@@ -155,8 +147,8 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SUNION", [_ | _] = keys, store) do
-    with :ok <- check_all_types(keys, store) do
-      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
+    with :ok <- check_all_types(keys, store),
+         {:ok, sets} <- get_member_sets(keys, store) do
       result = Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))
       MapSet.to_list(result)
     end
@@ -171,9 +163,10 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SDIFF", [first_key | rest_keys], store) do
-    with :ok <- check_all_types([first_key | rest_keys], store) do
-      first_set = get_members_set(first_key, store)
-      rest_sets = Enum.map(rest_keys, fn key -> get_members_set(key, store) end)
+    keys = [first_key | rest_keys]
+
+    with :ok <- check_all_types(keys, store),
+         {:ok, [first_set | rest_sets]} <- get_member_sets(keys, store) do
       result = Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))
       MapSet.to_list(result)
     end
@@ -188,24 +181,20 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SSCAN", [key, cursor_str | opts], store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store),
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
          {:ok, cursor} <- Scan.parse_cursor(cursor_str),
-         {:ok, match_pattern, count} <- Scan.parse_sscan_opts(opts) do
-      prefix = CompoundKey.set_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-      members = Enum.map(pairs, fn {member, _} -> member end)
-
-      filtered =
-        case match_pattern do
-          nil ->
-            members
-
-          pattern ->
-            Enum.filter(members, fn m -> Ferricstore.GlobMatcher.match?(m, pattern) end)
-        end
-
-      {next_cursor, batch} = Scan.paginate(filtered, cursor, count)
-      [next_cursor, batch]
+         {:ok, match_pattern, count} <- Scan.parse_sscan_opts(opts),
+         {:ok, {next_cursor, pairs}} <-
+           CollectionScan.page(
+             store,
+             key,
+             CompoundKey.set_prefix(key),
+             cursor,
+             count,
+             match_pattern,
+             true
+           ) do
+      [next_cursor, Enum.map(pairs, &elem(&1, 0))]
     end
   end
 
@@ -222,9 +211,8 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SRANDMEMBER", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      members = get_members_list(key, store)
-
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, members} <- get_members_list(key, store) do
       case members do
         [] -> nil
         _ -> Enum.random(members)
@@ -233,14 +221,15 @@ defmodule Ferricstore.Commands.Set do
   end
 
   def handle("SRANDMEMBER", [key, count_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, store) do
       case Integer.parse(count_str) do
         {0, ""} ->
           []
 
         {count, ""} ->
-          members = get_members_list(key, store)
-          Random.select_random_members(members, count)
+          with {:ok, members} <- get_members_list(key, store) do
+            Random.select_random_members(members, count)
+          end
 
         _ ->
           {:error, "ERR value is not an integer or out of range"}
@@ -259,7 +248,7 @@ defmodule Ferricstore.Commands.Set do
   def handle("SPOP", [key], store), do: spop_one(key, store)
 
   def handle("SPOP", [key, count_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, store) do
       case Integer.parse(count_str) do
         {0, ""} ->
           []
@@ -311,9 +300,8 @@ defmodule Ferricstore.Commands.Set do
     CrossShardOp.execute(
       keys_with_roles,
       fn unified_store ->
-        with :ok <- check_all_types(keys, unified_store) do
-          first_set = get_members_set(hd(keys), unified_store)
-          rest_sets = Enum.map(tl(keys), fn key -> get_members_set(key, unified_store) end)
+        with :ok <- check_all_types(keys, unified_store),
+             {:ok, [first_set | rest_sets]} <- get_member_sets(keys, unified_store) do
           result = Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))
 
           Destination.store_set_at(destination, result, unified_store)
@@ -344,15 +332,8 @@ defmodule Ferricstore.Commands.Set do
     CrossShardOp.execute(
       keys_with_roles,
       fn unified_store ->
-        with :ok <- check_all_types(keys, unified_store) do
-          sets = Enum.map(keys, fn key -> get_members_set(key, unified_store) end)
-
-          result =
-            case sets do
-              [first | rest] -> Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
-              [] -> MapSet.new()
-            end
-
+        with :ok <- check_all_types(keys, unified_store),
+             {:ok, result} <- Intersection.sinter_set(keys, unified_store) do
           Destination.store_set_at(destination, result, unified_store)
         end
       end,
@@ -381,8 +362,8 @@ defmodule Ferricstore.Commands.Set do
     CrossShardOp.execute(
       keys_with_roles,
       fn unified_store ->
-        with :ok <- check_all_types(keys, unified_store) do
-          sets = Enum.map(keys, fn key -> get_members_set(key, unified_store) end)
+        with :ok <- check_all_types(keys, unified_store),
+             {:ok, sets} <- get_member_sets(keys, unified_store) do
           result = Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))
 
           Destination.store_set_at(destination, result, unified_store)
@@ -409,8 +390,9 @@ defmodule Ferricstore.Commands.Set do
   def handle("SINTERCARD", [numkeys_str | rest], store) when rest != [] do
     with {:ok, numkeys} <- parse_numkeys(numkeys_str),
          {:ok, keys, limit} <- parse_sintercard_args(rest, numkeys) do
-      with :ok <- check_all_types(keys, store) do
-        Intersection.sinter_count(keys, limit, store)
+      with :ok <- check_all_types(keys, store),
+           {:ok, count} <- Intersection.sinter_count(keys, limit, store) do
+        count
       end
     end
   end
@@ -443,13 +425,13 @@ defmodule Ferricstore.Commands.Set do
   def handle_ast({:srandmember, _key, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:srandmember, key, count}, store) when is_integer(count) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, store) do
       if count == 0 do
         []
       else
-        key
-        |> get_members_list(store)
-        |> Random.select_random_members(count)
+        with {:ok, members} <- get_members_list(key, store) do
+          Random.select_random_members(members, count)
+        end
       end
     end
   end
@@ -462,11 +444,11 @@ defmodule Ferricstore.Commands.Set do
 
   def handle_ast({:sscan, _key, {:error, reason}}, _store), do: {:error, reason}
 
-  def handle_ast({:sscan, key, cursor, opts}, store) when is_integer(cursor) and cursor >= 0,
-    do: sscan_typed(key, cursor, opts, store)
-
-  def handle_ast({:sscan, _key, cursor, _opts}, _store) when is_integer(cursor) and cursor < 0,
-    do: {:error, "ERR invalid cursor"}
+  def handle_ast({:sscan, key, cursor, opts}, store) do
+    if CollectionScan.valid_cursor?(cursor),
+      do: sscan_typed(key, cursor, opts, store),
+      else: {:error, "ERR invalid cursor"}
+  end
 
   def handle_ast({:sintercard, {:error, reason}}, _store), do: {:error, reason}
 
@@ -488,16 +470,27 @@ defmodule Ferricstore.Commands.Set do
 
   defp sadd_members(key, members, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :set, store) do
+           TypeRegistry.command_check_or_set_status(key, :set, store) do
       compound_keys =
         members
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.set_member(key, &1))
 
       values = Ops.compound_batch_get(store, key, compound_keys)
-      new_entries = set_member_entries_for_missing(compound_keys, values, [])
 
-      put_new_member_entries(store, key, new_entries, type_status)
+      case ReadResult.first_failure(values) do
+        nil ->
+          new_entries = set_member_entries_for_missing(compound_keys, values, [])
+          put_new_member_entries(store, key, new_entries, type_status)
+
+        failure ->
+          rollback_new_set_type_marker(
+            key,
+            store,
+            type_status,
+            ReadResult.command_error(failure)
+          )
+      end
     end
   end
 
@@ -521,18 +514,25 @@ defmodule Ferricstore.Commands.Set do
   defp rollback_new_set_type_marker(_key, _store, :ok, write_error), do: write_error
 
   defp srem_args([key | members], store) when members != [] do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, store) do
       compound_keys =
         members
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.set_member(key, &1))
 
       values = Ops.compound_batch_get(store, key, compound_keys)
-      removed_entries = set_member_entries_for_present(compound_keys, values, [])
-      removed = length(removed_entries)
 
-      with :ok <- delete_set_members_and_cleanup(key, removed_entries, removed, store) do
-        removed
+      case ReadResult.first_failure(values) do
+        nil ->
+          removed_entries = set_member_entries_for_present(compound_keys, values, [])
+          removed = length(removed_entries)
+
+          with :ok <- delete_set_members_and_cleanup(key, removed_entries, removed, store) do
+            removed
+          end
+
+        failure ->
+          ReadResult.command_error(failure)
       end
     end
   end
@@ -564,26 +564,23 @@ defmodule Ferricstore.Commands.Set do
   defp set_member_entries_for_present(_compound_keys, _values, acc), do: Enum.reverse(acc)
 
   defp smembers_key(key, store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      key
-      |> get_members_list(store)
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, members} <- get_members_list(key, store) do
+      members
     end
   end
 
   defp sismember_member(key, member, store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      compound_key = CompoundKey.set_member(key, member)
-      if Ops.compound_get(store, key, compound_key) != nil, do: 1, else: 0
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, present?} <- member_present?(key, member, store) do
+      if present?, do: 1, else: 0
     end
   end
 
   defp smismember_args([key | members], store) when members != [] do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      compound_keys = Enum.map(members, &CompoundKey.set_member(key, &1))
-
-      store
-      |> Ops.compound_batch_get(key, compound_keys)
-      |> Enum.map(fn
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, values} <- member_values(key, members, store) do
+      Enum.map(values, fn
         nil -> 0
         _value -> 1
       end)
@@ -594,17 +591,16 @@ defmodule Ferricstore.Commands.Set do
     do: {:error, "ERR wrong number of arguments for 'smismember' command"}
 
   defp scard_key(key, store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, store) do
       prefix = CompoundKey.set_prefix(key)
-      Ops.compound_count(store, key, prefix)
+      store |> Ops.compound_count(key, prefix) |> ReadResult.command_result()
     end
   end
 
   defp sinter_keys([_ | _] = keys, store) do
-    with :ok <- check_all_types(keys, store) do
-      keys
-      |> Intersection.sinter_set(store)
-      |> MapSet.to_list()
+    with :ok <- check_all_types(keys, store),
+         {:ok, result} <- Intersection.sinter_set(keys, store) do
+      MapSet.to_list(result)
     end
   end
 
@@ -612,8 +608,8 @@ defmodule Ferricstore.Commands.Set do
     do: {:error, "ERR wrong number of arguments for 'sinter' command"}
 
   defp sunion_keys([_ | _] = keys, store) do
-    with :ok <- check_all_types(keys, store) do
-      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
+    with :ok <- check_all_types(keys, store),
+         {:ok, sets} <- get_member_sets(keys, store) do
       result = Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))
       MapSet.to_list(result)
     end
@@ -623,9 +619,10 @@ defmodule Ferricstore.Commands.Set do
     do: {:error, "ERR wrong number of arguments for 'sunion' command"}
 
   defp sdiff_keys([first_key | rest_keys], store) do
-    with :ok <- check_all_types([first_key | rest_keys], store) do
-      first_set = get_members_set(first_key, store)
-      rest_sets = Enum.map(rest_keys, fn key -> get_members_set(key, store) end)
+    keys = [first_key | rest_keys]
+
+    with :ok <- check_all_types(keys, store),
+         {:ok, [first_set | rest_sets]} <- get_member_sets(keys, store) do
       result = Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))
       MapSet.to_list(result)
     end
@@ -648,9 +645,9 @@ defmodule Ferricstore.Commands.Set do
 
   defp sdiffstore_args([destination | [_ | _] = keys], store) do
     store_result_at(destination, keys, :sdiffstore, store, fn source_keys, unified_store ->
-      first_set = get_members_set(hd(source_keys), unified_store)
-      rest_sets = Enum.map(tl(source_keys), fn key -> get_members_set(key, unified_store) end)
-      Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))
+      with {:ok, [first_set | rest_sets]} <- get_member_sets(source_keys, unified_store) do
+        {:ok, Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))}
+      end
     end)
   end
 
@@ -668,8 +665,9 @@ defmodule Ferricstore.Commands.Set do
 
   defp sunionstore_args([destination | [_ | _] = keys], store) do
     store_result_at(destination, keys, :sunionstore, store, fn source_keys, unified_store ->
-      sets = Enum.map(source_keys, fn key -> get_members_set(key, unified_store) end)
-      Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))
+      with {:ok, sets} <- get_member_sets(source_keys, unified_store) do
+        {:ok, Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))}
+      end
     end)
   end
 
@@ -683,9 +681,9 @@ defmodule Ferricstore.Commands.Set do
     CrossShardOp.execute(
       keys_with_roles,
       fn unified_store ->
-        with :ok <- check_all_types(keys, unified_store) do
-          destination
-          |> Destination.store_set_at(result_fun.(keys, unified_store), unified_store)
+        with :ok <- check_all_types(keys, unified_store),
+             {:ok, result} <- result_fun.(keys, unified_store) do
+          Destination.store_set_at(destination, result, unified_store)
         end
       end,
       intent: %{
@@ -704,8 +702,9 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp srandmember_one(key, store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      case get_members_list(key, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, members} <- get_members_list(key, store) do
+      case members do
         [] -> nil
         members -> Enum.random(members)
       end
@@ -713,8 +712,9 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp spop_one(key, store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
-      case get_members_list(key, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, members} <- get_members_list(key, store) do
+      case members do
         [] ->
           nil
 
@@ -730,66 +730,64 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp spop_count(key, count, store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :set, store) do
       if count == 0 do
         []
       else
-        members = get_members_list(key, store)
-        selected = Enum.take_random(members, count)
-        compound_keys = Enum.map(selected, &CompoundKey.set_member(key, &1))
-        removed = length(compound_keys)
-        removed_entries = Enum.map(compound_keys, &{&1, "1", 0})
+        with {:ok, members} <- get_members_list(key, store) do
+          selected = Enum.take_random(members, count)
+          compound_keys = Enum.map(selected, &CompoundKey.set_member(key, &1))
+          removed = length(compound_keys)
+          removed_entries = Enum.map(compound_keys, &{&1, "1", 0})
 
-        with :ok <- delete_set_members_and_cleanup(key, removed_entries, removed, store) do
-          selected
+          with :ok <- delete_set_members_and_cleanup(key, removed_entries, removed, store) do
+            selected
+          end
         end
       end
     end
   end
 
   defp sscan_typed(key, cursor, opts, store) do
-    with :ok <- TypeRegistry.check_type(key, :set, store),
-         {:ok, match_pattern, count} <- Scan.typed_scan_opts(opts) do
-      prefix = CompoundKey.set_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-      members = Enum.map(pairs, fn {member, _} -> member end)
-
-      filtered =
-        case match_pattern do
-          nil ->
-            members
-
-          pattern ->
-            Enum.filter(members, fn member -> Ferricstore.GlobMatcher.match?(member, pattern) end)
-        end
-
-      {next_cursor, batch} = Scan.paginate(filtered, cursor, count)
-      [next_cursor, batch]
+    with :ok <- TypeRegistry.command_check_type(key, :set, store),
+         {:ok, match_pattern, count} <- Scan.typed_scan_opts(opts),
+         {:ok, {next_cursor, pairs}} <-
+           CollectionScan.page(
+             store,
+             key,
+             CompoundKey.set_prefix(key),
+             cursor,
+             count,
+             match_pattern,
+             true
+           ) do
+      [next_cursor, Enum.map(pairs, &elem(&1, 0))]
     end
   end
 
   defp sintercard_typed(keys, limit, store) do
-    with :ok <- check_all_types(keys, store) do
-      Intersection.sinter_count(keys, limit, store)
+    with :ok <- check_all_types(keys, store),
+         {:ok, count} <- Intersection.sinter_count(keys, limit, store) do
+      count
     end
   end
 
   # Core SMOVE logic, extracted for use inside CrossShardOp.execute.
   defp do_smove(source, destination, member, store) do
-    with :ok <- TypeRegistry.check_type(source, :set, store) do
-      compound_key = CompoundKey.set_member(source, member)
-
+    with :ok <- TypeRegistry.command_check_type(source, :set, store),
+         {:ok, source_has_member?} <- member_present?(source, member, store) do
       cond do
-        Ops.compound_get(store, source, compound_key) == nil ->
+        not source_has_member? ->
           0
 
         source == destination ->
           1
 
         true ->
-          with :ok <- TypeRegistry.check_type(destination, :set, store) do
+          with :ok <- TypeRegistry.command_check_type(destination, :set, store),
+               {:ok, destination_had_member?} <- member_present?(destination, member, store) do
+            compound_key = CompoundKey.set_member(source, member)
             dst_key = CompoundKey.set_member(destination, member)
-            destination_had_member? = Ops.compound_get(store, destination, dst_key) != nil
 
             case maybe_put_smove_destination(destination_had_member?, destination, dst_key, store) do
               :ok ->
@@ -831,7 +829,7 @@ defmodule Ferricstore.Commands.Set do
 
   defp maybe_put_smove_destination(false, destination, dst_key, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(destination, :set, store) do
+           TypeRegistry.command_check_or_set_status(destination, :set, store) do
       case Ops.compound_put(store, destination, dst_key, @presence_marker, 0) do
         :ok -> :ok
         true -> :ok
@@ -936,20 +934,63 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp get_members_set(key, store) do
-    prefix = CompoundKey.set_prefix(key)
-    pairs = Ops.compound_scan(store, key, prefix)
-    MapSet.new(pairs, fn {member, _} -> member end)
+    with {:ok, members} <- get_members_list(key, store) do
+      {:ok, MapSet.new(members)}
+    end
   end
 
   defp get_members_list(key, store) do
     prefix = CompoundKey.set_prefix(key)
-    pairs = Ops.compound_scan(store, key, prefix)
-    Enum.map(pairs, fn {member, _} -> member end)
+
+    case Ops.compound_scan(store, key, prefix) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      pairs when is_list(pairs) ->
+        {:ok, Enum.map(pairs, fn {member, _} -> member end)}
+    end
+  end
+
+  defp get_member_sets(keys, store) do
+    keys
+    |> Enum.reduce_while({:ok, []}, fn key, {:ok, sets} ->
+      case get_members_set(key, store) do
+        {:ok, set} -> {:cont, {:ok, [set | sets]}}
+        error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, sets} -> {:ok, Enum.reverse(sets)}
+      error -> error
+    end
+  end
+
+  defp member_present?(key, member, store) do
+    case Ops.compound_get(store, key, CompoundKey.set_member(key, member)) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      nil ->
+        {:ok, false}
+
+      _value ->
+        {:ok, true}
+    end
+  end
+
+  defp member_values(key, members, store) do
+    compound_keys = Enum.map(members, &CompoundKey.set_member(key, &1))
+    values = Ops.compound_batch_get(store, key, compound_keys)
+
+    case ReadResult.first_failure(values) do
+      nil -> {:ok, values}
+      failure -> ReadResult.command_error(failure)
+    end
   end
 
   defp check_all_types(keys, store) do
     Enum.reduce_while(keys, :ok, fn key, :ok ->
-      case TypeRegistry.check_type(key, :set, store) do
+      case TypeRegistry.command_check_type(key, :set, store) do
         :ok -> {:cont, :ok}
         error -> {:halt, error}
       end
@@ -961,10 +1002,19 @@ defmodule Ferricstore.Commands.Set do
   defp maybe_cleanup_empty_set(key, _removed, store) do
     prefix = CompoundKey.set_prefix(key)
 
-    if Ops.compound_count(store, key, prefix) == 0 do
-      TypeRegistry.delete_type(key, store)
-    else
-      :ok
+    case Ops.compound_count(store, key, prefix) do
+      0 ->
+        TypeRegistry.delete_type(key, store)
+
+      count when is_integer(count) and count > 0 ->
+        :ok
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      invalid ->
+        ReadResult.failure({:invalid_compound_count_result, invalid})
+        |> ReadResult.command_error()
     end
   end
 

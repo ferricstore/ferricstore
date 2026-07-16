@@ -141,7 +141,7 @@ defmodule Ferricstore.Raft.WARaftStorage.PersistedConfig do
     Enum.reduce_while(peers, {:ok, []}, fn {@peer_tag, server, node_name}, {:ok, acc} ->
       case node_atom(node_name) do
         {:ok, node_atom} -> {:cont, {:ok, [{Map.fetch!(servers, server), node_atom} | acc]}}
-        :error -> {:halt, {:error, {:invalid_persisted_peer_node, node_name}}}
+        :error -> {:halt, {:error, {:unknown_persisted_peer_node, node_name}}}
       end
     end)
     |> case do
@@ -185,9 +185,7 @@ defmodule Ferricstore.Raft.WARaftStorage.PersistedConfig do
   end
 
   defp node_atom(name) do
-    {:ok, String.to_atom(name)}
-  rescue
-    ArgumentError -> :error
+    existing_atom(name)
   end
 
   defp unwrap!({:ok, value}), do: value

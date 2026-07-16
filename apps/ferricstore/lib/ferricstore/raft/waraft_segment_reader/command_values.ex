@@ -1,9 +1,19 @@
 defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   @moduledoc false
 
+  alias Ferricstore.Raft.CommandStamp
+
   def live_expire_at?(0), do: true
   def live_expire_at?(expire_at_ms) when is_integer(expire_at_ms), do: expire_at_ms > now_ms()
   def live_expire_at?(_expire_at_ms), do: false
+
+  def live_expire_at?(0, _now_ms), do: true
+
+  def live_expire_at?(expire_at_ms, now_ms)
+      when is_integer(expire_at_ms) and is_integer(now_ms),
+      do: expire_at_ms > now_ms
+
+  def live_expire_at?(_expire_at_ms, _now_ms), do: false
 
   def now_ms, do: System.system_time(:millisecond)
 
@@ -31,12 +41,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   def command_from_entry(_entry), do: :skip
 
   def decode_replay_command({:ttb, binary}) when is_binary(binary) do
-    try do
-      binary
-      |> :erlang.binary_to_term([:safe])
-      |> decode_replay_command()
-    rescue
-      _ -> {:ttb, binary}
+    case CommandStamp.decode_ttb(binary) do
+      {:ok, decoded} -> decode_replay_command(decoded)
+      {:error, :invalid_preencoded_command} -> {:ttb, binary}
     end
   end
 
@@ -44,6 +51,38 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
       when is_tuple(inner_command) and is_integer(physical_ms) and is_integer(logical) do
     decode_replay_command(inner_command)
   end
+
+  def decode_replay_command({:ferricstore_latency_trace, inner_command})
+      when is_tuple(inner_command),
+      do: decode_replay_command(inner_command)
+
+  def decode_replay_command({:ferricstore_apply_context, _encoded, inner_command})
+      when is_tuple(inner_command),
+      do: decode_replay_command(inner_command)
+
+  def decode_replay_command({:flow_policy_fence, _installs, inner_command})
+      when is_tuple(inner_command),
+      do: decode_replay_command(inner_command)
+
+  def decode_replay_command({:flow_shared_ref_write, _shard_index, inner_command})
+      when is_tuple(inner_command),
+      do: decode_replay_command(inner_command)
+
+  def decode_replay_command({:async, _origin, inner_command}) when is_tuple(inner_command),
+    do: decode_replay_command(inner_command)
+
+  def decode_replay_command(
+        {:origin_checked, _key, inner_command, _before_value, _before_expire_at_ms,
+         _expected_value, _expire_at_ms}
+      )
+      when is_tuple(inner_command),
+      do: decode_replay_command(inner_command)
+
+  def decode_replay_command(
+        {:origin_checked, _key, inner_command, _expected_value, _expire_at_ms}
+      )
+      when is_tuple(inner_command),
+      do: decode_replay_command(inner_command)
 
   def decode_replay_command(command), do: command
 

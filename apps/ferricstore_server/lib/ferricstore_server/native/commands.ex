@@ -12,24 +12,29 @@ defmodule FerricstoreServer.Native.Commands do
   It must not duplicate storage, Flow, WAL, or index semantics.
   """
 
+  require Logger
+
   alias Ferricstore.{AuditLog, Stats}
-  alias Ferricstore.Commands.PreparedCommand
+  alias Ferricstore.Commands.{PreparedCommand, Strings}
   alias Ferricstore.Flow.{ClaimDueAPI, ClaimWaiters}
   alias Ferricstore.Flow.Codec, as: FlowCodec
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Flow.Keys, as: FlowKeys
   alias Ferricstore.Flow.RecordProjection, as: FlowRecordProjection
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
-  alias Ferricstore.Store.{CompoundKey, Ops, Router}
+  alias Ferricstore.Store.{CompoundKey, ListOps, Ops, PublicationEpoch, ReadResult, Router}
   alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.SlotMap
   alias FerricstoreServer.AuthRateLimiter
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
+  alias FerricstoreServer.Native.Codec
   alias FerricstoreServer.Native.RouteMetadata
 
   @list_position_step 1_000_000_000
   @default_max_collection_response_items 10_000
+  @default_max_response_bytes 64 * 1024 * 1024
+  @internal_server_error "ERR internal server error"
   @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
 
   @op_hello 0x0001
@@ -44,6 +49,8 @@ defmodule FerricstoreServer.Native.Commands do
   @op_goaway 0x000A
   @op_options 0x000B
   @op_startup 0x000C
+
+  @max_client_name_bytes 1_024
   @op_window_update 0x000D
   @op_pipeline 0x000E
   @op_route_batch 0x000F
@@ -436,7 +443,7 @@ defmodule FerricstoreServer.Native.Commands do
     "approver" => :approver,
     "overwrite" => :overwrite,
     "owner_flow_id" => :owner_flow_id,
-    "parent_id" => :parent_id,
+    "parent_flow_id" => :parent_flow_id,
     "partition_key" => :partition_key,
     "partition_keys" => :partition_keys,
     "payload" => :payload,
@@ -460,7 +467,7 @@ defmodule FerricstoreServer.Native.Commands do
     "retention_ttl_ms" => :retention_ttl_ms,
     "rev" => :rev,
     "retry_at_ms" => :retry_at_ms,
-    "root_id" => :root_id,
+    "root_flow_id" => :root_flow_id,
     "run_at_ms" => :run_at_ms,
     "scope" => :scope,
     "signal" => :signal,
@@ -523,11 +530,27 @@ defmodule FerricstoreServer.Native.Commands do
   @spec event_opcode() :: non_neg_integer()
   def event_opcode, do: @op_event
 
+  @doc false
+  @spec mget_value_budget(non_neg_integer(), map()) ::
+          {:ok, non_neg_integer()} | {:error, binary()}
+  def mget_value_budget(value_count, state)
+      when is_integer(value_count) and value_count >= 0 do
+    limit = native_max_response_bytes(state)
+    encoding_overhead = 7 + value_count * 5
+
+    if encoding_overhead <= limit do
+      {:ok, limit - encoding_overhead}
+    else
+      {:error, "ERR native response byte limit exceeded"}
+    end
+  end
+
   @spec execute(non_neg_integer(), term(), map()) :: {atom(), term(), map()}
   def execute(opcode, payload, %{acl_cache: :full_access, require_auth: false} = state) do
     payload = normalize_payload(payload)
 
-    with :ok <- check_deadline(payload),
+    with :ok <- authorize_acl_projection(),
+         :ok <- check_deadline(payload),
          :ok <- authorize_public_opcode(opcode, payload),
          :ok <- check_native_resource_limits(opcode, payload, state) do
       do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
@@ -537,13 +560,17 @@ defmodule FerricstoreServer.Native.Commands do
     end
   rescue
     error ->
-      rescued_execute_error(opcode, payload, state, error)
+      rescued_execute_failure(opcode, state, :error, error, __STACKTRACE__)
+  catch
+    kind, reason ->
+      rescued_execute_failure(opcode, state, kind, reason, __STACKTRACE__)
   end
 
   def execute(opcode, payload, state) do
     payload = normalize_payload(payload)
 
     with {:ok, command} <- fetch_command(opcode),
+         :ok <- authorize_acl_projection(),
          :ok <- check_deadline(payload),
          :ok <- authorize(command, opcode, payload, state),
          :ok <- authorize_public_opcode(opcode, payload),
@@ -555,15 +582,23 @@ defmodule FerricstoreServer.Native.Commands do
     end
   rescue
     error ->
-      rescued_execute_error(opcode, payload, state, error)
+      rescued_execute_failure(opcode, state, :error, error, __STACKTRACE__)
+  catch
+    kind, reason ->
+      rescued_execute_failure(opcode, state, kind, reason, __STACKTRACE__)
   end
 
-  defp rescued_execute_error(opcode, payload, state, error) do
-    if metrics_command_payload?(opcode, payload) do
-      {:ok, "", state}
-    else
-      {:error, Exception.message(error), state}
-    end
+  defp rescued_execute_failure(opcode, state, kind, reason, stacktrace) do
+    Logger.error([
+      "native command execution failed opcode=",
+      inspect(opcode),
+      " command=",
+      inspect(command_name(opcode)),
+      "\n",
+      Exception.format(kind, reason, stacktrace)
+    ])
+
+    {:error, @internal_server_error, state}
   end
 
   defp record_native_activity({:ok, _payload, %{instance_ctx: store}} = result, opcode, payload) do
@@ -671,21 +706,6 @@ defmodule FerricstoreServer.Native.Commands do
   defp data_plane_activity_opcode?(opcode),
     do: Map.has_key?(@kv_commands, opcode) or Map.has_key?(@flow_commands, opcode)
 
-  defp metrics_command_payload?(@op_ferricstore_metrics, _payload), do: true
-
-  defp metrics_command_payload?(@op_command_exec, payload) when is_map(payload) do
-    payload
-    |> Map.get("command", Map.get(payload, :command))
-    |> metrics_command_name?()
-  end
-
-  defp metrics_command_payload?(_opcode, _payload), do: false
-
-  defp metrics_command_name?(command) when is_binary(command),
-    do: String.upcase(command) == "FERRICSTORE.METRICS"
-
-  defp metrics_command_name?(_command), do: false
-
   @spec summary(map()) :: map()
   def summary(state) do
     %{
@@ -706,8 +726,11 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp do_execute(@op_hello, payload, state) do
-    with {:ok, state} <- negotiate_compression(state, Map.get(payload, "compression", "none")) do
-      state = maybe_set_client_name(state, Map.get(payload, "client_name"))
+    client_name = Map.get(payload, "client_name")
+
+    with :ok <- validate_optional_client_name(client_name, "client"),
+         {:ok, state} <- negotiate_compression(state, Map.get(payload, "compression", "none")) do
+      state = maybe_set_client_name(state, client_name)
       {:ok, hello_payload(state), state}
     else
       {:error, reason} -> {:bad_request, reason, state}
@@ -718,11 +741,16 @@ defmodule FerricstoreServer.Native.Commands do
     do: {:ok, capabilities_payload(state), state}
 
   defp do_execute(@op_startup, payload, state) do
-    with {:ok, state} <- negotiate_compression(state, Map.get(payload, "compression", "none")) do
+    client_name = Map.get(payload, "client_name")
+    driver_name = Map.get(payload, "driver_name")
+
+    with :ok <- validate_optional_client_name(client_name, "client"),
+         :ok <- validate_optional_client_name(driver_name, "driver"),
+         {:ok, state} <- negotiate_compression(state, Map.get(payload, "compression", "none")) do
       state =
         state
-        |> maybe_set_client_name(Map.get(payload, "client_name"))
-        |> maybe_set_client_name(Map.get(payload, "driver_name"))
+        |> maybe_set_client_name(client_name)
+        |> maybe_set_client_name(driver_name)
         |> maybe_set_compact_flow_responses(Map.get(payload, "compact_flow_responses"))
 
       case maybe_startup_subscribe_events(state, Map.get(payload, "events", []), payload) do
@@ -766,8 +794,10 @@ defmodule FerricstoreServer.Native.Commands do
     do: {:ok, Map.get(payload, "message", "PONG"), state}
 
   defp do_execute(@op_client_set_name, payload, state) do
-    case require_binary(payload, "name") do
-      {:ok, name} -> {:ok, "OK", maybe_set_client_name(state, name)}
+    with {:ok, name} <- require_binary(payload, "name"),
+         :ok <- validate_optional_client_name(name, "client") do
+      {:ok, "OK", maybe_set_client_name(state, name)}
+    else
       {:error, reason} -> {:bad_request, reason, state}
     end
   end
@@ -872,9 +902,11 @@ defmodule FerricstoreServer.Native.Commands do
     do: {:ok, "OK", %{state | close_after_reply: true}}
 
   defp do_execute(@op_get, payload, state) do
-    with {:ok, key} <- require_binary(payload, "key"),
-         {:ok, value} <- FerricStore.Impl.get(state.instance_ctx, key) do
-      {:ok, value, state}
+    with {:ok, key} <- require_binary(payload, "key") do
+      native_get_result(
+        fn value_budget -> Router.get_bounded(state.instance_ctx, key, value_budget) end,
+        state
+      )
     else
       {:error, reason} -> {:error, reason, state}
     end
@@ -900,11 +932,16 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp do_execute(@op_mget, payload, state) do
-    with {:ok, keys} <- require_binary_list(payload, "keys") do
-      requested_collection_result_to_reply(length(keys), state, fn ->
-        FerricStore.Impl.mget(state.instance_ctx, keys)
-      end)
+    with {:ok, keys} <- require_binary_list(payload, "keys"),
+         false <- collection_items_exceeds_limit?(length(keys), state),
+         {:ok, value_budget} <- mget_value_budget(length(keys), state) do
+      case Router.batch_get_bounded(state.instance_ctx, keys, value_budget) do
+        {:ok, values} -> {:ok, values, state}
+        {:error, :response_byte_limit} -> response_byte_limit_reply(state)
+        {:error, {:storage_read_failed, _reason}} = failure -> result_to_reply(failure, state)
+      end
     else
+      true -> collection_response_limit_reply(state)
       {:error, reason} -> {:bad_request, reason, state}
     end
   end
@@ -975,9 +1012,10 @@ defmodule FerricstoreServer.Native.Commands do
     with {:ok, key} <- require_binary(payload, "key"),
          {:ok, ttl_ms} <- require_pos_integer(payload, "ttl_ms"),
          {:ok, hint} <- optional_binary(payload, "hint", "") do
-      case FerricStore.fetch_or_compute(key, ttl: ttl_ms, hint: hint) do
-        {:ok, {:hit, value}} -> {:ok, ["hit", value], state}
-        {:ok, {:compute, token}} -> {:ok, ["compute", token], state}
+      case Ferricstore.FetchOrCompute.fetch_or_compute(state.instance_ctx, key, ttl_ms, hint) do
+        {:hit, value} -> {:ok, ["hit", value], state}
+        {:ok, value} -> {:ok, ["hit", value], state}
+        {:compute, compute_hint, token} -> {:ok, ["compute", compute_hint, token], state}
         {:error, reason} -> {:error, reason, state}
       end
     else
@@ -987,9 +1025,19 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_fetch_or_compute_result, payload, state) do
     with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, token} <- require_binary(payload, "token"),
          {:ok, value} <- require_any(payload, "value"),
          {:ok, ttl_ms} <- require_pos_integer(payload, "ttl_ms") do
-      result_to_reply(FerricStore.fetch_or_compute_result(key, value, ttl: ttl_ms), state)
+      result_to_reply(
+        Ferricstore.FetchOrCompute.fetch_or_compute_result(
+          state.instance_ctx,
+          key,
+          value,
+          token,
+          ttl_ms
+        ),
+        state
+      )
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -997,8 +1045,17 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_fetch_or_compute_error, payload, state) do
     with {:ok, key} <- require_binary(payload, "key"),
+         {:ok, token} <- require_binary(payload, "token"),
          {:ok, message} <- require_binary(payload, "message") do
-      result_to_reply(Ferricstore.FetchOrCompute.fetch_or_compute_error(key, message), state)
+      result_to_reply(
+        Ferricstore.FetchOrCompute.fetch_or_compute_error(
+          state.instance_ctx,
+          key,
+          token,
+          message
+        ),
+        state
+      )
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -1035,13 +1092,9 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_hgetall, payload, state) do
     with {:ok, key} <- require_binary(payload, "key") do
-      counted_collection_result_to_reply(
-        FerricStore.Impl.hlen(state.instance_ctx, key),
-        state,
-        fn ->
-          FerricStore.Impl.hgetall(state.instance_ctx, key)
-        end
-      )
+      state.instance_ctx
+      |> native_hgetall_bounded(key, state)
+      |> bounded_collection_result_to_reply(state)
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -1089,13 +1142,9 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_smembers, payload, state) do
     with {:ok, key} <- require_binary(payload, "key") do
-      counted_collection_result_to_reply(
-        FerricStore.Impl.scard(state.instance_ctx, key),
-        state,
-        fn ->
-          FerricStore.Impl.smembers(state.instance_ctx, key)
-        end
-      )
+      state.instance_ctx
+      |> native_smembers_bounded(key, state)
+      |> bounded_collection_result_to_reply(state)
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -1199,16 +1248,7 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_ferricstore_metrics, payload, state) do
     with {:ok, args} <- native_args(payload) do
-      result =
-        try do
-          Ferricstore.Metrics.handle("FERRICSTORE.METRICS", args)
-        rescue
-          _ -> ""
-        catch
-          :exit, _ -> ""
-        end
-
-      result_to_reply(result, state)
+      result_to_reply(handle_metrics(args, state), state)
     else
       {:error, reason} -> {:bad_request, reason, state}
     end
@@ -1846,6 +1886,35 @@ defmodule FerricstoreServer.Native.Commands do
     ferricstore_metrics_result(parsed_args, state)
   end
 
+  defp dispatch_command_exec(
+         %PreparedCommand{command: "ACL", args: ["WHOAMI"]},
+         state,
+         _request_context
+       ) do
+    {:ok, state.username, state}
+  end
+
+  defp dispatch_command_exec(
+         %PreparedCommand{command: "ACL", args: ["WHOAMI" | _extra]},
+         state,
+         _request_context
+       ) do
+    {:bad_request, "ERR wrong number of arguments for 'acl whoami' command", state}
+  end
+
+  defp dispatch_command_exec(
+         %PreparedCommand{command: "GET", args: [key]},
+         state,
+         request_context
+       ) do
+    store = attach_request_context(state.instance_ctx, request_context)
+
+    native_get_result(
+      fn value_budget -> Strings.get_bounded(key, store, value_budget) end,
+      state
+    )
+  end
+
   defp dispatch_command_exec(%PreparedCommand{} = prepared, state, request_context) do
     store = attach_request_context(state.instance_ctx, request_context)
     result = Ferricstore.Commands.Dispatcher.dispatch_prepared(prepared, store)
@@ -1853,16 +1922,17 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp ferricstore_metrics_result(parsed_args, state) do
-    result =
-      try do
-        Ferricstore.Metrics.handle("FERRICSTORE.METRICS", parsed_args)
-      rescue
-        _ -> ""
-      catch
-        :exit, _ -> ""
-      end
+    parsed_args
+    |> handle_metrics(state)
+    |> raw_result_to_native()
+    |> result_to_reply(state)
+  end
 
-    result |> raw_result_to_native() |> result_to_reply(state)
+  defp handle_metrics(args, state) do
+    case Map.get(state, :metrics_handler) do
+      handler when is_function(handler, 2) -> handler.("FERRICSTORE.METRICS", args)
+      _other -> Ferricstore.Metrics.handle("FERRICSTORE.METRICS", args)
+    end
   end
 
   defp client_command_result_to_reply({:ok, new_state}, _state), do: {:ok, "OK", new_state}
@@ -2000,6 +2070,12 @@ defmodule FerricstoreServer.Native.Commands do
   defp result_to_reply(:ok, state), do: {:ok, "OK", state}
   defp result_to_reply({:ok, :ok}, state), do: {:ok, "OK", state}
   defp result_to_reply({:ok, value}, state), do: {:ok, value, state}
+
+  defp result_to_reply({:error, {:storage_read_failed, _reason}} = failure, state) do
+    {:error, message} = ReadResult.command_error(failure)
+    {:error, message, state}
+  end
+
   defp result_to_reply({:error, %{code: _code} = reason}, state), do: {:error, reason, state}
 
   defp result_to_reply({:error, reason}, state) when is_binary(reason) do
@@ -2026,24 +2102,114 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp collection_result_to_reply(result, state), do: result_to_reply(result, state)
 
+  defp bounded_collection_result_to_reply(:collection_response_limit_exceeded, state),
+    do: collection_response_limit_reply(state)
+
+  defp bounded_collection_result_to_reply(:response_byte_limit_exceeded, state),
+    do: response_byte_limit_reply(state)
+
+  defp bounded_collection_result_to_reply(result, state),
+    do: collection_result_to_reply(result, state)
+
+  defp native_hgetall_bounded(ctx, key, state) do
+    with {:ok, limits} <- native_collection_scan_limits(state, :hash) do
+      case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
+        nil ->
+          {:ok, %{}}
+
+        "hash" ->
+          case Router.compound_scan_raw_bounded(ctx, key, CompoundKey.hash_prefix(key), limits) do
+            {:error, :collection_response_limit} ->
+              :collection_response_limit_exceeded
+
+            {:error, :response_byte_limit} ->
+              :response_byte_limit_exceeded
+
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              ReadResult.command_error(failure)
+
+            entries when is_list(entries) ->
+              {:ok, Map.new(entries)}
+          end
+
+        _other_type ->
+          @wrongtype_error
+      end
+    else
+      {:error, :response_byte_limit} -> :response_byte_limit_exceeded
+    end
+  end
+
+  defp native_smembers_bounded(ctx, key, state) do
+    with {:ok, limits} <- native_collection_scan_limits(state, :set) do
+      case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
+        nil ->
+          {:ok, []}
+
+        "set" ->
+          case Router.compound_scan_raw_bounded(ctx, key, CompoundKey.set_prefix(key), limits) do
+            {:error, :collection_response_limit} ->
+              :collection_response_limit_exceeded
+
+            {:error, :response_byte_limit} ->
+              :response_byte_limit_exceeded
+
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              ReadResult.command_error(failure)
+
+            members when is_list(members) ->
+              {:ok, members}
+          end
+
+        _other_type ->
+          @wrongtype_error
+      end
+    else
+      {:error, :response_byte_limit} -> :response_byte_limit_exceeded
+    end
+  end
+
+  defp native_collection_scan_limits(state, collection_type) do
+    item_limit = native_max_collection_response_items(state)
+    response_limit = native_max_response_bytes(state)
+
+    with {:ok, max_bytes} <- collection_payload_budget(response_limit, 7) do
+      {entry_overhead, include_values, fields_only} =
+        case collection_type do
+          :hash -> {9, true, false}
+          :set -> {5, false, true}
+        end
+
+      {:ok,
+       %{
+         max_entries: if(item_limit > 0, do: item_limit, else: :unlimited),
+         max_bytes: max_bytes,
+         entry_overhead: entry_overhead,
+         include_values: include_values,
+         fields_only: fields_only
+       }}
+    end
+  end
+
+  defp collection_payload_budget(limit, base_bytes) when is_integer(limit) and limit > 0 do
+    if limit >= base_bytes,
+      do: {:ok, limit - base_bytes},
+      else: {:error, :response_byte_limit}
+  end
+
+  defp collection_payload_budget(_unlimited, _base_bytes), do: {:ok, :unlimited}
+
   defp requested_collection_result_to_reply(requested_count, state, fun) do
     if collection_items_exceeds_limit?(requested_count, state) do
       collection_response_limit_reply(state)
     else
       collection_result_to_reply(fun.(), state)
-    end
-  end
-
-  defp counted_collection_result_to_reply(count_result, state, fun) do
-    case count_result do
-      {:ok, count} when is_integer(count) ->
-        requested_collection_result_to_reply(count, state, fun)
-
-      {:error, reason} ->
-        result_to_reply({:error, reason}, state)
-
-      _other ->
-        collection_result_to_reply(fun.(), state)
     end
   end
 
@@ -2091,6 +2257,13 @@ defmodule FerricstoreServer.Native.Commands do
     case Map.fetch(@commands, opcode) do
       {:ok, command} -> {:ok, command}
       :error -> {:error, :bad_request, "ERR native unsupported opcode #{opcode}"}
+    end
+  end
+
+  defp authorize_acl_projection do
+    case ConnAuth.ensure_acl_projection_ready() do
+      :ok -> :ok
+      {:error, reason} -> {:error, :noperm, reason}
     end
   end
 
@@ -2294,18 +2467,19 @@ defmodule FerricstoreServer.Native.Commands do
   defp keys(@op_mset, payload),
     do: payload |> Map.get("pairs", []) |> Enum.map(&pair_key/1) |> binary_list()
 
+  defp keys(opcode, payload) when opcode in [@op_flow_get, @op_flow_history],
+    do: flow_partition_or_global(payload)
+
   defp keys(opcode, payload) when opcode in @flow_partition_or_id_opcodes,
     do: flow_partition_or_fallback(payload, [Map.get(payload, "id")])
 
   defp keys(@op_flow_schedule_create, payload), do: flow_schedule_create_acl_keys(payload)
 
-  defp keys(opcode, payload) when opcode in @flow_schedule_id_opcodes,
-    do: binary_list([Map.get(payload, "id")])
+  defp keys(opcode, _payload) when opcode in @flow_schedule_id_opcodes, do: ["*"]
 
   defp keys(@op_flow_approval_request, payload), do: flow_approval_request_acl_keys(payload)
 
-  defp keys(opcode, payload) when opcode in @flow_approval_id_opcodes,
-    do: binary_list([Map.get(payload, "id")])
+  defp keys(opcode, _payload) when opcode in @flow_approval_id_opcodes, do: ["*"]
 
   defp keys(opcode, payload) when opcode in @flow_batch_opcodes,
     do: flow_batch_acl_keys(opcode, payload)
@@ -2661,6 +2835,24 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp maybe_set_client_name(state, _name), do: state
 
+  defp validate_optional_client_name(nil, _field), do: :ok
+
+  defp validate_optional_client_name(name, field) when is_binary(name) do
+    cond do
+      byte_size(name) > @max_client_name_bytes ->
+        {:error, "ERR native #{field} name exceeds #{@max_client_name_bytes} bytes"}
+
+      not String.valid?(name) ->
+        {:error, "ERR native #{field} name must be valid UTF-8"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_optional_client_name(_name, field),
+    do: {:error, "ERR native #{field} name must be a binary"}
+
   defp maybe_set_compact_flow_responses(state, value)
        when value in [true, "true", "1", 1],
        do: Map.put(state, :compact_flow_responses, true)
@@ -2730,6 +2922,8 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp capabilities_payload(state) do
+    compact_response_opcodes = Codec.compact_response_opcodes()
+
     %{
       protocol_versions: [1],
       direction_bit: true,
@@ -2747,6 +2941,13 @@ defmodule FerricstoreServer.Native.Commands do
         max_collection_response_items:
           Map.get(state, :max_collection_response_items) ||
             native_max_collection_response_items(),
+        max_response_bytes:
+          Map.get(state, :max_response_bytes) ||
+            Application.get_env(
+              :ferricstore,
+              :native_max_response_bytes,
+              @default_max_response_bytes
+            ),
         max_lane_queue:
           Map.get(state, :lane_max_queue) ||
             Application.get_env(:ferricstore, :native_lane_max_queue, 1024),
@@ -2764,7 +2965,8 @@ defmodule FerricstoreServer.Native.Commands do
       response_codecs: %{
         typed_value: true,
         compact_flow_responses: Map.get(state, :compact_flow_responses, false),
-        supported: ["typed_value", "flow_claim_jobs_v1", "ok_list_v1"]
+        compact_response_opcodes: compact_response_opcodes,
+        supported: ["typed_value" | compact_response_opcodes |> Map.keys() |> Enum.sort()]
       },
       compression: supported_compressions(),
       auth: @supported_auth,
@@ -2785,7 +2987,18 @@ defmodule FerricstoreServer.Native.Commands do
       "MGET" => %{"required" => ["keys"], "fields" => ["keys", "deadline_ms"]},
       "SET" => %{
         "required" => ["key", "value"],
-        "fields" => ["key", "value", "ttl", "nx", "xx", "get", "deadline_ms"]
+        "fields" => [
+          "key",
+          "value",
+          "ttl",
+          "exat",
+          "pxat",
+          "nx",
+          "xx",
+          "get",
+          "keepttl",
+          "deadline_ms"
+        ]
       },
       "CAS" => %{
         "required" => ["key", "expected", "value"],
@@ -2812,12 +3025,12 @@ defmodule FerricstoreServer.Native.Commands do
         "fields" => ["key", "ttl_ms", "hint", "deadline_ms"]
       },
       "FETCH_OR_COMPUTE_RESULT" => %{
-        "required" => ["key", "value", "ttl_ms"],
-        "fields" => ["key", "value", "ttl_ms", "deadline_ms"]
+        "required" => ["key", "token", "value", "ttl_ms"],
+        "fields" => ["key", "token", "value", "ttl_ms", "deadline_ms"]
       },
       "FETCH_OR_COMPUTE_ERROR" => %{
-        "required" => ["key", "message"],
-        "fields" => ["key", "message", "deadline_ms"]
+        "required" => ["key", "token", "message"],
+        "fields" => ["key", "token", "message", "deadline_ms"]
       },
       "HSET" => %{
         "required" => ["key", "fields"],
@@ -2906,8 +3119,8 @@ defmodule FerricstoreServer.Native.Commands do
           "value_refs",
           "attributes",
           "partition_key",
-          "parent_id",
-          "root_id",
+          "parent_flow_id",
+          "root_flow_id",
           "correlation_id",
           "run_at_ms",
           "due_after_ms",
@@ -2939,6 +3152,35 @@ defmodule FerricstoreServer.Native.Commands do
           "deadline_ms"
         ]
       },
+      "FLOW.GET" => %{
+        "required" => ["id"],
+        "fields" => [
+          "id",
+          "partition_key",
+          "full",
+          "payload",
+          "payload_max_bytes",
+          "values",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.LIST" => %{
+        "required" => ["type"],
+        "fields" => [
+          "type",
+          "state",
+          "partition_key",
+          "count",
+          "from_ms",
+          "to_ms",
+          "rev",
+          "attributes",
+          "include_cold",
+          "consistent_projection",
+          "return",
+          "deadline_ms"
+        ]
+      },
       "FLOW.CLAIM_DUE" => %{
         "required" => ["type"],
         "fields" => [
@@ -2957,30 +3199,133 @@ defmodule FerricstoreServer.Native.Commands do
         ]
       },
       "FLOW.COMPLETE" => %{
-        "required" => ["id", "lease_token"],
+        "required" => ["id", "lease_token", "fencing_token"],
         "fields" => [
           "id",
           "lease_token",
+          "fencing_token",
+          "partition_key",
           "result",
-          "result_ref",
+          "payload",
+          "ttl_ms",
+          "values",
+          "value_refs",
+          "drop_values",
+          "override_values",
           "attributes",
           "attributes_merge",
           "attributes_delete",
+          "state_meta",
+          "now_ms",
           "deadline_ms"
         ]
       },
       "FLOW.TRANSITION" => %{
-        "required" => ["id", "from_state", "to_state"],
+        "required" => ["id", "from_state", "to_state", "lease_token", "fencing_token"],
         "fields" => [
           "id",
           "from_state",
           "to_state",
+          "lease_token",
+          "fencing_token",
+          "partition_key",
           "payload",
           "payload_ref",
+          "values",
+          "value_refs",
+          "drop_values",
+          "override_values",
           "attributes",
           "attributes_merge",
           "attributes_delete",
-          "delay_ms",
+          "state_meta",
+          "run_at_ms",
+          "priority",
+          "now_ms",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.RETRY" => %{
+        "required" => ["id", "lease_token", "fencing_token"],
+        "fields" => [
+          "id",
+          "lease_token",
+          "fencing_token",
+          "partition_key",
+          "error",
+          "payload",
+          "run_at_ms",
+          "retry",
+          "attributes",
+          "attributes_merge",
+          "attributes_delete",
+          "state_meta",
+          "now_ms",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.FAIL" => %{
+        "required" => ["id", "lease_token", "fencing_token"],
+        "fields" => [
+          "id",
+          "lease_token",
+          "fencing_token",
+          "partition_key",
+          "error",
+          "payload",
+          "ttl_ms",
+          "values",
+          "value_refs",
+          "drop_values",
+          "override_values",
+          "attributes",
+          "attributes_merge",
+          "attributes_delete",
+          "state_meta",
+          "now_ms",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.CANCEL" => %{
+        "required" => ["id", "fencing_token"],
+        "fields" => [
+          "id",
+          "lease_token",
+          "fencing_token",
+          "partition_key",
+          "reason",
+          "ttl_ms",
+          "values",
+          "value_refs",
+          "drop_values",
+          "override_values",
+          "attributes",
+          "attributes_merge",
+          "attributes_delete",
+          "state_meta",
+          "now_ms",
+          "deadline_ms"
+        ]
+      },
+      "FLOW.HISTORY" => %{
+        "required" => ["id"],
+        "fields" => [
+          "id",
+          "partition_key",
+          "count",
+          "from_event",
+          "to_event",
+          "from_ms",
+          "to_ms",
+          "from_version",
+          "to_version",
+          "rev",
+          "event",
+          "worker",
+          "values",
+          "payload_max_bytes",
+          "include_cold",
+          "consistent_projection",
           "deadline_ms"
         ]
       },
@@ -3034,6 +3379,10 @@ defmodule FerricstoreServer.Native.Commands do
           "deadline_ms"
         ]
       },
+      "FLOW.POLICY.GET" => %{
+        "required" => ["type"],
+        "fields" => ["type", "state", "deadline_ms"]
+      },
       "FLOW.STEP_CONTINUE" => %{
         "required" => ["id", "lease_token", "from_state", "to_state", "fencing_token"],
         "fields" => [
@@ -3074,8 +3423,8 @@ defmodule FerricstoreServer.Native.Commands do
           "override_values",
           "attributes",
           "partition_key",
-          "parent_id",
-          "root_id",
+          "parent_flow_id",
+          "root_flow_id",
           "correlation_id",
           "priority",
           "retention_ttl_ms",
@@ -3120,8 +3469,22 @@ defmodule FerricstoreServer.Native.Commands do
         "fields" => ["refs", "max_bytes", "payload_max_bytes", "value_max_bytes", "deadline_ms"]
       },
       "FLOW.SIGNAL" => %{
-        "required" => ["id"],
-        "fields" => ["id", "type", "payload", "deadline_ms"]
+        "required" => ["id", "signal"],
+        "fields" => [
+          "id",
+          "signal",
+          "partition_key",
+          "idempotency_key",
+          "if_state",
+          "transition_to",
+          "run_at_ms",
+          "now_ms",
+          "values",
+          "value_refs",
+          "drop_values",
+          "override_values",
+          "deadline_ms"
+        ]
       },
       "FLOW.SPAWN_CHILDREN" => %{
         "required" => ["id", "children", "partition_key", "group_id", "fencing_token"],
@@ -3203,6 +3566,7 @@ defmodule FerricstoreServer.Native.Commands do
           "from_ms",
           "to_ms",
           "count",
+          "rev",
           "deadline_ms"
         ]
       }
@@ -3461,6 +3825,29 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp optional_non_neg_integer(payload, key) do
+    case Map.get(payload, key) do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value >= 0 -> {:ok, value}
+      _ -> {:error, "ERR native field #{key} must be a non-negative integer"}
+    end
+  end
+
+  defp optional_pos_integer(payload, key) do
+    case Map.get(payload, key) do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _ -> {:error, "ERR native field #{key} must be a positive integer"}
+    end
+  end
+
+  defp optional_boolean(payload, key) do
+    case Map.get(payload, key, false) do
+      value when is_boolean(value) -> {:ok, value}
+      _ -> {:error, "ERR native field #{key} must be boolean"}
+    end
+  end
+
   defp optional_pos_integer(payload, key, default) do
     case Map.get(payload, key, default) do
       value when is_integer(value) and value > 0 -> {:ok, value}
@@ -3534,21 +3921,45 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp kv_set_opts(payload) do
-    opts =
-      []
-      |> maybe_option(:ttl, Map.get(payload, "ttl"))
-      |> maybe_option(:nx, Map.get(payload, "nx"))
-      |> maybe_option(:xx, Map.get(payload, "xx"))
-      |> maybe_option(:get, Map.get(payload, "get"))
-      |> maybe_option(:keepttl, Map.get(payload, "keepttl"))
-      |> maybe_option(:exat, Map.get(payload, "exat"))
-      |> maybe_option(:pxat, Map.get(payload, "pxat"))
+    with {:ok, ttl} <- optional_non_neg_integer(payload, "ttl"),
+         {:ok, exat} <- optional_pos_integer(payload, "exat"),
+         {:ok, pxat} <- optional_pos_integer(payload, "pxat"),
+         {:ok, nx} <- optional_boolean(payload, "nx"),
+         {:ok, xx} <- optional_boolean(payload, "xx"),
+         {:ok, get} <- optional_boolean(payload, "get"),
+         {:ok, keepttl} <- optional_boolean(payload, "keepttl"),
+         :ok <- validate_kv_set_conditions(nx, xx),
+         :ok <- validate_kv_set_expiry(ttl, exat, pxat, keepttl) do
+      opts =
+        []
+        |> maybe_option(:ttl, ttl)
+        |> maybe_option(:exat, exat)
+        |> maybe_option(:pxat, pxat)
+        |> maybe_true_option(:nx, nx)
+        |> maybe_true_option(:xx, xx)
+        |> maybe_true_option(:get, get)
+        |> maybe_true_option(:keepttl, keepttl)
 
-    {:ok, opts}
+      {:ok, opts}
+    end
+  end
+
+  defp validate_kv_set_conditions(true, true),
+    do: {:error, "ERR XX and NX options at the same time are not compatible"}
+
+  defp validate_kv_set_conditions(_nx, _xx), do: :ok
+
+  defp validate_kv_set_expiry(ttl, exat, pxat, keepttl) do
+    option_count = Enum.count([ttl, exat, pxat], &(not is_nil(&1))) + if(keepttl, do: 1, else: 0)
+
+    if option_count > 1, do: {:error, "ERR syntax error"}, else: :ok
   end
 
   defp maybe_option(opts, _key, nil), do: opts
   defp maybe_option(opts, key, value), do: [{key, value} | opts]
+
+  defp maybe_true_option(opts, key, true), do: [{key, true} | opts]
+  defp maybe_true_option(opts, _key, false), do: opts
 
   defp cas_result(1), do: {:ok, true}
   defp cas_result(0), do: {:ok, false}
@@ -3587,16 +3998,26 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp native_args(%{"args" => args}) when is_list(args) do
-    {:ok, Enum.map(args, &native_arg/1)}
+    native_args(args, [])
   end
 
   defp native_args(%{"args" => _args}), do: {:error, "ERR native field args must be a list"}
   defp native_args(_payload), do: {:ok, []}
 
-  defp native_arg(value) when is_binary(value), do: value
-  defp native_arg(value) when is_integer(value), do: Integer.to_string(value)
-  defp native_arg(value) when is_atom(value), do: Atom.to_string(value)
-  defp native_arg(value), do: to_string(value)
+  defp native_args([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp native_args([value | rest], acc) do
+    case native_arg(value) do
+      {:ok, value} -> native_args(rest, [value | acc])
+      :error -> {:error, "ERR native field args contains an unsupported value"}
+    end
+  end
+
+  defp native_arg(value) when is_binary(value), do: {:ok, value}
+  defp native_arg(value) when is_integer(value), do: {:ok, Integer.to_string(value)}
+  defp native_arg(value) when is_float(value), do: {:ok, Float.to_string(value)}
+  defp native_arg(value) when is_atom(value), do: {:ok, Atom.to_string(value)}
+  defp native_arg(_value), do: :error
 
   defp event_list(%{"events" => raw_events}) when is_list(raw_events) do
     events = Enum.map(raw_events, &normalize_event/1)
@@ -3746,7 +4167,14 @@ defmodule FerricstoreServer.Native.Commands do
     with :ok <- validate_compact_pipeline(mode, items, payload, state) do
       return_format = compact_pipeline_return_format(payload)
 
-      case execute_compact_pipeline_fast_path(mode, items, return_format, state) do
+      fast_path_result =
+        if FerricStore.ResourceLimits.default_implementation?() do
+          execute_compact_pipeline_fast_path(mode, items, return_format, state)
+        else
+          :fallback
+        end
+
+      case fast_path_result do
         {:ok, result} ->
           {:ok, result, state}
 
@@ -3769,9 +4197,19 @@ defmodule FerricstoreServer.Native.Commands do
   defp compact_pipeline_return_format(payload), do: pipeline_return_format(payload)
 
   defp execute_pipeline_commands(commands, return_format, state, request_context) do
-    case execute_pipeline_fast_path(commands, state) do
+    fast_path_result =
+      if FerricStore.ResourceLimits.default_implementation?() do
+        execute_pipeline_fast_path(commands, state)
+      else
+        :fallback
+      end
+
+    case fast_path_result do
       {:ok, results} ->
         {:ok, format_pipeline_results(results, return_format), state}
+
+      {:error, reason} ->
+        {:bad_request, reason, state}
 
       :fallback ->
         {results, state} =
@@ -4607,10 +5045,14 @@ defmodule FerricstoreServer.Native.Commands do
   defp pipeline_atomicity(payload) do
     atomicity = Map.get(payload, "atomicity", "none")
 
-    if atomicity in @supported_atomicity do
-      {:ok, atomicity}
+    if is_binary(atomicity) do
+      if atomicity in @supported_atomicity do
+        {:ok, atomicity}
+      else
+        {:error, "ERR native unsupported pipeline atomicity #{atomicity}"}
+      end
     else
-      {:error, "ERR native unsupported pipeline atomicity #{atomicity}"}
+      {:error, "ERR native field atomicity must be binary"}
     end
   end
 
@@ -4632,6 +5074,24 @@ defmodule FerricstoreServer.Native.Commands do
       nil -> pairs
     end
   end
+
+  defp format_pipeline_results(results, :values) do
+    if Enum.all?(results, &(Map.get(&1, "opcode") == @op_set)) do
+      results
+      |> Enum.map(&compact_set_pipeline_map_result/1)
+      |> format_compact_set_results(:values)
+    else
+      results
+      |> Enum.map(&[Map.get(&1, "status"), Map.get(&1, "value")])
+      |> format_compact_pipeline_pairs(@op_pipeline, :values)
+    end
+  end
+
+  defp compact_set_pipeline_map_result(%{"status" => "ok", "value" => value}),
+    do: {:ok, value}
+
+  defp compact_set_pipeline_map_result(%{"status" => _status, "value" => value}),
+    do: {:error, value}
 
   defp validate_pipeline_atomicity(_commands, atomicity, _state)
        when atomicity in ["none", "per_shard"],
@@ -4674,6 +5134,21 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp pipeline_routing_keys(command), do: keys(command.opcode, command.body)
 
+  defp pipeline_batch_get(ctx, keys, state) do
+    case native_max_response_bytes(state) do
+      limit when is_integer(limit) and limit > 0 ->
+        with {:ok, value_budget} <- mget_value_budget(length(keys), state) do
+          case Router.batch_get_bounded(ctx, keys, value_budget) do
+            {:ok, values} -> {:ok, values}
+            {:error, :response_byte_limit} -> {:error, "ERR native response byte limit exceeded"}
+          end
+        end
+
+      _unbounded ->
+        {:ok, Router.batch_get(ctx, keys)}
+    end
+  end
+
   defp execute_pipeline_fast_path(
          commands,
          %{
@@ -4699,12 +5174,10 @@ defmodule FerricstoreServer.Native.Commands do
           {:ok, requests, keys} ->
             Stats.incr_commands_by(state.stats_counter, length(commands))
 
-            results =
-              ctx
-              |> Router.batch_get(keys)
-              |> pipeline_get_results(requests)
-
-            {:ok, results}
+            case pipeline_batch_get(ctx, keys, state) do
+              {:ok, values} -> {:ok, pipeline_get_results(values, requests)}
+              {:error, _reason} = error -> error
+            end
 
           :fallback ->
             case pipeline_data_writes(commands) do
@@ -4826,12 +5299,14 @@ defmodule FerricstoreServer.Native.Commands do
        when mode == 2 and is_list(keys) and not is_nil(ctx) do
     Stats.incr_commands_by(state.stats_counter, length(keys))
 
-    pairs =
-      ctx
-      |> Router.batch_get(keys)
-      |> compact_pipeline_get_result(return_format)
+    case pipeline_batch_get(ctx, keys, state) do
+      {:ok, values} ->
+        pairs = compact_pipeline_get_result(values, return_format)
+        {:ok, format_compact_pipeline_get_result(pairs, @op_get, return_format)}
 
-    {:ok, format_compact_pipeline_get_result(pairs, @op_get, return_format)}
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp execute_compact_pipeline_fast_path(
@@ -4935,7 +5410,8 @@ defmodule FerricstoreServer.Native.Commands do
        when is_list(keys) and not is_nil(ctx) do
     Stats.incr_commands_by(state.stats_counter, length(keys))
 
-    with {:ok, results} <- guarded_collection_map(keys, state, &compact_smembers_result(ctx, &1)) do
+    with {:ok, results} <-
+           guarded_collection_map(keys, state, &compact_smembers_result(ctx, &1, &2, &3)) do
       {:ok, format_compact_pipeline_results(results, @op_smembers, return_format)}
     end
   end
@@ -4950,7 +5426,11 @@ defmodule FerricstoreServer.Native.Commands do
     Stats.incr_commands_by(state.stats_counter, length(keys))
 
     with {:ok, results} <-
-           guarded_collection_map(keys, state, &compact_hgetall_entry_result(ctx, &1)) do
+           guarded_collection_map(
+             keys,
+             state,
+             &compact_hgetall_entry_result(ctx, &1, &2, &3)
+           ) do
       case compact_hgetall_entry_values_payload(results) do
         payload when is_binary(payload) ->
           {:ok, payload}
@@ -4975,7 +5455,8 @@ defmodule FerricstoreServer.Native.Commands do
        when is_list(keys) and not is_nil(ctx) do
     Stats.incr_commands_by(state.stats_counter, length(keys))
 
-    with {:ok, results} <- guarded_collection_map(keys, state, &compact_hgetall_result(ctx, &1)) do
+    with {:ok, results} <-
+           guarded_collection_map(keys, state, &compact_hgetall_result(ctx, &1, &2, &3)) do
       {:ok, format_compact_pipeline_results(results, @op_hgetall, return_format)}
     end
   end
@@ -5020,18 +5501,24 @@ defmodule FerricstoreServer.Native.Commands do
        when is_list(ops) and not is_nil(ctx) do
     Stats.incr_commands_by(state.stats_counter, length(ops))
     {get_keys, set_pairs} = compact_mixed_collect(ops, [], [])
-    get_values = Router.batch_get(ctx, Enum.reverse(get_keys))
+    get_result = pipeline_batch_get(ctx, Enum.reverse(get_keys), state)
     set_results = Router.batch_quorum_put(ctx, Enum.reverse(set_pairs))
 
-    pairs =
-      compact_mixed_pairs(
-        ops,
-        get_values,
-        Enum.map(set_results, &pipeline_set_result_pair/1),
-        []
-      )
+    case get_result do
+      {:ok, get_values} ->
+        pairs =
+          compact_mixed_pairs(
+            ops,
+            get_values,
+            Enum.map(set_results, &pipeline_set_result_pair/1),
+            []
+          )
 
-    {:ok, format_compact_pipeline_pairs(pairs, @op_pipeline, return_format)}
+        {:ok, format_compact_pipeline_pairs(pairs, @op_pipeline, return_format)}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp execute_compact_pipeline_fast_path(
@@ -5185,23 +5672,29 @@ defmodule FerricstoreServer.Native.Commands do
         ]
       end)
 
-    values = Router.batch_get_on_route_keys(ctx, lookups)
+    values = Router.compound_batch_get_on_route_keys(ctx, lookups)
 
     {results, plain_checks} =
       items
       |> Enum.zip(Enum.chunk_every(values, 2))
       |> Enum.with_index()
       |> Enum.map_reduce([], fn {{{key, _field}, [type, field_value]}, index}, checks ->
-        case type do
-          "hash" ->
-            {{:ok, field_value}, checks}
-
+        case ReadResult.first_failure([type, field_value]) do
           nil ->
-            {{:check_plain, index}, [{index, {key, key}} | checks]}
+            case type do
+              "hash" ->
+                {{:ok, field_value}, checks}
 
-          _other_type ->
-            {{:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
-             checks}
+              nil ->
+                {{:check_plain, index}, [{index, {key, key}} | checks]}
+
+              _other_type ->
+                {{:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
+                 checks}
+            end
+
+          failure ->
+            {ReadResult.command_error(failure), checks}
         end
       end)
 
@@ -5235,23 +5728,29 @@ defmodule FerricstoreServer.Native.Commands do
         ]
       end)
 
-    values = Router.batch_get_on_route_keys(ctx, lookups)
+    values = Router.compound_batch_get_on_route_keys(ctx, lookups)
 
     {results, plain_checks} =
       items
       |> Enum.zip(Enum.chunk_every(values, 2))
       |> Enum.with_index()
       |> Enum.map_reduce([], fn {{{key, _member}, [type, member_value]}, index}, checks ->
-        case type do
-          "set" ->
-            {{:ok, member_value != nil}, checks}
-
+        case ReadResult.first_failure([type, member_value]) do
           nil ->
-            {{:check_plain, index}, [{index, {key, key}} | checks]}
+            case type do
+              "set" ->
+                {{:ok, member_value != nil}, checks}
 
-          _other_type ->
-            {{:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
-             checks}
+              nil ->
+                {{:check_plain, index}, [{index, {key, key}} | checks]}
+
+              _other_type ->
+                {{:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
+                 checks}
+            end
+
+          failure ->
+            {ReadResult.command_error(failure), checks}
         end
       end)
 
@@ -5267,23 +5766,29 @@ defmodule FerricstoreServer.Native.Commands do
         ]
       end)
 
-    values = Router.batch_get_on_route_keys(ctx, lookups)
+    values = Router.compound_batch_get_on_route_keys(ctx, lookups)
 
     {results, plain_checks} =
       items
       |> Enum.zip(Enum.chunk_every(values, 2))
       |> Enum.with_index()
       |> Enum.map_reduce([], fn {{{key, _member}, [type, score]}, index}, checks ->
-        case type do
-          "zset" ->
-            {{:ok, score}, checks}
-
+        case ReadResult.first_failure([type, score]) do
           nil ->
-            {{:check_plain, index}, [{index, {key, key}} | checks]}
+            case type do
+              "zset" ->
+                {{:ok, score}, checks}
 
-          _other_type ->
-            {{:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
-             checks}
+              nil ->
+                {{:check_plain, index}, [{index, {key, key}} | checks]}
+
+              _other_type ->
+                {{:error, "WRONGTYPE Operation against a key holding the wrong kind of value"},
+                 checks}
+            end
+
+          failure ->
+            {ReadResult.command_error(failure), checks}
         end
       end)
 
@@ -5296,7 +5801,7 @@ defmodule FerricstoreServer.Native.Commands do
     plain_checks = Enum.reverse(plain_checks)
 
     plain_values =
-      Router.batch_get_on_route_keys(ctx, Enum.map(plain_checks, fn {_index, pair} -> pair end))
+      Router.batch_get(ctx, Enum.map(plain_checks, fn {_index, {_route_key, key}} -> key end))
 
     nil_value = Keyword.fetch!(opts, :nil_value)
     result_tuple = List.to_tuple(results)
@@ -5305,9 +5810,16 @@ defmodule FerricstoreServer.Native.Commands do
     |> Enum.zip(plain_values)
     |> Enum.reduce(result_tuple, fn {{index, _pair}, value}, acc ->
       result =
-        if value == nil,
-          do: {:ok, nil_value},
-          else: {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        case value do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
+          nil ->
+            {:ok, nil_value}
+
+          _value ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
 
       put_elem(acc, index, result)
     end)
@@ -5425,17 +5937,31 @@ defmodule FerricstoreServer.Native.Commands do
     Enum.map(0..(count - 1), &Map.fetch!(result_map, &1))
   end
 
-  defp compact_smembers_result(ctx, key) do
+  defp compact_smembers_result(ctx, key, remaining, remaining_bytes) do
     case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         []
 
       "set" ->
         prefix = CompoundKey.set_prefix(key)
+        limits = compact_collection_scan_limits(remaining, remaining_bytes, :set)
 
-        ctx
-        |> Router.compound_scan_raw(key, prefix)
-        |> Enum.map(fn {member, _value} -> member end)
+        case Router.compound_scan_raw_bounded(ctx, key, prefix, limits) do
+          {:error, :collection_response_limit} ->
+            :collection_response_limit_exceeded
+
+          {:error, :response_byte_limit} ->
+            :response_byte_limit_exceeded
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
+          members when is_list(members) ->
+            members
+        end
 
       _other_type ->
         @wrongtype_error
@@ -5453,21 +5979,40 @@ defmodule FerricstoreServer.Native.Commands do
     FerricStore.Impl.hmget(ctx, key, fields)
   end
 
-  defp compact_hgetall_result(ctx, key) do
-    case compact_hgetall_entry_result(ctx, key) do
+  defp compact_hgetall_result(ctx, key, remaining, remaining_bytes) do
+    case compact_hgetall_entry_result(ctx, key, remaining, remaining_bytes) do
       {:ok, entries} -> Map.new(entries)
       {:error, _reason} = error -> error
+      :collection_response_limit_exceeded -> :collection_response_limit_exceeded
+      :response_byte_limit_exceeded -> :response_byte_limit_exceeded
     end
   end
 
-  defp compact_hgetall_entry_result(ctx, key) do
+  defp compact_hgetall_entry_result(ctx, key, remaining, remaining_bytes) do
     case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         {:ok, []}
 
       "hash" ->
         prefix = CompoundKey.hash_prefix(key)
-        {:ok, Router.compound_scan_raw(ctx, key, prefix)}
+        limits = compact_collection_scan_limits(remaining, remaining_bytes, :hash)
+
+        case Router.compound_scan_raw_bounded(ctx, key, prefix, limits) do
+          {:error, :collection_response_limit} ->
+            :collection_response_limit_exceeded
+
+          {:error, :response_byte_limit} ->
+            :response_byte_limit_exceeded
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
+          entries when is_list(entries) ->
+            {:ok, entries}
+        end
 
       _other_type ->
         @wrongtype_error
@@ -5493,28 +6038,99 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp guarded_collection_map(items, state, mapper) do
-    limit = native_max_collection_response_items(state)
-    guarded_collection_map(items, mapper, limit, 0, [])
+    item_limit = native_max_collection_response_items(state)
+    byte_limit = native_max_response_bytes(state)
+    guarded_collection_map(items, mapper, item_limit, byte_limit, 0, 0, [])
   end
 
-  defp guarded_collection_map([item | rest], mapper, limit, count, acc) do
-    result = mapper.(item)
-    count = count + collection_result_items(result)
+  defp guarded_collection_map(
+         [item | rest],
+         mapper,
+         item_limit,
+         byte_limit,
+         count,
+         bytes,
+         acc
+       ) do
+    remaining = compact_collection_remaining(item_limit, count)
+    remaining_bytes = compact_collection_remaining(byte_limit, bytes)
 
-    if limit > 0 and count > limit do
-      collection_response_limit_error()
-    else
-      guarded_collection_map(rest, mapper, limit, count, [result | acc])
+    case mapper.(item, remaining, remaining_bytes) do
+      :collection_response_limit_exceeded ->
+        collection_response_limit_error()
+
+      :response_byte_limit_exceeded ->
+        response_byte_limit_error()
+
+      result ->
+        count = count + collection_result_items(result)
+        bytes = bytes + collection_result_payload_bytes(result)
+
+        cond do
+          item_limit > 0 and count > item_limit ->
+            collection_response_limit_error()
+
+          byte_limit > 0 and bytes > byte_limit ->
+            response_byte_limit_error()
+
+          true ->
+            guarded_collection_map(
+              rest,
+              mapper,
+              item_limit,
+              byte_limit,
+              count,
+              bytes,
+              [result | acc]
+            )
+        end
     end
   end
 
-  defp guarded_collection_map([], _mapper, _limit, _count, acc), do: {:ok, Enum.reverse(acc)}
+  defp guarded_collection_map([], _mapper, _item_limit, _byte_limit, _count, _bytes, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp compact_collection_scan_limits(remaining, remaining_bytes, collection_type) do
+    {include_values, fields_only} =
+      case collection_type do
+        :hash -> {true, false}
+        :set -> {false, true}
+      end
+
+    %{
+      max_entries: remaining,
+      max_bytes: remaining_bytes,
+      entry_overhead: 0,
+      include_values: include_values,
+      fields_only: fields_only
+    }
+  end
 
   defp collection_result_items({:ok, value}), do: collection_result_items(value)
   defp collection_result_items({:error, _reason}), do: 0
   defp collection_result_items(value) when is_map(value), do: map_size(value)
   defp collection_result_items(value) when is_list(value), do: length(value)
   defp collection_result_items(_value), do: 1
+
+  defp collection_result_payload_bytes({:ok, value}), do: collection_result_payload_bytes(value)
+  defp collection_result_payload_bytes({:error, _reason}), do: 0
+
+  defp collection_result_payload_bytes(value) when is_binary(value),
+    do: byte_size(value)
+
+  defp collection_result_payload_bytes(value) when is_map(value) do
+    Enum.reduce(value, 0, fn {key, item}, bytes ->
+      bytes + collection_result_payload_bytes(key) + collection_result_payload_bytes(item)
+    end)
+  end
+
+  defp collection_result_payload_bytes(value) when is_list(value),
+    do: Enum.reduce(value, 0, &(&2 + collection_result_payload_bytes(&1)))
+
+  defp collection_result_payload_bytes(value) when is_tuple(value),
+    do: value |> Tuple.to_list() |> collection_result_payload_bytes()
+
+  defp collection_result_payload_bytes(_value), do: 0
 
   defp native_max_collection_response_items(state) do
     Map.get(state, :max_collection_response_items) ||
@@ -5529,6 +6145,15 @@ defmodule FerricstoreServer.Native.Commands do
     )
   end
 
+  defp native_max_response_bytes(state) do
+    Map.get(state, :max_response_bytes) ||
+      Application.get_env(
+        :ferricstore,
+        :native_max_response_bytes,
+        @default_max_response_bytes
+      )
+  end
+
   defp collection_items_exceeds_limit?(count, state) do
     limit = native_max_collection_response_items(state)
     limit > 0 and count > limit
@@ -5538,8 +6163,44 @@ defmodule FerricstoreServer.Native.Commands do
     {:bad_request, "ERR native collection response item limit exceeded", state}
   end
 
+  defp response_byte_limit_reply(state) do
+    {:bad_request, "ERR native response byte limit exceeded", state}
+  end
+
+  defp native_get_result(get_fun, state) when is_function(get_fun, 1) do
+    limit = native_max_response_bytes(state)
+    value_budget = native_get_value_budget(limit)
+
+    case get_fun.(value_budget) do
+      {:ok, value} ->
+        if native_get_value_fits?(value, limit),
+          do: {:ok, value, state},
+          else: response_byte_limit_reply(state)
+
+      {:error, :response_byte_limit} ->
+        response_byte_limit_reply(state)
+
+      {:error, _reason} = error ->
+        result_to_reply(error, state)
+    end
+  end
+
+  defp native_get_value_budget(limit) when is_integer(limit) and limit > 0,
+    do: max(limit - 7, 0)
+
+  defp native_get_value_budget(_unbounded), do: :unlimited
+
+  defp native_get_value_fits?(_value, limit) when not is_integer(limit) or limit <= 0, do: true
+  defp native_get_value_fits?(nil, limit), do: limit >= 3
+
+  defp native_get_value_fits?(value, limit) when is_binary(value),
+    do: byte_size(value) + 7 <= limit
+
   defp collection_response_limit_error,
     do: {:error, "ERR native collection response item limit exceeded"}
+
+  defp response_byte_limit_error,
+    do: {:error, "ERR native response byte limit exceeded"}
 
   defp compact_hgetall_entry_result_to_map_result({:ok, entries}), do: Map.new(entries)
   defp compact_hgetall_entry_result_to_map_result({:error, _reason} = error), do: error
@@ -5572,6 +6233,9 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp compact_lrange_result(ctx, key, start, stop, remaining) do
     case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         []
 
@@ -5585,6 +6249,9 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp compact_lrange_list_result(ctx, key, start, stop, remaining) do
     case compact_lrange_meta(ctx, key) do
+      {:error, _reason} = error ->
+        error
+
       nil ->
         []
 
@@ -5605,23 +6272,25 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp compact_lrange_meta(ctx, key) do
     case Router.compound_get(ctx, key, CompoundKey.list_meta_key(key)) do
-      nil -> nil
-      binary when is_binary(binary) -> decode_compact_lrange_meta(binary)
-      _other -> :invalid
-    end
-  end
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
-  defp decode_compact_lrange_meta(binary) do
-    case :erlang.binary_to_term(binary, [:safe]) do
-      {len, left_pos, right_pos}
-      when is_integer(len) and len >= 0 and is_integer(left_pos) and is_integer(right_pos) ->
-        {len, left_pos, right_pos}
+      nil ->
+        nil
+
+      binary when is_binary(binary) ->
+        decode_compact_lrange_meta(binary)
 
       _other ->
         :invalid
     end
-  rescue
-    _ -> :invalid
+  end
+
+  defp decode_compact_lrange_meta(binary) do
+    case ListOps.decode_meta(binary) do
+      nil -> :invalid
+      meta -> meta
+    end
   end
 
   defp compact_regular_list_meta?({len, left_pos, right_pos}) do
@@ -5647,10 +6316,16 @@ defmodule FerricstoreServer.Native.Commands do
           keys = compact_lrange_element_keys(key, left_pos, start_idx, stop_idx)
           values = Router.compound_batch_get(ctx, key, keys)
 
-          if Enum.any?(values, &is_nil/1) do
-            compact_lrange_fallback(ctx, key, start, stop, remaining)
-          else
-            values
+          case ReadResult.first_failure(values) do
+            nil ->
+              if Enum.any?(values, &is_nil/1) do
+                compact_lrange_fallback(ctx, key, start, stop, remaining)
+              else
+                values
+              end
+
+            failure ->
+              ReadResult.command_error(failure)
           end
         end
     end
@@ -5687,8 +6362,8 @@ defmodule FerricstoreServer.Native.Commands do
               :ok
           end
 
-        _other ->
-          :ok
+        {:error, _reason} = error ->
+          error
       end
     end
   end
@@ -5723,11 +6398,11 @@ defmodule FerricstoreServer.Native.Commands do
         {Router.shard_for(ctx, key), key, start, stop, with_scores}
       end)
 
-    table_cache = compact_zrange_table_cache(ctx, routed)
-
-    limit = native_max_collection_response_items(state)
-
-    compact_zrange_results(routed, table_cache, ctx, limit, 0, [])
+    PublicationEpoch.read(ctx, Enum.map(routed, &elem(&1, 0)), fn ->
+      table_cache = compact_zrange_table_cache(ctx, routed)
+      limit = native_max_collection_response_items(state)
+      compact_zrange_results(routed, table_cache, ctx, limit, 0, [])
+    end)
   end
 
   defp compact_zrange_results(
@@ -5800,7 +6475,27 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp compact_zrange_index_result(ctx, index, lookup, key, start, stop, with_scores, remaining) do
     if ZSetIndex.ready?(lookup, key) do
-      compact_zrange_ready_index_result(index, lookup, key, start, stop, with_scores, remaining)
+      case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
+        "zset" ->
+          compact_zrange_ready_index_result(
+            index,
+            lookup,
+            key,
+            start,
+            stop,
+            with_scores,
+            remaining
+          )
+
+        nil ->
+          if Router.exists?(ctx, key), do: @wrongtype_error, else: {:ok, []}
+
+        _other_type ->
+          @wrongtype_error
+      end
     else
       compact_zrange_not_ready_result(ctx, key, start, stop, with_scores, remaining)
     end
@@ -5863,11 +6558,11 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp compact_zrange_not_ready_result(ctx, key, start, stop, with_scores, remaining) do
     case Router.compound_get(ctx, key, CompoundKey.type_key(key)) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
-        case Router.batch_get(ctx, [key]) do
-          [nil] -> {:ok, []}
-          [_value] -> @wrongtype_error
-        end
+        if Router.exists?(ctx, key), do: @wrongtype_error, else: {:ok, []}
 
       "zset" ->
         compact_zrange_fallback(ctx, key, start, stop, with_scores, remaining)
@@ -5918,8 +6613,8 @@ defmodule FerricstoreServer.Native.Commands do
             :ok
           end
 
-        _other ->
-          :ok
+        {:error, _reason} = error ->
+          error
       end
     end
   end

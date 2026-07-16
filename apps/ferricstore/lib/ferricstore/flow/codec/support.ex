@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   import Bitwise
 
   alias Ferricstore.Flow.Codec.Primitives
+  alias Ferricstore.TermCodec
 
   @value_bin_magic "FSV2"
   @record_value_refs_key "__value_refs__"
@@ -11,6 +12,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   @record_indexed_attributes_key "__indexed_attributes__"
   @record_state_meta_key "__state_meta__"
   @record_indexed_state_meta_key "__indexed_state_meta__"
+  @record_incarnation_key "__incarnation__"
   @record_state_enter_seq_key "__state_enter_seq__"
   @record_governance_limit_key "__governance_limit__"
   @history_value_refs_key "value_refs"
@@ -42,6 +44,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   @record_flag_sidecar 1 <<< 23
   @record_flag_max_active_ms 1 <<< 24
   @history_flag_meta 1 <<< 12
+  @max_exact_integer 9_007_199_254_740_991
 
   def encode_record_flags(record, sidecar) do
     0
@@ -120,31 +123,59 @@ defmodule Ferricstore.Flow.Codec.Support do
   def encode_value(@value_bin_magic <> _rest = value), do: @value_bin_magic <> <<1>> <> value
 
   def encode_value(value) when is_binary(value), do: value
-  def encode_value(value), do: @value_bin_magic <> <<2>> <> :erlang.term_to_binary(value)
+  def encode_value(value), do: @value_bin_magic <> <<2>> <> TermCodec.encode(value)
 
   @doc false
   def decode_value(@value_bin_magic <> <<1, encoded::binary>>), do: encoded
 
   def decode_value(@value_bin_magic <> <<2, encoded::binary>>) do
-    :erlang.binary_to_term(encoded, [:safe])
-  rescue
-    _ -> encoded
+    case TermCodec.decode(encoded) do
+      {:ok, value} -> value
+      {:error, :invalid_external_term} -> encoded
+    end
   end
 
   def decode_value(value), do: value
+
+  def decode_value_result(@value_bin_magic <> <<1, encoded::binary>>), do: {:ok, encoded}
+
+  def decode_value_result(@value_bin_magic <> <<2, encoded::binary>>) do
+    case TermCodec.decode(encoded) do
+      {:ok, value} -> {:ok, value}
+      {:error, :invalid_external_term} -> {:error, :invalid_flow_value}
+    end
+  end
+
+  def decode_value_result(value), do: {:ok, value}
 
   def decode_value_with_user_size(@value_bin_magic <> <<1, encoded::binary>>) do
     {encoded, byte_size(encoded)}
   end
 
   def decode_value_with_user_size(@value_bin_magic <> <<2, encoded::binary>>) do
-    {:erlang.binary_to_term(encoded, [:safe]), byte_size(encoded)}
-  rescue
-    _ -> {encoded, byte_size(encoded)}
+    case TermCodec.decode(encoded) do
+      {:ok, value} -> {value, byte_size(encoded)}
+      {:error, :invalid_external_term} -> {encoded, byte_size(encoded)}
+    end
   end
 
   def decode_value_with_user_size(value) when is_binary(value), do: {value, byte_size(value)}
   def decode_value_with_user_size(value), do: {value, 0}
+
+  def decode_value_with_user_size_result(@value_bin_magic <> <<1, encoded::binary>>),
+    do: {:ok, {encoded, byte_size(encoded)}}
+
+  def decode_value_with_user_size_result(@value_bin_magic <> <<2, encoded::binary>>) do
+    case TermCodec.decode(encoded) do
+      {:ok, value} -> {:ok, {value, byte_size(encoded)}}
+      {:error, :invalid_external_term} -> {:error, :invalid_flow_value}
+    end
+  end
+
+  def decode_value_with_user_size_result(value) when is_binary(value),
+    do: {:ok, {value, byte_size(value)}}
+
+  def decode_value_with_user_size_result(value), do: {:ok, {value, 0}}
 
   def decode_history_meta_for_flags(flags, rest) do
     if (flags &&& @history_flag_meta) != 0 do
@@ -198,7 +229,8 @@ defmodule Ferricstore.Flow.Codec.Support do
   def history_meta_pair(key, value) when is_binary(value), do: [{key, value}]
   def history_meta_pair(key, value) when is_atom(value), do: [{key, Atom.to_string(value)}]
   def history_meta_pair(key, value) when is_integer(value), do: [{key, Integer.to_string(value)}]
-  def history_meta_pair(key, value), do: [{key, to_string(value)}]
+  def history_meta_pair(key, value) when is_float(value), do: [{key, Float.to_string(value)}]
+  def history_meta_pair(_key, _value), do: []
 
   def encode_history_meta([]), do: <<1>>
 
@@ -257,12 +289,14 @@ defmodule Ferricstore.Flow.Codec.Support do
     indexed_attributes = Ferricstore.Flow.Attributes.indexed_names(record)
     state_meta = Ferricstore.Flow.StateMeta.record(record)
     indexed_state_meta = Ferricstore.Flow.StateMeta.indexed_key(record)
+    incarnation = Map.get(record, :incarnation)
     state_enter_seq = Map.get(record, :state_enter_seq)
     governance_limit = encode_governance_limit(Map.get(record, :governance_limit))
 
     if map_size(refs) == 0 and map_size(attributes) == 0 and indexed_attributes == [] and
          map_size(state_meta) == 0 and is_nil(indexed_state_meta) and
-         not is_integer(state_enter_seq) and is_nil(governance_limit) do
+         not is_integer(incarnation) and not is_integer(state_enter_seq) and
+         is_nil(governance_limit) do
       encode_child_groups(child_groups)
     else
       child_groups
@@ -271,6 +305,7 @@ defmodule Ferricstore.Flow.Codec.Support do
       |> maybe_put_record_indexed_attributes(indexed_attributes)
       |> maybe_put_record_state_meta(state_meta)
       |> maybe_put_record_indexed_state_meta(indexed_state_meta)
+      |> maybe_put_record_incarnation(incarnation)
       |> maybe_put_record_state_enter_seq(state_enter_seq)
       |> maybe_put_record_governance_limit(governance_limit)
       |> encode_child_groups()
@@ -294,21 +329,32 @@ defmodule Ferricstore.Flow.Codec.Support do
     {indexed_state_meta, child_groups} =
       Map.pop(child_groups, @record_indexed_state_meta_key, nil)
 
+    {incarnation, child_groups} =
+      Map.pop(child_groups, @record_incarnation_key, nil)
+
     {state_enter_seq, child_groups} =
       Map.pop(child_groups, @record_state_enter_seq_key, nil)
 
     {governance_limit, child_groups} =
       Map.pop(child_groups, @record_governance_limit_key, nil)
 
-    {child_groups, decode_value_refs(encoded_refs),
-     Ferricstore.Flow.Attributes.decode_sidecar(encoded_attributes),
-     decode_record_indexed_attributes(indexed_attributes),
-     Ferricstore.Flow.StateMeta.decode_sidecar(encoded_state_meta),
-     decode_record_indexed_state_meta(indexed_state_meta),
-     decode_record_state_enter_seq(state_enter_seq), decode_governance_limit(governance_limit)}
+    with {:ok, value_refs} <- decode_value_refs_strict(encoded_refs),
+         {:ok, attributes} <- Ferricstore.Flow.Attributes.normalize(encoded_attributes),
+         {:ok, indexed_attributes} <-
+           Ferricstore.Flow.Attributes.normalize_indexed_names(indexed_attributes),
+         {:ok, state_meta} <- Ferricstore.Flow.StateMeta.normalize(encoded_state_meta),
+         {:ok, indexed_state_meta} <-
+           Ferricstore.Flow.StateMeta.normalize_indexed_key(indexed_state_meta),
+         {:ok, incarnation} <- decode_optional_nonnegative_integer(incarnation),
+         {:ok, state_enter_seq} <- decode_optional_nonnegative_integer(state_enter_seq) do
+      {child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta,
+       incarnation, state_enter_seq, decode_governance_limit(governance_limit)}
+    else
+      _ -> raise ArgumentError, "invalid flow record sidecar"
+    end
   end
 
-  def split_record_sidecar(_groups), do: {%{}, %{}, %{}, [], %{}, nil, nil, nil}
+  def split_record_sidecar(_groups), do: raise(ArgumentError, "invalid flow record sidecar")
 
   def maybe_put_record_refs(groups, refs) when is_map(refs) and map_size(refs) > 0,
     do: Map.put(groups, @record_value_refs_key, encode_value_refs(refs))
@@ -340,6 +386,12 @@ defmodule Ferricstore.Flow.Codec.Support do
     do: Map.put(groups, @record_indexed_state_meta_key, key)
 
   def maybe_put_record_indexed_state_meta(groups, _key), do: groups
+
+  def maybe_put_record_incarnation(groups, incarnation)
+      when is_integer(incarnation) and incarnation >= 0,
+      do: Map.put(groups, @record_incarnation_key, incarnation)
+
+  def maybe_put_record_incarnation(groups, _incarnation), do: groups
 
   def maybe_put_record_state_enter_seq(groups, seq) when is_integer(seq) and seq >= 0,
     do: Map.put(groups, @record_state_enter_seq_key, seq)
@@ -412,6 +464,20 @@ defmodule Ferricstore.Flow.Codec.Support do
   def decode_record_state_enter_seq(seq) when is_integer(seq) and seq >= 0, do: seq
   def decode_record_state_enter_seq(_seq), do: nil
 
+  def decode_record_incarnation(incarnation)
+      when is_integer(incarnation) and incarnation >= 0,
+      do: incarnation
+
+  def decode_record_incarnation(_incarnation), do: nil
+
+  defp decode_optional_nonnegative_integer(nil), do: {:ok, nil}
+
+  defp decode_optional_nonnegative_integer(value)
+       when is_integer(value) and value >= 0 and value <= @max_exact_integer,
+       do: {:ok, value}
+
+  defp decode_optional_nonnegative_integer(_value), do: :error
+
   def flow_record_value_refs(record) when is_map(record) do
     record
     |> Map.get(:value_refs, %{})
@@ -468,6 +534,48 @@ defmodule Ferricstore.Flow.Codec.Support do
 
   def decode_value_refs(_refs), do: %{}
 
+  defp decode_value_refs_strict(refs) when is_map(refs) do
+    if Enum.all?(refs, &valid_value_ref_entry?/1) do
+      {:ok, decode_value_refs(refs)}
+    else
+      :error
+    end
+  end
+
+  defp decode_value_refs_strict(_refs), do: :error
+
+  defp valid_value_ref_entry?({name, entry}) when is_binary(name) and name != "" do
+    case entry do
+      %{} ->
+        ref = Map.get(entry, :ref) || Map.get(entry, "ref")
+        version = Map.get(entry, :version) || Map.get(entry, "version")
+        digest = Map.get(entry, :digest) || Map.get(entry, "digest")
+
+        is_binary(ref) and ref != "" and valid_value_ref_version?(version) and
+          valid_value_ref_digest?(digest)
+
+      ref when is_binary(ref) ->
+        ref != ""
+
+      _other ->
+        false
+    end
+  end
+
+  defp valid_value_ref_entry?(_entry), do: false
+
+  defp valid_value_ref_version?(nil), do: true
+
+  defp valid_value_ref_version?(value) do
+    case value_ref_integer(value) do
+      value when is_integer(value) and value >= 0 and value <= @max_exact_integer -> true
+      _other -> false
+    end
+  end
+
+  defp valid_value_ref_digest?(nil), do: true
+  defp valid_value_ref_digest?(value), do: is_binary(value) and value != ""
+
   def value_ref_integer(value) when is_integer(value), do: value
 
   def value_ref_integer(value) when is_binary(value) do
@@ -492,11 +600,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   def decode_child_groups_payload("J{}"), do: {:ok, %{}}
   def decode_child_groups_payload("J" <> json), do: Jason.decode(json)
 
-  def decode_child_groups_payload(encoded) do
-    {:ok, :erlang.binary_to_term(encoded, [:safe])}
-  rescue
-    _ -> :error
-  end
+  def decode_child_groups_payload(_unsupported), do: :error
 
   def normalize_child_groups(groups) when is_map(groups), do: groups
   def normalize_child_groups(_groups), do: %{}

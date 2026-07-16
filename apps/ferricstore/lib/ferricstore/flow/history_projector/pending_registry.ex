@@ -11,7 +11,7 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
   def reserve(projector, count) when is_atom(projector) do
     case lookup(projector) do
       {:ok, counter, max_pending} -> reserve_counter(counter, count, max_pending)
-      :error -> :ok
+      :error -> {:error, :not_registered}
     end
   end
 
@@ -76,61 +76,28 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
 
       {min_index, max_index} ->
         table = ensure_replay_reservation_registry()
-
-        case :ets.lookup(table, projector) do
-          [{^projector, old_min, old_max, flushed_index}] ->
-            :ets.insert(
-              table,
-              {projector, min(old_min, min_index), max(old_max, max_index), flushed_index}
-            )
-
-          _missing ->
-            :ets.insert(table, {projector, min_index, max_index, 0})
-        end
-
-        :ok
+        reserve_replay_range_cas(table, projector, min_index, max_index)
     end
   rescue
-    _ -> :ok
+    error -> {:error, {:replay_reservation_failed, error}}
   end
 
   def mark_replay_range_flushed(_projector, nil), do: :ok
 
   def mark_replay_range_flushed(projector, index) when is_integer(index) and index >= 0 do
     table = ensure_replay_reservation_registry()
-
-    case :ets.lookup(table, projector) do
-      [{^projector, min_index, max_index, flushed_index}] ->
-        :ets.insert(table, {projector, min_index, max_index, max(flushed_index, index)})
-
-      _missing ->
-        :ok
-    end
-
-    :ok
+    mark_replay_range_flushed_cas(table, projector, index)
   rescue
-    _ -> :ok
+    error -> {:error, {:replay_flush_mark_failed, error}}
   end
 
   def trim_replay_reservation(_projector, nil), do: :ok
 
   def trim_replay_reservation(projector, index) when is_integer(index) and index >= 0 do
     table = ensure_replay_reservation_registry()
-
-    case :ets.lookup(table, projector) do
-      [{^projector, _min_index, max_index, _flushed_index}] when index >= max_index ->
-        :ets.delete(table, projector)
-
-      [{^projector, min_index, max_index, flushed_index}] when index >= min_index ->
-        :ets.insert(table, {projector, index + 1, max_index, flushed_index})
-
-      _other ->
-        :ok
-    end
-
-    :ok
+    trim_replay_reservation_cas(table, projector, index)
   rescue
-    _ -> :ok
+    error -> {:error, {:replay_reservation_trim_failed, error}}
   end
 
   def replay_reservation_flushed_index(projector) do
@@ -163,28 +130,52 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
   def append_overflow(projector, entries) when is_atom(projector) and is_list(entries) do
     table = ensure_overflow_registry()
     sequence = :erlang.unique_integer([:monotonic, :positive])
-    :ets.insert(table, {{projector, sequence}, entries})
-    :ok
+    :ets.insert(table, {{projector, sequence}, {:pending, entries}})
+    {:ok, sequence}
   rescue
     error -> {:error, {:overflow_append_failed, error}}
   end
 
-  def take_overflow(projector) when is_atom(projector) do
+  def commit_overflow(projector, sequence)
+      when is_atom(projector) and is_integer(sequence) and sequence > 0 do
     table = ensure_overflow_registry()
-
-    rows =
-      :ets.select(table, [
-        {{{projector, :"$1"}, :"$2"}, [], [{{:"$1", :"$2"}}]}
-      ])
-
-    rows
-    |> Enum.sort_by(fn {sequence, _entries} -> sequence end)
-    |> Enum.flat_map(fn {sequence, entries} ->
-      :ets.delete(table, {projector, sequence})
-      entries
-    end)
+    commit_overflow_cas(table, {projector, sequence})
   rescue
-    _ -> []
+    error -> {:error, {:overflow_commit_failed, error}}
+  end
+
+  def delete_overflow(projector, sequence)
+      when is_atom(projector) and is_integer(sequence) and sequence > 0 do
+    table = ensure_overflow_registry()
+    :ets.delete(table, {projector, sequence})
+    :ok
+  rescue
+    error -> {:error, {:overflow_delete_failed, error}}
+  end
+
+  def take_overflow(projector, max_entries)
+      when is_atom(projector) and is_integer(max_entries) and max_entries > 0 do
+    table = ensure_overflow_registry()
+    take_overflow_entries(table, projector, {projector, 0}, max_entries, [])
+  rescue
+    error -> {:error, {:overflow_take_failed, error}}
+  end
+
+  def take_overflow(_projector, max_entries),
+    do: {:error, {:invalid_overflow_take_limit, max_entries}}
+
+  def discard(projector) when is_atom(projector) do
+    overflow_table = ensure_overflow_registry()
+    replay_table = ensure_replay_reservation_registry()
+
+    :ets.select_delete(overflow_table, [
+      {{{projector, :"$1"}, :"$2"}, [], [true]}
+    ])
+
+    :ets.delete(replay_table, projector)
+    :ok
+  rescue
+    error -> {:error, {:pending_discard_failed, error}}
   end
 
   defp ensure_pending_registry(name) do
@@ -247,6 +238,160 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
 
       table ->
         table
+    end
+  end
+
+  defp take_overflow_entries(_table, _projector, _key, 0, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp take_overflow_entries(table, projector, key, remaining, acc) do
+    case :ets.next(table, key) do
+      :"$end_of_table" ->
+        {:ok, Enum.reverse(acc)}
+
+      {^projector, _sequence} = next_key ->
+        case :ets.lookup(table, next_key) do
+          [{^next_key, {:ready, entries}}] when is_list(entries) ->
+            {taken, rest} = Enum.split(entries, remaining)
+            next_acc = Enum.reverse(taken, acc)
+
+            case rest do
+              [] ->
+                :ets.delete(table, next_key)
+
+                take_overflow_entries(
+                  table,
+                  projector,
+                  next_key,
+                  remaining - length(taken),
+                  next_acc
+                )
+
+              [_ | _] ->
+                :ets.insert(table, {next_key, {:ready, rest}})
+                {:ok, Enum.reverse(next_acc)}
+            end
+
+          [{^next_key, {:pending, entries}}] when is_list(entries) ->
+            {:ok, Enum.reverse(acc)}
+
+          invalid ->
+            {:error, {:invalid_overflow_row, next_key, invalid}}
+        end
+
+      _other_projector ->
+        {:ok, Enum.reverse(acc)}
+    end
+  end
+
+  defp reserve_replay_range_cas(table, projector, min_index, max_index) do
+    case :ets.lookup(table, projector) do
+      [] ->
+        if :ets.insert_new(table, {projector, min_index, max_index, 0}) do
+          :ok
+        else
+          reserve_replay_range_cas(table, projector, min_index, max_index)
+        end
+
+      [{^projector, old_min, old_max, flushed_index} = current]
+      when is_integer(old_min) and old_min >= 0 and is_integer(old_max) and old_max >= old_min and
+             is_integer(flushed_index) and flushed_index >= 0 ->
+        replacement =
+          {projector, min(old_min, min_index), max(old_max, max_index), flushed_index}
+
+        replace_replay_row(
+          table,
+          current,
+          replacement,
+          fn -> reserve_replay_range_cas(table, projector, min_index, max_index) end
+        )
+
+      invalid ->
+        {:error, {:invalid_replay_reservation, projector, invalid}}
+    end
+  end
+
+  defp commit_overflow_cas(table, key) do
+    case :ets.lookup(table, key) do
+      [{^key, {:pending, entries}}] when is_list(entries) ->
+        case :ets.update_element(table, key, {2, {:ready, entries}}) do
+          true -> :ok
+          false -> commit_overflow_cas(table, key)
+        end
+
+      [{^key, {:ready, entries}}] when is_list(entries) ->
+        :ok
+
+      [] ->
+        {:error, {:overflow_row_missing, key}}
+
+      invalid ->
+        {:error, {:invalid_overflow_row, key, invalid}}
+    end
+  end
+
+  defp mark_replay_range_flushed_cas(table, projector, index) do
+    case :ets.lookup(table, projector) do
+      [] ->
+        :ok
+
+      [{^projector, min_index, max_index, flushed_index} = current]
+      when is_integer(min_index) and min_index >= 0 and is_integer(max_index) and
+             max_index >= min_index and is_integer(flushed_index) and flushed_index >= 0 ->
+        replacement = {projector, min_index, max_index, max(flushed_index, index)}
+
+        replace_replay_row(
+          table,
+          current,
+          replacement,
+          fn -> mark_replay_range_flushed_cas(table, projector, index) end
+        )
+
+      invalid ->
+        {:error, {:invalid_replay_reservation, projector, invalid}}
+    end
+  end
+
+  defp trim_replay_reservation_cas(table, projector, index) do
+    case :ets.lookup(table, projector) do
+      [] ->
+        :ok
+
+      [{^projector, min_index, max_index, flushed_index} = current]
+      when is_integer(min_index) and min_index >= 0 and is_integer(max_index) and
+             max_index >= min_index and is_integer(flushed_index) and flushed_index >= 0 ->
+        cond do
+          index >= max_index ->
+            case :ets.select_delete(table, [{current, [], [true]}]) do
+              1 -> :ok
+              0 -> trim_replay_reservation_cas(table, projector, index)
+            end
+
+          index >= min_index ->
+            replacement = {projector, index + 1, max_index, flushed_index}
+
+            replace_replay_row(
+              table,
+              current,
+              replacement,
+              fn -> trim_replay_reservation_cas(table, projector, index) end
+            )
+
+          true ->
+            :ok
+        end
+
+      invalid ->
+        {:error, {:invalid_replay_reservation, projector, invalid}}
+    end
+  end
+
+  defp replace_replay_row(_table, current, current, _retry), do: :ok
+
+  defp replace_replay_row(table, current, replacement, retry) do
+    case :ets.select_replace(table, [{current, [], [{replacement}]}]) do
+      1 -> :ok
+      0 -> retry.()
     end
   end
 

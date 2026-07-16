@@ -171,6 +171,7 @@ defmodule Ferricstore.Commands.DispatcherTest do
     assert [1] == Dispatcher.dispatch_ast({:hexpire, "h", 10, ["f1"]}, store)
     assert [_ttl] = Dispatcher.dispatch_ast({:httl, "h", ["f1"]}, store)
     assert ["6"] == Dispatcher.dispatch_ast({:hgetex, "h", :persist, ["f1"]}, store)
+    assert ["6"] == Dispatcher.dispatch_ast({:hgetex, "h", :none, ["f1"]}, store)
     assert 1 == Dispatcher.dispatch_ast({:hsetex, "h", 60, ["f3", "v3"]}, store)
     assert ["6", nil] == Dispatcher.dispatch_ast({:hmget, ["h", "f1", "missing"]}, store)
   end
@@ -338,7 +339,10 @@ defmodule Ferricstore.Commands.DispatcherTest do
     assert "embstr" == Dispatcher.dispatch_ast({:object, :encoding, "src"}, store)
     assert help = Dispatcher.dispatch_ast({:object, :help}, store)
     assert is_list(help)
-    assert 0 == Dispatcher.dispatch_ast({:wait, "abc", "xyz"}, store)
+
+    assert {:error, "ERR value is not an integer or out of range"} ==
+             Dispatcher.dispatch_ast({:wait, "abc", "xyz"}, store)
+
     assert 1 == Dispatcher.dispatch_ast({:unlink, ["src"]}, store)
   end
 

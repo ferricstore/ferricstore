@@ -4,7 +4,7 @@
 //! No mmap, no ResourceArc — fully stateless NIF functions.
 
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -15,7 +15,7 @@ use rustler::{Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, Term};
 // Constants (shared file format with the old mmap implementation)
 // ---------------------------------------------------------------------------
 
-const TOPK_MAGIC: u64 = 0x544F_504B_4D4D_5031; // "TOPKMMP1"
+const TOPK_MAGIC: [u8; 8] = *b"TOPKFS01";
 const TOPK_HEADER_SIZE: usize = 64;
 const HEAP_ENTRY_SIZE: usize = 264; // 8 (count) + 4 (len) + 252 (element)
 const MAX_ELEMENT_LEN: usize = 252;
@@ -127,35 +127,32 @@ fn topk_read_exact_at(file: &File, buf: &mut [u8], offset: u64, label: &str) -> 
 // ```
 //
 // Header (64 bytes):
-//   bytes  0..7:  magic (0x544F504B_4D4D5031 = "TOPKMMP1")
+//   bytes  0..7:  magic ("TOPKFS01")
 //   bytes  8..11: k (u32)
 //   bytes 12..15: width (u32)
 //   bytes 16..19: depth (u32)
-//   bytes 20..27: decay (f64)
-//   bytes 28..31: heap_len (u32) — number of items currently in heap
-//   bytes 32..63: reserved (zero)
+//   bytes 20..23: heap_len (u32) — number of items currently in heap
+//   bytes 24..63: reserved (zero)
 //
 // Each heap entry (HEAP_ENTRY_SIZE = 264 bytes):
 //   bytes 0..7:   count (i64)
 //   bytes 8..11:  element_len (u32)
 //   bytes 12..263: element bytes (max 252 bytes, zero-padded)
 
-/// Helper: read the mmap-format header from a file, returning
-/// (k, width, depth, decay, heap_len) or an error string.
-fn v2_read_header(file: &File) -> Result<(usize, usize, usize, f64, usize), String> {
+/// Helper: read the fixed-format header from a file, returning
+/// (k, width, depth, heap_len) or an error string.
+fn v2_read_header(file: &File) -> Result<(usize, usize, usize, usize), String> {
     let mut hdr = [0u8; TOPK_HEADER_SIZE];
     topk_read_exact_at(file, &mut hdr, 0, "header")?;
 
-    let magic = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
-    if magic != TOPK_MAGIC {
+    if hdr[0..8] != TOPK_MAGIC {
         return Err("invalid topk file magic".into());
     }
 
     let k = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
     let width = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
     let depth = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
-    let decay = f64::from_le_bytes(hdr[20..28].try_into().unwrap());
-    let heap_len = u32::from_le_bytes(hdr[28..32].try_into().unwrap()) as usize;
+    let heap_len = u32::from_le_bytes(hdr[20..24].try_into().unwrap()) as usize;
 
     if k == 0 {
         return Err("k must be > 0".into());
@@ -166,16 +163,26 @@ fn v2_read_header(file: &File) -> Result<(usize, usize, usize, f64, usize), Stri
     if depth == 0 {
         return Err("depth must be > 0".into());
     }
-    if !(0.0..=1.0).contains(&decay) {
-        return Err("decay must be between 0 and 1".into());
-    }
     if heap_len > k {
         return Err("heap_len must be <= k".into());
     }
+    if hdr[24..].iter().any(|byte| *byte != 0) {
+        return Err("topk reserved header bytes must be zero".into());
+    }
 
-    let _ = topk_layout(k, width, depth)?;
+    let layout = topk_layout(k, width, depth)?;
+    let actual_size = file
+        .metadata()
+        .map_err(|error| format!("read TopK file metadata: {error}"))?
+        .len();
+    if actual_size != layout.file_size {
+        return Err(format!(
+            "TopK file size mismatch: expected {}, got {actual_size}",
+            layout.file_size
+        ));
+    }
 
-    Ok((k, width, depth, decay, heap_len))
+    Ok((k, width, depth, heap_len))
 }
 
 /// Helper: read all CMS counters from the file into a Vec<i64>.
@@ -205,8 +212,15 @@ fn v2_write_cms(file: &File, counters: &[i64]) -> Result<(), String> {
 
 /// A heap entry read from file.
 struct V2HeapEntry {
-    element: String,
+    element: Vec<u8>,
     count: i64,
+}
+
+fn v2_query_fingerprints(entries: &[V2HeapEntry]) -> HashSet<&[u8]> {
+    entries
+        .iter()
+        .map(|entry| entry.element.as_slice())
+        .collect()
 }
 
 /// Helper: read all heap entries from the file.
@@ -230,10 +244,22 @@ fn v2_read_heap(
         let base = i * HEAP_ENTRY_SIZE;
         let count = i64::from_le_bytes(buf[base..base + 8].try_into().unwrap());
         let elem_len = u32::from_le_bytes(buf[base + 8..base + 12].try_into().unwrap()) as usize;
-        let clamped = elem_len.min(MAX_ELEMENT_LEN);
-        let element = String::from_utf8_lossy(&buf[base + 12..base + 12 + clamped]).to_string();
+        if elem_len > MAX_ELEMENT_LEN {
+            return Err(format!(
+                "TopK heap element length {elem_len} exceeds {MAX_ELEMENT_LEN}"
+            ));
+        }
+        let element = buf[base + 12..base + 12 + elem_len].to_vec();
         entries.push(V2HeapEntry { element, count });
     }
+
+    let mut seen = HashSet::with_capacity(entries.len());
+    for entry in &entries {
+        if !seen.insert(entry.element.as_slice()) {
+            return Err("TopK heap contains a duplicate element".into());
+        }
+    }
+
     Ok(entries)
 }
 
@@ -252,8 +278,13 @@ fn v2_write_heap(
     for (i, entry) in entries.iter().enumerate() {
         let base = i * HEAP_ENTRY_SIZE;
         buf[base..base + 8].copy_from_slice(&entry.count.to_le_bytes());
-        let elem_bytes = entry.element.as_bytes();
-        let len = elem_bytes.len().min(MAX_ELEMENT_LEN);
+        let elem_bytes = entry.element.as_slice();
+        let len = elem_bytes.len();
+        if len > MAX_ELEMENT_LEN {
+            return Err(format!(
+                "TopK heap element length {len} exceeds {MAX_ELEMENT_LEN}"
+            ));
+        }
         buf[base + 8..base + 12].copy_from_slice(&(len as u32).to_le_bytes());
         buf[base + 12..base + 12 + len].copy_from_slice(&elem_bytes[..len]);
         // rest is already zeroed
@@ -262,11 +293,11 @@ fn v2_write_heap(
         crate::write_all_at(file, &buf, heap_base, "topk heap")?;
     }
 
-    // Update heap_len in header at offset 28
+    // Update heap_len in header at offset 20.
     crate::write_all_at(
         file,
         &(entries.len() as u32).to_le_bytes(),
-        28,
+        20,
         "topk heap_len",
     )
 }
@@ -320,11 +351,11 @@ fn v2_cms_estimate(counters: &[i64], width: usize, depth: usize, element: &[u8])
 /// Returns the evicted element name if an eviction occurred.
 fn v2_heap_add(
     entries: &mut Vec<V2HeapEntry>,
-    fingerprints: &mut HashSet<String>,
+    fingerprints: &mut HashSet<Vec<u8>>,
     k: usize,
-    element: &str,
+    element: &[u8],
     estimated: i64,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     // Already tracked? Update count in-place.
     if fingerprints.contains(element) {
         for entry in entries.iter_mut() {
@@ -339,10 +370,10 @@ fn v2_heap_add(
     // Heap has room
     if entries.len() < k {
         entries.push(V2HeapEntry {
-            element: element.to_string(),
+            element: element.to_vec(),
             count: estimated,
         });
-        fingerprints.insert(element.to_string());
+        fingerprints.insert(element.to_vec());
         return None;
     }
 
@@ -360,10 +391,10 @@ fn v2_heap_add(
         let evicted = entries[min_idx].element.clone();
         fingerprints.remove(&evicted);
         entries[min_idx] = V2HeapEntry {
-            element: element.to_string(),
+            element: element.to_vec(),
             count: estimated,
         };
-        fingerprints.insert(element.to_string());
+        fingerprints.insert(element.to_vec());
         Some(evicted)
     } else {
         None
@@ -372,7 +403,7 @@ fn v2_heap_add(
 
 /// Create a new TopK file at the given path.
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_create_v2(
     env: Env,
@@ -380,7 +411,6 @@ pub fn topk_file_create_v2(
     k: u32,
     width: u32,
     depth: u32,
-    decay: f64,
 ) -> NifResult<Term> {
     if k == 0 {
         return Ok((atoms::error(), "k must be > 0").encode(env));
@@ -391,9 +421,6 @@ pub fn topk_file_create_v2(
     if depth == 0 {
         return Ok((atoms::error(), "depth must be > 0").encode(env));
     }
-    if !(0.0..=1.0).contains(&decay) {
-        return Ok((atoms::error(), "decay must be between 0 and 1").encode(env));
-    }
     let layout = match topk_layout(k as usize, width as usize, depth as usize) {
         Ok(layout) => layout,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
@@ -401,23 +428,22 @@ pub fn topk_file_create_v2(
 
     let p = Path::new(&path);
     if let Some(parent) = p.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
+        if let Err(e) = crate::fs_nif::create_dir_all_nofollow(parent) {
             return Ok((atoms::error(), format!("mkdir: {e}")).encode(env));
         }
     }
 
-    let mut file = match File::create(p) {
+    let mut file = match crate::create_staged_locked_nofollow(p) {
         Ok(f) => f,
         Err(e) => return Ok((atoms::error(), format!("create: {e}")).encode(env)),
     };
 
     let mut header = [0u8; TOPK_HEADER_SIZE];
-    header[0..8].copy_from_slice(&TOPK_MAGIC.to_le_bytes());
+    header[0..8].copy_from_slice(&TOPK_MAGIC);
     header[8..12].copy_from_slice(&k.to_le_bytes());
     header[12..16].copy_from_slice(&width.to_le_bytes());
     header[16..20].copy_from_slice(&depth.to_le_bytes());
-    header[20..28].copy_from_slice(&decay.to_le_bytes());
-    // heap_len = 0, reserved = 0 (already zeroed)
+    // heap_len = 0 and reserved = 0 (already zeroed)
 
     if let Err(e) = file.write_all(&header) {
         return Ok((atoms::error(), format!("write header: {e}")).encode(env));
@@ -426,8 +452,8 @@ pub fn topk_file_create_v2(
     if let Err(e) = file.set_len(layout.file_size) {
         return Ok((atoms::error(), format!("set file size: {e}")).encode(env));
     }
-    if let Err(e) = file.sync_data() {
-        return Ok((atoms::error(), format!("fdatasync: {e}")).encode(env));
+    if let Err(e) = file.publish() {
+        return Ok((atoms::error(), format!("publish: {e}")).encode(env));
     }
 
     Ok((atoms::ok(), atoms::ok()).encode(env))
@@ -435,14 +461,26 @@ pub fn topk_file_create_v2(
 
 /// Add elements (each with increment 1) to a file-backed TopK.
 /// Returns a list: nil for no eviction, or the evicted element binary.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_add_v2<'a>(
     env: Env<'a>,
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let file = match crate::open_random_rw(Path::new(&path)) {
+    if let Some(len) = elements
+        .iter()
+        .map(|element| element.as_slice().len())
+        .find(|len| *len > MAX_ELEMENT_LEN)
+    {
+        return Ok((
+            atoms::error(),
+            format!("TopK element length {len} exceeds {MAX_ELEMENT_LEN}"),
+        )
+            .encode(env));
+    }
+
+    let file = match crate::open_random_rw_locked(Path::new(&path)) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -450,7 +488,7 @@ pub fn topk_file_add_v2<'a>(
         Err(e) => return Ok((atoms::error(), format!("open: {e}")).encode(env)),
     };
 
-    let (k, width, depth, _decay, heap_len) = match v2_read_header(&file) {
+    let (k, width, depth, heap_len) = match v2_read_header(&file) {
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
@@ -465,13 +503,12 @@ pub fn topk_file_add_v2<'a>(
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
-    let mut fingerprints: HashSet<String> =
+    let mut fingerprints: HashSet<Vec<u8>> =
         heap_entries.iter().map(|e| e.element.clone()).collect();
 
     let mut results: Vec<Term<'a>> = Vec::with_capacity(elements.len());
     for elem_bin in &elements {
         let elem_bytes = elem_bin.as_slice();
-        let elem_str = String::from_utf8_lossy(elem_bytes);
         let estimated = match v2_cms_increment(&mut counters, width, depth, elem_bytes, 1) {
             Ok(estimated) => estimated,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
@@ -480,11 +517,11 @@ pub fn topk_file_add_v2<'a>(
             &mut heap_entries,
             &mut fingerprints,
             k,
-            &elem_str,
+            elem_bytes,
             estimated,
         ) {
             Some(evicted) => {
-                let evicted_bytes = evicted.as_bytes();
+                let evicted_bytes = evicted.as_slice();
                 match OwnedBinary::new(evicted_bytes.len()) {
                     Some(mut ob) => {
                         ob.as_mut_slice().copy_from_slice(evicted_bytes);
@@ -509,7 +546,7 @@ pub fn topk_file_add_v2<'a>(
         return Ok((atoms::error(), e).encode(env));
     }
     // Durability: fsync before returning. TopK is NOT idempotent under
-    // Raft replay (heap state + decay + counter RMW), so relying on
+    // Raft replay (heap state + counter RMW), so relying on
     // pagecache flush + replay corrupts state on kernel panic. See
     // background fsync design notes.
     if let Err(e) = crate::prob_fsync(&file) {
@@ -523,14 +560,30 @@ pub fn topk_file_add_v2<'a>(
 /// Increment elements by specified amounts in a file-backed TopK.
 /// `pairs` is a list of `{element_binary, increment}` tuples.
 /// Returns a list: nil for no eviction, or the evicted element binary.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_incrby_v2<'a>(
     env: Env<'a>,
     path: String,
     pairs: Vec<(Binary<'a>, i64)>,
 ) -> NifResult<Term<'a>> {
-    let file = match crate::open_random_rw(Path::new(&path)) {
+    if pairs.iter().any(|(_element, count)| *count <= 0) {
+        return Ok((atoms::error(), "TopK increment must be positive").encode(env));
+    }
+
+    if let Some(len) = pairs
+        .iter()
+        .map(|(element, _count)| element.as_slice().len())
+        .find(|len| *len > MAX_ELEMENT_LEN)
+    {
+        return Ok((
+            atoms::error(),
+            format!("TopK element length {len} exceeds {MAX_ELEMENT_LEN}"),
+        )
+            .encode(env));
+    }
+
+    let file = match crate::open_random_rw_locked(Path::new(&path)) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -538,7 +591,7 @@ pub fn topk_file_incrby_v2<'a>(
         Err(e) => return Ok((atoms::error(), format!("open: {e}")).encode(env)),
     };
 
-    let (k, width, depth, _decay, heap_len) = match v2_read_header(&file) {
+    let (k, width, depth, heap_len) = match v2_read_header(&file) {
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
@@ -553,13 +606,12 @@ pub fn topk_file_incrby_v2<'a>(
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
-    let mut fingerprints: HashSet<String> =
+    let mut fingerprints: HashSet<Vec<u8>> =
         heap_entries.iter().map(|e| e.element.clone()).collect();
 
     let mut results: Vec<Term<'a>> = Vec::with_capacity(pairs.len());
     for (elem_bin, count) in &pairs {
         let elem_bytes = elem_bin.as_slice();
-        let elem_str = String::from_utf8_lossy(elem_bytes);
         let estimated = match v2_cms_increment(&mut counters, width, depth, elem_bytes, *count) {
             Ok(estimated) => estimated,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
@@ -568,11 +620,11 @@ pub fn topk_file_incrby_v2<'a>(
             &mut heap_entries,
             &mut fingerprints,
             k,
-            &elem_str,
+            elem_bytes,
             estimated,
         ) {
             Some(evicted) => {
-                let evicted_bytes = evicted.as_bytes();
+                let evicted_bytes = evicted.as_slice();
                 match OwnedBinary::new(evicted_bytes.len()) {
                     Some(mut ob) => {
                         ob.as_mut_slice().copy_from_slice(evicted_bytes);
@@ -607,7 +659,7 @@ pub fn topk_file_incrby_v2<'a>(
 
 /// Query whether elements are in the top-K heap of a file-backed TopK.
 /// Returns a list of 0 (not in top-K) or 1 (in top-K).
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_query_v2<'a>(
     env: Env<'a>,
@@ -616,7 +668,7 @@ pub fn topk_file_query_v2<'a>(
 ) -> NifResult<Term<'a>> {
     let p = Path::new(&path);
 
-    let file = match crate::open_random_read(p) {
+    let file = match crate::open_random_read_locked(p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -624,7 +676,7 @@ pub fn topk_file_query_v2<'a>(
         Err(e) => return Ok((atoms::error(), format!("open: {e}")).encode(env)),
     };
 
-    let (k, width, depth, _decay, heap_len) = match v2_read_header(&file) {
+    let (k, width, depth, heap_len) = match v2_read_header(&file) {
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
@@ -634,14 +686,11 @@ pub fn topk_file_query_v2<'a>(
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
-    let fingerprints: HashSet<String> = heap_entries.iter().map(|e| e.element.clone()).collect();
+    let fingerprints = v2_query_fingerprints(&heap_entries);
 
     let results: Vec<i32> = elements
         .iter()
-        .map(|elem_bin| {
-            let elem_str = String::from_utf8_lossy(elem_bin.as_slice());
-            i32::from(fingerprints.contains(elem_str.as_ref()))
-        })
+        .map(|elem_bin| i32::from(fingerprints.contains(elem_bin.as_slice())))
         .collect();
 
     crate::fadvise_dontneed(&file, 0, 0);
@@ -650,12 +699,12 @@ pub fn topk_file_query_v2<'a>(
 
 /// List all elements in the top-K heap, sorted by count descending.
 /// Returns a list of element binaries.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     let p = Path::new(&path);
 
-    let file = match crate::open_random_read(p) {
+    let file = match crate::open_random_read_locked(p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -663,7 +712,7 @@ pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
         Err(e) => return Ok((atoms::error(), format!("open: {e}")).encode(env)),
     };
 
-    let (k, width, depth, _decay, heap_len) = match v2_read_header(&file) {
+    let (k, width, depth, heap_len) = match v2_read_header(&file) {
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
@@ -682,7 +731,7 @@ pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 
     let mut result_terms: Vec<Term<'_>> = Vec::with_capacity(heap_entries.len());
     for entry in &heap_entries {
-        let elem_bytes = entry.element.as_bytes();
+        let elem_bytes = entry.element.as_slice();
         match OwnedBinary::new(elem_bytes.len()) {
             Some(mut ob) => {
                 ob.as_mut_slice().copy_from_slice(elem_bytes);
@@ -700,7 +749,7 @@ pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 
 /// Return CMS count estimates for the given elements from a file-backed TopK.
 /// Returns a list of i64 estimates.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_count_v2<'a>(
     env: Env<'a>,
@@ -709,7 +758,7 @@ pub fn topk_file_count_v2<'a>(
 ) -> NifResult<Term<'a>> {
     let p = Path::new(&path);
 
-    let file = match crate::open_random_read(p) {
+    let file = match crate::open_random_read_locked(p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -717,7 +766,7 @@ pub fn topk_file_count_v2<'a>(
         Err(e) => return Ok((atoms::error(), format!("open: {e}")).encode(env)),
     };
 
-    let (_k, width, depth, _decay, _heap_len) = match v2_read_header(&file) {
+    let (_k, width, depth, _heap_len) = match v2_read_header(&file) {
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
@@ -736,13 +785,13 @@ pub fn topk_file_count_v2<'a>(
     Ok(results.encode(env))
 }
 
-/// Return metadata from a file-backed TopK: `{k, width, depth, decay}`.
-#[rustler::nif(schedule = "Normal")]
+/// Return metadata from a file-backed TopK: `{k, width, depth}`.
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn topk_file_info_v2(env: Env, path: String) -> NifResult<Term> {
     let p = Path::new(&path);
 
-    let file = match crate::open_random_read(p) {
+    let file = match crate::open_random_read_locked(p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -750,13 +799,13 @@ pub fn topk_file_info_v2(env: Env, path: String) -> NifResult<Term> {
         Err(e) => return Ok((atoms::error(), format!("open: {e}")).encode(env)),
     };
 
-    let (k, width, depth, decay, _heap_len) = match v2_read_header(&file) {
+    let (k, width, depth, _heap_len) = match v2_read_header(&file) {
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
     crate::fadvise_dontneed(&file, 0, 0);
-    Ok((k, width, depth, decay).encode(env))
+    Ok((k, width, depth).encode(env))
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +813,7 @@ pub fn topk_file_info_v2(env: Env, path: String) -> NifResult<Term> {
 // ---------------------------------------------------------------------------
 
 /// Async topk query: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn topk_file_query_v2_async<'a>(
     env: Env<'a>,
@@ -774,34 +823,33 @@ pub fn topk_file_query_v2_async<'a>(
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
     let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
+    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        let file = crate::open_random_read_locked(p).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "enoent".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        let (k, width, depth, heap_len) = v2_read_header(&file)?;
+        let heap_entries = v2_read_heap(&file, width, depth, heap_len, k).map_err(|e| e.clone())?;
+        let fingerprints = v2_query_fingerprints(&heap_entries);
+        let results: Vec<i32> = elements_owned
+            .iter()
+            .map(|elem| i32::from(fingerprints.contains(elem.as_slice())))
+            .collect();
+        crate::fadvise_dontneed(&file, 0, 0);
+        Ok(results)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     crate::async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let p = std::path::Path::new(&path);
-            let file = crate::open_random_read(p).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "enoent".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            let (k, width, depth, _decay, heap_len) =
-                v2_read_header(&file).map_err(|e| e.clone())?;
-            let heap_entries =
-                v2_read_heap(&file, width, depth, heap_len, k).map_err(|e| e.clone())?;
-            let fingerprints: std::collections::HashSet<String> =
-                heap_entries.iter().map(|e| e.element.clone()).collect();
-            let results: Vec<i32> = elements_owned
-                .iter()
-                .map(|elem| {
-                    let elem_str = String::from_utf8_lossy(elem);
-                    i32::from(fingerprints.contains(elem_str.as_ref()))
-                })
-                .collect();
-            crate::fadvise_dontneed(&file, 0, 0);
-            Ok(results)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -828,34 +876,35 @@ pub fn topk_file_list_v2_async(
     correlation_id: u64,
     path: String,
 ) -> NifResult<Term<'_>> {
+    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        let file = crate::open_random_read_locked(p).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "enoent".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        let (k, width, depth, heap_len) = v2_read_header(&file)?;
+        let mut heap_entries =
+            v2_read_heap(&file, width, depth, heap_len, k).map_err(|e| e.clone())?;
+        heap_entries.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.element.cmp(&b.element))
+        });
+        let items: Vec<Vec<u8>> = heap_entries.iter().map(|e| e.element.clone()).collect();
+        crate::fadvise_dontneed(&file, 0, 0);
+        Ok(items)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     crate::async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let p = std::path::Path::new(&path);
-            let file = crate::open_random_read(p).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "enoent".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            let (k, width, depth, _decay, heap_len) =
-                v2_read_header(&file).map_err(|e| e.clone())?;
-            let mut heap_entries =
-                v2_read_heap(&file, width, depth, heap_len, k).map_err(|e| e.clone())?;
-            heap_entries.sort_by(|a, b| {
-                b.count
-                    .cmp(&a.count)
-                    .then_with(|| a.element.cmp(&b.element))
-            });
-            let items: Vec<Vec<u8>> = heap_entries
-                .iter()
-                .map(|e| e.element.as_bytes().to_vec())
-                .collect();
-            crate::fadvise_dontneed(&file, 0, 0);
-            Ok(items)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -885,7 +934,7 @@ pub fn topk_file_list_v2_async(
 }
 
 /// Async topk count: spawns on Tokio, sends CMS estimates to `caller_pid`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn topk_file_count_v2_async<'a>(
     env: Env<'a>,
@@ -895,28 +944,32 @@ pub fn topk_file_count_v2_async<'a>(
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
     let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
+    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        let file = crate::open_random_read_locked(p).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "enoent".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        let (_k, width, depth, _heap_len) = v2_read_header(&file)?;
+        let counters = v2_read_cms(&file, width, depth).map_err(|e| e.clone())?;
+        let results: Vec<i64> = elements_owned
+            .iter()
+            .map(|elem| v2_cms_estimate(&counters, width, depth, elem))
+            .collect();
+        crate::fadvise_dontneed(&file, 0, 0);
+        Ok(results)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     crate::async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let p = std::path::Path::new(&path);
-            let file = crate::open_random_read(p).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "enoent".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            let (_k, width, depth, _decay, _heap_len) =
-                v2_read_header(&file).map_err(|e| e.clone())?;
-            let counters = v2_read_cms(&file, width, depth).map_err(|e| e.clone())?;
-            let results: Vec<i64> = elements_owned
-                .iter()
-                .map(|elem| v2_cms_estimate(&counters, width, depth, elem))
-                .collect();
-            crate::fadvise_dontneed(&file, 0, 0);
-            Ok(results)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -944,31 +997,35 @@ pub fn topk_file_info_v2_async(
     correlation_id: u64,
     path: String,
 ) -> NifResult<Term<'_>> {
+    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        let file = crate::open_random_read_locked(p).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "enoent".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        let (k, width, depth, _heap_len) = v2_read_header(&file)?;
+        crate::fadvise_dontneed(&file, 0, 0);
+        Ok((k, width, depth))
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     crate::async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let p = std::path::Path::new(&path);
-            let file = crate::open_random_read(p).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "enoent".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            let (k, width, depth, decay, _heap_len) =
-                v2_read_header(&file).map_err(|e| e.clone())?;
-            crate::fadvise_dontneed(&file, 0, 0);
-            Ok((k, width, depth, decay))
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
-            Ok((k, width, depth, decay)) => (
+            Ok((k, width, depth)) => (
                 atoms::tokio_complete(),
                 correlation_id,
                 atoms::ok(),
-                (k, width, depth, decay),
+                (k, width, depth),
             )
                 .encode(env),
             Err(reason) => (

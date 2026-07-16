@@ -17,6 +17,23 @@ defmodule Ferricstore.Store.ExpiryTracker do
     :ok
   end
 
+  def restore(nil, _shard_index, _count, _next_due_at_ms), do: :ok
+
+  def restore(ctx, shard_index, count, next_due_at_ms)
+      when is_integer(count) and count >= 0 and is_integer(next_due_at_ms) and
+             next_due_at_ms >= 0 do
+    idx = shard_index + 1
+
+    if ref = counter_ref(ctx, shard_index), do: :atomics.put(ref, idx, count)
+
+    if ref = due_ref(ctx, shard_index) do
+      due_at_ms = if next_due_at_ms == 0, do: 0, else: clamp_due_at_ms(next_due_at_ms)
+      :atomics.put(ref, idx, due_at_ms)
+    end
+
+    :ok
+  end
+
   def count(nil, _shard_index), do: :unknown
 
   def count(ctx, shard_index) do

@@ -8,8 +8,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
+      alias Ferricstore.Flow.SharedRefBackfill
       alias Ferricstore.Raft.StateMachine
       alias Ferricstore.Raft.WARaftSegmentReader
+      alias Ferricstore.ServerCatalog
       alias Ferricstore.Store.BlobRef
       alias Ferricstore.Store.BlobStore
       alias Ferricstore.Store.BlobValue
@@ -18,8 +20,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       alias Ferricstore.Store.Promotion
       alias Ferricstore.Store.Shard.ETS, as: ShardETS
       alias Ferricstore.Store.Shard.CompoundMemberIndex
+      alias Ferricstore.Store.Shard.LogicalKeyIndex
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       alias Ferricstore.Store.Shard.ZSetIndex
+
+      @segment_flush_page_size 512
 
       defp prepare_segment_blob_batch_entries(entries) do
         entries
@@ -162,7 +167,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
             threshold
           )
 
-        segment_project_put_compound_member_index(sm_state, key)
         sm_state
       end
 
@@ -186,7 +190,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
             previous
           )
 
-        segment_project_put_compound_member_index(sm_state, key)
         sm_state
       end
 
@@ -224,23 +227,23 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
           case segment_project_live_value(sm_state, marker_key) do
             "hash" ->
               sm_state
-              |> segment_project_delete_prefix(key, CompoundKey.hash_prefix(key))
+              |> segment_project_delete_prefix_for_string_put(key, CompoundKey.hash_prefix(key))
               |> segment_project_delete(marker_key)
 
             "list" ->
               sm_state
-              |> segment_project_delete_prefix(key, CompoundKey.list_prefix(key))
+              |> segment_project_delete_prefix_for_string_put(key, CompoundKey.list_prefix(key))
               |> segment_project_delete(CompoundKey.list_meta_key(key))
               |> segment_project_delete(marker_key)
 
             "set" ->
               sm_state
-              |> segment_project_delete_prefix(key, CompoundKey.set_prefix(key))
+              |> segment_project_delete_prefix_for_string_put(key, CompoundKey.set_prefix(key))
               |> segment_project_delete(marker_key)
 
             "zset" ->
               sm_state
-              |> segment_project_delete_prefix(key, CompoundKey.zset_prefix(key))
+              |> segment_project_delete_prefix_for_string_put(key, CompoundKey.zset_prefix(key))
               |> segment_project_delete(marker_key)
 
             _none_or_unknown ->
@@ -288,80 +291,88 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp segment_project_delete(sm_state, key) do
         true = ShardETS.ets_delete_key(shard_ets_state_from_sm(sm_state), key)
-        segment_project_delete_compound_member_index(sm_state, key)
         sm_state
       end
 
-      defp segment_project_delete_prefix(sm_state, redis_key, prefix) do
-        CompoundMemberIndex.delete_prefix(Map.get(sm_state, :compound_member_index_name), prefix)
+      defp segment_project_flush_shard(sm_state) do
+        try do
+          :ets.safe_fixtable(sm_state.ets, true)
 
-        sm_state.ets
-        |> segment_project_prefix_keys(prefix)
-        |> Enum.reduce(sm_state, fn key, acc ->
-          segment_project_delete(acc, key)
-        end)
-        |> ZSetIndex.clear_ready_key(redis_key)
+          try do
+            match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
+
+            {new_state, deleted} =
+              segment_project_flush_pages(
+                sm_state,
+                :ets.select(sm_state.ets, match_spec, @segment_flush_page_size),
+                0
+              )
+
+            _reset = CompoundMemberIndex.reset(Map.get(new_state, :compound_member_index_name))
+            _reset =
+              LogicalKeyIndex.reset(
+                Map.get(new_state, :logical_key_index_name),
+                Map.get(new_state, :logical_key_slots_name)
+              )
+
+            {ZSetIndex.reset(new_state), deleted}
+          after
+            :ets.safe_fixtable(sm_state.ets, false)
+          end
+        rescue
+          error in ArgumentError -> {:error, {:flush_shard_keydir_unavailable, error}}
+        end
       end
 
-      defp segment_project_put_compound_member_index(sm_state, <<"H:", _rest::binary>> = key),
-        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+      defp segment_project_flush_pages(sm_state, :"$end_of_table", deleted),
+        do: {sm_state, deleted}
 
-      defp segment_project_put_compound_member_index(sm_state, <<"L:", _rest::binary>> = key),
-        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+      defp segment_project_flush_pages(sm_state, {keys, continuation}, deleted) do
+        delete_keys = Enum.reject(keys, &segment_project_flush_preserved_key?(sm_state, &1))
+        new_state = Enum.reduce(delete_keys, sm_state, &segment_project_delete(&2, &1))
 
-      defp segment_project_put_compound_member_index(sm_state, <<"S:", _rest::binary>> = key),
-        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+        segment_project_flush_pages(
+          new_state,
+          :ets.select(continuation),
+          deleted + length(delete_keys)
+        )
+      end
 
-      defp segment_project_put_compound_member_index(sm_state, <<"Z:", _rest::binary>> = key),
-        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+      defp segment_project_flush_preserved_key?(sm_state, key) do
+        ServerCatalog.internal_key?(key) or
+          key == FlowKeys.shared_value_ref_backfill_key(sm_state.shard_index) or
+          key == SharedRefBackfill.progress_key(sm_state.shard_index)
+      end
 
-      defp segment_project_put_compound_member_index(sm_state, <<"X:", _rest::binary>> = key),
-        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+      defp segment_project_delete_prefix(sm_state, redis_key, prefix) do
+        index = Map.get(sm_state, :compound_member_index_name)
+        budget = sm_state.apply_context.compound_delete_member_budget
 
-      defp segment_project_put_compound_member_index(sm_state, <<"XM:", _rest::binary>> = key),
-        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+        case CompoundMemberIndex.keys_for_prefix(index, prefix, budget) do
+          {:ok, compound_keys} ->
+            next_state =
+              compound_keys
+              |> Enum.reduce(sm_state, fn key, acc -> segment_project_delete(acc, key) end)
+              |> ZSetIndex.clear_ready_key(redis_key)
 
-      defp segment_project_put_compound_member_index(sm_state, <<"XG:", _rest::binary>> = key),
-        do: CompoundMemberIndex.put(Map.get(sm_state, :compound_member_index_name), key)
+            {:ok, next_state}
 
-      defp segment_project_put_compound_member_index(_sm_state, _key), do: :ok
+          {:error, :limit_exceeded} ->
+            {:error, :compound_delete_budget_exceeded}
 
-      defp segment_project_delete_compound_member_index(sm_state, <<"H:", _rest::binary>> = key),
-        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
+          :unavailable ->
+            {:error, :compound_member_index_unavailable}
+        end
+      end
 
-      defp segment_project_delete_compound_member_index(sm_state, <<"L:", _rest::binary>> = key),
-        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
+      defp segment_project_delete_prefix_for_string_put(sm_state, redis_key, prefix) do
+        case segment_project_delete_prefix(sm_state, redis_key, prefix) do
+          {:ok, next_state} ->
+            next_state
 
-      defp segment_project_delete_compound_member_index(sm_state, <<"S:", _rest::binary>> = key),
-        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
-
-      defp segment_project_delete_compound_member_index(sm_state, <<"Z:", _rest::binary>> = key),
-        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
-
-      defp segment_project_delete_compound_member_index(sm_state, <<"X:", _rest::binary>> = key),
-        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
-
-      defp segment_project_delete_compound_member_index(sm_state, <<"XM:", _rest::binary>> = key),
-        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
-
-      defp segment_project_delete_compound_member_index(sm_state, <<"XG:", _rest::binary>> = key),
-        do: CompoundMemberIndex.delete(Map.get(sm_state, :compound_member_index_name), key)
-
-      defp segment_project_delete_compound_member_index(_sm_state, _key), do: :ok
-
-      defp segment_project_prefix_keys(keydir, prefix) do
-        prefix_len = byte_size(prefix)
-
-        match_spec = [
-          {{:"$1", :_, :_, :_, :_, :_, :_},
-           [
-             {:andalso, {:is_binary, :"$1"},
-              {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
-           ], [:"$1"]}
-        ]
-
-        :ets.select(keydir, match_spec)
+          {:error, reason} ->
+            raise "WARaft projected string overwrite violated compound cleanup preflight: #{inspect(reason)}"
+        end
       end
 
       defp segment_project_zset_put(sm_state, redis_key, compound_key, value),
@@ -486,7 +497,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         %{
           keydir: sm_state.ets,
           index: sm_state.shard_index,
-          instance_ctx: sm_state.instance_ctx
+          instance_ctx: sm_state.instance_ctx,
+          compound_member_index: Map.get(sm_state, :compound_member_index_name),
+          logical_key_index: Map.get(sm_state, :logical_key_index_name),
+          logical_key_slots: Map.get(sm_state, :logical_key_slots_name)
         }
       end
 

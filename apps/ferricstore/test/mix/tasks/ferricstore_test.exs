@@ -78,6 +78,25 @@ defmodule Mix.Tasks.FerricstoreTest do
       expected = baseline + 2
       assert output =~ "total_keys: #{expected}"
     end
+
+    test "uses the running instance topology instead of mutable application env" do
+      ctx = FerricStore.Instance.get(:default)
+      previous = Application.get_env(:ferricstore, :shard_count)
+      Application.put_env(:ferricstore, :shard_count, 1)
+
+      on_exit(fn ->
+        if is_nil(previous) do
+          Application.delete_env(:ferricstore, :shard_count)
+        else
+          Application.put_env(:ferricstore, :shard_count, previous)
+        end
+      end)
+
+      output = capture_io(fn -> Mix.Tasks.Ferricstore.Info.run([]) end)
+
+      assert output =~ "shard_count: #{ctx.shard_count}"
+      assert output =~ "shard_#{ctx.shard_count - 1}:"
+    end
   end
 
   # -------------------------------------------------------------------
@@ -225,6 +244,23 @@ defmodule Mix.Tasks.FerricstoreTest do
       output = capture_io(fn -> Mix.Tasks.Ferricstore.Merge.run(["abc"]) end)
 
       assert output =~ "ERROR" or output =~ "Invalid"
+    end
+
+    test "uses the running instance topology instead of mutable application env" do
+      ctx = FerricStore.Instance.get(:default)
+      previous = Application.get_env(:ferricstore, :shard_count)
+      Application.put_env(:ferricstore, :shard_count, 1)
+
+      on_exit(fn ->
+        if is_nil(previous) do
+          Application.delete_env(:ferricstore, :shard_count)
+        else
+          Application.put_env(:ferricstore, :shard_count, previous)
+        end
+      end)
+
+      output = capture_io(fn -> Mix.Tasks.Ferricstore.Merge.run([]) end)
+      assert output =~ "shard #{ctx.shard_count - 1}"
     end
   end
 

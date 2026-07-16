@@ -440,7 +440,7 @@ defmodule FerricStore.Flow.Workflow do
         attrs
         |> flow_opts_from_attrs()
         |> Keyword.merge(opts)
-        |> Keyword.put_new(:type, workflow.__flow_type__())
+        |> Keyword.put(:type, workflow.__flow_type__())
         |> Keyword.put_new(:state, workflow.__flow_initial_state__())
         |> Keyword.put_new(:partition_key, partition_key)
 
@@ -453,7 +453,7 @@ defmodule FerricStore.Flow.Workflow do
     with {:ok, mapped_items} <- create_many_items(workflow, items, opts) do
       create_opts =
         opts
-        |> Keyword.put_new(:type, workflow.__flow_type__())
+        |> Keyword.put(:type, workflow.__flow_type__())
         |> Keyword.put_new(:state, workflow.__flow_initial_state__())
 
       workflow.__flow_store__().flow_create_many(nil, mapped_items, create_opts)
@@ -480,7 +480,7 @@ defmodule FerricStore.Flow.Workflow do
         :history_max_events
       ])
       |> Map.put(:id, id)
-      |> Map.put_new(:type, Keyword.get(opts, :type, workflow.__flow_type__()))
+      |> Map.put(:type, workflow.__flow_type__())
       |> Map.put_new(:state, Keyword.get(opts, :state, workflow.__flow_initial_state__()))
       |> maybe_put_map(:partition_key, partition_key)
     end
@@ -561,18 +561,13 @@ defmodule FerricStore.Flow.Workflow do
 
   @spec handle(Job.t(), (Job.t() -> term()), keyword()) :: term()
   def handle(%Job{} = job, fun, opts) when is_function(fun, 1) and is_list(opts) do
-    case fun.(job) do
-      {:ok, result} -> ok(job, result, opts)
-      {:error, reason} -> error(job, reason, opts)
-      :noreply -> :ok
-      other -> error(job, {:unexpected_worker_result, other}, opts)
+    case invoke_handler(job, fun) do
+      {:handler_result, {:ok, result}} -> ok(job, result, opts)
+      {:handler_result, {:error, reason}} -> error(job, reason, opts)
+      {:handler_result, :noreply} -> :ok
+      {:handler_result, other} -> error(job, {:unexpected_worker_result, other}, opts)
+      {:handler_error, reason} -> error(job, reason, opts)
     end
-  rescue
-    exception ->
-      error(job, {exception.__struct__, Exception.message(exception)}, opts)
-  catch
-    kind, reason ->
-      error(job, {kind, reason}, opts)
   end
 
   @spec transition(Job.t(), atom() | binary(), term(), keyword()) ::
@@ -886,17 +881,31 @@ defmodule FerricStore.Flow.Workflow do
   defp build_partition_key([], _attrs), do: {:ok, nil}
 
   defp build_partition_key(fields, attrs) do
-    parts =
-      Enum.map(fields, fn field ->
-        Map.get(attrs, field) || Map.get(attrs, Atom.to_string(field))
-      end)
-
-    if Enum.any?(parts, &is_nil/1) do
-      {:error, "ERR flow partition key fields missing"}
-    else
-      {:ok, Enum.map_join(parts, ":", &to_string/1)}
+    fields
+    |> Enum.reduce_while({:ok, []}, fn field, {:ok, acc} ->
+      case partition_component(partition_field(attrs, field)) do
+        {:ok, component} -> {:cont, {:ok, [component | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, parts} -> {:ok, parts |> Enum.reverse() |> Enum.join(":")}
+      {:error, _reason} = error -> error
     end
   end
+
+  defp partition_field(attrs, field) when is_atom(field), do: map_field(attrs, field)
+  defp partition_field(attrs, field) when is_binary(field), do: Map.get(attrs, field)
+  defp partition_field(_attrs, _field), do: nil
+
+  defp partition_component(nil), do: {:error, "ERR flow partition key fields missing"}
+  defp partition_component(value) when is_binary(value), do: {:ok, value}
+  defp partition_component(value) when is_atom(value), do: {:ok, Atom.to_string(value)}
+  defp partition_component(value) when is_integer(value), do: {:ok, Integer.to_string(value)}
+  defp partition_component(value) when is_float(value), do: {:ok, Float.to_string(value)}
+
+  defp partition_component(_value),
+    do: {:error, "ERR flow partition key fields must be strings, atoms, integers, or floats"}
 
   defp flow_opts_from_attrs(attrs) do
     attrs
@@ -969,6 +978,16 @@ defmodule FerricStore.Flow.Workflow do
       handler when is_function(handler, 1) -> {:ok, handler}
       _ -> {:error, "ERR flow handler must be a one-arity function"}
     end
+  end
+
+  defp invoke_handler(job, fun) do
+    {:handler_result, fun.(job)}
+  rescue
+    exception ->
+      {:handler_error, {exception.__struct__, Exception.message(exception)}}
+  catch
+    kind, reason ->
+      {:handler_error, {kind, reason}}
   end
 
   defp compact_opts(opts), do: Enum.reject(opts, fn {_key, value} -> is_nil(value) end)

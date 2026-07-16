@@ -1,15 +1,19 @@
 defmodule Ferricstore.Flow.HistoryRead do
   @moduledoc false
 
+  alias Ferricstore.BatchResult
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Codec
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
 
   @max_history_max_events 1_000_000
+  @default_history_lmdb_sweep_limit 10_000
 
   def read(ctx, id, partition_key, history_key, query, false, consistent?, value_return) do
-    with :ok <- maybe_flush_history_projector(ctx, history_key, consistent?) do
-      if state_exists?(ctx, id, partition_key) do
+    with :ok <- maybe_flush_history_projector(ctx, history_key, consistent?),
+         {:ok, state_exists?} <- state_exists(ctx, id, partition_key) do
+      if state_exists? do
         fetch_count = query_fetch_count(query)
 
         case hot_refs(ctx, id, partition_key, history_key, fetch_count) do
@@ -23,6 +27,9 @@ defmodule Ferricstore.Flow.HistoryRead do
                    from_event_ids(ctx, id, partition_key, history_key, event_ids, value_return) do
               {:ok, apply_query(events, query)}
             end
+
+          {:error, _reason} = error ->
+            error
         end
       else
         {:ok, []}
@@ -31,8 +38,9 @@ defmodule Ferricstore.Flow.HistoryRead do
   end
 
   def read(ctx, id, partition_key, history_key, query, true, consistent?, value_return) do
-    with :ok <- maybe_flush_history_projector(ctx, history_key, consistent?) do
-      if state_exists?(ctx, id, partition_key) do
+    with :ok <- maybe_flush_history_projector(ctx, history_key, consistent?),
+         {:ok, state_exists?} <- state_exists(ctx, id, partition_key) do
+      if state_exists? do
         fetch_count = query_fetch_count(query)
 
         with {:ok, hot_refs} <- hot_refs(ctx, id, partition_key, history_key, fetch_count),
@@ -63,25 +71,39 @@ defmodule Ferricstore.Flow.HistoryRead do
       do: history_lmdb_query_scan_count(count, reverse?)
   end
 
-  def hot_values_by_event(event_ids, values) do
-    event_ids
-    |> Enum.zip(values)
-    |> Enum.reduce(%{}, fn
-      {event_id, value}, acc when is_binary(event_id) and is_binary(value) ->
-        Map.put(acc, event_id, value)
+  def hot_values_by_event(event_ids, values) when is_list(event_ids) and is_list(values) do
+    case ReadResult.first_failure(values) do
+      nil ->
+        case BatchResult.map_exact(event_ids, values, fn event_id, value -> {event_id, value} end) do
+          {:ok, pairs} ->
+            {:ok,
+             Enum.reduce(pairs, %{}, fn
+               {event_id, value}, acc when is_binary(event_id) and is_binary(value) ->
+                 Map.put(acc, event_id, value)
 
-      _missing, acc ->
-        acc
-    end)
+               _missing, acc ->
+                 acc
+             end)}
+
+          {:error, reason} ->
+            ReadResult.failure(reason)
+        end
+
+      failure ->
+        failure
+    end
   end
 
-  def cold_values_by_event(_ctx, _history_key, [], _hot_values), do: %{}
+  def hot_values_by_event(_event_ids, values),
+    do: ReadResult.failure({:invalid_batch_results, values})
+
+  def cold_values_by_event(_ctx, _history_key, [], _hot_values), do: {:ok, %{}}
 
   def cold_values_by_event(ctx, history_key, event_ids, hot_values) do
     missing_ids = Enum.reject(event_ids, &Map.has_key?(hot_values, &1))
 
     if missing_ids == [] do
-      %{}
+      {:ok, %{}}
     else
       shard_index = Router.shard_for(ctx, history_key)
       shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
@@ -98,49 +120,82 @@ defmodule Ferricstore.Flow.HistoryRead do
 
       case Ferricstore.Flow.LMDB.get_many(lmdb_path, lmdb_keys) do
         {:ok, lmdb_values} ->
-          missing_ids
-          |> Enum.zip(lmdb_values)
-          |> Enum.reduce(%{}, fn {event_id, lmdb_value}, acc ->
-            case cold_value_from_lmdb(shard_path, event_id, lmdb_value) do
-              {:ok, value} -> Map.put(acc, event_id, value)
-              _miss -> acc
-            end
+          cold_values_by_event_results(missing_ids, lmdb_values, fn event_id, lmdb_value ->
+            cold_value_from_lmdb(shard_path, event_id, lmdb_value)
           end)
 
-        _error ->
-          %{}
+        {:error, reason} ->
+          ReadResult.failure(reason)
+
+        invalid ->
+          ReadResult.failure({:invalid_batch_results, invalid})
       end
     end
   end
 
-  def decode_context(ctx, id, partition_key) do
-    case Router.flow_get(ctx, id, partition_key) do
-      value when is_binary(value) ->
-        case safe_decode_record(value) do
-          {:ok, record} -> record
-          _ -> %{id: id}
-        end
+  @doc false
+  def __cold_values_by_event_results_for_test__(event_ids, lmdb_values, decoder),
+    do: cold_values_by_event_results(event_ids, lmdb_values, decoder)
 
-      _ ->
-        %{id: id}
+  defp cold_values_by_event_results(event_ids, lmdb_values, decoder) do
+    case BatchResult.map_exact(event_ids, lmdb_values, fn event_id, lmdb_value ->
+           {event_id, decoder.(event_id, lmdb_value)}
+         end) do
+      {:ok, decoded} ->
+        Enum.reduce_while(decoded, {:ok, %{}}, fn
+          {event_id, {:ok, value}}, {:ok, acc} when is_binary(value) ->
+            {:cont, {:ok, Map.put(acc, event_id, value)}}
+
+          {_event_id, :miss}, {:ok, acc} ->
+            {:cont, {:ok, acc}}
+
+          {event_id, {:error, reason}}, _acc ->
+            {:halt, ReadResult.failure({:cold_value_read_failed, event_id, reason})}
+
+          {event_id, invalid}, _acc ->
+            {:halt, ReadResult.failure({:invalid_cold_value_result, event_id, invalid})}
+        end)
+
+      {:error, reason} ->
+        ReadResult.failure(reason)
     end
   rescue
-    _ -> %{id: id}
+    exception -> ReadResult.failure({:cold_value_decode_failed, exception.__struct__})
+  end
+
+  def decode_context(ctx, id, partition_key) do
+    ctx
+    |> Router.flow_get(id, partition_key)
+    |> decode_context_read(id)
+  rescue
+    _ -> {:error, "ERR storage read failed"}
   end
 
   def decode_context_from_history_key(ctx, history_key) do
     case state_key_from_history_key(history_key) do
       {:ok, state_key, id} -> decode_context_by_state_key(ctx, state_key, id)
-      :error -> %{}
+      :error -> {:ok, %{}}
     end
   end
 
-  defp state_exists?(ctx, id, partition_key) do
-    case Router.flow_get(ctx, id, partition_key) do
-      value when is_binary(value) -> true
-      _ -> false
-    end
-  end
+  @doc false
+  def __decode_context_read_for_test__(result, id), do: decode_context_read(result, id)
+
+  defp decode_context_read(value, _id) when is_binary(value), do: safe_decode_record(value)
+  defp decode_context_read(nil, id), do: {:ok, %{id: id}}
+  defp decode_context_read(_failure, _id), do: {:error, "ERR storage read failed"}
+
+  defp state_exists(ctx, id, partition_key),
+    do: ctx |> Router.flow_get_with_status(id, partition_key) |> normalize_state_read()
+
+  @doc false
+  def __normalize_state_read_for_test__(result), do: normalize_state_read(result)
+
+  defp normalize_state_read(value) when is_binary(value), do: {:ok, true}
+  defp normalize_state_read(nil), do: {:ok, false}
+  defp normalize_state_read(:unavailable), do: {:error, "ERR storage read failed"}
+  defp normalize_state_read({:error, _reason}), do: {:error, "ERR storage read failed"}
+  defp normalize_state_read(_invalid), do: {:error, "ERR storage read failed"}
 
   defp candidate_event_ids(refs, query) do
     refs
@@ -157,11 +212,18 @@ defmodule Ferricstore.Flow.HistoryRead do
   defp hot_refs(ctx, id, partition_key, history_key, count) do
     {start_idx, stop_idx} = hot_range(ctx, id, partition_key, history_key, count)
 
-    case Router.flow_index_rank_range(ctx, history_key, start_idx, stop_idx, false) do
-      {:ok, event_refs} -> {:ok, event_refs}
-      :unavailable -> {:ok, []}
-    end
+    ctx
+    |> Router.flow_index_rank_range(history_key, start_idx, stop_idx, false)
+    |> normalize_hot_refs()
   end
+
+  @doc false
+  def __normalize_hot_refs_for_test__(result), do: normalize_hot_refs(result)
+
+  defp normalize_hot_refs({:ok, event_refs}) when is_list(event_refs), do: {:ok, event_refs}
+  defp normalize_hot_refs(:unavailable), do: {:error, "ERR storage read failed"}
+  defp normalize_hot_refs({:error, _reason}), do: {:error, "ERR storage read failed"}
+  defp normalize_hot_refs(_invalid), do: {:error, "ERR storage read failed"}
 
   def hot_range(ctx, id, partition_key, history_key, count) do
     with {:ok, max} <- hot_max(ctx, id, partition_key),
@@ -220,8 +282,10 @@ defmodule Ferricstore.Flow.HistoryRead do
       scan_count = history_lmdb_scan_count(count, query)
 
       with {:ok, _swept} <- Ferricstore.Flow.LMDB.sweep_expired_history(path, now_ms, sweep_limit),
-           {:ok, entries} <- lmdb_prefix_entries(path, prefix, scan_count, query) do
-        {:ok, Ferricstore.Flow.LMDBIndexDecode.history_entries(entries, path, now_ms)}
+           {:ok, entries} <- lmdb_prefix_entries(path, prefix, scan_count, query),
+           {:ok, decoded_entries} <-
+             Ferricstore.Flow.LMDBIndexDecode.history_entries(entries, path, now_ms) do
+        {:ok, decoded_entries}
       end
     end
   end
@@ -314,11 +378,19 @@ defmodule Ferricstore.Flow.HistoryRead do
   defp maybe_flush_history_projector(ctx, history_key, true) do
     shard_index = Router.shard_for(ctx, history_key)
 
-    case Ferricstore.Flow.HistoryProjector.flush(ctx, shard_index, 120_000) do
-      :ok -> :ok
-      {:error, reason} -> {:error, "ERR flow history projection unavailable: #{inspect(reason)}"}
-    end
+    ctx
+    |> Ferricstore.Flow.HistoryProjector.flush(shard_index, 120_000)
+    |> normalize_history_projector_flush()
   end
+
+  @doc false
+  def __normalize_history_projector_flush_for_test__(result),
+    do: normalize_history_projector_flush(result)
+
+  defp normalize_history_projector_flush(:ok), do: :ok
+
+  defp normalize_history_projector_flush(_failure),
+    do: {:error, "ERR flow history projection unavailable"}
 
   defp require_lmdb_mirror_healthy_shard(ctx, index_key, shard_index) do
     if Ferricstore.Flow.LMDBMirror.degraded_shard?(ctx, shard_index) do
@@ -329,15 +401,17 @@ defmodule Ferricstore.Flow.HistoryRead do
   end
 
   def from_event_ids(ctx, id, partition_key, history_key, event_ids, value_return) do
-    from_event_ids_with_context(
-      ctx,
-      id,
-      partition_key,
-      history_key,
-      event_ids,
-      value_return,
-      decode_context(ctx, id, partition_key)
-    )
+    with {:ok, decode_context} <- decode_context(ctx, id, partition_key) do
+      from_event_ids_with_context(
+        ctx,
+        id,
+        partition_key,
+        history_key,
+        event_ids,
+        value_return,
+        decode_context
+      )
+    end
   end
 
   def from_event_ids_with_context(
@@ -353,24 +427,27 @@ defmodule Ferricstore.Flow.HistoryRead do
       Enum.map(event_ids, &Ferricstore.Flow.Keys.stream_entry_key(id, &1, partition_key))
 
     values = Router.compound_batch_get(ctx, history_key, compound_keys)
-    hot_values = hot_values_by_event(event_ids, values)
-    cold_values = cold_values_by_event(ctx, history_key, event_ids, hot_values)
 
-    entries =
-      Enum.flat_map(event_ids, fn event_id ->
-        value = Map.get(hot_values, event_id) || Map.get(cold_values, event_id)
+    with {:ok, hot_values} <- hot_values_by_event(event_ids, values),
+         {:ok, cold_values} <- cold_values_by_event(ctx, history_key, event_ids, hot_values) do
+      entries =
+        Enum.flat_map(event_ids, fn event_id ->
+          value = Map.get(hot_values, event_id) || Map.get(cold_values, event_id)
 
-        if is_binary(value) do
-          [{event_id, Codec.decode_history_fields(value, decode_context)}]
-        else
-          []
-        end
-      end)
+          if is_binary(value) do
+            [{event_id, Codec.decode_history_fields(value, decode_context)}]
+          else
+            []
+          end
+        end)
 
-    {:ok,
-     entries
-     |> Enum.map(&Ferricstore.Flow.HistoryEntry.to_tuple/1)
-     |> Ferricstore.Flow.HistoryValues.hydrate(ctx, value_return)}
+      {:ok,
+       entries
+       |> Enum.map(&Ferricstore.Flow.HistoryEntry.to_tuple/1)
+       |> Ferricstore.Flow.HistoryValues.hydrate(ctx, value_return)}
+    else
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+    end
   end
 
   def hot_fallback_scan(ctx, history_key, query, value_return) do
@@ -378,60 +455,76 @@ defmodule Ferricstore.Flow.HistoryRead do
     prefix_size = byte_size(prefix)
 
     fetch_count = query_fetch_count(query)
-    decode_context = decode_context_from_history_key(ctx, history_key)
 
-    entries =
-      ctx
-      |> Router.compound_scan(history_key, prefix)
-      |> Enum.flat_map(fn
-        {<<^prefix::binary-size(prefix_size), event_id::binary>>, value}
-        when is_binary(value) ->
-          [{event_id, Codec.decode_history_fields(value, decode_context)}]
+    with {:ok, decode_context} <- decode_context_from_history_key(ctx, history_key) do
+      case Router.compound_scan(ctx, history_key, prefix) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
 
-        {event_id, value} when is_binary(event_id) and is_binary(value) ->
-          [{event_id, Codec.decode_history_fields(value, decode_context)}]
+        scanned when is_list(scanned) ->
+          entries =
+            scanned
+            |> Enum.flat_map(fn
+              {<<^prefix::binary-size(prefix_size), event_id::binary>>, value}
+              when is_binary(value) ->
+                [{event_id, Codec.decode_history_fields(value, decode_context)}]
 
-        _other ->
-          []
-      end)
-      |> Enum.sort_by(fn {event_id, _fields} ->
-        {Ferricstore.Flow.HistoryEvent.ms(event_id), event_id}
-      end)
-      |> Enum.take(-fetch_count)
+              {event_id, value} when is_binary(event_id) and is_binary(value) ->
+                [{event_id, Codec.decode_history_fields(value, decode_context)}]
 
-    events =
-      entries
-      |> Enum.map(&Ferricstore.Flow.HistoryEntry.to_tuple/1)
-      |> Ferricstore.Flow.HistoryValues.hydrate(ctx, value_return)
+              _other ->
+                []
+            end)
+            |> Enum.sort_by(fn {event_id, _fields} ->
+              {Ferricstore.Flow.HistoryEvent.ms(event_id), event_id}
+            end)
+            |> Enum.take(-fetch_count)
 
-    {:ok, apply_query(events, query)}
+          events =
+            entries
+            |> Enum.map(&Ferricstore.Flow.HistoryEntry.to_tuple/1)
+            |> Ferricstore.Flow.HistoryValues.hydrate(ctx, value_return)
+
+          {:ok, apply_query(events, query)}
+      end
+    end
   end
 
   defp cold_value_from_lmdb(shard_path, event_id, {:ok, lmdb_value}),
     do: cold_value_from_lmdb(shard_path, event_id, lmdb_value)
 
+  defp cold_value_from_lmdb(_shard_path, _event_id, :not_found), do: :miss
+
   defp cold_value_from_lmdb(shard_path, event_id, lmdb_value) when is_binary(lmdb_value) do
     now = CommandTime.now_ms()
 
-    with {:ok, {^event_id, _event_ms, expire_at_ms, _compound_key, file_ref, offset, _value_size}} <-
-           Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value),
-         true <- expire_at_ms <= 0 or expire_at_ms > now do
-      case {file_ref, offset} do
-        {{:flow_history, _file_id} = ref, offset} when is_integer(offset) and offset >= 0 ->
-          Ferricstore.Flow.HistoryProjector.read_value(shard_path, ref, offset)
+    case Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value) do
+      {:ok, {^event_id, _event_ms, expire_at_ms, _compound_key, file_ref, offset, _value_size}} ->
+        cond do
+          expire_at_ms > 0 and expire_at_ms <= now ->
+            :miss
 
-        _other ->
-          :miss
-      end
-    else
-      _ -> :miss
+          match?({:flow_history, _file_id}, file_ref) and is_integer(offset) and offset >= 0 ->
+            Ferricstore.Flow.HistoryProjector.read_value(shard_path, file_ref, offset)
+
+          true ->
+            {:error, :missing_history_value_location}
+        end
+
+      _invalid ->
+        {:error, :invalid_history_index_location}
     end
   end
 
-  defp cold_value_from_lmdb(_shard_path, _event_id, _lmdb_value), do: :miss
+  defp cold_value_from_lmdb(_shard_path, _event_id, _lmdb_value),
+    do: {:error, :invalid_history_index_result}
 
   def query_fetch_count(query) do
-    Ferricstore.Flow.HistoryQuery.fetch_count(query, &history_lmdb_query_scan_count/2)
+    if query_filtering?(query) do
+      max(Map.fetch!(query, :count), max_history_max_events())
+    else
+      Map.fetch!(query, :count)
+    end
   end
 
   defp query_filtering?(query), do: Ferricstore.Flow.HistoryQuery.filtering?(query)
@@ -452,8 +545,18 @@ defmodule Ferricstore.Flow.HistoryRead do
   end
 
   defp history_lmdb_sweep_limit do
-    Application.get_env(:ferricstore, :flow_lmdb_history_sweep_limit, 10_000)
+    case Application.get_env(
+           :ferricstore,
+           :flow_lmdb_history_sweep_limit,
+           @default_history_lmdb_sweep_limit
+         ) do
+      value when is_integer(value) and value >= 0 -> min(value, @max_history_max_events)
+      _invalid -> @default_history_lmdb_sweep_limit
+    end
   end
+
+  @doc false
+  def __history_lmdb_sweep_limit_for_test__, do: history_lmdb_sweep_limit()
 
   defp max_history_max_events do
     case Application.get_env(
@@ -467,18 +570,10 @@ defmodule Ferricstore.Flow.HistoryRead do
   end
 
   defp decode_context_by_state_key(ctx, state_key, id) do
-    case Ferricstore.Stats.with_cache_tracking_disabled(fn -> Router.get(ctx, state_key) end) do
-      value when is_binary(value) ->
-        case safe_decode_record(value) do
-          {:ok, record} -> record
-          _ -> %{id: id}
-        end
-
-      _ ->
-        %{id: id}
-    end
+    Ferricstore.Stats.with_cache_tracking_disabled(fn -> Router.get(ctx, state_key) end)
+    |> decode_context_read(id)
   rescue
-    _ -> %{id: id}
+    _ -> {:error, "ERR storage read failed"}
   end
 
   defp state_key_from_history_key(history_key) when is_binary(history_key) do
@@ -497,6 +592,6 @@ defmodule Ferricstore.Flow.HistoryRead do
   defp safe_decode_record(value) when is_binary(value) do
     {:ok, Codec.decode_record(value)}
   rescue
-    _ -> {:ok, nil}
+    _ -> {:error, "ERR invalid flow record"}
   end
 end

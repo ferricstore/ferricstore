@@ -17,6 +17,7 @@ defmodule FerricStore.Instance do
   """
 
   @default_blob_side_channel_threshold_bytes 256 * 1024
+  @callback_fields [:connected_clients_fn, :process_rss_fn, :server_info_fn]
 
   @type t :: %__MODULE__{
           name: atom(),
@@ -26,6 +27,7 @@ defmodule FerricStore.Instance do
           slot_map: tuple(),
           shard_names: tuple(),
           keydir_refs: tuple(),
+          publication_epoch: reference(),
           replication_system: atom(),
           pressure_flags: reference(),
           disk_pressure: reference(),
@@ -60,6 +62,7 @@ defmodule FerricStore.Instance do
           lfu_log_factor: non_neg_integer(),
           lfu_initial_ref: reference(),
           hot_cache_max_value_size: non_neg_integer(),
+          max_value_size: pos_integer(),
           blob_side_channel_threshold_bytes: non_neg_integer(),
           sync_flush_timeout_ms: non_neg_integer(),
           max_active_file_size: non_neg_integer(),
@@ -74,8 +77,7 @@ defmodule FerricStore.Instance do
           config_table: atom() | reference(),
           connected_clients_fn: (-> non_neg_integer()),
           process_rss_fn: (-> non_neg_integer() | nil) | nil,
-          server_info_fn: (-> map()),
-          raft_apply_hook: (term() -> term()) | nil
+          server_info_fn: (-> map())
         }
 
   defstruct [
@@ -86,6 +88,7 @@ defmodule FerricStore.Instance do
     :slot_map,
     :shard_names,
     :keydir_refs,
+    :publication_epoch,
     :replication_system,
     :pressure_flags,
     :disk_pressure,
@@ -120,6 +123,7 @@ defmodule FerricStore.Instance do
     :lfu_log_factor,
     :lfu_initial_ref,
     :hot_cache_max_value_size,
+    :max_value_size,
     :blob_side_channel_threshold_bytes,
     :sync_flush_timeout_ms,
     :max_active_file_size,
@@ -135,8 +139,7 @@ defmodule FerricStore.Instance do
     :latch_refs,
     connected_clients_fn: nil,
     process_rss_fn: nil,
-    server_info_fn: nil,
-    raft_apply_hook: nil
+    server_info_fn: nil
   ]
 
   @doc """
@@ -159,6 +162,7 @@ defmodule FerricStore.Instance do
 
     # Per-shard ETS tables (anonymous — no global name pollution)
     keydir_refs = build_keydir_tables(name, shard_count)
+    publication_epoch = :atomics.new(shard_count, signed: false)
 
     # Per-shard latch tables — one ETS per shard, used by local direct RMW
     # helpers. Default-instance RMW commands go through Raft; these latches
@@ -452,7 +456,7 @@ defmodule FerricStore.Instance do
 
     # Hotness and config ETS tables (reuse existing for :default instance)
     hotness_name = if name == :default, do: :ferricstore_hotness, else: :"#{name}_hotness"
-    config_name = if name == :default, do: :ferricstore_config, else: :"#{name}_config"
+    config_name = if name == :default, do: :ferricstore_instance_config, else: :"#{name}_config"
 
     hotness_table =
       case :ets.whereis(hotness_name) do
@@ -492,6 +496,7 @@ defmodule FerricStore.Instance do
       slot_map: slot_map,
       shard_names: shard_names,
       keydir_refs: keydir_refs,
+      publication_epoch: publication_epoch,
       latch_refs: latch_refs,
       replication_system: :"#{name}_replication",
       pressure_flags: pressure_flags,
@@ -525,6 +530,7 @@ defmodule FerricStore.Instance do
       lfu_log_factor: lfu_log_factor,
       lfu_initial_ref: lfu_initial_ref,
       hot_cache_max_value_size: Keyword.get(opts, :hot_cache_max_value_size, 65_536),
+      max_value_size: apply_context.max_value_size,
       blob_side_channel_threshold_bytes:
         Keyword.get(
           opts,
@@ -591,12 +597,26 @@ defmodule FerricStore.Instance do
   Accepted keys: `:connected_clients_fn`, `:process_rss_fn`, `:server_info_fn`.
   """
   @spec inject_callbacks(atom(), keyword()) :: t()
-  def inject_callbacks(name, callbacks) do
+  def inject_callbacks(name, callbacks) when is_atom(name) and is_list(callbacks) do
+    validate_callbacks!(callbacks)
     ctx = get(name)
     updated = struct!(ctx, callbacks)
     :persistent_term.put({FerricStore.Instance, name}, updated)
     updated
   end
+
+  defp validate_callbacks!(callbacks) do
+    unless Keyword.keyword?(callbacks) and
+             Enum.all?(callbacks, fn {key, value} ->
+               key in @callback_fields and valid_callback?(key, value)
+             end) do
+      raise ArgumentError,
+            "callbacks must contain only connected_clients_fn/0, process_rss_fn/0, or server_info_fn/0"
+    end
+  end
+
+  defp valid_callback?(:process_rss_fn, nil), do: true
+  defp valid_callback?(_key, value), do: is_function(value, 0)
 
   @doc """
   Removes the cached instance context.
@@ -719,54 +739,6 @@ defmodule FerricStore.Instance do
   end
 
   defp detect_memory_limit do
-    cgroup_v2_limit() ||
-      cgroup_v1_limit() ||
-      host_total_memory() ||
-      Ferricstore.MemoryGuard.detect_memory_limit() ||
-      1_073_741_824
-  end
-
-  defp cgroup_v2_limit do
-    case File.read("/sys/fs/cgroup/memory.max") do
-      {:ok, "max\n"} ->
-        nil
-
-      {:ok, data} ->
-        case Integer.parse(String.trim(data)) do
-          {bytes, _} when bytes > 0 -> bytes
-          _ -> nil
-        end
-
-      _ ->
-        nil
-    end
-  end
-
-  defp cgroup_v1_limit do
-    case File.read("/sys/fs/cgroup/memory/memory.limit_in_bytes") do
-      {:ok, data} ->
-        case Integer.parse(String.trim(data)) do
-          {bytes, _} when bytes > 0 and bytes < 4_611_686_018_427_387_904 -> bytes
-          _ -> nil
-        end
-
-      _ ->
-        nil
-    end
-  end
-
-  defp host_total_memory do
-    try do
-      data = apply(:memsup, :get_system_memory_data, [])
-
-      case data do
-        list when is_list(list) -> Keyword.get(list, :total_memory)
-        _ -> nil
-      end
-    rescue
-      _ -> nil
-    catch
-      _, _ -> nil
-    end
+    Ferricstore.MemoryGuard.SystemMemory.detect_memory_limit()
   end
 end

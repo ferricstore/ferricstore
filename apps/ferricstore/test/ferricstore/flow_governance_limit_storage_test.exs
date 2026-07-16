@@ -13,6 +13,75 @@ defmodule Ferricstore.FlowGovernanceLimitStorageTest do
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.Router
 
+  test "catalog publication codecs reject non-canonical and out-of-range records" do
+    meta = LimitCatalogOutbox.encode_meta(%{head: 1, tail: 1})
+    intent = LimitCatalogOutbox.encode_intent(String.duplicate("owner", 1_024))
+
+    compressed_intent =
+      intent
+      |> :erlang.binary_to_term([:safe])
+      |> :erlang.term_to_binary(compressed: 9)
+
+    assert <<131, 80, _compressed::binary>> = compressed_intent
+
+    assert {:error, "ERR flow limit catalog publication outbox is corrupt"} =
+             LimitCatalogOutbox.decode_meta(meta <> <<0>>)
+
+    assert {:error, "ERR flow limit catalog publication entry is missing or corrupt"} =
+             LimitCatalogOutbox.decode_intent(intent <> <<0>>)
+
+    assert {:error, "ERR flow limit catalog publication entry is missing or corrupt"} =
+             LimitCatalogOutbox.decode_intent(compressed_intent)
+
+    assert_raise ArgumentError, fn ->
+      LimitCatalogOutbox.encode_meta(%{head: 2, tail: 0})
+    end
+
+    assert_raise ArgumentError, fn -> LimitCatalogOutbox.encode_intent("") end
+
+    assert_raise ArgumentError, fn ->
+      LimitCatalogOutbox.encode_intent(String.duplicate("o", Router.max_key_size() + 1))
+    end
+  end
+
+  test "limit record decoders reject non-canonical external terms" do
+    owner = CreditLease.owner(String.duplicate("scope", 1_024), 10)
+    assert {:ok, owner_value} = LimitRecord.encode_owner(owner)
+
+    owner_compressed =
+      owner_value
+      |> :erlang.binary_to_term([:safe])
+      |> :erlang.term_to_binary(compressed: 9)
+
+    assert <<131, 80, _rest::binary>> = owner_compressed
+
+    reservation = LimitRecord.encode_reservation("reservation", :active)
+    ids = for index <- 1..LimitRecord.page_size(), do: "reservation-#{index}"
+    assert {:ok, page} = LimitRecord.encode_page(ids)
+    cleanup = LimitRecord.encode_cleanup(0, 1, 1, 1)
+
+    assert {:error, "ERR flow limit record is corrupt"} =
+             LimitRecord.decode_owner(owner_compressed)
+
+    assert {:error, "ERR flow limit record is corrupt"} =
+             LimitRecord.decode_owner(owner_value <> <<0>>)
+
+    assert {:error, "ERR flow limit reservation record is corrupt"} =
+             LimitRecord.decode_reservation(reservation <> <<0>>, "reservation")
+
+    assert {:error, "ERR flow limit reservation page is corrupt"} =
+             LimitRecord.decode_page(page <> <<0>>)
+
+    assert {:error, "ERR flow limit cleanup record is corrupt"} =
+             LimitRecord.decode_cleanup(cleanup <> <<0>>)
+  end
+
+  test "individual reservation records enforce the reservation id bound" do
+    for invalid_id <- ["", String.duplicate("r", 257)] do
+      assert_raise ArgumentError, fn -> LimitRecord.encode_reservation(invalid_id, :active) end
+    end
+  end
+
   test "reservation records require the current explicit status field" do
     reservation_id = "reservation-1"
 

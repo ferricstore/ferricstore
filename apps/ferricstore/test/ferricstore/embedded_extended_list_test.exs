@@ -49,6 +49,28 @@ defmodule Ferricstore.EmbeddedExtendedListTest do
     end
   end
 
+  describe "negative range bounds" do
+    test "LRANGE returns empty when stop is before the beginning" do
+      assert {:ok, 3} = FerricStore.rpush("range:stop-before-start", ["a", "b", "c"])
+      assert {:ok, []} = FerricStore.lrange("range:stop-before-start", 0, -4)
+    end
+
+    test "LTRIM deletes the list when stop is before the beginning" do
+      key = "trim:stop-before-start"
+      assert {:ok, 3} = FerricStore.rpush(key, ["a", "b", "c"])
+
+      assert :ok =
+               Ferricstore.Commands.List.handle(
+                 "LTRIM",
+                 [key, "0", "-4"],
+                 FerricStore.Instance.get(:default)
+               )
+
+      assert {:ok, 0} = FerricStore.llen(key)
+      assert {:ok, []} = FerricStore.lrange(key, 0, -1)
+    end
+  end
+
   describe "lset/3" do
     test "sets element at index" do
       FerricStore.rpush("ls:key", ["a", "b", "c"])
@@ -65,6 +87,13 @@ defmodule Ferricstore.EmbeddedExtendedListTest do
     test "returns error for out-of-range index" do
       FerricStore.rpush("ls:oor", ["a"])
       assert {:error, _} = FerricStore.lset("ls:oor", 10, "X")
+    end
+
+    test "returns error for a negative index before the beginning" do
+      key = "ls:negative-oor"
+      assert {:ok, 3} = FerricStore.rpush(key, ["a", "b", "c"])
+      assert {:error, _} = FerricStore.lset(key, -4, "X")
+      assert {:ok, ["a", "b", "c"]} = FerricStore.lrange(key, 0, -1)
     end
   end
 

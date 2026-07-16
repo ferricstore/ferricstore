@@ -9,6 +9,10 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
   alias Ferricstore.Flow.Governance.View
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
+
+  @max_exact_integer 9_007_199_254_740_991
+  @max_reservation_id_bytes 256
 
   def reserve(ctx, scope, amount, opts \\ [])
 
@@ -16,11 +20,14 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
       when is_binary(scope) and scope != "" and is_integer(amount) and amount > 0 and
              is_list(opts) do
     result =
-      with {:ok, now_ms} <- optional_now_ms(opts),
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- budget_key(scope),
+           :ok <- validate_positive_exact_integer(amount, :amount),
+           {:ok, now_ms} <- optional_now_ms(opts),
            {:ok, requested_reservation_id} <- optional_reservation_id(opts) do
         AtomicRecord.mutate(
           ctx,
-          Keys.governance_budget_key(scope),
+          key,
           &decode/1,
           &encode/1,
           fn -> new_budget(scope, opts, now_ms) end,
@@ -37,6 +44,9 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
           end,
           catalog_kind: :budget
         )
+      else
+        false -> {:error, "ERR flow budget opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:budget_reserve, result, %{scope: scope, amount: amount})
@@ -52,10 +62,14 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
              reservation_id != "" and is_integer(actual_amount) and actual_amount >= 0 and
              is_list(opts) do
     result =
-      with {:ok, now_ms} <- optional_now_ms(opts) do
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- budget_key(scope),
+           :ok <- validate_non_negative_exact_integer(actual_amount, :actual_amount),
+           :ok <- validate_reservation_id(reservation_id),
+           {:ok, now_ms} <- optional_now_ms(opts) do
         AtomicRecord.mutate(
           ctx,
-          Keys.governance_budget_key(scope),
+          key,
           &decode/1,
           &encode/1,
           fn -> {:return, {:error, "ERR flow budget not found"}} end,
@@ -69,6 +83,9 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
             end
           end
         )
+      else
+        false -> {:error, "ERR flow budget commit opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:budget_commit, result, %{
@@ -87,10 +104,13 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
       when is_binary(scope) and scope != "" and is_binary(reservation_id) and
              reservation_id != "" and is_list(opts) do
     result =
-      with {:ok, now_ms} <- optional_now_ms(opts) do
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- budget_key(scope),
+           :ok <- validate_reservation_id(reservation_id),
+           {:ok, now_ms} <- optional_now_ms(opts) do
         AtomicRecord.mutate(
           ctx,
-          Keys.governance_budget_key(scope),
+          key,
           &decode/1,
           &encode/1,
           fn -> {:return, {:error, "ERR flow budget not found"}} end,
@@ -101,6 +121,9 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
             end
           end
         )
+      else
+        false -> {:error, "ERR flow budget release opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:budget_release, result, %{scope: scope, reservation_id: reservation_id})
@@ -112,15 +135,21 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
   def get(ctx, scope, opts \\ [])
 
   def get(ctx, scope, opts) when is_binary(scope) and scope != "" and is_list(opts) do
-    case Router.get(ctx, Keys.governance_budget_key(scope)) do
-      nil ->
-        {:ok, nil}
+    with true <- Keyword.keyword?(opts),
+         {:ok, key} <- budget_key(scope) do
+      case Router.get(ctx, key) do
+        nil ->
+          {:ok, nil}
 
-      value when is_binary(value) ->
-        with {:ok, budget} <- decode(value), do: {:ok, View.public(budget)}
+        value when is_binary(value) ->
+          with {:ok, budget} <- decode(value), do: {:ok, View.public(budget)}
 
-      _other ->
-        {:error, "ERR flow budget record is corrupt"}
+        _other ->
+          {:error, "ERR flow budget record is corrupt"}
+      end
+    else
+      false -> {:error, "ERR flow budget opts must be a keyword list"}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -129,11 +158,15 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
   def list(ctx, opts \\ [])
 
   def list(ctx, opts) when is_list(opts) do
-    with {:ok, limit} <- optional_limit(opts),
+    with true <- Keyword.keyword?(opts),
+         {:ok, limit} <- optional_limit(opts),
          {:ok, scopes} <- optional_scope_filters(opts),
          {:ok, budgets} <-
            collect_list_budgets(ctx, scopes, limit) do
       {:ok, budgets}
+    else
+      false -> {:error, "ERR flow budget opts must be a keyword list"}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -161,13 +194,21 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
   end
 
   defp load_list_budget(ctx, key, scopes) do
-    with value when is_binary(value) <- Router.get(ctx, key),
-         {:ok, budget} <- decode(value),
-         budget = View.public(budget),
-         true <- matches_scope?(budget, scopes) do
-      {:ok, budget}
-    else
-      _missing_corrupt_or_filtered -> :skip
+    case Router.get(ctx, key) do
+      nil ->
+        :skip
+
+      value when is_binary(value) ->
+        with {:ok, budget} <- decode(value) do
+          budget = View.public(budget)
+          if matches_scope?(budget, scopes), do: {:ok, budget}, else: :skip
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _other ->
+        {:error, "ERR flow budget record is corrupt"}
     end
   end
 
@@ -178,35 +219,47 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
     end
   end
 
-  defp encode(budget), do: :erlang.term_to_binary({:flow_governance_budget_v1, budget})
+  defp encode(budget), do: TermCodec.encode({:flow_governance_budget_v1, budget})
 
   defp decode(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {:flow_governance_budget_v1, %Budget{} = budget} -> {:ok, Budget.normalize(budget)}
-      _other -> {:error, "ERR flow budget record is corrupt"}
+    case TermCodec.decode(value) do
+      {:ok, {:flow_governance_budget_v1, %Budget{} = budget}} ->
+        if Budget.valid?(budget),
+          do: {:ok, budget},
+          else: {:error, "ERR flow budget record is corrupt"}
+
+      _other ->
+        {:error, "ERR flow budget record is corrupt"}
     end
-  rescue
-    _ -> {:error, "ERR flow budget record is corrupt"}
   end
 
   defp optional_now_ms(opts) do
     case Keyword.get(opts, :now_ms, CommandTime.now_ms()) do
-      value when is_integer(value) and value >= 0 -> {:ok, value}
+      value when is_integer(value) and value >= 0 and value <= @max_exact_integer -> {:ok, value}
       _other -> {:error, "ERR flow budget now_ms must be a non-negative integer"}
     end
   end
 
   defp optional_reservation_id(opts) do
     case Keyword.get(opts, :reservation_id) do
-      nil -> {:ok, nil}
-      value when is_binary(value) and value != "" -> {:ok, value}
-      _other -> {:error, "ERR flow budget reservation_id must be a non-empty string"}
+      nil ->
+        {:ok, nil}
+
+      value
+      when is_binary(value) and value != "" and byte_size(value) <= @max_reservation_id_bytes ->
+        {:ok, value}
+
+      value when is_binary(value) and value != "" ->
+        {:error, "ERR flow budget reservation_id must be at most 256 bytes"}
+
+      _other ->
+        {:error, "ERR flow budget reservation_id must be a non-empty string"}
     end
   end
 
   defp required_positive_integer(opts, key) do
     case Keyword.get(opts, key) do
-      value when is_integer(value) and value > 0 -> {:ok, value}
+      value when is_integer(value) and value > 0 and value <= @max_exact_integer -> {:ok, value}
       _other -> {:error, "ERR flow budget #{key} must be a positive integer"}
     end
   end
@@ -221,10 +274,16 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
   defp optional_scope_filters(opts) do
     case {Keyword.get(opts, :scope), Keyword.get(opts, :partition_key)} do
       {scope, _partition_key} when is_binary(scope) and scope != "" ->
-        {:ok, [scope]}
+        with {:ok, _key} <- budget_key(scope), do: {:ok, [scope]}
 
       {nil, partition_key} when is_binary(partition_key) and partition_key != "" ->
-        {:ok, [partition_key, "partition:" <> partition_key]}
+        scopes = [partition_key, "partition:" <> partition_key]
+
+        with true <- Enum.all?(scopes, &match?({:ok, _key}, budget_key(&1))) do
+          {:ok, scopes}
+        else
+          false -> {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+        end
 
       {nil, nil} ->
         {:ok, nil}
@@ -248,4 +307,38 @@ defmodule Ferricstore.Flow.Governance.BudgetStore do
     |> :crypto.strong_rand_bytes()
     |> Base.url_encode64(padding: false)
   end
+
+  defp budget_key(scope) do
+    key = Keys.governance_budget_key(scope)
+
+    if byte_size(key) <= Router.max_key_size() do
+      {:ok, key}
+    else
+      {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+    end
+  end
+
+  defp validate_positive_exact_integer(value, _key)
+       when is_integer(value) and value > 0 and value <= @max_exact_integer,
+       do: :ok
+
+  defp validate_positive_exact_integer(_value, key),
+    do: {:error, "ERR flow budget #{key} must be a positive integer"}
+
+  defp validate_non_negative_exact_integer(value, _key)
+       when is_integer(value) and value >= 0 and value <= @max_exact_integer,
+       do: :ok
+
+  defp validate_non_negative_exact_integer(_value, key),
+    do: {:error, "ERR flow budget #{key} must be a non-negative integer"}
+
+  defp validate_reservation_id(value)
+       when is_binary(value) and value != "" and byte_size(value) <= @max_reservation_id_bytes,
+       do: :ok
+
+  defp validate_reservation_id(value) when is_binary(value) and value != "",
+    do: {:error, "ERR flow budget reservation_id must be at most 256 bytes"}
+
+  defp validate_reservation_id(_value),
+    do: {:error, "ERR flow budget reservation_id must be a non-empty string"}
 end

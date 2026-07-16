@@ -218,8 +218,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         assert [binary_part(payload, 128, 8)] ==
                  GenServer.call(
                    shard,
-                   {:tx_execute, [{"GETRANGE", [key, "128", "135"], {:getrange, key, 128, 135}}],
-                    nil}
+                   {:tx_execute, [prepared_tx_entry("GETRANGE", [key, "128", "135"])], nil}
                  )
       end
 
@@ -280,6 +279,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         assert payload == Router.get(ctx, key)
       end
 
+      @tag :flow_policy_reference
       test "Flow-owned large payload values are persisted as blob refs", %{
         ctx: ctx,
         keydir: keydir
@@ -292,8 +292,14 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)
         active_file_path = ShardETS.file_path(shard_path, 0)
 
-        {:ok, policy_snapshot} =
-          Ferricstore.Flow.RetryPolicy.normalize_flow_policy("blob-flow", [])
+        policy = %{type: "blob-flow"}
+        encoded_policy = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy, 0)
+
+        policy_ref = %{
+          type: "blob-flow",
+          generation: 0,
+          digest: :crypto.hash(:sha256, encoded_policy)
+        }
 
         state =
           StateMachine.init(%{
@@ -319,9 +325,8 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
                partition_key: partition_key,
                payload: payload,
                now_ms: 1_000,
-               policy_generation: 0,
-               policy_snapshot: policy_snapshot,
-               policy_snapshot_captured: true
+               policy_ref: policy_ref,
+               policy_reference_captured: true
              }},
             state
           )
@@ -560,7 +565,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         assert payload == Router.compound_get(ctx, redis_key, field)
       end
 
-      test "cross-shard SET apply persists large values as blob refs", %{
+      test "transaction SET apply persists large values as blob refs", %{
         ctx: ctx,
         keydir: keydir
       } do
@@ -582,10 +587,10 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
           })
 
         assert_state_machine_result(
-          %{0 => [:ok]},
+          [:ok],
           StateMachine.apply(
             %{index: 1, system_time: 1_000},
-            {:cross_shard_tx, [{0, [prepared_tx_entry("SET", [key, payload])], nil}]},
+            {:tx_execute, [prepared_tx_entry("SET", [key, payload])], nil},
             state
           )
         )
@@ -594,10 +599,10 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         assert {:ok, ^payload} = BlobStore.get(ctx.data_dir, 0, ref)
 
         assert_state_machine_result(
-          %{0 => [payload]},
+          [payload],
           StateMachine.apply(
             %{index: 2, system_time: 1_001},
-            {:cross_shard_tx, [{0, [prepared_tx_entry("GET", [key])], nil}]},
+            {:tx_execute, [prepared_tx_entry("GET", [key])], nil},
             state
           )
         )
@@ -605,7 +610,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         assert payload == Router.get(ctx, key)
       end
 
-      test "cross-shard apply returns an error and rolls back when blob persistence fails", %{
+      test "transaction apply preserves successful commands when later blob persistence fails", %{
         ctx: ctx,
         keydir: keydir
       } do
@@ -631,22 +636,19 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
 
         try do
           assert_state_machine_result(
-            {:error, {:blob_externalize_failed, :eio}},
+            [:ok, {:error, {:blob_externalize_failed, :eio}}],
             StateMachine.apply(
               %{index: 1, system_time: 1_000},
-              {:cross_shard_tx,
+              {:tx_execute,
                [
-                 {0,
-                  [
-                    prepared_tx_entry("SET", [small_key, "small"]),
-                    prepared_tx_entry("SET", [large_key, payload])
-                  ], nil}
-               ]},
+                 prepared_tx_entry("SET", [small_key, "small"]),
+                 prepared_tx_entry("SET", [large_key, payload])
+               ], nil},
               state
             )
           )
 
-          assert [] == :ets.lookup(keydir, small_key)
+          assert [{^small_key, "small", 0, _, _, _, _}] = :ets.lookup(keydir, small_key)
           assert [] == :ets.lookup(keydir, large_key)
         after
           Process.delete(:ferricstore_blob_store_fsync_dir_hook)
@@ -744,10 +746,16 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         field_a = CompoundKey.hash_field(redis_key, "a")
         field_b = CompoundKey.hash_field(redis_key, "b")
 
+        assert :ok =
+                 GenServer.call(
+                   shard,
+                   {:put, CompoundKey.type_key(redis_key), CompoundKey.encode_type(:hash), 0}
+                 )
+
         assert :ok = GenServer.call(shard, {:compound_put, redis_key, field_a, first_ref, 0})
         assert :ok = GenServer.call(shard, {:compound_put, redis_key, field_b, second_ref, 0})
 
-        state = :sys.get_state(shard)
+        state = await_promoted_instance(shard, redis_key)
         dedicated_path = state.promoted_instances[redis_key].path
 
         refute String.starts_with?(
@@ -773,11 +781,16 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
         seed_a = CompoundKey.hash_field(redis_key, "seed-a")
         seed_b = CompoundKey.hash_field(redis_key, "seed-b")
 
+        assert :ok =
+                 GenServer.call(
+                   shard,
+                   {:put, CompoundKey.type_key(redis_key), CompoundKey.encode_type(:hash), 0}
+                 )
+
         assert :ok = GenServer.call(shard, {:compound_put, redis_key, seed_a, "small-a", 0})
         assert :ok = GenServer.call(shard, {:compound_put, redis_key, seed_b, "small-b", 0})
 
-        state = :sys.get_state(shard)
-        assert Map.has_key?(state.promoted_instances, redis_key)
+        state = await_promoted_instance(shard, redis_key)
 
         parent = self()
 
@@ -825,6 +838,12 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
 
         assert :ok = Router.put(ctx, live_key, :binary.copy("L", 1024), 0)
         assert :ok = Router.put(ctx, dead_key, :binary.copy("D", 1024), 0)
+
+        assert :ok =
+                 GenServer.call(
+                   shard,
+                   {:put, CompoundKey.type_key(redis_key), CompoundKey.encode_type(:hash), 0}
+                 )
 
         assert :ok =
                  GenServer.call(

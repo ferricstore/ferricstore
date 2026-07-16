@@ -469,12 +469,12 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
                       dirty?: true,
                       dirty_flag?: false,
                       in_flight?: true,
-                      result: :in_flight_retry
+                      result: :ok
                     }},
                    2_000
 
-    assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
-           "shutdown cannot prove the in-flight async fsync completed, so the next checkpointer must retry"
+    assert :atomics.get(ctx.checkpoint_flags, 1) == 0,
+           "shutdown must synchronously fsync and clear dirty state even with async work in flight"
 
     assert :atomics.get(ctx.checkpoint_in_flight, 1) == 0,
            "a stopped checkpointer must not leave release_cursor permanently gated"

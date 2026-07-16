@@ -165,6 +165,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
+      defp apply_single(state, {:flow_policy_fence, installs, command})
+           when is_list(installs) and is_tuple(command) do
+        apply_flow_policy_fence(state, installs, command)
+      end
+
       # Async PUT, origin: skip ETS (Router already inserted) but accumulate
       # disk write only for small values (file_id == :pending means Router
       # deferred disk write to us). Large values already have a real file_id
@@ -291,6 +296,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         do_checked_put_blob_ref(state, key, encoded_ref, expire_at_ms)
       end
 
+      defp apply_single(state, {:mset, entries}) when is_list(entries) do
+        apply_atomic_string_batch(state, entries, :mset, :plain)
+      end
+
+      defp apply_single(state, {:mset_blob_batch, entries}) when is_list(entries) do
+        apply_atomic_string_batch(state, entries, :mset, :blob)
+      end
+
+      defp apply_single(state, {:msetnx, entries}) when is_list(entries) do
+        apply_atomic_string_batch(state, entries, :msetnx, :plain)
+      end
+
+      defp apply_single(state, {:msetnx_blob_batch, entries}) when is_list(entries) do
+        apply_atomic_string_batch(state, entries, :msetnx, :blob)
+      end
+
       defp apply_single(state, {:set, key, value, expire_at_ms, opts}) do
         redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
@@ -328,6 +349,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         do_checked_lmove(state, src_key, dst_key, from_dir, to_dir)
       end
 
+      defp apply_single(state, {:compound_type_claim, redis_key, type})
+           when is_binary(redis_key) and type in [:hash, :list, :set, :zset, :stream] do
+        case check_key_lock(state, redis_key, nil) do
+          :ok ->
+            Ferricstore.Store.TypeRegistry.serialized_claim_status(
+              redis_key,
+              type,
+              build_compound_store(state)
+            )
+
+          {:error, :key_locked} ->
+            {:error, :key_locked}
+        end
+      end
+
       defp apply_single(state, {:compound_put, compound_key, value, expire_at_ms}) do
         redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
@@ -362,12 +398,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         type_key = CompoundKey.type_key(key)
         field_key = CompoundKey.hash_field(key, field)
 
-        case do_get(state, type_key) do
+        case sm_store_compound_get(state, key, type_key) do
           nil ->
             apply_hset_single_new_hash(state, key, type_key, field_key, value)
 
           "hash" ->
-            apply_hset_single_existing_hash(state, field_key, value)
+            apply_hset_single_existing_hash(state, key, field_key, value)
 
           _other_type ->
             {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
@@ -378,29 +414,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         if live_key?(state, key) do
           {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
         else
-          with :ok <- do_put(state, type_key, "hash", 0) do
-            case do_put(state, field_key, value, 0) do
+          with :ok <- do_compound_put(state, key, type_key, "hash", 0) do
+            case do_compound_put(state, key, field_key, value, 0) do
               :ok ->
                 1
 
               {:error, _reason} = error ->
-                rollback_hset_single_type_marker(state, type_key, error)
+                rollback_hset_single_type_marker(state, key, type_key, error)
             end
           end
         end
       end
 
-      defp apply_hset_single_existing_hash(state, field_key, value) do
-        existed? = do_get(state, field_key) != nil
+      defp apply_hset_single_existing_hash(state, key, field_key, value) do
+        existed? = sm_store_compound_get(state, key, field_key) != nil
 
-        case do_put(state, field_key, value, 0) do
+        case do_compound_put(state, key, field_key, value, 0) do
           :ok -> if existed?, do: 0, else: 1
           {:error, _reason} = error -> error
         end
       end
 
-      defp rollback_hset_single_type_marker(state, type_key, write_error) do
-        case do_delete(state, type_key) do
+      defp rollback_hset_single_type_marker(state, key, type_key, write_error) do
+        case do_compound_delete(state, key, type_key) do
           :ok ->
             write_error
 
@@ -610,16 +646,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       defp apply_srem_single(state, key, member) do
         type_key = CompoundKey.type_key(key)
 
-        case pending_aware_get(state, type_key) do
+        case pending_aware_compound_get(state, key, type_key) do
           "set" ->
             member_key = CompoundKey.set_member(key, member)
 
-            case pending_aware_get(state, member_key) do
+            case pending_aware_compound_get(state, key, member_key) do
               nil ->
                 0
 
               _present ->
-                with :ok <- do_delete(state, member_key),
+                with :ok <- do_compound_delete(state, key, member_key),
                      :ok <- maybe_delete_empty_compound_type(state, key, type_key, :set) do
                   1
                 end
@@ -640,7 +676,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         member_key = CompoundKey.zset_member(key, member)
         score_str = Float.to_string(score * 1.0)
 
-        case do_get(state, type_key) do
+        case sm_store_compound_get(state, key, type_key) do
           nil ->
             apply_zadd_single_new_zset(state, key, type_key, member_key, member, score, score_str)
 
@@ -676,8 +712,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         if live_key?(state, key) do
           {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
         else
-          with :ok <- do_put(state, type_key, "zset", 0),
-               :ok <- do_put(state, member_key, score_str, 0) do
+          with :ok <- do_compound_put(state, key, type_key, "zset", 0),
+               :ok <- do_compound_put(state, key, member_key, score_str, 0) do
             queue_zset_index_new_put_after_flush(state, key, member, score)
             1
           end
@@ -685,12 +721,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_zadd_single_existing_zset(state, key, member_key, score_str) do
-        current_score = do_get(state, member_key)
+        current_score = sm_store_compound_get(state, key, member_key)
 
         if current_score == score_str do
           0
         else
-          case do_put(state, member_key, score_str, 0) do
+          case do_compound_put(state, key, member_key, score_str, 0) do
             :ok ->
               queue_zset_index_put_after_flush(state, key, member_key, score_str)
 
@@ -705,16 +741,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       defp apply_zrem_single(state, key, member) do
         type_key = CompoundKey.type_key(key)
 
-        case pending_aware_get(state, type_key) do
+        case pending_aware_compound_get(state, key, type_key) do
           "zset" ->
             member_key = CompoundKey.zset_member(key, member)
 
-            case pending_aware_get(state, member_key) do
+            case pending_aware_compound_get(state, key, member_key) do
               nil ->
                 0
 
               _score ->
-                with :ok <- do_delete(state, member_key),
+                with :ok <- do_compound_delete(state, key, member_key),
                      :ok <- queue_zset_index_delete_after_flush_ok(state, key, member_key),
                      :ok <- maybe_delete_empty_compound_type(state, key, type_key, :zset) do
                   1
@@ -731,8 +767,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
-      defp pending_aware_get(state, key) do
-        if pending_deleted?(key), do: nil, else: do_get(state, key)
+      defp pending_aware_compound_get(state, redis_key, compound_key) do
+        if pending_deleted?(compound_key),
+          do: nil,
+          else: sm_store_compound_get(state, redis_key, compound_key)
       end
 
       defp pending_deleted?(key) do
@@ -745,34 +783,65 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp maybe_delete_empty_compound_type(state, key, type_key, :set) do
-        maybe_delete_empty_compound_type(state, type_key, CompoundKey.set_prefix(key))
+        maybe_delete_empty_compound_type(state, key, type_key, :set, [])
       end
 
       defp maybe_delete_empty_compound_type(state, key, type_key, :zset) do
-        maybe_delete_empty_compound_type(state, type_key, CompoundKey.zset_prefix(key))
+        maybe_delete_empty_compound_type(state, key, type_key, :zset, [])
       end
 
-      defp maybe_delete_empty_compound_type(state, type_key, prefix) do
+      defp maybe_delete_empty_compound_type(state, key, type_key, :set, ignored_keys) do
+        maybe_delete_empty_compound_type(
+          state,
+          key,
+          type_key,
+          CompoundKey.set_prefix(key),
+          ignored_keys
+        )
+      end
+
+      defp maybe_delete_empty_compound_type(state, key, type_key, :zset, ignored_keys) do
+        maybe_delete_empty_compound_type(
+          state,
+          key,
+          type_key,
+          CompoundKey.zset_prefix(key),
+          ignored_keys
+        )
+      end
+
+      defp maybe_delete_empty_compound_type(
+             state,
+             redis_key,
+             type_key,
+             prefix,
+             ignored_keys
+           ) do
+        ignored_keys =
+          Enum.reduce(ignored_keys, Process.get(:sm_pending_values, %{}), fn key, acc ->
+            Map.put(acc, key, :deleted)
+          end)
+
         case Ferricstore.Store.Shard.CompoundMemberIndex.any_live?(
                Map.get(state, :compound_member_index_name),
                shard_ets_state(state),
                prefix,
-               Process.get(:sm_pending_values, %{})
+               ignored_keys
              ) do
           false ->
-            do_delete(state, type_key)
+            do_compound_delete(state, redis_key, type_key)
 
           true ->
             :ok
 
           :unavailable ->
-            maybe_delete_empty_compound_type_fallback(state, type_key, prefix)
+            maybe_delete_empty_compound_type_fallback(state, redis_key, type_key, prefix)
         end
       end
 
-      defp maybe_delete_empty_compound_type_fallback(state, type_key, prefix) do
+      defp maybe_delete_empty_compound_type_fallback(state, redis_key, type_key, prefix) do
         if Ferricstore.Store.Shard.ETS.prefix_count_entries(shard_ets_state(state), prefix) == 0 do
-          do_delete(state, type_key)
+          do_compound_delete(state, redis_key, type_key)
         else
           :ok
         end
@@ -907,15 +976,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_single(state, {:ratelimit_add, key, window_ms, max, count}) do
-        do_ratelimit_add(state, key, window_ms, max, count, nil)
-      end
-
-      defp apply_single(state, {:ratelimit_add, key, window_ms, max, count, now_ms}) do
-        do_ratelimit_add(state, key, window_ms, max, count, now_ms)
+        do_ratelimit_add(state, key, window_ms, max, count)
       end
 
       defp apply_single(state, {:tx_execute, queue, sandbox_namespace}) when is_list(queue) do
         do_tx_execute(state, queue, sandbox_namespace)
+      end
+
+      defp apply_single(state, {:tx_execute, queue, sandbox_namespace, watched_keys})
+           when is_list(queue) and is_map(watched_keys) do
+        if transaction_watches_clean?(watched_keys, state) do
+          do_tx_execute(state, queue, sandbox_namespace)
+        else
+          nil
+        end
+      end
+
+      defp apply_single(state, {:watch_token, key}) when is_binary(key) do
+        transaction_watch_token(state, key)
+      end
+
+      defp apply_single(state, {:watch_tokens, keys}) when is_list(keys) do
+        transaction_watch_tokens(state, keys)
       end
 
       defp apply_single(state, {:locked_put, key, value, expire_at_ms, owner_ref}) do
@@ -1217,9 +1299,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end)
       end
 
-      defp apply_single(state, {:topk_create, key, k, width, depth, decay}) do
+      defp apply_single(state, {:topk_create, key, k, width, depth}) do
         do_prob_command(state, fn ->
-          create_topk_metadata(state, key, k, width, depth, decay)
+          create_topk_metadata(state, key, k, width, depth)
         end)
       end
 
@@ -1258,6 +1340,92 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
             error
         end
       end
+
+      defp apply_atomic_string_batch(state, entries, operation, representation) do
+        with {:ok, keys} <- atomic_string_batch_keys(entries, representation),
+             :ok <- atomic_string_batch_locks(state, keys),
+             :ok <- atomic_string_batch_precondition(state, keys, operation),
+             :ok <- atomic_string_batch_write(state, entries, representation) do
+          if operation == :msetnx, do: 1, else: :ok
+        else
+          :exists -> 0
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp atomic_string_batch_keys(entries, representation) do
+        entries
+        |> Enum.reduce_while({:ok, []}, fn entry, {:ok, keys} ->
+          case atomic_string_batch_key(entry, representation) do
+            {:ok, key} -> {:cont, {:ok, [key | keys]}}
+            :error -> {:halt, {:error, :invalid_atomic_string_batch_entry}}
+          end
+        end)
+        |> case do
+          {:ok, keys} -> {:ok, Enum.reverse(keys)}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp atomic_string_batch_key({key, value, expire_at_ms}, :plain)
+           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms),
+           do: {:ok, key}
+
+      defp atomic_string_batch_key({key, value, expire_at_ms, representation}, :blob)
+           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
+                  representation in [:value, :blob_ref],
+           do: {:ok, key}
+
+      defp atomic_string_batch_key(_entry, _representation), do: :error
+
+      defp atomic_string_batch_locks(state, keys) do
+        Enum.reduce_while(keys, :ok, fn key, :ok ->
+          redis_key = CompoundKey.extract_redis_key(key)
+
+          case check_key_lock(state, redis_key, nil) do
+            :ok -> {:cont, :ok}
+            {:error, :key_locked} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp atomic_string_batch_precondition(_state, _keys, :mset), do: :ok
+
+      defp atomic_string_batch_precondition(state, keys, :msetnx) do
+        if Enum.any?(keys, &atomic_string_key_exists?(state, &1)), do: :exists, else: :ok
+      end
+
+      defp atomic_string_key_exists?(state, key) do
+        case ets_lookup(state, key) do
+          {:hit, _value, _expire_at_ms} -> true
+          _missing_or_expired -> compound_data_structure_key?(state, key)
+        end
+      end
+
+      defp atomic_string_batch_write(state, entries, :plain) do
+        state
+        |> apply_put_batch_entries(entries)
+        |> atomic_string_batch_status()
+      end
+
+      defp atomic_string_batch_write(state, entries, :blob) do
+        state
+        |> apply_put_blob_batch_entries(entries)
+        |> atomic_string_batch_status()
+      end
+
+      defp atomic_string_batch_status(results) when is_list(results) do
+        Enum.reduce_while(results, :ok, fn
+          :ok, :ok -> {:cont, :ok}
+          {:error, _reason} = error, :ok -> {:halt, error}
+          invalid, :ok -> {:halt, {:error, {:invalid_atomic_string_batch_result, invalid}}}
+        end)
+      end
+
+      defp atomic_string_batch_status({:error, _reason} = error), do: error
+
+      defp atomic_string_batch_status(invalid),
+        do: {:error, {:invalid_atomic_string_batch_result, invalid}}
 
       defp apply_plain_put_batch_entries(state, entries) do
         case Map.get(state, :cross_shard_locks, %{}) do
@@ -1343,8 +1511,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp do_put_blob_ref_ref_only_validated(state, key, encoded_ref, expire_at_ms) do
-        maybe_clear_compound_data_structure_for_string_put(state, key)
-        raw_put_blob_ref_ref_only(state, key, encoded_ref, expire_at_ms)
+        with :ok <- maybe_clear_compound_data_structure_for_string_put(state, key) do
+          raw_put_blob_ref_ref_only(state, key, encoded_ref, expire_at_ms)
+        end
       end
 
       defp put_batch_fast_path?(state, entries) do

@@ -24,12 +24,25 @@ defmodule Ferricstore.Config.Local do
   """
 
   require Logger
+  use GenServer
 
   @table :ferricstore_config_local
 
   @valid_log_levels MapSet.new(["debug", "info", "notice", "warning", "error"])
 
   @known_local_params MapSet.new(["log_level"])
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(_opts \\ []) do
+    case GenServer.start_link(__MODULE__, [], name: __MODULE__) do
+      {:error, {:already_started, pid}} ->
+        Process.link(pid)
+        {:ok, pid}
+
+      result ->
+        result
+    end
+  end
 
   # -------------------------------------------------------------------
   # Types
@@ -52,21 +65,16 @@ defmodule Ferricstore.Config.Local do
   """
   @spec ensure_table() :: :ok
   def ensure_table do
-    case :ets.whereis(@table) do
-      :undefined ->
-        :ets.new(@table, [
-          :set,
-          :public,
-          :named_table,
-          {:read_concurrency, true},
-          {:write_concurrency, true}
-        ])
+    case Process.whereis(__MODULE__) do
+      nil ->
+        case GenServer.start(__MODULE__, [], name: __MODULE__) do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+        end
 
-      _ref ->
+      _pid ->
         :ok
     end
-
-    :ok
   end
 
   @doc """
@@ -99,9 +107,7 @@ defmodule Ferricstore.Config.Local do
       case validate_local(key, value) do
         :ok ->
           ensure_table()
-          :ets.insert(@table, {key, value})
-          apply_local_side_effect(key, value)
-          :ok
+          GenServer.call(__MODULE__, {:set, key, value})
 
         {:error, _} = err ->
           err
@@ -175,10 +181,32 @@ defmodule Ferricstore.Config.Local do
   @spec reset_all() :: :ok
   def reset_all do
     ensure_table()
-    :ets.delete_all_objects(@table)
-    :ok
-  rescue
-    ArgumentError -> :ok
+    GenServer.call(__MODULE__, :reset_all)
+  end
+
+  @impl true
+  def init([]) do
+    table =
+      :ets.new(@table, [
+        :set,
+        :protected,
+        :named_table,
+        {:read_concurrency, true}
+      ])
+
+    {:ok, %{table: table}}
+  end
+
+  @impl true
+  def handle_call({:set, key, value}, _from, state) do
+    apply_local_side_effect(key, value)
+    true = :ets.insert(@table, {key, value})
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:reset_all, _from, state) do
+    true = :ets.delete_all_objects(@table)
+    {:reply, :ok, state}
   end
 
   # -------------------------------------------------------------------

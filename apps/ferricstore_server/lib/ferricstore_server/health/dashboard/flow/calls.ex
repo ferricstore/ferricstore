@@ -114,23 +114,55 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Calls do
 
   def bounded_dashboard_call(fun, timeout_ms, operation) when is_function(fun, 0) do
     started_at = System.monotonic_time()
-    task = Task.async(fun)
+    caller = self()
+    reply_ref = make_ref()
+
+    {worker, monitor_ref} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            {:ok, fun.()}
+          rescue
+            exception -> {:error, {:exit, {exception, __STACKTRACE__}}}
+          catch
+            kind, reason -> {:error, {:exit, {{kind, reason}, __STACKTRACE__}}}
+          end
+
+        send(caller, {reply_ref, result})
+      end)
 
     result =
-      case Task.yield(task, timeout_ms) do
-        {:ok, value} ->
-          {:ok, value}
+      receive do
+        {^reply_ref, result} ->
+          Process.demonitor(monitor_ref, [:flush])
+          result
 
-        {:exit, reason} ->
+        {:DOWN, ^monitor_ref, :process, ^worker, reason} ->
           {:error, {:exit, reason}}
-
-        nil ->
-          Task.shutdown(task, :brutal_kill)
+      after
+        timeout_ms ->
+          Process.exit(worker, :kill)
+          await_worker_down(monitor_ref, worker)
+          flush_worker_reply(reply_ref)
           {:error, :timeout}
       end
 
     emit_dashboard_flow_lookup(operation, result, timeout_ms, started_at)
     result
+  end
+
+  defp await_worker_down(monitor_ref, worker) do
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^worker, _reason} -> :ok
+    end
+  end
+
+  defp flush_worker_reply(reply_ref) do
+    receive do
+      {^reply_ref, _result} -> :ok
+    after
+      0 -> :ok
+    end
   end
 
   defp emit_dashboard_flow_lookup(operation, result, timeout_ms, started_at) do

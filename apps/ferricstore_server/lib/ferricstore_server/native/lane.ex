@@ -9,8 +9,9 @@ defmodule FerricstoreServer.Native.Lane do
   """
 
   alias Ferricstore.{LatencyTrace, Stats}
-  alias Ferricstore.Store.Router
-  alias FerricstoreServer.Native.{Codec, Commands}
+  alias Ferricstore.Flow.InternalKey
+  alias Ferricstore.Store.{ReadResult, Router}
+  alias FerricstoreServer.Native.{Codec, Commands, ResourceBudget}
 
   @flag_trace 0x01
   @flag_custom_payload 0x02
@@ -19,13 +20,24 @@ defmodule FerricstoreServer.Native.Lane do
   @op_get 0x0101
   @op_set 0x0102
   @op_mget 0x0104
+  @op_fetch_or_compute 0x010B
   @compact_data_write_pipeline_modes [22, 23, 24, 25, 26, 31, 32]
 
-  @spec start_link(pid(), non_neg_integer(), map()) :: {:ok, pid()}
+  @spec start_link(pid(), non_neg_integer(), map()) :: {:ok, pid()} | {:error, term()}
   def start_link(owner, lane_id, command_state)
       when is_pid(owner) and is_integer(lane_id) and is_map(command_state) do
-    pid = spawn_link(__MODULE__, :loop, [owner, lane_id, command_state])
-    {:ok, pid}
+    starter = self()
+    start_ref = make_ref()
+    pid = spawn_link(fn -> init_lane(starter, start_ref, owner, lane_id, command_state) end)
+
+    receive do
+      {:native_lane_started, ^start_ref, ^pid} -> {:ok, pid}
+      {:native_lane_rejected, ^start_ref, ^pid, reason} -> {:error, reason}
+    after
+      5_000 ->
+        Process.exit(pid, :kill)
+        {:error, :start_timeout}
+    end
   end
 
   @spec enqueue(pid(), term()) :: :ok
@@ -46,6 +58,19 @@ defmodule FerricstoreServer.Native.Lane do
     :ok
   end
 
+  @doc false
+  @spec account_frame(term(), pos_integer()) :: term()
+  def account_frame(frame, bytes) when is_integer(bytes) and bytes > 0,
+    do: {:native_accounted_frame, frame, bytes}
+
+  @doc false
+  @spec execute_prepared_batch((-> term()), (term() -> term())) :: {:ok, term()}
+  def execute_prepared_batch(execute, encode)
+      when is_function(execute, 0) and is_function(encode, 1) do
+    results = execute.()
+    {:ok, encode.(results)}
+  end
+
   @spec stop(pid()) :: :ok
   def stop(pid) when is_pid(pid) do
     Process.unlink(pid)
@@ -63,34 +88,7 @@ defmodule FerricstoreServer.Native.Lane do
   def loop(owner, lane_id, command_state) do
     receive do
       {:native_lane_frame, frame} ->
-        cond do
-          compact_set_pipeline_frame?(frame) ->
-            {frames, next_frame} = collect_ready_compact_set_pipeline_frames([frame])
-            execute_and_send_frames(owner, lane_id, frames, command_state)
-
-            if next_frame != nil do
-              execute_and_send_frame(owner, lane_id, next_frame, command_state)
-            end
-
-          plain_set_frame?(frame) ->
-            {frames, next_frame} = collect_ready_plain_set_frames([frame])
-            execute_and_send_frames(owner, lane_id, frames, command_state)
-
-            if next_frame != nil do
-              execute_and_send_frame(owner, lane_id, next_frame, command_state)
-            end
-
-          compact_data_write_pipeline_frame?(frame) ->
-            {frames, next_frame} = collect_ready_compact_data_write_pipeline_frames([frame])
-            execute_and_send_frames(owner, lane_id, frames, command_state)
-
-            if next_frame != nil do
-              execute_and_send_frame(owner, lane_id, next_frame, command_state)
-            end
-
-          true ->
-            execute_and_send_frame(owner, lane_id, frame, command_state)
-        end
+        execute_and_send_frame(owner, lane_id, frame, command_state)
 
         loop(owner, lane_id, command_state)
 
@@ -106,87 +104,207 @@ defmodule FerricstoreServer.Native.Lane do
     end
   end
 
-  defp execute_and_send_frame(owner, lane_id, frame, command_state) do
-    case execute_frame(frame, command_state) do
-      :noreply -> send(owner, {:native_lane_done, lane_id})
-      iodata -> send(owner, {:native_lane_response, lane_id, iodata})
+  defp init_lane(starter, start_ref, owner, lane_id, command_state) do
+    budget = Map.get(command_state, :resource_budget, ResourceBudget)
+
+    case ResourceBudget.acquire(budget, :lanes, self(), 1) do
+      {:ok, token} ->
+        send(starter, {:native_lane_started, start_ref, self()})
+
+        try do
+          loop(owner, lane_id, command_state)
+        after
+          ResourceBudget.release_async(budget, token)
+        end
+
+      {:error, reason} ->
+        send(starter, {:native_lane_rejected, start_ref, self(), reason})
+    end
+  end
+
+  defp execute_and_send_frame(owner, lane_id, accounted_frame, command_state) do
+    {frame, request_bytes} = take_frame_accounting(accounted_frame)
+
+    case with_frame_slot(command_state, frame, fn -> execute_frame(frame, command_state) end) do
+      {:ok, :noreply} ->
+        send_lane_done(owner, lane_id, request_bytes)
+
+      {:ok, iodata} ->
+        send_lane_response(owner, lane_id, iodata, request_bytes)
+
+      {:error, reason} ->
+        if frame_no_reply?(frame) do
+          send_lane_done(owner, lane_id, request_bytes)
+        else
+          send_lane_response(
+            owner,
+            lane_id,
+            execution_budget_error_response(frame, command_state, reason),
+            request_bytes
+          )
+        end
     end
   end
 
   defp execute_and_send_frames(owner, lane_id, frames, command_state) do
-    {responses, done_count} = execute_frames(frames, command_state)
+    if Enum.any?(frames, &streamed_response_frame?/1) do
+      Enum.each(frames, &execute_and_send_frame(owner, lane_id, &1, command_state))
+    else
+      {frames, request_bytes} = take_frames_accounting(frames)
+      execute_and_send_frame_batch(owner, lane_id, frames, request_bytes, command_state)
+    end
+  end
+
+  defp execute_and_send_frame_batch(owner, lane_id, frames, request_bytes, command_state) do
+    result =
+      if Enum.any?(frames, &blocking_execution_frame?/1) do
+        {:ok, execute_frames_with_individual_slots(frames, command_state)}
+      else
+        with_execution_slot(command_state, fn -> execute_frames(frames, command_state) end)
+      end
+
+    {responses, done_count} =
+      case result do
+        {:ok, result} ->
+          result
+
+        {:error, reason} ->
+          responses =
+            frames
+            |> Enum.reject(&frame_no_reply?/1)
+            |> Enum.map(&execution_budget_error_response(&1, command_state, reason))
+
+          {responses, length(frames)}
+      end
 
     case responses do
-      [] -> send(owner, {:native_lane_done_many, lane_id, done_count})
-      _ -> send(owner, {:native_lane_responses, lane_id, responses, done_count})
+      [] -> send_lane_done_many(owner, lane_id, done_count, request_bytes)
+      _ -> send_lane_responses(owner, lane_id, responses, done_count, request_bytes)
     end
   end
 
-  defp compact_set_pipeline_frame?(
-         {_lane_id, @op_pipeline, _request_id, @flag_custom_payload,
-          <<0x94, 0x81, _rest::binary>>}
-       ),
-       do: true
-
-  defp compact_set_pipeline_frame?(_frame), do: false
-
-  defp compact_data_write_pipeline_frame?(frame),
-    do: compact_data_write_pipeline_mode(frame) != nil
-
-  defp compact_data_write_pipeline_mode(
-         {_lane_id, @op_pipeline, _request_id, @flag_custom_payload,
-          <<0x94, mode_byte, _rest::binary>>}
-       ) do
-    mode = Bitwise.band(mode_byte, 0x7F)
-
-    if mode_byte == mode and mode in @compact_data_write_pipeline_modes do
-      mode
-    end
+  defp take_frames_accounting(frames) do
+    Enum.map_reduce(frames, 0, fn frame, total_bytes ->
+      {frame, bytes} = take_frame_accounting(frame)
+      {frame, total_bytes + bytes}
+    end)
   end
 
-  defp compact_data_write_pipeline_mode(_frame), do: nil
+  defp take_frame_accounting({:native_accounted_frame, frame, bytes}), do: {frame, bytes}
+  defp take_frame_accounting(frame), do: {frame, 0}
 
-  defp plain_set_frame?({_lane_id, @op_set, _request_id, 0, _body}), do: true
-  defp plain_set_frame?(_frame), do: false
+  defp send_lane_response(owner, lane_id, iodata, 0),
+    do: send(owner, {:native_lane_response, lane_id, iodata})
 
-  defp collect_ready_compact_set_pipeline_frames(frames) do
-    receive do
-      {:native_lane_frame, frame} ->
-        if compact_set_pipeline_frame?(frame) do
-          collect_ready_compact_set_pipeline_frames([frame | frames])
-        else
-          {Enum.reverse(frames), frame}
+  defp send_lane_response(owner, lane_id, iodata, request_bytes),
+    do: send(owner, {:native_lane_response, lane_id, iodata, request_bytes})
+
+  defp send_lane_responses(owner, lane_id, responses, done_count, 0),
+    do: send(owner, {:native_lane_responses, lane_id, responses, done_count})
+
+  defp send_lane_responses(owner, lane_id, responses, done_count, request_bytes),
+    do: send(owner, {:native_lane_responses, lane_id, responses, done_count, request_bytes})
+
+  defp send_lane_done(owner, lane_id, 0), do: send(owner, {:native_lane_done, lane_id})
+
+  defp send_lane_done(owner, lane_id, request_bytes),
+    do: send(owner, {:native_lane_done, lane_id, request_bytes})
+
+  defp send_lane_done_many(owner, lane_id, done_count, 0),
+    do: send(owner, {:native_lane_done_many, lane_id, done_count})
+
+  defp send_lane_done_many(owner, lane_id, done_count, request_bytes),
+    do: send(owner, {:native_lane_done_many, lane_id, done_count, request_bytes})
+
+  defp execute_frames_with_individual_slots(frames, command_state) do
+    {responses, done_count} =
+      Enum.reduce(frames, {[], 0}, fn frame, {responses, done_count} ->
+        case with_frame_slot(command_state, frame, fn -> execute_frame(frame, command_state) end) do
+          {:ok, :noreply} ->
+            {responses, done_count + 1}
+
+          {:ok, iodata} ->
+            {[iodata | responses], done_count + 1}
+
+          {:error, reason} ->
+            if frame_no_reply?(frame) do
+              {responses, done_count + 1}
+            else
+              response = execution_budget_error_response(frame, command_state, reason)
+              {[response | responses], done_count + 1}
+            end
         end
-    after
-      0 -> {Enum.reverse(frames), nil}
+      end)
+
+    {Enum.reverse(responses), done_count}
+  end
+
+  defp with_frame_slot(command_state, frame, fun) do
+    if blocking_execution_frame?(frame) do
+      with_resource_slot(command_state, :blocking_requests, :fail_fast, fun)
+    else
+      with_execution_slot(command_state, fun)
     end
   end
 
-  defp collect_ready_plain_set_frames(frames) do
-    receive do
-      {:native_lane_frame, frame} ->
-        if plain_set_frame?(frame) do
-          collect_ready_plain_set_frames([frame | frames])
-        else
-          {Enum.reverse(frames), frame}
+  defp with_execution_slot(command_state, fun) do
+    with_resource_slot(command_state, :executions, :wait, fun)
+  end
+
+  defp with_resource_slot(command_state, resource, acquisition, fun) do
+    budget = Map.get(command_state, :resource_budget, ResourceBudget)
+
+    result =
+      case acquisition do
+        :wait -> ResourceBudget.acquire_wait(budget, resource, self(), 1)
+        :fail_fast -> ResourceBudget.acquire(budget, resource, self(), 1)
+      end
+
+    case result do
+      {:ok, token} ->
+        try do
+          {:ok, fun.()}
+        after
+          ResourceBudget.release_async(budget, token)
         end
-    after
-      0 -> {Enum.reverse(frames), nil}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp collect_ready_compact_data_write_pipeline_frames(frames) do
-    receive do
-      {:native_lane_frame, frame} ->
-        if compact_data_write_pipeline_frame?(frame) do
-          collect_ready_compact_data_write_pipeline_frames([frame | frames])
-        else
-          {Enum.reverse(frames), frame}
-        end
-    after
-      0 -> {Enum.reverse(frames), nil}
-    end
+  defp blocking_execution_frame?(frame) do
+    {_lane_id, opcode, _request_id, _flags, _body} = base_frame(frame)
+    opcode == @op_fetch_or_compute
   end
+
+  defp streamed_response_frame?(frame) do
+    {_lane_id, opcode, _request_id, _flags, _body} = base_frame(frame)
+    opcode == @op_mget
+  end
+
+  defp execution_budget_error_response(frame, command_state, reason) do
+    {lane_id, opcode, request_id, _flags, _body} = base_frame(frame)
+
+    message =
+      case reason do
+        {:limit, :executions} -> "ERR native global execution limit exceeded"
+        {:limit, :blocking_requests} -> "ERR native global blocking request limit exceeded"
+        _other -> "ERR native resource budget unavailable"
+      end
+
+    Codec.encode_command_response_frames(opcode, lane_id, request_id, :busy, message,
+      compression: Map.get(command_state, :compression, :none),
+      compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+      chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+      max_response_bytes: Map.get(command_state, :max_response_bytes)
+    )
+  end
+
+  defp frame_no_reply?(frame), do: frame |> base_frame() |> no_reply?()
+  defp base_frame({:native_accounted_frame, frame, _bytes}), do: base_frame(frame)
+  defp base_frame({:native_trace, frame, _trace}), do: base_frame(frame)
+  defp base_frame(frame), do: frame
 
   defp execute_frames(frames, command_state) do
     case try_compact_set_pipeline_batch(frames, command_state) do
@@ -231,18 +349,27 @@ defmodule FerricstoreServer.Native.Lane do
   end
 
   defp try_compact_set_pipeline_batch(frames, command_state) do
+    case prepare_compact_set_pipeline_batch(frames, command_state) do
+      {:ok, requests, counts, kv_pairs} ->
+        Stats.incr_commands_by(command_state.stats_counter, length(kv_pairs))
+
+        execute_prepared_batch(
+          fn -> Router.batch_quorum_put(command_state.instance_ctx, kv_pairs) end,
+          &encode_compact_set_pipeline_batch_responses(&1, requests, counts, command_state)
+        )
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp prepare_compact_set_pipeline_batch(frames, command_state) do
     with true <- plain_set_batch_allowed?(command_state),
          true <- pressure_ok?(command_state),
          {:ok, requests, counts, kv_pairs} <-
-           extract_compact_set_pipeline_frames(frames, [], [], []) do
-      Stats.incr_commands_by(command_state.stats_counter, length(kv_pairs))
-
-      responses =
-        command_state.instance_ctx
-        |> Router.batch_quorum_put(kv_pairs)
-        |> encode_compact_set_pipeline_batch_responses(requests, counts, command_state)
-
-      {:ok, responses}
+           extract_compact_set_pipeline_frames(frames, [], [], []),
+         :ok <- authorize_batch_pairs(kv_pairs) do
+      {:ok, requests, counts, kv_pairs}
     else
       _ -> :fallback
     end
@@ -297,7 +424,8 @@ defmodule FerricstoreServer.Native.Lane do
             compact_set_pipeline_result_body(frame_results),
             compression: Map.get(command_state, :compression, :none),
             compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
-            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+            max_response_bytes: Map.get(command_state, :max_response_bytes)
           )
 
         {response, rest}
@@ -307,18 +435,27 @@ defmodule FerricstoreServer.Native.Lane do
   end
 
   defp try_compact_data_write_pipeline_batch(frames, command_state) do
+    case prepare_compact_data_write_pipeline_batch(frames, command_state) do
+      {:ok, requests, counts, ops} ->
+        Stats.incr_commands_by(command_state.stats_counter, length(ops))
+
+        execute_prepared_batch(
+          fn -> Router.pipeline_write_batch(command_state.instance_ctx, ops) end,
+          &encode_compact_data_write_pipeline_batch_responses(&1, requests, counts, command_state)
+        )
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp prepare_compact_data_write_pipeline_batch(frames, command_state) do
     with true <- plain_set_batch_allowed?(command_state),
          true <- pressure_ok?(command_state),
          {:ok, requests, counts, ops} <-
-           extract_compact_data_write_pipeline_frames(frames, [], [], []) do
-      Stats.incr_commands_by(command_state.stats_counter, length(ops))
-
-      responses =
-        command_state.instance_ctx
-        |> Router.pipeline_write_batch(ops)
-        |> encode_compact_data_write_pipeline_batch_responses(requests, counts, command_state)
-
-      {:ok, responses}
+           extract_compact_data_write_pipeline_frames(frames, [], [], []),
+         :ok <- authorize_keyed_commands(ops) do
+      {:ok, requests, counts, ops}
     else
       _ -> :fallback
     end
@@ -405,7 +542,8 @@ defmodule FerricstoreServer.Native.Lane do
             compact_pipeline_result_body(frame_results),
             compression: Map.get(command_state, :compression, :none),
             compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
-            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+            max_response_bytes: Map.get(command_state, :max_response_bytes)
           )
 
         {response, rest}
@@ -450,7 +588,8 @@ defmodule FerricstoreServer.Native.Lane do
 
   defp try_compact_mget_batch(frames, command_state) do
     with true <- plain_set_batch_allowed?(command_state),
-         {:ok, requests, keys} <- extract_compact_mget_frames(frames, [], []) do
+         {:ok, requests, keys} <- extract_compact_mget_frames(frames, [], []),
+         :ok <- InternalKey.authorize_public(keys) do
       Stats.incr_commands_by(command_state.stats_counter, length(requests))
 
       responses =
@@ -495,11 +634,18 @@ defmodule FerricstoreServer.Native.Lane do
       Enum.map_reduce(requests, values, fn {lane_id, request_id, count}, remaining ->
         {frame_values, rest} = Enum.split(remaining, count)
 
+        {status, payload} =
+          case ReadResult.first_failure(frame_values) do
+            nil -> {:ok, frame_values}
+            failure -> ReadResult.command_error(failure)
+          end
+
         response =
-          Codec.encode_command_response_frames(@op_mget, lane_id, request_id, :ok, frame_values,
+          Codec.encode_command_response_frames(@op_mget, lane_id, request_id, status, payload,
             compression: Map.get(command_state, :compression, :none),
             compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
-            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+            chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+            max_response_bytes: Map.get(command_state, :max_response_bytes)
           )
 
         {response, rest}
@@ -510,13 +656,13 @@ defmodule FerricstoreServer.Native.Lane do
 
   defp try_plain_get_batch(frames, command_state) do
     with true <- plain_set_batch_allowed?(command_state),
-         {:ok, requests, keys} <- extract_plain_get_frames(frames, [], []) do
+         {:ok, requests, keys} <- extract_plain_get_frames(frames, [], []),
+         :ok <- InternalKey.authorize_public(keys),
+         {:ok, values} <- batch_get_values(keys, command_state) do
       Stats.incr_commands_by(command_state.stats_counter, length(keys))
 
       responses =
-        command_state.instance_ctx
-        |> Router.batch_get(keys)
-        |> encode_plain_get_batch_responses(requests, command_state)
+        encode_plain_get_batch_responses(values, requests, command_state)
 
       {:ok, responses}
     else
@@ -524,6 +670,16 @@ defmodule FerricstoreServer.Native.Lane do
     end
   rescue
     _ -> :fallback
+  end
+
+  defp batch_get_values(keys, %{instance_ctx: ctx} = command_state) do
+    case Map.get(command_state, :max_response_bytes) do
+      limit when is_integer(limit) and limit > 0 ->
+        Router.batch_get_each_bounded(ctx, keys, max(limit - 7, 0))
+
+      _unbounded ->
+        {:ok, Router.batch_get(ctx, keys)}
+    end
   end
 
   defp extract_plain_get_frames([], requests, keys),
@@ -554,26 +710,45 @@ defmodule FerricstoreServer.Native.Lane do
     requests
     |> Enum.zip(values)
     |> Enum.map(fn {{opcode, lane_id, request_id}, value} ->
-      Codec.encode_command_response_frames(opcode, lane_id, request_id, :ok, value,
+      {status, payload} =
+        case value do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
+          value ->
+            {:ok, value}
+        end
+
+      Codec.encode_command_response_frames(opcode, lane_id, request_id, status, payload,
         compression: Map.get(command_state, :compression, :none),
         compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
-        chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+        chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+        max_response_bytes: Map.get(command_state, :max_response_bytes)
       )
     end)
   end
 
   defp try_plain_set_batch(frames, command_state) do
+    case prepare_plain_set_batch(frames, command_state) do
+      {:ok, requests, kv_pairs} ->
+        Stats.incr_commands_by(command_state.stats_counter, length(kv_pairs))
+
+        execute_prepared_batch(
+          fn -> Router.batch_quorum_put(command_state.instance_ctx, kv_pairs) end,
+          &encode_plain_set_batch_responses(&1, requests, command_state)
+        )
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp prepare_plain_set_batch(frames, command_state) do
     with true <- plain_set_batch_allowed?(command_state),
          true <- pressure_ok?(command_state),
-         {:ok, requests, kv_pairs} <- extract_plain_set_frames(frames, [], []) do
-      Stats.incr_commands_by(command_state.stats_counter, length(kv_pairs))
-
-      responses =
-        command_state.instance_ctx
-        |> Router.batch_quorum_put(kv_pairs)
-        |> encode_plain_set_batch_responses(requests, command_state)
-
-      {:ok, responses}
+         {:ok, requests, kv_pairs} <- extract_plain_set_frames(frames, [], []),
+         :ok <- authorize_batch_pairs(kv_pairs) do
+      {:ok, requests, kv_pairs}
     else
       _ -> :fallback
     end
@@ -587,7 +762,7 @@ defmodule FerricstoreServer.Native.Lane do
          instance_ctx: ctx
        })
        when not is_nil(ctx),
-       do: true
+       do: FerricStore.ResourceLimits.default_implementation?()
 
   defp plain_set_batch_allowed?(_command_state), do: false
 
@@ -596,6 +771,18 @@ defmodule FerricstoreServer.Native.Lane do
   end
 
   defp pressure_ok?(_command_state), do: true
+
+  defp authorize_batch_pairs(pairs) do
+    if Enum.any?(pairs, fn {key, _value} -> InternalKey.reserved?(key) end),
+      do: {:error, InternalKey.error_message()},
+      else: :ok
+  end
+
+  defp authorize_keyed_commands(commands) do
+    if Enum.any?(commands, fn {key, _command} -> InternalKey.reserved?(key) end),
+      do: {:error, InternalKey.error_message()},
+      else: :ok
+  end
 
   defp extract_plain_set_frames([], requests, kv_pairs),
     do: {:ok, Enum.reverse(requests), Enum.reverse(kv_pairs)}
@@ -639,7 +826,8 @@ defmodule FerricstoreServer.Native.Lane do
       Codec.encode_command_response_frames(@op_set, lane_id, request_id, status, value,
         compression: Map.get(command_state, :compression, :none),
         compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
-        chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+        chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+        max_response_bytes: Map.get(command_state, :max_response_bytes)
       )
     end)
   end
@@ -749,14 +937,16 @@ defmodule FerricstoreServer.Native.Lane do
         Codec.encode_command_response_frames(opcode, lane_id, request_id, status, value,
           compression: Map.get(command_state, :compression, :none),
           compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
-          chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+          chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+          max_response_bytes: Map.get(command_state, :max_response_bytes)
         )
 
       {:error, reason} ->
         Codec.encode_command_response_frames(opcode, lane_id, request_id, :bad_request, reason,
           compression: Map.get(command_state, :compression, :none),
           compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
-          chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0)
+          chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+          max_response_bytes: Map.get(command_state, :max_response_bytes)
         )
     end
   end
@@ -783,6 +973,7 @@ defmodule FerricstoreServer.Native.Lane do
       compression: Map.get(command_state, :compression, :none),
       compact_flow_responses: false,
       chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
+      max_response_bytes: Map.get(command_state, :max_response_bytes),
       flags: @flag_trace
     )
   end

@@ -242,6 +242,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
         refute existing_atom?(atom_name)
       end
 
+      @tag :snapshot_metadata_nofollow
       test "storage rejects snapshot metadata symlinks before install", %{root: root} do
         snapshot_path = Path.join(root, "snapshot-metadata-symlink")
         File.mkdir_p!(snapshot_path)
@@ -284,6 +285,9 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
         assert {:error,
                 {:read_snapshot_metadata, {:unsafe_metadata_path, ^metadata_path, :symlink}}} =
                  Ferricstore.Raft.WARaftStorage.open_snapshot(snapshot_path, position, handle)
+
+        source = Ferricstore.Test.SourceFiles.waraft_storage_source()
+        assert source =~ "Ferricstore.FS.read_nofollow(path, max_bytes)"
       end
 
       test "storage rejects snapshot metadata missing position without crashing", %{

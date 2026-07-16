@@ -9,10 +9,13 @@ defmodule Ferricstore.Commands.Cuckoo do
 
   alias Ferricstore.Bitcask.{Async, NIF}
   alias Ferricstore.Commands.ProbType
+  alias Ferricstore.ProbFile
 
   @prob_read_timeout_ms 5_000
   @default_capacity 1024
   @bucket_size 4
+  @max_capacity 268_435_456
+  @max_batch_items 10_000
 
   # -------------------------------------------------------------------
   # Public command handler
@@ -23,7 +26,8 @@ defmodule Ferricstore.Commands.Cuckoo do
   def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
 
   def handle_ast({:cf_reserve, key, capacity}, store) do
-    with :ok <- check_cuckoo_not_exists(key, store) do
+    with :ok <- validate_cuckoo_capacity(capacity),
+         :ok <- check_cuckoo_not_exists(key, store) do
       store
       |> do_prob_write({:cuckoo_create, key, capacity, @bucket_size})
       |> normalize_create_result()
@@ -47,6 +51,7 @@ defmodule Ferricstore.Commands.Cuckoo do
 
   def handle("CF.RESERVE", [key, capacity_str], store) do
     with {:ok, capacity} <- parse_pos_integer(capacity_str, "capacity"),
+         :ok <- validate_cuckoo_capacity(capacity),
          :ok <- check_cuckoo_not_exists(key, store) do
       store
       |> do_prob_write({:cuckoo_create, key, capacity, @bucket_size})
@@ -78,8 +83,7 @@ defmodule Ferricstore.Commands.Cuckoo do
         {:ok, 1} -> 1
         {:ok, _} -> 1
         :ok -> 1
-        {:error, {:fsync_dir_failed, _phase, _reason} = reason} -> {:error, reason}
-        {:error, _} -> {:error, "ERR filter is full"}
+        {:error, reason} -> normalize_add_error(reason)
         other -> other
       end
     end
@@ -95,8 +99,7 @@ defmodule Ferricstore.Commands.Cuckoo do
 
       case result do
         {:ok, n} when n in [0, 1] -> n
-        {:error, {:fsync_dir_failed, _phase, _reason} = reason} -> {:error, reason}
-        {:error, _} -> {:error, "ERR filter is full"}
+        {:error, reason} -> normalize_add_error(reason)
         other -> other
       end
     end
@@ -106,10 +109,8 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.addnx' command"}
 
   defp cf_del_args([key, element], store) do
-    with :ok <- ProbType.check_expected(key, :cuckoo, store) do
-      path = prob_path(store, key, "cuckoo")
-
-      if Ferricstore.FS.exists?(path) do
+    case ProbType.check_create(key, :cuckoo, store) do
+      {:error, :exists} ->
         result = do_prob_write(store, {:cuckoo_del, key, element})
 
         case result do
@@ -117,32 +118,41 @@ defmodule Ferricstore.Commands.Cuckoo do
           {:error, reason} -> {:error, "ERR cuckoo del failed: #{inspect(reason)}"}
           other -> other
         end
-      else
-        0
-      end
+
+      :ok ->
+        maybe_delete_file_only_filter(key, element, store)
+
+      {:error, _} = error ->
+        error
     end
   end
 
   defp cf_del_args(_args, _store),
     do: {:error, "ERR wrong number of arguments for 'cf.del' command"}
 
+  defp maybe_delete_file_only_filter(key, element, store) do
+    if metadata_backed_store?(store) or
+         not Ferricstore.FS.exists?(prob_path(store, key, "cuckoo")) do
+      0
+    else
+      case do_prob_write(store, {:cuckoo_del, key, element}) do
+        {:ok, n} -> n
+        {:error, reason} -> {:error, "ERR cuckoo del failed: #{inspect(reason)}"}
+        other -> other
+      end
+    end
+  end
+
+  defp metadata_backed_store?(%FerricStore.Instance{}), do: true
+  defp metadata_backed_store?(%Ferricstore.Store.LocalTxStore{}), do: true
+  defp metadata_backed_store?(store) when is_map(store), do: Map.has_key?(store, :get)
+  defp metadata_backed_store?(_store), do: false
+
   defp cf_exists_args([key, element], store) do
-    path = prob_path(store, key, "cuckoo")
-
-    case await_nif(fn proxy, corr_id ->
-           NIF.cuckoo_file_exists_async(proxy, corr_id, path, element)
-         end) do
-      {:ok, result} ->
-        result
-
-      {:error, "enoent"} ->
-        missing_or_wrongtype(key, store, 0)
-
-      {:error, :timeout} ->
-        {:error, "ERR timeout"}
-
-      {:error, reason} ->
-        {:error, "ERR cuckoo exists failed: #{reason}"}
+    case cuckoo_read_status(key, store) do
+      :ok -> do_cf_exists(key, element, store)
+      :missing -> 0
+      {:error, _} = error -> error
     end
   end
 
@@ -150,22 +160,12 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.exists' command"}
 
   defp cf_mexists_args([key | elements], store) when elements != [] do
-    path = prob_path(store, key, "cuckoo")
-
-    case await_nif(fn proxy, corr_id ->
-           NIF.cuckoo_file_mexists_async(proxy, corr_id, path, elements)
-         end) do
-      {:ok, results} ->
-        results
-
-      {:error, "enoent"} ->
-        missing_or_wrongtype(key, store, List.duplicate(0, length(elements)))
-
-      {:error, :timeout} ->
-        {:error, "ERR timeout"}
-
-      {:error, reason} ->
-        {:error, "ERR cuckoo mexists failed: #{reason}"}
+    with :ok <- validate_batch_size(elements) do
+      case cuckoo_read_status(key, store) do
+        :ok -> do_cf_mexists(key, elements, store)
+        :missing -> List.duplicate(0, length(elements))
+        {:error, _} = error -> error
+      end
     end
   end
 
@@ -173,22 +173,10 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.mexists' command"}
 
   defp cf_count_args([key, element], store) do
-    path = prob_path(store, key, "cuckoo")
-
-    case await_nif(fn proxy, corr_id ->
-           NIF.cuckoo_file_count_async(proxy, corr_id, path, element)
-         end) do
-      {:ok, count} ->
-        count
-
-      {:error, "enoent"} ->
-        missing_or_wrongtype(key, store, 0)
-
-      {:error, :timeout} ->
-        {:error, "ERR timeout"}
-
-      {:error, reason} ->
-        {:error, "ERR cuckoo count failed: #{reason}"}
+    case cuckoo_read_status(key, store) do
+      :ok -> do_cf_count(key, element, store)
+      :missing -> 0
+      {:error, _} = error -> error
     end
   end
 
@@ -196,6 +184,56 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.count' command"}
 
   defp cf_info_args([key], store) do
+    case cuckoo_read_status(key, store) do
+      :ok -> do_cf_info(key, store)
+      :missing -> {:error, "ERR not found"}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp cf_info_args(_args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cf.info' command"}
+
+  defp do_cf_exists(key, element, store) do
+    path = prob_path(store, key, "cuckoo")
+
+    case await_nif(fn proxy, corr_id ->
+           NIF.cuckoo_file_exists_async(proxy, corr_id, path, element)
+         end) do
+      {:ok, result} -> result
+      {:error, "enoent"} -> missing_or_wrongtype(key, store, 0)
+      {:error, :timeout} -> {:error, "ERR timeout"}
+      {:error, reason} -> {:error, "ERR cuckoo exists failed: #{reason}"}
+    end
+  end
+
+  defp do_cf_mexists(key, elements, store) do
+    path = prob_path(store, key, "cuckoo")
+
+    case await_nif(fn proxy, corr_id ->
+           NIF.cuckoo_file_mexists_async(proxy, corr_id, path, elements)
+         end) do
+      {:ok, results} -> results
+      {:error, "enoent"} -> missing_or_wrongtype(key, store, List.duplicate(0, length(elements)))
+      {:error, :timeout} -> {:error, "ERR timeout"}
+      {:error, reason} -> {:error, "ERR cuckoo mexists failed: #{reason}"}
+    end
+  end
+
+  defp do_cf_count(key, element, store) do
+    path = prob_path(store, key, "cuckoo")
+
+    case await_nif(fn proxy, corr_id ->
+           NIF.cuckoo_file_count_async(proxy, corr_id, path, element)
+         end) do
+      {:ok, count} -> count
+      {:error, "enoent"} -> missing_or_wrongtype(key, store, 0)
+      {:error, :timeout} -> {:error, "ERR timeout"}
+      {:error, reason} -> {:error, "ERR cuckoo count failed: #{reason}"}
+    end
+  end
+
+  defp do_cf_info(key, store) do
     path = prob_path(store, key, "cuckoo")
 
     case await_nif(fn proxy, corr_id ->
@@ -236,9 +274,6 @@ defmodule Ferricstore.Commands.Cuckoo do
     end
   end
 
-  defp cf_info_args(_args, _store),
-    do: {:error, "ERR wrong number of arguments for 'cf.info' command"}
-
   # ---------------------------------------------------------------------------
   # Deletion
   # ---------------------------------------------------------------------------
@@ -260,17 +295,51 @@ defmodule Ferricstore.Commands.Cuckoo do
 
   defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
 
+  defp validate_batch_size(elements) do
+    if length(elements) <= @max_batch_items,
+      do: :ok,
+      else: {:error, "ERR cuckoo batch exceeds maximum of #{@max_batch_items} items"}
+  end
+
+  defp normalize_add_error("filter is full"), do: {:error, "ERR filter is full"}
+
+  defp normalize_add_error({:fsync_dir_failed, _phase, _reason} = reason),
+    do: {:error, reason}
+
+  defp normalize_add_error(reason) do
+    rendered = inspect(reason, limit: 20, printable_limit: 256)
+    {:error, "ERR cuckoo add failed: #{rendered}"}
+  end
+
   defp missing_or_wrongtype(key, store, missing_result) do
-    case ProbType.check_expected(key, :cuckoo, store) do
+    case ProbType.check_create(key, :cuckoo, store) do
       :ok -> missing_result
+      {:error, :exists} -> {:error, "ERR cuckoo filter file is missing"}
       {:error, _} = error -> error
     end
   end
 
+  defp cuckoo_read_status(key, store) do
+    case ProbType.check_create(key, :cuckoo, store) do
+      {:error, :exists} ->
+        :ok
+
+      :ok ->
+        if metadata_backed_store?(store) or
+             not Ferricstore.FS.exists?(prob_path(store, key, "cuckoo")) do
+          :missing
+        else
+          :ok
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
   defp prob_path(store, key, ext) do
-    safe = Base.url_encode64(key, padding: false)
     prob_dir = resolve_prob_dir(store, key)
-    Path.join(prob_dir, "#{safe}.#{ext}")
+    ProbFile.path(prob_dir, key, ext)
   end
 
   defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
@@ -309,10 +378,13 @@ defmodule Ferricstore.Commands.Cuckoo do
     dir = Path.dirname(path)
 
     with :ok <- ensure_prob_dir(dir),
-         {:ok, _resource} = result <- NIF.cuckoo_file_create(path, capacity, bucket_size),
-         :ok <- prob_fsync_dir(dir, :prob_file_dir),
-         :ok <- register_cuckoo_meta(result, store, key, capacity) do
-      result
+         {:ok, _resource} = result <- NIF.cuckoo_file_create(path, capacity, bucket_size) do
+      ProbType.finalize_created_file(path, result, fn ->
+        with :ok <- prob_fsync_dir(dir, :prob_file_dir),
+             :ok <- register_cuckoo_meta(result, store, key, capacity) do
+          :ok
+        end
+      end)
     end
   end
 
@@ -349,10 +421,16 @@ defmodule Ferricstore.Commands.Cuckoo do
       is_map(auto_params) ->
         %{capacity: cap, bucket_size: bs} = auto_params
 
-        with {:ok, _resource} = result <- NIF.cuckoo_file_create(path, cap, bs),
-             :ok <- prob_fsync_dir(dir, :prob_file_dir),
-             :ok <- register_cuckoo_meta(result, store, key, cap) do
-          :ok
+        with {:ok, _resource} = result <- NIF.cuckoo_file_create(path, cap, bs) do
+          case ProbType.finalize_created_file(path, result, fn ->
+                 with :ok <- prob_fsync_dir(dir, :prob_file_dir),
+                      :ok <- register_cuckoo_meta(result, store, key, cap) do
+                   :ok
+                 end
+               end) do
+            {:ok, _resource} -> :ok
+            {:error, _reason} = error -> error
+          end
         end
 
       true ->
@@ -412,6 +490,16 @@ defmodule Ferricstore.Commands.Cuckoo do
   defp normalize_create_result({:ok, _}), do: :ok
   defp normalize_create_result(:ok), do: :ok
   defp normalize_create_result(other), do: other
+
+  defp validate_cuckoo_capacity(capacity)
+       when is_integer(capacity) and capacity > 0 and capacity <= @max_capacity,
+       do: :ok
+
+  defp validate_cuckoo_capacity(capacity)
+       when is_integer(capacity) and capacity > @max_capacity,
+       do: {:error, "ERR capacity exceeds maximum of #{@max_capacity}"}
+
+  defp validate_cuckoo_capacity(_capacity), do: {:error, "ERR bad capacity value"}
 
   @spec parse_pos_integer(binary(), binary()) :: {:ok, pos_integer()} | {:error, binary()}
   defp parse_pos_integer(str, name) do

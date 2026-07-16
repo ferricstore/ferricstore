@@ -5,6 +5,7 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
   alias Ferricstore.Flow.Governance.LimitRecord
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
 
   @head_tag :flow_governance_cache_session_head_v1
   @meta_tag :flow_governance_cache_session_meta_v1
@@ -15,6 +16,7 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
   @floor_compaction_limit 256
   @max_exact_version 9_007_199_254_740_991
   @max_encoded_page_bytes 262_144
+  @max_identity_bytes 65_535
   @set_nx %{expire_at_ms: 0, nx: true, xx: false, get: false, keepttl: false}
 
   @type session :: %{
@@ -42,15 +44,20 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
 
   @spec open(FerricStore.Instance.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def open(ctx, opts) when is_list(opts) do
-    before_head_replace_fun = Keyword.get(opts, :before_head_replace_fun, fn _session -> :ok end)
+    if Keyword.keyword?(opts) do
+      before_head_replace_fun =
+        Keyword.get(opts, :before_head_replace_fun, fn _session -> :ok end)
 
-    with {:ok, node_id} <- required_identity(opts, :node_id),
-         {:ok, instance_name} <- required_identity(opts, :instance_name),
-         true <- is_function(before_head_replace_fun, 1) do
-      do_open(ctx, node_id, instance_name, before_head_replace_fun, @max_retries)
+      with {:ok, node_id} <- required_identity(opts, :node_id),
+           {:ok, instance_name} <- required_identity(opts, :instance_name),
+           true <- is_function(before_head_replace_fun, 1) do
+        do_open(ctx, node_id, instance_name, before_head_replace_fun, @max_retries)
+      else
+        false -> {:error, "ERR invalid flow governance cache session options"}
+        {:error, _reason} = error -> error
+      end
     else
-      false -> {:error, "ERR invalid flow governance cache session options"}
-      {:error, _reason} = error -> error
+      {:error, "ERR invalid flow governance cache session options"}
     end
   end
 
@@ -68,36 +75,41 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
       when is_map(session) and is_binary(scope) and scope != "" and is_integer(shard_id) and
              shard_id >= 0 and is_list(reservation_ids) and reservation_ids != [] and
              is_list(opts) do
-    page_size = Keyword.get(opts, :page_size, @max_page_size)
-    expires_at_ms = Keyword.get(opts, :expires_at_ms, 0)
-    config_version = Keyword.get(opts, :config_version, 0)
-    effective_limit = Keyword.get(opts, :effective_limit)
-    after_page_persist_fun = Keyword.get(opts, :after_page_persist_fun, fn _page -> :ok end)
+    if Keyword.keyword?(opts) do
+      page_size = Keyword.get(opts, :page_size, @max_page_size)
+      expires_at_ms = Keyword.get(opts, :expires_at_ms, 0)
+      config_version = Keyword.get(opts, :config_version, 0)
+      effective_limit = Keyword.get(opts, :effective_limit)
+      after_page_persist_fun = Keyword.get(opts, :after_page_persist_fun, fn _page -> :ok end)
 
-    with :ok <- validate_page_size(page_size),
-         :ok <- validate_expires_at(expires_at_ms),
-         :ok <- validate_cache_configuration(config_version, effective_limit),
-         true <- is_function(after_page_persist_fun, 1),
-         :ok <- validate_prefetch_reservation_ids(reservation_ids),
-         :ok <- assert_current(ctx, session),
-         chunks = Enum.chunk_every(reservation_ids, page_size),
-         {:ok, first_sequence} <- reserve_sequences(ctx, session, length(chunks)),
-         :ok <- assert_current(ctx, session),
-         pages =
-           build_pages(
-             session,
-             first_sequence,
-             scope,
-             shard_id,
-             expires_at_ms,
-             config_version,
-             effective_limit,
-             chunks
-           ) do
-      persist_reserved_pages(ctx, session, pages, after_page_persist_fun)
+      with :ok <- validate_session(session),
+           :ok <- validate_page_size(page_size),
+           :ok <- validate_expires_at(expires_at_ms),
+           :ok <- validate_cache_configuration(config_version, effective_limit),
+           true <- is_function(after_page_persist_fun, 1),
+           :ok <- validate_prefetch_reservation_ids(reservation_ids),
+           :ok <- assert_current(ctx, session),
+           chunks = Enum.chunk_every(reservation_ids, page_size),
+           {:ok, first_sequence} <- reserve_sequences(ctx, session, length(chunks)),
+           :ok <- assert_current(ctx, session),
+           pages =
+             build_pages(
+               session,
+               first_sequence,
+               scope,
+               shard_id,
+               expires_at_ms,
+               config_version,
+               effective_limit,
+               chunks
+             ) do
+        persist_reserved_pages(ctx, session, pages, after_page_persist_fun)
+      else
+        false -> {:error, "ERR invalid flow governance cache prefetch manifest"}
+        {:error, _reason} = error -> error
+      end
     else
-      false -> {:error, "ERR invalid flow governance cache prefetch manifest"}
-      {:error, _reason} = error -> error
+      {:error, "ERR invalid flow governance cache prefetch manifest"}
     end
   end
 
@@ -107,7 +119,8 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
   @spec activate_page(FerricStore.Instance.t(), session(), page()) ::
           {:ok, page()} | {:error, term()}
   def activate_page(ctx, session, page) when is_map(session) and is_map(page) do
-    with :ok <- same_session(session, page),
+    with :ok <- validate_session(session),
+         :ok <- same_session(session, page),
          :ok <- assert_current(ctx, session),
          {:ok, activated} <- do_activate_page(ctx, page),
          :ok <- assert_current(ctx, session) do
@@ -120,40 +133,47 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
 
   @spec recover(FerricStore.Instance.t(), session(), keyword()) :: {:ok, map()} | {:error, term()}
   def recover(ctx, session, opts) when is_map(session) and is_list(opts) do
-    cursor = Keyword.get(opts, :cursor)
-    limit = Keyword.get(opts, :limit, @max_page_size)
-    now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
-    release_fun = Keyword.get(opts, :release_fun, &LimitStore.release/3)
-    page_delete_fun = Keyword.get(opts, :page_delete_fun, &Router.delete/2)
-    page_read_fun = Keyword.get(opts, :page_read_fun, &read_durable_key/2)
-    after_cleanup_mark_fun = Keyword.get(opts, :after_cleanup_mark_fun, fn _session_id -> :ok end)
+    if Keyword.keyword?(opts) do
+      cursor = Keyword.get(opts, :cursor)
+      limit = Keyword.get(opts, :limit, @max_page_size)
+      now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
+      release_fun = Keyword.get(opts, :release_fun, &LimitStore.release/3)
+      page_delete_fun = Keyword.get(opts, :page_delete_fun, &Router.delete/2)
+      page_read_fun = Keyword.get(opts, :page_read_fun, &read_durable_key/2)
 
-    with :ok <-
-           validate_recovery_opts(
-             cursor,
-             limit,
-             now_ms,
-             release_fun,
-             page_delete_fun,
-             page_read_fun,
-             after_cleanup_mark_fun
-           ),
-         :ok <- assert_current(ctx, session),
-         {:ok, start_cursor} <- recovery_start(ctx, session, cursor) do
-      recover_pages(
-        ctx,
-        session,
-        start_cursor,
-        limit,
-        %{
-          now_ms: now_ms,
-          release_fun: release_fun,
-          page_delete_fun: page_delete_fun,
-          page_read_fun: page_read_fun,
-          after_cleanup_mark_fun: after_cleanup_mark_fun
-        },
-        %{released: 0, retained: 0, errors: 0, processed: 0}
-      )
+      after_cleanup_mark_fun =
+        Keyword.get(opts, :after_cleanup_mark_fun, fn _session_id -> :ok end)
+
+      with :ok <- validate_session(session),
+           :ok <-
+             validate_recovery_opts(
+               cursor,
+               limit,
+               now_ms,
+               release_fun,
+               page_delete_fun,
+               page_read_fun,
+               after_cleanup_mark_fun
+             ),
+           :ok <- assert_current(ctx, session),
+           {:ok, start_cursor} <- recovery_start(ctx, session, cursor) do
+        recover_pages(
+          ctx,
+          session,
+          start_cursor,
+          limit,
+          %{
+            now_ms: now_ms,
+            release_fun: release_fun,
+            page_delete_fun: page_delete_fun,
+            page_read_fun: page_read_fun,
+            after_cleanup_mark_fun: after_cleanup_mark_fun
+          },
+          %{released: 0, retained: 0, errors: 0, processed: 0}
+        )
+      end
+    else
+      {:error, "ERR invalid flow governance cache session recovery options"}
     end
   end
 
@@ -164,32 +184,39 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
           {:ok, [page()]} | {:error, term()}
   def update_pages(ctx, session, pages, opts)
       when is_map(session) and is_list(pages) and is_list(opts) do
-    expires_at_ms = Keyword.fetch!(opts, :expires_at_ms)
-    config_version = Keyword.fetch!(opts, :config_version)
-    effective_limit = Keyword.get(opts, :effective_limit)
-
-    with :ok <- validate_expires_at(expires_at_ms),
-         :ok <- validate_cache_configuration(config_version, effective_limit),
-         :ok <- assert_current(ctx, session),
-         :ok <- validate_session_pages(session, pages) do
-      Enum.reduce_while(pages, {:ok, []}, fn page, {:ok, updated} ->
-        case update_page_metadata(
-               ctx,
-               page,
-               expires_at_ms,
-               config_version,
-               effective_limit
-             ) do
-          {:ok, page} -> {:cont, {:ok, [page | updated]}}
-          {:error, _reason} = error -> {:halt, error}
+    if Keyword.keyword?(opts) do
+      with :ok <- validate_session(session),
+           {:ok, expires_at_ms} <- required_update_option(opts, :expires_at_ms),
+           {:ok, config_version} <- required_update_option(opts, :config_version),
+           effective_limit = Keyword.get(opts, :effective_limit),
+           :ok <- validate_expires_at(expires_at_ms),
+           :ok <- validate_cache_configuration(config_version, effective_limit),
+           :ok <- assert_current(ctx, session),
+           :ok <- validate_session_pages(session, pages) do
+        Enum.reduce_while(pages, {:ok, []}, fn page, {:ok, updated} ->
+          case update_page_metadata(
+                 ctx,
+                 page,
+                 expires_at_ms,
+                 config_version,
+                 effective_limit
+               ) do
+            {:ok, page} -> {:cont, {:ok, [page | updated]}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, updated} -> {:ok, Enum.reverse(updated)}
+          {:error, _reason} = error -> error
         end
-      end)
-      |> case do
-        {:ok, updated} -> {:ok, Enum.reverse(updated)}
-        {:error, _reason} = error -> error
       end
+    else
+      {:error, "ERR invalid flow governance cache update options"}
     end
   end
+
+  def update_pages(_ctx, _session, _pages, _opts),
+    do: {:error, "ERR invalid flow governance cache update options"}
 
   @spec discard_pages(FerricStore.Instance.t(), session(), [page()]) :: :ok | {:error, term()}
   def discard_pages(ctx, session, pages), do: discard_pages(ctx, session, pages, [])
@@ -199,29 +226,34 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
           :ok | {:error, term()}
   def discard_pages(ctx, session, pages, opts)
       when is_map(session) and is_list(pages) and is_list(opts) do
-    after_page_delete_fun = Keyword.get(opts, :after_page_delete_fun, fn -> :ok end)
-    allowed_states = Keyword.get(opts, :allowed_states, [:unused])
-    floor_read_fun = Keyword.get(opts, :floor_read_fun, &read_durable_keys/2)
+    if Keyword.keyword?(opts) do
+      after_page_delete_fun = Keyword.get(opts, :after_page_delete_fun, fn -> :ok end)
+      allowed_states = Keyword.get(opts, :allowed_states, [:unused])
+      floor_read_fun = Keyword.get(opts, :floor_read_fun, &read_durable_keys/2)
 
-    with true <- is_function(after_page_delete_fun, 0),
-         true <- is_function(floor_read_fun, 2),
-         :ok <- validate_discard_states(allowed_states),
-         :ok <- assert_current(ctx, session),
-         :ok <- validate_session_pages(session, pages),
-         sequences = pages |> Enum.map(& &1.sequence) |> Enum.sort(),
-         :ok <- claim_pages_for_discard(ctx, pages, allowed_states),
-         :ok <- delete_pages(ctx, pages),
-         :ok <- run_page_delete_checkpoint(after_page_delete_fun),
-         {:ok, :ok} <-
-           update_meta(ctx, session, fn meta ->
-             recovery_floor = advance_discarded_floor(meta.recovery_floor, sequences)
-             {:ok, %{meta | recovery_floor: recovery_floor}, :ok}
-           end),
-         :ok <- compact_recovery_floor(ctx, session, floor_read_fun) do
-      :ok
+      with :ok <- validate_session(session),
+           true <- is_function(after_page_delete_fun, 0),
+           true <- is_function(floor_read_fun, 2),
+           :ok <- validate_discard_states(allowed_states),
+           :ok <- assert_current(ctx, session),
+           :ok <- validate_session_pages(session, pages),
+           sequences = pages |> Enum.map(& &1.sequence) |> Enum.sort(),
+           :ok <- claim_pages_for_discard(ctx, pages, allowed_states),
+           :ok <- delete_pages(ctx, pages),
+           :ok <- run_page_delete_checkpoint(after_page_delete_fun),
+           {:ok, :ok} <-
+             update_meta(ctx, session, fn meta ->
+               recovery_floor = advance_discarded_floor(meta.recovery_floor, sequences)
+               {:ok, %{meta | recovery_floor: recovery_floor}, :ok}
+             end),
+           :ok <- compact_recovery_floor(ctx, session, floor_read_fun) do
+        :ok
+      else
+        false -> {:error, "ERR invalid flow governance cache discard options"}
+        {:error, _reason} = error -> error
+      end
     else
-      false -> {:error, "ERR invalid flow governance cache discard options"}
-      {:error, _reason} = error -> error
+      {:error, "ERR invalid flow governance cache discard options"}
     end
   end
 
@@ -236,29 +268,34 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
           :ok | {:error, term()}
   def acknowledge_page(ctx, session, %{state: :uncertain} = page, opts)
       when is_map(session) and is_list(opts) do
-    after_page_delete_fun = Keyword.get(opts, :after_page_delete_fun, fn -> :ok end)
-    floor_read_fun = Keyword.get(opts, :floor_read_fun, &read_durable_keys/2)
+    if Keyword.keyword?(opts) do
+      after_page_delete_fun = Keyword.get(opts, :after_page_delete_fun, fn -> :ok end)
+      floor_read_fun = Keyword.get(opts, :floor_read_fun, &read_durable_keys/2)
 
-    with true <- is_function(after_page_delete_fun, 0),
-         true <- is_function(floor_read_fun, 2),
-         :ok <- same_session(session, page),
-         :ok <- assert_current(ctx, session),
-         :ok <- Router.delete(ctx, page_key(page)),
-         :ok <- run_page_delete_checkpoint(after_page_delete_fun),
-         {:ok, :ok} <-
-           update_meta(ctx, session, fn meta ->
-             recovery_floor =
-               if page.sequence == meta.recovery_floor,
-                 do: page.sequence + 1,
-                 else: meta.recovery_floor
+      with :ok <- validate_session(session),
+           true <- is_function(after_page_delete_fun, 0),
+           true <- is_function(floor_read_fun, 2),
+           :ok <- same_session(session, page),
+           :ok <- assert_current(ctx, session),
+           :ok <- Router.delete(ctx, page_key(page)),
+           :ok <- run_page_delete_checkpoint(after_page_delete_fun),
+           {:ok, :ok} <-
+             update_meta(ctx, session, fn meta ->
+               recovery_floor =
+                 if page.sequence == meta.recovery_floor,
+                   do: page.sequence + 1,
+                   else: meta.recovery_floor
 
-             {:ok, %{meta | recovery_floor: recovery_floor}, :ok}
-           end),
-         :ok <- compact_recovery_floor(ctx, session, floor_read_fun) do
-      :ok
+               {:ok, %{meta | recovery_floor: recovery_floor}, :ok}
+             end),
+           :ok <- compact_recovery_floor(ctx, session, floor_read_fun) do
+        :ok
+      else
+        false -> {:error, "ERR invalid flow governance cache acknowledge options"}
+        {:error, _reason} = error -> error
+      end
     else
-      false -> {:error, "ERR invalid flow governance cache acknowledge options"}
-      {:error, _reason} = error -> error
+      {:error, "ERR invalid flow governance cache acknowledge options"}
     end
   end
 
@@ -266,37 +303,52 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
     do: {:error, :cache_session_page_not_acknowledgeable}
 
   @spec page_present?(FerricStore.Instance.t(), page()) :: boolean()
-  def page_present?(ctx, page) when is_map(page), do: is_binary(Router.get(ctx, page_key(page)))
+  def page_present?(ctx, page) when is_map(page) do
+    valid_page_identity?(page) and is_binary(Router.get(ctx, page_key(page)))
+  end
+
   def page_present?(_ctx, _page), do: false
 
   @spec manifest_bounds(FerricStore.Instance.t(), session()) :: {:ok, map()} | {:error, term()}
   def manifest_bounds(ctx, session) when is_map(session) do
-    with :ok <- assert_current(ctx, session),
+    with :ok <- validate_session(session),
+         :ok <- assert_current(ctx, session),
          {:ok, meta} <- read_meta(ctx, session, session.session_id) do
       {:ok, %{page_count: meta.page_count, recovery_floor: meta.recovery_floor}}
     end
   end
 
+  def manifest_bounds(_ctx, _session), do: {:error, "ERR invalid flow governance cache session"}
+
   @spec manifest_previous(FerricStore.Instance.t(), session()) ::
           {:ok, binary() | nil} | {:error, term()}
   def manifest_previous(ctx, session) when is_map(session) do
-    with {:ok, meta} <- read_meta(ctx, session, session.session_id) do
+    with :ok <- validate_session(session),
+         {:ok, meta} <- read_meta(ctx, session, session.session_id) do
       {:ok, meta.previous_session_id}
     end
   end
 
+  def manifest_previous(_ctx, _session), do: {:error, "ERR invalid flow governance cache session"}
+
   @spec current?(FerricStore.Instance.t(), session()) :: boolean()
-  def current?(ctx, session) when is_map(session), do: assert_current(ctx, session) == :ok
+  def current?(ctx, session) when is_map(session),
+    do: validate_session(session) == :ok and assert_current(ctx, session) == :ok
+
   def current?(_ctx, _session), do: false
 
   @spec head_present?(FerricStore.Instance.t(), keyword()) :: boolean()
   def head_present?(ctx, opts) when is_list(opts) do
-    with {:ok, node_id} <- required_identity(opts, :node_id),
-         {:ok, instance_name} <- required_identity(opts, :instance_name) do
-      key = Keys.governance_limit_cache_session_head_key(node_id, instance_name)
-      is_binary(Router.get(ctx, key))
+    if Keyword.keyword?(opts) do
+      with {:ok, node_id} <- required_identity(opts, :node_id),
+           {:ok, instance_name} <- required_identity(opts, :instance_name) do
+        key = Keys.governance_limit_cache_session_head_key(node_id, instance_name)
+        is_binary(Router.get(ctx, key))
+      else
+        _invalid -> false
+      end
     else
-      _invalid -> false
+      false
     end
   end
 
@@ -673,7 +725,12 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
       else: {:error, :cache_session_page_conflict}
   end
 
-  defp do_activate_page(ctx, page) do
+  defp do_activate_page(ctx, page), do: do_activate_page(ctx, page, @max_retries)
+
+  defp do_activate_page(_ctx, _page, retries_left) when retries_left <= 0,
+    do: {:error, :cache_session_conflict}
+
+  defp do_activate_page(ctx, page, retries_left) do
     key = page_key(page)
 
     case Router.get(ctx, key) do
@@ -686,7 +743,7 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
 
               case Router.cas(ctx, key, expected, encode_page(activated), nil) do
                 1 -> {:ok, activated}
-                result when result in [0, nil] -> do_activate_page(ctx, page)
+                result when result in [0, nil] -> do_activate_page(ctx, page, retries_left - 1)
                 {:error, _reason} = error -> error
                 _other -> {:error, :cache_session_page_write_failed}
               end
@@ -716,6 +773,35 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
          expires_at_ms,
          config_version,
          effective_limit
+       ),
+       do:
+         update_page_metadata(
+           ctx,
+           page,
+           expires_at_ms,
+           config_version,
+           effective_limit,
+           @max_retries
+         )
+
+  defp update_page_metadata(
+         _ctx,
+         _page,
+         _expires_at_ms,
+         _config_version,
+         _effective_limit,
+         retries_left
+       )
+       when retries_left <= 0,
+       do: {:error, :cache_session_conflict}
+
+  defp update_page_metadata(
+         ctx,
+         page,
+         expires_at_ms,
+         config_version,
+         effective_limit,
+         retries_left
        ) do
     key = page_key(page)
 
@@ -741,7 +827,8 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
                 page,
                 expires_at_ms,
                 config_version,
-                effective_limit
+                effective_limit,
+                retries_left - 1
               )
 
             {:error, _reason} = error ->
@@ -789,7 +876,7 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
     with :ok <- assert_current(ctx, session),
          {:ok, target_meta} <- read_recovery_meta(ctx, session, target_session_id) do
       cond do
-        sequence < target_meta.recovery_floor ->
+        sequence != target_meta.recovery_floor ->
           next_cursor = %{session_id: target_session_id, sequence: target_meta.recovery_floor}
           recover_pages(ctx, session, next_cursor, remaining, recovery, counts)
 
@@ -828,9 +915,21 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
           counts = merge_counts(counts, page_counts)
 
           if advance? do
-            next_cursor = %{session_id: target_session_id, sequence: next_sequence}
+            case advance_recovery_floor(ctx, session, target_meta, sequence) do
+              :ok ->
+                next_cursor = %{session_id: target_session_id, sequence: next_sequence}
 
-            recover_pages(ctx, session, next_cursor, remaining - 1, recovery, counts)
+                recover_pages(ctx, session, next_cursor, remaining - 1, recovery, counts)
+
+              {:error, _reason} ->
+                {:ok,
+                 counts
+                 |> Map.update!(:errors, &(&1 + 1))
+                 |> Map.put(:next_cursor, %{
+                   session_id: target_session_id,
+                   sequence: sequence
+                 })}
+            end
           else
             {:ok,
              Map.put(counts, :next_cursor, %{
@@ -871,6 +970,26 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
       end
 
     {counts, sequence + 1, advance?}
+  end
+
+  defp advance_recovery_floor(ctx, current_session, target_meta, sequence) do
+    target_session = session_for_meta(current_session, target_meta)
+
+    case update_meta(ctx, target_session, fn latest ->
+           cond do
+             latest.recovery_floor == sequence ->
+               {:ok, %{latest | recovery_floor: sequence + 1}, :ok}
+
+             latest.recovery_floor > sequence ->
+               {:ok, latest, :ok}
+
+             true ->
+               {:error, :cache_session_recovery_order_conflict}
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, _reason} = error -> error
+    end
   end
 
   defp recover_stored_page(ctx, encoded, recovery) do
@@ -1034,18 +1153,23 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
   end
 
   defp recovery_start(ctx, session, cursor) when is_nil(cursor) or is_map(cursor) do
+    _ = cursor
+
     with {:ok, current_meta} <- read_recovery_meta(ctx, session, session.session_id) do
       expected_session_id = current_meta.previous_session_id
 
-      cond do
-        is_nil(cursor) ->
-          {:ok, previous_cursor(expected_session_id)}
+      case expected_session_id do
+        nil ->
+          {:ok, nil}
 
-        cursor.session_id == expected_session_id ->
-          {:ok, cursor}
-
-        true ->
-          {:ok, previous_cursor(expected_session_id)}
+        target_session_id ->
+          with {:ok, target_meta} <- read_recovery_meta(ctx, session, target_session_id) do
+            {:ok,
+             %{
+               session_id: target_session_id,
+               sequence: target_meta.recovery_floor
+             }}
+          end
       end
     end
   end
@@ -1071,7 +1195,14 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
     end)
   end
 
-  defp claim_page_for_discard(ctx, page, allowed_states) do
+  defp claim_page_for_discard(ctx, page, allowed_states),
+    do: claim_page_for_discard(ctx, page, allowed_states, @max_retries)
+
+  defp claim_page_for_discard(_ctx, _page, _allowed_states, retries_left)
+       when retries_left <= 0,
+       do: {:error, :cache_session_conflict}
+
+  defp claim_page_for_discard(ctx, page, allowed_states, retries_left) do
     key = page_key(page)
 
     case safe_durable_read(&read_durable_key/2, ctx, key) do
@@ -1093,7 +1224,7 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
                   :ok
 
                 result when result in [0, nil] ->
-                  claim_page_for_discard(ctx, page, allowed_states)
+                  claim_page_for_discard(ctx, page, allowed_states, retries_left - 1)
 
                 {:error, _reason} = error ->
                   error
@@ -1285,44 +1416,47 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
   end
 
   defp encode_head(session) do
-    :erlang.term_to_binary({@head_tag, session.generation, session.session_id})
+    TermCodec.encode({@head_tag, session.generation, session.session_id})
   end
 
   defp decode_head(nil), do: {:ok, %{generation: 0, session_id: nil}}
 
   defp decode_head(value) when is_binary(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {@head_tag, generation, session_id}
+    case TermCodec.decode(value) do
+      {:ok, {@head_tag, generation, session_id}}
       when is_integer(generation) and generation > 0 and is_binary(session_id) and
-             generation <= @max_exact_version and session_id != "" ->
+             generation <= @max_exact_version and session_id != "" and
+             byte_size(session_id) <= @max_identity_bytes ->
         {:ok, %{generation: generation, session_id: session_id}}
 
       _other ->
         {:error, :cache_session_head_corrupt}
     end
-  rescue
-    _decode_error -> {:error, :cache_session_head_corrupt}
   end
 
   defp decode_head(_value), do: {:error, :cache_session_head_corrupt}
 
   defp encode_meta(meta) do
-    :erlang.term_to_binary(
+    TermCodec.encode(
       {@meta_tag, meta.session_id, meta.generation, meta.previous_session_id,
        meta.cleanup_session_id, meta.page_count, meta.recovery_floor, meta.state}
     )
   end
 
   defp decode_meta(value) when is_binary(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {@meta_tag, session_id, generation, previous_session_id, cleanup_session_id, page_count,
-       recovery_floor, state}
+    case TermCodec.decode(value) do
+      {:ok,
+       {@meta_tag, session_id, generation, previous_session_id, cleanup_session_id, page_count,
+        recovery_floor, state}}
       when is_binary(session_id) and session_id != "" and is_integer(generation) and
              generation > 0 and generation <= @max_exact_version and
+             byte_size(session_id) <= @max_identity_bytes and
              (is_nil(previous_session_id) or
-                (is_binary(previous_session_id) and previous_session_id != "")) and
+                (is_binary(previous_session_id) and previous_session_id != "" and
+                   byte_size(previous_session_id) <= @max_identity_bytes)) and
              (is_nil(cleanup_session_id) or
-                (is_binary(cleanup_session_id) and cleanup_session_id != "")) and
+                (is_binary(cleanup_session_id) and cleanup_session_id != "" and
+                   byte_size(cleanup_session_id) <= @max_identity_bytes)) and
              cleanup_session_id != session_id and is_integer(page_count) and page_count >= 0 and
              page_count <= @max_exact_version and is_integer(recovery_floor) and
              recovery_floor > 0 and recovery_floor <= page_count + 1 and
@@ -1341,14 +1475,12 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
       _other ->
         {:error, :cache_session_manifest_corrupt}
     end
-  rescue
-    _decode_error -> {:error, :cache_session_manifest_corrupt}
   end
 
   defp decode_meta(_value), do: {:error, :cache_session_manifest_corrupt}
 
   defp encode_page(page) do
-    :erlang.term_to_binary(
+    TermCodec.encode(
       {@page_tag, page.node_id, page.instance_name, page.session_id, page.generation,
        page.sequence, page.scope, page.shard_id, page.expires_at_ms, page.config_version,
        page.effective_limit, page.reservation_ids, page.state}
@@ -1359,14 +1491,19 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
     if byte_size(value) > @max_encoded_page_bytes do
       {:error, :cache_session_page_corrupt}
     else
-      case :erlang.binary_to_term(value, [:safe]) do
-        {@page_tag, node_id, instance_name, session_id, generation, sequence, scope, shard_id,
-         expires_at_ms, config_version, effective_limit, reservation_ids, state}
+      case TermCodec.decode(value) do
+        {:ok,
+         {@page_tag, node_id, instance_name, session_id, generation, sequence, scope, shard_id,
+          expires_at_ms, config_version, effective_limit, reservation_ids, state}}
         when is_binary(node_id) and node_id != "" and is_binary(instance_name) and
                instance_name != "" and is_binary(session_id) and session_id != "" and
+               byte_size(node_id) <= @max_identity_bytes and
+               byte_size(instance_name) <= @max_identity_bytes and
+               byte_size(session_id) <= @max_identity_bytes and
                is_integer(generation) and generation > 0 and generation <= @max_exact_version and
                is_integer(sequence) and sequence > 0 and sequence <= @max_exact_version and
-               is_binary(scope) and scope != "" and is_integer(shard_id) and shard_id >= 0 and
+               is_binary(scope) and scope != "" and byte_size(scope) <= @max_identity_bytes and
+               is_integer(shard_id) and shard_id >= 0 and
                is_integer(expires_at_ms) and expires_at_ms >= 0 and
                expires_at_ms <= @max_exact_version and is_list(reservation_ids) and
                reservation_ids != [] and is_integer(config_version) and config_version >= 0 and
@@ -1396,8 +1533,6 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
           {:error, :cache_session_page_corrupt}
       end
     end
-  rescue
-    _decode_error -> {:error, :cache_session_page_corrupt}
   end
 
   defp decode_page(_value), do: {:error, :cache_session_page_corrupt}
@@ -1501,6 +1636,41 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
 
   defp valid_recovery_cursor?(_cursor), do: false
 
+  defp validate_session(session) when is_map(session) do
+    if valid_identity?(Map.get(session, :node_id)) and
+         valid_identity?(Map.get(session, :instance_name)) and
+         valid_identity?(Map.get(session, :session_id)) and
+         is_integer(Map.get(session, :generation)) and Map.get(session, :generation) > 0 and
+         Map.get(session, :generation) <= @max_exact_version and
+         (is_nil(Map.get(session, :previous_session_id)) or
+            valid_identity?(Map.get(session, :previous_session_id))) do
+      :ok
+    else
+      {:error, "ERR invalid flow governance cache session"}
+    end
+  end
+
+  defp validate_session(_session), do: {:error, "ERR invalid flow governance cache session"}
+
+  defp valid_page_identity?(page) do
+    valid_identity?(Map.get(page, :node_id)) and
+      valid_identity?(Map.get(page, :instance_name)) and
+      valid_identity?(Map.get(page, :session_id)) and
+      is_integer(Map.get(page, :sequence)) and Map.get(page, :sequence) > 0 and
+      Map.get(page, :sequence) <= @max_exact_version
+  end
+
+  defp valid_identity?(value) do
+    is_binary(value) and value != "" and byte_size(value) <= Router.max_key_size()
+  end
+
+  defp required_update_option(opts, key) do
+    case Keyword.fetch(opts, key) do
+      {:ok, value} -> {:ok, value}
+      :error -> {:error, "ERR invalid flow governance cache update options"}
+    end
+  end
+
   defp validate_page_size(page_size)
        when is_integer(page_size) and page_size > 0 and page_size <= @max_page_size,
        do: :ok
@@ -1545,15 +1715,26 @@ defmodule Ferricstore.Flow.Governance.CacheSessionStore do
 
   defp required_identity(opts, key) do
     case Keyword.fetch(opts, key) do
-      {:ok, value} when is_binary(value) and value != "" -> {:ok, value}
-      {:ok, value} when is_atom(value) -> {:ok, Atom.to_string(value)}
-      _missing_or_invalid -> {:error, "ERR invalid flow governance cache session identity"}
+      {:ok, value} when is_binary(value) ->
+        if valid_identity?(value),
+          do: {:ok, value},
+          else: {:error, "ERR invalid flow governance cache session identity"}
+
+      {:ok, value} when is_atom(value) ->
+        value = Atom.to_string(value)
+
+        if valid_identity?(value),
+          do: {:ok, value},
+          else: {:error, "ERR invalid flow governance cache session identity"}
+
+      _missing_or_invalid ->
+        {:error, "ERR invalid flow governance cache session identity"}
     end
   end
 
   defp deterministic_session_id(node_id, instance_name, generation, previous_session_id) do
     {:flow_governance_cache_session, node_id, instance_name, generation, previous_session_id}
-    |> :erlang.term_to_binary()
+    |> TermCodec.encode()
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.url_encode64(padding: false)
   end

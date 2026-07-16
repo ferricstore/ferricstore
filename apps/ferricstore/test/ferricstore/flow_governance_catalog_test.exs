@@ -3,6 +3,43 @@ defmodule Ferricstore.FlowGovernanceCatalogTest do
 
   @stores ~w(approval_store budget_store circuit_store limit_store ledger)
 
+  test "approval catalog repair rejects non-canonical and oversized progress" do
+    ctx = FerricStore.Instance.get(:default)
+    progress_key = Ferricstore.Flow.Governance.ApprovalCatalogRepair.source_progress_key()
+    target_key = Ferricstore.Flow.Keys.governance_approval_scope_catalog_key("repair-target")
+    matcher = fn _key -> false end
+    targets = fn _key -> {:ok, []} end
+
+    assert :ok = Ferricstore.Flow.Governance.ApprovalCatalogRepair.mark_dirty(ctx)
+    value = Ferricstore.Store.Router.get(ctx, progress_key)
+    assert :ok = Ferricstore.Store.Router.put(ctx, progress_key, value <> <<0>>, 0)
+
+    assert {:error, "ERR flow approval catalog repair progress is corrupt"} =
+             Ferricstore.Flow.Governance.ApprovalCatalogRepair.step(
+               ctx,
+               target_key,
+               matcher,
+               targets
+             )
+
+    oversized =
+      :erlang.term_to_binary({
+        :flow_governance_approval_catalog_repair_v1,
+        :source,
+        String.duplicate("c", Ferricstore.Store.Router.max_key_size() + 1)
+      })
+
+    assert :ok = Ferricstore.Store.Router.put(ctx, progress_key, oversized, 0)
+
+    assert {:error, "ERR flow approval catalog repair progress is corrupt"} =
+             Ferricstore.Flow.Governance.ApprovalCatalogRepair.step(
+               ctx,
+               target_key,
+               matcher,
+               targets
+             )
+  end
+
   test "governance list paths never enumerate the full application keyspace" do
     Enum.each(@stores, fn store ->
       source =

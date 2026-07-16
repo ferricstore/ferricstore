@@ -43,12 +43,13 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
     acl_username = Access.keyspace_acl_username(opts)
     {rows, sampled} = collect_keyspace_rows(filters)
     rows = Access.filter_keyspace_rows_for_acl(rows, acl_username)
+    visible_sampled = if is_binary(acl_username), do: length(rows), else: sampled
 
     %{
       filters: filters,
       rows: rows,
       inspected: inspect_keyspace_key(filters.key, rows),
-      total_sampled: sampled
+      total_sampled: visible_sampled
     }
   end
 
@@ -260,7 +261,6 @@ defmodule FerricstoreServer.Health.Dashboard.Data.KV do
     }
   end
 
-  defp keyspace_logical_key(<<"T:", logical::binary>>), do: logical
   defp keyspace_logical_key(key), do: CompoundKey.extract_redis_key(key)
 
   defp keyspace_row_matches?(row, filters) do

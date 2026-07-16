@@ -63,6 +63,8 @@ defmodule FerricStore.API.HyperLogLog do
 
   """
   @spec pfcount([key()]) :: {:ok, non_neg_integer()} | {:error, binary()}
+  def pfcount([]), do: {:error, "ERR wrong number of arguments for 'pfcount' command"}
+
   def pfcount(keys) when is_list(keys) do
     store = build_string_store(hd(keys))
     result = HyperLogLog.handle_ast({:pfcount, keys}, store)

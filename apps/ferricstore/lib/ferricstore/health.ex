@@ -130,12 +130,13 @@ defmodule Ferricstore.Health do
     shards = collect_shard_info(shard_count, ctx)
 
     # Readiness requires: flag set + all shards alive + all Raft leaders elected
+    ready = ready?()
     all_shards_ok = Enum.all?(shards, fn s -> s.status == "ok" end)
-    raft_ready = ctx != nil and check_raft_leaders(shard_count)
+    raft_ready = ready and all_shards_ok and ctx != nil and check_raft_leaders(shard_count)
 
     status =
       cond do
-        not ready?() -> :starting
+        not ready -> :starting
         not all_shards_ok -> :starting
         not raft_ready -> :starting
         true -> :ok
@@ -163,17 +164,36 @@ defmodule Ferricstore.Health do
   # Without a leader, writes will fail. Returns true if all leaders
   # are elected, false if any shard has no leader.
   @spec check_raft_leaders(non_neg_integer()) :: boolean()
-  defp check_raft_leaders(shard_count) do
-    Enum.all?(0..(shard_count - 1), fn i ->
-      try do
-        case Ferricstore.Raft.Cluster.members(i, 1_000) do
-          {:ok, _members, leader} when leader not in [nil, :undefined] -> true
-          _ -> false
-        end
-      catch
-        :exit, _ -> false
-      end
-    end)
+  defp check_raft_leaders(shard_count), do: check_raft_leaders(shard_count, &raft_leader?/1)
+
+  defp check_raft_leaders(shard_count, checker) when shard_count > 0 do
+    0..(shard_count - 1)
+    |> Task.async_stream(checker,
+      ordered: false,
+      max_concurrency: min(shard_count, max(System.schedulers_online(), 1)),
+      timeout: 1_100,
+      on_timeout: :kill_task
+    )
+    |> Enum.all?(&match?({:ok, true}, &1))
+  end
+
+  defp check_raft_leaders(_shard_count, _checker), do: false
+
+  defp raft_leader?(shard_index) do
+    case Ferricstore.Raft.Cluster.members(shard_index, 1_000) do
+      {:ok, _members, leader} when leader not in [nil, :undefined] -> true
+      _ -> false
+    end
+  catch
+    :exit, _ -> false
+  end
+
+  if Mix.env() == :test do
+    @doc false
+    def __check_raft_leaders_for_test__(shard_count, checker)
+        when is_integer(shard_count) and is_function(checker, 1) do
+      check_raft_leaders(shard_count, checker)
+    end
   end
 
   @spec collect_shard_info(non_neg_integer(), FerricStore.Instance.t() | nil) :: [shard_info()]
@@ -181,29 +201,36 @@ defmodule Ferricstore.Health do
 
   defp collect_shard_info(shard_count, ctx) do
     Enum.map(0..(shard_count - 1), fn index ->
-      ets = :"keydir_#{index}"
       name = if ctx, do: Router.shard_name(ctx, index), else: nil
+      keys = keydir_size(ctx, index)
 
-      {status, keys} =
+      status =
         try do
-          keys =
-            case :ets.info(ets, :size) do
-              n when is_integer(n) -> n
-              _ -> 0
-            end
-
-          shard_status =
-            case Process.whereis(name) do
-              pid when is_pid(pid) -> if Process.alive?(pid), do: "ok", else: "down"
-              nil -> "down"
-            end
-
-          {shard_status, keys}
+          case Process.whereis(name) do
+            pid when is_pid(pid) -> if Process.alive?(pid), do: "ok", else: "down"
+            nil -> "down"
+          end
         rescue
-          ArgumentError -> {"down", 0}
+          ArgumentError -> "down"
         end
 
       %{index: index, status: status, keys: keys}
     end)
+  end
+
+  defp keydir_size(%{keydir_refs: refs}, index)
+       when is_tuple(refs) and is_integer(index) and index >= 0 and index < tuple_size(refs) do
+    safe_ets_size(elem(refs, index))
+  end
+
+  defp keydir_size(_ctx, index), do: safe_ets_size(:"keydir_#{index}")
+
+  defp safe_ets_size(table) do
+    case :ets.info(table, :size) do
+      n when is_integer(n) -> n
+      _ -> 0
+    end
+  rescue
+    ArgumentError -> 0
   end
 end

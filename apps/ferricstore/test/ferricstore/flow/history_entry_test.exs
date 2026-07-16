@@ -19,4 +19,14 @@ defmodule Ferricstore.Flow.HistoryEntryTest do
              "event" => "retry"
            }
   end
+
+  test "malformed stored fields do not crash history reads" do
+    assert HistoryEntry.fields_to_map([
+             :invalid_key,
+             "ignored",
+             "event",
+             "created",
+             "dangling"
+           ]) == %{"event" => "created"}
+  end
 end

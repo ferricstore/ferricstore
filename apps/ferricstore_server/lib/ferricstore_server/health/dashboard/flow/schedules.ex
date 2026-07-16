@@ -1,12 +1,14 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Schedules do
   @moduledoc false
 
+  alias FerricstoreServer.Health.QueryDecoder
+
   @default_limit 100
   @max_limit 500
 
   @spec opts_from_query(binary()) :: keyword()
   def opts_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     []
     |> put_opt(:state, normalize_state(Map.get(params, "state")))

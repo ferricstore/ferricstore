@@ -15,12 +15,29 @@ defmodule Ferricstore.Store.Shard.Lifecycle.Shutdown do
     # writes synchronously to guarantee all data hits disk before exit.
     state = ShardFlush.await_in_flight(state)
     state = ShardFlush.flush_pending_sync(state)
+    pending_write_count = length(state.pending)
+
+    pending_flush_result =
+      case Map.get(state, :last_flush_error) do
+        nil -> :ok
+        reason -> {:error, reason}
+      end
 
     t_flush = System.monotonic_time(:microsecond)
 
     # Step 2: write v2 hint file for the active file so the next startup
     # can rebuild the keydir from hints instead of replaying the full log.
-    hint_result = ShardFlush.write_hint_for_file(state, state.active_file_id)
+    hint_result =
+      cond do
+        pending_flush_result != :ok ->
+          {:error, :unflushed_pending_writes}
+
+        Map.get(state, :promotion_recovery_required, false) ->
+          {:error, :promotion_recovery_required}
+
+        true ->
+          ShardFlush.write_hint_for_file(state, state.active_file_id)
+      end
 
     hint_dir_fsync_result =
       if hint_result == :ok do
@@ -28,7 +45,10 @@ defmodule Ferricstore.Store.Shard.Lifecycle.Shutdown do
       end
 
     fsync_result = NIF.v2_fsync(state.active_file_path)
-    shutdown_errors = shutdown_errors(hint_result, hint_dir_fsync_result, fsync_result)
+
+    shutdown_errors =
+      shutdown_errors(pending_flush_result, hint_result, hint_dir_fsync_result, fsync_result)
+
     shutdown_status = if shutdown_errors == [], do: :ok, else: :warning
 
     t_hint = System.monotonic_time(:microsecond)
@@ -41,7 +61,12 @@ defmodule Ferricstore.Store.Shard.Lifecycle.Shutdown do
         hint_duration_us: t_hint - t_flush,
         total_duration_us: t_hint - t0
       },
-      %{shard_index: state.index, status: shutdown_status, errors: shutdown_errors}
+      %{
+        shard_index: state.index,
+        status: shutdown_status,
+        errors: shutdown_errors,
+        pending_write_count: pending_write_count
+      }
     )
 
     log_shutdown_result(state.index, t_flush - t0, t_hint - t_flush, shutdown_errors)
@@ -49,8 +74,9 @@ defmodule Ferricstore.Store.Shard.Lifecycle.Shutdown do
     :ok
   end
 
-  defp shutdown_errors(hint_result, hint_dir_fsync_result, fsync_result) do
+  defp shutdown_errors(pending_flush_result, hint_result, hint_dir_fsync_result, fsync_result) do
     []
+    |> maybe_shutdown_error(:pending_flush, pending_flush_result)
     |> maybe_shutdown_error(:hint_write, hint_result)
     |> maybe_shutdown_error(:hint_dir_fsync, hint_dir_fsync_result)
     |> maybe_shutdown_error(:active_fsync, fsync_result)

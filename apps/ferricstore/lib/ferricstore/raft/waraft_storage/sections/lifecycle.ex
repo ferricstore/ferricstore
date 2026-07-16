@@ -61,17 +61,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           ensure_apply_projection_segment_log_ready!(root_dir)
         end)
 
-        Ferricstore.Raft.WARaftBackend.cache_config(shard_index, Map.get(metadata, :config))
-
         sm_state =
           profile_startup_phase(shard_index, root_dir, :build_state, fn ->
             build_sm_state(ctx, shard_index, Map.get(metadata, :apply_context))
           end)
 
-        {sm_state, recovered_position, replay_dependencies} =
+        {sm_state, recovered_position, replay_dependencies, recovered_config} =
           profile_startup_phase(shard_index, root_dir, :recover_segment_projected_keydir, fn ->
             maybe_recover_segment_projected!(sm_state, root_dir, metadata)
           end)
+
+        Ferricstore.Raft.WARaftBackend.cache_config(shard_index, recovered_config)
 
         sm_state =
           profile_startup_phase(
@@ -102,7 +102,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
           last_clean_position: metadata_position,
           replay_dependencies: replay_dependencies,
           label: Map.get(metadata, :label),
-          config: Map.get(metadata, :config),
+          config: recovered_config,
           bitcask_dirty?: false
         }
 

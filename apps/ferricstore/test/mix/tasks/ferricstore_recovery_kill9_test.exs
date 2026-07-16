@@ -74,6 +74,69 @@ defmodule Mix.Tasks.FerricstoreRecoveryKill9Test do
     end
   end
 
+  describe "dataset verification" do
+    test "checks every recovered key rather than three samples" do
+      opts = %{writes: 5, batch_size: 2, prefix: "recovered"}
+
+      fetch_batch = fn keys ->
+        Enum.map(keys, fn "recovered:" <> index_text ->
+          index = String.to_integer(index_text)
+          if index == 2, do: "corrupt", else: "v#{index}"
+        end)
+      end
+
+      assert_raise Mix.Error, ~r/key 2 expected "v2", got "corrupt"/, fn ->
+        RecoveryKill9.verify_dataset!(opts, fetch_batch)
+      end
+    end
+  end
+
+  describe "child process lifecycle" do
+    test "always invokes cleanup when child work raises" do
+      parent = self()
+
+      assert_raise RuntimeError, "marker failed", fn ->
+        RecoveryKill9.with_child_cleanup(
+          :child,
+          fn _child -> raise "marker failed" end,
+          fn child -> send(parent, {:cleaned, child}) end
+        )
+      end
+
+      assert_receive {:cleaned, :child}
+    end
+
+    test "rejects a marker pid that does not belong to the opened child port" do
+      assert RecoveryKill9.validate_marker_pid!(%{"pid" => "123"}, 123) == 123
+
+      assert_raise Mix.Error, ~r/does not match child port pid/, fn ->
+        RecoveryKill9.validate_marker_pid!(%{"pid" => "456"}, 123)
+      end
+    end
+  end
+
+  describe "child output buffering" do
+    test "bounds an unterminated output line while preserving later markers" do
+      oversized = String.duplicate("x", 100_000)
+
+      {buffer, recent, nil} =
+        RecoveryKill9.consume_output("", oversized, [], "WRITE_DONE")
+
+      assert byte_size(buffer) <= 65_536
+
+      {_buffer, recent, marker} =
+        RecoveryKill9.consume_output(
+          buffer,
+          "\nFERRICSTORE_KILL9 event=WRITE_DONE pid=123\n",
+          recent,
+          "WRITE_DONE"
+        )
+
+      assert marker["pid"] == "123"
+      assert Enum.all?(recent, &(byte_size(&1) <= 4_096))
+    end
+  end
+
   describe "child_env/2" do
     test "passes only harness settings to child process" do
       opts = %{

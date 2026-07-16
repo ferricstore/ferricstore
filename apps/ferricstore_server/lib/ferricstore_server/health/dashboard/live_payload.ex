@@ -4,6 +4,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
   alias FerricstoreServer.Health.Dashboard.Data.{KV, Messaging, Operational}
   alias FerricstoreServer.Health.Dashboard.Flow.{Browse, Detail, Projection, Query}
+  alias FerricstoreServer.Health.Endpoint.FlowPaths
+  alias FerricstoreServer.Health.QueryDecoder
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
 
@@ -57,7 +59,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   def live_payload("keyspace?" <> query, opts) do
     data =
       query
-      |> URI.decode_query()
+      |> QueryDecoder.decode()
       |> Map.merge(DashboardAccess.keyspace_live_payload_opts(opts))
       |> KV.collect_keyspace_page()
 
@@ -82,6 +84,11 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
 
   def live_payload("flow/signals", opts), do: live_flow_signals_payload("", opts)
   def live_payload("flow/signals?" <> query, opts), do: live_flow_signals_payload(query, opts)
+  def live_payload("flow/value?" <> query, opts), do: live_flow_value_payload(query, opts)
+  def live_payload("flow/value", opts), do: live_flow_value_payload("", opts)
+
+  def live_payload("flow/" <> encoded_id, opts),
+    do: live_flow_detail_payload(encoded_id, opts)
 
   def live_payload("streams", opts) do
     data = Messaging.collect_streams_page(opts)
@@ -164,7 +171,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   end
 
   def live_payload("keyspace?" <> query) do
-    data = KV.collect_keyspace_page(URI.decode_query(query))
+    data = KV.collect_keyspace_page(QueryDecoder.decode(query))
 
     live_component_payload(%{
       "keyspace_inspector" => render_keyspace_inspector(data.inspected),
@@ -241,9 +248,18 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   def live_payload("flow/value?" <> query), do: live_flow_value_payload(query)
   def live_payload("flow/value"), do: live_flow_value_payload("")
 
-  def live_payload("flow/" <> encoded_id) do
+  def live_payload("flow/" <> encoded_id), do: live_flow_detail_payload(encoded_id, [])
+  def live_payload(_path), do: :not_found
+
+  defp live_flow_detail_payload(encoded_id, access_opts) do
     {id, opts} = decode_flow_detail_request(encoded_id)
-    data = Detail.collect_page(id, Keyword.put(opts, :values, false))
+
+    opts =
+      opts
+      |> Keyword.put(:values, false)
+      |> Keyword.merge(DashboardAccess.flow_acl_opts(access_opts))
+
+    data = Detail.collect_page(id, opts)
 
     live_component_payload(%{
       "flow_detail" => render_flow_detail(data),
@@ -257,8 +273,6 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
       "flow_timeline_chart" => render_flow_timeline_chart(data.history)
     })
   end
-
-  def live_payload(_path), do: :not_found
 
   defp live_flow_workers_payload(data) do
     live_component_payload(%{
@@ -296,8 +310,8 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
     })
   end
 
-  defp live_flow_value_payload(query) do
-    params = URI.decode_query(query)
+  defp live_flow_value_payload(query, access_opts \\ []) do
+    params = QueryDecoder.decode(query)
     ref = params |> Map.get("ref", "") |> String.trim()
     flow_id = params |> Map.get("flow", "") |> String.trim()
     partition_key = params |> Map.get("partition_key", "") |> String.trim()
@@ -315,6 +329,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
             do: [values: false],
             else: [values: false, partition_key: partition_key]
 
+        opts = Keyword.merge(opts, DashboardAccess.flow_acl_opts(access_opts))
         data = Detail.collect_page(flow_id, opts)
         visible_refs = flow_detail_value_refs(data.record, data.history) |> MapSet.new(& &1.ref)
 
@@ -424,13 +439,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
   end
 
   defp decode_flow_detail_request(encoded_id_with_query) do
-    {encoded_id, query} =
-      case String.split(encoded_id_with_query, "?", parts: 2) do
-        [encoded_id, query] -> {encoded_id, query}
-        [encoded_id] -> {encoded_id, ""}
-      end
-
-    {URI.decode(encoded_id), Detail.opts_from_query(query)}
+    FlowPaths.decode_flow_detail_request(encoded_id_with_query)
   end
 
   defp live_component_payload(components) do

@@ -1,11 +1,11 @@
 defmodule FerricstoreServer.Health.Endpoint.FlowPaths do
   @moduledoc false
 
+  alias FerricstoreServer.Health.QueryDecoder
+
   @spec decode_form_body(binary()) :: map()
   def decode_form_body(body) when is_binary(body) do
-    URI.decode_query(body)
-  rescue
-    _ -> %{}
+    QueryDecoder.decode(body)
   end
 
   @spec decode_flow_detail_request(binary()) :: {binary(), map()}
@@ -18,7 +18,7 @@ defmodule FerricstoreServer.Health.Endpoint.FlowPaths do
 
     opts = FerricstoreServer.Health.Dashboard.flow_detail_opts_from_query(query)
 
-    {URI.decode(encoded_id), opts}
+    {decoded_component_or_empty(encoded_id), opts}
   end
 
   @spec decode_flow_rewind_action(binary()) :: {:ok, binary()} | :not_found
@@ -29,7 +29,7 @@ defmodule FerricstoreServer.Health.Endpoint.FlowPaths do
       encoded_id =
         binary_part(encoded_action, 0, byte_size(encoded_action) - byte_size(suffix))
 
-      {:ok, URI.decode(encoded_id)}
+      decode_action_component(encoded_id)
     else
       :not_found
     end
@@ -43,7 +43,7 @@ defmodule FerricstoreServer.Health.Endpoint.FlowPaths do
       encoded_id =
         binary_part(encoded_action, 0, byte_size(encoded_action) - byte_size(suffix))
 
-      {:ok, URI.decode(encoded_id)}
+      decode_action_component(encoded_id)
     else
       :not_found
     end
@@ -80,5 +80,19 @@ defmodule FerricstoreServer.Health.Endpoint.FlowPaths do
 
   defp flow_detail_path(id) do
     "/dashboard/flow/" <> URI.encode(id, &URI.char_unreserved?/1)
+  end
+
+  defp decoded_component_or_empty(encoded) do
+    case QueryDecoder.decode_component(encoded) do
+      {:ok, decoded} -> decoded
+      :error -> ""
+    end
+  end
+
+  defp decode_action_component(encoded) do
+    case QueryDecoder.decode_component(encoded) do
+      {:ok, decoded} -> {:ok, decoded}
+      :error -> :not_found
+    end
   end
 end

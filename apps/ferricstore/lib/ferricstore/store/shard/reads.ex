@@ -4,7 +4,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{BlobValue, ColdRead}
+  alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -12,10 +12,12 @@ defmodule Ferricstore.Store.Shard.Reads do
   @max_get_many_keys 512
   @max_key_size 65_535
   @max_get_many_key_bytes 1_048_576
-
-  defguardp valid_cold_location(file_id, offset, value_size)
-            when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
-                   is_integer(value_size) and value_size >= 0
+  @default_get_many_max_concurrency 4
+  @default_get_many_max_queued 64
+  @default_get_many_deadline_ms 4_500
+  @get_many_busy_error {:error, "BUSY shard batch read queue is full"}
+  @get_many_failed_error {:error, "ERR shard batch read failed"}
+  @invalid_keydir_failure ReadResult.failure(:invalid_keydir_entry)
 
   defguardp valid_waraft_segment_location(file_id, offset, value_size)
             when is_tuple(file_id) and tuple_size(file_id) == 2 and
@@ -41,13 +43,16 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, nil, state}
 
+      {:error, :invalid_keydir_entry} ->
+        {:reply, @invalid_keydir_failure, state}
+
       {:cold, fid, off, vsize, exp} ->
         case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
             reply_cold_value(state, key, value, exp, fid, off, vsize)
 
-          _ ->
-            {:reply, nil, state}
+          failed_read ->
+            {:reply, cold_read_failure(failed_read), state}
         end
 
       :miss ->
@@ -64,30 +69,282 @@ defmodule Ferricstore.Store.Shard.Reads do
           {:noreply, map()} | {:reply, {:error, binary()}, map()}
   @doc false
   def handle_get_many(keys, from, state) when is_list(keys) do
-    if length(keys) <= @max_get_many_keys and
-         Enum.all?(keys, fn key -> is_binary(key) and byte_size(key) <= @max_key_size end) and
-         Enum.reduce(keys, 0, fn key, total -> total + byte_size(key) end) <=
-           @max_get_many_key_bytes do
-      state = flush_pending_get_many_keys(state, keys)
+    handle_get_many(keys, from, new_get_many_deadline(state), state)
+  end
 
-      spawn(fn ->
-        result =
-          try do
-            get_many_values(keys, state)
-          rescue
-            _read_error -> {:error, "ERR shard batch read failed"}
-          catch
-            _kind, _reason -> {:error, "ERR shard batch read failed"}
-          end
+  @spec handle_get_many([binary()], GenServer.from(), integer(), map()) ::
+          {:noreply, map()} | {:reply, term(), map()}
+  @doc false
+  def handle_get_many(keys, from, deadline_ms, state)
+      when is_list(keys) and is_integer(deadline_ms) do
+    cond do
+      not valid_get_many_request?(keys) ->
+        {:reply, {:error, "ERR invalid shard batch read request"}, state}
 
-        GenServer.reply(from, result)
-      end)
+      get_many_expired?(deadline_ms) ->
+        {:reply, unavailable_get_many_values(keys), state}
 
-      {:noreply, state}
-    else
-      {:reply, {:error, "ERR invalid shard batch read request"}, state}
+      true ->
+        state = flush_pending_get_many_keys(state, keys)
+        {:noreply, admit_get_many(state, from, keys, deadline_ms)}
     end
   end
+
+  @doc false
+  def handle_get_many_complete(job_ref, result, state) do
+    workers = Map.get(state, :get_many_workers, %{})
+
+    case Map.pop(workers, job_ref) do
+      {%{monitor_ref: monitor_ref, timer_ref: timer_ref, from: from}, remaining_workers} ->
+        cancel_get_many_timer(timer_ref)
+        Process.demonitor(monitor_ref, [:flush])
+        reply_get_many(from, result)
+
+        state
+        |> Map.put(:get_many_workers, remaining_workers)
+        |> drain_get_many_waiting()
+
+      {nil, _workers} ->
+        state
+    end
+  end
+
+  @doc false
+  def handle_get_many_timeout(job_ref, state) do
+    workers = Map.get(state, :get_many_workers, %{})
+
+    case Map.fetch(workers, job_ref) do
+      {:ok, %{from: nil}} ->
+        state
+
+      {:ok, %{pid: pid, from: from, keys: keys} = worker} ->
+        Process.exit(pid, :kill)
+        GenServer.reply(from, unavailable_get_many_values(keys))
+
+        timed_out_worker = %{
+          worker
+          | from: nil,
+            timer_ref: nil,
+            timed_out?: true
+        }
+
+        Map.put(state, :get_many_workers, Map.put(workers, job_ref, timed_out_worker))
+
+      :error ->
+        state
+    end
+  end
+
+  @doc false
+  def handle_get_many_down(monitor_ref, state) do
+    workers = Map.get(state, :get_many_workers, %{})
+
+    case Enum.find(workers, fn {_job_ref, worker} ->
+           worker.monitor_ref == monitor_ref
+         end) do
+      {job_ref, %{timer_ref: timer_ref, from: from}} ->
+        cancel_get_many_timer(timer_ref)
+        reply_get_many(from, @get_many_failed_error)
+
+        state =
+          state
+          |> Map.put(:get_many_workers, Map.delete(workers, job_ref))
+          |> drain_get_many_waiting()
+
+        {:handled, state}
+
+      nil ->
+        :unhandled
+    end
+  end
+
+  defp valid_get_many_request?(keys) do
+    keys
+    |> Enum.reduce_while({0, 0}, fn
+      key, {count, key_bytes} when is_binary(key) and byte_size(key) <= @max_key_size ->
+        next_count = count + 1
+        next_key_bytes = key_bytes + byte_size(key)
+
+        if next_count <= @max_get_many_keys and next_key_bytes <= @max_get_many_key_bytes do
+          {:cont, {next_count, next_key_bytes}}
+        else
+          {:halt, :invalid}
+        end
+
+      _key, _totals ->
+        {:halt, :invalid}
+    end)
+    |> case do
+      :invalid -> false
+      {_count, _key_bytes} -> true
+    end
+  end
+
+  defp admit_get_many(state, from, keys, deadline_ms) do
+    workers = Map.get(state, :get_many_workers, %{})
+
+    cond do
+      map_size(workers) < get_many_max_concurrency(state) ->
+        start_get_many_worker(state, from, keys, deadline_ms)
+
+      Map.get(state, :get_many_waiting_count, 0) < get_many_max_queued(state) ->
+        waiting = Map.get(state, :get_many_waiting, :queue.new())
+
+        state
+        |> Map.put(:get_many_waiting, :queue.in({from, keys, deadline_ms}, waiting))
+        |> Map.update(:get_many_waiting_count, 1, &(&1 + 1))
+
+      true ->
+        GenServer.reply(from, @get_many_busy_error)
+        state
+    end
+  end
+
+  defp start_get_many_worker(state, from, keys, deadline_ms) do
+    case get_many_remaining_ms(deadline_ms) do
+      0 ->
+        GenServer.reply(from, unavailable_get_many_values(keys))
+        state
+
+      timeout_ms ->
+        parent = self()
+        job_ref = make_ref()
+        read_state = get_many_read_state(state)
+
+        {pid, monitor_ref} =
+          spawn_monitor(fn ->
+            result = safe_get_many_values(keys, read_state, deadline_ms)
+            send(parent, {:shard_get_many_complete, job_ref, result})
+          end)
+
+        timer_ref = Process.send_after(parent, {:shard_get_many_timeout, job_ref}, timeout_ms)
+        workers = Map.get(state, :get_many_workers, %{})
+
+        worker = %{
+          pid: pid,
+          monitor_ref: monitor_ref,
+          timer_ref: timer_ref,
+          from: from,
+          keys: keys,
+          timed_out?: false
+        }
+
+        Map.put(state, :get_many_workers, Map.put(workers, job_ref, worker))
+    end
+  end
+
+  defp drain_get_many_waiting(state) do
+    workers = Map.get(state, :get_many_workers, %{})
+    waiting_count = Map.get(state, :get_many_waiting_count, 0)
+
+    if waiting_count > 0 and map_size(workers) < get_many_max_concurrency(state) do
+      waiting = Map.get(state, :get_many_waiting, :queue.new())
+
+      case :queue.out(waiting) do
+        {{:value, {from, keys, deadline_ms}}, remaining_waiting} ->
+          state =
+            state
+            |> Map.put(:get_many_waiting, remaining_waiting)
+            |> Map.put(:get_many_waiting_count, waiting_count - 1)
+
+          cond do
+            get_many_expired?(deadline_ms) ->
+              GenServer.reply(from, unavailable_get_many_values(keys))
+              drain_get_many_waiting(state)
+
+            not get_many_caller_alive?(from) ->
+              drain_get_many_waiting(state)
+
+            true ->
+              state
+              |> start_get_many_worker(from, keys, deadline_ms)
+              |> drain_get_many_waiting()
+          end
+
+        {:empty, _waiting} ->
+          state
+          |> Map.put(:get_many_waiting, :queue.new())
+          |> Map.put(:get_many_waiting_count, 0)
+      end
+    else
+      state
+    end
+  end
+
+  defp safe_get_many_values(keys, state, deadline_ms) do
+    if get_many_expired?(deadline_ms) do
+      unavailable_get_many_values(keys)
+    else
+      result =
+        try do
+          get_many_values(keys, state, deadline_ms)
+        rescue
+          _read_error -> @get_many_failed_error
+        catch
+          _kind, _reason -> @get_many_failed_error
+        end
+
+      if get_many_expired?(deadline_ms),
+        do: unavailable_get_many_values(keys),
+        else: result
+    end
+  end
+
+  defp get_many_read_state(state) do
+    Map.take(state, [
+      :keydir,
+      :shard_data_path,
+      :data_dir,
+      :index,
+      :shard_index,
+      :instance_ctx,
+      :get_many_pread_batch,
+      :get_many_waraft_batch
+    ])
+  end
+
+  defp get_many_max_concurrency(state) do
+    case Map.get(state, :get_many_max_concurrency) do
+      value when is_integer(value) and value > 0 -> value
+      _invalid -> @default_get_many_max_concurrency
+    end
+  end
+
+  defp get_many_max_queued(state) do
+    case Map.get(state, :get_many_max_queued) do
+      value when is_integer(value) and value >= 0 -> value
+      _invalid -> @default_get_many_max_queued
+    end
+  end
+
+  defp new_get_many_deadline(state) do
+    System.monotonic_time(:millisecond) + get_many_deadline_duration(state)
+  end
+
+  defp get_many_deadline_duration(state) do
+    case Map.get(state, :get_many_deadline_ms) do
+      value when is_integer(value) and value > 0 -> value
+      _invalid -> @default_get_many_deadline_ms
+    end
+  end
+
+  defp get_many_expired?(deadline_ms),
+    do: System.monotonic_time(:millisecond) >= deadline_ms
+
+  defp get_many_remaining_ms(deadline_ms) do
+    max(deadline_ms - System.monotonic_time(:millisecond), 0)
+  end
+
+  defp unavailable_get_many_values(keys), do: List.duplicate(:unavailable, length(keys))
+
+  defp cancel_get_many_timer(nil), do: false
+  defp cancel_get_many_timer(timer_ref), do: Process.cancel_timer(timer_ref)
+
+  defp reply_get_many(nil, _result), do: :ok
+  defp reply_get_many(from, result), do: GenServer.reply(from, result)
+
+  defp get_many_caller_alive?({pid, _tag}) when is_pid(pid), do: Process.alive?(pid)
+  defp get_many_caller_alive?(_from), do: true
 
   defp flush_pending_get_many_keys(state, keys) do
     if Enum.any?(keys, &ShardETS.pending_cold?(state, &1)) do
@@ -97,9 +354,9 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  defp get_many_values([], _state), do: []
+  defp get_many_values([], _state, _deadline_ms), do: []
 
-  defp get_many_values(keys, state) do
+  defp get_many_values(keys, state, deadline_ms) do
     {results, file_reads, segment_reads} =
       keys
       |> Enum.with_index()
@@ -114,6 +371,9 @@ defmodule Ferricstore.Store.Shard.Reads do
           :miss ->
             {Map.put(results, index, nil), file_reads, segment_reads}
 
+          {:error, :invalid_keydir_entry} ->
+            {Map.put(results, index, @invalid_keydir_failure), file_reads, segment_reads}
+
           {:cold, fid, off, vsize, exp}
           when valid_waraft_segment_location(fid, off, vsize) ->
             read = {index, key, exp, fid, off, vsize}
@@ -126,22 +386,22 @@ defmodule Ferricstore.Store.Shard.Reads do
         end
       end)
 
-    results = read_get_many_files(state, results, Enum.reverse(file_reads))
-    results = read_get_many_segments(state, results, Enum.reverse(segment_reads))
+    results = read_get_many_files(state, results, Enum.reverse(file_reads), deadline_ms)
+    results = read_get_many_segments(state, results, Enum.reverse(segment_reads), deadline_ms)
 
     Enum.map(0..(length(keys) - 1), &Map.get(results, &1))
   end
 
-  defp read_get_many_files(_state, results, []), do: results
+  defp read_get_many_files(_state, results, [], _deadline_ms), do: results
 
-  defp read_get_many_files(state, results, reads) do
+  defp read_get_many_files(state, results, reads, deadline_ms) do
     locations =
       Enum.map(reads, fn {_index, key, _exp, _fid, off, _vsize, path} ->
         {path, off, key}
       end)
 
     values =
-      case get_many_pread_batch(state, locations) do
+      case get_many_pread_batch(state, locations, deadline_ms) do
         {:ok, values} when is_list(values) and length(values) == length(reads) -> values
         _error -> List.duplicate(:unavailable, length(reads))
       end
@@ -150,41 +410,107 @@ defmodule Ferricstore.Store.Shard.Reads do
     |> Enum.zip(values)
     |> Enum.reduce(results, fn
       {{index, key, exp, fid, off, vsize, _path}, value}, acc when is_binary(value) ->
-        Map.put(acc, index, materialize_get_many_value(state, key, exp, fid, off, vsize, value))
+        Map.put(
+          acc,
+          index,
+          materialize_get_many_value(state, key, exp, fid, off, vsize, value, deadline_ms)
+        )
 
       {{index, _key, _exp, _fid, _off, _vsize, _path}, _error}, acc ->
         Map.put(acc, index, :unavailable)
     end)
   end
 
-  defp read_get_many_segments(_state, results, []), do: results
+  defp read_get_many_segments(_state, results, [], _deadline_ms), do: results
 
-  defp read_get_many_segments(state, results, reads) do
-    Enum.reduce(reads, results, fn {index, key, exp, fid, off, vsize}, acc ->
-      value =
-        case read_cold_raw(state, fid, off, key) do
-          {:ok, value} when is_binary(value) ->
-            materialize_get_many_value(state, key, exp, fid, off, vsize, value)
+  defp read_get_many_segments(state, results, reads, deadline_ms) do
+    reads
+    |> Enum.group_by(fn {_index, _key, _exp, file_id, _off, _vsize} -> file_id end)
+    |> Enum.reduce(results, fn {file_id, segment_reads}, acc ->
+      values_by_key = read_get_many_segment_group(state, file_id, segment_reads, deadline_ms)
 
-          _error ->
-            :unavailable
-        end
+      Enum.reduce(segment_reads, acc, fn {index, key, exp, ^file_id, off, vsize}, group_acc ->
+        value =
+          case Map.fetch(values_by_key, key) do
+            {:ok, encoded_value} when is_binary(encoded_value) ->
+              materialize_get_many_value(
+                state,
+                key,
+                exp,
+                file_id,
+                off,
+                vsize,
+                encoded_value,
+                deadline_ms
+              )
 
-      Map.put(acc, index, value)
+            _missing_or_invalid ->
+              :unavailable
+          end
+
+        Map.put(group_acc, index, value)
+      end)
     end)
   end
 
-  defp materialize_get_many_value(state, key, exp, fid, off, vsize, value) do
-    case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
-      nil -> :unavailable
-      materialized -> materialized
+  defp read_get_many_segment_group(state, file_id, reads, deadline_ms) do
+    case get_many_remaining_ms(deadline_ms) do
+      0 ->
+        %{}
+
+      timeout_ms ->
+        keys = Enum.map(reads, fn {_index, key, _exp, ^file_id, _off, _vsize} -> key end)
+
+        case get_many_waraft_batch(state, file_id, keys, timeout_ms) do
+          {:ok, values} when is_map(values) -> values
+          _error -> %{}
+        end
     end
   end
 
-  defp get_many_pread_batch(state, locations) do
-    case Map.get(state, :get_many_pread_batch) do
-      fun when is_function(fun, 2) -> fun.(locations, @cold_read_timeout_ms)
-      _default -> ColdRead.pread_batch_keyed(locations, @cold_read_timeout_ms)
+  defp get_many_waraft_batch(state, file_id, keys, timeout_ms) do
+    ctx = Map.get(state, :instance_ctx)
+    shard_index = shard_index(state)
+
+    case Map.get(state, :get_many_waraft_batch) do
+      fun when is_function(fun, 5) ->
+        fun.(ctx, shard_index, file_id, keys, timeout_ms)
+
+      _default ->
+        Ferricstore.Raft.WARaftSegmentReader.read_values_from_location(
+          ctx,
+          shard_index,
+          file_id,
+          keys,
+          timeout_ms
+        )
+    end
+  end
+
+  defp materialize_get_many_value(state, key, exp, fid, off, vsize, value, deadline_ms) do
+    if get_many_expired?(deadline_ms) do
+      :unavailable
+    else
+      case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
+        {:ok, materialized} ->
+          if(get_many_expired?(deadline_ms), do: :unavailable, else: materialized)
+
+        {:error, _reason} ->
+          :unavailable
+      end
+    end
+  end
+
+  defp get_many_pread_batch(state, locations, deadline_ms) do
+    case get_many_remaining_ms(deadline_ms) do
+      0 ->
+        {:error, :deadline_exceeded}
+
+      timeout_ms ->
+        case Map.get(state, :get_many_pread_batch) do
+          fun when is_function(fun, 2) -> fun.(locations, timeout_ms)
+          _default -> ColdRead.pread_batch_keyed(locations, timeout_ms)
+        end
     end
   end
 
@@ -199,13 +525,16 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, nil, state}
 
+      {:error, :invalid_keydir_entry} ->
+        {:reply, @invalid_keydir_failure, state}
+
       {:cold, fid, off, vsize, exp} when valid_waraft_segment_location(fid, off, vsize) ->
         case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
             reply_cold_value(state, key, value, exp, fid, off, vsize)
 
-          _ ->
-            {:reply, nil, state}
+          failed_read ->
+            {:reply, cold_read_failure(failed_read), state}
         end
 
       {:cold, fid, off, vsize, exp} ->
@@ -227,7 +556,8 @@ defmodule Ferricstore.Store.Shard.Reads do
   # The offset stored in ETS is the RECORD offset (start of header).
   # For sendfile, we need the VALUE offset = record_offset + 26 (header) + key_len.
   @spec handle_get_file_ref(binary(), map()) ::
-          {:reply, {binary(), non_neg_integer(), non_neg_integer()} | nil, map()}
+          {:reply, {binary(), non_neg_integer(), non_neg_integer()} | nil | ReadResult.failure(),
+           map()}
   @doc false
   def handle_get_file_ref(key, state) do
     case ShardETS.ets_lookup(state, key) do
@@ -238,6 +568,9 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       :expired ->
         {:reply, nil, state}
+
+      {:error, :invalid_keydir_entry} ->
+        {:reply, @invalid_keydir_failure, state}
 
       {:cold, fid, off, vsize, _exp} when valid_waraft_segment_location(fid, off, vsize) ->
         {:reply, nil, state}
@@ -256,7 +589,8 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  @spec handle_get_meta(binary(), map()) :: {:reply, {term(), non_neg_integer()} | nil, map()}
+  @spec handle_get_meta(binary(), map()) ::
+          {:reply, {term(), non_neg_integer()} | nil | ReadResult.failure(), map()}
   @doc false
   def handle_get_meta(key, state) do
     case ShardETS.ets_lookup(state, key) do
@@ -266,13 +600,16 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, nil, state}
 
+      {:error, :invalid_keydir_entry} ->
+        {:reply, @invalid_keydir_failure, state}
+
       {:cold, fid, off, vsize, exp} ->
         case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
             reply_cold_meta_value(state, key, value, exp, fid, off, vsize)
 
-          _ ->
-            {:reply, nil, state}
+          failed_read ->
+            {:reply, cold_read_failure(failed_read), state}
         end
 
       :miss ->
@@ -286,7 +623,8 @@ defmodule Ferricstore.Store.Shard.Reads do
   end
 
   @spec handle_get_meta(binary(), GenServer.from(), map()) ::
-          {:reply, {term(), non_neg_integer()} | nil, map()} | {:noreply, map()}
+          {:reply, {term(), non_neg_integer()} | nil | ReadResult.failure(), map()}
+          | {:noreply, map()}
   @doc false
   def handle_get_meta(key, from, state) do
     case ShardETS.ets_lookup(state, key) do
@@ -296,13 +634,16 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, nil, state}
 
+      {:error, :invalid_keydir_entry} ->
+        {:reply, @invalid_keydir_failure, state}
+
       {:cold, fid, off, vsize, exp} when valid_waraft_segment_location(fid, off, vsize) ->
         case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
             reply_cold_meta_value(state, key, value, exp, fid, off, vsize)
 
-          _ ->
-            {:reply, nil, state}
+          failed_read ->
+            {:reply, cold_read_failure(failed_read), state}
         end
 
       {:cold, fid, off, vsize, exp} ->
@@ -333,6 +674,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       :expired ->
         {:reply, false, state}
 
+      {:error, :invalid_keydir_entry} ->
+        {:reply, true, state}
+
       :miss ->
         if ShardETS.pending_cold?(state, key) do
           {:reply, true, state}
@@ -354,7 +698,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   # Internal read helpers
   # -------------------------------------------------------------------
 
-  @spec do_get(map(), binary()) :: term() | nil
+  @spec do_get(map(), binary()) :: term() | nil | ReadResult.failure()
   @doc false
   def do_get(state, key) do
     case ShardETS.ets_lookup(state, key) do
@@ -364,14 +708,20 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:cold, fid, off, vsize, exp} ->
         case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
-            materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize)
+            case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
+              {:ok, materialized} -> materialized
+              {:error, reason} -> ReadResult.failure({:cold_read_failed, reason})
+            end
 
-          _ ->
-            nil
+          failed_read ->
+            cold_read_failure(failed_read)
         end
 
       :expired ->
         nil
+
+      {:error, :invalid_keydir_entry} ->
+        @invalid_keydir_failure
 
       :miss ->
         nil
@@ -399,7 +749,8 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  @spec do_get_meta(map(), binary()) :: {term(), non_neg_integer()} | nil
+  @spec do_get_meta(map(), binary()) ::
+          {term(), non_neg_integer()} | nil | ReadResult.failure()
   @doc false
   def do_get_meta(state, key) do
     case ShardETS.ets_lookup(state, key) do
@@ -410,61 +761,67 @@ defmodule Ferricstore.Store.Shard.Reads do
         case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
             case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
-              nil -> nil
-              materialized -> {materialized, exp}
+              {:ok, materialized} -> {materialized, exp}
+              {:error, reason} -> ReadResult.failure({:cold_read_failed, reason})
             end
 
-          _ ->
-            nil
+          failed_read ->
+            cold_read_failure(failed_read)
         end
 
       :expired ->
         nil
+
+      {:error, :invalid_keydir_entry} ->
+        @invalid_keydir_failure
 
       :miss ->
         nil
     end
   end
 
-  # v2 local read for transaction closures. Returns {:ok, value} or {:ok, nil}.
-  # Replaces NIF.get_zero_copy(state.store, key) in the 2PC local store.
-  @spec v2_local_read(map(), binary()) :: {:ok, term()} | {:error, binary()}
+  # Local read for transaction closures. Failed live reads remain failures so
+  # read-modify-write commands cannot reinterpret corruption as key absence.
+  @spec v2_local_read(map(), binary()) :: {:ok, term()} | ReadResult.failure()
   @doc false
   def v2_local_read(state, key) do
-    case :ets.lookup(state.keydir, key) do
-      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil ->
+    case ShardETS.ets_lookup(state, key) do
+      {:hit, value, _expire_at_ms} ->
         {:ok, value}
 
-      [{^key, nil, _exp, _lfu, :pending, _off, _vsize}] ->
-        # Not yet flushed to disk — should never reach here. If it does,
-        # it means ets_lookup_warm failed to catch the :pending sentinel.
-        {:error, "ERR internal: pending entry reached cold read path for #{inspect(key)}"}
+      {:cold, fid, off, _vsize, _expire_at_ms} ->
+        state
+        |> read_cold_raw(fid, off, key)
+        |> materialize_v2_local_read(state)
 
-      [{^key, nil, _exp, _lfu, fid, off, _vsize}]
-      when is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 ->
-        # Cold key -- pread from disk
-        p = ShardETS.file_path(state.shard_data_path, fid)
-
-        with {:ok, value} <- read_cold_async(p, off, key),
-             {:ok, materialized} <- materialize_blob_value(state, value) do
-          {:ok, materialized}
-        end
-
-      [{^key, nil, _exp, _lfu, fid, off, vsize}]
-      when valid_waraft_segment_location(fid, off, vsize) ->
-        with {:ok, value} <- read_cold_raw(state, fid, off, key),
-             {:ok, materialized} <- materialize_blob_value(state, value) do
-          {:ok, materialized}
-        end
-
-      [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
-        ShardETS.ets_delete_key(state, key)
+      :expired ->
         {:ok, nil}
 
-      _ ->
-        {:ok, nil}
+      :miss ->
+        if ShardETS.pending_cold?(state, key) do
+          ReadResult.failure(:pending_cold_write)
+        else
+          {:ok, nil}
+        end
+
+      {:error, :invalid_keydir_entry} ->
+        ReadResult.failure(:invalid_keydir_entry)
     end
   end
+
+  defp materialize_v2_local_read({:ok, value}, state) when value != nil do
+    case materialize_blob_value(state, value) do
+      {:ok, materialized} when materialized != nil -> {:ok, materialized}
+      {:ok, nil} -> ReadResult.failure({:cold_read_failed, :missing_live_cold_entry})
+      {:error, reason} -> ReadResult.failure({:cold_read_failed, reason})
+    end
+  end
+
+  defp materialize_v2_local_read({:ok, nil}, _state),
+    do: ReadResult.failure({:cold_read_failed, :missing_live_cold_entry})
+
+  defp materialize_v2_local_read({:error, reason}, _state),
+    do: ReadResult.failure({:cold_read_failed, reason})
 
   defp submit_cold_read(path, offset, expected_key, state, pending_entry) do
     corr_id = state.next_correlation_id + 1
@@ -484,15 +841,19 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       {:error, reason} ->
         ColdRead.emit_pread_error(path, reason)
-        {:reply, nil, state}
+        {:reply, ReadResult.failure({:cold_read_failed, reason}), state}
     end
   end
 
-  defp read_cold_async(path, offset, expected_key) do
-    Ferricstore.Store.ColdRead.pread_keyed(path, offset, expected_key, @cold_read_timeout_ms)
+  defp read_cold_async(path, offset, expected_key, timeout_ms) do
+    Ferricstore.Store.ColdRead.pread_keyed(path, offset, expected_key, timeout_ms)
   end
 
-  defp read_cold_raw(state, file_id, _offset, expected_key)
+  defp read_cold_raw(state, file_id, offset, expected_key) do
+    read_cold_raw(state, file_id, offset, expected_key, @cold_read_timeout_ms)
+  end
+
+  defp read_cold_raw(state, file_id, _offset, expected_key, _timeout_ms)
        when valid_waraft_segment_location(file_id, 0, 0) do
     case shard_index(state) do
       idx when is_integer(idx) and idx >= 0 ->
@@ -508,10 +869,10 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  defp read_cold_raw(state, file_id, offset, expected_key) do
+  defp read_cold_raw(state, file_id, offset, expected_key, timeout_ms) do
     state.shard_data_path
     |> ShardETS.file_path(file_id)
-    |> read_cold_async(offset, expected_key)
+    |> read_cold_async(offset, expected_key, timeout_ms)
   end
 
   defp shard_index(%{index: index}), do: index
@@ -520,28 +881,40 @@ defmodule Ferricstore.Store.Shard.Reads do
 
   defp reply_cold_value(state, key, value, exp, fid, off, vsize) do
     case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
-      nil -> {:reply, nil, state}
-      materialized -> {:reply, materialized, state}
+      {:ok, materialized} -> {:reply, materialized, state}
+      {:error, reason} -> {:reply, ReadResult.failure({:cold_read_failed, reason}), state}
     end
   end
 
   defp reply_cold_meta_value(state, key, value, exp, fid, off, vsize) do
     case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
-      nil -> {:reply, nil, state}
-      materialized -> {:reply, {materialized, exp}, state}
+      {:ok, materialized} -> {:reply, {materialized, exp}, state}
+      {:error, reason} -> {:reply, ReadResult.failure({:cold_read_failed, reason}), state}
     end
   end
 
   defp materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
     case materialize_blob_value(state, value) do
-      {:ok, materialized} ->
+      {:ok, materialized} when materialized != nil ->
         ShardETS.cold_read_warm_ets(state, key, materialized, exp, fid, off, vsize)
-        materialized
+        {:ok, materialized}
 
-      {:error, _reason} ->
-        nil
+      {:ok, nil} ->
+        {:error, :missing_live_cold_entry}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
+
+  defp cold_read_failure({:error, reason}),
+    do: ReadResult.failure({:cold_read_failed, reason})
+
+  defp cold_read_failure({:ok, nil}),
+    do: ReadResult.failure({:cold_read_failed, :missing_live_cold_entry})
+
+  defp cold_read_failure(invalid),
+    do: ReadResult.failure({:cold_read_failed, {:invalid_read_result, invalid}})
 
   defp materialize_blob_value(%{data_dir: data_dir, index: shard_index} = state, value) do
     BlobValue.maybe_materialize(data_dir, shard_index, blob_side_channel_threshold(state), value)
@@ -555,40 +928,21 @@ defmodule Ferricstore.Store.Shard.Reads do
   def live_keys(state) do
     now = HLC.now_ms()
 
-    {live_keys, expired_keys} =
+    {live_keys, expired_entries} =
       :ets.foldl(
         fn
-          {key, value, 0, _lfu, _fid, _off, _vsize}, {live, expired} when value != nil ->
-            {[key | live], expired}
-
-          {key, nil, 0, _lfu, fid, off, vsize}, {live, expired}
-          when valid_cold_location(fid, off, vsize) ->
-            {[key | live], expired}
-
-          {key, nil, 0, _lfu, fid, off, vsize}, {live, expired}
-          when valid_waraft_segment_location(fid, off, vsize) ->
-            {[key | live], expired}
-
-          {key, value, exp, _lfu, _fid, _off, _vsize}, {live, expired}
-          when exp > now and value != nil ->
-            {[key | live], expired}
-
-          {key, nil, exp, _lfu, fid, off, vsize}, {live, expired}
-          when exp > now and valid_cold_location(fid, off, vsize) ->
-            {[key | live], expired}
-
-          {key, nil, exp, _lfu, fid, off, vsize}, {live, expired}
-          when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
-            {[key | live], expired}
+          {_key, _value, exp, _lfu, _fid, _off, _vsize} = entry, {live, expired}
+          when is_integer(exp) and exp > 0 and exp <= now ->
+            {live, [entry | expired]}
 
           {key, _value, _exp, _lfu, _fid, _off, _vsize}, {live, expired} ->
-            {live, [key | expired]}
+            {[key | live], expired}
         end,
         {[], []},
         state.keydir
       )
 
-    Enum.each(expired_keys, &ShardETS.ets_delete_key(state, &1))
+    Enum.each(expired_entries, &ShardETS.delete_exact_entry(state, &1))
     Enum.reject(live_keys, &InternalKey.internal?/1)
   end
 end

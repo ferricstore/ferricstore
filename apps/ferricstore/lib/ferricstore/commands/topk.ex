@@ -9,29 +9,39 @@ defmodule Ferricstore.Commands.TopK do
 
   alias Ferricstore.Bitcask.{Async, NIF}
   alias Ferricstore.Commands.ProbType
+  alias Ferricstore.ProbFile
   alias Ferricstore.Store.Ops
 
   @prob_read_timeout_ms 5_000
   @default_width 8
   @default_depth 7
-  @default_decay 0.9
+  @max_topk_k 100_000
+  @max_topk_cms_counters 1_048_576
+  @max_topk_element_bytes 252
+  @max_int64 9_223_372_036_854_775_807
+  @max_batch_items 10_000
 
   @spec handle_ast(term(), map()) :: term()
   def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
   def handle_ast({tag, _key, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
 
-  def handle_ast({:topk_reserve, key, k, width, depth, decay}, store) do
-    with :ok <- check_not_exists(key, store) do
+  def handle_ast({:topk_reserve, key, k, width, depth}, store) do
+    with :ok <- validate_topk_reserve(k, width, depth),
+         :ok <- check_not_exists(key, store) do
       store
-      |> do_prob_write({:topk_create, key, k, width, depth, decay * 1.0})
+      |> do_prob_write({:topk_create, key, k, width, depth})
       |> maybe_register_topk(store, key)
     end
   end
 
+  def handle_ast({:topk_reserve, _key, _k, _width, _depth, _decay}, _store),
+    do: {:error, "ERR TOPK.RESERVE decay is not supported"}
+
   def handle_ast({:topk_add, args}, store), do: topk_add_args(args, store)
 
   def handle_ast({:topk_incrby, key, pairs}, store) do
-    with :ok <- ProbType.check_expected(key, :topk, store) do
+    with :ok <- validate_topk_pairs(pairs),
+         :ok <- ProbType.check_expected(key, :topk, store) do
       result = do_prob_write(store, {:topk_incrby, key, pairs})
       normalize_result(result)
     end
@@ -47,18 +57,17 @@ defmodule Ferricstore.Commands.TopK do
   def handle(cmd, args, store)
 
   # ---------------------------------------------------------------------------
-  # TOPK.RESERVE key k [width depth decay]
+  # TOPK.RESERVE key k [width depth]
   # ---------------------------------------------------------------------------
 
   def handle("TOPK.RESERVE", [key, k_str], store) do
-    do_reserve(key, k_str, @default_width, @default_depth, @default_decay, store)
+    do_reserve(key, k_str, @default_width, @default_depth, store)
   end
 
-  def handle("TOPK.RESERVE", [key, k_str, width_str, depth_str, decay_str], store) do
+  def handle("TOPK.RESERVE", [key, k_str, width_str, depth_str], store) do
     with {:ok, width} <- parse_pos_integer(width_str, "width"),
-         {:ok, depth} <- parse_pos_integer(depth_str, "depth"),
-         {:ok, decay} <- parse_decay(decay_str) do
-      do_reserve(key, k_str, width, depth, decay, store)
+         {:ok, depth} <- parse_pos_integer(depth_str, "depth") do
+      do_reserve(key, k_str, width, depth, store)
     end
   end
 
@@ -77,8 +86,10 @@ defmodule Ferricstore.Commands.TopK do
   # ---------------------------------------------------------------------------
 
   def handle("TOPK.INCRBY", [key | rest], store) when rest != [] do
-    with :ok <- ProbType.check_expected(key, :topk, store),
-         {:ok, pairs} <- parse_element_count_pairs(rest) do
+    with :ok <- validate_raw_pair_batch(rest),
+         {:ok, pairs} <- parse_element_count_pairs(rest),
+         :ok <- validate_topk_pairs(pairs),
+         :ok <- ProbType.check_expected(key, :topk, store) do
       result = do_prob_write(store, {:topk_incrby, key, pairs})
       normalize_result(result)
     end
@@ -125,7 +136,8 @@ defmodule Ferricstore.Commands.TopK do
   def handle("TOPK.INFO", args, store), do: topk_info_args(args, store)
 
   defp topk_add_args([key | elements], store) when elements != [] do
-    with :ok <- ProbType.check_expected(key, :topk, store) do
+    with :ok <- validate_topk_elements(elements),
+         :ok <- ProbType.check_expected(key, :topk, store) do
       result = do_prob_write(store, {:topk_add, key, elements})
       normalize_result(result)
     end
@@ -136,6 +148,17 @@ defmodule Ferricstore.Commands.TopK do
   end
 
   defp topk_query_args([key | elements], store) when elements != [] do
+    with :ok <- validate_topk_elements(elements),
+         :ok <- topk_read_status(key, store) do
+      do_topk_query(key, elements, store)
+    end
+  end
+
+  defp topk_query_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'topk.query' command"}
+  end
+
+  defp do_topk_query(key, elements, store) do
     path = prob_path(store, key, "topk")
 
     case await_nif(fn proxy, corr_id ->
@@ -155,11 +178,13 @@ defmodule Ferricstore.Commands.TopK do
     end
   end
 
-  defp topk_query_args(_args, _store) do
-    {:error, "ERR wrong number of arguments for 'topk.query' command"}
+  defp topk_list_key(key, store) do
+    with :ok <- topk_read_status(key, store) do
+      do_topk_list(key, store)
+    end
   end
 
-  defp topk_list_key(key, store) do
+  defp do_topk_list(key, store) do
     path = prob_path(store, key, "topk")
 
     case await_nif(fn proxy, corr_id ->
@@ -180,6 +205,17 @@ defmodule Ferricstore.Commands.TopK do
   end
 
   defp topk_count_args([key | elements], store) when elements != [] do
+    with :ok <- validate_topk_elements(elements),
+         :ok <- topk_read_status(key, store) do
+      do_topk_count(key, elements, store)
+    end
+  end
+
+  defp topk_count_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'topk.count' command"}
+  end
+
+  defp do_topk_count(key, elements, store) do
     path = prob_path(store, key, "topk")
 
     case await_nif(fn proxy, corr_id ->
@@ -199,18 +235,24 @@ defmodule Ferricstore.Commands.TopK do
     end
   end
 
-  defp topk_count_args(_args, _store) do
-    {:error, "ERR wrong number of arguments for 'topk.count' command"}
+  defp topk_info_args([key], store) do
+    with :ok <- topk_read_status(key, store) do
+      do_topk_info(key, store)
+    end
   end
 
-  defp topk_info_args([key], store) do
+  defp topk_info_args(_args, _store) do
+    {:error, "ERR wrong number of arguments for 'topk.info' command"}
+  end
+
+  defp do_topk_info(key, store) do
     path = prob_path(store, key, "topk")
 
     case await_nif(fn proxy, corr_id ->
            NIF.topk_file_info_v2_async(proxy, corr_id, path)
          end) do
-      {:ok, {k, width, depth, decay}} ->
-        ["k", k, "width", width, "depth", depth, "decay", decay]
+      {:ok, {k, width, depth}} ->
+        ["k", k, "width", width, "depth", depth]
 
       {:error, "enoent"} ->
         missing_or_wrongtype(key, store, {:error, "ERR TOPK: key does not exist"})
@@ -221,10 +263,6 @@ defmodule Ferricstore.Commands.TopK do
       {:error, reason} ->
         {:error, "ERR TOPK: #{reason}"}
     end
-  end
-
-  defp topk_info_args(_args, _store) do
-    {:error, "ERR wrong number of arguments for 'topk.info' command"}
   end
 
   # ---------------------------------------------------------------------------
@@ -247,6 +285,12 @@ defmodule Ferricstore.Commands.TopK do
   # ---------------------------------------------------------------------------
 
   defp do_list_with_count(key, store) do
+    with :ok <- topk_read_status(key, store) do
+      do_list_with_count_after_type_check(key, store)
+    end
+  end
+
+  defp do_list_with_count_after_type_check(key, store) do
     path = prob_path(store, key, "topk")
 
     # First: get list (async, await)
@@ -277,7 +321,10 @@ defmodule Ferricstore.Commands.TopK do
                NIF.topk_file_count_v2_async(proxy, corr_id, path, items)
              end) do
           {:ok, counts} ->
-            topk_items_with_counts(items, counts, [])
+            case combine_items_counts(items, counts) do
+              {:ok, result} -> result
+              {:error, _message} = error -> error
+            end
 
           {:error, "enoent"} ->
             {:error, "ERR TOPK: key does not exist"}
@@ -291,30 +338,62 @@ defmodule Ferricstore.Commands.TopK do
     end
   end
 
-  defp topk_items_with_counts([item | items], [count | counts], acc) do
+  @doc false
+  @spec combine_items_counts(term(), term()) :: {:ok, list()} | {:error, binary()}
+  def combine_items_counts(items, counts) when is_list(items) and is_list(counts) do
+    topk_items_with_counts(items, counts, [])
+  end
+
+  def combine_items_counts(_items, _counts), do: invalid_count_response()
+
+  defp topk_items_with_counts([item | items], [count | counts], acc)
+       when is_binary(item) and is_integer(count) and count >= 0 do
     topk_items_with_counts(items, counts, [count, item | acc])
   end
 
-  defp topk_items_with_counts(_items, _counts, acc), do: Enum.reverse(acc)
+  defp topk_items_with_counts([], [], acc), do: {:ok, Enum.reverse(acc)}
+  defp topk_items_with_counts(_items, _counts, _acc), do: invalid_count_response()
 
-  defp do_reserve(key, k_str, width, depth, decay, store) do
+  defp invalid_count_response, do: {:error, "ERR TOPK: invalid count response"}
+
+  defp do_reserve(key, k_str, width, depth, store) do
     with {:ok, k} <- parse_pos_integer(k_str, "k"),
+         :ok <- validate_topk_reserve(k, width, depth),
          :ok <- check_not_exists(key, store) do
       store
-      |> do_prob_write({:topk_create, key, k, width, depth, decay * 1.0})
+      |> do_prob_write({:topk_create, key, k, width, depth})
       |> maybe_register_topk(store, key)
     end
   end
 
-  defp maybe_register_topk({:ok, _}, store, key), do: do_register_topk(store, key)
+  defp maybe_register_topk({:ok, _}, store, key) do
+    case do_register_topk(store, key) do
+      :ok ->
+        :ok
+
+      {:error, _reason} = error ->
+        ProbType.rollback_created_file(prob_path(store, key, "topk"))
+        error
+    end
+  end
+
   defp maybe_register_topk(:ok, store, key), do: do_register_topk(store, key)
   defp maybe_register_topk(other, _store, _key), do: other
 
   defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
 
   defp missing_or_wrongtype(key, store, missing_result) do
-    case ProbType.check_expected(key, :topk, store) do
+    case ProbType.check_create(key, :topk, store) do
       :ok -> missing_result
+      {:error, :exists} -> {:error, "ERR TopK tracker file is missing"}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp topk_read_status(key, store) do
+    case ProbType.check_create(key, :topk, store) do
+      {:error, :exists} -> :ok
+      :ok -> {:error, "ERR TOPK: key does not exist"}
       {:error, _} = error -> error
     end
   end
@@ -344,9 +423,8 @@ defmodule Ferricstore.Commands.TopK do
   end
 
   defp prob_path(store, key, ext) do
-    safe = Base.url_encode64(key, padding: false)
     prob_dir = resolve_prob_dir(store, key)
-    Path.join(prob_dir, "#{safe}.#{ext}")
+    ProbFile.path(prob_dir, key, ext)
   end
 
   defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
@@ -378,14 +456,15 @@ defmodule Ferricstore.Commands.TopK do
     end
   end
 
-  defp apply_prob_locally(store, {:topk_create, key, k, width, depth, decay}) do
+  defp apply_prob_locally(store, {:topk_create, key, k, width, depth}) do
     path = prob_path(store, key, "topk")
     dir = Path.dirname(path)
 
     with :ok <- ensure_prob_dir(dir),
-         {:ok, _resource} = result <- NIF.topk_file_create_v2(path, k, width, depth, decay),
-         :ok <- prob_fsync_dir(dir, :prob_file_dir) do
-      result
+         {:ok, _resource} = result <- NIF.topk_file_create_v2(path, k, width, depth) do
+      ProbType.finalize_created_file(path, result, fn ->
+        prob_fsync_dir(dir, :prob_file_dir)
+      end)
     end
   end
 
@@ -427,19 +506,68 @@ defmodule Ferricstore.Commands.TopK do
     end
   end
 
+  defp validate_topk_reserve(k, width, depth)
+       when is_integer(k) and k > 0 and is_integer(width) and width > 0 and is_integer(depth) and
+              depth > 0 do
+    cond do
+      k > @max_topk_k ->
+        {:error, "ERR k must be <= #{@max_topk_k}"}
+
+      width > div(@max_topk_cms_counters, depth) ->
+        {:error, "ERR TopK counter count exceeds #{@max_topk_cms_counters}"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_topk_reserve(_k, _width, _depth),
+    do: {:error, "ERR invalid TopK reserve parameters"}
+
+  defp validate_topk_elements([_ | _] = elements) do
+    with :ok <- validate_batch_count(length(elements)) do
+      if Enum.all?(elements, &(is_binary(&1) and byte_size(&1) <= @max_topk_element_bytes)) do
+        :ok
+      else
+        {:error, "ERR TopK element exceeds #{@max_topk_element_bytes} bytes"}
+      end
+    end
+  end
+
+  defp validate_topk_elements(_elements), do: {:error, "ERR invalid TopK elements"}
+
+  defp validate_topk_pairs([_ | _] = pairs) do
+    with :ok <- validate_batch_count(length(pairs)) do
+      if Enum.all?(pairs, fn
+           {element, count}
+           when is_binary(element) and byte_size(element) <= @max_topk_element_bytes and
+                  is_integer(count) and count > 0 and count <= @max_int64 ->
+             true
+
+           _other ->
+             false
+         end) do
+        :ok
+      else
+        {:error, "ERR TOPK: invalid element/count pairs"}
+      end
+    end
+  end
+
+  defp validate_topk_pairs(_pairs), do: {:error, "ERR TOPK: invalid element/count pairs"}
+
+  defp validate_raw_pair_batch(args), do: validate_batch_count(div(length(args) + 1, 2))
+
+  defp validate_batch_count(count) when count <= @max_batch_items, do: :ok
+
+  defp validate_batch_count(_count),
+    do: {:error, "ERR TopK batch exceeds maximum of #{@max_batch_items} items"}
+
   defp parse_pos_integer(str, label) do
     case Integer.parse(str) do
       {n, ""} when n > 0 -> {:ok, n}
       {_n, ""} -> {:error, "ERR #{label} must be a positive integer"}
       _ -> {:error, "ERR #{label} is not an integer or out of range"}
-    end
-  end
-
-  defp parse_decay(str) do
-    case Float.parse(str) do
-      {f, ""} when f >= 0.0 and f <= 1.0 -> {:ok, f}
-      {_f, ""} -> {:error, "ERR decay must be between 0 and 1"}
-      _ -> {:error, "ERR decay is not a valid number"}
     end
   end
 
@@ -470,7 +598,7 @@ defmodule Ferricstore.Commands.TopK do
 
   defp parse_count(str) do
     case Integer.parse(str) do
-      {count, ""} when count >= 1 -> {:ok, count}
+      {count, ""} when count >= 1 and count <= @max_int64 -> {:ok, count}
       _ -> {:error, "ERR TOPK: invalid count value"}
     end
   end

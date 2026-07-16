@@ -16,6 +16,10 @@ defmodule Ferricstore.PrefixMetricsCache do
   @cache_key :prefix_metrics_text
   @refreshing_key :refreshing
   @default_refresh_interval_ms 5_000
+  @max_metric_prefixes 1_000
+  @max_named_metric_prefixes @max_metric_prefixes - 1
+  @max_metric_prefix_bytes 256
+  @empty_metrics {0, 0, 0, 0}
 
   @doc """
   Starts the prefix metrics cache.
@@ -187,15 +191,11 @@ defmodule Ferricstore.PrefixMetricsCache do
 
   @spec scan_prefix_metrics_text() :: binary()
   defp scan_prefix_metrics_text do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-
     # Aggregate key counts and keydir bytes per prefix across all shards.
     now = System.os_time(:millisecond)
 
-    prefix_data =
-      Enum.reduce(0..(shard_count - 1), %{}, fn i, acc ->
-        table = :"keydir_#{i}"
-
+    metrics =
+      Enum.reduce(keydir_tables(), {:gb_trees.empty(), @empty_metrics}, fn table, acc ->
         try do
           :ets.foldl(
             fn {key, _value, exp, _lfu, _fid, _off, _vsize}, inner_acc ->
@@ -203,10 +203,9 @@ defmodule Ferricstore.PrefixMetricsCache do
               if exp > 0 and exp <= now do
                 inner_acc
               else
-                prefix = Stats.extract_prefix(key)
+                prefix = key |> Stats.extract_prefix() |> metric_prefix()
                 key_bytes = byte_size(key) + 8 + 8 + 64
-                {count, bytes} = Map.get(inner_acc, prefix, {0, 0})
-                Map.put(inner_acc, prefix, {count + 1, bytes + key_bytes})
+                add_prefix_metrics(inner_acc, prefix, {1, key_bytes, 0, 0})
               end
             end,
             acc,
@@ -219,52 +218,128 @@ defmodule Ferricstore.PrefixMetricsCache do
         end
       end)
 
-    hotness_data =
+    metrics =
       try do
-        :ets.tab2list(:ferricstore_hotness)
-        |> Map.new(fn {prefix, hot, cold} -> {prefix, {hot, cold}} end)
+        :ets.foldl(
+          fn {prefix, hot, cold}, acc ->
+            add_prefix_metrics(acc, metric_prefix(prefix), {0, 0, hot, cold})
+          end,
+          metrics,
+          :ferricstore_hotness
+        )
       rescue
-        _ -> %{}
+        _ -> metrics
       catch
-        _, _ -> %{}
+        _, _ -> metrics
       end
 
-    format_prefix_metrics(prefix_data, hotness_data)
+    format_prefix_metrics(metrics)
   end
 
-  @spec format_prefix_metrics(map(), map()) :: binary()
-  defp format_prefix_metrics(prefix_data, hotness_data) do
-    if prefix_data == %{} and hotness_data == %{} do
+  defp keydir_tables do
+    case FerricStore.Instance.get(:default) do
+      %{keydir_refs: refs, shard_count: count}
+      when is_tuple(refs) and is_integer(count) and count > 0 ->
+        available = min(count, tuple_size(refs))
+        if available > 0, do: for(shard <- 0..(available - 1), do: elem(refs, shard)), else: []
+
+      _missing_or_invalid ->
+        []
+    end
+  rescue
+    ArgumentError -> []
+  end
+
+  @spec add_prefix_metrics(
+          {:gb_trees.tree(binary(), tuple()), tuple()},
+          binary(),
+          tuple()
+        ) :: {:gb_trees.tree(binary(), tuple()), tuple()}
+  defp add_prefix_metrics({prefixes, other}, "_other", delta) do
+    {prefixes, add_metrics(other, delta)}
+  end
+
+  defp add_prefix_metrics({prefixes, other}, prefix, delta) do
+    case :gb_trees.lookup(prefix, prefixes) do
+      {:value, metrics} ->
+        {:gb_trees.update(prefix, add_metrics(metrics, delta), prefixes), other}
+
+      :none ->
+        if :gb_trees.size(prefixes) < @max_named_metric_prefixes do
+          {:gb_trees.insert(prefix, delta, prefixes), other}
+        else
+          {largest_prefix, largest_metrics} = :gb_trees.largest(prefixes)
+
+          if prefix < largest_prefix do
+            prefixes = :gb_trees.delete(largest_prefix, prefixes)
+            prefixes = :gb_trees.insert(prefix, delta, prefixes)
+
+            {prefixes, add_metrics(other, largest_metrics)}
+          else
+            {prefixes, add_metrics(other, delta)}
+          end
+        end
+    end
+  end
+
+  @spec add_metrics(tuple(), tuple()) :: tuple()
+  defp add_metrics(
+         {key_count, keydir_bytes, hot_reads, cold_reads},
+         {count_delta, bytes_delta, hot_delta, cold_delta}
+       ) do
+    {
+      key_count + count_delta,
+      keydir_bytes + bytes_delta,
+      hot_reads + hot_delta,
+      cold_reads + cold_delta
+    }
+  end
+
+  defp metric_prefix(prefix) when is_binary(prefix) do
+    if byte_size(prefix) <= @max_metric_prefix_bytes and String.valid?(prefix) do
+      :binary.copy(prefix)
+    else
+      kind = if String.valid?(prefix), do: "long", else: "binary"
+
+      digest =
+        :crypto.hash(:sha256, prefix)
+        |> binary_part(0, 16)
+        |> Base.encode16(case: :lower)
+
+      "_#{kind}_#{byte_size(prefix)}_#{digest}"
+    end
+  end
+
+  @spec format_prefix_metrics({:gb_trees.tree(binary(), tuple()), tuple()}) :: binary()
+  defp format_prefix_metrics({prefixes, other}) do
+    if :gb_trees.is_empty(prefixes) and other == @empty_metrics do
       ""
     else
-      all_prefixes =
-        MapSet.union(
-          MapSet.new(Map.keys(prefix_data)),
-          MapSet.new(Map.keys(hotness_data))
-        )
-        |> Enum.sort()
+      prefix_metrics =
+        if other == @empty_metrics do
+          :gb_trees.to_list(prefixes)
+        else
+          [{"_other", other} | :gb_trees.to_list(prefixes)]
+          |> Enum.sort_by(&elem(&1, 0))
+        end
 
       key_count_samples =
-        Enum.map_join(all_prefixes, "\n", fn prefix ->
-          {count, _bytes} = Map.get(prefix_data, prefix, {0, 0})
+        Enum.map_join(prefix_metrics, "\n", fn {prefix, {count, _bytes, _hot, _cold}} ->
           "ferricstore_prefix_key_count{prefix=\"#{escape_label(prefix)}\"} #{count}"
         end)
 
       keydir_bytes_samples =
-        Enum.map_join(all_prefixes, "\n", fn prefix ->
-          {_count, bytes} = Map.get(prefix_data, prefix, {0, 0})
+        Enum.map_join(prefix_metrics, "\n", fn {prefix, {_count, bytes, _hot, _cold}} ->
           "ferricstore_prefix_keydir_bytes{prefix=\"#{escape_label(prefix)}\"} #{bytes}"
         end)
 
       hot_reads_samples =
-        Enum.map_join(all_prefixes, "\n", fn prefix ->
-          {hot, _cold} = Map.get(hotness_data, prefix, {0, 0})
+        Enum.map_join(prefix_metrics, "\n", fn {prefix, {_count, _bytes, hot, _cold}} ->
           "ferricstore_prefix_hot_reads{prefix=\"#{escape_label(prefix)}\"} #{hot}"
         end)
 
       cold_reads_samples =
-        Enum.map_join(all_prefixes, "\n", fn prefix ->
-          {_hot, cold} = Map.get(hotness_data, prefix, {0, 0})
+        Enum.map_join(prefix_metrics, "\n", fn {prefix, {_count, _bytes, _hot, cold}} ->
           "ferricstore_prefix_cold_reads{prefix=\"#{escape_label(prefix)}\"} #{cold}"
         end)
 

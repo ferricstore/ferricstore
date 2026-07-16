@@ -1,15 +1,17 @@
 defmodule Ferricstore.Flow.ValueStore do
   @moduledoc false
 
+  alias Ferricstore.BatchResult
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Codec
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{BlobValue, ColdRead, Router}
+  alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult, Router}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @max_ref_size 4_096
+  @max_exact_integer 9_007_199_254_740_991
   def value_put(ctx, value, opts \\ [])
 
   def value_put(ctx, value, opts) when is_list(opts) do
@@ -26,7 +28,8 @@ defmodule Ferricstore.Flow.ValueStore do
            {:ok, now} <- optional_now_ms(opts),
            {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms) do
         if is_binary(owner_flow_id) and is_binary(name) do
-          with {:ok, return_mode} <- optional_value_put_return_mode(opts) do
+          with :ok <- reject_named_value_ttl(ttl_ms),
+               {:ok, return_mode} <- optional_value_put_return_mode(opts) do
             attrs =
               named_value_attrs_from_parts(
                 value,
@@ -46,7 +49,8 @@ defmodule Ferricstore.Flow.ValueStore do
 
           with {:ok, return_mode} <- optional_value_put_return_mode(opts),
                :ok <- validate_key_size(ref),
-               expire_at = flow_value_expire_at(now, ttl_ms),
+               now = now || now_ms(),
+               {:ok, expire_at} <- flow_value_expire_at(now, ttl_ms),
                :ok <- Router.put(ctx, ref, Codec.encode_value(value), expire_at) do
             response = %{
               ref: ref,
@@ -76,6 +80,8 @@ defmodule Ferricstore.Flow.ValueStore do
          {:ok, name} <- optional_binary_or_nil(opts, :name, nil),
          :ok <- validate_ref_size(:name, name),
          true <- is_binary(owner_flow_id) and is_binary(name),
+         {:ok, ttl_ms} <- optional_pos_integer_or_nil(opts, :ttl_ms),
+         :ok <- reject_named_value_ttl(ttl_ms),
          {:ok, override?} <- optional_boolean(opts, :override, false),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, return_mode} <- optional_value_put_return_mode(opts) do
@@ -123,41 +129,54 @@ defmodule Ferricstore.Flow.ValueStore do
         _ -> Router.pipeline_write_batch(ctx, commands)
       end
 
-    {results, _remaining_writes} =
-      Enum.map_reduce(prepared, write_results, fn
-        {:ok, attrs}, [:ok | rest] ->
-          {{:ok, shared_value_put_response(attrs)}, rest}
+    map_shared_value_put_results(prepared, write_results)
+  end
 
-        {:ok, attrs}, [{:ok, :ok} | rest] ->
-          {{:ok, shared_value_put_response(attrs)}, rest}
+  def shared_value_put_batch(_ctx, _items), do: [{:error, "ERR flow opts must be a keyword list"}]
 
-        {:ok, _attrs}, [{:error, _reason} = error | rest] ->
-          {error, rest}
+  @doc false
+  def __map_shared_value_put_results_for_test__(prepared, write_results),
+    do: map_shared_value_put_results(prepared, write_results)
 
-        {:ok, _attrs}, [other | rest] ->
-          {{:error, "ERR flow value put failed: #{inspect(other)}"}, rest}
+  defp map_shared_value_put_results(prepared, write_results) do
+    valid_attrs = for {:ok, attrs} <- prepared, do: attrs
 
-        {:ok, _attrs}, [] ->
-          {{:error, "ERR flow value put failed"}, []}
+    case BatchResult.map_exact(valid_attrs, write_results, &map_shared_value_put_result/2) do
+      {:ok, valid_results} -> weave_shared_value_put_results(prepared, valid_results)
+      {:error, _reason} -> shared_value_put_mismatch_results(prepared)
+    end
+  end
 
-        {:error, _reason} = error, writes ->
-          {error, writes}
+  defp map_shared_value_put_result(attrs, result) when result in [:ok, {:ok, :ok}],
+    do: {:ok, shared_value_put_response(attrs)}
+
+  defp map_shared_value_put_result(_attrs, {:error, _reason} = error), do: error
+  defp map_shared_value_put_result(_attrs, _other), do: {:error, "ERR flow value put failed"}
+
+  defp weave_shared_value_put_results(prepared, valid_results) do
+    {results, []} =
+      Enum.map_reduce(prepared, valid_results, fn
+        {:ok, _attrs}, [result | rest] -> {result, rest}
+        {:error, _reason} = error, rest -> {error, rest}
       end)
 
     results
   end
 
-  def shared_value_put_batch(_ctx, _items), do: [{:error, "ERR flow opts must be a keyword list"}]
+  defp shared_value_put_mismatch_results(prepared) do
+    Enum.map(prepared, fn
+      {:ok, _attrs} -> {:error, "ERR flow value put result mismatch"}
+      {:error, _reason} = error -> error
+    end)
+  end
+
   def value_mget(ctx, refs, opts \\ [])
 
   def value_mget(ctx, refs, opts) when is_list(refs) and is_list(opts) do
     with {:ok, max_bytes} <- optional_value_mget_max_bytes(opts) do
       case raw_mget(ctx, refs) do
         values when is_list(values) ->
-          {:ok,
-           refs
-           |> Enum.zip(values)
-           |> Enum.map(fn {ref, value} -> decode_or_omit_value(ref, value, max_bytes) end)}
+          decode_mget_results(refs, values, max_bytes)
 
         {:error, _reason} = error ->
           error
@@ -172,6 +191,25 @@ defmodule Ferricstore.Flow.ValueStore do
     do: {:error, "ERR flow opts must be a keyword list"}
 
   def value_mget(_ctx, _refs, _opts), do: {:error, "ERR flow refs must be a list"}
+
+  @doc false
+  def __decode_mget_results_for_test__(refs, values, max_bytes),
+    do: decode_mget_results(refs, values, max_bytes)
+
+  defp decode_mget_results(refs, values, max_bytes) do
+    case ReadResult.first_failure(values) do
+      nil ->
+        case BatchResult.map_exact(refs, values, fn ref, value ->
+               decode_or_omit_value(ref, value, max_bytes)
+             end) do
+          {:ok, decoded} -> unwrap_decoded_mget_results(decoded)
+          {:error, _reason} -> {:error, "ERR flow value mget result mismatch"}
+        end
+
+      failure ->
+        ReadResult.command_error(failure)
+    end
+  end
 
   defp optional_value_mget_max_bytes(opts) do
     value =
@@ -188,37 +226,98 @@ defmodule Ferricstore.Flow.ValueStore do
     end
   end
 
-  defp decode_or_omit_value(_ref, nil, _max_bytes), do: nil
+  defp decode_or_omit_value(_ref, nil, _max_bytes), do: {:decoded, nil}
 
   defp decode_or_omit_value(ref, value, max_bytes)
        when is_binary(ref) and is_binary(value) and is_integer(max_bytes) and
               byte_size(value) > max_bytes do
-    %{ref: ref, value_omitted: true, value_size: byte_size(value)}
+    {:decoded, %{ref: ref, value_omitted: true, value_size: byte_size(value)}}
   end
 
-  defp decode_or_omit_value(_ref, value, _max_bytes), do: Codec.decode_value(value)
+  defp decode_or_omit_value(_ref, value, _max_bytes) do
+    case Codec.decode_value_result(value) do
+      {:ok, decoded} -> {:decoded, decoded}
+      {:error, :invalid_flow_value} -> :invalid_flow_value
+    end
+  end
+
+  defp unwrap_decoded_mget_results(decoded) do
+    if :invalid_flow_value in decoded do
+      {:error, "ERR invalid flow value"}
+    else
+      {:ok, Enum.map(decoded, fn {:decoded, value} -> value end)}
+    end
+  end
 
   def raw_mget(_ctx, []), do: []
 
   def raw_mget(ctx, refs) do
-    values =
+    fetch_flow_value_refs(ctx, refs, fn flow_refs ->
       Stats.with_cache_tracking_disabled(fn ->
-        Router.batch_get(ctx, refs)
+        Router.batch_get(ctx, flow_refs)
       end)
-
-    flow_value_fill_lmdb_missing(values, ctx, refs)
+    end)
   end
 
   def raw_mget_with_file_refs(_ctx, [], _min_file_ref_size), do: []
 
   def raw_mget_with_file_refs(ctx, refs, min_file_ref_size) do
-    values =
+    fetch_flow_value_refs(ctx, refs, fn flow_refs ->
       Stats.with_cache_tracking_disabled(fn ->
-        Router.batch_get_with_file_refs(ctx, refs, min_file_ref_size)
+        Router.batch_get_with_file_refs(ctx, flow_refs, min_file_ref_size)
       end)
-
-    flow_value_fill_lmdb_missing(values, ctx, refs)
+    end)
   end
+
+  defp fetch_flow_value_refs(ctx, refs, fetch) do
+    if Enum.all?(refs, &Keys.value_key?/1) do
+      refs
+      |> fetch.()
+      |> flow_value_fill_lmdb_missing(ctx, refs)
+    else
+      fetch_filtered_flow_value_refs(ctx, refs, fetch)
+    end
+  end
+
+  defp fetch_filtered_flow_value_refs(ctx, refs, fetch) do
+    {mask, flow_refs} =
+      refs
+      |> Enum.reduce({[], []}, fn ref, {mask, flow_refs} ->
+        if Keys.value_key?(ref) do
+          {[true | mask], [ref | flow_refs]}
+        else
+          {[false | mask], flow_refs}
+        end
+      end)
+      |> then(fn {mask, flow_refs} -> {Enum.reverse(mask), Enum.reverse(flow_refs)} end)
+
+    case flow_refs do
+      [] ->
+        List.duplicate(nil, length(refs))
+
+      flow_refs ->
+        flow_refs
+        |> fetch.()
+        |> flow_value_fill_lmdb_missing(ctx, flow_refs)
+        |> restore_filtered_value_results(mask)
+    end
+  end
+
+  defp restore_filtered_value_results(values, mask) when is_list(values) do
+    if length(values) == Enum.count(mask, & &1) do
+      {restored, []} =
+        Enum.map_reduce(mask, values, fn
+          true, [value | rest] -> {value, rest}
+          false, rest -> {nil, rest}
+        end)
+
+      restored
+    else
+      List.duplicate(nil, length(mask))
+    end
+  end
+
+  defp restore_filtered_value_results(other, _mask), do: other
 
   defp flow_value_fill_lmdb_missing(values, ctx, refs)
        when is_list(values) and is_list(refs) and length(values) == length(refs) do
@@ -462,18 +561,7 @@ defmodule Ferricstore.Flow.ValueStore do
   defp flow_value_read_locator_bytes(_ctx, _shard_index, _key, _file_id, _offset),
     do: {:error, :bad_flow_value_locator}
 
-  defp flow_generated_payload_value_ref?("f:" <> _rest = ref) do
-    case :binary.split(ref, ":v:") do
-      ["f:" <> tag, <<kind, ?:, rest::binary>>]
-      when byte_size(tag) > 0 and kind in [?p, ?r, ?e, ?s] and byte_size(rest) > 0 ->
-        true
-
-      _other ->
-        false
-    end
-  end
-
-  defp flow_generated_payload_value_ref?(_ref), do: false
+  defp flow_generated_payload_value_ref?(ref), do: Keys.value_key?(ref)
 
   defp validate_opts(opts) do
     if Keyword.keyword?(opts), do: :ok, else: {:error, "ERR flow opts must be a keyword list"}
@@ -491,8 +579,8 @@ defmodule Ferricstore.Flow.ValueStore do
   defp optional_binary_or_nil(opts, key, default) do
     case Keyword.get(opts, key, default) do
       nil -> {:ok, nil}
-      value when is_binary(value) -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a string"}
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, "ERR flow #{key} must be a non-empty string"}
     end
   end
 
@@ -515,11 +603,12 @@ defmodule Ferricstore.Flow.ValueStore do
 
   defp optional_now_ms(opts) do
     case Keyword.fetch(opts, :now_ms) do
-      {:ok, value} when is_integer(value) and value >= 0 ->
+      {:ok, value}
+      when is_integer(value) and value >= 0 and value <= @max_exact_integer ->
         {:ok, value}
 
       {:ok, _value} ->
-        {:error, "ERR flow now_ms must be a non-negative integer"}
+        {:error, "ERR flow now_ms must be an exact non-negative integer"}
 
       :error ->
         {:ok, nil}
@@ -529,8 +618,8 @@ defmodule Ferricstore.Flow.ValueStore do
   defp optional_pos_integer_or_nil(opts, key) do
     case Keyword.get(opts, key, nil) do
       nil -> {:ok, nil}
-      value when is_integer(value) and value > 0 -> {:ok, value}
-      _ -> {:error, "ERR flow #{key} must be a positive integer"}
+      value when is_integer(value) and value > 0 and value <= @max_exact_integer -> {:ok, value}
+      _ -> {:error, "ERR flow #{key} must be an exact positive integer"}
     end
   end
 
@@ -544,13 +633,24 @@ defmodule Ferricstore.Flow.ValueStore do
     end
   end
 
+  defp reject_named_value_ttl(nil), do: :ok
+
+  defp reject_named_value_ttl(_ttl_ms),
+    do: {:error, "ERR flow ttl_ms is not supported for named values"}
+
   defp shared_value_ref_id do
     :crypto.strong_rand_bytes(18)
     |> Base.url_encode64(padding: false)
   end
 
-  defp flow_value_expire_at(_now, nil), do: 0
-  defp flow_value_expire_at(now, ttl_ms), do: now + ttl_ms
+  defp flow_value_expire_at(_now, nil), do: {:ok, 0}
+
+  defp flow_value_expire_at(now, ttl_ms)
+       when now <= @max_exact_integer - ttl_ms,
+       do: {:ok, now + ttl_ms}
+
+  defp flow_value_expire_at(_now, _ttl_ms),
+    do: {:error, "ERR flow expiry exceeds the exact integer limit"}
 
   defp shared_value_put_attrs(value, opts) do
     with :ok <- validate_opts(opts),
@@ -567,7 +667,8 @@ defmodule Ferricstore.Flow.ValueStore do
       ref = Keys.value_key(ref_id, :shared, 1, partition_key)
       now = now || now_ms()
 
-      with :ok <- validate_key_size(ref) do
+      with :ok <- validate_key_size(ref),
+           {:ok, expire_at} <- flow_value_expire_at(now, ttl_ms) do
         {:ok,
          %{
            ref: ref,
@@ -575,7 +676,7 @@ defmodule Ferricstore.Flow.ValueStore do
            owner_flow_id: owner_flow_id,
            return: return_mode,
            encoded: Codec.encode_value(value),
-           expire_at: flow_value_expire_at(now, ttl_ms)
+           expire_at: expire_at
          }}
       end
     else

@@ -2,7 +2,9 @@ defmodule Ferricstore.Store.Shard.Flush do
   @moduledoc "Async and sync Bitcask batch flush, file rotation, hint-file writing, and per-file dead-byte fragmentation tracking."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.AppendResult
   alias Ferricstore.Store.BlobValue
+  alias Ferricstore.Store.Promotion
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   require Logger
@@ -33,7 +35,8 @@ defmodule Ferricstore.Store.Shard.Flush do
     with {:ok, batch} <- build_flush_batch(state, raw_batch),
          state <- maybe_rotate_file(state),
          {:ok, locations} <-
-           NIF.v2_append_batch_nosync(state.active_file_path, append_batch(batch)) do
+           NIF.v2_append_batch_nosync(state.active_file_path, append_batch(batch)),
+         :ok <- AppendResult.validate_locations(locations, length(batch)) do
       Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
       # Raise dirty flag so BitcaskCheckpointer picks this up on the
       # next tick. This is the ONLY fsync trigger for the nosync path.
@@ -105,7 +108,8 @@ defmodule Ferricstore.Store.Shard.Flush do
 
     with {:ok, batch} <- build_flush_batch(state, raw_batch),
          state <- maybe_rotate_file(state),
-         {:ok, locations} <- NIF.v2_append_batch(state.active_file_path, append_batch(batch)) do
+         {:ok, locations} <- NIF.v2_append_batch(state.active_file_path, append_batch(batch)),
+         :ok <- AppendResult.validate_locations(locations, length(batch)) do
       Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
       # v2_append_batch fsyncs inside the NIF — we just wrote & fsynced
       # in one call, so clear the checkpoint flag too.
@@ -419,6 +423,23 @@ defmodule Ferricstore.Store.Shard.Flush do
     end
   end
 
+  @doc false
+  def track_delete_dead_bytes_entry(
+        state,
+        {key, _value, _expire_at_ms, _lfu, old_fid, _offset, old_vsize}
+      )
+      when is_integer(old_fid) and old_fid >= 0 and is_integer(old_vsize) and old_vsize >= 0 do
+    dead_increment = old_vsize + @record_header_size + byte_size(key)
+    {old_total, old_dead} = Map.get(state.file_stats, old_fid, {0, 0})
+
+    %{
+      state
+      | file_stats: Map.put(state.file_stats, old_fid, {old_total, old_dead + dead_increment})
+    }
+  end
+
+  def track_delete_dead_bytes_entry(state, _entry), do: state
+
   # Check if any non-active file exceeds fragmentation thresholds and notify
   # the merge scheduler. Cheap: iterates a small map (typically <20 files).
   @spec maybe_notify_fragmentation(map()) :: map()
@@ -475,12 +496,11 @@ defmodule Ferricstore.Store.Shard.Flush do
         file_totals =
           files
           |> Enum.reduce(%{}, fn name, acc ->
-            case regular_log_file_id(name) do
-              nil ->
+            case regular_log_file(shard_path, name) do
+              :skip ->
                 acc
 
-              fid ->
-                size = file_size_or_zero(Path.join(shard_path, name))
+              {:ok, fid, size} ->
                 Map.put(acc, fid, size)
             end
           end)
@@ -524,22 +544,17 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   defp accumulate_live_bytes(acc, _key, _fid, _vsize), do: acc
 
-  defp file_size_or_zero(path) do
-    case File.stat(path) do
-      {:ok, %{size: s}} -> s
-      _ -> 0
-    end
-  end
-
-  defp regular_log_file_id(name) do
+  defp regular_log_file(shard_path, name) do
     with true <- String.ends_with?(name, ".log"),
          false <- String.starts_with?(name, "compact_"),
          stem <- String.trim_trailing(name, ".log"),
          {fid, ""} <- Integer.parse(stem),
-         true <- fid >= 0 do
-      fid
+         true <- fid >= 0,
+         {:ok, %File.Stat{type: :regular, size: size}} <-
+           File.lstat(Path.join(shard_path, name)) do
+      {:ok, fid, size}
     else
-      _ -> nil
+      _ -> :skip
     end
   end
 
@@ -553,7 +568,32 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   @spec maybe_rotate_file(map()) :: map()
   @doc false
+  def maybe_rotate_file(%{compound_promotion_worker: worker} = state)
+      when not is_nil(worker),
+      do: state
+
   def maybe_rotate_file(state) do
+    if state.active_file_size >= state.max_active_file_size do
+      case Promotion.try_acquire_shared_log_latch(state) do
+        :busy ->
+          state
+
+        :none ->
+          do_maybe_rotate_file(state)
+
+        {:ok, latch_token} ->
+          try do
+            do_maybe_rotate_file(state)
+          after
+            Promotion.release_compaction_latch(latch_token)
+          end
+      end
+    else
+      state
+    end
+  end
+
+  defp do_maybe_rotate_file(state) do
     if state.active_file_size >= state.max_active_file_size do
       # Rotation durability handoff
       # (the active-file rotation design):
@@ -585,51 +625,64 @@ defmodule Ferricstore.Store.Shard.Flush do
           #    between touch! and the first append can leave the file
           #    absent on reboot — the next append would create a fresh
           #    one but we'd lose any bytes already buffered in page cache.
-          case Ferricstore.Bitcask.NIF.v2_fsync_dir(sp) do
+          case fsync_rotation_dir(sp) do
             :ok ->
-              :ok
+              :telemetry.execute(
+                [:ferricstore, :bitcask, :rotation_fsync],
+                %{},
+                %{shard_index: state.index, kind: :new_dir, path: sp}
+              )
+
+              if ctx = Map.get(state, :instance_ctx) do
+                Ferricstore.Store.ActiveFile.publish(ctx, state.index, new_id, new_path, sp)
+              end
+
+              Ferricstore.Store.HintBuilder.enqueue(
+                Map.get(state, :instance_ctx),
+                state.index,
+                state.active_file_id,
+                state.active_file_path,
+                sp
+              )
+
+              # Initialize file_stats for the new file
+              new_file_stats = Map.put(state.file_stats, new_id, {0, 0})
+
+              # Notify the merge scheduler that a rotation happened. File ids can
+              # have gaps after compaction deletes old logs, so use tracked live
+              # file count instead of deriving count from the newest id.
+              # Direct cast avoids the Merge.Scheduler → ... → Shard.Flush cycle.
+              try do
+                GenServer.cast(
+                  merge_scheduler_name(Map.get(state, :instance_ctx), state.index),
+                  {:file_rotated, map_size(new_file_stats)}
+                )
+              catch
+                :exit, _ -> :ok
+              end
+
+              state
+              |> Map.merge(%{
+                active_file_id: new_id,
+                active_file_path: new_path,
+                active_file_size: 0,
+                file_stats: new_file_stats
+              })
+              |> Map.delete(:last_rotation_error)
 
             {:error, reason} ->
-              require Logger
+              if ctx = Map.get(state, :instance_ctx) do
+                Ferricstore.Store.DiskPressure.set(ctx, state.index)
+              end
+
+              cleanup_rotation_candidate(new_path)
 
               Logger.warning(
-                "Shard #{state.index}: rotation fsync_dir failed: #{inspect(reason)}"
+                "Shard #{state.index}: rotation fsync_dir failed: #{inspect(reason)}; keeping active file"
               )
+
+              Map.put(state, :last_rotation_error, {:directory_fsync_failed, reason})
           end
-
-          :telemetry.execute(
-            [:ferricstore, :bitcask, :rotation_fsync],
-            %{},
-            %{shard_index: state.index, kind: :new_dir, path: sp}
-          )
-
-          if ctx = Map.get(state, :instance_ctx) do
-            Ferricstore.Store.ActiveFile.publish(ctx, state.index, new_id, new_path, sp)
-          end
-
-          # Initialize file_stats for the new file
-          new_file_stats = Map.put(state.file_stats, new_id, {0, 0})
-
-          # Notify the merge scheduler that a rotation happened. File ids can
-          # have gaps after compaction deletes old logs, so use tracked live
-          # file count instead of deriving count from the newest id.
-          # Direct cast avoids the Merge.Scheduler → ... → Shard.Flush cycle.
-          try do
-            GenServer.cast(
-              merge_scheduler_name(Map.get(state, :instance_ctx), state.index),
-              {:file_rotated, map_size(new_file_stats)}
-            )
-          catch
-            :exit, _ -> :ok
-          end
-
-          %{
-            state
-            | active_file_id: new_id,
-              active_file_path: new_path,
-              active_file_size: 0,
-              file_stats: new_file_stats
-          }
 
         {:error, reason} ->
           if ctx = Map.get(state, :instance_ctx) do
@@ -647,29 +700,33 @@ defmodule Ferricstore.Store.Shard.Flush do
     end
   end
 
-  @spec write_hint_for_file(map(), non_neg_integer()) :: :ok | {:error, term()} | nil
+  defp fsync_rotation_dir(path) do
+    case Process.get(:ferricstore_shard_rotation_fsync_dir_hook) do
+      hook when is_function(hook, 1) -> hook.(path)
+      _ -> Ferricstore.Bitcask.NIF.v2_fsync_dir(path)
+    end
+  end
+
+  defp cleanup_rotation_candidate(path) do
+    case File.rm(path) do
+      :ok ->
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to remove rotation candidate #{path}: #{inspect(reason)}")
+    end
+  end
+
+  @spec write_hint_for_file(map(), non_neg_integer()) :: :ok | {:error, term()}
   @doc false
   def write_hint_for_file(state, target_fid) do
     sp = state.shard_data_path
     hint_path = Path.join(sp, "#{String.pad_leading(Integer.to_string(target_fid), 5, "0")}.hint")
 
-    entries =
-      :ets.foldl(
-        fn {key, _value, exp, _lfu, fid, off, vsize}, acc ->
-          if fid == target_fid do
-            # NIF expects: {key, file_id, offset, value_size, expire_at_ms}
-            [{key, target_fid, off, vsize, exp} | acc]
-          else
-            acc
-          end
-        end,
-        [],
-        state.keydir
-      )
-
-    if entries != [] do
-      NIF.v2_write_hint_file(hint_path, entries)
-    end
+    Ferricstore.Store.HintFile.write_from_keydir(hint_path, state.keydir, target_fid)
   end
 
   # -------------------------------------------------------------------

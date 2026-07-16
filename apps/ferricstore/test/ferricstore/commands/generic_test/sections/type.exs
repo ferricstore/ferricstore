@@ -333,6 +333,69 @@ defmodule Ferricstore.Commands.GenericTest.Sections.Type do
           refute_receive {:compound_batch_put, _}
         end
 
+        @tag :generic_snapshot_failure
+        test "COPY REPLACE reads the complete compound source before deleting destination" do
+          base = MockStore.make(%{"dst" => {"old", 0}})
+          assert 1 == Hash.handle("HSET", ["src", "field", "new"], base)
+          failure = Ferricstore.Store.ReadResult.failure(:missing_file)
+
+          store =
+            base
+            |> Map.put(:compound_batch_get_meta, fn
+              "src", compound_keys -> Enum.map(compound_keys, fn _key -> failure end)
+              key, compound_keys -> base.compound_batch_get_meta.(key, compound_keys)
+            end)
+            |> Map.put(:delete, fn _key ->
+              flunk("COPY must not delete before the source snapshot is complete")
+            end)
+            |> Map.put(:compound_delete, fn _key, _compound_key ->
+              flunk("COPY must not delete before the source snapshot is complete")
+            end)
+            |> Map.put(:compound_delete_prefix, fn _key, _prefix ->
+              flunk("COPY must not delete before the source snapshot is complete")
+            end)
+            |> Map.put(:compound_batch_put, fn _key, _entries ->
+              flunk("COPY must not write an incomplete source snapshot")
+            end)
+
+          assert {:error, "ERR storage read failed"} ==
+                   Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
+
+          assert "old" == base.get.("dst")
+        end
+
+        @tag :generic_snapshot_failure
+        test "COPY REPLACE does not mutate an incompletely snapshotted destination" do
+          base = MockStore.make()
+          assert 1 == Hash.handle("HSET", ["src", "field", "new"], base)
+          assert 1 == Hash.handle("HSET", ["dst", "field", "old"], base)
+          failure = Ferricstore.Store.ReadResult.failure(:missing_file)
+
+          store =
+            base
+            |> Map.put(:compound_batch_get_meta, fn
+              "dst", compound_keys -> Enum.map(compound_keys, fn _key -> failure end)
+              key, compound_keys -> base.compound_batch_get_meta.(key, compound_keys)
+            end)
+            |> Map.put(:delete, fn _key ->
+              flunk("COPY must not delete before the destination snapshot is complete")
+            end)
+            |> Map.put(:compound_delete, fn _key, _compound_key ->
+              flunk("COPY must not delete before the destination snapshot is complete")
+            end)
+            |> Map.put(:compound_delete_prefix, fn _key, _prefix ->
+              flunk("COPY must not delete before the destination snapshot is complete")
+            end)
+            |> Map.put(:compound_batch_put, fn "dst", _entries ->
+              flunk("COPY must not write before the destination snapshot is complete")
+            end)
+
+          assert {:error, "ERR storage read failed"} ==
+                   Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
+
+          assert "old" == Hash.handle("HGET", ["dst", "field"], base)
+        end
+
         test "COPY preserves stream consumer groups" do
           Stream.ensure_meta_table()
           store = MockStore.make()

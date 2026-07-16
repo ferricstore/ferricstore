@@ -89,8 +89,8 @@ defmodule FerricStore.API.Flow do
   @doc """
   Atomically creates child Flow records under `parent_id`.
 
-  v1 requires a single `partition_key`, so parent and children are coordinated by
-  one shard. `wait: :none` advances the parent immediately to
+  The command requires a single `partition_key`, so parent and children are
+  coordinated by one shard. `wait: :none` advances the parent immediately to
   `exhaust_to.success`; `wait: :all` keeps the parent in `wait_state` until all
   direct children are terminal.
   """
@@ -116,8 +116,8 @@ defmodule FerricStore.API.Flow do
 
   By default this returns metadata and value references only. Pass `full: true`
   or `payload: true` to hydrate the current payload/result/error values from
-  internal storage up to `:payload_max_bytes` (default
-  `:flow_payload_return_max_bytes`, 64 KiB). Larger values return
+  internal storage up to `:payload_max_bytes`, capped by the
+  `:flow_payload_return_max_bytes` application limit (64 KiB by default). Larger values return
   `:payload_omitted`/`:result_omitted`/`:error_omitted` with the stored size.
   """
   @spec flow_get(binary(), keyword()) :: {:ok, map() | nil} | {:error, binary()}
@@ -201,7 +201,8 @@ defmodule FerricStore.API.Flow do
   def flow_reclaim(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc "Extends a running Flow lease when `lease_token` and `fencing_token` match."
-  @spec flow_extend_lease(binary(), binary(), keyword()) :: {:ok, map()} | {:error, binary()}
+  @spec flow_extend_lease(binary(), binary(), keyword()) ::
+          :ok | {:ok, map()} | {:error, binary()}
   def flow_extend_lease(id, lease_token, opts \\ [])
 
   def flow_extend_lease(id, lease_token, opts)

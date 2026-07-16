@@ -135,6 +135,51 @@
     }
 
     #[test]
+    fn complete_header_rejects_a_truncated_bit_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_bits.bloom");
+        let mut header = [0u8; HEADER_SIZE];
+        header[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        header[8..16].copy_from_slice(&64u64.to_le_bytes());
+        header[16..20].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        assert!(file_read_header(&File::open(path).unwrap()).is_err());
+    }
+
+    #[test]
+    fn header_rejects_nonzero_reserved_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reserved.bloom");
+        let mut data = [0u8; HEADER_SIZE + 1];
+        data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        data[8..16].copy_from_slice(&8u64.to_le_bytes());
+        data[16..20].copy_from_slice(&1u32.to_le_bytes());
+        data[20] = 1;
+        std::fs::write(&path, data).unwrap();
+
+        let error = file_read_header(&File::open(path).unwrap()).unwrap_err();
+
+        assert!(error.contains("reserved"));
+    }
+
+    #[test]
+    fn header_rejects_count_larger_than_the_bit_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("impossible_count.bloom");
+        let mut data = [0u8; HEADER_SIZE + 1];
+        data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        data[8..16].copy_from_slice(&8u64.to_le_bytes());
+        data[16..20].copy_from_slice(&1u32.to_le_bytes());
+        data[24..32].copy_from_slice(&9u64.to_le_bytes());
+        std::fs::write(&path, data).unwrap();
+
+        let error = file_read_header(&File::open(path).unwrap()).unwrap_err();
+
+        assert!(error.contains("count"));
+    }
+
+    #[test]
     fn read_exact_at_rejects_short_bitset() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("short_bitset.bloom");
@@ -176,6 +221,31 @@
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("num_bits"));
+    }
+
+    #[test]
+    fn bloom_size_rejects_bit_arrays_above_the_native_resource_ceiling() {
+        assert!(bloom_file_size(MAX_BLOOM_BITS).is_ok());
+
+        let error = bloom_file_size(MAX_BLOOM_BITS + 1).unwrap_err();
+
+        assert!(error.contains("exceeds"));
+    }
+
+    #[test]
+    fn header_rejects_bit_arrays_above_the_native_resource_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized_bits.bloom");
+        let mut data = [0u8; HEADER_SIZE];
+        data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        data[8..16].copy_from_slice(&(MAX_BLOOM_BITS + 1).to_le_bytes());
+        data[16..20].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, data).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let error = file_read_header(&file).unwrap_err();
+
+        assert!(error.contains("exceeds"));
     }
 
     #[test]

@@ -6,10 +6,9 @@
 ///
 /// ## Scheduler contract
 ///
-/// Runs on a Normal scheduler to avoid dirty-scheduler starvation. Hot paths
-/// should prefer the async/Tokio APIs when disk or kernel backpressure is
-/// expected.
-#[rustler::nif(schedule = "Normal")]
+/// Runs on a dirty I/O scheduler because page-cache writes may still block
+/// under filesystem or memory pressure.
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_batch_nosync<'a>(
     env: Env<'a>,
@@ -40,7 +39,7 @@ fn v2_append_batch_nosync<'a>(
 
 /// Append a mixed batch of put and delete records **without** fsync.
 /// Returns `{:ok, [{:put, offset, value_size} | {:delete, offset, record_size}, ...]}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_ops_batch_nosync<'a>(
     env: Env<'a>,
@@ -90,42 +89,124 @@ fn v2_append_ops_batch_nosync<'a>(
     }
 }
 
+/// Append a mixed batch of put and delete records and fsync it under the same
+/// per-file append lock. On any append or fsync error the writer restores the
+/// original file length before returning an error.
+/// Returns `{:ok, [{:put, offset, value_size} | {:delete, offset, record_size}, ...]}`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_append_ops_batch<'a>(
+    env: Env<'a>,
+    path: String,
+    records: Vec<NifBatchWrite<'a>>,
+) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+    let file_id = parse_file_id(p);
+
+    match log::LogWriter::open(p, file_id) {
+        Ok(mut writer) => {
+            let entries: Vec<log::BatchWrite<'_>> = records
+                .iter()
+                .map(|record| match record {
+                    NifBatchWrite::Put(key, value, expire_at_ms) => log::BatchWrite::Put {
+                        key: key.as_slice(),
+                        value: value.as_slice(),
+                        expire_at_ms: *expire_at_ms,
+                    },
+                    NifBatchWrite::Delete(key) => log::BatchWrite::Delete {
+                        key: key.as_slice(),
+                    },
+                })
+                .collect();
+
+            match writer.write_ops_batch(&entries) {
+                Ok(results) => {
+                    let tuples: Vec<Term<'a>> = results
+                        .into_iter()
+                        .map(|result| match result {
+                            log::BatchWriteResult::Put { offset, value_len } => {
+                                (atoms::put(), offset, value_len).encode(env)
+                            }
+                            log::BatchWriteResult::Delete {
+                                offset,
+                                record_size,
+                            } => (atoms::delete(), offset, record_size).encode(env),
+                        })
+                        .collect();
+
+                    Ok((atoms::ok(), tuples).encode(env))
+                }
+                Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+            }
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
 fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
-    let stores = LMDB_STORES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-
-    let mut guard = stores
-        .lock()
-        .map_err(|_| "lmdb cache poisoned".to_string())?;
-
-    std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    crate::fs_nif::create_dir_all_nofollow(std::path::Path::new(path))
+        .map_err(|e| e.to_string())?;
     let cache_key = std::fs::canonicalize(path)
         .map_err(|e| e.to_string())?
         .to_string_lossy()
         .into_owned();
-
-    if let Some(store) = guard.get(&cache_key) {
-        return Ok(Arc::clone(store));
-    }
-
     let map_size = usize::try_from(map_size).map_err(|_| "lmdb map_size too large".to_string())?;
+    let stores = LMDB_STORES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let cell = {
+        let mut guard = stores
+            .lock()
+            .map_err(|_| "lmdb cache poisoned".to_string())?;
+        Arc::clone(
+            guard
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(OnceLock::new())),
+        )
+    };
 
+    let initialized = cell.get_or_init(|| initialize_lmdb_store(&cache_key, map_size));
+    match initialized {
+        Ok(store) if store.map_size == map_size => Ok(Arc::clone(store)),
+        Ok(store) => Err(format!(
+            "lmdb map_size mismatch for {cache_key}: cached={}, requested={map_size}; release the environment before changing map_size",
+            store.map_size
+        )),
+        Err(error) => {
+            if let Ok(mut guard) = stores.lock() {
+                if guard
+                    .get(&cache_key)
+                    .is_some_and(|cached| Arc::ptr_eq(cached, &cell))
+                {
+                    guard.remove(&cache_key);
+                }
+            }
+            Err(error.clone())
+        }
+    }
+}
+
+fn initialize_lmdb_store(cache_key: &str, map_size: usize) -> Result<Arc<LmdbStore>, String> {
     let mut env_options = heed::EnvOpenOptions::new();
     env_options.map_size(map_size).max_dbs(4);
     unsafe {
         env_options.flags(heed::EnvFlags::NO_READ_AHEAD);
     }
 
-    let env = unsafe { env_options.open(&cache_key).map_err(|e| e.to_string())? };
-
+    let env = unsafe { env_options.open(cache_key).map_err(|e| e.to_string())? };
     let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
     let db = env
         .create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("flow_state"))
         .map_err(|e| e.to_string())?;
     wtxn.commit().map_err(|e| e.to_string())?;
 
-    let store = Arc::new(LmdbStore { env, db });
-    guard.insert(cache_key, Arc::clone(&store));
-    Ok(store)
+    Ok(Arc::new(LmdbStore { env, db, map_size }))
+}
+
+fn lmdb_store_cell_busy(cell: &Arc<LmdbStoreCell>) -> bool {
+    Arc::strong_count(cell) > 1
+        || cell
+            .get()
+            .and_then(|result| result.as_ref().ok())
+            .is_some_and(|store| Arc::strong_count(store) > 1)
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -571,7 +652,7 @@ fn lmdb_prefix_entries_reverse_before<'a>(
             } else {
                 let range = (
                     std::ops::Bound::Unbounded,
-                    std::ops::Bound::Included(before_key.as_slice()),
+                    std::ops::Bound::Excluded(before_key.as_slice()),
                 );
                 let iter = match store.db.rev_range(&rtxn, &range) {
                     Ok(iter) => iter,
@@ -654,7 +735,7 @@ fn lmdb_release_all<'a>(env: Env<'a>) -> NifResult<Term<'a>> {
 
     let busy = guard
         .values()
-        .filter(|store| Arc::strong_count(store) > 1)
+        .filter(|cell| lmdb_store_cell_busy(cell))
         .count();
 
     if busy > 0 {
@@ -685,7 +766,7 @@ fn lmdb_release<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
 
     if guard
         .get(&cache_key)
-        .is_some_and(|store| Arc::strong_count(store) > 1)
+        .is_some_and(lmdb_store_cell_busy)
     {
         return Ok((atoms::busy(), 1usize).encode(env));
     }
@@ -719,7 +800,9 @@ fn lmdb_write_batch_impl<'a>(
                 let key = match record {
                     LmdbBatchWrite::Put(key, _)
                     | LmdbBatchWrite::PutNew(key, _)
-                    | LmdbBatchWrite::Delete(key) => key.as_slice(),
+                    | LmdbBatchWrite::Delete(key)
+                    | LmdbBatchWrite::Compare(key, _)
+                    | LmdbBatchWrite::CompareMissing(key) => key.as_slice(),
                 };
 
                 if return_originals && seen.insert(key.to_vec()) {
@@ -744,6 +827,32 @@ fn lmdb_write_batch_impl<'a>(
                     },
                     LmdbBatchWrite::Delete(key) => {
                         store.db.delete(&mut wtxn, key.as_slice()).map(|_| ())
+                    }
+                    LmdbBatchWrite::Compare(key, expected) => {
+                        match store.db.get(&wtxn, key.as_slice()) {
+                            Ok(Some(current)) if current == expected.as_slice() => Ok(()),
+                            Ok(_) => {
+                                let key_term = binary_term(env, key.as_slice())?;
+
+                                return Ok(
+                                    (atoms::error(), (atoms::compare_failed(), key_term)).encode(env)
+                                );
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    LmdbBatchWrite::CompareMissing(key) => {
+                        match store.db.get(&wtxn, key.as_slice()) {
+                            Ok(None) => Ok(()),
+                            Ok(Some(_)) => {
+                                let key_term = binary_term(env, key.as_slice())?;
+
+                                return Ok(
+                                    (atoms::error(), (atoms::compare_failed(), key_term)).encode(env)
+                                );
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
                 };
 
@@ -782,7 +891,9 @@ fn lmdb_record_key<'a>(record: &'a LmdbBatchWrite<'_>) -> &'a [u8] {
     match record {
         LmdbBatchWrite::Put(key, _)
         | LmdbBatchWrite::PutNew(key, _)
-        | LmdbBatchWrite::Delete(key) => key.as_slice(),
+        | LmdbBatchWrite::Delete(key)
+        | LmdbBatchWrite::Compare(key, _)
+        | LmdbBatchWrite::CompareMissing(key) => key.as_slice(),
     }
 }
 

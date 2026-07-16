@@ -23,6 +23,74 @@ defmodule Ferricstore.FlowGovernanceCacheSessionStoreTest do
     :ok
   end
 
+  test "session heads reject trailing external-term bytes" do
+    ctx = FerricStore.Instance.get(:default)
+    node_id = unique_flow_id("cache-head-canonical-node")
+    instance_name = unique_flow_id("cache-head-canonical-instance")
+
+    assert {:ok, _session} =
+             CacheSessionStore.open(ctx, node_id: node_id, instance_name: instance_name)
+
+    head_key = Keys.governance_limit_cache_session_head_key(node_id, instance_name)
+    value = Router.get(ctx, head_key)
+    assert :ok = Router.put(ctx, head_key, value <> <<0>>, 0)
+
+    assert {:error, :cache_session_head_corrupt} =
+             CacheSessionStore.open(ctx, node_id: node_id, instance_name: instance_name)
+  end
+
+  test "session manifests reject trailing external-term bytes" do
+    ctx = FerricStore.Instance.get(:default)
+    node_id = unique_flow_id("cache-meta-canonical-node")
+    instance_name = unique_flow_id("cache-meta-canonical-instance")
+
+    assert {:ok, session} =
+             CacheSessionStore.open(ctx, node_id: node_id, instance_name: instance_name)
+
+    meta_key =
+      Keys.governance_limit_cache_session_meta_key(node_id, instance_name, session.session_id)
+
+    value = Router.get(ctx, meta_key)
+    assert :ok = Router.put(ctx, meta_key, value <> <<0>>, 0)
+
+    assert {:error, :cache_session_manifest_corrupt} =
+             CacheSessionStore.manifest_bounds(ctx, session)
+  end
+
+  test "session pages reject trailing external-term bytes" do
+    ctx = FerricStore.Instance.get(:default)
+    node_id = unique_flow_id("cache-page-canonical-node")
+    instance_name = unique_flow_id("cache-page-canonical-instance")
+
+    assert {:ok, session} =
+             CacheSessionStore.open(ctx, node_id: node_id, instance_name: instance_name)
+
+    assert {:ok, [page]} =
+             CacheSessionStore.persist_prefetch(
+               ctx,
+               session,
+               "canonical-page-scope",
+               0,
+               ["canonical-page-reservation"],
+               page_size: 1,
+               expires_at_ms: 11_001
+             )
+
+    page_key =
+      Keys.governance_limit_cache_session_page_key(
+        node_id,
+        instance_name,
+        session.session_id,
+        page.sequence
+      )
+
+    value = Router.get(ctx, page_key)
+    assert :ok = Router.put(ctx, page_key, value <> <<0>>, 0)
+
+    assert {:error, :cache_session_page_corrupt} =
+             CacheSessionStore.activate_page(ctx, session, page)
+  end
+
   test "power loss before activation releases every durably proven-unused page" do
     ctx = FerricStore.Instance.get(:default)
     scope = unique_flow_id("cache-session-unused")

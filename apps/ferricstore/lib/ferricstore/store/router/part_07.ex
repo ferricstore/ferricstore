@@ -1207,11 +1207,7 @@ defmodule Ferricstore.Store.Router.Part07 do
 
           valid_results = flow_transition_batch_valid_results(ctx, valid)
 
-          indexed_results =
-            valid
-            |> Enum.map(fn {idx, _key, _cmd} -> idx end)
-            |> Enum.zip(valid_results)
-            |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+          indexed_results = merge_flow_batch_results(valid, indexed_results, valid_results)
 
           for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
         else
@@ -1282,11 +1278,7 @@ defmodule Ferricstore.Store.Router.Part07 do
           valid = Enum.reverse(valid)
           valid_results = flow_step_continue_batch_valid_results(ctx, valid)
 
-          indexed_results =
-            valid
-            |> Enum.map(fn {idx, _key, _cmd} -> idx end)
-            |> Enum.zip(valid_results)
-            |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+          indexed_results = merge_flow_batch_results(valid, indexed_results, valid_results)
 
           for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
         else
@@ -1361,11 +1353,7 @@ defmodule Ferricstore.Store.Router.Part07 do
           valid = Enum.reverse(valid)
           valid_results = flow_signal_batch_valid_results(ctx, valid)
 
-          indexed_results =
-            valid
-            |> Enum.map(fn {idx, _key, _cmd} -> idx end)
-            |> Enum.zip(valid_results)
-            |> Enum.reduce(indexed_results, fn {idx, result}, acc -> Map.put(acc, idx, result) end)
+          indexed_results = merge_flow_batch_results(valid, indexed_results, valid_results)
 
           for idx <- 0..(length(attrs_list) - 1), do: Map.fetch!(indexed_results, idx)
         else

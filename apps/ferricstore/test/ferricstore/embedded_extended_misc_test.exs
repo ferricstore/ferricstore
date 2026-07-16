@@ -538,9 +538,12 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
   describe "fetch_or_compute/2 and fetch_or_compute_result/3" do
     test "returns :compute on cache miss, then :hit after storing" do
       case FerricStore.fetch_or_compute("foc:key", ttl: 60_000) do
-        {:ok, {:compute, _hint}} ->
+        {:ok, {:compute, _hint, token}} ->
           assert :ok =
-                   FerricStore.fetch_or_compute_result("foc:key", "computed_value", ttl: 60_000)
+                   FerricStore.fetch_or_compute_result("foc:key", "computed_value",
+                     token: token,
+                     ttl: 60_000
+                   )
 
           case FerricStore.fetch_or_compute("foc:key", ttl: 60_000) do
             {:ok, {:hit, value}} ->

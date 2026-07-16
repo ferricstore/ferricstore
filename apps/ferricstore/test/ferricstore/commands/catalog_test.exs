@@ -10,7 +10,7 @@ defmodule Ferricstore.Commands.CatalogTest do
 
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.Catalog
+  alias Ferricstore.Commands.{Catalog, Extension, NativeAstParser, Server}
 
   # ---------------------------------------------------------------------------
   # all/0 — structural validation of every entry
@@ -164,6 +164,31 @@ defmodule Ferricstore.Commands.CatalogTest do
     test "all names are lowercase" do
       for name <- Catalog.names() do
         assert name == String.downcase(name)
+      end
+    end
+
+    test "is the single built-in inventory used by the native parser" do
+      catalog_names = Catalog.names() |> Enum.map(&String.upcase/1) |> MapSet.new()
+      extension_names = Extension.command_names_upper()
+
+      assert NativeAstParser.supported_command_names() ==
+               MapSet.union(catalog_names, extension_names)
+    end
+
+    test "includes every implemented command family in COMMAND replies" do
+      representatives = ~w(
+        APPEND LPUSH HSET SADD ZADD SETBIT XADD GEOADD PFADD BF.RESERVE
+        CF.RESERVE CMS.INITBYDIM TOPK.RESERVE CAS CLUSTER.HEALTH MEMORY
+      )
+
+      listed = Server.handle("COMMAND", ["LIST"], %{}) |> MapSet.new()
+      assert Server.handle("COMMAND", ["COUNT"], %{}) == MapSet.size(listed)
+
+      for name <- representatives do
+        lower = String.downcase(name)
+        assert MapSet.member?(listed, lower), "COMMAND LIST omitted #{name}"
+        assert [entry] = Server.handle("COMMAND", ["INFO", name], %{})
+        assert [^lower, _arity, _flags, _first, _last, _step] = entry
       end
     end
   end
@@ -363,7 +388,7 @@ defmodule Ferricstore.Commands.CatalogTest do
                  "30000"
                ])
 
-      assert {:ok, ["tenant:a:schedule"]} =
+      assert {:ok, ["*"]} =
                Catalog.get_keys("FLOW.SCHEDULE.GET", ["tenant:a:schedule"])
 
       assert {:ok, ["tenant:a:scope"]} =

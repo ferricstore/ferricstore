@@ -720,12 +720,12 @@ defmodule Ferricstore.Commands.SortedSetTest.Sections.Zpopmin do
                    SortedSet.handle_ast({:zscan, "zs", -1, []}, store)
         end
 
-        test "ZSCAN with very large cursor returns cursor 0 and empty list" do
+        test "ZSCAN rejects numeric offset cursors" do
           store = MockStore.make()
           SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
-          [cursor, elements] = SortedSet.handle("ZSCAN", ["zs", "999999"], store)
-          assert cursor == "0"
-          assert elements == []
+
+          assert {:error, "ERR invalid cursor"} =
+                   SortedSet.handle("ZSCAN", ["zs", "999999"], store)
         end
 
         test "ZSCAN with COUNT 0 returns error" do

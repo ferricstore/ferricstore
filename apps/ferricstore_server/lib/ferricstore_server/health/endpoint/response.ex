@@ -28,6 +28,8 @@ defmodule FerricstoreServer.Health.Endpoint.Response do
                                        "; "
                                      )
 
+  @header_name_punctuation ~c"!#$%&'*+-.^_`|~"
+
   @spec send_response(:inet.socket(), module(), pos_integer(), String.t(), String.t()) :: :ok
   def send_response(socket, transport, status_code, status_text, body) do
     send_response(socket, transport, status_code, status_text, "application/json", body)
@@ -87,6 +89,7 @@ defmodule FerricstoreServer.Health.Endpoint.Response do
 
   @spec send_redirect_response(:inet.socket(), module(), binary(), [{binary(), binary()}]) :: :ok
   def send_redirect_response(socket, transport, location, extra_headers) do
+    location = validate_header_value!(location)
     body = ""
     headers = encode_http_headers(common_security_headers() ++ extra_headers)
 
@@ -124,6 +127,8 @@ defmodule FerricstoreServer.Health.Endpoint.Response do
          body,
          extra_headers
        ) do
+    status_text = validate_header_value!(status_text)
+    content_type = validate_header_value!(content_type)
     content_length = byte_size(body)
     headers = encode_http_headers(security_headers(content_type) ++ extra_headers)
 
@@ -141,8 +146,43 @@ defmodule FerricstoreServer.Health.Endpoint.Response do
   end
 
   defp encode_http_headers(headers) do
-    Enum.map_join(headers, "", fn {name, value} -> "#{name}: #{value}\r\n" end)
+    Enum.map_join(headers, "", fn {name, value} ->
+      name = validate_header_name!(name)
+      value = validate_header_value!(value)
+      "#{name}: #{value}\r\n"
+    end)
   end
+
+  defp validate_header_name!(name) when is_binary(name) and byte_size(name) > 0 do
+    if valid_header_name?(name), do: name, else: raise(ArgumentError, "invalid HTTP header name")
+  end
+
+  defp validate_header_name!(_name), do: raise(ArgumentError, "invalid HTTP header name")
+
+  defp valid_header_name?(<<>>), do: true
+
+  defp valid_header_name?(<<byte, rest::binary>>)
+       when byte in ?0..?9 or byte in ?A..?Z or byte in ?a..?z or
+              byte in @header_name_punctuation,
+       do: valid_header_name?(rest)
+
+  defp valid_header_name?(_name), do: false
+
+  defp validate_header_value!(value) when is_binary(value) do
+    if valid_header_value?(value),
+      do: value,
+      else: raise(ArgumentError, "invalid HTTP header value")
+  end
+
+  defp validate_header_value!(_value), do: raise(ArgumentError, "invalid HTTP header value")
+
+  defp valid_header_value?(<<>>), do: true
+
+  defp valid_header_value?(<<byte, rest::binary>>)
+       when byte == ?\t or (byte >= 32 and byte != 127),
+       do: valid_header_value?(rest)
+
+  defp valid_header_value?(_value), do: false
 
   defp security_headers("text/html" <> _rest) do
     [

@@ -68,6 +68,60 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
                Ferricstore.Transaction.Coordinator.execute([{"GET", [key]}], %{}, nil)
     end
 
+    test "production coordinator rejects raw tuples even when they contain an AST", %{same1: key} do
+      assert {:error, "ERR invalid transaction command"} =
+               Ferricstore.Transaction.Coordinator.execute(
+                 [{"GET", [key], {:get, key}}],
+                 %{},
+                 nil
+               )
+    end
+
+    test "production coordinator rejects commands that cannot run in replicated apply" do
+      for {command, args} <- [
+            {"PUBLISH", ["tx-channel", "must-not-publish"]},
+            {"KEY_INFO", ["tx-key-info"]},
+            {"FETCH_OR_COMPUTE", ["tx-fetch", "1000"]},
+            {"SPOP", ["tx-random-set"]},
+            {"BF.ADD", ["tx-bloom", "member"]}
+          ] do
+        assert {:ok, prepared} = PreparedCommand.prepare(command, args)
+
+        expected =
+          "ERR command '#{String.downcase(command)}' is not supported inside transactions"
+
+        assert {:error, ^expected} =
+                 Ferricstore.Transaction.Coordinator.execute([prepared], %{}, nil)
+      end
+    end
+
+    @tag :transaction_native_router_escape
+    test "rejects native mutations before they can route out of replicated apply" do
+      ctx = FerricStore.Instance.get(:default)
+      cas_key = "{native-tx}:cas"
+      untouched_keys = Enum.map(["lock", "unlock", "extend", "ratelimit"], &"{native-tx}:#{&1}")
+      :ok = Router.put(ctx, cas_key, "old", 0)
+
+      for {command, args} <- [
+            {"CAS", [cas_key, "old", "new"]},
+            {"LOCK", [Enum.at(untouched_keys, 0), "owner", "1000"]},
+            {"UNLOCK", [Enum.at(untouched_keys, 1), "owner"]},
+            {"EXTEND", [Enum.at(untouched_keys, 2), "owner", "1000"]},
+            {"RATELIMIT.ADD", [Enum.at(untouched_keys, 3), "1000", "10", "1"]}
+          ] do
+        assert {:ok, prepared} = PreparedCommand.prepare(command, args)
+
+        assert {:error, reason} =
+                 Ferricstore.Transaction.Coordinator.execute([prepared], %{}, nil)
+
+        assert reason ==
+                 "ERR command '#{String.downcase(command)}' is not supported inside transactions"
+      end
+
+      assert Router.get(ctx, cas_key) == "old"
+      assert Enum.all?(untouched_keys, &(Router.get(ctx, &1) == nil))
+    end
+
     test "executes when all commands target the same shard", %{same1: s1, same2: s2} do
       queue = [{"SET", [s1, "100"]}, {"SET", [s2, "200"]}, {"GET", [s1]}]
 
@@ -176,11 +230,169 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
 
       assert result == [1, large, ["field", large]]
     end
+
+    @tag :transaction_compound_member_index
+    test "committed hash mutations publish compound member-index updates", %{same1: shard_seed} do
+      suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+      key = "#{shard_seed}:tx-hash-index:#{suffix}"
+      prefix = Ferricstore.Store.CompoundKey.hash_prefix(key)
+
+      assert :ok = FerricStore.hset(key, %{"baseline" => "old"})
+      assert {:ok, %{"baseline" => "old"}} = FerricStore.hgetall(key)
+
+      ctx = FerricStore.Instance.get(:default)
+      shard_index = Router.shard_for(ctx, key)
+
+      member_index =
+        Ferricstore.Store.Shard.CompoundMemberIndex.table_name(:default, shard_index)
+
+      assert [{{^prefix, "baseline"}, _compound_key}] =
+               :ets.lookup(member_index, {prefix, "baseline"})
+
+      assert [1] = Coordinator.execute([{"HSET", [key, "new", "value"]}], %{}, nil)
+      assert {:ok, %{"baseline" => "old", "new" => "value"}} = FerricStore.hgetall(key)
+
+      assert [{{^prefix, "new"}, _compound_key}] =
+               :ets.lookup(member_index, {prefix, "new"})
+
+      assert [1] = Coordinator.execute([{"HDEL", [key, "baseline"]}], %{}, nil)
+      assert [] == :ets.lookup(member_index, {prefix, "baseline"})
+      assert {:ok, %{"new" => "value"}} = FerricStore.hgetall(key)
+    end
+
+    @tag :transaction_namespace_batch_barrier
+    test "namespace windows do not nest transaction entries inside generic batches" do
+      suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+      first = "{tx-batch-barrier:#{suffix}}:first"
+      second = "{tx-batch-barrier:#{suffix}}:second"
+      ctx = FerricStore.Instance.get(:default)
+
+      assert Router.shard_for(ctx, first) == Router.shard_for(ctx, second)
+
+      for key <- [first, second] do
+        assert :ok = FerricStore.hset(key, %{"baseline" => "old"})
+        assert {:ok, %{"baseline" => "old"}} = FerricStore.hgetall(key)
+      end
+
+      :ok = Ferricstore.NamespaceConfig.set("_root", "window_ms", "50")
+      on_exit(fn -> Ferricstore.NamespaceConfig.reset("_root") end)
+      parent = self()
+
+      tasks =
+        for key <- [first, second] do
+          Task.async(fn ->
+            send(parent, {:transaction_batch_ready, self()})
+
+            receive do
+              :run_transaction_batch ->
+                Coordinator.execute([{"HSET", [key, "new", "value"]}], %{}, nil)
+            end
+          end)
+        end
+
+      pids =
+        for _ <- tasks do
+          assert_receive {:transaction_batch_ready, pid}, 1_000
+          pid
+        end
+
+      Enum.each(pids, &send(&1, :run_transaction_batch))
+      assert [[1], [1]] == Enum.map(tasks, &Task.await(&1, 5_000))
+
+      shard_index = Router.shard_for(ctx, first)
+
+      member_index =
+        Ferricstore.Store.Shard.CompoundMemberIndex.table_name(:default, shard_index)
+
+      for key <- [first, second] do
+        prefix = Ferricstore.Store.CompoundKey.hash_prefix(key)
+
+        assert [{{^prefix, "new"}, _compound_key}] =
+                 :ets.lookup(member_index, {prefix, "new"})
+
+        assert {:ok, %{"baseline" => "old", "new" => "value"}} = FerricStore.hgetall(key)
+      end
+    end
+
+    @tag :transaction_zset_index
+    test "committed ZADD publishes score-index updates", %{same1: shard_seed} do
+      suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+      key = "#{shard_seed}:tx-zset:#{suffix}"
+
+      assert {:ok, 1} = FerricStore.zadd(key, [{10.0, "baseline"}])
+      assert {:ok, ["baseline"]} = FerricStore.zrange(key, 0, -1)
+
+      ctx = FerricStore.Instance.get(:default)
+      shard_index = Router.shard_for(ctx, key)
+
+      {_score_index, score_lookup} =
+        Ferricstore.Store.Shard.ZSetIndex.table_names(:default, shard_index)
+
+      shard = Router.shard_name(ctx, shard_index)
+      refute GenServer.call(shard, {:promoted?, key})
+
+      assert {:ok, [{"baseline", 10.0}]} =
+               GenServer.call(shard, {:zset_rank_range, key, 0, 0, false})
+
+      assert [{{:ready, ^key}, true}] = :ets.lookup(score_lookup, {:ready, key})
+
+      assert [1] = Coordinator.execute([{"ZADD", [key, "1", "new"]}], %{}, nil)
+      assert {:ok, ["new", "baseline"]} = FerricStore.zrange(key, 0, -1)
+
+      assert [0] = Coordinator.execute([{"ZADD", [key, "0", "baseline"]}], %{}, nil)
+      assert {:ok, ["baseline", "new"]} = FerricStore.zrange(key, 0, -1)
+
+      assert [1] = Coordinator.execute([{"ZREM", [key, "new"]}], %{}, nil)
+      assert {:ok, ["baseline"]} = FerricStore.zrange(key, 0, -1)
+      refute GenServer.call(shard, {:promoted?, key})
+
+      refute File.dir?(
+               Ferricstore.Store.Promotion.dedicated_path(ctx.data_dir, shard_index, :zset, key)
+             )
+
+      assert [1] = Coordinator.execute([{"DEL", [key]}], %{}, nil)
+      assert {:ok, []} = FerricStore.zrange(key, 0, -1)
+    end
+
+    @tag :transaction_orphan_promotion_dir
+    test "orphaned dedicated directories do not block compound mutations" do
+      suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+      key = "tx-orphan-promotion:#{suffix}"
+      ctx = FerricStore.Instance.get(:default)
+      shard_index = Router.shard_for(ctx, key)
+
+      dedicated_path =
+        Ferricstore.Store.Promotion.dedicated_path(ctx.data_dir, shard_index, :hash, key)
+
+      File.mkdir_p!(dedicated_path)
+      on_exit(fn -> File.rm_rf(dedicated_path) end)
+
+      refute GenServer.call(Router.shard_name(ctx, shard_index), {:promoted?, key})
+
+      assert [1, "value"] =
+               Coordinator.execute(
+                 [{"HSET", [key, "field", "value"]}, {"HGET", [key, "field"]}],
+                 %{},
+                 nil
+               )
+    end
   end
 
-  describe "cross-shard succeeds atomically" do
+  describe "cross-shard transactions" do
+    test "rejects independent Raft groups before applying any mutation", %{k0: k0, k1: k1} do
+      assert {:error, "CROSSSLOT Keys in request don't hash to the same slot"} =
+               Coordinator.execute(
+                 [{"SET", [k0, "unsafe-0"]}, {"SET", [k1, "unsafe-1"]}],
+                 %{},
+                 nil
+               )
+
+      assert Router.get(FerricStore.Instance.get(:default), k0) == nil
+      assert Router.get(FerricStore.Instance.get(:default), k1) == nil
+    end
+
     @tag :prepared_multi_routing
-    test "prepared MSET tracks every write shard while returning one result", %{k0: k0, k1: k1} do
+    test "prepared MSET spanning shards is rejected without version changes", %{k0: k0, k1: k1} do
       ctx = FerricStore.Instance.get(:default)
       idx0 = Router.shard_for(ctx, k0)
       idx1 = Router.shard_for(ctx, k1)
@@ -188,151 +400,73 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       before1 = WriteVersion.get(idx1)
 
       assert {:ok, prepared} = PreparedCommand.prepare("MSET", [k0, "v0", k1, "v1"])
-      assert Coordinator.execute([prepared], %{}, nil) == [:ok]
+      assert_crossslot(Coordinator.execute([prepared], %{}, nil))
 
-      assert Router.get(ctx, k0) == "v0"
-      assert Router.get(ctx, k1) == "v1"
-      assert WriteVersion.get(idx0) == before0 + 1
-      assert WriteVersion.get(idx1) == before1 + 1
+      assert Router.get(ctx, k0) == nil
+      assert Router.get(ctx, k1) == nil
+      assert WriteVersion.get(idx0) == before0
+      assert WriteVersion.get(idx1) == before1
     end
 
     @tag :prepared_multi_routing
-    test "prepared RENAME spanning shards executes exactly once", %{k0: source, k1: destination} do
+    test "prepared RENAME spanning shards leaves the source intact", %{
+      k0: source,
+      k1: destination
+    } do
       ctx = FerricStore.Instance.get(:default)
       :ok = Router.put(ctx, source, "move-once", 0)
 
       assert {:ok, prepared} = PreparedCommand.prepare("RENAME", [source, destination])
-      assert Coordinator.execute([prepared], %{}, nil) == [:ok]
+      assert_crossslot(Coordinator.execute([prepared], %{}, nil))
 
-      assert Router.get(ctx, source) == nil
-      assert Router.get(ctx, destination) == "move-once"
+      assert Router.get(ctx, source) == "move-once"
+      assert Router.get(ctx, destination) == nil
     end
 
     @tag :prepared_multi_routing
-    test "prepared COPY bumps only its destination write shard", %{k0: source, k1: destination} do
+    test "prepared COPY spanning shards leaves the destination absent", %{
+      k0: source,
+      k1: destination
+    } do
       ctx = FerricStore.Instance.get(:default)
-      source_idx = Router.shard_for(ctx, source)
-      destination_idx = Router.shard_for(ctx, destination)
       :ok = Router.put(ctx, source, "copy-me", 0)
-      source_before = WriteVersion.get(source_idx)
-      destination_before = WriteVersion.get(destination_idx)
 
       assert {:ok, prepared} = PreparedCommand.prepare("COPY", [source, destination])
-      assert Coordinator.execute([prepared], %{}, nil) == [1]
+      assert_crossslot(Coordinator.execute([prepared], %{}, nil))
 
       assert Router.get(ctx, source) == "copy-me"
-      assert Router.get(ctx, destination) == "copy-me"
-      assert WriteVersion.get(source_idx) == source_before
-      assert WriteVersion.get(destination_idx) == destination_before + 1
+      assert Router.get(ctx, destination) == nil
     end
 
-    test "two shards succeeds", %{k0: k0, k1: k1} do
-      queue = [{"SET", [k0, "val_k0"]}, {"SET", [k1, "val_k1"]}]
-
-      result = Coordinator.execute(queue, %{}, nil)
-
-      assert result == [:ok, :ok]
-      assert Router.get(FerricStore.Instance.get(:default), k0) == "val_k0"
-      assert Router.get(FerricStore.Instance.get(:default), k1) == "val_k1"
-    end
-
-    test "four shards succeeds", %{k0: k0, k1: k1, k2: k2, k3: k3} do
-      queue = [
-        {"SET", [k0, "v0"]},
-        {"SET", [k1, "v1"]},
-        {"SET", [k2, "v2"]},
-        {"SET", [k3, "v3"]}
-      ]
-
-      result = Coordinator.execute(queue, %{}, nil)
-
-      assert result == [:ok, :ok, :ok, :ok]
-      assert Router.get(FerricStore.Instance.get(:default), k0) == "v0"
-      assert Router.get(FerricStore.Instance.get(:default), k1) == "v1"
-      assert Router.get(FerricStore.Instance.get(:default), k2) == "v2"
-      assert Router.get(FerricStore.Instance.get(:default), k3) == "v3"
-    end
-
-    test "mixed read/write across shards succeeds", %{k0: k0, k1: k1} do
-      Router.put(FerricStore.Instance.get(:default), k0, "existing_k0", 0)
-
-      queue = [
-        {"GET", [k0]},
-        {"SET", [k1, "new_k1"]}
-      ]
-
-      result = Coordinator.execute(queue, %{}, nil)
-
-      assert result == ["existing_k0", :ok]
-      assert Router.get(FerricStore.Instance.get(:default), k1) == "new_k1"
-    end
-
-    test "large SET is visible to later GET in same cross-shard transaction", %{
-      k0: k0,
-      k1: k1
-    } do
+    @tag :prepared_unlink_keys
+    test "prepared UNLINK spanning shards leaves every key intact", %{k0: k0, k1: k1} do
       ctx = FerricStore.Instance.get(:default)
-      large = :binary.copy("y", ctx.hot_cache_max_value_size + 1024)
+      :ok = Router.put(ctx, k0, "value-0", 0)
+      :ok = Router.put(ctx, k1, "value-1", 0)
+      idx0 = Router.shard_for(ctx, k0)
+      idx1 = Router.shard_for(ctx, k1)
+      before0 = WriteVersion.get(idx0)
+      before1 = WriteVersion.get(idx1)
 
-      queue = [
-        {"SET", [k0, large]},
-        {"GET", [k0]},
-        {"SET", [k1, "other"]}
-      ]
+      assert {:ok, prepared} = PreparedCommand.prepare("UNLINK", [k0, k1])
+      assert prepared.acl_keys == [k0, k1]
+      assert prepared.routing_keys == [k0, k1]
+      assert prepared.write_keys == [k0, k1]
+      assert_crossslot(Coordinator.execute([prepared], %{}, nil))
 
-      result = Coordinator.execute(queue, %{}, nil)
-
-      assert result == [:ok, large, :ok]
+      assert Router.get(ctx, k0) == "value-0"
+      assert Router.get(ctx, k1) == "value-1"
+      assert WriteVersion.get(idx0) == before0
+      assert WriteVersion.get(idx1) == before1
     end
 
-    test "large HSET is visible to later HGETALL in same cross-shard transaction", %{
-      k0: k0,
-      k1: k1
-    } do
+    test "mixed reads and writes spanning shards are rejected", %{k0: k0, k1: k1} do
       ctx = FerricStore.Instance.get(:default)
-      large = :binary.copy("c", ctx.hot_cache_max_value_size + 1024)
+      :ok = Router.put(ctx, k0, "existing", 0)
 
-      queue = [
-        {"HSET", [k0, "field", large]},
-        {"HGETALL", [k0]},
-        {"SET", [k1, "other"]}
-      ]
-
-      result = Coordinator.execute(queue, %{}, nil)
-
-      assert result == [1, ["field", large], :ok]
-    end
-
-    test "INCR across shards succeeds", %{k0: k0, k1: k1} do
-      Router.put(FerricStore.Instance.get(:default), k0, "10", 0)
-      Router.put(FerricStore.Instance.get(:default), k1, "20", 0)
-
-      queue = [{"INCR", [k0]}, {"INCR", [k1]}]
-
-      result = Coordinator.execute(queue, %{}, nil)
-
-      assert result == [{:ok, 11}, {:ok, 21}]
-      assert Router.get(FerricStore.Instance.get(:default), k0) == "11"
-      assert Router.get(FerricStore.Instance.get(:default), k1) == "21"
-    end
-
-    test "DEL across shards succeeds", %{k0: k0, k1: k1, k2: k2} do
-      Router.put(FerricStore.Instance.get(:default), k0, "v", 0)
-      Router.put(FerricStore.Instance.get(:default), k1, "v", 0)
-      Router.put(FerricStore.Instance.get(:default), k2, "v", 0)
-
-      queue = [
-        {"DEL", [k0]},
-        {"DEL", [k1]},
-        {"DEL", [k2]}
-      ]
-
-      result = Coordinator.execute(queue, %{}, nil)
-
-      assert result == [1, 1, 1]
-      assert Router.get(FerricStore.Instance.get(:default), k0) == nil
-      assert Router.get(FerricStore.Instance.get(:default), k1) == nil
-      assert Router.get(FerricStore.Instance.get(:default), k2) == nil
+      assert_crossslot(Coordinator.execute([{"GET", [k0]}, {"SET", [k1, "new"]}], %{}, nil))
+      assert Router.get(ctx, k0) == "existing"
+      assert Router.get(ctx, k1) == nil
     end
   end
 
@@ -413,7 +547,91 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       end
     end
 
-    test "cross-shard WATCH succeeds when watches pass", %{k0: k0, k1: k1} do
+    test "an empty transaction still aborts when its watched key changed", %{same1: key} do
+      ctx = FerricStore.Instance.get(:default)
+      :ok = Router.put(ctx, key, "before", 0)
+      watched = %{key => Router.watch_token(ctx, key)}
+      :ok = Router.put(ctx, key, "after", 0)
+
+      assert Coordinator.execute([], watched, nil) == nil
+    end
+
+    test "a compound-field mutation aborts the watched transaction", %{
+      same1: hash_key,
+      same2: target_key
+    } do
+      ctx = FerricStore.Instance.get(:default)
+      :ok = FerricStore.hset(hash_key, %{"field" => "before"})
+      watched = %{hash_key => Router.watch_token(ctx, hash_key)}
+      :ok = FerricStore.hset(hash_key, %{"field" => "after"})
+
+      assert Coordinator.execute([{"SET", [target_key, "must-not-commit"]}], watched, nil) == nil
+      assert Router.get(ctx, target_key) == nil
+    end
+
+    @tag :transaction_watch_catalog
+    test "batched WATCH bounds aggregate compound catalog work" do
+      ctx = FerricStore.Instance.get(:default)
+      tag = System.unique_integer([:positive, :monotonic])
+      first = "watch-budget:{#{tag}}:first"
+      second = "watch-budget:{#{tag}}:second"
+      shard_index = Router.shard_for(ctx, first)
+      keydir = elem(ctx.keydir_refs, shard_index)
+      index = Ferricstore.Store.Shard.CompoundMemberIndex.table_name(ctx.name, shard_index)
+
+      internal_keys =
+        Enum.flat_map([first, second], fn key ->
+          [
+            Ferricstore.Store.CompoundKey.type_key(key)
+            | Enum.map(
+                1..5_001,
+                &Ferricstore.Store.CompoundKey.hash_field(key, "field:#{&1}")
+              )
+          ]
+        end)
+
+      rows =
+        Enum.map(internal_keys, fn key ->
+          value = if String.starts_with?(key, "T:"), do: "hash", else: "value"
+          {key, value, 0, Ferricstore.Store.LFU.initial(), :pending, 0, 0}
+        end)
+
+      true = :ets.insert(keydir, rows)
+
+      Enum.each(internal_keys, fn key ->
+        Ferricstore.Store.Shard.CompoundMemberIndex.put(index, key)
+      end)
+
+      on_exit(fn ->
+        Enum.each(internal_keys, fn key ->
+          :ets.delete(keydir, key)
+          Ferricstore.Store.Shard.CompoundMemberIndex.delete(index, key)
+        end)
+      end)
+
+      assert {:error, :watch_scan_budget_exceeded} = Router.watch_tokens(ctx, [first, second])
+    end
+
+    @tag :transaction_watch_catalog
+    test "compound WATCH uses the exact catalog instead of scanning shard ETS" do
+      source =
+        Path.expand(
+          "../../../lib/ferricstore/raft/state_machine/sections/cross_shard_dispatch.ex",
+          __DIR__
+        )
+        |> File.read!()
+
+      [_prefix, body_and_rest] =
+        String.split(source, "defp transaction_compound_watch_keys", parts: 2)
+
+      [body | _rest] = String.split(body_and_rest, "\n      defp ", parts: 2)
+
+      assert body =~ "CompoundMemberIndex.keys_for_prefix"
+      refute body =~ "prefix_collect_keys"
+      refute body =~ ":ets.select"
+    end
+
+    test "cross-shard WATCH is rejected when watches pass", %{k0: k0, k1: k1} do
       Router.put(FerricStore.Instance.get(:default), k0, "orig_k0", 0)
 
       watched = %{k0 => Router.watch_token(FerricStore.Instance.get(:default), k0)}
@@ -425,12 +643,12 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
 
       result = Coordinator.execute(queue, watched, nil)
 
-      assert result == [:ok, :ok]
-      assert Router.get(FerricStore.Instance.get(:default), k0) == "new_k0"
-      assert Router.get(FerricStore.Instance.get(:default), k1) == "new_k1"
+      assert_crossslot(result)
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "orig_k0"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == nil
     end
 
-    test "cross-shard WATCH conflict returns nil", %{k0: k0, k1: k1} do
+    test "cross-shard WATCH conflict still returns CROSSSLOT", %{k0: k0, k1: k1} do
       Router.put(FerricStore.Instance.get(:default), k0, "orig_k0", 0)
 
       watched = %{k0 => Router.watch_token(FerricStore.Instance.get(:default), k0)}
@@ -445,8 +663,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
 
       result = Coordinator.execute(queue, watched, nil)
 
-      # WATCH fails first -> nil (before classify even runs)
-      assert result == nil
+      assert_crossslot(result)
     end
   end
 
@@ -475,6 +692,74 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   end
 
   describe "sandbox namespace support" do
+    @tag :transaction_sandbox_multi_key
+    test "namespaces both SMOVE keys during replicated apply" do
+      namespace = "tenant:"
+      source = "{sandbox-smove}:source"
+      destination = "{sandbox-smove}:destination"
+
+      assert {:ok, 1} = FerricStore.sadd(namespace <> source, ["member"])
+      assert {:ok, 1} = FerricStore.sadd(destination, ["outside"])
+      assert {:ok, prepared} = PreparedCommand.prepare("SMOVE", [source, destination, "member"])
+
+      assert [1] =
+               Ferricstore.Transaction.Coordinator.execute([prepared], %{}, namespace)
+
+      assert {:ok, []} = FerricStore.smembers(namespace <> source)
+      assert {:ok, ["member"]} = FerricStore.smembers(namespace <> destination)
+      assert {:ok, ["outside"]} = FerricStore.smembers(destination)
+    end
+
+    @tag :transaction_sandbox_multi_key
+    test "namespaces both RPOPLPUSH keys during replicated apply" do
+      namespace = "tenant:"
+      source = "{sandbox-rpoplpush}:source"
+      destination = "{sandbox-rpoplpush}:destination"
+
+      assert {:ok, 2} = FerricStore.rpush(namespace <> source, ["first", "last"])
+      assert {:ok, 1} = FerricStore.rpush(destination, ["outside"])
+      assert {:ok, prepared} = PreparedCommand.prepare("RPOPLPUSH", [source, destination])
+
+      assert ["last"] =
+               Ferricstore.Transaction.Coordinator.execute([prepared], %{}, namespace)
+
+      assert {:ok, ["first"]} = FerricStore.lrange(namespace <> source, 0, -1)
+      assert {:ok, ["last"]} = FerricStore.lrange(namespace <> destination, 0, -1)
+      assert {:ok, ["outside"]} = FerricStore.lrange(destination, 0, -1)
+    end
+
+    @tag :transaction_sandbox_multi_key
+    test "namespaces GEOSEARCHSTORE source and destination during replicated apply" do
+      namespace = "tenant:"
+      source = "{sandbox-geosearchstore}:source"
+      destination = "{sandbox-geosearchstore}:destination"
+      coordinates = {13.361389, 38.115556}
+      {longitude, latitude} = coordinates
+
+      assert {:ok, 1} =
+               FerricStore.geoadd(namespace <> source, [{longitude, latitude, "inside"}])
+
+      assert {:ok, 1} = FerricStore.geoadd(source, [{longitude, latitude, "outside"}])
+
+      assert {:ok, prepared} =
+               PreparedCommand.prepare("GEOSEARCHSTORE", [
+                 destination,
+                 source,
+                 "FROMLONLAT",
+                 Float.to_string(longitude),
+                 Float.to_string(latitude),
+                 "BYRADIUS",
+                 "1",
+                 "KM"
+               ])
+
+      assert [1] =
+               Ferricstore.Transaction.Coordinator.execute([prepared], %{}, namespace)
+
+      assert {:ok, ["inside"]} = FerricStore.zrange(namespace <> destination, 0, -1)
+      assert {:ok, []} = FerricStore.zrange(destination, 0, -1)
+    end
+
     @tag :prepared_multi_routing
     test "prepared routing namespaces metadata keys before shard classification" do
       ctx = FerricStore.Instance.get(:default)
@@ -542,5 +827,9 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       Ferricstore.Raft.WARaftBackend.storage_position(shard_index)
 
     index
+  end
+
+  defp assert_crossslot(result) do
+    assert result == {:error, "CROSSSLOT Keys in request don't hash to the same slot"}
   end
 end

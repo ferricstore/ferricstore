@@ -1281,7 +1281,8 @@ defmodule Ferricstore.FlowWriteContractTest do
     cleanup_source =
       Ferricstore.Test.SourceFiles.private_function_source!(
         state_machine_source,
-        "do_flow_retention_cleanup"
+        "do_flow_retention_cleanup",
+        "terminal_candidates"
       )
 
     cross_cleanup_source =
@@ -1328,7 +1329,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     refute cross_cleanup_source =~ "flow_active_timeout_expired_state_entries"
   end
 
-  test "retention planning is bounded and uses one all-shard active transaction" do
+  test "retention planning is bounded and executes shard-local commands" do
     state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
     router_source = Ferricstore.Test.SourceFiles.router_source()
 
@@ -1354,7 +1355,9 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert cleanup_source =~ "flow_retention_cleanup_active"
     refute cleanup_source =~ "flow_retention_cleanup_shard"
 
-    assert length(Regex.scan(~r/flow_cross_shard_tx\(/, active_source)) == 1
+    assert active_source =~ "flow_retention_shard_commands"
+    assert active_source =~ "flow_retention_execute_shard_commands"
+    refute active_source =~ "flow_cross_shard_tx"
     assert terminal_planner_source =~ "expired_terminal_state_keys"
     refute terminal_planner_source =~ "flow_retention_expired_state_entries"
     refute terminal_planner_source =~ "safe_ets_select"
@@ -1385,11 +1388,19 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert tracker_source =~ "shared_value_ref_registry_key"
     assert tracker_source =~ "flow_increment_shared_value_ref_counts"
     assert cleanup_executor_source =~ "flow_retention_enqueue_shared_value_orphans"
-    assert terminal_cleanup_source =~ "flow_cross_shard_tx"
+    assert terminal_cleanup_source =~ "flow_retention_shard_commands"
+    assert terminal_cleanup_source =~ "flow_retention_execute_shard_commands"
 
     refute state_machine_source =~ "flow_retention_value_refs_used_by_other_states"
     refute state_machine_source =~ "flow_retention_reference_scan_states"
     refute state_machine_source =~ "flow_retention_reference_scan_hook"
+  end
+
+  test "replicated flow apply does not invoke node-local application callbacks" do
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    refute state_machine_source =~ ":flow_shared_value_ref_acquisition_hook"
+    refute state_machine_source =~ ":flow_retention_owned_write_hook"
   end
 
   test "retention cleanup ownership planning uses the bounded durable member index" do
@@ -1439,17 +1450,18 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert guard_pos < fallback_pos
   end
 
-  test "same-shard child spawning acquires shared refs in the retention ordering domain" do
+  test "Flow mutations acquire shared refs in their owning shard apply" do
     router_source = Ferricstore.Test.SourceFiles.router_source()
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    serialized_ops_source =
+    tracker_source =
       Ferricstore.Test.SourceFiles.private_function_source!(
-        router_source,
-        "flow_shared_ref_write_op?"
+        state_machine_source,
+        "flow_track_shared_value_refs"
       )
 
-    [_, serialized_ops] = Regex.run(~r/when op in \[(.*?)\]/s, serialized_ops_source)
-    assert serialized_ops =~ ":flow_spawn_children"
+    assert tracker_source =~ "flow_increment_shared_value_ref_counts"
+    refute router_source =~ "flow_shared_ref_write"
   end
 
   test "startup refreshes active file size after retention metadata backfill writes" do
@@ -1505,7 +1517,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     refute migration_source =~ ":ets.foldl"
   end
 
-  test "Flow policy updates commit all shard copies in one fatal cross-shard transaction" do
+  test "Flow policy updates allocate once and install through each Raft group" do
     router_source = Ferricstore.Test.SourceFiles.router_source()
     state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
 
@@ -1515,20 +1527,17 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert [policy_put_source, _] =
              String.split(policy_put_source, "      def flow_get", parts: 2)
 
-    refute policy_put_source =~ "Enum.reduce_while",
-           "separate shard writes leave earlier policy copies committed after a later failure"
+    assert policy_put_source =~ "{:flow_policy_allocate, key, value, expire_at_ms}"
+    assert policy_put_source =~ "flow_policy_install_remaining_shards"
+    assert policy_put_source =~ "versioned_value"
+    assert router_source =~ "Task.async_stream"
+    assert policy_put_source =~ "{:flow_policy_put, key, value, expire_at_ms}"
+    refute router_source =~ "{:cross_shard_tx, shard_batches}"
 
-    assert policy_put_source =~ "flow_policy_put_all_command"
-    assert router_source =~ "{:cross_shard_tx, shard_batches}"
-    assert router_source =~ "|> Map.keys()"
-    assert router_source =~ "entry = {:flow_cross_policy_put"
-    refute router_source =~ "flow_policy_generation_v2"
-    refute router_source =~ "flow_cross_policy_put_v2"
-    refute state_machine_source =~ "flow_cross_policy_put_v2"
-
-    assert state_machine_source =~ "%{shard_index: shard_index}"
-
-    assert state_machine_source =~ "validate_cross_shard_policy_target_sets"
+    assert state_machine_source =~ "apply_flow_policy_fence"
+    assert state_machine_source =~ "do_flow_policy_allocate"
+    assert state_machine_source =~ "validate_flow_policy_fence"
+    assert state_machine_source =~ "install_flow_policy_fence"
   end
 
   defp create_many_and_claim(partition, ids, type, now_ms) do

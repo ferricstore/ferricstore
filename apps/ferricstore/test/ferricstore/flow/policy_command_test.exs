@@ -11,6 +11,11 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
     assert {:ok, ^delete} = PolicyCommand.stamp(:context_must_not_be_read, delete)
   end
 
+  test "signal transitions are policy-sensitive commands" do
+    assert PolicyCommand.requires_stamp?({:flow_signal, "state-key", %{}})
+    assert PolicyCommand.requires_stamp?({:flow_signal_many, "state-key", %{records: []}})
+  end
+
   test "ordinary KV batches return the original list without consulting context" do
     commands =
       Enum.map(1..10_000, fn index ->
@@ -20,6 +25,22 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
     assert {:ok, stamped} = PolicyCommand.stamp_many(:context_must_not_be_read, commands)
     assert :erts_debug.same(commands, stamped)
+  end
+
+  test "malformed policy-sensitive commands fail before policy reads" do
+    assert {:error, "ERR flow policy-sensitive command attrs must be a map"} =
+             PolicyCommand.stamp(:context_must_not_be_read, {:flow_create, "state-key", :invalid})
+
+    assert {:error, "ERR flow command must be a tuple"} =
+             PolicyCommand.stamp(:context_must_not_be_read, :invalid)
+  end
+
+  test "malformed keyed command batches return errors instead of raising" do
+    error = {:error, "ERR flow keyed command must be a {binary_key, tuple_command} pair"}
+
+    assert ^error = PolicyCommand.stamp_many(:context_must_not_be_read, [:invalid])
+    assert ^error = PolicyCommand.stamp_many(:context_must_not_be_read, [{"key", :invalid}])
+    assert ^error = PolicyCommand.stamp_many(:context_must_not_be_read, [{:invalid, {:set, "k"}}])
   end
 
   test "existing-flow policy stamping fails closed while the state shard is unavailable" do
@@ -75,6 +96,8 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
         updated_at_ms: 1,
         next_run_at_ms: nil,
         priority: 0,
+        incarnation: 1,
+        state_enter_seq: 1,
         partition_key: partition_key,
         root_flow_id: id
       })
@@ -90,9 +113,147 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
 
     command = {:flow_retry, state_key, %{id: id, partition_key: partition_key}}
 
-    assert {:ok, {:flow_retry, ^state_key, stamped}} = PolicyCommand.stamp(ctx, command)
-    assert stamped.policy_generation == 7
-    assert stamped.policy_snapshot == policy
+    assert {:ok, fenced} = PolicyCommand.stamp(ctx, command)
+    assert {[_install], {:flow_retry, ^state_key, stamped}} = unwrap_policy_fence(fenced)
+    assert %{type: ^type, generation: 7, digest: digest} = stamped.policy_ref
+    assert byte_size(digest) == 32
+    assert stamped.policy_guard.incarnation == 1
+  end
+
+  test "single commands fence their compact reference with the exact coordinator policy" do
+    keydir = :ets.new(:policy_fence_stamp, [:set, :public])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    type = "fenced-policy"
+    partition_key = "fenced-tenant"
+    id = "fenced-flow"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+    policy_key = Ferricstore.Flow.Keys.policy_key(type)
+    policy = %{type: type, max_active_ms: 7_000}
+    policy_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy, 4)
+
+    :ets.insert(
+      keydir,
+      {policy_key, policy_value, 0, Ferricstore.Store.LFU.initial(), 0, 0,
+       byte_size(policy_value)}
+    )
+
+    ctx = %{
+      keydir_refs: {keydir},
+      name: :policy_fence_stamp_test,
+      shard_names: {:policy_fence_stamp_shard_must_not_run},
+      slot_map: List.duplicate(0, 1_024) |> List.to_tuple()
+    }
+
+    command =
+      {:flow_create, state_key,
+       %{id: id, type: type, state: "queued", partition_key: partition_key}}
+
+    assert {:ok,
+            {:flow_policy_fence, [{^policy_key, ^policy_value, 0}],
+             {:flow_create, ^state_key, stamped}}} = PolicyCommand.stamp(ctx, command)
+
+    assert %{type: ^type, generation: 4, digest: <<_::256>>} = stamped.policy_ref
+    refute Map.has_key?(stamped.policy_ref, :encoded)
+  end
+
+  @tag :compact_policy_ref
+  test "policy-sensitive commands carry a fixed-size reference and one exact fence" do
+    keydir = :ets.new(:compact_policy_ref, [:set, :public])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    type = "compact-policy-ref"
+    policy = %{type: type, version: String.duplicate("v", 128 * 1024)}
+    encoded = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy, 17)
+
+    :ets.insert(
+      keydir,
+      {Ferricstore.Flow.Keys.policy_key(type), encoded, 0, Ferricstore.Store.LFU.initial(), 0, 0,
+       byte_size(encoded)}
+    )
+
+    ctx = %{
+      keydir_refs: {keydir},
+      shard_names: {:policy_stamp_shard_process_must_not_exist}
+    }
+
+    key = Ferricstore.Flow.Keys.state_key("compact-policy-flow", "tenant")
+
+    command =
+      {:flow_create, key,
+       %{id: "compact-policy-flow", type: type, state: "queued", partition_key: "tenant"}}
+
+    assert {:ok, fenced} = PolicyCommand.stamp(ctx, command)
+
+    assert {[{_policy_key, ^encoded, 0}], {:flow_create, ^key, stamped}} =
+             unwrap_policy_fence(fenced)
+
+    assert %{
+             type: ^type,
+             generation: 17,
+             digest: digest
+           } = stamped.policy_ref
+
+    assert is_binary(digest) and byte_size(digest) == 32
+    refute Map.has_key?(stamped, :policy_snapshot)
+    assert :erlang.external_size(stamped.policy_ref) < 256
+  end
+
+  @tag :compact_policy_ref
+  test "existing-flow stamps fence the observed type and incarnation" do
+    keydir = :ets.new(:policy_target_guard, [:set, :public])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    id = "policy-target-flow"
+    type = "policy-target-type"
+    partition_key = "tenant"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    record = %{
+      id: id,
+      type: type,
+      state: "queued",
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 1,
+      updated_at_ms: 1,
+      next_run_at_ms: nil,
+      priority: 0,
+      incarnation: 44,
+      state_enter_seq: 44,
+      partition_key: partition_key,
+      root_flow_id: id,
+      child_groups: %{}
+    }
+
+    value = Ferricstore.Flow.encode_record(record)
+
+    :ets.insert(
+      keydir,
+      {state_key, value, 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size(value)}
+    )
+
+    ctx = %{
+      keydir_refs: {keydir},
+      name: :policy_target_guard_test,
+      shard_names: {:policy_stamp_shard_process_must_not_exist},
+      slot_map: List.duplicate(0, 1_024) |> List.to_tuple()
+    }
+
+    assert {:ok, fenced} =
+             PolicyCommand.stamp(
+               ctx,
+               {:flow_retry, state_key, %{id: id, partition_key: partition_key}}
+             )
+
+    assert {[_install], {:flow_retry, ^state_key, stamped}} = unwrap_policy_fence(fenced)
+
+    assert stamped.policy_guard == %{
+             state_key: state_key,
+             type: type,
+             incarnation: 44
+           }
   end
 
   test "policy and migration codecs expose one canonical beta wire shape" do
@@ -127,7 +288,7 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
     assert :error = Ferricstore.Flow.PolicyMigration.decode_job(revisionless_job)
   end
 
-  test "outer Flow batches cap repeated serialized snapshots" do
+  test "outer Flow batches replicate compact references instead of repeated policies" do
     keydir = :ets.new(:outer_batch_policy_stamp, [:set, :public])
     on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
@@ -161,117 +322,28 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
           }}}
       end)
 
-    max_batch_bytes = Ferricstore.Flow.RetryPolicy.max_policy_snapshot_batch_bytes()
-    too_large_error = "ERR flow policy snapshot batch exceeds #{max_batch_bytes} bytes"
+    assert {:ok, stamped} = PolicyCommand.stamp_many(ctx, keyed_commands)
+    assert length(stamped) == 100
 
-    assert {:error, ^too_large_error} = PolicyCommand.stamp_many(ctx, keyed_commands)
-
-    assert {:ok, stamped} = PolicyCommand.stamp_many(ctx, Enum.take(keyed_commands, 50))
-    assert length(stamped) == 50
-
-    assert Enum.all?(stamped, fn {_key, {_op, _state_key, attrs}} ->
-             attrs.policy_snapshot == policy
+    assert Enum.all?(stamped, fn {_key, command} ->
+             {_installs, {_op, _state_key, attrs}} = unwrap_policy_fence(command)
+             match?(%{type: ^type, generation: 1, digest: <<_::256>>}, attrs.policy_ref)
            end)
+
+    assert 1 == Enum.count(stamped, fn {_key, command} -> fence_installs(command) != [] end)
+
+    assert :erlang.external_size(stamped) < 256 * 1024
   end
 
-  test "one cross-shard transaction caps repeated snapshot occurrences" do
-    keydir = :ets.new(:cross_batch_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+  test "obsolete cross-shard envelopes bypass policy traversal unchanged" do
+    command =
+      {:cross_shard_tx, [{0, [{0, {:flow_create, "state-key", %{id: "id", type: "type"}}}], nil}]}
 
-    type = "cross-batch-policy"
-    policy = %{type: type, version: String.duplicate("p", 64 * 1024)}
-    value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy, 1)
-    policy_key = Ferricstore.Flow.Keys.policy_key(type)
-
-    :ets.insert(
-      keydir,
-      {policy_key, value, 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size(value)}
-    )
-
-    ctx = %{
-      keydir_refs: {keydir},
-      shard_names: {:policy_stamp_shard_process_must_not_exist}
-    }
-
-    entries =
-      Enum.map(0..99, fn index ->
-        id = "cross-batch-flow-#{index}"
-        key = Ferricstore.Flow.Keys.state_key(id, "cross-batch-tenant")
-
-        {index,
-         {:flow_create, key,
-          %{
-            id: id,
-            type: type,
-            state: "queued",
-            partition_key: "cross-batch-tenant"
-          }}}
-      end)
-
-    max_batch_bytes = Ferricstore.Flow.RetryPolicy.max_policy_snapshot_batch_bytes()
-    too_large_error = "ERR flow policy snapshot batch exceeds #{max_batch_bytes} bytes"
-
-    assert {:error, ^too_large_error} =
-             PolicyCommand.stamp(ctx, {:cross_shard_tx, [{0, entries, nil}]})
-
-    assert {:ok, {:cross_shard_tx, [{0, stamped, nil}]}} =
-             PolicyCommand.stamp(
-               ctx,
-               {:cross_shard_tx, [{0, Enum.take(entries, 50), nil}]}
-             )
-
-    assert length(stamped) == 50
+    assert {:ok, unchanged} = PolicyCommand.stamp(:context_must_not_be_read, command)
+    assert :erts_debug.same(command, unchanged)
   end
 
-  test "generic cross-shard commands stay unchanged while Flow entries are stamped" do
-    generic =
-      {:cross_shard_tx,
-       [
-         {0, [{0, {:put, "key-a", "value-a", 0}}], nil},
-         {1, [{1, {:delete, "key-b"}}], nil}
-       ]}
-
-    assert {:ok, unchanged} = PolicyCommand.stamp(:context_must_not_be_read, generic)
-    assert :erts_debug.same(generic, unchanged)
-
-    keydir = :ets.new(:cross_flow_policy_stamp, [:set, :public])
-    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
-
-    ctx = %{
-      keydir_refs: {keydir},
-      shard_names: {:policy_stamp_shard_process_must_not_exist}
-    }
-
-    attrs = %{
-      id: "cross-policy-flow",
-      type: "cross-policy-type",
-      partition_key: "cross-policy-tenant",
-      children: []
-    }
-
-    flow =
-      {:cross_shard_tx, [{0, [{0, {:flow_cross_spawn_children, attrs}}], nil}]}
-
-    assert {:ok,
-            {:cross_shard_tx,
-             [
-               {0,
-                [
-                  {0,
-                   {:flow_cross_spawn_children,
-                    %{
-                      policy_snapshots: %{
-                        "cross-policy-type" => %{
-                          generation: 0,
-                          policy: %{type: "cross-policy-type"}
-                        }
-                      }
-                    }}}
-                ], nil}
-             ]}} = PolicyCommand.stamp(ctx, flow)
-  end
-
-  test "nested batches store each policy snapshot once" do
+  test "nested batches store each policy reference once" do
     keydir = :ets.new(:deduplicated_policy_stamp, [:set, :public])
     on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
 
@@ -304,18 +376,19 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
     command = {:flow_create_many, key, %{records: records}}
     unstamped_size = :erlang.external_size(command)
 
-    assert {:ok, {:flow_create_many, ^key, stamped_attrs} = stamped} =
-             PolicyCommand.stamp(ctx, command)
+    assert {:ok, fenced} = PolicyCommand.stamp(ctx, command)
 
-    assert %{^type => %{generation: 5, policy: ^policy}} = stamped_attrs.policy_snapshots
+    assert {[_install], {:flow_create_many, ^key, stamped_attrs} = stamped} =
+             unwrap_policy_fence(fenced)
+
+    assert %{^type => %{type: ^type, generation: 5, digest: <<_::256>>}} =
+             stamped_attrs.policy_refs
 
     assert Enum.all?(stamped_attrs.records, fn attrs ->
-             not Map.has_key?(attrs, :policy_generation) and
-               not Map.has_key?(attrs, :policy_snapshot)
+             not Map.has_key?(attrs, :policy_ref)
            end)
 
-    assert :erlang.external_size(stamped) <
-             unstamped_size + 2 * :erlang.external_size(policy)
+    assert :erlang.external_size(stamped) < unstamped_size + 512
   end
 
   test "policy snapshot size has a deterministic inclusive boundary" do
@@ -345,7 +418,7 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
              )
   end
 
-  test "oversized and compressed stored policy envelopes are rejected before decode" do
+  test "oversized, compressed, and trailing stored policy envelopes are rejected before decode" do
     max_encoded = Ferricstore.Flow.RetryPolicy.max_encoded_policy_bytes()
 
     oversized_policy = %{
@@ -363,6 +436,9 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
     assert <<131, 80, _rest::binary>> = compressed
     assert byte_size(compressed) < max_encoded
     assert :error = Ferricstore.Flow.RetryPolicy.decode_flow_policy_entry(compressed)
+
+    valid = Ferricstore.Flow.RetryPolicy.encode_flow_policy(%{type: "canonical"}, 1)
+    assert :error = Ferricstore.Flow.RetryPolicy.decode_flow_policy_entry(valid <> <<0>>)
   end
 
   test "policy generations stop at the exact migration score boundary" do
@@ -432,10 +508,13 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
     key = Ferricstore.Flow.Keys.state_key("__batch__", "bundle-tenant")
     command = {:flow_create_many, key, %{records: records}}
 
-    assert {:ok, {:flow_create_many, ^key, %{policy_snapshots: snapshots}}} =
-             PolicyCommand.stamp(ctx, command)
+    assert {:ok, fenced} = PolicyCommand.stamp(ctx, command)
 
-    assert map_size(snapshots) == 3
+    assert {installs, {:flow_create_many, ^key, %{policy_refs: refs}}} =
+             unwrap_policy_fence(fenced)
+
+    assert map_size(refs) == 3
+    assert length(installs) == 3
 
     oversized_third = %{third | version: third.version <> "x"}
     oversized_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(oversized_third, 2)
@@ -485,7 +564,7 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
       type: type,
       state: "queued",
       partition_key: "hot-policy-tenant",
-      policy_snapshot_captured: false,
+      policy_reference_captured: false,
       policy_snapshots: %{
         "injected-type" => %{
           generation: 999,
@@ -497,10 +576,10 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
     command =
       {:flow_create, Ferricstore.Flow.Keys.state_key(attrs.id, attrs.partition_key), attrs}
 
-    assert {:ok, {:flow_create, _key, stamped}} = PolicyCommand.stamp(ctx, command)
-    assert stamped.policy_generation == 7
-    assert stamped.policy_snapshot.max_active_ms == 1_000
-    assert stamped.policy_snapshot_captured
+    assert {:ok, fenced} = PolicyCommand.stamp(ctx, command)
+    assert {[_install], {:flow_create, _key, stamped}} = unwrap_policy_fence(fenced)
+    assert %{type: ^type, generation: 7, digest: <<_::256>>} = stamped.policy_ref
+    assert stamped.policy_reference_captured
     refute Map.has_key?(stamped, :policy_snapshots)
   end
 
@@ -532,4 +611,10 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
   defp sized_policy(payload_size) do
     %{type: "snapshot-boundary", version: String.duplicate("x", payload_size)}
   end
+
+  defp unwrap_policy_fence({:flow_policy_fence, installs, command}), do: {installs, command}
+  defp unwrap_policy_fence(command), do: {[], command}
+
+  defp fence_installs({:flow_policy_fence, installs, _command}), do: installs
+  defp fence_installs(_command), do: []
 end

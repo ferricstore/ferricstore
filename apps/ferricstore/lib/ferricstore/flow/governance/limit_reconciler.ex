@@ -14,12 +14,19 @@ defmodule Ferricstore.Flow.Governance.LimitReconciler do
 
   @default_interval_ms 1_000
   @default_reservation_limit 128
+  @max_exact_version 9_007_199_254_740_991
 
   def start_link(opts) when is_list(opts) do
-    ctx = Keyword.fetch!(opts, :instance_ctx)
-    name = Keyword.get(opts, :name, process_name(ctx))
-    GenServer.start_link(__MODULE__, ctx, name: name)
+    with true <- Keyword.keyword?(opts),
+         {:ok, ctx} <- Keyword.fetch(opts, :instance_ctx) do
+      name = Keyword.get(opts, :name, process_name(ctx))
+      GenServer.start_link(__MODULE__, ctx, name: name)
+    else
+      _invalid -> {:error, "ERR invalid flow limit reconciler options"}
+    end
   end
+
+  def start_link(_opts), do: {:error, "ERR invalid flow limit reconciler options"}
 
   @impl true
   def init(ctx) do
@@ -54,25 +61,46 @@ defmodule Ferricstore.Flow.Governance.LimitReconciler do
   end
 
   @doc false
-  def run_once(ctx, opts \\ []) when is_list(opts) do
-    now_ms = Keyword.get(opts, :now_ms, now_ms())
+  def run_once(ctx, opts \\ [])
 
-    reservation_limit =
-      Keyword.get(opts, :reservation_limit, Keyword.get(opts, :scope_limit, 256))
+  def run_once(ctx, opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      now_ms = Keyword.get(opts, :now_ms, now_ms())
+      reservation_limit = Keyword.get(opts, :reservation_limit, 256)
+      cursor = Keyword.get(opts, :cursor)
+      catalog_shard = Keyword.get(opts, :catalog_shard, 0)
 
-    cursor = Keyword.get(opts, :cursor)
-    catalog_shard = Keyword.get(opts, :catalog_shard, 0)
+      if valid_run_options?(ctx, cursor, reservation_limit, now_ms, catalog_shard) do
+        {next_catalog_shard, catalog_result} =
+          reconcile_catalog_publications(ctx, catalog_shard, reservation_limit)
 
-    {next_catalog_shard, catalog_result} =
-      reconcile_catalog_publications(ctx, catalog_shard, reservation_limit)
+        case reconcile_page(ctx, cursor, reservation_limit, now_ms) do
+          {:ok, result} ->
+            {:ok, attach_catalog_result(result, catalog_result, next_catalog_shard)}
 
-    case reconcile_page(ctx, cursor, reservation_limit, now_ms) do
-      {:ok, result} ->
-        {:ok, attach_catalog_result(result, catalog_result, next_catalog_shard)}
-
-      {:error, _reason} = error ->
-        error
+          {:error, _reason} = error ->
+            error
+        end
+      else
+        {:error, "ERR invalid flow limit reconciliation options"}
+      end
+    else
+      {:error, "ERR invalid flow limit reconciliation options"}
     end
+  end
+
+  def run_once(_ctx, _opts), do: {:error, "ERR invalid flow limit reconciliation options"}
+
+  defp valid_run_options?(ctx, cursor, reservation_limit, now_ms, catalog_shard) do
+    is_map(ctx) and is_integer(Map.get(ctx, :shard_count)) and Map.get(ctx, :shard_count) > 0 and
+      is_integer(reservation_limit) and reservation_limit > 0 and reservation_limit <= 256 and
+      is_integer(now_ms) and now_ms >= 0 and now_ms <= @max_exact_version and
+      is_integer(catalog_shard) and catalog_shard >= 0 and
+      catalog_shard <= @max_exact_version and
+      match?(
+        {:ok, _cursor_state},
+        ReleaseOutbox.decode_reconcile_cursor(cursor, Map.get(ctx, :shard_count))
+      )
   end
 
   defp reconcile_catalog_publications(ctx, start_shard, limit)
@@ -246,7 +274,7 @@ defmodule Ferricstore.Flow.Governance.LimitReconciler do
   defp run_page(ctx, cursor, reservation_limit, now_ms)
        when is_integer(reservation_limit) and reservation_limit > 0 and
               reservation_limit <= 256 and
-              is_integer(now_ms) and now_ms >= 0 do
+              is_integer(now_ms) and now_ms >= 0 and now_ms <= @max_exact_version do
     with {:ok, cursor_state} <-
            ReleaseOutbox.decode_reconcile_cursor(cursor, Map.fetch!(ctx, :shard_count)),
          {:ok, page} <- next_outbox_page(ctx, cursor_state, reservation_limit) do

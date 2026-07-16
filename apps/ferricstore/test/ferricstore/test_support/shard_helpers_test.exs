@@ -5,8 +5,37 @@ defmodule Ferricstore.Test.ShardHelpersTest do
   alias Ferricstore.MemoryGuard
   alias Ferricstore.Flow.Governance.LimitCache
   alias Ferricstore.Raft.WARaftBackend
+  alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.{DiskPressure, Router}
   alias Ferricstore.Test.ShardHelpers
+
+  test "flush_all_keys preserves the durable server catalog" do
+    ctx = FerricStore.Instance.get(:default)
+    namespace = "cleanup-probe-#{System.unique_integer([:positive, :monotonic])}"
+
+    keys = [
+      ServerCatalog.entry_key(namespace, "subject"),
+      ServerCatalog.revision_key(namespace),
+      ServerCatalog.live_count_key(namespace)
+    ]
+
+    values = [
+      ServerCatalog.encode_entry(11, "value"),
+      ServerCatalog.encode_revision(11),
+      ServerCatalog.encode_live_count(1)
+    ]
+
+    Enum.zip(keys, values)
+    |> Enum.each(fn {key, value} -> assert :ok = Router.put(ctx, key, value, 0) end)
+
+    on_exit(fn -> Enum.each(keys, &Router.delete(ctx, &1)) end)
+
+    before = Map.new(keys, &{&1, Router.get(ctx, &1)})
+    assert Enum.all?(before, fn {_key, value} -> is_binary(value) end)
+
+    assert :ok = ShardHelpers.flush_all_keys()
+    assert before == Map.new(keys, &{&1, Router.get(ctx, &1)})
+  end
 
   test "flush_all_keys drains cached governance reservations before deleting owners" do
     ctx = FerricStore.Instance.get(:default)

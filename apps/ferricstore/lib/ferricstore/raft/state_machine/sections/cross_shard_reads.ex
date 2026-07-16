@@ -39,7 +39,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         ValueCodec
       }
 
-      alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -56,8 +56,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             active_file_id: anchor_state.active_file_id,
             zset_score_index_name: anchor_state.zset_score_index_name,
             zset_score_lookup_name: anchor_state.zset_score_lookup_name,
+            compound_member_index_name: Map.get(anchor_state, :compound_member_index_name),
             flow_index_name: Map.get(anchor_state, :flow_index_name),
-            flow_lookup_name: Map.get(anchor_state, :flow_lookup_name)
+            flow_lookup_name: Map.get(anchor_state, :flow_lookup_name),
+            promoted_instances: Map.get(anchor_state, :promoted_instances, %{})
           }
         else
           {file_id, file_path, shard_data_path} =
@@ -88,6 +90,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             active_file_id: file_id,
             zset_score_index_name: zset_score_index_name,
             zset_score_lookup_name: zset_score_lookup_name,
+            compound_member_index_name: CompoundMemberIndex.table_name(instance_name, shard_idx),
             flow_index_name: flow_index_name,
             flow_lookup_name: flow_lookup_name
           }
@@ -262,8 +265,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                       valid_waraft_segment_location(fid, off, vsize)) ->
               true
 
-            [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+            [{^key, value, exp, _lfu, _fid, _off, _vsize}]
+            when exp != 0 and exp <= now ->
               cross_shard_delete_keydir_entry(ctx, key, value)
+              false
+
+            [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
+              record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
               false
 
             _ ->
@@ -272,6 +280,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         rescue
           ArgumentError ->
             emit_cross_shard_keydir_unavailable(ctx, :cross_shard_exists)
+            record_state_read_failure(:keydir_unavailable)
             false
         end
       end
@@ -288,8 +297,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             when valid_cold_location(fid, off, vsize) or
                    valid_waraft_segment_location(fid, off, vsize) ->
               case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
-                {:ok, v} -> materialize_cross_shard_cold_value(ctx, v)
-                _ -> nil
+                {:ok, v} when is_binary(v) -> materialize_cross_shard_cold_value(ctx, v)
+                {:ok, invalid} -> record_cross_shard_read_failure({:invalid_value, invalid})
+                {:error, reason} -> record_cross_shard_read_failure(reason)
+                :not_found -> record_cross_shard_read_failure(:not_found)
+                invalid -> record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
               end
 
             [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
@@ -300,13 +312,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                    (valid_cold_location(fid, off, vsize) or
                       valid_waraft_segment_location(fid, off, vsize)) ->
               case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
-                {:ok, v} -> materialize_cross_shard_cold_value(ctx, v)
-                _ -> nil
+                {:ok, v} when is_binary(v) -> materialize_cross_shard_cold_value(ctx, v)
+                {:ok, invalid} -> record_cross_shard_read_failure({:invalid_value, invalid})
+                {:error, reason} -> record_cross_shard_read_failure(reason)
+                :not_found -> record_cross_shard_read_failure(:not_found)
+                invalid -> record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
               end
 
-            [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+            [{^key, nil, exp, _lfu, _fid, _off, _vsize}]
+            when exp != 0 and exp <= now ->
               cross_shard_delete_keydir_entry(ctx, key, nil)
               nil
+
+            [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
+              record_cross_shard_read_failure({:invalid_cold_location, {fid, off, vsize}})
 
             _ ->
               nil
@@ -314,6 +333,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         rescue
           ArgumentError ->
             emit_cross_shard_keydir_unavailable(ctx, :cross_shard_get)
+            record_state_read_failure(:keydir_unavailable)
             nil
         end
       end
@@ -328,8 +348,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
         case BlobValue.maybe_materialize(ctx.data_dir, ctx.index, threshold, value) do
           {:ok, materialized} -> materialized
-          {:error, _reason} -> nil
+          {:error, reason} -> record_cross_shard_read_failure({:blob_ref_unavailable, reason})
         end
+      end
+
+      defp record_cross_shard_read_failure(reason) do
+        record_state_read_failure({:cold_value_unavailable, reason})
+        nil
       end
 
       defp cross_shard_read_cold_value(_ctx, data_path, key, fid, off, value_size)
@@ -362,8 +387,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             when valid_cold_location(fid, off, vsize) or
                    valid_waraft_segment_location(fid, off, vsize) ->
               case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
-                {:ok, v} -> {materialize_cross_shard_cold_value(ctx, v), 0}
-                _ -> nil
+                {:ok, v} when is_binary(v) -> {materialize_cross_shard_cold_value(ctx, v), 0}
+                {:ok, invalid} -> record_cross_shard_read_failure({:invalid_value, invalid})
+                {:error, reason} -> record_cross_shard_read_failure(reason)
+                :not_found -> record_cross_shard_read_failure(:not_found)
+                invalid -> record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
               end
 
             [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
@@ -374,13 +402,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                    (valid_cold_location(fid, off, vsize) or
                       valid_waraft_segment_location(fid, off, vsize)) ->
               case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
-                {:ok, v} -> {materialize_cross_shard_cold_value(ctx, v), exp}
-                _ -> nil
+                {:ok, v} when is_binary(v) -> {materialize_cross_shard_cold_value(ctx, v), exp}
+                {:ok, invalid} -> record_cross_shard_read_failure({:invalid_value, invalid})
+                {:error, reason} -> record_cross_shard_read_failure(reason)
+                :not_found -> record_cross_shard_read_failure(:not_found)
+                invalid -> record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
               end
 
-            [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+            [{^key, nil, exp, _lfu, _fid, _off, _vsize}]
+            when exp != 0 and exp <= now ->
               cross_shard_delete_keydir_entry(ctx, key, nil)
               nil
+
+            [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
+              record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
 
             _ ->
               nil
@@ -388,6 +423,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         rescue
           ArgumentError ->
             emit_cross_shard_keydir_unavailable(ctx, :cross_shard_get_meta)
+            record_state_read_failure(:keydir_unavailable)
             nil
         end
       end
@@ -419,7 +455,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                   {tokens, cold_entries, cold_count}
 
                 value == nil and not valid_cross_shard_cold_location_value?(fid, off, vsize) ->
-                  cross_shard_delete_keydir_entry(ctx, key, nil)
+                  record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
                   {tokens, cold_entries, cold_count}
 
                 value == nil and valid_cold_location(fid, off, vsize) ->
@@ -459,6 +495,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         rescue
           ArgumentError ->
             emit_cross_shard_keydir_unavailable(ctx, :cross_shard_prefix_scan)
+            record_state_read_failure(:keydir_unavailable)
             []
         end
       end
@@ -474,15 +511,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
         values_by_entry =
           %{}
-          |> cross_shard_read_cold_bitcask_values(bitcask_entries)
+          |> cross_shard_read_cold_bitcask_values(ctx, bitcask_entries)
           |> cross_shard_read_cold_waraft_values(ctx, waraft_entries)
 
         Enum.map(entries, fn entry -> Map.get(values_by_entry, entry) end)
       end
 
-      defp cross_shard_read_cold_bitcask_values(acc, []), do: acc
+      defp cross_shard_read_cold_bitcask_values(acc, _ctx, []), do: acc
 
-      defp cross_shard_read_cold_bitcask_values(acc, entries) do
+      defp cross_shard_read_cold_bitcask_values(acc, ctx, entries) do
         locations =
           Enum.map(entries, fn {_field, key, {:bitcask, path, off}} -> {path, off, key} end)
 
@@ -499,9 +536,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         Enum.zip(entries, values)
         |> Enum.reduce(acc, fn
           {entry = {_field, _key, _location}, value}, acc when is_binary(value) ->
-            Map.put(acc, entry, cross_shard_cold_result(entry, value))
+            case materialize_cross_shard_cold_value(ctx, value) do
+              materialized when is_binary(materialized) ->
+                Map.put(acc, entry, cross_shard_cold_result(entry, materialized))
 
-          {_entry, _value}, acc ->
+              _failed ->
+                acc
+            end
+
+          {_entry, {:error, reason}}, acc ->
+            record_state_read_failure({:cold_value_unavailable, reason})
+            acc
+
+          {_entry, invalid}, acc ->
+            record_state_read_failure({:invalid_cold_read_result, invalid})
             acc
         end)
       end
@@ -524,14 +572,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
               Enum.reduce(grouped, acc, fn entry = {_field, key, _location}, acc ->
                 case Map.fetch(values_by_key, key) do
                   {:ok, value} when is_binary(value) ->
-                    Map.put(acc, entry, cross_shard_cold_result(entry, value))
+                    case materialize_cross_shard_cold_value(ctx, value) do
+                      materialized when is_binary(materialized) ->
+                        Map.put(acc, entry, cross_shard_cold_result(entry, materialized))
+
+                      _failed ->
+                        acc
+                    end
 
                   _missing ->
+                    record_state_read_failure({:waraft_value_unavailable, :not_found})
                     acc
                 end
               end)
 
-            _error ->
+            {:error, reason} ->
+              record_state_read_failure({:waraft_value_unavailable, reason})
+              acc
+
+            invalid ->
+              record_state_read_failure({:invalid_waraft_read_result, invalid})
               acc
           end
         end)
@@ -720,7 +780,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
           when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
             {results, [{index, key, {:waraft, fid}, exp} | cold]}
 
-          [{^key, nil, _exp, _lfu, _fid, _off, _vsize}] ->
+          [{^key, value, exp, _lfu, _fid, _off, _vsize}]
+          when exp != 0 and exp <= now ->
+            cross_shard_delete_keydir_entry(ctx, key, value)
+            {results, cold}
+
+          [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
+            record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+            {results, cold}
+
+          [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
             cross_shard_delete_keydir_entry(ctx, key, nil)
             {results, cold}
 
@@ -729,6 +798,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         end
       rescue
         ArgumentError ->
+          record_state_read_failure(:keydir_unavailable)
           {results, cold}
       end
 
@@ -742,13 +812,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
           end)
 
         results
-        |> cross_shard_read_cold_meta_bitcask_batch(bitcask_reads)
+        |> cross_shard_read_cold_meta_bitcask_batch(ctx, bitcask_reads)
         |> cross_shard_read_cold_meta_waraft_batch(ctx, waraft_reads)
       end
 
-      defp cross_shard_read_cold_meta_bitcask_batch(results, []), do: results
+      defp cross_shard_read_cold_meta_bitcask_batch(results, _ctx, []), do: results
 
-      defp cross_shard_read_cold_meta_bitcask_batch(results, cold_reads) do
+      defp cross_shard_read_cold_meta_bitcask_batch(results, ctx, cold_reads) do
         locations =
           Enum.map(cold_reads, fn {_index, key, {:bitcask, path, off}, _exp} ->
             {path, off, key}
@@ -767,9 +837,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         |> Enum.zip(values)
         |> Enum.reduce(results, fn
           {{index, _key, _location, exp}, value}, acc when is_binary(value) ->
-            Map.put(acc, index, {value, exp})
+            case materialize_cross_shard_cold_value(ctx, value) do
+              materialized when is_binary(materialized) ->
+                Map.put(acc, index, {materialized, exp})
 
-          {_read, _value}, acc ->
+              _failed ->
+                acc
+            end
+
+          {_read, {:error, reason}}, acc ->
+            record_state_read_failure({:cold_value_unavailable, reason})
+            acc
+
+          {_read, invalid}, acc ->
+            record_state_read_failure({:invalid_cold_read_result, invalid})
             acc
         end)
       end
@@ -791,12 +872,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             {:ok, values_by_key} when is_map(values_by_key) ->
               Enum.reduce(grouped, acc, fn {index, key, _location, exp}, acc ->
                 case Map.fetch(values_by_key, key) do
-                  {:ok, value} when is_binary(value) -> Map.put(acc, index, {value, exp})
-                  _missing -> acc
+                  {:ok, value} when is_binary(value) ->
+                    case materialize_cross_shard_cold_value(ctx, value) do
+                      materialized when is_binary(materialized) ->
+                        Map.put(acc, index, {materialized, exp})
+
+                      _failed ->
+                        acc
+                    end
+
+                  _missing ->
+                    record_state_read_failure({:waraft_value_unavailable, :not_found})
+                    acc
                 end
               end)
 
-            _error ->
+            {:error, reason} ->
+              record_state_read_failure({:waraft_value_unavailable, reason})
+              acc
+
+            invalid ->
+              record_state_read_failure({:invalid_waraft_read_result, invalid})
               acc
           end
         end)
@@ -821,9 +917,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             :unavailable
 
           true ->
-            ctx
-            |> cross_shard_zset_index_state(redis_key)
-            |> fun.()
+            case cross_shard_zset_index_state(ctx, redis_key) do
+              {:ok, state} -> fun.(state)
+              {:error, {:storage_read_failed, _reason}} = failure -> failure
+            end
         end
       end
 
@@ -855,17 +952,129 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       end
 
       defp promoted_compound_path(ctx, redis_key, compound_key_or_prefix) do
+        Promotion.await_compaction_latch(ctx, redis_key)
+
         case compound_type_from_key(compound_key_or_prefix) do
           nil ->
             nil
 
           type ->
-            path =
-              Promotion.dedicated_path(promoted_data_dir(ctx), ctx_index(ctx), type, redis_key)
-
-            if Ferricstore.FS.dir?(path), do: path, else: nil
+            promoted_catalog_path(ctx, redis_key) || promoted_marker_path(ctx, redis_key, type)
         end
       end
+
+      defp promoted_catalog_path(ctx, redis_key) do
+        if promoted_instance_removal_pending?(redis_key) do
+          nil
+        else
+          case Map.get(Map.get(ctx, :promoted_instances, %{}), redis_key) do
+            %{path: path} when is_binary(path) -> path
+            path when is_binary(path) -> path
+            _missing -> nil
+          end
+        end
+      end
+
+      defp promoted_instance_removal_pending?(redis_key) do
+        case Process.get(:sm_pending_compound_promotion_removals) do
+          %MapSet{} = removals -> MapSet.member?(removals, redis_key)
+          _not_applying -> false
+        end
+      end
+
+      defp promoted_marker_path(ctx, redis_key, :collection_metadata) do
+        marker_key = Promotion.marker_key(redis_key)
+        marker_ctx = promoted_marker_ctx(ctx)
+
+        type =
+          case cross_shard_ets_read(marker_ctx, marker_key) do
+            "hash" -> :hash
+            "set" -> :set
+            "zset" -> :zset
+            _other -> nil
+          end
+
+        if type do
+          Promotion.dedicated_path(
+            promoted_data_dir(ctx),
+            ctx_index(ctx),
+            type,
+            redis_key
+          )
+        end
+      end
+
+      defp promoted_marker_path(ctx, redis_key, type) do
+        marker_key = Promotion.marker_key(redis_key)
+        marker_ctx = promoted_marker_ctx(ctx)
+        expected_type = Atom.to_string(type)
+
+        case cross_shard_ets_read(marker_ctx, marker_key) do
+          ^expected_type ->
+            Promotion.dedicated_path(
+              promoted_data_dir(ctx),
+              ctx_index(ctx),
+              type,
+              redis_key
+            )
+
+          nil ->
+            if live_promotion_marker_entry?(marker_ctx.keydir, marker_key) do
+              Promotion.dedicated_path(
+                promoted_data_dir(ctx),
+                ctx_index(ctx),
+                type,
+                redis_key
+              )
+            end
+
+          _other_type ->
+            nil
+        end
+      end
+
+      defp promoted_marker_ctx(%{keydir: _keydir} = ctx), do: ctx
+      defp promoted_marker_ctx(%{ets: keydir} = ctx), do: Map.put(ctx, :keydir, keydir)
+
+      defp live_promotion_marker_entry?(keydir, marker_key) do
+        now = apply_now_ms()
+
+        case :ets.lookup(keydir, marker_key) do
+          [{^marker_key, _value, expire_at_ms, _lfu, _fid, _offset, _value_size}] ->
+            expire_at_ms == 0 or expire_at_ms > now
+
+          _missing ->
+            false
+        end
+      rescue
+        ArgumentError -> false
+      end
+
+      defp promoted_compound_batch_path(ctx, redis_key, compound_entries) do
+        {targets, _cached_types} =
+          Enum.reduce(compound_entries, {MapSet.new(), %{}}, fn entry, {targets, cached_types} ->
+            compound_key = compound_batch_key(entry)
+            type = compound_type_from_key(compound_key)
+
+            case Map.fetch(cached_types, type) do
+              {:ok, target} ->
+                {MapSet.put(targets, target), cached_types}
+
+              :error ->
+                target = promoted_compound_path(ctx, redis_key, compound_key)
+                {MapSet.put(targets, target), Map.put(cached_types, type, target)}
+            end
+          end)
+
+        case MapSet.to_list(targets) do
+          [] -> nil
+          [target] -> target
+          _mixed -> :mixed
+        end
+      end
+
+      defp compound_batch_key({compound_key, _value, _expire_at_ms}), do: compound_key
+      defp compound_batch_key(compound_key) when is_binary(compound_key), do: compound_key
 
       defp ctx_index(%{index: index}), do: index
       defp ctx_index(%{shard_index: index}), do: index
@@ -886,6 +1095,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       defp compound_type_from_key("H:" <> _), do: :hash
       defp compound_type_from_key("S:" <> _), do: :set
       defp compound_type_from_key("Z:" <> _), do: :zset
+      defp compound_type_from_key("T:" <> _), do: :collection_metadata
       defp compound_type_from_key(_), do: nil
 
       defp cross_shard_prefix_count(ctx, prefix) do
@@ -893,20 +1103,36 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         now = apply_now_ms()
 
         ms = [
-          {{:"$1", :_, :"$2", :_, :_, :_, :_},
+          {{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
            [
              {:andalso, {:is_binary, :"$1"},
               {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
                {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
-           ], [:"$2"]}
+           ], [{{:"$2", :"$3", :"$4", :"$5", :"$6"}}]}
         ]
 
         try do
           :ets.select(ctx.keydir, ms)
-          |> Enum.count(fn exp -> exp == 0 or exp > now end)
+          |> Enum.reduce(0, fn {value, exp, fid, off, vsize}, count ->
+            cond do
+              exp != 0 and exp <= now ->
+                count
+
+              value != nil ->
+                count + 1
+
+              valid_cross_shard_cold_location_value?(fid, off, vsize) ->
+                count + 1
+
+              true ->
+                record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                count
+            end
+          end)
         rescue
           ArgumentError ->
             emit_cross_shard_keydir_unavailable(ctx, :cross_shard_prefix_count)
+            record_state_read_failure(:keydir_unavailable)
             0
         end
       end
@@ -942,6 +1168,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         rescue
           ArgumentError ->
             emit_cross_shard_keydir_unavailable(ctx, :cross_shard_delete_prefix)
+            record_state_read_failure(:keydir_unavailable)
             :ok
         end
 

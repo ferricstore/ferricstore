@@ -23,6 +23,16 @@ defmodule Ferricstore.Commands.SlowLogTest do
   # ---------------------------------------------------------------------------
 
   describe "SlowLog module" do
+    test "uses ordered traversal instead of copying and sorting the complete ring" do
+      assert :ets.info(:ferricstore_slowlog, :type) == :ordered_set
+
+      source =
+        File.read!(Path.expand("../../../lib/ferricstore/slowlog.ex", __DIR__))
+
+      refute source =~ ":ets.tab2list"
+      refute source =~ "Enum.sort_by"
+    end
+
     test "get returns empty list initially" do
       assert SlowLog.get() == []
     end
@@ -183,6 +193,66 @@ defmodule Ferricstore.Commands.SlowLogTest do
       assert ["CMD_5"] in commands
       assert ["CMD_4"] in commands
       assert ["CMD_3"] in commands
+    end
+
+    test "invalid cached limits fall back instead of disabling logging or eviction" do
+      original_threshold = SlowLog.threshold()
+      original_max = SlowLog.max_len()
+
+      try do
+        :persistent_term.put(:ferricstore_slowlog_threshold, "invalid")
+        :persistent_term.put(:ferricstore_slowlog_max_len, "invalid")
+
+        assert SlowLog.threshold() == 10_000
+        assert SlowLog.max_len() == 128
+      after
+        SlowLog.set_threshold(original_threshold)
+        SlowLog.set_max_len(original_max)
+      end
+    end
+
+    test "redacts authentication and configuration secrets before enqueueing" do
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
+
+      on_exit(fn -> SlowLog.set_threshold(original) end)
+
+      SlowLog.maybe_log(["AUTH", "admin", "auth-secret"], 100)
+      SlowLog.maybe_log(["CONFIG", "SET", "requirepass", "config-secret"], 100)
+
+      SlowLog.maybe_log(
+        ["ACL", "SETUSER", "alice", "on", ">acl-secret", "+@all"],
+        100
+      )
+
+      assert :pong = GenServer.call(SlowLog, :ping)
+
+      stored = SlowLog.get() |> Enum.map(fn {_id, _ts, _duration, command} -> command end)
+      serialized = :erlang.term_to_binary(stored)
+
+      refute serialized =~ "auth-secret"
+      refute serialized =~ "config-secret"
+      refute serialized =~ "acl-secret"
+      assert ["AUTH", "[redacted]"] in stored
+      assert ["CONFIG", "SET", "requirepass", "[redacted]"] in stored
+      assert ["ACL", "SETUSER", "alice", "[redacted]"] in stored
+    end
+
+    test "bounds stored argument count and bytes" do
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
+
+      on_exit(fn -> SlowLog.set_threshold(original) end)
+
+      oversized = :binary.copy("x", 4_096)
+      SlowLog.maybe_log(["SET", oversized | Enum.map(1..40, &"arg-#{&1}")], 100)
+      assert :pong = GenServer.call(SlowLog, :ping)
+
+      [{_id, _ts, _duration, command}] = SlowLog.get()
+      assert length(command) == 32
+      assert byte_size(Enum.at(command, 1)) < 256
+      refute Enum.at(command, 1) == oversized
+      assert List.last(command) =~ "more arguments"
     end
 
     test "reset clears all entries and resets ID counter" do

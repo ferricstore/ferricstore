@@ -12,6 +12,9 @@ defmodule Ferricstore.Flow.HistoryEntry do
   def fields_to_map(fields) when is_list(fields) do
     fields
     |> Enum.chunk_every(2)
-    |> Map.new(fn [key, value] -> {key, value} end)
+    |> Enum.reduce(%{}, fn
+      [key, value], acc when is_binary(key) -> Map.put(acc, key, value)
+      _invalid, acc -> acc
+    end)
   end
 end

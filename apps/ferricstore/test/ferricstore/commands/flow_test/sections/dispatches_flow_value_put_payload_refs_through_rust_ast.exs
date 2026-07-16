@@ -812,6 +812,43 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
                    MockStore.make()
                  )
       end
+
+      @tag :extend_lease_return_ok_command
+      test "dispatches Flow extend_lease with an OK-only response" do
+        id = uid("flow-command-extend-lease-ok")
+
+        assert "OK" =
+                 Dispatcher.dispatch(
+                   "FLOW.CREATE",
+                   [id, "TYPE", "extend-command-ok", "RUN_AT", "1000"],
+                   MockStore.make()
+                 )
+
+        assert [%{"lease_token" => lease_token, "fencing_token" => fencing_token}] =
+                 Dispatcher.dispatch(
+                   "FLOW.CLAIM_DUE",
+                   ["extend-command-ok", "WORKER", "worker-a", "LEASE_MS", "50", "NOW", "1000"],
+                   MockStore.make()
+                 )
+
+        assert "OK" =
+                 Dispatcher.dispatch(
+                   "FLOW.EXTEND_LEASE",
+                   [
+                     id,
+                     lease_token,
+                     "FENCING",
+                     Integer.to_string(fencing_token),
+                     "LEASE_MS",
+                     "500",
+                     "NOW",
+                     "1020",
+                     "RETURN",
+                     "OK_ON_SUCCESS"
+                   ],
+                   MockStore.make()
+                 )
+      end
     end
   end
 end

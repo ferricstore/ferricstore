@@ -1,0 +1,322 @@
+defmodule Ferricstore.Store.StandaloneCommitQueueTest do
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.Shard
+
+  test "waiting commits are bounded without changing FIFO apply order" do
+    {pid, ctx, data_dir} = start_shard(standalone_commit_max_queued_ops: 2)
+
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    assert :ok = GenServer.call(pid, :standalone_cross_shard_barrier_acquire)
+
+    first = :gen_server.send_request(pid, {:standalone_commit, {:put, "queue:key", "first", 0}})
+
+    second =
+      :gen_server.send_request(pid, {:standalone_commit, {:put, "queue:key", "second", 0}})
+
+    assert %{waiting_count: 2} = GenServer.call(pid, :standalone_commit_debug)
+
+    rejected =
+      :gen_server.send_request(pid, {:standalone_commit, {:put, "queue:rejected", "value", 0}})
+
+    assert {:reply, {:error, "BUSY standalone commit queue is full"}} =
+             :gen_server.receive_response(rejected, 500)
+
+    assert %{waiting_count: 2} = GenServer.call(pid, :standalone_commit_debug)
+    assert :ok = GenServer.call(pid, :standalone_cross_shard_barrier_release)
+    assert {:reply, :ok} = :gen_server.receive_response(first, 5_000)
+    assert {:reply, :ok} = :gen_server.receive_response(second, 5_000)
+
+    assert "second" = Router.get(ctx, "queue:key")
+    assert nil == Router.get(ctx, "queue:rejected")
+  end
+
+  test "retained commit bytes include the in-flight durability batch" do
+    test_pid = self()
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(test_pid, {:durability_batch, self(), length(batch)})
+
+      receive do
+        :continue -> :passthrough
+      after
+        1_000 -> :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    first_command = {:put, "queue:bytes:first", String.duplicate("a", 256), 0}
+    first_bytes = :erlang.external_size(first_command)
+
+    {pid, ctx, data_dir} =
+      start_shard(
+        standalone_fsync_max_delay_ms: 1,
+        standalone_commit_max_queued_ops: 10,
+        standalone_commit_max_queued_bytes: first_bytes
+      )
+
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    first = :gen_server.send_request(pid, {:standalone_commit, first_command})
+    assert_receive {:durability_batch, first_worker, 1}, 1_000
+
+    assert %{
+             batch_bytes: 0,
+             waiting_bytes: 0,
+             inflight_bytes: ^first_bytes,
+             retained_bytes: ^first_bytes
+           } = GenServer.call(pid, :standalone_commit_debug)
+
+    rejected =
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit, {:put, "queue:bytes:rejected", "b", 0}}
+      )
+
+    assert {:reply, {:error, "BUSY standalone commit queue is full"}} =
+             :gen_server.receive_response(rejected, 500)
+
+    send(first_worker, :continue)
+    assert {:reply, :ok} = :gen_server.receive_response(first, 5_000)
+    assert nil == Router.get(ctx, "queue:bytes:rejected")
+  end
+
+  test "a drained waiting queue still honors the fsync batch limit" do
+    test_pid = self()
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(test_pid, {:durability_batch, self(), length(batch)})
+
+      receive do
+        :continue -> :passthrough
+      after
+        1_000 -> :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    {pid, ctx, data_dir} =
+      start_shard(standalone_fsync_max_ops: 2, standalone_commit_max_queued_ops: 5)
+
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    assert :ok = GenServer.call(pid, :standalone_cross_shard_barrier_acquire)
+
+    requests =
+      for index <- 1..5 do
+        :gen_server.send_request(
+          pid,
+          {:standalone_commit, {:put, "queue:chunk:#{index}", Integer.to_string(index), 0}}
+        )
+      end
+
+    assert %{waiting_count: 5} = GenServer.call(pid, :standalone_commit_debug)
+    assert :ok = GenServer.call(pid, :standalone_cross_shard_barrier_release)
+
+    assert_receive {:durability_batch, first_worker, 2}, 1_000
+    assert %{batch_count: 3, inflight_count: 2} = GenServer.call(pid, :standalone_commit_debug)
+    send(first_worker, :continue)
+
+    assert_receive {:durability_batch, second_worker, 2}, 1_000
+    send(second_worker, :continue)
+
+    assert_receive {:durability_batch, third_worker, 1}, 1_000
+    send(third_worker, :continue)
+
+    Enum.each(requests, fn request ->
+      assert {:reply, :ok} = :gen_server.receive_response(request, 5_000)
+    end)
+  end
+
+  test "a later single-key write cannot overtake an earlier multi-key dependency" do
+    test_pid = self()
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(test_pid, {:durability_batch, self(), length(batch)})
+
+      receive do
+        :continue -> :passthrough
+      after
+        5_000 -> :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 0)
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    first = :gen_server.send_request(pid, {:standalone_commit, {:put, "queue:dep:a", "a0", 0}})
+    assert_receive {:durability_batch, first_worker, 1}, 1_000
+
+    middle =
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit, {:mset, [{"queue:dep:a", "a1", 0}, {"queue:dep:b", "b1", 0}]}}
+      )
+
+    last =
+      :gen_server.send_request(pid, {:standalone_commit, {:put, "queue:dep:b", "b2", 0}})
+
+    assert %{batch_count: 0, waiting_count: 2, inflight_count: 1} =
+             GenServer.call(pid, :standalone_commit_debug)
+
+    send(first_worker, :continue)
+    assert_receive {:durability_batch, second_worker, 2}, 1_000
+    send(second_worker, :continue)
+
+    assert_receive {:durability_batch, third_worker, 1}, 1_000
+    send(third_worker, :continue)
+
+    assert {:reply, :ok} = :gen_server.receive_response(first, 5_000)
+    assert {:reply, :ok} = :gen_server.receive_response(middle, 5_000)
+    assert {:reply, :ok} = :gen_server.receive_response(last, 5_000)
+    assert "b2" == Router.get(ctx, "queue:dep:b")
+  end
+
+  test "same-key conditional writes observe the preceding durability batch" do
+    test_pid = self()
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, batch ->
+      send(test_pid, {:durability_batch, self(), length(batch)})
+
+      receive do
+        :continue -> :passthrough
+      after
+        5_000 -> :passthrough
+      end
+    end)
+
+    on_exit(fn -> restore_env(:standalone_durability_hook, previous_hook) end)
+
+    {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 50)
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    opts = %{expire_at_ms: 0, get: false, keepttl: false, nx: true, xx: false}
+
+    first =
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit, {:set, "queue:nx", "first", 0, opts}}
+      )
+
+    second =
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit, {:set, "queue:nx", "second", 0, opts}}
+      )
+
+    assert_receive {:durability_batch, first_worker, 1}, 1_000
+
+    assert %{batch_count: 0, waiting_count: 1, inflight_count: 1} =
+             GenServer.call(pid, :standalone_commit_debug)
+
+    refute_receive {:durability_batch, _worker, _count}, 100
+    send(first_worker, :continue)
+
+    assert {:reply, :ok} = :gen_server.receive_response(first, 5_000)
+    assert {:reply, nil} = :gen_server.receive_response(second, 5_000)
+    refute_receive {:durability_batch, _worker, _count}, 100
+    assert "first" == Router.get(ctx, "queue:nx")
+  end
+
+  test "nested batches and disjoint writes receive their own exact result slices" do
+    {pid, ctx, data_dir} = start_shard(standalone_commit_delay_ms: 100)
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    batch =
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit,
+         {:batch,
+          [
+            {:put, "queue:batch:a", "a", 0},
+            {:put, "queue:batch:b", "b", 0}
+          ]}}
+      )
+
+    single =
+      :gen_server.send_request(
+        pid,
+        {:standalone_commit, {:put, "queue:single:c", "c", 0}}
+      )
+
+    assert %{batch_count: 2} = GenServer.call(pid, :standalone_commit_debug)
+    assert {:reply, {:ok, [:ok, :ok]}} = :gen_server.receive_response(batch, 5_000)
+    assert {:reply, :ok} = :gen_server.receive_response(single, 5_000)
+
+    assert "a" == Router.get(ctx, "queue:batch:a")
+    assert "b" == Router.get(ctx, "queue:batch:b")
+    assert "c" == Router.get(ctx, "queue:single:c")
+  end
+
+  test "pausing writes keeps list reads available while rejecting list mutations" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    assert :ok = GenServer.call(pid, {:pause_writes})
+    assert 0 = GenServer.call(pid, {:list_read, "queue:paused:list", :llen})
+
+    assert {:error, "ERR shard writes paused for sync"} =
+             GenServer.call(pid, {:list_op, "queue:paused:list", {:rpush, ["value"]}})
+
+    assert {:error, "ERR shard writes paused for sync"} =
+             GenServer.call(pid, {:locked_put, "queue:paused:key", "value", 0, make_ref()})
+  end
+
+  test "pause reports a prior flush failure instead of claiming a clean sync boundary" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    :sys.replace_state(pid, &Map.put(&1, :last_flush_error, :synthetic_eio))
+
+    assert {:error, {:flush_failed, :synthetic_eio}} = GenServer.call(pid, {:pause_writes})
+    assert %{writes_paused: true, last_flush_error: :synthetic_eio} = :sys.get_state(pid)
+  end
+
+  defp start_shard(opts) do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "standalone_commit_queue_#{System.unique_integer([:positive])}"
+      )
+
+    name = :"standalone_commit_queue_#{System.unique_integer([:positive])}"
+    ctx = FerricStore.Instance.build(name, data_dir: data_dir, shard_count: 1)
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    {:ok, pid} =
+      Shard.start_link(
+        [
+          index: 0,
+          data_dir: data_dir,
+          instance_ctx: ctx,
+          flow_shared_ref_backfill?: false
+        ] ++ opts
+      )
+
+    {pid, ctx, data_dir}
+  end
+
+  defp cleanup_shard(pid, ctx, data_dir) do
+    try do
+      if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
+    catch
+      :exit, _reason -> :ok
+    end
+
+    FerricStore.Instance.cleanup(ctx.name)
+    File.rm_rf!(data_dir)
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+end

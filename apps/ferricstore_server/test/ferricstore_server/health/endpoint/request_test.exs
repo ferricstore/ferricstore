@@ -77,6 +77,14 @@ defmodule FerricstoreServer.Health.Endpoint.RequestTest do
     assert Request.parse_request_line("GET /missing-terminator HTTP/1.1") == :error
   end
 
+  test "parse_request_line rejects invalid UTF-8 before routing" do
+    invalid_path = <<"GET /dashboard/", 0xFF, " HTTP/1.1\r\nHost: localhost\r\n\r\n">>
+    invalid_header = <<"GET /dashboard HTTP/1.1\r\nX-Test: ", 0xFF, "\r\n\r\n">>
+
+    assert Request.parse_request_line(invalid_path) == :error
+    assert Request.parse_request_line(invalid_header) == :error
+  end
+
   test "parse_request_line rejects ambiguous HTTP body framing" do
     assert Request.parse_request_line(
              "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"

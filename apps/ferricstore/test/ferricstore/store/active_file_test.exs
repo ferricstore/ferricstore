@@ -32,6 +32,16 @@ defmodule Ferricstore.Store.ActiveFileTest do
   # ---------------------------------------------------------------------------
 
   describe "ActiveFile registry" do
+    test "uses one instance-qualified key shape for the default instance" do
+      ActiveFile.publish(0, 77_001, "/tmp/default-active.log", "/tmp")
+
+      assert [
+               {{:default, 0}, _generation, 77_001, "/tmp/default-active.log", "/tmp"}
+             ] = :ets.lookup(:ferricstore_active_files, {:default, 0})
+
+      assert [] = :ets.lookup(:ferricstore_active_files, 0)
+    end
+
     test "get/1 returns valid file metadata for each shard" do
       shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
@@ -68,6 +78,28 @@ defmodule Ferricstore.Store.ActiveFileTest do
       {fid2, path2, _} = ActiveFile.get(0)
       assert fid2 == 88_888
       assert path2 == new_path
+    end
+
+    @tag :active_file_scoped_generation
+    test "publishing another shard does not invalidate this shard's process cache" do
+      ctx = %{name: :active_file_scoped_generation, shard_count: 2}
+      first_path = "/tmp/active-file-scoped-0.log"
+      second_path = "/tmp/active-file-scoped-1.log"
+
+      try do
+        ActiveFile.publish(ctx, 0, 0, first_path, "/tmp")
+        ActiveFile.publish(ctx, 1, 0, second_path, "/tmp")
+        assert {0, ^first_path, "/tmp"} = ActiveFile.get(ctx, 0)
+
+        cache_key = {:active_file_cache, {ctx.name, 0}}
+        cached_first = Process.get(cache_key)
+
+        ActiveFile.publish(ctx, 1, 1, second_path <> ".next", "/tmp")
+        assert {0, ^first_path, "/tmp"} = ActiveFile.get(ctx, 0)
+        assert Process.get(cache_key) == cached_first
+      after
+        ActiveFile.cleanup_instance(ctx)
+      end
     end
 
     test "get/1 from different processes sees published values", %{orig_af: {_, _, data_path}} do

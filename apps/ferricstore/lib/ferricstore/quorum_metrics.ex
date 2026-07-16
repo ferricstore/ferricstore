@@ -633,14 +633,35 @@ defmodule Ferricstore.QuorumMetrics do
     key = {metric_id, labels}
 
     try do
-      case :ets.lookup(@table, key) do
-        [{^key, current}] when current >= amount -> :ok
-        _ -> :ets.insert(@table, {key, amount})
-      end
-
-      :ok
+      put_max(key, amount)
     rescue
       ArgumentError -> :ok
+    end
+  end
+
+  defp put_max(key, amount) do
+    if :ets.insert_new(@table, {key, amount}) do
+      :ok
+    else
+      replace_max(key, amount)
+    end
+  end
+
+  defp replace_max(key, amount) do
+    case :ets.lookup(@table, key) do
+      [{^key, current}] when current >= amount ->
+        :ok
+
+      [{^key, current}] ->
+        match_spec = [{{:"$1", current}, [{:"=:=", :"$1", {:const, key}}], [{{:"$1", amount}}]}]
+
+        case :ets.select_replace(@table, match_spec) do
+          1 -> :ok
+          0 -> replace_max(key, amount)
+        end
+
+      [] ->
+        put_max(key, amount)
     end
   end
 

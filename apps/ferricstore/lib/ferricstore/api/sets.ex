@@ -170,13 +170,10 @@ defmodule FerricStore.API.Sets do
   def smismember(key, members) when is_list(members) do
     store = build_compound_store(key)
 
-    results =
-      Enum.map(members, fn member ->
-        compound_key = Ferricstore.Store.CompoundKey.set_member(key, member)
-        if store.compound_get.(key, compound_key) != nil, do: 1, else: 0
-      end)
-
-    {:ok, results}
+    case Set.handle_ast({:smismember, [key | members]}, store) do
+      {:error, _reason} = error -> error
+      results -> {:ok, results}
+    end
   end
 
   @doc """

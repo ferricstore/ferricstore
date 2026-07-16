@@ -55,35 +55,29 @@
     }
 
     #[test]
-    fn load_into_keydir_populates_entries() {
-        let dir = tmp();
-        let path = dir.path().join("data.hint");
+    fn hint_crc_hot_paths_do_not_copy_record_bodies() {
+        let source = include_str!("../hint.rs");
 
-        let mut writer = HintWriter::open(&path).unwrap();
-        writer
-            .write_entry(&HintEntry {
-                file_id: 5,
-                offset: 256,
-                value_size: 20,
-                expire_at_ms: 99_000,
-                key: b"mykey".to_vec(),
-            })
-            .unwrap();
-        writer.commit().unwrap();
+        let write_start = source.find("pub fn write_entry").unwrap();
+        let write_end = source[write_start..].find("pub fn commit").unwrap() + write_start;
+        let write_body = &source[write_start..write_end];
 
-        let mut kd = KeyDir::new();
-        let mut reader = HintReader::open(&path).unwrap();
-        reader.load_into(&mut kd).unwrap();
+        let read_start = source.find("fn read_hint_entry").unwrap();
+        let read_end = source[read_start..].find("fn crc32").unwrap() + read_start;
+        let read_body = &source[read_start..read_end];
 
-        let entry = kd.get(b"mykey").unwrap();
-        assert_eq!(entry.file_id, 5);
-        assert_eq!(entry.offset, 256);
-        assert_eq!(entry.value_size, 20);
-        assert_eq!(entry.expire_at_ms, 99_000);
+        assert!(
+            !write_body.contains("Vec::with_capacity"),
+            "hint writes must hash and write header/key slices without assembling a copy"
+        );
+        assert!(
+            !read_body.contains("Vec::with_capacity"),
+            "hint reads must hash header/key slices without assembling a copy"
+        );
     }
 
     #[test]
-    fn load_into_keydir_skips_tombstones() {
+    fn read_all_preserves_zero_length_live_values() {
         let dir = tmp();
         let path = dir.path().join("data.hint");
 
@@ -101,69 +95,32 @@
             .write_entry(&HintEntry {
                 file_id: 2,
                 offset: 0,
-                value_size: 0, // tombstone
+                value_size: 0,
                 expire_at_ms: 0,
                 key: b"dead".to_vec(),
             })
             .unwrap();
         writer.commit().unwrap();
 
-        let mut kd = KeyDir::new();
         let mut reader = HintReader::open(&path).unwrap();
-        reader.load_into(&mut kd).unwrap();
+        let entries = reader.read_all().unwrap();
 
-        assert!(kd.get(b"live").is_some());
-        assert!(kd.get(b"dead").is_none());
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, b"live");
+        assert_eq!(entries[1].key, b"dead");
+        assert_eq!(entries[1].value_size, 0);
     }
 
     #[test]
-    fn load_into_keydir_later_entry_overwrites_earlier() {
-        let dir = tmp();
-        let path = dir.path().join("data.hint");
-
-        let mut writer = HintWriter::open(&path).unwrap();
-        writer
-            .write_entry(&HintEntry {
-                file_id: 1,
-                offset: 0,
-                value_size: 5,
-                expire_at_ms: 0,
-                key: b"k".to_vec(),
-            })
-            .unwrap();
-        writer
-            .write_entry(&HintEntry {
-                file_id: 2,
-                offset: 500,
-                value_size: 8,
-                expire_at_ms: 0,
-                key: b"k".to_vec(),
-            })
-            .unwrap();
-        writer.commit().unwrap();
-
-        let mut kd = KeyDir::new();
-        let mut reader = HintReader::open(&path).unwrap();
-        reader.load_into(&mut kd).unwrap();
-
-        let entry = kd.get(b"k").unwrap();
-        assert_eq!(entry.file_id, 2);
-        assert_eq!(entry.offset, 500);
-    }
-
-    #[test]
-    fn empty_hint_file_loads_empty_keydir() {
+    fn empty_hint_file_reads_empty() {
         let dir = tmp();
         let path = dir.path().join("empty.hint");
 
         let writer = HintWriter::open(&path).unwrap();
         writer.commit().unwrap();
 
-        let mut kd = KeyDir::new();
         let mut reader = HintReader::open(&path).unwrap();
-        reader.load_into(&mut kd).unwrap();
-
-        assert!(kd.is_empty());
+        assert!(reader.read_all().unwrap().is_empty());
     }
 
     // ------------------------------------------------------------------
@@ -524,92 +481,6 @@
     }
 
     // ------------------------------------------------------------------
-    // load_into: detailed edge cases
-    // ------------------------------------------------------------------
-
-    /// Loading an empty hint file results in an empty keydir.
-    #[test]
-    fn load_into_empty_file_returns_empty_keydir() {
-        let dir = tmp();
-        let path = dir.path().join("empty2.hint");
-
-        let writer = HintWriter::open(&path).unwrap();
-        writer.commit().unwrap();
-
-        let mut kd = KeyDir::new();
-        let mut reader = HintReader::open(&path).unwrap();
-        reader.load_into(&mut kd).unwrap();
-
-        assert!(kd.is_empty(), "empty hint file must produce empty keydir");
-        assert_eq!(kd.len(), 0);
-    }
-
-    /// Writing 15 entries and loading them populates the keydir with 15 entries.
-    #[test]
-    fn load_into_all_entries_added_to_keydir() {
-        let dir = tmp();
-        let path = dir.path().join("data.hint");
-
-        let entries: Vec<HintEntry> = (0u64..15)
-            .map(|i| HintEntry {
-                file_id: 1,
-                offset: i * 50,
-                value_size: 10,
-                expire_at_ms: 0,
-                key: format!("load_key_{i}").into_bytes(),
-            })
-            .collect();
-
-        {
-            let mut writer = HintWriter::open(&path).unwrap();
-            for e in &entries {
-                writer.write_entry(e).unwrap();
-            }
-            writer.commit().unwrap();
-        }
-
-        let mut kd = KeyDir::new();
-        let mut reader = HintReader::open(&path).unwrap();
-        reader.load_into(&mut kd).unwrap();
-
-        assert_eq!(kd.len(), 15, "all 15 entries must be loaded into keydir");
-        for e in &entries {
-            assert!(kd.get(&e.key).is_some(), "keydir must contain {:?}", e.key);
-        }
-    }
-
-    /// A hint file with a corrupt CRC in the first entry causes `load_into` to return Err.
-    #[test]
-    fn load_into_corrupt_crc_returns_error() {
-        let dir = tmp();
-        let path = dir.path().join("data.hint");
-
-        {
-            let mut writer = HintWriter::open(&path).unwrap();
-            writer
-                .write_entry(&sample_entry(b"crc_load_test", 1, 0))
-                .unwrap();
-            writer.commit().unwrap();
-        }
-
-        // Flip a byte in the key area (byte 34) to invalidate the CRC.
-        {
-            use std::fs::OpenOptions;
-            use std::io::{Seek, SeekFrom, Write};
-            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
-            f.seek(SeekFrom::Start(34)).unwrap();
-            f.write_all(&[0xCC]).unwrap();
-        }
-
-        let mut kd = KeyDir::new();
-        let mut reader = HintReader::open(&path).unwrap();
-        assert!(
-            reader.load_into(&mut kd).is_err(),
-            "load_into on corrupt hint must return Err"
-        );
-    }
-
-    // ------------------------------------------------------------------
     // H-REMAIN-1: crc32fast backward compatibility
     // ------------------------------------------------------------------
 
@@ -833,3 +704,50 @@
             "Drop must clean up the .hint.tmp file when commit was skipped"
         );
     }
+#[test]
+fn truncated_crc_prefix_is_corruption_not_clean_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("truncated.hint");
+    std::fs::write(&path, [0xAA]).unwrap();
+
+    let error = HintReader::open(&path)
+        .unwrap()
+        .read_all()
+        .unwrap_err();
+
+    assert!(error.to_string().contains("truncated"));
+}
+
+#[test]
+fn writer_rejects_keys_that_do_not_fit_the_persisted_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized.hint");
+    let mut writer = HintWriter::open(&path).unwrap();
+
+    let error = writer
+        .write_entry(&HintEntry {
+            file_id: 1,
+            offset: 0,
+            value_size: 0,
+            expire_at_ms: 0,
+            key: vec![b'x'; usize::from(u16::MAX) + 1],
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("key too large"));
+}
+
+#[test]
+fn hint_page_limits_are_bounded_before_scanning() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bounded-page.hint");
+    HintWriter::open(&path).unwrap().commit().unwrap();
+    let mut reader = HintReader::open(&path).unwrap();
+
+    assert!(reader
+        .read_page(0, MAX_HINT_PAGE_ENTRIES + 1, 1)
+        .is_err());
+    assert!(reader
+        .read_page(0, 1, MAX_HINT_PAGE_BYTES + 1)
+        .is_err());
+}

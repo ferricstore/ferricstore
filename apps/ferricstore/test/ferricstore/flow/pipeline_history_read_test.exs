@@ -101,6 +101,43 @@ defmodule Ferricstore.Flow.PipelineHistoryReadTest do
            }
   end
 
+  test "results fail every hot request closed when the rank batch reply is short" do
+    op1 = {1, "flow-1", "tenant", "history-key-1", %{count: 1}, false, false, %{enabled?: false}}
+
+    op2 = {2, "flow-2", "tenant", "history-key-2", %{count: 1}, false, false, %{enabled?: false}}
+
+    callbacks = %{
+      fetch_count: fn %{count: 1} -> 1 end,
+      hot_range: fn :ctx, _id, "tenant", _history_key, 1 -> {0, 0} end,
+      rank_range_many: fn :ctx, _requests -> {:ok, [[{"e-1", 1}]]} end
+    }
+
+    expected = {:error, "ERR flow history batch read result mismatch"}
+
+    assert PipelineHistoryRead.results([op1, op2], :ctx, callbacks) == %{
+             1 => expected,
+             2 => expected
+           }
+  end
+
+  test "results fail a malformed hot rank result closed without raising" do
+    op = {1, "flow-1", "tenant", "history-key", %{count: 1}, false, false, %{enabled?: false}}
+
+    callbacks = %{
+      fetch_count: fn %{count: 1} -> 1 end,
+      hot_range: fn :ctx, "flow-1", "tenant", "history-key", 1 -> {0, 0} end,
+      rank_range_many: fn :ctx, [{"history-key", 0, 0, false}] -> {:ok, [[:invalid]]} end,
+      from_event_ids: fn _ctx, _id, _partition_key, _history_key, _event_ids, _value_return ->
+        flunk("malformed rank entries must not reach event hydration")
+      end,
+      apply_query: fn events, _query -> events end
+    }
+
+    assert PipelineHistoryRead.results([op], :ctx, callbacks) == %{
+             1 => {:error, "ERR flow history batch read result mismatch"}
+           }
+  end
+
   test "results batch fetches decode contexts for hot history entries" do
     parent = self()
 
@@ -151,6 +188,45 @@ defmodule Ferricstore.Flow.PipelineHistoryReadTest do
 
     assert_received {:from_event_ids_with_context, "flow-2", "history-key-2", ["e-2"],
                      %{id: "flow-2", type: "sms"}}
+  end
+
+  test "results fails a hot read closed when its batched decode context is missing" do
+    op = {1, "flow-1", "tenant", "history-key", %{count: 1}, false, false, %{enabled?: false}}
+
+    callbacks = %{
+      decode_contexts: fn :ctx, [{"flow-1", "tenant"}] -> %{} end,
+      fetch_count: fn _query -> flunk("missing context must stop before range planning") end,
+      hot_range: fn _ctx, _id, _partition_key, _history_key, _count ->
+        flunk("missing context must stop before hot index access")
+      end,
+      rank_range_many: fn _ctx, _requests ->
+        flunk("missing context must stop before rank reads")
+      end
+    }
+
+    assert PipelineHistoryRead.results([op], :ctx, callbacks) == %{
+             1 => {:error, "ERR flow history batch read result mismatch"}
+           }
+  end
+
+  test "results preserves an explicit decode context error" do
+    op = {1, "flow-1", "tenant", "history-key", %{count: 1}, false, false, %{enabled?: false}}
+    error = {:error, "ERR flow state batch unavailable"}
+
+    callbacks = %{
+      decode_contexts: fn :ctx, [{"flow-1", "tenant"}] ->
+        %{{"flow-1", "tenant"} => error}
+      end,
+      fetch_count: fn _query -> flunk("context error must stop before range planning") end,
+      hot_range: fn _ctx, _id, _partition_key, _history_key, _count ->
+        flunk("context error must stop before hot index access")
+      end,
+      rank_range_many: fn _ctx, _requests ->
+        flunk("context error must stop before rank reads")
+      end
+    }
+
+    assert PipelineHistoryRead.results([op], :ctx, callbacks) == %{1 => error}
   end
 
   test "results skips hot index and fallback scan when record disables hot history" do

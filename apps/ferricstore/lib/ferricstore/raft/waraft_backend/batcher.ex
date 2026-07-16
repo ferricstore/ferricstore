@@ -109,6 +109,50 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     end
   end
 
+  @spec write_batch_async(
+          non_neg_integer(),
+          [tuple()],
+          GenServer.from(),
+          SyncGate.token() | nil
+        ) :: :ok | {:direct, term()}
+  def write_batch_async(shard_index, commands, from, sync_token \\ nil)
+      when is_integer(shard_index) and is_list(commands) do
+    case generic_batch_window_ms() do
+      window_ms when window_ms > 0 ->
+        cast_or_commit_batch_direct(shard_index, commands, window_ms, from, sync_token)
+
+      _disabled ->
+        if generic_batch_during_flush?() do
+          cast_or_commit_batch_direct(shard_index, commands, 0, from, sync_token)
+        else
+          {:direct, backend_call(:__commit_batch_direct__, [shard_index, commands])}
+        end
+    end
+  end
+
+  @spec write_single_async(
+          non_neg_integer(),
+          tuple(),
+          GenServer.from(),
+          SyncGate.token() | nil
+        ) :: :ok | {:direct, term()}
+  def write_single_async(shard_index, command, from, sync_token \\ nil)
+      when is_integer(shard_index) and is_tuple(command) do
+    target = {:single, from}
+
+    case generic_batch_window_ms() do
+      window_ms when window_ms > 0 ->
+        cast_or_commit_single_direct(shard_index, command, window_ms, target, sync_token)
+
+      _disabled ->
+        if generic_batch_during_flush?() do
+          cast_or_commit_single_direct(shard_index, command, 0, target, sync_token)
+        else
+          {:direct, backend_call(:__commit_single_direct__, [shard_index, command])}
+        end
+    end
+  end
+
   @spec write_put_batch(non_neg_integer(), [{binary(), binary(), non_neg_integer()}]) :: term()
   def write_put_batch(shard_index, entries)
       when is_integer(shard_index) and is_list(entries) do
@@ -186,30 +230,34 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     do: {:reply, {:error, :shutting_down}, state}
 
   def handle_call({:write, prefix, command, window_ms}, from, state) do
-    slot = Map.get(state.slots, prefix, new_slot(window_ms))
-
-    slot =
-      if slot.timer_ref == nil do
-        token = make_ref()
-        ref = Process.send_after(self(), {:flush, prefix, token}, window_ms)
-        %{slot | timer_ref: ref, timer_token: token, window_ms: window_ms}
-      else
-        slot
-      end
-
-    slot = %{
-      slot
-      | commands: [command | slot.commands],
-        froms: [from | slot.froms],
-        count: slot.count + 1
-    }
-
-    state = %{state | slots: Map.put(state.slots, prefix, slot)}
-
-    if slot.count >= state.max_batch_size and not in_flight?(state, {:prefix, prefix}) do
-      {:noreply, flush_slot(state, prefix)}
+    if namespace_queue_saturated?(state, prefix) do
+      {:reply, {:error, :batcher_overloaded}, state}
     else
-      {:noreply, state}
+      slot = Map.get(state.slots, prefix, new_slot(window_ms))
+
+      slot =
+        if slot.timer_ref == nil do
+          token = make_ref()
+          ref = Process.send_after(self(), {:flush, prefix, token}, window_ms)
+          %{slot | timer_ref: ref, timer_token: token, window_ms: window_ms}
+        else
+          slot
+        end
+
+      slot = %{
+        slot
+        | commands: [command | slot.commands],
+          froms: [from | slot.froms],
+          count: slot.count + 1
+      }
+
+      state = %{state | slots: Map.put(state.slots, prefix, slot)}
+
+      if slot.count >= state.max_batch_size and not in_flight?(state, {:prefix, prefix}) do
+        {:noreply, flush_slot(state, prefix)}
+      else
+        {:noreply, state}
+      end
     end
   end
 
@@ -217,20 +265,26 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     do: {:reply, {:error, :shutting_down}, state}
 
   def handle_call({:write_batch, commands, window_ms}, from, state) do
-    state = enqueue_hot_batch(state, from, commands, window_ms)
+    reply_count = hot_batch_reply_count(commands)
 
-    cond do
-      in_flight?(state, :batch) ->
-        {:noreply, state}
+    if hot_queue_overflow?(state, :batch, state.batch_slot, reply_count) do
+      {:reply, {:error, :batcher_overloaded}, state}
+    else
+      state = enqueue_hot_batch(state, from, commands, window_ms, reply_count)
 
-      window_ms == 0 ->
-        {:noreply, flush_hot_batch_slot(state)}
+      cond do
+        in_flight?(state, :batch) ->
+          {:noreply, state}
 
-      state.batch_slot.count >= state.hot_max_batch_size ->
-        {:noreply, flush_hot_batch_slot(state)}
+        window_ms == 0 ->
+          {:noreply, flush_hot_batch_slot(state)}
 
-      true ->
-        {:noreply, state}
+        state.batch_slot.count >= state.hot_max_batch_size ->
+          {:noreply, flush_hot_batch_slot(state)}
+
+        true ->
+          {:noreply, state}
+      end
     end
   end
 
@@ -238,12 +292,18 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     do: {:reply, {:error, :shutting_down}, state}
 
   def handle_call({:write_put_batch, entries, window_ms}, from, state) do
-    state = enqueue_hot_put_batch(state, from, entries, window_ms)
+    count = length(entries)
 
-    if state.put_slot.count >= state.hot_max_batch_size and not in_flight?(state, :put_batch) do
-      {:noreply, flush_hot_put_slot(state)}
+    if hot_queue_overflow?(state, :put_batch, state.put_slot, count) do
+      {:reply, {:error, :batcher_overloaded}, state}
     else
-      {:noreply, state}
+      state = enqueue_hot_put_batch(state, from, entries, window_ms, count)
+
+      if state.put_slot.count >= state.hot_max_batch_size and not in_flight?(state, :put_batch) do
+        {:noreply, flush_hot_put_slot(state)}
+      else
+        {:noreply, state}
+      end
     end
   end
 
@@ -251,13 +311,19 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     do: {:reply, {:error, :shutting_down}, state}
 
   def handle_call({:write_delete_batch, keys, window_ms}, from, state) do
-    state = enqueue_hot_delete_batch(state, from, keys, window_ms)
+    count = length(keys)
 
-    if state.delete_slot.count >= state.hot_max_batch_size and
-         not in_flight?(state, :delete_batch) do
-      {:noreply, flush_hot_delete_slot(state)}
+    if hot_queue_overflow?(state, :delete_batch, state.delete_slot, count) do
+      {:reply, {:error, :batcher_overloaded}, state}
     else
-      {:noreply, state}
+      state = enqueue_hot_delete_batch(state, from, keys, window_ms, count)
+
+      if state.delete_slot.count >= state.hot_max_batch_size and
+           not in_flight?(state, :delete_batch) do
+        {:noreply, flush_hot_delete_slot(state)}
+      else
+        {:noreply, state}
+      end
     end
   end
 
@@ -275,6 +341,47 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   @impl true
   def handle_cast(
+        {:write_batch, _commands, _window_ms, from, sync_token},
+        %{stopping?: true} = state
+      ) do
+    try do
+      reply_async_target(from, {:error, :shutting_down})
+      {:noreply, state}
+    after
+      release_sync_token(sync_token)
+    end
+  end
+
+  def handle_cast({:write_batch, commands, window_ms, from, sync_token}, state) do
+    try do
+      reply_count = hot_batch_reply_count(commands)
+
+      if hot_queue_overflow?(state, :batch, state.batch_slot, reply_count) do
+        reply_async_target(from, {:error, :batcher_overloaded})
+        {:noreply, state}
+      else
+        state = enqueue_hot_batch(state, from, commands, window_ms, reply_count)
+
+        cond do
+          in_flight?(state, :batch) ->
+            {:noreply, state}
+
+          window_ms == 0 ->
+            {:noreply, flush_hot_batch_slot(state)}
+
+          state.batch_slot.count >= state.hot_max_batch_size ->
+            {:noreply, flush_hot_batch_slot(state)}
+
+          true ->
+            {:noreply, state}
+        end
+      end
+    after
+      release_sync_token(sync_token)
+    end
+  end
+
+  def handle_cast(
         {:write_put_batch, _entries, _window_ms, from, sync_token},
         %{stopping?: true} = state
       ) do
@@ -288,12 +395,20 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   def handle_cast({:write_put_batch, entries, window_ms, from, sync_token}, state) do
     try do
-      state = enqueue_hot_put_batch(state, from, entries, window_ms)
+      count = length(entries)
 
-      if state.put_slot.count >= state.hot_max_batch_size and not in_flight?(state, :put_batch) do
-        {:noreply, flush_hot_put_slot(state)}
-      else
+      if hot_queue_overflow?(state, :put_batch, state.put_slot, count) do
+        GenServer.reply(from, {:error, :batcher_overloaded})
         {:noreply, state}
+      else
+        state = enqueue_hot_put_batch(state, from, entries, window_ms, count)
+
+        if state.put_slot.count >= state.hot_max_batch_size and
+             not in_flight?(state, :put_batch) do
+          {:noreply, flush_hot_put_slot(state)}
+        else
+          {:noreply, state}
+        end
       end
     after
       release_sync_token(sync_token)
@@ -314,13 +429,20 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   def handle_cast({:write_delete_batch, keys, window_ms, from, sync_token}, state) do
     try do
-      state = enqueue_hot_delete_batch(state, from, keys, window_ms)
+      count = length(keys)
 
-      if state.delete_slot.count >= state.hot_max_batch_size and
-           not in_flight?(state, :delete_batch) do
-        {:noreply, flush_hot_delete_slot(state)}
-      else
+      if hot_queue_overflow?(state, :delete_batch, state.delete_slot, count) do
+        GenServer.reply(from, {:error, :batcher_overloaded})
         {:noreply, state}
+      else
+        state = enqueue_hot_delete_batch(state, from, keys, window_ms, count)
+
+        if state.delete_slot.count >= state.hot_max_batch_size and
+             not in_flight?(state, :delete_batch) do
+          {:noreply, flush_hot_delete_slot(state)}
+        else
+          {:noreply, state}
+        end
       end
     after
       release_sync_token(sync_token)
@@ -420,6 +542,40 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     :exit, {:normal, _} -> backend_call(:__commit_batch_direct__, [shard_index, commands])
   end
 
+  defp cast_or_commit_batch_direct(shard_index, commands, window_ms, from, sync_token) do
+    case Process.whereis(name(shard_index)) do
+      nil ->
+        {:direct, backend_call(:__commit_batch_direct__, [shard_index, commands])}
+
+      pid ->
+        cast_hot_batch(pid, {:write_batch, commands, window_ms, from, sync_token})
+        :ok
+    end
+  catch
+    :exit, {:noproc, _} ->
+      {:direct, backend_call(:__commit_batch_direct__, [shard_index, commands])}
+
+    :exit, {:normal, _} ->
+      {:direct, backend_call(:__commit_batch_direct__, [shard_index, commands])}
+  end
+
+  defp cast_or_commit_single_direct(shard_index, command, window_ms, target, sync_token) do
+    case Process.whereis(name(shard_index)) do
+      nil ->
+        {:direct, backend_call(:__commit_single_direct__, [shard_index, command])}
+
+      pid ->
+        cast_hot_batch(pid, {:write_batch, [command], window_ms, target, sync_token})
+        :ok
+    end
+  catch
+    :exit, {:noproc, _} ->
+      {:direct, backend_call(:__commit_single_direct__, [shard_index, command])}
+
+    :exit, {:normal, _} ->
+      {:direct, backend_call(:__commit_single_direct__, [shard_index, command])}
+  end
+
   defp call_or_commit_put_batch_direct(shard_index, entries, window_ms) do
     case Process.whereis(name(shard_index)) do
       nil ->
@@ -516,6 +672,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     release_sync_token(sync_token)
   end
 
+  defp handle_lost_hot_batch({:write_batch, _commands, _window_ms, from, sync_token}) do
+    reply_unhandled_async_batch(from)
+    release_sync_token(sync_token)
+  end
+
   defp handle_lost_hot_batch({:write_delete_batch, _keys, _window_ms, from, sync_token}) do
     reply_unhandled_async_batch(from)
     release_sync_token(sync_token)
@@ -526,6 +687,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
 
   defp drain_unhandled_async_sync_tokens do
     receive do
+      {:"$gen_cast", {:write_batch, _commands, _window_ms, from, sync_token}} ->
+        reply_unhandled_async_batch(from)
+        release_sync_token(sync_token)
+        drain_unhandled_async_sync_tokens()
+
       {:"$gen_cast", {:write_put_batch, _entries, _window_ms, from, sync_token}} ->
         reply_unhandled_async_batch(from)
         release_sync_token(sync_token)
@@ -541,10 +707,13 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
   end
 
   defp reply_unhandled_async_batch(from) do
-    GenServer.reply(from, {:error, :shutting_down})
+    reply_async_target(from, {:error, :shutting_down})
   catch
     _kind, _reason -> :ok
   end
+
+  defp reply_async_target({:single, from}, reply), do: GenServer.reply(from, reply)
+  defp reply_async_target(from, reply), do: GenServer.reply(from, reply)
 
   defp new_slot(window_ms) do
     %{
@@ -557,6 +726,23 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
       created_mono: System.monotonic_time()
     }
   end
+
+  defp namespace_queue_saturated?(state, prefix) do
+    case Map.get(state.slots, prefix) do
+      %{count: count} when count >= state.max_batch_size ->
+        in_flight?(state, {:prefix, prefix})
+
+      _other ->
+        false
+    end
+  end
+
+  defp hot_queue_overflow?(state, kind, slot, incoming_count) do
+    in_flight?(state, kind) and hot_slot_count(slot) + incoming_count > state.hot_max_batch_size
+  end
+
+  defp hot_slot_count(nil), do: 0
+  defp hot_slot_count(%{count: count}), do: count
 
   defp flush_all_slots(state, mode) do
     state =
@@ -615,9 +801,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     end
   end
 
-  defp enqueue_hot_batch(state, from, commands, window_ms) do
+  defp enqueue_hot_batch(state, from, commands, window_ms, reply_count) do
     slot = state.batch_slot || new_hot_slot(window_ms, :flush_hot_batch)
-    reply_count = hot_batch_reply_count(commands)
 
     %{
       state
@@ -629,9 +814,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     }
   end
 
-  defp enqueue_hot_put_batch(state, from, entries, window_ms) do
+  defp enqueue_hot_put_batch(state, from, entries, window_ms, count) do
     slot = state.put_slot || new_hot_slot(window_ms, :flush_hot_put_batch)
-    count = length(entries)
 
     %{
       state
@@ -643,9 +827,8 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
     }
   end
 
-  defp enqueue_hot_delete_batch(state, from, keys, window_ms) do
+  defp enqueue_hot_delete_batch(state, from, keys, window_ms, count) do
     slot = state.delete_slot || new_hot_slot(window_ms, :flush_hot_delete_batch)
-    count = length(keys)
 
     %{
       state
@@ -843,19 +1026,23 @@ defmodule Ferricstore.Raft.WARaftBackend.Batcher do
       {group_replies, []} =
         Enum.map_reduce(groups, replies, fn {from, items}, remaining ->
           {reply, rest} = Enum.split(remaining, hot_batch_reply_count(items))
-          {{from, {:ok, reply}}, rest}
+          {successful_group_reply(from, reply), rest}
         end)
 
       Enum.each(group_replies, fn {from, reply} -> GenServer.reply(from, reply) end)
     else
       error = {:error, {:batch_result_mismatch, expected, length(replies)}}
-      Enum.each(groups, fn {from, _items} -> GenServer.reply(from, error) end)
+      Enum.each(groups, fn {from, _items} -> reply_async_target(from, error) end)
     end
   end
 
   defp reply_hot_batch_groups(groups, result) do
-    Enum.each(groups, fn {from, _items} -> GenServer.reply(from, result) end)
+    Enum.each(groups, fn {from, _items} -> reply_async_target(from, result) end)
   end
+
+  defp successful_group_reply({:single, from}, [reply]), do: {from, reply}
+  defp successful_group_reply({:single, from}, replies), do: {from, {:ok, replies}}
+  defp successful_group_reply(from, replies), do: {from, {:ok, replies}}
 
   defp total_hot_batch_replies(groups) do
     Enum.reduce(groups, 0, fn {_from, items}, acc -> acc + hot_batch_reply_count(items) end)

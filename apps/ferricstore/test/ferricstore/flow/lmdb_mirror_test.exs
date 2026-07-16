@@ -21,6 +21,18 @@ defmodule Ferricstore.Flow.LMDBMirrorTest do
     refute LMDBMirror.degraded_flag?(ctx, 2)
   end
 
+  test "degraded flag fails safe when the configured atomics vector is too small" do
+    flags = :atomics.new(1, [])
+    ctx = %{shard_count: 2, flow_lmdb_mirror_degraded: flags}
+
+    assert LMDBMirror.degraded_flag?(ctx, 1)
+  end
+
+  test "shard paths do not invent descending shards for invalid counts" do
+    assert LMDBMirror.shard_paths("/data", 0) == []
+    assert LMDBMirror.shard_paths("/data", -1) == []
+  end
+
   test "require healthy reports degraded mirror" do
     flags = :atomics.new(2, [])
     :atomics.put(flags, 1, 1)

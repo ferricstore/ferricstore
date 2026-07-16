@@ -1,18 +1,17 @@
 defmodule Ferricstore.Flow.OrderedIndex do
   @moduledoc """
-  Compatibility facade for the Flow ordered index.
+  Paired-registry facade for the native Flow ordered index.
 
-  Flow no longer keeps an ETS mirror for secondary indexes. This module keeps
-  the older call shape alive for tests and any internal callers that have not
-  been renamed yet, but all data lives in `Ferricstore.Flow.NativeOrderedIndex`.
+  All data lives in `Ferricstore.Flow.NativeOrderedIndex`; the paired identifiers
+  let callers resolve the same native resource from either side.
   """
 
   alias Ferricstore.Flow.NativeOrderedIndex
 
   @type score_input :: NativeOrderedIndex.score_input()
-  @type table_ref :: atom() | reference()
+  @type table_ref :: NativeOrderedIndex.index_name()
 
-  @spec table_names(atom(), non_neg_integer()) :: {atom(), atom()}
+  @spec table_names(atom(), non_neg_integer()) :: {table_ref(), table_ref()}
   def table_names(instance_name, shard_index),
     do: NativeOrderedIndex.table_names(instance_name, shard_index)
 
@@ -164,21 +163,13 @@ defmodule Ferricstore.Flow.OrderedIndex do
     end
   end
 
-  defp lookup_table_name(index_table) when is_atom(index_table) do
-    index_table
-    |> Atom.to_string()
-    |> String.replace("ferricstore_flow_index_", "ferricstore_flow_lookup_", global: false)
-    |> String.to_atom()
-  end
+  defp lookup_table_name({NativeOrderedIndex, :index, instance_name, shard_index}),
+    do: {NativeOrderedIndex, :lookup, instance_name, shard_index}
 
   defp lookup_table_name(index_table), do: index_table
 
-  defp index_table_name(lookup_table) when is_atom(lookup_table) do
-    lookup_table
-    |> Atom.to_string()
-    |> String.replace("ferricstore_flow_lookup_", "ferricstore_flow_index_", global: false)
-    |> String.to_atom()
-  end
+  defp index_table_name({NativeOrderedIndex, :lookup, instance_name, shard_index}),
+    do: {NativeOrderedIndex, :index, instance_name, shard_index}
 
   defp index_table_name(lookup_table), do: lookup_table
 end

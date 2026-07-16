@@ -84,6 +84,119 @@ defmodule Ferricstore.Raft.WARaftStorageHotPathGuardTest do
     assert tab2list_calls(Ferricstore.Test.SourceFiles.waraft_storage_source()) == []
   end
 
+  test "segment metadata reads are bounded and nofollow at open time" do
+    source = Ferricstore.Test.SourceFiles.waraft_segment_log_source()
+
+    for function <- ["read_append_failure_marker", "read_segment_metadata_file"] do
+      [function_source] =
+        Regex.run(
+          ~r/#{function}\([^)]*\) ->.*?\.\n/ms,
+          source
+        )
+
+      assert function_source =~ "read_segment_file_nofollow",
+             "#{function}/N must not reopen a validated path with symlink following"
+
+      refute function_source =~ "file:read_file"
+    end
+
+    assert source =~ "'Elixir.Ferricstore.Bitcask.NIF':fs_read_nofollow"
+  end
+
+  test "new segment writers verify the opened descriptor identity" do
+    source = Ferricstore.Test.SourceFiles.waraft_segment_log_source()
+
+    [open_source] =
+      Regex.run(
+        ~r/open_record_group_file_fd_after_inactive_close\([^)]*\) ->.*?^    end\.\n/ms,
+        source
+      )
+
+    assert open_source =~ "validate_open_segment_file(Path, Fd)"
+
+    assert String.split(open_source, "validate_open_segment_file(Path, Fd)", parts: 2)
+           |> hd() =~ "file:open(Path"
+
+    assert source =~ "file:read_file_info(Fd)"
+    assert source =~ "file:read_link_info(Path)"
+  end
+
+  test "segment recovery and truncation verify descriptor identity after open" do
+    source = Ferricstore.Test.SourceFiles.waraft_segment_log_source()
+
+    refute source =~ "case file:open(Path, [read",
+           "an lstat followed by an unchecked read/read-write open permits a final symlink swap"
+
+    assert source =~ "open_verified_segment_file(Path, [read, raw, binary])"
+    assert source =~ "open_verified_segment_file(Path, [read, write, raw, binary])"
+  end
+
+  test "segment metadata temporary writes use exclusive nofollow atomic replacement" do
+    source = Ferricstore.Test.SourceFiles.waraft_segment_log_source()
+
+    [write_source] =
+      Regex.run(
+        ~r/write_file_sync\(Path, Binary\) ->.*?^    end\./ms,
+        source
+      )
+
+    assert write_source =~ "fs_atomic_replace_nofollow"
+    refute write_source =~ "file:open"
+  end
+
+  test "WARaft storage metadata journal is bounded and nofollow" do
+    source = Ferricstore.Test.SourceFiles.waraft_storage_source()
+
+    [append_source] =
+      Regex.run(
+        ~r/defp append_metadata_journal_payload\(path, payload\).*?^      end/ms,
+        source
+      )
+
+    assert source =~ "@max_metadata_journal_bytes"
+    assert append_source =~ "Ferricstore.FS.append_sync_nofollow_bounded"
+    refute append_source =~ "File.write"
+
+    [size_source] =
+      Regex.run(
+        ~r/defp metadata_journal_size\(journal_path\).*?^      end/ms,
+        source
+      )
+
+    assert size_source =~ "@max_metadata_journal_bytes"
+
+    for function <- ["rollback_metadata_journal_append", "read_latest_storage_metadata_journal"] do
+      assert source =~ "open_verified_metadata_journal"
+      assert source =~ "defp #{function}"
+    end
+  end
+
+  test "WARaft storage metadata temp writes use nofollow atomic replacement" do
+    source = Ferricstore.Test.SourceFiles.waraft_storage_source()
+
+    [write_source] =
+      Regex.run(
+        ~r/defp atomic_write_binary\(path, payload\).*?^      end/ms,
+        source
+      )
+
+    assert write_source =~ "Ferricstore.FS.atomic_replace_nofollow"
+    refute write_source =~ "File.write"
+  end
+
+  test "snapshot payload files are copied through a nofollow streaming primitive" do
+    source = Ferricstore.Test.SourceFiles.waraft_storage_source()
+
+    [copy_source] =
+      Regex.run(
+        ~r/defp copy_snapshot_payload_entry\(source, dest\).*?^      end/ms,
+        source
+      )
+
+    assert copy_source =~ "Ferricstore.FS.copy_sync_nofollow"
+    refute copy_source =~ "File.cp"
+  end
+
   defp tab2list_calls(source) do
     {:ok, ast} =
       Code.string_to_quoted(source, columns: true)

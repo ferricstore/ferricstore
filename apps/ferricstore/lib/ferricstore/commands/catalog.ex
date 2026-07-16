@@ -110,10 +110,7 @@ defmodule Ferricstore.Commands.Catalog do
   def get_keys_upper("FLOW." <> _rest = name, args) when is_list(args) do
     case Ferricstore.Commands.NativeAstParser.parse(name, args) do
       {:ok, ^name, _parsed_args, {:unknown, ^name, _unknown_args}, _keys} ->
-        case Extension.keys(name, args) do
-          {:ok, keys} -> {:ok, keys}
-          :error -> {:error, "ERR Invalid command specified"}
-        end
+        extension_keys(name, args)
 
       {:ok, ^name, _parsed_args, _ast, keys} ->
         {:ok, keys}
@@ -129,7 +126,10 @@ defmodule Ferricstore.Commands.Catalog do
         {:ok, keys}
 
       :not_dynamic ->
-        case lookup_upper(name) do
+        case Entries.lookup_upper(name) do
+          {:ok, %{metadata: :conservative}} ->
+            {:ok, Ferricstore.Commands.NativeAstParser.conservative_command_keys(name, args)}
+
           {:ok, %{first_key: 0}} ->
             {:ok, []}
 
@@ -137,8 +137,16 @@ defmodule Ferricstore.Commands.Catalog do
             extract_keys(first, last, step, args)
 
           :error ->
-            {:error, "ERR Invalid command specified"}
+            extension_keys(name, args)
         end
+    end
+  end
+
+  defp extension_keys(name, args) do
+    case Extension.prepare(name, args) do
+      {:ok, %{keys: keys}} -> {:ok, keys}
+      {:error, :invalid_keys} -> {:error, "ERR Invalid extension key metadata"}
+      :error -> {:error, "ERR Invalid command specified"}
     end
   end
 
@@ -148,17 +156,25 @@ defmodule Ferricstore.Commands.Catalog do
 
   # Shared key extraction logic.
   defp extract_keys(first, last, step, args) do
-    # Arguments are 0-indexed in our list, but first_key is 1-indexed
-    # (position 1 = first arg after the command name).
-    first_idx = first - 1
-    last_idx = if last == -1, do: length(args) - 1, else: last - 1
+    first_idx = max(first - 1, 0)
+    last_idx = if last == -1, do: :last, else: last - 1
     step_val = max(step, 1)
 
-    keys =
-      first_idx..last_idx//step_val
-      |> Enum.map(fn i -> Enum.at(args, i) end)
-      |> Enum.reject(&is_nil/1)
+    {:ok, positional_keys(args, 0, first_idx, last_idx, step_val, [])}
+  end
 
-    {:ok, keys}
+  defp positional_keys([], _index, _first, _last, _step, acc), do: Enum.reverse(acc)
+
+  defp positional_keys(_args, index, _first, last, _step, acc)
+       when is_integer(last) and index > last,
+       do: Enum.reverse(acc)
+
+  defp positional_keys([arg | rest], index, first, last, step, acc) do
+    acc =
+      if index >= first and rem(index - first, step) == 0 and not is_nil(arg),
+        do: [arg | acc],
+        else: acc
+
+    positional_keys(rest, index + 1, first, last, step, acc)
   end
 end

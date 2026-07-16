@@ -165,14 +165,16 @@ defmodule Ferricstore.Waiters do
 
   defp notify_oldest_live([], _key), do: nil
 
-  defp notify_oldest_live([{key, pid, _deadline, _reg_at} | rest], key) do
-    if Process.alive?(pid) do
-      # Remove this waiter before notifying (prevent double-wake).
-      :ets.match_delete(@table, {key, pid, :_, :_})
-      send(pid, {:waiter_notify, key})
-      pid
+  defp notify_oldest_live([{key, pid, _deadline, _reg_at} = entry | rest], key) do
+    if claim_waiter(entry) do
+      if Process.alive?(pid) do
+        send(pid, {:waiter_notify, key})
+        pid
+      else
+        cleanup(pid)
+        notify_oldest_live(rest, key)
+      end
     else
-      cleanup(pid)
       notify_oldest_live(rest, key)
     end
   end
@@ -180,14 +182,26 @@ defmodule Ferricstore.Waiters do
   defp notify_oldest_live_many(_entries, _key, 0, acc), do: acc
   defp notify_oldest_live_many([], _key, _remaining, acc), do: acc
 
-  defp notify_oldest_live_many([{key, pid, _deadline, _reg_at} | rest], key, remaining, acc) do
-    if Process.alive?(pid) do
-      :ets.match_delete(@table, {key, pid, :_, :_})
-      send(pid, {:waiter_notify, key})
-      notify_oldest_live_many(rest, key, remaining - 1, [pid | acc])
+  defp notify_oldest_live_many(
+         [{key, pid, _deadline, _reg_at} = entry | rest],
+         key,
+         remaining,
+         acc
+       ) do
+    if claim_waiter(entry) do
+      if Process.alive?(pid) do
+        send(pid, {:waiter_notify, key})
+        notify_oldest_live_many(rest, key, remaining - 1, [pid | acc])
+      else
+        cleanup(pid)
+        notify_oldest_live_many(rest, key, remaining, acc)
+      end
     else
-      cleanup(pid)
       notify_oldest_live_many(rest, key, remaining, acc)
     end
+  end
+
+  defp claim_waiter(entry) do
+    :ets.select_delete(@table, [{entry, [], [true]}]) == 1
   end
 end

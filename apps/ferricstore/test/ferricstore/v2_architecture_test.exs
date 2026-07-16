@@ -279,20 +279,14 @@ defmodule Ferricstore.V2ArchitectureTest do
       assert length(dest_records) == 1
     end
 
-    test "17. Tombstones not copied by copy_records", %{dir: dir} do
+    test "17. live-only copy rejects tombstone offsets", %{dir: dir} do
       source = data_file(dir, 1)
       {:ok, {off_live, _}} = NIF.v2_append_record(source, "live", "val", 0)
       {:ok, {off_tomb, _}} = NIF.v2_append_tombstone(source, "dead")
 
       dest = data_file(dir, 10)
-      {:ok, results} = NIF.v2_copy_records(source, dest, [off_live, off_tomb])
-      # Tombstones are silently skipped by copy_records
-      assert length(results) == 1
-
-      {:ok, dest_records} = NIF.v2_scan_file(dest)
-      assert length(dest_records) == 1
-      [{key, _, _, _, _}] = dest_records
-      assert key == "live"
+      assert {:error, reason} = NIF.v2_copy_records(source, dest, [off_live, off_tomb])
+      assert reason =~ "expected live record"
     end
 
     test "18. Hint file written after compaction matches records", %{dir: dir} do

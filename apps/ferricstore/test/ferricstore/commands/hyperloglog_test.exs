@@ -141,6 +141,22 @@ defmodule Ferricstore.Commands.HyperLogLogTest do
   # ---------------------------------------------------------------------------
 
   describe "PFCOUNT" do
+    test "rejects a length-correct sketch with impossible register values" do
+      corrupted = :binary.copy(<<255>>, HLL.num_registers())
+      store = MockStore.make(%{"mykey" => {corrupted, 0}})
+
+      refute HLL.valid_sketch?(corrupted)
+      assert {:error, message} = HLLCmd.handle("PFCOUNT", ["mykey"], store)
+      assert message =~ "WRONGTYPE"
+    end
+
+    test "saturates an otherwise valid estimate at the 64-bit hash-space cardinality" do
+      maximum_rank_sketch = :binary.copy(<<51>>, HLL.num_registers())
+
+      assert HLL.valid_sketch?(maximum_rank_sketch)
+      assert HLL.count(maximum_rank_sketch) == 18_446_744_073_709_551_616
+    end
+
     test "PFCOUNT on non-existent key returns 0" do
       store = MockStore.make()
       assert 0 == HLLCmd.handle("PFCOUNT", ["nokey"], store)

@@ -7,12 +7,27 @@ Code.require_file("state_machine_test/sections/flow_blob_side_channel_apply.exs"
 Code.require_file("state_machine_test/sections/flow_command_time.exs", __DIR__)
 
 Code.require_file(
+  "state_machine_test/sections/flow_shared_value_ref_persistence.exs",
+  __DIR__
+)
+
+Code.require_file(
   "state_machine_test/sections/flow_governance_release_outbox.exs",
   __DIR__
 )
 
 Code.require_file(
   "state_machine_test/sections/promoted_compound_member_index.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "state_machine_test/sections/promoted_single_mutation_durability.exs",
+  __DIR__
+)
+
+Code.require_file(
+  "state_machine_test/sections/compound_prefix_delete_exact.exs",
   __DIR__
 )
 
@@ -56,6 +71,7 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   alias Ferricstore.Commands.PreparedCommand
   alias Ferricstore.Flow.PolicyCommand
   alias Ferricstore.Raft.StateMachine
+  alias Ferricstore.Transaction.ExecutionEntry
 
   def apply(meta, command, state), do: StateMachine.apply(meta, canonical(command), state)
 
@@ -96,8 +112,17 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   defp canonical({:batch, commands}) when is_list(commands),
     do: {:batch, Enum.map(commands, &canonical/1)}
 
+  defp canonical({:tx_execute, queue, namespace}) when is_list(queue),
+    do: {:tx_execute, Enum.map(queue, &canonical_entry/1), namespace}
+
+  defp canonical({:tx_execute, queue, namespace, watched_keys}) when is_list(queue),
+    do: {:tx_execute, Enum.map(queue, &canonical_entry/1), namespace, watched_keys}
+
   defp canonical({:flow_shared_ref_write, shard_index, command}),
     do: {:flow_shared_ref_write, shard_index, canonical(command)}
+
+  defp canonical({:flow_policy_fence, installs, command}),
+    do: {:flow_policy_fence, installs, canonical(command)}
 
   defp canonical({command, metadata}) when is_tuple(command) and is_map(metadata),
     do: {canonical(command), metadata}
@@ -110,7 +135,7 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
         put_elem(
           command,
           tuple_size(command) - 1,
-          Map.put_new(attrs, :policy_snapshot_captured, true)
+          Map.put_new(attrs, :policy_reference_captured, true)
         )
       else
         command
@@ -135,13 +160,27 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   defp canonical_entry({index, command}) when is_integer(index) and is_tuple(command),
     do: {index, canonical(command)}
 
+  defp canonical_entry(%ExecutionEntry{} = entry), do: entry
+
+  defp canonical_entry({command, args, _ast}) when is_binary(command) and is_list(args) do
+    command
+    |> PreparedCommand.prepare(args)
+    |> execution_entry!()
+  end
+
   defp canonical_entry({command, args}) when is_binary(command) and is_list(args) do
-    {:ok, prepared} = PreparedCommand.prepare(command, args)
-    {prepared.command, prepared.args, prepared.ast}
+    command
+    |> PreparedCommand.prepare(args)
+    |> execution_entry!()
   end
 
   defp canonical_entry(command) when is_tuple(command), do: canonical(command)
   defp canonical_entry(other), do: other
+
+  defp execution_entry!({:ok, prepared}) do
+    {:ok, entry} = ExecutionEntry.from_prepared(prepared)
+    entry
+  end
 end
 
 defmodule Ferricstore.Raft.StateMachineTest do
@@ -198,6 +237,13 @@ defmodule Ferricstore.Raft.StateMachineTest do
         ets: keydir_name
       })
 
+    Ferricstore.Store.Shard.CompoundMemberIndex.ensure_table!(state.compound_member_index_name)
+
+    Ferricstore.Store.Shard.CompoundMemberIndex.rebuild(
+      state.compound_member_index_name,
+      keydir_name
+    )
+
     # Start a BitcaskWriter for this shard so deferred writes are processed.
     {:ok, writer_pid} = BitcaskWriter.start_link(shard_index: shard_index)
 
@@ -240,11 +286,88 @@ defmodule Ferricstore.Raft.StateMachineTest do
     assert [] = :ets.lookup(ets, "old-async")
   end
 
+  @tag :invalid_batch_shape
+  test "non-list batch envelopes are rejected without crashing apply", %{state: state} do
+    commands = [{:batch, :not_a_list}, {:cross_shard_tx, :not_a_list}]
+
+    Enum.each(commands, fn command ->
+      assert {^state, {:error, {:unknown_command, ^command}}} =
+               StateMachine.apply(%{}, command, state)
+    end)
+  end
+
+  @tag :invalid_flow_plan_list_shape
+  test "malformed Flow migration plan lists return errors instead of crashing apply", %{
+    state: state
+  } do
+    commands = [
+      {:flow_policy_migration_step, %{catalog_entries: :not_a_list}},
+      {:flow_policy_catalog_backfill_step, %{candidates: :not_a_list}}
+    ]
+
+    Enum.each(commands, fn command ->
+      assert {_next_state, {:error, reason}} = StateMachine.apply(%{}, command, state)
+      assert is_binary(reason)
+    end)
+  end
+
+  @tag :atomic_type_claim
+  test "replicated type claims cannot overwrite an earlier incompatible claim", %{
+    state: state,
+    ets: ets
+  } do
+    key = "type-claim-race"
+    type_key = CompoundKey.type_key(key)
+
+    assert {claimed_state, {:applied_at, _claim_time, {:ok, :created}}, _effects} =
+             StateMachine.apply(%{index: 1}, {:compound_type_claim, key, :hash}, state)
+
+    assert {rejected_state, {:applied_at, _reject_time, {:error, wrongtype}}, _effects} =
+             StateMachine.apply(%{index: 2}, {:compound_type_claim, key, :set}, claimed_state)
+
+    assert wrongtype =~ "WRONGTYPE"
+    assert rejected_state.active_file_size == claimed_state.active_file_size
+    assert [{^type_key, "hash", 0, _, _, _, _}] = :ets.lookup(ets, type_key)
+  end
+
+  @tag :cross_raft_isolation
+  test "cross-shard transactions cannot mutate another Raft group", %{
+    state: state,
+    ets: ets,
+    shard_index: shard_index
+  } do
+    remote_shard_index = shard_index + 1
+
+    command =
+      {:cross_shard_tx, [{remote_shard_index, [{0, {:put, "remote-key", "value", 0}}], nil}]}
+
+    assert {_new_state, {:error, "CROSSSLOT cross-shard Raft transactions are not supported"}} =
+             StateMachine.apply(%{}, command, state)
+
+    assert [] = :ets.lookup(ets, "remote-key")
+  end
+
+  @tag :cross_raft_isolation
+  test "the obsolete cross-shard envelope is rejected even when its batch names this group", %{
+    state: state,
+    ets: ets,
+    shard_index: shard_index
+  } do
+    command = {:cross_shard_tx, [{shard_index, [{0, {:put, "local-key", "value", 0}}], nil}]}
+
+    assert {_new_state, {:error, "CROSSSLOT cross-shard Raft transactions are not supported"}} =
+             StateMachine.apply(%{}, command, state)
+
+    assert [] = :ets.lookup(ets, "local-key")
+  end
+
   use Ferricstore.Raft.StateMachineTest.Sections.CoalescesConsecutiveFlowNativeIndexOpsCrossingOrderingBarriers
 
   use Ferricstore.Raft.StateMachineTest.Sections.FlowGovernanceReleaseOutbox
   use Ferricstore.Raft.StateMachineTest.Sections.FlowGovernanceLimit
   use Ferricstore.Raft.StateMachineTest.Sections.PromotedCompoundMemberIndex
+  use Ferricstore.Raft.StateMachineTest.Sections.PromotedSingleMutationDurability
+  use Ferricstore.Raft.StateMachineTest.Sections.CompoundPrefixDeleteExact
 
   defp safe_delete_ets(table) do
     :ets.delete(table)
@@ -309,14 +432,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
   defp setup_flow_indexes(state) do
     :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
     :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-    :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-    :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
 
     on_exit(fn ->
       safe_delete_ets(state.zset_score_index_name)
       safe_delete_ets(state.zset_score_lookup_name)
-      safe_delete_ets(state.flow_index_name)
-      safe_delete_ets(state.flow_lookup_name)
     end)
   end
 
@@ -514,6 +633,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
   use Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime
 
+  use Ferricstore.Raft.StateMachineTest.Sections.FlowSharedValueRefPersistence
+
   use Ferricstore.Raft.StateMachineTest.Sections.FlowIndexRollback
 
   use Ferricstore.Raft.StateMachineTest.Sections.StateMachineCompoundReads
@@ -607,7 +728,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   end
 
   defp prob_test_path(dir, key, ext) do
-    Path.join(dir, "#{Base.url_encode64(key, padding: false)}.#{ext}")
+    Ferricstore.ProbFile.path(dir, key, ext)
   end
 
   defp apply_result_value({_state, {:applied_at, _now_ms, result}, _effects}), do: result

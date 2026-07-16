@@ -11,7 +11,9 @@ defmodule Ferricstore.Store.Shard.Calls do
       alias Ferricstore.Raft.Backend, as: RaftBackend
       alias Ferricstore.Store.BlobValue
       alias Ferricstore.Store.ColdRead
+      alias Ferricstore.Store.CompoundCommand
       alias Ferricstore.Store.CompoundKey
+      alias Ferricstore.Store.ReadResult
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.Shard.Compound, as: ShardCompound
       alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -36,11 +38,17 @@ defmodule Ferricstore.Store.Shard.Calls do
       @impl true
       def handle_call({:get, key}, from, state), do: ShardReads.handle_get(key, from, state)
 
-      def handle_call({:get_many, keys}, from, state)
-          when is_list(keys) and length(keys) <= 512,
-          do: ShardReads.handle_get_many(keys, from, state)
+      def handle_call({:get_many, keys}, from, state) when is_list(keys),
+        do: ShardReads.handle_get_many(keys, from, state)
+
+      def handle_call({:get_many, keys, deadline_ms}, from, state)
+          when is_list(keys) and is_integer(deadline_ms),
+          do: ShardReads.handle_get_many(keys, from, deadline_ms, state)
 
       def handle_call({:get_many, _invalid}, _from, state),
+        do: {:reply, {:error, "ERR invalid shard batch read request"}, state}
+
+      def handle_call({:get_many, _keys, _deadline_ms}, _from, state),
         do: {:reply, {:error, "ERR invalid shard batch read request"}, state}
 
       def handle_call({:get_file_ref, key}, _from, state),
@@ -74,7 +82,11 @@ defmodule Ferricstore.Store.Shard.Calls do
           end
 
         results = prefix_scan_entries(state, prefix, state.shard_data_path)
-        {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
+
+        reply =
+          ReadResult.map_success(results, &Enum.sort_by(&1, fn {field, _value} -> field end))
+
+        {:reply, reply, state}
       end
 
       # Count entries matching a compound key prefix.
@@ -118,21 +130,21 @@ defmodule Ferricstore.Store.Shard.Calls do
         {:reply, {:error, "ERR shard writes paused for sync"}, state}
       end
 
-      def handle_call(command, _from, %{writes_paused: true} = state)
-          when is_tuple(command) and command != {:pause_writes} and command != {:resume_writes} do
-        {:reply, {:error, "ERR shard writes paused for sync"}, state}
-      end
-
       def handle_call({:standalone_commit, command}, from, state) do
-        if default_waraft_write_state?(state) do
-          reply_default_waraft_write(command, state)
-        else
-          state =
-            state
-            |> enqueue_standalone_commit(from, command)
-            |> maybe_flush_full_standalone_batch()
+        cond do
+          state.writes_paused ->
+            {:reply, {:error, "ERR shard writes paused for sync"}, state}
 
-          {:noreply, state}
+          default_waraft_write_state?(state) ->
+            reply_default_waraft_write(command, state)
+
+          true ->
+            state =
+              state
+              |> enqueue_standalone_commit(from, command)
+              |> maybe_flush_full_standalone_batch()
+
+            {:noreply, state}
         end
       end
 
@@ -183,6 +195,37 @@ defmodule Ferricstore.Store.Shard.Calls do
       end
 
       def handle_call(
+            {:standalone_cross_shard_execute, execute_fn},
+            _from,
+            %{standalone_write_barrier: true} = state
+          )
+          when is_function(execute_fn, 1) do
+        sm_state = direct_sm_state(state)
+
+        case Ferricstore.Raft.StateMachine.apply_standalone_cross_shard(execute_fn, sm_state) do
+          {result, %{} = new_sm_state} ->
+            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+
+          {:error, reason, new_sm_state} ->
+            {:reply, {:error, {:standalone_durability_failed, reason}},
+             state
+             |> apply_direct_sm_state(new_sm_state)
+             |> Map.put(:writes_paused, true)
+             |> Map.put(:last_flush_error, reason)}
+
+          {:error, reason} ->
+            {:reply, {:error, {:standalone_durability_failed, reason}},
+             state
+             |> Map.put(:writes_paused, true)
+             |> Map.put(:last_flush_error, reason)}
+        end
+      end
+
+      def handle_call({:standalone_cross_shard_execute, _execute_fn}, _from, state) do
+        {:reply, {:error, :standalone_cross_shard_barrier_required}, state}
+      end
+
+      def handle_call(
             {:standalone_commit_sync, {:cross_shard_tx, _shard_batches} = command},
             _from,
             state
@@ -226,9 +269,15 @@ defmodule Ferricstore.Store.Shard.Calls do
       def handle_call(:standalone_commit_debug, _from, state) do
         {:reply,
          %{
-           batch_count: length(state.standalone_batch),
-           waiting_count: length(state.standalone_waiting),
+           batch_count: state.standalone_batch_count,
+           batch_bytes: state.standalone_batch_bytes,
+           waiting_count: state.standalone_waiting_count,
+           waiting_bytes: state.standalone_waiting_bytes,
            inflight_count: length(state.standalone_flush_entries),
+           inflight_bytes: state.standalone_flush_bytes,
+           retained_bytes:
+             state.standalone_batch_bytes + state.standalone_waiting_bytes +
+               state.standalone_flush_bytes,
            inflight_keys: MapSet.to_list(state.standalone_inflight_keys)
          }, state}
       end
@@ -239,10 +288,21 @@ defmodule Ferricstore.Store.Shard.Calls do
            writes_paused: state.writes_paused,
            last_flush_error: state.last_flush_error,
            pending_count: state.pending_count,
-           standalone_batch_count: length(state.standalone_batch),
-           standalone_waiting_count: length(state.standalone_waiting),
+           standalone_batch_count: state.standalone_batch_count,
+           standalone_batch_bytes: state.standalone_batch_bytes,
+           standalone_waiting_count: state.standalone_waiting_count,
+           standalone_waiting_bytes: state.standalone_waiting_bytes,
+           standalone_flush_bytes: state.standalone_flush_bytes,
            standalone_flush_inflight: state.standalone_flush_ref != nil
          }, state}
+      end
+
+      def handle_call(
+            {:forwarded_quorum, _origin_node, _command},
+            _from,
+            %{writes_paused: true} = state
+          ) do
+        {:reply, {:error, "ERR shard writes paused for sync"}, state}
       end
 
       def handle_call({:forwarded_quorum, origin_node, command}, from, state) do
@@ -369,6 +429,18 @@ defmodule Ferricstore.Store.Shard.Calls do
         ShardCompound.handle_compound_batch_get_meta(redis_key, compound_keys, state)
       end
 
+      def handle_call({:compound_type_claim, redis_key, type}, _from, state) do
+        maybe_route_default_waraft_write(
+          CompoundCommand.type_claim(redis_key, type),
+          state,
+          fn ->
+            redis_key
+            |> ShardNativeOps.handle_type_claim(type, state)
+            |> track_write_version_result(state)
+          end
+        )
+      end
+
       def handle_call({:compound_put, redis_key, compound_key, value, expire_at_ms}, _from, state) do
         maybe_route_default_waraft_write(
           {:compound_put, redis_key, compound_key, value, expire_at_ms},
@@ -423,6 +495,26 @@ defmodule Ferricstore.Store.Shard.Calls do
 
       def handle_call({:compound_scan, redis_key, prefix}, _from, state) do
         ShardCompound.handle_compound_scan(redis_key, prefix, state)
+      end
+
+      def handle_call({:compound_scan_bounded, redis_key, prefix, limits}, _from, state) do
+        ShardCompound.handle_compound_scan_bounded(redis_key, prefix, limits, state)
+      end
+
+      def handle_call(
+            {:compound_scan_page, redis_key, prefix, cursor, count, match_pattern, fields_only},
+            _from,
+            state
+          ) do
+        ShardCompound.handle_compound_scan_page(
+          redis_key,
+          prefix,
+          cursor,
+          count,
+          match_pattern,
+          fields_only,
+          state
+        )
       end
 
       def handle_call({:compound_fields, redis_key, prefix}, _from, state) do
@@ -576,6 +668,27 @@ defmodule Ferricstore.Store.Shard.Calls do
         {:reply, reply, state}
       end
 
+      def handle_call(
+            {:flow_earliest_due_score, prefixes, needles, suffixes},
+            _from,
+            state
+          ) do
+        reply =
+          case native_flow_index_for_read(state) do
+            {:ok, native} ->
+              case NativeFlowIndex.earliest_due_score(native, prefixes, needles, suffixes) do
+                score when is_float(score) -> {:ok, score}
+                nil -> {:ok, nil}
+                _invalid -> :unavailable
+              end
+
+            :unavailable ->
+              :unavailable
+          end
+
+        {:reply, reply, state}
+      end
+
       # -------------------------------------------------------------------
       # handle_call — native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD
       # -------------------------------------------------------------------
@@ -623,32 +736,22 @@ defmodule Ferricstore.Store.Shard.Calls do
         )
       end
 
-      # 6-tuple variant: includes pre-computed now_ms from Router.raft_write.
-      # In cluster mode this MUST go through Raft (replicated) just like the
-      # 5-tuple variant — otherwise a follower's ratelimit-add lands locally
-      # only and other nodes never see the increment. Falls back to direct in
-      # non-Raft mode.
-      def handle_call({:ratelimit_add, key, window_ms, max, count, _now_ms}, _from, state) do
-        maybe_route_default_waraft_write(
-          {:ratelimit_add, key, window_ms, max, count},
-          state,
-          fn ->
-            key
-            |> ShardNativeOps.handle_ratelimit_add(window_ms, max, count, state)
-            |> track_write_version_result(state)
-          end
-        )
-      end
-
       # -------------------------------------------------------------------
       # handle_call — list operations
       # -------------------------------------------------------------------
+      def handle_call({:list_read, key, operation}, _from, state),
+        do: ShardNativeOps.handle_list_read(key, operation, state)
+
       def handle_call({:list_op, key, operation}, _from, state) do
-        maybe_route_default_waraft_write({:list_op, key, operation}, state, fn ->
-          key
-          |> ShardNativeOps.handle_list_op(operation, state)
-          |> track_write_version_result(state)
-        end)
+        if Ferricstore.Store.ListOps.read_operation?(operation) do
+          ShardNativeOps.handle_list_read(key, operation, state)
+        else
+          maybe_route_default_waraft_write({:list_op, key, operation}, state, fn ->
+            key
+            |> ShardNativeOps.handle_list_op(operation, state)
+            |> track_write_version_result(state)
+          end)
+        end
       end
 
       def handle_call({:list_op_lmove, src_key, dst_key, from_dir, to_dir}, _from, state) do
@@ -675,8 +778,25 @@ defmodule Ferricstore.Store.Shard.Calls do
       end
 
       # Check if a redis_key has been promoted to dedicated storage.
-      def handle_call({:promoted?, redis_key}, _from, state) do
-        {:reply, ShardCompound.promoted_store(state, redis_key) != nil, state}
+      def handle_call({:promoted?, redis_key}, from, state) do
+        if compound_promotion_scheduled?(state, redis_key) do
+          waiters =
+            Map.update(
+              Map.get(state, :compound_promotion_waiters, %{}),
+              redis_key,
+              [from],
+              &[from | &1]
+            )
+
+          {:noreply, Map.put(state, :compound_promotion_waiters, waiters)}
+        else
+          {:reply, ShardCompound.promoted_store(state, redis_key) != nil, state}
+        end
+      end
+
+      defp compound_promotion_scheduled?(state, redis_key) do
+        Map.has_key?(Map.get(state, :compound_promotion_pending, %{}), redis_key) or
+          match?(%{redis_key: ^redis_key}, Map.get(state, :compound_promotion_worker))
       end
 
       # -------------------------------------------------------------------
@@ -686,7 +806,12 @@ defmodule Ferricstore.Store.Shard.Calls do
         state = drain_standalone_commits_for_sync(state)
         state = await_in_flight(state)
         state = flush_pending_sync(state)
-        {:reply, :ok, %{state | writes_paused: true}}
+        state = %{state | writes_paused: true}
+
+        case state.last_flush_error do
+          nil -> {:reply, :ok, state}
+          reason -> {:reply, {:error, {:flush_failed, reason}}, state}
+        end
       end
 
       def handle_call({:resume_writes}, _from, state) do

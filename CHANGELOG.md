@@ -4,6 +4,7 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Default governance effect lookups to the Flow ID auto-partition when no explicit partition is provided.
 - Added type-level and per-Flow `max_active_ms` limits with durable timeout failure history, cold-record enforcement, and parent/child coordination.
 - Exposed maximum active runtime through embedded, native TCP, workflow, and dashboard policy surfaces, including an `infinity` override.
 - Made Flow timeout sweeping instance-scoped and surfaced active timeout candidates and counts in retention maintenance views.

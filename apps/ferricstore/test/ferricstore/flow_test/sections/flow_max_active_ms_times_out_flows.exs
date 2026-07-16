@@ -347,7 +347,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
                  FerricStore.flow_get(active_id, partition_key: partition_key)
       end
 
-      test "retention bounds the exact cross-shard cleanup command globally" do
+      @tag :flow_local_retention
+      test "retention bounds shard-local cleanup commands globally" do
         {partition_a, _same_partition, partition_b} = mixed_partition_keys()
         create_now = System.system_time(:millisecond) + 60_000
         complete_now = create_now + 10
@@ -414,17 +415,20 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
                  FerricStore.flow_retention_cleanup(limit: 10, now_ms: cleanup_now)
 
         assert_receive {:retention_command, :terminal,
-                        command =
-                          {:cross_shard_tx,
-                           [{0, [{0, {:flow_cross_retention_cleanup, command_attrs}}], nil} | _]}},
+                        manifest = {:flow_retention_shard_commands, commands}},
                        5_000
 
-        assert :erlang.external_size(command) <= byte_budget
+        assert :erlang.external_size(manifest) <= byte_budget
+        assert commands != []
 
-        assert command_attrs.terminal_candidates != []
+        candidates =
+          Enum.flat_map(commands, fn
+            {shard_index, {:flow_retention_cleanup, _key, %{terminal_candidates: candidates}}} ->
+              assert Enum.all?(candidates, &(&1.shard_index == shard_index))
+              candidates
+          end)
 
-        assert Enum.sum(Enum.map(command_attrs.terminal_candidates, & &1.planned_key_count)) <=
-                 key_budget
+        assert Enum.sum(Enum.map(candidates, & &1.planned_key_count)) <= key_budget
 
         refute_receive {:retention_command, :terminal, _other_command}, 100
 
@@ -1076,6 +1080,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
         assert terminal_child.state in ["failed", "cancelled"]
       end
 
+      @tag :active_reverse_success
       test "timeout cleanup enforces max_active_ms for hibernated flows" do
         id = uid("flow-active-timeout-cold")
         partition_key = uid("tenant-active-timeout-cold")
@@ -1139,6 +1144,56 @@ defmodule Ferricstore.FlowTest.Sections.FlowMaxActiveMsTimesOutFlows do
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
 
         assert {:ok, []} =
+                 Ferricstore.Flow.LMDB.expired_active_timeout_state_keys(
+                   lmdb_path,
+                   now + 100,
+                   1
+                 )
+      end
+
+      @tag :active_reverse_failure
+      test "timeout cleanup fails closed when a hibernated flow reverse index is missing" do
+        id = uid("flow-active-timeout-cold-missing-reverse")
+        partition_key = uid("tenant-active-timeout-cold-missing-reverse")
+        now = System.system_time(:millisecond) + 60_000
+        ctx = FerricStore.Instance.get(:default)
+        state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+        shard_index = shard_for(state_key)
+        keydir = elem(ctx.keydir_refs, shard_index)
+
+        lmdb_path =
+          ctx.data_dir
+          |> Ferricstore.DataDir.shard_data_path(shard_index)
+          |> Ferricstore.Flow.LMDB.path()
+
+        assert {:ok, %{max_active_ms: 100}} =
+                 flow_create_and_get(id,
+                   type: "active-timeout-cold-missing-reverse",
+                   state: "queued",
+                   partition_key: partition_key,
+                   max_active_ms: 100,
+                   run_at_ms: now + 600_000,
+                   now_ms: now
+                 )
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+        Ferricstore.Test.ShardHelpers.eventually(
+          fn -> :ets.lookup(keydir, state_key) == [] end,
+          "flow should be evicted from the hot keydir after hibernation"
+        )
+
+        reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+        assert {:ok, _reverse_value} = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
+        assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:delete, reverse_key}])
+
+        assert {:error, :missing_active_index_reverse} =
+                 FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 100)
+
+        assert {:ok, %{state: "queued"}} =
+                 FerricStore.flow_get(id, partition_key: partition_key)
+
+        assert {:ok, [^state_key]} =
                  Ferricstore.Flow.LMDB.expired_active_timeout_state_keys(
                    lmdb_path,
                    now + 100,

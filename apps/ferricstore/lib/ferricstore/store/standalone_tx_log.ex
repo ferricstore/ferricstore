@@ -2,35 +2,49 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.AppendResult
+  alias Ferricstore.TermCodec
 
   @file_name "standalone_cross_shard_tx.log"
   @magic :ferricstore_standalone_cross_shard_tx_v1
+  @compact_threshold_bytes 4 * 1_024 * 1_024
+  @max_journal_bytes 64 * 1_024 * 1_024
+  @terminal_reserve_bytes 1_024
+  @max_txid_bytes 128
 
   @type group :: {binary(), list()}
 
   @spec prepare(binary(), [group()]) :: {:ok, binary()} | {:error, term()}
   def prepare(data_dir, groups) when is_binary(data_dir) and is_list(groups) do
-    txid = new_txid()
-    stats = group_stats(groups)
+    if valid_groups?(data_dir, groups) do
+      txid = new_txid()
+      stats = group_stats(groups)
 
-    case append_entry(data_dir, {@magic, :prepare, txid, groups}) do
-      :ok ->
-        observe(:prepare, stats, %{status: :ok})
-        forget_recover_once(data_dir)
-        {:ok, txid}
+      case with_journal_lock(data_dir, fn ->
+             append_entry_locked(
+               data_dir,
+               {@magic, :prepare, txid, groups},
+               @terminal_reserve_bytes
+             )
+           end) do
+        :ok ->
+          observe(:prepare, stats, %{status: :ok})
+          {:ok, txid}
 
-      {:error, _reason} = error ->
-        observe(:prepare, stats, %{status: :error})
-        error
+        {:error, _reason} = error ->
+          observe(:prepare, stats, %{status: :error})
+          error
+      end
+    else
+      {:error, :invalid_groups}
     end
   end
 
   @spec commit(binary(), binary()) :: :ok | {:error, term()}
   def commit(data_dir, txid) when is_binary(data_dir) and is_binary(txid) do
-    case append_entry(data_dir, {@magic, :commit, txid}) do
+    case append_terminal(data_dir, :commit, txid) do
       :ok ->
         observe(:commit, %{count: 1}, %{status: :ok})
-        _ = compact_committed(data_dir)
         :ok
 
       {:error, _reason} = error ->
@@ -39,34 +53,25 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end
   end
 
-  @spec recover_once(binary()) :: :ok | {:error, term()}
-  def recover_once(data_dir) when is_binary(data_dir) do
-    key = recover_once_key(data_dir)
-
-    case :persistent_term.get(key, false) do
-      true ->
+  @spec abort(binary(), binary()) :: :ok | {:error, term()}
+  def abort(data_dir, txid) when is_binary(data_dir) and is_binary(txid) do
+    case append_terminal(data_dir, :abort, txid) do
+      :ok ->
+        observe(:abort, %{count: 1}, %{status: :ok})
         :ok
 
-      false ->
-        case recover(data_dir) do
-          :ok ->
-            :persistent_term.put(key, true)
-            :ok
-
-          {:error, _reason} = error ->
-            error
-        end
+      {:error, _reason} = error ->
+        observe(:abort, %{count: 1}, %{status: :error})
+        error
     end
   end
 
+  @spec recover_once(binary()) :: :ok | {:error, term()}
+  def recover_once(data_dir) when is_binary(data_dir), do: recover(data_dir)
+
   @spec recover(binary()) :: :ok | {:error, term()}
   def recover(data_dir) when is_binary(data_dir) do
-    result =
-      with {:ok, entries} <- read_entries(data_dir),
-           {:ok, stats} <- recover_entries(data_dir, entries) do
-        _ = compact_committed(data_dir)
-        {:ok, stats}
-      end
+    result = with_journal_lock(data_dir, fn -> recover_locked(data_dir) end)
 
     case result do
       {:ok, stats} ->
@@ -83,9 +88,46 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end
   end
 
-  defp compact_committed(data_dir) do
-    with {:ok, entries} <- read_entries(data_dir),
-         entries <- pending_entries(entries) do
+  defp recover_locked(data_dir) do
+    with {:ok, pending} <- read_pending_transactions(data_dir),
+         {:ok, stats} <- recover_pending(data_dir, pending),
+         :ok <- compact_committed_locked(data_dir) do
+      {:ok, stats}
+    end
+  end
+
+  defp append_terminal(data_dir, terminal, txid) when terminal in [:commit, :abort] do
+    if valid_txid?(txid) do
+      with_journal_lock(data_dir, fn ->
+        persist_terminal_locked(data_dir, terminal, txid, true)
+      end)
+    else
+      {:error, :invalid_txid}
+    end
+  end
+
+  defp maybe_compact_committed_locked(data_dir) do
+    case File.lstat(path(data_dir)) do
+      {:ok, %File.Stat{type: :regular, size: size}} when size >= @compact_threshold_bytes ->
+        compact_committed_locked(data_dir)
+
+      {:ok, %File.Stat{type: :regular}} ->
+        :ok
+
+      {:ok, %File.Stat{type: type}} ->
+        {:error, {:unsafe_journal_type, type}}
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp compact_committed_locked(data_dir) do
+    with {:ok, pending} <- read_pending_transactions(data_dir),
+         entries <- pending_entries(pending) do
       rewrite_entries(data_dir, entries)
     end
   end
@@ -95,23 +137,7 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     "#{System.system_time(:nanosecond)}-#{unique}"
   end
 
-  defp recover_entries(data_dir, entries) do
-    {prepares, commits} =
-      Enum.reduce(entries, {%{}, MapSet.new()}, fn
-        {@magic, :prepare, txid, groups}, {prepares, commits} ->
-          {Map.put(prepares, txid, groups), commits}
-
-        {@magic, :commit, txid}, {prepares, commits} ->
-          {prepares, MapSet.put(commits, txid)}
-
-        _other, acc ->
-          acc
-      end)
-
-    pending =
-      prepares
-      |> Enum.reject(fn {txid, _groups} -> MapSet.member?(commits, txid) end)
-
+  defp recover_pending(data_dir, pending) do
     initial_stats = %{pending: length(pending), replayed: 0, groups: 0, ops: 0}
 
     pending
@@ -120,7 +146,7 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
       case apply_groups(groups) do
         :ok ->
-          case commit(data_dir, txid) do
+          case persist_terminal_locked(data_dir, :commit, txid, false) do
             :ok ->
               next_stats = %{
                 stats
@@ -141,22 +167,14 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end)
   end
 
-  defp pending_entries(entries) do
-    {prepares, commits} =
-      Enum.reduce(entries, {%{}, MapSet.new()}, fn
-        {@magic, :prepare, txid, groups}, {prepares, commits} ->
-          {Map.put(prepares, txid, groups), commits}
+  defp pending_entries(pending),
+    do: Enum.map(pending, fn {txid, groups} -> {@magic, :prepare, txid, groups} end)
 
-        {@magic, :commit, txid}, {prepares, commits} ->
-          {prepares, MapSet.put(commits, txid)}
-
-        _other, acc ->
-          acc
-      end)
-
-    prepares
-    |> Enum.reject(fn {txid, _groups} -> MapSet.member?(commits, txid) end)
-    |> Enum.map(fn {txid, groups} -> {@magic, :prepare, txid, groups} end)
+  defp pending_transactions({order, prepares, terminals}) do
+    order
+    |> Enum.reverse()
+    |> Enum.reject(&MapSet.member?(terminals, &1))
+    |> Enum.map(&{&1, Map.fetch!(prepares, &1)})
   end
 
   defp apply_groups(groups) do
@@ -169,6 +187,12 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   end
 
   defp append_batch_sync(file_path, batch) do
+    with :ok <- Ferricstore.FS.mkdir_p(Path.dirname(file_path)) do
+      do_append_batch_sync(file_path, batch)
+    end
+  end
+
+  defp do_append_batch_sync(file_path, batch) do
     if Enum.any?(batch, &match?({:delete, _, _}, &1)) do
       ops =
         Enum.map(batch, fn
@@ -177,11 +201,10 @@ defmodule Ferricstore.Store.StandaloneTxLog do
           {:delete, key, _prob_path} -> {:delete, key}
         end)
 
-      case NIF.v2_append_ops_batch_nosync(file_path, ops) do
+      case NIF.v2_append_ops_batch(file_path, ops) do
         {:ok, locations} ->
-          case NIF.v2_fsync(file_path) do
-            :ok -> {:ok, locations}
-            {:error, reason} -> {:error, reason}
+          with :ok <- AppendResult.validate_operation_locations(locations, ops) do
+            {:ok, locations}
           end
 
         {:error, _reason} = error ->
@@ -196,7 +219,9 @@ defmodule Ferricstore.Store.StandaloneTxLog do
 
       case NIF.v2_append_batch(file_path, puts) do
         {:ok, locations} ->
-          {:ok, Enum.map(locations, fn {offset, value_size} -> {:put, offset, value_size} end)}
+          with :ok <- AppendResult.validate_locations(locations, length(puts)) do
+            {:ok, Enum.map(locations, fn {offset, value_size} -> {:put, offset, value_size} end)}
+          end
 
         {:error, _reason} = error ->
           error
@@ -204,19 +229,36 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end
   end
 
-  defp append_entry(data_dir, entry) do
+  defp persist_terminal_locked(data_dir, terminal, txid, compact?) do
+    case append_entry_locked(data_dir, {@magic, terminal, txid}) do
+      :ok when compact? -> maybe_compact_committed_locked(data_dir)
+      :ok -> :ok
+      {:error, {:journal_limit_exceeded, _reason}} -> rewrite_terminal_locked(data_dir, txid)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp rewrite_terminal_locked(data_dir, txid) do
+    with {:ok, pending} <- read_pending_transactions(data_dir) do
+      pending
+      |> Enum.reject(fn {pending_txid, _groups} -> pending_txid == txid end)
+      |> pending_entries()
+      |> then(&rewrite_entries(data_dir, &1))
+    end
+  end
+
+  defp append_entry_locked(data_dir, entry, reserve_bytes \\ 0) do
     path = path(data_dir)
     dir = Path.dirname(path)
     line = encode_entry(entry) <> "\n"
+    append_limit = @max_journal_bytes - reserve_bytes
 
     with :ok <- Ferricstore.FS.mkdir_p(dir),
-         {:ok, io} <- File.open(path, [:append, :binary]),
-         :ok <- IO.binwrite(io, line),
-         :ok <- :file.sync(io),
-         :ok <- File.close(io),
+         :ok <- Ferricstore.FS.append_sync_nofollow_bounded(path, line, append_limit),
          :ok <- fsync_dir(dir) do
       :ok
     else
+      {:error, {:too_large, reason}} -> {:error, {:journal_limit_exceeded, reason}}
       {:error, _reason} = error -> error
       other -> {:error, other}
     end
@@ -236,16 +278,12 @@ defmodule Ferricstore.Store.StandaloneTxLog do
   defp rewrite_entries(data_dir, entries) do
     path = path(data_dir)
     dir = Path.dirname(path)
-    tmp_path = path <> ".compact"
-    data = Enum.map_join(entries, "", fn entry -> encode_entry(entry) <> "\n" end)
+
+    data =
+      entries |> Enum.map(fn entry -> [encode_entry(entry), "\n"] end) |> IO.iodata_to_binary()
 
     with :ok <- Ferricstore.FS.mkdir_p(dir),
-         {:ok, io} <- File.open(tmp_path, [:write, :binary]),
-         :ok <- IO.binwrite(io, data),
-         :ok <- :file.sync(io),
-         :ok <- File.close(io),
-         :ok <- fsync_dir(dir),
-         :ok <- Ferricstore.FS.rename(tmp_path, path),
+         :ok <- Ferricstore.FS.atomic_replace_nofollow(path, data, @max_journal_bytes),
          :ok <- fsync_dir(dir) do
       :ok
     else
@@ -254,29 +292,21 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end
   end
 
-  defp read_entries(data_dir) do
+  defp read_pending_transactions(data_dir) do
     path = path(data_dir)
 
-    case File.read(path) do
-      {:ok, data} ->
-        {entries, skipped} =
-          data
-          |> String.split("\n", trim: true)
-          |> Enum.reduce({[], 0}, fn line, {entries, skipped} ->
-            case decode_line(line) do
-              {:ok, entry} -> {[entry | entries], skipped}
-              :error -> {entries, skipped + 1}
-            end
-          end)
+    case Ferricstore.FS.read_nofollow(path, @max_journal_bytes) do
+      {:ok, contents} ->
+        {pending_state, skipped} = reduce_journal(contents, data_dir, {[], %{}, MapSet.new()}, 0)
 
         if skipped > 0 do
           observe(:corrupt_entry, %{count: skipped}, %{data_dir_hash: :erlang.phash2(data_dir)})
           {:error, {:corrupt_entries, skipped}}
         else
-          {:ok, Enum.reverse(entries)}
+          {:ok, pending_transactions(pending_state)}
         end
 
-      {:error, :enoent} ->
+      {:error, {:not_found, _reason}} ->
         {:ok, []}
 
       {:error, _reason} = error ->
@@ -284,30 +314,116 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end
   end
 
-  defp encode_entry(entry), do: Base.encode64(:erlang.term_to_binary(entry, [:compressed]))
+  defp reduce_journal(<<>>, _data_dir, pending_state, skipped),
+    do: {pending_state, skipped}
 
-  defp decode_line(line) do
+  defp reduce_journal(contents, data_dir, pending_state, skipped) do
+    {line, rest} = take_journal_line(contents)
+
+    case trim_line_ending(line) do
+      "" ->
+        reduce_journal(rest, data_dir, pending_state, skipped)
+
+      encoded ->
+        case decode_line(encoded, data_dir) do
+          {:ok, entry} ->
+            reduce_journal(rest, data_dir, accumulate_pending(entry, pending_state), skipped)
+
+          :error ->
+            reduce_journal(rest, data_dir, pending_state, skipped + 1)
+        end
+    end
+  end
+
+  defp take_journal_line(contents) do
+    case :binary.match(contents, "\n") do
+      {newline_offset, 1} ->
+        line = binary_part(contents, 0, newline_offset + 1)
+        rest_offset = newline_offset + 1
+        rest = binary_part(contents, rest_offset, byte_size(contents) - rest_offset)
+        {line, rest}
+
+      :nomatch ->
+        {contents, <<>>}
+    end
+  end
+
+  defp accumulate_pending(
+         {@magic, :prepare, txid, groups},
+         {order, prepares, terminals}
+       ) do
+    if Map.has_key?(prepares, txid) do
+      {order, Map.put(prepares, txid, groups), terminals}
+    else
+      {[txid | order], Map.put(prepares, txid, groups), terminals}
+    end
+  end
+
+  defp accumulate_pending(
+         {@magic, terminal, txid},
+         {order, prepares, terminals}
+       )
+       when terminal in [:commit, :abort],
+       do: {order, Map.delete(prepares, txid), MapSet.put(terminals, txid)}
+
+  defp trim_line_ending(line) when is_binary(line) do
+    line
+    |> trim_last_byte(?\n)
+    |> trim_last_byte(?\r)
+  end
+
+  defp trim_last_byte(<<>>, _byte), do: <<>>
+
+  defp trim_last_byte(binary, byte) do
+    size = byte_size(binary)
+
+    if :binary.at(binary, size - 1) == byte do
+      binary_part(binary, 0, size - 1)
+    else
+      binary
+    end
+  end
+
+  defp encode_entry(entry), do: Base.encode64(TermCodec.encode(entry))
+
+  defp decode_line(line, data_dir) do
     with {:ok, binary} <- Base.decode64(line),
-         term <- :erlang.binary_to_term(binary, [:safe]),
-         true <- valid_entry?(term) do
+         {:ok, term} <- TermCodec.decode(binary),
+         true <- valid_entry?(term, data_dir) do
       {:ok, term}
     else
       _ -> :error
     end
-  rescue
-    _ -> :error
   end
 
-  defp valid_entry?({@magic, :prepare, txid, groups}) when is_binary(txid) and is_list(groups),
-    do: Enum.all?(groups, &valid_group?/1)
+  defp valid_entry?({@magic, :prepare, txid, groups}, data_dir)
+       when is_binary(txid) and is_list(groups),
+       do: valid_txid?(txid) and valid_groups?(data_dir, groups)
 
-  defp valid_entry?({@magic, :commit, txid}) when is_binary(txid), do: true
-  defp valid_entry?(_other), do: false
+  defp valid_entry?({@magic, terminal, txid}, _data_dir)
+       when terminal in [:commit, :abort] and is_binary(txid),
+       do: valid_txid?(txid)
 
-  defp valid_group?({file_path, batch}) when is_binary(file_path) and is_list(batch),
-    do: Enum.all?(batch, &valid_batch_op?/1)
+  defp valid_entry?(_other, _data_dir), do: false
 
-  defp valid_group?(_other), do: false
+  defp valid_txid?(txid),
+    do: is_binary(txid) and byte_size(txid) > 0 and byte_size(txid) <= @max_txid_bytes
+
+  defp valid_groups?(data_dir, groups) do
+    groups != [] and Enum.all?(groups, &valid_group?(&1, data_dir))
+  end
+
+  defp valid_group?({file_path, batch}, data_dir)
+       when is_binary(file_path) and is_list(batch) and batch != [],
+       do: path_within_data_dir?(file_path, data_dir) and Enum.all?(batch, &valid_batch_op?/1)
+
+  defp valid_group?(_other, _data_dir), do: false
+
+  defp path_within_data_dir?(file_path, data_dir) do
+    expanded_root = Path.expand(data_dir)
+    expanded_path = Path.expand(file_path)
+    expanded_path != expanded_root and String.starts_with?(expanded_path, expanded_root <> "/")
+  end
 
   defp valid_batch_op?({:put, key, value, expire_at_ms})
        when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
@@ -346,11 +462,12 @@ defmodule Ferricstore.Store.StandaloneTxLog do
     end
   end
 
-  defp recover_once_key(data_dir), do: {__MODULE__, Path.expand(data_dir)}
+  defp with_journal_lock(data_dir, fun) when is_function(fun, 0) do
+    lock = {{__MODULE__, Path.expand(data_dir)}, self()}
 
-  defp forget_recover_once(data_dir) do
-    :persistent_term.erase(recover_once_key(data_dir))
-  rescue
-    ArgumentError -> :ok
+    case :global.trans(lock, fun, [node()]) do
+      {:aborted, reason} -> {:error, {:journal_lock_failed, reason}}
+      result -> result
+    end
   end
 end

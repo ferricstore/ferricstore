@@ -15,7 +15,9 @@ defmodule Ferricstore.Flow.Governance.Scope do
     "global" => :global
   }
 
-  def resolve(attrs, record \\ nil) when is_map(attrs) do
+  def resolve(attrs, record \\ nil)
+
+  def resolve(attrs, record) when is_map(attrs) and (is_nil(record) or is_map(record)) do
     explicit = fetch(attrs, :governance_scope, "governance_scope")
 
     partition_key =
@@ -58,30 +60,47 @@ defmodule Ferricstore.Flow.Governance.Scope do
     end
   end
 
-  def normalize(scope, metadata \\ []) when is_binary(scope) do
-    case String.split(scope, ":", parts: 2) do
-      [kind, name] when kind != "" and name != "" ->
-        case Map.fetch(@kinds, kind) do
-          {:ok, atom_kind} ->
-            {:ok,
-             %__MODULE__{
-               kind: atom_kind,
-               name: name,
-               key: kind <> ":" <> name,
-               partition_key: Keyword.get(metadata, :partition_key),
-               type: Keyword.get(metadata, :type),
-               state: Keyword.get(metadata, :state),
-               effect_type: Keyword.get(metadata, :effect_type)
-             }}
+  def resolve(attrs, _record) when is_map(attrs),
+    do: {:error, "ERR governance scope record must be a map"}
 
-          :error ->
-            {:error, "ERR invalid governance scope kind"}
-        end
+  def resolve(_attrs, _record), do: {:error, "ERR governance scope attributes must be a map"}
 
-      _other ->
-        {:error, "ERR governance scope must use kind:name format"}
+  def normalize(scope, metadata \\ [])
+
+  def normalize(scope, metadata) when is_binary(scope) and is_list(metadata) do
+    if Keyword.keyword?(metadata) do
+      case String.split(scope, ":", parts: 2) do
+        [kind, name] when kind != "" and name != "" ->
+          case Map.fetch(@kinds, kind) do
+            {:ok, atom_kind} ->
+              {:ok,
+               %__MODULE__{
+                 kind: atom_kind,
+                 name: name,
+                 key: kind <> ":" <> name,
+                 partition_key: Keyword.get(metadata, :partition_key),
+                 type: Keyword.get(metadata, :type),
+                 state: Keyword.get(metadata, :state),
+                 effect_type: Keyword.get(metadata, :effect_type)
+               }}
+
+            :error ->
+              {:error, "ERR invalid governance scope kind"}
+          end
+
+        _other ->
+          {:error, "ERR governance scope must use kind:name format"}
+      end
+    else
+      {:error, "ERR governance scope metadata must be a keyword list"}
     end
   end
+
+  def normalize(scope, _metadata) when not is_binary(scope),
+    do: {:error, "ERR governance scope must be a string"}
+
+  def normalize(_scope, _metadata),
+    do: {:error, "ERR governance scope metadata must be a keyword list"}
 
   def key(%__MODULE__{key: key}), do: key
 

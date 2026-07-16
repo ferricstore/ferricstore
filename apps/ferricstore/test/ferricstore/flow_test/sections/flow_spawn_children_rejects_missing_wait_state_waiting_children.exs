@@ -562,7 +562,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenRejectsMissingWaitState
         assert cancelled_sibling.state == "cancelled"
       end
 
-      test "flow_spawn_children supports child partition overrides across shards" do
+      @tag :flow_partition_locality
+      test "flow_spawn_children rejects child partition overrides across Raft groups" do
         parent = uid("flow-parent-cross-partition")
         child = uid("flow-child-cross-partition")
         {partition, _same_partition, other_partition} = mixed_partition_keys()
@@ -574,8 +575,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenRejectsMissingWaitState
                    partition_key: partition
                  )
 
-        assert {:ok, waiting} =
-                 flow_spawn_children_and_get(
+        assert {:error, "CROSSSLOT Flow dependency keys must hash to the same shard"} =
+                 FerricStore.flow_spawn_children(
                    parent,
                    [%{id: child, type: "child", partition_key: other_partition}],
                    group_id: "fanout",
@@ -589,25 +590,10 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenRejectsMissingWaitState
                    fencing_token: created_parent.fencing_token
                  )
 
-        assert waiting.state == "waiting_children"
-        assert waiting.child_groups["fanout"]["children"][child] == "running"
-        assert waiting.child_groups["fanout"]["child_partitions"][child] == other_partition
-
-        assert {:ok, child_record} = FerricStore.flow_get(child, partition_key: other_partition)
-        assert child_record.parent_flow_id == parent
-        assert child_record.parent_partition_key == partition
-
-        claimed = create_claimed_flow_child(child, other_partition, "worker-cross")
-
-        assert {:ok, _child_done} =
-                 flow_complete_and_get(child, claimed.lease_token,
-                   partition_key: other_partition,
-                   fencing_token: claimed.fencing_token
-                 )
-
-        assert {:ok, done_parent} = FerricStore.flow_get(parent, partition_key: partition)
-        assert done_parent.state == "children_done"
-        assert done_parent.child_groups["fanout"]["children"][child] == "completed"
+        assert {:ok, unchanged_parent} = FerricStore.flow_get(parent, partition_key: partition)
+        assert unchanged_parent.state == "dispatch"
+        assert unchanged_parent.fencing_token == created_parent.fencing_token
+        assert {:ok, nil} = FerricStore.flow_get(child, partition_key: other_partition)
       end
 
       test "cross-shard child completion survives Ra shard restart without duplicate parent summary" do

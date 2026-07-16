@@ -3,7 +3,10 @@ defmodule FerricstoreServer.Health.Endpoint.Session do
 
   import Bitwise
 
+  alias Ferricstore.TermCodec
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Acl.CatalogProjector
+  alias FerricstoreServer.Health.QueryDecoder
 
   @dashboard_session_cookie "ferricstore_dashboard"
   @dashboard_csrf_cookie "ferricstore_dashboard_csrf"
@@ -13,6 +16,27 @@ defmodule FerricstoreServer.Health.Endpoint.Session do
   @csrf_process_key {__MODULE__, :csrf_token}
   @request_headers_process_key {__MODULE__, :request_headers}
   @request_peer_process_key {__MODULE__, :request_peer}
+
+  @doc false
+  @spec initialize_secret!() :: :ok
+  def initialize_secret! do
+    case configured_session_secret() do
+      {:ok, _secret} ->
+        :ok
+
+      :missing ->
+        if Application.get_env(:ferricstore, :dashboard_remote_access, false) == true do
+          raise ArgumentError,
+                ":dashboard_session_secret must be configured when dashboard_remote_access is enabled"
+        end
+
+        _secret = local_session_secret()
+        :ok
+
+      {:error, :too_short} ->
+        raise ArgumentError, ":dashboard_session_secret must be at least 32 bytes"
+    end
+  end
 
   def session_cookie(username, headers \\ %{}) do
     session_cookie(username, :unknown, headers)
@@ -171,14 +195,14 @@ defmodule FerricstoreServer.Health.Endpoint.Session do
   def validate_state_change(_method, _path, _peer, _headers, _body), do: :ok
 
   def session_user(headers) do
-    with token when is_binary(token) <- cookie_value(headers, @dashboard_session_cookie),
+    with true <- CatalogProjector.ready?(),
+         token when is_binary(token) <- cookie_value(headers, @dashboard_session_cookie),
          [encoded_payload, signature] <- String.split(token, ".", parts: 2),
          true <- constant_time_equal?(signature, session_signature(encoded_payload)),
          {:ok, payload} <- Base.url_decode64(encoded_payload, padding: false),
-         {username, expires_at, auth_epoch, acl_fingerprint}
+         {:ok, {username, expires_at, auth_epoch, acl_fingerprint}}
          when is_binary(username) and is_integer(expires_at) and is_integer(auth_epoch) and
-                is_binary(acl_fingerprint) <-
-           safe_binary_to_term(payload),
+                is_binary(acl_fingerprint) <- TermCodec.decode(payload),
          true <- expires_at > System.system_time(:millisecond),
          %{enabled: true} = user <- Acl.get_user(username),
          true <- Map.get(user, :auth_epoch) == auth_epoch,
@@ -205,7 +229,7 @@ defmodule FerricstoreServer.Health.Endpoint.Session do
     expires_at = System.system_time(:millisecond) + @dashboard_session_ttl_ms
     user = Acl.get_user(username)
     fingerprint = acl_fingerprint(user)
-    payload = :erlang.term_to_binary({username, expires_at, auth_epoch, fingerprint})
+    payload = TermCodec.encode({username, expires_at, auth_epoch, fingerprint})
     encoded_payload = Base.url_encode64(payload, padding: false)
     signature = session_signature(encoded_payload)
     encoded_payload <> "." <> signature
@@ -217,27 +241,50 @@ defmodule FerricstoreServer.Health.Endpoint.Session do
   end
 
   defp session_secret do
-    case Application.get_env(:ferricstore, :dashboard_session_secret) do
-      secret when is_binary(secret) and byte_size(secret) >= 32 ->
+    case configured_session_secret() do
+      {:ok, secret} ->
         secret
 
-      _ ->
-        case :persistent_term.get(@dashboard_session_secret_key, nil) do
-          nil ->
-            secret = :crypto.strong_rand_bytes(32)
-            :persistent_term.put(@dashboard_session_secret_key, secret)
-            secret
+      :missing ->
+        local_session_secret()
 
-          secret ->
-            secret
-        end
+      {:error, :too_short} ->
+        raise ArgumentError, ":dashboard_session_secret must be at least 32 bytes"
     end
   end
 
-  defp safe_binary_to_term(payload) do
-    :erlang.binary_to_term(payload, [:safe])
-  rescue
-    _ -> :error
+  defp configured_session_secret do
+    case Application.get_env(:ferricstore, :dashboard_session_secret) do
+      nil -> :missing
+      secret when is_binary(secret) and byte_size(secret) >= 32 -> {:ok, secret}
+      _invalid -> {:error, :too_short}
+    end
+  end
+
+  defp local_session_secret do
+    case :persistent_term.get(@dashboard_session_secret_key, nil) do
+      secret when is_binary(secret) ->
+        secret
+
+      nil ->
+        lock_id = {@dashboard_session_secret_key, self()}
+
+        :global.trans(
+          lock_id,
+          fn ->
+            case :persistent_term.get(@dashboard_session_secret_key, nil) do
+              secret when is_binary(secret) ->
+                secret
+
+              nil ->
+                secret = :crypto.strong_rand_bytes(32)
+                :persistent_term.put(@dashboard_session_secret_key, secret)
+                secret
+            end
+          end,
+          [node()]
+        )
+    end
   end
 
   defp constant_time_equal?(left, right) when is_binary(left) and is_binary(right) do
@@ -297,7 +344,7 @@ defmodule FerricstoreServer.Health.Endpoint.Session do
 
   defp csrf_body_token(body) when is_binary(body) do
     body
-    |> URI.decode_query()
+    |> QueryDecoder.decode()
     |> Map.get("_csrf_token")
   rescue
     _error -> nil

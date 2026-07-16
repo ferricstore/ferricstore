@@ -72,7 +72,14 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
             assert {new_state, _result, _effects} =
                      StateMachine.apply(
                        %{index: 1},
-                       {:cross_shard_intent, make_ref(), %{}},
+                       {:cross_shard_intent, make_ref(),
+                        %{
+                          command: :test,
+                          keys: %{target: "release-cursor-control"},
+                          value_hashes: %{"release-cursor-control" => nil},
+                          status: :executing,
+                          created_at: 1
+                        }},
                        state
                      )
 
@@ -213,7 +220,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
                  "Raft cursor must not advance past data that still needs a Bitcask checkpoint"
         end
 
-        test "release_cursor block metric records consecutive blocked applies", %{
+        test "dirty checkpoints do not increment the release_cursor apply-failure metric", %{
           ets: ets
         } do
           shard0 = 0
@@ -275,27 +282,21 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
 
           state = %{state | instance_ctx: instance_ctx}
 
-          # The old cold location intentionally points at a missing retired file.
-          # If shard1 fails after shard0 accepted its write, compensation must fail
-          # instead of releasing Ra's cursor past divergent Bitcask state.
           key = "blocked_cold_original"
           :ets.insert(ets, {key, nil, 0, 0, 1, 0, 5})
 
           try do
-            {state, {:applied_at, 1, {:error, {:cross_shard_compensation_failed, _reason}}},
-             effects1} =
+            {state, {:applied_at, 1, :ok}, effects1} =
               StateMachine.apply(
                 %{index: 1, term: 1, system_time: System.os_time(:millisecond)},
-                {:cross_shard_tx,
-                 [
-                   {shard0, [{"SET", [key, "new"]}], nil},
-                   {shard1, [{"SET", ["blocked_remote_fail", "value"]}], nil}
-                 ]},
+                {:put, "blocked_local_write", "value", 0},
                 state
               )
 
-            assert :atomics.get(release_cursor_blocked_apply_count, shard0 + 1) == 1
+            assert :atomics.get(release_cursor_blocked_apply_count, shard0 + 1) == 0
             refute Enum.any?(effects1, &match?({:release_cursor, _}, &1))
+
+            :atomics.put(checkpoint_flags, shard0 + 1, 0)
 
             {_state, {:applied_at, 2, nil}, _effects2} =
               StateMachine.apply(
@@ -312,7 +313,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
           end
         end
 
-        test "cross-shard SET dirties checkpoint state before release_cursor", %{
+        test "transaction SET dirties checkpoint state before release_cursor", %{
           ets: ets,
           shard_index: shard_index
         } do
@@ -343,10 +344,10 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
 
           meta = %{index: 1, term: 1, system_time: System.os_time(:millisecond)}
 
-          {_new_state, {:applied_at, 1, %{^shard_index => [:ok]}}, effects} =
+          {_new_state, {:applied_at, 1, [:ok]}, effects} =
             StateMachine.apply(
               meta,
-              {:cross_shard_tx, [{shard_index, [{"SET", ["cross_cursor_dirty", "value"]}], nil}]},
+              {:tx_execute, [{"SET", ["tx_cursor_dirty", "value"]}], nil},
               state
             )
 
@@ -354,10 +355,10 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
           assert :atomics.get(last_released_cursor_index, shard_index + 1) == 0
 
           refute Enum.any?(effects, &match?({:release_cursor, 1}, &1)),
-                 "cross-shard writes append to Bitcask and must not release Ra log before checkpoint fsync"
+                 "transaction writes append to Bitcask and must not release Ra log before checkpoint fsync"
         end
 
-        test "remote-only cross-shard SET blocks coordinator release_cursor until remote checkpoint is clean",
+        test "remote-only transaction envelopes are rejected without dirtying remote checkpoints",
              %{ets: ets} do
           shard0 = 0
           shard1 = 1
@@ -424,33 +425,18 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
           state = %{state | instance_ctx: instance_ctx}
 
           try do
-            {state, {:applied_at, 1, %{^shard1 => [:ok]}}, effects1} =
+            {_state,
+             {:applied_at, 1,
+              {:error, "CROSSSLOT cross-shard Raft transactions are not supported"}}, _effects1} =
               StateMachine.apply(
                 %{index: 1, term: 1, system_time: System.os_time(:millisecond)},
                 {:cross_shard_tx, [{shard1, [{"SET", ["remote_cursor_dirty", "value"]}], nil}]},
                 state
               )
 
-            assert :atomics.get(checkpoint_flags, shard1 + 1) == 1
-            assert :atomics.get(last_released_cursor_index, shard0 + 1) == 0
-            assert :atomics.get(pending_release_cursor_checkpoint_count, shard0 + 1) == 1
-
-            refute Enum.any?(effects1, &match?({:release_cursor, 1}, &1)),
-                   "coordinator Ra log must wait for remote Bitcask checkpoint durability"
-
-            :atomics.put(checkpoint_flags, shard1 + 1, 0)
-            :atomics.put(checkpoint_in_flight, shard1 + 1, 0)
-
-            {_state, {:applied_at, 2, nil}, effects2} =
-              StateMachine.apply(
-                %{index: 2, term: 1, system_time: System.os_time(:millisecond)},
-                {:getdel, "remote_cursor_missing"},
-                state
-              )
-
-            assert Enum.any?(effects2, &match?({:release_cursor, 2}, &1))
-            assert :atomics.get(last_released_cursor_index, shard0 + 1) == 2
+            assert :atomics.get(checkpoint_flags, shard1 + 1) == 0
             assert :atomics.get(pending_release_cursor_checkpoint_count, shard0 + 1) == 0
+            assert [] = :ets.lookup(ets1, "remote_cursor_dirty")
           after
             :ets.delete(ets1)
             Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)
@@ -458,7 +444,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
           end
         end
 
-        test "remote-only cross-shard SET rotates the remote active file when it grows past threshold",
+        test "rejected remote-only envelopes do not rotate the remote active file",
              %{ets: ets} do
           shard0 = 0
           shard1 = 1
@@ -511,18 +497,20 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.ReleaseCursorLogCompaction 
           value = :binary.copy("R", 120)
 
           try do
-            {_state, {:applied_at, 1, %{^shard1 => [:ok]}}, _effects} =
+            {_state,
+             {:applied_at, 1,
+              {:error, "CROSSSLOT cross-shard Raft transactions are not supported"}}, _effects} =
               StateMachine.apply(
                 %{index: 1, term: 1, system_time: System.os_time(:millisecond)},
                 {:cross_shard_tx, [{shard1, [{"SET", ["remote_rotate_key", value]}], nil}]},
                 state
               )
 
-            assert {1, rotated_path, ^shard1_path} =
+            assert {0, active_path, ^shard1_path} =
                      Ferricstore.Store.ActiveFile.get(instance_ctx, shard1)
 
-            assert rotated_path == Path.join(shard1_path, "00001.log")
-            assert File.exists?(rotated_path)
+            assert active_path == shard1_file
+            refute File.exists?(Path.join(shard1_path, "00001.log"))
           after
             :ets.delete(ets1)
             Ferricstore.Store.ActiveFile.cleanup_instance(instance_ctx)

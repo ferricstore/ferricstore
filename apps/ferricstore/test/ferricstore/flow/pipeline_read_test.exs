@@ -27,6 +27,24 @@ defmodule Ferricstore.Flow.PipelineReadTest do
            ]
   end
 
+  test "batch fast path fails every read closed when a batch reply is short" do
+    callbacks = %{
+      start: fn -> :started end,
+      command: fn _ctx, {:get, id} ->
+        {:get, id, "p1", %{enabled?: false, max_bytes: 64 * 1024}}
+      end,
+      batch_get: fn :ctx, ["a", "b"], "p1" -> ["a"] end,
+      decode_get: fn value -> {:ok, %{id: value}} end,
+      history_results: fn [], :ctx -> %{} end,
+      observe: fn :started, [{:get, "a"}, {:get, "b"}] -> :ok end
+    }
+
+    assert PipelineRead.batch(:ctx, [{:get, "a"}, {:get, "b"}], callbacks) == [
+             {:error, "ERR flow batch read result mismatch"},
+             {:error, "ERR flow batch read result mismatch"}
+           ]
+  end
+
   test "batch fast path preserves get order without payload hydration" do
     callbacks = %{
       start: fn -> :started end,
@@ -54,6 +72,67 @@ defmodule Ferricstore.Flow.PipelineReadTest do
              {:ok, %{id: "b"}},
              {:ok, %{id: "a"}},
              {:ok, %{id: "c"}}
+           ]
+  end
+
+  test "batch fast path isolates a short reply to its partition group" do
+    callbacks = %{
+      start: fn -> :started end,
+      command: fn _ctx, {:get, id, partition} ->
+        {:get, id, partition, %{enabled?: false, max_bytes: 64 * 1024}}
+      end,
+      batch_get: fn
+        :ctx, ["a", "b"], "p1" -> ["a"]
+        :ctx, ["c"], "p2" -> ["c"]
+      end,
+      decode_get: fn value -> {:ok, %{id: value}} end,
+      history_results: fn [], :ctx -> %{} end,
+      observe: fn :started, [{:get, "a", "p1"}, {:get, "c", "p2"}, {:get, "b", "p1"}] ->
+        :ok
+      end
+    }
+
+    assert PipelineRead.batch(
+             :ctx,
+             [{:get, "a", "p1"}, {:get, "c", "p2"}, {:get, "b", "p1"}],
+             callbacks
+           ) == [
+             {:error, "ERR flow batch read result mismatch"},
+             {:ok, %{id: "c"}},
+             {:error, "ERR flow batch read result mismatch"}
+           ]
+  end
+
+  test "batch generic path isolates a short get reply to its partition group" do
+    callbacks = %{
+      start: fn -> :started end,
+      command: fn
+        _ctx, {:get, id, partition} ->
+          {:get, id, partition, %{enabled?: false, max_bytes: 64 * 1024}}
+
+        _ctx, :other ->
+          {:other, fn -> {:ok, :other} end}
+      end,
+      batch_get: fn
+        :ctx, ["a", "b"], "p1" -> ["a"]
+        :ctx, ["c"], "p2" -> ["c"]
+      end,
+      decode_get: fn value -> {:ok, %{id: value}} end,
+      history_results: fn [], :ctx -> %{} end,
+      observe: fn :started, [{:get, "a", "p1"}, :other, {:get, "c", "p2"}, {:get, "b", "p1"}] ->
+        :ok
+      end
+    }
+
+    assert PipelineRead.batch(
+             :ctx,
+             [{:get, "a", "p1"}, :other, {:get, "c", "p2"}, {:get, "b", "p1"}],
+             callbacks
+           ) == [
+             {:error, "ERR flow batch read result mismatch"},
+             {:ok, :other},
+             {:ok, %{id: "c"}},
+             {:error, "ERR flow batch read result mismatch"}
            ]
   end
 
@@ -87,6 +166,26 @@ defmodule Ferricstore.Flow.PipelineReadTest do
              {:error, "ERR bad"},
              {:ok, :other}
            ]
+  end
+
+  test "batch prepares each command once when the get fast path falls back" do
+    parent = self()
+
+    callbacks = %{
+      start: fn -> :started end,
+      command: fn _ctx, :other = op ->
+        send(parent, {:prepared, op})
+        {:other, fn -> {:ok, :other} end}
+      end,
+      decode_get: fn nil -> {:ok, nil} end,
+      history_results: fn [], :ctx -> %{} end,
+      observe: fn :started, [:other] -> :ok end
+    }
+
+    assert PipelineRead.batch(:ctx, [:other], callbacks) == [{:ok, :other}]
+
+    assert_received {:prepared, :other}
+    refute_received {:prepared, _op}
   end
 
   test "batch coalesces identical keyed reads while preserving output order" do

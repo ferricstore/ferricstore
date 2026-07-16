@@ -324,6 +324,117 @@ defmodule Ferricstore.Commands.GeoTest.Sections.Geosearch do
           assert "Catania" in members
         end
 
+        @tag :stream_destination_cleanup
+        test "overwrites a stream destination without leaving stream rows or cache" do
+          store =
+            store_with_geo("src", [
+              {@palermo_lng, @palermo_lat, "Palermo"},
+              {@catania_lng, @catania_lat, "Catania"}
+            ])
+
+          destination = "geo_stream_dest_#{System.unique_integer([:positive])}"
+          Ferricstore.Commands.Stream.ensure_meta_table()
+
+          on_exit(fn ->
+            if :ets.whereis(Ferricstore.Stream.Meta) != :undefined do
+              :ets.delete(Ferricstore.Stream.Meta, destination)
+            end
+          end)
+
+          assert "1-0" ==
+                   Ferricstore.Commands.Stream.handle(
+                     "XADD",
+                     [destination, "1-0", "f", "v"],
+                     store
+                   )
+
+          assert 2 ==
+                   Geo.handle(
+                     "GEOSEARCHSTORE",
+                     [
+                       destination,
+                       "src",
+                       "FROMLONLAT",
+                       "13.361389",
+                       "38.115556",
+                       "BYRADIUS",
+                       "200",
+                       "KM"
+                     ],
+                     store
+                   )
+
+          assert [] == :ets.lookup(Ferricstore.Stream.Meta, destination)
+
+          assert [] ==
+                   store.compound_scan.(destination, CompoundKey.stream_prefix(destination))
+
+          assert nil ==
+                   store.compound_get.(destination, CompoundKey.stream_meta_key(destination))
+        end
+
+        @tag :geo_destination_rollback
+        test "failed replacement restores a stream destination" do
+          base =
+            store_with_geo("src", [
+              {@palermo_lng, @palermo_lat, "Palermo"},
+              {@catania_lng, @catania_lat, "Catania"}
+            ])
+
+          destination = "geo_stream_rollback_#{System.unique_integer([:positive])}"
+          Ferricstore.Commands.Stream.ensure_meta_table()
+
+          on_exit(fn ->
+            if :ets.whereis(Ferricstore.Stream.Meta) != :undefined do
+              :ets.delete(Ferricstore.Stream.Meta, destination)
+            end
+          end)
+
+          assert "1-0" ==
+                   Ferricstore.Commands.Stream.handle(
+                     "XADD",
+                     [destination, "1-0", "field", "original"],
+                     base
+                   )
+
+          store =
+            Map.put(base, :compound_batch_put, fn key, entries ->
+              if key == destination and
+                   Enum.any?(entries, fn {compound_key, _value, _expire_at_ms} ->
+                     String.starts_with?(compound_key, CompoundKey.zset_prefix(destination))
+                   end) do
+                {:error, :disk_full}
+              else
+                base.compound_batch_put.(key, entries)
+              end
+            end)
+
+          assert {:error, :disk_full} ==
+                   Geo.handle(
+                     "GEOSEARCHSTORE",
+                     [
+                       destination,
+                       "src",
+                       "FROMLONLAT",
+                       "13.361389",
+                       "38.115556",
+                       "BYRADIUS",
+                       "200",
+                       "KM"
+                     ],
+                     store
+                   )
+
+          assert 1 == Ferricstore.Commands.Stream.handle("XLEN", [destination], base)
+
+          assert [["1-0", "field", "original"]] ==
+                   Ferricstore.Commands.Stream.handle(
+                     "XRANGE",
+                     [destination, "-", "+"],
+                     base
+                   )
+        end
+
         test "stores destination in sorted-set format for ZSCORE compatibility" do
           store =
             store_with_geo("src", [
@@ -454,6 +565,56 @@ defmodule Ferricstore.Commands.GeoTest.Sections.Geosearch do
                    )
 
           assert "zset" == base.compound_get.("dst", type_key)
+          assert ["Old"] == SortedSet.handle("ZRANGE", ["dst", "0", "-1"], base)
+        end
+
+        @tag :geo_destination_snapshot
+        test "does not replace a destination whose type marker cannot be read" do
+          base =
+            store_with_geo("src", [
+              {@palermo_lng, @palermo_lat, "Palermo"},
+              {@catania_lng, @catania_lat, "Catania"}
+            ])
+
+          assert 1 == Geo.handle("GEOADD", ["dst", "12.0", "42.0", "Old"], base)
+          type_key = CompoundKey.type_key("dst")
+          failure = Ferricstore.Store.ReadResult.failure(:missing_file)
+
+          store =
+            base
+            |> Map.put(:compound_get, fn
+              "dst", ^type_key -> failure
+              key, compound_key -> base.compound_get.(key, compound_key)
+            end)
+            |> Map.put(:delete, fn _key ->
+              flunk("GEOSEARCHSTORE must not delete without a complete destination snapshot")
+            end)
+            |> Map.put(:compound_delete, fn _key, _compound_key ->
+              flunk("GEOSEARCHSTORE must not delete without a complete destination snapshot")
+            end)
+            |> Map.put(:compound_delete_prefix, fn _key, _prefix ->
+              flunk("GEOSEARCHSTORE must not delete without a complete destination snapshot")
+            end)
+            |> Map.put(:compound_batch_put, fn _key, _entries ->
+              flunk("GEOSEARCHSTORE must not write without a complete destination snapshot")
+            end)
+
+          assert {:error, "ERR storage read failed"} ==
+                   Geo.handle(
+                     "GEOSEARCHSTORE",
+                     [
+                       "dst",
+                       "src",
+                       "FROMLONLAT",
+                       "13.361389",
+                       "38.115556",
+                       "BYRADIUS",
+                       "200",
+                       "KM"
+                     ],
+                     store
+                   )
+
           assert ["Old"] == SortedSet.handle("ZRANGE", ["dst", "0", "-1"], base)
         end
 

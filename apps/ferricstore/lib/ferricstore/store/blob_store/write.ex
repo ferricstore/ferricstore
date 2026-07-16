@@ -143,40 +143,31 @@ defmodule Ferricstore.Store.BlobStore.Write do
         with {:ok, _stats} <- ensure_recovered(data_dir, shard_index),
              :ok <- ensure_segment_dir(data_dir, shard_index),
              {:ok, segment} <- writable_segment(data_dir, shard_index, batch.batch_bytes),
-             :ok <- ensure_safe_segment_file_for_append(segment.path) do
-          case File.open(segment.path, [:append, :raw, :binary]) do
-            {:ok, io} ->
-              try do
-                case build_segment_records(batch, segment.id, segment.start_offset) do
-                  {:ok, refs, iodata, next_offset} ->
-                    case append_and_sync_segment(io, segment, shard_index, iodata) do
-                      :ok ->
-                        cache_active_segment(
-                          data_dir,
-                          shard_index,
-                          segment.id,
-                          segment.path,
-                          next_offset
-                        )
+             {:ok, io} <- open_append_file(segment.path) do
+          try do
+            case build_segment_records(batch, segment.id, segment.start_offset) do
+              {:ok, refs, iodata, next_offset} ->
+                case append_and_sync_segment(io, segment, shard_index, iodata) do
+                  :ok ->
+                    cache_active_segment(
+                      data_dir,
+                      shard_index,
+                      segment.id,
+                      segment.path,
+                      next_offset
+                    )
 
-                        {:ok, refs}
-
-                      {:error, _reason} = error ->
-                        error
-                    end
+                    {:ok, refs}
 
                   {:error, _reason} = error ->
                     error
                 end
-              after
-                :file.close(io)
-              end
 
-            {:error, :enoent} ->
-              {:error, :blob_segment_dir_missing}
-
-            {:error, reason} ->
-              {:error, reason}
+              {:error, _reason} = error ->
+                error
+            end
+          after
+            :file.close(io)
           end
         end
       end
@@ -230,7 +221,6 @@ defmodule Ferricstore.Store.BlobStore.Write do
 
       defp blob_ref_from_prehashed_segment(entry, segment_id, offset) do
         %BlobRef{
-          version: 2,
           checksum: entry.checksum,
           size: entry.size,
           segment_id: segment_id,
@@ -311,7 +301,7 @@ defmodule Ferricstore.Store.BlobStore.Write do
 
       defp find_seen_payload([_other | rest], payload), do: find_seen_payload(rest, payload)
 
-      defp segment_header(%BlobRef{version: 2, size: size, checksum: checksum})
+      defp segment_header(%BlobRef{size: size, checksum: checksum})
            when is_binary(checksum) and byte_size(checksum) == 32 do
         <<@segment_header_magic::binary, size::unsigned-big-64, checksum::binary>>
       end

@@ -73,6 +73,29 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         end
       end
 
+      @tag :async_segment_keydir
+      test "replica async puts stay on the segment-keydir fast path", %{root: root, ctx: ctx} do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+        bitcask_file = Path.join([root, "data", "shard_0", "00000.log"])
+        bitcask_size = File.stat!(bitcask_file).size
+        key = "async-segment-keydir:large"
+        value = :binary.copy("v", ctx.hot_cache_max_value_size + 1)
+
+        assert :ok =
+                 WARaftBackend.write(0, {:async, :replica_origin@host, {:put, key, value, 0}})
+
+        assert [
+                 {^key, nil, 0, _lfu, {:waraft_segment, index}, offset, value_size}
+               ] = :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+        assert index > 0
+        assert offset >= 0
+        assert value_size == byte_size(value)
+        assert value == Router.get(ctx, key)
+        assert File.stat!(bitcask_file).size == bitcask_size
+      end
+
       test "pause_writes_for_sync blocks new WARaft writes until resume", %{ctx: ctx} do
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -147,6 +170,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         assert :ok = Ferricstore.Raft.Batcher.resume_writes_for_sync(0, 1_000)
       end
 
+      @tag :sync_gate_async_batch
       test "pause_writes_for_sync waits for async batch casts admitted before pause", %{ctx: ctx} do
         previous_window = Application.get_env(:ferricstore, :waraft_hot_batch_window_ms)
         previous_hook = Application.get_env(:ferricstore, :waraft_backend_batcher_cast_hook)

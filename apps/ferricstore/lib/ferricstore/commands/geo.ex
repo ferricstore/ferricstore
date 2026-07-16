@@ -23,8 +23,8 @@ defmodule Ferricstore.Commands.Geo do
     * `GEOSEARCHSTORE destination source [same GEOSEARCH options]`
   """
 
-  alias Ferricstore.Commands.Geo.Parsing
-  alias Ferricstore.Store.{CompoundKey, Ops, TypeRegistry}
+  alias Ferricstore.Commands.{CompoundSnapshot, Geo.Parsing, Strings.Delete}
+  alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
 
   # Earth radius in meters (WGS-84 mean radius)
   @earth_radius_m 6_371_000.0
@@ -58,7 +58,9 @@ defmodule Ferricstore.Commands.Geo do
   def handle_ast({tag, {:error, msg}}, _store) when is_atom(tag), do: {:error, msg}
 
   def handle_ast({:geoadd, key, flags, pairs}, store) do
-    do_geoadd(store, key, pairs, flags)
+    with :ok <- Parsing.validate_geoadd_ast(flags, pairs) do
+      do_geoadd(store, key, pairs, flags)
+    end
   end
 
   def handle_ast({:geopos, args}, store), do: geopos_args(args, store)
@@ -68,7 +70,10 @@ defmodule Ferricstore.Commands.Geo do
     do: {:error, msg}
 
   def handle_ast({:geodist, key, member1, member2, unit}, store) do
-    with {:ok, [score1, score2]} <- read_zset_member_scores(store, key, [member1, member2]) do
+    unit = if is_binary(unit), do: String.upcase(unit), else: nil
+
+    with true <- unit in Map.keys(@unit_conversions),
+         {:ok, [score1, score2]} <- read_zset_member_scores(store, key, [member1, member2]) do
       case {score1, score2} do
         {nil, _} ->
           nil
@@ -83,15 +88,17 @@ defmodule Ferricstore.Commands.Geo do
           dist = dist_m / @unit_conversions[unit]
           format_distance(dist)
       end
+    else
+      false -> {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
+      error -> error
     end
   end
 
   def handle_ast({:geosearch, _key, {:error, msg}}, _store), do: {:error, msg}
 
   def handle_ast({:geosearch, key, opts}, store) do
-    opts = Map.new(opts)
-
-    with {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
+    with {:ok, opts} <- Parsing.validate_geosearch_ast_opts(opts),
+         {:ok, center_lng, center_lat} <- resolve_center(opts, store, key),
          {:ok, zset} <- read_zset(store, key) do
       do_geosearch(zset, center_lng, center_lat, opts)
     end
@@ -101,9 +108,8 @@ defmodule Ferricstore.Commands.Geo do
     do: {:error, msg}
 
   def handle_ast({:geosearchstore, destination, source, opts}, store) do
-    opts = Map.new(opts)
-
-    with {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
+    with {:ok, opts} <- Parsing.validate_geosearch_ast_opts(opts),
+         {:ok, center_lng, center_lat} <- resolve_center(opts, store, source),
          {:ok, zset} <- read_zset(store, source) do
       matches = find_matching_members(zset, center_lng, center_lat, opts)
       sorted = sort_matches(matches, opts)
@@ -268,13 +274,10 @@ defmodule Ferricstore.Commands.Geo do
     case Ops.compound_get(store, key, type_key) do
       "zset" ->
         compound_keys = Enum.map(members, &CompoundKey.zset_member(key, &1))
+        read_geo_scores(store, key, compound_keys)
 
-        scores =
-          store
-          |> Ops.compound_batch_get(key, compound_keys)
-          |> Enum.map(&parse_geo_score/1)
-
-        {:ok, scores}
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
       nil ->
         if Ops.exists?(store, key),
@@ -287,13 +290,7 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp parse_geo_score(nil), do: nil
-
-  defp parse_geo_score(score_str) when is_binary(score_str) do
-    case Float.parse(score_str) do
-      {score, ""} -> score
-      _ -> 0.0
-    end
-  end
+  defp parse_geo_score(score_str) when is_binary(score_str), do: parse_stored_geo_score(score_str)
 
   defp missing_scores(members), do: Enum.map(members, fn _member -> nil end)
 
@@ -394,7 +391,10 @@ defmodule Ferricstore.Commands.Geo do
 
     case Ops.compound_get(store, key, type_key) do
       "zset" ->
-        {:ok, load_compound_zset(store, key, prefix)}
+        load_compound_zset(store, key, prefix)
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
       nil ->
         if Ops.exists?(store, key), do: {:error, @wrongtype_msg}, else: :missing
@@ -405,61 +405,30 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp load_compound_zset(store, key, prefix) do
-    store
-    |> Ops.compound_scan(key, prefix)
-    |> parse_compound_zset()
+    case Ops.compound_scan(store, key, prefix) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      entries when is_list(entries) ->
+        {:ok, parse_compound_zset(entries)}
+    end
   end
 
   defp parse_compound_zset(entries) do
     entries
     |> Enum.map(fn {member, score_str} ->
-      score =
-        case Float.parse(score_str) do
-          {score, ""} -> score
-          _ -> 0.0
-        end
-
-      {score, member}
+      {parse_stored_geo_score(score_str), member}
     end)
     |> Enum.sort()
   end
 
-  defp write_zset(store, key, zset) do
-    with type_status when type_status in [:ok, {:ok, :created}] <-
-           ensure_zset_type(store, key) do
-      prefix = CompoundKey.zset_prefix(key)
-      new_members = MapSet.new(Enum.map(zset, fn {_score, member} -> member end))
-
-      delete_keys =
-        store
-        |> Ops.compound_scan(key, prefix)
-        |> Enum.flat_map(fn {member, _score} ->
-          if MapSet.member?(new_members, member) do
-            []
-          else
-            [CompoundKey.zset_member(key, member)]
-          end
-        end)
-
-      put_entries =
-        Enum.map(zset, fn {score, member} ->
-          {CompoundKey.zset_member(key, member), Float.to_string(score), 0}
-        end)
-
-      with :ok <- Ops.compound_batch_delete(store, key, delete_keys),
-           :ok <- Ops.compound_batch_put(store, key, put_entries) do
-        :ok
-      else
-        {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
-      end
+  defp parse_stored_geo_score(score_str) do
+    case Float.parse(score_str) do
+      {score, ""} -> score
+      _ -> 0.0
     end
-  end
-
-  defp store_geosearch_results(store, destination, []) do
-    case delete_key_data(store, destination) do
-      :ok -> 0
-      {:error, _} = err -> err
-    end
+  rescue
+    ArgumentError -> 0.0
   end
 
   defp store_geosearch_results(store, destination, limited) do
@@ -470,35 +439,54 @@ defmodule Ferricstore.Commands.Geo do
 
     case replace_zset(store, destination, new_zset) do
       :ok -> length(limited)
-      {:error, _} = err -> err
+      {:error, _} = error -> command_error(error)
     end
   end
 
   defp replace_zset(store, key, zset) do
-    backup = zset_destination_backup(store, key)
+    case zset_destination_backup(store, key) do
+      {:ok, backup} -> replace_zset_from_backup(store, key, zset, backup)
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+    end
+  end
 
+  defp replace_zset_from_backup(store, key, zset, backup) do
     case delete_key_data(store, key) do
       :ok ->
-        case write_zset(store, key, zset) do
+        case write_replacement_zset(store, key, zset) do
           :ok -> :ok
-          {:error, _} = err -> restore_zset_destination(store, key, backup, err)
+          {:error, _} = error -> restore_zset_destination(store, key, backup, error)
         end
 
-      {:error, _} = err ->
-        restore_zset_destination(store, key, backup, err)
+      {:error, _} = error ->
+        restore_zset_after_clear_failure(store, key, backup, error)
     end
   end
 
   defp zset_destination_backup(store, key) do
-    case TypeRegistry.get_type(key, store) do
-      "zset" ->
-        case read_zset(store, key) do
-          {:ok, zset} -> {:zset, zset}
-          {:error, _} -> :missing
+    case Ops.compound_get(store, key, CompoundKey.type_key(key)) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      nil ->
+        plain_destination_backup(store, key)
+
+      type when type in ["hash", "list", "set", "zset", "stream"] ->
+        case CompoundSnapshot.snapshot(key, type, store) do
+          {:ok, entries} -> {:ok, {:compound, entries}}
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
         end
 
-      _other ->
-        :missing
+      type ->
+        ReadResult.failure({:unsupported_destination_type, type})
+    end
+  end
+
+  defp plain_destination_backup(store, key) do
+    case Ops.get_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      nil -> {:ok, :missing}
+      {value, expire_at_ms} -> {:ok, {:plain, value, expire_at_ms}}
     end
   end
 
@@ -509,8 +497,36 @@ defmodule Ferricstore.Commands.Geo do
     end
   end
 
-  defp restore_zset_destination(store, key, {:zset, zset}, original_error) do
-    case write_zset(store, key, zset) do
+  defp restore_zset_destination(store, key, {:plain, value, expire_at_ms}, original_error) do
+    with :ok <- delete_key_data(store, key),
+         :ok <- Ops.put(store, key, value, expire_at_ms) do
+      original_error
+    else
+      {:error, _} = restore_error -> restore_error
+    end
+  end
+
+  defp restore_zset_destination(store, key, {:compound, entries}, original_error) do
+    with :ok <- delete_key_data(store, key),
+         :ok <- Ops.compound_batch_put(store, key, entries) do
+      original_error
+    else
+      {:error, _} = restore_error -> restore_error
+    end
+  end
+
+  defp restore_zset_after_clear_failure(_store, _key, :missing, original_error),
+    do: original_error
+
+  defp restore_zset_after_clear_failure(store, key, {:plain, value, expire_at_ms}, original_error) do
+    case Ops.put(store, key, value, expire_at_ms) do
+      :ok -> original_error
+      {:error, _} = restore_error -> restore_error
+    end
+  end
+
+  defp restore_zset_after_clear_failure(store, key, {:compound, entries}, original_error) do
+    case Ops.compound_batch_put(store, key, entries) do
       :ok -> original_error
       {:error, _} = restore_error -> restore_error
     end
@@ -519,24 +535,50 @@ defmodule Ferricstore.Commands.Geo do
   defp delete_key_data(store, key) do
     with :ok <- Ops.delete(store, key),
          :ok <- TypeRegistry.delete_type(key, store),
-         :ok <- Ops.compound_delete(store, key, CompoundKey.list_meta_key(key)) do
-      [
-        CompoundKey.hash_prefix(key),
-        CompoundKey.list_prefix(key),
-        CompoundKey.set_prefix(key),
-        CompoundKey.zset_prefix(key)
-      ]
-      |> Enum.reduce_while(:ok, fn prefix, :ok ->
-        case Ops.compound_delete_prefix(store, key, prefix) do
-          :ok -> {:cont, :ok}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
+         :ok <- Ops.compound_delete(store, key, CompoundKey.list_meta_key(key)),
+         :ok <- Ops.compound_delete(store, key, CompoundKey.stream_meta_key(key)),
+         :ok <- delete_key_prefixes(store, key),
+         :ok <- Delete.cleanup_stream_metadata(key, store) do
+      :ok
+    end
+  end
+
+  defp delete_key_prefixes(store, key) do
+    [
+      CompoundKey.hash_prefix(key),
+      CompoundKey.list_prefix(key),
+      CompoundKey.set_prefix(key),
+      CompoundKey.zset_prefix(key),
+      CompoundKey.stream_prefix(key),
+      CompoundKey.stream_group_prefix(key)
+    ]
+    |> Enum.reduce_while(:ok, fn prefix, :ok ->
+      case Ops.compound_delete_prefix(store, key, prefix) do
+        :ok -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+  end
+
+  defp write_replacement_zset(_store, _key, []), do: :ok
+
+  defp write_replacement_zset(store, key, zset) do
+    with type_status when type_status in [:ok, {:ok, :created}] <-
+           ensure_zset_type(store, key) do
+      entries =
+        Enum.map(zset, fn {score, member} ->
+          {CompoundKey.zset_member(key, member), Float.to_string(score), 0}
+        end)
+
+      case Ops.compound_batch_put(store, key, entries) do
+        :ok -> :ok
+        {:error, _} = error -> rollback_new_zset_type_marker(key, store, type_status, error)
+      end
     end
   end
 
   defp ensure_zset_type(store, key) do
-    TypeRegistry.check_or_set_status(key, :zset, store)
+    TypeRegistry.command_check_or_set_status(key, :zset, store)
   end
 
   defp rollback_new_zset_type_marker(key, store, {:ok, :created}, write_error) do
@@ -550,6 +592,11 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp rollback_new_zset_type_marker(_key, _store, :ok, write_error), do: write_error
+
+  defp command_error({:error, {:storage_read_failed, _reason}} = failure),
+    do: ReadResult.command_error(failure)
+
+  defp command_error(error), do: error
 
   # ===========================================================================
   # Private -- GEOADD implementation
@@ -619,12 +666,13 @@ defmodule Ferricstore.Commands.Geo do
       "zset" ->
         compound_keys = Enum.map(members, &CompoundKey.zset_member(key, &1))
 
-        scores =
-          store
-          |> Ops.compound_batch_get(key, compound_keys)
-          |> Enum.map(&parse_geo_score/1)
+        case read_geo_scores(store, key, compound_keys) do
+          {:ok, scores} -> {:ok, :ok, scores}
+          {:error, _} = error -> error
+        end
 
-        {:ok, :ok, scores}
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
       nil ->
         if Ops.exists?(store, key),
@@ -651,6 +699,15 @@ defmodule Ferricstore.Commands.Geo do
         :ok -> :ok
         {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
       end
+    end
+  end
+
+  defp read_geo_scores(store, key, compound_keys) do
+    values = Ops.compound_batch_get(store, key, compound_keys)
+
+    case ReadResult.first_failure(values) do
+      nil -> {:ok, Enum.map(values, &parse_geo_score/1)}
+      failure -> ReadResult.command_error(failure)
     end
   end
 
@@ -766,8 +823,10 @@ defmodule Ferricstore.Commands.Geo do
     lat_half_deg = height_m / 2.0 / 111_320.0
     cos_lat = :math.cos(center_lat * :math.pi() / 180.0)
     lon_half_deg = if cos_lat > 0, do: width_m / 2.0 / (111_320.0 * cos_lat), else: 180.0
+    longitude_delta = abs(lng - center_lng)
+    wrapped_longitude_delta = min(longitude_delta, 360.0 - longitude_delta)
 
-    abs(lat - center_lat) <= lat_half_deg and abs(lng - center_lng) <= lon_half_deg
+    abs(lat - center_lat) <= lat_half_deg and wrapped_longitude_delta <= lon_half_deg
   end
 
   defp sort_matches(matches, %{sort: :asc}) do

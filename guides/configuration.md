@@ -63,9 +63,9 @@ config :ferricstore, :health_probe_port, 4001
 | `:shard_count` | `integer` | `0` (auto) | Both | Number of shards. `0` = auto-detect via `System.schedulers_online()`. Each shard is a separate ETS table, Bitcask directory, and WARaft partition. More shards = more write parallelism but more file descriptors. Set at startup. |
 | `:hot_cache_max_value_size` | `integer` | `65_536` | Both | Maximum value size (bytes) stored in ETS hot cache. Values larger than this are stored as `nil` in ETS and read from Bitcask on access. Prevents large binaries from being copied on every ETS lookup. |
 | `:blob_side_channel_threshold_bytes` | `integer` | `262_144` | Both | Values at or above this size are stored in per-shard append blob segments with a small Bitcask reference. `0` disables the blob side channel. |
-| `:blob_gc_sweeper_enabled` | `boolean` | `true` | Both | Enables automatic conservative cleanup of stale tmp and legacy side-channel blob files. Append-segment record compaction is a separate maintenance path. |
+| `:blob_gc_sweeper_enabled` | `boolean` | `true` | Both | Enables automatic conservative cleanup of stale metadata tmp files and append segments with no live refs. Partial segment compaction is a separate maintenance path. |
 | `:blob_gc_sweeper_initial_delay_ms` | `integer` | `60_000` | Both | Delay before the first automatic blob GC sweep. |
-| `:blob_gc_sweeper_interval_ms` | `integer` | `600_000` | Both | Interval between automatic blob GC sweeps. Each tick first checks blob storage stats and skips the keydir scan when no reclaimable legacy blob files or tmp files exist. |
+| `:blob_gc_sweeper_interval_ms` | `integer` | `600_000` | Both | Interval between automatic blob GC sweeps. Each tick first checks storage stats and skips the keydir scan when no blob segments or metadata tmp files exist. |
 | `:max_active_file_size` | `integer` | `8_589_934_592` | Both | Maximum Bitcask active file size before rotation. Larger defaults reduce high-throughput rollover tail latency; lower this if reclaim granularity is more important than p99 write latency. |
 
 ```elixir
@@ -151,10 +151,11 @@ from RAM (Tier 1 → Tier 2) but it stays on disk. The ETS entry keeps the key
 and disk location (`file_id`, `offset`) so the next read can fetch it. The key
 goes from "hot" (~1-5 us) to "cold" (~50-200 us) — slower but still accessible.
 
-**Expiration DOES delete data.** When a key's TTL expires, the key is
-permanently removed from both ETS and Bitcask (a tombstone is written to disk).
-The key is gone — `GET` returns nil, `EXISTS` returns 0. This happens two ways:
-lazy deletion on the next read, and active sweep every 100ms (configurable).
+**Expiration makes data inaccessible.** When a key's TTL expires, `GET` returns
+nil and `EXISTS` returns 0. The absolute expiry is stored in the Bitcask record,
+so recovery cannot resurrect an expired value. Replicated active expiry records
+a conditional delete through Raft; direct contexts remove only the exact ETS row
+they observed, and compaction later reclaims obsolete disk records.
 This is the same behavior as FerricStore `EXPIRE`.
 
 When RAM usage reaches `max_memory_bytes`, MemoryGuard must choose which hot
@@ -389,12 +390,27 @@ runaway transactions or pipelines.
 |--------|------|---------|----------|------------|-------------|
 | `:max_value_size` | `integer` | `1_048_576` (1 MB) | `67_108_864` (64 MB) | Both | Maximum value size in bytes. Enforced during native body validation and in embedded `FerricStore.set/3`. The hard cap of 64 MB is non-configurable. |
 | `:native_max_frame_bytes` | `integer` | `16_777_216` (16 MB) | `134_217_704` (128 MiB minus the 24-byte header) | Standalone only | Maximum native frame body size before command dispatch. Startup rejects values outside `1..134_217_704`. |
+| `:native_unauthenticated_max_frame_bytes` | `integer` | `65_536` (64 KiB) | `:native_max_frame_bytes` | Standalone only | Maximum frame body accepted before authentication. |
+| `:native_frame_assembly_timeout_ms` | `integer` | `15_000` | — | Standalone only | Absolute deadline for completing an incomplete wire frame or logical chunk stream. Unrelated traffic does not extend it. |
+| `:native_max_value_items` | `integer` | `100_000` | — | Standalone only | Maximum aggregate typed-value items across a nested request payload. |
+| `:native_max_value_depth` | `integer` | `64` | — | Standalone only | Maximum typed-value container nesting depth. |
 | `:native_max_lanes_per_connection` | `integer` | `1024` | — | Standalone only | Maximum active native protocol lanes per connection. |
 | `:native_lane_max_queue` | `integer` | `1024` | — | Standalone only | Maximum queued/inflight requests per native lane before `busy` responses. |
+| `:native_max_pipeline_commands` | `integer` | `1024` | — | Standalone only | Maximum commands accepted in one native pipeline request. |
 | `:native_max_inflight_per_connection` | `integer` | `4096` | — | Standalone only | Maximum total in-flight native requests per connection. |
 | `:native_max_inflight_per_lane` | `integer` | `1024` | — | Standalone only | Maximum in-flight native requests per lane. |
 | `:native_max_pending_chunks` | `integer` | `1024` | — | Standalone only | Maximum incomplete chunked request streams per connection. |
 | `:native_max_pending_chunk_bytes` | `integer` | `67_108_864` (64 MB) | — | Standalone only | Maximum memory held by incomplete native request chunks per connection. |
+| `:native_max_collection_response_items` | `integer` | `10_000` | — | Standalone only | Maximum collection elements materialized by bounded native collection responses. |
+| `:native_max_response_bytes` | `integer` | `67_108_864` (64 MB) | — | Standalone only | Maximum encoded size of a successful native response. Oversized results become a bounded error response. |
+| `:native_idle_timeout_ms` | `integer` | `90_000` | — | Standalone only | Closes an idle connection when it has no in-flight command. Active commands retain their own deadlines. |
+| `:native_max_global_executions` | `integer` | `8 × schedulers` | — | Standalone only | Node-wide concurrent command execution leases, including session `EXEC` and `WATCH`. |
+| `:native_max_global_lanes` | `integer` | `32 × schedulers` | — | Standalone only | Node-wide active lane process leases. |
+| `:native_max_global_blocking_requests` | `integer` | `4096` | — | Standalone only | Node-wide blocking command leases. |
+| `:native_max_global_pending_chunks` | `integer` | `4096` | — | Standalone only | Node-wide incomplete logical chunk stream leases. |
+| `:native_max_global_pending_chunk_bytes` | `integer` | `268_435_456` (256 MB) | — | Standalone only | Node-wide bytes leased by incomplete logical chunk streams. |
+| `:native_max_global_inbound_buffer_bytes` | `integer` | `268_435_456` (256 MB) | — | Standalone only | Node-wide bytes leased by connection receive buffers. |
+| `:native_request_compression_enabled` | `boolean` | `false` | — | Standalone only | Allows clients to negotiate zlib request compression. Disabled by default to keep decompression work opt-in. |
 | Connection buffer limit | compile-time | `134_217_728` (128 MiB) | — | Standalone only | Maximum incomplete wire bytes accumulated before the connection is closed. A complete boundary-sized frame may carry at most 64 KiB of coalesced continuation into immediate decode. Defined in `Native.Connection.FrameBuffer`. |
 | MULTI queue limit | compile-time | `100_000` | — | Standalone only | Maximum commands queued inside a `MULTI` transaction. When exceeded, the transaction is auto-discarded and an error is returned. |
 
@@ -412,18 +428,28 @@ config :ferricstore, :max_value_size, 10_485_760
 
 ### Native frame, lane, and transaction limits
 
-The native listener rejects or backpressures clients before one connection can
-consume unbounded memory. Runtime-configurable native limits bound frame bodies,
-active lanes, per-lane queues, in-flight requests, and incomplete chunked
-requests. The receive-buffer and `MULTI` queue caps are compile-time safeguards.
+The native listener rejects or backpressures clients before one connection or
+the aggregate connection population can consume unbounded resources.
+Runtime-configurable limits bound frame bodies, typed-value expansion, active
+lanes, execution concurrency, in-flight requests, receive buffers, and chunked
+requests. The per-connection receive-buffer and `MULTI` command-count caps are
+compile-time safeguards.
 
 - **Frame too large** — a native frame body larger than `native_max_frame_bytes`
-  is rejected before command dispatch.
+  is rejected before command dispatch; unauthenticated clients have a lower cap.
+- **Assembly timeout** — incomplete wire frames and logical chunk streams have
+  an absolute deadline that unrelated traffic cannot postpone.
+- **Decode amplification** — nesting depth and aggregate typed-value item counts
+  are checked during the single decode pass.
 - **Buffer overflow** — a client sending incomplete native frames faster than
   they can be parsed will accumulate data in the receive buffer. At 128 MB the
-  connection is closed with `ERR connection buffer overflow`.
+  connection is closed; the global inbound-byte lease can reject it earlier.
 - **Lane or inflight overflow** — a client exceeding lane or in-flight limits
   receives a `busy` response instead of growing server memory without bound.
+- **Global saturation** — node-wide execution, lane, blocking, and chunk leases
+  reject excess work without allocating an unbounded waiter population.
+- **Response overflow** — a successful value whose encoded representation
+  exceeds `native_max_response_bytes` is replaced by a bounded error.
 - **MULTI queue overflow** — a client queueing more than 100K commands inside
   `MULTI` triggers an automatic `DISCARD` with `ERR MULTI queue overflow`.
 
@@ -447,10 +473,9 @@ config :ferricstore,
   native_response_coalesce_bytes: 8 * 1024 * 1024
 ```
 
-The legacy `:sendfile_threshold` server option is retained for older/internal
-direct file-send helpers. The native TCP/TLS data plane uses response
-framing, coalescing, and chunking instead. Every emitted response frame stays
-within the connection's advertised `native_max_frame_bytes` limit.
+The native TCP/TLS data plane uses response framing, coalescing, and chunking.
+Every emitted response frame stays within the connection's advertised
+`native_max_frame_bytes` limit.
 
 ## TLS
 
@@ -522,8 +547,8 @@ and on disk forever, wasting RAM.
     ▼                                   ▼
   Check expire_at_ms                  Sample keys from ETS
     │                                   │
-    ├─ not expired → return value       ├─ expired → delete from ETS
-    │                                   │             + write tombstone to disk
+    ├─ not expired → return value       ├─ expired → conditional delete
+    │                                   │             of the observed version
     └─ expired → delete + return nil    └─ not expired → skip
 ```
 
@@ -536,8 +561,10 @@ and on disk forever, wasting RAM.
 | `10_000` | Lazy cleanup. Expired keys may linger up to 10 seconds. Saves CPU if you have few expiring keys or don't care about precise cleanup. |
 | `600_000` | Effectively disables active sweep (10 minutes). Only lazy expiry on read. Good for tests or when you don't use TTLs at all. |
 
-The sweep also writes tombstones to Bitcask for expired keys, so they're
-cleaned from disk on the next compaction cycle.
+Replicated sweeps commit conditional deletes so a stale sweep cannot remove a
+newer value. Direct sweeps exact-delete the scanned ETS tuple; the expired log
+record remains harmless because recovery checks its absolute expiry, and
+compaction reclaims it later.
 
 > See [Architecture Guide — Recovery](architecture.md#recovery) for how expired
 > keys are handled during shard restart.
@@ -753,7 +780,7 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | `FERRICSTORE_MAX_VALUE_SIZE` | `1048576` (1MB) | Max value size in bytes |
 | `FERRICSTORE_HOT_CACHE_MAX_VALUE_SIZE` | `65536` (64KB) | Values larger than this are stored cold (disk only) |
 | `FERRICSTORE_BLOB_SIDE_CHANNEL_THRESHOLD_BYTES` | `262144` (256KB) | Values at or above this size use append-segment blob side-channel storage. `0` disables it. |
-| `FERRICSTORE_BLOB_GC_SWEEPER_ENABLED` | `true` | Enables automatic conservative cleanup of stale tmp and legacy blob files. |
+| `FERRICSTORE_BLOB_GC_SWEEPER_ENABLED` | `true` | Enables automatic conservative cleanup of stale metadata tmp files and append segments with no live refs. |
 | `FERRICSTORE_BLOB_GC_SWEEPER_INITIAL_DELAY_MS` | `60000` | Delay before the first automatic blob GC sweep. |
 | `FERRICSTORE_BLOB_GC_SWEEPER_INTERVAL_MS` | `600000` | Interval between automatic blob GC sweeps. |
 | `FERRICSTORE_MEMORY_GUARD_INTERVAL_MS` | `5000` | Memory pressure check interval |

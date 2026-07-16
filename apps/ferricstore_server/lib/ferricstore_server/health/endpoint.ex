@@ -216,7 +216,7 @@ defmodule FerricstoreServer.Health.Endpoint do
          _headers,
          _body
        ) do
-    params = URI.decode_query(query)
+    params = FerricstoreServer.Health.QueryDecoder.decode(query)
 
     send_html_response(
       socket,
@@ -237,7 +237,7 @@ defmodule FerricstoreServer.Health.Endpoint do
          body
        ) do
     params = FlowPaths.decode_form_body(body)
-    username = params |> Map.get("username", "") |> String.trim()
+    username = Map.get(params, "username", "")
     password = Map.get(params, "password", "")
     next = Login.sanitize_next(Map.get(params, "next", ""))
 
@@ -1142,6 +1142,7 @@ defmodule FerricstoreServer.Health.Endpoint do
 
       true ->
         {id, opts} = FlowPaths.decode_flow_detail_request(encoded_id)
+        opts = Auth.dashboard_flow_collect_opts(opts, peer, headers)
         data = FerricstoreServer.Health.Dashboard.collect_flow_detail_page(id, opts)
         body = FerricstoreServer.Health.Dashboard.render_flow_detail_page(data)
         send_html_response(socket, transport, 200, "OK", body)

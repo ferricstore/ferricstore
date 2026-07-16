@@ -23,18 +23,68 @@ defmodule Ferricstore.Store.Router.Part08 do
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
 
+      @doc false
+      def __merge_flow_batch_results_for_test__(valid, indexed_results, valid_results),
+        do: merge_flow_batch_results(valid, indexed_results, valid_results)
+
+      @doc false
+      def __expand_flow_pipeline_results_for_test__(count, rejected, groups, group_results),
+        do: expand_flow_pipeline_results(count, rejected, groups, group_results)
+
+      @doc false
+      def __expand_flow_transition_results_for_test__(count, groups, group_results),
+        do: expand_flow_transition_batch_results(count, groups, group_results)
+
+      defp merge_flow_batch_results(valid, indexed_results, valid_results)
+           when is_list(valid_results) do
+        if same_list_length?(valid, valid_results) do
+          merge_exact_flow_batch_results(valid, valid_results, indexed_results)
+        else
+          put_unknown_flow_batch_results(valid, indexed_results)
+        end
+      end
+
+      defp merge_flow_batch_results(valid, indexed_results, _invalid_results),
+        do: put_unknown_flow_batch_results(valid, indexed_results)
+
+      defp merge_exact_flow_batch_results([], [], indexed_results), do: indexed_results
+
+      defp merge_exact_flow_batch_results(
+             [{index, _key, _command} | valid],
+             [result | valid_results],
+             indexed_results
+           ) do
+        merge_exact_flow_batch_results(
+          valid,
+          valid_results,
+          Map.put(indexed_results, index, result)
+        )
+      end
+
+      defp put_unknown_flow_batch_results(valid, indexed_results) do
+        unknown = ErrorReasons.write_timeout_unknown()
+
+        Enum.reduce(valid, indexed_results, fn {index, _key, _command}, results ->
+          Map.put(results, index, unknown)
+        end)
+      end
+
       defp expand_flow_transition_batch_results(count, groups, group_results) do
         results =
-          group_results
-          |> Enum.zip(groups)
+          groups
+          |> zip_batch_groups_with_results(group_results)
           |> Enum.reduce(new_waraft_result_tuple(count), fn
-            {results, {_key, indices, _cmd}}, acc when is_list(results) ->
-              put_flow_transition_batch_results(indices, results, acc)
+            {{_key, indices, _cmd}, results}, acc when is_list(results) ->
+              put_flow_transition_batch_results(
+                indices,
+                exact_flow_group_results(indices, results),
+                acc
+              )
 
-            {{:error, _reason} = error, {_key, indices, _cmd}}, acc ->
+            {{_key, indices, _cmd}, {:error, _reason} = error}, acc ->
               Enum.reduce(indices, acc, fn idx, next -> put_elem(next, idx, error) end)
 
-            {other, {_key, indices, _cmd}}, acc ->
+            {{_key, indices, _cmd}, other}, acc ->
               Enum.reduce(indices, acc, fn idx, next -> put_elem(next, idx, other) end)
           end)
 
@@ -477,27 +527,7 @@ defmodule Ferricstore.Store.Router.Part08 do
 
         keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
         group_results = batch_quorum_commands(ctx, keyed_commands)
-
-        results =
-          groups
-          |> Enum.zip(group_results)
-          |> Enum.reduce(flow_result_tuple(count, rejected), fn {{_shard_idx, _route_key, indices,
-                                                                  _cmd}, result},
-                                                                results ->
-            group_results =
-              case result do
-                result when is_list(result) and length(result) == length(indices) -> result
-                result -> List.duplicate(result, length(indices))
-              end
-
-            indices
-            |> Enum.zip(group_results)
-            |> Enum.reduce(results, fn {index, result}, results ->
-              put_elem(results, index, result)
-            end)
-          end)
-
-        Tuple.to_list(results)
+        expand_flow_pipeline_results(count, rejected, groups, group_results)
       end
 
       @doc false
@@ -532,27 +562,7 @@ defmodule Ferricstore.Store.Router.Part08 do
 
         keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
         group_results = batch_quorum_commands(ctx, keyed_commands)
-
-        results =
-          groups
-          |> Enum.zip(group_results)
-          |> Enum.reduce(flow_result_tuple(count, rejected), fn {{_shard_idx, _route_key, indices,
-                                                                  _cmd}, result},
-                                                                results ->
-            group_results =
-              case result do
-                result when is_list(result) and length(result) == length(indices) -> result
-                result -> List.duplicate(result, length(indices))
-              end
-
-            indices
-            |> Enum.zip(group_results)
-            |> Enum.reduce(results, fn {index, result}, results ->
-              put_elem(results, index, result)
-            end)
-          end)
-
-        Tuple.to_list(results)
+        expand_flow_pipeline_results(count, rejected, groups, group_results)
       end
 
       @doc false
@@ -592,27 +602,7 @@ defmodule Ferricstore.Store.Router.Part08 do
 
         keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
         group_results = batch_quorum_commands(ctx, keyed_commands)
-
-        results =
-          groups
-          |> Enum.zip(group_results)
-          |> Enum.reduce(flow_result_tuple(count, rejected), fn {{_shard_idx, _route_key, indices,
-                                                                  _cmd}, result},
-                                                                results ->
-            group_results =
-              case result do
-                result when is_list(result) and length(result) == length(indices) -> result
-                result -> List.duplicate(result, length(indices))
-              end
-
-            indices
-            |> Enum.zip(group_results)
-            |> Enum.reduce(results, fn {index, result}, results ->
-              put_elem(results, index, result)
-            end)
-          end)
-
-        Tuple.to_list(results)
+        expand_flow_pipeline_results(count, rejected, groups, group_results)
       end
 
       @doc false
@@ -648,38 +638,59 @@ defmodule Ferricstore.Store.Router.Part08 do
         keyed_commands = Enum.map(groups, fn {_shard_idx, key, _indices, cmd} -> {key, cmd} end)
         group_results = batch_quorum_commands(ctx, keyed_commands)
 
-        if map_size(rejected) == 0 and Enum.all?(group_results, &flow_create_group_success?/1) do
+        if map_size(rejected) == 0 and flow_pipeline_groups_succeeded?(groups, group_results) do
           :ok
         else
-          results =
-            groups
-            |> Enum.zip(group_results)
-            |> Enum.reduce(flow_result_tuple(count, rejected), fn {{_shard_idx, _route_key,
-                                                                    indices, _cmd}, result},
-                                                                  results ->
-              group_results =
-                case result do
-                  result when is_list(result) and length(result) == length(indices) -> result
-                  result -> List.duplicate(result, length(indices))
-                end
-
-              indices
-              |> Enum.zip(group_results)
-              |> Enum.reduce(results, fn {index, result}, results ->
-                put_elem(results, index, result)
-              end)
-            end)
-
-          Tuple.to_list(results)
+          expand_flow_pipeline_results(count, rejected, groups, group_results)
         end
       end
 
-      defp flow_create_group_success?(:ok), do: true
+      defp flow_pipeline_groups_succeeded?([], []), do: true
 
-      defp flow_create_group_success?(results) when is_list(results),
-        do: Enum.all?(results, &(&1 == :ok))
+      defp flow_pipeline_groups_succeeded?(
+             [{_shard_idx, _route_key, indices, _cmd} | groups],
+             [result | group_results]
+           ) do
+        flow_pipeline_group_succeeded?(indices, result) and
+          flow_pipeline_groups_succeeded?(groups, group_results)
+      end
 
-      defp flow_create_group_success?(_result), do: false
+      defp flow_pipeline_groups_succeeded?(_groups, _group_results), do: false
+
+      defp flow_pipeline_group_succeeded?(_indices, :ok), do: true
+
+      defp flow_pipeline_group_succeeded?(indices, results) when is_list(results) do
+        same_list_length?(indices, results) and Enum.all?(results, &(&1 == :ok))
+      end
+
+      defp flow_pipeline_group_succeeded?(_indices, _result), do: false
+
+      defp expand_flow_pipeline_results(count, rejected, groups, group_results) do
+        results =
+          groups
+          |> zip_batch_groups_with_results(group_results)
+          |> Enum.reduce(flow_result_tuple(count, rejected), fn
+            {{_shard_idx, _route_key, indices, _cmd}, result}, acc ->
+              indices
+              |> exact_flow_group_results(result)
+              |> Enum.zip(indices)
+              |> Enum.reduce(acc, fn {result, index}, results ->
+                put_elem(results, index, result)
+              end)
+          end)
+
+        Tuple.to_list(results)
+      end
+
+      defp exact_flow_group_results(indices, results) when is_list(results) do
+        if same_list_length?(indices, results) do
+          results
+        else
+          List.duplicate(ErrorReasons.write_timeout_unknown(), length(indices))
+        end
+      end
+
+      defp exact_flow_group_results(indices, result), do: List.duplicate(result, length(indices))
 
       defp flow_create_pipeline_entries([], indices, keys, attrs) do
         {Enum.reverse(indices), Enum.reverse(keys), Enum.reverse(attrs)}
@@ -824,25 +835,9 @@ defmodule Ferricstore.Store.Router.Part08 do
         group_results = batch_quorum_commands(ctx, keyed_commands)
 
         results =
-          groups
-          |> Enum.zip(group_results)
-          |> Enum.reduce(flow_result_tuple(count), fn {{_shard_idx, _route_key, indices, _cmd},
-                                                       result},
-                                                      acc ->
-            group_results =
-              case result do
-                result when is_list(result) and length(result) == length(indices) -> result
-                result -> List.duplicate(result, length(indices))
-              end
+          expand_flow_pipeline_results(count, %{}, groups, group_results)
 
-            indices
-            |> Enum.zip(group_results)
-            |> Enum.reduce(acc, fn {index, result}, results_acc ->
-              put_elem(results_acc, index, result)
-            end)
-          end)
-
-        Tuple.to_list(results)
+        results
       end
 
       defp flow_terminal_pipeline_entries([], indices, keys, attrs) do
@@ -1316,27 +1311,25 @@ defmodule Ferricstore.Store.Router.Part08 do
                candidate_count: 0
              }}
           else
-            key = "__flow_retention_cleanup__:active"
+            commands =
+              flow_retention_shard_commands(
+                active_candidates,
+                Map.fetch!(attrs, :now_ms),
+                :active
+              )
 
-            active_attrs = %{
-              now_ms: Map.fetch!(attrs, :now_ms),
-              active_candidates: active_candidates
-            }
+            manifest = flow_retention_command_manifest(commands)
 
-            entry = {:flow_cross_retention_cleanup, active_attrs}
-            command = flow_cross_shard_tx_command(ctx, entry)
-
-            with :ok <- flow_retention_run_command_hook(:active, command) do
-              case flow_cross_shard_tx(ctx, [key], entry) do
-                {:ok, result} when is_map(result) ->
-                  {:ok, Map.put(result, :candidate_count, Map.get(result, :active_timeouts, 0))}
-
-                {:error, _reason} = error ->
-                  error
-
-                _other ->
-                  {:error, "ERR flow retention cleanup failed"}
-              end
+            with :ok <- flow_retention_run_command_hook(:active, manifest),
+                 {:ok, result} <-
+                   flow_retention_execute_shard_commands(ctx, commands, %{
+                     flows: 0,
+                     history: 0,
+                     values: 0,
+                     active_timeouts: 0,
+                     shard_counts: %{}
+                   }) do
+              {:ok, Map.put(result, :candidate_count, Map.get(result, :active_timeouts, 0))}
             end
           end
         end
@@ -1355,77 +1348,146 @@ defmodule Ferricstore.Store.Router.Part08 do
           if terminal_candidates == [] do
             {:ok, initial}
           else
-            key = "__flow_retention_cleanup__:terminal"
+            commands =
+              flow_retention_shard_commands(
+                terminal_candidates,
+                Map.fetch!(attrs, :now_ms),
+                :terminal
+              )
 
-            terminal_attrs = %{
-              now_ms: Map.fetch!(attrs, :now_ms),
-              terminal_candidates: terminal_candidates
-            }
+            manifest = flow_retention_command_manifest(commands)
 
-            entry = {:flow_cross_retention_cleanup, terminal_attrs}
-            command = flow_cross_shard_tx_command(ctx, entry)
-
-            with :ok <- flow_retention_run_command_hook(:terminal, command) do
-              case flow_cross_shard_tx(ctx, [key], entry) do
-                {:ok, terminal_result} when is_map(terminal_result) ->
-                  {:ok, merge_flow_cleanup_counts(initial, terminal_result)}
-
-                {:error, _reason} = error ->
-                  error
-
-                _other ->
-                  {:error, "ERR flow retention cleanup failed"}
-              end
+            with :ok <- flow_retention_run_command_hook(:terminal, manifest),
+                 {:ok, result} <-
+                   flow_retention_execute_shard_commands(ctx, commands, initial) do
+              {:ok, Map.drop(result, [:shard_counts])}
             end
           end
         end
       end
 
-      defp flow_retention_command_candidates(candidates, ctx, attrs, kind) do
+      defp flow_retention_shard_commands(candidates, now_ms, kind) do
         field = if(kind == :active, do: :active_candidates, else: :terminal_candidates)
-        empty_attrs = %{field => [], now_ms: Map.fetch!(attrs, :now_ms)}
 
-        base_bytes =
-          ctx
-          |> flow_cross_shard_tx_command({:flow_cross_retention_cleanup, empty_attrs})
-          |> :erlang.external_size()
+        candidates
+        |> Enum.group_by(&Map.fetch!(&1, :shard_index))
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.map(fn {shard_index, shard_candidates} ->
+          key = shard_candidates |> hd() |> Map.fetch!(:state_key)
+          attrs = %{field => shard_candidates, now_ms: now_ms}
+          {shard_index, key, {:flow_retention_cleanup, key, attrs}}
+        end)
+      end
 
+      defp flow_retention_command_manifest(commands) do
+        {:flow_retention_shard_commands,
+         Enum.map(commands, fn {shard_index, _key, command} -> {shard_index, command} end)}
+      end
+
+      defp flow_retention_execute_shard_commands(ctx, commands, initial) do
+        keyed_commands = Enum.map(commands, fn {_shard_index, key, command} -> {key, command} end)
+        results = pipeline_write_batch(ctx, keyed_commands)
+
+        commands
+        |> zip_batch_groups_with_results(results)
+        |> Enum.reduce_while({:ok, initial}, fn
+          {{shard_index, _key, _command}, {:ok, counts}}, {:ok, acc} when is_map(counts) ->
+            {:cont, {:ok, flow_retention_merge_shard_result(acc, shard_index, counts)}}
+
+          {{shard_index, _key, _command}, counts}, {:ok, acc} when is_map(counts) ->
+            {:cont, {:ok, flow_retention_merge_shard_result(acc, shard_index, counts)}}
+
+          {{_shard_index, _key, _command}, {:error, _reason} = error}, _acc ->
+            {:halt, error}
+
+          _invalid, _acc ->
+            {:halt, {:error, "ERR flow retention cleanup failed"}}
+        end)
+      end
+
+      defp flow_retention_merge_shard_result(acc, shard_index, counts) do
+        shard_counts =
+          Map.update(Map.get(acc, :shard_counts, %{}), shard_index, counts, fn existing ->
+            merge_flow_cleanup_counts(existing, counts)
+          end)
+
+        acc
+        |> merge_flow_cleanup_counts(counts)
+        |> Map.put(:shard_counts, shard_counts)
+      end
+
+      defp flow_retention_command_candidates(candidates, _ctx, attrs, kind) do
         byte_budget = Map.fetch!(attrs, :cleanup_byte_budget)
         key_budget = Map.fetch!(attrs, :cleanup_key_budget)
         limit = Map.get(attrs, :limit, 100)
+        now_ms = Map.fetch!(attrs, :now_ms)
+        base_bytes = :erlang.external_size({:flow_retention_shard_commands, []})
 
-        {selected, _keys, _bytes, _count} =
-          Enum.reduce_while(candidates, {[], 0, base_bytes, 0}, fn candidate,
-                                                                   {selected, keys, bytes, count} ->
+        {selected, _keys, _bytes, _count, _shards} =
+          Enum.reduce_while(candidates, {[], 0, base_bytes, 0, MapSet.new()}, fn candidate,
+                                                                                 {selected, keys,
+                                                                                  bytes, count,
+                                                                                  shards} ->
             candidate_keys = Map.fetch!(candidate, :planned_key_count)
             candidate_bytes = :erlang.external_size(candidate) + 32
+            shard_index = Map.fetch!(candidate, :shard_index)
+
+            {candidate_bytes, selected_shards} =
+              if MapSet.member?(shards, shard_index) do
+                {candidate_bytes, shards}
+              else
+                empty_command =
+                  flow_retention_shard_commands(
+                    [Map.put(candidate, :planned_key_count, 0)],
+                    now_ms,
+                    kind
+                  )
+                  |> hd()
+                  |> elem(2)
+
+                {candidate_bytes + :erlang.external_size(empty_command),
+                 MapSet.put(shards, shard_index)}
+              end
 
             if count >= limit or keys >= key_budget or bytes >= byte_budget do
-              {:halt, {selected, keys, bytes, count}}
+              {:halt, {selected, keys, bytes, count, shards}}
             else
               if keys + candidate_keys > key_budget or bytes + candidate_bytes > byte_budget do
-                {:cont, {selected, keys, bytes, count}}
+                {:cont, {selected, keys, bytes, count, shards}}
               else
                 {:cont,
                  {
                    [candidate | selected],
                    keys + candidate_keys,
                    bytes + candidate_bytes,
-                   count + 1
+                   count + 1,
+                   selected_shards
                  }}
               end
             end
           end)
 
-        selected = Enum.reverse(selected)
-        command_attrs = %{field => selected, now_ms: Map.fetch!(attrs, :now_ms)}
+        selected
+        |> Enum.reverse()
+        |> flow_retention_trim_to_byte_budget(now_ms, kind, byte_budget)
+      end
 
-        actual_bytes =
-          ctx
-          |> flow_cross_shard_tx_command({:flow_cross_retention_cleanup, command_attrs})
+      defp flow_retention_trim_to_byte_budget([], _now_ms, _kind, _byte_budget), do: []
+
+      defp flow_retention_trim_to_byte_budget(candidates, now_ms, kind, byte_budget) do
+        size =
+          candidates
+          |> flow_retention_shard_commands(now_ms, kind)
+          |> flow_retention_command_manifest()
           |> :erlang.external_size()
 
-        if actual_bytes <= byte_budget, do: selected, else: []
+        if size <= byte_budget do
+          candidates
+        else
+          candidates
+          |> Enum.drop(-1)
+          |> flow_retention_trim_to_byte_budget(now_ms, kind, byte_budget)
+        end
       end
 
       defp flow_retention_planning_attrs(ctx, attrs) do

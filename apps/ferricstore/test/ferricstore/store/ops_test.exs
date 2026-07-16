@@ -6,7 +6,7 @@ defmodule Ferricstore.Store.OpsTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
-  alias Ferricstore.Store.LFU
+  alias Ferricstore.Store.{BlobRef, CompoundKey, LFU, ReadResult}
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.Router
@@ -24,6 +24,135 @@ defmodule Ferricstore.Store.OpsTest do
       }
 
       assert Ops.prob_dir(store, "prob-key") == "/right/prob"
+    end
+  end
+
+  describe "compound_batch_mutate/4 fallback" do
+    test "restores successful sequential deletes when a later delete fails" do
+      table = :ets.new(:compound_batch_mutate_rollback, [:set, :private])
+      first = "L:list:first"
+      second = "L:list:second"
+      inserted = "L:list:inserted"
+
+      try do
+        :ets.insert(table, [{first, "a", 10}, {second, "b", 20}])
+
+        store = %{
+          compound_get_meta: fn "list", compound_key ->
+            case :ets.lookup(table, compound_key) do
+              [{^compound_key, value, expire_at_ms}] -> {value, expire_at_ms}
+              [] -> nil
+            end
+          end,
+          compound_delete: fn
+            "list", ^second ->
+              {:error, :disk_full}
+
+            "list", compound_key ->
+              :ets.delete(table, compound_key)
+              :ok
+          end,
+          compound_put: fn "list", compound_key, value, expire_at_ms ->
+            :ets.insert(table, {compound_key, value, expire_at_ms})
+            :ok
+          end
+        }
+
+        assert {:error, :disk_full} ==
+                 Ops.compound_batch_mutate(store, "list", [first, second], [
+                   {inserted, "x", 0}
+                 ])
+
+        assert [{^first, "a", 10}] = :ets.lookup(table, first)
+        assert [{^second, "b", 20}] = :ets.lookup(table, second)
+        assert [] == :ets.lookup(table, inserted)
+      after
+        :ets.delete(table)
+      end
+    end
+
+    test "rejects malformed snapshot rows before deleting data" do
+      store = %{
+        compound_batch_get_meta: fn "list", ["L:list:first"] -> [:malformed] end,
+        compound_delete: fn _redis_key, _compound_key ->
+          flunk("malformed snapshots must be rejected before deleting data")
+        end,
+        compound_put: fn _redis_key, _compound_key, _value, _expire_at_ms ->
+          flunk("malformed snapshots must be rejected before writing data")
+        end
+      }
+
+      assert ReadResult.failure(:invalid_compound_mutation_snapshot) ==
+               Ops.compound_batch_mutate(store, "list", ["L:list:first"], [])
+    end
+  end
+
+  describe "map-backed SET" do
+    test "propagates backing write failures with and without GET" do
+      store = %{
+        get_meta: fn _key -> {"old", 0} end,
+        exists?: fn _key -> true end,
+        put: fn _key, _value, _expire_at_ms -> {:error, :disk_full} end
+      }
+
+      assert {:error, :disk_full} == Ops.set(store, "key", "new", set_opts(%{}))
+
+      assert {:error, :disk_full} ==
+               Ops.set(store, "key", "new", set_opts(%{get: true}))
+    end
+
+    test "propagates backing read failures without attempting a write" do
+      failure = ReadResult.failure(:corrupt_segment)
+
+      store = %{
+        get_meta: fn _key -> failure end,
+        exists?: fn _key -> false end,
+        put: fn key, value, expire_at_ms ->
+          send(self(), {:put, key, value, expire_at_ms})
+          :ok
+        end
+      }
+
+      assert ^failure = Ops.set(store, "key", "new", set_opts(%{get: true}))
+      refute_receive {:put, _key, _value, _expire_at_ms}
+    end
+
+    test "propagates conditional existence read failures without attempting a write" do
+      failure = ReadResult.failure(:unavailable)
+
+      store = %{
+        get_meta: fn _key -> nil end,
+        exists?: fn _key -> failure end,
+        put: fn key, value, expire_at_ms ->
+          send(self(), {:put, key, value, expire_at_ms})
+          :ok
+        end
+      }
+
+      assert ^failure = Ops.set(store, "key", "new", set_opts(%{nx: true}))
+      refute_receive {:put, _key, _value, _expire_at_ms}
+    end
+
+    test "propagates KEEPTTL expiry read failures without attempting a write" do
+      failure = ReadResult.failure(:expiry_index_unavailable)
+
+      store = %{
+        expire_at_ms: fn _key -> failure end,
+        get_meta: fn _key -> flunk("KEEPTTL should use the expiry-only callback") end,
+        put: fn _key, _value, _expire_at_ms -> flunk("a failed expiry read must not write") end
+      }
+
+      assert ^failure = Ops.set(store, "key", "new", set_opts(%{keepttl: true}))
+    end
+
+    test "reuses GET metadata for conditional existence checks" do
+      store = %{
+        get_meta: fn _key -> nil end,
+        exists?: fn _key -> flunk("GET metadata already established that the key is absent") end,
+        put: fn "key", "new", 0 -> :ok end
+      }
+
+      assert nil == Ops.set(store, "key", "new", set_opts(%{get: true, nx: true}))
     end
   end
 
@@ -59,6 +188,32 @@ defmodule Ferricstore.Store.OpsTest do
         :ets.delete(keydir)
       end
     end
+
+    test "invalid live keydir entries cannot be treated as absent by conditional SET" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "ops:local_tx:invalid-set:#{System.unique_integer([:positive])}"
+      shard_index = Router.shard_for(ctx, key)
+      keydir = :ets.new(:ops_local_tx_invalid_set, [:set, :public])
+      entry = {key, nil, 0, LFU.initial(), 0, :invalid_offset, 3}
+
+      try do
+        Process.put(:tx_pending_values, %{})
+        Process.put(:tx_deleted_keys, MapSet.new())
+        :ets.insert(keydir, entry)
+        tx = local_tx(ctx, shard_index, keydir, %{})
+
+        assert {:error, "ERR cold read failed"} ==
+                 Ops.set(tx, key, "replacement", set_opts(%{nx: true}))
+
+        assert [^entry] = :ets.lookup(keydir, key)
+        assert %{} == Process.get(:tx_pending_values)
+        refute_receive {:tx_pending_write, ^key, _value, _expire_at_ms}
+      after
+        Process.delete(:tx_pending_values)
+        Process.delete(:tx_deleted_keys)
+        :ets.delete(keydir)
+      end
+    end
   end
 
   describe "LocalTxStore read-modify-write TTL preservation" do
@@ -89,6 +244,85 @@ defmodule Ferricstore.Store.OpsTest do
         {"abXYef", "abXYef"}
       end)
     end
+
+    test "derived writes enforce the instance value-size limit before mutation" do
+      ctx = FerricStore.Instance.get(:default) |> Map.put(:max_value_size, 4)
+      keydir = :ets.new(:ops_local_tx_size_limit, [:set, :public])
+
+      try do
+        Process.put(:tx_pending_values, %{})
+        Process.put(:tx_deleted_keys, MapSet.new())
+
+        {shard_index, [append_key, setrange_key, getset_key]} =
+          same_shard_keys(ctx, "ops:local_tx:size", 3)
+
+        tx = local_tx(ctx, shard_index, keydir, %{})
+
+        assert {:error, "ERR value too large (5 bytes, max 4 bytes)"} ==
+                 Ops.append(tx, append_key, "12345")
+
+        assert {:error, "ERR value too large (5 bytes, max 4 bytes)"} ==
+                 Ops.setrange(tx, setrange_key, 4, "x")
+
+        assert {:error, "ERR value too large (5 bytes, max 4 bytes)"} ==
+                 Ops.getset(tx, getset_key, "12345")
+
+        assert [] == :ets.tab2list(keydir)
+        assert %{} == Process.get(:tx_pending_values)
+        refute_receive {:tx_pending_write, _key, _value, _expire_at_ms}
+      after
+        Process.delete(:tx_pending_values)
+        Process.delete(:tx_deleted_keys)
+        :ets.delete(keydir)
+      end
+    end
+
+    test "read-modify-write operations abort when a cold value cannot be read" do
+      ctx = FerricStore.Instance.get(:default)
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ops_local_tx_missing_cold_#{System.unique_integer([:positive])}"
+        )
+
+      keydir = :ets.new(:ops_local_tx_missing_cold, [:set, :public])
+
+      mutations = [
+        {"incr", fn tx, key -> Ops.incr(tx, key, 1) end},
+        {"append", fn tx, key -> Ops.append(tx, key, "suffix") end},
+        {"getset", fn tx, key -> Ops.getset(tx, key, "replacement") end},
+        {"setrange", fn tx, key -> Ops.setrange(tx, key, 0, "replacement") end}
+      ]
+
+      try do
+        File.mkdir_p!(dir)
+        Process.put(:tx_pending_values, %{})
+        Process.put(:tx_deleted_keys, MapSet.new())
+
+        Enum.each(mutations, fn {name, mutate} ->
+          key = "ops:local_tx:cold-error:#{name}:#{System.unique_integer([:positive])}"
+          shard_index = Router.shard_for(ctx, key)
+          entry = {key, nil, 0, LFU.initial(), 0, 0, 64}
+          :ets.insert(keydir, entry)
+
+          tx =
+            ctx
+            |> local_tx(shard_index, keydir, %{})
+            |> put_in([Access.key!(:shard_state), :shard_data_path], dir)
+
+          assert {:error, "ERR cold read failed"} == mutate.(tx, key)
+          assert [^entry] = :ets.lookup(keydir, key)
+          refute Map.has_key?(Process.get(:tx_pending_values), key)
+          refute_receive {:tx_pending_write, ^key, _value, _expire_at_ms}
+        end)
+      after
+        Process.delete(:tx_pending_values)
+        Process.delete(:tx_deleted_keys)
+        :ets.delete(keydir)
+        File.rm_rf!(dir)
+      end
+    end
   end
 
   describe "LocalTxStore EXISTS" do
@@ -107,6 +341,37 @@ defmodule Ferricstore.Store.OpsTest do
                "EXISTS should trust valid cold keydir metadata instead of reading the value"
       after
         :ets.delete(keydir)
+      end
+    end
+  end
+
+  describe "LocalTxStore value metadata" do
+    test "value_size reports an unreadable live blob reference" do
+      ctx =
+        FerricStore.Instance.get(:default)
+        |> Map.put(:blob_side_channel_threshold_bytes, 1)
+
+      key = "ops:local_tx:blob-size-error:#{System.unique_integer([:positive])}"
+      shard_index = Router.shard_for(ctx, key)
+      keydir = :ets.new(:ops_local_tx_blob_size_error, [:set, :public])
+
+      dir =
+        Path.join(System.tmp_dir!(), "ops_blob_size_error_#{System.unique_integer([:positive])}")
+
+      try do
+        File.mkdir_p!(dir)
+        :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, BlobRef.encoded_size()})
+
+        tx =
+          ctx
+          |> local_tx(shard_index, keydir, %{})
+          |> put_in([Access.key!(:shard_state), :shard_data_path], dir)
+
+        assert {:error, {:storage_read_failed, {:cold_read_failed, _reason}}} =
+                 Ops.value_size(tx, key)
+      after
+        :ets.delete(keydir)
+        File.rm_rf(dir)
       end
     end
   end
@@ -134,6 +399,13 @@ defmodule Ferricstore.Store.OpsTest do
              "LocalTxStore batch reads should pread each repeated cold {path, offset, key} once and fan out the result"
     end
 
+    test "local cold batch reads re-resolve locations changed by compaction" do
+      source = File.read!(@local_read_path)
+
+      assert source =~ "ColdRead.pread_batch_keyed_current",
+             "LocalTxStore batch reads must retry a keydir row relocated after the initial lookup"
+    end
+
     test "local cold batch reads materialize blob refs with the batch helper" do
       source = File.read!(@local_read_path)
       [_before, section] = String.split(source, "defp read_unique_local_batch_cold", parts: 2)
@@ -149,6 +421,26 @@ defmodule Ferricstore.Store.OpsTest do
 
       refute read_body =~ "local_materialize_blob_value(tx, value)",
              "LocalTxStore batch reads should not materialize blob refs one entry at a time"
+    end
+
+    test "batch_get reports malformed live rows without deleting them" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "ops:local_tx:plain-batch-invalid:#{System.unique_integer([:positive])}"
+      shard_index = Router.shard_for(ctx, key)
+      keydir = :ets.new(:ops_local_tx_batch_invalid, [:set, :public])
+      entry = {key, nil, 0, LFU.initial(), 0, :invalid_offset, 3}
+
+      try do
+        :ets.insert(keydir, entry)
+        tx = local_tx(ctx, shard_index, keydir, %{})
+
+        assert [{:error, {:storage_read_failed, :invalid_keydir_entry}}] ==
+                 Ops.batch_get(tx, [key])
+
+        assert [^entry] = :ets.lookup(keydir, key)
+      after
+        :ets.delete(keydir)
+      end
     end
 
     test "batch_get returns ordered cold values and warms matching ETS entries" do
@@ -225,7 +517,8 @@ defmodule Ferricstore.Store.OpsTest do
           local_tx(ctx, shard_index, keydir, %{})
           |> put_in([Access.key!(:shard_state), :shard_data_path], dir)
 
-        assert [nil] == Ops.batch_get(tx, [target])
+        assert [{:error, {:storage_read_failed, {:cold_read_failed, _reason}}}] =
+                 Ops.batch_get(tx, [target])
       after
         :ets.delete(keydir)
         File.rm_rf(dir)
@@ -273,7 +566,13 @@ defmodule Ferricstore.Store.OpsTest do
         )
 
         try do
-          assert [nil, "good"] == Ops.batch_get(tx, keys)
+          assert [
+                   {:error, {:storage_read_failed, {:cold_read_failed, reason}}},
+                   "good"
+                 ] = Ops.batch_get(tx, keys)
+
+          assert is_binary(reason)
+          assert String.contains?(reason, missing_path)
 
           assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                           %{path: ^missing_path, reason: :missing_file}},
@@ -302,10 +601,10 @@ defmodule Ferricstore.Store.OpsTest do
              "LocalTxStore promoted mixed compound_batch_get_meta must partition and batch, not serialize per key"
     end
 
-    test "promoted type metadata reads cold value from shared shard log" do
+    test "promoted type metadata reads cold value from the dedicated log" do
       ctx = FerricStore.Instance.get(:default)
       redis_key = "ops:local_tx:promoted-type:#{System.unique_integer([:positive])}"
-      type_key = "T:" <> redis_key
+      type_key = CompoundKey.type_key(redis_key)
       shard_index = Router.shard_for(ctx, redis_key)
 
       shared_dir =
@@ -325,11 +624,11 @@ defmodule Ferricstore.Store.OpsTest do
       try do
         File.mkdir_p!(shared_dir)
         File.mkdir_p!(dedicated_dir)
-        shared_path = Path.join(shared_dir, "00000.log")
-        File.touch!(shared_path)
+        dedicated_path = Path.join(dedicated_dir, "00000.log")
+        File.touch!(dedicated_path)
 
         assert {:ok, [{off, size}]} =
-                 NIF.v2_append_batch_nosync(shared_path, [{type_key, "hash", 0}])
+                 NIF.v2_append_batch_nosync(dedicated_path, [{type_key, "hash", 0}])
 
         :ets.insert(keydir, {type_key, nil, 0, LFU.initial(), 0, off, size})
 
@@ -427,7 +726,8 @@ defmodule Ferricstore.Store.OpsTest do
           local_tx(ctx, shard_index, keydir, %{})
           |> put_in([Access.key!(:shard_state), :shard_data_path], dir)
 
-        assert [nil] == Ops.compound_batch_get(tx, redis_key, [target])
+        assert [{:error, {:storage_read_failed, {:cold_read_failed, _reason}}}] =
+                 Ops.compound_batch_get(tx, redis_key, [target])
       after
         :ets.delete(keydir)
         File.rm_rf(dir)
@@ -442,15 +742,18 @@ defmodule Ferricstore.Store.OpsTest do
       keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
 
       try do
-        :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+        entry = {compound_key, nil, 0, LFU.initial(), 0, :pending_offset, 3}
+        :ets.insert(keydir, entry)
 
         tx =
           local_tx(ctx, shard_index, keydir, %{
             redis_key => %{path: System.tmp_dir!()}
           })
 
-        assert nil == Ops.compound_get(tx, redis_key, compound_key)
-        assert [] == :ets.lookup(keydir, compound_key)
+        assert {:error, {:storage_read_failed, :invalid_keydir_entry}} ==
+                 Ops.compound_get(tx, redis_key, compound_key)
+
+        assert [^entry] = :ets.lookup(keydir, compound_key)
       after
         :ets.delete(keydir)
       end
@@ -464,17 +767,74 @@ defmodule Ferricstore.Store.OpsTest do
       keydir = :ets.new(:"ops_local_tx_#{System.unique_integer([:positive])}", [:set, :public])
 
       try do
-        :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+        entry = {compound_key, nil, 0, LFU.initial(), 0, :pending_offset, 3}
+        :ets.insert(keydir, entry)
 
         tx =
           local_tx(ctx, shard_index, keydir, %{
             redis_key => %{path: System.tmp_dir!()}
           })
 
-        assert nil == Ops.compound_get_meta(tx, redis_key, compound_key)
-        assert [] == :ets.lookup(keydir, compound_key)
+        assert {:error, {:storage_read_failed, :invalid_keydir_entry}} ==
+                 Ops.compound_get_meta(tx, redis_key, compound_key)
+
+        assert [^entry] = :ets.lookup(keydir, compound_key)
       after
         :ets.delete(keydir)
+      end
+    end
+
+    test "promoted cold read emits one telemetry event per physical failure" do
+      ctx = FerricStore.Instance.get(:default)
+      redis_key = "ops:local_tx:promoted-missing:#{System.unique_integer([:positive])}"
+      compound_key = "H:" <> redis_key <> <<0>> <> "field"
+      shard_index = Router.shard_for(ctx, redis_key)
+      keydir = :ets.new(:ops_local_tx_promoted_missing, [:set, :public])
+
+      dedicated_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ops_local_tx_promoted_missing_#{System.unique_integer([:positive])}"
+        )
+
+      handler_id = {:ops_promoted_pread_corrupt, self(), make_ref()}
+      parent = self()
+
+      try do
+        File.mkdir_p!(dedicated_dir)
+        :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 9, 0, 3})
+
+        tx =
+          local_tx(ctx, shard_index, keydir, %{
+            redis_key => %{path: dedicated_dir}
+          })
+
+        :ok =
+          :telemetry.attach(
+            handler_id,
+            [:ferricstore, :bitcask, :pread_corrupt],
+            fn event, measurements, metadata, _config ->
+              send(parent, {:promoted_pread_corrupt, event, measurements, metadata})
+            end,
+            nil
+          )
+
+        assert {:error, {:storage_read_failed, {:cold_read_failed, _reason}}} =
+                 Ops.compound_get(tx, redis_key, compound_key)
+
+        missing_path = Path.join(dedicated_dir, "00009.log")
+
+        assert_receive {:promoted_pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt],
+                        %{count: 1}, %{path: ^missing_path, reason: :missing_file}},
+                       1_000
+
+        refute_receive {:promoted_pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt],
+                        _measurements, _metadata},
+                       50
+      after
+        :telemetry.detach(handler_id)
+        :ets.delete(keydir)
+        File.rm_rf(dedicated_dir)
       end
     end
   end
@@ -499,12 +859,14 @@ defmodule Ferricstore.Store.OpsTest do
       )
 
       try do
-        assert nil == Ops.compound_get(tx, redis_key, compound_key)
-        assert [nil] == Ops.compound_batch_get(tx, redis_key, [compound_key])
-        assert nil == Ops.compound_get_meta(tx, redis_key, compound_key)
-        assert [nil] == Ops.compound_batch_get_meta(tx, redis_key, [compound_key])
-        assert [] == Ops.compound_scan(tx, redis_key, "H:" <> redis_key <> <<0>>)
-        assert 0 == Ops.compound_count(tx, redis_key, "H:" <> redis_key <> <<0>>)
+        failure = ReadResult.failure(:shard_unavailable)
+
+        assert ^failure = Ops.compound_get(tx, redis_key, compound_key)
+        assert [^failure] = Ops.compound_batch_get(tx, redis_key, [compound_key])
+        assert ^failure = Ops.compound_get_meta(tx, redis_key, compound_key)
+        assert [^failure] = Ops.compound_batch_get_meta(tx, redis_key, [compound_key])
+        assert ^failure = Ops.compound_scan(tx, redis_key, "H:" <> redis_key <> <<0>>)
+        assert ^failure = Ops.compound_count(tx, redis_key, "H:" <> redis_key <> <<0>>)
 
         for request <- [
               :compound_get,

@@ -5,14 +5,26 @@ defmodule Ferricstore.Raft.WARaftPersistedConfigTest do
 
   @peer_tag "ferricstore_waraft_peer"
 
-  test "canonical persisted peers round trip bounded dynamic node names" do
-    node_name = unique_node_name("valid")
+  test "canonical persisted peers round trip configured node names" do
+    configured_node = node()
+    node_name = Atom.to_string(configured_node)
     config = %{participants: [{@peer_tag, Atom.to_string(__MODULE__), node_name}]}
 
-    assert {:ok, %{participants: [{__MODULE__, decoded_node}]}} =
+    assert {:ok, %{participants: [{__MODULE__, ^configured_node}]}} =
              WARaftStorage.__decode_persisted_waraft_config_for_test__(config)
+  end
 
-    assert Atom.to_string(decoded_node) == node_name
+  test "unknown persisted node names are rejected without interning atoms" do
+    node_name = unique_node_name("unknown-node")
+    refute existing_atom?(node_name)
+
+    result =
+      WARaftStorage.__decode_persisted_waraft_config_for_test__(%{
+        participants: [{@peer_tag, Atom.to_string(__MODULE__), node_name}]
+      })
+
+    refute existing_atom?(node_name)
+    assert {:error, {:unknown_persisted_peer_node, ^node_name}} = result
   end
 
   test "unknown persisted server names are rejected without interning atoms" do

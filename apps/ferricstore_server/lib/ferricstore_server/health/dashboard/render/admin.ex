@@ -527,12 +527,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.Admin do
 
   def render_clients_summary(conns, clients) do
     oldest_age =
-      clients
-      |> Enum.map(& &1.age_seconds)
-      |> Enum.max(fn -> 0 end)
+      Map.get_lazy(conns, :oldest_age_seconds, fn ->
+        clients
+        |> Enum.map(& &1.age_seconds)
+        |> Enum.max(fn -> 0 end)
+      end)
 
-    pubsub = Enum.count(clients, &String.contains?(&1.flags, "S"))
-    transactions = Enum.count(clients, &String.contains?(&1.flags, "M"))
+    pubsub =
+      Map.get_lazy(conns, :pubsub, fn -> Enum.count(clients, &String.contains?(&1.flags, "S")) end)
+
+    transactions =
+      Map.get_lazy(conns, :transactions, fn ->
+        Enum.count(clients, &String.contains?(&1.flags, "M"))
+      end)
 
     render_ops_summary("Client Summary", [
       %{label: "Active", value: format_number(conns.active)},

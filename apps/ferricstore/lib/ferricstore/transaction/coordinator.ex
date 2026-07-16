@@ -2,158 +2,196 @@ defmodule Ferricstore.Transaction.Coordinator do
   @moduledoc """
   Transaction coordinator for MULTI/EXEC.
 
-  Raft-enabled transactions submit a single Raft log entry to an "anchor shard"
-  containing commands for all involved shards. The StateMachine's `apply/3`
-  writes to all shards' ETS tables and Bitcask files in one deterministic pass.
-  This includes single-shard write transactions; otherwise they would bypass
-  the quorum write path and only mutate the local shard process.
+  Transactions are accepted only when every routed and watched key belongs to
+  one shard. The complete queue and WATCH snapshot are then checked and applied
+  by that shard's Raft state machine in one ordered entry. Independent Raft
+  groups cannot provide atomic commit through an anchor-group write, so
+  cross-shard transactions fail with `CROSSSLOT` before mutation.
 
   ## WATCH conflict detection
 
-  WATCH uses per-key tokens rather than per-shard write-version counters. Hot
-  keys include the in-memory value hash plus the live Bitcask location; cold
-  keys snapshot the live keydir location, so large values do not have to be
-  materialized just to enter or check WATCH.
+  WATCH tokens use the key's logical Raft write index when available and a
+  content digest for projected Bitcask values. Capture and validation are both
+  ordered through the owning shard's Raft log.
   """
 
-  alias Ferricstore.Commands.PreparedCommand
+  alias Ferricstore.Commands.{PreparedCommand, TransactionPolicy}
   alias Ferricstore.Raft.Backend
   alias Ferricstore.Store.{Router, WriteVersion}
-  alias Ferricstore.Transaction.Ast, as: TxAst
+  alias Ferricstore.Transaction.ExecutionEntry
 
-  @type queue_entry :: TxAst.queue_entry() | PreparedCommand.t()
+  @type queue_entry :: PreparedCommand.t()
 
   @spec execute([queue_entry()], %{binary() => term()}, binary() | nil) ::
           [term()] | nil | {:error, binary()}
-  def execute([], _watched_keys, _sandbox_namespace), do: []
+  def execute([], watched_keys, _sandbox_namespace) when map_size(watched_keys) == 0, do: []
 
   def execute(queue, watched_keys, sandbox_namespace) do
-    if watches_clean?(watched_keys) do
-      maybe_run_after_watch_preflight_hook()
+    maybe_run_after_watch_preflight_hook()
 
-      case classify_shards(queue, sandbox_namespace) do
-        {:ok, shard_groups, write_shards} ->
-          execute_cross_shard(
-            shard_groups,
-            length(queue),
-            sandbox_namespace,
-            watched_keys,
-            write_shards
-          )
+    case classify_shards(queue, sandbox_namespace, watched_keys) do
+      {:ok, shard_groups, write_shards} when map_size(shard_groups) == 1 ->
+        execute_single_shard(shard_groups, sandbox_namespace, watched_keys, write_shards)
 
-        {:error, _reason} = error ->
-          error
-      end
-    else
-      nil
+      {:ok, _shard_groups, _write_shards} ->
+        {:error, "CROSSSLOT Keys in request don't hash to the same slot"}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @doc false
+  @spec execute_pipeline([queue_entry()], binary() | nil) :: [term()] | {:error, binary()}
+  def execute_pipeline([], _sandbox_namespace), do: []
+
+  def execute_pipeline(queue, sandbox_namespace) do
+    ctx = FerricStore.Instance.get(:default)
+
+    with {:ok, classified} <- classify_entries(queue, ctx, sandbox_namespace),
+         {:ok, groups} <- pipeline_groups(classified) do
+      execute_pipeline_groups(groups, length(queue), sandbox_namespace)
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Cross-shard path: anchor shard Raft entry or sequential GenServer fallback
+  # Single-shard Raft execution
   # ---------------------------------------------------------------------------
 
-  defp execute_cross_shard(
-         shard_groups,
-         total,
-         sandbox_namespace,
-         watched_keys,
-         write_shards
-       ) do
-    anchor_idx = shard_groups |> Map.keys() |> Enum.min()
-
-    shard_batches =
-      Enum.map(shard_groups, fn {shard_idx, cmds_with_indices} ->
-        {shard_idx, cmds_with_indices, sandbox_namespace}
-      end)
-
-    command = {:cross_shard_tx, shard_batches, watched_keys}
+  defp execute_single_shard(shard_groups, sandbox_namespace, watched_keys, write_shards) do
+    [{shard_idx, indexed_entries}] = Map.to_list(shard_groups)
+    queue = Enum.map(indexed_entries, fn {_index, entry} -> entry end)
+    command = {:tx_execute, queue, sandbox_namespace, watched_keys}
 
     try do
-      case Backend.write(anchor_idx, command) do
+      case Backend.write(shard_idx, command) do
         {:error, :noproc} ->
-          maybe_execute_cross_shard_sequential(
-            shard_groups,
-            total,
-            sandbox_namespace,
-            :noproc
-          )
+          raft_unavailable(:noproc)
 
         {:error, _reason} ->
-          maybe_execute_cross_shard_sequential(
-            shard_groups,
-            total,
-            sandbox_namespace,
-            :pipeline_rejected
-          )
+          raft_unavailable(:pipeline_rejected)
 
         nil ->
           nil
 
-        shard_results ->
+        results ->
           Enum.each(write_shards, &WriteVersion.increment/1)
-
-          reassemble_results(shard_results, shard_groups, total)
+          results
       end
     catch
       :exit, {:noproc, _} ->
-        maybe_execute_cross_shard_sequential(
-          shard_groups,
-          total,
-          sandbox_namespace,
-          :noproc
-        )
+        raft_unavailable(:noproc)
     end
   end
 
-  # The default application instance owns Raft, so transaction submit failures
-  # must fail closed instead of acknowledging local-only writes.
-  defp maybe_execute_cross_shard_sequential(
-         shard_groups,
-         total,
-         sandbox_namespace,
-         reason
-       ) do
-    _ = {shard_groups, total, sandbox_namespace}
+  defp execute_pipeline_groups(groups, command_count, sandbox_namespace) do
+    group_specs =
+      groups
+      |> Enum.sort_by(fn {shard_idx, _entries} -> shard_idx end)
+      |> Enum.map(fn {shard_idx, entries} ->
+        queue = Enum.map(entries, & &1.entry)
+        write_shards = entries |> Enum.flat_map(& &1.write_shards) |> Enum.uniq()
+        {shard_idx, entries, write_shards, {:tx_execute, queue, sandbox_namespace, %{}}}
+      end)
+
+    backend_results =
+      try do
+        case group_specs do
+          [{shard_idx, _entries, _write_shards, command}] ->
+            [Backend.write(shard_idx, command)]
+
+          _multiple_groups ->
+            group_specs
+            |> Enum.map(fn {shard_idx, _entries, _write_shards, command} ->
+              {shard_idx, command}
+            end)
+            |> Backend.write_many()
+        end
+      catch
+        :exit, {:noproc, _} -> :noproc
+        :exit, _reason -> :pipeline_rejected
+      end
+
+    with {:ok, indexed_results} <-
+           index_pipeline_results(group_specs, backend_results, command_count) do
+      for index <- 0..(command_count - 1), do: Map.fetch!(indexed_results, index)
+    end
+  end
+
+  defp index_pipeline_results(group_specs, backend_results, command_count)
+       when is_list(backend_results) and length(group_specs) == length(backend_results) do
+    indexed_results =
+      group_specs
+      |> Enum.zip(backend_results)
+      |> Enum.flat_map(fn {{_shard_idx, entries, write_shards, _command}, result} ->
+        index_pipeline_group(entries, write_shards, result)
+      end)
+      |> Map.new()
+
+    if map_size(indexed_results) == command_count do
+      {:ok, indexed_results}
+    else
+      {:error, "ERR pipeline result count mismatch"}
+    end
+  end
+
+  defp index_pipeline_results(group_specs, reason, _command_count) do
+    error = pipeline_raft_unavailable(reason)
+
+    {:ok,
+     group_specs
+     |> Enum.flat_map(fn {_shard_idx, entries, _write_shards, _command} ->
+       Enum.map(entries, &{&1.index, error})
+     end)
+     |> Map.new()}
+  end
+
+  defp index_pipeline_group(entries, write_shards, results)
+       when is_list(results) and length(entries) == length(results) do
+    Enum.each(write_shards, &WriteVersion.increment/1)
+    Enum.zip_with(entries, results, fn entry, result -> {entry.index, result} end)
+  end
+
+  defp index_pipeline_group(entries, _write_shards, {:error, :noproc}) do
+    pipeline_group_error(entries, pipeline_raft_unavailable(:noproc))
+  end
+
+  defp index_pipeline_group(entries, _write_shards, {:error, _reason}) do
+    pipeline_group_error(entries, pipeline_raft_unavailable(:pipeline_rejected))
+  end
+
+  defp index_pipeline_group(entries, _write_shards, _invalid_result) do
+    pipeline_group_error(entries, {:error, "ERR pipeline result count mismatch"})
+  end
+
+  defp pipeline_group_error(entries, error), do: Enum.map(entries, &{&1.index, error})
+
+  defp raft_unavailable(reason) do
     {:error, "ERR transaction raft unavailable: #{inspect(reason)}"}
   end
 
-  # Reassembles per-shard results back into the original command order.
-  defp reassemble_results(shard_results, shard_groups, total) do
-    indexed_results =
-      Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds_with_indices}, acc ->
-        shard_results
-        |> Map.fetch!(shard_idx)
-        |> then(fn results_for_shard ->
-          cmds_with_indices
-          |> Enum.map(fn {orig_idx, _entry} -> orig_idx end)
-          |> Enum.zip(results_for_shard)
-        end)
-        |> Enum.reduce(acc, fn {orig_idx, result}, inner ->
-          Map.put(inner, orig_idx, result)
-        end)
-      end)
-
-    Enum.map(0..(total - 1)//1, &Map.fetch!(indexed_results, &1))
+  defp pipeline_raft_unavailable(reason) do
+    {:error, "ERR pipeline raft unavailable: #{inspect(reason)}"}
   end
 
   # ---------------------------------------------------------------------------
   # Shard classification
   # ---------------------------------------------------------------------------
 
-  # Commands that don't target a specific key. These are assigned to
-  # whichever shard the keyed commands target, so they never cause CROSSSLOT.
-  @keyless_commands MapSet.new(~w(PING ECHO DBSIZE TIME RANDOMKEY))
-
-  @spec classify_shards([queue_entry()], binary() | nil) ::
+  @spec classify_shards([queue_entry()], binary() | nil, %{binary() => term()}) ::
           {:ok, %{non_neg_integer() => list()}, [non_neg_integer()]}
           | {:error, binary()}
-  defp classify_shards(queue, sandbox_namespace) do
+  defp classify_shards(queue, sandbox_namespace, watched_keys) do
     ctx = FerricStore.Instance.get(:default)
 
     with {:ok, classified} <- classify_entries(queue, ctx, sandbox_namespace) do
+      watched_shards =
+        watched_keys
+        |> Map.keys()
+        |> Enum.map(&Router.shard_for(ctx, &1))
+
       default_shard =
-        Enum.find_value(classified, 0, fn
+        Enum.find_value(classified, List.first(watched_shards) || 0, fn
           %{routing_shards: [first | _rest]} -> first
           _entry -> nil
         end)
@@ -174,8 +212,10 @@ defmodule Ferricstore.Transaction.Coordinator do
         end)
 
       touched_shards =
-        classified
-        |> Enum.flat_map(fn entry -> [entry.execution_shard | entry.routing_shards] end)
+        (watched_shards ++
+           Enum.flat_map(classified, fn entry ->
+             [entry.execution_shard | entry.routing_shards]
+           end))
         |> Enum.uniq()
         |> Enum.sort()
 
@@ -224,18 +264,29 @@ defmodule Ferricstore.Transaction.Coordinator do
   end
 
   defp classify_entry(
+         %PreparedCommand{transaction_mode: :request, command: command},
+         _index,
+         _ctx,
+         _sandbox_namespace
+       ) do
+    TransactionPolicy.error(command)
+  end
+
+  defp classify_entry(
          %PreparedCommand{routing_scope: :none, routing_keys: [], write_keys: []} = prepared,
          index,
          _ctx,
          _sandbox_namespace
        ) do
-    {:ok,
-     %{
-       index: index,
-       entry: prepared_entry(prepared),
-       routing_shards: [],
-       write_shards: []
-     }}
+    with {:ok, entry} <- ExecutionEntry.from_prepared(prepared) do
+      {:ok,
+       %{
+         index: index,
+         entry: entry,
+         routing_shards: [],
+         write_shards: []
+       }}
+    end
   end
 
   defp classify_entry(
@@ -247,15 +298,23 @@ defmodule Ferricstore.Transaction.Coordinator do
        ) do
     if valid_prepared_keys?(routing_keys) and valid_prepared_keys?(prepared.write_keys) do
       routing_shards = command_shards(routing_keys, sandbox_namespace, ctx)
-      write_shards = command_shards(prepared.write_keys, sandbox_namespace, ctx)
 
-      {:ok,
-       %{
-         index: index,
-         entry: prepared_entry(prepared),
-         routing_shards: Enum.uniq(routing_shards ++ write_shards),
-         write_shards: write_shards
-       }}
+      write_shards =
+        if prepared.write_keys == routing_keys do
+          routing_shards
+        else
+          command_shards(prepared.write_keys, sandbox_namespace, ctx)
+        end
+
+      with {:ok, entry} <- ExecutionEntry.from_prepared(prepared) do
+        {:ok,
+         %{
+           index: index,
+           entry: entry,
+           routing_shards: Enum.uniq(routing_shards ++ write_shards),
+           write_shards: write_shards
+         }}
+      end
     else
       invalid_prepared_routing()
     end
@@ -264,31 +323,8 @@ defmodule Ferricstore.Transaction.Coordinator do
   defp classify_entry(%PreparedCommand{}, _index, _ctx, _sandbox_namespace),
     do: invalid_prepared_routing()
 
-  defp classify_entry({cmd, args, _ast} = entry, index, ctx, sandbox_namespace)
-       when is_binary(cmd) and is_list(args) do
-    {cmd, args, ast} = TxAst.normalize_entry(entry)
-
-    routing_shards =
-      if MapSet.member?(@keyless_commands, cmd) do
-        []
-      else
-        [command_shard(args, sandbox_namespace, ctx)]
-      end
-
-    {:ok,
-     %{
-       index: index,
-       entry: {cmd, args, ast},
-       routing_shards: routing_shards,
-       write_shards: :execution
-     }}
-  end
-
   defp classify_entry(_invalid, _index, _ctx, _sandbox_namespace),
     do: {:error, "ERR invalid transaction command"}
-
-  defp prepared_entry(%PreparedCommand{command: command, args: args, ast: ast}),
-    do: {command, args, ast}
 
   defp valid_prepared_keys?(keys) when is_list(keys), do: Enum.all?(keys, &is_binary/1)
   defp valid_prepared_keys?(_keys), do: false
@@ -304,37 +340,46 @@ defmodule Ferricstore.Transaction.Coordinator do
     end)
   end
 
-  defp command_shard(args, sandbox_namespace, ctx) do
-    key = args |> extract_key() |> namespace_key(sandbox_namespace)
-
-    Router.shard_for(ctx, key)
-  end
-
   defp namespace_key(key, nil), do: key
   defp namespace_key(key, ""), do: key
   defp namespace_key(key, namespace) when is_binary(namespace), do: namespace <> key
 
-  @spec extract_key([binary()]) :: binary()
-  defp extract_key([key | _]) when is_binary(key), do: key
-  defp extract_key(_args), do: ""
+  defp pipeline_groups(classified) do
+    default_shard =
+      Enum.find_value(classified, 0, fn
+        %{routing_shards: [first | _rest]} -> first
+        _entry -> nil
+      end)
+
+    classified
+    |> Enum.reduce_while({:ok, %{}}, fn entry, {:ok, groups} ->
+      touched_shards = Enum.uniq(entry.routing_shards ++ entry.write_shards)
+
+      case touched_shards do
+        [] ->
+          grouped = Map.update(groups, default_shard, [entry], &[entry | &1])
+          {:cont, {:ok, grouped}}
+
+        [shard_idx] ->
+          grouped = Map.update(groups, shard_idx, [entry], &[entry | &1])
+          {:cont, {:ok, grouped}}
+
+        _multiple_shards ->
+          {:halt, {:error, "CROSSSLOT Keys in request don't hash to the same slot"}}
+      end
+    end)
+    |> case do
+      {:ok, groups} ->
+        {:ok, Map.new(groups, fn {shard_idx, entries} -> {shard_idx, Enum.reverse(entries)} end)}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # WATCH support
   # ---------------------------------------------------------------------------
-
-  defp watches_clean?(watched) when map_size(watched) == 0, do: true
-
-  defp watches_clean?(watched) do
-    ctx = FerricStore.Instance.get(:default)
-
-    Enum.all?(watched, fn {key, saved_token} ->
-      try do
-        Router.watch_token(ctx, key) == saved_token
-      catch
-        :exit, _ -> false
-      end
-    end)
-  end
 
   defp maybe_run_after_watch_preflight_hook do
     case Process.get(:ferricstore_tx_after_watch_preflight_hook) do

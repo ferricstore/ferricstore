@@ -39,7 +39,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         ValueCodec
       }
 
-      alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -74,18 +74,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
 
       defp prob_file_path_from_delete_value(state, key, value) when is_binary(value) do
         case safe_binary_to_term(value) do
-          {:bloom_meta, %{path: path}} -> path
-          {:cms_meta, _} -> prob_path(state, key, "cms")
-          {:cuckoo_meta, _} -> prob_path(state, key, "cuckoo")
-          {:topk_meta, %{path: path}} -> path
+          {:bloom_meta, meta} when is_map(meta) -> prob_path(state, key, "bloom")
+          {:cms_meta, meta} when is_map(meta) -> prob_path(state, key, "cms")
+          {:cuckoo_meta, meta} when is_map(meta) -> prob_path(state, key, "cuckoo")
+          {:topk_meta, meta} when is_map(meta) -> prob_path(state, key, "topk")
           _ -> nil
         end
       end
 
       defp safe_binary_to_term(value) do
-        :erlang.binary_to_term(value, [:safe])
-      rescue
-        _ -> :not_term
+        case Ferricstore.TermCodec.decode(value) do
+          {:ok, term} -> term
+          {:error, :invalid_external_term} -> :not_term
+        end
       end
 
       defp apply_delete_batch_keys(state, keys) do
@@ -136,26 +137,39 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp do_apply_compound_batch_put_entries_unlocked(state, redis_key, entries) do
-        case prepare_apply_blob_command(state, {:compound_batch_put, redis_key, entries}) do
-          {:ok, {:compound_blob_batch_put, ^redis_key, blob_entries}} ->
-            with {:ok, prepared_entries} <-
-                   prepare_compound_blob_batch_entries(state, blob_entries) do
-              do_compound_blob_batch_put(state, redis_key, prepared_entries)
-            end
+        with :ok <- validate_compound_batch_target(state, redis_key, entries) do
+          case prepare_apply_blob_command(state, {:compound_batch_put, redis_key, entries}) do
+            {:ok, {:compound_blob_batch_put, ^redis_key, blob_entries}} ->
+              with :ok <- validate_raw_compound_blob_batch_target(state, redis_key, blob_entries),
+                   {:ok, prepared_entries} <-
+                     prepare_compound_blob_batch_entries(state, blob_entries) do
+                do_compound_blob_batch_put(state, redis_key, prepared_entries)
+              end
 
-          {:ok, {:compound_batch_put, ^redis_key, ^entries}} ->
-            do_compound_batch_put(state, redis_key, entries)
+            {:ok, {:compound_batch_put, ^redis_key, ^entries}} ->
+              do_compound_batch_put(state, redis_key, entries)
 
-          {:ok, _other} ->
-            {:error, :invalid_compound_batch_entry}
+            {:ok, _other} ->
+              {:error, :invalid_compound_batch_entry}
 
-          {:error, _reason} = error ->
-            error
+            {:error, _reason} = error ->
+              error
+          end
+        end
+      end
+
+      defp validate_compound_batch_target(_state, _redis_key, []), do: :ok
+
+      defp validate_compound_batch_target(state, redis_key, entries) do
+        case compound_batch_put_target(state, redis_key, entries) do
+          :mixed -> {:error, :mixed_compound_batch_targets}
+          _homogeneous -> :ok
         end
       end
 
       defp apply_compound_blob_batch_put_entries(state, redis_key, entries) do
         with true <- compound_blob_put_entries_for_key?(redis_key, entries),
+             :ok <- validate_raw_compound_blob_batch_target(state, redis_key, entries),
              {:ok, prepared_entries} <- prepare_compound_blob_batch_entries(state, entries) do
           cond do
             Map.get(state, :cross_shard_locks, %{}) != %{} ->
@@ -180,6 +194,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
           {:error, _reason} = error -> error
         end
       end
+
+      defp validate_raw_compound_blob_batch_target(_state, _redis_key, []), do: :ok
+
+      defp validate_raw_compound_blob_batch_target(state, redis_key, [first | rest]) do
+        with {:ok, first_key} <- raw_compound_blob_key(first) do
+          first_path = promoted_compound_path(state, redis_key, first_key)
+
+          Enum.reduce_while(rest, :ok, fn entry, :ok ->
+            case raw_compound_blob_key(entry) do
+              {:ok, compound_key} ->
+                if promoted_compound_path(state, redis_key, compound_key) == first_path,
+                  do: {:cont, :ok},
+                  else: {:halt, {:error, :mixed_compound_batch_targets}}
+
+              {:error, _reason} = error ->
+                {:halt, error}
+            end
+          end)
+        end
+      end
+
+      defp raw_compound_blob_key({compound_key, _value, _expire_at_ms, kind})
+           when is_binary(compound_key) and kind in [:value, :blob_ref],
+           do: {:ok, compound_key}
+
+      defp raw_compound_blob_key(_invalid),
+        do: {:error, :invalid_compound_blob_batch_entry}
 
       defp prepare_compound_blob_batch_entries(state, entries) do
         entries
@@ -208,7 +249,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         end
       end
 
+      defp do_compound_blob_batch_put(_state, _redis_key, []), do: :ok
+
       defp do_compound_blob_batch_put(state, redis_key, prepared_entries) do
+        case compound_blob_batch_target(state, redis_key, prepared_entries) do
+          :shared ->
+            do_shared_compound_blob_batch_put(state, redis_key, prepared_entries)
+
+          {:promoted, dedicated_path} ->
+            do_promoted_compound_blob_batch_put(
+              state,
+              redis_key,
+              prepared_entries,
+              dedicated_path
+            )
+
+          :mixed ->
+            {:error, :mixed_compound_batch_targets}
+        end
+      end
+
+      defp do_shared_compound_blob_batch_put(state, redis_key, prepared_entries) do
         prepared_entries
         |> Enum.reduce_while(:ok, fn
           {:value, compound_key, value, expire_at_ms}, :ok ->
@@ -230,6 +291,130 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
               {:error, _reason} = error -> {:halt, error}
             end
         end)
+      end
+
+      defp do_promoted_compound_blob_batch_put(
+             state,
+             redis_key,
+             prepared_entries,
+             dedicated_path
+           ) do
+        Promotion.await_compaction_latch(state, redis_key)
+
+        active = Promotion.find_active(dedicated_path)
+        fid = parse_fid_from_path(active)
+        disk_entries = Enum.map(prepared_entries, &compound_blob_disk_entry/1)
+        maintenance = promoted_batch_put_maintenance(state, disk_entries)
+
+        case NIF.v2_append_batch(active, disk_entries) do
+          {:ok, locations} when length(locations) == length(prepared_entries) ->
+            prepared_entries
+            |> Enum.zip(locations)
+            |> Enum.each(fn
+              {{:value, compound_key, value, expire_at_ms}, {offset, value_size}} ->
+                publish_promoted_compound_blob_entry(
+                  state,
+                  redis_key,
+                  compound_key,
+                  value,
+                  expire_at_ms,
+                  fid,
+                  offset,
+                  value_size
+                )
+
+              {{:blob_ref, compound_key, _encoded_ref, expire_at_ms, materialized},
+               {offset, value_size}} ->
+                publish_promoted_compound_blob_entry(
+                  state,
+                  redis_key,
+                  compound_key,
+                  materialized,
+                  expire_at_ms,
+                  fid,
+                  offset,
+                  value_size
+                )
+            end)
+
+            queue_promoted_maintenance_after_flush(redis_key, maintenance)
+
+            queue_promoted_revision_puts_after_flush(
+              Enum.map(prepared_entries, &compound_blob_key/1)
+            )
+
+            :ok
+
+          {:ok, locations} ->
+            {:error, {:batch_result_mismatch, length(prepared_entries), locations}}
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp publish_promoted_compound_blob_entry(
+             state,
+             redis_key,
+             compound_key,
+             logical_value,
+             expire_at_ms,
+             fid,
+             offset,
+             value_size
+           ) do
+        ets_value = value_for_ets(logical_value, hot_cache_threshold(state))
+        track_keydir_binary_delta(state, compound_key, ets_value, expire_at_ms)
+
+        :ets.insert(
+          state.ets,
+          {compound_key, ets_value, expire_at_ms, LFU.initial(), fid, offset, value_size}
+        )
+
+        CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), compound_key)
+        sm_tx_put_pending(compound_key, logical_value, expire_at_ms)
+        remove_tx_deleted_key(compound_key)
+        zset_index_put(state, redis_key, compound_key, logical_value)
+      end
+
+      defp compound_blob_batch_target(state, redis_key, [first | rest]) do
+        first_path = promoted_compound_path(state, redis_key, compound_blob_key(first))
+
+        if Enum.all?(rest, fn entry ->
+             promoted_compound_path(state, redis_key, compound_blob_key(entry)) == first_path
+           end) do
+          case first_path do
+            nil -> :shared
+            dedicated_path -> {:promoted, dedicated_path}
+          end
+        else
+          :mixed
+        end
+      end
+
+      defp compound_blob_key({:value, compound_key, _value, _expire_at_ms}), do: compound_key
+
+      defp compound_blob_key(
+             {:blob_ref, compound_key, _encoded_ref, _expire_at_ms, _materialized}
+           ),
+           do: compound_key
+
+      defp compound_blob_disk_entry({:value, compound_key, value, expire_at_ms}),
+        do: {compound_key, to_disk_binary(value), expire_at_ms}
+
+      defp compound_blob_disk_entry(
+             {:blob_ref, compound_key, encoded_ref, expire_at_ms, _materialized}
+           ),
+           do: {compound_key, to_disk_binary(encoded_ref), expire_at_ms}
+
+      defp remove_tx_deleted_key(compound_key) do
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+        if MapSet.member?(deleted, compound_key) do
+          Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
+        end
+
+        :ok
       end
 
       defp do_compound_put_blob_ref_validated(
@@ -782,23 +967,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         false
       end
 
-      defp normalize_stamped_command({:ratelimit_add, key, window_ms, max, count, _legacy_now_ms}) do
-        {:ratelimit_add, key, window_ms, max, count}
-      end
-
-      defp normalize_stamped_command({:batch, commands}) when is_list(commands) do
-        {:batch, Enum.map(commands, &normalize_stamped_command/1)}
-      end
-
-      defp normalize_stamped_command(command), do: command
-
       defp with_cross_shard_pending_writes(state, fun) do
         init_pending_write_process_state(state)
         Process.put(:sm_cross_shard_pending_writes, [])
         Process.put(:sm_cross_shard_pending_originals, %{})
+        Process.put(:sm_tx_promoted_latches, %{})
 
         try do
-          result = fun.()
+          result = fun.() |> state_storage_failure_result()
 
           case cross_shard_pending_error_result(result) do
             {:error, _reason} = error ->
@@ -809,6 +985,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             nil ->
               case flush_cross_shard_pending_writes(state) do
                 {:ok, flushed_state} ->
+                  :ok = flush_pending_stream_cache_cleanups()
+                  :ok = flush_pending_compound_member_indexes()
+                  :ok = flush_pending_zset_indexes(flushed_state)
                   :ok = flush_pending_flow_native_indexes(flushed_state)
 
                   case publish_pending_flow_history_projections(flushed_state) do
@@ -831,16 +1010,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
                       {result, flushed_state}
                   end
 
-                {:error, reason, partial_state, successful_groups} ->
+                {:error, reason, partial_state, successful_groups, journal_txid} ->
                   case compensate_cross_shard_partial_writes(
                          partial_state,
                          successful_groups,
                          Process.get(:sm_cross_shard_pending_originals, %{})
                        ) do
                     {:ok, compensated_state} ->
-                      rollback_cross_shard_pending_writes(state)
-                      rollback_pending_writes(state)
-                      {:error, reason, compensated_state}
+                      case abort_standalone_cross_shard_journal(state, journal_txid) do
+                        :ok ->
+                          rollback_cross_shard_pending_writes(state)
+                          rollback_pending_writes(state)
+                          {:error, reason, compensated_state}
+
+                        {:error, abort_reason} ->
+                          rollback_cross_shard_pending_writes(state)
+                          rollback_pending_writes(state)
+                          block_release_cursor_for_apply()
+
+                          {:error,
+                           {:cross_shard_compensation_failed,
+                            {:standalone_tx_abort_failed, abort_reason}}, compensated_state}
+                      end
 
                     {:error, compensation_reason, compensated_state} ->
                       rollback_cross_shard_pending_writes(state)
@@ -863,10 +1054,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             rollback_pending_writes(state)
             :erlang.raise(kind, reason, __STACKTRACE__)
         after
+          release_transaction_promotion_latches()
           Process.delete(:sm_cross_shard_pending_writes)
           Process.delete(:sm_cross_shard_pending_originals)
+          Process.delete(:sm_tx_promoted_latches)
           clear_pending_write_process_state()
         end
+      end
+
+      defp release_transaction_promotion_latches do
+        :sm_tx_promoted_latches
+        |> Process.get(%{})
+        |> Map.values()
+        |> Enum.each(&Promotion.release_compaction_latch/1)
+
+        :ok
       end
 
       defp cross_shard_pending_error_result({:error, _reason} = error), do: error
@@ -885,48 +1087,129 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       defp flush_cross_shard_pending_writes(state, pending) do
         staged_publish? = standalone_staged_apply?()
 
-        pending
-        |> Enum.group_by(&cross_shard_pending_target/1)
-        |> Enum.reduce_while({:ok, state, []}, fn {{idx, file_path, file_id, keydir}, entries},
-                                                  {:ok, acc_state, successful_groups} ->
-          batch = Enum.map(entries, &cross_shard_pending_to_batch_entry/1)
-          append_result = append_pending_batch(file_path, batch)
-          validated_append_result = validate_append_result(batch, append_result)
+        groups =
+          pending
+          |> Enum.group_by(&cross_shard_pending_target/1)
+          |> Enum.sort_by(fn {target, _entries} -> target end)
 
-          case validated_append_result do
-            {:ok, locations} ->
-              unless staged_publish? do
-                apply_cross_shard_pending_locations(keydir, file_id, entries, locations)
-              end
+        case prepare_standalone_cross_shard_journal(state, staged_publish?, groups) do
+          {:ok, journal_txid} ->
+            flush_cross_shard_pending_groups(state, groups, staged_publish?, journal_txid)
 
-              acc_state =
-                acc_state
-                |> track_cross_shard_append_bytes(
-                  idx,
-                  file_path,
-                  file_id,
-                  bitcask_record_bytes(batch)
-                )
-                |> mark_cross_shard_checkpoint_dirty(idx)
+          {:error, reason} ->
+            {:error, {:bitcask_append_failed, {:standalone_tx_prepare_failed, reason}}, state, [],
+             nil}
+        end
+      end
 
-              group = {idx, file_path, file_id, keydir, entries, locations}
-              {:cont, {:ok, acc_state, [group | successful_groups]}}
+      defp flush_cross_shard_pending_groups(
+             state,
+             groups,
+             staged_publish?,
+             journal_txid
+           ) do
+        groups
+        |> Enum.reduce_while({:ok, state, []}, fn
+          {{idx, file_path, file_id, keydir}, entries}, {:ok, acc_state, successful_groups} ->
+            batch = Enum.map(entries, &cross_shard_pending_to_batch_entry/1)
+            append_result = append_pending_batch(file_path, batch)
+            validated_append_result = validate_append_result(batch, append_result)
 
-            {:error, reason} ->
-              {:halt, {:error, {:bitcask_append_failed, reason}, acc_state, successful_groups}}
-          end
+            case validated_append_result do
+              {:ok, locations} ->
+                unless staged_publish? do
+                  apply_cross_shard_pending_locations(keydir, file_id, entries, locations)
+                end
+
+                acc_state =
+                  acc_state
+                  |> track_cross_shard_append_bytes(
+                    idx,
+                    file_path,
+                    file_id,
+                    bitcask_record_bytes(batch)
+                  )
+                  |> mark_cross_shard_checkpoint_dirty(idx)
+
+                group = {idx, file_path, file_id, keydir, entries, locations}
+                {:cont, {:ok, acc_state, [group | successful_groups]}}
+
+              {:error, reason} ->
+                {:halt,
+                 {:error, {:bitcask_append_failed, reason}, acc_state, successful_groups,
+                  journal_txid}}
+            end
         end)
         |> case do
           {:ok, flushed_state, successful_groups} ->
-            if staged_publish? do
-              publish_cross_shard_pending_groups(flushed_state, successful_groups)
+            case commit_standalone_cross_shard_journal(state, journal_txid) do
+              :ok ->
+                if staged_publish? do
+                  publish_cross_shard_pending_groups(flushed_state, successful_groups)
+                end
+
+                {:ok, flushed_state}
+
+              {:error, reason} ->
+                {:error, {:bitcask_append_failed, {:standalone_tx_commit_failed, reason}},
+                 flushed_state, successful_groups, journal_txid}
             end
 
-            {:ok, flushed_state}
-
-          {:error, _reason, _partial_state, _successful_groups} = error ->
+          {:error, _reason, _partial_state, _successful_groups, _journal_txid} = error ->
             error
         end
+      end
+
+      defp prepare_standalone_cross_shard_journal(_state, false, _groups), do: {:ok, nil}
+      defp prepare_standalone_cross_shard_journal(_state, true, []), do: {:ok, nil}
+
+      defp prepare_standalone_cross_shard_journal(state, true, groups) do
+        originals = Process.get(:sm_cross_shard_pending_originals, %{})
+
+        with {:ok, undo_groups} <- cross_shard_undo_groups(state, groups, originals),
+             {:ok, txid} <-
+               Ferricstore.Store.StandaloneTxLog.prepare(state.data_dir, undo_groups) do
+          {:ok, txid}
+        end
+      end
+
+      defp cross_shard_undo_groups(state, groups, originals) do
+        Enum.reduce_while(groups, {:ok, []}, fn
+          {{idx, file_path, _file_id, keydir}, entries}, {:ok, undo_groups} ->
+            case cross_shard_compensation_batch(
+                   state,
+                   idx,
+                   keydir,
+                   file_path,
+                   entries,
+                   originals
+                 ) do
+              {:ok, undo_batch} when undo_batch != [] ->
+                {:cont, {:ok, [{file_path, undo_batch} | undo_groups]}}
+
+              {:ok, []} ->
+                {:cont, {:ok, undo_groups}}
+
+              {:error, reason} ->
+                {:halt, {:error, reason}}
+            end
+        end)
+        |> case do
+          {:ok, undo_groups} -> {:ok, Enum.reverse(undo_groups)}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp commit_standalone_cross_shard_journal(_state, nil), do: :ok
+
+      defp commit_standalone_cross_shard_journal(state, txid) do
+        Ferricstore.Store.StandaloneTxLog.commit(state.data_dir, txid)
+      end
+
+      defp abort_standalone_cross_shard_journal(_state, nil), do: :ok
+
+      defp abort_standalone_cross_shard_journal(state, txid) do
+        Ferricstore.Store.StandaloneTxLog.abort(state.data_dir, txid)
       end
 
       defp cross_shard_pending_target(

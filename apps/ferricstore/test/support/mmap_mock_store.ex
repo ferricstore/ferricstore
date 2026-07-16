@@ -34,8 +34,7 @@ defmodule Ferricstore.Test.ProbMockStore do
       dir: tmp_dir
     }
 
-    # Note: exists? is intentionally omitted so the handler falls back
-    # to File.exists? on the base64-encoded path.
+    # exists? is omitted so the handler checks the deterministic sidecar path.
     %{
       cuckoo_registry: registry,
       prob_dir: fn -> tmp_dir end
@@ -78,9 +77,7 @@ defmodule Ferricstore.Test.ProbMockStore do
       end)
     end
 
-    # Note: exists? is intentionally omitted so the handler falls back
-    # to File.exists? on the base64-encoded path, which works with the
-    # stateless pread/pwrite NIF architecture.
+    # exists? is omitted so the handler checks the deterministic sidecar path.
     %{
       cms_registry: registry,
       get: get_fn,
@@ -115,8 +112,7 @@ defmodule Ferricstore.Test.ProbMockStore do
       dir: tmp_dir
     }
 
-    # Note: exists? is intentionally omitted so the handler falls back
-    # to File.exists? on the base64-encoded path.
+    # exists? is omitted so the handler checks the deterministic sidecar path.
     %{
       bloom_registry: registry,
       prob_dir: fn -> tmp_dir end

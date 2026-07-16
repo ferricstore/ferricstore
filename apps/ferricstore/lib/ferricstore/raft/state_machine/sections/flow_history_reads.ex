@@ -190,16 +190,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
             {:ok, value |> flow_decode_history_fields(record) |> flow_history_fields_to_map()}
 
           _ ->
-            state
-            |> shard_ets_state()
-            |> Ferricstore.Store.Shard.ETS.prefix_scan_entries(prefix, state.shard_data_path)
-            |> Enum.find(fn {entry_id, _value} -> prefix <> entry_id == target_key end)
-            |> case do
-              {_entry_id, value} ->
-                {:ok, value |> flow_decode_history_fields(record) |> flow_history_fields_to_map()}
+            case Ferricstore.Store.Shard.ETS.prefix_scan_entries(
+                   shard_ets_state(state),
+                   prefix,
+                   state.shard_data_path
+                 ) do
+              {:error, {:storage_read_failed, _reason}} = failure ->
+                Ferricstore.Store.ReadResult.command_error(failure)
 
-              nil ->
-                {:error, "ERR flow rewind target event not found"}
+              entries when is_list(entries) ->
+                case Enum.find(entries, fn {entry_id, _value} ->
+                       prefix <> entry_id == target_key
+                     end) do
+                  {_entry_id, value} ->
+                    {:ok,
+                     value |> flow_decode_history_fields(record) |> flow_history_fields_to_map()}
+
+                  nil ->
+                    {:error, "ERR flow rewind target event not found"}
+                end
             end
         end
       end
@@ -1061,9 +1070,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
       defp flow_after_history_put_records_batch(_state, []), do: :ok
 
       defp flow_after_history_put_records_batch(state, records) do
-        lmdb_mirror? = flow_lmdb_projection_enabled?(state)
-
-        if Enum.all?(records, &flow_after_history_fast_record?(lmdb_mirror?, &1)) do
+        if Enum.all?(records, &flow_after_history_fast_record?/1) do
           :ok
         else
           flow_after_history_put_many(records, state)

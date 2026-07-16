@@ -62,11 +62,76 @@ defmodule FerricstoreServer.Native.CodecTest do
     assert {:ok, [], ^partial, :done} = Codec.decode_frames(partial, 1024)
   end
 
+  @tag :native_command_peek
+  test "command probe skips nested values and uses the last duplicate command" do
+    nested_args =
+      Codec.encode_value([
+        %{"payload" => String.duplicate("x", 64 * 1024)},
+        List.duplicate(nil, 32)
+      ])
+
+    body =
+      IO.iodata_to_binary([
+        <<6, 4::unsigned-32>>,
+        encoded_map_entry("command", Codec.encode_value("MULTI")),
+        encoded_map_entry("args", nested_args),
+        encoded_map_entry("command", Codec.encode_value("GET")),
+        encoded_map_entry("metadata", Codec.encode_value(%{"trace" => true}))
+      ])
+
+    assert {:ok, "GET"} = Codec.peek_command_name(0, body)
+  end
+
+  @tag :native_command_peek
+  test "command probe rejects custom, malformed, and over-budget typed payloads" do
+    flags = Codec.flags()
+    body = Codec.encode_value(%{"command" => "GET"})
+
+    assert :not_found = Codec.peek_command_name(flags.custom_payload, body)
+    assert {:error, _reason} = Codec.peek_command_name(0, body <> <<0>>)
+
+    Application.put_env(:ferricstore, :native_max_value_items, 1)
+
+    over_budget =
+      IO.iodata_to_binary([
+        <<6, 2::unsigned-32>>,
+        encoded_map_entry("command", Codec.encode_value("GET")),
+        encoded_map_entry("args", Codec.encode_value([]))
+      ])
+
+    assert {:error, reason} = Codec.peek_command_name(0, over_budget)
+    assert reason =~ "max items"
+  end
+
   test "response frames use response direction bit and are rejected as client input" do
     response = Codec.encode_response(0x0101, 2, 99, :ok, "value")
 
     assert {:error, "ERR native client frame cannot use response direction"} =
              Codec.decode_frames(response, 1024)
+  end
+
+  test "response value sizing matches the wire encoding at exact boundaries" do
+    values = [nil, true, 42, 1.5, "value", ["a", nil], {"tuple", 3}, %{"key" => [1, 2]}]
+
+    Enum.each(values, fn value ->
+      encoded_bytes = value |> Codec.encode_value() |> byte_size()
+
+      assert Codec.encoded_value_fits?(value, encoded_bytes)
+      refute Codec.encoded_value_fits?(value, encoded_bytes - 1)
+    end)
+  end
+
+  test "successful responses over their byte budget become bounded errors" do
+    [frame] =
+      Codec.encode_command_response_frames(0x0101, 2, 99, :ok, String.duplicate("x", 128),
+        max_response_bytes: 64
+      )
+
+    <<"FSNP", 0x81, _flags, 2::unsigned-32, 0x0101::unsigned-16, 99::unsigned-64,
+      _body_len::unsigned-32, 6::unsigned-16, value_body::binary>> = IO.iodata_to_binary(frame)
+
+    assert {:ok, %{"message" => message}} = Codec.decode_body(value_body)
+    assert message == "ERR native response byte limit exceeded"
   end
 
   test "busy response is structured and retryable" do
@@ -127,11 +192,36 @@ defmodule FerricstoreServer.Native.CodecTest do
     assert reason =~ "max items"
   end
 
+  test "typed value decoder applies the item limit across nested containers" do
+    Application.put_env(:ferricstore, :native_max_value_items, 3)
+
+    assert {:ok, [[nil], nil]} = Codec.decode_body(Codec.encode_value([[nil], nil]))
+
+    assert {:error, reason} =
+             Codec.decode_body(Codec.encode_value([[nil, nil], [nil, nil]]))
+
+    assert reason =~ "total items"
+  end
+
   test "typed value decoder rejects nesting over configured depth limit" do
     Application.put_env(:ferricstore, :native_max_value_depth, 1)
 
     assert {:error, reason} = Codec.decode_body(Codec.encode_value([["nested"]]))
     assert reason =~ "max depth"
+  end
+
+  @tag :native_invalid_value_limits
+  test "invalid typed value limits fail closed instead of disabling validation" do
+    Application.put_env(:ferricstore, :native_max_value_items, -1)
+
+    assert {:error, item_reason} = Codec.decode_body(Codec.encode_value(["item"]))
+    assert item_reason =~ "max items"
+
+    Application.put_env(:ferricstore, :native_max_value_items, 100_000)
+    Application.put_env(:ferricstore, :native_max_value_depth, -1)
+
+    assert {:error, depth_reason} = Codec.decode_body(Codec.encode_value([]))
+    assert depth_reason =~ "max depth"
   end
 
   test "compact Flow claim jobs response uses custom payload tag" do
@@ -145,13 +235,42 @@ defmodule FerricstoreServer.Native.CodecTest do
     assert <<^tag, 2::unsigned-32, _rest::binary>> = payload
   end
 
+  test "compact Flow claim jobs response encodes state-only tuples" do
+    payload =
+      Codec.encode_compact_flow_claim_jobs([
+        ["flow-1", "bucket-1", "lease-1", 42, "running:step"]
+      ])
+
+    tag = Codec.compact_tags().flow_claim_jobs
+    assert <<^tag, 1::unsigned-32, _rest::binary>> = payload
+    assert payload =~ "running:step"
+  end
+
+  test "native NIF directly frames state-only compact Flow claims" do
+    frame =
+      NIF.encode_compact_claim_jobs_response_frame(
+        0x0203,
+        2,
+        99,
+        [["flow-1", "bucket-1", "lease-1", 42, "running:step"]]
+      )
+
+    custom_payload = Codec.flags().custom_payload
+    tag = Codec.compact_tags().flow_claim_jobs
+
+    assert <<"FSNP", 0x81, ^custom_payload, 2::unsigned-32, 0x0203::unsigned-16, 99::unsigned-64,
+             _body_len::unsigned-32, 0::unsigned-16, ^tag, 1::unsigned-32, rest::binary>> = frame
+
+    assert rest =~ "running:step"
+  end
+
   test "compact Flow claim jobs response can include attributes" do
     attrs = %{"tenant" => "acme"}
 
     payload =
       Codec.encode_compact_flow_claim_jobs([
         ["flow-1", "bucket-1", "lease-1", 42, attrs],
-        ["flow-2", nil, "lease-2", 43, "running:step", %{}]
+        ["flow-2", nil, "lease-2", 43, %{}]
       ])
 
     tag = Codec.compact_tags().flow_claim_jobs
@@ -159,7 +278,16 @@ defmodule FerricstoreServer.Native.CodecTest do
 
     assert <<^tag, 2::unsigned-32, _rest::binary>> = payload
     assert :binary.match(payload, encoded_attrs) != :nomatch
-    assert :binary.match(payload, "running:step") != :nomatch
+  end
+
+  test "compact Flow claim jobs response rejects mixed tuple modes" do
+    jobs = [
+      ["flow-1", "bucket-1", "lease-1", 42],
+      ["flow-2", nil, "lease-2", 43, "running:step"]
+    ]
+
+    assert Codec.encode_compact_flow_claim_jobs(jobs) == nil
+    assert NIF.encode_compact_claim_jobs_response_frame(0x0203, 2, 99, jobs) == nil
   end
 
   test "compact Flow record response encodes known atom fields" do
@@ -229,6 +357,31 @@ defmodule FerricstoreServer.Native.CodecTest do
 
     assert {:ok, %{"keys" => ["k1", "k2"]}} =
              Codec.decode_body(0x0104, Codec.flags().custom_payload, mget_body)
+  end
+
+  test "compact request decoder rejects collections over the native item budget before allocating" do
+    Application.put_env(:ferricstore, :native_max_value_items, 2)
+
+    mget_body =
+      <<0x94, 2, 3::unsigned-32, compact_bin("")::binary, compact_bin("")::binary,
+        compact_bin("")::binary>>
+
+    assert {:error, reason} =
+             Codec.decode_body(0x0104, Codec.flags().custom_payload, mget_body)
+
+    assert reason =~ "exceeds max items"
+  end
+
+  test "compact HMGET decoder applies one budget across nested field lists" do
+    Application.put_env(:ferricstore, :native_max_value_items, 5)
+
+    body =
+      <<0x94, 0x9C, 2::unsigned-32, compact_bin("h1")::binary, 2::unsigned-32,
+        compact_bin("f1")::binary, compact_bin("f2")::binary, compact_bin("h2")::binary,
+        2::unsigned-32, compact_bin("f3")::binary, compact_bin("f4")::binary>>
+
+    assert {:error, reason} = Codec.decode_body(0x000E, Codec.flags().custom_payload, body)
+    assert reason =~ "exceeds max items"
   end
 
   test "decodes compact SMEMBERS pipeline request body" do
@@ -604,6 +757,36 @@ defmodule FerricstoreServer.Native.CodecTest do
     assert fixed_body_len == byte_size(fixed_body)
     assert Bitwise.band(fixed_flags, custom_payload) != 0
     assert <<0::unsigned-16, 0x89, 2::unsigned-32, 2::unsigned-32, "v1", "v2">> = fixed_body
+  end
+
+  @tag :streamed_mget_encoding
+  test "chunked MGET encoding keeps values as bounded iodata frames" do
+    first = String.duplicate("a", 80)
+    second = String.duplicate("b", 80)
+
+    frames =
+      Codec.encode_command_response_frames(0x0104, 4, 45, :ok, [first, nil, second],
+        chunk_bytes: 64
+      )
+
+    assert length(frames) > 1
+    assert Enum.any?(frames, &(not is_binary(&1)))
+
+    body =
+      Enum.map(frames, fn frame ->
+        frame = IO.iodata_to_binary(frame)
+
+        assert <<"FSNP", 0x81, _flags, 4::unsigned-32, 0x0104::unsigned-16, 45::unsigned-64,
+                 body_len::unsigned-32, frame_body::binary>> = frame
+
+        assert body_len == byte_size(frame_body)
+        assert body_len <= 64
+        frame_body
+      end)
+      |> IO.iodata_to_binary()
+
+    assert <<0::unsigned-16, 0x83, 3::unsigned-32, 1, 80::unsigned-32, ^first::binary-size(80), 0,
+             1, 80::unsigned-32, ^second::binary-size(80)>> = body
   end
 
   test "command response frames compact hot Flow many responses when negotiated" do
@@ -1172,6 +1355,10 @@ defmodule FerricstoreServer.Native.CodecTest do
   defp compact_bin(value) do
     value = IO.iodata_to_binary(value)
     <<byte_size(value)::unsigned-32, value::binary>>
+  end
+
+  defp encoded_map_entry(key, encoded_value) do
+    [<<byte_size(key)::unsigned-32>>, key, encoded_value]
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

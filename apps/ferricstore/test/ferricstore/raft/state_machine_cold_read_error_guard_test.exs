@@ -12,12 +12,23 @@ defmodule Ferricstore.Raft.StateMachineColdReadErrorGuardTest do
         ] do
       bodies = private_function_bodies(source, function)
 
-      assert Enum.any?(bodies, &String.contains?(&1, "normalize_state_machine_batch_values")),
+      assert Enum.any?(bodies, fn body ->
+               String.contains?(body, "normalize_state_machine_batch_values") or
+                 String.contains?(body, "pread_batch_keyed_current")
+             end),
              "#{function}/... must preserve per-index batch errors instead of converting them to nil"
 
       assert Enum.any?(bodies, &String.contains?(&1, "emit_state_machine_batch_cold_errors")),
              "#{function}/... must emit telemetry for corrupt/missing cold records"
     end
+  end
+
+  test "state-machine local batch reads re-resolve compaction relocations" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+    bodies = private_function_bodies(source, "sm_store_read_bitcask_cold_batch")
+
+    assert Enum.any?(bodies, &String.contains?(&1, "pread_batch_keyed_current")),
+           "state-machine local reads must retry a keydir row relocated after the initial lookup"
   end
 
   defp private_function_bodies(source, function) do

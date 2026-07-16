@@ -21,6 +21,7 @@ defmodule Ferricstore.Raft.BlobCommand do
           | {:setrange, binary(), non_neg_integer(), binary()}
           | {:cas, binary(), binary(), binary(), non_neg_integer() | nil}
           | {:locked_put, binary(), binary(), non_neg_integer(), term()}
+          | {:fetch_or_compute_publish, binary(), binary(), non_neg_integer(), binary()}
           | {:compound_put, binary(), binary(), non_neg_integer()}
           | {:compound_batch_put, binary(), [{binary(), binary(), non_neg_integer()}]}
           | {:put_batch, [{binary(), binary(), non_neg_integer()}]}
@@ -211,6 +212,26 @@ defmodule Ferricstore.Raft.BlobCommand do
          %{data_dir: data_dir},
          shard_index,
          threshold,
+         {:fetch_or_compute_publish, key, value, expire_at_ms, owner_ref}
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(key) and is_binary(value) and is_binary(owner_ref) do
+    case prepare_value(data_dir, shard_index, threshold, value) do
+      {:ok, {^value, :value}} ->
+        {:ok, {:fetch_or_compute_publish, key, value, expire_at_ms, owner_ref}}
+
+      {:ok, {encoded_ref, :blob_ref}} ->
+        {:ok, {:fetch_or_compute_publish_blob_ref, key, encoded_ref, expire_at_ms, owner_ref}}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp prepare_enabled(
+         %{data_dir: data_dir},
+         shard_index,
+         threshold,
          {:compound_put, compound_key, value, expire_at_ms}
        )
        when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
@@ -262,12 +283,28 @@ defmodule Ferricstore.Raft.BlobCommand do
     end
   end
 
+  defp prepare_enabled(ctx, shard_index, threshold, {operation, entries})
+       when operation in [:mset, :msetnx] and is_list(entries) do
+    case prepare_enabled(ctx, shard_index, threshold, {:put_batch, entries}) do
+      {:ok, {:put_batch, prepared}} -> {:ok, {operation, prepared}}
+      {:ok, {:put_blob_batch, prepared}} -> {:ok, {atomic_blob_operation(operation), prepared}}
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp prepare_enabled(%{data_dir: data_dir}, shard_index, threshold, {:batch, commands})
        when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
               is_list(commands) do
     with {:ok, prepared_commands} <-
            prepare_generic_batch_commands(data_dir, shard_index, threshold, commands) do
       {:ok, {:batch, prepared_commands}}
+    end
+  end
+
+  defp prepare_enabled(ctx, shard_index, threshold, {:flow_policy_fence, installs, command})
+       when is_list(installs) and is_tuple(command) do
+    with {:ok, prepared} <- prepare_enabled(ctx, shard_index, threshold, command) do
+      {:ok, {:flow_policy_fence, installs, prepared}}
     end
   end
 
@@ -326,6 +363,9 @@ defmodule Ferricstore.Raft.BlobCommand do
 
   defp prepare_enabled(_ctx, _shard_index, _threshold, command), do: {:ok, command}
 
+  defp atomic_blob_operation(:mset), do: :mset_blob_batch
+  defp atomic_blob_operation(:msetnx), do: :msetnx_blob_batch
+
   defp command_candidate?({:put, _key, value, _expire_at_ms}, threshold)
        when is_binary(value) do
     externalize?(value, threshold)
@@ -359,6 +399,14 @@ defmodule Ferricstore.Raft.BlobCommand do
     locked_put_blob_side_channel_key?(key) and externalize?(value, threshold)
   end
 
+  defp command_candidate?(
+         {:fetch_or_compute_publish, key, value, _expire_at_ms, owner_ref},
+         threshold
+       )
+       when is_binary(key) and is_binary(value) and is_binary(owner_ref) do
+    externalize?(value, threshold)
+  end
+
   defp command_candidate?({:compound_put, compound_key, value, _expire_at_ms}, threshold)
        when is_binary(compound_key) and is_binary(value) do
     compound_blob_side_channel_key?(compound_key) and externalize?(value, threshold)
@@ -382,9 +430,17 @@ defmodule Ferricstore.Raft.BlobCommand do
     end)
   end
 
+  defp command_candidate?({operation, entries}, threshold)
+       when operation in [:mset, :msetnx] and is_list(entries) do
+    command_candidate?({:put_batch, entries}, threshold)
+  end
+
   defp command_candidate?({:batch, commands}, threshold) when is_list(commands) do
     Enum.any?(commands, &command_candidate?(&1, threshold))
   end
+
+  defp command_candidate?({:flow_policy_fence, _installs, command}, threshold),
+    do: command_candidate?(command, threshold)
 
   defp command_candidate?({:flow_terminal_pipeline_batch, op, _key, attrs}, threshold)
        when is_atom(op) and is_map(attrs) do

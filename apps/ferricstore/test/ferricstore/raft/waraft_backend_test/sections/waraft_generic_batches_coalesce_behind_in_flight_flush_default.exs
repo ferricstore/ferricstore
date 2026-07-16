@@ -243,7 +243,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
             Task.async(fn ->
               WARaftBackend.write_batch(0, [
                 {:flow_create_pipeline_batch, "flow-window-bypass",
-                 %{records: [], policy_snapshot_captured: true}}
+                 %{records: [], policy_reference_captured: true}}
               ])
             end)
 
@@ -815,7 +815,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
           assert {:ok, pre_write_position} = WARaftBackend.storage_position(0)
 
           payload = "v1"
-          {encoded_ref, ref} = missing_legacy_blob_ref(payload)
+          {encoded_ref, ref} = missing_blob_ref(payload)
 
           assert Ferricstore.ErrorReasons.write_timeout_unknown() ==
                    WARaftBackend.write(0, {:put_blob_ref, "apply-block:k", encoded_ref, 0})
@@ -828,7 +828,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
           assert nil == Router.get(ctx, "apply-block:after")
 
           assert :ok = WARaftBackend.stop()
-          write_legacy_blob!(ctx, 0, ref, payload)
+          write_blob_segment!(ctx, 0, ref, payload)
           FerricStore.Instance.cleanup(ctx.name)
 
           restarted_ctx = build_ctx(root)
@@ -867,7 +867,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
           Application.put_env(:ferricstore, :waraft_storage_apply_mode, :bitcask_keydir)
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
-          {encoded_ref, _ref} = missing_legacy_blob_ref("v1")
+          {encoded_ref, _ref} = missing_blob_ref("missing")
 
           assert Ferricstore.ErrorReasons.write_timeout_unknown() ==
                    WARaftBackend.write(0, {:put_blob_ref, "telemetry-block:k", encoded_ref, 0})
@@ -905,7 +905,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftGenericBatchesCoales
           Application.put_env(:ferricstore, :waraft_storage_apply_mode, :bitcask_keydir)
           assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
-          {encoded_ref, _ref} = missing_legacy_blob_ref("v1")
+          {encoded_ref, _ref} = missing_blob_ref("missing")
 
           assert Ferricstore.ErrorReasons.write_timeout_unknown() ==
                    WARaftBackend.write(0, {:put_blob_ref, "snapshot-block:k", encoded_ref, 0})

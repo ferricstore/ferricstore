@@ -20,6 +20,7 @@ defmodule Ferricstore.Store.PromotionTest do
   alias Ferricstore.Store.{CompoundKey, Promotion, Router}
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Test.ShardHelpers
+  alias Ferricstore.Transaction.ExecutionEntry
 
   # Use a very low threshold so we can trigger promotion in tests
   # without inserting hundreds of fields.
@@ -145,7 +146,8 @@ defmodule Ferricstore.Store.PromotionTest do
 
   defp prepared_tx_entry(command, args) do
     {:ok, prepared} = PreparedCommand.prepare(command, args)
-    {prepared.command, prepared.args, prepared.ast}
+    {:ok, entry} = ExecutionEntry.from_prepared(prepared)
+    entry
   end
 
   # Inserts `n` fields into a hash and returns the key.

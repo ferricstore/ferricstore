@@ -40,6 +40,10 @@ defmodule Ferricstore.AuditLog do
   use GenServer
 
   @table :ferricstore_audit_log
+  @default_max_entries 128
+  @max_detail_fields 32
+  @max_collection_items 32
+  @max_metadata_bytes 256
 
   # -------------------------------------------------------------------------
   # Types
@@ -91,13 +95,15 @@ defmodule Ferricstore.AuditLog do
       AuditLog.log(:dangerous_command, %{command: "FLUSHDB", args: []})
   """
   @spec log(event_type(), details()) :: :ok
-  def log(event_type, details) do
+  def log(event_type, details) when is_atom(event_type) and is_map(details) do
     if enabled?() do
-      GenServer.cast(__MODULE__, {:log, event_type, details})
+      GenServer.cast(__MODULE__, {:log, event_type, sanitize_details(details, 0)})
     end
 
     :ok
   end
+
+  def log(_event_type, _details), do: :ok
 
   @doc """
   Returns the last `count` audit log entries, newest first.
@@ -106,15 +112,8 @@ defmodule Ferricstore.AuditLog do
   """
   @spec get(non_neg_integer() | nil) :: [entry()]
   def get(count \\ nil) do
-    entries =
-      @table
-      |> :ets.tab2list()
-      |> Enum.sort_by(fn {id, _, _, _} -> id end, :desc)
-
-    case count do
-      nil -> entries
-      n when is_integer(n) and n >= 0 -> Enum.take(entries, n)
-    end
+    limit = if is_nil(count), do: :all, else: count
+    newest_entries(:ets.last(@table), limit, [])
   end
 
   @doc """
@@ -138,15 +137,18 @@ defmodule Ferricstore.AuditLog do
   """
   @spec enabled?() :: boolean()
   def enabled? do
-    Application.get_env(:ferricstore, :audit_log_enabled, false)
+    Application.get_env(:ferricstore, :audit_log_enabled, false) == true
   end
 
   @doc """
   Returns the configured maximum number of entries.
   """
-  @spec max_entries() :: pos_integer()
+  @spec max_entries() :: non_neg_integer()
   def max_entries do
-    Application.get_env(:ferricstore, :audit_log_max_entries, 128)
+    case Application.get_env(:ferricstore, :audit_log_max_entries, @default_max_entries) do
+      value when is_integer(value) and value >= 0 -> value
+      _invalid -> @default_max_entries
+    end
   end
 
   # -------------------------------------------------------------------------
@@ -180,7 +182,7 @@ defmodule Ferricstore.AuditLog do
 
   @impl true
   def init(_opts) do
-    table = :ets.new(@table, [:set, :public, :named_table])
+    table = :ets.new(@table, [:ordered_set, :public, :named_table])
     {:ok, %{table: table, next_id: 0}}
   end
 
@@ -213,14 +215,80 @@ defmodule Ferricstore.AuditLog do
     size = :ets.info(@table, :size)
 
     if size > max do
-      to_remove = size - max
-
-      @table
-      |> :ets.tab2list()
-      |> Enum.sort_by(fn {id, _, _, _} -> id end)
-      |> Enum.take(to_remove)
-      |> Enum.each(fn {id, _, _, _} -> :ets.delete(@table, id) end)
+      delete_oldest(size - max)
     end
+  end
+
+  defp delete_oldest(remaining) when remaining <= 0, do: :ok
+
+  defp delete_oldest(remaining) do
+    case :ets.first(@table) do
+      :"$end_of_table" ->
+        :ok
+
+      id ->
+        :ets.delete(@table, id)
+        delete_oldest(remaining - 1)
+    end
+  end
+
+  defp newest_entries(:"$end_of_table", _remaining, acc), do: Enum.reverse(acc)
+  defp newest_entries(_id, 0, acc), do: Enum.reverse(acc)
+
+  defp newest_entries(id, remaining, acc) do
+    previous_id = :ets.prev(@table, id)
+
+    case :ets.lookup(@table, id) do
+      [entry] -> newest_entries(previous_id, decrement_limit(remaining), [entry | acc])
+      [] -> newest_entries(previous_id, remaining, acc)
+    end
+  end
+
+  defp decrement_limit(:all), do: :all
+  defp decrement_limit(remaining), do: remaining - 1
+
+  defp sanitize_details(details, depth) do
+    details
+    |> Enum.take(@max_detail_fields)
+    |> Map.new(fn {key, value} -> {sanitize_key(key), sanitize_value(value, depth + 1)} end)
+  end
+
+  defp sanitize_key(key) when is_atom(key), do: key
+  defp sanitize_key(key) when is_binary(key), do: copy_bounded_binary(key)
+  defp sanitize_key(key), do: key |> bounded_inspect() |> copy_bounded_binary()
+
+  defp sanitize_value(value, _depth) when is_binary(value), do: copy_bounded_binary(value)
+
+  defp sanitize_value(value, _depth)
+       when is_atom(value) or is_integer(value) or is_float(value),
+       do: value
+
+  defp sanitize_value(value, depth) when is_list(value) and depth < 3 do
+    value
+    |> Enum.take(@max_collection_items)
+    |> Enum.map(&sanitize_value(&1, depth + 1))
+  end
+
+  defp sanitize_value(value, depth) when is_map(value) and depth < 3,
+    do: sanitize_details(value, depth)
+
+  defp sanitize_value(value, _depth), do: value |> bounded_inspect() |> copy_bounded_binary()
+
+  defp bounded_inspect(value) do
+    inspect(value,
+      limit: @max_collection_items,
+      printable_limit: @max_metadata_bytes,
+      charlists: :as_lists
+    )
+  end
+
+  defp copy_bounded_binary(value) when byte_size(value) <= @max_metadata_bytes,
+    do: :binary.copy(value)
+
+  defp copy_bounded_binary(value) do
+    omitted = byte_size(value) - @max_metadata_bytes
+    prefix = value |> binary_part(0, @max_metadata_bytes) |> :binary.copy()
+    prefix <> "...[#{omitted} more bytes]"
   end
 
   defp format_details(details) when map_size(details) == 0, do: ""

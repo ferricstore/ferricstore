@@ -215,15 +215,15 @@ defmodule Ferricstore.Commands.Cluster do
 
   # -- CLUSTER.FAILOVER -------------------------------------------------------
 
-  def handle("CLUSTER.FAILOVER", [shard_str, node_str], _store) do
-    with {shard_idx, ""} <- Integer.parse(shard_str),
+  def handle("CLUSTER.FAILOVER", [shard_str, node_str], store) do
+    with {:ok, shard_idx} <- parse_shard_index(shard_str, store),
          {:ok, target} <- parse_existing_node(node_str) do
       case RaftCluster.transfer_leadership(shard_idx, target) do
         :ok -> :ok
         {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
       end
     else
-      _ -> {:error, "ERR shard index must be an integer"}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -475,6 +475,40 @@ defmodule Ferricstore.Commands.Cluster do
   rescue
     ArgumentError ->
       {:error, "ERR unknown node; connect the distributed node before using CLUSTER commands"}
+  end
+
+  defp parse_shard_index(shard_str, store) do
+    shard_count = effective_shard_count(store)
+
+    case Integer.parse(shard_str) do
+      {shard_index, ""} when shard_index >= 0 and shard_index < shard_count ->
+        {:ok, shard_index}
+
+      {_shard_index, ""} ->
+        {:error, "ERR shard index is out of range"}
+
+      _invalid ->
+        {:error, "ERR shard index must be an integer"}
+    end
+  end
+
+  defp effective_shard_count(%FerricStore.Instance{shard_count: shard_count})
+       when is_integer(shard_count) and shard_count > 0,
+       do: shard_count
+
+  defp effective_shard_count(%{__instance_ctx__: %FerricStore.Instance{} = ctx}),
+    do: effective_shard_count(ctx)
+
+  defp effective_shard_count(%{instance_ctx: %FerricStore.Instance{} = ctx}),
+    do: effective_shard_count(ctx)
+
+  defp effective_shard_count(_store) do
+    case default_instance() do
+      %FerricStore.Instance{shard_count: shard_count}
+      when is_integer(shard_count) and shard_count > 0 -> shard_count
+
+      _none -> configured_shard_count()
+    end
   end
 
   # Returns "leader" or "follower" for the given shard on this node.

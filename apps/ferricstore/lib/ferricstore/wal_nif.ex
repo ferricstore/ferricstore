@@ -5,8 +5,10 @@ defmodule :ferricstore_wal_nif do
   Replaces file:write and file:datasync with a Rust background thread
   that handles O_DIRECT, commit_delay batching, and fdatasync.
 
-  All NIF functions run on normal BEAM schedulers (<1μs each).
-  The blocking I/O runs on a dedicated Rust OS thread.
+  Constant-time sync admission and position reads run on normal BEAM
+  schedulers. Caller-sized write copies run on a dirty CPU scheduler, while
+  open, close, recovery reads, and preallocation use dirty I/O schedulers. WAL
+  flushes themselves run on a dedicated Rust OS thread.
 
   This module is registered as an Erlang atom `:ferricstore_wal_nif`
   so the WARaft segment log can call it from Erlang.

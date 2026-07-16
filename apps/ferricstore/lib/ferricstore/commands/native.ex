@@ -14,8 +14,12 @@ defmodule Ferricstore.Commands.Native do
   """
 
   alias Ferricstore.CommandTime
-  alias Ferricstore.Store.Ops
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{LocalTxStore, Ops, ReadResult, Router}
+
+  @max_int64 9_223_372_036_854_775_807
+  # Expiries are signed 64-bit values and HLC physical time occupies 48 bits.
+  @max_ttl_ms @max_int64 - 281_474_976_710_656 + 1
+  @max_window_ms div(@max_ttl_ms, 2)
 
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
@@ -23,10 +27,17 @@ defmodule Ferricstore.Commands.Native do
   def handle("CAS", [key, expected, new_value], store),
     do: Ops.cas(store, key, expected, new_value, nil)
 
-  def handle("CAS", [key, expected, new_value, "EX", secs_str], store) do
-    case Integer.parse(secs_str) do
-      {secs, ""} when secs > 0 -> Ops.cas(store, key, expected, new_value, secs * 1_000)
-      _ -> {:error, "ERR value is not an integer or out of range"}
+  def handle("CAS", [key, expected, new_value, option, secs_str], store) do
+    if String.upcase(option) == "EX" do
+      case Integer.parse(secs_str) do
+        {secs, ""} when secs > 0 and secs <= div(@max_ttl_ms, 1_000) ->
+          Ops.cas(store, key, expected, new_value, secs * 1_000)
+
+        _ ->
+          integer_error()
+      end
+    else
+      {:error, "ERR wrong number of arguments for 'cas' command"}
     end
   end
 
@@ -35,8 +46,11 @@ defmodule Ferricstore.Commands.Native do
 
   def handle("LOCK", [key, owner, ttl_ms_str], store) do
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms > 0 -> Ops.lock(store, key, owner, ttl_ms)
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      {ttl_ms, ""} when ttl_ms > 0 and ttl_ms <= @max_ttl_ms ->
+        Ops.lock(store, key, owner, ttl_ms)
+
+      _ ->
+        integer_error()
     end
   end
 
@@ -50,8 +64,11 @@ defmodule Ferricstore.Commands.Native do
 
   def handle("EXTEND", [key, owner, ttl_ms_str], store) do
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms > 0 -> Ops.extend(store, key, owner, ttl_ms)
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      {ttl_ms, ""} when ttl_ms > 0 and ttl_ms <= @max_ttl_ms ->
+        Ops.extend(store, key, owner, ttl_ms)
+
+      _ ->
+        integer_error()
     end
   end
 
@@ -72,18 +89,25 @@ defmodule Ferricstore.Commands.Native do
   def handle("KEY_INFO", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'key_info' command"}
 
-  def handle("FETCH_OR_COMPUTE", [key, ttl], _store), do: do_fetch_or_compute(key, ttl, "")
+  def handle("FETCH_OR_COMPUTE", [key, ttl], store),
+    do: do_fetch_or_compute(store, key, ttl, "")
 
-  def handle("FETCH_OR_COMPUTE", [key, ttl, hint], _store),
-    do: do_fetch_or_compute(key, ttl, hint)
+  def handle("FETCH_OR_COMPUTE", [key, ttl, hint], store),
+    do: do_fetch_or_compute(store, key, ttl, hint)
 
   def handle("FETCH_OR_COMPUTE", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'fetch_or_compute' command"}
 
-  def handle("FETCH_OR_COMPUTE_RESULT", [key, value, ttl_ms_str], _store) do
+  def handle("FETCH_OR_COMPUTE_RESULT", [key, token, value, ttl_ms_str], store) do
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms >= 0 ->
-        Ferricstore.FetchOrCompute.fetch_or_compute_result(key, value, ttl_ms)
+      {ttl_ms, ""} when ttl_ms >= 0 and ttl_ms <= @max_ttl_ms ->
+        Ferricstore.FetchOrCompute.fetch_or_compute_result(
+          fetch_or_compute_ctx(store),
+          key,
+          value,
+          token,
+          ttl_ms
+        )
 
       _ ->
         {:error, "ERR value is not an integer or out of range"}
@@ -93,8 +117,14 @@ defmodule Ferricstore.Commands.Native do
   def handle("FETCH_OR_COMPUTE_RESULT", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'fetch_or_compute_result' command"}
 
-  def handle("FETCH_OR_COMPUTE_ERROR", [key, msg], _store),
-    do: Ferricstore.FetchOrCompute.fetch_or_compute_error(key, msg)
+  def handle("FETCH_OR_COMPUTE_ERROR", [key, token, msg], store),
+    do:
+      Ferricstore.FetchOrCompute.fetch_or_compute_error(
+        fetch_or_compute_ctx(store),
+        key,
+        token,
+        msg
+      )
 
   def handle("FETCH_OR_COMPUTE_ERROR", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'fetch_or_compute_error' command"}
@@ -102,8 +132,13 @@ defmodule Ferricstore.Commands.Native do
   @spec handle_ast(term(), map()) :: term()
   def handle_ast({:cas, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:cas, key, expected, new_value, ttl_ms}, store),
-    do: Ops.cas(store, key, expected, new_value, ttl_ms)
+  def handle_ast({:cas, key, expected, new_value, ttl_ms}, store)
+      when is_nil(ttl_ms) or
+             (is_integer(ttl_ms) and ttl_ms > 0 and ttl_ms <= @max_ttl_ms),
+      do: Ops.cas(store, key, expected, new_value, ttl_ms)
+
+  def handle_ast({:cas, _key, _expected, _new_value, _ttl_ms}, _store),
+    do: integer_error()
 
   def handle_ast({:cas, _args}, _store),
     do: {:error, "ERR wrong number of arguments for 'cas' command"}
@@ -111,7 +146,11 @@ defmodule Ferricstore.Commands.Native do
   def handle_ast({:lock, {:error, _} = err}, _store), do: err
   def handle_ast({:lock, _key, _owner, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:lock, key, owner, ttl_ms}, store), do: Ops.lock(store, key, owner, ttl_ms)
+  def handle_ast({:lock, key, owner, ttl_ms}, store)
+      when is_integer(ttl_ms) and ttl_ms > 0 and ttl_ms <= @max_ttl_ms,
+    do: Ops.lock(store, key, owner, ttl_ms)
+
+  def handle_ast({:lock, _key, _owner, _ttl_ms}, _store), do: integer_error()
 
   def handle_ast({:unlock, {:error, _} = err}, _store), do: err
 
@@ -120,28 +159,58 @@ defmodule Ferricstore.Commands.Native do
   def handle_ast({:extend, {:error, _} = err}, _store), do: err
   def handle_ast({:extend, _key, _owner, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:extend, key, owner, ttl_ms}, store), do: Ops.extend(store, key, owner, ttl_ms)
+  def handle_ast({:extend, key, owner, ttl_ms}, store)
+      when is_integer(ttl_ms) and ttl_ms > 0 and ttl_ms <= @max_ttl_ms,
+    do: Ops.extend(store, key, owner, ttl_ms)
+
+  def handle_ast({:extend, _key, _owner, _ttl_ms}, _store), do: integer_error()
 
   def handle_ast({:ratelimit_add, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:ratelimit_add, key, window_ms, max, count}, store),
-    do: Ops.ratelimit_add(store, key, window_ms, max, count)
+  def handle_ast({:ratelimit_add, key, window_ms, max, count}, store)
+      when is_integer(window_ms) and window_ms > 0 and window_ms <= @max_window_ms and
+             is_integer(max) and max > 0 and max <= @max_int64 and is_integer(count) and
+             count > 0 and count <= @max_int64,
+      do: Ops.ratelimit_add(store, key, window_ms, max, count)
+
+  def handle_ast({:ratelimit_add, _key, _window_ms, _max, _count}, _store),
+    do: integer_error()
 
   def handle_ast({:ferricstore_key_info, {:error, _} = err}, _store), do: err
   def handle_ast({:ferricstore_key_info, key}, store), do: do_key_info(key, store)
 
   def handle_ast({:fetch_or_compute, _key, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:fetch_or_compute, key, ttl_ms, hint}, _store),
-    do: do_fetch_or_compute_ast(key, ttl_ms, hint)
+  def handle_ast({:fetch_or_compute, key, ttl_ms, hint}, store)
+      when is_integer(ttl_ms) and ttl_ms > 0 and ttl_ms <= @max_ttl_ms,
+      do: do_fetch_or_compute_ast(store, key, ttl_ms, hint)
+
+  def handle_ast({:fetch_or_compute, _key, _ttl_ms, _hint}, _store), do: integer_error()
 
   def handle_ast({:fetch_or_compute_result, _key, {:error, _} = err}, _store), do: err
 
-  def handle_ast({:fetch_or_compute_result, key, value, ttl_ms}, _store),
-    do: Ferricstore.FetchOrCompute.fetch_or_compute_result(key, value, ttl_ms)
+  def handle_ast({:fetch_or_compute_result, key, token, value, ttl_ms}, store)
+      when is_integer(ttl_ms) and ttl_ms >= 0 and ttl_ms <= @max_ttl_ms,
+      do:
+        Ferricstore.FetchOrCompute.fetch_or_compute_result(
+          fetch_or_compute_ctx(store),
+          key,
+          value,
+          token,
+          ttl_ms
+        )
 
-  def handle_ast({:fetch_or_compute_error, key, msg}, _store),
-    do: Ferricstore.FetchOrCompute.fetch_or_compute_error(key, msg)
+  def handle_ast({:fetch_or_compute_result, _key, _token, _value, _ttl_ms}, _store),
+    do: integer_error()
+
+  def handle_ast({:fetch_or_compute_error, key, token, msg}, store),
+    do:
+      Ferricstore.FetchOrCompute.fetch_or_compute_error(
+        fetch_or_compute_ctx(store),
+        key,
+        token,
+        msg
+      )
 
   def handle_ast({tag, _args}, _store)
       when tag in ~w(lock unlock extend ratelimit_add fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a do
@@ -151,16 +220,18 @@ defmodule Ferricstore.Commands.Native do
 
   defp do_ratelimit_add(store, key, wms, max_str, cnt) do
     with {w, ""} <- Integer.parse(wms),
-         true <- w > 0,
+         true <- w > 0 and w <= @max_window_ms,
          {m, ""} <- Integer.parse(max_str),
-         true <- m > 0,
+         true <- m > 0 and m <= @max_int64,
          {c, ""} <- Integer.parse(cnt),
-         true <- c > 0 do
+         true <- c > 0 and c <= @max_int64 do
       Ops.ratelimit_add(store, key, w, m, c)
     else
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
+
+  defp integer_error, do: {:error, "ERR value is not an integer or out of range"}
 
   defp do_key_info(key, store) do
     ctx = key_info_ctx(store)
@@ -168,28 +239,35 @@ defmodule Ferricstore.Commands.Native do
     keydir = Router.resolve_keydir(ctx, idx)
     now = CommandTime.now_ms()
 
-    type = Ferricstore.Store.TypeRegistry.get_type(key, ctx)
-    alive? = type != "none"
+    case Ferricstore.Store.TypeRegistry.get_type(key, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
-    {value_size, expire_at_ms, hot_status} = resolve_key_info(alive?, keydir, key, now)
-    ttl_ms = compute_ttl_ms(alive?, expire_at_ms, now)
+      type when is_binary(type) ->
+        alive? = type != "none"
 
-    [
-      "type",
-      type,
-      "value_size",
-      Integer.to_string(value_size),
-      "ttl_ms",
-      Integer.to_string(ttl_ms),
-      "hot_cache_status",
-      hot_status,
-      "last_write_shard",
-      Integer.to_string(idx)
-    ]
+        {value_size, expire_at_ms, hot_status} = resolve_key_info(alive?, keydir, key, now)
+        ttl_ms = compute_ttl_ms(alive?, expire_at_ms, now)
+
+        [
+          "type",
+          type,
+          "value_size",
+          Integer.to_string(value_size),
+          "ttl_ms",
+          Integer.to_string(ttl_ms),
+          "hot_cache_status",
+          hot_status,
+          "last_write_shard",
+          Integer.to_string(idx)
+        ]
+
+      _invalid ->
+        {:error, "ERR storage read failed"}
+    end
   end
 
-  defp key_info_ctx(%{__instance_ctx__: %FerricStore.Instance{} = ctx}), do: ctx
-  defp key_info_ctx(_store), do: FerricStore.Instance.get(:default)
+  defp key_info_ctx(store), do: command_instance_ctx(store)
 
   defp resolve_key_info(false, _keydir, _key, _now), do: {0, 0, "cold"}
   defp resolve_key_info(true, keydir, key, now), do: ets_key_info(keydir, key, now)
@@ -225,14 +303,19 @@ defmodule Ferricstore.Commands.Native do
     end
   end
 
-  defp do_fetch_or_compute(key, ttl_ms_str, hint) do
+  defp do_fetch_or_compute(store, key, ttl_ms_str, hint) do
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms > 0 ->
-        case Ferricstore.FetchOrCompute.fetch_or_compute(key, ttl_ms, hint) do
+      {ttl_ms, ""} when ttl_ms > 0 and ttl_ms <= @max_ttl_ms ->
+        case Ferricstore.FetchOrCompute.fetch_or_compute(
+               fetch_or_compute_ctx(store),
+               key,
+               ttl_ms,
+               hint
+             ) do
           {:hit, v} -> ["hit", v]
-          {:compute, ch} -> ["compute", ch]
+          {:compute, ch, token} -> ["compute", ch, token]
           {:ok, v} -> ["hit", v]
-          {:error, reason} -> {:error, "ERR compute failed: " <> reason}
+          {:error, reason} -> fetch_or_compute_error(reason)
         end
 
       _ ->
@@ -240,12 +323,33 @@ defmodule Ferricstore.Commands.Native do
     end
   end
 
-  defp do_fetch_or_compute_ast(key, ttl_ms, hint) do
-    case Ferricstore.FetchOrCompute.fetch_or_compute(key, ttl_ms, hint) do
+  defp do_fetch_or_compute_ast(store, key, ttl_ms, hint) do
+    case Ferricstore.FetchOrCompute.fetch_or_compute(
+           fetch_or_compute_ctx(store),
+           key,
+           ttl_ms,
+           hint
+         ) do
       {:hit, v} -> ["hit", v]
-      {:compute, ch} -> ["compute", ch]
+      {:compute, ch, token} -> ["compute", ch, token]
       {:ok, v} -> ["hit", v]
-      {:error, reason} -> {:error, "ERR compute failed: " <> reason}
+      {:error, reason} -> fetch_or_compute_error(reason)
     end
   end
+
+  defp fetch_or_compute_error(reason) when is_binary(reason),
+    do: {:error, "ERR compute failed: " <> reason}
+
+  defp fetch_or_compute_error(reason),
+    do: {:error, "ERR compute failed: " <> inspect(reason, limit: 20, printable_limit: 256)}
+
+  defp fetch_or_compute_ctx(store), do: command_instance_ctx(store)
+
+  defp command_instance_ctx(%FerricStore.Instance{} = ctx), do: ctx
+
+  defp command_instance_ctx(%LocalTxStore{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx
+
+  defp command_instance_ctx(%{__instance_ctx__: %FerricStore.Instance{} = ctx}), do: ctx
+  defp command_instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx
+  defp command_instance_ctx(_store), do: FerricStore.Instance.get(:default)
 end

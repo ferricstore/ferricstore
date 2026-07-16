@@ -71,16 +71,7 @@ defmodule Ferricstore.Commands.PubSub do
   def handle_ast({:publish, _args}),
     do: {:error, "ERR wrong number of arguments for 'publish' command"}
 
-  def handle_ast({:pubsub, ["CHANNELS" | args]}), do: handle_channels(args)
-  def handle_ast({:pubsub, ["NUMSUB" | args]}), do: handle_numsub(args)
-  def handle_ast({:pubsub, ["NUMPAT" | args]}), do: handle_numpat(args)
-
-  def handle_ast({:pubsub, []}),
-    do: {:error, "ERR wrong number of arguments for 'pubsub' command"}
-
-  def handle_ast({:pubsub, [other | _rest]}) do
-    {:error, "ERR unknown subcommand '#{String.downcase(other)}'. Try PUBSUB HELP."}
-  end
+  def handle_ast({:pubsub, args}) when is_list(args), do: handle("PUBSUB", args)
 
   # ---------------------------------------------------------------------------
   # PUBSUB subcommand handlers

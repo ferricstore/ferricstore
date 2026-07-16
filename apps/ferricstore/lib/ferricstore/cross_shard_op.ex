@@ -35,8 +35,11 @@ defmodule Ferricstore.CrossShardOp do
   require Logger
 
   @lock_ttl_ms 5_000
+  @lock_renew_interval_ms div(@lock_ttl_ms, 3)
+  @lock_renew_timeout_ms div(@lock_ttl_ms, 3)
   @max_retries 3
   @max_cross_shard_keys 20
+  @standalone_barrier_timeout 30_000
 
   @too_many_keys_error "ERR cross-shard operation exceeds max key limit (#{@max_cross_shard_keys}). " <>
                          "Use hash tags {tag} to colocate keys on the same shard."
@@ -68,7 +71,12 @@ defmodule Ferricstore.CrossShardOp do
   cannot be represented safely as a cross-shard transaction.
   """
   @spec execute([key_with_role()], (map() -> term()), keyword()) :: term()
-  def execute(keys_with_roles, execute_fn, opts \\ []) do
+  def execute(keys_with_roles, execute_fn, opts \\ [])
+
+  def execute([], _execute_fn, _opts),
+    do: {:error, "ERR cross-shard operation requires at least one key"}
+
+  def execute(keys_with_roles, execute_fn, opts) do
     caller_store = Keyword.get(opts, :store)
 
     # Direct stores already know how to execute every operation locally. Check
@@ -141,15 +149,62 @@ defmodule Ferricstore.CrossShardOp do
   # ---------------------------------------------------------------------------
 
   defp execute_direct_cross_shard(ctx, shard_map, execute_fn) do
-    # Non-Raft instances have no lock or intent machinery. Preserve their
-    # direct-shard semantics while still routing each key through the caller
-    # instance instead of falling into the default Raft cluster.
-    per_shard_stores =
-      shard_map
-      |> Map.keys()
-      |> Map.new(fn idx -> {idx, build_store_for_shard(ctx, idx)} end)
+    shard_indices = shard_map |> Map.keys() |> Enum.sort()
 
-    execute_fn.(build_routing_store(ctx, per_shard_stores))
+    case acquire_standalone_barriers(ctx, shard_indices, []) do
+      {:ok, acquired} ->
+        coordinator = hd(shard_indices)
+
+        try do
+          ctx
+          |> Router.shard_name(coordinator)
+          |> GenServer.call(
+            {:standalone_cross_shard_execute, execute_fn},
+            @standalone_barrier_timeout
+          )
+        catch
+          :exit, reason -> {:error, {:standalone_cross_shard_failed, reason}}
+        after
+          release_standalone_barriers(ctx, acquired)
+        end
+
+      {:error, reason, acquired} ->
+        release_standalone_barriers(ctx, acquired)
+        {:error, {:standalone_cross_shard_busy, reason}}
+    end
+  end
+
+  defp acquire_standalone_barriers(_ctx, [], acquired), do: {:ok, acquired}
+
+  defp acquire_standalone_barriers(ctx, [shard_index | rest], acquired) do
+    result =
+      try do
+        ctx
+        |> Router.shard_name(shard_index)
+        |> GenServer.call(:standalone_cross_shard_barrier_acquire, @standalone_barrier_timeout)
+      catch
+        :exit, reason -> {:error, reason}
+      end
+
+    case result do
+      :ok -> acquire_standalone_barriers(ctx, rest, [shard_index | acquired])
+      {:error, reason} -> {:error, reason, acquired}
+      other -> {:error, {:unexpected_barrier_reply, other}, acquired}
+    end
+  end
+
+  defp release_standalone_barriers(ctx, acquired) do
+    Enum.each(acquired, fn shard_index ->
+      try do
+        ctx
+        |> Router.shard_name(shard_index)
+        |> GenServer.call(:standalone_cross_shard_barrier_release, @standalone_barrier_timeout)
+      catch
+        :exit, _reason -> :ok
+      end
+    end)
+
+    :ok
   end
 
   defp execute_cross_shard(ctx, keys_with_roles, shard_map, execute_fn, opts) do
@@ -163,53 +218,68 @@ defmodule Ferricstore.CrossShardOp do
 
     case lock_phase(sorted_shards, lock_map, owner_ref, 0) do
       :ok ->
-        # Intent phase: write to coordinator shard (lowest index)
-        coordinator_shard = hd(sorted_shards)
-        intent_map = Keyword.get(opts, :intent, %{})
-
-        # Build read-only stores to compute value hashes before writing intent
-        per_shard_stores =
-          Map.new(sorted_shards, fn idx -> {idx, build_store_for_shard(ctx, idx)} end)
-
-        value_hashes = compute_value_hashes(ctx, keys_with_roles, per_shard_stores)
-        full_intent = Map.put(intent_map, :value_hashes, value_hashes)
-
         try do
+          # Everything after the first lock belongs inside this scope. Building
+          # stores and reading intent tokens can fail just like command execution.
+          coordinator_shard = hd(sorted_shards)
+          intent_map = Keyword.get(opts, :intent, %{})
+
+          per_shard_stores =
+            Map.new(sorted_shards, fn idx -> {idx, build_store_for_shard(ctx, idx)} end)
+
+          value_hashes = compute_value_hashes(ctx, keys_with_roles, per_shard_stores)
+          full_intent = Map.put(intent_map, :value_hashes, value_hashes)
+
           case write_intent(coordinator_shard, owner_ref, full_intent) do
             {:ok, :ok, _leader} ->
-              # Execute phase: build a unified routing store that uses locked
-              # write variants with owner_ref, so writes pass through the lock
-              # check in the state machine.
-              unified_store = build_locked_routing_store(ctx, per_shard_stores, owner_ref)
+              renew_fun = fn -> renew_key_locks(sorted_shards, lock_map, owner_ref) end
 
-              result = execute_fn.(unified_store)
+              case with_lock_renewal(
+                     fn lease ->
+                       # Every mutation checks the local lease state before
+                       # submitting its owner-fenced Raft command.
+                       unified_store =
+                         build_locked_routing_store(
+                           ctx,
+                           per_shard_stores,
+                           owner_ref,
+                           lease
+                         )
 
-              # Clean up: delete intent, unlock
-              delete_intent(coordinator_shard, owner_ref)
-              unlock_all(sorted_shards, lock_map, owner_ref)
+                       execute_fn.(unified_store)
+                     end,
+                     renew_fun,
+                     @lock_renew_interval_ms
+                   ) do
+                {:ok, result} ->
+                  # A failed delete leaves a recoverable stale intent. Locks are
+                  # released unconditionally by the enclosing after block.
+                  delete_intent(coordinator_shard, owner_ref)
+                  result
 
-              result
+                {:error, :lock_lease_lost} ->
+                  {:error, "ERR cross-shard operation failed: lock lease lost"}
+              end
 
             {:ok, {:error, reason}, _leader} ->
-              unlock_all(sorted_shards, lock_map, owner_ref)
               cross_shard_intent_error(reason)
 
             {:error, reason} ->
-              unlock_all(sorted_shards, lock_map, owner_ref)
               cross_shard_intent_error(reason)
 
             other ->
-              unlock_all(sorted_shards, lock_map, owner_ref)
               cross_shard_intent_error(other)
           end
-        rescue
-          e ->
-            unlock_all(sorted_shards, lock_map, owner_ref)
-            reraise e, __STACKTRACE__
+        after
+          unlock_all(sorted_shards, lock_map, owner_ref)
         end
 
       {:error, :keys_locked} ->
         {:error, "ERR cross-shard operation failed: keys are locked by another operation"}
+
+      {:error, reason} ->
+        Logger.warning("CrossShardOp: lock phase failed: #{inspect(reason)}")
+        {:error, "ERR cross-shard operation failed: lock phase failed"}
     end
   end
 
@@ -271,6 +341,155 @@ defmodule Ferricstore.CrossShardOp do
     end
   end
 
+  defp renew_key_locks(sorted_shards, lock_map, owner_ref) do
+    expire_at = HLC.now_ms() + @lock_ttl_ms
+
+    targets =
+      sorted_shards
+      |> Enum.map(fn shard_idx -> {shard_idx, Map.get(lock_map, shard_idx, [])} end)
+      |> Enum.reject(fn {_shard_idx, keys} -> keys == [] end)
+
+    targets
+    |> Task.async_stream(
+      fn {shard_idx, keys} ->
+        shard_idx
+        |> Cluster.shard_server_id()
+        |> CommandClock.process_command({:renew_key_locks, keys, owner_ref, expire_at})
+        |> unwrap_ra_reply()
+      end,
+      max_concurrency: max(length(targets), 1),
+      ordered: false,
+      timeout: @lock_renew_timeout_ms,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce_while(:ok, fn
+      {:ok, {:ok, :ok, _leader}}, :ok -> {:cont, :ok}
+      {:ok, {:ok, {:error, reason}, _leader}}, :ok -> {:halt, {:error, reason}}
+      {:ok, {:error, reason}}, :ok -> {:halt, {:error, reason}}
+      {:exit, reason}, :ok -> {:halt, {:error, {:renewal_task_exit, reason}}}
+      unexpected, :ok -> {:halt, {:error, {:unexpected_renewal_reply, unexpected}}}
+    end)
+  end
+
+  defp with_lock_renewal(execute_fun, renew_fun, interval_ms)
+       when is_function(execute_fun, 1) and is_function(renew_fun, 0) and
+              is_integer(interval_ms) and interval_ms > 0 do
+    lease = start_lock_renewal(renew_fun, interval_ms)
+
+    try do
+      result = execute_fun.(lease)
+      stop_lock_renewal(lease)
+
+      case lock_lease_available(lease) do
+        :ok -> {:ok, result}
+        {:error, :lock_lease_lost} = error -> error
+      end
+    after
+      stop_lock_renewal(lease)
+    end
+  end
+
+  defp start_lock_renewal(renew_fun, interval_ms) do
+    status = :atomics.new(1, signed: false)
+    :ok = :atomics.put(status, 1, 1)
+    owner = self()
+    stop_ref = make_ref()
+
+    pid =
+      spawn(fn ->
+        owner_monitor = Process.monitor(owner)
+        lock_renewal_loop(owner_monitor, stop_ref, status, renew_fun, interval_ms)
+      end)
+
+    %{pid: pid, status: status, stop_ref: stop_ref}
+  end
+
+  defp lock_renewal_loop(owner_monitor, stop_ref, status, renew_fun, interval_ms) do
+    receive do
+      {:stop_lock_renewal, ^stop_ref, caller} ->
+        send(caller, {:lock_renewal_stopped, stop_ref})
+
+      {:DOWN, ^owner_monitor, :process, _owner, _reason} ->
+        :ok
+    after
+      interval_ms ->
+        case safe_renew(renew_fun) do
+          :ok ->
+            lock_renewal_loop(owner_monitor, stop_ref, status, renew_fun, interval_ms)
+
+          {:error, _reason} ->
+            mark_lock_lease_lost(status)
+            wait_for_lock_renewal_stop(owner_monitor, stop_ref)
+        end
+    end
+  end
+
+  defp wait_for_lock_renewal_stop(owner_monitor, stop_ref) do
+    receive do
+      {:stop_lock_renewal, ^stop_ref, caller} ->
+        send(caller, {:lock_renewal_stopped, stop_ref})
+
+      {:DOWN, ^owner_monitor, :process, _owner, _reason} ->
+        :ok
+    end
+  end
+
+  defp safe_renew(renew_fun) do
+    case renew_fun.() do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, {:unexpected_renewal_result, other}}
+    end
+  rescue
+    error -> {:error, {:renewal_exception, error}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp stop_lock_renewal(%{pid: pid, stop_ref: stop_ref}) do
+    monitor = Process.monitor(pid)
+    send(pid, {:stop_lock_renewal, stop_ref, self()})
+
+    receive do
+      {:lock_renewal_stopped, ^stop_ref} ->
+        receive do
+          {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+        after
+          100 -> Process.demonitor(monitor, [:flush])
+        end
+
+      {:DOWN, ^monitor, :process, ^pid, _reason} ->
+        :ok
+    after
+      @lock_renew_timeout_ms + 100 ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+        after
+          100 -> Process.demonitor(monitor, [:flush])
+        end
+    end
+  end
+
+  defp lock_lease_available(nil), do: :ok
+
+  defp lock_lease_available(%{status: status}) do
+    if :atomics.get(status, 1) == 1, do: :ok, else: {:error, :lock_lease_lost}
+  end
+
+  defp mark_lock_lease_lost(status) do
+    :ok = :atomics.put(status, 1, 0)
+  end
+
+  @doc false
+  def __with_lock_renewal_for_test__(execute_fun, renew_fun, interval_ms),
+    do: with_lock_renewal(execute_fun, renew_fun, interval_ms)
+
+  @doc false
+  def __locked_write_for_test__(lease, write_fun),
+    do: with_live_lock_lease(lease, write_fun)
+
   # ---------------------------------------------------------------------------
   # Unlock helpers
   # ---------------------------------------------------------------------------
@@ -302,28 +521,50 @@ defmodule Ferricstore.CrossShardOp do
   end
 
   defp attempt_unlock(shards_keys, owner_ref) do
-    tasks =
-      Enum.map(shards_keys, fn {shard_idx, keys} ->
-        {shard_idx, keys,
-         Task.async(fn ->
-           shard_id = Cluster.shard_server_id(shard_idx)
+    attempt_unlock_with(shards_keys, owner_ref, &unlock_shard/3, 5_000)
+  end
 
-           unwrap_ra_reply(
-             CommandClock.process_command(shard_id, {:unlock_keys, keys, owner_ref})
-           )
-         end)}
-      end)
+  @doc false
+  def __attempt_unlock_for_test__(shards_keys, owner_ref, unlock_fun, timeout_ms),
+    do: attempt_unlock_with(shards_keys, owner_ref, unlock_fun, timeout_ms)
 
-    results = Task.await_many(Enum.map(tasks, fn {_, _, task} -> task end), 5_000)
+  defp attempt_unlock_with([], _owner_ref, _unlock_fun, _timeout_ms), do: []
 
-    Enum.zip(tasks, results)
-    |> Enum.filter(fn {{_idx, _keys, _task}, result} ->
-      case result do
-        {:ok, :ok, _} -> false
-        _ -> true
-      end
+  defp attempt_unlock_with(shards_keys, owner_ref, unlock_fun, timeout_ms)
+       when is_list(shards_keys) and is_function(unlock_fun, 3) and is_integer(timeout_ms) and
+              timeout_ms > 0 do
+    results =
+      Task.async_stream(
+        shards_keys,
+        fn {shard_idx, keys} ->
+          try do
+            {:unlock_result, unlock_fun.(shard_idx, keys, owner_ref)}
+          catch
+            kind, reason -> {:unlock_failure, kind, reason}
+          end
+        end,
+        max_concurrency: length(shards_keys),
+        ordered: true,
+        timeout: timeout_ms,
+        on_timeout: :kill_task
+      )
+
+    shards_keys
+    |> Enum.zip(results)
+    |> Enum.reduce([], fn
+      {_shard_keys, {:ok, {:unlock_result, {:ok, :ok, _leader}}}}, failed ->
+        failed
+
+      {shard_keys, _failed_or_timed_out}, failed ->
+        [shard_keys | failed]
     end)
-    |> Enum.map(fn {{idx, keys, _task}, _result} -> {idx, keys} end)
+    |> Enum.reverse()
+  end
+
+  defp unlock_shard(shard_idx, keys, owner_ref) do
+    shard_id = Cluster.shard_server_id(shard_idx)
+
+    unwrap_ra_reply(CommandClock.process_command(shard_id, {:unlock_keys, keys, owner_ref}))
   end
 
   defp retry_unlock([], _owner_ref, _remaining_ms), do: :ok
@@ -503,27 +744,35 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec build_locked_routing_store(FerricStore.Instance.t(), map(), reference()) :: map()
   def build_locked_routing_store(ctx, per_shard_stores, owner_ref) do
+    build_locked_routing_store(ctx, per_shard_stores, owner_ref, nil)
+  end
+
+  defp build_locked_routing_store(ctx, per_shard_stores, owner_ref, lease) do
     route = fn key ->
       idx = Router.shard_for(ctx, key)
       Map.get(per_shard_stores, idx) || Map.get(per_shard_stores, hd(Map.keys(per_shard_stores)))
     end
 
     locked_compound_put = fn redis_key, compound_key, value, expire_at_ms ->
-      shard_idx = Router.shard_for(ctx, redis_key)
-      command = {:locked_put, compound_key, value, expire_at_ms, owner_ref}
-      submit_locked_write_command(ctx, shard_idx, command)
+      with_live_lock_lease(lease, fn ->
+        shard_idx = Router.shard_for(ctx, redis_key)
+        command = {:locked_put, compound_key, value, expire_at_ms, owner_ref}
+        submit_locked_write_command(ctx, shard_idx, command)
+      end)
     end
 
     locked_compound_delete = fn redis_key, compound_key ->
-      shard_idx = Router.shard_for(ctx, redis_key)
-      shard_id = Cluster.shard_server_id(shard_idx)
+      with_live_lock_lease(lease, fn ->
+        shard_idx = Router.shard_for(ctx, redis_key)
+        shard_id = Cluster.shard_server_id(shard_idx)
 
-      case unwrap_ra_reply(
-             CommandClock.process_command(shard_id, {:locked_delete, compound_key, owner_ref})
-           ) do
-        {:ok, result, _} -> result
-        {:error, reason} -> {:error, reason}
-      end
+        case unwrap_ra_reply(
+               CommandClock.process_command(shard_id, {:locked_delete, compound_key, owner_ref})
+             ) do
+          {:ok, result, _} -> result
+          {:error, reason} -> {:error, reason}
+        end
+      end)
     end
 
     %{
@@ -553,20 +802,24 @@ defmodule Ferricstore.CrossShardOp do
 
       # Writes: use locked variants through Raft with owner_ref
       put: fn key, value, expire_at_ms ->
-        shard_idx = Router.shard_for(ctx, key)
-        command = {:locked_put, key, value, expire_at_ms, owner_ref}
-        submit_locked_write_command(ctx, shard_idx, command)
+        with_live_lock_lease(lease, fn ->
+          shard_idx = Router.shard_for(ctx, key)
+          command = {:locked_put, key, value, expire_at_ms, owner_ref}
+          submit_locked_write_command(ctx, shard_idx, command)
+        end)
       end,
       delete: fn key ->
-        shard_idx = Router.shard_for(ctx, key)
-        shard_id = Cluster.shard_server_id(shard_idx)
+        with_live_lock_lease(lease, fn ->
+          shard_idx = Router.shard_for(ctx, key)
+          shard_id = Cluster.shard_server_id(shard_idx)
 
-        case unwrap_ra_reply(
-               CommandClock.process_command(shard_id, {:locked_delete, key, owner_ref})
-             ) do
-          {:ok, result, _} -> result
-          {:error, reason} -> {:error, reason}
-        end
+          case unwrap_ra_reply(
+                 CommandClock.process_command(shard_id, {:locked_delete, key, owner_ref})
+               ) do
+            {:ok, result, _} -> result
+            {:error, reason} -> {:error, reason}
+          end
+        end)
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         locked_compound_put.(redis_key, compound_key, value, expire_at_ms)
@@ -593,15 +846,20 @@ defmodule Ferricstore.CrossShardOp do
         end)
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard_idx = Router.shard_for(ctx, redis_key)
-        shard_id = Cluster.shard_server_id(shard_idx)
+        with_live_lock_lease(lease, fn ->
+          shard_idx = Router.shard_for(ctx, redis_key)
+          shard_id = Cluster.shard_server_id(shard_idx)
 
-        case unwrap_ra_reply(
-               CommandClock.process_command(shard_id, {:locked_delete_prefix, prefix, owner_ref})
-             ) do
-          {:ok, result, _} -> result
-          {:error, reason} -> {:error, reason}
-        end
+          case unwrap_ra_reply(
+                 CommandClock.process_command(
+                   shard_id,
+                   {:locked_delete_prefix, prefix, owner_ref}
+                 )
+               ) do
+            {:ok, result, _} -> result
+            {:error, reason} -> {:error, reason}
+          end
+        end)
       end
     }
   end
@@ -626,6 +884,29 @@ defmodule Ferricstore.CrossShardOp do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp with_live_lock_lease(lease, write_fun) do
+    with :ok <- lock_lease_available(lease) do
+      result = write_fun.()
+      observe_locked_write_result(lease, result)
+      result
+    end
+  end
+
+  defp observe_locked_write_result(nil, _result), do: :ok
+
+  defp observe_locked_write_result(%{status: status}, {:error, reason})
+       when reason in [
+              :key_lock_expired,
+              :key_not_locked,
+              :key_locked,
+              :not_lock_owner,
+              :lock_lease_lost
+            ] do
+    mark_lock_lease_lost(status)
+  end
+
+  defp observe_locked_write_result(_lease, _result), do: :ok
 
   defp submit_locked_write_command(ctx, shard_idx, command) do
     with {:ok, prepared_command} <- prepare_locked_write_command(ctx, shard_idx, command) do

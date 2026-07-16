@@ -452,10 +452,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
       end
 
       defp flow_due_key_state_match?(key, type, :any) do
+        encoded_type = FlowKeys.index_component(type)
+
         if flow_due_any_index_enabled?() do
-          String.contains?(key, "}:da:" <> type <> ":p")
+          String.contains?(key, "}:da:" <> encoded_type <> ":p")
         else
-          String.contains?(key, "}:d:" <> type <> ":")
+          String.contains?(key, "}:d:" <> encoded_type <> ":")
         end
       end
 
@@ -468,7 +470,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
       end
 
       defp flow_due_key_state_match?(key, type, state) when is_binary(state) do
-        String.contains?(key, "}:d:" <> type <> ":" <> state <> ":p")
+        String.contains?(
+          key,
+          "}:d:" <>
+            FlowKeys.index_component(type) <> ":" <> FlowKeys.index_component(state) <> ":p"
+        )
       end
 
       defp flow_due_key_state_match?(_key, _type, _state), do: false
@@ -963,7 +969,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
       end
 
       defp flow_due_key_state(type, due_key) when is_binary(type) and is_binary(due_key) do
-        marker = "}:d:" <> type <> ":"
+        encoded_type = FlowKeys.index_component(type)
+        marker = "}:d:" <> encoded_type <> ":"
 
         case :binary.match(due_key, marker) do
           {pos, len} ->
@@ -972,14 +979,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
 
             case :binary.match(rest, ":p") do
               {state_len, _priority_len} when state_len > 0 ->
-                {:ok, binary_part(rest, 0, state_len)}
+                rest
+                |> binary_part(0, state_len)
+                |> Base.url_decode64(padding: false)
 
               _other ->
                 :error
             end
 
           :nomatch ->
-            if :binary.match(due_key, "}:da:" <> type <> ":p") == :nomatch do
+            if :binary.match(due_key, "}:da:" <> encoded_type <> ":p") == :nomatch do
               :error
             else
               :any

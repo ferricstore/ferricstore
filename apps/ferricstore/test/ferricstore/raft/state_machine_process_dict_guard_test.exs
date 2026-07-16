@@ -94,4 +94,11 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
     refute source =~ "defp checkpoint_clean?(%{instance_ctx: nil}), do: true",
            "unresolved instance checkpoint context must not be treated as clean; only :default may use the legacy carve-out"
   end
+
+  test "Raft apply cannot branch on a process-local LMDB projection switch" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    refute source =~ "flow_lmdb_hot_projection_removed"
+    refute source =~ "flow_lmdb_projection_enabled?"
+  end
 end

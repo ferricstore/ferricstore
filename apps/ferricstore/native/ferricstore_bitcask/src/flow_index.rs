@@ -1,15 +1,96 @@
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
-use std::ops::Bound::{Excluded, Unbounded};
-use std::sync::Mutex;
+use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+
+const MAX_FLOW_INDEX_REQUEST_ITEMS: usize = 100_000;
+const MAX_FLOW_INDEX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const FLOW_INDEX_REQUEST_TOO_LARGE: &str = "flow index native request exceeds safety budget";
+
+struct FlowIndexRequestBudget {
+    items: usize,
+    bytes: usize,
+    valid: bool,
+}
+
+impl FlowIndexRequestBudget {
+    fn new() -> Self {
+        Self {
+            items: 0,
+            bytes: 0,
+            valid: true,
+        }
+    }
+
+    fn add_items(&mut self, count: usize) {
+        let Some(items) = self.items.checked_add(count) else {
+            self.valid = false;
+            return;
+        };
+        self.items = items;
+        if self.items > MAX_FLOW_INDEX_REQUEST_ITEMS {
+            self.valid = false;
+        }
+    }
+
+    fn add_bytes(&mut self, bytes: usize) {
+        let Some(total) = self.bytes.checked_add(bytes) else {
+            self.valid = false;
+            return;
+        };
+        self.bytes = total;
+        if self.bytes > MAX_FLOW_INDEX_REQUEST_BYTES {
+            self.valid = false;
+        }
+    }
+
+    fn add_item<'a>(&mut self, binaries: impl IntoIterator<Item = &'a [u8]>) {
+        self.add_items(1);
+        for binary in binaries {
+            self.add_bytes(binary.len());
+        }
+    }
+
+    fn within_limits(&self) -> bool {
+        self.valid
+    }
+}
+
+#[cfg(test)]
+fn flow_index_request_within_budget(parts: impl IntoIterator<Item = (usize, usize)>) -> bool {
+    let mut budget = FlowIndexRequestBudget::new();
+    for (items, bytes) in parts {
+        budget.add_items(items);
+        budget.add_bytes(bytes);
+    }
+    budget.within_limits()
+}
+
+macro_rules! enforce_flow_index_request_budget {
+    ($env:expr, $budget:expr) => {
+        if !$budget.within_limits() {
+            return Ok((crate::atoms::error(), FLOW_INDEX_REQUEST_TOO_LARGE).encode($env));
+        }
+    };
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Score(f64);
 
+impl Score {
+    fn canonical(self) -> f64 {
+        if self.0 == 0.0 {
+            0.0
+        } else {
+            self.0
+        }
+    }
+}
+
 impl PartialEq for Score {
     fn eq(&self, other: &Self) -> bool {
-        self.0.total_cmp(&other.0) == Ordering::Equal
+        self.canonical().total_cmp(&other.canonical()) == Ordering::Equal
     }
 }
 
@@ -23,7 +104,7 @@ impl PartialOrd for Score {
 
 impl Ord for Score {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
+        self.canonical().total_cmp(&other.canonical())
     }
 }
 
@@ -61,12 +142,59 @@ impl PartialOrd for DueCandidate {
 #[derive(Default)]
 struct FlowOrderedIndex {
     ordered: BTreeSet<OrderedEntry>,
-    lookup: HashMap<(Vec<u8>, Vec<u8>), f64>,
+    lookup: HashMap<Vec<u8>, HashMap<Vec<u8>, f64>>,
     counts: HashMap<Vec<u8>, i64>,
 }
 
 pub struct FlowOrderedIndexResource {
-    inner: Mutex<FlowOrderedIndex>,
+    inner: RwLock<FlowOrderedIndex>,
+}
+
+enum IndexLockError {
+    Busy,
+    Poisoned,
+}
+
+fn try_read_index(
+    resource: &FlowOrderedIndexResource,
+) -> Result<RwLockReadGuard<'_, FlowOrderedIndex>, IndexLockError> {
+    resource.inner.try_read().map_err(|error| match error {
+        TryLockError::WouldBlock => IndexLockError::Busy,
+        TryLockError::Poisoned(_) => IndexLockError::Poisoned,
+    })
+}
+
+fn try_write_index(
+    resource: &FlowOrderedIndexResource,
+) -> Result<RwLockWriteGuard<'_, FlowOrderedIndex>, IndexLockError> {
+    resource.inner.try_write().map_err(|error| match error {
+        TryLockError::WouldBlock => IndexLockError::Busy,
+        TryLockError::Poisoned(_) => IndexLockError::Poisoned,
+    })
+}
+
+fn read_index(
+    resource: &FlowOrderedIndexResource,
+) -> Result<RwLockReadGuard<'_, FlowOrderedIndex>, IndexLockError> {
+    resource.inner.read().map_err(|_| IndexLockError::Poisoned)
+}
+
+fn write_index(
+    resource: &FlowOrderedIndexResource,
+) -> Result<RwLockWriteGuard<'_, FlowOrderedIndex>, IndexLockError> {
+    resource.inner.write().map_err(|_| IndexLockError::Poisoned)
+}
+
+macro_rules! try_index_guard {
+    ($env:expr, $guard:expr) => {
+        match $guard {
+            Ok(index) => index,
+            Err(IndexLockError::Busy) => return Ok(crate::atoms::busy().encode($env)),
+            Err(IndexLockError::Poisoned) => {
+                return Ok((crate::atoms::error(), "flow index lock poisoned").encode($env));
+            }
+        }
+    };
 }
 
 #[derive(rustler::NifTuple)]
@@ -97,6 +225,59 @@ struct ClaimHistoryEntry<'a>(
     Term<'a>,
     bool,
 );
+
+fn add_claim_entry_budget(budget: &mut FlowIndexRequestBudget, entry: &ClaimEntry<'_>) {
+    let ClaimEntry(
+        id,
+        from_due_key,
+        _from_due_score,
+        to_due_key,
+        _to_due_score,
+        from_state_key,
+        _from_state_score,
+        to_state_key,
+        _to_state_score,
+        inflight_key,
+        worker_key,
+        _lease_score,
+    ) = entry;
+
+    budget.add_items(6);
+    for _operation in 0..6 {
+        budget.add_bytes(id.as_slice().len());
+    }
+    for key in [
+        from_due_key.as_slice(),
+        to_due_key.as_slice(),
+        from_state_key.as_slice(),
+        to_state_key.as_slice(),
+        inflight_key.as_slice(),
+        worker_key.as_slice(),
+    ] {
+        budget.add_bytes(key.len());
+    }
+}
+
+fn flow_record_plan_request_budget(
+    candidates: &[(Binary<'_>, f64)],
+    values: &[Option<Binary<'_>>],
+    fixed_binaries: &[&[u8]],
+) -> FlowIndexRequestBudget {
+    let mut budget = FlowIndexRequestBudget::new();
+    budget.add_items(candidates.len().max(values.len()));
+
+    for (id, _score) in candidates {
+        budget.add_bytes(id.as_slice().len());
+    }
+    for value in values.iter().flatten() {
+        budget.add_bytes(value.as_slice().len());
+    }
+    for value in fixed_binaries {
+        budget.add_bytes(value.len());
+    }
+
+    budget
+}
 
 const FLOW_RECORD_MAGIC: &[u8; 4] = b"FSF5";
 const FLOW_HISTORY_MAGIC: &[u8; 4] = b"FSH2";
@@ -134,6 +315,8 @@ const RECORD_FLAG_RUN_STATE: u64 = 1 << 21;
 const RECORD_FLAG_REWOUND_TO_EVENT_ID: u64 = 1 << 22;
 const RECORD_FLAG_SIDECAR: u64 = 1 << 23;
 const RECORD_FLAG_MAX_ACTIVE_MS: u64 = 1 << 24;
+const RECORD_KNOWN_FLAGS: u64 = (1 << 25) - 1;
+const MAX_EXACT_INTEGER: u64 = (1 << 53) - 1;
 
 const HISTORY_FLAG_PRIORITY: u64 = 1 << 0;
 const HISTORY_FLAG_ATTEMPTS: u64 = 1 << 1;
@@ -148,6 +331,7 @@ const HISTORY_FLAG_RESULT_REF: u64 = 1 << 9;
 const HISTORY_FLAG_ERROR_REF: u64 = 1 << 10;
 const HISTORY_FLAG_REWOUND_TO_EVENT_ID: u64 = 1 << 11;
 const HISTORY_FLAG_META: u64 = 1 << 12;
+const HISTORY_KNOWN_FLAGS: u64 = (1 << 13) - 1;
 
 struct FlowRecordParts<'a> {
     id: &'a [u8],
@@ -190,17 +374,23 @@ pub fn register_resource(env: Env) {
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_index_new() -> ResourceArc<FlowOrderedIndexResource> {
     ResourceArc::new(FlowOrderedIndexResource {
-        inner: Mutex::new(FlowOrderedIndex::default()),
+        inner: RwLock::new(FlowOrderedIndex::default()),
     })
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_put_entries<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     entries: Vec<(Binary<'a>, Binary<'a>, f64)>,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut budget = FlowIndexRequestBudget::new();
+    for (key, member, _score) in &entries {
+        budget.add_item([key.as_slice(), member.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let mut index = try_index_guard!(env, try_write_index(&resource));
 
     for (key_bin, member_bin, score) in entries {
         index.put(key_bin.as_slice(), member_bin.as_slice(), score, false);
@@ -209,13 +399,19 @@ pub fn flow_index_put_entries<'a>(
     Ok(crate::atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_put_new_entries<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     entries: Vec<(Binary<'a>, Binary<'a>, f64)>,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut budget = FlowIndexRequestBudget::new();
+    for (key, member, _score) in &entries {
+        budget.add_item([key.as_slice(), member.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let mut index = try_index_guard!(env, try_write_index(&resource));
 
     for (key_bin, member_bin, score) in entries {
         index.put(key_bin.as_slice(), member_bin.as_slice(), score, true);
@@ -224,13 +420,19 @@ pub fn flow_index_put_new_entries<'a>(
     Ok(crate::atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_move_entries<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     entries: Vec<(Binary<'a>, Binary<'a>, Binary<'a>, f64)>,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut budget = FlowIndexRequestBudget::new();
+    for (from_key, to_key, member, _score) in &entries {
+        budget.add_item([from_key.as_slice(), to_key.as_slice(), member.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let mut index = try_index_guard!(env, try_write_index(&resource));
 
     for (from_key_bin, to_key_bin, member_bin, score) in entries {
         index.move_member(
@@ -244,14 +446,21 @@ pub fn flow_index_move_entries<'a>(
     Ok(crate::atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_delete_members<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     key: Binary<'a>,
     members: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut budget = FlowIndexRequestBudget::new();
+    budget.add_bytes(key.as_slice().len());
+    for member in &members {
+        budget.add_item([member.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let mut index = try_index_guard!(env, try_write_index(&resource));
 
     for member in members {
         index.delete(key.as_slice(), member.as_slice());
@@ -260,13 +469,19 @@ pub fn flow_index_delete_members<'a>(
     Ok(crate::atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_delete_entries<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     entries: Vec<(Binary<'a>, Binary<'a>)>,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut budget = FlowIndexRequestBudget::new();
+    for (key, member) in &entries {
+        budget.add_item([key.as_slice(), member.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let mut index = try_index_guard!(env, try_write_index(&resource));
 
     for (key, member) in entries {
         index.delete(key.as_slice(), member.as_slice());
@@ -275,7 +490,7 @@ pub fn flow_index_delete_entries<'a>(
     Ok(crate::atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_apply_batch<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
@@ -285,7 +500,28 @@ pub fn flow_index_apply_batch<'a>(
     delete_entries: Vec<(Binary<'a>, Vec<Binary<'a>>)>,
     claim_entries: Vec<ClaimEntry<'a>>,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut budget = FlowIndexRequestBudget::new();
+    for (key, member, _score) in &put_entries {
+        budget.add_item([key.as_slice(), member.as_slice()]);
+    }
+    for (key, member, _score) in &put_new_entries {
+        budget.add_item([key.as_slice(), member.as_slice()]);
+    }
+    for (from_key, to_key, member, _score) in &move_entries {
+        budget.add_item([from_key.as_slice(), to_key.as_slice(), member.as_slice()]);
+    }
+    for (key, members) in &delete_entries {
+        budget.add_bytes(key.as_slice().len());
+        for member in members {
+            budget.add_item([member.as_slice()]);
+        }
+    }
+    for entry in &claim_entries {
+        add_claim_entry_budget(&mut budget, entry);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let mut index = try_index_guard!(env, write_index(&resource));
 
     for (key_bin, member_bin, score) in put_entries {
         index.put(key_bin.as_slice(), member_bin.as_slice(), score, false);
@@ -322,18 +558,15 @@ pub fn flow_index_score_of<'a>(
     key: Binary<'a>,
     member: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let index = resource.inner.lock().expect("flow index mutex poisoned");
+    let index = try_index_guard!(env, try_read_index(&resource));
 
-    match index
-        .lookup
-        .get(&(key.as_slice().to_vec(), member.as_slice().to_vec()))
-    {
+    match index.lookup_score(key.as_slice(), member.as_slice()) {
         Some(score) => Ok((crate::atoms::ok(), *score).encode(env)),
         None => Ok(crate::atoms::miss().encode(env)),
     }
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_range_slice<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
@@ -346,20 +579,52 @@ pub fn flow_index_range_slice<'a>(
     offset: usize,
     count: isize,
 ) -> NifResult<Term<'a>> {
-    let index = resource.inner.lock().expect("flow index mutex poisoned");
-    let rows = index.range_slice(
-        key.as_slice(),
-        Bound::from_min(min_kind, min_score),
-        Bound::from_max(max_kind, max_score),
-        reverse,
-        offset,
-        count,
-    );
+    let rows = {
+        let index = try_index_guard!(env, read_index(&resource));
+        index.range_slice(
+            key.as_slice(),
+            Bound::from_min(min_kind, min_score),
+            Bound::from_max(max_kind, max_score),
+            reverse,
+            offset,
+            count,
+        )
+    };
 
-    encode_member_scores(env, rows)
+    encode_owned_member_scores(env, rows)
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn flow_index_range_cursor_slice<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<FlowOrderedIndexResource>,
+    key: Binary<'a>,
+    min_kind: u8,
+    min_score: f64,
+    max_kind: u8,
+    max_score: f64,
+    cursor_score: f64,
+    cursor_member: Binary<'a>,
+    offset: usize,
+    count: isize,
+) -> NifResult<Term<'a>> {
+    let rows = {
+        let index = try_index_guard!(env, read_index(&resource));
+        index.range_reverse_before(
+            key.as_slice(),
+            Bound::from_min(min_kind, min_score),
+            Bound::from_max(max_kind, max_score),
+            cursor_score,
+            cursor_member.as_slice(),
+            offset,
+            count,
+        )
+    };
+
+    encode_owned_member_scores(env, rows)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_take_due<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
@@ -367,13 +632,17 @@ pub fn flow_index_take_due<'a>(
     max_score: f64,
     count: usize,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    if count > MAX_FLOW_INDEX_REQUEST_ITEMS {
+        return Ok((crate::atoms::error(), FLOW_INDEX_REQUEST_TOO_LARGE).encode(env));
+    }
+
+    let mut index = try_index_guard!(env, write_index(&resource));
     let rows = index.take_due(key.as_slice(), max_score, count);
 
     encode_owned_member_scores(env, rows)
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_claim_due_candidates<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
@@ -382,49 +651,79 @@ pub fn flow_index_claim_due_candidates<'a>(
     limit: usize,
     max_scan: usize,
 ) -> NifResult<Term<'a>> {
-    let index = resource.inner.lock().expect("flow index mutex poisoned");
-    let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
-    let rows = index.claim_due_candidates(&key_refs, max_score, limit, max_scan);
+    let mut budget = FlowIndexRequestBudget::new();
+    for key in &keys {
+        budget.add_item([key.as_slice()]);
+    }
+    if limit > MAX_FLOW_INDEX_REQUEST_ITEMS || max_scan > MAX_FLOW_INDEX_REQUEST_ITEMS {
+        budget.valid = false;
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let rows = {
+        let index = try_index_guard!(env, read_index(&resource));
+        let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+        index.claim_due_candidates(&key_refs, max_score, limit, max_scan)
+    };
 
     encode_owned_key_member_score_runs(env, ordered_due_candidate_runs(rows))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_due_keys_present<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     keys: Vec<Binary<'a>>,
     max_score: f64,
 ) -> NifResult<Term<'a>> {
-    let index = resource.inner.lock().expect("flow index mutex poisoned");
-    let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
-    let rows = index.due_keys_present(&key_refs, max_score);
+    let mut budget = FlowIndexRequestBudget::new();
+    for key in &keys {
+        budget.add_item([key.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let rows = {
+        let index = try_index_guard!(env, try_read_index(&resource));
+        let key_refs = keys.iter().map(|key| key.as_slice()).collect::<Vec<_>>();
+        index.due_keys_present(&key_refs, max_score)
+    };
 
     encode_owned_binaries(env, rows)
 }
 
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_index_count_all<'a>(
+    env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     key: Binary<'a>,
-) -> i64 {
-    let index = resource.inner.lock().expect("flow index mutex poisoned");
-    index
+) -> NifResult<Term<'a>> {
+    let index = try_index_guard!(env, try_read_index(&resource));
+    let count = index
         .counts
         .get(key.as_slice())
         .copied()
         .unwrap_or(0)
-        .max(0)
+        .max(0);
+
+    Ok(count.encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_count_many<'a>(
+    env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     keys: Vec<Binary<'a>>,
-) -> Vec<i64> {
-    let index = resource.inner.lock().expect("flow index mutex poisoned");
+) -> NifResult<Term<'a>> {
+    let mut budget = FlowIndexRequestBudget::new();
+    for key in &keys {
+        budget.add_item([key.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
 
-    keys.into_iter()
+    let index = try_index_guard!(env, try_read_index(&resource));
+
+    let counts = keys
+        .into_iter()
         .map(|key| {
             index
                 .counts
@@ -433,49 +732,74 @@ pub fn flow_index_count_many<'a>(
                 .unwrap_or(0)
                 .max(0)
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    Ok(counts.encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_count_keys<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
 ) -> NifResult<Term<'a>> {
-    let index = resource.inner.lock().expect("flow index mutex poisoned");
-    let keys = index
-        .counts
-        .iter()
-        .filter_map(|(key, count)| {
-            if *count > 0 {
-                Some(key.as_slice())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+    let keys = {
+        let index = try_index_guard!(env, read_index(&resource));
+        index
+            .counts
+            .iter()
+            .filter_map(|(key, count)| if *count > 0 { Some(key.clone()) } else { None })
+            .collect::<Vec<_>>()
+    };
 
-    encode_binaries(env, keys)
+    encode_owned_binaries(env, keys)
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_due_count_keys<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
 ) -> NifResult<Term<'a>> {
-    let index = resource.inner.lock().expect("flow index mutex poisoned");
-    let keys = index
-        .counts
-        .iter()
-        .filter_map(|(key, count)| {
-            if *count > 0 && due_key(key) {
-                Some(key.as_slice())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+    let keys = {
+        let index = try_index_guard!(env, read_index(&resource));
+        index
+            .counts
+            .iter()
+            .filter_map(|(key, count)| {
+                if *count > 0 && due_key(key) {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
 
-    encode_binaries(env, keys)
+    encode_owned_binaries(env, keys)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn flow_index_earliest_due_score<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<FlowOrderedIndexResource>,
+    prefixes: Vec<Binary<'a>>,
+    needles: Vec<Binary<'a>>,
+    suffixes: Vec<Binary<'a>>,
+) -> NifResult<Term<'a>> {
+    let mut budget = FlowIndexRequestBudget::new();
+    for value in prefixes.iter().chain(&needles).chain(&suffixes) {
+        budget.add_item([value.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let index = try_index_guard!(env, read_index(&resource));
+    let prefix_refs = prefixes.iter().map(Binary::as_slice).collect::<Vec<_>>();
+    let needle_refs = needles.iter().map(Binary::as_slice).collect::<Vec<_>>();
+    let suffix_refs = suffixes.iter().map(Binary::as_slice).collect::<Vec<_>>();
+
+    match index.earliest_due_score_matching(&prefix_refs, &needle_refs, &suffix_refs) {
+        Some(score) => Ok(score.encode(env)),
+        None => Ok(crate::atoms::nil().encode(env)),
+    }
 }
 
 #[rustler::nif(schedule = "Normal")]
@@ -485,7 +809,7 @@ pub fn flow_index_restore_count<'a>(
     key: Binary<'a>,
     count: i64,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut index = try_index_guard!(env, try_write_index(&resource));
     index.counts.insert(key.as_slice().to_vec(), count);
     Ok(crate::atoms::ok().encode(env))
 }
@@ -496,18 +820,24 @@ pub fn flow_index_delete_count<'a>(
     resource: ResourceArc<FlowOrderedIndexResource>,
     key: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut index = try_index_guard!(env, try_write_index(&resource));
     index.counts.remove(key.as_slice());
     Ok(crate::atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_apply_claim_entries<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     entries: Vec<ClaimEntry<'a>>,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut budget = FlowIndexRequestBudget::new();
+    for entry in &entries {
+        add_claim_entry_budget(&mut budget, entry);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let mut index = try_index_guard!(env, write_index(&resource));
     apply_claim_entries_locked(&mut index, entries);
 
     Ok(crate::atoms::ok().encode(env))
@@ -555,13 +885,19 @@ fn apply_claim_entries_locked<'a>(index: &mut FlowOrderedIndex, entries: Vec<Cla
     index.apply_count_deltas(count_deltas);
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_rollback_claim_entries<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
     entries: Vec<ClaimEntry<'a>>,
 ) -> NifResult<Term<'a>> {
-    let mut index = resource.inner.lock().expect("flow index mutex poisoned");
+    let mut budget = FlowIndexRequestBudget::new();
+    for entry in &entries {
+        add_claim_entry_budget(&mut budget, entry);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let mut index = try_index_guard!(env, write_index(&resource));
     let mut count_deltas: HashMap<Vec<u8>, i64> = HashMap::new();
 
     for ClaimEntry(
@@ -605,7 +941,7 @@ pub fn flow_index_rollback_claim_entries<'a>(
     Ok(crate::atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_record_plan_claims<'a>(
     env: Env<'a>,
     candidates: Vec<(Binary<'a>, f64)>,
@@ -624,6 +960,24 @@ pub fn flow_record_plan_claims<'a>(
     worker_key: Binary<'a>,
     state_key_prefix: Binary<'a>,
 ) -> NifResult<Term<'a>> {
+    let budget = flow_record_plan_request_budget(
+        &candidates,
+        &values,
+        &[
+            flow_type.as_slice(),
+            expected_state.as_slice(),
+            worker.as_slice(),
+            from_due_key.as_slice(),
+            to_due_key.as_slice(),
+            from_state_key.as_slice(),
+            to_state_key.as_slice(),
+            inflight_key.as_slice(),
+            worker_key.as_slice(),
+            state_key_prefix.as_slice(),
+        ],
+    );
+    enforce_flow_index_request_budget!(env, budget);
+
     if values.len() != candidates.len() || expected_state.as_slice() == RUNNING_STATE {
         return Ok(crate::atoms::fallback().encode(env));
     }
@@ -695,10 +1049,13 @@ pub fn flow_record_plan_claims<'a>(
             return Ok(crate::atoms::fallback().encode(env));
         }
 
-        let next_version = version.saturating_add(1);
-        let next_fencing_token = fencing_token.saturating_add(1);
+        let Some((next_version, next_fencing_token)) =
+            checked_claim_counters(version, fencing_token)
+        else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
         let lease_token = claim_lease_token(worker, now_ms, next_fencing_token);
-        let next_value = encode_claimed_record(
+        let Some(next_value) = encode_claimed_record(
             &record,
             worker,
             &lease_token,
@@ -706,7 +1063,9 @@ pub fn flow_record_plan_claims<'a>(
             now_ms,
             next_version,
             next_fencing_token,
-        );
+        ) else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
 
         let mut state_key = Vec::with_capacity(state_key_prefix.as_slice().len() + id.len());
         state_key.extend_from_slice(state_key_prefix.as_slice());
@@ -750,7 +1109,7 @@ pub fn flow_record_plan_claims<'a>(
     Ok((crate::atoms::ok(), plan_terms, stale_terms, accepted).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_record_plan_claims_with_history<'a>(
     env: Env<'a>,
     candidates: Vec<(Binary<'a>, f64)>,
@@ -770,6 +1129,25 @@ pub fn flow_record_plan_claims_with_history<'a>(
     state_key_prefix: Binary<'a>,
     history_key_prefix: Binary<'a>,
 ) -> NifResult<Term<'a>> {
+    let budget = flow_record_plan_request_budget(
+        &candidates,
+        &values,
+        &[
+            flow_type.as_slice(),
+            expected_state.as_slice(),
+            worker.as_slice(),
+            from_due_key.as_slice(),
+            to_due_key.as_slice(),
+            from_state_key.as_slice(),
+            to_state_key.as_slice(),
+            inflight_key.as_slice(),
+            worker_key.as_slice(),
+            state_key_prefix.as_slice(),
+            history_key_prefix.as_slice(),
+        ],
+    );
+    enforce_flow_index_request_budget!(env, budget);
+
     if values.len() != candidates.len() || expected_state.as_slice() == RUNNING_STATE {
         return Ok(crate::atoms::fallback().encode(env));
     }
@@ -841,10 +1219,13 @@ pub fn flow_record_plan_claims_with_history<'a>(
             return Ok(crate::atoms::fallback().encode(env));
         }
 
-        let next_version = version.saturating_add(1);
-        let next_fencing_token = fencing_token.saturating_add(1);
+        let Some((next_version, next_fencing_token)) =
+            checked_claim_counters(version, fencing_token)
+        else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
         let lease_token = claim_lease_token(worker, now_ms, next_fencing_token);
-        let next_value = encode_claimed_record(
+        let Some(next_value) = encode_claimed_record(
             &record,
             worker,
             &lease_token,
@@ -852,7 +1233,9 @@ pub fn flow_record_plan_claims_with_history<'a>(
             now_ms,
             next_version,
             next_fencing_token,
-        );
+        ) else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
 
         let mut state_key = Vec::with_capacity(state_key_prefix.as_slice().len() + id.len());
         state_key.extend_from_slice(state_key_prefix.as_slice());
@@ -872,7 +1255,7 @@ pub fn flow_record_plan_claims_with_history<'a>(
         history_entry_key.push(0);
         history_entry_key.extend_from_slice(&event_id);
 
-        let history_value = encode_flow_history_compact(
+        let Some(history_value) = encode_flow_history_compact(
             CLAIMED_EVENT,
             Some(next_version),
             Some(now_ms),
@@ -890,7 +1273,9 @@ pub fn flow_record_plan_claims_with_history<'a>(
             record.error_ref,
             record.rewound_to_event_id,
             EMPTY_HISTORY_META_ENCODED,
-        );
+        ) else {
+            return Ok(crate::atoms::fallback().encode(env));
+        };
 
         let next_value_term = binary_term(env, &next_value)?;
         let state_key_term = binary_term(env, &state_key)?;
@@ -947,7 +1332,7 @@ pub fn flow_record_plan_claims_with_history<'a>(
     Ok((crate::atoms::ok(), plan_terms, stale_terms, accepted).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_record_encode<'a>(
     env: Env<'a>,
     id: Option<Binary<'a>>,
@@ -981,7 +1366,7 @@ pub fn flow_record_encode<'a>(
     rewound_to_event_id: Option<Binary<'a>>,
     child_groups_encoded: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let out = encode_flow_record_compact(
+    let Some(out) = encode_flow_record_compact(
         optional_bin_slice(id.as_ref()),
         optional_bin_slice(flow_type.as_ref()),
         optional_bin_slice(state.as_ref()),
@@ -1012,7 +1397,9 @@ pub fn flow_record_encode<'a>(
         optional_bin_slice(run_state.as_ref()),
         optional_bin_slice(rewound_to_event_id.as_ref()),
         child_groups_encoded.as_slice(),
-    );
+    ) else {
+        return Err(rustler::Error::BadArg);
+    };
 
     binary_term(env, &out)
 }
@@ -1049,7 +1436,17 @@ fn encode_flow_record_compact(
     run_state: Option<&[u8]>,
     rewound_to_event_id: Option<&[u8]>,
     child_groups_encoded: &[u8],
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
+    if !matches!(id, Some(value) if !value.is_empty())
+        || !matches!(flow_type, Some(value) if !value.is_empty())
+        || !matches!(state, Some(value) if !value.is_empty())
+        || !matches!(version, Some(value) if value <= MAX_EXACT_INTEGER)
+        || !matches!(created_at_ms, Some(value) if value <= MAX_EXACT_INTEGER)
+        || !matches!(updated_at_ms, Some(value) if value <= MAX_EXACT_INTEGER)
+    {
+        return None;
+    }
+
     // Required fields stay inline. Nil/default optional fields are skipped by
     // flags so common state records avoid repeated policy/lease metadata.
     let flags = encode_record_flags(
@@ -1103,43 +1500,43 @@ fn encode_flow_record_compact(
 
     // Wire order is schema-owned; update Elixir codec/tests with every change.
     out.extend_from_slice(FLOW_RECORD_MAGIC);
-    encode_int(&mut out, Some(flags));
+    encode_int(&mut out, Some(flags))?;
     encode_bin(&mut out, id);
     encode_bin(&mut out, flow_type);
     encode_bin(&mut out, state);
-    encode_int(&mut out, version);
-    encode_int(&mut out, created_at_ms);
-    encode_int(&mut out, updated_at_ms);
-    encode_flagged_int(&mut out, flags, RECORD_FLAG_ATTEMPTS, attempts);
-    encode_flagged_int(&mut out, flags, RECORD_FLAG_FENCING_TOKEN, fencing_token);
-    encode_flagged_int(&mut out, flags, RECORD_FLAG_NEXT_RUN_AT_MS, next_run_at_ms);
-    encode_flagged_int(&mut out, flags, RECORD_FLAG_PRIORITY, priority);
-    encode_flagged_int(&mut out, flags, RECORD_FLAG_TTL_MS, ttl_ms);
+    encode_int(&mut out, version)?;
+    encode_int(&mut out, created_at_ms)?;
+    encode_int(&mut out, updated_at_ms)?;
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_ATTEMPTS, attempts)?;
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_FENCING_TOKEN, fencing_token)?;
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_NEXT_RUN_AT_MS, next_run_at_ms)?;
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_PRIORITY, priority)?;
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_TTL_MS, ttl_ms)?;
     encode_flagged_int(
         &mut out,
         flags,
         RECORD_FLAG_HISTORY_HOT_MAX_EVENTS,
         history_hot_max_events,
-    );
+    )?;
     encode_flagged_int(
         &mut out,
         flags,
         RECORD_FLAG_HISTORY_MAX_EVENTS,
         history_max_events,
-    );
+    )?;
     encode_flagged_int(
         &mut out,
         flags,
         RECORD_FLAG_RETENTION_TTL_MS,
         retention_ttl_ms,
-    );
+    )?;
     encode_flagged_int(
         &mut out,
         flags,
         RECORD_FLAG_TERMINAL_RETENTION_UNTIL_MS,
         terminal_retention_until_ms,
-    );
-    encode_flagged_int(&mut out, flags, RECORD_FLAG_MAX_ACTIVE_MS, max_active_ms);
+    )?;
+    encode_flagged_int(&mut out, flags, RECORD_FLAG_MAX_ACTIVE_MS, max_active_ms)?;
     encode_flagged_bin(&mut out, flags, RECORD_FLAG_PARTITION_KEY, partition_key);
     encode_flagged_bin(&mut out, flags, RECORD_FLAG_PAYLOAD_REF, payload_ref);
     encode_flagged_bin(&mut out, flags, RECORD_FLAG_PARENT_FLOW_ID, parent_flow_id);
@@ -1160,7 +1557,7 @@ fn encode_flow_record_compact(
         flags,
         RECORD_FLAG_LEASE_DEADLINE_MS,
         lease_deadline_ms,
-    );
+    )?;
     encode_flagged_bin(&mut out, flags, RECORD_FLAG_RUN_STATE, run_state);
     encode_flagged_bin(
         &mut out,
@@ -1173,10 +1570,10 @@ fn encode_flow_record_compact(
         out.extend_from_slice(child_groups_encoded);
     }
 
-    out
+    Some(out)
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
     let Some(record) = decode_flow_record(value.as_slice()) else {
         return Ok(crate::atoms::error().encode(env));
@@ -1218,7 +1615,7 @@ pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term
     Ok((crate::atoms::ok(), fields).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_record_decode_meta<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
     let Some(record) = decode_flow_record(value.as_slice()) else {
         return Ok(crate::atoms::error().encode(env));
@@ -1250,7 +1647,7 @@ pub fn flow_record_decode_meta<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult
     Ok((crate::atoms::ok(), fields).encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_records_terminal_after_noop(values: Vec<Binary<'_>>) -> Vec<bool> {
     values
         .iter()
@@ -1265,7 +1662,7 @@ pub fn flow_records_terminal_after_noop(values: Vec<Binary<'_>>) -> Vec<bool> {
         .collect()
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_history_encode<'a>(
     env: Env<'a>,
     event: Binary<'a>,
@@ -1293,7 +1690,7 @@ pub fn flow_history_encode<'a>(
 ) -> NifResult<Term<'a>> {
     // History is compact by design: workflow identity fields passed above are
     // omitted and reconstructed from record context on user-facing decode.
-    let out = encode_flow_history_compact(
+    let Some(out) = encode_flow_history_compact(
         event.as_slice(),
         version,
         now_ms,
@@ -1311,7 +1708,9 @@ pub fn flow_history_encode<'a>(
         optional_bin_slice(error_ref.as_ref()),
         optional_bin_slice(rewound_to_event_id.as_ref()),
         meta_encoded.as_slice(),
-    );
+    ) else {
+        return Err(rustler::Error::BadArg);
+    };
 
     binary_term(env, &out)
 }
@@ -1335,7 +1734,7 @@ fn encode_flow_history_compact(
     error_ref: Option<&[u8]>,
     rewound_to_event_id: Option<&[u8]>,
     meta_encoded: &[u8],
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let flags = encode_history_flags(
         priority,
         attempts,
@@ -1368,23 +1767,23 @@ fn encode_flow_history_compact(
 
     // Keep this field order identical to Flow.encode_history_parts_elixir/23.
     out.extend_from_slice(FLOW_HISTORY_MAGIC);
-    encode_int(&mut out, Some(flags));
+    encode_int(&mut out, Some(flags))?;
     encode_bin(&mut out, Some(event));
-    encode_int(&mut out, version);
-    encode_int(&mut out, now_ms);
+    encode_int(&mut out, version)?;
+    encode_int(&mut out, now_ms)?;
     encode_bin(&mut out, state);
-    encode_flagged_int(&mut out, flags, HISTORY_FLAG_PRIORITY, priority);
-    encode_flagged_int(&mut out, flags, HISTORY_FLAG_ATTEMPTS, attempts);
-    encode_flagged_int(&mut out, flags, HISTORY_FLAG_FENCING_TOKEN, fencing_token);
-    encode_flagged_int(&mut out, flags, HISTORY_FLAG_CREATED_AT_MS, created_at_ms);
-    encode_flagged_int(&mut out, flags, HISTORY_FLAG_UPDATED_AT_MS, updated_at_ms);
-    encode_flagged_int(&mut out, flags, HISTORY_FLAG_NEXT_RUN_AT_MS, next_run_at_ms);
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_PRIORITY, priority)?;
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_ATTEMPTS, attempts)?;
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_FENCING_TOKEN, fencing_token)?;
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_CREATED_AT_MS, created_at_ms)?;
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_UPDATED_AT_MS, updated_at_ms)?;
+    encode_flagged_int(&mut out, flags, HISTORY_FLAG_NEXT_RUN_AT_MS, next_run_at_ms)?;
     encode_flagged_int(
         &mut out,
         flags,
         HISTORY_FLAG_LEASE_DEADLINE_MS,
         lease_deadline_ms,
-    );
+    )?;
     encode_flagged_bin(&mut out, flags, HISTORY_FLAG_LEASE_OWNER, lease_owner);
     encode_flagged_bin(&mut out, flags, HISTORY_FLAG_PAYLOAD_REF, payload_ref);
     encode_flagged_bin(&mut out, flags, HISTORY_FLAG_RESULT_REF, result_ref);
@@ -1400,10 +1799,10 @@ fn encode_flow_history_compact(
         out.extend_from_slice(meta_encoded);
     }
 
-    out
+    Some(out)
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
     let input = value.as_slice();
     if !input.starts_with(FLOW_HISTORY_MAGIC) {
@@ -1417,6 +1816,9 @@ pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
     let Some(flags) = flags else {
         return Ok(crate::atoms::error().encode(env));
     };
+    if flags & !HISTORY_KNOWN_FLAGS != 0 {
+        return Ok(crate::atoms::error().encode(env));
+    }
     let Some((event, rest)) = decode_required_bin(rest) else {
         return Ok(crate::atoms::error().encode(env));
     };
@@ -1496,8 +1898,10 @@ pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
         (0, rest)
     };
 
-    let mut fields =
-        Vec::with_capacity(42usize.saturating_add(usize::try_from(meta_count).unwrap_or(0) * 2));
+    let Some(field_capacity) = checked_history_field_capacity(meta_count, rest.len()) else {
+        return Ok(crate::atoms::error().encode(env));
+    };
+    let mut fields = Vec::with_capacity(field_capacity);
     push_history_binary_field(env, &mut fields, b"event", event)?;
     push_history_int_field(env, &mut fields, b"version", version, false)?;
     push_history_int_field(env, &mut fields, b"at", at, false)?;
@@ -1564,11 +1968,47 @@ pub fn flow_history_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
     Ok((crate::atoms::ok(), fields).encode(env))
 }
 
-impl FlowOrderedIndex {
-    fn put(&mut self, key: &[u8], member: &[u8], score: f64, new_only: bool) {
-        let lookup_key = (key.to_vec(), member.to_vec());
+fn checked_history_field_capacity(meta_count: u64, remaining_bytes: usize) -> Option<usize> {
+    let meta_count = usize::try_from(meta_count).ok()?;
+    // Each required key/value pair consumes at least two one-byte length
+    // prefixes, even when both binaries are empty.
+    if meta_count > remaining_bytes / 2 {
+        return None;
+    }
+    42usize.checked_add(meta_count.checked_mul(2)?)
+}
 
-        if let Some(old_score) = self.lookup.get(&lookup_key).copied() {
+impl FlowOrderedIndex {
+    fn lookup_score(&self, key: &[u8], member: &[u8]) -> Option<&f64> {
+        self.lookup.get(key)?.get(member)
+    }
+
+    fn insert_lookup(&mut self, key: &[u8], member: &[u8], score: f64) -> Option<f64> {
+        if let Some(members) = self.lookup.get_mut(key) {
+            return members.insert(member.to_vec(), score);
+        }
+
+        self.lookup
+            .insert(key.to_vec(), HashMap::from([(member.to_vec(), score)]));
+        None
+    }
+
+    fn remove_lookup(&mut self, key: &[u8], member: &[u8]) -> Option<f64> {
+        let (old_score, remove_key) = {
+            let members = self.lookup.get_mut(key)?;
+            let old_score = members.remove(member)?;
+            (old_score, members.is_empty())
+        };
+
+        if remove_key {
+            self.lookup.remove(key);
+        }
+
+        Some(old_score)
+    }
+
+    fn put(&mut self, key: &[u8], member: &[u8], score: f64, new_only: bool) {
+        if let Some(old_score) = self.lookup_score(key, member).copied() {
             if new_only {
                 return;
             }
@@ -1587,12 +2027,11 @@ impl FlowOrderedIndex {
             score: Score(score),
             member: member.to_vec(),
         });
-        self.lookup.insert(lookup_key, score);
+        self.insert_lookup(key, member, score);
     }
 
     fn delete(&mut self, key: &[u8], member: &[u8]) -> Option<f64> {
-        let lookup_key = (key.to_vec(), member.to_vec());
-        let old_score = self.lookup.remove(&lookup_key)?;
+        let old_score = self.remove_lookup(key, member)?;
 
         self.ordered.remove(&OrderedEntry {
             key: key.to_vec(),
@@ -1604,9 +2043,7 @@ impl FlowOrderedIndex {
     }
 
     fn put_new_without_count(&mut self, key: &[u8], member: &[u8], score: f64) -> bool {
-        let lookup_key = (key.to_vec(), member.to_vec());
-
-        if self.lookup.contains_key(&lookup_key) {
+        if self.lookup_score(key, member).is_some() {
             return false;
         }
 
@@ -1615,13 +2052,12 @@ impl FlowOrderedIndex {
             score: Score(score),
             member: member.to_vec(),
         });
-        self.lookup.insert(lookup_key, score);
+        self.insert_lookup(key, member, score);
         true
     }
 
     fn delete_without_count(&mut self, key: &[u8], member: &[u8]) -> bool {
-        let lookup_key = (key.to_vec(), member.to_vec());
-        let Some(old_score) = self.lookup.remove(&lookup_key) else {
+        let Some(old_score) = self.remove_lookup(key, member) else {
             return false;
         };
 
@@ -1635,11 +2071,7 @@ impl FlowOrderedIndex {
 
     fn move_member(&mut self, from_key: &[u8], to_key: &[u8], member: &[u8], score: f64) {
         if from_key == to_key {
-            if let Some(old_score) = self
-                .lookup
-                .get(&(from_key.to_vec(), member.to_vec()))
-                .copied()
-            {
+            if let Some(old_score) = self.lookup_score(from_key, member).copied() {
                 self.ordered.remove(&OrderedEntry {
                     key: from_key.to_vec(),
                     score: Score(old_score),
@@ -1659,8 +2091,7 @@ impl FlowOrderedIndex {
             score: Score(score),
             member: member.to_vec(),
         });
-        self.lookup
-            .insert((to_key.to_vec(), member.to_vec()), score);
+        self.insert_lookup(to_key, member, score);
 
         self.increment_count(to_key, 1);
     }
@@ -1670,7 +2101,12 @@ impl FlowOrderedIndex {
             return;
         }
 
-        let next = self.counts.get(key).copied().unwrap_or(0) + delta;
+        let next = self
+            .counts
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(delta);
         self.counts.insert(key.to_vec(), next);
     }
 
@@ -1680,7 +2116,12 @@ impl FlowOrderedIndex {
                 continue;
             }
 
-            let next = self.counts.get(key.as_slice()).copied().unwrap_or(0) + delta;
+            let next = self
+                .counts
+                .get(key.as_slice())
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(delta);
             self.counts.insert(key, next);
         }
     }
@@ -1693,7 +2134,7 @@ impl FlowOrderedIndex {
         reverse: bool,
         offset: usize,
         count: isize,
-    ) -> Vec<(&[u8], f64)> {
+    ) -> Vec<(Vec<u8>, f64)> {
         if !min.can_match_min() || !max.can_match_max() || count == 0 {
             return Vec::new();
         }
@@ -1707,22 +2148,12 @@ impl FlowOrderedIndex {
             count as usize
         };
 
+        let Some((lower, upper)) = exact_key_range_bounds(key, min, max) else {
+            return Vec::new();
+        };
+
         if reverse {
-            let upper = OrderedEntry {
-                key: upper_key_for_exact_key(key),
-                score: Score(f64::NEG_INFINITY),
-                member: Vec::new(),
-            };
-
-            for entry in self.ordered.range((Unbounded, Excluded(upper))).rev() {
-                if entry.key.as_slice() != key {
-                    break;
-                }
-
-                if !max.matches_upper(entry.score.0) || !min.matches_lower(entry.score.0) {
-                    continue;
-                }
-
+            for entry in self.ordered.range((Included(lower), Excluded(upper))).rev() {
                 if skipped < offset {
                     skipped += 1;
                     continue;
@@ -1732,24 +2163,10 @@ impl FlowOrderedIndex {
                     break;
                 }
 
-                rows.push((entry.member.as_slice(), entry.score.0));
+                rows.push((entry.member.clone(), entry.score.0));
             }
         } else {
-            let lower = OrderedEntry {
-                key: key.to_vec(),
-                score: Score(f64::NEG_INFINITY),
-                member: Vec::new(),
-            };
-
-            for entry in self.ordered.range(lower..) {
-                if entry.key.as_slice() != key {
-                    break;
-                }
-
-                if !min.matches_lower(entry.score.0) || !max.matches_upper(entry.score.0) {
-                    continue;
-                }
-
+            for entry in self.ordered.range((Included(lower), Excluded(upper))) {
                 if skipped < offset {
                     skipped += 1;
                     continue;
@@ -1759,8 +2176,60 @@ impl FlowOrderedIndex {
                     break;
                 }
 
-                rows.push((entry.member.as_slice(), entry.score.0));
+                rows.push((entry.member.clone(), entry.score.0));
             }
+        }
+
+        rows
+    }
+
+    fn range_reverse_before(
+        &self,
+        key: &[u8],
+        min: Bound,
+        max: Bound,
+        cursor_score: f64,
+        cursor_member: &[u8],
+        offset: usize,
+        count: isize,
+    ) -> Vec<(Vec<u8>, f64)> {
+        if !min.can_match_min() || !max.can_match_max() || count == 0 {
+            return Vec::new();
+        }
+
+        let cursor_upper = OrderedEntry {
+            key: key.to_vec(),
+            score: Score(cursor_score),
+            member: cursor_member.to_vec(),
+        };
+        let Some((lower, score_upper)) = exact_key_range_bounds(key, min, max) else {
+            return Vec::new();
+        };
+        let upper = std::cmp::min(cursor_upper, score_upper);
+
+        if lower >= upper {
+            return Vec::new();
+        }
+
+        let mut rows = Vec::new();
+        let mut skipped = 0usize;
+        let limit = if count < 0 {
+            usize::MAX
+        } else {
+            count as usize
+        };
+
+        for entry in self.ordered.range((Included(lower), Excluded(upper))).rev() {
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+
+            if rows.len() >= limit {
+                break;
+            }
+
+            rows.push((entry.member.clone(), entry.score.0));
         }
 
         rows
@@ -1771,7 +2240,7 @@ impl FlowOrderedIndex {
             return Vec::new();
         }
 
-        let mut rows = Vec::with_capacity(count);
+        let mut rows = Vec::with_capacity(count.min(self.ordered.len()));
         let lower = OrderedEntry {
             key: key.to_vec(),
             score: Score(f64::NEG_INFINITY),
@@ -1816,9 +2285,10 @@ impl FlowOrderedIndex {
             return self.claim_due_candidates_single_key(keys[0], max_score, limit, max_scan);
         }
 
-        let mut rows = Vec::with_capacity(limit.min(max_scan));
+        let result_capacity = limit.min(max_scan).min(self.ordered.len());
+        let mut rows = Vec::with_capacity(result_capacity);
         let mut scanned = 0usize;
-        let mut heap = BinaryHeap::with_capacity(keys.len());
+        let mut heap = BinaryHeap::with_capacity(keys.len().min(self.ordered.len()));
 
         for (key_index, key) in keys.iter().enumerate() {
             if let Some(entry) = self.first_due_entry_for_key(key, max_score) {
@@ -1858,7 +2328,7 @@ impl FlowOrderedIndex {
         limit: usize,
         max_scan: usize,
     ) -> Vec<(Vec<u8>, Vec<u8>, f64)> {
-        let mut rows = Vec::with_capacity(limit.min(max_scan));
+        let mut rows = Vec::with_capacity(limit.min(max_scan).min(self.ordered.len()));
         let mut scanned = 0usize;
         let lower = OrderedEntry {
             key: key.to_vec(),
@@ -1956,6 +2426,58 @@ impl FlowOrderedIndex {
 
         rows
     }
+
+    fn earliest_due_score_matching(
+        &self,
+        prefixes: &[&[u8]],
+        needles: &[&[u8]],
+        suffixes: &[&[u8]],
+    ) -> Option<f64> {
+        let mut earliest = None;
+
+        for (key, count) in &self.counts {
+            if *count <= 0
+                || !due_key(key)
+                || !matches_any(prefixes, |prefix| key.starts_with(prefix))
+                || !matches_any(needles, |needle| contains_bytes(key, needle))
+                || !matches_any(suffixes, |suffix| key.ends_with(suffix))
+            {
+                continue;
+            }
+
+            let Some(score) = self.first_score_for_key(key) else {
+                continue;
+            };
+
+            if earliest.map_or(true, |current| Score(score) < Score(current)) {
+                earliest = Some(score);
+            }
+        }
+
+        earliest
+    }
+
+    fn first_score_for_key(&self, key: &[u8]) -> Option<f64> {
+        let lower = OrderedEntry {
+            key: key.to_vec(),
+            score: Score(f64::NEG_INFINITY),
+            member: Vec::new(),
+        };
+
+        self.ordered
+            .range(lower..)
+            .next()
+            .filter(|entry| entry.key.as_slice() == key)
+            .map(|entry| entry.score.0)
+    }
+}
+
+fn matches_any(patterns: &[&[u8]], mut predicate: impl FnMut(&[u8]) -> bool) -> bool {
+    patterns.is_empty() || patterns.iter().any(|pattern| predicate(pattern))
+}
+
+fn contains_bytes(value: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || value.windows(needle.len()).any(|window| window == needle)
 }
 
 enum DueEntryMatch {
@@ -2008,24 +2530,6 @@ impl Bound {
     fn can_match_max(self) -> bool {
         !matches!(self, Self::NegInf | Self::Impossible)
     }
-
-    fn matches_lower(self, score: f64) -> bool {
-        match self {
-            Self::NegInf => true,
-            Self::Inclusive(bound) => score >= bound,
-            Self::Exclusive(bound) => score > bound,
-            Self::PosInf | Self::Impossible => false,
-        }
-    }
-
-    fn matches_upper(self, score: f64) -> bool {
-        match self {
-            Self::PosInf => true,
-            Self::Inclusive(bound) => score <= bound,
-            Self::Exclusive(bound) => score < bound,
-            Self::NegInf | Self::Impossible => false,
-        }
-    }
 }
 
 fn due_key(key: &[u8]) -> bool {
@@ -2040,7 +2544,7 @@ fn add_count_delta(count_deltas: &mut HashMap<Vec<u8>, i64>, key: &[u8], delta: 
     }
 
     if let Some(current) = count_deltas.get_mut(key) {
-        *current += delta;
+        *current = current.saturating_add(delta);
     } else {
         count_deltas.insert(key.to_vec(), delta);
     }
@@ -2051,18 +2555,21 @@ fn decode_flow_record(value: &[u8]) -> Option<FlowRecordParts<'_>> {
 
     let (flags, rest) = decode_int(input)?;
     let flags = flags?;
+    if flags & !RECORD_KNOWN_FLAGS != 0 {
+        return None;
+    }
     input = rest;
-    let (id, rest) = decode_required_bin(input)?;
+    let (id, rest) = decode_required_record_bin(input)?;
     input = rest;
-    let (flow_type, rest) = decode_required_bin(input)?;
+    let (flow_type, rest) = decode_required_record_bin(input)?;
     input = rest;
-    let (state, rest) = decode_required_bin(input)?;
+    let (state, rest) = decode_required_record_bin(input)?;
     input = rest;
-    let (version, rest) = decode_int(input)?;
+    let (version, rest) = decode_required_record_int(input)?;
     input = rest;
-    let (created_at_ms, rest) = decode_int(input)?;
+    let (created_at_ms, rest) = decode_required_record_int(input)?;
     input = rest;
-    let (updated_at_ms, rest) = decode_int(input)?;
+    let (updated_at_ms, rest) = decode_required_record_int(input)?;
     input = rest;
     let (attempts, rest) = decode_flagged_int(input, flags, RECORD_FLAG_ATTEMPTS, Some(0))?;
     input = rest;
@@ -2166,17 +2673,99 @@ fn upper_key_for_exact_key(key: &[u8]) -> Vec<u8> {
     upper
 }
 
+fn lower_entry_for_exact_key(key: &[u8], min: Bound) -> Option<OrderedEntry> {
+    let score = match min {
+        Bound::NegInf => f64::NEG_INFINITY,
+        Bound::Inclusive(score) => score,
+        Bound::Exclusive(score) => next_score(score)?,
+        Bound::PosInf | Bound::Impossible => return None,
+    };
+
+    Some(OrderedEntry {
+        key: key.to_vec(),
+        score: Score(score),
+        member: Vec::new(),
+    })
+}
+
+fn upper_entry_for_exact_key(key: &[u8], max: Bound) -> Option<OrderedEntry> {
+    let score = match max {
+        Bound::PosInf => {
+            return Some(OrderedEntry {
+                key: upper_key_for_exact_key(key),
+                score: Score(f64::NEG_INFINITY),
+                member: Vec::new(),
+            });
+        }
+        Bound::Exclusive(score) => score,
+        Bound::Inclusive(score) => match next_score(score) {
+            Some(next) => next,
+            None if score == f64::INFINITY => {
+                return Some(OrderedEntry {
+                    key: upper_key_for_exact_key(key),
+                    score: Score(f64::NEG_INFINITY),
+                    member: Vec::new(),
+                });
+            }
+            None => return None,
+        },
+        Bound::NegInf | Bound::Impossible => return None,
+    };
+
+    Some(OrderedEntry {
+        key: key.to_vec(),
+        score: Score(score),
+        member: Vec::new(),
+    })
+}
+
+fn exact_key_range_bounds(
+    key: &[u8],
+    min: Bound,
+    max: Bound,
+) -> Option<(OrderedEntry, OrderedEntry)> {
+    let lower = lower_entry_for_exact_key(key, min)?;
+    let upper = upper_entry_for_exact_key(key, max)?;
+    (lower < upper).then_some((lower, upper))
+}
+
+fn next_score(score: f64) -> Option<f64> {
+    if score.is_nan() || score == f64::INFINITY {
+        return None;
+    }
+
+    if score == 0.0 {
+        return Some(f64::from_bits(1));
+    }
+
+    let bits = score.to_bits();
+    Some(f64::from_bits(if score > 0.0 {
+        bits + 1
+    } else {
+        bits - 1
+    }))
+}
+
 fn decode_varint(input: &[u8]) -> Option<(u64, &[u8])> {
     let mut result = 0u64;
     let mut shift = 0u32;
     let mut rest = input;
 
-    for _ in 0..10 {
+    for index in 0..10 {
         let (&byte, next) = rest.split_first()?;
         rest = next;
+
+        // A u64 uses at most one payload bit in byte ten. The final zero byte
+        // of a multi-byte value is also noncanonical (for example 80 00).
+        if index == 9 && byte & 0xfe != 0 {
+            return None;
+        }
         result |= u64::from(byte & 0x7f) << shift;
 
         if byte & 0x80 == 0 {
+            if index > 0 && byte == 0 {
+                return None;
+            }
             return Some((result, rest));
         }
 
@@ -2198,6 +2787,17 @@ fn decode_int(input: &[u8]) -> Option<(Option<u64>, &[u8])> {
 fn decode_required_bin(input: &[u8]) -> Option<(&[u8], &[u8])> {
     let (value, rest) = decode_bin(input)?;
     Some((value?, rest))
+}
+
+fn decode_required_record_bin(input: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (value, rest) = decode_required_bin(input)?;
+    (!value.is_empty()).then_some((value, rest))
+}
+
+fn decode_required_record_int(input: &[u8]) -> Option<(Option<u64>, &[u8])> {
+    let (value, rest) = decode_int(input)?;
+    let value = value?;
+    (value <= MAX_EXACT_INTEGER).then_some((Some(value), rest))
 }
 
 fn decode_bin(input: &[u8]) -> Option<(Option<&[u8]>, &[u8])> {
@@ -2298,7 +2898,7 @@ fn encode_claimed_record(
     now_ms: u64,
     next_version: u64,
     next_fencing_token: u64,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     encode_flow_record_compact(
         Some(record.id),
         Some(record.flow_type),
@@ -2342,11 +2942,12 @@ fn encode_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
-fn encode_int(out: &mut Vec<u8>, value: Option<u64>) {
+fn encode_int(out: &mut Vec<u8>, value: Option<u64>) -> Option<()> {
     match value {
-        Some(value) => encode_varint(out, value.saturating_add(1)),
+        Some(value) => encode_varint(out, value.checked_add(1)?),
         None => out.push(0),
     }
+    Some(())
 }
 
 fn encode_bin(out: &mut Vec<u8>, value: Option<&[u8]>) {
@@ -2359,10 +2960,11 @@ fn encode_bin(out: &mut Vec<u8>, value: Option<&[u8]>) {
     }
 }
 
-fn encode_flagged_int(out: &mut Vec<u8>, flags: u64, flag: u64, value: Option<u64>) {
+fn encode_flagged_int(out: &mut Vec<u8>, flags: u64, flag: u64, value: Option<u64>) -> Option<()> {
     if flags & flag != 0 {
-        encode_int(out, value);
+        encode_int(out, value)?;
     }
+    Some(())
 }
 
 fn encode_flagged_bin(out: &mut Vec<u8>, flags: u64, flag: u64, value: Option<&[u8]>) {
@@ -2576,6 +3178,13 @@ fn claim_lease_token(worker: &[u8], now_ms: u64, fencing_token: u64) -> Vec<u8> 
     token
 }
 
+fn checked_claim_counters(version: u64, fencing_token: u64) -> Option<(u64, u64)> {
+    let next_version = version.checked_add(1)?;
+    let next_fencing_token = fencing_token.checked_add(1)?;
+    (next_version < u64::MAX && next_fencing_token < u64::MAX)
+        .then_some((next_version, next_fencing_token))
+}
+
 fn flow_claim_run_state<'a>(record: &'a FlowRecordParts<'a>) -> &'a [u8] {
     if record.state == RUNNING_STATE {
         DEFAULT_RUNNING_RUN_STATE
@@ -2595,16 +3204,6 @@ fn flow_record_fast_claim_shape(record: &FlowRecordParts<'_>) -> bool {
 
 fn blank(value: Option<&[u8]>) -> bool {
     value.map_or(true, <[u8]>::is_empty)
-}
-
-fn encode_member_scores<'a>(env: Env<'a>, rows: Vec<(&[u8], f64)>) -> NifResult<Term<'a>> {
-    let mut terms = Vec::with_capacity(rows.len());
-
-    for (member, score) in rows {
-        terms.push((binary_term(env, member)?, score).encode(env));
-    }
-
-    Ok(terms.encode(env))
 }
 
 fn encode_owned_member_scores<'a>(env: Env<'a>, rows: Vec<(Vec<u8>, f64)>) -> NifResult<Term<'a>> {
@@ -2648,16 +3247,6 @@ fn encode_owned_key_member_score_runs<'a>(
         }
 
         terms.push((binary_term(env, &key)?, member_terms).encode(env));
-    }
-
-    Ok(terms.encode(env))
-}
-
-fn encode_binaries<'a>(env: Env<'a>, values: Vec<&[u8]>) -> NifResult<Term<'a>> {
-    let mut terms = Vec::with_capacity(values.len());
-
-    for value in values {
-        terms.push(binary_term(env, value)?);
     }
 
     Ok(terms.encode(env))
@@ -2732,6 +3321,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn score_ranges_treat_signed_zero_as_one_numeric_value() {
+        let mut index = FlowOrderedIndex::default();
+        index.put(b"scores", b"negative-zero", -0.0, false);
+        index.put(b"scores", b"positive-zero", 0.0, false);
+
+        let inclusive = index.range_slice(
+            b"scores",
+            Bound::Inclusive(0.0),
+            Bound::Inclusive(0.0),
+            false,
+            0,
+            -1,
+        );
+        assert_eq!(inclusive.len(), 2);
+
+        let exclusive = index.range_slice(
+            b"scores",
+            Bound::Exclusive(0.0),
+            Bound::Inclusive(f64::INFINITY),
+            false,
+            0,
+            -1,
+        );
+        assert!(exclusive.is_empty());
+    }
+
+    #[test]
+    fn lookup_owns_each_index_key_once_across_members() {
+        let mut index = FlowOrderedIndex::default();
+        index.put(b"shared-index", b"member-a", 1.0, false);
+        index.put(b"shared-index", b"member-b", 2.0, false);
+
+        assert_eq!(index.lookup.len(), 1);
+    }
+
+    #[test]
     fn claim_due_candidates_merge_by_due_time_across_keys() {
         let mut index = FlowOrderedIndex::default();
         index.put(b"due:queued", b"queued-job", 100.0, false);
@@ -2748,6 +3373,53 @@ mod tests {
         assert_eq!(rows[0].0, b"due:retry");
         assert_eq!(rows[0].1, b"retry-job");
         assert_eq!(rows[0].2, 10.0);
+    }
+
+    #[test]
+    fn take_due_does_not_preallocate_the_untrusted_result_limit() {
+        let mut index = FlowOrderedIndex::default();
+        index.put(b"due:queued", b"only-job", 10.0, false);
+
+        let rows = index.take_due(b"due:queued", 10.0, usize::MAX);
+
+        assert_eq!(rows, vec![(b"only-job".to_vec(), 10.0)]);
+    }
+
+    #[test]
+    fn claim_due_does_not_preallocate_untrusted_scan_limits() {
+        let mut index = FlowOrderedIndex::default();
+        index.put(b"due:queued", b"only-job", 10.0, false);
+
+        let rows =
+            index.claim_due_candidates(&[b"due:queued".as_slice()], 10.0, usize::MAX, usize::MAX);
+
+        assert_eq!(
+            rows,
+            vec![(b"due:queued".to_vec(), b"only-job".to_vec(), 10.0)]
+        );
+    }
+
+    #[test]
+    fn native_request_budget_rejects_oversized_cardinality_bytes_and_overflow() {
+        assert!(flow_index_request_within_budget([
+            (MAX_FLOW_INDEX_REQUEST_ITEMS, 0),
+            (0, MAX_FLOW_INDEX_REQUEST_BYTES),
+        ]));
+
+        assert!(!flow_index_request_within_budget([(
+            MAX_FLOW_INDEX_REQUEST_ITEMS + 1,
+            0,
+        )]));
+        assert!(!flow_index_request_within_budget([(
+            0,
+            MAX_FLOW_INDEX_REQUEST_BYTES + 1,
+        )]));
+        assert!(!flow_index_request_within_budget(
+            [(usize::MAX, 0), (1, 0),]
+        ));
+        assert!(!flow_index_request_within_budget(
+            [(0, usize::MAX), (0, 1),]
+        ));
     }
 
     #[test]
@@ -2787,6 +3459,518 @@ mod tests {
                 (b"due:queued".to_vec(), b"second".to_vec(), 20.0)
             ]
         );
+    }
+
+    #[test]
+    fn earliest_due_score_matching_filters_native_positive_counts_without_copying_keys() {
+        let mut index = FlowOrderedIndex::default();
+
+        index.put(b"f:{flow}:d:email:queued:p1", b"queued-later", 40.0, false);
+        index.put(b"f:{flow}:d:email:queued:p1", b"queued-first", 30.0, false);
+        index.put(b"f:{flow}:d:email:retry:p1", b"retry-first", 20.0, false);
+        index.put(b"f:{flow}:da:email:p1", b"any-state-first", 15.0, false);
+        index.put(
+            b"f:{flow}:d:email:queued:p2",
+            b"wrong-priority",
+            10.0,
+            false,
+        );
+        index.put(b"f:{flow}:d:sms:queued:p1", b"wrong-type", 5.0, false);
+        index.put(b"not-a-due-key", b"not-due", 1.0, false);
+
+        let zero_count_key = b"f:{flow}:d:email:zero:p1";
+        index.put(zero_count_key, b"ignored-zero-count", 2.0, false);
+        index.counts.insert(zero_count_key.to_vec(), 0);
+
+        index
+            .counts
+            .insert(b"f:{flow}:d:email:stale:p1".to_vec(), 1);
+
+        assert_eq!(
+            index.earliest_due_score_matching(
+                &[b"f:{flow}:".as_slice()],
+                &[b"}:d:email:".as_slice(), b"}:da:email:p".as_slice()],
+                &[b":p1".as_slice()],
+            ),
+            Some(15.0)
+        );
+    }
+
+    #[test]
+    fn earliest_due_score_matching_treats_empty_matcher_groups_as_wildcards() {
+        let mut index = FlowOrderedIndex::default();
+        index.put(b"f:{flow}:d:email:queued:p1", b"later", 30.0, false);
+        index.put(b"f:{fa:auto}:d:sms:ready:p2", b"earlier", 12.0, false);
+        index.put(b"ordinary:index", b"not-due", 1.0, false);
+
+        assert_eq!(index.earliest_due_score_matching(&[], &[], &[]), Some(12.0));
+        assert_eq!(
+            index.earliest_due_score_matching(&[b"f:{missing}".as_slice()], &[], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn reverse_cursor_uses_the_minimum_score_as_its_btree_lower_bound() {
+        let lower = lower_entry_for_exact_key(b"state:tied", Bound::Inclusive(42.0)).unwrap();
+
+        assert_eq!(lower.key, b"state:tied");
+        assert_eq!(lower.score.0, 42.0);
+        assert!(lower.member.is_empty());
+        assert!(lower_entry_for_exact_key(b"state:tied", Bound::PosInf).is_none());
+    }
+
+    #[test]
+    fn score_range_builds_a_two_sided_btree_window() {
+        let mut index = FlowOrderedIndex::default();
+
+        for score in 0..10_000 {
+            index.put(
+                b"state:bounded",
+                format!("flow-{score:05}").as_bytes(),
+                score as f64,
+                false,
+            );
+        }
+
+        let (lower, upper) = exact_key_range_bounds(
+            b"state:bounded",
+            Bound::Inclusive(10.0),
+            Bound::Inclusive(20.0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            index
+                .ordered
+                .range((Included(lower), Excluded(upper)))
+                .count(),
+            11
+        );
+    }
+
+    #[test]
+    fn normal_scheduler_lock_attempts_report_busy_instead_of_waiting() {
+        let resource = FlowOrderedIndexResource {
+            inner: RwLock::new(FlowOrderedIndex::default()),
+        };
+        let _writer = resource.inner.write().unwrap();
+
+        assert!(matches!(
+            try_read_index(&resource),
+            Err(IndexLockError::Busy)
+        ));
+        assert!(matches!(
+            try_write_index(&resource),
+            Err(IndexLockError::Busy)
+        ));
+    }
+
+    #[test]
+    fn blocking_guards_report_poison_without_panicking() {
+        let resource = FlowOrderedIndexResource {
+            inner: RwLock::new(FlowOrderedIndex::default()),
+        };
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _writer = resource.inner.write().unwrap();
+            panic!("poison flow index");
+        }));
+
+        assert!(matches!(
+            read_index(&resource),
+            Err(IndexLockError::Poisoned)
+        ));
+        assert!(matches!(
+            write_index(&resource),
+            Err(IndexLockError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn unbounded_flow_nifs_run_on_dirty_cpu_schedulers() {
+        let source = include_str!("flow_index.rs");
+        for function in [
+            "flow_index_put_entries",
+            "flow_index_put_new_entries",
+            "flow_index_move_entries",
+            "flow_index_delete_members",
+            "flow_index_delete_entries",
+            "flow_index_due_keys_present",
+            "flow_index_count_many",
+            "flow_index_earliest_due_score",
+            "flow_record_plan_claims",
+            "flow_record_plan_claims_with_history",
+            "flow_record_encode",
+            "flow_record_decode",
+            "flow_record_decode_meta",
+            "flow_records_terminal_after_noop",
+            "flow_history_encode",
+            "flow_history_decode",
+        ] {
+            let declaration = format!("pub fn {function}");
+            let declaration_offset = source.find(&declaration).unwrap();
+            let attribute_start = source[..declaration_offset]
+                .rfind("#[rustler::nif")
+                .unwrap();
+            let attribute = &source[attribute_start..declaration_offset];
+            assert!(
+                attribute.contains("schedule = \"DirtyCpu\""),
+                "{function} accepts unbounded work and must not monopolize a normal scheduler"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_request_budgets_are_checked_before_index_locks() {
+        let source = include_str!("flow_index.rs");
+
+        for function in [
+            "flow_index_put_entries",
+            "flow_index_put_new_entries",
+            "flow_index_move_entries",
+            "flow_index_delete_members",
+            "flow_index_delete_entries",
+            "flow_index_apply_batch",
+            "flow_index_take_due",
+            "flow_index_apply_claim_entries",
+            "flow_index_rollback_claim_entries",
+        ] {
+            let start = source
+                .find(&format!("pub fn {function}"))
+                .unwrap_or_else(|| panic!("missing {function}"));
+            let rest = &source[start..];
+            let end = rest.find("\n#[rustler::nif").unwrap_or(rest.len());
+            let body = &rest[..end];
+            let budget = body
+                .find("FLOW_INDEX_REQUEST_TOO_LARGE")
+                .or_else(|| body.find("enforce_flow_index_request_budget!"))
+                .unwrap_or_else(|| panic!("{function} has no native request budget"));
+            let lock = body
+                .find("index_guard!")
+                .unwrap_or_else(|| panic!("{function} has no index lock"));
+
+            assert!(
+                budget < lock,
+                "{function} must reject oversized input before taking the index lock"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_varints_reject_overlong_and_overflowing_encodings() {
+        assert!(decode_varint(&[0x80, 0x00]).is_none());
+        assert!(decode_varint(&[0xff; 10]).is_none());
+
+        let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(decode_varint(&max), Some((u64::MAX, &[][..])));
+    }
+
+    #[test]
+    fn durable_optional_int_encoder_rejects_unrepresentable_max() {
+        let mut bytes = vec![0xaa];
+        assert_eq!(encode_int(&mut bytes, Some(u64::MAX)), None);
+        assert_eq!(bytes, vec![0xaa]);
+
+        assert_eq!(encode_int(&mut bytes, Some(u64::MAX - 1)), Some(()));
+        assert_eq!(decode_int(&bytes[1..]), Some((Some(u64::MAX - 1), &[][..])));
+    }
+
+    #[test]
+    fn claim_counter_step_rejects_version_or_fencing_overflow() {
+        assert_eq!(checked_claim_counters(7, 11), Some((8, 12)));
+        assert_eq!(checked_claim_counters(u64::MAX - 1, 11), None);
+        assert_eq!(checked_claim_counters(7, u64::MAX - 1), None);
+        assert_eq!(checked_claim_counters(u64::MAX, 11), None);
+        assert_eq!(checked_claim_counters(7, u64::MAX), None);
+    }
+
+    #[test]
+    fn restored_count_boundaries_do_not_panic_during_index_updates() {
+        let mut index = FlowOrderedIndex::default();
+        index.counts.insert(b"max".to_vec(), i64::MAX);
+        index.increment_count(b"max", 1);
+        assert_eq!(index.counts.get(b"max".as_slice()), Some(&i64::MAX));
+
+        index.counts.insert(b"min".to_vec(), i64::MIN);
+        index.apply_count_deltas(HashMap::from([(b"min".to_vec(), -1)]));
+        assert_eq!(index.counts.get(b"min".as_slice()), Some(&i64::MIN));
+    }
+
+    #[test]
+    fn flow_record_decoder_rejects_unknown_persisted_flags() {
+        let mut bytes = FLOW_RECORD_MAGIC.to_vec();
+        encode_int(&mut bytes, Some(1 << 63)).unwrap();
+        encode_bin(&mut bytes, Some(b"id"));
+        encode_bin(&mut bytes, Some(b"type"));
+        encode_bin(&mut bytes, Some(b"queued"));
+        encode_int(&mut bytes, Some(1)).unwrap();
+        encode_int(&mut bytes, Some(2)).unwrap();
+        encode_int(&mut bytes, Some(3)).unwrap();
+
+        assert!(decode_flow_record(&bytes).is_none());
+    }
+
+    #[test]
+    fn flow_record_decoder_rejects_invalid_required_fields() {
+        fn record(
+            id: Option<&[u8]>,
+            flow_type: Option<&[u8]>,
+            state: Option<&[u8]>,
+            version: Option<u64>,
+            created_at_ms: Option<u64>,
+            updated_at_ms: Option<u64>,
+        ) -> Vec<u8> {
+            let mut bytes = FLOW_RECORD_MAGIC.to_vec();
+            encode_int(&mut bytes, Some(0)).unwrap();
+            encode_bin(&mut bytes, id);
+            encode_bin(&mut bytes, flow_type);
+            encode_bin(&mut bytes, state);
+            encode_int(&mut bytes, version).unwrap();
+            encode_int(&mut bytes, created_at_ms).unwrap();
+            encode_int(&mut bytes, updated_at_ms).unwrap();
+            bytes
+        }
+
+        let valid = || {
+            record(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(3),
+            )
+        };
+
+        assert!(decode_flow_record(&valid()).is_some());
+
+        for invalid in [
+            record(
+                None,
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(3),
+            ),
+            record(
+                Some(b""),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(3),
+            ),
+            record(
+                Some(b"id"),
+                None,
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(3),
+            ),
+            record(
+                Some(b"id"),
+                Some(b""),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(3),
+            ),
+            record(Some(b"id"), Some(b"type"), None, Some(1), Some(2), Some(3)),
+            record(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b""),
+                Some(1),
+                Some(2),
+                Some(3),
+            ),
+            record(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                None,
+                Some(2),
+                Some(3),
+            ),
+            record(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                None,
+                Some(3),
+            ),
+            record(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                None,
+            ),
+            record(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(9_007_199_254_740_992),
+                Some(2),
+                Some(3),
+            ),
+            record(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(9_007_199_254_740_992),
+                Some(3),
+            ),
+            record(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(9_007_199_254_740_992),
+            ),
+        ] {
+            assert!(decode_flow_record(&invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn flow_record_encoder_rejects_values_its_decoder_cannot_read() {
+        fn encode_minimal(
+            id: Option<&[u8]>,
+            flow_type: Option<&[u8]>,
+            state: Option<&[u8]>,
+            version: Option<u64>,
+            created_at_ms: Option<u64>,
+            updated_at_ms: Option<u64>,
+        ) -> Option<Vec<u8>> {
+            encode_flow_record_compact(
+                id,
+                flow_type,
+                state,
+                version,
+                None,
+                None,
+                created_at_ms,
+                updated_at_ms,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                EMPTY_CHILD_GROUPS_ENCODED,
+            )
+        }
+
+        let valid = encode_minimal(
+            Some(b"id"),
+            Some(b"type"),
+            Some(b"queued"),
+            Some(1),
+            Some(2),
+            Some(3),
+        )
+        .expect("valid record must encode");
+        assert!(decode_flow_record(&valid).is_some());
+
+        for invalid in [
+            encode_minimal(
+                None,
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(3),
+            ),
+            encode_minimal(
+                Some(b""),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(3),
+            ),
+            encode_minimal(
+                Some(b"id"),
+                Some(b""),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(3),
+            ),
+            encode_minimal(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b""),
+                Some(1),
+                Some(2),
+                Some(3),
+            ),
+            encode_minimal(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                None,
+                Some(2),
+                Some(3),
+            ),
+            encode_minimal(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(MAX_EXACT_INTEGER + 1),
+                Some(2),
+                Some(3),
+            ),
+            encode_minimal(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(MAX_EXACT_INTEGER + 1),
+                Some(3),
+            ),
+            encode_minimal(
+                Some(b"id"),
+                Some(b"type"),
+                Some(b"queued"),
+                Some(1),
+                Some(2),
+                Some(MAX_EXACT_INTEGER + 1),
+            ),
+        ] {
+            assert!(invalid.is_none());
+        }
+    }
+
+    #[test]
+    fn history_meta_count_is_bounded_by_the_remaining_payload() {
+        assert_eq!(checked_history_field_capacity(0, 0), Some(42));
+        assert_eq!(checked_history_field_capacity(2, 4), Some(46));
+        assert_eq!(checked_history_field_capacity(3, 4), None);
+        assert_eq!(checked_history_field_capacity(u64::MAX, 0), None);
     }
 }
 // This file is intentionally kept as a single fused Rust source unit even

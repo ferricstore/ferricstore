@@ -8,6 +8,8 @@ defmodule Ferricstore.Commands.Geo.Parsing do
     "MI" => 1609.344
   }
 
+  @geosearch_option_keys ~w(center shape unit raw_radius sort count any withcoord withdist withhash)a
+
   def parse_geoadd_flags(args) do
     {flags, rest} = take_geoadd_flags(args, [])
 
@@ -23,6 +25,49 @@ defmodule Ferricstore.Commands.Geo.Parsing do
   def parse_geosearch_opts(args) do
     parse_geosearch_opts(args, %{})
   end
+
+  def validate_geoadd_ast(flags, pairs) when is_list(flags) and is_list(pairs) do
+    cond do
+      Enum.any?(flags, &(&1 not in [:nx, :xx, :ch])) ->
+        {:error, "ERR syntax error"}
+
+      :nx in flags and :xx in flags ->
+        {:error, "ERR XX and NX options at the same time are not compatible"}
+
+      pairs == [] ->
+        {:error, "ERR wrong number of arguments for 'geoadd' command"}
+
+      true ->
+        validate_geoadd_pairs(pairs)
+    end
+  end
+
+  def validate_geoadd_ast(_flags, _pairs), do: {:error, "ERR syntax error"}
+
+  def validate_geosearch_ast_opts(opts) when is_list(opts) do
+    keys = Enum.map(opts, fn
+      {key, _value} when is_atom(key) -> key
+      _invalid -> :invalid
+    end)
+
+    cond do
+      not Keyword.keyword?(opts) ->
+        {:error, "ERR syntax error"}
+
+      Enum.any?(keys, &(&1 not in @geosearch_option_keys)) ->
+        {:error, "ERR syntax error"}
+
+      length(keys) != MapSet.size(MapSet.new(keys)) ->
+        {:error, "ERR syntax error"}
+
+      true ->
+        opts
+        |> Map.new()
+        |> validate_typed_geosearch_map()
+    end
+  end
+
+  def validate_geosearch_ast_opts(_opts), do: {:error, "ERR syntax error"}
 
   defp take_geoadd_flags(["NX" | rest], acc), do: take_geoadd_flags(rest, [:nx | acc])
   defp take_geoadd_flags(["XX" | rest], acc), do: take_geoadd_flags(rest, [:xx | acc])
@@ -66,6 +111,78 @@ defmodule Ferricstore.Commands.Geo.Parsing do
 
   defp valid_coordinates?(lng, lat) do
     lng >= -180.0 and lng <= 180.0 and lat >= -85.05112878 and lat <= 85.05112878
+  end
+
+  defp validate_geoadd_pairs(pairs) do
+    Enum.reduce_while(pairs, :ok, fn
+      {lng, lat, member}, :ok when is_float(lng) and is_float(lat) and is_binary(member) ->
+        if valid_coordinates?(lng, lat),
+          do: {:cont, :ok},
+          else: {:halt, {:error, "ERR invalid longitude,latitude pair #{lng},#{lat}"}}
+
+      _invalid, :ok ->
+        {:halt, {:error, "ERR syntax error"}}
+    end)
+  end
+
+  defp validate_typed_geosearch_map(opts) do
+    with :ok <- validate_typed_center(Map.get(opts, :center)),
+         :ok <- validate_typed_shape(Map.get(opts, :shape)),
+         {:ok, unit} <- validate_typed_unit(Map.get(opts, :unit, "M")),
+         :ok <- validate_optional_count(Map.get(opts, :count)),
+         :ok <- validate_optional_sort(Map.get(opts, :sort)),
+         :ok <- validate_optional_booleans(opts) do
+      {:ok, Map.put(opts, :unit, unit)}
+    end
+  end
+
+  defp validate_typed_center({:lonlat, lng, lat}) when is_float(lng) and is_float(lat) do
+    if valid_coordinates?(lng, lat),
+      do: :ok,
+      else: {:error, "ERR invalid longitude,latitude pair #{lng},#{lat}"}
+  end
+
+  defp validate_typed_center({:member, member}) when is_binary(member), do: :ok
+
+  defp validate_typed_center(_center),
+    do: {:error, "ERR exactly one of FROMMEMBER or FROMLONLAT must be provided"}
+
+  defp validate_typed_shape({:radius, radius}) when is_float(radius) and radius > 0, do: :ok
+
+  defp validate_typed_shape({:box, width, height})
+       when is_float(width) and width > 0 and is_float(height) and height > 0,
+       do: :ok
+
+  defp validate_typed_shape(_shape),
+    do: {:error, "ERR exactly one of BYRADIUS or BYBOX must be provided"}
+
+  defp validate_typed_unit(unit) when is_binary(unit) do
+    normalized = String.upcase(unit)
+
+    if normalized in Map.keys(@unit_conversions),
+      do: {:ok, normalized},
+      else: {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
+  end
+
+  defp validate_typed_unit(_unit),
+    do: {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
+
+  defp validate_optional_count(nil), do: :ok
+  defp validate_optional_count(count) when is_integer(count) and count > 0, do: :ok
+  defp validate_optional_count(_count), do: {:error, "ERR value is not an integer or out of range"}
+
+  defp validate_optional_sort(nil), do: :ok
+  defp validate_optional_sort(sort) when sort in [:asc, :desc], do: :ok
+  defp validate_optional_sort(_sort), do: {:error, "ERR syntax error"}
+
+  defp validate_optional_booleans(opts) do
+    if Enum.all?([:any, :withcoord, :withdist, :withhash], fn key ->
+         not Map.has_key?(opts, key) or is_boolean(Map.fetch!(opts, key))
+       end) do
+      :ok
+    else
+      {:error, "ERR syntax error"}
+    end
   end
 
   defp parse_geosearch_opts([], opts) do
@@ -141,7 +258,11 @@ defmodule Ferricstore.Commands.Geo.Parsing do
         else
           with {:ok, lng} <- parse_float(lng_str),
                {:ok, lat} <- parse_float(lat_str) do
-            parse_geosearch_opts(rest, Map.put(opts, :center, {:lonlat, lng, lat}))
+            if valid_coordinates?(lng, lat) do
+              parse_geosearch_opts(rest, Map.put(opts, :center, {:lonlat, lng, lat}))
+            else
+              {:error, "ERR invalid longitude,latitude pair #{lng_str},#{lat_str}"}
+            end
           end
         end
 
@@ -172,12 +293,16 @@ defmodule Ferricstore.Commands.Geo.Parsing do
 
       with {:ok, radius} <- parse_float(radius_str),
            true <- unit in Map.keys(@unit_conversions) do
-        radius_m = radius * @unit_conversions[unit]
+        if radius > 0 do
+          radius_m = radius * @unit_conversions[unit]
 
-        opts =
-          Map.merge(opts, %{shape: {:radius, radius_m}, unit: unit, raw_radius: radius})
+          opts =
+            Map.merge(opts, %{shape: {:radius, radius_m}, unit: unit, raw_radius: radius})
 
-        parse_geosearch_opts(rest, opts)
+          parse_geosearch_opts(rest, opts)
+        else
+          {:error, "ERR radius must be greater than 0"}
+        end
       else
         false -> {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
         err -> err
@@ -194,13 +319,17 @@ defmodule Ferricstore.Commands.Geo.Parsing do
       with {:ok, width} <- parse_float(width_str),
            {:ok, height} <- parse_float(height_str),
            true <- unit in Map.keys(@unit_conversions) do
-        width_m = width * @unit_conversions[unit]
-        height_m = height * @unit_conversions[unit]
+        if width > 0 and height > 0 do
+          width_m = width * @unit_conversions[unit]
+          height_m = height * @unit_conversions[unit]
 
-        opts =
-          Map.merge(opts, %{shape: {:box, width_m, height_m}, unit: unit})
+          opts =
+            Map.merge(opts, %{shape: {:box, width_m, height_m}, unit: unit})
 
-        parse_geosearch_opts(rest, opts)
+          parse_geosearch_opts(rest, opts)
+        else
+          {:error, "ERR width and height must be greater than 0"}
+        end
       else
         false -> {:error, "ERR unsupported unit provided. please use M, KM, FT, MI"}
         err -> err
@@ -239,5 +368,8 @@ defmodule Ferricstore.Commands.Geo.Parsing do
           _ -> {:error, "ERR value is not a valid float"}
         end
     end
+  rescue
+    ArgumentError -> {:error, "ERR value is not a valid float"}
+    ArithmeticError -> {:error, "ERR value is not a valid float"}
   end
 end

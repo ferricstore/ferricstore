@@ -36,6 +36,124 @@ mod copy_records_preserve_tombstones_tests {
     }
 
     #[test]
+    fn copy_rejects_missing_and_misclassified_requested_offsets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("00001.log");
+        let mut writer = log::LogWriter::open(&source, 1).unwrap();
+        let live_offset = writer.write(b"live", b"value", 0).unwrap();
+        let tombstone_offset = writer.write_tombstone(b"dead").unwrap();
+        writer.sync().unwrap();
+        let eof = std::fs::metadata(&source).unwrap().len();
+
+        let missing = copy_records_preserve_tombstones_impl(
+            &source,
+            &dir.path().join("missing.log"),
+            2,
+            &[],
+            &[eof],
+        )
+        .unwrap_err();
+        assert!(missing.contains("requested tombstone offset"));
+
+        let live_as_tombstone = copy_records_preserve_tombstones_impl(
+            &source,
+            &dir.path().join("live-as-tombstone.log"),
+            3,
+            &[],
+            &[live_offset],
+        )
+        .unwrap_err();
+        assert!(live_as_tombstone.contains("expected tombstone"));
+
+        let tombstone_as_live = copy_records_preserve_tombstones_impl(
+            &source,
+            &dir.path().join("tombstone-as-live.log"),
+            4,
+            &[tombstone_offset],
+            &[],
+        )
+        .unwrap_err();
+        assert!(tombstone_as_live.contains("expected live record"));
+    }
+
+    #[test]
+    fn live_only_copy_rejects_missing_and_tombstone_offsets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("00001.log");
+        let mut writer = log::LogWriter::open(&source, 1).unwrap();
+        let live_offset = writer.write(b"live", b"value", 0).unwrap();
+        let tombstone_offset = writer.write_tombstone(b"dead").unwrap();
+        writer.sync().unwrap();
+        let eof = std::fs::metadata(&source).unwrap().len();
+
+        let copied = copy_live_records_impl(
+            &source,
+            &dir.path().join("live.log"),
+            2,
+            &[live_offset],
+        )
+        .unwrap();
+        assert_eq!(1, copied.len());
+
+        let duplicate = copy_live_records_impl(
+            &source,
+            &dir.path().join("duplicate-live-only.log"),
+            5,
+            &[live_offset, live_offset],
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("duplicate live offset"));
+
+        let missing = copy_live_records_impl(
+            &source,
+            &dir.path().join("missing.log"),
+            3,
+            &[eof],
+        )
+        .unwrap_err();
+        assert!(missing.contains("requested live offset"));
+
+        let tombstone = copy_live_records_impl(
+            &source,
+            &dir.path().join("tombstone.log"),
+            4,
+            &[tombstone_offset],
+        )
+        .unwrap_err();
+        assert!(tombstone.contains("expected live record"));
+    }
+
+    #[test]
+    fn tombstone_preserving_copy_rejects_duplicate_requested_offsets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("00001.log");
+        let mut writer = log::LogWriter::open(&source, 1).unwrap();
+        let live_offset = writer.write(b"live", b"value", 0).unwrap();
+        let tombstone_offset = writer.write_tombstone(b"dead").unwrap();
+        writer.sync().unwrap();
+
+        let duplicate_live = copy_records_preserve_tombstones_impl(
+            &source,
+            &dir.path().join("duplicate-live.log"),
+            2,
+            &[live_offset, live_offset],
+            &[],
+        )
+        .unwrap_err();
+        assert!(duplicate_live.contains("duplicate live offset"));
+
+        let duplicate_tombstone = copy_records_preserve_tombstones_impl(
+            &source,
+            &dir.path().join("duplicate-tombstone.log"),
+            3,
+            &[],
+            &[tombstone_offset, tombstone_offset],
+        )
+        .unwrap_err();
+        assert!(duplicate_tombstone.contains("duplicate tombstone offset"));
+    }
+
+    #[test]
     fn compaction_copy_paths_do_not_materialize_live_values() {
         let source = include_str!("part_02.rs");
         let copy_records = source
@@ -69,7 +187,8 @@ mod copy_records_preserve_tombstones_tests {
 //
 // These submit IO work to the global Tokio thread pool and send the result
 // back to the calling Erlang process via OwnedEnv::send_and_clear.
-// The BEAM Normal scheduler returns immediately — no blocking.
+// Scalar submissions return immediately on a Normal scheduler. Batch-shaped
+// submissions decode/copy on a dirty CPU scheduler before offloading I/O.
 //
 // All messages include a correlation_id so the Elixir side can match
 // responses to requests, fixing the LIFO pending_reads ordering bug.
@@ -92,25 +211,28 @@ fn v2_pread_at_async(
     path: String,
     offset: u64,
 ) -> NifResult<Term<'_>> {
+    let blocking_task = match async_io::try_spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        open_random_read(p)
+            .map_err(|e| log::LogError(e.to_string()))
+            .and_then(|file| {
+                fadvise_random(&file);
+                let record = log::pread_record_from_file(&file, offset);
+                if let Ok(Some(ref r)) = record {
+                    let size =
+                        (log::HEADER_SIZE + r.key.len() + r.value.as_ref().map_or(0, Vec::len))
+                            as i64;
+                    fadvise_dontneed(&file, offset as i64, size);
+                }
+                record
+            })
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     async_io::runtime().spawn(async move {
-        // spawn_blocking: IO runs on Tokio's blocking thread pool (up to 512 threads),
-        // keeping async worker threads free for coordination.
-        let result = tokio::task::spawn_blocking(move || {
-            let p = std::path::Path::new(&path);
-            std::fs::File::open(p)
-                .map_err(|e| log::LogError(e.to_string()))
-                .and_then(|file| {
-                    fadvise_random(&file);
-                    let record = log::pread_record_from_file(&file, offset);
-                    if let Ok(Some(ref r)) = record {
-                        let size =
-                            (log::HEADER_SIZE + r.key.len() + r.value.as_ref().map_or(0, Vec::len))
-                                as i64;
-                        fadvise_dontneed(&file, offset as i64, size);
-                    }
-                    record
-                })
-        })
+        let result = blocking_task
         .await
         .unwrap_or_else(|e| Err(log::LogError(format!("spawn_blocking failed: {e}"))));
 
@@ -164,24 +286,29 @@ fn v2_pread_at_key_async<'a>(
 ) -> NifResult<Term<'a>> {
     let expected_key = expected_key.as_slice().to_vec();
 
+    let blocking_task = match async_io::try_spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        open_random_read(p)
+            .map_err(|e| log::LogError(e.to_string()))
+            .and_then(|file| {
+                fadvise_random(&file);
+                let value = log::pread_value_for_key_from_file(&file, offset, &expected_key);
+                if let Ok(Some(ref value)) = value {
+                    let size = (log::HEADER_SIZE
+                        + expected_key.len()
+                        + value.as_ref().map_or(0, Vec::len))
+                        as i64;
+                    fadvise_dontneed(&file, offset as i64, size);
+                }
+                value
+            })
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let p = std::path::Path::new(&path);
-            std::fs::File::open(p)
-                .map_err(|e| log::LogError(e.to_string()))
-                .and_then(|file| {
-                    fadvise_random(&file);
-                    let value = log::pread_value_for_key_from_file(&file, offset, &expected_key);
-                    if let Ok(Some(ref value)) = value {
-                        let size = (log::HEADER_SIZE
-                            + expected_key.len()
-                            + value.as_ref().map_or(0, Vec::len))
-                            as i64;
-                        fadvise_dontneed(&file, offset as i64, size);
-                    }
-                    value
-                })
-        })
+        let result = blocking_task
         .await
         .unwrap_or_else(|e| Err(log::LogError(format!("spawn_blocking failed: {e}"))));
 
@@ -321,17 +448,33 @@ where
         .collect()
 }
 
+fn open_error_results<I>(path: &str, error: &std::io::Error, reads: I) -> Vec<(usize, BatchReadValue)>
+where
+    I: IntoIterator<Item = usize>,
+{
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        return missing_file_results(path, reads);
+    }
+
+    let reason = format!("open_file: {path}: {error}");
+    reads
+        .into_iter()
+        .map(|index| (index, BatchReadValue::Error(reason.clone())))
+        .collect()
+}
+
 fn pread_batch_for_path(
     path: String,
     reads: Vec<(usize, u64)>,
 ) -> Result<Vec<(usize, BatchReadValue)>, String> {
     let read_count = reads.len();
 
-    let file = match std::fs::File::open(std::path::Path::new(&path)) {
+    let file = match open_random_read(std::path::Path::new(&path)) {
         Ok(file) => file,
-        Err(_e) => {
-            return Ok(missing_file_results(
+        Err(error) => {
+            return Ok(open_error_results(
                 &path,
+                &error,
                 reads.into_iter().map(|(index, _offset)| index),
             ))
         }
@@ -369,11 +512,12 @@ fn pread_batch_for_path_keyed(
 ) -> Result<Vec<(usize, BatchReadValue)>, String> {
     let read_count = reads.len();
 
-    let file = match std::fs::File::open(std::path::Path::new(&path)) {
+    let file = match open_random_read(std::path::Path::new(&path)) {
         Ok(file) => file,
-        Err(_e) => {
-            return Ok(missing_file_results(
+        Err(error) => {
+            return Ok(open_error_results(
                 &path,
+                &error,
                 reads
                     .into_iter()
                     .map(|(index, _offset, _expected_key)| index),
@@ -465,7 +609,6 @@ fn send_pread_batch_result(
     });
 }
 
-#[cfg(test)]
 fn pread_batch_grouped(locations: Vec<(String, u64)>) -> Result<Vec<BatchReadValue>, String> {
     let (count, groups) = group_pread_locations(locations);
     let mut values = vec![BatchReadValue::Nil; count];
@@ -501,7 +644,7 @@ fn pread_batch_grouped_keyed(
     Ok(values)
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_path_async(
     env: Env<'_>,
@@ -510,24 +653,29 @@ fn v2_pread_batch_path_async(
     path: String,
     offsets: Vec<u64>,
 ) -> NifResult<Term<'_>> {
-    async_io::runtime().spawn(async move {
+    let blocking_task = match async_io::try_spawn_blocking(move || {
         let count = offsets.len();
         let reads: Vec<(usize, u64)> = offsets.into_iter().enumerate().collect();
 
-        let result = tokio::task::spawn_blocking(move || {
-            let mut values = vec![BatchReadValue::Nil; count];
-            apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads)?);
-            Ok(values)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+        let mut values = vec![BatchReadValue::Nil; count];
+        apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads)?);
+        Ok(values)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
+    async_io::runtime().spawn(async move {
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         send_pread_batch_result(caller_pid, correlation_id, result);
     });
     Ok(atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_path_key_async<'a>(
     env: Env<'a>,
@@ -543,12 +691,17 @@ fn v2_pread_batch_path_key_async<'a>(
         .map(|(index, (offset, key))| (index, offset, key.as_slice().to_vec()))
         .collect();
 
+    let blocking_task = match async_io::try_spawn_blocking(move || {
+        let mut values = vec![BatchReadValue::Nil; count];
+        apply_grouped_pread_results(&mut values, pread_batch_for_path_keyed(path, reads)?);
+        Ok(values)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let mut values = vec![BatchReadValue::Nil; count];
-            apply_grouped_pread_results(&mut values, pread_batch_for_path_keyed(path, reads)?);
-            Ok(values)
-        })
+        let result = blocking_task
         .await
         .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
@@ -557,7 +710,7 @@ fn v2_pread_batch_path_key_async<'a>(
     Ok(atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_async(
     env: Env<'_>,
@@ -565,41 +718,21 @@ fn v2_pread_batch_async(
     correlation_id: u64,
     locations: Vec<(String, u64)>,
 ) -> NifResult<Term<'_>> {
+    let blocking_task = match async_io::try_spawn_blocking(move || pread_batch_grouped(locations)) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     async_io::runtime().spawn(async move {
-        let (count, groups) = group_pread_locations(locations);
-        let mut handles = Vec::with_capacity(groups.len());
-
-        for (path, reads) in groups {
-            handles.push(tokio::task::spawn_blocking(move || {
-                pread_batch_for_path(path, reads)
-            }));
-        }
-
-        let mut result: Result<Vec<BatchReadValue>, String> = Ok(vec![BatchReadValue::Nil; count]);
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(results)) => {
-                    if let Ok(values) = &mut result {
-                        apply_grouped_pread_results(values, results);
-                    }
-                }
-                Ok(Err(reason)) => {
-                    result = Err(reason);
-                    break;
-                }
-                Err(e) => {
-                    result = Err(format!("spawn_blocking: {e}"));
-                    break;
-                }
-            }
-        }
-
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
         send_pread_batch_result(caller_pid, correlation_id, result);
     });
     Ok(atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_grouped_async(
     env: Env<'_>,
@@ -607,48 +740,31 @@ fn v2_pread_batch_grouped_async(
     correlation_id: u64,
     groups: Vec<(String, Vec<(usize, u64)>)>,
 ) -> NifResult<Term<'_>> {
-    async_io::runtime().spawn(async move {
+    let blocking_task = match async_io::try_spawn_blocking(move || {
         let count = match validate_grouped_pread_groups(&groups) {
             Ok(count) => count,
-            Err(reason) => {
-                send_pread_batch_result(caller_pid, correlation_id, Err(reason));
-                return;
-            }
+            Err(reason) => return Err(reason),
         };
-
-        let mut handles = Vec::with_capacity(groups.len());
-
+        let mut values = vec![BatchReadValue::Nil; count];
         for (path, reads) in groups {
-            handles.push(tokio::task::spawn_blocking(move || {
-                pread_batch_for_path(path, reads)
-            }));
+            apply_grouped_pread_results(&mut values, pread_batch_for_path(path, reads)?);
         }
+        Ok(values)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
 
-        let mut result: Result<Vec<BatchReadValue>, String> = Ok(vec![BatchReadValue::Nil; count]);
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(results)) => {
-                    if let Ok(values) = &mut result {
-                        apply_grouped_pread_results(values, results);
-                    }
-                }
-                Ok(Err(reason)) => {
-                    result = Err(reason);
-                    break;
-                }
-                Err(e) => {
-                    result = Err(format!("spawn_blocking: {e}"));
-                    break;
-                }
-            }
-        }
-
+    async_io::runtime().spawn(async move {
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
         send_pread_batch_result(caller_pid, correlation_id, result);
     });
     Ok(atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_batch_grouped_key_async<'a>(
     env: Env<'a>,
@@ -667,42 +783,25 @@ fn v2_pread_batch_grouped_key_async<'a>(
         })
         .collect();
 
-    async_io::runtime().spawn(async move {
+    let blocking_task = match async_io::try_spawn_blocking(move || {
         let count = match validate_grouped_keyed_pread_groups(&groups) {
             Ok(count) => count,
-            Err(reason) => {
-                send_pread_batch_result(caller_pid, correlation_id, Err(reason));
-                return;
-            }
+            Err(reason) => return Err(reason),
         };
-
-        let mut handles = Vec::with_capacity(groups.len());
-
+        let mut values = vec![BatchReadValue::Nil; count];
         for (path, reads) in groups {
-            handles.push(tokio::task::spawn_blocking(move || {
-                pread_batch_for_path_keyed(path, reads)
-            }));
+            apply_grouped_pread_results(&mut values, pread_batch_for_path_keyed(path, reads)?);
         }
+        Ok(values)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
 
-        let mut result: Result<Vec<BatchReadValue>, String> = Ok(vec![BatchReadValue::Nil; count]);
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(results)) => {
-                    if let Ok(values) = &mut result {
-                        apply_grouped_pread_results(values, results);
-                    }
-                }
-                Ok(Err(reason)) => {
-                    result = Err(reason);
-                    break;
-                }
-                Err(e) => {
-                    result = Err(format!("spawn_blocking: {e}"));
-                    break;
-                }
-            }
-        }
-
+    async_io::runtime().spawn(async move {
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
         send_pread_batch_result(caller_pid, correlation_id, result);
     });
     Ok(atoms::ok().encode(env))
@@ -723,14 +822,16 @@ fn v2_fsync_async(
     correlation_id: u64,
     path: String,
 ) -> NifResult<Term<'_>> {
+    let blocking_task = match async_io::try_spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        open_write_nofollow(p).and_then(|f| f.sync_data())
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let p = std::path::Path::new(&path);
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(p)
-                .and_then(|f| f.sync_data())
-        })
+        let result = blocking_task
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(format!("spawn_blocking: {e}"))));
 
@@ -755,7 +856,7 @@ fn v2_fsync_async(
     Ok(atoms::ok().encode(env))
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn io_uring_available() -> bool {
     io_backend::detect_io_uring()
 }

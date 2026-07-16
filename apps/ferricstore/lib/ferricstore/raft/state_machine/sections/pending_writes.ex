@@ -151,9 +151,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       defp materialize_blob_ref(state, encoded_ref) when is_binary(encoded_ref) do
         case BlobRef.decode(encoded_ref) do
           {:ok, ref} ->
-            case BlobStore.get(state.data_dir, state.shard_index, ref) do
-              {:ok, value} -> {:ok, value}
-              {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
+            with :ok <- Ferricstore.Raft.ApplyLimits.validate_value_size(state, ref.size) do
+              case BlobStore.get(state.data_dir, state.shard_index, ref) do
+                {:ok, value} -> {:ok, value}
+                {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
+              end
             end
 
           :error ->
@@ -240,18 +242,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             case validated_append_result do
               {:ok, locations} ->
                 clear_disk_pressure(state)
-
-                Ferricstore.LatencyTrace.maybe_span "server_pending_locations_us" do
-                  apply_pending_locations(state, file_id, batch, locations)
-                end
-
-                Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
-                  flush_pending_flow_native_indexes(state)
-                end
-
-                Ferricstore.LatencyTrace.maybe_span "server_zset_index_update_us" do
-                  flush_pending_zset_indexes(state)
-                end
+                publish_pending_batch(state, file_id, batch, locations)
 
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
                 state = track_bitcask_append_bytes(state, file_path, file_id, record_bytes)
@@ -277,18 +268,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             case validate_append_result(batch, {:ok, locations}) do
               {:ok, ^locations} ->
                 clear_disk_pressure(state)
-
-                Ferricstore.LatencyTrace.maybe_span "server_pending_locations_us" do
-                  apply_pending_locations(state, file_id, batch, locations)
-                end
-
-                Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
-                  flush_pending_flow_native_indexes(state)
-                end
-
-                Ferricstore.LatencyTrace.maybe_span "server_zset_index_update_us" do
-                  flush_pending_zset_indexes(state)
-                end
+                publish_pending_batch(state, file_id, batch, locations)
 
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
                 :ok
@@ -309,6 +289,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             rollback_pending_writes(state)
             {:error, {:waraft_projection_failed, {:unexpected_result, other}}}
         end
+      end
+
+      defp publish_pending_batch(state, file_id, batch, locations) do
+        ctx = Map.get(state, :instance_ctx, %{})
+
+        Ferricstore.Store.PublicationEpoch.with_write(ctx, state.shard_index, fn ->
+          Ferricstore.LatencyTrace.maybe_span "server_pending_locations_us" do
+            apply_pending_locations(state, file_id, batch, locations)
+          end
+
+          Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
+            flush_pending_flow_native_indexes(state)
+          end
+
+          Ferricstore.LatencyTrace.maybe_span "server_zset_index_update_us" do
+            flush_pending_zset_indexes(state)
+          end
+        end)
       end
 
       defp flush_pending_flow_native_indexes(state) do
@@ -481,18 +479,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       defp track_bitcask_append_bytes(state, _file_path, _file_id, _written_bytes), do: state
 
       defp track_cross_shard_append_bytes(state, shard_index, file_path, file_id, written_bytes) do
-        if shard_index == state.shard_index do
-          track_bitcask_append_bytes(state, file_path, file_id, written_bytes)
-        else
-          maybe_rotate_remote_cross_shard_active_file(
-            state,
-            shard_index,
-            file_path,
-            file_id,
-            written_bytes
-          )
+        cond do
+          shard_index == state.shard_index and file_path == state.active_file_path and
+              file_id == state.active_file_id ->
+            track_bitcask_append_bytes(state, file_path, file_id, written_bytes)
 
-          state
+          shard_index != state.shard_index ->
+            maybe_rotate_remote_cross_shard_active_file(
+              state,
+              shard_index,
+              file_path,
+              file_id,
+              written_bytes
+            )
+
+            state
+
+          true ->
+            # Dedicated collection files are checkpoint dependencies, but they
+            # are not the shard's rotatable shared active file.
+            state
         end
       end
 
@@ -649,16 +655,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
               {:delete, key, _prob_path} -> {:delete, key}
             end)
 
-          case NIF.v2_append_ops_batch_nosync(file_path, ops) do
-            {:ok, locations} ->
-              case NIF.v2_fsync(file_path) do
-                :ok -> {:ok, locations}
-                {:error, reason} -> {:error, reason}
-              end
-
-            {:error, _reason} = error ->
-              error
-          end
+          NIF.v2_append_ops_batch(file_path, ops)
         else
           puts =
             Enum.map(batch, fn
@@ -860,6 +857,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         )
 
         CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+        logical_key_index_put(state, key, value, expire_at_ms)
         apply_fast_put_pending_locations(state, file_id, batch, locations, hot_threshold)
       end
 
@@ -874,6 +872,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         track_keydir_binary_remove(state, key)
         :ets.delete(state.ets, key)
         CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
+        logical_key_index_delete(state, key)
         maybe_queue_lmdb_state_delete_after_publish(state, key)
         maybe_delete_prob_file_path(state, prob_path)
 

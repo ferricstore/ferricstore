@@ -43,9 +43,34 @@ defmodule Ferricstore.Flow.InfoCountsTest do
   end
 
   test "merge_terminal_counts adds counts into existing accumulator" do
-    assert InfoCounts.merge_terminal_counts(%{"c" => 1, "f" => 2}, ["c", "f"], [3, 4]) == %{
-             "c" => 4,
-             "f" => 6
-           }
+    assert {:ok, %{"c" => 4, "f" => 6}} =
+             InfoCounts.merge_terminal_counts(%{"c" => 1, "f" => 2}, ["c", "f"], [3, 4])
+  end
+
+  test "merge_terminal_counts rejects a partial count vector" do
+    assert {:error, {:batch_result_mismatch, 2, 1}} =
+             InfoCounts.merge_terminal_counts(%{"c" => 1, "f" => 2}, ["c", "f"], [3])
+  end
+
+  test "merge_terminal_counts rejects malformed counts without raising" do
+    assert {:error, {:invalid_batch_results, [3, :invalid]}} =
+             InfoCounts.merge_terminal_counts(
+               %{"c" => 1, "f" => 2},
+               ["c", "f"],
+               [3, :invalid]
+             )
+
+    assert {:error, {:invalid_batch_results, [3, -1]}} =
+             InfoCounts.merge_terminal_counts(%{"c" => 1, "f" => 2}, ["c", "f"], [3, -1])
+  end
+
+  test "validate_counts rejects malformed vectors before callers inspect them" do
+    assert InfoCounts.validate_counts(["c", "f"], [3, 4]) == {:ok, [3, 4]}
+
+    assert InfoCounts.validate_counts(["c", "f"], [3, :invalid]) ==
+             {:error, {:invalid_batch_results, [3, :invalid]}}
+
+    assert InfoCounts.validate_counts(["c", "f"], [3]) ==
+             {:error, {:batch_result_mismatch, 2, 1}}
   end
 end

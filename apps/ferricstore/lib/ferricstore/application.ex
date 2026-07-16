@@ -44,11 +44,13 @@ defmodule Ferricstore.Application do
 
   @default_large_value_warning_bytes 512 * 1024
   @large_value_blob_ref_read_timeout_ms 1_000
+  @started_at_key {__MODULE__, :started_at_ms}
 
   @impl true
   @spec start(Application.start_type(), term()) ::
           {:ok, pid()} | {:ok, pid(), term()} | {:error, term()}
   def start(_type, _args) do
+    started_at_ms = System.monotonic_time(:millisecond)
     mark_starting()
 
     try do
@@ -173,6 +175,7 @@ defmodule Ferricstore.Application do
           eviction_policy: Application.get_env(:ferricstore, :eviction_policy, :volatile_lfu),
           hot_cache_max_value_size:
             Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536),
+          max_value_size: Application.get_env(:ferricstore, :max_value_size, 1_048_576),
           max_active_file_size:
             Application.get_env(:ferricstore, :max_active_file_size, 8 * 1024 * 1024 * 1024),
           read_sample_rate: Application.get_env(:ferricstore, :read_sample_rate, 100),
@@ -225,24 +228,38 @@ defmodule Ferricstore.Application do
             Ferricstore.PubSub.ActivityLog,
             Ferricstore.AuditLog,
             Ferricstore.Config,
+            Ferricstore.Config.Local,
             Ferricstore.NamespaceConfig,
             Ferricstore.Doctor,
             Ferricstore.HLC,
             Ferricstore.QuorumMetrics,
             Ferricstore.PrefixMetricsCache,
             Ferricstore.Waiters.Monitor,
+            Ferricstore.Flow.LMDB.TerminalCountCacheOwner,
             Ferricstore.Flow.HistoryProjector.TableOwner,
             Ferricstore.Flow.Governance.LimitCache,
+            Supervisor.child_spec(
+              {Ferricstore.Store.ETSTableHeir, name: Ferricstore.Store.BlobStore.TableHeir},
+              id: Ferricstore.Store.BlobStore.TableHeir
+            ),
             Ferricstore.Store.BlobStore.TableOwner,
             Ferricstore.Raft.WARaftBackend.BatcherSupervisor,
-            {Ferricstore.Store.KeydirTableOwner, instance_ctx: default_ctx}
+            Supervisor.child_spec(
+              {Ferricstore.Store.ETSTableHeir,
+               name: Ferricstore.Store.KeydirTableOwner.table_heir_name(default_ctx)},
+              id: Ferricstore.Store.KeydirTableOwner.table_heir_name(default_ctx)
+            )
           ] ++
           bitcask_writer_children ++
           [{Ferricstore.Flow.LMDBFlushCoordinator, []}] ++
           flow_lmdb_writer_children ++
           [
-            {Ferricstore.Store.ShardSupervisor,
-             data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}
+            {Ferricstore.Store.KeydirRuntimeSupervisor,
+             name: Ferricstore.Store.KeydirRuntimeSupervisor,
+             shard_supervisor_name: Ferricstore.Store.ShardSupervisor,
+             data_dir: data_dir,
+             shard_count: shard_count,
+             instance_ctx: default_ctx}
           ] ++
           [
             {Ferricstore.Flow.Governance.LimitReconciler, instance_ctx: default_ctx},
@@ -273,7 +290,7 @@ defmodule Ferricstore.Application do
           case Ferricstore.Raft.WARaftBackend.start(default_ctx, waraft_backend_opts()) do
             :ok ->
               :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(data_dir, shard_count)
-              mark_started(shard_count)
+              mark_started(shard_count, started_at_ms)
               {:ok, pid, app_state}
 
             {:error, reason} ->
@@ -313,24 +330,28 @@ defmodule Ferricstore.Application do
     :persistent_term.put({__MODULE__, :starting}, false)
   end
 
-  defp mark_started(shard_count, ready? \\ true) do
+  defp mark_started(shard_count, started_at_ms, ready? \\ true) do
     # Mark the node as ready for Kubernetes readiness probes (spec 2C.1).
     # In embedded mode, set_ready(true) is still called so that
     # Health.ready?() returns true for any code that checks it.
     Ferricstore.Health.set_ready(ready?)
 
+    now_ms = System.monotonic_time(:millisecond)
+    :persistent_term.put(@started_at_key, started_at_ms)
+
     :telemetry.execute(
       [:ferricstore, :node, :startup_complete],
-      %{duration_ms: System.monotonic_time(:millisecond)},
+      %{duration_ms: elapsed_ms(started_at_ms, now_ms)},
       %{shard_count: shard_count}
     )
 
     # Step 6 - Large value check:
     # Scan keydir for values exceeding the configured threshold.
     # Pure RAM scan -- keydir already holds value_size per entry, no disk reads.
-    # Non-blocking: fires before any traffic is served so operator sees the
-    # warning immediately.
-    check_large_values(shard_count)
+    # The scan can read blob-reference records from disk. Keep this diagnostic
+    # outside the application start path so a large cold dataset cannot delay
+    # readiness.
+    schedule_large_value_check(shard_count)
   end
 
   defp stop_started_supervisor(pid) do
@@ -349,7 +370,7 @@ defmodule Ferricstore.Application do
 
     :telemetry.execute(
       [:ferricstore, :node, :shutdown_started],
-      %{uptime_ms: t0},
+      %{uptime_ms: elapsed_ms(:persistent_term.get(@started_at_key, t0), t0)},
       %{}
     )
 
@@ -388,6 +409,7 @@ defmodule Ferricstore.Application do
 
     FerricStore.Instance.cleanup(:default)
     Ferricstore.Raft.Backend.clear_running()
+    :persistent_term.erase(@started_at_key)
     :ok
   end
 
@@ -396,8 +418,16 @@ defmodule Ferricstore.Application do
     _ = Ferricstore.Raft.WARaftBackend.stop()
     FerricStore.Instance.cleanup(:default)
     Ferricstore.Raft.Backend.clear_running()
+    :persistent_term.erase(@started_at_key)
     :ok
   end
+
+  defp elapsed_ms(started_at_ms, now_ms) when is_integer(started_at_ms) and is_integer(now_ms) do
+    max(now_ms - started_at_ms, 0)
+  end
+
+  @doc false
+  def __elapsed_ms_for_test__(started_at_ms, now_ms), do: elapsed_ms(started_at_ms, now_ms)
 
   defp runtime_shutdown_config(%{shard_count: shard_count, data_dir: data_dir})
        when is_integer(shard_count) and is_binary(data_dir) do
@@ -480,14 +510,23 @@ defmodule Ferricstore.Application do
   end
 
   defp shutdown_flush_flow_lmdb_writers(shard_count) do
-    _ = Ferricstore.Flow.LMDBWriter.suspend_all(shard_count, flush: false)
+    suspend_flow_lmdb_writers(shard_count, &Ferricstore.Flow.LMDBWriter.suspend_all/2)
+  end
+
+  defp suspend_flow_lmdb_writers(shard_count, suspend) do
+    _ = suspend.(shard_count, flush: false)
     Logger.info("Shutdown: Flow LMDB lagged projection flush skipped")
     :ok
   catch
     :exit, reason ->
-      _ = Ferricstore.Flow.LMDBWriter.suspend_all(shard_count, flush: false)
       Logger.warning("Shutdown: Flow LMDB writer flush failed: #{inspect(reason)}")
       {:error, reason}
+  end
+
+  @doc false
+  def __shutdown_flow_lmdb_for_test__(shard_count, suspend)
+      when is_function(suspend, 2) do
+    suspend_flow_lmdb_writers(shard_count, suspend)
   end
 
   defp shutdown_fsync_bitcask(shard_count, data_dir) do
@@ -520,7 +559,12 @@ defmodule Ferricstore.Application do
   end
 
   @doc false
-  def fsync_bitcask_for_shutdown(shard_count, data_dir, opts \\ []) do
+  def fsync_bitcask_for_shutdown(shard_count, data_dir, opts \\ [])
+
+  def fsync_bitcask_for_shutdown(0, _data_dir, _opts), do: :ok
+
+  def fsync_bitcask_for_shutdown(shard_count, data_dir, opts)
+      when is_integer(shard_count) and shard_count > 0 do
     active_file_path = Keyword.get(opts, :active_file_path, &shutdown_active_file_path/1)
     exists? = Keyword.get(opts, :exists?, &Ferricstore.FS.exists?/1)
     fsync = Keyword.get(opts, :fsync, &Ferricstore.Bitcask.NIF.v2_fsync/1)
@@ -643,7 +687,12 @@ defmodule Ferricstore.Application do
   """
   @spec scan_large_values(non_neg_integer(), non_neg_integer()) ::
           {non_neg_integer(), binary() | nil, non_neg_integer()}
-  def scan_large_values(shard_count, threshold_bytes \\ nil) do
+  def scan_large_values(shard_count, threshold_bytes \\ nil)
+
+  def scan_large_values(0, _threshold_bytes), do: {0, nil, 0}
+
+  def scan_large_values(shard_count, threshold_bytes)
+      when is_integer(shard_count) and shard_count > 0 do
     threshold =
       threshold_bytes ||
         Application.get_env(
@@ -677,7 +726,7 @@ defmodule Ferricstore.Application do
             {key, nil, _exp, _lfu, fid, off, vsize}, {c, lk, ls}
             when is_integer(vsize) and vsize > 0 ->
               # Cold key (value evicted from RAM) -- use vsize from disk location.
-              # Blob values store a 48-byte ref in Bitcask, but the ref carries
+              # Blob values store a 64-byte ref in Bitcask, but the ref carries
               # the original logical payload size used by operators.
               logical_size = large_value_logical_size(ctx, i, key, fid, off, vsize)
 
@@ -746,6 +795,20 @@ defmodule Ferricstore.Application do
       Ferricstore.Store.BlobValue.threshold(ctx) > 0 and
       is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 and
       Ferricstore.Store.BlobRef.encoded_size?(vsize)
+  end
+
+  @doc false
+  @spec schedule_large_value_check(non_neg_integer(), (non_neg_integer() -> term())) :: :ok
+  def schedule_large_value_check(shard_count, check_fun \\ &check_large_values/1)
+      when is_integer(shard_count) and shard_count >= 0 and is_function(check_fun, 1) do
+    case Task.start(fn -> check_fun.(shard_count) end) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Could not start embedded large-value diagnostic: #{inspect(reason)}")
+        :ok
+    end
   end
 
   # Runs the large value check and emits a warning + telemetry if any are found.

@@ -4,13 +4,13 @@ defmodule Ferricstore.Flow do
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.ClaimWaiters
   alias Ferricstore.Flow.Codec
+  alias Ferricstore.Flow.PayloadReturn
   alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Store.Router
 
   @default_priority 0
   @claim_waiter_min_wake_budget_per_ready_bucket 8
-  @default_payload_return_max_bytes 64 * 1024
 
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
     started = flow_start_time()
@@ -84,9 +84,10 @@ defmodule Ferricstore.Flow do
     do: {:error, "ERR flow run_steps_many opts must be a keyword list"}
 
   defp run_steps_many_attrs(items, opts) do
-    with {:ok, type} <- run_steps_many_type(opts),
+    with :ok <- Ferricstore.Flow.MutationAttrs.validate_many_item_count(items),
+         {:ok, type} <- run_steps_many_type(opts),
          {:ok, worker} <- run_steps_many_worker(opts),
-         {:ok, states} <- run_steps_many_states(opts),
+         {:ok, states} <- run_steps_many_states(opts, length(items)),
          {:ok, lease_ms} <- run_steps_many_pos_integer(opts, :lease_ms, 30_000),
          {:ok, now_ms} <- run_steps_many_now_ms(opts) do
       base_start_opts =
@@ -163,19 +164,24 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp run_steps_many_states(opts) do
+  defp run_steps_many_states(opts, item_count) do
     cond do
       is_list(Keyword.get(opts, :states)) ->
         states = Keyword.fetch!(opts, :states)
 
-        if states != [] and Enum.all?(states, &(is_binary(&1) and &1 != "")) do
+        with [_ | _] <- states,
+             :ok <- validate_run_steps_many_work(item_count, length(states)),
+             true <- Enum.all?(states, &(is_binary(&1) and &1 != "")) do
           {:ok, states}
         else
-          {:error, "ERR flow states must be a non-empty list of strings"}
+          [] -> {:error, "ERR flow states must be a non-empty list of strings"}
+          false -> {:error, "ERR flow states must be a non-empty list of strings"}
+          {:error, _reason} = error -> error
         end
 
       true ->
-        with {:ok, steps} <- run_steps_many_pos_integer(opts, :steps, 1) do
+        with {:ok, steps} <- run_steps_many_pos_integer(opts, :steps, 1),
+             :ok <- validate_run_steps_many_work(item_count, steps) do
           {:ok, Enum.map(1..steps, &("step_" <> Integer.to_string(&1)))}
         end
     end
@@ -186,6 +192,16 @@ defmodule Ferricstore.Flow do
       {:ok, now_ms} when is_integer(now_ms) and now_ms >= 0 -> {:ok, now_ms}
       :error -> {:ok, System.system_time(:millisecond)}
       _ -> {:error, "ERR flow now_ms must be a non-negative integer"}
+    end
+  end
+
+  defp validate_run_steps_many_work(item_count, step_count) do
+    max = Ferricstore.Flow.MutationAttrs.flow_max_batch_items()
+
+    if item_count <= div(max, step_count) do
+      :ok
+    else
+      {:error, "ERR flow run step operation count exceeds maximum #{max}"}
     end
   end
 
@@ -459,11 +475,11 @@ defmodule Ferricstore.Flow do
     with :ok <- validate_id(id),
          :ok <- validate_opts(opts),
          :ok <- Ferricstore.Flow.Internal.reject_reserved_id(id, opts),
-         {:ok, payload_return} <- payload_return_opts(opts, false),
+         {:ok, payload_return} <- PayloadReturn.options(opts, false),
          {:ok, named_values} <- named_value_return_opts(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
          :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)) do
-      case Router.flow_get(ctx, id, partition_key) do
+      case Router.flow_get_with_status(ctx, id, partition_key) do
         nil ->
           {:ok, nil}
 
@@ -476,6 +492,9 @@ defmodule Ferricstore.Flow do
 
         {:error, _reason} = error ->
           error
+
+        :unavailable ->
+          {:error, "ERR storage read failed"}
       end
     end
   end
@@ -486,17 +505,28 @@ defmodule Ferricstore.Flow do
   defdelegate claim_due(ctx, type, opts), to: Ferricstore.Flow.ClaimDueAPI
   defdelegate reclaim(ctx, type, opts), to: Ferricstore.Flow.ClaimDueAPI
 
-  false
-
+  @doc false
   defdelegate claim_due_wait_registration(type, opts),
     to: Ferricstore.Flow.ClaimDueAPI,
     as: :wait_registration
 
-  false
+  @doc false
   defdelegate claim_due_wait_keys(type, opts), to: Ferricstore.Flow.ClaimDueAPI, as: :wait_keys
 
   defp maybe_notify_claim_waiters(result, attrs, state_key) when is_map(attrs) do
     maybe_notify_claim_waiters(result, [attrs], state_key)
+  end
+
+  defp maybe_notify_claim_waiters({:ok, results} = result, attrs_list, state_key)
+       when is_list(results) and is_list(attrs_list) do
+    notify_successful_claim_waiter_hints(results, attrs_list, state_key)
+    result
+  end
+
+  defp maybe_notify_claim_waiters(results, attrs_list, state_key)
+       when is_list(results) and is_list(attrs_list) do
+    notify_successful_claim_waiter_hints(results, attrs_list, state_key)
+    results
   end
 
   defp maybe_notify_claim_waiters(result, attrs_list, state_key) when is_list(attrs_list) do
@@ -513,6 +543,34 @@ defmodule Ferricstore.Flow do
 
     result
   end
+
+  defp notify_successful_claim_waiter_hints(results, attrs_list, state_key) do
+    case successful_claim_waiter_hints(results, attrs_list, state_key, []) do
+      {:ok, hints} ->
+        ClaimWaiters.notify_ready_many(hints, @claim_waiter_min_wake_budget_per_ready_bucket)
+
+      :mismatch ->
+        0
+    end
+  end
+
+  defp successful_claim_waiter_hints([], [], _state_key, hints), do: {:ok, hints}
+
+  defp successful_claim_waiter_hints([result | results], [attrs | attrs_list], state_key, hints) do
+    hints =
+      if flow_write_succeeded?(result) do
+        case claim_waiter_ready_hint(attrs, state_key) do
+          nil -> hints
+          hint -> [hint | hints]
+        end
+      else
+        hints
+      end
+
+    successful_claim_waiter_hints(results, attrs_list, state_key, hints)
+  end
+
+  defp successful_claim_waiter_hints(_results, _attrs_list, _state_key, _hints), do: :mismatch
 
   defp maybe_notify_retry_claim_waiters(result, ctx, attrs) when is_map(attrs) do
     if flow_write_succeeded?(result) and ClaimWaiters.any_waiters?() do
@@ -617,11 +675,14 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <-
-             Ferricstore.Flow.MutationAttrs.extend_lease_attrs(id, lease_token, opts),
+      with {:ok, return_mode, mutation_opts} <- extend_lease_return_mode(opts),
+           {:ok, attrs} <-
+             Ferricstore.Flow.MutationAttrs.extend_lease_attrs(id, lease_token, mutation_opts),
            attrs = flow_stamp_governance_command_time(attrs),
            :ok <- maybe_renew_governance_limit(ctx, attrs) do
-        Router.flow_extend_lease(ctx, attrs)
+        ctx
+        |> Router.flow_extend_lease(attrs)
+        |> maybe_return_extend_lease(return_mode)
       end
 
     FlowTelemetry.observe(:extend_lease, started, result, %{flow_id: id, _count: 1})
@@ -963,7 +1024,7 @@ defmodule Ferricstore.Flow do
 
     command_callbacks = %{
       optional_now_ms: &optional_now_ms/1,
-      payload_return_opts: &payload_return_opts/2,
+      payload_return_opts: &PayloadReturn.options/2,
       named_value_return_opts: &named_value_return_opts/1
     }
 
@@ -1208,7 +1269,7 @@ defmodule Ferricstore.Flow do
   defp safe_decode_record(value) when is_binary(value) do
     {:ok, Codec.decode_record(value)}
   rescue
-    _ -> {:ok, nil}
+    _ -> {:error, "ERR invalid flow record"}
   end
 
   @doc false
@@ -1377,7 +1438,7 @@ defmodule Ferricstore.Flow do
     do: Map.put(attrs, :now_ms, Ferricstore.CommandTime.now_ms())
 
   defp maybe_renew_governance_limit(ctx, %{id: id, partition_key: partition_key} = attrs) do
-    case Router.flow_get(ctx, id, partition_key) do
+    case Router.flow_get_with_status(ctx, id, partition_key) do
       value when is_binary(value) ->
         case Ferricstore.Flow.decode_record(value) do
           %{
@@ -1418,8 +1479,17 @@ defmodule Ferricstore.Flow do
             :ok
         end
 
-      _missing_or_unavailable ->
+      nil ->
         :ok
+
+      :unavailable ->
+        {:error, "ERR storage read failed"}
+
+      {:error, _reason} ->
+        {:error, "ERR storage read failed"}
+
+      _invalid ->
+        {:error, "ERR invalid flow record"}
     end
   rescue
     _decode_error -> {:error, "ERR invalid flow record"}
@@ -1443,6 +1513,25 @@ defmodule Ferricstore.Flow do
       _ -> {:error, "ERR flow return must be items or ok_on_success"}
     end
   end
+
+  defp extend_lease_return_mode(opts) do
+    case Keyword.fetch(opts, :return) do
+      :error ->
+        {:ok, :record, opts}
+
+      {:ok, value} when value in [nil, :record, "record", "RECORD"] ->
+        {:ok, :record, Keyword.delete(opts, :return)}
+
+      {:ok, value} when value in [:ok_on_success, "ok_on_success", "OK_ON_SUCCESS"] ->
+        {:ok, :ok_on_success, Keyword.delete(opts, :return)}
+
+      _ ->
+        {:error, "ERR flow extend_lease return must be record or ok_on_success"}
+    end
+  end
+
+  defp maybe_return_extend_lease({:ok, _record}, :ok_on_success), do: :ok
+  defp maybe_return_extend_lease(result, _return_mode), do: result
 
   defp maybe_return_many_ok_on_success(result, :items), do: result
   defp maybe_return_many_ok_on_success(:ok, :ok_on_success), do: :ok
@@ -1505,29 +1594,6 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp optional_non_neg_integer(opts, key, default) do
-    case Keyword.fetch(opts, key) do
-      {:ok, value} when is_integer(value) and value >= 0 -> {:ok, value}
-      {:ok, _} -> {:error, "ERR flow #{key} must be a non-negative integer"}
-      :error when is_integer(default) and default >= 0 -> {:ok, default}
-      :error when is_nil(default) -> {:ok, nil}
-      :error -> {:error, "ERR flow #{key} must be a non-negative integer"}
-    end
-  end
-
-  defp payload_return_opts(opts, default_enabled?) do
-    with {:ok, full?} <- optional_boolean(opts, :full, default_enabled?),
-         {:ok, enabled?} <- optional_boolean(opts, :payload, full?),
-         {:ok, max_bytes} <-
-           optional_non_neg_integer(
-             opts,
-             :payload_max_bytes,
-             flow_payload_return_max_bytes()
-           ) do
-      {:ok, %{enabled?: enabled?, max_bytes: max_bytes}}
-    end
-  end
-
   defp named_value_return_opts(opts) do
     case Keyword.fetch(opts, :values) do
       :error -> {:ok, nil}
@@ -1551,21 +1617,15 @@ defmodule Ferricstore.Flow do
     end
   end
 
-  defp flow_payload_return_max_bytes do
-    case Application.get_env(
-           :ferricstore,
-           :flow_payload_return_max_bytes,
-           @default_payload_return_max_bytes
-         ) do
-      value when is_integer(value) and value >= 0 -> value
-      _ -> @default_payload_return_max_bytes
-    end
-  end
+  @max_exact_ms 9_007_199_254_740_991
 
   defp optional_now_ms(opts) do
     case Keyword.fetch(opts, :now_ms) do
-      {:ok, value} when is_integer(value) and value >= 0 ->
+      {:ok, value} when is_integer(value) and value >= 0 and value <= @max_exact_ms ->
         {:ok, value}
+
+      {:ok, value} when is_integer(value) and value > @max_exact_ms ->
+        {:error, "ERR flow now_ms exceeds maximum #{@max_exact_ms}"}
 
       {:ok, _value} ->
         {:error, "ERR flow now_ms must be a non-negative integer"}

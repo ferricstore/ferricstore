@@ -364,7 +364,14 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
           Ferricstore.Test.IsolatedInstance.checkin(ctx)
         end)
 
-        ref = "f:{lmdb-direct-blob}:v:p:flow-lmdb-direct-blob:1"
+        ref =
+          Ferricstore.Flow.Keys.value_key(
+            "flow-lmdb-direct-blob",
+            :payload,
+            1,
+            "lmdb-direct-blob"
+          )
+
         payload = String.duplicate("payload-", 64)
         encoded_payload = Ferricstore.Flow.encode_value(payload)
 
@@ -398,7 +405,14 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
           Ferricstore.Test.IsolatedInstance.checkin(ctx)
         end)
 
-        ref = "f:{lmdb-blob-gc}:v:p:flow-lmdb-blob-gc:1"
+        ref =
+          Ferricstore.Flow.Keys.value_key(
+            "flow-lmdb-blob-gc",
+            :payload,
+            1,
+            "lmdb-blob-gc"
+          )
+
         payload = String.duplicate("payload-", 64)
         encoded_payload = Ferricstore.Flow.encode_value(payload)
 
@@ -434,8 +448,22 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
           Ferricstore.Test.IsolatedInstance.checkin(ctx)
         end)
 
-        ref1 = "f:{lmdb-locator-batch}:v:p:flow-lmdb-locator-batch-1:1"
-        ref2 = "f:{lmdb-locator-batch}:v:p:flow-lmdb-locator-batch-2:1"
+        ref1 =
+          Ferricstore.Flow.Keys.value_key(
+            "flow-lmdb-locator-batch-1",
+            :payload,
+            1,
+            "lmdb-locator-batch"
+          )
+
+        ref2 =
+          Ferricstore.Flow.Keys.value_key(
+            "flow-lmdb-locator-batch-2",
+            :payload,
+            1,
+            "lmdb-locator-batch"
+          )
+
         encoded1 = Ferricstore.Flow.encode_value("value-one")
         encoded2 = Ferricstore.Flow.encode_value("value-two")
         index = 12_345
@@ -576,7 +604,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
         refute Task.yield(flush, 50),
                "flush replied before the async enqueue reservation reached the writer"
 
-        GenServer.cast(writer, {:enqueue, seq, [{:put, key, "v1"}], []})
+        GenServer.cast(writer, {:enqueue, seq, [{:put, key, "v1"}], [], {seq_ref, 0}})
 
         assert Task.await(flush, 1_000) == :ok
         assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)

@@ -21,7 +21,7 @@
 //! where h1 and h2 are derived from xxh3 with two different seeds.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -36,6 +36,8 @@ const YIELD_CHECK_INTERVAL: usize = 64;
 const MAGIC: u64 = 0x424C_4F4F_4D46_5F31; // "BLOOMF_1"
 const HEADER_SIZE: usize = 32;
 const MAX_NUM_HASHES: u32 = 1024;
+const MAX_BLOOM_BYTES: u64 = 1 << 30;
+const MAX_BLOOM_BITS: u64 = MAX_BLOOM_BYTES * 8;
 
 // ---------------------------------------------------------------------------
 // NIF atoms
@@ -65,6 +67,9 @@ fn file_hash_positions(element: &[u8], num_bits: u64, num_hashes: u32) -> Vec<u6
 }
 
 fn bloom_file_size(num_bits: u64) -> Result<u64, String> {
+    if num_bits > MAX_BLOOM_BITS {
+        return Err(format!("bloom bit array exceeds {MAX_BLOOM_BYTES} bytes"));
+    }
     let byte_count = num_bits.div_ceil(8);
     (HEADER_SIZE as u64)
         .checked_add(byte_count)
@@ -113,11 +118,27 @@ fn file_read_header(file: &File) -> Result<(u64, u32, u64), String> {
     if num_bits == 0 {
         return Err("num_bits must be > 0".into());
     }
+    if header[20..24].iter().any(|byte| *byte != 0) {
+        return Err("bloom reserved header bytes must be zero".into());
+    }
+    if count > num_bits {
+        return Err("bloom count must not exceed num_bits".into());
+    }
+    let expected_size = bloom_file_size(num_bits)?;
     if num_hashes == 0 {
         return Err("num_hashes must be > 0".into());
     }
     if num_hashes > MAX_NUM_HASHES {
         return Err(format!("num_hashes must be <= {MAX_NUM_HASHES}"));
+    }
+    let actual_size = file
+        .metadata()
+        .map_err(|error| format!("read bloom file metadata: {error}"))?
+        .len();
+    if actual_size != expected_size {
+        return Err(format!(
+            "bloom file size mismatch: expected {expected_size}, got {actual_size}"
+        ));
     }
 
     Ok((num_bits, num_hashes, count))
@@ -146,7 +167,7 @@ fn encode_file_error(env: Env, fe: FileError) -> Term {
 
 /// Create a new bloom filter file at the given path.
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_create(
     env: Env,
@@ -176,13 +197,13 @@ pub fn bloom_file_create(
 
     // Ensure parent directory exists.
     if let Some(parent) = p.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
+        if let Err(e) = crate::fs_nif::create_dir_all_nofollow(parent) {
             return Ok((atoms::error(), format!("mkdir: {e}")).encode(env));
         }
     }
 
     // Write the file with header + zeroed bit array.
-    let mut file = match File::create(p) {
+    let mut file = match crate::create_staged_locked_nofollow(p) {
         Ok(f) => f,
         Err(e) => return Ok((atoms::error(), format!("create: {e}")).encode(env)),
     };
@@ -202,8 +223,8 @@ pub fn bloom_file_create(
         return Ok((atoms::error(), format!("set file size: {e}")).encode(env));
     }
 
-    if let Err(e) = file.sync_data() {
-        return Ok((atoms::error(), format!("fdatasync: {e}")).encode(env));
+    if let Err(e) = file.publish() {
+        return Ok((atoms::error(), format!("publish: {e}")).encode(env));
     }
 
     Ok((atoms::ok(), atoms::ok()).encode(env))
@@ -212,10 +233,10 @@ pub fn bloom_file_create(
 /// Add an element to a bloom filter file via pread/pwrite.
 /// Returns `{:ok, 1}` if any bit was newly set, `{:ok, 0}` if all bits were already set.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> NifResult<Term<'a>> {
-    let file = match crate::open_random_rw(Path::new(&path)) {
+    let file = match crate::open_random_rw_locked(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -277,14 +298,14 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
 /// Add multiple elements to a bloom filter file via pread/pwrite.
 /// Returns `{:ok, [0|1, ...]}` with one result per element.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_madd<'a>(
     env: Env<'a>,
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let file = match crate::open_random_rw(Path::new(&path)) {
+    let file = match crate::open_random_rw_locked(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -371,14 +392,14 @@ pub fn bloom_file_madd<'a>(
 /// Check if an element may exist in a bloom filter file via pread.
 /// Returns `{:ok, 1}` if possibly present, `{:ok, 0}` if definitely not.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_exists<'a>(
     env: Env<'a>,
     path: String,
     element: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let file = match crate::open_random_read(Path::new(&path)) {
+    let file = match crate::open_random_read_locked(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -413,14 +434,14 @@ pub fn bloom_file_exists<'a>(
 /// Check if multiple elements may exist in a bloom filter file via pread.
 /// Returns `{:ok, [0|1, ...]}` with one result per element.
 /// Returns `{:error, :enoent}` if the file does not exist.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_mexists<'a>(
     env: Env<'a>,
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let file = match crate::open_random_read(Path::new(&path)) {
+    let file = match crate::open_random_read_locked(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -465,10 +486,10 @@ pub fn bloom_file_mexists<'a>(
 
 /// Return the insertion count from a bloom filter file header.
 /// Returns `{:ok, count}` or `{:error, :enoent}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_card(env: Env, path: String) -> NifResult<Term> {
-    let file = match crate::open_random_read(Path::new(&path)) {
+    let file = match crate::open_random_read_locked(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -484,10 +505,10 @@ pub fn bloom_file_card(env: Env, path: String) -> NifResult<Term> {
 
 /// Return bloom filter info from a file header.
 /// Returns `{:ok, {num_bits, count, num_hashes}}` or `{:error, :enoent}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_info(env: Env, path: String) -> NifResult<Term> {
-    let file = match crate::open_random_read(Path::new(&path)) {
+    let file = match crate::open_random_read_locked(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -506,7 +527,7 @@ pub fn bloom_file_info(env: Env, path: String) -> NifResult<Term> {
 // ---------------------------------------------------------------------------
 
 /// Async bloom exists: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn bloom_file_exists_async<'a>(
     env: Env<'a>,
@@ -516,33 +537,38 @@ pub fn bloom_file_exists_async<'a>(
     element: Binary<'a>,
 ) -> NifResult<Term<'a>> {
     let element_owned = element.as_slice().to_vec();
-    crate::async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "enoent".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
-            let positions = file_hash_positions(&element_owned, num_bits, num_hashes);
-            for pos in positions {
-                let byte_index = pos / 8;
-                let bit_offset = (pos % 8) as u8;
-                let file_offset = HEADER_SIZE as u64 + byte_index;
-                let mut buf = [0u8; 1];
-                bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
-                if (buf[0] & (1u8 << bit_offset)) == 0 {
-                    crate::fadvise_dontneed(&file, 0, 0);
-                    return Ok(0u32);
-                }
+    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+        let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "enoent".to_string()
+            } else {
+                e.to_string()
             }
-            crate::fadvise_dontneed(&file, 0, 0);
-            Ok(1u32)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+        })?;
+        let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
+        let positions = file_hash_positions(&element_owned, num_bits, num_hashes);
+        for pos in positions {
+            let byte_index = pos / 8;
+            let bit_offset = (pos % 8) as u8;
+            let file_offset = HEADER_SIZE as u64 + byte_index;
+            let mut buf = [0u8; 1];
+            bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
+            if (buf[0] & (1u8 << bit_offset)) == 0 {
+                crate::fadvise_dontneed(&file, 0, 0);
+                return Ok(0u32);
+            }
+        }
+        crate::fadvise_dontneed(&file, 0, 0);
+        Ok(1u32)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
+    crate::async_io::runtime().spawn(async move {
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -560,7 +586,7 @@ pub fn bloom_file_exists_async<'a>(
 }
 
 /// Async bloom mexists: spawns on Tokio, sends result to `caller_pid`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn bloom_file_mexists_async<'a>(
     env: Env<'a>,
@@ -570,38 +596,43 @@ pub fn bloom_file_mexists_async<'a>(
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
     let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
-    crate::async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "enoent".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
-            let mut results: Vec<u32> = Vec::with_capacity(elements_owned.len());
-            for element in &elements_owned {
-                let positions = file_hash_positions(element, num_bits, num_hashes);
-                let mut found = true;
-                for pos in positions {
-                    let byte_index = pos / 8;
-                    let bit_offset = (pos % 8) as u8;
-                    let file_offset = HEADER_SIZE as u64 + byte_index;
-                    let mut buf = [0u8; 1];
-                    bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
-                    if (buf[0] & (1u8 << bit_offset)) == 0 {
-                        found = false;
-                        break;
-                    }
-                }
-                results.push(u32::from(found));
+    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+        let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "enoent".to_string()
+            } else {
+                e.to_string()
             }
-            crate::fadvise_dontneed(&file, 0, 0);
-            Ok(results)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+        })?;
+        let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
+        let mut results: Vec<u32> = Vec::with_capacity(elements_owned.len());
+        for element in &elements_owned {
+            let positions = file_hash_positions(element, num_bits, num_hashes);
+            let mut found = true;
+            for pos in positions {
+                let byte_index = pos / 8;
+                let bit_offset = (pos % 8) as u8;
+                let file_offset = HEADER_SIZE as u64 + byte_index;
+                let mut buf = [0u8; 1];
+                bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
+                if (buf[0] & (1u8 << bit_offset)) == 0 {
+                    found = false;
+                    break;
+                }
+            }
+            results.push(u32::from(found));
+        }
+        crate::fadvise_dontneed(&file, 0, 0);
+        Ok(results)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
+    crate::async_io::runtime().spawn(async move {
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -627,21 +658,26 @@ pub fn bloom_file_card_async(
     correlation_id: u64,
     path: String,
 ) -> NifResult<Term<'_>> {
+    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+        let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "enoent".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        let (_num_bits, _num_hashes, count) = file_read_header(&file).map_err(|e| e.clone())?;
+        crate::fadvise_dontneed(&file, 0, 0);
+        Ok(count)
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     crate::async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "enoent".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            let (_num_bits, _num_hashes, count) = file_read_header(&file).map_err(|e| e.clone())?;
-            crate::fadvise_dontneed(&file, 0, 0);
-            Ok(count)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -667,21 +703,26 @@ pub fn bloom_file_info_async(
     correlation_id: u64,
     path: String,
 ) -> NifResult<Term<'_>> {
+    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+        let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "enoent".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        let (num_bits, num_hashes, count) = file_read_header(&file).map_err(|e| e.clone())?;
+        crate::fadvise_dontneed(&file, 0, 0);
+        Ok((num_bits, count, num_hashes as u64))
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     crate::async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "enoent".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            let (num_bits, num_hashes, count) = file_read_header(&file).map_err(|e| e.clone())?;
-            crate::fadvise_dontneed(&file, 0, 0);
-            Ok((num_bits, count, num_hashes as u64))
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {

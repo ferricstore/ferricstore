@@ -24,6 +24,8 @@ defmodule Ferricstore.Commands.Blocking do
     * `BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]` -- blocking LMPOP
   """
 
+  @max_timeout_ms 0xFFFFFFFF
+
   @doc """
   Parses BLPOP/BRPOP arguments into `{:ok, keys, timeout_ms}` or `{:error, msg}`.
 
@@ -127,56 +129,34 @@ defmodule Ferricstore.Commands.Blocking do
     {:error, "ERR wrong number of arguments for 'blmpop' command"}
   end
 
-  @doc """
-  Parses BRPOPLPUSH arguments into `{:ok, source, destination, timeout_ms}` or `{:error, msg}`.
-
-  Format: `source destination timeout`
-
-  ## Parameters
-
-    - `args` -- list of string arguments: `[source, destination, timeout]`
-
-  ## Returns
-
-    - `{:ok, source, destination, timeout_ms}` -- parsed arguments
-    - `{:error, reason}` -- parse error
-  """
-  @spec parse_brpoplpush_args([binary()]) ::
-          {:ok, binary(), binary(), non_neg_integer()} | {:error, binary()}
-  def parse_brpoplpush_args([source, destination, timeout_str]) do
-    case parse_timeout(timeout_str) do
-      {:ok, timeout_ms} ->
-        {:ok, source, destination, timeout_ms}
-
-      {:error, _} = err ->
-        err
-    end
-  end
-
-  def parse_brpoplpush_args(_args) do
-    {:error, "ERR wrong number of arguments for 'brpoplpush' command"}
-  end
-
   # ===========================================================================
   # Private -- parsing helpers
   # ===========================================================================
 
   defp parse_timeout(str) do
     case Float.parse(str) do
-      {val, ""} when val >= 0 ->
+      {val, ""} when val >= 0 and val <= @max_timeout_ms / 1_000 ->
         {:ok, trunc(val * 1000)}
 
       {_val, ""} ->
-        {:error, "ERR timeout is negative"}
+        timeout_range_error(str)
 
       _ ->
         case Integer.parse(str) do
-          {val, ""} when val >= 0 -> {:ok, val * 1000}
+          {val, ""} when val >= 0 and val <= div(@max_timeout_ms, 1_000) ->
+            {:ok, val * 1000}
+
           {_val, ""} -> {:error, "ERR timeout is negative"}
           _ -> {:error, "ERR timeout is not a float or out of range"}
         end
     end
+  rescue
+    ArgumentError -> {:error, "ERR timeout is not a float or out of range"}
+    ArithmeticError -> {:error, "ERR timeout is not a float or out of range"}
   end
+
+  defp timeout_range_error("-" <> _rest), do: {:error, "ERR timeout is negative"}
+  defp timeout_range_error(_str), do: {:error, "ERR timeout is not a float or out of range"}
 
   defp parse_direction(dir) do
     case String.upcase(dir) do
@@ -208,16 +188,6 @@ defmodule Ferricstore.Commands.Blocking do
   @spec handle(binary(), [binary()], map()) :: term()
   def handle("BLPOP", args, store), do: do_blocking_pop(args, store, "LPOP")
   def handle("BRPOP", args, store), do: do_blocking_pop(args, store, "RPOP")
-
-  def handle("BRPOPLPUSH", args, store) do
-    case parse_brpoplpush_args(args) do
-      {:ok, source, destination, _timeout_ms} ->
-        List.handle_ast({:lmove, source, destination, :right, :left}, store)
-
-      {:error, _} = err ->
-        err
-    end
-  end
 
   def handle("BLMOVE", args, store) do
     case parse_blmove_args(args) do

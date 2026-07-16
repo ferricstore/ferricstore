@@ -13,6 +13,12 @@ defmodule Ferricstore.Flow.Governance.Policy do
 
   @modes [:minimal, :ledger, :full]
   @denial_audit_modes [:off, :sampled, :all]
+  @max_rules 1_000
+  @max_string_list_values 1_000
+  @max_string_bytes 65_535
+  @max_error_class_bytes 256
+  @max_policy_bytes 1_048_576
+  @max_exact_integer 9_007_199_254_740_991
   @enforcement_modes [
     :strict_global,
     :approximate_global
@@ -38,26 +44,25 @@ defmodule Ferricstore.Flow.Governance.Policy do
          {:ok, budgets} <- optional_budgets(policy),
          {:ok, circuits} <- optional_circuits(policy),
          {:ok, approvals} <- optional_approvals(policy) do
-      {:ok,
-       %{}
-       |> maybe_put(:mode, mode)
-       |> maybe_put(:effects, effects)
-       |> maybe_put(:audit, audit)
-       |> maybe_put(:limits, limits)
-       |> maybe_put(:budgets, budgets)
-       |> maybe_put(:circuits, circuits)
-       |> maybe_put(:approvals, approvals)}
+      %{}
+      |> maybe_put(:mode, mode)
+      |> maybe_put(:effects, effects)
+      |> maybe_put(:audit, audit)
+      |> maybe_put(:limits, limits)
+      |> maybe_put(:budgets, budgets)
+      |> maybe_put(:circuits, circuits)
+      |> maybe_put(:approvals, approvals)
+      |> validate_policy_size()
     end
   end
 
   def normalize(_policy), do: {:error, "ERR flow governance policy must be a map or keyword list"}
 
-  def resolve(policy, state \\ nil, effect_type \\ nil) do
+  def resolve(policy, state \\ nil, _effect_type \\ nil) do
     base =
       default()
       |> merge_policy(flow_governance(policy))
       |> merge_policy(state_policy(policy, state))
-      |> merge_policy(effect_policy(policy, effect_type))
 
     base
     |> Map.put(:policy_hash, policy_hash(base))
@@ -257,17 +262,29 @@ defmodule Ferricstore.Flow.Governance.Policy do
         end
 
       rules when is_map(rules) ->
-        rules
-        |> Enum.reduce_while({:ok, %{}}, fn
-          {name, rule}, {:ok, acc} when is_binary(name) and name != "" ->
-            case normalizer.(rule) do
-              {:ok, normalized} -> {:cont, {:ok, Map.put(acc, name, normalized)}}
-              {:error, _reason} = error -> {:halt, error}
-            end
+        if map_size(rules) <= @max_rules do
+          rules
+          |> Enum.reduce_while({:ok, %{}}, fn
+            {name, rule}, {:ok, acc}
+            when is_binary(name) and name != "" and byte_size(name) <= @max_string_bytes ->
+              case normalizer.(rule) do
+                {:ok, normalized} -> {:cont, {:ok, Map.put(acc, name, normalized)}}
+                {:error, _reason} = error -> {:halt, error}
+              end
 
-          _entry, _acc ->
-            {:halt, {:error, "ERR flow governance #{binary_key} names must be non-empty strings"}}
-        end)
+            {name, _rule}, _acc when is_binary(name) and name != "" ->
+              {:halt,
+               {:error,
+                "ERR flow governance #{binary_key} names must be at most #{@max_string_bytes} bytes"}}
+
+            _entry, _acc ->
+              {:halt,
+               {:error, "ERR flow governance #{binary_key} names must be non-empty strings"}}
+          end)
+        else
+          {:error,
+           "ERR flow governance #{binary_key} policy must contain at most #{@max_rules} rules"}
+        end
 
       _other ->
         {:error, "ERR flow governance #{binary_key} policy must be a map or keyword list"}
@@ -311,7 +328,13 @@ defmodule Ferricstore.Flow.Governance.Policy do
          {:ok, failure_rate_pct} <- optional_percent(rule, :failure_rate_pct, "failure_rate_pct"),
          {:ok, latency_threshold_ms} <-
            optional_positive_integer(rule, :latency_threshold_ms, "latency_threshold_ms"),
-         {:ok, error_classes} <- optional_string_list(rule, :error_classes, "error_classes"),
+         {:ok, error_classes} <-
+           optional_string_list(
+             rule,
+             :error_classes,
+             "error_classes",
+             @max_error_class_bytes
+           ),
          {:ok, half_open_max_probes} <-
            optional_positive_integer(rule, :half_open_max_probes, "half_open_max_probes"),
          {:ok, half_open_success_threshold} <-
@@ -353,27 +376,56 @@ defmodule Ferricstore.Flow.Governance.Policy do
   end
 
   defp optional_string_list(policy, atom_key, binary_key) do
+    optional_string_list(policy, atom_key, binary_key, @max_string_bytes)
+  end
+
+  defp optional_string_list(policy, atom_key, binary_key, max_bytes) do
     case fetch_policy(policy, atom_key, binary_key, nil) do
       nil -> {:ok, nil}
-      values when is_list(values) -> normalize_string_list(values)
+      values when is_list(values) -> normalize_string_list(values, binary_key, max_bytes)
       _other -> {:error, "ERR flow governance #{binary_key} must be a list of strings"}
     end
   end
 
-  defp normalize_string_list(values) do
-    values
-    |> Enum.reduce_while({:ok, []}, fn
-      value, {:ok, acc} when is_binary(value) and value != "" ->
-        {:cont, {:ok, [value | acc]}}
+  defp normalize_string_list(values, name, max_bytes) do
+    normalize_string_list(values, name, max_bytes, MapSet.new(), [], 0)
+  end
 
-      _value, _acc ->
-        {:halt, {:error, "ERR flow governance list values must be non-empty strings"}}
-    end)
-    |> case do
-      {:ok, values} -> {:ok, values |> Enum.uniq() |> Enum.reverse()}
-      {:error, _reason} = error -> error
+  defp normalize_string_list([], _name, _max_bytes, _seen, values, _count),
+    do: {:ok, Enum.reverse(values)}
+
+  defp normalize_string_list(
+         [_value | _rest],
+         _name,
+         _max_bytes,
+         _seen,
+         _values,
+         @max_string_list_values
+       ),
+       do: {:error, "ERR flow governance list must contain at most 1000 values"}
+
+  defp normalize_string_list([value | rest], name, max_bytes, seen, values, count)
+       when is_binary(value) and value != "" and byte_size(value) <= max_bytes do
+    if MapSet.member?(seen, value) do
+      normalize_string_list(rest, name, max_bytes, seen, values, count + 1)
+    else
+      normalize_string_list(
+        rest,
+        name,
+        max_bytes,
+        MapSet.put(seen, value),
+        [value | values],
+        count + 1
+      )
     end
   end
+
+  defp normalize_string_list([value | _rest], name, max_bytes, _seen, _values, _count)
+       when is_binary(value) and value != "",
+       do: {:error, "ERR flow governance #{name} values must be at most #{max_bytes} bytes"}
+
+  defp normalize_string_list(_values, _name, _max_bytes, _seen, _normalized, _count),
+    do: {:error, "ERR flow governance list values must be non-empty strings"}
 
   defp optional_boolean(policy, atom_key, binary_key) do
     case fetch_policy(policy, atom_key, binary_key, nil) do
@@ -385,9 +437,15 @@ defmodule Ferricstore.Flow.Governance.Policy do
 
   defp optional_string(policy, atom_key, binary_key) do
     case fetch_policy(policy, atom_key, binary_key, nil) do
-      nil -> {:ok, nil}
-      value when is_binary(value) and value != "" -> {:ok, value}
-      _other -> {:error, "ERR flow governance #{binary_key} must be a non-empty string"}
+      nil ->
+        {:ok, nil}
+
+      value when is_binary(value) and value != "" and byte_size(value) <= @max_string_bytes ->
+        {:ok, value}
+
+      _other ->
+        {:error,
+         "ERR flow governance #{binary_key} must be a non-empty string of at most #{@max_string_bytes} bytes"}
     end
   end
 
@@ -414,7 +472,7 @@ defmodule Ferricstore.Flow.Governance.Policy do
   defp optional_positive_integer(policy, atom_key, binary_key) do
     case fetch_policy(policy, atom_key, binary_key, nil) do
       nil -> {:ok, nil}
-      value when is_integer(value) and value > 0 -> {:ok, value}
+      value when is_integer(value) and value > 0 and value <= @max_exact_integer -> {:ok, value}
       _other -> {:error, "ERR flow governance #{binary_key} must be a positive integer"}
     end
   end
@@ -429,14 +487,14 @@ defmodule Ferricstore.Flow.Governance.Policy do
 
   defp required_positive_integer(policy, atom_key, binary_key) do
     case fetch_policy(policy, atom_key, binary_key, nil) do
-      value when is_integer(value) and value > 0 -> {:ok, value}
+      value when is_integer(value) and value > 0 and value <= @max_exact_integer -> {:ok, value}
       _other -> {:error, "ERR flow governance #{binary_key} must be a positive integer"}
     end
   end
 
   defp required_non_negative_integer(policy, atom_key, binary_key) do
     case fetch_policy(policy, atom_key, binary_key, nil) do
-      value when is_integer(value) and value >= 0 -> {:ok, value}
+      value when is_integer(value) and value >= 0 and value <= @max_exact_integer -> {:ok, value}
       _other -> {:error, "ERR flow governance #{binary_key} must be a non-negative integer"}
     end
   end
@@ -465,22 +523,18 @@ defmodule Ferricstore.Flow.Governance.Policy do
 
   defp state_policy(_policy, _state), do: nil
 
-  defp effect_policy(%{governance: %{effects_by_type: policies}}, effect_type)
-       when is_map(policies) and is_binary(effect_type) do
-    Map.get(policies, effect_type)
-  end
-
-  defp effect_policy(_policy, _effect_type), do: nil
-
   defp policy_version(%{version: version}) when is_binary(version) and version != "", do: version
-  defp policy_version(%{version: version}) when is_integer(version) and version >= 0, do: version
+
+  defp policy_version(%{version: version})
+       when is_integer(version) and version >= 0 and version <= @max_exact_integer,
+       do: version
 
   defp policy_version(%{governance: %{version: version}})
        when is_binary(version) and version != "",
        do: version
 
   defp policy_version(%{governance: %{version: version}})
-       when is_integer(version) and version >= 0,
+       when is_integer(version) and version >= 0 and version <= @max_exact_integer,
        do: version
 
   defp policy_version(_policy), do: nil
@@ -512,6 +566,14 @@ defmodule Ferricstore.Flow.Governance.Policy do
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp validate_policy_size(policy) do
+    if :erlang.external_size(policy) <= @max_policy_bytes do
+      {:ok, policy}
+    else
+      {:error, "ERR flow governance policy exceeds #{@max_policy_bytes}-byte durable limit"}
+    end
+  end
 
   defp fetch_policy(policy, atom_key, binary_key, default) do
     cond do

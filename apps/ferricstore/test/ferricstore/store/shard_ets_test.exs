@@ -8,6 +8,11 @@ defmodule Ferricstore.Store.ShardETSTest do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.LFU
+  alias Ferricstore.Store.LocalTxStore
+  alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.Ops.LocalRead
+  alias Ferricstore.Store.Shard.Compound.Read, as: CompoundRead
+  alias Ferricstore.Store.Shard.Compound.Promoted
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
   alias Ferricstore.Test.ShardHelpers
@@ -119,6 +124,23 @@ defmodule Ferricstore.Store.ShardETSTest do
     end
   end
 
+  test "pending classifiers preserve malformed expiry metadata conservatively" do
+    keydir = :ets.new(:shard_ets_pending_invalid_expiry, [:set, :public])
+    key = "ets:pending:invalid-expiry"
+    entry = {key, nil, -1, LFU.initial(), :pending, 0, 3}
+    state = %{keydir: keydir}
+
+    try do
+      :ets.insert(keydir, entry)
+
+      assert ShardETS.pending_cold?(state, key)
+      assert ShardETS.prefix_has_pending_cold?(keydir, "ets:pending:")
+      assert [^entry] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   test "shard GET reads cold WARaft apply-projection locations without Bitcask file path conversion" do
     unique = System.unique_integer([:positive])
     data_dir = Path.join(System.tmp_dir!(), "ferricstore_shard_apply_projection_get_#{unique}")
@@ -205,7 +227,7 @@ defmodule Ferricstore.Store.ShardETSTest do
     end
   end
 
-  test "warm lookup rejects malformed cold location without calling NIF" do
+  test "warm lookup reports malformed cold location without deleting the live row" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     key = "ets:cold:bad-offset"
 
@@ -218,8 +240,197 @@ defmodule Ferricstore.Store.ShardETSTest do
     try do
       :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
 
-      assert :expired == ShardETS.ets_lookup_warm(state, key)
-      assert [] == :ets.lookup(keydir, key)
+      assert {:error, :cold_read_failed} == ShardETS.ets_lookup_warm_result(state, key)
+      assert [{^key, nil, 0, _lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "shard read handlers fail closed on a malformed live cold location" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:cold:bad-handler-offset"
+
+    state = %{
+      keydir: keydir,
+      shard_data_path: System.tmp_dir!(),
+      instance_ctx: %{hot_cache_max_value_size: 64}
+    }
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+      failure = {:error, {:storage_read_failed, :invalid_keydir_entry}}
+
+      assert {:reply, ^failure, ^state} = ShardReads.handle_get(key, state)
+      assert {:reply, ^failure, ^state} = ShardReads.handle_get_meta(key, state)
+      assert {:reply, ^failure, ^state} = ShardReads.handle_get_file_ref(key, state)
+      assert {:reply, true, ^state} = ShardReads.handle_exists(key, state)
+      assert failure == ShardReads.do_get(state, key)
+      assert failure == ShardReads.do_get_meta(state, key)
+      assert [{^key, nil, 0, _lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "synchronous shard reads report failures for live cold rows" do
+    keydir = :ets.new(:shard_ets_missing_cold_read, [:set, :public])
+    key = "ets:cold:missing-file"
+
+    dir =
+      Path.join(System.tmp_dir!(), "shard_ets_missing_#{System.unique_integer([:positive])}")
+
+    state = %{keydir: keydir, shard_data_path: dir}
+
+    try do
+      File.mkdir_p!(dir)
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 9, 0, 3})
+
+      assert {:reply, {:error, {:storage_read_failed, {:cold_read_failed, _reason}}}, ^state} =
+               ShardReads.handle_get(key, state)
+
+      assert {:reply, {:error, {:storage_read_failed, {:cold_read_failed, _reason}}}, ^state} =
+               ShardReads.handle_get_meta(key, state)
+
+      assert {:error, {:storage_read_failed, {:cold_read_failed, _reason}}} =
+               ShardReads.do_get(state, key)
+
+      assert {:error, {:storage_read_failed, {:cold_read_failed, _reason}}} =
+               ShardReads.do_get_meta(state, key)
+
+      assert [{^key, nil, 0, _lfu, 9, 0, 3}] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+      File.rm_rf(dir)
+    end
+  end
+
+  test "transaction-local existence stays conservative for a malformed live row" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:cold:bad-local-exists"
+    state = %{keydir: keydir, shard_data_path: System.tmp_dir!()}
+    tx = %LocalTxStore{instance_ctx: nil, shard_index: 0, shard_state: state}
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+
+      assert LocalRead.local_exists?(tx, key)
+      assert [{^key, nil, 0, _lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "transaction-local metadata ignores unrelated malformed locator fields" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:cold:bad-local-metadata"
+    lfu = LFU.initial()
+    state = %{keydir: keydir, shard_data_path: System.tmp_dir!()}
+    tx = %LocalTxStore{instance_ctx: nil, shard_index: 0, shard_state: state}
+
+    try do
+      :ets.insert(keydir, {key, nil, 0, lfu, 0, :pending_offset, 3})
+
+      assert {:error, {:storage_read_failed, :cold_read_failed}} == Ops.get(tx, key)
+
+      assert {:error, {:storage_read_failed, :cold_read_failed}} == Ops.get_meta(tx, key)
+
+      assert 0 == Ops.expire_at_ms(tx, key)
+      assert 3 == Ops.value_size(tx, key)
+      assert lfu == Ops.object_lfu(tx, key)
+
+      assert {:error, {:storage_read_failed, :invalid_keydir_entry}} ==
+               Ops.getrange(tx, key, 0, 1)
+
+      assert [{^key, nil, 0, ^lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "compound reads report malformed live rows in single and batch results" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    redis_key = "ets:compound:bad-location"
+    compound_key = CompoundKey.type_key(redis_key)
+
+    state = %{
+      ets: keydir,
+      keydir: keydir,
+      promoted_instances: %{},
+      shard_data_path: System.tmp_dir!()
+    }
+
+    try do
+      :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
+      failure = {:error, {:storage_read_failed, :invalid_keydir_entry}}
+
+      assert {:reply, ^failure, ^state} =
+               CompoundRead.handle_compound_get(redis_key, compound_key, state)
+
+      assert {:reply, [^failure], ^state} =
+               CompoundRead.handle_compound_batch_get(redis_key, [compound_key], state)
+
+      assert {:reply, ^failure, ^state} =
+               CompoundRead.handle_compound_get_meta(redis_key, compound_key, state)
+
+      assert {:reply, [^failure], ^state} =
+               CompoundRead.handle_compound_batch_get_meta(redis_key, [compound_key], state)
+
+      assert [{^compound_key, nil, 0, _lfu, 0, :pending_offset, 3}] =
+               :ets.lookup(keydir, compound_key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "compound batch reads report live cold read failures per position" do
+    keydir = :ets.new(:shard_ets_compound_cold_failure, [:set, :public])
+    redis_key = "ets:compound:missing-file"
+    compound_key = CompoundKey.type_key(redis_key)
+
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "shard_ets_compound_missing_#{System.unique_integer([:positive])}"
+      )
+
+    state = %{
+      ets: keydir,
+      keydir: keydir,
+      promoted_instances: %{},
+      shard_data_path: dir
+    }
+
+    try do
+      File.mkdir_p!(dir)
+      :ets.insert(keydir, {compound_key, nil, 0, LFU.initial(), 9, 0, 3})
+
+      assert {:reply, [{:error, {:storage_read_failed, {:cold_read_failed, _reason}}}], ^state} =
+               CompoundRead.handle_compound_batch_get(redis_key, [compound_key], state)
+
+      assert {:reply, [{:error, {:storage_read_failed, {:cold_read_failed, _reason}}}], ^state} =
+               CompoundRead.handle_compound_batch_get_meta(redis_key, [compound_key], state)
+
+      assert [{^compound_key, nil, 0, _lfu, 9, 0, 3}] = :ets.lookup(keydir, compound_key)
+    after
+      :ets.delete(keydir)
+      File.rm_rf(dir)
+    end
+  end
+
+  test "promoted reads preserve and report malformed live keydir rows" do
+    keydir = :ets.new(:shard_ets_promoted_invalid_read, [:set, :public])
+    compound_key = "H:promoted-invalid" <> <<0>> <> "field"
+    entry = {compound_key, nil, 0, LFU.initial(), 0, :invalid_offset, 3}
+    state = %{keydir: keydir}
+
+    try do
+      :ets.insert(keydir, entry)
+
+      assert {:error, :invalid_keydir_entry} ==
+               Promoted.promoted_read(System.tmp_dir!(), compound_key, state)
+
+      assert [^entry] = :ets.lookup(keydir, compound_key)
     after
       :ets.delete(keydir)
     end
@@ -249,7 +460,7 @@ defmodule Ferricstore.Store.ShardETSTest do
 
       :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
 
-      assert :miss == ShardETS.ets_lookup_warm(state, key)
+      assert {:error, :cold_read_failed} == ShardETS.ets_lookup_warm_result(state, key)
       assert [{^key, nil, 0, _lfu, 0, ^other_offset, ^value_size}] = :ets.lookup(keydir, key)
     after
       :ets.delete(keydir)
@@ -257,7 +468,7 @@ defmodule Ferricstore.Store.ShardETSTest do
     end
   end
 
-  test "warm_from_store rejects malformed cold location without calling NIF" do
+  test "warm_from_store preserves a malformed live cold location" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     key = "ets:warm-store:bad-offset"
 
@@ -270,8 +481,15 @@ defmodule Ferricstore.Store.ShardETSTest do
     try do
       :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
 
-      assert nil == ShardETS.warm_from_store(state, key)
-      assert [] == :ets.lookup(keydir, key)
+      assert {:error, {:storage_read_failed, :cold_read_failed}} ==
+               ShardETS.warm_from_store(state, key)
+
+      assert [{^key, nil, 0, _lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, key)
+
+      assert {:error, {:storage_read_failed, :cold_read_failed}} ==
+               ShardETS.warm_meta_from_store(state, key)
+
+      assert [{^key, nil, 0, _lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, key)
     after
       :ets.delete(keydir)
     end
@@ -301,7 +519,9 @@ defmodule Ferricstore.Store.ShardETSTest do
 
       :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
 
-      assert nil == ShardETS.warm_from_store(state, key)
+      assert {:error, {:storage_read_failed, :cold_read_failed}} ==
+               ShardETS.warm_from_store(state, key)
+
       assert [{^key, nil, 0, _lfu, 0, ^other_offset, ^value_size}] = :ets.lookup(keydir, key)
     after
       :ets.delete(keydir)
@@ -309,7 +529,7 @@ defmodule Ferricstore.Store.ShardETSTest do
     end
   end
 
-  test "prefix scan skips malformed cold locations without calling NIF" do
+  test "prefix scans fail closed and preserve malformed live cold locations" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     key = "H:bad-scan" <> <<0>> <> "field"
 
@@ -321,8 +541,11 @@ defmodule Ferricstore.Store.ShardETSTest do
     try do
       :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
 
-      assert [] == ShardETS.prefix_scan_entries(state, "H:bad-scan", System.tmp_dir!())
-      assert [] == :ets.lookup(keydir, key)
+      assert {:error, {:storage_read_failed, {:invalid_prefix_scan_location, ^key}}} =
+               ShardETS.prefix_scan_entries(state, "H:bad-scan", System.tmp_dir!())
+
+      assert ["field"] == ShardETS.prefix_scan_fields(state, "H:bad-scan")
+      assert [{^key, nil, 0, _lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, key)
     after
       :ets.delete(keydir)
     end
@@ -347,14 +570,15 @@ defmodule Ferricstore.Store.ShardETSTest do
 
       :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
 
-      assert [] == ShardETS.prefix_scan_entries(keydir, prefix, dir)
+      assert {:error, {:storage_read_failed, {:invalid_cold_prefix_value, nil}}} =
+               ShardETS.prefix_scan_entries(keydir, prefix, dir)
     after
       :ets.delete(keydir)
       File.rm_rf!(dir)
     end
   end
 
-  test "prefix count skips malformed cold locations" do
+  test "prefix count conservatively includes malformed live cold locations" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     key = "H:bad-count" <> <<0>> <> "field"
 
@@ -366,14 +590,14 @@ defmodule Ferricstore.Store.ShardETSTest do
     try do
       :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
 
-      assert 0 == ShardETS.prefix_count_entries(state, "H:bad-count")
-      assert [] == :ets.lookup(keydir, key)
+      assert 1 == ShardETS.prefix_count_entries(state, "H:bad-count")
+      assert [{^key, nil, 0, _lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, key)
     after
       :ets.delete(keydir)
     end
   end
 
-  test "local transaction read rejects malformed cold location without calling NIF" do
+  test "local transaction read reports malformed cold location without deleting it" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     key = "ets:tx-read:bad-offset"
 
@@ -386,14 +610,16 @@ defmodule Ferricstore.Store.ShardETSTest do
     try do
       :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 3})
 
-      assert {:ok, nil} == ShardReads.v2_local_read(state, key)
-      assert [] == :ets.lookup(keydir, key)
+      assert {:error, {:storage_read_failed, :invalid_keydir_entry}} ==
+               ShardReads.v2_local_read(state, key)
+
+      assert [{^key, nil, 0, _lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, key)
     after
       :ets.delete(keydir)
     end
   end
 
-  test "live keys skip malformed cold locations" do
+  test "live keys conservatively include malformed cold locations" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     good = "ets:keys:good"
     bad = "ets:keys:bad-offset"
@@ -408,8 +634,8 @@ defmodule Ferricstore.Store.ShardETSTest do
       :ets.insert(keydir, {good, "value", 0, LFU.initial(), :pending, 0, 0})
       :ets.insert(keydir, {bad, nil, 0, LFU.initial(), 0, :pending_offset, 3})
 
-      assert [^good] = ShardReads.live_keys(state)
-      assert [] == :ets.lookup(keydir, bad)
+      assert Enum.sort([good, bad]) == Enum.sort(ShardReads.live_keys(state))
+      assert [{^bad, nil, 0, _lfu, 0, :pending_offset, 3}] = :ets.lookup(keydir, bad)
     after
       :ets.delete(keydir)
     end

@@ -1,13 +1,11 @@
 defmodule Ferricstore.InstanceCallbacksTest do
   @moduledoc """
-  Tests for Instance callback injection, raft_apply_hook, server_command
-  routing, and on_push callback in list commands.
+  Tests for Instance callback injection and on_push callbacks in list commands.
   """
   use ExUnit.Case, async: false
   @moduletag :global_state
 
   alias Ferricstore.Test.ShardHelpers
-  alias Ferricstore.Store.Router
   alias Ferricstore.Commands.List
   alias Ferricstore.Test.MockStore
 
@@ -53,80 +51,25 @@ defmodule Ferricstore.InstanceCallbacksTest do
       assert %FerricStore.Instance{} = result
       assert result.connected_clients_fn.() == 7
     end
-  end
 
-  # ===========================================================================
-  # raft_apply_hook
-  # ===========================================================================
+    test "rejects attempts to replace immutable instance fields", %{ctx: original} do
+      assert_raise ArgumentError, fn ->
+        FerricStore.Instance.inject_callbacks(:default, shard_count: 0)
+      end
 
-  describe "raft_apply_hook" do
-    test "custom hook handles command and returns result", %{ctx: _ctx} do
-      FerricStore.Instance.inject_callbacks(:default,
-        raft_apply_hook: fn
-          {:test_echo, value} -> {:echoed, value}
-        end
-      )
-
-      ctx = FerricStore.Instance.get(:default)
-      result = Router.server_command(ctx, {:test_echo, "hello"})
-      assert result == {:echoed, "hello"}
+      assert FerricStore.Instance.get(:default) == original
     end
 
-    test "nil hook returns {:error, :no_hook}", %{ctx: _ctx} do
-      FerricStore.Instance.inject_callbacks(:default, raft_apply_hook: nil)
+    test "rejects callbacks with the wrong arity or type", %{ctx: original} do
+      assert_raise ArgumentError, fn ->
+        FerricStore.Instance.inject_callbacks(:default, connected_clients_fn: :not_a_function)
+      end
 
-      ctx = FerricStore.Instance.get(:default)
-      result = Router.server_command(ctx, {:test_echo, "hello"})
-      assert result == {:error, :no_hook}
-    end
+      assert_raise ArgumentError, fn ->
+        FerricStore.Instance.inject_callbacks(:default, server_info_fn: fn _arg -> %{} end)
+      end
 
-    test "hook can return arbitrary terms", %{ctx: _ctx} do
-      FerricStore.Instance.inject_callbacks(:default,
-        raft_apply_hook: fn cmd -> {:processed, cmd, System.monotonic_time()} end
-      )
-
-      ctx = FerricStore.Instance.get(:default)
-      result = Router.server_command(ctx, :ping)
-      assert {:processed, :ping, _ts} = result
-    end
-  end
-
-  # ===========================================================================
-  # server_command routing through Raft
-  # ===========================================================================
-
-  describe "server_command routing" do
-    test "routes through Raft consensus path", %{ctx: _ctx} do
-      FerricStore.Instance.inject_callbacks(:default,
-        raft_apply_hook: fn
-          {:test_echo, value} -> {:echoed, value}
-        end
-      )
-
-      ctx = FerricStore.Instance.get(:default)
-
-      # server_command dispatches through raft_write → quorum_write → ra.pipeline_command
-      # The result is applied by the state machine and returned.
-      result = Router.server_command(ctx, {:test_echo, "raft_path"})
-      assert result == {:echoed, "raft_path"}
-    end
-
-    test "multiple sequential server commands all apply correctly", %{ctx: _ctx} do
-      counter = :counters.new(1, [:atomics])
-
-      FerricStore.Instance.inject_callbacks(:default,
-        raft_apply_hook: fn
-          {:inc, n} ->
-            :counters.add(counter, 1, n)
-            :counters.get(counter, 1)
-        end
-      )
-
-      ctx = FerricStore.Instance.get(:default)
-
-      assert Router.server_command(ctx, {:inc, 1}) == 1
-      assert Router.server_command(ctx, {:inc, 5}) == 6
-      assert Router.server_command(ctx, {:inc, 10}) == 16
+      assert FerricStore.Instance.get(:default) == original
     end
   end
 

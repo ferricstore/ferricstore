@@ -3,8 +3,8 @@ defmodule FerricStore.API.Strings do
 
   import FerricStore.API.Store
   alias Ferricstore.Commands.Strings
-  alias Ferricstore.HLC
-  alias Ferricstore.Store.Router
+  alias Ferricstore.EmbeddedStringValidation
+  alias Ferricstore.Store.{ReadResult, Router}
 
   @type key :: FerricStore.key()
   @type value :: FerricStore.value()
@@ -67,52 +67,31 @@ defmodule FerricStore.API.Strings do
   """
   @spec set(key(), value(), set_opts()) :: :ok | {:ok, value() | nil} | nil | write_error()
   def set(key, value, opts \\ []) do
-    max_value_size =
-      Application.get_env(:ferricstore, :max_value_size, 1_048_576)
+    ctx = default_ctx()
 
-    if is_binary(value) and byte_size(value) > max_value_size do
-      {:error, "ERR value too large (#{byte_size(value)} bytes, max #{max_value_size} bytes)"}
-    else
-      set_inner(key, value, opts)
+    with {:ok, parsed} <- EmbeddedStringValidation.parse_set_options(opts),
+         :ok <- EmbeddedStringValidation.validate_value_size(ctx, value) do
+      set_inner(ctx, key, value, parsed)
     end
   end
 
-  defp set_inner(key, value, opts) do
-    ctx = default_ctx()
-    ttl = Keyword.get(opts, :ttl, 0)
-    exat = Keyword.get(opts, :exat)
-    pxat = Keyword.get(opts, :pxat)
-    nx? = Keyword.get(opts, :nx, false)
-    xx? = Keyword.get(opts, :xx, false)
-    get? = Keyword.get(opts, :get, false)
-    keepttl? = Keyword.get(opts, :keepttl, false)
-
-    # Determine expire_at_ms from the expiry options (mutually exclusive)
-    {expire_at_ms, from_keepttl?} =
-      cond do
-        keepttl? -> {0, true}
-        exat != nil -> {exat * 1000, false}
-        pxat != nil -> {pxat, false}
-        ttl > 0 -> {HLC.now_ms() + ttl, false}
-        true -> {0, false}
-      end
-
-    if nx? or xx? or get? or from_keepttl? do
+  defp set_inner(ctx, key, value, parsed) do
+    if parsed.nx or parsed.xx or parsed.get or parsed.keepttl do
       opts = %{
-        expire_at_ms: expire_at_ms,
-        nx: nx?,
-        xx: xx?,
-        get: get?,
-        keepttl: from_keepttl?
+        expire_at_ms: parsed.expire_at_ms,
+        nx: parsed.nx,
+        xx: parsed.xx,
+        get: parsed.get,
+        keepttl: parsed.keepttl
       }
 
       case Router.set(ctx, key, value, opts) do
         {:error, _} = err -> err
-        result when get? -> {:ok, result}
+        result when parsed.get -> {:ok, result}
         result -> result
       end
     else
-      Router.put(ctx, key, value, expire_at_ms)
+      Router.put(ctx, key, value, parsed.expire_at_ms)
     end
   end
 
@@ -140,11 +119,17 @@ defmodule FerricStore.API.Strings do
     store = build_string_store("")
 
     case Ferricstore.Store.TypeRegistry.get_type("", store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       type when type in ["list", "hash", "set", "zset"] ->
         {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
 
       _ ->
-        {:ok, Router.get(default_ctx(), "")}
+        case Router.get(default_ctx(), "") do
+          {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+          value -> {:ok, value}
+        end
     end
   end
 
@@ -178,6 +163,7 @@ defmodule FerricStore.API.Strings do
   """
   @spec del(key() | [key()]) :: {:ok, non_neg_integer()} | write_error()
   def del(key) when is_binary(key), do: del([key])
+  def del([]), do: {:ok, 0}
 
   def del(keys) when is_list(keys) do
     store = build_compound_store(hd(keys))
@@ -335,10 +321,13 @@ defmodule FerricStore.API.Strings do
 
   """
   @spec mget([key()]) :: {:ok, [value() | nil]}
+  def mget([]), do: {:ok, []}
+
   def mget(keys) when is_list(keys) do
-    ctx = default_ctx()
-    values = Router.batch_get(ctx, keys)
-    {:ok, values}
+    case Strings.handle_ast({:mget, keys}, build_string_store("")) do
+      {:error, _reason} = error -> error
+      values -> {:ok, values}
+    end
   end
 
   @doc """
@@ -358,18 +347,8 @@ defmodule FerricStore.API.Strings do
   """
   @spec mset(%{key() => value()}) :: :ok | {:error, term()}
   def mset(pairs) when is_map(pairs) do
-    ctx = default_ctx()
-
-    ctx
-    |> Router.batch_quorum_put(Map.to_list(pairs))
-    |> mset_batch_result()
+    Router.atomic_mset(default_ctx(), Map.to_list(pairs))
   end
-
-  defp mset_batch_result(results) when is_list(results) do
-    if Enum.all?(results, &(&1 == :ok)), do: :ok, else: {:error, results}
-  end
-
-  defp mset_batch_result({:error, _reason} = error), do: error
 
   @doc """
   Appends `suffix` to the string value stored at `key`.
@@ -501,34 +480,22 @@ defmodule FerricStore.API.Strings do
       {:ok, nil}
 
   """
-  @spec getex(key(), keyword()) :: {:ok, value() | nil}
+  @spec getex(key(), keyword()) :: {:ok, value() | nil} | {:error, binary()}
   def getex(key, opts \\ []) do
-    ctx = default_ctx()
+    with {:ok, expire_at_ms} <- EmbeddedStringValidation.parse_getex_options(opts) do
+      case expire_at_ms do
+        nil ->
+          case Strings.handle_ast({:getex, key}, build_string_store(key)) do
+            {:error, _} = err -> err
+            result -> {:ok, result}
+          end
 
-    expire_at_ms =
-      cond do
-        Keyword.get(opts, :persist, false) ->
-          0
-
-        ttl = Keyword.get(opts, :ttl) ->
-          HLC.now_ms() + ttl
-
-        true ->
-          nil
+        ms ->
+          case Router.getex(default_ctx(), key, ms) do
+            {:error, _} = err -> err
+            result -> {:ok, result}
+          end
       end
-
-    case expire_at_ms do
-      nil ->
-        case Strings.handle_ast({:getex, key}, build_string_store(key)) do
-          {:error, _} = err -> err
-          result -> {:ok, result}
-        end
-
-      ms ->
-        case Router.getex(ctx, key, ms) do
-          {:error, _} = err -> err
-          result -> {:ok, result}
-        end
     end
   end
 
@@ -571,11 +538,15 @@ defmodule FerricStore.API.Strings do
       :ok
 
   """
-  @spec setex(key(), pos_integer(), value()) :: :ok
+  @spec setex(key(), pos_integer(), value()) :: :ok | write_error()
   def setex(key, seconds, value) do
     ctx = default_ctx()
-    expire_at_ms = HLC.now_ms() + seconds * 1_000
-    Router.put(ctx, key, value, expire_at_ms)
+
+    with {:ok, expire_at_ms} <-
+           EmbeddedStringValidation.relative_expiry(seconds, 1_000, "setex"),
+         :ok <- EmbeddedStringValidation.validate_value_size(ctx, value) do
+      Router.put(ctx, key, value, expire_at_ms)
+    end
   end
 
   @doc """
@@ -593,11 +564,15 @@ defmodule FerricStore.API.Strings do
       :ok
 
   """
-  @spec psetex(key(), pos_integer(), value()) :: :ok
+  @spec psetex(key(), pos_integer(), value()) :: :ok | write_error()
   def psetex(key, milliseconds, value) do
     ctx = default_ctx()
-    expire_at_ms = HLC.now_ms() + milliseconds
-    Router.put(ctx, key, value, expire_at_ms)
+
+    with {:ok, expire_at_ms} <-
+           EmbeddedStringValidation.relative_expiry(milliseconds, 1, "psetex"),
+         :ok <- EmbeddedStringValidation.validate_value_size(ctx, value) do
+      Router.put(ctx, key, value, expire_at_ms)
+    end
   end
 
   @doc """
@@ -677,30 +652,10 @@ defmodule FerricStore.API.Strings do
   """
   @spec msetnx(%{key() => value()}) :: {:ok, boolean()}
   def msetnx(pairs) when is_map(pairs) do
-    keys = Map.keys(pairs)
-    store = default_ctx()
-
-    result =
-      Ferricstore.CrossShardOp.execute(
-        Enum.map(keys, &{&1, :write}),
-        fn unified_store ->
-          any_exists =
-            Enum.any?(keys, fn k -> Ferricstore.Store.Ops.exists?(unified_store, k) end)
-
-          if any_exists do
-            false
-          else
-            Enum.each(pairs, fn {k, v} -> Ferricstore.Store.Ops.put(unified_store, k, v, 0) end)
-            true
-          end
-        end,
-        intent: %{command: :msetnx, keys: %{targets: keys}},
-        store: store
-      )
-
-    case result do
+    case Router.atomic_msetnx(default_ctx(), Map.to_list(pairs)) do
       {:error, _} = err -> err
-      val -> {:ok, val}
+      1 -> {:ok, true}
+      0 -> {:ok, false}
     end
   end
 

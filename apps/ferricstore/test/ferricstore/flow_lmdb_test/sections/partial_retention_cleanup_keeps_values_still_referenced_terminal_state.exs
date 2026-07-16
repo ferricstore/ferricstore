@@ -788,11 +788,19 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
           Ferricstore.Flow.LMDB.terminal_index_key(completed_index_key, queued.id, 99)
 
         queued_state_key = Ferricstore.Flow.Keys.state_key(queued.id, partition_key)
+        count_key = Ferricstore.Flow.LMDB.terminal_count_key(completed_index_key)
 
         assert :ok =
                  Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
                    {:put, stale_terminal_key,
-                    Ferricstore.Flow.LMDB.encode_terminal_index_value(queued.id, 99)},
+                    Ferricstore.Flow.LMDB.encode_terminal_index_value(
+                      queued.id,
+                      99,
+                      0,
+                      nil,
+                      count_key
+                    )},
+                   {:put, count_key, Ferricstore.Flow.LMDB.encode_count(1)},
                    {:put, Ferricstore.Flow.LMDB.terminal_by_state_key_key(queued_state_key),
                     stale_terminal_key}
                  ])

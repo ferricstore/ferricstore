@@ -77,6 +77,70 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   def pause(shard_index), do: {:error, {:invalid_shard_index, shard_index}}
 
+  @spec pause_many([non_neg_integer()]) ::
+          {:ok, [{non_neg_integer(), pid()}]} | {:error, term()}
+  def pause_many(shard_indexes) when is_list(shard_indexes) do
+    shard_indexes
+    |> Enum.uniq()
+    |> Enum.reduce_while({:ok, []}, fn shard_index, {:ok, paused} ->
+      case pause(shard_index) do
+        {:ok, pid} ->
+          {:cont, {:ok, [{shard_index, pid} | paused]}}
+
+        {:error, reason} ->
+          _ = resume_many(Enum.map(paused, &elem(&1, 0)), 5_000)
+          {:halt, {:error, {:sync_pause_many_failed, shard_index, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, paused} -> {:ok, Enum.reverse(paused)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def pause_many(shard_indexes), do: {:error, {:invalid_shard_indexes, shard_indexes}}
+
+  @spec await_many_drained([{non_neg_integer(), pid()}], timeout()) :: :ok | {:error, term()}
+  def await_many_drained(pauses, timeout) when is_list(pauses) do
+    deadline = sync_gate_deadline(timeout)
+
+    Enum.reduce_while(pauses, :ok, fn {shard_index, pid}, :ok ->
+      case await_drained(pid, sync_gate_remaining(deadline)) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:sync_pause_drain_failed, shard_index, reason}}}
+      end
+    end)
+  end
+
+  @spec resume_many([non_neg_integer()], timeout()) :: :ok | {:error, term()}
+  def resume_many(shard_indexes, timeout) when is_list(shard_indexes) do
+    deadline = sync_gate_deadline(timeout)
+
+    failures =
+      shard_indexes
+      |> Enum.uniq()
+      |> Enum.reduce([], fn shard_index, failures ->
+        case resume(shard_index, sync_gate_remaining(deadline)) do
+          :ok -> failures
+          {:error, reason} -> [{shard_index, reason} | failures]
+        end
+      end)
+
+    case Enum.reverse(failures) do
+      [] -> :ok
+      failures -> {:error, {:sync_resume_many_failed, failures}}
+    end
+  end
+
+  def resume_many(shard_indexes, _timeout),
+    do: {:error, {:invalid_shard_indexes, shard_indexes}}
+
+  @spec paused?(non_neg_integer()) :: boolean()
+  def paused?(shard_index) when is_integer(shard_index) and shard_index >= 0,
+    do: is_pid(pause_pid(shard_index))
+
+  def paused?(_shard_index), do: false
+
   @spec await(pid(), timeout()) :: :ok | {:error, term()}
   def await(pid, timeout) when is_pid(pid) do
     GenServer.call(pid, :await, timeout)
@@ -204,16 +268,42 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   defp active_count(counters), do: :atomics.get(counters, @active_index)
 
+  defp sync_gate_deadline(:infinity), do: :infinity
+
+  defp sync_gate_deadline(timeout) when is_integer(timeout) and timeout >= 0,
+    do: System.monotonic_time(:millisecond) + timeout
+
+  defp sync_gate_remaining(:infinity), do: :infinity
+
+  defp sync_gate_remaining(deadline),
+    do: max(deadline - System.monotonic_time(:millisecond), 0)
+
   defp ensure_state(shard_index) do
     case :persistent_term.get(state_key(shard_index), nil) do
       nil ->
-        counters = :atomics.new(1, signed: false)
-        :persistent_term.put(state_key(shard_index), counters)
-        counters
+        initialize_state(shard_index)
 
       counters ->
         counters
     end
+  end
+
+  defp initialize_state(shard_index) do
+    :global.trans(
+      {{__MODULE__, {:state, shard_index}}, self()},
+      fn ->
+        case :persistent_term.get(state_key(shard_index), nil) do
+          nil ->
+            counters = :atomics.new(1, signed: false)
+            :persistent_term.put(state_key(shard_index), counters)
+            counters
+
+          counters ->
+            counters
+        end
+      end,
+      [node()]
+    )
   end
 
   defp acquire_existing_pause(shard_index, pid) do

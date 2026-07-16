@@ -25,12 +25,47 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           assert contents =~ "user default on nopass ~* &* +@all"
         end
 
+        @tag :acl_snapshot_render_limit
+        test "snapshot rendering enforces the reload size limit incrementally" do
+          entries = [{"default", Acl.get_user("default")}]
+          generated_at = "2026-07-16T00:00:00Z"
+          persistence = FerricstoreServer.Acl.Persistence
+
+          assert {:ok, contents} =
+                   persistence.build_contents(entries, 0, generated_at, 1_000_000)
+
+          rendered_bytes = IO.iodata_length(contents)
+
+          assert {:ok, exact_contents} =
+                   persistence.build_contents(entries, 0, generated_at, rendered_bytes)
+
+          assert IO.iodata_length(exact_contents) == rendered_bytes
+
+          assert {:error, {:too_large, ^rendered_bytes, max_bytes}} =
+                   persistence.build_contents(entries, 0, generated_at, rendered_bytes - 1)
+
+          assert max_bytes == rendered_bytes - 1
+        end
+
         test "saved file has 0600 permissions", %{tmp_dir: dir} do
           assert :ok = Acl.save(dir)
           {:ok, stat} = File.stat(Acl.acl_file_path(dir))
           # 0600 = 384 in decimal, but File.stat returns the full mode including
           # file type bits. We check the permission bits only.
           assert Bitwise.band(stat.mode, 0o777) == 0o600
+        end
+
+        @tag :acl_secure_temp
+        test "secure temp writes reject symlinks without changing their target", %{tmp_dir: dir} do
+          target = Path.join(dir, "unrelated")
+          temp = Path.join(dir, "acl.conf.tmp.test")
+          File.write!(target, "unchanged")
+          File.ln_s!(target, temp)
+
+          assert {:error, :eexist} =
+                   FerricstoreServer.Acl.Persistence.write_secure_temp(temp, "secret hash")
+
+          assert File.read!(target) == "unchanged"
         end
 
         test "saves multiple users", %{tmp_dir: dir} do
@@ -119,6 +154,15 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           files = File.ls!(dir)
           refute Enum.any?(files, &String.contains?(&1, ".tmp"))
         end
+
+        test "reports directory fsync failure after the atomic rename", %{tmp_dir: dir} do
+          assert {:error, message} =
+                   FerricstoreServer.Acl.Persistence.save(dir, 0,
+                     fsync_dir_fun: fn _path -> {:error, :forced_fsync_failure} end
+                   )
+
+          assert message =~ "forced_fsync_failure"
+        end
       end
 
       describe "save/1 overwrite" do
@@ -165,6 +209,7 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           assert Acl.get_user("alice") != nil
         end
 
+        @tag :acl_snapshot_swap
         test "load does not expose an empty or partial ACL table while swapping snapshots" do
           parent = self()
           assert :ok = Acl.set_user("alice", ["on", "nopass", "~*", "+@all"])
@@ -188,9 +233,10 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           assert Acl.get_user("bob") != nil
         end
 
+        @tag :acl_snapshot_swap
         test "load keeps the previous ACL snapshot readable for in-flight readers" do
           assert :ok = Acl.set_user("alice", ["on", "nopass", "~*", "+@all"])
-          old_table = :ets.whereis(:ferricstore_acl)
+          old_table = FerricstoreServer.Acl.Tables.active_table()
           assert [{"alice", _user}] = :ets.lookup(old_table, "alice")
 
           contents = """
@@ -590,19 +636,6 @@ defmodule FerricstoreServer.AclPersistenceTest.Sections.Save1Basic do
           File.ln_s!(real_file, acl_path)
 
           assert {:error, msg} = Acl.load(dir)
-          assert msg =~ "symlink"
-        end
-
-        test "auto-load rejects symlink ACL file", %{tmp_dir: dir} do
-          real_file = Path.join(dir, "real_acl.conf")
-          File.write!(real_file, "user default on nopass ~* &* +@all\n")
-
-          acl_path = Acl.acl_file_path(dir)
-          File.ln_s!(real_file, acl_path)
-
-          assert {:error, msg} =
-                   FerricstoreServer.Acl.Persistence.auto_load_from_file(dir, 0)
-
           assert msg =~ "symlink"
         end
 

@@ -9,6 +9,7 @@ defmodule FerricstoreServer.Native.TlsListener do
   @listener_ref __MODULE__
 
   alias FerricstoreServer.Native.Connection.FrameBuffer
+  alias FerricstoreServer.Native.Listener
 
   @spec ref() :: atom()
   def ref, do: @listener_ref
@@ -32,19 +33,14 @@ defmodule FerricstoreServer.Native.TlsListener do
 
   @spec start(keyword()) :: {:ok, pid()} | {:error, term()}
   def start(opts) do
-    port = Keyword.fetch!(opts, :port)
-    certfile = Keyword.fetch!(opts, :certfile)
-    keyfile = Keyword.fetch!(opts, :keyfile)
+    socket_opts = tls_socket_opts(opts)
 
-    socket_opts =
-      [
-        port: port,
-        certfile: certfile,
-        keyfile: keyfile,
-        versions: [:"tlsv1.3", :"tlsv1.2"]
-      ] ++ ca_opt(Keyword.get(opts, :cacertfile))
+    transport_opts = %{
+      socket_opts: socket_opts,
+      num_acceptors: 10,
+      max_connections: Keyword.get(opts, :max_connections, Listener.max_connections())
+    }
 
-    transport_opts = %{socket_opts: socket_opts, num_acceptors: 10}
     protocol_opts = native_protocol_opts()
 
     :ranch.start_listener(
@@ -68,15 +64,13 @@ defmodule FerricstoreServer.Native.TlsListener do
     keyfile = Keyword.get(opts, :keyfile)
 
     if port && certfile && keyfile do
-      socket_opts =
-        [
-          port: port,
-          certfile: certfile,
-          keyfile: keyfile,
-          versions: [:"tlsv1.3", :"tlsv1.2"]
-        ] ++ ca_opt(Keyword.get(opts, :cacertfile))
+      socket_opts = tls_socket_opts(opts)
 
-      transport_opts = %{socket_opts: socket_opts, num_acceptors: 10}
+      transport_opts = %{
+        socket_opts: socket_opts,
+        num_acceptors: 10,
+        max_connections: Keyword.get(opts, :max_connections, Listener.max_connections())
+      }
 
       :ranch.child_spec(
         @listener_ref,
@@ -97,6 +91,17 @@ defmodule FerricstoreServer.Native.TlsListener do
       max_lanes: Application.get_env(:ferricstore, :native_max_lanes_per_connection, 1024),
       lane_max_queue: Application.get_env(:ferricstore, :native_lane_max_queue, 1024)
     }
+  end
+
+  defp tls_socket_opts(opts) do
+    port = Keyword.fetch!(opts, :port)
+
+    Listener.socket_opts(port, opts) ++
+      [
+        certfile: Keyword.fetch!(opts, :certfile),
+        keyfile: Keyword.fetch!(opts, :keyfile),
+        versions: [:"tlsv1.3", :"tlsv1.2"]
+      ] ++ ca_opt(Keyword.get(opts, :cacertfile))
   end
 
   defp ca_opt(nil), do: []

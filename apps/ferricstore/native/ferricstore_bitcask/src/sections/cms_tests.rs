@@ -1,4 +1,5 @@
-    use super::*;
+use super::*;
+use std::fs;
 
     // -----------------------------------------------------------------------
     // Stateless pread/pwrite file tests
@@ -152,6 +153,19 @@
         std::fs::write(&path, [0u8; 16]).unwrap();
         let file = File::open(&path).unwrap();
         assert!(cms_file_read_header(&file).is_err());
+    }
+
+    #[test]
+    fn complete_header_rejects_a_truncated_counter_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_counters.cms");
+        let mut header = [0u8; MMAP_HEADER_SIZE];
+        header[0..8].copy_from_slice(&MMAP_MAGIC.to_le_bytes());
+        header[8..16].copy_from_slice(&4u64.to_le_bytes());
+        header[16..24].copy_from_slice(&2u64.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        assert!(cms_file_read_header(&File::open(path).unwrap()).is_err());
     }
 
     #[test]
@@ -352,7 +366,7 @@
 
     /// Helper: do pread/pwrite incrby for a single element, return min count.
     fn file_incrby_one(path: &str, element: &[u8], count: i64) -> i64 {
-        let file = crate::open_random_rw(Path::new(path)).unwrap();
+        let file = crate::open_random_rw_locked(Path::new(path)).unwrap();
         let (width, depth, mut total_count) = cms_file_read_header(&file).unwrap();
         let indices = hash_indices_standalone(element, width, depth);
         let mut buf = [0u8; 8];
@@ -372,7 +386,7 @@
 
     /// Helper: query a single element via pread, return min count.
     fn file_query_one(path: &str, element: &[u8]) -> i64 {
-        let file = crate::open_random_read(Path::new(path)).unwrap();
+        let file = crate::open_random_read_locked(Path::new(path)).unwrap();
         let (width, depth, _) = cms_file_read_header(&file).unwrap();
         let indices = hash_indices_standalone(element, width, depth);
         let mut buf = [0u8; 8];
@@ -420,6 +434,32 @@
         file_incrby_one(&path, b"item", 2);
         let count = file_query_one(&path, b"item");
         assert_eq!(count, 12);
+    }
+
+    #[test]
+    fn batch_staging_accumulates_duplicate_elements_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_cms_file(dir.path(), "batch_duplicates.cms", 100, 5);
+        let file = crate::open_random_rw(Path::new(&path)).unwrap();
+
+        let plan = cms_stage_increments(
+            &file,
+            100,
+            5,
+            0,
+            [(b"same".as_slice(), 2), (b"same".as_slice(), 3)],
+        )
+        .unwrap();
+
+        assert_eq!(plan.counts, vec![2, 5]);
+        assert_eq!(plan.total_count, 5);
+        assert!(plan.updates.iter().all(|(_, value)| *value == 5));
+
+        let mut bytes = [0u8; 8];
+        for (offset, _) in &plan.updates {
+            cms_read_exact_at(&file, &mut bytes, *offset, "counter").unwrap();
+            assert_eq!(i64::from_le_bytes(bytes), 0, "staging must not mutate disk");
+        }
     }
 
     #[test]
@@ -524,6 +564,22 @@
     }
 
     #[test]
+    fn merge_uses_bounded_chunks_instead_of_one_syscall_per_counter() {
+        let source = std::fs::read_to_string("src/cms.rs").unwrap();
+        let merge = source
+            .split("pub fn cms_file_merge(")
+            .nth(1)
+            .unwrap()
+            .split("// Async variants of read NIFs")
+            .next()
+            .unwrap();
+
+        assert!(merge.contains("CMS_MERGE_CHUNK_COUNTERS"));
+        assert!(!merge.contains("\"destination counter\""));
+        assert!(!merge.contains("\"source counter\""));
+    }
+
+    #[test]
     fn counter_large_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = create_cms_file(dir.path(), "large.cms", 100, 5);
@@ -574,6 +630,40 @@
         // Final count must be exactly 100
         let final_count = file_query_one(&path_arc, b"concurrent");
         assert_eq!(final_count, 100);
+    }
+
+    #[test]
+    fn concurrent_writers_preserve_every_increment() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const WRITERS: usize = 8;
+        const INCREMENTS_PER_WRITER: usize = 200;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(create_cms_file(dir.path(), "writers.cms", 200, 5));
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let writers = (0..WRITERS)
+            .map(|_| {
+                let writer_path = Arc::clone(&path);
+                let writer_barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    writer_barrier.wait();
+                    for _ in 0..INCREMENTS_PER_WRITER {
+                        file_incrby_one(&writer_path, b"contended", 1);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        assert_eq!(
+            file_query_one(&path, b"contended"),
+            (WRITERS * INCREMENTS_PER_WRITER) as i64
+        );
     }
 
     #[test]

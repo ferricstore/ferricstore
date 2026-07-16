@@ -6,8 +6,8 @@
 //! [ crc32: u32 | timestamp_ms: u64 | expire_at_ms: u64 | key_size: u16 | value_size: u32 | key: [u8] | value: [u8] ]
 //! ```
 //!
-//! A tombstone record has `value_size = 0` and no value bytes. It signals a
-//! logical delete and is used during compaction.
+//! A tombstone record has `value_size = u32::MAX` and no value bytes. Zero is
+//! reserved for a live empty value, so the two states remain unambiguous.
 //!
 //! The CRC32 covers everything after the checksum field:
 //!   `timestamp_ms || expire_at_ms || key_size || value_size || key || value`

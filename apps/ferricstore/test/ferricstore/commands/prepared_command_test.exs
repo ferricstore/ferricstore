@@ -2,7 +2,44 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Dispatcher, KeyDiscovery, PreparedCommand}
+  alias Ferricstore.Transaction.ExecutionEntry
   alias Ferricstore.Transaction.Ast, as: TransactionAst
+
+  test "unknown commands are rejected before ACL and routing metadata are constructed" do
+    assert {:error, "ERR unknown command 'brpoplpush', with args beginning with: "} =
+             Dispatcher.prepare_raw("BRPOPLPUSH", ["source", "destination", "1"])
+
+    assert {:error, "ERR unknown command 'not.a.command', with args beginning with: "} =
+             Dispatcher.prepare_raw("NOT.A.COMMAND", ["secret:key"])
+  end
+
+  @tag :shared_command_spec
+  test "KeyDiscovery prepares parsing, ACL, routing, and mutation metadata together" do
+    assert {:ok, spec} = KeyDiscovery.prepare("set", ["key", "value", "GET"])
+
+    assert spec.command == "SET"
+    assert spec.args == ["key", "value", "GET"]
+    assert spec.ast == {:set, "key", "value", [:get]}
+    assert spec.acl_keys == ["key"]
+    assert spec.routing_scope == :keys
+    assert spec.routing_keys == ["key"]
+    assert spec.read_keys == ["key"]
+    assert spec.write_keys == ["key"]
+    assert spec.transaction_mode == :local
+  end
+
+  @tag :shared_command_spec
+  test "PreparedCommand has one canonical preparation boundary" do
+    source =
+      Path.expand("../../../lib/ferricstore/commands/prepared_command.ex", __DIR__)
+      |> File.read!()
+
+    assert source =~ "KeyDiscovery.prepare"
+    refute source =~ "NativeAstParser"
+    refute source =~ "Extension"
+    refute source =~ "def from_parsed"
+    refute function_exported?(PreparedCommand, :from_parsed, 4)
+  end
 
   test "dynamic merge keys share one ACL, routing, and mutation footprint" do
     assert {:ok, prepared} =
@@ -137,6 +174,134 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     refute PreparedCommand.cross_shard?(prepared, fn _key -> flunk("unexpected routing") end)
   end
 
+  test "prepared commands identify deterministic transaction-local execution" do
+    for {command, args} <- [
+          {"PING", []},
+          {"SET", ["key", "value"]},
+          {"MEMORY", ["USAGE", "key"]},
+          {"CLUSTER.KEYSLOT", ["key"]}
+        ] do
+      assert {:ok, prepared} = Dispatcher.prepare_raw(command, args)
+      assert prepared.transaction_mode == :local
+      assert PreparedCommand.transaction_safe?(prepared)
+    end
+  end
+
+  @tag :transaction_namespace_contract
+  test "transaction-local multi-key ASTs namespace every prepared routing key" do
+    namespace = "tenant:"
+
+    fixtures = [
+      {"DEL", ["del:a", "del:b"]},
+      {"UNLINK", ["unlink:a", "unlink:b"]},
+      {"EXISTS", ["exists:a", "exists:b"]},
+      {"MGET", ["mget:a", "mget:b"]},
+      {"MSET", ["mset:a", "value-a", "mset:b", "value-b"]},
+      {"MSETNX", ["msetnx:a", "value-a", "msetnx:b", "value-b"]},
+      {"SINTER", ["sinter:a", "sinter:b"]},
+      {"SUNION", ["sunion:a", "sunion:b"]},
+      {"SDIFF", ["sdiff:a", "sdiff:b"]},
+      {"SDIFFSTORE", ["sdiffstore:dest", "sdiffstore:a", "sdiffstore:b"]},
+      {"SINTERSTORE", ["sinterstore:dest", "sinterstore:a", "sinterstore:b"]},
+      {"SUNIONSTORE", ["sunionstore:dest", "sunionstore:a", "sunionstore:b"]},
+      {"SINTERCARD", ["2", "sintercard:a", "sintercard:b"]},
+      {"PFCOUNT", ["pfcount:a", "pfcount:b"]},
+      {"PFMERGE", ["pfmerge:dest", "pfmerge:a", "pfmerge:b"]},
+      {"BITOP", ["AND", "bitop:dest", "bitop:a", "bitop:b"]},
+      {"COPY", ["copy:source", "copy:destination"]},
+      {"RENAME", ["rename:source", "rename:destination"]},
+      {"RENAMENX", ["renamenx:source", "renamenx:destination"]},
+      {"LMOVE", ["lmove:source", "lmove:destination", "LEFT", "RIGHT"]},
+      {"RPOPLPUSH", ["rpoplpush:source", "rpoplpush:destination"]},
+      {"SMOVE", ["smove:source", "smove:destination", "member"]},
+      {"GEOSEARCHSTORE",
+       [
+         "geosearchstore:destination",
+         "geosearchstore:source",
+         "FROMLONLAT",
+         "0",
+         "0",
+         "BYRADIUS",
+         "1",
+         "KM"
+       ]}
+    ]
+
+    for {command, args} <- fixtures do
+      assert {:ok, prepared} = Dispatcher.prepare_raw(command, args)
+      assert prepared.transaction_mode == :local
+      assert length(prepared.routing_keys) > 1
+
+      ast_binaries =
+        prepared.ast
+        |> TransactionAst.namespace_ast_keys(namespace)
+        |> collect_ast_binaries()
+
+      for key <- prepared.routing_keys do
+        assert (namespace <> key) in ast_binaries,
+               "#{command} did not namespace routing key #{inspect(key)}"
+
+        refute key in ast_binaries,
+               "#{command} retained unnamespaced routing key #{inspect(key)}"
+      end
+    end
+  end
+
+  @tag :transaction_stream_cache_commit
+  test "prepared commands fail closed when replicated apply would escape the local store" do
+    for {command, args} <- [
+          {"PUBLISH", ["channel", "message"]},
+          {"KEY_INFO", ["key"]},
+          {"FETCH_OR_COMPUTE", ["key", "1000"]},
+          {"XADD", ["stream", "1-0", "field", "value"]},
+          {"XLEN", ["stream"]},
+          {"XREAD", ["BLOCK", "1000", "STREAMS", "stream", "0-0"]},
+          {"XACK", ["stream", "group", "1-0"]},
+          {"SPOP", ["set"]},
+          {"BF.ADD", ["filter", "member"]},
+          {"FLOW.GET", ["flow-id"]}
+        ] do
+      assert {:ok, prepared} = Dispatcher.prepare_raw(command, args)
+      assert prepared.transaction_mode == :request
+      refute PreparedCommand.transaction_safe?(prepared)
+    end
+  end
+
+  @tag :transaction_native_local_apply
+  test "deterministic native mutations execute transaction-locally" do
+    for {command, args} <- [
+          {"CAS", ["native:key", "old", "new"]},
+          {"LOCK", ["native:key", "owner", "1000"]},
+          {"UNLOCK", ["native:key", "owner"]},
+          {"EXTEND", ["native:key", "owner", "1000"]},
+          {"RATELIMIT.ADD", ["native:key", "1000", "10", "1"]}
+        ] do
+      assert {:ok, prepared} = Dispatcher.prepare_raw(command, args)
+      assert prepared.transaction_mode == :local
+      assert PreparedCommand.transaction_safe?(prepared)
+    end
+  end
+
+  test "transaction execution entries retain only the compact validated apply plan" do
+    value = :binary.copy("v", 4_096)
+    assert {:ok, prepared} = Dispatcher.prepare_raw("SET", ["key", value])
+    assert {:ok, entry} = ExecutionEntry.from_prepared(prepared)
+
+    assert %ExecutionEntry{
+             command: "SET",
+             ast: {:set, "key", ^value},
+             routing_scope: :keys
+           } = entry
+
+    refute Map.has_key?(Map.from_struct(entry), :args)
+
+    assert :erlang.external_size(entry) <
+             :erlang.external_size({prepared.command, prepared.args, prepared.ast})
+
+    assert {:ok, unsafe} = Dispatcher.prepare_raw("PUBLISH", ["channel", "message"])
+    assert {:error, _reason} = ExecutionEntry.from_prepared(unsafe)
+  end
+
   test "a literal wildcard data key remains routable" do
     assert {:ok, prepared} = Dispatcher.prepare_raw("GET", ["*"])
     assert prepared.acl_keys == ["*"]
@@ -193,8 +358,22 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     refute function_exported?(PreparedCommand, :legacy_result, 1)
   end
 
-  test "legacy transaction queue entries derive their prepared AST" do
-    assert {"HGETALL", ["hash"], {:hgetall, "hash"}} =
-             TransactionAst.normalize_entry({"HGETALL", ["hash"]})
+  test "raw transaction queue tuples are not part of the execution contract" do
+    assert_raise FunctionClauseError, fn ->
+      apply(TransactionAst, :normalize_entry, [{"HGETALL", ["hash"]}])
+    end
   end
+
+  defp collect_ast_binaries(value) when is_binary(value), do: [value]
+
+  defp collect_ast_binaries(value) when is_list(value),
+    do: Enum.flat_map(value, &collect_ast_binaries/1)
+
+  defp collect_ast_binaries(value) when is_tuple(value) do
+    value
+    |> Tuple.to_list()
+    |> collect_ast_binaries()
+  end
+
+  defp collect_ast_binaries(_value), do: []
 end

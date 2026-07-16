@@ -146,10 +146,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
              {:ok, expected_state} <- flow_due_key_expected_state(state_filter),
              {:ok, priority} <- flow_due_key_priority(due_key, tag, type, expected_state),
              false <- expected_state == "running" do
+          encoded_type = FlowKeys.index_component(type)
+          encoded_expected_state = FlowKeys.index_component(expected_state)
+          encoded_running = FlowKeys.index_component("running")
           from_due_key = due_key
-          to_due_key = "f:" <> tag <> ":d:" <> type <> ":running:p" <> Integer.to_string(priority)
-          from_state_key = "f:" <> tag <> ":i:s:" <> type <> ":" <> expected_state
-          to_state_key = "f:" <> tag <> ":i:s:" <> type <> ":running"
+
+          to_due_key =
+            "f:" <>
+              tag <>
+              ":d:" <>
+              encoded_type <> ":" <> encoded_running <> ":p" <> Integer.to_string(priority)
+
+          from_state_key =
+            "f:" <> tag <> ":i:s:" <> encoded_type <> ":" <> encoded_expected_state
+
+          to_state_key = "f:" <> tag <> ":i:s:" <> encoded_type <> ":" <> encoded_running
           inflight_key = "f:" <> tag <> ":i:r:" <> type
           worker_key = "f:" <> tag <> ":i:w:" <> worker
           state_key_prefix = "f:" <> tag <> ":s:"
@@ -234,7 +245,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
       defp flow_due_key_priority(due_key, tag, type, expected_state)
            when is_binary(due_key) and is_binary(tag) and is_binary(type) and
                   is_binary(expected_state) do
-        prefix = "f:" <> tag <> ":d:" <> type <> ":" <> expected_state <> ":p"
+        prefix =
+          "f:" <>
+            tag <>
+            ":d:" <>
+            FlowKeys.index_component(type) <>
+            ":" <> FlowKeys.index_component(expected_state) <> ":p"
+
         prefix_size = byte_size(prefix)
 
         with true <- byte_size(due_key) > prefix_size,
@@ -326,36 +343,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
 
       defp flow_read_claim_candidate_records(state, :any, due_key, candidates) do
         prefix = flow_state_key_prefix_from_due_key(due_key)
-
-        if flow_lmdb_projection_enabled?(state) do
-          keys =
-            if is_binary(prefix) do
-              Enum.map(candidates, fn {id, _score} -> prefix <> id end)
-            else
-              Enum.map(candidates, fn {id, _score} -> FlowKeys.state_key(id, nil) end)
-            end
-
-          flow_read_records_by_keys(state, keys)
-        else
-          flow_read_claim_candidate_hot_records(state, candidates, prefix, nil)
-        end
+        flow_read_claim_candidate_hot_records(state, candidates, prefix, nil)
       end
 
       defp flow_read_claim_candidate_records(state, partition_key, due_key, candidates) do
         prefix = flow_state_key_prefix_from_due_key(due_key)
-
-        if flow_lmdb_projection_enabled?(state) do
-          keys =
-            if is_binary(prefix) do
-              Enum.map(candidates, fn {id, _score} -> prefix <> id end)
-            else
-              Enum.map(candidates, fn {id, _score} -> FlowKeys.state_key(id, partition_key) end)
-            end
-
-          flow_read_records_by_keys(state, keys)
-        else
-          flow_read_claim_candidate_hot_records(state, candidates, prefix, partition_key)
-        end
+        flow_read_claim_candidate_hot_records(state, candidates, prefix, partition_key)
       end
 
       defp flow_claim_read_partition_key(:any), do: nil

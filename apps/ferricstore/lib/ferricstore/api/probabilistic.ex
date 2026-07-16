@@ -467,7 +467,7 @@ defmodule FerricStore.API.Probabilistic do
   @spec topk_reserve(key(), pos_integer()) :: :ok | {:error, binary()}
   def topk_reserve(key, k) do
     store = build_topk_store(key)
-    TopK.handle_ast({:topk_reserve, key, k, 8, 7, 0.9}, store)
+    TopK.handle_ast({:topk_reserve, key, k, 8, 7}, store)
   end
 
   @doc """
@@ -535,7 +535,7 @@ defmodule FerricStore.API.Probabilistic do
   end
 
   @doc """
-  Returns metadata about the Top-K tracker at `key` (k, width, depth, decay).
+  Returns metadata about the Top-K tracker at `key` (k, width, and depth).
 
   ## Returns
 
@@ -545,7 +545,7 @@ defmodule FerricStore.API.Probabilistic do
   ## Examples
 
       iex> FerricStore.topk_info("trending:searches")
-      {:ok, ["k", 10, "width", 8, "depth", 7, "decay", "0.9"]}
+      {:ok, ["k", 10, "width", 8, "depth", 7]}
 
   """
   @spec topk_info(key()) :: {:ok, list()} | {:error, binary()}

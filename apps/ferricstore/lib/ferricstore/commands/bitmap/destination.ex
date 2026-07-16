@@ -1,16 +1,19 @@
 defmodule Ferricstore.Commands.Bitmap.Destination do
   @moduledoc false
 
-  alias Ferricstore.Store.{CompoundKey, Ops, TypeRegistry}
+  alias Ferricstore.Commands.{CompoundSnapshot, Strings.Delete}
+  alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
 
   @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
 
-  @spec bitop_compound_destination_type(binary(), map()) :: binary() | nil
+  @spec bitop_compound_destination_type(binary(), map()) ::
+          binary() | nil | ReadResult.failure()
   def bitop_compound_destination_type(key, store) do
     if Ops.has_compound?(store), do: Ops.compound_get(store, key, CompoundKey.type_key(key))
   end
 
-  @spec metadata_value_size(map(), binary()) :: non_neg_integer() | nil | :unknown
+  @spec metadata_value_size(map(), binary()) ::
+          non_neg_integer() | nil | :unknown | ReadResult.failure()
   def metadata_value_size(%FerricStore.Instance{} = store, key), do: Ops.value_size(store, key)
 
   def metadata_value_size(%Ferricstore.Store.LocalTxStore{} = store, key),
@@ -23,10 +26,34 @@ defmodule Ferricstore.Commands.Bitmap.Destination do
 
   @spec ensure_string_key(binary(), map()) :: :ok | {:error, binary()}
   def ensure_string_key(key, store) do
-    if compound_data_structure_key?(key, store) do
-      @wrongtype_error
+    if Ops.has_compound?(store) do
+      type_key = CompoundKey.type_key(key)
+
+      case Ops.compound_get(store, key, type_key) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
+        nil ->
+          :ok
+
+        type_marker ->
+          ensure_resolved_string_key(key, type_marker, store)
+      end
     else
       :ok
+    end
+  end
+
+  defp ensure_resolved_string_key(key, type_marker, store) do
+    case TypeRegistry.resolve_type_marker(key, type_marker, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      "none" ->
+        :ok
+
+      _compound_type ->
+        @wrongtype_error
     end
   end
 
@@ -50,28 +77,32 @@ defmodule Ferricstore.Commands.Bitmap.Destination do
             {:error, _} = error -> {:halt, error}
           end
         end)
+        |> cleanup_stream_destination(key, store)
       end
     else
       :ok
     end
   end
 
+  defp cleanup_stream_destination(:ok, key, store),
+    do: Delete.cleanup_stream_metadata(key, store)
+
+  defp cleanup_stream_destination({:error, _reason} = error, _key, _store), do: error
+
   @spec compound_destination_backup(binary(), binary(), map()) ::
-          {:compound, list()} | :unrestorable
+          {:ok, {:compound, list()}} | ReadResult.failure()
   def compound_destination_backup(key, type, store) do
-    if compound_backup_supported?(store) do
-      {:compound,
-       compound_backup_meta_entries(key, type, store) ++
-         compound_backup_member_entries(key, type, store)}
+    if CompoundSnapshot.supported?(store) do
+      case CompoundSnapshot.snapshot(key, type, store) do
+        {:ok, entries} -> {:ok, {:compound, entries}}
+        {:error, {:storage_read_failed, _reason}} = failure -> failure
+      end
     else
-      :unrestorable
+      ReadResult.failure(:compound_snapshot_unsupported)
     end
   end
 
-  @spec restore_bitop_destination(map(), binary(), {:compound, list()} | :unrestorable, term()) ::
-          term()
-  def restore_bitop_destination(_store, _key, :unrestorable, original_error), do: original_error
-
+  @spec restore_bitop_destination(map(), binary(), {:compound, list()}, term()) :: term()
   def restore_bitop_destination(store, key, {:compound, entries}, original_error) do
     case Ops.delete(store, key) do
       :ok ->
@@ -84,93 +115,4 @@ defmodule Ferricstore.Commands.Bitmap.Destination do
         restore_error
     end
   end
-
-  defp compound_data_structure_key?(key, store) do
-    Ops.has_compound?(store) and
-      compound_type_marker?(key, store) and
-      TypeRegistry.get_type(key, store) != "none"
-  end
-
-  defp compound_type_marker?(key, store) do
-    Ops.compound_get(store, key, CompoundKey.type_key(key)) != nil
-  end
-
-  defp compound_backup_supported?(%FerricStore.Instance{}), do: true
-  defp compound_backup_supported?(%Ferricstore.Store.LocalTxStore{}), do: true
-
-  defp compound_backup_supported?(store) when is_map(store) do
-    is_function(Map.get(store, :compound_scan), 2)
-  end
-
-  defp compound_backup_meta_entries(key, type, store) do
-    type_key = CompoundKey.type_key(key)
-
-    type_entries =
-      case Ops.compound_get_meta(store, key, type_key) do
-        nil -> [{type_key, type, 0}]
-        {value, expire_at_ms} -> [{type_key, value, expire_at_ms}]
-      end
-
-    list_meta_entries =
-      if type == "list" do
-        list_meta_key = CompoundKey.list_meta_key(key)
-
-        case Ops.compound_get_meta(store, key, list_meta_key) do
-          nil -> []
-          {value, expire_at_ms} -> [{list_meta_key, value, expire_at_ms}]
-        end
-      else
-        []
-      end
-
-    stream_meta_entries =
-      if type == "stream" do
-        stream_meta_key = CompoundKey.stream_meta_key(key)
-
-        case Ops.compound_get_meta(store, key, stream_meta_key) do
-          nil -> []
-          {value, expire_at_ms} -> [{stream_meta_key, value, expire_at_ms}]
-        end
-      else
-        []
-      end
-
-    type_entries ++ list_meta_entries ++ stream_meta_entries
-  end
-
-  defp compound_backup_member_entries(key, type, store) do
-    prefixes = compound_backup_prefixes(key, type)
-
-    compound_keys =
-      Enum.flat_map(prefixes, fn prefix ->
-        store
-        |> Ops.compound_scan(key, prefix)
-        |> Enum.map(fn {member_or_key, _value} ->
-          if String.starts_with?(member_or_key, prefix) do
-            member_or_key
-          else
-            prefix <> member_or_key
-          end
-        end)
-      end)
-
-    store
-    |> Ops.compound_batch_get_meta(key, compound_keys)
-    |> Enum.zip(compound_keys)
-    |> Enum.flat_map(fn
-      {nil, _compound_key} -> []
-      {{value, expire_at_ms}, compound_key} -> [{compound_key, value, expire_at_ms}]
-    end)
-  end
-
-  defp compound_backup_prefix(key, "hash"), do: CompoundKey.hash_prefix(key)
-  defp compound_backup_prefix(key, "list"), do: CompoundKey.list_prefix(key)
-  defp compound_backup_prefix(key, "set"), do: CompoundKey.set_prefix(key)
-  defp compound_backup_prefix(key, "zset"), do: CompoundKey.zset_prefix(key)
-  defp compound_backup_prefix(key, "stream"), do: CompoundKey.stream_prefix(key)
-
-  defp compound_backup_prefixes(key, "stream"),
-    do: [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)]
-
-  defp compound_backup_prefixes(key, type), do: [compound_backup_prefix(key, type)]
 end

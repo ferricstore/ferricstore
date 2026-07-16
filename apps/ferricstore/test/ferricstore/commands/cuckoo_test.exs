@@ -37,7 +37,7 @@ defmodule Ferricstore.Commands.CuckooTest do
       right_dir = temp_prob_dir("cuckoo_right_prob", suffix)
 
       key = "key_specific_cuckoo_#{suffix}"
-      safe = Base.url_encode64(key, padding: false)
+      filename = Ferricstore.ProbFile.filename(key, "cuckoo")
 
       store =
         ProbMockStore.make_cuckoo()
@@ -46,8 +46,8 @@ defmodule Ferricstore.Commands.CuckooTest do
 
       try do
         assert :ok = Cuckoo.handle("CF.RESERVE", [key, "1024"], store)
-        assert File.exists?(Path.join(right_dir, "#{safe}.cuckoo"))
-        refute File.exists?(Path.join(wrong_dir, "#{safe}.cuckoo"))
+        assert File.exists?(Path.join(right_dir, filename))
+        refute File.exists?(Path.join(wrong_dir, filename))
       after
         File.rm_rf!(wrong_dir)
         File.rm_rf!(right_dir)
@@ -573,8 +573,7 @@ defmodule Ferricstore.Commands.CuckooTest do
     test "prob file exists on disk after create" do
       store = ProbMockStore.make_cuckoo()
       Cuckoo.handle("CF.RESERVE", ["myfilter", "256"], store)
-      safe = Base.url_encode64("myfilter", padding: false)
-      path = Path.join(store.prob_dir.(), "#{safe}.cuckoo")
+      path = Ferricstore.ProbFile.path(store.prob_dir.(), "myfilter", "cuckoo")
       assert File.exists?(path), "Cuckoo prob file should exist at #{path}"
     end
 

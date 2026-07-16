@@ -202,11 +202,12 @@ defmodule Ferricstore.Commands.GenericTest.Sections.ObjectIdletime do
         end
       end
 
-      describe "WAIT arity edge cases" do
-        test "WAIT accepts string args that represent non-integer but still returns 0" do
-          # WAIT doesn't validate its args because no replication - just returns 0
+      describe "WAIT argument edge cases" do
+        test "WAIT rejects non-integer arguments before evaluating replication state" do
           store = MockStore.make()
-          assert 0 == Generic.handle("WAIT", ["abc", "xyz"], store)
+
+          assert {:error, "ERR value is not an integer or out of range"} ==
+                   Generic.handle("WAIT", ["abc", "xyz"], store)
         end
       end
     end

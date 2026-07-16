@@ -243,6 +243,32 @@ defmodule Ferricstore.Merge.SchedulerTest do
         File.rm_rf!(data_dir)
       end
     end
+
+    test "init rejects invalid merge configuration before starting" do
+      invalid_configs = [
+        {:mode, :unknown},
+        {:min_files_for_merge, 1},
+        {:max_files_per_merge, 0},
+        {:merge_window, {24, 24}},
+        {:min_free_space_ratio, 1.1},
+        {:fragmentation_threshold, 0.0},
+        {:dead_bytes_threshold, -1},
+        {:merge_cooldown_ms, -1},
+        {:min_file_age_ms, -1},
+        {:small_file_threshold, -1},
+        {:merge_retry_interval_ms, 0},
+        {:compaction_call_timeout_ms, 0}
+      ]
+
+      Enum.each(invalid_configs, fn {key, value} ->
+        assert {:stop, {:invalid_merge_config, ^key, ^value}} =
+                 Scheduler.init(
+                   shard_index: 0,
+                   data_dir: "/validation-must-run-before-filesystem-access",
+                   merge_config: %{key => value}
+                 )
+      end)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -357,7 +383,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
       assert status.merging == false
     end
 
-    test "run_compaction can exceed GenServer default call timeout" do
+    test "scheduler remains responsive while compaction runs" do
       ctx = FerricStore.Instance.get(:default)
       shard_name = Router.shard_name(ctx, 0)
       real_shard = Process.whereis(shard_name)
@@ -374,7 +400,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
       File.write!(Path.join(shard_dir, "00001.log"), "active")
 
       Process.unregister(shard_name)
-      {:ok, fake_shard} = SlowShard.start(name: shard_name, parent: self(), sleep_ms: 5_200)
+      {:ok, fake_shard} = SlowShard.start(name: shard_name, parent: self(), sleep_ms: 300)
 
       {:ok, pid} =
         Scheduler.start_link(
@@ -390,9 +416,20 @@ defmodule Ferricstore.Merge.SchedulerTest do
         )
 
       try do
+        started_at = System.monotonic_time(:millisecond)
         assert :ok = Scheduler.trigger_check(pid)
-        assert_receive :slow_compaction_started
-        assert_receive :slow_compaction_finished
+        assert System.monotonic_time(:millisecond) - started_at < 100
+
+        assert_receive :slow_compaction_started, 500
+        assert GenServer.call(pid, :status).merging
+        assert_receive :slow_compaction_finished, 1_000
+
+        ShardHelpers.eventually(
+          fn -> GenServer.call(pid, :status).merge_count == 1 end,
+          "merge completion was not recorded",
+          20,
+          10
+        )
 
         status = GenServer.call(pid, :status)
         assert status.merge_count == 1
@@ -454,6 +491,103 @@ defmodule Ferricstore.Merge.SchedulerTest do
       end
     end
 
+    test "runtime directory read failures preserve fragmentation for retry" do
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_directory_failure_#{System.unique_integer([:positive])}"
+        )
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      File.mkdir_p!(shard_dir)
+      File.write!(Path.join(shard_dir, "00000.log"), "old")
+      File.write!(Path.join(shard_dir, "00001.log"), "active")
+
+      {:ok, semaphore} = GenServer.start_link(Ferricstore.Merge.Semaphore, [])
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: data_dir,
+          merge_config: %{
+            mode: :hot,
+            min_files_for_merge: 2,
+            merge_retry_interval_ms: 60_000
+          },
+          semaphore: semaphore,
+          name: :test_scheduler_directory_failure
+        )
+
+      try do
+        File.rm_rf!(shard_dir)
+        GenServer.cast(pid, {:fragmentation, [0], 2})
+
+        ShardHelpers.eventually(
+          fn ->
+            status = GenServer.call(pid, :status)
+            status.file_count == 2 and not status.merging
+          end,
+          "failed merge attempt did not settle",
+          20,
+          10
+        )
+
+        assert GenServer.call(pid, :status).fragmentation_candidates == [0]
+      after
+        if Process.alive?(pid), do: GenServer.stop(pid)
+        if Process.alive?(semaphore), do: GenServer.stop(semaphore)
+        File.rm_rf!(data_dir)
+      end
+    end
+
+    test "runtime log stat failures preserve fragmentation for retry" do
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_stat_failure_#{System.unique_integer([:positive])}"
+        )
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      File.mkdir_p!(shard_dir)
+      File.ln_s!(Path.join(shard_dir, "missing.log"), Path.join(shard_dir, "00000.log"))
+      File.write!(Path.join(shard_dir, "00001.log"), "active")
+
+      {:ok, semaphore} = GenServer.start_link(Ferricstore.Merge.Semaphore, [])
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: data_dir,
+          merge_config: %{
+            mode: :hot,
+            min_files_for_merge: 100,
+            merge_retry_interval_ms: 60_000
+          },
+          semaphore: semaphore,
+          name: :test_scheduler_stat_failure
+        )
+
+      try do
+        GenServer.cast(pid, {:fragmentation, [0], 2})
+
+        ShardHelpers.eventually(
+          fn ->
+            state = :sys.get_state(pid)
+            not state.merging and is_reference(state.retry_ref)
+          end,
+          "failed log stat did not schedule a retry",
+          20,
+          10
+        )
+
+        assert GenServer.call(pid, :status).fragmentation_candidates == [0]
+      after
+        if Process.alive?(pid), do: GenServer.stop(pid)
+        if Process.alive?(semaphore), do: GenServer.stop(semaphore)
+        File.rm_rf!(data_dir)
+      end
+    end
+
     test "age mode does not compact fresh inactive files before min file age" do
       ctx = FerricStore.Instance.get(:default)
       shard_name = Router.shard_name(ctx, 0)
@@ -490,6 +624,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
       try do
         assert :ok = Scheduler.trigger_check(pid)
         refute_received :compaction_called
+
+        state = :sys.get_state(pid)
+        assert is_reference(state.retry_ref)
+        assert is_integer(Process.read_timer(state.retry_ref))
       after
         if Process.alive?(pid), do: GenServer.stop(pid)
         ref = Process.monitor(fake_shard)
@@ -749,6 +887,13 @@ defmodule Ferricstore.Merge.SchedulerTest do
         assert_receive {:compaction_finished, 0}, 1_000
         assert Task.await(task0, 1_000) == :ok
 
+        ShardHelpers.eventually(
+          fn -> Ferricstore.Merge.Semaphore.status(semaphore) == :free end,
+          "first compaction worker did not release the semaphore",
+          20,
+          10
+        )
+
         assert Scheduler.trigger_check(scheduler1) == :ok
         assert_receive {:compaction_started, 1}, 1_000
         assert_receive {:compaction_finished, 1}, 1_000
@@ -886,9 +1031,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
 
       ShardHelpers.eventually(
         fn ->
-          GenServer.call(pid, :status).file_count == 10
+          status = GenServer.call(pid, :status)
+          status.file_count == 10 and not status.merging
         end,
-        "file count not updated",
+        "busy merge attempt did not settle",
         20,
         10
       )

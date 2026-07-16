@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
 
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
   alias FerricstoreServer.Health.Dashboard.Flow.PolicyRetention
+  alias FerricstoreServer.Health.QueryDecoder
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
   import FerricstoreServer.Health.Dashboard.Flow.Sample
@@ -64,7 +65,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
 
   @spec opts_from_query(binary()) :: keyword()
   def opts_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     []
     |> maybe_put_query_opt(:type, normalize_flow_type_filter(Map.get(params, "type")))
@@ -84,7 +85,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Recovery do
   @spec flash_from_query(binary()) :: map() | nil
   def flash_from_query(query) when is_binary(query) do
     query
-    |> URI.decode_query()
+    |> QueryDecoder.decode()
     |> flash_from_params()
   rescue
     _ -> nil

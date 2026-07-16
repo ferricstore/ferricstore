@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.Shard.ZSetIndexTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Shard.ZSetIndex
 
   setup do
@@ -145,6 +146,51 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
 
     assert 1 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
     assert [{"b", 2.0}] == ZSetIndex.rank_range(index, "zs", 0, 10, false)
+  end
+
+  test "rebuild_key atomically replaces one key and marks it ready", %{
+    index: index,
+    lookup: lookup
+  } do
+    insert_members(index, lookup, "zs", [{"stale", "99"}])
+    insert_members(index, lookup, "other", [{"keep", "1"}])
+
+    assert :ok == ZSetIndex.rebuild_key(index, lookup, "zs", [{"a", "2"}, {"b", "3"}])
+
+    assert ZSetIndex.ready?(lookup, "zs")
+    assert [{"a", 2.0}, {"b", 3.0}] == ZSetIndex.rank_range(index, "zs", 0, 10, false)
+    assert [{"keep", 1.0}] == ZSetIndex.rank_range(index, "other", 0, 10, false)
+  end
+
+  test "ensure does not publish a partial index after a storage read failure", %{
+    index: index,
+    lookup: lookup
+  } do
+    keydir = :ets.new(:zset_index_cold_failure, [:set, :public])
+    data_path = Path.join(System.tmp_dir!(), "missing_zset_index_#{System.unique_integer()}")
+    redis_key = "zs"
+    prefix = "Z:zs" <> <<0>>
+
+    state = %{
+      keydir: keydir,
+      data_dir: data_path,
+      index: 0,
+      zset_score_index: index,
+      zset_score_lookup: lookup,
+      zset_index_ready: MapSet.new()
+    }
+
+    try do
+      true = :ets.insert(keydir, {prefix <> "member", nil, 0, 0, 17, 0, 5})
+
+      result = ZSetIndex.ensure(state, redis_key, prefix, data_path)
+
+      assert ReadResult.failure?(result)
+      refute ZSetIndex.ready?(lookup, redis_key)
+      assert [] == ZSetIndex.rank_range(index, redis_key, 0, 10, false)
+    after
+      :ets.delete(keydir)
+    end
   end
 
   defp insert_members(index, lookup, redis_key, members) do

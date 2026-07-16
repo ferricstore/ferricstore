@@ -32,6 +32,10 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
   @default_batch_size 1_000
   @default_timeout_ms 120_000
   @default_release_cursor_interval 500
+  @max_verify_batch_size 1_000
+  @max_partial_output_bytes 65_536
+  @max_recent_line_bytes 4_096
+  @max_recent_lines 20
 
   @impl Mix.Task
   def run(args) do
@@ -141,6 +145,27 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
     |> Enum.join(",")
   end
 
+  @doc false
+  def with_child_cleanup(child, work, cleanup)
+      when is_function(work, 1) and is_function(cleanup, 1) do
+    try do
+      work.(child)
+    after
+      cleanup.(child)
+    end
+  end
+
+  @doc false
+  def validate_marker_pid!(marker, expected_pid) when is_integer(expected_pid) do
+    marker_pid = marker_pid!(marker)
+
+    if marker_pid == expected_pid do
+      marker_pid
+    else
+      Mix.raise("marker pid #{marker_pid} does not match child port pid #{expected_pid}")
+    end
+  end
+
   defp run_parent(opts) do
     Mix.shell().info("kill9 data_dir=#{opts.data_dir}")
     Mix.shell().info("kill9 writes=#{opts.writes} prefix=#{opts.prefix}")
@@ -151,33 +176,50 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
 
     File.mkdir_p!(opts.data_dir)
 
-    writer = start_child(:writer, opts)
-    {:ok, write_marker} = wait_for_marker(writer, "WRITE_DONE", opts.timeout_ms)
-    writer_pid = marker_pid!(write_marker)
+    try do
+      _write_marker =
+        :writer
+        |> start_child(opts)
+        |> with_child_cleanup(
+          fn writer ->
+            {:ok, marker} = wait_for_marker(writer, "WRITE_DONE", opts.timeout_ms)
+            writer_pid = validate_marker_pid!(marker, child_os_pid!(writer))
 
-    Mix.shell().info(
-      "writer ready pid=#{writer_pid} applied=#{write_marker["applied"]} released=#{write_marker["released"]} gap=#{write_marker["gap"]}"
-    )
+            Mix.shell().info(
+              "writer ready pid=#{writer_pid} applied=#{marker["applied"]} released=#{marker["released"]} gap=#{marker["gap"]}"
+            )
 
-    kill9(writer_pid)
-    wait_for_exit(writer, 10_000)
-    Mix.shell().info("writer killed with SIGKILL")
+            kill9(writer_pid)
+            wait_for_exit(writer, 10_000)
+            Mix.shell().info("writer killed with SIGKILL")
+            marker
+          end,
+          &terminate_child/1
+        )
 
-    verifier = start_child(:verifier, opts)
-    {:ok, verify_marker} = wait_for_marker(verifier, "VERIFY_DONE", opts.timeout_ms)
-    wait_for_exit(verifier, 10_000)
+      verify_marker =
+        :verifier
+        |> start_child(opts)
+        |> with_child_cleanup(
+          fn verifier ->
+            {:ok, marker} = wait_for_marker(verifier, "VERIFY_DONE", opts.timeout_ms)
+            wait_for_exit(verifier, 10_000)
+            marker
+          end,
+          &terminate_child/1
+        )
 
-    Mix.shell().info("verify ok")
-    Mix.shell().info("recovery_time_ms=#{verify_marker["recovery_ms"]}")
-    Mix.shell().info("recovery_profile_us=#{verify_marker["profile_us"]}")
-    Mix.shell().info("dbsize=#{verify_marker["dbsize"]}")
-    Mix.shell().info("data_dir=#{opts.data_dir}")
-
-    unless opts.keep_data do
-      File.rm_rf!(opts.data_dir)
+      Mix.shell().info("verify ok")
+      Mix.shell().info("recovery_time_ms=#{verify_marker["recovery_ms"]}")
+      Mix.shell().info("recovery_profile_us=#{verify_marker["profile_us"]}")
+      Mix.shell().info("dbsize=#{verify_marker["dbsize"]}")
+      Mix.shell().info("data_dir=#{opts.data_dir}")
+      :ok
+    after
+      unless opts.keep_data do
+        File.rm_rf!(opts.data_dir)
+      end
     end
-
-    :ok
   end
 
   defp run_writer_child(opts) do
@@ -220,7 +262,10 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
 
     profile = collect_startup_profile(handler_id)
     ctx = FerricStore.Instance.get(:default)
-    verify_samples!(ctx, opts)
+
+    verify_dataset!(opts, fn keys ->
+      Router.batch_get(ctx, keys)
+    end)
 
     marker(
       event: "VERIFY_DONE",
@@ -294,19 +339,45 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
     end
   end
 
-  defp verify_samples!(ctx, opts) do
-    samples =
-      [1, div(opts.writes + 1, 2), opts.writes]
-      |> Enum.uniq()
+  @doc false
+  def verify_dataset!(
+        %{writes: writes, batch_size: batch_size, prefix: prefix},
+        fetch_batch
+      )
+      when is_integer(writes) and writes > 0 and is_integer(batch_size) and batch_size > 0 and
+             is_binary(prefix) and is_function(fetch_batch, 1) do
+    verify_batch_size = min(batch_size, @max_verify_batch_size)
 
-    Enum.each(samples, fn i ->
-      expected = value(i)
+    1..writes
+    |> Enum.chunk_every(verify_batch_size)
+    |> Enum.each(fn indexes ->
+      keys = Enum.map(indexes, &key(prefix, &1))
 
-      case Router.get(ctx, key(opts.prefix, i)) do
-        ^expected -> :ok
-        other -> Mix.raise("key #{i} expected #{inspect(expected)}, got #{inspect(other)}")
+      case fetch_batch.(keys) do
+        values when is_list(values) -> verify_batch!(indexes, values)
+        other -> Mix.raise("batch read failed during verification: #{inspect(other)}")
       end
     end)
+
+    :ok
+  end
+
+  defp verify_batch!([index | indexes], [actual | values]) do
+    expected = value(index)
+
+    if actual == expected do
+      verify_batch!(indexes, values)
+    else
+      Mix.raise("key #{index} expected #{inspect(expected)}, got #{inspect(actual)}")
+    end
+  end
+
+  defp verify_batch!([], []), do: :ok
+
+  defp verify_batch!(indexes, values) do
+    Mix.raise(
+      "batch read returned wrong result count: expected #{length(indexes)}, got #{length(values)}"
+    )
   end
 
   defp write_dataset!(ctx, opts) do
@@ -348,7 +419,7 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
 
     receive do
       {^port, {:data, data}} ->
-        {buffer, recent, marker} = consume_lines(buffer <> data, recent, event)
+        {buffer, recent, marker} = consume_output(buffer, data, recent, event)
 
         case marker do
           nil -> do_wait_for_marker(port, event, buffer, recent, deadline)
@@ -363,24 +434,41 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
     end
   end
 
-  defp consume_lines(buffer, recent, event) do
-    parts = String.split(buffer, "\n")
+  @doc false
+  def consume_output(buffer, data, recent, event)
+      when is_binary(buffer) and is_binary(data) and is_list(recent) and is_binary(event) do
+    parts = :binary.split(buffer <> data, "\n", [:global])
     {lines, [tail]} = Enum.split(parts, -1)
 
-    Enum.reduce(lines, {tail, recent, nil}, fn line, {tail, recent, found} ->
-      recent = keep_recent([String.trim(line) | recent])
+    {_, recent, marker} =
+      Enum.reduce(lines, {nil, recent, nil}, fn line, {_tail, recent, found} ->
+        recent_line = line |> keep_suffix(@max_recent_line_bytes) |> String.trim()
+        recent = keep_recent([recent_line | recent])
 
-      marker =
-        case {found, parse_marker(line)} do
-          {nil, {:ok, %{"event" => ^event} = marker}} -> marker
-          {current, _} -> current
-        end
+        marker =
+          case {found, parse_bounded_marker(line)} do
+            {nil, {:ok, %{"event" => ^event} = marker}} -> marker
+            {current, _} -> current
+          end
 
-      {tail, recent, marker}
-    end)
+        {nil, recent, marker}
+      end)
+
+    {keep_suffix(tail, @max_partial_output_bytes), recent, marker}
   end
 
-  defp keep_recent(lines), do: Enum.take(lines, 20)
+  defp parse_bounded_marker(line) when byte_size(line) <= @max_recent_line_bytes,
+    do: parse_marker(line)
+
+  defp parse_bounded_marker(_line), do: :ignore
+
+  defp keep_recent(lines), do: Enum.take(lines, @max_recent_lines)
+
+  defp keep_suffix(binary, limit) when byte_size(binary) <= limit, do: binary
+
+  defp keep_suffix(binary, limit) do
+    binary_part(binary, byte_size(binary) - limit, limit)
+  end
 
   defp marker_pid!(%{"pid" => pid}) do
     case Integer.parse(pid) do
@@ -403,6 +491,29 @@ defmodule Mix.Tasks.Ferricstore.RecoveryKill9 do
       {^port, {:exit_status, _status}} -> :ok
     after
       timeout_ms -> Mix.raise("timed out waiting for child exit")
+    end
+  end
+
+  defp child_os_pid!(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} when is_integer(pid) and pid > 0 -> pid
+      _ -> Mix.raise("child port closed before reporting its OS pid")
+    end
+  end
+
+  defp terminate_child(port) when is_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} when is_integer(pid) and pid > 0 ->
+        _ = System.cmd("kill", ["-9", Integer.to_string(pid)], stderr_to_stdout: true)
+
+      _closed ->
+        :ok
+    end
+
+    try do
+      Port.close(port)
+    catch
+      :error, :badarg -> :ok
     end
   end
 

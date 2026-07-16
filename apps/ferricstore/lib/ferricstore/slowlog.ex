@@ -27,6 +27,10 @@ defmodule Ferricstore.SlowLog do
   @table :ferricstore_slowlog
   @default_threshold_us 10_000
   @default_max_len 128
+  @max_stored_args 32
+  @max_stored_arg_bytes 128
+  @redacted "[redacted]"
+  @arguments_omitted "[more arguments omitted]"
 
   # -------------------------------------------------------------------------
   # Types
@@ -66,7 +70,7 @@ defmodule Ferricstore.SlowLog do
     threshold = threshold()
 
     if threshold >= 0 and duration_us > threshold do
-      GenServer.cast(__MODULE__, {:log, command, duration_us})
+      GenServer.cast(__MODULE__, {:log, sanitize_command(command), duration_us})
     end
 
     :ok
@@ -79,15 +83,8 @@ defmodule Ferricstore.SlowLog do
   """
   @spec get(non_neg_integer() | nil) :: [entry()]
   def get(count \\ nil) do
-    entries =
-      @table
-      |> :ets.tab2list()
-      |> Enum.sort_by(fn {id, _, _, _} -> id end, :desc)
-
-    case count do
-      nil -> entries
-      n when is_integer(n) and n >= 0 -> Enum.take(entries, n)
-    end
+    limit = if is_nil(count), do: :all, else: count
+    newest_entries(:ets.last(@table), limit, [])
   end
 
   @doc """
@@ -118,7 +115,10 @@ defmodule Ferricstore.SlowLog do
   """
   @spec threshold() :: integer()
   def threshold do
-    :persistent_term.get(:ferricstore_slowlog_threshold, @default_threshold_us)
+    case :persistent_term.get(:ferricstore_slowlog_threshold, @default_threshold_us) do
+      value when is_integer(value) and value >= -1 -> value
+      _invalid -> @default_threshold_us
+    end
   end
 
   @doc """
@@ -138,9 +138,12 @@ defmodule Ferricstore.SlowLog do
 
   Reads from `persistent_term` (~5ns) rather than `Application.get_env`.
   """
-  @spec max_len() :: pos_integer()
+  @spec max_len() :: non_neg_integer()
   def max_len do
-    :persistent_term.get(:ferricstore_slowlog_max_len, @default_max_len)
+    case :persistent_term.get(:ferricstore_slowlog_max_len, @default_max_len) do
+      value when is_integer(value) and value >= 0 -> value
+      _invalid -> @default_max_len
+    end
   end
 
   @doc """
@@ -152,6 +155,11 @@ defmodule Ferricstore.SlowLog do
   def set_max_len(value) when is_integer(value) and value >= 0 do
     Application.put_env(:ferricstore, :slowlog_max_len, value)
     :persistent_term.put(:ferricstore_slowlog_max_len, value)
+
+    if Process.whereis(__MODULE__) do
+      GenServer.call(__MODULE__, :trim)
+    end
+
     :ok
   end
 
@@ -161,7 +169,7 @@ defmodule Ferricstore.SlowLog do
 
   @impl true
   def init(_opts) do
-    table = :ets.new(@table, [:set, :public, :named_table])
+    table = :ets.new(@table, [:ordered_set, :public, :named_table])
 
     # Cache slowlog threshold and max_len in persistent_term for hot-path reads.
     # This runs once at startup; values can be updated via CONFIG SET which calls
@@ -198,6 +206,11 @@ defmodule Ferricstore.SlowLog do
     {:reply, :ok, %{state | next_id: 0}}
   end
 
+  def handle_call(:trim, _from, state) do
+    evict_if_needed(state)
+    {:reply, :ok, state}
+  end
+
   @impl true
   def handle_call(:ping, _from, state), do: {:reply, :pong, state}
 
@@ -210,16 +223,89 @@ defmodule Ferricstore.SlowLog do
     size = :ets.info(@table, :size)
 
     if size > max do
-      # Find and delete the oldest (lowest ID) entries.
-      to_remove = size - max
-
-      @table
-      |> :ets.tab2list()
-      |> Enum.sort_by(fn {id, _, _, _} -> id end)
-      |> Enum.take(to_remove)
-      |> Enum.each(fn {id, _, _, _} -> :ets.delete(@table, id) end)
+      delete_oldest(size - max)
     end
   end
+
+  defp delete_oldest(remaining) when remaining <= 0, do: :ok
+
+  defp delete_oldest(remaining) do
+    case :ets.first(@table) do
+      :"$end_of_table" ->
+        :ok
+
+      id ->
+        :ets.delete(@table, id)
+        delete_oldest(remaining - 1)
+    end
+  end
+
+  defp newest_entries(:"$end_of_table", _remaining, acc), do: Enum.reverse(acc)
+  defp newest_entries(_id, 0, acc), do: Enum.reverse(acc)
+
+  defp newest_entries(id, remaining, acc) do
+    previous_id = :ets.prev(@table, id)
+
+    case :ets.lookup(@table, id) do
+      [entry] -> newest_entries(previous_id, decrement_limit(remaining), [entry | acc])
+      [] -> newest_entries(previous_id, remaining, acc)
+    end
+  end
+
+  defp decrement_limit(:all), do: :all
+  defp decrement_limit(remaining), do: remaining - 1
+
+  defp sanitize_command([command | args]) when is_binary(command) do
+    case {String.upcase(command), args} do
+      {"AUTH", _args} ->
+        [copy_arg(command), @redacted]
+
+      {"CONFIG", [subcommand, key, _value | _rest]}
+      when is_binary(subcommand) and is_binary(key) ->
+        if String.upcase(subcommand) == "SET" and Ferricstore.Config.sensitive_param?(key) do
+          [copy_arg(command), copy_arg(subcommand), copy_arg(key), @redacted]
+        else
+          bound_command([command | args])
+        end
+
+      {"ACL", [subcommand, username | _rules]}
+      when is_binary(subcommand) and is_binary(username) ->
+        if String.upcase(subcommand) == "SETUSER" do
+          [copy_arg(command), copy_arg(subcommand), copy_arg(username), @redacted]
+        else
+          bound_command([command | args])
+        end
+
+      _other ->
+        bound_command([command | args])
+    end
+  end
+
+  defp sanitize_command(command) when is_list(command), do: bound_command(command)
+
+  defp bound_command(command) do
+    take_bounded_args(command, @max_stored_args, [])
+  end
+
+  defp take_bounded_args([], _remaining, acc), do: Enum.reverse(acc)
+  defp take_bounded_args([arg], 1, acc), do: Enum.reverse([copy_arg(arg) | acc])
+  defp take_bounded_args([_arg | _rest], 1, acc), do: Enum.reverse([@arguments_omitted | acc])
+
+  defp take_bounded_args([arg | rest], remaining, acc) do
+    take_bounded_args(rest, remaining - 1, [copy_arg(arg) | acc])
+  end
+
+  defp copy_arg(arg) when is_binary(arg) and byte_size(arg) <= @max_stored_arg_bytes do
+    :binary.copy(arg)
+  end
+
+  defp copy_arg(arg) when is_binary(arg) do
+    omitted = byte_size(arg) - @max_stored_arg_bytes
+    prefix = arg |> binary_part(0, @max_stored_arg_bytes) |> :binary.copy()
+    prefix <> "...[#{omitted} more bytes]"
+  end
+
+  defp copy_arg(arg), do: arg |> inspect(limit: 8, printable_limit: 64) |> copy_arg()
 
   @near_full_threshold 0.90
 

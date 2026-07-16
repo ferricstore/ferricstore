@@ -104,6 +104,27 @@ defmodule Ferricstore.PipelineBatchTest do
       assert {:ok, "b"} = FerricStore.get("pb:cross_beta")
       assert {:ok, "c"} = FerricStore.get("pb:cross_gamma")
     end
+
+    test "complex pipeline batches each shard and preserves global result order" do
+      [key_a, key_b] = Ferricstore.Test.ShardHelpers.keys_on_different_shards(2)
+      ctx = FerricStore.Instance.get(:default)
+      shard_a = Ferricstore.Store.Router.shard_for(ctx, key_a)
+      shard_b = Ferricstore.Store.Router.shard_for(ctx, key_b)
+      before_a = raft_position(shard_a)
+      before_b = raft_position(shard_b)
+
+      assert {:ok, [{:ok, 1}, {:ok, 1}, {:ok, 2}, {:ok, 2}]} =
+               FerricStore.pipeline(fn pipe ->
+                 pipe
+                 |> FerricStore.Pipe.incr(key_a)
+                 |> FerricStore.Pipe.incr(key_b)
+                 |> FerricStore.Pipe.incr(key_a)
+                 |> FerricStore.Pipe.incr(key_b)
+               end)
+
+      assert raft_position(shard_a) == before_a + 1
+      assert raft_position(shard_b) == before_b + 1
+    end
   end
 
   describe "edge cases" do
@@ -247,6 +268,14 @@ defmodule Ferricstore.PipelineBatchTest do
 
       assert {:ok, "new"} = FerricStore.get("pb:get_before_set")
     end
+
+    test "mixed distinct-key batches preserve per-shard command ordering" do
+      assert :complex =
+               FerricStore.Pipe.__classify_batch_for_test__([
+                 {:get, "{pb:ordered}:before"},
+                 {:set, "{pb:ordered}:after", "value", []}
+               ])
+    end
   end
 
   describe "performance" do
@@ -292,5 +321,12 @@ defmodule Ferricstore.PipelineBatchTest do
         assert {:ok, ^expected} = FerricStore.get("pb:pipe:#{i}")
       end
     end
+  end
+
+  defp raft_position(shard_index) do
+    {:ok, {:raft_log_pos, index, _term}} =
+      Ferricstore.Raft.WARaftBackend.storage_position(shard_index)
+
+    index
   end
 end

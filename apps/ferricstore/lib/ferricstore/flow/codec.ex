@@ -14,6 +14,7 @@ defmodule Ferricstore.Flow.Codec do
   # Flow data, incompatible field-order/type changes need explicit migration.
   @record_bin_magic "FSF5"
   @history_bin_magic "FSH2"
+  @max_exact_integer 9_007_199_254_740_991
 
   # FSF5 stores only the required mutable state fields inline. Optional fields
   # are controlled by the flag word below so nil/default values do not repeat on
@@ -213,7 +214,14 @@ defmodule Ferricstore.Flow.Codec do
   def decode_value(value), do: Support.decode_value(value)
 
   @doc false
+  def decode_value_result(value), do: Support.decode_value_result(value)
+
+  @doc false
   def decode_value_with_user_size(value), do: Support.decode_value_with_user_size(value)
+
+  @doc false
+  def decode_value_with_user_size_result(value),
+    do: Support.decode_value_with_user_size_result(value)
 
   @doc false
   # Flow has not shipped as a public durable format yet, so recovery accepts
@@ -705,7 +713,8 @@ defmodule Ferricstore.Flow.Codec do
            decode_flagged_bin(flags, @record_flag_rewound_to_event_id, rest, nil),
          {:ok, child_groups, ""} <- decode_record_sidecar(flags, rest) do
       {child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta,
-       state_enter_seq, governance_limit} = Support.split_record_sidecar(child_groups)
+       incarnation, state_enter_seq, governance_limit} =
+        Support.split_record_sidecar(child_groups)
 
       record =
         %{
@@ -743,15 +752,14 @@ defmodule Ferricstore.Flow.Codec do
         |> maybe_put_decoded_indexed_attributes(indexed_attributes)
         |> maybe_put_decoded_state_meta(state_meta)
         |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
+        |> maybe_put_decoded_incarnation(incarnation)
         |> maybe_put_decoded_state_enter_seq(state_enter_seq)
         |> maybe_put_decoded_governance_limit(governance_limit)
         |> maybe_put_decoded_max_active_ms(max_active_ms)
 
-      if is_nil(rewound_to_event_id) do
-        record
-      else
-        Map.put(record, :rewound_to_event_id, rewound_to_event_id)
-      end
+      record
+      |> maybe_put_decoded_rewound_to_event_id(rewound_to_event_id)
+      |> validate_decoded_record!()
     else
       _ -> raise ArgumentError, "invalid flow record"
     end
@@ -831,7 +839,8 @@ defmodule Ferricstore.Flow.Codec do
        when is_binary(child_groups_encoded) do
     with {:ok, child_groups, ""} <- Support.decode_child_groups(child_groups_encoded) do
       {child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta,
-       state_enter_seq, governance_limit} = Support.split_record_sidecar(child_groups)
+       incarnation, state_enter_seq, governance_limit} =
+        Support.split_record_sidecar(child_groups)
 
       record =
         %{
@@ -869,15 +878,14 @@ defmodule Ferricstore.Flow.Codec do
         |> maybe_put_decoded_indexed_attributes(indexed_attributes)
         |> maybe_put_decoded_state_meta(state_meta)
         |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
+        |> maybe_put_decoded_incarnation(incarnation)
         |> maybe_put_decoded_state_enter_seq(state_enter_seq)
         |> maybe_put_decoded_governance_limit(governance_limit)
         |> maybe_put_decoded_max_active_ms(max_active_ms)
 
-      if is_nil(rewound_to_event_id) do
-        record
-      else
-        Map.put(record, :rewound_to_event_id, rewound_to_event_id)
-      end
+      record
+      |> maybe_put_decoded_rewound_to_event_id(rewound_to_event_id)
+      |> validate_decoded_record!()
     else
       _ -> raise ArgumentError, "invalid flow record"
     end
@@ -910,7 +918,8 @@ defmodule Ferricstore.Flow.Codec do
        when is_binary(child_groups_encoded) do
     with {:ok, child_groups, ""} <- Support.decode_child_groups(child_groups_encoded) do
       {_child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta,
-       _state_enter_seq, _governance_limit} = Support.split_record_sidecar(child_groups)
+       _incarnation, _state_enter_seq, _governance_limit} =
+        Support.split_record_sidecar(child_groups)
 
       %{
         id: id,
@@ -938,6 +947,7 @@ defmodule Ferricstore.Flow.Codec do
       |> maybe_put_decoded_state_meta(state_meta)
       |> maybe_put_decoded_indexed_state_meta(indexed_state_meta)
       |> maybe_put_decoded_max_active_ms(max_active_ms)
+      |> validate_decoded_record!()
     else
       _ -> raise ArgumentError, "invalid flow record"
     end
@@ -976,6 +986,12 @@ defmodule Ferricstore.Flow.Codec do
 
   defp maybe_put_decoded_indexed_state_meta(record, _key), do: record
 
+  defp maybe_put_decoded_incarnation(record, incarnation)
+       when is_integer(incarnation) and incarnation >= 0,
+       do: Map.put(record, :incarnation, incarnation)
+
+  defp maybe_put_decoded_incarnation(record, _incarnation), do: record
+
   defp maybe_put_decoded_state_enter_seq(record, seq) when is_integer(seq) and seq >= 0,
     do: Map.put(record, :state_enter_seq, seq)
 
@@ -986,6 +1002,28 @@ defmodule Ferricstore.Flow.Codec do
        do: Map.put(record, :max_active_ms, max_active_ms)
 
   defp maybe_put_decoded_max_active_ms(record, _max_active_ms), do: record
+
+  defp maybe_put_decoded_rewound_to_event_id(record, nil), do: record
+
+  defp maybe_put_decoded_rewound_to_event_id(record, rewound_to_event_id),
+    do: Map.put(record, :rewound_to_event_id, rewound_to_event_id)
+
+  defp validate_decoded_record!(%{
+         id: id,
+         type: type,
+         state: state,
+         version: version,
+         created_at_ms: created_at_ms,
+         updated_at_ms: updated_at_ms
+       } = record)
+       when is_binary(id) and id != "" and is_binary(type) and type != "" and is_binary(state) and
+              state != "" and is_integer(version) and version >= 0 and
+              version <= @max_exact_integer and is_integer(created_at_ms) and created_at_ms >= 0 and
+              created_at_ms <= @max_exact_integer and is_integer(updated_at_ms) and
+              updated_at_ms >= 0 and updated_at_ms <= @max_exact_integer,
+       do: record
+
+  defp validate_decoded_record!(_record), do: raise(ArgumentError, "invalid flow record")
 
   defp decode_history_fields_bin(rest, context) do
     with {:ok, flags, rest} <- decode_int(rest),

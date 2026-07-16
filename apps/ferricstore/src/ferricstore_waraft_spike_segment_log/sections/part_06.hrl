@@ -1,14 +1,13 @@
 %% Included by ferricstore_waraft_spike_segment_log.erl; generated split section 6.
 
 decode_segment_config(Binary) ->
-    try binary_to_term(Binary, [safe]) of
-        #{version := 1, records_per_segment := Value}
+    case decode_external_term_exact(Binary) of
+        {ok, #{version := 1, records_per_segment := Value}}
           when is_integer(Value), Value > 0 ->
             {ok, Value};
-        Other ->
-            {error, {bad_segment_config, Other}}
-    catch
-        _:Reason ->
+        {ok, Other} ->
+            {error, {bad_segment_config, Other}};
+        {error, Reason} ->
             {error, {bad_segment_config, Reason}}
     end.
 
@@ -24,7 +23,7 @@ write_segment_config(Dir, Value) ->
     Path = segment_config_path(Dir),
     TmpPath = Path ++ ".tmp." ++ unique_suffix(),
     Config = #{version => 1, records_per_segment => Value},
-    case write_file_sync(TmpPath, term_to_binary(Config)) of
+    case write_file_sync(TmpPath, encode_external_term(Config)) of
         ok ->
             case rename_path(TmpPath, Path) of
                 ok -> sync_dir(Dir);
@@ -103,21 +102,17 @@ delete_file_if_exists(Path) ->
     end.
 
 write_file_sync(Path, Binary) ->
-    case file:open(Path, [write, raw, binary]) of
-        {ok, Fd} ->
-            WriteResult =
-                case file:write(Fd, Binary) of
-                    ok -> file:sync(Fd);
-                    {error, Reason} -> {error, {write, Reason}}
-                end,
-            CloseResult = file:close(Fd),
-            case {WriteResult, CloseResult} of
-                {ok, ok} -> ok;
-                {{error, WriteReason}, _} -> {error, WriteReason};
-                {_, {error, CloseReason}} -> {error, {close, CloseReason}}
-            end;
-        {error, Reason} ->
-            {error, {open_write, Reason}}
+    BinaryPath = unicode:characters_to_binary(Path),
+    try 'Elixir.Ferricstore.Bitcask.NIF':fs_atomic_replace_nofollow(
+        BinaryPath,
+        Binary,
+        ?MAX_SEGMENT_METADATA_BYTES
+    ) of
+        ok -> ok;
+        {error, Reason} -> {error, {atomic_write, Path, Reason}};
+        Other -> {error, {atomic_write, Path, Other}}
+    catch
+        Class:Reason -> {error, {atomic_write_exception, Path, Class, Reason}}
     end.
 
 sync_dir(Path) ->
@@ -674,22 +669,47 @@ segment_append_kind(Path) ->
         _ -> raft_log
     end.
 
-decode_segment_record(Path, Payload) ->
-    try
-        Decoded =
-            case segment_append_kind(Path) of
-                raft_log ->
-                    %% Safe decoding still supports VM references used as local
-                    %% correlation ids, but rejects new atoms from corrupt WAL.
-                    binary_to_term(Payload, [safe]);
-                _Projection ->
-                    binary_to_term(Payload, [safe])
-            end,
-        {ok, Decoded}
-    catch
-        _:Reason ->
+decode_segment_record(_Path, Payload) ->
+    case decode_external_term_exact(Payload) of
+        {ok, Decoded} ->
+            {ok, Decoded};
+        {error, Reason} ->
             {error, {bad_term, Reason}}
     end.
+
+read_segment_file_nofollow(Path, MaxBytes) ->
+    BinaryPath = unicode:characters_to_binary(Path),
+    try 'Elixir.Ferricstore.Bitcask.NIF':fs_read_nofollow(BinaryPath, MaxBytes) of
+        {ok, Binary} when is_binary(Binary) ->
+            {ok, Binary};
+        {error, {enoent, _Detail}} ->
+            {error, enoent};
+        {error, Reason} ->
+            {error, Reason};
+        Other ->
+            {error, {unexpected_secure_read_result, Other}}
+    catch
+        Class:Reason ->
+            {error, {secure_read_exception, Class, Reason}}
+    end.
+
+encode_external_term(Term) ->
+    term_to_binary(Term, [deterministic]).
+
+decode_external_term_exact(<<131, 80, _/binary>>) ->
+    {error, compressed_external_term};
+decode_external_term_exact(Binary) when is_binary(Binary) ->
+    try binary_to_term(Binary, [safe, used]) of
+        {Term, Used} when Used =:= byte_size(Binary) ->
+            {ok, Term};
+        {_Term, _Used} ->
+            {error, trailing_external_term}
+    catch
+        _:Reason ->
+            {error, Reason}
+    end;
+decode_external_term_exact(_Other) ->
+    {error, invalid_external_term}.
 
 emit_telemetry(Event, Measurements, Metadata) ->
     %% telemetry:execute/3 logs a warning when the telemetry application has not

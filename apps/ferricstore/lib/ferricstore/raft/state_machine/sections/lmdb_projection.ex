@@ -300,11 +300,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
             _ -> []
           end
 
-        {hibernation_ops, hibernation_after_flush} = pending_flow_hibernation_mirror_items(state)
-        ops = pending_ops ++ hibernation_ops
-        after_flush = after_flush ++ hibernation_after_flush
-
-        with :ok <- enqueue_lmdb_projection_dirty_groups(state, dirty_projection_shards),
+        with {:ok, {hibernation_ops, hibernation_after_flush}} <-
+               pending_flow_hibernation_mirror_items(state),
+             ops = pending_ops ++ hibernation_ops,
+             after_flush = after_flush ++ hibernation_after_flush,
+             :ok <- enqueue_lmdb_projection_dirty_groups(state, dirty_projection_shards),
              :ok <- enqueue_lmdb_projection_outbox_groups(state, projection_outbox_entries) do
           case ops do
             [] ->
@@ -321,48 +321,60 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           pending when is_list(pending) ->
             pending
             |> Enum.reverse()
-            |> Enum.reduce({[], []}, fn
-              {key, record, state_value}, {ops_acc, after_acc} ->
-                case flow_hibernation_candidate_items(state, key, record, state_value) do
-                  {ops, after_flush} -> {ops_acc ++ ops, after_acc ++ after_flush}
-                  :skip -> {ops_acc, after_acc}
-                end
+            |> Enum.reduce_while({:ok, {[], []}}, fn
+              {key, record, state_value}, {:ok, acc} ->
+                reduce_flow_hibernation_candidate(state, key, record, state_value, acc)
 
-              {key, record}, {ops_acc, after_acc} ->
-                case flow_hibernation_candidate_items(state, key, record, nil) do
-                  {ops, after_flush} -> {ops_acc ++ ops, after_acc ++ after_flush}
-                  :skip -> {ops_acc, after_acc}
-                end
+              {key, record}, {:ok, acc} ->
+                reduce_flow_hibernation_candidate(state, key, record, nil, acc)
             end)
+            |> case do
+              {:ok, {reversed_ops, reversed_after_flush}} ->
+                {:ok, {Enum.reverse(reversed_ops), Enum.reverse(reversed_after_flush)}}
+
+              {:error, _reason} = error ->
+                error
+            end
 
           _ ->
-            {[], []}
+            {:ok, {[], []}}
+        end
+      end
+
+      defp reduce_flow_hibernation_candidate(
+             state,
+             key,
+             record,
+             state_value,
+             {ops_acc, after_acc}
+           ) do
+        case flow_hibernation_candidate_items(state, key, record, state_value) do
+          {:ok, {ops, after_flush}} ->
+            {:cont, {:ok, {Enum.reverse(ops, ops_acc), Enum.reverse(after_flush, after_acc)}}}
+
+          :skip ->
+            {:cont, {:ok, {ops_acc, after_acc}}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
         end
       end
 
       defp flow_hibernation_candidate_items(state, key, record, state_value) do
-        with {:ok, locator} <- flow_hibernation_locator_from_hot(state, key, record) do
+        with {:ok, locator} <- flow_hibernation_locator_from_hot(state, key, record),
+             {:ok, active_index_reverse_value} <-
+               flow_hibernation_active_index_reverse(state, key),
+             {:ok, ops} <-
+               Hibernation.demotion_ops_result(%{
+                 locator: locator,
+                 record: Map.put(record, :state_key, key),
+                 state_value: state_value,
+                 active_index_reverse_value: active_index_reverse_value
+               }) do
           candidate_record = Map.put(record, :state_key, key)
 
-          active_index_reverse_value =
-            case Ferricstore.Flow.LMDB.get(
-                   flow_lmdb_record_path(state),
-                   Ferricstore.Flow.LMDB.active_by_state_key_key(key)
-                 ) do
-              {:ok, reverse_value} when is_binary(reverse_value) -> reverse_value
-              _missing -> nil
-            end
-
-          ops =
-            Hibernation.demotion_ops(%{
-              locator: locator,
-              record: candidate_record,
-              state_value: state_value,
-              active_index_reverse_value: active_index_reverse_value
-            })
-
           action =
-            {:hibernate_flow_evict_hot_v1,
+            {:hibernate_flow_evict_hot,
              %{
                data_dir: Map.get(state, :data_dir),
                shard_index: Map.get(state, :shard_index),
@@ -376,12 +388,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
                locator: locator
              }}
 
-          {
-            Enum.map(ops, &{:lmdb_shard, state.shard_index, &1}),
-            [{:lmdb_shard, state.shard_index, action}]
-          }
+          {:ok,
+           {
+             Enum.map(ops, &{:lmdb_shard, state.shard_index, &1}),
+             [{:lmdb_shard, state.shard_index, action}]
+           }}
         else
-          _ -> :skip
+          {:error, :not_found} -> :skip
+          {:error, reason} -> {:error, {:flow_hibernation_demotion_failed, reason}}
+          _invalid_locator -> :skip
+        end
+      end
+
+      defp flow_hibernation_active_index_reverse(state, key) do
+        case Ferricstore.Flow.LMDB.get(
+               flow_lmdb_record_path(state),
+               Ferricstore.Flow.LMDB.active_by_state_key_key(key)
+             ) do
+          {:ok, reverse_value} when is_binary(reverse_value) -> {:ok, reverse_value}
+          :not_found -> {:ok, nil}
+          {:error, _reason} = error -> error
+          other -> {:error, {:invalid_active_index_reverse_read, other}}
         end
       end
 
@@ -752,10 +779,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
                 end
               end
 
+              queue_compound_promotion_removal_after_flush(key)
               :ok
           end
         end
       end
+
+      defp queue_compound_promotion_removal_after_flush(<<"PM:", _::binary>> = marker_key) do
+        redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(marker_key)
+
+        case Process.get(:sm_pending_compound_promotion_removals) do
+          %MapSet{} = pending ->
+            Process.put(
+              :sm_pending_compound_promotion_removals,
+              MapSet.put(pending, redis_key)
+            )
+
+          _not_in_apply ->
+            :ok
+        end
+
+        :ok
+      end
+
+      defp queue_compound_promotion_removal_after_flush(_key), do: :ok
 
       defp maybe_queue_lmdb_state_delete(state, key) when is_binary(key) do
         cond do
@@ -987,9 +1034,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
               {v, exp} -> {to_disk_binary(v), exp}
             end
 
-          new_val = old_val <> suffix
-          do_put(state, key, new_val, expire_at_ms)
-          {:ok, byte_size(new_val)}
+          new_size =
+            Ferricstore.Raft.ApplyLimits.append_size(byte_size(old_val), byte_size(suffix))
+
+          with :ok <- Ferricstore.Raft.ApplyLimits.validate_value_size(state, new_size),
+               new_val = old_val <> suffix,
+               :ok <- do_put(state, key, new_val, expire_at_ms) do
+            {:ok, new_size}
+          end
         end
       end
 

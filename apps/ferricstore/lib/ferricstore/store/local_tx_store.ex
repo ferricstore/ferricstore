@@ -2,12 +2,11 @@ defmodule Ferricstore.Store.LocalTxStore do
   @moduledoc """
   Transaction-local store context for MULTI/EXEC.
 
-  During a transaction, commands execute inside a shard's GenServer.call.
-  For keys on the local shard, operations go directly to ETS (avoiding
-  GenServer.call deadlock). For remote keys, operations delegate to Router.
-
-  This struct replaces the 445-line `build_local_store` closure factory.
-  `Store.Ops` dispatches on this struct type.
+  Prepared transaction routing admits only commands whose keys belong to the
+  owning shard. Operations then go directly to the shard's ETS and pending
+  write state, avoiding nested GenServer or Raft calls during replicated apply.
+  `Store.Ops` dispatches on this struct type and retains defensive nonlocal
+  branches for callers outside the prepared transaction contract.
   """
 
   @type t :: %__MODULE__{
@@ -33,6 +32,8 @@ defmodule Ferricstore.Store.LocalTxStore do
         shard_data_path: Map.fetch!(state, :shard_data_path),
         data_dir: Map.fetch!(state, :data_dir),
         promoted_instances: Map.get(state, :promoted_instances, %{}),
+        compound_member_index:
+          Map.get(state, :compound_member_index) || Map.get(state, :compound_member_index_name),
         zset_score_index: Map.get(state, :zset_score_index),
         zset_score_lookup: Map.get(state, :zset_score_lookup),
         zset_index_ready: Map.get(state, :zset_index_ready)

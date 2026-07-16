@@ -1354,6 +1354,51 @@ defmodule Ferricstore.FlowAttributesTest do
     end)
   end
 
+  test "auto partition attribute discovery excludes expired terminal projections" do
+    type = unique_flow_id("attrs-auto-expired-type")
+    id = unique_flow_id("attrs-auto-expired")
+    stale_now_ms = System.system_time(:millisecond) - 60_000
+
+    assert {:ok, _} = FerricStore.flow_policy_set(type, indexed_attributes: ["tenant"])
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "queued",
+               attributes: %{"tenant" => "acme"},
+               retention_ttl_ms: 1,
+               run_at_ms: stale_now_ms,
+               now_ms: stale_now_ms
+             )
+
+    assert {:ok, created} = FerricStore.flow_get(id)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               states: ["queued"],
+               partition_key: created.partition_key,
+               worker: "w1",
+               limit: 1,
+               now_ms: stale_now_ms + 1
+             )
+
+    assert :ok =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               partition_key: created.partition_key,
+               now_ms: stale_now_ms + 2
+             )
+
+    assert_eventually(fn ->
+      assert {:ok, []} =
+               FerricStore.flow_attributes(type,
+                 state: "completed",
+                 partition_key: :auto,
+                 consistent_projection: true
+               )
+    end)
+  end
+
   defp claim_one!(type, state, now_ms) do
     assert {:ok, [claimed]} =
              FerricStore.flow_claim_due(type,

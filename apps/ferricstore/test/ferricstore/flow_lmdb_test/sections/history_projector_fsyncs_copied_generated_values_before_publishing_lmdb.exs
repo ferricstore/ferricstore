@@ -24,9 +24,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
         instance_name = :"flow_lmdb_projected_value_fsync_#{System.unique_integer([:positive])}"
         flow_id = "projected-value-fsync"
         history_key = Ferricstore.Flow.Keys.history_key(flow_id)
-        event_id = "1"
+        event_id = "1-1"
         event_key = Ferricstore.Flow.Keys.stream_entry_key_from_history_key(history_key, event_id)
-        value_ref = "f:{#{flow_id}}:v:p:#{flow_id}:1"
+        value_ref = Ferricstore.Flow.Keys.value_key(flow_id, :payload, 1)
         payload = "projected-payload"
 
         on_exit(fn ->
@@ -616,6 +616,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
 
         assert_receive {:flow_lmdb_rebuild, [:ferricstore, :flow, :lmdb_rebuild],
                         %{history: 1, history_lmdb_errors: 1, lmdb_errors: 1}, %{shard_index: 0}}
+
+        assert Ferricstore.Flow.LMDB.flush_in_progress?(Ferricstore.Flow.LMDB.path(shard_path))
       end
 
       test "startup reconcile writes one history flow expiry marker per flow" do

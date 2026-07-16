@@ -36,6 +36,7 @@ mod atoms {
         busy,
         value,
         fallback,
+        compare_failed,
     }
 }
 
@@ -50,18 +51,28 @@ enum LmdbBatchWrite<'a> {
     Put(Binary<'a>, Binary<'a>),
     PutNew(Binary<'a>, Binary<'a>),
     Delete(Binary<'a>),
+    Compare(Binary<'a>, Binary<'a>),
+    CompareMissing(Binary<'a>),
 }
 
 struct LmdbStore {
     env: heed::Env,
     db: heed::Database<heed::types::Bytes, heed::types::Bytes>,
+    map_size: usize,
 }
 
-static LMDB_STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<LmdbStore>>>> =
+type LmdbStoreCell = OnceLock<Result<Arc<LmdbStore>, String>>;
+
+static LMDB_STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<LmdbStoreCell>>>> =
     OnceLock::new();
 
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
+    if let Err(error) = async_io::initialize() {
+        eprintln!("ferricstore NIF failed to initialise async runtime: {error}");
+        return false;
+    }
+
     let _ = rustler::resource!(ValueBuffer, env);
     flow_index::register_resource(env);
     tdigest::register_resource(env);
@@ -91,19 +102,454 @@ fn load(env: Env, _info: Term) -> bool {
 
 /// Open a file for reading with FADV_RANDOM hint (disable readahead).
 pub fn open_random_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let file = std::fs::File::open(path)?;
+    #[cfg(unix)]
+    let file = crate::path_open::open_file_nofollow(path, libc::O_RDONLY, 0)?;
+
+    #[cfg(not(unix))]
+    let file = {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    reject_final_component_symlink(path)?;
+        options.open(path)?
+    };
+
+    ensure_regular_file(&file, "random-access read target")?;
     fadvise_random(&file);
     Ok(file)
 }
 
 /// Open a file for read+write with FADV_RANDOM hint.
 pub fn open_random_rw(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
+    #[cfg(unix)]
+    let file = crate::path_open::open_file_nofollow(path, libc::O_RDWR, 0)?;
+
+    #[cfg(not(unix))]
+    let file = {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    reject_final_component_symlink(path)?;
+        options.open(path)?
+    };
+
+    ensure_regular_file(&file, "random-access read-write target")?;
     fadvise_random(&file);
     Ok(file)
+}
+
+fn ensure_regular_file(file: &std::fs::File, description: &str) -> std::io::Result<()> {
+    if file.metadata()?.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{description} is not a regular file"),
+        ))
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct FileLock(std::os::fd::RawFd);
+
+#[cfg(unix)]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0, libc::LOCK_UN) };
+    }
+}
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub(crate) struct FileLock;
+
+#[cfg(unix)]
+fn lock_file(file: &std::fs::File, operation: libc::c_int) -> std::io::Result<FileLock> {
+    use std::os::fd::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    loop {
+        if unsafe { libc::flock(fd, operation) } == 0 {
+            return Ok(FileLock(fd));
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn lock_file_exclusive(file: &std::fs::File) -> std::io::Result<FileLock> {
+    lock_file(file, libc::LOCK_EX)
+}
+
+#[cfg(unix)]
+pub(crate) fn lock_file_shared(file: &std::fs::File) -> std::io::Result<FileLock> {
+    lock_file(file, libc::LOCK_SH)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn lock_file_exclusive(_file: &std::fs::File) -> std::io::Result<FileLock> {
+    Ok(FileLock)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn lock_file_shared(_file: &std::fs::File) -> std::io::Result<FileLock> {
+    Ok(FileLock)
+}
+
+/// An open sidecar descriptor whose advisory lock is held for its lifetime.
+#[derive(Debug)]
+pub struct LockedFile {
+    // Unlock while `file` is still open. Rust drops fields in declaration order.
+    _lock: Option<FileLock>,
+    file: std::fs::File,
+}
+
+impl std::ops::Deref for LockedFile {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl std::ops::DerefMut for LockedFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.file
+    }
+}
+
+/// Open a sidecar for a consistent read. Concurrent readers share the lock;
+/// creators and mutators wait until every reader has finished.
+pub fn open_random_read_locked(path: &std::path::Path) -> std::io::Result<LockedFile> {
+    let file = open_random_read(path)?;
+    let lock = lock_file_shared(&file)?;
+    Ok(LockedFile {
+        _lock: Some(lock),
+        file,
+    })
+}
+
+/// Open a sidecar for a serialized read-modify-write operation.
+pub fn open_random_rw_locked(path: &std::path::Path) -> std::io::Result<LockedFile> {
+    let file = open_random_rw(path)?;
+    let lock = lock_file_exclusive(&file)?;
+    Ok(LockedFile {
+        _lock: Some(lock),
+        file,
+    })
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FileIdentity(u64);
+
+#[cfg(not(unix))]
+fn file_identity(_file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    static NEXT_IDENTITY: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    Ok(FileIdentity(NEXT_IDENTITY.fetch_add(
+        1,
+        std::sync::atomic::Ordering::Relaxed,
+    )))
+}
+
+/// A destination and its merge sources protected as one deadlock-free lock set.
+pub(crate) struct MergeLockedFiles {
+    // Release locks while every descriptor is still open.
+    _locks: Vec<FileLock>,
+    pub(crate) destination: std::fs::File,
+    pub(crate) sources: Vec<std::fs::File>,
+}
+
+#[derive(Clone, Copy)]
+enum MergeLockTarget {
+    Destination,
+    Source(usize),
+}
+
+/// Open every file in a read-modify-write merge and acquire unique inode locks
+/// in one global order. Opposing merges therefore cannot form an A->B/B->A
+/// lock cycle, and destination hard-link aliases reuse its exclusive lock.
+pub(crate) fn open_random_merge_locked(
+    destination_path: &std::path::Path,
+    source_paths: &[&std::path::Path],
+) -> std::io::Result<MergeLockedFiles> {
+    let destination = open_random_rw(destination_path)?;
+    let mut sources = Vec::new();
+    sources.try_reserve_exact(source_paths.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "merge source descriptor allocation failed",
+        )
+    })?;
+    for path in source_paths {
+        sources.push(open_random_read(path)?);
+    }
+
+    let mut targets = std::collections::BTreeMap::new();
+    for (index, source) in sources.iter().enumerate() {
+        targets
+            .entry(file_identity(source)?)
+            .or_insert(MergeLockTarget::Source(index));
+    }
+    targets.insert(
+        file_identity(&destination)?,
+        MergeLockTarget::Destination,
+    );
+
+    let mut locks = Vec::new();
+    locks.try_reserve_exact(targets.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "merge lock allocation failed",
+        )
+    })?;
+    for target in targets.into_values() {
+        let lock = match target {
+            MergeLockTarget::Destination => lock_file_exclusive(&destination)?,
+            MergeLockTarget::Source(index) => lock_file_shared(&sources[index])?,
+        };
+        locks.push(lock);
+    }
+
+    Ok(MergeLockedFiles {
+        _locks: locks,
+        destination,
+        sources,
+    })
+}
+
+static SIDECAR_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub struct StagedFile {
+    file: LockedFile,
+    temp_path: std::path::PathBuf,
+    destination_path: std::path::PathBuf,
+    published: bool,
+}
+
+impl std::ops::Deref for StagedFile {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl std::ops::DerefMut for StagedFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.file
+    }
+}
+
+impl StagedFile {
+    /// Sync a complete sidecar and publish it with one same-directory rename.
+    pub fn publish(mut self) -> std::io::Result<()> {
+        self.file.sync_all()?;
+        #[cfg(unix)]
+        crate::path_open::rename_nofollow(&self.temp_path, &self.destination_path)?;
+        #[cfg(not(unix))]
+        std::fs::rename(&self.temp_path, &self.destination_path)?;
+        self.published = true;
+
+        let parent = self
+            .destination_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        sync_sidecar_directory(parent)
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if !self.published {
+            #[cfg(unix)]
+            let _ = crate::path_open::remove_file_nofollow(&self.temp_path);
+            #[cfg(not(unix))]
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+/// Create an exclusively locked same-directory temporary sidecar. The final
+/// path remains absent (or retains its prior complete inode) until `publish`.
+pub fn create_staged_locked_nofollow(path: &std::path::Path) -> std::io::Result<StagedFile> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "sidecar path has no file name")
+    })?;
+
+    for _ in 0..128 {
+        let sequence = SIDECAR_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{}.ferric-sidecar-{}-{sequence}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+        #[cfg(unix)]
+        let file_result = crate::path_open::open_file_nofollow(
+            &temp_path,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        );
+
+        #[cfg(not(unix))]
+        let file_result = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp_path);
+
+        match file_result {
+            Ok(file) => {
+                let lock = lock_file_exclusive(&file)?;
+                return Ok(StagedFile {
+                    file: LockedFile {
+                        _lock: Some(lock),
+                        file,
+                    },
+                    temp_path,
+                    destination_path: path.to_path_buf(),
+                    published: false,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate sidecar staging file",
+    ))
+}
+
+#[cfg(unix)]
+fn sync_sidecar_directory(path: &std::path::Path) -> std::io::Result<()> {
+    crate::path_open::open_directory_nofollow(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_sidecar_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// Open or create an append-only log without following a final-component symlink.
+pub(crate) fn open_append_nofollow(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = crate::path_open::open_file_nofollow(
+        path,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+        0o666,
+    )?;
+
+    #[cfg(not(unix))]
+    let file = {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    reject_final_component_symlink(path)?;
+        options.open(path)?
+    };
+
+    ensure_regular_file(&file, "append target")?;
+
+    Ok(file)
+}
+
+/// Open or create a random-access log without following a final-component symlink.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_rw_create_nofollow(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    let file = crate::path_open::open_file_nofollow(
+        path,
+        libc::O_RDWR | libc::O_CREAT,
+        0o666,
+    )?;
+    ensure_regular_file(&file, "random-access log target")?;
+    Ok(file)
+}
+
+/// Open an existing file for write-only maintenance without following a symlink.
+pub(crate) fn open_write_nofollow(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = crate::path_open::open_file_nofollow(path, libc::O_WRONLY, 0)?;
+
+    #[cfg(not(unix))]
+    let file = {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    reject_final_component_symlink(path)?;
+        options.open(path)?
+    };
+
+    ensure_regular_file(&file, "maintenance write target")?;
+    Ok(file)
+}
+
+/// Create or truncate a regular file without following a final-component
+/// symlink. Probabilistic sidecar creation uses this before publishing metadata.
+pub fn create_truncate_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = crate::path_open::open_file_nofollow(
+        path,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+        0o666,
+    )?;
+
+    #[cfg(not(unix))]
+    let file = {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    reject_final_component_symlink(path)?;
+        options.open(path)?
+    };
+
+    ensure_regular_file(&file, "truncate target")?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn reject_final_component_symlink(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "final path component is a symlink",
+        )),
+        Ok(_metadata) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Hint the kernel that this fd will be accessed randomly (disable readahead).
@@ -150,8 +596,25 @@ pub fn fsync_dir(path: &str) -> Result<(), String> {
         return Err("empty path".to_string());
     }
 
+    let path = std::path::Path::new(path);
+
+    #[cfg(unix)]
     let dir =
-        std::fs::File::open(std::path::Path::new(path)).map_err(|e| format!("open dir: {e}"))?;
+        crate::path_open::open_directory_nofollow(path).map_err(|e| format!("open dir: {e}"))?;
+
+    #[cfg(not(unix))]
+    let dir = {
+        reject_final_component_symlink(path).map_err(|e| format!("open dir: {e}"))?;
+        let dir = std::fs::File::open(path).map_err(|e| format!("open dir: {e}"))?;
+        if !dir
+            .metadata()
+            .map_err(|e| format!("stat dir: {e}"))?
+            .is_dir()
+        {
+            return Err("open dir: path is not a directory".to_string());
+        }
+        dir
+    };
 
     dir.sync_data().map_err(|e| format!("sync_data: {e}"))
 }
@@ -223,7 +686,7 @@ fn parse_file_id(path: &std::path::Path) -> u64 {
 ///
 /// Pure I/O — no keydir, no Mutex for reads.
 /// The caller (Elixir Shard GenServer) serialises writes.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_record<'a>(
     env: Env<'a>,
@@ -246,10 +709,7 @@ fn v2_append_record<'a>(
     match log::LogWriter::open_small(p, file_id) {
         Ok(mut writer) => {
             let offset = writer
-                .write(key.as_slice(), value.as_slice(), expire_at_ms)
-                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-            writer
-                .sync()
+                .write_sync(key.as_slice(), value.as_slice(), expire_at_ms)
                 .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
             let record_size =
                 (log::HEADER_SIZE + key.as_slice().len() + value.as_slice().len()) as u64;
@@ -261,7 +721,7 @@ fn v2_append_record<'a>(
 
 /// Append a tombstone record (logical delete) to a data file.
 /// Returns `{:ok, {offset, record_size}}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_tombstone<'a>(env: Env<'a>, path: String, key: Binary) -> NifResult<Term<'a>> {
     let p = std::path::Path::new(&path);
@@ -271,10 +731,7 @@ fn v2_append_tombstone<'a>(env: Env<'a>, path: String, key: Binary) -> NifResult
     match log::LogWriter::open_small(p, file_id) {
         Ok(mut writer) => {
             let offset = writer
-                .write_tombstone(key.as_slice())
-                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-            writer
-                .sync()
+                .write_tombstone_sync(key.as_slice())
                 .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
             let record_size = (log::HEADER_SIZE + key.as_slice().len()) as u64;
             Ok((atoms::ok(), (offset, record_size)).encode(env))
@@ -285,7 +742,7 @@ fn v2_append_tombstone<'a>(env: Env<'a>, path: String, key: Binary) -> NifResult
 
 /// Append a batch of records with a single fsync. Returns
 /// `{:ok, [{offset, value_size}, ...]}`.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_batch<'a>(
     env: Env<'a>,
@@ -321,7 +778,7 @@ fn v2_append_batch<'a>(
 /// but not the value bytes. We pread from disk and return the value.
 ///
 /// No Mutex needed — pread is stateless and thread-safe.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
     let p = std::path::Path::new(&path);
@@ -330,7 +787,7 @@ fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
     // LogReader::open which does open + fstat + seek (4 syscalls).
     // File::open + pread = 2 syscalls (open + pread).
     // Future optimization: cache fds per shard in a global fd pool.
-    match std::fs::File::open(p) {
+    match open_random_read(p) {
         Ok(file) => {
             fadvise_random(&file);
             match log::pread_record_from_file(&file, offset) {
@@ -412,7 +869,9 @@ fn validate_value_ref_from_file(
         let key_offset = offset
             .checked_add(log::HEADER_SIZE as u64)
             .ok_or_else(|| "file ref key offset overflow".to_string())?;
-        read_exact_at_for_ref(file, &mut key, key_offset)?;
+        if !read_exact_at_for_ref(file, &mut key, key_offset)? {
+            return Err("short read while validating file ref key".to_string());
+        }
     }
 
     if key != expected_key {
@@ -456,7 +915,9 @@ fn validate_file_ref_crc(
         let read_size = usize::try_from(remaining.min(buf.len() as u64))
             .map_err(|_| "file ref value read size overflow".to_string())?;
         let chunk = &mut buf[..read_size];
-        read_exact_at_for_ref(file, chunk, read_offset)?;
+        if !read_exact_at_for_ref(file, chunk, read_offset)? {
+            return Err("short read while validating file ref value".to_string());
+        }
         hasher.update(chunk);
         read_offset = read_offset
             .checked_add(read_size as u64)

@@ -1,6 +1,8 @@
 defmodule Ferricstore.Stream.LocalState do
   @moduledoc false
 
+  alias Ferricstore.Commands.Stream.CacheKey
+
   @tables [
     Ferricstore.Stream.Meta,
     Ferricstore.Stream.Groups,
@@ -9,13 +11,43 @@ defmodule Ferricstore.Stream.LocalState do
   ]
 
   @spec clear() :: :ok
-  def clear do
+  def clear, do: clear(nil)
+
+  @spec clear(term()) :: :ok
+  def clear(store) do
+    scope = CacheKey.scope(store)
+
     Enum.each(@tables, fn table ->
       if :ets.whereis(table) != :undefined do
-        :ets.delete_all_objects(table)
+        clear_table(table, scope)
       end
     end)
 
     :ok
+  end
+
+  defp clear_table(table, :unscoped), do: :ets.delete_all_objects(table)
+
+  defp clear_table(Ferricstore.Stream.Meta = table, {:ok, scope}) do
+    delete_scoped(table, {{{:"$1", :_}, :_, :_, :_, :_, :_}, scope})
+  end
+
+  defp clear_table(Ferricstore.Stream.Groups = table, {:ok, scope}) do
+    delete_scoped(table, {{{{:"$1", :_}, :_}, :_, :_, :_}, scope})
+  end
+
+  defp clear_table(Ferricstore.Stream.Index = table, {:ok, scope}) do
+    delete_scoped(table, {{{:ready, {:"$1", :_}}, :_}, scope})
+    delete_scoped(table, {{{{:"$1", :_}, :_, :_}, :_, :_}, scope})
+  end
+
+  defp clear_table(:ferricstore_stream_waiters = table, {:ok, scope}) do
+    delete_scoped(table, {{{:"$1", :_}, :_, :_, :_}, scope})
+  end
+
+  defp delete_scoped(table, {head, scope}) do
+    :ets.select_delete(table, [
+      {head, [{:"=:=", :"$1", {:const, scope}}], [true]}
+    ])
   end
 end

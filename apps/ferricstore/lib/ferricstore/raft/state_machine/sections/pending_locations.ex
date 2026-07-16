@@ -41,6 +41,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
       alias Ferricstore.Store.Shard.ZSetIndex
       alias Ferricstore.Store.Shard.CompoundMemberIndex
+      alias Ferricstore.Store.Shard.LogicalKeyIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -107,6 +108,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
               )
 
               CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+              logical_key_index_put(state, key, value, expire_at_ms)
               refs
 
             _other ->
@@ -154,6 +156,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
               )
 
               CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+              logical_key_index_put(state, key, value, expire_at_ms)
               refs
 
             _other ->
@@ -294,6 +297,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
           CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
+          logical_key_index_delete(state, key)
           maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
@@ -312,6 +316,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
           CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
+          logical_key_index_delete(state, key)
           maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
@@ -334,14 +339,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           track_keydir_binary_delta(state, key, nil, expire_at_ms)
           :ets.insert(state.ets, {key, nil, expire_at_ms, lfu, file_id, offset, value_size})
           CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+          logical_key_index_put(state, key, value, expire_at_ms)
         else
           expected_staged_size = byte_size(to_disk_binary(value))
 
           replaced =
-            replace_pending_location(
+            replace_current_pending_location(
               state,
               key,
-              nil,
+              value,
               expire_at_ms,
               expected_staged_size,
               file_id,
@@ -349,9 +355,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
               value_size
             )
 
+          replaced =
+            if replaced > 0 do
+              replaced
+            else
+              replace_pending_location(
+                state,
+                key,
+                nil,
+                expire_at_ms,
+                expected_staged_size,
+                file_id,
+                offset,
+                value_size
+              )
+            end
+
           if replaced > 0 do
             delete_apply_projection_cache_for_pending_original(state, key, file_id)
             CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+            logical_key_index_put(state, key, value, expire_at_ms)
           end
         end
 
@@ -380,18 +403,35 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           )
 
           CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+          logical_key_index_put(state, key, value, expire_at_ms)
         else
           replaced =
-            replace_pending_location(
+            replace_current_pending_location(
               state,
               key,
-              expected_value,
+              value,
               expire_at_ms,
               expected_staged_size,
               file_id,
               offset,
               value_size
             )
+
+          replaced =
+            if replaced > 0 do
+              replaced
+            else
+              replace_pending_location(
+                state,
+                key,
+                expected_value,
+                expire_at_ms,
+                expected_staged_size,
+                file_id,
+                offset,
+                value_size
+              )
+            end
 
           if replaced == 0 and expected_staged_size != 0 do
             # Older staged writes can carry vsize=0; state-machine apply must still
@@ -411,16 +451,38 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             if fallback_replaced > 0 do
               delete_apply_projection_cache_for_pending_original(state, key, file_id)
               CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+              logical_key_index_put(state, key, value, expire_at_ms)
             end
           else
             if replaced > 0 do
               delete_apply_projection_cache_for_pending_original(state, key, file_id)
               CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+              logical_key_index_put(state, key, value, expire_at_ms)
             end
           end
         end
 
         :ok
+      end
+
+      defp logical_key_index_put(state, key, value, expire_at_ms) do
+        :ok =
+          LogicalKeyIndex.put(
+            Map.get(state, :logical_key_index_name),
+            Map.get(state, :logical_key_slots_name),
+            key,
+            value,
+            expire_at_ms
+          )
+      end
+
+      defp logical_key_index_delete(state, key) do
+        :ok =
+          LogicalKeyIndex.delete(
+            Map.get(state, :logical_key_index_name),
+            Map.get(state, :logical_key_slots_name),
+            key
+          )
       end
 
       defp maybe_prepend_apply_projection_cache_ref(state, key, refs, current_file_id) do
@@ -545,6 +607,41 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           ])
         rescue
           ArgumentError -> 0
+        end
+      end
+
+      defp replace_current_pending_location(
+             state,
+             key,
+             value,
+             expire_at_ms,
+             expected_staged_size,
+             file_id,
+             offset,
+             value_size
+           ) do
+        case Process.get(:sm_pending_values, %{}) do
+          %{^key => {^value, ^expire_at_ms}} ->
+            try do
+              file_id_spec = pending_location_file_id_matchspec(file_id)
+
+              :ets.select_replace(state.ets, [
+                {
+                  {key, :"$1", expire_at_ms, :"$2", :pending, 0, expected_staged_size},
+                  [
+                    {:orelse, {:==, :"$1", nil}, {:==, :"$1", value}}
+                  ],
+                  [
+                    {{key, :"$1", expire_at_ms, :"$2", file_id_spec, offset, value_size}}
+                  ]
+                }
+              ])
+            rescue
+              ArgumentError -> 0
+            end
+
+          _stale_or_missing ->
+            0
         end
       end
 
@@ -893,10 +990,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       defp pending_original_from_previous([entry]), do: {:entry, entry}
       defp pending_original_from_previous([]), do: :missing
 
-      defp flow_lmdb_projection_enabled?(_state) do
-        :persistent_term.get({__MODULE__, :flow_lmdb_hot_projection_removed}, false)
-      end
-
       defp flow_lmdb_record_path(state), do: Map.fetch!(state, :flow_lmdb_path)
 
       defp flow_hibernation_enabled?(state),
@@ -994,7 +1087,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             NativeFlowIndex.table_names(Map.get(state, :instance_name), shard_index)
 
           action =
-            {:prune_terminal_flow_v3, data_dir, shard_index, state.ets, zset_index, zset_lookup,
+            {:prune_terminal_flow, data_dir, shard_index, state.ets, zset_index, zset_lookup,
              flow_index, flow_lookup, state_key, type, terminal_state,
              Map.get(record, :partition_key), Map.get(record, :parent_flow_id),
              Map.get(record, :root_flow_id), Map.get(record, :correlation_id), id, version}

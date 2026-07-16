@@ -5,7 +5,7 @@ read_disk_record_at(Dir, Index, Offset, EncodedSize, RecordsPerSegment) ->
     Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case file:open(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
                     Result =
                         try read_disk_record_at_fd(Fd, Path, Index, Offset, EncodedSize, FileBytes, Ordinal, RecordsPerSegment) of
@@ -197,7 +197,7 @@ scan_segment_paths([{Ordinal, Path} | Rest], PreviousIndex, RecordsPerSegment, F
 scan_segment(Ordinal, Path, PreviousIndex, RecordsPerSegment, FirstIndex, LastIndex, Count) ->
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case file:open(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
                     Result =
                         try scan_segment_fd(Fd, Path, PreviousIndex, 0, FileBytes, Ordinal, RecordsPerSegment, FirstIndex, LastIndex, Count) of
@@ -318,7 +318,7 @@ scan_raft_segment_paths([{Ordinal, Path} | Rest], PreviousIndex, RecordsPerSegme
 scan_raft_segment(Ordinal, Path, PreviousIndex, RecordsPerSegment, FirstIndex, Count, TailLimit, TailQueue, ScanPayloadBytes) ->
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case file:open(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
                     Result =
                         try scan_raft_segment_fd(
@@ -541,14 +541,12 @@ load_raft_tail_locations(Dir, Name, RecordsPerSegment, [{Index, Ordinal, Path, O
 maybe_update_latest_config_from_payload(Dir, Index, Payload) ->
     case config_candidate_payload(Payload) of
         true ->
-            try binary_to_term(Payload, [safe]) of
-                {Index, {_Term, _Op} = Entry} ->
+            case decode_external_term_exact(Payload) of
+                {ok, {Index, {_Term, _Op} = Entry}} ->
                     _ = update_latest_config_from_record(Dir, {Index, Entry}),
                     ok;
                 _Other ->
                     ok
-            catch
-                _:_ -> ok
             end;
         false ->
             ok
@@ -557,7 +555,7 @@ maybe_update_latest_config_from_payload(Dir, Index, Payload) ->
 load_segment(Ordinal, Path, Name, PreviousIndex, RecordsPerSegment) ->
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case file:open(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
                     try load_segment_fd(Fd, Path, Name, PreviousIndex, 0, FileBytes, Ordinal, RecordsPerSegment) of
                         {ok, LastIndex, ValidBytes} ->
@@ -855,7 +853,7 @@ little_unsigned(<<Digit, Rest/binary>>, Shift, Acc) ->
 maybe_truncate(Path, ValidBytes, FileBytes) when ValidBytes < FileBytes ->
     case validate_existing_segment_file(Path) of
         ok ->
-            case file:open(Path, [read, write, raw, binary]) of
+            case open_verified_segment_file(Path, [read, write, raw, binary]) of
                 {ok, Fd} ->
                     Result = file:position(Fd, ValidBytes),
                     TruncResult =

@@ -51,6 +51,12 @@ defmodule Ferricstore.DataDirTest do
     assert_raise ArgumentError, ~r/canonical/, fn ->
       DataDir.root_from_shard_path(Path.join(root, "shard_2"))
     end
+
+    for invalid <- ["not-a-shard", "shard_-1", "shard_01", "shard_2.tmp"] do
+      assert_raise ArgumentError, ~r/canonical/, fn ->
+        DataDir.root_from_shard_path(Path.join([root, "data", invalid]))
+      end
+    end
   end
 
   test "blob_shard_path returns canonical blob shard path and layout creates it" do
@@ -65,6 +71,21 @@ defmodule Ferricstore.DataDirTest do
       assert File.dir?(Path.join([root, "blob", "shard_1"]))
       assert File.dir?(Path.join([root, "waraft", "ferricstore_waraft_backend.1", "segment_log"]))
       assert File.dir?(Path.join([root, "waraft", "ferricstore_waraft_backend.2", "segment_log"]))
+    after
+      File.rm_rf!(root)
+    end
+  end
+
+  test "ensure_layout rejects a non-positive shard count before creating directories" do
+    root =
+      Path.join(System.tmp_dir!(), "data_dir_invalid_count_#{System.unique_integer([:positive])}")
+
+    try do
+      assert_raise ArgumentError, ~r/positive integer/, fn ->
+        DataDir.ensure_layout!(root, 0)
+      end
+
+      refute File.exists?(root)
     after
       File.rm_rf!(root)
     end

@@ -8,6 +8,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
   require Logger
 
   @default_flush_delay_ms 0
+  @default_retry_delay_ms 100
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -73,8 +74,9 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
     shard_data_path = Keyword.fetch!(opts, :shard_data_path)
     instance_ctx = Keyword.get(opts, :instance_ctx)
     flush_delay_ms = Keyword.get(opts, :flush_delay_ms, @default_flush_delay_ms)
+    retry_delay_ms = Keyword.get(opts, :retry_delay_ms, @default_retry_delay_ms)
     durable_index = ReplaySafeIndex.read(shard_data_path)
-    publish_durable(instance_ctx, shard_index, durable_index)
+    publish_initial_durable(instance_ctx, shard_index, durable_index)
 
     {:ok,
      %{
@@ -84,6 +86,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
        durable_index: durable_index,
        requested_index: durable_index,
        flush_delay_ms: flush_delay_ms,
+       retry_delay_ms: retry_delay_ms,
        flush_ref: nil
      }}
   end
@@ -140,13 +143,33 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
       {:error, reason} ->
         record_persist_failure(state.instance_ctx, state.shard_index)
         emit_persist({:error, reason}, state, index, started_at)
-        state
+        schedule_retry(state)
     end
+  end
+
+  defp schedule_retry(%{flush_ref: ref} = state) when is_reference(ref), do: state
+
+  defp schedule_retry(state) do
+    ref = Process.send_after(self(), :flush, max(state.retry_delay_ms, 1))
+    %{state | flush_ref: ref}
   end
 
   defp poke_release_cursor(_state, _index), do: :ok
 
   defp publish_durable(%{replay_safe_index: replay_safe_index}, shard_index, index)
+       when is_reference(replay_safe_index) do
+    if shard_index < :atomics.info(replay_safe_index).size do
+      put_atomic_max(replay_safe_index, shard_index, index)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp publish_durable(_instance_ctx, _shard_index, _index), do: :ok
+
+  defp publish_initial_durable(%{replay_safe_index: replay_safe_index}, shard_index, index)
        when is_reference(replay_safe_index) do
     if shard_index < :atomics.info(replay_safe_index).size do
       :atomics.put(replay_safe_index, shard_index + 1, index)
@@ -157,7 +180,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
     _ -> :ok
   end
 
-  defp publish_durable(_instance_ctx, _shard_index, _index), do: :ok
+  defp publish_initial_durable(_instance_ctx, _shard_index, _index), do: :ok
 
   defp publish_requested(%{replay_safe_requested_index: requested_index}, shard_index, index)
        when is_reference(requested_index) do
@@ -184,14 +207,20 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
   defp put_atomic_max(ref, shard_index, value) do
     if shard_index < :atomics.info(ref).size do
       position = shard_index + 1
-      current = :atomics.get(ref, position)
-
-      if value > current do
-        :atomics.put(ref, position, value)
-      end
+      compare_exchange_atomic_max(ref, position, value, :atomics.get(ref, position))
     end
 
     :ok
+  end
+
+  defp compare_exchange_atomic_max(_ref, _position, value, current) when value <= current,
+    do: :ok
+
+  defp compare_exchange_atomic_max(ref, position, value, current) do
+    case :atomics.compare_exchange(ref, position, current, value) do
+      :ok -> :ok
+      actual when is_integer(actual) -> compare_exchange_atomic_max(ref, position, value, actual)
+    end
   end
 
   defp emit_persist(status, state, index, started_at) do

@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.ColdReadTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Store.ColdRead
+  alias Ferricstore.Bitcask.NIF
 
   test "await_tokio returns successful completion" do
     assert {:ok, "value"} =
@@ -76,5 +77,110 @@ defmodule Ferricstore.Store.ColdReadTest do
 
     assert {:grouped_paths, [{^path_a, [{0, 10}, {2, 30}]}, {^path_b, [{1, 20}]}]} =
              ColdRead.pread_batch_submit_shape(locations)
+  end
+
+  test "keyed batch result normalization rejects silent cardinality truncation" do
+    assert {:ok, ["a", nil]} =
+             ColdRead.normalize_keyed_batch_result({:ok, ["a", nil]}, 2)
+
+    assert {:error, {:batch_result_length_mismatch, 2, 1}} =
+             ColdRead.normalize_keyed_batch_result({:ok, ["only-one"]}, 2)
+
+    assert {:error, {:invalid_batch_result, :invalid}} =
+             ColdRead.normalize_keyed_batch_result(:invalid, 2)
+  end
+
+  test "keyed batch reads recover old offsets from a compaction backup" do
+    dir =
+      Path.join(System.tmp_dir!(), "cold-read-generation-#{System.unique_integer([:positive])}")
+
+    source = Path.join(dir, "00000.log")
+    backup = Path.join(dir, "compaction_backup_0.log")
+    File.mkdir_p!(dir)
+
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    assert {:ok, [{new_offset, _size}]} = NIF.v2_append_batch(source, [{"new", "new-value", 0}])
+
+    assert {:ok, [_dead, {old_offset, _size}]} =
+             NIF.v2_append_batch(backup, [
+               {"dead", "dead-value", 0},
+               {"old", "old-value", 0}
+             ])
+
+    assert {:ok, ["old-value", "new-value"]} =
+             ColdRead.pread_batch_keyed(
+               [{source, old_offset, "old"}, {source, new_offset, "new"}],
+               5_000
+             )
+  end
+
+  test "keyed batch reads never follow a symlinked compaction backup" do
+    dir =
+      Path.join(System.tmp_dir!(), "cold-read-backup-link-#{System.unique_integer([:positive])}")
+
+    source = Path.join(dir, "00000.log")
+    external = Path.join(dir, "external.log")
+    backup = Path.join(dir, "compaction_backup_0.log")
+    File.mkdir_p!(dir)
+
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    assert {:ok, [{_source_offset, _size}]} =
+             NIF.v2_append_batch(source, [{"different", "source-value", 0}])
+
+    assert {:ok, [{external_offset, _size}]} =
+             NIF.v2_append_batch(external, [{"secret", "external-value", 0}])
+
+    File.ln_s!(external, backup)
+
+    assert {:ok, [nil]} =
+             ColdRead.pread_batch_keyed([{source, external_offset, "secret"}], 5_000)
+  end
+
+  test "current keyed batch reads retry a relocated row after its backup is gone" do
+    dir =
+      Path.join(System.tmp_dir!(), "cold-read-current-#{System.unique_integer([:positive])}")
+
+    source = Path.join(dir, "00000.log")
+    replacement = Path.join(dir, "replacement.log")
+    File.mkdir_p!(dir)
+
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    assert {:ok, [_dead, {old_offset, _size}]} =
+             NIF.v2_append_batch(source, [
+               {"dead", "dead-value", 0},
+               {"key", "current-value", 0}
+             ])
+
+    assert {:ok, [{new_offset, _size}]} =
+             NIF.v2_append_batch(replacement, [{"key", "current-value", 0}])
+
+    File.rename!(replacement, source)
+    old_token = {:keydir_row, 0, old_offset}
+    new_token = {:keydir_row, 0, new_offset}
+
+    assert {:ok, [{:value, "current-value", ^new_token}]} =
+             ColdRead.pread_batch_keyed_current(
+               [{source, old_offset, "key", old_token}],
+               fn "key", ^old_token -> {:cold, source, new_offset, new_token} end,
+               5_000
+             )
+  end
+
+  test "current keyed batch reads can resolve a concurrently warmed value without disk IO" do
+    missing_path =
+      Path.join(System.tmp_dir!(), "missing-#{System.unique_integer([:positive])}.log")
+
+    token = {:keydir_row, :old}
+    current_token = {:keydir_row, :current}
+
+    assert {:ok, [{:value, "hot-value", ^current_token}]} =
+             ColdRead.pread_batch_keyed_current(
+               [{missing_path, 0, "key", token}],
+               fn "key", ^token -> {:hot, "hot-value", current_token} end,
+               5_000
+             )
   end
 end

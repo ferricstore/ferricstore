@@ -18,6 +18,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       alias Ferricstore.Store.Promotion
       alias Ferricstore.Store.Shard.ETS, as: ShardETS
       alias Ferricstore.Store.Shard.CompoundMemberIndex
+      alias Ferricstore.Store.Shard.LogicalKeyIndex
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       alias Ferricstore.Store.Shard.ZSetIndex
 
@@ -152,10 +153,19 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         reset_keydir!(ctx, shard_index, keydir)
         ShardLifecycle.recover_keydir(shard_data_path, keydir, shard_index, ctx)
 
+        promoted_instances =
+          Promotion.recover_promoted(shard_data_path, keydir, data_dir, shard_index, ctx)
+
         instance_name = ctx.name
         compound_member_index = CompoundMemberIndex.table_name(instance_name, shard_index)
         ensure_ets_table!(compound_member_index, :ordered_set)
         CompoundMemberIndex.rebuild(compound_member_index, keydir)
+
+        {logical_key_index, logical_key_slots} =
+          LogicalKeyIndex.table_names(instance_name, shard_index)
+
+        LogicalKeyIndex.ensure_tables!(logical_key_index, logical_key_slots)
+        rebuild_logical_key_index!(logical_key_index, logical_key_slots, keydir, shard_index)
 
         {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, shard_index)
         ensure_ets_table!(zset_score_index, :ordered_set)
@@ -198,9 +208,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           active_file_size: active_file_size,
           ets: keydir,
           instance_ctx: ctx,
+          promoted_instances: promoted_instances,
           apply_context: resolve_persisted_apply_context(persisted_apply_context, ctx),
           instance_name: instance_name,
           compound_member_index_name: compound_member_index,
+          logical_key_index_name: logical_key_index,
+          logical_key_slots_name: logical_key_slots,
           zset_score_index_name: zset_score_index,
           zset_score_lookup_name: zset_score_lookup,
           flow_index_name: flow_index,
@@ -227,14 +240,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         with {:ok, projected_sm_state, replay_after_index, base_position} <-
                recover_segment_projection_log(root_dir, sm_state, metadata_position),
              target_position = segment_recovery_target_position(root_dir, metadata, base_position),
-             {:ok, recovered_sm_state, recovered_position, replay_dependencies} <-
+             {:ok, recovered_sm_state, recovered_position, replay_dependencies, recovered_config} <-
                recover_segment_projected_keydir(
                  root_dir,
                  projected_sm_state,
                  target_position,
-                 replay_after_index
+                 replay_after_index,
+                 Map.get(metadata, :config)
                ) do
-          {recovered_sm_state, recovered_position, replay_dependencies}
+          {recovered_sm_state, recovered_position, replay_dependencies, recovered_config}
         else
           {:error, reason} ->
             raise "failed to recover WARaft segment-backed keydir: #{inspect(reason)}"
@@ -246,6 +260,15 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
              ctx,
              shard_index
            ) do
+        CompoundMemberIndex.rebuild(sm_state.compound_member_index_name, keydir)
+
+        rebuild_logical_key_index!(
+          sm_state.logical_key_index_name,
+          sm_state.logical_key_slots_name,
+          keydir,
+          shard_index
+        )
+
         Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
           shard_data_path,
           keydir,
@@ -262,6 +285,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         )
 
         %{sm_state | active_file_size: recovery_file_size(sm_state.active_file_path)}
+      end
+
+      defp rebuild_logical_key_index!(ordered, slots, keydir, shard_index) do
+        case LogicalKeyIndex.rebuild(ordered, slots, keydir) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            raise "failed to rebuild logical key index on shard #{shard_index}: #{inspect(reason)}"
+        end
       end
 
       defp recovery_file_size(path) do
@@ -333,21 +366,23 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
              _root_dir,
              sm_state,
              {:raft_log_pos, index, _term},
-             _after
+             _after,
+             config
            )
            when is_integer(index) and index <= 0,
-           do: {:ok, sm_state, @zero_pos, %{history: %{}}}
+           do: {:ok, sm_state, @zero_pos, %{history: %{}}, config}
 
       defp recover_segment_projected_keydir(
              root_dir,
              sm_state,
              target_position,
-             replay_after_index
+             replay_after_index,
+             config
            ) do
         target_index = recovery_target_index(target_position)
 
         if target_index <= replay_after_index do
-          {:ok, sm_state, recovery_base_position(target_position), %{history: %{}}}
+          {:ok, sm_state, recovery_base_position(target_position), %{history: %{}}, config}
         else
           initial = %{
             sm_state: sm_state,
@@ -355,6 +390,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
             target_index: target_index,
             replay_after_index: replay_after_index,
             replay_dependencies: replay_dependency_defaults(),
+            config: config,
             error: nil
           }
 
@@ -366,7 +402,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
             {:ok, %{error: nil} = acc} ->
               case validate_recovered_target_position(acc, target_position) do
                 :ok ->
-                  {:ok, acc.sm_state, acc.position, acc.replay_dependencies}
+                  {:ok, acc.sm_state, acc.position, acc.replay_dependencies, acc.config}
 
                 {:error, reason} ->
                   {:error, reason}
@@ -401,6 +437,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
 
       defp recover_segment_projected_keydir_record(index, {term, _op} = entry, acc) do
         case command_from_segment_log_entry(entry) do
+          {:ok, {:config, config}} ->
+            position = {:raft_log_pos, index, term}
+            %{acc | position: position, config: {position, config}}
+
           {:ok, command} ->
             position = {:raft_log_pos, index, term}
 
@@ -708,7 +748,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       end
 
       defp encode_storage_metadata(metadata) do
-        payload = metadata |> encode_persisted_metadata_term() |> :erlang.term_to_binary()
+        payload = metadata |> encode_persisted_metadata_term() |> Ferricstore.TermCodec.encode()
 
         if byte_size(payload) <= @max_storage_metadata_bytes do
           {:ok, payload}

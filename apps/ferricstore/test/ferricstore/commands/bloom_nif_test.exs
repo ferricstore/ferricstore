@@ -49,7 +49,7 @@ defmodule Ferricstore.Commands.BloomNifTest do
     }
 
     # Note: exists? is intentionally omitted so the handler falls back
-    # to File.exists? on the base64-encoded path.
+    # to File.exists? on the deterministic sidecar path.
     %{
       bloom_registry: bloom_registry,
       get: fn key ->
@@ -72,11 +72,9 @@ defmodule Ferricstore.Commands.BloomNifTest do
     dir
   end
 
-  # Computes the new-style prob file path (base64 encoded key)
   defp prob_file_path(store, key, ext) do
     dir = store.bloom_registry.dir
-    safe = Base.url_encode64(key, padding: false)
-    Path.join(dir, "#{safe}.#{ext}")
+    Ferricstore.ProbFile.path(dir, key, ext)
   end
 
   # ===========================================================================
@@ -89,7 +87,7 @@ defmodule Ferricstore.Commands.BloomNifTest do
       store = make_nif_store()
       assert :ok = Bloom.handle("BF.RESERVE", ["mybloom", "0.01", "1000"], store)
 
-      # Verify the .bloom file was created (new base64 path convention)
+      # Verify the digest-named .bloom file was created.
       path = prob_file_path(store, "mybloom", "bloom")
       assert File.exists?(path)
     end

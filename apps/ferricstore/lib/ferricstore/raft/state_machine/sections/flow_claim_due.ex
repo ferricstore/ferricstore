@@ -275,6 +275,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
                                     :flow_due_any_index,
                                     false
                                   )
+      @flow_hibernation_recent_scan_pages 16
+      @flow_hibernation_recent_scan_entries 128
+      @flow_hibernation_backfill_scan_pages 64
+      @flow_hibernation_backfill_scan_entries 1_000
+      @flow_hibernation_max_promotions 1_000
+      @flow_hibernation_bucket_ms 60_000
+
       defp flow_due_any_index_enabled?, do: @flow_due_any_index_enabled
 
       if @flow_claim_due_phase_telemetry do
@@ -538,15 +545,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
       defp flow_should_promote_cold_due_for_claim?(
              state,
              attrs,
-             claimed,
-             next_claimed,
+             _claimed,
+             _next_claimed,
              remaining
            ) do
         mode = Map.get(attrs, :cold_due_mode, :skip)
-        hot_miss? = length(next_claimed) == length(claimed)
 
-        flow_hibernation_enabled?(state) and remaining > 0 and hot_miss? and
-          mode in [:allow, :block]
+        flow_hibernation_enabled?(state) and remaining > 0 and mode in [:allow, :block]
+      end
+
+      @doc false
+      def __flow_should_promote_cold_due_for_claim_for_test__(
+            state,
+            attrs,
+            claimed,
+            next_claimed,
+            remaining
+          ) do
+        flow_should_promote_cold_due_for_claim?(
+          state,
+          attrs,
+          claimed,
+          next_claimed,
+          remaining
+        )
       end
 
       defp maybe_promote_cold_due_for_claim(
@@ -561,61 +583,162 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
         if flow_hibernation_enabled?(state) and remaining > 0 do
           promote_limit = flow_hibernation_promote_limit(remaining)
           path = flow_lmdb_record_path(state)
+          {start_ms, horizon_ms} = flow_hibernation_promotion_window(now_ms, state)
+          scan_fun = flow_hibernation_promotion_scan_fun(path)
 
-          now_ms
-          |> flow_hibernation_promote_prefixes(state)
-          |> Enum.reduce_while(0, fn prefix, promoted ->
-            if promoted >= promote_limit do
-              {:halt, promoted}
-            else
-              scan_limit = promote_limit - promoted
+          reduce_fun = fn {due_key, park_key}, acc ->
+            next_acc =
+              case flow_promote_cold_due_entry(
+                     state,
+                     path,
+                     due_key,
+                     park_key,
+                     type,
+                     state_filter,
+                     partition_key,
+                     priority,
+                     now_ms
+                   ) do
+                :ok ->
+                  %{acc | promoted: acc.promoted + 1}
 
-              case Ferricstore.Flow.LMDB.prefix_entries(path, prefix, scan_limit) do
-                {:ok, entries} ->
-                  next_promoted =
-                    Enum.reduce_while(entries, promoted, fn {due_key, park_key}, acc ->
-                      if acc >= promote_limit do
-                        {:halt, acc}
-                      else
-                        case flow_promote_cold_due_entry(
-                               state,
-                               path,
-                               due_key,
-                               park_key,
-                               type,
-                               state_filter,
-                               partition_key,
-                               priority,
-                               now_ms
-                             ) do
-                          :ok -> {:cont, acc + 1}
-                          _ -> {:cont, acc}
-                        end
-                      end
-                    end)
+                {:stale_due, cleanup_batch} ->
+                  %{
+                    acc
+                    | stale_due_cleanups: [cleanup_batch | acc.stale_due_cleanups]
+                  }
 
-                  {:cont, next_promoted}
-
-                _ ->
-                  {:cont, promoted}
+                _skip ->
+                  acc
               end
-            end
-          end)
+
+            if next_acc.promoted >= promote_limit,
+              do: {:halt, next_acc},
+              else: {:cont, next_acc}
+          end
+
+          recent_start_ms =
+            flow_hibernation_recent_start_ms(
+              start_ms,
+              horizon_ms,
+              @flow_hibernation_bucket_ms,
+              @flow_hibernation_recent_scan_pages
+            )
+
+          recent_result =
+            Hibernation.reduce_promotion_buckets(
+              recent_start_ms,
+              horizon_ms,
+              nil,
+              [
+                bucket_ms: @flow_hibernation_bucket_ms,
+                max_pages: @flow_hibernation_recent_scan_pages,
+                max_entries: @flow_hibernation_recent_scan_entries
+              ],
+              flow_hibernation_scan_initial_acc(),
+              scan_fun,
+              reduce_fun
+            )
+
+          recent_acc = flow_hibernation_scan_acc(recent_result)
+
+          if recent_acc.promoted >= promote_limit do
+            flow_queue_stale_due_cleanups(path, recent_acc)
+            recent_acc.promoted
+          else
+            cursor =
+              flow_hibernation_promotion_cursor(state) ||
+                %{bucket_ms: recent_start_ms, after_key: nil}
+
+            backfill_result =
+              Hibernation.reduce_promotion_buckets(
+                start_ms,
+                horizon_ms,
+                cursor,
+                [
+                  bucket_ms: @flow_hibernation_bucket_ms,
+                  max_pages: @flow_hibernation_backfill_scan_pages,
+                  max_entries: @flow_hibernation_backfill_scan_entries
+                ],
+                recent_acc,
+                scan_fun,
+                reduce_fun
+              )
+
+            apply_state_put(
+              :flow_hibernation_promotion_cursor,
+              flow_hibernation_scan_cursor(backfill_result, cursor)
+            )
+
+            backfill_acc = flow_hibernation_scan_acc(backfill_result)
+            flow_queue_stale_due_cleanups(path, backfill_acc)
+            backfill_acc.promoted
+          end
         else
           0
         end
       end
 
       defp flow_hibernation_promote_limit(remaining) do
-        max(remaining * 4, min(remaining + 16, 128))
+        remaining
+        |> Kernel.*(4)
+        |> max(min(remaining + 16, 128))
+        |> min(@flow_hibernation_max_promotions)
       end
 
-      defp flow_hibernation_promote_prefixes(now_ms, state) do
+      defp flow_hibernation_promotion_window(now_ms, state) do
         context = raft_apply_context(state)
         start_ms = max(now_ms - Hibernation.late_promote_window_ms(context), 0)
         horizon_ms = now_ms + Hibernation.promote_window_ms(context)
-        Hibernation.promotion_bucket_prefixes(start_ms, horizon_ms, 60_000)
+        {start_ms, horizon_ms}
       end
+
+      defp flow_hibernation_recent_start_ms(start_ms, horizon_ms, bucket_ms, max_pages) do
+        first_bucket = Ferricstore.Flow.LMDB.cold_due_bucket_ms(start_ms, bucket_ms)
+        last_bucket = Ferricstore.Flow.LMDB.cold_due_bucket_ms(horizon_ms, bucket_ms)
+        max(first_bucket, last_bucket - (max_pages - 1) * bucket_ms)
+      end
+
+      defp flow_hibernation_promotion_scan_fun(path) do
+        fn
+          prefix, nil, limit ->
+            Ferricstore.Flow.LMDB.prefix_entries(path, prefix, limit)
+
+          prefix, after_key, limit when is_binary(after_key) ->
+            Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, after_key, limit)
+        end
+      end
+
+      defp flow_hibernation_promotion_cursor(state) do
+        apply_state_get(
+          :flow_hibernation_promotion_cursor,
+          Map.get(state, :flow_hibernation_promotion_cursor)
+        )
+      end
+
+      defp flow_hibernation_scan_acc({:ok, %{acc: acc}}), do: acc
+      defp flow_hibernation_scan_acc({:error, _reason, %{acc: acc}}), do: acc
+
+      defp flow_hibernation_scan_initial_acc,
+        do: %{promoted: 0, stale_due_cleanups: []}
+
+      defp flow_queue_stale_due_cleanups(_path, %{stale_due_cleanups: []}), do: :ok
+
+      defp flow_queue_stale_due_cleanups(path, %{stale_due_cleanups: cleanups}) do
+        queue_pending_lmdb_mirror_after_flush(
+          {:cleanup_stale_cold_due, path, Enum.reverse(cleanups)}
+        )
+      end
+
+      defp flow_hibernation_scan_cursor({:ok, %{cursor: cursor}}, _fallback), do: cursor
+
+      defp flow_hibernation_scan_cursor(
+             {:error, _reason, %{cursor: cursor}},
+             _fallback
+           ),
+           do: cursor
+
+      defp flow_hibernation_scan_cursor(_invalid, fallback), do: fallback
 
       defp flow_promote_cold_due_entry(
              state,
@@ -629,36 +752,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
              now_ms
            )
            when is_binary(due_key) and is_binary(park_key) do
-        with {:ok, park_blob} <- Ferricstore.Flow.LMDB.get(path, park_key),
-             {:ok, %{locator: %Locator{kind: :state} = locator, state_key: state_key} = park} <-
-               Ferricstore.Flow.LMDB.decode_cold_park(park_blob),
-             true <- is_binary(state_key),
-             {:ok, value} <- flow_read_cold_park_state_value(state, state_key, locator, park),
-             record when is_map(record) <- flow_decode_hot_state_value(value),
-             true <- flow_locator_matches_record?(locator, record),
-             true <-
-               flow_cold_due_record_matches_claim?(
-                 record,
-                 type,
-                 state_filter,
-                 partition_key,
-                 priority,
-                 now_ms
-               ),
-             :ok <- flow_install_hot_cold_record(state, state_key, value, locator, record) do
-          %{locator: locator, park_key: park_key, due_key: due_key}
-          |> Hibernation.cleanup_ops()
-          |> Enum.each(&queue_pending_lmdb_mirror_op/1)
+        case Ferricstore.Flow.LMDB.get(path, park_key) do
+          {:ok, park_blob} when is_binary(park_blob) ->
+            flow_promote_cold_due_park(
+              state,
+              due_key,
+              park_key,
+              park_blob,
+              type,
+              state_filter,
+              partition_key,
+              priority,
+              now_ms
+            )
 
-          :telemetry.execute(
-            [:ferricstore, :flow, :hibernation, :promote],
-            %{count: 1},
-            %{result: :promoted, shard_index: Map.get(state, :shard_index)}
-          )
+          :not_found ->
+            flow_stale_due_cleanup(due_key, park_key, :missing)
 
-          :ok
-        else
-          _ -> :skip
+          _read_failure ->
+            :skip
         end
       end
 
@@ -674,6 +786,155 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
              _now_ms
            ),
            do: :skip
+
+      defp flow_promote_cold_due_park(
+             state,
+             due_key,
+             park_key,
+             park_blob,
+             type,
+             state_filter,
+             partition_key,
+             priority,
+             now_ms
+           ) do
+        case Ferricstore.Flow.LMDB.decode_cold_park(park_blob) do
+          {:ok, %{locator: %Locator{kind: :state} = locator, state_key: state_key} = park}
+          when is_binary(state_key) ->
+            flow_promote_decoded_cold_due(
+              state,
+              due_key,
+              park_key,
+              park_blob,
+              locator,
+              state_key,
+              park,
+              type,
+              state_filter,
+              partition_key,
+              priority,
+              now_ms
+            )
+
+          _invalid_park ->
+            flow_stale_due_cleanup(due_key, park_key, park_blob)
+        end
+      end
+
+      defp flow_promote_decoded_cold_due(
+             state,
+             due_key,
+             park_key,
+             park_blob,
+             locator,
+             state_key,
+             park,
+             type,
+             state_filter,
+             partition_key,
+             priority,
+             now_ms
+           ) do
+        case flow_read_cold_park_state_value(state, state_key, locator, park) do
+          {:ok, value} when is_binary(value) ->
+            case flow_decode_hot_state_value(value) do
+              record when is_map(record) ->
+                flow_promote_decoded_cold_record(
+                  state,
+                  due_key,
+                  park_key,
+                  park_blob,
+                  locator,
+                  state_key,
+                  value,
+                  record,
+                  type,
+                  state_filter,
+                  partition_key,
+                  priority,
+                  now_ms
+                )
+
+              _invalid_record ->
+                flow_stale_due_cleanup(due_key, park_key, park_blob)
+            end
+
+          _read_failure ->
+            :skip
+        end
+      end
+
+      defp flow_promote_decoded_cold_record(
+             state,
+             due_key,
+             park_key,
+             park_blob,
+             locator,
+             state_key,
+             value,
+             record,
+             type,
+             state_filter,
+             partition_key,
+             priority,
+             now_ms
+           ) do
+        cond do
+          not flow_locator_matches_record?(locator, record) ->
+            flow_stale_due_cleanup(due_key, park_key, park_blob)
+
+          not flow_cold_due_entry_current?(due_key, locator, record) ->
+            flow_stale_due_cleanup(due_key, park_key, park_blob)
+
+          not flow_cold_due_record_matches_claim?(
+            record,
+            type,
+            state_filter,
+            partition_key,
+            priority,
+            now_ms
+          ) ->
+            :skip
+
+          flow_install_hot_cold_record(state, state_key, value, locator, record) == :ok ->
+            %{locator: locator, park_key: park_key, due_key: due_key}
+            |> Hibernation.cleanup_ops()
+            |> Enum.each(&queue_pending_lmdb_mirror_op/1)
+
+            :telemetry.execute(
+              [:ferricstore, :flow, :hibernation, :promote],
+              %{count: 1},
+              %{result: :promoted, shard_index: Map.get(state, :shard_index)}
+            )
+
+            :ok
+
+          true ->
+            :skip
+        end
+      end
+
+      defp flow_stale_due_cleanup(due_key, park_key, park_snapshot) do
+        case Hibernation.stale_due_cleanup_batch(due_key, park_key, park_snapshot) do
+          {:ok, cleanup_batch} -> {:stale_due, cleanup_batch}
+          {:error, _reason} -> :skip
+        end
+      end
+
+      defp flow_cold_due_entry_current?(due_key, %Locator{} = locator, record) do
+        due_key ==
+          Ferricstore.Flow.LMDB.cold_due_key(
+            type: Map.fetch!(record, :type),
+            state: Map.fetch!(record, :state),
+            partition_key: Map.get(record, :partition_key, ""),
+            priority: Map.get(record, :priority, 0),
+            due_at_ms: Map.fetch!(record, :next_run_at_ms),
+            flow_id: locator.flow_id,
+            version: Map.get(record, :version, locator.version)
+          )
+      rescue
+        _error -> false
+      end
 
       defp flow_cold_due_record_matches_claim?(
              record,

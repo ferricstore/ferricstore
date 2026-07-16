@@ -43,6 +43,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
   require Logger
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.AppendResult
 
   @batch_size_threshold 2000
   @flush_interval_ms 1
@@ -278,25 +279,15 @@ defmodule Ferricstore.Store.BitcaskWriter do
     handle_entry(entry, state)
   end
 
-  def handle_cast({:write, path, file_id, ets, key, value, expire_at_ms}, state) do
-    entry = {:write, nil, path, file_id, ets, key, value, expire_at_ms}
-    handle_entry(entry, state)
-  end
-
   def handle_cast({:tombstone, instance_ctx, path, key}, state) do
     entry = {:tombstone, instance_ctx, path, key}
-    handle_entry(entry, state)
-  end
-
-  def handle_cast({:tombstone, path, key}, state) do
-    entry = {:tombstone, nil, path, key}
     handle_entry(entry, state)
   end
 
   def handle_cast({:write_batch, entries}, state) do
     new_pending =
       Enum.reduce(entries, state.pending, fn {path, fid, ets, key, value, exp}, acc ->
-        [{:write, path, fid, ets, key, value, exp} | acc]
+        [{:write, nil, path, fid, ets, key, value, exp} | acc]
       end)
 
     new_count = state.pending_count + length(entries)
@@ -315,6 +306,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
       {:noreply, %{state | pending: new_pending, pending_count: new_count, flush_timer: timer}}
     end
   end
+
+  def handle_cast(_unsupported, state), do: {:noreply, state}
 
   # Drain the mailbox in one sweep so we amortize handle_cast overhead
   # across many messages. Under heavy load the mailbox had 270K+
@@ -353,15 +346,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
         entry = {:write, instance_ctx, path, fid, ets, key, value, exp}
         drain_mailbox([entry | pending], count + 1)
 
-      {:"$gen_cast", {:write, path, fid, ets, key, value, exp}} ->
-        entry = {:write, nil, path, fid, ets, key, value, exp}
-        drain_mailbox([entry | pending], count + 1)
-
       {:"$gen_cast", {:tombstone, instance_ctx, path, key}} ->
         drain_mailbox([{:tombstone, instance_ctx, path, key} | pending], count + 1)
-
-      {:"$gen_cast", {:tombstone, path, key}} ->
-        drain_mailbox([{:tombstone, nil, path, key} | pending], count + 1)
     after
       0 -> {pending, count}
     end
@@ -469,17 +455,9 @@ defmodule Ferricstore.Store.BitcaskWriter do
 
   defp entry_path({:write, _ctx, path, _fid, _ets, _key, _value, _exp}), do: path
   defp entry_path({:tombstone, _ctx, path, _key}), do: path
-  # Legacy format (6-tuple without tag) for backward compatibility with
-  # any in-flight casts that used the old format.
-  defp entry_path({:write, path, _fid, _ets, _key, _value, _exp}), do: path
-  defp entry_path({:tombstone, path, _key}), do: path
-  defp entry_path({path, _fid, _ets, _key, _value, _exp}), do: path
 
   defp pending_entry_key({:write, _ctx, _path, _fid, _ets, key, _value, _exp}), do: key
-  defp pending_entry_key({:write, _path, _fid, _ets, key, _value, _exp}), do: key
   defp pending_entry_key({:tombstone, _ctx, _path, key}), do: key
-  defp pending_entry_key({:tombstone, _path, key}), do: key
-  defp pending_entry_key({_path, _fid, _ets, key, _value, _exp}), do: key
 
   # Processes a group of entries for a single file path. Consecutive writes
   # are batched into a single v2_append_batch_nosync call for efficiency.
@@ -525,47 +503,52 @@ defmodule Ferricstore.Store.BitcaskWriter do
   end
 
   defp entry_type({:write, _, _, _, _, _, _, _}), do: :write
-  defp entry_type({:write, _, _, _, _, _, _}), do: :write
   defp entry_type({:tombstone, _, _, _}), do: :tombstone
-  defp entry_type({:tombstone, _, _}), do: :tombstone
-  defp entry_type({_, _, _, _, _, _}), do: :write
 
   defp flush_write_batch(path, write_entries, shard_index) do
     batch =
       Enum.map(write_entries, fn
         {:write, _ctx, _path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
-        {:write, _path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
-        {_path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
       end)
 
     case NIF.v2_append_batch_nosync(path, batch) do
       {:ok, locations} ->
-        mark_checkpoint_dirty(write_entries, shard_index)
+        if AppendResult.validate_locations(locations, length(write_entries)) == :ok do
+          mark_checkpoint_dirty(write_entries, shard_index)
 
-        # Update ETS entries with real file_id and offset.
-        Enum.zip(write_entries, locations)
-        |> Enum.each(fn {entry, {offset, _record_size}} ->
-          {_tag, _ctx, _path, file_id, ets, key, value, exp} = normalize_write_entry(entry)
-          bin_value = to_binary(value)
-          vsize = byte_size(bin_value)
+          # Update ETS entries with real file_id and offset.
+          Enum.zip(write_entries, locations)
+          |> Enum.each(fn {entry, {offset, _record_size}} ->
+            {_tag, _ctx, _path, file_id, ets, key, value, exp} = normalize_write_entry(entry)
+            bin_value = to_binary(value)
+            vsize = byte_size(bin_value)
 
-          # Only update if the key still has the same pending value/expiry
-          # this writer persisted. Newer pending writes for the same key must
-          # not inherit this older disk location.
-          try do
-            :ets.select_replace(ets, [
-              {
-                {key, bin_value, exp, :"$1", :pending, :_, :_},
-                [],
-                [{{key, bin_value, exp, :"$1", file_id, offset, vsize}}]
-              }
-            ])
-          rescue
-            ArgumentError -> :ok
-          end
-        end)
+            # Only update if the key still has the same pending value/expiry
+            # this writer persisted. Newer pending writes for the same key must
+            # not inherit this older disk location.
+            try do
+              :ets.select_replace(ets, [
+                {
+                  {key, bin_value, exp, :"$1", :pending, :_, :_},
+                  [],
+                  [{{key, bin_value, exp, :"$1", file_id, offset, vsize}}]
+                }
+              ])
+            rescue
+              ArgumentError -> :ok
+            end
+          end)
 
-        []
+          []
+        else
+          mark_disk_pressure(write_entries, shard_index)
+
+          Logger.error(
+            "BitcaskWriter shard_#{shard_index}: write batch result mismatch for #{path}: #{inspect(locations)}"
+          )
+
+          write_entries
+        end
 
       {:error, reason} ->
         mark_disk_pressure(write_entries, shard_index)
@@ -577,6 +560,10 @@ defmodule Ferricstore.Store.BitcaskWriter do
         write_entries
     end
   end
+
+  @doc false
+  def __valid_write_locations_for_test__(locations, expected_count),
+    do: AppendResult.validate_locations(locations, expected_count) == :ok
 
   defp flush_tombstone_batch(path, tombstone_entries, shard_index) do
     normalized = Enum.map(tombstone_entries, &normalize_tombstone_entry/1)
@@ -635,14 +622,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
   defp normalize_write_entry({:write, ctx, path, fid, ets, key, value, exp}),
     do: {:write, ctx, path, fid, ets, key, value, exp}
 
-  defp normalize_write_entry({:write, path, fid, ets, key, value, exp}),
-    do: {:write, nil, path, fid, ets, key, value, exp}
-
-  defp normalize_write_entry({path, fid, ets, key, value, exp}),
-    do: {:write, nil, path, fid, ets, key, value, exp}
-
   defp normalize_tombstone_entry({:tombstone, ctx, _path, key}), do: {ctx, key}
-  defp normalize_tombstone_entry({:tombstone, _path, key}), do: {nil, key}
 
   defp mark_disk_pressure(entries, shard_index) do
     entries

@@ -24,6 +24,37 @@ defmodule Ferricstore.HealthReadinessTest do
   end
 
   describe "Health.check/0" do
+    test "does not query Raft while the node readiness flag is false" do
+      :erlang.trace(self(), true, [:call])
+      :erlang.trace_pattern({Ferricstore.Raft.Cluster, :members, 2}, true, [])
+      Health.set_ready(false)
+
+      try do
+        assert Health.check().status == :starting
+
+        refute_receive {:trace, _pid, :call,
+                        {Ferricstore.Raft.Cluster, :members, [_shard, _timeout]}},
+                       100
+      after
+        :erlang.trace_pattern({Ferricstore.Raft.Cluster, :members, 2}, false, [])
+        :erlang.trace(self(), false, [:call])
+        Health.set_ready(true)
+      end
+    end
+
+    test "checks independent shard leaders concurrently" do
+      checker = fn _shard ->
+        Process.sleep(50)
+        true
+      end
+
+      {elapsed_us, result} =
+        :timer.tc(fn -> Health.__check_raft_leaders_for_test__(8, checker) end)
+
+      assert result
+      assert elapsed_us < 200_000
+    end
+
     test "uses backend-aware membership lookup for readiness" do
       source =
         Path.expand("../../lib/ferricstore/health.ex", __DIR__)

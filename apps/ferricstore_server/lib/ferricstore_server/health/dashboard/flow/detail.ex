@@ -3,6 +3,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
 
   alias FerricstoreServer.Health.Dashboard.Flow.Fifo
   alias FerricstoreServer.Health.Dashboard.Flow.PolicyRetention
+  alias FerricstoreServer.Health.QueryDecoder
+  alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
   import FerricstoreServer.Health.Dashboard.Flow.Sample
@@ -69,7 +71,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
 
   @spec opts_from_query(binary()) :: keyword()
   def opts_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     []
     |> maybe_put_query_opt(
@@ -97,7 +99,12 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   def collect_page(id, opts) when is_binary(id) and is_list(opts) do
     partition_key = flow_detail_partition_key(opts)
     history_page_opts = flow_detail_history_page_opts(opts)
-    {record_status, record} = flow_detail_record(id, partition_key)
+
+    {record_status, record} =
+      id
+      |> flow_detail_record(partition_key)
+      |> authorize_flow_detail_record(opts)
+
     {history_status, history, history_page} = flow_detail_history(id, record, history_page_opts)
 
     {values_status, value_refs, values_by_ref} =
@@ -158,6 +165,20 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Detail do
   end
 
   defp flow_detail_fifo_lane(_record), do: {:parallel, nil}
+
+  defp authorize_flow_detail_record({:ok, %{} = record} = result, opts) do
+    case DashboardAccess.keyspace_acl_username(opts) do
+      nil ->
+        result
+
+      username ->
+        if DashboardAccess.flow_record_allowed_for_acl?(record, username),
+          do: result,
+          else: {:not_found, nil}
+    end
+  end
+
+  defp authorize_flow_detail_record(result, _opts), do: result
 
   defp same_fifo_lane?(record, type, state, partition_key) when is_map(record) do
     flow_record_type(record) == type and

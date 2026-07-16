@@ -89,9 +89,14 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
         assert {:ok, {:flow_create, ^key, stamped}} =
                  Ferricstore.Flow.PolicyCommand.stamp(ctx, {:flow_create, key, attrs})
 
-        assert stamped.policy_generation == 2
-        assert stamped.policy_snapshot.version == "customer-v2"
-        assert stamped.policy_snapshot.max_active_ms == 2_000
+        assert %{type: ^type, generation: 2, digest: digest} = stamped.policy_ref
+
+        assert {:ok, encoded_policy} =
+                 Ferricstore.Store.Router.read_shard_value(ctx, 0, policy_key)
+
+        assert digest == :crypto.hash(:sha256, encoded_policy)
+        refute Map.has_key?(stamped, :policy_generation)
+        refute Map.has_key?(stamped, :policy_snapshot)
 
         assert {:ok, _flow} =
                  flow_create_and_get(attrs.id,
@@ -112,8 +117,10 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
         assert {:ok, {:flow_transition, ^key, stamped_transition}} =
                  Ferricstore.Flow.PolicyCommand.stamp(ctx, transition)
 
-        assert stamped_transition.policy_generation == 2
-        assert stamped_transition.policy_snapshot.type == type
+        assert %{type: ^type, generation: 2, digest: <<_::256>>} =
+                 stamped_transition.policy_ref
+
+        assert stamped_transition.policy_guard.type == type
       end
 
       test "flow policy rejects hot history cap because it is internal" do
@@ -852,6 +859,34 @@ defmodule Ferricstore.FlowTest.Sections.FlowPolicyExposesTypeStateRetryRetention
                    lease_ms: 500,
                    now_ms: 1_030
                  )
+      end
+
+      @tag :lease_return_ok
+      test "flow_extend_lease can return OK without materializing the updated record" do
+        type = uid("lease-extend-ok")
+        id = uid("flow-lease-extend-ok")
+
+        assert {:ok, _} = flow_create_and_get(id, type: type, run_at_ms: 1_000)
+
+        assert {:ok, [claimed]} =
+                 FerricStore.flow_claim_due(type,
+                   worker: "worker-a",
+                   lease_ms: 50,
+                   limit: 1,
+                   now_ms: 1_000
+                 )
+
+        assert :ok =
+                 FerricStore.flow_extend_lease(id, claimed.lease_token,
+                   fencing_token: claimed.fencing_token,
+                   lease_ms: 500,
+                   now_ms: 1_020,
+                   return: :ok_on_success
+                 )
+
+        assert {:ok, extended} = FerricStore.flow_get(id)
+        assert extended.version == claimed.version + 1
+        assert extended.lease_deadline_ms == 1_520
       end
 
       test "expired lease reclaim fences old worker and records takeover history" do

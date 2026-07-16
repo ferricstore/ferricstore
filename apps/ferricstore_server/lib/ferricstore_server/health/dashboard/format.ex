@@ -155,8 +155,9 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
     ~s(<span class="info-icon" tabindex="0" role="img" aria-label="#{attr}" data-tooltip="#{attr}" title="#{attr}">i</span>)
   end
 
-  def escape(str) do
+  def escape(str) when is_binary(str) do
     str
+    |> valid_html_text()
     |> String.replace("&", "&amp;")
     |> String.replace("<", "&lt;")
     |> String.replace(">", "&gt;")
@@ -164,6 +165,14 @@ defmodule FerricstoreServer.Health.Dashboard.Format do
   end
 
   def escape_attr(str), do: escape(str)
+
+  defp valid_html_text(str) do
+    if String.valid?(str) do
+      str
+    else
+      inspect(str, binaries: :as_binaries, limit: 256, printable_limit: 256)
+    end
+  end
 
   def safe_ets_size(table) do
     try do

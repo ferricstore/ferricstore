@@ -33,9 +33,11 @@ defmodule Ferricstore.Commands.Server do
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Stats
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
 
   @waraft_table :ferricstore_waraft_backend
+  @max_timer_ms 0xFFFFFFFF
 
   @doc """
   Handles a server command.
@@ -79,11 +81,9 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   def handle("DBSIZE", [], store) do
-    alias Ferricstore.Store.CompoundKey
-
-    Ops.keys(store)
-    |> CompoundKey.user_visible_keys()
-    |> length()
+    store
+    |> Ops.dbsize()
+    |> ReadResult.command_result()
   end
 
   def handle("DBSIZE", _args, _store) do
@@ -98,8 +98,12 @@ defmodule Ferricstore.Commands.Server do
     alias Ferricstore.Store.CompoundKey
 
     Ops.keys(store)
-    |> CompoundKey.user_visible_keys()
-    |> Enum.filter(&Ferricstore.GlobMatcher.match?(&1, pattern))
+    |> ReadResult.map_success(fn keys ->
+      keys
+      |> CompoundKey.user_visible_keys()
+      |> Enum.filter(&Ferricstore.GlobMatcher.match?(&1, pattern))
+    end)
+    |> ReadResult.command_result()
   end
 
   def handle("KEYS", [], _store) do
@@ -118,13 +122,20 @@ defmodule Ferricstore.Commands.Server do
     AuditLog.log(:dangerous_command, %{command: "FLUSHDB", args: args})
 
     with :ok <- Ops.flush(store) do
-      Ferricstore.Commands.Stream.clear_local_state()
+      Ferricstore.Commands.Stream.clear_local_state(store)
 
       # Wipe prob files (bloom, CMS, cuckoo, TopK) across all shards.
       # store.flush deletes keys via Raft which should clean up files via
       # maybe_delete_prob_file, but as a safety net we also wipe the prob
       # directories directly.
       flush_store_prob_dirs(store)
+    end
+  end
+
+  def handle("FLUSHDB", [mode], store) when is_binary(mode) do
+    case String.upcase(mode) do
+      normalized when normalized in ["ASYNC", "SYNC"] -> handle("FLUSHDB", [normalized], store)
+      _invalid -> {:error, "ERR syntax error"}
     end
   end
 
@@ -140,8 +151,15 @@ defmodule Ferricstore.Commands.Server do
     AuditLog.log(:dangerous_command, %{command: "FLUSHALL", args: args})
 
     with :ok <- Ops.flush(store) do
-      Ferricstore.Commands.Stream.clear_local_state()
+      Ferricstore.Commands.Stream.clear_local_state(store)
       flush_store_prob_dirs(store)
+    end
+  end
+
+  def handle("FLUSHALL", [mode], store) when is_binary(mode) do
+    case String.upcase(mode) do
+      normalized when normalized in ["ASYNC", "SYNC"] -> handle("FLUSHALL", [normalized], store)
+      _invalid -> {:error, "ERR syntax error"}
     end
   end
 
@@ -270,7 +288,7 @@ defmodule Ferricstore.Commands.Server do
             AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["SLEEP", seconds_str]})
 
             case Integer.parse(seconds_str) do
-              {secs, ""} when secs >= 0 ->
+              {secs, ""} when secs >= 0 and secs <= div(@max_timer_ms, 1_000) ->
                 Process.sleep(secs * 1000)
                 :ok
 
@@ -285,9 +303,12 @@ defmodule Ferricstore.Commands.Server do
       "RELOAD" when rest == [] ->
         :ok
 
-      "FLUSHALL" ->
+      "FLUSHALL" when rest in [[], ["ASYNC"]] ->
         AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["FLUSHALL"]})
-        handle("FLUSHALL", [], store)
+        handle("FLUSHALL", rest, store)
+
+      "FLUSHALL" ->
+        {:error, "ERR syntax error"}
 
       "BATCHER-STATS" when rest == [] ->
         ctx = FerricStore.Instance.get(:default)
@@ -408,15 +429,25 @@ defmodule Ferricstore.Commands.Server do
 
   @last_save_key {__MODULE__, :last_save_unix_seconds}
 
-  def handle("SAVE", [], store), do: save_now(store)
+  def handle("SAVE", [], store) do
+    case with_save_lock(store, fn -> save_now(store) end) do
+      :busy -> {:error, "ERR save already in progress"}
+      result -> result
+    end
+  end
 
   def handle("SAVE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'save' command"}
   end
 
   def handle("BGSAVE", [], store) do
-    _ = Task.start(fn -> save_now(store) end)
-    {:simple, "Background saving started"}
+    parent = self()
+    start_ref = make_ref()
+
+    case Task.start(fn -> background_save(parent, start_ref, store) end) do
+      {:ok, pid} -> await_background_save_start(pid, start_ref)
+      {:error, reason} -> {:error, "ERR background save failed to start: #{inspect(reason)}"}
+    end
   end
 
   def handle("BGSAVE", _args, _store) do
@@ -513,6 +544,63 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
   # SAVE helpers
   # ---------------------------------------------------------------------------
+
+  defp background_save(parent, start_ref, store) do
+    case with_save_lock(store, fn ->
+           send(parent, {:background_save_started, start_ref, self()})
+           save_now(store)
+         end) do
+      :busy -> send(parent, {:background_save_busy, start_ref, self()})
+      _result -> :ok
+    end
+  end
+
+  defp await_background_save_start(pid, start_ref) do
+    monitor_ref = Process.monitor(pid)
+
+    receive do
+      {:background_save_started, ^start_ref, ^pid} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:simple, "Background saving started"}
+
+      {:background_save_busy, ^start_ref, ^pid} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, "ERR background save already in progress"}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:error, "ERR background save failed to start: #{inspect(reason)}"}
+    after
+      5_000 ->
+        Process.exit(pid, :kill)
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, "ERR background save failed to start: timeout"}
+    end
+  end
+
+  defp with_save_lock(store, fun) do
+    lock_id = {save_lock_resource(store), self()}
+
+    if :global.set_lock(lock_id, [node()], 0) do
+      try do
+        fun.()
+      after
+        :global.del_lock(lock_id, [node()])
+      end
+    else
+      :busy
+    end
+  end
+
+  defp save_lock_resource(%FerricStore.Instance{name: name}),
+    do: {__MODULE__, :save, name}
+
+  defp save_lock_resource(%{__instance_ctx__: %FerricStore.Instance{name: name}}),
+    do: {__MODULE__, :save, name}
+
+  defp save_lock_resource(%{instance_ctx: %FerricStore.Instance{name: name}}),
+    do: {__MODULE__, :save, name}
+
+  defp save_lock_resource(_store), do: {__MODULE__, :save, :default}
 
   defp save_now(store) do
     case persistence_barrier(store) do

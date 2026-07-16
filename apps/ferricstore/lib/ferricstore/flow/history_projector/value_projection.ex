@@ -2,8 +2,11 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   @moduledoc false
 
   alias Ferricstore.Flow.HistoryProjector
+  alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.BlobRef
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
+
+  @projection_batch_size 256
 
   def compact_projected_flow_values(
         instance_ctx,
@@ -14,10 +17,40 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
         file_id,
         entries
       ) do
-    refs = projected_flow_value_refs(entries)
+    entries
+    |> projected_flow_value_refs()
+    |> projected_flow_value_ref_batches()
+    |> Enum.reduce_while(:ok, fn refs, :ok ->
+      with {:ok, keydir_items} <- projected_flow_value_keydir_items_result(keydir, refs),
+           :ok <-
+             compact_projected_flow_value_items(
+               instance_ctx,
+               shard_index,
+               shard_data_path,
+               keydir,
+               file_path,
+               file_id,
+               keydir_items
+             ) do
+        {:cont, :ok}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
 
-    keydir_items = projected_flow_value_keydir_items(keydir, refs)
+  def projected_flow_value_ref_batches(refs),
+    do: Enum.chunk_every(refs, @projection_batch_size)
 
+  defp compact_projected_flow_value_items(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         keydir,
+         file_path,
+         file_id,
+         keydir_items
+       ) do
     {direct_segment_items, lmdb_checked_items} =
       Enum.split_with(keydir_items, fn {_ref, file_id} ->
         direct_segment_value_file_id?(file_id)
@@ -35,52 +68,55 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
 
     delete_projected_flow_value_keydir_refs(instance_ctx, shard_index, keydir, projected_refs)
 
-    case collect_projected_flow_values(
-           instance_ctx,
-           shard_index,
-           shard_data_path,
-           keydir,
-           direct_segment_refs ++ pending_refs
-         ) do
-      [] ->
-        :ok
-
-      value_entries ->
-        {direct_entries, remaining_entries} =
-          Enum.split_with(value_entries, &direct_segment_value_entry?/1)
-
-        {direct_value_entries, copied_entries} =
-          Enum.split_with(remaining_entries, &direct_lmdb_value_entry?/1)
-
-        with :ok <- publish_lmdb_direct_value_locations(shard_data_path, direct_entries),
-             :ok <-
-               delete_projected_flow_value_keydir_rows(
-                 instance_ctx,
-                 shard_index,
-                 keydir,
-                 direct_entries,
-                 delete_apply_projection_cache?: false
-               ),
-             :ok <- publish_lmdb_direct_values(shard_data_path, direct_value_entries),
-             :ok <-
-               delete_projected_flow_value_keydir_rows(
-                 instance_ctx,
-                 shard_index,
-                 keydir,
-                 direct_value_entries
-               ),
-             :ok <-
-               copy_projected_flow_values(
-                 instance_ctx,
-                 shard_index,
-                 shard_data_path,
-                 keydir,
-                 file_path,
-                 file_id,
-                 copied_entries
-               ) do
+    with {:ok, value_entries} <-
+           collect_projected_flow_values(
+             instance_ctx,
+             shard_index,
+             shard_data_path,
+             keydir,
+             direct_segment_refs ++ pending_refs
+           ) do
+      case value_entries do
+        [] ->
           :ok
-        end
+
+        value_entries ->
+          {direct_entries, remaining_entries} =
+            Enum.split_with(value_entries, &direct_segment_value_entry?/1)
+
+          {direct_value_entries, copied_entries} =
+            Enum.split_with(remaining_entries, &direct_lmdb_value_entry?/1)
+
+          with :ok <- publish_lmdb_direct_value_locations(shard_data_path, direct_entries),
+               :ok <-
+                 delete_projected_flow_value_keydir_rows(
+                   instance_ctx,
+                   shard_index,
+                   keydir,
+                   direct_entries,
+                   delete_apply_projection_cache?: false
+                 ),
+               :ok <- publish_lmdb_direct_values(shard_data_path, direct_value_entries),
+               :ok <-
+                 delete_projected_flow_value_keydir_rows(
+                   instance_ctx,
+                   shard_index,
+                   keydir,
+                   direct_value_entries
+                 ),
+               :ok <-
+                 copy_projected_flow_values(
+                   instance_ctx,
+                   shard_index,
+                   shard_data_path,
+                   keydir,
+                   file_path,
+                   file_id,
+                   copied_entries
+                 ) do
+            :ok
+          end
+      end
     end
   end
 
@@ -109,6 +145,27 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
       end
     end)
     |> Enum.reverse()
+  end
+
+  def projected_flow_value_keydir_items_result(keydir, refs) do
+    refs
+    |> Enum.reduce_while({:ok, []}, fn ref, {:ok, acc} ->
+      case HistoryProjector.safe_ets_lookup(keydir, ref) do
+        [{^ref, _value, _expire_at_ms, _lfu, file_id, offset, value_size} = row] ->
+          if readable_value_locator?(file_id, offset, value_size) do
+            {:cont, {:ok, [{ref, file_id} | acc]}}
+          else
+            {:halt, {:error, {:invalid_projected_flow_value_locator, ref, row}}}
+          end
+
+        _missing ->
+          {:cont, {:ok, acc}}
+      end
+    end)
+    |> case do
+      {:ok, items} -> {:ok, Enum.reverse(items)}
+      {:error, _reason} = error -> error
+    end
   end
 
   def direct_segment_value_file_id?({:waraft_segment, index})
@@ -170,10 +227,16 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
 
   def collect_projected_flow_values(instance_ctx, shard_index, shard_data_path, keydir, refs) do
     refs
-    |> Enum.map(
-      &projected_flow_value_source(instance_ctx, shard_index, shard_data_path, keydir, &1)
-    )
-    |> materialize_projected_flow_value_sources(instance_ctx, shard_index)
+    |> Enum.reduce_while({:ok, []}, fn ref, {:ok, acc} ->
+      case projected_flow_value_source(instance_ctx, shard_index, shard_data_path, keydir, ref) do
+        {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, value_entries} -> {:ok, Enum.reverse(value_entries)}
+      {:error, _reason} = error -> error
+    end
   end
 
   def projected_flow_value_source(instance_ctx, shard_index, shard_data_path, keydir, key) do
@@ -182,7 +245,7 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
         if readable_value_locator?(file_id, offset, value_size) do
           case {value, file_id, value_size} do
             {nil, {tag, _index}, 0} when tag in [:waraft_segment, :waraft_apply_projection] ->
-              {:entry,
+              {:ok,
                projected_flow_value_entry_from_row(
                  key,
                  <<>>,
@@ -195,7 +258,7 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
                )}
 
             {nil, {:waraft_segment, _index}, _value_size} ->
-              {:entry,
+              {:ok,
                direct_projected_flow_value_entry_from_row(
                  key,
                  expire_at_ms,
@@ -217,7 +280,7 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
                      offset
                    ) do
                 {:ok, bytes} ->
-                  {:entry,
+                  {:ok,
                    projected_flow_value_entry_from_row(
                      key,
                      bytes,
@@ -229,29 +292,20 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
                      row
                    )}
 
-                _error ->
-                  :skip
+                {:error, reason} ->
+                  {:error, {:projected_flow_value_read_failed, key, reason}}
+
+                invalid ->
+                  {:error, {:projected_flow_value_read_failed, key, invalid}}
               end
           end
         else
-          :skip
+          {:error, {:invalid_projected_flow_value_locator, key, row}}
         end
 
-      _other ->
-        :skip
+      _missing ->
+        {:error, {:projected_flow_value_source_missing, key}}
     end
-  end
-
-  def materialize_projected_flow_value_sources(sources, _instance_ctx, _shard_index) do
-    sources
-    |> Enum.reduce([], fn
-      {:entry, entry}, acc ->
-        [entry | acc]
-
-      _skip, acc ->
-        acc
-    end)
-    |> Enum.reverse()
   end
 
   def projected_flow_value_entry_from_row(
@@ -650,18 +704,7 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
 
   def named_flow_value_refs(_refs), do: []
 
-  def generated_flow_value_ref?("f:" <> _rest = ref) do
-    case :binary.split(ref, ":v:") do
-      ["f:" <> tag, <<kind, ?:, rest::binary>>]
-      when byte_size(tag) > 0 and kind in [?p, ?r, ?e, ?s] and byte_size(rest) > 0 ->
-        true
-
-      _other ->
-        false
-    end
-  end
-
-  def generated_flow_value_ref?(_ref), do: false
+  def generated_flow_value_ref?(ref), do: Keys.value_key?(ref)
 
   def readable_value_locator?(file_id, offset, value_size)
       when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and

@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
   @moduledoc false
 
   alias Ferricstore.Raft.ApplyContext
+  alias Ferricstore.TermCodec
 
   @max_retries 1_000
   @max_delay_ms 2_592_000_000
@@ -14,8 +15,6 @@ defmodule Ferricstore.Flow.RetryPolicy do
   @max_policy_snapshot_batch_bytes 4 * 1024 * 1024
   @max_policy_envelope_overhead_bytes 1_024
   @max_encoded_policy_bytes @max_policy_snapshot_bytes + @max_policy_envelope_overhead_bytes
-  @external_term_version 131
-  @compressed_term_tag 80
 
   @default %{
     max_retries: 3,
@@ -277,7 +276,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
   def encode_flow_policy(policy, generation)
       when is_map(policy) and is_integer(generation) and generation >= 0 and
              generation <= @max_policy_generation do
-    :erlang.term_to_binary({:flow_policy_v1, generation, policy})
+    TermCodec.encode({:flow_policy_v1, generation, policy})
   end
 
   @spec max_policy_generation() :: pos_integer()
@@ -331,11 +330,10 @@ defmodule Ferricstore.Flow.RetryPolicy do
 
   @spec decode_flow_policy_entry(binary()) ::
           {:ok, {non_neg_integer(), map()}} | :error
-  def decode_flow_policy_entry(<<@external_term_version, encoding_tag, _rest::binary>> = value)
-      when encoding_tag != @compressed_term_tag and
-             byte_size(value) <= @max_encoded_policy_bytes do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {:flow_policy_v1, generation, policy}
+  def decode_flow_policy_entry(value)
+      when is_binary(value) and byte_size(value) <= @max_encoded_policy_bytes do
+    case TermCodec.decode(value) do
+      {:ok, {:flow_policy_v1, generation, policy}}
       when is_integer(generation) and generation >= 0 and
              generation <= @max_policy_generation and is_map(policy) ->
         if old_max_attempts_policy?(policy), do: :error, else: {:ok, {generation, policy}}
@@ -566,7 +564,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
   defp normalize_state_policies(states) when is_map(states) do
     Enum.reduce_while(states, {:ok, %{}}, fn {state, policy}, {:ok, acc} ->
       with {:ok, state} <- normalize_state_name(state),
-           policy = policy_map(policy),
+           {:ok, policy} <- policy_map(policy),
            :ok <- reject_state_level_max_active_ms(policy),
            {:ok, mode} <- optional_state_mode(policy),
            {:ok, retry} <- optional_retry_override(policy),
@@ -651,13 +649,17 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
-  defp policy_map(policy) when is_map(policy), do: policy
+  defp policy_map(policy) when is_map(policy), do: {:ok, policy}
 
   defp policy_map(policy) when is_list(policy) do
-    if Keyword.keyword?(policy), do: Map.new(policy), else: %{}
+    if Keyword.keyword?(policy) do
+      {:ok, Map.new(policy)}
+    else
+      {:error, "ERR flow state policy must be a map or keyword list"}
+    end
   end
 
-  defp policy_map(_policy), do: %{}
+  defp policy_map(_policy), do: {:error, "ERR flow state policy must be a map or keyword list"}
 
   defp merge_retry(policy, nil), do: policy
   defp merge_retry(policy, override) when override == %{}, do: policy
@@ -862,16 +864,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
   end
 
   defp drop_nil_policy_fields(policy) do
-    policy
-    |> drop_nil_field(:retry)
-    |> drop_nil_field(:retention)
-    |> drop_nil_field(:indexed_attributes)
-    |> drop_nil_field(:indexed_state_meta)
-    |> drop_nil_field(:governance)
-  end
-
-  defp drop_nil_field(policy, key) do
-    if Map.get(policy, key) == nil, do: Map.delete(policy, key), else: policy
+    Map.reject(policy, fn {_key, value} -> is_nil(value) end)
   end
 
   defp maybe_put(map, _key, nil), do: map

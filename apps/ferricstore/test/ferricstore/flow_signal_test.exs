@@ -106,6 +106,77 @@ defmodule Ferricstore.FlowSignalTest do
     assert claimed.values == %{"payment_event" => "payment-v1"}
   end
 
+  test "signal rejects entry into a fifo state without an explicit partition" do
+    type = uid("signal-fifo-partition-type")
+    id = uid("signal-fifo-partition")
+
+    assert {:ok, _policy} =
+             FerricStore.flow_policy_set(type, states: %{"queued" => [mode: :fifo]})
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "waiting",
+               run_at_ms: 10_000,
+               now_ms: 1_000
+             )
+
+    assert {:error, "ERR flow partition_key is required for fifo state"} =
+             FerricStore.flow_signal(id,
+               signal: "ready",
+               if_state: "waiting",
+               transition_to: "queued",
+               run_at_ms: 2_000,
+               now_ms: 1_100
+             )
+
+    assert {:ok, record} = FerricStore.flow_get(id)
+    assert record.state == "waiting"
+  end
+
+  test "fifo claims follow signal state-entry order instead of creation order" do
+    type = uid("signal-fifo-order-type")
+    partition_key = uid("signal-fifo-order-partition")
+    created_first = uid("signal-fifo-created-first")
+    entered_first = uid("signal-fifo-entered-first")
+
+    assert {:ok, _policy} =
+             FerricStore.flow_policy_set(type, states: %{"queued" => [mode: :fifo]})
+
+    for {id, now_ms} <- [{created_first, 1_000}, {entered_first, 1_001}] do
+      assert :ok =
+               FerricStore.flow_create(id,
+                 type: type,
+                 state: "waiting",
+                 partition_key: partition_key,
+                 run_at_ms: 10_000,
+                 now_ms: now_ms
+               )
+    end
+
+    for {id, now_ms} <- [{entered_first, 2_000}, {created_first, 2_001}] do
+      assert :ok =
+               FerricStore.flow_signal(id,
+                 partition_key: partition_key,
+                 signal: "ready",
+                 if_state: "waiting",
+                 transition_to: "queued",
+                 run_at_ms: 3_000,
+                 now_ms: now_ms
+               )
+    end
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               state: "queued",
+               partition_key: partition_key,
+               worker: "signal-fifo-worker",
+               now_ms: 3_000
+             )
+
+    assert claimed.id == entered_first
+  end
+
   test "signal transition requires an if_state guard" do
     id = uid("signal-transition-guard-required")
 

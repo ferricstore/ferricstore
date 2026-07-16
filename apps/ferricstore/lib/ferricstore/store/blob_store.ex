@@ -2,10 +2,9 @@ defmodule Ferricstore.Store.BlobStore do
   @moduledoc """
   Side-channel blob storage for large values.
 
-  New writes append payload records into a shard-local segment log under
+  Payload records append into a shard-local segment log under
   `data_dir/blob/shard_N/segments/`, while Bitcask stores the fixed-size
-  `BlobRef`. Older content-addressed v1 refs remain readable so existing data
-  can be served during the transition.
+  `BlobRef`.
   """
 
   alias Ferricstore.Bitcask.NIF
@@ -21,6 +20,7 @@ defmodule Ferricstore.Store.BlobStore do
   @segment_header_magic <<0, ?F, ?S, ?B, ?L, ?O, ?G, 1>>
   @segment_header_bytes 48
   @segment_next_id_filename "next_segment_id"
+  @max_segment_next_id_bytes 32
   @recovery_table :ferricstore_blob_store_recovery
   @segment_table :ferricstore_blob_store_segments
   @lock_table :ferricstore_blob_store_locks
@@ -37,7 +37,7 @@ defmodule Ferricstore.Store.BlobStore do
           | [protection_token()]
 
   @doc false
-  @spec init_tables() :: :ok
+  @spec init_tables() :: :ok | {:error, :table_owner_unavailable}
   def init_tables do
     TableOwner.ensure_tables()
   end

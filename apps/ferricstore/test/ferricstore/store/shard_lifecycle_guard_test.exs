@@ -28,6 +28,13 @@ defmodule Ferricstore.Store.ShardLifecycleGuardTest do
     assert {:NIF, :v2_scan_file_page, 3} in calls
   end
 
+  test "hint recovery scans tombstones in bounded pages" do
+    calls = nif_calls(@lifecycle_path)
+
+    refute {:NIF, :v2_scan_tombstones, 1} in calls
+    assert {:NIF, :v2_scan_tombstones_page, 3} in calls
+  end
+
   defp tab2list_calls(path) do
     {:ok, ast} =
       path

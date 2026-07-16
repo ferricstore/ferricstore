@@ -90,7 +90,7 @@ truncate_segment_path_to(Path, Size) ->
         ok ->
             case validate_existing_segment_file(Path) of
                 ok ->
-                    case file:open(Path, [read, write, raw, binary]) of
+                    case open_verified_segment_file(Path, [read, write, raw, binary]) of
                         {ok, Fd} ->
                             Result = rollback_append_fd(Path, Fd, Size),
                             CloseResult = file:close(Fd),
@@ -186,7 +186,7 @@ fold_binary_impl(_Log, _Start, _End, Size, SizeLimit, _Func, Acc) when Size >= S
 fold_binary_impl(Log, Start, End, Size, SizeLimit, Func, Acc) ->
     case get(Log, Start) of
         {ok, Entry} ->
-            Binary = term_to_binary(Entry),
+            Binary = encode_external_term(Entry),
             EntrySize = byte_size(Binary),
             fold_binary_impl(Log, Start + 1, End, Size + EntrySize, SizeLimit, Func, Func(Start, Binary, Acc));
         not_found ->
@@ -223,10 +223,9 @@ append_decode(Index, [Entry | Entries], Acc) ->
     end.
 
 decode_append_entry(Entry) when is_binary(Entry) ->
-    try binary_to_term(Entry, [safe]) of
-        Decoded -> {ok, Decoded}
-    catch
-        _:Reason -> {error, {bad_entry_term, Reason}}
+    case decode_external_term_exact(Entry) of
+        {ok, Decoded} -> {ok, Decoded};
+        {error, Reason} -> {error, {bad_entry_term, Reason}}
     end;
 decode_append_entry(Entry) ->
     {ok, Entry}.
@@ -315,13 +314,12 @@ read_logical_trim_floor(Dir) ->
     end.
 
 decode_trim_floor(Binary) ->
-    try binary_to_term(Binary, [safe]) of
-        #{version := 1, index := Index} when is_integer(Index), Index >= 0 ->
+    case decode_external_term_exact(Binary) of
+        {ok, #{version := 1, index := Index}} when is_integer(Index), Index >= 0 ->
             {ok, Index};
-        Other ->
-            {error, {bad_trim_floor, Other}}
-    catch
-        _:Reason ->
+        {ok, Other} ->
+            {error, {bad_trim_floor, Other}};
+        {error, Reason} ->
             {error, {bad_trim_floor, Reason}}
     end.
 
@@ -343,7 +341,7 @@ set_logical_trim_floor(Dir, Index) when is_integer(Index), Index >= 0 ->
     Metadata = #{version => 1, index => Index},
     case filelib:ensure_dir(Path) of
         ok ->
-            case write_file_sync(TmpPath, term_to_binary(Metadata)) of
+            case write_file_sync(TmpPath, encode_external_term(Metadata)) of
                 ok ->
                     case rename_path(TmpPath, Path) of
                         ok ->
@@ -579,37 +577,46 @@ open_record_group_file_fd_after_inactive_close(Registry, Key, WriterDir, Path) -
         ok ->
             case file:open(Path, [append, raw, binary]) of
                 {ok, Fd} ->
-                    case file:position(Fd, eof) of
-                        {ok, OldSize} ->
-                            case maybe_preallocate_new_segment(Path, OldSize =:= 0) of
-                                ok ->
-                                    BinaryPath = unicode:characters_to_binary(Path),
-                                    case maybe_run_file_open_hook(BinaryPath) of
-                                        ok ->
-                                            case put_writer_entry(Registry, {Key, WriterDir, file_fd_writing, Fd, OldSize}) of
-                                                ok ->
-                                                    {ok, Fd, OldSize, OldSize =:= 0};
-                                                {error, _Reason} = Error ->
-                                                    _ = file:close(Fd),
-                                                    Error
-                                            end;
-                                        {error, _Reason} = Error ->
-                                            _ = file:close(Fd),
-                                            Error
-                                    end;
-                                {error, _Reason} = Error ->
-                                    _ = file:close(Fd),
-                                    Error
-                            end;
-                        {error, Reason} ->
+                    case validate_open_segment_file(Path, Fd) of
+                        ok ->
+                            finish_open_record_group_file_fd(Registry, Key, WriterDir, Path, Fd);
+                        {error, _Reason} = Error ->
                             _ = file:close(Fd),
-                            {error, {position, Reason}}
+                            Error
                     end;
                 {error, Reason} ->
                     {error, {open, Reason}}
             end;
         {error, _Reason} = Error ->
             Error
+    end.
+
+finish_open_record_group_file_fd(Registry, Key, WriterDir, Path, Fd) ->
+    case file:position(Fd, eof) of
+        {ok, OldSize} ->
+            case maybe_preallocate_new_segment(Path, OldSize =:= 0) of
+                ok ->
+                    BinaryPath = unicode:characters_to_binary(Path),
+                    case maybe_run_file_open_hook(BinaryPath) of
+                        ok ->
+                            case put_writer_entry(Registry, {Key, WriterDir, file_fd_writing, Fd, OldSize}) of
+                                ok ->
+                                    {ok, Fd, OldSize, OldSize =:= 0};
+                                {error, _Reason} = Error ->
+                                    _ = file:close(Fd),
+                                    Error
+                            end;
+                        {error, _Reason} = Error ->
+                            _ = file:close(Fd),
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    _ = file:close(Fd),
+                    Error
+            end;
+        {error, Reason} ->
+            _ = file:close(Fd),
+            {error, {position, Reason}}
     end.
 
 close_inactive_writers_for_dir(Registry, WriterDir, ActiveKey) ->
@@ -709,6 +716,43 @@ validate_segment_file_for_append(Path) ->
             {error, {read_segment_info, Reason}}
     end.
 
+validate_open_segment_file(Path, Fd) ->
+    case {file:read_file_info(Fd), file:read_link_info(Path)} of
+        {{ok, #file_info{
+            type = regular,
+            major_device = MajorDevice,
+            minor_device = MinorDevice,
+            inode = Inode
+        }},
+         {ok, #file_info{
+            type = regular,
+            major_device = MajorDevice,
+            minor_device = MinorDevice,
+            inode = Inode
+        }}} ->
+            ok;
+        {{ok, #file_info{type = OpenType}}, {ok, #file_info{type = PathType}}} ->
+            {error, {opened_segment_identity_mismatch, Path, OpenType, PathType}};
+        {{error, Reason}, _PathResult} ->
+            {error, {read_open_segment_info, Path, Reason}};
+        {_OpenResult, {error, Reason}} ->
+            {error, {read_segment_info_after_open, Path, Reason}}
+    end.
+
+open_verified_segment_file(Path, Modes) ->
+    case file:open(Path, Modes) of
+        {ok, Fd} ->
+            case validate_open_segment_file(Path, Fd) of
+                ok ->
+                    {ok, Fd};
+                {error, _Reason} = Error ->
+                    _ = file:close(Fd),
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
 write_record_group_file_direct(Dir, Path, Fd, OldSize, Writes, NewSegment) ->
     StartedAt = erlang:monotonic_time(),
     Count = length(Writes),
@@ -789,7 +833,7 @@ rollback_append_path(Path, OldSize, OriginalReason) ->
         ok ->
             case validate_existing_segment_file(Path) of
                 ok ->
-                    case file:open(Path, [read, write, raw, binary]) of
+                    case open_verified_segment_file(Path, [read, write, raw, binary]) of
                         {ok, Fd} ->
                             Result = rollback_append_fd(Path, Fd, OldSize),
                             CloseResult = file:close(Fd),
@@ -867,15 +911,13 @@ check_append_failure_marker(Dir) ->
     end.
 
 read_append_failure_marker(Path) ->
-    case file:read_file(Path) of
-        {ok, Binary} when byte_size(Binary) =< ?MAX_SEGMENT_METADATA_BYTES ->
-            try binary_to_term(Binary, [safe]) of
-                Metadata -> {error, {segment_log_poisoned, Metadata}}
-            catch
-                _:Reason -> {error, {segment_log_poisoned, #{path => Path, decode_error => Reason}}}
-            end;
+    case read_segment_file_nofollow(Path, ?MAX_SEGMENT_METADATA_BYTES) of
         {ok, Binary} ->
-            {error, {segment_log_poisoned, #{path => Path, marker_bytes => byte_size(Binary)}}};
+            case decode_external_term_exact(Binary) of
+                {ok, Metadata} -> {error, {segment_log_poisoned, Metadata}};
+                {error, Reason} ->
+                    {error, {segment_log_poisoned, #{path => Path, decode_error => Reason}}}
+            end;
         {error, Reason} ->
             {error, {read_append_failure_marker, Path, Reason}}
     end.

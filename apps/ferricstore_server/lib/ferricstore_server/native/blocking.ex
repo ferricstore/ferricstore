@@ -7,7 +7,7 @@ defmodule FerricstoreServer.Native.Blocking do
   alias Ferricstore.Commands.List, as: ListCmd
   alias Ferricstore.Commands.Stream, as: StreamCmd
   alias Ferricstore.Waiters
-  alias FerricstoreServer.Native.Session
+  alias FerricstoreServer.Native.{ResourceBudget, Session}
 
   @blocking_commands MapSet.new(~w(BLPOP BRPOP BLMOVE BLMPOP XREAD XREADGROUP))
 
@@ -16,7 +16,7 @@ defmodule FerricstoreServer.Native.Blocking do
   def blocking_command?(_cmd), do: false
 
   @spec start_request(map(), map(), map()) ::
-          {:ok, pid()} | {:error, atom(), binary()}
+          {:ok, pid(), reference()} | {:error, atom(), binary()}
   def start_request(payload, state, meta) do
     with {:ok, prepared} <- Session.prepare_command(payload) do
       start_prepared(prepared, state, meta)
@@ -26,7 +26,7 @@ defmodule FerricstoreServer.Native.Blocking do
   end
 
   @spec start_prepared(PreparedCommand.t(), map(), map()) ::
-          {:ok, pid()} | {:error, atom(), binary()}
+          {:ok, pid(), reference()} | {:error, atom(), binary()}
   def start_prepared(%PreparedCommand{} = prepared, state, meta) do
     with true <-
            blocking_command?(prepared.command) ||
@@ -34,20 +34,82 @@ defmodule FerricstoreServer.Native.Blocking do
          :ok <- Session.authorize_command(prepared, state) do
       parent = self()
       ctx = state.instance_ctx
+      budget = Map.get(state, :resource_budget, ResourceBudget)
+      start_ref = make_ref()
 
-      pid =
-        spawn(fn ->
-          {status, value} =
-            run_blocking(prepared.command, prepared.args, prepared.ast, ctx)
+      {pid, monitor_ref} =
+        spawn_monitor(fn ->
+          case ResourceBudget.acquire(budget, :blocking_requests, self(), 1) do
+            {:ok, budget_token} ->
+              send(parent, {:native_blocking_started, start_ref, self()})
 
-          send(parent, {:native_blocking_response, meta, self(), status, value})
+              try do
+                run_with_owner_guard(parent, fn ->
+                  {status, value} =
+                    run_blocking(prepared.command, prepared.args, prepared.ast, ctx)
+
+                  send(parent, {:native_blocking_response, meta, self(), status, value})
+                end)
+              after
+                ResourceBudget.release(budget, budget_token)
+              end
+
+            {:error, reason} ->
+              send(parent, {:native_blocking_rejected, start_ref, self(), reason})
+          end
         end)
 
-      {:ok, pid}
+      await_worker_start(pid, monitor_ref, start_ref)
     else
       {:error, status, reason} -> {:error, status, reason}
       {:error, reason} -> {:error, :bad_request, reason}
       false -> {:error, :bad_request, "ERR native command is not blocking"}
+    end
+  end
+
+  defp await_worker_start(pid, monitor_ref, start_ref) do
+    receive do
+      {:native_blocking_started, ^start_ref, ^pid} ->
+        {:ok, pid, monitor_ref}
+
+      {:native_blocking_rejected, ^start_ref, ^pid, {:limit, :blocking_requests}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, :busy, "ERR native global blocking request limit exceeded"}
+
+      {:native_blocking_rejected, ^start_ref, ^pid, _reason} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, :busy, "ERR native resource budget unavailable"}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:error, :busy, "ERR native blocking worker failed to start: #{inspect(reason)}"}
+    after
+      5_000 ->
+        Process.exit(pid, :kill)
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, :busy, "ERR native blocking worker start timed out"}
+    end
+  end
+
+  defp run_with_owner_guard(owner, fun) do
+    worker = self()
+
+    guardian =
+      spawn_link(fn ->
+        monitor_ref = Process.monitor(owner)
+
+        receive do
+          {:stop_owner_guard, ^worker} ->
+            Process.demonitor(monitor_ref, [:flush])
+
+          {:DOWN, ^monitor_ref, :process, ^owner, _reason} ->
+            Process.exit(worker, :shutdown)
+        end
+      end)
+
+    try do
+      fun.()
+    after
+      send(guardian, {:stop_owner_guard, worker})
     end
   end
 
@@ -121,7 +183,7 @@ defmodule FerricstoreServer.Native.Blocking do
     case Dispatcher.dispatch_ast(ast, store) do
       {:block, timeout_ms, stream_ids, _count} ->
         try do
-          wait_for_stream(stream_ids, timeout_ms, fn ->
+          wait_for_stream(stream_ids, timeout_ms, store, fn ->
             case Dispatcher.dispatch_ast(ast, store) do
               {:block, _timeout_ms, _stream_ids, _count} -> nil
               [] -> nil
@@ -176,51 +238,61 @@ defmodule FerricstoreServer.Native.Blocking do
   end
 
   defp wait_list_loop(deadline, pop_fun) do
-    receive do
-      {:waiter_notify, _key} ->
-        case pop_fun.() do
-          nil -> wait_list_loop(deadline, pop_fun)
-          other -> native_result(other)
-        end
-    after
-      wait_ms(deadline) ->
-        case pop_fun.() do
-          nil -> {:ok, nil}
-          other -> native_result(other)
-        end
+    if deadline_expired?(deadline) do
+      final_wait_result(pop_fun)
+    else
+      receive do
+        {:waiter_notify, _key} ->
+          case pop_fun.() do
+            nil -> wait_list_loop(deadline, pop_fun)
+            other -> native_result(other)
+          end
+      after
+        wait_ms(deadline) -> final_wait_result(pop_fun)
+      end
     end
   end
 
-  defp wait_for_stream(stream_ids, timeout_ms, read_fun) do
+  defp wait_for_stream(stream_ids, timeout_ms, store, read_fun) do
     deadline = deadline(timeout_ms)
-    Enum.each(stream_ids, fn {key, id} -> StreamCmd.register_stream_waiter(key, self(), id) end)
+
+    Enum.each(stream_ids, fn {key, id} ->
+      StreamCmd.register_stream_waiter(key, self(), id, store)
+    end)
 
     case read_fun.() do
-      nil -> wait_stream_loop(deadline, stream_ids, read_fun)
+      nil -> wait_stream_loop(deadline, stream_ids, store, read_fun)
       other -> native_result(other)
     end
   end
 
-  defp wait_stream_loop(deadline, stream_ids, read_fun) do
-    receive do
-      {:stream_waiter_notify, _key} ->
-        case read_fun.() do
-          nil ->
-            Enum.each(stream_ids, fn {key, id} ->
-              StreamCmd.register_stream_waiter(key, self(), id)
-            end)
+  defp wait_stream_loop(deadline, stream_ids, store, read_fun) do
+    if deadline_expired?(deadline) do
+      final_wait_result(read_fun)
+    else
+      receive do
+        {:stream_waiter_notify, _key} ->
+          case read_fun.() do
+            nil ->
+              Enum.each(stream_ids, fn {key, id} ->
+                StreamCmd.register_stream_waiter(key, self(), id, store)
+              end)
 
-            wait_stream_loop(deadline, stream_ids, read_fun)
+              wait_stream_loop(deadline, stream_ids, store, read_fun)
 
-          other ->
-            native_result(other)
-        end
-    after
-      wait_ms(deadline) ->
-        case read_fun.() do
-          nil -> {:ok, nil}
-          other -> native_result(other)
-        end
+            other ->
+              native_result(other)
+          end
+      after
+        wait_ms(deadline) -> final_wait_result(read_fun)
+      end
+    end
+  end
+
+  defp final_wait_result(fun) do
+    case fun.() do
+      nil -> {:ok, nil}
+      other -> native_result(other)
     end
   end
 
@@ -238,5 +310,11 @@ defmodule FerricstoreServer.Native.Blocking do
 
   defp wait_ms(deadline) do
     max(deadline - System.monotonic_time(:millisecond), 0)
+  end
+
+  defp deadline_expired?(0), do: false
+
+  defp deadline_expired?(deadline) do
+    deadline <= System.monotonic_time(:millisecond)
   end
 end

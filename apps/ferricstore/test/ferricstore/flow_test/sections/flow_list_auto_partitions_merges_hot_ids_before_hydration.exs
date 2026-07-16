@@ -40,6 +40,39 @@ defmodule Ferricstore.FlowTest.Sections.FlowListAutoPartitionsMergesHotIdsBefore
         assert Enum.map(records, & &1.id) == Enum.take(ids, 2)
       end
 
+      @tag :flow_list_reverse_regression
+      test "Flow list applies reverse ordering before count on an explicit partition" do
+        ctx = FerricStore.Instance.get(:default)
+        type = uid("partition-list-reverse")
+        partition = Ferricstore.Flow.Keys.auto_partition_keys() |> hd()
+
+        ids =
+          for index <- 0..1 do
+            id = uid("partition-list-reverse-#{index}")
+            now_ms = 1_100 + index
+
+            assert {:ok, %{id: ^id}} =
+                     flow_create_and_get(id,
+                       type: type,
+                       partition_key: partition,
+                       now_ms: now_ms,
+                       run_at_ms: now_ms
+                     )
+
+            id
+          end
+
+        assert {:ok, [record]} =
+                 Ferricstore.Flow.list(ctx, type,
+                   state: "queued",
+                   partition_key: partition,
+                   count: 1,
+                   rev: true
+                 )
+
+        assert record.id == List.last(ids)
+      end
+
       test "Flow list without partition preserves sparse auto partition ordering" do
         ctx = FerricStore.Instance.get(:default)
         type = uid("auto-list-sparse")

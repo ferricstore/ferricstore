@@ -1,9 +1,10 @@
 defmodule FerricStore.EmbeddedInternalKeyAccessTest do
   use ExUnit.Case, async: false
 
+  alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.{CompoundKey, Router}
 
-  @error "ERR access to internal Flow keys is not allowed"
+  @error "ERR access to internal keys is not allowed"
 
   defmodule CustomProtected do
     use FerricStore, shard_count: 1
@@ -65,6 +66,161 @@ defmodule FerricStore.EmbeddedInternalKeyAccessTest do
     assert {:error, @error} = FerricStore.set(physical, "hash")
     assert {:error, @error} = FerricStore.get(physical)
     assert nil == Router.get(context.ctx, physical)
+  end
+
+  test "embedded access cannot read or overwrite the durable server catalog", context do
+    namespace = "security-probe-#{System.unique_integer([:positive, :monotonic])}"
+    key = ServerCatalog.revision_key(namespace)
+    encoded_revision = ServerCatalog.encode_revision(7)
+    assert :ok = Router.put(context.ctx, key, encoded_revision, 0)
+    on_exit(fn -> Router.delete(context.ctx, key) end)
+
+    original = Router.get(context.ctx, key)
+    assert original == encoded_revision
+
+    assert {:error, @error} = FerricStore.get(key)
+    assert {:error, @error} = FerricStore.set(key, "forged")
+    assert {:error, @error} = FerricStore.del(key)
+    assert original == Router.get(context.ctx, key)
+  end
+
+  test "Flow value hydration cannot be used as a generic key read", context do
+    namespace = "flow-value-read-probe"
+    catalog_key = ServerCatalog.revision_key(namespace)
+    catalog_value = ServerCatalog.encode_revision(11)
+
+    assert :ok = Router.put(context.ctx, context.ordinary, "ordinary-secret", 0)
+    assert :ok = Router.put(context.ctx, catalog_key, catalog_value, 0)
+    on_exit(fn -> Router.delete(context.ctx, catalog_key) end)
+
+    assert {:ok, [nil, nil]} =
+             FerricStore.flow_value_mget([context.ordinary, catalog_key])
+
+    flow_id = "value-read-probe-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok =
+             FerricStore.flow_create(flow_id,
+               type: "security-probe",
+               state: "queued",
+               payload_ref: context.ordinary
+             )
+
+    assert {:ok, hydrated} = FerricStore.flow_get(flow_id, full: true)
+    assert hydrated.payload_ref == context.ordinary
+    assert hydrated.payload == nil
+    assert hydrated.payload_missing
+  end
+
+  test "durable server catalog keys stay out of public enumeration and counts" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_catalog_visibility_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    on_exit(fn ->
+      CustomProtected.stop()
+      File.rm_rf(data_dir)
+    end)
+
+    assert {:ok, _pid} = CustomProtected.start_link(data_dir: data_dir, shard_count: 1)
+    ctx = CustomProtected.__instance__()
+    catalog_key = ServerCatalog.revision_key("visibility-probe")
+
+    assert :ok = Router.put(ctx, catalog_key, ServerCatalog.encode_revision(3), 0)
+    assert :ok = CustomProtected.set("ordinary", "value")
+
+    assert {:ok, ["ordinary"]} = CustomProtected.keys()
+    assert {:ok, 1} = CustomProtected.dbsize()
+    assert 1 == Router.dbsize(ctx)
+  end
+
+  test "flushdb removes user data without deleting the durable server catalog" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_catalog_flush_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    on_exit(fn ->
+      CustomProtected.stop()
+      File.rm_rf(data_dir)
+    end)
+
+    assert {:ok, _pid} = CustomProtected.start_link(data_dir: data_dir, shard_count: 1)
+    ctx = CustomProtected.__instance__()
+    namespace = "flush-probe"
+
+    catalog = %{
+      ServerCatalog.entry_key(namespace, "subject") =>
+        ServerCatalog.encode_entry(5, %{role: "admin"}),
+      ServerCatalog.revision_key(namespace) => ServerCatalog.encode_revision(5),
+      ServerCatalog.live_count_key(namespace) => ServerCatalog.encode_live_count(1)
+    }
+
+    Enum.each(catalog, fn {key, value} -> assert :ok = Router.put(ctx, key, value, 0) end)
+    assert :ok = CustomProtected.set("ordinary", "value")
+
+    assert :ok = CustomProtected.flushdb()
+    assert {:ok, nil} = CustomProtected.get("ordinary")
+
+    Enum.each(catalog, fn {key, value} ->
+      assert value == Router.get(ctx, key)
+    end)
+  end
+
+  test "custom flushdb deletes Flow state from the instance being flushed" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_flow_flush_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    on_exit(fn ->
+      CustomProtected.stop()
+      File.rm_rf(data_dir)
+    end)
+
+    assert {:ok, _pid} = CustomProtected.start_link(data_dir: data_dir, shard_count: 1)
+    flow_id = "custom-flow-flush-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok = CustomProtected.flow_create(flow_id, type: "flush-probe", state: "queued")
+    assert {:ok, %{id: ^flow_id}} = CustomProtected.flow_get(flow_id)
+
+    assert :ok = CustomProtected.flushdb()
+    assert {:ok, nil} = CustomProtected.flow_get(flow_id)
+  end
+
+  test "custom flushdb deletes orphan compound rows from their observed shard" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_compound_flush_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    on_exit(fn ->
+      CustomProtected.stop()
+      File.rm_rf(data_dir)
+    end)
+
+    assert {:ok, _pid} = CustomProtected.start_link(data_dir: data_dir, shard_count: 2)
+    ctx = CustomProtected.__instance__()
+
+    {parent, physical} =
+      Enum.find_value(1..1_000, fn suffix ->
+        parent = "compound-flush-parent-#{suffix}"
+        physical = CompoundKey.hash_field(parent, "field")
+
+        if Router.shard_for(ctx, parent) != Router.shard_for(ctx, physical) do
+          {parent, physical}
+        end
+      end)
+
+    assert :ok = Router.compound_put(ctx, parent, physical, "orphan", 0)
+    assert "orphan" == Router.compound_get(ctx, parent, physical)
+
+    assert :ok = CustomProtected.flushdb()
+    assert nil == Router.compound_get(ctx, parent, physical)
   end
 
   test "embedded transactions and pipelines reject before any command executes", context do

@@ -48,7 +48,7 @@ defmodule Mix.Tasks.Ferricstore.Merge do
   def run([]) do
     ensure_started()
 
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    shard_count = FerricStore.Instance.get(:default).shard_count
 
     Enum.each(0..(shard_count - 1), fn i ->
       trigger_shard(i)
@@ -60,7 +60,7 @@ defmodule Mix.Tasks.Ferricstore.Merge do
   def run([shard_str | _]) do
     ensure_started()
 
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    shard_count = FerricStore.Instance.get(:default).shard_count
 
     case Integer.parse(shard_str) do
       {index, ""} when index >= 0 and index < shard_count ->

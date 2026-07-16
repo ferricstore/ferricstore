@@ -144,6 +144,30 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.V2AppendBatchNosyncNif do
         end
       end
 
+      describe "v2_append_ops_batch NIF" do
+        @tag :append_ops_sync
+        test "durably appends a mixed batch and returns exact record locations" do
+          dir = Path.join(System.tmp_dir!(), "sync_ops_nif_#{:rand.uniform(9_999_999)}")
+          File.mkdir_p!(dir)
+          path = Path.join(dir, "00000.log")
+          File.touch!(path)
+
+          on_exit(fn -> File.rm_rf(dir) end)
+
+          assert {:ok, [{:put, put_offset, 5}, {:delete, delete_offset, tombstone_size}]} =
+                   NIF.v2_append_ops_batch(path, [
+                     {:put, "live", "value", 0},
+                     {:delete, "gone"}
+                   ])
+
+          assert put_offset == 0
+          assert delete_offset == @header_size + byte_size("live") + byte_size("value")
+          assert tombstone_size == @header_size + byte_size("gone")
+          assert {:ok, "value"} = NIF.v2_pread_at(path, put_offset)
+          assert {:ok, nil} = NIF.v2_pread_at(path, delete_offset)
+        end
+      end
+
       # ---------------------------------------------------------------------------
       # Shard: nosync writes + deferred fsync
       # ---------------------------------------------------------------------------

@@ -111,6 +111,18 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalDataTest do
     assert Enum.count(events, &(&1 == {:path, shard_file})) == 1
   end
 
+  test "storage scans do not follow symlinks outside the data directory", %{
+    data_dir: data_dir
+  } do
+    outside_dir = data_dir <> "-outside"
+    File.mkdir_p!(outside_dir)
+    File.write!(Path.join(outside_dir, "unrelated.log"), "outside")
+    File.ln_s!(outside_dir, Path.join(data_dir, "linked"))
+    on_exit(fn -> File.rm_rf!(outside_dir) end)
+
+    assert Operational.scan_storage_tree(data_dir) == {0, 0, 0}
+  end
+
   test "concurrent storage callers share one refresh", %{data_dir: data_dir} do
     test_pid = self()
 

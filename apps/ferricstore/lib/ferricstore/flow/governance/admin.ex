@@ -9,7 +9,8 @@ defmodule Ferricstore.Flow.Governance.Admin do
   def overview(ctx, opts \\ [])
 
   def overview(ctx, opts) when is_list(opts) do
-    with {:ok, approvals} <- ApprovalStore.list(ctx, opts),
+    with true <- Keyword.keyword?(opts),
+         {:ok, approvals} <- ApprovalStore.list(ctx, opts),
          {:ok, budgets} <- BudgetStore.list(ctx, opts),
          {:ok, limits} <- LimitStore.list(ctx, opts),
          {:ok, circuits} <- CircuitStore.list(ctx, opts) do
@@ -29,6 +30,9 @@ defmodule Ferricstore.Flow.Governance.Admin do
            half_open_circuits: Enum.count(circuits, &(Map.get(&1, :status) == :half_open))
          }
        }}
+    else
+      false -> {:error, "ERR flow governance opts must be a keyword list"}
+      {:error, _reason} = error -> error
     end
   end
 

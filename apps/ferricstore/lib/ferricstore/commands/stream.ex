@@ -47,8 +47,7 @@ defmodule Ferricstore.Commands.Stream do
   alias Ferricstore.Commands.Stream.Tables
   alias Ferricstore.Commands.Stream.Waiters
   alias Ferricstore.Stream.ActivityLog
-  alias Ferricstore.Store.Ops
-  alias Ferricstore.Store.TypeRegistry
+  alias Ferricstore.Store.{Ops, ReadResult, TypeRegistry}
 
   @typedoc "A parsed stream ID as `{milliseconds, sequence}`."
   @type stream_id :: {non_neg_integer(), non_neg_integer()}
@@ -56,7 +55,9 @@ defmodule Ferricstore.Commands.Stream do
   @typedoc "A stream entry: `{id_string, [field, value, ...]}` flat list."
   @type entry :: {binary(), [binary()]}
 
-  @meta_table Ferricstore.Stream.Meta
+  @max_timeout_ms 0xFFFFFFFF
+  @max_u64 18_446_744_073_709_551_615
+  @invalid_stream_id "ERR Invalid stream ID specified as stream command argument"
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -197,8 +198,20 @@ defmodule Ferricstore.Commands.Stream do
   # XINFO STREAM key [FULL [COUNT count]]
   # -------------------------------------------------------------------------
 
-  def handle("XINFO", ["STREAM", key | _rest], store) do
-    Info.stream(key, store)
+  def handle("XINFO", [subcommand, key], store) when is_binary(subcommand) do
+    if String.upcase(subcommand) == "STREAM" do
+      Info.stream(key, store)
+    else
+      {:error, "ERR wrong number of arguments for 'xinfo' command"}
+    end
+  end
+
+  def handle("XINFO", [subcommand, _key | _rest], _store) when is_binary(subcommand) do
+    if String.upcase(subcommand) == "STREAM" do
+      {:error, "ERR syntax error"}
+    else
+      {:error, "ERR wrong number of arguments for 'xinfo' command"}
+    end
   end
 
   def handle("XINFO", _args, _store) do
@@ -209,9 +222,15 @@ defmodule Ferricstore.Commands.Stream do
   # XGROUP CREATE key groupname id [MKSTREAM]
   # -------------------------------------------------------------------------
 
-  def handle("XGROUP", ["CREATE", key, group, id_str | rest], store) do
-    mkstream = Enum.any?(rest, &(String.upcase(&1) == "MKSTREAM"))
-    do_xgroup_create(key, group, id_str, mkstream, store)
+  def handle("XGROUP", [subcommand, key, group, id_str | rest], store)
+      when is_binary(subcommand) do
+    if String.upcase(subcommand) == "CREATE" do
+      with {:ok, mkstream} <- parse_xgroup_create_options(rest) do
+        do_xgroup_create(key, group, id_str, mkstream, store)
+      end
+    else
+      {:error, "ERR syntax error"}
+    end
   end
 
   def handle("XGROUP", _args, _store) do
@@ -260,8 +279,9 @@ defmodule Ferricstore.Commands.Stream do
 
   def handle_ast({:xadd, key, {id_spec, fields, trim_opts, nomkstream}}, store)
       when is_list(fields) and is_boolean(nomkstream) do
-    trim_opts = if trim_opts == nil, do: nil, else: trim_opts
-    do_xadd(key, id_spec, fields, trim_opts, nomkstream, store)
+    with :ok <- validate_ast_xadd(key, id_spec, fields, trim_opts) do
+      do_xadd(key, id_spec, fields, trim_opts, nomkstream, store)
+    end
   end
 
   def handle_ast({:xlen, key}, store), do: xlen_key(key, store)
@@ -270,16 +290,16 @@ defmodule Ferricstore.Commands.Stream do
 
   def handle_ast({:xrange, key, range_start, range_end, count}, store) do
     with {:ok, range_start} <- ID.normalize_ast_range_id(range_start, :min),
-         {:ok, range_end} <- ID.normalize_ast_range_id(range_end, :max) do
-      count = normalize_ast_count(count)
+         {:ok, range_end} <- ID.normalize_ast_range_id(range_end, :max),
+         {:ok, count} <- normalize_ast_count(count) do
       do_xrange(key, range_start, range_end, count, store)
     end
   end
 
   def handle_ast({:xrevrange, key, range_start, range_end, count}, store) do
     with {:ok, range_start} <- ID.normalize_ast_range_id(range_start, :min),
-         {:ok, range_end} <- ID.normalize_ast_range_id(range_end, :max) do
-      count = normalize_ast_count(count)
+         {:ok, range_end} <- ID.normalize_ast_range_id(range_end, :max),
+         {:ok, count} <- normalize_ast_count(count) do
       do_xrevrange(key, range_start, range_end, count, store)
     end
   end
@@ -287,16 +307,21 @@ defmodule Ferricstore.Commands.Stream do
   def handle_ast({:xread, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:xread, count, :no_block, stream_ids}, store) do
-    do_xread(stream_ids, count, store)
+    with {:ok, count} <- normalize_ast_count(count) do
+      do_xread(stream_ids, count, store)
+    end
   end
 
   def handle_ast({:xread, count, {:block, timeout_ms}, stream_ids}, store) do
-    result = do_xread(stream_ids, count, store)
+    with {:ok, count} <- normalize_ast_count(count),
+         :ok <- validate_ast_timeout(timeout_ms) do
+      result = do_xread(stream_ids, count, store)
 
-    if result == [] do
-      {:block, timeout_ms, stream_ids, count}
-    else
-      result
+      if result == [] do
+        {:block, timeout_ms, stream_ids, count}
+      else
+        result
+      end
     end
   end
 
@@ -320,16 +345,21 @@ defmodule Ferricstore.Commands.Stream do
   def handle_ast({:xreadgroup, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:xreadgroup, group, consumer, {count, :no_block, stream_ids}}, store) do
-    do_xreadgroup(group, consumer, stream_ids, count, store)
+    with {:ok, count} <- normalize_ast_count(count) do
+      do_xreadgroup(group, consumer, stream_ids, count, store)
+    end
   end
 
   def handle_ast({:xreadgroup, group, consumer, {count, {:block, timeout_ms}, stream_ids}}, store) do
-    result = do_xreadgroup(group, consumer, stream_ids, count, store)
+    with {:ok, count} <- normalize_ast_count(count),
+         :ok <- validate_ast_timeout(timeout_ms) do
+      result = do_xreadgroup(group, consumer, stream_ids, count, store)
 
-    if result == [] do
-      {:block, timeout_ms, stream_ids, count}
-    else
-      result
+      if result == [] do
+        {:block, timeout_ms, stream_ids, count}
+      else
+        result
+      end
     end
   end
 
@@ -340,7 +370,7 @@ defmodule Ferricstore.Commands.Stream do
   def handle_ast(_ast, _store), do: {:error, "ERR unsupported stream command AST"}
 
   defp xlen_key(key, store) do
-    # `@meta_table` is local-only (not Raft-replicated), so on a follower we
+    # The metadata cache is local-only (not Raft-replicated), so on a follower we
     # don't have it. Fall back to counting the stream's compound entries —
     # those go through Router.compound_put and are present on every node.
     # On the originating node we still consult the meta table for O(1) speed
@@ -350,7 +380,9 @@ defmodule Ferricstore.Commands.Stream do
     with :ok <- Meta.ensure_read_type(key, store) do
       case Meta.entries(key, store) do
         [{^key, len, _first, _last, _ms, _seq}] -> len
-        [] -> Entries.count(store, key)
+        [] -> store |> Entries.count(key) |> ReadResult.command_result()
+        {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+        {:error, _reason} = error -> error
       end
     end
   end
@@ -384,6 +416,9 @@ defmodule Ferricstore.Commands.Stream do
     Ferricstore.Stream.LocalState.clear()
   end
 
+  @spec clear_local_state(term()) :: :ok
+  def clear_local_state(store), do: Ferricstore.Stream.LocalState.clear(store)
+
   @doc """
   Ensures the stream metadata ETS tables exist.
 
@@ -401,8 +436,16 @@ defmodule Ferricstore.Commands.Stream do
   @spec register_stream_waiter(binary(), pid(), binary()) :: :ok
   defdelegate register_stream_waiter(stream_key, pid, last_seen_id), to: Waiters, as: :register
 
+  @spec register_stream_waiter(binary(), pid(), binary(), term()) :: :ok
+  defdelegate register_stream_waiter(stream_key, pid, last_seen_id, store),
+    to: Waiters,
+    as: :register
+
   @spec unregister_stream_waiter(binary(), pid()) :: :ok
   defdelegate unregister_stream_waiter(stream_key, pid), to: Waiters, as: :unregister
+
+  @spec unregister_stream_waiter(binary(), pid(), term()) :: :ok
+  defdelegate unregister_stream_waiter(stream_key, pid, store), to: Waiters, as: :unregister
 
   @spec cleanup_stream_waiters(pid()) :: :ok
   defdelegate cleanup_stream_waiters(pid), to: Waiters, as: :cleanup
@@ -410,9 +453,16 @@ defmodule Ferricstore.Commands.Stream do
   @spec stream_waiter_count(binary()) :: non_neg_integer()
   defdelegate stream_waiter_count(stream_key), to: Waiters, as: :count
 
+  @spec stream_waiter_count(binary(), term()) :: non_neg_integer()
+  defdelegate stream_waiter_count(stream_key, store), to: Waiters, as: :count
+
   @doc false
   @spec notify_stream_waiters(binary()) :: :ok
   defdelegate notify_stream_waiters(stream_key), to: Waiters, as: :notify
+
+  @doc false
+  @spec notify_stream_waiters(binary(), term()) :: :ok
+  defdelegate notify_stream_waiters(stream_key, store), to: Waiters, as: :notify
 
   # ---------------------------------------------------------------------------
   # Private: XADD
@@ -424,6 +474,12 @@ defmodule Ferricstore.Commands.Stream do
 
     # Check if stream exists when NOMKSTREAM is set
     case meta_entries do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      {:error, _reason} = error ->
+        error
+
       [] when nomkstream ->
         nil
 
@@ -446,35 +502,61 @@ defmodule Ferricstore.Commands.Stream do
           id_str = "#{ms}-#{seq}"
           compound_key = Entries.entry_key(key, id_str)
 
-          # Serialize field-value pairs as Erlang binary term.
-          encoded = :erlang.term_to_binary(fields)
+          case Mutations.prepare_trim(key, id_str, trim_opts, store) do
+            {:ok, trim_plan} ->
+              encoded = Ferricstore.TermCodec.encode(fields)
 
-          case Entries.put(store, key, compound_key, encoded) do
-            :ok ->
-              maybe_index_stream_put(store, key, id_str, compound_key, meta_entries)
+              case Entries.put(store, key, compound_key, encoded) do
+                :ok ->
+                  maybe_index_stream_put(store, key, id_str, compound_key, meta_entries)
 
-              # Update metadata.
-              {new_len, new_first} =
-                case meta_entries do
-                  [{^key, len, first, _last, _ms, _seq}] ->
-                    {len + 1, first}
+                  # Update metadata.
+                  {new_len, new_first} =
+                    case meta_entries do
+                      [{^key, len, first, _last, _ms, _seq}] ->
+                        {len + 1, first}
 
-                  [] ->
-                    {1, id_str}
-                end
+                      [] ->
+                        {1, id_str}
+                    end
 
-              Meta.put(key, new_len, new_first, id_str, ms, seq, store)
+                  case Meta.put(key, new_len, new_first, id_str, ms, seq, store) do
+                    :ok ->
+                      case Mutations.maybe_trim(key, trim_plan, store) do
+                        :ok ->
+                          # Notify any XREAD BLOCK waiters watching this stream.
+                          notify_stream_waiters(key, store)
 
-              # Apply trim if requested.
-              Mutations.maybe_trim(key, trim_opts, store)
+                          ActivityLog.record_xadd(
+                            key,
+                            id_str,
+                            div(length(fields), 2),
+                            trim_opts,
+                            nomkstream
+                          )
 
-              # Notify any XREAD BLOCK waiters watching this stream.
-              notify_stream_waiters(key)
-              ActivityLog.record_xadd(key, id_str, div(length(fields), 2), trim_opts, nomkstream)
+                          id_str
 
-              id_str
+                        {:error, _reason} = error ->
+                          error
+                      end
 
-            {:error, _} = error ->
+                    {:error, _reason} = error ->
+                      rollback_xadd_metadata_failure(
+                        key,
+                        id_str,
+                        compound_key,
+                        type_status,
+                        store,
+                        error
+                      )
+                  end
+
+                {:error, _} = error ->
+                  rollback_new_stream_type_marker(key, store, type_status, error)
+              end
+
+            {:error, _reason} = error ->
               rollback_new_stream_type_marker(key, store, type_status, error)
           end
 
@@ -497,6 +579,36 @@ defmodule Ferricstore.Commands.Stream do
   defp rollback_new_stream_type_marker(_key, _store, :ok, write_error), do: write_error
   defp rollback_new_stream_type_marker(_key, _store, :no_marker, write_error), do: write_error
 
+  defp rollback_xadd_metadata_failure(
+         key,
+         id_str,
+         compound_key,
+         type_status,
+         store,
+         write_error
+       ) do
+    entry_result = Entries.delete(store, key, [compound_key])
+    Index.delete_ids(key, [id_str], store)
+
+    type_result =
+      case type_status do
+        {:ok, :created} -> TypeRegistry.delete_type(key, store)
+        _existing_or_untyped -> :ok
+      end
+
+    if type_status == {:ok, :created} do
+      Meta.cleanup_local(key, store)
+    end
+
+    case {entry_result, type_result} do
+      {:ok, :ok} ->
+        write_error
+
+      {entry_error, type_error} ->
+        {:error, {:stream_metadata_rollback_failed, write_error, entry_error, type_error}}
+    end
+  end
+
   defp record_xtrim_result(key, trim_opts, result) when is_integer(result) do
     ActivityLog.record_xtrim(key, result, trim_opts)
     result
@@ -513,7 +625,7 @@ defmodule Ferricstore.Commands.Stream do
 
   defp stream_type_status(key, store) do
     if Ops.has_compound?(store) do
-      TypeRegistry.check_or_set_status(key, :stream, store)
+      TypeRegistry.command_check_or_set_status(key, :stream, store)
     else
       :no_marker
     end
@@ -542,43 +654,54 @@ defmodule Ferricstore.Commands.Stream do
       if Ops.has_compound?(store) do
         indexed_stream_range(key, range_start, range_end, count, true, store)
       else
-        key
-        |> scanned_stream_range(range_start, range_end, :infinity, store)
-        |> Enum.reverse()
-        |> maybe_take(count)
+        case scanned_stream_range(key, range_start, range_end, :infinity, store) do
+          {:error, _} = error -> error
+          entries -> entries |> Enum.reverse() |> maybe_take(count)
+        end
       end
     end
   end
 
   defp scanned_stream_range(key, range_start, range_end, count, store) do
-    case :ets.lookup(@meta_table, key) do
+    case Meta.entries(key, store) do
       [] ->
         []
 
       [{^key, _len, _first, _last, _ms, _seq}] ->
-        selected_entries =
-          store
-          |> Entries.scan(key)
-          |> Enum.map(fn {id_str, raw} -> {id_str, parse_id!(id_str), raw} end)
-          |> Enum.filter(fn {_id_str, id, _raw} ->
-            ID.in_range?(id, range_start, range_end)
-          end)
-          |> Enum.sort_by(fn {_id_str, id, _raw} -> id end)
-          |> maybe_take(count)
+        case Entries.scan(store, key) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
 
-        Enum.flat_map(selected_entries, fn {id_str, _id, raw} ->
-          case Entries.decode_fields(raw) do
-            {:ok, fields} -> [[id_str | fields]]
-            :error -> []
-          end
-        end)
+          scanned when is_list(scanned) ->
+            selected_entries =
+              scanned
+              |> Enum.map(fn {id_str, raw} -> {id_str, parse_id!(id_str), raw} end)
+              |> Enum.filter(fn {_id_str, id, _raw} ->
+                ID.in_range?(id, range_start, range_end)
+              end)
+              |> Enum.sort_by(fn {_id_str, id, _raw} -> id end)
+              |> maybe_take(count)
+
+            Enum.flat_map(selected_entries, fn {id_str, _id, raw} ->
+              case Entries.decode_fields(raw) do
+                {:ok, fields} -> [[id_str | fields]]
+                :error -> []
+              end
+            end)
+        end
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
   defp indexed_stream_range(key, range_start, range_end, count, reverse?, store) do
     with :ok <- Index.ensure(key, store) do
       key
-      |> Index.slice(range_start, range_end, count, reverse?)
+      |> Index.slice(range_start, range_end, count, reverse?, store)
       |> Entries.decode_indexed(key, store)
     end
   end
@@ -605,16 +728,31 @@ defmodule Ferricstore.Commands.Stream do
         case Meta.entries(key, store) do
           [{^key, _len, _first, last, _ms, _seq}] -> last
           [] -> "0-0"
+          {:error, _} = error -> error
         end
       else
         id_str
       end
 
     # For XREAD, the start is exclusive (entries > id).
+    case resolved_id do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      {:error, _} = error ->
+        error
+
+      resolved_id ->
+        xread_from_resolved_id(rest, key, resolved_id, count, store, acc)
+    end
+  end
+
+  defp xread_from_resolved_id(rest, key, resolved_id, count, store, acc) do
     case ID.parse_exclusive_start(resolved_id) do
       {:ok, excl_start} ->
         case do_xrange(key, excl_start, :max, count, store) do
           [] -> xread_results(rest, count, store, acc)
+          {:error, _} = error -> error
           entries -> xread_results(rest, count, store, [[key, entries] | acc])
         end
 
@@ -628,52 +766,84 @@ defmodule Ferricstore.Commands.Stream do
   # ---------------------------------------------------------------------------
 
   defp do_xgroup_create(key, group, id_str, mkstream, store) do
-    ensure_meta_table()
+    with {:ok, id_str} <- normalize_group_start_id(id_str) do
+      ensure_meta_table()
 
-    Groups.with_lock(key, group, fn ->
-      do_xgroup_create_locked(key, group, id_str, mkstream, store)
-    end)
-  end
-
-  defp do_xgroup_create_locked(key, group, id_str, mkstream, store) do
-    stream_exists? = stream_exists_for_group_create?(key, store)
-    group_exists? = Groups.lookup(store, key, group) != :missing
-
-    cond do
-      not stream_exists? and not mkstream ->
-        {:error,
-         "ERR The XGROUP subcommand requires the key to exist. " <>
-           "Note that for CREATE you may want to use the MKSTREAM option to create " <>
-           "an empty stream automatically."}
-
-      not stream_exists? and mkstream ->
-        # Create an empty stream. The type marker is the durable existence
-        # marker; local ETS metadata is only an accelerator.
-        case stream_type_status(key, store) do
-          type_status when type_status in [:ok, {:ok, :created}, :no_marker] ->
-            case create_group(key, group, id_str, store) do
-              :ok ->
-                Meta.put(key, 0, "0-0", "0-0", 0, 0, store)
-                :ok
-
-              {:error, _} = error ->
-                rollback_new_stream_type_marker(key, store, type_status, error)
-            end
-
-          {:error, _} = error ->
-            error
-        end
-
-      group_exists? ->
-        {:error, "BUSYGROUP Consumer Group name already exists"}
-
-      true ->
-        create_group(key, group, id_str, store)
+      Groups.with_lock(store, key, group, fn ->
+        do_xgroup_create_locked(key, group, id_str, mkstream, store)
+      end)
     end
   end
 
-  defp stream_exists_for_group_create?(key, store) do
-    Meta.entries(key, store) != [] or Meta.type_marker?(key, store)
+  defp do_xgroup_create_locked(key, group, id_str, mkstream, store) do
+    case stream_exists_for_group_create(key, store) do
+      {:ok, stream_exists?} ->
+        do_xgroup_create_with_existence(key, group, id_str, mkstream, stream_exists?, store)
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp do_xgroup_create_with_existence(key, group, id_str, mkstream, stream_exists?, store) do
+    with {:ok, group_exists?} <- stream_group_exists?(store, key, group) do
+      cond do
+        not stream_exists? and not mkstream ->
+          {:error,
+           "ERR The XGROUP subcommand requires the key to exist. " <>
+             "Note that for CREATE you may want to use the MKSTREAM option to create " <>
+             "an empty stream automatically."}
+
+        not stream_exists? and mkstream ->
+          # Create an empty stream. The type marker is the durable existence
+          # marker; local ETS metadata is only an accelerator.
+          case stream_type_status(key, store) do
+            type_status when type_status in [:ok, {:ok, :created}, :no_marker] ->
+              case create_group(key, group, id_str, store) do
+                :ok ->
+                  case Meta.put(key, 0, "0-0", "0-0", 0, 0, store) do
+                    :ok ->
+                      :ok
+
+                    {:error, _reason} = error ->
+                      rollback_xgroup_mkstream(key, group, type_status, store, error)
+                  end
+
+                {:error, _} = error ->
+                  rollback_new_stream_type_marker(key, store, type_status, error)
+              end
+
+            {:error, _} = error ->
+              error
+          end
+
+        group_exists? ->
+          {:error, "BUSYGROUP Consumer Group name already exists"}
+
+        true ->
+          create_group(key, group, id_str, store)
+      end
+    end
+  end
+
+  defp stream_group_exists?(store, key, group) do
+    case Groups.lookup(store, key, group) do
+      :missing -> {:ok, false}
+      {:ok, _last_delivered, _consumers, _pending} -> {:ok, true}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp stream_exists_for_group_create(key, store) do
+    case Meta.entries(key, store) do
+      [] -> Meta.type_marker_status(key, store)
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      {:error, _reason} = error -> error
+      _entries -> {:ok, true}
+    end
   end
 
   defp create_group(key, group, id_str, store) do
@@ -683,7 +853,7 @@ defmodule Ferricstore.Commands.Stream do
     last_delivered =
       case id_str do
         "$" ->
-          case :ets.lookup(@meta_table, key) do
+          case Meta.entries(key, store) do
             [{^key, _len, _first, last, _ms, _seq}] -> last
             [] -> "0-0"
           end
@@ -693,6 +863,24 @@ defmodule Ferricstore.Commands.Stream do
       end
 
     Groups.persist(store, key, group, last_delivered, %{}, %{})
+  end
+
+  defp rollback_xgroup_mkstream(key, group, type_status, store, write_error) do
+    group_result = Groups.delete(store, key, group)
+
+    type_result =
+      case type_status do
+        {:ok, :created} -> TypeRegistry.delete_type(key, store)
+        _existing_or_untyped -> :ok
+      end
+
+    case {group_result, type_result} do
+      {:ok, :ok} ->
+        write_error
+
+      {group_error, type_error} ->
+        {:error, {:stream_group_metadata_rollback_failed, write_error, group_error, type_error}}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -719,10 +907,13 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp xreadgroup_stream_result(group, consumer, key, id_str, count, store) do
-    Groups.with_lock(key, group, fn ->
+    Groups.with_lock(store, key, group, fn ->
       case Groups.lookup(store, key, group) do
         :missing ->
           {:error, "NOGROUP No such consumer group '#{group}' for key name '#{key}'"}
+
+        {:error, _reason} = error ->
+          error
 
         {:ok, last_delivered, consumers, pending} ->
           xreadgroup_known_group_result(
@@ -755,6 +946,9 @@ defmodule Ferricstore.Commands.Stream do
     case ID.parse_exclusive_start(last_delivered) do
       {:ok, excl_start} ->
         case do_xrange(key, excl_start, :max, count, store) do
+          {:error, _reason} = error ->
+            error
+
           [] ->
             nil
 
@@ -801,33 +995,35 @@ defmodule Ferricstore.Commands.Stream do
          pending
        ) do
     # Return pending entries for this consumer with id >= id_str.
-    pending_start =
-      if id_str == "0" or id_str == "0-0" do
-        :min
-      else
-        parse_id!(id_str)
+    with {:ok, pending_start} <- normalize_pending_start(id_str) do
+      pending_ids = xreadgroup_pending_ids(pending, consumer, pending_start, count)
+
+      pending_compound_keys = Enum.map(pending_ids, &Entries.entry_key(key, &1))
+
+      raw_values = Entries.batch_get(store, key, pending_compound_keys)
+
+      case ReadResult.first_failure(raw_values) do
+        nil ->
+          pending_entries =
+            raw_values
+            |> Enum.zip(pending_ids)
+            |> Enum.reduce([], fn {raw, id_str_inner}, acc ->
+              case Entries.decode_fields(raw) do
+                {:ok, fields} -> [[id_str_inner | fields] | acc]
+                :error -> acc
+              end
+            end)
+            |> Enum.reverse()
+
+          if pending_entries == [] do
+            nil
+          else
+            [key, pending_entries]
+          end
+
+        failure ->
+          ReadResult.command_error(failure)
       end
-
-    pending_ids = xreadgroup_pending_ids(pending, consumer, pending_start, count)
-
-    pending_compound_keys = Enum.map(pending_ids, &Entries.entry_key(key, &1))
-
-    pending_entries =
-      store
-      |> Entries.batch_get(key, pending_compound_keys)
-      |> Enum.zip(pending_ids)
-      |> Enum.reduce([], fn {raw, id_str_inner}, acc ->
-        case Entries.decode_fields(raw) do
-          {:ok, fields} -> [[id_str_inner | fields] | acc]
-          :error -> acc
-        end
-      end)
-      |> Enum.reverse()
-
-    if pending_entries == [] do
-      nil
-    else
-      [key, pending_entries]
     end
   end
 
@@ -858,7 +1054,7 @@ defmodule Ferricstore.Commands.Stream do
   defp do_xack(key, group, ids, store) do
     ensure_meta_table()
 
-    Groups.with_lock(key, group, fn ->
+    Groups.with_lock(store, key, group, fn ->
       do_xack_locked(key, group, ids, store)
     end)
   end
@@ -867,6 +1063,9 @@ defmodule Ferricstore.Commands.Stream do
     case Groups.lookup(store, key, group) do
       :missing ->
         0
+
+      {:error, _reason} = error ->
+        error
 
       {:ok, last_delivered, consumers, pending} ->
         {new_pending, acked} =
@@ -893,8 +1092,91 @@ defmodule Ferricstore.Commands.Stream do
   @spec parse_id!(binary()) :: stream_id()
   defdelegate parse_id!(id_str), to: ID
 
-  defp normalize_ast_count(nil), do: :infinity
-  defp normalize_ast_count(count), do: count
+  defp normalize_ast_count(nil), do: {:ok, :infinity}
+  defp normalize_ast_count(:infinity), do: {:ok, :infinity}
+  defp normalize_ast_count(count) when is_integer(count) and count >= 0, do: {:ok, count}
+
+  defp normalize_ast_count(_count),
+    do: {:error, "ERR value is not an integer or out of range"}
+
+  defp validate_ast_timeout(timeout_ms)
+       when is_integer(timeout_ms) and timeout_ms >= 0 and timeout_ms <= @max_timeout_ms,
+       do: :ok
+
+  defp validate_ast_timeout(_timeout_ms),
+    do: {:error, "ERR value is not an integer or out of range"}
+
+  defp validate_ast_xadd(key, id_spec, fields, trim_opts) when is_binary(key) do
+    with :ok <- validate_ast_xadd_fields(fields),
+         :ok <- validate_ast_xadd_id(id_spec),
+         :ok <- validate_ast_trim(trim_opts) do
+      :ok
+    end
+  end
+
+  defp validate_ast_xadd(_key, _id_spec, _fields, _trim_opts),
+    do: {:error, "ERR protocol error"}
+
+  defp validate_ast_xadd_fields(fields) do
+    if fields != [] and rem(length(fields), 2) == 0 and Enum.all?(fields, &is_binary/1) do
+      :ok
+    else
+      {:error, "ERR wrong number of arguments for 'xadd' command"}
+    end
+  end
+
+  defp validate_ast_xadd_id(:auto), do: :ok
+
+  defp validate_ast_xadd_id({:explicit, ms, seq})
+       when is_integer(ms) and ms in 0..@max_u64 and is_integer(seq) and seq in 0..@max_u64,
+       do: :ok
+
+  defp validate_ast_xadd_id({:partial, ms})
+       when is_integer(ms) and ms in 0..@max_u64,
+       do: :ok
+
+  defp validate_ast_xadd_id(_id_spec), do: {:error, @invalid_stream_id}
+
+  defp validate_ast_trim(nil), do: :ok
+
+  defp validate_ast_trim({:maxlen, approximate?, max_len})
+       when is_boolean(approximate?) and is_integer(max_len) and max_len >= 0,
+       do: :ok
+
+  defp validate_ast_trim({:maxlen, _approximate?, _max_len}),
+    do: {:error, "ERR value is not an integer or out of range"}
+
+  defp validate_ast_trim({:minid, approximate?, id_str})
+       when is_boolean(approximate?) and is_binary(id_str) do
+    case ID.parse_full_id(id_str) do
+      {:ok, _id} -> :ok
+      {:error, _message} = error -> error
+    end
+  end
+
+  defp validate_ast_trim(_trim_opts), do: {:error, "ERR syntax error"}
+
+  defp parse_xgroup_create_options([]), do: {:ok, false}
+
+  defp parse_xgroup_create_options([option]) when is_binary(option) do
+    if String.upcase(option) == "MKSTREAM", do: {:ok, true}, else: {:error, "ERR syntax error"}
+  end
+
+  defp parse_xgroup_create_options(_options), do: {:error, "ERR syntax error"}
+
+  defp normalize_group_start_id("$"), do: {:ok, "$"}
+
+  defp normalize_group_start_id(id_str) when is_binary(id_str) do
+    case ID.parse_full_id(id_str) do
+      {:ok, {ms, seq}} -> {:ok, "#{ms}-#{seq}"}
+      {:error, _message} = error -> error
+    end
+  end
+
+  defp normalize_group_start_id(_id_str), do: {:error, @invalid_stream_id}
+
+  defp normalize_pending_start(id_str) when id_str in ["0", "0-0"], do: {:ok, :min}
+  defp normalize_pending_start(id_str), do: ID.parse_full_id(id_str)
 
   # ---------------------------------------------------------------------------
   # Private: compound key helpers
@@ -902,10 +1184,10 @@ defmodule Ferricstore.Commands.Stream do
 
   defp maybe_index_stream_put(store, stream_key, id_str, compound_key, meta_entries) do
     if Ops.has_compound?(store) do
-      Index.insert_entry(stream_key, id_str, compound_key)
+      Index.insert_entry(stream_key, id_str, compound_key, store)
 
-      if Index.ready?(stream_key) or meta_entries == [] do
-        Index.mark_ready(stream_key)
+      if Index.ready?(stream_key, store) or meta_entries == [] do
+        Index.mark_ready(stream_key, store)
       end
     end
 

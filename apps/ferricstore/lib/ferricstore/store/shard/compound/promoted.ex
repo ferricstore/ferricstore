@@ -3,7 +3,8 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{ColdRead, CompoundKey, LFU, Promotion}
+  alias Ferricstore.Store.{ColdRead, CompoundKey, Promotion}
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.Compound.Support
@@ -15,6 +16,7 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   @promoted_dead_bytes_min 1_048_576
   @promoted_compaction_cooldown_ms 30_000
   @cold_batch_read_timeout_ms 10_000
+  @promoted_compaction_page_size 256
 
   defp promoted_record_size(compound_key, value) when is_binary(value) do
     @record_header_size + byte_size(compound_key) + byte_size(value)
@@ -23,10 +25,26 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   @spec promoted_store(map(), binary()) :: binary() | nil
   @doc false
   def promoted_store(state, redis_key) do
+    Promotion.await_compaction_latch(state, redis_key)
+
     case Map.get(Map.get(state, :promoted_instances, %{}), redis_key) do
-      %{path: path} -> path
-      path when is_binary(path) -> path
+      %{path: path} -> if(promotion_marker_live?(state, redis_key), do: path)
+      path when is_binary(path) -> if(promotion_marker_live?(state, redis_key), do: path)
       nil -> marker_promoted_store(state, redis_key)
+    end
+  end
+
+  defp promotion_marker_live?(state, redis_key) do
+    marker_key = Promotion.marker_key(redis_key)
+    now = HLC.now_ms()
+
+    case :ets.lookup(Map.get(state, :ets), marker_key) do
+      [{^marker_key, type_str, expire_at_ms, _lfu, _fid, _offset, _value_size}]
+      when expire_at_ms == 0 or expire_at_ms > now ->
+        decode_promoted_marker_type(type_str) != nil
+
+      _other ->
+        false
     end
   end
 
@@ -68,28 +86,27 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     end
   end
 
-  # Type and promotion metadata are authoritative in the shared shard log.
-  # Promoted H/S/Z data rows use dedicated Bitcask files, but metadata rows
-  # keep shared-log offsets and must not be read through the dedicated path.
-  def shared_log_compound_key?(<<"T:", _rest::binary>>), do: true
+  # The marker remains in the shared log so recovery can discover the dedicated
+  # collection. Type metadata is co-located with members so logical batches use
+  # one append target.
   def shared_log_compound_key?(<<"PM:", _rest::binary>>), do: true
   def shared_log_compound_key?(_key), do: false
 
   def tombstone_and_delete_keys(state, []), do: {:ok, state}
 
   def tombstone_and_delete_keys(state, keys) do
-    next_state =
-      Enum.reduce(keys, state, fn key, acc_state ->
-        ShardFlush.track_delete_dead_bytes(acc_state, key)
-      end)
-
-    case append_tombstone_batch_sync(next_state.active_file_path, keys) do
+    case append_tombstone_batch_sync(state.active_file_path, keys) do
       {:ok, _locations} ->
+        next_state =
+          Enum.reduce(keys, state, fn key, acc_state ->
+            ShardFlush.track_delete_dead_bytes(acc_state, key)
+          end)
+
         Enum.each(keys, fn key -> ShardETS.ets_delete_key(next_state, key) end)
         {:ok, next_state}
 
       {:error, reason} ->
-        {{:error, reason}, next_state}
+        {{:error, reason}, state}
     end
   end
 
@@ -100,17 +117,14 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
              non_neg_integer()}
           | {:error, term()}
   @doc false
-  def promoted_read(dedicated_path, compound_key, %{keydir: keydir} = state) do
-    now = HLC.now_ms()
-
-    case :ets.lookup(keydir, compound_key) do
-      [{^compound_key, value, exp, _lfu, _fid, _offset, _vsize}]
-      when value != nil and (exp == 0 or exp > now) ->
+  def promoted_read(dedicated_path, compound_key, state) do
+    case ShardETS.ets_lookup_metadata(state, compound_key) do
+      {:live, {^compound_key, value, exp, _lfu, _fid, _offset, _vsize}, :hot} ->
         {:ok, value, exp}
 
-      [{^compound_key, nil, exp, _lfu, fid, offset, vsize}]
-      when (exp == 0 or exp > now) and is_integer(fid) and fid >= 0 and is_integer(offset) and
-             offset >= 0 and is_integer(vsize) and vsize >= 0 ->
+      {:live, {^compound_key, nil, exp, _lfu, fid, offset, vsize}, :cold}
+      when is_integer(fid) and fid >= 0 and is_integer(offset) and offset >= 0 and
+             is_integer(vsize) and vsize >= 0 ->
         file_path = dedicated_file_path(dedicated_path, fid)
 
         case Support.read_cold_async(state, file_path, offset, compound_key) do
@@ -118,13 +132,20 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
           other -> other
         end
 
-      [{^compound_key, _value, _exp, _lfu, _fid, _offset, _vsize}] ->
-        ShardETS.ets_delete_key(state, compound_key)
-        {:ok, nil}
+      {:live, _entry, :pending} ->
+        {:error, :pending_cold_write}
 
-      _ ->
+      {:live, _entry, _invalid_or_unsupported_location} ->
+        {:error, :invalid_keydir_entry}
+
+      {:error, :invalid_keydir_entry} ->
+        {:error, :invalid_keydir_entry}
+
+      result when result in [:expired, :miss] ->
         {:ok, nil}
     end
+  rescue
+    ArgumentError -> {:error, :keydir_unavailable}
   end
 
   @spec promoted_write(binary(), binary(), binary(), non_neg_integer()) ::
@@ -203,10 +224,9 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   defp append_tombstone_batch_sync(path, keys) do
     ops = Enum.map(keys, &{:delete, &1})
 
-    case NIF.v2_append_ops_batch_nosync(path, ops) do
+    case NIF.v2_append_ops_batch(path, ops) do
       {:ok, locations} ->
-        with :ok <- validate_tombstone_locations(locations, length(keys)),
-             :ok <- NIF.v2_fsync(path) do
+        with :ok <- validate_tombstone_locations(locations, length(keys)) do
           {:ok, locations}
         end
 
@@ -248,49 +268,55 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   @spec bump_promoted_writes(map(), binary()) :: map()
   @doc false
   def bump_promoted_writes(state, redis_key) do
-    case Map.get(state.promoted_instances, redis_key) do
-      %{path: path, total_bytes: total, dead_bytes: dead, last_compacted_at: last} = info ->
-        frag = if total > 0, do: dead / total, else: 0.0
+    if promoted_compaction_due?(state, redis_key) do
+      send(self(), {:maybe_compact_promoted, redis_key})
+    end
 
-        cooldown_ok =
-          last == nil or
-            System.monotonic_time(:millisecond) - last >= @promoted_compaction_cooldown_ms
+    state
+  end
 
-        if frag >= @promoted_frag_threshold and dead >= @promoted_dead_bytes_min and cooldown_ok do
-          case compact_dedicated_result(state, redis_key, path) do
-            {:ok, state} ->
-              new_total = promoted_dir_size(path)
+  @spec apply_promoted_maintenance(map(), binary(), map()) :: map()
+  @doc false
+  def apply_promoted_maintenance(
+        state,
+        redis_key,
+        %{appended_bytes: appended, reclaimable_bytes: reclaimable, writes: writes}
+      )
+      when is_integer(appended) and appended >= 0 and is_integer(reclaimable) and
+             reclaimable >= 0 and is_integer(writes) and writes >= 0 do
+    case Map.get(Map.get(state, :promoted_instances, %{}), redis_key) do
+      info when is_map(info) ->
+        updated =
+          info
+          |> Map.update(:total_bytes, appended, &(&1 + appended))
+          |> Map.update(:dead_bytes, reclaimable, &(&1 + reclaimable))
+          |> Map.update(:writes, writes, &(&1 + writes))
+          |> Map.put_new(:last_compacted_at, nil)
 
-              new_info = %{
-                info
-                | dead_bytes: 0,
-                  total_bytes: new_total,
-                  last_compacted_at: System.monotonic_time(:millisecond)
-              }
+        %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, updated)}
 
-              new_promoted = Map.put(state.promoted_instances, redis_key, new_info)
-              %{state | promoted_instances: new_promoted}
-
-            {:error, state} ->
-              %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, info)}
-          end
-        else
-          %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, info)}
-        end
-
-      %{path: path, writes: _writes} = info ->
-        new_info =
-          Map.merge(info, %{
-            total_bytes: promoted_dir_size(path),
-            dead_bytes: 0,
-            last_compacted_at: nil
-          })
-
-        new_promoted = Map.put(state.promoted_instances, redis_key, new_info)
-        %{state | promoted_instances: new_promoted}
-
-      _ ->
+      _missing ->
         state
+    end
+  end
+
+  def apply_promoted_maintenance(state, _redis_key, _invalid), do: state
+
+  @spec promoted_compaction_due?(map(), binary(), integer()) :: boolean()
+  @doc false
+  def promoted_compaction_due?(
+        state,
+        redis_key,
+        now_ms \\ System.monotonic_time(:millisecond)
+      ) do
+    case Map.get(Map.get(state, :promoted_instances, %{}), redis_key) do
+      %{total_bytes: total, dead_bytes: dead, last_compacted_at: last}
+      when is_integer(total) and total > 0 and is_integer(dead) and dead >= 0 ->
+        dead >= @promoted_dead_bytes_min and dead / total >= @promoted_frag_threshold and
+          (last == nil or now_ms - last >= @promoted_compaction_cooldown_ms)
+
+      _other ->
+        false
     end
   end
 
@@ -303,8 +329,8 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
         |> Enum.reduce(0, fn name, acc ->
           case dedicated_log_file_id(name) do
             {:ok, _fid} ->
-              case File.stat(Path.join(dir_path, name)) do
-                {:ok, %{size: s}} -> acc + s
+              case File.lstat(Path.join(dir_path, name)) do
+                {:ok, %File.Stat{type: :regular, size: size}} -> acc + size
                 _ -> acc
               end
 
@@ -350,7 +376,7 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   @doc false
   def track_promoted_delete_bytes(state, redis_key, compound_key) do
     case Map.get(state.promoted_instances, redis_key) do
-      %{dead_bytes: dead} = info ->
+      %{total_bytes: total, dead_bytes: dead} = info ->
         old_record_size =
           case :ets.lookup(state.keydir, compound_key) do
             [{^compound_key, _v, _exp, _lfu, _fid, _off, old_vsize}]
@@ -361,6 +387,31 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
               0
           end
 
+        tombstone_size = @record_header_size + byte_size(compound_key)
+
+        new_info = %{
+          info
+          | total_bytes: total + tombstone_size,
+            dead_bytes: dead + old_record_size + tombstone_size
+        }
+
+        %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, new_info)}
+
+      _ ->
+        state
+    end
+  end
+
+  @doc false
+  def track_promoted_delete_bytes_entry(
+        state,
+        redis_key,
+        {compound_key, _value, _expire_at_ms, _lfu, _file_id, _offset, old_vsize}
+      )
+      when is_integer(old_vsize) and old_vsize >= 0 do
+    case Map.get(state.promoted_instances, redis_key) do
+      %{dead_bytes: dead} = info ->
+        old_record_size = @record_header_size + byte_size(compound_key) + old_vsize
         new_info = %{info | dead_bytes: dead + old_record_size}
         %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, new_info)}
 
@@ -369,6 +420,8 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     end
   end
 
+  def track_promoted_delete_bytes_entry(state, _redis_key, _entry), do: state
+
   @spec compact_dedicated(map(), binary(), binary()) :: map()
   @doc false
   def compact_dedicated(state, redis_key, dedicated_path) do
@@ -376,10 +429,16 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     state
   end
 
-  defp compact_dedicated_result(state, redis_key, dedicated_path) do
+  @doc false
+  def compact_dedicated_result(state, redis_key, dedicated_path) do
     Promotion.with_compaction_latch(state, redis_key, fn ->
       do_compact_dedicated(state, redis_key, dedicated_path)
     end)
+  end
+
+  @doc false
+  def compact_dedicated_result_latched(state, redis_key, dedicated_path) do
+    do_compact_dedicated(state, redis_key, dedicated_path)
   end
 
   defp do_compact_dedicated(state, redis_key, dedicated_path) do
@@ -410,35 +469,16 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
             :ok ->
               now = HLC.now_ms()
 
-              case collect_promoted_live_entries(state, dedicated_path, prefix, now) do
-                {:ok, live_entries} ->
-                  maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries)
-
-                  compact_promoted_live_entries(
-                    state,
-                    redis_key,
-                    dedicated_path,
-                    new_file,
-                    old_fid,
-                    new_fid,
-                    live_entries
-                  )
-
-                {:error, reason} ->
-                  Logger.error(
-                    "Shard #{state.index}: dedicated compaction read failed: #{inspect(reason)}"
-                  )
-
-                  rollback_new_active_file(state, dedicated_path, new_file)
-
-                  fail_dedicated_compaction(
-                    state,
-                    redis_key,
-                    dedicated_path,
-                    :collect_live_entries,
-                    reason
-                  )
-              end
+              compact_promoted_catalog_pages(
+                state,
+                redis_key,
+                dedicated_path,
+                prefix,
+                new_file,
+                old_fid,
+                new_fid,
+                now
+              )
 
             {:error, reason} ->
               rollback_new_active_file(state, dedicated_path, new_file)
@@ -451,96 +491,204 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     end
   end
 
-  defp compact_promoted_live_entries(
+  defp compact_promoted_catalog_pages(
          state,
          redis_key,
          dedicated_path,
+         prefix,
          new_file,
          old_fid,
          new_fid,
-         live_entries
+         now_ms
        ) do
-    if live_entries == [] do
-      # No live promoted members remain. Keep the newly touched empty
-      # active file so future writes have a valid target, and remove old
-      # dedicated logs so accounting does not reset while bytes remain.
-      with :ok <- remove_dedicated_logs_before(state, dedicated_path, new_fid),
-           :ok <- dedicated_fsync_dir(state, dedicated_path, :remove_old_logs) do
-        {:ok, state}
+    member_index =
+      Map.get(state, :compound_member_index) || Map.get(state, :compound_member_index_name)
+
+    metadata_key = CompoundKey.type_key(redis_key)
+
+    page_result =
+      with {:ok, metadata_entries} <-
+             collect_promoted_exact_page(state, dedicated_path, [metadata_key], now_ms),
+           :ok <- maybe_run_promoted_compaction_after_collect_hook(redis_key, metadata_entries),
+           {:ok, metadata_written?} <-
+             append_promoted_compaction_page(state, new_file, new_fid, metadata_entries) do
+        compact_promoted_page(
+          state,
+          redis_key,
+          dedicated_path,
+          prefix,
+          member_index,
+          new_file,
+          new_fid,
+          now_ms,
+          0,
+          length(metadata_entries),
+          metadata_written?
+        )
       else
+        {:error, {:cold_read_failed, _errors} = reason} ->
+          {:error, :collect_metadata, reason, false}
+
         {:error, reason} ->
-          fail_dedicated_compaction(state, redis_key, dedicated_path, :remove_old_logs, reason)
+          {:error, :append_metadata, reason, false}
       end
-    else
-      batch = Enum.map(live_entries, fn {k, v, exp} -> {k, v, exp} end)
 
-      case NIF.v2_append_batch(new_file, batch) do
-        {:ok, results} when length(results) == length(live_entries) ->
-          ref = Support.keydir_binary_ref(state)
+    case page_result do
+      {:ok, live_count, _published?} ->
+        with :ok <- remove_dedicated_logs_before(state, dedicated_path, new_fid),
+             :ok <- dedicated_fsync_dir(state, dedicated_path, :remove_old_logs) do
+          Logger.debug(
+            "Shard #{state.index}: compacted dedicated #{inspect(redis_key)} " <>
+              "(#{live_count} live entries, fid #{old_fid} -> #{new_fid})"
+          )
 
-          live_entries
-          |> Enum.zip(results)
-          |> Enum.each(fn {{key, value, expire_at_ms}, {offset, value_size}} ->
-            value_for_ets = ShardETS.value_for_ets(value, ShardETS.hot_cache_threshold(state))
+          :telemetry.execute(
+            [:ferricstore, :dedicated, :compaction],
+            %{live_entries: live_count, old_fid: old_fid, new_fid: new_fid},
+            %{shard_index: state.index, redis_key: redis_key}
+          )
+
+          {:ok, state}
+        else
+          {:error, reason} ->
+            fail_dedicated_compaction(
+              state,
+              redis_key,
+              dedicated_path,
+              :remove_old_logs,
+              reason
+            )
+        end
+
+      {:error, phase, reason, published?} ->
+        log_promoted_compaction_page_failure(state, phase, reason)
+
+        unless published? do
+          rollback_new_active_file(state, dedicated_path, new_file)
+        end
+
+        fail_dedicated_compaction(state, redis_key, dedicated_path, phase, reason)
+    end
+  end
+
+  defp compact_promoted_page(
+         state,
+         redis_key,
+         dedicated_path,
+         prefix,
+         member_index,
+         new_file,
+         new_fid,
+         now_ms,
+         cursor,
+         live_count,
+         published?
+       ) do
+    case CompoundMemberIndex.scan_page(
+           member_index,
+           state,
+           prefix,
+           cursor,
+           @promoted_compaction_page_size,
+           nil
+         ) do
+      {:ok, {next_cursor, members}} ->
+        with {:ok, live_entries} <-
+               collect_promoted_live_page(state, dedicated_path, prefix, members, now_ms),
+             :ok <- maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries),
+             {:ok, wrote?} <-
+               append_promoted_compaction_page(state, new_file, new_fid, live_entries) do
+          live_count = live_count + length(live_entries)
+          published? = published? or wrote?
+
+          if next_cursor == 0 do
+            {:ok, live_count, published?}
+          else
+            compact_promoted_page(
+              state,
+              redis_key,
+              dedicated_path,
+              prefix,
+              member_index,
+              new_file,
+              new_fid,
+              now_ms,
+              next_cursor,
+              live_count,
+              published?
+            )
+          end
+        else
+          {:error, {:cold_read_failed, _errors} = reason} ->
+            {:error, :collect_live_entries, reason, published?}
+
+          {:error, reason} ->
+            {:error, :append, reason, published?}
+        end
+
+      :unavailable ->
+        {:error, :member_catalog, :compound_member_index_unavailable, published?}
+
+      {:error, reason} ->
+        {:error, :member_catalog, reason, published?}
+    end
+  end
+
+  defp append_promoted_compaction_page(_state, _new_file, _new_fid, []),
+    do: {:ok, false}
+
+  defp append_promoted_compaction_page(state, new_file, new_fid, live_entries) do
+    batch =
+      Enum.map(live_entries, fn {key, value, expire_at_ms, _old_row} ->
+        {key, value, expire_at_ms}
+      end)
+
+    case NIF.v2_append_batch(new_file, batch) do
+      {:ok, results} when length(results) == length(live_entries) ->
+        publish_promoted_compaction_page(state, new_fid, live_entries, results)
+        {:ok, true}
+
+      {:ok, results} ->
+        {:error, {:append_result_mismatch, length(live_entries), length(results)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp publish_promoted_compaction_page(state, new_fid, live_entries, results) do
+    ref = Support.keydir_binary_ref(state)
+    hot_cache_threshold = ShardETS.hot_cache_threshold(state)
+
+    live_entries
+    |> Enum.zip(results)
+    |> Enum.each(fn
+      {{key, value, expire_at_ms, old_row}, {offset, value_size}} ->
+        case :ets.lookup(state.keydir, key) do
+          [^old_row] ->
+            value_for_ets = ShardETS.value_for_ets(value, hot_cache_threshold)
             Support.track_binary_insert(ref, state, key, value_for_ets)
+            old_lfu = elem(old_row, 3)
 
             :ets.insert(
               state.keydir,
-              {key, value_for_ets, expire_at_ms, LFU.initial(), new_fid, offset, value_size}
-            )
-          end)
-
-          with :ok <- remove_dedicated_logs_before(state, dedicated_path, new_fid),
-               :ok <- dedicated_fsync_dir(state, dedicated_path, :remove_old_logs) do
-            Logger.debug(
-              "Shard #{state.index}: compacted dedicated #{inspect(redis_key)} " <>
-                "(#{length(live_entries)} live entries, fid #{old_fid} -> #{new_fid})"
+              {key, value_for_ets, expire_at_ms, old_lfu, new_fid, offset, value_size}
             )
 
-            :telemetry.execute(
-              [:ferricstore, :dedicated, :compaction],
-              %{live_entries: length(live_entries), old_fid: old_fid, new_fid: new_fid},
-              %{shard_index: state.index, redis_key: redis_key}
-            )
+          _changed_or_deleted ->
+            :ok
+        end
+    end)
 
-            {:ok, state}
-          else
-            {:error, reason} ->
-              fail_dedicated_compaction(
-                state,
-                redis_key,
-                dedicated_path,
-                :remove_old_logs,
-                reason
-              )
-          end
+    :ok
+  end
 
-        {:ok, results} ->
-          Logger.error(
-            "Shard #{state.index}: dedicated compaction append result mismatch: expected #{length(live_entries)}, got #{length(results)}"
-          )
+  defp log_promoted_compaction_page_failure(state, :append, reason) do
+    Logger.error("Shard #{state.index}: dedicated compaction write failed: #{inspect(reason)}")
+  end
 
-          rollback_new_active_file(state, dedicated_path, new_file)
-
-          fail_dedicated_compaction(
-            state,
-            redis_key,
-            dedicated_path,
-            :append,
-            {:append_result_mismatch, length(live_entries), length(results)}
-          )
-
-        {:error, reason} ->
-          Logger.error(
-            "Shard #{state.index}: dedicated compaction write failed: #{inspect(reason)}"
-          )
-
-          # Roll back the `touch!(new_file)` on write error. Fsync
-          # so the rollback survives a subsequent crash.
-          rollback_new_active_file(state, dedicated_path, new_file)
-          fail_dedicated_compaction(state, redis_key, dedicated_path, :append, reason)
-      end
-    end
+  defp log_promoted_compaction_page_failure(state, phase, reason) do
+    Logger.error("Shard #{state.index}: dedicated compaction #{phase} failed: #{inspect(reason)}")
   end
 
   defp fail_dedicated_compaction(state, redis_key, dedicated_path, phase, reason) do
@@ -685,46 +833,69 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     mk = Promotion.marker_key(redis_key)
 
     case :ets.lookup(state.keydir, mk) do
-      [{^mk, "hash", _, _, _, _, _}] -> "H:" <> redis_key <> <<0>>
-      [{^mk, "set", _, _, _, _, _}] -> "S:" <> redis_key <> <<0>>
-      [{^mk, "zset", _, _, _, _, _}] -> "Z:" <> redis_key <> <<0>>
+      [{^mk, "hash", _, _, _, _, _}] -> CompoundKey.hash_prefix(redis_key)
+      [{^mk, "set", _, _, _, _, _}] -> CompoundKey.set_prefix(redis_key)
+      [{^mk, "zset", _, _, _, _, _}] -> CompoundKey.zset_prefix(redis_key)
       _ -> nil
     end
   end
 
-  defp collect_promoted_live_entries(state, dedicated_path, prefix, now) do
+  defp collect_promoted_live_page(state, dedicated_path, prefix, members, now) do
+    keys = Enum.map(members, &(prefix <> &1))
+    collect_promoted_exact_page(state, dedicated_path, keys, now)
+  end
+
+  defp collect_promoted_exact_page(state, dedicated_path, keys, now) do
     {tokens, cold_entries, _cold_count} =
-      :ets.foldl(
-        fn {key, value, exp, _lfu, fid, off, vsize}, {tokens, cold_entries, cold_count} ->
-          cond do
-            not is_binary(key) or not String.starts_with?(key, prefix) ->
+      Enum.reduce(
+        keys,
+        {[], [], 0},
+        fn key, {tokens, cold_entries, cold_count} ->
+          case :ets.lookup(state.keydir, key) do
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize}]
+            when exp != 0 and exp <= now ->
               {tokens, cold_entries, cold_count}
 
-            exp != 0 and exp <= now ->
-              {tokens, cold_entries, cold_count}
+            [{^key, value, exp, _lfu, _fid, _off, _vsize} = row] when is_binary(value) ->
+              {[{:value, {key, value, exp, row}} | tokens], cold_entries, cold_count}
 
-            value != nil ->
-              {[{:value, {key, value, exp}} | tokens], cold_entries, cold_count}
-
-            valid_promoted_cold_location?(fid, off, vsize) ->
+            [{^key, nil, exp, _lfu, fid, off, vsize} = row]
+            when is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 and
+                   is_integer(vsize) and vsize >= 0 ->
               file_path = dedicated_file_path(dedicated_path, fid)
-              entry = {key, exp, file_path, off}
+              entry = {key, exp, file_path, off, row}
               {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
 
-            true ->
+            [] ->
               {tokens, cold_entries, cold_count}
+
+            [invalid] ->
+              {[{:error, {:invalid_promoted_keydir_entry, invalid}} | tokens], cold_entries,
+               cold_count}
           end
-        end,
-        {[], [], 0},
-        state.keydir
+        end
       )
 
+    case Enum.find(tokens, &match?({:error, _reason}, &1)) do
+      {:error, reason} ->
+        {:error, reason}
+
+      nil ->
+        materialize_promoted_live_page(tokens, cold_entries)
+    end
+  rescue
+    ArgumentError -> {:error, :compound_keydir_unavailable}
+  end
+
+  defp materialize_promoted_live_page(tokens, cold_entries) do
     case read_promoted_cold_batch(Enum.reverse(cold_entries)) do
       {:ok, cold_values} ->
         cold_values = List.to_tuple(cold_values)
 
         live_entries =
-          Enum.flat_map(tokens, fn
+          tokens
+          |> Enum.reverse()
+          |> Enum.flat_map(fn
             {:value, entry} ->
               [entry]
 
@@ -742,7 +913,8 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   defp read_promoted_cold_batch([]), do: {:ok, []}
 
   defp read_promoted_cold_batch(entries) do
-    locations = Enum.map(entries, fn {key, _exp, file_path, off} -> {file_path, off, key} end)
+    locations =
+      Enum.map(entries, fn {key, _exp, file_path, off, _row} -> {file_path, off, key} end)
 
     values =
       case Ferricstore.Store.ColdRead.pread_batch_keyed(locations, @cold_batch_read_timeout_ms) do
@@ -761,16 +933,17 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     {live_entries, errors} =
       Enum.zip(entries, values)
       |> Enum.reduce({[], []}, fn
-        {{key, exp, _file_path, _off}, value}, {live_entries, errors} when is_binary(value) ->
-          {[{key, value, exp} | live_entries], errors}
+        {{key, exp, _file_path, _off, row}, value}, {live_entries, errors}
+        when is_binary(value) ->
+          {[{key, value, exp, row} | live_entries], errors}
 
-        {{key, _exp, file_path, off}, {:error, reason}}, {live_entries, errors} ->
+        {{key, _exp, file_path, off, _row}, {:error, reason}}, {live_entries, errors} ->
           {live_entries, [{key, file_path, off, reason} | errors]}
 
-        {{key, _exp, file_path, off}, nil}, {live_entries, errors} ->
+        {{key, _exp, file_path, off, _row}, nil}, {live_entries, errors} ->
           {live_entries, [{key, file_path, off, :missing_live_cold_entry} | errors]}
 
-        {{key, _exp, file_path, off}, value}, {live_entries, errors} ->
+        {{key, _exp, file_path, off, _row}, value}, {live_entries, errors} ->
           {live_entries, [{key, file_path, off, {:unexpected_cold_value, value}} | errors]}
       end)
 
@@ -780,21 +953,25 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     end
   end
 
+  defp maybe_run_promoted_compaction_after_collect_hook(_redis_key, []), do: :ok
+
   defp maybe_run_promoted_compaction_after_collect_hook(redis_key, live_entries) do
     case Process.get(:ferricstore_promoted_compaction_after_collect_hook) do
       fun when is_function(fun, 2) -> fun.(redis_key, live_entries)
       _ -> :ok
     end
+
+    :ok
   end
 
   defp emit_promoted_cold_read_errors(entries, values) do
     entries
     |> Enum.zip(values)
     |> Enum.reduce(%{}, fn
-      {{_key, _exp, file_path, _off}, {:error, raw_reason}}, acc ->
+      {{_key, _exp, file_path, _off, _row}, {:error, raw_reason}}, acc ->
         Map.update(acc, {file_path, raw_reason}, 1, &(&1 + 1))
 
-      {{_key, _exp, file_path, _off}, nil}, acc ->
+      {{_key, _exp, file_path, _off, _row}, nil}, acc ->
         Map.update(acc, {file_path, :missing_live_cold_entry}, 1, &(&1 + 1))
 
       {_entry, _value}, acc ->
@@ -805,11 +982,6 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
     end)
   end
 
-  defp valid_promoted_cold_location?(fid, off, vsize) do
-    is_integer(fid) and fid >= 0 and is_integer(off) and off >= 0 and is_integer(vsize) and
-      vsize >= 0
-  end
-
   @spec maybe_promote(map(), binary(), binary()) :: map()
   @doc false
   def maybe_promote(state, redis_key, compound_key) do
@@ -817,13 +989,6 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
 
     threshold = Promotion.threshold()
 
-    # Promotion is a one-time structural migration per collection. Keeping it
-    # inline preserves the current crash-safe semantics, but it can add a cold
-    # create latency spike when a large hash/set/zset first crosses the
-    # threshold. If that p99 path becomes important, move promotion to a
-    # background job that keeps reads on shared compound keys until the dedicated
-    # copy and marker are fully durable. Do not prioritize that over steady-state
-    # score-index work for long-lived hot sorted sets.
     if threshold == 0 or Map.has_key?(state.promoted_instances, redis_key) do
       state
     else
@@ -832,39 +997,49 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
           state
 
         {type, prefix} ->
-          count = ShardETS.prefix_count_entries(state, prefix)
+          if promotion_type_metadata_ready?(state, redis_key, type) do
+            count = ShardETS.prefix_count_entries(state, prefix)
 
-          if count > threshold do
-            state = ShardFlush.await_in_flight(state)
-            state = ShardFlush.flush_pending_sync(state)
-
-            case Promotion.promote_collection!(
-                   type,
-                   redis_key,
-                   state.shard_data_path,
-                   state.keydir,
-                   state.data_dir,
-                   state.index,
-                   state.instance_ctx
-                 ) do
-              {:ok, dedicated_store} ->
-                total_bytes = promoted_dir_size(dedicated_store)
-
-                new_promoted =
-                  Map.put(state.promoted_instances, redis_key, %{
-                    path: dedicated_store,
-                    writes: 0,
-                    total_bytes: total_bytes,
-                    dead_bytes: 0,
-                    last_compacted_at: nil
-                  })
-
-                %{state | promoted_instances: new_promoted}
+            if is_integer(count) and count > threshold do
+              start_compound_promotion(state, redis_key, type)
+            else
+              state
             end
           else
             state
           end
       end
+    end
+  end
+
+  defp promotion_type_metadata_ready?(state, redis_key, type) do
+    type_key = CompoundKey.type_key(redis_key)
+    expected_type = CompoundKey.encode_type(type)
+    now = HLC.now_ms()
+
+    case :ets.lookup(state.keydir, type_key) do
+      [{^type_key, value, expire_at_ms, _lfu, _fid, _offset, _value_size}]
+      when (expire_at_ms == 0 or expire_at_ms > now) and
+             (value == nil or value == expected_type) ->
+        true
+
+      _missing_expired_or_mismatched ->
+        false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  defp start_compound_promotion(state, redis_key, type) do
+    pending = Map.get(state, :compound_promotion_pending, %{})
+    worker = Map.get(state, :compound_promotion_worker)
+
+    if Map.has_key?(pending, redis_key) or
+         match?(%{redis_key: ^redis_key}, worker) do
+      state
+    else
+      send(self(), {:start_compound_promotion, redis_key, type})
+      Map.put(state, :compound_promotion_pending, Map.put(pending, redis_key, type))
     end
   end
 

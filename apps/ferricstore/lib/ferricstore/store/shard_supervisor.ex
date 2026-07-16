@@ -53,6 +53,10 @@ defmodule Ferricstore.Store.ShardSupervisor do
             id: :"replay_safe_index_writer_#{i}"
           ),
           Supervisor.child_spec(
+            {Ferricstore.Store.HintBuilder, [index: i, instance_ctx: instance_ctx]},
+            id: :"hint_builder_#{i}"
+          ),
+          Supervisor.child_spec(
             {Ferricstore.Store.Shard, shard_opts},
             id: :"shard_#{i}"
           ),

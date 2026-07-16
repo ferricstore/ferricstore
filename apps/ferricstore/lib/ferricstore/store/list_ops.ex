@@ -13,17 +13,30 @@ defmodule Ferricstore.Store.ListOps do
 
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.ReadResult
+  alias Ferricstore.TermCodec
 
   # Integer positions with large gaps. LPUSH/RPUSH decrement/increment by @position_step.
   # LINSERT picks the integer midpoint. When no room (adjacent positions differ by 1),
   # rebalance redistributes all positions with even spacing.
   @initial_position 0
   @position_step 1_000_000_000
+  @max_encoded_meta_bytes 128
+
+  @doc false
+  @spec read_operation?(term()) :: boolean()
+  def read_operation?(:llen), do: true
+  def read_operation?({:lrange, _start, _stop}), do: true
+  def read_operation?({:lindex, _index}), do: true
+  def read_operation?({:lpos, _element, _rank, _count, _maxlen}), do: true
+  def read_operation?(_operation), do: false
 
   @spec execute(binary(), map(), term()) :: term()
   def execute(key, store, operation) do
-    meta = read_meta(key, store)
-    do_execute(key, store, meta, operation)
+    case read_meta(key, store) do
+      {:error, _} = error -> error
+      meta -> do_execute(key, store, meta, operation)
+    end
   end
 
   @spec execute_lmove(binary(), binary(), map(), :left | :right, :left | :right) ::
@@ -39,65 +52,122 @@ defmodule Ferricstore.Store.ListOps do
         nil
 
       {_len, _left, _right} = src_meta ->
-        sorted = sorted_elements(src_key, store)
+        with {:ok, sorted} <- sorted_elements(src_key, store),
+             dst_meta when not is_tuple(dst_meta) or tuple_size(dst_meta) == 3 <-
+               lmove_destination_meta(src_key, dst_key, src_meta, store) do
+          if sorted == [] do
+            nil
+          else
+            {pos, element} =
+              case from_dir do
+                :left -> hd(sorted)
+                :right -> List.last(sorted)
+              end
 
-        if sorted == [] do
-          nil
-        else
-          {pos, element} =
-            case from_dir do
-              :left -> hd(sorted)
-              :right -> List.last(sorted)
-            end
+            remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
 
-          remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
-
-          with :ok <- delete_elements(src_key, store, [{pos, element}]) do
-            case update_or_delete_meta(src_key, store, length(remaining), remaining) do
-              :ok ->
-                case push_moved_element(
-                       dst_key,
+            if src_key == dst_key and (from_dir == to_dir or remaining == []) do
+              element
+            else
+              with :ok <-
+                     remove_lmove_source(
+                       src_key,
                        store,
+                       pos,
                        element,
-                       read_meta(dst_key, store),
-                       to_dir
+                       src_meta,
+                       remaining
                      ) do
+                effective_dst_meta =
+                  if src_key == dst_key, do: lmove_meta_from_elements(remaining), else: dst_meta
+
+                case push_moved_element(dst_key, store, element, effective_dst_meta, to_dir) do
                   :ok ->
                     element
 
                   {:error, _} = error ->
-                    rollback_lmove_source(src_key, store, pos, element, src_meta)
-                    error
+                    rollback_lmove_source_result(
+                      src_key,
+                      store,
+                      pos,
+                      element,
+                      src_meta,
+                      error
+                    )
                 end
-
-              {:error, _} = error ->
-                rollback_lmove_source(src_key, store, pos, element, src_meta)
-                error
+              end
             end
           end
         end
+
+      {:error, _} = error ->
+        error
     end
   end
 
-  defp rollback_lmove_source(src_key, store, pos, element, src_meta) do
-    _ =
-      store
-      |> Ops.compound_put(src_key, CompoundKey.list_element(src_key, pos), element, 0)
-      |> write_result()
+  defp lmove_destination_meta(src_key, src_key, src_meta, _store), do: src_meta
+  defp lmove_destination_meta(_src_key, dst_key, _src_meta, store), do: read_meta(dst_key, store)
 
-    _ = write_meta(src_key, store, src_meta)
-    :ok
+  defp remove_lmove_source(src_key, store, pos, _element, _src_meta, []) do
+    compound_keys = [
+      CompoundKey.list_element(src_key, pos),
+      CompoundKey.list_meta_key(src_key)
+    ]
+
+    store
+    |> Ops.compound_batch_delete(src_key, compound_keys)
+    |> write_result()
+  end
+
+  defp remove_lmove_source(src_key, store, pos, element, src_meta, remaining) do
+    with :ok <- delete_elements(src_key, store, [{pos, element}]) do
+      case write_meta(src_key, store, lmove_meta_from_elements(remaining)) do
+        :ok ->
+          :ok
+
+        {:error, _} = error ->
+          rollback_lmove_source_result(src_key, store, pos, element, src_meta, error)
+      end
+    end
+  end
+
+  defp lmove_meta_from_elements([]), do: nil
+
+  defp lmove_meta_from_elements(elements) do
+    {min_pos, _value} = hd(elements)
+    {max_pos, _value} = List.last(elements)
+    {length(elements), min_pos - @position_step, max_pos + @position_step}
+  end
+
+  defp rollback_lmove_source(src_key, store, pos, element, src_meta) do
+    entries = [
+      {CompoundKey.list_element(src_key, pos), element, 0},
+      {CompoundKey.list_meta_key(src_key), encode_meta(src_meta), 0}
+    ]
+
+    store
+    |> Ops.compound_batch_put(src_key, entries)
+    |> write_result()
+  end
+
+  defp rollback_lmove_source_result(src_key, store, pos, element, src_meta, write_error) do
+    case rollback_lmove_source(src_key, store, pos, element, src_meta) do
+      :ok ->
+        write_error
+
+      {:error, _} = rollback_error ->
+        {:error, {:lmove_source_rollback_failed, write_error, rollback_error}}
+    end
   end
 
   defp push_moved_element(dst_key, store, element, nil, _to_dir) do
     new_pos = @initial_position
 
-    put_one_element_and_write_meta(
+    put_moved_element_and_meta(
       dst_key,
       store,
       {new_pos, element},
-      {1, new_pos - @position_step, new_pos + @position_step},
-      :ok
+      {1, new_pos - @position_step, new_pos + @position_step}
     )
   end
 
@@ -111,13 +181,23 @@ defmodule Ferricstore.Store.ListOps do
     new_left = if to_dir == :left, do: new_pos - @position_step, else: dst_left
     new_right = if to_dir == :right, do: new_pos + @position_step, else: dst_right
 
-    put_one_element_and_write_meta(
+    put_moved_element_and_meta(
       dst_key,
       store,
       {new_pos, element},
-      {dst_len + 1, new_left, new_right},
-      :ok
+      {dst_len + 1, new_left, new_right}
     )
+  end
+
+  defp put_moved_element_and_meta(key, store, {pos, element}, meta) do
+    entries = [
+      {CompoundKey.list_element(key, pos), element, 0},
+      {CompoundKey.list_meta_key(key), encode_meta(meta), 0}
+    ]
+
+    store
+    |> Ops.compound_batch_put(key, entries)
+    |> write_result()
   end
 
   @doc false
@@ -125,18 +205,28 @@ defmodule Ferricstore.Store.ListOps do
     meta_key = CompoundKey.list_meta_key(key)
 
     case Ops.compound_get(store, key, meta_key) do
-      nil -> nil
-      binary -> decode_meta(binary)
+      nil ->
+        nil
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      binary ->
+        case decode_meta(binary) do
+          nil -> {:error, "ERR storage read failed"}
+          meta -> meta
+        end
     end
   end
 
   @doc false
-  def encode_meta(meta), do: :erlang.term_to_binary(meta)
+  def encode_meta(meta), do: TermCodec.encode(meta)
 
   @doc false
-  def decode_meta(binary) when is_binary(binary) do
-    case :erlang.binary_to_term(binary, [:safe]) do
-      {len, left_pos, right_pos}
+  def decode_meta(binary)
+      when is_binary(binary) and byte_size(binary) <= @max_encoded_meta_bytes do
+    case TermCodec.decode(binary) do
+      {:ok, {len, left_pos, right_pos}}
       when is_integer(len) and len >= 0 and is_integer(left_pos) and is_integer(right_pos) ->
         {len, left_pos, right_pos}
 
@@ -162,12 +252,60 @@ defmodule Ferricstore.Store.ListOps do
   defp sorted_elements(key, store) do
     prefix = CompoundKey.list_prefix(key)
 
-    Ops.compound_scan(store, key, prefix)
-    |> Enum.map(fn {encoded_pos, value} -> {CompoundKey.decode_position(encoded_pos), value} end)
+    case Ops.compound_scan(store, key, prefix) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      pairs when is_list(pairs) ->
+        decode_position_pairs(pairs)
+    end
   end
 
   defp ordered_values(key, store) do
-    sorted_elements(key, store) |> Enum.map(fn {_pos, value} -> value end)
+    with {:ok, sorted} <- sorted_elements(key, store) do
+      {:ok, Enum.map(sorted, fn {_pos, value} -> value end)}
+    end
+  end
+
+  defp sorted_slice(key, store, start, count, total) do
+    prefix = CompoundKey.list_prefix(key)
+
+    case Ops.compound_scan_slice(store, key, prefix, start, count, total) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      pairs when is_list(pairs) ->
+        decode_position_pairs(pairs)
+    end
+  end
+
+  defp decode_position_pairs(pairs) do
+    Enum.reduce_while(pairs, {:ok, []}, fn
+      {encoded_pos, value}, {:ok, decoded} ->
+        case CompoundKey.decode_position_safe(encoded_pos) do
+          {:ok, position} -> {:cont, {:ok, [{position, value} | decoded]}}
+          :error -> {:halt, corrupt_position_error()}
+        end
+
+      _malformed_pair, _decoded ->
+        {:halt, corrupt_position_error()}
+    end)
+    |> case do
+      {:ok, decoded} -> {:ok, Enum.reverse(decoded)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp corrupt_position_error do
+    :corrupt_list_position
+    |> ReadResult.failure()
+    |> ReadResult.command_error()
+  end
+
+  defp ordered_slice(key, store, start, count, total) do
+    with {:ok, sorted} <- sorted_slice(key, store, start, count, total) do
+      {:ok, Enum.map(sorted, fn {_pos, value} -> value end)}
+    end
   end
 
   defp single_boundary_values(key, store, left_pos) do
@@ -178,8 +316,14 @@ defmodule Ferricstore.Store.ListOps do
     compound_key = CompoundKey.list_element(key, pos)
 
     case Ops.compound_get(store, key, compound_key) do
-      nil -> ordered_values(key, store)
-      value -> [value]
+      nil ->
+        ordered_values(key, store)
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      value ->
+        {:ok, [value]}
     end
   end
 
@@ -187,41 +331,12 @@ defmodule Ferricstore.Store.ListOps do
   defp pos_to_int(pos) when is_integer(pos), do: pos
   defp pos_to_int(pos) when is_float(pos), do: round(pos * 1_000_000_000)
 
-  # Rebalances all positions with even spacing. Called when LINSERT runs out
-  # of room between two adjacent positions. Deletes old compound keys and
-  # re-inserts with evenly spaced integer positions.
-  defp rebalance_positions(key, store, sorted) do
-    count = length(sorted)
+  # Produces evenly spaced positions without mutating storage. The caller
+  # commits the rewrite and the inserted element in one mixed batch.
+  defp rebalance_positions(sorted) do
     values = Enum.map(sorted, fn {_pos, val} -> val end)
 
-    new_sorted =
-      Enum.with_index(values)
-      |> Enum.map(fn {val, idx} ->
-        new_pos = idx * @position_step
-        {new_pos, val}
-      end)
-
-    with :ok <- delete_elements(key, store, sorted) do
-      case put_elements(key, store, new_sorted) do
-        :ok ->
-          case write_rebalanced_meta(key, store, count, new_sorted) do
-            :ok ->
-              {:ok, new_sorted}
-
-            {:error, _} = error ->
-              rollback_rebalanced_elements(key, store, new_sorted, sorted, error)
-          end
-
-        {:error, _} = error ->
-          rollback_deleted_elements(key, store, sorted, error)
-      end
-    end
-  end
-
-  defp write_rebalanced_meta(key, store, count, new_sorted) do
-    {min_pos, _} = hd(new_sorted)
-    {max_pos, _} = List.last(new_sorted)
-    write_meta(key, store, {count, min_pos - @position_step, max_pos + @position_step})
+    Enum.with_index(values, fn val, idx -> {idx * @position_step, val} end)
   end
 
   defp update_meta_from_remaining(key, store, new_len, remaining) do
@@ -277,8 +392,8 @@ defmodule Ferricstore.Store.ListOps do
     pop_single_boundary(key, store, len, left_pos + @position_step, :left, {left_pos, right_pos})
   end
 
-  defp do_execute(key, store, {len, _, _}, {:lpop, count}) do
-    pop_left_by_scan(key, store, len, count)
+  defp do_execute(key, store, {len, left_pos, right_pos}, {:lpop, count}) do
+    pop_left_by_scan(key, store, len, count, {left_pos, right_pos})
   end
 
   # RPOP
@@ -297,40 +412,47 @@ defmodule Ferricstore.Store.ListOps do
     )
   end
 
-  defp do_execute(key, store, {len, _, _}, {:rpop, count}) do
-    pop_right_by_scan(key, store, len, count)
+  defp do_execute(key, store, {len, left_pos, right_pos}, {:rpop, count}) do
+    pop_right_by_scan(key, store, len, count, {left_pos, right_pos})
   end
 
   # LRANGE
   defp do_execute(_key, _store, nil, {:lrange, _, _}), do: []
 
   defp do_execute(key, store, {len, left_pos, _right_pos}, {:lrange, 0, 0}) when len > 0 do
-    single_boundary_values(key, store, left_pos)
+    with {:ok, values} <- single_boundary_values(key, store, left_pos), do: values
   end
 
   defp do_execute(key, store, {len, _left_pos, right_pos}, {:lrange, -1, -1}) when len > 0 do
-    single_position_values(key, store, right_pos - @position_step)
+    with {:ok, values} <- single_position_values(key, store, right_pos - @position_step),
+         do: values
   end
 
   defp do_execute(key, store, {1, left_pos, _right_pos}, {:lrange, start, stop}) do
-    ns = normalize_index(start, 1)
-    ne = normalize_index(stop, 1)
+    ns = normalize_range_start(start, 1)
+    ne = normalize_range_stop(stop, 1)
 
     cond do
       ns > ne -> []
       ns >= 1 -> []
-      true -> single_boundary_values(key, store, left_pos)
+      true -> with {:ok, values} <- single_boundary_values(key, store, left_pos), do: values
     end
   end
 
   defp do_execute(key, store, {len, _, _}, {:lrange, start, stop}) do
-    ns = normalize_index(start, len)
-    ne = normalize_index(stop, len)
+    ns = normalize_range_start(start, len)
+    ne = normalize_range_stop(stop, len)
 
     cond do
-      ns > ne -> []
-      ns >= len -> []
-      true -> ordered_values(key, store) |> Enum.slice(ns..ne//1)
+      ns > ne ->
+        []
+
+      ns >= len ->
+        []
+
+      true ->
+        count = min(ne, len - 1) - ns + 1
+        with {:ok, values} <- ordered_slice(key, store, ns, count, len), do: values
     end
   end
 
@@ -345,8 +467,13 @@ defmodule Ferricstore.Store.ListOps do
     if index < 0 and len + index < 0 do
       nil
     else
-      norm = normalize_index(index, len)
-      if norm >= 0 and norm < len, do: ordered_values(key, store) |> Enum.at(norm), else: nil
+      norm = normalize_point_index(index, len)
+
+      if norm >= 0 and norm < len do
+        with {:ok, values} <- ordered_slice(key, store, norm, 1, len), do: List.first(values)
+      else
+        nil
+      end
     end
   end
 
@@ -354,14 +481,14 @@ defmodule Ferricstore.Store.ListOps do
   defp do_execute(_key, _store, nil, {:lset, _, _}), do: {:error, "ERR no such key"}
 
   defp do_execute(key, store, {len, _, _}, {:lset, index, element}) do
-    norm = normalize_index(index, len)
+    norm = normalize_point_index(index, len)
 
     if norm >= 0 and norm < len do
-      {old_pos, _} = sorted_elements(key, store) |> Enum.at(norm)
-
-      store
-      |> Ops.compound_put(key, CompoundKey.list_element(key, old_pos), element, 0)
-      |> write_result()
+      with {:ok, [{old_pos, _old_value}]} <- sorted_slice(key, store, norm, 1, len) do
+        store
+        |> Ops.compound_put(key, CompoundKey.list_element(key, old_pos), element, 0)
+        |> write_result()
+      end
     else
       {:error, "ERR index out of range"}
     end
@@ -371,28 +498,29 @@ defmodule Ferricstore.Store.ListOps do
   defp do_execute(_key, _store, nil, {:lrem, _, _}), do: 0
 
   defp do_execute(key, store, {len, _, _}, {:lrem, count, element}) do
-    sorted = sorted_elements(key, store)
-    {to_remove, remaining, removed_count} = select_removals(sorted, count, element)
+    with {:ok, sorted} <- sorted_elements(key, store) do
+      {to_remove, remaining, removed_count} = select_removals(sorted, count, element)
 
-    cond do
-      removed_count == 0 ->
-        0
+      cond do
+        removed_count == 0 ->
+          0
 
-      remaining == [] ->
-        with :ok <-
-               delete_elements_and_update_meta(key, store, to_remove, fn ->
-                 delete_meta(key, store)
-               end) do
-          removed_count
-        end
+        remaining == [] ->
+          with :ok <-
+                 delete_elements_and_update_meta(key, store, to_remove, fn ->
+                   delete_meta(key, store)
+                 end) do
+            removed_count
+          end
 
-      true ->
-        with :ok <-
-               delete_elements_and_update_meta(key, store, to_remove, fn ->
-                 update_meta_from_remaining(key, store, len - removed_count, remaining)
-               end) do
-          removed_count
-        end
+        true ->
+          with :ok <-
+                 delete_elements_and_update_meta(key, store, to_remove, fn ->
+                   update_meta_from_remaining(key, store, len - removed_count, remaining)
+                 end) do
+            removed_count
+          end
+      end
     end
   end
 
@@ -400,64 +528,75 @@ defmodule Ferricstore.Store.ListOps do
   defp do_execute(_key, _store, nil, {:ltrim, _, _}), do: :ok
 
   defp do_execute(key, store, {len, _, _}, {:ltrim, start, stop}) do
-    ns = normalize_index(start, len)
-    ne = normalize_index(stop, len)
-    sorted = sorted_elements(key, store)
+    ns = normalize_range_start(start, len)
+    ne = normalize_range_stop(stop, len)
 
-    {to_keep, to_delete} =
-      cond do
-        ns > ne ->
-          {[], sorted}
+    with {:ok, sorted} <- sorted_elements(key, store) do
+      {to_keep, to_delete} =
+        cond do
+          ns > ne ->
+            {[], sorted}
 
-        ns >= len ->
-          {[], sorted}
+          ns >= len ->
+            {[], sorted}
 
-        true ->
-          kept = Enum.slice(sorted, ns..ne//1)
-          ks = MapSet.new(kept, fn {p, _} -> p end)
-          {kept, Enum.reject(sorted, fn {p, _} -> MapSet.member?(ks, p) end)}
-      end
+          true ->
+            kept = Enum.slice(sorted, ns..ne//1)
+            ks = MapSet.new(kept, fn {p, _} -> p end)
+            {kept, Enum.reject(sorted, fn {p, _} -> MapSet.member?(ks, p) end)}
+        end
 
-    delete_elements_and_update_meta(key, store, to_delete, fn ->
-      if to_keep == [] do
-        delete_meta(key, store)
-      else
-        {mp, _} = hd(to_keep)
-        {xp, _} = List.last(to_keep)
-        write_meta(key, store, {length(to_keep), mp - @position_step, xp + @position_step})
-      end
-    end)
+      delete_elements_and_update_meta(key, store, to_delete, fn ->
+        if to_keep == [] do
+          delete_meta(key, store)
+        else
+          {mp, _} = hd(to_keep)
+          {xp, _} = List.last(to_keep)
+          write_meta(key, store, {length(to_keep), mp - @position_step, xp + @position_step})
+        end
+      end)
+    end
   end
 
   # LPOS
   defp do_execute(_key, _store, nil, {:lpos, _, _, _, _}), do: nil
 
-  defp do_execute(key, store, {_, _, _}, {:lpos, element, rank, count, maxlen}) do
-    find_positions(ordered_values(key, store), element, rank, count, maxlen)
+  defp do_execute(key, store, {len, _, _}, {:lpos, element, rank, count, maxlen}) do
+    scan_count = if maxlen == 0, do: len, else: min(maxlen, len)
+    start = if rank < 0, do: len - scan_count, else: 0
+
+    with {:ok, values} <- ordered_slice(key, store, start, scan_count, len) do
+      find_positions(values, element, rank, count, start)
+    end
   end
 
   # LINSERT
   defp do_execute(_key, _store, nil, {:linsert, _, _, _}), do: 0
 
   defp do_execute(key, store, {len, left_pos, right_pos}, {:linsert, direction, pivot, element}) do
-    sorted = sorted_elements(key, store)
-    values = Enum.map(sorted, fn {_, val} -> val end)
+    with {:ok, sorted} <- sorted_elements(key, store) do
+      values = Enum.map(sorted, fn {_, val} -> val end)
 
-    case Enum.find_index(values, &(&1 == pivot)) do
-      nil ->
-        -1
+      case Enum.find_index(values, &(&1 == pivot)) do
+        nil ->
+          -1
 
-      idx ->
-        with {:ok, new_pos} <- linsert_position(key, store, sorted, direction, idx) do
-          put_one_element_and_write_meta(
-            key,
-            store,
-            {new_pos, element},
-            {len + 1, min(left_pos, new_pos - @position_step),
-             max(right_pos, new_pos + @position_step)},
-            len + 1
-          )
-        end
+        idx ->
+          case linsert_position(sorted, direction, idx) do
+            {:ok, new_pos} ->
+              put_one_element_and_write_meta(
+                key,
+                store,
+                {new_pos, element},
+                {len + 1, min(left_pos, new_pos - @position_step),
+                 max(right_pos, new_pos + @position_step)},
+                len + 1
+              )
+
+            {:rebalance, new_pos, rebalanced} ->
+              commit_rebalanced_insert(key, store, sorted, rebalanced, new_pos, element, len + 1)
+          end
+      end
     end
   end
 
@@ -469,24 +608,24 @@ defmodule Ferricstore.Store.ListOps do
   defp do_execute(_key, _store, {0, _, _}, {:pop_for_move, _}), do: nil
 
   defp do_execute(key, store, {len, _, _}, {:pop_for_move, dir}) do
-    sorted = sorted_elements(key, store)
+    with {:ok, sorted} <- sorted_elements(key, store) do
+      if sorted == [] do
+        nil
+      else
+        {pos, element} =
+          case dir do
+            :left -> hd(sorted)
+            :right -> List.last(sorted)
+          end
 
-    if sorted == [] do
-      nil
-    else
-      {pos, element} =
-        case dir do
-          :left -> hd(sorted)
-          :right -> List.last(sorted)
+        remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
+
+        with :ok <-
+               delete_elements_and_update_meta(key, store, [{pos, element}], fn ->
+                 update_or_delete_meta(key, store, len - 1, remaining)
+               end) do
+          element
         end
-
-      remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
-
-      with :ok <-
-             delete_elements_and_update_meta(key, store, [{pos, element}], fn ->
-               update_or_delete_meta(key, store, len - 1, remaining)
-             end) do
-        element
       end
     end
   end
@@ -508,9 +647,12 @@ defmodule Ferricstore.Store.ListOps do
     case Ops.compound_get(store, key, compound_key) do
       nil ->
         case direction do
-          :left -> pop_left_by_scan(key, store, len, 1)
-          :right -> pop_right_by_scan(key, store, len, 1)
+          :left -> pop_left_by_scan(key, store, len, 1, {left_pos, right_pos})
+          :right -> pop_right_by_scan(key, store, len, 1, {left_pos, right_pos})
         end
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
       value ->
         delete_result =
@@ -539,94 +681,111 @@ defmodule Ferricstore.Store.ListOps do
     write_meta(key, store, {len - 1, left_pos, pos})
   end
 
-  defp pop_left_by_scan(key, store, len, count) do
-    sorted = sorted_elements(key, store)
+  defp pop_left_by_scan(key, store, len, count, {_left_pos, right_pos}) do
+    actual_count = min(count, len)
 
-    if sorted == [] do
-      nil
-    else
-      actual_count = min(count, length(sorted))
-      {to_pop, remaining} = Enum.split(sorted, actual_count)
-
-      popped_values = Enum.map(to_pop, fn {_, val} -> val end)
+    with {:ok, to_pop} <- sorted_slice(key, store, 0, actual_count, len),
+         :ok <- validate_pop_window(to_pop, actual_count) do
+      {new_left, _value} = List.last(to_pop)
+      popped_values = Enum.map(to_pop, fn {_pos, value} -> value end)
 
       delete_result =
-        if remaining == [] do
+        if actual_count == len do
           delete_elements_and_meta(key, store, to_pop)
         else
           delete_elements_and_update_meta(key, store, to_pop, fn ->
-            update_meta_from_remaining(key, store, len - actual_count, remaining)
+            write_meta(key, store, {len - actual_count, new_left, right_pos})
           end)
         end
 
       with :ok <- delete_result do
-        case count do
-          1 -> List.first(popped_values)
-          _ -> popped_values
-        end
+        if count == 1, do: List.first(popped_values), else: popped_values
       end
     end
   end
 
-  defp pop_right_by_scan(key, store, len, count) do
-    sorted = sorted_elements(key, store)
+  defp pop_right_by_scan(key, store, len, count, {left_pos, _right_pos}) do
+    actual_count = min(count, len)
+    start = len - actual_count
 
-    if sorted == [] do
-      nil
-    else
-      total = length(sorted)
-      actual_count = min(count, total)
-      {remaining, to_pop} = Enum.split(sorted, total - actual_count)
-
-      popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
+    with {:ok, to_pop} <- sorted_slice(key, store, start, actual_count, len),
+         :ok <- validate_pop_window(to_pop, actual_count) do
+      {new_right, _value} = hd(to_pop)
+      popped_values = to_pop |> Enum.map(fn {_pos, value} -> value end) |> Enum.reverse()
 
       delete_result =
-        if remaining == [] do
+        if actual_count == len do
           delete_elements_and_meta(key, store, to_pop)
         else
           delete_elements_and_update_meta(key, store, to_pop, fn ->
-            update_meta_from_remaining(key, store, len - actual_count, remaining)
+            write_meta(key, store, {len - actual_count, left_pos, new_right})
           end)
         end
 
       with :ok <- delete_result do
-        case count do
-          1 -> List.first(popped_values)
-          _ -> popped_values
-        end
+        if count == 1, do: List.first(popped_values), else: popped_values
       end
     end
   end
 
-  defp linsert_position(_key, _store, sorted, :before, 0) do
+  defp validate_pop_window(window, expected_count) do
+    if length(window) == expected_count, do: :ok, else: {:error, "ERR storage read failed"}
+  end
+
+  defp linsert_position(sorted, :before, 0) do
     {:ok, pos_to_int(elem(hd(sorted), 0)) - @position_step}
   end
 
-  defp linsert_position(key, store, sorted, :before, idx) do
-    midpoint_or_rebalance(key, store, sorted, idx - 1, idx)
+  defp linsert_position(sorted, :before, idx) do
+    midpoint_or_rebalance(sorted, idx - 1, idx)
   end
 
-  defp linsert_position(_key, _store, sorted, :after, idx) when idx == length(sorted) - 1 do
+  defp linsert_position(sorted, :after, idx) when idx == length(sorted) - 1 do
     {:ok, pos_to_int(elem(List.last(sorted), 0)) + @position_step}
   end
 
-  defp linsert_position(key, store, sorted, :after, idx) do
-    midpoint_or_rebalance(key, store, sorted, idx, idx + 1)
+  defp linsert_position(sorted, :after, idx) do
+    midpoint_or_rebalance(sorted, idx, idx + 1)
   end
 
-  defp midpoint_or_rebalance(key, store, sorted, left_idx, right_idx) do
+  defp midpoint_or_rebalance(sorted, left_idx, right_idx) do
     a = pos_to_int(elem(Enum.at(sorted, left_idx), 0))
     b = pos_to_int(elem(Enum.at(sorted, right_idx), 0))
     mid = div(a + b, 2)
 
     if mid == a or mid == b do
-      with {:ok, rebalanced} <- rebalance_positions(key, store, sorted) do
-        a2 = pos_to_int(elem(Enum.at(rebalanced, left_idx), 0))
-        b2 = pos_to_int(elem(Enum.at(rebalanced, right_idx), 0))
-        {:ok, div(a2 + b2, 2)}
-      end
+      rebalanced = rebalance_positions(sorted)
+      a2 = pos_to_int(elem(Enum.at(rebalanced, left_idx), 0))
+      b2 = pos_to_int(elem(Enum.at(rebalanced, right_idx), 0))
+      {:rebalance, div(a2 + b2, 2), rebalanced}
     else
       {:ok, mid}
+    end
+  end
+
+  defp commit_rebalanced_insert(key, store, old_sorted, rebalanced, new_pos, element, new_len) do
+    {min_pos, _value} = hd(rebalanced)
+    {max_pos, _value} = List.last(rebalanced)
+
+    entries =
+      Enum.map(rebalanced, fn {pos, value} ->
+        {CompoundKey.list_element(key, pos), value, 0}
+      end) ++
+        [
+          {CompoundKey.list_element(key, new_pos), element, 0},
+          {CompoundKey.list_meta_key(key),
+           encode_meta(
+             {new_len, min(min_pos, new_pos) - @position_step,
+              max(max_pos, new_pos) + @position_step}
+           ), 0}
+        ]
+
+    compound_keys =
+      Enum.map(old_sorted, fn {pos, _value} -> CompoundKey.list_element(key, pos) end)
+
+    case Ops.compound_batch_mutate(store, key, compound_keys, entries) |> write_result() do
+      :ok -> new_len
+      {:error, _reason} = error -> error
     end
   end
 
@@ -754,16 +913,6 @@ defmodule Ferricstore.Store.ListOps do
     end
   end
 
-  defp rollback_rebalanced_elements(key, store, new_elements, old_elements, write_error) do
-    case delete_elements(key, store, new_elements) do
-      :ok ->
-        rollback_deleted_elements(key, store, old_elements, write_error)
-
-      {:error, _} = rollback_error ->
-        {:error, {:list_rebalance_rollback_failed, write_error, rollback_error}}
-    end
-  end
-
   defp update_or_delete_meta(key, store, _new_len, []), do: delete_meta(key, store)
 
   defp update_or_delete_meta(key, store, new_len, remaining),
@@ -773,8 +922,14 @@ defmodule Ferricstore.Store.ListOps do
   defp write_result(true), do: :ok
   defp write_result({:error, _} = error), do: error
 
-  defp normalize_index(index, len) when index < 0, do: max(0, len + index)
-  defp normalize_index(index, _len), do: index
+  defp normalize_range_start(index, len) when index < 0, do: max(0, len + index)
+  defp normalize_range_start(index, _len), do: index
+
+  defp normalize_range_stop(index, len) when index < 0, do: len + index
+  defp normalize_range_stop(index, _len), do: index
+
+  defp normalize_point_index(index, len) when index < 0, do: len + index
+  defp normalize_point_index(index, _len), do: index
 
   defp select_removals(sorted, 0, target) do
     {removed, kept} = Enum.split_with(sorted, fn {_, val} -> val == target end)
@@ -801,19 +956,20 @@ defmodule Ferricstore.Store.ListOps do
     {Enum.reverse(removed), Enum.reverse(remaining), length(removed)}
   end
 
-  defp find_positions(elements, element, rank, count, maxlen) do
+  defp find_positions(elements, element, rank, count, base_index) do
     {scan_list, reverse?} =
       if rank < 0, do: {Enum.reverse(elements), true}, else: {elements, false}
 
     abs_rank = abs(rank)
-    eff = if maxlen == 0, do: length(scan_list), else: min(maxlen, length(scan_list))
-    total_len = length(elements)
+    slice_len = length(elements)
 
     matches =
-      Enum.take(scan_list, eff)
+      scan_list
       |> Enum.with_index()
       |> Enum.filter(fn {e, _} -> e == element end)
-      |> Enum.map(fn {_, idx} -> if reverse?, do: total_len - 1 - idx, else: idx end)
+      |> Enum.map(fn {_, idx} ->
+        if reverse?, do: base_index + slice_len - 1 - idx, else: base_index + idx
+      end)
 
     from_rank = Enum.drop(matches, abs_rank - 1)
 

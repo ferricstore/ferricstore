@@ -27,7 +27,7 @@ defmodule Ferricstore.Flow.RecordProjection do
   ]
 
   def public(record) when is_map(record),
-    do: Map.drop(record, [:state_enter_seq, :governance_limit])
+    do: Map.drop(record, [:incarnation, :state_enter_seq, :governance_limit])
 
   def public(record), do: record
 

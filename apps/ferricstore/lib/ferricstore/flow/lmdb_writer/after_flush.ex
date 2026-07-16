@@ -6,75 +6,25 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   alias Ferricstore.Flow.Locator
   alias Ferricstore.Store.{BlobRef, BlobStore, ColdRead}
 
-  def apply_after_flush(
-        {:prune_terminal_flow, ets, zset_index, zset_lookup, state_key, state_index_key, id,
-         version}
-      ) do
-    prune_terminal_state_key(ets, state_key, version)
+  @max_timer_ms 4_294_967_295
 
-    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
-
-    :ok
-  end
-
-  def apply_after_flush(
-        {:prune_terminal_flow, ets, zset_index, zset_lookup, flow_index, flow_lookup, state_key,
-         state_index_key, id, version}
-      ) do
-    prune_terminal_state_key(ets, state_key, version)
-
-    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
-    safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
-
-    :ok
-  end
-
-  def apply_after_flush(
-        {:prune_terminal_flow, ets, zset_index, zset_lookup, flow_index, flow_lookup, state_key,
-         state_index_key, metadata_index_keys, id, version}
-      ) do
-    prune_terminal_state_key(ets, state_key, version)
-
-    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
-    safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
-
-    Enum.each(metadata_index_keys, fn index_key ->
-      safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
+  def apply_actions(actions) when is_list(actions) do
+    Enum.reduce_while(actions, :ok, fn action, :ok ->
+      case apply_after_flush(action) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
     end)
-
-    :ok
+  rescue
+    _ -> {:error, :after_flush_action_failed}
+  catch
+    _, _ -> {:error, :after_flush_action_failed}
   end
 
-  def apply_after_flush(
-        {:prune_terminal_flow_v2, ets, zset_index, zset_lookup, flow_index, flow_lookup,
-         state_key, type, terminal_state, partition_key, parent_flow_id, root_flow_id,
-         correlation_id, id, version}
-      ) do
-    state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
-
-    metadata_index_keys =
-      ProjectionOps.terminal_project_metadata_index_keys(
-        id,
-        partition_key,
-        parent_flow_id,
-        root_flow_id,
-        correlation_id
-      )
-
-    prune_terminal_state_key(ets, state_key, version)
-
-    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
-    safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
-
-    Enum.each(metadata_index_keys, fn index_key ->
-      safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
-    end)
-
-    :ok
-  end
+  def apply_actions(_actions), do: {:error, :invalid_after_flush_actions}
 
   def apply_after_flush(
-        {:prune_terminal_flow_v3, data_dir, shard_index, ets, zset_index, zset_lookup, flow_index,
+        {:prune_terminal_flow, data_dir, shard_index, ets, zset_index, zset_lookup, flow_index,
          flow_lookup, state_key, type, terminal_state, partition_key, parent_flow_id,
          root_flow_id, correlation_id, id, version}
       ) do
@@ -89,55 +39,63 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
         correlation_id
       )
 
-    prune_terminal_state_key(data_dir, shard_index, ets, state_key, version)
-
-    safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
-    safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
-
-    Enum.each(metadata_index_keys, fn index_key ->
-      safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
-    end)
-
-    :ok
+    with :ok <- prune_terminal_state_key(data_dir, shard_index, ets, state_key, version),
+         :ok <- safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id),
+         :ok <- safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id),
+         :ok <-
+           delete_flow_index_members(flow_index, flow_lookup, metadata_index_keys, id) do
+      :ok
+    end
   end
 
   def apply_after_flush(
-        {:prune_terminal_flow_from_source_v1, data_dir, shard_index, ets, zset_index, zset_lookup,
+        {:prune_terminal_flow_from_source, data_dir, shard_index, ets, zset_index, zset_lookup,
          flow_index, flow_lookup, state_key, version}
       ) do
-    with {:ok, record} <- flow_record_from_keydir(data_dir, shard_index, ets, state_key),
-         ^version <- Map.get(record, :version),
-         terminal_state when is_binary(terminal_state) <- Map.get(record, :state),
-         true <- Ferricstore.Flow.LMDB.terminal_state?(terminal_state),
-         type when is_binary(type) <- Map.get(record, :type),
-         id when is_binary(id) <- Map.get(record, :id) do
-      partition_key = Map.get(record, :partition_key)
-      state_index_key = Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
+    case flow_record_from_keydir(data_dir, shard_index, ets, state_key) do
+      {:ok, record} ->
+        with ^version <- Map.get(record, :version),
+             terminal_state when is_binary(terminal_state) <- Map.get(record, :state),
+             true <- Ferricstore.Flow.LMDB.terminal_state?(terminal_state),
+             type when is_binary(type) <- Map.get(record, :type),
+             id when is_binary(id) <- Map.get(record, :id),
+             :ok <- prune_terminal_state_key(data_dir, shard_index, ets, state_key, version) do
+          partition_key = Map.get(record, :partition_key)
 
-      metadata_index_keys =
-        ProjectionOps.terminal_project_metadata_index_keys(
-          id,
-          partition_key,
-          Map.get(record, :parent_flow_id),
-          Map.get(record, :root_flow_id),
-          Map.get(record, :correlation_id)
-        )
+          state_index_key =
+            Ferricstore.Flow.Keys.state_index_key(type, terminal_state, partition_key)
 
-      prune_terminal_state_key(data_dir, shard_index, ets, state_key, version)
+          metadata_index_keys =
+            ProjectionOps.terminal_project_metadata_index_keys(
+              id,
+              partition_key,
+              Map.get(record, :parent_flow_id),
+              Map.get(record, :root_flow_id),
+              Map.get(record, :correlation_id)
+            )
 
-      safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
-      safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id)
+          with :ok <- safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id),
+               :ok <-
+                 safe_flow_index_delete_member(flow_index, flow_lookup, state_index_key, id),
+               :ok <-
+                 delete_flow_index_members(flow_index, flow_lookup, metadata_index_keys, id) do
+            :ok
+          end
+        else
+          {:error, _reason} = error -> error
+          _stale_or_nonterminal -> :ok
+        end
 
-      Enum.each(metadata_index_keys, fn index_key ->
-        safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
-      end)
+      :not_found ->
+        :ok
+
+      {:error, _reason} = error ->
+        error
     end
-
-    :ok
   end
 
   def apply_after_flush(
-        {:hibernate_flow_evict_hot_v1,
+        {:hibernate_flow_evict_hot,
          %{
            data_dir: data_dir,
            shard_index: shard_index,
@@ -149,30 +107,43 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
            locator: %Locator{} = locator
          } = attrs}
       ) do
-    evicted? = hibernate_delete_hot_state_key(data_dir, shard_index, ets, state_key, locator)
+    case hibernate_delete_hot_state_key(data_dir, shard_index, ets, state_key, locator) do
+      {:ok, true} ->
+        zset_index = Map.get(attrs, :zset_index)
+        zset_lookup = Map.get(attrs, :zset_lookup)
+        id = Map.fetch!(record, :id)
+        index_keys = Hibernation.hot_index_keys(record, due_any?: true)
 
-    if evicted? do
-      zset_index = Map.get(attrs, :zset_index)
-      zset_lookup = Map.get(attrs, :zset_lookup)
-      id = Map.fetch!(record, :id)
+        with :ok <-
+               delete_hot_index_members(
+                 zset_index,
+                 zset_lookup,
+                 flow_index,
+                 flow_lookup,
+                 index_keys,
+                 id
+               ) do
+          Hibernation.maybe_schedule_claim_waiter(record)
+          emit_hibernation_evict(:evicted, shard_index)
+          :ok
+        else
+          {:error, _reason} = error ->
+            emit_hibernation_evict(:error, shard_index)
+            error
+        end
 
-      record
-      |> Hibernation.hot_index_keys(due_any?: true)
-      |> Enum.each(fn index_key ->
-        safe_zset_delete_member(zset_index, zset_lookup, index_key, id)
-        safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id)
-      end)
+      {:ok, false} ->
+        emit_hibernation_evict(:stale, shard_index)
+        :ok
 
-      Hibernation.maybe_schedule_claim_waiter(record)
+      {:error, _reason} = error ->
+        emit_hibernation_evict(:error, shard_index)
+        error
     end
+  end
 
-    :telemetry.execute(
-      [:ferricstore, :flow, :hibernation, :evict_hot],
-      %{count: 1},
-      %{result: if(evicted?, do: :evicted, else: :stale), shard_index: shard_index}
-    )
-
-    :ok
+  def apply_after_flush({:cleanup_stale_cold_due, path, batches}) do
+    Hibernation.cleanup_stale_due_batches(path, batches)
   end
 
   def apply_after_flush({:defer_after_flush, delay_ms, action}) do
@@ -188,14 +159,18 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
 
   def apply_after_flush({:delete_flow_tombstone, ets, key}) do
     case :ets.lookup(ets, key) do
-      [{^key, nil, 0, :flow_state_deleted, :deleted, 0, 0}] -> :ets.delete(ets, key)
-      _ -> :ok
+      [{^key, nil, 0, :flow_state_deleted, :deleted, 0, 0}] ->
+        :ets.delete(ets, key)
+        :ok
+
+      _ ->
+        :ok
     end
   rescue
     ArgumentError -> :ok
   end
 
-  def apply_after_flush(_action), do: :ok
+  def apply_after_flush(_action), do: {:error, :invalid_after_flush_action}
 
   def hot_flow_record_from_ets(ets, state_key) do
     case :ets.lookup(ets, state_key) do
@@ -211,9 +186,12 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   end
 
   def decode_raw_flow_record(value) when is_binary(value) do
-    {:ok, ProjectionOps.flow_call(:decode_record, [value])}
+    case ProjectionOps.flow_call(:decode_record, [value]) do
+      record when is_map(record) -> {:ok, record}
+      _invalid -> {:error, :invalid_source_flow_record}
+    end
   rescue
-    _ -> :error
+    _ -> {:error, :invalid_source_flow_record}
   end
 
   def hibernate_delete_hot_state_key(data_dir, shard_index, ets, state_key, %Locator{} = locator) do
@@ -223,19 +201,21 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
              value_size == locator.value_size do
           delete_apply_projection_cache_for_row(data_dir, shard_index, row)
           :ets.delete(ets, state_key)
-          true
+          {:ok, true}
         else
-          false
+          {:ok, false}
         end
 
       _ ->
-        false
+        {:ok, false}
     end
   rescue
-    ArgumentError -> false
+    ArgumentError -> {:error, :source_keydir_unavailable}
   end
 
-  def normalize_delay_ms(delay_ms) when is_integer(delay_ms) and delay_ms >= 0, do: delay_ms
+  def normalize_delay_ms(delay_ms) when is_integer(delay_ms) and delay_ms >= 0,
+    do: min(delay_ms, @max_timer_ms)
+
   def normalize_delay_ms(_delay_ms), do: 0
 
   def normalize_non_negative_integer(value, _default) when is_integer(value) and value >= 0,
@@ -254,12 +234,27 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
     :ferricstore
     |> Application.get_env(:flow_terminal_hot_ttl_ms, 0)
     |> normalize_non_negative_integer(0)
+    |> normalize_delay_ms()
   end
 
   def safe_zset_delete_member(nil, _zset_lookup, _state_index_key, _id), do: :ok
   def safe_zset_delete_member(_zset_index, nil, _state_index_key, _id), do: :ok
 
+  def safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
+      when is_atom(zset_index) and is_atom(zset_lookup) do
+    case {:ets.whereis(zset_index), :ets.whereis(zset_lookup)} do
+      {:undefined, :undefined} -> :ok
+      {:undefined, _lookup} -> {:error, :zset_index_unavailable}
+      {_index, :undefined} -> {:error, :zset_index_unavailable}
+      {_index, _lookup} -> do_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
+    end
+  end
+
   def safe_zset_delete_member(zset_index, zset_lookup, state_index_key, id) do
+    do_zset_delete_member(zset_index, zset_lookup, state_index_key, id)
+  end
+
+  defp do_zset_delete_member(zset_index, zset_lookup, state_index_key, id) do
     Ferricstore.Store.Shard.ZSetIndex.delete_member(
       zset_index,
       zset_lookup,
@@ -267,7 +262,8 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
       id
     )
   rescue
-    ArgumentError -> :ok
+    ArgumentError -> {:error, :zset_index_unavailable}
+    _ -> {:error, :zset_index_delete_failed}
   end
 
   def safe_flow_index_delete_member(nil, _flow_lookup, _state_index_key, _id), do: :ok
@@ -279,22 +275,43 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
       native -> Ferricstore.Flow.NativeOrderedIndex.delete_member(native, state_index_key, id)
     end
   rescue
-    ArgumentError -> :ok
+    ArgumentError -> {:error, :flow_index_unavailable}
+    _ -> {:error, :flow_index_delete_failed}
   end
 
-  def prune_terminal_state_key(ets, state_key, version) do
-    case :ets.lookup(ets, state_key) do
-      [
-        {^state_key, _value, _expire_at_ms, {:flow_state_version, ^version, _lfu}, _fid, _off,
-         _vsize}
-      ] ->
-        :ets.delete(ets, state_key)
+  defp delete_flow_index_members(flow_index, flow_lookup, index_keys, id) do
+    Enum.reduce_while(index_keys, :ok, fn index_key, :ok ->
+      case safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
 
-      _ ->
-        :ok
-    end
-  rescue
-    ArgumentError -> :ok
+  defp delete_hot_index_members(
+         zset_index,
+         zset_lookup,
+         flow_index,
+         flow_lookup,
+         index_keys,
+         id
+       ) do
+    Enum.reduce_while(index_keys, :ok, fn index_key, :ok ->
+      with :ok <- safe_zset_delete_member(zset_index, zset_lookup, index_key, id),
+           :ok <- safe_flow_index_delete_member(flow_index, flow_lookup, index_key, id) do
+        {:cont, :ok}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp emit_hibernation_evict(result, shard_index) do
+    :telemetry.execute(
+      [:ferricstore, :flow, :hibernation, :evict_hot],
+      %{count: 1},
+      %{result: result, shard_index: shard_index}
+    )
   end
 
   def prune_terminal_state_key(data_dir, shard_index, ets, state_key, version) do
@@ -305,29 +322,48 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
       ] ->
         delete_apply_projection_cache_for_row(data_dir, shard_index, row)
         :ets.delete(ets, state_key)
+        :ok
 
       [{^state_key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize} = row] ->
-        if terminal_state_row_version?(data_dir, shard_index, state_key, version, row) do
-          delete_apply_projection_cache_for_row(data_dir, shard_index, row)
-          :ets.delete(ets, state_key)
-        else
-          :ok
+        case terminal_state_row_version(data_dir, shard_index, state_key, version, row) do
+          {:ok, true} ->
+            delete_apply_projection_cache_for_row(data_dir, shard_index, row)
+            :ets.delete(ets, state_key)
+            :ok
+
+          {:ok, false} ->
+            :ok
+
+          {:error, _reason} = error ->
+            error
         end
 
       _ ->
         :ok
     end
   rescue
-    ArgumentError -> :ok
+    ArgumentError -> {:error, :source_keydir_unavailable}
   end
 
-  defp terminal_state_row_version?(data_dir, shard_index, state_key, version, row) do
-    with {:ok, record} <- flow_record_from_keydir_row(data_dir, shard_index, state_key, row),
-         ^version <- Map.get(record, :version),
-         terminal_state when is_binary(terminal_state) <- Map.get(record, :state) do
-      Ferricstore.Flow.LMDB.terminal_state?(terminal_state)
-    else
-      _ -> false
+  defp terminal_state_row_version(data_dir, shard_index, state_key, version, row) do
+    case flow_record_from_keydir_row(data_dir, shard_index, state_key, row) do
+      {:ok, record} ->
+        cond do
+          Map.get(record, :version) != version ->
+            {:ok, false}
+
+          is_binary(Map.get(record, :state)) ->
+            {:ok, Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state))}
+
+          true ->
+            {:error, :invalid_source_flow_record}
+        end
+
+      :not_found ->
+        {:ok, false}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -356,7 +392,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
       _ -> :not_found
     end
   rescue
-    ArgumentError -> :not_found
+    ArgumentError -> {:error, :source_keydir_unavailable}
   end
 
   def flow_record_from_keydir_row(

@@ -216,6 +216,24 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
     end
   end
 
+  describe "CLUSTER.FAILOVER" do
+    test "preserves the unknown-node error", %{store: store} do
+      node_name = "cluster_failover_unknown_#{System.unique_integer([:positive])}@127.0.0.1"
+
+      assert {:error, "ERR unknown node" <> _rest} =
+               Cluster.handle("CLUSTER.FAILOVER", ["0", node_name], store)
+    end
+
+    test "rejects negative shard indexes before calling Raft", %{store: store} do
+      assert {:error, "ERR shard index is out of range"} =
+               Cluster.handle(
+                 "CLUSTER.FAILOVER",
+                 ["-1", Atom.to_string(node())],
+                 store
+               )
+    end
+  end
+
   describe "CLUSTER.STATUS" do
     test "includes replication marker details", %{store: store} do
       result = Cluster.handle("CLUSTER.STATUS", [], store)

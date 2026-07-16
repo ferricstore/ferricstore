@@ -96,14 +96,97 @@ defmodule Ferricstore.Commands.ExtensionTest do
     def keys("EXT.INVALID_KEYS", [_key]), do: {:ok, [:not_a_binary_key]}
   end
 
+  defmodule SnapshotExtensionA do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      [
+        %{
+          name: "EXT.SNAPSHOT",
+          arity: 2,
+          flags: ["write"],
+          first_key: 1,
+          last_key: 1,
+          step: 1,
+          access: :write
+        }
+      ]
+    end
+
+    @impl true
+    def handle("EXT.SNAPSHOT", [_key], _store), do: {:ok, :provider_a}
+
+    @impl true
+    def keys("EXT.SNAPSHOT", [key]), do: {:ok, ["a:" <> key]}
+  end
+
+  defmodule SnapshotExtensionB do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      [
+        %{
+          name: "EXT.SNAPSHOT",
+          arity: 2,
+          flags: ["readonly"],
+          first_key: 1,
+          last_key: 1,
+          step: 1,
+          access: :read
+        }
+      ]
+    end
+
+    @impl true
+    def handle("EXT.SNAPSHOT", [_key], _store), do: {:ok, :provider_b}
+
+    @impl true
+    def keys("EXT.SNAPSHOT", [key]), do: {:ok, ["b:" <> key]}
+  end
+
+  defmodule CountingExtension do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      if pid = Application.get_env(:ferricstore, :extension_test_pid) do
+        send(pid, :extension_commands_called)
+      end
+
+      [
+        %{
+          name: "EXT.COUNTED",
+          arity: 2,
+          flags: ["write"],
+          first_key: 1,
+          last_key: 1,
+          step: 1,
+          access: :write
+        }
+      ]
+    end
+
+    @impl true
+    def handle("EXT.COUNTED", [_key], _store), do: {:ok, "OK"}
+  end
+
   setup do
     previous = Application.get_env(:ferricstore, :command_extensions)
+    previous_test_pid = Application.get_env(:ferricstore, :extension_test_pid)
     Application.delete_env(:ferricstore, :command_extensions)
+    Application.delete_env(:ferricstore, :extension_test_pid)
 
     on_exit(fn ->
       case previous do
         nil -> Application.delete_env(:ferricstore, :command_extensions)
         value -> Application.put_env(:ferricstore, :command_extensions, value)
+      end
+
+      case previous_test_pid do
+        nil -> Application.delete_env(:ferricstore, :extension_test_pid)
+        value -> Application.put_env(:ferricstore, :extension_test_pid, value)
       end
     end)
   end
@@ -127,9 +210,39 @@ defmodule Ferricstore.Commands.ExtensionTest do
             %Ferricstore.Commands.PreparedCommand{
               command: "EXT.PUT",
               args: ["k", "v"],
-              ast: {:extension_command, "EXT.PUT", ["k", "v"]},
+              ast: {:extension_command, TestExtension, "EXT.PUT", ["k", "v"], :write},
               acl_keys: ["dynamic:v"]
             }} = Dispatcher.prepare_raw("ext.put", ["k", "v"])
+  end
+
+  test "catalog key discovery uses an extension's dynamic key callback" do
+    Application.put_env(:ferricstore, :command_extensions, [TestExtension])
+
+    assert {:ok, ["dynamic:v"]} = Catalog.get_keys("EXT.PUT", ["k", "v"])
+  end
+
+  test "prepared extension commands retain the authorized provider snapshot" do
+    Application.put_env(:ferricstore, :command_extensions, [SnapshotExtensionA])
+
+    assert {:ok, prepared} = Dispatcher.prepare_raw("EXT.SNAPSHOT", ["tenant-key"])
+    assert prepared.acl_keys == ["a:tenant-key"]
+    assert prepared.read_keys == []
+    assert prepared.write_keys == ["a:tenant-key"]
+
+    Application.put_env(:ferricstore, :command_extensions, [SnapshotExtensionB])
+
+    assert {:ok, :provider_a} = Dispatcher.dispatch_prepared(prepared, MockStore.make())
+  end
+
+  test "preparing an extension command reads provider metadata once" do
+    Application.put_env(:ferricstore, :extension_test_pid, self())
+    Application.put_env(:ferricstore, :command_extensions, [CountingExtension])
+
+    assert {:ok, prepared} = Dispatcher.prepare_raw("EXT.COUNTED", ["key"])
+    assert prepared.acl_keys == ["key"]
+
+    assert_receive :extension_commands_called
+    refute_receive :extension_commands_called
   end
 
   test "invalid extension key metadata fails closed before dispatch" do

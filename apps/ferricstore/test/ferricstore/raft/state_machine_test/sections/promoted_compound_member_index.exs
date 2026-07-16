@@ -26,6 +26,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.PromotedCompoundMemberIndex
         File.mkdir_p!(dedicated_path)
         File.touch!(Path.join(dedicated_path, "00000.log"))
         CompoundMemberIndex.ensure_table!(index)
+        CompoundMemberIndex.reset(index)
 
         on_exit(fn -> safe_delete_ets(index) end)
 

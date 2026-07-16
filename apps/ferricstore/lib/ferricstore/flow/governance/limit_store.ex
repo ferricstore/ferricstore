@@ -18,13 +18,14 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
 
   def lease(ctx, scope, opts) when is_binary(scope) and scope != "" and is_list(opts) do
     result =
-      with {:ok, shard_id} <- required_shard_id(ctx, opts),
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- limit_key(scope),
+           {:ok, shard_id} <- required_shard_id(ctx, opts),
            {:ok, amount} <- required_mutation_amount(opts, :amount),
            {:ok, ttl_ms} <- required_positive_integer(opts, :ttl_ms),
            {:ok, now_ms} <- optional_now_ms(opts),
            :ok <- validate_deadline(now_ms, ttl_ms),
            {:ok, configuration} <- limit_configuration(opts),
-           key = Keys.governance_limit_key(scope),
            owner_exists? = not is_nil(Router.get(ctx, key)),
            :ok <- require_limit_for_new_owner(owner_exists?, configuration),
            :ok <- register_existing_limit(ctx, key, owner_exists?) do
@@ -41,6 +42,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
           })
 
         register_committed_limit(ctx, key, result, opts)
+      else
+        false -> {:error, "ERR flow limit opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:limit_lease, result, limit_metadata(scope, opts))
@@ -52,12 +56,13 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
 
   def spend(ctx, scope, opts) when is_binary(scope) and scope != "" and is_list(opts) do
     result =
-      with {:ok, shard_id} <- required_shard_id(ctx, opts),
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- limit_key(scope),
+           {:ok, shard_id} <- required_shard_id(ctx, opts),
            {:ok, amount} <- required_mutation_amount(opts, :amount),
            {:ok, now_ms} <- optional_now_ms(opts),
            {:ok, ttl_ms} <- optional_positive_integer(opts, :ttl_ms),
            :ok <- validate_deadline(now_ms, ttl_ms),
-           key = Keys.governance_limit_key(scope),
            {:ok, lease_epoch} <- current_lease_epoch(ctx, key, shard_id),
            :ok <- ensure_limit_registered(ctx, key),
            {:ok, reservation_ids} <- spend_reservation_ids(opts, amount, lease_epoch),
@@ -76,6 +81,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
           configuration: configuration
         })
         |> normalize_spend_result(scope, shard_id, reservation_ids)
+      else
+        false -> {:error, "ERR flow limit opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:limit_spend, result, limit_metadata(scope, opts))
@@ -87,14 +95,15 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
   def spend_reserved(ctx, scope, opts, reservation_ids)
       when is_binary(scope) and scope != "" and is_list(opts) and is_list(reservation_ids) do
     result =
-      with {:ok, shard_id} <- required_shard_id(ctx, opts),
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- limit_key(scope),
+           {:ok, shard_id} <- required_shard_id(ctx, opts),
            {:ok, amount} <- required_mutation_amount(opts, :amount),
            {:ok, reservation_ids} <- validate_preallocated_ids(reservation_ids, amount),
            {:ok, now_ms} <- optional_now_ms(opts),
            {:ok, ttl_ms} <- optional_positive_integer(opts, :ttl_ms),
            :ok <- validate_deadline(now_ms, ttl_ms),
            {:ok, configuration} <- limit_configuration(opts),
-           key = Keys.governance_limit_key(scope),
            {:ok, _current_epoch} <- current_lease_epoch(ctx, key, shard_id),
            :ok <- ensure_limit_registered(ctx, key),
            {:ok, lease_epoch} <- reservation_ids_epoch(reservation_ids) do
@@ -110,6 +119,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
           reservation_ids: reservation_ids,
           configuration: configuration
         })
+      else
+        false -> {:error, "ERR flow limit reserved spend opts are invalid"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:limit_spend_reserved, result, limit_metadata(scope, opts))
@@ -123,8 +135,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
       when is_binary(scope) and scope != "" and is_integer(amount) and amount > 0 and
              amount <= @max_mutation_amount do
     with {:ok, shard_id} <- required_shard_id(ctx, shard_id: shard_id),
+         {:ok, key} <- limit_key(scope),
          {:ok, lease_epoch} <-
-           current_lease_epoch(ctx, Keys.governance_limit_key(scope), shard_id) do
+           current_lease_epoch(ctx, key, shard_id) do
       {:ok, new_reservation_ids(amount, lease_epoch)}
     end
   end
@@ -157,11 +170,12 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
 
   def renew(ctx, scope, opts) when is_binary(scope) and scope != "" and is_list(opts) do
     result =
-      with {:ok, shard_id} <- required_shard_id(ctx, opts),
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- limit_key(scope),
+           {:ok, shard_id} <- required_shard_id(ctx, opts),
            {:ok, ttl_ms} <- required_positive_integer(opts, :ttl_ms),
            {:ok, now_ms} <- optional_now_ms(opts),
            :ok <- validate_deadline(now_ms, ttl_ms),
-           key = Keys.governance_limit_key(scope),
            :ok <- ensure_existing_limit_registered(ctx, key) do
         Router.flow_governance_limit_mutate(ctx, key, %{
           op: :renew,
@@ -171,6 +185,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
           ttl_ms: ttl_ms,
           now_ms: now_ms
         })
+      else
+        false -> {:error, "ERR flow limit opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:limit_renew, result, limit_metadata(scope, opts))
@@ -182,11 +199,12 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
 
   def release(ctx, scope, opts) when is_binary(scope) and scope != "" and is_list(opts) do
     result =
-      with {:ok, shard_id} <- required_shard_id(ctx, opts),
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- limit_key(scope),
+           {:ok, shard_id} <- required_shard_id(ctx, opts),
            {:ok, reservation_ids} <- release_reservation_ids(opts),
            {:ok, amount} <- release_amount(opts, reservation_ids),
            {:ok, now_ms} <- optional_now_ms(opts),
-           key = Keys.governance_limit_key(scope),
            :ok <- ensure_existing_limit_registered(ctx, key) do
         Router.flow_governance_limit_mutate(ctx, key, %{
           op: :release,
@@ -197,6 +215,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
           reservation_ids: reservation_ids,
           now_ms: now_ms
         })
+      else
+        false -> {:error, "ERR flow limit opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:limit_release, result, limit_metadata(scope, opts))
@@ -208,9 +229,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
 
   def get(ctx, scope, opts) when is_binary(scope) and scope != "" and is_list(opts) do
     result =
-      with {:ok, now_ms} <- optional_now_ms(opts) do
-        key = Keys.governance_limit_key(scope)
-
+      with true <- Keyword.keyword?(opts),
+           {:ok, key} <- limit_key(scope),
+           {:ok, now_ms} <- optional_now_ms(opts) do
         case Router.get(ctx, key) do
           nil ->
             {:ok, nil}
@@ -224,6 +245,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
               })
             end
         end
+      else
+        false -> {:error, "ERR flow limit opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:limit_reclaim, result, %{scope: scope})
@@ -236,9 +260,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
 
   def cleanup(ctx, scope, opts)
       when is_binary(scope) and scope != "" and is_list(opts) do
-    with {:ok, now_ms} <- optional_now_ms(opts) do
-      key = Keys.governance_limit_key(scope)
-
+    with true <- Keyword.keyword?(opts),
+         {:ok, key} <- limit_key(scope),
+         {:ok, now_ms} <- optional_now_ms(opts) do
       case Router.get(ctx, key) do
         nil ->
           {:ok, %{deleted: 0, pending?: false}}
@@ -250,6 +274,9 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
             now_ms: now_ms
           })
       end
+    else
+      false -> {:error, "ERR flow limit cleanup opts must be a keyword list"}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -259,12 +286,16 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
   def list(ctx, opts \\ [])
 
   def list(ctx, opts) when is_list(opts) do
-    with {:ok, limit} <- optional_list_limit(opts),
+    with true <- Keyword.keyword?(opts),
+         {:ok, limit} <- optional_list_limit(opts),
          {:ok, scopes} <- optional_scope_filters(opts),
          {:ok, now_ms} <- optional_now_ms(opts),
          {:ok, limits} <-
            collect_list_limits(ctx, scopes, limit, now_ms) do
       {:ok, limits}
+    else
+      false -> {:error, "ERR flow limit opts must be a keyword list"}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -292,13 +323,21 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
   end
 
   defp load_list_limit(ctx, key, scopes, now_ms) do
-    with value when is_binary(value) <- Router.get(ctx, key),
-         {:ok, owner} <- LimitRecord.decode_owner(value),
-         owner = owner |> CreditLease.reclaim_expired(now_ms) |> View.public(),
-         true <- matches_scope?(owner, scopes) do
-      {:ok, owner}
-    else
-      _missing_corrupt_or_filtered -> :skip
+    case Router.get(ctx, key) do
+      nil ->
+        :skip
+
+      value when is_binary(value) ->
+        with {:ok, owner} <- LimitRecord.decode_owner(value) do
+          owner = owner |> CreditLease.reclaim_expired(now_ms) |> View.public()
+          if matches_scope?(owner, scopes), do: {:ok, owner}, else: :skip
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _other ->
+        {:error, "ERR flow limit record is corrupt"}
     end
   end
 
@@ -537,10 +576,16 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
   defp optional_scope_filters(opts) do
     case {Keyword.get(opts, :scope), Keyword.get(opts, :partition_key)} do
       {scope, _partition_key} when is_binary(scope) and scope != "" ->
-        {:ok, [scope]}
+        with {:ok, _key} <- limit_key(scope), do: {:ok, [scope]}
 
       {nil, partition_key} when is_binary(partition_key) and partition_key != "" ->
-        {:ok, [partition_key, "partition:" <> partition_key]}
+        scopes = [partition_key, "partition:" <> partition_key]
+
+        with true <- Enum.all?(scopes, &match?({:ok, _key}, limit_key(&1))) do
+          {:ok, scopes}
+        else
+          false -> {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+        end
 
       {nil, nil} ->
         {:ok, nil}
@@ -552,6 +597,16 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
 
   defp matches_scope?(_record, nil), do: true
   defp matches_scope?(record, scopes), do: Map.get(record, :scope) in scopes
+
+  defp limit_key(scope) do
+    key = Keys.governance_limit_key(scope)
+
+    if byte_size(key) <= Router.max_key_size() do
+      {:ok, key}
+    else
+      {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
+    end
+  end
 
   defp validate_deadline(_now_ms, nil), do: :ok
 
@@ -627,10 +682,14 @@ defmodule Ferricstore.Flow.Governance.LimitStore do
   end
 
   defp limit_metadata(scope, opts) do
-    %{
-      scope: scope,
-      shard_id: Keyword.get(opts, :shard_id),
-      amount: Keyword.get(opts, :amount)
-    }
+    if Keyword.keyword?(opts) do
+      %{
+        scope: scope,
+        shard_id: Keyword.get(opts, :shard_id),
+        amount: Keyword.get(opts, :amount)
+      }
+    else
+      %{scope: scope, shard_id: nil, amount: nil}
+    end
   end
 end

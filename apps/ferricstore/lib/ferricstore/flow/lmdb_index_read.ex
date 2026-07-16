@@ -12,6 +12,8 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
   alias Ferricstore.Flow.RecordQuery
   alias Ferricstore.Store.Router
 
+  @default_terminal_lmdb_sweep_limit 10_000
+
   def terminal_ids(
         ctx,
         index_key,
@@ -81,6 +83,58 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
     end
   end
 
+  def terminal_entries_window_with_count(
+        _ctx,
+        _index_key,
+        _state,
+        _partition_key,
+        count,
+        _include_cold?,
+        _consistent?,
+        _query,
+        _terminal_states
+      )
+      when count <= 0,
+      do: {:ok, [], true, 0}
+
+  def terminal_entries_window_with_count(
+        _ctx,
+        _index_key,
+        _state,
+        _partition_key,
+        _count,
+        false,
+        _consistent?,
+        _query,
+        _terminal_states
+      ),
+      do: {:ok, [], true, 0}
+
+  def terminal_entries_window_with_count(
+        ctx,
+        index_key,
+        state,
+        partition_key,
+        count,
+        true,
+        consistent?,
+        query,
+        terminal_states
+      ) do
+    if state in terminal_states do
+      lmdb_terminal_entries_window(
+        ctx,
+        index_key,
+        partition_key,
+        count,
+        consistent?,
+        query
+      )
+    else
+      {:ok, [], true, 0}
+    end
+  end
+
   def query_entries(
         _ctx,
         _index_key,
@@ -94,29 +148,93 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
       do: {:ok, []}
 
   def query_entries(ctx, index_key, partition_key, count, consistent?, query, default_scan_limit) do
+    scan_count = query_scan_count(count, default_scan_limit)
+
+    query_entries_window(
+      ctx,
+      index_key,
+      partition_key,
+      scan_count,
+      consistent?,
+      query
+    )
+  end
+
+  def query_entries_window(
+        _ctx,
+        _index_key,
+        _partition_key,
+        count,
+        _consistent?,
+        _query
+      )
+      when count <= 0,
+      do: {:ok, []}
+
+  def query_entries_window(ctx, index_key, partition_key, count, consistent?, query) do
+    with {:ok, entries, _exhausted?, _scanned_count} <-
+           query_entries_window_with_count(
+             ctx,
+             index_key,
+             partition_key,
+             count,
+             consistent?,
+             query
+           ) do
+      {:ok, entries}
+    end
+  end
+
+  def query_entries_window_with_count(
+        _ctx,
+        _index_key,
+        _partition_key,
+        count,
+        _consistent?,
+        _query
+      )
+      when count <= 0,
+      do: {:ok, [], true, 0}
+
+  def query_entries_window_with_count(
+        ctx,
+        index_key,
+        partition_key,
+        count,
+        consistent?,
+        query
+      ) do
     with :ok <- maybe_flush_lmdb_for_index(ctx, index_key, partition_key, consistent?),
          :ok <- LMDBMirror.require_healthy(ctx, index_key, partition_key) do
       prefix = LMDB.query_index_prefix(index_key)
       now_ms = CommandTime.now_ms()
-      scan_count = query_scan_count(count, default_scan_limit)
+      probe_count = count + 1
 
       ctx
       |> lmdb_paths_for_index(index_key, partition_key)
       |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
-        with {:ok, entries} <- query_prefix_entries(path, prefix, scan_count, query) do
-          {:cont,
-           {:ok,
-            RecordQuery.prepend_chunk(
-              LMDBIndexDecode.query_entries(entries, path, now_ms),
-              acc
-            )}}
-        else
-          {:error, _reason} = error -> {:halt, error}
+        case query_prefix_entries(path, prefix, probe_count, query) do
+          {:ok, entries} when is_list(entries) ->
+            {bounded_entries, exhausted?} =
+              bounded_query_entries(entries, prefix, probe_count, query)
+
+            {:cont, {:ok, [{path, bounded_entries, exhausted?} | acc]}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+
+          invalid ->
+            {:halt, {:error, {:invalid_lmdb_query_window, invalid}}}
         end
       end)
       |> case do
-        {:ok, chunks} -> {:ok, IndexMerge.query_entries_from_chunks(chunks)}
-        {:error, _reason} = error -> error
+        {:ok, path_windows} ->
+          path_windows
+          |> Enum.reverse()
+          |> finalize_query_window(count, query, now_ms)
+
+        {:error, _reason} = error ->
+          error
       end
     end
   end
@@ -145,8 +263,14 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
         end
       end)
       |> case do
-        {:ok, chunks} -> {:ok, Enum.reverse(chunks)}
-        {:error, _reason} = error -> error
+        {:ok, chunks} ->
+          chunks
+          |> Enum.reverse()
+          |> limit_raw_path_chunks(count)
+          |> then(&{:ok, &1})
+
+        {:error, _reason} = error ->
+          error
       end
     end
   end
@@ -178,6 +302,88 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
     end)
   end
 
+  defp bounded_query_entries(entries, prefix, probe_count, query) do
+    {bounded_entries, outside_range} =
+      Enum.split_while(entries, &query_entry_within_far_bound?(&1, prefix, query))
+
+    exhausted? = outside_range != [] or length(entries) < probe_count
+    {bounded_entries, exhausted?}
+  end
+
+  defp limit_raw_path_chunks(chunks, count) do
+    selected_by_path =
+      chunks
+      |> Enum.flat_map(fn {path, entries} -> Enum.map(entries, &{path, &1}) end)
+      |> Enum.sort_by(fn {_path, {key, _value}} -> key end)
+      |> Enum.take(count)
+      |> Enum.group_by(
+        fn {path, _entry} -> path end,
+        fn {_path, entry} -> entry end
+      )
+
+    Enum.flat_map(chunks, fn {path, _entries} ->
+      case Map.fetch(selected_by_path, path) do
+        {:ok, entries} -> [{path, entries}]
+        :error -> []
+      end
+    end)
+  end
+
+  defp query_entry_within_far_bound?({key, _value}, prefix, %{rev?: true, from_ms: from_ms})
+       when is_binary(key) and is_integer(from_ms) and from_ms >= 0 do
+    key >= LMDBQueryWindow.time_seek_key(prefix, from_ms)
+  end
+
+  defp query_entry_within_far_bound?({key, _value}, prefix, %{rev?: false, to_ms: to_ms})
+       when is_binary(key) and is_integer(to_ms) and to_ms >= 0 do
+    key < LMDBQueryWindow.time_upper_seek_key(prefix, to_ms)
+  end
+
+  defp query_entry_within_far_bound?(_entry, _prefix, _query), do: true
+
+  defp finalize_query_window(path_windows, count, query, now_ms) do
+    raw_entries = ranked_raw_entries(path_windows, query)
+    selected_entries = Enum.take(raw_entries, count)
+    exhausted? = raw_window_exhausted?(path_windows, raw_entries, count)
+
+    with {:ok, chunks} <- decode_query_window_entries(selected_entries, now_ms) do
+      {:ok, IndexMerge.query_entries_from_chunks(chunks), exhausted?, length(selected_entries)}
+    end
+  end
+
+  defp decode_query_window_entries(entries, now_ms) do
+    entries
+    |> Enum.group_by(
+      fn {path, _entry} -> path end,
+      fn {_path, entry} -> entry end
+    )
+    |> Enum.reduce_while({:ok, []}, fn {path, path_entries}, {:ok, chunks} ->
+      case LMDBIndexDecode.query_entries(path_entries, path, now_ms) do
+        {:ok, decoded_entries} ->
+          {:cont, {:ok, RecordQuery.prepend_chunk(decoded_entries, chunks)}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp ranked_raw_entries(path_windows, query) do
+    path_windows
+    |> Enum.flat_map(fn {path, entries, _exhausted?} ->
+      Enum.map(entries, &{path, &1})
+    end)
+    |> Enum.sort_by(
+      fn {_path, {key, _value}} -> key end,
+      if(RAMIndexRead.reverse?(query), do: :desc, else: :asc)
+    )
+  end
+
+  defp raw_window_exhausted?(path_windows, raw_entries, count) do
+    length(raw_entries) <= count and
+      Enum.all?(path_windows, fn {_path, _entries, exhausted?} -> exhausted? end)
+  end
+
   defp lmdb_terminal_entries(
          ctx,
          index_key,
@@ -187,43 +393,91 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
          query,
          default_scan_limit
        ) do
+    scan_count = terminal_scan_count(count, query, default_scan_limit)
+
+    with {:ok, entries, _exhausted?, _scanned_count} <-
+           lmdb_terminal_entries_window(
+             ctx,
+             index_key,
+             partition_key,
+             scan_count,
+             consistent?,
+             query
+           ) do
+      {:ok, Enum.take(entries, count)}
+    end
+  end
+
+  defp lmdb_terminal_entries_window(
+         ctx,
+         index_key,
+         partition_key,
+         count,
+         consistent?,
+         query
+       ) do
     with :ok <- maybe_flush_lmdb_for_index(ctx, index_key, partition_key, consistent?),
          :ok <- LMDBMirror.require_healthy(ctx, index_key, partition_key) do
       prefix = LMDB.terminal_index_prefix(index_key)
       now_ms = CommandTime.now_ms()
-      sweep_limit = terminal_lmdb_sweep_limit()
-      scan_count = terminal_scan_count(count, query, default_scan_limit)
+      probe_count = count + 1
+      sweep_limit = terminal_lmdb_sweep_limit(probe_count)
 
       ctx
       |> lmdb_paths_for_index(index_key, partition_key)
       |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
         with {:ok, _swept} <- LMDB.sweep_expired_terminal(path, now_ms, sweep_limit),
-             {:ok, entries} <- terminal_prefix_entries(path, prefix, scan_count, query) do
-          {:cont,
-           {:ok,
-            RecordQuery.prepend_chunk(
-              LMDBIndexDecode.terminal_entries(entries, path, now_ms),
-              acc
-            )}}
+             {:ok, entries} <- terminal_prefix_entries(path, prefix, probe_count, query) do
+          {bounded_entries, exhausted?} =
+            bounded_query_entries(entries, prefix, probe_count, query)
+
+          {:cont, {:ok, [{path, bounded_entries, exhausted?} | acc]}}
         else
           {:error, _reason} = error -> {:halt, error}
         end
       end)
       |> case do
-        {:ok, chunks} ->
-          entries =
-            IndexMerge.terminal_entries_from_chunks(
-              chunks,
-              count,
-              RAMIndexRead.reverse?(query)
-            )
-
-          {:ok, entries}
+        {:ok, path_windows} ->
+          path_windows
+          |> Enum.reverse()
+          |> finalize_terminal_window(count, query, now_ms)
 
         {:error, _reason} = error ->
           error
       end
     end
+  end
+
+  defp finalize_terminal_window(path_windows, count, query, now_ms) do
+    raw_entries = ranked_raw_entries(path_windows, query)
+    selected_entries = Enum.take(raw_entries, count)
+    exhausted? = raw_window_exhausted?(path_windows, raw_entries, count)
+
+    with {:ok, chunks} <- decode_terminal_window_entries(selected_entries, now_ms) do
+      {:ok,
+       IndexMerge.terminal_entries_from_chunks(
+         chunks,
+         count,
+         RAMIndexRead.reverse?(query)
+       ), exhausted?, length(selected_entries)}
+    end
+  end
+
+  defp decode_terminal_window_entries(entries, now_ms) do
+    entries
+    |> Enum.group_by(
+      fn {path, _entry} -> path end,
+      fn {_path, entry} -> entry end
+    )
+    |> Enum.reduce_while({:ok, []}, fn {path, path_entries}, {:ok, chunks} ->
+      case LMDBIndexDecode.terminal_entries(path_entries, path, now_ms) do
+        {:ok, decoded_entries} ->
+          {:cont, {:ok, RecordQuery.prepend_chunk(decoded_entries, chunks)}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
   end
 
   defp terminal_scan_count(count, nil, _default_scan_limit), do: count
@@ -240,6 +494,20 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
 
   defp terminal_prefix_entries(path, prefix, limit, query) do
     query_prefix_entries(path, prefix, limit, query)
+  end
+
+  defp query_prefix_entries(path, prefix, limit, %{
+         rev?: true,
+         to_ms: to_ms,
+         before_id: before_id
+       })
+       when is_integer(to_ms) and to_ms >= 0 and is_binary(before_id) and before_id != "" do
+    LMDB.prefix_entries_reverse_before(
+      path,
+      prefix,
+      LMDBQueryWindow.cursor_seek_key(prefix, to_ms, before_id),
+      limit
+    )
   end
 
   defp query_prefix_entries(path, prefix, limit, %{rev?: true, to_ms: to_ms})
@@ -292,6 +560,25 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
   end
 
   defp terminal_lmdb_sweep_limit do
-    Application.get_env(:ferricstore, :flow_lmdb_terminal_sweep_limit, 10_000)
+    case Application.get_env(
+           :ferricstore,
+           :flow_lmdb_terminal_sweep_limit,
+           @default_terminal_lmdb_sweep_limit
+         ) do
+      value when is_integer(value) and value > 0 -> value
+      _invalid -> @default_terminal_lmdb_sweep_limit
+    end
   end
+
+  defp terminal_lmdb_sweep_limit(request_limit)
+       when is_integer(request_limit) and request_limit > 0 do
+    min(terminal_lmdb_sweep_limit(), request_limit)
+  end
+
+  @doc false
+  def __terminal_lmdb_sweep_limit_for_test__, do: terminal_lmdb_sweep_limit()
+
+  @doc false
+  def __terminal_lmdb_sweep_limit_for_test__(request_limit),
+    do: terminal_lmdb_sweep_limit(request_limit)
 end

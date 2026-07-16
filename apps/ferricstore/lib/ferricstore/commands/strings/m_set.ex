@@ -5,6 +5,8 @@ defmodule Ferricstore.Commands.Strings.MSet do
   alias Ferricstore.CrossShardOp
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.ReadResult
+  alias Ferricstore.Store.Router
 
   @max_key_bytes 65_535
 
@@ -34,19 +36,28 @@ defmodule Ferricstore.Commands.Strings.MSet do
     end
   end
 
+  defp msetnx_validated_args(args, %FerricStore.Instance{} = store) do
+    Router.atomic_msetnx(store, mset_pairs(args))
+  end
+
   defp msetnx_validated_args(args, store) do
     keys = extract_keys(args)
 
     CrossShardOp.execute(
       Enum.map(keys, &{&1, :write}),
       fn unified_store ->
-        if msetnx_any_exists?(args, unified_store) do
-          0
-        else
-          case mset_exec(args, unified_store) do
-            :ok -> 1
-            {:error, _} = err -> err
-          end
+        case msetnx_any_exists?(args, unified_store) do
+          {:ok, true} ->
+            0
+
+          {:ok, false} ->
+            case mset_exec(args, unified_store) do
+              :ok -> 1
+              {:error, _} = err -> err
+            end
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
         end
       end,
       intent: %{command: :msetnx, keys: %{targets: keys}},
@@ -68,41 +79,49 @@ defmodule Ferricstore.Commands.Strings.MSet do
   defp mset_exec([], _store), do: :ok
 
   defp mset_exec(args, %FerricStore.Instance{} = store) do
-    Ops.batch_put(store, mset_pairs(args))
+    Router.atomic_mset(store, mset_pairs(args))
   end
 
   defp mset_exec(args, store) do
-    if mset_needs_compound_cleanup?(args, store) do
-      mset_exec_sequential(args, store)
-    else
-      Ops.batch_put(store, mset_pairs(args))
+    case mset_needs_compound_cleanup?(args, store) do
+      {:ok, true} -> mset_exec_sequential(args, store)
+      {:ok, false} -> Ops.batch_put(store, mset_pairs(args))
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
     end
   end
 
-  defp mset_needs_compound_cleanup?([], _store), do: false
+  defp mset_needs_compound_cleanup?([], _store), do: {:ok, false}
 
   defp mset_needs_compound_cleanup?([k, _v | rest], store) do
-    Compound.data_structure_key?(k, store) or mset_needs_compound_cleanup?(rest, store)
+    case Compound.data_structure_status(k, store) do
+      :compound -> {:ok, true}
+      :plain -> mset_needs_compound_cleanup?(rest, store)
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+    end
   end
 
   defp mset_pairs([]), do: []
   defp mset_pairs([k, v | rest]), do: [{k, v} | mset_pairs(rest)]
 
   defp mset_exec_sequential(args, store) do
-    backups =
-      args
-      |> backup_mset_originals(store)
-      |> Map.new(fn {key, _plain, _compound} = backup -> {key, backup} end)
+    case backup_mset_originals(args, store) do
+      {:ok, backups} ->
+        case mset_exec_sequential_replace(args, store, []) do
+          :ok ->
+            :ok
 
-    case mset_exec_sequential_replace(args, store, []) do
-      :ok ->
-        :ok
+          {{:error, _} = err, replaced_keys} ->
+            case restore_mset_originals(replaced_keys, backups, store) do
+              :ok ->
+                err
 
-      {{:error, _} = err, replaced_keys} ->
-        case restore_mset_originals(replaced_keys, backups, store) do
-          :ok -> err
-          {:error, _} = rollback_error -> {:error, {:mset_rollback_failed, err, rollback_error}}
+              {:error, _} = rollback_error ->
+                {:error, {:mset_rollback_failed, err, rollback_error}}
+            end
         end
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
     end
   end
 
@@ -119,11 +138,26 @@ defmodule Ferricstore.Commands.Strings.MSet do
     args
     |> extract_keys()
     |> Enum.uniq()
-    |> Enum.map(&backup_string_key(&1, store))
+    |> Enum.reduce_while({:ok, %{}}, fn key, {:ok, backups} ->
+      case backup_string_key(key, store) do
+        {:ok, backup} -> {:cont, {:ok, Map.put(backups, key, backup)}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp backup_string_key(key, store) do
-    {key, Ops.get_meta(store, key), backup_compound_data_structure(key, store)}
+    with {:ok, plain_meta} <- read_plain_meta(key, store),
+         {:ok, compound_backup} <- backup_compound_data_structure(key, store) do
+      {:ok, {key, plain_meta, compound_backup}}
+    end
+  end
+
+  defp read_plain_meta(key, store) do
+    case Ops.get_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      meta -> {:ok, meta}
+    end
   end
 
   defp backup_compound_data_structure(key, store) do
@@ -131,50 +165,99 @@ defmodule Ferricstore.Commands.Strings.MSet do
       type_key = CompoundKey.type_key(key)
 
       case Ops.compound_get_meta(store, key, type_key) do
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          failure
+
         nil ->
-          nil
+          {:ok, nil}
 
         {type, type_expire_at_ms} ->
-          %{
-            type: {type_key, type, type_expire_at_ms},
-            entries: backup_compound_entries(key, type, store)
-          }
+          case backup_compound_entries(key, type, store) do
+            {:ok, entries} ->
+              {:ok,
+               %{
+                 type: {type_key, type, type_expire_at_ms},
+                 entries: entries
+               }}
+
+            {:error, _reason} = error ->
+              error
+          end
       end
+    else
+      {:ok, nil}
     end
   end
 
   defp backup_compound_entries(key, type, store) do
-    entries =
-      key
-      |> Compound.prefixes_for_type(type)
-      |> Enum.flat_map(&scan_compound_entries(&1, key, store))
+    with {:ok, entries} <- backup_compound_prefixes(key, type, store) do
+      maybe_add_list_meta_entry(entries, key, type, store)
+    end
+  end
 
-    maybe_add_list_meta_entry(entries, key, type, store)
+  defp backup_compound_prefixes(key, type, store) do
+    key
+    |> Compound.prefixes_for_type(type)
+    |> Enum.reduce_while({:ok, []}, fn prefix, {:ok, entries} ->
+      case scan_compound_entries(prefix, key, store) do
+        {:ok, prefix_entries} -> {:cont, {:ok, prefix_entries ++ entries}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp scan_compound_entries(prefix, key, store) do
-    store
-    |> Ops.compound_scan(key, prefix)
-    |> Enum.flat_map(fn {field, _value} ->
-      compound_key = prefix <> field
+    case Ops.compound_scan(store, key, prefix) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
 
-      case Ops.compound_get_meta(store, key, compound_key) do
-        nil -> []
-        {value, expire_at_ms} -> [{compound_key, value, expire_at_ms}]
-      end
-    end)
+      pairs when is_list(pairs) ->
+        compound_keys =
+          Enum.map(pairs, fn {field, _value} -> Compound.scanned_key(prefix, field) end)
+
+        metas = Ops.compound_batch_get_meta(store, key, compound_keys)
+
+        case metas do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
+
+          metas when is_list(metas) ->
+            cond do
+              length(metas) != length(compound_keys) ->
+                ReadResult.failure(:compound_batch_meta_length_mismatch)
+
+              failure = ReadResult.first_failure(metas) ->
+                failure
+
+              true ->
+                entries =
+                  compound_keys
+                  |> Enum.zip(metas)
+                  |> Enum.flat_map(fn
+                    {_compound_key, nil} -> []
+                    {compound_key, {value, expire_at_ms}} -> [{compound_key, value, expire_at_ms}]
+                  end)
+
+                {:ok, entries}
+            end
+
+          invalid ->
+            ReadResult.failure({:invalid_compound_batch_meta_result, invalid})
+        end
+    end
   end
 
   defp maybe_add_list_meta_entry(entries, key, "list", store) do
     meta_key = CompoundKey.list_meta_key(key)
 
     case Ops.compound_get_meta(store, key, meta_key) do
-      nil -> entries
-      {value, expire_at_ms} -> [{meta_key, value, expire_at_ms} | entries]
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      nil -> {:ok, entries}
+      {value, expire_at_ms} -> {:ok, [{meta_key, value, expire_at_ms} | entries]}
     end
   end
 
-  defp maybe_add_list_meta_entry(entries, _key, _type, _store), do: entries
+  defp maybe_add_list_meta_entry(entries, _key, _type, _store), do: {:ok, entries}
 
   defp restore_mset_originals(replaced_keys, backups, store) do
     replaced_keys
@@ -216,12 +299,18 @@ defmodule Ferricstore.Commands.Strings.MSet do
     end
   end
 
-  defp msetnx_any_exists?([], _store), do: false
+  defp msetnx_any_exists?([], _store), do: {:ok, false}
 
   defp msetnx_any_exists?([k, _v | rest], store) do
-    if Ops.exists?(store, k) or Compound.data_structure_key?(k, store),
-      do: true,
-      else: msetnx_any_exists?(rest, store)
+    if Ops.exists?(store, k) do
+      {:ok, true}
+    else
+      case Compound.data_structure_status(k, store) do
+        :compound -> {:ok, true}
+        :plain -> msetnx_any_exists?(rest, store)
+        {:error, {:storage_read_failed, _reason}} = failure -> failure
+      end
+    end
   end
 
   defp extract_keys([]), do: []

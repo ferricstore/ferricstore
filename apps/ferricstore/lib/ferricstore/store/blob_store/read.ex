@@ -14,27 +14,7 @@ defmodule Ferricstore.Store.BlobStore.Read do
         if BlobRef.valid?(ref), do: do_get(data_dir, shard_index, ref), else: invalid_blob_ref()
       end
 
-      defp do_get(data_dir, shard_index, %BlobRef{version: 1} = ref) do
-        path = BlobRef.path(data_dir, shard_index, ref)
-
-        result =
-          with {:ok, payload} <- File.read(path),
-               :ok <- verify_size(ref, payload),
-               :ok <- verify_checksum(ref, payload) do
-            {:ok, payload}
-          end
-
-        case result do
-          {:ok, _payload} = ok ->
-            ok
-
-          {:error, reason} = error ->
-            emit_error(:get, shard_index, path, ref, reason)
-            error
-        end
-      end
-
-      defp do_get(data_dir, shard_index, %BlobRef{version: 2, size: size, offset: offset} = ref) do
+      defp do_get(data_dir, shard_index, %BlobRef{size: size, offset: offset} = ref) do
         path = BlobRef.path(data_dir, shard_index, ref)
         result = read_segment_payload(path, offset, size, ref)
 
@@ -90,29 +70,10 @@ defmodule Ferricstore.Store.BlobStore.Read do
         end
       end
 
-      defp do_verify(data_dir, shard_index, %BlobRef{version: 1, size: size} = ref) do
-        path = BlobRef.path(data_dir, shard_index, ref)
-
-        result =
-          with :ok <- stat_regular_size(path, size),
-               :ok <- file_matches_ref?(path, ref) do
-            :ok
-          end
-
-        case result do
-          :ok ->
-            :ok
-
-          {:error, reason} = error ->
-            emit_error(:verify, shard_index, path, ref, reason)
-            error
-        end
-      end
-
       defp do_verify(
              data_dir,
              shard_index,
-             %BlobRef{version: 2, size: size, offset: offset} = ref
+             %BlobRef{size: size, offset: offset} = ref
            ) do
         path = BlobRef.path(data_dir, shard_index, ref)
 
@@ -195,8 +156,7 @@ defmodule Ferricstore.Store.BlobStore.Read do
       end
 
       defp do_verify_many(data_dir, shard_index, refs) do
-        with {:ok, unique_refs} <- unique_blob_refs(refs),
-             :ok <- verify_legacy_refs(data_dir, shard_index, unique_refs) do
+        with {:ok, unique_refs} <- unique_blob_refs(refs) do
           verify_segment_refs(data_dir, shard_index, unique_refs)
         end
       end
@@ -225,25 +185,8 @@ defmodule Ferricstore.Store.BlobStore.Read do
         end
       end
 
-      defp verify_legacy_refs(data_dir, shard_index, refs) do
-        Enum.reduce_while(refs, :ok, fn
-          %BlobRef{version: 1} = ref, :ok ->
-            case do_verify(data_dir, shard_index, ref) do
-              :ok -> {:cont, :ok}
-              {:error, _reason} = error -> {:halt, error}
-            end
-
-          %BlobRef{version: 2}, :ok ->
-            {:cont, :ok}
-
-          %BlobRef{}, :ok ->
-            {:halt, {:error, :invalid_blob_ref}}
-        end)
-      end
-
       defp verify_segment_refs(data_dir, shard_index, refs) do
         refs
-        |> Enum.filter(&match?(%BlobRef{version: 2}, &1))
         |> Enum.group_by(& &1.segment_id)
         |> Enum.reduce_while(:ok, fn {segment_id, segment_refs}, :ok ->
           path = segment_path(data_dir, shard_index, segment_id)
@@ -322,34 +265,7 @@ defmodule Ferricstore.Store.BlobStore.Read do
       end
 
       defp load_blob_refs(data_dir, shard_index, refs) do
-        {legacy_refs, segment_refs, invalid_refs} =
-          Enum.reduce(refs, {[], [], []}, fn
-            %BlobRef{version: 1} = ref, {legacy_refs, segment_refs, invalid_refs} ->
-              {[ref | legacy_refs], segment_refs, invalid_refs}
-
-            %BlobRef{version: 2} = ref, {legacy_refs, segment_refs, invalid_refs} ->
-              {legacy_refs, [ref | segment_refs], invalid_refs}
-
-            %BlobRef{} = ref, {legacy_refs, segment_refs, invalid_refs} ->
-              {legacy_refs, segment_refs, [ref | invalid_refs]}
-          end)
-
-        %{}
-        |> put_invalid_ref_results(invalid_refs)
-        |> put_legacy_ref_results(data_dir, shard_index, Enum.reverse(legacy_refs))
-        |> put_segment_ref_results(data_dir, shard_index, Enum.reverse(segment_refs))
-      end
-
-      defp put_invalid_ref_results(results, refs) do
-        Enum.reduce(refs, results, fn ref, acc ->
-          Map.put(acc, ref, {:error, :invalid_blob_ref})
-        end)
-      end
-
-      defp put_legacy_ref_results(results, data_dir, shard_index, refs) do
-        Enum.reduce(refs, results, fn ref, acc ->
-          Map.put(acc, ref, get(data_dir, shard_index, ref))
-        end)
+        put_segment_ref_results(%{}, data_dir, shard_index, refs)
       end
 
       defp put_segment_ref_results(results, _data_dir, _shard_index, []), do: results
@@ -459,34 +375,7 @@ defmodule Ferricstore.Store.BlobStore.Read do
       defp validate_segment_payload(_payload, %BlobRef{}), do: {:error, :size_mismatch}
 
       defp load_blob_file_refs(data_dir, shard_index, refs) do
-        {legacy_refs, segment_refs, invalid_refs} =
-          Enum.reduce(refs, {[], [], []}, fn
-            %BlobRef{version: 1} = ref, {legacy_refs, segment_refs, invalid_refs} ->
-              {[ref | legacy_refs], segment_refs, invalid_refs}
-
-            %BlobRef{version: 2} = ref, {legacy_refs, segment_refs, invalid_refs} ->
-              {legacy_refs, [ref | segment_refs], invalid_refs}
-
-            %BlobRef{} = ref, {legacy_refs, segment_refs, invalid_refs} ->
-              {legacy_refs, segment_refs, [ref | invalid_refs]}
-          end)
-
-        %{}
-        |> put_invalid_file_ref_results(invalid_refs)
-        |> put_legacy_file_ref_results(data_dir, shard_index, Enum.reverse(legacy_refs))
-        |> put_segment_file_ref_results(data_dir, shard_index, Enum.reverse(segment_refs))
-      end
-
-      defp put_invalid_file_ref_results(results, refs) do
-        Enum.reduce(refs, results, fn ref, acc ->
-          Map.put(acc, ref, {:error, :invalid_blob_ref})
-        end)
-      end
-
-      defp put_legacy_file_ref_results(results, data_dir, shard_index, refs) do
-        Enum.reduce(refs, results, fn ref, acc ->
-          Map.put(acc, ref, file_ref(data_dir, shard_index, ref))
-        end)
+        put_segment_file_ref_results(%{}, data_dir, shard_index, refs)
       end
 
       defp put_segment_file_ref_results(results, _data_dir, _shard_index, []), do: results
@@ -580,7 +469,7 @@ defmodule Ferricstore.Store.BlobStore.Read do
 
       defp validate_segment_header(
              header,
-             %BlobRef{version: 2, size: size, checksum: expected_checksum}
+             %BlobRef{size: size, checksum: expected_checksum}
            )
            when is_binary(header) and byte_size(header) == @segment_header_bytes do
         case decode_segment_header(header) do
@@ -609,28 +498,10 @@ defmodule Ferricstore.Store.BlobStore.Read do
           else: invalid_blob_ref()
       end
 
-      defp do_file_ref(data_dir, shard_index, %BlobRef{version: 1, size: size} = ref) do
-        path = BlobRef.path(data_dir, shard_index, ref)
-
-        result =
-          with :ok <- stat_regular_size(path, size) do
-            {:ok, {path, 0, size}}
-          end
-
-        case result do
-          {:ok, _file_ref} = ok ->
-            ok
-
-          {:error, reason} = error ->
-            emit_error(:file_ref, shard_index, path, ref, reason)
-            error
-        end
-      end
-
       defp do_file_ref(
              data_dir,
              shard_index,
-             %BlobRef{version: 2, size: size, offset: offset} = ref
+             %BlobRef{size: size, offset: offset} = ref
            ) do
         path = BlobRef.path(data_dir, shard_index, ref)
 
@@ -711,34 +582,7 @@ defmodule Ferricstore.Store.BlobStore.Read do
       defp do_get_range(
              data_dir,
              shard_index,
-             %BlobRef{version: 1, size: size} = ref,
-             relative_offset,
-             count
-           ) do
-        path = BlobRef.path(data_dir, shard_index, ref)
-
-        result =
-          with :ok <- validate_blob_range(size, relative_offset, count),
-               :ok <- stat_regular_size(path, size),
-               :ok <- file_matches_ref?(path, ref),
-               {:ok, slice} <- read_blob_file_range(path, relative_offset, count) do
-            {:ok, slice}
-          end
-
-        case result do
-          {:ok, _payload} = ok ->
-            ok
-
-          {:error, reason} = error ->
-            emit_error(:get_range, shard_index, path, ref, reason)
-            error
-        end
-      end
-
-      defp do_get_range(
-             data_dir,
-             shard_index,
-             %BlobRef{version: 2, size: size, offset: offset} = ref,
+             %BlobRef{size: size, offset: offset} = ref,
              relative_offset,
              count
            ) do

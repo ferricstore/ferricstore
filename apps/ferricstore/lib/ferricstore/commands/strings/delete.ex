@@ -1,8 +1,20 @@
 defmodule Ferricstore.Commands.Strings.Delete do
   @moduledoc false
 
-  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK}
-  alias Ferricstore.Store.{CompoundKey, Ops, TypeRegistry}
+  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, ProbType, TopK}
+  alias Ferricstore.Commands.Stream.{CacheKey, Meta, Waiters}
+  alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
+  alias Ferricstore.TermCodec
+
+  def cleanup_stream_metadata(key, %{defer_stream_cleanup: defer} = store)
+      when is_function(defer, 1) do
+    defer.(CacheKey.build(store, key))
+  end
+
+  def cleanup_stream_metadata(key, store) do
+    Meta.cleanup_local(key, store)
+    Waiters.clear(key, store)
+  end
 
   def do_del_key(key, store) do
     if Ops.has_compound?(store) do
@@ -12,36 +24,15 @@ defmodule Ferricstore.Commands.Strings.Delete do
     end
   end
 
-  def cleanup_stream_metadata(key) do
-    meta_table = Ferricstore.Stream.Meta
-    groups_table = Ferricstore.Stream.Groups
-    index_table = Ferricstore.Stream.Index
-    waiters_table = :ferricstore_stream_waiters
-
-    if :ets.whereis(meta_table) != :undefined do
-      :ets.delete(meta_table, key)
-    end
-
-    if :ets.whereis(groups_table) != :undefined do
-      :ets.match_delete(groups_table, {{key, :_}, :_, :_, :_})
-    end
-
-    if :ets.whereis(index_table) != :undefined do
-      :ets.select_delete(index_table, [{{{key, :_, :_}, :_, :_}, [], [true]}])
-      :ets.delete(index_table, {:ready, key})
-    end
-
-    if :ets.whereis(waiters_table) != :undefined do
-      :ets.match_delete(waiters_table, {key, :_, :_, :_})
-    end
-
-    :ok
-  end
+  def cleanup_stream_metadata(key), do: cleanup_stream_metadata(key, nil)
 
   defp delete_key_with_compound_support(key, store) do
     type_key = CompoundKey.type_key(key)
 
     case Ops.compound_get(store, key, type_key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         case maybe_delete_stream_key(key, store) do
           true -> true
@@ -97,7 +88,7 @@ defmodule Ferricstore.Commands.Strings.Delete do
          :ok <- delete_stream_groups_if_needed(key, type_str, store),
          :ok <- delete_stream_durable_meta_if_needed(key, type_str, store),
          :ok <- delete_list_meta_if_needed(key, type_str, store),
-         :ok <- delete_stream_metadata_if_needed(key, type_str),
+         :ok <- delete_stream_metadata_if_needed(key, type_str, store),
          :ok <- TypeRegistry.delete_type(key, store) do
       :ok
     end
@@ -126,12 +117,10 @@ defmodule Ferricstore.Commands.Strings.Delete do
 
   defp delete_stream_durable_meta_if_needed(_key, _type_str, _store), do: :ok
 
-  defp delete_stream_metadata_if_needed(key, "stream") do
-    cleanup_stream_metadata(key)
-    :ok
-  end
+  defp delete_stream_metadata_if_needed(key, "stream", store),
+    do: cleanup_stream_metadata(key, store)
 
-  defp delete_stream_metadata_if_needed(_key, _type_str), do: :ok
+  defp delete_stream_metadata_if_needed(_key, _type_str, _store), do: :ok
 
   defp maybe_delete_prob_file(_key, %FerricStore.Instance{}), do: :ok
   defp maybe_delete_prob_file(_key, %Ferricstore.Store.LocalTxStore{}), do: :ok
@@ -158,45 +147,62 @@ defmodule Ferricstore.Commands.Strings.Delete do
   end
 
   defp decode_prob_meta(value) when is_binary(value) do
-    try do
-      value
-      |> :erlang.binary_to_term([:safe])
-      |> decode_prob_meta()
-    rescue
-      _ -> nil
+    case TermCodec.decode(value) do
+      {:ok, metadata} -> decode_prob_meta(metadata)
+      {:error, :invalid_external_term} -> nil
     end
   end
 
-  defp decode_prob_meta({:bloom_meta, _}), do: :bloom
-  defp decode_prob_meta({:cms_meta, _}), do: :cms
-  defp decode_prob_meta({:cuckoo_meta, _}), do: :cuckoo
-  defp decode_prob_meta({:topk_meta, _}), do: :topk
-  defp decode_prob_meta({:topk_path, _}), do: :topk
-  defp decode_prob_meta(_), do: nil
+  defp decode_prob_meta(metadata) do
+    case ProbType.metadata_type(metadata) do
+      type when type in [:bloom, :cms, :cuckoo, :topk] -> type
+      :other -> nil
+    end
+  end
 
   defp maybe_delete_stream_key(key, store) do
     prefix = CompoundKey.stream_prefix(key)
     group_prefix = CompoundKey.stream_group_prefix(key)
     meta_key = CompoundKey.stream_meta_key(key)
 
-    if Ops.compound_scan(store, key, prefix) != [] or
-         Ops.compound_scan(store, key, group_prefix) != [] or
-         Ops.compound_get(store, key, meta_key) != nil or stream_metadata_exists?(key) do
-      with :ok <- Ops.compound_delete_prefix(store, key, prefix),
-           :ok <- Ops.compound_delete_prefix(store, key, group_prefix),
-           :ok <- Ops.compound_delete(store, key, meta_key) do
-        cleanup_stream_metadata(key)
-        true
+    with {:ok, stream_entries?} <- compound_prefix_present?(store, key, prefix),
+         {:ok, group_entries?} <- compound_prefix_present?(store, key, group_prefix),
+         {:ok, stream_meta?} <- compound_key_present?(store, key, meta_key) do
+      if stream_entries? or group_entries? or stream_meta? or stream_metadata_exists?(key, store) do
+        with :ok <- Ops.compound_delete_prefix(store, key, prefix),
+             :ok <- Ops.compound_delete_prefix(store, key, group_prefix),
+             :ok <- Ops.compound_delete(store, key, meta_key) do
+          case cleanup_stream_metadata(key, store) do
+            :ok -> true
+            {:error, _reason} = error -> error
+          end
+        else
+          {:error, _reason} = error -> error
+        end
       else
-        {:error, _reason} = error -> error
+        false
       end
-    else
-      false
     end
   end
 
-  defp stream_metadata_exists?(key) do
+  defp compound_prefix_present?(store, key, prefix) do
+    case Ops.compound_scan(store, key, prefix) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      entries when is_list(entries) -> {:ok, entries != []}
+    end
+  end
+
+  defp compound_key_present?(store, key, compound_key) do
+    case Ops.compound_get(store, key, compound_key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      nil -> {:ok, false}
+      _value -> {:ok, true}
+    end
+  end
+
+  defp stream_metadata_exists?(key, store) do
     table = Ferricstore.Stream.Meta
-    :ets.whereis(table) != :undefined and :ets.lookup(table, key) != []
+    cache_key = CacheKey.build(store, key)
+    :ets.whereis(table) != :undefined and :ets.lookup(table, cache_key) != []
   end
 end

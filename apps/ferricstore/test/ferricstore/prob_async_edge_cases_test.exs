@@ -90,6 +90,14 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
     %{
       prob_dir: fn -> dir end,
       exists?: fn key -> Agent.get(pid, &Map.has_key?(&1, key)) end,
+      get: fn key ->
+        Agent.get(pid, fn state ->
+          case Map.get(state, key) do
+            {value, _ttl} -> value
+            nil -> nil
+          end
+        end)
+      end,
       put: fn key, value, ttl ->
         Agent.update(pid, &Map.put(&1, key, {value, ttl}))
         :ok
@@ -98,8 +106,7 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
   end
 
   defp prob_file_path(dir, key, ext) do
-    safe = Base.url_encode64(key, padding: false)
-    Path.join(dir, "#{safe}.#{ext}")
+    Ferricstore.ProbFile.path(dir, key, ext)
   end
 
   describe "cuckoo file write edge cases" do
@@ -702,7 +709,7 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
       store = make_topk_store()
       key = "large_topk"
 
-      TopK.handle("TOPK.RESERVE", [key, "100", "32", "7", "0.9"], store)
+      TopK.handle("TOPK.RESERVE", [key, "100", "32", "7"], store)
 
       for i <- 0..99 do
         TopK.handle("TOPK.ADD", [key, "elem_#{i}"], store)
@@ -717,7 +724,7 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
       store = make_topk_store()
       key = "large_topk_wc"
 
-      TopK.handle("TOPK.RESERVE", [key, "100", "32", "7", "0.9"], store)
+      TopK.handle("TOPK.RESERVE", [key, "100", "32", "7"], store)
 
       for i <- 0..99 do
         # Add multiple times so each has count > 0

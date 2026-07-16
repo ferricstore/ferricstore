@@ -42,7 +42,7 @@ defmodule Ferricstore.Commands.BloomTest do
     }
 
     # Note: exists? is intentionally omitted so the handler falls back
-    # to File.exists? on the base64-encoded path.
+    # to File.exists? on the deterministic sidecar path.
     %{
       bloom_registry: bloom_registry,
       get: fn key ->
@@ -64,11 +64,9 @@ defmodule Ferricstore.Commands.BloomTest do
     dir
   end
 
-  # Computes the new-style prob file path (base64 encoded key)
   defp prob_file_path(store, key, ext) do
     dir = store.bloom_registry.dir
-    safe = Base.url_encode64(key, padding: false)
-    Path.join(dir, "#{safe}.#{ext}")
+    Ferricstore.ProbFile.path(dir, key, ext)
   end
 
   # ===========================================================================
@@ -80,7 +78,7 @@ defmodule Ferricstore.Commands.BloomTest do
       store = make_store()
       assert :ok = Bloom.handle("BF.RESERVE", ["mybloom", "0.01", "1000"], store)
 
-      # Verify the .bloom file was created (new base64 path convention)
+      # Verify the digest-named .bloom file was created.
       path = prob_file_path(store, "mybloom", "bloom")
       assert File.exists?(path)
     end
@@ -89,7 +87,7 @@ defmodule Ferricstore.Commands.BloomTest do
       wrong_dir = make_temp_dir()
       right_dir = make_temp_dir()
       key = "key_specific_bloom"
-      safe = Base.url_encode64(key, padding: false)
+      filename = Ferricstore.ProbFile.filename(key, "bloom")
 
       store =
         make_store(dir: wrong_dir)
@@ -97,8 +95,8 @@ defmodule Ferricstore.Commands.BloomTest do
         |> Map.put(:prob_dir_for_key, fn ^key -> right_dir end)
 
       assert :ok = Bloom.handle("BF.RESERVE", [key, "0.01", "1000"], store)
-      assert File.exists?(Path.join(right_dir, "#{safe}.bloom"))
-      refute File.exists?(Path.join(wrong_dir, "#{safe}.bloom"))
+      assert File.exists?(Path.join(right_dir, filename))
+      refute File.exists?(Path.join(wrong_dir, filename))
     end
 
     test "returns error when key already exists" do

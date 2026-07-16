@@ -54,7 +54,10 @@ defmodule Ferricstore.DataDir do
     Raises on filesystem errors (e.g. permission denied).
   """
   @spec ensure_layout!(binary(), pos_integer()) :: :ok
-  def ensure_layout!(data_dir, shard_count \\ 4) do
+  def ensure_layout!(data_dir, shard_count \\ 4)
+
+  def ensure_layout!(data_dir, shard_count)
+      when is_binary(data_dir) and is_integer(shard_count) and shard_count > 0 do
     created_dirs = maybe_create_dir([], data_dir, :create_root)
 
     created_dirs =
@@ -70,23 +73,23 @@ defmodule Ferricstore.DataDir do
       end)
 
     created_dirs =
-      if shard_count > 0 do
-        Enum.reduce(1..shard_count, created_dirs, fn partition, acc ->
-          root = Path.join([data_dir, "waraft", "#{@waraft_storage_root}.#{partition}"])
+      Enum.reduce(1..shard_count, created_dirs, fn partition, acc ->
+        root = Path.join([data_dir, "waraft", "#{@waraft_storage_root}.#{partition}"])
 
-          acc
-          |> maybe_create_dir(root, :create_waraft_partition_dir)
-          |> maybe_create_dir(Path.join(root, "segment_log"), :create_waraft_segment_log_dir)
-        end)
-      else
-        created_dirs
-      end
+        acc
+        |> maybe_create_dir(root, :create_waraft_partition_dir)
+        |> maybe_create_dir(Path.join(root, "segment_log"), :create_waraft_segment_log_dir)
+      end)
 
     fsync_created_dir_parents!(created_dirs)
 
     Logger.debug("DataDir layout ensured under #{data_dir} (#{shard_count} shards)")
 
     :ok
+  end
+
+  def ensure_layout!(_data_dir, _shard_count) do
+    raise ArgumentError, "data_dir must be a binary and shard_count must be a positive integer"
   end
 
   defp maybe_create_dir(created_dirs, path, phase) do
@@ -216,14 +219,24 @@ defmodule Ferricstore.DataDir do
   @spec root_from_shard_path(binary()) :: binary()
   def root_from_shard_path(shard_data_path) do
     parent = Path.dirname(shard_data_path)
+    basename = Path.basename(shard_data_path)
 
-    if Path.basename(parent) == "data" do
+    if Path.basename(parent) == "data" and canonical_shard_basename?(basename) do
       Path.dirname(parent)
     else
       raise ArgumentError,
             "expected canonical shard data path root/data/shard_N, got: #{inspect(shard_data_path)}"
     end
   end
+
+  defp canonical_shard_basename?("shard_" <> index) do
+    case Integer.parse(index) do
+      {value, ""} when value >= 0 -> Integer.to_string(value) == index
+      _invalid -> false
+    end
+  end
+
+  defp canonical_shard_basename?(_basename), do: false
 
   @doc """
   Returns the list of top-level subdirectory names that make up the layout.

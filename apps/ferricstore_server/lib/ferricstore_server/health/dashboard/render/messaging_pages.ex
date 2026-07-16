@@ -170,9 +170,15 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
               Map.get(summary, :pattern_subscriptions, 0)
           )
       },
-      %{label: "Subscribers", value: format_number(Map.get(summary, :active_subscribers, 0))}
+      %{
+        label: "Subscribers",
+        value: format_optional_number(Map.get(summary, :active_subscribers, 0))
+      }
     ])
   end
+
+  defp format_optional_number(nil), do: "-"
+  defp format_optional_number(value), do: format_number(value)
 
   def render_pubsub_channels(data) do
     rows = Map.get(data, :channels, [])

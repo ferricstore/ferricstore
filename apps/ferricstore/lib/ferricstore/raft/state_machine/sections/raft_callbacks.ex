@@ -45,6 +45,81 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       alias Ferricstore.Transaction.Ast, as: TxAst
 
       defp apply_cross_shard_tx(meta, shard_batches, watched_keys, state) do
+        if is_list(shard_batches) or
+             cross_shard_tx_targets_remote_group?(shard_batches, state.shard_index) do
+          reject_cross_shard_tx(meta, state)
+        else
+          apply_local_cross_shard_tx(meta, shard_batches, watched_keys, state)
+        end
+      end
+
+      defp cross_shard_tx_targets_remote_group?(shard_batches, local_shard_index)
+           when is_list(shard_batches) do
+        Enum.any?(shard_batches, fn
+          {shard_index, _queue, _sandbox_namespace} when is_integer(shard_index) ->
+            shard_index != local_shard_index
+
+          _invalid_batch ->
+            false
+        end)
+      end
+
+      defp cross_shard_tx_targets_remote_group?(_shard_batches, _local_shard_index), do: false
+
+      defp reject_cross_shard_tx(meta, state) do
+        with_apply_time(meta, fn ->
+          old_count = state.applied_count
+          new_state = %{state | applied_count: old_count + 1}
+
+          maybe_release_cursor(
+            meta,
+            old_count,
+            new_state,
+            {:error, "CROSSSLOT cross-shard Raft transactions are not supported"}
+          )
+        end)
+      end
+
+      defp apply_tx_execute(meta, queue, sandbox_namespace, watched_keys, state) do
+        with_apply_time(meta, fn ->
+          with_current_ra_index(meta, fn ->
+            old_count = state.applied_count
+
+            write_result =
+              if transaction_watches_clean?(watched_keys, state) do
+                with_cross_shard_pending_writes(state, fn ->
+                  ShardTransaction.execute(
+                    queue,
+                    sandbox_namespace,
+                    build_local_raft_tx_store(state)
+                  )
+                end)
+              else
+                nil
+              end
+
+            case write_result do
+              {:error, _reason} = error ->
+                new_state = %{state | applied_count: old_count + 1}
+                maybe_release_cursor(meta, old_count, new_state, error)
+
+              {:error, reason, flushed_state} ->
+                new_state = %{flushed_state | applied_count: old_count + 1}
+                maybe_release_cursor(meta, old_count, new_state, {:error, reason})
+
+              {results, flushed_state} when is_list(results) ->
+                new_state = %{flushed_state | applied_count: old_count + 1}
+                maybe_release_cursor(meta, old_count, new_state, results)
+
+              nil ->
+                new_state = %{state | applied_count: old_count + 1}
+                maybe_release_cursor(meta, old_count, new_state, nil)
+            end
+          end)
+        end)
+      end
+
+      defp apply_local_cross_shard_tx(meta, shard_batches, watched_keys, state) do
         with_apply_time(meta, fn ->
           old_count = state.applied_count
 
@@ -314,6 +389,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       @doc false
       def apply_standalone_command(command, meta, state) when is_map(meta) do
         apply_standalone(fn -> apply(meta, command, state) end)
+      end
+
+      @doc false
+      def apply_standalone_cross_shard(execute_fn, state) when is_function(execute_fn, 1) do
+        apply_standalone(fn ->
+          with_cross_shard_pending_writes(state, fn ->
+            Process.put(:tx_deleted_keys, MapSet.new())
+            Process.put(:tx_pending_values, %{})
+
+            try do
+              state.shard_index
+              |> build_cross_shard_store(state)
+              |> execute_fn.()
+            catch
+              {:transaction_store_failure, reason} -> {:error, reason}
+            after
+              Process.delete(:tx_deleted_keys)
+              Process.delete(:tx_pending_values)
+            end
+          end)
+        end)
       end
 
       @doc false
@@ -752,26 +848,51 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       end
 
       defp consume_pending_state(state) do
-        case apply_state_pop(:pending_state) do
-          nil ->
-            state
+        state =
+          case apply_state_pop(:pending_state) do
+            nil ->
+              state
 
-          pending_state ->
-            state
-            |> Map.merge(%{
-              active_file_id: pending_state.active_file_id,
-              active_file_path: pending_state.active_file_path,
-              active_file_size: pending_state.active_file_size,
-              file_stats: pending_state.file_stats
-            })
-            |> Map.put(
-              :promoted_instances,
-              Map.get(
-                pending_state,
+            pending_state ->
+              state
+              |> Map.merge(%{
+                active_file_id: pending_state.active_file_id,
+                active_file_path: pending_state.active_file_path,
+                active_file_size: pending_state.active_file_size,
+                file_stats: pending_state.file_stats
+              })
+              |> Map.put(
                 :promoted_instances,
-                Map.get(state, :promoted_instances, %{})
+                Map.get(
+                  pending_state,
+                  :promoted_instances,
+                  Map.get(state, :promoted_instances, %{})
+                )
               )
-            )
+          end
+
+        state =
+          case apply_state_pop(:flow_hibernation_promotion_cursor, :unchanged) do
+            :unchanged ->
+              state
+
+            %{bucket_ms: bucket_ms, after_key: after_key} = cursor
+            when is_integer(bucket_ms) and bucket_ms >= 0 and
+                   (is_nil(after_key) or is_binary(after_key)) ->
+              Map.put(state, :flow_hibernation_promotion_cursor, cursor)
+
+            _invalid ->
+              Map.put(state, :flow_hibernation_promotion_cursor, nil)
+          end
+
+        removals = apply_state_pop(:promoted_instance_removals, MapSet.new())
+
+        if MapSet.size(removals) == 0 do
+          state
+        else
+          Map.update!(state, :promoted_instances, fn promoted_instances ->
+            Enum.reduce(removals, promoted_instances, &Map.delete(&2, &1))
+          end)
         end
       end
 
@@ -902,14 +1023,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
 
       defp checkpoint_clean?(_state), do: true
 
-      defp with_apply_time(%{system_time: now_ms}, fun) when is_integer(now_ms) do
+      defp with_apply_time(%{system_time: now_ms} = meta, fun) when is_integer(now_ms) do
         clear_stale_pending_state()
-        CommandTime.with_now_ms(now_ms, fun)
+        CommandTime.with_now_ms(now_ms, fn -> with_current_ra_index(meta, fun) end)
       end
 
-      defp with_apply_time(_meta, fun) do
+      defp with_apply_time(meta, fun) do
         clear_stale_pending_state()
-        fun.()
+        with_current_ra_index(meta, fun)
       end
 
       defp clear_stale_pending_state do

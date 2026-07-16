@@ -22,12 +22,12 @@ defmodule Ferricstore.Commands.List do
   def handle("RPUSH", _, _), do: {:error, "ERR wrong number of arguments for 'rpush' command"}
 
   def handle("LPOP", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
          do: do_pop(key, store, :lpop, 1)
   end
 
   def handle("LPOP", [key, count_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case Integer.parse(count_str) do
         {count, ""} when count >= 0 ->
           do_pop(key, store, :lpop, count)
@@ -41,12 +41,12 @@ defmodule Ferricstore.Commands.List do
   def handle("LPOP", _, _), do: {:error, "ERR wrong number of arguments for 'lpop' command"}
 
   def handle("RPOP", [key], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
          do: do_pop(key, store, :rpop, 1)
   end
 
   def handle("RPOP", [key, count_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case Integer.parse(count_str) do
         {count, ""} when count >= 0 ->
           do_pop(key, store, :rpop, count)
@@ -60,9 +60,9 @@ defmodule Ferricstore.Commands.List do
   def handle("RPOP", _, _), do: {:error, "ERR wrong number of arguments for 'rpop' command"}
 
   def handle("LRANGE", [key, start_str, stop_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case {Integer.parse(start_str), Integer.parse(stop_str)} do
-        {{start, ""}, {stop, ""}} -> ListOps.execute(key, store, {:lrange, start, stop})
+        {{start, ""}, {stop, ""}} -> execute_list_op(key, store, {:lrange, start, stop})
         _ -> {:error, "ERR value is not an integer or out of range"}
       end
     end
@@ -73,16 +73,16 @@ defmodule Ferricstore.Commands.List do
   def handle("LLEN", [key], store),
     do:
       with(
-        :ok <- TypeRegistry.check_type(key, :list, store),
-        do: ListOps.execute(key, store, :llen)
+        :ok <- TypeRegistry.command_check_type(key, :list, store),
+        do: execute_list_op(key, store, :llen)
       )
 
   def handle("LLEN", _, _), do: {:error, "ERR wrong number of arguments for 'llen' command"}
 
   def handle("LINDEX", [key, index_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case Integer.parse(index_str) do
-        {index, ""} -> ListOps.execute(key, store, {:lindex, index})
+        {index, ""} -> execute_list_op(key, store, {:lindex, index})
         _ -> {:error, "ERR value is not an integer or out of range"}
       end
     end
@@ -91,9 +91,9 @@ defmodule Ferricstore.Commands.List do
   def handle("LINDEX", _, _), do: {:error, "ERR wrong number of arguments for 'lindex' command"}
 
   def handle("LSET", [key, index_str, element], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case Integer.parse(index_str) do
-        {index, ""} -> ListOps.execute(key, store, {:lset, index, element})
+        {index, ""} -> execute_list_op(key, store, {:lset, index, element})
         _ -> {:error, "ERR value is not an integer or out of range"}
       end
     end
@@ -102,11 +102,11 @@ defmodule Ferricstore.Commands.List do
   def handle("LSET", _, _), do: {:error, "ERR wrong number of arguments for 'lset' command"}
 
   def handle("LREM", [key, count_str, element], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case Integer.parse(count_str) do
         {count, ""} ->
           key
-          |> ListOps.execute(store, {:lrem, count, element})
+          |> execute_list_op(store, {:lrem, count, element})
           |> return_after_list_delete_count(key, store)
 
         _ ->
@@ -118,11 +118,11 @@ defmodule Ferricstore.Commands.List do
   def handle("LREM", _, _), do: {:error, "ERR wrong number of arguments for 'lrem' command"}
 
   def handle("LTRIM", [key, start_str, stop_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case {Integer.parse(start_str), Integer.parse(stop_str)} do
         {{start, ""}, {stop, ""}} ->
           key
-          |> ListOps.execute(store, {:ltrim, start, stop})
+          |> execute_list_op(store, {:ltrim, start, stop})
           |> return_after_list_trim(key, store)
 
         _ ->
@@ -134,10 +134,10 @@ defmodule Ferricstore.Commands.List do
   def handle("LTRIM", _, _), do: {:error, "ERR wrong number of arguments for 'ltrim' command"}
 
   def handle("LPOS", [key, element | opts], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case parse_lpos_opts(opts) do
         {:ok, rank, count, maxlen} ->
-          ListOps.execute(key, store, {:lpos, element, rank, count, maxlen})
+          execute_list_op(key, store, {:lpos, element, rank, count, maxlen})
 
         {:error, _} = error ->
           error
@@ -148,9 +148,9 @@ defmodule Ferricstore.Commands.List do
   def handle("LPOS", _, _), do: {:error, "ERR wrong number of arguments for 'lpos' command"}
 
   def handle("LINSERT", [key, direction_str, pivot, element], store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case parse_direction(direction_str) do
-        {:ok, direction} -> ListOps.execute(key, store, {:linsert, direction, pivot, element})
+        {:ok, direction} -> execute_list_op(key, store, {:linsert, direction, pivot, element})
         :error -> {:error, "ERR syntax error"}
       end
     end
@@ -186,15 +186,15 @@ defmodule Ferricstore.Commands.List do
     do: {:error, "ERR wrong number of arguments for 'rpoplpush' command"}
 
   def handle("LPUSHX", [key | elements], store) when elements != [] do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
-         do: ListOps.execute(key, store, {:lpushx, elements})
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
+         do: execute_list_op(key, store, {:lpushx, elements})
   end
 
   def handle("LPUSHX", _, _), do: {:error, "ERR wrong number of arguments for 'lpushx' command"}
 
   def handle("RPUSHX", [key | elements], store) when elements != [] do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
-         do: ListOps.execute(key, store, {:rpushx, elements})
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
+         do: execute_list_op(key, store, {:rpushx, elements})
   end
 
   def handle("RPUSHX", _, _), do: {:error, "ERR wrong number of arguments for 'rpushx' command"}
@@ -210,14 +210,14 @@ defmodule Ferricstore.Commands.List do
   def handle_ast({:lpop, key}, store),
     do:
       with(
-        :ok <- TypeRegistry.check_type(key, :list, store),
+        :ok <- TypeRegistry.command_check_type(key, :list, store),
         do: do_pop(key, store, :lpop, 1)
       )
 
   def handle_ast({:rpop, key}, store),
     do:
       with(
-        :ok <- TypeRegistry.check_type(key, :list, store),
+        :ok <- TypeRegistry.command_check_type(key, :list, store),
         do: do_pop(key, store, :rpop, 1)
       )
 
@@ -237,23 +237,23 @@ defmodule Ferricstore.Commands.List do
 
   def handle_ast({:lrange, key, start, stop}, store)
       when is_integer(start) and is_integer(stop) do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
-         do: ListOps.execute(key, store, {:lrange, start, stop})
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
+         do: execute_list_op(key, store, {:lrange, start, stop})
   end
 
   def handle_ast({:ltrim, key, start, stop}, store) when is_integer(start) and is_integer(stop) do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
          do:
            key
-           |> ListOps.execute(store, {:ltrim, start, stop})
+           |> execute_list_op(store, {:ltrim, start, stop})
            |> return_after_list_trim(key, store)
   end
 
   def handle_ast({:llen, key}, store),
     do:
       with(
-        :ok <- TypeRegistry.check_type(key, :list, store),
-        do: ListOps.execute(key, store, :llen)
+        :ok <- TypeRegistry.command_check_type(key, :list, store),
+        do: execute_list_op(key, store, :llen)
       )
 
   def handle_ast({:lindex, _key, {:error, reason}}, _store), do: {:error, reason}
@@ -261,28 +261,28 @@ defmodule Ferricstore.Commands.List do
   def handle_ast({:lrem, _key, {:error, reason}, _element}, _store), do: {:error, reason}
 
   def handle_ast({:lindex, key, index}, store) when is_integer(index) do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
-         do: ListOps.execute(key, store, {:lindex, index})
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
+         do: execute_list_op(key, store, {:lindex, index})
   end
 
   def handle_ast({:lset, key, index, element}, store) when is_integer(index) do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
-         do: ListOps.execute(key, store, {:lset, index, element})
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
+         do: execute_list_op(key, store, {:lset, index, element})
   end
 
   def handle_ast({:lrem, key, count, element}, store) when is_integer(count) do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
          do:
            key
-           |> ListOps.execute(store, {:lrem, count, element})
+           |> execute_list_op(store, {:lrem, count, element})
            |> return_after_list_delete_count(key, store)
   end
 
   def handle_ast({:lpos, [key, element | opts]}, store) do
-    with :ok <- TypeRegistry.check_type(key, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :list, store) do
       case parse_lpos_opts(opts) do
         {:ok, rank, count, maxlen} ->
-          ListOps.execute(key, store, {:lpos, element, rank, count, maxlen})
+          execute_list_op(key, store, {:lpos, element, rank, count, maxlen})
 
         {:error, _} = error ->
           error
@@ -298,8 +298,8 @@ defmodule Ferricstore.Commands.List do
 
   def handle_ast({:linsert, key, direction, pivot, element}, store)
       when direction in [:before, :after] do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
-         do: ListOps.execute(key, store, {:linsert, direction, pivot, element})
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
+         do: execute_list_op(key, store, {:linsert, direction, pivot, element})
   end
 
   def handle_ast({:lmove, _source, _destination, {:error, reason}, _to_dir}, _store),
@@ -338,10 +338,18 @@ defmodule Ferricstore.Commands.List do
   defp push_args(_args, _store, :rpush),
     do: {:error, "ERR wrong number of arguments for 'rpush' command"}
 
+  defp execute_list_op(key, %{list_op: list_op}, operation) when is_function(list_op, 2),
+    do: list_op.(key, operation)
+
+  defp execute_list_op(key, %FerricStore.Instance{} = store, operation),
+    do: Ops.list_op(store, key, operation)
+
+  defp execute_list_op(key, store, operation), do: ListOps.execute(key, store, operation)
+
   defp push_list(key, elements, store, direction) when direction in [:lpush, :rpush] do
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :list, store) do
-      result = ListOps.execute(key, store, {direction, elements})
+           TypeRegistry.command_check_or_set_status(key, :list, store) do
+      result = execute_list_op(key, store, {direction, elements})
 
       case result do
         count when is_integer(count) and count > 0 ->
@@ -370,8 +378,8 @@ defmodule Ferricstore.Commands.List do
   defp rollback_new_list_type_marker(_key, _store, :ok, write_error), do: write_error
 
   defp pushx_args([key | elements], store, direction) when elements != [] do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
-         do: ListOps.execute(key, store, {direction, elements})
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
+         do: execute_list_op(key, store, {direction, elements})
   end
 
   defp pushx_args(_args, _store, :lpushx),
@@ -381,12 +389,16 @@ defmodule Ferricstore.Commands.List do
     do: {:error, "ERR wrong number of arguments for 'rpushx' command"}
 
   defp do_pop(key, store, _direction, 0) do
-    if ListOps.read_meta(key, store) == nil, do: nil, else: []
+    case ListOps.read_meta(key, store) do
+      nil -> nil
+      {:error, _reason} = error -> error
+      _meta -> []
+    end
   end
 
   defp do_pop(key, store, direction, count) do
     key
-    |> ListOps.execute(store, {direction, count})
+    |> execute_list_op(store, {direction, count})
     |> return_after_list_pop(key, store, direction)
   end
 
@@ -416,9 +428,11 @@ defmodule Ferricstore.Commands.List do
   end
 
   defp maybe_cleanup_empty_list(key, store) do
-    case ListOps.execute(key, store, :llen) do
+    case execute_list_op(key, store, :llen) do
       0 -> TypeRegistry.delete_type(key, store)
-      _len -> :ok
+      len when is_integer(len) and len > 0 -> :ok
+      {:error, _reason} = error -> error
+      invalid -> {:error, {:invalid_list_length_result, invalid}}
     end
   end
 
@@ -431,7 +445,7 @@ defmodule Ferricstore.Commands.List do
         direction when direction in [:right, :rpop] -> Enum.reverse(values)
       end
 
-    case ListOps.execute(key, store, {:rpush, restore_values}) do
+    case execute_list_op(key, store, {:rpush, restore_values}) do
       count when is_integer(count) ->
         cleanup_error
 
@@ -444,7 +458,7 @@ defmodule Ferricstore.Commands.List do
   end
 
   defp pop_parsed(key, store, direction, count) when count >= 0 do
-    with :ok <- TypeRegistry.check_type(key, :list, store),
+    with :ok <- TypeRegistry.command_check_type(key, :list, store),
          do: do_pop(key, store, direction, count)
   end
 
@@ -506,7 +520,7 @@ defmodule Ferricstore.Commands.List do
   end
 
   defp checked_lmove(source, destination, store, from_dir, to_dir) do
-    with :ok <- TypeRegistry.check_type(source, :list, store) do
+    with :ok <- TypeRegistry.command_check_type(source, :list, store) do
       case ListOps.read_meta(source, store) do
         nil ->
           nil
@@ -514,9 +528,12 @@ defmodule Ferricstore.Commands.List do
         {0, _, _} ->
           nil
 
+        {:error, _reason} = error ->
+          error
+
         _meta ->
           with type_status when type_status in [:ok, {:ok, :created}] <-
-                 TypeRegistry.check_or_set_status(destination, :list, store) do
+                 TypeRegistry.command_check_or_set_status(destination, :list, store) do
             case ListOps.execute_lmove(source, destination, store, from_dir, to_dir) do
               result when is_binary(result) ->
                 with :ok <- maybe_cleanup_empty_list(source, store), do: result

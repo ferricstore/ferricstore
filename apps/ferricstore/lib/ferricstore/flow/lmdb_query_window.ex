@@ -9,6 +9,10 @@ defmodule Ferricstore.Flow.LMDBQueryWindow do
   def time_upper_seek_key(prefix, ms) when is_binary(prefix) and is_integer(ms),
     do: prefix <> pad_u64(ms) <> <<255>>
 
+  def cursor_seek_key(prefix, ms, id)
+      when is_binary(prefix) and is_integer(ms) and is_binary(id),
+      do: prefix <> pad_u64(ms) <> <<0>> <> id
+
   def pad_u64(value) when is_integer(value) and value >= 0 do
     encoded = Integer.to_string(value)
 

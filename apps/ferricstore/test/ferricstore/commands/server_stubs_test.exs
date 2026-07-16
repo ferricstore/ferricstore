@@ -102,6 +102,13 @@ defmodule Ferricstore.Commands.ServerStubsTest do
       assert :ok = Server.handle("DEBUG", ["FLUSHALL", "ASYNC"], store)
       assert 0 == store.dbsize.()
     end
+
+    test "rejects invalid options without flushing" do
+      store = MockStore.make(%{"a" => {"1", 0}})
+
+      assert {:error, _reason} = Server.handle("DEBUG", ["FLUSHALL", "BOGUS"], store)
+      assert 1 == store.dbsize.()
+    end
   end
 
   describe "DEBUG SET-ACTIVE-EXPIRE" do

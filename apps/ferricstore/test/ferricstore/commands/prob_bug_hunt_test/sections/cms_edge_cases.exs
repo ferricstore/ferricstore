@@ -95,7 +95,7 @@ defmodule Ferricstore.Commands.ProbBugHuntTest.Sections.CmsEdgeCases do
           :ok = TopK.handle("TOPK.RESERVE", ["tk", "10"], store)
 
           result = TopK.handle("TOPK.INFO", ["tk"], store)
-          assert ["k", 10, "width", 8, "depth", 7, "decay", 0.9] = result
+          assert ["k", 10, "width", 8, "depth", 7] = result
         end
       end
     end

@@ -291,10 +291,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
       end
 
       defp flow_run_steps_after_history_put(state, plans) do
-        lmdb_mirror? = flow_lmdb_projection_enabled?(state)
-
         if Enum.all?(plans, fn %{record: final} ->
-             flow_after_history_fast_record?(lmdb_mirror?, final)
+             flow_after_history_fast_record?(final)
            end) do
           :ok
         else

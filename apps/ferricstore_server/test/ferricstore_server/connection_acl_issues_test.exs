@@ -71,7 +71,7 @@ defmodule FerricstoreServer.ConnectionAclIssuesTest do
           denied_commands: MapSet.new(["GET"])
       }
 
-      :ets.insert(:ferricstore_acl, {"reader", user})
+      :ets.insert(FerricstoreServer.Acl.Tables.active_table(), {"reader", user})
 
       assert {:error, "NOPERM" <> _} = Acl.check_command("reader", "GET")
       assert :ok = Acl.check_command("reader", "MGET")

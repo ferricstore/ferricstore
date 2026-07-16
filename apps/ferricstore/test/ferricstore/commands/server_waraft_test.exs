@@ -20,8 +20,7 @@ defmodule Ferricstore.Commands.ServerWARaftTest do
 
     on_exit(fn ->
       if :ets.whereis(:ferricstore_active_files) != :undefined do
-        :ets.delete(:ferricstore_active_files, 4)
-        :atomics.add(:persistent_term.get(:ferricstore_active_file_gen), 1, 1)
+        Ferricstore.Store.ActiveFile.delete(4)
       end
 
       File.rm_rf!(dir)

@@ -18,10 +18,12 @@ defmodule Ferricstore.Commands.SortedSet do
   a key that holds a different type returns WRONGTYPE.
   """
 
+  alias Ferricstore.Commands.CollectionScan
   alias Ferricstore.Commands.SortedSet.Helpers
   alias Ferricstore.Commands.SortedSet.Reads
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.TypeRegistry
 
   @doc """
@@ -47,64 +49,59 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZADD", [key | rest], store) when rest != [] do
     with {:ok, opts, score_member_pairs} <- Helpers.parse_zadd_opts(rest),
          type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :zset, store) do
+           TypeRegistry.command_check_or_set_status(key, :zset, store) do
       unique_members =
         score_member_pairs |> Enum.map(fn {_score, member} -> member end) |> Enum.uniq()
 
       compound_keys = Enum.map(unique_members, &CompoundKey.zset_member(key, &1))
 
-      current_values = Ops.compound_batch_get(store, key, compound_keys)
-      current_by_member = zset_current_by_member(unique_members, current_values, %{})
+      with {:ok, current_values} <-
+             read_zadd_current_values(key, compound_keys, store, type_status) do
+        current_by_member = zset_current_by_member(unique_members, current_values, %{})
 
-      {added, changed, _current_by_member, writes_by_member} =
-        Enum.reduce(score_member_pairs, {0, 0, current_by_member, %{}}, fn {score, member},
-                                                                           {add_acc, ch_acc,
-                                                                            current_acc,
-                                                                            writes_acc} ->
-          existing = Map.get(current_acc, member)
-          score_str = Float.to_string(score)
+        {added, changed, _current_by_member, writes_by_member} =
+          Enum.reduce(score_member_pairs, {0, 0, current_by_member, %{}}, fn {score, member},
+                                                                             {add_acc, ch_acc,
+                                                                              current_acc,
+                                                                              writes_acc} ->
+            existing = Map.get(current_acc, member)
+            score_str = Float.to_string(score)
 
-          cond do
-            # NX: only add new elements, don't update existing
-            opts.nx and existing != nil ->
-              {add_acc, ch_acc, current_acc, writes_acc}
-
-            # XX: only update existing elements, don't add new
-            opts.xx and existing == nil ->
-              {add_acc, ch_acc, current_acc, writes_acc}
-
-            existing == nil ->
-              {add_acc + 1, ch_acc, Map.put(current_acc, member, score_str),
-               Map.put(writes_acc, member, score_str)}
-
-            true ->
-              existing_score =
-                case Float.parse(existing) do
-                  {score, ""} -> score
-                  _ -> 0.0
-                end
-
-              should_update =
-                cond do
-                  opts.gt -> score > existing_score
-                  opts.lt -> score < existing_score
-                  true -> true
-                end
-
-              if should_update and score != existing_score do
-                {add_acc, ch_acc + 1, Map.put(current_acc, member, score_str),
-                 Map.put(writes_acc, member, score_str)}
-              else
+            cond do
+              # NX: only add new elements, don't update existing
+              opts.nx and existing != nil ->
                 {add_acc, ch_acc, current_acc, writes_acc}
-              end
-          end
-        end)
 
-      write_entries = zset_write_entries(unique_members, compound_keys, writes_by_member, [])
+              # XX: only update existing elements, don't add new
+              opts.xx and existing == nil ->
+                {add_acc, ch_acc, current_acc, writes_acc}
 
-      case Ops.compound_batch_put(store, key, write_entries) do
-        :ok -> if opts.ch, do: added + changed, else: added
-        {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
+              existing == nil ->
+                {add_acc + 1, ch_acc, Map.put(current_acc, member, score_str),
+                 Map.put(writes_acc, member, score_str)}
+
+              true ->
+                existing_score = Helpers.parse_stored_score(existing)
+
+                should_update =
+                  cond do
+                    opts.gt -> score > existing_score
+                    opts.lt -> score < existing_score
+                    true -> true
+                  end
+
+                if should_update and score != existing_score do
+                  {add_acc, ch_acc + 1, Map.put(current_acc, member, score_str),
+                   Map.put(writes_acc, member, score_str)}
+                else
+                  {add_acc, ch_acc, current_acc, writes_acc}
+                end
+            end
+          end)
+
+        write_entries = zset_write_entries(unique_members, compound_keys, writes_by_member, [])
+        result = if opts.ch, do: added + changed, else: added
+        persist_zadd_entries(key, write_entries, result, store, type_status)
       end
     end
   end
@@ -140,7 +137,9 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZRANGE", [key, start_str, stop_str | opts], store) do
     case {Integer.parse(start_str), Integer.parse(stop_str)} do
       {{start, ""}, {stop, ""}} ->
-        zrange_rank_parsed(key, start, stop, "WITHSCORES" in opts, false, store)
+        with {:ok, with_scores} <- parse_rank_range_opts(opts) do
+          zrange_rank_parsed(key, start, stop, with_scores, false, store)
+        end
 
       _ ->
         {:error, "ERR value is not an integer or out of range"}
@@ -158,7 +157,9 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZREVRANGE", [key, start_str, stop_str | opts], store) do
     case {Integer.parse(start_str), Integer.parse(stop_str)} do
       {{start, ""}, {stop, ""}} ->
-        zrange_rank_parsed(key, start, stop, "WITHSCORES" in opts, true, store)
+        with {:ok, with_scores} <- parse_rank_range_opts(opts) do
+          zrange_rank_parsed(key, start, stop, with_scores, true, store)
+        end
 
       _ ->
         {:error, "ERR value is not an integer or out of range"}
@@ -192,7 +193,7 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZINCRBY", [key, increment_str, member], store) do
     with {:ok, increment} <- parse_zincrby_increment(increment_str),
          type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :zset, store) do
+           TypeRegistry.command_check_or_set_status(key, :zset, store) do
       zincrby_member(key, increment, member, store, type_status)
     end
   end
@@ -206,7 +207,7 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZCOUNT", [key, min_str, max_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       case {Helpers.parse_score_bound(min_str), Helpers.parse_score_bound(max_str)} do
         {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
           min_bound = Helpers.raw_score_bound(min_val, min_excl)
@@ -216,14 +217,17 @@ defmodule Ferricstore.Commands.SortedSet do
             {:ok, count} ->
               count
 
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              ReadResult.command_error(failure)
+
             :unavailable ->
-              key
-              |> load_members(store)
-              |> Enum.count(fn {_member, score} ->
-                above_min = Helpers.score_gte?(score, min_val, min_excl)
-                below_max = Helpers.score_lte?(score, max_val, max_excl)
-                above_min and below_max
-              end)
+              with {:ok, members} <- load_members(key, store) do
+                Enum.count(members, fn {_member, score} ->
+                  above_min = Helpers.score_gte?(score, min_val, min_excl)
+                  below_max = Helpers.score_lte?(score, max_val, max_excl)
+                  above_min and below_max
+                end)
+              end
           end
 
         _ ->
@@ -279,25 +283,20 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZSCAN", [key, cursor_str | opts], store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store),
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store),
          {:ok, cursor} <- Helpers.parse_cursor(cursor_str),
-         {:ok, match_pattern, count} <- Helpers.parse_zscan_opts(opts) do
-      prefix = CompoundKey.zset_prefix(key)
-      pairs = Ops.compound_scan(store, key, prefix)
-
-      filtered =
-        case match_pattern do
-          nil ->
-            pairs
-
-          pattern ->
-            Enum.filter(pairs, fn {member, _score} ->
-              Ferricstore.GlobMatcher.match?(member, pattern)
-            end)
-        end
-
-      {next_cursor, batch} = Helpers.paginate(filtered, cursor, count)
-      elements = Helpers.score_string_pairs_to_flat_list(batch)
+         {:ok, match_pattern, count} <- Helpers.parse_zscan_opts(opts),
+         {:ok, {next_cursor, pairs}} <-
+           CollectionScan.page(
+             store,
+             key,
+             CompoundKey.zset_prefix(key),
+             cursor,
+             count,
+             match_pattern,
+             false
+           ) do
+      elements = Helpers.score_string_pairs_to_flat_list(pairs)
       [next_cursor, elements]
     end
   end
@@ -317,15 +316,15 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZRANDMEMBER", [key], store), do: Reads.zrandmember_one(key, store)
 
   def handle("ZRANDMEMBER", [key, count_str], store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       case Integer.parse(count_str) do
         {0, ""} ->
           []
 
         {count, ""} ->
-          prefix = CompoundKey.zset_prefix(key)
-          pairs = Ops.compound_scan(store, key, prefix)
-          Helpers.select_random_members(pairs, count, false)
+          with {:ok, pairs} <- scan_pairs(key, store) do
+            Helpers.select_random_members(pairs, count, false)
+          end
 
         _ ->
           {:error, "ERR value is not an integer or out of range"}
@@ -337,15 +336,15 @@ defmodule Ferricstore.Commands.SortedSet do
     if String.upcase(withscores_str) != "WITHSCORES" do
       {:error, "ERR syntax error"}
     else
-      with :ok <- TypeRegistry.check_type(key, :zset, store) do
+      with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
         case Integer.parse(count_str) do
           {0, ""} ->
             []
 
           {count, ""} ->
-            prefix = CompoundKey.zset_prefix(key)
-            pairs = Ops.compound_scan(store, key, prefix)
-            Helpers.select_random_members(pairs, count, true)
+            with {:ok, pairs} <- scan_pairs(key, store) do
+              Helpers.select_random_members(pairs, count, true)
+            end
 
           _ ->
             {:error, "ERR value is not an integer or out of range"}
@@ -369,7 +368,7 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZRANGEBYSCORE", [key, min_str, max_str | opts], store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       case {Helpers.parse_score_bound(min_str), Helpers.parse_score_bound(max_str)} do
         {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
           case Helpers.parse_range_by_score_opts(opts) do
@@ -380,35 +379,13 @@ defmodule Ferricstore.Commands.SortedSet do
               min_bound = Helpers.raw_score_bound(min_val, min_excl)
               max_bound = Helpers.raw_score_bound(max_val, max_excl)
 
-              filtered =
-                case Ops.zset_score_range_slice(
-                       store,
-                       key,
-                       min_bound,
-                       max_bound,
-                       false,
-                       offset,
-                       count
-                     ) do
-                  {:ok, members} ->
-                    members
-
-                  :unavailable ->
-                    zrangebyscore_full_range(
-                      key,
-                      min_bound,
-                      max_bound,
-                      false,
-                      offset,
-                      count,
-                      store
-                    )
+              with {:ok, filtered} <-
+                     score_range_slice(key, min_bound, max_bound, false, offset, count, store) do
+                if with_scores do
+                  Helpers.score_pairs_to_flat_list(filtered)
+                else
+                  Enum.map(filtered, fn {member, _score} -> member end)
                 end
-
-              if with_scores do
-                Helpers.score_pairs_to_flat_list(filtered)
-              else
-                Enum.map(filtered, fn {member, _score} -> member end)
               end
           end
 
@@ -427,7 +404,7 @@ defmodule Ferricstore.Commands.SortedSet do
   # ---------------------------------------------------------------------------
 
   def handle("ZREVRANGEBYSCORE", [key, max_str, min_str | opts], store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       case {Helpers.parse_score_bound(min_str), Helpers.parse_score_bound(max_str)} do
         {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
           case Helpers.parse_range_by_score_opts(opts) do
@@ -438,35 +415,13 @@ defmodule Ferricstore.Commands.SortedSet do
               min_bound = Helpers.raw_score_bound(min_val, min_excl)
               max_bound = Helpers.raw_score_bound(max_val, max_excl)
 
-              filtered =
-                case Ops.zset_score_range_slice(
-                       store,
-                       key,
-                       min_bound,
-                       max_bound,
-                       true,
-                       offset,
-                       count
-                     ) do
-                  {:ok, members} ->
-                    members
-
-                  :unavailable ->
-                    zrangebyscore_full_range(
-                      key,
-                      min_bound,
-                      max_bound,
-                      true,
-                      offset,
-                      count,
-                      store
-                    )
+              with {:ok, filtered} <-
+                     score_range_slice(key, min_bound, max_bound, true, offset, count, store) do
+                if with_scores do
+                  Helpers.score_pairs_to_flat_list(filtered)
+                else
+                  Enum.map(filtered, fn {member, _score} -> member end)
                 end
-
-              if with_scores do
-                Helpers.score_pairs_to_flat_list(filtered)
-              else
-                Enum.map(filtered, fn {member, _score} -> member end)
               end
           end
 
@@ -494,6 +449,7 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle_ast(ast, store)
 
   def handle_ast({:zadd, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:zadd, _key, _opts, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:zadd, key, opts, score_member_pairs}, store),
     do: zadd_parsed(key, opts, score_member_pairs, store)
@@ -516,6 +472,12 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle_ast({:zrange, _key, {:error, reason}, _tail}, _store), do: {:error, reason}
   def handle_ast({:zrevrange, _key, {:error, reason}, _tail}, _store), do: {:error, reason}
 
+  def handle_ast({:zrange, _key, _start, _stop, {:error, reason}}, _store),
+    do: {:error, reason}
+
+  def handle_ast({:zrevrange, _key, _start, _stop, {:error, reason}}, _store),
+    do: {:error, reason}
+
   def handle_ast({:zrange, key, start, stop, with_scores}, store),
     do: zrange_rank_parsed(key, start, stop, with_scores, false, store)
 
@@ -536,6 +498,7 @@ defmodule Ferricstore.Commands.SortedSet do
 
   def handle_ast({:zrandmember, key}, store), do: Reads.zrandmember_one(key, store)
   def handle_ast({:zrandmember, _key, {:error, reason}}, _store), do: {:error, reason}
+  def handle_ast({:zrandmember, _key, {:error, reason}, _with_scores}, _store), do: {:error, reason}
   def handle_ast({:zrandmember, _key, _count, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:zrandmember, key, count, with_scores}, store),
@@ -561,13 +524,33 @@ defmodule Ferricstore.Commands.SortedSet do
   # Private helpers
   # ---------------------------------------------------------------------------
 
+  defp parse_rank_range_opts([]), do: {:ok, false}
+
+  defp parse_rank_range_opts([option]) when is_binary(option) do
+    if String.upcase(option) == "WITHSCORES",
+      do: {:ok, true},
+      else: {:error, "ERR syntax error"}
+  end
+
+  defp parse_rank_range_opts(_options), do: {:error, "ERR syntax error"}
+
   defp maybe_cleanup_empty_zset(_key, 0, _store), do: :ok
 
   defp maybe_cleanup_empty_zset(key, _removed, store) do
-    if zset_member_count(key, store) == 0 do
-      TypeRegistry.delete_type(key, store)
-    else
-      :ok
+    case zset_member_count(key, store) do
+      0 ->
+        TypeRegistry.delete_type(key, store)
+
+      count when is_integer(count) and count > 0 ->
+        :ok
+
+      {:error, _reason} = error ->
+        error
+
+      invalid ->
+        invalid
+        |> ReadResult.failure()
+        |> ReadResult.command_error()
     end
   end
 
@@ -600,30 +583,31 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp zrem_args([key | members], store) when members != [] do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       compound_keys =
         members
         |> Enum.uniq()
         |> Enum.map(&CompoundKey.zset_member(key, &1))
 
-      scores_by_key =
-        store
-        |> Ops.compound_batch_get(key, compound_keys)
-        |> Enum.zip(compound_keys)
-        |> Map.new(fn {score_str, compound_key} -> {compound_key, score_str} end)
+      with {:ok, values} <- read_score_values(key, compound_keys, store) do
+        scores_by_key =
+          values
+          |> Enum.zip(compound_keys)
+          |> Map.new(fn {score_str, compound_key} -> {compound_key, score_str} end)
 
-      removed_entries =
-        Enum.flat_map(compound_keys, fn compound_key ->
-          case Map.fetch!(scores_by_key, compound_key) do
-            nil -> []
-            score_str -> [{compound_key, score_str, 0}]
-          end
-        end)
+        removed_entries =
+          Enum.flat_map(compound_keys, fn compound_key ->
+            case Map.fetch!(scores_by_key, compound_key) do
+              nil -> []
+              score_str -> [{compound_key, score_str, 0}]
+            end
+          end)
 
-      removed = length(removed_entries)
+        removed = length(removed_entries)
 
-      with :ok <- delete_zset_members_and_cleanup(key, removed_entries, removed, store) do
-        removed
+        with :ok <- delete_zset_members_and_cleanup(key, removed_entries, removed, store) do
+          removed
+        end
       end
     end
   end
@@ -633,6 +617,12 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp zadd_parsed(key, opts, score_member_pairs, store) do
+    with :ok <- validate_zadd_ast(opts, score_member_pairs) do
+      do_zadd_parsed(key, opts, score_member_pairs, store)
+    end
+  end
+
+  defp do_zadd_parsed(key, opts, score_member_pairs, store) do
     opts = %{
       nx: :nx in opts,
       xx: :xx in opts,
@@ -642,62 +632,60 @@ defmodule Ferricstore.Commands.SortedSet do
     }
 
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :zset, store) do
+           TypeRegistry.command_check_or_set_status(key, :zset, store) do
       unique_members =
         score_member_pairs |> Enum.map(fn {_score, member} -> member end) |> Enum.uniq()
 
       compound_keys = Enum.map(unique_members, &CompoundKey.zset_member(key, &1))
 
-      current_values = Ops.compound_batch_get(store, key, compound_keys)
-      current_by_member = zset_current_by_member(unique_members, current_values, %{})
+      case read_zadd_current_values(key, compound_keys, store, type_status) do
+        {:ok, current_values} ->
+          current_by_member = zset_current_by_member(unique_members, current_values, %{})
 
-      {added, changed, _current_by_member, writes_by_member} =
-        Enum.reduce(score_member_pairs, {0, 0, current_by_member, %{}}, fn {score, member},
-                                                                           {add_acc, ch_acc,
-                                                                            current_acc,
-                                                                            writes_acc} ->
-          existing = Map.get(current_acc, member)
-          score_str = Float.to_string(score)
+          {added, changed, _current_by_member, writes_by_member} =
+            Enum.reduce(score_member_pairs, {0, 0, current_by_member, %{}}, fn {score, member},
+                                                                               {add_acc, ch_acc,
+                                                                                current_acc,
+                                                                                writes_acc} ->
+              existing = Map.get(current_acc, member)
+              score_str = Float.to_string(score)
 
-          cond do
-            opts.nx and existing != nil ->
-              {add_acc, ch_acc, current_acc, writes_acc}
+              cond do
+                opts.nx and existing != nil ->
+                  {add_acc, ch_acc, current_acc, writes_acc}
 
-            opts.xx and existing == nil ->
-              {add_acc, ch_acc, current_acc, writes_acc}
+                opts.xx and existing == nil ->
+                  {add_acc, ch_acc, current_acc, writes_acc}
 
-            existing == nil ->
-              {add_acc + 1, ch_acc, Map.put(current_acc, member, score_str),
-               Map.put(writes_acc, member, score_str)}
+                existing == nil ->
+                  {add_acc + 1, ch_acc, Map.put(current_acc, member, score_str),
+                   Map.put(writes_acc, member, score_str)}
 
-            true ->
-              existing_score =
-                case Float.parse(existing) do
-                  {score, ""} -> score
-                  _ -> 0.0
-                end
+                true ->
+                  existing_score = Helpers.parse_stored_score(existing)
 
-              should_update =
-                cond do
-                  opts.gt -> score > existing_score
-                  opts.lt -> score < existing_score
-                  true -> true
-                end
+                  should_update =
+                    cond do
+                      opts.gt -> score > existing_score
+                      opts.lt -> score < existing_score
+                      true -> true
+                    end
 
-              if should_update and score != existing_score do
-                {add_acc, ch_acc + 1, Map.put(current_acc, member, score_str),
-                 Map.put(writes_acc, member, score_str)}
-              else
-                {add_acc, ch_acc, current_acc, writes_acc}
+                  if should_update and score != existing_score do
+                    {add_acc, ch_acc + 1, Map.put(current_acc, member, score_str),
+                     Map.put(writes_acc, member, score_str)}
+                  else
+                    {add_acc, ch_acc, current_acc, writes_acc}
+                  end
               end
-          end
-        end)
+            end)
 
-      write_entries = zset_write_entries(unique_members, compound_keys, writes_by_member, [])
+          write_entries = zset_write_entries(unique_members, compound_keys, writes_by_member, [])
+          result = if opts.ch, do: added + changed, else: added
+          persist_zadd_entries(key, write_entries, result, store, type_status)
 
-      case Ops.compound_batch_put(store, key, write_entries) do
-        :ok -> if opts.ch, do: added + changed, else: added
-        {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
+        error ->
+          error
       end
     end
   end
@@ -713,6 +701,41 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp rollback_new_zset_type_marker(_key, _store, :ok, write_error), do: write_error
+
+  defp persist_zadd_entries(key, [], result, store, {:ok, :created}) do
+    case TypeRegistry.delete_type(key, store) do
+      :ok -> result
+      {:error, _} = error -> error
+    end
+  end
+
+  defp persist_zadd_entries(_key, [], result, _store, :ok), do: result
+
+  defp persist_zadd_entries(key, entries, result, store, type_status) do
+    case Ops.compound_batch_put(store, key, entries) do
+      :ok -> result
+      {:error, _} = err -> rollback_new_zset_type_marker(key, store, type_status, err)
+    end
+  end
+
+  defp read_zadd_current_values(key, compound_keys, store, type_status) do
+    case read_score_values(key, compound_keys, store) do
+      {:ok, values} ->
+        {:ok, values}
+
+      {:error, _} = error ->
+        rollback_new_zset_type_marker(key, store, type_status, error)
+    end
+  end
+
+  defp read_score_values(key, compound_keys, store) do
+    values = Ops.compound_batch_get(store, key, compound_keys)
+
+    case ReadResult.first_failure(values) do
+      nil -> {:ok, values}
+      failure -> ReadResult.command_error(failure)
+    end
+  end
 
   defp zset_current_by_member([member | members], [value | values], acc) do
     zset_current_by_member(members, values, Map.put(acc, member, value))
@@ -739,21 +762,15 @@ defmodule Ferricstore.Commands.SortedSet do
 
   defp zincrby_parsed(key, increment, member, store) do
     with type_status when type_status in [:ok, {:ok, :created}] <-
-           TypeRegistry.check_or_set_status(key, :zset, store) do
+           TypeRegistry.command_check_or_set_status(key, :zset, store) do
       zincrby_member(key, increment, member, store, type_status)
     end
   end
 
   defp parse_zincrby_increment(increment_str) do
-    case Float.parse(increment_str) do
-      {increment, ""} ->
-        {:ok, increment}
-
-      :error ->
-        case Integer.parse(increment_str) do
-          {increment, ""} -> {:ok, increment * 1.0}
-          _ -> {:error, "ERR value is not a valid float"}
-        end
+    case Helpers.parse_score(increment_str) do
+      {:ok, increment} -> {:ok, increment}
+      :error -> {:error, "ERR value is not a valid float"}
     end
   end
 
@@ -761,20 +778,28 @@ defmodule Ferricstore.Commands.SortedSet do
     compound_key = CompoundKey.zset_member(key, member)
     existing = Ops.compound_get(store, key, compound_key)
 
-    current_score =
-      case existing do
-        nil ->
-          0.0
+    case existing do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        rollback_new_zset_type_marker(key, store, type_status, ReadResult.command_error(failure))
 
-        score_str ->
-          case Float.parse(score_str) do
-            {score, ""} -> score
-            _ -> 0.0
+      value ->
+        current_score =
+          case value do
+            nil ->
+              0.0
+
+            score_str ->
+              Helpers.parse_stored_score(score_str)
           end
-      end
 
-    new_score = current_score + increment
-    write_zscore(store, key, compound_key, new_score, type_status)
+        case Helpers.checked_score_add(current_score, increment) do
+          {:ok, new_score} ->
+            write_zscore(store, key, compound_key, new_score, type_status)
+
+          :overflow ->
+            {:error, "ERR resulting score is not a number (NaN)"}
+        end
+    end
   end
 
   defp write_zscore(store, key, compound_key, new_score, type_status) do
@@ -787,19 +812,23 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp zrange_rank_parsed(key, start, stop, with_scores, reverse?, store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      {start_idx, stop_idx} = normalize_rank_bounds(key, start, stop, store)
-
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store),
+         {:ok, {start_idx, stop_idx}} <- normalize_rank_bounds(key, start, stop, store) do
       zrange_rank_from_index_or_scan(key, start_idx, stop_idx, with_scores, reverse?, store)
     end
   end
 
   defp normalize_rank_bounds(key, start, stop, store) when start < 0 or stop < 0 do
-    len = zcard_count(key, store)
-    {Helpers.normalize_index(start, len), Helpers.normalize_index(stop, len)}
+    case zcard_count(key, store) do
+      len when is_integer(len) ->
+        {:ok, {Helpers.normalize_index(start, len), Helpers.normalize_index(stop, len)}}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
-  defp normalize_rank_bounds(_key, start, stop, _store), do: {start, stop}
+  defp normalize_rank_bounds(_key, start, stop, _store), do: {:ok, {start, stop}}
 
   defp zrange_rank_from_index_or_scan(_key, start_idx, stop_idx, _with_scores, _reverse?, _store)
        when start_idx > stop_idx do
@@ -811,22 +840,21 @@ defmodule Ferricstore.Commands.SortedSet do
       {:ok, members} ->
         format_rank_members(members, with_scores)
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       :unavailable ->
-        sorted =
-          if reverse? do
-            load_sorted_members(key, store) |> Enum.reverse()
+        with {:ok, members} <- load_sorted_members(key, store) do
+          sorted = if reverse?, do: Enum.reverse(members), else: members
+          len = length(sorted)
+
+          if start_idx >= len do
+            []
           else
-            load_sorted_members(key, store)
+            sorted
+            |> Enum.slice(start_idx..stop_idx)
+            |> format_rank_members(with_scores)
           end
-
-        len = length(sorted)
-
-        if start_idx >= len do
-          []
-        else
-          sorted
-          |> Enum.slice(start_idx..stop_idx)
-          |> format_rank_members(with_scores)
         end
     end
   end
@@ -840,26 +868,28 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp zcount_parsed(key, min_bound, max_bound, store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
       case Ops.zset_score_count(store, key, min_bound, max_bound) do
         {:ok, count} ->
           count
 
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          ReadResult.command_error(failure)
+
         :unavailable ->
-          key
-          |> load_members(store)
-          |> Enum.count(fn {_member, score} ->
-            Helpers.score_gte_bound?(score, min_bound) and
-              Helpers.score_lte_bound?(score, max_bound)
-          end)
+          with {:ok, members} <- load_members(key, store) do
+            Enum.count(members, fn {_member, score} ->
+              Helpers.score_gte_bound?(score, min_bound) and
+                Helpers.score_lte_bound?(score, max_bound)
+            end)
+          end
       end
     end
   end
 
-  defp zpop_parsed(key, count, reverse?, store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store) do
-      to_pop = zpop_members(key, count, reverse?, store)
-
+  defp zpop_parsed(key, count, reverse?, store) when is_integer(count) and count >= 0 do
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store),
+         {:ok, to_pop} <- zpop_members(key, count, reverse?, store) do
       result = Helpers.score_pairs_to_flat_list(to_pop)
 
       compound_keys =
@@ -877,45 +907,32 @@ defmodule Ferricstore.Commands.SortedSet do
     end
   end
 
-  defp zpop_members(_key, 0, _reverse?, _store), do: []
+  defp zpop_parsed(_key, _count, _reverse?, _store),
+    do: {:error, "ERR value is not an integer or out of range"}
+
+  defp zpop_members(_key, 0, _reverse?, _store), do: {:ok, []}
 
   defp zpop_members(key, count, reverse?, store) do
     case Ops.zset_rank_range(store, key, 0, count - 1, reverse?) do
       {:ok, members} ->
-        members
+        {:ok, members}
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
       :unavailable ->
-        sorted =
-          if reverse? do
-            load_sorted_members(key, store) |> Enum.reverse()
-          else
-            load_sorted_members(key, store)
-          end
-
-        Enum.take(sorted, count)
+        with {:ok, members} <- load_sorted_members(key, store) do
+          sorted = if reverse?, do: Enum.reverse(members), else: members
+          {:ok, Enum.take(sorted, count)}
+        end
     end
   end
 
   defp zrangebyscore_parsed(key, min_bound, max_bound, opts, reverse?, store) do
-    with :ok <- TypeRegistry.check_type(key, :zset, store),
-         {:ok, with_scores, offset, count} <- Helpers.typed_range_by_score_opts(opts) do
-      filtered =
-        case Ops.zset_score_range_slice(
-               store,
-               key,
-               min_bound,
-               max_bound,
-               reverse?,
-               offset,
-               count
-             ) do
-          {:ok, members} ->
-            members
-
-          :unavailable ->
-            zrangebyscore_full_range(key, min_bound, max_bound, reverse?, offset, count, store)
-        end
-
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store),
+         {:ok, with_scores, offset, count} <- Helpers.typed_range_by_score_opts(opts),
+         {:ok, filtered} <-
+           score_range_slice(key, min_bound, max_bound, reverse?, offset, count, store) do
       if with_scores do
         Helpers.score_pairs_to_flat_list(filtered)
       else
@@ -925,28 +942,32 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp zrangebyscore_full_range(key, min_bound, max_bound, reverse?, offset, count, store) do
-    filtered =
-      case Ops.zset_score_range(store, key, min_bound, max_bound, reverse?) do
-        {:ok, members} ->
-          members
+    case Ops.zset_score_range(store, key, min_bound, max_bound, reverse?) do
+      {:ok, members} ->
+        {:ok, Helpers.apply_limit(members, offset, count)}
 
-        :unavailable ->
-          key
-          |> load_members(store)
-          |> Enum.filter(fn {_member, score} ->
-            Helpers.score_gte_bound?(score, min_bound) and
-              Helpers.score_lte_bound?(score, max_bound)
-          end)
-          |> sort_members(reverse?)
-      end
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
-    Helpers.apply_limit(filtered, offset, count)
+      :unavailable ->
+        with {:ok, members} <- load_members(key, store) do
+          filtered =
+            members
+            |> Enum.filter(fn {_member, score} ->
+              Helpers.score_gte_bound?(score, min_bound) and
+                Helpers.score_lte_bound?(score, max_bound)
+            end)
+            |> sort_members(reverse?)
+
+          {:ok, Helpers.apply_limit(filtered, offset, count)}
+        end
+    end
   end
 
   defp load_sorted_members(key, store) do
-    key
-    |> load_members(store)
-    |> sort_members(false)
+    with {:ok, members} <- load_members(key, store) do
+      {:ok, sort_members(members, false)}
+    end
   end
 
   defp zcard_count(key, store) do
@@ -958,19 +979,52 @@ defmodule Ferricstore.Commands.SortedSet do
       {:ok, count} ->
         count
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       :unavailable ->
         prefix = CompoundKey.zset_prefix(key)
-        Ops.compound_count(store, key, prefix)
+        store |> Ops.compound_count(key, prefix) |> ReadResult.command_result()
     end
   end
 
   defp load_members(key, store) do
-    prefix = CompoundKey.zset_prefix(key)
-    pairs = Ops.compound_scan(store, key, prefix)
+    with {:ok, pairs} <- scan_pairs(key, store) do
+      {:ok,
+       Enum.map(pairs, fn {member, score_str} ->
+         {member, Helpers.parse_stored_score(score_str)}
+       end)}
+    end
+  end
 
-    Enum.map(pairs, fn {member, score_str} ->
-      {member, Helpers.parse_stored_score(score_str)}
-    end)
+  defp score_range_slice(key, min_bound, max_bound, reverse?, offset, count, store) do
+    case Ops.zset_score_range_slice(
+           store,
+           key,
+           min_bound,
+           max_bound,
+           reverse?,
+           offset,
+           count
+         ) do
+      {:ok, members} ->
+        {:ok, members}
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      :unavailable ->
+        zrangebyscore_full_range(key, min_bound, max_bound, reverse?, offset, count, store)
+    end
+  end
+
+  defp scan_pairs(key, store) do
+    prefix = CompoundKey.zset_prefix(key)
+
+    case Ops.compound_scan(store, key, prefix) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      pairs when is_list(pairs) -> {:ok, pairs}
+    end
   end
 
   defp sort_members(members, false) do
@@ -978,4 +1032,40 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   defp sort_members(members, true), do: members |> sort_members(false) |> Enum.reverse()
+
+  defp validate_zadd_ast(opts, score_member_pairs)
+       when is_list(opts) and is_list(score_member_pairs) do
+    cond do
+      Enum.any?(opts, &(&1 not in [:nx, :xx, :gt, :lt, :ch])) ->
+        {:error, "ERR syntax error"}
+
+      :nx in opts and :xx in opts ->
+        {:error, "ERR XX and NX options at the same time are not compatible"}
+
+      (:gt in opts and :lt in opts) or (:nx in opts and (:gt in opts or :lt in opts)) ->
+        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+
+      score_member_pairs == [] ->
+        {:error, "ERR wrong number of arguments for 'zadd' command"}
+
+      true ->
+        validate_zadd_pairs(score_member_pairs)
+    end
+  end
+
+  defp validate_zadd_ast(_opts, {:error, reason}) when is_binary(reason), do: {:error, reason}
+  defp validate_zadd_ast(_opts, _score_member_pairs), do: {:error, "ERR syntax error"}
+
+  defp validate_zadd_pairs(score_member_pairs) do
+    Enum.reduce_while(score_member_pairs, :ok, fn
+      {score, member}, :ok when is_float(score) and is_binary(member) ->
+        {:cont, :ok}
+
+      {{:error, reason}, _member}, :ok when is_binary(reason) ->
+        {:halt, {:error, reason}}
+
+      _invalid, :ok ->
+        {:halt, {:error, "ERR syntax error"}}
+    end)
+  end
 end

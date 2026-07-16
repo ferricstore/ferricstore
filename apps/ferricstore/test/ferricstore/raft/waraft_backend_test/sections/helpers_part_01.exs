@@ -378,15 +378,20 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01 do
         |> :erlang.binary_to_term([:safe])
       end
 
-      defp missing_legacy_blob_ref(payload) when is_binary(payload) do
-        ref = BlobRef.from_payload(payload)
+      defp missing_blob_ref(payload) when is_binary(payload) do
+        <<segment_id::unsigned-big-64, _rest::binary>> = :crypto.hash(:sha256, payload)
+        ref = BlobRef.from_segment(payload, segment_id, 48)
         {BlobRef.encode!(ref), ref}
       end
 
-      defp write_legacy_blob!(ctx, shard_index, ref, payload) do
+      defp write_blob_segment!(ctx, shard_index, ref, payload) do
         path = BlobRef.path(ctx.data_dir, shard_index, ref)
         File.mkdir_p!(Path.dirname(path))
-        File.write!(path, payload)
+
+        File.write!(
+          path,
+          <<0, "FSBLOG", 1, ref.size::unsigned-big-64, ref.checksum::binary, payload::binary>>
+        )
       end
 
       defp waraft_segment_log_record(shard_index) do

@@ -27,4 +27,39 @@ defmodule Ferricstore.Flow.MutationAttrsTest do
                partition_key: "p1"
              )
   end
+
+  test "create_attrs rejects timestamps that cannot be represented exactly by Flow indexes" do
+    above_exact_integer = 9_007_199_254_740_992
+
+    assert {:error, "ERR flow now_ms exceeds maximum 9007199254740991"} =
+             MutationAttrs.create_attrs("flow-1",
+               type: "email",
+               now_ms: above_exact_integer
+             )
+
+    assert {:error, "ERR flow run_at_ms exceeds maximum 9007199254740991"} =
+             MutationAttrs.create_attrs("flow-1",
+               type: "email",
+               now_ms: 1,
+               run_at_ms: above_exact_integer
+             )
+  end
+
+  test "lease mutations reject deadlines outside the exact Flow timestamp range" do
+    max_exact_integer = 9_007_199_254_740_991
+
+    assert {:error, "ERR flow lease_ms exceeds maximum 9007199254740991"} =
+             MutationAttrs.start_and_claim_attrs("flow-1", "email", "queued",
+               worker: "worker",
+               now_ms: 0,
+               lease_ms: max_exact_integer + 1
+             )
+
+    assert {:error, "ERR flow lease_ms deadline exceeds maximum 9007199254740991"} =
+             MutationAttrs.start_and_claim_attrs("flow-1", "email", "queued",
+               worker: "worker",
+               now_ms: max_exact_integer,
+               lease_ms: 1
+             )
+  end
 end

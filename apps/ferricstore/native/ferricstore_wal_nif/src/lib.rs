@@ -1,9 +1,11 @@
 // ferricstore_wal_nif -- Rust NIF append-log I/O layer for WARaft segments
 //
-// Hot write/sync NIF functions run on normal BEAM schedulers (<1μs each).
+// Sync/position submissions run on normal BEAM schedulers (<1μs each).
+// WAL writes decode and copy caller-sized iodata on dirty CPU schedulers.
 // Blocking I/O (write + fdatasync) runs on a dedicated background thread.
-// Startup/recovery/shutdown calls stay on Normal schedulers; long-running
-// runtime I/O belongs on the background thread/Tokio path, not dirty schedulers.
+// Startup/recovery/shutdown filesystem calls use dirty I/O schedulers. Runtime
+// sync submission stays non-blocking on normal schedulers while the dedicated
+// background thread owns write() + fdatasync().
 //
 // Architecture:
 //   NIF calls → Mutex<AlignedBuffer> (shared) → FlushRequest channel → Background thread
@@ -48,7 +50,7 @@ mod atoms {
 /// commit_delay_us: maximum adaptive microseconds to wait before fdatasync (default 6000)
 /// pre_allocate_bytes: fallocate size (default 256MB)
 /// max_buffer_bytes: backpressure limit (default 64MB)
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn open(
     path: String,
     commit_delay_us: u64,
@@ -62,7 +64,7 @@ fn open(
 }
 
 /// Open a generic append log file from byte 0.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn open_raw_append(
     path: String,
     commit_delay_us: u64,
@@ -78,7 +80,7 @@ fn open_raw_append(
 /// Write pre-formatted iodata to the WAL buffer.
 /// Copies bytes into the shared aligned buffer. Does NOT write to disk.
 /// Returns :ok | {:error, :wal_thread_dead} | {:error, :backpressure}
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn write(handle: ResourceArc<WalHandle>, iodata: Term) -> NifResult<Atom> {
     handle.check_alive()?;
 
@@ -132,8 +134,7 @@ fn sync_with_delay(
 }
 
 /// Close the WAL file. Blocks until background thread drains, syncs, and exits.
-/// Timeout: 30 seconds.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn close<'a>(env: Env<'a>, handle: ResourceArc<WalHandle>) -> NifResult<Term<'a>> {
     match handle.close() {
         Ok(()) => Ok(atoms::ok().encode(env)),
@@ -148,7 +149,7 @@ fn position(handle: ResourceArc<WalHandle>) -> NifResult<(Atom, u64)> {
 }
 
 /// Read bytes from WAL at offset. Used during recovery.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn pread<'a>(
     env: Env<'a>,
     handle: ResourceArc<WalHandle>,
@@ -163,7 +164,7 @@ fn pread<'a>(
 }
 
 /// Reserve disk space for an external segmented log without changing file size.
-#[rustler::nif(schedule = "Normal")]
+#[rustler::nif(schedule = "DirtyIo")]
 fn preallocate_keep_size<'a>(env: Env<'a>, path: String, bytes: u64) -> NifResult<Term<'a>> {
     match background_thread::preallocate_keep_size_path(&path, bytes) {
         Ok(()) => Ok(atoms::ok().encode(env)),

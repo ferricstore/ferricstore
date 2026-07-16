@@ -29,6 +29,32 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           {_s3, :ok} = StateMachine.apply(%{}, {:delete, "k"}, s2)
         end
 
+        @tag :prob_metadata_path_confinement
+        test "delete never trusts a probabilistic metadata path from the stored value", %{
+          state: state,
+          dir: dir
+        } do
+          key = "crafted-prob-metadata"
+          victim = Path.join(dir, "must-not-be-unlinked")
+          prob_dir = Path.join(dir, "prob")
+          expected_sidecar = Ferricstore.ProbFile.path(prob_dir, key, "bloom")
+
+          File.mkdir_p!(prob_dir)
+          File.write!(victim, "keep")
+          File.write!(expected_sidecar, "sidecar")
+
+          metadata =
+            Ferricstore.TermCodec.encode(
+              {:bloom_meta, %{path: victim, num_bits: 8, num_hashes: 1}}
+            )
+
+          {state2, :ok} = StateMachine.apply(%{}, {:put, key, metadata, 0}, state)
+          {_state3, :ok} = StateMachine.apply(%{}, {:delete, key}, state2)
+
+          assert File.read!(victim) == "keep"
+          refute File.exists?(expected_sidecar)
+        end
+
         test "missing active file fails delete and keeps ETS entry", %{state: state, ets: ets} do
           {state2, :ok} =
             StateMachine.apply(%{}, {:put, "missing_active_delete", "val", 0}, state)
@@ -51,7 +77,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           key = "missing_active_prob_delete"
           prob_dir = Path.join(dir, "prob")
           File.mkdir_p!(prob_dir)
-          prob_path = Path.join(prob_dir, "#{Base.url_encode64(key, padding: false)}.cms")
+          prob_path = Ferricstore.ProbFile.path(prob_dir, key, "cms")
           File.write!(prob_path, "cms")
 
           meta = :erlang.term_to_binary({:cms_meta, %{width: 1, depth: 1}})
@@ -74,7 +100,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           key = "prob_delete_fsync_telemetry"
           prob_dir = Path.join(dir, "prob")
           File.mkdir_p!(prob_dir)
-          prob_path = Path.join(prob_dir, "#{Base.url_encode64(key, padding: false)}.cms")
+          prob_path = Ferricstore.ProbFile.path(prob_dir, key, "cms")
           File.write!(prob_path, "cms")
 
           handler_id = {__MODULE__, self(), :prob_sidecar_delete_failed}
@@ -369,7 +395,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
               {:bloom_meta, %{num_bits: 9586, num_hashes: 7, capacity: 1000, error_rate: 0.01}}}},
             {"batch_cms_create_fail", {:cms_create, "batch_cms_create_fail", 100, 5}},
             {"batch_cuckoo_create_fail", {:cuckoo_create, "batch_cuckoo_create_fail", 1024, 4}},
-            {"batch_topk_create_fail", {:topk_create, "batch_topk_create_fail", 10, 8, 7, 0.9}}
+            {"batch_topk_create_fail", {:topk_create, "batch_topk_create_fail", 10, 8, 7}}
           ]
 
           {_state, {:ok, results}} =
@@ -560,6 +586,73 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           assert [{^key, "new", 456, _lfu, 7, 42, 3}] = :ets.lookup(ets, key)
         end
 
+        test "attaches append location to a forced-hot staged value above the cache threshold", %{
+          state: state,
+          ets: ets
+        } do
+          key = "forced-hot-flow-location-key"
+          value = "flow-state-kept-hot"
+          expire_at_ms = 456
+          state = Map.put(state, :instance_ctx, %{hot_cache_max_value_size: 1})
+
+          :ets.insert(
+            ets,
+            {key, value, expire_at_ms, Ferricstore.Store.LFU.initial(), :pending, 0,
+             byte_size(value)}
+          )
+
+          try do
+            Process.put(:sm_pending_fast_staged_put_batch, true)
+            Process.put(:sm_pending_values, %{key => {value, expire_at_ms}})
+
+            StateMachine.__apply_pending_locations_for_test__(
+              state,
+              7,
+              [{:put, key, value, expire_at_ms}],
+              [{:put, 42, byte_size(value)}]
+            )
+          after
+            Process.delete(:sm_pending_fast_staged_put_batch)
+            Process.delete(:sm_pending_values)
+          end
+
+          assert [{^key, ^value, ^expire_at_ms, _lfu, 7, 42, _value_size}] =
+                   :ets.lookup(ets, key)
+        end
+
+        test "does not attach a stale forced-hot append when the staged value changed", %{
+          state: state,
+          ets: ets
+        } do
+          key = "stale-forced-hot-flow-location-key"
+          expire_at_ms = 456
+          state = Map.put(state, :instance_ctx, %{hot_cache_max_value_size: 1})
+
+          :ets.insert(
+            ets,
+            {key, "new", expire_at_ms, Ferricstore.Store.LFU.initial(), :pending, 0,
+             byte_size("new")}
+          )
+
+          try do
+            Process.put(:sm_pending_fast_staged_put_batch, true)
+            Process.put(:sm_pending_values, %{key => {"new", expire_at_ms}})
+
+            StateMachine.__apply_pending_locations_for_test__(
+              state,
+              7,
+              [{:put, key, "old", expire_at_ms}],
+              [{:put, 42, byte_size("old")}]
+            )
+          after
+            Process.delete(:sm_pending_fast_staged_put_batch)
+            Process.delete(:sm_pending_values)
+          end
+
+          assert [{^key, "new", ^expire_at_ms, _lfu, :pending, 0, 3}] =
+                   :ets.lookup(ets, key)
+        end
+
         test "attaches WARaft tuple file ids to matching hot and cold pending rows", %{
           state: state,
           ets: ets
@@ -734,6 +827,33 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
       end
 
       describe "apply/3 probabilistic native failures" do
+        @tag :prob_long_key_path
+        test "replicated creates use bounded sidecar filenames for long keys", %{
+          state: state,
+          dir: dir
+        } do
+          long_key = String.duplicate("long-probabilistic-key", 1_000)
+
+          commands = [
+            {long_key <> ":bf", "bloom",
+             {:bloom_create, long_key <> ":bf", 9586, 7,
+              {:bloom_meta, %{num_bits: 9586, num_hashes: 7, capacity: 1000, error_rate: 0.01}}}},
+            {long_key <> ":cms", "cms", {:cms_create, long_key <> ":cms", 100, 5}},
+            {long_key <> ":cf", "cuckoo", {:cuckoo_create, long_key <> ":cf", 1024, 4}},
+            {long_key <> ":topk", "topk", {:topk_create, long_key <> ":topk", 10, 8, 7}}
+          ]
+
+          Enum.reduce(commands, state, fn {key, extension, command}, acc_state ->
+            {next_state, :ok} = StateMachine.apply(%{}, command, acc_state)
+            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, extension)
+
+            assert File.regular?(path)
+            assert byte_size(Path.basename(path)) <= 255
+
+            next_state
+          end)
+        end
+
         test "create reports prob directory parent fsync failure", %{
           state: state,
           ets: ets,
@@ -772,7 +892,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
               {:bloom_meta, %{num_bits: 9586, num_hashes: 7, capacity: 1000, error_rate: 0.01}}}},
             {"cms_create_fail", {:cms_create, "cms_create_fail", 100, 5}},
             {"cuckoo_create_fail", {:cuckoo_create, "cuckoo_create_fail", 1024, 4}},
-            {"topk_create_fail", {:topk_create, "topk_create_fail", 10, 8, 7, 0.9}}
+            {"topk_create_fail", {:topk_create, "topk_create_fail", 10, 8, 7}}
           ]
 
           Enum.reduce(commands, state, fn {key, command}, acc_state ->

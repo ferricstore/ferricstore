@@ -9,11 +9,11 @@
 
 use crate::aligned_buffer::AlignedBuffer;
 use crate::background_thread::{self, FlushCaller, FlushTarget, ThreadConfig, ThreadMsg};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -27,6 +27,9 @@ pub struct WalHandle {
     /// True while the background thread is alive.
     alive: Arc<AtomicBool>,
 
+    /// Serializes sync enqueue with panic cleanup so admitted callers are notified.
+    sync_admission: Arc<Mutex<()>>,
+
     /// Logical file size (updated by background thread after each write).
     file_size_counter: Arc<AtomicU64>,
 
@@ -38,6 +41,12 @@ pub struct WalHandle {
 
     /// Background thread handle.
     thread_handle: Mutex<Option<JoinHandle<()>>>,
+
+    /// Serializes sync admission with close and makes concurrent closes wait.
+    close_gate: Mutex<()>,
+
+    /// Preserves a terminal close failure for later close callers.
+    close_error: Mutex<Option<String>>,
 
     /// File handle for pread (recovery). Protected by mutex for seek safety.
     read_file: Mutex<File>,
@@ -52,19 +61,22 @@ impl WalHandle {
         max_buffer_bytes: u64,
     ) -> io::Result<Self> {
         let (file, _o_direct) = background_thread::open_wal_file(&path, pre_allocate_bytes)?;
+        let initial_size = file.metadata()?.len();
 
-        // Open a second fd for pread (recovery reads)
-        let read_file = std::fs::OpenOptions::new().read(true).open(&path)?;
+        // Open a second fd for pread (recovery reads).
+        let read_file = open_matching_read_file(&path, &file)?;
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let (flush_tx, flush_rx) = crossbeam_channel::bounded(1024);
         let alive = Arc::new(AtomicBool::new(true));
-        let file_size = Arc::new(AtomicU64::new(background_thread::WAL_HEADER_SIZE));
+        let sync_admission = Arc::new(Mutex::new(()));
+        let file_size = Arc::new(AtomicU64::new(initial_size));
         let config = ThreadConfig {
             file,
             buffer: buffer.clone(),
             rx: flush_rx,
             alive: alive.clone(),
+            sync_admission: Arc::clone(&sync_admission),
             file_size: file_size.clone(),
             commit_delay: Duration::from_micros(commit_delay_us),
             _use_o_direct: _o_direct,
@@ -78,10 +90,13 @@ impl WalHandle {
             buffer,
             flush_tx,
             alive,
+            sync_admission,
             file_size_counter: file_size,
             max_buffer_bytes,
             commit_delay: Duration::from_micros(commit_delay_us),
             thread_handle: Mutex::new(Some(thread_handle)),
+            close_gate: Mutex::new(()),
+            close_error: Mutex::new(None),
             read_file: Mutex::new(read_file),
         })
     }
@@ -97,17 +112,19 @@ impl WalHandle {
     ) -> io::Result<Self> {
         let (file, _o_direct) = background_thread::open_raw_append_file(&path, start_offset)?;
 
-        let read_file = std::fs::OpenOptions::new().read(true).open(&path)?;
+        let read_file = open_matching_read_file(&path, &file)?;
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let (flush_tx, flush_rx) = crossbeam_channel::bounded(1024);
         let alive = Arc::new(AtomicBool::new(true));
+        let sync_admission = Arc::new(Mutex::new(()));
         let file_size = Arc::new(AtomicU64::new(start_offset));
         let config = ThreadConfig {
             file,
             buffer: buffer.clone(),
             rx: flush_rx,
             alive: alive.clone(),
+            sync_admission: Arc::clone(&sync_admission),
             file_size: file_size.clone(),
             commit_delay: Duration::from_micros(commit_delay_us),
             _use_o_direct: _o_direct,
@@ -121,10 +138,13 @@ impl WalHandle {
             buffer,
             flush_tx,
             alive,
+            sync_admission,
             file_size_counter: file_size,
             max_buffer_bytes,
             commit_delay: Duration::from_micros(commit_delay_us),
             thread_handle: Mutex::new(Some(thread_handle)),
+            close_gate: Mutex::new(()),
+            close_error: Mutex::new(None),
             read_file: Mutex::new(read_file),
         })
     }
@@ -148,13 +168,17 @@ impl WalHandle {
             .lock()
             .map_err(|_| rustler::Error::Term(Box::new("buffer_mutex_poisoned")))?;
 
+        self.check_alive()?;
+
         let buffered = buf.len() as u64;
         let incoming = data.len() as u64;
 
-        // A single write larger than the configured limit can never become
-        // acceptable by retrying. Treat the limit as soft only while the buffer
-        // is empty, then apply normal backpressure until the WAL thread drains.
-        if buffered > 0 && buffered + incoming > self.max_buffer_bytes {
+        if incoming > self.max_buffer_bytes {
+            return Err(rustler::Error::Term(Box::new("write_too_large")));
+        }
+
+        // Subtraction avoids overflowing while checking the aggregate bound.
+        if buffered > self.max_buffer_bytes - incoming {
             return Err(rustler::Error::Term(Box::new("backpressure")));
         }
 
@@ -170,6 +194,26 @@ impl WalHandle {
         saved_ref: rustler::env::SavedTerm,
         commit_delay: Duration,
     ) -> Result<(), rustler::Error> {
+        let _close_guard = match self.close_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                return Err(rustler::Error::Term(Box::new("backpressure")));
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(rustler::Error::Term(Box::new("close_gate_poisoned")));
+            }
+        };
+        let _admission_guard = match self.sync_admission.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                return Err(rustler::Error::Term(Box::new("backpressure")));
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(rustler::Error::Term(Box::new("sync_admission_poisoned")));
+            }
+        };
+        self.check_alive()?;
+
         let caller = FlushCaller {
             target: FlushTarget::Beam {
                 pid,
@@ -179,17 +223,27 @@ impl WalHandle {
             commit_delay,
         };
 
-        self.flush_tx
-            .send(ThreadMsg::Flush(caller))
-            .map_err(|_| rustler::Error::Term(Box::new("wal_thread_dead")))
+        match self.flush_tx.try_send(ThreadMsg::Flush(caller)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(rustler::Error::Term(Box::new("backpressure"))),
+            Err(TrySendError::Disconnected(_)) => {
+                Err(rustler::Error::Term(Box::new("wal_thread_dead")))
+            }
+        }
     }
 
     pub fn commit_delay(&self) -> Duration {
         self.commit_delay
     }
 
-    /// Close the WAL. Blocks until background thread exits (max 30s).
+    /// Close the WAL. Blocks until the background thread reports its final
+    /// drain/sync result and exits.
     pub fn close(&self) -> io::Result<()> {
+        let _close_guard = self
+            .close_gate
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "close gate poisoned"))?;
+
         let handle = {
             let mut guard = self
                 .thread_handle
@@ -199,50 +253,55 @@ impl WalHandle {
             match guard.take() {
                 Some(handle) => handle,
                 None => {
-                    self.alive.store(false, Ordering::Release);
-                    return Ok(());
+                    return match self
+                        .close_error
+                        .lock()
+                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "close result poisoned"))?
+                        .as_ref()
+                    {
+                        Some(reason) => Err(io::Error::new(io::ErrorKind::Other, reason.clone())),
+                        None => Ok(()),
+                    };
                 }
             }
         };
 
-        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        // Reject new writes and sync requests before the final drain begins.
+        self.alive.store(false, Ordering::Release);
+        let result = self.close_thread(handle);
 
-        if self
-            .flush_tx
-            .send(ThreadMsg::Close(Some(result_tx)))
-            .is_err()
-        {
-            self.alive.store(false, Ordering::Release);
-            let _ = handle.join();
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "wal thread dead"));
+        if let Err(error) = &result {
+            *self
+                .close_error
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "close result poisoned"))? =
+                Some(error.to_string());
         }
 
-        let close_result = match result_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(reason)) => Err(io::Error::new(io::ErrorKind::Other, reason)),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "wal close timeout"))
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "wal thread closed without reporting close result",
-            )),
+        result
+    }
+
+    fn close_thread(&self, handle: JoinHandle<()>) -> io::Result<()> {
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        let close_result = match self.flush_tx.send(ThreadMsg::Close(Some(result_tx))) {
+            Ok(()) => match result_rx.recv() {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(reason)) => Err(io::Error::new(io::ErrorKind::Other, reason)),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "wal thread closed without reporting close result",
+                )),
+            },
+            Err(_) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "wal thread dead")),
         };
 
-        // Wait for thread to exit.
-        let start = std::time::Instant::now();
-        loop {
-            if handle.is_finished() {
-                let _ = handle.join();
-                break;
-            }
-            if start.elapsed() > Duration::from_secs(30) {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "wal close timeout"));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        if handle.join().is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "wal thread panicked during close",
+            ));
         }
 
-        self.alive.store(false, Ordering::Release);
         close_result
     }
 
@@ -261,6 +320,28 @@ impl WalHandle {
         background_thread::pread_from_file(&mut file, offset, len)
             .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))
     }
+}
+
+fn open_matching_read_file(path: &str, write_file: &File) -> io::Result<File> {
+    let read_file = background_thread::open_read_nofollow(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let write_metadata = write_file.metadata()?;
+        let read_metadata = read_file.metadata()?;
+        if write_metadata.dev() != read_metadata.dev()
+            || write_metadata.ino() != read_metadata.ino()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL path changed while opening read descriptor",
+            ));
+        }
+    }
+
+    Ok(read_file)
 }
 
 impl Drop for WalHandle {
@@ -417,6 +498,107 @@ mod tests {
 
         assert!(err.to_string().contains("buffer mutex poisoned"));
         assert!(handle.check_alive().is_err());
+    }
+
+    #[test]
+    fn concurrent_close_waits_for_the_inflight_close_result() {
+        let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
+        let (flush_tx, flush_rx) = crossbeam_channel::bounded(4);
+        let (close_started_tx, close_started_rx) = crossbeam_channel::bounded(1);
+        let (release_close_tx, release_close_rx) = crossbeam_channel::bounded(1);
+
+        let thread_handle = std::thread::spawn(move || {
+            let ThreadMsg::Close(Some(response)) = flush_rx.recv().unwrap() else {
+                panic!("expected close request");
+            };
+            close_started_tx.send(()).unwrap();
+            release_close_rx.recv().unwrap();
+            response.send(Ok(())).unwrap();
+        });
+
+        let handle = Arc::new(WalHandle {
+            buffer,
+            flush_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            sync_admission: Arc::new(Mutex::new(())),
+            file_size_counter: Arc::new(AtomicU64::new(0)),
+            max_buffer_bytes: 1024,
+            commit_delay: Duration::ZERO,
+            thread_handle: Mutex::new(Some(thread_handle)),
+            close_gate: Mutex::new(()),
+            close_error: Mutex::new(None),
+            read_file: Mutex::new(tempfile::tempfile().unwrap()),
+        });
+
+        let first_handle = Arc::clone(&handle);
+        let first = std::thread::spawn(move || first_handle.close());
+        close_started_rx.recv().unwrap();
+
+        let second_handle = Arc::clone(&handle);
+        let (second_done_tx, second_done_rx) = crossbeam_channel::bounded(1);
+        let second = std::thread::spawn(move || {
+            second_done_tx.send(second_handle.close()).unwrap();
+        });
+
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "a concurrent close must not return before the inflight close is durable"
+        );
+
+        release_close_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn close_waits_for_channel_capacity_and_joins_the_worker() {
+        let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
+        let (flush_tx, flush_rx) = crossbeam_channel::bounded(1);
+        flush_tx.send(ThreadMsg::Close(None)).unwrap();
+
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let thread_handle = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+            drop(flush_rx);
+        });
+
+        let handle = Arc::new(WalHandle {
+            buffer,
+            flush_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            sync_admission: Arc::new(Mutex::new(())),
+            file_size_counter: Arc::new(AtomicU64::new(0)),
+            max_buffer_bytes: 1024,
+            commit_delay: Duration::ZERO,
+            thread_handle: Mutex::new(Some(thread_handle)),
+            close_gate: Mutex::new(()),
+            close_error: Mutex::new(None),
+            read_file: Mutex::new(tempfile::tempfile().unwrap()),
+        });
+
+        let close_handle = Arc::clone(&handle);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let closer = std::thread::spawn(move || done_tx.send(close_handle.close()).unwrap());
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(40)).is_err(),
+            "close returned before the queued durability worker could finish"
+        );
+
+        release_tx.send(()).unwrap();
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        closer.join().unwrap();
+        assert!(handle.thread_handle.lock().unwrap().is_none());
     }
 
     #[test]

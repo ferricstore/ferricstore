@@ -14,6 +14,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
+      alias Ferricstore.FetchOrCompute.Outcome, as: FetchOrComputeOutcome
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -32,14 +33,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         ColdRead,
         CompoundKey,
         ExpiryTracker,
+        Keydir,
         LFU,
         ListOps,
         Promotion,
+        RateLimit,
         Router,
         ValueCodec
       }
 
-      alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -94,9 +97,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
               {v, exp} -> {to_disk_binary(v), exp}
             end
 
-          new_val = sm_apply_setrange(old_val, offset, value)
-          do_put(state, key, new_val, expire_at_ms)
-          {:ok, byte_size(new_val)}
+          target_size =
+            Ferricstore.Raft.ApplyLimits.setrange_size(
+              byte_size(old_val),
+              offset,
+              byte_size(value)
+            )
+
+          with :ok <- Ferricstore.Raft.ApplyLimits.validate_value_size(state, target_size),
+               new_val = sm_apply_setrange(old_val, offset, value),
+               :ok <- do_put(state, key, new_val, expire_at_ms) do
+            {:ok, target_size}
+          end
         end
       end
 
@@ -113,28 +125,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
           byte_index = div(offset, 8)
           bit_position = 7 - rem(offset, 8)
+          target_size = Ferricstore.Raft.ApplyLimits.setbit_size(byte_size(old_val), offset)
 
-          extended =
-            if byte_size(old_val) >= byte_index + 1 do
-              old_val
-            else
-              old_val <> :binary.copy(<<0>>, byte_index + 1 - byte_size(old_val))
+          with :ok <- Ferricstore.Raft.ApplyLimits.validate_value_size(state, target_size) do
+            extended =
+              if byte_size(old_val) >= byte_index + 1 do
+                old_val
+              else
+                old_val <> :binary.copy(<<0>>, byte_index + 1 - byte_size(old_val))
+              end
+
+            old_byte = :binary.at(extended, byte_index)
+            old_bit = old_byte >>> bit_position &&& 1
+
+            new_byte =
+              case bit_val do
+                1 -> old_byte ||| 1 <<< bit_position
+                0 -> old_byte &&& bnot(1 <<< bit_position)
+              end
+
+            <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
+            new_value = <<prefix::binary, new_byte::8, suffix::binary>>
+
+            case do_put(state, key, new_value, expire_at_ms) do
+              :ok -> old_bit
+              {:error, _reason} = error -> error
             end
-
-          old_byte = :binary.at(extended, byte_index)
-          old_bit = old_byte >>> bit_position &&& 1
-
-          new_byte =
-            case bit_val do
-              1 -> old_byte ||| 1 <<< bit_position
-              0 -> old_byte &&& bnot(1 <<< bit_position)
-            end
-
-          <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
-          new_value = <<prefix::binary, new_byte::8, suffix::binary>>
-
-          do_put(state, key, new_value, expire_at_ms)
-          old_bit
+          end
         end
       end
 
@@ -148,8 +165,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             if delta > @int64_max or delta < @int64_min do
               {:error, "ERR increment or decrement would overflow"}
             else
-              do_put(state, compound_key, Integer.to_string(delta), 0)
-              delta
+              case do_compound_put(state, redis_key, compound_key, Integer.to_string(delta), 0) do
+                :ok -> delta
+                {:error, _reason} = error -> error
+              end
             end
 
           {value, expire_at_ms} ->
@@ -160,8 +179,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                 if new_val > @int64_max or new_val < @int64_min do
                   {:error, "ERR increment or decrement would overflow"}
                 else
-                  do_put(state, compound_key, Integer.to_string(new_val), expire_at_ms)
-                  new_val
+                  case do_compound_put(
+                         state,
+                         redis_key,
+                         compound_key,
+                         Integer.to_string(new_val),
+                         expire_at_ms
+                       ) do
+                    :ok -> new_val
+                    {:error, _reason} = error -> error
+                  end
                 end
 
               :error ->
@@ -177,16 +204,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         case sm_store_compound_get_meta(state, redis_key, compound_key) do
           nil ->
             new_val = delta * 1.0
-            do_put(state, compound_key, Float.to_string(new_val), 0)
-            Float.to_string(new_val)
+            new_str = Float.to_string(new_val)
+
+            case do_compound_put(state, redis_key, compound_key, new_str, 0) do
+              :ok -> new_str
+              {:error, _reason} = error -> error
+            end
 
           {value, expire_at_ms} ->
             case coerce_float(value) do
               {:ok, cur} ->
                 new_val = cur + delta
                 new_str = Float.to_string(new_val)
-                do_put(state, compound_key, new_str, expire_at_ms)
-                new_str
+
+                case do_compound_put(state, redis_key, compound_key, new_str, expire_at_ms) do
+                  :ok -> new_str
+                  {:error, _reason} = error -> error
+                end
 
               :error ->
                 {:error, "ERR hash value is not a valid float"}
@@ -225,9 +259,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           new_score = current_score + increment * 1.0
           new_str = Float.to_string(new_score)
 
-          do_put(state, compound_key, new_str, 0)
-          zset_index_put(state, redis_key, compound_key, new_str)
-          new_str
+          case do_compound_put(state, redis_key, compound_key, new_str, 0) do
+            :ok -> new_str
+            {:error, _reason} = error -> error
+          end
         end
       end
 
@@ -242,32 +277,47 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         store = build_compound_store(state)
 
         with :ok <- Ferricstore.Store.TypeRegistry.check_type(redis_key, :set, store) do
-          prefix = CompoundKey.set_prefix(redis_key)
-
-          members =
-            state
-            |> shard_ets_state()
-            |> Ferricstore.Store.Shard.ETS.prefix_scan_entries(prefix, state.shard_data_path)
-            |> Enum.map(fn {member, _value} -> member end)
-            |> Enum.sort()
-
           pop_count = if is_nil(count), do: 1, else: count
 
-          # Raft apply must be deterministic on every replica. Use the committed
-          # Ra index as the selection seed instead of caller-side randomness.
-          selected = deterministic_take(members, pop_count, {redis_key, seed})
+          if pop_count == 0 do
+            []
+          else
+            prefix = CompoundKey.set_prefix(redis_key)
+            cursor = deterministic_member_cursor({redis_key, seed})
 
-          selected_delete_keys = Enum.map(selected, &CompoundKey.set_member(redis_key, &1))
-
-          with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
-               :ok <-
-                 maybe_delete_empty_compound_type_key_after_pop(
-                   state,
-                   redis_key,
-                   length(members),
-                   length(selected)
+            case CompoundMemberIndex.member_slice(
+                   Map.get(state, :compound_member_index_name),
+                   shard_ets_state(state),
+                   prefix,
+                   cursor,
+                   pop_count,
+                   apply_now_ms(),
+                   Process.get(:sm_pending_values, %{})
                  ) do
-            if is_nil(count), do: List.first(selected), else: selected
+              {:ok, selected} ->
+                selected_delete_keys =
+                  Enum.map(selected, &CompoundKey.set_member(redis_key, &1))
+
+                type_key = CompoundKey.type_key(redis_key)
+
+                with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
+                     :ok <-
+                       maybe_delete_empty_compound_type(
+                         state,
+                         redis_key,
+                         type_key,
+                         :set,
+                         selected_delete_keys
+                       ) do
+                  if is_nil(count), do: List.first(selected), else: selected
+                end
+
+              :unavailable ->
+                pop_state_read_failure(:compound_member_index_unavailable)
+
+              {:error, reason} ->
+                pop_state_read_failure(reason)
+            end
           end
         end
       end
@@ -280,34 +330,42 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         store = build_compound_store(state)
 
         with :ok <- Ferricstore.Store.TypeRegistry.check_type(redis_key, :zset, store) do
-          prefix = CompoundKey.zset_prefix(redis_key)
+          if count == 0 do
+            []
+          else
+            prefix = CompoundKey.zset_prefix(redis_key)
 
-          sorted =
-            state
-            |> shard_ets_state()
-            |> Ferricstore.Store.Shard.ETS.prefix_scan_entries(prefix, state.shard_data_path)
-            |> Enum.map(fn {member, score_value} ->
-              {member, zpop_score(score_value)}
-            end)
-            |> Enum.sort_by(fn {member, score} -> {score, member} end)
+            with :ok <- ensure_zpop_score_index(state, redis_key, prefix) do
+              selected =
+                ZSetIndex.rank_range(
+                  state.zset_score_index_name,
+                  redis_key,
+                  0,
+                  count - 1,
+                  direction == :max
+                )
 
-          sorted = if direction == :max, do: Enum.reverse(sorted), else: sorted
-          selected = Enum.take(sorted, count)
+              selected_delete_keys =
+                Enum.map(selected, fn {member, _score} ->
+                  CompoundKey.zset_member(redis_key, member)
+                end)
 
-          selected_delete_keys =
-            Enum.map(selected, fn {member, _score} ->
-              CompoundKey.zset_member(redis_key, member)
-            end)
+              type_key = CompoundKey.type_key(redis_key)
 
-          with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
-               :ok <-
-                 maybe_delete_empty_compound_type_key_after_pop(
-                   state,
-                   redis_key,
-                   length(sorted),
-                   length(selected)
-                 ) do
-            Enum.flat_map(selected, fn {member, score} -> [member, format_zset_score(score)] end)
+              with :ok <- do_compound_batch_delete(state, redis_key, selected_delete_keys),
+                   :ok <-
+                     maybe_delete_empty_compound_type(
+                       state,
+                       redis_key,
+                       type_key,
+                       :zset,
+                       selected_delete_keys
+                     ) do
+                Enum.flat_map(selected, fn {member, score} ->
+                  [member, format_zset_score(score)]
+                end)
+              end
+            end
           end
         end
       end
@@ -315,26 +373,45 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp do_zpop(_state, _redis_key, _count, _direction),
         do: {:error, "ERR syntax error"}
 
-      defp deterministic_take(_members, 0, _seed), do: []
-      defp deterministic_take([], _count, _seed), do: []
-
-      defp deterministic_take(members, count, seed) do
-        size = length(members)
-        count = min(count, size)
-        start = :erlang.phash2(seed, size)
-        {left, right} = Enum.split(members, start)
-        Enum.take(right ++ left, count)
+      defp deterministic_member_cursor(seed) do
+        :crypto.hash(:sha256, :erlang.term_to_binary(seed, [:deterministic]))
       end
 
-      defp zpop_score(score) when is_binary(score) do
-        case Float.parse(score) do
-          {parsed, ""} -> parsed
-          _ -> 0.0
+      defp ensure_zpop_score_index(state, redis_key, prefix) do
+        cond do
+          not zset_index_tables?(state) ->
+            pop_state_read_failure(:zset_index_unavailable)
+
+          ZSetIndex.ready?(state.zset_score_lookup_name, redis_key) ->
+            :ok
+
+          true ->
+            instance_ctx = cross_shard_instance_ctx(state)
+            ctx = cross_shard_ctx(state, state.shard_index, state.data_dir, instance_ctx)
+            entries = cross_shard_compound_scan(ctx, redis_key, prefix)
+
+            case Process.get(:sm_state_read_failure) do
+              nil ->
+                case ZSetIndex.rebuild_key(
+                       state.zset_score_index_name,
+                       state.zset_score_lookup_name,
+                       redis_key,
+                       entries
+                     ) do
+                  :ok -> :ok
+                  {:error, reason} -> pop_state_read_failure(reason)
+                end
+
+              reason ->
+                {:error, {:state_read_failed, reason}}
+            end
         end
       end
 
-      defp zpop_score(score) when is_number(score), do: score * 1.0
-      defp zpop_score(_score), do: 0.0
+      defp pop_state_read_failure(reason) do
+        record_state_read_failure(reason)
+        {:error, {:state_read_failed, reason}}
+      end
 
       defp format_zset_score(score) when is_float(score) do
         :erlang.float_to_binary(score, [:compact, decimals: 17])
@@ -400,42 +477,49 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
             {Map.put(results, index, value), cold, remote}
 
-          [{^key, nil, 0, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-            {results, [{index, key, 0, fid, off} | cold], remote}
+          [{^key, nil, 0, _lfu, fid, off, vsize} = entry]
+          when valid_cold_location(fid, off, vsize) ->
+            {results, [{index, entry} | cold], remote}
 
-          [{^key, nil, 0, _lfu, fid, off, vsize}]
+          [{^key, nil, 0, _lfu, fid, off, vsize} = entry]
           when valid_waraft_segment_location(fid, off, vsize) ->
-            {results, [{index, key, 0, fid, off} | cold], remote}
+            {results, [{index, entry} | cold], remote}
 
           [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
             {Map.put(results, index, value), cold, remote}
 
-          [{^key, nil, exp, _lfu, fid, off, vsize}]
+          [{^key, nil, exp, _lfu, fid, off, vsize} = entry]
           when exp > now and valid_cold_location(fid, off, vsize) ->
-            {results, [{index, key, exp, fid, off} | cold], remote}
+            {results, [{index, entry} | cold], remote}
 
-          [{^key, nil, exp, _lfu, fid, off, vsize}]
+          [{^key, nil, exp, _lfu, fid, off, vsize} = entry]
           when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
-            {results, [{index, key, exp, fid, off} | cold], remote}
+            {results, [{index, entry} | cold], remote}
 
-          [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+          [{^key, value, exp, _lfu, _fid, _off, _vsize}]
+          when exp != 0 and exp <= now ->
             track_keydir_binary_remove_known(state, key, value)
             :ets.delete(state.ets, key)
             {results, cold, [{index, key} | remote]}
+
+          [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
+            record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+            {results, cold, remote}
 
           [] ->
             {results, cold, [{index, key} | remote]}
         end
       rescue
         ArgumentError ->
-          {results, cold, [{index, key} | remote]}
+          record_state_read_failure(:keydir_unavailable)
+          {results, cold, remote}
       end
 
       defp sm_store_read_cold_batch(_state, results, [], _path_fun), do: results
 
       defp sm_store_read_cold_batch(state, results, cold_reads, path_fun) do
         {segment_reads, file_reads} =
-          Enum.split_with(cold_reads, fn {_index, _key, _exp, fid, off} ->
+          Enum.split_with(cold_reads, fn {_index, {_key, _value, _exp, _lfu, fid, off, _vsize}} ->
             valid_waraft_segment_location(fid, off, 0)
           end)
 
@@ -448,70 +532,127 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp sm_store_read_bitcask_cold_batch(_state, results, [], _path_fun), do: results
 
       defp sm_store_read_bitcask_cold_batch(state, results, cold_reads, path_fun) do
-        locations =
-          Enum.map(cold_reads, fn {_index, key, _exp, fid, off} ->
-            {path_fun.(state, fid), off, key}
+        reads =
+          Enum.map(cold_reads, fn {_index, {key, nil, _exp, _lfu, fid, off, _vsize} = entry} ->
+            {path_fun.(state, fid), off, key, entry}
           end)
 
-        values =
-          locations
-          |> Ferricstore.Store.ColdRead.pread_batch_keyed(@cold_read_timeout_ms)
-          |> normalize_state_machine_batch_values(length(cold_reads))
+        {:ok, current_results} =
+          Ferricstore.Store.ColdRead.pread_batch_keyed_current(
+            reads,
+            fn key, entry -> sm_store_resolve_current_bitcask(state, path_fun, key, entry) end,
+            @cold_read_timeout_ms
+          )
 
-        emit_state_machine_batch_cold_errors(cold_reads, values, fn {_index, _key, _exp, fid,
-                                                                     _off} ->
-          path_fun.(state, fid)
+        values = Enum.map(current_results, &sm_store_current_read_value/1)
+
+        emit_state_machine_batch_cold_errors(cold_reads, values, fn
+          {_index, {_key, _value, _exp, _lfu, fid, _off, _vsize}} ->
+            path_fun.(state, fid)
         end)
 
         materialized_values = materialize_state_machine_batch_values(state, values)
 
-        cold_reads
-        |> Enum.zip(values)
-        |> Enum.zip(materialized_values)
+        [cold_reads, current_results, materialized_values]
+        |> Enum.zip()
         |> Enum.reduce(results, fn
-          {{{index, key, exp, fid, off}, value}, materialized}, acc
-          when is_binary(value) and value == materialized ->
-            ets_value = value_for_ets(value, hot_cache_threshold(state))
-            track_keydir_binary_warm(state, ets_value)
-
-            :ets.insert(
-              state.ets,
-              {key, ets_value, exp, LFU.initial(), fid, off, byte_size(value)}
-            )
-
-            Map.put(acc, index, value)
-
-          {{{index, _key, _exp, _fid, _off}, value}, materialized}, acc
+          {{index, _observed_entry}, {:value, value, current_entry}, materialized}, acc
           when is_binary(value) and is_binary(materialized) ->
+            sm_store_maybe_warm_current_entry(state, current_entry, value)
             Map.put(acc, index, materialized)
 
-          {_read_value, _materialized}, acc ->
+          {{_index, _observed_entry}, {:error, reason}, _materialized}, acc ->
+            record_state_read_failure({:cold_value_unavailable, reason})
+            acc
+
+          {{_index, _observed_entry}, {:value, _value, _current_entry}, {:error, reason}}, acc ->
+            record_state_read_failure(reason)
+            acc
+
+          {_read, _current_result, _materialized}, acc ->
             acc
         end)
       end
+
+      defp sm_store_current_read_value({:value, value, _entry}), do: value
+      defp sm_store_current_read_value({:error, reason}), do: {:error, reason}
+      defp sm_store_current_read_value(:missing), do: nil
+
+      defp sm_store_resolve_current_bitcask(state, path_fun, key, _observed_entry) do
+        now = apply_now_ms()
+
+        case :ets.lookup(state.ets, key) do
+          [{^key, value, 0, _lfu, _fid, _off, _vsize} = entry] when is_binary(value) ->
+            {:hot, value, entry}
+
+          [{^key, value, exp, _lfu, _fid, _off, _vsize} = entry]
+          when exp > now and is_binary(value) ->
+            {:hot, value, entry}
+
+          [{^key, nil, 0, _lfu, fid, off, vsize} = entry]
+          when valid_cold_location(fid, off, vsize) ->
+            {:cold, path_fun.(state, fid), off, entry}
+
+          [{^key, nil, exp, _lfu, fid, off, vsize} = entry]
+          when exp > now and valid_cold_location(fid, off, vsize) ->
+            {:cold, path_fun.(state, fid), off, entry}
+
+          _ ->
+            :missing
+        end
+      rescue
+        ArgumentError -> :missing
+      end
+
+      defp sm_store_maybe_warm_current_entry(
+             state,
+             {key, nil, _exp, _lfu, _fid, _off, _vsize} = current_entry,
+             value
+           ) do
+        ets_value = value_for_ets(value, hot_cache_threshold(state))
+        replacement = put_elem(current_entry, 1, ets_value)
+
+        if Keydir.replace_exact(state.ets, current_entry, replacement) do
+          track_keydir_binary_warm(state, ets_value)
+        end
+
+        :ok
+      end
+
+      defp sm_store_maybe_warm_current_entry(_state, _current_entry, _value), do: :ok
 
       defp sm_store_read_waraft_segment_batch(_state, results, []), do: results
 
       defp sm_store_read_waraft_segment_batch(state, results, segment_reads) do
         ctx = instance_ctx_for_state(state)
 
-        Enum.reduce(segment_reads, results, fn {index, key, exp, fid, off}, acc ->
-          case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
-                 ctx,
-                 state.shard_index,
-                 fid,
-                 key
-               ) do
-            {:ok, value} when is_binary(value) ->
-              sm_store_merge_segment_value(state, acc, index, key, exp, fid, off, value)
+        Enum.reduce(segment_reads, results, fn
+          {index, {key, nil, _exp, _lfu, fid, _off, _vsize} = entry}, acc ->
+            case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                   ctx,
+                   state.shard_index,
+                   fid,
+                   key
+                 ) do
+              {:ok, value} when is_binary(value) ->
+                sm_store_merge_segment_value(state, acc, index, entry, value)
 
-            _miss_or_error ->
-              acc
-          end
+              {:error, reason} ->
+                record_state_read_failure({:waraft_value_unavailable, reason})
+                acc
+
+              :not_found ->
+                record_state_read_failure({:waraft_value_unavailable, :not_found})
+                acc
+
+              invalid ->
+                record_state_read_failure({:invalid_waraft_read_result, invalid})
+                acc
+            end
         end)
       end
 
-      defp sm_store_merge_segment_value(state, acc, index, key, exp, fid, off, value) do
+      defp sm_store_merge_segment_value(state, acc, index, entry, value) do
         case BlobValue.maybe_materialize(
                Map.get(blob_apply_ctx(state), :data_dir),
                state.shard_index,
@@ -519,20 +660,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                value
              ) do
           {:ok, ^value} ->
-            ets_value = value_for_ets(value, hot_cache_threshold(state))
-            track_keydir_binary_warm(state, ets_value)
-
-            :ets.insert(
-              state.ets,
-              {key, ets_value, exp, LFU.initial(), fid, off, byte_size(value)}
-            )
-
+            sm_store_maybe_warm_current_entry(state, entry, value)
             Map.put(acc, index, value)
 
           {:ok, materialized} when is_binary(materialized) ->
             Map.put(acc, index, materialized)
 
-          {:error, _reason} ->
+          {:error, reason} ->
+            record_state_read_failure({:blob_ref_unavailable, reason})
             acc
         end
       end
@@ -570,15 +705,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
-      defp sm_store_batch_remote_get([], _ctx, results), do: results
-      defp sm_store_batch_remote_get(_entries, nil, results), do: results
-
-      defp sm_store_batch_remote_get(entries, ctx, results) do
-        remote_keys = Enum.map(entries, fn {_index, key} -> key end)
-        remote_values = Router.batch_get(ctx, remote_keys)
-
-        merge_indexed_values(results, entries, remote_values)
-      end
+      # Raft apply must be a pure function of replicated state. A local keydir
+      # miss is therefore a missing value; consulting Router here could observe
+      # a different Raft group or replica and make peers apply different data.
+      defp sm_store_batch_remote_get(_entries, _ctx, results), do: results
 
       defp merge_indexed_values(results, entries, values) do
         entries
@@ -618,14 +748,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # Mirror of TypeRegistry.check_or_set but operates on state machine state.
       # Writes type metadata on first use, returns :ok or wrongtype error.
       defp check_or_set_type(state, redis_key, type_key, expected_type) do
-        case do_get(state, type_key) do
+        case sm_store_compound_get(state, redis_key, type_key) do
           nil ->
             # No type metadata yet. Reject if the key already exists as a plain string.
             if ets_has?(state.ets, redis_key) do
               {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
             else
-              do_put(state, type_key, expected_type, 0)
-              :ok
+              do_compound_put(state, redis_key, type_key, expected_type, 0)
             end
 
           existing when is_binary(existing) and existing == expected_type ->
@@ -764,17 +893,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # Private: cross-shard key locking (mini-percolator)
       # ---------------------------------------------------------------------------
 
-      # Lock map is stored in a process dictionary key per shard. This avoids
-      # adding a field to the Raft state struct (which would require migration).
-      # The process dictionary persists across apply/3 calls because ra runs the
-      # state machine in a dedicated process.
+      @cross_shard_lock_prune_batch 256
 
       # Locks all keys atomically. If any key is already locked by a different
       # owner (and not expired), rejects the entire batch.
       # Returns {new_state, result} — locks are persisted in Raft state.
       defp do_lock_keys(state, keys, owner_ref, expire_at_ms) do
         locks = Map.get(state, :cross_shard_locks, %{})
+        {state, expiry_index} = ensure_cross_shard_lock_expiry_index(state, locks)
         now = apply_now_ms()
+
+        {locks, expiry_index} =
+          prune_cross_shard_lock_expiries(
+            locks,
+            expiry_index,
+            now,
+            @cross_shard_lock_prune_batch
+          )
+
+        indexed_state = put_cross_shard_lock_state(state, locks, expiry_index)
 
         conflict =
           Enum.find(keys, fn key ->
@@ -786,17 +923,53 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           end)
 
         if conflict do
-          {state, {:error, :keys_locked}}
+          {indexed_state, {:error, :keys_locked}}
         else
-          # Prune expired locks to prevent unbounded memory growth
-          pruned = Map.reject(locks, fn {_k, {_ref, exp}} -> exp <= now end)
+          {new_locks, new_expiry_index} =
+            Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
+              index_acc = remove_cross_shard_lock_expiry(index_acc, key, Map.get(lock_acc, key))
 
-          new_locks =
-            Enum.reduce(keys, pruned, fn key, acc ->
-              Map.put(acc, key, {owner_ref, expire_at_ms})
+              {
+                Map.put(lock_acc, key, {owner_ref, expire_at_ms}),
+                :gb_trees.enter({expire_at_ms, key}, owner_ref, index_acc)
+              }
             end)
 
-          {Map.put(state, :cross_shard_locks, new_locks), :ok}
+          {put_cross_shard_lock_state(state, new_locks, new_expiry_index), :ok}
+        end
+      end
+
+      # Renews all requested locks only when the owner still has one continuous,
+      # live lease over every key. Validation is read-only so a failed batch
+      # cannot partially move either the lock map or its ordered expiry index.
+      defp do_renew_key_locks(state, keys, owner_ref, expire_at_ms) do
+        locks = Map.get(state, :cross_shard_locks, %{})
+        {indexed_state, expiry_index} = ensure_cross_shard_lock_expiry_index(state, locks)
+        now = apply_now_ms()
+
+        owns_all? =
+          Enum.all?(keys, fn key ->
+            case Map.get(locks, key) do
+              {^owner_ref, current_expiry} when current_expiry > now -> true
+              _missing_expired_or_other_owner -> false
+            end
+          end)
+
+        if owns_all? do
+          {new_locks, new_expiry_index} =
+            Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
+              current_lock = Map.fetch!(lock_acc, key)
+              index_acc = remove_cross_shard_lock_expiry(index_acc, key, current_lock)
+
+              {
+                Map.put(lock_acc, key, {owner_ref, expire_at_ms}),
+                :gb_trees.enter({expire_at_ms, key}, owner_ref, index_acc)
+              }
+            end)
+
+          {put_cross_shard_lock_state(indexed_state, new_locks, new_expiry_index), :ok}
+        else
+          {state, {:error, :not_lock_owner}}
         end
       end
 
@@ -804,40 +977,226 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # Returns {new_state, :ok}.
       defp do_unlock_keys(state, keys, owner_ref) do
         locks = Map.get(state, :cross_shard_locks, %{})
+        {state, expiry_index} = ensure_cross_shard_lock_expiry_index(state, locks)
 
-        new_locks =
-          Enum.reduce(keys, locks, fn key, acc ->
-            case Map.get(acc, key) do
-              {^owner_ref, _exp} -> Map.delete(acc, key)
-              _ -> acc
+        {new_locks, new_expiry_index} =
+          Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
+            case Map.get(lock_acc, key) do
+              {^owner_ref, _exp} = lock ->
+                {
+                  Map.delete(lock_acc, key),
+                  remove_cross_shard_lock_expiry(index_acc, key, lock)
+                }
+
+              _missing_or_other_owner ->
+                {lock_acc, index_acc}
             end
           end)
 
-        {Map.put(state, :cross_shard_locks, new_locks), :ok}
+        {put_cross_shard_lock_state(state, new_locks, new_expiry_index), :ok}
       end
 
-      # Checks whether a key is locked by someone other than owner_ref.
-      defp check_key_lock(state, key, owner_ref) do
+      defp do_unlock_keys_owned(state, keys, owner_ref) do
         locks = Map.get(state, :cross_shard_locks, %{})
+        {state, expiry_index} = ensure_cross_shard_lock_expiry_index(state, locks)
+        now = apply_now_ms()
 
-        if map_size(locks) == 0 do
+        owns_all? =
+          Enum.all?(keys, fn key ->
+            case Map.get(locks, key) do
+              {^owner_ref, expire_at_ms} when expire_at_ms > now -> true
+              _missing_expired_or_other_owner -> false
+            end
+          end)
+
+        if owns_all? do
+          {new_locks, new_expiry_index} =
+            Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
+              lock = Map.fetch!(lock_acc, key)
+
+              {
+                Map.delete(lock_acc, key),
+                remove_cross_shard_lock_expiry(index_acc, key, lock)
+              }
+            end)
+
+          {put_cross_shard_lock_state(state, new_locks, new_expiry_index), :ok}
+        else
+          {state, {:error, :not_lock_owner}}
+        end
+      end
+
+      defp ensure_cross_shard_lock_expiry_index(state, locks) do
+        case Map.fetch(state, :cross_shard_lock_expiries) do
+          {:ok, expiry_index} ->
+            {state, expiry_index}
+
+          :error ->
+            expiry_index =
+              Enum.reduce(locks, :gb_trees.empty(), fn {key, {owner_ref, expire_at_ms}}, acc ->
+                :gb_trees.enter({expire_at_ms, key}, owner_ref, acc)
+              end)
+
+            {Map.put(state, :cross_shard_lock_expiries, expiry_index), expiry_index}
+        end
+      end
+
+      defp prune_cross_shard_lock_expiries(locks, expiry_index, _now, 0),
+        do: {locks, expiry_index}
+
+      defp prune_cross_shard_lock_expiries(locks, expiry_index, now, remaining) do
+        if :gb_trees.is_empty(expiry_index) do
+          {locks, expiry_index}
+        else
+          {{expire_at_ms, key}, indexed_owner} = :gb_trees.smallest(expiry_index)
+
+          if expire_at_ms > now do
+            {locks, expiry_index}
+          else
+            expiry_index = :gb_trees.delete({expire_at_ms, key}, expiry_index)
+
+            locks =
+              case Map.get(locks, key) do
+                {^indexed_owner, ^expire_at_ms} -> Map.delete(locks, key)
+                _missing_or_renewed -> locks
+              end
+
+            prune_cross_shard_lock_expiries(locks, expiry_index, now, remaining - 1)
+          end
+        end
+      end
+
+      defp remove_cross_shard_lock_expiry(expiry_index, _key, nil), do: expiry_index
+
+      defp remove_cross_shard_lock_expiry(expiry_index, key, {_owner_ref, expire_at_ms}) do
+        :gb_trees.delete_any({expire_at_ms, key}, expiry_index)
+      end
+
+      defp put_cross_shard_lock_state(state, locks, expiry_index) do
+        state
+        |> Map.put(:cross_shard_locks, locks)
+        |> Map.put(:cross_shard_lock_expiries, expiry_index)
+      end
+
+      defp do_fetch_or_compute_lock(state, key, outcome_key, owner_ref, expire_at_ms) do
+        with :ok <- validate_fetch_or_compute_outcome_key(key, outcome_key) do
+          case do_lock_keys(state, [key], owner_ref, expire_at_ms) do
+            {locked_state, :ok} ->
+              case clear_fetch_or_compute_outcome(locked_state, outcome_key) do
+                :ok -> {locked_state, :ok}
+                {:error, _reason} = error -> {state, error}
+              end
+
+            {indexed_state, {:error, _reason} = error} ->
+              {indexed_state, error}
+          end
+        else
+          {:error, _reason} = error -> {state, error}
+        end
+      end
+
+      defp do_fetch_or_compute_fail(
+             state,
+             key,
+             outcome_key,
+             encoded_error,
+             outcome_expire_at_ms,
+             owner_ref
+           ) do
+        with :ok <- validate_fetch_or_compute_outcome_key(key, outcome_key),
+             {:ok, _error} <- FetchOrComputeOutcome.decode_error(encoded_error),
+             :ok <- check_key_lock(state, key, owner_ref) do
+          case with_pending_writes(state, fn ->
+                 do_put(state, outcome_key, encoded_error, outcome_expire_at_ms)
+               end) do
+            :ok -> do_unlock_keys(state, [key], owner_ref)
+            {:error, _reason} = error -> {state, error}
+            other -> {state, {:error, {:invalid_fetch_or_compute_write_result, other}}}
+          end
+        else
+          {:error, _reason} = error -> {state, error}
+        end
+      end
+
+      defp do_fetch_or_compute_publish(state, key, value, expire_at_ms, owner_ref) do
+        with :ok <- check_key_lock(state, key, owner_ref) do
+          case with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end) do
+            :ok -> do_unlock_keys(state, [key], owner_ref)
+            {:error, _reason} = error -> {state, error}
+            other -> {state, {:error, {:invalid_fetch_or_compute_write_result, other}}}
+          end
+        else
+          {:error, _reason} = error -> {state, error}
+        end
+      end
+
+      defp validate_fetch_or_compute_outcome_key(key, outcome_key) do
+        if outcome_key == FetchOrComputeOutcome.key(key) do
           :ok
         else
-          now = apply_now_ms()
+          {:error, "ERR invalid fetch_or_compute outcome key"}
+        end
+      end
 
-          case Map.get(locks, key) do
-            nil -> :ok
-            {^owner_ref, _exp} -> :ok
-            {_other, exp} when exp <= now -> :ok
-            {_other, _exp} -> {:error, :key_locked}
-          end
+      defp clear_fetch_or_compute_outcome(state, outcome_key) do
+        case ets_lookup(state, outcome_key) do
+          {:hit, _value, _expire_at_ms} ->
+            case with_pending_writes(state, fn -> do_delete(state, outcome_key) end) do
+              result when result in [:ok, 0, 1] -> :ok
+              {:error, _reason} = error -> error
+              other -> {:error, {:invalid_fetch_or_compute_delete_result, other}}
+            end
+
+          _missing_or_expired ->
+            :ok
+        end
+      end
+
+      # Ordinary mutations may proceed when no live lock exists. Fenced
+      # mutations must prove that their exact owner still holds a live lock.
+      defp check_key_lock(state, key, nil) do
+        locks = Map.get(state, :cross_shard_locks, %{})
+        now = apply_now_ms()
+
+        case Map.get(locks, key) do
+          nil -> :ok
+          {_owner_ref, expire_at_ms} when expire_at_ms <= now -> :ok
+          {_owner_ref, _expire_at_ms} -> {:error, :key_locked}
+        end
+      end
+
+      defp check_key_lock(state, key, owner_ref) do
+        locks = Map.get(state, :cross_shard_locks, %{})
+        now = apply_now_ms()
+
+        case Map.get(locks, key) do
+          {^owner_ref, expire_at_ms} when expire_at_ms > now ->
+            :ok
+
+          {^owner_ref, _expired_at_ms} ->
+            {:error, :key_lock_expired}
+
+          nil ->
+            {:error, :key_not_locked}
+
+          {_other_owner, expire_at_ms} when expire_at_ms <= now ->
+            {:error, :key_lock_expired}
+
+          {_other_owner, _expire_at_ms} ->
+            {:error, :key_locked}
         end
       end
 
       # Writes an intent record. Returns {new_state, :ok}.
       defp do_write_intent(state, owner_ref, intent_map) do
-        intents = Map.get(state, :cross_shard_intents, %{})
-        {Map.put(state, :cross_shard_intents, Map.put(intents, owner_ref, intent_map)), :ok}
+        case Ferricstore.CrossShardOp.Intent.validate(owner_ref, intent_map) do
+          {:ok, _keys} ->
+            intents = state.cross_shard_intents
+            {%{state | cross_shard_intents: Map.put(intents, owner_ref, intent_map)}, :ok}
+
+          {:error, :invalid_cross_shard_intent} = error ->
+            {state, error}
+        end
       end
 
       # Deletes an intent record. Returns {new_state, :ok}.
@@ -861,8 +1220,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # Returns [status, count, remaining, ms_until_reset].
       #
       # Replicates the exact shard.ex handle_ratelimit_add_direct logic.
-      defp do_ratelimit_add(state, key, window_ms, max, count, precomputed_now_ms) do
-        now = precomputed_now_ms || apply_now_ms()
+      defp do_ratelimit_add(state, key, window_ms, max, count) do
+        now = apply_now_ms()
 
         {cur_count, cur_start, prv_count} =
           case ets_lookup(state, key) do
@@ -878,10 +1237,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             true -> {cur_count, cur_start, prv_count}
           end
 
-        # Compute effective count with sliding window approximation
         elapsed = now - cur_start
-        weight = max(0.0, 1.0 - elapsed / window_ms)
-        effective = cur_count + trunc(Float.round(prv_count * weight))
+        effective = RateLimit.effective_count(cur_count, prv_count, elapsed, window_ms)
         expire_at_ms = cur_start + window_ms * 2
 
         {status, final_count, remaining, value} =

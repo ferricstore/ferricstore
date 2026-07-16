@@ -11,26 +11,21 @@ defmodule Ferricstore.Store.Ops do
   without changing command handler logic.
   """
 
-  alias Ferricstore.HLC
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{ReadResult, Router}
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
   alias Ferricstore.Store.Ops.Compound, as: CompoundOps
-  alias Ferricstore.Store.Ops.{Delete, Flush, LocalRead, MapStore}
+  alias Ferricstore.Store.Ops.{Delete, Flush, LocalNative, LocalRead, MapStore}
 
   @typep store :: FerricStore.Instance.t() | LocalTxStore.t() | map()
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
   @overflow_error "ERR increment or decrement would overflow"
 
-  defguardp valid_cold_location(file_id, offset, value_size)
-            when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
-                   is_integer(value_size) and value_size >= 0
-
   # --- Basic key operations ---
 
-  @spec get(store(), binary()) :: binary() | nil
+  @spec get(store(), binary()) :: binary() | nil | ReadResult.failure()
   def get(%FerricStore.Instance{} = ctx, key), do: Router.get(ctx, key)
 
   def get(%LocalTxStore{} = tx, key) do
@@ -43,7 +38,32 @@ defmodule Ferricstore.Store.Ops do
 
   def get(store, key) when is_map(store), do: store.get.(key)
 
-  @spec batch_get(store(), [binary()]) :: [binary() | nil]
+  @spec get_bounded(store(), binary(), non_neg_integer() | :unlimited) ::
+          {:ok, binary() | nil} | {:error, :response_byte_limit} | ReadResult.failure()
+  def get_bounded(%FerricStore.Instance{} = ctx, key, limit),
+    do: Router.get_bounded(ctx, key, limit)
+
+  def get_bounded(store, key, :unlimited) do
+    case get(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      value -> {:ok, value}
+    end
+  end
+
+  def get_bounded(store, key, limit) when is_integer(limit) and limit >= 0 do
+    case get(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      value when is_binary(value) and byte_size(value) > limit ->
+        {:error, :response_byte_limit}
+
+      value ->
+        {:ok, value}
+    end
+  end
+
+  @spec batch_get(store(), [binary()]) :: [binary() | nil | ReadResult.failure()]
   def batch_get(%FerricStore.Instance{} = ctx, keys), do: Router.batch_get(ctx, keys)
 
   def batch_get(%LocalTxStore{} = tx, keys), do: LocalRead.local_batch_get(tx, keys)
@@ -90,7 +110,8 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
-  @spec get_meta(store(), binary()) :: {binary(), non_neg_integer()} | nil
+  @spec get_meta(store(), binary()) ::
+          {binary(), non_neg_integer()} | nil | ReadResult.failure()
   def get_meta(%FerricStore.Instance{} = ctx, key), do: Router.get_meta(ctx, key)
 
   def get_meta(%LocalTxStore{} = tx, key) do
@@ -103,7 +124,7 @@ defmodule Ferricstore.Store.Ops do
 
   def get_meta(store, key) when is_map(store), do: store.get_meta.(key)
 
-  @spec expire_at_ms(store(), binary()) :: non_neg_integer() | nil
+  @spec expire_at_ms(store(), binary()) :: non_neg_integer() | nil | ReadResult.failure()
   def expire_at_ms(%FerricStore.Instance{} = ctx, key), do: Router.expire_at_ms(ctx, key)
 
   def expire_at_ms(%LocalTxStore{} = tx, key) do
@@ -113,10 +134,11 @@ defmodule Ferricstore.Store.Ops do
           exp
 
         nil ->
-          case ShardETS.ets_lookup(tx.shard_state, key) do
-            {:hit, _value, exp} -> exp
-            {:cold, _fid, _off, _vsize, exp} -> exp
-            _ -> nil
+          case ShardETS.ets_lookup_metadata(tx.shard_state, key) do
+            {:live, {^key, _value, exp, _lfu, _fid, _off, _vsize}, _location} -> exp
+            {:error, :invalid_keydir_entry} -> ReadResult.failure(:invalid_keydir_entry)
+            :expired -> nil
+            :miss -> nil
           end
       end
     else
@@ -131,13 +153,14 @@ defmodule Ferricstore.Store.Ops do
 
       _ ->
         case get_meta(store, key) do
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
           nil -> nil
           {_value, expire_at_ms} -> expire_at_ms
         end
     end
   end
 
-  @spec value_size(store(), binary()) :: non_neg_integer() | nil
+  @spec value_size(store(), binary()) :: non_neg_integer() | nil | ReadResult.failure()
   def value_size(%FerricStore.Instance{} = ctx, key), do: Router.value_size(ctx, key)
 
   def value_size(%LocalTxStore{} = tx, key) do
@@ -154,14 +177,27 @@ defmodule Ferricstore.Store.Ops do
             LocalRead.stored_value_size(value)
 
           nil ->
-            case ShardETS.ets_lookup(tx.shard_state, key) do
-              {:hit, value, _exp} ->
+            case ShardETS.ets_lookup_metadata(tx.shard_state, key) do
+              {:live, {^key, value, _exp, _lfu, _fid, _off, _vsize}, :hot} ->
                 LocalRead.stored_value_size(value)
 
-              {:cold, fid, off, vsize, _exp} ->
+              {:live, {^key, nil, _exp, _lfu, fid, off, vsize}, :cold} ->
                 LocalRead.local_cold_value_size(tx, key, fid, off, vsize)
 
-              _ ->
+              {:live, {^key, _value, _exp, _lfu, _fid, _off, vsize}, location}
+              when location in [:pending, :invalid] and is_integer(vsize) and vsize >= 0 ->
+                vsize
+
+              {:live, _entry, _location} ->
+                ReadResult.failure(:invalid_keydir_entry)
+
+              {:error, :invalid_keydir_entry} ->
+                ReadResult.failure(:invalid_keydir_entry)
+
+              :expired ->
+                nil
+
+              :miss ->
                 nil
             end
         end
@@ -175,13 +211,14 @@ defmodule Ferricstore.Store.Ops do
 
       _ ->
         case get(store, key) do
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
           nil -> nil
           value -> LocalRead.stored_value_size(value)
         end
     end
   end
 
-  @spec object_lfu(store(), binary()) :: non_neg_integer() | nil
+  @spec object_lfu(store(), binary()) :: non_neg_integer() | nil | ReadResult.failure()
   def object_lfu(%FerricStore.Instance{} = ctx, key), do: Router.object_lfu(ctx, key)
 
   def object_lfu(%LocalTxStore{} = tx, key) do
@@ -196,23 +233,21 @@ defmodule Ferricstore.Store.Ops do
         Ferricstore.Store.LFU.initial()
 
       true ->
-        now = HLC.now_ms()
-
-        case :ets.lookup(tx.shard_state.keydir, key) do
-          [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
+        case ShardETS.ets_lookup_metadata(tx.shard_state, key) do
+          {:live, {^key, _value, _exp, lfu, _fid, _off, _vsize}, _location}
+          when is_integer(lfu) and lfu >= 0 ->
             lfu
 
-          [{^key, nil, 0, lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-            lfu
+          {:live, _entry, _location} ->
+            ReadResult.failure(:invalid_keydir_entry)
 
-          [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-            lfu
+          {:error, :invalid_keydir_entry} ->
+            ReadResult.failure(:invalid_keydir_entry)
 
-          [{^key, nil, exp, lfu, fid, off, vsize}]
-          when exp > now and valid_cold_location(fid, off, vsize) ->
-            lfu
+          :expired ->
+            nil
 
-          _ ->
+          :miss ->
             nil
         end
     end
@@ -225,7 +260,8 @@ defmodule Ferricstore.Store.Ops do
     end
   end
 
-  @spec getrange(store(), binary(), integer(), integer()) :: binary() | nil
+  @spec getrange(store(), binary(), integer(), integer()) ::
+          binary() | nil | ReadResult.failure()
   def getrange(%FerricStore.Instance{} = ctx, key, start_idx, end_idx),
     do: Router.getrange(ctx, key, start_idx, end_idx)
 
@@ -250,6 +286,9 @@ defmodule Ferricstore.Store.Ops do
               {:cold, _fid, _off, _vsize, _exp} ->
                 Router.getrange(tx.instance_ctx, key, start_idx, end_idx)
 
+              {:error, :invalid_keydir_entry} ->
+                ReadResult.failure(:invalid_keydir_entry)
+
               _ ->
                 nil
             end
@@ -265,6 +304,7 @@ defmodule Ferricstore.Store.Ops do
       _ ->
         case get(store, key) do
           nil -> nil
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
           value -> LocalRead.range_from_value(value, start_idx, end_idx)
         end
     end
@@ -324,12 +364,47 @@ defmodule Ferricstore.Store.Ops do
 
   def exists?(store, key) when is_map(store), do: store.exists?.(key)
 
-  @spec keys(store()) :: [binary()]
+  @spec keys(store()) :: [binary()] | ReadResult.failure()
   def keys(%FerricStore.Instance{} = ctx), do: Router.keys(ctx)
   def keys(%LocalTxStore{} = tx), do: Router.keys(tx.instance_ctx)
   def keys(store) when is_map(store), do: store.keys.()
 
-  @spec dbsize(store()) :: non_neg_integer()
+  @spec scan_keys_page(store(), binary(), pos_integer(), binary() | nil, binary() | nil) ::
+          {:ok, {binary(), [binary()]}} | {:error, term()} | :unsupported
+  def scan_keys_page(%FerricStore.Instance{} = ctx, cursor, count, match_pattern, type_filter),
+    do: Router.scan_keys_page(ctx, cursor, count, match_pattern, type_filter)
+
+  def scan_keys_page(%LocalTxStore{} = tx, cursor, count, match_pattern, type_filter),
+    do: Router.scan_keys_page(tx.instance_ctx, cursor, count, match_pattern, type_filter)
+
+  def scan_keys_page(store, cursor, count, match_pattern, type_filter) when is_map(store) do
+    case store do
+      %{scan_keys_page: pager} when is_function(pager, 4) ->
+        pager.(cursor, count, match_pattern, type_filter)
+
+      _missing ->
+        :unsupported
+    end
+  end
+
+  @spec random_key(store()) :: {:ok, binary() | nil} | {:error, term()} | :unsupported
+  def random_key(%FerricStore.Instance{} = ctx),
+    do: random_key_result(Router.random_logical_key(ctx))
+
+  def random_key(%LocalTxStore{} = tx),
+    do: random_key_result(Router.random_logical_key(tx.instance_ctx))
+
+  def random_key(store) when is_map(store) do
+    case store do
+      %{random_key: sampler} when is_function(sampler, 0) -> sampler.()
+      _missing -> :unsupported
+    end
+  end
+
+  defp random_key_result({:error, {:storage_read_failed, _reason}} = failure), do: failure
+  defp random_key_result(key) when is_binary(key) or is_nil(key), do: {:ok, key}
+
+  @spec dbsize(store()) :: non_neg_integer() | ReadResult.failure()
   def dbsize(%FerricStore.Instance{} = ctx), do: Router.dbsize(ctx)
   def dbsize(%LocalTxStore{} = tx), do: Router.dbsize(tx.instance_ctx)
   def dbsize(store) when is_map(store), do: store.dbsize.()
@@ -341,37 +416,41 @@ defmodule Ferricstore.Store.Ops do
 
   def incr(%LocalTxStore{} = tx, key, delta) do
     if LocalRead.local?(tx, key) do
-      {current, expire_at_ms} = LocalRead.local_read_meta_for_rmw(tx, key)
+      case LocalRead.local_read_meta_for_rmw(tx, key) do
+        {:error, _reason} = error ->
+          error
 
-      case current do
-        nil ->
-          case checked_integer_add(0, delta) do
-            {:ok, new_val} ->
-              ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
-              LocalRead.tx_put_pending(key, new_val, 0)
-              send(self(), {:tx_pending_write, key, new_val, 0})
-              {:ok, new_val}
-
-            :overflow ->
-              {:error, @overflow_error}
-          end
-
-        value ->
-          case ShardETS.coerce_integer(value) do
-            {:ok, int_val} ->
-              case checked_integer_add(int_val, delta) do
+        {current, expire_at_ms} ->
+          case current do
+            nil ->
+              case checked_integer_add(0, delta) do
                 {:ok, new_val} ->
-                  ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
-                  LocalRead.tx_put_pending(key, new_val, expire_at_ms)
-                  send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
+                  ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+                  LocalRead.tx_put_pending(key, new_val, 0)
+                  send(self(), {:tx_pending_write, key, new_val, 0})
                   {:ok, new_val}
 
                 :overflow ->
                   {:error, @overflow_error}
               end
 
-            :error ->
-              {:error, "ERR value is not an integer or out of range"}
+            value ->
+              case ShardETS.coerce_integer(value) do
+                {:ok, int_val} ->
+                  case checked_integer_add(int_val, delta) do
+                    {:ok, new_val} ->
+                      ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
+                      LocalRead.tx_put_pending(key, new_val, expire_at_ms)
+                      send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
+                      {:ok, new_val}
+
+                    :overflow ->
+                      {:error, @overflow_error}
+                  end
+
+                :error ->
+                  {:error, "ERR value is not an integer or out of range"}
+              end
           end
       end
     else
@@ -397,27 +476,31 @@ defmodule Ferricstore.Store.Ops do
 
   def incr_float(%LocalTxStore{} = tx, key, delta) do
     if LocalRead.local?(tx, key) do
-      {current, expire_at_ms} = LocalRead.local_read_meta_for_rmw(tx, key)
+      case LocalRead.local_read_meta_for_rmw(tx, key) do
+        {:error, _reason} = error ->
+          error
 
-      case current do
-        nil ->
-          new_val = delta * 1.0
-          ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
-          LocalRead.tx_put_pending(key, new_val, 0)
-          send(self(), {:tx_pending_write, key, new_val, 0})
-          {:ok, new_val}
-
-        value ->
-          case ShardETS.coerce_float(value) do
-            {:ok, float_val} ->
-              new_val = float_val + delta
-              ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
-              LocalRead.tx_put_pending(key, new_val, expire_at_ms)
-              send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
+        {current, expire_at_ms} ->
+          case current do
+            nil ->
+              new_val = delta * 1.0
+              ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
+              LocalRead.tx_put_pending(key, new_val, 0)
+              send(self(), {:tx_pending_write, key, new_val, 0})
               {:ok, new_val}
 
-            :error ->
-              {:error, "ERR value is not a valid float"}
+            value ->
+              case ShardETS.coerce_float(value) do
+                {:ok, float_val} ->
+                  new_val = float_val + delta
+                  ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
+                  LocalRead.tx_put_pending(key, new_val, expire_at_ms)
+                  send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
+                  {:ok, new_val}
+
+                :error ->
+                  {:error, "ERR value is not a valid float"}
+              end
           end
       end
     else
@@ -434,17 +517,32 @@ defmodule Ferricstore.Store.Ops do
 
   def append(%LocalTxStore{} = tx, key, suffix) do
     if LocalRead.local?(tx, key) do
-      {current, expire_at_ms} =
-        case LocalRead.local_read_meta_for_rmw(tx, key) do
-          {nil, _exp} -> {"", 0}
-          {value, exp} -> {ShardETS.to_disk_binary(value), exp}
-        end
+      case LocalRead.local_read_meta_for_rmw(tx, key) do
+        {:error, _reason} = error ->
+          error
 
-      new_val = current <> suffix
-      ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
-      LocalRead.tx_put_pending(key, new_val, expire_at_ms)
-      send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
-      {:ok, byte_size(new_val)}
+        meta ->
+          {current, expire_at_ms} =
+            case meta do
+              {nil, _exp} -> {"", 0}
+              {value, exp} -> {ShardETS.to_disk_binary(value), exp}
+            end
+
+          new_size =
+            Ferricstore.Raft.ApplyLimits.append_size(byte_size(current), byte_size(suffix))
+
+          with :ok <-
+                 Ferricstore.Raft.ApplyLimits.validate_instance_value_size(
+                   tx.instance_ctx,
+                   new_size
+                 ) do
+            new_val = current <> suffix
+            ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
+            LocalRead.tx_put_pending(key, new_val, expire_at_ms)
+            send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
+            {:ok, new_size}
+          end
+      end
     else
       Router.append(tx.instance_ctx, key, suffix)
     end
@@ -457,11 +555,22 @@ defmodule Ferricstore.Store.Ops do
 
   def getset(%LocalTxStore{} = tx, key, new_value) do
     if LocalRead.local?(tx, key) do
-      old = LocalRead.local_read_value_for_rmw(tx, key)
-      ShardETS.ets_insert(tx.shard_state, key, new_value, 0)
-      LocalRead.tx_put_pending(key, new_value, 0)
-      send(self(), {:tx_pending_write, key, new_value, 0})
-      old
+      case LocalRead.local_read_value_for_rmw(tx, key) do
+        {:error, _reason} = error ->
+          error
+
+        old ->
+          with :ok <-
+                 Ferricstore.Raft.ApplyLimits.validate_instance_value_size(
+                   tx.instance_ctx,
+                   byte_size(new_value)
+                 ) do
+            ShardETS.ets_insert(tx.shard_state, key, new_value, 0)
+            LocalRead.tx_put_pending(key, new_value, 0)
+            send(self(), {:tx_pending_write, key, new_value, 0})
+            old
+          end
+      end
     else
       Router.getset(tx.instance_ctx, key, new_value)
     end
@@ -474,16 +583,20 @@ defmodule Ferricstore.Store.Ops do
 
   def getdel(%LocalTxStore{} = tx, key) do
     if LocalRead.local?(tx, key) do
-      old = LocalRead.local_read_value_for_rmw(tx, key)
+      case LocalRead.local_read_value_for_rmw(tx, key) do
+        {:error, _reason} = error ->
+          error
 
-      if old do
-        ShardETS.ets_delete_key(tx.shard_state, key)
-        LocalRead.tx_drop_pending(key)
-        LocalRead.tx_mark_deleted(key)
-        send(self(), {:tx_pending_delete, key})
+        old ->
+          if old do
+            ShardETS.ets_delete_key(tx.shard_state, key)
+            LocalRead.tx_drop_pending(key)
+            LocalRead.tx_mark_deleted(key)
+            send(self(), {:tx_pending_delete, key})
+          end
+
+          old
       end
-
-      old
     else
       Router.getdel(tx.instance_ctx, key)
     end
@@ -496,15 +609,19 @@ defmodule Ferricstore.Store.Ops do
 
   def getex(%LocalTxStore{} = tx, key, expire_at_ms) do
     if LocalRead.local?(tx, key) do
-      value = LocalRead.local_read_value_for_rmw(tx, key)
+      case LocalRead.local_read_value_for_rmw(tx, key) do
+        {:error, _reason} = error ->
+          error
 
-      if value do
-        ShardETS.ets_insert(tx.shard_state, key, value, expire_at_ms)
-        LocalRead.tx_put_pending(key, value, expire_at_ms)
-        send(self(), {:tx_pending_write, key, value, expire_at_ms})
+        value ->
+          if value do
+            ShardETS.ets_insert(tx.shard_state, key, value, expire_at_ms)
+            LocalRead.tx_put_pending(key, value, expire_at_ms)
+            send(self(), {:tx_pending_write, key, value, expire_at_ms})
+          end
+
+          value
       end
-
-      value
     else
       Router.getex(tx.instance_ctx, key, expire_at_ms)
     end
@@ -518,17 +635,36 @@ defmodule Ferricstore.Store.Ops do
 
   def setrange(%LocalTxStore{} = tx, key, offset, value) do
     if LocalRead.local?(tx, key) do
-      {old, expire_at_ms} =
-        case LocalRead.local_read_meta_for_rmw(tx, key) do
-          {nil, _exp} -> {"", 0}
-          {v, exp} -> {ShardETS.to_disk_binary(v), exp}
-        end
+      case LocalRead.local_read_meta_for_rmw(tx, key) do
+        {:error, _reason} = error ->
+          error
 
-      new_val = ShardWrites.apply_setrange(old, offset, value)
-      ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
-      LocalRead.tx_put_pending(key, new_val, expire_at_ms)
-      send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
-      {:ok, byte_size(new_val)}
+        meta ->
+          {old, expire_at_ms} =
+            case meta do
+              {nil, _exp} -> {"", 0}
+              {v, exp} -> {ShardETS.to_disk_binary(v), exp}
+            end
+
+          new_size =
+            Ferricstore.Raft.ApplyLimits.setrange_size(
+              byte_size(old),
+              offset,
+              byte_size(value)
+            )
+
+          with :ok <-
+                 Ferricstore.Raft.ApplyLimits.validate_instance_value_size(
+                   tx.instance_ctx,
+                   new_size
+                 ) do
+            new_val = ShardWrites.apply_setrange(old, offset, value)
+            ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
+            LocalRead.tx_put_pending(key, new_val, expire_at_ms)
+            send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
+            {:ok, new_size}
+          end
+      end
     else
       Router.setrange(tx.instance_ctx, key, offset, value)
     end
@@ -543,8 +679,11 @@ defmodule Ferricstore.Store.Ops do
   def cas(%FerricStore.Instance{} = ctx, key, expected, new_val, ttl),
     do: Router.cas(ctx, key, expected, new_val, ttl)
 
-  def cas(%LocalTxStore{} = tx, key, expected, new_val, ttl),
-    do: Router.cas(tx.instance_ctx, key, expected, new_val, ttl)
+  def cas(%LocalTxStore{} = tx, key, expected, new_val, ttl) do
+    if LocalRead.local?(tx, key),
+      do: LocalNative.cas(tx, key, expected, new_val, ttl),
+      else: Router.cas(tx.instance_ctx, key, expected, new_val, ttl)
+  end
 
   def cas(store, key, expected, new_val, ttl) when is_map(store),
     do: store.cas.(key, expected, new_val, ttl)
@@ -552,22 +691,34 @@ defmodule Ferricstore.Store.Ops do
   @spec lock(store(), binary(), binary(), pos_integer()) :: :ok | {:error, binary()}
   def lock(%FerricStore.Instance{} = ctx, key, owner, ttl), do: Router.lock(ctx, key, owner, ttl)
 
-  def lock(%LocalTxStore{} = tx, key, owner, ttl),
-    do: Router.lock(tx.instance_ctx, key, owner, ttl)
+  def lock(%LocalTxStore{} = tx, key, owner, ttl) do
+    if LocalRead.local?(tx, key),
+      do: LocalNative.lock(tx, key, owner, ttl),
+      else: Router.lock(tx.instance_ctx, key, owner, ttl)
+  end
 
   def lock(store, key, owner, ttl) when is_map(store), do: store.lock.(key, owner, ttl)
 
   @spec unlock(store(), binary(), binary()) :: 1 | {:error, binary()}
   def unlock(%FerricStore.Instance{} = ctx, key, owner), do: Router.unlock(ctx, key, owner)
-  def unlock(%LocalTxStore{} = tx, key, owner), do: Router.unlock(tx.instance_ctx, key, owner)
+
+  def unlock(%LocalTxStore{} = tx, key, owner) do
+    if LocalRead.local?(tx, key),
+      do: LocalNative.unlock(tx, key, owner),
+      else: Router.unlock(tx.instance_ctx, key, owner)
+  end
+
   def unlock(store, key, owner) when is_map(store), do: store.unlock.(key, owner)
 
   @spec extend(store(), binary(), binary(), pos_integer()) :: 1 | {:error, binary()}
   def extend(%FerricStore.Instance{} = ctx, key, owner, ttl),
     do: Router.extend(ctx, key, owner, ttl)
 
-  def extend(%LocalTxStore{} = tx, key, owner, ttl),
-    do: Router.extend(tx.instance_ctx, key, owner, ttl)
+  def extend(%LocalTxStore{} = tx, key, owner, ttl) do
+    if LocalRead.local?(tx, key),
+      do: LocalNative.extend(tx, key, owner, ttl),
+      else: Router.extend(tx.instance_ctx, key, owner, ttl)
+  end
 
   def extend(store, key, owner, ttl) when is_map(store), do: store.extend.(key, owner, ttl)
 
@@ -575,8 +726,11 @@ defmodule Ferricstore.Store.Ops do
   def ratelimit_add(%FerricStore.Instance{} = ctx, key, window, max, count),
     do: Router.ratelimit_add(ctx, key, window, max, count)
 
-  def ratelimit_add(%LocalTxStore{} = tx, key, window, max, count),
-    do: Router.ratelimit_add(tx.instance_ctx, key, window, max, count)
+  def ratelimit_add(%LocalTxStore{} = tx, key, window, max, count) do
+    if LocalRead.local?(tx, key),
+      do: LocalNative.ratelimit_add(tx, key, window, max, count),
+      else: Router.ratelimit_add(tx.instance_ctx, key, window, max, count)
+  end
 
   def ratelimit_add(store, key, window, max, count) when is_map(store),
     do: store.ratelimit_add.(key, window, max, count)
@@ -596,6 +750,9 @@ defmodule Ferricstore.Store.Ops do
   def has_compound?(store) when is_map(store), do: is_map_key(store, :compound_get)
 
   # --- Compound key operations ---
+
+  def compound_type_claim(store, redis_key, type),
+    do: CompoundOps.compound_type_claim(store, redis_key, type)
 
   def compound_get(store, redis_key, compound_key),
     do: CompoundOps.compound_get(store, redis_key, compound_key)
@@ -621,8 +778,34 @@ defmodule Ferricstore.Store.Ops do
   def compound_batch_delete(store, redis_key, compound_keys),
     do: CompoundOps.compound_batch_delete(store, redis_key, compound_keys)
 
+  def compound_batch_mutate(store, redis_key, compound_keys, entries),
+    do: CompoundOps.compound_batch_mutate(store, redis_key, compound_keys, entries)
+
   def compound_scan(store, redis_key, prefix),
     do: CompoundOps.compound_scan(store, redis_key, prefix)
+
+  def compound_scan_slice(store, redis_key, prefix, start, count, total),
+    do: CompoundOps.compound_scan_slice(store, redis_key, prefix, start, count, total)
+
+  def compound_scan_page(
+        store,
+        redis_key,
+        prefix,
+        cursor,
+        count,
+        match_pattern,
+        fields_only
+      ),
+      do:
+        CompoundOps.compound_scan_page(
+          store,
+          redis_key,
+          prefix,
+          cursor,
+          count,
+          match_pattern,
+          fields_only
+        )
 
   def compound_fields(store, redis_key, prefix),
     do: CompoundOps.compound_fields(store, redis_key, prefix)

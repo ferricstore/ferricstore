@@ -14,6 +14,7 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
   @default_interval_ms 1_000
   @default_catchup_delay_ms 10
   @default_batch_size 32
+  @default_shards_per_run 4
   @default_backfill_batch_size 256
   @default_backfill_max_bytes 2 * 1_024 * 1_024
   @max_backfill_bytes 64 * 1_024 * 1_024
@@ -71,6 +72,16 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
           configured(:flow_policy_migration_worker_batch_size, @default_batch_size),
           256
         ),
+      shards_per_run:
+        bounded_positive_opt(
+          opts,
+          :shards_per_run,
+          configured(
+            :flow_policy_migration_worker_shards_per_run,
+            @default_shards_per_run
+          ),
+          256
+        ),
       backfill_batch_size:
         bounded_positive_opt(
           opts,
@@ -95,11 +106,15 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       backfill_step_fun:
         Keyword.get(opts, :backfill_step_fun, &Router.flow_policy_catalog_backfill_step/3),
       backfill_page_fun: Keyword.get(opts, :backfill_page_fun, &PolicyMigration.backfill_page/5),
-      snapshot_fun: Keyword.get(opts, :snapshot_fun, &PolicyMigration.snapshot_primary_keydir/5),
+      snapshot_fun:
+        Keyword.get(opts, :snapshot_fun, &PolicyMigration.snapshot_primary_keydir_page/5),
       cleanup_fun: Keyword.get(opts, :cleanup_fun, &PolicyMigration.cleanup_snapshot/3),
       attribute_repair_fun:
         Keyword.get(opts, :attribute_repair_fun, &PolicyAttributeCatalog.repair_next/2),
       backfill_runs: %{},
+      next_shard_index: 0,
+      sweep_remaining: Keyword.fetch!(opts, :instance_ctx).shard_count,
+      sweep_more_work?: false,
       run_timer_ref: nil,
       run_timer_token: nil
     }
@@ -136,7 +151,7 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       ) do
     state = clear_task_pid(state, shard_index, run_token, :snapshot_pid, snapshot_pid)
 
-    if result != :ok do
+    if not snapshot_result?(result) do
       Logger.warning(
         "Flow policy catalog snapshot failed for shard #{shard_index}: #{inspect(result)}"
       )
@@ -193,42 +208,82 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
     :ok
   end
 
+  defp run_shards(%{instance_ctx: %{shard_count: shard_count}} = state)
+       when shard_count <= 0 do
+    {%{state | next_shard_index: 0, sweep_remaining: 0, sweep_more_work?: false}, false}
+  end
+
   defp run_shards(state) do
-    Enum.reduce(
-      0..max(state.instance_ctx.shard_count - 1, -1)//1,
-      {state, false},
-      fn shard_index, {next_state, more_work?} ->
+    shard_count = state.instance_ctx.shard_count
+    sweep_remaining = valid_sweep_remaining(state.sweep_remaining, shard_count)
+    run_count = min(state.shards_per_run, sweep_remaining)
+
+    shard_indexes =
+      Enum.map(0..(run_count - 1), fn offset ->
+        rem(state.next_shard_index + offset, shard_count)
+      end)
+
+    {next_state, chunk_more_work?} =
+      Enum.reduce(shard_indexes, {state, false}, fn shard_index, {next_state, more_work?} ->
         {next_state, result} = run_shard(next_state, shard_index)
+        {next_state, shard_result_more_work?(result, shard_index, more_work?)}
+      end)
 
-        next_more_work? =
-          case result do
-            {:ok, %{idle?: true}} ->
-              more_work?
+    next_shard_index = rem(state.next_shard_index + run_count, shard_count)
+    remaining_after_run = sweep_remaining - run_count
+    sweep_more_work? = state.sweep_more_work? or chunk_more_work?
 
-            {:ok, %{processed: processed}} when is_integer(processed) and processed >= 0 ->
-              true
+    if remaining_after_run == 0 do
+      {%{
+         next_state
+         | next_shard_index: next_shard_index,
+           sweep_remaining: shard_count,
+           sweep_more_work?: false
+       }, sweep_more_work?}
+    else
+      {%{
+         next_state
+         | next_shard_index: next_shard_index,
+           sweep_remaining: remaining_after_run,
+           sweep_more_work?: sweep_more_work?
+       }, true}
+    end
+  end
 
-            {:retry, _reason} ->
-              more_work?
+  defp valid_sweep_remaining(remaining, shard_count)
+       when is_integer(remaining) and remaining > 0 and remaining <= shard_count,
+       do: remaining
 
-            {:error, reason} ->
-              Logger.warning(
-                "Flow policy migration step failed for shard #{shard_index}: #{inspect(reason)}"
-              )
+  defp valid_sweep_remaining(_remaining, shard_count), do: shard_count
 
-              more_work?
+  defp shard_result_more_work?({:ok, %{idle?: true}}, _shard_index, more_work?),
+    do: more_work?
 
-            other ->
-              Logger.warning(
-                "Flow policy migration step returned an invalid result for shard #{shard_index}: #{inspect(other)}"
-              )
+  defp shard_result_more_work?(
+         {:ok, %{processed: processed}},
+         _shard_index,
+         _more_work?
+       )
+       when is_integer(processed) and processed >= 0,
+       do: true
 
-              more_work?
-          end
+  defp shard_result_more_work?({:retry, _reason}, _shard_index, more_work?),
+    do: more_work?
 
-        {next_state, next_more_work?}
-      end
+  defp shard_result_more_work?({:error, reason}, shard_index, more_work?) do
+    Logger.warning(
+      "Flow policy migration step failed for shard #{shard_index}: #{inspect(reason)}"
     )
+
+    more_work?
+  end
+
+  defp shard_result_more_work?(other, shard_index, more_work?) do
+    Logger.warning(
+      "Flow policy migration step returned an invalid result for shard #{shard_index}: #{inspect(other)}"
+    )
+
+    more_work?
   end
 
   defp run_shard(state, shard_index) do
@@ -501,6 +556,10 @@ defmodule Ferricstore.Flow.PolicyMigrationWorker do
       is_pid(Map.get(run, :snapshot_pid)) and Process.alive?(run.snapshot_pid)
     end)
   end
+
+  defp snapshot_result?(:ok), do: true
+  defp snapshot_result?({:ok, %{done?: done?}}) when is_boolean(done?), do: true
+  defp snapshot_result?(_result), do: false
 
   defp ensure_cleanup_task(state, shard_index, %{cleanup_pid: pid} = run)
        when is_pid(pid),

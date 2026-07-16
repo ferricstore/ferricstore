@@ -6,6 +6,10 @@ defmodule Ferricstore.Commands.Management do
   `COMMAND_EXEC`.
   """
 
+  @telemetry_raw_pair_fields MapSet.new(
+                               ~w(before_id partition partition_key namespace prefix scope type state event worker)
+                             )
+
   @spec handle(binary(), [binary()], term()) :: term()
   def handle("FERRICSTORE.CAPABILITIES", [], _store) do
     FerricStore.ManagementCapabilities.capabilities()
@@ -20,10 +24,10 @@ defmodule Ferricstore.Commands.Management do
 
   def handle("ACL", ["SETUSER"], _store), do: wrong_arity("acl setuser")
 
-  def handle("ACL", ["DELUSER", username], store),
-    do: result(FerricStore.Management.ACL.del_user(username, store_opts(store)))
+  def handle("ACL", ["DELUSER" | usernames], store) when usernames != [],
+    do: result(FerricStore.Management.ACL.del_users(usernames, store_opts(store)))
 
-  def handle("ACL", ["DELUSER" | _], _store), do: wrong_arity("acl deluser")
+  def handle("ACL", ["DELUSER"], _store), do: wrong_arity("acl deluser")
 
   def handle("ACL", ["GETUSER", username], store),
     do: result(FerricStore.Management.ACL.get_user(username, store_opts(store)))
@@ -39,6 +43,11 @@ defmodule Ferricstore.Commands.Management do
     do: result(FerricStore.Management.ACL.save(store_opts(store)))
 
   def handle("ACL", ["SAVE" | _], _store), do: wrong_arity("acl save")
+
+  def handle("ACL", ["LOAD"], store),
+    do: result(FerricStore.Management.ACL.load(store_opts(store)))
+
+  def handle("ACL", ["LOAD" | _], _store), do: wrong_arity("acl load")
 
   def handle("ACL", [subcmd | _args], _store),
     do: {:error, "ERR unknown ACL subcommand '#{String.downcase(subcmd)}'"}
@@ -90,13 +99,13 @@ defmodule Ferricstore.Commands.Management do
     do: result(FerricStore.Management.Telemetry.namespace_usage(prefix, store_opts(store)))
 
   def handle("FERRICSTORE.TELEMETRY", ["FLOW_QUERY" | rest], store) do
-    with {:ok, attrs} <- pair_map(rest) do
+    with {:ok, attrs} <- pair_map(rest, @telemetry_raw_pair_fields) do
       result(FerricStore.Management.Telemetry.flow_query(attrs, store_opts(store)))
     end
   end
 
   def handle("FERRICSTORE.TELEMETRY", ["FLOW_HISTORY", id | rest], store) do
-    with {:ok, attrs} <- pair_map(rest) do
+    with {:ok, attrs} <- pair_map(rest, @telemetry_raw_pair_fields) do
       opts = Keyword.put(store_opts(store), :attrs, attrs)
       result(FerricStore.Management.Telemetry.flow_history(id, opts))
     end
@@ -116,16 +125,27 @@ defmodule Ferricstore.Commands.Management do
   defp result({:error, reason}), do: {:error, "ERR #{inspect(reason)}"}
   defp result(value), do: normalize_value(value)
 
-  defp pair_map([]), do: {:ok, %{}}
+  defp pair_map(args), do: pair_map(args, MapSet.new())
 
-  defp pair_map(args) when is_list(args) and rem(length(args), 2) == 0 do
+  defp pair_map([], _raw_fields), do: {:ok, %{}}
+
+  defp pair_map(args, raw_fields) when is_list(args) and rem(length(args), 2) == 0 do
     args
     |> Enum.chunk_every(2)
-    |> Map.new(fn [key, value] -> {String.downcase(key), parse_value(value)} end)
+    |> Map.new(fn [key, value] ->
+      key = String.downcase(key)
+      {key, parse_pair_value(key, value, raw_fields)}
+    end)
     |> then(&{:ok, &1})
   end
 
-  defp pair_map(_args), do: {:error, "ERR syntax error"}
+  defp pair_map(_args, _raw_fields), do: {:error, "ERR syntax error"}
+
+  # Cursor identifiers are opaque bytes. Parsing numeric- or boolean-looking
+  # IDs would change their ordering and make pagination skip or repeat rows.
+  defp parse_pair_value(key, value, raw_fields) do
+    if MapSet.member?(raw_fields, key), do: value, else: parse_value(value)
+  end
 
   defp parse_value(value) when is_binary(value) do
     case Integer.parse(value) do

@@ -95,6 +95,59 @@ defmodule Ferricstore.Store.Shard.FlushTest do
     end
   end
 
+  test "maybe_rotate_file keeps the old active file when directory fsync fails" do
+    Ferricstore.Store.ActiveFile.init(1)
+
+    ctx = %{
+      name: :"rotation_dir_fsync_failure_#{System.unique_integer([:positive])}",
+      disk_pressure: :atomics.new(1, signed: false)
+    }
+
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "rotation_dir_fsync_failure_#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(dir)
+    active_path = Path.join(dir, "00000.log")
+    new_path = Path.join(dir, "00001.log")
+    File.write!(active_path, "active")
+
+    keydir = :ets.new(:rotation_dir_fsync_failure_keydir, [:set, :public])
+    Ferricstore.Store.ActiveFile.publish(ctx, 0, 0, active_path, dir)
+    Process.put(:ferricstore_shard_rotation_fsync_dir_hook, fn ^dir -> {:error, :eio} end)
+
+    state = %{
+      active_file_id: 0,
+      active_file_path: active_path,
+      active_file_size: 10_000,
+      file_stats: %{0 => {10_000, 0}},
+      index: 0,
+      instance_ctx: ctx,
+      keydir: keydir,
+      max_active_file_size: 1_024,
+      pending: [],
+      shard_data_path: dir
+    }
+
+    try do
+      rotated = Flush.maybe_rotate_file(state)
+
+      assert rotated.active_file_id == 0
+      assert rotated.active_file_path == active_path
+      assert rotated.file_stats == state.file_stats
+      assert {0, ^active_path, ^dir} = Ferricstore.Store.ActiveFile.get(ctx, 0)
+      refute File.exists?(new_path)
+      assert DiskPressure.under_pressure?(ctx, 0)
+      assert rotated.last_rotation_error == {:directory_fsync_failed, :eio}
+    after
+      Process.delete(:ferricstore_shard_rotation_fsync_dir_hook)
+      :ets.delete(keydir)
+      File.rm_rf!(dir)
+    end
+  end
+
   test "maybe_rotate_file reports actual file count after file id gaps" do
     Ferricstore.Store.ActiveFile.init(1)
 

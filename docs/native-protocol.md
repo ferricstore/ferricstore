@@ -268,6 +268,9 @@ ZADD: {"key": "z", "items": [[1.0, "a"], [2.0, "b"]]}
 ZRANGE: {"key": "z", "start": 0, "stop": -1, "withscores": true}
 ```
 
+All MSET keys must hash to one slot. Cross-slot payloads fail before mutation;
+accepted payloads are committed atomically as one state-machine command.
+
 Hash/list/set/sorted-set opcodes use the same store semantics as the embedded
 command handlers. Native requests use typed map payloads; compact binary fast
 paths can be added for commands that show up as real bottlenecks.
@@ -549,11 +552,21 @@ Operator tuning:
 
 ```text
 FERRICSTORE_NATIVE_MAX_FRAME_BYTES
+FERRICSTORE_NATIVE_UNAUTHENTICATED_MAX_FRAME_BYTES
+FERRICSTORE_NATIVE_FRAME_ASSEMBLY_TIMEOUT_MS
+FERRICSTORE_NATIVE_SEND_TIMEOUT_MS
+FERRICSTORE_NATIVE_MAX_VALUE_ITEMS
+FERRICSTORE_NATIVE_MAX_VALUE_DEPTH
 FERRICSTORE_NATIVE_MAX_LANES_PER_CONNECTION
 FERRICSTORE_NATIVE_LANE_MAX_QUEUE
-FERRICSTORE_NATIVE_MAX_BATCH_COMMANDS
+FERRICSTORE_NATIVE_MAX_PIPELINE_COMMANDS
 FERRICSTORE_NATIVE_MAX_INFLIGHT_PER_CONNECTION
 FERRICSTORE_NATIVE_MAX_INFLIGHT_PER_LANE
+FERRICSTORE_NATIVE_MAX_RESPONSE_BYTES
+FERRICSTORE_NATIVE_MAX_GLOBAL_EXECUTIONS
+FERRICSTORE_NATIVE_MAX_GLOBAL_LANES
+FERRICSTORE_NATIVE_MAX_GLOBAL_BLOCKING_REQUESTS
+FERRICSTORE_NATIVE_MAX_GLOBAL_INBOUND_BUFFER_BYTES
 ```
 
 `request_id` is still required because clients may have many independent

@@ -319,7 +319,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
       end
 
       defp encode_snapshot_metadata(metadata) do
-        payload = metadata |> encode_persisted_metadata_term() |> :erlang.term_to_binary()
+        payload = metadata |> encode_persisted_metadata_term() |> Ferricstore.TermCodec.encode()
 
         if byte_size(payload) <= @max_snapshot_metadata_bytes do
           {:ok, payload}
@@ -471,7 +471,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
       defp read_bounded_metadata_file(path, max_bytes, too_large_reason) do
         case File.lstat(path) do
           {:ok, %{type: :regular, size: size}} when size <= max_bytes ->
-            File.read(path)
+            Ferricstore.FS.read_nofollow(path, max_bytes)
 
           {:ok, %{type: :regular, size: size}} ->
             {:error, {too_large_reason, size, max_bytes}}
@@ -777,7 +777,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
       end
 
       defp atomic_write_term(path, term) do
-        atomic_write_binary(path, :erlang.term_to_binary(term))
+        atomic_write_binary(path, Ferricstore.TermCodec.encode(term))
       end
 
       defp atomic_write_binary(path, payload) do
@@ -785,8 +785,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ProjectionSnapshot do
         previous = maybe_metadata_previous_path(path)
 
         with :ok <- Ferricstore.FS.mkdir_p(Path.dirname(path)),
-             :ok <- File.write(tmp, payload),
-             :ok <- fsync_metadata_file(tmp),
+             :ok <- run_storage_metadata_fsync_hook(tmp),
+             :ok <-
+               Ferricstore.FS.atomic_replace_nofollow(
+                 tmp,
+                 payload,
+                 @max_storage_metadata_bytes
+               ),
              :ok <- stage_previous_metadata(path, previous),
              :ok <- Ferricstore.FS.rename(tmp, path),
              :ok <- fsync_dir(Path.dirname(path)) do

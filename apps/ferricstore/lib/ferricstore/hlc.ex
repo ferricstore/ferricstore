@@ -145,6 +145,8 @@ defmodule Ferricstore.HLC do
   # Bit layout: 48-bit physical | 16-bit logical.
   @logical_bits 16
   @logical_mask Bitwise.bsl(1, 16) - 1
+  @max_physical_ms Bitwise.bsl(1, 48) - 1
+  @max_packed Bitwise.bsl(1, 64) - 1
 
   # ---------------------------------------------------------------------------
   # Client API
@@ -204,24 +206,6 @@ defmodule Ferricstore.HLC do
   end
 
   @doc """
-  Returns the current HLC timestamp as `{physical_ms, logical}`.
-
-  This overload accepts a server argument for backward compatibility with
-  existing tests. In production, prefer the zero-arity `now/0` which is
-  lock-free.
-
-  ## Parameters
-
-    * `server` -- ignored (kept for API compatibility). The atomics ref is
-      always read from `:persistent_term`.
-
-  """
-  @spec now(GenServer.server()) :: timestamp()
-  def now(_server) do
-    now()
-  end
-
-  @doc """
   Convenience: returns only the physical (millisecond) component of `now/0`.
 
   This is the value used as the millisecond part of Redis Stream IDs and as
@@ -234,21 +218,6 @@ defmodule Ferricstore.HLC do
   def now_ms do
     {physical, _logical} = now()
     physical
-  end
-
-  @doc """
-  Convenience: returns only the physical (millisecond) component of `now/0`.
-
-  This overload accepts a server argument for backward compatibility.
-
-  ## Parameters
-
-    * `server` -- ignored (kept for API compatibility).
-
-  """
-  @spec now_ms(GenServer.server()) :: non_neg_integer()
-  def now_ms(_server) do
-    now_ms()
   end
 
   @doc """
@@ -288,28 +257,7 @@ defmodule Ferricstore.HLC do
   end
 
   @doc """
-  Merges a remote HLC timestamp, sending the call to `server`.
-
-  ## Parameters
-
-    * `server` -- the HLC process
-    * `remote_ts` -- the remote HLC timestamp `{physical_ms, logical}`
-
-  """
-  @spec update(GenServer.server(), timestamp()) :: :ok
-  def update(__MODULE__, remote_ts) do
-    hlc_update_packed(remote_ts)
-  end
-
-  def update(server, remote_ts) do
-    case atomics_ref() do
-      nil -> GenServer.call(server, {:update, remote_ts})
-      _ref -> hlc_update_packed(remote_ts)
-    end
-  end
-
-  @doc """
-  Returns the absolute drift in milliseconds between the HLC physical
+  Returns the future drift in milliseconds between the HLC physical
   component and the current wall clock.
 
   This function is **lock-free** -- it reads the atomics ref directly.
@@ -327,23 +275,8 @@ defmodule Ferricstore.HLC do
       ref ->
         {phys, _logical} = unpack(:atomics.get(ref, @slot))
         wall = System.os_time(:millisecond)
-        abs(wall - phys)
+        max(phys - wall, 0)
     end
-  end
-
-  @doc """
-  Returns the absolute drift in milliseconds.
-
-  This overload accepts a server argument for backward compatibility.
-
-  ## Parameters
-
-    * `server` -- ignored (kept for API compatibility).
-
-  """
-  @spec drift_ms(GenServer.server()) :: non_neg_integer()
-  def drift_ms(_server) do
-    drift_ms()
   end
 
   @doc """
@@ -355,21 +288,6 @@ defmodule Ferricstore.HLC do
   @spec drift_exceeded?() :: boolean()
   def drift_exceeded? do
     drift_ms() >= @drift_reject_ms
-  end
-
-  @doc """
-  Returns `true` when drift exceeds the reject threshold (1 000 ms).
-
-  This overload accepts a server argument for backward compatibility.
-
-  ## Parameters
-
-    * `server` -- ignored (kept for API compatibility).
-
-  """
-  @spec drift_exceeded?(GenServer.server()) :: boolean()
-  def drift_exceeded?(_server) do
-    drift_exceeded?()
   end
 
   @doc """
@@ -424,12 +342,6 @@ defmodule Ferricstore.HLC do
     :atomics.put(ref, @slot, 0)
     :persistent_term.put(@atomics_key, ref)
     {:ok, %{}}
-  end
-
-  @impl true
-  def handle_call({:update, {remote_phys, remote_log}}, _from, state) do
-    _ = hlc_update_packed({remote_phys, remote_log})
-    {:reply, :ok, state}
   end
 
   @impl true
@@ -516,8 +428,9 @@ defmodule Ferricstore.HLC do
   end
 
   defp hlc_update_packed({remote_phys, remote_log})
-       when is_integer(remote_phys) and remote_phys >= 0 and is_integer(remote_log) and
-              remote_log >= 0 do
+       when is_integer(remote_phys) and remote_phys >= 0 and
+              remote_phys <= @max_physical_ms and is_integer(remote_log) and remote_log >= 0 and
+              remote_log <= @logical_mask do
     case atomics_ref() do
       nil ->
         :ok
@@ -540,6 +453,9 @@ defmodule Ferricstore.HLC do
     target = pack(new_physical, new_logical)
 
     cond do
+      target > @max_packed ->
+        :ok
+
       target <= current ->
         maybe_emit_drift_warning(local_phys, wall)
         :ok
@@ -565,7 +481,7 @@ defmodule Ferricstore.HLC do
   end
 
   defp maybe_emit_drift_warning(hlc_physical, wall_clock) do
-    drift = abs(wall_clock - hlc_physical)
+    drift = max(hlc_physical - wall_clock, 0)
 
     if drift >= @drift_warning_ms do
       :telemetry.execute(

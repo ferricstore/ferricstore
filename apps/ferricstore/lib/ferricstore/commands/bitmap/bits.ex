@@ -60,14 +60,7 @@ defmodule Ferricstore.Commands.Bitmap.Bits do
     else
       s = max(s, 0)
       e = min(e, total_bits - 1)
-
-      s..e
-      |> Enum.count(fn bit_offset ->
-        byte_idx = div(bit_offset, 8)
-        bit_pos = 7 - rem(bit_offset, 8)
-        byte = :binary.at(bin, byte_idx)
-        (byte >>> bit_pos &&& 1) == 1
-      end)
+      count_masked_byte_range(bin, s, e)
     end
   end
 
@@ -102,12 +95,7 @@ defmodule Ferricstore.Commands.Bitmap.Bits do
     if s > e or s >= total_bits do
       -1
     else
-      Enum.find(s..e, -1, fn bit_offset ->
-        byte_idx = div(bit_offset, 8)
-        bit_pos = 7 - rem(bit_offset, 8)
-        byte = :binary.at(bin, byte_idx)
-        (byte >>> bit_pos &&& 1) == bit_val
-      end)
+      find_bit_in_masked_byte_range(bin, bit_val, s, e)
     end
   end
 
@@ -135,6 +123,77 @@ defmodule Ferricstore.Commands.Bitmap.Bits do
 
   defp do_byte_popcount(byte, count) do
     do_byte_popcount(byte &&& byte - 1, count + 1)
+  end
+
+  defp count_masked_byte_range(bin, start_bit, end_bit) do
+    start_byte = div(start_bit, 8)
+    end_byte = div(end_bit, 8)
+    start_offset = rem(start_bit, 8)
+    end_offset = rem(end_bit, 8)
+
+    if start_byte == end_byte do
+      mask = 0xFF >>> start_offset &&& (0xFF <<< (7 - end_offset) &&& 0xFF)
+      byte_popcount(:binary.at(bin, start_byte) &&& mask)
+    else
+      first_mask = 0xFF >>> start_offset
+      last_mask = 0xFF <<< (7 - end_offset) &&& 0xFF
+      middle_size = end_byte - start_byte - 1
+
+      middle_count =
+        if middle_size > 0 do
+          bin
+          |> binary_part(start_byte + 1, middle_size)
+          |> popcount()
+        else
+          0
+        end
+
+      byte_popcount(:binary.at(bin, start_byte) &&& first_mask) +
+        middle_count + byte_popcount(:binary.at(bin, end_byte) &&& last_mask)
+    end
+  end
+
+  defp find_bit_in_masked_byte_range(bin, bit_val, start_bit, end_bit) do
+    start_byte = div(start_bit, 8)
+    end_byte = div(end_bit, 8)
+    start_offset = rem(start_bit, 8)
+    end_offset = rem(end_bit, 8)
+    first_end_offset = if start_byte == end_byte, do: end_offset, else: 7
+
+    case find_bit_in_byte(:binary.at(bin, start_byte), bit_val, start_offset, first_end_offset) do
+      offset when is_integer(offset) ->
+        start_byte * 8 + offset
+
+      nil when start_byte == end_byte ->
+        -1
+
+      nil ->
+        find_bit_after_first_byte(bin, bit_val, start_byte, end_byte, end_offset)
+    end
+  end
+
+  defp find_bit_after_first_byte(bin, bit_val, start_byte, end_byte, end_offset) do
+    middle_position =
+      if start_byte + 1 < end_byte do
+        scan_bytes_for_bit(bin, bit_val, start_byte + 1, end_byte - 1)
+      else
+        -1
+      end
+
+    if middle_position >= 0 do
+      middle_position
+    else
+      case find_bit_in_byte(:binary.at(bin, end_byte), bit_val, 0, end_offset) do
+        offset when is_integer(offset) -> end_byte * 8 + offset
+        nil -> -1
+      end
+    end
+  end
+
+  defp find_bit_in_byte(byte, bit_val, from, to) do
+    Enum.find(from..to, fn offset ->
+      (byte >>> (7 - offset) &&& 1) == bit_val
+    end)
   end
 
   defp bitpos_not_found_fallback(pos, _bit_val, _end_byte, _explicit_end) when pos >= 0, do: pos

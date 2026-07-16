@@ -26,6 +26,22 @@ pub fn copy_record_raw_from_file(
     copy_record_raw(file, writer, offset, copy_tombstone)
 }
 
+/// Copy exactly one live record without materializing its value.
+///
+/// Unlike `copy_record_raw_from_file(..., false)`, this does not conflate a
+/// tombstone with a missing offset. Both violate a live-only compaction plan.
+pub fn copy_live_record_raw_from_file(
+    file: &File,
+    writer: &mut LogWriter,
+    offset: u64,
+) -> Result<RawCopyResult> {
+    copy_record_raw(file, writer, offset, false)?.ok_or_else(|| {
+        LogError(format!(
+            "requested live offset {offset} was not found or contained a tombstone; expected live record"
+        ))
+    })
+}
+
 #[cfg(unix)]
 fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     // Step 1: pread the header
@@ -63,8 +79,10 @@ fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
 
     let mut body = vec![0u8; body_len];
     if body_len > 0 {
-        let body_offset = offset + HEADER_SIZE as u64;
-        read_exact_at_or_eof(file, &mut body, body_offset, "body")?;
+        let body_offset = offset
+            .checked_add(HEADER_SIZE as u64)
+            .ok_or_else(|| LogError("record body offset overflow".into()))?;
+        read_exact_at_required(file, &mut body, body_offset, "body")?;
     }
 
     let key = body[..key_size].to_vec();
@@ -130,13 +148,22 @@ fn read_exact_at_or_eof(file: &File, buf: &mut [u8], offset: u64, label: &str) -
     Ok(true)
 }
 
-fn read_next_record(reader: &mut impl Read) -> Result<Option<Record>> {
-    let mut header = [0u8; HEADER_SIZE];
-    match reader.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+#[cfg(unix)]
+fn read_exact_at_required(file: &File, buf: &mut [u8], offset: u64, label: &str) -> Result<()> {
+    if read_exact_at_or_eof(file, buf, offset, label)? {
+        Ok(())
+    } else {
+        Err(LogError(format!(
+            "pread {label} short read: expected {} B, got 0 B",
+            buf.len()
+        )))
     }
+}
+
+fn read_next_record(reader: &mut impl Read) -> Result<Option<Record>> {
+    let Some(header) = read_record_header(reader)? else {
+        return Ok(None);
+    };
 
     let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let timestamp_ms = u64::from_le_bytes(header[4..12].try_into().unwrap());
@@ -199,7 +226,7 @@ fn pread_value_for_key(
         let key_offset = offset
             .checked_add(HEADER_SIZE as u64)
             .ok_or_else(|| LogError("keyed pread key offset overflow".into()))?;
-        read_exact_at_or_eof(file, &mut key, key_offset, "key")?;
+        read_exact_at_required(file, &mut key, key_offset, "key")?;
     }
 
     if key != expected_key {
@@ -234,7 +261,7 @@ fn pread_value_for_key(
                 .checked_add(HEADER_SIZE as u64)
                 .and_then(|off| off.checked_add(key_size as u64))
                 .ok_or_else(|| LogError("keyed pread value offset overflow".into()))?;
-            read_exact_at_or_eof(file, &mut value, value_offset, "value")?;
+            read_exact_at_required(file, &mut value, value_offset, "value")?;
         }
         value
     };
@@ -280,6 +307,22 @@ fn copy_record_raw(
     let value_size = decoded_value_size(value_size_raw, is_tombstone)?;
 
     if is_tombstone && !copy_tombstone {
+        let key_offset = offset
+            .checked_add(HEADER_SIZE as u64)
+            .ok_or_else(|| LogError("skipped tombstone key offset overflow".into()))?;
+        let mut key = vec![0u8; key_size];
+        if key_size > 0 {
+            read_exact_at_required(file, &mut key, key_offset, "tombstone key")?;
+        }
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header[4..]);
+        hasher.update(&key);
+        let computed_crc = hasher.finalize();
+        if computed_crc != stored_crc {
+            return Err(LogError(format!(
+                "CRC mismatch: stored={stored_crc}, computed={computed_crc}"
+            )));
+        }
         return Ok(None);
     }
 
@@ -301,36 +344,46 @@ fn copy_record_raw(
         }
     }
 
-    let new_offset = writer.offset;
-    writer.write_raw(&header)?;
+    let new_offset = writer.write_raw(&header)?;
+    let copy_result = (|| {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header[4..]);
 
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&header[4..]);
+        let key_offset = offset
+            .checked_add(HEADER_SIZE as u64)
+            .ok_or_else(|| LogError("raw copy key offset overflow".into()))?;
+        copy_hashed_range(file, writer, key_offset, key_size, &mut hasher, "key")?;
 
-    let key_offset = offset
-        .checked_add(HEADER_SIZE as u64)
-        .ok_or_else(|| LogError("raw copy key offset overflow".into()))?;
-    copy_hashed_range(file, writer, key_offset, key_size, &mut hasher, "key")?;
+        if !is_tombstone {
+            let value_offset = key_offset
+                .checked_add(key_size as u64)
+                .ok_or_else(|| LogError("raw copy value offset overflow".into()))?;
+            copy_hashed_range(file, writer, value_offset, value_size, &mut hasher, "value")?;
+        }
 
-    if !is_tombstone {
-        let value_offset = key_offset
-            .checked_add(key_size as u64)
-            .ok_or_else(|| LogError("raw copy value offset overflow".into()))?;
-        copy_hashed_range(file, writer, value_offset, value_size, &mut hasher, "value")?;
+        let computed_crc = hasher.finalize();
+        if computed_crc != stored_crc {
+            return Err(LogError(format!(
+                "CRC mismatch: stored={stored_crc}, computed={computed_crc}"
+            )));
+        }
+
+        Ok(Some(RawCopyResult {
+            offset: new_offset,
+            record_size,
+            is_tombstone,
+        }))
+    })();
+
+    match copy_result {
+        Ok(copied) => Ok(copied),
+        Err(cause) => match writer.rollback_to(new_offset) {
+            Ok(()) => Err(cause),
+            Err(rollback) => Err(LogError(format!(
+                "raw copy failed: {cause}; rollback failed: {rollback}"
+            ))),
+        },
     }
-
-    let computed_crc = hasher.finalize();
-    if computed_crc != stored_crc {
-        return Err(LogError(format!(
-            "CRC mismatch: stored={stored_crc}, computed={computed_crc}"
-        )));
-    }
-
-    Ok(Some(RawCopyResult {
-        offset: new_offset,
-        record_size,
-        is_tombstone,
-    }))
 }
 
 #[cfg(unix)]
@@ -367,6 +420,7 @@ fn copy_hashed_range(
     Ok(())
 }
 
+#[cfg(test)]
 fn iter_metadata_tolerant(
     reader: &mut impl Read,
     start_offset: u64,
@@ -374,11 +428,18 @@ fn iter_metadata_tolerant(
     let mut records = Vec::new();
     let mut offset = start_offset;
 
-    while let Ok(Some(record)) = read_next_record_metadata(reader, offset) {
-        offset = offset
-            .checked_add(record.record_size)
-            .ok_or_else(|| LogError("record offset overflow".into()))?;
-        records.push(record);
+    loop {
+        match read_next_record_metadata(reader, offset) {
+            Ok(Some(record)) => {
+                offset = offset
+                    .checked_add(record.record_size)
+                    .ok_or_else(|| LogError("record offset overflow".into()))?;
+                records.push(record);
+            }
+            Ok(None) => break,
+            Err(error) if error.is_truncated_record() => break,
+            Err(error) => return Err(error),
+        }
     }
 
     Ok(records)
@@ -405,7 +466,10 @@ fn iter_metadata_page_tolerant(
                 records.push(record);
             }
             Ok(None) => return Ok((records, offset, true)),
-            Err(_err) => return Ok((records, offset, true)),
+            Err(error) if error.is_truncated_record() => {
+                return Ok((records, offset, true));
+            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -416,12 +480,9 @@ fn read_next_record_metadata(
     reader: &mut impl Read,
     offset: u64,
 ) -> Result<Option<RecordMetadata>> {
-    let mut header = [0u8; HEADER_SIZE];
-    match reader.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
+    let Some(header) = read_record_header(reader)? else {
+        return Ok(None);
+    };
 
     let stored_crc = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let timestamp_ms = u64::from_le_bytes(header[4..12].try_into().unwrap());
@@ -461,6 +522,27 @@ fn read_next_record_metadata(
     }))
 }
 
+fn read_record_header(reader: &mut impl Read) -> Result<Option<[u8; HEADER_SIZE]>> {
+    let mut header = [0u8; HEADER_SIZE];
+    let mut read = 0usize;
+
+    while read < HEADER_SIZE {
+        match reader.read(&mut header[read..]) {
+            Ok(0) if read == 0 => return Ok(None),
+            Ok(0) => {
+                return Err(LogError(format!(
+                    "truncated record header: expected {HEADER_SIZE} bytes, got {read}"
+                )));
+            }
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Ok(Some(header))
+}
+
 /// CRC32 using hardware acceleration (SSE4.2 on x86, ARM CRC on aarch64).
 ///
 /// C-1 fix: replaces the hand-rolled byte-at-a-time CRC32 with `crc32fast`
@@ -483,4 +565,3 @@ fn now_ms() -> u64 {
         .as_millis() as u64;
     ms
 }
-

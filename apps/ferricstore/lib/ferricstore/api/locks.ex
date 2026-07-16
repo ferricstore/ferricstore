@@ -132,11 +132,15 @@ defmodule FerricStore.API.Locks do
       {:ok, [1, 6]}
 
   """
-  @spec ratelimit_add(key(), pos_integer(), pos_integer(), pos_integer()) :: {:ok, list()}
+  @spec ratelimit_add(key(), pos_integer(), pos_integer(), pos_integer()) ::
+          {:ok, list()} | {:error, term()}
   def ratelimit_add(key, window_ms, max, count \\ 1) do
     ctx = default_ctx()
-    result = Router.ratelimit_add(ctx, key, window_ms, max, count)
-    {:ok, result}
+
+    case Router.ratelimit_add(ctx, key, window_ms, max, count) do
+      {:error, _reason} = error -> error
+      result -> {:ok, result}
+    end
   end
 
   # ---------------------------------------------------------------------------

@@ -1,11 +1,17 @@
 defmodule Ferricstore.Commands.SortedSet.Helpers do
   @moduledoc false
 
+  alias Ferricstore.Commands.CollectionScan
+
+  @max_random_replacement_count 10_000
+
   def parse_stored_score(score_str) do
     case Float.parse(score_str) do
       {score, ""} -> score
       _ -> 0.0
     end
+  rescue
+    ArgumentError -> 0.0
   end
 
   def raw_score_bound(:neg_infinity, _exclusive), do: :neg_inf
@@ -25,6 +31,8 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
       {score, ""} -> format_score(score)
       _ -> score_str
     end
+  rescue
+    ArgumentError -> score_str
   end
 
   def score_pairs_to_flat_list(pairs), do: score_pairs_to_flat_list(pairs, [])
@@ -45,6 +53,15 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
           _ -> :error
         end
     end
+  rescue
+    ArgumentError -> :error
+    ArithmeticError -> :error
+  end
+
+  def checked_score_add(left, right) when is_float(left) and is_float(right) do
+    {:ok, left + right}
+  rescue
+    ArithmeticError -> :overflow
   end
 
   def parse_score_bound("-inf"), do: {:ok, :neg_infinity, false}
@@ -94,32 +111,13 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
   def typed_range_by_score_opts(opts), do: do_typed_range_by_score_opts(opts, false, 0, :all)
   def typed_scan_opts(opts), do: do_typed_scan_opts(opts, nil, 10)
 
-  def parse_cursor(cursor_str) do
-    case Integer.parse(cursor_str) do
-      {cursor, ""} when cursor >= 0 -> {:ok, cursor}
-      _ -> {:error, "ERR invalid cursor"}
-    end
-  end
+  def parse_cursor(cursor_str), do: CollectionScan.parse_cursor(cursor_str)
 
   def parse_zscan_opts(opts), do: do_parse_zscan_opts(opts, nil, 10)
 
-  def paginate(items, cursor, count) do
-    total = length(items)
-
-    if cursor >= total do
-      {"0", []}
-    else
-      batch = Enum.slice(items, cursor, count)
-      batch_len = min(count, total - cursor)
-      next_pos = cursor + batch_len
-
-      if next_pos >= total do
-        {"0", batch}
-      else
-        {Integer.to_string(next_pos), batch}
-      end
-    end
-  end
+  def select_random_members(_pairs, count, _with_scores)
+      when count < -@max_random_replacement_count,
+      do: {:error, "ERR count exceeds maximum allowed response size"}
 
   def select_random_members(pairs, count, with_scores) do
     cond do
@@ -141,7 +139,9 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
         if pairs == [] do
           []
         else
-          selected = for _ <- 1..abs_count, do: Enum.random(pairs)
+          tuple = List.to_tuple(pairs)
+          size = tuple_size(tuple)
+          selected = for _ <- 1..abs_count, do: elem(tuple, :rand.uniform(size) - 1)
 
           if with_scores do
             score_string_pairs_to_flat_list(selected)
@@ -241,11 +241,11 @@ defmodule Ferricstore.Commands.SortedSet.Helpers do
             end
 
           _ ->
-            {ws, offset, count}
+            {:error, "ERR syntax error"}
         end
 
       _ ->
-        {ws, offset, count}
+        {:error, "ERR syntax error"}
     end
   end
 

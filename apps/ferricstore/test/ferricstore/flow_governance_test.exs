@@ -3,6 +3,195 @@ defmodule Ferricstore.FlowGovernanceTest do
 
   @partition "tenant-governance"
 
+  test "approval records reject trailing external-term bytes" do
+    ctx = FerricStore.Instance.get(:default)
+    id = unique_flow_id("approval-canonical-record")
+
+    assert {:ok, _approval} =
+             FerricStore.flow_approval_request(id,
+               flow_id: unique_flow_id("approval-flow"),
+               scope: unique_flow_id("approval-scope"),
+               now_ms: 1_000
+             )
+
+    key = Ferricstore.Flow.Keys.governance_approval_key(id)
+    value = Ferricstore.Store.Router.get(ctx, key)
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, value <> <<0>>, 0)
+
+    assert {:error, "ERR flow approval record is corrupt"} =
+             FerricStore.flow_approval_get(id)
+  end
+
+  test "budget records reject compressed external terms" do
+    ctx = FerricStore.Instance.get(:default)
+    scope = unique_flow_id("budget-canonical-record")
+
+    assert {:ok, _reservation} =
+             FerricStore.flow_budget_reserve(scope, 1,
+               limit: 10,
+               window_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    key = Ferricstore.Flow.Keys.governance_budget_key(scope)
+
+    compressed =
+      ctx
+      |> Ferricstore.Store.Router.get(key)
+      |> :erlang.binary_to_term([:safe])
+      |> :erlang.term_to_binary(compressed: 9)
+
+    assert <<131, 80, _compressed::binary>> = compressed
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, compressed, 0)
+
+    assert {:error, "ERR flow budget record is corrupt"} =
+             FerricStore.flow_budget_get(scope)
+  end
+
+  test "circuit records reject trailing external-term bytes" do
+    ctx = FerricStore.Instance.get(:default)
+    scope = unique_flow_id("circuit-canonical-record")
+
+    assert {:ok, _circuit} =
+             FerricStore.flow_circuit_open(scope,
+               failure_threshold: 1,
+               open_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    key = Ferricstore.Flow.Keys.governance_circuit_key(scope)
+    value = Ferricstore.Store.Router.get(ctx, key)
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, value <> <<0>>, 0)
+
+    assert {:error, "ERR flow circuit record is corrupt"} =
+             FerricStore.flow_circuit_get(scope)
+  end
+
+  test "approval records reject structurally invalid structs" do
+    id = unique_flow_id("approval-structural-corruption")
+    ctx = FerricStore.Instance.get(:default)
+    key = Ferricstore.Flow.Keys.governance_approval_key(id)
+
+    corrupt =
+      :erlang.term_to_binary({
+        :flow_governance_approval_v1,
+        %Ferricstore.Flow.Governance.Approval{}
+      })
+
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, corrupt, 0)
+
+    assert {:error, "ERR flow approval record is corrupt"} =
+             FerricStore.flow_approval_get(id)
+  end
+
+  test "budget records reject structurally invalid structs without raising" do
+    scope = unique_flow_id("budget-structural-corruption")
+    ctx = FerricStore.Instance.get(:default)
+    key = Ferricstore.Flow.Keys.governance_budget_key(scope)
+
+    corrupt =
+      :erlang.term_to_binary({
+        :flow_governance_budget_v1,
+        %Ferricstore.Flow.Governance.Budget{}
+      })
+
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, corrupt, 0)
+
+    assert {:error, "ERR flow budget record is corrupt"} =
+             FerricStore.flow_budget_get(scope)
+  end
+
+  test "circuit records reject structurally invalid structs" do
+    scope = unique_flow_id("circuit-structural-corruption")
+    ctx = FerricStore.Instance.get(:default)
+    key = Ferricstore.Flow.Keys.governance_circuit_key(scope)
+
+    corrupt =
+      :erlang.term_to_binary({
+        :flow_governance_circuit_v1,
+        %Ferricstore.Flow.Governance.Circuit{}
+      })
+
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, corrupt, 0)
+
+    assert {:error, "ERR flow circuit record is corrupt"} =
+             FerricStore.flow_circuit_get(scope)
+  end
+
+  test "effect records reject trailing external-term bytes" do
+    type = unique_flow_id("effect-canonical-type")
+    id = unique_flow_id("effect-canonical")
+    claimed = create_and_claim!(id, type)
+
+    assert {:ok, _effect} =
+             FerricStore.flow_effect_reserve(id, "canonical-effect", "email.send",
+               partition_key: @partition,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               operation_digest: "canonical-effect-digest",
+               idempotency_key: "canonical-effect-idempotency",
+               now_ms: 1_002
+             )
+
+    ctx = FerricStore.Instance.get(:default)
+    key = Ferricstore.Flow.Keys.governance_effect_key(id, "canonical-effect", @partition)
+    value = Ferricstore.Store.Router.get(ctx, key)
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, value <> <<0>>, 0)
+
+    assert {:error, "ERR flow governance effect record is corrupt"} =
+             FerricStore.flow_effect_get(id, "canonical-effect", partition_key: @partition)
+  end
+
+  test "effect records reject structurally invalid maps" do
+    id = unique_flow_id("effect-structural-corruption")
+    ctx = FerricStore.Instance.get(:default)
+    key = Ferricstore.Flow.Keys.governance_effect_key(id, "corrupt-effect", @partition)
+    corrupt = :erlang.term_to_binary({:flow_governance_effect_v1, %{}})
+
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, corrupt, 0)
+
+    assert {:error, "ERR flow governance effect record is corrupt"} =
+             FerricStore.flow_effect_get(id, "corrupt-effect", partition_key: @partition)
+  end
+
+  test "ledger indexes reject non-canonical external terms" do
+    type = unique_flow_id("ledger-canonical-type")
+    id = unique_flow_id("ledger-canonical")
+    claimed = create_and_claim!(id, type)
+
+    assert {:ok, _effect} =
+             FerricStore.flow_effect_reserve(id, "ledger-effect", "email.send",
+               partition_key: @partition,
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               operation_digest: "ledger-effect-digest",
+               idempotency_key: "ledger-effect-idempotency",
+               now_ms: 1_002
+             )
+
+    ctx = FerricStore.Instance.get(:default)
+    key = Ferricstore.Flow.Keys.governance_ledger_index_key(id, @partition)
+    value = Ferricstore.Store.Router.get(ctx, key)
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, value <> <<0>>, 0)
+
+    assert {:error, "ERR flow governance ledger index is corrupt"} =
+             FerricStore.flow_governance_ledger(id, partition_key: @partition)
+  end
+
+  test "ledger indexes reject structurally invalid events without raising" do
+    id = unique_flow_id("ledger-structural-corruption")
+    ctx = FerricStore.Instance.get(:default)
+    key = Ferricstore.Flow.Keys.governance_ledger_index_key(id, @partition)
+
+    corrupt =
+      :erlang.term_to_binary({:flow_governance_ledger_index_v1, [:not_an_event]})
+
+    assert :ok = Ferricstore.Store.Router.put(ctx, key, corrupt, 0)
+
+    assert {:error, "ERR flow governance ledger index is corrupt"} =
+             FerricStore.flow_governance_ledger(id, partition_key: @partition)
+  end
+
   test "flow policy stores governance rules and exposes them" do
     type = unique_flow_id("gov-policy-type")
 
@@ -58,6 +247,51 @@ defmodule Ferricstore.FlowGovernanceTest do
     assert {:ok, [event]} = FerricStore.flow_governance_ledger(id, partition_key: @partition)
     assert event.policy_version == "policy-v1"
     assert event.policy_hash == denial.policy_hash
+  end
+
+  test "governance ledger defaults to the flow id auto partition" do
+    id = unique_flow_id("gov-auto-ledger")
+    partition = Ferricstore.Flow.Keys.auto_partition_key(id)
+    expected = Ferricstore.Flow.Keys.governance_ledger_index_key(id, partition)
+
+    assert {:ok, ^expected} =
+             Ferricstore.Flow.Governance.Ledger.resolve_index_key(id, [])
+  end
+
+  test "effect get defaults to the flow id auto partition" do
+    type = unique_flow_id("gov-auto-effect-type")
+    id = unique_flow_id("gov-auto-effect")
+    partition = Ferricstore.Flow.Keys.auto_partition_key(id)
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "queued",
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               states: ["queued"],
+               partition_key: partition,
+               worker: "worker-1",
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    assert {:ok, reserved} =
+             FerricStore.flow_effect_reserve(id, "charge", "stripe.charge",
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               operation_digest: "auto-effect-digest",
+               idempotency_key: "auto-effect-idempotency",
+               now_ms: 1_002
+             )
+
+    assert {:ok, fetched} = FerricStore.flow_effect_get(id, "charge")
+    assert fetched.flow_id == reserved.flow_id
+    assert fetched.effect_key == reserved.effect_key
   end
 
   test "effect reserve is idempotent for same digest and conflicts for different digest" do
@@ -265,11 +499,35 @@ defmodule Ferricstore.FlowGovernanceTest do
   test "approval request validates optional metadata" do
     id = unique_flow_id("gov-approval-validation")
 
+    assert {:error, "ERR flow approval reason must be a non-empty string"} =
+             FerricStore.flow_approval_request(id,
+               flow_id: "flow-1",
+               scope: @partition,
+               reason: 123,
+               now_ms: 1_000
+             )
+
+    assert {:error, "ERR flow approval requested_by must be a non-empty string"} =
+             FerricStore.flow_approval_request(id,
+               flow_id: "flow-1",
+               scope: @partition,
+               requested_by: "",
+               now_ms: 1_000
+             )
+
     assert {:error, "ERR flow approval assignees must be a list of non-empty strings"} =
              FerricStore.flow_approval_request(id,
                flow_id: "flow-1",
                scope: @partition,
                assignees: "finance",
+               now_ms: 1_000
+             )
+
+    assert {:error, "ERR flow approval assignees must be a list of non-empty strings"} =
+             FerricStore.flow_approval_request(id,
+               flow_id: "flow-1",
+               scope: @partition,
+               assignees: Enum.map(1..1_001, &"assignee-#{&1}"),
                now_ms: 1_000
              )
 
@@ -288,6 +546,26 @@ defmodule Ferricstore.FlowGovernanceTest do
                expires_at_ms: -1,
                now_ms: 1_000
              )
+  end
+
+  test "approval decisions validate optional persisted metadata before mutation" do
+    id = unique_flow_id("gov-approval-decision-validation")
+
+    assert {:ok, _approval} =
+             FerricStore.flow_approval_request(id,
+               flow_id: "flow-1",
+               scope: @partition,
+               now_ms: 1_000
+             )
+
+    assert {:error, "ERR flow approval reason must be a non-empty string"} =
+             FerricStore.flow_approval_approve(id,
+               approver: "admin",
+               reason: 123,
+               now_ms: 1_001
+             )
+
+    assert {:ok, %{status: :pending}} = FerricStore.flow_approval_get(id)
   end
 
   test "approval list filters pending requests and governance overview summarizes records" do
@@ -1662,11 +1940,9 @@ defmodule Ferricstore.FlowGovernanceTest do
   test "terminal retention serializes with racing effect and ledger owner writes" do
     ctx = FerricStore.Instance.get(:default)
     parent = self()
-    old_write_hook = Application.get_env(:ferricstore, :flow_retention_owned_write_hook)
     old_plan_hook = Application.get_env(:ferricstore, :flow_retention_after_plan_hook)
 
     on_exit(fn ->
-      restore_env(:flow_retention_owned_write_hook, old_write_hook)
       restore_env(:flow_retention_after_plan_hook, old_plan_hook)
     end)
 
@@ -1719,27 +1995,19 @@ defmodule Ferricstore.FlowGovernanceTest do
 
       release_ref = make_ref()
 
-      Application.put_env(:ferricstore, :flow_retention_owned_write_hook, fn
-        %{id: ^id}, ^key ->
-          send(parent, {:governance_owner_write_paused, key, self(), release_ref})
-
-          receive do
-            {:release_governance_owner_write, ^release_ref} -> :ok
-          after
-            10_000 -> {:error, :governance_owner_write_hook_timeout}
-          end
-
-        _owner, _key ->
-          :ok
-      end)
-
       Application.put_env(:ferricstore, :flow_retention_after_plan_hook, fn
         :terminal, candidates when is_list(candidates) ->
           if Enum.any?(candidates, &(&1.record.id == id)) do
-            send(parent, {:governance_cleanup_planned, key})
-          end
+            send(parent, {:governance_cleanup_planned, key, self(), release_ref})
 
-          :ok
+            receive do
+              {:release_governance_cleanup, ^release_ref} -> :ok
+            after
+              10_000 -> {:error, :governance_cleanup_plan_hook_timeout}
+            end
+          else
+            :ok
+          end
 
         _kind, _candidates ->
           :ok
@@ -1754,25 +2022,22 @@ defmodule Ferricstore.FlowGovernanceTest do
         flow_retention_owner: owner
       }
 
-      write_task =
-        Task.async(fn -> Ferricstore.Store.Router.set(ctx, key, "governance", set_opts) end)
-
-      assert_receive {:governance_owner_write_paused, ^key, apply_pid, ^release_ref}, 5_000
-
       cleanup_task =
         Task.async(fn ->
           FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 1_000)
         end)
 
-      assert_receive {:governance_cleanup_planned, ^key}, 5_000
+      assert_receive {:governance_cleanup_planned, ^key, cleanup_pid, ^release_ref}, 5_000
       assert Task.yield(cleanup_task, 500) == nil
-      send(apply_pid, {:release_governance_owner_write, release_ref})
 
-      assert :ok = Task.await(write_task, 10_000)
+      assert :ok = Ferricstore.Store.Router.set(ctx, key, "governance", set_opts)
+      send(cleanup_pid, {:release_governance_cleanup, release_ref})
+
       assert {:ok, %{flows: 0}} = Task.await(cleanup_task, 10_000)
       assert Ferricstore.Store.Router.get(ctx, key) == "governance"
 
       assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+      restore_env(:flow_retention_after_plan_hook, old_plan_hook)
 
       assert {:ok, %{flows: 1}} =
                FerricStore.flow_retention_cleanup(limit: 10, now_ms: now + 1_001)

@@ -6,7 +6,12 @@ defmodule FerricstoreServer.Acl.Password do
   @pbkdf2_iterations 100_000
   @pbkdf2_key_length 32
   @salt_length 16
+  @max_password_bytes 4_096
   @dummy_hash String.duplicate("A", 64)
+
+  @doc false
+  @spec max_password_bytes() :: pos_integer()
+  def max_password_bytes, do: @max_password_bytes
 
   @doc false
   @spec dummy_hash() :: binary()

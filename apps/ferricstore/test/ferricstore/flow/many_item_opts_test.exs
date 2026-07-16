@@ -73,4 +73,23 @@ defmodule Ferricstore.Flow.ManyItemOptsTest do
 
     assert ManyItemOpts.transition(:bad) == {:error, "ERR flow id must be a non-empty string"}
   end
+
+  test "item parsers reject empty ids and required lease tokens at the boundary" do
+    assert ManyItemOpts.create("") == {:error, "ERR flow id must be a non-empty string"}
+
+    assert ManyItemOpts.create(%{id: "", type: "email"}) ==
+             {:error, "ERR flow id must be a non-empty string"}
+
+    assert ManyItemOpts.complete({"flow-1", "", [fencing_token: 1]}) ==
+             {:error, "ERR flow lease_token must be a non-empty string"}
+
+    assert ManyItemOpts.complete(%{id: "flow-1", lease_token: "", fencing_token: 1}) ==
+             {:error, "ERR flow lease_token must be a non-empty string"}
+
+    assert ManyItemOpts.cancel(%{id: "flow-1", lease_token: "", fencing_token: 1}) ==
+             {:error, "ERR flow lease_token must be a non-empty string"}
+
+    assert ManyItemOpts.transition({:id, "flow-1", :fencing_token, 1, :lease_token, ""}) ==
+             {:error, "ERR flow lease_token must be a non-empty string"}
+  end
 end

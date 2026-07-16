@@ -2,6 +2,9 @@ defmodule Ferricstore.Flow.IndexMerge do
   @moduledoc false
 
   def ids_from_scored_entries(ram_entries, lmdb_entries, count, reverse?) do
+    ram_ids = MapSet.new(ram_entries, fn {id, _score} -> id end)
+    lmdb_entries = Enum.reject(lmdb_entries, fn {id, _score} -> MapSet.member?(ram_ids, id) end)
+
     (ram_entries ++ lmdb_entries)
     |> Enum.sort_by(fn {id, score} -> {score, id} end)
     |> maybe_reverse(reverse?)

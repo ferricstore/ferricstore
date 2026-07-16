@@ -306,16 +306,28 @@ defmodule Ferricstore.MemoryBudget do
 
   defp disk_free_bytes(_data_dir), do: 0
 
-  defp existing_parent(path) do
+  defp existing_parent(path), do: existing_parent(path, &Ferricstore.FS.exists?/1)
+
+  defp existing_parent(path, exists?) do
     expanded = Path.expand(path)
+    parent = Path.dirname(expanded)
 
     cond do
-      Ferricstore.FS.exists?(expanded) ->
+      exists?.(expanded) ->
         expanded
 
-      parent = Path.dirname(expanded) ->
-        if Ferricstore.FS.exists?(parent), do: parent, else: existing_parent(parent)
+      parent == expanded ->
+        expanded
+
+      true ->
+        existing_parent(parent, exists?)
     end
+  end
+
+  if Mix.env() == :test do
+    @doc false
+    def __existing_parent_for_test__(path, exists?) when is_function(exists?, 1),
+      do: existing_parent(path, exists?)
   end
 
   defp parse_df_available_bytes(nil), do: 0

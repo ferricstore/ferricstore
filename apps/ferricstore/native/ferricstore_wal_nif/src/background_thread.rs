@@ -11,7 +11,7 @@
 use crate::aligned_buffer::AlignedBuffer;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rustler::Encoder;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 /// Messages sent from NIF to background thread (flush signals only, not data).
 pub type ThreadResult = std::result::Result<(), String>;
@@ -28,6 +31,8 @@ pub enum ThreadMsg {
     Flush(FlushCaller),
     /// Shutdown: drain, sync, close, exit.
     Close(Option<Sender<ThreadResult>>),
+    #[cfg(test)]
+    Panic,
 }
 
 /// Caller information for flush notification.
@@ -44,6 +49,8 @@ pub enum FlushTarget {
     },
     #[cfg(test)]
     Test(Sender<u64>),
+    #[cfg(test)]
+    TestResult(Sender<Result<u64, String>>),
 }
 
 // FlushCaller must be Send to cross thread boundary
@@ -55,6 +62,7 @@ pub struct ThreadConfig {
     pub buffer: Arc<Mutex<AlignedBuffer>>,
     pub rx: Receiver<ThreadMsg>,
     pub alive: Arc<AtomicBool>,
+    pub sync_admission: Arc<Mutex<()>>,
     pub file_size: Arc<AtomicU64>,
     pub commit_delay: Duration,
     pub _use_o_direct: bool,
@@ -73,6 +81,9 @@ impl SyncData for File {
 /// Run the background thread loop.
 /// This is called from std::thread::spawn — runs entirely outside BEAM.
 pub fn thread_loop(config: ThreadConfig) {
+    let mut callers = Vec::new();
+    let panic_rx = config.rx.clone();
+    let panic_sync_admission = Arc::clone(&config.sync_admission);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         thread_loop_inner(
             config.file,
@@ -80,21 +91,32 @@ pub fn thread_loop(config: ThreadConfig) {
             config.rx,
             config.file_size,
             config.commit_delay,
+            &mut callers,
         );
     }));
 
-    // On panic or normal exit, mark thread as dead
-    config.alive.store(false, Ordering::Release);
-
-    if let Err(panic) = result {
-        eprintln!(
-            "[ferricstore_wal_nif] WAL thread panicked: {:?}",
-            panic
+    match result {
+        Ok(()) => config.alive.store(false, Ordering::Release),
+        Err(panic) => {
+            let panic_reason = panic
                 .downcast_ref::<String>()
-                .map(|s| s.as_str())
+                .map(String::as_str)
                 .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown")
-        );
+                .unwrap_or("unknown");
+            let error = io::Error::new(
+                io::ErrorKind::Other,
+                format!("WAL thread panicked: {panic_reason}"),
+            );
+
+            notify_thread_panic(
+                &config.alive,
+                &panic_sync_admission,
+                &mut callers,
+                &panic_rx,
+                &error,
+            );
+            eprintln!("[ferricstore_wal_nif] {error}");
+        }
     }
 }
 
@@ -104,9 +126,8 @@ fn thread_loop_inner(
     rx: Receiver<ThreadMsg>,
     file_size: Arc<AtomicU64>,
     _commit_delay: Duration,
+    callers: &mut Vec<FlushCaller>,
 ) {
-    let mut callers: Vec<FlushCaller> = Vec::new();
-
     loop {
         // =====================================================================
         // Phase 1: IDLE — block until first message (zero CPU when idle)
@@ -114,29 +135,26 @@ fn thread_loop_inner(
         let msg = match rx.recv() {
             Ok(msg) => msg,
             Err(_) => {
-                finish_disconnect(&mut file, &buffer, &file_size, &mut callers);
+                finish_disconnect(&mut file, &buffer, &file_size, callers);
                 return;
             }
         };
 
         match msg {
             ThreadMsg::Close(response) => {
-                finish_close(&mut file, &buffer, &file_size, &mut callers, response);
+                finish_close(&mut file, &buffer, &file_size, callers, response);
                 return;
             }
             ThreadMsg::Flush(caller) => {
                 let commit_delay = caller.commit_delay;
                 callers.push(caller);
-                run_sync_cycle(
-                    &mut file,
-                    &buffer,
-                    &file_size,
-                    &rx,
-                    &mut callers,
-                    commit_delay,
-                );
+                if !run_sync_cycle(&mut file, &buffer, &file_size, &rx, callers, commit_delay) {
+                    return;
+                }
                 continue;
             }
+            #[cfg(test)]
+            ThreadMsg::Panic => panic!("forced WAL worker panic"),
         }
     }
 }
@@ -148,7 +166,8 @@ fn run_sync_cycle<W>(
     rx: &Receiver<ThreadMsg>,
     callers: &mut Vec<FlushCaller>,
     commit_delay: Duration,
-) where
+) -> bool
+where
     W: Write + SyncData,
 {
     // =====================================================================
@@ -156,14 +175,20 @@ fn run_sync_cycle<W>(
     // =====================================================================
     if let Err(e) = drain_to_kernel(file, buffer, file_size) {
         notify_callers_error(callers, &e);
-        return;
+        return true;
     }
 
     // =====================================================================
     // Phase 3: Commit delay — collect more Flush requests, keep draining
     // =====================================================================
     if !commit_delay.is_zero() {
-        let deadline = Instant::now() + commit_delay;
+        let deadline = match commit_deadline(Instant::now(), commit_delay) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                notify_callers_error(callers, &error);
+                return true;
+            }
+        };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -173,17 +198,19 @@ fn run_sync_cycle<W>(
                 Ok(ThreadMsg::Flush(c)) => callers.push(c),
                 Ok(ThreadMsg::Close(response)) => {
                     finish_close(file, buffer, file_size, callers, response);
-                    return;
+                    return false;
                 }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
                     finish_disconnect(file, buffer, file_size, callers);
-                    return;
+                    return false;
                 }
+                #[cfg(test)]
+                Ok(ThreadMsg::Panic) => panic!("forced WAL worker panic"),
             }
             if let Err(e) = drain_to_kernel(file, buffer, file_size) {
                 notify_callers_error(callers, &e);
-                return;
+                return true;
             }
         }
     }
@@ -197,7 +224,7 @@ fn run_sync_cycle<W>(
     // schedules the next sync cycle.
     if let Err(e) = drain_to_kernel(file, buffer, file_size) {
         notify_callers_error(callers, &e);
-        return;
+        return true;
     }
 
     if !callers.is_empty() {
@@ -211,6 +238,17 @@ fn run_sync_cycle<W>(
             }
         }
     }
+
+    true
+}
+
+fn commit_deadline(now: Instant, delay: Duration) -> io::Result<Instant> {
+    now.checked_add(delay).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "WAL commit delay exceeds the monotonic clock range",
+        )
+    })
 }
 
 fn finish_close<W>(
@@ -247,6 +285,38 @@ fn notify_callers_for_close(callers: &mut Vec<FlushCaller>, result: &io::Result<
     match result {
         Ok(synced_position) => notify_callers_success(callers, *synced_position),
         Err(e) => notify_callers_error(callers, e),
+    }
+}
+
+fn notify_thread_panic(
+    alive: &AtomicBool,
+    sync_admission: &Mutex<()>,
+    callers: &mut Vec<FlushCaller>,
+    rx: &Receiver<ThreadMsg>,
+    error: &io::Error,
+) {
+    let _admission_guard = sync_admission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    alive.store(false, Ordering::Release);
+    notify_callers_error(callers, error);
+    notify_queued_thread_failure(rx, error);
+}
+
+fn notify_queued_thread_failure(rx: &Receiver<ThreadMsg>, error: &io::Error) {
+    while let Ok(message) = rx.try_recv() {
+        match message {
+            ThreadMsg::Flush(caller) => notify_callers_error(&mut vec![caller], error),
+            ThreadMsg::Close(response) => {
+                send_close_result(
+                    response,
+                    &Err(io::Error::new(error.kind(), error.to_string())),
+                );
+            }
+            #[cfg(test)]
+            ThreadMsg::Panic => {}
+        }
     }
 }
 
@@ -300,32 +370,59 @@ fn drain_to_kernel_writer<W: Write>(
     }
 
     let bytes = taken.logical_len as u64;
-    if let Err(e) = write_all_retry(writer, taken.as_logical_slice()) {
+    if let Err(failure) = write_all_retry(writer, taken.as_logical_slice()) {
+        let written = failure.written;
+        if written > 0 {
+            file_size.fetch_add(written as u64, Ordering::Release);
+        }
+
         let mut buf = buffer
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "buffer mutex poisoned"))?;
-        buf.prepend(taken.as_logical_slice());
-        return Err(e);
+        buf.prepend(&taken.as_logical_slice()[written..]);
+        return Err(failure.error);
     }
 
     file_size.fetch_add(bytes, Ordering::Release);
     Ok(true)
 }
 
-/// Write with retry on EINTR.
-fn write_all_retry<W: Write>(file: &mut W, data: &[u8]) -> io::Result<()> {
+#[derive(Debug)]
+struct WriteFailure {
+    error: io::Error,
+    written: usize,
+}
+
+impl WriteFailure {
+    #[cfg(test)]
+    fn kind(&self) -> io::ErrorKind {
+        self.error.kind()
+    }
+}
+
+/// Write with retry on EINTR while retaining progress for a recoverable retry.
+fn write_all_retry<W: Write>(file: &mut W, data: &[u8]) -> Result<(), WriteFailure> {
     let mut written = 0;
     while written < data.len() {
         match file.write(&data[written..]) {
             Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write WAL bytes",
-                ));
+                return Err(WriteFailure {
+                    error: io::Error::new(io::ErrorKind::WriteZero, "failed to write WAL bytes"),
+                    written,
+                });
             }
-            Ok(n) => written += n,
+            Ok(n) if n <= data.len() - written => written += n,
+            Ok(_) => {
+                return Err(WriteFailure {
+                    error: io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "writer reported progress beyond the supplied WAL buffer",
+                    ),
+                    written,
+                });
+            }
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+            Err(error) => return Err(WriteFailure { error, written }),
         }
     }
     Ok(())
@@ -356,6 +453,10 @@ fn notify_callers_success(callers: &mut Vec<FlushCaller>, synced_position: u64) 
             FlushTarget::Test(tx) => {
                 let _ = tx.send(synced_position);
             }
+            #[cfg(test)]
+            FlushTarget::TestResult(tx) => {
+                let _ = tx.send(Ok(synced_position));
+            }
         }
     }
 }
@@ -384,16 +485,56 @@ fn notify_callers_error(callers: &mut Vec<FlushCaller>, error: &io::Error) {
             }
             #[cfg(test)]
             FlushTarget::Test(_tx) => {}
+            #[cfg(test)]
+            FlushTarget::TestResult(tx) => {
+                let _ = tx.send(Err(reason.clone()));
+            }
         }
     }
 }
 
 /// WARaft segment logs start at byte 0.
+#[cfg(test)]
 pub const WAL_HEADER_SIZE: u64 = 0;
+
+// Keep the NIF recovery allocation at or below the segment parser's persisted
+// record ceiling. Callers must page larger scans instead of one-shot allocating.
+const MAX_PREAD_BYTES: u64 = 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // File opening
 // ---------------------------------------------------------------------------
+
+fn open_rw_create_nofollow(path: &str) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).write(true).read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    ensure_regular_file(&file, "WAL write target")?;
+    Ok(file)
+}
+
+pub(crate) fn open_read_nofollow(path: &str) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    ensure_regular_file(&file, "WAL read target")?;
+    Ok(file)
+}
+
+fn ensure_regular_file(file: &File, description: &str) -> io::Result<()> {
+    if file.metadata()?.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} is not a regular file"),
+        ))
+    }
+}
 
 /// Open an append log file with platform-appropriate flags.
 pub fn open_wal_file(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, bool)> {
@@ -402,8 +543,48 @@ pub fn open_wal_file(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, b
     #[cfg(not(target_os = "linux"))]
     let (mut file, o_direct) = open_wal_file_fallback(path, pre_allocate_bytes)?;
 
-    file.seek(SeekFrom::Start(WAL_HEADER_SIZE))?;
+    file.seek(SeekFrom::End(0))?;
     Ok((file, o_direct))
+}
+
+trait RawAppendFile: SyncData + Seek {
+    fn file_len(&self) -> io::Result<u64>;
+    fn set_logical_len(&mut self, len: u64) -> io::Result<()>;
+}
+
+impl RawAppendFile for File {
+    fn file_len(&self) -> io::Result<u64> {
+        self.metadata().map(|metadata| metadata.len())
+    }
+
+    fn set_logical_len(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+fn prepare_raw_append_file<F: RawAppendFile>(file: &mut F, start_offset: u64) -> io::Result<()> {
+    let file_len = file.file_len()?;
+    if start_offset > file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "raw append start offset exceeds file length",
+        ));
+    }
+
+    if start_offset < file_len {
+        file.set_logical_len(start_offset)?;
+        file.sync_data()?;
+    }
+
+    let position = file.seek(SeekFrom::Start(start_offset))?;
+    if position != start_offset {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raw append seek returned an unexpected position",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Open a generic append log file and seek to the supplied logical end.
@@ -411,14 +592,8 @@ pub fn open_wal_file(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, b
 /// WARaft segment files are self-framed from byte 0. Segment preallocation is handled separately with
 /// KEEP_SIZE so recovery never scans zero-filled preallocated trailers.
 pub fn open_raw_append_file(path: &str, start_offset: u64) -> io::Result<(File, bool)> {
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .read(true)
-        .open(path)?;
-
-    file.seek(SeekFrom::Start(start_offset))?;
+    let mut file = open_rw_create_nofollow(path)?;
+    prepare_raw_append_file(&mut file, start_offset)?;
     Ok((file, false))
 }
 
@@ -435,19 +610,14 @@ pub fn preallocate_keep_size_path(path: &str, bytes: u64) -> io::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .read(true)
-            .open(path)?;
+        let f = open_rw_create_nofollow(path)?;
 
         let ret = unsafe {
             libc::fallocate(
                 f.as_raw_fd(),
                 libc::FALLOC_FL_KEEP_SIZE,
                 0,
-                bytes as libc::off_t,
+                checked_fallocate_len(bytes)?,
             )
         };
 
@@ -467,15 +637,17 @@ pub fn preallocate_keep_size_path(path: &str, bytes: u64) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, bool)> {
     // Keep buffered writes and rely on explicit fdatasync for durability.
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .read(true)
-        .open(path)?;
+    let f = open_rw_create_nofollow(path)?;
 
     if pre_allocate_bytes > 0 {
-        let ret = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, pre_allocate_bytes as i64) };
+        let ret = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_KEEP_SIZE,
+                0,
+                checked_fallocate_len(pre_allocate_bytes)?,
+            )
+        };
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -484,23 +656,55 @@ fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File,
     Ok((f, false))
 }
 
+#[cfg(target_os = "linux")]
+fn checked_fallocate_len(bytes: u64) -> io::Result<libc::off_t> {
+    libc::off_t::try_from(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "preallocation size unsupported",
+        )
+    })
+}
+
 #[cfg(not(target_os = "linux"))]
 fn open_wal_file_fallback(path: &str, _pre_allocate_bytes: u64) -> io::Result<(File, bool)> {
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .read(true)
-        .open(path)?;
+    let f = open_rw_create_nofollow(path)?;
     Ok((f, false)) // No O_DIRECT on macOS
 }
 
 /// Read bytes from file at offset (for recovery).
 pub fn pread_from_file(file: &mut File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    let len = validated_pread_len(file.metadata()?.len(), offset, len)?;
     file.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; len as usize];
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "pread allocation failed"))?;
+    buf.resize(len, 0);
     file.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+fn validated_pread_len(file_len: u64, offset: u64, len: u64) -> io::Result<usize> {
+    if len > MAX_PREAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pread length exceeds maximum",
+        ));
+    }
+
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pread range overflow"))?;
+
+    if end > file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "pread range exceeds file length",
+        ));
+    }
+
+    usize::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pread length unsupported"))
 }
 
 // ---------------------------------------------------------------------------

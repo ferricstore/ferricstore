@@ -82,6 +82,12 @@ defmodule FerricStore.ResourceLimits do
     Keyword.get(opts, :impl) ||
       Application.get_env(:ferricstore, __MODULE__, FerricStore.ResourceLimits.Default)
   end
+
+  @doc false
+  @spec default_implementation?() :: boolean()
+  def default_implementation? do
+    implementation() == FerricStore.ResourceLimits.Default
+  end
 end
 
 defmodule FerricStore.ResourceLimits.Default do

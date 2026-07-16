@@ -51,6 +51,18 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
            "state-machine command store must provide batch_get for plain multi-key reads"
   end
 
+  test "transaction apply stores do not expose process-global Router callbacks" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    refute source =~ "keys: fn -> Router.keys(instance_ctx) end"
+    refute source =~ "Router.dbsize(instance_ctx)"
+    refute source =~ "Router.list_op(instance_ctx, key, op)"
+    refute source =~ "prob_write: prob_write"
+
+    refute source =~
+             "sm_tx_pending_meta(key) != nil or cross_shard_ets_exists?(ctx, key)\n            sm_tx_pending_meta(key) != nil or cross_shard_ets_exists?(ctx, key)"
+  end
+
   test "state-machine compound batch metadata reads use keyed batched cold path" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
     body = function_body(source, "cross_shard_read_cold_meta_bitcask_batch")
@@ -62,23 +74,33 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
            "state-machine compound batch metadata reads must use the keyed batched cold reader"
   end
 
-  test "state-machine pop commands remove empty type markers without stale ETS counts" do
+  test "state-machine pop commands use bounded ordered indexes" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
-    # SPOP/ZPOP bypass the public command store and run as deterministic
-    # single-key Raft commands. Shared batch deletes are publish-after-append,
-    # so a prefix count after staging deletes can still see the old members.
-    # Use the already-built candidate list to decide whether the type marker
-    # should be removed, and avoid an extra ETS prefix count on the pop path.
-    assert source =~ "defp maybe_delete_empty_compound_type_key_after_pop"
+    [_before_spop, spop_and_after] = String.split(source, "defp do_spop(state", parts: 2)
+    [spop, zpop_and_after] = String.split(spop_and_after, "defp do_zpop(", parts: 2)
+
+    [zpop, _after_zpop] =
+      String.split(zpop_and_after, "defp deterministic_member_cursor", parts: 2)
+
+    assert spop =~ "CompoundMemberIndex.member_slice("
+    refute spop =~ "prefix_scan_entries("
+    refute spop =~ "Enum.sort"
+    refute spop =~ "right ++ left"
+
+    assert zpop =~ "ZSetIndex.rank_range("
+    assert zpop =~ "ensure_zpop_score_index(state, redis_key, prefix)"
+    refute zpop =~ "prefix_scan_entries("
+    refute zpop =~ "Enum.sort"
+    refute zpop =~ "Enum.reverse"
 
     assert Regex.match?(
-             ~r/maybe_delete_empty_compound_type_key_after_pop\(\s*state,\s*redis_key,\s*length\(members\),\s*length\(selected\)\s*\)/,
+             ~r/maybe_delete_empty_compound_type\(\s*state,\s*redis_key,\s*type_key,\s*:set,\s*selected_delete_keys\s*\)/,
              source
            )
 
     assert Regex.match?(
-             ~r/maybe_delete_empty_compound_type_key_after_pop\(\s*state,\s*redis_key,\s*length\(sorted\),\s*length\(selected\)\s*\)/,
+             ~r/maybe_delete_empty_compound_type\(\s*state,\s*redis_key,\s*type_key,\s*:zset,\s*selected_delete_keys\s*\)/,
              source
            )
 
@@ -87,10 +109,6 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
 
     refute source =~
              "do_compound_delete(state, redis_key, CompoundKey.zset_member(redis_key, member))"
-
-    body = function_body(source, "maybe_delete_empty_compound_type_key_after_pop")
-
-    refute body =~ "prefix_count_entries(shard_ets_state(state), prefix) == 0"
   end
 
   test "state-machine applies compact compound batch terms directly" do
@@ -130,14 +148,20 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     # The old single promoted tombstone path used v2_append_tombstone/2, which
     # fsyncs. The batched replacement must keep that ack boundary because
     # promoted files bypass the shared pending-write checkpointer.
-    assert body =~ "NIF.v2_append_ops_batch_nosync(active, ops)"
-    assert body =~ "NIF.v2_fsync(active)"
+    assert body =~ "NIF.v2_append_ops_batch(active, ops)"
+    refute body =~ "NIF.v2_append_ops_batch_nosync(active, ops)"
+    refute body =~ "NIF.v2_fsync(active)"
   end
 
   test "WARaft standalone staged apply keeps Bitcask sync boundary until unified segments exist" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
     dispatcher = function_body(source, "append_pending_batch")
-    sync_body = function_body(source, "do_append_pending_batch_sync")
+
+    sync_body =
+      source
+      |> function_body("do_append_pending_batch_sync")
+      |> String.split("\n      defp append_pending_batch_nosync", parts: 2)
+      |> hd()
 
     # WARaft currently uses the standalone staged apply path. It already has a
     # durable WARaft segment log, but Bitcask is still a separate physical log,
@@ -149,8 +173,9 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
 
     assert sync_body =~ "NIF.v2_append_batch(file_path, puts)"
 
-    assert sync_body =~ "NIF.v2_append_ops_batch_nosync(file_path, ops)"
-    assert sync_body =~ "NIF.v2_fsync(file_path)"
+    assert sync_body =~ "NIF.v2_append_ops_batch(file_path, ops)"
+    refute sync_body =~ "NIF.v2_append_ops_batch_nosync(file_path, ops)"
+    refute sync_body =~ "NIF.v2_fsync(file_path)"
   end
 
   defp function_body(source, function) do

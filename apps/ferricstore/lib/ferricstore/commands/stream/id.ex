@@ -3,6 +3,9 @@ defmodule Ferricstore.Commands.Stream.ID do
 
   alias Ferricstore.CommandTime
 
+  @max_u64 18_446_744_073_709_551_615
+  @invalid_id "ERR Invalid stream ID specified as stream command argument"
+
   @type stream_id :: {integer(), integer()}
 
   @spec resolve(
@@ -17,49 +20,48 @@ defmodule Ferricstore.Commands.Stream.ID do
     now = CommandTime.now_ms()
 
     cond do
+      not valid_component?(last_ms) or not valid_component?(last_seq) -> {:error, @invalid_id}
+      not valid_component?(now) -> {:error, @invalid_id}
       now > last_ms -> {:ok, {now, 0}}
-      now == last_ms -> {:ok, {now, last_seq + 1}}
+      now == last_ms -> increment_sequence(now, last_seq)
       # HLC physical behind last_ms: keep last_ms with incremented seq.
-      true -> {:ok, {last_ms, last_seq + 1}}
+      true -> increment_sequence(last_ms, last_seq)
     end
   end
 
   def resolve({:explicit, ms, seq}, last_ms, last_seq) do
-    case compare({ms, seq}, {last_ms, last_seq}) do
-      :gt ->
-        {:ok, {ms, seq}}
+    if valid_component?(ms) and valid_component?(seq) and valid_component?(last_ms) and
+         valid_component?(last_seq) do
+      case compare({ms, seq}, {last_ms, last_seq}) do
+        :gt ->
+          {:ok, {ms, seq}}
 
-      _ ->
-        {:error,
-         "ERR The ID specified in XADD is equal or smaller than the " <>
-           "target stream top item"}
+        _ ->
+          smaller_id_error()
+      end
+    else
+      {:error, @invalid_id}
     end
   end
 
   def resolve({:partial, ms}, last_ms, last_seq) do
-    # Partial ID: only ms given, seq auto-assigned.
-    cond do
-      ms > last_ms ->
-        {:ok, {ms, 0}}
-
-      ms == last_ms ->
-        {:ok, {ms, last_seq + 1}}
-
-      true ->
-        {:error,
-         "ERR The ID specified in XADD is equal or smaller than the " <>
-           "target stream top item"}
+    if valid_component?(ms) and valid_component?(last_ms) and valid_component?(last_seq) do
+      # Partial ID: only ms given, seq auto-assigned.
+      cond do
+        ms > last_ms -> {:ok, {ms, 0}}
+        ms == last_ms -> increment_sequence(ms, last_seq)
+        true -> smaller_id_error()
+      end
+    else
+      {:error, @invalid_id}
     end
   end
 
   @spec parse_id!(binary()) :: stream_id()
   def parse_id!(id_str) do
-    case String.split(id_str, "-", parts: 2) do
-      [ms_str, seq_str] ->
-        {String.to_integer(ms_str), String.to_integer(seq_str)}
-
-      [ms_str] ->
-        {String.to_integer(ms_str), 0}
+    case parse_full_id(id_str) do
+      {:ok, id} -> id
+      {:error, message} -> raise ArgumentError, message
     end
   end
 
@@ -68,14 +70,17 @@ defmodule Ferricstore.Commands.Stream.ID do
     case String.split(id_str, "-", parts: 2) do
       [ms_str, seq_str] ->
         case {Integer.parse(ms_str), Integer.parse(seq_str)} do
-          {{ms, ""}, {seq, ""}} -> {:ok, {ms, seq}}
-          _ -> {:error, "ERR Invalid stream ID specified as stream command argument"}
+          {{ms, ""}, {seq, ""}} when ms in 0..@max_u64 and seq in 0..@max_u64 ->
+            {:ok, {ms, seq}}
+
+          _ ->
+            {:error, @invalid_id}
         end
 
       [ms_str] ->
         case Integer.parse(ms_str) do
-          {ms, ""} -> {:ok, {ms, 0}}
-          _ -> {:error, "ERR Invalid stream ID specified as stream command argument"}
+          {ms, ""} when ms in 0..@max_u64 -> {:ok, {ms, 0}}
+          _ -> {:error, @invalid_id}
         end
     end
   end
@@ -90,7 +95,12 @@ defmodule Ferricstore.Commands.Stream.ID do
           {:ok, :min | :max | stream_id()} | {:error, binary()}
   def normalize_ast_range_id(:min, _default), do: {:ok, :min}
   def normalize_ast_range_id(:max, _default), do: {:ok, :max}
-  def normalize_ast_range_id({_ms, _seq} = id, _default), do: {:ok, id}
+
+  def normalize_ast_range_id({ms, seq} = id, _default)
+      when ms in 0..@max_u64 and seq in 0..@max_u64,
+      do: {:ok, id}
+
+  def normalize_ast_range_id({_ms, _seq}, _default), do: {:error, @invalid_id}
 
   def normalize_ast_range_id(id_str, default) when is_binary(id_str),
     do: parse_range_id(id_str, default)
@@ -122,4 +132,15 @@ defmodule Ferricstore.Commands.Stream.ID do
       true -> :eq
     end
   end
+
+  defp increment_sequence(ms, seq) when seq < @max_u64, do: {:ok, {ms, seq + 1}}
+  defp increment_sequence(_ms, _seq), do: smaller_id_error()
+
+  defp smaller_id_error do
+    {:error,
+     "ERR The ID specified in XADD is equal or smaller than the " <>
+       "target stream top item"}
+  end
+
+  defp valid_component?(value), do: is_integer(value) and value >= 0 and value <= @max_u64
 end

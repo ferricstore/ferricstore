@@ -78,6 +78,12 @@ defmodule Ferricstore.Store.Shard do
   # How often (ms) to flush the pending write queue to disk.
   # 1ms gives up to 50k batched writes/s per shard (4 shards → 200k/s total).
   @flush_interval_ms 1
+  @default_standalone_fsync_max_ops 1024
+  @default_standalone_commit_max_queued_ops 65_536
+  @default_standalone_commit_max_queued_bytes 64 * 1024 * 1024
+  @default_shard_get_many_max_concurrency 4
+  @default_shard_get_many_max_queued 64
+  @default_promoted_compaction_retry_ms 30_000
   @cold_read_timeout_ms 10_000
   @cold_read_compaction_retry_attempts 8
   @cold_read_compaction_retry_delay_ms 1
@@ -137,6 +143,22 @@ defmodule Ferricstore.Store.Shard do
     pending_reads: %{},
     # Monotonically increasing counter for async read/write correlation IDs.
     next_correlation_id: 0,
+    get_many_workers: %{},
+    get_many_waiting: {[], []},
+    get_many_waiting_count: 0,
+    get_many_max_concurrency: 4,
+    get_many_max_queued: 64,
+    get_many_pread_batch: nil,
+    get_many_waraft_batch: nil,
+    compaction_worker: nil,
+    compaction_copy_fun: nil,
+    compound_promotion_worker: nil,
+    compound_promotion_pending: %{},
+    compound_promotion_waiters: %{},
+    promoted_compaction_worker: nil,
+    promoted_compaction_pending: MapSet.new(),
+    promoted_compaction_retry_ms: 30_000,
+    promoted_compaction_retry_timers: %{},
     # Whether this shard has quorum-write infrastructure.
     # Application-supervised shards always have WARaft. Isolated test
     # shards with ad-hoc indices use the direct write path instead.
@@ -146,18 +168,34 @@ defmodule Ferricstore.Store.Shard do
     max_active_file_size: 8 * 1024 * 1024 * 1024,
     writes_paused: false,
     compound_member_index: nil,
+    logical_key_index: nil,
+    logical_key_slots: nil,
     zset_score_index: nil,
     zset_score_lookup: nil,
     flow_index: nil,
     flow_lookup: nil,
     zset_index_ready: MapSet.new(),
-    standalone_batch: [],
+    standalone_batch: {[], []},
+    standalone_batch_count: 0,
+    standalone_batch_bytes: 0,
+    standalone_batch_keys: MapSet.new(),
     standalone_batch_timer: nil,
+    standalone_commit_delay_ms: 1,
+    standalone_commit_max_ops: 1024,
+    standalone_commit_max_queued_ops: 65_536,
+    standalone_commit_max_queued_bytes: 64 * 1024 * 1024,
     standalone_flush_ref: nil,
     standalone_flush_entries: [],
+    standalone_flush_bytes: 0,
     standalone_inflight_keys: MapSet.new(),
-    standalone_waiting: [],
-    standalone_write_barrier: false
+    standalone_waiting: {[], []},
+    standalone_waiting_count: 0,
+    standalone_waiting_bytes: 0,
+    standalone_waiting_keys: MapSet.new(),
+    standalone_write_barrier: false,
+    cross_shard_locks: %{},
+    cross_shard_lock_expiries: {0, nil},
+    cross_shard_intents: %{}
   ]
 
   # -------------------------------------------------------------------
@@ -172,6 +210,12 @@ defmodule Ferricstore.Store.Shard do
     * `:index` (required) -- zero-based shard index
     * `:data_dir` (required) -- base directory for Bitcask data files
     * `:flush_interval_ms` -- batch-commit interval in ms (default: #{@flush_interval_ms})
+    * `:standalone_fsync_max_ops` -- maximum operations in one standalone fsync
+    * `:standalone_commit_max_queued_ops` -- maximum queued standalone commits
+    * `:standalone_commit_max_queued_bytes` -- maximum encoded bytes retained by
+      queued and in-flight standalone commits
+    * `:shard_get_many_max_concurrency` -- maximum concurrent batch-read workers per shard
+    * `:shard_get_many_max_queued` -- maximum queued batch reads per shard
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do

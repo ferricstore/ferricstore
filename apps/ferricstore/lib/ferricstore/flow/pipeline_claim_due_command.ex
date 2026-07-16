@@ -1,6 +1,7 @@
 defmodule Ferricstore.Flow.PipelineClaimDueCommand do
   @moduledoc false
 
+  alias Ferricstore.Flow.ClaimFilter
   alias Ferricstore.Store.Router
 
   import Ferricstore.Flow.Options,
@@ -14,6 +15,7 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
   @default_lease_ms 30_000
   @default_limit 1
   @default_max_claim_limit 1_000
+  @max_exact_ms 9_007_199_254_740_991
   @max_priority 2
 
   def command({:claim_due, type, opts}, callbacks) when is_binary(type) and is_list(opts) do
@@ -25,6 +27,7 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
          {:ok, limit} <- optional_claim_limit(opts),
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, now} <- callbacks.optional_now_ms.(opts),
+         :ok <- validate_deadline(now, lease_ms, :lease_ms),
          {:ok, return_mode} <- optional_claim_return(opts),
          {:ok, payload_return} <- callbacks.payload_return_opts.(opts, return_mode == :records),
          {:ok, named_values} <- callbacks.named_value_return_opts.(opts),
@@ -130,6 +133,9 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
       Keyword.has_key?(opts, :return) and not Keyword.get(allowed, :return, false) ->
         {:error, "ERR flow return option is not supported"}
 
+      Keyword.has_key?(opts, :block_ms) ->
+        {:error, "ERR flow block_ms is not supported in pipelines"}
+
       true ->
         :ok
     end
@@ -174,21 +180,46 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
 
   defp optional_pos_integer(opts, key, default) do
     case Keyword.get(opts, key, default) do
-      value when is_integer(value) and value > 0 -> {:ok, value}
+      value when is_integer(value) and value > 0 and value <= @max_exact_ms ->
+        {:ok, value}
+
+      value when is_integer(value) and value > @max_exact_ms ->
+        {:error, "ERR flow #{key} exceeds maximum #{@max_exact_ms}"}
+
       _ -> {:error, "ERR flow #{key} must be a positive integer"}
     end
   end
 
+  defp validate_deadline(nil, _duration_ms, _key), do: :ok
+
+  defp validate_deadline(now_ms, duration_ms, _key)
+       when now_ms <= @max_exact_ms - duration_ms,
+       do: :ok
+
+  defp validate_deadline(_now_ms, _duration_ms, key),
+    do: {:error, "ERR flow #{key} deadline exceeds maximum #{@max_exact_ms}"}
+
   defp validate_claim_due_keys(type, state, nil, partition_key) do
-    validate_claim_due_key_lengths(type, state, nil, partition_key, Router.max_key_size())
+    with :ok <- ClaimFilter.validate_footprint(state, partition_key) do
+      validate_claim_due_key_lengths(type, state, nil, partition_key, Router.max_key_size())
+    end
   end
 
   defp validate_claim_due_keys(type, state, priority, partition_key) do
-    validate_claim_due_key_lengths(type, state, priority, partition_key, Router.max_key_size())
+    with :ok <- ClaimFilter.validate_footprint(state, partition_key) do
+      validate_claim_due_key_lengths(type, state, priority, partition_key, Router.max_key_size())
+    end
   end
 
-  defp validate_claim_due_key_lengths(type, :any, _priority, _partition_key, max_key_size) do
-    validate_generated_key_size(due_any_key_size(type, max_key_priority_len()), max_key_size)
+  defp validate_claim_due_key_lengths(type, :any, priority, partition_filter, max_key_size) do
+    validate_generated_key_size(
+      due_any_key_size(
+        type,
+        priority_key_size(priority),
+        max_claim_partition_tag_size(partition_filter)
+      ),
+      max_key_size
+    )
   end
 
   defp validate_claim_due_key_lengths(type, states, priority, partition_keys, max_key_size)
@@ -237,10 +268,15 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
   end
 
   defp due_key_size(type, state_size, priority_size, tag_size),
-    do: 2 + tag_size + 3 + byte_size(type) + 1 + state_size + 2 + priority_size
+    do:
+      2 + tag_size + 3 + encoded_index_component_size(byte_size(type)) + 1 +
+        encoded_index_component_size(state_size) + 2 + priority_size
 
-  defp due_any_key_size(type, priority_size),
-    do: 2 + partition_tag_size(nil) + 4 + byte_size(type) + 2 + priority_size
+  defp due_any_key_size(type, priority_size, tag_size),
+    do: 2 + tag_size + 4 + encoded_index_component_size(byte_size(type)) + 2 + priority_size
+
+  defp encoded_index_component_size(size) when is_integer(size) and size >= 0,
+    do: div(size * 4 + 2, 3)
 
   defp priority_key_size(nil), do: max_key_priority_len()
   defp priority_key_size(priority), do: integer_decimal_size(priority)
@@ -263,6 +299,11 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
       max(max_size, partition_tag_size(partition_key))
     end)
   end
+
+  defp max_claim_partition_tag_size(partition_keys) when is_list(partition_keys),
+    do: max_partition_tag_size(partition_keys)
+
+  defp max_claim_partition_tag_size(partition_key), do: partition_tag_size(partition_key)
 
   defp partition_tag_size(nil), do: 3
   defp partition_tag_size(:any), do: 3

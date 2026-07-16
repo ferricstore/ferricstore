@@ -9,7 +9,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
   def reserve_pending(projector, count) when is_atom(projector) do
     case PendingRegistry.lookup(projector) do
       {:ok, counter, max_pending} -> reserve_pending_counter(counter, count, max_pending)
-      :error -> :ok
+      :error -> {:error, :not_registered}
     end
   end
 
@@ -35,6 +35,17 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
   def release_pending(_state, count) when count <= 0, do: :ok
 
   def release_pending(%{pending_counter: counter}, count) do
+    release_pending_counter(counter, count)
+  end
+
+  def release_pending(projector, count) when is_atom(projector) do
+    case PendingRegistry.lookup(projector) do
+      {:ok, counter, _max_pending} -> release_pending_counter(counter, count)
+      :error -> {:error, :not_registered}
+    end
+  end
+
+  defp release_pending_counter(counter, count) do
     pending_entries = :atomics.add_get(counter, 1, -count)
 
     if pending_entries < 0 do
@@ -52,101 +63,22 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
 
   def unregister_pending_counter(projector), do: PendingRegistry.unregister(projector)
 
-  def reserve_replay_range(projector, entries) do
-    case entry_index_range(entries) do
-      nil ->
-        :ok
-
-      {min_index, max_index} ->
-        table = PendingRegistry.replay_table()
-
-        case :ets.lookup(table, projector) do
-          [{^projector, old_min, old_max, flushed_index}] ->
-            :ets.insert(
-              table,
-              {projector, min(old_min, min_index), max(old_max, max_index), flushed_index}
-            )
-
-          _missing ->
-            :ets.insert(table, {projector, min_index, max_index, 0})
-        end
-
-        :ok
-    end
-  rescue
-    _ -> :ok
-  end
-
-  def mark_replay_range_flushed(_projector, nil), do: :ok
-
-  def mark_replay_range_flushed(projector, index) when is_integer(index) and index >= 0 do
-    table = PendingRegistry.replay_table()
-
-    case :ets.lookup(table, projector) do
-      [{^projector, min_index, max_index, flushed_index}] ->
-        :ets.insert(table, {projector, min_index, max_index, max(flushed_index, index)})
-
-      _missing ->
-        :ok
-    end
-
-    :ok
-  rescue
-    _ -> :ok
-  end
-
-  def trim_replay_reservation(_projector, nil), do: :ok
-
-  def trim_replay_reservation(projector, index) when is_integer(index) and index >= 0 do
-    table = PendingRegistry.replay_table()
-
-    case :ets.lookup(table, projector) do
-      [{^projector, _min_index, max_index, _flushed_index}] when index >= max_index ->
-        :ets.delete(table, projector)
-
-      [{^projector, min_index, max_index, flushed_index}] when index >= min_index ->
-        :ets.insert(table, {projector, index + 1, max_index, flushed_index})
-
-      _other ->
-        :ok
-    end
-
-    :ok
-  rescue
-    _ -> :ok
-  end
-
-  def replay_reservation_flushed_index(projector) do
-    table = PendingRegistry.replay_table()
-
-    case :ets.lookup(table, projector) do
-      [{^projector, _min_index, _max_index, flushed_index}] when is_integer(flushed_index) ->
-        flushed_index
-
-      _missing ->
-        0
-    end
-  rescue
-    _ -> 0
-  end
+  defdelegate reserve_replay_range(projector, entries), to: PendingRegistry
+  defdelegate mark_replay_range_flushed(projector, index), to: PendingRegistry
+  defdelegate trim_replay_reservation(projector, index), to: PendingRegistry
+  defdelegate replay_reservation_flushed_index(projector), to: PendingRegistry
 
   def append_overflow(projector, entries),
     do: PendingRegistry.append_overflow(projector, entries)
 
-  def take_overflow(projector), do: PendingRegistry.take_overflow(projector)
+  def commit_overflow(projector, sequence),
+    do: PendingRegistry.commit_overflow(projector, sequence)
 
-  def entry_index_range(entries) do
-    Enum.reduce(entries, nil, fn entry, acc ->
-      case Map.get(entry, :ra_index) do
-        index when is_integer(index) and index >= 0 ->
-          case acc do
-            nil -> {index, index}
-            {min_index, max_index} -> {min(min_index, index), max(max_index, index)}
-          end
+  def delete_overflow(projector, sequence),
+    do: PendingRegistry.delete_overflow(projector, sequence)
 
-        _other ->
-          acc
-      end
-    end)
-  end
+  def take_overflow(projector, max_entries),
+    do: PendingRegistry.take_overflow(projector, max_entries)
+
+  def discard(projector), do: PendingRegistry.discard(projector)
 end

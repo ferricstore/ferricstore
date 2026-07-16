@@ -640,7 +640,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionWritesDed
                  Ferricstore.Flow.LMDB.decode_history_index_location(lmdb_value)
       end
 
-      test "recover with zero hot history trusts existing LMDB projection when projected marker is missing" do
+      test "recover with zero hot history rejects a directory at the history log path" do
         unique = System.unique_integer([:positive])
         instance_name = :"history_projector_missing_marker_recover_#{unique}"
 
@@ -699,8 +699,8 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionWritesDed
         :ets.delete_all_objects(keydir)
         :atomics.put(ctx.flow_history_projected_index, 1, 0)
 
-        assert HistoryProjector.__skip_history_log_recover_for_test__(dir, 0)
-        assert :ok = HistoryProjector.recover(ctx, 0, dir, keydir)
+        refute HistoryProjector.__skip_history_log_recover_for_test__(dir, 0)
+        assert {:error, _reason} = HistoryProjector.recover(ctx, 0, dir, keydir)
         assert OrderedIndex.count_all(flow_lookup, history_key) == 0
 
         lmdb_key = Ferricstore.Flow.LMDB.history_index_key(history_key, event_id, 3_002)
@@ -744,7 +744,7 @@ defmodule Ferricstore.Flow.HistoryProjectorTest.Sections.SyncProjectionWritesDed
         history_key = Ferricstore.Flow.Keys.history_key(id)
         event_id = "1000-1"
         history_entry_key = Ferricstore.Flow.Keys.stream_entry_key(id, event_id, nil)
-        value_key = "f:{flow-lmdb-value}:v:p:#{id}:1"
+        value_key = Ferricstore.Flow.Keys.value_key(id, :payload, 1)
         source_value = Ferricstore.Flow.encode_value("source-payload")
 
         assert {:ok, [{value_offset, value_size}]} =

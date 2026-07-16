@@ -101,6 +101,55 @@ defmodule Ferricstore.ProductionDefaultsTest do
     end
   end
 
+  @tag :native_runtime_limits
+  test "native safety limits have matching config and release environment names" do
+    config_exs = File.read!(Path.join(@repo_root, "config/config.exs"))
+    runtime_exs = File.read!(Path.join(@repo_root, "config/runtime.exs"))
+
+    for key <- [
+          "native_unauthenticated_max_frame_bytes",
+          "native_frame_assembly_timeout_ms",
+          "native_send_timeout_ms",
+          "native_max_value_items",
+          "native_max_value_depth",
+          "native_max_pipeline_commands",
+          "native_max_pending_chunk_bytes",
+          "native_max_response_bytes",
+          "native_response_coalesce_max",
+          "native_response_coalesce_bytes",
+          "native_request_compression_enabled"
+        ] do
+      assert config_exs =~ "#{key}:"
+    end
+
+    for env_name <- [
+          "FERRICSTORE_NATIVE_UNAUTHENTICATED_MAX_FRAME_BYTES",
+          "FERRICSTORE_NATIVE_FRAME_ASSEMBLY_TIMEOUT_MS",
+          "FERRICSTORE_NATIVE_SEND_TIMEOUT_MS",
+          "FERRICSTORE_NATIVE_MAX_VALUE_ITEMS",
+          "FERRICSTORE_NATIVE_MAX_VALUE_DEPTH",
+          "FERRICSTORE_NATIVE_MAX_PIPELINE_COMMANDS",
+          "FERRICSTORE_NATIVE_MAX_PENDING_CHUNK_BYTES",
+          "FERRICSTORE_NATIVE_MAX_RESPONSE_BYTES",
+          "FERRICSTORE_NATIVE_RESPONSE_COALESCE_MAX",
+          "FERRICSTORE_NATIVE_RESPONSE_COALESCE_BYTES",
+          "FERRICSTORE_NATIVE_REQUEST_COMPRESSION_ENABLED",
+          "FERRICSTORE_NATIVE_MAX_GLOBAL_EXECUTIONS",
+          "FERRICSTORE_NATIVE_MAX_GLOBAL_LANES",
+          "FERRICSTORE_NATIVE_MAX_GLOBAL_BLOCKING_REQUESTS",
+          "FERRICSTORE_NATIVE_MAX_GLOBAL_PENDING_CHUNKS",
+          "FERRICSTORE_NATIVE_MAX_GLOBAL_PENDING_CHUNK_BYTES",
+          "FERRICSTORE_NATIVE_MAX_GLOBAL_INBOUND_BUFFER_BYTES"
+        ] do
+      assert runtime_exs =~ env_name
+    end
+
+    refute config_exs =~ "native_max_batch_commands"
+    refute runtime_exs =~ "FERRICSTORE_NATIVE_MAX_BATCH_COMMANDS"
+    refute runtime_exs =~ "FERRICSTORE_SOCKET_ACTIVE_MODE"
+    refute config_exs =~ "sendfile_threshold"
+  end
+
   test "current docs, Docker, deploy, and bench examples do not require native build flag" do
     deploy_paths =
       Path.wildcard(Path.join(@repo_root, "deploy/**/*"))

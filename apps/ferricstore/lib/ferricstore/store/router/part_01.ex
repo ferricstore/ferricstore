@@ -7,6 +7,8 @@ defmodule Ferricstore.Store.Router.Part01 do
       @shard_batch_read_max_keys 512
       @shard_batch_read_max_key_size 65_535
       @shard_batch_read_max_key_bytes 1_048_576
+      @shard_batch_read_deadline_ms 4_500
+      @shard_batch_read_call_timeout_ms 5_000
 
       alias Ferricstore.CommandTime
       alias Ferricstore.ErrorReasons
@@ -22,8 +24,11 @@ defmodule Ferricstore.Store.Router.Part01 do
       alias Ferricstore.Store.BlobValue
       alias Ferricstore.Store.CompoundCommand
       alias Ferricstore.Store.CompoundKey
+      alias Ferricstore.Store.ExpiryTracker
+      alias Ferricstore.Store.Keydir
       alias Ferricstore.Store.LFU
       alias Ferricstore.Store.ListOps
+      alias Ferricstore.Store.ReadResult
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
@@ -68,7 +73,12 @@ defmodule Ferricstore.Store.Router.Part01 do
 
       @doc false
       def safe_read_call(ctx, idx, request) do
-        {:ok, GenServer.call(resolve_shard(ctx, idx), request)}
+        safe_read_call(ctx, idx, request, 5_000)
+      end
+
+      @doc false
+      def safe_read_call(ctx, idx, request, timeout_ms) do
+        {:ok, GenServer.call(resolve_shard(ctx, idx), request, timeout_ms)}
       catch
         :exit, {:noproc, _} ->
           emit_shard_unavailable(ctx, idx, request, :noproc)
@@ -100,7 +110,14 @@ defmodule Ferricstore.Store.Router.Part01 do
            end) and
              Enum.reduce(keys, 0, fn key, total -> total + byte_size(key) end) <=
                @shard_batch_read_max_key_bytes do
-          case safe_read_call(ctx, idx, {:get_many, keys}) do
+          deadline_ms = System.monotonic_time(:millisecond) + @shard_batch_read_deadline_ms
+
+          case safe_read_call(
+                 ctx,
+                 idx,
+                 {:get_many, keys, deadline_ms},
+                 @shard_batch_read_call_timeout_ms
+               ) do
             {:ok, values} when is_list(values) and length(values) == length(keys) ->
               {:ok, values}
 
@@ -327,15 +344,9 @@ defmodule Ferricstore.Store.Router.Part01 do
       # IO/WAL/read machinery remains separate from client acknowledgement policy.
       @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
       defp raft_write(ctx, idx, key, command) do
-        with {:ok, command} <- PolicyCommand.stamp(ctx, command) do
+        with :ok <- validate_flow_owned_write_locality(ctx, idx, key, command),
+             {:ok, command} <- PolicyCommand.stamp(ctx, command) do
           cond do
-            flow_shared_ref_acquisition_command?(command) ->
-              flow_cross_shard_tx(
-                ctx,
-                [key],
-                {:flow_shared_ref_write, idx, command}
-              )
-
             durable_raft_ctx?(ctx) ->
               quorum_write(ctx, idx, command)
 
@@ -347,127 +358,31 @@ defmodule Ferricstore.Store.Router.Part01 do
         end
       end
 
-      defp flow_shared_ref_acquisition_command?({:cross_shard_tx, _shard_batches}), do: false
-
-      defp flow_shared_ref_acquisition_command?({:set, _key, _value, _expire_at_ms, opts})
+      defp validate_flow_owned_write_locality(
+             ctx,
+             idx,
+             key,
+             {:set, key, _value, _expire_at_ms, opts}
+           )
            when is_map(opts) do
         case Map.get(opts, :flow_retention_owner) do
           %{
-            id: id,
-            state_key: state_key,
-            expected_guard: expected_guard
+            state_key: state_key
           }
-          when is_binary(id) and is_binary(state_key) and is_binary(expected_guard) ->
-            true
+          when is_binary(state_key) ->
+            if extract_hash_tag(key) == extract_hash_tag(state_key) and
+                 shard_for(ctx, state_key) == idx do
+              :ok
+            else
+              {:error, "CROSSSLOT Flow-owned keys must hash to the owner shard"}
+            end
 
           _not_flow_owned ->
-            false
+            :ok
         end
       end
 
-      defp flow_shared_ref_acquisition_command?(command)
-           when is_tuple(command) and tuple_size(command) >= 2 do
-        op = elem(command, 0)
-
-        if flow_shared_ref_write_op?(op) do
-          command
-          |> elem(tuple_size(command) - 1)
-          |> flow_attrs_acquire_shared_ref?()
-        else
-          false
-        end
-      end
-
-      defp flow_shared_ref_acquisition_command?(_command), do: false
-
-      defp flow_shared_ref_write_op?(op)
-           when op in [
-                  :flow_create,
-                  :flow_create_many,
-                  :flow_create_pipeline_batch,
-                  :flow_start_and_claim_pipeline_batch,
-                  :flow_named_value_put,
-                  :flow_named_value_put_pipeline_batch,
-                  :flow_signal,
-                  :flow_signal_many,
-                  :flow_spawn_children,
-                  :flow_run_steps_many,
-                  :flow_complete,
-                  :flow_complete_many,
-                  :flow_terminal_pipeline_batch,
-                  :flow_transition,
-                  :flow_transition_many,
-                  :flow_reschedule,
-                  :flow_schedule_replace,
-                  :flow_start_and_claim,
-                  :flow_step_continue,
-                  :flow_step_continue_many,
-                  :flow_retry,
-                  :flow_retry_many,
-                  :flow_fail,
-                  :flow_fail_many,
-                  :flow_cancel,
-                  :flow_cancel_many,
-                  :flow_rewind
-                ],
-           do: true
-
-      defp flow_shared_ref_write_op?(_op), do: false
-
-      defp flow_attrs_acquire_shared_ref?(attrs) when is_map(attrs) do
-        Enum.any?(attrs, fn
-          {key, refs}
-          when key in [
-                 :payload_ref,
-                 :result_ref,
-                 :error_ref,
-                 :value_refs,
-                 "payload_ref",
-                 "result_ref",
-                 "error_ref",
-                 "value_refs"
-               ] ->
-            flow_term_has_shared_ref?(refs)
-
-          {_key, nested} when is_map(nested) or is_list(nested) ->
-            flow_attrs_acquire_shared_ref?(nested)
-
-          _other ->
-            false
-        end)
-      end
-
-      defp flow_attrs_acquire_shared_ref?(attrs) when is_list(attrs),
-        do: Enum.any?(attrs, &flow_attrs_acquire_shared_ref?/1)
-
-      defp flow_attrs_acquire_shared_ref?(_attrs), do: false
-
-      defp flow_term_has_shared_ref?(ref) when is_binary(ref) do
-        if Ferricstore.Flow.Keys.shared_value_ref?(ref) do
-          true
-        else
-          case Jason.decode(ref) do
-            {:ok, decoded} -> flow_term_has_shared_ref?(decoded)
-            {:error, _reason} -> false
-          end
-        end
-      end
-
-      defp flow_term_has_shared_ref?(refs) when is_map(refs),
-        do: Enum.any?(refs, fn {_key, value} -> flow_term_has_shared_ref?(value) end)
-
-      defp flow_term_has_shared_ref?(refs) when is_list(refs),
-        do: Enum.any?(refs, &flow_term_has_shared_ref?/1)
-
-      defp flow_term_has_shared_ref?(ref) when is_tuple(ref),
-        do: ref |> Tuple.to_list() |> Enum.any?(&flow_term_has_shared_ref?/1)
-
-      defp flow_term_has_shared_ref?(_ref), do: false
-
-      defp shard_under_disk_pressure?(ctx, idx) do
-        size = :atomics.info(ctx.disk_pressure).size
-        idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
-      end
+      defp validate_flow_owned_write_locality(_ctx, _idx, _key, _command), do: :ok
 
       defp forced_quorum_write(ctx, idx, command, origin_node) do
         do_forced_quorum_write(ctx, idx, command, origin_node)
@@ -729,9 +644,7 @@ defmodule Ferricstore.Store.Router.Part01 do
         do: :ok
 
       defp delete_local_prefix(ctx, idx, keydir, file_path, prefix) do
-        keydir
-        |> Ferricstore.Store.Shard.ETS.prefix_collect_keys(prefix)
-        |> Enum.each(fn compound_key ->
+        Ferricstore.Store.Shard.ETS.prefix_each_key(keydir, prefix, fn compound_key ->
           delete_local_key(ctx, idx, keydir, file_path, compound_key)
         end)
       end
@@ -774,6 +687,21 @@ defmodule Ferricstore.Store.Router.Part01 do
         if bytes > 0, do: :atomics.sub(ctx.keydir_binary_bytes, idx + 1, bytes)
       end
 
+      defp delete_observed_keydir_entry(
+             ctx,
+             idx,
+             keydir,
+             {key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size} = entry
+           ) do
+        if Keydir.delete_exact(keydir, entry) do
+          track_keydir_binary_delete_known(ctx, idx, key, value)
+          ExpiryTracker.adjust(ctx, idx, expire_at_ms, 0)
+          true
+        else
+          false
+        end
+      end
+
       defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
       defp offheap_size(_), do: 0
 
@@ -796,8 +724,8 @@ defmodule Ferricstore.Store.Router.Part01 do
                 :error -> value_size
               end
 
-            {:error, _reason} ->
-              nil
+            {:error, reason} ->
+              ReadResult.failure({:cold_read_failed, reason})
           end
         else
           value_size
@@ -819,11 +747,11 @@ defmodule Ferricstore.Store.Router.Part01 do
               end
 
             :not_found ->
-              nil
+              ReadResult.failure({:cold_read_failed, :missing_live_cold_entry})
 
             {:error, reason} ->
               emit_waraft_segment_read_error(ctx, idx, file_id, reason, 1)
-              nil
+              ReadResult.failure({:cold_read_failed, reason})
           end
         else
           value_size
@@ -930,7 +858,7 @@ defmodule Ferricstore.Store.Router.Part01 do
       and would need a normal `get` + `transport.send`.
       """
       @spec get_file_ref(FerricStore.Instance.t(), binary()) ::
-              {binary(), non_neg_integer(), non_neg_integer()} | nil
+              {binary(), non_neg_integer(), non_neg_integer()} | nil | ReadResult.failure()
       def get_file_ref(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
@@ -985,8 +913,11 @@ defmodule Ferricstore.Store.Router.Part01 do
                 nil
 
               :unavailable ->
-                nil
+                ReadResult.failure(:shard_unavailable)
             end
+
+          {:invalid, entry} ->
+            ReadResult.failure({:invalid_keydir_entry, entry})
 
           :expired ->
             record_keyspace_miss(ctx, key)
@@ -998,7 +929,7 @@ defmodule Ferricstore.Store.Router.Part01 do
             nil
 
           :no_table ->
-            nil
+            ReadResult.failure(:keydir_unavailable)
         end
       end
 
@@ -1016,6 +947,7 @@ defmodule Ferricstore.Store.Router.Part01 do
               | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()}
               | {:cold_value, binary()}
               | {:error, binary()}
+              | ReadResult.failure()
               | :miss
       def get_with_file_ref(ctx, key) do
         do_get_with_file_ref(ctx, key, true)

@@ -14,7 +14,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowInternalKeysUseCompactPartitionTags 
 
         assert state_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:s:flow-a$/
         assert history_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:h:flow-a$/
-        assert due_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:d:checkout:queued:p0$/
+        assert due_key =~ ~r/^f:\{f:[A-Za-z0-9_-]{43}\}:d:Y2hlY2tvdXQ:cXVldWVk:p0$/
         assert Ferricstore.Flow.Keys.state_key?(state_key)
         refute Ferricstore.Flow.Keys.state_key?(history_key)
 
@@ -290,6 +290,36 @@ defmodule Ferricstore.FlowTest.Sections.FlowInternalKeysUseCompactPartitionTags 
 
         assert transitioned.state == "ready"
         assert transitioned.payload_ref == transition_ref
+      end
+
+      @tag :flow_shared_ref_locality
+      test "managed shared value refs must share the Flow hash slot" do
+        {partition, _same_partition, other_partition} = mixed_partition_keys()
+
+        assert {:ok, %{ref: shared_ref}} =
+                 FerricStore.flow_value_put("shared", partition_key: partition)
+
+        assert {:error, "CROSSSLOT Flow shared value refs must hash to the Flow shard"} =
+                 FerricStore.flow_create(uid("cross-slot-shared-ref"),
+                   type: "shared-ref-consumer",
+                   state: "queued",
+                   partition_key: other_partition,
+                   payload_ref: shared_ref,
+                   run_at_ms: 1_000,
+                   now_ms: 1_000
+                 )
+
+        assert {:ok, local} =
+                 flow_create_and_get(uid("local-shared-ref"),
+                   type: "shared-ref-consumer",
+                   state: "queued",
+                   partition_key: partition,
+                   payload_ref: shared_ref,
+                   run_at_ms: 1_000,
+                   now_ms: 1_000
+                 )
+
+        assert local.payload_ref == shared_ref
       end
 
       test "flow_transition without value options preserves existing named value refs" do

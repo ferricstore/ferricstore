@@ -56,6 +56,26 @@ defmodule Ferricstore.FlowGovernanceLimitCleanerCorrectnessTest do
     assert Router.get(ctx, progress_key) == nil
   end
 
+  test "a non-canonical progress cursor is reset within the tick write budget", %{ctx: ctx} do
+    scope = unique_flow_id("cleaner-corrupt-progress")
+    [reservation_id] = create_expired_limit(ctx, scope, 1)
+    progress_key = Keys.governance_limit_cleanup_progress_key()
+
+    encoded =
+      :erlang.term_to_binary({:flow_governance_limit_cleanup_progress, nil}) <> <<0>>
+
+    assert :ok = Router.put(ctx, progress_key, encoded, 0)
+
+    assert %{commands: 1, deleted: 0, errors: 0} =
+             LimitStorageCleaner.run_tick(ctx, now_ms: 1_006, page_budget: 1)
+
+    assert Router.get(ctx, progress_key) == nil
+    assert reservation(ctx, scope, reservation_id) != nil
+
+    assert %{commands: 1, deleted: 1, errors: 0} =
+             LimitStorageCleaner.run_tick(ctx, now_ms: 1_006, page_budget: 1)
+  end
+
   defp create_expired_limit(ctx, scope, amount) do
     assert {:ok, _lease} =
              LimitStore.lease(ctx, scope,

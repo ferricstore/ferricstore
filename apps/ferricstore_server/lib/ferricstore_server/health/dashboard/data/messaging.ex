@@ -54,11 +54,14 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
 
     %{
       summary:
-        pubsub_summary(%{
-          snapshot
-          | channels: channels,
-            patterns: patterns
-        }),
+        pubsub_summary(
+          %{
+            snapshot
+            | channels: channels,
+              patterns: patterns
+          },
+          acl_username
+        ),
       channels: channels,
       patterns: patterns,
       activity: activity,
@@ -86,7 +89,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
     }
   end
 
-  defp pubsub_summary(snapshot) do
+  defp pubsub_summary(snapshot, nil) do
     %{
       channels: length(Map.get(snapshot, :channels, [])),
       patterns: length(Map.get(snapshot, :patterns, [])),
@@ -94,6 +97,23 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
       pattern_subscriptions: Map.get(snapshot, :pattern_subscriptions, 0),
       active_subscribers: Map.get(snapshot, :active_subscribers, 0)
     }
+  end
+
+  defp pubsub_summary(snapshot, _acl_username) do
+    channels = Map.get(snapshot, :channels, [])
+    patterns = Map.get(snapshot, :patterns, [])
+
+    %{
+      channels: length(channels),
+      patterns: length(patterns),
+      exact_subscriptions: visible_subscription_count(channels),
+      pattern_subscriptions: visible_subscription_count(patterns),
+      active_subscribers: nil
+    }
+  end
+
+  defp visible_subscription_count(rows) do
+    Enum.reduce(rows, 0, fn row, total -> total + Map.get(row, :subscribers, 0) end)
   end
 
   defp top_streams(entries) do

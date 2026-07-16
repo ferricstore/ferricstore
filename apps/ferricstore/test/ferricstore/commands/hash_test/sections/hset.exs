@@ -447,7 +447,7 @@ defmodule Ferricstore.Commands.HashTest.Sections.Hset do
               )
 
           assert source =~ "Helpers.hash_pairs_to_flat_list(pairs)"
-          assert source =~ "Helpers.hash_pairs_to_flat_list(batch)"
+          assert length(Regex.scan(~r/Helpers\.hash_pairs_to_flat_list\(/, source)) >= 4
           assert source =~ "hash_pairs_to_flat_list(selected)"
           refute source =~ "Enum.flat_map(pairs, fn {field, value} -> [field, value] end)"
           refute source =~ "Enum.flat_map(batch, fn {field, value} -> [field, value] end)"

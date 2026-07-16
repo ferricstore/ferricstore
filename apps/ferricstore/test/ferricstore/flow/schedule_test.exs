@@ -180,6 +180,92 @@ defmodule Ferricstore.Flow.ScheduleTest do
              FerricStore.flow_claim_due("__ferricstore_schedule", worker: "public-worker")
   end
 
+  test "public callers cannot forge the internal schedule capability" do
+    forged_opts = [__ferricstore_internal__: true]
+
+    refute Ferricstore.Flow.Internal.allowed?(forged_opts)
+    assert Ferricstore.Flow.Internal.allowed?(Ferricstore.Flow.Internal.put([]))
+
+    assert {:error, "ERR flow type is reserved for internal use"} =
+             FerricStore.flow_create(unique_flow_id("forged-reserved-type"),
+               type: "__ferricstore_schedule",
+               __ferricstore_internal__: true
+             )
+
+    assert {:error, "ERR flow id is reserved for internal use"} =
+             FerricStore.flow_get("__ferricstore_schedule__:forged",
+               __ferricstore_internal__: true
+             )
+
+    assert {:error, "ERR flow type is reserved for internal use"} =
+             FerricStore.flow_claim_due("__ferricstore_schedule",
+               worker: "forged-public-worker",
+               __ferricstore_internal__: true
+             )
+  end
+
+  test "schedule APIs reject non-keyword option lists without raising" do
+    schedule_id = unique_flow_id("schedule-invalid-opts")
+    invalid_opts = [:not_a_keyword_pair]
+    error = {:error, "ERR flow schedule opts must be a keyword list"}
+
+    assert ^error = FerricStore.flow_schedule_create(schedule_id, invalid_opts)
+    assert ^error = FerricStore.flow_schedule_get(schedule_id, invalid_opts)
+    assert ^error = FerricStore.flow_schedule_fire(schedule_id, invalid_opts)
+    assert ^error = FerricStore.flow_schedule_pause(schedule_id, invalid_opts)
+    assert ^error = FerricStore.flow_schedule_resume(schedule_id, invalid_opts)
+    assert ^error = FerricStore.flow_schedule_list(invalid_opts)
+    assert ^error = FerricStore.flow_schedule_delete(schedule_id, invalid_opts)
+    assert ^error = FerricStore.flow_schedule_fire_due(invalid_opts)
+  end
+
+  test "manual fire without a timestamp uses the current command time" do
+    schedule_id = unique_flow_id("schedule-manual-default-time")
+    target_prefix = unique_flow_id("schedule-manual-default-time-target")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :one_shot,
+               at_ms: 0,
+               now_ms: 0,
+               target: [
+                 id_prefix: target_prefix,
+                 type: unique_flow_id("schedule-manual-default-time-type")
+               ]
+             )
+
+    assert {:ok, %{fired: 1, target_id: target_id}} =
+             FerricStore.flow_schedule_fire(schedule_id)
+
+    assert String.starts_with?(target_id, target_prefix <> ":")
+  end
+
+  test "schedule get keeps internal routing and payload options authoritative" do
+    schedule_id = unique_flow_id("schedule-get-protected-options")
+
+    assert {:ok, created} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :one_shot,
+               at_ms: 1_000,
+               now_ms: 0,
+               target: [
+                 id: unique_flow_id("schedule-get-protected-options-target"),
+                 type: unique_flow_id("schedule-get-protected-options-type")
+               ]
+             )
+
+    assert {:ok, fetched} =
+             FerricStore.flow_schedule_get(schedule_id,
+               partition_key: "wrong-partition",
+               payload: false,
+               payload_max_bytes: 1
+             )
+
+    assert fetched.id == created.id
+    assert fetched.kind == :one_shot
+    assert fetched.target == created.target
+  end
+
   test "schedule rejects large inline target payloads" do
     assert {:error, "ERR flow schedule payload too large; use payload_ref/value_refs"} =
              FerricStore.flow_schedule_create(unique_flow_id("schedule-large-payload"),
@@ -221,6 +307,59 @@ defmodule Ferricstore.Flow.ScheduleTest do
                target: [
                  id_prefix: "__ferricstore_schedule__:target",
                  type: unique_flow_id("schedule-reserved-target-prefix-type")
+               ]
+             )
+  end
+
+  test "schedule rejects target definitions that cannot create a flow" do
+    assert {:error, "ERR flow type is reserved for internal use"} =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-reserved-target-type"),
+               kind: :one_shot,
+               target: [
+                 id: unique_flow_id("schedule-reserved-target-type-id"),
+                 type: "__ferricstore_schedule"
+               ]
+             )
+
+    assert {:error, "ERR flow priority must be between 0 and 2"} =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-invalid-target-priority"),
+               kind: :interval,
+               every_ms: 1_000,
+               target: [
+                 id_prefix: unique_flow_id("schedule-invalid-target-priority-prefix"),
+                 type: unique_flow_id("schedule-invalid-target-priority-type"),
+                 priority: "high"
+               ]
+             )
+  end
+
+  test "schedule time inputs are bounded and cron conversion never raises" do
+    max_exact_integer = 9_007_199_254_740_991
+
+    overflow_error =
+      {:error, "ERR flow schedule start_at_ms exceeds maximum #{max_exact_integer}"}
+
+    assert ^overflow_error =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-cron-time-overflow"),
+               kind: :cron,
+               cron: "* * * * *",
+               start_at_ms: max_exact_integer + 1,
+               now_ms: 0,
+               target: [
+                 id_prefix: unique_flow_id("schedule-cron-time-overflow-target"),
+                 type: unique_flow_id("schedule-cron-time-overflow-type")
+               ]
+             )
+
+    assert {:error, "ERR flow schedule timestamp is outside supported calendar range"} =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-cron-calendar-overflow"),
+               kind: :cron,
+               cron: "* * * * *",
+               start_at_ms: max_exact_integer,
+               now_ms: 0,
+               target: [
+                 id_prefix: unique_flow_id("schedule-cron-calendar-overflow-target"),
+                 type: unique_flow_id("schedule-cron-calendar-overflow-type")
                ]
              )
   end
@@ -561,6 +700,86 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert schedule.timezone == "Asia/Jerusalem"
   end
 
+  test "schedule list applies reverse ordering before count" do
+    now_ms = 3_950
+    id_prefix = unique_flow_id("schedule-list-reverse")
+
+    {earlier_id, later_id} =
+      Enum.reduce_while(0..256, %{}, fn suffix, ids_by_bucket ->
+        id = id_prefix <> ":" <> Integer.to_string(suffix)
+        bucket = :erlang.phash2(id, 256)
+
+        case Map.fetch(ids_by_bucket, bucket) do
+          {:ok, existing_id} -> {:halt, {existing_id, id}}
+          :error -> {:cont, Map.put(ids_by_bucket, bucket, id)}
+        end
+      end)
+
+    target_type = unique_flow_id("schedule-list-reverse-target-type")
+
+    for {id, at_ms} <- [{earlier_id, now_ms + 100}, {later_id, now_ms + 200}] do
+      assert {:ok, _schedule} =
+               FerricStore.flow_schedule_create(id,
+                 kind: :one_shot,
+                 at_ms: at_ms,
+                 now_ms: now_ms,
+                 target: [id_prefix: id <> ":target", type: target_type]
+               )
+    end
+
+    assert {:ok, schedules} =
+             FerricStore.flow_schedule_list(
+               kind: :one_shot,
+               target_type: target_type,
+               from_ms: now_ms,
+               to_ms: now_ms + 300,
+               count: 1,
+               rev: true
+             )
+
+    assert Enum.map(schedules, & &1.id) == [later_id]
+  end
+
+  test "schedule due ranges exclude terminal schedules without a next run" do
+    now_ms = 3_975
+    schedule_id = unique_flow_id("schedule-list-terminal-range")
+    target_type = unique_flow_id("schedule-list-terminal-range-type")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :one_shot,
+               at_ms: now_ms,
+               now_ms: now_ms,
+               target: [
+                 id: unique_flow_id("schedule-list-terminal-range-target"),
+                 type: target_type
+               ]
+             )
+
+    assert {:ok, %{fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "schedule-test")
+
+    assert {:ok, []} =
+             FerricStore.flow_schedule_list(
+               state: :all,
+               target_type: target_type,
+               from_ms: 0,
+               to_ms: now_ms + 1,
+               count: 10
+             )
+  end
+
+  test "schedule list fails closed when a partition index is unavailable" do
+    ctx = %{
+      name: :schedule_unavailable_test,
+      shard_names: {:schedule_missing_shard},
+      slot_map: List.duplicate(0, 1_024) |> List.to_tuple()
+    }
+
+    assert {:error, "ERR flow index unavailable"} =
+             Ferricstore.Flow.Schedule.list(ctx, count: 1)
+  end
+
   test "recurring schedule completes after max_fires" do
     now_ms = 4_010
     schedule_id = unique_flow_id("schedule-max-fires")
@@ -630,6 +849,37 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert completed.state == "completed"
     assert completed.fire_count == 2
     assert completed.end_reason == "end_at_ms"
+    assert completed.next_run_at_ms == nil
+  end
+
+  test "recurring schedule completes when its next timestamp exceeds the exact limit" do
+    max_exact_integer = 9_007_199_254_740_991
+    schedule_id = unique_flow_id("schedule-timestamp-limit")
+    target_prefix = unique_flow_id("schedule-timestamp-limit-target")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 2,
+               start_at_ms: max_exact_integer - 1,
+               now_ms: max_exact_integer - 1,
+               target: [
+                 id_prefix: target_prefix,
+                 type: unique_flow_id("schedule-timestamp-limit-type")
+               ]
+             )
+
+    assert {:ok, %{fired: 1, claimed: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: max_exact_integer - 1,
+               lease_ms: 1,
+               worker: "schedule-test"
+             )
+
+    assert {:ok, completed} = FerricStore.flow_schedule_get(schedule_id)
+    assert completed.state == "completed"
+    assert completed.fire_count == 1
+    assert completed.end_reason == "timestamp_limit"
     assert completed.next_run_at_ms == nil
   end
 

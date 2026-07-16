@@ -10,11 +10,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
       require Logger
 
-      alias Ferricstore.Bitcask.NIF
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
       alias Ferricstore.Raft.BlobCommand
+      alias Ferricstore.Raft.ApplyLimits
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
@@ -35,26 +35,35 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         LFU,
         ListOps,
         Promotion,
+        RateLimit,
         Router,
         ValueCodec
       }
 
-      alias Ferricstore.Store.Shard.ZSetIndex
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
+
+      @transaction_watch_max_entries 10_000
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
-      defp with_current_ra_index(%{index: ra_index}, fun) when is_integer(ra_index) do
-        previous = Process.get(:sm_current_ra_index, :undefined)
-        Process.put(:sm_current_ra_index, ra_index)
+      defp with_current_ra_index(%{index: ra_index}, fun)
+           when is_integer(ra_index) and ra_index >= 0 do
+        case Process.get(:sm_current_ra_index, :undefined) do
+          ^ra_index ->
+            fun.()
 
-        try do
-          fun.()
-        after
-          case previous do
-            :undefined -> Process.delete(:sm_current_ra_index)
-            value -> Process.put(:sm_current_ra_index, value)
-          end
+          previous ->
+            Process.put(:sm_current_ra_index, ra_index)
+
+            try do
+              fun.()
+            after
+              case previous do
+                :undefined -> Process.delete(:sm_current_ra_index)
+                value -> Process.put(:sm_current_ra_index, value)
+              end
+            end
         end
       end
 
@@ -64,55 +73,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         case Process.get(:sm_current_ra_index) do
           idx when is_integer(idx) and idx >= 0 -> idx
           _ -> nil
-        end
-      end
-
-      defp raft_apply_hook(%{instance_name: name} = state) when is_atom(name) do
-        case current_raft_apply_hook(name) do
-          {:ok, hook} -> hook
-          :error -> raft_apply_hook_from_ctx(state)
-        end
-      end
-
-      defp raft_apply_hook(%{instance_ctx: %{name: name}} = state) when is_atom(name) do
-        case current_raft_apply_hook(name) do
-          {:ok, hook} -> hook
-          :error -> raft_apply_hook_from_ctx(state)
-        end
-      end
-
-      defp raft_apply_hook(state) do
-        raft_apply_hook_from_ctx(state) || raft_apply_hook_for_instance(:default)
-      end
-
-      defp raft_apply_hook_from_ctx(%{instance_ctx: %{raft_apply_hook: fun}})
-           when is_function(fun),
-           do: fun
-
-      defp raft_apply_hook_from_ctx(_state), do: nil
-
-      defp current_raft_apply_hook(name) do
-        case FerricStore.Instance.get(name) do
-          %{raft_apply_hook: fun} when is_function(fun) -> {:ok, fun}
-          %{} -> {:ok, nil}
-          _ -> :error
-        end
-      rescue
-        _ -> :error
-      catch
-        :exit, _ -> :error
-      end
-
-      defp raft_apply_hook_for_instance(name) do
-        try do
-          case FerricStore.Instance.get(name) do
-            %{raft_apply_hook: fun} when is_function(fun) -> fun
-            _ -> nil
-          end
-        rescue
-          _ -> nil
-        catch
-          :exit, _ -> nil
         end
       end
 
@@ -132,9 +92,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             started_at = System.monotonic_time()
 
             result =
-              with_flow_policy_snapshots(command_shape, attrs, fn ->
-                with_pending_writes(state, fun)
-              end)
+              with :ok <- ApplyLimits.validate_flow_batch(state, attrs),
+                   :ok <- ApplyLimits.validate_flow_time(attrs, apply_now_ms()) do
+                with_flow_policy_references(state, command_shape, attrs, fn ->
+                  with_pending_writes(state, fun)
+                end)
+              end
 
             emit_flow_apply_telemetry(
               state,
@@ -152,7 +115,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       defp apply_flow_single_with_telemetry(state, command_shape, attrs, fun) do
         item_count = flow_apply_item_count(attrs)
         started_at = System.monotonic_time()
-        result = with_flow_policy_snapshots(command_shape, attrs, fun)
+        result =
+          with :ok <- ApplyLimits.validate_flow_batch(state, attrs),
+               :ok <- ApplyLimits.validate_flow_time(attrs, apply_now_ms()) do
+            with_flow_policy_references(state, command_shape, attrs, fun)
+          end
 
         emit_flow_apply_telemetry(
           state,
@@ -165,9 +132,55 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         result
       end
 
-      defp with_flow_policy_snapshots(command_shape, attrs, fun) when is_function(fun, 0) do
+      defp apply_flow_policy_fence(state, installs, command) do
+        with :ok <- validate_flow_policy_fence(installs),
+             :ok <- install_flow_policy_fence(state, installs) do
+          apply_single(state, command)
+        end
+      end
+
+      defp validate_flow_policy_fence(installs) when is_list(installs) do
+        with :ok <-
+               installs
+               |> :erlang.external_size()
+               |> RetryPolicy.validate_flow_policy_snapshot_batch_size() do
+          installs
+          |> Enum.reduce_while({:ok, MapSet.new()}, fn
+            {key, encoded, 0}, {:ok, seen} when is_binary(key) and is_binary(encoded) ->
+              with {:ok, type} <- FlowKeys.policy_type(key),
+                   {:ok, {_generation, %{type: ^type}}} <-
+                     RetryPolicy.decode_flow_policy_entry(encoded),
+                   false <- MapSet.member?(seen, key) do
+                {:cont, {:ok, MapSet.put(seen, key)}}
+              else
+                _invalid -> {:halt, {:error, "ERR invalid flow policy fence"}}
+              end
+
+            _invalid, _acc ->
+              {:halt, {:error, "ERR invalid flow policy fence"}}
+          end)
+          |> case do
+            {:ok, _seen} -> :ok
+            {:error, _reason} = error -> error
+          end
+        end
+      end
+
+      defp install_flow_policy_fence(state, installs) do
+        Enum.reduce_while(installs, :ok, fn {key, encoded, expire_at_ms}, :ok ->
+          case do_flow_policy_put(state, key, encoded, expire_at_ms) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp with_flow_policy_references(state, command_shape, attrs, fun)
+           when is_function(fun, 0) do
         if Ferricstore.Flow.PolicyCommand.policy_sensitive_op?(command_shape) do
-          with {:ok, snapshots} <- flow_policy_snapshots(attrs),
+          with :ok <- validate_flow_policy_guards(state, attrs),
+               {:ok, refs} <- flow_policy_refs(attrs),
+               {:ok, snapshots} <- resolve_flow_policy_refs(state, refs),
                {:ok, merged} <- merge_flow_policy_snapshots(snapshots) do
             previous = Process.get(:sm_flow_policy_snapshots, :undefined)
             Process.put(:sm_flow_policy_snapshots, merged)
@@ -186,36 +199,35 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         end
       end
 
-      defp flow_policy_snapshots(attrs) do
-        with {:ok, snapshots} <- collect_flow_policy_snapshots(attrs, %{}),
+      defp flow_policy_refs(attrs) do
+        with {:ok, refs} <- collect_flow_policy_refs(attrs, %{}),
              :ok <-
-               snapshots
+               refs
                |> Map.values()
-               |> Enum.map(& &1.policy)
                |> RetryPolicy.validate_flow_policy_snapshots_size(),
-             :ok <- require_flow_policy_snapshot_marker(attrs) do
-          {:ok, snapshots}
+             :ok <- require_flow_policy_reference_marker(attrs) do
+          {:ok, refs}
         end
       end
 
-      defp require_flow_policy_snapshot_marker(attrs) when is_map(attrs) do
-        case Map.fetch(attrs, :policy_snapshot_captured) do
+      defp require_flow_policy_reference_marker(attrs) when is_map(attrs) do
+        case Map.fetch(attrs, :policy_reference_captured) do
           {:ok, true} -> :ok
-          :error -> {:error, "ERR flow policy snapshot is required"}
-          {:ok, _invalid} -> {:error, "ERR invalid flow policy snapshot"}
+          :error -> {:error, "ERR flow policy reference is required"}
+          {:ok, _invalid} -> {:error, "ERR invalid flow policy reference marker"}
         end
       end
 
-      defp require_flow_policy_snapshot_marker(_attrs),
-        do: {:error, "ERR flow policy snapshot is required"}
+      defp require_flow_policy_reference_marker(_attrs),
+        do: {:error, "ERR flow policy reference is required"}
 
-      defp collect_flow_policy_snapshots(attrs, snapshots) when is_map(attrs) do
-        with {:ok, snapshots} <- collect_flow_policy_snapshot(attrs, snapshots),
-             {:ok, snapshots} <- collect_flow_policy_snapshot_map(attrs, snapshots) do
-          Enum.reduce_while([:records, :children], {:ok, snapshots}, fn key, {:ok, acc} ->
+      defp collect_flow_policy_refs(attrs, refs) when is_map(attrs) do
+        with {:ok, refs} <- collect_flow_policy_ref(attrs, refs),
+             {:ok, refs} <- collect_flow_policy_ref_map(attrs, refs) do
+          Enum.reduce_while([:records, :children], {:ok, refs}, fn key, {:ok, acc} ->
             case Map.get(attrs, key) do
               entries when is_list(entries) ->
-                case collect_flow_policy_snapshots(entries, acc) do
+                case collect_flow_policy_refs(entries, acc) do
                   {:ok, next} -> {:cont, {:ok, next}}
                   {:error, _reason} = error -> {:halt, error}
                 end
@@ -227,76 +239,188 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         end
       end
 
-      defp collect_flow_policy_snapshot_map(attrs, snapshots) do
-        case Map.fetch(attrs, :policy_snapshots) do
+      defp collect_flow_policy_ref_map(attrs, refs) do
+        case Map.fetch(attrs, :policy_refs) do
           :error ->
-            {:ok, snapshots}
+            {:ok, refs}
 
           {:ok, entries} when is_map(entries) ->
-            Enum.reduce_while(entries, {:ok, snapshots}, fn
-              {type, %{generation: generation, policy: policy}}, {:ok, acc}
+            Enum.reduce_while(entries, {:ok, refs}, fn
+              {type, %{type: type, generation: generation, digest: digest} = policy_ref},
+              {:ok, acc}
               when is_binary(type) and type != "" ->
-                snapshot_attrs = %{
-                  type: type,
-                  policy_generation: generation,
-                  policy_snapshot: policy
-                }
+                ref_attrs = %{type: type, policy_ref: policy_ref}
 
-                case collect_flow_policy_snapshot(snapshot_attrs, acc) do
+                case collect_flow_policy_ref(ref_attrs, acc) do
                   {:ok, next} -> {:cont, {:ok, next}}
                   {:error, _reason} = error -> {:halt, error}
                 end
 
               _invalid, _acc ->
-                {:halt, {:error, "ERR invalid flow policy snapshot"}}
+                {:halt, {:error, "ERR invalid flow policy reference"}}
             end)
 
           {:ok, _invalid} ->
-            {:error, "ERR invalid flow policy snapshot"}
+            {:error, "ERR invalid flow policy reference"}
         end
       end
 
-      defp collect_flow_policy_snapshots(entries, snapshots) when is_list(entries) do
-        Enum.reduce_while(entries, {:ok, snapshots}, fn entry, {:ok, acc} ->
-          case collect_flow_policy_snapshots(entry, acc) do
+      defp collect_flow_policy_refs(entries, refs) when is_list(entries) do
+        Enum.reduce_while(entries, {:ok, refs}, fn entry, {:ok, acc} ->
+          case collect_flow_policy_refs(entry, acc) do
             {:ok, next} -> {:cont, {:ok, next}}
             {:error, _reason} = error -> {:halt, error}
           end
         end)
       end
 
-      defp collect_flow_policy_snapshots(_other, snapshots), do: {:ok, snapshots}
+      defp collect_flow_policy_refs(_other, refs), do: {:ok, refs}
 
-      defp collect_flow_policy_snapshot(attrs, snapshots) do
-        case {Map.fetch(attrs, :policy_generation), Map.fetch(attrs, :policy_snapshot)} do
-          {:error, :error} ->
-            {:ok, snapshots}
+      defp collect_flow_policy_ref(attrs, refs) do
+        case Map.fetch(attrs, :policy_ref) do
+          :error ->
+            {:ok, refs}
 
-          {{:ok, generation}, {:ok, %{type: type} = policy}}
-          when is_integer(generation) and generation >= 0 and is_binary(type) and type != "" ->
+          {:ok, %{type: type, generation: generation, digest: digest} = policy_ref}
+          when is_integer(generation) and generation >= 0 and is_binary(type) and type != "" and
+                 is_binary(digest) and byte_size(digest) == 32 ->
             if generation <= RetryPolicy.max_policy_generation() and
-                 flow_policy_snapshot_matches_attrs?(attrs, type) do
-              snapshot = %{generation: generation, policy: policy}
-
-              case Map.fetch(snapshots, type) do
-                :error -> {:ok, Map.put(snapshots, type, snapshot)}
-                {:ok, ^snapshot} -> {:ok, snapshots}
-                {:ok, _conflict} -> {:error, "ERR conflicting flow policy snapshots"}
+                 flow_policy_ref_matches_attrs?(attrs, type) do
+              case Map.fetch(refs, type) do
+                :error -> {:ok, Map.put(refs, type, policy_ref)}
+                {:ok, ^policy_ref} -> {:ok, refs}
+                {:ok, _conflict} -> {:error, "ERR conflicting flow policy references"}
               end
             else
-              {:error, "ERR invalid flow policy snapshot"}
+              {:error, "ERR invalid flow policy reference"}
             end
 
           _invalid ->
-            {:error, "ERR invalid flow policy snapshot"}
+            {:error, "ERR invalid flow policy reference"}
         end
       end
 
-      defp flow_policy_snapshot_matches_attrs?(%{type: attrs_type}, snapshot_type)
+      defp flow_policy_ref_matches_attrs?(%{type: attrs_type}, ref_type)
            when is_binary(attrs_type) and attrs_type != "",
-           do: attrs_type == snapshot_type
+           do: attrs_type == ref_type
 
-      defp flow_policy_snapshot_matches_attrs?(_attrs, _snapshot_type), do: true
+      defp flow_policy_ref_matches_attrs?(_attrs, _ref_type), do: true
+
+      defp resolve_flow_policy_refs(state, refs) do
+        refs
+        |> Enum.reduce_while({:ok, %{}}, fn {type, policy_ref}, {:ok, snapshots} ->
+          case resolve_flow_policy_ref(state, type, policy_ref) do
+            {:ok, snapshot} -> {:cont, {:ok, Map.put(snapshots, type, snapshot)}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, snapshots} ->
+            with :ok <-
+                   snapshots
+                   |> Map.values()
+                   |> Enum.map(& &1.policy)
+                   |> RetryPolicy.validate_flow_policy_snapshots_size() do
+              {:ok, snapshots}
+            end
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp resolve_flow_policy_ref(
+             state,
+             type,
+             %{generation: expected_generation, digest: expected_digest}
+           ) do
+        value = do_get(state, FlowKeys.policy_key(type))
+
+        case decode_replicated_flow_policy(type, value) do
+          {:ok, {local_generation, policy, encoded}} ->
+            cond do
+              local_generation < expected_generation ->
+                {:error, "ERR flow policy generation is not applied"}
+
+              local_generation > expected_generation ->
+                {:error, "ERR stale flow policy generation"}
+
+              not :crypto.hash_equals(:crypto.hash(:sha256, encoded), expected_digest) ->
+                {:error, "ERR conflicting flow policy generation"}
+
+              true ->
+                {:ok, %{generation: local_generation, policy: policy}}
+            end
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp decode_replicated_flow_policy(type, nil) do
+        policy = %{type: type}
+        {:ok, {0, policy, RetryPolicy.encode_flow_policy(policy, 0)}}
+      end
+
+      defp decode_replicated_flow_policy(type, encoded) when is_binary(encoded) do
+        case RetryPolicy.decode_flow_policy_entry(encoded) do
+          {:ok, {generation, %{type: ^type} = policy}} ->
+            {:ok, {generation, policy, encoded}}
+
+          _invalid ->
+            {:error, "ERR replicated flow policy is corrupt"}
+        end
+      end
+
+      defp decode_replicated_flow_policy(_type, _invalid),
+        do: {:error, "ERR replicated flow policy is corrupt"}
+
+      defp validate_flow_policy_guards(state, attrs) when is_map(attrs) do
+        with :ok <- validate_flow_policy_guard(state, Map.get(attrs, :policy_guard)) do
+          Enum.reduce_while([:records, :children], :ok, fn key, :ok ->
+            case Map.get(attrs, key) do
+              entries when is_list(entries) ->
+                case validate_flow_policy_guards(state, entries) do
+                  :ok -> {:cont, :ok}
+                  {:error, _reason} = error -> {:halt, error}
+                end
+
+              _other ->
+                {:cont, :ok}
+            end
+          end)
+        end
+      end
+
+      defp validate_flow_policy_guards(state, entries) when is_list(entries) do
+        Enum.reduce_while(entries, :ok, fn entry, :ok ->
+          case validate_flow_policy_guards(state, entry) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp validate_flow_policy_guards(_state, _other), do: :ok
+
+      defp validate_flow_policy_guard(_state, nil), do: :ok
+
+      defp validate_flow_policy_guard(
+             state,
+             %{state_key: state_key, type: expected_type, incarnation: expected_incarnation}
+           )
+           when is_binary(state_key) and is_binary(expected_type) and expected_type != "" and
+                  is_integer(expected_incarnation) and expected_incarnation >= 0 do
+        target_state = cross_shard_state_for_key(state, state_key)
+
+        case flow_read_record_by_key(target_state, state_key) do
+          %{type: ^expected_type, incarnation: ^expected_incarnation} -> :ok
+          _missing_or_recreated -> {:error, "ERR stale flow policy target"}
+        end
+      end
+
+      defp validate_flow_policy_guard(_state, _invalid),
+        do: {:error, "ERR invalid flow policy target"}
 
       defp merge_flow_policy_snapshots(snapshots) do
         current = Process.get(:sm_flow_policy_snapshots, %{})
@@ -620,16 +744,229 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         do: true
 
       defp transaction_watches_clean?(watched_keys, state) when is_map(watched_keys) do
-        ctx = state.instance_ctx || FerricStore.Instance.get(:default)
-
-        Enum.all?(watched_keys, fn {key, saved_token} ->
-          try do
-            Router.watch_token(ctx, key) == saved_token
-          rescue
-            _ -> false
-          catch
-            :exit, _ -> false
+        watched_keys
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.reduce_while(@transaction_watch_max_entries, fn {key, saved_token}, remaining ->
+          if match?({:error, _reason}, saved_token) do
+            {:halt, false}
+          else
+            case transaction_watch_token_with_budget(state, key, remaining) do
+              {:ok, ^saved_token, cost} -> {:cont, remaining - cost}
+              _changed_or_unavailable -> {:halt, false}
+            end
           end
+        end)
+        |> is_integer()
+      end
+
+      defp transaction_watch_token(state, key) when is_binary(key) do
+        case transaction_watch_token_with_budget(state, key, @transaction_watch_max_entries) do
+          {:ok, token, _cost} -> token
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp transaction_watch_token_with_budget(state, key, remaining)
+           when is_binary(key) and is_integer(remaining) and remaining >= 0 do
+        case :ets.lookup(state.ets, key) do
+          [] ->
+            transaction_compound_watch_token(state, key, remaining)
+
+          entry ->
+            case transaction_storage_watch_token(state, key, entry) do
+              {:error, _reason} = error -> error
+              token -> {:ok, token, 0}
+            end
+        end
+      rescue
+        ArgumentError -> {:error, :watch_state_unavailable}
+      end
+
+      defp transaction_watch_tokens(state, keys) when is_list(keys) do
+        Enum.reduce_while(keys, {:ok, %{}, @transaction_watch_max_entries}, fn
+          key, {:ok, tokens, remaining} when is_binary(key) ->
+            case transaction_watch_token_with_budget(state, key, remaining) do
+              {:error, _reason} = error -> {:halt, error}
+              {:ok, token, cost} -> {:cont, {:ok, Map.put(tokens, key, token), remaining - cost}}
+            end
+
+          _invalid_key, _acc ->
+            {:halt, {:error, :invalid_watch_key}}
+        end)
+        |> case do
+          {:ok, tokens, _remaining} -> tokens
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp transaction_compound_watch_token(state, key, remaining) do
+        {metadata_keys, prefixes} = transaction_compound_watch_layout(state, key)
+
+        case transaction_compound_watch_keys(state, metadata_keys, prefixes, remaining) do
+          {:error, _reason} = error ->
+            error
+
+          keys ->
+            case transaction_compound_watch_entries(state, key, keys) do
+              {:error, _reason} = error -> error
+              token -> {:ok, token, length(keys)}
+            end
+        end
+      end
+
+      defp transaction_compound_watch_keys(state, metadata_keys, prefixes, max_entries) do
+        initial = MapSet.new(metadata_keys)
+
+        if MapSet.size(initial) > max_entries do
+          {:error, watch_budget_error(max_entries)}
+        else
+          Enum.reduce_while(prefixes, initial, fn prefix, keys ->
+            remaining = max(max_entries - MapSet.size(keys), 0)
+
+            case CompoundMemberIndex.keys_for_prefix(
+                   Map.get(state, :compound_member_index_name),
+                   prefix,
+                   remaining
+                 ) do
+              {:ok, prefix_keys} ->
+                {:cont, Enum.reduce(prefix_keys, keys, &MapSet.put(&2, &1))}
+
+              {:error, :limit_exceeded} ->
+                {:halt, {:error, watch_budget_error(max_entries)}}
+
+              :unavailable ->
+                {:halt, {:error, :watch_compound_index_unavailable}}
+            end
+          end)
+          |> case do
+            %MapSet{} = keys -> keys |> MapSet.to_list() |> Enum.sort()
+            {:error, _reason} = error -> error
+          end
+        end
+      end
+
+      defp watch_budget_error(@transaction_watch_max_entries),
+        do: :watch_collection_too_large
+
+      defp watch_budget_error(_remaining), do: :watch_scan_budget_exceeded
+
+      defp transaction_compound_watch_layout(state, key) do
+        type_key = CompoundKey.type_key(key)
+        list_meta_key = CompoundKey.list_meta_key(key)
+
+        case sm_store_compound_get(state, key, type_key) do
+          "hash" ->
+            {[type_key], [CompoundKey.hash_prefix(key)]}
+
+          "list" ->
+            {[type_key, list_meta_key], [CompoundKey.list_prefix(key)]}
+
+          "set" ->
+            {[type_key], [CompoundKey.set_prefix(key)]}
+
+          "zset" ->
+            {[type_key], [CompoundKey.zset_prefix(key)]}
+
+          "stream" ->
+            {[type_key, CompoundKey.stream_meta_key(key)],
+             [CompoundKey.stream_prefix(key), CompoundKey.stream_group_prefix(key)]}
+
+          nil ->
+            if do_get(state, list_meta_key) == nil do
+              {[], []}
+            else
+              {[list_meta_key], [CompoundKey.list_prefix(key)]}
+            end
+
+          _other_type ->
+            {[type_key], []}
+        end
+      end
+
+      defp transaction_compound_watch_entries(_state, _redis_key, []), do: :missing
+
+      defp transaction_compound_watch_entries(state, _redis_key, keys)
+           when length(keys) > @transaction_watch_max_entries do
+        _ = state
+        {:error, :watch_collection_too_large}
+      end
+
+      defp transaction_compound_watch_entries(state, redis_key, keys) do
+        keys
+        |> Enum.reduce_while({:ok, []}, fn storage_key, {:ok, acc} ->
+          entry = :ets.lookup(state.ets, storage_key)
+
+          token =
+            transaction_compound_storage_watch_token(state, redis_key, storage_key, entry)
+
+          case token do
+            :missing -> {:cont, {:ok, acc}}
+            {:error, _reason} = error -> {:halt, error}
+            _token -> {:cont, {:ok, [{storage_key, token} | acc]}}
+          end
+        end)
+        |> case do
+          {:ok, []} ->
+            :missing
+
+          {:ok, entries} ->
+            digest =
+              entries
+              |> Enum.reverse()
+              |> :erlang.term_to_binary([:deterministic])
+              |> then(&:crypto.hash(:sha256, &1))
+
+            {:watch, {:compound_sha256, digest}}
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp transaction_compound_storage_watch_token(
+             state,
+             redis_key,
+             storage_key,
+             [
+               {entry_key, _value, expire_at_ms, _lfu, file_id, offset, value_size}
+             ] = entry
+           )
+           when entry_key == storage_key and is_integer(expire_at_ms) and is_integer(file_id) and
+                  file_id >= 0 and
+                  is_integer(offset) and offset >= 0 and is_integer(value_size) and
+                  value_size >= 0 do
+        if promoted_compound_path(state, redis_key, storage_key) == nil do
+          transaction_storage_watch_token(state, storage_key, entry)
+        else
+          if expire_at_ms != 0 and expire_at_ms <= apply_now_ms() do
+            :missing
+          else
+            case Ferricstore.Store.Shard.CompoundRevisionIndex.revision_token(
+                   Map.get(state, :compound_revision_index_name),
+                   storage_key
+                 ) do
+              {:ok, {epoch, revision}} ->
+                {:watch, {:dedicated_revision, epoch, revision}, expire_at_ms}
+
+              :missing ->
+                transaction_storage_watch_token(state, storage_key, entry)
+
+              :unavailable ->
+                {:error, :watch_state_unavailable}
+            end
+          end
+        end
+      end
+
+      defp transaction_compound_storage_watch_token(state, redis_key, storage_key, entry) do
+        Ferricstore.Transaction.WatchToken.from_entry(entry, apply_now_ms(), fn ->
+          sm_store_compound_get(state, redis_key, storage_key)
+        end)
+      end
+
+      defp transaction_storage_watch_token(state, storage_key, entry) do
+        Ferricstore.Transaction.WatchToken.from_entry(entry, apply_now_ms(), fn ->
+          do_get(state, storage_key)
         end)
       end
 
@@ -639,7 +976,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              _store,
              state
            ) do
-        with_flow_policy_snapshots(:flow_cross_spawn_children, attrs, fn ->
+        with_flow_policy_references(state, :flow_cross_spawn_children, attrs, fn ->
           do_flow_cross_spawn_children(state, attrs)
         end)
       end
@@ -688,7 +1025,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              state
            ) do
         if op in [:complete, :retry, :fail, :cancel] do
-          with_flow_policy_snapshots(:flow_cross_terminal, attrs, fn ->
+          with_flow_policy_references(state, :flow_cross_terminal, attrs, fn ->
             do_flow_cross_terminal(state, op, attrs)
           end)
         else
@@ -703,7 +1040,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              state
            ) do
         if op in [:complete, :retry, :fail, :cancel] do
-          with_flow_policy_snapshots(:flow_cross_terminal_many, attrs_list, fn ->
+          with_flow_policy_references(state, :flow_cross_terminal_many, attrs_list, fn ->
             do_flow_cross_terminal_many(state, op, attrs_list)
           end)
         else
@@ -717,7 +1054,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
              _store,
              state
            ) do
-        with_flow_policy_snapshots(:flow_cross_retention_cleanup, attrs, fn ->
+        with_flow_policy_references(state, :flow_cross_retention_cleanup, attrs, fn ->
           do_flow_cross_retention_cleanup(state, attrs)
         end)
       end
@@ -740,7 +1077,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         {:ok,
          entry
          |> TxAst.command_ast()
-         |> TxAst.namespace_first_key(sandbox_namespace)}
+         |> TxAst.namespace_ast_keys(sandbox_namespace)}
       rescue
         _error in [ArgumentError, FunctionClauseError] ->
           {:error, "ERR invalid cross-shard transaction entry"}
@@ -812,11 +1149,65 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       # Private: cross-shard transaction store builder
       # ---------------------------------------------------------------------------
 
+      defp hold_transaction_promotion_latch(ctx, redis_key) do
+        latch_key = {ctx.index, redis_key}
+        held = Process.get(:sm_tx_promoted_latches, %{})
+
+        unless Map.has_key?(held, latch_key) do
+          token = Promotion.acquire_compaction_latch(ctx, redis_key)
+          Process.put(:sm_tx_promoted_latches, Map.put(held, latch_key, token))
+        end
+
+        :ok
+      end
+
+      defp transaction_compound_prefix_keys(ctx, prefix) do
+        case CompoundMemberIndex.keys_for_prefix(ctx.compound_member_index_name, prefix) do
+          {:ok, catalog_keys} ->
+            deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+            keys =
+              Process.get(:tx_pending_values, %{})
+              |> Map.keys()
+              |> Enum.reduce(MapSet.new(catalog_keys), fn key, acc ->
+                if transaction_key_has_prefix?(key, prefix), do: MapSet.put(acc, key), else: acc
+              end)
+              |> MapSet.difference(deleted)
+              |> MapSet.to_list()
+              |> Enum.sort()
+
+            {:ok, keys}
+
+          :unavailable ->
+            {:error, :compound_member_index_unavailable}
+        end
+      end
+
+      defp transaction_key_has_prefix?(key, prefix)
+           when is_binary(key) and byte_size(key) >= byte_size(prefix),
+           do: binary_part(key, 0, byte_size(prefix)) == prefix
+
+      defp transaction_key_has_prefix?(_key, _prefix), do: false
+
       # Builds a store map for a given shard_idx, usable by Dispatcher.dispatch.
       # For the anchor shard (matching state.shard_index), uses state directly.
       # For remote shards, reads active file info from persistent_term.
       defp build_cross_shard_store(shard_idx, anchor_state) do
+        build_transaction_store(shard_idx, anchor_state, :routed)
+      end
+
+      defp build_local_raft_tx_store(anchor_state) do
+        build_transaction_store(anchor_state.shard_index, anchor_state, :local)
+      end
+
+      defp build_transaction_store(shard_idx, anchor_state, routing_mode) do
         instance_ctx = cross_shard_instance_ctx(anchor_state)
+
+        cache_scope =
+          case instance_ctx do
+            %{name: name} -> name
+            _missing_instance_ctx -> :default
+          end
 
         data_dir =
           if instance_ctx do
@@ -828,7 +1219,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         default_ctx = cross_shard_ctx(anchor_state, shard_idx, data_dir, instance_ctx)
 
         ctx_for_key =
-          if instance_ctx do
+          if routing_mode == :routed and instance_ctx do
             ctx_by_shard =
               0..(instance_ctx.shard_count - 1)
               |> Map.new(fn idx ->
@@ -844,52 +1235,116 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
         tx_binary_ref = keydir_binary_ref(anchor_state)
 
-        put_in_ctx = fn ctx, key, value, expire_at_ms ->
-          case maybe_externalize_cross_shard_value(anchor_state, ctx, value) do
-            {:ok, value_for, disk_val, pending_value} ->
-              record_cross_shard_pending_original(ctx, key)
+        validate_value! = fn value ->
+          case Ferricstore.Raft.ApplyLimits.validate_value(anchor_state, value) do
+            :ok -> :ok
+            {:error, reason} -> throw({:transaction_store_failure, reason})
+          end
+        end
 
-              unless standalone_staged_apply?() do
-                if tx_binary_ref do
-                  new_bytes = binary_byte_size(key) + binary_byte_size(value_for)
+        validate_value_size! = fn size ->
+          case Ferricstore.Raft.ApplyLimits.validate_value_size(anchor_state, size) do
+            :ok -> :ok
+            {:error, reason} -> throw({:transaction_store_failure, reason})
+          end
+        end
 
-                  old_bytes =
-                    case :ets.lookup(ctx.keydir, key) do
-                      [{^key, old_val, _, _, _, _, _}] ->
-                        binary_byte_size(key) + binary_byte_size(old_val)
+        stage_put_in_ctx = fn ctx, key, value_for, disk_val, pending_value, expire_at_ms ->
+          record_cross_shard_pending_original(ctx, key)
 
-                      _ ->
-                        0
-                    end
+          unless standalone_staged_apply?() do
+            if tx_binary_ref do
+              new_bytes = binary_byte_size(key) + binary_byte_size(value_for)
 
-                  delta = new_bytes - old_bytes
-                  if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
+              old_bytes =
+                case :ets.lookup(ctx.keydir, key) do
+                  [{^key, old_val, _, _, _, _, _}] ->
+                    binary_byte_size(key) + binary_byte_size(old_val)
+
+                  _ ->
+                    0
                 end
 
-                :ets.insert(
-                  ctx.keydir,
-                  {key, value_for, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
-                )
-              end
+              delta = new_bytes - old_bytes
+              if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
+            end
 
-              sm_tx_put_pending(key, pending_value, expire_at_ms)
-              deleted = Process.get(:tx_deleted_keys, MapSet.new())
+            :ets.insert(
+              ctx.keydir,
+              {key, value_for, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
+            )
+          end
 
-              if MapSet.member?(deleted, key) do
-                Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
-              end
+          sm_tx_put_pending(key, pending_value, expire_at_ms)
+          deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
-              queue_cross_shard_pending_put(ctx, key, disk_val, expire_at_ms, value_for)
+          if MapSet.member?(deleted, key) do
+            Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
+          end
+
+          queue_cross_shard_pending_put(ctx, key, disk_val, expire_at_ms, value_for)
+          :ok
+        end
+
+        put_in_ctx = fn ctx, key, value, expire_at_ms ->
+          :ok = validate_value!.(value)
+
+          case maybe_externalize_cross_shard_value(anchor_state, ctx, value) do
+            {:ok, value_for, disk_val, pending_value} ->
+              stage_put_in_ctx.(ctx, key, value_for, disk_val, pending_value, expire_at_ms)
+
+            {:error, reason} ->
+              throw({:transaction_store_failure, reason})
+          end
+        end
+
+        batch_put_in_ctx = fn ctx, entries ->
+          Enum.each(entries, fn {_key, value, _expire_at_ms} ->
+            :ok = validate_value!.(value)
+          end)
+
+          case maybe_externalize_cross_shard_entries(anchor_state, ctx, entries) do
+            {:ok, prepared} ->
+              Enum.each(prepared, fn {key, value_for, disk_val, pending_value, expire_at_ms} ->
+                :ok =
+                  stage_put_in_ctx.(
+                    ctx,
+                    key,
+                    value_for,
+                    disk_val,
+                    pending_value,
+                    expire_at_ms
+                  )
+              end)
 
               :ok
 
-            {:error, _reason} = error ->
-              error
+            {:error, reason} ->
+              throw({:transaction_store_failure, reason})
           end
         end
 
         local_put = fn key, value, expire_at_ms ->
           put_in_ctx.(ctx_for_key.(key), key, value, expire_at_ms)
+        end
+
+        local_batch_put = fn kv_pairs ->
+          kv_pairs
+          |> Enum.reduce(%{}, fn {key, value}, groups ->
+            ctx = ctx_for_key.(key)
+            entry = {key, value, 0}
+
+            Map.update(groups, ctx.index, {ctx, [entry]}, fn {existing_ctx, entries} ->
+              {existing_ctx, [entry | entries]}
+            end)
+          end)
+          |> Map.values()
+          |> Enum.reduce_while(:ok, fn {ctx, reversed_entries}, :ok ->
+            case batch_put_in_ctx.(ctx, Enum.reverse(reversed_entries)) do
+              :ok -> {:cont, :ok}
+              {:error, _reason} = error -> {:halt, error}
+            end
+          end)
         end
 
         delete_in_ctx = fn ctx, key ->
@@ -1007,9 +1462,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
               {v, exp} -> {v, exp}
             end
 
+          new_size =
+            Ferricstore.Raft.ApplyLimits.append_size(byte_size(current), byte_size(suffix))
+
+          :ok = validate_value_size!.(new_size)
           new_val = current <> suffix
           local_put.(key, new_val, expire_at_ms)
-          {:ok, byte_size(new_val)}
+          {:ok, new_size}
         end
 
         local_getset = fn key, new_value ->
@@ -1039,216 +1498,183 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
               {v, exp} -> {v, exp}
             end
 
+          new_size =
+            Ferricstore.Raft.ApplyLimits.setrange_size(
+              byte_size(old),
+              offset,
+              byte_size(value)
+            )
+
+          :ok = validate_value_size!.(new_size)
           new_val = sm_apply_setrange(old, offset, value)
           local_put.(key, new_val, expire_at_ms)
-          {:ok, byte_size(new_val)}
+          {:ok, new_size}
+        end
+
+        local_cas = fn key, expected, new_value, ttl_ms ->
+          case local_get_meta.(key) do
+            nil ->
+              nil
+
+            {current, old_expire_at_ms} ->
+              if normalize_get_value(current) == expected do
+                expire_at_ms =
+                  if is_integer(ttl_ms), do: apply_now_ms() + ttl_ms, else: old_expire_at_ms
+
+                case local_put.(key, new_value, expire_at_ms) do
+                  :ok -> 1
+                  {:error, _reason} = error -> error
+                end
+              else
+                0
+              end
+          end
+        end
+
+        local_lock = fn key, owner, ttl_ms ->
+          expire_at_ms = apply_now_ms() + ttl_ms
+
+          case local_get_meta.(key) do
+            nil -> local_put.(key, owner, expire_at_ms)
+            {^owner, _old_expire_at_ms} -> local_put.(key, owner, expire_at_ms)
+            {_other, _old_expire_at_ms} -> {:error, "DISTLOCK lock is held by another owner"}
+          end
+        end
+
+        local_unlock = fn key, owner ->
+          case local_get_meta.(key) do
+            nil ->
+              1
+
+            {^owner, _expire_at_ms} ->
+              :ok = local_delete.(key)
+              1
+
+            {_other, _expire_at_ms} ->
+              {:error, "DISTLOCK caller is not the lock owner"}
+          end
+        end
+
+        local_extend = fn key, owner, ttl_ms ->
+          case local_get_meta.(key) do
+            {^owner, _old_expire_at_ms} ->
+              case local_put.(key, owner, apply_now_ms() + ttl_ms) do
+                :ok -> 1
+                {:error, _reason} = error -> error
+              end
+
+            nil ->
+              {:error, "DISTLOCK lock does not exist or has expired"}
+
+            {_other, _old_expire_at_ms} ->
+              {:error, "DISTLOCK caller is not the lock owner"}
+          end
+        end
+
+        local_ratelimit_add = fn key, window_ms, limit, count ->
+          now_ms = apply_now_ms()
+
+          {current_count, current_start_ms, previous_count} =
+            case local_get_meta.(key) do
+              {value, _expire_at_ms} -> ValueCodec.decode_ratelimit(value, now_ms)
+              nil -> {0, now_ms, 0}
+            end
+
+          {current_count, current_start_ms, previous_count} =
+            cond do
+              now_ms - current_start_ms >= window_ms * 2 -> {0, now_ms, 0}
+              now_ms - current_start_ms >= window_ms -> {0, now_ms, current_count}
+              true -> {current_count, current_start_ms, previous_count}
+            end
+
+          elapsed_ms = now_ms - current_start_ms
+
+          effective_count =
+            RateLimit.effective_count(current_count, previous_count, elapsed_ms, window_ms)
+
+          expire_at_ms = current_start_ms + window_ms * 2
+
+          {status, final_count, remaining, stored_count} =
+            if effective_count + count > limit do
+              {"denied", effective_count, max(0, limit - effective_count), current_count}
+            else
+              new_count = current_count + count
+
+              {"allowed", effective_count + count, max(0, limit - effective_count - count),
+               new_count}
+            end
+
+          encoded =
+            ValueCodec.encode_ratelimit(stored_count, current_start_ms, previous_count)
+
+          case local_put.(key, encoded, expire_at_ms) do
+            :ok ->
+              [status, final_count, remaining, max(0, current_start_ms + window_ms - now_ms)]
+
+            {:error, _reason} = error ->
+              error
+          end
+        end
+
+        promoted_target_ctx = fn redis_key, dedicated_path ->
+          ctx = ctx_for_key.(redis_key)
+          hold_transaction_promotion_latch(ctx, redis_key)
+          active = Promotion.find_active(dedicated_path)
+
+          Map.merge(ctx, %{
+            active_file_path: active,
+            active_file_id: parse_fid_from_path(active)
+          })
         end
 
         promoted_put = fn redis_key, compound_key, value, expire_at_ms, dedicated_path ->
-          ctx = ctx_for_key.(redis_key)
-          Promotion.await_compaction_latch(anchor_state, redis_key)
+          ctx = promoted_target_ctx.(redis_key, dedicated_path)
 
-          value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
-          disk_val = to_disk_binary(value)
-          active = Promotion.find_active(dedicated_path)
-          fid = parse_fid_from_path(active)
-
-          case NIF.v2_append_record(active, compound_key, disk_val, expire_at_ms) do
-            {:ok, {offset, _record_size}} ->
-              value_size = byte_size(disk_val)
-
-              if tx_binary_ref do
-                new_bytes = binary_byte_size(compound_key) + binary_byte_size(value_for)
-
-                old_bytes =
-                  case :ets.lookup(ctx.keydir, compound_key) do
-                    [{^compound_key, old_val, _, _, _, _, _}] ->
-                      binary_byte_size(compound_key) + binary_byte_size(old_val)
-
-                    _ ->
-                      0
-                  end
-
-                delta = new_bytes - old_bytes
-                if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
-              end
-
-              :ets.insert(
-                ctx.keydir,
-                {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, value_size}
-              )
-
-              sm_tx_put_pending(compound_key, value, expire_at_ms)
-              deleted = Process.get(:tx_deleted_keys, MapSet.new())
-
-              if MapSet.member?(deleted, compound_key) do
-                Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
-              end
-
-              :ok
-
-            {:error, _reason} = err ->
-              err
+          with :ok <- put_in_ctx.(ctx, compound_key, value, expire_at_ms) do
+            queue_compound_indexes_put_after_flush(ctx, redis_key, compound_key, value)
           end
         end
 
         promoted_delete = fn redis_key, compound_key, dedicated_path ->
-          ctx = ctx_for_key.(redis_key)
-          Promotion.await_compaction_latch(anchor_state, redis_key)
+          ctx = promoted_target_ctx.(redis_key, dedicated_path)
 
-          if tx_binary_ref do
-            bytes =
-              case :ets.lookup(ctx.keydir, compound_key) do
-                [{^compound_key, val, _, _, _, _, _}] ->
-                  binary_byte_size(compound_key) + binary_byte_size(val)
-
-                _ ->
-                  0
-              end
-
-            if bytes > 0, do: :atomics.sub(tx_binary_ref, ctx.index + 1, bytes)
-          end
-
-          active = Promotion.find_active(dedicated_path)
-
-          case NIF.v2_append_tombstone(active, compound_key) do
-            {:ok, _offset} ->
-              :ets.delete(ctx.keydir, compound_key)
-              sm_tx_drop_pending(compound_key)
-              deleted = Process.get(:tx_deleted_keys, MapSet.new())
-              Process.put(:tx_deleted_keys, MapSet.put(deleted, compound_key))
-              :ok
-
-            {:error, _reason} = err ->
-              err
+          with :ok <- delete_in_ctx.(ctx, compound_key) do
+            queue_compound_indexes_delete_after_flush(ctx, redis_key, compound_key)
           end
         end
 
         promoted_put_batch = fn redis_key, entries, dedicated_path ->
-          ctx = ctx_for_key.(redis_key)
-          Promotion.await_compaction_latch(anchor_state, redis_key)
+          ctx = promoted_target_ctx.(redis_key, dedicated_path)
 
-          active = Promotion.find_active(dedicated_path)
-          fid = parse_fid_from_path(active)
-
-          prepared =
-            Enum.map(entries, fn {compound_key, value, expire_at_ms} ->
-              value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
-              disk_val = to_disk_binary(value)
-              {compound_key, value, value_for, disk_val, expire_at_ms}
+          with :ok <- batch_put_in_ctx.(ctx, entries) do
+            Enum.each(entries, fn {compound_key, value, _expire_at_ms} ->
+              :ok = queue_compound_indexes_put_after_flush(ctx, redis_key, compound_key, value)
             end)
 
-          batch =
-            Enum.map(prepared, fn {compound_key, _value, _value_for, disk_val, expire_at_ms} ->
-              {compound_key, disk_val, expire_at_ms}
-            end)
-
-          case NIF.v2_append_batch(active, batch) do
-            {:ok, locations} when length(locations) == length(prepared) ->
-              deleted =
-                Enum.zip(prepared, locations)
-                |> Enum.reduce(Process.get(:tx_deleted_keys, MapSet.new()), fn
-                  {{compound_key, value, value_for, disk_val, expire_at_ms},
-                   {offset, _value_size}},
-                  deleted_acc ->
-                    if tx_binary_ref do
-                      new_bytes = binary_byte_size(compound_key) + binary_byte_size(value_for)
-
-                      old_bytes =
-                        case :ets.lookup(ctx.keydir, compound_key) do
-                          [{^compound_key, old_val, _, _, _, _, _}] ->
-                            binary_byte_size(compound_key) + binary_byte_size(old_val)
-
-                          _ ->
-                            0
-                        end
-
-                      delta = new_bytes - old_bytes
-                      if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
-                    end
-
-                    :ets.insert(
-                      ctx.keydir,
-                      {
-                        compound_key,
-                        value_for,
-                        expire_at_ms,
-                        LFU.initial(),
-                        fid,
-                        offset,
-                        byte_size(disk_val)
-                      }
-                    )
-
-                    sm_tx_put_pending(compound_key, value, expire_at_ms)
-                    MapSet.delete(deleted_acc, compound_key)
-                end)
-
-              Process.put(:tx_deleted_keys, deleted)
-              :ok
-
-            {:ok, locations} ->
-              {:error, {:batch_result_mismatch, length(prepared), locations}}
-
-            {:error, _reason} = err ->
-              err
+            :ok
           end
         end
 
         promoted_delete_batch = fn redis_key, compound_keys, dedicated_path ->
-          ctx = ctx_for_key.(redis_key)
-          Promotion.await_compaction_latch(anchor_state, redis_key)
+          ctx = promoted_target_ctx.(redis_key, dedicated_path)
 
-          active = Promotion.find_active(dedicated_path)
-          ops = Enum.map(compound_keys, &{:delete, &1})
+          Enum.each(compound_keys, fn compound_key ->
+            :ok = delete_in_ctx.(ctx, compound_key)
+            :ok = queue_compound_indexes_delete_after_flush(ctx, redis_key, compound_key)
+          end)
 
-          case NIF.v2_append_ops_batch_nosync(active, ops) do
-            {:ok, locations} ->
-              with :ok <- validate_promoted_tombstone_batch(locations, length(compound_keys)),
-                   :ok <- NIF.v2_fsync(active) do
-                deleted =
-                  Enum.reduce(compound_keys, Process.get(:tx_deleted_keys, MapSet.new()), fn
-                    compound_key, acc ->
-                      if tx_binary_ref do
-                        bytes =
-                          case :ets.lookup(ctx.keydir, compound_key) do
-                            [{^compound_key, val, _, _, _, _, _}] ->
-                              binary_byte_size(compound_key) + binary_byte_size(val)
-
-                            _ ->
-                              0
-                          end
-
-                        if bytes > 0, do: :atomics.sub(tx_binary_ref, ctx.index + 1, bytes)
-                      end
-
-                      :ets.delete(ctx.keydir, compound_key)
-                      sm_tx_drop_pending(compound_key)
-                      MapSet.put(acc, compound_key)
-                  end)
-
-                Process.put(:tx_deleted_keys, deleted)
-                :ok
-              end
-
-            {:error, _reason} = err ->
-              err
-          end
+          :ok
         end
 
         %{
           get: local_get,
+          cache_scope: cache_scope,
           get_meta: local_get_meta,
           batch_get: fn keys -> cross_shard_routed_batch_read(keys, ctx_for_key) end,
           put: local_put,
+          batch_put: local_batch_put,
           delete: local_delete,
           exists?: local_exists,
-          keys: fn -> Router.keys(instance_ctx) end,
-          flush: fn ->
-            Enum.each(Router.keys(instance_ctx), fn k -> Router.delete(instance_ctx, k) end)
-            :ok
-          end,
-          dbsize: fn -> Router.dbsize(instance_ctx) end,
           incr: local_incr,
           incr_float: local_incr_float,
           append: local_append,
@@ -1256,16 +1682,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           getdel: local_getdel,
           getex: local_getex,
           setrange: local_setrange,
-          cas: fn key, expected, new_value, ttl_ms ->
-            Router.cas(instance_ctx, key, expected, new_value, ttl_ms)
-          end,
-          lock: fn key, owner, ttl_ms -> Router.lock(instance_ctx, key, owner, ttl_ms) end,
-          unlock: fn key, owner -> Router.unlock(instance_ctx, key, owner) end,
-          extend: fn key, owner, ttl_ms -> Router.extend(instance_ctx, key, owner, ttl_ms) end,
-          ratelimit_add: fn key, window_ms, max, count ->
-            Router.ratelimit_add(instance_ctx, key, window_ms, max, count)
-          end,
-          list_op: fn key, op -> Router.list_op(instance_ctx, key, op) end,
+          defer_stream_cleanup: &queue_stream_cache_cleanup/1,
+          cas: local_cas,
+          lock: local_lock,
+          unlock: local_unlock,
+          extend: local_extend,
+          ratelimit_add: local_ratelimit_add,
           compound_get: fn redis_key, compound_key ->
             ctx = ctx_for_key.(redis_key)
             cross_shard_compound_read(ctx, redis_key, compound_key)
@@ -1287,7 +1709,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
             case promoted_compound_path(ctx, redis_key, compound_key) do
               nil ->
-                put_in_ctx.(ctx, compound_key, value, expire_at_ms)
+                with :ok <- put_in_ctx.(ctx, compound_key, value, expire_at_ms) do
+                  queue_compound_indexes_put_after_flush(ctx, redis_key, compound_key, value)
+                end
 
               dedicated_path ->
                 promoted_put.(redis_key, compound_key, value, expire_at_ms, dedicated_path)
@@ -1296,64 +1720,60 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           compound_batch_put: fn redis_key, entries ->
             ctx = ctx_for_key.(redis_key)
 
-            entries
-            |> Enum.chunk_by(fn {compound_key, _value, _expire_at_ms} ->
-              promoted_compound_path(ctx, redis_key, compound_key)
-            end)
-            |> Enum.reduce_while(:ok, fn entries, :ok ->
-              result =
-                case promoted_compound_path(ctx, redis_key, elem(hd(entries), 0)) do
-                  nil ->
-                    Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
-                      put_in_ctx.(ctx, compound_key, value, expire_at_ms)
-                    end)
+            case promoted_compound_batch_path(ctx, redis_key, entries) do
+              :mixed ->
+                {:error, :mixed_compound_batch_targets}
 
-                    :ok
+              nil ->
+                :ok = batch_put_in_ctx.(ctx, entries)
 
-                  dedicated_path ->
-                    promoted_put_batch.(redis_key, entries, dedicated_path)
-                end
+                Enum.each(entries, fn {compound_key, value, _expire_at_ms} ->
+                  :ok =
+                    queue_compound_indexes_put_after_flush(
+                      ctx,
+                      redis_key,
+                      compound_key,
+                      value
+                    )
+                end)
 
-              case result do
-                :ok -> {:cont, :ok}
-                {:error, _} = error -> {:halt, error}
-              end
-            end)
+                :ok
+
+              dedicated_path when is_binary(dedicated_path) ->
+                promoted_put_batch.(redis_key, entries, dedicated_path)
+            end
           end,
           compound_delete: fn redis_key, compound_key ->
             ctx = ctx_for_key.(redis_key)
 
             case promoted_compound_path(ctx, redis_key, compound_key) do
-              nil -> delete_in_ctx.(ctx, compound_key)
-              dedicated_path -> promoted_delete.(redis_key, compound_key, dedicated_path)
+              nil ->
+                with :ok <- delete_in_ctx.(ctx, compound_key) do
+                  queue_compound_indexes_delete_after_flush(ctx, redis_key, compound_key)
+                end
+
+              dedicated_path ->
+                promoted_delete.(redis_key, compound_key, dedicated_path)
             end
           end,
           compound_batch_delete: fn redis_key, compound_keys ->
             ctx = ctx_for_key.(redis_key)
 
-            compound_keys
-            |> Enum.chunk_by(fn compound_key ->
-              promoted_compound_path(ctx, redis_key, compound_key)
-            end)
-            |> Enum.reduce_while(:ok, fn compound_keys, :ok ->
-              result =
-                case promoted_compound_path(ctx, redis_key, hd(compound_keys)) do
-                  nil ->
-                    Enum.each(compound_keys, fn compound_key ->
-                      delete_in_ctx.(ctx, compound_key)
-                    end)
+            case promoted_compound_batch_path(ctx, redis_key, compound_keys) do
+              :mixed ->
+                {:error, :mixed_compound_batch_targets}
 
-                    :ok
+              nil ->
+                Enum.each(compound_keys, fn compound_key ->
+                  :ok = delete_in_ctx.(ctx, compound_key)
+                  :ok = queue_compound_indexes_delete_after_flush(ctx, redis_key, compound_key)
+                end)
 
-                  dedicated_path ->
-                    promoted_delete_batch.(redis_key, compound_keys, dedicated_path)
-                end
+                :ok
 
-              case result do
-                :ok -> {:cont, :ok}
-                {:error, _} = error -> {:halt, error}
-              end
-            end)
+              dedicated_path when is_binary(dedicated_path) ->
+                promoted_delete_batch.(redis_key, compound_keys, dedicated_path)
+            end
           end,
           compound_scan: fn redis_key, prefix ->
             ctx = ctx_for_key.(redis_key)
@@ -1365,7 +1785,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end,
           compound_delete_prefix: fn redis_key, prefix ->
             ctx = ctx_for_key.(redis_key)
-            cross_shard_delete_prefix(ctx, prefix, fn key -> delete_in_ctx.(ctx, key) end)
+
+            with {:ok, compound_keys} <- transaction_compound_prefix_keys(ctx, prefix) do
+              case promoted_compound_path(ctx, redis_key, prefix) do
+                nil ->
+                  Enum.each(compound_keys, fn key ->
+                    :ok = delete_in_ctx.(ctx, key)
+                    :ok = queue_compound_indexes_delete_after_flush(ctx, redis_key, key)
+                  end)
+
+                  :ok
+
+                dedicated_path ->
+                  promoted_delete_batch.(redis_key, compound_keys, dedicated_path)
+              end
+            end
           end,
           zset_score_range: fn redis_key, min_bound, max_bound, reverse? ->
             ctx = ctx_for_key.(redis_key)
@@ -1435,11 +1869,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end,
           prob_dir: fn ->
             Path.join(default_ctx.shard_data_path, "prob")
-          end,
-          prob_write: fn command ->
-            # Within cross-shard tx, prob writes are applied directly
-            # (the state machine is already applying through Raft)
-            apply_prob_locally(instance_ctx, command)
           end,
           shard_index: default_ctx.index,
           data_dir: data_dir

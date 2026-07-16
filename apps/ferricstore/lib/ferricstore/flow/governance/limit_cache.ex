@@ -16,6 +16,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   @default_max_chunk 10_000
   @limit_store_max_mutation_amount 1_000
   @default_session_page_size 256
+  @max_pending_activation_attempts 16
 
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
@@ -339,7 +340,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
           now_ms: now_ms
         ]
 
-        case safe_release(&LimitStore.release/3, ctx, expired_page.scope, opts) do
+        case safe_release(release_fun, ctx, expired_page.scope, opts) do
           {:ok, _owner} ->
             case session_from_state(state, instance_name) do
               {:ok, session} ->
@@ -528,35 +529,39 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   def with_drained_cache(ctx, fun, opts \\ [])
 
   def with_drained_cache(ctx, fun, opts) when is_function(fun, 0) and is_list(opts) do
-    now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
-    before_detach_fun = Keyword.get(opts, :before_detach_fun, fn _entry -> :ok end)
-    release_fun = Keyword.get(opts, :release_fun, &LimitStore.release/3)
+    if Keyword.keyword?(opts) do
+      now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
+      before_detach_fun = Keyword.get(opts, :before_detach_fun, fn _entry -> :ok end)
+      release_fun = Keyword.get(opts, :release_fun, &LimitStore.release/3)
 
-    if is_integer(now_ms) and now_ms >= 0 and is_function(before_detach_fun, 1) and
-         is_function(release_fun, 3) do
-      case :ets.whereis(@table) do
-        :undefined ->
-          fun.()
+      if is_integer(now_ms) and now_ms >= 0 and is_function(before_detach_fun, 1) and
+           is_function(release_fun, 3) do
+        case :ets.whereis(@table) do
+          :undefined ->
+            fun.()
 
-        table ->
-          with_cache_flush(
-            table,
-            ctx,
-            now_ms,
-            before_detach_fun,
-            release_fun,
-            fn counts ->
-              if counts.errors == 0 do
-                try do
-                  fun.()
-                after
-                  GenServer.call(__MODULE__, {:reset_session, instance_name(ctx)})
+          table ->
+            with_cache_flush(
+              table,
+              ctx,
+              now_ms,
+              before_detach_fun,
+              release_fun,
+              fn counts ->
+                if counts.errors == 0 do
+                  try do
+                    fun.()
+                  after
+                    GenServer.call(__MODULE__, {:reset_session, instance_name(ctx)})
+                  end
+                else
+                  {:error, {:cached_reservation_release_failed, counts}}
                 end
-              else
-                {:error, {:cached_reservation_release_failed, counts}}
               end
-            end
-          )
+            )
+        end
+      else
+        {:error, "ERR invalid flow limit cache drain opts"}
       end
     else
       {:error, "ERR invalid flow limit cache drain opts"}
@@ -567,26 +572,42 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     do: {:error, "ERR invalid flow limit cache drain opts"}
 
   @doc false
-  def flush(ctx, opts \\ []) when is_list(opts) do
-    now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
-    before_detach_fun = Keyword.get(opts, :before_detach_fun, fn _entry -> :ok end)
-    release_fun = Keyword.get(opts, :release_fun, &LimitStore.release/3)
+  def flush(ctx, opts \\ [])
 
-    if is_integer(now_ms) and now_ms >= 0 and is_function(before_detach_fun, 1) and
-         is_function(release_fun, 3) do
-      case :ets.whereis(@table) do
-        :undefined -> {:ok, %{released: 0, errors: 0}}
-        table -> flush_table(table, ctx, now_ms, before_detach_fun, release_fun)
+  def flush(ctx, opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
+      before_detach_fun = Keyword.get(opts, :before_detach_fun, fn _entry -> :ok end)
+      release_fun = Keyword.get(opts, :release_fun, &LimitStore.release/3)
+
+      if is_integer(now_ms) and now_ms >= 0 and is_function(before_detach_fun, 1) and
+           is_function(release_fun, 3) do
+        case :ets.whereis(@table) do
+          :undefined -> {:ok, %{released: 0, errors: 0}}
+          table -> flush_table(table, ctx, now_ms, before_detach_fun, release_fun)
+        end
+      else
+        {:error, "ERR invalid flow limit cache flush opts"}
       end
     else
       {:error, "ERR invalid flow limit cache flush opts"}
     end
   end
 
+  def flush(_ctx, _opts), do: {:error, "ERR invalid flow limit cache flush opts"}
+
   @doc false
-  def recover(ctx, opts \\ []) when is_list(opts) do
-    GenServer.call(__MODULE__, {:recover_session, ctx, opts}, 30_000)
+  def recover(ctx, opts \\ [])
+
+  def recover(ctx, opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      GenServer.call(__MODULE__, {:recover_session, ctx, opts}, 30_000)
+    else
+      {:error, "ERR invalid flow limit cache recovery opts"}
+    end
   end
+
+  def recover(_ctx, _opts), do: {:error, "ERR invalid flow limit cache recovery opts"}
 
   defp cached_spend(ctx, scope, opts) do
     with {:ok, shard_id} <- fetch_non_negative_integer(opts, :shard_id),
@@ -631,7 +652,8 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
                        now_ms,
                        generation,
                        requested_configuration,
-                       cache_release_fun
+                       cache_release_fun,
+                       @max_pending_activation_attempts
                      ) do
                   {:ok, reservation_ids} ->
                     cache_hit(scope, shard_id, amount, reservation_ids)
@@ -666,7 +688,34 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
          now_ms,
          generation,
          requested_configuration,
-         release_fun
+         release_fun,
+         attempts_left
+       ) do
+    if attempts_left <= 0 do
+      :miss
+    else
+      do_take_pending_cached(
+        ctx,
+        key,
+        amount,
+        now_ms,
+        generation,
+        requested_configuration,
+        release_fun,
+        attempts_left
+      )
+    end
+  end
+
+  defp do_take_pending_cached(
+         ctx,
+         key,
+         amount,
+         now_ms,
+         generation,
+         requested_configuration,
+         release_fun,
+         attempts_left
        ) do
     case GenServer.call(
            __MODULE__,
@@ -691,7 +740,8 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
               now_ms,
               generation,
               requested_configuration,
-              release_fun
+              release_fun,
+              attempts_left - 1
             )
         end
 
@@ -703,7 +753,8 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
           now_ms,
           generation,
           requested_configuration,
-          release_fun
+          release_fun,
+          attempts_left - 1
         )
 
       :stale_configuration ->
@@ -1101,11 +1152,16 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     case GenServer.call(__MODULE__, {:begin_flush, instance_name, token}) do
       {:ok, _generation} ->
         try do
-          detached_entries =
-            detach_cached_entries(table, instance_name, before_detach_fun, [])
-
           detached_counts =
-            release_detached(table, ctx, detached_entries, now_ms, release_fun)
+            drain_cached_batches(
+              table,
+              ctx,
+              instance_name,
+              now_ms,
+              before_detach_fun,
+              release_fun,
+              %{released: 0, errors: 0}
+            )
 
           pending_counts =
             GenServer.call(
@@ -1126,25 +1182,57 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     end
   end
 
-  defp detach_cached_entries(table, instance_name, before_detach_fun, detached) do
+  defp drain_cached_batches(
+         table,
+         ctx,
+         instance_name,
+         now_ms,
+         before_detach_fun,
+         release_fun,
+         counts
+       ) do
+    case detach_cached_batch(table, instance_name, before_detach_fun) do
+      [] ->
+        counts
+
+      detached_entries ->
+        batch_counts = release_detached(table, ctx, detached_entries, now_ms, release_fun)
+        counts = merge_flush_counts(counts, batch_counts)
+
+        if batch_counts.errors == 0 do
+          drain_cached_batches(
+            table,
+            ctx,
+            instance_name,
+            now_ms,
+            before_detach_fun,
+            release_fun,
+            counts
+          )
+        else
+          counts
+        end
+    end
+  end
+
+  defp detach_cached_batch(table, instance_name, before_detach_fun) do
     match_spec = cache_entry_match_spec(instance_name)
 
     case :ets.select(table, match_spec, @flush_batch_size) do
       {entries, _continuation} ->
-        newly_detached =
-          Enum.reduce(entries, detached, fn snapshot, acc ->
-            invoke_before_detach(before_detach_fun, snapshot)
+        entries
+        |> Enum.reduce([], fn snapshot, acc ->
+          invoke_before_detach(before_detach_fun, snapshot)
 
-            case :ets.take(table, elem(snapshot, 0)) do
-              [entry] -> [entry | acc]
-              [] -> acc
-            end
-          end)
-
-        detach_cached_entries(table, instance_name, before_detach_fun, newly_detached)
+          case :ets.take(table, elem(snapshot, 0)) do
+            [entry] -> [entry | acc]
+            [] -> acc
+          end
+        end)
+        |> Enum.reverse()
 
       :"$end_of_table" ->
-        Enum.reverse(detached)
+        []
     end
   end
 

@@ -7,6 +7,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       alias Ferricstore.ErrorReasons
       alias Ferricstore.NamespaceConfig
       alias Ferricstore.Raft.BlobCommand
+      alias Ferricstore.Raft.CommandBatching
       alias Ferricstore.Raft.CommandStamp
       alias Ferricstore.Raft.WARaftBackend.Batcher, as: NamespaceBatcher
       alias Ferricstore.Raft.WARaftBackend.BatcherSupervisor, as: NamespaceBatcherSupervisor
@@ -130,7 +131,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       end
 
       defp maybe_namespace_window_write(shard_index, command) do
-        if NamespaceConfig.has_overrides?() do
+        if NamespaceConfig.has_overrides?() and CommandBatching.batchable?(command) do
           prefix = Ferricstore.Raft.CommandPrefix.extract(command)
           window_ms = NamespaceConfig.window_for(prefix)
 

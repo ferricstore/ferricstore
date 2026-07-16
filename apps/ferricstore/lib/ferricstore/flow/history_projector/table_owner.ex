@@ -7,7 +7,9 @@ defmodule Ferricstore.Flow.HistoryProjector.TableOwner do
     {:ferricstore_flow_history_projector_pending_registry,
      [:named_table, :public, :set, {:read_concurrency, true}, {:write_concurrency, true}]},
     {:ferricstore_flow_history_projector_replay_reservations,
-     [:named_table, :public, :set, {:read_concurrency, true}, {:write_concurrency, true}]}
+     [:named_table, :public, :set, {:read_concurrency, true}, {:write_concurrency, true}]},
+    {:ferricstore_flow_history_projector_overflow,
+     [:named_table, :public, :ordered_set, {:read_concurrency, true}, {:write_concurrency, true}]}
   ]
 
   @spec start_link(keyword()) :: GenServer.on_start()

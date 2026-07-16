@@ -2,10 +2,9 @@ defmodule Ferricstore.Store.ActiveFile do
   @moduledoc """
   Tracks the active log file for each shard.
 
-  Uses atomics generation counter + process dictionary cache — ~15ns reads
-  on the hot path. On file rotation, only an ETS re-read (~100ns) happens
-  per caller process. No global GC from persistent_term.put, which matters
-  when the host app has 50K+ LiveView/Channel processes.
+  Uses a per-row atomics generation counter plus a process dictionary cache.
+  Reads stay one `Process.get/1` plus one `:atomics.get/2` on the hot path,
+  while a rotation invalidates only callers that cached that exact shard.
 
   ## Usage
 
@@ -17,7 +16,6 @@ defmodule Ferricstore.Store.ActiveFile do
   """
 
   @table :ferricstore_active_files
-  @atomics_key :ferricstore_active_file_gen
 
   @doc """
   Initializes the registry. Called once from Application.start.
@@ -26,11 +24,6 @@ defmodule Ferricstore.Store.ActiveFile do
   def init(_shard_count) do
     if :ets.whereis(@table) == :undefined do
       :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
-    end
-
-    unless :persistent_term.get(@atomics_key, nil) do
-      ref = :atomics.new(1, signed: false)
-      :persistent_term.put(@atomics_key, ref)
     end
 
     :ok
@@ -49,17 +42,13 @@ defmodule Ferricstore.Store.ActiveFile do
   @doc """
   Publishes active file metadata for a shard in a specific instance.
 
-  The default instance keeps the historical shard-index key for backward
-  compatibility. Custom instances use `{instance_name, shard_index}` so
-  isolated tests and embedded instances cannot overwrite each other.
+  Every instance uses `{instance_name, shard_index}` so registry identity is
+  uniform across default and embedded stores.
   """
   @spec publish(map() | nil, non_neg_integer(), non_neg_integer(), binary(), binary()) :: :ok
   def publish(ctx, shard_index, file_id, file_path, shard_data_path) do
     table_key = table_key(ctx, shard_index)
-    :ets.insert(@table, {table_key, file_id, file_path, shard_data_path})
-    ref = :persistent_term.get(@atomics_key)
-    :atomics.add(ref, 1, 1)
-    :ok
+    publish_row(table_key, file_id, file_path, shard_data_path)
   end
 
   @doc """
@@ -80,27 +69,33 @@ defmodule Ferricstore.Store.ActiveFile do
   """
   @spec get(map() | nil, non_neg_integer()) :: {non_neg_integer(), binary(), binary()}
   def get(ctx, shard_index) do
-    ref = :persistent_term.get(@atomics_key)
-    current_gen = :atomics.get(ref, 1)
     table_key = table_key(ctx, shard_index)
+    cache_key = {:active_file_cache, table_key}
 
-    case Process.get({:active_file_cache, table_key}) do
-      {^current_gen, file_id, file_path, shard_data_path} ->
-        {file_id, file_path, shard_data_path}
+    case Process.get(cache_key) do
+      {ref, cached_gen, file_id, file_path, shard_data_path} ->
+        if :atomics.get(ref, 1) == cached_gen do
+          {file_id, file_path, shard_data_path}
+        else
+          refresh_cache(table_key, cache_key)
+        end
 
       _ ->
-        prune_process_cache_if_generation_changed(current_gen)
-
-        [{^table_key, file_id, file_path, shard_data_path}] =
-          :ets.lookup(@table, table_key)
-
-        Process.put(
-          {:active_file_cache, table_key},
-          {current_gen, file_id, file_path, shard_data_path}
-        )
-
-        {file_id, file_path, shard_data_path}
+        refresh_cache(table_key, cache_key)
     end
+  end
+
+  @doc false
+  @spec delete(non_neg_integer()) :: :ok
+  def delete(shard_index), do: delete(nil, shard_index)
+
+  @doc false
+  @spec delete(map() | nil, non_neg_integer()) :: :ok
+  def delete(ctx, shard_index) do
+    table_key = table_key(ctx, shard_index)
+    delete_row(table_key)
+    Process.delete({:active_file_cache, table_key})
+    :ok
   end
 
   @doc """
@@ -115,40 +110,73 @@ defmodule Ferricstore.Store.ActiveFile do
   def cleanup_instance(%{name: name, shard_count: shard_count}) do
     if :ets.whereis(@table) != :undefined and shard_count > 0 do
       Enum.each(0..(shard_count - 1), fn shard_index ->
-        :ets.delete(@table, {name, shard_index})
+        table_key = {name, shard_index}
+        delete_row(table_key)
+        Process.delete({:active_file_cache, table_key})
       end)
-
-      bump_generation()
     end
 
     :ok
   end
 
-  defp table_key(nil, shard_index), do: shard_index
-  defp table_key(%{name: :default}, shard_index), do: shard_index
+  defp table_key(nil, shard_index), do: {:default, shard_index}
+  defp table_key(%{name: :default}, shard_index), do: {:default, shard_index}
   defp table_key(%{name: name}, shard_index), do: {name, shard_index}
 
-  defp prune_process_cache_if_generation_changed(current_gen) do
-    case Process.get(:active_file_cache_generation) do
-      ^current_gen ->
+  defp publish_row(table_key, file_id, file_path, shard_data_path) do
+    case :ets.lookup(@table, table_key) do
+      [{^table_key, ref, _old_file_id, _old_file_path, _old_shard_path}] ->
+        :ets.insert(@table, {table_key, ref, file_id, file_path, shard_data_path})
+        :atomics.add(ref, 1, 1)
         :ok
 
-      _ ->
-        Process.get()
-        |> Enum.each(fn
-          {{:active_file_cache, _key} = key, _value} -> Process.delete(key)
-          _ -> :ok
-        end)
+      [] ->
+        ref = :atomics.new(1, signed: false)
 
-        Process.put(:active_file_cache_generation, current_gen)
-        :ok
+        if :ets.insert_new(@table, {table_key, ref, file_id, file_path, shard_data_path}) do
+          :ok
+        else
+          publish_row(table_key, file_id, file_path, shard_data_path)
+        end
     end
   end
 
-  defp bump_generation do
-    case :persistent_term.get(@atomics_key, nil) do
-      nil -> :ok
-      ref -> :atomics.add(ref, 1, 1)
+  defp refresh_cache(table_key, cache_key) do
+    case :ets.lookup(@table, table_key) do
+      [{^table_key, ref, _file_id, _file_path, _shard_data_path}] ->
+        generation_before = :atomics.get(ref, 1)
+
+        case :ets.lookup(@table, table_key) do
+          [{^table_key, ^ref, file_id, file_path, shard_data_path}] ->
+            if :atomics.get(ref, 1) == generation_before do
+              Process.put(
+                cache_key,
+                {ref, generation_before, file_id, file_path, shard_data_path}
+              )
+
+              {file_id, file_path, shard_data_path}
+            else
+              refresh_cache(table_key, cache_key)
+            end
+
+          _changed_or_deleted ->
+            refresh_cache(table_key, cache_key)
+        end
+
+      [] ->
+        Process.delete(cache_key)
+        raise MatchError, term: []
+    end
+  end
+
+  defp delete_row(table_key) do
+    case :ets.take(@table, table_key) do
+      [{^table_key, ref, _file_id, _file_path, _shard_data_path}] ->
+        :atomics.add(ref, 1, 1)
+        :ok
+
+      [] ->
+        :ok
     end
   end
 end

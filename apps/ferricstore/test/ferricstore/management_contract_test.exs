@@ -16,6 +16,9 @@ defmodule FerricStore.ManagementContractTest do
     def del_user(username, _opts), do: {:ok, %{deleted: username}}
 
     @impl true
+    def del_users(usernames, _opts), do: {:ok, length(usernames)}
+
+    @impl true
     def get_user(username, _opts), do: {:ok, %{username: username}}
 
     @impl true
@@ -23,6 +26,9 @@ defmodule FerricStore.ManagementContractTest do
 
     @impl true
     def save(_opts), do: :ok
+
+    @impl true
+    def load(opts), do: {:ok, %{loaded: true, store?: Keyword.has_key?(opts, :store)}}
   end
 
   defmodule FakeCapabilities do
@@ -30,6 +36,30 @@ defmodule FerricStore.ManagementContractTest do
 
     @impl true
     def capabilities(_opts), do: %{acl_management: true, quota_management: true}
+  end
+
+  defmodule NonMapCapabilities do
+    def capabilities(_opts), do: :enabled
+  end
+
+  defmodule NonBooleanCapabilities do
+    def capabilities(_opts), do: %{sdk: "yes"}
+  end
+
+  defmodule FakeTelemetry do
+    @behaviour FerricStore.Management.Telemetry
+
+    @impl true
+    def cluster_info(_opts), do: {:ok, %{}}
+
+    @impl true
+    def namespace_usage(prefix, _opts), do: {:ok, %{prefix: prefix}}
+
+    @impl true
+    def flow_query(attrs, _opts), do: {:ok, attrs}
+
+    @impl true
+    def flow_history(id, opts), do: {:ok, %{id: id, attrs: Keyword.get(opts, :attrs, %{})}}
   end
 
   defmodule FakeResourceLimits do
@@ -98,12 +128,14 @@ defmodule FerricStore.ManagementContractTest do
 
   setup do
     Application.delete_env(:ferricstore, FerricStore.ManagementCapabilities)
+    Application.delete_env(:ferricstore, FerricStore.Management.Telemetry)
     Application.delete_env(:ferricstore, FerricStore.Management.ACL)
     Application.delete_env(:ferricstore, FerricStore.Management.Namespace)
     Application.delete_env(:ferricstore, FerricStore.ResourceLimits)
 
     on_exit(fn ->
       Application.delete_env(:ferricstore, FerricStore.ManagementCapabilities)
+      Application.delete_env(:ferricstore, FerricStore.Management.Telemetry)
       Application.delete_env(:ferricstore, FerricStore.Management.ACL)
       Application.delete_env(:ferricstore, FerricStore.Management.Namespace)
       Application.delete_env(:ferricstore, FerricStore.ResourceLimits)
@@ -136,6 +168,23 @@ defmodule FerricStore.ManagementContractTest do
            }
   end
 
+  test "FLOW_QUERY transports opaque cursor IDs without scalar coercion" do
+    Application.put_env(:ferricstore, FerricStore.Management.Telemetry, FakeTelemetry)
+    store = MockStore.make()
+
+    assert Dispatcher.dispatch(
+             "FERRICSTORE.TELEMETRY",
+             ["FLOW_QUERY", "BEFORE_ID", "00123", "COUNT", "10", "REV", "true"],
+             store
+           ) == %{"before_id" => "00123", "count" => 10, "rev" => true}
+
+    assert Dispatcher.dispatch(
+             "FERRICSTORE.TELEMETRY",
+             ["FLOW_QUERY", "BEFORE_ID", "TRUE"],
+             store
+           ) == %{"before_id" => "TRUE"}
+  end
+
   test "capabilities can be extended by a configured implementation" do
     Application.put_env(:ferricstore, FerricStore.ManagementCapabilities, FakeCapabilities)
 
@@ -148,6 +197,20 @@ defmodule FerricStore.ManagementContractTest do
              "quota_management" => true,
              "flow_observability" => true
            }
+  end
+
+  test "capability adapters fail clearly when they violate the public contract" do
+    assert_raise ArgumentError, ~r/must return a map/, fn ->
+      FerricStore.ManagementCapabilities.capabilities(impl: NonMapCapabilities)
+    end
+
+    assert_raise ArgumentError, ~r/capability :sdk must be a boolean/, fn ->
+      FerricStore.ManagementCapabilities.capabilities(impl: NonBooleanCapabilities)
+    end
+
+    assert_raise ArgumentError, ~r/must export capabilities\/1/, fn ->
+      FerricStore.ManagementCapabilities.capabilities(impl: String)
+    end
   end
 
   test "management mutations fail closed in OSS" do
@@ -165,6 +228,13 @@ defmodule FerricStore.ManagementContractTest do
                ["SET", "tenant:namespace", "KEYS", "10"],
                store
              )
+  end
+
+  test "ACL LOAD delegates to the configured durable management adapter" do
+    Application.put_env(:ferricstore, FerricStore.Management.ACL, FakeACL)
+
+    assert %{"loaded" => true, "store?" => true} =
+             Dispatcher.dispatch("ACL", ["LOAD"], MockStore.make())
   end
 
   test "resource limit enforcement hooks are neutral no-ops by default" do

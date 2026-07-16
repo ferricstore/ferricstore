@@ -17,8 +17,9 @@ defmodule Ferricstore.Store.PromotionTest.Sections.PromotionBatchesSharedTombsto
           |> Path.join("../../../lib/ferricstore/store/promotion.ex")
           |> File.read!()
 
-        assert source =~ "v2_append_ops_batch_nosync(active_path, tombstone_ops)"
-        assert source =~ "v2_fsync(active_path)"
+        assert source =~ "v2_append_ops_batch(active_path, tombstone_ops)"
+        refute source =~ "v2_append_ops_batch_nosync(active_path, tombstone_ops)"
+        refute source =~ "v2_fsync(active_path)"
       end
 
       test "promoted recovery reports leftover compact temp cleanup failures" do
@@ -46,6 +47,7 @@ defmodule Ferricstore.Store.PromotionTest.Sections.PromotionBatchesSharedTombsto
 
         Ferricstore.DataDir.ensure_layout!(root, 1)
         shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+        File.touch!(Path.join(shard_path, "00000.log"))
         redis_key = "recover-temp-cleanup-fail"
         marker_key = Promotion.marker_key(redis_key)
         dedicated_path = Promotion.dedicated_path(root, 0, :hash, redis_key)
@@ -55,6 +57,21 @@ defmodule Ferricstore.Store.PromotionTest.Sections.PromotionBatchesSharedTombsto
         File.mkdir!(Path.join(dedicated_path, "compact_1.log"))
 
         :ets.insert(keydir, {marker_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+
+        shared_key = CompoundKey.hash_field(redis_key, "field")
+
+        :ets.insert(
+          keydir,
+          {shared_key, "shared", 0, Ferricstore.Store.LFU.initial(), 0, 0, 6}
+        )
+
+        type_key = CompoundKey.type_key(redis_key)
+
+        :ets.insert(
+          keydir,
+          {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4}
+        )
+
         compact_dir = Path.join(dedicated_path, "compact_1.log")
         parent = self()
         handler_id = {:promotion_compact_temp_cleanup_failed, parent, make_ref()}

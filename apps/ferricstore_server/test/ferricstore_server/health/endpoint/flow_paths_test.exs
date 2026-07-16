@@ -15,9 +15,22 @@ defmodule FerricstoreServer.Health.Endpoint.FlowPathsTest do
     assert FlowPaths.decode_form_body("%") == %{"%" => ""}
   end
 
+  test "decode_form_body rejects percent-decoded invalid UTF-8" do
+    assert FlowPaths.decode_form_body("username=%FF") == %{}
+    assert FlowPaths.decode_form_body("%FF=value") == %{}
+  end
+
   test "decode_flow_detail_request decodes id and dashboard options" do
     assert FlowPaths.decode_flow_detail_request("flow%2F1?partition_key=tenant-a&payload=true") ==
              {"flow/1", [partition_key: "tenant-a", history_count: 50]}
+  end
+
+  test "path decoders reject percent-decoded invalid UTF-8" do
+    assert FlowPaths.decode_flow_detail_request("%FF?partition_key=tenant-a") ==
+             {"", [partition_key: "tenant-a", history_count: 50]}
+
+    assert FlowPaths.decode_flow_rewind_action("%FF/rewind") == :not_found
+    assert FlowPaths.decode_flow_signal_action("%FF/signal") == :not_found
   end
 
   test "decode_flow_rewind_action accepts only rewind suffix" do

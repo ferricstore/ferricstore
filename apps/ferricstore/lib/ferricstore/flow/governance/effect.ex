@@ -12,58 +12,45 @@ defmodule Ferricstore.Flow.Governance.Effect do
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.RetentionGuard
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
 
   @terminal_statuses [:confirmed, :failed, :compensated]
+  @effect_statuses [:reserved | @terminal_statuses]
+  @max_exact_integer 9_007_199_254_740_991
+  @max_effect_field_bytes 262_144
+  @max_record_bytes 900_000
 
   def reserve(ctx, id, effect_key, effect_type, opts \\ [])
 
   def reserve(ctx, id, effect_key, effect_type, opts)
       when is_binary(id) and is_binary(effect_key) and is_binary(effect_type) and is_list(opts) do
     result =
-      with :ok <- validate_non_empty(:id, id),
-           :ok <- validate_non_empty(:effect_key, effect_key),
-           :ok <- validate_non_empty(:effect_type, effect_type),
+      with true <- Keyword.keyword?(opts),
+           :ok <- validate_bounded_binary(:id, id, Router.max_key_size()),
+           :ok <- validate_bounded_binary(:effect_key, effect_key, Router.max_key_size()),
+           :ok <- validate_bounded_binary(:effect_type, effect_type, Router.max_key_size()),
            {:ok, record, partition_key} <- load_flow_record(ctx, id, opts),
            :ok <- validate_flow_lease(record, opts),
-           {:ok, operation_digest} <- required_binary(opts, :operation_digest),
-           {:ok, idempotency_key} <- optional_binary(opts, :idempotency_key, nil),
+           {:ok, operation_digest} <-
+             required_bounded_binary(opts, :operation_digest, @max_effect_field_bytes),
+           {:ok, idempotency_key} <-
+             optional_bounded_binary(opts, :idempotency_key, nil, @max_effect_field_bytes),
            {:ok, now_ms} <- optional_now_ms(opts),
-           {:ok, policy} <- effective_policy(ctx, record, effect_type),
-           :ok <- allowed_by_policy?(ctx, policy, record, effect_key, effect_type, opts, now_ms),
-           :ok <- allowed_by_circuit?(ctx, policy, record, effect_key, effect_type, now_ms),
-           effect =
-             effect_record(
-               record,
-               effect_key,
-               effect_type,
-               operation_digest,
-               idempotency_key,
-               policy,
-               now_ms
-             ),
            effect_key_bin = Keys.governance_effect_key(id, effect_key, partition_key),
-           :ok <- validate_key_size(effect_key_bin),
-           encoded = encode_effect(effect),
-           set_result <-
-             Router.set(ctx, effect_key_bin, encoded, %{
-               expire_at_ms: 0,
-               nx: true,
-               xx: false,
-               get: false,
-               keepttl: false,
-               flow_retention_owner: retention_owner(record)
-             }) do
-        case set_result do
-          :ok ->
-            write_ledger(ctx, record, :effect_reserved, effect, now_ms)
-            {:ok, Map.put(effect, :decision, :reserved)}
-
-          nil ->
-            existing_effect_decision(ctx, effect_key_bin, operation_digest)
-
-          {:error, _reason} = error ->
-            error
-        end
+           :ok <- validate_key_size(effect_key_bin) do
+        reserve_or_replay_effect(ctx, %{
+          record: record,
+          effect_key: effect_key,
+          effect_type: effect_type,
+          operation_digest: operation_digest,
+          idempotency_key: idempotency_key,
+          now_ms: now_ms,
+          opts: opts,
+          storage_key: effect_key_bin
+        })
+      else
+        false -> {:error, "ERR flow effect opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:effect_reserve, result, %{
@@ -92,14 +79,26 @@ defmodule Ferricstore.Flow.Governance.Effect do
 
   def get(ctx, id, effect_key, opts)
       when is_binary(id) and is_binary(effect_key) and is_list(opts) do
-    with {:ok, partition_key} <- optional_partition_key(opts),
+    with true <- Keyword.keyword?(opts),
+         :ok <- validate_bounded_binary(:id, id, Router.max_key_size()),
+         :ok <- validate_bounded_binary(:effect_key, effect_key, Router.max_key_size()),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         partition_key = partition_key || Keys.auto_partition_key(id),
          key = Keys.governance_effect_key(id, effect_key, partition_key),
          :ok <- validate_key_size(key) do
       case Router.get(ctx, key) do
-        nil -> {:ok, nil}
-        value when is_binary(value) -> decode_effect_result(value)
-        _other -> {:error, "ERR flow governance effect record is corrupt"}
+        nil ->
+          {:ok, nil}
+
+        value when is_binary(value) ->
+          with {:ok, effect} <- decode_effect_result(value), do: {:ok, public_effect(effect)}
+
+        _other ->
+          {:error, "ERR flow governance effect record is corrupt"}
       end
+    else
+      false -> {:error, "ERR flow effect opts must be a keyword list"}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -110,7 +109,11 @@ defmodule Ferricstore.Flow.Governance.Effect do
        when is_binary(id) and is_binary(effect_key) and status in @terminal_statuses and
               is_list(opts) do
     result =
-      with {:ok, record, partition_key} <- load_flow_record(ctx, id, opts),
+      with true <- Keyword.keyword?(opts),
+           :ok <- validate_bounded_binary(:id, id, Router.max_key_size()),
+           :ok <- validate_bounded_binary(:effect_key, effect_key, Router.max_key_size()),
+           :ok <- validate_terminal_options(opts),
+           {:ok, record, partition_key} <- load_flow_record(ctx, id, opts),
            :ok <- validate_flow_lease(record, opts),
            {:ok, now_ms} <- optional_now_ms(opts),
            key = Keys.governance_effect_key(id, effect_key, partition_key),
@@ -128,10 +131,13 @@ defmodule Ferricstore.Flow.Governance.Effect do
                    {:error, _reason} = error -> error
                  end
                end
-             ) do
-        write_ledger(ctx, record, :"effect_#{status}", updated, now_ms)
-        maybe_record_circuit(ctx, record, updated, status, now_ms)
-        {:ok, updated}
+             ),
+           {:ok, finalized} <-
+             finalize_effect_side_effects(ctx, key, record, updated, status) do
+        {:ok, finalized}
+      else
+        false -> {:error, "ERR flow effect opts must be a keyword list"}
+        {:error, _reason} = error -> error
       end
 
     Telemetry.emit(:"effect_#{status}", result, %{flow_id: id, effect_key: effect_key})
@@ -142,18 +148,144 @@ defmodule Ferricstore.Flow.Governance.Effect do
 
   defp existing_effect_decision(ctx, key, operation_digest) do
     with {:ok, existing} <- get_existing_effect(ctx, key) do
-      if Map.get(existing, :operation_digest) == operation_digest do
-        {:ok, Map.put(existing, :decision, :already_reserved)}
-      else
-        {:error,
-         Decision.conflict(%{
-           message: "Effect key already exists with a different operation_digest",
-           policy: "effect_idempotency",
-           effect_key: Map.get(existing, :effect_key),
-           status: Map.get(existing, :status),
-           decision_id: decision_id("effect_conflict", key)
-         })}
+      existing_effect_result(existing, key, operation_digest)
+    end
+  end
+
+  defp existing_effect_result(existing, key, operation_digest) do
+    if Map.get(existing, :operation_digest) == operation_digest do
+      {:ok, Map.put(existing, :decision, :already_reserved)}
+    else
+      {:error,
+       Decision.conflict(%{
+         message: "Effect key already exists with a different operation_digest",
+         policy: "effect_idempotency",
+         effect_key: Map.get(existing, :effect_key),
+         status: Map.get(existing, :status),
+         decision_id: decision_id("effect_conflict", key)
+       })}
+    end
+  end
+
+  defp reserve_or_replay_effect(ctx, reservation) do
+    case get_optional_effect(ctx, reservation.storage_key) do
+      {:ok, nil} ->
+        reserve_new_effect(ctx, reservation)
+
+      {:ok, existing} ->
+        with {:ok, replayed} <-
+               existing_effect_result(
+                 existing,
+                 reservation.storage_key,
+                 reservation.operation_digest
+               ) do
+          finalize_effect_side_effects(
+            ctx,
+            reservation.storage_key,
+            reservation.record,
+            replayed,
+            :reserved
+          )
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp reserve_new_effect(ctx, reservation) do
+    with {:ok, policy} <-
+           effective_policy(ctx, reservation.record, reservation.effect_type),
+         :ok <-
+           allowed_by_policy?(
+             ctx,
+             policy,
+             reservation.record,
+             reservation.effect_key,
+             reservation.effect_type,
+             reservation.opts,
+             reservation.now_ms
+           ),
+         {:ok, circuit_permit} <-
+           allowed_by_circuit?(
+             ctx,
+             policy,
+             reservation.record,
+             reservation.effect_key,
+             reservation.effect_type,
+             reservation.now_ms
+           ),
+         effect =
+           effect_record(
+             reservation.record,
+             reservation.effect_key,
+             reservation.effect_type,
+             reservation.operation_digest,
+             reservation.idempotency_key,
+             policy,
+             reservation.now_ms
+           ),
+         encoded = encode_effect(effect),
+         :ok <- run_before_effect_set_hook(effect),
+         set_result <-
+           Router.set(ctx, reservation.storage_key, encoded, %{
+             expire_at_ms: 0,
+             nx: true,
+             xx: false,
+             get: false,
+             keepttl: false,
+             flow_retention_owner: retention_owner(reservation.record)
+           }) do
+      case set_result do
+        :ok ->
+          finalize_effect_side_effects(
+            ctx,
+            reservation.storage_key,
+            reservation.record,
+            Map.put(effect, :decision, :reserved),
+            :reserved
+          )
+
+        nil ->
+          with :ok <-
+                 CircuitStore.release_permit(ctx, circuit_permit, reservation.now_ms),
+               {:ok, replayed} <-
+                 existing_effect_decision(
+                   ctx,
+                   reservation.storage_key,
+                   reservation.operation_digest
+                 ) do
+            finalize_effect_side_effects(
+              ctx,
+              reservation.storage_key,
+              reservation.record,
+              replayed,
+              :reserved
+            )
+          end
+
+        {:error, _reason} = error ->
+          case CircuitStore.release_permit(ctx, circuit_permit, reservation.now_ms) do
+            :ok -> error
+            {:error, _reason} = release_error -> release_error
+          end
       end
+    end
+  end
+
+  defp get_optional_effect(ctx, key) do
+    case Router.get(ctx, key) do
+      nil -> {:ok, nil}
+      value when is_binary(value) -> decode_effect_result(value)
+      {:error, _reason} = error -> error
+      _other -> {:error, "ERR flow governance effect record is corrupt"}
+    end
+  end
+
+  defp run_before_effect_set_hook(effect) do
+    case Process.get(:ferricstore_governance_effect_before_set_hook) do
+      hook when is_function(hook, 1) -> hook.(effect)
+      _missing -> :ok
     end
   end
 
@@ -175,6 +307,9 @@ defmodule Ferricstore.Flow.Governance.Effect do
            decision_id: decision_id("effect_terminal", Map.get(effect, :effect_key, ""))
          })}
 
+      now_ms < Map.get(effect, :updated_at_ms, Map.get(effect, :created_at_ms, 0)) ->
+        {:error, "ERR flow effect now_ms cannot precede updated_at_ms"}
+
       true ->
         {:ok,
          effect
@@ -188,12 +323,108 @@ defmodule Ferricstore.Flow.Governance.Effect do
     end
   end
 
-  defp maybe_record_circuit(ctx, record, effect, status, now_ms) do
-    if Map.get(effect, :decision) == status and status in [:confirmed, :failed] do
-      do_record_circuit(ctx, record, effect, status, now_ms)
-    else
-      :ok
+  defp finalize_effect_side_effects(ctx, key, record, effect, :reserved) do
+    decision = Map.get(effect, :decision)
+
+    with {:ok, finalized} <-
+           ensure_effect_side_effects(ctx, key, record, effect, :reserved) do
+      {:ok, public_effect(finalized, decision)}
     end
+  end
+
+  defp finalize_effect_side_effects(ctx, key, record, effect, status)
+       when status in @terminal_statuses do
+    decision = Map.get(effect, :decision)
+
+    with {:ok, effect} <-
+           ensure_effect_side_effects(ctx, key, record, effect, :reserved),
+         {:ok, finalized} <-
+           ensure_effect_side_effects(ctx, key, record, effect, status) do
+      {:ok, public_effect(finalized, decision)}
+    end
+  end
+
+  defp ensure_effect_side_effects(ctx, key, record, effect, status) do
+    if side_effects_applied?(effect, status) do
+      {:ok, effect}
+    else
+      at_ms = side_effect_at_ms(effect, status)
+
+      with :ok <- write_effect_ledger(ctx, record, effect, status, at_ms),
+           :ok <- maybe_record_circuit(ctx, record, effect, status, at_ms),
+           {:ok, finalized} <- mark_side_effects_applied(ctx, key, status) do
+        {:ok, finalized}
+      end
+    end
+  end
+
+  defp write_effect_ledger(ctx, record, effect, status, at_ms) do
+    fields =
+      effect
+      |> Map.put(:status, status)
+      |> Map.put(:event_id, effect_ledger_event_id(effect, status))
+
+    write_ledger(ctx, record, :"effect_#{status}", fields, at_ms)
+  end
+
+  defp maybe_record_circuit(ctx, record, effect, status, now_ms)
+       when status in [:confirmed, :failed] do
+    case do_record_circuit(ctx, record, effect, status, now_ms) do
+      {:ok, _circuit} -> :ok
+      :ok -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp maybe_record_circuit(_ctx, _record, _effect, _status, _now_ms), do: :ok
+
+  defp mark_side_effects_applied(ctx, key, status) do
+    AtomicRecord.mutate(
+      ctx,
+      key,
+      &decode_effect_result/1,
+      &encode_effect/1,
+      fn -> {:error, "ERR flow effect not found"} end,
+      fn effect ->
+        if side_effect_status_matches?(effect, status) do
+          {:ok, put_applied_side_effect(effect, status)}
+        else
+          {:error, "ERR flow effect changed while finalizing governance side effects"}
+        end
+      end
+    )
+  end
+
+  defp side_effect_status_matches?(_effect, :reserved), do: true
+  defp side_effect_status_matches?(effect, status), do: Map.get(effect, :status) == status
+
+  defp put_applied_side_effect(effect, status) do
+    applied =
+      effect
+      |> Map.get(:applied_side_effects, [])
+      |> Kernel.++([status])
+      |> Enum.uniq()
+      |> Enum.sort_by(&side_effect_status_rank/1)
+
+    Map.put(effect, :applied_side_effects, applied)
+  end
+
+  defp side_effects_applied?(effect, status),
+    do: status in Map.get(effect, :applied_side_effects, [])
+
+  defp side_effect_status_rank(:reserved), do: 0
+  defp side_effect_status_rank(:confirmed), do: 1
+  defp side_effect_status_rank(:failed), do: 1
+  defp side_effect_status_rank(:compensated), do: 1
+
+  defp side_effect_at_ms(effect, :reserved), do: Map.fetch!(effect, :created_at_ms)
+  defp side_effect_at_ms(effect, _terminal_status), do: Map.fetch!(effect, :updated_at_ms)
+
+  defp effect_ledger_event_id(effect, status) do
+    decision_id(
+      "effect_ledger_#{status}",
+      Map.fetch!(effect, :flow_id) <> ":" <> Map.fetch!(effect, :effect_key)
+    )
   end
 
   defp do_record_circuit(ctx, _record, effect, status, now_ms) do
@@ -233,22 +464,6 @@ defmodule Ferricstore.Flow.Governance.Effect do
         {:ok, scope, rule}
 
       _other ->
-        old_effect_circuit_rule(effect)
-    end
-  end
-
-  defp old_effect_circuit_rule(effect) do
-    case {
-      Map.get(effect, :circuit_scope),
-      Map.get(effect, :circuit_failure_threshold),
-      Map.get(effect, :circuit_open_ms)
-    } do
-      {scope, failure_threshold, open_ms}
-      when is_binary(scope) and scope != "" and is_integer(failure_threshold) and
-             failure_threshold > 0 and is_integer(open_ms) and open_ms > 0 ->
-        {:ok, scope, %{failure_threshold: failure_threshold, open_ms: open_ms}}
-
-      _other ->
         :skip
     end
   end
@@ -275,7 +490,8 @@ defmodule Ferricstore.Flow.Governance.Effect do
       policy_hash: Map.get(policy, :policy_hash),
       policy_version: Map.get(policy, :policy_version),
       created_at_ms: now_ms,
-      updated_at_ms: now_ms
+      updated_at_ms: now_ms,
+      applied_side_effects: []
     }
     |> put_circuit_metadata(policy, effect_type)
   end
@@ -285,8 +501,6 @@ defmodule Ferricstore.Flow.Governance.Effect do
       {:ok, scope, rule} ->
         effect
         |> Map.put(:circuit_scope, scope)
-        |> Map.put(:circuit_failure_threshold, Map.fetch!(rule, :failure_threshold))
-        |> Map.put(:circuit_open_ms, Map.fetch!(rule, :open_ms))
         |> Map.put(:circuit_rule, rule)
 
       :skip ->
@@ -331,11 +545,11 @@ defmodule Ferricstore.Flow.Governance.Effect do
     scope = "effect:" <> effect_type
 
     if Map.has_key?(circuits, scope) do
-      case CircuitStore.allow(ctx, scope, now_ms) do
-        :ok ->
-          :ok
+      case CircuitStore.acquire(ctx, scope, now_ms) do
+        {:ok, permit} ->
+          {:ok, permit}
 
-        {:error, denial} ->
+        {:error, denial} when is_map(denial) ->
           denial =
             denial
             |> Map.put(:policy_hash, Map.get(policy, :policy_hash))
@@ -343,9 +557,12 @@ defmodule Ferricstore.Flow.Governance.Effect do
 
           write_denial_ledger(ctx, record, :circuit_open, effect_key, effect_type, denial, now_ms)
           {:error, denial}
+
+        {:error, _reason} = error ->
+          error
       end
     else
-      :ok
+      {:ok, nil}
     end
   end
 
@@ -450,7 +667,11 @@ defmodule Ferricstore.Flow.Governance.Effect do
   end
 
   defp write_ledger(ctx, record, event, effect, now_ms) do
-    Ledger.append(ctx, record, event, effect, now_ms)
+    case Ledger.append(ctx, record, event, effect, now_ms) do
+      {:ok, :ok} -> :ok
+      :ok -> :ok
+      {:error, _reason} = error -> error
+    end
   end
 
   defp retention_owner(record) do
@@ -465,15 +686,121 @@ defmodule Ferricstore.Flow.Governance.Effect do
     }
   end
 
-  defp encode_effect(effect), do: :erlang.term_to_binary({:flow_governance_effect_v1, effect})
+  defp encode_effect(effect) do
+    encoded_effect = Map.delete(effect, :decision)
+    TermCodec.encode({:flow_governance_effect_v1, encoded_effect})
+  end
 
   defp decode_effect_result(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {:flow_governance_effect_v1, effect} when is_map(effect) -> {:ok, effect}
-      _other -> {:error, "ERR flow governance effect record is corrupt"}
+    case TermCodec.decode(value) do
+      {:ok, {:flow_governance_effect_v1, effect}} when is_map(effect) ->
+        if valid_effect?(effect) do
+          {:ok, effect}
+        else
+          {:error, "ERR flow governance effect record is corrupt"}
+        end
+
+      _other ->
+        {:error, "ERR flow governance effect record is corrupt"}
     end
-  rescue
-    _ -> {:error, "ERR flow governance effect record is corrupt"}
+  end
+
+  defp valid_effect?(effect) do
+    valid_required_binary(effect, :flow_id, Router.max_key_size()) and
+      valid_required_binary(effect, :type, Router.max_key_size()) and
+      valid_required_binary(effect, :state, Router.max_key_size()) and
+      valid_required_binary(effect, :effect_key, Router.max_key_size()) and
+      valid_required_binary(effect, :effect_type, Router.max_key_size()) and
+      valid_required_binary(effect, :operation_digest, @max_effect_field_bytes) and
+      valid_optional_binary(effect, :partition_key, Router.max_key_size()) and
+      valid_optional_binary(effect, :idempotency_key, @max_effect_field_bytes) and
+      valid_optional_binary(effect, :policy_hash, @max_effect_field_bytes) and
+      valid_policy_version?(Map.get(effect, :policy_version)) and
+      Map.get(effect, :status) in @effect_statuses and
+      valid_timestamp?(Map.get(effect, :created_at_ms)) and
+      valid_timestamp?(Map.get(effect, :updated_at_ms)) and
+      Map.get(effect, :updated_at_ms) >= Map.get(effect, :created_at_ms) and
+      valid_optional_binary(effect, :external_id, @max_effect_field_bytes) and
+      valid_optional_binary(effect, :error, @max_effect_field_bytes) and
+      valid_optional_binary(effect, :reason, @max_effect_field_bytes) and
+      valid_optional_non_negative_integer(effect, :latency_ms) and
+      valid_applied_side_effects?(effect) and valid_circuit_metadata?(effect) and
+      :erlang.external_size(effect) <= @max_record_bytes
+  end
+
+  defp valid_applied_side_effects?(effect) do
+    case {Map.get(effect, :status), Map.get(effect, :applied_side_effects)} do
+      {:reserved, []} -> true
+      {:reserved, [:reserved]} -> true
+      {status, []} when status in @terminal_statuses -> true
+      {status, [:reserved]} when status in @terminal_statuses -> true
+      {status, [:reserved, status]} when status in @terminal_statuses -> true
+      _invalid -> false
+    end
+  end
+
+  defp valid_circuit_metadata?(effect) do
+    scope_present? = Map.has_key?(effect, :circuit_scope)
+    rule_present? = Map.has_key?(effect, :circuit_rule)
+
+    cond do
+      not scope_present? and not rule_present? ->
+        true
+
+      scope_present? and rule_present? ->
+        scope = Map.get(effect, :circuit_scope)
+        rule = Map.get(effect, :circuit_rule)
+
+        if is_binary(scope) and scope != "" and byte_size(scope) <= Router.max_key_size() and
+             is_map(rule) do
+          case Policy.normalize(%{circuits: %{scope => rule}}) do
+            {:ok, %{circuits: %{^scope => canonical}}} -> canonical == rule
+            _invalid -> false
+          end
+        else
+          false
+        end
+
+      true ->
+        false
+    end
+  end
+
+  defp valid_required_binary(map, key, max_bytes) do
+    case Map.fetch(map, key) do
+      {:ok, value} when is_binary(value) ->
+        byte_size(value) > 0 and byte_size(value) <= max_bytes
+
+      _missing_or_invalid ->
+        false
+    end
+  end
+
+  defp valid_optional_binary(map, key, max_bytes) do
+    case Map.fetch(map, key) do
+      :error -> true
+      {:ok, nil} -> true
+      {:ok, value} when is_binary(value) -> byte_size(value) <= max_bytes
+      _invalid -> false
+    end
+  end
+
+  defp valid_policy_version?(nil), do: true
+
+  defp valid_policy_version?(version) when is_binary(version),
+    do: byte_size(version) > 0 and byte_size(version) <= @max_effect_field_bytes
+
+  defp valid_policy_version?(version), do: valid_timestamp?(version)
+
+  defp valid_timestamp?(value),
+    do: is_integer(value) and value >= 0 and value <= @max_exact_integer
+
+  defp valid_optional_non_negative_integer(map, key) do
+    case Map.fetch(map, key) do
+      :error -> true
+      {:ok, nil} -> true
+      {:ok, value} -> valid_timestamp?(value)
+    end
   end
 
   defp governance_scope(record, opts) do
@@ -484,16 +811,41 @@ defmodule Ferricstore.Flow.Governance.Effect do
 
   defp optional_partition_key(opts) do
     case Keyword.get(opts, :partition_key) do
-      nil -> {:ok, nil}
-      value when is_binary(value) -> {:ok, value}
-      _other -> {:error, "ERR flow partition_key must be a string"}
+      nil ->
+        {:ok, nil}
+
+      value when is_binary(value) ->
+        if byte_size(value) <= Router.max_key_size(),
+          do: {:ok, value},
+          else: {:error, "ERR flow partition_key must be a string"}
+
+      _other ->
+        {:error, "ERR flow partition_key must be a string"}
     end
   end
 
   defp optional_now_ms(opts) do
     case Keyword.get(opts, :now_ms, CommandTime.now_ms()) do
-      value when is_integer(value) and value >= 0 -> {:ok, value}
+      value when is_integer(value) and value >= 0 and value <= @max_exact_integer -> {:ok, value}
       _other -> {:error, "ERR flow now_ms must be a non-negative integer"}
+    end
+  end
+
+  defp required_bounded_binary(opts, key, max_bytes) do
+    case Keyword.get(opts, key) do
+      value when is_binary(value) and value != "" and byte_size(value) <= max_bytes ->
+        {:ok, value}
+
+      _other ->
+        {:error, "ERR flow #{key} must be a non-empty string of at most #{max_bytes} bytes"}
+    end
+  end
+
+  defp optional_bounded_binary(opts, key, default, max_bytes) do
+    case Keyword.get(opts, key, default) do
+      nil -> {:ok, nil}
+      value when is_binary(value) and byte_size(value) <= max_bytes -> {:ok, value}
+      _other -> {:error, "ERR flow #{key} must be a string of at most #{max_bytes} bytes"}
     end
   end
 
@@ -504,14 +856,6 @@ defmodule Ferricstore.Flow.Governance.Effect do
     end
   end
 
-  defp optional_binary(opts, key, default) do
-    case Keyword.get(opts, key, default) do
-      nil -> {:ok, nil}
-      value when is_binary(value) -> {:ok, value}
-      _other -> {:error, "ERR flow #{key} must be a string"}
-    end
-  end
-
   defp required_integer(opts, key) do
     case Keyword.get(opts, key) do
       value when is_integer(value) -> {:ok, value}
@@ -519,8 +863,39 @@ defmodule Ferricstore.Flow.Governance.Effect do
     end
   end
 
-  defp validate_non_empty(field, value) do
-    if value != "", do: :ok, else: {:error, "ERR flow #{field} must be a non-empty string"}
+  defp validate_bounded_binary(field, value, max_bytes) do
+    if value != "" and byte_size(value) <= max_bytes do
+      :ok
+    else
+      {:error, "ERR flow #{field} must be a non-empty string of at most #{max_bytes} bytes"}
+    end
+  end
+
+  defp validate_terminal_options(opts) do
+    with :ok <- validate_optional_binary_option(opts, :external_id),
+         :ok <- validate_optional_binary_option(opts, :error),
+         :ok <- validate_optional_binary_option(opts, :reason),
+         :ok <- validate_optional_latency(opts) do
+      :ok
+    end
+  end
+
+  defp validate_optional_binary_option(opts, key) do
+    case Keyword.fetch(opts, key) do
+      :error -> :ok
+      {:ok, nil} -> :ok
+      {:ok, value} when is_binary(value) and byte_size(value) <= @max_effect_field_bytes -> :ok
+      _invalid -> {:error, "ERR flow #{key} must be a string"}
+    end
+  end
+
+  defp validate_optional_latency(opts) do
+    case Keyword.fetch(opts, :latency_ms) do
+      :error -> :ok
+      {:ok, nil} -> :ok
+      {:ok, value} when is_integer(value) and value >= 0 and value <= @max_exact_integer -> :ok
+      _invalid -> {:error, "ERR flow latency_ms must be a non-negative integer"}
+    end
   end
 
   defp validate_key_size(key) do
@@ -541,6 +916,16 @@ defmodule Ferricstore.Flow.Governance.Effect do
     do: Map.put(map, key, value)
 
   defp maybe_put_non_negative_integer(map, _key, _value), do: map
+
+  defp public_effect(effect, decision \\ nil) do
+    effect =
+      Map.drop(effect, [
+        :applied_side_effects,
+        :decision
+      ])
+
+    if is_nil(decision), do: effect, else: Map.put(effect, :decision, decision)
+  end
 
   defp decision_id(reason, subject) do
     :crypto.hash(:sha256, "#{reason}:#{subject}")

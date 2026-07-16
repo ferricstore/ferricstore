@@ -2,7 +2,10 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.HistoryProjector.KeyCodec
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+
+  @trim_batch_size 4_096
 
   def trim_history_caps(
         instance_ctx,
@@ -26,43 +29,213 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
 
       native = NativeFlowIndex.get(flow_index, flow_lookup)
 
-      trim_items =
-        cap_requirements
-        |> Enum.flat_map(fn
-          {history_key, {max_events, true}} ->
-            history_key
-            |> lmdb_history_over_cap_items(shard_data_path, max_events)
-            |> Enum.map(fn {event_id, key, history_index_key} ->
-              {history_key, event_id, key, history_index_key}
-            end)
+      trim_history_cap_requirements(
+        cap_requirements,
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        keydir,
+        file_path,
+        native,
+        callbacks
+      )
+    end
+  end
 
-          {_history_key, {_max_events, false}} ->
-            []
-        end)
+  defp trim_history_cap_requirements(
+         cap_requirements,
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         keydir,
+         file_path,
+         native,
+         callbacks
+       ) do
+    cap_requirements
+    |> Enum.reduce_while(:ok, fn
+      {history_key, {max_events, true}}, :ok ->
+        case trim_history_cap_batches(
+               history_key,
+               max_events,
+               instance_ctx,
+               shard_index,
+               shard_data_path,
+               keydir,
+               file_path,
+               native,
+               callbacks
+             ) do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
 
-      case trim_items do
-        [] ->
-          :ok
+      {_history_key, {_max_events, false}}, :ok ->
+        {:cont, :ok}
+    end)
+  end
 
-        [_ | _] ->
-          tombstone_keys =
-            Enum.map(trim_items, fn {_history_key, _event_id, key, _history_index_key} -> key end)
+  defp trim_history_cap_batches(
+         history_key,
+         max_events,
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         keydir,
+         file_path,
+         native,
+         callbacks
+       ) do
+    with {:ok, excess} <- history_trim_excess_count(history_key, shard_data_path, max_events) do
+      trim_history_excess_batches(
+        history_key,
+        excess,
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        keydir,
+        file_path,
+        native,
+        callbacks
+      )
+    end
+  end
 
-          with :ok <- append_tombstones(file_path, tombstone_keys, callbacks),
-               :ok <- delete_lmdb_history_entries(shard_data_path, trim_items) do
-            if native do
-              NativeFlowIndex.delete_entries(native, history_delete_entries(trim_items))
-            end
+  defp trim_history_excess_batches(
+         _history_key,
+         0,
+         _instance_ctx,
+         _shard_index,
+         _shard_data_path,
+         _keydir,
+         _file_path,
+         _native,
+         _callbacks
+       ),
+       do: :ok
 
-            Enum.each(tombstone_keys, fn key ->
-              callbacks.delete_keydir_row.(instance_ctx, keydir, shard_index, key)
-            end)
+  defp trim_history_excess_batches(
+         history_key,
+         excess,
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         keydir,
+         file_path,
+         native,
+         callbacks
+       ) do
+    batch_size = history_trim_batch_size(excess)
 
-            :ok
+    case lmdb_history_trim_batch(history_key, shard_data_path, batch_size) do
+      {:ok, items} ->
+        trim_items =
+          Enum.map(items, fn {event_id, key, history_index_key} ->
+            {history_key, event_id, key, history_index_key}
+          end)
+
+        tombstone_keys =
+          Enum.map(trim_items, fn {_history_key, _event_id, key, _history_index_key} -> key end)
+
+        with {:ok, lmdb_delete_ops} <-
+               lmdb_history_delete_ops(shard_data_path, trim_items),
+             :ok <- append_tombstones(file_path, tombstone_keys, callbacks),
+             :ok <- write_lmdb_history_delete_ops(shard_data_path, lmdb_delete_ops) do
+          if native do
+            NativeFlowIndex.delete_entries(native, history_delete_entries(trim_items))
           end
+
+          Enum.each(tombstone_keys, fn key ->
+            callbacks.delete_keydir_row.(instance_ctx, keydir, shard_index, key)
+          end)
+
+          trim_history_excess_batches(
+            history_key,
+            excess - batch_size,
+            instance_ctx,
+            shard_index,
+            shard_data_path,
+            keydir,
+            file_path,
+            native,
+            callbacks
+          )
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def lmdb_history_over_cap_items(history_key, shard_data_path, max_events) do
+    with {:ok, excess} <- history_trim_excess_count(history_key, shard_data_path, max_events) do
+      case excess do
+        0 ->
+          {:ok, []}
+
+        count ->
+          lmdb_history_trim_batch(history_key, shard_data_path, history_trim_batch_size(count))
       end
     end
   end
+
+  defp history_trim_excess_count(history_key, shard_data_path, max_events) do
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
+    prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+
+    case Ferricstore.Flow.LMDB.prefix_count(lmdb_path, prefix) do
+      {:ok, count} when is_integer(count) and count >= 0 and count <= max_events ->
+        {:ok, 0}
+
+      {:ok, count} when is_integer(count) and count > max_events ->
+        {:ok, count - max_events}
+
+      {:ok, invalid_count} ->
+        {:error, {:invalid_history_trim_count, invalid_count}}
+
+      {:error, _reason} = error ->
+        error
+
+      invalid ->
+        {:error, {:invalid_history_trim_count_result, invalid}}
+    end
+  end
+
+  defp lmdb_history_trim_batch(history_key, shard_data_path, trim_count) do
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
+    prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+
+    case Ferricstore.Flow.LMDB.prefix_entries(lmdb_path, prefix, trim_count) do
+      {:ok, entries} -> decode_lmdb_history_trim_items(entries, trim_count)
+      {:error, _reason} = error -> error
+      invalid -> {:error, {:invalid_history_trim_entries_result, invalid}}
+    end
+  end
+
+  def history_trim_batch_size(excess) when is_integer(excess) and excess > 0,
+    do: min(excess, @trim_batch_size)
+
+  def decode_lmdb_history_trim_items(entries, expected_count)
+      when is_list(entries) and is_integer(expected_count) and expected_count >= 0 do
+    if length(entries) == expected_count do
+      entries
+      |> Enum.reduce_while({:ok, []}, fn entry, {:ok, acc} ->
+        case decode_lmdb_history_trim_item(entry) do
+          {:ok, item} -> {:cont, {:ok, [item | acc]}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, items} -> {:ok, Enum.reverse(items)}
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, {:history_trim_batch_result_mismatch, expected_count, length(entries)}}
+    end
+  end
+
+  def decode_lmdb_history_trim_items(entries, expected_count),
+    do: {:error, {:invalid_history_trim_batch, expected_count, entries}}
 
   def history_cap_requirements(entries, load_cap_fun) do
     entries
@@ -143,29 +316,18 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
 
   def history_cap_required?(_state, _max_events), do: false
 
-  def lmdb_history_over_cap_items(history_key, shard_data_path, max_events) do
-    lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
-    prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
-
-    with {:ok, count} <- Ferricstore.Flow.LMDB.prefix_count(lmdb_path, prefix),
-         true <- count > max_events,
-         {:ok, entries} <-
-           Ferricstore.Flow.LMDB.prefix_entries(lmdb_path, prefix, count - max_events) do
-      Enum.flat_map(entries, &decode_lmdb_history_trim_item/1)
-    else
-      _ -> []
-    end
-  end
-
   def decode_lmdb_history_trim_item({history_index_key, value}) do
     case Ferricstore.Flow.LMDB.decode_history_index_value(value) do
       {:ok, {event_id, _event_ms, _expire_at_ms, compound_key}} ->
-        [{event_id, compound_key, history_index_key}]
+        {:ok, {event_id, compound_key, history_index_key}}
 
       _ ->
-        []
+        {:error, {:invalid_history_trim_index, history_index_key}}
     end
   end
+
+  def decode_lmdb_history_trim_item(invalid),
+    do: {:error, {:invalid_history_trim_index_entry, invalid}}
 
   def trim_history_hot_cache(instance_ctx, shard_index, keydir, entries, callbacks) do
     direct_items = direct_hot_history_evict_items(entries)
@@ -368,9 +530,9 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   def append_tombstones(file_path, keys, callbacks) do
     ops = Enum.map(keys, &{:delete, &1})
 
-    with {:ok, locations} <- NIF.v2_append_ops_batch_nosync(file_path, ops),
+    with {:ok, locations} <- NIF.v2_append_ops_batch(file_path, ops),
          :ok <- validate_tombstone_locations(locations, length(keys)),
-         :ok <- callbacks.sync_history_log.(file_path) do
+         :ok <- callbacks.sync_history_log_before_publish.(file_path) do
       :ok
     end
   end
@@ -396,43 +558,55 @@ defmodule Ferricstore.Flow.HistoryProjector.Trim do
   def delete_lmdb_history_entries(_shard_data_path, []), do: :ok
 
   def delete_lmdb_history_entries(shard_data_path, items) do
+    with {:ok, ops} <- lmdb_history_delete_ops(shard_data_path, items) do
+      write_lmdb_history_delete_ops(shard_data_path, ops)
+    end
+  end
+
+  defp lmdb_history_delete_ops(shard_data_path, items) do
     path = Ferricstore.Flow.LMDB.path(shard_data_path)
 
-    ops =
-      Enum.flat_map(items, fn
-        {_history_key, _event_id, _key, history_index_key} when is_binary(history_index_key) ->
-          Ferricstore.Flow.LMDB.history_index_delete_ops(path, history_index_key)
+    items
+    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+      with {:ok, history_index_key} <- history_index_key_for_delete(item),
+           {:ok, item_ops} <-
+             Ferricstore.Flow.LMDB.history_index_delete_ops_result(path, history_index_key) do
+        {:cont, {:ok, Enum.reverse(item_ops, acc)}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, reversed_ops} -> {:ok, Enum.reverse(reversed_ops)}
+      {:error, _reason} = error -> error
+    end
+  end
 
-        {history_key, event_id, _key} ->
-          case parse_event_ms(event_id) do
-            {:ok, event_ms} ->
-              history_index_key =
-                Ferricstore.Flow.LMDB.history_index_key(history_key, event_id, event_ms)
+  defp history_index_key_for_delete({_history_key, _event_id, _key, history_index_key})
+       when is_binary(history_index_key),
+       do: {:ok, history_index_key}
 
-              Ferricstore.Flow.LMDB.history_index_delete_ops(path, history_index_key)
+  defp history_index_key_for_delete({history_key, event_id, _key})
+       when is_binary(history_key) and is_binary(event_id) do
+    case parse_event_ms(event_id) do
+      {:ok, event_ms} ->
+        {:ok, Ferricstore.Flow.LMDB.history_index_key(history_key, event_id, event_ms)}
 
-            :error ->
-              []
-          end
-      end)
+      :error ->
+        {:error, {:invalid_history_event_id, event_id}}
+    end
+  end
 
+  defp history_index_key_for_delete(item), do: {:error, {:invalid_history_trim_item, item}}
+
+  defp write_lmdb_history_delete_ops(shard_data_path, ops) do
+    path = Ferricstore.Flow.LMDB.path(shard_data_path)
     Ferricstore.Flow.LMDB.write_batch(path, ops)
   end
 
   def history_entry_key(history_key, event_id), do: "X:" <> history_key <> <<0>> <> event_id
 
-  def parse_event_ms(event_id) do
-    case :binary.split(event_id, "-") do
-      [ms, _version] ->
-        case Integer.parse(ms) do
-          {event_ms, ""} -> {:ok, event_ms}
-          _ -> :error
-        end
-
-      _ ->
-        :error
-    end
-  end
+  def parse_event_ms(event_id), do: KeyCodec.parse_event_ms(event_id)
 
   def instance_name(%{name: name}), do: name
   def instance_name(_instance_ctx), do: :default

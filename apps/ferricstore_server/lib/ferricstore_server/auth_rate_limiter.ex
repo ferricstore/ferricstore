@@ -4,12 +4,13 @@ defmodule FerricstoreServer.AuthRateLimiter do
   use GenServer
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Acl.{Password, Rules}
 
   @default_max_attempts 10
   @default_window_ms 60_000
   @default_max_entries 10_000
-  @max_username_bytes 1_024
-  @max_password_bytes 4_096
+  @max_username_bytes Rules.max_username_bytes()
+  @max_password_bytes Password.max_password_bytes()
 
   @type limiter_key :: {:ip | :user, binary()}
   @type entry :: %{

@@ -6,6 +6,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
   alias Ferricstore.Bitcask.NIF
 
   @filename "raft_replay_safe.index"
+  @max_marker_bytes 64
 
   @spec path(binary()) :: binary()
   def path(shard_data_path), do: Path.join(shard_data_path, @filename)
@@ -14,7 +15,7 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
   def read(shard_data_path) do
     shard_data_path
     |> path()
-    |> File.read()
+    |> Ferricstore.FS.read_nofollow(@max_marker_bytes)
     |> case do
       {:ok, contents} ->
         contents
@@ -37,12 +38,19 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
     contents = Integer.to_string(index) <> "\n"
 
     result =
-      with :ok <- ensure_marker_dir(shard_data_path),
-           :ok <- File.write(tmp_path, contents),
-           :ok <- fsync(NIF.v2_fsync(tmp_path), tmp_path),
-           :ok <- Ferricstore.FS.rename(tmp_path, marker_path),
-           :ok <- fsync(NIF.v2_fsync_dir(shard_data_path), shard_data_path) do
-        :ok
+      with :ok <- ensure_marker_dir(shard_data_path) do
+        with_marker_lock(marker_path, fn ->
+          if read(shard_data_path) >= index do
+            :ok
+          else
+            with :ok <- write_exclusive(tmp_path, contents),
+                 :ok <- fsync(NIF.v2_fsync(tmp_path), tmp_path),
+                 :ok <- Ferricstore.FS.rename(tmp_path, marker_path),
+                 :ok <- fsync(NIF.v2_fsync_dir(shard_data_path), shard_data_path) do
+              :ok
+            end
+          end
+        end)
       end
 
     case result do
@@ -90,6 +98,32 @@ defmodule Ferricstore.Raft.ReplaySafeIndex do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp write_exclusive(path, contents) do
+    case File.open(path, [:write, :binary, :exclusive]) do
+      {:ok, io} ->
+        write_result = IO.binwrite(io, contents)
+        close_result = File.close(io)
+
+        case {write_result, close_result} do
+          {:ok, :ok} -> :ok
+          {{:error, reason}, _close_result} -> {:error, reason}
+          {:ok, {:error, reason}} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp with_marker_lock(marker_path, fun) when is_function(fun, 0) do
+    lock = {{__MODULE__, marker_path}, self()}
+
+    case :global.trans(lock, fun, [node()]) do
+      :aborted -> {:error, :marker_lock_busy}
+      result -> result
     end
   end
 

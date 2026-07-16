@@ -101,7 +101,11 @@ defmodule Ferricstore.Merge.Semaphore do
     {:reply, {:busy, held_shard}, state}
   end
 
-  def handle_call({:release, shard_index}, _from, %{holder: {shard_index, _pid}} = state) do
+  def handle_call(
+        {:release, shard_index},
+        {caller_pid, _tag},
+        %{holder: {shard_index, caller_pid}} = state
+      ) do
     if state.monitor_ref, do: Process.demonitor(state.monitor_ref, [:flush])
     {:reply, :ok, %{state | holder: nil, monitor_ref: nil}}
   end

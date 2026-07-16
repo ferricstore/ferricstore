@@ -7,8 +7,10 @@ defmodule Ferricstore.Flow.RAMIndexRead do
 
   def rank_entries(ctx, index_key, count) do
     case Router.flow_index_rank_range(ctx, index_key, 0, count - 1, false) do
-      {:ok, entries} -> {:ok, entries}
-      :unavailable -> {:ok, []}
+      {:ok, entries} when is_list(entries) -> {:ok, entries}
+      :unavailable -> {:error, :flow_index_unavailable}
+      {:error, _reason} = error -> error
+      _invalid -> {:error, :flow_index_unavailable}
     end
   end
 
@@ -27,13 +29,15 @@ defmodule Ferricstore.Flow.RAMIndexRead do
            ctx,
            index_key,
            min_bound(query.from_ms),
-           max_bound(query.to_ms),
+           max_bound(query),
            query.rev?,
            0,
            count
          ) do
-      {:ok, entries} -> {:ok, entries}
-      :unavailable -> {:ok, []}
+      {:ok, entries} when is_list(entries) -> {:ok, entries}
+      :unavailable -> {:error, :flow_index_unavailable}
+      {:error, _reason} = error -> error
+      _invalid -> {:error, :flow_index_unavailable}
     end
   end
 
@@ -46,6 +50,11 @@ defmodule Ferricstore.Flow.RAMIndexRead do
   def min_bound(nil), do: :neg_inf
   def min_bound(ms), do: {:inclusive, ms}
 
+  def max_bound(%{rev?: true, to_ms: to_ms, before_id: before_id})
+      when is_integer(to_ms) and is_binary(before_id) and before_id != "",
+      do: {:cursor_before, to_ms, before_id}
+
+  def max_bound(%{to_ms: to_ms}), do: max_bound(to_ms)
   def max_bound(nil), do: :pos_inf
   def max_bound(ms), do: {:inclusive, ms}
 end

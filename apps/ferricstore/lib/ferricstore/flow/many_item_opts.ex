@@ -1,51 +1,60 @@
 defmodule Ferricstore.Flow.ManyItemOpts do
   @moduledoc false
 
-  def create(id) when is_binary(id), do: {:ok, id, []}
+  def create(id) when is_binary(id), do: keyword_result(id, [])
 
-  def create(%{id: id} = item) when is_binary(id), do: {:ok, id, create_opts_from_map(item)}
-  def create(%{"id" => id} = item) when is_binary(id), do: {:ok, id, create_opts_from_map(item)}
+  def create(%{id: id} = item) when is_binary(id),
+    do: keyword_result(id, create_opts_from_map(item))
+
+  def create(%{"id" => id} = item) when is_binary(id),
+    do: keyword_result(id, create_opts_from_map(item))
 
   def create({id, item_opts}) when is_binary(id) and is_list(item_opts) do
     keyword_result(id, item_opts)
   end
 
   def create({:id, id, :payload_ref, payload_ref}) when is_binary(id) do
-    {:ok, id, [payload_ref: payload_ref]}
+    keyword_result(id, payload_ref: payload_ref)
   end
 
   def create({:id, id, :payload, payload}) when is_binary(id) do
-    {:ok, id, [payload: payload]}
+    keyword_result(id, payload: payload)
   end
 
   def create({:id, id, :partition_key, partition_key, :payload, payload})
       when is_binary(id) do
-    {:ok, id, [partition_key: partition_key, payload: payload]}
+    keyword_result(id, partition_key: partition_key, payload: payload)
   end
 
   def create({:id, id, :partition_key, partition_key, :payload_ref, payload_ref})
       when is_binary(id) do
-    {:ok, id, [partition_key: partition_key, payload_ref: payload_ref]}
+    keyword_result(id, partition_key: partition_key, payload_ref: payload_ref)
   end
 
   def create(_item), do: {:error, "ERR flow id must be a non-empty string"}
 
   def complete(%{id: id, lease_token: lease_token, fencing_token: fencing_token} = item)
       when is_binary(id) do
-    {:ok, id, lease_token,
-     [fencing_token: fencing_token] ++
-       complete_result_ref(item) ++
-       complete_result(item) ++ complete_payload(item) ++ partition_key(item)}
+    lease_result(
+      id,
+      lease_token,
+      [fencing_token: fencing_token] ++
+        complete_result_ref(item) ++
+        complete_result(item) ++ complete_payload(item) ++ partition_key(item)
+    )
   end
 
   def complete(
         %{"id" => id, "lease_token" => lease_token, "fencing_token" => fencing_token} = item
       )
       when is_binary(id) do
-    {:ok, id, lease_token,
-     [fencing_token: fencing_token] ++
-       complete_result_ref(item) ++
-       complete_result(item) ++ complete_payload(item) ++ partition_key(item)}
+    lease_result(
+      id,
+      lease_token,
+      [fencing_token: fencing_token] ++
+        complete_result_ref(item) ++
+        complete_result(item) ++ complete_payload(item) ++ partition_key(item)
+    )
   end
 
   def complete({id, lease_token, item_opts})
@@ -59,7 +68,7 @@ defmodule Ferricstore.Flow.ManyItemOpts do
 
   def complete({:id, id, :lease_token, lease_token, :fencing_token, fencing_token})
       when is_binary(id) do
-    {:ok, id, lease_token, [fencing_token: fencing_token]}
+    lease_result(id, lease_token, fencing_token: fencing_token)
   end
 
   def complete(
@@ -67,25 +76,31 @@ defmodule Ferricstore.Flow.ManyItemOpts do
          fencing_token}
       )
       when is_binary(id) do
-    {:ok, id, lease_token, [partition_key: partition_key, fencing_token: fencing_token]}
+    lease_result(id, lease_token, partition_key: partition_key, fencing_token: fencing_token)
   end
 
   def complete(_item), do: {:error, "ERR flow id must be a non-empty string"}
 
   def retry(%{id: id, lease_token: lease_token, fencing_token: fencing_token} = item)
       when is_binary(id) do
-    {:ok, id, lease_token,
-     [fencing_token: fencing_token] ++
-       retry_error_ref(item) ++
-       retry_error(item) ++ retry_payload(item) ++ retry_policy(item) ++ partition_key(item)}
+    lease_result(
+      id,
+      lease_token,
+      [fencing_token: fencing_token] ++
+        retry_error_ref(item) ++
+        retry_error(item) ++ retry_payload(item) ++ retry_policy(item) ++ partition_key(item)
+    )
   end
 
   def retry(%{"id" => id, "lease_token" => lease_token, "fencing_token" => fencing_token} = item)
       when is_binary(id) do
-    {:ok, id, lease_token,
-     [fencing_token: fencing_token] ++
-       retry_error_ref(item) ++
-       retry_error(item) ++ retry_payload(item) ++ retry_policy(item) ++ partition_key(item)}
+    lease_result(
+      id,
+      lease_token,
+      [fencing_token: fencing_token] ++
+        retry_error_ref(item) ++
+        retry_error(item) ++ retry_payload(item) ++ retry_policy(item) ++ partition_key(item)
+    )
   end
 
   def retry({id, lease_token, item_opts})
@@ -99,7 +114,7 @@ defmodule Ferricstore.Flow.ManyItemOpts do
 
   def retry({:id, id, :lease_token, lease_token, :fencing_token, fencing_token})
       when is_binary(id) do
-    {:ok, id, lease_token, [fencing_token: fencing_token]}
+    lease_result(id, lease_token, fencing_token: fencing_token)
   end
 
   def retry(
@@ -107,23 +122,29 @@ defmodule Ferricstore.Flow.ManyItemOpts do
          fencing_token}
       )
       when is_binary(id) do
-    {:ok, id, lease_token, [partition_key: partition_key, fencing_token: fencing_token]}
+    lease_result(id, lease_token, partition_key: partition_key, fencing_token: fencing_token)
   end
 
   def retry(_item), do: {:error, "ERR flow id must be a non-empty string"}
 
   def fail(%{id: id, lease_token: lease_token, fencing_token: fencing_token} = item)
       when is_binary(id) do
-    {:ok, id, lease_token,
-     [fencing_token: fencing_token] ++
-       retry_error_ref(item) ++ retry_error(item) ++ retry_payload(item) ++ partition_key(item)}
+    lease_result(
+      id,
+      lease_token,
+      [fencing_token: fencing_token] ++
+        retry_error_ref(item) ++ retry_error(item) ++ retry_payload(item) ++ partition_key(item)
+    )
   end
 
   def fail(%{"id" => id, "lease_token" => lease_token, "fencing_token" => fencing_token} = item)
       when is_binary(id) do
-    {:ok, id, lease_token,
-     [fencing_token: fencing_token] ++
-       retry_error_ref(item) ++ retry_error(item) ++ retry_payload(item) ++ partition_key(item)}
+    lease_result(
+      id,
+      lease_token,
+      [fencing_token: fencing_token] ++
+        retry_error_ref(item) ++ retry_error(item) ++ retry_payload(item) ++ partition_key(item)
+    )
   end
 
   def fail({id, lease_token, item_opts})
@@ -137,7 +158,7 @@ defmodule Ferricstore.Flow.ManyItemOpts do
 
   def fail({:id, id, :lease_token, lease_token, :fencing_token, fencing_token})
       when is_binary(id) do
-    {:ok, id, lease_token, [fencing_token: fencing_token]}
+    lease_result(id, lease_token, fencing_token: fencing_token)
   end
 
   def fail(
@@ -145,21 +166,25 @@ defmodule Ferricstore.Flow.ManyItemOpts do
          fencing_token}
       )
       when is_binary(id) do
-    {:ok, id, lease_token, [partition_key: partition_key, fencing_token: fencing_token]}
+    lease_result(id, lease_token, partition_key: partition_key, fencing_token: fencing_token)
   end
 
   def fail(_item), do: {:error, "ERR flow id must be a non-empty string"}
 
   def cancel(%{id: id, fencing_token: fencing_token} = item) when is_binary(id) do
-    {:ok, id,
-     [fencing_token: fencing_token] ++
-       lease_token(item) ++ cancel_reason_ref(item) ++ cancel_reason(item) ++ partition_key(item)}
+    keyword_result(
+      id,
+      [fencing_token: fencing_token] ++
+        lease_token(item) ++ cancel_reason_ref(item) ++ cancel_reason(item) ++ partition_key(item)
+    )
   end
 
   def cancel(%{"id" => id, "fencing_token" => fencing_token} = item) when is_binary(id) do
-    {:ok, id,
-     [fencing_token: fencing_token] ++
-       lease_token(item) ++ cancel_reason_ref(item) ++ cancel_reason(item) ++ partition_key(item)}
+    keyword_result(
+      id,
+      [fencing_token: fencing_token] ++
+        lease_token(item) ++ cancel_reason_ref(item) ++ cancel_reason(item) ++ partition_key(item)
+    )
   end
 
   def cancel({id, item_opts}) when is_binary(id) and is_list(item_opts) do
@@ -167,26 +192,30 @@ defmodule Ferricstore.Flow.ManyItemOpts do
   end
 
   def cancel({:id, id, :fencing_token, fencing_token}) when is_binary(id) do
-    {:ok, id, [fencing_token: fencing_token]}
+    keyword_result(id, fencing_token: fencing_token)
   end
 
   def cancel({:id, id, :partition_key, partition_key, :fencing_token, fencing_token})
       when is_binary(id) do
-    {:ok, id, [partition_key: partition_key, fencing_token: fencing_token]}
+    keyword_result(id, partition_key: partition_key, fencing_token: fencing_token)
   end
 
   def cancel(_item), do: {:error, "ERR flow id must be a non-empty string"}
 
   def transition(%{id: id, fencing_token: fencing_token} = item) when is_binary(id) do
-    {:ok, id,
-     [fencing_token: fencing_token] ++
-       transition_payload(item) ++ lease_token(item) ++ partition_key(item)}
+    keyword_result(
+      id,
+      [fencing_token: fencing_token] ++
+        transition_payload(item) ++ lease_token(item) ++ partition_key(item)
+    )
   end
 
   def transition(%{"id" => id, "fencing_token" => fencing_token} = item) when is_binary(id) do
-    {:ok, id,
-     [fencing_token: fencing_token] ++
-       transition_payload(item) ++ lease_token(item) ++ partition_key(item)}
+    keyword_result(
+      id,
+      [fencing_token: fencing_token] ++
+        transition_payload(item) ++ lease_token(item) ++ partition_key(item)
+    )
   end
 
   def transition({id, item_opts}) when is_binary(id) and is_list(item_opts) do
@@ -200,7 +229,7 @@ defmodule Ferricstore.Flow.ManyItemOpts do
         do: [fencing_token: fencing_token],
         else: [fencing_token: fencing_token, lease_token: lease_token]
 
-    {:ok, id, opts}
+    keyword_result(id, opts)
   end
 
   def transition(
@@ -217,7 +246,7 @@ defmodule Ferricstore.Flow.ManyItemOpts do
           lease_token: lease_token
         ]
 
-    {:ok, id, opts}
+    keyword_result(id, opts)
   end
 
   def transition(_item), do: {:error, "ERR flow id must be a non-empty string"}
@@ -255,27 +284,60 @@ defmodule Ferricstore.Flow.ManyItemOpts do
   end
 
   defp keyword_result(id, item_opts) do
-    if Keyword.keyword?(item_opts) do
-      {:ok, id, item_opts}
-    else
-      {:error, "ERR flow opts must be a keyword list"}
+    cond do
+      id == "" ->
+        {:error, "ERR flow id must be a non-empty string"}
+
+      not Keyword.keyword?(item_opts) ->
+        {:error, "ERR flow opts must be a keyword list"}
+
+      not valid_optional_lease_token?(item_opts) ->
+        {:error, "ERR flow lease_token must be a non-empty string"}
+
+      true ->
+        {:ok, id, item_opts}
+    end
+  end
+
+  defp valid_optional_lease_token?(item_opts) do
+    case Keyword.fetch(item_opts, :lease_token) do
+      :error -> true
+      {:ok, nil} -> true
+      {:ok, value} when is_binary(value) and value != "" -> true
+      {:ok, _invalid} -> false
     end
   end
 
   defp lease_keyword_result(id, lease_token, item_opts) do
-    if Keyword.keyword?(item_opts) do
-      {:ok, id, lease_token, item_opts}
-    else
-      {:error, "ERR flow opts must be a keyword list"}
+    cond do
+      id == "" ->
+        {:error, "ERR flow id must be a non-empty string"}
+
+      not (is_binary(lease_token) and lease_token != "") ->
+        {:error, "ERR flow lease_token must be a non-empty string"}
+
+      Keyword.keyword?(item_opts) ->
+        {:ok, id, lease_token, item_opts}
+
+      true ->
+        {:error, "ERR flow opts must be a keyword list"}
     end
+  end
+
+  defp lease_result(id, lease_token, item_opts) do
+    lease_keyword_result(id, lease_token, item_opts)
   end
 
   defp item_keyword_lease_result(id, item_opts) do
     cond do
+      id == "" ->
+        {:error, "ERR flow id must be a non-empty string"}
+
       not Keyword.keyword?(item_opts) ->
         {:error, "ERR flow opts must be a keyword list"}
 
-      not is_binary(Keyword.get(item_opts, :lease_token)) ->
+      not (is_binary(Keyword.get(item_opts, :lease_token)) and
+               Keyword.get(item_opts, :lease_token) != "") ->
         {:error, "ERR flow lease_token must be a non-empty string"}
 
       true ->

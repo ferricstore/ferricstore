@@ -10,21 +10,24 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.ExistsRejectsColdRowsIn
       alias Ferricstore.Stats
       alias Ferricstore.Test.IsolatedInstance
 
-      test "exists rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
+      test "exists preserves live cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
         key = "cold_invalid_exists:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
-        refute Router.exists?(ctx, key)
-        refute Router.exists_fast?(ctx, key)
-        assert [] == :ets.lookup(keydir, key)
+        assert Router.exists?(ctx, key)
+        assert Router.exists_fast?(ctx, key)
+        assert [{^key, nil, 0, _lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
       end
 
-      test "expire_at rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
+      test "expire_at reads independent metadata without deleting an invalid location", %{
+        ctx: ctx,
+        keydir: keydir
+      } do
         key = "cold_invalid_expire_at:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
-        assert nil == Router.expire_at_ms(ctx, key)
-        assert [] == :ets.lookup(keydir, key)
+        assert 0 == Router.expire_at_ms(ctx, key)
+        assert [{^key, nil, 0, _lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
       end
 
       test "expire_at_ms preserves live pending cold rows", %{ctx: ctx, keydir: keydir} do
@@ -34,6 +37,32 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.ExistsRejectsColdRowsIn
 
         assert expire_at_ms == Router.expire_at_ms(ctx, key)
         assert [{^key, nil, ^expire_at_ms, _lfu, :pending, 0, 8192}] = :ets.lookup(keydir, key)
+      end
+
+      test "object_lfu reads independent metadata without deleting an invalid location", %{
+        ctx: ctx,
+        keydir: keydir
+      } do
+        key = "cold_invalid_lfu:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+        lfu = LFU.initial()
+        :ets.insert(keydir, {key, nil, 0, lfu, 0, :pending_offset, 5})
+
+        assert lfu == Router.object_lfu(ctx, key)
+        assert [{^key, nil, 0, ^lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
+      end
+
+      test "key enumeration preserves rows whose expiry cannot be classified", %{
+        ctx: ctx,
+        keydir: keydir
+      } do
+        key = "invalid_expiry_keys:" <> Integer.to_string(:erlang.unique_integer([:positive]))
+        before_size = Router.dbsize(ctx)
+        row = {key, nil, -1, LFU.initial(), 0, :pending_offset, 5}
+        :ets.insert(keydir, row)
+
+        assert key in Router.keys(ctx)
+        assert before_size + 1 == Router.dbsize(ctx)
+        assert [^row] = :ets.lookup(keydir, key)
       end
     end
   end

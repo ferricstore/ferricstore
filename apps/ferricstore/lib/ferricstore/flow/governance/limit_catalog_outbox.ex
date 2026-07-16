@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.Governance.LimitCatalogOutbox do
 
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
 
   @meta_tag :flow_governance_limit_catalog_outbox_meta_v1
   @intent_tag :flow_governance_limit_catalog_outbox_intent_v1
@@ -14,10 +15,14 @@ defmodule Ferricstore.Flow.Governance.LimitCatalogOutbox do
 
   def append(%{head: head, tail: tail}, owner_key)
       when is_integer(head) and head > 0 and is_integer(tail) and tail >= 0 and
-             is_binary(owner_key) and owner_key != "" do
+             tail <= @max_exact_version and head <= @max_exact_version + 1 and
+             is_binary(owner_key) do
     pending = max(tail - head + 1, 0)
 
     cond do
+      not valid_owner_key?(owner_key) ->
+        corrupt_error()
+
       head > tail + 1 ->
         corrupt_error()
 
@@ -37,7 +42,11 @@ defmodule Ferricstore.Flow.Governance.LimitCatalogOutbox do
 
   def acknowledge(%{head: head, tail: tail} = meta, expected_head, up_to)
       when is_integer(head) and head > 0 and is_integer(tail) and tail >= 0 and
-             is_integer(expected_head) and expected_head > 0 and is_integer(up_to) and up_to > 0 do
+             tail <= @max_exact_version and head <= @max_exact_version + 1 and
+             head <= tail + 1 and
+             is_integer(expected_head) and expected_head > 0 and
+             expected_head <= @max_exact_version + 1 and is_integer(up_to) and up_to > 0 and
+             up_to <= @max_exact_version do
     cond do
       up_to < head ->
         {:ok, meta, []}
@@ -60,42 +69,48 @@ defmodule Ferricstore.Flow.Governance.LimitCatalogOutbox do
 
   def encode_meta(%{head: head, tail: tail})
       when is_integer(head) and head > 0 and is_integer(tail) and tail >= 0 and
+             tail <= @max_exact_version and head <= @max_exact_version + 1 and
              head <= tail + 1 do
-    :erlang.term_to_binary({@meta_tag, head, tail})
+    TermCodec.encode({@meta_tag, head, tail})
   end
+
+  def encode_meta(_meta), do: raise(ArgumentError, "invalid catalog publication metadata")
 
   def decode_meta(nil), do: {:ok, empty_meta()}
 
   def decode_meta(value) when is_binary(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {@meta_tag, head, tail}
+    case TermCodec.decode(value) do
+      {:ok, {@meta_tag, head, tail}}
       when is_integer(head) and head > 0 and is_integer(tail) and tail >= 0 and
-             head <= tail + 1 and tail <= @max_exact_version ->
+             head <= tail + 1 and tail <= @max_exact_version and
+             head <= @max_exact_version + 1 ->
         {:ok, %{head: head, tail: tail}}
 
       _invalid ->
         corrupt_error()
     end
-  rescue
-    _decode_error -> corrupt_error()
   end
 
   def decode_meta(_value), do: corrupt_error()
 
-  def encode_intent(owner_key) when is_binary(owner_key) and owner_key != "" do
-    :erlang.term_to_binary({@intent_tag, owner_key})
+  def encode_intent(owner_key) when is_binary(owner_key) do
+    if valid_owner_key?(owner_key) do
+      TermCodec.encode({@intent_tag, owner_key})
+    else
+      raise ArgumentError, "invalid catalog publication owner key"
+    end
   end
 
+  def encode_intent(_owner_key), do: raise(ArgumentError, "invalid catalog publication owner key")
+
   def decode_intent(value) when is_binary(value) do
-    case :erlang.binary_to_term(value, [:safe]) do
-      {@intent_tag, owner_key} when is_binary(owner_key) and owner_key != "" ->
-        {:ok, owner_key}
+    case TermCodec.decode(value) do
+      {:ok, {@intent_tag, owner_key}} when is_binary(owner_key) ->
+        if valid_owner_key?(owner_key), do: {:ok, owner_key}, else: entry_error()
 
       _invalid ->
         entry_error()
     end
-  rescue
-    _decode_error -> entry_error()
   end
 
   def decode_intent(_value), do: entry_error()
@@ -171,6 +186,10 @@ defmodule Ferricstore.Flow.Governance.LimitCatalogOutbox do
   end
 
   defp corrupt_error, do: {:error, "ERR flow limit catalog publication outbox is corrupt"}
+
+  defp valid_owner_key?(owner_key) do
+    byte_size(owner_key) > 0 and byte_size(owner_key) <= Router.max_key_size()
+  end
 
   defp entry_error,
     do: {:error, "ERR flow limit catalog publication entry is missing or corrupt"}

@@ -210,6 +210,21 @@ defmodule Ferricstore.Commands.StreamTest.Sections.Xadd do
 
           assert Stream.handle("XLEN", [key], store) == 2
         end
+
+        test "XADD validates MINID before creating an entry" do
+          store = MockStore.make()
+          key = ustream()
+
+          assert {:error, "ERR Invalid stream ID specified as stream command argument"} =
+                   Stream.handle(
+                     "XADD",
+                     [key, "MINID", "not-an-id", "1-0", "field", "value"],
+                     store
+                   )
+
+          assert 0 == Stream.handle("XLEN", [key], store)
+          assert [] == Stream.handle("XRANGE", [key, "-", "+"], store)
+        end
       end
 
       # ===========================================================================

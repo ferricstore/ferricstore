@@ -39,11 +39,16 @@ defmodule Mix.Tasks.Ferricstore.Info do
   def run(_args) do
     ensure_started()
 
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
     uptime = Ferricstore.Stats.uptime_seconds()
     ctx = FerricStore.Instance.get(:default)
-    keys = Ferricstore.Store.Router.keys(ctx)
-    total_keys = length(keys)
+    shard_count = ctx.shard_count
+
+    total_keys =
+      case Ferricstore.Store.Router.dbsize(ctx) do
+        count when is_integer(count) and count >= 0 -> count
+        {:error, reason} -> Mix.raise("could not count FerricStore keys: #{inspect(reason)}")
+      end
+
     memory = :erlang.memory(:total)
 
     Mix.shell().info("=== FerricStore Node Status ===")
@@ -65,9 +70,15 @@ defmodule Mix.Tasks.Ferricstore.Info do
 
       key_count =
         try do
-          :ets.info(:"keydir_#{i}", :size)
+          ctx.keydir_refs
+          |> elem(i)
+          |> :ets.info(:size)
+          |> case do
+            :undefined -> 0
+            size -> size
+          end
         rescue
-          ArgumentError -> 0
+          _error in [ArgumentError, ErlangError] -> 0
         end
 
       raft_info =

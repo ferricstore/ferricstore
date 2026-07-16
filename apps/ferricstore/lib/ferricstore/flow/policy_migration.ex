@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBMirror
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
 
   @catalog_magic <<"FCT", 1>>
   @type_descriptor_magic <<"FTD", 1>>
@@ -18,6 +19,8 @@ defmodule Ferricstore.Flow.PolicyMigration do
   @done_cursor <<2>>
   @staging_root <<0, "fpcw:1:">>
   @staging_manifest_root <<0, "fpcm:1:">>
+  @staging_progress_root <<0, "fpcp:1:">>
+  @snapshot_progress_magic <<"FPS", 1>>
 
   @type catalog_entry :: %{
           state_key: binary(),
@@ -275,29 +278,71 @@ defmodule Ferricstore.Flow.PolicyMigration do
       when is_binary(run_token) and run_token != "" and byte_size(run_token) <= 64 and
              is_integer(max_items) and max_items > 0 and max_items <= 256 and
              is_integer(max_bytes) and max_bytes > 0 do
-    keydir = elem(ctx.keydir_refs, shard_index)
+    case snapshot_primary_keydir_page(ctx, shard_index, run_token, max_items, max_bytes) do
+      {:ok, %{done?: true}} ->
+        :ok
+
+      {:ok, %{done?: false}} ->
+        snapshot_primary_keydir(ctx, shard_index, run_token, max_items, max_bytes)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec snapshot_primary_keydir_page(
+          FerricStore.Instance.t(),
+          non_neg_integer(),
+          binary(),
+          pos_integer(),
+          pos_integer()
+        ) :: {:ok, %{done?: boolean(), scanned: non_neg_integer()}} | {:error, term()}
+  def snapshot_primary_keydir_page(ctx, shard_index, run_token, max_items, max_bytes)
+      when is_binary(run_token) and run_token != "" and byte_size(run_token) <= 64 and
+             is_integer(max_items) and max_items > 0 and max_items <= 256 and
+             is_integer(max_bytes) and max_bytes > 0 do
     path = lmdb_path(ctx, shard_index)
-    prefix = staging_prefix(run_token)
-    :ets.safe_fixtable(keydir, true)
 
-    try do
-      match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
+    if snapshot_complete?(ctx, shard_index, run_token) do
+      {:ok, %{done?: true, scanned: 0}}
+    else
+      keydir = elem(ctx.keydir_refs, shard_index)
 
-      with :ok <-
-             snapshot_primary_pages(
-               keydir,
+      with {:ok, cursor} <- load_snapshot_cursor(path, run_token, keydir) do
+        case snapshot_keydir_page(
                path,
-               prefix,
-               max_bytes,
-               :ets.select(keydir, match_spec, max_items)
+               keydir,
+               run_token,
+               cursor,
+               max_items,
+               max_bytes
              ) do
-        LMDB.write_batch(path, [{:put, staging_manifest_key(run_token), run_token}])
+          {:error, :policy_catalog_snapshot_cursor_invalidated} ->
+            with :ok <- LMDB.write_batch(path, [{:delete, staging_progress_key(run_token)}]) do
+              snapshot_keydir_page(
+                path,
+                keydir,
+                run_token,
+                :start,
+                max_items,
+                max_bytes
+              )
+            end
+
+          result ->
+            result
+        end
       end
-    after
-      :ets.safe_fixtable(keydir, false)
     end
   rescue
     error in ArgumentError -> {:error, {:policy_catalog_keydir_unavailable, error}}
+  end
+
+  @doc false
+  @spec snapshot_progress(FerricStore.Instance.t(), non_neg_integer(), binary()) ::
+          {:ok, binary()} | :not_found | {:error, term()}
+  def snapshot_progress(ctx, shard_index, run_token) do
+    LMDB.get(lmdb_path(ctx, shard_index), staging_progress_key(run_token))
   end
 
   @spec cleanup_snapshot(FerricStore.Instance.t(), non_neg_integer(), binary()) ::
@@ -307,7 +352,10 @@ defmodule Ferricstore.Flow.PolicyMigration do
     prefix = staging_prefix(run_token)
 
     with :ok <- cleanup_snapshot_pages(path, prefix) do
-      LMDB.write_batch(path, [{:delete, staging_manifest_key(run_token)}])
+      LMDB.write_batch(path, [
+        {:delete, staging_manifest_key(run_token)},
+        {:delete, staging_progress_key(run_token)}
+      ])
     end
   end
 
@@ -596,18 +644,103 @@ defmodule Ferricstore.Flow.PolicyMigration do
     _error -> {:error, :corrupt_policy_catalog_state_record}
   end
 
-  defp snapshot_primary_pages(_keydir, _path, _prefix, _max_bytes, :"$end_of_table"),
-    do: :ok
+  defp load_snapshot_cursor(path, run_token, keydir) do
+    case LMDB.get(path, staging_progress_key(run_token)) do
+      :not_found ->
+        {:ok, :start}
 
-  defp snapshot_primary_pages(keydir, path, prefix, max_bytes, {keys, continuation}) do
-    ops =
+      {:ok, encoded} ->
+        with {:ok, table_id, continuation} <- decode_snapshot_cursor(encoded) do
+          if table_id == :ets.info(keydir, :id) do
+            {:ok, continuation}
+          else
+            case LMDB.write_batch(path, [{:delete, staging_progress_key(run_token)}]) do
+              :ok -> {:ok, :start}
+              {:error, _reason} = error -> error
+            end
+          end
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp select_snapshot_page(keydir, :start, max_items) do
+    with_fixed_keydir(keydir, fn ->
+      case :ets.select(keydir, snapshot_match_spec(), max_items) do
+        :"$end_of_table" -> {:ok, [], :end_of_table}
+        {keys, :"$end_of_table"} -> {:ok, keys, :end_of_table}
+        {keys, continuation} -> {:ok, keys, continuation}
+      end
+    end)
+  end
+
+  defp select_snapshot_page(keydir, continuation, _max_items) do
+    try do
+      with_fixed_keydir(keydir, fn ->
+        repaired = :ets.repair_continuation(continuation, snapshot_match_spec())
+
+        case :ets.select(repaired) do
+          :"$end_of_table" -> {:ok, [], :end_of_table}
+          {keys, :"$end_of_table"} -> {:ok, keys, :end_of_table}
+          {keys, next_continuation} -> {:ok, keys, next_continuation}
+        end
+      end)
+    rescue
+      _error in [ArgumentError, FunctionClauseError] ->
+        {:error, :policy_catalog_snapshot_cursor_invalidated}
+    end
+  end
+
+  defp with_fixed_keydir(keydir, fun) do
+    :ets.safe_fixtable(keydir, true)
+
+    try do
+      fun.()
+    after
+      :ets.safe_fixtable(keydir, false)
+    end
+  end
+
+  defp snapshot_keydir_page(path, keydir, run_token, cursor, max_items, max_bytes) do
+    with {:ok, keys, next_cursor} <- select_snapshot_page(keydir, cursor, max_items),
+         :ok <-
+           persist_snapshot_page(
+             path,
+             keydir,
+             run_token,
+             keys,
+             next_cursor,
+             max_bytes
+           ) do
+      {:ok, %{done?: next_cursor == :end_of_table, scanned: length(keys)}}
+    end
+  end
+
+  defp persist_snapshot_page(path, keydir, run_token, keys, next_cursor, max_bytes) do
+    prefix = staging_prefix(run_token)
+
+    staging_ops =
       keys
       |> Enum.flat_map(&backfill_staging_keys/1)
       |> Enum.uniq()
       |> Enum.map(&{:put, prefix <> &1, <<>>})
 
-    with :ok <- write_snapshot_ops(path, ops, max_bytes) do
-      snapshot_primary_pages(keydir, path, prefix, max_bytes, :ets.select(continuation))
+    with :ok <- write_snapshot_ops(path, staging_ops, max_bytes) do
+      case next_cursor do
+        :end_of_table ->
+          LMDB.write_batch(path, [
+            {:put, staging_manifest_key(run_token), run_token},
+            {:delete, staging_progress_key(run_token)}
+          ])
+
+        continuation ->
+          LMDB.write_batch(path, [
+            {:put, staging_progress_key(run_token),
+             encode_snapshot_cursor(:ets.info(keydir, :id), continuation)}
+          ])
+      end
     end
   end
 
@@ -640,6 +773,27 @@ defmodule Ferricstore.Flow.PolicyMigration do
     |> Enum.reject(&(&1 == []))
     |> Enum.reverse()
   end
+
+  defp snapshot_match_spec,
+    do: [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
+
+  defp encode_snapshot_cursor(table_id, continuation) do
+    @snapshot_progress_magic <> TermCodec.encode({table_id, continuation})
+  end
+
+  defp decode_snapshot_cursor(<<@snapshot_progress_magic::binary, encoded::binary>>) do
+    case TermCodec.decode(encoded) do
+      {:ok, {table_id, continuation}}
+      when is_reference(table_id) and is_tuple(continuation) ->
+        {:ok, table_id, continuation}
+
+      _invalid ->
+        {:error, :corrupt_policy_catalog_snapshot_progress}
+    end
+  end
+
+  defp decode_snapshot_cursor(_encoded),
+    do: {:error, :corrupt_policy_catalog_snapshot_progress}
 
   defp cleanup_snapshot_pages(path, prefix) do
     case LMDB.prefix_entries(path, prefix, 256) do
@@ -679,6 +833,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
 
   defp staging_prefix(run_token), do: @staging_root <> run_token <> <<0>>
   defp staging_manifest_key(run_token), do: @staging_manifest_root <> run_token
+  defp staging_progress_key(run_token), do: @staging_progress_root <> run_token
 
   defp encode_work_cursor(run_token, after_key) do
     <<@work_cursor::binary, byte_size(run_token)::unsigned-big-8, run_token::binary,

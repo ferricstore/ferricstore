@@ -50,6 +50,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   alias Ferricstore.Commands.TDigest
   alias Ferricstore.Commands.TopK
   alias Ferricstore.Flow.InternalKey
+  alias Ferricstore.Store.Router
 
   @string_raw_commands ~w(GET SET DEL EXISTS MGET MSET INCR DECR INCRBY DECRBY INCRBYFLOAT APPEND STRLEN GETSET GETDEL GETEX SETNX SETEX PSETEX GETRANGE SETRANGE MSETNX)
   @expiry_raw_commands ~w(EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST)
@@ -64,6 +65,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @geo_raw_commands ~w(GEOADD GEOPOS GEODIST GEOHASH GEOSEARCH GEOSEARCHSTORE)
   @hll_raw_commands ~w(PFADD PFCOUNT PFMERGE)
   @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
+  @tdigest_rmw_commands ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE)
   @native_raw_commands ~w(CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO FERRICSTORE.KEY_INFO FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT FETCH_OR_COMPUTE_ERROR)
   @management_raw_commands ~w(ACL FERRICSTORE.CAPABILITIES FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
   @cluster_raw_commands ~w(CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE FERRICSTORE.HOTNESS)
@@ -498,7 +500,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       when tag in ~w(bf_reserve cms_initbydim cms_initbyprob cms_merge tdigest_trimmed_mean tdigest_merge)a,
       do: dispatch_prob_ast(ast, store)
 
-  def dispatch_ast({:topk_reserve, _, _, _, _, _} = ast, store), do: TopK.handle_ast(ast, store)
+  def dispatch_ast({:topk_reserve, _, _, _, _} = ast, store), do: TopK.handle_ast(ast, store)
 
   def dispatch_ast({tag, args}, store)
       when tag in ~w(ping echo dbsize keys flushdb flushall info command select lolwut debug slowlog save bgsave lastsave config module waitaof)a,
@@ -585,9 +587,13 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_ast({:publish, args}, _store), do: PubSub.handle_ast({:publish, args})
   def dispatch_ast({:pubsub, args}, _store), do: PubSub.handle_ast({:pubsub, args})
 
-  def dispatch_ast({:extension_command, cmd, args}, store)
-      when is_binary(cmd) and is_list(args),
-      do: dispatch_extension_raw(cmd, args, store)
+  def dispatch_ast({:extension_command, module, cmd, args, access}, store)
+      when is_atom(module) and is_binary(cmd) and is_list(args) and
+             access in [:read, :write, :rw],
+      do: Extension.handle_prepared(module, cmd, args, store)
+
+  def dispatch_ast({:structured_native_command, cmd}, _store) when is_binary(cmd),
+    do: {:error, "ERR command '#{String.downcase(cmd)}' requires its structured native opcode"}
 
   def dispatch_ast({:raw_command, cmd, args}, store) when is_binary(cmd) and is_list(args),
     do: dispatch_raw_handler(cmd, args, store)
@@ -794,7 +800,7 @@ defmodule Ferricstore.Commands.Dispatcher do
                  store
                ) do
             :ok ->
-              result = dispatch_ast(prepared.ast, store)
+              result = dispatch_prepared_ast(prepared, store)
               record_raw_activity(result, prepared.command, prepared.acl_keys, store)
               result
 
@@ -809,6 +815,16 @@ defmodule Ferricstore.Commands.Dispatcher do
     log_raw_dispatch(prepared.command, prepared.args, start)
     result
   end
+
+  defp dispatch_prepared_ast(
+         %PreparedCommand{command: command, ast: ast, write_keys: [key | _rest]},
+         %FerricStore.Instance{} = store
+       )
+       when command in @tdigest_rmw_commands do
+    Router.with_key_latch(store, key, fn -> dispatch_ast(ast, store) end)
+  end
+
+  defp dispatch_prepared_ast(%PreparedCommand{ast: ast}, store), do: dispatch_ast(ast, store)
 
   if Mix.env() == :test do
     @doc """

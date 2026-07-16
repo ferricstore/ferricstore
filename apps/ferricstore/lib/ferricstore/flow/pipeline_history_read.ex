@@ -1,6 +1,10 @@
 defmodule Ferricstore.Flow.PipelineHistoryRead do
   @moduledoc false
 
+  alias Ferricstore.BatchResult
+
+  @batch_read_error {:error, "ERR flow history batch read result mismatch"}
+
   def results([], _ctx, _callbacks), do: %{}
 
   def results(history_ops, ctx, callbacks) when is_map(callbacks) do
@@ -97,21 +101,37 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
       Enum.reduce(history_ops, {%{}, []}, fn {idx, id, partition_key, history_key, query, false,
                                               false, value_return} = op,
                                              {ready_acc, request_acc} ->
-        decode_context = Map.get(context_by_flow, {id, partition_key})
-        fetch_count = callbacks.fetch_count.(query)
+        case Map.fetch(context_by_flow, {id, partition_key}) do
+          {:ok, {:error, _reason} = error} ->
+            {Map.put(ready_acc, idx, error), request_acc}
 
-        if no_hot_history?(decode_context) do
-          {Map.put(ready_acc, idx, {:ok, []}), request_acc}
-        else
-          {start_idx, stop_idx} =
-            hot_range(ctx, id, partition_key, history_key, fetch_count, decode_context, callbacks)
+          {:ok, decode_context} ->
+            fetch_count = callbacks.fetch_count.(query)
 
-          {ready_acc,
-           [
-             {op, idx, id, partition_key, history_key, query, start_idx, stop_idx, false,
-              value_return, decode_context}
-             | request_acc
-           ]}
+            if no_hot_history?(decode_context) do
+              {Map.put(ready_acc, idx, {:ok, []}), request_acc}
+            else
+              {start_idx, stop_idx} =
+                hot_range(
+                  ctx,
+                  id,
+                  partition_key,
+                  history_key,
+                  fetch_count,
+                  decode_context,
+                  callbacks
+                )
+
+              {ready_acc,
+               [
+                 {op, idx, id, partition_key, history_key, query, start_idx, stop_idx, false,
+                  value_return, decode_context}
+                 | request_acc
+               ]}
+            end
+
+          :error ->
+            {Map.put(ready_acc, idx, @batch_read_error), request_acc}
         end
       end)
 
@@ -128,24 +148,7 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
     else
       case callbacks.rank_range_many.(ctx, router_requests) do
         {:ok, rank_results} ->
-          ranked_results =
-            Map.new(Enum.zip(requests, rank_results), fn {{_op, idx, id, partition_key,
-                                                           history_key, query, _start_idx,
-                                                           _stop_idx, _reverse?, value_return,
-                                                           decode_context}, rank_result} ->
-              {idx,
-               result_from_rank(
-                 ctx,
-                 id,
-                 partition_key,
-                 history_key,
-                 query,
-                 rank_result,
-                 value_return,
-                 decode_context,
-                 callbacks
-               )}
-            end)
+          ranked_results = hot_rank_results(requests, rank_results, ctx, callbacks)
 
           Map.merge(ready_results, ranked_results)
 
@@ -157,8 +160,41 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
             end)
 
           Map.merge(ready_results, fallback_results)
+
+        _invalid ->
+          Map.merge(ready_results, failed_hot_results(requests))
       end
     end
+  end
+
+  defp hot_rank_results(requests, rank_results, ctx, callbacks) do
+    case BatchResult.map_exact(requests, rank_results, fn
+           {_op, idx, id, partition_key, history_key, query, _start_idx, _stop_idx, _reverse?,
+            value_return, decode_context},
+           rank_result ->
+             {idx,
+              result_from_rank(
+                ctx,
+                id,
+                partition_key,
+                history_key,
+                query,
+                rank_result,
+                value_return,
+                decode_context,
+                callbacks
+              )}
+         end) do
+      {:ok, results} -> Map.new(results)
+      {:error, _reason} -> failed_hot_results(requests)
+    end
+  end
+
+  defp failed_hot_results(requests) do
+    Map.new(requests, fn {_op, idx, _id, _partition_key, _history_key, _query, _start_idx,
+                          _stop_idx, _reverse?, _value_return, _decode_context} ->
+      {idx, @batch_read_error}
+    end)
   end
 
   defp result_from_rank(
@@ -185,9 +221,8 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
          decode_context,
          callbacks
        ) do
-    event_ids = Enum.map(event_refs, fn {event_id, _score} -> event_id end)
-
-    with {:ok, events} <-
+    with {:ok, event_ids} <- event_ids(event_refs),
+         {:ok, events} <-
            from_event_ids(
              ctx,
              id,
@@ -202,8 +237,23 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
     end
   end
 
-  defp decode_contexts_for_ops(history_ops, ctx, %{decode_contexts: decode_contexts})
-       when is_function(decode_contexts, 2) do
+  defp event_ids(event_refs) when is_list(event_refs) do
+    Enum.reduce_while(event_refs, {:ok, []}, fn
+      {event_id, score}, {:ok, acc} when is_binary(event_id) and is_number(score) ->
+        {:cont, {:ok, [event_id | acc]}}
+
+      _invalid, _acc ->
+        {:halt, @batch_read_error}
+    end)
+    |> case do
+      {:ok, ids} -> {:ok, Enum.reverse(ids)}
+      @batch_read_error -> @batch_read_error
+    end
+  end
+
+  defp event_ids(_invalid), do: @batch_read_error
+
+  defp decode_contexts_for_ops(history_ops, ctx, callbacks) do
     flows =
       Enum.map(history_ops, fn
         {_idx, id, partition_key, _history_key, _query, _include_cold?, _consistent?,
@@ -211,10 +261,17 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
           {id, partition_key}
       end)
 
-    decode_contexts.(ctx, flows)
-  end
+    case callbacks do
+      %{decode_contexts: decode_contexts} when is_function(decode_contexts, 2) ->
+        case decode_contexts.(ctx, flows) do
+          contexts when is_map(contexts) -> contexts
+          _invalid -> Map.new(flows, &{&1, @batch_read_error})
+        end
 
-  defp decode_contexts_for_ops(_history_ops, _ctx, _callbacks), do: %{}
+      _without_context_decoder ->
+        Map.new(flows, &{&1, nil})
+    end
+  end
 
   defp hot_range(
          ctx,

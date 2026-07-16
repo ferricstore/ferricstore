@@ -43,6 +43,10 @@ defmodule FerricstoreServer.Acl.Patterns do
   defp access_permitted?(_, _), do: false
 
   defp compile_glob_chars([], acc), do: Enum.reverse(acc)
+
+  defp compile_glob_chars(["*", "*" | rest], acc),
+    do: compile_glob_chars(["*" | rest], acc)
+
   defp compile_glob_chars(["*" | rest], acc), do: compile_glob_chars(rest, [".*" | acc])
   defp compile_glob_chars(["?" | rest], acc), do: compile_glob_chars(rest, ["." | acc])
 

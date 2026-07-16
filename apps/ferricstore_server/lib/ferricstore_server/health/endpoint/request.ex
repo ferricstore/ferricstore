@@ -73,7 +73,8 @@ defmodule FerricstoreServer.Health.Endpoint.Request do
   def parse_request_line(data) do
     case String.split(data, "\r\n\r\n", parts: 2) do
       [head, body] ->
-        with [request_line | header_lines] <- String.split(head, "\r\n"),
+        with true <- String.valid?(head),
+             [request_line | header_lines] <- String.split(head, "\r\n"),
              [method, path, _version] <- String.split(request_line, " ", parts: 3),
              {:ok, headers} <- parse_headers(header_lines) do
           {:ok, method, path, headers, body}

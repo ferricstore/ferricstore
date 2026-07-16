@@ -20,7 +20,9 @@ defmodule Ferricstore.Raft.Batcher do
 
   @spec write_async(non_neg_integer(), command(), GenServer.from()) :: :ok
   def write_async(shard_index, command, reply_to) do
-    reply_later(reply_to, fn -> WARaftBackend.write(shard_index, command) end)
+    shard_index
+    |> WARaftBackend.write_async(command, reply_to)
+    |> complete_async_submission(reply_to)
   end
 
   @spec write_async_quorum(non_neg_integer(), command(), GenServer.from()) :: :ok
@@ -34,7 +36,9 @@ defmodule Ferricstore.Raft.Batcher do
 
   @spec write_batch(non_neg_integer(), [command()], GenServer.from()) :: :ok
   def write_batch(shard_index, commands, reply_to) do
-    reply_later(reply_to, fn -> WARaftBackend.write_batch(shard_index, commands) end)
+    shard_index
+    |> WARaftBackend.write_batch_async(commands, reply_to)
+    |> complete_async_submission(reply_to)
   end
 
   @spec write_batch_forwarded(non_neg_integer(), [command()], GenServer.from(), node()) :: :ok
@@ -75,47 +79,6 @@ defmodule Ferricstore.Raft.Batcher do
   def write_delete_batch_forwarded(shard_index, keys, reply_to, _origin_node),
     do: write_delete_batch(shard_index, keys, reply_to)
 
-  @spec origin_submit(non_neg_integer(), command()) :: :ok
-  def origin_submit(shard_index, command) do
-    _ = Task.start(fn -> WARaftBackend.write(shard_index, {:async, node(), command}) end)
-    :ok
-  end
-
-  @spec origin_submit_ordered(non_neg_integer(), command()) :: :ok | {:error, term()}
-  def origin_submit_ordered(shard_index, command) do
-    case WARaftBackend.write(shard_index, {:async, node(), command}) do
-      {:error, _reason} = error -> error
-      _result -> :ok
-    end
-  end
-
-  @spec origin_enqueue_ordered(non_neg_integer(), command()) :: :ok | {:error, term()}
-  def origin_enqueue_ordered(shard_index, command),
-    do: origin_submit_ordered(shard_index, command)
-
-  @spec origin_submit_batch_ordered(non_neg_integer(), [command()]) :: :ok | {:error, term()}
-  def origin_submit_batch_ordered(_shard_index, []), do: :ok
-
-  def origin_submit_batch_ordered(shard_index, commands) do
-    wrapped = Enum.map(commands, &{:async, node(), &1})
-
-    case WARaftBackend.write_batch(shard_index, wrapped) do
-      {:error, _reason} = error -> error
-      _result -> :ok
-    end
-  end
-
-  @spec origin_submit_batch(non_neg_integer(), [command()]) :: :ok
-  def origin_submit_batch(_shard_index, []), do: :ok
-
-  def origin_submit_batch(shard_index, commands) do
-    _ = Task.start(fn -> origin_submit_batch_ordered(shard_index, commands) end)
-    :ok
-  end
-
-  @spec origin_accepting?(non_neg_integer()) :: boolean()
-  def origin_accepting?(_shard_index), do: true
-
   @spec pause_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
   def pause_writes_for_sync(shard_index, timeout \\ 30_000),
     do: WARaftBackend.pause_writes_for_sync(shard_index, timeout)
@@ -123,6 +86,20 @@ defmodule Ferricstore.Raft.Batcher do
   @spec resume_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
   def resume_writes_for_sync(shard_index, timeout \\ 5_000),
     do: WARaftBackend.resume_writes_for_sync(shard_index, timeout)
+
+  @spec pause_writes_for_sync_all(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def pause_writes_for_sync_all(shard_count, timeout \\ 30_000),
+    do: WARaftBackend.pause_writes_for_sync_all(shard_count, timeout)
+
+  @spec resume_writes_for_sync_all(non_neg_integer(), timeout()) :: :ok | {:error, term()}
+  def resume_writes_for_sync_all(shard_count, timeout \\ 5_000),
+    do: WARaftBackend.resume_writes_for_sync_all(shard_count, timeout)
+
+  @doc false
+  @spec write_flush_shard_paused(non_neg_integer(), {non_neg_integer(), non_neg_integer()}) ::
+          term()
+  def write_flush_shard_paused(shard_index, flush_epoch),
+    do: WARaftBackend.write_flush_shard_paused(shard_index, flush_epoch)
 
   @spec await_local_applied(non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
           :ok | {:error, :timeout}
@@ -175,12 +152,10 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  defp reply_later(reply_to, fun) when is_function(fun, 0) do
-    _ =
-      Task.start(fn ->
-        GenServer.reply(reply_to, fun.())
-      end)
+  defp complete_async_submission(:ok, _reply_to), do: :ok
 
+  defp complete_async_submission({:direct, result}, reply_to) do
+    GenServer.reply(reply_to, result)
     :ok
   end
 

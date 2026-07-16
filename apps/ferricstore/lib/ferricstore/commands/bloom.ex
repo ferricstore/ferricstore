@@ -21,10 +21,15 @@ defmodule Ferricstore.Commands.Bloom do
 
   alias Ferricstore.Bitcask.{Async, NIF}
   alias Ferricstore.Commands.ProbType
+  alias Ferricstore.ProbFile
+  alias Ferricstore.TermCodec
 
   @prob_read_timeout_ms 5_000
   @default_error_rate 0.01
   @default_capacity 100
+  @max_bloom_bits 8_589_934_592
+  @max_bloom_hashes 1_024
+  @default_max_batch_items 10_000
 
   # -------------------------------------------------------------------
   # Public command handler
@@ -37,8 +42,9 @@ defmodule Ferricstore.Commands.Bloom do
   def handle_ast({:bf_reserve, key, error_rate, capacity}, store) do
     with :ok <- validate_error_rate(error_rate),
          :ok <- validate_bloom_capacity(capacity),
+         {:ok, num_bits, num_hashes} <- validated_bloom_params(capacity, error_rate),
          :ok <- check_bloom_not_exists(key, store) do
-      do_bloom_reserve(key, capacity, error_rate, store)
+      do_bloom_reserve(key, capacity, error_rate, num_bits, num_hashes, store)
     end
   end
 
@@ -61,8 +67,9 @@ defmodule Ferricstore.Commands.Bloom do
          {:ok, capacity} <- parse_pos_integer(capacity_str, "capacity"),
          :ok <- validate_error_rate(error_rate),
          :ok <- validate_bloom_capacity(capacity),
+         {:ok, num_bits, num_hashes} <- validated_bloom_params(capacity, error_rate),
          :ok <- check_bloom_not_exists(key, store) do
-      do_bloom_reserve(key, capacity, error_rate, store)
+      do_bloom_reserve(key, capacity, error_rate, num_bits, num_hashes, store)
     end
   end
 
@@ -333,13 +340,17 @@ defmodule Ferricstore.Commands.Bloom do
         end
     end
   rescue
-    _ -> false
+    _ -> {:error, "ERR bloom metadata lookup failed"}
   end
 
   defp production_bloom_read_status(key, store) do
     case ProbType.check_create(key, :bloom, store) do
       {:error, :exists} ->
-        if Ferricstore.FS.exists?(prob_path(store, key, "bloom")), do: :ok, else: :missing
+        if Ferricstore.FS.exists?(prob_path(store, key, "bloom")) do
+          :ok
+        else
+          {:error, "ERR bloom filter file is missing"}
+        end
 
       :ok ->
         :missing
@@ -351,7 +362,7 @@ defmodule Ferricstore.Commands.Bloom do
 
   defp bloom_file_read_status(key, store) do
     if Ferricstore.FS.exists?(prob_path(store, key, "bloom")) do
-      :ok
+      ProbType.check_expected(key, :bloom, store)
     else
       case ProbType.check_expected(key, :bloom, store) do
         :ok -> :missing
@@ -369,8 +380,9 @@ defmodule Ferricstore.Commands.Bloom do
   defp production_prob_store?(_store), do: false
 
   defp missing_or_wrongtype(key, store, missing_result) do
-    case ProbType.check_expected(key, :bloom, store) do
+    case ProbType.check_create(key, :bloom, store) do
       :ok -> missing_result
+      {:error, :exists} -> {:error, "ERR bloom filter file is missing"}
       {:error, _} = error -> error
     end
   end
@@ -383,27 +395,23 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  defp do_bloom_reserve(key, capacity, error_rate, store) do
-    {num_bits, num_hashes} = compute_params(capacity, error_rate)
+  defp do_bloom_reserve(key, capacity, error_rate, num_bits, num_hashes, store) do
+    meta =
+      {:bloom_meta,
+       %{
+         path: prob_path(store, key, "bloom"),
+         num_bits: num_bits,
+         num_hashes: num_hashes,
+         capacity: capacity,
+         error_rate: error_rate
+       }}
 
-    with :ok <- validate_bloom_num_bits(num_bits) do
-      meta =
-        {:bloom_meta,
-         %{
-           path: prob_path(store, key, "bloom"),
-           num_bits: num_bits,
-           num_hashes: num_hashes,
-           capacity: capacity,
-           error_rate: error_rate
-         }}
+    result = do_prob_write(store, {:bloom_create, key, num_bits, num_hashes, meta})
 
-      result = do_prob_write(store, {:bloom_create, key, num_bits, num_hashes, meta})
-
-      case result do
-        {:ok, _} -> :ok
-        :ok -> :ok
-        other -> other
-      end
+    case result do
+      {:ok, _} -> :ok
+      :ok -> :ok
+      other -> other
     end
   end
 
@@ -413,7 +421,7 @@ defmodule Ferricstore.Commands.Bloom do
     {num_bits, num_hashes}
   end
 
-  defp validate_bloom_capacity(capacity) do
+  defp validate_bloom_capacity(capacity) when is_integer(capacity) and capacity > 0 do
     case Application.get_env(:ferricstore, :bloom_max_capacity) do
       max_capacity
       when is_integer(max_capacity) and max_capacity > 0 and capacity > max_capacity ->
@@ -424,24 +432,64 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  defp validate_bloom_num_bits(num_bits) do
-    case Application.get_env(:ferricstore, :bloom_max_num_bits) do
-      max_bits when is_integer(max_bits) and max_bits > 0 and num_bits > max_bits ->
-        {:error, "ERR bloom computed bits exceed configured maximum bits"}
+  defp validate_bloom_capacity(_capacity), do: {:error, "ERR bad capacity value"}
 
-      _ ->
-        :ok
+  defp validate_bloom_num_bits(num_bits)
+       when is_integer(num_bits) and num_bits > 0 and num_bits <= @max_bloom_bits do
+    if num_bits <= configured_bloom_max_bits() do
+      :ok
+    else
+      {:error, "ERR bloom computed bits exceed configured maximum bits"}
+    end
+  end
+
+  defp validate_bloom_num_bits(_num_bits),
+    do: {:error, "ERR bloom computed bits exceed native maximum bits"}
+
+  defp validate_bloom_num_hashes(num_hashes)
+       when is_integer(num_hashes) and num_hashes > 0 and num_hashes <= @max_bloom_hashes,
+       do: :ok
+
+  defp validate_bloom_num_hashes(_num_hashes),
+    do: {:error, "ERR bloom hash count exceeds native maximum"}
+
+  defp validated_bloom_params(capacity, error_rate) do
+    max_bits = configured_bloom_max_bits()
+    bits_per_item = -:math.log(error_rate) / :math.pow(:math.log(2), 2)
+    max_capacity = floor(max_bits / bits_per_item)
+
+    if capacity > max_capacity do
+      {:error, "ERR bloom computed bits exceed configured maximum bits"}
+    else
+      {num_bits, num_hashes} = compute_params(capacity, error_rate)
+
+      with :ok <- validate_bloom_num_bits(num_bits),
+           :ok <- validate_bloom_num_hashes(num_hashes) do
+        {:ok, num_bits, num_hashes}
+      end
+    end
+  rescue
+    ArithmeticError -> {:error, "ERR bloom sizing parameters are out of range"}
+  end
+
+  defp configured_bloom_max_bits do
+    case Application.get_env(:ferricstore, :bloom_max_num_bits) do
+      max_bits when is_integer(max_bits) and max_bits > 0 -> min(max_bits, @max_bloom_bits)
+      _ -> @max_bloom_bits
     end
   end
 
   defp validate_bloom_batch_size(elements) do
-    case Application.get_env(:ferricstore, :bloom_max_batch_items) do
-      max_items when is_integer(max_items) and max_items > 0 and length(elements) > max_items ->
-        {:error, "ERR bloom batch exceeds configured maximum batch size"}
+    configured = Application.get_env(:ferricstore, :bloom_max_batch_items)
 
-      _ ->
-        :ok
-    end
+    max_items =
+      if is_integer(configured) and configured > 0,
+        do: min(configured, @default_max_batch_items),
+        else: @default_max_batch_items
+
+    if length(elements) > max_items,
+      do: {:error, "ERR bloom batch exceeds configured maximum batch size"},
+      else: :ok
   end
 
   defp default_auto_create_params do
@@ -456,9 +504,8 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   defp prob_path(store, key, ext) do
-    safe = Base.url_encode64(key, padding: false)
     prob_dir = resolve_prob_dir(store, key)
-    Path.join(prob_dir, "#{safe}.#{ext}")
+    ProbFile.path(prob_dir, key, ext)
   end
 
   defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
@@ -519,10 +566,13 @@ defmodule Ferricstore.Commands.Bloom do
     dir = Path.dirname(path)
 
     with :ok <- ensure_prob_dir(dir),
-         {:ok, _resource} = result <- NIF.bloom_file_create(path, num_bits, num_hashes),
-         :ok <- prob_fsync_dir(dir, :prob_file_dir),
-         :ok <- register_bloom_meta(result, store, key, meta) do
-      result
+         {:ok, _resource} = result <- NIF.bloom_file_create(path, num_bits, num_hashes) do
+      ProbType.finalize_created_file(path, result, fn ->
+        with :ok <- prob_fsync_dir(dir, :prob_file_dir),
+             :ok <- register_bloom_meta(result, store, key, meta) do
+          :ok
+        end
+      end)
     end
   end
 
@@ -554,16 +604,22 @@ defmodule Ferricstore.Commands.Bloom do
       is_map(auto_params) ->
         %{num_bits: nb, num_hashes: nh} = auto_params
 
-        with {:ok, _resource} = result <- NIF.bloom_file_create(path, nb, nh),
-             :ok <- prob_fsync_dir(dir, :prob_file_dir),
-             :ok <-
-               register_bloom_meta(
-                 result,
-                 store,
-                 key,
-                 {:bloom_meta, Map.put(auto_params, :path, path)}
-               ) do
-          :ok
+        with {:ok, _resource} = result <- NIF.bloom_file_create(path, nb, nh) do
+          case ProbType.finalize_created_file(path, result, fn ->
+                 with :ok <- prob_fsync_dir(dir, :prob_file_dir),
+                      :ok <-
+                        register_bloom_meta(
+                          result,
+                          store,
+                          key,
+                          {:bloom_meta, Map.put(auto_params, :path, path)}
+                        ) do
+                   :ok
+                 end
+               end) do
+            {:ok, _resource} -> :ok
+            {:error, _reason} = error -> error
+          end
         end
 
       true ->
@@ -614,13 +670,14 @@ defmodule Ferricstore.Commands.Bloom do
   defp parse_stored_meta(nil), do: nil
 
   defp parse_stored_meta(value) when is_binary(value) do
-    try do
-      case :erlang.binary_to_term(value, [:safe]) do
-        {:bloom_meta, %{capacity: c, error_rate: e}} -> {c, e}
-        _ -> nil
-      end
-    rescue
-      _ -> nil
+    case TermCodec.decode(value) do
+      {:ok, {:bloom_meta, %{capacity: capacity, error_rate: error_rate}}}
+      when is_integer(capacity) and capacity > 0 and is_number(error_rate) and
+             error_rate > 0 and error_rate < 1 ->
+        {capacity, error_rate}
+
+      _invalid ->
+        nil
     end
   end
 
@@ -659,6 +716,9 @@ defmodule Ferricstore.Commands.Bloom do
           _ -> {:error, "ERR bad #{name} value"}
         end
     end
+  rescue
+    ArgumentError -> {:error, "ERR bad #{name} value"}
+    ArithmeticError -> {:error, "ERR bad #{name} value"}
   end
 
   @spec parse_pos_integer(binary(), binary()) :: {:ok, pos_integer()} | {:error, binary()}
@@ -670,6 +730,6 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   @spec validate_error_rate(float()) :: :ok | {:error, binary()}
-  defp validate_error_rate(rate) when rate > 0.0 and rate < 1.0, do: :ok
+  defp validate_error_rate(rate) when is_float(rate) and rate > 0.0 and rate < 1.0, do: :ok
   defp validate_error_rate(_), do: {:error, "ERR (0 < error rate range < 1)"}
 end

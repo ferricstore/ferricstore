@@ -329,17 +329,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
       defp flow_retention_owned_value_ref?(_ref, _record), do: false
 
       defp flow_retention_exact_owned_value_ref?(ref, id, partition_key) do
-        [:payload, :result, :error, :shared]
-        |> Enum.any?(fn kind ->
-          flow_retention_exact_owned_value_ref?(ref, id, partition_key, kind)
-        end)
+        flow_retention_named_shared_value_ref?(ref, id, partition_key) or
+          Enum.any?([:payload, :result, :error, :shared], fn kind ->
+            flow_retention_exact_owned_value_ref?(ref, id, partition_key, kind)
+          end)
       end
 
       defp flow_retention_shareable_owned_value_ref?(ref, record)
            when is_binary(ref) and is_map(record) do
         with id when is_binary(id) <- Map.get(record, :id) || Map.get(record, "id") do
           partition_key = Map.get(record, :partition_key) || Map.get(record, "partition_key")
-          flow_retention_exact_owned_value_ref?(ref, id, partition_key, :shared)
+
+          flow_retention_named_shared_value_ref?(ref, id, partition_key) or
+            flow_retention_exact_owned_value_ref?(ref, id, partition_key, :shared)
         else
           _other -> false
         end
@@ -361,6 +363,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         end
       end
 
+      defp flow_retention_named_shared_value_ref?(ref, id, partition_key) do
+        case FlowKeys.named_shared_value_parts(ref) do
+          {:ok, ^id, name, version} ->
+            ref == FlowKeys.named_shared_value_key(id, name, version, partition_key)
+
+          _not_owned ->
+            false
+        end
+      end
+
       defp flow_retention_owned_value_ref_prefix(key) when is_binary(key) do
         case :binary.matches(key, ":") do
           [] ->
@@ -370,19 +382,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
             {idx, 1} = List.last(matches)
             binary_part(key, 0, idx + 1)
         end
-      end
-
-      defp flow_retention_owned_value_suffix?(suffix, :shared) when is_binary(suffix) do
-        flow_retention_value_version?(suffix) or
-          case :binary.matches(suffix, ":") do
-            [] ->
-              false
-
-            matches ->
-              {idx, 1} = List.last(matches)
-              version = binary_part(suffix, idx + 1, byte_size(suffix) - idx - 1)
-              flow_retention_value_version?(version)
-          end
       end
 
       defp flow_retention_owned_value_suffix?(suffix, _kind),
@@ -395,10 +394,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         end
       end
 
-      defp flow_owned_value_ref?(<<"f:{", rest::binary>>),
-        do: :binary.match(rest, "}:v:") != :nomatch
-
-      defp flow_owned_value_ref?(_ref), do: false
+      defp flow_owned_value_ref?(ref), do: FlowKeys.value_key?(ref)
 
       defp flow_retention_delete_keys(state, keys) do
         keys
@@ -454,19 +450,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
         end
       end
 
-      defp flow_queue_lmdb_reactivated_state_projection(state, state_key, record)
-           when is_binary(state_key) and is_map(record) do
-        if flow_lmdb_projection_enabled?(state) and
-             not Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-          queue_pending_lmdb_flow_state_projection(
-            state_key,
-            flow_encode(record),
-            flow_record_expire_at(record)
-          )
-        end
-
-        :ok
-      end
+      defp flow_queue_lmdb_reactivated_state_projection(_state, state_key, record)
+           when is_binary(state_key) and is_map(record),
+           do: :ok
 
       defp flow_prepare_claim_candidate_record(
              record,

@@ -10,20 +10,16 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowIndexRollback do
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 
       describe "Flow index rollback" do
-        test "rolls back Flow.OrderedIndex mutations when apply append fails", %{
+        test "rolls back native Flow index mutations when apply append fails", %{
           state: state,
           dir: dir
         } do
           :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
           :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
-          :ets.new(state.flow_index_name, [:ordered_set, :public, :named_table])
-          :ets.new(state.flow_lookup_name, [:set, :public, :named_table])
 
           on_exit(fn ->
             safe_delete_ets(state.zset_score_index_name)
             safe_delete_ets(state.zset_score_lookup_name)
-            safe_delete_ets(state.flow_index_name)
-            safe_delete_ets(state.flow_lookup_name)
           end)
 
           id = "flow-index-rollback"

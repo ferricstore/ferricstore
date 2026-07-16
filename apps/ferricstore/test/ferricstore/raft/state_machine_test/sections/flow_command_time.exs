@@ -11,7 +11,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
       describe "Flow command time" do
         @tag :flow_policy_generation
-        test "Flow create uses its captured policy when the local shard has a newer generation",
+        test "Flow create rejects a policy reference older than the local generation",
              %{
                state: state,
                ets: ets
@@ -37,6 +37,22 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
              byte_size(newer_value)}
           )
 
+          {_state, {:error, "ERR stale flow policy generation"}} =
+            StateMachine.apply(
+              %{system_time: 1_000},
+              {:flow_create, state_key,
+               %{
+                 id: "captured-policy-flow",
+                 type: type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 policy_ref: flow_command_policy_ref(captured_policy, 1)
+               }},
+              state
+            )
+
+          assert [] = :ets.lookup(ets, state_key)
+
           {_state, :ok} =
             StateMachine.apply(
               %{system_time: 1_000},
@@ -46,13 +62,12 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                  type: type,
                  state: "queued",
                  partition_key: partition_key,
-                 policy_generation: 1,
-                 policy_snapshot: captured_policy
+                 policy_ref: flow_command_policy_ref(newer_policy, 2)
                }},
               state
             )
 
-          assert flow_record!(state, state_key).max_active_ms == 1_000
+          assert flow_record!(state, state_key).max_active_ms == 9_000
 
           {:ok, newest_policy} =
             Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 15_000)
@@ -67,7 +82,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           second_key = Ferricstore.Flow.Keys.state_key("captured-policy-flow-2", partition_key)
 
-          {_state, :ok} =
+          {_state, {:error, "ERR stale flow policy generation"}} =
             StateMachine.apply(
               %{system_time: 1_001},
               {:flow_create, second_key,
@@ -76,13 +91,178 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                  type: type,
                  state: "queued",
                  partition_key: partition_key,
-                 policy_generation: 1,
-                 policy_snapshot: captured_policy
+                 policy_ref: flow_command_policy_ref(newer_policy, 2)
                }},
               state
             )
 
-          assert flow_record!(state, second_key).max_active_ms == 1_000
+          assert [] = :ets.lookup(ets, second_key)
+        end
+
+        @tag :flow_policy_generation
+        test "Flow create rejects a policy generation not yet applied locally", %{
+          state: state,
+          ets: ets
+        } do
+          setup_flow_indexes(state)
+
+          type = "future-policy-create"
+          partition_key = "future-policy-tenant"
+          state_key = Ferricstore.Flow.Keys.state_key("future-policy-flow", partition_key)
+
+          {:ok, future_policy} =
+            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 9_000)
+
+          {_state, {:error, "ERR flow policy generation is not applied"}} =
+            StateMachine.apply(
+              %{system_time: 1_000},
+              {:flow_create, state_key,
+               %{
+                 id: "future-policy-flow",
+                 type: type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 policy_ref: flow_command_policy_ref(future_policy, 1)
+               }},
+              state
+            )
+
+          assert [] = :ets.lookup(ets, state_key)
+        end
+
+        @tag :flow_policy_generation
+        test "a policy fence installs a future generation before its Flow command", %{
+          state: state,
+          ets: ets
+        } do
+          setup_flow_indexes(state)
+
+          type = "fenced-future-policy"
+          partition_key = "fenced-future-tenant"
+          id = "fenced-future-flow"
+          state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+          policy_key = Ferricstore.Flow.Keys.policy_key(type)
+
+          {:ok, future_policy} =
+            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 9_000)
+
+          future_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(future_policy, 1)
+
+          command =
+            {:flow_policy_fence, [{policy_key, future_value, 0}],
+             {:flow_create, state_key,
+              %{
+                id: id,
+                type: type,
+                state: "queued",
+                partition_key: partition_key,
+                policy_ref: flow_command_policy_ref(future_policy, 1)
+              }}}
+
+          {_state, :ok} =
+            StateMachine.apply(%{system_time: 1_000}, command, state)
+
+          assert [{^policy_key, ^future_value, 0, _, _, _, _}] = :ets.lookup(ets, policy_key)
+          assert flow_record!(state, state_key).max_active_ms == 9_000
+        end
+
+        @tag :flow_policy_generation
+        test "Flow create rejects a conflicting digest at the same generation", %{
+          state: state,
+          ets: ets
+        } do
+          setup_flow_indexes(state)
+
+          type = "conflicting-policy-create"
+          partition_key = "conflicting-policy-tenant"
+          state_key = Ferricstore.Flow.Keys.state_key("conflicting-policy-flow", partition_key)
+          policy_key = Ferricstore.Flow.Keys.policy_key(type)
+
+          {:ok, local_policy} =
+            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 1_000)
+
+          {:ok, conflicting_policy} =
+            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 9_000)
+
+          local_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(local_policy, 1)
+
+          :ets.insert(
+            ets,
+            {policy_key, local_value, 0, Ferricstore.Store.LFU.initial(), 0, 0,
+             byte_size(local_value)}
+          )
+
+          {_state, {:error, "ERR conflicting flow policy generation"}} =
+            StateMachine.apply(
+              %{system_time: 1_000},
+              {:flow_create, state_key,
+               %{
+                 id: "conflicting-policy-flow",
+                 type: type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 policy_ref: flow_command_policy_ref(conflicting_policy, 1)
+               }},
+              state
+            )
+
+          assert [] = :ets.lookup(ets, state_key)
+        end
+
+        @tag :flow_policy_target_guard
+        test "an existing-flow command rejects a recreated flow incarnation", %{
+          state: state,
+          ets: ets
+        } do
+          setup_flow_indexes(state)
+
+          id = "policy-incarnation-flow"
+          partition_key = "policy-incarnation-tenant"
+          old_type = "policy-incarnation-old"
+          new_type = "policy-incarnation-new"
+          state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+          {_state, :ok} =
+            StateMachine.apply(
+              %{system_time: 1_000},
+              {:flow_create, state_key,
+               %{
+                 id: id,
+                 type: old_type,
+                 state: "queued",
+                 partition_key: partition_key
+               }},
+              state
+            )
+
+          original = flow_record!(state, state_key)
+          replacement = %{original | type: new_type, incarnation: original.incarnation + 1}
+          encoded_replacement = Ferricstore.Flow.encode_record(replacement)
+
+          :ets.insert(
+            ets,
+            {state_key, encoded_replacement, 0, Ferricstore.Store.LFU.initial(), 0, 0,
+             byte_size(encoded_replacement)}
+          )
+
+          {_state, {:error, "ERR stale flow policy target"}} =
+            StateMachine.apply(
+              %{system_time: 1_001},
+              {:flow_retry, state_key,
+               %{
+                 id: id,
+                 partition_key: partition_key,
+                 policy_ref: flow_command_policy_ref(%{type: old_type}, 0),
+                 policy_guard: %{
+                   state_key: state_key,
+                   type: old_type,
+                   incarnation: original.incarnation
+                 }
+               }},
+              state
+            )
+
+          assert flow_record!(state, state_key).type == new_type
         end
 
         @tag :flow_policy_generation
@@ -108,7 +288,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
              byte_size(local_value)}
           )
 
-          {_state, {:error, "ERR flow policy snapshot is required"}} =
+          {_state, {:error, "ERR flow policy reference is required"}} =
             Ferricstore.Raft.StateMachine.apply(
               %{system_time: 1_000},
               {:flow_create, state_key,
@@ -116,7 +296,10 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                  id: "unstamped-policy-flow",
                  type: type,
                  state: "queued",
-                 partition_key: partition_key
+                 partition_key: partition_key,
+                 policy_snapshot_captured: true,
+                 policy_generation: 7,
+                 policy_snapshot: local_policy
                }},
               state
             )
@@ -151,8 +334,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         @tag :flow_policy_generation
         test "reserved policy puts reject invalid keys and values without storing them", %{
           state: state,
-          ets: ets,
-          shard_index: shard_index
+          ets: ets
         } do
           type = "invalid-reserved-policy-put"
           policy_key = Ferricstore.Flow.Keys.policy_key(type)
@@ -196,24 +378,14 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           {_state, {:error, "ERR invalid flow policy value"}} =
             StateMachine.apply(
               %{system_time: 1_003},
-              {:cross_shard_tx,
-               [
-                 {shard_index,
-                  [{0, {:flow_cross_policy_put, shard_index, policy_key, invalid_value, 0}}], nil}
-               ]},
+              {:flow_policy_allocate, policy_key, invalid_value, 0},
               state
             )
 
           {_state, {:error, "ERR invalid flow policy value"}} =
             StateMachine.apply(
               %{system_time: 1_004},
-              {:cross_shard_tx,
-               [
-                 {shard_index,
-                  [
-                    {0, {:flow_cross_policy_put, shard_index, policy_key, mismatched_value, 0}}
-                  ], nil}
-               ]},
+              {:flow_policy_allocate, policy_key, mismatched_value, 0},
               state
             )
 
@@ -222,10 +394,9 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "cross-shard policy puts allocate generations and reject generationless payloads", %{
+        test "policy allocation stamps generations and rejects generationless payloads", %{
           state: state,
-          ets: ets,
-          shard_index: shard_index
+          ets: ets
         } do
           current_type = "current-cross-policy-wire"
           current_key = Ferricstore.Flow.Keys.policy_key(current_type)
@@ -237,19 +408,14 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           current_input = Ferricstore.Flow.RetryPolicy.encode_flow_policy(current_policy)
 
-          {_state, %{^shard_index => [:ok]}} =
+          {_state, {:ok, current_value}} =
             StateMachine.apply(
               %{system_time: 1_000},
-              {:cross_shard_tx,
-               [
-                 {shard_index,
-                  [{0, {:flow_cross_policy_put, shard_index, current_key, current_input, 0}}],
-                  nil}
-               ]},
+              {:flow_policy_allocate, current_key, current_input, 0},
               state
             )
 
-          assert [{^current_key, current_value, 0, _, _, _, _}] =
+          assert [{^current_key, ^current_value, 0, _, _, _, _}] =
                    :ets.lookup(ets, current_key)
 
           assert {:ok, {1, ^current_policy}} =
@@ -268,13 +434,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           {_state, {:error, "ERR invalid flow policy value"}} =
             StateMachine.apply(
               %{system_time: 2_000},
-              {:cross_shard_tx,
-               [
-                 {shard_index,
-                  [
-                    {0, {:flow_cross_policy_put, shard_index, beta_key, beta_input, 0}}
-                  ], nil}
-               ]},
+              {:flow_policy_allocate, beta_key, beta_input, 0},
               state
             )
 
@@ -287,19 +447,14 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           updated_input = Ferricstore.Flow.RetryPolicy.encode_flow_policy(updated_policy)
 
-          {_state, %{^shard_index => [:ok]}} =
+          {_state, {:ok, updated_value}} =
             StateMachine.apply(
               %{system_time: 3_000},
-              {:cross_shard_tx,
-               [
-                 {shard_index,
-                  [{0, {:flow_cross_policy_put, shard_index, current_key, updated_input, 0}}],
-                  nil}
-               ]},
+              {:flow_policy_allocate, current_key, updated_input, 0},
               state
             )
 
-          assert [{^current_key, updated_value, 0, _, _, _, _}] =
+          assert [{^current_key, ^updated_value, 0, _, _, _, _}] =
                    :ets.lookup(ets, current_key)
 
           assert {:ok, {2, ^updated_policy}} =
@@ -470,10 +625,9 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "list-shaped cross-shard terminal batches are rejected without canonical metadata",
+        test "terminal batches are rejected without canonical policy metadata",
              %{
-               state: state,
-               shard_index: shard_index
+               state: state
              } do
           setup_flow_indexes(state)
 
@@ -491,7 +645,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                  type: type,
                  state: "queued",
                  partition_key: partition_key,
-                 policy_snapshot_captured: true
+                 policy_reference_captured: true
                }},
               state
             )
@@ -506,13 +660,10 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
             }
           ]
 
-          {_state, {:error, "ERR flow policy snapshot is required"}} =
+          {_state, {:error, "ERR flow policy reference is required"}} =
             Ferricstore.Raft.StateMachine.apply(
               %{system_time: 2_000},
-              {:cross_shard_tx,
-               [
-                 {shard_index, [{:flow_cross_terminal_many, :cancel, unstamped_attrs}], nil}
-               ]},
+              {:flow_cancel_many, state_key, %{records: unstamped_attrs}},
               state
             )
 
@@ -522,8 +673,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         @tag :flow_policy_generation
         test "policy allocation fails closed on corrupt migration high-water state", %{
           state: state,
-          ets: ets,
-          shard_index: shard_index
+          ets: ets
         } do
           Enum.each([:job, :marker], fn kind ->
             type = "corrupt-policy-high-water-#{kind}"
@@ -553,14 +703,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               )
             end)
 
-            command =
-              {:cross_shard_tx,
-               [
-                 {shard_index,
-                  [
-                    {0, {:flow_cross_policy_put, shard_index, policy_key, input_value, 0}}
-                  ], nil}
-               ]}
+            command = {:flow_policy_allocate, policy_key, input_value, 0}
 
             {_state, {:error, "ERR corrupt flow policy migration high-water"}} =
               StateMachine.apply(%{system_time: 1_000}, command, state)
@@ -571,6 +714,42 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
             assert [{^high_water_key, ^corrupt_value, 0, _, _, _, _}] =
                      :ets.lookup(ets, high_water_key)
           end)
+        end
+
+        @tag :flow_policy_generation
+        test "policy allocation and install fail closed on a corrupt stored high-water", %{
+          state: state,
+          ets: ets
+        } do
+          type = "corrupt-stored-policy-high-water"
+          policy_key = Ferricstore.Flow.Keys.policy_key(type)
+          corrupt_value = "corrupt-stored-policy"
+
+          {:ok, policy} =
+            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 2_000)
+
+          allocation_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy)
+          install_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy, 4)
+
+          :ets.insert(
+            ets,
+            {policy_key, corrupt_value, 0, Ferricstore.Store.LFU.initial(), 0, 0,
+             byte_size(corrupt_value)}
+          )
+
+          Enum.each(
+            [
+              {:flow_policy_allocate, policy_key, allocation_value, 0},
+              {:flow_policy_put, policy_key, install_value, 0}
+            ],
+            fn command ->
+              {_state, {:error, "ERR corrupt flow policy high-water"}} =
+                StateMachine.apply(%{system_time: 1_000}, command, state)
+
+              assert [{^policy_key, ^corrupt_value, 0, _, _, _, _}] =
+                       :ets.lookup(ets, policy_key)
+            end
+          )
         end
 
         @tag :flow_policy_generation
@@ -596,8 +775,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                  state: "queued",
                  state_meta: %{"owner" => "alice"},
                  partition_key: partition_key,
-                 policy_generation: 0,
-                 policy_snapshot: %{type: type}
+                 policy_ref: flow_command_policy_ref(%{type: type}, 0)
                }},
               state
             )
@@ -628,7 +806,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                  to_state: "processing",
                  fencing_token: created.fencing_token,
                  partition_key: partition_key,
-                 policy_snapshot_captured: true
+                 policy_reference_captured: true
                }},
               state
             )
@@ -638,7 +816,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "Flow apply rejects a partial policy snapshot before mutation", %{
+        test "Flow apply rejects an invalid policy reference before mutation", %{
           state: state,
           ets: ets
         } do
@@ -649,7 +827,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           state_key =
             Ferricstore.Flow.Keys.state_key("invalid-policy-snapshot-flow", partition_key)
 
-          {_state, {:error, "ERR invalid flow policy snapshot"}} =
+          {_state, {:error, "ERR invalid flow policy reference"}} =
             StateMachine.apply(
               %{system_time: 1_000},
               {:flow_create, state_key,
@@ -658,7 +836,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                  type: "invalid-policy-snapshot",
                  state: "queued",
                  partition_key: partition_key,
-                 policy_generation: 1
+                 policy_ref: %{type: "invalid-policy-snapshot", generation: 1}
                }},
               state
             )
@@ -667,7 +845,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           batch_key = Ferricstore.Flow.Keys.state_key("__batch__", partition_key)
 
-          {_state, {:error, "ERR invalid flow policy snapshot"}} =
+          {_state, {:error, "ERR invalid flow policy reference"}} =
             StateMachine.apply(
               %{system_time: 1_001},
               {:flow_create_many, batch_key,
@@ -680,10 +858,11 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                      partition_key: partition_key
                    }
                  ],
-                 policy_snapshots: %{
+                 policy_refs: %{
                    "invalid-policy-snapshot" => %{
+                     type: "invalid-policy-snapshot",
                      generation: -1,
-                     policy: %{type: "invalid-policy-snapshot"}
+                     digest: <<0::256>>
                    }
                  }
                }},
@@ -703,7 +882,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           max_generation = Ferricstore.Flow.RetryPolicy.max_policy_generation()
 
-          {_state, {:error, "ERR invalid flow policy snapshot"}} =
+          {_state, {:error, "ERR invalid flow policy reference"}} =
             StateMachine.apply(
               %{system_time: 1_002},
               {:flow_create, overflow_state_key,
@@ -712,8 +891,11 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                  type: "invalid-policy-snapshot",
                  state: "queued",
                  partition_key: partition_key,
-                 policy_generation: max_generation + 1,
-                 policy_snapshot: %{type: "invalid-policy-snapshot"}
+                 policy_ref: %{
+                   type: "invalid-policy-snapshot",
+                   generation: max_generation + 1,
+                   digest: <<0::256>>
+                 }
                }},
               state
             )
@@ -722,7 +904,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "Flow apply rejects conflicting batch snapshots before mutation", %{
+        test "Flow apply rejects conflicting batch policy references before mutation", %{
           state: state,
           ets: ets
         } do
@@ -743,22 +925,20 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               type: type,
               state: "queued",
               partition_key: partition_key,
-              policy_generation: 1,
-              policy_snapshot: first_policy
+              policy_ref: flow_command_policy_ref(first_policy, 1)
             },
             %{
               id: "conflicting-policy-snapshot-b",
               type: type,
               state: "queued",
               partition_key: partition_key,
-              policy_generation: 2,
-              policy_snapshot: second_policy
+              policy_ref: flow_command_policy_ref(second_policy, 2)
             }
           ]
 
           batch_key = Ferricstore.Flow.Keys.state_key("__batch__", partition_key)
 
-          {_state, {:error, "ERR conflicting flow policy snapshots"}} =
+          {_state, {:error, "ERR conflicting flow policy references"}} =
             StateMachine.apply(
               %{system_time: 1_000},
               {:flow_create_many, batch_key, %{records: records}},
@@ -772,7 +952,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "Flow batches apply a deduplicated command-level policy snapshot", %{
+        test "Flow batches resolve one deduplicated command-level policy reference", %{
           state: state,
           ets: ets
         } do
@@ -781,9 +961,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           type = "deduplicated-apply-policy"
           partition_key = "deduplicated-apply-tenant"
           policy_key = Ferricstore.Flow.Keys.policy_key(type)
-
-          {:ok, captured_policy} =
-            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 1_000)
 
           {:ok, local_policy} =
             Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 9_000)
@@ -803,8 +980,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           attrs = %{
             records: records,
-            policy_snapshots: %{
-              type => %{generation: 1, policy: captured_policy}
+            policy_refs: %{
+              type => flow_command_policy_ref(local_policy, 2)
             }
           }
 
@@ -819,7 +996,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           Enum.each(records, fn record ->
             key = Ferricstore.Flow.Keys.state_key(record.id, partition_key)
-            assert flow_record!(state, key).max_active_ms == 1_000
+            assert flow_record!(state, key).max_active_ms == 9_000
           end)
         end
 
@@ -1854,6 +2031,16 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                           %{shard_index: ^shard_index, reason: :writer_not_started}},
                          500
         end
+      end
+
+      defp flow_command_policy_ref(policy, generation) do
+        encoded = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy, generation)
+
+        %{
+          type: Map.fetch!(policy, :type),
+          generation: generation,
+          digest: :crypto.hash(:sha256, encoded)
+        }
       end
     end
   end

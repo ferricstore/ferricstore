@@ -44,6 +44,11 @@ defmodule FerricStore.Flow.WorkflowSDKTest do
 
     def flow_transition(id, from_state, to_state, opts) do
       send(test_pid(), {:flow_transition, id, from_state, to_state, opts})
+
+      if Process.get(:flow_sdk_raise_transition) do
+        raise "transition storage failure"
+      end
+
       {:ok, %{id: id, state: to_state}}
     end
 
@@ -199,6 +204,43 @@ defmodule FerricStore.Flow.WorkflowSDKTest do
 
     assert opts[:type] == "billing"
     assert opts[:state] == "created"
+  end
+
+  test "workflow commands cannot override the declared flow type" do
+    assert {:ok, _record} =
+             BillingFlow.create(
+               %{id: "f-type", tenant_id: "tenant-a", invoice_id: "1"},
+               type: "forged"
+             )
+
+    assert_received {:flow_create, "f-type", create_opts}
+    assert create_opts[:type] == "billing"
+
+    assert {:ok, _records} =
+             BillingFlow.create_many(
+               [%{id: "f-type-many", tenant_id: "tenant-a", invoice_id: "2"}],
+               type: "forged"
+             )
+
+    assert_received {:flow_create_many, nil, _items, create_many_opts}
+    assert create_many_opts[:type] == "billing"
+
+    assert %{type: "billing"} =
+             BillingFlow.child(
+               %{id: "f-type-child", tenant_id: "tenant-a", invoice_id: "3"},
+               type: "forged"
+             )
+  end
+
+  test "partition builders reject non-scalar values without raising" do
+    error =
+      {:error, "ERR flow partition key fields must be strings, atoms, integers, or floats"}
+
+    attrs = %{id: "f-invalid-partition", tenant_id: %{}, invoice_id: "1"}
+
+    assert ^error = BillingFlow.create(attrs)
+    assert ^error = BillingFlow.create_many([attrs])
+    assert ^error = BillingFlow.child(attrs)
   end
 
   test "child builds child specs with workflow defaults" do
@@ -421,6 +463,29 @@ defmodule FerricStore.Flow.WorkflowSDKTest do
 
     assert_received {:flow_retry, "f2", "lease-2", retry_opts}
     assert retry_opts[:error] == "boom"
+  end
+
+  test "handle does not convert storage mutation failures into a second command" do
+    Process.put(:flow_sdk_raise_transition, true)
+
+    job =
+      FerricStore.Flow.Job.new(BillingFlow, %{
+        id: "f-storage-failure",
+        state: "created",
+        type: "billing",
+        partition_key: "tenant-a:invoice-1",
+        lease_token: "lease-storage-failure",
+        fencing_token: 9
+      })
+
+    assert_raise RuntimeError, "transition storage failure", fn ->
+      BillingFlow.handle(job, fn _job -> {:ok, "charged"} end)
+    end
+
+    assert_received {:flow_transition, "f-storage-failure", "created", "charged", _opts}
+    refute_received {:flow_retry, "f-storage-failure", "lease-storage-failure", _opts}
+  after
+    Process.delete(:flow_sdk_raise_transition)
   end
 
   test "reclaim_once wraps reclaimed records as jobs" do

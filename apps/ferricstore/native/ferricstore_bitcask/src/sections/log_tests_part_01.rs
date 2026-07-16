@@ -216,13 +216,14 @@
     }
 
     #[test]
-    fn truncated_header_returns_none() {
-        // Only 10 bytes — less than HEADER_SIZE (26) — should return None (EOF)
+    fn truncated_header_is_not_silently_treated_as_clean_eof() {
+        // A partial header is a torn record, not a clean EOF. Tolerant iterators
+        // may stop at this condition, but strict readers must surface it.
         let partial = vec![0u8; 10];
         let mut cursor = io::Cursor::new(partial);
-        let result = read_next_record(&mut cursor);
-        // Truncated header looks like EOF → Ok(None)
-        assert!(result.unwrap().is_none());
+        let error = read_next_record(&mut cursor).unwrap_err();
+
+        assert!(error.to_string().contains("truncated record header"));
     }
 
     #[test]
@@ -607,7 +608,7 @@
     // ------------------------------------------------------------------
 
     #[test]
-    fn tolerant_iter_stops_at_first_crc_error() {
+    fn tolerant_iter_rejects_crc_corruption() {
         let dir = temp_dir();
         let path = dir.path().join("data.log");
         let mut w = LogWriter::open(&path, 1).unwrap();
@@ -630,14 +631,11 @@
         }
 
         let mut reader = LogReader::open(&path).unwrap();
-        let records = reader.iter_from_start_tolerant().unwrap();
-        // Only the first record is valid; tolerant iterator stops at 2nd CRC error.
-        assert_eq!(
-            records.len(),
-            1,
-            "tolerant iter must stop at first corrupt record"
+        let error = reader.iter_from_start_tolerant().unwrap_err();
+        assert!(
+            error.0.contains("CRC mismatch"),
+            "integrity failures must not be classified as a torn tail: {error}"
         );
-        assert_eq!(records[0].key, b"k1");
     }
 
     #[test]
@@ -780,4 +778,3 @@
             );
         }
     }
-

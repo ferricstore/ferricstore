@@ -4,9 +4,9 @@ defmodule FerricStore.Pipe do
 
   Used with `FerricStore.pipeline/1` to batch multiple operations into a single
   Raft entry per shard. Commands are accumulated in reverse order and on execute,
-  converted to command tuples and dispatched through the Coordinator. Single-shard
-  pipelines commit in one Raft round-trip; cross-shard pipelines use the
-  anchor-shard mechanism.
+  prepared once and dispatched through the Coordinator. Single-shard pipelines
+  commit in one Raft round-trip; cross-shard pipelines submit independent shard
+  groups concurrently and are not atomic across shards.
 
   Results are normalized to match the FerricStore public API format (e.g.
   `{:ok, value}` for GET, `:ok` for DEL) rather than raw Dispatcher values.
@@ -39,6 +39,9 @@ defmodule FerricStore.Pipe do
   @type t :: %__MODULE__{commands: [command()]}
 
   defstruct commands: []
+
+  alias Ferricstore.Commands.PreparedAccumulatorCommand
+  alias Ferricstore.Store.ReadResult
 
   @doc "Creates a new empty pipeline."
   @spec new() :: t()
@@ -120,11 +123,11 @@ defmodule FerricStore.Pipe do
   Executes all accumulated pipeline commands as a single batch Raft entry
   per shard via the Coordinator.
 
-  This is called internally by `FerricStore.pipeline/1`. Commands are converted
-  to command tuples and dispatched through `Ferricstore.Transaction.Coordinator`,
-  which groups them by shard and submits each group as a single `{:batch}` or
-  `{:tx_execute}` Raft entry. Single-shard pipelines commit in one Raft round-trip;
-  cross-shard pipelines use the anchor-shard mechanism.
+  This is called internally by `FerricStore.pipeline/1`. Commands are prepared
+  once and dispatched through `Ferricstore.Transaction.Coordinator`, which groups
+  them by shard and submits each group as one `{:tx_execute}` Raft entry.
+  Single-shard pipelines commit atomically in one Raft round-trip; cross-shard
+  pipelines are ordered within each shard but not atomic across shards.
 
   Results are returned in the original command order.
   """
@@ -146,16 +149,16 @@ defmodule FerricStore.Pipe do
           kv_pairs = Enum.map(ordered, fn {:set, k, v, _opts} -> {k, v} end)
           execute_batch_sets(ctx, ordered, kv_pairs)
 
-        {:mixed_get_set, _} ->
-          execute_mixed_get_set(ctx, ordered)
-
         :complex ->
-          queue = Enum.map(ordered, &to_resp_command/1)
-          raw_results = Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
-
-          ordered
-          |> Enum.zip(raw_results)
-          |> Enum.map(fn {cmd, raw} -> normalize_result(cmd, raw) end)
+          with {:ok, queue} <- PreparedAccumulatorCommand.prepare_all(ordered),
+               raw_results when is_list(raw_results) <-
+                 Ferricstore.Transaction.Coordinator.execute_pipeline(queue, nil) do
+            ordered
+            |> Enum.zip(raw_results)
+            |> Enum.map(fn {cmd, raw} -> normalize_result(cmd, raw) end)
+          else
+            {:error, _reason} = error -> error
+          end
       end
     end
   end
@@ -180,8 +183,7 @@ defmodule FerricStore.Pipe do
         case kind do
           nil -> :all_gets
           :all_gets -> :all_gets
-          :all_sets -> {:mixed_get_set, true}
-          {:mixed_get_set, _} -> {:mixed_get_set, true}
+          :all_sets -> :complex
           _ -> :complex
         end
 
@@ -199,8 +201,7 @@ defmodule FerricStore.Pipe do
         case kind do
           nil -> :all_sets
           :all_sets -> :all_sets
-          :all_gets -> {:mixed_get_set, true}
-          {:mixed_get_set, _} -> {:mixed_get_set, true}
+          :all_gets -> :complex
           _ -> :complex
         end
 
@@ -212,47 +213,13 @@ defmodule FerricStore.Pipe do
 
   defp classify_batch(_, _, _, _), do: :complex
 
-  defp execute_batch_sets(ctx, _ordered, kv_pairs) do
-    Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
+  if Mix.env() == :test do
+    @doc false
+    def __classify_batch_for_test__(commands), do: classify_batch(commands)
   end
 
-  defp execute_mixed_get_set(ctx, ordered) do
-    indexed = Enum.with_index(ordered)
-    get_ops = for {{:get, key}, i} <- indexed, do: {i, key}
-    set_ops = for {{:set, key, value, _}, i} <- indexed, do: {i, key, value}
-
-    set_results =
-      if set_ops != [] do
-        kv_pairs = Enum.map(set_ops, fn {_i, k, v} -> {k, v} end)
-
-        results =
-          Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
-
-        set_ops
-        |> Enum.zip(results)
-        |> Map.new(fn {{i, _, _}, r} -> {i, r} end)
-      else
-        %{}
-      end
-
-    get_results =
-      if get_ops != [] do
-        keys = Enum.map(get_ops, &elem(&1, 1))
-        values = Ferricstore.Store.Router.batch_get(ctx, keys)
-        results = pipeline_get_results(ctx, keys, values)
-
-        get_ops
-        |> Enum.zip(results)
-        |> Map.new(fn {{i, _}, result} -> {i, result} end)
-      else
-        %{}
-      end
-
-    count = length(ordered)
-
-    for i <- 0..(count - 1) do
-      Map.get(get_results, i) || Map.get(set_results, i)
-    end
+  defp execute_batch_sets(ctx, _ordered, kv_pairs) do
+    Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
   end
 
   defp pipeline_get_results(ctx, keys, values) do
@@ -261,22 +228,56 @@ defmodule FerricStore.Pipe do
     |> Enum.map(fn {key, value} -> pipeline_get_result(ctx, key, value) end)
   end
 
-  defp pipeline_get_result(_ctx, _key, value) when value != nil, do: {:ok, value}
+  defp pipeline_get_result(ctx, key, value) do
+    pipeline_get_result_with_lookup(key, value, fn redis_key, compound_key ->
+      Ferricstore.Store.Router.compound_get(ctx, redis_key, compound_key)
+    end)
+  end
 
-  defp pipeline_get_result(ctx, key, nil) do
-    if pipeline_compound_data_structure_key?(ctx, key) do
-      {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-    else
-      {:ok, nil}
+  defp pipeline_get_result_with_lookup(
+         _key,
+         {:error, {:storage_read_failed, _reason}} = failure,
+         _compound_get
+       ),
+       do: ReadResult.command_error(failure)
+
+  defp pipeline_get_result_with_lookup(_key, value, _compound_get) when not is_nil(value),
+    do: {:ok, value}
+
+  defp pipeline_get_result_with_lookup(key, nil, compound_get) do
+    case pipeline_compound_data_structure_status(key, compound_get) do
+      :compound -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+      :plain -> {:ok, nil}
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
     end
   end
 
-  defp pipeline_compound_data_structure_key?(ctx, key) do
+  defp pipeline_compound_data_structure_status(key, compound_get) do
     type_key = Ferricstore.Store.CompoundKey.type_key(key)
     list_meta_key = Ferricstore.Store.CompoundKey.list_meta_key(key)
 
-    Ferricstore.Store.Router.compound_get(ctx, key, type_key) != nil or
-      Ferricstore.Store.Router.compound_get(ctx, key, list_meta_key) != nil
+    case compound_get.(key, type_key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      nil ->
+        case compound_get.(key, list_meta_key) do
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+          nil -> :plain
+          _list_meta -> :compound
+        end
+
+      _type_marker ->
+        :compound
+    end
+  end
+
+  if Mix.env() == :test do
+    @doc false
+    def __pipeline_get_result_for_test__(key, value, compound_get)
+        when is_function(compound_get, 2) do
+      pipeline_get_result_with_lookup(key, value, compound_get)
+    end
   end
 
   # The Coordinator returns raw Dispatcher results (dispatcher-level values).
@@ -312,96 +313,4 @@ defmodule FerricStore.Pipe do
 
   # SET, INCR, INCR_BY already return the correct format from Dispatcher
   defp normalize_result(_, result), do: result
-
-  defp to_resp_command({:set, key, value, opts}) do
-    args = [key, value]
-    ast_opts = set_ast_options(opts)
-
-    args =
-      case Keyword.get(opts, :ttl) do
-        nil -> args
-        0 -> args
-        ms -> args ++ ["PX", Integer.to_string(ms)]
-      end
-
-    args =
-      case Keyword.get(opts, :ex) do
-        nil -> args
-        seconds -> args ++ ["EX", Integer.to_string(seconds)]
-      end
-
-    args =
-      case Keyword.get(opts, :px) do
-        nil -> args
-        ms -> args ++ ["PX", Integer.to_string(ms)]
-      end
-
-    args =
-      if Keyword.get(opts, :nx, false), do: args ++ ["NX"], else: args
-
-    args =
-      if Keyword.get(opts, :xx, false), do: args ++ ["XX"], else: args
-
-    {"SET", args, {:set, key, value, ast_opts}}
-  end
-
-  defp to_resp_command({:get, key}), do: {"GET", [key], {:get, key}}
-  defp to_resp_command({:del, key}), do: {"DEL", [key], {:del, [key]}}
-  defp to_resp_command({:incr, key}), do: {"INCR", [key], {:incr, key}}
-
-  defp to_resp_command({:incr_by, key, amount}),
-    do: {"INCRBY", [key, Integer.to_string(amount)], {:incrby, key, amount}}
-
-  defp to_resp_command({:hset, key, fields}) do
-    flat = Enum.flat_map(fields, fn {k, v} -> [to_string(k), to_string(v)] end)
-    args = [key | flat]
-    {"HSET", args, {:hset, args}}
-  end
-
-  defp to_resp_command({:hget, key, field}), do: {"HGET", [key, field], {:hget, key, field}}
-
-  defp to_resp_command({:lpush, key, elements}),
-    do: {"LPUSH", [key | elements], {:lpush, [key | elements]}}
-
-  defp to_resp_command({:rpush, key, elements}),
-    do: {"RPUSH", [key | elements], {:rpush, [key | elements]}}
-
-  defp to_resp_command({:sadd, key, members}),
-    do: {"SADD", [key | members], {:sadd, [key | members]}}
-
-  defp to_resp_command({:zadd, key, pairs}) do
-    flat =
-      Enum.flat_map(pairs, fn {score, member} ->
-        [to_string(score), member]
-      end)
-
-    args = [key | flat]
-
-    {"ZADD", args,
-     {:zadd, key, [], Enum.map(pairs, fn {score, member} -> {score / 1, member} end)}}
-  end
-
-  defp to_resp_command({:expire, key, ttl_ms}) do
-    {"PEXPIRE", [key, Integer.to_string(ttl_ms)], {:pexpire, key, ttl_ms}}
-  end
-
-  defp set_ast_options(opts) do
-    []
-    |> maybe_add_set_expiry(opts)
-    |> maybe_add_set_flag(opts, :nx)
-    |> maybe_add_set_flag(opts, :xx)
-  end
-
-  defp maybe_add_set_expiry(acc, opts) do
-    cond do
-      Keyword.get(opts, :ttl) not in [nil, 0] -> [{:px, Keyword.fetch!(opts, :ttl)} | acc]
-      Keyword.has_key?(opts, :ex) -> [{:ex, Keyword.fetch!(opts, :ex)} | acc]
-      Keyword.has_key?(opts, :px) -> [{:px, Keyword.fetch!(opts, :px)} | acc]
-      true -> acc
-    end
-  end
-
-  defp maybe_add_set_flag(acc, opts, flag) do
-    if Keyword.get(opts, flag, false), do: [flag | acc], else: acc
-  end
 end

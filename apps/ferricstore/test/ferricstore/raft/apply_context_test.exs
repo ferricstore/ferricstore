@@ -1,7 +1,7 @@
 defmodule Ferricstore.Raft.ApplyContextTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Flow.{Hibernation, RetryPolicy}
+  alias Ferricstore.Flow.{Hibernation, MutationAttrs, RetryPolicy}
   alias Ferricstore.Raft.{ApplyContext, StateMachine}
 
   test "history hot limits cannot exceed the total history maximum" do
@@ -28,7 +28,11 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     :flow_retention_cleanup_byte_budget,
     :flow_lmdb_history_cleanup_scan_limit,
     :flow_lmdb_value_cleanup_scan_limit,
-    :flow_hibernation_enabled
+    :flow_hibernation_enabled,
+    :promotion_threshold,
+    :compound_delete_member_budget,
+    :flow_max_batch_items,
+    :max_value_size
   ]
 
   setup do
@@ -110,6 +114,38 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     assert context == context |> :erlang.term_to_binary() |> :erlang.binary_to_term([:safe])
   end
 
+  @tag :replicated_promotion_threshold
+  test "promotion threshold is captured once and strictly serialized" do
+    Application.put_env(:ferricstore, :promotion_threshold, 7)
+    context = ApplyContext.from_runtime()
+
+    Application.put_env(:ferricstore, :promotion_threshold, 999)
+
+    assert context.promotion_threshold == 7
+    assert {:ok, ^context} = context |> ApplyContext.encode() |> ApplyContext.decode()
+
+    old_shape =
+      context
+      |> ApplyContext.encode()
+      |> Tuple.delete_at(tuple_size(ApplyContext.encode(context)) - 3)
+
+    assert {:error, :invalid_apply_context} = ApplyContext.decode(old_shape)
+  end
+
+  @tag :replicated_promotion_threshold
+  test "WARaft segment projection reads promotion threshold only from replicated state" do
+    source =
+      File.read!(
+        Path.expand(
+          "lib/ferricstore/raft/waraft_storage/sections/segment_project_commands.ex",
+          File.cwd!()
+        )
+      )
+
+    refute source =~ "Promotion.threshold("
+    assert source =~ "Map.fetch!(sm_state, :apply_context).promotion_threshold"
+  end
+
   test "invalid runtime values normalize once before replication" do
     context =
       ApplyContext.new(
@@ -136,6 +172,66 @@ defmodule Ferricstore.Raft.ApplyContextTest do
 
     assert floored.flow_retention_cleanup_key_budget == 8
     assert floored.flow_retention_cleanup_byte_budget == 4_096
+  end
+
+  test "value-size limits are bounded and preserved by the replicated context" do
+    context = ApplyContext.new(max_value_size: 8)
+
+    assert context.max_value_size == 8
+    assert {:ok, ^context} = context |> ApplyContext.encode() |> ApplyContext.decode()
+
+    hard_max = 512 * 1_024 * 1_024
+    assert ApplyContext.new(max_value_size: hard_max + 1).max_value_size == hard_max
+
+    oversized =
+      context
+      |> ApplyContext.encode()
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 1, hard_max + 1)
+
+    assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
+  end
+
+  test "compound delete work budget is bounded and preserved by the replicated context" do
+    context = ApplyContext.new(compound_delete_member_budget: 8)
+
+    assert context.compound_delete_member_budget == 8
+    assert {:ok, ^context} = context |> ApplyContext.encode() |> ApplyContext.decode()
+
+    hard_max = 100_000
+
+    assert ApplyContext.new(compound_delete_member_budget: hard_max + 1).compound_delete_member_budget ==
+             hard_max
+
+    oversized =
+      context
+      |> ApplyContext.encode()
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 2, hard_max + 1)
+
+    assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
+  end
+
+  test "Flow batch work is bounded and preserved by the replicated context" do
+    context = ApplyContext.new(flow_max_batch_items: 8)
+
+    assert context.flow_max_batch_items == 8
+    assert {:ok, ^context} = context |> ApplyContext.encode() |> ApplyContext.decode()
+
+    hard_max = 100_000
+    assert ApplyContext.new(flow_max_batch_items: hard_max + 1).flow_max_batch_items == hard_max
+
+    oversized =
+      context
+      |> ApplyContext.encode()
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 4, hard_max + 1)
+
+    assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
+  end
+
+  test "command construction and replicated apply clamp Flow batch work identically" do
+    Application.put_env(:ferricstore, :flow_max_batch_items, 100_001)
+
+    assert MutationAttrs.flow_max_batch_items() == 100_000
+    assert ApplyContext.from_runtime().flow_max_batch_items == 100_000
   end
 
   test "replicated history limits retain the existing hot-history safety cap" do
@@ -342,6 +438,22 @@ defmodule Ferricstore.Raft.ApplyContextTest do
 
     assert wrap_source =~ "context_command_shape?(command)"
     refute wrap_source =~ "encode(context)"
+  end
+
+  test "large ordinary batches use a constant-stack sanitizer and preserve identity" do
+    context = ApplyContext.default()
+    commands = List.duplicate({:put, "key", "value", 0}, 100_000)
+    batch = {:batch, commands}
+
+    assert :erts_debug.same(batch, ApplyContext.wrap_command(batch, context))
+
+    source =
+      "../../../lib/ferricstore/raft/apply_context.ex"
+      |> Path.expand(__DIR__)
+      |> File.read!()
+
+    refute source =~ "sanitize_command_list(rest, context)",
+           "batch sanitation must not consume one call frame per replicated command"
   end
 
   test "pre-stamped commands cannot bypass or inject replicated context" do

@@ -3,6 +3,7 @@ defmodule Ferricstore.Commands.Bitmap do
   alias Ferricstore.Commands.Bitmap.Bits
   alias Ferricstore.Commands.Bitmap.Destination
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.ReadResult
 
   @moduledoc """
   Handles Redis bitmap commands: SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP.
@@ -29,7 +30,6 @@ defmodule Ferricstore.Commands.Bitmap do
 
   import Bitwise
 
-  @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
   @bitcount_chunk_bytes 64 * 1024
 
   @doc """
@@ -56,9 +56,11 @@ defmodule Ferricstore.Commands.Bitmap do
     with :ok <- Destination.ensure_string_key(key, store),
          {:ok, offset} <- Args.parse_non_negative_integer(offset_str, "bit offset"),
          :ok <- Args.check_bit_offset(offset),
-         {:ok, bit_val} <- Args.parse_bit_value(bit_str) do
+         {:ok, bit_val} <- Args.parse_bit_value(bit_str),
+         :ok <- validate_setbit_target_size(store, offset) do
       case setbit_noop_from_store(store, key, offset, bit_val) do
         {:ok, old_bit} -> old_bit
+        {:error, _reason} = error -> error
         :unknown -> setbit_rewrite(key, offset, bit_val, store)
       end
     end
@@ -78,17 +80,10 @@ defmodule Ferricstore.Commands.Bitmap do
          :ok <- Args.check_bit_offset(offset) do
       byte_index = div(offset, 8)
 
-      if byte_index_outside_value?(store, key, byte_index) do
-        0
-      else
-        case byte_at(store, key, byte_index) do
-          nil ->
-            0
-
-          byte ->
-            bit_position = 7 - rem(offset, 8)
-            byte >>> bit_position &&& 1
-        end
+      case byte_index_outside_value?(store, key, byte_index) do
+        true -> 0
+        false -> getbit_from_byte(store, key, byte_index, offset)
+        {:error, _reason} = error -> error
       end
     end
   end
@@ -107,9 +102,13 @@ defmodule Ferricstore.Commands.Bitmap do
         {:ok, count} ->
           count
 
+        {:error, _reason} = error ->
+          error
+
         :unknown ->
-          current = Ops.get(store, key) || <<>>
-          Bits.popcount(current)
+          with {:ok, current} <- read_string_or_empty(store, key) do
+            Bits.popcount(current)
+          end
       end
     end
   end
@@ -128,12 +127,15 @@ defmodule Ferricstore.Commands.Bitmap do
           {:ok, count} ->
             count
 
-          :unknown ->
-            current = Ops.get(store, key) || <<>>
+          {:error, _reason} = error ->
+            error
 
-            case mode do
-              :byte -> Bits.bitcount_byte_range(current, start_idx, end_idx)
-              :bit -> Bits.bitcount_bit_range(current, start_idx, end_idx)
+          :unknown ->
+            with {:ok, current} <- read_string_or_empty(store, key) do
+              case mode do
+                :byte -> Bits.bitcount_byte_range(current, start_idx, end_idx)
+                :bit -> Bits.bitcount_bit_range(current, start_idx, end_idx)
+              end
             end
         end
       end
@@ -159,9 +161,13 @@ defmodule Ferricstore.Commands.Bitmap do
         {:ok, pos} ->
           pos
 
+        {:error, _reason} = error ->
+          error
+
         :unknown ->
-          current = Ops.get(store, key) || <<>>
-          Bits.bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
+          with {:ok, current} <- read_string_or_empty(store, key) do
+            Bits.bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
+          end
       end
     end
   end
@@ -174,16 +180,23 @@ defmodule Ferricstore.Commands.Bitmap do
         {:ok, result} ->
           result
 
+        {:error, _reason} = error ->
+          error
+
         :unknown ->
           case bitpos_byte_range_from_store(store, key, bit_val, start_idx, nil, false) do
             {:ok, result} ->
               result
 
+            {:error, _reason} = error ->
+              error
+
             :unknown ->
-              current = Ops.get(store, key) || <<>>
-              len = byte_size(current)
-              start_resolved = Bits.resolve_index(start_idx, len)
-              Bits.bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
+              with {:ok, current} <- read_string_or_empty(store, key) do
+                len = byte_size(current)
+                start_resolved = Bits.resolve_index(start_idx, len)
+                Bits.bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
+              end
           end
       end
     end
@@ -203,17 +216,24 @@ defmodule Ferricstore.Commands.Bitmap do
             {:ok, result} ->
               result
 
+            {:error, _reason} = error ->
+              error
+
             :unknown ->
               case bitpos_byte_range_from_store(store, key, bit_val, start_idx, end_idx, true) do
                 {:ok, result} ->
                   result
 
+                {:error, _reason} = error ->
+                  error
+
                 :unknown ->
-                  current = Ops.get(store, key) || <<>>
-                  len = byte_size(current)
-                  s = Bits.resolve_index(start_idx, len)
-                  e = Bits.resolve_index(end_idx, len)
-                  Bits.bitpos_byte_range(current, bit_val, s, e, true)
+                  with {:ok, current} <- read_string_or_empty(store, key) do
+                    len = byte_size(current)
+                    s = Bits.resolve_index(start_idx, len)
+                    e = Bits.resolve_index(end_idx, len)
+                    Bits.bitpos_byte_range(current, bit_val, s, e, true)
+                  end
               end
           end
 
@@ -222,17 +242,24 @@ defmodule Ferricstore.Commands.Bitmap do
             {:ok, result} ->
               result
 
+            {:error, _reason} = error ->
+              error
+
             :unknown ->
               case bitpos_bit_range_from_store(store, key, bit_val, start_idx, end_idx) do
                 {:ok, result} ->
                   result
 
+                {:error, _reason} = error ->
+                  error
+
                 :unknown ->
-                  current = Ops.get(store, key) || <<>>
-                  total_bits = byte_size(current) * 8
-                  s = Bits.resolve_index(start_idx, total_bits)
-                  e = Bits.resolve_index(end_idx, total_bits)
-                  Bits.bitpos_bit_range(current, bit_val, s, e)
+                  with {:ok, current} <- read_string_or_empty(store, key) do
+                    total_bits = byte_size(current) * 8
+                    s = Bits.resolve_index(start_idx, total_bits)
+                    e = Bits.resolve_index(end_idx, total_bits)
+                    Bits.bitpos_bit_range(current, bit_val, s, e)
+                  end
               end
           end
       end
@@ -277,9 +304,11 @@ defmodule Ferricstore.Commands.Bitmap do
   def handle_ast({:setbit, key, offset, bit_val}, store)
       when is_integer(offset) and offset >= 0 and bit_val in [0, 1] do
     with :ok <- Destination.ensure_string_key(key, store),
-         :ok <- Args.check_bit_offset(offset) do
+         :ok <- Args.check_bit_offset(offset),
+         :ok <- validate_setbit_target_size(store, offset) do
       case setbit_noop_from_store(store, key, offset, bit_val) do
         {:ok, old_bit} -> old_bit
+        {:error, _reason} = error -> error
         :unknown -> setbit_rewrite(key, offset, bit_val, store)
       end
     end
@@ -290,17 +319,10 @@ defmodule Ferricstore.Commands.Bitmap do
          :ok <- Args.check_bit_offset(offset) do
       byte_index = div(offset, 8)
 
-      if byte_index_outside_value?(store, key, byte_index) do
-        0
-      else
-        case byte_at(store, key, byte_index) do
-          nil ->
-            0
-
-          byte ->
-            bit_position = 7 - rem(offset, 8)
-            byte >>> bit_position &&& 1
-        end
+      case byte_index_outside_value?(store, key, byte_index) do
+        true -> 0
+        false -> getbit_from_byte(store, key, byte_index, offset)
+        {:error, _reason} = error -> error
       end
     end
   end
@@ -311,9 +333,13 @@ defmodule Ferricstore.Commands.Bitmap do
         {:ok, count} ->
           count
 
+        {:error, _reason} = error ->
+          error
+
         :unknown ->
-          current = Ops.get(store, key) || <<>>
-          Bits.popcount(current)
+          with {:ok, current} <- read_string_or_empty(store, key) do
+            Bits.popcount(current)
+          end
       end
     end
   end
@@ -328,12 +354,15 @@ defmodule Ferricstore.Commands.Bitmap do
           {:ok, count} ->
             count
 
-          :unknown ->
-            current = Ops.get(store, key) || <<>>
+          {:error, _reason} = error ->
+            error
 
-            case mode do
-              :byte -> Bits.bitcount_byte_range(current, start_idx, end_idx)
-              :bit -> Bits.bitcount_bit_range(current, start_idx, end_idx)
+          :unknown ->
+            with {:ok, current} <- read_string_or_empty(store, key) do
+              case mode do
+                :byte -> Bits.bitcount_byte_range(current, start_idx, end_idx)
+                :bit -> Bits.bitcount_bit_range(current, start_idx, end_idx)
+              end
             end
         end
       end
@@ -346,9 +375,13 @@ defmodule Ferricstore.Commands.Bitmap do
         {:ok, pos} ->
           pos
 
+        {:error, _reason} = error ->
+          error
+
         :unknown ->
-          current = Ops.get(store, key) || <<>>
-          Bits.bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
+          with {:ok, current} <- read_string_or_empty(store, key) do
+            Bits.bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
+          end
       end
     end
   end
@@ -360,16 +393,23 @@ defmodule Ferricstore.Commands.Bitmap do
         {:ok, result} ->
           result
 
+        {:error, _reason} = error ->
+          error
+
         :unknown ->
           case bitpos_byte_range_from_store(store, key, bit_val, start_idx, nil, false) do
             {:ok, result} ->
               result
 
+            {:error, _reason} = error ->
+              error
+
             :unknown ->
-              current = Ops.get(store, key) || <<>>
-              len = byte_size(current)
-              start_resolved = Bits.resolve_index(start_idx, len)
-              Bits.bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
+              with {:ok, current} <- read_string_or_empty(store, key) do
+                len = byte_size(current)
+                start_resolved = Bits.resolve_index(start_idx, len)
+                Bits.bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
+              end
           end
       end
     end
@@ -385,17 +425,24 @@ defmodule Ferricstore.Commands.Bitmap do
             {:ok, result} ->
               result
 
+            {:error, _reason} = error ->
+              error
+
             :unknown ->
               case bitpos_byte_range_from_store(store, key, bit_val, start_idx, end_idx, true) do
                 {:ok, result} ->
                   result
 
+                {:error, _reason} = error ->
+                  error
+
                 :unknown ->
-                  current = Ops.get(store, key) || <<>>
-                  len = byte_size(current)
-                  s = Bits.resolve_index(start_idx, len)
-                  e = Bits.resolve_index(end_idx, len)
-                  Bits.bitpos_byte_range(current, bit_val, s, e, true)
+                  with {:ok, current} <- read_string_or_empty(store, key) do
+                    len = byte_size(current)
+                    s = Bits.resolve_index(start_idx, len)
+                    e = Bits.resolve_index(end_idx, len)
+                    Bits.bitpos_byte_range(current, bit_val, s, e, true)
+                  end
               end
           end
 
@@ -404,17 +451,24 @@ defmodule Ferricstore.Commands.Bitmap do
             {:ok, result} ->
               result
 
+            {:error, _reason} = error ->
+              error
+
             :unknown ->
               case bitpos_bit_range_from_store(store, key, bit_val, start_idx, end_idx) do
                 {:ok, result} ->
                   result
 
+                {:error, _reason} = error ->
+                  error
+
                 :unknown ->
-                  current = Ops.get(store, key) || <<>>
-                  total_bits = byte_size(current) * 8
-                  s = Bits.resolve_index(start_idx, total_bits)
-                  e = Bits.resolve_index(end_idx, total_bits)
-                  Bits.bitpos_bit_range(current, bit_val, s, e)
+                  with {:ok, current} <- read_string_or_empty(store, key) do
+                    total_bits = byte_size(current) * 8
+                    s = Bits.resolve_index(start_idx, total_bits)
+                    e = Bits.resolve_index(end_idx, total_bits)
+                    Bits.bitpos_bit_range(current, bit_val, s, e)
+                  end
               end
           end
       end
@@ -434,8 +488,33 @@ defmodule Ferricstore.Commands.Bitmap do
   # Private helpers
   # ===========================================================================
 
+  defp validate_setbit_target_size(store, offset) do
+    target_size = div(offset, 8) + 1
+
+    case configured_value_size_limit(store) do
+      limit when is_integer(limit) and target_size > limit ->
+        {:error, "ERR value too large (#{target_size} bytes, max #{limit} bytes)"}
+
+      _within_limit_or_unknown ->
+        :ok
+    end
+  end
+
+  defp configured_value_size_limit(%{max_value_size: limit})
+       when is_integer(limit) and limit > 0,
+       do: limit
+
+  defp configured_value_size_limit(%{__instance_ctx__: ctx}),
+    do: configured_value_size_limit(ctx)
+
+  defp configured_value_size_limit(%{instance_ctx: ctx}),
+    do: configured_value_size_limit(ctx)
+
+  defp configured_value_size_limit(_store), do: :unknown
+
   defp byte_index_outside_value?(store, key, byte_index) do
     case Destination.metadata_value_size(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       size when is_integer(size) -> byte_index >= size
       _ -> false
     end
@@ -443,8 +522,23 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp byte_at(store, key, byte_index) do
     case Ops.getrange(store, key, byte_index, byte_index) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       <<byte>> -> byte
       _ -> nil
+    end
+  end
+
+  defp getbit_from_byte(store, key, byte_index, offset) do
+    case byte_at(store, key, byte_index) do
+      {:error, _reason} = error ->
+        error
+
+      nil ->
+        0
+
+      byte ->
+        bit_position = 7 - rem(offset, 8)
+        byte >>> bit_position &&& 1
     end
   end
 
@@ -459,6 +553,8 @@ defmodule Ferricstore.Commands.Bitmap do
 
       if old_bit == bit_val, do: {:ok, old_bit}, else: :unknown
     else
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      {:error, _reason} = error -> error
       _ -> :unknown
     end
   end
@@ -466,6 +562,7 @@ defmodule Ferricstore.Commands.Bitmap do
   defp setbit_noop_candidate_size(%FerricStore.Instance{} = store, key) do
     case Ferricstore.Store.Router.get_keydir_file_ref(store, key) do
       {:ok, {_fid, _offset, value_size}} -> value_size
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
       :miss -> :unknown
     end
   end
@@ -476,12 +573,19 @@ defmodule Ferricstore.Commands.Bitmap do
   defp setbit_noop_candidate_size(_store, _key), do: :unknown
 
   defp setbit_rewrite(key, offset, bit_val, store) do
-    {current, expire_at_ms} =
-      case Ops.get_meta(store, key) do
-        nil -> {<<>>, 0}
-        {value, exp} -> {value, exp}
-      end
+    case Ops.get_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
 
+      nil ->
+        rewrite_setbit_value(key, offset, bit_val, store, <<>>, 0)
+
+      {value, exp} ->
+        rewrite_setbit_value(key, offset, bit_val, store, value, exp)
+    end
+  end
+
+  defp rewrite_setbit_value(key, offset, bit_val, store, current, expire_at_ms) do
     byte_index = div(offset, 8)
     # Extend the binary with zero bytes if needed
     extended = Bits.extend_binary(current, byte_index + 1)
@@ -514,6 +618,9 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp write_bitop_result(store, destkey, result) do
     case Destination.bitop_compound_destination_type(destkey, store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       nil ->
         case Ops.put(store, destkey, result, 0) do
           :ok -> byte_size(result)
@@ -521,21 +628,26 @@ defmodule Ferricstore.Commands.Bitmap do
         end
 
       type ->
-        backup = Destination.compound_destination_backup(destkey, type, store)
+        case Destination.compound_destination_backup(destkey, type, store) do
+          {:ok, backup} -> replace_compound_bitop_destination(store, destkey, result, backup)
+          {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+        end
+    end
+  end
 
-        case Destination.clear_compound_data_structure(destkey, store) do
+  defp replace_compound_bitop_destination(store, destkey, result, backup) do
+    case Destination.clear_compound_data_structure(destkey, store) do
+      :ok ->
+        case Ops.put(store, destkey, result, 0) do
           :ok ->
-            case Ops.put(store, destkey, result, 0) do
-              :ok ->
-                byte_size(result)
-
-              {:error, _} = error ->
-                Destination.restore_bitop_destination(store, destkey, backup, error)
-            end
+            byte_size(result)
 
           {:error, _} = error ->
             Destination.restore_bitop_destination(store, destkey, backup, error)
         end
+
+      {:error, _} = error ->
+        Destination.restore_bitop_destination(store, destkey, backup, error)
     end
   end
 
@@ -563,6 +675,9 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp bitcount_all_from_store(store, key) do
     case Destination.metadata_value_size(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       0 ->
         {:ok, 0}
 
@@ -582,6 +697,9 @@ defmodule Ferricstore.Commands.Bitmap do
     expected_size = last - offset + 1
 
     case Ops.getrange(store, key, offset, last) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       slice when is_binary(slice) and byte_size(slice) == expected_size ->
         bitcount_all_chunks(store, key, size, last + 1, acc + Bits.popcount(slice))
 
@@ -592,6 +710,9 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp bitpos_all_from_store(store, key, bit_val) do
     case Destination.metadata_value_size(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       0 when bit_val == 0 ->
         {:ok, 0}
 
@@ -617,6 +738,9 @@ defmodule Ferricstore.Commands.Bitmap do
     expected_size = last - offset + 1
 
     case Ops.getrange(store, key, offset, last) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       slice when is_binary(slice) and byte_size(slice) == expected_size ->
         case Bits.scan_bytes_for_bit(slice, bit_val, 0, byte_size(slice) - 1) do
           pos when pos >= 0 -> {:ok, offset * 8 + pos}
@@ -633,6 +757,8 @@ defmodule Ferricstore.Commands.Bitmap do
          {:ok, start_byte, end_byte} <- resolve_range(start_idx, end_idx, size) do
       bitcount_byte_range_chunks(store, key, start_byte, end_byte, 0)
     else
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      {:error, _reason} = error -> error
       :empty -> {:ok, 0}
       _ -> :unknown
     end
@@ -646,6 +772,8 @@ defmodule Ferricstore.Commands.Bitmap do
       end_byte = div(end_bit, 8)
       bitcount_bit_range_chunks(store, key, start_byte, end_byte, start_bit, end_bit, 0)
     else
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      {:error, _reason} = error -> error
       :empty -> {:ok, 0}
       _ -> :unknown
     end
@@ -668,6 +796,9 @@ defmodule Ferricstore.Commands.Bitmap do
     expected_size = last - offset + 1
 
     case Ops.getrange(store, key, offset, last) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       slice when is_binary(slice) and byte_size(slice) == expected_size ->
         chunk_start_bit = offset * 8
         local_start_bit = max(start_bit - chunk_start_bit, 0)
@@ -697,6 +828,9 @@ defmodule Ferricstore.Commands.Bitmap do
     expected_size = last - offset + 1
 
     case Ops.getrange(store, key, offset, last) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       slice when is_binary(slice) and byte_size(slice) == expected_size ->
         bitcount_byte_range_chunks(store, key, last + 1, end_byte, acc + Bits.popcount(slice))
 
@@ -720,6 +854,9 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp bitpos_byte_range_from_size(store, key, bit_val, start_idx, end_idx, explicit_end) do
     case Destination.metadata_value_size(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       size when is_integer(size) ->
         start_resolved = Bits.resolve_index(start_idx, size)
         end_resolved = if end_idx == nil, do: size - 1, else: Bits.resolve_index(end_idx, size)
@@ -744,6 +881,9 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp bitpos_bit_range_from_size(store, key, start_idx, end_idx) do
     case Destination.metadata_value_size(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       size when is_integer(size) ->
         total_bits = size * 8
         start_resolved = Bits.resolve_index(start_idx, total_bits)
@@ -768,8 +908,17 @@ defmodule Ferricstore.Commands.Bitmap do
          {:ok, start_byte, end_byte} <- resolve_range(start_idx, end_idx, size) do
       bitpos_byte_range_chunks(store, key, bit_val, start_byte, end_byte, size, explicit_end)
     else
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      {:error, _reason} = error ->
+        error
+
       :empty ->
         case Destination.metadata_value_size(store, key) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
           size when is_integer(size) ->
             {:ok, bitpos_empty_byte_range_result(bit_val, size, explicit_end)}
 
@@ -792,6 +941,9 @@ defmodule Ferricstore.Commands.Bitmap do
     expected_size = last - offset + 1
 
     case Ops.getrange(store, key, offset, last) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       slice when is_binary(slice) and byte_size(slice) == expected_size ->
         case Bits.scan_bytes_for_bit(slice, bit_val, 0, byte_size(slice) - 1) do
           pos when pos >= 0 ->
@@ -822,8 +974,17 @@ defmodule Ferricstore.Commands.Bitmap do
       end_byte = div(end_bit, 8)
       bitpos_bit_range_chunks(store, key, bit_val, start_byte, end_byte, start_bit, end_bit)
     else
-      :empty -> {:ok, -1}
-      _ -> :unknown
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      {:error, _reason} = error ->
+        error
+
+      :empty ->
+        {:ok, -1}
+
+      _ ->
+        :unknown
     end
   end
 
@@ -836,6 +997,9 @@ defmodule Ferricstore.Commands.Bitmap do
     expected_size = last - offset + 1
 
     case Ops.getrange(store, key, offset, last) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
       slice when is_binary(slice) and byte_size(slice) == expected_size ->
         chunk_start_bit = offset * 8
         local_start_bit = max(start_bit - chunk_start_bit, 0)
@@ -871,6 +1035,7 @@ defmodule Ferricstore.Commands.Bitmap do
     with :ok <- ensure_string_keys(source_keys, store) do
       case and_zero_result_from_missing_source(source_keys, store) do
         {:ok, result} -> {:ok, result}
+        {:error, _reason} = error -> error
         :unknown -> read_sources_unchecked(source_keys, store, "AND")
       end
     end
@@ -898,6 +1063,7 @@ defmodule Ferricstore.Commands.Bitmap do
     with :ok <- ensure_string_keys(source_keys, store) do
       case and_zero_result_from_missing_source(source_keys, store) do
         {:ok, result} -> {:ok, result}
+        {:error, _reason} = error -> error
         :unknown -> read_sources_unchecked(source_keys, store, "AND")
       end
     end
@@ -918,20 +1084,25 @@ defmodule Ferricstore.Commands.Bitmap do
   end
 
   defp read_sources_unchecked(source_keys, store, op) do
-    {:ok, values} = values_from_batch_get(source_keys, store)
-    combine_bitop_sources(op, values)
+    with {:ok, values} <- values_from_batch_get(source_keys, store) do
+      combine_bitop_sources(op, values)
+    end
   end
 
   defp values_from_batch_get(source_keys, store) do
-    values =
-      store
-      |> Ops.batch_get(source_keys)
-      |> Enum.map(fn
-        nil -> <<>>
-        value -> value
-      end)
+    values = Ops.batch_get(store, source_keys)
 
-    {:ok, values}
+    case ReadResult.first_failure(values) do
+      nil ->
+        {:ok,
+         Enum.map(values, fn
+           nil -> <<>>
+           value -> value
+         end)}
+
+      failure ->
+        ReadResult.command_error(failure)
+    end
   end
 
   defp combine_bitop_sources(op, values) do
@@ -952,6 +1123,9 @@ defmodule Ferricstore.Commands.Bitmap do
 
   defp and_zero_result_from_missing_source(source_keys, store) do
     case bitop_source_sizes(source_keys, store) do
+      {:error, _reason} = error ->
+        error
+
       :unknown ->
         :unknown
 
@@ -972,11 +1146,18 @@ defmodule Ferricstore.Commands.Bitmap do
   defp bitop_source_sizes(source_keys, store) do
     Enum.reduce_while(source_keys, [], fn key, acc ->
       case Destination.metadata_value_size(store, key) do
-        :unknown -> {:halt, :unknown}
-        size when is_integer(size) or is_nil(size) -> {:cont, [size | acc]}
+        {:error, {:storage_read_failed, _reason}} = failure ->
+          {:halt, ReadResult.command_error(failure)}
+
+        :unknown ->
+          {:halt, :unknown}
+
+        size when is_integer(size) or is_nil(size) ->
+          {:cont, [size | acc]}
       end
     end)
     |> case do
+      {:error, _reason} = error -> error
       :unknown -> :unknown
       sizes -> Enum.reverse(sizes)
     end
@@ -986,15 +1167,23 @@ defmodule Ferricstore.Commands.Bitmap do
     Enum.reduce_while(keys, :ok, fn key, :ok ->
       case Destination.ensure_string_key(key, store) do
         :ok -> {:cont, :ok}
-        @wrongtype_error -> {:halt, @wrongtype_error}
+        {:error, _reason} = error -> {:halt, error}
       end
     end)
   end
 
   defp read_source(key, store) do
     case Destination.ensure_string_key(key, store) do
-      :ok -> {:ok, Ops.get(store, key) || <<>>}
-      @wrongtype_error -> @wrongtype_error
+      :ok -> read_string_or_empty(store, key)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp read_string_or_empty(store, key) do
+    case Ops.get(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      nil -> {:ok, <<>>}
+      value -> {:ok, value}
     end
   end
 end

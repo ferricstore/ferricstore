@@ -226,13 +226,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
           assert :ok =
                    Ferricstore.Flow.LMDB.write_batch(
                      lmdb_path,
-                     Ferricstore.Flow.LMDB.segment_value_pin_put_ops(
-                       payload_ref,
-                       0,
-                       {:waraft_apply_projection, value_index},
-                       value_offset,
-                       value_size
-                     )
+                     Ferricstore.Flow.LMDB.segment_value_pin_batch_put_ops([
+                       {payload_ref, 0, {:waraft_apply_projection, value_index}, value_offset,
+                        value_size}
+                     ])
                    )
 
           :ets.delete(elem(ctx.keydir_refs, 0), payload_ref)
@@ -326,13 +323,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
             assert :ok =
                      Ferricstore.Flow.LMDB.write_batch(
                        lmdb_path,
-                       Ferricstore.Flow.LMDB.segment_value_pin_put_ops(
-                         payload_ref,
-                         0,
-                         {:waraft_apply_projection, value_index},
-                         value_offset,
-                         value_size
-                       )
+                       Ferricstore.Flow.LMDB.segment_value_pin_batch_put_ops([
+                         {payload_ref, 0, {:waraft_apply_projection, value_index}, value_offset,
+                          value_size}
+                       ])
                      )
 
             :ets.delete(elem(ctx.keydir_refs, 0), payload_ref)
@@ -400,13 +394,10 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.UnifiedSegmentTrimPrunesFl
         assert :ok =
                  Ferricstore.Flow.LMDB.write_batch(
                    lmdb_path,
-                   Ferricstore.Flow.LMDB.segment_value_pin_put_ops(
-                     payload_ref,
-                     expired_at_ms,
-                     {:waraft_apply_projection, value_index},
-                     0,
-                     value_size
-                   )
+                   Ferricstore.Flow.LMDB.segment_value_pin_batch_put_ops([
+                     {payload_ref, expired_at_ms, {:waraft_apply_projection, value_index}, 0,
+                      value_size}
+                   ])
                  )
 
         :ets.delete(elem(ctx.keydir_refs, 0), payload_ref)

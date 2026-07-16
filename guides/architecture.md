@@ -103,7 +103,7 @@ FerricstoreServer.Supervisor (:one_for_one)  [standalone mode only]
 ├── FerricstoreServer.Acl                 # Server-side ACL state and invalidation hooks
 ├── Ranch TCP Listener                    # Native protocol connections
 ├── Ranch TLS Listener                    # Optional encrypted native connections
-├── Dashboard/Metrics HTTP Endpoint       # /dashboard + /metrics + legacy health routes
+├── Dashboard/Metrics HTTP Endpoint       # /dashboard + /metrics + combined health routes
 └── Isolated Health Probe Endpoint        # /health/live + /health/ready
 ```
 
@@ -683,8 +683,8 @@ pipeline validation, blocking and session handling, transaction
 reauthorization, and `MULTI` shard planning reuse the same immutable value so
 no stage can reinterpret a command's keys differently. Coordinated Flow and
 global control commands are rejected by execution modes that promise
-single-shard semantics. Legacy parser callers receive a compatibility tuple
-derived from the prepared value.
+single-shard semantics. Replicated transactions retain a compact validated
+execution entry containing only the normalized command and AST needed at apply.
 
 ### Per-Connection State
 

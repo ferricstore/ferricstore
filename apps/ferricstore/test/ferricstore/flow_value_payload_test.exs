@@ -235,6 +235,26 @@ defmodule Ferricstore.FlowValuePayloadTest do
     assert {:ok, [^payload]} = FerricStore.flow_value_mget([ref], payload_max_bytes: 64 * 1024)
   end
 
+  test "shared value TTL uses command time when now_ms is omitted" do
+    assert {:ok, %{ref: ref}} =
+             FerricStore.flow_value_put("expires", partition_key: "tenant-a", ttl_ms: 60_000)
+
+    assert {:ok, ["expires"]} = FerricStore.flow_value_mget([ref])
+  end
+
+  test "shared value expiry stays in the exact integer domain" do
+    max_exact = 9_007_199_254_740_991
+
+    assert {:error, "ERR flow now_ms must be an exact non-negative integer"} =
+             FerricStore.flow_value_put("invalid", now_ms: max_exact + 1)
+
+    assert {:error, "ERR flow ttl_ms must be an exact positive integer"} =
+             FerricStore.flow_value_put("invalid", ttl_ms: max_exact + 1)
+
+    assert {:error, "ERR flow expiry exceeds the exact integer limit"} =
+             FerricStore.flow_value_put("invalid", now_ms: max_exact, ttl_ms: 1)
+  end
+
   test "value_mget returns hot values and leaves ordinary missing refs as nil" do
     assert {:ok, %{ref: ref}} =
              FerricStore.flow_value_put("hot-value", partition_key: "tenant-a")

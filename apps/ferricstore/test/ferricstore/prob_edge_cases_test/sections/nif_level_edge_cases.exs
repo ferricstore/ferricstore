@@ -326,7 +326,7 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
         test "topk_file_create_v2 and roundtrip" do
           dir = make_prob_dir("nif_topk")
           path = Path.join(dir, "test.topk")
-          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7, 0.9)
+          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7)
 
           # Add elements
           result = NIF.topk_file_add_v2(path, ["apple", "banana", "cherry"])
@@ -344,7 +344,7 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           path = Path.join(dir, "overflow.topk")
           max_i64 = 9_223_372_036_854_775_807
 
-          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7, 0.9)
+          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7)
           assert [nil] = NIF.topk_file_incrby_v2(path, [{"hot", max_i64}])
           assert [^max_i64] = NIF.topk_file_count_v2(path, ["hot"])
 
@@ -357,7 +357,7 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           dir = make_prob_dir("nif_topk_truncated_count")
           path = Path.join(dir, "truncated.topk")
 
-          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7, 0.9)
+          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7)
           <<header::binary-size(64), _::binary>> = File.read!(path)
           File.write!(path, header)
 
@@ -368,7 +368,7 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
         test "topk_file_list_v2 on empty topk returns empty list" do
           dir = make_prob_dir("nif_topk_empty")
           path = Path.join(dir, "empty.topk")
-          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7, 0.9)
+          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7)
 
           result = NIF.topk_file_list_v2(path)
           assert result == []
@@ -378,7 +378,7 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           dir = make_prob_dir("nif_topk_evict")
           path = Path.join(dir, "evict.topk")
           # k=2: only 2 elements in heap
-          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 2, 8, 7, 0.9)
+          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 2, 8, 7)
 
           # Add elements with different counts
           NIF.topk_file_incrby_v2(path, [{"high", 100}])
@@ -403,11 +403,10 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
         test "topk_file_info_v2 returns correct metadata" do
           dir = make_prob_dir("nif_topk_info")
           path = Path.join(dir, "info.topk")
-          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 10, 16, 5, 0.8)
+          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 10, 16, 5)
 
           result = NIF.topk_file_info_v2(path)
-          assert {10, 16, 5, decay} = result
-          assert_in_delta decay, 0.8, 0.001
+          assert {10, 16, 5} = result
         end
       end
 

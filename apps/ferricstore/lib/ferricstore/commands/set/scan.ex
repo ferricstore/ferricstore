@@ -1,33 +1,13 @@
 defmodule Ferricstore.Commands.Set.Scan do
   @moduledoc false
 
+  alias Ferricstore.Commands.CollectionScan
+
   def typed_scan_opts(opts), do: do_typed_scan_opts(opts, nil, 10)
 
-  def parse_cursor(cursor_str) do
-    case Integer.parse(cursor_str) do
-      {cursor, ""} when cursor >= 0 -> {:ok, cursor}
-      _ -> {:error, "ERR invalid cursor"}
-    end
-  end
+  def parse_cursor(cursor_str), do: CollectionScan.parse_cursor(cursor_str)
 
   def parse_sscan_opts(opts), do: do_parse_sscan_opts(opts, nil, 10)
-
-  def paginate(items, cursor, count) do
-    rest = Enum.drop(items, cursor)
-
-    case rest do
-      [] ->
-        {"0", []}
-
-      _ ->
-        {batch, remainder} = Enum.split(rest, count)
-
-        case remainder do
-          [] -> {"0", batch}
-          _ -> {Integer.to_string(cursor + length(batch)), batch}
-        end
-    end
-  end
 
   defp do_typed_scan_opts([], match, count), do: {:ok, match, count}
 

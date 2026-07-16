@@ -213,7 +213,7 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_CHUNK_PAUSE_MS", "1")),
     flow_lmdb_flush_jitter_ms:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_FLUSH_JITTER_MS", "250")),
-    flow_lmdb_flush_on_max_ops: boolean_env.("FERRICSTORE_FLOW_LMDB_FLUSH_ON_MAX_OPS", false),
+    flow_lmdb_flush_on_max_ops: boolean_env.("FERRICSTORE_FLOW_LMDB_FLUSH_ON_MAX_OPS", true),
     flow_lmdb_max_concurrent_flushes:
       String.to_integer(System.get_env("FERRICSTORE_FLOW_LMDB_MAX_CONCURRENT_FLUSHES", "1")),
     flow_hibernation_enabled: boolean_env.("FERRICSTORE_FLOW_HIBERNATION_ENABLED", true),
@@ -379,6 +379,13 @@ if config_env() == :prod do
     System.get_env("FERRICSTORE_DASHBOARD_TRUSTED_PROXIES", "")
     |> String.split([",", " "], trim: true)
 
+  dashboard_session_secret =
+    case System.get_env("FERRICSTORE_DASHBOARD_SESSION_SECRET") do
+      nil -> nil
+      secret when byte_size(secret) >= 32 -> secret
+      _too_short -> raise "FERRICSTORE_DASHBOARD_SESSION_SECRET must be at least 32 bytes"
+    end
+
   Enum.each(dashboard_trusted_proxies, fn entry ->
     {address, prefix} =
       case String.split(entry, "/", parts: 2) do
@@ -415,6 +422,7 @@ if config_env() == :prod do
     dashboard_trusted_proxies: dashboard_trusted_proxies,
     dashboard_cookie_secure: dashboard_cookie_secure,
     dashboard_allowed_origins: dashboard_allowed_origins,
+    dashboard_session_secret: dashboard_session_secret,
     auth_rate_limit_max_attempts:
       positive_integer_env.("FERRICSTORE_AUTH_RATE_LIMIT_MAX_ATTEMPTS", 10),
     auth_rate_limit_window_ms:
@@ -425,15 +433,7 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   # Connection
   # ---------------------------------------------------------------------------
-  socket_mode = System.get_env("FERRICSTORE_SOCKET_ACTIVE_MODE", "true")
-
   config :ferricstore,
-    socket_active_mode:
-      (case socket_mode do
-         "true" -> true
-         "once" -> :once
-         n -> String.to_integer(n)
-       end),
     require_tls: boolean_env.("FERRICSTORE_REQUIRE_TLS", false),
     native_protocol_enabled: true,
     native_tls_port:
@@ -451,23 +451,78 @@ if config_env() == :prod do
     native_tls_ca_cert_file: System.get_env("FERRICSTORE_NATIVE_TLS_CA_CERT_FILE"),
     native_max_frame_bytes:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_FRAME_BYTES", "16777216")),
+    native_unauthenticated_max_frame_bytes:
+      String.to_integer(
+        System.get_env("FERRICSTORE_NATIVE_UNAUTHENTICATED_MAX_FRAME_BYTES", "65536")
+      ),
+    native_frame_assembly_timeout_ms:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_FRAME_ASSEMBLY_TIMEOUT_MS", "15000")),
+    native_send_timeout_ms: positive_integer_env.("FERRICSTORE_NATIVE_SEND_TIMEOUT_MS", 15_000),
+    native_max_value_items:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_VALUE_ITEMS", "100000")),
+    native_max_value_depth:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_VALUE_DEPTH", "64")),
     native_max_lanes_per_connection:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_LANES_PER_CONNECTION", "1024")),
     native_lane_max_queue:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_LANE_MAX_QUEUE", "1024")),
-    native_max_batch_commands:
-      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_BATCH_COMMANDS", "1024")),
+    native_max_pipeline_commands:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_PIPELINE_COMMANDS", "1024")),
     native_max_inflight_per_connection:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_INFLIGHT_PER_CONNECTION", "4096")),
     native_max_inflight_per_lane:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_INFLIGHT_PER_LANE", "1024")),
+    native_max_queued_request_bytes_per_connection:
+      String.to_integer(
+        System.get_env("FERRICSTORE_NATIVE_MAX_QUEUED_REQUEST_BYTES_PER_CONNECTION", "67108864")
+      ),
+    native_max_queued_request_bytes_per_lane:
+      String.to_integer(
+        System.get_env("FERRICSTORE_NATIVE_MAX_QUEUED_REQUEST_BYTES_PER_LANE", "33554432")
+      ),
     native_response_chunk_bytes:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_RESPONSE_CHUNK_BYTES", "0")),
+    native_max_response_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_RESPONSE_BYTES", "67108864")),
+    native_response_coalesce_max:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_RESPONSE_COALESCE_MAX", "64")),
+    native_response_coalesce_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_RESPONSE_COALESCE_BYTES", "8388608")),
     native_max_pending_chunks:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_PENDING_CHUNKS", "1024")),
+    native_max_pending_chunk_bytes:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_PENDING_CHUNK_BYTES", "67108864")),
     native_max_collection_response_items:
       String.to_integer(
         System.get_env("FERRICSTORE_NATIVE_MAX_COLLECTION_RESPONSE_ITEMS", "10000")
+      ),
+    native_request_compression_enabled:
+      boolean_env.("FERRICSTORE_NATIVE_REQUEST_COMPRESSION_ENABLED", false),
+    native_max_global_executions:
+      String.to_integer(
+        System.get_env(
+          "FERRICSTORE_NATIVE_MAX_GLOBAL_EXECUTIONS",
+          Integer.to_string(max(System.schedulers_online(), 1) * 8)
+        )
+      ),
+    native_max_global_lanes:
+      String.to_integer(
+        System.get_env(
+          "FERRICSTORE_NATIVE_MAX_GLOBAL_LANES",
+          Integer.to_string(max(System.schedulers_online(), 1) * 32)
+        )
+      ),
+    native_max_global_blocking_requests:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_GLOBAL_BLOCKING_REQUESTS", "4096")),
+    native_max_global_pending_chunks:
+      String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_GLOBAL_PENDING_CHUNKS", "4096")),
+    native_max_global_pending_chunk_bytes:
+      String.to_integer(
+        System.get_env("FERRICSTORE_NATIVE_MAX_GLOBAL_PENDING_CHUNK_BYTES", "268435456")
+      ),
+    native_max_global_inbound_buffer_bytes:
+      String.to_integer(
+        System.get_env("FERRICSTORE_NATIVE_MAX_GLOBAL_INBOUND_BUFFER_BYTES", "268435456")
       ),
     native_trace_enabled: boolean_env.("FERRICSTORE_NATIVE_TRACE_ENABLED", false),
     native_trusted_request_context_users: native_trusted_request_context_users,

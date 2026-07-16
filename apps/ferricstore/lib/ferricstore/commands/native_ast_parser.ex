@@ -8,63 +8,18 @@ defmodule Ferricstore.Commands.NativeAstParser do
   command catalog.
   """
 
-  alias Ferricstore.Commands.{Catalog, Extension}
+  alias Ferricstore.Commands.{Catalog, CollectionScan, Extension}
 
   @max_flow_ref_size 4096
-  @extra_command_names ~w(
-    PING ECHO HELLO AUTH ACL CLIENT QUIT RESET SANDBOX
-    MULTI EXEC DISCARD WATCH UNWATCH
-    DBSIZE KEYS FLUSHDB FLUSHALL SELECT INFO COMMAND LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE
-    CONFIG MODULE WAITAOF FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR FERRICSTORE.CONFIG
-    FERRICSTORE.METRICS FERRICSTORE.KEY_INFO FERRICSTORE.CAPABILITIES
-    FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY
-    FLOW.SEARCH FLOW.STATS FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.STEP_CONTINUE
-    FLOW.START_AND_CLAIM FLOW.RUN_STEPS_MANY
-    FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.GET FLOW.SCHEDULE.DELETE FLOW.SCHEDULE.FIRE_DUE
-    FLOW.SCHEDULE.LIST FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME
-    FLOW.EFFECT.RESERVE FLOW.EFFECT.CONFIRM FLOW.EFFECT.FAIL FLOW.EFFECT.COMPENSATE
-    FLOW.EFFECT.GET FLOW.GOVERNANCE.LEDGER FLOW.GOVERNANCE.OVERVIEW
-    FLOW.APPROVAL.REQUEST FLOW.APPROVAL.APPROVE FLOW.APPROVAL.REJECT FLOW.APPROVAL.GET
-    FLOW.APPROVAL.LIST FLOW.CIRCUIT.OPEN FLOW.CIRCUIT.CLOSE FLOW.CIRCUIT.GET
-    FLOW.BUDGET.RESERVE FLOW.BUDGET.COMMIT FLOW.BUDGET.RELEASE FLOW.BUDGET.GET
-    FLOW.BUDGET.LIST FLOW.LIMIT.LEASE FLOW.LIMIT.SPEND FLOW.LIMIT.RELEASE
-    FLOW.LIMIT.GET FLOW.LIMIT.LIST
-    CAS LOCK UNLOCK EXTEND RATELIMIT.ADD KEY_INFO FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT
-    FETCH_OR_COMPUTE_ERROR
-    CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS CLUSTER.JOIN
-    CLUSTER.LEAVE CLUSTER.FAILOVER CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE FERRICSTORE.HOTNESS
-    SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE PUBLISH PUBSUB
-    GET SET SETEX PSETEX SETNX GETSET GETEX GETDEL APPEND STRLEN
-    INCR DECR INCRBY DECRBY INCRBYFLOAT GETRANGE SETRANGE
-    EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST EXPIRETIME PEXPIRETIME
-    DEL UNLINK EXISTS TYPE RENAME RENAMENX COPY RANDOMKEY SCAN OBJECT WAIT MEMORY
-    MGET MSET MSETNX
-    LPUSH RPUSH LPUSHX RPUSHX LPOP RPOP LLEN LRANGE LTRIM LINDEX LSET LREM LINSERT
-    LMOVE RPOPLPUSH LPOS BLPOP BRPOP BLMOVE BLMPOP
-    HGET HGETALL HKEYS HVALS HLEN HEXISTS HSTRLEN HSET HSETNX HDEL HMGET
-    HINCRBY HINCRBYFLOAT HRANDFIELD HSCAN HEXPIRE HPEXPIRE HTTL HPTTL HPERSIST
-    HEXPIRETIME HGETDEL HGETEX HSETEX
-    SADD SREM SMEMBERS SCARD SISMEMBER SMISMEMBER SRANDMEMBER SPOP SMOVE SSCAN
-    SINTER SUNION SDIFF SDIFFSTORE SINTERSTORE SUNIONSTORE SINTERCARD
-    ZADD ZINCRBY ZSCORE ZRANK ZREVRANK ZPOPMIN ZPOPMAX ZRANDMEMBER ZCOUNT
-    ZRANGE ZREVRANGE ZRANGEBYSCORE ZREVRANGEBYSCORE ZSCAN ZREM ZMSCORE ZCARD
-    PFADD PFCOUNT PFMERGE
-    GETBIT SETBIT BITCOUNT BITPOS BITOP
-    XADD XLEN XRANGE XREVRANGE XREAD XTRIM XDEL XINFO XGROUP XREADGROUP XACK
-    GEOADD GEOPOS GEODIST GEOHASH GEOSEARCH GEOSEARCHSTORE
-    BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO
-    CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO
-    CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO
-    TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO
-    TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF
-    TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK
-    TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE
-  )
+  @min_int64 -9_223_372_036_854_775_808
+  @max_int64 9_223_372_036_854_775_807
+  @max_blocking_timeout_ms 0xFFFFFFFF
+  @flow_repeated_option_keys ~w(attributes_delete values value_refs drop_values override_values)a
   @extra_first_key_commands ~w(
     GET SET SETEX PSETEX SETNX GETSET GETEX GETDEL APPEND STRLEN
     INCR DECR INCRBY DECRBY INCRBYFLOAT GETRANGE SETRANGE
     EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST EXPIRETIME PEXPIRETIME
-    UNLINK TYPE OBJECT MEMORY
+    TYPE OBJECT MEMORY
     LPUSH RPUSH LPUSHX RPUSHX LPOP RPOP LLEN LRANGE LTRIM LINDEX LSET LREM LINSERT LPOS
     HGET HGETALL HKEYS HVALS HLEN HEXISTS HSTRLEN HSET HSETNX HDEL HMGET
     HINCRBY HINCRBYFLOAT HRANDFIELD HSCAN HEXPIRE HPEXPIRE HTTL HPTTL HPERSIST
@@ -89,7 +44,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   @management_scoped_commands ~w(FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
 
   @command_tags Map.new(
-                  Enum.map(Catalog.names(), &String.upcase/1) ++ @extra_command_names,
+                  Enum.map(Catalog.names(), &String.upcase/1),
                   fn upper ->
                     tag =
                       upper |> String.downcase() |> String.replace(".", "_") |> String.to_atom()
@@ -106,6 +61,13 @@ defmodule Ferricstore.Commands.NativeAstParser do
   def supported_command_names do
     MapSet.union(@supported_command_names, Extension.command_names_upper())
   end
+
+  @doc false
+  @spec conservative_command_keys(binary(), [binary()]) :: [binary()]
+  def conservative_command_keys(cmd, args) when cmd in @management_scoped_commands,
+    do: management_command_keys(cmd, args)
+
+  def conservative_command_keys(cmd, args), do: extra_command_keys(cmd, args)
 
   @single_key_tags ~w(
     get incr decr strlen getdel ttl pttl persist llen hgetall hkeys hvals hlen
@@ -205,7 +167,8 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {"FENCING", :fencing_token, :non_negative},
       {"LEASE_MS", :lease_ms, {:positive, :lease_ms}},
       {"NOW", :now_ms, :non_negative},
-      {"PARTITION", :partition_key, :partition}
+      {"PARTITION", :partition_key, :partition},
+      {"RETURN", :return, :binary}
     ],
     transition: [
       {"FENCING", :fencing_token, :non_negative},
@@ -363,11 +326,13 @@ defmodule Ferricstore.Commands.NativeAstParser do
   def parse("", _args), do: {:error, "ERR unknown command '', with args beginning with: "}
 
   def parse(name, args) when is_binary(name) and is_list(args) do
-    cmd = String.upcase(name)
-    parsed_args = Enum.map(args, &to_command_binary/1)
-    ast = make_ast(cmd, Map.get(@command_tags, cmd), parsed_args)
-    keys = command_keys(cmd, parsed_args, ast)
-    {:ok, cmd, parsed_args, ast, keys}
+    with {:ok, parsed_args} <- normalize_command_args(args) do
+      cmd = String.upcase(name)
+      parsed_args = normalize_scoped_management_subcommand(cmd, parsed_args)
+      ast = make_ast(cmd, Map.get(@command_tags, cmd), parsed_args)
+      keys = command_keys(cmd, parsed_args, ast)
+      {:ok, cmd, parsed_args, ast, keys}
+    end
   end
 
   def parse(_name, _args), do: {:error, "ERR protocol error"}
@@ -545,15 +510,25 @@ defmodule Ferricstore.Commands.NativeAstParser do
     do: {:hrandfield, key, parse_int(count), parse_withvalues(withvalues)}
 
   defp make_ast(_cmd, :hscan, [key, cursor | opts]),
-    do: {:hscan, key, parse_int(cursor), parse_scan_opts(opts)}
+    do: {:hscan, key, parse_scan_cursor(cursor), parse_collection_scan_opts(opts)}
 
-  defp make_ast(_cmd, tag, [key, ttl, "FIELDS", count | fields])
-       when tag in ~w(hexpire hpexpire)a,
-       do: parse_hash_expire(tag, key, ttl, count, fields)
+  defp make_ast(_cmd, tag, [key, ttl, option, count | fields])
+       when tag in ~w(hexpire hpexpire)a do
+    if String.upcase(option) == "FIELDS" do
+      parse_hash_expire(tag, key, ttl, count, fields)
+    else
+      {tag, key, {:error, "ERR syntax error"}, []}
+    end
+  end
 
-  defp make_ast(_cmd, tag, [key, "FIELDS", count | fields])
-       when tag in ~w(httl hpttl hpersist hexpiretime hgetdel)a,
-       do: parse_hash_field_list(tag, key, count, fields)
+  defp make_ast(_cmd, tag, [key, option, count | fields])
+       when tag in ~w(httl hpttl hpersist hexpiretime hgetdel)a do
+    if String.upcase(option) == "FIELDS" do
+      parse_hash_field_list(tag, key, count, fields)
+    else
+      {tag, key, {:error, "ERR syntax error"}}
+    end
+  end
 
   defp make_ast(_cmd, :hgetex, [key | opts]), do: parse_hgetex(key, opts)
 
@@ -571,7 +546,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     do: {:smove, source, destination, member}
 
   defp make_ast(_cmd, :sscan, [key, cursor | opts]),
-    do: {:sscan, key, parse_int(cursor), parse_scan_opts(opts)}
+    do: {:sscan, key, parse_scan_cursor(cursor), parse_collection_scan_opts(opts)}
 
   defp make_ast(_cmd, :sintercard, args), do: parse_sintercard(args)
 
@@ -589,11 +564,11 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, :zrandmember, [key, count]),
     do: {:zrandmember, key, parse_int(count), false}
 
-  defp make_ast(_cmd, :zrandmember, [key, count, "WITHSCORES"]),
-    do: {:zrandmember, key, parse_int(count), true}
-
-  defp make_ast(_cmd, :zrandmember, [_key, _count, _bad]),
-    do: {:zrandmember, nil, nil, {:error, "ERR syntax error"}}
+  defp make_ast(_cmd, :zrandmember, [key, count, option]) do
+    if String.upcase(option) == "WITHSCORES",
+      do: {:zrandmember, key, parse_int(count), true},
+      else: {:zrandmember, key, parse_int(count), {:error, "ERR syntax error"}}
+  end
 
   defp make_ast(_cmd, tag, [key]) when tag in ~w(zpopmin zpopmax zrandmember)a, do: {tag, key}
 
@@ -604,13 +579,19 @@ defmodule Ferricstore.Commands.NativeAstParser do
        when tag in ~w(zrangebyscore zrevrangebyscore)a, do: {tag, key, min, max, opts}
 
   defp make_ast(_cmd, tag, [key, cursor | opts]) when tag in ~w(zscan)a,
-    do: {tag, key, parse_int(cursor), parse_scan_opts(opts)}
+    do: {tag, key, parse_scan_cursor(cursor), parse_collection_scan_opts(opts)}
 
   defp make_ast(_cmd, tag, [key, start, stop]) when tag in ~w(zrange zrevrange)a,
     do: {tag, key, parse_int(start), parse_int(stop), false}
 
-  defp make_ast(_cmd, tag, [key, start, stop, "WITHSCORES"]) when tag in ~w(zrange zrevrange)a,
-    do: {tag, key, parse_int(start), parse_int(stop), true}
+  defp make_ast(_cmd, tag, [key, start, stop, option]) when tag in ~w(zrange zrevrange)a do
+    with_scores =
+      if String.upcase(option) == "WITHSCORES",
+        do: true,
+        else: {:error, "ERR syntax error"}
+
+    {tag, key, parse_int(start), parse_int(stop), with_scores}
+  end
 
   defp make_ast("MEMORY", :memory, [subcmd | rest]), do: {:memory, [String.upcase(subcmd) | rest]}
   defp make_ast("MEMORY", :memory, []), do: {:memory, []}
@@ -642,7 +623,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast(_cmd, tag, [key, newkey]) when tag in ~w(rename renamenx)a, do: {tag, key, newkey}
 
   defp make_ast(_cmd, :copy, [source, destination | opts]),
-    do: {:copy, source, destination, copy_replace?(opts)}
+    do: {:copy, source, destination, parse_copy_opts(opts)}
 
   defp make_ast(_cmd, :randomkey, []), do: {:randomkey, []}
   defp make_ast(_cmd, :scan, [cursor | opts]), do: {:scan, cursor, parse_scan_opts(opts)}
@@ -832,21 +813,20 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast("TOPK.RESERVE", :topk_reserve, [key, k]),
     do:
       with_parsed_numbers(:topk_reserve, [parse_pos_int(k)], fn [parsed_k] ->
-        {:topk_reserve, key, parsed_k, 8, 7, 0.9}
+        {:topk_reserve, key, parsed_k, 8, 7}
       end)
 
-  defp make_ast("TOPK.RESERVE", :topk_reserve, [key, k, width, depth, decay]),
+  defp make_ast("TOPK.RESERVE", :topk_reserve, [key, k, width, depth]),
     do:
       with_parsed_numbers(
         :topk_reserve,
         [
           parse_pos_int(k),
           parse_pos_int(width),
-          parse_pos_int(depth),
-          parse_probability_inclusive_float(decay)
+          parse_pos_int(depth)
         ],
-        fn [parsed_k, parsed_width, parsed_depth, parsed_decay] ->
-          {:topk_reserve, key, parsed_k, parsed_width, parsed_depth, parsed_decay}
+        fn [parsed_k, parsed_width, parsed_depth] ->
+          {:topk_reserve, key, parsed_k, parsed_width, parsed_depth}
         end
       )
 
@@ -864,21 +844,27 @@ defmodule Ferricstore.Commands.NativeAstParser do
     do: {:topk_incrby, {:error, "ERR wrong number of arguments for 'topk.incrby' command"}}
 
   defp make_ast("TOPK.LIST", :topk_list, [key]), do: {:topk_list, key, false}
-  defp make_ast("TOPK.LIST", :topk_list, [key, "WITHCOUNT"]), do: {:topk_list, key, true}
 
-  defp make_ast("TOPK.LIST", :topk_list, [_key, _bad]),
-    do: {:topk_list, {:error, "ERR syntax error"}}
+  defp make_ast("TOPK.LIST", :topk_list, [key, option]) do
+    if String.upcase(option) == "WITHCOUNT",
+      do: {:topk_list, key, true},
+      else: {:topk_list, {:error, "ERR syntax error"}}
+  end
 
   defp make_ast("TOPK.LIST", :topk_list, _args),
     do: {:topk_list, {:error, "ERR wrong number of arguments for 'topk.list' command"}}
 
   defp make_ast("TDIGEST.CREATE", :tdigest_create, [key]), do: {:tdigest_create, key, nil}
 
-  defp make_ast("TDIGEST.CREATE", :tdigest_create, [key, "COMPRESSION", compression]),
-    do:
+  defp make_ast("TDIGEST.CREATE", :tdigest_create, [key, option, compression]) do
+    if String.upcase(option) == "COMPRESSION" do
       with_parsed_numbers(:tdigest_create, [parse_pos_int(compression)], fn [parsed_compression] ->
         {:tdigest_create, key, parsed_compression}
       end)
+    else
+      {:tdigest_create, {:error, "ERR syntax error"}}
+    end
+  end
 
   defp make_ast("TDIGEST.CREATE", :tdigest_create, _args),
     do: {:tdigest_create, {:error, "ERR wrong number of arguments for 'tdigest.create' command"}}
@@ -898,8 +884,15 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast("TDIGEST.RESET", :tdigest_reset, _args),
     do: {:tdigest_reset, {:error, "ERR wrong number of arguments for 'tdigest.reset' command"}}
 
+  defp make_ast("TDIGEST.QUANTILE", :tdigest_quantile, [key | values]) when values != [] do
+    case parse_list(values, &parse_probability_inclusive_float/1) do
+      {:ok, quantiles} -> {:tdigest_quantile, key, quantiles}
+      {:error, msg} -> {:tdigest_quantile, key, {:error, msg}}
+    end
+  end
+
   defp make_ast(_cmd, tag, [key | values])
-       when tag in ~w(tdigest_quantile tdigest_cdf tdigest_rank tdigest_revrank)a and values != [] do
+       when tag in ~w(tdigest_cdf tdigest_rank tdigest_revrank)a and values != [] do
     case parse_float_list(values) do
       {:ok, floats} -> {tag, key, floats}
       {:error, msg} -> {tag, key, {:error, msg}}
@@ -922,13 +915,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     do: {tag, {:error, "ERR wrong number of arguments for 'tdigest' command"}}
 
   defp make_ast("TDIGEST.TRIMMED_MEAN", :tdigest_trimmed_mean, [key, low, high]),
-    do:
-      with_parsed_numbers(:tdigest_trimmed_mean, [parse_float(low), parse_float(high)], fn [
-                                                                                             parsed_low,
-                                                                                             parsed_high
-                                                                                           ] ->
-        {:tdigest_trimmed_mean, key, parsed_low, parsed_high}
-      end)
+    do: make_tdigest_trimmed_mean_ast(key, parse_float(low), parse_float(high))
 
   defp make_ast("TDIGEST.TRIMMED_MEAN", :tdigest_trimmed_mean, _args),
     do:
@@ -956,6 +943,8 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp make_ast(_cmd, tag, args), do: {tag, args}
 
+  defp command_keys(_cmd, _args, {:unknown, _unknown_command, _unknown_args}), do: []
+
   defp command_keys("FLOW." <> _rest, _args, ast) do
     case flow_ast_keys(ast) do
       keys when is_list(keys) and keys != [] -> Enum.uniq(keys)
@@ -972,7 +961,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp command_keys(cmd, args) do
     case Catalog.get_keys_upper(cmd, args) do
       {:ok, keys} -> keys
-      {:error, _} -> static_or_extension_keys(cmd, args)
+      {:error, _} -> static_command_keys(cmd, args)
     end
   end
 
@@ -986,14 +975,16 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
+  defp flow_ast_keys({tag, _id, opts})
+       when tag in [:flow_get, :flow_history] and is_list(opts),
+       do: [flow_partition_or_global(opts)]
+
   defp flow_ast_keys({tag, id, opts})
        when tag in [
               :flow_create,
               :flow_signal,
-              :flow_get,
               :flow_cancel,
-              :flow_rewind,
-              :flow_history
+              :flow_rewind
             ] and is_binary(id) and is_list(opts),
        do: [flow_partition_or_id(opts, id)]
 
@@ -1067,24 +1058,29 @@ defmodule Ferricstore.Commands.NativeAstParser do
     [parent_key | child_keys]
   end
 
-  defp flow_ast_keys({tag, [key | _args]})
+  defp flow_ast_keys({tag, [_opaque_id | _args]})
        when tag in [
-              :flow_step_continue,
-              :flow_start_and_claim,
               :flow_schedule_get,
               :flow_schedule_delete,
               :flow_schedule_fire,
               :flow_schedule_pause,
               :flow_schedule_resume,
+              :flow_approval_approve,
+              :flow_approval_reject,
+              :flow_approval_get
+            ],
+       do: ["*"]
+
+  defp flow_ast_keys({tag, [key | _args]})
+       when tag in [
+              :flow_step_continue,
+              :flow_start_and_claim,
               :flow_effect_reserve,
               :flow_effect_confirm,
               :flow_effect_fail,
               :flow_effect_compensate,
               :flow_effect_get,
               :flow_governance_ledger,
-              :flow_approval_approve,
-              :flow_approval_reject,
-              :flow_approval_get,
               :flow_circuit_open,
               :flow_circuit_close,
               :flow_circuit_get,
@@ -1116,6 +1112,13 @@ defmodule Ferricstore.Commands.NativeAstParser do
     case Keyword.get(opts, :partition_key) do
       partition when is_binary(partition) and partition != "" -> flow_acl_partition_key(partition)
       _none -> id
+    end
+  end
+
+  defp flow_partition_or_global(opts) do
+    case Keyword.get(opts, :partition_key) do
+      partition when is_binary(partition) and partition != "" -> flow_acl_partition_key(partition)
+      _none -> "*"
     end
   end
 
@@ -1202,16 +1205,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp flow_nonempty_key(value) when is_binary(value) and value != "", do: [value]
   defp flow_nonempty_key(_value), do: ["*"]
 
-  defp static_or_extension_keys(cmd, args) do
-    if MapSet.member?(@supported_command_names, cmd) do
-      extra_command_keys(cmd, args)
-    else
-      case Extension.keys(cmd, args) do
-        {:ok, keys} -> keys
-        :error -> extra_command_keys(cmd, args)
-      end
-    end
-  end
+  defp static_command_keys(cmd, args), do: extra_command_keys(cmd, args)
 
   defp management_command_keys("FERRICSTORE.NAMESPACE", ["ENSURE", prefix | _]),
     do: [scope_boundary_key(prefix)]
@@ -1276,7 +1270,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   end
 
   defp extra_command_keys(cmd, args)
-       when cmd in ~w(DEL EXISTS MGET MSET MSETNX SINTER SUNION SDIFF),
+       when cmd in ~w(DEL UNLINK EXISTS MGET MSET MSETNX SINTER SUNION SDIFF),
        do: every_nth(args, 0, if(cmd in ~w(MSET MSETNX), do: 2, else: 1))
 
   defp extra_command_keys(cmd, args) when cmd in ~w(SDIFFSTORE SINTERSTORE SUNIONSTORE PFMERGE),
@@ -1311,7 +1305,12 @@ defmodule Ferricstore.Commands.NativeAstParser do
     do: take_count(rest, parse_int(count))
 
   defp extra_command_keys("XREAD", args), do: xread_keys(args)
-  defp extra_command_keys("XREADGROUP", args), do: xread_keys(args)
+
+  defp extra_command_keys("XREADGROUP", [option, _group, _consumer | args]) do
+    if String.upcase(option) == "GROUP", do: xread_keys(args), else: []
+  end
+
+  defp extra_command_keys("XREADGROUP", _args), do: []
   defp extra_command_keys("GEOSEARCHSTORE", [destination, source | _]), do: [destination, source]
 
   defp extra_command_keys(cmd, [key | _args]) when cmd in @extra_first_key_commands, do: [key]
@@ -1324,28 +1323,31 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
-  defp flow_partition_key_values(args, option_start) when option_start >= length(args), do: []
-
   defp flow_partition_key_values(args, option_start) do
-    option_start..(length(args) - 2)
-    |> Enum.flat_map(fn idx ->
-      case {Enum.at(args, idx), Enum.at(args, idx + 1)} do
-        {name, value} when is_binary(value) ->
-          if String.upcase(to_string(name)) == "PARTITION" do
-            [flow_acl_partition_key(value)]
-          else
-            []
-          end
-
-        _other ->
-          []
-      end
-    end)
-    |> Enum.uniq()
+    args
+    |> Enum.drop(option_start)
+    |> collect_flow_partition_keys(MapSet.new(), [])
   end
 
-  defp flow_acl_partition_key("GLOBAL"), do: "*"
-  defp flow_acl_partition_key(value), do: value
+  defp collect_flow_partition_keys([name, value | rest], seen, acc) do
+    key =
+      if is_binary(name) and is_binary(value) and String.upcase(name) == "PARTITION",
+        do: flow_acl_partition_key(value),
+        else: nil
+
+    {seen, acc} =
+      if is_binary(key) and not MapSet.member?(seen, key),
+        do: {MapSet.put(seen, key), [key | acc]},
+        else: {seen, acc}
+
+    collect_flow_partition_keys([value | rest], seen, acc)
+  end
+
+  defp collect_flow_partition_keys(_args, _seen, acc), do: Enum.reverse(acc)
+
+  defp flow_acl_partition_key(value) do
+    if String.upcase(value) == "GLOBAL", do: "*", else: value
+  end
 
   defp parse_set_opts(opts), do: parse_set_opts(opts, [])
 
@@ -1428,8 +1430,34 @@ defmodule Ferricstore.Commands.NativeAstParser do
     if String.upcase(value) == "WITHVALUES", do: :withvalues, else: {:error, "ERR syntax error"}
   end
 
-  defp parse_scan_opts(opts), do: Enum.map(opts, &maybe_parse_scan_opt/1)
-  defp maybe_parse_scan_opt(value), do: value
+  defp parse_scan_opts(opts), do: parse_scan_opts(opts, true, [])
+  defp parse_collection_scan_opts(opts), do: parse_scan_opts(opts, false, [])
+
+  defp parse_scan_opts([], _allow_type?, acc), do: Enum.reverse(acc)
+
+  defp parse_scan_opts([option, value | rest], allow_type?, acc) do
+    case String.upcase(option) do
+      "MATCH" ->
+        parse_scan_opts(rest, allow_type?, Keyword.put(acc, :match, value))
+
+      "COUNT" ->
+        case parse_int(value) do
+          count when is_integer(count) and count > 0 and count <= 10_000 ->
+            parse_scan_opts(rest, allow_type?, Keyword.put(acc, :count, count))
+
+          _invalid ->
+            {:error, "ERR value is not an integer or out of range"}
+        end
+
+      "TYPE" when allow_type? ->
+        parse_scan_opts(rest, allow_type?, Keyword.put(acc, :type, String.downcase(value)))
+
+      _unsupported ->
+        {:error, "ERR syntax error"}
+    end
+  end
+
+  defp parse_scan_opts(_invalid, _allow_type?, _acc), do: {:error, "ERR syntax error"}
 
   defp parse_hash_expire(tag, key, ttl, count, fields) do
     with ttl when is_integer(ttl) <- parse_pos_int(ttl),
@@ -1447,25 +1475,40 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
-  defp parse_hgetex(key, ["PERSIST", "FIELDS", count | fields]) do
-    case parse_hash_fields(count, fields) do
-      parsed_fields when is_list(parsed_fields) -> {:hgetex, key, :persist, parsed_fields}
-      {:error, _} = error -> {:hgetex, key, error}
-    end
-  end
+  defp parse_hgetex(key, [option | rest]) do
+    case {String.upcase(option), rest} do
+      {"FIELDS", [count | fields]} ->
+        parse_hgetex_fields(key, :none, count, fields)
 
-  defp parse_hgetex(key, [mode, value, "FIELDS", count | fields])
-       when mode in ~w(EX PX EXAT PXAT) do
-    with expiry when is_tuple(expiry) <- parse_hgetex_expiry(mode, value),
-         parsed_fields when is_list(parsed_fields) <- parse_hash_fields(count, fields) do
-      {:hgetex, key, expiry, parsed_fields}
-    else
-      {:error, _} = error -> {:hgetex, key, error}
+      {"PERSIST", [fields_option, count | fields]} ->
+        if String.upcase(fields_option) == "FIELDS",
+          do: parse_hgetex_fields(key, :persist, count, fields),
+          else: {:hgetex, key, {:error, "ERR syntax error"}}
+
+      {mode, [value, fields_option, count | fields]} when mode in ~w(EX PX EXAT PXAT) ->
+        if String.upcase(fields_option) == "FIELDS" do
+          case parse_hgetex_expiry(mode, value) do
+            expiry when is_tuple(expiry) -> parse_hgetex_fields(key, expiry, count, fields)
+            {:error, _} = error -> {:hgetex, key, error}
+          end
+        else
+          {:hgetex, key, {:error, "ERR syntax error"}}
+        end
+
+      _invalid ->
+        {:hgetex, key, {:error, "ERR syntax error"}}
     end
   end
 
   defp parse_hgetex(key, _opts),
     do: {:hgetex, key, {:error, "ERR wrong number of arguments for 'hgetex' command"}}
+
+  defp parse_hgetex_fields(key, expiry, count, fields) do
+    case parse_hash_fields(count, fields) do
+      parsed_fields when is_list(parsed_fields) -> {:hgetex, key, expiry, parsed_fields}
+      {:error, _} = error -> {:hgetex, key, error}
+    end
+  end
 
   defp parse_hgetex_expiry("EX", value), do: wrap_expiry(:ex, parse_pos_int(value))
   defp parse_hgetex_expiry("PX", value), do: wrap_expiry(:px, parse_pos_int(value))
@@ -1488,32 +1531,56 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
-  defp parse_sintercard([count | rest]), do: parse_sintercard_keys(parse_int(count), rest)
-
-  defp parse_sintercard(args), do: {:sintercard, args}
-
-  defp parse_sintercard_keys(count, rest) when is_integer(count) and count >= 0 do
-    {keys, tail} = Enum.split(rest, count)
-
-    limit =
-      case tail do
-        ["LIMIT", value] -> parse_int(value)
-        [] -> 0
-        _ -> {:error, "ERR syntax error"}
-      end
-
-    {:sintercard, keys, limit}
+  defp parse_sintercard([count | rest]) do
+    case parse_int(count) do
+      count when is_integer(count) and count > 0 -> parse_sintercard_keys(count, rest)
+      _ -> {:sintercard, {:error, "ERR numkeys can't be non-positive value"}}
+    end
   end
 
-  defp parse_sintercard_keys(error, _rest), do: {:sintercard, [], error}
+  defp parse_sintercard(_args),
+    do: {:sintercard, {:error, "ERR wrong number of arguments for 'sintercard' command"}}
+
+  defp parse_sintercard_keys(count, rest) do
+    {keys, tail} = Enum.split(rest, count)
+
+    if length(keys) < count do
+      {:sintercard, {:error, "ERR Number of keys can't be greater than number of args"}}
+    else
+      parse_sintercard_limit(keys, tail)
+    end
+  end
+
+  defp parse_sintercard_limit(keys, []), do: {:sintercard, keys, 0}
+
+  defp parse_sintercard_limit(keys, [option, value]) do
+    if String.upcase(option) == "LIMIT" do
+      case parse_int(value) do
+        limit when is_integer(limit) and limit >= 0 -> {:sintercard, keys, limit}
+        _ -> {:sintercard, {:error, "ERR value is not an integer or out of range"}}
+      end
+    else
+      {:sintercard, {:error, "ERR syntax error"}}
+    end
+  end
+
+  defp parse_sintercard_limit(_keys, _tail),
+    do: {:sintercard, {:error, "ERR syntax error"}}
 
   defp parse_zadd(key, rest) do
     {opts, pairs} = split_zadd_opts(rest, [])
     {:zadd, key, Enum.reverse(opts), parse_score_member_pairs(pairs)}
   end
 
-  defp split_zadd_opts([opt | rest], acc) when opt in ["NX", "XX", "GT", "LT", "CH"],
-    do: split_zadd_opts(rest, [String.downcase(opt) |> String.to_atom() | acc])
+  defp split_zadd_opts([opt | rest] = args, acc) do
+    case String.upcase(opt) do
+      normalized when normalized in ["NX", "XX", "GT", "LT", "CH"] ->
+        split_zadd_opts(rest, [normalized |> String.downcase() |> String.to_atom() | acc])
+
+      _not_option ->
+        {acc, args}
+    end
+  end
 
   defp split_zadd_opts(rest, acc), do: {acc, rest}
 
@@ -1525,9 +1592,19 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_score_member_pairs(_args, _acc), do: {:error, "ERR syntax error"}
 
-  defp copy_replace?(opts), do: Enum.any?(opts, &(String.upcase(&1) == "REPLACE"))
+  defp parse_copy_opts([]), do: false
 
-  defp parse_object(["HELP"]), do: {:object, :help}
+  defp parse_copy_opts([option]) do
+    if String.upcase(option) == "REPLACE", do: true, else: {:error, "ERR syntax error"}
+  end
+
+  defp parse_copy_opts(_opts), do: {:error, "ERR syntax error"}
+
+  defp parse_object([subcommand]) do
+    if String.upcase(subcommand) == "HELP",
+      do: {:object, :help},
+      else: {:object, {:error, "ERR syntax error"}}
+  end
 
   defp parse_object([subcmd, key]) do
     case String.upcase(subcmd) do
@@ -1562,7 +1639,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
       match?({:error, _}, timeout_ms) ->
         {:blmpop, timeout_ms}
 
-      not (is_integer(key_count) and key_count >= 0) ->
+      not (is_integer(key_count) and key_count > 0) ->
         {:blmpop, {:error, "ERR value is not an integer or out of range"}}
 
       true ->
@@ -1575,11 +1652,14 @@ defmodule Ferricstore.Commands.NativeAstParser do
               direction -> {:blmpop, keys, direction, 1, timeout_ms}
             end
 
-          [where, "COUNT", count] ->
+          [where, option, count] ->
             direction = parse_direction(where)
             parsed_count = parse_int(count)
 
             cond do
+              String.upcase(option) != "COUNT" ->
+                {:blmpop, {:error, "ERR syntax error"}}
+
               match?({:error, _}, direction) ->
                 {:blmpop, direction}
 
@@ -1600,9 +1680,16 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_timeout_ms(value) do
     case Float.parse(value) do
-      {timeout, ""} when timeout >= 0 -> trunc(timeout * 1000)
-      _ -> {:error, "ERR timeout is not a float or out of range"}
+      {timeout, ""}
+      when timeout >= 0 and timeout <= @max_blocking_timeout_ms / 1_000 ->
+        trunc(timeout * 1_000)
+
+      _ ->
+        {:error, "ERR timeout is not a float or out of range"}
     end
+  rescue
+    ArgumentError -> {:error, "ERR timeout is not a float or out of range"}
+    ArithmeticError -> {:error, "ERR timeout is not a float or out of range"}
   end
 
   defp parse_bitop(operation, destination, sources) do
@@ -1646,25 +1733,31 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_flow_options(args, specs), do: parse_flow_options(args, specs, [])
 
-  defp parse_flow_options([], _specs, acc), do: Enum.reverse(acc)
+  defp parse_flow_options([], _specs, acc), do: finalize_flow_list_opts(Enum.reverse(acc))
 
-  defp parse_flow_options(["ATTRIBUTE", key, value | rest], specs, acc),
-    do: parse_flow_options(rest, specs, merge_map_opt(:attributes, key, value, acc))
+  defp parse_flow_options([name | rest], specs, acc) do
+    case {String.upcase(name), rest} do
+      {"ATTRIBUTE", [key, value | tail]} ->
+        parse_flow_options(tail, specs, merge_map_opt(:attributes, key, value, acc))
 
-  defp parse_flow_options(["ATTRIBUTE_MERGE", key, value | rest], specs, acc),
-    do: parse_flow_options(rest, specs, merge_map_opt(:attributes_merge, key, value, acc))
+      {"ATTRIBUTE_MERGE", [key, value | tail]} ->
+        parse_flow_options(tail, specs, merge_map_opt(:attributes_merge, key, value, acc))
 
-  defp parse_flow_options(["ATTRIBUTE_DELETE", key | rest], specs, acc),
-    do: parse_flow_options(rest, specs, append_list_opt(:attributes_delete, key, acc))
+      {"ATTRIBUTE_DELETE", [key | tail]} ->
+        parse_flow_options(tail, specs, append_list_opt(:attributes_delete, key, acc))
 
-  defp parse_flow_options(["STATE_META", key, value | rest], specs, acc),
-    do: parse_flow_options(rest, specs, merge_map_opt(:state_meta, key, value, acc))
+      {"STATE_META", [key, value | tail]} ->
+        parse_flow_options(tail, specs, merge_map_opt(:state_meta, key, value, acc))
 
-  defp parse_flow_options([name, value | rest], specs, acc) do
-    case parse_flow_option(name, value, specs) do
-      {:ok, nil} -> parse_flow_options(rest, specs, acc)
-      {:ok, opt} -> parse_flow_options(rest, specs, [opt | acc])
-      {:error, reason} -> {:error, reason}
+      {_option, [value | tail]} ->
+        case parse_flow_option(name, value, specs) do
+          {:ok, nil} -> parse_flow_options(tail, specs, acc)
+          {:ok, opt} -> parse_flow_options(tail, specs, [opt | acc])
+          {:error, reason} -> {:error, reason}
+        end
+
+      _invalid ->
+        {:error, "ERR syntax error"}
     end
   end
 
@@ -1690,84 +1783,112 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_flow_read_options(args, specs), do: parse_flow_read_options(args, specs, [])
 
-  defp parse_flow_read_options([], _specs, acc), do: Enum.reverse(acc)
+  defp parse_flow_read_options([], _specs, acc), do: finalize_flow_list_opts(Enum.reverse(acc))
 
-  defp parse_flow_read_options(["FULL", value | rest], specs, acc) do
-    case parse_bool(value) do
-      {:ok, bool} -> parse_flow_read_options(rest, specs, [{:full, bool} | acc])
-      {:error, _} -> parse_flow_read_options([value | rest], specs, [{:full, true} | acc])
-    end
-  end
+  defp parse_flow_read_options([name | rest], specs, acc) do
+    case {String.upcase(name), rest} do
+      {"FULL", [value | tail]} ->
+        case parse_bool(value) do
+          {:ok, bool} -> parse_flow_read_options(tail, specs, [{:full, bool} | acc])
+          {:error, _} -> parse_flow_read_options(rest, specs, [{:full, true} | acc])
+        end
 
-  defp parse_flow_read_options(["FULL" | rest], specs, acc),
-    do: parse_flow_read_options(rest, specs, [{:full, true} | acc])
+      {"FULL", []} ->
+        parse_flow_read_options([], specs, [{:full, true} | acc])
 
-  defp parse_flow_read_options(["NOPAYLOAD" | rest], specs, acc),
-    do: parse_flow_read_options(rest, specs, [{:payload, false} | acc])
+      {"NOPAYLOAD", tail} ->
+        parse_flow_read_options(tail, specs, [{:payload, false} | acc])
 
-  defp parse_flow_read_options(["PAYLOAD", "MAXBYTES", bytes | rest], specs, acc),
-    do:
-      parse_flow_read_options(rest, specs, [
-        {:payload_max_bytes, parse_int(bytes)},
-        {:payload, true} | acc
-      ])
+      {"PAYLOAD", [maxbytes, bytes | tail]} ->
+        if String.upcase(maxbytes) == "MAXBYTES" do
+          case parse_int(bytes) do
+            parsed when is_integer(parsed) and parsed >= 0 ->
+              parse_flow_read_options(tail, specs, [
+                {:payload_max_bytes, parsed},
+                {:payload, true} | acc
+              ])
 
-  defp parse_flow_read_options(["PAYLOAD" | rest], specs, acc),
-    do: parse_flow_read_options(rest, specs, [{:payload, true} | acc])
+            _invalid ->
+              {:error, "ERR value is not an integer or out of range"}
+          end
+        else
+          parse_flow_read_options(rest, specs, [{:payload, true} | acc])
+        end
 
-  defp parse_flow_read_options(["VALUE", value | rest], specs, acc),
-    do: parse_flow_read_options(rest, specs, [{:values, [value]} | acc])
+      {"PAYLOAD", tail} ->
+        parse_flow_read_options(tail, specs, [{:payload, true} | acc])
 
-  defp parse_flow_read_options(["PARTITIONS", count | rest], specs, acc) do
-    parsed_count = parse_int(count)
+      {"VALUE", [value | tail]} ->
+        parse_flow_read_options(tail, specs, [{:values, [value]} | acc])
 
-    if is_integer(parsed_count) and parsed_count > 0 do
-      {partitions, tail} = Enum.split(rest, parsed_count)
-      parse_flow_read_options(tail, specs, [{:partition_keys, partitions} | acc])
-    else
-      {:error, "ERR flow partition_keys must be a non-empty list"}
-    end
-  end
+      {"PARTITIONS", [count | tail]} ->
+        parse_flow_partitions(count, tail, specs, acc)
 
-  defp parse_flow_read_options(["ATTRIBUTE", key, value | rest], specs, acc),
-    do: parse_flow_read_options(rest, specs, merge_map_opt(:attributes, key, value, acc))
+      {"ATTRIBUTE", [key, value | tail]} ->
+        parse_flow_read_options(tail, specs, merge_map_opt(:attributes, key, value, acc))
 
-  defp parse_flow_read_options(["ATTRIBUTE_MERGE", key, value | rest], specs, acc),
-    do: parse_flow_read_options(rest, specs, merge_map_opt(:attributes_merge, key, value, acc))
+      {"ATTRIBUTE_MERGE", [key, value | tail]} ->
+        parse_flow_read_options(tail, specs, merge_map_opt(:attributes_merge, key, value, acc))
 
-  defp parse_flow_read_options(["ATTRIBUTE_DELETE", key | rest], specs, acc),
-    do: parse_flow_read_options(rest, specs, append_list_opt(:attributes_delete, key, acc))
+      {"ATTRIBUTE_DELETE", [key | tail]} ->
+        parse_flow_read_options(tail, specs, append_list_opt(:attributes_delete, key, acc))
 
-  defp parse_flow_read_options([name, value | rest], specs, acc) do
-    case parse_flow_option(name, value, specs) do
-      {:ok, nil} -> parse_flow_read_options(rest, specs, acc)
-      {:ok, opt} -> parse_flow_read_options(rest, specs, [opt | acc])
-      {:error, reason} -> {:error, reason}
+      {_option, [value | tail]} ->
+        case parse_flow_option(name, value, specs) do
+          {:ok, nil} -> parse_flow_read_options(tail, specs, acc)
+          {:ok, opt} -> parse_flow_read_options(tail, specs, [opt | acc])
+          {:error, reason} -> {:error, reason}
+        end
+
+      _invalid ->
+        {:error, "ERR syntax error"}
     end
   end
 
   defp parse_flow_read_options(_args, _specs, _acc), do: {:error, "ERR syntax error"}
 
+  defp parse_flow_partitions(count, rest, specs, acc) do
+    case parse_int(count) do
+      parsed_count when is_integer(parsed_count) and parsed_count > 0 ->
+        {partitions, tail} = Enum.split(rest, parsed_count)
+
+        if length(partitions) == parsed_count do
+          parse_flow_read_options(tail, specs, [{:partition_keys, partitions} | acc])
+        else
+          {:error, "ERR flow partition_keys count mismatch"}
+        end
+
+      _invalid ->
+        {:error, "ERR flow partition_keys must be a non-empty list"}
+    end
+  end
+
   defp parse_flow_signal_opts(args), do: parse_flow_signal_opts(args, [])
-  defp parse_flow_signal_opts([], acc), do: Enum.reverse(acc)
+  defp parse_flow_signal_opts([], acc), do: finalize_flow_list_opts(Enum.reverse(acc))
 
-  defp parse_flow_signal_opts(["VALUE", key, value | rest], acc),
-    do: parse_flow_signal_opts(rest, append_list_opt(:values, {key, value}, acc))
+  defp parse_flow_signal_opts([name | rest], acc) do
+    case {String.upcase(name), rest} do
+      {"VALUE", [key, value | tail]} ->
+        parse_flow_signal_opts(tail, append_list_opt(:values, {key, value}, acc))
 
-  defp parse_flow_signal_opts(["VALUE_REF", key, value | rest], acc),
-    do: parse_flow_signal_opts(rest, append_list_opt(:value_refs, {key, value}, acc))
+      {"VALUE_REF", [key, value | tail]} ->
+        parse_flow_signal_opts(tail, append_list_opt(:value_refs, {key, value}, acc))
 
-  defp parse_flow_signal_opts(["DROP_VALUE", key | rest], acc),
-    do: parse_flow_signal_opts(rest, append_list_opt(:drop_values, key, acc))
+      {"DROP_VALUE", [key | tail]} ->
+        parse_flow_signal_opts(tail, append_list_opt(:drop_values, key, acc))
 
-  defp parse_flow_signal_opts(["OVERRIDE_VALUE", key | rest], acc),
-    do: parse_flow_signal_opts(rest, append_list_opt(:override_values, key, acc))
+      {"OVERRIDE_VALUE", [key | tail]} ->
+        parse_flow_signal_opts(tail, append_list_opt(:override_values, key, acc))
 
-  defp parse_flow_signal_opts([name, value | rest], acc) do
-    case parse_flow_option(name, value, spec(:signal)) do
-      {:ok, nil} -> parse_flow_signal_opts(rest, acc)
-      {:ok, opt} -> parse_flow_signal_opts(rest, [opt | acc])
-      {:error, reason} -> {:error, reason}
+      {_option, [value | tail]} ->
+        case parse_flow_option(name, value, spec(:signal)) do
+          {:ok, nil} -> parse_flow_signal_opts(tail, acc)
+          {:ok, opt} -> parse_flow_signal_opts(tail, [opt | acc])
+          {:error, reason} -> {:error, reason}
+        end
+
+      _invalid ->
+        {:error, "ERR syntax error"}
     end
   end
 
@@ -1777,17 +1898,23 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_flow_search_options([], acc), do: Enum.reverse(acc)
 
-  defp parse_flow_search_options(["ATTRIBUTE", key, value | rest], acc),
-    do: parse_flow_search_options(rest, merge_map_opt(:attributes, key, value, acc))
+  defp parse_flow_search_options([name | rest], acc) do
+    case {String.upcase(name), rest} do
+      {"ATTRIBUTE", [key, value | tail]} ->
+        parse_flow_search_options(tail, merge_map_opt(:attributes, key, value, acc))
 
-  defp parse_flow_search_options(["STATE_META", state, key, value | rest], acc),
-    do: parse_flow_search_options(rest, merge_nested_map_opt(:state_meta, state, key, value, acc))
+      {"STATE_META", [state, key, value | tail]} ->
+        parse_flow_search_options(tail, merge_nested_map_opt(:state_meta, state, key, value, acc))
 
-  defp parse_flow_search_options([name, value | rest], acc) do
-    case parse_flow_option(name, value, spec(:search)) do
-      {:ok, nil} -> parse_flow_search_options(rest, acc)
-      {:ok, opt} -> parse_flow_search_options(rest, [opt | acc])
-      {:error, reason} -> {:error, reason}
+      {_option, [value | tail]} ->
+        case parse_flow_option(name, value, spec(:search)) do
+          {:ok, nil} -> parse_flow_search_options(tail, acc)
+          {:ok, opt} -> parse_flow_search_options(tail, [opt | acc])
+          {:error, reason} -> {:error, reason}
+        end
+
+      _invalid ->
+        {:error, "ERR syntax error"}
     end
   end
 
@@ -1852,49 +1979,68 @@ defmodule Ferricstore.Commands.NativeAstParser do
          retention_opts,
          states
        ) do
-    case parse_flow_policy_option(name, value) do
-      {:retry, opt} ->
-        parse_flow_policy_set_options(
-          rest,
-          policy_opts,
-          [opt | retry_opts],
-          backoff_opts,
-          retention_opts,
-          states
-        )
+    if String.upcase(name) == "STATE" do
+      {state_args, tail} = Enum.split_while(rest, &(String.upcase(&1) != "STATE"))
 
-      {:backoff, opt} ->
-        parse_flow_policy_set_options(
-          rest,
-          policy_opts,
-          retry_opts,
-          [opt | backoff_opts],
-          retention_opts,
-          states
-        )
+      case parse_flow_policy_state_options(state_args) do
+        {:ok, state_policy} ->
+          parse_flow_policy_set_options(
+            tail,
+            policy_opts,
+            retry_opts,
+            backoff_opts,
+            retention_opts,
+            [{value, state_policy} | states]
+          )
 
-      {:retention, opt} ->
-        parse_flow_policy_set_options(
-          rest,
-          policy_opts,
-          retry_opts,
-          backoff_opts,
-          [opt | retention_opts],
-          states
-        )
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      case parse_flow_policy_option(name, value) do
+        {:retry, opt} ->
+          parse_flow_policy_set_options(
+            rest,
+            policy_opts,
+            [opt | retry_opts],
+            backoff_opts,
+            retention_opts,
+            states
+          )
 
-      {:policy, opt} ->
-        parse_flow_policy_set_options(
-          rest,
-          [opt | policy_opts],
-          retry_opts,
-          backoff_opts,
-          retention_opts,
-          states
-        )
+        {:backoff, opt} ->
+          parse_flow_policy_set_options(
+            rest,
+            policy_opts,
+            retry_opts,
+            [opt | backoff_opts],
+            retention_opts,
+            states
+          )
 
-      {:error, reason} ->
-        {:error, reason}
+        {:retention, opt} ->
+          parse_flow_policy_set_options(
+            rest,
+            policy_opts,
+            retry_opts,
+            backoff_opts,
+            [opt | retention_opts],
+            states
+          )
+
+        {:policy, opt} ->
+          parse_flow_policy_set_options(
+            rest,
+            [opt | policy_opts],
+            retry_opts,
+            backoff_opts,
+            retention_opts,
+            states
+          )
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
@@ -2070,8 +2216,10 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end
   end
 
-  defp flow_value(_key, :partition, "GLOBAL"), do: {:ok, nil}
-  defp flow_value(key, :partition, value), do: {:ok, {key, value}}
+  defp flow_value(key, :partition, value) do
+    if String.upcase(value) == "GLOBAL", do: {:ok, nil}, else: {:ok, {key, value}}
+  end
+
   defp flow_value(key, :non_negative, value), do: non_negative_value(key, value)
   defp flow_value(key, {:non_negative_named, _label}, value), do: non_negative_value(key, value)
   defp flow_value(key, {:positive, _label}, value), do: positive_value(key, value)
@@ -2139,7 +2287,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp parse_flow_spawn_children([parent | rest]) do
     with {:ok, before_items, raw_items} <- split_items(rest),
          opts when is_list(opts) <- parse_flow_options(before_items, spec(:spawn_children)) do
-      mixed? = match?(["MIXED" | _], raw_items)
+      mixed? = raw_items != [] and String.upcase(hd(raw_items)) == "MIXED"
       item_values = if mixed?, do: tl(raw_items), else: raw_items
       width = if mixed?, do: 4, else: 3
       items = parse_fixed_items(item_values, width, &spawn_child_item(&1, mixed?))
@@ -2220,7 +2368,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp split_items(args) do
     case Enum.split_while(args, &(String.upcase(&1) != "ITEMS")) do
       {_before, []} -> {:error, "ERR flow items are required"}
-      {before_items, ["ITEMS" | raw_items]} when raw_items != [] -> {:ok, before_items, raw_items}
+      {before_items, [_items | raw_items]} when raw_items != [] -> {:ok, before_items, raw_items}
       {_before, _} -> {:error, "ERR syntax error"}
     end
   end
@@ -2305,7 +2453,17 @@ defmodule Ferricstore.Commands.NativeAstParser do
     end)
   end
 
-  defp append_list_opt(key, value, acc), do: Keyword.update(acc, key, [value], &(&1 ++ [value]))
+  defp append_list_opt(key, value, acc), do: Keyword.update(acc, key, [value], &[value | &1])
+
+  defp finalize_flow_list_opts(opts) do
+    Enum.map(opts, fn
+      {key, values} when key in @flow_repeated_option_keys and is_list(values) ->
+        {key, Enum.reverse(values)}
+
+      option ->
+        option
+    end)
+  end
 
   defp parse_bool(value) do
     case String.upcase(value) do
@@ -2323,8 +2481,15 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_int(value) do
     case Integer.parse(value) do
-      {int, ""} -> int
+      {int, ""} when int >= @min_int64 and int <= @max_int64 -> int
       _ -> {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
+  defp parse_scan_cursor(value) do
+    case CollectionScan.parse_cursor(value) do
+      {:ok, cursor} -> cursor
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -2341,6 +2506,8 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {float, ""} -> float
       _ -> {:error, "ERR value is not a valid float"}
     end
+  rescue
+    ArgumentError -> {:error, "ERR value is not a valid float"}
   end
 
   defp parse_pos_float(value) do
@@ -2420,14 +2587,20 @@ defmodule Ferricstore.Commands.NativeAstParser do
       [] ->
         {:ok, src_keys, List.duplicate(1, count)}
 
-      ["WEIGHTS" | weights] when length(weights) == count ->
-        case parse_int_list(weights) do
-          {:ok, parsed_weights} -> {:ok, src_keys, parsed_weights}
-          {:error, msg} -> {:error, msg}
-        end
+      [option | weights] ->
+        cond do
+          String.upcase(option) != "WEIGHTS" ->
+            {:error, "ERR syntax error in 'cms.merge' command"}
 
-      ["WEIGHTS" | _] ->
-        {:error, "ERR wrong number of weights for 'cms.merge' command"}
+          length(weights) != count ->
+            {:error, "ERR wrong number of weights for 'cms.merge' command"}
+
+          true ->
+            case parse_int_list(weights) do
+              {:ok, parsed_weights} -> {:ok, src_keys, parsed_weights}
+              {:error, msg} -> {:error, msg}
+            end
+        end
 
       _ ->
         {:error, "ERR syntax error in 'cms.merge' command"}
@@ -2444,24 +2617,68 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_tdigest_merge_opts(src_keys, [], opts), do: {:ok, src_keys, Enum.reverse(opts)}
 
-  defp parse_tdigest_merge_opts(src_keys, ["OVERRIDE" | rest], opts),
-    do: parse_tdigest_merge_opts(src_keys, rest, [{:override, true} | opts])
+  defp parse_tdigest_merge_opts(src_keys, [option | rest], opts) do
+    case {String.upcase(option), rest} do
+      {"OVERRIDE", rest} ->
+        parse_tdigest_merge_opts(src_keys, rest, [{:override, true} | opts])
 
-  defp parse_tdigest_merge_opts(src_keys, ["COMPRESSION", value | rest], opts) do
-    case parse_pos_int(value) do
-      compression when is_integer(compression) ->
-        parse_tdigest_merge_opts(src_keys, rest, [{:compression, compression} | opts])
+      {"COMPRESSION", [value | rest]} ->
+        case parse_pos_int(value) do
+          compression when is_integer(compression) ->
+            parse_tdigest_merge_opts(src_keys, rest, [{:compression, compression} | opts])
 
-      {:error, msg} ->
-        {:error, msg}
+          {:error, msg} ->
+            {:error, msg}
+        end
+
+      _invalid ->
+        {:error, "ERR syntax error in 'tdigest.merge' command"}
     end
   end
 
-  defp parse_tdigest_merge_opts(_src_keys, _tail, _opts),
-    do: {:error, "ERR syntax error in 'tdigest.merge' command"}
+  defp make_tdigest_trimmed_mean_ast(key, low, high)
+       when is_float(low) and is_float(high) and low >= 0.0 and high <= 1.0 and low < high,
+       do: {:tdigest_trimmed_mean, key, low, high}
+
+  defp make_tdigest_trimmed_mean_ast(_key, {:error, msg}, _high),
+    do: {:tdigest_trimmed_mean, {:error, msg}}
+
+  defp make_tdigest_trimmed_mean_ast(_key, _low, {:error, msg}),
+    do: {:tdigest_trimmed_mean, {:error, msg}}
+
+  defp make_tdigest_trimmed_mean_ast(_key, _low, _high),
+    do:
+      {:tdigest_trimmed_mean,
+       {:error, "ERR TDIGEST: low_quantile must be less than high_quantile in [0, 1]"}}
 
   defp prob_command_name(:cms_incrby), do: "cms.incrby"
   defp prob_command_name(:topk_incrby), do: "topk.incrby"
+
+  defp normalize_scoped_management_subcommand(cmd, [subcommand | rest])
+       when cmd in @management_scoped_commands,
+       do: [String.upcase(subcommand) | rest]
+
+  defp normalize_scoped_management_subcommand(_cmd, args), do: args
+
+  defp normalize_command_args(args) do
+    args
+    |> Enum.reduce_while({:ok, []}, fn value, {:ok, acc} ->
+      case safe_command_binary(value) do
+        {:ok, binary} -> {:cont, {:ok, [binary | acc]}}
+        :error -> {:halt, {:error, "ERR protocol error"}}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _message} = error -> error
+    end
+  end
+
+  defp safe_command_binary(value) do
+    {:ok, to_command_binary(value)}
+  rescue
+    _exception -> :error
+  end
 
   defp to_command_binary(value) when is_binary(value), do: value
   defp to_command_binary(value), do: to_string(value)

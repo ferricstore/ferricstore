@@ -2,9 +2,13 @@ defmodule Ferricstore.Flow.LMDB do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.LMDB.Access
+  alias Ferricstore.Flow.LMDB.ValueLocator
+  alias Ferricstore.TermCodec
 
   @default_map_size 16 * 1024 * 1024 * 1024
   @release_retry_interval_ms 5
+  @max_u64 18_446_744_073_709_551_615
 
   def enabled?, do: true
   def projection_enabled?, do: true
@@ -13,7 +17,10 @@ defmodule Ferricstore.Flow.LMDB do
   def normalize_mode(_value), do: :lagged
 
   def map_size do
-    Application.get_env(:ferricstore, :flow_lmdb_map_size, @default_map_size)
+    case Application.get_env(:ferricstore, :flow_lmdb_map_size, @default_map_size) do
+      value when is_integer(value) and value > 0 and value <= @max_u64 -> value
+      _invalid -> @default_map_size
+    end
   end
 
   def path(shard_data_path), do: Path.join(shard_data_path, "flow_lmdb")
@@ -37,21 +44,26 @@ defmodule Ferricstore.Flow.LMDB do
   # LMDB stores Flow state as a wrapper around the already-versioned Flow record
   # bytes: {expire_at_ms, encoded_record}. The wrapper owns TTL semantics only.
   # Do not decode user payload here; the Flow schema gate remains centralized.
-  def encode_value(value, expire_at_ms) when is_integer(expire_at_ms) and expire_at_ms >= 0,
-    do: :erlang.term_to_binary({expire_at_ms, value})
+  def encode_value(value, expire_at_ms)
+      when is_binary(value) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
+             expire_at_ms <= @max_u64,
+      do: TermCodec.encode({expire_at_ms, value})
 
   def encode_value(_value, _expire_at_ms),
-    do: raise(ArgumentError, "LMDB value expiration must be a non-negative integer")
+    do: raise(ArgumentError, "LMDB value fields are invalid")
 
   # Returns the wrapped encoded Flow record when it is still live. Callers must
   # pass the returned value through Ferricstore.Flow.decode_record/1 so the Flow
   # schema version gate stays centralized in one place.
-  def decode_value(blob, now_ms) when is_binary(blob) do
-    case :erlang.binary_to_term(blob, [:safe]) do
-      {expire_at_ms, value} when is_integer(expire_at_ms) and expire_at_ms > 0 ->
+  def decode_value(blob, now_ms)
+      when is_binary(blob) and is_integer(now_ms) and now_ms >= 0 and now_ms <= @max_u64 do
+    case TermCodec.decode(blob) do
+      {:ok, {expire_at_ms, value}}
+      when is_integer(expire_at_ms) and expire_at_ms > 0 and expire_at_ms <= @max_u64 and
+             is_binary(value) ->
         if expire_at_ms <= now_ms, do: :expired, else: {:ok, value}
 
-      {0, value} ->
+      {:ok, {0, value}} when is_binary(value) ->
         {:ok, value}
 
       _invalid ->
@@ -61,33 +73,30 @@ defmodule Ferricstore.Flow.LMDB do
     _ -> :error
   end
 
+  def decode_value(blob, _now_ms) when is_binary(blob), do: :error
+
   def get(path, key) when is_binary(path) and is_binary(key) do
     if Ferricstore.FS.dir?(path), do: NIF.lmdb_get(path, key, map_size()), else: :not_found
   end
 
-  def encode_value_locator(expire_at_ms, file_id, offset, value_size)
-      when is_integer(expire_at_ms) and expire_at_ms >= 0 and is_integer(offset) and offset >= 0 and
-             is_integer(value_size) and value_size >= 0 do
-    :erlang.term_to_binary({:flow_value_locator, 1, expire_at_ms, file_id, offset, value_size})
-  end
+  def encode_value_locator(expire_at_ms, file_id, offset, value_size),
+    do: ValueLocator.encode(expire_at_ms, file_id, offset, value_size)
 
-  def encode_value_locator(_expire_at_ms, _file_id, _offset, _value_size),
-    do: raise(ArgumentError, "LMDB value locator metadata is invalid")
-
-  def decode_value_locator(blob, now_ms) when is_binary(blob) do
-    case :erlang.binary_to_term(blob, [:safe]) do
-      {:flow_value_locator, 1, expire_at_ms, file_id, offset, value_size}
-      when is_integer(expire_at_ms) and expire_at_ms > 0 ->
+  def decode_value_locator(blob, now_ms)
+      when is_binary(blob) and is_integer(now_ms) and now_ms >= 0 and now_ms <= @max_u64 do
+    case TermCodec.decode(blob) do
+      {:ok, {:flow_value_locator, 1, expire_at_ms, file_id, offset, value_size}}
+      when is_integer(expire_at_ms) and expire_at_ms > 0 and expire_at_ms <= @max_u64 ->
         if expire_at_ms <= now_ms do
           :expired
         else
           decode_live_value_locator(file_id, offset, value_size)
         end
 
-      {:flow_value_locator, 1, 0, file_id, offset, value_size} ->
+      {:ok, {:flow_value_locator, 1, 0, file_id, offset, value_size}} ->
         decode_live_value_locator(file_id, offset, value_size)
 
-      {:flow_value_locator, 1, _expire_at_ms, _file_id, _offset, _value_size} ->
+      {:ok, {:flow_value_locator, 1, _expire_at_ms, _file_id, _offset, _value_size}} ->
         :error
 
       _other ->
@@ -97,9 +106,14 @@ defmodule Ferricstore.Flow.LMDB do
     _ -> :error
   end
 
+  def decode_value_locator(blob, _now_ms) when is_binary(blob), do: :error
+
   defp decode_live_value_locator(file_id, offset, value_size)
-       when is_integer(offset) and offset >= 0 and is_integer(value_size) and value_size >= 0 do
-    {:ok, {file_id, offset, value_size}}
+       when is_integer(offset) and offset >= 0 and offset <= @max_u64 and
+              is_integer(value_size) and value_size >= 0 and value_size <= @max_u64 do
+    if ValueLocator.valid_file_id?(file_id),
+      do: {:ok, {file_id, offset, value_size}},
+      else: :error
   end
 
   defp decode_live_value_locator(_file_id, _offset, _value_size), do: :error
@@ -130,6 +144,9 @@ defmodule Ferricstore.Flow.LMDB do
 
   def cold_by_segment_key(locator), do: Ferricstore.Flow.LMDB.Cold.by_segment_key(locator)
 
+  def cold_by_segment_key(file_id, offset),
+    do: Ferricstore.Flow.LMDB.Cold.by_segment_key(file_id, offset)
+
   def cold_by_segment_prefix(file_id), do: Ferricstore.Flow.LMDB.Cold.by_segment_prefix(file_id)
 
   def encode_cold_park(locator, attrs),
@@ -151,13 +168,7 @@ defmodule Ferricstore.Flow.LMDB do
 
   def get_many(_path, []), do: {:ok, []}
 
-  def get_many(path, keys) when is_binary(path) and is_list(keys) do
-    if Ferricstore.FS.dir?(path) do
-      NIF.lmdb_get_many(path, keys, map_size())
-    else
-      {:ok, Enum.map(keys, fn _key -> :not_found end)}
-    end
-  end
+  def get_many(path, keys) when is_binary(path) and is_list(keys), do: Access.get_many(path, keys)
 
   def warm(path) when is_binary(path) do
     case NIF.lmdb_get(path, <<0>>, map_size()) do
@@ -258,20 +269,37 @@ defmodule Ferricstore.Flow.LMDB do
 
   def flush_in_progress?(path) when is_binary(path) do
     if env_present?(path) do
-      case get(path, flush_in_progress_key()) do
-        {:ok, _value} -> true
-        _ -> false
-      end
+      path
+      |> get(flush_in_progress_key())
+      |> normalize_flush_marker_read()
     else
       false
     end
   end
 
+  @doc false
+  def __normalize_flush_marker_read_for_test__(result), do: normalize_flush_marker_read(result)
+
+  defp normalize_flush_marker_read({:ok, _value}), do: true
+  defp normalize_flush_marker_read(:not_found), do: false
+  defp normalize_flush_marker_read(_storage_failure_or_invalid), do: true
+
   def env_present?(path) when is_binary(path) do
-    File.regular?(Path.join(path, "data.mdb")) or File.regular?(Path.join(path, "lock.mdb"))
+    case File.lstat(path) do
+      {:ok, %{type: :directory}} ->
+        regular_file_nofollow?(Path.join(path, "data.mdb")) or
+          regular_file_nofollow?(Path.join(path, "lock.mdb"))
+
+      _missing_or_unsafe ->
+        false
+    end
   end
 
   def env_present?(_path), do: false
+
+  defp regular_file_nofollow?(path) do
+    match?({:ok, %{type: :regular}}, File.lstat(path))
+  end
 
   def flush_in_progress_put_op, do: {:put, flush_in_progress_key(), <<1>>}
   def flush_in_progress_delete_op, do: {:delete, flush_in_progress_key()}
@@ -296,6 +324,91 @@ defmodule Ferricstore.Flow.LMDB do
       do: NIF.lmdb_prefix_entries_after(path, prefix, after_key, limit, map_size()),
       else: {:ok, []}
   end
+
+  def reduce_prefix_entries(path, prefix, page_size, acc, reduce_fun)
+      when is_binary(path) and is_binary(prefix) and is_integer(page_size) and page_size > 0 and
+             is_function(reduce_fun, 2) do
+    scan_fun = fn
+      nil -> prefix_entries(path, prefix, page_size)
+      after_key -> prefix_entries_after(path, prefix, after_key, page_size)
+    end
+
+    reduce_prefix_pages(prefix, page_size, acc, scan_fun, reduce_fun, nil)
+  end
+
+  @doc false
+  def __reduce_prefix_pages_for_test__(prefix, page_size, acc, scan_fun, reduce_fun)
+      when is_binary(prefix) and is_integer(page_size) and page_size > 0 and
+             is_function(scan_fun, 1) and is_function(reduce_fun, 2) do
+    reduce_prefix_pages(prefix, page_size, acc, scan_fun, reduce_fun, nil)
+  end
+
+  defp reduce_prefix_pages(prefix, page_size, acc, scan_fun, reduce_fun, cursor) do
+    case scan_fun.(cursor) do
+      {:ok, []} ->
+        {:ok, acc}
+
+      {:ok, entries} when is_list(entries) ->
+        with :ok <- validate_prefix_page(entries, prefix, cursor, page_size),
+             {:ok, next_acc} <- normalize_prefix_page_reduce(reduce_fun.(entries, acc)) do
+          if length(entries) < page_size do
+            {:ok, next_acc}
+          else
+            {next_cursor, _value} = List.last(entries)
+
+            reduce_prefix_pages(
+              prefix,
+              page_size,
+              next_acc,
+              scan_fun,
+              reduce_fun,
+              next_cursor
+            )
+          end
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _invalid ->
+        {:error, :invalid_prefix_page}
+    end
+  end
+
+  defp validate_prefix_page(entries, prefix, cursor, page_size)
+       when length(entries) <= page_size do
+    entries
+    |> Enum.reduce_while({:ok, cursor}, fn
+      {key, value}, {:ok, previous_key}
+      when is_binary(key) and is_binary(value) ->
+        cond do
+          not String.starts_with?(key, prefix) ->
+            {:halt, {:error, :invalid_prefix_page}}
+
+          is_binary(previous_key) and key <= previous_key ->
+            {:halt, {:error, :non_monotonic_prefix_page}}
+
+          true ->
+            {:cont, {:ok, key}}
+        end
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_prefix_page}}
+    end)
+    |> case do
+      {:ok, _last_key} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_prefix_page(_entries, _prefix, _cursor, _page_size),
+    do: {:error, :invalid_prefix_page}
+
+  defp normalize_prefix_page_reduce({:ok, _acc} = result), do: result
+  defp normalize_prefix_page_reduce({:error, _reason} = error), do: error
+
+  defp normalize_prefix_page_reduce(_invalid),
+    do: {:error, :invalid_prefix_page_reducer_result}
 
   def prefix_entries_after_bounded(path, prefix, after_key, max_items, max_bytes)
       when is_binary(path) and is_binary(prefix) and is_binary(after_key) and
@@ -350,6 +463,9 @@ defmodule Ferricstore.Flow.LMDB do
   def terminal_index_key(state_index_key, id, updated_at_ms),
     do: Ferricstore.Flow.LMDB.IndexCodec.terminal_index_key(state_index_key, id, updated_at_ms)
 
+  def terminal_index_entry_key?(key, id, updated_at_ms),
+    do: Ferricstore.Flow.LMDB.IndexCodec.terminal_index_entry_key?(key, id, updated_at_ms)
+
   def terminal_count_key(state_index_key),
     do: Ferricstore.Flow.LMDB.IndexCodec.terminal_count_key(state_index_key)
 
@@ -374,6 +490,9 @@ defmodule Ferricstore.Flow.LMDB do
 
   def active_index_key(index_key, id, score),
     do: Ferricstore.Flow.LMDB.IndexCodec.active_index_key(index_key, id, score)
+
+  def active_index_entry_key?(key, index_key, id, score),
+    do: Ferricstore.Flow.LMDB.IndexCodec.active_index_entry_key?(key, index_key, id, score)
 
   def active_by_state_key_key(state_key),
     do: Ferricstore.Flow.LMDB.IndexCodec.active_by_state_key_key(state_key)
@@ -407,13 +526,9 @@ defmodule Ferricstore.Flow.LMDB do
     }
   end
 
-  def active_timeout_index_put_ops(state_key, record, expire_at_ms, reverse_value \\ nil)
+  def active_timeout_index_put_ops(state_key, record, expire_at_ms)
       when is_binary(state_key) and is_map(record) and is_integer(expire_at_ms) do
-    cleanup_ops =
-      record
-      |> active_non_timeout_index_delete_ops()
-      |> Kernel.++(active_timeout_previous_index_delete_ops(state_key, reverse_value))
-      |> Enum.uniq()
+    cleanup_ops = record |> active_non_timeout_index_delete_ops() |> Enum.uniq()
 
     case active_timeout_deadline(record) do
       {:ok, deadline_ms} ->
@@ -453,31 +568,104 @@ defmodule Ferricstore.Flow.LMDB do
     end)
   end
 
-  defp active_timeout_previous_index_delete_ops(state_key, reverse_value)
-       when is_binary(reverse_value) do
-    active_index_delete_ops_from_reverse(state_key, reverse_value)
+  def active_index_delete_ops_from_reverse_result(state_key, reverse_value)
+      when is_binary(state_key) and is_binary(reverse_value),
+      do: active_index_delete_ops_from_read_result({:ok, reverse_value}, state_key)
+
+  def active_index_delete_ops_from_reverse_result(_state_key, invalid),
+    do: {:error, {:invalid_active_index_reverse_read, invalid}}
+
+  def active_index_delete_ops_result(path, state_key)
+      when is_binary(path) and is_binary(state_key) do
+    case get(path, active_by_state_key_key(state_key)) do
+      {:ok, reverse_value} when is_binary(reverse_value) ->
+        with {:ok, active_keys} <- decode_active_index_reverse_value(reverse_value),
+             {:ok, active_compare_ops} <-
+               validate_active_index_reverse_rows(path, state_key, active_keys) do
+          reverse_key = active_by_state_key_key(state_key)
+
+          {:ok,
+           [{:compare, reverse_key, reverse_value} | active_compare_ops] ++
+             [{:delete, reverse_key} | Enum.map(active_keys, &{:delete, &1})]}
+        else
+          :error -> {:error, :invalid_active_index_reverse}
+          {:error, _reason} = error -> error
+        end
+
+      result ->
+        active_index_delete_ops_from_read_result(result, state_key)
+    end
   end
 
-  defp active_timeout_previous_index_delete_ops(_state_key, _reverse_value), do: []
+  @doc false
+  def __active_index_delete_ops_result_for_test__(state_key, result),
+    do: active_index_delete_ops_from_read_result(result, state_key)
 
-  def active_index_delete_ops_from_reverse(state_key, reverse_value) when is_binary(state_key) do
+  defp active_index_delete_ops_from_read_result(:not_found, state_key),
+    do: {:ok, [{:compare_missing, active_by_state_key_key(state_key)}]}
+
+  defp active_index_delete_ops_from_read_result({:ok, reverse_value}, state_key)
+       when is_binary(reverse_value) do
     reverse_key = active_by_state_key_key(state_key)
 
     case decode_active_index_reverse_value(reverse_value) do
       {:ok, active_keys} ->
-        [{:delete, reverse_key} | Enum.map(active_keys, &{:delete, &1})]
+        {:ok,
+         [
+           {:compare, reverse_key, reverse_value},
+           {:delete, reverse_key}
+           | Enum.map(active_keys, &{:delete, &1})
+         ]}
 
       :error ->
-        [{:delete, reverse_key}]
+        {:error, :invalid_active_index_reverse}
     end
   end
 
-  def active_index_delete_ops(path, state_key) when is_binary(path) and is_binary(state_key) do
-    reverse_key = active_by_state_key_key(state_key)
+  defp active_index_delete_ops_from_read_result({:error, _reason} = error, _state_key),
+    do: error
 
-    case get(path, reverse_key) do
-      {:ok, reverse_value} -> active_index_delete_ops_from_reverse(state_key, reverse_value)
-      _ -> [{:delete, reverse_key}]
+  defp active_index_delete_ops_from_read_result(invalid, _state_key),
+    do: {:error, {:invalid_active_index_reverse_read, invalid}}
+
+  defp validate_active_index_reverse_rows(path, state_key, active_keys) do
+    case Access.get_many(path, active_keys) do
+      {:ok, results} ->
+        active_keys
+        |> Enum.zip(results)
+        |> Enum.reduce_while({:ok, []}, fn
+          {active_key, :not_found}, {:ok, compare_ops} ->
+            {:cont, {:ok, [{:compare_missing, active_key} | compare_ops]}}
+
+          {active_key, {:ok, active_value}}, {:ok, compare_ops} when is_binary(active_value) ->
+            case decode_active_index_value(active_value) do
+              {:ok, {index_key, id, score, _expire_at_ms, ^state_key}} ->
+                if active_index_entry_key?(active_key, index_key, id, score) do
+                  {:cont, {:ok, [{:compare, active_key, active_value} | compare_ops]}}
+                else
+                  {:halt, {:error, {:invalid_active_index_value, active_key}}}
+                end
+
+              {:ok, {_index_key, _id, _score, _expire_at_ms, _foreign_state_key}} ->
+                {:halt, {:error, {:active_index_reverse_state_mismatch, active_key}}}
+
+              :error ->
+                {:halt, {:error, {:invalid_active_index_value, active_key}}}
+            end
+
+          {active_key, invalid}, {:ok, _compare_ops} ->
+            {:halt, {:error, {:invalid_active_index_read, active_key, invalid}}}
+        end)
+        |> case do
+          {:ok, reversed_compare_ops} -> {:ok, Enum.reverse(reversed_compare_ops)}
+          {:error, _reason} = error -> error
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      invalid ->
+        {:error, {:invalid_active_index_batch_read, invalid}}
     end
   end
 
@@ -490,11 +678,17 @@ defmodule Ferricstore.Flow.LMDB do
   def query_index_key(index_key, id, updated_at_ms),
     do: Ferricstore.Flow.LMDB.IndexCodec.query_index_key(index_key, id, updated_at_ms)
 
+  def query_index_entry_key?(key, id, updated_at_ms),
+    do: Ferricstore.Flow.LMDB.IndexCodec.query_index_entry_key?(key, id, updated_at_ms)
+
   def history_index_prefix(history_key),
     do: Ferricstore.Flow.LMDB.IndexCodec.history_index_prefix(history_key)
 
   def history_index_key(history_key, event_id, event_ms),
     do: Ferricstore.Flow.LMDB.IndexCodec.history_index_key(history_key, event_id, event_ms)
+
+  def history_index_entry_key?(key, event_id, event_ms),
+    do: Ferricstore.Flow.LMDB.IndexCodec.history_index_entry_key?(key, event_id, event_ms)
 
   def history_expire_prefix, do: Ferricstore.Flow.LMDB.IndexCodec.history_expire_prefix()
 
@@ -506,27 +700,11 @@ defmodule Ferricstore.Flow.LMDB do
   def segment_value_pin_prefix(tag) when tag in [:waraft_segment, :waraft_apply_projection],
     do: Ferricstore.Flow.LMDB.SegmentPins.prefix(tag)
 
-  def segment_value_pin_key(file_id, value_key),
-    do: Ferricstore.Flow.LMDB.SegmentPins.key(file_id, value_key)
-
   def encode_segment_value_pin_batch(file_id, entries),
     do: Ferricstore.Flow.LMDB.SegmentPins.encode_batch(file_id, entries)
 
-  def segment_value_pin_put_ops(value_key, expire_at_ms, file_id, offset, value_size),
-    do:
-      Ferricstore.Flow.LMDB.SegmentPins.put_ops(
-        value_key,
-        expire_at_ms,
-        file_id,
-        offset,
-        value_size
-      )
-
   def segment_value_pin_batch_put_ops(entries),
     do: Ferricstore.Flow.LMDB.SegmentPins.batch_put_ops(entries)
-
-  def segment_value_pin_delete_ops(value_key, file_id),
-    do: Ferricstore.Flow.LMDB.SegmentPins.delete_ops(value_key, file_id)
 
   def segment_value_pin_entries_before(path, trim_index, limit),
     do: Ferricstore.Flow.LMDB.SegmentPins.entries_before(path, trim_index, limit)
@@ -612,69 +790,224 @@ defmodule Ferricstore.Flow.LMDB do
 
   def delete_state_artifacts(path, state_key) when is_binary(path) and is_binary(state_key) do
     reverse_key = terminal_by_state_key_key(state_key)
-    active_ops = active_index_delete_ops(path, state_key)
 
-    case get(path, reverse_key) do
-      {:ok, terminal_key} when is_binary(terminal_key) ->
-        ops = terminal_index_delete_ops(path, terminal_key, state_key) ++ active_ops
-        write_batch(path, ops)
+    with {:ok, active_ops} <- active_index_delete_ops_result(path, state_key),
+         {:ok, terminal_key} <- path |> get(reverse_key) |> terminal_reverse_read() do
+      case terminal_key do
+        nil ->
+          write_batch(path, [{:delete, state_key}, {:delete, reverse_key} | active_ops])
 
-      _ ->
-        write_batch(path, [{:delete, state_key}, {:delete, reverse_key} | active_ops])
+        terminal_key ->
+          with {:ok, terminal_ops} <-
+                 strict_terminal_index_delete_ops_result(path, terminal_key, state_key) do
+            write_batch(path, terminal_ops ++ active_ops)
+          end
+      end
     end
   end
 
+  @doc false
+  def __terminal_reverse_read_for_test__(result), do: terminal_reverse_read(result)
+
+  defp terminal_reverse_read(:not_found), do: {:ok, nil}
+
+  defp terminal_reverse_read({:ok, terminal_key}) when is_binary(terminal_key),
+    do: {:ok, terminal_key}
+
+  defp terminal_reverse_read({:error, _reason} = error), do: error
+  defp terminal_reverse_read(_invalid), do: {:error, :invalid_terminal_reverse_read}
+
   def delete_terminal_index_entry(path, terminal_key, state_key)
       when is_binary(path) and is_binary(terminal_key) do
-    count_key = terminal_count_key_for_index_entry(path, terminal_key)
-    ops = terminal_index_delete_ops(path, terminal_key, state_key)
-
-    case write_batch(path, ops) do
-      :ok ->
-        refresh_terminal_count_cache_after_delete(path, count_key)
-        :ok
-
-      {:error, _reason} = error ->
-        error
+    with {:ok, ops} <- strict_terminal_index_delete_ops_result(path, terminal_key, state_key),
+         :ok <- write_batch(path, ops) do
+      refresh_terminal_count_cache_after_delete(path, terminal_count_key_from_delete_ops(ops))
+      :ok
     end
   end
 
   def delete_history_index_entry(path, history_index_key)
       when is_binary(path) and is_binary(history_index_key) do
-    ops = history_index_delete_ops(path, history_index_key)
-    write_batch(path, ops)
-  end
-
-  def terminal_index_delete_ops(path, terminal_key, state_key)
-      when is_binary(path) and is_binary(terminal_key) do
-    ops = [{:delete, terminal_key}]
-
-    ops =
-      if is_binary(state_key) do
-        [{:delete, state_key}, {:delete, terminal_by_state_key_key(state_key)} | ops]
-      else
-        ops
-      end
-
-    case get(path, terminal_key) do
-      {:ok, terminal_value} ->
-        ops
-        |> maybe_decrement_count(path, terminal_value)
-        |> maybe_delete_expire_key(terminal_key, terminal_value)
-
-      _ ->
-        ops
+    with {:ok, ops} <- history_index_delete_ops_result(path, history_index_key) do
+      write_batch(path, ops)
     end
   end
 
-  def encode_terminal_index_value(id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil),
-    do:
-      Ferricstore.Flow.LMDB.IndexCodec.encode_terminal_index_value(
-        id,
-        updated_at_ms,
-        expire_at_ms,
-        state_key
-      )
+  def terminal_index_delete_ops_result(path, terminal_key, state_key)
+      when is_binary(path) and is_binary(terminal_key) do
+    terminal_result = get(path, terminal_key)
+
+    terminal_index_delete_ops_from_results(
+      terminal_key,
+      state_key,
+      terminal_result,
+      fn count_key -> get(path, count_key) end
+    )
+  end
+
+  defp strict_terminal_index_delete_ops_result(path, terminal_key, state_key) do
+    case get(path, terminal_key) do
+      :not_found ->
+        {:error, :missing_terminal_index}
+
+      terminal_result ->
+        terminal_index_delete_ops_from_results(
+          terminal_key,
+          state_key,
+          terminal_result,
+          fn count_key -> get(path, count_key) end
+        )
+    end
+  end
+
+  @doc false
+  def __terminal_index_delete_ops_result_for_test__(
+        terminal_key,
+        state_key,
+        terminal_result,
+        count_result
+      ) do
+    terminal_index_delete_ops_from_results(
+      terminal_key,
+      state_key,
+      terminal_result,
+      fn _count_key -> count_result end
+    )
+  end
+
+  defp terminal_index_delete_ops_from_results(
+         terminal_key,
+         _state_key,
+         :not_found,
+         _count_reader
+       ) do
+    {:ok, [{:compare_missing, terminal_key}]}
+  end
+
+  defp terminal_index_delete_ops_from_results(
+         _terminal_key,
+         _state_key,
+         {:error, _reason} = error,
+         _count_reader
+       ),
+       do: error
+
+  defp terminal_index_delete_ops_from_results(
+         terminal_key,
+         state_key,
+         {:ok, terminal_value},
+         count_reader
+       )
+       when is_binary(terminal_value) do
+    with {:ok, {id, updated_at_ms, expire_at_ms, stored_state_key}} <-
+           decode_terminal_index_value(terminal_value),
+         true <- terminal_index_entry_key?(terminal_key, id, updated_at_ms),
+         :ok <- validate_terminal_delete_state_key(state_key, stored_state_key),
+         {:ok, count_key} <- terminal_index_count_key(terminal_value),
+         {:ok, count, count_value} <- terminal_count_from_read_result(count_reader.(count_key)) do
+      ops =
+        terminal_key
+        |> terminal_index_base_delete_ops(state_key)
+        |> prepend_terminal_count_update(count_key, count)
+        |> prepend_terminal_expire_delete(
+          terminal_key,
+          expire_at_ms,
+          stored_state_key,
+          count_key
+        )
+
+      {:ok,
+       [
+         {:compare, terminal_key, terminal_value},
+         {:compare, count_key, count_value}
+         | ops
+       ]}
+    else
+      false -> {:error, :invalid_terminal_index_value}
+      :missing -> {:error, :invalid_terminal_index_value}
+      :error -> {:error, :invalid_terminal_index_value}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp terminal_index_delete_ops_from_results(
+         _terminal_key,
+         _state_key,
+         _invalid,
+         _count_reader
+       ),
+       do: {:error, :invalid_terminal_index_read}
+
+  defp terminal_index_base_delete_ops(terminal_key, state_key) do
+    ops = [{:delete, terminal_key}]
+
+    if is_binary(state_key) do
+      reverse_key = terminal_by_state_key_key(state_key)
+
+      [
+        {:compare, reverse_key, terminal_key},
+        {:delete, state_key},
+        {:delete, reverse_key}
+        | ops
+      ]
+    else
+      ops
+    end
+  end
+
+  defp validate_terminal_delete_state_key(nil, _stored_state_key), do: :ok
+  defp validate_terminal_delete_state_key(state_key, state_key), do: :ok
+
+  defp validate_terminal_delete_state_key(_state_key, _stored_state_key),
+    do: {:error, :terminal_state_key_mismatch}
+
+  defp terminal_count_from_read_result({:ok, blob}) when is_binary(blob) do
+    case decode_count(blob) do
+      {:ok, count} -> {:ok, count, blob}
+      :error -> {:error, :invalid_terminal_count_value}
+    end
+  end
+
+  defp terminal_count_from_read_result(:not_found), do: {:error, :terminal_count_missing}
+  defp terminal_count_from_read_result({:error, _reason} = error), do: error
+
+  defp terminal_count_from_read_result(_invalid),
+    do: {:error, :invalid_terminal_count_read}
+
+  defp prepend_terminal_count_update(ops, count_key, count),
+    do: [{:put, count_key, encode_count(max(count - 1, 0))} | ops]
+
+  defp prepend_terminal_expire_delete(
+         ops,
+         terminal_key,
+         expire_at_ms,
+         state_key,
+         count_key
+       )
+       when is_integer(expire_at_ms) and expire_at_ms > 0 do
+    expire_key = terminal_expire_key(expire_at_ms, terminal_key)
+    expire_value = encode_terminal_expire_value(terminal_key, state_key, count_key)
+    [{:compare, expire_key, expire_value}, {:delete, expire_key} | ops]
+  end
+
+  defp prepend_terminal_expire_delete(
+         ops,
+         _terminal_key,
+         _expire_at_ms,
+         _state_key,
+         _count_key
+       ),
+       do: ops
+
+  defp terminal_count_key_from_delete_ops(ops) do
+    case Enum.find(ops, fn
+           {:put, _count_key, _value} -> true
+           _other -> false
+         end) do
+      {:put, count_key, _value} -> {:ok, count_key}
+      nil -> :missing
+    end
+  end
 
   def encode_terminal_index_value(id, updated_at_ms, expire_at_ms, state_key, count_key),
     do:
@@ -734,42 +1067,6 @@ defmodule Ferricstore.Flow.LMDB do
   def sweep_expired_history(path, now_ms, limit),
     do: Ferricstore.Flow.LMDB.Retention.sweep_expired_history(path, now_ms, limit)
 
-  def history_compound_entries(path, history_key, limit)
-      when is_binary(path) and is_binary(history_key) and is_integer(limit) and limit > 0 do
-    with {:ok, decoded} <- history_compound_location_entries(path, history_key, limit) do
-      decoded =
-        decoded
-        |> Enum.map(fn {compound_key, event_id, _value} -> {compound_key, event_id} end)
-        |> Enum.uniq()
-
-      {:ok, decoded}
-    end
-  end
-
-  def history_compound_entries(_path, _history_key, _limit), do: {:ok, []}
-
-  def history_compound_location_entries(path, history_key, limit)
-      when is_binary(path) and is_binary(history_key) and is_integer(limit) and limit > 0 do
-    with {:ok, entries} <- prefix_entries(path, history_index_prefix(history_key), limit) do
-      decoded =
-        entries
-        |> Enum.flat_map(fn {_history_index_key, value} ->
-          case decode_history_index_value(value) do
-            {:ok, {event_id, _event_ms, _expire_at_ms, compound_key}} ->
-              [{compound_key, event_id, value}]
-
-            :error ->
-              []
-          end
-        end)
-        |> Enum.uniq_by(fn {compound_key, event_id, _value} -> {compound_key, event_id} end)
-
-      {:ok, decoded}
-    end
-  end
-
-  def history_compound_location_entries(_path, _history_key, _limit), do: {:ok, []}
-
   def decode_terminal_index_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_index_value(blob)
 
@@ -787,7 +1084,7 @@ defmodule Ferricstore.Flow.LMDB do
     type = Map.fetch!(record, :type)
     state = Map.fetch!(record, :state)
     partition_key = Map.get(record, :partition_key)
-    updated_score = normalize_ms(Map.get(record, :updated_at_ms, 0))
+    updated_score = normalize_ms(Map.get(record, :updated_at_ms))
     state_index_key = Ferricstore.Flow.Keys.state_index_key(type, state, partition_key)
 
     [{state_index_key, id, updated_score}]
@@ -861,13 +1158,6 @@ defmodule Ferricstore.Flow.LMDB do
   def terminal_index_count_key(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.terminal_index_count_key(blob)
 
-  defp terminal_count_key_for_index_entry(path, terminal_key) do
-    case get(path, terminal_key) do
-      {:ok, terminal_value} -> terminal_index_count_key(terminal_value)
-      _ -> :missing
-    end
-  end
-
   defp refresh_terminal_count_cache_after_delete(path, {:ok, count_key}) do
     Ferricstore.Flow.LMDB.TerminalCounts.refresh_after_delete(path, {:ok, count_key})
   end
@@ -875,82 +1165,56 @@ defmodule Ferricstore.Flow.LMDB do
   defp refresh_terminal_count_cache_after_delete(path, :missing),
     do: Ferricstore.Flow.LMDB.TerminalCounts.refresh_after_delete(path, :missing)
 
-  defp maybe_decrement_count(ops, path, terminal_value) do
-    case terminal_index_count_key(terminal_value) do
-      {:ok, count_key} ->
-        count = max(read_count_key(path, count_key) - 1, 0)
-        [{:put, count_key, encode_count(count)} | ops]
-
-      :missing ->
-        ops
-    end
+  def history_index_delete_ops_result(path, history_index_key)
+      when is_binary(path) and is_binary(history_index_key) do
+    path
+    |> get(history_index_key)
+    |> history_index_delete_ops_from_read_result(history_index_key)
   end
 
-  defp maybe_delete_expire_key(ops, terminal_key, terminal_value) do
-    case decode_terminal_index_value(terminal_value) do
-      {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}} when expire_at_ms > 0 ->
-        expire_key = terminal_expire_key(expire_at_ms, terminal_key)
-        [{:delete, expire_key} | ops]
+  @doc false
+  def __history_index_delete_ops_result_for_test__(history_index_key, result),
+    do: history_index_delete_ops_from_read_result(result, history_index_key)
 
-      _ ->
-        ops
-    end
-  end
+  defp history_index_delete_ops_from_read_result(:not_found, history_index_key),
+    do: {:ok, [{:compare_missing, history_index_key}]}
 
-  def history_index_delete_ops(path, history_index_key) do
-    ops = [{:delete, history_index_key}]
+  defp history_index_delete_ops_from_read_result({:error, _reason} = error, _history_index_key),
+    do: error
 
-    case get(path, history_index_key) do
-      {:ok, history_value} ->
-        history_index_delete_ops_from_value(ops, history_index_key, history_value)
-
-      _ ->
-        ops
-    end
-  end
-
-  defp history_index_delete_ops_from_value(ops, history_index_key, history_value) do
-    maybe_delete_history_expire_key(ops, history_index_key, history_value)
-  end
-
-  defp maybe_delete_history_expire_key(ops, history_index_key, history_value) do
+  defp history_index_delete_ops_from_read_result({:ok, history_value}, history_index_key)
+       when is_binary(history_value) do
     case decode_history_index_value(history_value) do
-      {:ok, {_event_id, _event_ms, expire_at_ms, _compound_key}} when expire_at_ms > 0 ->
-        [{:delete, history_expire_key(expire_at_ms, history_index_key)} | ops]
+      {:ok, {event_id, event_ms, expire_at_ms, _compound_key}} ->
+        if history_index_entry_key?(history_index_key, event_id, event_ms) do
+          ops = [{:delete, history_index_key}]
 
-      _ ->
-        ops
-    end
-  end
+          ops =
+            if expire_at_ms > 0 do
+              expire_key = history_expire_key(expire_at_ms, history_index_key)
+              expire_value = encode_history_expire_value(history_index_key)
+              [{:compare, expire_key, expire_value}, {:delete, expire_key} | ops]
+            else
+              ops
+            end
 
-  defp read_count_key(path, count_key) do
-    case get(path, count_key) do
-      {:ok, blob} ->
-        case decode_count(blob) do
-          {:ok, count} -> count
-          :error -> 0
+          {:ok, [{:compare, history_index_key, history_value} | ops]}
+        else
+          {:error, :invalid_history_index_value}
         end
 
-      _ ->
-        0
+      :error ->
+        {:error, :invalid_history_index_value}
     end
   end
 
-  defp normalize_ms(value) when is_integer(value), do: value
-  defp normalize_ms(value) when is_float(value), do: trunc(value)
+  defp history_index_delete_ops_from_read_result(_invalid, _history_index_key),
+    do: {:error, :invalid_history_index_read}
 
-  defp normalize_ms(value) when is_binary(value) do
-    case Integer.parse(value) do
-      {int, ""} ->
-        int
+  defp normalize_ms(value)
+       when is_integer(value) and value >= 0 and value <= @max_u64,
+       do: value
 
-      _ ->
-        case Float.parse(value) do
-          {float, _rest} -> trunc(float)
-          :error -> 0
-        end
-    end
-  end
-
-  defp normalize_ms(_value), do: 0
+  defp normalize_ms(_value),
+    do: raise(ArgumentError, "active index score must be an unsigned 64-bit integer")
 end

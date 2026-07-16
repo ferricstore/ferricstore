@@ -1,7 +1,8 @@
 defmodule Ferricstore.Commands.Hash.Helpers do
   @moduledoc false
 
-  alias Ferricstore.CommandTime
+  alias Ferricstore.Commands.CollectionScan
+  alias Ferricstore.Commands.ExpiryTime
 
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
@@ -16,7 +17,7 @@ defmodule Ferricstore.Commands.Hash.Helpers do
 
   def parse_integer_value(str) when is_binary(str) do
     case Integer.parse(str) do
-      {int, ""} -> {:ok, int}
+      {int, ""} when int >= @min_int64 and int <= @max_int64 -> {:ok, int}
       _ -> :error
     end
   end
@@ -37,15 +38,18 @@ defmodule Ferricstore.Commands.Hash.Helpers do
 
   def parse_float_value(str) when is_binary(str) do
     case Float.parse(str) do
-      {float, ""} ->
-        {:ok, float}
-
-      _ ->
-        case Integer.parse(str) do
-          {int, ""} -> {:ok, int * 1.0}
-          _ -> :error
-        end
+      {float, ""} when is_float(float) -> {:ok, float}
+      _ -> :error
     end
+  rescue
+    ArgumentError -> :error
+  end
+
+  @spec checked_float_add(float(), float()) :: {:ok, float()} | :overflow
+  def checked_float_add(left, right) when is_float(left) and is_float(right) do
+    {:ok, left + right}
+  rescue
+    ArithmeticError -> :overflow
   end
 
   @spec format_float(float()) :: binary()
@@ -62,45 +66,26 @@ defmodule Ferricstore.Commands.Hash.Helpers do
   end
 
   @spec parse_expiry_mode(binary(), binary()) :: {:ok, integer()} | {:error, binary()}
-  def parse_expiry_mode("EX", value_str) do
-    case Integer.parse(value_str) do
-      {seconds, ""} when seconds > 0 ->
-        {:ok, CommandTime.now_ms() + seconds * 1000}
+  def parse_expiry_mode("EX", value_str), do: parse_expiry(value_str, 1_000, :relative)
+  def parse_expiry_mode("PX", value_str), do: parse_expiry(value_str, 1, :relative)
+  def parse_expiry_mode("EXAT", value_str), do: parse_expiry(value_str, 1_000, :absolute)
+  def parse_expiry_mode("PXAT", value_str), do: parse_expiry(value_str, 1, :absolute)
 
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
+  @spec relative_expire_at(integer(), pos_integer()) ::
+          {:ok, integer()} | {:error, binary()}
+  def relative_expire_at(value, multiplier) when is_integer(value) and value > 0 do
+    normalize_expiry_result(ExpiryTime.relative(value, multiplier))
   end
 
-  def parse_expiry_mode("PX", value_str) do
-    case Integer.parse(value_str) do
-      {ms, ""} when ms > 0 ->
-        {:ok, CommandTime.now_ms() + ms}
+  def relative_expire_at(_value, _multiplier), do: integer_range_error()
 
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
+  @spec absolute_expire_at(integer(), pos_integer()) ::
+          {:ok, integer()} | {:error, binary()}
+  def absolute_expire_at(value, multiplier) when is_integer(value) and value > 0 do
+    normalize_expiry_result(ExpiryTime.absolute(value, multiplier))
   end
 
-  def parse_expiry_mode("EXAT", value_str) do
-    case Integer.parse(value_str) do
-      {ts, ""} when ts > 0 ->
-        {:ok, ts * 1000}
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  def parse_expiry_mode("PXAT", value_str) do
-    case Integer.parse(value_str) do
-      {ts_ms, ""} when ts_ms > 0 ->
-        {:ok, ts_ms}
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
-  end
+  def absolute_expire_at(_value, _multiplier), do: integer_range_error()
 
   @spec validate_field_count(non_neg_integer(), [term()]) :: :ok | {:error, binary()}
   def validate_field_count(0, []), do: :ok
@@ -109,34 +94,12 @@ defmodule Ferricstore.Commands.Hash.Helpers do
   def validate_field_count(_, _),
     do: {:error, "ERR number of fields does not match the count argument"}
 
-  @spec parse_cursor(binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
-  def parse_cursor(cursor_str) do
-    case Integer.parse(cursor_str) do
-      {cursor, ""} when cursor >= 0 -> {:ok, cursor}
-      _ -> {:error, "ERR invalid cursor"}
-    end
-  end
+  @spec parse_cursor(binary()) ::
+          {:ok, CollectionScan.cursor()} | {:error, binary()}
+  def parse_cursor(cursor_str), do: CollectionScan.parse_cursor(cursor_str)
 
   @spec parse_hscan_opts([binary()]) :: {:ok, binary() | nil, pos_integer()} | {:error, binary()}
   def parse_hscan_opts(opts), do: do_parse_hscan_opts(opts, nil, 10)
-
-  @spec paginate([term()], non_neg_integer(), pos_integer()) :: {binary(), [term()]}
-  def paginate(items, cursor, count) do
-    rest = Enum.drop(items, cursor)
-
-    case rest do
-      [] ->
-        {"0", []}
-
-      _ ->
-        {batch, remainder} = Enum.split(rest, count)
-
-        case remainder do
-          [] -> {"0", batch}
-          _ -> {Integer.to_string(cursor + length(batch)), batch}
-        end
-    end
-  end
 
   @spec hash_pairs_to_flat_list([{binary(), binary()}]) :: [binary()]
   def hash_pairs_to_flat_list(pairs), do: hash_pairs_to_flat_list(pairs, [])
@@ -196,6 +159,22 @@ defmodule Ferricstore.Commands.Hash.Helpers do
   defp do_parse_hscan_opts([_ | _], _match, _count) do
     {:error, "ERR syntax error"}
   end
+
+  defp parse_expiry(raw, multiplier, mode) do
+    with {:ok, value} when value > 0 <- ExpiryTime.parse_integer(raw) do
+      case mode do
+        :relative -> relative_expire_at(value, multiplier)
+        :absolute -> absolute_expire_at(value, multiplier)
+      end
+    else
+      _invalid -> integer_range_error()
+    end
+  end
+
+  defp normalize_expiry_result({:ok, expire_at_ms}), do: {:ok, expire_at_ms}
+  defp normalize_expiry_result(:error), do: integer_range_error()
+
+  defp integer_range_error, do: {:error, "ERR value is not an integer or out of range"}
 
   defp hash_pairs_to_flat_list([{field, value} | pairs], acc) do
     hash_pairs_to_flat_list(pairs, [value, field | acc])

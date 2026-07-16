@@ -52,10 +52,11 @@ defmodule Ferricstore.Store.LFU do
       Application.get_env(:ferricstore, :lfu_log_factor, 10)
     )
 
-    # Atomics for the per-minute initial value cache.
-    # Slot 1: cached minute, Slot 2: packed initial value.
+    # One atomic word is the per-minute initial value cache. Keeping the minute
+    # inside the packed value prevents readers from observing a partially
+    # published cache refresh.
     # Avoids persistent_term.put once per minute (global GC in embedded).
-    ref = :atomics.new(2, signed: false)
+    ref = :atomics.new(1, signed: false)
     :persistent_term.put(:ferricstore_lfu_initial_ref, ref)
     :ok
   end
@@ -71,15 +72,14 @@ defmodule Ferricstore.Store.LFU do
   def initial do
     current_min = now_minutes()
     ref = initial_ref()
+    packed = pack(current_min, @initial_counter)
 
     case :atomics.get(ref, 1) do
-      ^current_min ->
-        :atomics.get(ref, 2)
+      ^packed ->
+        packed
 
       _ ->
-        packed = pack(current_min, @initial_counter)
-        :atomics.put(ref, 1, current_min)
-        :atomics.put(ref, 2, packed)
+        :atomics.put(ref, 1, packed)
         packed
     end
   end
@@ -89,15 +89,14 @@ defmodule Ferricstore.Store.LFU do
   def initial(ctx) do
     current_min = now_minutes()
     ref = ctx.lfu_initial_ref
+    packed = pack(current_min, @initial_counter)
 
     case :atomics.get(ref, 1) do
-      ^current_min ->
-        :atomics.get(ref, 2)
+      ^packed ->
+        packed
 
       _ ->
-        packed = pack(current_min, @initial_counter)
-        :atomics.put(ref, 1, current_min)
-        :atomics.put(ref, 2, packed)
+        :atomics.put(ref, 1, packed)
         packed
     end
   end
@@ -109,7 +108,7 @@ defmodule Ferricstore.Store.LFU do
   defp initial_ref do
     case :persistent_term.get(:ferricstore_lfu_initial_ref, nil) do
       nil ->
-        ref = :atomics.new(2, signed: false)
+        ref = :atomics.new(1, signed: false)
         :persistent_term.put(:ferricstore_lfu_initial_ref, ref)
         ref
 

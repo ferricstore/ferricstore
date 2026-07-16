@@ -9,7 +9,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
       alias Ferricstore.Raft.StateMachine
+      alias Ferricstore.Raft.CommandStamp
       alias Ferricstore.Raft.WARaftSegmentReader
+      alias Ferricstore.Raft.WARaftSegmentReader.CommandValues
       alias Ferricstore.Store.BlobRef
       alias Ferricstore.Store.BlobStore
       alias Ferricstore.Store.BlobValue
@@ -64,22 +66,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp maybe_clear_replay_safe_noop_dirty(_command, _result, _old_handle, new_handle),
         do: new_handle
 
-      defp decoded_replay_command({:ttb, binary}) when is_binary(binary) do
-        try do
-          binary
-          |> :erlang.binary_to_term([:safe])
-          |> decoded_replay_command()
-        rescue
-          _ -> {:ttb, binary}
-        end
-      end
-
-      defp decoded_replay_command({inner_command, %{hlc_ts: {physical_ms, logical}}})
-           when is_tuple(inner_command) and is_integer(physical_ms) and is_integer(logical) do
-        decoded_replay_command(inner_command)
-      end
-
-      defp decoded_replay_command(command), do: command
+      defp decoded_replay_command(command), do: CommandValues.decode_replay_command(command)
 
       defp replay_safe_noop_result?({:cas, _key, _expected, _new_value, _ttl_ms}, result)
            when result in [0, nil],
@@ -104,11 +91,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp storage_apply_failure?(_result), do: false
 
       defp storage_apply_failure_reason?(:active_file_unavailable), do: true
+      defp storage_apply_failure_reason?(:invalid_preencoded_command), do: true
+      defp storage_apply_failure_reason?({:unknown_command, _command}), do: true
       defp storage_apply_failure_reason?({:bitcask_append_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:bitcask_append_result_mismatch, _reason}), do: true
       defp storage_apply_failure_reason?({:bitcask_writer_flush_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:blob_externalize_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:blob_ref_unavailable, _reason}), do: true
+      defp storage_apply_failure_reason?({:state_read_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:cross_shard_compensation_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:flow_history_projection_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:batch_result_mismatch, _expected, _actual}), do: true

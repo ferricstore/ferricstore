@@ -101,8 +101,8 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
         shard: shard
       } do
         payload = "dead-without-waraft-storage"
-        ref = BlobRef.from_payload(payload)
-        path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+        assert {:ok, ref} = BlobStore.put(ctx.data_dir, 0, payload)
+        path = BlobRef.path(ctx.data_dir, 0, ref)
         original_state = :sys.get_state(shard)
 
         :sys.replace_state(shard, fn state -> %{state | raft?: true} end)
@@ -131,8 +131,8 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
         attach_blob_gc_handler()
 
         payload = "dead-but-live-ref-scan-fails"
-        ref = BlobRef.from_payload(payload)
-        path = write_legacy_blob!(ctx.data_dir, 0, ref, payload)
+        assert {:ok, ref} = BlobStore.put(ctx.data_dir, 0, payload)
+        path = BlobRef.path(ctx.data_dir, 0, ref)
         live_key = "blob:gc:missing-live-location"
 
         :ets.insert(keydir, {live_key, nil, 0, LFU.initial(), 999_999, 0, BlobRef.encoded_size()})
@@ -243,16 +243,11 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
                 %{
                   files: 1,
                   bytes: bytes,
-                  legacy_files: 0,
-                  legacy_bytes: 0,
-                  segment_files: 1,
-                  segment_bytes: segment_bytes,
                   tmp_files: 0,
                   tmp_bytes: 0
                 }} = BlobStore.storage_stats(ctx.data_dir)
 
         assert bytes >= 2048
-        assert segment_bytes == bytes
       end
     end
   end

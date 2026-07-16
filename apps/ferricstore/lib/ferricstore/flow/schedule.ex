@@ -9,7 +9,7 @@ defmodule Ferricstore.Flow.Schedule do
   """
 
   alias Ferricstore.Flow
-  alias Ferricstore.Flow.{Internal, Keys}
+  alias Ferricstore.Flow.{Internal, Keys, MutationAttrs}
   alias Ferricstore.Store.Router
 
   @schedule_type "__ferricstore_schedule"
@@ -32,13 +32,16 @@ defmodule Ferricstore.Flow.Schedule do
   @default_definition_max_bytes 32 * 1024
   @default_inline_value_max_bytes 8 * 1024
   @default_timezone "Etc/UTC"
+  @max_exact_integer 9_007_199_254_740_991
+  @timestamp_limit_error "ERR flow schedule next_run_at_ms exceeds maximum #{@max_exact_integer}"
 
   @type schedule_id :: binary()
 
   @spec create(FerricStore.Instance.t(), schedule_id(), keyword()) ::
           {:ok, map()} | {:error, binary()}
   def create(ctx, id, opts) when is_binary(id) and is_list(opts) do
-    with :ok <- validate_id(id),
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
          {:ok, overwrite?} <- optional_boolean(opts, :overwrite, false),
          {:ok, definition} <- definition(id, opts) do
       flow_id = flow_id(id)
@@ -77,17 +80,16 @@ defmodule Ferricstore.Flow.Schedule do
   def get(ctx, id, opts \\ [])
 
   def get(ctx, id, opts) when is_binary(id) and is_list(opts) do
-    with :ok <- validate_id(id) do
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id) do
       ctx
       |> Flow.get(
         flow_id(id),
         Keyword.merge(
-          [
-            partition_key: partition_key(id),
-            payload: true,
-            payload_max_bytes: schedule_definition_max_bytes()
-          ],
-          Internal.put(opts)
+          Internal.put(opts),
+          partition_key: partition_key(id),
+          payload: true,
+          payload_max_bytes: schedule_definition_max_bytes()
         )
       )
       |> case do
@@ -105,7 +107,8 @@ defmodule Ferricstore.Flow.Schedule do
   def fire(ctx, id, opts \\ [])
 
   def fire(ctx, id, opts) when is_binary(id) and is_list(opts) do
-    with :ok <- validate_id(id),
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
          {:ok, now_ms} <- optional_now_ms(opts),
          {:ok, fire_at_ms} <- optional_non_neg_integer(opts, :fire_at_ms, now_ms),
          {:ok, record} <-
@@ -180,15 +183,19 @@ defmodule Ferricstore.Flow.Schedule do
   def list(ctx, opts \\ [])
 
   def list(ctx, opts) when is_list(opts) do
-    with {:ok, states} <- list_states(opts),
+    with :ok <- validate_opts(opts),
+         {:ok, states} <- list_states(opts),
          {:ok, count} <- list_count(opts),
-         {:ok, filters} <- list_filters(opts) do
+         {:ok, rev?} <- optional_boolean(opts, :rev, false),
+         {:ok, filters} <- list_filters(opts),
+         {:ok, schedules} <- list_states(ctx, states, count, rev?, filters) do
+      direction = if rev?, do: :desc, else: :asc
+
       schedules =
-        states
-        |> Enum.flat_map(&list_state(ctx, &1, count))
+        schedules
         |> Enum.uniq_by(& &1.id)
         |> Enum.filter(&schedule_matches_filters?(&1, filters))
-        |> Enum.sort_by(&{schedule_sort_due(&1), &1.id})
+        |> Enum.sort_by(&{schedule_sort_due(&1), &1.id}, direction)
         |> Enum.take(count)
 
       {:ok, schedules}
@@ -201,7 +208,8 @@ defmodule Ferricstore.Flow.Schedule do
   def delete(ctx, id, opts \\ [])
 
   def delete(ctx, id, opts) when is_binary(id) and is_list(opts) do
-    with :ok <- validate_id(id),
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
          {:ok, now_ms} <- optional_now_ms(opts),
          {:ok, record} <-
            Flow.get(
@@ -239,48 +247,53 @@ defmodule Ferricstore.Flow.Schedule do
   def fire_due(ctx, opts \\ [])
 
   def fire_due(ctx, opts) when is_list(opts) do
-    now_ms = Keyword.get(opts, :now_ms, now_ms())
-    worker = Keyword.get(opts, :worker, default_worker())
-    limit = Keyword.get(opts, :limit, @default_limit)
-    lease_ms = Keyword.get(opts, :lease_ms, @default_lease_ms)
+    with :ok <- validate_opts(opts) do
+      now_ms = Keyword.get(opts, :now_ms, now_ms())
+      worker = Keyword.get(opts, :worker, default_worker())
+      limit = Keyword.get(opts, :limit, @default_limit)
+      lease_ms = Keyword.get(opts, :lease_ms, @default_lease_ms)
 
-    claim_opts =
-      [
-        state: @active_state,
-        partition_key: :any,
-        worker: worker,
-        limit: limit,
-        lease_ms: lease_ms,
-        now_ms: now_ms,
-        payload: true,
-        payload_max_bytes: schedule_definition_max_bytes()
-      ]
-      |> maybe_put(:block_ms, Keyword.get(opts, :block_ms))
-      |> Internal.put()
+      claim_opts =
+        [
+          state: @active_state,
+          partition_key: :any,
+          worker: worker,
+          limit: limit,
+          lease_ms: lease_ms,
+          now_ms: now_ms,
+          payload: true,
+          payload_max_bytes: schedule_definition_max_bytes()
+        ]
+        |> maybe_put(:block_ms, Keyword.get(opts, :block_ms))
+        |> Internal.put()
 
-    with {:ok, claimed} <- Flow.claim_due(ctx, @schedule_type, claim_opts) do
-      claimed
-      |> Enum.reduce_while(
-        {:ok, %{claimed: length(claimed), fired: 0, skipped: 0, errors: []}},
-        fn record, {:ok, acc} ->
-          case fire_one(ctx, record, now_ms) do
-            {:ok, target_id} ->
-              {:cont,
-               {:ok, acc |> Map.update!(:fired, &(&1 + 1)) |> Map.put(:last_target_id, target_id)}}
+      with {:ok, claimed} <- Flow.claim_due(ctx, @schedule_type, claim_opts) do
+        claimed
+        |> Enum.reduce_while(
+          {:ok, %{claimed: length(claimed), fired: 0, skipped: 0, errors: []}},
+          fn record, {:ok, acc} ->
+            case fire_one(ctx, record, now_ms) do
+              {:ok, target_id} ->
+                {:cont,
+                 {:ok,
+                  acc
+                  |> Map.update!(:fired, &(&1 + 1))
+                  |> Map.put(:last_target_id, target_id)}}
 
-            {:skipped, reason} ->
-              {:cont,
-               {:ok,
-                acc
-                |> Map.update!(:skipped, &(&1 + 1))
-                |> Map.put(:last_skip_reason, reason)}}
+              {:skipped, reason} ->
+                {:cont,
+                 {:ok,
+                  acc
+                  |> Map.update!(:skipped, &(&1 + 1))
+                  |> Map.put(:last_skip_reason, reason)}}
 
-            {:error, reason} ->
-              {:cont, {:ok, %{acc | errors: [{Map.get(record, :id), reason} | acc.errors]}}}
+              {:error, reason} ->
+                {:cont, {:ok, %{acc | errors: [{Map.get(record, :id), reason} | acc.errors]}}}
+            end
           end
-        end
-      )
-      |> normalize_fire_result()
+        )
+        |> normalize_fire_result()
+      end
     end
   end
 
@@ -405,57 +418,116 @@ defmodule Ferricstore.Flow.Schedule do
       |> Map.put(:end_reason, "one_shot_fired")
       |> Map.delete(:next_run_at_ms)
 
-    Flow.complete(ctx, Map.fetch!(record, :id), Map.fetch!(record, :lease_token),
-      partition_key: Map.get(record, :partition_key),
-      fencing_token: Map.fetch!(record, :fencing_token),
-      payload: completed_definition,
-      result: %{target_id: target_id, fire_count: fire_count, fired_at_ms: due_at_ms},
-      now_ms: now_ms,
-      __ferricstore_internal__: true
+    Flow.complete(
+      ctx,
+      Map.fetch!(record, :id),
+      Map.fetch!(record, :lease_token),
+      Internal.put(
+        partition_key: Map.get(record, :partition_key),
+        fencing_token: Map.fetch!(record, :fencing_token),
+        payload: completed_definition,
+        result: %{target_id: target_id, fire_count: fire_count, fired_at_ms: due_at_ms},
+        now_ms: now_ms
+      )
     )
     |> internal_terminal_result()
   end
 
   defp finish_schedule_fire(ctx, record, definition, target_id, due_at_ms, fire_count, now_ms) do
-    with {:ok, next_run_at_ms} <- next_run_at_ms(definition, due_at_ms) do
-      next_definition =
-        next_definition_after_fire(definition, target_id, due_at_ms, fire_count, next_run_at_ms)
+    case next_run_at_ms(definition, due_at_ms) do
+      {:ok, next_run_at_ms} ->
+        next_definition =
+          next_definition_after_fire(definition, target_id, due_at_ms, fire_count, next_run_at_ms)
 
-      case recurring_end_reason(next_definition, next_run_at_ms, fire_count) do
-        nil ->
-          Flow.reschedule(ctx, Map.fetch!(record, :id), Map.fetch!(record, :lease_token),
-            state: @active_state,
-            partition_key: Map.get(record, :partition_key),
-            fencing_token: Map.fetch!(record, :fencing_token),
-            payload: next_definition,
-            run_at_ms: next_run_at_ms,
-            now_ms: now_ms,
-            __ferricstore_internal__: true
+        case recurring_end_reason(next_definition, next_run_at_ms, fire_count) do
+          nil ->
+            Flow.reschedule(
+              ctx,
+              Map.fetch!(record, :id),
+              Map.fetch!(record, :lease_token),
+              Internal.put(
+                state: @active_state,
+                partition_key: Map.get(record, :partition_key),
+                fencing_token: Map.fetch!(record, :fencing_token),
+                payload: next_definition,
+                run_at_ms: next_run_at_ms,
+                now_ms: now_ms
+              )
+            )
+            |> ok_result()
+
+          reason ->
+            complete_recurring_schedule(
+              ctx,
+              record,
+              next_definition,
+              target_id,
+              due_at_ms,
+              fire_count,
+              reason,
+              now_ms
+            )
+        end
+
+      {:error, @timestamp_limit_error} ->
+        definition =
+          completed_definition_after_fire(
+            definition,
+            target_id,
+            due_at_ms,
+            fire_count,
+            "timestamp_limit"
           )
-          |> ok_result()
 
-        reason ->
-          completed_definition =
-            next_definition
-            |> Map.put(:end_reason, reason)
-            |> Map.delete(:next_run_at_ms)
+        complete_recurring_schedule(
+          ctx,
+          record,
+          definition,
+          target_id,
+          due_at_ms,
+          fire_count,
+          "timestamp_limit",
+          now_ms
+        )
 
-          Flow.complete(ctx, Map.fetch!(record, :id), Map.fetch!(record, :lease_token),
-            partition_key: Map.get(record, :partition_key),
-            fencing_token: Map.fetch!(record, :fencing_token),
-            payload: completed_definition,
-            result: %{
-              target_id: target_id,
-              fire_count: fire_count,
-              fired_at_ms: due_at_ms,
-              end_reason: reason
-            },
-            now_ms: now_ms,
-            __ferricstore_internal__: true
-          )
-          |> internal_terminal_result()
-      end
+      {:error, _reason} = error ->
+        error
     end
+  end
+
+  defp complete_recurring_schedule(
+         ctx,
+         record,
+         definition,
+         target_id,
+         due_at_ms,
+         fire_count,
+         reason,
+         now_ms
+       ) do
+    completed_definition =
+      definition
+      |> Map.put(:end_reason, reason)
+      |> Map.delete(:next_run_at_ms)
+
+    Flow.complete(
+      ctx,
+      Map.fetch!(record, :id),
+      Map.fetch!(record, :lease_token),
+      Internal.put(
+        partition_key: Map.get(record, :partition_key),
+        fencing_token: Map.fetch!(record, :fencing_token),
+        payload: completed_definition,
+        result: %{
+          target_id: target_id,
+          fire_count: fire_count,
+          fired_at_ms: due_at_ms,
+          end_reason: reason
+        },
+        now_ms: now_ms
+      )
+    )
+    |> internal_terminal_result()
   end
 
   defp internal_terminal_result(result), do: ok_result(result)
@@ -524,16 +596,20 @@ defmodule Ferricstore.Flow.Schedule do
   end
 
   defp fail_schedule_overlap(ctx, record, definition, reason, now_ms) do
-    Flow.fail(ctx, Map.fetch!(record, :id), Map.fetch!(record, :lease_token),
-      partition_key: Map.get(record, :partition_key),
-      fencing_token: Map.fetch!(record, :fencing_token),
-      error: %{
-        reason: reason,
-        schedule_id: Map.fetch!(definition, :id),
-        previous_target_id: Map.get(definition, :last_target_id)
-      },
-      now_ms: now_ms,
-      __ferricstore_internal__: true
+    Flow.fail(
+      ctx,
+      Map.fetch!(record, :id),
+      Map.fetch!(record, :lease_token),
+      Internal.put(
+        partition_key: Map.get(record, :partition_key),
+        fencing_token: Map.fetch!(record, :fencing_token),
+        error: %{
+          reason: reason,
+          schedule_id: Map.fetch!(definition, :id),
+          previous_target_id: Map.get(definition, :last_target_id)
+        },
+        now_ms: now_ms
+      )
     )
     |> case do
       :ok -> {:error, reason}
@@ -597,22 +673,45 @@ defmodule Ferricstore.Flow.Schedule do
          fire_count,
          now_ms
        ) do
-    with {:ok, next_run_at_ms} <- next_run_at_ms(definition, due_at_ms) do
-      next_definition =
-        next_definition_after_fire(definition, target_id, due_at_ms, fire_count, next_run_at_ms)
+    case next_run_at_ms(definition, due_at_ms) do
+      {:ok, next_run_at_ms} ->
+        next_definition =
+          next_definition_after_fire(definition, target_id, due_at_ms, fire_count, next_run_at_ms)
 
-      case recurring_end_reason(next_definition, next_run_at_ms, fire_count) do
-        nil ->
-          replace_with_state(ctx, record, next_definition, @active_state, next_run_at_ms, now_ms)
+        case recurring_end_reason(next_definition, next_run_at_ms, fire_count) do
+          nil ->
+            replace_with_state(
+              ctx,
+              record,
+              next_definition,
+              @active_state,
+              next_run_at_ms,
+              now_ms
+            )
 
-        reason ->
-          completed_definition =
-            next_definition
-            |> Map.put(:end_reason, reason)
-            |> Map.delete(:next_run_at_ms)
+          reason ->
+            completed_definition =
+              next_definition
+              |> Map.put(:end_reason, reason)
+              |> Map.delete(:next_run_at_ms)
 
-          replace_with_state(ctx, record, completed_definition, "completed", due_at_ms, now_ms)
-      end
+            replace_with_state(ctx, record, completed_definition, "completed", due_at_ms, now_ms)
+        end
+
+      {:error, @timestamp_limit_error} ->
+        completed_definition =
+          completed_definition_after_fire(
+            definition,
+            target_id,
+            due_at_ms,
+            fire_count,
+            "timestamp_limit"
+          )
+
+        replace_with_state(ctx, record, completed_definition, "completed", due_at_ms, now_ms)
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -665,6 +764,16 @@ defmodule Ferricstore.Flow.Schedule do
     |> Map.delete(:end_reason)
   end
 
+  defp completed_definition_after_fire(definition, target_id, due_at_ms, fire_count, reason) do
+    definition
+    |> Map.put(:fire_count, fire_count)
+    |> Map.put(:last_fire_at_ms, due_at_ms)
+    |> Map.put(:last_target_id, target_id)
+    |> Map.put(:end_reason, reason)
+    |> Map.delete(:next_run_at_ms)
+    |> Map.delete(:overlap_queued_due_at_ms)
+  end
+
   defp skipped_definition(definition, due_at_ms, next_run_at_ms, reason, now_ms) do
     definition
     |> Map.update(:skipped_count, 1, &(&1 + 1))
@@ -701,14 +810,18 @@ defmodule Ferricstore.Flow.Schedule do
   end
 
   defp reschedule_definition(ctx, record, definition, run_at_ms, now_ms) do
-    Flow.reschedule(ctx, Map.fetch!(record, :id), Map.fetch!(record, :lease_token),
-      state: @active_state,
-      partition_key: Map.get(record, :partition_key),
-      fencing_token: Map.fetch!(record, :fencing_token),
-      payload: definition,
-      run_at_ms: run_at_ms,
-      now_ms: now_ms,
-      __ferricstore_internal__: true
+    Flow.reschedule(
+      ctx,
+      Map.fetch!(record, :id),
+      Map.fetch!(record, :lease_token),
+      Internal.put(
+        state: @active_state,
+        partition_key: Map.get(record, :partition_key),
+        fencing_token: Map.fetch!(record, :fencing_token),
+        payload: definition,
+        run_at_ms: run_at_ms,
+        now_ms: now_ms
+      )
     )
     |> ok_result()
   end
@@ -747,23 +860,7 @@ defmodule Ferricstore.Flow.Schedule do
     target = Map.fetch!(definition, :target)
     partition_key = target_partition_key(target_id, target)
     correlation_id = target_correlation_id(definition, target)
-
-    opts =
-      [
-        type: Map.fetch!(target, :type),
-        state: Map.get(target, :state, @default_state),
-        partition_key: partition_key,
-        correlation_id: correlation_id,
-        now_ms: now_ms,
-        run_at_ms: Map.get(target, :run_at_ms, now_ms)
-      ]
-      |> maybe_put(:priority, Map.get(target, :priority))
-      |> maybe_put(:parent_flow_id, Map.get(target, :parent_flow_id))
-      |> maybe_put(:root_flow_id, Map.get(target, :root_flow_id))
-      |> maybe_put(:payload, Map.get(target, :payload))
-      |> maybe_put(:payload_ref, Map.get(target, :payload_ref))
-      |> maybe_put(:values, Map.get(target, :values))
-      |> maybe_put(:value_refs, Map.get(target, :value_refs))
+    opts = target_create_opts(definition, target_id, now_ms)
 
     case Flow.create(ctx, target_id, opts) do
       :ok ->
@@ -815,7 +912,8 @@ defmodule Ferricstore.Flow.Schedule do
   defp require_paused_schedule(_record), do: {:error, "ERR flow schedule is not paused"}
 
   defp mutable_schedule_record(ctx, id, opts) do
-    with :ok <- validate_id(id),
+    with :ok <- validate_opts(opts),
+         :ok <- validate_id(id),
          {:ok, now_ms} <- optional_now_ms(opts),
          {:ok, record} <-
            Flow.get(
@@ -839,42 +937,118 @@ defmodule Ferricstore.Flow.Schedule do
   defp schedule_resume_run_at(_record, _now_ms),
     do: {:error, "ERR flow schedule has no next run time"}
 
-  defp list_state(ctx, state, count) do
+  defp list_state(ctx, state, count, rev?, filters) do
     schedule_partition_keys()
-    |> Enum.flat_map(fn partition_key ->
-      opts =
-        Internal.put(
-          state: state,
-          partition_key: partition_key,
-          count: count,
-          include_cold: true,
-          consistent_projection: true
-        )
-
-      result =
-        if Ferricstore.Flow.LMDB.terminal_state?(state) do
-          Flow.terminals(ctx, @schedule_type, opts)
-        else
-          Flow.list(ctx, @schedule_type, opts)
-        end
-
-      case result do
-        {:ok, records} -> records
-        {:error, _reason} -> []
+    |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
+      case list_partition(ctx, state, partition_key, count, rev?, filters, count, %{}) do
+        {:ok, schedules} -> {:cont, {:ok, [schedules | acc]}}
+        {:error, _reason} = error -> {:halt, error}
       end
     end)
-    |> Enum.map(&hydrate_schedule_record(ctx, &1))
-    |> Enum.reject(&is_nil/1)
+    |> case do
+      {:ok, schedules} -> {:ok, schedules |> Enum.reverse() |> List.flatten()}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp list_partition(ctx, state, partition_key, count, rev?, filters, scan_count, cache) do
+    with {:ok, records} <- list_partition_records(ctx, state, partition_key, scan_count, rev?),
+         {:ok, schedules, cache} <- hydrate_schedule_records(ctx, records, cache) do
+      matches =
+        schedules
+        |> Enum.reject(&is_nil/1)
+        |> Enum.filter(&schedule_matches_filters?(&1, filters))
+
+      if length(records) < scan_count or scan_count >= 1_000 do
+        direction = if rev?, do: :desc, else: :asc
+
+        {:ok,
+         matches
+         |> Enum.sort_by(&{schedule_sort_due(&1), &1.id}, direction)
+         |> Enum.take(count)}
+      else
+        next_scan_count = min(scan_count * 2, 1_000)
+
+        list_partition(
+          ctx,
+          state,
+          partition_key,
+          count,
+          rev?,
+          filters,
+          next_scan_count,
+          cache
+        )
+      end
+    end
+  end
+
+  defp list_partition_records(ctx, state, partition_key, count, rev?) do
+    opts =
+      Internal.put(
+        state: state,
+        partition_key: partition_key,
+        count: count,
+        rev: rev?,
+        include_cold: true,
+        consistent_projection: true
+      )
+
+    result =
+      if Ferricstore.Flow.LMDB.terminal_state?(state) do
+        Flow.terminals(ctx, @schedule_type, opts)
+      else
+        Flow.list(ctx, @schedule_type, opts)
+      end
+
+    result
+  end
+
+  defp hydrate_schedule_records(ctx, records, cache) do
+    Enum.reduce_while(records, {:ok, [], cache}, fn record, {:ok, schedules, acc} ->
+      id = Map.get(record, :id)
+
+      case Map.fetch(acc, id) do
+        {:ok, schedule} ->
+          {:cont, {:ok, [schedule | schedules], acc}}
+
+        :error ->
+          case hydrate_schedule_record(ctx, record) do
+            {:ok, schedule} ->
+              {:cont, {:ok, [schedule | schedules], Map.put(acc, id, schedule)}}
+
+            {:error, _reason} = error ->
+              {:halt, error}
+          end
+      end
+    end)
+    |> case do
+      {:ok, schedules, cache} -> {:ok, Enum.reverse(schedules), cache}
+      {:error, _reason} = error -> error
+    end
   end
 
   defp hydrate_schedule_record(ctx, %{id: @schedule_id_prefix <> id}) do
     case get(ctx, id) do
-      {:ok, schedule} -> schedule
-      _other -> nil
+      {:ok, schedule} -> {:ok, schedule}
+      {:error, _reason} = error -> error
     end
   end
 
-  defp hydrate_schedule_record(_ctx, _record), do: nil
+  defp hydrate_schedule_record(_ctx, _record), do: {:ok, nil}
+
+  defp list_states(ctx, states, count, rev?, filters) do
+    Enum.reduce_while(states, {:ok, []}, fn state, {:ok, acc} ->
+      case list_state(ctx, state, count, rev?, filters) do
+        {:ok, schedules} -> {:cont, {:ok, [schedules | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, schedules} -> {:ok, schedules |> Enum.reverse() |> List.flatten()}
+      {:error, _reason} = error -> error
+    end
+  end
 
   defp schedule_partition_keys do
     Enum.map(0..(@partition_buckets - 1), &schedule_partition_key/1)
@@ -943,7 +1117,8 @@ defmodule Ferricstore.Flow.Schedule do
   defp schedule_filter_match?(value, value), do: true
   defp schedule_filter_match?(_expected, _value), do: false
 
-  defp schedule_due_in_range?(nil, _from_ms, _to_ms), do: true
+  defp schedule_due_in_range?(nil, nil, nil), do: true
+  defp schedule_due_in_range?(nil, _from_ms, _to_ms), do: false
   defp schedule_due_in_range?(due_ms, nil, nil), do: is_integer(due_ms)
   defp schedule_due_in_range?(due_ms, from_ms, nil), do: is_integer(due_ms) and due_ms >= from_ms
   defp schedule_due_in_range?(due_ms, nil, to_ms), do: is_integer(due_ms) and due_ms <= to_ms
@@ -977,9 +1152,8 @@ defmodule Ferricstore.Flow.Schedule do
   end
 
   defp definition(id, opts) do
-    now_ms = Keyword.get(opts, :now_ms, now_ms())
-
-    with {:ok, kind} <- schedule_kind(opts),
+    with {:ok, now_ms} <- optional_now_ms(opts),
+         {:ok, kind} <- schedule_kind(opts),
          {:ok, target} <- target_from_opts(opts),
          :ok <- validate_target_id_mode(kind, target),
          :ok <- validate_target_namespace(kind, target),
@@ -1010,10 +1184,37 @@ defmodule Ferricstore.Flow.Schedule do
         |> maybe_put(:max_fires, max_fires)
         |> maybe_put(:end_at_ms, end_at_ms)
 
-      with :ok <- validate_definition_size(definition) do
+      target_id = target_id(definition, next_run_at_ms, 1)
+
+      with {:ok, _attrs} <-
+             MutationAttrs.create_attrs(
+               target_id,
+               target_create_opts(definition, target_id, now_ms)
+             ),
+           :ok <- validate_definition_size(definition) do
         {:ok, definition}
       end
     end
+  end
+
+  defp target_create_opts(definition, target_id, now_ms) do
+    target = Map.fetch!(definition, :target)
+
+    [
+      type: Map.fetch!(target, :type),
+      state: Map.get(target, :state, @default_state),
+      partition_key: target_partition_key(target_id, target),
+      correlation_id: target_correlation_id(definition, target),
+      now_ms: now_ms,
+      run_at_ms: Map.get(target, :run_at_ms, now_ms)
+    ]
+    |> maybe_put(:priority, Map.get(target, :priority))
+    |> maybe_put(:parent_flow_id, Map.get(target, :parent_flow_id))
+    |> maybe_put(:root_flow_id, Map.get(target, :root_flow_id))
+    |> maybe_put(:payload, Map.get(target, :payload))
+    |> maybe_put(:payload_ref, Map.get(target, :payload_ref))
+    |> maybe_put(:values, Map.get(target, :values))
+    |> maybe_put(:value_refs, Map.get(target, :value_refs))
   end
 
   defp schedule_kind(opts) do
@@ -1036,8 +1237,14 @@ defmodule Ferricstore.Flow.Schedule do
 
   defp initial_run_at_ms(:delay, opts, now_ms, _timezone) do
     case Keyword.get(opts, :delay_ms) do
-      delay when is_integer(delay) and delay >= 0 -> {:ok, now_ms + delay}
-      _ -> {:error, "ERR flow schedule delay_ms must be a non-negative integer"}
+      delay when is_integer(delay) and delay >= 0 and delay <= @max_exact_integer ->
+        safe_schedule_add(now_ms, delay, :at_ms)
+
+      delay when is_integer(delay) and delay > @max_exact_integer ->
+        {:error, "ERR flow schedule delay_ms exceeds maximum #{@max_exact_integer}"}
+
+      _ ->
+        {:error, "ERR flow schedule delay_ms must be a non-negative integer"}
     end
   end
 
@@ -1058,8 +1265,14 @@ defmodule Ferricstore.Flow.Schedule do
 
   defp interval_ms(:interval, opts) do
     case Keyword.get(opts, :every_ms) do
-      value when is_integer(value) and value > 0 -> {:ok, value}
-      _ -> {:error, "ERR flow schedule every_ms must be a positive integer"}
+      value when is_integer(value) and value > 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      value when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow schedule every_ms exceeds maximum #{@max_exact_integer}"}
+
+      _ ->
+        {:error, "ERR flow schedule every_ms must be a positive integer"}
     end
   end
 
@@ -1121,17 +1334,33 @@ defmodule Ferricstore.Flow.Schedule do
 
   defp overlap_retry_ms(opts) do
     case Keyword.get(opts, :overlap_retry_ms) do
-      nil -> {:ok, nil}
-      value when is_integer(value) and value > 0 -> {:ok, value}
-      _ -> {:error, "ERR flow schedule overlap_retry_ms must be a positive integer"}
+      nil ->
+        {:ok, nil}
+
+      value when is_integer(value) and value > 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      value when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow schedule overlap_retry_ms exceeds maximum #{@max_exact_integer}"}
+
+      _ ->
+        {:error, "ERR flow schedule overlap_retry_ms must be a positive integer"}
     end
   end
 
   defp max_fires(kind, opts) when kind in [:interval, :cron] do
     case Keyword.get(opts, :max_fires) do
-      nil -> {:ok, nil}
-      value when is_integer(value) and value > 0 -> {:ok, value}
-      _ -> {:error, "ERR flow schedule max_fires must be a positive integer"}
+      nil ->
+        {:ok, nil}
+
+      value when is_integer(value) and value > 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      value when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow schedule max_fires exceeds maximum #{@max_exact_integer}"}
+
+      _ ->
+        {:error, "ERR flow schedule max_fires must be a positive integer"}
     end
   end
 
@@ -1166,7 +1395,7 @@ defmodule Ferricstore.Flow.Schedule do
   defp next_run_at_ms(%{kind: :delay}, due_at_ms), do: {:ok, due_at_ms}
 
   defp next_run_at_ms(%{kind: :interval, every_ms: every_ms}, due_at_ms),
-    do: {:ok, due_at_ms + every_ms}
+    do: safe_schedule_add(due_at_ms, every_ms, :next_run_at_ms)
 
   defp next_run_at_ms(%{kind: :cron, cron: expr} = definition, due_at_ms),
     do: next_cron_run_at_ms(expr, due_at_ms, Map.get(definition, :timezone, @default_timezone))
@@ -1333,19 +1562,29 @@ defmodule Ferricstore.Flow.Schedule do
 
   defp next_cron_run_at_ms(expr, after_ms, timezone) do
     with {:ok, cron} <- parse_cron(expr),
-         {:ok, _datetime} <- cron_datetime(0, timezone) do
+         {:ok, _datetime} <- cron_datetime(0, timezone),
+         {:ok, _after_datetime} <- cron_datetime(after_ms, timezone) do
       start_ms = div(max(after_ms + @minute_ms, 0), @minute_ms) * @minute_ms
 
       0..cron_search_minutes()
-      |> Enum.find_value(fn offset ->
+      |> Enum.reduce_while(nil, fn offset, nil ->
         candidate_ms = start_ms + offset * @minute_ms
 
-        with {:ok, datetime} <- cron_datetime(candidate_ms, timezone) do
-          if cron_match?(cron, datetime), do: {:ok, candidate_ms}
+        case cron_datetime(candidate_ms, timezone) do
+          {:ok, datetime} ->
+            if cron_match?(cron, datetime) do
+              {:halt, {:ok, candidate_ms}}
+            else
+              {:cont, nil}
+            end
+
+          {:error, _reason} = error ->
+            {:halt, error}
         end
       end)
       |> case do
         {:ok, value} -> {:ok, value}
+        {:error, _reason} = error -> error
         nil -> {:error, "ERR flow schedule cron has no matching time in search window"}
       end
     end
@@ -1470,11 +1709,15 @@ defmodule Ferricstore.Flow.Schedule do
   defp cron_range_order(_first, _last), do: {:error, "ERR flow schedule cron range is invalid"}
 
   defp cron_datetime(ms, timezone) do
-    datetime = DateTime.from_unix!(ms, :millisecond)
+    case DateTime.from_unix(ms, :millisecond) do
+      {:ok, datetime} ->
+        case DateTime.shift_zone(datetime, timezone, Tz.TimeZoneDatabase) do
+          {:ok, shifted} -> {:ok, shifted}
+          {:error, _reason} -> {:error, "ERR flow schedule timezone is invalid or unavailable"}
+        end
 
-    case DateTime.shift_zone(datetime, timezone, Tz.TimeZoneDatabase) do
-      {:ok, shifted} -> {:ok, shifted}
-      {:error, _reason} -> {:error, "ERR flow schedule timezone is invalid or unavailable"}
+      {:error, _reason} ->
+        {:error, "ERR flow schedule timestamp is outside supported calendar range"}
     end
   end
 
@@ -1555,6 +1798,12 @@ defmodule Ferricstore.Flow.Schedule do
   defp validate_id(id) when is_binary(id) and id != "", do: :ok
   defp validate_id(_id), do: {:error, "ERR flow schedule id must be a non-empty string"}
 
+  defp validate_opts(opts) do
+    if Keyword.keyword?(opts),
+      do: :ok,
+      else: {:error, "ERR flow schedule opts must be a keyword list"}
+  end
+
   defp required_binary(opts, key) do
     case Keyword.get(opts, key) do
       value when is_binary(value) and value != "" -> {:ok, value}
@@ -1572,19 +1821,40 @@ defmodule Ferricstore.Flow.Schedule do
 
   defp optional_non_neg_integer(opts, key, default) do
     case Keyword.get(opts, key, default) do
-      nil -> {:ok, nil}
-      value when is_integer(value) and value >= 0 -> {:ok, value}
-      _ -> {:error, "ERR flow schedule #{key} must be a non-negative integer"}
+      nil ->
+        {:ok, nil}
+
+      value when is_integer(value) and value >= 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      value when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow schedule #{key} exceeds maximum #{@max_exact_integer}"}
+
+      _ ->
+        {:error, "ERR flow schedule #{key} must be a non-negative integer"}
     end
   end
 
   defp optional_now_ms(opts) do
-    case Keyword.get(opts, :now_ms) do
-      nil -> {:ok, nil}
-      value when is_integer(value) and value >= 0 -> {:ok, value}
-      _ -> {:error, "ERR flow schedule now_ms must be a non-negative integer"}
+    case Keyword.get(opts, :now_ms, now_ms()) do
+      value when is_integer(value) and value >= 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      value when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow schedule now_ms exceeds maximum #{@max_exact_integer}"}
+
+      _ ->
+        {:error, "ERR flow schedule now_ms must be a non-negative integer"}
     end
   end
+
+  defp safe_schedule_add(left, right, _key)
+       when is_integer(left) and is_integer(right) and left >= 0 and right >= 0 and
+              left <= @max_exact_integer - right,
+       do: {:ok, left + right}
+
+  defp safe_schedule_add(_left, _right, key),
+    do: {:error, "ERR flow schedule #{key} exceeds maximum #{@max_exact_integer}"}
 
   defp optional_boolean(opts, key, default) do
     case Keyword.get(opts, key, default) do

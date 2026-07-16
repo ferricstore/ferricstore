@@ -57,7 +57,7 @@ defmodule Ferricstore.Store.BlobValue do
   Materializes an encoded blob ref when the side-channel is enabled.
 
   When the threshold is disabled, ref-shaped user bytes are ordinary values.
-  This keeps arbitrary 48-byte payloads from being misread as internal refs.
+  This keeps arbitrary 64-byte payloads from being misread as internal refs.
   """
   @spec maybe_materialize(binary(), non_neg_integer(), non_neg_integer(), term()) ::
           {:ok, term()} | {:error, term()}
@@ -121,14 +121,46 @@ defmodule Ferricstore.Store.BlobValue do
     Enum.map(values, &{:ok, &1})
   end
 
+  @doc false
+  def __load_materialize_results_for_test__(unique_refs, results),
+    do: load_materialize_results(unique_refs, results)
+
   defp load_materialize_refs(data_dir, shard_index, unique_refs) do
     refs = Enum.map(unique_refs, fn {_encoded_ref, ref} -> ref end)
     results = BlobStore.get_many(data_dir, shard_index, refs)
 
-    unique_refs
-    |> Enum.zip(results)
-    |> Map.new(fn {{encoded_ref, _ref}, result} ->
-      {encoded_ref, normalize_load_result(result)}
+    load_materialize_results(unique_refs, results)
+  end
+
+  defp load_materialize_results(unique_refs, results) when is_list(results) do
+    case put_materialize_results(unique_refs, results, %{}) do
+      {:ok, loaded_refs} -> loaded_refs
+      :mismatch -> materialize_result_mismatch(unique_refs)
+    end
+  end
+
+  defp load_materialize_results(unique_refs, _invalid),
+    do: materialize_result_mismatch(unique_refs)
+
+  defp put_materialize_results([], [], loaded_refs), do: {:ok, loaded_refs}
+
+  defp put_materialize_results(
+         [{encoded_ref, _ref} | unique_refs],
+         [result | results],
+         loaded_refs
+       ) do
+    put_materialize_results(
+      unique_refs,
+      results,
+      Map.put(loaded_refs, encoded_ref, normalize_load_result(result))
+    )
+  end
+
+  defp put_materialize_results(_unique_refs, _results, _loaded_refs), do: :mismatch
+
+  defp materialize_result_mismatch(unique_refs) do
+    Map.new(unique_refs, fn {encoded_ref, _ref} ->
+      {encoded_ref, {:error, :blob_batch_result_count_mismatch}}
     end)
   end
 

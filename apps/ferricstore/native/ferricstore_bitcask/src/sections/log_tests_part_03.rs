@@ -207,6 +207,25 @@
     }
 
     #[test]
+    fn pread_rejects_crc_valid_header_with_missing_zero_body() {
+        let dir = temp_dir();
+        let path = dir.path().join("missing_zero_body.log");
+        let mut header = [0u8; HEADER_SIZE];
+        header[20..22].copy_from_slice(&1u16.to_le_bytes());
+        header[22..26].copy_from_slice(&1u32.to_le_bytes());
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header[4..]);
+        hasher.update(&[0, 0]);
+        header[0..4].copy_from_slice(&hasher.finalize().to_le_bytes());
+        fs::write(&path, header).unwrap();
+
+        let file = File::open(&path).unwrap();
+        assert!(pread_record_from_file(&file, 0).is_err());
+        assert!(pread_value_for_key_from_file(&file, 0, &[0]).is_err());
+    }
+
+    #[test]
     fn keyed_pread_mismatch_ignores_corrupt_huge_value_size() {
         use std::os::unix::fs::FileExt;
 
@@ -822,3 +841,311 @@
         let w2 = LogWriter::open_small(&path, 99999).unwrap();
         assert_eq!(w2.file_id, 99999);
     }
+
+    struct PartialAppendFailsBackend {
+        bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl crate::io_backend::IoBackend for PartialAppendFailsBackend {
+        fn append(&mut self, data: &[u8]) -> io::Result<u64> {
+            let mut bytes = self.bytes.lock().unwrap();
+            let start = bytes.len();
+            bytes.extend_from_slice(data);
+            bytes.truncate(start);
+            Err(io::Error::other("forced partial append failure"))
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn offset(&self) -> u64 {
+            self.bytes.lock().unwrap().len() as u64
+        }
+
+        fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
+            self.bytes.lock().unwrap().truncate(offset as usize);
+            Ok(())
+        }
+
+        fn append_batch_and_sync(&mut self, _buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
+            Err(io::Error::other("unused batch operation"))
+        }
+    }
+
+    #[test]
+    fn nosync_batch_rolls_back_bytes_when_append_fails_after_partial_write() {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(b"seed".to_vec()));
+        let backend = PartialAppendFailsBackend {
+            bytes: std::sync::Arc::clone(&bytes),
+        };
+        let mut writer = LogWriter {
+            backend: Box::new(backend),
+            offset: 4,
+            file_id: 1,
+        };
+
+        let result = writer.write_batch_nosync(&[(b"key", b"value", 0)]);
+
+        assert!(result.is_err());
+        assert_eq!(&*bytes.lock().unwrap(), b"seed");
+        assert_eq!(writer.offset, 4);
+    }
+
+    struct AtomicAppendFailsAtActualEofBackend {
+        bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        rollback_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::io_backend::IoBackend for AtomicAppendFailsAtActualEofBackend {
+        fn append(&mut self, data: &[u8]) -> io::Result<u64> {
+            let mut bytes = self.bytes.lock().unwrap();
+            let actual_start = bytes.len() as u64;
+            bytes.extend_from_slice(data);
+            bytes.truncate(actual_start as usize);
+            self.offset
+                .store(actual_start, std::sync::atomic::Ordering::Release);
+            Err(io::Error::other("forced atomic append failure"))
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn offset(&self) -> u64 {
+            self.offset.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
+            self.rollback_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.bytes.lock().unwrap().truncate(offset as usize);
+            self.offset
+                .store(offset, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+
+        fn append_batch_and_sync(&mut self, _buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
+            Err(io::Error::other("unused batch operation"))
+        }
+    }
+
+    #[test]
+    fn nosync_batch_does_not_rollback_twice_to_a_stale_writer_offset() {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(b"seed-newer".to_vec()));
+        let offset = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4));
+        let rollback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = AtomicAppendFailsAtActualEofBackend {
+            bytes: std::sync::Arc::clone(&bytes),
+            offset: std::sync::Arc::clone(&offset),
+            rollback_calls: std::sync::Arc::clone(&rollback_calls),
+        };
+        let mut writer = LogWriter {
+            backend: Box::new(backend),
+            offset: 4,
+            file_id: 1,
+        };
+
+        let result = writer.write_batch_nosync(&[(b"key", b"value", 0)]);
+
+        assert!(result.is_err());
+        assert_eq!(&*bytes.lock().unwrap(), b"seed-newer");
+        assert_eq!(rollback_calls.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(writer.offset, b"seed-newer".len() as u64);
+    }
+
+    struct AppendThenSyncFailsBackend {
+        bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl crate::io_backend::IoBackend for AppendThenSyncFailsBackend {
+        fn append(&mut self, data: &[u8]) -> io::Result<u64> {
+            let mut bytes = self.bytes.lock().unwrap();
+            let offset = bytes.len() as u64;
+            bytes.extend_from_slice(data);
+            Ok(offset)
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            Err(io::Error::other("forced fsync failure"))
+        }
+
+        fn offset(&self) -> u64 {
+            self.bytes.lock().unwrap().len() as u64
+        }
+
+        fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
+            self.bytes.lock().unwrap().truncate(offset as usize);
+            Ok(())
+        }
+
+        fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
+            let start = self.bytes.lock().unwrap().len() as u64;
+            let mut offsets = Vec::with_capacity(buffers.len());
+
+            for buffer in buffers {
+                offsets.push(self.append(buffer)?);
+            }
+
+            match self.sync() {
+                Ok(()) => Ok(offsets),
+                Err(cause) => {
+                    self.rollback_to(start)?;
+                    Err(cause)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sync_mixed_batch_rolls_back_bytes_when_fsync_fails() {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(b"seed".to_vec()));
+        let backend = AppendThenSyncFailsBackend {
+            bytes: std::sync::Arc::clone(&bytes),
+        };
+        let mut writer = LogWriter {
+            backend: Box::new(backend),
+            offset: 4,
+            file_id: 1,
+        };
+
+        let result = writer.write_ops_batch(&[
+            BatchWrite::Put {
+                key: b"key",
+                value: b"value",
+                expire_at_ms: 0,
+            },
+            BatchWrite::Delete { key: b"gone" },
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(&*bytes.lock().unwrap(), b"seed");
+        assert_eq!(writer.offset, 4);
+    }
+#[cfg(unix)]
+#[test]
+fn log_reader_rejects_a_final_component_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("outside.log");
+    let link = dir.path().join("segment.log");
+    std::fs::write(&target, b"outside").unwrap();
+    symlink(&target, &link).unwrap();
+
+    assert!(LogReader::open(&link).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_copy_crc_failure_rolls_back_destination_append() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.log");
+    let destination_path = dir.path().join("destination.log");
+
+    let mut source_writer = LogWriter::open(&source_path, 1).unwrap();
+    let source_offset = source_writer.write(b"source", b"value", 0).unwrap();
+    source_writer.sync().unwrap();
+    drop(source_writer);
+    let source_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&source_path)
+        .unwrap();
+    source_file
+        .write_at(
+            b"X",
+            source_offset + HEADER_SIZE as u64 + b"source".len() as u64,
+        )
+        .unwrap();
+
+    let mut destination_writer = LogWriter::open(&destination_path, 2).unwrap();
+    destination_writer.write(b"prior", b"record", 0).unwrap();
+    destination_writer.sync().unwrap();
+    let original_len = std::fs::metadata(&destination_path).unwrap().len();
+
+    let error = copy_record_raw_from_file(
+        &source_file,
+        &mut destination_writer,
+        source_offset,
+        false,
+    )
+    .unwrap_err();
+
+    assert!(error.0.contains("CRC mismatch"));
+    assert_eq!(destination_writer.offset, original_len);
+    assert_eq!(std::fs::metadata(destination_path).unwrap().len(), original_len);
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_copy_returns_the_actual_offset_when_its_writer_cache_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source-stale.log");
+    let destination_path = dir.path().join("destination-stale.log");
+
+    let mut source_writer = LogWriter::open(&source_path, 1).unwrap();
+    let source_offset = source_writer.write(b"source", b"value", 0).unwrap();
+    source_writer.sync().unwrap();
+    let source_file = std::fs::File::open(&source_path).unwrap();
+
+    let mut stale_writer = LogWriter::open(&destination_path, 2).unwrap();
+    let mut concurrent_writer = LogWriter::open(&destination_path, 2).unwrap();
+    let prior_offset = concurrent_writer.write(b"prior", b"record", 0).unwrap();
+    concurrent_writer.sync().unwrap();
+    let expected_copy_offset = std::fs::metadata(&destination_path).unwrap().len();
+
+    let copied = copy_record_raw_from_file(
+        &source_file,
+        &mut stale_writer,
+        source_offset,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    stale_writer.sync().unwrap();
+
+    assert_eq!(copied.offset, expected_copy_offset);
+    let mut reader = LogReader::open(&destination_path).unwrap();
+    assert_eq!(reader.read_at(prior_offset).unwrap().unwrap().key, b"prior");
+    assert_eq!(reader.read_at(copied.offset).unwrap().unwrap().key, b"source");
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_copy_rejects_live_record_forged_into_tombstone() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("forged-source.log");
+    let destination_path = dir.path().join("forged-destination.log");
+    let mut source_writer = LogWriter::open(&source_path, 1).unwrap();
+    let source_offset = source_writer.write(b"live", b"value", 0).unwrap();
+    source_writer.sync().unwrap();
+    drop(source_writer);
+
+    let source_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&source_path)
+        .unwrap();
+    source_file
+        .write_at(&TOMBSTONE.to_le_bytes(), source_offset + 22)
+        .unwrap();
+    let mut destination_writer = LogWriter::open(&destination_path, 2).unwrap();
+
+    let error = copy_record_raw_from_file(
+        &source_file,
+        &mut destination_writer,
+        source_offset,
+        false,
+    )
+    .unwrap_err();
+
+    assert!(error.0.contains("CRC mismatch"));
+    assert_eq!(destination_writer.offset, 0);
+    assert_eq!(std::fs::metadata(destination_path).unwrap().len(), 0);
+}

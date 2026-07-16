@@ -1,4 +1,4 @@
-defmodule Ferricstore.Transaction.CrossShardRestartDurabilityTest do
+defmodule Ferricstore.Transaction.RestartDurabilityTest do
   use ExUnit.Case, async: false
 
   @moduletag :global_state
@@ -24,8 +24,8 @@ defmodule Ferricstore.Transaction.CrossShardRestartDurabilityTest do
     {:ok, isolated: isolated}
   end
 
-  test "cross-shard transaction survives SAVE and full app restart", %{isolated: isolated} do
-    keys = keys_on_different_shards(3)
+  test "single-shard transaction survives SAVE and full app restart", %{isolated: isolated} do
+    keys = same_shard_keys(3)
 
     assert [:ok, :ok, :ok] =
              Coordinator.execute(
@@ -41,17 +41,17 @@ defmodule Ferricstore.Transaction.CrossShardRestartDurabilityTest do
     Enum.each(keys, fn key ->
       ShardHelpers.eventually(
         fn -> Router.get(FerricStore.Instance.get(:default), key) == "tx-value:#{key}" end,
-        "cross-shard transaction key #{inspect(key)} should survive restart",
+        "transaction key #{inspect(key)} should survive restart",
         100,
         100
       )
     end)
   end
 
-  test "cross-shard transaction survives active-file rotation and full app restart", %{
+  test "single-shard transaction survives active-file rotation and full app restart", %{
     isolated: isolated
   } do
-    keys = keys_on_different_shards(2)
+    keys = same_shard_keys(2)
     large = String.duplicate("x", 4_096)
 
     assert [:ok, :ok] =
@@ -89,7 +89,7 @@ defmodule Ferricstore.Transaction.CrossShardRestartDurabilityTest do
 
       ShardHelpers.eventually(
         fn -> Router.get(FerricStore.Instance.get(:default), key) == expected end,
-        "rotated cross-shard key #{inspect(key)} should survive restart",
+        "rotated transaction key #{inspect(key)} should survive restart",
         100,
         100
       )
@@ -103,10 +103,9 @@ defmodule Ferricstore.Transaction.CrossShardRestartDurabilityTest do
     Ferricstore.Health.set_ready(true)
   end
 
-  defp keys_on_different_shards(count) do
-    FerricStore.Instance.get(:default).shard_count
-    |> min(count)
-    |> ShardHelpers.keys_on_different_shards()
+  defp same_shard_keys(count) do
+    tag = "tx-restart-#{System.unique_integer([:positive])}"
+    Enum.map(1..count, &"{#{tag}}:#{&1}")
   end
 
   defp log_file_count(shard) do

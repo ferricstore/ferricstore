@@ -386,9 +386,10 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
           assert extract_body(response) =~ "write"
         end
 
-        test "dashboard schedule POST enforces write access to the submitted schedule id" do
+        @tag :dashboard_schedule_acl_scope
+        test "dashboard schedule POST requires global write access for an id-only action" do
           Application.put_env(:ferricstore, :protected_mode, true)
-          denied_id = "tenant-b:schedule:#{System.unique_integer([:positive])}"
+          schedule_id = "tenant-a:schedule:#{System.unique_integer([:positive])}"
 
           :ok =
             FerricstoreServer.Acl.set_user("flow-schedule-writer", [
@@ -410,13 +411,13 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
             http_post_form(
               HealthEndpoint.port(),
               "/dashboard/flow/schedules",
-              %{"action" => "pause", "id" => denied_id},
+              %{"action" => "pause", "id" => schedule_id},
               [{"Cookie", dashboard_session_cookie(login)}]
             )
 
           assert extract_status_code(response) == 403
           assert extract_body(response) =~ "FLOW.SCHEDULE.PAUSE"
-          assert extract_body(response) =~ "%W~#{denied_id}"
+          assert extract_body(response) =~ "%W~*"
           assert extract_body(response) =~ "write"
         end
 

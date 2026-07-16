@@ -45,6 +45,8 @@ defmodule Ferricstore.TDigest.Core do
             buffer_size: 0,
             total_compressions: 0
 
+  @max_compression 1_000
+
   @type centroid :: {float(), float()}
   @type t :: %__MODULE__{
           compression: pos_integer(),
@@ -76,8 +78,16 @@ defmodule Ferricstore.TDigest.Core do
       %Ferricstore.TDigest.Core{compression: 200}
   """
   @spec new(pos_integer()) :: t()
-  def new(compression \\ 100) do
+  def new(compression \\ 100)
+
+  def new(compression)
+      when is_integer(compression) and compression > 0 and compression <= @max_compression do
     %__MODULE__{compression: compression}
+  end
+
+  def new(compression) do
+    raise ArgumentError,
+          "compression must be an integer between 1 and #{@max_compression}, got: #{inspect(compression)}"
   end
 
   @doc """
@@ -442,6 +452,8 @@ defmodule Ferricstore.TDigest.Core do
   def merge_many([], compression), do: new(compression)
 
   def merge_many(digests, compression) do
+    validate_compression!(compression)
+
     # Compress all digests first
     digests = Enum.map(digests, &ensure_compressed/1)
 
@@ -566,23 +578,22 @@ defmodule Ferricstore.TDigest.Core do
   defp merge_centroids(sorted, total_weight, compression) when total_weight > 0 do
     [{first_mean, first_weight} | rest] = sorted
 
-    {result, current_mean, current_weight, _weight_so_far} =
-      Enum.reduce(rest, {[], first_mean, first_weight, first_weight / 2.0}, fn
-        {mean, weight}, {acc, c_mean, c_weight, w_so_far} ->
+    {result, current_mean, current_weight, _weight_before} =
+      Enum.reduce(rest, {[], first_mean, first_weight, 0.0}, fn
+        {mean, weight}, {acc, c_mean, c_weight, weight_before} ->
           # Quantile position of the proposed merged centroid
           proposed_weight = c_weight + weight
-          q = (w_so_far + proposed_weight / 2.0) / total_weight
+          q = (weight_before + proposed_weight / 2.0) / total_weight
 
           max_w = max_weight(q, total_weight, compression)
 
           if proposed_weight <= max_w do
             # Merge into current centroid
             new_mean = (c_mean * c_weight + mean * weight) / proposed_weight
-            {acc, new_mean, proposed_weight, w_so_far}
+            {acc, new_mean, proposed_weight, weight_before}
           else
             # Start a new centroid
-            new_w_so_far = w_so_far + c_weight
-            {[{c_mean, c_weight} | acc], mean, weight, new_w_so_far + weight / 2.0}
+            {[{c_mean, c_weight} | acc], mean, weight, weight_before + c_weight}
           end
       end)
 
@@ -779,4 +790,13 @@ defmodule Ferricstore.TDigest.Core do
   end
 
   defp clamp(value, _min_val, _max_val), do: value
+
+  defp validate_compression!(compression)
+       when is_integer(compression) and compression > 0 and compression <= @max_compression,
+       do: :ok
+
+  defp validate_compression!(compression) do
+    raise ArgumentError,
+          "compression must be an integer between 1 and #{@max_compression}, got: #{inspect(compression)}"
+  end
 end

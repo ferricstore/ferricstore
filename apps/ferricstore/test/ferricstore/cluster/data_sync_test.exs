@@ -131,6 +131,41 @@ defmodule Ferricstore.Cluster.DataSyncTest do
              "large-payload"
   end
 
+  test "full shard copy removes target-only files from every storage tree" do
+    root =
+      Path.join(System.tmp_dir!(), "ferricstore_data_sync_#{System.unique_integer([:positive])}")
+
+    source = Path.join(root, "source")
+    target = Path.join(root, "target")
+    source_data = Ferricstore.DataDir.shard_data_path(source, 0)
+    source_dedicated = Path.join([source, "dedicated", "shard_0", "live"])
+    source_blob = Path.join([source, "blob", "shard_0", "live"])
+
+    stale_paths = [
+      Path.join([target, "data", "shard_0", "99999.log"]),
+      Path.join([target, "dedicated", "shard_0", "deleted", "00000.log"]),
+      Path.join([target, "blob", "shard_0", "deleted", "stale.blob"])
+    ]
+
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    File.mkdir_p!(source_data)
+    File.mkdir_p!(source_dedicated)
+    File.mkdir_p!(source_blob)
+    File.write!(Path.join(source_data, "00000.log"), "current")
+    File.write!(Path.join(source_dedicated, "00000.log"), "current")
+    File.write!(Path.join(source_blob, "current.blob"), "current")
+
+    Enum.each(stale_paths, fn path ->
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, "stale")
+    end)
+
+    assert :ok = DataSync.copy_shard_storage_from(node(), source, node(), target, 0)
+    refute Enum.any?(stale_paths, &File.exists?/1)
+    assert File.read!(Path.join([target, "data", "shard_0", "00000.log"])) == "current"
+  end
+
   test "blob side-channel files force full resync instead of WAL-only bridge" do
     assert :needs_resync =
              DataSync.__maybe_require_blob_resync_for_test__(:wal_bridgeable, {:ok, true})
@@ -174,6 +209,23 @@ defmodule Ferricstore.Cluster.DataSyncTest do
 
     assert {:error, {:pause_shard_failed, _reason}} =
              DataSync.__pause_shard_for_test__(missing_node, :missing_shard)
+  end
+
+  test "leader discovery fails closed when membership is unavailable" do
+    members = fn _shard_index, _timeout -> {:error, :no_quorum} end
+
+    assert {:error, {:leader_unavailable, :no_quorum}} = DataSync.find_leader_for(0, members)
+  end
+
+  test "zero retry budget performs no sync attempt" do
+    assert {:error, :not_attempted} = DataSync.retry_sync_shard(0, node(), %{}, 0)
+  end
+
+  test "target keydir rebuild failures are returned to the sync coordinator" do
+    missing_node = :"missing_keydir_rebuild_node@127.0.0.1"
+
+    assert {:error, {:target_keydir_rebuild_failed, ^missing_node, %{0 => _reason}}} =
+             DataSync.rebuild_keydirs_on_target(missing_node, 1)
   end
 
   test "partial cleanup removes target shard data, dedicated data, and blob data" do

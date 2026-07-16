@@ -63,23 +63,20 @@ defmodule Ferricstore.Store.DirectTombstoneBatchGuardTest do
     refute body =~ "NIF.v2_append_tombstone"
   end
 
-  test "expiry sweep batches shared tombstones" do
+  test "expiry sweep submits one conditional replicated batch" do
     source = File.read!(@lifecycle_path)
+    body = function_body(source, "expire_replicated_entries")
 
-    assert source =~ "defp expire_shared_keys"
-
-    body = function_body(source, "expire_shared_keys")
-
-    assert body =~ "append_tombstone_batch_sync"
-    refute body =~ "NIF.v2_append_tombstone"
+    assert body =~ "Router.expire_if_batch"
+    refute body =~ "append_tombstone_batch_sync"
   end
 
-  test "expiry sweep batches promoted tombstones by dedicated path" do
+  test "standalone expiry exact-deletes only the observed row" do
     source = File.read!(@lifecycle_path)
-    body = function_body(source, "expire_promoted_key_group")
+    body = function_body(source, "expire_direct_entries")
 
-    assert body =~ "promoted_tombstone_batch"
-    refute body =~ "NIF.v2_append_tombstone"
+    assert body =~ "ShardETS.delete_exact_entry"
+    refute body =~ "ets_delete_key"
   end
 
   defp function_body(source, function) do

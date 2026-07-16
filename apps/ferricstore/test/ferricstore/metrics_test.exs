@@ -534,6 +534,69 @@ defmodule Ferricstore.MetricsTest do
                ~s(ferricstore_prefix_key_count{prefix="#{prefix}"} 1)
              )
     end
+
+    test "bounds per-prefix metric cardinality and aggregates overflow" do
+      PrefixMetricsCache.reset()
+      base = "metrics_cardinality_#{System.unique_integer([:positive])}"
+
+      rows =
+        for index <- 1..1_005 do
+          key = "#{base}_#{index}:key"
+          {key, "value", 0, 0, 0, 0, 5}
+        end
+
+      :ets.insert(:keydir_0, rows)
+
+      on_exit(fn ->
+        Enum.each(rows, fn {key, _, _, _, _, _, _} -> :ets.delete(:keydir_0, key) end)
+        PrefixMetricsCache.reset()
+      end)
+
+      assert :ok = PrefixMetricsCache.refresh_now()
+      text = Metrics.handle("FERRICSTORE.METRICS", [])
+
+      assert length(Regex.scan(~r/^ferricstore_prefix_key_count\{/m, text)) <= 1_000
+
+      assert [_, other_count] =
+               Regex.run(
+                 ~r/^ferricstore_prefix_key_count\{prefix="_other"\} (\d+)$/m,
+                 text
+               )
+
+      assert String.to_integer(other_count) >= 6
+    end
+
+    test "bounds long prefix labels and survives binary keys" do
+      PrefixMetricsCache.reset()
+      long_prefix = :binary.copy("p", 4_096)
+      long_key = long_prefix <> ":key"
+      binary_key = <<255, 254, ?:, ?k, ?e, ?y>>
+
+      :ets.insert(:keydir_0, [
+        {long_key, "value", 0, 0, 0, 0, 5},
+        {binary_key, "value", 0, 0, 0, 0, 5}
+      ])
+
+      on_exit(fn ->
+        :ets.delete(:keydir_0, long_key)
+        :ets.delete(:keydir_0, binary_key)
+        PrefixMetricsCache.reset()
+      end)
+
+      assert :ok = PrefixMetricsCache.refresh_now()
+      text = Metrics.handle("FERRICSTORE.METRICS", [])
+
+      labels =
+        Regex.scan(~r/^ferricstore_prefix_key_count\{prefix="([^"]*)"\}/m, text,
+          capture: :all_but_first
+        )
+        |> List.flatten()
+
+      assert Enum.any?(labels, &String.starts_with?(&1, "_long_4096_"))
+      assert Enum.any?(labels, &String.starts_with?(&1, "_binary_2_"))
+      assert Enum.all?(labels, &(String.valid?(&1) and byte_size(&1) <= 256))
+      refute text =~ long_prefix
+    end
   end
 
   # ---------------------------------------------------------------------------

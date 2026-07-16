@@ -6,10 +6,11 @@ defmodule Ferricstore.Commands.Server.Info do
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Stats
   alias Ferricstore.Store.Ops
+  alias Ferricstore.Store.ReadResult
 
   @last_save_key {Ferricstore.Commands.Server, :last_save_unix_seconds}
 
-  @all_sections [
+  @default_sections [
     "server",
     "clients",
     "memory",
@@ -21,35 +22,43 @@ defmodule Ferricstore.Commands.Server.Info do
     "namespace_config",
     "raft",
     "bitcask",
-    "ferricstore",
-    "keydir_analysis"
+    "ferricstore"
   ]
+  @all_sections @default_sections ++ ["keydir_analysis"]
 
-  # Read shard_count from persistent_term (set by application.ex) with
-  # Application.get_env fallback for early startup / test environments.
-  defp shard_count do
-    try do
-      FerricStore.Instance.get(:default).shard_count
-    rescue
-      ArgumentError ->
-        Application.get_env(:ferricstore, :shard_count, 4)
+  defp shard_count(%FerricStore.Instance{shard_count: count})
+       when is_integer(count) and count > 0,
+       do: count
+
+  defp shard_count(_ctx), do: Application.get_env(:ferricstore, :shard_count, 4)
+
+  def info_string(section, store) when section in ["all", "everything"] do
+    @default_sections
+    |> Enum.reduce_while({:ok, []}, fn name, {:ok, sections} ->
+      case build_section(name, store) do
+        {:error, {:storage_read_failed, _reason}} = failure -> {:halt, failure}
+        section -> {:cont, {:ok, [section | sections]}}
+      end
+    end)
+    |> case do
+      {:ok, sections} -> sections |> Enum.reverse() |> Enum.join("\r\n")
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
     end
   end
 
-  def info_string(section, store) when section in ["all", "everything"] do
-    Enum.map_join(@all_sections, "\r\n", fn s -> build_section(s, store) end)
-  end
-
   def info_string(section, store) when section in @all_sections do
-    build_section(section, store)
+    case build_section(section, store) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      result -> result
+    end
   end
 
   def info_string(_unknown, _store) do
     ""
   end
 
-  defp build_section("server", _store) do
-    ctx = default_instance_ctx()
+  defp build_section("server", store) do
+    ctx = instance_ctx(store)
     info = if ctx && ctx.server_info_fn, do: ctx.server_info_fn.(), else: %{}
     native_port = Map.get(info, :native_port, 0)
     protocol = Map.get(info, :protocol, "embedded")
@@ -79,8 +88,8 @@ defmodule Ferricstore.Commands.Server.Info do
     format_section("Server", fields)
   end
 
-  defp build_section("clients", _store) do
-    ctx = default_instance_ctx()
+  defp build_section("clients", store) do
+    ctx = instance_ctx(store)
     connected = if ctx && ctx.connected_clients_fn, do: ctx.connected_clients_fn.(), else: 0
 
     blocked = safe_ets_size(:ferricstore_waiters)
@@ -98,16 +107,17 @@ defmodule Ferricstore.Commands.Server.Info do
     format_section("Clients", fields)
   end
 
-  defp build_section("memory", _store) do
+  defp build_section("memory", store) do
     total = :erlang.memory(:total)
     process_mem = :erlang.memory(:processes)
-    shard_count = shard_count()
+    ctx = instance_ctx(store)
+    shard_count = shard_count(ctx)
 
     # Sum ETS memory across keydir tables per shard.
     keydir_bytes =
       Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
         try do
-          case :ets.info(:"keydir_#{i}", :memory) do
+          case :ets.info(keydir_table(ctx, i), :memory) do
             words when is_integer(words) ->
               acc + words * :erlang.system_info(:wordsize)
 
@@ -146,26 +156,25 @@ defmodule Ferricstore.Commands.Server.Info do
   end
 
   defp build_section("keyspace", store) do
-    key_count = Ops.dbsize(store)
+    case Ops.dbsize(store) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
 
-    ctx =
-      try do
-        FerricStore.Instance.get(:default)
-      rescue
-        _ -> nil
-      end
+      key_count ->
+        ctx = instance_ctx(store)
 
-    {expires, avg_ttl} = if ctx, do: compute_expiry_stats(ctx), else: {0, 0}
+        {expires, avg_ttl} = if ctx, do: compute_expiry_stats(ctx), else: {0, 0}
 
-    fields = [
-      {"db0", "keys=#{key_count},expires=#{expires},avg_ttl=#{avg_ttl}"}
-    ]
+        fields = [
+          {"db0", "keys=#{key_count},expires=#{expires},avg_ttl=#{avg_ttl}"}
+        ]
 
-    format_section("Keyspace", fields)
+        format_section("Keyspace", fields)
+    end
   end
 
-  defp build_section("stats", _store) do
-    rate = read_sample_rate()
+  defp build_section("stats", store) do
+    rate = read_sample_rate(instance_ctx(store))
     hot_sampled = Stats.total_hot_reads()
     cold_sampled = Stats.total_cold_reads()
     hits_sampled = Stats.keyspace_hits()
@@ -263,8 +272,8 @@ defmodule Ferricstore.Commands.Server.Info do
   # INFO raft -- per-shard Raft state
   # ---------------------------------------------------------------------------
 
-  defp build_section("raft", _store) do
-    shard_count = shard_count()
+  defp build_section("raft", store) do
+    shard_count = store |> instance_ctx() |> shard_count()
 
     fields =
       Enum.flat_map(0..(shard_count - 1), fn i ->
@@ -332,10 +341,10 @@ defmodule Ferricstore.Commands.Server.Info do
   # INFO bitcask -- per-shard storage stats
   # ---------------------------------------------------------------------------
 
-  defp build_section("bitcask", _store) do
-    shard_count = shard_count()
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    instance_ctx = default_instance_ctx()
+  defp build_section("bitcask", store) do
+    instance_ctx = instance_ctx(store)
+    shard_count = shard_count(instance_ctx)
+    data_dir = instance_data_dir(instance_ctx)
 
     fields =
       Enum.flat_map(0..(shard_count - 1), fn i ->
@@ -491,8 +500,8 @@ defmodule Ferricstore.Commands.Server.Info do
   # INFO ferricstore -- aggregate native metrics
   # ---------------------------------------------------------------------------
 
-  defp build_section("ferricstore", _store) do
-    shard_count = shard_count()
+  defp build_section("ferricstore", store) do
+    shard_count = store |> instance_ctx() |> shard_count()
 
     raft_committed =
       Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
@@ -531,13 +540,14 @@ defmodule Ferricstore.Commands.Server.Info do
   # INFO keydir_analysis -- per-prefix keydir breakdown
   # ---------------------------------------------------------------------------
 
-  defp build_section("keydir_analysis", _store) do
-    shard_count = shard_count()
+  defp build_section("keydir_analysis", store) do
+    ctx = instance_ctx(store)
+    shard_count = shard_count(ctx)
 
     # Collect all keys from all keydir ETS tables and group by prefix
     prefix_data =
       Enum.reduce(0..(shard_count - 1), %{}, fn i, acc ->
-        table = :"keydir_#{i}"
+        table = keydir_table(ctx, i)
 
         try do
           :ets.foldl(
@@ -652,6 +662,22 @@ defmodule Ferricstore.Commands.Server.Info do
     _, _ -> nil
   end
 
+  defp instance_ctx(%FerricStore.Instance{} = ctx), do: ctx
+  defp instance_ctx(%{__instance_ctx__: %FerricStore.Instance{} = ctx}), do: ctx
+  defp instance_ctx(%{instance_ctx: %FerricStore.Instance{} = ctx}), do: ctx
+  defp instance_ctx(_store), do: default_instance_ctx()
+
+  defp instance_data_dir(%FerricStore.Instance{data_dir: data_dir}) when is_binary(data_dir),
+    do: data_dir
+
+  defp instance_data_dir(_ctx), do: Application.get_env(:ferricstore, :data_dir, "data")
+
+  defp keydir_table(%FerricStore.Instance{keydir_refs: refs}, shard_index)
+       when is_tuple(refs) and shard_index < tuple_size(refs),
+       do: elem(refs, shard_index)
+
+  defp keydir_table(_ctx, shard_index), do: :"keydir_#{shard_index}"
+
   defp atomic_metric(%FerricStore.Instance{} = ctx, field, shard_index) do
     case Map.get(ctx, field) do
       ref when is_reference(ref) ->
@@ -676,13 +702,13 @@ defmodule Ferricstore.Commands.Server.Info do
   # and samples up to 20 keys per shard for avg_ttl.
   defp compute_expiry_stats(ctx) do
     now = HLC.now_ms()
-    count_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [true]}]
-    sample_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [:"$1"]}]
+    count_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", now}], [true]}]
+    sample_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", now}], [:"$1"]}]
 
     {total_expires, ttl_samples} =
       for i <- 0..(ctx.shard_count - 1), reduce: {0, []} do
         {exp_acc, ttl_acc} ->
-          keydir = elem(ctx.keydir_refs, i)
+          keydir = keydir_table(ctx, i)
 
           try do
             count = :ets.select_count(keydir, count_spec)
@@ -724,11 +750,33 @@ defmodule Ferricstore.Commands.Server.Info do
   end
 
   defp format_section(header, fields) do
-    lines = Enum.map(fields, fn {k, v} -> [k, ":", v] end)
+    lines =
+      Enum.map(fields, fn {key, value} ->
+        [escape_info_key(key), ":", escape_info_value(value)]
+      end)
 
     ["# ", header, "\r\n", Enum.intersperse(lines, "\r\n"), "\r\n"]
     |> IO.iodata_to_binary()
   end
+
+  defp escape_info_key(key) when is_binary(key) do
+    for <<byte <- key>>, into: "" do
+      if info_key_byte?(byte), do: <<byte>>, else: percent_encode(byte)
+    end
+  end
+
+  defp escape_info_value(value) when is_binary(value) do
+    for <<byte <- value>>, into: "" do
+      if byte in [13, 10], do: percent_encode(byte), else: <<byte>>
+    end
+  end
+
+  defp info_key_byte?(byte),
+    do:
+      byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or
+        byte in [?_, ?-, ?.]
+
+  defp percent_encode(byte), do: "%" <> Base.encode16(<<byte>>, case: :upper)
 
   defp safe_ets_size(table) do
     case :ets.info(table, :size) do
@@ -743,11 +791,10 @@ defmodule Ferricstore.Commands.Server.Info do
     :erlang.float_to_binary(val, [{:decimals, 2}])
   end
 
-  defp read_sample_rate do
-    FerricStore.Instance.get(:default).read_sample_rate
-  rescue
-    ArgumentError -> 100
-  end
+  defp read_sample_rate(%FerricStore.Instance{read_sample_rate: rate}) when is_integer(rate),
+    do: rate
+
+  defp read_sample_rate(_ctx), do: 100
 
   defp format_bytes(bytes) when bytes < 1024, do: "#{bytes}B"
 

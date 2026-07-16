@@ -6,10 +6,10 @@
 ///
 /// ## Scheduler contract
 ///
-/// Runs on a Normal scheduler only long enough to copy BEAM binaries into
-/// owned memory. CRC/record encoding and file write + fsync run on a Tokio
-/// blocking worker.
-#[rustler::nif(schedule = "Normal")]
+/// Runs on a dirty CPU scheduler while decoding and copying the unbounded
+/// batch. CRC/record encoding and file write + fsync run on a Tokio blocking
+/// worker.
+#[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_batch_async<'a>(
     env: Env<'a>,
@@ -21,7 +21,7 @@ fn v2_append_batch_async<'a>(
     // Step 1: Copy BEAM binaries into owned Vecs before spawning to Tokio
     // because Binary<'a> borrows from the NIF env which is destroyed when
     // this function returns. Validation and record encoding happen in the
-    // blocking worker below so large batches do not burn BEAM scheduler time.
+    // blocking worker below so large batches do not burn normal BEAM scheduler time.
     let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = records
         .iter()
         .map(|(k, v, exp)| (k.as_slice().to_vec(), v.as_slice().to_vec(), *exp))
@@ -29,56 +29,32 @@ fn v2_append_batch_async<'a>(
 
     let owned_path = path;
 
+    let blocking_task = match async_io::try_spawn_blocking(move || {
+        let p = std::path::Path::new(&owned_path);
+        let file_id = parse_file_id(p);
+
+        match log::LogWriter::open(p, file_id) {
+            Ok(mut writer) => {
+                let batch: Vec<(&[u8], &[u8], u64)> = entries
+                    .iter()
+                    .map(|(key, value, expire_at_ms)| {
+                        (key.as_slice(), value.as_slice(), *expire_at_ms)
+                    })
+                    .collect();
+
+                writer.write_batch(&batch).map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
     // Step 2: Spawn CPU encoding + IO to Tokio blocking thread pool — BEAM
     // scheduler returns immediately.
     async_io::runtime().spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let p = std::path::Path::new(&owned_path);
-            let file_id = parse_file_id(p);
-
-            for (key, value, _) in &entries {
-                log::validate_kv_sizes(key, value).map_err(|e| e.to_string())?;
-            }
-
-            match log::LogWriter::open(p, file_id) {
-                Ok(mut writer) => {
-                    let mut offsets = Vec::with_capacity(entries.len());
-                    let mut value_sizes = Vec::with_capacity(entries.len());
-                    let mut write_err: Option<String> = None;
-                    for (key, value, expire_at_ms) in &entries {
-                        let buf = log::encode_record(key, value, *expire_at_ms);
-                        match writer.write_raw(&buf) {
-                            Ok(off) => {
-                                offsets.push(off);
-                                value_sizes.push(value.len());
-                            }
-                            Err(e) => {
-                                write_err = Some(e.to_string());
-                                offsets.clear();
-                                value_sizes.clear();
-                                break;
-                            }
-                        }
-                    }
-                    if write_err.is_none() {
-                        match writer.sync() {
-                            Ok(()) => {
-                                let locations: Vec<(u64, usize)> = offsets
-                                    .into_iter()
-                                    .zip(value_sizes.iter())
-                                    .map(|(off, &vs)| (off, vs))
-                                    .collect();
-                                Ok(locations)
-                            }
-                            Err(e) => Err(e.to_string()),
-                        }
-                    } else {
-                        Err(write_err.unwrap_or_else(|| "write failed".to_string()))
-                    }
-                }
-                Err(e) => Err(e.to_string()),
-            }
-        })
+        let result = blocking_task
         .await
         .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
@@ -295,6 +271,25 @@ mod audit_fix_tests {
     }
 
     #[test]
+    fn value_ref_validation_rejects_crc_valid_header_with_missing_zero_body() {
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+        let mut header = [0u8; log::HEADER_SIZE];
+        header[20..22].copy_from_slice(&1u16.to_le_bytes());
+        header[22..26].copy_from_slice(&1u32.to_le_bytes());
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header[4..]);
+        hasher.update(&[0, 0]);
+        header[0..4].copy_from_slice(&hasher.finalize().to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let err = validate_value_ref_from_file(&file, 0, &[0], 1).unwrap_err();
+        assert!(err.contains("short read"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn open_small_1000_sequential_writes_no_corruption() {
         let dir = tmp();
         let path = dir.path().join("00000000000000000001.log");
@@ -368,6 +363,28 @@ mod audit_fix_tests {
 
         assert!(matches!(values[0], BatchReadValue::Error(_)));
         assert_eq!(values[1].as_deref(), Some(&b"value"[..]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grouped_batch_pread_does_not_misclassify_symlink_rejection_as_missing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tmp();
+        let target = dir.path().join("00000000000000000001.log");
+        let link = dir.path().join("00000000000000000002.log");
+        std::fs::write(&target, b"protected").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let values = pread_batch_grouped(vec![(link.to_string_lossy().into_owned(), 0)]).unwrap();
+
+        let BatchReadValue::Error(reason) = &values[0] else {
+            panic!("symlink rejection must be reported as an error");
+        };
+        assert!(
+            !reason.contains("missing_file"),
+            "only ENOENT may be classified as missing_file: {reason}"
+        );
     }
 
     #[test]
@@ -587,6 +604,108 @@ mod audit_fix_tests {
     }
 
     #[test]
+    fn tombstone_scan_rejects_values_above_the_bitcask_limit_before_streaming() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        let offset = writer.write(b"oversized", b"small", 0).unwrap();
+        writer.sync().unwrap();
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_at(&(512_u32 * 1024 * 1024 + 1).to_le_bytes(), offset + 22)
+            .unwrap();
+        file.sync_data().unwrap();
+
+        let err = scan_tombstones_from_path(&path).unwrap_err();
+        assert!(
+            err.contains("value too large in log record"),
+            "scanner must enforce the normal Bitcask value ceiling, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn tombstone_scan_page_counts_physical_records_and_reports_exact_cursor() {
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        writer.write(b"live-1", b"value-1", 11).unwrap();
+        writer.write_tombstone(b"deleted-1").unwrap();
+        let second_page_offset = writer.write(b"live-2", b"value-2", 22).unwrap();
+        writer.write_tombstone(b"deleted-2").unwrap();
+        writer.sync().unwrap();
+
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        let (first, first_cursor, first_done) =
+            scan_tombstones_page_from_path(&path, 0, 2).unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].key, b"deleted-1");
+        assert_eq!(first_cursor, second_page_offset);
+        assert!(!first_done);
+
+        let (second, second_cursor, second_done) =
+            scan_tombstones_page_from_path(&path, first_cursor, 2).unwrap();
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].key, b"deleted-2");
+        assert_eq!(second_cursor, file_len);
+        assert!(second_done);
+
+        let (eof, eof_cursor, eof_done) =
+            scan_tombstones_page_from_path(&path, second_cursor, 2).unwrap();
+        assert!(eof.is_empty());
+        assert_eq!(eof_cursor, file_len);
+        assert!(eof_done);
+    }
+
+    #[test]
+    fn tombstone_scan_page_rejects_invalid_bounds() {
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        writer.write_tombstone(b"deleted").unwrap();
+        writer.sync().unwrap();
+
+        assert!(scan_tombstones_page_from_path(&path, 0, 0)
+            .unwrap_err()
+            .contains("max_records must be positive"));
+        assert!(scan_tombstones_page_from_path(&path, 0, 65_537)
+            .unwrap_err()
+            .contains("max_records exceeds maximum 65536"));
+
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert!(scan_tombstones_page_from_path(&path, file_len + 1, 1)
+            .unwrap_err()
+            .contains("exceeds file length"));
+    }
+
+    #[test]
+    fn tombstone_scan_page_rejects_corrupt_live_record_without_partial_results() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        writer.write_tombstone(b"deleted").unwrap();
+        let corrupt = writer.write(b"live", b"value", 0).unwrap();
+        writer.sync().unwrap();
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let corrupt_value_byte = corrupt + log::HEADER_SIZE as u64 + b"live".len() as u64;
+        file.write_at(b"X", corrupt_value_byte).unwrap();
+        file.sync_data().unwrap();
+
+        let err = scan_tombstones_page_from_path(&path, 0, 2).unwrap_err();
+        assert!(err.contains("CRC mismatch"));
+    }
+
+    #[test]
     fn key_state_scan_returns_latest_masked_state_without_values() {
         let dir = tmp();
         let path = dir.path().join("00000000000000000001.log");
@@ -645,6 +764,29 @@ mod audit_fix_tests {
         .unwrap_err();
 
         assert!(err.contains("unexpected EOF in value"));
+    }
+
+    #[test]
+    fn key_state_scan_rejects_values_above_the_bitcask_limit_before_streaming() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tmp();
+        let path = dir.path().join("00000000000000000001.log");
+
+        let mut writer = log::LogWriter::open(&path, 1).unwrap();
+        let offset = writer.write(b"oversized", b"small", 0).unwrap();
+        writer.sync().unwrap();
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_at(&(512_u32 * 1024 * 1024 + 1).to_le_bytes(), offset + 22)
+            .unwrap();
+        file.sync_data().unwrap();
+
+        let err = scan_key_states_from_path(&path, &[b"oversized".to_vec()]).unwrap_err();
+        assert!(
+            err.contains("value too large in log record"),
+            "scanner must enforce the normal Bitcask value ceiling, got {err:?}"
+        );
     }
 
     #[test]
@@ -763,35 +905,46 @@ mod audit_fix_tests {
         assert!(err.contains("duplicate"));
     }
 
-    // ------------------------------------------------------------------
-    // M-REMAIN-1: OwnedBinary OOM path exists (code structure test)
-    // ------------------------------------------------------------------
-
-    // Note: We cannot reliably trigger OOM in a unit test. We verify the
-    // code structure by confirming that the old `.unwrap()` calls have been
-    // replaced. The grep-based verification in the global audit section
-    // confirms no `.unwrap()` remains on OwnedBinary::new in production paths.
-
     #[test]
-    fn v2_scan_and_read_hint_have_no_unwrap_on_owned_binary() {
-        // This is a structural test: read the source and verify the fix is in place.
-        // The actual OOM path returns {:error, "out of memory allocating key binary"}.
-        // We just verify the functions compile and work for normal cases.
+    fn lmdb_cache_rejects_a_conflicting_map_size() {
         let dir = tmp();
-        let path = dir.path().join("00000000000000000001.log");
+        let path = dir.path().join("lmdb");
+        let path = path.to_string_lossy();
+        let initial_size = 4 * 1024 * 1024;
 
-        // Write a test record
-        {
-            let mut writer = log::LogWriter::open(&path, 1).unwrap();
-            writer.write(b"scankey", b"scanval", 0).unwrap();
-            writer.sync().unwrap();
-        }
+        let store = lmdb_store(path.as_ref(), initial_size).unwrap();
+        let error = match lmdb_store(path.as_ref(), initial_size * 2) {
+            Ok(_) => panic!("conflicting map size silently reused the cached environment"),
+            Err(error) => error,
+        };
 
-        // Verify we can read it via LogReader (same path as v2_scan_file)
-        let mut reader = log::LogReader::open(&path).unwrap();
-        let records = reader.iter_from_start_tolerant().unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(&records[0].key, b"scankey");
+        assert!(
+            error.contains("map_size mismatch"),
+            "conflicting map size must not silently reuse the cached environment: {error}"
+        );
+        drop(store);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lmdb_store_rejects_a_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tmp();
+        let outside = dir.path().join("outside");
+        let redirected = dir.path().join("redirected");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, &redirected).unwrap();
+        let path = redirected.join("lmdb");
+        let path_string = path.to_string_lossy();
+
+        let error = match lmdb_store(path_string.as_ref(), 4 * 1024 * 1024) {
+            Ok(_) => panic!("LMDB path followed a symlinked parent"),
+            Err(error) => error,
+        };
+
+        assert!(!error.is_empty());
+        assert!(!outside.join("lmdb").exists());
     }
 
     // ------------------------------------------------------------------

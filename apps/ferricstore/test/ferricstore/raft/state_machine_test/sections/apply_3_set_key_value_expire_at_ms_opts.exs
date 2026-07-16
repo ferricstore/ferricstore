@@ -10,6 +10,26 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 
       describe "apply/3 with {:set, key, value, expire_at_ms, opts}" do
+        @tag :flow_owned_key_locality
+        test "Flow-owned SET rejects an owner in another hash slot", %{state: state, ets: ets} do
+          key = "{owned-value}:effect"
+
+          owner = %{
+            id: "owner",
+            partition_key: "owner-partition",
+            state_key: "{owner-flow}:state",
+            expected_guard: "guard"
+          }
+
+          command =
+            {:set, key, "value", 0, set_opts(%{flow_retention_owner: owner})}
+
+          assert {_new_state, {:error, "CROSSSLOT Flow-owned keys must hash to the owner shard"}} =
+                   StateMachine.apply(%{}, command, state)
+
+          assert [] = :ets.lookup(ets, key)
+        end
+
         test "SET NX treats a cold keydir entry as existing without warming it", %{
           state: state,
           ets: ets,
@@ -143,7 +163,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           ets: ets
         } do
           key = "set_blob_ref_nx_skip_invalid_ref"
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           :ets.insert(
             ets,
@@ -240,7 +260,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           ets: ets
         } do
           key = "getset_blob_ref_invalid"
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           :ets.insert(
             ets,
@@ -282,7 +302,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           ets: ets
         } do
           key = "append_blob_ref_invalid"
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           :ets.insert(
             ets,
@@ -324,7 +344,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           ets: ets
         } do
           key = "setrange_blob_ref_invalid"
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           :ets.insert(
             ets,
@@ -415,7 +435,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           ets: ets
         } do
           key = "cas_blob_ref_mismatch"
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           :ets.insert(
             ets,
@@ -434,7 +454,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           ets: ets
         } do
           key = "cas_blob_ref_invalid"
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           :ets.insert(
             ets,
@@ -472,7 +492,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           ets: ets
         } do
           compound_key = CompoundKey.hash_field("blob_hash_invalid", "field")
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           :ets.insert(
             ets,
@@ -523,7 +543,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           key = "locked_blob_ref_wrong_owner"
           owner_ref = make_ref()
           apply_now = System.os_time(:millisecond)
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           :ets.insert(
             ets,
@@ -555,7 +575,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           key = "locked_blob_ref_invalid"
           owner_ref = make_ref()
           apply_now = System.os_time(:millisecond)
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           :ets.insert(
             ets,
@@ -745,6 +765,132 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
                    :ets.lookup(ets, large_field)
         end
 
+        @tag :promoted_blob_batch
+        test "promoted compound blob batch exposes materialized values to later commands", %{
+          state: state,
+          ets: ets,
+          shard_index: shard_index
+        } do
+          redis_key = "promoted_blob_hash_batch"
+          field_name = "counter"
+          field = CompoundKey.hash_field(redis_key, field_name)
+          marker = Promotion.marker_key(redis_key)
+
+          dedicated_path =
+            Promotion.dedicated_path(state.data_dir, shard_index, :hash, redis_key)
+
+          File.mkdir_p!(dedicated_path)
+          File.touch!(Path.join(dedicated_path, "00000.log"))
+          :ets.insert(ets, {marker, "hash", 0, LFU.initial(), 0, 0, 4})
+
+          assert {:ok, ref} = BlobStore.put(state.data_dir, shard_index, "1")
+          encoded_ref = BlobRef.encode!(ref)
+
+          promoted_state = %{
+            state
+            | promoted_instances: %{redis_key => %{path: dedicated_path}}
+          }
+
+          {_new_state, result} =
+            StateMachine.apply(
+              %{},
+              {:batch,
+               [
+                 {:compound_blob_batch_put, redis_key, [{field, encoded_ref, 0, :blob_ref}]},
+                 {:hincrby, redis_key, field_name, 1}
+               ]},
+              promoted_state
+            )
+
+          assert {:ok, [:ok, 2]} == result
+          assert [{^field, "2", 0, _lfu, _fid, _off, 1}] = :ets.lookup(ets, field)
+        end
+
+        @tag :promoted_blob_batch
+        test "promoted compound blob batches reject mixed append targets", %{
+          state: state,
+          ets: ets,
+          shard_index: shard_index
+        } do
+          redis_key = "promoted_blob_mixed_targets"
+          marker = Promotion.marker_key(redis_key)
+          field = CompoundKey.hash_field(redis_key, "field")
+
+          dedicated_path =
+            Promotion.dedicated_path(state.data_dir, shard_index, :hash, redis_key)
+
+          File.mkdir_p!(dedicated_path)
+          File.touch!(Path.join(dedicated_path, "00000.log"))
+          :ets.insert(ets, {marker, "hash", 0, LFU.initial(), 0, 0, 4})
+
+          missing_ref = BlobRef.from_segment("missing", 999_999, 48) |> BlobRef.encode!()
+
+          promoted_state = %{
+            state
+            | promoted_instances: %{redis_key => %{path: dedicated_path}}
+          }
+
+          {_new_state, result} =
+            StateMachine.apply(
+              %{},
+              {:compound_blob_batch_put, redis_key,
+               [
+                 {marker, "hash", 0, :value},
+                 {field, missing_ref, 0, :blob_ref}
+               ]},
+              promoted_state
+            )
+
+          assert {:error, :mixed_compound_batch_targets} == result
+
+          assert [{^marker, "hash", 0, _lfu, _fid, _off, _value_size}] =
+                   :ets.lookup(ets, marker)
+
+          assert [] == :ets.lookup(ets, field)
+        end
+
+        @tag :promoted_blob_batch
+        test "promoted compound blob append failures do not publish partial state", %{
+          state: state,
+          ets: ets,
+          shard_index: shard_index
+        } do
+          redis_key = "promoted_blob_append_failure"
+          marker = Promotion.marker_key(redis_key)
+          existing = CompoundKey.hash_field(redis_key, "existing")
+          new_field = CompoundKey.hash_field(redis_key, "new")
+
+          dedicated_path =
+            Promotion.dedicated_path(state.data_dir, shard_index, :hash, redis_key)
+
+          File.mkdir_p!(Path.join(dedicated_path, "00000.log"))
+          :ets.insert(ets, {marker, "hash", 0, LFU.initial(), 0, 0, 4})
+          :ets.insert(ets, {existing, "old", 0, LFU.initial(), 0, 1, 3})
+          old_entry = :ets.lookup(ets, existing)
+
+          assert {:ok, ref} = BlobStore.put(state.data_dir, shard_index, "new-value")
+
+          promoted_state = %{
+            state
+            | promoted_instances: %{redis_key => %{path: dedicated_path}}
+          }
+
+          {_new_state, result} =
+            StateMachine.apply(
+              %{},
+              {:compound_blob_batch_put, redis_key,
+               [
+                 {existing, BlobRef.encode!(ref), 0, :blob_ref},
+                 {new_field, "new", 0, :value}
+               ]},
+              promoted_state
+            )
+
+          assert {:error, _reason} = result
+          assert old_entry == :ets.lookup(ets, existing)
+          assert [] == :ets.lookup(ets, new_field)
+        end
+
         test "compound blob batch put preserves old values when ref validation fails", %{
           state: state,
           ets: ets
@@ -752,7 +898,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           redis_key = "blob_hash_batch_invalid"
           existing = CompoundKey.hash_field(redis_key, "existing")
           new_field = CompoundKey.hash_field(redis_key, "new")
-          missing_ref = BlobRef.encode!(BlobRef.from_payload("missing"))
+          missing_ref = BlobRef.encode!(BlobRef.from_segment("missing", 999_999, 48))
 
           {state2, {:ok, [:ok]}} =
             StateMachine.apply(
@@ -815,7 +961,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
       end
 
       describe "apply/3 with {:append, key, suffix}" do
-        test "APPEND treats a mismatched cold offset as missing", %{
+        test "APPEND aborts when a cold offset belongs to another key", %{
           state: state,
           ets: ets,
           active_file_path: active_file_path
@@ -834,9 +980,123 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
             {key, nil, 0, Ferricstore.Store.LFU.initial(), 0, other_offset, value_size}
           )
 
-          {_new_state, {:ok, 1}} = StateMachine.apply(%{}, {:append, key, "!"}, state)
+          {_new_state, result} = StateMachine.apply(%{}, {:append, key, "!"}, state)
 
-          assert [{^key, "!", 0, _lfu, _fid, _off, 1}] = :ets.lookup(ets, key)
+          assert {:error, {:state_read_failed, _reason}} = result
+
+          assert [{^key, nil, 0, _lfu, 0, ^other_offset, ^value_size}] =
+                   :ets.lookup(ets, key)
+        end
+
+        test "APPEND propagates derived-value blob externalization failures", %{
+          state: state,
+          ets: ets
+        } do
+          key = "append_derived_blob_failure"
+          threshold = 4
+
+          state =
+            Map.put(state, :instance_ctx, %{
+              data_dir: state.data_dir,
+              blob_side_channel_threshold_bytes: threshold
+            })
+
+          old_entry =
+            {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")}
+
+          :ets.insert(ets, old_entry)
+
+          Process.put(:ferricstore_blob_store_write_hook, fn _io, _iodata ->
+            {:error, :enospc}
+          end)
+
+          on_exit(fn -> Process.delete(:ferricstore_blob_store_write_hook) end)
+
+          {_new_state, result} = StateMachine.apply(%{}, {:append, key, "xx"}, state)
+
+          assert {:error, {:blob_externalize_failed, :enospc}} = result
+          assert [old_entry] == :ets.lookup(ets, key)
+        end
+
+        test "APPEND rejects a derived value above the replicated size limit", %{
+          state: state,
+          ets: ets
+        } do
+          key = "append_replicated_size_limit"
+          context = Ferricstore.Raft.ApplyContext.new(max_value_size: 4)
+
+          state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          old_entry =
+            {key, "old", 0, Ferricstore.Store.LFU.initial(), 0, 0, byte_size("old")}
+
+          :ets.insert(ets, old_entry)
+
+          {_new_state, result} = StateMachine.apply(%{}, {:append, key, "xx"}, state)
+
+          assert {:error, "ERR value too large (5 bytes, max 4 bytes)"} = result
+          assert [old_entry] == :ets.lookup(ets, key)
+        end
+
+        test "SETRANGE rejects padding above the replicated size limit", %{
+          state: state,
+          ets: ets
+        } do
+          key = "setrange_replicated_size_limit"
+          context = Ferricstore.Raft.ApplyContext.new(max_value_size: 4)
+
+          state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          {_new_state, result} = StateMachine.apply(%{}, {:setrange, key, 4, "x"}, state)
+
+          assert {:error, "ERR value too large (5 bytes, max 4 bytes)"} = result
+          assert [] == :ets.lookup(ets, key)
+        end
+
+        test "SETBIT rejects bitmap expansion above the replicated size limit", %{
+          state: state,
+          ets: ets
+        } do
+          key = "setbit_replicated_size_limit"
+          context = Ferricstore.Raft.ApplyContext.new(max_value_size: 4)
+
+          state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          {_new_state, result} = StateMachine.apply(%{}, {:setbit, key, 32, 1}, state)
+
+          assert {:error, "ERR value too large (5 bytes, max 4 bytes)"} = result
+          assert [] == :ets.lookup(ets, key)
+        end
+
+        test "crafted direct writes cannot bypass the replicated size limit", %{
+          state: state,
+          ets: ets
+        } do
+          key = "put_replicated_size_limit"
+          context = Ferricstore.Raft.ApplyContext.new(max_value_size: 4)
+
+          state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          {_new_state, result} = StateMachine.apply(%{}, {:put, key, "12345", 0}, state)
+
+          assert {:error, "ERR value too large (5 bytes, max 4 bytes)"} = result
+          assert [] == :ets.lookup(ets, key)
         end
       end
 

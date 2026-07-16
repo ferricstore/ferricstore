@@ -130,6 +130,43 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
   # ---------------------------------------------------------------------------
 
   describe "intent resolver timing" do
+    test "stale store-command intent unlocks every nested source key" do
+      [source_a, source_b, destination] = ShardHelpers.keys_on_different_shards(3)
+      ctx = FerricStore.Instance.get(:default)
+
+      coordinator_shard =
+        [source_a, source_b, destination]
+        |> Enum.map(&Router.shard_for(ctx, &1))
+        |> Enum.min()
+
+      shard_id = Cluster.shard_server_id(coordinator_shard)
+      owner_ref = make_ref()
+
+      intent = %{
+        command: :sdiffstore,
+        keys: %{dest: destination, sources: [source_a, source_b]},
+        value_hashes: %{
+          source_a => Router.watch_token(ctx, source_a),
+          source_b => Router.watch_token(ctx, source_b),
+          destination => Router.watch_token(ctx, destination)
+        },
+        status: :executing,
+        created_at: System.os_time(:millisecond) - 20_000
+      }
+
+      Ferricstore.Raft.CommandClock.process_command(
+        shard_id,
+        {:cross_shard_intent, owner_ref, intent}
+      )
+
+      assert :ok = Ferricstore.CrossShardOp.IntentResolver.resolve_shard_intents(coordinator_shard)
+
+      {:ok, {:applied_at, _, intents}, _} =
+        Ferricstore.Raft.CommandClock.process_command(shard_id, {:get_intents})
+
+      refute Map.has_key?(intents, owner_ref)
+    end
+
     test "fresh intent is NOT cleaned up" do
       shard_id = Cluster.shard_server_id(0)
       owner_ref = make_ref()
@@ -140,6 +177,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
          %{
            command: :smove,
            keys: %{source: "a", dest: "b"},
+           value_hashes: %{"a" => nil, "b" => nil},
            status: :executing,
            created_at: System.os_time(:millisecond)
          }}
@@ -166,6 +204,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
          %{
            command: :smove,
            keys: %{source: "a", dest: "b"},
+           value_hashes: %{"a" => nil, "b" => nil},
            status: :executing,
            created_at: System.os_time(:millisecond) - 20_000
          }}

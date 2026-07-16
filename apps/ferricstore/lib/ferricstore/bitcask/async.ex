@@ -29,7 +29,7 @@ defmodule Ferricstore.Bitcask.Async do
 
     proxy =
       spawn(fn ->
-        case submit_fun.(self(), corr_id) do
+        case submit(submit_fun, corr_id) do
           :ok -> proxy_receive(parent, ref, corr_id, timeout_ms)
           {:error, _reason} = error -> maybe_send_result(parent, ref, error)
         end
@@ -52,6 +52,18 @@ defmodule Ferricstore.Bitcask.Async do
             {:error, :timeout}
         end
     end
+  end
+
+  defp submit(submit_fun, corr_id) do
+    case submit_fun.(self(), corr_id) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, {:invalid_submit_result, other}}
+    end
+  rescue
+    exception -> {:error, {:submit_failed, :error, exception}}
+  catch
+    kind, reason -> {:error, {:submit_failed, kind, reason}}
   end
 
   defp proxy_receive(parent, ref, corr_id, timeout_ms) do

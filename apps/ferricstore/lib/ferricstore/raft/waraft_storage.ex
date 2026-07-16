@@ -29,6 +29,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
   @metadata_journal_magic "FSMJ1"
   @max_storage_metadata_bytes 1_048_576
   @max_metadata_journal_record_bytes @max_storage_metadata_bytes
+  @max_metadata_journal_bytes 67_108_864
   @max_snapshot_metadata_bytes @max_storage_metadata_bytes
   @max_snapshot_install_marker_bytes @max_storage_metadata_bytes
   @version 1

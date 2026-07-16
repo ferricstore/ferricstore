@@ -17,18 +17,15 @@ defmodule Ferricstore.Commands.CMSTest do
   # CMS.INITBYDIM
   # ===========================================================================
 
-  # Computes the new-style prob file path (base64 encoded key)
   defp prob_file_path(store, key, ext) do
     dir = store.prob_dir.()
-    safe = Base.url_encode64(key, padding: false)
-    Path.join(dir, "#{safe}.#{ext}")
+    Ferricstore.ProbFile.path(dir, key, ext)
   end
 
   describe "CMS.INITBYDIM" do
     test "creates a new sketch with given dimensions" do
       store = ProbMockStore.make_cms()
       assert :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
-      # Verify the file was created at the base64-encoded path
       assert File.exists?(prob_file_path(store, "mysketch", "cms"))
     end
 
@@ -38,9 +35,8 @@ defmodule Ferricstore.Commands.CMSTest do
       right_dir = temp_prob_dir("cms_right_prob", suffix)
 
       key = "key_specific_cms_#{suffix}"
-      safe = Base.url_encode64(key, padding: false)
-      wrong_path = Path.join(wrong_dir, "#{safe}.cms")
-      right_path = Path.join(right_dir, "#{safe}.cms")
+      wrong_path = Ferricstore.ProbFile.path(wrong_dir, key, "cms")
+      right_path = Ferricstore.ProbFile.path(right_dir, key, "cms")
 
       store =
         ProbMockStore.make_cms()

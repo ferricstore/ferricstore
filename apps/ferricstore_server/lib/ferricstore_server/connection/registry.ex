@@ -82,33 +82,112 @@ defmodule FerricstoreServer.Connection.Registry do
     :ok
   end
 
-  @spec summaries() :: [summary()]
-  def summaries do
+  @type snapshot :: %{
+          clients: [summary()],
+          registered_count: non_neg_integer(),
+          pubsub_count: non_neg_integer(),
+          transaction_count: non_neg_integer(),
+          oldest_created_at_ms: integer() | nil
+        }
+
+  @spec snapshot(non_neg_integer()) :: snapshot()
+  def snapshot(limit \\ 500) do
     init_table()
+    limit = max(limit, 0)
+    now_ms = System.monotonic_time(:millisecond)
 
-    @table
-    |> :ets.tab2list()
-    |> Enum.flat_map(fn
-      {client_id, pid, summary} when is_integer(client_id) and is_pid(pid) and is_map(summary) ->
-        if Process.alive?(pid) do
-          [summary |> Map.put(:client_id, client_id) |> Map.put(:pid, pid)]
-        else
-          :ets.delete(@table, client_id)
-          []
-        end
+    {clients, registered_count, pubsub_count, transaction_count, oldest_created_at_ms} =
+      :ets.foldl(
+        fn entry, acc -> snapshot_entry(entry, acc, limit, now_ms) end,
+        {:gb_trees.empty(), 0, 0, 0, nil},
+        @table
+      )
 
-      {client_id, pid} when is_integer(client_id) and is_pid(pid) ->
-        if Process.alive?(pid) do
-          [%{client_id: client_id, pid: pid}]
-        else
-          :ets.delete(@table, client_id)
-          []
-        end
-
-      _ ->
-        []
-    end)
+    %{
+      clients: clients |> :gb_trees.to_list() |> Enum.map(&elem(&1, 1)),
+      registered_count: registered_count,
+      pubsub_count: pubsub_count,
+      transaction_count: transaction_count,
+      oldest_created_at_ms: oldest_created_at_ms
+    }
   end
+
+  defp snapshot_entry(
+         {client_id, pid, summary},
+         acc,
+         limit,
+         now_ms
+       )
+       when is_integer(client_id) and is_pid(pid) and is_map(summary) do
+    if Process.alive?(pid) do
+      add_live_summary(client_id, pid, summary, acc, limit, now_ms)
+    else
+      :ets.delete(@table, client_id)
+      acc
+    end
+  end
+
+  defp snapshot_entry({client_id, pid}, acc, limit, now_ms)
+       when is_integer(client_id) and is_pid(pid) do
+    if Process.alive?(pid) do
+      add_live_summary(client_id, pid, %{}, acc, limit, now_ms)
+    else
+      :ets.delete(@table, client_id)
+      acc
+    end
+  end
+
+  defp snapshot_entry(_invalid, acc, _limit, _now_ms), do: acc
+
+  defp add_live_summary(
+         client_id,
+         pid,
+         summary,
+         {clients, registered_count, pubsub_count, transaction_count, oldest_created_at_ms},
+         limit,
+         now_ms
+       ) do
+    summary = summary |> Map.put(:client_id, client_id) |> Map.put(:pid, pid)
+    created_at_ms = valid_created_at(summary, now_ms)
+    flags = Map.get(summary, :flags, "")
+
+    clients = bounded_client_insert(clients, {created_at_ms, client_id}, summary, limit)
+
+    {
+      clients,
+      registered_count + 1,
+      pubsub_count + flag_count(flags, "S"),
+      transaction_count + flag_count(flags, "M"),
+      oldest_created_at(oldest_created_at_ms, created_at_ms)
+    }
+  end
+
+  defp bounded_client_insert(clients, _rank, _summary, 0), do: clients
+
+  defp bounded_client_insert(clients, rank, summary, limit) do
+    clients = :gb_trees.enter(rank, summary, clients)
+
+    if :gb_trees.size(clients) > limit do
+      {largest_rank, _summary} = :gb_trees.largest(clients)
+      :gb_trees.delete(largest_rank, clients)
+    else
+      clients
+    end
+  end
+
+  defp valid_created_at(%{created_at_ms: created_at_ms}, _now_ms) when is_integer(created_at_ms),
+    do: created_at_ms
+
+  defp valid_created_at(_summary, now_ms), do: now_ms
+
+  defp flag_count(flags, flag) when is_binary(flags) do
+    if String.contains?(flags, flag), do: 1, else: 0
+  end
+
+  defp flag_count(_flags, _flag), do: 0
+
+  defp oldest_created_at(nil, created_at_ms), do: created_at_ms
+  defp oldest_created_at(oldest, created_at_ms), do: min(oldest, created_at_ms)
 
   @spec lookup(pos_integer()) :: {:ok, pid()} | {:error, :not_found}
   def lookup(client_id) when is_integer(client_id) do

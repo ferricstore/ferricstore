@@ -61,6 +61,12 @@ defmodule Ferricstore.HyperLogLog do
   # Number of bits remaining after extracting the register index.
   # 64 total hash bits - 14 precision bits = 50 bits for rank.
   @remaining_bits 64 - @precision
+  @max_rank @remaining_bits + 1
+  @hash_space_size 18_446_744_073_709_551_616.0
+  @large_range_threshold @hash_space_size / 30.0
+  @inverse_powers 0..@max_rank
+                  |> Enum.map(&:math.pow(2.0, -&1))
+                  |> List.to_tuple()
 
   @typedoc "A 16,384-byte binary representing a HyperLogLog sketch."
   @type sketch :: <<_::131_072>>
@@ -143,21 +149,17 @@ defmodule Ferricstore.HyperLogLog do
       0
   """
   @spec count(sketch()) :: non_neg_integer()
-  def count(sketch) when is_binary(sketch) do
-    registers = extract_registers(sketch)
+  def count(sketch) when is_binary(sketch) and byte_size(sketch) == @num_registers do
+    {inverse_sum, zeros} = estimate_inputs!(sketch, 0.0, 0)
     alpha = alpha_m(@num_registers)
     m = @num_registers
-
-    inverse_sum =
-      Enum.reduce(registers, 0.0, fn reg, acc ->
-        acc + :math.pow(2.0, -reg)
-      end)
-
     raw_estimate = alpha * m * m / inverse_sum
 
-    estimate = correct_estimate(raw_estimate, registers, m)
+    estimate = correct_estimate(raw_estimate, zeros, m)
     round(estimate)
   end
+
+  def count(_sketch), do: raise(ArgumentError, "invalid HyperLogLog sketch")
 
   @doc """
   Merges two sketches by taking the maximum register value at each position.
@@ -205,7 +207,8 @@ defmodule Ferricstore.HyperLogLog do
   @doc """
   Validates that a binary is a well-formed HLL sketch.
 
-  A valid sketch is exactly 16,384 bytes long.
+  A valid sketch is exactly 16,384 bytes long and every register contains a
+  rank in the range produced by the 50-bit rank calculation (0..51).
 
   ## Parameters
 
@@ -213,7 +216,8 @@ defmodule Ferricstore.HyperLogLog do
 
   ## Returns
 
-  `true` if the binary is exactly `num_registers/0` bytes, `false` otherwise.
+  `true` if the binary has the expected length and register values, `false`
+  otherwise.
 
   ## Examples
 
@@ -224,7 +228,9 @@ defmodule Ferricstore.HyperLogLog do
       false
   """
   @spec valid_sketch?(binary()) :: boolean()
-  def valid_sketch?(binary) when is_binary(binary), do: byte_size(binary) == @num_registers
+  def valid_sketch?(binary) when is_binary(binary) and byte_size(binary) == @num_registers,
+    do: valid_registers?(binary)
+
   def valid_sketch?(_), do: false
 
   # ---------------------------------------------------------------------------
@@ -264,13 +270,29 @@ defmodule Ferricstore.HyperLogLog do
   end
 
   # ---------------------------------------------------------------------------
-  # Private — Register extraction
+  # Private — Register validation and estimation inputs
   # ---------------------------------------------------------------------------
 
-  @spec extract_registers(sketch()) :: [non_neg_integer()]
-  defp extract_registers(sketch) do
-    for i <- 0..(@num_registers - 1), do: :binary.at(sketch, i)
+  defp valid_registers?(<<>>), do: true
+
+  defp valid_registers?(<<register, rest::binary>>) when register <= @max_rank,
+    do: valid_registers?(rest)
+
+  defp valid_registers?(_invalid), do: false
+
+  defp estimate_inputs!(<<>>, inverse_sum, zeros), do: {inverse_sum, zeros}
+
+  defp estimate_inputs!(<<register, rest::binary>>, inverse_sum, zeros)
+       when register <= @max_rank do
+    estimate_inputs!(
+      rest,
+      inverse_sum + elem(@inverse_powers, register),
+      if(register == 0, do: zeros + 1, else: zeros)
+    )
   end
+
+  defp estimate_inputs!(_invalid, _inverse_sum, _zeros),
+    do: raise(ArgumentError, "invalid HyperLogLog sketch")
 
   # ---------------------------------------------------------------------------
   # Private — Merge (element-wise max)
@@ -303,14 +325,12 @@ defmodule Ferricstore.HyperLogLog do
   end
 
   # Apply small-range (linear counting) and large-range (2^64) corrections.
-  @spec correct_estimate(float(), [non_neg_integer()], pos_integer()) :: float()
-  defp correct_estimate(raw_estimate, registers, m) do
+  @spec correct_estimate(float(), non_neg_integer(), pos_integer()) :: float()
+  defp correct_estimate(raw_estimate, zeros, m) do
     cond do
       # Small range correction: use linear counting when estimate is small
       # and there are zero-valued registers.
       raw_estimate <= 2.5 * m ->
-        zeros = Enum.count(registers, &(&1 == 0))
-
         if zeros > 0 do
           # Linear counting
           m * :math.log(m / zeros)
@@ -318,11 +338,14 @@ defmodule Ferricstore.HyperLogLog do
           raw_estimate
         end
 
+      # The estimator cannot represent a cardinality beyond its hash space.
+      raw_estimate >= @hash_space_size ->
+        @hash_space_size
+
       # Large range correction: when estimate approaches 2^64
-      raw_estimate > 1.0e17 ->
+      raw_estimate > @large_range_threshold ->
         # -2^64 * log(1 - E/2^64)
-        two_pow_64 = :math.pow(2, 64)
-        -two_pow_64 * :math.log(1.0 - raw_estimate / two_pow_64)
+        -@hash_space_size * :math.log(1.0 - raw_estimate / @hash_space_size)
 
       # Normal range — no correction needed
       true ->

@@ -19,6 +19,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   @default_state "queued"
   @default_max_count 1_000
   @default_lmdb_query_scan_limit 10_000
+  @max_exact_integer 9_007_199_254_740_991
   @terminal_states ["completed", "failed", "cancelled"]
 
   def list(ctx, type, opts \\ [])
@@ -178,10 +179,6 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, from_ms} <- optional_non_neg_integer(opts, :from_ms, nil),
          {:ok, to_ms} <- optional_non_neg_integer(opts, :to_ms, nil),
          :ok <- validate_ms_range(from_ms, to_ms),
-         fetch_count =
-           RecordQuery.fetch_count(count, from_ms, to_ms, fn count ->
-             LMDBIndexRead.query_scan_count(count, @default_lmdb_query_scan_limit)
-           end),
          query = %{from_ms: from_ms, to_ms: to_ms, rev?: rev?},
          {:ok, records} <-
            RecordRead.terminal_records(
@@ -189,7 +186,7 @@ defmodule Ferricstore.Flow.ReadAPI do
              type,
              state,
              partition_key,
-             fetch_count,
+             count,
              include_cold? or consistent_projection?,
              consistent_projection?,
              query,
@@ -232,17 +229,18 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
-         index_key = Ferricstore.Flow.Keys.parent_index_key(parent_flow_id, partition_key),
-         :ok <- validate_key_size(index_key),
          {:ok, records} <-
-           RecordRead.records_for_index(
+           related_index_records(
              ctx,
-             index_key,
              partition_key,
              query,
              include_cold? or consistent_projection?,
              consistent_projection?,
-             @default_lmdb_query_scan_limit
+             &Keys.parent_index_key(parent_flow_id, &1),
+             fn record ->
+               Map.get(record, :parent_flow_id) == parent_flow_id and
+                 IndexQuery.record_matches?(record, query, @terminal_states)
+             end
            ) do
       {:ok,
        RecordRead.filter_index_records(
@@ -271,17 +269,18 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
-         index_key = Ferricstore.Flow.Keys.root_index_key(root_flow_id, partition_key),
-         :ok <- validate_key_size(index_key),
          {:ok, indexed_records} <-
-           RecordRead.records_for_index(
+           related_index_records(
              ctx,
-             index_key,
              partition_key,
              query,
              include_cold? or consistent_projection?,
              consistent_projection?,
-             @default_lmdb_query_scan_limit
+             &Keys.root_index_key(root_flow_id, &1),
+             fn record ->
+               Map.get(record, :root_flow_id) == root_flow_id and
+                 IndexQuery.record_matches?(record, query, @terminal_states)
+             end
            ),
          {:ok, root_record} <- RecordRead.root_record(ctx, root_flow_id, partition_key) do
       records =
@@ -316,17 +315,18 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
-         index_key = Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key),
-         :ok <- validate_key_size(index_key),
          {:ok, records} <-
-           RecordRead.records_for_index(
+           related_index_records(
              ctx,
-             index_key,
              partition_key,
              query,
              include_cold? or consistent_projection?,
              consistent_projection?,
-             @default_lmdb_query_scan_limit
+             &Keys.correlation_index_key(correlation_id, &1),
+             fn record ->
+               Map.get(record, :correlation_id) == correlation_id and
+                 IndexQuery.record_matches?(record, query, @terminal_states)
+             end
            ) do
       {:ok,
        RecordRead.filter_index_records(
@@ -603,7 +603,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          attributes,
          include_cold?,
          consistent_projection?,
-         _query
+         query
        )
        when map_size(attributes) == 0 do
     if state == "any" do
@@ -615,6 +615,7 @@ defmodule Ferricstore.Flow.ReadAPI do
         state,
         partition_key,
         count,
+        query,
         include_cold? or consistent_projection?,
         consistent_projection?,
         @terminal_states,
@@ -644,15 +645,21 @@ defmodule Ferricstore.Flow.ReadAPI do
              consistent_projection?
            ),
          {:ok, records} <-
-           list_records_for_search_attribute(
+           list_records_for_search_attribute_filtered(
              ctx,
              type,
              if(state == "any", do: nil, else: state),
              partition_key,
              name,
              value,
-             attribute_fetch_query(query, attributes),
-             consistent_projection?
+             query,
+             consistent_projection?,
+             fn record ->
+               Map.get(record, :type) == type and
+                 (state == "any" or Map.get(record, :state) == state) and
+                 IndexQuery.record_matches?(record, query, @terminal_states) and
+                 Attributes.matches?(record, attributes)
+             end
            ) do
       {:ok,
        records
@@ -666,30 +673,6 @@ defmodule Ferricstore.Flow.ReadAPI do
     end
   end
 
-  defp attribute_fetch_query(query, attributes) do
-    if map_size(attributes) > 1 do
-      %{
-        query
-        | count: LMDBIndexRead.query_scan_count(query.count, @default_lmdb_query_scan_limit)
-      }
-    else
-      query
-    end
-  end
-
-  defp state_meta_fetch_query(query, attributes, state_meta) do
-    fetch_more? = map_size(attributes) > 0 or length(StateMeta.candidate_filters(state_meta)) > 1
-
-    if fetch_more? do
-      %{
-        query
-        | count: LMDBIndexRead.query_scan_count(query.count, @default_lmdb_query_scan_limit)
-      }
-    else
-      query
-    end
-  end
-
   defp list_records_for_search_attribute(
          ctx,
          type,
@@ -700,26 +683,23 @@ defmodule Ferricstore.Flow.ReadAPI do
          query,
          consistent_projection?
        ) do
-    Ferricstore.Flow.Keys.auto_partition_keys()
-    |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
-      case list_records_for_search_attribute(
-             ctx,
-             type,
-             state,
-             partition_key,
-             name,
-             value,
-             query,
-             consistent_projection?
-           ) do
-        {:ok, records} -> {:cont, {:ok, RecordQuery.prepend_chunk(records, acc)}}
-        {:error, _reason} = error -> {:halt, error}
+    RecordQuery.bounded_auto_partition_records(
+      Keys.auto_partition_keys(),
+      query.count,
+      query.rev?,
+      fn partition_key, fetch_count ->
+        list_records_for_search_attribute(
+          ctx,
+          type,
+          state,
+          partition_key,
+          name,
+          value,
+          %{query | count: fetch_count},
+          consistent_projection?
+        )
       end
-    end)
-    |> case do
-      {:ok, chunks} -> {:ok, RecordQuery.flatten_chunks(chunks)}
-      {:error, _reason} = error -> error
-    end
+    )
   end
 
   defp list_records_for_search_attribute(
@@ -745,6 +725,126 @@ defmodule Ferricstore.Flow.ReadAPI do
         true,
         consistent_projection?,
         @default_lmdb_query_scan_limit
+      )
+    end
+  end
+
+  defp list_records_for_search_attribute_filtered(
+         ctx,
+         type,
+         state,
+         :auto,
+         name,
+         value,
+         query,
+         consistent_projection?,
+         match_fun
+       ) do
+    RecordQuery.bounded_auto_partition_filtered_records(
+      Keys.auto_partition_keys(),
+      query.count,
+      query.rev?,
+      fn partition_key, fetch_count, scan_budget ->
+        indexed_value = Attributes.index_value(value)
+        index_key = attribute_index_key(type, state, name, indexed_value, partition_key)
+
+        with :ok <- validate_key_size(index_key) do
+          RecordRead.records_for_index_filtered_with_count(
+            ctx,
+            index_key,
+            partition_key,
+            %{query | count: fetch_count},
+            true,
+            consistent_projection?,
+            scan_budget,
+            match_fun
+          )
+        end
+      end
+    )
+  end
+
+  defp list_records_for_search_attribute_filtered(
+         ctx,
+         type,
+         state,
+         partition_key,
+         name,
+         value,
+         query,
+         consistent_projection?,
+         match_fun
+       ) do
+    value = Attributes.index_value(value)
+    index_key = attribute_index_key(type, state, name, value, partition_key)
+
+    with :ok <- validate_key_size(index_key) do
+      RecordRead.records_for_index_filtered(
+        ctx,
+        index_key,
+        partition_key,
+        query,
+        true,
+        consistent_projection?,
+        @default_lmdb_query_scan_limit,
+        match_fun
+      )
+    end
+  end
+
+  defp related_index_records(
+         ctx,
+         :auto,
+         query,
+         include_cold?,
+         consistent?,
+         index_key_fun,
+         match_fun
+       ) do
+    RecordQuery.bounded_auto_partition_filtered_records(
+      Keys.auto_partition_keys(),
+      query.count,
+      query.rev?,
+      fn partition_key, fetch_count, scan_budget ->
+        index_key = index_key_fun.(partition_key)
+
+        with :ok <- validate_key_size(index_key) do
+          RecordRead.records_for_index_filtered_with_count(
+            ctx,
+            index_key,
+            partition_key,
+            %{query | count: fetch_count},
+            include_cold?,
+            consistent?,
+            scan_budget,
+            match_fun
+          )
+        end
+      end
+    )
+  end
+
+  defp related_index_records(
+         ctx,
+         partition_key,
+         query,
+         include_cold?,
+         consistent?,
+         index_key_fun,
+         match_fun
+       ) do
+    index_key = index_key_fun.(partition_key)
+
+    with :ok <- validate_key_size(index_key) do
+      RecordRead.records_for_index_filtered(
+        ctx,
+        index_key,
+        partition_key,
+        query,
+        include_cold?,
+        consistent?,
+        @default_lmdb_query_scan_limit,
+        match_fun
       )
     end
   end
@@ -836,7 +936,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   defp search_records(
          ctx,
          type,
-         _state,
+         state,
          partition_key,
          attributes,
          state_meta,
@@ -846,15 +946,22 @@ defmodule Ferricstore.Flow.ReadAPI do
        when map_size(state_meta) > 0 do
     with {:ok, {meta_state, name, value}} <-
            select_state_meta_filter(ctx, type, partition_key, state_meta, consistent_projection?) do
-      list_records_for_search_state_meta(
+      list_records_for_search_state_meta_filtered(
         ctx,
         type,
         meta_state,
         partition_key,
         name,
         value,
-        state_meta_fetch_query(query, attributes, state_meta),
-        consistent_projection?
+        query,
+        consistent_projection?,
+        fn record ->
+          (is_nil(type) or Map.get(record, :type) == type) and
+            (is_nil(state) or Map.get(record, :state) == state) and
+            IndexQuery.record_matches?(record, query, @terminal_states) and
+            Attributes.matches?(record, attributes) and
+            StateMeta.matches?(record, state_meta)
+        end
       )
     end
   end
@@ -878,15 +985,21 @@ defmodule Ferricstore.Flow.ReadAPI do
              attributes,
              consistent_projection?
            ) do
-      list_records_for_search_attribute(
+      list_records_for_search_attribute_filtered(
         ctx,
         type,
         state,
         partition_key,
         name,
         value,
-        attribute_fetch_query(query, attributes),
-        consistent_projection?
+        query,
+        consistent_projection?,
+        fn record ->
+          (is_nil(type) or Map.get(record, :type) == type) and
+            (is_nil(state) or Map.get(record, :state) == state) and
+            IndexQuery.record_matches?(record, query, @terminal_states) and
+            Attributes.matches?(record, attributes)
+        end
       )
     end
   end
@@ -961,13 +1074,9 @@ defmodule Ferricstore.Flow.ReadAPI do
         candidates
         |> Enum.map(fn {name, value} = candidate ->
           {attribute_candidate_count(ctx, type, state, partition_key, name, value, consistent?),
-           candidate}
+           candidate, {name, Attributes.index_value(value)}}
         end)
-        |> Enum.min_by(fn {{status, count}, {name, value}} ->
-          score = if status == :ok, do: count, else: @default_lmdb_query_scan_limit
-          {score, name, Attributes.index_value(value)}
-        end)
-        |> elem(1)
+        |> select_scored_candidate()
         |> then(&{:ok, &1})
     end
   end
@@ -1002,7 +1111,7 @@ defmodule Ferricstore.Flow.ReadAPI do
     if byte_size(index_key) <= Ferricstore.Store.Router.max_key_size() do
       with {:ok, lmdb_count} <-
              LMDBIndexRead.query_count(ctx, index_key, partition_key, consistent?) do
-        {:ok, max(lmdb_count, ram_attribute_candidate_count(ctx, index_key))}
+        {:ok, candidate_scan_count(lmdb_count, ram_attribute_candidate_count(ctx, index_key))}
       end
     else
       {:error, "ERR key too large (max #{Ferricstore.Store.Router.max_key_size()} bytes)"}
@@ -1035,13 +1144,9 @@ defmodule Ferricstore.Flow.ReadAPI do
              name,
              value,
              consistent?
-           ), candidate}
+           ), candidate, {meta_state, name, StateMeta.index_value(value)}}
         end)
-        |> Enum.min_by(fn {{status, count}, {meta_state, name, value}} ->
-          score = if status == :ok, do: count, else: @default_lmdb_query_scan_limit
-          {score, meta_state, name, StateMeta.index_value(value)}
-        end)
-        |> elem(1)
+        |> select_scored_candidate()
         |> then(&{:ok, &1})
     end
   end
@@ -1071,14 +1176,14 @@ defmodule Ferricstore.Flow.ReadAPI do
     if byte_size(index_key) <= Ferricstore.Store.Router.max_key_size() do
       with {:ok, lmdb_count} <-
              LMDBIndexRead.query_count(ctx, index_key, partition_key, consistent?) do
-        {:ok, max(lmdb_count, ram_attribute_candidate_count(ctx, index_key))}
+        {:ok, candidate_scan_count(lmdb_count, ram_attribute_candidate_count(ctx, index_key))}
       end
     else
       {:error, "ERR key too large (max #{Ferricstore.Store.Router.max_key_size()} bytes)"}
     end
   end
 
-  defp list_records_for_search_state_meta(
+  defp list_records_for_search_state_meta_filtered(
          ctx,
          type,
          meta_state,
@@ -1086,31 +1191,36 @@ defmodule Ferricstore.Flow.ReadAPI do
          name,
          value,
          query,
-         consistent_projection?
+         consistent_projection?,
+         match_fun
        ) do
-    Ferricstore.Flow.Keys.auto_partition_keys()
-    |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
-      case list_records_for_search_state_meta(
-             ctx,
-             type,
-             meta_state,
-             partition_key,
-             name,
-             value,
-             query,
-             consistent_projection?
-           ) do
-        {:ok, records} -> {:cont, {:ok, RecordQuery.prepend_chunk(records, acc)}}
-        {:error, _reason} = error -> {:halt, error}
+    RecordQuery.bounded_auto_partition_filtered_records(
+      Keys.auto_partition_keys(),
+      query.count,
+      query.rev?,
+      fn partition_key, fetch_count, scan_budget ->
+        indexed_value = StateMeta.index_value(value)
+
+        index_key =
+          Keys.state_meta_index_key(type, meta_state, name, indexed_value, partition_key)
+
+        with :ok <- validate_key_size(index_key) do
+          RecordRead.records_for_index_filtered_with_count(
+            ctx,
+            index_key,
+            partition_key,
+            %{query | count: fetch_count},
+            true,
+            consistent_projection?,
+            scan_budget,
+            match_fun
+          )
+        end
       end
-    end)
-    |> case do
-      {:ok, chunks} -> {:ok, RecordQuery.flatten_chunks(chunks)}
-      {:error, _reason} = error -> error
-    end
+    )
   end
 
-  defp list_records_for_search_state_meta(
+  defp list_records_for_search_state_meta_filtered(
          ctx,
          type,
          meta_state,
@@ -1118,20 +1228,22 @@ defmodule Ferricstore.Flow.ReadAPI do
          name,
          value,
          query,
-         consistent_projection?
+         consistent_projection?,
+         match_fun
        ) do
     value = StateMeta.index_value(value)
     index_key = Keys.state_meta_index_key(type, meta_state, name, value, partition_key)
 
     with :ok <- validate_key_size(index_key) do
-      RecordRead.records_for_index(
+      RecordRead.records_for_index_filtered(
         ctx,
         index_key,
         partition_key,
         query,
         true,
         consistent_projection?,
-        @default_lmdb_query_scan_limit
+        @default_lmdb_query_scan_limit,
+        match_fun
       )
     end
   end
@@ -1181,9 +1293,20 @@ defmodule Ferricstore.Flow.ReadAPI do
   end
 
   defp attribute_name_count(ctx, type, state, :auto, name, consistent?) do
-    Keys.auto_partition_keys()
+    partition_keys = Keys.auto_partition_keys()
+    scan_limit = discovery_auto_bucket_scan_limit(partition_keys)
+
+    partition_keys
     |> Enum.reduce_while({:ok, {0, false}}, fn partition_key, {:ok, {count_acc, approx_acc}} ->
-      case attribute_name_prefix_count(ctx, type, state, partition_key, name, consistent?) do
+      case attribute_name_prefix_count(
+             ctx,
+             type,
+             state,
+             partition_key,
+             name,
+             consistent?,
+             scan_limit
+           ) do
         {:ok, {count, approximate?}} ->
           {:cont, {:ok, {count_acc + count, approx_acc or approximate?}}}
 
@@ -1205,28 +1328,61 @@ defmodule Ferricstore.Flow.ReadAPI do
     attribute_live_count_for_prefix(ctx, index_key_prefix, partition_key, consistent?)
   end
 
-  defp attribute_name_prefix_count(ctx, type, "any", partition_key, name, consistent?) do
+  defp attribute_name_prefix_count(
+         ctx,
+         type,
+         "any",
+         partition_key,
+         name,
+         consistent?,
+         scan_limit
+       ) do
     index_key_prefix = Keys.attribute_type_index_prefix(type, name, partition_key)
 
-    attribute_raw_count_for_prefix(ctx, index_key_prefix, partition_key, consistent?)
+    attribute_live_count_for_prefix(
+      ctx,
+      index_key_prefix,
+      partition_key,
+      consistent?,
+      scan_limit
+    )
   end
 
-  defp attribute_name_prefix_count(ctx, type, state, partition_key, name, consistent?) do
+  defp attribute_name_prefix_count(
+         ctx,
+         type,
+         state,
+         partition_key,
+         name,
+         consistent?,
+         scan_limit
+       ) do
     index_key_prefix = Keys.attribute_index_prefix(type, state, name, partition_key)
 
-    attribute_raw_count_for_prefix(ctx, index_key_prefix, partition_key, consistent?)
+    attribute_live_count_for_prefix(
+      ctx,
+      index_key_prefix,
+      partition_key,
+      consistent?,
+      scan_limit
+    )
   end
 
-  defp attribute_raw_count_for_prefix(ctx, index_key_prefix, partition_key, consistent?) do
-    with {:ok, count} <-
-           LMDBIndexRead.query_prefix_count(ctx, index_key_prefix, partition_key, consistent?) do
-      {:ok, {count, count > discovery_scan_limit()}}
-    end
-  end
-
-  defp attribute_live_count_for_prefix(ctx, index_key_prefix, partition_key, consistent?) do
+  defp attribute_live_count_for_prefix(
+         ctx,
+         index_key_prefix,
+         partition_key,
+         consistent?,
+         scan_limit \\ nil
+       ) do
     with {:ok, {counts, approximate?}} <-
-           attribute_value_counts_for_prefix(ctx, index_key_prefix, partition_key, consistent?) do
+           attribute_value_counts_for_prefix(
+             ctx,
+             index_key_prefix,
+             partition_key,
+             consistent?,
+             scan_limit
+           ) do
       {:ok, {Enum.reduce(counts, 0, fn {_value, count}, acc -> acc + count end), approximate?}}
     end
   end
@@ -1312,7 +1468,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          index_key_prefix,
          partition_key,
          consistent?,
-         scan_limit \\ nil
+         scan_limit
        ) do
     scan_limit = scan_limit || discovery_scan_limit()
 
@@ -1329,38 +1485,99 @@ defmodule Ferricstore.Flow.ReadAPI do
       raw_count = Enum.reduce(chunks, 0, fn {_path, entries}, acc -> acc + length(entries) end)
       approximate? = raw_count > scan_limit
 
-      counts =
-        Enum.reduce(chunks, %{}, fn {path, entries}, acc ->
-          Enum.reduce(entries, acc, fn {key, value}, acc ->
-            case live_query_index_value?(path, key, value, now_ms) do
-              true ->
-                case attribute_value_from_query_key(key, raw_prefix) do
-                  nil -> acc
-                  value -> Map.update(acc, value, 1, &(&1 + 1))
-                end
-
-              false ->
-                acc
-            end
-          end)
-        end)
-
-      {:ok, {counts, approximate?}}
+      with {:ok, counts} <-
+             attribute_value_counts_from_chunks(
+               chunks,
+               raw_prefix,
+               now_ms,
+               &live_query_index_value?/4
+             ) do
+        {:ok, {counts, approximate?}}
+      end
     end
   end
 
-  defp live_query_index_value?(path, key, value, now_ms) do
-    case Ferricstore.Flow.LMDB.decode_query_index_value(value) do
-      {:ok, {_id, _updated_at_ms, expire_at_ms, _state_key}}
-      when expire_at_ms <= 0 or expire_at_ms > now_ms ->
-        true
+  defp attribute_value_counts_from_chunks(chunks, raw_prefix, now_ms, classify_fun)
+       when is_list(chunks) and is_binary(raw_prefix) and is_integer(now_ms) and
+              is_function(classify_fun, 4) do
+    Enum.reduce_while(chunks, {:ok, %{}}, fn
+      {path, entries}, {:ok, acc} when is_binary(path) and is_list(entries) ->
+        case attribute_value_counts_from_entries(
+               entries,
+               path,
+               raw_prefix,
+               now_ms,
+               classify_fun,
+               acc
+             ) do
+          {:ok, counts} -> {:cont, {:ok, counts}}
+          {:error, _reason} = error -> {:halt, error}
+        end
 
-      {:ok, {_id, _updated_at_ms, _expire_at_ms, _state_key}} ->
-        Ferricstore.Flow.LMDB.write_batch(path, [{:delete, key}])
-        false
+      invalid, _acc ->
+        {:halt, {:error, {:invalid_query_index_chunk, invalid}}}
+    end)
+  end
+
+  defp attribute_value_counts_from_entries(
+         entries,
+         path,
+         raw_prefix,
+         now_ms,
+         classify_fun,
+         initial
+       ) do
+    Enum.reduce_while(entries, {:ok, initial}, fn
+      {key, value}, {:ok, acc} when is_binary(key) and is_binary(value) ->
+        case classify_fun.(path, key, value, now_ms) do
+          {:ok, true} ->
+            case attribute_value_from_query_key(key, raw_prefix) do
+              {:ok, attribute_value} ->
+                {:cont, {:ok, Map.update(acc, attribute_value, 1, &(&1 + 1))}}
+
+              :error ->
+                {:halt, {:error, {:invalid_query_index_key, key}}}
+            end
+
+          {:ok, false} ->
+            {:cont, {:ok, acc}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+
+          invalid ->
+            {:halt, {:error, {:invalid_query_index_classification, invalid}}}
+        end
+
+      invalid, _acc ->
+        {:halt, {:error, {:invalid_query_index_entry, invalid}}}
+    end)
+  end
+
+  defp live_query_index_value?(path, key, value, now_ms),
+    do: live_query_index_value?(path, key, value, now_ms, &Ferricstore.Flow.LMDB.write_batch/2)
+
+  defp live_query_index_value?(path, key, value, now_ms, delete_fun)
+       when is_function(delete_fun, 2) do
+    case Ferricstore.Flow.LMDB.decode_query_index_value(value) do
+      {:ok, {id, updated_at_ms, expire_at_ms, _state_key}} ->
+        cond do
+          not Ferricstore.Flow.LMDB.query_index_entry_key?(key, id, updated_at_ms) ->
+            {:error, {:invalid_query_index_value, key}}
+
+          expire_at_ms <= 0 or expire_at_ms > now_ms ->
+            {:ok, true}
+
+          true ->
+            case delete_fun.(path, [{:delete, key}]) do
+              :ok -> {:ok, false}
+              {:error, _reason} = error -> error
+              invalid -> {:error, {:invalid_query_index_delete_result, invalid}}
+            end
+        end
 
       :error ->
-        false
+        {:error, {:invalid_query_index_value, key}}
     end
   end
 
@@ -1369,24 +1586,45 @@ defmodule Ferricstore.Flow.ReadAPI do
 
     cond do
       byte_size(key) <= prefix_size ->
-        nil
+        :error
 
       binary_part(key, 0, prefix_size) != raw_prefix ->
-        nil
+        :error
 
       true ->
         rest = binary_part(key, prefix_size, byte_size(key) - prefix_size)
 
         case :binary.match(rest, <<0>>) do
           {value_size, 1} ->
-            rest
-            |> binary_part(0, value_size)
-            |> Attributes.decode_index_value()
+            value =
+              rest
+              |> binary_part(0, value_size)
+              |> Attributes.decode_index_value()
+
+            {:ok, value}
 
           :nomatch ->
-            nil
+            :error
         end
     end
+  end
+
+  @doc false
+  def __attribute_value_counts_from_chunks_for_test__(
+        chunks,
+        raw_prefix,
+        now_ms,
+        delete_fun
+      )
+      when is_function(delete_fun, 2) do
+    attribute_value_counts_from_chunks(
+      chunks,
+      raw_prefix,
+      now_ms,
+      fn path, key, value, event_now_ms ->
+        live_query_index_value?(path, key, value, event_now_ms, delete_fun)
+      end
+    )
   end
 
   defp top_attribute_values(counts, approximate?) do
@@ -1423,6 +1661,32 @@ defmodule Ferricstore.Flow.ReadAPI do
       Map.update(acc, key, count, &(&1 + count))
     end)
   end
+
+  defp candidate_scan_count(lmdb_count, ram_count)
+       when is_integer(lmdb_count) and lmdb_count >= 0 and is_integer(ram_count) and
+              ram_count >= 0 do
+    lmdb_count + ram_count
+  end
+
+  defp select_scored_candidate(scored_candidates) do
+    scored_candidates
+    |> Enum.min_by(fn
+      {{:ok, count}, _candidate, tie_breaker} when is_integer(count) and count >= 0 ->
+        {0, count, tie_breaker}
+
+      {{:error, _reason}, _candidate, tie_breaker} ->
+        {1, 0, tie_breaker}
+    end)
+    |> elem(1)
+  end
+
+  @doc false
+  def __candidate_scan_count_for_test__(lmdb_count, ram_count),
+    do: candidate_scan_count(lmdb_count, ram_count)
+
+  @doc false
+  def __select_scored_candidate_for_test__(scored_candidates),
+    do: select_scored_candidate(scored_candidates)
 
   defp attribute_index_key(type, state, name, value, partition_key) do
     cond do
@@ -1491,15 +1755,18 @@ defmodule Ferricstore.Flow.ReadAPI do
     with {:ok, from_ms} <- optional_non_neg_integer(opts, :from_ms, nil),
          {:ok, to_ms} <- optional_non_neg_integer(opts, :to_ms, nil),
          {:ok, rev?} <- optional_boolean(opts, :rev, false),
+         {:ok, before_id} <- optional_before_id(opts),
          {:ok, state} <- optional_binary_or_nil(opts, :state, nil),
          {:ok, terminal_only?} <- optional_boolean(opts, :terminal_only, false),
-         :ok <- validate_ms_range(from_ms, to_ms) do
+         :ok <- validate_ms_range(from_ms, to_ms),
+         :ok <- validate_before_id_cursor(before_id, to_ms, rev?) do
       {:ok,
        %{
          count: count,
          from_ms: from_ms,
          to_ms: to_ms,
          rev?: rev?,
+         before_id: before_id,
          state: state,
          terminal_only?: terminal_only?
        }}
@@ -1507,20 +1774,26 @@ defmodule Ferricstore.Flow.ReadAPI do
   end
 
   defp flow_count(opts) do
-    case Keyword.get(opts, :count, 100) do
-      value when is_integer(value) and value > 0 ->
-        max_count = flow_max_count()
+    max_count = flow_max_count()
 
+    case Keyword.fetch(opts, :count) do
+      :error ->
+        {:ok, min(100, max_count)}
+
+      {:ok, value} when is_integer(value) and value > 0 ->
         if value <= max_count do
           {:ok, value}
         else
           {:error, "ERR flow count exceeds maximum #{max_count}"}
         end
 
-      _ ->
+      {:ok, _invalid} ->
         {:error, "ERR flow count must be a positive integer"}
     end
   end
+
+  @doc false
+  def __flow_count_for_test__(opts), do: flow_count(opts)
 
   defp flow_max_count do
     case Application.get_env(:ferricstore, :flow_max_count, @default_max_count) do
@@ -1543,7 +1816,7 @@ defmodule Ferricstore.Flow.ReadAPI do
       nil -> {:ok, nil}
       value when is_binary(value) and value != "" -> {:ok, value}
       :auto -> {:ok, :auto}
-      :any -> {:ok, :any}
+      :any -> {:ok, :auto}
       _ -> {:error, "ERR flow partition_key must be a non-empty string"}
     end
   end
@@ -1568,6 +1841,22 @@ defmodule Ferricstore.Flow.ReadAPI do
     end
   end
 
+  defp optional_before_id(opts) do
+    case Keyword.fetch(opts, :before_id) do
+      :error -> {:ok, nil}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, value} when is_binary(value) and value != "" -> {:ok, value}
+      {:ok, ""} -> {:error, "ERR flow before_id must be a non-empty string"}
+      {:ok, _value} -> {:error, "ERR flow before_id must be a string"}
+    end
+  end
+
+  defp validate_before_id_cursor(nil, _to_ms, _rev?), do: :ok
+  defp validate_before_id_cursor(_before_id, to_ms, true) when is_integer(to_ms), do: :ok
+
+  defp validate_before_id_cursor(_before_id, _to_ms, _rev?),
+    do: {:error, "ERR flow before_id requires rev: true and to_ms"}
+
   defp optional_boolean(opts, key, default) do
     case Keyword.get(opts, key, default) do
       value when is_boolean(value) -> {:ok, value}
@@ -1577,11 +1866,28 @@ defmodule Ferricstore.Flow.ReadAPI do
 
   defp optional_non_neg_integer(opts, key, default) do
     case Keyword.fetch(opts, key) do
-      {:ok, value} when is_integer(value) and value >= 0 -> {:ok, value}
-      {:ok, _} -> {:error, "ERR flow #{key} must be a non-negative integer"}
-      :error when is_integer(default) and default >= 0 -> {:ok, default}
-      :error when is_nil(default) -> {:ok, nil}
-      :error -> {:error, "ERR flow #{key} must be a non-negative integer"}
+      {:ok, value}
+      when is_integer(value) and value >= 0 and value <= @max_exact_integer ->
+        {:ok, value}
+
+      {:ok, value} when is_integer(value) and value > @max_exact_integer ->
+        {:error, "ERR flow #{key} exceeds maximum #{@max_exact_integer}"}
+
+      {:ok, _} ->
+        {:error, "ERR flow #{key} must be a non-negative integer"}
+
+      :error
+      when is_integer(default) and default >= 0 and default <= @max_exact_integer ->
+        {:ok, default}
+
+      :error when is_integer(default) and default > @max_exact_integer ->
+        {:error, "ERR flow #{key} exceeds maximum #{@max_exact_integer}"}
+
+      :error when is_nil(default) ->
+        {:ok, nil}
+
+      :error ->
+        {:error, "ERR flow #{key} must be a non-negative integer"}
     end
   end
 end

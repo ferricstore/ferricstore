@@ -64,7 +64,16 @@ defmodule Ferricstore.Store.Shard.Routing do
             file_stats: Map.get(sm_state, :file_stats, state.file_stats),
             apply_context: Map.get(sm_state, :apply_context, state.apply_context),
             apply_context_encoded:
-              Map.get(sm_state, :apply_context_encoded, state.apply_context_encoded)
+              Map.get(sm_state, :apply_context_encoded, state.apply_context_encoded),
+            cross_shard_locks: Map.get(sm_state, :cross_shard_locks, state.cross_shard_locks),
+            cross_shard_lock_expiries:
+              Map.get(
+                sm_state,
+                :cross_shard_lock_expiries,
+                state.cross_shard_lock_expiries
+              ),
+            cross_shard_intents:
+              Map.get(sm_state, :cross_shard_intents, state.cross_shard_intents)
         }
       end
 
@@ -86,8 +95,9 @@ defmodule Ferricstore.Store.Shard.Routing do
           apply_context_encoded: state.apply_context_encoded,
           applied_count: 0,
           release_cursor_interval: state.release_cursor_interval,
-          cross_shard_locks: %{},
-          cross_shard_intents: %{},
+          cross_shard_locks: state.cross_shard_locks,
+          cross_shard_lock_expiries: state.cross_shard_lock_expiries,
+          cross_shard_intents: state.cross_shard_intents,
           instance_ctx: state.instance_ctx,
           instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
           compound_member_index_name: state.compound_member_index,
@@ -109,57 +119,77 @@ defmodule Ferricstore.Store.Shard.Routing do
       end
 
       defp enqueue_standalone_commit(state, from, command) do
-        entry = {from, command, standalone_command_keys(command)}
-
-        if state.standalone_write_barrier or
-             standalone_entry_conflicts?(entry, state.standalone_inflight_keys) do
-          %{state | standalone_waiting: state.standalone_waiting ++ [entry]}
+        if standalone_queued_count(state) >= state.standalone_commit_max_queued_ops do
+          GenServer.reply(from, {:error, "BUSY standalone commit queue is full"})
+          state
         else
-          enqueue_ready_standalone_commit(state, entry)
+          command_bytes = :erlang.external_size(command)
+
+          if standalone_retained_bytes(state) + command_bytes >
+               state.standalone_commit_max_queued_bytes do
+            GenServer.reply(from, {:error, "BUSY standalone commit queue is full"})
+            state
+          else
+            entry = {from, command, standalone_command_keys(command), command_bytes}
+
+            if state.standalone_write_barrier or
+                 standalone_entry_conflicts?(entry, state.standalone_inflight_keys) or
+                 standalone_entry_conflicts?(entry, state.standalone_batch_keys) or
+                 standalone_entry_conflicts?(entry, state.standalone_waiting_keys) do
+              {_from, _command, keys, _command_bytes} = entry
+
+              %{
+                state
+                | standalone_waiting: :queue.in(entry, state.standalone_waiting),
+                  standalone_waiting_count: state.standalone_waiting_count + 1,
+                  standalone_waiting_bytes: state.standalone_waiting_bytes + command_bytes,
+                  standalone_waiting_keys: MapSet.union(state.standalone_waiting_keys, keys)
+              }
+            else
+              enqueue_ready_standalone_commit(state, entry)
+            end
+          end
         end
       end
 
+      defp standalone_queued_count(state) do
+        state.standalone_batch_count + state.standalone_waiting_count
+      end
+
+      defp standalone_retained_bytes(state) do
+        state.standalone_batch_bytes + state.standalone_waiting_bytes +
+          state.standalone_flush_bytes
+      end
+
       defp enqueue_ready_standalone_commit(state, entry) do
+        {_from, _command, keys, command_bytes} = entry
+
         timer =
           if state.standalone_batch_timer == nil and state.standalone_flush_ref == nil do
-            Process.send_after(self(), :standalone_commit_flush, standalone_commit_delay_ms())
+            Process.send_after(self(), :standalone_commit_flush, state.standalone_commit_delay_ms)
           else
             state.standalone_batch_timer
           end
 
         %{
           state
-          | standalone_batch: [entry | state.standalone_batch],
+          | standalone_batch: :queue.in(entry, state.standalone_batch),
+            standalone_batch_count: state.standalone_batch_count + 1,
+            standalone_batch_bytes: state.standalone_batch_bytes + command_bytes,
+            standalone_batch_keys: MapSet.union(state.standalone_batch_keys, keys),
             standalone_batch_timer: timer
         }
       end
 
       defp maybe_flush_full_standalone_batch(state) do
-        if length(state.standalone_batch) >= standalone_commit_max_ops() do
+        if state.standalone_batch_count >= state.standalone_commit_max_ops do
           flush_standalone_batch(state)
         else
           state
         end
       end
 
-      defp standalone_commit_delay_ms do
-        :ferricstore
-        |> Application.get_env(:standalone_fsync_max_delay_ms, @flush_interval_ms)
-        |> normalize_positive_integer(@flush_interval_ms)
-      end
-
-      defp standalone_commit_max_ops do
-        :ferricstore
-        |> Application.get_env(:standalone_fsync_max_ops, 1024)
-        |> normalize_positive_integer(1024)
-      end
-
-      defp normalize_positive_integer(value, _default) when is_integer(value) and value > 0,
-        do: value
-
-      defp normalize_positive_integer(_value, default), do: default
-
-      defp flush_standalone_batch(%{standalone_batch: []} = state) do
+      defp flush_standalone_batch(%{standalone_batch_count: 0} = state) do
         %{state | standalone_batch_timer: nil}
       end
 
@@ -172,7 +202,11 @@ defmodule Ferricstore.Store.Shard.Routing do
           Process.cancel_timer(timer)
         end
 
-        entries = Enum.reverse(state.standalone_batch)
+        flush_count = min(state.standalone_batch_count, state.standalone_commit_max_ops)
+        {flush_queue, remaining_batch} = :queue.split(flush_count, state.standalone_batch)
+        entries = :queue.to_list(flush_queue)
+        flush_bytes = standalone_entries_bytes(entries)
+        flush_keys = standalone_entries_keys(entries)
         sm_state = direct_sm_state(state)
         ref = make_ref()
         parent = self()
@@ -187,16 +221,21 @@ defmodule Ferricstore.Store.Shard.Routing do
 
         %{
           state
-          | standalone_batch: [],
+          | standalone_batch: remaining_batch,
+            standalone_batch_count: state.standalone_batch_count - flush_count,
+            standalone_batch_bytes: state.standalone_batch_bytes - flush_bytes,
+            standalone_batch_keys:
+              Enum.reduce(flush_keys, state.standalone_batch_keys, &MapSet.delete(&2, &1)),
             standalone_batch_timer: nil,
             standalone_flush_ref: ref,
             standalone_flush_entries: entries,
-            standalone_inflight_keys: standalone_entries_keys(entries)
+            standalone_flush_bytes: flush_bytes,
+            standalone_inflight_keys: flush_keys
         }
       end
 
       defp run_standalone_batch(entries, sm_state) do
-        commands = Enum.map(entries, fn {_from, command, _keys} -> command end)
+        commands = Enum.map(entries, fn {_from, command, _keys, _bytes} -> command end)
 
         try do
           if Enum.any?(commands, &match?({:cross_shard_tx, _}, &1)) do
@@ -226,7 +265,13 @@ defmodule Ferricstore.Store.Shard.Routing do
         Enum.reduce_while(commands, {:ok, sm_state, []}, fn command, {:ok, acc_state, results} ->
           case run_standalone_command(command, acc_state) do
             {:ok, new_state, result} ->
-              {:cont, {:ok, new_state, [result | results]}}
+              case flatten_standalone_command_result(command, result) do
+                {:ok, command_results} ->
+                  {:cont, {:ok, new_state, Enum.reverse(command_results, results)}}
+
+                {:error, reason} ->
+                  {:halt, {:error, new_state, reason}}
+              end
 
             {:error, new_state, reason} ->
               {:halt, {:error, new_state, reason}}
@@ -264,6 +309,7 @@ defmodule Ferricstore.Store.Shard.Routing do
             state
             | standalone_flush_ref: nil,
               standalone_flush_entries: [],
+              standalone_flush_bytes: 0,
               standalone_inflight_keys: MapSet.new()
           }
 
@@ -299,16 +345,22 @@ defmodule Ferricstore.Store.Shard.Routing do
             %{
               state
               | writes_paused: true,
-                standalone_batch: [],
+                standalone_batch: :queue.new(),
+                standalone_batch_count: 0,
+                standalone_batch_bytes: 0,
+                standalone_batch_keys: MapSet.new(),
                 standalone_batch_timer: nil,
-                standalone_waiting: []
+                standalone_waiting: :queue.new(),
+                standalone_waiting_count: 0,
+                standalone_waiting_bytes: 0,
+                standalone_waiting_keys: MapSet.new()
             }
         end
       end
 
       defp handle_standalone_flush_result(_ref, _result, state), do: state
 
-      defp flush_ready_standalone_batch(%{standalone_batch: []} = state), do: state
+      defp flush_ready_standalone_batch(%{standalone_batch_count: 0} = state), do: state
       defp flush_ready_standalone_batch(state), do: flush_standalone_batch(state)
 
       defp clear_standalone_write_barrier(state), do: %{state | standalone_write_barrier: false}
@@ -321,7 +373,18 @@ defmodule Ferricstore.Store.Shard.Routing do
         reply_standalone_error(state.standalone_batch, reason)
         reply_standalone_error(state.standalone_waiting, reason)
 
-        %{state | standalone_batch: [], standalone_batch_timer: nil, standalone_waiting: []}
+        %{
+          state
+          | standalone_batch: :queue.new(),
+            standalone_batch_count: 0,
+            standalone_batch_bytes: 0,
+            standalone_batch_keys: MapSet.new(),
+            standalone_batch_timer: nil,
+            standalone_waiting: :queue.new(),
+            standalone_waiting_count: 0,
+            standalone_waiting_bytes: 0,
+            standalone_waiting_keys: MapSet.new()
+        }
       end
 
       defp await_standalone_flush(%{standalone_flush_ref: nil} = state), do: state
@@ -347,20 +410,48 @@ defmodule Ferricstore.Store.Shard.Routing do
 
       defp drain_standalone_waiting(%{standalone_write_barrier: true} = state), do: state
 
+      defp drain_standalone_waiting(%{standalone_waiting_count: 0} = state) do
+        %{state | standalone_waiting_bytes: 0, standalone_waiting_keys: MapSet.new()}
+      end
+
       defp drain_standalone_waiting(state) do
-        {ready, waiting} =
-          Enum.split_with(state.standalone_waiting, fn entry ->
-            not standalone_entry_conflicts?(entry, state.standalone_inflight_keys)
-          end)
+        {ready, waiting, waiting_keys, ready_keys, ready_count, ready_bytes} =
+          state.standalone_waiting
+          |> :queue.to_list()
+          |> Enum.reduce(
+            {[], [], MapSet.new(), state.standalone_batch_keys, 0, 0},
+            fn entry, {ready, waiting, blocked_keys, ready_keys, ready_count, ready_bytes} ->
+              {_from, _command, keys, command_bytes} = entry
+
+              if standalone_entry_conflicts?(entry, state.standalone_inflight_keys) or
+                   standalone_entry_conflicts?(entry, blocked_keys) or
+                   standalone_entry_conflicts?(entry, ready_keys) do
+                {ready, [entry | waiting], MapSet.union(blocked_keys, keys), ready_keys,
+                 ready_count, ready_bytes}
+              else
+                {[entry | ready], waiting, blocked_keys, MapSet.union(ready_keys, keys),
+                 ready_count + 1, ready_bytes + command_bytes}
+              end
+            end
+          )
+
+        ready = Enum.reverse(ready)
+        waiting = Enum.reverse(waiting)
 
         %{
           state
-          | standalone_batch: Enum.reverse(ready) ++ state.standalone_batch,
-            standalone_waiting: waiting
+          | standalone_batch: :queue.join(state.standalone_batch, :queue.from_list(ready)),
+            standalone_batch_count: state.standalone_batch_count + ready_count,
+            standalone_batch_bytes: state.standalone_batch_bytes + ready_bytes,
+            standalone_batch_keys: ready_keys,
+            standalone_waiting: :queue.from_list(waiting),
+            standalone_waiting_count: state.standalone_waiting_count - ready_count,
+            standalone_waiting_bytes: state.standalone_waiting_bytes - ready_bytes,
+            standalone_waiting_keys: waiting_keys
         }
       end
 
-      defp standalone_entry_conflicts?({_from, _command, keys}, inflight_keys) do
+      defp standalone_entry_conflicts?({_from, _command, keys, _bytes}, inflight_keys) do
         (standalone_global_keys?(keys) and MapSet.size(inflight_keys) > 0) or
           standalone_global_keys?(inflight_keys) or
           not MapSet.disjoint?(keys, inflight_keys)
@@ -369,15 +460,36 @@ defmodule Ferricstore.Store.Shard.Routing do
       defp standalone_global_keys?(keys), do: MapSet.member?(keys, @standalone_global_key)
 
       defp standalone_entries_keys(entries) do
-        Enum.reduce(entries, MapSet.new(), fn {_from, _command, keys}, acc ->
+        Enum.reduce(entries, MapSet.new(), fn {_from, _command, keys, _bytes}, acc ->
           MapSet.union(acc, keys)
         end)
+      end
+
+      defp standalone_entries_bytes(entries) do
+        Enum.reduce(entries, 0, fn {_from, _command, _keys, bytes}, acc -> acc + bytes end)
       end
 
       defp standalone_command_keys({:batch, commands}) when is_list(commands) do
         commands
         |> Enum.reduce(MapSet.new(), fn command, acc ->
           MapSet.union(acc, standalone_command_keys(command))
+        end)
+        |> standalone_nonempty_keys()
+      end
+
+      defp standalone_command_keys({operation, entries})
+           when operation in [:mset, :msetnx, :mset_blob_batch, :msetnx_blob_batch] and
+                  is_list(entries) do
+        entries
+        |> Enum.reduce(MapSet.new(), fn
+          entry, acc when is_tuple(entry) and tuple_size(entry) >= 3 ->
+            case elem(entry, 0) do
+              key when is_binary(key) -> MapSet.put(acc, standalone_lock_key(key))
+              _invalid -> MapSet.put(acc, @standalone_global_key)
+            end
+
+          _invalid, acc ->
+            MapSet.put(acc, @standalone_global_key)
         end)
         |> standalone_nonempty_keys()
       end
@@ -409,12 +521,54 @@ defmodule Ferricstore.Store.Shard.Routing do
         standalone_global_keys()
       end
 
-      defp standalone_command_keys({:server_command, _command}) do
-        standalone_global_keys()
+      defp standalone_command_keys(
+             {:server_catalog_mutate, namespace, subject, _expected_encoded, _expected_revision,
+              _value, _max_live_entries}
+           )
+           when is_binary(namespace) and is_binary(subject) do
+        MapSet.new([
+          standalone_lock_key(Ferricstore.ServerCatalog.entry_key(namespace, subject)),
+          standalone_lock_key(Ferricstore.ServerCatalog.revision_key(namespace)),
+          standalone_lock_key(Ferricstore.ServerCatalog.live_count_key(namespace))
+        ])
+      rescue
+        ArgumentError -> standalone_global_keys()
+      end
+
+      defp standalone_command_keys(
+             {:server_catalog_replace, namespace, _expected_revision, mutations,
+              _expected_live_count, _max_live_entries}
+           )
+           when is_binary(namespace) and is_list(mutations) do
+        mutations
+        |> Enum.reduce(
+          MapSet.new([
+            standalone_lock_key(Ferricstore.ServerCatalog.revision_key(namespace)),
+            standalone_lock_key(Ferricstore.ServerCatalog.live_count_key(namespace))
+          ]),
+          fn
+            {subject, _value}, acc when is_binary(subject) ->
+              MapSet.put(
+                acc,
+                standalone_lock_key(Ferricstore.ServerCatalog.entry_key(namespace, subject))
+              )
+
+            _invalid, _acc ->
+              throw(:invalid_server_catalog_replacement)
+          end
+        )
+      rescue
+        ArgumentError -> standalone_global_keys()
+      catch
+        :invalid_server_catalog_replacement -> standalone_global_keys()
       end
 
       defp standalone_command_keys({:list_op_lmove, source, destination, _from_dir, _to_dir}) do
         MapSet.new([standalone_lock_key(source), standalone_lock_key(destination)])
+      end
+
+      defp standalone_command_keys({:watch_tokens, keys}) when is_list(keys) do
+        standalone_lock_keys(keys)
       end
 
       defp standalone_command_keys({:pfmerge, destination, sources}) when is_list(sources) do
@@ -436,7 +590,35 @@ defmodule Ferricstore.Store.Shard.Routing do
         standalone_lock_keys(keys)
       end
 
+      defp standalone_command_keys(
+             {:fetch_or_compute_lock, key, outcome_key, _owner_ref, _expire_at_ms}
+           ) do
+        standalone_lock_keys([key, outcome_key])
+      end
+
+      defp standalone_command_keys(
+             {:fetch_or_compute_fail, key, outcome_key, _encoded_error, _expire_at_ms, _owner_ref}
+           ) do
+        standalone_lock_keys([key, outcome_key])
+      end
+
+      defp standalone_command_keys(
+             {:fetch_or_compute_publish, key, _value, _expire_at_ms, _owner_ref}
+           ) do
+        MapSet.new([standalone_lock_key(key)])
+      end
+
+      defp standalone_command_keys(
+             {:fetch_or_compute_publish_blob_ref, key, _encoded_ref, _expire_at_ms, _owner_ref}
+           ) do
+        MapSet.new([standalone_lock_key(key)])
+      end
+
       defp standalone_command_keys({:unlock_keys, keys, _owner_ref}) when is_list(keys) do
+        standalone_lock_keys(keys)
+      end
+
+      defp standalone_command_keys({:unlock_keys_owned, keys, _owner_ref}) when is_list(keys) do
         standalone_lock_keys(keys)
       end
 
@@ -597,25 +779,121 @@ defmodule Ferricstore.Store.Shard.Routing do
         end
       end
 
-      defp reply_standalone_results(entries, results) when length(entries) == length(results) do
-        Enum.zip(entries, results)
-        |> Enum.each(fn {{from, _command, _keys}, result} -> GenServer.reply(from, result) end)
-      end
-
-      defp reply_standalone_results([{from, {:batch, _commands}, _keys}], results) do
-        GenServer.reply(from, {:ok, results})
-      end
-
-      defp reply_standalone_results(entries, [result]) do
-        Enum.each(entries, fn {from, _command, _keys} -> GenServer.reply(from, result) end)
-      end
-
       defp reply_standalone_results(entries, results) do
-        reply_standalone_error(entries, {:standalone_result_mismatch, length(results)})
+        case partition_standalone_results(entries, results, []) do
+          {:ok, replies} ->
+            entries
+            |> Enum.zip(replies)
+            |> Enum.each(fn {{from, _command, _keys, _bytes}, reply} ->
+              GenServer.reply(from, reply)
+            end)
+
+          :mismatch ->
+            reply_standalone_error(entries, {:standalone_result_mismatch, length(results)})
+        end
+      end
+
+      defp partition_standalone_results([], [], replies),
+        do: {:ok, Enum.reverse(replies)}
+
+      defp partition_standalone_results(
+             [{_from, command, _keys, _bytes} | entries],
+             results,
+             replies
+           ) do
+        width = standalone_command_reply_width(command)
+
+        case take_standalone_results(results, width, []) do
+          {:ok, command_results, remaining_results} ->
+            reply =
+              if standalone_multi_reply_command?(command) do
+                {:ok, command_results}
+              else
+                case command_results do
+                  [result] -> result
+                  _invalid -> :standalone_result_mismatch
+                end
+              end
+
+            if reply == :standalone_result_mismatch do
+              :mismatch
+            else
+              partition_standalone_results(entries, remaining_results, [reply | replies])
+            end
+
+          :mismatch ->
+            :mismatch
+        end
+      end
+
+      defp partition_standalone_results(_entries, _results, _replies), do: :mismatch
+
+      defp take_standalone_results(results, 0, acc),
+        do: {:ok, Enum.reverse(acc), results}
+
+      defp take_standalone_results([result | results], remaining, acc) when remaining > 0 do
+        take_standalone_results(results, remaining - 1, [result | acc])
+      end
+
+      defp take_standalone_results(_results, _remaining, _acc), do: :mismatch
+
+      defp flatten_standalone_command_result(command, result) do
+        if standalone_multi_reply_command?(command) do
+          width = standalone_command_reply_width(command)
+
+          cond do
+            width == 0 and result == [] -> {:ok, []}
+            width == 1 -> {:ok, [result]}
+            is_list(result) and exact_standalone_result_count?(result, width) -> {:ok, result}
+            true -> {:error, {:standalone_result_mismatch, result}}
+          end
+        else
+          {:ok, [result]}
+        end
+      end
+
+      defp exact_standalone_result_count?([], 0), do: true
+
+      defp exact_standalone_result_count?([_result | results], remaining) when remaining > 0,
+        do: exact_standalone_result_count?(results, remaining - 1)
+
+      defp exact_standalone_result_count?(_results, _remaining), do: false
+
+      defp standalone_command_reply_width({:batch, commands}) when is_list(commands) do
+        Enum.reduce(commands, 0, fn command, count ->
+          count + standalone_command_reply_width(command)
+        end)
+      end
+
+      defp standalone_command_reply_width({command, entries})
+           when command in [:put_batch, :delete_batch] and is_list(entries),
+           do: length(entries)
+
+      defp standalone_command_reply_width({:put_blob_batch, entries}) when is_list(entries),
+        do: length(entries)
+
+      defp standalone_command_reply_width(_command), do: 1
+
+      defp standalone_multi_reply_command?({:batch, commands}) when is_list(commands), do: true
+
+      defp standalone_multi_reply_command?({command, entries})
+           when command in [:put_batch, :delete_batch] and is_list(entries),
+           do: true
+
+      defp standalone_multi_reply_command?({:put_blob_batch, entries}) when is_list(entries),
+        do: true
+
+      defp standalone_multi_reply_command?(_command), do: false
+
+      defp reply_standalone_error({rear, front} = entries, reason)
+           when is_list(rear) and is_list(front) do
+        entries
+        |> :queue.to_list()
+        |> reply_standalone_error(reason)
       end
 
       defp reply_standalone_error(entries, reason) do
-        Enum.each(entries, fn {from, _command, _keys} ->
+        Enum.each(entries, fn {from, _command, _keys, _bytes} ->
           GenServer.reply(from, {:error, reason})
         end)
       end
@@ -633,7 +911,15 @@ defmodule Ferricstore.Store.Shard.Routing do
         left_keys = standalone_command_keys(left)
         right_keys = standalone_command_keys(right)
 
-        standalone_entry_conflicts?({nil, left, left_keys}, right_keys)
+        standalone_entry_conflicts?({nil, left, left_keys, 0}, right_keys)
+      end
+
+      defp maybe_route_default_waraft_write(
+             _command,
+             %{writes_paused: true} = state,
+             _local_fun
+           ) do
+        {:reply, {:error, "ERR shard writes paused for sync"}, state}
       end
 
       defp maybe_route_default_waraft_write(command, state, local_fun) do
@@ -760,9 +1046,9 @@ defmodule Ferricstore.Store.Shard.Routing do
       end
 
       defp active_file_size(path) do
-        case File.stat(path) do
-          {:ok, %{size: size}} -> size
-          {:error, _reason} -> 0
+        case File.lstat(path) do
+          {:ok, %File.Stat{type: :regular, size: size}} -> size
+          _invalid_or_missing -> 0
         end
       end
 
@@ -814,6 +1100,10 @@ defmodule Ferricstore.Store.Shard.Routing do
         ShardWrites.handle_setrange(key, offset, value, from, state)
       end
 
+      defp handle_forwarded_quorum({:compound_type_claim, redis_key, type}, _from, state) do
+        ShardNativeOps.handle_type_claim(redis_key, type, state)
+      end
+
       defp handle_forwarded_quorum(
              {:compound_put, redis_key, compound_key, value, expire_at_ms},
              _from,
@@ -855,14 +1145,6 @@ defmodule Ferricstore.Store.Shard.Routing do
       end
 
       defp handle_forwarded_quorum({:ratelimit_add, key, window_ms, max, count}, _from, state) do
-        ShardNativeOps.handle_ratelimit_add(key, window_ms, max, count, state)
-      end
-
-      defp handle_forwarded_quorum(
-             {:ratelimit_add, key, window_ms, max, count, _now_ms},
-             _from,
-             state
-           ) do
         ShardNativeOps.handle_ratelimit_add(key, window_ms, max, count, state)
       end
 

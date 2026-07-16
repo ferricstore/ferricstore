@@ -615,7 +615,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
                  )
                ) do
           with :ok <- flow_validate_due_key(record, type, flow_state, priority, partition_key),
-               :ok <- flow_validate_running_index_keys(record, type, partition_key) do
+               :ok <- flow_validate_running_index_keys(record, type, partition_key),
+               :ok <-
+                 flow_validate_shared_value_ref_locality(
+                   record,
+                   flow_record_shared_value_refs(record)
+                 ) do
             flow_validate_metadata_index_keys(record, partition_key)
           end
         end

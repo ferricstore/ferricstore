@@ -31,6 +31,7 @@ defmodule Ferricstore.Commands.ListTest.Sections.Lmove do
           List.handle("RPUSH", ["mylist", "a", "b", "c"], store)
           assert "a" == List.handle("LMOVE", ["mylist", "mylist", "LEFT", "RIGHT"], store)
           assert ["b", "c", "a"] == List.handle("LRANGE", ["mylist", "0", "-1"], store)
+          assert 3 == List.handle("LLEN", ["mylist"], store)
         end
 
         test "returns nil for non-existent source" do
@@ -58,12 +59,12 @@ defmodule Ferricstore.Commands.ListTest.Sections.Lmove do
           List.handle("RPUSH", ["dst", "x"], base)
 
           store =
-            Map.put(base, :compound_put, fn
-              "dst", "L:dst" <> <<0>> <> _pos, _value, 0 ->
+            Map.put(base, :compound_batch_put, fn
+              "dst", _entries ->
                 {:error, :disk_full}
 
-              key, compound_key, value, expire_at_ms ->
-                base.compound_put.(key, compound_key, value, expire_at_ms)
+              key, entries ->
+                base.compound_batch_put.(key, entries)
             end)
 
           assert {:error, :disk_full} ==
@@ -86,11 +87,15 @@ defmodule Ferricstore.Commands.ListTest.Sections.Lmove do
                 send(parent, :type_written)
                 base.compound_put.("dst", dst_type_key, "list", 0)
 
-              "dst", "L:dst" <> <<0>> <> _pos, _value, 0 ->
-                {:error, :disk_full}
-
               key, compound_key, value, expire_at_ms ->
                 base.compound_put.(key, compound_key, value, expire_at_ms)
+            end)
+            |> Map.put(:compound_batch_put, fn
+              "dst", _entries ->
+                {:error, :disk_full}
+
+              key, entries ->
+                base.compound_batch_put.(key, entries)
             end)
             |> Map.put(:compound_delete, fn
               "dst", ^dst_type_key ->

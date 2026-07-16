@@ -6,6 +6,20 @@ defmodule Ferricstore.Cluster.JoinIdentity do
   @spec validate(marker_read(), marker_read(), node()) :: :ok | {:error, term()}
   def validate(local_state, target_state, target_node) do
     case {local_state, target_state} do
+      {{:ok, local}, _}
+      when not is_map(local) or not is_map_key(local, :cluster_id) ->
+        {:error, {:local_cluster_state_invalid, local}}
+
+      {{:ok, %{cluster_id: cluster_id} = local}, _} when not is_binary(cluster_id) ->
+        {:error, {:local_cluster_state_invalid, local}}
+
+      {_, {:ok, target}}
+      when not is_map(target) or not is_map_key(target, :cluster_id) ->
+        {:error, {:target_cluster_state_invalid, target_node, target}}
+
+      {_, {:ok, %{cluster_id: cluster_id} = target}} when not is_binary(cluster_id) ->
+        {:error, {:target_cluster_state_invalid, target_node, target}}
+
       {{:ok, %{cluster_id: cluster_id}},
        {:ok, %{cluster_id: cluster_id, replication_mode: :raft}}}
       when is_binary(cluster_id) ->

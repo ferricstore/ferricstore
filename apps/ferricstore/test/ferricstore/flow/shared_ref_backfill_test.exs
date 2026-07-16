@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
   alias Ferricstore.Flow.NativeOrderedIndex
   alias Ferricstore.Flow.RetentionGuard
   alias Ferricstore.Flow.SharedRefBackfill
+  alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   setup do
@@ -110,6 +111,17 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
 
     assert_raise RuntimeError, ~r/injected_lmdb_read_failure/, fn ->
       run!(test_ctx)
+    end
+
+    refute :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
+  end
+
+  test "missing async fsync completion fails instead of hanging startup", test_ctx do
+    assert_raise RuntimeError, ~r/shared-ref backfill fsync timed out/, fn ->
+      run!(test_ctx,
+        fsync_timeout_ms: 10,
+        fsync_async: fn _caller, _correlation_id, _path -> :ok end
+      )
     end
 
     refute :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
@@ -418,15 +430,15 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
              NativeOrderedIndex.range_slice(native, shadow_index, :neg_inf, :inf, false, 0, :all)
   end
 
-  test "shared-link owner resolution skips a shadow flow that fails exact link validation",
+  test "shared-link owner resolution uses the encoded exact owner instead of a shadow flow",
        test_ctx do
     owner = record("link-owner")
     shadow = record("link-owner:name")
     insert_record!(test_ctx, owner)
     insert_record!(test_ctx, shadow)
 
-    value_ref = Keys.value_key("link-owner:name", :shared, 1, owner.partition_key)
-    link_key = Keys.shared_value_link_prefix(owner.id, owner.partition_key) <> "name:1"
+    value_ref = Keys.named_shared_value_key(owner.id, "name", 1, owner.partition_key)
+    link_key = Keys.shared_value_link_key(owner.id, "name", 1, owner.partition_key)
     append_primary!(test_ctx, [{link_key, value_ref}, {value_ref, Flow.encode_value("value")}])
 
     assert :ok = run!(test_ctx, batch_size: 2, batch_bytes: 2_048)
@@ -589,6 +601,47 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
     assert SharedRefBackfill.verified_complete?(test_ctx.ctx.name, 0)
   end
 
+  test "a forged completion certificate without its proof chain is repaired", test_ctx do
+    ref = shared_ref("forged-certificate-ref")
+    rec = record("forged-certificate-consumer", payload_ref: ref)
+    insert_record!(test_ctx, rec)
+
+    forged_run_id = "forged-complete-run"
+
+    forged_progress =
+      :erlang.term_to_binary(
+        {:shared_ref_backfill_progress, 2, forged_run_id, :complete, <<>>, 0},
+        [:deterministic]
+      )
+
+    append_primary!(test_ctx, [
+      {Keys.shared_value_ref_backfill_key(0), <<1>>},
+      {SharedRefBackfill.progress_key(0), forged_progress}
+    ])
+
+    assert :ok =
+             LMDB.write_batch(LMDB.path(test_ctx.shard_path), [
+               {:put, SharedRefBackfill.completion_key(0),
+                :erlang.term_to_binary(
+                  {:shared_ref_backfill_complete, 2, 0, forged_run_id},
+                  [:deterministic]
+                )}
+             ])
+
+    assert :ok = run!(test_ctx, batch_size: 2, batch_bytes: 2_048)
+
+    registry_key = Keys.shared_value_ref_registry_key(rec.id, rec.partition_key)
+    assert :ets.member(test_ctx.keydir, registry_key)
+
+    assert {:ok, certificate} =
+             LMDB.get(LMDB.path(test_ctx.shard_path), SharedRefBackfill.completion_key(0))
+
+    assert {:shared_ref_backfill_complete, 2, 0, repaired_run_id} =
+             :erlang.binary_to_term(certificate, [:safe])
+
+    refute repaired_run_id == forged_run_id
+  end
+
   test "forged finalize progress cannot manufacture a completion certificate", test_ctx do
     rec = record("forged-finalize")
     insert_record!(test_ctx, rec)
@@ -613,6 +666,26 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
              :erlang.binary_to_term(certificate, [:safe])
 
     refute run_id == "client-controlled-run"
+  end
+
+  test "non-canonical authoritative progress fails closed", test_ctx do
+    encoded =
+      :erlang.term_to_binary(
+        {:shared_ref_backfill_progress, 2, "noncanonical-run", :cleanup_stale, <<>>, 0}
+      ) <> <<0>>
+
+    append_primary!(test_ctx, [{SharedRefBackfill.progress_key(0), encoded}])
+
+    assert :ok =
+             LMDB.write_batch(LMDB.path(test_ctx.shard_path), [
+               {:put, "__ferricstore:shared-ref-backfill:progress:v2:0", encoded}
+             ])
+
+    assert_raise RuntimeError, ~r/corrupt migration progress/, fn ->
+      run!(test_ctx, batch_size: 2, batch_bytes: 2_048)
+    end
+
+    refute :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
   end
 
   test "forged mid-run phase and cursor cannot skip staged state work", test_ctx do
@@ -666,7 +739,8 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
     refute source =~ "NIF.v2_fsync("
     assert source =~ "NIF.v2_append_batch_nosync("
     assert source =~ "NIF.v2_append_ops_batch_nosync("
-    assert source =~ "NIF.v2_fsync_async("
+    assert source =~ "&NIF.v2_fsync_async/3"
+    assert source =~ "ctx.fsync_async.(self(), correlation_id, file_path)"
   end
 
   test "keydir safe fixation is released before LMDB state pages", test_ctx do
@@ -769,6 +843,30 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
              :erlang.binary_to_term(current_progress, [:safe])
 
     refute run_id == "pre-flush-run"
+  end
+
+  test "empty-shard finalization treats the durable server catalog as control-plane data",
+       test_ctx do
+    catalog_key = ServerCatalog.revision_key("acl")
+    catalog_value = ServerCatalog.encode_revision(9)
+
+    :ets.insert(
+      test_ctx.keydir,
+      {catalog_key, catalog_value, 0, 0, 0, 0, byte_size(catalog_value)}
+    )
+
+    assert :ok =
+             SharedRefBackfill.finalize_empty_shard!(
+               test_ctx.shard_path,
+               test_ctx.keydir,
+               test_ctx.shard_index,
+               test_ctx.ctx,
+               active_file_id: 0,
+               active_file_path: test_ctx.active_file_path
+             )
+
+    assert [{^catalog_key, ^catalog_value, 0, 0, 0, 0, _size}] =
+             :ets.lookup(test_ctx.keydir, catalog_key)
   end
 
   defp run!(test_ctx, opts \\ []) do

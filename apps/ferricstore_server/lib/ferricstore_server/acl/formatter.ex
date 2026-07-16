@@ -11,8 +11,29 @@ defmodule FerricstoreServer.Acl.Formatter do
     keys = format_keys(user.keys)
     channels = format_channels(Rules.user_channels(user))
     cmds = format_user_commands(user)
-    "user #{name} #{flag} #{keys} #{channels} #{cmds}"
+    username = name |> file_username_tokens() |> Enum.join(" ")
+    "#{username} #{flag} #{keys} #{channels} #{cmds}"
   end
+
+  @doc false
+  @spec split_user_rule(binary()) :: {:ok, {binary(), binary(), binary()}} | :error
+  def split_user_rule(rule) when is_binary(rule) do
+    case String.split(rule, " ", parts: 4, trim: true) do
+      ["user", username, state, summary] ->
+        {:ok, {username, state, summary}}
+
+      ["user64", "b" <> encoded_username, state, summary] ->
+        case Base.url_decode64(encoded_username, padding: false) do
+          {:ok, username} -> {:ok, {username, state, summary}}
+          :error -> :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  def split_user_rule(_rule), do: :error
 
   @spec format_user_commands(user()) :: binary()
   def format_user_commands(%{commands: :all, denied_commands: denied}) do
@@ -42,9 +63,9 @@ defmodule FerricstoreServer.Acl.Formatter do
 
   def format_keys(patterns) when is_list(patterns) do
     Enum.map_join(patterns, " ", fn
-      {glob, :rw, _regex} -> "~#{glob}"
-      {glob, :read, _regex} -> "%R~#{glob}"
-      {glob, :write, _regex} -> "%W~#{glob}"
+      {glob, :rw, _regex} -> format_key_rule_token(glob, :rw)
+      {glob, :read, _regex} -> format_key_rule_token(glob, :read)
+      {glob, :write, _regex} -> format_key_rule_token(glob, :write)
     end)
   end
 
@@ -53,12 +74,12 @@ defmodule FerricstoreServer.Acl.Formatter do
   def format_channels([]), do: "resetchannels"
 
   def format_channels(patterns) when is_list(patterns) do
-    Enum.map_join(patterns, " ", fn {glob, _regex} -> "&#{glob}" end)
+    Enum.map_join(patterns, " ", fn {glob, _regex} -> format_channel_rule_token(glob) end)
   end
 
   @spec format_user_for_file({binary(), user()}) :: binary()
   def format_user_for_file({name, user}) do
-    parts = ["user", name]
+    parts = file_username_tokens(name)
     parts = parts ++ [if(user.enabled, do: "on", else: "off")]
 
     parts =
@@ -75,9 +96,9 @@ defmodule FerricstoreServer.Acl.Formatter do
         patterns ->
           parts ++
             Enum.map(patterns, fn
-              {glob, :rw, _regex} -> "~#{glob}"
-              {glob, :read, _regex} -> "%R~#{glob}"
-              {glob, :write, _regex} -> "%W~#{glob}"
+              {glob, :rw, _regex} -> format_key_rule_token(glob, :rw)
+              {glob, :read, _regex} -> format_key_rule_token(glob, :read)
+              {glob, :write, _regex} -> format_key_rule_token(glob, :write)
             end)
       end
 
@@ -118,6 +139,38 @@ defmodule FerricstoreServer.Acl.Formatter do
   defp format_channel_rule_tokens([]), do: ["resetchannels"]
 
   defp format_channel_rule_tokens(patterns) when is_list(patterns) do
-    Enum.map(patterns, fn {glob, _regex} -> "&#{glob}" end)
+    Enum.map(patterns, fn {glob, _regex} -> format_channel_rule_token(glob) end)
+  end
+
+  defp file_username_tokens(name) when is_binary(name) do
+    if name != "" and plain_file_token?(name) do
+      ["user", name]
+    else
+      ["user64", "b" <> Base.url_encode64(name, padding: false)]
+    end
+  end
+
+  defp format_key_rule_token(glob, mode) do
+    if plain_file_token?(glob) do
+      key_rule_prefix(mode) <> glob
+    else
+      "key64:#{mode}:b" <> Base.url_encode64(glob, padding: false)
+    end
+  end
+
+  defp format_channel_rule_token(glob) do
+    if plain_file_token?(glob) do
+      "&" <> glob
+    else
+      "channel64:b" <> Base.url_encode64(glob, padding: false)
+    end
+  end
+
+  defp key_rule_prefix(:rw), do: "~"
+  defp key_rule_prefix(:read), do: "%R~"
+  defp key_rule_prefix(:write), do: "%W~"
+
+  defp plain_file_token?(value) when is_binary(value) do
+    String.valid?(value) and not Regex.match?(~r/[\s\p{C}]/u, value)
   end
 end

@@ -221,13 +221,17 @@ defmodule FerricstoreServer.AclTest do
       assert {:error, _} = Acl.authenticate("alice", "notempty")
     end
 
-    test "very long password is accepted" do
-      long_pass = String.duplicate("a", 10_000)
+    test "password length matches the authentication ingress limit" do
+      long_pass = String.duplicate("a", 4_096)
       assert :ok = Acl.set_user("alice", ["on", ">" <> long_pass])
       user = Acl.get_user("alice")
       # Password is hashed
       refute user.password == long_pass
       assert {:ok, "alice"} = Acl.authenticate("alice", long_pass)
+
+      oversized = long_pass <> "a"
+      assert {:error, reason} = Acl.set_user("alice", [">" <> oversized])
+      assert reason =~ "password exceeds 4096 bytes"
     end
 
     test "unicode password is accepted" do
@@ -688,8 +692,8 @@ defmodule FerricstoreServer.AclTest do
       assert {:error, _} = Acl.authenticate("alice", "wrong")
     end
 
-    test "very long password authentication" do
-      long_pass = String.duplicate("x", 10_000)
+    test "maximum-length password authentication" do
+      long_pass = String.duplicate("x", 4_096)
       assert :ok = Acl.set_user("alice", ["on", ">" <> long_pass])
       assert {:ok, "alice"} = Acl.authenticate("alice", long_pass)
     end
@@ -955,6 +959,13 @@ defmodule FerricstoreServer.AclTest do
       regex = Acl.compile_glob("foo.bar")
       assert Regex.match?(regex, "foo.bar")
       refute Regex.match?(regex, "fooXbar")
+    end
+
+    test "consecutive wildcards compile to one greedy fragment" do
+      regex = Acl.compile_glob("***cache:**")
+
+      assert Regex.source(regex) == "^.*cache:.*$"
+      assert Regex.match?(regex, "tenant:cache:key")
     end
 
     test "exact key match (no wildcards)" do

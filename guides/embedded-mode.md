@@ -534,7 +534,7 @@ Cuckoo filters support deletion (unlike Bloom). Auto-created with capacity 1024 
 ```elixir
 # TOPK.RESERVE -- create tracker
 :ok = FerricStore.topk_reserve("top10", 10)
-# Optional: FerricStore.topk_reserve("top10", 10, width: 8, depth: 7, decay: 0.9)
+# Optional: FerricStore.topk_reserve("top10", 10)
 
 # TOPK.ADD -- add items (returns evicted items or nil)
 {:ok, evicted} = FerricStore.topk_add("top10", ["item1", "item2", "item3"])
@@ -661,10 +661,13 @@ case FerricStore.fetch_or_compute("expensive:key", ttl: 60_000) do
     # Cache hit -- return immediately
     value
 
-  {:ok, {:compute, _hint}} ->
+  {:ok, {:compute, _hint, token}} ->
     # Cache miss -- this process is the designated computer
     value = expensive_computation()
-    FerricStore.fetch_or_compute_result("expensive:key", value, ttl: 60_000)
+    FerricStore.fetch_or_compute_result("expensive:key", value,
+      token: token,
+      ttl: 60_000
+    )
     value
 end
 ```
@@ -672,7 +675,7 @@ end
 To report a computation error:
 
 ```elixir
-FerricStore.fetch_or_compute_error("expensive:key", "computation failed")
+FerricStore.fetch_or_compute_error("expensive:key", "computation failed", token: token)
 ```
 
 ### Multi/Transaction
@@ -890,10 +893,10 @@ defmodule MyApp.Cache do
   def fetch_or_compute(key, ttl, fun) do
     case FerricStore.fetch_or_compute(key, ttl: ttl) do
       {:ok, {:hit, bin}} -> :erlang.binary_to_term(bin)
-      {:ok, {:compute, _}} ->
+      {:ok, {:compute, _, token}} ->
         value = fun.()
         bin = :erlang.term_to_binary(value)
-        FerricStore.fetch_or_compute_result(key, bin, ttl: ttl)
+        FerricStore.fetch_or_compute_result(key, bin, token: token, ttl: ttl)
         value
     end
   end

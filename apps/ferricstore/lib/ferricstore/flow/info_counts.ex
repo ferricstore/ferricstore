@@ -1,6 +1,7 @@
 defmodule Ferricstore.Flow.InfoCounts do
   @moduledoc false
 
+  alias Ferricstore.BatchResult
   alias Ferricstore.Flow.Keys
 
   def zero_counts(default_state, terminal_states) do
@@ -33,11 +34,25 @@ defmodule Ferricstore.Flow.InfoCounts do
     |> Enum.map(fn {_state, key} -> key end)
   end
 
+  def validate_counts(expected, counts) do
+    with {:ok, validated} <-
+           BatchResult.map_exact(expected, counts, fn _entry, count -> count end),
+         true <- Enum.all?(validated, &(is_integer(&1) and &1 >= 0)) do
+      {:ok, validated}
+    else
+      false -> {:error, {:invalid_batch_results, counts}}
+      {:error, _reason} = error -> error
+    end
+  end
+
   def merge_terminal_counts(acc, terminal_keys, counts) do
-    terminal_keys
-    |> Enum.zip(counts)
-    |> Enum.reduce(acc, fn {key, count}, count_acc ->
-      Map.update!(count_acc, key, &(&1 + count))
-    end)
+    with {:ok, counts} <- validate_counts(terminal_keys, counts) do
+      {:ok,
+       terminal_keys
+       |> Enum.zip(counts)
+       |> Enum.reduce(acc, fn {key, count}, count_acc ->
+         Map.update!(count_acc, key, &(&1 + count))
+       end)}
+    end
   end
 end

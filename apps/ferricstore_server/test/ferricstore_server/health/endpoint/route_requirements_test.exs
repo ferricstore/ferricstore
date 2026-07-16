@@ -27,6 +27,22 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
 
     assert RouteRequirements.dashboard_route_requirement("GET", "/dashboard/flow/governance") ==
              {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}}
+
+    for path <- [
+          "/dashboard/prefixes",
+          "/dashboard/api/prefixes"
+        ] do
+      assert RouteRequirements.dashboard_route_requirement("GET", path) ==
+               {"SCAN", key: {"*", :read}}
+    end
+
+    for path <- [
+          "/dashboard/reads",
+          "/dashboard/api/reads"
+        ] do
+      assert RouteRequirements.dashboard_route_requirement("GET", path) ==
+               {"INFO", key: {"*", :read}}
+    end
   end
 
   test "dashboard_route_requirement scopes keyspace and flow lookup reads" do
@@ -109,7 +125,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
     assert RouteRequirements.flow_schedule_form_requirement(%{
              "action" => "pause",
              "id" => "tenant-a:schedule:daily"
-           }) == {"FLOW.SCHEDULE.PAUSE", key: {"tenant-a:schedule:daily", :write}}
+           }) == {"FLOW.SCHEDULE.PAUSE", key: {"*", :write}}
 
     assert RouteRequirements.flow_reclaim_form_requirement(%{
              "type" => "email",

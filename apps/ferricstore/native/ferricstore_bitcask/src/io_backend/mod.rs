@@ -14,14 +14,12 @@
 //! the full duration of the write, but never blocks a normal scheduler.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
-// On Linux, bring in the uring backend modules.
-#[cfg(target_os = "linux")]
-pub mod async_uring;
+// On Linux, bring in the synchronous uring backend.
 #[cfg(target_os = "linux")]
 pub mod uring;
 
@@ -34,6 +32,10 @@ pub trait IoBackend: Send {
     /// Append `data` to the file. Returns the byte offset where the write
     /// started (i.e. the value callers should store as the record's offset
     /// in the keydir).
+    ///
+    /// If this returns an error, the implementation must roll back any bytes
+    /// written by this call before returning. Callers may have a stale cached
+    /// offset because multiple backend instances can append to the same file.
     ///
     /// # Errors
     ///
@@ -53,14 +55,9 @@ pub trait IoBackend: Send {
     /// successful `append`.
     fn offset(&self) -> u64;
 
-    /// Advance the internal write offset by `bytes` without actually writing
-    /// any data. Used by the async `io_uring` path to reserve file space that
-    /// will be written by an `AsyncUringBackend` operating on the same file.
-    ///
-    /// The default implementation does nothing. Backends that track an
-    /// internal offset counter (like `SyncBackend`) override this to keep
-    /// their counter in sync with externally-written bytes.
-    fn advance_offset(&mut self, _bytes: u64) {}
+    /// Discard every byte at or after `offset` and durably publish the shorter
+    /// file length. This is used only on failed append transactions.
+    fn rollback_to(&mut self, offset: u64) -> io::Result<()>;
 
     /// Flush any internal write buffer to the OS page cache **without**
     /// calling fsync. This makes the data visible to subsequent reads via
@@ -79,10 +76,10 @@ pub trait IoBackend: Send {
 
     /// Append multiple buffers as a single atomic batch, then fsync once.
     ///
-    /// The default implementation calls `append` for each buffer and then
-    /// `sync`. Platform-specific backends may override this to submit all
-    /// writes in a single syscall before fsyncing (e.g. `io_uring`'s batch
-    /// submission path).
+    /// Implementations must hold their file-level append lock across the full
+    /// append + sync transaction. Building this from separate `append` calls
+    /// is unsafe because another backend instance can interleave bytes before
+    /// rollback.
     ///
     /// Returns the starting offset of each buffer in the same order as the
     /// input slice.
@@ -90,25 +87,240 @@ pub trait IoBackend: Send {
     /// # Errors
     ///
     /// Returns an `io::Error` if any write or the final sync fails.
-    fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
-        let mut offsets = Vec::with_capacity(buffers.len());
-        for buf in buffers {
-            offsets.push(self.append(buf)?);
-        }
-        self.sync()?;
-        Ok(offsets)
+    fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>>;
+
+    fn append_and_sync(&mut self, data: &[u8]) -> io::Result<u64> {
+        self.append_batch_and_sync(&[data])
+            .map(|offsets| offsets[0])
     }
+}
+
+pub(super) fn rollback_failure(cause: io::Error, rollback: io::Error) -> io::Error {
+    io::Error::new(
+        cause.kind(),
+        format!("append failed: {cause}; durable rollback failed: {rollback}"),
+    )
+}
+
+pub(super) fn checked_append_end(offset: u64, len: usize) -> io::Result<u64> {
+    let len = u64::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "append length exceeds the file-offset domain",
+        )
+    })?;
+    offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "append file offset overflow"))
+}
+
+/// Validate one submitted io_uring write batch while consuming every CQE.
+/// Draining is required even after the first error because the ring is reused.
+#[cfg(any(test, target_os = "linux"))]
+pub(super) fn validate_uring_batch_completions(
+    completions: impl IntoIterator<Item = (u64, i32)>,
+    expected_lengths: &[usize],
+) -> io::Result<()> {
+    let mut seen = vec![false; expected_lengths.len()];
+    let mut completed = 0usize;
+    let mut first_error = None;
+
+    for (tag, result) in completions {
+        completed = completed.saturating_add(1);
+
+        let Ok(index) = usize::try_from(tag) else {
+            first_error.get_or_insert_with(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "io_uring completion index exceeds platform size",
+                )
+            });
+            continue;
+        };
+
+        let Some(&expected_len) = expected_lengths.get(index) else {
+            first_error.get_or_insert_with(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("io_uring returned unknown completion index {index}"),
+                )
+            });
+            continue;
+        };
+
+        if std::mem::replace(&mut seen[index], true) {
+            first_error.get_or_insert_with(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("io_uring returned duplicate completion index {index}"),
+                )
+            });
+            continue;
+        }
+
+        if result < 0 {
+            first_error.get_or_insert_with(|| io::Error::from_raw_os_error(-result));
+        } else if usize::try_from(result).ok() != Some(expected_len) {
+            first_error.get_or_insert_with(|| {
+                io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "io_uring short write: expected {expected_len} B for entry {index}, wrote {result} B"
+                    ),
+                )
+            });
+        }
+    }
+
+    if completed != expected_lengths.len() {
+        first_error.get_or_insert_with(|| {
+            io::Error::other(format!(
+                "io_uring batch: expected {} completions, got {completed}",
+                expected_lengths.len()
+            ))
+        });
+    }
+
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Validate one synchronous io_uring operation while draining every CQE.
+///
+/// A duplicate or stale CQE must not remain in the reusable ring where the
+/// next operation could mistake it for its own completion.
+#[cfg(any(test, target_os = "linux"))]
+pub(super) fn validate_uring_single_completion(
+    completions: impl IntoIterator<Item = (u64, i32)>,
+    expected_tag: u64,
+    expected_result: usize,
+    operation: &str,
+) -> io::Result<()> {
+    let mut completed = 0usize;
+    let mut first_error = None;
+
+    for (tag, result) in completions {
+        completed = completed.saturating_add(1);
+
+        if tag != expected_tag {
+            first_error.get_or_insert_with(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "io_uring {operation} returned completion tag {tag}, expected {expected_tag}"
+                    ),
+                )
+            });
+            continue;
+        }
+
+        if result < 0 {
+            first_error.get_or_insert_with(|| io::Error::from_raw_os_error(-result));
+        } else if usize::try_from(result).ok() != Some(expected_result) {
+            first_error.get_or_insert_with(|| {
+                io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "io_uring {operation}: expected result {expected_result}, got {result}"
+                    ),
+                )
+            });
+        }
+    }
+
+    if completed != 1 {
+        first_error.get_or_insert_with(|| {
+            io::Error::other(format!(
+                "io_uring {operation}: expected one completion, got {completed}"
+            ))
+        });
+    }
+
+    first_error.map_or(Ok(()), Err)
 }
 
 type AppendLock = Arc<Mutex<()>>;
 
-static APPEND_LOCKS: OnceLock<Mutex<HashMap<PathBuf, AppendLock>>> = OnceLock::new();
+#[derive(Debug)]
+struct AppendLockKey {
+    #[cfg(any(test, not(unix)))]
+    path: std::path::PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
 
-pub(crate) fn append_lock_for_path(path: &Path) -> AppendLock {
-    let key = path.to_path_buf();
+impl PartialEq for AppendLockKey {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(not(unix))]
+        {
+            self.path == other.path
+        }
+    }
+}
+
+impl Eq for AppendLockKey {}
+
+impl std::hash::Hash for AppendLockKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        #[cfg(unix)]
+        {
+            self.device.hash(state);
+            self.inode.hash(state);
+        }
+        #[cfg(not(unix))]
+        self.path.hash(state);
+    }
+}
+
+fn append_lock_key(path: &Path, file: &File) -> io::Result<AppendLockKey> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        #[cfg(not(test))]
+        let _ = path;
+        let metadata = file.metadata()?;
+        Ok(AppendLockKey {
+            #[cfg(test)]
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(AppendLockKey {
+            path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+        })
+    }
+}
+
+static APPEND_LOCKS: OnceLock<Mutex<HashMap<AppendLockKey, Weak<Mutex<()>>>>> = OnceLock::new();
+
+pub(crate) fn append_lock_for_file(path: &Path, file: &File) -> io::Result<AppendLock> {
+    let key = append_lock_key(path, file)?;
     let locks = APPEND_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().expect("append lock registry poisoned");
-    Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+    let mut locks = locks.lock().unwrap_or_else(PoisonError::into_inner);
+
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+pub(crate) fn lock_append(lock: &AppendLock) -> io::Result<MutexGuard<'_, ()>> {
+    lock.lock()
+        .map_err(|_| io::Error::other("append lock poisoned"))
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +332,7 @@ pub(crate) fn append_lock_for_path(path: &Path) -> AppendLock {
 /// This is the fallback backend used on all platforms. On macOS (and any
 /// platform where `io_uring` is unavailable) this is the only backend.
 pub struct SyncBackend {
-    writer: BufWriter<File>,
+    writer: Option<BufWriter<File>>,
     offset: u64,
     append_lock: AppendLock,
 }
@@ -133,12 +345,13 @@ impl SyncBackend {
     /// Returns an `io::Error` if the file cannot be opened or its size cannot
     /// be determined.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = crate::open_append_nofollow(path)?;
         let offset = file.metadata()?.len();
+        let append_lock = append_lock_for_file(path, &file)?;
         Ok(Self {
-            writer: BufWriter::with_capacity(256 * 1024, file), // H-1: 256KB buffer for batch writes
+            writer: Some(BufWriter::with_capacity(256 * 1024, file)), // H-1: 256KB buffer for batch writes
             offset,
-            append_lock: append_lock_for_path(path),
+            append_lock,
         })
     }
 
@@ -155,12 +368,13 @@ impl SyncBackend {
     /// Returns an `io::Error` if the file cannot be opened or its size cannot
     /// be determined.
     pub fn open_small_buffer(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = crate::open_append_nofollow(path)?;
         let offset = file.metadata()?.len();
+        let append_lock = append_lock_for_file(path, &file)?;
         Ok(Self {
-            writer: BufWriter::with_capacity(8 * 1024, file),
+            writer: Some(BufWriter::with_capacity(8 * 1024, file)),
             offset,
-            append_lock: append_lock_for_path(path),
+            append_lock,
         })
     }
 }
@@ -168,14 +382,27 @@ impl SyncBackend {
 impl IoBackend for SyncBackend {
     fn append(&mut self, data: &[u8]) -> io::Result<u64> {
         let append_lock = Arc::clone(&self.append_lock);
-        let _guard = append_lock.lock().expect("append lock poisoned");
+        let _guard = lock_append(&append_lock)?;
+        let start = self.writer().get_ref().metadata()?.len();
+        let end = checked_append_end(start, data.len())?;
 
-        self.writer.flush()?;
-        let start = self.writer.get_ref().metadata()?.len();
-        self.writer.write_all(data)?;
-        self.writer.flush()?;
-        self.offset = start + data.len() as u64;
-        Ok(start)
+        let result = (|| {
+            self.writer().flush()?;
+            self.writer().write_all(data)?;
+            self.writer().flush()?;
+            Ok(start)
+        })();
+
+        match result {
+            Ok(start) => {
+                self.offset = end;
+                Ok(start)
+            }
+            Err(cause) => match self.rollback_locked(start) {
+                Ok(()) => Err(cause),
+                Err(rollback) => Err(rollback_failure(cause, rollback)),
+            },
+        }
     }
 
     /// C-7 fix: use `sync_data()` (`fdatasync`) instead of `sync_all()` (`fsync`).
@@ -184,13 +411,13 @@ impl IoBackend for SyncBackend {
     /// and 5-50us faster on NVMe. For append-only logs the file size is the only
     /// critical metadata, and `fdatasync` syncs size changes on Linux.
     fn sync(&mut self) -> io::Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
+        self.writer().flush()?;
+        self.writer().get_ref().sync_data()?;
         Ok(())
     }
 
     fn flush_no_sync(&mut self) -> io::Result<()> {
-        self.writer.flush()?;
+        self.writer().flush()?;
         Ok(())
     }
 
@@ -198,28 +425,69 @@ impl IoBackend for SyncBackend {
         self.offset
     }
 
-    fn advance_offset(&mut self, bytes: u64) {
-        self.offset += bytes;
+    fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
+        let append_lock = Arc::clone(&self.append_lock);
+        let _guard = lock_append(&append_lock)?;
+        self.rollback_locked(offset)
     }
 
     fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
         let append_lock = Arc::clone(&self.append_lock);
-        let _guard = append_lock.lock().expect("append lock poisoned");
-
-        self.writer.flush()?;
-        let mut running = self.writer.get_ref().metadata()?.len();
+        let _guard = lock_append(&append_lock)?;
+        let start = self.writer().get_ref().metadata()?.len();
+        let mut running = start;
         let mut offsets = Vec::with_capacity(buffers.len());
 
         for buf in buffers {
-            offsets.push(running);
-            self.writer.write_all(buf)?;
-            running += buf.len() as u64;
+            running = checked_append_end(running, buf.len())?;
+        }
+        let end = running;
+        running = start;
+
+        let result = (|| {
+            self.writer().flush()?;
+
+            for buf in buffers {
+                offsets.push(running);
+                self.writer().write_all(buf)?;
+                running = checked_append_end(running, buf.len())?;
+            }
+
+            self.writer().flush()?;
+            self.writer().get_ref().sync_data()?;
+            Ok(offsets)
+        })();
+
+        match result {
+            Ok(offsets) => {
+                self.offset = end;
+                Ok(offsets)
+            }
+            Err(cause) => match self.rollback_locked(start) {
+                Ok(()) => Err(cause),
+                Err(rollback) => Err(rollback_failure(cause, rollback)),
+            },
+        }
+    }
+}
+
+impl SyncBackend {
+    fn writer(&mut self) -> &mut BufWriter<File> {
+        self.writer.as_mut().expect("SyncBackend writer missing")
+    }
+
+    fn rollback_locked(&mut self, offset: u64) -> io::Result<()> {
+        let writer = self.writer.take().expect("SyncBackend writer missing");
+        let capacity = writer.capacity();
+        let (file, _buffer) = writer.into_parts();
+        let rollback_result = file.set_len(offset).and_then(|()| file.sync_data());
+        self.writer = Some(BufWriter::with_capacity(capacity, file));
+
+        if rollback_result.is_ok() {
+            self.offset = offset;
         }
 
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
-        self.offset = running;
-        Ok(offsets)
+        rollback_result
     }
 }
 
@@ -311,6 +579,12 @@ mod tests {
     }
 
     #[test]
+    fn append_end_rejects_file_offset_overflow() {
+        let error = checked_append_end(u64::MAX, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn sync_backend_append_and_sync() {
         let dir = tmp();
         let path = dir.path().join("test.log");
@@ -342,6 +616,21 @@ mod tests {
             4,
             "offset must resume at file size after reopen"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_backend_rejects_a_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tmp();
+        let target = dir.path().join("outside.log");
+        let link = dir.path().join("active.log");
+        std::fs::write(&target, b"outside").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(SyncBackend::open(&link).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"outside");
     }
 
     #[test]
@@ -617,5 +906,90 @@ mod tests {
 
         assert_eq!(off, 0);
         assert_eq!(backend.offset(), 4);
+    }
+
+    #[test]
+    fn append_lock_registry_prunes_closed_segment_paths() {
+        let dir = tmp();
+
+        for index in 0..64 {
+            let path = dir.path().join(format!("{index}.log"));
+            drop(SyncBackend::open(&path).unwrap());
+        }
+
+        let active_path = dir.path().join("active.log");
+        let _active = SyncBackend::open(&active_path).unwrap();
+
+        let locks = APPEND_LOCKS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let retained = locks
+            .keys()
+            .filter(|key| key.path.starts_with(dir.path()))
+            .count();
+
+        assert_eq!(retained, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_aliases_share_one_append_lock() {
+        let dir = tmp();
+        let path = dir.path().join("segment.log");
+        let alias = dir.path().join("segment-alias.log");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+
+        let primary = SyncBackend::open(&path).unwrap();
+        let secondary = SyncBackend::open(&alias).unwrap();
+
+        assert!(Arc::ptr_eq(&primary.append_lock, &secondary.append_lock));
+    }
+
+    #[test]
+    fn poisoned_append_lock_returns_io_error() {
+        let lock = Arc::new(Mutex::new(()));
+        let poison = Arc::clone(&lock);
+
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison append lock");
+        });
+
+        assert!(lock_append(&lock).is_err());
+    }
+
+    #[test]
+    fn uring_batch_validation_drains_completions_after_early_error() {
+        use std::cell::Cell;
+
+        let visited = Cell::new(0usize);
+        let completions = [(0, -libc::EIO), (1, 4)]
+            .into_iter()
+            .inspect(|_completion| {
+                visited.set(visited.get() + 1);
+            });
+
+        let error = validate_uring_batch_completions(completions, &[4, 4]).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(visited.get(), 2, "all submitted CQEs must be drained");
+    }
+
+    #[test]
+    fn uring_single_validation_drains_and_rejects_duplicate_or_wrong_tags() {
+        use std::cell::Cell;
+
+        let visited = Cell::new(0usize);
+        let completions = [(0x01, 4), (0x01, 4)]
+            .into_iter()
+            .inspect(|_completion| visited.set(visited.get() + 1));
+
+        assert!(validate_uring_single_completion(completions, 0x01, 4, "write").is_err());
+        assert_eq!(visited.get(), 2, "all unexpected CQEs must be drained");
+
+        assert!(validate_uring_single_completion([(0x02, 4)], 0x01, 4, "write").is_err());
     }
 }

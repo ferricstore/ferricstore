@@ -100,15 +100,18 @@
     #[test]
     fn file_alternate_bucket_is_involution() {
         // alt(alt(b, fp)) == b  (the cuckoo property)
-        for i in 0..1000 {
-            let elem = format!("invol_{i}");
-            let (fp, b1) = cuckoo_file_fingerprint_and_bucket(elem.as_bytes(), 1, 1024);
-            let b2 = cuckoo_file_alternate_bucket(b1, &fp, 1024);
-            let b1_again = cuckoo_file_alternate_bucket(b2, &fp, 1024);
-            assert_eq!(
-                b1, b1_again,
-                "alternate_bucket must be an involution for elem {i}"
-            );
+        for num_buckets in [1, 3, 10, 127, 1024] {
+            for i in 0..1000 {
+                let elem = format!("invol_{num_buckets}_{i}");
+                let (fp, b1) =
+                    cuckoo_file_fingerprint_and_bucket(elem.as_bytes(), 1, num_buckets);
+                let b2 = cuckoo_file_alternate_bucket(b1, &fp, num_buckets);
+                let b1_again = cuckoo_file_alternate_bucket(b2, &fp, num_buckets);
+                assert_eq!(
+                    b1, b1_again,
+                    "alternate_bucket must be an involution for {num_buckets} buckets, elem {i}"
+                );
+            }
         }
     }
 
@@ -178,12 +181,61 @@
     }
 
     #[test]
+    fn identical_primary_and_alternate_bucket_is_visited_once() {
+        assert_eq!(
+            cuckoo_file_candidate_buckets(7, 7).collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert_eq!(
+            cuckoo_file_candidate_buckets(7, 9).collect::<Vec<_>>(),
+            vec![7, 9]
+        );
+    }
+
+    #[test]
     fn truncated_header_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncated.cuckoo");
         std::fs::write(&path, [0u8; 10]).unwrap();
         let file = File::open(&path).unwrap();
         assert!(cuckoo_read_header(&file).is_err());
+    }
+
+    #[test]
+    fn complete_header_rejects_a_truncated_bucket_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_buckets.cuckoo");
+        let mut header = [0u8; HEADER_SIZE];
+        header[0..2].copy_from_slice(&MAGIC);
+        header[2] = VERSION;
+        header[3..7].copy_from_slice(&4u32.to_le_bytes());
+        header[7] = 2;
+        header[8] = 1;
+        header[9..11].copy_from_slice(&500u16.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        assert!(cuckoo_read_header(&File::open(path).unwrap()).is_err());
+    }
+
+    #[test]
+    fn header_rejects_num_items_larger_than_total_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("impossible_items.cuckoo");
+        let mut data = [0u8; HEADER_SIZE + 1];
+        data[0..2].copy_from_slice(&MAGIC);
+        data[2] = VERSION;
+        data[3..7].copy_from_slice(&1u32.to_le_bytes());
+        data[7] = 1;
+        data[8] = 1;
+        data[9..11].copy_from_slice(&1u16.to_le_bytes());
+        data[11..19].copy_from_slice(&2u64.to_le_bytes());
+        std::fs::write(&path, data).unwrap();
+
+        let error = cuckoo_read_header(&File::open(path).unwrap())
+            .err()
+            .expect("impossible num_items must be rejected");
+
+        assert!(error.contains("num_items"));
     }
 
     #[test]
@@ -745,4 +797,3 @@
     // -----------------------------------------------------------------------
     // Full integration tests using test helpers
     // -----------------------------------------------------------------------
-

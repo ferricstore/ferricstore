@@ -28,14 +28,17 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetFileRefTreatsColdEmp
         assert is_integer(value_offset)
       end
 
-      test "get_with_file_ref falls back on cold rows with invalid offsets", %{
+      test "get_with_file_ref rejects live cold rows with invalid offsets", %{
         ctx: ctx,
         keydir: keydir
       } do
         key = "cold_invalid_offset:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
-        assert :miss == Router.get_with_file_ref(ctx, key)
+        assert {:error, {:storage_read_failed, {:invalid_keydir_entry, _entry}}} =
+                 Router.get_with_file_ref(ctx, key)
+
+        assert [{^key, nil, 0, _lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
       end
 
       test "get_with_file_ref retries when compaction changes the cold row after validation misses",
@@ -113,7 +116,8 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetFileRefTreatsColdEmp
         :ok = GenServer.call(shard, :flush)
         assert [{^key, nil, 0, lfu, fid, off, ^value_size}] = :ets.lookup(keydir, key)
 
-        assert {:cold, ^fid, ^off, ^value_size, 0} = Router.watch_token(ctx, key)
+        assert {:watch, {:sha256, digest}, 0} = Router.watch_token(ctx, key)
+        assert digest == :crypto.hash(:sha256, value)
         assert [{^key, nil, 0, ^lfu, ^fid, ^off, ^value_size}] = :ets.lookup(keydir, key)
       end
 
@@ -374,15 +378,26 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetFileRefTreatsColdEmp
                  )
       end
 
-      test "direct cold reads do not crash on cold rows with invalid offsets", %{
+      test "direct cold reads reject live cold rows with invalid offsets", %{
         ctx: ctx,
         keydir: keydir
       } do
         key = "cold_invalid_get:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
-        assert nil == Router.get(ctx, key)
-        assert nil == Router.get_meta(ctx, key)
+        assert {:error, {:storage_read_failed, {:invalid_keydir_entry, _entry}}} =
+                 Router.get(ctx, key)
+
+        assert {:error, {:storage_read_failed, {:invalid_keydir_entry, _entry}}} =
+                 Router.get_meta(ctx, key)
+
+        assert {:error, {:storage_read_failed, {:invalid_keydir_entry, _entry}}} =
+                 Router.getrange(ctx, key, 0, 2)
+
+        assert {:error, "ERR storage read failed"} =
+                 Ferricstore.Commands.Strings.handle("GETRANGE", [key, "0", "2"], ctx)
+
+        assert [{^key, nil, 0, _lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
       end
 
       test "compound_get reads a valid shared cold row without the shard GenServer", %{
@@ -650,17 +665,20 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetFileRefTreatsColdEmp
         end
       end
 
-      test "failed direct cold GET increments keyspace misses", %{ctx: ctx, keydir: keydir} do
+      test "failed direct cold GET does not increment keyspace misses", %{
+        ctx: ctx,
+        keydir: keydir
+      } do
         key = "cold_missing_get_stats:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 99, 0, 5})
 
         before_misses = Stats.keyspace_misses(ctx)
 
-        assert nil == Router.get(ctx, key)
-        assert Stats.keyspace_misses(ctx) == before_misses + 1
+        assert {:error, {:storage_read_failed, _reason}} = Router.get(ctx, key)
+        assert Stats.keyspace_misses(ctx) == before_misses
       end
 
-      test "failed direct cold GET_META increments misses without cold-read success", %{
+      test "failed direct cold GET_META does not increment misses or cold-read success", %{
         ctx: ctx,
         keydir: keydir
       } do
@@ -672,8 +690,8 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetFileRefTreatsColdEmp
         before_misses = Stats.keyspace_misses(ctx)
         before_cold_reads = Stats.total_cold_reads(ctx)
 
-        assert nil == Router.get_meta(ctx, key)
-        assert Stats.keyspace_misses(ctx) == before_misses + 1
+        assert {:error, {:storage_read_failed, _reason}} = Router.get_meta(ctx, key)
+        assert Stats.keyspace_misses(ctx) == before_misses
         assert Stats.total_cold_reads(ctx) == before_cold_reads
       end
 

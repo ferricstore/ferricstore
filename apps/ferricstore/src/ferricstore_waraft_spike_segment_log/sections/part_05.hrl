@@ -13,7 +13,7 @@ validate_segment_log_dir(Dir) ->
     end.
 
 encode_record({Index, Entry}) ->
-    Payload = term_to_binary({Index, Entry}),
+    Payload = encode_external_term({Index, Entry}),
     Len = byte_size(Payload),
     Crc = erlang:crc32(Payload),
     <<Len:32/unsigned-big, Crc:32/unsigned-big, Payload/binary>>.
@@ -190,7 +190,7 @@ locate_disk_record_offset(Dir, Index, RecordsPerSegment) ->
     Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = FileBytes}} ->
-            case file:open(Path, [read, raw, binary]) of
+            case open_verified_segment_file(Path, [read, raw, binary]) of
                 {ok, Fd} ->
                     Result =
                         try locate_disk_record_offset_fd(Fd, Path, Index, 0, FileBytes, Ordinal, RecordsPerSegment) of
@@ -439,9 +439,39 @@ refresh_memory_stats(Name, Dir) ->
                     choose_last(OldLast, EtsLast)
                 };
             not_found ->
-                {EtsFirst, EtsLast}
+                recover_durable_memory_boundaries(Dir, EtsFirst, EtsLast)
         end,
     set_memory_stats(Name, Dir, Count, Bytes, First, Last).
+
+recover_durable_memory_boundaries(Dir, EtsFirst, EtsLast) ->
+    case existing_records_per_segment(Dir) of
+        {ok, RecordsPerSegment} ->
+            case segment_paths(Dir) of
+                {ok, Paths} ->
+                    case scan_segment_paths(
+                        Paths,
+                        undefined,
+                        RecordsPerSegment,
+                        undefined,
+                        undefined,
+                        0
+                    ) of
+                        {ok, DiskFirst, DiskLast, _Count} ->
+                            {
+                                choose_first(DiskFirst, EtsFirst),
+                                choose_last(DiskLast, EtsLast)
+                            };
+                        {error, _Reason} ->
+                            {EtsFirst, EtsLast}
+                    end;
+                {error, _Reason} ->
+                    {EtsFirst, EtsLast}
+            end;
+        not_found ->
+            {EtsFirst, EtsLast};
+        {error, _Reason} ->
+            {EtsFirst, EtsLast}
+    end.
 
 append_memory_stats(_Name, _Dir, []) ->
     ok;
@@ -916,7 +946,14 @@ preload_segment_config(Dir) ->
 read_segment_metadata_file(Path, TooLargeReason) ->
     case file:read_link_info(Path) of
         {ok, #file_info{type = regular, size = Size}} when Size =< ?MAX_SEGMENT_METADATA_BYTES ->
-            file:read_file(Path);
+            case read_segment_file_nofollow(Path, ?MAX_SEGMENT_METADATA_BYTES) of
+                {error, {too_large, Detail}} ->
+                    {error, {TooLargeReason, changed_after_validation, ?MAX_SEGMENT_METADATA_BYTES, Detail}};
+                {error, {symlink, _Detail}} ->
+                    {error, {unsafe_segment_metadata_path, Path, symlink}};
+                Result ->
+                    Result
+            end;
         {ok, #file_info{type = regular, size = Size}} ->
             {error, {TooLargeReason, Size, ?MAX_SEGMENT_METADATA_BYTES}};
         {ok, #file_info{type = Type}} ->

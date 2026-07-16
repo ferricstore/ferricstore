@@ -59,10 +59,16 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         key = "cold_invalid_batch:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
-        assert [nil] == Router.batch_get(ctx, [key])
+        assert [{:error, {:storage_read_failed, {:invalid_keydir_entry, _entry}}}] =
+                 Router.batch_get(ctx, [key])
+
+        assert [{^key, nil, 0, _lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
       end
 
-      test "failed batch cold GET increments keyspace misses", %{ctx: ctx, keydir: keydir} do
+      test "failed batch cold GET does not increment keyspace misses", %{
+        ctx: ctx,
+        keydir: keydir
+      } do
         key =
           "cold_batch_missing_stats:" <> Integer.to_string(:erlang.unique_integer([:positive]))
 
@@ -71,8 +77,8 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         before_misses = Stats.keyspace_misses(ctx)
         before_cold_reads = Stats.total_cold_reads(ctx)
 
-        assert [nil] == Router.batch_get(ctx, [key])
-        assert Stats.keyspace_misses(ctx) == before_misses + 1
+        assert [{:error, {:storage_read_failed, _reason}}] = Router.batch_get(ctx, [key])
+        assert Stats.keyspace_misses(ctx) == before_misses
         assert Stats.total_cold_reads(ctx) == before_cold_reads
       end
 
@@ -102,7 +108,10 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         Process.put(:ferricstore_router_pread_batch_keyed_result, {:ok, ["only-one-value"]})
 
         try do
-          assert [nil, nil] == Router.batch_get(ctx, [key1, key2])
+          assert [
+                   {:error, {:storage_read_failed, _reason1}},
+                   {:error, {:storage_read_failed, _reason2}}
+                 ] = Router.batch_get(ctx, [key1, key2])
 
           assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 2},
                           %{path: ^path, reason: :batch_result_length_mismatch}}
@@ -129,7 +138,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         )
 
         try do
-          assert [nil] == Router.batch_get(ctx, [key])
+          assert [{:error, {:storage_read_failed, _reason}}] = Router.batch_get(ctx, [key])
 
           assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                           %{path: ^path, reason: :missing_file}}
@@ -152,7 +161,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         attach_pread_corrupt_handler()
         before_misses = Stats.keyspace_misses(ctx)
 
-        assert [nil] == Router.batch_get(ctx, [key])
+        assert [{:error, {:storage_read_failed, _reason}}] = Router.batch_get(ctx, [key])
         assert Stats.keyspace_misses(ctx) == before_misses
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
@@ -175,7 +184,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         attach_pread_corrupt_handler()
         before_misses = Stats.keyspace_misses(ctx)
 
-        assert nil == Router.get(ctx, key)
+        assert {:error, {:storage_read_failed, _reason}} = Router.get(ctx, key)
         assert Stats.keyspace_misses(ctx) == before_misses
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
@@ -243,7 +252,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         attach_pread_corrupt_handler()
         before_misses = Stats.keyspace_misses(ctx)
 
-        assert nil == Router.get_meta(ctx, key)
+        assert {:error, {:storage_read_failed, _reason}} = Router.get_meta(ctx, key)
         assert Stats.keyspace_misses(ctx) == before_misses
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
@@ -266,7 +275,10 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         attach_pread_corrupt_handler()
         before_misses = Stats.keyspace_misses(ctx)
 
-        assert nil == Router.getrange(ctx, key, 0, 2)
+        assert {:error, {:storage_read_failed, _reason}} = Router.getrange(ctx, key, 0, 2)
+        assert {:error, "ERR storage read failed"} =
+                 Ferricstore.Commands.Strings.handle("GETRANGE", [key, "0", "2"], ctx)
+
         assert Stats.keyspace_misses(ctx) == before_misses
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
@@ -289,8 +301,8 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
 
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
 
-        assert nil == Router.get(ctx, key)
-        assert nil == Router.get_meta(ctx, key)
+        assert {:error, {:storage_read_failed, _get_reason}} = Router.get(ctx, key)
+        assert {:error, {:storage_read_failed, _meta_reason}} = Router.get_meta(ctx, key)
       end
 
       test "batch cold reads do not return values from mismatched key offsets", %{
@@ -307,7 +319,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
 
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, other_offset, value_size})
 
-        assert [nil] == Router.batch_get(ctx, [key])
+        assert [{:error, {:storage_read_failed, _reason}}] = Router.batch_get(ctx, [key])
       end
 
       test "direct cold reads emit telemetry when a cold record cannot be decoded", %{
@@ -330,7 +342,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
 
         attach_pread_corrupt_handler()
 
-        assert nil == Router.get(ctx, key)
+        assert {:error, {:storage_read_failed, _reason}} = Router.get(ctx, key)
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                         %{path: ^path, reason: :corrupt_record}}
@@ -350,7 +362,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
 
         attach_pread_corrupt_handler()
 
-        assert nil == Router.get(ctx, key)
+        assert {:error, {:storage_read_failed, _reason}} = Router.get(ctx, key)
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                         %{path: ^missing_path, reason: :missing_file}}
@@ -371,7 +383,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         attach_pread_corrupt_handler()
         attach_cold_retry_exhausted_handler()
 
-        assert nil == Router.get(ctx, key)
+        assert {:error, {:storage_read_failed, _reason}} = Router.get(ctx, key)
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                         %{path: ^missing_path, reason: :missing_file}}
@@ -459,7 +471,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         attach_pread_corrupt_handler()
         attach_cold_retry_exhausted_handler()
 
-        assert nil == Router.get_meta(ctx, key)
+        assert {:error, {:storage_read_failed, _reason}} = Router.get_meta(ctx, key)
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                         %{path: ^missing_path, reason: :missing_file}}
@@ -509,7 +521,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
 
         on_exit(fn -> :telemetry.detach(handler_id) end)
 
-        assert [nil] == Router.batch_get(ctx, [key])
+        assert [{:error, {:storage_read_failed, _reason}}] = Router.batch_get(ctx, [key])
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                         %{path: ^path, reason: :corrupt_record}}
@@ -540,7 +552,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
 
         on_exit(fn -> :telemetry.detach(handler_id) end)
 
-        assert [nil] == Router.batch_get(ctx, [key])
+        assert [{:error, {:storage_read_failed, _reason}}] = Router.batch_get(ctx, [key])
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                         %{path: ^missing_path, reason: :missing_file}}
@@ -561,7 +573,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         attach_pread_corrupt_handler()
         attach_cold_retry_exhausted_handler()
 
-        assert [nil] == Router.batch_get(ctx, [key])
+        assert [{:error, {:storage_read_failed, _reason}}] = Router.batch_get(ctx, [key])
 
         assert_receive {:pread_corrupt, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                         %{path: ^missing_path, reason: :missing_file}}
@@ -658,7 +670,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         :ok = :file.pwrite(fd, corrupt_at, <<"X">>)
         :ok = :file.close(fd)
 
-        assert [^same_file_good_value, nil, ^good_value] =
+        assert [^same_file_good_value, {:error, {:storage_read_failed, _reason}}, ^good_value] =
                  Router.batch_get(ctx, [same_file_good_key, bad_key, good_key])
       end
 
@@ -721,7 +733,10 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         key = "cold_invalid_sendfile:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
-        assert nil == Router.get_file_ref(ctx, key)
+        assert {:error, {:storage_read_failed, {:invalid_keydir_entry, _entry}}} =
+                 Router.get_file_ref(ctx, key)
+
+        assert [{^key, nil, 0, _lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
       end
 
       test "get_file_ref retries when compaction changes the cold row after validation misses", %{
@@ -834,23 +849,28 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         end
       end
 
-      test "get_keydir_file_ref rejects cold rows with invalid offsets", %{
+      test "get_keydir_file_ref reports invalid live rows without deleting them", %{
         ctx: ctx,
         keydir: keydir
       } do
         key = "cold_invalid_file_ref:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
-        assert :miss == Router.get_keydir_file_ref(ctx, key)
-        assert [] == :ets.lookup(keydir, key)
+        assert {:error, {:storage_read_failed, {:invalid_keydir_entry, _entry}}} =
+                 Router.get_keydir_file_ref(ctx, key)
+
+        assert [{^key, nil, 0, _lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
       end
 
-      test "value_size rejects cold rows with invalid offsets", %{ctx: ctx, keydir: keydir} do
+      test "value_size reads independent metadata without deleting an invalid location", %{
+        ctx: ctx,
+        keydir: keydir
+      } do
         key = "cold_invalid_value_size:" <> Integer.to_string(:erlang.unique_integer([:positive]))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, :pending_offset, 5})
 
-        assert nil == Router.value_size(ctx, key)
-        assert [] == :ets.lookup(keydir, key)
+        assert 5 == Router.value_size(ctx, key)
+        assert [{^key, nil, 0, _lfu, 0, :pending_offset, 5}] = :ets.lookup(keydir, key)
       end
 
       test "value_size preserves live pending cold rows", %{ctx: ctx, keydir: keydir} do

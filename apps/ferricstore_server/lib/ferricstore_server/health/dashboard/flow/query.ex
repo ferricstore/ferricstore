@@ -2,6 +2,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   @moduledoc false
 
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
+  alias FerricstoreServer.Health.QueryDecoder
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls
   import FerricstoreServer.Health.Dashboard.Flow.Sample
@@ -43,7 +44,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   @spec lineage_opts_from_query(binary()) :: keyword()
   def lineage_opts_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     []
     |> maybe_put_query_opt(:mode, normalize_flow_lineage_mode(Map.get(params, "mode")))
@@ -68,13 +69,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
       |> collect_flow_records_sample()
       |> DashboardAccess.filter_flow_records_for_acl(acl_username)
 
+    {query_result, query_acl_scope} = execute_flow_query_for_acl(filters, acl_username)
+
     %{
       filters: filters,
       result:
-        flow_query_execute(filters)
+        query_result
         |> DashboardAccess.flow_query_filter_result_for_acl(
           acl_username,
-          flow_query_acl_scope(filters)
+          query_acl_scope
         ),
       available_types: flow_available_types(sampled_records),
       total_sampled: length(sampled_records),
@@ -85,7 +88,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   @spec query_opts_from_query(binary()) :: keyword()
   def query_opts_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     []
     |> maybe_put_query_opt(:kind, normalize_flow_query_kind(Map.get(params, "kind")))
@@ -136,6 +139,60 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     end
   end
 
+  defp execute_flow_query_for_acl(
+         %{kind: "history", id: id} = filters,
+         username
+       )
+       when is_binary(id) and id != "" and is_binary(username) do
+    opts =
+      [payload: false]
+      |> maybe_put_query_opt(:partition_key, Map.get(filters, :partition_key))
+      |> Enum.reverse()
+
+    case bounded_dashboard_call(
+           fn -> flow_dashboard_flow_get(id, opts) end,
+           flow_dashboard_detail_fetch_timeout_ms(),
+           :query_history_record
+         ) do
+      {:ok, {:ok, record}} when is_map(record) ->
+        execute_authorized_flow_history_query(filters, record, username)
+
+      _other ->
+        denied_flow_history_query(filters)
+    end
+  end
+
+  defp execute_flow_query_for_acl(filters, _username),
+    do: {flow_query_execute(filters), flow_query_acl_scope(filters)}
+
+  defp execute_authorized_flow_history_query(filters, record, username) do
+    if DashboardAccess.flow_record_allowed_for_acl?(record, username) do
+      partition_key = flow_record_partition_key(record)
+
+      filters =
+        if is_binary(partition_key) and partition_key != "" do
+          Map.put(filters, :partition_key, partition_key)
+        else
+          filters
+        end
+
+      {flow_query_execute(filters), partition_key || flow_record_id(record)}
+    else
+      denied_flow_history_query(filters)
+    end
+  end
+
+  defp denied_flow_history_query(filters) do
+    result = %{
+      status: :ok,
+      command: flow_query_kind_command(Map.get(filters, :kind)),
+      rows: [],
+      message: "0 row(s)"
+    }
+
+    {result, "*"}
+  end
+
   @spec collect_signals_page(keyword()) :: map()
   def collect_signals_page(opts \\ []) when is_list(opts) do
     filters = flow_signals_filters_from_opts(opts)
@@ -173,7 +230,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   @spec signals_opts_from_query(binary()) :: keyword()
   def signals_opts_from_query(query) when is_binary(query) do
-    params = URI.decode_query(query)
+    params = QueryDecoder.decode(query)
 
     []
     |> maybe_put_query_opt(:type, normalize_flow_type_filter(Map.get(params, "type")))

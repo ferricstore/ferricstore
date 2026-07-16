@@ -123,8 +123,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
 
       defp validate_storage_config(other), do: {:error, {:bad_config, other}}
 
-      defp validate_storage_snapshot_boundary(%{snapshot_boundary_position: position}) do
+      defp validate_storage_snapshot_boundary(%{
+             position: position,
+             snapshot_boundary_position: position
+           }) do
         validate_raft_position(position)
+      end
+
+      defp validate_storage_snapshot_boundary(%{
+             position: position,
+             snapshot_boundary_position: boundary
+           }) do
+        with :ok <- validate_raft_position(boundary) do
+          {:error, {:snapshot_boundary_position_mismatch, position, boundary}}
+        end
       end
 
       defp validate_storage_snapshot_boundary(_metadata), do: :ok
@@ -146,12 +158,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       defp validate_raft_position(other), do: {:error, {:bad_position, other}}
 
       defp persisted_binary_to_term(binary) do
-        term =
-          binary
-          |> :erlang.binary_to_term([:safe])
-          |> decode_persisted_metadata_term()
-
-        {:ok, term}
+        with {:ok, term} <- Ferricstore.TermCodec.decode(binary) do
+          {:ok, decode_persisted_metadata_term(term)}
+        end
       rescue
         error -> {:error, error}
       end
@@ -197,7 +206,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              {:flow_apply_context_v1, _retention_ttl_ms, _history_hot, _history_max,
               _max_history_hot, _max_history, _cleanup_keys, _cleanup_bytes, _history_scan,
               _value_scan, _hibernation_enabled, _hot_window_ms, _safety_margin_ms,
-              _promote_window_ms, _late_promote_window_ms} = encoded
+              _promote_window_ms, _late_promote_window_ms, _flow_max_batch_items,
+              _promotion_threshold,
+              _compound_delete_member_budget, _max_value_size} = encoded
            ) do
         case Ferricstore.Raft.ApplyContext.decode(encoded) do
           {:ok, context} -> context

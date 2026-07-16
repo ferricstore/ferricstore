@@ -9,6 +9,8 @@ defmodule Ferricstore.Store.ValueCodec do
 
   alias Ferricstore.HLC
 
+  @integer_float_fast_path_bytes 32
+
   # ---------------------------------------------------------------------------
   # Integer parsing
   # ---------------------------------------------------------------------------
@@ -31,7 +33,8 @@ defmodule Ferricstore.Store.ValueCodec do
   strings ("3.14"). Returns `{:ok, float}` or `:error`.
   """
   @spec parse_float(binary()) :: {:ok, float()} | :error
-  def parse_float(str) when is_binary(str) do
+  def parse_float(str)
+      when is_binary(str) and byte_size(str) <= @integer_float_fast_path_bytes do
     case Integer.parse(str) do
       {val, ""} ->
         {:ok, val * 1.0}
@@ -41,11 +44,16 @@ defmodule Ferricstore.Store.ValueCodec do
     end
   end
 
+  def parse_float(str) when is_binary(str), do: parse_float_value(str)
+
   defp parse_float_value(str) do
     case Float.parse(str) do
       {val, ""} when val not in [:infinity, :neg_infinity, :nan] -> {:ok, val}
       _ -> :error
     end
+  rescue
+    ArgumentError -> :error
+    ArithmeticError -> :error
   end
 
   @doc """
@@ -84,7 +92,7 @@ defmodule Ferricstore.Store.ValueCodec do
   def encode_ratelimit(cur, start, prev), do: <<cur::64, start::64, prev::64>>
 
   @doc """
-  Decodes rate limiter state from a 24-byte binary or legacy string format.
+  Decodes rate limiter state from its fixed-width 24-byte binary format.
   """
   @spec decode_ratelimit(binary()) :: {integer(), integer(), integer()}
   def decode_ratelimit(value), do: decode_ratelimit(value, HLC.now_ms())
@@ -99,20 +107,6 @@ defmodule Ferricstore.Store.ValueCodec do
   def decode_ratelimit(<<cur::64, start::64, prev::64>>, _fallback_start_ms),
     do: {cur, start, prev}
 
-  def decode_ratelimit(value, fallback_start_ms) when is_binary(value) do
-    # Legacy fallback: decode old string-encoded values ("cur:start:prev").
-    case String.split(value, ":") do
-      [cur, start, prev] ->
-        with {:ok, cur} <- parse_integer(cur),
-             {:ok, start} <- parse_integer(start),
-             {:ok, prev} <- parse_integer(prev) do
-          {cur, start, prev}
-        else
-          :error -> {0, fallback_start_ms, 0}
-        end
-
-      _ ->
-        {0, fallback_start_ms, 0}
-    end
-  end
+  def decode_ratelimit(_value, fallback_start_ms),
+    do: {0, fallback_start_ms, 0}
 end

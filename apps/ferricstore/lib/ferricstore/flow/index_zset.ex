@@ -18,7 +18,7 @@ defmodule Ferricstore.Flow.IndexZSet do
     end
   end
 
-  def range_by_score(ctx, key, min, max) do
+  def range_by_score(ctx, key, min, max, count) do
     case Router.flow_index_score_range_slice(
            ctx,
            key,
@@ -26,7 +26,7 @@ defmodule Ferricstore.Flow.IndexZSet do
            ScoreBound.parse(max),
            false,
            0,
-           :all
+           count
          ) do
       {:ok, members} -> {:ok, Enum.map(members, fn {member, _score} -> member end)}
       :unavailable -> {:error, "ERR flow index unavailable"}

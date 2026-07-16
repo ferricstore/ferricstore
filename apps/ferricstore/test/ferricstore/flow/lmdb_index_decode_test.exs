@@ -7,28 +7,60 @@ defmodule Ferricstore.Flow.LMDBIndexDecodeTest do
 
   test "terminal entries keep live rows" do
     key = LMDB.terminal_index_key("terminal:type:done", "flow-1", 100)
-    value = LMDB.encode_terminal_index_value("flow-1", 100, 1_000, "state-key")
+    count_key = LMDB.terminal_count_key("terminal:type:done")
+    value = LMDB.encode_terminal_index_value("flow-1", 100, 1_000, "state-key", count_key)
 
-    assert LMDBIndexDecode.terminal_entries([{key, value}], "unused", 999) == [{"flow-1", 100}]
+    assert LMDBIndexDecode.terminal_entries([{key, value}], "unused", 999) ==
+             {:ok, [{"flow-1", 100}]}
   end
 
-  test "query entries keep live rows and skip malformed values" do
+  test "query entries keep live rows and reject malformed values" do
     key = LMDB.query_index_key("parent:p1", "flow-1", 100)
     value = LMDB.encode_query_index_value("flow-1", 100, 0, "state-key")
 
-    assert LMDBIndexDecode.query_entries(
-             [{key, value}, {"bad", "not-a-valid-index"}],
-             "unused",
-             999
-           ) ==
-             [{"flow-1", 100, "state-key"}]
+    assert {:error, {:invalid_query_index_value, "bad"}} =
+             LMDBIndexDecode.query_entries(
+               [{key, value}, {"bad", "not-a-valid-index"}],
+               "unused",
+               999
+             )
   end
 
   test "history entries keep live rows" do
     key = LMDB.history_index_key("history:flow-1", "event-1", 100)
     value = LMDB.encode_history_index_value("event-1", 100, "history-key", 0)
 
-    assert LMDBIndexDecode.history_entries([{key, value}], "unused", 999) == [{"event-1", 100}]
+    assert LMDBIndexDecode.history_entries([{key, value}], "unused", 999) ==
+             {:ok, [{"event-1", 100}]}
+  end
+
+  test "ordered index entries reject key and value identity mismatches" do
+    terminal_key = LMDB.terminal_index_key("terminal:type:done", "flow-1", 100)
+    terminal_count_key = LMDB.terminal_count_key("terminal:type:done")
+
+    terminal_value =
+      LMDB.encode_terminal_index_value(
+        "other-flow",
+        100,
+        0,
+        "state-key",
+        terminal_count_key
+      )
+
+    assert {:error, {:invalid_terminal_index_value, ^terminal_key}} =
+             LMDBIndexDecode.terminal_entries([{terminal_key, terminal_value}], "unused", 999)
+
+    query_key = LMDB.query_index_key("parent:p1", "flow-1", 100)
+    query_value = LMDB.encode_query_index_value("flow-1", 101, 0, "state-key")
+
+    assert {:error, {:invalid_query_index_value, ^query_key}} =
+             LMDBIndexDecode.query_entries([{query_key, query_value}], "unused", 999)
+
+    history_key = LMDB.history_index_key("history:flow-1", "event-1", 100)
+    history_value = LMDB.encode_history_index_value("event-2", 100, "compound-key", 0)
+
+    assert {:error, {:invalid_history_index_value, ^history_key}} =
+             LMDBIndexDecode.history_entries([{history_key, history_value}], "unused", 999)
   end
 
   test "query entries delete expired rows" do
@@ -39,8 +71,26 @@ defmodule Ferricstore.Flow.LMDBIndexDecodeTest do
     assert :ok = LMDB.write_batch(path, [{:put, key, value}])
     assert {:ok, ^value} = LMDB.get(path, key)
 
-    assert LMDBIndexDecode.query_entries([{key, value}], path, 11) == []
+    assert LMDBIndexDecode.query_entries([{key, value}], path, 11) == {:ok, []}
     assert LMDB.get(path, key) == :not_found
+  end
+
+  @tag :lmdb_reverse_before_cursor
+  test "reverse-before scan excludes an exact cursor key before applying its limit" do
+    path = tmp_lmdb_path()
+    prefix = "cursor:"
+    first_key = prefix <> "a"
+    cursor_key = prefix <> "b"
+
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, first_key, "first"},
+               {:put, cursor_key, "cursor"},
+               {:put, prefix <> "c", "last"}
+             ])
+
+    assert {:ok, [{^first_key, "first"}]} =
+             LMDB.prefix_entries_reverse_before(path, prefix, cursor_key, 1)
   end
 
   defp tmp_lmdb_path do

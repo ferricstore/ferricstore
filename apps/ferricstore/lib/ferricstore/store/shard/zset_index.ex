@@ -14,33 +14,39 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     }
   end
 
-  @spec ensure(map(), binary(), binary(), binary() | nil) :: map()
+  @spec ensure(map(), binary(), binary(), binary() | nil) ::
+          {:ok, map()} | Ferricstore.Store.ReadResult.failure()
   def ensure(state, redis_key, prefix, data_path) do
     cond do
       not ready_tables?(state) ->
-        state
+        {:ok, state}
 
       ready_key?(state.zset_score_lookup, redis_key) ->
-        state
+        {:ok, state}
 
       true ->
         clear_key(state.zset_score_index, state.zset_score_lookup, redis_key)
-        :ets.insert(state.zset_score_lookup, {{:count, redis_key}, 0})
 
-        state
-        |> ShardETS.prefix_scan_entries(prefix, data_path)
-        |> Enum.each(fn {member, score_str} ->
-          put_member(
-            state.zset_score_index,
-            state.zset_score_lookup,
-            redis_key,
-            member,
-            score_str
-          )
-        end)
+        case ShardETS.prefix_scan_entries(state, prefix, data_path) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
 
-        :ets.insert(state.zset_score_lookup, {{:ready, redis_key}, true})
-        %{state | zset_index_ready: MapSet.put(state.zset_index_ready, redis_key)}
+          entries when is_list(entries) ->
+            :ets.insert(state.zset_score_lookup, {{:count, redis_key}, 0})
+
+            Enum.each(entries, fn {member, score_str} ->
+              put_member(
+                state.zset_score_index,
+                state.zset_score_lookup,
+                redis_key,
+                member,
+                score_str
+              )
+            end)
+
+            :ets.insert(state.zset_score_lookup, {{:ready, redis_key}, true})
+            {:ok, %{state | zset_index_ready: MapSet.put(state.zset_index_ready, redis_key)}}
+        end
     end
   end
 
@@ -258,6 +264,38 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     end
   end
 
+  @spec reset(map()) :: map()
+  def reset(state) when is_map(state) do
+    state
+    |> zset_table(:zset_score_index, :zset_score_index_name)
+    |> delete_all_objects()
+
+    state
+    |> zset_table(:zset_score_lookup, :zset_score_lookup_name)
+    |> delete_all_objects()
+
+    if Map.has_key?(state, :zset_index_ready) do
+      Map.put(state, :zset_index_ready, MapSet.new())
+    else
+      state
+    end
+  end
+
+  defp zset_table(state, primary_key, fallback_key) do
+    Map.get(state, primary_key) || Map.get(state, fallback_key)
+  end
+
+  defp delete_all_objects(nil), do: :ok
+
+  defp delete_all_objects(table) do
+    case :ets.info(table) do
+      :undefined -> :ok
+      _info -> :ets.delete_all_objects(table)
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
   @spec put_member(:ets.tid(), :ets.tid(), binary(), binary(), binary()) :: :ok
   def put_member(index_table, lookup_table, redis_key, member, score_str) do
     case parse_score(score_str) do
@@ -384,11 +422,32 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec clear_key(:ets.tid(), :ets.tid(), binary()) :: :ok
   def clear_key(index_table, lookup_table, redis_key) do
-    delete_index_entries(index_table, :ets.next(index_table, {redis_key, @index_tag}), redis_key)
+    delete_index_entries(index_table, :ets.next(index_table, first_before(redis_key)), redis_key)
     :ets.match_delete(lookup_table, {{redis_key, :_}, :_})
     :ets.delete(lookup_table, {:ready, redis_key})
     :ets.delete(lookup_table, {:count, redis_key})
     :ok
+  end
+
+  @spec rebuild_key(:ets.tid(), :ets.tid(), binary(), [{binary(), score_input()}]) ::
+          :ok | {:error, {:invalid_score, binary(), term()}}
+  def rebuild_key(index_table, lookup_table, redis_key, member_score_pairs) do
+    with :ok <- validate_member_scores(member_score_pairs) do
+      clear_key(index_table, lookup_table, redis_key)
+      :ets.insert(lookup_table, {{:count, redis_key}, 0})
+      put_new_members(index_table, lookup_table, redis_key, member_score_pairs)
+      :ets.insert(lookup_table, {{:ready, redis_key}, true})
+      :ok
+    end
+  end
+
+  defp validate_member_scores(member_score_pairs) do
+    Enum.reduce_while(member_score_pairs, :ok, fn {member, score}, :ok ->
+      case parse_score(score) do
+        {:ok, _parsed} -> {:cont, :ok}
+        :error -> {:halt, {:error, {:invalid_score, member, score}}}
+      end
+    end)
   end
 
   defp count_all(lookup_table, redis_key) do

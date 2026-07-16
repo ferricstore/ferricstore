@@ -2,6 +2,7 @@ defmodule FerricStore.API.Store do
   @moduledoc false
 
   alias Ferricstore.Store.Router
+  alias Ferricstore.TermCodec
 
   def default_ctx do
     FerricStore.Instance.get(:default)
@@ -135,7 +136,7 @@ defmodule FerricStore.API.Store do
     index = Router.shard_for(ctx, key)
     ensure_prob_registry_tables(index)
 
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    data_dir = ctx.data_dir
     shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
     %{
@@ -164,7 +165,7 @@ defmodule FerricStore.API.Store do
 
   def build_topk_store(key) do
     ctx = default_ctx()
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    data_dir = ctx.data_dir
     index = Router.shard_for(ctx, key)
     shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
@@ -175,16 +176,11 @@ defmodule FerricStore.API.Store do
             nil
 
           bin when is_binary(bin) ->
-            try do
-              :erlang.binary_to_term(bin, [:safe])
-            rescue
-              ArgumentError -> bin
-            end
+            decode_topk_metadata(bin)
         end
       end,
       put: fn key, val, exp ->
-        encoded = if is_tuple(val), do: :erlang.term_to_binary(val), else: val
-        Router.put(ctx, key, encoded, exp)
+        Router.put(ctx, key, encode_topk_metadata(val), exp)
       end,
       delete: fn k -> Router.delete(ctx, k) end,
       exists?: fn k -> Router.exists?(ctx, k) end,
@@ -222,25 +218,11 @@ defmodule FerricStore.API.Store do
             nil
 
           bin when is_binary(bin) ->
-            try do
-              case :erlang.binary_to_term(bin, [:safe]) do
-                {:tdigest, _, _} = tuple -> tuple
-                _ -> bin
-              end
-            rescue
-              ArgumentError -> bin
-            end
+            decode_tdigest(bin)
         end
       end,
       put: fn key, val, exp ->
-        encoded =
-          if is_tuple(val) and tuple_size(val) >= 1 and elem(val, 0) == :tdigest do
-            :erlang.term_to_binary(val)
-          else
-            val
-          end
-
-        Router.put(ctx, key, encoded, exp)
+        Router.put(ctx, key, encode_tdigest(val), exp)
       end,
       delete: fn k -> Router.delete(ctx, k) end,
       exists?: fn key ->
@@ -249,6 +231,32 @@ defmodule FerricStore.API.Store do
       keys: fn -> Router.keys(ctx) end
     }
   end
+
+  defp decode_topk_metadata(binary) do
+    case TermCodec.decode(binary) do
+      {:ok, {:topk_meta, metadata} = value} when is_map(metadata) -> value
+      {:ok, {:topk_path, path} = value} when is_binary(path) -> value
+      _invalid_or_unrelated -> binary
+    end
+  end
+
+  defp encode_topk_metadata({:topk_meta, metadata} = value) when is_map(metadata),
+    do: TermCodec.encode(value)
+
+  defp encode_topk_metadata({:topk_path, path} = value) when is_binary(path),
+    do: TermCodec.encode(value)
+
+  defp encode_topk_metadata(value), do: value
+
+  defp decode_tdigest(binary) do
+    case TermCodec.decode(binary) do
+      {:ok, {:tdigest, _centroids, _metadata} = value} -> value
+      _invalid_or_unrelated -> binary
+    end
+  end
+
+  defp encode_tdigest({:tdigest, _centroids, _metadata} = value), do: TermCodec.encode(value)
+  defp encode_tdigest(value), do: value
 
   # ---------------------------------------------------------------------------
   # Private — compound key store builder for set/sorted-set operations

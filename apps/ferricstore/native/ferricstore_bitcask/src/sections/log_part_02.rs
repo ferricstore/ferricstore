@@ -8,7 +8,7 @@ impl LogReader {
     ///
     /// Returns a `LogError` if the file cannot be opened.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
+        let file = crate::open_random_read(path)?;
         Ok(Self { file })
     }
 
@@ -57,25 +57,32 @@ impl LogReader {
         read_next_record(&mut self.file)
     }
 
+    /// Read the next record's metadata at the current file position without
+    /// materializing its value bytes.
+    pub fn read_next_metadata(&mut self, offset: u64) -> Result<Option<RecordMetadata>> {
+        read_next_record_metadata(&mut self.file, offset)
+    }
+
     /// Iterate records tolerating a truncated tail (crash-recovery mode).
     ///
-    /// Like `iter_from_start`, but stops silently at the first CRC error or
-    /// truncated record rather than returning `Err`. This matches the Bitcask
-    /// paper's crash-recovery semantics: a partial record at the end of the
-    /// log (written during a crash before fsync) is discarded; all complete
-    /// records before it are valid.
+    /// Like `iter_from_start`, but stops silently at a truncated final record.
+    /// Integrity and format errors are returned so recovery cannot turn
+    /// mid-file corruption into silent truncation and data loss.
     ///
     /// # Errors
     ///
-    /// Returns a `LogError` only for I/O errors (seek/read failures), not for
-    /// record-level corruption or truncation.
+    /// Returns a `LogError` for I/O, integrity, and format errors. A structurally
+    /// truncated final record is the only error tolerated as crash residue.
     pub fn iter_from_start_tolerant(&mut self) -> Result<Vec<Record>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut records = Vec::new();
-        // while let stops at EOF (Ok(None)) or any error — crash-recovery semantics:
-        // a truncated/corrupt tail record is silently discarded.
-        while let Ok(Some(record)) = read_next_record(&mut self.file) {
-            records.push(record);
+        loop {
+            match read_next_record(&mut self.file) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => break,
+                Err(error) if error.is_truncated_record() => break,
+                Err(error) => return Err(error),
+            }
         }
         Ok(records)
     }
@@ -87,8 +94,13 @@ impl LogReader {
     pub fn iter_from_offset_tolerant(&mut self, offset: u64) -> Result<Vec<Record>> {
         self.file.seek(SeekFrom::Start(offset))?;
         let mut records = Vec::new();
-        while let Ok(Some(record)) = read_next_record(&mut self.file) {
-            records.push(record);
+        loop {
+            match read_next_record(&mut self.file) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => break,
+                Err(error) if error.is_truncated_record() => break,
+                Err(error) => return Err(error),
+            }
         }
         Ok(records)
     }
@@ -97,12 +109,14 @@ impl LogReader {
     ///
     /// Used by startup, recovery, and compaction keydir scans where only key,
     /// offset, value size, expiry, and tombstone state are needed.
+    #[cfg(test)]
     pub fn iter_metadata_from_start_tolerant(&mut self) -> Result<Vec<RecordMetadata>> {
         self.file.seek(SeekFrom::Start(0))?;
         iter_metadata_tolerant(&mut self.file, 0)
     }
 
     /// Iterate record metadata from an exact byte offset without materializing values.
+    #[cfg(test)]
     pub fn iter_metadata_from_offset_tolerant(
         &mut self,
         offset: u64,
@@ -149,7 +163,7 @@ pub(crate) fn validate_kv_sizes(key: &[u8], value: &[u8]) -> std::result::Result
     Ok(())
 }
 
-fn decoded_value_size(value_size_raw: u32, is_tombstone: bool) -> Result<usize> {
+pub(crate) fn decoded_value_size(value_size_raw: u32, is_tombstone: bool) -> Result<usize> {
     if is_tombstone {
         return Ok(0);
     }
@@ -167,6 +181,12 @@ fn checked_record_body_len(key_size: usize, value_size: usize) -> Result<usize> 
     key_size
         .checked_add(value_size)
         .ok_or_else(|| LogError("record body length overflow".into()))
+}
+
+impl LogError {
+    pub(crate) fn is_truncated_record(&self) -> bool {
+        self.0.starts_with("truncated record ")
+    }
 }
 
 fn read_exact_vec(reader: &mut impl Read, len: usize, label: &str) -> Result<Vec<u8>> {
@@ -287,4 +307,3 @@ fn encode_tombstone_into(buf: &mut Vec<u8>, key: &[u8]) {
     let crc = crc32(&buf[start + 4..]);
     buf[start..start + 4].copy_from_slice(&crc.to_le_bytes());
 }
-

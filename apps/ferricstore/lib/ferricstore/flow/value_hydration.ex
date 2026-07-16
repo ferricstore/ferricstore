@@ -1,11 +1,10 @@
 defmodule Ferricstore.Flow.ValueHydration do
   @moduledoc false
 
+  alias Ferricstore.BatchResult
   alias Ferricstore.Flow.Codec
   alias Ferricstore.Flow.ValueStore
   alias Ferricstore.Store.Router
-
-  @value_bin_magic "FSV2"
 
   def payload_result(_ctx, {:ok, nil}, _payload_return), do: {:ok, nil}
 
@@ -39,10 +38,11 @@ defmodule Ferricstore.Flow.ValueHydration do
       end)
 
     values =
-      ctx
-      |> ValueStore.raw_mget_with_file_refs(fetchable_refs, file_ref_payload_threshold(max_bytes))
-      |> Enum.zip(fetchable_refs)
-      |> Map.new(fn {value, ref} -> {ref, value} end)
+      fetchable_refs
+      |> then(fn refs ->
+        ValueStore.raw_mget_with_file_refs(ctx, refs, file_ref_payload_threshold(max_bytes))
+      end)
+      |> map_fetched_values(fetchable_refs)
 
     Enum.map(records, fn record ->
       Enum.reduce([:payload, :result, :error], record, fn kind, acc ->
@@ -98,33 +98,84 @@ defmodule Ferricstore.Flow.ValueHydration do
       |> Enum.filter(fn ref -> byte_size(ref) <= Router.max_key_size() end)
 
     values =
-      ctx
-      |> ValueStore.raw_mget(fetchable_refs)
-      |> Enum.zip(fetchable_refs)
-      |> Map.new(fn {value, ref} -> {ref, value} end)
+      fetchable_refs
+      |> then(&ValueStore.raw_mget(ctx, &1))
+      |> map_fetched_values(fetchable_refs)
 
-    values_by_record =
-      Enum.reduce(ref_entries, %{}, fn {idx, name, ref}, acc ->
-        case Map.get(values, ref) do
-          value when is_binary(value) ->
-            Map.update(acc, idx, %{name => Codec.decode_value(value)}, fn existing ->
-              Map.put(existing, name, Codec.decode_value(value))
-            end)
+    hydrate_named_values(records, ref_entries, values)
+  end
 
-          _other ->
-            acc
+  @doc false
+  def __map_fetched_values_for_test__(refs, results), do: map_fetched_values(results, refs)
+
+  defp map_fetched_values(results, refs) do
+    case BatchResult.map_exact(refs, results, fn ref, value -> {ref, value} end) do
+      {:ok, entries} ->
+        Map.new(entries)
+
+      {:error, _reason} ->
+        Map.new(refs, fn ref ->
+          {ref, {:error, {:storage_read_failed, :batch_result_mismatch}}}
+        end)
+    end
+  end
+
+  @doc false
+  def __hydrate_named_values_for_test__(records, ref_entries, values),
+    do: hydrate_named_values(records, ref_entries, values)
+
+  defp hydrate_named_values(records, ref_entries, values) do
+    decoded_values = Map.new(values, fn {ref, value} -> {ref, decode_named_value(value)} end)
+
+    {values_by_record, errors_by_record} =
+      Enum.reduce(ref_entries, {%{}, %{}}, fn {idx, name, ref}, {value_acc, error_acc} ->
+        case Map.get(decoded_values, ref, :missing) do
+          {:ok, value} ->
+            next_values =
+              Map.update(value_acc, idx, %{name => value}, &Map.put(&1, name, value))
+
+            {next_values, error_acc}
+
+          {:error, message} ->
+            {value_acc, Map.put_new(error_acc, idx, message)}
+
+          :missing ->
+            {value_acc, error_acc}
         end
       end)
 
     records
     |> Enum.with_index()
     |> Enum.map(fn {record, idx} ->
-      case Map.get(values_by_record, idx) do
-        values when is_map(values) and map_size(values) > 0 -> Map.put(record, :values, values)
-        _other -> record
-      end
+      record
+      |> maybe_put_named_values(Map.get(values_by_record, idx))
+      |> maybe_put_named_values_error(Map.get(errors_by_record, idx))
     end)
   end
+
+  defp decode_named_value(value) when is_binary(value) do
+    case Codec.decode_value_result(value) do
+      {:ok, decoded} -> {:ok, decoded}
+      {:error, :invalid_flow_value} -> {:error, "ERR invalid flow value"}
+    end
+  end
+
+  defp decode_named_value({:error, {:storage_read_failed, _reason}}),
+    do: {:error, "ERR storage read failed"}
+
+  defp decode_named_value(_value), do: :missing
+
+  defp maybe_put_named_values(record, values) when is_map(values) and map_size(values) > 0,
+    do: Map.put(record, :values, values)
+
+  defp maybe_put_named_values(record, _values), do: record
+
+  defp maybe_put_named_values_error(record, nil), do: record
+  defp maybe_put_named_values_error(record, message), do: Map.put(record, :values_error, message)
+
+  @doc false
+  def __apply_value_result_for_test__(record, kind, ref, value, max_bytes),
+    do: apply_value_result(record, kind, ref, value, max_bytes)
 
   defp apply_value_result(record, _kind, nil, _value, _max_bytes), do: record
   defp apply_value_result(record, _kind, "", _value, _max_bytes), do: record
@@ -148,26 +199,40 @@ defmodule Ferricstore.Flow.ValueHydration do
   defp apply_value_result_for_valid_ref(
          record,
          kind,
+         {:error, {:storage_read_failed, _reason}},
+         _max_bytes
+       ) do
+    Map.put(record, value_error_field(kind), "ERR storage read failed")
+  end
+
+  defp apply_value_result_for_valid_ref(
+         record,
+         kind,
          {:file_ref, _path, _offset, size},
          _max_bytes
        ) do
     record
     |> Map.put(value_omitted_field(kind), true)
-    |> Map.put(value_size_field(kind), value_user_size_from_file_size(size))
+    |> Map.put(value_size_field(kind), size)
   end
 
   defp apply_value_result_for_valid_ref(record, kind, encoded_value, max_bytes)
-       when is_binary(encoded_value) do
-    {decoded, size} = Codec.decode_value_with_user_size(encoded_value)
+       when is_binary(encoded_value) and byte_size(encoded_value) > max_bytes do
+    record
+    |> Map.put(value_omitted_field(kind), true)
+    |> Map.put(value_size_field(kind), byte_size(encoded_value))
+  end
 
-    if size <= max_bytes do
-      record
-      |> Map.put(kind, decoded)
-      |> Map.put(value_size_field(kind), size)
-    else
-      record
-      |> Map.put(value_omitted_field(kind), true)
-      |> Map.put(value_size_field(kind), size)
+  defp apply_value_result_for_valid_ref(record, kind, encoded_value, _max_bytes)
+       when is_binary(encoded_value) do
+    case Codec.decode_value_result(encoded_value) do
+      {:ok, decoded} ->
+        record
+        |> Map.put(kind, decoded)
+        |> Map.put(value_size_field(kind), byte_size(encoded_value))
+
+      {:error, :invalid_flow_value} ->
+        Map.put(record, value_error_field(kind), "ERR invalid flow value")
     end
   end
 
@@ -194,16 +259,5 @@ defmodule Ferricstore.Flow.ValueHydration do
   defp value_size_field(:error), do: :error_size
 
   defp file_ref_payload_threshold(max_bytes) when max_bytes < 1, do: 1
-
-  defp file_ref_payload_threshold(max_bytes) do
-    max_bytes + value_codec_overhead_bytes() + 1
-  end
-
-  defp value_codec_overhead_bytes, do: byte_size(@value_bin_magic) + 1
-
-  defp value_user_size_from_file_size(size) when is_integer(size) and size >= 0 do
-    max(0, size - value_codec_overhead_bytes())
-  end
-
-  defp value_user_size_from_file_size(size), do: size
+  defp file_ref_payload_threshold(max_bytes), do: max_bytes + 1
 end

@@ -29,37 +29,21 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
     :ok
   end
 
-  test "cold read timeout removes simple pending read and replies nil" do
-    tag = make_ref()
-    state = %{flush_in_flight: nil, pending_reads: %{123 => {{self(), tag}, "key"}}}
-
-    assert {:noreply, new_state} = Shard.handle_info({:cold_read_timeout, 123}, state)
-    assert new_state.pending_reads == %{}
-    assert_receive {^tag, nil}
-  end
-
-  test "cold read timeout removes metadata pending read and replies nil" do
-    tag = make_ref()
-    state = %{flush_in_flight: nil, pending_reads: %{456 => {{self(), tag}, "key", :meta, 99}}}
-
-    assert {:noreply, new_state} = Shard.handle_info({:cold_read_timeout, 456}, state)
-    assert new_state.pending_reads == %{}
-    assert_receive {^tag, nil}
-  end
-
-  test "cold read timeout removes location-stamped pending read and replies nil" do
+  test "cold read timeout removes location-stamped pending read and reports failure" do
     tag = make_ref()
     shard_data_path = Path.join(System.tmp_dir!(), "pending_read_timeout")
 
     state = %{
       flush_in_flight: nil,
       shard_data_path: shard_data_path,
-      pending_reads: %{321 => {{self(), tag}, "key", 0, 1, 2, 3}}
+      pending_reads: %{
+        321 => {:pending_read, {{self(), tag}, "key", 0, 1, 2, 3}, nil}
+      }
     }
 
     assert {:noreply, new_state} = Shard.handle_info({:cold_read_timeout, 321}, state)
     assert new_state.pending_reads == %{}
-    assert_receive {^tag, nil}
+    assert_receive {^tag, {:error, {:storage_read_failed, {:cold_read_failed, :timeout}}}}
 
     assert_receive {:pread_telemetry, [:ferricstore, :bitcask, :pread_corrupt], %{count: 1},
                     %{path: path, reason: :timeout, raw_reason: :timeout}}
@@ -67,7 +51,7 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
     assert path == Path.join(shard_data_path, "00001.log")
   end
 
-  test "async cold read submit errors emit pread telemetry before replying nil" do
+  test "async cold read submit errors emit telemetry and return a typed failure" do
     source =
       __DIR__
       |> Path.join("../../../lib/ferricstore/store/shard/reads.ex")
@@ -78,6 +62,28 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
 
     assert branch =~ "ColdRead.emit_pread_error(path, reason)",
            "immediate async pread submit failures must use the same telemetry event as timeout and completion errors"
+
+    assert branch =~ "ReadResult.failure({:cold_read_failed, reason})"
+  end
+
+  test "cold read resubmit errors return typed failures for value and metadata reads" do
+    source =
+      __DIR__
+      |> Path.join("../../../lib/ferricstore/store/shard/info.ex")
+      |> Path.expand()
+      |> File.read!()
+
+    [_before, resubmit_section] = String.split(source, "defp resubmit_cold_read", parts: 2)
+    [resubmit_section | _after] = String.split(resubmit_section, "# Graceful shutdown", parts: 2)
+
+    refute resubmit_section =~ "GenServer.reply(from, nil)"
+
+    assert length(
+             Regex.scan(
+               ~r/GenServer\.reply\(from, ReadResult\.failure\(\{:cold_read_failed, reason\}\)\)/,
+               resubmit_section
+             )
+           ) == 2
   end
 
   test "cold read timeout ignores stale correlation ids" do
@@ -96,7 +102,9 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
       flush_in_flight: nil,
       keydir: keydir,
       instance_ctx: %{hot_cache_max_value_size: 64},
-      pending_reads: %{123 => {{self(), tag}, key}}
+      pending_reads: %{
+        123 => {:pending_read, {{self(), tag}, key, 0, 7, 12, 3}, nil}
+      }
     }
 
     try do
@@ -157,7 +165,7 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
                Shard.handle_info({:tokio_complete, 126, :error, :enoent}, state)
 
       assert new_state.pending_reads == %{}
-      assert_receive {^tag, nil}
+      assert_receive {^tag, {:error, {:storage_read_failed, {:cold_read_failed, :enoent}}}}
       assert Process.read_timer(timer_ref) == false
       refute_received :unexpected_timeout
 
@@ -179,7 +187,9 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
       flush_in_flight: nil,
       keydir: keydir,
       instance_ctx: %{hot_cache_max_value_size: 64},
-      pending_reads: %{124 => {{self(), tag}, key, 0, 7, 12, 3}}
+      pending_reads: %{
+        124 => {:pending_read, {{self(), tag}, key, 0, 7, 12, 3}, nil}
+      }
     }
 
     try do
@@ -204,7 +214,9 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
       keydir: keydir,
       shard_data_path: Path.join(System.tmp_dir!(), "pending_read_retry"),
       instance_ctx: %{hot_cache_max_value_size: 64},
-      pending_reads: %{127 => {{self(), tag}, key, 0, 7, 12, 3}}
+      pending_reads: %{
+        127 => {:pending_read, {{self(), tag}, key, 0, 7, 12, 3}, nil}
+      }
     }
 
     try do
@@ -251,7 +263,10 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
       pending_entry = {{self(), tag}, key, 0, 7, 12, 3}
 
       assert {:noreply, ^state} = Shard.handle_info({:cold_read_retry, pending_entry, 0}, state)
-      assert_receive {^tag, nil}
+
+      assert_receive {^tag,
+                      {:error,
+                       {:storage_read_failed, {:cold_read_failed, :missing_live_cold_entry}}}}
 
       path = Path.join(shard_data_path, "00007.log")
 
@@ -274,6 +289,45 @@ defmodule Ferricstore.Store.ShardPendingReadTest do
     after
       :ets.delete(keydir)
     end
+  end
+
+  test "cold read retry reports an invalid replacement row without deleting it" do
+    keydir = :ets.new(:"pending_read_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "pending:invalid-replacement"
+    tag = make_ref()
+
+    state = %{
+      index: 0,
+      flush_in_flight: nil,
+      keydir: keydir,
+      shard_data_path: System.tmp_dir!(),
+      pending_reads: %{}
+    }
+
+    row = {key, nil, 0, LFU.initial(), 0, :invalid_offset, 3}
+
+    try do
+      :ets.insert(keydir, row)
+      pending_entry = {{self(), tag}, key, 0, 7, 12, 3}
+
+      assert {:noreply, ^state} = Shard.handle_info({:cold_read_retry, pending_entry, 0}, state)
+      assert_receive {^tag, {:error, {:storage_read_failed, :invalid_keydir_entry}}}
+      assert [^row] = :ets.lookup(keydir, key)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "pending read handler has no pre-correlation compatibility shapes" do
+    source =
+      __DIR__
+      |> Path.join("../../../lib/ferricstore/store/shard/info.ex")
+      |> Path.expand()
+      |> File.read!()
+
+    refute source =~ "Legacy in-memory pending entry"
+    refute source =~ "def handle_info({:tokio_complete, :ok, _value}, state)"
+    refute source =~ "def handle_info({:tokio_complete, :error, _reason}, state)"
   end
 
   def handle_telemetry(event, measurements, metadata, parent) do

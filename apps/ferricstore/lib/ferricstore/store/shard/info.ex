@@ -12,6 +12,8 @@ defmodule Ferricstore.Store.Shard.Info do
       alias Ferricstore.Store.BlobValue
       alias Ferricstore.Store.ColdRead
       alias Ferricstore.Store.CompoundKey
+      alias Ferricstore.Store.Promotion
+      alias Ferricstore.Store.ReadResult
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.Shard.Compound, as: ShardCompound
       alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -67,10 +69,136 @@ defmodule Ferricstore.Store.Shard.Info do
         end
       end
 
+      def handle_info({:maybe_promote_after_commit, redis_key, compound_key}, state) do
+        {:noreply, ShardCompound.maybe_promote(state, redis_key, compound_key)}
+      end
+
+      def handle_info({:start_compound_promotion, redis_key, type}, state) do
+        {:noreply, maybe_start_compound_promotion(state, redis_key, type)}
+      end
+
+      def handle_info(
+            {:compound_promotion_complete, job_ref, pid, result},
+            %{compound_promotion_worker: %{job_ref: job_ref, pid: pid} = worker} = state
+          ) do
+        Process.demonitor(worker.monitor_ref, [:flush])
+
+        state =
+          state
+          |> sync_active_file_from_registry()
+          |> Map.put(:compound_promotion_worker, nil)
+          |> refresh_active_file_size_after_compound_promotion(worker)
+
+        case result do
+          {:ok, dedicated_path} ->
+            state = install_promoted_instance(state, worker.redis_key, dedicated_path)
+            :ok = Promotion.clear_compound_promotion_fence(state, worker.redis_key)
+            acknowledge_compound_promotion_worker(worker)
+
+            state =
+              state
+              |> reply_compound_promotion_waiters(worker.redis_key)
+              |> maybe_start_pending_compound_promotion()
+
+            {:noreply, state}
+
+          {:error, reason} ->
+            Logger.error(
+              "Shard #{state.index}: compound promotion failed for " <>
+                "#{inspect(worker.redis_key)}: #{inspect(reason)}"
+            )
+
+            state =
+              state
+              |> Map.put(:promotion_recovery_required, true)
+              |> reply_compound_promotion_waiters(worker.redis_key, false)
+
+            acknowledge_compound_promotion_worker(worker)
+            {:stop, {:compound_promotion_failed, reason}, state}
+
+          unexpected ->
+            reason = {:unexpected_promotion_result, unexpected}
+
+            state =
+              state
+              |> Map.put(:promotion_recovery_required, true)
+              |> reply_compound_promotion_waiters(worker.redis_key, false)
+
+            acknowledge_compound_promotion_worker(worker)
+            {:stop, {:compound_promotion_failed, reason}, state}
+        end
+      end
+
+      def handle_info({:compound_promotion_complete, _job_ref, _pid, _result}, state) do
+        {:noreply, state}
+      end
+
+      def handle_info({:remove_promoted_after_commit, redis_key}, state) do
+        state =
+          state
+          |> cancel_promoted_compaction_retry(redis_key)
+          |> Map.update!(:promoted_compaction_pending, &MapSet.delete(&1, redis_key))
+
+        {:noreply, %{state | promoted_instances: Map.delete(state.promoted_instances, redis_key)}}
+      end
+
+      def handle_info({:promoted_maintenance_after_commit, redis_key, maintenance}, state) do
+        state = ShardCompound.apply_promoted_maintenance(state, redis_key, maintenance)
+        {:noreply, ShardCompound.bump_promoted_writes(state, redis_key)}
+      end
+
+      def handle_info({:maybe_compact_promoted, redis_key}, state) do
+        if promoted_compaction_retry_scheduled?(state, redis_key) do
+          {:noreply, state}
+        else
+          {:noreply, maybe_start_promoted_compaction(state, redis_key)}
+        end
+      end
+
+      def handle_info({:retry_promoted_compaction, redis_key, retry_tag}, state) do
+        case Map.get(state.promoted_compaction_retry_timers, redis_key) do
+          %{tag: ^retry_tag} ->
+            state =
+              Map.update!(state, :promoted_compaction_retry_timers, &Map.delete(&1, redis_key))
+
+            {:noreply, maybe_start_promoted_compaction(state, redis_key)}
+
+          _stale_or_cancelled ->
+            {:noreply, state}
+        end
+      end
+
+      def handle_info(
+            {:promoted_compaction_complete, job_ref, pid, result},
+            %{promoted_compaction_worker: %{job_ref: job_ref, pid: pid} = worker} = state
+          ) do
+        Process.demonitor(worker.monitor_ref, [:flush])
+
+        state =
+          state
+          |> finish_promoted_compaction(worker, result)
+          |> Map.put(:promoted_compaction_worker, nil)
+          |> maybe_schedule_failed_promoted_compaction(worker.redis_key, result)
+          |> maybe_start_pending_promoted_compaction()
+
+        {:noreply, state}
+      end
+
+      def handle_info({:promoted_compaction_complete, _job_ref, _pid, _result}, state) do
+        {:noreply, state}
+      end
+
       def handle_info({:tx_pending_write, key, value, expire_at_ms}, state) do
         new_pending = [{key, value, expire_at_ms} | state.pending]
+        new_pending_count = Map.get(state, :pending_count, length(state.pending)) + 1
         new_version = state.write_version + 1
-        new_state = %{state | pending: new_pending, write_version: new_version}
+
+        new_state = %{
+          state
+          | pending: new_pending,
+            pending_count: new_pending_count,
+            write_version: new_version
+        }
 
         new_state =
           if state.flush_in_flight == nil,
@@ -88,13 +216,20 @@ defmodule Ferricstore.Store.Shard.Info do
         else
           state = await_in_flight(state)
           state = flush_pending_sync(state)
-          state = track_delete_dead_bytes(state, key)
 
           case NIF.v2_append_tombstone(state.active_file_path, key) do
             {:ok, _} ->
+              state = track_delete_dead_bytes(state, key)
               new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == key end)
               new_version = state.write_version + 1
-              {:noreply, %{state | pending: new_pending, write_version: new_version}}
+
+              {:noreply,
+               %{
+                 state
+                 | pending: new_pending,
+                   pending_count: length(new_pending),
+                   write_version: new_version
+               }}
 
             {:error, reason} ->
               Logger.error(
@@ -126,6 +261,545 @@ defmodule Ferricstore.Store.Shard.Info do
 
       def handle_info({:standalone_commit_flushed, ref, result}, state) do
         {:noreply, handle_standalone_flush_result(ref, result, state)}
+      end
+
+      def handle_info({:shard_get_many_complete, job_ref, result}, state) do
+        {:noreply, ShardReads.handle_get_many_complete(job_ref, result, state)}
+      end
+
+      def handle_info({:shard_get_many_timeout, job_ref}, state) do
+        {:noreply, ShardReads.handle_get_many_timeout(job_ref, state)}
+      end
+
+      def handle_info(
+            {:shard_compaction_complete, job_ref, pid, {reply, compacted_file_ids}},
+            %{
+              compaction_worker: %{job_ref: job_ref, pid: pid} = worker
+            } = state
+          ) do
+        Process.demonitor(worker.monitor_ref, [:flush])
+        GenServer.reply(worker.from, reply)
+
+        state =
+          state
+          |> refresh_compacted_file_stats(compacted_file_ids)
+          |> Map.put(:compaction_worker, nil)
+
+        {:noreply, state}
+      end
+
+      def handle_info({:shard_compaction_complete, _job_ref, _pid, _result}, state) do
+        {:noreply, state}
+      end
+
+      def handle_info(
+            {:DOWN, monitor_ref, :process, pid, reason},
+            %{compaction_worker: %{monitor_ref: monitor_ref, pid: pid} = worker} = state
+          ) do
+        GenServer.reply(worker.from, {:error, {:compaction_worker_failed, reason}})
+        {:noreply, %{state | compaction_worker: nil}}
+      end
+
+      def handle_info(
+            {:DOWN, monitor_ref, :process, pid, reason},
+            %{
+              compound_promotion_worker:
+                %{monitor_ref: monitor_ref, pid: pid, redis_key: redis_key} = worker
+            } = state
+          ) do
+        Logger.error(
+          "Shard #{state.index}: compound promotion worker failed for " <>
+            "#{inspect(redis_key)}: #{inspect(reason)}"
+        )
+
+        state =
+          state
+          |> Map.put(:compound_promotion_worker, nil)
+          |> Map.put(:promotion_recovery_required, true)
+          |> sync_active_file_from_registry()
+          |> refresh_active_file_size_after_compound_promotion(worker)
+          |> reply_compound_promotion_waiters(redis_key, false)
+
+        release_compound_promotion_worker_latches(worker)
+        {:stop, {:compound_promotion_worker_failed, reason}, state}
+      end
+
+      def handle_info(
+            {:DOWN, monitor_ref, :process, pid, reason},
+            %{
+              promoted_compaction_worker:
+                %{
+                  monitor_ref: monitor_ref,
+                  pid: pid,
+                  redis_key: redis_key
+                } = worker
+            } = state
+          ) do
+        release_promoted_compaction_latch_if_owned(
+          Map.get(worker, :latch_token, :none),
+          worker.pid
+        )
+
+        Logger.error(
+          "Shard #{state.index}: promoted compaction worker failed for " <>
+            "#{inspect(redis_key)}: #{inspect(reason)}"
+        )
+
+        state =
+          state
+          |> Map.put(:promoted_compaction_worker, nil)
+          |> schedule_promoted_compaction_retry(redis_key)
+          |> maybe_start_pending_promoted_compaction()
+
+        {:noreply, state}
+      end
+
+      def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
+        case ShardReads.handle_get_many_down(monitor_ref, state) do
+          {:handled, state} -> {:noreply, state}
+          :unhandled -> {:noreply, state}
+        end
+      end
+
+      defp maybe_start_compound_promotion(
+             %{compound_promotion_worker: nil} = state,
+             redis_key,
+             type
+           ) do
+        state =
+          Map.update!(state, :compound_promotion_pending, &Map.delete(&1, redis_key))
+
+        case ShardCompound.promoted_store(state, redis_key) do
+          path when is_binary(path) ->
+            state
+            |> install_promoted_instance(redis_key, path)
+            |> reply_compound_promotion_waiters(redis_key)
+            |> maybe_start_pending_compound_promotion()
+
+          nil ->
+            state = ShardFlush.await_in_flight(state)
+            state = ShardFlush.flush_pending_sync(state)
+            parent = self()
+            job_ref = make_ref()
+            :ok = Promotion.clear_compound_promotion_fence(state, redis_key)
+            latch_token = Promotion.acquire_compaction_latch(state, redis_key)
+            :ok = Promotion.record_compound_promotion_running(state, redis_key)
+            shared_log_latch_token = Promotion.acquire_shared_log_latch(state)
+            state = sync_active_file_from_registry(state)
+
+            {pid, monitor_ref} =
+              spawn_compound_promotion_worker(
+                state,
+                redis_key,
+                type,
+                parent,
+                job_ref,
+                latch_token,
+                shared_log_latch_token
+              )
+
+            worker = %{
+              job_ref: job_ref,
+              monitor_ref: monitor_ref,
+              pid: pid,
+              redis_key: redis_key,
+              type: type,
+              latch_token: latch_token,
+              shared_log_latch_token: shared_log_latch_token,
+              active_file_id: state.active_file_id,
+              active_file_path: state.active_file_path
+            }
+
+            %{state | compound_promotion_worker: worker}
+        end
+      end
+
+      defp maybe_start_compound_promotion(state, _redis_key, _type), do: state
+
+      defp spawn_compound_promotion_worker(
+             state,
+             redis_key,
+             type,
+             parent,
+             job_ref,
+             latch_token,
+             shared_log_latch_token
+           ) do
+        {pid, monitor_ref} =
+          try do
+            :erlang.spawn_opt(
+              fn ->
+                try do
+                  receive do
+                    {:start_compound_promotion_worker, ^job_ref} ->
+                      result =
+                        try do
+                          Promotion.promote_collection!(
+                            type,
+                            redis_key,
+                            state.shard_data_path,
+                            state.keydir,
+                            state.data_dir,
+                            state.index,
+                            state.instance_ctx,
+                            state.compound_member_index
+                          )
+                        rescue
+                          error ->
+                            {:error,
+                             {:exception, error.__struct__, Exception.message(error),
+                              __STACKTRACE__}}
+                        catch
+                          kind, reason -> {:error, {kind, reason, __STACKTRACE__}}
+                        end
+
+                      case result do
+                        {:ok, _dedicated_path} ->
+                          Promotion.record_compound_promotion_success(state, redis_key)
+
+                        {:error, reason} ->
+                          Promotion.record_compound_promotion_failure(
+                            state,
+                            redis_key,
+                            reason
+                          )
+
+                        unexpected ->
+                          Promotion.record_compound_promotion_failure(
+                            state,
+                            redis_key,
+                            {:unexpected_promotion_result, unexpected}
+                          )
+                      end
+
+                      release_promoted_compaction_latch_if_owned(latch_token, self())
+
+                      release_promoted_compaction_latch_if_owned(
+                        shared_log_latch_token,
+                        self()
+                      )
+
+                      send(parent, {:compound_promotion_complete, job_ref, self(), result})
+                  after
+                    5_000 -> :ok
+                  end
+                after
+                  release_promoted_compaction_latch_if_owned(latch_token, self())
+
+                  release_promoted_compaction_latch_if_owned(
+                    shared_log_latch_token,
+                    self()
+                  )
+                end
+              end,
+              [:link, :monitor]
+            )
+          catch
+            kind, reason ->
+              release_promoted_compaction_latch_if_owned(latch_token, self())
+
+              release_promoted_compaction_latch_if_owned(
+                shared_log_latch_token,
+                self()
+              )
+
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+
+        try do
+          transfer_promoted_compaction_latch(latch_token, pid)
+          transfer_promoted_compaction_latch(shared_log_latch_token, pid)
+          send(pid, {:start_compound_promotion_worker, job_ref})
+          {pid, monitor_ref}
+        catch
+          kind, reason ->
+            Process.exit(pid, :kill)
+            Process.demonitor(monitor_ref, [:flush])
+            release_promoted_compaction_latch_if_owned(latch_token, self())
+            release_promoted_compaction_latch_if_owned(latch_token, pid)
+
+            release_promoted_compaction_latch_if_owned(
+              shared_log_latch_token,
+              self()
+            )
+
+            release_promoted_compaction_latch_if_owned(shared_log_latch_token, pid)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+      end
+
+      defp acknowledge_compound_promotion_worker(worker) do
+        release_compound_promotion_worker_latches(worker)
+        :ok
+      end
+
+      defp release_compound_promotion_worker_latches(worker) do
+        release_promoted_compaction_latch_if_owned(
+          Map.get(worker, :latch_token, :none),
+          worker.pid
+        )
+
+        release_promoted_compaction_latch_if_owned(
+          Map.get(worker, :shared_log_latch_token, :none),
+          worker.pid
+        )
+      end
+
+      defp refresh_active_file_size_after_compound_promotion(state, worker) do
+        file_id = Map.get(worker, :active_file_id, state.active_file_id)
+        file_path = Map.get(worker, :active_file_path, state.active_file_path)
+
+        case File.lstat(file_path) do
+          {:ok, %File.Stat{type: :regular, size: size}}
+          when is_integer(size) and size >= 0 ->
+            {_total, dead} =
+              Map.get(state.file_stats, file_id, {state.active_file_size, 0})
+
+            state = %{state | file_stats: Map.put(state.file_stats, file_id, {size, dead})}
+
+            if state.active_file_id == file_id and state.active_file_path == file_path do
+              %{state | active_file_size: size}
+            else
+              state
+            end
+
+          stat_error ->
+            Logger.error(
+              "Shard #{state.index}: failed to reconcile active log size after promotion: " <>
+                inspect(stat_error)
+            )
+
+            state
+        end
+      end
+
+      defp install_promoted_instance(state, redis_key, dedicated_path) do
+        info = %{
+          path: dedicated_path,
+          writes: 0,
+          total_bytes: ShardCompound.promoted_dir_size(dedicated_path),
+          dead_bytes: 0,
+          last_compacted_at: nil
+        }
+
+        %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, info)}
+      end
+
+      defp maybe_start_pending_compound_promotion(state) do
+        case Enum.at(state.compound_promotion_pending, 0) do
+          {redis_key, type} -> maybe_start_compound_promotion(state, redis_key, type)
+          nil -> state
+        end
+      end
+
+      defp reply_compound_promotion_waiters(state, redis_key) do
+        promoted? = ShardCompound.promoted_store(state, redis_key) != nil
+        reply_compound_promotion_waiters(state, redis_key, promoted?)
+      end
+
+      defp reply_compound_promotion_waiters(state, redis_key, promoted?)
+           when is_boolean(promoted?) do
+        {waiters, remaining} =
+          Map.pop(Map.get(state, :compound_promotion_waiters, %{}), redis_key, [])
+
+        Enum.each(waiters, &GenServer.reply(&1, promoted?))
+        Map.put(state, :compound_promotion_waiters, remaining)
+      end
+
+      defp maybe_start_promoted_compaction(
+             %{promoted_compaction_worker: nil} = state,
+             redis_key
+           ) do
+        case Map.get(state.promoted_instances, redis_key) do
+          %{path: path, dead_bytes: baseline_dead}
+          when is_binary(path) and is_integer(baseline_dead) and baseline_dead >= 0 ->
+            if ShardCompound.promoted_compaction_due?(state, redis_key) do
+              parent = self()
+              job_ref = make_ref()
+              latch_token = Promotion.acquire_compaction_latch(state, redis_key)
+
+              {pid, monitor_ref} =
+                spawn_promoted_compaction_worker(
+                  state,
+                  redis_key,
+                  path,
+                  parent,
+                  job_ref,
+                  latch_token
+                )
+
+              worker = %{
+                job_ref: job_ref,
+                monitor_ref: monitor_ref,
+                pid: pid,
+                redis_key: redis_key,
+                path: path,
+                baseline_dead: baseline_dead,
+                latch_token: latch_token
+              }
+
+              %{state | promoted_compaction_worker: worker}
+            else
+              state
+            end
+
+          _missing ->
+            state
+        end
+      end
+
+      defp maybe_start_promoted_compaction(state, redis_key) do
+        Map.update!(state, :promoted_compaction_pending, &MapSet.put(&1, redis_key))
+      end
+
+      defp spawn_promoted_compaction_worker(
+             state,
+             redis_key,
+             path,
+             parent,
+             job_ref,
+             latch_token
+           ) do
+        {pid, monitor_ref} =
+          try do
+            spawn_monitor(fn ->
+              receive do
+                {:start_promoted_compaction, ^job_ref} ->
+                  {status, _worker_state} =
+                    try do
+                      ShardCompound.compact_dedicated_result_latched(state, redis_key, path)
+                    after
+                      Promotion.release_compaction_latch(latch_token)
+                    end
+
+                  send(parent, {:promoted_compaction_complete, job_ref, self(), status})
+              after
+                5_000 -> :ok
+              end
+            end)
+          catch
+            kind, reason ->
+              release_promoted_compaction_latch_if_owned(latch_token, self())
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+
+        try do
+          transfer_promoted_compaction_latch(latch_token, pid)
+          send(pid, {:start_promoted_compaction, job_ref})
+          {pid, monitor_ref}
+        catch
+          kind, reason ->
+            Process.exit(pid, :kill)
+            Process.demonitor(monitor_ref, [:flush])
+            release_promoted_compaction_latch_if_owned(latch_token, self())
+            release_promoted_compaction_latch_if_owned(latch_token, pid)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+      end
+
+      defp transfer_promoted_compaction_latch(:none, _pid), do: :ok
+
+      defp transfer_promoted_compaction_latch({table, latch_key}, pid) when is_pid(pid) do
+        case :ets.lookup(table, latch_key) do
+          [{^latch_key, owner}] when owner == self() ->
+            true = :ets.update_element(table, latch_key, {2, pid})
+            :ok
+
+          other ->
+            raise "promoted compaction latch transfer failed: #{inspect(other)}"
+        end
+      end
+
+      defp release_promoted_compaction_latch_if_owned(:none, _owner), do: :ok
+
+      defp release_promoted_compaction_latch_if_owned({table, latch_key}, owner) do
+        :ets.delete_object(table, {latch_key, owner})
+        :ok
+      rescue
+        ArgumentError -> :ok
+      end
+
+      defp finish_promoted_compaction(state, worker, :ok) do
+        case Map.get(state.promoted_instances, worker.redis_key) do
+          %{dead_bytes: current_dead} = info when is_integer(current_dead) ->
+            updated = %{
+              info
+              | total_bytes: ShardCompound.promoted_dir_size(worker.path),
+                dead_bytes: max(current_dead - worker.baseline_dead, 0),
+                last_compacted_at: System.monotonic_time(:millisecond)
+            }
+
+            %{
+              state
+              | promoted_instances: Map.put(state.promoted_instances, worker.redis_key, updated)
+            }
+
+          _removed ->
+            state
+        end
+      end
+
+      defp finish_promoted_compaction(state, _worker, :error), do: state
+
+      defp maybe_schedule_failed_promoted_compaction(state, redis_key, :error),
+        do: schedule_promoted_compaction_retry(state, redis_key)
+
+      defp maybe_schedule_failed_promoted_compaction(state, _redis_key, :ok), do: state
+
+      defp schedule_promoted_compaction_retry(state, redis_key) do
+        state =
+          Map.update!(state, :promoted_compaction_pending, &MapSet.delete(&1, redis_key))
+
+        if promoted_compaction_retry_scheduled?(state, redis_key) do
+          state
+        else
+          retry_tag = make_ref()
+
+          timer_ref =
+            Process.send_after(
+              self(),
+              {:retry_promoted_compaction, redis_key, retry_tag},
+              state.promoted_compaction_retry_ms
+            )
+
+          retry = %{tag: retry_tag, timer_ref: timer_ref}
+
+          Map.update!(state, :promoted_compaction_retry_timers, &Map.put(&1, redis_key, retry))
+        end
+      end
+
+      defp cancel_promoted_compaction_retry(state, redis_key) do
+        case Map.pop(state.promoted_compaction_retry_timers, redis_key) do
+          {nil, _timers} ->
+            state
+
+          {%{timer_ref: timer_ref}, timers} ->
+            _ = Process.cancel_timer(timer_ref, async: false, info: false)
+            %{state | promoted_compaction_retry_timers: timers}
+        end
+      end
+
+      defp promoted_compaction_retry_scheduled?(state, redis_key) do
+        Map.has_key?(state.promoted_compaction_retry_timers, redis_key)
+      end
+
+      defp maybe_start_pending_promoted_compaction(state) do
+        case Enum.at(state.promoted_compaction_pending, 0) do
+          nil ->
+            state
+
+          redis_key ->
+            state =
+              Map.update!(state, :promoted_compaction_pending, &MapSet.delete(&1, redis_key))
+
+            case maybe_start_promoted_compaction(state, redis_key) do
+              %{promoted_compaction_worker: nil} = state ->
+                maybe_start_pending_promoted_compaction(state)
+
+              state ->
+                state
+            end
+        end
       end
 
       # Periodic fragmentation re-evaluation for idle shards.
@@ -188,20 +862,12 @@ defmodule Ferricstore.Store.Shard.Info do
         case pop_pending_read(state.pending_reads, corr_id, :keep_timer) do
           {{from, _key, _exp, _fid, _off, _vsize} = pending_entry, rest_pending} ->
             emit_pending_read_error(state, pending_entry, :timeout)
-            GenServer.reply(from, nil)
+            GenServer.reply(from, ReadResult.failure({:cold_read_failed, :timeout}))
             {:noreply, %{state | pending_reads: rest_pending}}
 
           {{from, _key, :meta, _exp, _fid, _off, _vsize} = pending_entry, rest_pending} ->
             emit_pending_read_error(state, pending_entry, :timeout)
-            GenServer.reply(from, nil)
-            {:noreply, %{state | pending_reads: rest_pending}}
-
-          {{from, _key}, rest_pending} ->
-            GenServer.reply(from, nil)
-            {:noreply, %{state | pending_reads: rest_pending}}
-
-          {{from, _key, :meta, _exp}, rest_pending} ->
-            GenServer.reply(from, nil)
+            GenServer.reply(from, ReadResult.failure({:cold_read_failed, :timeout}))
             {:noreply, %{state | pending_reads: rest_pending}}
 
           {nil, _} ->
@@ -272,19 +938,6 @@ defmodule Ferricstore.Store.Shard.Info do
                   )
                 end
 
-              {{from, _key}, rest_pending} ->
-                # Legacy in-memory pending entry without disk location. Reply but
-                # do not warm, because the current ETS location may be newer than
-                # the value returned by the async read.
-                GenServer.reply(from, value)
-                {:noreply, %{state | pending_reads: rest_pending}}
-
-              {{from, _key, :meta, exp}, rest_pending} ->
-                # Legacy in-memory pending entry without disk location. Reply but
-                # skip warming for the same stale-completion reason as simple GET.
-                GenServer.reply(from, if(value != nil, do: {value, exp}, else: nil))
-                {:noreply, %{state | pending_reads: rest_pending}}
-
               {nil, _} ->
                 # Unknown correlation_id — could be a stale fsync or read. Ignore.
                 {:noreply, state}
@@ -304,36 +957,18 @@ defmodule Ferricstore.Store.Shard.Info do
           case pop_pending_read(state.pending_reads, corr_id, :cancel_timer) do
             {{from, _key, _exp, _fid, _off, _vsize} = pending_entry, rest_pending} ->
               emit_pending_read_error(state, pending_entry, reason)
-              GenServer.reply(from, nil)
+              GenServer.reply(from, ReadResult.failure({:cold_read_failed, reason}))
               {:noreply, %{state | pending_reads: rest_pending}}
 
             {{from, _key, :meta, _exp, _fid, _off, _vsize} = pending_entry, rest_pending} ->
               emit_pending_read_error(state, pending_entry, reason)
-              GenServer.reply(from, nil)
-              {:noreply, %{state | pending_reads: rest_pending}}
-
-            {{from, _key}, rest_pending} ->
-              GenServer.reply(from, nil)
-              {:noreply, %{state | pending_reads: rest_pending}}
-
-            {{from, _key, :meta, _exp}, rest_pending} ->
-              GenServer.reply(from, nil)
+              GenServer.reply(from, ReadResult.failure({:cold_read_failed, reason}))
               {:noreply, %{state | pending_reads: rest_pending}}
 
             {nil, _} ->
               {:noreply, state}
           end
         end
-      end
-
-      # Legacy v1 3-tuple format (no correlation ID) — keep for backward compat
-      # during rolling upgrades. Once all async NIFs use correlation IDs, remove.
-      def handle_info({:tokio_complete, :ok, _value}, state) do
-        {:noreply, state}
-      end
-
-      def handle_info({:tokio_complete, :error, _reason}, state) do
-        {:noreply, state}
       end
 
       # Catch-all for unexpected messages. Without this, any unmatched message
@@ -349,8 +984,11 @@ defmodule Ferricstore.Store.Shard.Info do
             maybe_cancel_pending_timer(timer_action, timer_ref)
             {entry, rest_pending}
 
-          other ->
-            other
+          {nil, rest_pending} ->
+            {nil, rest_pending}
+
+          {_invalid_entry, rest_pending} ->
+            {nil, rest_pending}
         end
       end
 
@@ -431,7 +1069,8 @@ defmodule Ferricstore.Store.Shard.Info do
           {:cold, ^fid, ^off, ^vsize, _exp} ->
             emit_cold_retry_exhausted(state, pending_entry, :get, :missing_live_cold_entry)
             emit_pending_read_error(state, pending_entry, :missing_live_cold_entry)
-            {:reply, from, nil}
+
+            {:reply, from, ReadResult.failure({:cold_read_failed, :missing_live_cold_entry})}
 
           {:cold, new_fid, new_off, new_vsize, new_exp} ->
             {:resubmit, {from, key, new_exp, new_fid, new_off, new_vsize}}
@@ -442,8 +1081,8 @@ defmodule Ferricstore.Store.Shard.Info do
           :miss ->
             {:reply, from, nil}
 
-          _ ->
-            {:reply, from, nil}
+          {:error, :invalid_keydir_entry} ->
+            {:reply, from, ReadResult.failure(:invalid_keydir_entry)}
         end
       end
 
@@ -462,7 +1101,8 @@ defmodule Ferricstore.Store.Shard.Info do
           {:cold, ^fid, ^off, ^vsize, _exp} ->
             emit_cold_retry_exhausted(state, pending_entry, :get_meta, :missing_live_cold_entry)
             emit_pending_read_error(state, pending_entry, :missing_live_cold_entry)
-            {:reply, from, nil}
+
+            {:reply, from, ReadResult.failure({:cold_read_failed, :missing_live_cold_entry})}
 
           {:cold, new_fid, new_off, new_vsize, new_exp} ->
             {:resubmit, {from, key, :meta, new_exp, new_fid, new_off, new_vsize}}
@@ -473,15 +1113,10 @@ defmodule Ferricstore.Store.Shard.Info do
           :miss ->
             {:reply, from, nil}
 
-          _ ->
-            {:reply, from, nil}
+          {:error, :invalid_keydir_entry} ->
+            {:reply, from, ReadResult.failure(:invalid_keydir_entry)}
         end
       end
-
-      defp resolve_nil_cold_read(_state, {from, _key}, _attempts_left), do: {:reply, from, nil}
-
-      defp resolve_nil_cold_read(_state, {from, _key, :meta, _exp}, _attempts_left),
-        do: {:reply, from, nil}
 
       defp emit_cold_retry_exhausted(
              %{index: shard_index, shard_data_path: shard_data_path},
@@ -577,7 +1212,7 @@ defmodule Ferricstore.Store.Shard.Info do
 
           {:error, reason} ->
             emit_pending_read_error(state, pending_entry, reason)
-            GenServer.reply(from, nil)
+            GenServer.reply(from, ReadResult.failure({:cold_read_failed, reason}))
             {:noreply, state}
         end
       end
@@ -605,7 +1240,7 @@ defmodule Ferricstore.Store.Shard.Info do
 
           {:error, reason} ->
             emit_pending_read_error(state, pending_entry, reason)
-            GenServer.reply(from, nil)
+            GenServer.reply(from, ReadResult.failure({:cold_read_failed, reason}))
             {:noreply, state}
         end
       end
@@ -622,9 +1257,57 @@ defmodule Ferricstore.Store.Shard.Info do
       @impl true
       def terminate(reason, state) do
         state
+        |> cancel_compaction_worker()
+        |> cancel_compound_promotion_worker()
+        |> cancel_promoted_compaction_worker_and_retries()
         |> flush_standalone_batch()
         |> await_standalone_flush()
         |> then(&ShardLifecycle.do_terminate(reason, &1))
+      end
+
+      defp cancel_compound_promotion_worker(state) do
+        case state.compound_promotion_worker do
+          nil ->
+            %{state | compound_promotion_pending: %{}}
+
+          worker ->
+            Process.exit(worker.pid, :kill)
+            await_compaction_worker_down(worker)
+            release_compound_promotion_worker_latches(worker)
+
+            %{
+              state
+              | compound_promotion_worker: nil,
+                compound_promotion_pending: %{}
+            }
+            |> Map.put(:promotion_recovery_required, true)
+        end
+      end
+
+      defp cancel_promoted_compaction_worker_and_retries(state) do
+        Enum.each(state.promoted_compaction_retry_timers, fn {_redis_key, %{timer_ref: timer_ref}} ->
+          _ = Process.cancel_timer(timer_ref, async: false, info: false)
+        end)
+
+        case state.promoted_compaction_worker do
+          nil ->
+            %{state | promoted_compaction_retry_timers: %{}}
+
+          worker ->
+            Process.exit(worker.pid, :kill)
+            await_compaction_worker_down(worker)
+
+            release_promoted_compaction_latch_if_owned(
+              Map.get(worker, :latch_token, :none),
+              worker.pid
+            )
+
+            %{
+              state
+              | promoted_compaction_worker: nil,
+                promoted_compaction_retry_timers: %{}
+            }
+        end
       end
 
       # -------------------------------------------------------------------

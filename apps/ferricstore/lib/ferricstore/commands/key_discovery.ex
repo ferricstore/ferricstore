@@ -1,7 +1,7 @@
 defmodule Ferricstore.Commands.KeyDiscovery do
   @moduledoc false
 
-  alias Ferricstore.Commands.Extension
+  alias Ferricstore.Commands.{Extension, NativeAstParser, TransactionPolicy}
 
   @type result :: {:ok, [binary()]} | :not_dynamic
   @type access :: :read | :write | :rw
@@ -10,7 +10,19 @@ defmodule Ferricstore.Commands.KeyDiscovery do
           routing_scope: :none | :keys | :coordinated,
           routing_keys: [binary()],
           read_keys: [binary()],
-          write_keys: [binary()]
+          write_keys: [binary()],
+          transaction_mode: Ferricstore.Commands.TransactionPolicy.mode()
+        }
+  @type prepared_description :: %{
+          command: binary(),
+          args: [binary()],
+          ast: term(),
+          acl_keys: [binary()],
+          routing_scope: :none | :keys | :coordinated,
+          routing_keys: [binary()],
+          read_keys: [binary()],
+          write_keys: [binary()],
+          transaction_mode: Ferricstore.Commands.TransactionPolicy.mode()
         }
 
   @read_key_commands MapSet.new(~w(
@@ -90,6 +102,19 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA
   )
 
+  @structured_native_commands MapSet.new(~w(
+    FLOW.STEP_CONTINUE FLOW.START_AND_CLAIM FLOW.RUN_STEPS_MANY
+    FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.GET FLOW.SCHEDULE.DELETE FLOW.SCHEDULE.FIRE_DUE
+    FLOW.SCHEDULE.LIST FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME
+    FLOW.EFFECT.RESERVE FLOW.EFFECT.CONFIRM FLOW.EFFECT.FAIL FLOW.EFFECT.COMPENSATE
+    FLOW.EFFECT.GET FLOW.GOVERNANCE.LEDGER FLOW.GOVERNANCE.OVERVIEW
+    FLOW.APPROVAL.REQUEST FLOW.APPROVAL.APPROVE FLOW.APPROVAL.REJECT FLOW.APPROVAL.GET
+    FLOW.APPROVAL.LIST FLOW.CIRCUIT.OPEN FLOW.CIRCUIT.CLOSE FLOW.CIRCUIT.GET
+    FLOW.BUDGET.RESERVE FLOW.BUDGET.COMMIT FLOW.BUDGET.RELEASE FLOW.BUDGET.GET
+    FLOW.BUDGET.LIST FLOW.LIMIT.LEASE FLOW.LIMIT.SPEND FLOW.LIMIT.RELEASE
+    FLOW.LIMIT.GET FLOW.LIMIT.LIST
+  ))
+
   # These commands can mutate data or control-plane state outside one data
   # shard. Treat read-only subcommands conservatively because routing metadata
   # is intentionally command-level and immutable after parsing.
@@ -100,6 +125,62 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     FERRICSTORE.CONFIG FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR FERRICSTORE.TELEMETRY
     FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA
   )
+
+  @spec prepare(binary(), [term()]) :: {:ok, prepared_description()} | {:error, binary()}
+  def prepare(name, args) do
+    case NativeAstParser.parse(name, args) do
+      {:ok, command, parsed_args, {:unknown, unknown_command, _unknown_args}, _parser_keys}
+      when unknown_command == command ->
+        prepare_extension(command, parsed_args)
+
+      {:ok, command, parsed_args, ast, acl_keys} ->
+        prepared_ast =
+          if MapSet.member?(@structured_native_commands, command) do
+            {:structured_native_command, command}
+          else
+            ast
+          end
+
+        {:ok, describe_prepared(command, parsed_args, prepared_ast, acl_keys)}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp prepare_extension(command, parsed_args) do
+    case Extension.prepare(command, parsed_args) do
+      {:ok, %{ast: ast, keys: keys}} when is_list(keys) ->
+        if Enum.all?(keys, &is_binary/1) do
+          {:ok, describe_prepared(command, parsed_args, ast, keys)}
+        else
+          invalid_extension_keys(command)
+        end
+
+      {:error, :invalid_keys} ->
+        invalid_extension_keys(command)
+
+      :error ->
+        unknown_command(command)
+    end
+  end
+
+  defp describe_prepared(command, args, ast, acl_keys) do
+    {read_keys, write_keys, routing_scope, routing_keys, transaction_mode} =
+      discovery_metadata(command, ast, acl_keys)
+
+    %{
+      command: command,
+      args: args,
+      ast: ast,
+      acl_keys: acl_keys,
+      routing_scope: routing_scope,
+      routing_keys: routing_keys,
+      read_keys: read_keys,
+      write_keys: write_keys,
+      transaction_mode: transaction_mode
+    }
+  end
 
   @spec extract(binary(), [binary()]) :: result()
   def extract(command, args)
@@ -170,16 +251,25 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   @spec describe(binary(), term(), [binary()]) :: description()
   def describe(command, ast, acl_keys) when is_binary(command) and is_list(acl_keys) do
     command = String.upcase(command)
-    {read_keys, write_keys} = footprint(command, ast, acl_keys)
-    {routing_scope, routing_keys} = routing(command, acl_keys)
+
+    {read_keys, write_keys, routing_scope, routing_keys, transaction_mode} =
+      discovery_metadata(command, ast, acl_keys)
 
     %{
       acl_keys: acl_keys,
       routing_scope: routing_scope,
       routing_keys: routing_keys,
       read_keys: read_keys,
-      write_keys: write_keys
+      write_keys: write_keys,
+      transaction_mode: transaction_mode
     }
+  end
+
+  defp discovery_metadata(command, ast, acl_keys) do
+    {read_keys, write_keys} = footprint(command, ast, acl_keys)
+    {routing_scope, routing_keys} = routing(command, acl_keys)
+    transaction_mode = TransactionPolicy.mode(command, ast, routing_scope)
+    {read_keys, write_keys, routing_scope, routing_keys, transaction_mode}
   end
 
   @spec access_keys(binary(), [binary()]) :: {[binary()], [binary()]}
@@ -207,6 +297,14 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     if :get in opts, do: {keys, keys}, else: {[], keys}
   end
 
+  defp footprint(
+         _command,
+         {:extension_command, _module, _name, _args, access},
+         keys
+       )
+       when access in [:read, :write, :rw],
+       do: access_footprint(access, keys)
+
   defp footprint(command, _ast, keys), do: footprint(command, keys)
 
   defp footprint(command, [source, destination | _rest])
@@ -232,12 +330,12 @@ defmodule Ferricstore.Commands.KeyDiscovery do
        do: {[source], [source, destination]}
 
   defp footprint(command, keys) do
-    case command_access_type(command) do
-      :read -> {keys, []}
-      :write -> {[], keys}
-      :rw -> {keys, keys}
-    end
+    command |> command_access_type() |> access_footprint(keys)
   end
+
+  defp access_footprint(:read, keys), do: {keys, []}
+  defp access_footprint(:write, keys), do: {[], keys}
+  defp access_footprint(:rw, keys), do: {keys, keys}
 
   defp routing("FLOW." <> _rest, _keys), do: {:coordinated, []}
 
@@ -253,5 +351,13 @@ defmodule Ferricstore.Commands.KeyDiscovery do
       {parsed, ""} when parsed >= 0 -> Enum.take(keys, parsed)
       _invalid -> []
     end
+  end
+
+  defp invalid_extension_keys(command) do
+    {:error, "ERR invalid key metadata for extension command '#{String.downcase(command)}'"}
+  end
+
+  defp unknown_command(command) do
+    {:error, "ERR unknown command '#{String.downcase(command)}', with args beginning with: "}
   end
 end

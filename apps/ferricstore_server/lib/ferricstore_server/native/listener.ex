@@ -22,17 +22,41 @@ defmodule FerricstoreServer.Native.Listener do
     match?({:ok, _}, try_port())
   end
 
+  @spec max_connections() :: non_neg_integer()
+  def max_connections do
+    Application.get_env(:ferricstore, :maxclients, 10_000)
+  end
+
+  @doc false
+  @spec socket_opts(:inet.port_number(), keyword()) :: keyword()
+  def socket_opts(port, opts \\ []) do
+    [
+      port: port,
+      nodelay: Keyword.get(opts, :nodelay, Application.get_env(:ferricstore, :tcp_nodelay, true)),
+      recbuf: Application.get_env(:ferricstore, :tcp_recbuf, 131_072),
+      sndbuf: Application.get_env(:ferricstore, :tcp_sndbuf, 131_072),
+      backlog: Keyword.get(opts, :backlog, 1024),
+      keepalive: true
+    ] ++ send_timeout_opts()
+  end
+
+  @doc false
+  @spec send_timeout_opts() :: keyword()
+  def send_timeout_opts do
+    timeout = Application.get_env(:ferricstore, :native_send_timeout_ms, 15_000)
+
+    if is_integer(timeout) and timeout > 0 do
+      [send_timeout: timeout, send_timeout_close: true]
+    else
+      raise ArgumentError, "native_send_timeout_ms must be a positive integer"
+    end
+  end
+
   @spec start(:inet.port_number(), keyword()) :: {:ok, pid()} | {:error, term()}
   def start(port, opts \\ []) do
     transport_opts = %{
-      socket_opts: [
-        port: port,
-        nodelay: Application.get_env(:ferricstore, :tcp_nodelay, true),
-        recbuf: Application.get_env(:ferricstore, :tcp_recbuf, 131_072),
-        sndbuf: Application.get_env(:ferricstore, :tcp_sndbuf, 131_072),
-        backlog: Keyword.get(opts, :backlog, 1024),
-        keepalive: true
-      ]
+      max_connections: Keyword.get(opts, :max_connections, max_connections()),
+      socket_opts: socket_opts(port, opts)
     }
 
     max_frame_bytes =

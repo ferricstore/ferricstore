@@ -44,10 +44,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
-      defp flow_after_history_fast_record?(lmdb_mirror?, record) do
-        flow_history_trim_skippable?(record) and
-          (not lmdb_mirror? or not Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)))
-      end
+      defp flow_after_history_fast_record?(record), do: flow_history_trim_skippable?(record)
 
       defp flow_after_history_put(state, record) do
         with :ok <- flow_history_trim(state, record) do
@@ -94,12 +91,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         Enum.reduce_while(events, :ok, fn {event_id, event_ms}, :ok ->
           compound_key = FlowKeys.stream_entry_key(id, event_id, partition_key)
 
-          if flow_lmdb_projection_enabled?(state) do
-            with_lmdb_mirror_shard(state, fn ->
-              queue_lmdb_history_index_delete(record, history_key, event_id, trunc(event_ms))
-            end)
-          end
-
           case do_delete(state, compound_key) do
             :ok -> {:cont, :ok}
             {:error, _reason} = error -> {:halt, error}
@@ -107,20 +98,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         end)
       end
 
-      defp maybe_queue_terminal_lmdb_history_indexes(state, record) do
-        if flow_lmdb_projection_enabled?(state) and
-             Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-          id = Map.fetch!(record, :id)
-          partition_key = Map.get(record, :partition_key)
-          history_key = FlowKeys.history_key(id, partition_key)
-
-          with_lmdb_mirror_shard(state, fn ->
-            queue_lmdb_history_indexes_project_from_index(state, record, history_key)
-          end)
-        end
-
-        :ok
-      end
+      defp maybe_queue_terminal_lmdb_history_indexes(_state, _record), do: :ok
 
       defp flow_record_expire_at(%{terminal_retention_until_ms: expire_at_ms})
            when is_integer(expire_at_ms) and expire_at_ms > 0,
@@ -179,16 +157,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       end
 
       defp do_put(state, key, value, expire_at_ms) do
-        maybe_clear_compound_data_structure_for_string_put(state, key)
+        case Ferricstore.Raft.ApplyLimits.validate_value(state, value) do
+          :ok ->
+            with :ok <- maybe_clear_compound_data_structure_for_string_put(state, key) do
+              case maybe_externalize_apply_value(state, value) do
+                {:ok, :value, value} ->
+                  raw_put(state, key, value, expire_at_ms)
 
-        case maybe_externalize_apply_value(state, value) do
-          {:ok, :value, value} ->
-            raw_put(state, key, value, expire_at_ms)
+                {:ok, :blob_ref, encoded_ref, materialized_value} ->
+                  raw_put_blob_ref(state, key, encoded_ref, expire_at_ms, materialized_value)
 
-          {:ok, :blob_ref, encoded_ref, materialized_value} ->
-            raw_put_blob_ref(state, key, encoded_ref, expire_at_ms, materialized_value)
+                {:error, reason} = error ->
+                  record_state_write_failure(reason)
+                  error
+              end
+            end
 
-          {:error, _reason} = error ->
+          {:error, reason} = error ->
+            record_state_write_failure(reason)
             error
         end
       end
@@ -268,6 +254,49 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp maybe_externalize_cross_shard_value(anchor_state, _ctx, value) do
         {:ok, value_for_ets(value, hot_cache_threshold(anchor_state)), to_disk_binary(value),
          value}
+      end
+
+      defp maybe_externalize_cross_shard_entries(anchor_state, ctx, entries)
+           when is_list(entries) do
+        if Enum.all?(entries, fn {_key, value, _expire_at_ms} -> is_binary(value) end) do
+          instance_ctx = Map.get(ctx, :instance_ctx) || Map.get(anchor_state, :instance_ctx)
+          threshold = BlobValue.threshold(instance_ctx)
+          values = Enum.map(entries, fn {_key, value, _expire_at_ms} -> value end)
+
+          case BlobValue.maybe_externalize_many(ctx.data_dir, ctx.index, threshold, values) do
+            {:ok, stored_values} ->
+              hot_threshold = hot_cache_threshold(anchor_state)
+
+              prepared =
+                entries
+                |> Enum.zip(stored_values)
+                |> Enum.map(fn {{key, value, expire_at_ms}, stored_value} ->
+                  value_for =
+                    if stored_value == value, do: value_for_ets(value, hot_threshold), else: nil
+
+                  {key, value_for, to_disk_binary(stored_value), value, expire_at_ms}
+                end)
+
+              {:ok, prepared}
+
+            {:error, reason} ->
+              {:error, {:blob_externalize_failed, reason}}
+          end
+        else
+          Enum.reduce_while(entries, {:ok, []}, fn {key, value, expire_at_ms}, {:ok, acc} ->
+            case maybe_externalize_cross_shard_value(anchor_state, ctx, value) do
+              {:ok, value_for, disk_value, pending_value} ->
+                {:cont, {:ok, [{key, value_for, disk_value, pending_value, expire_at_ms} | acc]}}
+
+              {:error, _reason} = error ->
+                {:halt, error}
+            end
+          end)
+          |> case do
+            {:ok, prepared} -> {:ok, Enum.reverse(prepared)}
+            {:error, _reason} = error -> error
+          end
+        end
       end
 
       defp flow_inline_blob_value?(threshold, value) when is_binary(value) do
@@ -357,11 +386,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
 
       defp flow_shared_value_link_key(record, name, %{version: version})
            when is_binary(name) and is_integer(version) do
-        Map.fetch!(record, :id)
-        |> FlowKeys.shared_value_link_prefix(Map.get(record, :partition_key))
-        |> Kernel.<>(name)
-        |> Kernel.<>(":")
-        |> Kernel.<>(Integer.to_string(version))
+        FlowKeys.shared_value_link_key(
+          Map.fetch!(record, :id),
+          name,
+          version,
+          Map.get(record, :partition_key)
+        )
       end
 
       defp flow_shared_value_link_key(_record, _name, _entry), do: nil
@@ -538,11 +568,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp flow_put_state_record_encoded(state, key, value, expire_at_ms, record) do
         result =
           cond do
-            flow_lmdb_projection_enabled?(state) ->
-              flow_mirror_put_state_record(state, key, value, expire_at_ms, record)
-              maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
-              maybe_queue_flow_hibernation_candidate(state, key, record, value)
-
             flow_record_has_indexed_attributes?(record) ->
               with :ok <- flow_put_hot(state, key, value, expire_at_ms) do
                 maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
@@ -649,20 +674,40 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
             :ok
 
           refs ->
-            registry_key =
-              FlowKeys.shared_value_ref_registry_key(
-                Map.fetch!(record, :id),
-                Map.get(record, :partition_key)
-              )
+            with :ok <- flow_validate_shared_value_ref_locality(record, refs) do
+              registry_key =
+                FlowKeys.shared_value_ref_registry_key(
+                  Map.fetch!(record, :id),
+                  Map.get(record, :partition_key)
+                )
 
-            existing = flow_shared_value_ref_registry(state, registry_key)
-            new_refs = refs -- existing
+              with {:ok, existing} <- flow_shared_value_ref_registry(state, registry_key),
+                   :ok <- flow_increment_shared_value_ref_counts(state, refs -- existing) do
+                registry = Enum.sort(Enum.uniq(existing ++ refs))
 
-            with :ok <- flow_maybe_run_shared_value_ref_acquisition_hook(record, new_refs),
-                 :ok <- flow_increment_shared_value_ref_counts(state, new_refs) do
-              registry = Enum.sort(Enum.uniq(existing ++ new_refs))
-              flow_put_hot_value(state, registry_key, :erlang.term_to_binary(registry), 0)
+                flow_put_hot_value(
+                  state,
+                  registry_key,
+                  Ferricstore.TermCodec.encode(registry),
+                  0
+                )
+              end
             end
+        end
+      end
+
+      defp flow_validate_shared_value_ref_locality(record, refs) do
+        refs = Enum.filter(refs, &FlowKeys.shared_value_ref?/1)
+
+        state_key =
+          FlowKeys.state_key(Map.fetch!(record, :id), Map.get(record, :partition_key))
+
+        state_tag = Router.extract_hash_tag(state_key)
+
+        if Enum.all?(refs, &(Router.extract_hash_tag(&1) == state_tag)) do
+          :ok
+        else
+          {:error, "CROSSSLOT Flow shared value refs must hash to the Flow shard"}
         end
       end
 
@@ -670,30 +715,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         flow_record_shared_and_private_value_refs(record)
       end
 
-      defp flow_maybe_run_shared_value_ref_acquisition_hook(_record, []), do: :ok
-
-      defp flow_maybe_run_shared_value_ref_acquisition_hook(record, refs) do
-        case Application.get_env(:ferricstore, :flow_shared_value_ref_acquisition_hook) do
-          fun when is_function(fun, 2) -> fun.(record, refs)
-          _missing -> :ok
-        end
-      end
-
       defp flow_shared_value_ref_registry(state, registry_key) do
         case sm_store_batch_get(state, [registry_key], &sm_file_path/2) do
           [value] when is_binary(value) ->
-            try do
-              value
-              |> :erlang.binary_to_term([:safe])
-              |> Enum.filter(&FlowKeys.shared_value_ref?/1)
-              |> Enum.uniq()
-              |> Enum.sort()
-            rescue
-              _ -> []
-            end
+            flow_decode_shared_value_ref_registry(state, registry_key, value)
 
           _missing ->
-            []
+            {:ok, []}
+        end
+      end
+
+      defp flow_decode_shared_value_ref_registry(state, registry_key, value) do
+        max_bytes = raft_apply_context(state).max_value_size
+
+        with true <- byte_size(value) <= max_bytes,
+             {:ok, refs} when is_list(refs) <- Ferricstore.TermCodec.decode(value) do
+          normalized =
+            refs
+            |> Enum.filter(&FlowKeys.shared_value_ref?/1)
+            |> Enum.uniq()
+            |> Enum.sort()
+
+          if refs == normalized do
+            {:ok, refs}
+          else
+            {:error, {:invalid_flow_shared_value_ref_registry, registry_key}}
+          end
+        else
+          _invalid -> {:error, {:invalid_flow_shared_value_ref_registry, registry_key}}
         end
       end
 
@@ -702,34 +751,40 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp flow_increment_shared_value_ref_counts(state, refs) do
         Enum.reduce_while(refs, :ok, fn ref, :ok ->
           count_key = FlowKeys.shared_value_ref_count_key(ref, state.shard_index)
-          count = flow_shared_value_ref_count(state, count_key)
-          :ok = flow_put_hot_value(state, count_key, :erlang.term_to_binary(count + 1), 0)
-          {:cont, :ok}
+
+          with {:ok, count} <- flow_shared_value_ref_count(state, count_key),
+               :ok <-
+                 flow_put_hot_value(
+                   state,
+                   count_key,
+                   Ferricstore.TermCodec.encode(count + 1),
+                   0
+                 ) do
+            {:cont, :ok}
+          else
+            {:error, _reason} = error -> {:halt, error}
+          end
         end)
       end
 
       defp flow_shared_value_ref_count(state, count_key) do
         case sm_store_batch_get(state, [count_key], &sm_file_path/2) do
           [value] when is_binary(value) ->
-            try do
-              case :erlang.binary_to_term(value, [:safe]) do
-                count when is_integer(count) and count > 0 -> count
-                _invalid -> 0
+            if byte_size(value) <= 64 do
+              case Ferricstore.TermCodec.decode(value) do
+                {:ok, count}
+                when is_integer(count) and count > 0 and count < 9_223_372_036_854_775_807 ->
+                  {:ok, count}
+
+                _invalid ->
+                  {:error, {:invalid_flow_shared_value_ref_count, count_key}}
               end
-            rescue
-              _ -> 0
+            else
+              {:error, {:invalid_flow_shared_value_ref_count, count_key}}
             end
 
           _missing ->
-            0
-        end
-      end
-
-      defp flow_mirror_put_state_record(state, key, value, expire_at_ms, record) do
-        if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-          raw_put_cold(state, key, value, expire_at_ms, flow_record_lfu(record, value))
-        else
-          flow_put_hot(state, key, value, expire_at_ms)
+            {:ok, 0}
         end
       end
 
@@ -943,8 +998,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
 
       defp do_set(state, key, value, expire_at_ms, opts) do
         with {:ok, owner_state, owner_record} <-
-               flow_validate_retention_owned_write(state, opts),
-             :ok <- flow_maybe_run_retention_owned_write_hook(owner_record, key) do
+               flow_validate_retention_owned_write(state, key, opts) do
           do_set_validated(
             state,
             key,
@@ -1014,7 +1068,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         end
       end
 
-      defp flow_validate_retention_owned_write(state, opts) do
+      defp flow_validate_retention_owned_write(state, key, opts) do
         case Map.get(opts, :flow_retention_owner) do
           nil ->
             {:ok, nil, nil}
@@ -1027,26 +1081,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
           }
           when is_binary(id) and (is_binary(partition_key) or is_nil(partition_key)) and
                  is_binary(state_key) and is_binary(expected_guard) ->
-            owner_state = cross_shard_state_for_key(state, state_key)
-            guard_key = FlowKeys.retention_guard_key(id, partition_key)
+            if Router.extract_hash_tag(key) == Router.extract_hash_tag(state_key) do
+              guard_key = FlowKeys.retention_guard_key(id, partition_key)
 
-            if flow_retention_current_guard(owner_state, guard_key) == expected_guard do
-              {:ok, owner_state, %{id: id, partition_key: partition_key}}
+              if flow_retention_current_guard(state, guard_key) == expected_guard do
+                {:ok, state, %{id: id, partition_key: partition_key}}
+              else
+                {:error, "ERR stale flow governance owner"}
+              end
             else
-              {:error, "ERR stale flow governance owner"}
+              {:error, "CROSSSLOT Flow-owned keys must hash to the owner shard"}
             end
 
           _invalid_owner ->
             {:error, "ERR invalid flow retention owner"}
-        end
-      end
-
-      defp flow_maybe_run_retention_owned_write_hook(nil, _key), do: :ok
-
-      defp flow_maybe_run_retention_owned_write_hook(owner_record, key) do
-        case Application.get_env(:ferricstore, :flow_retention_owned_write_hook) do
-          hook when is_function(hook, 2) -> hook.(owner_record, key)
-          _missing -> :ok
         end
       end
 
@@ -1119,14 +1167,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       end
 
       defp do_put_blob_ref(state, key, encoded_ref, expire_at_ms) do
-        with {:ok, materialized} <- materialize_blob_ref(state, encoded_ref) do
-          maybe_clear_compound_data_structure_for_string_put(state, key)
+        with {:ok, materialized} <- materialize_blob_ref(state, encoded_ref),
+             :ok <- maybe_clear_compound_data_structure_for_string_put(state, key) do
           raw_put_blob_ref(state, key, encoded_ref, expire_at_ms, materialized)
         end
       end
 
       defp do_put_blob_ref_ref_only(state, key, encoded_ref, expire_at_ms) do
         with {:ok, ref} <- decode_blob_ref(encoded_ref),
+             :ok <- Ferricstore.Raft.ApplyLimits.validate_value_size(state, ref.size),
              :ok <- verify_blob_refs_for_apply(state, [ref]) do
           do_put_blob_ref_ref_only_validated(state, key, encoded_ref, expire_at_ms)
         end
@@ -1232,6 +1281,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
         case check_key_lock(state, redis_key, owner_ref) do
           :ok -> do_put_blob_ref(state, key, encoded_ref, expire_at_ms)
           {:error, _reason} = error -> error
+        end
+      end
+
+      defp do_fetch_or_compute_publish_blob_ref(
+             state,
+             key,
+             encoded_ref,
+             expire_at_ms,
+             owner_ref
+           ) do
+        with :ok <- check_key_lock(state, key, owner_ref) do
+          case with_pending_writes(state, fn ->
+                 do_put_blob_ref(state, key, encoded_ref, expire_at_ms)
+               end) do
+            :ok -> do_unlock_keys(state, [key], owner_ref)
+            {:error, _reason} = error -> {state, error}
+            other -> {state, {:error, {:invalid_fetch_or_compute_write_result, other}}}
+          end
+        else
+          {:error, _reason} = error -> {state, error}
         end
       end
 

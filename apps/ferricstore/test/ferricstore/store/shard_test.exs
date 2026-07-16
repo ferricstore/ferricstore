@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.ShardTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.DiskPressure
+  alias Ferricstore.Store.{CompoundKey, DiskPressure, TypeRegistry}
   alias Ferricstore.Test.IsolatedInstance
 
   setup do
@@ -118,6 +118,33 @@ defmodule Ferricstore.Store.ShardTest do
       past = System.os_time(:millisecond) - 1000
       :ok = GenServer.call(shard, {:put, "key", "value", past})
       assert false == GenServer.call(shard, {:exists, "key"})
+    end
+  end
+
+  describe "compound type claims" do
+    test "concurrent incompatible first claims cannot replace each other", %{
+      ctx: ctx,
+      keydir: keydir
+    } do
+      key = "compound-type-race"
+
+      results =
+        [:hash, :set]
+        |> Enum.map(fn type ->
+          Task.async(fn -> TypeRegistry.check_or_set_status(key, type, ctx) end)
+        end)
+        |> Task.await_many(5_000)
+
+      assert Enum.count(results, &(&1 == {:ok, :created})) == 1
+
+      assert Enum.count(results, fn
+               {:error, message} when is_binary(message) -> String.contains?(message, "WRONGTYPE")
+               _other -> false
+             end) == 1
+
+      type_key = CompoundKey.type_key(key)
+      assert [{^type_key, type, 0, _lfu, _fid, _offset, _size}] = :ets.lookup(keydir, type_key)
+      assert type in ["hash", "set"]
     end
   end
 

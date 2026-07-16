@@ -18,14 +18,24 @@ config :ferricstore,
   native_port: 6388,
   native_tls_port: nil,
   native_max_frame_bytes: 16 * 1024 * 1024,
+  native_unauthenticated_max_frame_bytes: 64 * 1024,
+  native_frame_assembly_timeout_ms: 15_000,
+  native_send_timeout_ms: 15_000,
+  native_max_value_items: 100_000,
+  native_max_value_depth: 64,
   native_max_lanes_per_connection: 1024,
   native_lane_max_queue: 1024,
-  native_max_batch_commands: 1024,
+  native_max_pipeline_commands: 1024,
   native_max_inflight_per_connection: 4096,
   native_max_inflight_per_lane: 1024,
   native_response_chunk_bytes: 0,
+  native_max_response_bytes: 64 * 1024 * 1024,
+  native_response_coalesce_max: 64,
+  native_response_coalesce_bytes: 8 * 1024 * 1024,
   native_max_pending_chunks: 1024,
+  native_max_pending_chunk_bytes: 64 * 1024 * 1024,
   native_max_collection_response_items: 10_000,
+  native_request_compression_enabled: false,
   native_trace_enabled: false,
   native_idle_timeout_ms: 90_000
 
@@ -93,15 +103,10 @@ config :ferricstore, :lfu_decay_time, 1
 # LFU log factor: controls probabilistic increment curve.
 config :ferricstore, :lfu_log_factor, 10
 
-# Legacy direct file-send threshold retained for older/internal transports.
-# Native TCP/TLS responses use native frame encoding, response coalescing,
-# and optional response chunking.
-config :ferricstore_server, :sendfile_threshold, 65_536
-
 # Large values at or above this size are stored in per-shard append blob
 # segments with a small Bitcask reference. A conservative sweeper cleans stale
-# tmp/legacy blob files and whole append segments once no live ref points into
-# them. Partial segment compaction is intentionally a separate maintenance step.
+# metadata tmp files and whole append segments once no live ref points into them.
+# Partial segment compaction is intentionally a separate maintenance step.
 config :ferricstore,
   blob_side_channel_threshold_bytes: 256 * 1024,
   blob_segment_max_bytes: 256 * 1024 * 1024,

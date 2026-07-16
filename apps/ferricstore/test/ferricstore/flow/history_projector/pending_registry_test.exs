@@ -34,4 +34,21 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistryTest do
     assert PendingRegistry.trim_replay_reservation(projector, 7) == :ok
     assert PendingRegistry.replay_reservation_flushed_index(projector) == 0
   end
+
+  test "concurrent replay reservations preserve the full index range" do
+    projector = :history_projector_replay_registry_concurrent_test
+    PendingRegistry.trim_replay_reservation(projector, 1_000_000)
+
+    1..500
+    |> Task.async_stream(
+      fn index -> PendingRegistry.reserve_replay_range(projector, [%{ra_index: index}]) end,
+      max_concurrency: 64,
+      timeout: 10_000,
+      ordered: false
+    )
+    |> Enum.each(fn result -> assert result == {:ok, :ok} end)
+
+    assert [{^projector, 1, 500, 0}] =
+             :ets.lookup(PendingRegistry.replay_table(), projector)
+  end
 end

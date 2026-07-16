@@ -148,6 +148,25 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
   end
 
+  test "prepares large fetch-or-compute publish without losing lease consumption", %{
+    ctx: ctx,
+    root: root
+  } do
+    payload = :binary.copy("F", 1024)
+    owner_ref = "fetch-owner"
+
+    assert {:ok, {:fetch_or_compute_publish_blob_ref, "cache-key", encoded_ref, 0, ^owner_ref}} =
+             BlobCommand.prepare(
+               ctx,
+               0,
+               {:fetch_or_compute_publish, "cache-key", payload, 0, owner_ref},
+               single_member?: true
+             )
+
+    assert {:ok, ref} = BlobRef.decode(encoded_ref)
+    assert {:ok, ^payload} = BlobStore.get(root, 0, ref)
+  end
+
   test "leaves zset locked puts inline", %{ctx: ctx} do
     payload = :binary.copy("9", 1024)
     compound_key = CompoundKey.zset_member("zset", "member")

@@ -14,17 +14,60 @@ defmodule Ferricstore.Commands.PubSubTest do
       start_supervised!(PubSub)
     end
 
-    # Clean ETS tables between tests
-    clear_table(:ferricstore_pubsub)
-    clear_table(:ferricstore_pubsub_patterns)
-    clear_table(:ferricstore_pubsub_channel_cache)
+    reset_registry()
     :ok
   end
 
-  defp clear_table(table) do
-    case :ets.whereis(table) do
-      :undefined -> :ok
-      _tid -> :ets.delete_all_objects(table)
+  defp reset_registry do
+    :sys.replace_state(PubSub, fn state ->
+      for {_pid, ref} <- :ets.tab2list(:ferricstore_pubsub_monitors) do
+        Process.demonitor(ref, [:flush])
+      end
+
+      for table <- [
+            :ferricstore_pubsub,
+            :ferricstore_pubsub_patterns,
+            :ferricstore_pubsub_channel_cache,
+            :ferricstore_pubsub_pattern_cache,
+            :ferricstore_pubsub_monitors
+          ] do
+        :ets.delete_all_objects(table)
+      end
+
+      state
+    end)
+  end
+
+  describe "subscription snapshot" do
+    test "subscription state can only be mutated by the registry owner" do
+      for table <- [
+            :ferricstore_pubsub,
+            :ferricstore_pubsub_patterns,
+            :ferricstore_pubsub_channel_cache,
+            :ferricstore_pubsub_pattern_cache
+          ] do
+        assert :ets.info(table, :protection) == :protected
+      end
+    end
+
+    test "does not materialize unbounded ETS tables" do
+      source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
+
+      refute source =~ ":ets.tab2list"
+      assert source =~ "@pattern_cache_table"
+      assert source =~ "safe_ets_size(@monitors_table)"
+    end
+
+    test "keeps exact pattern counts and one active subscriber per pid" do
+      PubSub.subscribe("exact", self())
+      PubSub.psubscribe("news.*", self())
+      PubSub.psubscribe("news.*", self())
+
+      assert %{
+               patterns: [%{pattern: "news.*", subscribers: 1}],
+               active_subscribers: 1,
+               pattern_subscriptions: 1
+             } = PubSub.subscription_snapshot(10)
     end
   end
 
@@ -91,7 +134,12 @@ defmodule Ferricstore.Commands.PubSubTest do
 
     test "pattern subscribe relies on ETS bag idempotence without a pre-insert scan" do
       source = File.read!(Path.expand("../../../lib/ferricstore/pubsub.ex", __DIR__))
-      [psubscribe_source] = Regex.run(~r/def psubscribe\(pattern, pid\).*?^  end/ms, source)
+
+      [psubscribe_source] =
+        Regex.run(
+          ~r/def handle_call\(\{:pattern_subscription_changed.*?^  end/ms,
+          source
+        )
 
       refute psubscribe_source =~ ":ets.match"
       assert psubscribe_source =~ ":ets.insert"
@@ -148,6 +196,12 @@ defmodule Ferricstore.Commands.PubSubTest do
   describe "PUBSUB CHANNELS" do
     test "returns empty list when no active channels" do
       assert PubSubCmd.handle("PUBSUB", ["CHANNELS"]) == []
+    end
+
+    test "prepared AST subcommands remain case-insensitive" do
+      assert PubSubCmd.handle_ast({:pubsub, ["channels"]}) == []
+      assert PubSubCmd.handle_ast({:pubsub, ["numsub", "missing"]}) == ["missing", 0]
+      assert PubSubCmd.handle_ast({:pubsub, ["numpat"]}) == 0
     end
 
     test "returns active channels" do

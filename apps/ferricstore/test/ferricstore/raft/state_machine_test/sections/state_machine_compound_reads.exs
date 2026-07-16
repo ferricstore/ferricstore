@@ -33,6 +33,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.StateMachineCompoundReads d
             NIF.v2_append_batch(dedicated_file, [{field_key, "41", 0}])
 
           :ets.insert(ets, {field_key, nil, 0, 1, 0, cold_offset, cold_size})
+          state = put_in(state.promoted_instances[key], %{path: dedicated_path, type: :hash})
 
           {_state2, result} =
             StateMachine.apply(%{}, {:hincrby, key, "counter", 1}, state)
@@ -64,6 +65,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.StateMachineCompoundReads d
             NIF.v2_append_batch(dedicated_file, [{field_key, "41.5", 0}])
 
           :ets.insert(ets, {field_key, nil, 0, 1, 0, cold_offset, cold_size})
+          state = put_in(state.promoted_instances[key], %{path: dedicated_path, type: :hash})
 
           {_state2, result} =
             StateMachine.apply(%{}, {:hincrbyfloat, key, "ratio", 1.0}, state)
@@ -95,6 +97,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.StateMachineCompoundReads d
             NIF.v2_append_batch(dedicated_file, [{member_key, "41.5", 0}])
 
           :ets.insert(ets, {member_key, nil, 0, 1, 0, cold_offset, cold_size})
+          state = put_in(state.promoted_instances[key], %{path: dedicated_path, type: :zset})
 
           {_state2, result} =
             StateMachine.apply(%{}, {:zincrby, key, 1.0, "Palermo"}, state)

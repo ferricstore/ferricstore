@@ -18,6 +18,7 @@ defmodule Ferricstore.Store.Shard.Startup do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       alias Ferricstore.Store.Shard.CompoundMemberIndex
+      alias Ferricstore.Store.Shard.LogicalKeyIndex
       alias Ferricstore.Store.Shard.NativeOps, as: ShardNativeOps
       alias Ferricstore.Store.Shard.Reads, as: ShardReads
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
@@ -57,9 +58,57 @@ defmodule Ferricstore.Store.Shard.Startup do
           flow_async_history =
             Keyword.get_lazy(opts, :flow_async_history, &flow_async_history_enabled?/0)
 
+          standalone_commit_delay_ms =
+            positive_runtime_option(opts, :standalone_fsync_max_delay_ms, @flush_interval_ms)
+
+          standalone_commit_max_ops =
+            positive_runtime_option(
+              opts,
+              :standalone_fsync_max_ops,
+              @default_standalone_fsync_max_ops
+            )
+
+          standalone_commit_max_queued_ops =
+            positive_runtime_option(
+              opts,
+              :standalone_commit_max_queued_ops,
+              @default_standalone_commit_max_queued_ops
+            )
+
+          standalone_commit_max_queued_bytes =
+            positive_runtime_option(
+              opts,
+              :standalone_commit_max_queued_bytes,
+              @default_standalone_commit_max_queued_bytes
+            )
+
+          get_many_max_concurrency =
+            positive_runtime_option(
+              opts,
+              :shard_get_many_max_concurrency,
+              @default_shard_get_many_max_concurrency
+            )
+
+          get_many_max_queued =
+            non_negative_runtime_option(
+              opts,
+              :shard_get_many_max_queued,
+              @default_shard_get_many_max_queued
+            )
+
+          get_many_pread_batch = Keyword.get(opts, :get_many_pread_batch)
+          get_many_waraft_batch = Keyword.get(opts, :get_many_waraft_batch)
+
+          promoted_compaction_retry_ms =
+            positive_runtime_option(
+              opts,
+              :promoted_compaction_retry_ms,
+              @default_promoted_compaction_retry_ms
+            )
+
           flow_shared_ref_backfill? = Keyword.get(opts, :flow_shared_ref_backfill?, true)
 
-          if ctx && !Ferricstore.ReplicationMode.raft?() do
+          if ctx && !raft_projection_owner?(ctx) do
             :ok = Ferricstore.Store.StandaloneTxLog.recover_once(data_dir)
           end
 
@@ -74,6 +123,7 @@ defmodule Ferricstore.Store.Shard.Startup do
             if ctx, do: elem(ctx.keydir_refs, index), else: :"keydir_#{index}"
 
           keydir = prepare_startup_keydir(keydir_name, ctx, index)
+          Ferricstore.Store.PublicationEpoch.reset(ctx || %{}, index)
 
           # Remove any leftover hot_cache table from a previous run.
           case :ets.whereis(:"hot_cache_#{index}") do
@@ -84,6 +134,11 @@ defmodule Ferricstore.Store.Shard.Startup do
           instance_name = if ctx, do: ctx.name, else: :default
           compound_member_index = CompoundMemberIndex.table_name(instance_name, index)
           CompoundMemberIndex.ensure_table!(compound_member_index)
+
+          {logical_key_index, logical_key_slots} =
+            LogicalKeyIndex.table_names(instance_name, index)
+
+          LogicalKeyIndex.ensure_tables!(logical_key_index, logical_key_slots)
           {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
           ensure_zset_index_table!(zset_score_index, :ordered_set)
           ensure_zset_index_table!(zset_score_lookup, :set)
@@ -104,12 +159,36 @@ defmodule Ferricstore.Store.Shard.Startup do
             :ok
           end)
 
+          promoted =
+            profile_startup_phase(index, :recover_promoted, fn ->
+              Ferricstore.Store.Promotion.recover_promoted(
+                path,
+                keydir,
+                data_dir,
+                index,
+                ctx
+              )
+            end)
+
+          :ok =
+            Ferricstore.Store.Promotion.clear_compound_promotion_fences(%{
+              instance_ctx: ctx,
+              index: index
+            })
+
           profile_startup_phase(index, :compound_member_index_rebuild, fn ->
             unless raft_projection_owner?(ctx) do
               CompoundMemberIndex.rebuild(compound_member_index, keydir)
             end
 
             :ok
+          end)
+
+          profile_startup_phase(index, :logical_key_index_rebuild, fn ->
+            case LogicalKeyIndex.rebuild(logical_key_index, logical_key_slots, keydir, path) do
+              :ok -> :ok
+              {:error, reason} -> throw({:shard_init_failed, reason})
+            end
           end)
 
           profile_startup_phase(index, :flow_native_index_init, fn ->
@@ -152,17 +231,8 @@ defmodule Ferricstore.Store.Shard.Startup do
           # still own local keydir/read/recovery state.
           raft? = false
 
-          # Recover promoted collection instances
-          promoted =
-            profile_startup_phase(index, :recover_promoted, fn ->
-              Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index, ctx)
-            end)
-
-          # Migrate existing prob files: scan prob dir for files without
-          # corresponding metadata markers in the keydir. Write markers so
-          # DEL can clean up prob files and BF.INFO/CMS.INFO can recover metadata.
-          profile_startup_phase(index, :migrate_prob_files, fn ->
-            ShardLifecycle.migrate_prob_files(path, keydir, index, ctx)
+          profile_startup_phase(index, :validate_prob_files, fn ->
+            ShardLifecycle.validate_prob_files(path, index)
           end)
 
           # Publish active file metadata to ActiveFile registry
@@ -221,7 +291,18 @@ defmodule Ferricstore.Store.Shard.Startup do
              merge_config: merge_config,
              raft?: raft?,
              max_active_file_size: max_file_size,
+             standalone_commit_delay_ms: standalone_commit_delay_ms,
+             standalone_commit_max_ops: standalone_commit_max_ops,
+             standalone_commit_max_queued_ops: standalone_commit_max_queued_ops,
+             standalone_commit_max_queued_bytes: standalone_commit_max_queued_bytes,
+             get_many_max_concurrency: get_many_max_concurrency,
+             get_many_max_queued: get_many_max_queued,
+             get_many_pread_batch: get_many_pread_batch,
+             get_many_waraft_batch: get_many_waraft_batch,
+             promoted_compaction_retry_ms: promoted_compaction_retry_ms,
              compound_member_index: compound_member_index,
+             logical_key_index: logical_key_index,
+             logical_key_slots: logical_key_slots,
              zset_score_index: zset_score_index,
              zset_score_lookup: zset_score_lookup,
              flow_index: flow_index,
@@ -235,10 +316,32 @@ defmodule Ferricstore.Store.Shard.Startup do
 
       defp file_path(shard_path, file_id), do: ShardETS.file_path(shard_path, file_id)
 
+      defp positive_runtime_option(opts, key, default) do
+        value =
+          Keyword.get_lazy(opts, key, fn ->
+            Application.get_env(:ferricstore, key, default)
+          end)
+
+        if is_integer(value) and value > 0, do: value, else: default
+      end
+
+      defp non_negative_runtime_option(opts, key, default) do
+        value =
+          Keyword.get_lazy(opts, key, fn ->
+            Application.get_env(:ferricstore, key, default)
+          end)
+
+        if is_integer(value) and value >= 0, do: value, else: default
+      end
+
       defp startup_file_size(path) do
-        case File.stat(path) do
-          {:ok, %{size: size}} when is_integer(size) and size >= 0 -> size
-          _missing -> 0
+        case File.lstat(path) do
+          {:ok, %File.Stat{type: :regular, size: size}}
+          when is_integer(size) and size >= 0 ->
+            size
+
+          _missing ->
+            0
         end
       end
 

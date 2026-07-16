@@ -126,6 +126,8 @@ defmodule Ferricstore.Raft.StateMachine do
   @sm_standalone_staged_key :sm_standalone_staged_apply
   @sm_waraft_projection_writer_key :sm_waraft_projection_writer
   @sm_pending_write_keys [
+    :sm_state_read_failure,
+    :sm_state_write_failure,
     :sm_pending_writes,
     :sm_pending_originals,
     :sm_pending_values,
@@ -142,6 +144,12 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_flow_native_flush?,
     :sm_pending_zset_index_ops,
     :sm_pending_compound_promotions,
+    :sm_pending_compound_promotion_removals,
+    :sm_pending_promoted_maintenance,
+    :sm_pending_compound_revision_ops,
+    :sm_compound_revision_fallback,
+    :sm_pending_compound_member_index_ops,
+    :sm_pending_stream_cache_cleanups,
     :sm_pending_prob_creates,
     :sm_pending_has_delete,
     :sm_pending_fast_put_batch,
@@ -149,6 +157,8 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_fast_staged_put_batch
   ]
   @sm_pending_write_initial_values [
+    sm_state_read_failure: nil,
+    sm_state_write_failure: nil,
     sm_pending_writes: [],
     sm_pending_originals: %{},
     sm_pending_values: %{},
@@ -165,6 +175,12 @@ defmodule Ferricstore.Raft.StateMachine do
     sm_pending_flow_native_flush?: false,
     sm_pending_zset_index_ops: [],
     sm_pending_compound_promotions: MapSet.new(),
+    sm_pending_compound_promotion_removals: MapSet.new(),
+    sm_pending_promoted_maintenance: %{},
+    sm_pending_compound_revision_ops: [],
+    sm_compound_revision_fallback: nil,
+    sm_pending_compound_member_index_ops: [],
+    sm_pending_stream_cache_cleanups: MapSet.new(),
     sm_pending_prob_creates: [],
     sm_pending_has_delete: false,
     sm_pending_fast_put_batch: false,

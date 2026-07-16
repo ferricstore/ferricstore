@@ -26,6 +26,38 @@ defmodule Ferricstore.FlowGovernanceReleaseOutboxTest do
     :ok
   end
 
+  test "release outbox codecs reject non-canonical and invalid records" do
+    intent = release_intent(String.duplicate("flow", 1_024), "scope", "reservation")
+    encoded_intent = ReleaseOutbox.encode_intent(intent)
+    encoded_meta = ReleaseOutbox.encode_meta(%{head: 1, tail: 1})
+
+    compressed_intent =
+      encoded_intent
+      |> :erlang.binary_to_term([:safe])
+      |> :erlang.term_to_binary(compressed: 9)
+
+    assert <<131, 80, _rest::binary>> = compressed_intent
+
+    assert {:error, "ERR flow governance release intent is corrupt"} =
+             ReleaseOutbox.decode_intent(compressed_intent)
+
+    assert {:error, "ERR flow governance release intent is corrupt"} =
+             ReleaseOutbox.decode_intent(encoded_intent <> <<0>>)
+
+    assert {:error, "ERR flow governance release outbox is corrupt"} =
+             ReleaseOutbox.decode_meta(encoded_meta <> <<0>>)
+
+    assert_raise ArgumentError, fn -> ReleaseOutbox.encode_meta(%{head: 2, tail: 0}) end
+
+    for invalid <- [
+          %{intent | reservation_id: ""},
+          %{intent | created_at_ms: -1},
+          Map.put(intent, :unexpected, "field")
+        ] do
+      assert_raise ArgumentError, fn -> ReleaseOutbox.encode_intent(invalid) end
+    end
+  end
+
   test "governed claims do not rewrite the limit owner to bind Flow metadata" do
     type = unique_flow_id("outbox-no-bind-type")
     scope = unique_flow_id("outbox-no-bind-scope")
@@ -463,8 +495,9 @@ defmodule Ferricstore.FlowGovernanceReleaseOutboxTest do
     assert length(entries) == 256
 
     assert_receive {:shard_batch_read, {:get, ^meta_key}}
-    assert_receive {:shard_batch_read, {:get_many, keys}}
+    assert_receive {:shard_batch_read, {:get_many, keys, deadline_ms}}
     assert length(keys) == 512
+    assert deadline_ms > System.monotonic_time(:millisecond)
     refute_receive {:shard_batch_read, _request}, 50
   end
 
@@ -512,12 +545,15 @@ defmodule Ferricstore.FlowGovernanceReleaseOutboxTest do
 
     started_at = System.monotonic_time(:millisecond)
 
-    assert {:noreply, ^state} =
+    assert {:noreply, admitted_state} =
              Ferricstore.Store.Shard.Reads.handle_get_many(
                keys,
                {self(), make_ref()},
                state
              )
+
+    assert Map.take(admitted_state, Map.keys(state)) == state
+    assert map_size(admitted_state.get_many_workers) == 1
 
     elapsed_ms = System.monotonic_time(:millisecond) - started_at
     assert elapsed_ms < 100
@@ -713,6 +749,11 @@ defmodule Ferricstore.FlowGovernanceReleaseOutboxTest do
         shard_batch_reader(parent, values)
 
       {:"$gen_call", from, {:get_many, keys} = request} ->
+        send(parent, {:shard_batch_read, request})
+        GenServer.reply(from, Enum.map(keys, &Map.get(values, &1)))
+        shard_batch_reader(parent, values)
+
+      {:"$gen_call", from, {:get_many, keys, _deadline_ms} = request} ->
         send(parent, {:shard_batch_read, request})
         GenServer.reply(from, Enum.map(keys, &Map.get(values, &1)))
         shard_batch_reader(parent, values)

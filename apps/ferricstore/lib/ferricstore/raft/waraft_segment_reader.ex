@@ -73,8 +73,11 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
              is_integer(index) and index > 0 do
     root = storage_root(%{data_dir: data_dir}, shard_index)
 
-    apply_projection_index_on_disk?(root, index) or
-      not apply_projection_cache_entries_present?(root, index)
+    case read_apply_projection_latest_entries_from_disk(root, index) do
+      {:ok, _entries} -> true
+      :not_found -> not apply_projection_cache_entries_present?(root, index)
+      {:error, _reason} -> false
+    end
   rescue
     ArgumentError -> false
   end
@@ -253,6 +256,29 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
           binary()
         ]) ::
           {:ok, %{binary() => binary()}} | {:error, term()}
+
+  @spec read_values_from_location(
+          FerricStore.Instance.t(),
+          non_neg_integer(),
+          term(),
+          [binary()],
+          non_neg_integer()
+        ) :: {:ok, %{binary() => binary()}} | {:error, term()}
+  def read_values_from_location(ctx, shard_index, file_id, keys, timeout_ms)
+      when is_list(keys) and is_integer(timeout_ms) and timeout_ms >= 0 do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+
+    if waraft_read_expired?(deadline_ms) do
+      {:error, :deadline_exceeded}
+    else
+      result = read_values_from_location(ctx, shard_index, file_id, keys)
+
+      if waraft_read_expired?(deadline_ms),
+        do: {:error, :deadline_exceeded},
+        else: result
+    end
+  end
+
   def read_values_from_location(ctx, shard_index, {:waraft_segment, index}, keys)
       when is_integer(index) and index > 0 and is_list(keys) do
     case read_main_log_entry(ctx, shard_index, index) do
@@ -276,15 +302,8 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     root_chars = to_charlist(projection_root)
     keyset = MapSet.new(keys)
 
-    with {:ok, {_ordinal, offset, encoded_size}} <-
-           :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, index),
-         {:ok, entry} <-
-           :ferricstore_waraft_spike_segment_log.read_disk_at(
-             root_chars,
-             index,
-             offset,
-             encoded_size
-           ) do
+    case read_projection_entry_at(root_chars, index) do
+      {:ok, entry} ->
       case entry do
         {0, {:ferricstore_segment_projection_entry, key, value, _expire_at_ms}}
         when is_binary(key) and is_binary(value) ->
@@ -293,9 +312,8 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
         _other ->
           {:error, :bad_segment_projection_entry}
       end
-    else
+
       :not_found -> {:ok, %{}}
-      {:error, :enoent} -> {:ok, %{}}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -303,12 +321,13 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   def read_values_from_location(ctx, shard_index, {:waraft_apply_projection, index}, keys)
       when is_integer(index) and index > 0 and is_list(keys) do
     root = storage_root(ctx, shard_index)
+    read_mode = {:live, CommandValues.now_ms()}
 
     {found, missing} =
       keys
       |> Enum.uniq()
       |> Enum.reduce({%{}, []}, fn key, {found, missing} ->
-        case read_apply_projection_cache(root, index, key) do
+        case read_apply_projection_cache(root, index, key, read_mode) do
           {:ok, value} -> {Map.put(found, key, value), missing}
           :not_found -> {found, [key | missing]}
         end
@@ -321,13 +340,19 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       [_ | _] ->
         case read_apply_projection_latest_entries_from_disk(root, index) do
           {:ok, entries} ->
-            found = collect_projection_entry_values(entries, missing, found)
+            found = collect_projection_entry_values(entries, missing, found, read_mode)
             still_missing = reject_found_keys(missing, found)
 
             if still_missing == [] do
               {:ok, found}
             else
-              read_apply_projection_missing_from_merged_disk(root, index, still_missing, found)
+              read_apply_projection_missing_from_merged_disk(
+                root,
+                index,
+                still_missing,
+                found,
+                read_mode
+              )
             end
 
           :not_found ->
@@ -340,21 +365,22 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   end
 
   def read_values_from_location(ctx, shard_index, file_id, keys) when is_list(keys) do
-    values =
-      Enum.reduce(keys, %{}, fn key, acc ->
-        case read_value_from_location(ctx, shard_index, file_id, key) do
-          {:ok, value} -> Map.put(acc, key, value)
-          _missing_or_error -> acc
-        end
-      end)
-
-    {:ok, values}
+    Enum.reduce_while(keys, {:ok, %{}}, fn key, {:ok, acc} ->
+      case read_value_from_location(ctx, shard_index, file_id, key) do
+        {:ok, value} -> {:cont, {:ok, Map.put(acc, key, value)}}
+        :not_found -> {:cont, {:ok, acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
-  defp read_apply_projection_missing_from_merged_disk(root, index, missing, found) do
+  defp waraft_read_expired?(deadline_ms),
+    do: System.monotonic_time(:millisecond) >= deadline_ms
+
+  defp read_apply_projection_missing_from_merged_disk(root, index, missing, found, read_mode) do
     case read_apply_projection_entries_from_disk(root, index) do
       {:ok, entries} ->
-        {:ok, collect_projection_entry_values(entries, missing, found)}
+        {:ok, collect_projection_entry_values(entries, missing, found, read_mode)}
 
       :not_found ->
         {:ok, found}
@@ -443,15 +469,8 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     projection_root = Path.join(storage_root(ctx, shard_index), @projection_dir)
     root_chars = to_charlist(projection_root)
 
-    with {:ok, {_ordinal, offset, encoded_size}} <-
-           :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, index),
-         {:ok, entry} <-
-           :ferricstore_waraft_spike_segment_log.read_disk_at(
-             root_chars,
-             index,
-             offset,
-             encoded_size
-           ) do
+    case read_projection_entry_at(root_chars, index) do
+      {:ok, entry} ->
       case entry do
         {0, {:ferricstore_segment_projection_entry, ^key, value, _expire_at_ms}}
         when is_binary(value) ->
@@ -463,9 +482,8 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
         _other ->
           {:error, :bad_segment_projection_entry}
       end
-    else
+
       :not_found -> :not_found
-      {:error, :enoent} -> :not_found
       {:error, reason} -> {:error, reason}
     end
   end
@@ -473,16 +491,42 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   defp read_projection_value_at(_ctx, _shard_index, _index, _key),
     do: {:error, :bad_segment_projection_location}
 
+  defp read_projection_entry_at(root_chars, index) do
+    case :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, index) do
+      {:ok, {_ordinal, offset, encoded_size}} ->
+        case :ferricstore_waraft_spike_segment_log.read_disk_at(
+               root_chars,
+               index,
+               offset,
+               encoded_size
+             ) do
+          {:ok, entry} -> {:ok, entry}
+          :not_found -> {:error, :projection_entry_missing_at_recorded_location}
+          {:error, reason} -> {:error, reason}
+        end
+
+      :not_found ->
+        :not_found
+
+      {:error, :enoent} ->
+        :not_found
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp read_apply_projection_value_at(ctx, shard_index, index, key)
        when is_integer(index) and index > 0 and is_binary(key) do
     root = storage_root(ctx, shard_index)
+    read_mode = {:live, CommandValues.now_ms()}
 
-    case read_apply_projection_cache(root, index, key) do
+    case read_apply_projection_cache(root, index, key, read_mode) do
       {:ok, value} ->
         {:ok, value}
 
       :not_found ->
-        read_apply_projection_value_from_disk(root, index, key)
+        read_apply_projection_value_from_disk(root, index, key, read_mode)
     end
   end
 
@@ -498,14 +542,14 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
         {:ok, value}
 
       :not_found ->
-        read_apply_projection_value_from_disk(root, index, key)
+        read_apply_projection_value_from_disk(root, index, key, :include_expired)
     end
   end
 
   defp read_apply_projection_value_at(_ctx, _shard_index, _index, _key, :include_expired),
     do: {:error, :bad_segment_apply_projection_location}
 
-  defp read_apply_projection_cache(root, index, key) do
+  defp read_apply_projection_cache(root, index, key, {:live, now_ms}) do
     case :ets.whereis(@apply_projection_table) do
       :undefined ->
         :not_found
@@ -513,7 +557,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       table ->
         case :ets.lookup(table, {root, index, key}) do
           [{{^root, ^index, ^key}, value, expire_at_ms}] ->
-            if CommandValues.live_expire_at?(expire_at_ms), do: {:ok, value}, else: :not_found
+            if CommandValues.live_expire_at?(expire_at_ms, now_ms),
+              do: {:ok, value},
+              else: :not_found
 
           [] ->
             :not_found
@@ -538,12 +584,12 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     ArgumentError -> :not_found
   end
 
-  defp read_apply_projection_value_from_disk(root, index, key) do
+  defp read_apply_projection_value_from_disk(root, index, key, read_mode) do
     case read_apply_projection_latest_entries_from_disk(root, index) do
       {:ok, entries} ->
-        case value_from_projection_entries(entries, key) do
+        case value_from_projection_entries(entries, key, read_mode) do
           {:ok, _value} = ok -> ok
-          :not_found -> read_apply_projection_value_from_merged_disk(root, index, key)
+          :not_found -> read_apply_projection_value_from_merged_disk(root, index, key, read_mode)
         end
 
       :not_found ->
@@ -554,9 +600,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     end
   end
 
-  defp read_apply_projection_value_from_merged_disk(root, index, key) do
+  defp read_apply_projection_value_from_merged_disk(root, index, key, read_mode) do
     case read_apply_projection_entries_from_disk(root, index) do
-      {:ok, entries} -> value_from_projection_entries(entries, key)
+      {:ok, entries} -> value_from_projection_entries(entries, key, read_mode)
       :not_found -> :not_found
       {:error, reason} -> {:error, reason}
     end
@@ -567,29 +613,38 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     root_chars = to_charlist(projection_root)
     maybe_run_apply_projection_disk_read_hook(root, index, :latest)
 
-    with {:ok, {_ordinal, offset, encoded_size}} <-
-           :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, index),
-         {:ok, entry} <-
-           :ferricstore_waraft_spike_segment_log.read_disk_at(
-             root_chars,
-             index,
-             offset,
-             encoded_size
-           ) do
-      case entry do
-        {0, {:ferricstore_segment_apply_projection_batch, _position, entries}}
-        when is_list(entries) ->
-          {:ok, entries}
+    case :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, index) do
+      {:ok, {_ordinal, offset, encoded_size}} ->
+        case :ferricstore_waraft_spike_segment_log.read_disk_at(
+               root_chars,
+               index,
+               offset,
+               encoded_size
+             ) do
+          {:ok, entry} -> decode_apply_projection_entry(entry)
+          :not_found -> {:error, :apply_projection_entry_missing_at_recorded_location}
+          {:error, reason} -> {:error, reason}
+        end
 
-        _other ->
-          {:error, :bad_segment_apply_projection_entry}
-      end
-    else
-      :not_found -> :not_found
-      {:error, :enoent} -> :not_found
-      {:error, reason} -> {:error, reason}
+      :not_found ->
+        :not_found
+
+      {:error, :enoent} ->
+        :not_found
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
+
+  defp decode_apply_projection_entry(
+         {0, {:ferricstore_segment_apply_projection_batch, _position, entries}}
+       )
+       when is_list(entries),
+       do: {:ok, entries}
+
+  defp decode_apply_projection_entry(_entry),
+    do: {:error, :bad_segment_apply_projection_entry}
 
   defp read_apply_projection_entries_from_disk(root, index) do
     projection_root = Path.join(root, @apply_projection_dir)
@@ -610,13 +665,6 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       :not_found -> :not_found
       {:error, :enoent} -> :not_found
       {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp apply_projection_index_on_disk?(root, index) do
-    case read_apply_projection_latest_entries_from_disk(root, index) do
-      {:ok, _entries} -> true
-      _missing_or_error -> false
     end
   end
 
@@ -641,25 +689,39 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     end
   end
 
-  defp value_from_projection_entries(entries, key) do
+  defp value_from_projection_entries(entries, key, read_mode) do
     Enum.reduce(entries, :not_found, fn
-      {^key, value, _expire_at_ms}, _acc when is_binary(value) -> {:ok, value}
-      _entry, acc -> acc
+      {^key, value, expire_at_ms}, _acc when is_binary(value) ->
+        if projection_entry_live?(expire_at_ms, read_mode), do: {:ok, value}, else: :not_found
+
+      _entry, acc ->
+        acc
     end)
   end
 
-  defp collect_projection_entry_values(entries, keys, acc) do
+  defp collect_projection_entry_values(entries, keys, acc, read_mode) do
     keyset = MapSet.new(keys)
 
     Enum.reduce(entries, acc, fn
-      {key, value, _expire_at_ms}, values
+      {key, value, expire_at_ms}, values
       when is_binary(key) and is_binary(value) ->
-        if MapSet.member?(keyset, key), do: Map.put(values, key, value), else: values
+        if MapSet.member?(keyset, key) do
+          if projection_entry_live?(expire_at_ms, read_mode),
+            do: Map.put(values, key, value),
+            else: Map.delete(values, key)
+        else
+          values
+        end
 
       _entry, values ->
         values
     end)
   end
+
+  defp projection_entry_live?(_expire_at_ms, :include_expired), do: true
+
+  defp projection_entry_live?(expire_at_ms, {:live, now_ms}),
+    do: CommandValues.live_expire_at?(expire_at_ms, now_ms)
 
   defp ensure_apply_projection_table! do
     case :ets.whereis(@apply_projection_table) do
@@ -806,5 +868,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     Path.join([data_dir, "waraft", "#{@storage_root}.#{shard_index + 1}"])
   end
 
-  defp log_table(shard_index), do: String.to_atom("#{@table_prefix}#{shard_index + 1}")
+  defp log_table(shard_index) do
+    String.to_existing_atom("#{@table_prefix}#{shard_index + 1}")
+  rescue
+    ArgumentError -> nil
+  end
 end

@@ -43,7 +43,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           assert extract_body(response) =~ "%R~tenant-b:1"
         end
 
-        test "keyspace sampled rows are filtered by dashboard ACL key patterns" do
+        @tag :dashboard_keyspace_acl_summary
+        test "keyspace sampled rows and counts are filtered by dashboard ACL key patterns" do
           Application.put_env(:ferricstore, :protected_mode, true)
 
           suffix = System.unique_integer([:positive])
@@ -77,14 +78,17 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               "+SCAN"
             ])
 
-          keys =
-            %{"limit" => "200", "acl_username" => "tenant-a-keyspace"}
-            |> Dashboard.collect_keyspace_page()
-            |> Map.fetch!(:rows)
-            |> Enum.map(& &1.key)
+          data =
+            Dashboard.collect_keyspace_page(%{
+              "limit" => "200",
+              "acl_username" => "tenant-a-keyspace"
+            })
+
+          keys = Enum.map(data.rows, & &1.key)
 
           assert allowed_key in keys
           refute denied_key in keys
+          assert data.total_sampled == length(data.rows)
 
           login =
             http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
@@ -132,6 +136,195 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
                    records,
                    "flow-type-only"
                  ) == []
+        end
+
+        @tag :flow_detail_acl_partition
+        test "Flow detail rechecks the fetched record partition instead of trusting its id" do
+          suffix = System.unique_integer([:positive])
+          id = "visible-flow:#{suffix}"
+          username = "flow-detail-partition-#{suffix}"
+          test_pid = self()
+          previous_get = Application.get_env(:ferricstore, :flow_dashboard_flow_get_fun)
+          previous_history = Application.get_env(:ferricstore, :flow_dashboard_flow_history_fun)
+
+          :ok =
+            FerricstoreServer.Acl.set_user(username, [
+              "on",
+              ">secret",
+              "%R~visible-flow:*",
+              "-@all",
+              "+FLOW.GET",
+              "+FLOW.HISTORY"
+            ])
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_get_fun, fn ^id, _opts ->
+            {:ok,
+             %{
+               id: id,
+               type: "sensitive",
+               state: "queued",
+               partition_key: "denied-tenant:partition"
+             }}
+          end)
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_history_fun, fn ^id, _opts ->
+            send(test_pid, :unauthorized_history_read)
+            {:ok, []}
+          end)
+
+          on_exit(fn ->
+            restore_env(:flow_dashboard_flow_get_fun, previous_get)
+            restore_env(:flow_dashboard_flow_history_fun, previous_history)
+          end)
+
+          data = Dashboard.collect_flow_detail_page(id, acl_username: username, values: false)
+
+          assert data.record == nil
+          assert data.record_status == :not_found
+          assert data.history_status == :skipped
+
+          Application.put_env(:ferricstore, :protected_mode, true)
+
+          login =
+            http_post_form(HealthEndpoint.port(), "/dashboard/login", %{
+              "username" => username,
+              "password" => "secret"
+            })
+
+          cookie = dashboard_session_cookie(login)
+          encoded_id = URI.encode(id, &URI.char_unreserved?/1)
+
+          for path <- ["/dashboard/flow/#{encoded_id}", "/dashboard/api/flow/#{encoded_id}"] do
+            response = http_get(HealthEndpoint.port(), path, [{"Cookie", cookie}])
+            body = extract_body(response)
+
+            assert extract_status_code(response) == 200
+            refute body =~ "denied-tenant:partition"
+            refute body =~ "sensitive"
+          end
+
+          refute_receive :unauthorized_history_read
+        end
+
+        @tag :flow_query_history_acl_partition
+        test "Flow query history rechecks the persisted partition before reading history" do
+          suffix = System.unique_integer([:positive])
+          id = "visible-flow:#{suffix}"
+          username = "flow-query-history-partition-#{suffix}"
+          test_pid = self()
+          previous_get = Application.get_env(:ferricstore, :flow_dashboard_flow_get_fun)
+          previous_history = Application.get_env(:ferricstore, :flow_dashboard_flow_history_fun)
+
+          :ok =
+            FerricstoreServer.Acl.set_user(username, [
+              "on",
+              ">secret",
+              "%R~visible-flow:*",
+              "-@all",
+              "+FLOW.HISTORY"
+            ])
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_get_fun, fn ^id, opts ->
+            send(test_pid, {:flow_query_history_get_opts, opts})
+
+            {:ok,
+             %{
+               id: id,
+               type: "sensitive",
+               state: "queued",
+               partition_key: "denied-tenant:partition"
+             }}
+          end)
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_history_fun, fn ^id, _opts ->
+            send(test_pid, :unauthorized_query_history_read)
+            {:ok, [{"1-0", %{"secret" => "value"}}]}
+          end)
+
+          on_exit(fn ->
+            restore_env(:flow_dashboard_flow_get_fun, previous_get)
+            restore_env(:flow_dashboard_flow_history_fun, previous_history)
+          end)
+
+          data =
+            Dashboard.collect_flow_query_page(
+              kind: "history",
+              id: id,
+              acl_username: username
+            )
+
+          assert data.result.status == :ok
+          assert data.result.rows == []
+          assert data.result.message == "0 visible row(s)"
+          assert_receive {:flow_query_history_get_opts, opts}
+          assert Keyword.get(opts, :payload) == false
+          refute_receive :unauthorized_query_history_read
+        end
+
+        @tag :flow_query_history_acl_partition
+        test "Flow query history routes authorized reads with the persisted partition" do
+          suffix = System.unique_integer([:positive])
+          id = "tenant-a:flow:#{suffix}"
+          username = "flow-query-history-allowed-#{suffix}"
+          test_pid = self()
+          previous_get = Application.get_env(:ferricstore, :flow_dashboard_flow_get_fun)
+          previous_history = Application.get_env(:ferricstore, :flow_dashboard_flow_history_fun)
+
+          :ok =
+            FerricstoreServer.Acl.set_user(username, [
+              "on",
+              ">secret",
+              "%R~tenant-a:*",
+              "-@all",
+              "+FLOW.HISTORY"
+            ])
+
+          ShardHelpers.eventually(
+            fn ->
+              FerricstoreServer.Acl.check_key_access(
+                username,
+                "tenant-a:partition",
+                :read
+              ) == :ok
+            end,
+            "expected Flow history ACL projection to become visible",
+            50,
+            20
+          )
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_get_fun, fn ^id, _opts ->
+            {:ok,
+             %{
+               id: id,
+               type: "email",
+               state: "queued",
+               partition_key: "tenant-a:partition"
+             }}
+          end)
+
+          Application.put_env(:ferricstore, :flow_dashboard_flow_history_fun, fn ^id, opts ->
+            send(test_pid, {:authorized_query_history_opts, opts})
+            {:ok, [{"1-0", %{"signal" => "queued"}}]}
+          end)
+
+          on_exit(fn ->
+            restore_env(:flow_dashboard_flow_get_fun, previous_get)
+            restore_env(:flow_dashboard_flow_history_fun, previous_history)
+          end)
+
+          data =
+            Dashboard.collect_flow_query_page(
+              kind: "history",
+              id: id,
+              acl_username: username
+            )
+
+          assert data.result.status == :ok
+          assert data.result.rows == [{"1-0", %{"signal" => "queued"}}]
+          assert_receive {:authorized_query_history_opts, opts}
+          assert Keyword.get(opts, :partition_key) == "tenant-a:partition"
+          assert Keyword.get(opts, :values) == false
+          assert Keyword.get(opts, :consistent_projection) == true
         end
 
         test "Flow query aggregate rows require their canonical request scope" do
@@ -200,7 +393,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           refute denied_key in keys
         end
 
-        test "pubsub activity rows are filtered by dashboard ACL channel patterns" do
+        @tag :dashboard_pubsub_acl_summary
+        test "pubsub activity and summary are filtered by dashboard ACL channel patterns" do
           Ferricstore.PubSub.ActivityLog.reset()
 
           suffix = System.unique_integer([:positive])
@@ -236,6 +430,15 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           refute denied_channel in channels
           assert Enum.any?(targets, &String.contains?(&1, allowed_channel))
           refute Enum.any?(targets, &String.contains?(&1, denied_channel))
+
+          assert data.summary.exact_subscriptions ==
+                   Enum.sum(Enum.map(data.channels, & &1.subscribers))
+
+          assert data.summary.pattern_subscriptions ==
+                   Enum.sum(Enum.map(data.patterns, & &1.subscribers))
+
+          assert data.summary.active_subscribers == nil
+          assert Dashboard.render_pubsub_page(data) =~ "Pub/Sub Activity"
         end
 
         test "security page is OSS-only diagnostics and redacts password material" do
@@ -271,6 +474,84 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           refute html =~ "very-secret-password"
           refute html =~ "ACL SETUSER"
           refute html =~ ~s(method="post")
+        end
+
+        @tag :dashboard_security_acl_identity
+        test "security diagnostics preserve an empty or whitespace session identity" do
+          for username <- ["", " "] do
+            data = Dashboard.collect_security_page(%{"acl_username" => username})
+
+            assert data.current_user == username
+            assert data.tester.input.user == username
+          end
+        end
+
+        @tag :dashboard_security_acl_encoded_identity
+        test "security diagnostics decode unambiguous ACL list usernames" do
+          username = "tenant security"
+
+          :ok =
+            FerricstoreServer.Acl.set_user(username, [
+              "on",
+              "nopass",
+              "~*",
+              "&*",
+              "+@all"
+            ])
+
+          data = Dashboard.collect_security_page()
+
+          assert %{username: ^username, state: "on"} =
+                   Enum.find(data.acl_users, &(&1.username == username))
+        end
+
+        @tag :dashboard_security_acl_exact_values
+        test "security diagnostics preserve exact usernames keys and channels" do
+          username = " exact user "
+          key = " exact key "
+          channel = " exact channel "
+
+          :ok =
+            FerricstoreServer.Acl.set_user(username, [
+              "on",
+              "nopass",
+              "%R~#{key}",
+              "&#{channel}",
+              "-@all"
+            ])
+
+          data =
+            Dashboard.collect_security_page(%{
+              "user" => username,
+              "key" => key,
+              "key_access" => "read",
+              "channel" => channel
+            })
+
+          assert data.tester.input.user == username
+          assert data.tester.input.key == key
+          assert data.tester.input.channel == channel
+          assert data.tester.key.status == :allowed
+          assert data.tester.channel.status == :allowed
+        end
+
+        @tag :dashboard_security_acl_malformed_channels
+        test "security channel diagnostics fail closed for malformed ACL state" do
+          username = "malformed-channel-user"
+
+          true =
+            :ets.insert(
+              FerricstoreServer.Acl.Tables.active_table(),
+              {username, %{enabled: true, channels: :invalid}}
+            )
+
+          data =
+            Dashboard.collect_security_page(%{
+              "user" => username,
+              "channel" => "events"
+            })
+
+          assert data.tester.channel.status == :denied
         end
 
         test "security page tester shows denied command key and channel checks" do
@@ -505,18 +786,55 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           refute extract_body(page) =~ "cold query-index work pending"
         end
 
-        test "Flow policy page filters configured types and editor data by type ACL" do
+        @tag :dashboard_policy_acl_summary
+        test "Flow policy page filters configured types editor data and sample counts by type ACL" do
           Application.put_env(:ferricstore, :protected_mode, true)
 
           suffix = System.unique_integer([:positive])
           allowed_type = "tenant-a:policy:#{suffix}"
           denied_type = "tenant-b:policy:#{suffix}"
+          now_ms = System.system_time(:millisecond)
 
           assert {:ok, _policy} =
                    FerricStore.flow_policy_set(allowed_type, max_active_ms: 11_000)
 
           assert {:ok, _policy} =
                    FerricStore.flow_policy_set(denied_type, max_active_ms: 22_000)
+
+          for {id, type} <- [
+                {"policy-allowed-#{suffix}", allowed_type},
+                {"policy-denied-#{suffix}", denied_type}
+              ] do
+            record = %{
+              id: id,
+              type: type,
+              state: "running",
+              version: 1,
+              attempts: 1,
+              fencing_token: 1,
+              created_at_ms: now_ms,
+              updated_at_ms: now_ms,
+              next_run_at_ms: now_ms,
+              priority: 0,
+              partition_key: type,
+              run_state: "running"
+            }
+
+            assert :ok =
+                     Ferricstore.Store.Router.put(
+                       FerricStore.Instance.get(:default),
+                       Ferricstore.Flow.Keys.state_key(id, type),
+                       Ferricstore.Flow.encode_record(record),
+                       0
+                     )
+          end
+
+          ShardHelpers.eventually(
+            fn -> Dashboard.collect_flow_policies_page().total_sampled == 2 end,
+            "expected Flow policy dashboard sample to include setup records",
+            50,
+            20
+          )
 
           :ok =
             FerricstoreServer.Acl.set_user("tenant-a-policy-dashboard", [
@@ -526,6 +844,16 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               "-@all",
               "+FLOW.POLICY.GET"
             ])
+
+          ShardHelpers.eventually(
+            fn ->
+              Dashboard.collect_flow_policies_page(acl_username: "tenant-a-policy-dashboard").policies
+              |> Enum.any?(&(&1.type == allowed_type))
+            end,
+            "expected allowed Flow policy type to become visible",
+            50,
+            20
+          )
 
           data =
             Dashboard.collect_flow_policies_page(
@@ -538,6 +866,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
           refute denied_type in types
           assert data.editor.type == ""
           assert data.policy_scan == %{restricted: true}
+          assert data.total_sampled == 1
 
           login =
             http_post_form(HealthEndpoint.port(), "/dashboard/login", %{

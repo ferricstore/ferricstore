@@ -2,7 +2,8 @@ defmodule Ferricstore.ProbCleanup do
   @moduledoc false
 
   @spec flush_all(binary(), pos_integer()) :: :ok | {:error, term()}
-  def flush_all(data_dir, shard_count) do
+  def flush_all(data_dir, shard_count)
+      when is_binary(data_dir) and is_integer(shard_count) and shard_count > 0 do
     try do
       Enum.reduce_while(0..(shard_count - 1), :ok, fn i, :ok ->
         shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
@@ -23,6 +24,8 @@ defmodule Ferricstore.ProbCleanup do
         {:error, {:flush_prob_dirs_failed, kind, reason}}
     end
   end
+
+  def flush_all(_data_dir, _shard_count), do: {:error, :invalid_shard_count}
 
   @spec clear_dir(binary()) :: :ok | {:error, term()}
   def clear_dir(prob_dir) do

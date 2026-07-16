@@ -5,11 +5,11 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
     quote do
       alias Ferricstore.Test.ShardHelpers
 
-      test "flow_spawn_children wait any resolves on first successful child across shards" do
-        parent = uid("flow-parent-any-cross")
-        child_a = uid("flow-child-any-cross-a")
-        child_b = uid("flow-child-any-cross-b")
-        {partition, same_partition, other_partition} = mixed_partition_keys()
+      test "flow_spawn_children wait any resolves on first successful child in one Raft group" do
+        parent = uid("flow-parent-any-local")
+        child_a = uid("flow-child-any-local-a")
+        child_b = uid("flow-child-any-local-b")
+        {partition, same_partition, _other_partition} = mixed_partition_keys()
 
         assert {:ok, created_parent} =
                  flow_create_and_get(parent,
@@ -22,8 +22,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
                  flow_spawn_children_and_get(
                    parent,
                    [
-                     %{id: child_a, type: "child", partition_key: same_partition},
-                     %{id: child_b, type: "child", partition_key: other_partition}
+                     %{id: child_a, type: "child", partition_key: partition},
+                     %{id: child_b, type: "child", partition_key: same_partition}
                    ],
                    group_id: "fanout",
                    wait: :any,
@@ -38,11 +38,11 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
 
         assert waiting.state == "waiting_children"
 
-        claimed_b = create_claimed_flow_child(child_b, other_partition, "worker-cross-any")
+        claimed_b = create_claimed_flow_child(child_b, same_partition, "worker-local-any")
 
         assert {:ok, _child_done} =
                  flow_complete_and_get(child_b, claimed_b.lease_token,
-                   partition_key: other_partition,
+                   partition_key: same_partition,
                    fencing_token: claimed_b.fencing_token
                  )
 
@@ -52,16 +52,16 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
         assert done_parent.child_groups["fanout"]["children"][child_b] == "completed"
 
         assert {:ok, cancelled_sibling} =
-                 FerricStore.flow_get(child_a, partition_key: same_partition)
+                 FerricStore.flow_get(child_a, partition_key: partition)
 
         assert cancelled_sibling.state == "cancelled"
       end
 
-      test "flow_spawn_children wait any resolves failure when every child fails" do
+      test "flow_spawn_children wait any resolves failure when every local child fails" do
         parent = uid("flow-parent-any-all-failed")
         child_a = uid("flow-child-any-all-failed-a")
         child_b = uid("flow-child-any-all-failed-b")
-        {partition, same_partition, other_partition} = mixed_partition_keys()
+        {partition, same_partition, _other_partition} = mixed_partition_keys()
 
         assert {:ok, created_parent} =
                  flow_create_and_get(parent,
@@ -74,8 +74,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
                  flow_spawn_children_and_get(
                    parent,
                    [
-                     %{id: child_a, type: "child", partition_key: same_partition},
-                     %{id: child_b, type: "child", partition_key: other_partition}
+                     %{id: child_a, type: "child", partition_key: partition},
+                     %{id: child_b, type: "child", partition_key: same_partition}
                    ],
                    group_id: "fanout",
                    wait: :any,
@@ -90,8 +90,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
 
         assert waiting.state == "waiting_children"
 
-        claimed_a = create_claimed_flow_child(child_a, same_partition, "worker-cross-any-fail-a")
-        claimed_b = create_claimed_flow_child(child_b, other_partition, "worker-cross-any-fail-b")
+        claimed_a = create_claimed_flow_child(child_a, partition, "worker-local-any-fail-a")
+        claimed_b = create_claimed_flow_child(child_b, same_partition, "worker-local-any-fail-b")
 
         assert {:ok, failed_children} =
                  flow_fail_many_and_get(
@@ -99,13 +99,13 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
                    [
                      %{
                        id: child_a,
-                       partition_key: same_partition,
+                       partition_key: partition,
                        lease_token: claimed_a.lease_token,
                        fencing_token: claimed_a.fencing_token
                      },
                      %{
                        id: child_b,
-                       partition_key: other_partition,
+                       partition_key: same_partition,
                        lease_token: claimed_b.lease_token,
                        fencing_token: claimed_b.fencing_token
                      }
@@ -121,11 +121,11 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
         assert failed_parent.child_groups["fanout"]["summary"]["failed"] == 2
       end
 
-      test "flow_fail_many fail_parent policy closes parent and cancels cross-shard siblings" do
-        parent = uid("flow-parent-cross-fail-many")
-        failed_child = uid("flow-child-cross-fail-many-failed")
-        sibling = uid("flow-child-cross-fail-many-sibling")
-        {partition, same_partition, other_partition} = mixed_partition_keys()
+      test "flow_fail_many fail_parent policy closes parent and cancels local siblings" do
+        parent = uid("flow-parent-local-fail-many")
+        failed_child = uid("flow-child-local-fail-many-failed")
+        sibling = uid("flow-child-local-fail-many-sibling")
+        {partition, same_partition, _other_partition} = mixed_partition_keys()
 
         assert {:ok, created_parent} =
                  flow_create_and_get(parent,
@@ -138,8 +138,8 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
                  flow_spawn_children_and_get(
                    parent,
                    [
-                     %{id: failed_child, type: "child", partition_key: other_partition},
-                     %{id: sibling, type: "child", partition_key: same_partition}
+                     %{id: failed_child, type: "child", partition_key: same_partition},
+                     %{id: sibling, type: "child", partition_key: partition}
                    ],
                    group_id: "fanout",
                    wait: :all,
@@ -153,7 +153,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
                  )
 
         claimed_failed =
-          create_claimed_flow_child(failed_child, other_partition, "worker-cross-fail")
+          create_claimed_flow_child(failed_child, same_partition, "worker-local-fail")
 
         assert {:ok, [%{id: ^failed_child, state: "failed"}]} =
                  flow_fail_many_and_get(
@@ -161,7 +161,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
                    [
                      %{
                        id: failed_child,
-                       partition_key: other_partition,
+                       partition_key: same_partition,
                        lease_token: claimed_failed.lease_token,
                        fencing_token: claimed_failed.fencing_token
                      }
@@ -176,7 +176,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
         assert failed_parent.child_groups["fanout"]["children"][sibling] == "cancelled"
 
         assert {:ok, cancelled_sibling} =
-                 FerricStore.flow_get(sibling, partition_key: same_partition)
+                 FerricStore.flow_get(sibling, partition_key: partition)
 
         assert cancelled_sibling.state == "cancelled"
 

@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Bitcask.NIF
+      alias Ferricstore.Flow.{LMDB, Locator}
       alias Ferricstore.Store.{CompoundKey, Promotion}
       alias Ferricstore.Store.BitcaskWriter
       alias Ferricstore.Store.LFU
@@ -302,6 +303,248 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           end
         end
 
+        test "aborts before replacing a segment when an exact cold catalog batch fails" do
+          {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+          try do
+            source = Path.join([dir, "data", "shard_0", "00000.log"])
+
+            assert :ok = GenServer.call(pid, {:put, "catalog_scan_live", "live", 0})
+            assert :ok = GenServer.call(pid, {:put, "catalog_scan_dead", "dead", 0})
+            assert :ok = GenServer.call(pid, :flush)
+            assert :ok = GenServer.call(pid, {:delete, "catalog_scan_dead"})
+            assert :ok = GenServer.call(pid, :flush)
+            assert :ok = force_rotate_active_file(pid)
+
+            original = File.read!(source)
+
+            :sys.replace_state(pid, fn state ->
+              Map.put(state, :compaction_cold_get_many_fun, fn _path, _keys ->
+                {:error, :catalog_io_failed}
+              end)
+            end)
+
+            assert {:error,
+                    {:compaction_failed,
+                     [
+                       {0,
+                        {:compaction_plan_failed, {:cold_catalog_read_failed, :catalog_io_failed}}}
+                     ]}} =
+                     GenServer.call(pid, {:run_compaction, [0]})
+
+            assert File.read!(source) == original
+            assert "live" == GenServer.call(pid, {:get, "catalog_scan_live"})
+            refute File.exists?(Path.join(Path.dirname(source), "compact_0.log"))
+          after
+            cleanup_shard(pid, ctx, dir)
+          end
+        end
+
+        test "resolves cold records with exact batched catalog reads" do
+          {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+          try do
+            state = :sys.get_state(pid)
+            source = Path.join(state.shard_data_path, "00000.log")
+            lmdb_path = LMDB.path(state.shard_data_path)
+            key1 = "flow:state:catalog-page-1"
+            key2 = "flow:state:catalog-page-2"
+            value1 = "cold-state-one"
+            value2 = "cold-state-two"
+
+            assert {:ok, [{offset1, _record_size1}, {offset2, _record_size2}]} =
+                     NIF.v2_append_batch(source, [{key1, value1, 0}, {key2, value2, 0}])
+
+            locator1 = %Locator{
+              flow_id: "catalog-page-1",
+              kind: :state,
+              version: 1,
+              raft_index: 1,
+              file_id: 0,
+              offset: offset1,
+              value_size: byte_size(value1)
+            }
+
+            locator2 = %Locator{
+              flow_id: "catalog-page-2",
+              kind: :state,
+              version: 1,
+              raft_index: 2,
+              file_id: 0,
+              offset: offset2,
+              value_size: byte_size(value2)
+            }
+
+            park_key1 = LMDB.cold_park_key_for_state_key(key1)
+            park_key2 = LMDB.cold_park_key_for_state_key(key2)
+            reverse_key1 = LMDB.cold_by_segment_key(locator1)
+            reverse_key2 = LMDB.cold_by_segment_key(locator2)
+
+            assert :ok =
+                     LMDB.write_batch(lmdb_path, [
+                       {:put, park_key1, LMDB.encode_cold_park(locator1, state_key: key1)},
+                       {:put, park_key2, LMDB.encode_cold_park(locator2, state_key: key2)},
+                       {:put, reverse_key1, park_key1},
+                       {:put, reverse_key2, park_key2}
+                     ])
+
+            parent = self()
+
+            :sys.replace_state(pid, fn shard_state ->
+              Map.put(
+                shard_state,
+                :compaction_cold_get_many_fun,
+                fn ^lmdb_path, keys ->
+                  send(parent, {:catalog_batch, keys})
+                  LMDB.get_many(lmdb_path, keys)
+                end
+              )
+            end)
+
+            assert :ok = force_rotate_active_file(pid)
+            assert {:ok, {2, 0, _reclaimed}} = GenServer.call(pid, {:run_compaction, [0]})
+
+            assert_receive {:catalog_batch, [^reverse_key1, ^reverse_key2]}
+            assert_receive {:catalog_batch, [^park_key1, ^park_key2]}
+
+            assert {:ok, encoded1} = LMDB.get(lmdb_path, park_key1)
+            assert {:ok, encoded2} = LMDB.get(lmdb_path, park_key2)
+            assert {:ok, %{locator: relocated1}} = LMDB.decode_cold_park(encoded1)
+            assert {:ok, %{locator: relocated2}} = LMDB.decode_cold_park(encoded2)
+            assert {:ok, ^value1} = NIF.v2_pread_at(source, relocated1.offset)
+            assert {:ok, ^value2} = NIF.v2_pread_at(source, relocated2.offset)
+          after
+            cleanup_shard(pid, ctx, dir)
+          end
+        end
+
+        @tag :compaction_publication
+        test "cold reads remain available while compacted offsets are being published" do
+          {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+          try do
+            dead_key = "compaction-publication-dead"
+            key = "compaction-publication-live"
+            value = "live-value-through-publication"
+
+            assert :ok = GenServer.call(pid, {:put, dead_key, "dead", 0})
+            assert :ok = GenServer.call(pid, {:put, key, value, 0})
+            assert :ok = GenServer.call(pid, :flush)
+            assert :ok = GenServer.call(pid, {:delete, dead_key})
+            assert :ok = GenServer.call(pid, :flush)
+            assert :ok = force_rotate_active_file(pid)
+
+            keydir = :sys.get_state(pid).keydir
+
+            [{^key, ^value, expire_at_ms, lfu, 0, old_offset, value_size}] =
+              :ets.lookup(keydir, key)
+
+            true =
+              :ets.insert(
+                keydir,
+                {key, nil, expire_at_ms, lfu, 0, old_offset, value_size}
+              )
+
+            parent = self()
+
+            :sys.replace_state(pid, fn shard_state ->
+              Map.put(shard_state, :compaction_cold_write_fun, fn path, ops ->
+                send(parent, {:compaction_publication_open, self()})
+
+                receive do
+                  :finish_compaction_publication -> LMDB.write_batch(path, ops)
+                end
+              end)
+            end)
+
+            task = Task.async(fn -> GenServer.call(pid, {:run_compaction, [0]}, 10_000) end)
+            assert_receive {:compaction_publication_open, worker}, 5_000
+
+            source = Path.join(:sys.get_state(pid).shard_data_path, "00000.log")
+            backup = Path.join(:sys.get_state(pid).shard_data_path, "compaction_backup_0.log")
+            assert File.regular?(backup)
+
+            assert {:ok, ^value} =
+                     Ferricstore.Store.ColdRead.pread_keyed(source, old_offset, key, 5_000)
+
+            assert {:cold_ref, ref_path, value_offset, ^value_size} =
+                     Router.get_with_file_ref(ctx, key)
+
+            assert ref_path == source
+            assert binary_part(File.read!(ref_path), value_offset, value_size) == value
+            assert Router.getrange(ctx, key, 0, -1) == value
+            assert Router.get(ctx, key) == value
+
+            send(worker, :finish_compaction_publication)
+            assert {:ok, {1, 0, _reclaimed}} = Task.await(task, 10_000)
+            assert Router.get(ctx, key) == value
+          after
+            cleanup_shard(pid, ctx, dir)
+          end
+        end
+
+        test "restores the original segment when cold locator publication fails" do
+          {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+          try do
+            state = :sys.get_state(pid)
+            source = Path.join(state.shard_data_path, "00000.log")
+            lmdb_path = LMDB.path(state.shard_data_path)
+            state_key = "flow:state:locator-publish-failure"
+            state_value = "cold-state-survives"
+
+            assert {:ok, [_dead, {old_offset, _record_size}]} =
+                     NIF.v2_append_batch(source, [
+                       {"dead-before-cold", "dead", 0},
+                       {state_key, state_value, 0}
+                     ])
+
+            locator = %Locator{
+              flow_id: "locator-publish-failure",
+              kind: :state,
+              version: 1,
+              raft_index: 1,
+              file_id: 0,
+              offset: old_offset,
+              value_size: byte_size(state_value)
+            }
+
+            park_key = LMDB.cold_park_key_for_state_key(state_key)
+            reverse_key = LMDB.cold_by_segment_key(locator)
+            encoded_park = LMDB.encode_cold_park(locator, state_key: state_key)
+
+            assert :ok =
+                     LMDB.write_batch(lmdb_path, [
+                       {:put, park_key, encoded_park},
+                       {:put, reverse_key, park_key}
+                     ])
+
+            original = File.read!(source)
+
+            :sys.replace_state(pid, fn shard_state ->
+              Map.put(shard_state, :compaction_cold_write_fun, fn _path, _ops ->
+                {:error, :forced_locator_write_failure}
+              end)
+            end)
+
+            assert :ok = force_rotate_active_file(pid)
+
+            assert {:error,
+                    {:compaction_failed,
+                     [
+                       {0, :compaction_publication_failed, :forced_locator_write_failure}
+                     ]}} = GenServer.call(pid, {:run_compaction, [0]})
+
+            assert File.read!(source) == original
+            assert {:ok, ^state_value} = NIF.v2_pread_at(source, old_offset)
+            assert {:ok, ^encoded_park} = LMDB.get(lmdb_path, park_key)
+            assert {:ok, ^park_key} = LMDB.get(lmdb_path, reverse_key)
+            refute File.exists?(Path.join(Path.dirname(source), "compaction_backup_0.log"))
+          after
+            cleanup_shard(pid, ctx, dir)
+          end
+        end
+
         test "emits telemetry when raw-copy compaction hits a CRC mismatch" do
           {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
           shard_path = Ferricstore.DataDir.shard_data_path(dir, 0)
@@ -357,15 +600,13 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           end
         end
 
-        test "groups compaction live entries in one keydir pass before per-file work" do
+        test "streams compaction records without a keydir-wide planning pass" do
           source = shard_source()
 
-          fold_pos = :binary.match(source, "group_compaction_live_entries")
-          reduce_pos = :binary.match(source, "Enum.reduce(file_ids")
-
-          assert {fold_offset, _} = fold_pos
-          assert {reduce_offset, _} = reduce_pos
-          assert fold_offset < reduce_offset
+          assert source =~ "NIF.v2_scan_file_page"
+          assert source =~ "CompactionPlan.append"
+          refute source =~ "group_compaction_live_entries"
+          refute source =~ ":ets.foldl("
         end
 
         test "ignores promoted dedicated entries when compacting shared log files" do

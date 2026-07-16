@@ -34,7 +34,8 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.{CompoundKey, LFU, LocalTxStore, Ops, Promotion}
+  alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, LocalTxStore, Ops, Promotion}
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
 
   # ---------------------------------------------------------------------------
@@ -113,6 +114,8 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       assert_raise RuntimeError, ~r/promotion cleanup directory fsync failed/, fn ->
         Promotion.cleanup_promoted!(
           redis_key,
+          :hash,
+          dedicated_path,
           ctx.shard_data_path,
           ctx.keydir,
           ctx.data_dir,
@@ -127,6 +130,60 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
     end
   end
 
+  @tag :resolved_promotion_cleanup
+  test "cleanup_promoted uses the resolved type and path when the marker is absent", ctx do
+    redis_key = "zset:cleanup:resolved-path"
+
+    {:ok, zset_path} =
+      Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :zset, redis_key)
+
+    {:ok, hash_path} =
+      Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
+    assert :ok =
+             Promotion.cleanup_promoted!(
+               redis_key,
+               :zset,
+               zset_path,
+               ctx.shard_data_path,
+               ctx.keydir,
+               ctx.data_dir,
+               ctx.shard_index
+             )
+
+    refute File.dir?(zset_path)
+    assert File.dir?(hash_path)
+    assert [] = :ets.lookup(ctx.keydir, Promotion.marker_key(redis_key))
+  end
+
+  @tag :resolved_promotion_cleanup
+  test "cleanup_promoted rejects a mismatched resolved path before mutation", ctx do
+    redis_key = "zset:cleanup:path-mismatch"
+    mk = Promotion.marker_key(redis_key)
+    {:ok, {offset, value_size}} = NIF.v2_append_record(ctx.active_path, mk, "zset", 0)
+    :ets.insert(ctx.keydir, {mk, "zset", 0, LFU.initial(), 0, offset, value_size})
+
+    {:ok, zset_path} =
+      Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :zset, redis_key)
+
+    wrong_path = Promotion.dedicated_path(ctx.data_dir, ctx.shard_index, :hash, redis_key)
+
+    assert_raise ArgumentError, ~r/resolved promotion path mismatch/, fn ->
+      Promotion.cleanup_promoted!(
+        redis_key,
+        :zset,
+        wrong_path,
+        ctx.shard_data_path,
+        ctx.keydir,
+        ctx.data_dir,
+        ctx.shard_index
+      )
+    end
+
+    assert File.dir?(zset_path)
+    assert [{^mk, "zset", 0, _lfu, 0, ^offset, ^value_size}] = :ets.lookup(ctx.keydir, mk)
+  end
+
   test "promote_collection reports open_dedicated fsync failures with context", ctx do
     {redis_key, _entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
 
@@ -134,14 +191,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
 
     try do
       assert_raise RuntimeError, ~r/promotion open dedicated failed.*fsync_dir_failed/, fn ->
-        Promotion.promote_collection!(
-          :hash,
-          redis_key,
-          ctx.shard_data_path,
-          ctx.keydir,
-          ctx.data_dir,
-          ctx.shard_index
-        )
+        promote_hash(ctx, redis_key)
       end
     after
       Process.delete(:ferricstore_promotion_fsync_dir_hook)
@@ -151,6 +201,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
   defp seed_hash_entries(active_path, keydir) do
     redis_key = "user:1"
     fields = ~w(name email age city country)
+    seed_type_entry(active_path, keydir, redis_key, :hash)
 
     entries =
       Enum.map(fields, fn field ->
@@ -162,6 +213,30 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       end)
 
     {redis_key, entries}
+  end
+
+  defp seed_type_entry(active_path, keydir, redis_key, type) do
+    type_key = CompoundKey.type_key(redis_key)
+    type_value = CompoundKey.encode_type(type)
+    {:ok, {offset, value_size}} = NIF.v2_append_record(active_path, type_key, type_value, 0)
+    :ets.insert(keydir, {type_key, type_value, 0, LFU.initial(), 0, offset, value_size})
+    {type_key, type_value}
+  end
+
+  defp promote_hash(ctx, redis_key) do
+    member_index = :ets.new(:promotion_atomicity_members, [:ordered_set, :public])
+    :ok = CompoundMemberIndex.rebuild(member_index, ctx.keydir)
+
+    Promotion.promote_collection!(
+      :hash,
+      redis_key,
+      ctx.shard_data_path,
+      ctx.keydir,
+      ctx.data_dir,
+      ctx.shard_index,
+      nil,
+      member_index
+    )
   end
 
   # Simulates a process restart: wipe the in-memory keydir and re-run
@@ -229,18 +304,35 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
   # ---------------------------------------------------------------------------
 
   describe "full successful promotion" do
+    test "moves type metadata into the dedicated log", ctx do
+      {redis_key, _entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
+      type_key = CompoundKey.type_key(redis_key)
+
+      {:ok, {offset, value_size}} = NIF.v2_append_record(ctx.active_path, type_key, "hash", 0)
+      :ets.insert(ctx.keydir, {type_key, "hash", 0, LFU.initial(), 0, offset, value_size})
+
+      {:ok, dedicated_path} =
+        promote_hash(ctx, redis_key)
+
+      dedicated_records =
+        dedicated_path
+        |> Promotion.find_active()
+        |> NIF.v2_scan_file()
+        |> elem(1)
+
+      assert Enum.any?(dedicated_records, fn {key, _off, _size, _exp, tombstone?} ->
+               key == type_key and not tombstone?
+             end)
+
+      promoted = simulate_restart(ctx)
+      assert "hash" == Ops.compound_get(local_tx(ctx, promoted), redis_key, type_key)
+    end
+
     test "every compound key remains reachable after restart", ctx do
       {redis_key, entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
 
       {:ok, _dedicated_path} =
-        Promotion.promote_collection!(
-          :hash,
-          redis_key,
-          ctx.shard_data_path,
-          ctx.keydir,
-          ctx.data_dir,
-          ctx.shard_index
-        )
+        promote_hash(ctx, redis_key)
 
       # Before restart, keydir already sees dedicated.
       for {ckey, _v} <- entries do
@@ -263,14 +355,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       {redis_key, entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
 
       {:ok, _dedicated_path} =
-        Promotion.promote_collection!(
-          :hash,
-          redis_key,
-          ctx.shard_data_path,
-          ctx.keydir,
-          ctx.data_dir,
-          ctx.shard_index
-        )
+        promote_hash(ctx, redis_key)
 
       promoted = simulate_restart(ctx)
 
@@ -287,6 +372,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
     test "recovered promoted entries keep large values cold in ETS", ctx do
       redis_key = "cold:promoted:restart"
       large_value = String.duplicate("x", 128)
+      seed_type_entry(ctx.active_path, ctx.keydir, redis_key, :hash)
 
       entries =
         Enum.map(~w(field_a field_b), fn field ->
@@ -300,14 +386,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
         end)
 
       {:ok, _dedicated_path} =
-        Promotion.promote_collection!(
-          :hash,
-          redis_key,
-          ctx.shard_data_path,
-          ctx.keydir,
-          ctx.data_dir,
-          ctx.shard_index
-        )
+        promote_hash(ctx, redis_key)
 
       instance_ctx = %{hot_cache_max_value_size: 8, keydir_binary_bytes: nil, shard_count: 1}
       promoted = simulate_restart(ctx, instance_ctx)
@@ -323,6 +402,47 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       end
     end
 
+    @tag :promoted_blob_recovery
+    test "recovered promoted blob refs stay cold and materialize logical values", ctx do
+      redis_key = "blob:promoted:restart"
+      compound_key = CompoundKey.hash_field(redis_key, "large")
+      payload = :binary.copy("blob-payload", 128)
+      seed_type_entry(ctx.active_path, ctx.keydir, redis_key, :hash)
+
+      assert {:ok, ref} = BlobStore.put(ctx.data_dir, ctx.shard_index, payload)
+      encoded_ref = BlobRef.encode!(ref)
+
+      {:ok, {offset, _record_size}} =
+        NIF.v2_append_record(ctx.active_path, compound_key, encoded_ref, 0)
+
+      value_size = byte_size(encoded_ref)
+
+      :ets.insert(
+        ctx.keydir,
+        {compound_key, nil, 0, LFU.initial(), 0, offset, value_size}
+      )
+
+      {:ok, _dedicated_path} =
+        promote_hash(ctx, redis_key)
+
+      instance_ctx =
+        FerricStore.Instance.build(
+          :"prom_atom_blob_#{:erlang.unique_integer([:positive])}",
+          data_dir: ctx.data_dir,
+          shard_count: 1,
+          hot_cache_max_value_size: 65_536,
+          blob_side_channel_threshold_bytes: 1
+        )
+
+      promoted = simulate_restart(ctx, instance_ctx)
+
+      assert [{^compound_key, nil, 0, _lfu, _fid, _off, ^value_size}] =
+               :ets.lookup(ctx.keydir, compound_key)
+
+      assert payload ==
+               Ops.compound_get(local_tx(ctx, promoted, instance_ctx), redis_key, compound_key)
+    end
+
     test "promotion records marker location in the actual active file", ctx do
       {redis_key, _entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
 
@@ -330,14 +450,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       File.touch!(rotated_active)
 
       {:ok, _dedicated_path} =
-        Promotion.promote_collection!(
-          :hash,
-          redis_key,
-          ctx.shard_data_path,
-          ctx.keydir,
-          ctx.data_dir,
-          ctx.shard_index
-        )
+        promote_hash(ctx, redis_key)
 
       mk = Promotion.marker_key(redis_key)
       assert [{^mk, _type, 0, _lfu, 5, _off, _vsize}] = :ets.lookup(ctx.keydir, mk)
@@ -353,14 +466,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       File.mkdir!(Path.join(dedicated_path, "00000.log"))
 
       assert_raise RuntimeError, ~r/promotion dedicated write failed/, fn ->
-        Promotion.promote_collection!(
-          :hash,
-          redis_key,
-          ctx.shard_data_path,
-          ctx.keydir,
-          ctx.data_dir,
-          ctx.shard_index
-        )
+        promote_hash(ctx, redis_key)
       end
 
       assert {:ok, records} = NIF.v2_scan_file(ctx.active_path)
@@ -384,15 +490,8 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       end)
 
       try do
-        assert_raise RuntimeError, ~r/promotion shared tombstone write failed/, fn ->
-          Promotion.promote_collection!(
-            :hash,
-            redis_key,
-            ctx.shard_data_path,
-            ctx.keydir,
-            ctx.data_dir,
-            ctx.shard_index
-          )
+        assert_raise RuntimeError, ~r/promotion shared tombstone batch failed/, fn ->
+          promote_hash(ctx, redis_key)
         end
 
         mk = Promotion.marker_key(redis_key)
@@ -407,7 +506,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
   end
 
   describe "cleanup failure" do
-    test "marker tombstone failure preserves marker and dedicated directory", ctx do
+    test "marker fence failure preserves marker and dedicated directory", ctx do
       redis_key = "user:cleanup"
       mk = Promotion.marker_key(redis_key)
       type_str = CompoundKey.encode_type(:hash)
@@ -420,9 +519,11 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       File.rm!(ctx.active_path)
       File.mkdir!(ctx.active_path)
 
-      assert_raise RuntimeError, ~r/promotion cleanup marker tombstone failed/, fn ->
+      assert_raise RuntimeError, ~r/promotion cleanup marker fence failed/, fn ->
         Promotion.cleanup_promoted!(
           redis_key,
+          :hash,
+          dedicated_path,
           ctx.shard_data_path,
           ctx.keydir,
           ctx.data_dir,
@@ -450,6 +551,8 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       assert :ok =
                Promotion.cleanup_promoted!(
                  redis_key,
+                 :zset,
+                 zset_path,
                  ctx.shard_data_path,
                  ctx.keydir,
                  ctx.data_dir,
@@ -492,17 +595,18 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       assert [] == :ets.lookup(ctx.keydir, list_marker)
     end
 
-    test "partial dedicated recovery builds the shared compound fallback index once" do
+    test "partial dedicated recovery builds the exact shared fallback index once" do
       source =
         File.read!(Path.expand("../../../lib/ferricstore/store/promotion.ex", __DIR__))
 
       [_match, recover_body] =
         Regex.run(
-          ~r/(def recover_promoted\(.*?)(?=\n  defp shared_live_compound_keys_by_marker)/s,
+          ~r/(def recover_promoted\(.*?)(?=\n  defp plan_recovery_markers!)/s,
           source
         )
 
-      assert recover_body =~ "shared_live_compound_keys_by_marker(keydir, marker_types)"
+      assert recover_body =~ "build_shared_recovery_index!("
+      assert recover_body =~ "shared_compound_recovery_state!("
 
       refute recover_body =~ "shared_uncovered_live_compound?(keydir",
              "promotion recovery must not scan the full ETS table once per promoted marker"
@@ -566,7 +670,8 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
         Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
 
       dedicated_active = Promotion.find_active(dedicated_path)
-      batch = Enum.map(entries, fn {k, v} -> {k, v, 0} end)
+      type_entry = {CompoundKey.type_key(redis_key), "hash", 0}
+      batch = [type_entry | Enum.map(entries, fn {k, v} -> {k, v, 0} end)]
       {:ok, _locs} = NIF.v2_append_batch(dedicated_active, batch)
 
       # CRASH — no step 3 (no tombstones yet).
@@ -580,6 +685,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
 
     test "crash during partial dedicated batch keeps public reads on shared storage", ctx do
       redis_key = "user:partial-large"
+      seed_type_entry(ctx.active_path, ctx.keydir, redis_key, :hash)
 
       entries =
         Enum.map(~w(name email age city country), fn field ->
@@ -636,6 +742,11 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
         Promotion.open_dedicated(ctx.data_dir, ctx.shard_index, :hash, redis_key)
 
       dedicated_active = Promotion.find_active(dedicated_path)
+      type_key = CompoundKey.type_key(redis_key)
+
+      {:ok, {_type_offset, _type_size}} =
+        NIF.v2_append_record(dedicated_active, type_key, "hash", 0)
+
       {:ok, _delete_offset} = NIF.v2_append_tombstone(dedicated_active, field_key)
 
       promoted = simulate_restart(ctx)
@@ -650,14 +761,7 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
       {redis_key, entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
 
       {:ok, _dp} =
-        Promotion.promote_collection!(
-          :hash,
-          redis_key,
-          ctx.shard_data_path,
-          ctx.keydir,
-          ctx.data_dir,
-          ctx.shard_index
-        )
+        promote_hash(ctx, redis_key)
 
       simulate_restart(ctx)
 
@@ -719,6 +823,10 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
         shard_count: 1
       )
 
+    local_tx(ctx, promoted_instances, instance_ctx)
+  end
+
+  defp local_tx(ctx, promoted_instances, instance_ctx) do
     %LocalTxStore{
       instance_ctx: instance_ctx,
       shard_index: ctx.shard_index,

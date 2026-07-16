@@ -244,7 +244,9 @@ defmodule Ferricstore.Store.RouterTest do
 
       :ets.insert(keydir, {key_a, nil, 0, LFU.initial(), fid_b, off_b, vsize_b})
 
-      assert Router.get(ctx, key_a) == nil
+      assert {:error, {:storage_read_failed, {:cold_value_unavailable, _reason}}} =
+               Router.get(ctx, key_a)
+
       assert Router.get_with_file_ref(ctx, key_a) == :miss
     end
 

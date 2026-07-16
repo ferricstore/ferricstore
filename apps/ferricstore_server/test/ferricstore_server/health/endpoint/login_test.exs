@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Health.Endpoint.LoginTest do
   @moduletag :global_state
 
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Acl.Password
   alias FerricstoreServer.Health.Endpoint.Login
 
   setup do
@@ -53,6 +54,22 @@ defmodule FerricstoreServer.Health.Endpoint.LoginTest do
 
     assert {:ok, "known", _auth_epoch} = Login.authenticate_session("known", "secret")
     assert String.starts_with?(Acl.get_user("known").password, "pbkdf2-sha256$")
+  end
+
+  @tag :dashboard_auth_epoch_race
+  test "authentication fails closed when the verified ACL snapshot changes" do
+    assert :ok = Acl.set_user("known", ["on", ">old-secret", "~*", "+@all"])
+    initial_epoch = Acl.get_user("known").auth_epoch
+
+    verifier = fn candidate, stored_hash ->
+      assert Password.verify(candidate, stored_hash)
+      assert :ok = Acl.set_user("known", ["on", ">new-secret", "~*", "+@all"])
+      true
+    end
+
+    assert {:error, reason} = Login.authenticate_session("known", "old-secret", verifier)
+    assert reason =~ "WRONGPASS"
+    assert Acl.get_user("known").auth_epoch > initial_epoch
   end
 
   defp unversioned_pbkdf2_hash(password) do

@@ -50,12 +50,49 @@ defmodule Ferricstore.Store.Shard.Compound do
   def handle_compound_scan(redis_key, prefix, state),
     do: Ops.handle_compound_scan(redis_key, prefix, state)
 
+  @spec handle_compound_scan_bounded(binary(), binary(), map(), map()) ::
+          {:reply, term(), map()}
+  @doc false
+  def handle_compound_scan_bounded(redis_key, prefix, limits, state),
+    do: Ops.handle_compound_scan_bounded(redis_key, prefix, limits, state)
+
+  @spec handle_compound_scan_page(
+          binary(),
+          binary(),
+          0 | {:after, binary()},
+          pos_integer(),
+          binary() | nil,
+          boolean(),
+          map()
+        ) :: {:reply, term(), map()}
+  @doc false
+  def handle_compound_scan_page(
+        redis_key,
+        prefix,
+        cursor,
+        count,
+        match_pattern,
+        fields_only,
+        state
+      ),
+      do:
+        Ops.handle_compound_scan_page(
+          redis_key,
+          prefix,
+          cursor,
+          count,
+          match_pattern,
+          fields_only,
+          state
+        )
+
   @spec handle_compound_fields(binary(), binary(), map()) :: {:reply, [binary()], map()}
   @doc false
   def handle_compound_fields(redis_key, prefix, state),
     do: Ops.handle_compound_fields(redis_key, prefix, state)
 
-  @spec handle_compound_count(binary(), binary(), map()) :: {:reply, non_neg_integer(), map()}
+  @spec handle_compound_count(binary(), binary(), map()) ::
+          {:reply, non_neg_integer() | Ferricstore.Store.ReadResult.failure(), map()}
   @doc false
   def handle_compound_count(redis_key, prefix, state),
     do: Ops.handle_compound_count(redis_key, prefix, state)
@@ -175,6 +212,26 @@ defmodule Ferricstore.Store.Shard.Compound do
   def bump_promoted_writes(state, redis_key),
     do: Promoted.bump_promoted_writes(state, redis_key)
 
+  @spec apply_promoted_maintenance(map(), binary(), map()) :: map()
+  @doc false
+  def apply_promoted_maintenance(state, redis_key, maintenance),
+    do: Promoted.apply_promoted_maintenance(state, redis_key, maintenance)
+
+  @spec promoted_compaction_due?(map(), binary(), integer()) :: boolean()
+  @doc false
+  def promoted_compaction_due?(state, redis_key, now_ms \\ System.monotonic_time(:millisecond)),
+    do: Promoted.promoted_compaction_due?(state, redis_key, now_ms)
+
+  @spec compact_dedicated_result(map(), binary(), binary()) :: {:ok | :error, map()}
+  @doc false
+  def compact_dedicated_result(state, redis_key, dedicated_path),
+    do: Promoted.compact_dedicated_result(state, redis_key, dedicated_path)
+
+  @doc false
+  @spec compact_dedicated_result_latched(map(), binary(), binary()) :: {:ok | :error, map()}
+  def compact_dedicated_result_latched(state, redis_key, dedicated_path),
+    do: Promoted.compact_dedicated_result_latched(state, redis_key, dedicated_path)
+
   @spec promoted_dir_size(binary()) :: non_neg_integer()
   @doc false
   def promoted_dir_size(dir_path), do: Promoted.promoted_dir_size(dir_path)
@@ -188,6 +245,10 @@ defmodule Ferricstore.Store.Shard.Compound do
   @doc false
   def track_promoted_delete_bytes(state, redis_key, compound_key),
     do: Promoted.track_promoted_delete_bytes(state, redis_key, compound_key)
+
+  @doc false
+  def track_promoted_delete_bytes_entry(state, redis_key, entry),
+    do: Promoted.track_promoted_delete_bytes_entry(state, redis_key, entry)
 
   @spec compact_dedicated(map(), binary(), binary()) :: map()
   @doc false

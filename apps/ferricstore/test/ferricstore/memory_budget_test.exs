@@ -149,6 +149,11 @@ defmodule Ferricstore.MemoryBudgetTest do
     end
   end
 
+  test "filesystem parent discovery terminates at root when no path probes as present" do
+    assert MemoryBudget.__existing_parent_for_test__("/missing/path", fn _path -> false end) ==
+             "/"
+  end
+
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

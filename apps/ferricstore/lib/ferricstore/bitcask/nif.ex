@@ -94,6 +94,32 @@ defmodule Ferricstore.Bitcask.NIF do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec flow_index_range_cursor_slice(
+          flow_index_resource(),
+          binary(),
+          non_neg_integer(),
+          float(),
+          non_neg_integer(),
+          float(),
+          float(),
+          binary(),
+          non_neg_integer(),
+          integer()
+        ) :: [{binary(), float()}]
+  def flow_index_range_cursor_slice(
+        _resource,
+        _key,
+        _min_kind,
+        _min_score,
+        _max_kind,
+        _max_score,
+        _cursor_score,
+        _cursor_member,
+        _offset,
+        _count
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   @spec flow_index_take_due(
           flow_index_resource(),
           binary(),
@@ -128,6 +154,15 @@ defmodule Ferricstore.Bitcask.NIF do
 
   @spec flow_index_due_count_keys(flow_index_resource()) :: [binary()]
   def flow_index_due_count_keys(_resource), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_earliest_due_score(
+          flow_index_resource(),
+          [binary()],
+          [binary()],
+          [binary()]
+        ) :: float() | nil | {:error, binary()}
+  def flow_index_earliest_due_score(_resource, _prefixes, _needles, _suffixes),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec flow_index_restore_count(flow_index_resource(), binary(), integer()) :: :ok
   def flow_index_restore_count(_resource, _key, _count), do: :erlang.nif_error(:nif_not_loaded)
@@ -383,26 +418,24 @@ defmodule Ferricstore.Bitcask.NIF do
   def v2_validate_value_ref(_path, _offset, _expected_key, _expected_value_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_scan_file(binary()) ::
-          {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}]}
-          | {:error, term()}
-  def v2_scan_file(_path), do: :erlang.nif_error(:nif_not_loaded)
-
-  @spec v2_scan_file_from_offset(binary(), non_neg_integer()) ::
-          {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}]}
-          | {:error, term()}
-  def v2_scan_file_from_offset(_path, _start_offset), do: :erlang.nif_error(:nif_not_loaded)
-
   @spec v2_scan_file_page(binary(), non_neg_integer(), pos_integer()) ::
           {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}],
            non_neg_integer(), boolean()}
           | {:error, term()}
   def v2_scan_file_page(_path, _start_offset, _limit), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_scan_tombstones(binary()) ::
-          {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()}]}
+  @doc """
+  Strictly scans at most `max_records` physical log records for tombstones.
+
+  The returned cursor points to the next physical record. `done` is true only
+  when that cursor reaches the file length captured when the page was opened.
+  """
+  @spec v2_scan_tombstones_page(binary(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()}],
+           non_neg_integer(), boolean()}
           | {:error, term()}
-  def v2_scan_tombstones(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_scan_tombstones_page(_path, _start_offset, _max_records),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec v2_scan_key_states(binary(), [binary()]) ::
           {:ok, [{binary(), non_neg_integer(), boolean()}]} | {:error, term()}
@@ -439,14 +472,117 @@ defmodule Ferricstore.Bitcask.NIF do
         ]) :: :ok | {:error, term()}
   def v2_write_hint_file(_path, _entries), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_read_hint_file(binary()) ::
+  @spec v2_read_hint_file_page(binary(), non_neg_integer(), pos_integer(), pos_integer()) ::
           {:ok,
            [
              {binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(),
               non_neg_integer()}
-           ]}
+           ], non_neg_integer(), boolean()}
           | {:error, term()}
-  def v2_read_hint_file(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_read_hint_file_page(_path, _start_offset, _max_entries, _max_bytes),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  if Mix.env() == :test do
+    @test_scan_page_records 4_096
+    @test_hint_page_entries 4_096
+    @test_hint_page_bytes 4 * 1024 * 1024
+
+    @doc false
+    @spec v2_scan_file(binary()) ::
+            {:ok,
+             [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}]}
+            | {:error, term()}
+    def v2_scan_file(path), do: collect_scan_file_pages(path, 0, [])
+
+    @doc false
+    @spec v2_scan_file_from_offset(binary(), non_neg_integer()) ::
+            {:ok,
+             [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}]}
+            | {:error, term()}
+    def v2_scan_file_from_offset(path, start_offset),
+      do: collect_scan_file_pages(path, start_offset, [])
+
+    @doc false
+    @spec v2_scan_tombstones(binary()) ::
+            {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()}]}
+            | {:error, term()}
+    def v2_scan_tombstones(path), do: collect_tombstone_pages(path, 0, [])
+
+    @doc false
+    @spec v2_read_hint_file(binary()) ::
+            {:ok,
+             [
+               {binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(),
+                non_neg_integer()}
+             ]}
+            | {:error, term()}
+    def v2_read_hint_file(path), do: collect_hint_pages(path, 0, [])
+
+    defp collect_scan_file_pages(path, offset, pages) do
+      case v2_scan_file_page(path, offset, @test_scan_page_records) do
+        {:ok, records, _next_offset, true} ->
+          {:ok, flatten_test_pages(pages, records)}
+
+        {:ok, records, next_offset, false} when next_offset > offset ->
+          collect_scan_file_pages(path, next_offset, [records | pages])
+
+        {:ok, _records, next_offset, false} ->
+          {:error, {:non_advancing_scan_cursor, offset, next_offset}}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+
+    defp collect_tombstone_pages(path, offset, pages) do
+      case v2_scan_tombstones_page(path, offset, @test_scan_page_records) do
+        {:ok, records, _next_offset, true} ->
+          {:ok, flatten_test_pages(pages, records)}
+
+        {:ok, records, next_offset, false} when next_offset > offset ->
+          collect_tombstone_pages(path, next_offset, [records | pages])
+
+        {:ok, _records, next_offset, false} ->
+          {:error, {:non_advancing_tombstone_cursor, offset, next_offset}}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+
+    defp collect_hint_pages(path, offset, pages) do
+      case v2_read_hint_file_page(
+             path,
+             offset,
+             @test_hint_page_entries,
+             @test_hint_page_bytes
+           ) do
+        {:ok, entries, _next_offset, true} ->
+          {:ok, flatten_test_pages(pages, entries)}
+
+        {:ok, entries, next_offset, false} when next_offset > offset ->
+          collect_hint_pages(path, next_offset, [entries | pages])
+
+        {:ok, _entries, next_offset, false} ->
+          {:error, {:non_advancing_hint_cursor, offset, next_offset}}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+
+    defp flatten_test_pages(pages, final_page) do
+      pages
+      |> then(&[final_page | &1])
+      |> Enum.reverse()
+      |> Enum.concat()
+    end
+  end
+
+  @spec v2_build_hint_file_from_log(binary(), binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer(), non_neg_integer()} | {:error, term()}
+  def v2_build_hint_file_from_log(_log_path, _hint_path, _file_id),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec v2_copy_records(binary(), binary(), [non_neg_integer()]) ::
           {:ok, [{non_neg_integer(), non_neg_integer()}]} | {:error, term()}
@@ -475,13 +611,21 @@ defmodule Ferricstore.Bitcask.NIF do
   @type append_op_location ::
           {:put, non_neg_integer(), non_neg_integer()}
           | {:delete, non_neg_integer(), non_neg_integer()}
+  @spec v2_append_ops_batch(binary(), [append_op()]) ::
+          {:ok, [append_op_location()]} | {:error, term()}
+  def v2_append_ops_batch(_path, _records), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_append_ops_batch_nosync(binary(), [append_op()]) ::
           {:ok, [append_op_location()]} | {:error, term()}
   def v2_append_ops_batch_nosync(_path, _records), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- LMDB Flow state backend --
   @type lmdb_op ::
-          {:put, binary(), binary()} | {:put_new, binary(), binary()} | {:delete, binary()}
+          {:put, binary(), binary()}
+          | {:put_new, binary(), binary()}
+          | {:delete, binary()}
+          | {:compare, binary(), binary()}
+          | {:compare_missing, binary()}
   @type lmdb_original :: {binary(), :missing | {:value, binary()}}
 
   @spec lmdb_get(binary(), binary(), non_neg_integer()) ::
@@ -743,10 +887,9 @@ defmodule Ferricstore.Bitcask.NIF do
           binary(),
           non_neg_integer(),
           non_neg_integer(),
-          non_neg_integer(),
-          float()
+          non_neg_integer()
         ) :: :ok | {:error, term()}
-  def topk_file_create_v2(_path, _k, _width, _depth, _decay),
+  def topk_file_create_v2(_path, _k, _width, _depth),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @spec topk_file_add_v2(binary(), [binary()]) :: {:ok, [binary() | nil]} | {:error, term()}
@@ -765,7 +908,8 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec topk_file_count_v2(binary(), [binary()]) :: {:ok, [non_neg_integer()]} | {:error, term()}
   def topk_file_count_v2(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec topk_file_info_v2(binary()) :: {:ok, tuple()} | {:error, term()}
+  @spec topk_file_info_v2(binary()) ::
+          {pos_integer(), pos_integer(), pos_integer()} | {:error, term()}
   def topk_file_info_v2(_path), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- Async TopK v2 read NIFs (Tokio spawn_blocking) --
@@ -800,7 +944,7 @@ defmodule Ferricstore.Bitcask.NIF do
   # Error shape: `{:error, {atom_kind, message_binary}}` where `kind` is
   # one of: `:not_found`, `:already_exists`, `:permission_denied`,
   # `:not_a_directory`, `:is_a_directory`, `:directory_not_empty`,
-  # `:invalid_path`, `:symlink`, `:other`.
+  # `:invalid_path`, `:symlink`, `:too_large`, `:other`.
   # -------------------------------------------------------------------
 
   @type fs_error :: {:error, {atom(), binary()}}
@@ -857,10 +1001,30 @@ defmodule Ferricstore.Bitcask.NIF do
   def fs_ls(_path), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
-  Read a regular file while refusing a symlink at the final path component.
+  Read at most `max_bytes` from a regular file while refusing a symlink at the
+  final path component. The size is checked before the BEAM binary is allocated.
   """
-  @spec fs_read_nofollow(binary()) :: {:ok, binary()} | fs_error()
-  def fs_read_nofollow(_path), do: :erlang.nif_error(:nif_not_loaded)
+  @spec fs_read_nofollow(binary(), non_neg_integer()) :: {:ok, binary()} | fs_error()
+  def fs_read_nofollow(_path, _max_bytes), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Stream-copy a regular file into a new destination without following final symlinks."
+  @spec fs_copy_sync_nofollow(binary(), binary()) :: :ok | fs_error()
+  def fs_copy_sync_nofollow(_source, _dest), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Append one binary and fdatasync it without following a final symlink."
+  @spec fs_append_sync_nofollow(binary(), binary()) :: :ok | fs_error()
+  def fs_append_sync_nofollow(_path, _payload), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Append and fdatasync only when the opened regular file stays within `max_bytes`."
+  @spec fs_append_sync_nofollow_bounded(binary(), binary(), non_neg_integer()) ::
+          :ok | fs_error()
+  def fs_append_sync_nofollow_bounded(_path, _payload, _max_bytes),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Durably replace a file atomically when the payload is within `max_bytes`."
+  @spec fs_atomic_replace_nofollow(binary(), binary(), non_neg_integer()) :: :ok | fs_error()
+  def fs_atomic_replace_nofollow(_path, _payload, _max_bytes),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
   Async recursive remove. Runs on the Tokio blocking pool; sends

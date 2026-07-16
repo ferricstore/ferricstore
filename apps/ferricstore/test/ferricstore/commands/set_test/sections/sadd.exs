@@ -715,6 +715,32 @@ defmodule Ferricstore.Commands.SetTest.Sections.Sadd do
           assert {:error, :disk_full} == Set.handle("SUNIONSTORE", ["dst", "src"], store)
           assert ["old"] == Set.handle("SMEMBERS", ["dst"], base)
         end
+
+        @tag :stream_destination_cleanup
+        test "SUNIONSTORE clears stream destination cache and durable rows" do
+          Ferricstore.Commands.Stream.ensure_meta_table()
+          key = "set_store_stream_dest_#{System.unique_integer([:positive])}"
+          store = MockStore.make()
+
+          on_exit(fn ->
+            if :ets.whereis(Ferricstore.Stream.Meta) != :undefined do
+              :ets.delete(Ferricstore.Stream.Meta, key)
+            end
+          end)
+
+          assert "1-0" ==
+                   Ferricstore.Commands.Stream.handle(
+                     "XADD",
+                     [key, "1-0", "f", "v"],
+                     store
+                   )
+
+          assert 1 == Set.handle("SADD", ["src", "member"], store)
+          assert 1 == Set.handle("SUNIONSTORE", [key, "src"], store)
+          assert [] == :ets.lookup(Ferricstore.Stream.Meta, key)
+          assert [] == store.compound_scan.(key, CompoundKey.stream_prefix(key))
+          assert ["member"] == Set.handle("SMEMBERS", [key], store)
+        end
       end
 
       describe "SSCAN" do

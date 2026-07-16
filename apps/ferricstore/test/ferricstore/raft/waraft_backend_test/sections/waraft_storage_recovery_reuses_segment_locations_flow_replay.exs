@@ -29,7 +29,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
           run_at_ms: 1,
           now_ms: 1,
           payload: "payload-v1",
-          policy_snapshot_captured: true
+          policy_reference_captured: true
         }
 
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
@@ -555,6 +555,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
         end
       end
 
+      @tag :membership_metadata_recovery
       test "membership metadata fsync failure returns unknown outcome and replays after restart",
            %{
              root: root,

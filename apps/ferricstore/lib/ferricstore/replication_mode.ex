@@ -1,8 +1,11 @@
 defmodule Ferricstore.ReplicationMode do
   @moduledoc false
 
+  alias Ferricstore.TermCodec
+
   @state_file "cluster_state.term"
   @pt_key {__MODULE__, :current}
+  @max_marker_bytes 1_048_576
 
   @type mode :: :raft
 
@@ -48,9 +51,9 @@ defmodule Ferricstore.ReplicationMode do
   def read(data_dir) do
     path = marker_path(data_dir)
 
-    case File.read(path) do
+    case Ferricstore.FS.read_nofollow(path, @max_marker_bytes) do
       {:ok, binary} -> decode(binary)
-      {:error, :enoent} -> {:error, :enoent}
+      {:error, {:not_found, _reason}} -> {:error, :enoent}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -67,9 +70,14 @@ defmodule Ferricstore.ReplicationMode do
       |> Map.put_new(:updated_at_ms, System.system_time(:millisecond))
       |> normalize_marker_data()
 
-    payload = :erlang.term_to_binary({:ferricstore_cluster_state, data})
+    payload = TermCodec.encode({:ferricstore_cluster_state, data})
     checksum = :crypto.hash(:sha256, payload)
-    encoded = :erlang.term_to_binary({:ferricstore_cluster_state_v1, payload, checksum})
+    encoded = TermCodec.encode({:ferricstore_cluster_state_v1, payload, checksum})
+
+    if byte_size(encoded) > @max_marker_bytes do
+      raise ArgumentError, "cluster_state marker exceeds #{@max_marker_bytes} bytes"
+    end
+
     path = marker_path(data_dir)
     tmp_path = unique_marker_tmp_path(path)
 
@@ -107,20 +115,20 @@ defmodule Ferricstore.ReplicationMode do
   end
 
   defp decode(binary) do
-    case :erlang.binary_to_term(binary, [:safe]) do
-      {:ferricstore_cluster_state_v1, payload, checksum}
-      when is_binary(payload) and is_binary(checksum) ->
+    case TermCodec.decode(binary) do
+      {:ok, {:ferricstore_cluster_state_v1, payload, checksum}}
+      when is_binary(payload) and is_binary(checksum) and byte_size(checksum) == 32 ->
         if :crypto.hash(:sha256, payload) == checksum do
-          case :erlang.binary_to_term(payload, [:safe]) do
-            {:ferricstore_cluster_state, data} when is_map(data) -> {:ok, data}
-            other -> {:error, {:invalid_payload, other}}
+          case TermCodec.decode(payload) do
+            {:ok, {:ferricstore_cluster_state, data}} when is_map(data) -> {:ok, data}
+            _invalid -> {:error, :invalid_payload}
           end
         else
           {:error, :checksum_mismatch}
         end
 
-      other ->
-        {:error, {:invalid_marker, other}}
+      _invalid ->
+        {:error, :invalid_marker}
     end
   rescue
     error -> {:error, {:decode_failed, error}}

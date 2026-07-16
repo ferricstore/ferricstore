@@ -25,6 +25,10 @@ defmodule Ferricstore.NamespaceConfig do
 
   @table :ferricstore_ns_config
   @default_window_ms 1
+  @max_window_ms 10_000
+  @default_max_entries 1_000
+  @max_prefix_bytes 256
+  @max_changed_by_bytes 256
   @has_overrides_key {__MODULE__, :has_overrides}
 
   @typedoc "A namespace configuration entry."
@@ -63,14 +67,13 @@ defmodule Ferricstore.NamespaceConfig do
   @spec set(binary(), binary(), binary(), binary()) :: :ok | {:error, binary()}
   def set(prefix, field, value, changed_by)
       when is_binary(prefix) and is_binary(field) and is_binary(value) and is_binary(changed_by) do
-    normalized = String.trim_trailing(prefix, ":")
-
-    case validate_field_value(field, value) do
-      {:ok, parsed_field, parsed_value} ->
-        do_set(normalized, parsed_field, parsed_value, changed_by)
-
-      {:error, _} = err ->
-        err
+    with {:ok, normalized} <- normalize_stored_prefix(prefix),
+         :ok <- validate_changed_by(changed_by),
+         {:ok, parsed_field, parsed_value} <- validate_field_value(field, value) do
+      GenServer.call(
+        __MODULE__,
+        {:set, normalized, parsed_field, parsed_value, :binary.copy(changed_by)}
+      )
     end
   end
 
@@ -79,8 +82,10 @@ defmodule Ferricstore.NamespaceConfig do
   """
   @spec get(binary()) :: {:ok, ns_entry()}
   def get(prefix) when is_binary(prefix) do
-    case lookup(prefix) do
-      nil -> {:ok, default_entry(prefix)}
+    normalized = normalize_lookup_prefix(prefix)
+
+    case lookup(normalized) do
+      nil -> {:ok, default_entry(normalized)}
       entry -> {:ok, entry}
     end
   end
@@ -104,16 +109,7 @@ defmodule Ferricstore.NamespaceConfig do
   """
   @spec reset(binary()) :: :ok
   def reset(prefix) when is_binary(prefix) do
-    try do
-      :ets.delete(@table, prefix)
-      refresh_override_flag()
-    rescue
-      ArgumentError -> :ok
-    end
-
-    broadcast_ns_config_changed()
-
-    :ok
+    GenServer.call(__MODULE__, {:reset, normalize_lookup_prefix(prefix)})
   end
 
   @doc """
@@ -121,16 +117,7 @@ defmodule Ferricstore.NamespaceConfig do
   """
   @spec reset_all() :: :ok
   def reset_all do
-    try do
-      :ets.delete_all_objects(@table)
-      :persistent_term.put(@has_overrides_key, false)
-    rescue
-      ArgumentError -> :ok
-    end
-
-    broadcast_ns_config_changed()
-
-    :ok
+    GenServer.call(__MODULE__, :reset_all)
   end
 
   @doc """
@@ -138,7 +125,7 @@ defmodule Ferricstore.NamespaceConfig do
   """
   @spec window_for(binary()) :: pos_integer()
   def window_for(prefix) when is_binary(prefix) do
-    case lookup(prefix) do
+    case lookup(normalize_lookup_prefix(prefix)) do
       nil -> @default_window_ms
       %{window_ms: w} -> w
     end
@@ -159,8 +146,8 @@ defmodule Ferricstore.NamespaceConfig do
     case :ets.whereis(@table) do
       :undefined ->
         :ets.new(@table, [
-          :set,
-          :public,
+          :ordered_set,
+          :protected,
           :named_table,
           {:read_concurrency, true},
           {:write_concurrency, true}
@@ -175,17 +162,73 @@ defmodule Ferricstore.NamespaceConfig do
     {:ok, %{}}
   end
 
-  defp do_set(prefix, :window_ms, value, changed_by) do
+  @impl true
+  def handle_call({:set, prefix, :window_ms, value, changed_by}, _from, state) do
     now = System.os_time(:second)
 
-    try do
-      :ets.insert(@table, {prefix, value, now, changed_by})
-      :persistent_term.put(@has_overrides_key, true)
-      broadcast_ns_config_changed()
-      :ok
-    rescue
-      ArgumentError ->
-        {:error, "ERR namespace config table not available"}
+    reply =
+      if :ets.member(@table, prefix) or :ets.info(@table, :size) < max_entries() do
+        :ets.insert(@table, {prefix, value, now, changed_by})
+        :persistent_term.put(@has_overrides_key, true)
+        :ok
+      else
+        {:error, "ERR namespace config limit reached (max #{max_entries()})"}
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:reset, prefix}, _from, state) do
+    :ets.delete(@table, prefix)
+    refresh_override_flag()
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:reset_all, _from, state) do
+    :ets.delete_all_objects(@table)
+    :persistent_term.put(@has_overrides_key, false)
+    {:reply, :ok, state}
+  end
+
+  defp max_entries do
+    case Application.get_env(
+           :ferricstore,
+           :namespace_config_max_entries,
+           @default_max_entries
+         ) do
+      value when is_integer(value) and value >= 0 -> value
+      _other -> @default_max_entries
+    end
+  end
+
+  defp normalize_stored_prefix(prefix) do
+    if String.valid?(prefix) do
+      normalized = String.trim_trailing(prefix, ":")
+
+      if byte_size(normalized) <= @max_prefix_bytes do
+        {:ok, :binary.copy(normalized)}
+      else
+        {:error, "ERR namespace prefix exceeds #{@max_prefix_bytes} bytes"}
+      end
+    else
+      {:error, "ERR namespace prefix must be valid UTF-8"}
+    end
+  end
+
+  defp normalize_lookup_prefix(prefix) do
+    if String.valid?(prefix), do: String.trim_trailing(prefix, ":"), else: prefix
+  end
+
+  defp validate_changed_by(changed_by) do
+    cond do
+      byte_size(changed_by) > @max_changed_by_bytes ->
+        {:error, "ERR namespace changed_by exceeds #{@max_changed_by_bytes} bytes"}
+
+      not String.valid?(changed_by) ->
+        {:error, "ERR namespace changed_by must be valid UTF-8"}
+
+      true ->
+        :ok
     end
   end
 
@@ -238,8 +281,11 @@ defmodule Ferricstore.NamespaceConfig do
 
   defp validate_field_value("window_ms", value) do
     case Integer.parse(value) do
-      {n, ""} when n > 0 ->
+      {n, ""} when n > 0 and n <= @max_window_ms ->
         {:ok, :window_ms, n}
+
+      {n, ""} when n > @max_window_ms ->
+        {:error, "ERR window_ms must be at most #{@max_window_ms} milliseconds"}
 
       _ ->
         {:error, "ERR window_ms must be a positive integer"}
@@ -248,26 +294,5 @@ defmodule Ferricstore.NamespaceConfig do
 
   defp validate_field_value(field, _value) do
     {:error, "ERR unknown namespace config field '#{field}'"}
-  end
-
-  # Sends :ns_config_changed to live namespace batchers so they clear their
-  # in-process window caches.
-  @spec broadcast_ns_config_changed() :: :ok
-  defp broadcast_ns_config_changed do
-    notify_batchers()
-    :ok
-  end
-
-  defp notify_batchers do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-
-    for i <- 0..(shard_count - 1) do
-      name = :"Ferricstore.Raft.Batcher.#{i}"
-
-      case Process.whereis(name) do
-        nil -> :ok
-        pid -> send(pid, :ns_config_changed)
-      end
-    end
   end
 end

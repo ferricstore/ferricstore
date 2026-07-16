@@ -76,4 +76,20 @@ defmodule Ferricstore.Cluster.JoinIdentityTest do
                @target
              )
   end
+
+  test "rejects malformed readable markers without raising" do
+    assert {:error, {:local_cluster_state_invalid, %{replication_mode: :raft}}} =
+             JoinIdentity.validate(
+               {:ok, %{replication_mode: :raft}},
+               {:ok, %{cluster_id: "cluster-a", replication_mode: :raft}},
+               @target
+             )
+
+    assert {:error, {:target_cluster_state_invalid, @target, :not_a_marker}} =
+             JoinIdentity.validate(
+               {:ok, %{cluster_id: "cluster-a", replication_mode: :raft}},
+               {:ok, :not_a_marker},
+               @target
+             )
+  end
 end

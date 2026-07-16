@@ -92,11 +92,32 @@ defmodule FerricStore do
   """
   @spec await_ready(keyword()) :: :ok
   def await_ready(opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, 30_000)
-    interval = Keyword.get(opts, :interval, 100)
+    {timeout, interval} = validate_await_ready_options!(opts)
     deadline = System.monotonic_time(:millisecond) + timeout
 
     do_await_ready(deadline, interval)
+  end
+
+  defp validate_await_ready_options!(opts) when is_list(opts) do
+    case Keyword.validate(opts, timeout: 30_000, interval: 100) do
+      {:ok, validated} ->
+        timeout = Keyword.fetch!(validated, :timeout)
+        interval = Keyword.fetch!(validated, :interval)
+
+        if is_integer(timeout) and timeout >= 0 and is_integer(interval) and interval > 0 do
+          {timeout, interval}
+        else
+          raise ArgumentError,
+                "await_ready options require a non-negative integer timeout and positive integer interval"
+        end
+
+      {:error, invalid} ->
+        raise ArgumentError, "invalid await_ready options: #{inspect(invalid)}"
+    end
+  end
+
+  defp validate_await_ready_options!(_opts) do
+    raise ArgumentError, "await_ready options must be a keyword list"
   end
 
   defp do_await_ready(deadline, interval) do
@@ -105,11 +126,13 @@ defmodule FerricStore do
         :ok
 
       _ ->
-        if System.monotonic_time(:millisecond) > deadline do
+        remaining = deadline - System.monotonic_time(:millisecond)
+
+        if remaining <= 0 do
           raise "FerricStore not ready within timeout. Check shard health with FerricStore.health()"
         end
 
-        Process.sleep(interval)
+        Process.sleep(min(interval, remaining))
         do_await_ready(deadline, interval)
     end
   end
@@ -324,6 +347,11 @@ defmodule FerricStore do
   defguardeddelegate(fetch_or_compute(key, opts), to: GenericAPI, keys: [key])
 
   defguardeddelegate(fetch_or_compute_result(key, value, opts),
+    to: GenericAPI,
+    keys: [key]
+  )
+
+  defguardeddelegate(fetch_or_compute_error(key, message, opts),
     to: GenericAPI,
     keys: [key]
   )

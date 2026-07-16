@@ -19,20 +19,43 @@ defmodule Ferricstore.Store.Router.Part10 do
       alias Ferricstore.Store.CompoundKey
       alias Ferricstore.Store.LFU
       alias Ferricstore.Store.ListOps
+      alias Ferricstore.Store.ReadResult
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
-      @spec compound_batch_get(FerricStore.Instance.t(), binary(), [binary()]) :: [binary() | nil]
+
+      @spec compound_type_claim(
+              FerricStore.Instance.t(),
+              binary(),
+              CompoundKey.data_type()
+            ) :: :ok | {:ok, :created} | {:error, term()}
+      def compound_type_claim(ctx, redis_key, type) do
+        idx = shard_for(ctx, redis_key)
+        command = CompoundCommand.type_claim(redis_key, type)
+
+        if durable_raft_ctx?(ctx) do
+          quorum_write(ctx, idx, command)
+        else
+          safe_write_call(ctx, idx, command)
+        end
+      end
+
+      @spec compound_batch_get(FerricStore.Instance.t(), binary(), [binary()]) ::
+              [binary() | nil | ReadResult.failure()]
       def compound_batch_get(ctx, redis_key, compound_keys) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
         now = HLC.now_ms()
+        waraft? = selected_waraft_ctx?(ctx)
 
         if promoted_compound_collection?(keydir, redis_key, now) and
              Enum.any?(compound_keys, &(not shared_log_compound_key?(&1))) do
           case safe_read_call(ctx, idx, {:compound_batch_get, redis_key, compound_keys}) do
-            {:ok, values} -> values
-            :unavailable -> List.duplicate(nil, length(compound_keys))
+            {:ok, values} ->
+              normalize_compound_batch_reply(values, length(compound_keys))
+
+            :unavailable ->
+              List.duplicate(ReadResult.failure(:shard_unavailable), length(compound_keys))
           end
         else
           {results, {fallback_keys, hot_hits}} =
@@ -58,7 +81,17 @@ defmodule Ferricstore.Store.Router.Part10 do
                     :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
                   end
 
-                _ ->
+                terminal when waraft? and terminal in [:miss, :expired] ->
+                  {{:value, nil}, {fallback_keys, hot_hits}}
+
+                :no_table when waraft? ->
+                  {{:value, ReadResult.failure(:keydir_unavailable)}, {fallback_keys, hot_hits}}
+
+                {:invalid, entry} ->
+                  {{:value, ReadResult.failure({:invalid_keydir_entry, entry})},
+                   {fallback_keys, hot_hits}}
+
+                _other ->
                   {:fallback, {[compound_key | fallback_keys], hot_hits}}
               end
             end)
@@ -74,8 +107,11 @@ defmodule Ferricstore.Store.Router.Part10 do
                 pending_keys = Enum.reverse(keys)
 
                 case safe_read_call(ctx, idx, {:compound_batch_get, redis_key, pending_keys}) do
-                  {:ok, values} -> values
-                  :unavailable -> List.duplicate(nil, length(pending_keys))
+                  {:ok, values} ->
+                    normalize_compound_batch_reply(values, length(pending_keys))
+
+                  :unavailable ->
+                    List.duplicate(ReadResult.failure(:shard_unavailable), length(pending_keys))
                 end
             end
 
@@ -87,6 +123,42 @@ defmodule Ferricstore.Store.Router.Part10 do
 
           values
         end
+      end
+
+      @doc false
+      @spec compound_batch_get_on_route_keys(
+              FerricStore.Instance.t(),
+              [{binary(), binary()}]
+            ) :: [binary() | nil | ReadResult.failure()]
+      def compound_batch_get_on_route_keys(_ctx, []), do: []
+
+      def compound_batch_get_on_route_keys(ctx, route_lookup_pairs) do
+        indexed_groups =
+          route_lookup_pairs
+          |> Enum.with_index()
+          |> Enum.group_by(
+            fn {{route_key, _lookup_key}, _index} -> route_key end,
+            fn {{_route_key, lookup_key}, index} -> {lookup_key, index} end
+          )
+
+        indexed_values =
+          Enum.flat_map(indexed_groups, fn {route_key, group} ->
+            lookup_keys = Enum.map(group, &elem(&1, 0))
+            values = compound_batch_get(ctx, route_key, lookup_keys)
+
+            values =
+              if is_list(values) and length(values) == length(group) do
+                values
+              else
+                List.duplicate(ReadResult.failure(:invalid_shard_batch_reply), length(group))
+              end
+
+            Enum.zip_with(group, values, fn {_lookup_key, index}, value -> {index, value} end)
+          end)
+
+        indexed_values
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.map(&elem(&1, 1))
       end
 
       defp retry_or_fallback_compound_get(
@@ -125,7 +197,7 @@ defmodule Ferricstore.Store.Router.Part10 do
       defp fallback_compound_get(ctx, idx, redis_key, compound_key) do
         case safe_read_call(ctx, idx, {:compound_get, redis_key, compound_key}) do
           {:ok, value} -> value
-          :unavailable -> nil
+          :unavailable -> ReadResult.failure(:shard_unavailable)
         end
       end
 
@@ -198,7 +270,7 @@ defmodule Ferricstore.Store.Router.Part10 do
       end
 
       @spec compound_get_meta(FerricStore.Instance.t(), binary(), binary()) ::
-              {binary(), non_neg_integer()} | nil
+              {binary(), non_neg_integer()} | nil | ReadResult.failure()
       def compound_get_meta(ctx, redis_key, compound_key) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
@@ -238,23 +310,44 @@ defmodule Ferricstore.Store.Router.Part10 do
                 )
             end
 
-          _ ->
+          terminal when terminal in [:miss, :expired] ->
+            if selected_waraft_ctx?(ctx) do
+              nil
+            else
+              fallback_compound_get_meta(ctx, idx, redis_key, compound_key)
+            end
+
+          :no_table ->
+            if selected_waraft_ctx?(ctx) do
+              ReadResult.failure(:keydir_unavailable)
+            else
+              fallback_compound_get_meta(ctx, idx, redis_key, compound_key)
+            end
+
+          {:invalid, entry} ->
+            ReadResult.failure({:invalid_keydir_entry, entry})
+
+          _other ->
             fallback_compound_get_meta(ctx, idx, redis_key, compound_key)
         end
       end
 
       @spec compound_batch_get_meta(FerricStore.Instance.t(), binary(), [binary()]) ::
-              [{binary(), non_neg_integer()} | nil]
+              [{binary(), non_neg_integer()} | nil | ReadResult.failure()]
       def compound_batch_get_meta(ctx, redis_key, compound_keys) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
         now = HLC.now_ms()
+        waraft? = selected_waraft_ctx?(ctx)
 
         if promoted_compound_collection?(keydir, redis_key, now) and
              Enum.any?(compound_keys, &(not shared_log_compound_key?(&1))) do
           case safe_read_call(ctx, idx, {:compound_batch_get_meta, redis_key, compound_keys}) do
-            {:ok, metas} -> metas
-            :unavailable -> List.duplicate(nil, length(compound_keys))
+            {:ok, metas} ->
+              normalize_compound_batch_reply(metas, length(compound_keys))
+
+            :unavailable ->
+              List.duplicate(ReadResult.failure(:shard_unavailable), length(compound_keys))
           end
         else
           {results, {fallback_keys, hot_hits}} =
@@ -281,7 +374,17 @@ defmodule Ferricstore.Store.Router.Part10 do
                     :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
                   end
 
-                _ ->
+                terminal when waraft? and terminal in [:miss, :expired] ->
+                  {{:value, nil}, {fallback_keys, hot_hits}}
+
+                :no_table when waraft? ->
+                  {{:value, ReadResult.failure(:keydir_unavailable)}, {fallback_keys, hot_hits}}
+
+                {:invalid, entry} ->
+                  {{:value, ReadResult.failure({:invalid_keydir_entry, entry})},
+                   {fallback_keys, hot_hits}}
+
+                _other ->
                   {:fallback, {[compound_key | fallback_keys], hot_hits}}
               end
             end)
@@ -297,8 +400,11 @@ defmodule Ferricstore.Store.Router.Part10 do
                 pending_keys = Enum.reverse(keys)
 
                 case safe_read_call(ctx, idx, {:compound_batch_get_meta, redis_key, pending_keys}) do
-                  {:ok, metas} -> metas
-                  :unavailable -> List.duplicate(nil, length(pending_keys))
+                  {:ok, metas} ->
+                    normalize_compound_batch_reply(metas, length(pending_keys))
+
+                  :unavailable ->
+                    List.duplicate(ReadResult.failure(:shard_unavailable), length(pending_keys))
                 end
             end
 
@@ -318,7 +424,9 @@ defmodule Ferricstore.Store.Router.Part10 do
       end
 
       defp promoted_compound_collection?(keydir, redis_key, now) do
-        case :ets.lookup(keydir, "PM:" <> redis_key) do
+        marker_key = Ferricstore.Store.CompoundKey.promotion_marker_key(redis_key)
+
+        case :ets.lookup(keydir, marker_key) do
           [{_, _value, 0, _lfu, _fid, _off, _vsize}] -> true
           [{_, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now -> true
           _ -> false
@@ -327,7 +435,29 @@ defmodule Ferricstore.Store.Router.Part10 do
         ArgumentError -> false
       end
 
-      defp shared_log_compound_key?(<<"T:", _rest::binary>>), do: true
+      defp normalize_compound_batch_reply(values, expected_count)
+           when is_list(values) and is_integer(expected_count) and expected_count >= 0 do
+        if compound_batch_reply_exact?(values, expected_count) do
+          values
+        else
+          invalid_compound_batch_reply(expected_count)
+        end
+      end
+
+      defp normalize_compound_batch_reply(_invalid, expected_count),
+        do: invalid_compound_batch_reply(expected_count)
+
+      defp compound_batch_reply_exact?([], 0), do: true
+
+      defp compound_batch_reply_exact?([_value | rest], remaining) when remaining > 0,
+        do: compound_batch_reply_exact?(rest, remaining - 1)
+
+      defp compound_batch_reply_exact?(_values, _remaining), do: false
+
+      defp invalid_compound_batch_reply(expected_count) do
+        List.duplicate(ReadResult.failure(:invalid_shard_batch_reply), expected_count)
+      end
+
       defp shared_log_compound_key?(<<"PM:", _rest::binary>>), do: true
       defp shared_log_compound_key?(_key), do: false
 
@@ -417,7 +547,7 @@ defmodule Ferricstore.Store.Router.Part10 do
       defp fallback_compound_get_meta(ctx, idx, redis_key, compound_key) do
         case safe_read_call(ctx, idx, {:compound_get_meta, redis_key, compound_key}) do
           {:ok, meta} -> meta
-          :unavailable -> nil
+          :unavailable -> ReadResult.failure(:shard_unavailable)
         end
       end
 
@@ -452,7 +582,7 @@ defmodule Ferricstore.Store.Router.Part10 do
         if durable_raft_ctx?(ctx) do
           ctx
           |> quorum_write(idx, CompoundCommand.batch_put(redis_key, entries))
-          |> normalize_compound_batch_write_result()
+          |> normalize_compound_batch_write_result(length(entries))
         else
           safe_write_call(ctx, idx, {:compound_batch_put, redis_key, entries})
         end
@@ -480,26 +610,22 @@ defmodule Ferricstore.Store.Router.Part10 do
         if durable_raft_ctx?(ctx) do
           ctx
           |> quorum_write(idx, CompoundCommand.batch_delete(redis_key, compound_keys))
-          |> normalize_compound_batch_write_result()
+          |> normalize_compound_batch_write_result(length(compound_keys))
         else
           safe_write_call(ctx, idx, {:compound_batch_delete, redis_key, compound_keys})
         end
       end
 
-      defp normalize_compound_batch_write_result(:ok), do: :ok
-      defp normalize_compound_batch_write_result({:error, _reason} = error), do: error
+      @doc false
+      def __normalize_compound_batch_write_result_for_test__(result, expected_count),
+        do: normalize_compound_batch_write_result(result, expected_count)
 
-      defp normalize_compound_batch_write_result({:ok, results}),
-        do: normalize_compound_batch_results(results)
+      defp normalize_compound_batch_write_result(results, expected_count)
+           when is_list(results),
+           do: CompoundCommand.normalize_batch_reply({:ok, results}, expected_count)
 
-      defp normalize_compound_batch_write_result(results) when is_list(results),
-        do: normalize_compound_batch_results(results)
-
-      defp normalize_compound_batch_write_result(other), do: other
-
-      defp normalize_compound_batch_results(results) when is_list(results) do
-        Enum.find(results, :ok, &match?({:error, _reason}, &1))
-      end
+      defp normalize_compound_batch_write_result(result, expected_count),
+        do: CompoundCommand.normalize_batch_reply(result, expected_count)
 
       defp origin_compound_get(ctx, idx, keydir, compound_key) do
         now = HLC.now_ms()
@@ -552,25 +678,25 @@ defmodule Ferricstore.Store.Router.Part10 do
         end
       end
 
-      @spec compound_scan(FerricStore.Instance.t(), binary(), binary()) :: [{binary(), binary()}]
+      @spec compound_scan(FerricStore.Instance.t(), binary(), binary()) ::
+              [{binary(), binary()}] | ReadResult.failure()
       def compound_scan(ctx, redis_key, prefix) do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
           idx
           |> direct_compound_scan(ctx, prefix)
-          |> Enum.sort_by(fn {field, _} -> field end)
+          |> ReadResult.map_success(&Enum.sort_by(&1, fn {field, _value} -> field end))
         else
           case safe_read_call(ctx, idx, {:compound_scan, redis_key, prefix}) do
             {:ok, results} -> results
-            :unavailable -> []
+            :unavailable -> ReadResult.failure(:shard_unavailable)
           end
         end
       end
 
-      @spec compound_scan_raw(FerricStore.Instance.t(), binary(), binary()) :: [
-              {binary(), binary()}
-            ]
+      @spec compound_scan_raw(FerricStore.Instance.t(), binary(), binary()) ::
+              [{binary(), binary()}] | ReadResult.failure()
       def compound_scan_raw(ctx, redis_key, prefix) do
         idx = shard_for(ctx, redis_key)
 
@@ -579,12 +705,80 @@ defmodule Ferricstore.Store.Router.Part10 do
         else
           case safe_read_call(ctx, idx, {:compound_scan, redis_key, prefix}) do
             {:ok, results} -> results
-            :unavailable -> []
+            :unavailable -> ReadResult.failure(:shard_unavailable)
           end
         end
       end
 
-      @spec compound_fields(FerricStore.Instance.t(), binary(), binary()) :: [binary()]
+      @doc false
+      @spec compound_scan_raw_bounded(
+              FerricStore.Instance.t(),
+              binary(),
+              binary(),
+              map()
+            ) :: term()
+      def compound_scan_raw_bounded(ctx, redis_key, prefix, limits) when is_map(limits) do
+        idx = shard_for(ctx, redis_key)
+
+        if selected_waraft_ctx?(ctx) do
+          state = direct_compound_read_state(ctx, idx)
+
+          data_path =
+            Ferricstore.Store.Shard.Compound.Promoted.promoted_store(state, redis_key) ||
+              state.shard_data_path
+
+          Ferricstore.Store.Shard.ETS.prefix_scan_entries_bounded(
+            state,
+            prefix,
+            data_path,
+            limits
+          )
+        else
+          case safe_read_call(
+                 ctx,
+                 idx,
+                 {:compound_scan_bounded, redis_key, prefix, limits}
+               ) do
+            {:ok, results} -> results
+            :unavailable -> ReadResult.failure(:shard_unavailable)
+          end
+        end
+      end
+
+      @doc false
+      @spec compound_scan_page(
+              FerricStore.Instance.t(),
+              binary(),
+              binary(),
+              0 | {:after, binary()},
+              pos_integer(),
+              binary() | nil,
+              boolean()
+            ) ::
+              {:ok, {0 | {:after, binary()}, [{binary(), binary() | nil}]}}
+              | ReadResult.failure()
+      def compound_scan_page(
+            ctx,
+            redis_key,
+            prefix,
+            cursor,
+            count,
+            match_pattern,
+            fields_only
+          ) do
+        idx = shard_for(ctx, redis_key)
+
+        request =
+          {:compound_scan_page, redis_key, prefix, cursor, count, match_pattern, fields_only}
+
+        case safe_read_call(ctx, idx, request) do
+          {:ok, result} -> result
+          :unavailable -> ReadResult.failure(:shard_unavailable)
+        end
+      end
+
+      @spec compound_fields(FerricStore.Instance.t(), binary(), binary()) ::
+              [binary()] | ReadResult.failure()
       def compound_fields(ctx, redis_key, prefix) do
         idx = shard_for(ctx, redis_key)
 
@@ -595,12 +789,13 @@ defmodule Ferricstore.Store.Router.Part10 do
         else
           case safe_read_call(ctx, idx, {:compound_fields, redis_key, prefix}) do
             {:ok, fields} -> fields
-            :unavailable -> []
+            :unavailable -> ReadResult.failure(:shard_unavailable)
           end
         end
       end
 
-      @spec compound_count(FerricStore.Instance.t(), binary(), binary()) :: non_neg_integer()
+      @spec compound_count(FerricStore.Instance.t(), binary(), binary()) ::
+              non_neg_integer() | ReadResult.failure()
       def compound_count(ctx, redis_key, prefix) do
         idx = shard_for(ctx, redis_key)
 
@@ -611,7 +806,7 @@ defmodule Ferricstore.Store.Router.Part10 do
         else
           case safe_read_call(ctx, idx, {:compound_count, redis_key, prefix}) do
             {:ok, count} -> count
-            :unavailable -> 0
+            :unavailable -> ReadResult.failure(:shard_unavailable)
           end
         end
       end
@@ -631,8 +826,11 @@ defmodule Ferricstore.Store.Router.Part10 do
       end
 
       defp direct_compound_read_state(ctx, idx) do
+        keydir = resolve_keydir(ctx, idx)
+
         %{
-          keydir: resolve_keydir(ctx, idx),
+          keydir: keydir,
+          ets: keydir,
           compound_member_index:
             Ferricstore.Store.Shard.CompoundMemberIndex.table_name(ctx.name, idx),
           data_dir: ctx.data_dir,
@@ -648,7 +846,10 @@ defmodule Ferricstore.Store.Router.Part10 do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
-          {:ok, direct_zset_score_range(ctx, idx, redis_key, min_bound, max_bound, reverse?)}
+          case direct_zset_score_range(ctx, idx, redis_key, min_bound, max_bound, reverse?) do
+            {:error, {:storage_read_failed, _reason}} = failure -> failure
+            result -> {:ok, result}
+          end
         else
           ctx
           |> safe_read_call(idx, {:zset_score_range, redis_key, min_bound, max_bound, reverse?})
@@ -670,10 +871,13 @@ defmodule Ferricstore.Store.Router.Part10 do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
-          {:ok,
-           ctx
-           |> direct_zset_score_range(idx, redis_key, min_bound, max_bound, reverse?)
-           |> apply_zset_slice(offset, count)}
+          case direct_zset_score_range(ctx, idx, redis_key, min_bound, max_bound, reverse?) do
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              failure
+
+            members ->
+              {:ok, apply_zset_slice(members, offset, count)}
+          end
         else
           ctx
           |> safe_read_call(
@@ -690,7 +894,10 @@ defmodule Ferricstore.Store.Router.Part10 do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
-          {:ok, direct_zset_score_count(ctx, idx, redis_key, min_bound, max_bound)}
+          case direct_zset_score_count(ctx, idx, redis_key, min_bound, max_bound) do
+            {:error, {:storage_read_failed, _reason}} = failure -> failure
+            result -> {:ok, result}
+          end
         else
           ctx
           |> safe_read_call(idx, {:zset_score_count, redis_key, min_bound, max_bound})
@@ -704,10 +911,7 @@ defmodule Ferricstore.Store.Router.Part10 do
 
       def zset_score_count_many(ctx, [{first_key, _min, _max} | _] = queries) do
         if selected_waraft_ctx?(ctx) do
-          {:ok,
-           Enum.map(queries, fn {key, min_bound, max_bound} ->
-             direct_zset_score_count(ctx, shard_for(ctx, key), key, min_bound, max_bound)
-           end)}
+          direct_zset_counts(ctx, queries)
         else
           idx = shard_for(ctx, first_key)
 
@@ -725,11 +929,13 @@ defmodule Ferricstore.Store.Router.Part10 do
         Enum.reduce_while(queries, {:ok, []}, fn {key, min_bound, max_bound}, {:ok, acc} ->
           case zset_score_count(ctx, key, min_bound, max_bound) do
             {:ok, count} -> {:cont, {:ok, [count | acc]}}
+            {:error, {:storage_read_failed, _reason}} = failure -> {:halt, failure}
             :unavailable -> {:halt, :unavailable}
           end
         end)
         |> case do
           {:ok, counts} -> {:ok, Enum.reverse(counts)}
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
           :unavailable -> :unavailable
         end
       end
@@ -740,10 +946,8 @@ defmodule Ferricstore.Store.Router.Part10 do
 
       def zset_score_count_all_many_no_build(ctx, [first_key | _] = keys) do
         if selected_waraft_ctx?(ctx) do
-          {:ok,
-           Enum.map(keys, fn key ->
-             direct_zset_score_count(ctx, shard_for(ctx, key), key, :neg_inf, :inf)
-           end)}
+          queries = Enum.map(keys, &{&1, :neg_inf, :inf})
+          direct_zset_counts(ctx, queries)
         else
           idx = shard_for(ctx, first_key)
 
@@ -769,6 +973,19 @@ defmodule Ferricstore.Store.Router.Part10 do
         |> case do
           {:ok, counts} -> {:ok, Enum.reverse(counts)}
           :unavailable -> :unavailable
+        end
+      end
+
+      defp direct_zset_counts(ctx, queries) do
+        Enum.reduce_while(queries, {:ok, []}, fn {key, min_bound, max_bound}, {:ok, counts} ->
+          case direct_zset_score_count(ctx, shard_for(ctx, key), key, min_bound, max_bound) do
+            {:error, {:storage_read_failed, _reason}} = failure -> {:halt, failure}
+            count -> {:cont, {:ok, [count | counts]}}
+          end
+        end)
+        |> case do
+          {:ok, counts} -> {:ok, Enum.reverse(counts)}
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
         end
       end
 
@@ -845,14 +1062,18 @@ defmodule Ferricstore.Store.Router.Part10 do
             case safe_read_call(ctx, idx, {:flow_index_rank_range_many, shard_requests})
                  |> unwrap_zset_index_reply() do
               {:ok, results} when is_list(results) ->
-                indexed =
-                  indexed_requests
-                  |> Enum.zip(results)
-                  |> Enum.reduce(acc, fn {{_request, original_index}, result}, next_acc ->
-                    Map.put(next_acc, original_index, result)
-                  end)
+                if valid_flow_index_rank_batch?(results, length(indexed_requests)) do
+                  indexed =
+                    indexed_requests
+                    |> Enum.zip(results)
+                    |> Enum.reduce(acc, fn {{_request, original_index}, result}, next_acc ->
+                      Map.put(next_acc, original_index, result)
+                    end)
 
-                {:cont, {:ok, indexed}}
+                  {:cont, {:ok, indexed}}
+                else
+                  {:halt, :unavailable}
+                end
 
               :unavailable ->
                 {:halt, :unavailable}

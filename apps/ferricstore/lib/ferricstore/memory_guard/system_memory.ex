@@ -1,13 +1,25 @@
 defmodule Ferricstore.MemoryGuard.SystemMemory do
   @moduledoc false
 
+  @fallback_memory_bytes 1_073_741_824
+
   def detect_memory_limit do
-    cgroup_v2_limit() ||
-      cgroup_v1_limit() ||
-      host_total_memory() ||
-      proc_meminfo_total() ||
-      1_073_741_824
+    select_limit([
+      cgroup_v2_limit(),
+      cgroup_v1_limit(),
+      host_total_memory(),
+      proc_meminfo_total()
+    ])
   end
+
+  defp select_limit(limits) do
+    limits
+    |> Enum.filter(&(is_integer(&1) and &1 > 0))
+    |> Enum.min(fn -> @fallback_memory_bytes end)
+  end
+
+  @doc false
+  def __select_limit_for_test__(limits) when is_list(limits), do: select_limit(limits)
 
   def parse_sysctl_memsize(output) when is_binary(output) do
     case Integer.parse(String.trim(output)) do

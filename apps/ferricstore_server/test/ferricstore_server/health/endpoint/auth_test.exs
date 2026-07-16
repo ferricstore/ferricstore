@@ -274,8 +274,38 @@ defmodule FerricstoreServer.Health.Endpoint.AuthTest do
     assert Session.session_user(%{"cookie" => cookie}) == nil
   end
 
+  test "dashboard sessions reject non-canonical external-term payloads" do
+    Application.put_env(:ferricstore, :protected_mode, true)
+    username = "canonical-" <> String.duplicate("a", 512)
+    assert :ok = Acl.set_user(username, ["on", "nopass", "~*", "+info"])
+
+    cookie = Session.session_cookie(username)
+    token = Session.cookie_value(%{"cookie" => cookie}, "ferricstore_dashboard")
+    [encoded_payload, _signature] = String.split(token, ".", parts: 2)
+    {:ok, payload} = Base.url_decode64(encoded_payload, padding: false)
+    term = :erlang.binary_to_term(payload, [:safe])
+
+    compressed = :erlang.term_to_binary(term, compressed: 9)
+    assert <<131, 80, _rest::binary>> = compressed
+
+    for non_canonical <- [compressed, payload <> <<0>>] do
+      headers = %{"cookie" => signed_session_cookie(non_canonical)}
+      assert Session.session_user(headers) == nil
+    end
+  end
+
   defp session_headers(username) do
     %{"cookie" => Session.session_cookie(username)}
+  end
+
+  defp signed_session_cookie(payload) do
+    encoded_payload = Base.url_encode64(payload, padding: false)
+
+    signature =
+      :crypto.mac(:hmac, :sha256, String.duplicate("s", 32), encoded_payload)
+      |> Base.url_encode64(padding: false)
+
+    "ferricstore_dashboard=#{encoded_payload}.#{signature}"
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

@@ -136,6 +136,54 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
     assert ClaimWaiters.total_count() == 0
   end
 
+  test "concurrent registrations cannot oversubscribe the waiter row cap" do
+    Application.put_env(:ferricstore, :flow_claim_due_max_waiter_rows, 1)
+    parent = self()
+
+    contenders =
+      for id <- 1..64 do
+        spawn(fn ->
+          key = {"email", "queued", 0, "p#{id}"}
+          send(parent, {:ready, self()})
+
+          receive do
+            :register ->
+              result = ClaimWaiters.register([key], self(), now_ms() + 1_000)
+              send(parent, {:registered, self(), result})
+
+              receive do
+                :stop -> ClaimWaiters.unregister([key], self())
+              end
+          end
+        end)
+      end
+
+    on_exit(fn -> Enum.each(contenders, &Process.exit(&1, :kill)) end)
+
+    Enum.each(contenders, fn pid -> assert_receive {:ready, ^pid}, 1_000 end)
+    Enum.each(contenders, &send(&1, :register))
+
+    results =
+      Enum.map(contenders, fn pid ->
+        assert_receive {:registered, ^pid, result}, 1_000
+        result
+      end)
+
+    assert Enum.count(results, &(&1 == :ok)) == 1
+    assert ClaimWaiters.total_count() == 1
+
+    Enum.each(contenders, &send(&1, :stop))
+  end
+
+  test "register rejects a direct key set larger than the waiter footprint limit" do
+    keys = for id <- 1..65, do: {"email", "queued", 0, "p#{id}"}
+
+    assert {:error, "ERR blocked claim_due waiter has too many keys"} =
+             ClaimWaiters.register(keys, self(), now_ms() + 1_000)
+
+    assert ClaimWaiters.total_count() == 0
+  end
+
   test "multi-state multi-partition wait keys stay compact" do
     states = Enum.map(1..50, &"state-#{&1}")
     partitions = Enum.map(1..32, &"partition-#{&1}")
@@ -336,6 +384,20 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
 
     assert :ok = ClaimWaiters.unregister(keys, self())
     assert ClaimWaiters.scheduled_count() == 0
+  end
+
+  test "unregister cancels the underlying delayed wake timer" do
+    keys = ClaimWaiters.wait_keys("email", "queued", 0, "p1")
+    due_at = Ferricstore.CommandTime.now_ms() + 60_000
+
+    assert :ok = ClaimWaiters.register(keys, self(), now_ms() + 1_000, limit: 1)
+    assert :ok = ClaimWaiters.schedule_ready("email", "queued", 0, "p1", due_at, 1)
+
+    assert [{_timer_key, 1, {:once, timer_ref}}] = :ets.tab2list(@timer_table)
+    assert is_integer(:erlang.read_timer(timer_ref))
+
+    assert :ok = ClaimWaiters.unregister(keys, self())
+    assert :erlang.read_timer(timer_ref) == false
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)

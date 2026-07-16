@@ -3,6 +3,8 @@ defmodule Ferricstore.Flow.Governance.CreditLease do
 
   alias Ferricstore.Flow.Governance.Decision
 
+  @max_exact_version 9_007_199_254_740_991
+
   defmodule Owner do
     @moduledoc false
     defstruct [
@@ -85,30 +87,36 @@ defmodule Ferricstore.Flow.Governance.CreditLease do
     owner = reclaim_expired(owner, now_ms)
     grant = min(requested, owner.free)
 
-    if grant > 0 do
-      lease =
-        owner.leases
-        |> Map.get(shard_id, new_lease(shard_id, owner.epoch + 1))
-        |> normalize_lease()
+    cond do
+      grant > 0 and not Map.has_key?(owner.leases, shard_id) and
+          owner.epoch >= @max_exact_version ->
+        {:error, "ERR flow limit lease generation exhausted", owner}
 
-      lease = %{
-        lease
-        | available: lease.available + grant,
-          expires_at_ms: now_ms + ttl_ms,
-          pending_reclaim: max(lease.pending_reclaim - grant, 0)
-      }
+      grant > 0 ->
+        lease =
+          owner.leases
+          |> Map.get(shard_id, new_lease(shard_id, owner.epoch + 1))
+          |> normalize_lease()
 
-      owner = %Owner{
-        owner
-        | free: owner.free - grant,
-          epoch: max(owner.epoch, lease.epoch),
-          leases: Map.put(owner.leases, shard_id, lease)
-      }
+        lease = %{
+          lease
+          | available: lease.available + grant,
+            expires_at_ms: extend_expiry(lease.expires_at_ms, now_ms + ttl_ms),
+            pending_reclaim: max(lease.pending_reclaim - grant, 0)
+        }
 
-      {:ok, owner, lease}
-    else
-      owner = mark_reclaim(owner, shard_id, requested)
-      {:error, exhausted(owner, requested), owner}
+        owner = %Owner{
+          owner
+          | free: owner.free - grant,
+            epoch: max(owner.epoch, lease.epoch),
+            leases: Map.put(owner.leases, shard_id, lease)
+        }
+
+        {:ok, owner, lease}
+
+      true ->
+        owner = mark_reclaim(owner, shard_id, requested)
+        {:error, exhausted(owner, requested), owner}
     end
   end
 
@@ -132,6 +140,9 @@ defmodule Ferricstore.Flow.Governance.CreditLease do
           reservation_ids != [] and
               Enum.any?(reservation_ids, &Map.has_key?(lease.reservations, &1)) ->
             {:error, "ERR flow limit reservation_id conflict", owner}
+
+          is_integer(lease.last_spend_at_ms) and now_ms < lease.last_spend_at_ms ->
+            {:error, "ERR flow limit now_ms cannot precede last_spend_at_ms", owner}
 
           lease.available >= amount ->
             lease = %Lease{
@@ -348,6 +359,11 @@ defmodule Ferricstore.Flow.Governance.CreditLease do
     end
   end
 
+  defp extend_expiry(nil, expires_at_ms), do: expires_at_ms
+
+  defp extend_expiry(current_expires_at_ms, expires_at_ms),
+    do: max(current_expires_at_ms, expires_at_ms)
+
   defp rebalance_capacity(%Owner{} = owner) do
     allocated = allocated_credits(owner.leases)
 
@@ -391,7 +407,9 @@ defmodule Ferricstore.Flow.Governance.CreditLease do
 
   defp mark_reclaim(%Owner{} = owner, requester_shard_id, requested) do
     {leases, _remaining} =
-      Enum.reduce(owner.leases, {owner.leases, requested}, fn
+      owner.leases
+      |> Enum.sort_by(fn {shard_id, _lease} -> shard_id end)
+      |> Enum.reduce({owner.leases, requested}, fn
         {_shard_id, _lease}, {leases, 0} ->
           {leases, 0}
 
