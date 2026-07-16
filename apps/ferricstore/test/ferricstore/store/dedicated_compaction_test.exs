@@ -503,6 +503,42 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       assert File.exists?(Path.join(dedicated_path, "00001.log")),
              "failed compaction must retain an already-published metadata page"
     end
+
+    test "dedicated compaction reports old-log directory listing failures" do
+      store = real_store()
+      key = ukey("compact_cleanup_list_failure")
+      promote_hash(store, key)
+
+      ctx = FerricStore.Instance.get(:default)
+      shard_idx = Router.shard_for(ctx, key)
+      shard = Router.shard_name(ctx, shard_idx)
+      state = :sys.get_state(shard)
+      dedicated_path = promoted_path!(state, key)
+
+      attach_dedicated_compaction_failed_handler()
+
+      Process.put(:ferricstore_promoted_compaction_list_hook, fn ^dedicated_path ->
+        {:error, {:permission_denied, "injected list failure"}}
+      end)
+
+      try do
+        assert {:error, ^state} =
+                 ShardCompound.compact_dedicated_result(state, key, dedicated_path)
+      after
+        Process.delete(:ferricstore_promoted_compaction_list_hook)
+      end
+
+      assert_receive {:dedicated_compaction_failed,
+                      [:ferricstore, :dedicated, :compaction_failed], %{count: 1, error_count: 1},
+                      %{
+                        shard_index: ^shard_idx,
+                        phase: :remove_old_logs,
+                        reason: :list_old_logs_failed,
+                        path: ^dedicated_path
+                      }}
+
+      assert log_files(dedicated_path) == ["00000.log", "00001.log"]
+    end
   end
 
   # ---------------------------------------------------------------------------

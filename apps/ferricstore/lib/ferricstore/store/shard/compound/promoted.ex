@@ -783,7 +783,7 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   end
 
   defp remove_dedicated_logs_before(state, dedicated_path, new_fid) do
-    case Ferricstore.FS.ls(dedicated_path) do
+    case list_dedicated_logs(dedicated_path) do
       {:ok, files} ->
         Enum.reduce_while(files, :ok, fn name, :ok ->
           case dedicated_log_file_id(name) do
@@ -810,8 +810,28 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
           end
         end)
 
-      _ ->
-        :ok
+      {:error, reason} ->
+        Logger.error(
+          "Shard #{state.index}: dedicated compaction failed to list old logs under " <>
+            "#{dedicated_path}: #{inspect(reason)}"
+        )
+
+        {:error, {:list_old_logs_failed, {dedicated_path, reason}}}
+
+      other ->
+        Logger.error(
+          "Shard #{state.index}: dedicated compaction received an invalid old-log listing for " <>
+            "#{dedicated_path}: #{inspect(other)}"
+        )
+
+        {:error, {:list_old_logs_failed, {dedicated_path, {:unexpected_result, other}}}}
+    end
+  end
+
+  defp list_dedicated_logs(dedicated_path) do
+    case Process.get(:ferricstore_promoted_compaction_list_hook) do
+      fun when is_function(fun, 1) -> fun.(dedicated_path)
+      _missing -> Ferricstore.FS.ls(dedicated_path)
     end
   end
 
