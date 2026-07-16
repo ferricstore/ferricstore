@@ -1,6 +1,32 @@
 defmodule Ferricstore.Flow.ScheduleTest do
   use Ferricstore.Test.FlowCase
 
+  test "delay schedule defaults are based on the cluster-adjusted clock" do
+    ref = :persistent_term.get(:ferricstore_hlc_ref)
+    previous = :atomics.get(ref, 1)
+
+    on_exit(fn ->
+      :atomics.put(:persistent_term.get(:ferricstore_hlc_ref), 1, previous)
+    end)
+
+    future_ms = System.system_time(:millisecond) + 60_000
+    :atomics.put(ref, 1, Bitwise.bsl(future_ms, 16))
+    schedule_id = unique_flow_id("schedule-hlc-delay")
+
+    assert {:ok, schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :delay,
+               delay_ms: 30_000,
+               target: [
+                 id: unique_flow_id("schedule-hlc-target"),
+                 type: unique_flow_id("schedule-hlc-type"),
+                 partition_key: unique_flow_id("schedule-hlc-partition")
+               ]
+             )
+
+    assert schedule.next_run_at_ms >= future_ms + 30_000
+  end
+
   test "one-shot schedule fires target flow once and completes schedule" do
     now_ms = 1_000
     schedule_id = unique_flow_id("schedule-once")

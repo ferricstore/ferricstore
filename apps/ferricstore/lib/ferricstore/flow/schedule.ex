@@ -8,6 +8,7 @@ defmodule Ferricstore.Flow.Schedule do
   fire/reschedule is still guarded by Flow fencing tokens.
   """
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Flow
   alias Ferricstore.Flow.{Internal, Keys, MutationAttrs}
   alias Ferricstore.Store.Router
@@ -1869,7 +1870,7 @@ defmodule Ferricstore.Flow.Schedule do
   defp maybe_put(map, key, value) when is_map(map), do: Map.put(map, key, value)
 
   defp default_worker, do: "ferricstore-scheduler:" <> Atom.to_string(node())
-  defp now_ms, do: System.system_time(:millisecond)
+  defp now_ms, do: CommandTime.now_ms()
 
   defp schedule_definition_max_bytes do
     env_pos_integer(:flow_schedule_definition_max_bytes, @default_definition_max_bytes)
