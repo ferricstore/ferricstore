@@ -676,7 +676,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
                  end)
       end
 
-      test "flow get treats malformed LMDB mirror records as missing" do
+      test "flow get fails closed on malformed LMDB mirror records" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
         Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -702,7 +702,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
 
         assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, wrapped}])
 
-        assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        assert {:error, "ERR invalid flow record"} =
+                 Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
       end
 
       test "legacy Flow LMDB mode values are ignored" do

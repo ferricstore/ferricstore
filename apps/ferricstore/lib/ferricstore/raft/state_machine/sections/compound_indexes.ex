@@ -904,15 +904,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       # Enhanced do_delete that cleans up prob files.
       # When a key's value is a prob metadata marker, delete the associated file.
       defp prob_file_path_for_delete(state, key) do
-        case do_get(state, key) do
-          nil ->
-            nil
+        if CompoundKey.internal_key?(key) do
+          nil
+        else
+          case do_get(state, key) do
+            nil ->
+              nil
 
-          value when is_binary(value) ->
-            prob_file_path_from_delete_value(state, key, value)
+            value when is_binary(value) ->
+              prob_file_path_from_delete_value(state, key, value)
 
-          _ ->
-            nil
+            _ ->
+              nil
+          end
         end
       end
 

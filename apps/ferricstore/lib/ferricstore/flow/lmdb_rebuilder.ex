@@ -453,7 +453,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     {ops, terminal_prunes, active_records, terminal_counts, projection_read_errors} =
       Enum.reduce(decoded, {[], [], [], acc.terminal_counts, 0}, fn
         {key, value, expire_at_ms, record}, {ops, prunes, active, counts, read_errors} ->
-          lmdb_ops = [{:put, key, LMDB.encode_value(value, expire_at_ms)} | ops]
+          state_put_op = {:put, key, LMDB.encode_value(value, expire_at_ms)}
 
           if LMDB.terminal_state?(Map.get(record, :state)) do
             projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
@@ -503,12 +503,16 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                 {:error, _reason} -> {[], read_errors + 1}
               end
 
+            reconcile_ops =
+              active_delete_ops ++
+                [
+                  state_put_op,
+                  {:put, reverse_key, terminal_key},
+                  {:put, terminal_key, terminal_value}
+                ] ++ terminal_expire_ops ++ metadata_ops
+
             {
-              [
-                {:put, reverse_key, terminal_key},
-                {:put, terminal_key, terminal_value}
-                | active_delete_ops ++ terminal_expire_ops ++ metadata_ops ++ lmdb_ops
-              ],
+              :lists.reverse(reconcile_ops, ops),
               [{key, record} | prunes],
               active,
               Map.update(counts, count_key, 1, &(&1 + 1)),
@@ -524,7 +528,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                 key
               )
 
-            {attribute_ops ++ lmdb_ops, prunes, [{key, record} | active], counts, read_errors}
+            reconcile_ops = [state_put_op | attribute_ops]
+
+            {:lists.reverse(reconcile_ops, ops), prunes, [{key, record} | active], counts,
+             read_errors}
           end
       end)
 

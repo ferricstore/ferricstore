@@ -528,6 +528,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
         older_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "1000-1", 1_000)
         newer_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "1001-2", 1_001)
         reused_key = Ferricstore.Flow.LMDB.history_index_key(history_key, "3000-1", 3_000)
+        newer_expire_key = Ferricstore.Flow.LMDB.history_expire_key(2_000, newer_key)
         flow_expire_key = Ferricstore.Flow.LMDB.history_flow_expire_key(2_000, history_key)
 
         on_exit(fn -> File.rm_rf!(path) end)
@@ -543,6 +544,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
                       "X:newer",
                       2_000
                     )},
+                   {:put, newer_expire_key,
+                    Ferricstore.Flow.LMDB.encode_history_expire_value(newer_key)},
                    {:put, reused_key,
                     Ferricstore.Flow.LMDB.encode_history_index_value("3000-1", 3_000, "X:reused")},
                    {:put, flow_expire_key,

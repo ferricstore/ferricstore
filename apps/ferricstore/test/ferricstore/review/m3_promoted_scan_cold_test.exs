@@ -166,6 +166,9 @@ defmodule Ferricstore.Review.M3PromotedScanColdTest do
 
       count = Hash.handle("HLEN", [key], store)
       assert count == @test_threshold + 1
+
+      assert :ok = ShardHelpers.flush_all_keys()
+      assert [] = :ets.lookup(keydir, "H:#{key}\0f_1")
     end
   end
 end

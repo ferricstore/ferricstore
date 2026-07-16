@@ -17,9 +17,14 @@ defmodule Ferricstore.Store.PromotionTest.Sections.PromotionBatchesSharedTombsto
           |> Path.join("../../../lib/ferricstore/store/promotion.ex")
           |> File.read!()
 
-        assert source =~ "v2_append_ops_batch(active_path, tombstone_ops)"
-        refute source =~ "v2_append_ops_batch_nosync(active_path, tombstone_ops)"
-        refute source =~ "v2_fsync(active_path)"
+        [_, tombstone_section] =
+          String.split(source, "# Step 3: tombstone compound keys in shared log", parts: 2)
+
+        [tombstone_section, _] = String.split(tombstone_section, "Logger.info(", parts: 2)
+
+        assert tombstone_section =~ "v2_append_ops_batch(active_path, tombstone_ops)"
+        refute tombstone_section =~ "v2_append_ops_batch_nosync(active_path, tombstone_ops)"
+        refute tombstone_section =~ "v2_fsync(active_path)"
       end
 
       test "promoted recovery reports leftover compact temp cleanup failures" do

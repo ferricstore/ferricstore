@@ -147,10 +147,13 @@ defmodule Ferricstore.Flow.LMDB.Retention do
              limit
            ),
          {:ok, ops, swept} <- expired_history_sweep_ops(path, entries, now_ms),
-         {:ok, flow_ops, flow_swept} <-
+         {:ok, flow_ops, _flow_swept} <-
            expired_history_flow_sweep(path, now_ms, limit, max(limit - swept, 0)) do
-      case Access.write_batch(path, flow_ops ++ ops) do
-        :ok -> {:ok, swept + flow_swept}
+      write_ops = Enum.uniq(flow_ops ++ ops)
+      swept_count = Enum.count(write_ops, &history_index_delete?/1)
+
+      case Access.write_batch(path, write_ops) do
+        :ok -> {:ok, swept_count}
         {:error, _reason} = error -> error
       end
     end
@@ -727,4 +730,7 @@ defmodule Ferricstore.Flow.LMDB.Retention do
         ops
     end
   end
+
+  defp history_index_delete?({:delete, <<"flow-history-index:", _rest::binary>>}), do: true
+  defp history_index_delete?(_op), do: false
 end
