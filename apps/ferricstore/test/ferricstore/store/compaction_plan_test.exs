@@ -112,7 +112,8 @@ defmodule Ferricstore.Store.CompactionPlanTest do
       locator: old_locator,
       state_key: "flow/state/flow-1",
       type: "job",
-      state: "waiting"
+      state: "waiting",
+      due_at_ms: 900_000
     }
 
     old_blob = LMDB.encode_cold_park(old_locator, Map.delete(park, :locator))

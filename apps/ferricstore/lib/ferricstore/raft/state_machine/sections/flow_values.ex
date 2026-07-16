@@ -809,6 +809,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
           maybe_queue_lmdb_policy_put(key, disk_val, expire_at_ms)
           :ok
         else
+          materialize_pending_fast_deletes(state)
           record_pending_original(state, key)
 
           unless standalone_staged_apply?() do
@@ -852,6 +853,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
           ets_val = nil
           cross_shard_raw_put(state, key, ets_val, disk_val, expire_at_ms, lfu)
         else
+          materialize_pending_fast_deletes(state)
           record_pending_original(state, key)
 
           unless standalone_staged_apply?() do
@@ -970,6 +972,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
           maybe_queue_lmdb_policy_put(key, disk_val, expire_at_ms)
           :ok
         else
+          materialize_pending_fast_deletes(state)
           record_pending_original(state, key)
 
           unless standalone_staged_apply?() do

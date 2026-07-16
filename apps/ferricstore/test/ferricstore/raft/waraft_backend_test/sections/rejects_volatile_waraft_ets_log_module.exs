@@ -114,6 +114,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         assert "v1" == Router.get(ctx, key)
       end
 
+      @tag :sync_pause_nested_legacy
       test "overlapping sync pauses require matching resumes before writes continue", %{ctx: ctx} do
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
@@ -136,6 +137,40 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         assert "v1" == Router.get(ctx, key)
       end
 
+      @tag :sync_pause_lease
+      test "explicit sync pause lease releases when its origin owner dies", %{ctx: ctx} do
+        assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+        parent = self()
+        key = "sync-pause-owner-down:k"
+
+        owner =
+          spawn(fn ->
+            pause_lease = {self(), make_ref()}
+
+            send(
+              parent,
+              {:sync_pause_owner_ready,
+               Ferricstore.Raft.Batcher.pause_writes_for_sync(0, pause_lease, 1_000)}
+            )
+
+            Process.sleep(:infinity)
+          end)
+
+        assert_receive {:sync_pause_owner_ready, :ok}, 2_000
+
+        task =
+          Task.async(fn ->
+            WARaftBackend.write(0, {:put, key, "v1", 0})
+          end)
+
+        refute Task.yield(task, 50)
+        Process.exit(owner, :kill)
+
+        assert {:ok, :ok} == Task.yield(task, 1_000)
+        assert "v1" == Router.get(ctx, key)
+      end
+
+      @tag :sync_pause_cross_process
       test "pause_writes_for_sync waits for writes admitted before pause publication", %{ctx: ctx} do
         assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 

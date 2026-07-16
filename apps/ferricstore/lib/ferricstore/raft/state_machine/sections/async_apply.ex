@@ -1416,7 +1416,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
       defp apply_plain_put_batch_entries(state, entries) do
         cond do
-          put_batch_fast_path?(state, entries) and put_batch_entries_unlocked?(state, entries) ->
+          put_batch_fast_path?(state, entries) and put_batch_entries_unlocked?(state, entries) and
+              fast_put_publish_possible?(
+                Process.get(:sm_pending_writes, []),
+                Process.get(:sm_pending_values, %{})
+              ) ->
             apply_put_batch_entries_fast(state, entries)
 
           true ->
@@ -1555,8 +1559,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       # with rollback, ordering, and mixed-result tests.
       defp apply_put_batch_entries_fast(_state, entries) do
         pending = Process.get(:sm_pending_writes, [])
-        pending_values = Process.get(:sm_pending_values, %{})
-        fast_publish? = fast_put_publish_possible?(pending, pending_values)
 
         {results, pending} =
           Enum.reduce(entries, {[], pending}, fn
@@ -1574,7 +1576,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           end)
 
         Process.put(:sm_pending_writes, pending)
-        Process.put(:sm_pending_fast_put_batch, fast_publish?)
+        Process.put(:sm_pending_fast_put_batch, true)
 
         Enum.reverse(results)
       end

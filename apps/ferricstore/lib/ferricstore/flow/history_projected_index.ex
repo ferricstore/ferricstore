@@ -37,6 +37,19 @@ defmodule Ferricstore.Flow.HistoryProjectedIndex do
 
   def persist(_shard_data_path, _index), do: {:error, :invalid_durable_index}
 
+  @spec reset(binary(), non_neg_integer()) :: :ok | {:error, term()}
+  def reset(shard_data_path, index)
+      when is_binary(shard_data_path) and is_integer(index) and index >= 0 and
+             index <= @max_index do
+    marker_path = path(shard_data_path)
+
+    with_marker_lock(marker_path, fn ->
+      write_locked(shard_data_path, marker_path, index)
+    end)
+  end
+
+  def reset(_shard_data_path, _index), do: {:error, :invalid_durable_index}
+
   defp persist_locked(shard_data_path, marker_path, index) do
     case read_marker_result(marker_path) do
       {:ok, current} when current >= index ->

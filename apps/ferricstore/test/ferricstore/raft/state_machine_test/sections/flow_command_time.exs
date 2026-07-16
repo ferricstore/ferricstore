@@ -10,6 +10,159 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 
       describe "Flow command time" do
+        @tag :mixed_fast_delete_flow_put
+        test "Flow writes materialize a preceding compound fast delete", %{
+          state: state,
+          ets: ets
+        } do
+          setup_flow_indexes(state)
+
+          collection_key = "flow-batch-delete"
+          member_key = CompoundKey.set_member(collection_key, "member")
+
+          {state, :ok} =
+            StateMachine.apply(%{}, {:compound_put, member_key, "1", 0}, state)
+
+          id = "flow-after-fast-delete"
+          partition_key = "tenant-after-fast-delete"
+          state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+          {_state, {:ok, [:ok, :ok]}} =
+            StateMachine.apply(
+              %{system_time: 1_000},
+              {:batch,
+               [
+                 {:compound_batch_delete, collection_key, [member_key]},
+                 {:flow_create, state_key,
+                  %{
+                    id: id,
+                    type: "flow-after-fast-delete",
+                    state: "queued",
+                    partition_key: partition_key
+                  }}
+               ]},
+              state
+            )
+
+          assert [] == :ets.lookup(ets, member_key)
+          assert %{id: ^id, state: "queued"} = flow_record!(state, state_key)
+        end
+
+        @tag :mixed_fast_delete_put_batch
+        test "MSET falls back to staged puts after a compound fast delete", %{
+          state: state,
+          ets: ets
+        } do
+          collection_key = "mset-batch-delete"
+          member_key = CompoundKey.hash_field(collection_key, "field")
+          string_key = "mset-after-fast-delete"
+
+          {state, :ok} =
+            StateMachine.apply(%{}, {:compound_put, member_key, "old", 0}, state)
+
+          {_state, {:ok, [:ok, :ok]}} =
+            StateMachine.apply(
+              %{},
+              {:batch,
+               [
+                 {:compound_batch_delete, collection_key, [member_key]},
+                 {:mset, [{string_key, "value", 0}]}
+               ]},
+              state
+            )
+
+          assert [] == :ets.lookup(ets, member_key)
+
+          assert [{^string_key, "value", 0, _lfu, _file_id, _offset, 5}] =
+                   :ets.lookup(ets, string_key)
+        end
+
+        @tag :mixed_fast_delete_rmw
+        test "RMW commands observe a preceding compound fast delete", %{
+          state: state,
+          ets: ets
+        } do
+          collection_key = "hincrby-batch-delete"
+          member_key = CompoundKey.hash_field(collection_key, "field")
+
+          {state, 1} =
+            StateMachine.apply(%{}, {:hset_single, collection_key, "field", "5"}, state)
+
+          {_state, {:ok, [:ok, 1]}} =
+            StateMachine.apply(
+              %{},
+              {:batch,
+               [
+                 {:compound_batch_delete, collection_key, [member_key]},
+                 {:hincrby, collection_key, "field", 1}
+               ]},
+              state
+            )
+
+          assert [{^member_key, "1", 0, _lfu, _file_id, _offset, 1}] =
+                   :ets.lookup(ets, member_key)
+        end
+
+        @tag :mixed_fast_delete_list_read
+        test "list reads observe a preceding compound fast delete", %{
+          state: state,
+          ets: ets
+        } do
+          collection_key = "list-batch-delete"
+          first_member_key = CompoundKey.list_element(collection_key, 0)
+
+          {state, 2} =
+            StateMachine.apply(
+              %{},
+              {:list_op, collection_key, {:rpush, ["first", "second"]}},
+              state
+            )
+
+          {_state, {:ok, [:ok, ["second"]]}} =
+            StateMachine.apply(
+              %{},
+              {:batch,
+               [
+                 {:compound_batch_delete, collection_key, [first_member_key]},
+                 {:list_op, collection_key, {:lrange, 0, 0}}
+               ]},
+              state
+            )
+
+          assert [] == :ets.lookup(ets, first_member_key)
+        end
+
+        @tag :fast_delete_materialization_scope
+        test "fast-delete materialization ignores unrelated pending writes", %{
+          state: state,
+          ets: ets
+        } do
+          fast_key = "tracked-fast-delete"
+          unrelated_key = "already-staged-delete"
+          fast_entry = {fast_key, "fast", 0, LFU.initial(), 0, 0, 4}
+          unrelated_entry = {unrelated_key, "keep", 0, LFU.initial(), 0, 0, 4}
+
+          :ets.insert(ets, [fast_entry, unrelated_entry])
+
+          unrelated_tail =
+            Enum.map(1..10_000, fn index ->
+              {:delete, "unrelated-pending-delete-#{index}", nil}
+            end)
+
+          pending_writes =
+            [{:delete, unrelated_key, nil}, {:delete, fast_key, nil} | unrelated_tail]
+
+          assert {:ok, 1} =
+                   Ferricstore.Raft.StateMachine.__materialize_pending_fast_deletes_for_test__(
+                     state,
+                     pending_writes,
+                     [fast_key]
+                   )
+
+          assert [] == :ets.lookup(ets, fast_key)
+          assert [^unrelated_entry] = :ets.lookup(ets, unrelated_key)
+        end
+
         @tag :flow_policy_generation
         test "Flow create rejects a policy reference older than the local generation",
              %{

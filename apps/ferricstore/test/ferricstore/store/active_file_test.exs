@@ -10,6 +10,7 @@ defmodule Ferricstore.Store.ActiveFileTest do
   @moduletag :global_state
 
   alias Ferricstore.Store.ActiveFile
+  alias Ferricstore.Store.ActiveFile.TableOwner
   alias Ferricstore.Test.ShardHelpers
 
   setup do
@@ -32,6 +33,34 @@ defmodule Ferricstore.Store.ActiveFileTest do
   # ---------------------------------------------------------------------------
 
   describe "ActiveFile registry" do
+    test "the supervised owner retains the table after application startup" do
+      owner = Process.whereis(TableOwner)
+
+      assert is_pid(owner)
+      assert :ets.info(:ferricstore_active_files, :owner) == owner
+      assert is_pid(:ets.info(:ferricstore_active_files, :heir))
+    end
+
+    test "rows survive an active-file owner crash through the table heir" do
+      table = :ferricstore_active_files
+      table_id = :ets.whereis(table)
+      owner = Process.whereis(TableOwner)
+      path = "/tmp/active-file-owner-crash.log"
+
+      ActiveFile.publish(0, 82_001, path, "/tmp")
+
+      monitor = Process.monitor(owner)
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^owner, :killed}, 5_000
+
+      assert :ets.whereis(table) == table_id
+      assert {82_001, ^path, "/tmp"} = ActiveFile.get(0)
+
+      restarted_owner = await_restarted_owner(owner, 100)
+      assert is_pid(restarted_owner)
+      assert_owner_eventually(table, restarted_owner, 100)
+    end
+
     test "uses one instance-qualified key shape for the default instance" do
       ActiveFile.publish(0, 77_001, "/tmp/default-active.log", "/tmp")
 
@@ -226,5 +255,31 @@ defmodule Ferricstore.Store.ActiveFileTest do
       {:active_file_cache_generation, _value} -> Process.delete(:active_file_cache_generation)
       _ -> :ok
     end)
+  end
+
+  defp await_restarted_owner(_old_owner, 0), do: nil
+
+  defp await_restarted_owner(old_owner, attempts) do
+    case Process.whereis(TableOwner) do
+      pid when is_pid(pid) and pid != old_owner ->
+        pid
+
+      _missing ->
+        Process.sleep(10)
+        await_restarted_owner(old_owner, attempts - 1)
+    end
+  end
+
+  defp assert_owner_eventually(table, expected_owner, 0) do
+    assert :ets.info(table, :owner) == expected_owner
+  end
+
+  defp assert_owner_eventually(table, expected_owner, attempts) do
+    if :ets.info(table, :owner) == expected_owner do
+      :ok
+    else
+      Process.sleep(10)
+      assert_owner_eventually(table, expected_owner, attempts - 1)
+    end
   end
 end

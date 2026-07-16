@@ -4,9 +4,11 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
 
   alias Ferricstore.Raft.WARaftBackend.RuntimeSupervisor
   alias Ferricstore.Raft.WARaftSegmentReader.TableOwner, as: ApplyProjectionTableOwner
+  alias Ferricstore.Store.ActiveFile.TableOwner, as: ActiveFileTableOwner
   alias Ferricstore.Store.BlobStore
   alias Ferricstore.Store.BlobStore.TableOwner
 
+  @active_file_table_heir Ferricstore.Store.ActiveFile.TableHeir
   @table_heir Ferricstore.Store.BlobStore.TableHeir
   @apply_projection_table_heir Ferricstore.Raft.WARaftSegmentReader.TableHeir
 
@@ -58,6 +60,8 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
 
       assert Process.whereis(TableOwner) == nil
       assert Process.whereis(@table_heir) == nil
+      assert Process.whereis(ActiveFileTableOwner) == nil
+      assert Process.whereis(@active_file_table_heir) == nil
       assert Process.whereis(ApplyProjectionTableOwner) == nil
       assert Process.whereis(@apply_projection_table_heir) == nil
 
@@ -76,15 +80,20 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
       runtime = Process.whereis(RuntimeSupervisor)
       owner = Process.whereis(TableOwner)
       heir = Process.whereis(@table_heir)
+      active_file_owner = Process.whereis(ActiveFileTableOwner)
+      active_file_heir = Process.whereis(@active_file_table_heir)
       apply_projection_owner = Process.whereis(ApplyProjectionTableOwner)
       apply_projection_heir = Process.whereis(@apply_projection_table_heir)
 
       assert is_pid(runtime)
       assert is_pid(owner)
       assert is_pid(heir)
+      assert is_pid(active_file_owner)
+      assert is_pid(active_file_heir)
       assert is_pid(apply_projection_owner)
       assert is_pid(apply_projection_heir)
       assert Enum.any?(Supervisor.which_children(:kernel_sup), &(elem(&1, 1) == runtime))
+      assert :ets.info(:ferricstore_active_files, :owner) == active_file_owner
       assert :ets.info(:ferricstore_blob_store_locks, :owner) == owner
 
       assert :ets.info(:ferricstore_waraft_apply_projection_cache, :owner) ==
@@ -253,6 +262,7 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
         Process.whereis(:wa_raft_storage.registered_name(:ferricstore_waraft_backend, 1))
 
       old_apply_projection_owner = Process.whereis(ApplyProjectionTableOwner)
+      old_active_file_owner = Process.whereis(ActiveFileTableOwner)
       runtime_monitor = Process.monitor(runtime)
       storage_monitor = Process.monitor(old_storage)
 
@@ -263,17 +273,22 @@ defmodule Ferricstore.Store.BlobStoreTableOwnerTest do
       assert Process.whereis(RuntimeSupervisor) == nil
 
       app_apply_projection_owner = Process.whereis(ApplyProjectionTableOwner)
+      app_active_file_owner = Process.whereis(ActiveFileTableOwner)
 
       app_storage =
         Process.whereis(:wa_raft_storage.registered_name(:ferricstore_waraft_backend, 1))
 
       assert is_pid(app_apply_projection_owner)
       assert app_apply_projection_owner != old_apply_projection_owner
+      assert is_pid(app_active_file_owner)
+      assert app_active_file_owner != old_active_file_owner
       assert is_pid(app_storage)
       assert app_storage != old_storage
 
       assert :ets.info(:ferricstore_waraft_apply_projection_cache, :owner) ==
                app_apply_projection_owner
+
+      assert :ets.info(:ferricstore_active_files, :owner) == app_active_file_owner
     after
       if application_started?(:ferricstore) do
         _ = Application.stop(:ferricstore)

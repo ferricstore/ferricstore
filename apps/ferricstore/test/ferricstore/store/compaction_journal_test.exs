@@ -211,7 +211,14 @@ defmodule Ferricstore.Store.CompactionJournalTest do
       )
 
     new_locator = Locator.relocate!(old_locator, offset: 110, value_size: 60)
-    park = %{locator: old_locator, state_key: state_key, type: "job", state: "waiting"}
+
+    park = %{
+      locator: old_locator,
+      state_key: state_key,
+      type: "job",
+      state: "waiting",
+      due_at_ms: 900_000
+    }
 
     assert :ok =
              LMDB.write_batch(lmdb_path, [

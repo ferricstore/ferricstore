@@ -77,7 +77,10 @@ defmodule Ferricstore.Store.Shard.Info do
       end
 
       def handle_info({:start_compound_promotion, redis_key, type}, state) do
-        {:noreply, maybe_start_compound_promotion(state, redis_key, type)}
+        case Map.get(state.compound_promotion_pending, redis_key) do
+          ^type -> {:noreply, maybe_start_compound_promotion(state, redis_key, type)}
+          _cancelled_or_stale -> {:noreply, state}
+        end
       end
 
       def handle_info(
@@ -249,6 +252,13 @@ defmodule Ferricstore.Store.Shard.Info do
         {:noreply, sync_active_file_from_registry(state)}
       end
 
+      def handle_cast(
+            {:refresh_flush_marker_accounting, file_id, file_path},
+            state
+          ) do
+        {:noreply, refresh_active_file_size(state, file_id, file_path)}
+      end
+
       def handle_info(:drain_pending, state) do
         # Drain any pending writes from BEAM memory to the active file
         # (page cache only — NO fsync). BitcaskCheckpointer is responsible
@@ -369,10 +379,23 @@ defmodule Ferricstore.Store.Shard.Info do
         {:noreply, release_standalone_write_barrier(state)}
       end
 
-      def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
-        case ShardReads.handle_get_many_down(monitor_ref, state) do
-          {:handled, state} -> {:noreply, state}
-          :unhandled -> {:noreply, state}
+      def handle_info({:DOWN, monitor_ref, :process, owner_pid, _reason}, state) do
+        case Map.get(state.write_pause_monitors, monitor_ref) do
+          nil ->
+            case ShardReads.handle_get_many_down(monitor_ref, state) do
+              {:handled, state} -> {:noreply, state}
+              :unhandled -> {:noreply, state}
+            end
+
+          lease_ref ->
+            state =
+              release_write_pause_lease(
+                state,
+                {owner_pid, lease_ref},
+                false
+              )
+
+            {:noreply, state}
         end
       end
 
@@ -563,7 +586,10 @@ defmodule Ferricstore.Store.Shard.Info do
       defp refresh_active_file_size_after_compound_promotion(state, worker) do
         file_id = Map.get(worker, :active_file_id, state.active_file_id)
         file_path = Map.get(worker, :active_file_path, state.active_file_path)
+        refresh_active_file_size(state, file_id, file_path)
+      end
 
+      defp refresh_active_file_size(state, file_id, file_path) do
         case File.lstat(file_path) do
           {:ok, %File.Stat{type: :regular, size: size}}
           when is_integer(size) and size >= 0 ->
@@ -605,6 +631,46 @@ defmodule Ferricstore.Store.Shard.Info do
           {redis_key, type} -> maybe_start_compound_promotion(state, redis_key, type)
           nil -> state
         end
+      end
+
+      defp prepare_promoted_flush_state(state) do
+        state
+        |> cancel_compound_promotion_worker_for_flush()
+        |> cancel_promoted_compaction_worker_and_retries()
+        |> reply_all_compound_promotion_waiters(false)
+        |> Map.put(:compound_promotion_pending, %{})
+        |> Map.put(:promoted_compaction_pending, MapSet.new())
+        |> Map.put(:promoted_instances, %{})
+        |> tap(&Promotion.clear_compound_promotion_fences/1)
+      end
+
+      defp cancel_compound_promotion_worker_for_flush(%{compound_promotion_worker: nil} = state),
+        do: state
+
+      defp cancel_compound_promotion_worker_for_flush(
+             %{compound_promotion_worker: worker} = state
+           ) do
+        if Process.alive?(worker.pid) do
+          Process.unlink(worker.pid)
+          Process.exit(worker.pid, :kill)
+        end
+
+        await_compaction_worker_down(worker)
+        release_compound_promotion_worker_latches(worker)
+
+        state
+        |> sync_active_file_from_registry()
+        |> refresh_active_file_size_after_compound_promotion(worker)
+        |> Map.put(:compound_promotion_worker, nil)
+      end
+
+      defp reply_all_compound_promotion_waiters(state, promoted?) when is_boolean(promoted?) do
+        state.compound_promotion_waiters
+        |> Map.values()
+        |> List.flatten()
+        |> Enum.each(&GenServer.reply(&1, promoted?))
+
+        %{state | compound_promotion_waiters: %{}}
       end
 
       defp reply_compound_promotion_waiters(state, redis_key) do

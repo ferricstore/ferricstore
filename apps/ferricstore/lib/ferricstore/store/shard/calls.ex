@@ -779,20 +779,41 @@ defmodule Ferricstore.Store.Shard.Calls do
       # -------------------------------------------------------------------
       # handle_call — pause/resume writes for global flush barriers
       # -------------------------------------------------------------------
-      def handle_call({:pause_writes}, _from, state) do
-        state = drain_standalone_commits_for_sync(state)
-        state = await_in_flight(state)
-        state = flush_pending_sync(state)
-        state = %{state | writes_paused: true}
+      def handle_call({:pause_writes}, {owner_pid, _tag}, state) do
+        pause_standalone_writes(state, {owner_pid, make_ref()})
+      end
 
-        case state.last_flush_error do
+      def handle_call(
+            {:pause_writes, {owner_pid, lease_ref} = pause_lease},
+            _from,
+            state
+          )
+          when is_pid(owner_pid) and is_reference(lease_ref) do
+        pause_standalone_writes(state, pause_lease)
+      end
+
+      def handle_call({:pause_writes, _invalid_lease}, _from, state) do
+        {:reply, {:error, :invalid_write_pause_lease}, state}
+      end
+
+      def handle_call({:resume_writes}, {owner_pid, _tag}, state) do
+        case one_write_pause_lease(state, owner_pid) do
           nil -> {:reply, :ok, state}
-          reason -> {:reply, {:error, {:flush_failed, reason}}, state}
+          pause_lease -> {:reply, :ok, release_write_pause_lease(state, pause_lease, true)}
         end
       end
 
-      def handle_call({:resume_writes}, _from, state) do
-        {:reply, :ok, %{state | writes_paused: false}}
+      def handle_call(
+            {:resume_writes, {owner_pid, lease_ref} = pause_lease},
+            _from,
+            state
+          )
+          when is_pid(owner_pid) and is_reference(lease_ref) do
+        {:reply, :ok, release_write_pause_lease(state, pause_lease, true)}
+      end
+
+      def handle_call({:resume_writes, _invalid_lease}, _from, state) do
+        {:reply, {:error, :invalid_write_pause_lease}, state}
       end
 
       def handle_call(:enable_raft, _from, state) do
@@ -834,6 +855,99 @@ defmodule Ferricstore.Store.Shard.Calls do
       catch
         kind, reason ->
           {:reply, {:error, {kind, reason}}, state}
+      end
+
+      defp pause_standalone_writes(state, pause_lease) do
+        case acquire_write_pause_lease(state, pause_lease) do
+          {:existing, state} ->
+            write_pause_reply(state)
+
+          {:new, state} ->
+            state =
+              if map_size(state.write_pause_leases) == 1 do
+                state
+                |> drain_standalone_commits_for_sync()
+                |> await_in_flight()
+                |> flush_pending_sync()
+              else
+                state
+              end
+
+            state = %{state | writes_paused: true}
+
+            case state.last_flush_error do
+              nil ->
+                {:reply, :ok, state}
+
+              reason ->
+                state = release_write_pause_lease(state, pause_lease, true)
+                {:reply, {:error, {:flush_failed, reason}}, state}
+            end
+
+          {:error, reason, state} ->
+            {:reply, {:error, reason}, state}
+        end
+      end
+
+      defp write_pause_reply(state) do
+        case state.last_flush_error do
+          nil -> {:reply, :ok, state}
+          reason -> {:reply, {:error, {:flush_failed, reason}}, state}
+        end
+      end
+
+      defp acquire_write_pause_lease(
+             state,
+             {owner_pid, lease_ref}
+           ) do
+        case Map.get(state.write_pause_leases, lease_ref) do
+          nil ->
+            monitor_ref = Process.monitor(owner_pid)
+            lease = %{owner_pid: owner_pid, monitor_ref: monitor_ref}
+
+            {:new,
+             %{
+               state
+               | write_pause_leases: Map.put(state.write_pause_leases, lease_ref, lease),
+                 write_pause_monitors: Map.put(state.write_pause_monitors, monitor_ref, lease_ref)
+             }}
+
+          %{owner_pid: ^owner_pid} ->
+            {:existing, state}
+
+          _different_owner ->
+            {:error, :write_pause_lease_conflict, state}
+        end
+      end
+
+      defp release_write_pause_lease(
+             state,
+             {owner_pid, lease_ref},
+             demonitor?
+           ) do
+        case Map.get(state.write_pause_leases, lease_ref) do
+          %{owner_pid: ^owner_pid, monitor_ref: monitor_ref} ->
+            if demonitor?, do: Process.demonitor(monitor_ref, [:flush])
+
+            leases = Map.delete(state.write_pause_leases, lease_ref)
+
+            %{
+              state
+              | write_pause_leases: leases,
+                write_pause_monitors: Map.delete(state.write_pause_monitors, monitor_ref),
+                writes_paused: map_size(leases) > 0 or state.last_flush_error != nil
+            }
+
+          _missing_or_different_owner ->
+            state
+        end
+      end
+
+      defp one_write_pause_lease(state, owner_pid) do
+        Enum.find_value(state.write_pause_leases, fn
+          {lease_ref, %{owner_pid: ^owner_pid}} -> {owner_pid, lease_ref}
+          _other -> nil
+        end)
       end
 
       use Ferricstore.Store.Shard.Calls.Admin

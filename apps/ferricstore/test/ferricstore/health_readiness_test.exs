@@ -43,16 +43,27 @@ defmodule Ferricstore.HealthReadinessTest do
     end
 
     test "checks independent shard leaders concurrently" do
-      checker = fn _shard ->
-        Process.sleep(50)
+      parent = self()
+      gate = :atomics.new(1, signed: false)
+      expected_concurrency = min(8, max(System.schedulers_online(), 1))
+
+      checker = fn shard ->
+        send(parent, {:leader_check_started, shard})
+        await_gate(gate)
         true
       end
 
-      {elapsed_us, result} =
-        :timer.tc(fn -> Health.__check_raft_leaders_for_test__(8, checker) end)
+      check = Task.async(fn -> Health.__check_raft_leaders_for_test__(8, checker) end)
 
-      assert result
-      assert elapsed_us < 200_000
+      started =
+        for _ <- 1..expected_concurrency do
+          assert_receive {:leader_check_started, shard}, 2_000
+          shard
+        end
+
+      assert length(Enum.uniq(started)) == expected_concurrency
+      :atomics.put(gate, 1, 1)
+      assert Task.await(check, 2_000)
     end
 
     test "uses backend-aware membership lookup for readiness" do
@@ -63,7 +74,7 @@ defmodule Ferricstore.HealthReadinessTest do
       refute source =~ ":" <> "ra.members(",
              "health readiness must not bypass Ferricstore.Raft.Cluster.members/1 when WARaft is selected"
 
-      assert source =~ "Ferricstore.Raft.Cluster.members(i, 1_000)"
+      assert source =~ "Ferricstore.Raft.Cluster.members(shard_index, 1_000)"
     end
 
     test "returns :ok when system is fully ready" do
@@ -178,6 +189,15 @@ defmodule Ferricstore.HealthReadinessTest do
       # Can't really test this without restarting the app,
       # but verify the key exists after startup
       assert is_boolean(Health.ready?())
+    end
+  end
+
+  defp await_gate(gate) do
+    if :atomics.get(gate, 1) == 1 do
+      :ok
+    else
+      Process.sleep(1)
+      await_gate(gate)
     end
   end
 end

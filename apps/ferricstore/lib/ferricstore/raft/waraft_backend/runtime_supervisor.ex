@@ -4,9 +4,11 @@ defmodule Ferricstore.Raft.WARaftBackend.RuntimeSupervisor do
   use Supervisor
 
   alias Ferricstore.Raft.WARaftSegmentReader.TableOwner, as: ApplyProjectionTableOwner
+  alias Ferricstore.Store.ActiveFile.TableOwner, as: ActiveFileTableOwner
   alias Ferricstore.Store.BlobStore.TableOwner, as: BlobTableOwner
   alias Ferricstore.Store.ETSTableHeir
 
+  @active_file_table_heir Ferricstore.Store.ActiveFile.TableHeir
   @apply_projection_table_heir Ferricstore.Raft.WARaftSegmentReader.TableHeir
   @blob_table_heir Ferricstore.Store.BlobStore.TableHeir
   @kernel_child_id __MODULE__
@@ -41,6 +43,11 @@ defmodule Ferricstore.Raft.WARaftBackend.RuntimeSupervisor do
   @impl true
   def init(:ok) do
     children = [
+      Supervisor.child_spec(
+        {ETSTableHeir, name: @active_file_table_heir},
+        id: @active_file_table_heir
+      ),
+      ActiveFileTableOwner,
       Supervisor.child_spec(
         {ETSTableHeir, name: @blob_table_heir},
         id: @blob_table_heir
@@ -108,7 +115,8 @@ defmodule Ferricstore.Raft.WARaftBackend.RuntimeSupervisor do
   end
 
   defp ensure_tables do
-    with :ok <- BlobTableOwner.ensure_tables(),
+    with :ok <- ActiveFileTableOwner.ensure_table(),
+         :ok <- BlobTableOwner.ensure_tables(),
          :ok <- ApplyProjectionTableOwner.ensure_table() do
       :ok
     end

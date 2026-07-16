@@ -356,16 +356,22 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndexTest do
     assert_receive :writer_started
 
     observed =
-      Enum.reduce_while(1..50_000, MapSet.new(), fn _iteration, counts ->
+      Enum.reduce(1..50_000, MapSet.new(), fn _iteration, counts ->
         case LogicalKeyIndex.slot_count(ctx.ordered, ctx.slots) do
-          count when count in [0, 1] -> {:cont, MapSet.put(counts, count)}
-          inconsistent -> {:halt, {:inconsistent, inconsistent}}
+          count when count in [0, 1] ->
+            MapSet.put(counts, count)
+
+          {:error, :logical_key_index_busy} ->
+            MapSet.put(counts, :busy)
+
+          inconsistent ->
+            flunk("observed partially published logical-key index: #{inspect(inconsistent)}")
         end
       end)
 
     Task.await(writer, 10_000)
-    refute match?({:inconsistent, _reason}, observed)
-    assert MapSet.subset?(observed, MapSet.new([0, 1]))
+    assert MapSet.subset?(observed, MapSet.new([0, 1, :busy]))
+    assert 0 = LogicalKeyIndex.slot_count(ctx.ordered, ctx.slots)
   end
 
   test "rebuild fails closed on malformed keydir rows", ctx do

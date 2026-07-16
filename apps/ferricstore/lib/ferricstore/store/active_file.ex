@@ -18,15 +18,11 @@ defmodule Ferricstore.Store.ActiveFile do
   @table :ferricstore_active_files
 
   @doc """
-  Initializes the registry. Called once from Application.start.
+  Ensures the supervised active-file registry is available.
   """
-  @spec init(non_neg_integer()) :: :ok
+  @spec init(non_neg_integer()) :: :ok | {:error, :table_owner_unavailable}
   def init(_shard_count) do
-    if :ets.whereis(@table) == :undefined do
-      :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
-    end
-
-    :ok
+    Ferricstore.Store.ActiveFile.TableOwner.ensure_table()
   end
 
   @doc """

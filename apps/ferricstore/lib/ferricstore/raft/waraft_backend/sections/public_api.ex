@@ -8,6 +8,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       alias Ferricstore.NamespaceConfig
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Raft.CommandStamp
+      alias Ferricstore.Raft.MembershipGate
       alias Ferricstore.Raft.WARaftBackend.Batcher, as: NamespaceBatcher
       alias Ferricstore.Raft.WARaftBackend.BatcherSupervisor, as: NamespaceBatcherSupervisor
       alias Ferricstore.Raft.WARaftBackend.RuntimeSupervisor
@@ -573,6 +574,35 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
 
       def pause_writes_for_sync(shard_index, _timeout), do: invalid_shard_index_error(shard_index)
 
+      @spec pause_writes_for_sync(
+              non_neg_integer(),
+              SyncGate.pause_lease(),
+              timeout()
+            ) :: :ok | {:error, term()}
+      def pause_writes_for_sync(
+            shard_index,
+            {owner_pid, lease_ref} = pause_lease,
+            timeout
+          )
+          when valid_shard_index_shape(shard_index) and is_pid(owner_pid) and
+                 is_reference(lease_ref) do
+        with {:ok, gate_pid} <- SyncGate.pause(shard_index, pause_lease),
+             :ok <- NamespaceBatcher.flush(shard_index, timeout),
+             :ok <- SyncGate.await_drained(gate_pid, timeout),
+             :ok <- NamespaceBatcher.flush(shard_index, timeout),
+             :ok <- sync_pause_barrier(shard_index) do
+          :ok
+        else
+          {:error, reason} = error ->
+            _ = SyncGate.resume(shard_index, pause_lease, 5_000)
+            emit_sync_pause_failed(shard_index, reason)
+            error
+        end
+      end
+
+      def pause_writes_for_sync(shard_index, _pause_lease, _timeout),
+        do: invalid_shard_index_error(shard_index)
+
       @spec resume_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
       def resume_writes_for_sync(shard_index, timeout \\ 5_000)
 
@@ -582,6 +612,24 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       end
 
       def resume_writes_for_sync(shard_index, _timeout),
+        do: invalid_shard_index_error(shard_index)
+
+      @spec resume_writes_for_sync(
+              non_neg_integer(),
+              SyncGate.pause_lease(),
+              timeout()
+            ) :: :ok | {:error, term()}
+      def resume_writes_for_sync(
+            shard_index,
+            {owner_pid, lease_ref} = pause_lease,
+            timeout
+          )
+          when valid_shard_index_shape(shard_index) and is_pid(owner_pid) and
+                 is_reference(lease_ref) do
+        SyncGate.resume(shard_index, pause_lease, timeout)
+      end
+
+      def resume_writes_for_sync(shard_index, _pause_lease, _timeout),
         do: invalid_shard_index_error(shard_index)
 
       @spec pause_writes_for_sync_all(non_neg_integer(), timeout()) :: :ok | {:error, term()}
@@ -611,6 +659,40 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       def pause_writes_for_sync_all(shard_count, _timeout),
         do: {:error, {:invalid_shard_count, shard_count}}
 
+      @spec pause_writes_for_sync_all(
+              non_neg_integer(),
+              SyncGate.pause_lease(),
+              timeout()
+            ) :: :ok | {:error, term()}
+      def pause_writes_for_sync_all(0, {_owner_pid, _lease_ref}, _timeout), do: :ok
+
+      def pause_writes_for_sync_all(
+            shard_count,
+            {owner_pid, lease_ref} = pause_lease,
+            timeout
+          )
+          when is_integer(shard_count) and shard_count > 0 and is_pid(owner_pid) and
+                 is_reference(lease_ref) do
+        shard_indexes = Enum.to_list(0..(shard_count - 1))
+        deadline = sync_pause_deadline(timeout)
+
+        with {:ok, pauses} <- SyncGate.pause_many(shard_indexes, pause_lease),
+             :ok <- flush_sync_pause_batchers(shard_indexes, deadline),
+             :ok <- SyncGate.await_many_drained(pauses, sync_pause_remaining(deadline)),
+             :ok <- flush_sync_pause_batchers(shard_indexes, deadline),
+             :ok <- run_sync_pause_barriers(shard_indexes) do
+          :ok
+        else
+          {:error, reason} = error ->
+            _ = SyncGate.resume_many(shard_indexes, pause_lease, 5_000)
+            emit_sync_pause_failed(:all, reason)
+            error
+        end
+      end
+
+      def pause_writes_for_sync_all(shard_count, _pause_lease, _timeout),
+        do: {:error, {:invalid_shard_count, shard_count}}
+
       @spec resume_writes_for_sync_all(non_neg_integer(), timeout()) :: :ok | {:error, term()}
       def resume_writes_for_sync_all(shard_count, timeout \\ 5_000)
 
@@ -622,6 +704,26 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
       end
 
       def resume_writes_for_sync_all(shard_count, _timeout),
+        do: {:error, {:invalid_shard_count, shard_count}}
+
+      @spec resume_writes_for_sync_all(
+              non_neg_integer(),
+              SyncGate.pause_lease(),
+              timeout()
+            ) :: :ok | {:error, term()}
+      def resume_writes_for_sync_all(0, {_owner_pid, _lease_ref}, _timeout), do: :ok
+
+      def resume_writes_for_sync_all(
+            shard_count,
+            {owner_pid, lease_ref} = pause_lease,
+            timeout
+          )
+          when is_integer(shard_count) and shard_count > 0 and is_pid(owner_pid) and
+                 is_reference(lease_ref) do
+        SyncGate.resume_many(Enum.to_list(0..(shard_count - 1)), pause_lease, timeout)
+      end
+
+      def resume_writes_for_sync_all(shard_count, _pause_lease, _timeout),
         do: {:error, {:invalid_shard_count, shard_count}}
 
       @doc false
@@ -1149,7 +1251,9 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
             redirect_add_member(leader_node, shard_index, node_name, timeout_ms, redirects_left)
 
           _other ->
-            add_member_local(shard_index, node_name, timeout_ms)
+            MembershipGate.with_membership_change(fn ->
+              add_member_local(shard_index, node_name, timeout_ms)
+            end)
         end
       end
 
@@ -1191,7 +1295,9 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
             )
 
           _other ->
-            add_participant_local(shard_index, node_name, timeout_ms)
+            MembershipGate.with_membership_change(fn ->
+              add_participant_local(shard_index, node_name, timeout_ms)
+            end)
         end
       end
 

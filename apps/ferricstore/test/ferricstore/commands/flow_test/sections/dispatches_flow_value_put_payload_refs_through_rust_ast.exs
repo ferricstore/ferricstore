@@ -49,7 +49,7 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
                      id_a,
                      "tenant-a",
                      id_b,
-                     "tenant-b"
+                     "tenant-a"
                    ],
                    MockStore.make()
                  )

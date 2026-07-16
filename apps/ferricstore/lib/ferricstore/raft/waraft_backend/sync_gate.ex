@@ -8,6 +8,10 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   @pause_key {__MODULE__, :pause}
 
   @type token :: {non_neg_integer(), :atomics.atomics_ref()}
+  @type pause_lease :: {pid(), reference()}
+
+  @spec lease(pid()) :: pause_lease()
+  def lease(owner_pid \\ self()) when is_pid(owner_pid), do: {owner_pid, make_ref()}
 
   @spec init_shards(pos_integer()) :: :ok
   def init_shards(shard_count) when is_integer(shard_count) and shard_count > 0 do
@@ -144,14 +148,27 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   @spec pause(non_neg_integer()) :: {:ok, pid()} | {:error, term()}
   def pause(shard_index) when is_integer(shard_index) and shard_index >= 0 do
-    case GenServer.start_link(__MODULE__, shard_index, name: name(shard_index)) do
+    case GenServer.start(__MODULE__, {:legacy, shard_index}, name: name(shard_index)) do
       {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> acquire_existing_pause(shard_index, pid)
+      {:error, {:already_started, pid}} -> acquire_existing_legacy_pause(shard_index, pid)
       {:error, reason} -> {:error, reason}
     end
   end
 
   def pause(shard_index), do: {:error, {:invalid_shard_index, shard_index}}
+
+  @spec pause(non_neg_integer(), pause_lease()) :: {:ok, pid()} | {:error, term()}
+  def pause(shard_index, {owner_pid, lease_ref} = pause_lease)
+      when is_integer(shard_index) and shard_index >= 0 and is_pid(owner_pid) and
+             is_reference(lease_ref) do
+    case GenServer.start(__MODULE__, {shard_index, pause_lease}, name: name(shard_index)) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> acquire_existing_pause(shard_index, pid, pause_lease)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def pause(shard_index, _pause_lease), do: {:error, {:invalid_shard_index, shard_index}}
 
   @spec pause_many([non_neg_integer()]) ::
           {:ok, [{non_neg_integer(), pid()}]} | {:error, term()}
@@ -175,6 +192,31 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   end
 
   def pause_many(shard_indexes), do: {:error, {:invalid_shard_indexes, shard_indexes}}
+
+  @spec pause_many([non_neg_integer()], pause_lease()) ::
+          {:ok, [{non_neg_integer(), pid()}]} | {:error, term()}
+  def pause_many(shard_indexes, {owner_pid, lease_ref} = pause_lease)
+      when is_list(shard_indexes) and is_pid(owner_pid) and is_reference(lease_ref) do
+    shard_indexes
+    |> Enum.uniq()
+    |> Enum.reduce_while({:ok, []}, fn shard_index, {:ok, paused} ->
+      case pause(shard_index, pause_lease) do
+        {:ok, pid} ->
+          {:cont, {:ok, [{shard_index, pid} | paused]}}
+
+        {:error, reason} ->
+          _ = resume_many(Enum.map(paused, &elem(&1, 0)), pause_lease, 5_000)
+          {:halt, {:error, {:sync_pause_many_failed, shard_index, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, paused} -> {:ok, Enum.reverse(paused)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def pause_many(shard_indexes, _pause_lease),
+    do: {:error, {:invalid_shard_indexes, shard_indexes}}
 
   @spec await_many_drained([{non_neg_integer(), pid()}], timeout()) :: :ok | {:error, term()}
   def await_many_drained(pauses, timeout) when is_list(pauses) do
@@ -211,6 +253,30 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   def resume_many(shard_indexes, _timeout),
     do: {:error, {:invalid_shard_indexes, shard_indexes}}
 
+  @spec resume_many([non_neg_integer()], pause_lease(), timeout()) :: :ok | {:error, term()}
+  def resume_many(shard_indexes, {owner_pid, lease_ref} = pause_lease, timeout)
+      when is_list(shard_indexes) and is_pid(owner_pid) and is_reference(lease_ref) do
+    deadline = sync_gate_deadline(timeout)
+
+    failures =
+      shard_indexes
+      |> Enum.uniq()
+      |> Enum.reduce([], fn shard_index, failures ->
+        case resume(shard_index, pause_lease, sync_gate_remaining(deadline)) do
+          :ok -> failures
+          {:error, reason} -> [{shard_index, reason} | failures]
+        end
+      end)
+
+    case Enum.reverse(failures) do
+      [] -> :ok
+      failures -> {:error, {:sync_resume_many_failed, failures}}
+    end
+  end
+
+  def resume_many(shard_indexes, _pause_lease, _timeout),
+    do: {:error, {:invalid_shard_indexes, shard_indexes}}
+
   @spec paused?(non_neg_integer()) :: boolean()
   def paused?(shard_index) when is_integer(shard_index) and shard_index >= 0,
     do: is_pid(pause_pid(shard_index))
@@ -232,8 +298,8 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
     GenServer.call(pid, :await_drained, timeout)
   catch
     :exit, {:timeout, _} -> {:error, :sync_pause_drain_timeout}
-    :exit, {:noproc, _} -> :ok
-    :exit, {:normal, _} -> :ok
+    :exit, {:noproc, _} -> {:error, :sync_pause_released}
+    :exit, {:normal, _} -> {:error, :sync_pause_released}
     :exit, reason -> {:error, {:sync_pause_drain_failed, reason}}
   end
 
@@ -248,6 +314,23 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
     :exit, {:normal, _} -> :ok
     :exit, reason -> {:error, {:sync_pause_resume_failed, reason}}
   end
+
+  @spec resume(non_neg_integer(), pause_lease(), timeout()) :: :ok | {:error, term()}
+  def resume(shard_index, {owner_pid, lease_ref} = pause_lease, timeout)
+      when is_integer(shard_index) and shard_index >= 0 and is_pid(owner_pid) and
+             is_reference(lease_ref) do
+    case Process.whereis(name(shard_index)) do
+      nil -> :ok
+      _pid -> GenServer.call(name(shard_index), {:resume, pause_lease}, timeout)
+    end
+  catch
+    :exit, {:noproc, _} -> :ok
+    :exit, {:normal, _} -> :ok
+    :exit, reason -> {:error, {:sync_pause_resume_failed, reason}}
+  end
+
+  def resume(shard_index, _pause_lease, _timeout),
+    do: {:error, {:invalid_shard_index, shard_index}}
 
   @spec force_resume(non_neg_integer(), timeout()) :: :ok | {:error, term()}
   def force_resume(shard_index, timeout \\ 5_000)
@@ -269,17 +352,30 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   def name(shard_index), do: :"ferricstore_waraft_sync_gate_#{shard_index}"
 
   @impl true
-  def init(shard_index) do
-    counters = ensure_state(shard_index)
-    :persistent_term.put(pause_key(shard_index), self())
+  def init({:legacy, shard_index}) do
+    state = initial_pause_state(shard_index)
+    {:ok, %{state | legacy_holds: 1}}
+  end
 
-    {:ok,
-     %{shard_index: shard_index, counters: counters, waiters: [], drain_waiters: [], holds: 1}}
+  def init({shard_index, pause_lease}) do
+    state = initial_pause_state(shard_index)
+
+    case add_pause_lease(state, pause_lease) do
+      {:ok, state} -> {:ok, state}
+      {:error, reason} -> {:stop, reason}
+    end
   end
 
   @impl true
-  def handle_call(:acquire, _from, state) do
-    {:reply, :ok, %{state | holds: state.holds + 1}}
+  def handle_call(:acquire_legacy, _from, state) do
+    {:reply, :ok, %{state | legacy_holds: state.legacy_holds + 1}}
+  end
+
+  def handle_call({:acquire, pause_lease}, _from, state) do
+    case add_pause_lease(state, pause_lease) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:await, from, state) do
@@ -294,28 +390,66 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
     end
   end
 
-  def handle_call(:resume, _from, %{holds: holds} = state) when holds > 1 do
-    {:reply, :ok, %{state | holds: holds - 1}}
+  def handle_call(:resume, _from, %{legacy_holds: legacy_holds} = state)
+      when legacy_holds > 0 do
+    state = %{state | legacy_holds: legacy_holds - 1}
+    maybe_release_pause(state)
   end
 
-  def handle_call(:resume, _from, state) do
-    release_pause(state)
+  def handle_call(:resume, _from, state), do: {:reply, :ok, state}
+
+  def handle_call({:resume, pause_lease}, _from, state) do
+    state = remove_pause_lease(state, pause_lease)
+    maybe_release_pause(state)
   end
 
   def handle_call(:force_resume, _from, state) do
+    state = demonitor_pause_owners(state)
     release_pause(state)
   end
 
   defp release_pause(state) do
     unpublish_pause(state.shard_index)
     Enum.each(state.waiters, &GenServer.reply(&1, :ok))
+    Enum.each(state.drain_waiters, &GenServer.reply(&1, {:error, :sync_pause_released}))
     {:stop, :normal, :ok, %{state | waiters: []}}
   end
+
+  defp maybe_release_pause(%{legacy_holds: 0, leases: leases} = state)
+       when map_size(leases) == 0,
+       do: release_pause(state)
+
+  defp maybe_release_pause(state), do: {:reply, :ok, state}
 
   @impl true
   def handle_cast(:drained, state) do
     state = maybe_reply_drained(state)
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, monitor_ref, :process, owner_pid, _reason}, state) do
+    case Map.get(state.monitor_owners, monitor_ref) do
+      ^owner_pid ->
+        state = remove_owner_leases(state, owner_pid, false)
+
+        if state.legacy_holds == 0 and map_size(state.leases) == 0 do
+          unpublish_pause(state.shard_index)
+          Enum.each(state.waiters, &GenServer.reply(&1, :ok))
+
+          Enum.each(
+            state.drain_waiters,
+            &GenServer.reply(&1, {:error, :sync_pause_released})
+          )
+
+          {:stop, :normal, %{state | waiters: [], drain_waiters: []}}
+        else
+          {:noreply, state}
+        end
+
+      _unknown_monitor ->
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -382,8 +516,24 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
     )
   end
 
-  defp acquire_existing_pause(shard_index, pid) do
-    case GenServer.call(pid, :acquire, 5_000) do
+  defp initial_pause_state(shard_index) do
+    counters = ensure_state(shard_index)
+    :persistent_term.put(pause_key(shard_index), self())
+
+    %{
+      shard_index: shard_index,
+      counters: counters,
+      waiters: [],
+      drain_waiters: [],
+      legacy_holds: 0,
+      leases: %{},
+      owners: %{},
+      monitor_owners: %{}
+    }
+  end
+
+  defp acquire_existing_legacy_pause(shard_index, pid) do
+    case GenServer.call(pid, :acquire_legacy, 5_000) do
       :ok -> {:ok, pid}
       other -> {:error, {:sync_pause_acquire_failed, other}}
     end
@@ -391,6 +541,113 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
     :exit, {:noproc, _} -> pause(shard_index)
     :exit, {:normal, _} -> pause(shard_index)
     :exit, reason -> {:error, {:sync_pause_acquire_failed, reason}}
+  end
+
+  defp acquire_existing_pause(shard_index, pid, pause_lease) do
+    case GenServer.call(pid, {:acquire, pause_lease}, 5_000) do
+      :ok -> {:ok, pid}
+      {:error, reason} -> {:error, {:sync_pause_acquire_failed, reason}}
+      other -> {:error, {:sync_pause_acquire_failed, other}}
+    end
+  catch
+    :exit, {:noproc, _} -> pause(shard_index, pause_lease)
+    :exit, {:normal, _} -> pause(shard_index, pause_lease)
+    :exit, reason -> {:error, {:sync_pause_acquire_failed, reason}}
+  end
+
+  defp add_pause_lease(
+         state,
+         {owner_pid, lease_ref}
+       )
+       when is_pid(owner_pid) and is_reference(lease_ref) do
+    case Map.get(state.leases, lease_ref) do
+      nil ->
+        {owner, monitor_owners} =
+          case Map.get(state.owners, owner_pid) do
+            nil ->
+              monitor_ref = Process.monitor(owner_pid)
+
+              {%{monitor_ref: monitor_ref, leases: MapSet.new()},
+               Map.put(state.monitor_owners, monitor_ref, owner_pid)}
+
+            owner ->
+              {owner, state.monitor_owners}
+          end
+
+        owner = %{owner | leases: MapSet.put(owner.leases, lease_ref)}
+
+        {:ok,
+         %{
+           state
+           | leases: Map.put(state.leases, lease_ref, owner_pid),
+             owners: Map.put(state.owners, owner_pid, owner),
+             monitor_owners: monitor_owners
+         }}
+
+      ^owner_pid ->
+        {:ok, state}
+
+      _different_owner ->
+        {:error, :sync_pause_lease_conflict}
+    end
+  end
+
+  defp add_pause_lease(_state, _pause_lease), do: {:error, :invalid_sync_pause_lease}
+
+  defp remove_pause_lease(state, {owner_pid, lease_ref})
+       when is_pid(owner_pid) and is_reference(lease_ref) do
+    case Map.get(state.leases, lease_ref) do
+      ^owner_pid ->
+        leases = Map.delete(state.leases, lease_ref)
+        owner = Map.fetch!(state.owners, owner_pid)
+        owner_leases = MapSet.delete(owner.leases, lease_ref)
+
+        if MapSet.size(owner_leases) == 0 do
+          Process.demonitor(owner.monitor_ref, [:flush])
+
+          %{
+            state
+            | leases: leases,
+              owners: Map.delete(state.owners, owner_pid),
+              monitor_owners: Map.delete(state.monitor_owners, owner.monitor_ref)
+          }
+        else
+          owner = %{owner | leases: owner_leases}
+          %{state | leases: leases, owners: Map.put(state.owners, owner_pid, owner)}
+        end
+
+      _missing_or_different_owner ->
+        state
+    end
+  end
+
+  defp remove_pause_lease(state, _pause_lease), do: state
+
+  defp remove_owner_leases(state, owner_pid, demonitor?) do
+    case Map.get(state.owners, owner_pid) do
+      nil ->
+        state
+
+      owner ->
+        if demonitor?, do: Process.demonitor(owner.monitor_ref, [:flush])
+
+        leases = Enum.reduce(owner.leases, state.leases, &Map.delete(&2, &1))
+
+        %{
+          state
+          | leases: leases,
+            owners: Map.delete(state.owners, owner_pid),
+            monitor_owners: Map.delete(state.monitor_owners, owner.monitor_ref)
+        }
+    end
+  end
+
+  defp demonitor_pause_owners(state) do
+    Enum.each(state.owners, fn {_owner_pid, owner} ->
+      Process.demonitor(owner.monitor_ref, [:flush])
+    end)
+
+    %{state | legacy_holds: 0, leases: %{}, owners: %{}, monitor_owners: %{}}
   end
 
   defp pause_pid(shard_index) do

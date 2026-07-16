@@ -382,8 +382,16 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
 
             assert :ok =
                      LMDB.write_batch(lmdb_path, [
-                       {:put, park_key1, LMDB.encode_cold_park(locator1, state_key: key1)},
-                       {:put, park_key2, LMDB.encode_cold_park(locator2, state_key: key2)},
+                       {:put, park_key1,
+                        LMDB.encode_cold_park(locator1,
+                          state_key: key1,
+                          due_at_ms: 900_000
+                        )},
+                       {:put, park_key2,
+                        LMDB.encode_cold_park(locator2,
+                          state_key: key2,
+                          due_at_ms: 900_000
+                        )},
                        {:put, reverse_key1, park_key1},
                        {:put, reverse_key2, park_key2}
                      ])
@@ -511,7 +519,12 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
 
             park_key = LMDB.cold_park_key_for_state_key(state_key)
             reverse_key = LMDB.cold_by_segment_key(locator)
-            encoded_park = LMDB.encode_cold_park(locator, state_key: state_key)
+
+            encoded_park =
+              LMDB.encode_cold_park(locator,
+                state_key: state_key,
+                due_at_ms: 900_000
+              )
 
             assert :ok =
                      LMDB.write_batch(lmdb_path, [
@@ -583,7 +596,11 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
               :ok = :file.close(file)
             end
 
-            assert {:error, {:compaction_failed, [{0, {:copy_failed, reason}}]}} =
+            assert {:error,
+                    {:compaction_failed,
+                     [
+                       {0, {:compaction_plan_failed, {:source_scan_failed, reason}}}
+                     ]}} =
                      GenServer.call(pid, {:run_compaction, [0]})
 
             assert value_size == byte_size(value)

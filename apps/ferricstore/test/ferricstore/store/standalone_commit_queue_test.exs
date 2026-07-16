@@ -368,7 +368,99 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
     :sys.replace_state(pid, &Map.put(&1, :last_flush_error, :synthetic_eio))
 
     assert {:error, {:flush_failed, :synthetic_eio}} = GenServer.call(pid, {:pause_writes})
-    assert %{writes_paused: true, last_flush_error: :synthetic_eio} = :sys.get_state(pid)
+
+    assert %{
+             writes_paused: true,
+             last_flush_error: :synthetic_eio,
+             write_pause_leases: leases
+           } = :sys.get_state(pid)
+
+    assert map_size(leases) == 0
+  end
+
+  test "failed pause owner death keeps durability failure paused without leaking its lease" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+    parent = self()
+
+    :sys.replace_state(pid, &Map.put(&1, :last_flush_error, :synthetic_eio))
+
+    owner =
+      spawn(fn ->
+        lease = {self(), make_ref()}
+
+        send(
+          parent,
+          {:failed_pause_result, GenServer.call(pid, {:pause_writes, lease})}
+        )
+
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:failed_pause_result, {:error, {:flush_failed, :synthetic_eio}}}, 1_000
+
+    assert %{writes_paused: true, write_pause_leases: leases} = :sys.get_state(pid)
+    assert map_size(leases) == 0
+
+    Process.exit(owner, :kill)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+
+             state.writes_paused and state.last_flush_error == :synthetic_eio and
+               map_size(state.write_pause_leases) == 0
+           end)
+  end
+
+  test "pause lease owner death releases only its standalone shard hold" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+    owner_lease = {owner, make_ref()}
+    nested_lease = {self(), make_ref()}
+
+    assert :ok = GenServer.call(pid, {:pause_writes, owner_lease})
+    assert :ok = GenServer.call(pid, {:pause_writes, nested_lease})
+    assert :ok = GenServer.call(pid, {:pause_writes, nested_lease})
+
+    unrelated_resume = Task.async(fn -> GenServer.call(pid, {:resume_writes}) end)
+    assert :ok = Task.await(unrelated_resume, 1_000)
+    assert :sys.get_state(pid).writes_paused
+
+    Process.exit(owner, :kill)
+
+    assert eventually(fn ->
+             state = :sys.get_state(pid)
+             state.writes_paused and map_size(state.write_pause_leases) == 1
+           end)
+
+    assert :ok = GenServer.call(pid, {:resume_writes, owner_lease})
+    assert :ok = GenServer.call(pid, {:resume_writes, owner_lease})
+    assert :sys.get_state(pid).writes_paused
+
+    assert :ok = GenServer.call(pid, {:resume_writes, nested_lease})
+    refute :sys.get_state(pid).writes_paused
+  end
+
+  test "sole pause lease owner death resumes standalone shard writes" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        lease = {self(), make_ref()}
+        send(parent, {:standalone_pause_acquired, GenServer.call(pid, {:pause_writes, lease})})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:standalone_pause_acquired, :ok}, 1_000
+    Process.exit(owner, :kill)
+
+    assert eventually(fn -> not :sys.get_state(pid).writes_paused end)
+    assert :ok = GenServer.call(pid, {:put, "pause-owner-down", "value", 0})
+    assert "value" == GenServer.call(pid, {:get, "pause-owner-down"})
   end
 
   defp start_shard(opts) do
@@ -405,6 +497,19 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
     FerricStore.Instance.cleanup(ctx.name)
     File.rm_rf!(data_dir)
   end
+
+  defp eventually(fun, attempts \\ 50)
+
+  defp eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(fun, attempts - 1)
+    end
+  end
+
+  defp eventually(_fun, 0), do: false
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)

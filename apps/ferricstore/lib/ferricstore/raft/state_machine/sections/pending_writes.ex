@@ -94,6 +94,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
           maybe_queue_lmdb_flow_blob_value_put(state, key, encoded_ref, expire_at_ms)
           :ok
         else
+          materialize_pending_fast_deletes(state)
           record_pending_original(state, key)
 
           unless standalone_staged_apply?() do
@@ -123,6 +124,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
           maybe_queue_lmdb_flow_blob_value_put(state, key, encoded_ref, expire_at_ms)
           :ok
         else
+          materialize_pending_fast_deletes(state)
           record_pending_original(state, key)
 
           unless standalone_staged_apply?() do
@@ -146,6 +148,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       defp put_pending_value(key, value, expire_at_ms) do
         pending_values = Process.get(:sm_pending_values, %{})
         Process.put(:sm_pending_values, Map.put(pending_values, key, {value, expire_at_ms}))
+      end
+
+      defp materialize_pending_fast_deletes(state) do
+        if Process.get(:sm_pending_fast_delete_batch) == true do
+          :sm_pending_unmaterialized_fast_delete_keys
+          |> Process.put([])
+          |> Enum.each(fn key ->
+            record_pending_original(state, key)
+            track_keydir_binary_remove(state, key)
+            :ets.delete(state.ets, key)
+            maybe_queue_lmdb_state_delete(state, key)
+          end)
+
+          Process.put(:sm_pending_fast_delete_batch, false)
+        end
+
+        :ok
       end
 
       defp materialize_blob_ref(state, encoded_ref) when is_binary(encoded_ref) do
@@ -382,6 +401,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       @doc false
       def __safe_ets_select_page_for_test__(table, match_spec, limit) do
         safe_ets_select_page(table, match_spec, limit)
+      end
+
+      @doc false
+      def __materialize_pending_fast_deletes_for_test__(
+            state,
+            pending_writes,
+            unmaterialized_keys
+          )
+          when is_list(pending_writes) and is_list(unmaterialized_keys) do
+        Process.put(:sm_pending_writes, pending_writes)
+        Process.put(:sm_pending_unmaterialized_fast_delete_keys, unmaterialized_keys)
+        Process.put(:sm_pending_fast_delete_batch, true)
+        Process.put(:sm_pending_originals, %{})
+
+        try do
+          :ok = materialize_pending_fast_deletes(state)
+          {:ok, map_size(Process.get(:sm_pending_originals, %{}))}
+        after
+          Process.delete(:sm_pending_writes)
+          Process.delete(:sm_pending_unmaterialized_fast_delete_keys)
+          Process.delete(:sm_pending_fast_delete_batch)
+          Process.delete(:sm_pending_originals)
+        end
       end
 
       defp normalize_flow_native_ops([], _state), do: []

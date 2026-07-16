@@ -8,6 +8,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
       alias Ferricstore.NamespaceConfig
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Raft.CommandStamp
+      alias Ferricstore.Raft.MembershipGate
       alias Ferricstore.Raft.WARaftBackend.Batcher, as: NamespaceBatcher
       alias Ferricstore.Raft.WARaftBackend.BatcherSupervisor, as: NamespaceBatcherSupervisor
       alias Ferricstore.Raft.WARaftBackend.SyncGate
@@ -710,7 +711,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
       end
 
       defp commit_config_or_redirect(shard_index, action, node_name, timeout_ms, redirects_left) do
-        case commit_config(shard_index, action, node_name, timeout_ms) do
+        result =
+          MembershipGate.with_membership_change(fn ->
+            commit_config(shard_index, action, node_name, timeout_ms)
+          end)
+
+        case result do
           {:error, _reason} = error ->
             maybe_redirect_config(
               error,
@@ -956,13 +962,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
       defp normalize_identity(other), do: other
 
       defp ensure_participant(shard_index, node_name, timeout_ms) do
-        case commit_config_or_redirect(
-               shard_index,
-               :add_participant,
-               node_name,
-               timeout_ms,
-               @config_redirects
-             ) do
+        case commit_config(shard_index, :add_participant, node_name, timeout_ms) do
           {:ok, _position} ->
             wait_storage_participant(shard_index, node_name, timeout_ms)
 
@@ -984,12 +984,11 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
       end
 
       defp promote_participant(shard_index, node_name, timeout_ms) do
-        case commit_config_or_redirect(
+        case commit_config(
                shard_index,
                :promote_participant_if_ready,
                node_name,
-               timeout_ms,
-               @config_redirects
+               timeout_ms
              ) do
           {:ok, position} ->
             with :ok <- wait_storage_member(shard_index, node_name, timeout_ms) do

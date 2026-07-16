@@ -925,6 +925,305 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
     assert :ok = Ferricstore.Flow.Governance.LimitCache.clear()
   end
 
+  test "cache drain owner death releases the flush fence" do
+    ctx = FerricStore.Instance.get(:default)
+    parent = self()
+
+    {drain_pid, drain_monitor} =
+      spawn_monitor(fn ->
+        Ferricstore.Flow.Governance.LimitCache.with_drained_cache(
+          ctx,
+          fn ->
+            send(parent, {:cache_drain_owner_started, self()})
+            Process.sleep(:infinity)
+          end,
+          now_ms: 1_000
+        )
+      end)
+
+    assert_receive {:cache_drain_owner_started, ^drain_pid}, 2_000
+    Process.exit(drain_pid, :kill)
+    assert_receive {:DOWN, ^drain_monitor, :process, ^drain_pid, :killed}, 2_000
+
+    assert eventually(
+             fn ->
+               Ferricstore.Flow.Governance.LimitCache.with_drained_cache(
+                 ctx,
+                 fn -> :recovered end,
+                 now_ms: 1_001
+               ) == :recovered
+             end,
+             timeout: 1_000
+           ),
+           "cache drain fence remained active after its owner died"
+  end
+
+  test "cache drain owner death releases entries detached before durable release" do
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
+
+    scope = unique_flow_id("cache-drain-detached-owner-death")
+    lease_limit!(scope, 4)
+    ctx = FerricStore.Instance.get(:default)
+    parent = self()
+
+    assert {:ok, %{reservation_ids: [_active_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
+               shard_id: 0,
+               amount: 1,
+               ttl_ms: 1_000,
+               now_ms: 1_001
+             )
+
+    {drain_pid, drain_monitor} =
+      spawn_monitor(fn ->
+        Ferricstore.Flow.Governance.LimitCache.flush(ctx,
+          now_ms: 1_002,
+          release_fun: fn _release_ctx, _release_scope, release_opts ->
+            send(
+              parent,
+              {:detached_cache_release_started, self(), release_opts[:reservation_ids]}
+            )
+
+            Process.sleep(:infinity)
+          end
+        )
+      end)
+
+    assert_receive {:detached_cache_release_started, ^drain_pid, detached_ids}, 2_000
+    assert length(detached_ids) == 3
+
+    Process.exit(drain_pid, :kill)
+    assert_receive {:DOWN, ^drain_monitor, :process, ^drain_pid, :killed}, 2_000
+
+    assert eventually(
+             fn ->
+               case FerricStore.flow_limit_get(scope, now_ms: 1_003) do
+                 {:ok, owner} -> owner.leases[0].in_use == 1
+                 _other -> false
+               end
+             end,
+             timeout: 2_000
+           ),
+           "detached cached reservations remained durably in use after their owner died"
+  end
+
+  test "pending cache-page release runs outside the cache server and survives owner death" do
+    old_multiplier =
+      Application.get_env(:ferricstore, :flow_governance_limit_cache_multiplier)
+
+    old_max_chunk =
+      Application.get_env(:ferricstore, :flow_governance_limit_cache_max_chunk)
+
+    old_page_size =
+      Application.get_env(:ferricstore, :flow_governance_cache_session_page_size)
+
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_multiplier, 6)
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_max_chunk, 6)
+    Application.put_env(:ferricstore, :flow_governance_cache_session_page_size, 2)
+
+    on_exit(fn ->
+      restore_env(:flow_governance_limit_cache_multiplier, old_multiplier)
+      restore_env(:flow_governance_limit_cache_max_chunk, old_max_chunk)
+      restore_env(:flow_governance_cache_session_page_size, old_page_size)
+    end)
+
+    scope = unique_flow_id("cache-drain-pending-owner-death")
+    lease_limit!(scope, 6)
+    ctx = FerricStore.Instance.get(:default)
+    parent = self()
+    release_calls = :atomics.new(1, signed: false)
+
+    assert {:ok, %{reservation_ids: [_active_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
+               shard_id: 0,
+               amount: 1,
+               ttl_ms: 10_000,
+               now_ms: 1_001
+             )
+
+    {drain_pid, drain_monitor} =
+      spawn_monitor(fn ->
+        Ferricstore.Flow.Governance.LimitCache.flush(ctx,
+          now_ms: 1_002,
+          release_fun: fn release_ctx, release_scope, release_opts ->
+            case :atomics.add_get(release_calls, 1, 1) do
+              call when call in [1, 2] ->
+                Ferricstore.Flow.Governance.LimitStore.release(
+                  release_ctx,
+                  release_scope,
+                  release_opts
+                )
+
+              _pending_call ->
+                send(
+                  parent,
+                  {:pending_cache_page_release_started, self(), release_opts[:reservation_ids]}
+                )
+
+                receive do
+                  :unblock_pending_cache_page_release ->
+                    {:error, :test_release_unblocked}
+                end
+            end
+          end
+        )
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(drain_pid), do: Process.exit(drain_pid, :kill)
+    end)
+
+    assert_receive {:pending_cache_page_release_started, release_pid, pending_ids}, 2_000
+    assert pending_ids != []
+
+    if release_pid != drain_pid do
+      send(release_pid, :unblock_pending_cache_page_release)
+    end
+
+    assert release_pid == drain_pid
+
+    Process.exit(drain_pid, :kill)
+    assert_receive {:DOWN, ^drain_monitor, :process, ^drain_pid, :killed}, 2_000
+
+    assert eventually(
+             fn ->
+               case FerricStore.flow_limit_get(scope, now_ms: 1_003) do
+                 {:ok, owner} -> owner.leases[0].in_use == 1
+                 _other -> false
+               end
+             end,
+             timeout: 2_000
+           ),
+           "pending cache pages remained durably in use after their drain owner died"
+  end
+
+  test "cache drain quarantines a page when durable release succeeds before discard fails" do
+    old_multiplier =
+      Application.get_env(:ferricstore, :flow_governance_limit_cache_multiplier)
+
+    old_max_chunk =
+      Application.get_env(:ferricstore, :flow_governance_limit_cache_max_chunk)
+
+    old_page_size =
+      Application.get_env(:ferricstore, :flow_governance_cache_session_page_size)
+
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_multiplier, 6)
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_max_chunk, 6)
+    Application.put_env(:ferricstore, :flow_governance_cache_session_page_size, 2)
+
+    on_exit(fn ->
+      restore_env(:flow_governance_limit_cache_multiplier, old_multiplier)
+      restore_env(:flow_governance_limit_cache_max_chunk, old_max_chunk)
+      restore_env(:flow_governance_cache_session_page_size, old_page_size)
+    end)
+
+    scope = unique_flow_id("cache-drain-discard-failure")
+    lease_limit!(scope, 6)
+    ctx = FerricStore.Instance.get(:default)
+    parent = self()
+    discard_calls = :atomics.new(1, signed: false)
+
+    assert {:ok, %{reservation_ids: [_active_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
+               shard_id: 0,
+               amount: 1,
+               ttl_ms: 10_000,
+               now_ms: 1_001
+             )
+
+    assert {:ok, %{released: 5, errors: 1}} =
+             Ferricstore.Flow.Governance.LimitCache.flush(ctx,
+               now_ms: 1_002,
+               page_discard_fun: fn discard_ctx, session, pages, discard_opts ->
+                 if :atomics.add_get(discard_calls, 1, 1) == 1 do
+                   discarded_ids = Enum.flat_map(pages, & &1.reservation_ids)
+                   send(parent, {:cache_page_discard_failed, discarded_ids})
+                   {:error, :injected_page_discard_failure}
+                 else
+                   Ferricstore.Flow.Governance.CacheSessionStore.discard_pages(
+                     discard_ctx,
+                     session,
+                     pages,
+                     discard_opts
+                   )
+                 end
+               end
+             )
+
+    assert_receive {:cache_page_discard_failed, released_page_ids}, 1_000
+    assert released_page_ids != []
+
+    assert {:ok, %{reservation_ids: [next_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope,
+               shard_id: 0,
+               amount: 1,
+               ttl_ms: 10_000,
+               now_ms: 1_003
+             )
+
+    refute next_id in released_page_ids
+  end
+
+  test "concurrent cache drains serialize by instance" do
+    ctx = FerricStore.Instance.get(:default)
+    parent = self()
+
+    first =
+      Task.async(fn ->
+        Ferricstore.Flow.Governance.LimitCache.with_drained_cache(
+          ctx,
+          fn ->
+            send(parent, {:cache_drain_started, :first, self()})
+            receive do: (:release_first_cache_drain -> :first_done)
+          end,
+          now_ms: 1_000
+        )
+      end)
+
+    assert_receive {:cache_drain_started, :first, first_pid}, 2_000
+
+    second =
+      Task.async(fn ->
+        Ferricstore.Flow.Governance.LimitCache.with_drained_cache(
+          ctx,
+          fn ->
+            send(parent, {:cache_drain_started, :second, self()})
+            receive do: (:release_second_cache_drain -> :second_done)
+          end,
+          now_ms: 1_001
+        )
+      end)
+
+    refute_receive {:cache_drain_started, :second, _pid}, 100
+    assert Task.yield(second, 100) == nil
+
+    send(first_pid, :release_first_cache_drain)
+    assert :first_done = Task.await(first, 2_000)
+
+    assert_receive {:cache_drain_started, :second, second_pid}, 2_000
+    send(second_pid, :release_second_cache_drain)
+    assert :second_done = Task.await(second, 2_000)
+  end
+
+  test "nested cache drain rejects reentrant ownership without blocking" do
+    ctx = FerricStore.Instance.get(:default)
+
+    assert {:error, :flush_reentrant} =
+             Ferricstore.Flow.Governance.LimitCache.with_drained_cache(
+               ctx,
+               fn ->
+                 Ferricstore.Flow.Governance.LimitCache.with_drained_cache(
+                   ctx,
+                   fn -> :unexpected end,
+                   now_ms: 1_001
+                 )
+               end,
+               now_ms: 1_000
+             )
+  end
+
   test "cache refills after a durable clear resets its session" do
     Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
 
@@ -1075,6 +1374,45 @@ defmodule Ferricstore.FlowGovernanceLimitCorrectnessTest do
            ] = :ets.lookup(table, key)
 
     assert Enum.sort(restored_ids) == Enum.sort([concurrent_id | detached_ids])
+  end
+
+  test "unknown flush release outcome fences detached reservations before reuse" do
+    Application.put_env(:ferricstore, :flow_governance_limit_cache_enabled, true)
+
+    scope = unique_flow_id("cache-flush-unknown-release")
+    lease_limit!(scope, 4)
+    ctx = FerricStore.Instance.get(:default)
+    opts = [shard_id: 0, amount: 1, ttl_ms: 1_000, now_ms: 1_001]
+    parent = self()
+
+    assert {:ok, %{reservation_ids: [_active_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(ctx, scope, opts)
+
+    assert {:ok, %{released: 0, errors: 1}} =
+             Ferricstore.Flow.Governance.LimitCache.flush(ctx,
+               now_ms: 1_002,
+               release_fun: fn _release_ctx, _release_scope, release_opts ->
+                 send(parent, {:unknown_cache_release, release_opts[:reservation_ids]})
+                 {:error, {:timeout, :unknown_outcome}}
+               end
+             )
+
+    assert_receive {:unknown_cache_release, detached_ids}, 1_000
+    key = {ctx.name, scope, 0}
+
+    assert [
+             {^key, 3, _expiry, 4, ^detached_ids, {:fenced, 0}, 4,
+              :flow_governance_limit_cache_entry}
+           ] = :ets.lookup(:ferricstore_flow_governance_limit_cache, key)
+
+    assert {:ok, %{reservation_ids: [next_id]}} =
+             Ferricstore.Flow.Governance.LimitCache.spend(
+               ctx,
+               scope,
+               Keyword.put(opts, :now_ms, 1_003)
+             )
+
+    refute next_id in detached_ids
   end
 
   test "clear refuses to erase live cached reservations without a durable flush" do

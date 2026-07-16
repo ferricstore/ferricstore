@@ -9,9 +9,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   specific or different shards, without hardcoding key-to-shard mappings.
   """
 
-  alias Ferricstore.Flow.Governance.LimitCache
   alias Ferricstore.Raft.{ApplyContext, WARaftBackend}
-  alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.Router
 
   @test_max_memory_bytes 1_073_741_824
@@ -170,90 +168,27 @@ defmodule Ferricstore.Test.ShardHelpers do
   @spec flush_all_keys() :: :ok
   def flush_all_keys do
     ctx = FerricStore.Instance.get(:default)
-
-    case LimitCache.with_drained_cache(ctx, fn -> do_flush_all_keys(ctx) end) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        raise "Governance limit cache drain failed during cleanup: #{inspect(reason)}"
-
-      other ->
-        raise "Governance limit cache drain returned an invalid result: #{inspect(other)}"
-    end
+    do_flush_all_keys(ctx)
   end
 
   defp do_flush_all_keys(ctx) do
-    alias Ferricstore.Store.Router
-
     reset_server_auth_state()
     reset_memory_guard_pressure()
     reset_runtime_pressure_state()
 
     shard_count = shard_count()
-    flush_timeout = 30_000
-    ready_timeout = min(flush_timeout, 10_000)
+    ready_timeout = 10_000
 
-    # Flush background BitcaskWriter so deferred writes are on disk
-    # before we snapshot keys for deletion.
-    Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
-
-    # Delete every key on each shard directly via that shard's Raft batcher.
-    # We must NOT use Router.delete/1 because it re-hashes the key, which
-    # routes compound keys (H:, S:, Z:, T: prefixed) to the wrong shard —
-    # compound keys live on their parent's shard, not the shard determined
-    # by hashing the compound key string. Use one delete batch per shard so a
-    # restart-heavy full suite cannot spend 30s per key waiting on stale leader
-    # state during cleanup.
     ensure_default_waraft_started()
     wait_default_waraft_ready(ready_timeout)
 
-    Enum.each(0..(shard_count - 1), fn i ->
-      shard = Router.shard_name(ctx, i)
+    case Ferricstore.Store.Ops.Flush.flush(ctx) do
+      :ok -> :ok
+      {:error, reason} -> raise "FLUSHDB cleanup failed: #{inspect(reason)}"
+      other -> raise "FLUSHDB cleanup returned an invalid result: #{inspect(other)}"
+    end
 
-      keys =
-        try do
-          shard
-          |> GenServer.call(:keys, flush_timeout)
-          |> Enum.reject(&preserve_during_test_flush?/1)
-        catch
-          :exit, _ -> []
-        end
-
-      delete_keys_on_shard(i, keys)
-    end)
-
-    # Clear fetch-or-compute ownership locks through WARaft so tests start clean.
-    Enum.each(0..(shard_count - 1), fn i ->
-      case clear_key_locks_strict(i) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          raise "Shard #{i} clear_key_locks failed during cleanup: #{inspect(reason)}"
-      end
-    end)
-
-    # Prove the WARaft write/apply path is usable before handing control back.
     wait_default_waraft_ready(ready_timeout)
-
-    # Flow secondary indexes are native-only and rebuilt from durable Flow
-    # records. The key delete path above removes the durable records; reset the
-    # native projection too so test setup cannot leak in-memory index state.
-    Ferricstore.Flow.NativeOrderedIndex.reset_all(ctx.name, shard_count)
-    clear_flow_projection_storage(ctx, shard_count)
-
-    # Safety net: clear any remaining compound key entries from ETS.
-    # After the per-shard deletes and drain above this should be a no-op,
-    # but guards against edge cases where NIF tombstones haven't propagated.
-    Enum.each(0..(shard_count - 1), fn i ->
-      # Single-table keydir has 7-element tuples {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
-      try do
-        delete_unpreserved_keydir_rows(:"keydir_#{i}", i)
-      rescue
-        ArgumentError -> :ok
-      end
-    end)
 
     # Clear disk pressure flags. A previous test may have hit a transient
     # NIF flush error (e.g. a rotation race) and set the pressure atomic.
@@ -269,36 +204,10 @@ defmodule Ferricstore.Test.ShardHelpers do
     Ferricstore.NamespaceConfig.reset_all()
     reset_server_auth_state()
 
-    # The safety-net ETS clear above bypasses normal insert/delete hooks, so
-    # reset the auxiliary memory accounting that MemoryGuard reads lock-free.
-    # Otherwise a prior test can leave phantom keydir bytes and make later
-    # command tests fail with KEYDIR_FULL despite empty ETS tables.
+    # Keep auxiliary accounting aligned even after fixtures directly mutate ETS.
     reset_keydir_binary_counters(ctx, shard_count)
     reset_memory_guard_pressure()
-  end
-
-  defp preserve_during_test_flush?(key) do
-    Ferricstore.Flow.Keys.shared_value_ref_backfill_key?(key) or
-      ServerCatalog.internal_key?(key)
-  end
-
-  defp delete_unpreserved_keydir_rows(keydir, shard_index) do
-    backfill_key = Ferricstore.Flow.Keys.shared_value_ref_backfill_key(shard_index)
-    catalog_prefix = ServerCatalog.root_prefix()
-    prefix_size = byte_size(catalog_prefix)
-
-    catalog_key_guard =
-      {:andalso, {:is_binary, :"$1"},
-       {:andalso, {:>=, {:byte_size, :"$1"}, prefix_size},
-        {:==, {:binary_part, :"$1", 0, prefix_size}, catalog_prefix}}}
-
-    delete_guard =
-      {:not, {:orelse, {:==, :"$1", backfill_key}, catalog_key_guard}}
-
-    :ets.select_delete(
-      keydir,
-      [{{:"$1", :_, :_, :_, :_, :_, :_}, [delete_guard], [true]}]
-    )
+    :ok
   end
 
   def reset_server_auth_state do
@@ -314,55 +223,6 @@ defmodule Ferricstore.Test.ShardHelpers do
     :ok
   rescue
     _ -> :ok
-  end
-
-  defp clear_flow_projection_storage(ctx, shard_count) do
-    Enum.each(0..max(shard_count - 1, -1)//1, fn shard_index ->
-      :ok = Ferricstore.Flow.HistoryProjector.discard(ctx, shard_index)
-    end)
-
-    :ok = Ferricstore.Flow.LMDBWriter.discard_all(ctx.name, shard_count)
-    :ok = Ferricstore.Flow.LMDB.clear_all(ctx.data_dir, shard_count)
-
-    Enum.each(0..max(shard_count - 1, -1)//1, fn shard_index ->
-      history_dir =
-        ctx.data_dir
-        |> Ferricstore.DataDir.shard_data_path(shard_index)
-        |> Ferricstore.Flow.HistoryProjector.history_dir()
-
-      :ok = Ferricstore.FS.rm_rf(history_dir)
-    end)
-  end
-
-  defp delete_keys_on_shard(_shard_index, []), do: :ok
-
-  defp delete_keys_on_shard(shard_index, keys) do
-    case Ferricstore.Raft.Backend.write_delete_batch(shard_index, keys) do
-      {:ok, results} when is_list(results) ->
-        if length(results) == length(keys) do
-          :ok
-        else
-          raise "Shard #{shard_index} WARaft delete cleanup returned #{length(results)} result(s) for #{length(keys)} key(s)"
-        end
-
-      {:error, reason} ->
-        raise "Shard #{shard_index} WARaft delete cleanup failed: #{inspect(reason)}"
-
-      other ->
-        raise "Shard #{shard_index} WARaft delete cleanup returned unexpected result: #{inspect(other)}"
-    end
-  end
-
-  defp clear_key_locks_strict(shard_index) do
-    case Ferricstore.Raft.Backend.write(shard_index, {:clear_key_locks}) do
-      :ok -> :ok
-      {:ok, :ok} -> :ok
-      {:ok, {:applied_at, _index, :ok}} -> :ok
-      {:error, _reason} = error -> {:error, error}
-      other -> {:error, other}
-    end
-  catch
-    :exit, reason -> {:error, {:exit, reason}}
   end
 
   defp wait_default_waraft_ready(timeout_ms) do

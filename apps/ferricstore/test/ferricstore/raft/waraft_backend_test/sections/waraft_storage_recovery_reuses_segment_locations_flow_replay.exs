@@ -15,7 +15,8 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
       alias Ferricstore.Raft.WARaftBackendTest.LabelCounter
       alias Ferricstore.Raft.WARaftBackendTest.OversizedLabel
 
-      test "WARaft storage recovery reuses segment locations for Flow replay", %{
+      @tag :flow_replay_segment_locations
+      test "WARaft storage recovery rebuilds Flow apply projection locations from WAL", %{
         root: root,
         ctx: ctx
       } do
@@ -61,30 +62,28 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
             WARaftStorage.open(%{table: :ferricstore_waraft_backend, partition: 1}, storage_root)
 
           try do
-            keydir_rows = :ets.tab2list(elem(restarted_ctx.keydir_refs, 0))
+            assert [
+                     {^key, _value, _expire_at_ms, _lfu,
+                      {:waraft_apply_projection, ^applied_index}, _offset, _value_size}
+                   ] = :ets.lookup(elem(restarted_ctx.keydir_refs, 0), key)
 
-            assert Enum.any?(keydir_rows, fn
-                     {^key, _value, _expire_at_ms, _lfu, {:waraft_segment, ^applied_index},
-                      _offset, _value_size} ->
-                       true
+            assert apply_projection_cache_contains?(
+                     root,
+                     0,
+                     applied_index,
+                     key
+                   )
 
-                     _row ->
-                       false
-                   end)
+            assert {:ok, recovered_value} =
+                     Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                       restarted_ctx,
+                       0,
+                       {:waraft_apply_projection, applied_index},
+                       key
+                     )
 
-            refute Enum.any?(keydir_rows, fn
-                     {_key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, _index},
-                      _offset, _value_size} ->
-                       true
-
-                     _row ->
-                       false
-                   end)
-
-            assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(
-                     restarted_ctx.data_dir,
-                     0
-                   ) == 0
+            assert %{id: ^id, partition_key: ^partition_key} =
+                     Ferricstore.Flow.decode_record(recovered_value)
 
             assert WARaftStorage.position(handle) == applied_position
           after

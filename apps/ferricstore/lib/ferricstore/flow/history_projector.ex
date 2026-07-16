@@ -207,6 +207,39 @@ defmodule Ferricstore.Flow.HistoryProjector do
     :exit, reason -> {:error, {:discard_exit, reason}}
   end
 
+  @spec reset_after_flush(map() | nil, non_neg_integer(), non_neg_integer(), timeout()) ::
+          :ok | {:error, term()}
+  def reset_after_flush(instance_ctx, shard_index, index, timeout \\ 5_000)
+      when is_integer(shard_index) and shard_index >= 0 and is_integer(index) and index >= 0 do
+    projector = name(instance_ctx, shard_index)
+
+    case Process.whereis(projector) do
+      nil -> Pending.discard(projector)
+      _pid -> GenServer.call(projector, {:reset_after_flush, index}, timeout)
+    end
+  catch
+    :exit, reason -> {:error, {:reset_after_flush_exit, reason}}
+  end
+
+  @spec reset_projected_index(map() | nil, non_neg_integer(), binary(), non_neg_integer()) ::
+          :ok | {:error, term()}
+  def reset_projected_index(instance_ctx, shard_index, shard_data_path, index)
+      when is_integer(shard_index) and shard_index >= 0 and is_binary(shard_data_path) and
+             is_integer(index) and index >= 0 do
+    with :ok <- HistoryProjectedIndex.reset(shard_data_path, index) do
+      case instance_ctx do
+        %{flow_history_projected_index: ref} when is_reference(ref) ->
+          size = :atomics.info(ref).size
+          if shard_index < size, do: :atomics.put(ref, shard_index + 1, index)
+
+        _ ->
+          :ok
+      end
+    end
+  rescue
+    error -> {:error, {:history_projected_index_reset_failed, error}}
+  end
+
   @spec pending_count(map() | nil, non_neg_integer(), timeout()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   def pending_count(instance_ctx, shard_index, timeout \\ 1_000) do
@@ -399,6 +432,32 @@ defmodule Ferricstore.Flow.HistoryProjector do
             pending_count: 0,
             first_pending_at: nil,
             requested_index: nil
+          })
+          |> publish_backlog_state()
+
+        {:reply, :ok, state}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:reset_after_flush, index}, _from, state)
+      when is_integer(index) and index >= 0 do
+    state = cancel_flush(state)
+
+    case Pending.discard(state.projector_name) do
+      :ok ->
+        :ok = Pending.release_pending(state, state.pending_count)
+
+        state =
+          state
+          |> Map.merge(%{
+            pending: [],
+            pending_count: 0,
+            first_pending_at: nil,
+            requested_index: nil,
+            flushed_index: index
           })
           |> publish_backlog_state()
 

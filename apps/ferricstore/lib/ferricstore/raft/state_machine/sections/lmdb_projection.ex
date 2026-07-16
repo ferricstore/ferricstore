@@ -654,13 +654,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       defp track_keydir_binary_restore(state, key, original_entry) do
         ref = keydir_binary_ref(state)
+        current = safe_ets_lookup(state.ets, key)
+        original = if(original_entry, do: [original_entry], else: [])
+
+        ExpiryTracker.adjust(
+          expiry_instance_ctx(state),
+          state.shard_index,
+          ExpiryTracker.entry_expire_at(current),
+          ExpiryTracker.entry_expire_at(original)
+        )
 
         if ref do
-          current_bytes = keydir_entry_binary_bytes(key, safe_ets_lookup(state.ets, key))
-
-          original_bytes =
-            keydir_entry_binary_bytes(key, if(original_entry, do: [original_entry], else: []))
-
+          current_bytes = keydir_entry_binary_bytes(key, current)
+          original_bytes = keydir_entry_binary_bytes(key, original)
           delta = original_bytes - current_bytes
           if delta != 0, do: :atomics.add(ref, state.shard_index + 1, delta)
         end

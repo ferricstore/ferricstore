@@ -48,7 +48,7 @@ defmodule Ferricstore.Store.Promotion do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
   alias Ferricstore.Raft.WARaftSegmentReader
-  alias Ferricstore.Store.{AppendResult, BlobRef, BlobValue, CompoundKey, LFU}
+  alias Ferricstore.Store.{ActiveFile, AppendResult, BlobRef, BlobValue, CompoundKey, LFU}
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
@@ -77,6 +77,212 @@ defmodule Ferricstore.Store.Promotion do
 
   @spec marker_key(binary()) :: binary()
   def marker_key(redis_key), do: CompoundKey.promotion_marker_key(redis_key)
+
+  @doc false
+  @spec flush_marker_tombstones(map(), pos_integer()) ::
+          {:ok,
+           %{
+             marker_count: non_neg_integer(),
+             appended_bytes: non_neg_integer(),
+             active_file_id: non_neg_integer() | nil,
+             active_file_path: binary() | nil
+           }}
+          | {:error, term()}
+  def flush_marker_tombstones(owner, page_size \\ 512)
+      when is_map(owner) and is_integer(page_size) and page_size > 0 do
+    keydir = Map.get(owner, :ets, Map.get(owner, :keydir))
+
+    try do
+      :ets.safe_fixtable(keydir, true)
+
+      try do
+        match_spec = [
+          {{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}
+        ]
+
+        initial = %{
+          marker_count: 0,
+          appended_bytes: 0,
+          active_file_id: nil,
+          active_file_path: nil
+        }
+
+        with {:ok, result} <-
+               flush_marker_tombstone_pages(
+                 owner,
+                 :ets.select(keydir, match_spec, page_size),
+                 initial
+               ),
+             :ok <- fsync_flushed_marker_tombstones(result) do
+          {:ok, result}
+        end
+      after
+        :ets.safe_fixtable(keydir, false)
+      end
+    rescue
+      error in ArgumentError -> {:error, {:promotion_marker_keydir_unavailable, error}}
+      error -> {:error, {:promotion_marker_flush_failed, error}}
+    catch
+      kind, reason -> {:error, {:promotion_marker_flush_failed, kind, reason}}
+    end
+  end
+
+  defp flush_marker_tombstone_pages(_owner, :"$end_of_table", result), do: {:ok, result}
+
+  defp flush_marker_tombstone_pages(owner, {keys, continuation}, result) do
+    marker_keys = Enum.filter(keys, &promotion_marker?/1)
+
+    with {:ok, next_result} <- append_marker_tombstone_page(owner, marker_keys, result) do
+      flush_marker_tombstone_pages(owner, :ets.select(continuation), next_result)
+    end
+  end
+
+  defp append_marker_tombstone_page(_owner, [], result), do: {:ok, result}
+
+  defp append_marker_tombstone_page(owner, marker_keys, result) do
+    with {:ok, file_id, active_path} <- marker_flush_active_file(owner, result),
+         ops = Enum.map(marker_keys, &{:delete, &1}),
+         {:ok, locations} <- append_marker_tombstone_ops(active_path, ops),
+         :ok <- AppendResult.validate_operation_locations(locations, ops),
+         {:ok, appended_bytes} <- marker_tombstone_location_bytes(locations) do
+      {:ok,
+       %{
+         result
+         | marker_count: result.marker_count + length(marker_keys),
+           appended_bytes: result.appended_bytes + appended_bytes,
+           active_file_id: file_id,
+           active_file_path: active_path
+       }}
+    end
+  end
+
+  defp marker_flush_active_file(
+         _owner,
+         %{active_file_id: file_id, active_file_path: path}
+       )
+       when is_integer(file_id) and file_id >= 0 and is_binary(path),
+       do: {:ok, file_id, path}
+
+  defp marker_flush_active_file(owner, _result) do
+    case {Map.get(owner, :instance_ctx), Map.get(owner, :shard_index, Map.get(owner, :index))} do
+      {%FerricStore.Instance{} = ctx, shard_index}
+      when is_integer(shard_index) and shard_index >= 0 ->
+        case ActiveFile.get(ctx, shard_index) do
+          {file_id, path, _shard_path}
+          when is_integer(file_id) and file_id >= 0 and is_binary(path) ->
+            {:ok, file_id, path}
+
+          other ->
+            {:error, {:promotion_marker_active_file_unavailable, other}}
+        end
+
+      _missing_context ->
+        case {Map.get(owner, :active_file_id), Map.get(owner, :active_file_path)} do
+          {file_id, path} when is_integer(file_id) and file_id >= 0 and is_binary(path) ->
+            {:ok, file_id, path}
+
+          other ->
+            {:error, {:promotion_marker_active_file_unavailable, other}}
+        end
+    end
+  rescue
+    error -> {:error, {:promotion_marker_active_file_unavailable, error}}
+  end
+
+  defp append_marker_tombstone_ops(active_path, ops) do
+    result =
+      case Process.get(:ferricstore_promotion_marker_append_hook) do
+        hook when is_function(hook, 2) ->
+          case hook.(active_path, ops) do
+            :passthrough -> NIF.v2_append_ops_batch(active_path, ops)
+            result -> result
+          end
+
+        _missing ->
+          NIF.v2_append_ops_batch(active_path, ops)
+      end
+
+    case result do
+      {:ok, locations} -> {:ok, locations}
+      {:error, reason} -> {:error, {:append_promotion_marker_tombstones_failed, reason}}
+      other -> {:error, {:append_promotion_marker_tombstones_failed, other}}
+    end
+  end
+
+  defp marker_tombstone_location_bytes(locations) do
+    Enum.reduce_while(locations, {:ok, 0}, fn
+      {:delete, _offset, record_size}, {:ok, total}
+      when is_integer(record_size) and record_size >= 0 ->
+        {:cont, {:ok, total + record_size}}
+
+      invalid, {:ok, _total} ->
+        {:halt, {:error, {:invalid_promotion_marker_tombstone_location, invalid}}}
+    end)
+  end
+
+  defp fsync_flushed_marker_tombstones(%{marker_count: 0}), do: :ok
+
+  defp fsync_flushed_marker_tombstones(%{active_file_path: active_path})
+       when is_binary(active_path) do
+    case NIF.v2_fsync(active_path) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:fsync_promotion_marker_tombstones_failed, reason}}
+      other -> {:error, {:fsync_promotion_marker_tombstones_failed, other}}
+    end
+  end
+
+  defp promotion_marker?(<<"PM:", _::binary>>), do: true
+  defp promotion_marker?(_key), do: false
+
+  @doc false
+  @spec remove_shard_dedicated_storage(map()) :: :ok | {:error, term()}
+  def remove_shard_dedicated_storage(owner) when is_map(owner) do
+    with data_dir when is_binary(data_dir) <- Map.get(owner, :data_dir),
+         shard_index when is_integer(shard_index) and shard_index >= 0 <-
+           Map.get(owner, :shard_index, Map.get(owner, :index)) do
+      dedicated_parent = Path.join(data_dir, "dedicated")
+      shard_root = Path.join(dedicated_parent, "shard_#{shard_index}")
+
+      with :ok <- maybe_remove_dedicated_shard_root(shard_root),
+           :ok <- fsync_dedicated_parent(data_dir, dedicated_parent) do
+        :ok
+      end
+    else
+      invalid -> {:error, {:invalid_dedicated_storage_owner, invalid}}
+    end
+  end
+
+  defp maybe_remove_dedicated_shard_root(shard_root) do
+    if Ferricstore.FS.exists?(shard_root),
+      do: remove_dedicated_shard_root(shard_root),
+      else: :ok
+  end
+
+  defp remove_dedicated_shard_root(shard_root) do
+    case Ferricstore.FS.rm_rf(shard_root) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:remove_dedicated_shard_root_failed, shard_root, reason}}
+    end
+  end
+
+  defp fsync_dedicated_parent(data_dir, dedicated_parent) do
+    sync_dir =
+      if Ferricstore.FS.dir?(dedicated_parent),
+        do: dedicated_parent,
+        else: data_dir
+
+    result =
+      case Process.get(:ferricstore_promotion_fsync_dir_hook) do
+        hook when is_function(hook, 1) -> hook.(sync_dir)
+        _missing -> NIF.v2_fsync_dir(sync_dir)
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:fsync_dedicated_parent_failed, sync_dir, reason}}
+      other -> {:error, {:fsync_dedicated_parent_failed, sync_dir, other}}
+    end
+  end
 
   @doc """
   Runs `fun` while holding the per-promoted-key compaction latch.

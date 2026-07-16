@@ -167,6 +167,8 @@ defmodule Ferricstore.Store.Shard do
     # at init time. Updated via handle_cast(:update_max_active_file_size, n).
     max_active_file_size: 8 * 1024 * 1024 * 1024,
     writes_paused: false,
+    write_pause_leases: %{},
+    write_pause_monitors: %{},
     compound_member_index: nil,
     logical_key_index: nil,
     logical_key_slots: nil,

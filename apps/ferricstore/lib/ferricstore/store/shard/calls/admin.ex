@@ -450,20 +450,80 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
             _from,
             %{writes_paused: true} = state
           ) do
+        state = prepare_promoted_flush_state(state)
         sm_state = direct_sm_state(state)
 
-        case Ferricstore.Raft.StateMachine.apply(%{}, {:flush_shard, flush_epoch}, sm_state) do
+        case Ferricstore.Raft.StateMachine.apply_standalone_command(
+               {:flush_shard, flush_epoch},
+               sm_state
+             ) do
           {new_sm_state, result} ->
-            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+            new_state =
+              state
+              |> apply_direct_sm_state(new_sm_state)
+              |> record_standalone_flush_result(result)
+
+            {:reply, result, new_state}
 
           {new_sm_state, result, _effects} ->
-            {:reply, result, apply_direct_sm_state(state, new_sm_state)}
+            new_state =
+              state
+              |> apply_direct_sm_state(new_sm_state)
+              |> record_standalone_flush_result(result)
+
+            {:reply, result, new_state}
         end
       end
+
+      defp record_standalone_flush_result(state, {:error, reason}) do
+        state
+        |> Map.put(:last_flush_error, reason)
+        |> Map.put(:writes_paused, true)
+      end
+
+      defp record_standalone_flush_result(state, _success),
+        do: Map.put(state, :last_flush_error, nil)
 
       def handle_call({:flush_shard_paused, _flush_epoch}, _from, state) do
         {:reply, {:error, :flush_shard_requires_paused_writes}, state}
       end
+
+      def handle_call(
+            {:prepare_promoted_flush, _flush_epoch},
+            _from,
+            %{writes_paused: true} = state
+          ) do
+        {:reply, :ok, prepare_promoted_flush_state(state)}
+      end
+
+      def handle_call({:prepare_promoted_flush, _flush_epoch}, _from, state) do
+        {:reply, {:error, :flush_shard_requires_paused_writes}, state}
+      end
+
+      def handle_call(
+            {:prepare_promoted_flush_from_raft, _flush_epoch},
+            {caller_pid, _tag},
+            state
+          ) do
+        if waraft_storage_caller?(state.index, caller_pid) do
+          {:reply, :ok, prepare_promoted_flush_state(state)}
+        else
+          {:reply, {:error, :invalid_flush_shard_caller}, state}
+        end
+      end
+
+      defp waraft_storage_caller?(shard_index, caller_pid)
+           when is_integer(shard_index) and shard_index >= 0 and is_pid(caller_pid) do
+        storage =
+          :wa_raft_storage.registered_name(
+            :ferricstore_waraft_backend,
+            shard_index + 1
+          )
+
+        Process.whereis(storage) == caller_pid
+      end
+
+      defp waraft_storage_caller?(_shard_index, _caller_pid), do: false
 
       def handle_call(command, _from, %{writes_paused: true} = state)
           when is_tuple(command) do

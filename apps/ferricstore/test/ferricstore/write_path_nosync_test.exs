@@ -26,6 +26,27 @@ defmodule Ferricstore.WritePathNosyncTest do
   # Helper: unique key with a given prefix
   defp ukey(prefix), do: "#{prefix}:#{:rand.uniform(9_999_999)}"
 
+  defp safe_stop(pid) do
+    try do
+      GenServer.stop(pid, :normal, 5_000)
+    catch
+      :exit, {:noproc, _call} ->
+        :ok
+
+      :exit, :noproc ->
+        :ok
+
+      :exit, {:shutdown, _call} ->
+        :ok
+
+      :exit, :shutdown ->
+        :ok
+
+      :exit, {{:shutdown, {:sys, :terminate, _terminate_args}}, {GenServer, :stop, _stop_args}} ->
+        :ok
+    end
+  end
+
   # =========================================================================
   # StateMachine nosync Bitcask write + background BitcaskWriter
   # =========================================================================
@@ -218,7 +239,10 @@ defmodule Ferricstore.WritePathNosyncTest do
   describe "background BitcaskWriter" do
     test "rejects obsolete untagged write messages without touching disk" do
       shard_index = 49
-      dir = Path.join(System.tmp_dir!(), "bitcask_writer_shape_#{System.unique_integer([:positive])}")
+
+      dir =
+        Path.join(System.tmp_dir!(), "bitcask_writer_shape_#{System.unique_integer([:positive])}")
+
       path = Path.join(dir, "00000000000000000000.log")
       File.mkdir_p!(dir)
       File.touch!(path)
@@ -231,7 +255,7 @@ defmodule Ferricstore.WritePathNosyncTest do
       {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
 
       on_exit(fn ->
-        if Process.alive?(writer), do: GenServer.stop(writer)
+        safe_stop(writer)
         File.rm_rf!(dir)
       end)
 
@@ -313,11 +337,7 @@ defmodule Ferricstore.WritePathNosyncTest do
       {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
 
       on_exit(fn ->
-        try do
-          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
-        catch
-          :exit, _ -> :ok
-        end
+        safe_stop(writer)
 
         try do
           :ets.delete(keydir)
@@ -351,12 +371,7 @@ defmodule Ferricstore.WritePathNosyncTest do
       {:ok, writer} = BitcaskWriter.start_link(shard_index: shard_index)
 
       on_exit(fn ->
-        try do
-          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
-        catch
-          :exit, _ -> :ok
-        end
-
+        safe_stop(writer)
         File.rm_rf(dir)
       end)
 
@@ -387,13 +402,7 @@ defmodule Ferricstore.WritePathNosyncTest do
 
       missing_path = Path.join(missing_dir, "00000.log")
 
-      on_exit(fn ->
-        try do
-          if Process.alive?(writer), do: GenServer.stop(writer, :normal, 5000)
-        catch
-          :exit, _ -> :ok
-        end
-      end)
+      on_exit(fn -> safe_stop(writer) end)
 
       Ferricstore.Store.DiskPressure.clear(ctx, 0)
       Ferricstore.Store.DiskPressure.clear(0)
@@ -421,7 +430,7 @@ defmodule Ferricstore.WritePathNosyncTest do
         assert Process.whereis(BitcaskWriter.writer_name(ctx, shard_index)) == pid
         assert Process.whereis(BitcaskWriter.writer_name(shard_index)) == nil
       after
-        if Process.alive?(pid), do: GenServer.stop(pid)
+        safe_stop(pid)
       end
     end
 

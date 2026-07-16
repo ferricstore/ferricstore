@@ -41,6 +41,11 @@ defmodule Ferricstore.Flow.LMDBWriter.Telemetry do
     :ok
   end
 
+  def clear_mirror_degraded(instance_ctx, shard_index)
+      when is_integer(shard_index) and shard_index >= 0 do
+    reset_atomic(Map.get(instance_ctx || %{}, :flow_lmdb_mirror_degraded), shard_index, 0)
+  end
+
   def record_persist_failure(%{flow_lmdb_replay_safe_persist_failures: failures}, shard_index)
       when is_reference(failures) do
     if shard_index < :atomics.info(failures).size do

@@ -6,7 +6,7 @@ defmodule Ferricstore.Test.ShardHelpersTest do
   alias Ferricstore.Flow.Governance.LimitCache
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.ServerCatalog
-  alias Ferricstore.Store.{DiskPressure, Router}
+  alias Ferricstore.Store.{CompoundKey, DiskPressure, Promotion, Router}
   alias Ferricstore.Test.ShardHelpers
 
   test "flush_all_keys preserves the durable server catalog" do
@@ -76,6 +76,46 @@ defmodule Ferricstore.Test.ShardHelpersTest do
 
     assert :ok = ShardHelpers.flush_all_keys()
     assert :ok = LimitCache.clear()
+  end
+
+  test "flush_all_keys durably removes promoted storage" do
+    assert :ok = ShardHelpers.flush_all_keys()
+
+    apply_context_snapshot =
+      ShardHelpers.replace_default_apply_context(promotion_threshold: 1)
+
+    on_exit(fn ->
+      ShardHelpers.restore_default_apply_context(apply_context_snapshot)
+    end)
+
+    ctx = FerricStore.Instance.get(:default)
+    redis_key = "shard-helper-promoted-#{System.unique_integer([:positive])}"
+    shard_index = Router.shard_for(ctx, redis_key)
+    shard = Router.shard_name(ctx, shard_index)
+    type_key = CompoundKey.type_key(redis_key)
+    first = CompoundKey.hash_field(redis_key, "first")
+    second = CompoundKey.hash_field(redis_key, "second")
+
+    assert :ok = Router.compound_put(ctx, redis_key, type_key, "hash", 0)
+    assert :ok = Router.compound_put(ctx, redis_key, first, "one", 0)
+    assert :ok = Router.compound_put(ctx, redis_key, second, "two", 0)
+
+    ShardHelpers.eventually(
+      fn ->
+        shard
+        |> :sys.get_state()
+        |> Map.fetch!(:promoted_instances)
+        |> Map.has_key?(redis_key)
+      end,
+      "expected cleanup fixture to be promoted"
+    )
+
+    dedicated_path = Promotion.dedicated_path(ctx.data_dir, shard_index, :hash, redis_key)
+    assert File.dir?(dedicated_path)
+
+    assert :ok = ShardHelpers.flush_all_keys()
+    refute File.exists?(dedicated_path)
+    assert [] = :ets.lookup(elem(ctx.keydir_refs, shard_index), Promotion.marker_key(redis_key))
   end
 
   test "flush_all_keys clears stale keydir memory pressure accounting" do

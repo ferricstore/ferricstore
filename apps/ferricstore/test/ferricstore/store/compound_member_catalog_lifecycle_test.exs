@@ -82,14 +82,8 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
 
     on_exit(fn ->
       IsolatedInstance.checkin(ctx)
-
-      if Process.alive?(owner) do
-        GenServer.stop(owner, :normal, 5_000)
-      end
-
-      if Process.alive?(heir) do
-        GenServer.stop(heir, :normal, 5_000)
-      end
+      safe_stop(owner)
+      safe_stop(heir)
     end)
 
     {:ok, ctx: ctx, owner: owner}
@@ -131,7 +125,7 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
              )
 
     {:ok, restarted_owner} = KeydirTableOwner.start_link(instance_ctx: ctx)
-    on_exit(fn -> if Process.alive?(restarted_owner), do: GenServer.stop(restarted_owner) end)
+    on_exit(fn -> safe_stop(restarted_owner) end)
 
     assert keydir_owner == :ets.info(keydir, :owner)
     assert restarted_owner == :ets.info(catalog, :owner)
@@ -157,7 +151,7 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     assert_receive {:DOWN, ^heir_monitor, :process, ^old_heir, :killed}, 5_000
 
     {:ok, restarted_heir} = ETSTableHeir.start_link(name: heir_name)
-    on_exit(fn -> if Process.alive?(restarted_heir), do: GenServer.stop(restarted_heir) end)
+    on_exit(fn -> safe_stop(restarted_heir) end)
     assert_table_info_eventually(catalog, :heir, restarted_heir, 100)
 
     Process.unlink(owner)
@@ -174,7 +168,7 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
              )
 
     {:ok, restarted_owner} = KeydirTableOwner.start_link(instance_ctx: ctx)
-    on_exit(fn -> if Process.alive?(restarted_owner), do: GenServer.stop(restarted_owner) end)
+    on_exit(fn -> safe_stop(restarted_owner) end)
     assert_table_info_eventually(catalog, :owner, restarted_owner, 100)
   end
 
@@ -309,4 +303,13 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     do: Keyword.put(opts, :promotion_threshold, threshold)
 
   defp maybe_put_promotion_threshold(opts, _test_context), do: opts
+
+  defp safe_stop(pid) do
+    try do
+      GenServer.stop(pid, :normal, 5_000)
+    catch
+      :exit, {:noproc, _call} -> :ok
+      :exit, :noproc -> :ok
+    end
+  end
 end

@@ -3,31 +3,31 @@ defmodule Ferricstore.Commands.ServerInfoObservabilityTest do
   @moduletag :global_state
 
   alias Ferricstore.Commands.Server
-  alias Ferricstore.Test.MockStore
 
   setup do
-    old_data_dir = Application.get_env(:ferricstore, :data_dir)
-    old_shard_count = Application.get_env(:ferricstore, :shard_count)
-
     root =
       Path.join(
         System.tmp_dir!(),
         "ferricstore_server_info_observability_#{System.unique_integer([:positive])}"
       )
 
-    Application.put_env(:ferricstore, :data_dir, root)
-    Application.put_env(:ferricstore, :shard_count, 1)
+    instance_ctx = %FerricStore.Instance{
+      name: :server_info_observability_test,
+      data_dir: root,
+      data_dir_expanded: Path.expand(root),
+      shard_count: 1,
+      read_sample_rate: 1
+    }
 
-    on_exit(fn ->
-      restore_env(:data_dir, old_data_dir)
-      restore_env(:shard_count, old_shard_count)
-      File.rm_rf!(root)
-    end)
+    on_exit(fn -> File.rm_rf!(root) end)
 
-    %{root: root}
+    %{root: root, store: %{__instance_ctx__: instance_ctx}}
   end
 
-  test "INFO bitcask emits telemetry when a shard directory cannot be scanned", %{root: root} do
+  test "INFO bitcask emits telemetry when a shard directory cannot be scanned", %{
+    root: root,
+    store: store
+  } do
     shard_dir = Ferricstore.DataDir.shard_data_path(root, 0)
     File.mkdir_p!(Path.dirname(shard_dir))
     File.write!(shard_dir, "not a directory")
@@ -45,7 +45,7 @@ defmodule Ferricstore.Commands.ServerInfoObservabilityTest do
     )
 
     try do
-      info = Server.handle("INFO", ["bitcask"], MockStore.make())
+      info = Server.handle("INFO", ["bitcask"], store)
 
       assert info =~ "# Bitcask"
       assert info =~ "shard_0_data_file_count:0"
@@ -62,7 +62,4 @@ defmodule Ferricstore.Commands.ServerInfoObservabilityTest do
       :telemetry.detach(handler_id)
     end
   end
-
-  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
-  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

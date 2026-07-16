@@ -104,11 +104,6 @@ defmodule Ferricstore.Application do
       # Initialize per-shard disk pressure flags (reject writes on ENOSPC).
       Ferricstore.Store.DiskPressure.init(shard_count)
 
-      # Initialize the active file registry (ETS + atomics generation counter).
-      # Replaces persistent_term for active file metadata to avoid global GC
-      # on file rotation — critical for embedded mode with many host processes.
-      Ferricstore.Store.ActiveFile.init(shard_count)
-
       # This VM-lifetime atomic is initialized before shard recovery can launch
       # concurrent LMDB active-index rebuilds.
       Ferricstore.Flow.LMDBRebuilder.init_startup_active_rebuild_limiter()
@@ -234,6 +229,11 @@ defmodule Ferricstore.Application do
             Ferricstore.Waiters.Monitor,
             Ferricstore.Flow.HistoryProjector.TableOwner,
             Ferricstore.Flow.Governance.LimitCache,
+            Supervisor.child_spec(
+              {Ferricstore.Store.ETSTableHeir, name: Ferricstore.Store.ActiveFile.TableHeir},
+              id: Ferricstore.Store.ActiveFile.TableHeir
+            ),
+            Ferricstore.Store.ActiveFile.TableOwner,
             Supervisor.child_spec(
               {Ferricstore.Store.ETSTableHeir, name: Ferricstore.Store.BlobStore.TableHeir},
               id: Ferricstore.Store.BlobStore.TableHeir

@@ -139,6 +139,103 @@ defmodule Ferricstore.Raft.WritePathTest.Sections.ListOpLpushThroughRaftAddsElem
 
           cleanup_sm(ctx)
         end
+
+        @tag :mixed_fast_delete_rollback
+        test "LPOP append failure restores list rows and the exact member catalog" do
+          ctx = fresh_sm_state()
+          {state, ets, instance_ctx, _dir} = ctx
+          key = "rollback-list"
+          prefix = CompoundKey.list_prefix(key)
+          member_index = state.compound_member_index_name
+
+          {state2, 3} =
+            SM.apply(%{}, {:list_op, key, {:rpush, ["a", "b", "c"]}}, state)
+
+          assert {:ok, original_members} =
+                   Ferricstore.Store.Shard.CompoundMemberIndex.keys_for_prefix(
+                     member_index,
+                     prefix,
+                     10
+                   )
+
+          bad_active_path = Path.join(state.shard_data_path, "append-failure.log")
+          File.mkdir_p!(bad_active_path)
+
+          Ferricstore.Store.ActiveFile.publish(
+            instance_ctx,
+            0,
+            state.active_file_id + 1,
+            bad_active_path,
+            state.shard_data_path
+          )
+
+          {_failed_state, result} =
+            SM.apply(%{}, {:list_op, key, {:lpop, 1}}, state2)
+
+          assert {:error, {:bitcask_append_failed, _reason}} = result
+
+          {_read_state, elements} =
+            SM.apply(%{}, {:list_op, key, {:lrange, 0, -1}}, state2)
+
+          assert elements == ["a", "b", "c"]
+
+          assert {:ok, ^original_members} =
+                   Ferricstore.Store.Shard.CompoundMemberIndex.keys_for_prefix(
+                     member_index,
+                     prefix,
+                     10
+                   )
+
+          assert Enum.all?(original_members, &match?([_], :ets.lookup(ets, &1)))
+
+          cleanup_sm(ctx)
+        end
+
+        @tag :mixed_fast_delete_expiry_rollback
+        test "mixed fast-delete append failure restores the expiry tracker" do
+          ctx = fresh_sm_state()
+          {state, ets, instance_ctx, _dir} = ctx
+          key = "rollback-expiring-hash"
+          member_key = CompoundKey.hash_field(key, "field")
+          expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+
+          {state2, :ok} =
+            SM.apply(%{}, {:compound_put, member_key, "value", expire_at_ms}, state)
+
+          assert Ferricstore.Store.ExpiryTracker.count(instance_ctx, 0) == 1
+
+          bad_active_path = Path.join(state.shard_data_path, "append-failure.log")
+          File.mkdir_p!(bad_active_path)
+
+          Ferricstore.Store.ActiveFile.publish(
+            instance_ctx,
+            0,
+            state.active_file_id + 1,
+            bad_active_path,
+            state.shard_data_path
+          )
+
+          {_failed_state, result} =
+            SM.apply(
+              %{},
+              {:batch,
+               [
+                 {:compound_batch_delete, key, [member_key]},
+                 {:mset, [{"after-failed-delete", "value", 0}]}
+               ]},
+              state2
+            )
+
+          assert {:error, {:bitcask_append_failed, _reason}} = result
+
+          assert [{^member_key, "value", ^expire_at_ms, _lfu, _file_id, _offset, 5}] =
+                   :ets.lookup(ets, member_key)
+
+          assert Ferricstore.Store.ExpiryTracker.count(instance_ctx, 0) == 1
+          assert [] == :ets.lookup(ets, "after-failed-delete")
+
+          cleanup_sm(ctx)
+        end
       end
 
       describe "list_op: RPOP through Raft removes element" do
@@ -232,6 +329,7 @@ defmodule Ferricstore.Raft.WritePathTest.Sections.ListOpLpushThroughRaftAddsElem
           {:ok, dedicated_path} =
             Ferricstore.Store.Promotion.open_dedicated(state.data_dir, 0, :hash, key)
 
+          state = %{state | promoted_instances: %{key => %{path: dedicated_path}}}
           dedicated_log = Ferricstore.Store.Promotion.find_active(dedicated_path)
 
           assert File.stat!(dedicated_log).size == 0
@@ -293,6 +391,7 @@ defmodule Ferricstore.Raft.WritePathTest.Sections.ListOpLpushThroughRaftAddsElem
           {:ok, dedicated_path} =
             Ferricstore.Store.Promotion.open_dedicated(state.data_dir, 0, :hash, key)
 
+          state = %{state | promoted_instances: %{key => %{path: dedicated_path}}}
           dedicated_log = Ferricstore.Store.Promotion.find_active(dedicated_path)
 
           {state2, :ok} = SM.apply(%{}, {:compound_put, compound_key, "value1", 0}, state)
@@ -355,20 +454,24 @@ defmodule Ferricstore.Raft.WritePathTest.Sections.ListOpLpushThroughRaftAddsElem
           {state, ets, _store, _dir} = ctx
 
           # Insert several fields for a hash "myhash"
-          prefix = "myhash\x00"
+          prefix = CompoundKey.hash_prefix("myhash")
+          field1 = CompoundKey.hash_field("myhash", "f1")
+          field2 = CompoundKey.hash_field("myhash", "f2")
+          field3 = CompoundKey.hash_field("myhash", "f3")
+          other_field = CompoundKey.hash_field("otherhash", "x")
 
           {state2, :ok} =
-            SM.apply(%{}, {:compound_put, "myhash\x00f1", "v1", 0}, state)
+            SM.apply(%{}, {:compound_put, field1, "v1", 0}, state)
 
           {state3, :ok} =
-            SM.apply(%{}, {:compound_put, "myhash\x00f2", "v2", 0}, state2)
+            SM.apply(%{}, {:compound_put, field2, "v2", 0}, state2)
 
           {state4, :ok} =
-            SM.apply(%{}, {:compound_put, "myhash\x00f3", "v3", 0}, state3)
+            SM.apply(%{}, {:compound_put, field3, "v3", 0}, state3)
 
           # Also insert a key with a different prefix to ensure it is NOT deleted
           {state5, :ok} =
-            SM.apply(%{}, {:compound_put, "otherhash\x00x", "ox", 0}, state4)
+            SM.apply(%{}, {:compound_put, other_field, "ox", 0}, state4)
 
           # Verify all 4 keys exist in ETS
           assert :ets.info(ets, :size) == 4
@@ -380,17 +483,17 @@ defmodule Ferricstore.Raft.WritePathTest.Sections.ListOpLpushThroughRaftAddsElem
           assert state6.applied_count == 5
 
           # All "myhash" fields should be gone
-          assert [] == :ets.lookup(ets, "myhash\x00f1")
-          assert [] == :ets.lookup(ets, "myhash\x00f2")
-          assert [] == :ets.lookup(ets, "myhash\x00f3")
+          assert [] == :ets.lookup(ets, field1)
+          assert [] == :ets.lookup(ets, field2)
+          assert [] == :ets.lookup(ets, field3)
 
           # Bitcask should also have them deleted
-          assert [] = :ets.lookup(ets, "myhash\x00f1")
-          assert [] = :ets.lookup(ets, "myhash\x00f2")
-          assert [] = :ets.lookup(ets, "myhash\x00f3")
+          assert [] = :ets.lookup(ets, field1)
+          assert [] = :ets.lookup(ets, field2)
+          assert [] = :ets.lookup(ets, field3)
 
           # The "otherhash" key should still exist
-          assert [{_, "ox", _, _, _, _, _}] = :ets.lookup(ets, "otherhash\x00x")
+          assert [{_, "ox", _, _, _, _, _}] = :ets.lookup(ets, other_field)
 
           cleanup_sm(ctx)
         end
@@ -399,23 +502,26 @@ defmodule Ferricstore.Raft.WritePathTest.Sections.ListOpLpushThroughRaftAddsElem
           ctx = fresh_sm_state()
           {state, ets, _store, _dir} = ctx
 
-          prefix = "myset\x00"
+          prefix = CompoundKey.set_prefix("myset")
+          member1 = CompoundKey.set_member("myset", "m1")
+          member2 = CompoundKey.set_member("myset", "m2")
+          member3 = CompoundKey.set_member("myset", "m3")
 
           {state2, :ok} =
-            SM.apply(%{}, {:compound_put, "myset\x00m1", "1", 0}, state)
+            SM.apply(%{}, {:compound_put, member1, "1", 0}, state)
 
           {state3, :ok} =
-            SM.apply(%{}, {:compound_put, "myset\x00m2", "1", 0}, state2)
+            SM.apply(%{}, {:compound_put, member2, "1", 0}, state2)
 
           {state4, :ok} =
-            SM.apply(%{}, {:compound_put, "myset\x00m3", "1", 0}, state3)
+            SM.apply(%{}, {:compound_put, member3, "1", 0}, state3)
 
           {_state5, :ok} =
             SM.apply(%{}, {:compound_delete_prefix, prefix}, state4)
 
-          assert [] == :ets.lookup(ets, "myset\x00m1")
-          assert [] == :ets.lookup(ets, "myset\x00m2")
-          assert [] == :ets.lookup(ets, "myset\x00m3")
+          assert [] == :ets.lookup(ets, member1)
+          assert [] == :ets.lookup(ets, member2)
+          assert [] == :ets.lookup(ets, member3)
 
           cleanup_sm(ctx)
         end
@@ -436,18 +542,21 @@ defmodule Ferricstore.Raft.WritePathTest.Sections.ListOpLpushThroughRaftAddsElem
           ctx = fresh_sm_state()
           {state, ets, _store, _dir} = ctx
 
+          hash_a_field = CompoundKey.hash_field("hash_a", "f1")
+          hash_b_field = CompoundKey.hash_field("hash_b", "f1")
+
           {state2, :ok} =
-            SM.apply(%{}, {:compound_put, "hash_a\x00f1", "v1", 0}, state)
+            SM.apply(%{}, {:compound_put, hash_a_field, "v1", 0}, state)
 
           {state3, :ok} =
-            SM.apply(%{}, {:compound_put, "hash_b\x00f1", "v2", 0}, state2)
+            SM.apply(%{}, {:compound_put, hash_b_field, "v2", 0}, state2)
 
           # Only delete hash_a's fields
           {_state4, :ok} =
-            SM.apply(%{}, {:compound_delete_prefix, "hash_a\x00"}, state3)
+            SM.apply(%{}, {:compound_delete_prefix, CompoundKey.hash_prefix("hash_a")}, state3)
 
-          assert [] == :ets.lookup(ets, "hash_a\x00f1")
-          assert [{_, "v2", _, _, _, _, _}] = :ets.lookup(ets, "hash_b\x00f1")
+          assert [] == :ets.lookup(ets, hash_a_field)
+          assert [{_, "v2", _, _, _, _, _}] = :ets.lookup(ets, hash_b_field)
 
           cleanup_sm(ctx)
         end

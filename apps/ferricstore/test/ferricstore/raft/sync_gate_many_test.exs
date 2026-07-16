@@ -94,4 +94,120 @@ defmodule Ferricstore.Raft.SyncGateManyTest do
     assert {:ok, {:ok, tokens}} = Task.yield(entrant, 1_000)
     Enum.each(tokens, &SyncGate.leave/1)
   end
+
+  test "owner death releases only that pause lease and explicit resume is idempotent" do
+    shard_index = System.unique_integer([:positive]) + 300_000
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+    owner_lease = {owner, make_ref()}
+    nested_lease = {self(), make_ref()}
+
+    on_exit(fn -> SyncGate.force_resume(shard_index, 1_000) end)
+
+    assert {:ok, gate_pid} = SyncGate.pause(shard_index, owner_lease)
+    assert {:ok, ^gate_pid} = SyncGate.pause(shard_index, nested_lease)
+    assert {:ok, ^gate_pid} = SyncGate.pause(shard_index, nested_lease)
+
+    Process.exit(owner, :kill)
+
+    assert eventually(fn -> SyncGate.paused?(shard_index) end)
+    assert :ok = SyncGate.resume(shard_index, owner_lease, 1_000)
+    assert :ok = SyncGate.resume(shard_index, owner_lease, 1_000)
+    assert SyncGate.paused?(shard_index)
+
+    assert :ok = SyncGate.resume(shard_index, nested_lease, 1_000)
+    assert eventually(fn -> not SyncGate.paused?(shard_index) end)
+  end
+
+  test "sole pause owner death admits blocked writers" do
+    shard_index = System.unique_integer([:positive]) + 400_000
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        lease = {self(), make_ref()}
+        send(parent, {:sole_pause_acquired, self(), SyncGate.pause(shard_index, lease)})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:sole_pause_acquired, ^owner, {:ok, _gate_pid}}, 1_000
+
+    blocked =
+      Task.async(fn ->
+        SyncGate.enter(shard_index)
+      end)
+
+    refute Task.yield(blocked, 50)
+    Process.exit(owner, :kill)
+
+    assert {:ok, {:ok, token}} = Task.yield(blocked, 1_000)
+    SyncGate.leave(token)
+  end
+
+  test "explicit multi-shard pause unwinds earlier holds after partial acquisition failure" do
+    shard_index = System.unique_integer([:positive]) + 500_000
+    pause_lease = {self(), make_ref()}
+
+    assert {:error, {:sync_pause_many_failed, -1, _reason}} =
+             SyncGate.pause_many([shard_index, -1], pause_lease)
+
+    refute SyncGate.paused?(shard_index)
+    assert :ok = SyncGate.resume(shard_index, pause_lease, 1_000)
+  end
+
+  test "legacy pause survives the acquiring process and resumes from another process" do
+    shard_index = System.unique_integer([:positive]) + 600_000
+    parent = self()
+
+    on_exit(fn -> SyncGate.force_resume(shard_index, 1_000) end)
+
+    {pause_pid, pause_monitor} =
+      spawn_monitor(fn ->
+        send(parent, {:legacy_pause_result, SyncGate.pause(shard_index)})
+      end)
+
+    assert_receive {:legacy_pause_result, {:ok, _gate_pid}}, 1_000
+    assert_receive {:DOWN, ^pause_monitor, :process, ^pause_pid, :normal}, 1_000
+    Process.sleep(20)
+    assert SyncGate.paused?(shard_index)
+
+    resume_task =
+      Task.async(fn ->
+        SyncGate.resume(shard_index, 1_000)
+      end)
+
+    assert :ok = Task.await(resume_task, 1_000)
+    assert eventually(fn -> not SyncGate.paused?(shard_index) end)
+  end
+
+  test "releasing a gate fails drain waiters while admitted writers remain" do
+    shard_index = System.unique_integer([:positive]) + 700_000
+    pause_lease = {self(), make_ref()}
+
+    assert {:ok, active_token} = SyncGate.enter(shard_index)
+    assert {:ok, gate_pid} = SyncGate.pause(shard_index, pause_lease)
+
+    drain_waiter =
+      Task.async(fn ->
+        SyncGate.await_drained(gate_pid, 1_000)
+      end)
+
+    refute Task.yield(drain_waiter, 50)
+    assert :ok = SyncGate.resume(shard_index, pause_lease, 1_000)
+
+    assert {:ok, {:error, :sync_pause_released}} = Task.yield(drain_waiter, 1_000)
+    SyncGate.leave(active_token)
+  end
+
+  defp eventually(fun, attempts \\ 50)
+
+  defp eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(fun, attempts - 1)
+    end
+  end
+
+  defp eventually(_fun, 0), do: false
 end

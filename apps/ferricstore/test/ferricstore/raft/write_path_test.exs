@@ -55,17 +55,38 @@ defmodule Ferricstore.Raft.WritePathTest do
   use Ferricstore.Raft.WritePathTest.Sections.SetViaRouterGoesThroughRaft
 
   defp fresh_sm_state do
-    dir = Path.join(System.tmp_dir!(), "wp_sm_#{:rand.uniform(9_999_999)}")
+    suffix = System.unique_integer([:positive])
+    dir = Path.join(System.tmp_dir!(), "wp_sm_#{suffix}")
     shard_path = Ferricstore.DataDir.shard_data_path(dir, 0)
-    File.mkdir_p!(shard_path)
+    Ferricstore.DataDir.ensure_layout!(dir, 1)
 
-    # v2: create a .log file instead of NIF.new
     active_file_path = Path.join(shard_path, "00000.log")
     File.touch!(active_file_path)
 
-    suffix = :rand.uniform(9_999_999)
-    keydir_name = :"wp_sm_keydir_#{suffix}"
-    :ets.new(keydir_name, [:set, :public, :named_table])
+    instance_ctx =
+      FerricStore.Instance.build(:"wp_sm_#{suffix}",
+        data_dir: dir,
+        shard_count: 1,
+        hot_cache_max_value_size: 65_536
+      )
+
+    keydir = elem(instance_ctx.keydir_refs, 0)
+    :ets.new(keydir, [:set, :public, :named_table])
+
+    compound_member_index =
+      Ferricstore.Store.Shard.CompoundMemberIndex.table_name(instance_ctx.name, 0)
+
+    Ferricstore.Store.Shard.CompoundMemberIndex.ensure_table!(compound_member_index)
+    Ferricstore.Store.Shard.CompoundMemberIndex.reset(compound_member_index)
+    Ferricstore.Store.ActiveFile.init(1)
+
+    Ferricstore.Store.ActiveFile.publish(
+      instance_ctx,
+      0,
+      0,
+      active_file_path,
+      shard_path
+    )
 
     state =
       Ferricstore.Raft.StateMachine.init(%{
@@ -74,20 +95,33 @@ defmodule Ferricstore.Raft.WritePathTest do
         data_dir: dir,
         active_file_id: 0,
         active_file_path: active_file_path,
-        ets: keydir_name
+        ets: keydir,
+        instance_ctx: instance_ctx,
+        instance_name: instance_ctx.name
       })
 
-    {state, keydir_name, nil, dir}
+    {state, keydir, instance_ctx, dir}
   end
 
-  defp cleanup_sm({_state, ets_name, _store, dir}) do
-    try do
-      :ets.delete(ets_name)
-    rescue
-      ArgumentError -> :ok
-    end
-
+  defp cleanup_sm({_state, _ets, instance_ctx, dir}) do
+    FerricStore.Instance.cleanup(instance_ctx.name)
+    cleanup_sm_indexes(instance_ctx.name)
     File.rm_rf!(dir)
+  end
+
+  defp cleanup_sm_indexes(instance_name) do
+    {logical_key_index, logical_key_slots} =
+      Ferricstore.Store.Shard.LogicalKeyIndex.table_names(instance_name, 0)
+
+    [
+      Ferricstore.Store.Shard.CompoundMemberIndex.table_name(instance_name, 0),
+      Ferricstore.Store.Shard.CompoundRevisionIndex.table_name(instance_name, 0),
+      logical_key_index,
+      logical_key_slots
+    ]
+    |> Enum.each(fn table ->
+      if :ets.whereis(table) != :undefined, do: :ets.delete(table)
+    end)
   end
 
   alias Ferricstore.Raft.StateMachine, as: SM

@@ -56,10 +56,19 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   def invalidate_verified!(instance_name, shard_count)
       when is_integer(shard_count) and shard_count > 0 do
     Enum.each(0..(shard_count - 1), fn shard_index ->
-      :persistent_term.erase(verified_key(instance_name, shard_index))
+      invalidate_verified_shard!(instance_name, shard_index)
     end)
 
     :ok
+  end
+
+  @doc false
+  def invalidate_verified_shard!(instance_name, shard_index)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 do
+    :persistent_term.erase(verified_key(instance_name, shard_index))
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   def run!(shard_path, keydir, shard_index, instance_ctx, flow_index, flow_lookup, opts \\ []) do

@@ -1069,6 +1069,9 @@ defmodule FerricStore.Impl do
       compound_batch_get_meta: fn redis_key, compound_keys ->
         Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
       end,
+      compound_type_claim: fn redis_key, type ->
+        Router.compound_type_claim(ctx, redis_key, type)
+      end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
       end,

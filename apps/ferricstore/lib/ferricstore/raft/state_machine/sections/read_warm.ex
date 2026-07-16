@@ -635,7 +635,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       # locations for the whole batch. ZSET side indexes are queued and flushed
       # only after the append succeeds.
       defp do_shared_compound_batch_put_fast(state, redis_key, entries) do
-        if compound_shared_fast_path?(state) do
+        pending = Process.get(:sm_pending_writes, [])
+        pending_values = Process.get(:sm_pending_values, %{})
+
+        if compound_shared_fast_path?(state) and
+             fast_put_publish_possible?(pending, pending_values) do
           case List.last(entries) do
             {compound_key, _value, _expire_at_ms} ->
               queue_compound_promotion_after_flush(state, redis_key, compound_key)
@@ -643,10 +647,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             nil ->
               :ok
           end
-
-          pending = Process.get(:sm_pending_writes, [])
-          pending_values = Process.get(:sm_pending_values, %{})
-          fast_publish? = fast_put_publish_possible?(pending, pending_values)
 
           pending =
             Enum.reduce(entries, pending, fn {compound_key, value, expire_at_ms}, acc ->
@@ -656,7 +656,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             end)
 
           Process.put(:sm_pending_writes, pending)
-          Process.put(:sm_pending_fast_put_batch, fast_publish?)
+          Process.put(:sm_pending_fast_put_batch, true)
           :ok
         else
           do_compound_batch_put_generic(state, redis_key, entries)

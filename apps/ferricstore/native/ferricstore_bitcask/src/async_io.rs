@@ -34,6 +34,7 @@ const MIN_BLOCKING_THREADS: usize = 1;
 const MAX_BLOCKING_THREADS: usize = 256;
 const BLOCKING_THREADS_ENV: &str = "FERRICSTORE_TOKIO_BLOCKING_THREADS";
 const BLOCKING_ADMISSION_MULTIPLIER: usize = 4;
+const MIN_OUTSTANDING_BLOCKING_JOBS: usize = 128;
 const MAX_OUTSTANDING_BLOCKING_JOBS: usize = 4_096;
 pub const BLOCKING_OVERLOAD_ERROR: &str = "native async IO overloaded";
 
@@ -155,7 +156,7 @@ fn blocking_admission() -> &'static BlockingAdmission {
 fn blocking_admission_limit(blocking_threads: usize) -> usize {
     blocking_threads
         .saturating_mul(BLOCKING_ADMISSION_MULTIPLIER)
-        .clamp(MIN_BLOCKING_THREADS, MAX_OUTSTANDING_BLOCKING_JOBS)
+        .clamp(MIN_OUTSTANDING_BLOCKING_JOBS, MAX_OUTSTANDING_BLOCKING_JOBS)
 }
 
 fn blocking_thread_cap() -> usize {
@@ -184,8 +185,10 @@ mod tests {
 
     #[test]
     fn blocking_admission_limit_bounds_the_active_pool_and_waiting_queue() {
-        assert_eq!(blocking_admission_limit(1), 4);
-        assert_eq!(blocking_admission_limit(16), 64);
+        assert_eq!(blocking_admission_limit(1), 128);
+        assert_eq!(blocking_admission_limit(16), 128);
+        assert_eq!(blocking_admission_limit(32), 128);
+        assert_eq!(blocking_admission_limit(64), 256);
         assert_eq!(blocking_admission_limit(usize::MAX), 4_096);
     }
 

@@ -17,6 +17,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   @limit_store_max_mutation_amount 1_000
   @default_session_page_size 256
   @max_pending_activation_attempts 16
+  @max_flush_waiters_per_instance 64
 
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
@@ -27,7 +28,16 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     _table = create_table!()
     Process.send_after(self(), :recover_existing_default_session, 50)
 
-    {:ok, %{sessions: %{}, session_contexts: %{}, pending_pages: %{}, recovery_cursors: %{}}}
+    {:ok,
+     %{
+       sessions: %{},
+       session_contexts: %{},
+       pending_pages: %{},
+       recovery_cursors: %{},
+       flush_owners: %{},
+       flush_waiters: %{},
+       flush_monitors: %{}
+     }}
   end
 
   @impl true
@@ -100,33 +110,88 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
   end
 
   @impl true
-  def handle_call({:begin_flush, instance_name, token}, _from, state) do
+  def handle_call({:begin_flush, instance_name, token}, from, state) do
     table = create_table!()
-    key = coord_key(instance_name)
 
     case ensure_coord(table, instance_name) do
       {epoch, nil} ->
-        next_epoch = epoch + 1
-        true = :ets.insert(table, {key, next_epoch, token})
-        {:reply, {:ok, next_epoch}, state}
+        {reply, state} = activate_flush(table, instance_name, epoch, token, from, state)
+        {:reply, reply, state}
 
       {_epoch, _active_token} ->
-        {:reply, {:error, :flush_in_progress}, state}
+        if flush_owner?(state, instance_name, elem(from, 0)) do
+          {:reply, {:error, :flush_reentrant}, state}
+        else
+          case enqueue_flush_waiter(instance_name, token, from, state) do
+            {:ok, state} -> {:noreply, state}
+            {:error, reason, state} -> {:reply, {:error, reason}, state}
+          end
+        end
     end
   end
 
   @impl true
   def handle_call({:finish_flush, instance_name, token}, _from, state) do
     table = create_table!()
-    key = coord_key(instance_name)
+    {:reply, :ok, finish_active_flush(table, instance_name, token, state, true)}
+  end
 
-    case :ets.lookup(table, key) do
-      [{^key, epoch, ^token}] ->
-        true = :ets.insert(table, {key, epoch, nil})
-        {:reply, :ok, state}
+  @impl true
+  def handle_call(
+        {:detach_flush_batch, instance_name, token, ctx, now_ms, keys},
+        from,
+        state
+      ) do
+    table = create_table!()
 
-      _stale_or_finished ->
-        {:reply, :ok, state}
+    case detach_active_flush_batch(
+           table,
+           instance_name,
+           token,
+           elem(from, 0),
+           ctx,
+           now_ms,
+           keys,
+           state
+         ) do
+      {:ok, entries, state} -> {:reply, {:ok, entries}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_call(
+        {:detach_pending_flush_batch, instance_name, token, ctx, now_ms},
+        from,
+        state
+      ) do
+    case detach_active_pending_flush_batch(
+           instance_name,
+           token,
+           elem(from, 0),
+           ctx,
+           now_ms,
+           state
+         ) do
+      {:ok, entries, state} -> {:reply, {:ok, entries}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:resolve_flush_batch, instance_name, token, resolutions}, from, state) do
+    table = create_table!()
+
+    case resolve_active_flush_batch(
+           table,
+           instance_name,
+           token,
+           elem(from, 0),
+           resolutions,
+           state
+         ) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
@@ -333,27 +398,36 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
         end
 
       {{^generation, nil}, [expired_page | remaining_pages]} ->
-        opts = [
-          shard_id: expired_page.shard_id,
-          amount: length(expired_page.reservation_ids),
-          reservation_ids: expired_page.reservation_ids,
-          now_ms: now_ms
-        ]
+        case session_from_state(state, instance_name) do
+          {:ok, session} ->
+            case release_pending_page(
+                   ctx,
+                   session,
+                   expired_page,
+                   now_ms,
+                   release_fun,
+                   &discard_pending_pages/4
+                 ) do
+              {:ok, _released} ->
+                pending_pages = put_pending_pages(state.pending_pages, key, remaining_pages)
+                {:reply, :expired, %{state | pending_pages: pending_pages}}
 
-        case safe_release(release_fun, ctx, expired_page.scope, opts) do
-          {:ok, _owner} ->
-            case session_from_state(state, instance_name) do
-              {:ok, session} ->
-                CacheSessionStore.discard_pages(ctx, session, [expired_page],
-                  allowed_states: [:unused, :uncertain]
-                )
+              {:error, reason, _released} = error ->
+                retry_page = pending_page_after_failure(expired_page, error)
 
-              {:error, _reason} ->
-                :ok
+                pending_pages =
+                  put_pending_pages(state.pending_pages, key, [retry_page | remaining_pages])
+
+                {:reply, {:error, reason}, %{state | pending_pages: pending_pages}}
+
+              {:error, _reason} = error ->
+                retry_page = pending_page_after_failure(expired_page, error)
+
+                pending_pages =
+                  put_pending_pages(state.pending_pages, key, [retry_page | remaining_pages])
+
+                {:reply, error, %{state | pending_pages: pending_pages}}
             end
-
-            pending_pages = put_pending_pages(state.pending_pages, key, remaining_pages)
-            {:reply, :expired, %{state | pending_pages: pending_pages}}
 
           {:error, _reason} = error ->
             {:reply, error, state}
@@ -365,21 +439,6 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
       {_flush_started_or_generation_changed, _pages} ->
         {:reply, {:error, :cache_generation_changed}, state}
     end
-  end
-
-  @impl true
-  def handle_call({:flush_pending, ctx, instance_name, now_ms, release_fun}, _from, state) do
-    {counts, pending_pages} =
-      flush_pending_pages(
-        ctx,
-        Map.get(state.sessions, instance_name),
-        instance_name,
-        now_ms,
-        release_fun,
-        state.pending_pages
-      )
-
-    {:reply, counts, %{state | pending_pages: pending_pages}}
   end
 
   @impl true
@@ -440,6 +499,24 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     pending_pages = put_pending_pages(state.pending_pages, key, remaining)
     counts = merge_flush_counts(entry_counts, pending_counts)
     {:reply, counts, %{state | pending_pages: pending_pages}}
+  end
+
+  @impl true
+  def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
+    case Map.pop(state.flush_monitors, monitor_ref) do
+      {nil, _flush_monitors} ->
+        {:noreply, state}
+
+      {{:owner, instance_name, token}, flush_monitors} ->
+        state = %{state | flush_monitors: flush_monitors}
+        table = create_table!()
+        {:noreply, finish_active_flush(table, instance_name, token, state, false)}
+
+      {{:waiter, instance_name, token}, flush_monitors} ->
+        state = %{state | flush_monitors: flush_monitors}
+        {_waiter, state} = pop_flush_waiter(instance_name, token, state)
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -533,9 +610,10 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
       now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
       before_detach_fun = Keyword.get(opts, :before_detach_fun, fn _entry -> :ok end)
       release_fun = Keyword.get(opts, :release_fun, &LimitStore.release/3)
+      page_discard_fun = Keyword.get(opts, :page_discard_fun, &discard_pending_pages/4)
 
       if is_integer(now_ms) and now_ms >= 0 and is_function(before_detach_fun, 1) and
-           is_function(release_fun, 3) do
+           is_function(release_fun, 3) and is_function(page_discard_fun, 4) do
         case :ets.whereis(@table) do
           :undefined ->
             fun.()
@@ -547,6 +625,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
               now_ms,
               before_detach_fun,
               release_fun,
+              page_discard_fun,
               fn counts ->
                 if counts.errors == 0 do
                   try do
@@ -579,12 +658,23 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
       now_ms = Keyword.get(opts, :now_ms, Ferricstore.CommandTime.now_ms())
       before_detach_fun = Keyword.get(opts, :before_detach_fun, fn _entry -> :ok end)
       release_fun = Keyword.get(opts, :release_fun, &LimitStore.release/3)
+      page_discard_fun = Keyword.get(opts, :page_discard_fun, &discard_pending_pages/4)
 
       if is_integer(now_ms) and now_ms >= 0 and is_function(before_detach_fun, 1) and
-           is_function(release_fun, 3) do
+           is_function(release_fun, 3) and is_function(page_discard_fun, 4) do
         case :ets.whereis(@table) do
-          :undefined -> {:ok, %{released: 0, errors: 0}}
-          table -> flush_table(table, ctx, now_ms, before_detach_fun, release_fun)
+          :undefined ->
+            {:ok, %{released: 0, errors: 0}}
+
+          table ->
+            flush_table(
+              table,
+              ctx,
+              now_ms,
+              before_detach_fun,
+              release_fun,
+              page_discard_fun
+            )
         end
       else
         {:error, "ERR invalid flow limit cache flush opts"}
@@ -1132,10 +1222,23 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     end
   end
 
-  defp flush_table(table, ctx, now_ms, before_detach_fun, release_fun) do
-    with_cache_flush(table, ctx, now_ms, before_detach_fun, release_fun, fn counts ->
-      {:ok, counts}
-    end)
+  defp flush_table(
+         table,
+         ctx,
+         now_ms,
+         before_detach_fun,
+         release_fun,
+         page_discard_fun
+       ) do
+    with_cache_flush(
+      table,
+      ctx,
+      now_ms,
+      before_detach_fun,
+      release_fun,
+      page_discard_fun,
+      fn counts -> {:ok, counts} end
+    )
   end
 
   defp with_cache_flush(
@@ -1144,12 +1247,13 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
          now_ms,
          before_detach_fun,
          release_fun,
+         page_discard_fun,
          after_drain_fun
        ) do
     instance_name = instance_name(ctx)
     token = make_ref()
 
-    case GenServer.call(__MODULE__, {:begin_flush, instance_name, token}) do
+    case GenServer.call(__MODULE__, {:begin_flush, instance_name, token}, :infinity) do
       {:ok, _generation} ->
         try do
           detached_counts =
@@ -1157,6 +1261,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
               table,
               ctx,
               instance_name,
+              token,
               now_ms,
               before_detach_fun,
               release_fun,
@@ -1164,20 +1269,24 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
             )
 
           pending_counts =
-            GenServer.call(
-              __MODULE__,
-              {:flush_pending, ctx, instance_name, now_ms, release_fun},
-              30_000
+            drain_pending_flush_batches(
+              ctx,
+              instance_name,
+              token,
+              now_ms,
+              release_fun,
+              page_discard_fun,
+              %{released: 0, errors: 0}
             )
 
           detached_counts
           |> merge_flush_counts(pending_counts)
           |> after_drain_fun.()
         after
-          GenServer.call(__MODULE__, {:finish_flush, instance_name, token})
+          GenServer.call(__MODULE__, {:finish_flush, instance_name, token}, :infinity)
         end
 
-      {:error, :flush_in_progress} = error ->
+      {:error, _reason} = error ->
         error
     end
   end
@@ -1186,17 +1295,34 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
          table,
          ctx,
          instance_name,
+         token,
          now_ms,
          before_detach_fun,
          release_fun,
          counts
        ) do
-    case detach_cached_batch(table, instance_name, before_detach_fun) do
-      [] ->
+    case detach_cached_batch(
+           table,
+           ctx,
+           instance_name,
+           token,
+           now_ms,
+           before_detach_fun
+         ) do
+      {:ok, []} ->
         counts
 
-      detached_entries ->
-        batch_counts = release_detached(table, ctx, detached_entries, now_ms, release_fun)
+      {:ok, detached_entries} ->
+        batch_counts =
+          release_detached(
+            ctx,
+            instance_name,
+            token,
+            detached_entries,
+            now_ms,
+            release_fun
+          )
+
         counts = merge_flush_counts(counts, batch_counts)
 
         if batch_counts.errors == 0 do
@@ -1204,6 +1330,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
             table,
             ctx,
             instance_name,
+            token,
             now_ms,
             before_detach_fun,
             release_fun,
@@ -1212,27 +1339,77 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
         else
           counts
         end
+
+      {:error, _reason} ->
+        Map.update!(counts, :errors, &(&1 + 1))
     end
   end
 
-  defp detach_cached_batch(table, instance_name, before_detach_fun) do
+  defp drain_pending_flush_batches(
+         ctx,
+         instance_name,
+         token,
+         now_ms,
+         release_fun,
+         page_discard_fun,
+         counts
+       ) do
+    case GenServer.call(
+           __MODULE__,
+           {:detach_pending_flush_batch, instance_name, token, ctx, now_ms},
+           :infinity
+         ) do
+      {:ok, []} ->
+        counts
+
+      {:ok, detached_entries} ->
+        batch_counts =
+          release_detached_pending_pages(
+            instance_name,
+            token,
+            detached_entries,
+            now_ms,
+            release_fun,
+            page_discard_fun
+          )
+
+        counts = merge_flush_counts(counts, batch_counts)
+
+        if batch_counts.errors == 0 do
+          drain_pending_flush_batches(
+            ctx,
+            instance_name,
+            token,
+            now_ms,
+            release_fun,
+            page_discard_fun,
+            counts
+          )
+        else
+          counts
+        end
+
+      {:error, _reason} ->
+        Map.update!(counts, :errors, &(&1 + 1))
+    end
+  end
+
+  defp detach_cached_batch(table, ctx, instance_name, token, now_ms, before_detach_fun) do
     match_spec = cache_entry_match_spec(instance_name)
 
     case :ets.select(table, match_spec, @flush_batch_size) do
       {entries, _continuation} ->
-        entries
-        |> Enum.reduce([], fn snapshot, acc ->
-          invoke_before_detach(before_detach_fun, snapshot)
+        Enum.each(entries, &invoke_before_detach(before_detach_fun, &1))
+        keys = Enum.map(entries, &elem(&1, 0))
 
-          case :ets.take(table, elem(snapshot, 0)) do
-            [entry] -> [entry | acc]
-            [] -> acc
-          end
-        end)
-        |> Enum.reverse()
+        GenServer.call(
+          __MODULE__,
+          {:detach_flush_batch, instance_name, token, ctx, now_ms, keys},
+          :infinity
+        )
 
       :"$end_of_table" ->
-        []
+        {:ok, []}
     end
   end
 
@@ -1242,54 +1419,118 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     _kind, _reason -> :ok
   end
 
-  defp release_detached(table, ctx, entries, now_ms, release_fun) do
-    Enum.reduce(entries, %{released: 0, errors: 0}, fn
-      {{_instance, scope, shard_id}, _available, expires_at_ms, capacity, reservation_ids,
-       _config_version, _effective_limit, @entry_tag} = entry,
-      acc
-      when is_binary(scope) and is_integer(shard_id) and is_integer(expires_at_ms) and
-             is_integer(capacity) and capacity >= 0 and is_list(reservation_ids) ->
-        release_detached_entry(
-          table,
-          ctx,
-          entry,
-          scope,
-          shard_id,
-          reservation_ids,
-          now_ms,
-          release_fun,
-          acc
-        )
+  defp release_detached(ctx, instance_name, token, entries, now_ms, release_fun) do
+    {counts, resolutions} =
+      Enum.reduce(entries, {%{released: 0, errors: 0}, []}, fn
+        {{_instance, scope, shard_id}, _available, expires_at_ms, capacity, reservation_ids,
+         _config_version, _effective_limit, @entry_tag} = entry,
+        {counts, resolutions}
+        when is_binary(scope) and is_integer(shard_id) and is_integer(expires_at_ms) and
+               is_integer(capacity) and capacity >= 0 and is_list(reservation_ids) ->
+          case release_detached_entry(
+                 ctx,
+                 scope,
+                 shard_id,
+                 reservation_ids,
+                 now_ms,
+                 release_fun
+               ) do
+            {:ok, released} ->
+              counts = Map.update!(counts, :released, &(&1 + released))
+              {counts, [{:released, {:cache_entry, elem(entry, 0)}} | resolutions]}
 
-      invalid_entry, acc ->
-        restore_invalid_entry(table, invalid_entry)
-        Map.update!(acc, :errors, &(&1 + 1))
-    end)
+            {:error, _reason} = error ->
+              counts = Map.update!(counts, :errors, &(&1 + 1))
+
+              resolution =
+                cache_entry_failure_resolution(
+                  {:cache_entry, elem(entry, 0)},
+                  error
+                )
+
+              {counts, [resolution | resolutions]}
+          end
+
+        invalid_entry, {counts, resolutions} ->
+          counts = Map.update!(counts, :errors, &(&1 + 1))
+          {counts, [{:restore, {:cache_entry, elem(invalid_entry, 0)}} | resolutions]}
+      end)
+
+    case GenServer.call(
+           __MODULE__,
+           {:resolve_flush_batch, instance_name, token, Enum.reverse(resolutions)},
+           :infinity
+         ) do
+      :ok -> counts
+      {:error, _reason} -> Map.update!(counts, :errors, &(&1 + 1))
+    end
+  end
+
+  defp release_detached_pending_pages(
+         instance_name,
+         token,
+         entries,
+         now_ms,
+         release_fun,
+         page_discard_fun
+       ) do
+    {counts, resolutions} =
+      Enum.reduce(entries, {%{released: 0, errors: 0}, []}, fn
+        %{inflight_key: inflight_key, ctx: ctx, session: session, page: page},
+        {counts, resolutions} ->
+          case release_pending_page(
+                 ctx,
+                 session,
+                 page,
+                 now_ms,
+                 release_fun,
+                 page_discard_fun
+               ) do
+            {:ok, released} ->
+              counts = Map.update!(counts, :released, &(&1 + released))
+              {counts, [{:released, inflight_key} | resolutions]}
+
+            {:error, _reason, released} = error ->
+              counts =
+                counts
+                |> Map.update!(:released, &(&1 + released))
+                |> Map.update!(:errors, &(&1 + 1))
+
+              {counts, [pending_page_failure_resolution(inflight_key, error) | resolutions]}
+
+            {:error, _reason} = error ->
+              counts = Map.update!(counts, :errors, &(&1 + 1))
+              {counts, [pending_page_failure_resolution(inflight_key, error) | resolutions]}
+          end
+      end)
+
+    case GenServer.call(
+           __MODULE__,
+           {:resolve_flush_batch, instance_name, token, Enum.reverse(resolutions)},
+           :infinity
+         ) do
+      :ok -> counts
+      {:error, _reason} -> Map.update!(counts, :errors, &(&1 + 1))
+    end
   end
 
   defp release_detached_entry(
-         _table,
          _ctx,
-         _entry,
          _scope,
          _shard_id,
          [],
          _now_ms,
-         _release_fun,
-         counts
+         _release_fun
        ),
-       do: counts
+       do: {:ok, 0}
 
   defp release_detached_entry(
-         table,
          ctx,
-         entry,
          scope,
          shard_id,
          reservation_ids,
          now_ms,
-         release_fun,
-         counts
+         release_fun
        ) do
     opts = [
       shard_id: shard_id,
@@ -1299,14 +1540,50 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     ]
 
     case safe_release(release_fun, ctx, scope, opts) do
-      {:ok, _owner} ->
-        Map.update!(counts, :released, &(&1 + length(reservation_ids)))
-
-      {:error, _reason} ->
-        restore_cached_entry(table, entry)
-        Map.update!(counts, :errors, &(&1 + 1))
+      {:ok, _owner} -> {:ok, length(reservation_ids)}
+      {:error, _reason} = error -> error
     end
   end
+
+  defp release_pending_page(ctx, session, page, now_ms, release_fun, page_discard_fun)
+       when is_map(session) and is_map(page) and is_function(page_discard_fun, 4) do
+    opts = [
+      shard_id: page.shard_id,
+      amount: length(page.reservation_ids),
+      reservation_ids: page.reservation_ids,
+      now_ms: now_ms
+    ]
+
+    case safe_release(release_fun, ctx, page.scope, opts) do
+      {:ok, _owner} ->
+        case safe_discard_pages(
+               page_discard_fun,
+               ctx,
+               session,
+               [page],
+               allowed_states: [:unused, :uncertain]
+             ) do
+          :ok ->
+            {:ok, length(page.reservation_ids)}
+
+          {:error, reason} ->
+            {:error, {:pending_page_discard_failed, reason}, length(page.reservation_ids)}
+        end
+
+      {:error, reason} ->
+        {:error, {:pending_page_release_failed, reason}}
+    end
+  end
+
+  defp release_pending_page(
+         _ctx,
+         _session,
+         _page,
+         _now_ms,
+         _release_fun,
+         _page_discard_fun
+       ),
+       do: {:error, :cache_session_unavailable}
 
   defp flush_pending_pages(
          ctx,
@@ -1323,32 +1600,38 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
         if elem(key, 0) == instance_name do
           {counts, remaining} =
             Enum.reduce(pages, {counts, []}, fn page, {page_counts, remaining} ->
-              opts = [
-                shard_id: page.shard_id,
-                amount: length(page.reservation_ids),
-                reservation_ids: page.reservation_ids,
-                now_ms: now_ms
-              ]
-
-              case safe_release(release_fun, ctx, page.scope, opts) do
-                {:ok, _owner} ->
-                  if is_map(session) do
-                    CacheSessionStore.discard_pages(ctx, session, [page],
-                      allowed_states: [:unused, :uncertain]
-                    )
-                  end
-
+              case release_pending_page(
+                     ctx,
+                     session,
+                     page,
+                     now_ms,
+                     release_fun,
+                     &discard_pending_pages/4
+                   ) do
+                {:ok, released} ->
                   updated_counts =
                     Map.update!(
                       page_counts,
                       :released,
-                      &(&1 + length(page.reservation_ids))
+                      &(&1 + released)
                     )
 
                   {updated_counts, remaining}
 
-                {:error, _reason} ->
-                  {Map.update!(page_counts, :errors, &(&1 + 1)), [page | remaining]}
+                {:error, _reason, released} = error ->
+                  retry_page = pending_page_after_failure(page, error)
+
+                  updated_counts =
+                    page_counts
+                    |> Map.update!(:released, &(&1 + released))
+                    |> Map.update!(:errors, &(&1 + 1))
+
+                  {updated_counts, [retry_page | remaining]}
+
+                {:error, _reason} = error ->
+                  retry_page = pending_page_after_failure(page, error)
+
+                  {Map.update!(page_counts, :errors, &(&1 + 1)), [retry_page | remaining]}
               end
             end)
 
@@ -1435,15 +1718,8 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     []
   end
 
-  defp restore_fenced_entry(
-         {key, available, expires_at_ms, capacity, reservation_ids, config_version,
-          effective_limit, @entry_tag}
-       ) do
-    fenced_entry =
-      {key, available, expires_at_ms, capacity, reservation_ids, {:fenced, config_version},
-       effective_limit, @entry_tag}
-
-    :ets.insert_new(table(), fenced_entry)
+  defp restore_fenced_entry(entry) do
+    restore_fenced_detached_entry(table(), entry)
     :ok
   end
 
@@ -1451,7 +1727,7 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
          {_key, _available, _expires_at_ms, _capacity, _ids, config_version, effective_limit,
           @entry_tag}
        ),
-       do: {config_version, effective_limit}
+       do: {unfenced_config_version(config_version), normalized_effective_limit(effective_limit)}
 
   defp merge_flush_counts(left, right) do
     %{
@@ -1470,6 +1746,46 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
     kind, reason -> {:error, {kind, reason}}
   end
 
+  defp safe_discard_pages(page_discard_fun, ctx, session, pages, opts) do
+    case page_discard_fun.(ctx, session, pages, opts) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, {:invalid_page_discard_result, other}}
+    end
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp discard_pending_pages(ctx, session, pages, opts) do
+    CacheSessionStore.discard_pages(ctx, session, pages, opts)
+  end
+
+  defp cache_entry_failure_resolution(key, {:error, {:timeout, :unknown_outcome}}),
+    do: {:retry, key}
+
+  defp cache_entry_failure_resolution(key, _error), do: {:restore, key}
+
+  defp pending_page_failure_resolution(key, error) do
+    if pending_page_retry_required?(error), do: {:retry, key}, else: {:restore, key}
+  end
+
+  defp pending_page_after_failure(page, error) do
+    if pending_page_retry_required?(error), do: Map.put(page, :retry_only, true), else: page
+  end
+
+  defp pending_page_retry_required?(
+         {:error, {:pending_page_release_failed, {:timeout, :unknown_outcome}}}
+       ),
+       do: true
+
+  defp pending_page_retry_required?({:error, {:pending_page_discard_failed, _reason}}),
+    do: true
+
+  defp pending_page_retry_required?({:error, {:pending_page_discard_failed, _reason}, _released}),
+    do: true
+
+  defp pending_page_retry_required?(_error), do: false
+
   defp restore_cached_entry(
          table,
          {key, _available, expires_at_ms, capacity, reservation_ids, config_version,
@@ -1485,6 +1801,86 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
       effective_limit
     )
   end
+
+  defp restore_detached_entry(
+         table,
+         {{_instance, scope, shard_id}, _available, expires_at_ms, capacity, reservation_ids,
+          _config_version, _effective_limit, @entry_tag} = entry
+       )
+       when is_binary(scope) and is_integer(shard_id) and is_integer(expires_at_ms) and
+              is_integer(capacity) and capacity >= 0 and is_list(reservation_ids) do
+    restore_cached_entry(table, entry)
+  end
+
+  defp restore_detached_entry(table, entry), do: restore_invalid_entry(table, entry)
+
+  defp restore_fenced_detached_entry(
+         table,
+         {key, _available, expires_at_ms, capacity, reservation_ids, config_version,
+          effective_limit, @entry_tag}
+       )
+       when is_integer(expires_at_ms) and is_integer(capacity) and capacity >= 0 and
+              is_list(reservation_ids) do
+    fenced_entry =
+      {key, length(reservation_ids), expires_at_ms, capacity, reservation_ids,
+       {:fenced, unfenced_config_version(config_version)},
+       normalized_effective_limit(effective_limit), @entry_tag}
+
+    restore_fenced_cached_entry(table, fenced_entry)
+  end
+
+  defp restore_fenced_detached_entry(table, entry), do: restore_invalid_entry(table, entry)
+
+  defp restore_fenced_cached_entry(
+         table,
+         {key, available, expires_at_ms, capacity, reservation_ids, fenced_version,
+          effective_limit, @entry_tag} = fenced_entry
+       ) do
+    case :ets.lookup(table, key) do
+      [] ->
+        if :ets.insert_new(table, fenced_entry) do
+          :ok
+        else
+          restore_fenced_cached_entry(table, fenced_entry)
+        end
+
+      [
+        current =
+            {^key, old_available, old_expiry, old_capacity, old_ids, _old_version,
+             _old_effective_limit, @entry_tag}
+      ]
+      when is_integer(old_available) and old_available >= 0 and is_integer(old_expiry) and
+             is_integer(old_capacity) and old_capacity >= 0 and is_list(old_ids) ->
+        updated =
+          {key, old_available + available, max(old_expiry, expires_at_ms),
+           old_capacity + capacity, reservation_ids ++ old_ids, fenced_version, effective_limit,
+           @entry_tag}
+
+        if replace_exact(table, current, updated) do
+          :ok
+        else
+          restore_fenced_cached_entry(table, fenced_entry)
+        end
+
+      [invalid_entry] ->
+        if delete_exact(table, invalid_entry) do
+          restore_fenced_cached_entry(table, fenced_entry)
+        else
+          restore_fenced_cached_entry(table, fenced_entry)
+        end
+    end
+  end
+
+  defp unfenced_config_version({:fenced, version}), do: unfenced_config_version(version)
+  defp unfenced_config_version(version) when is_integer(version) and version >= 0, do: version
+  defp unfenced_config_version(_invalid), do: 0
+
+  defp normalized_effective_limit(nil), do: nil
+
+  defp normalized_effective_limit(limit) when is_integer(limit) and limit >= 0,
+    do: limit
+
+  defp normalized_effective_limit(_invalid), do: nil
 
   defp restore_invalid_entry(table, entry) do
     case entry do
@@ -1502,6 +1898,9 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
        [:"$_"]}
     ]
   end
+
+  defp flush_cache_key?({instance_name, _scope, _shard_id}, instance_name), do: true
+  defp flush_cache_key?(_key, _instance_name), do: false
 
   defp ensure_cached_lease_deadline(ctx, scope, key, opts, now_ms) do
     case {Keyword.get(opts, :ttl_ms), :ets.lookup(table(), key)} do
@@ -1560,7 +1959,8 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
 
   defp pending_reservations?(state) do
     Enum.any?(state.pending_pages, fn {_key, pages} -> pages != [] end) or
-      Enum.any?(state.recovery_cursors, fn {_instance_name, cursor} -> cursor != :done end)
+      Enum.any?(state.recovery_cursors, fn {_instance_name, cursor} -> cursor != :done end) or
+      Enum.any?(state.flush_owners, fn {_instance_name, owner} -> owner.inflight != %{} end)
   end
 
   defp ensure_cache_session(ctx) do
@@ -1787,6 +2187,526 @@ defmodule Ferricstore.Flow.Governance.LimitCache do
           ensure_coord(table, instance_name)
         end
     end
+  end
+
+  defp activate_flush(table, instance_name, epoch, token, from, state) do
+    pid = elem(from, 0)
+    monitor_ref = Process.monitor(pid)
+    next_epoch = epoch + 1
+    key = coord_key(instance_name)
+
+    true = :ets.insert(table, {key, next_epoch, token})
+
+    owner = %{pid: pid, token: token, monitor_ref: monitor_ref, inflight: %{}}
+
+    state = %{
+      state
+      | flush_owners: Map.put(state.flush_owners, instance_name, owner),
+        flush_monitors: Map.put(state.flush_monitors, monitor_ref, {:owner, instance_name, token})
+    }
+
+    {{:ok, next_epoch}, state}
+  end
+
+  defp enqueue_flush_waiter(instance_name, token, from, state) do
+    queue = Map.get(state.flush_waiters, instance_name, :queue.new())
+
+    if :queue.len(queue) >= @max_flush_waiters_per_instance do
+      {:error, :flush_queue_full, state}
+    else
+      pid = elem(from, 0)
+      monitor_ref = Process.monitor(pid)
+
+      waiter = %{
+        from: from,
+        pid: pid,
+        token: token,
+        monitor_ref: monitor_ref
+      }
+
+      state = %{
+        state
+        | flush_waiters: Map.put(state.flush_waiters, instance_name, :queue.in(waiter, queue)),
+          flush_monitors:
+            Map.put(state.flush_monitors, monitor_ref, {:waiter, instance_name, token})
+      }
+
+      {:ok, state}
+    end
+  end
+
+  defp detach_active_flush_batch(
+         table,
+         instance_name,
+         token,
+         pid,
+         ctx,
+         now_ms,
+         keys,
+         state
+       )
+       when is_list(keys) do
+    case Map.get(state.flush_owners, instance_name) do
+      %{token: ^token, pid: ^pid, inflight: inflight} = owner ->
+        {entries, inflight} =
+          Enum.reduce(keys, {[], inflight}, fn key, {entries, inflight} ->
+            cond do
+              not flush_cache_key?(key, instance_name) ->
+                {entries, inflight}
+
+              Map.has_key?(inflight, {:cache_entry, key}) ->
+                {entries, inflight}
+
+              true ->
+                case :ets.take(table, key) do
+                  [entry] ->
+                    inflight_key = {:cache_entry, key}
+                    recovery = %{kind: :cache_entry, entry: entry, ctx: ctx, now_ms: now_ms}
+                    {[entry | entries], Map.put(inflight, inflight_key, recovery)}
+
+                  [] ->
+                    {entries, inflight}
+                end
+            end
+          end)
+
+        owner = %{owner | inflight: inflight}
+        state = put_flush_owner(state, instance_name, owner)
+        {:ok, Enum.reverse(entries), state}
+
+      _missing_or_replaced ->
+        {:error, :cache_generation_changed}
+    end
+  end
+
+  defp detach_active_flush_batch(
+         _table,
+         _instance_name,
+         _token,
+         _pid,
+         _ctx,
+         _now_ms,
+         _keys,
+         _state
+       ),
+       do: {:error, :cache_generation_changed}
+
+  defp detach_active_pending_flush_batch(
+         instance_name,
+         token,
+         pid,
+         ctx,
+         now_ms,
+         state
+       ) do
+    case Map.get(state.flush_owners, instance_name) do
+      %{token: ^token, pid: ^pid, inflight: inflight} = owner ->
+        if pending_pages_for_instance?(state.pending_pages, instance_name) do
+          case Map.get(state.sessions, instance_name) do
+            session when is_map(session) ->
+              {entries, pending_pages} =
+                detach_pending_pages(
+                  state.pending_pages,
+                  instance_name,
+                  ctx,
+                  session,
+                  @flush_batch_size
+                )
+
+              inflight =
+                Enum.reduce(entries, inflight, fn entry, inflight ->
+                  recovery =
+                    entry
+                    |> Map.take([:ctx, :session, :page, :pending_key])
+                    |> Map.put(:kind, :pending_page)
+                    |> Map.put(:now_ms, now_ms)
+
+                  Map.put(inflight, entry.inflight_key, recovery)
+                end)
+
+              owner = %{owner | inflight: inflight}
+
+              state =
+                state
+                |> Map.put(:pending_pages, pending_pages)
+                |> put_flush_owner(instance_name, owner)
+
+              {:ok, entries, state}
+
+            _missing_session ->
+              {:error, :cache_session_unavailable}
+          end
+        else
+          {:ok, [], state}
+        end
+
+      _missing_or_replaced ->
+        {:error, :cache_generation_changed}
+    end
+  end
+
+  defp detach_pending_pages(pending_pages, instance_name, ctx, session, limit) do
+    {entries, pending_pages, _remaining} =
+      Enum.reduce_while(
+        pending_pages,
+        {[], pending_pages, limit},
+        fn
+          {{^instance_name, _scope, _shard_id} = pending_key, pages},
+          {entries, pending_pages, remaining}
+          when remaining > 0 ->
+            {detached, kept} = Enum.split(pages, remaining)
+
+            pending_pages =
+              if kept == [] do
+                Map.delete(pending_pages, pending_key)
+              else
+                Map.put(pending_pages, pending_key, kept)
+              end
+
+            entries =
+              Enum.reduce(detached, entries, fn page, entries ->
+                [
+                  %{
+                    inflight_key: pending_page_inflight_key(page),
+                    pending_key: pending_key,
+                    ctx: ctx,
+                    session: session,
+                    page: page
+                  }
+                  | entries
+                ]
+              end)
+
+            remaining = remaining - length(detached)
+
+            if remaining == 0 do
+              {:halt, {entries, pending_pages, remaining}}
+            else
+              {:cont, {entries, pending_pages, remaining}}
+            end
+
+          _other, acc ->
+            {:cont, acc}
+        end
+      )
+
+    {Enum.reverse(entries), pending_pages}
+  end
+
+  defp resolve_active_flush_batch(
+         table,
+         instance_name,
+         token,
+         pid,
+         resolutions,
+         state
+       )
+       when is_list(resolutions) do
+    case Map.get(state.flush_owners, instance_name) do
+      %{token: ^token, pid: ^pid, inflight: inflight} = owner ->
+        {inflight, state} =
+          Enum.reduce(resolutions, {inflight, state}, fn
+            {:released, key}, {inflight, state} ->
+              {Map.delete(inflight, key), state}
+
+            {:restore, key}, {inflight, state} ->
+              case Map.pop(inflight, key) do
+                {nil, inflight} ->
+                  {inflight, state}
+
+                {recovery, inflight} ->
+                  {inflight, restore_inflight(table, recovery, state, :restore)}
+              end
+
+            {:retry, key}, {inflight, state} ->
+              case Map.pop(inflight, key) do
+                {nil, inflight} ->
+                  {inflight, state}
+
+                {recovery, inflight} ->
+                  {inflight, restore_inflight(table, recovery, state, :retry)}
+              end
+
+            _invalid_resolution, acc ->
+              acc
+          end)
+
+        owner = %{owner | inflight: inflight}
+        {:ok, put_flush_owner(state, instance_name, owner)}
+
+      _missing_or_replaced ->
+        {:error, :cache_generation_changed}
+    end
+  end
+
+  defp resolve_active_flush_batch(
+         _table,
+         _instance_name,
+         _token,
+         _pid,
+         _resolutions,
+         _state
+       ),
+       do: {:error, :cache_generation_changed}
+
+  defp recover_active_flush_entries(table, instance_name, token, state) do
+    case Map.get(state.flush_owners, instance_name) do
+      %{token: ^token, inflight: inflight} = owner ->
+        state =
+          Enum.reduce(inflight, state, fn {_key, recovery}, state ->
+            recover_inflight(table, recovery, state)
+          end)
+
+        put_flush_owner(state, instance_name, %{owner | inflight: %{}})
+
+      _missing_or_replaced ->
+        state
+    end
+  end
+
+  defp recover_inflight(
+         table,
+         %{
+           kind: :cache_entry,
+           entry:
+             {{_instance, scope, shard_id}, _available, expires_at_ms, capacity, reservation_ids,
+              _config_version, _effective_limit, @entry_tag} = entry,
+           ctx: ctx,
+           now_ms: now_ms
+         },
+         state
+       )
+       when is_binary(scope) and is_integer(shard_id) and is_integer(expires_at_ms) and
+              is_integer(capacity) and capacity >= 0 and is_list(reservation_ids) do
+    case release_detached_entry(
+           ctx,
+           scope,
+           shard_id,
+           reservation_ids,
+           now_ms,
+           &LimitStore.release/3
+         ) do
+      {:ok, _released} ->
+        state
+
+      {:error, _reason} = error ->
+        mode =
+          case cache_entry_failure_resolution(:recovery, error) do
+            {:retry, :recovery} -> :retry
+            {:restore, :recovery} -> :restore
+          end
+
+        restore_inflight(table, %{kind: :cache_entry, entry: entry}, state, mode)
+    end
+  end
+
+  defp recover_inflight(
+         _table,
+         %{
+           kind: :pending_page,
+           ctx: ctx,
+           session: session,
+           page: page,
+           now_ms: now_ms
+         } = recovery,
+         state
+       ) do
+    case release_pending_page(
+           ctx,
+           session,
+           page,
+           now_ms,
+           &LimitStore.release/3,
+           &discard_pending_pages/4
+         ) do
+      {:ok, _released} ->
+        state
+
+      {:error, _reason, _released} ->
+        restore_inflight(nil, recovery, state, :retry)
+
+      {:error, _reason} = error ->
+        mode = if pending_page_retry_required?(error), do: :retry, else: :restore
+        restore_inflight(nil, recovery, state, mode)
+    end
+  end
+
+  defp recover_inflight(table, %{entry: entry}, state) do
+    restore_detached_entry(table, entry)
+    state
+  end
+
+  defp recover_inflight(_table, recovery, state) do
+    restore_inflight(nil, recovery, state, :restore)
+  end
+
+  defp restore_inflight(table, %{kind: :cache_entry, entry: entry}, state, :retry) do
+    restore_fenced_detached_entry(table, entry)
+    state
+  end
+
+  defp restore_inflight(table, %{kind: :cache_entry, entry: entry}, state, _mode) do
+    restore_detached_entry(table, entry)
+    state
+  end
+
+  defp restore_inflight(
+         _table,
+         %{kind: :pending_page, pending_key: pending_key, page: page},
+         state,
+         mode
+       ) do
+    page = if mode == :retry, do: Map.put(page, :retry_only, true), else: page
+
+    pending_pages =
+      Map.update(state.pending_pages, pending_key, [page], fn pages ->
+        [page | pages]
+        |> Enum.uniq_by(&pending_page_inflight_key/1)
+        |> Enum.sort_by(& &1.sequence)
+      end)
+
+    %{state | pending_pages: pending_pages}
+  end
+
+  defp restore_inflight(_table, _invalid_recovery, state, _mode), do: state
+
+  defp pending_page_inflight_key(page) do
+    {:pending_page, page.session_id, page.generation, page.sequence}
+  end
+
+  defp pending_pages_for_instance?(pending_pages, instance_name) do
+    Enum.any?(pending_pages, fn
+      {{^instance_name, _scope, _shard_id}, pages} -> pages != []
+      _other -> false
+    end)
+  end
+
+  defp finish_active_flush(table, instance_name, token, state, demonitor?) do
+    key = coord_key(instance_name)
+
+    case :ets.lookup(table, key) do
+      [{^key, epoch, ^token}] ->
+        state = recover_active_flush_entries(table, instance_name, token, state)
+        state = drop_flush_owner(instance_name, token, state, demonitor?)
+        promote_next_flush(table, instance_name, epoch, state)
+
+      _stale_or_finished ->
+        state
+    end
+  end
+
+  defp drop_flush_owner(instance_name, token, state, demonitor?) do
+    case Map.get(state.flush_owners, instance_name) do
+      %{token: ^token, monitor_ref: monitor_ref} ->
+        if demonitor?, do: Process.demonitor(monitor_ref, [:flush])
+
+        %{
+          state
+          | flush_owners: Map.delete(state.flush_owners, instance_name),
+            flush_monitors: Map.delete(state.flush_monitors, monitor_ref)
+        }
+
+      _missing_or_replaced ->
+        state
+    end
+  end
+
+  defp promote_next_flush(table, instance_name, epoch, state) do
+    case take_next_live_flush_waiter(instance_name, state) do
+      {nil, state} ->
+        true = :ets.insert(table, {coord_key(instance_name), epoch, nil})
+        state
+
+      {waiter, state} ->
+        next_epoch = epoch + 1
+
+        true =
+          :ets.insert(
+            table,
+            {coord_key(instance_name), next_epoch, waiter.token}
+          )
+
+        owner =
+          waiter
+          |> Map.take([:pid, :token, :monitor_ref])
+          |> Map.put(:inflight, %{})
+
+        state = %{
+          state
+          | flush_owners: Map.put(state.flush_owners, instance_name, owner),
+            flush_monitors:
+              Map.put(
+                state.flush_monitors,
+                waiter.monitor_ref,
+                {:owner, instance_name, waiter.token}
+              )
+        }
+
+        GenServer.reply(waiter.from, {:ok, next_epoch})
+        state
+    end
+  end
+
+  defp take_next_live_flush_waiter(instance_name, state) do
+    queue = Map.get(state.flush_waiters, instance_name, :queue.new())
+
+    case :queue.out(queue) do
+      {:empty, _queue} ->
+        {nil, %{state | flush_waiters: Map.delete(state.flush_waiters, instance_name)}}
+
+      {{:value, waiter}, remaining} ->
+        state = put_flush_waiter_queue(state, instance_name, remaining)
+
+        if Process.alive?(waiter.pid) do
+          {waiter, state}
+        else
+          Process.demonitor(waiter.monitor_ref, [:flush])
+
+          state = %{
+            state
+            | flush_monitors: Map.delete(state.flush_monitors, waiter.monitor_ref)
+          }
+
+          take_next_live_flush_waiter(instance_name, state)
+        end
+    end
+  end
+
+  defp pop_flush_waiter(instance_name, token, state) do
+    queue = Map.get(state.flush_waiters, instance_name, :queue.new())
+
+    {waiter, remaining} =
+      queue
+      |> :queue.to_list()
+      |> Enum.reduce({nil, []}, fn
+        %{token: ^token} = entry, {nil, kept} -> {entry, kept}
+        entry, {found, kept} -> {found, [entry | kept]}
+      end)
+
+    state =
+      state
+      |> put_flush_waiter_queue(instance_name, :queue.from_list(Enum.reverse(remaining)))
+
+    {waiter, state}
+  end
+
+  defp flush_owner?(state, instance_name, pid) do
+    match?(%{pid: ^pid}, Map.get(state.flush_owners, instance_name))
+  end
+
+  defp put_flush_owner(state, instance_name, owner) do
+    %{state | flush_owners: Map.put(state.flush_owners, instance_name, owner)}
+  end
+
+  defp put_flush_waiter_queue(state, instance_name, queue) do
+    flush_waiters =
+      if :queue.is_empty(queue) do
+        Map.delete(state.flush_waiters, instance_name)
+      else
+        Map.put(state.flush_waiters, instance_name, queue)
+      end
+
+    %{state | flush_waiters: flush_waiters}
   end
 
   defp coord_status({epoch, nil}), do: {:ready, epoch}

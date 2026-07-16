@@ -776,7 +776,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
       slot_map: List.duplicate(0, 1_024) |> List.to_tuple()
     }
 
-    assert {:error, "ERR flow index unavailable"} =
+    assert {:error, :flow_index_unavailable} =
              Ferricstore.Flow.Schedule.list(ctx, count: 1)
   end
 

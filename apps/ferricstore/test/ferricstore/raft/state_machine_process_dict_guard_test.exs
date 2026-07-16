@@ -42,7 +42,8 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
           ":sm_pending_lmdb_mirror_ops",
           ":sm_pending_lmdb_mirror_after_flush",
           ":sm_pending_fast_put_batch",
-          ":sm_pending_fast_delete_batch"
+          ":sm_pending_fast_delete_batch",
+          ":sm_pending_unmaterialized_fast_delete_keys"
         ] do
       assert source =~ key
     end

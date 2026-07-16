@@ -310,18 +310,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
         end
       end
 
-      defp segment_project_command({:flush_shard, {physical_ms, logical}}, _position, sm_state)
+      defp segment_project_command({:flush_shard, {physical_ms, logical}}, _position, _sm_state)
            when is_integer(physical_ms) and physical_ms >= 0 and is_integer(logical) and
                   logical >= 0 do
-        flush_state =
-          sm_state
-          |> Map.put(:fetch_or_compute_locks, %{})
-          |> Map.put(:fetch_or_compute_lock_expiries, {0, nil})
-
-        case segment_project_flush_shard(flush_state) do
-          {:error, _reason} -> :unsupported
-          {%{} = new_sm_state, deleted} -> {:ok, new_sm_state, {:ok, deleted}, 1}
-        end
+        :unsupported
       end
 
       defp segment_project_command(

@@ -83,17 +83,49 @@ defmodule Ferricstore.Raft.Batcher do
   def pause_writes_for_sync(shard_index, timeout \\ 30_000),
     do: WARaftBackend.pause_writes_for_sync(shard_index, timeout)
 
+  @spec pause_writes_for_sync(
+          non_neg_integer(),
+          Ferricstore.Raft.WARaftBackend.SyncGate.pause_lease(),
+          timeout()
+        ) :: :ok | {:error, term()}
+  def pause_writes_for_sync(shard_index, pause_lease, timeout),
+    do: WARaftBackend.pause_writes_for_sync(shard_index, pause_lease, timeout)
+
   @spec resume_writes_for_sync(non_neg_integer(), timeout()) :: :ok | {:error, term()}
   def resume_writes_for_sync(shard_index, timeout \\ 5_000),
     do: WARaftBackend.resume_writes_for_sync(shard_index, timeout)
+
+  @spec resume_writes_for_sync(
+          non_neg_integer(),
+          Ferricstore.Raft.WARaftBackend.SyncGate.pause_lease(),
+          timeout()
+        ) :: :ok | {:error, term()}
+  def resume_writes_for_sync(shard_index, pause_lease, timeout),
+    do: WARaftBackend.resume_writes_for_sync(shard_index, pause_lease, timeout)
 
   @spec pause_writes_for_sync_all(non_neg_integer(), timeout()) :: :ok | {:error, term()}
   def pause_writes_for_sync_all(shard_count, timeout \\ 30_000),
     do: WARaftBackend.pause_writes_for_sync_all(shard_count, timeout)
 
+  @spec pause_writes_for_sync_all(
+          non_neg_integer(),
+          Ferricstore.Raft.WARaftBackend.SyncGate.pause_lease(),
+          timeout()
+        ) :: :ok | {:error, term()}
+  def pause_writes_for_sync_all(shard_count, pause_lease, timeout),
+    do: WARaftBackend.pause_writes_for_sync_all(shard_count, pause_lease, timeout)
+
   @spec resume_writes_for_sync_all(non_neg_integer(), timeout()) :: :ok | {:error, term()}
   def resume_writes_for_sync_all(shard_count, timeout \\ 5_000),
     do: WARaftBackend.resume_writes_for_sync_all(shard_count, timeout)
+
+  @spec resume_writes_for_sync_all(
+          non_neg_integer(),
+          Ferricstore.Raft.WARaftBackend.SyncGate.pause_lease(),
+          timeout()
+        ) :: :ok | {:error, term()}
+  def resume_writes_for_sync_all(shard_count, pause_lease, timeout),
+    do: WARaftBackend.resume_writes_for_sync_all(shard_count, pause_lease, timeout)
 
   @doc false
   @spec write_flush_shard_paused(non_neg_integer(), {non_neg_integer(), non_neg_integer()}) ::

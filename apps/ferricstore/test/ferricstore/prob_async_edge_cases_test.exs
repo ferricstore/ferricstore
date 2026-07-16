@@ -483,8 +483,7 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
       File.rm!(path)
 
       result = TopK.handle("TOPK.QUERY", [key, "elem"], store)
-      assert {:error, msg} = result
-      assert msg =~ "does not exist"
+      assert {:error, "ERR TOPK: key does not exist"} = result
     end
   end
 

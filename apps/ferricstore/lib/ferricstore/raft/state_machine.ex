@@ -154,6 +154,7 @@ defmodule Ferricstore.Raft.StateMachine do
     :sm_pending_has_delete,
     :sm_pending_fast_put_batch,
     :sm_pending_fast_delete_batch,
+    :sm_pending_unmaterialized_fast_delete_keys,
     :sm_pending_fast_staged_put_batch
   ]
   @sm_pending_write_initial_values [
@@ -185,6 +186,7 @@ defmodule Ferricstore.Raft.StateMachine do
     sm_pending_has_delete: false,
     sm_pending_fast_put_batch: false,
     sm_pending_fast_delete_batch: false,
+    sm_pending_unmaterialized_fast_delete_keys: [],
     sm_pending_fast_staged_put_batch: false
   ]
 

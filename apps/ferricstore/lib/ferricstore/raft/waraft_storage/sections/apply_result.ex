@@ -100,6 +100,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp storage_apply_failure_reason?({:state_read_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:cross_shard_compensation_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:flow_history_projection_failed, _reason}), do: true
+      defp storage_apply_failure_reason?({:flush_shard_apply_failed, _reason}), do: true
       defp storage_apply_failure_reason?({:batch_result_mismatch, _expected, _actual}), do: true
 
       defp storage_apply_failure_reason?({:tombstone_batch_result_mismatch, _expected, _actual}),

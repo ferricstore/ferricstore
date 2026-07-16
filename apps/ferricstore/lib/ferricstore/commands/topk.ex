@@ -385,7 +385,7 @@ defmodule Ferricstore.Commands.TopK do
   defp missing_or_wrongtype(key, store, missing_result) do
     case ProbType.check_create(key, :topk, store) do
       :ok -> missing_result
-      {:error, :exists} -> {:error, "ERR TopK tracker file is missing"}
+      {:error, :exists} -> missing_result
       {:error, _} = error -> error
     end
   end

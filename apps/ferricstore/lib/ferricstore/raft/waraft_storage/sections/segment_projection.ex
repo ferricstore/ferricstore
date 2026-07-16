@@ -294,57 +294,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         sm_state
       end
 
-      defp segment_project_flush_shard(sm_state) do
-        try do
-          :ets.safe_fixtable(sm_state.ets, true)
-
-          try do
-            match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
-
-            {new_state, deleted} =
-              segment_project_flush_pages(
-                sm_state,
-                :ets.select(sm_state.ets, match_spec, @segment_flush_page_size),
-                0
-              )
-
-            _reset = CompoundMemberIndex.reset(Map.get(new_state, :compound_member_index_name))
-
-            _reset =
-              LogicalKeyIndex.reset(
-                Map.get(new_state, :logical_key_index_name),
-                Map.get(new_state, :logical_key_slots_name)
-              )
-
-            {ZSetIndex.reset(new_state), deleted}
-          after
-            :ets.safe_fixtable(sm_state.ets, false)
-          end
-        rescue
-          error in ArgumentError -> {:error, {:flush_shard_keydir_unavailable, error}}
-        end
-      end
-
-      defp segment_project_flush_pages(sm_state, :"$end_of_table", deleted),
-        do: {sm_state, deleted}
-
-      defp segment_project_flush_pages(sm_state, {keys, continuation}, deleted) do
-        delete_keys = Enum.reject(keys, &segment_project_flush_preserved_key?(sm_state, &1))
-        new_state = Enum.reduce(delete_keys, sm_state, &segment_project_delete(&2, &1))
-
-        segment_project_flush_pages(
-          new_state,
-          :ets.select(continuation),
-          deleted + length(delete_keys)
-        )
-      end
-
-      defp segment_project_flush_preserved_key?(sm_state, key) do
-        ServerCatalog.internal_key?(key) or
-          key == FlowKeys.shared_value_ref_backfill_key(sm_state.shard_index) or
-          key == SharedRefBackfill.progress_key(sm_state.shard_index)
-      end
-
       defp segment_project_delete_prefix(sm_state, redis_key, prefix) do
         index = Map.get(sm_state, :compound_member_index_name)
         budget = sm_state.apply_context.compound_delete_member_budget

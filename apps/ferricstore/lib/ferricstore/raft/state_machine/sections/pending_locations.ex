@@ -292,15 +292,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
              [{:delete, _offset, _record_size} | locations],
              staged?
            ) do
+        delete_apply_projection_cache_for_pending_original(state, key)
+
         if staged? do
-          delete_apply_projection_cache_for_pending_original(state, key)
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
-          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
-          logical_key_index_delete(state, key)
           maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
+        CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
+        logical_key_index_delete(state, key)
         apply_pending_locations(state, file_id, batch, locations, staged?)
       end
 
@@ -311,15 +312,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
              [{:delete, _offset, _record_size} | locations],
              staged?
            ) do
+        delete_apply_projection_cache_for_pending_original(state, key)
+
         if staged? do
-          delete_apply_projection_cache_for_pending_original(state, key)
           track_keydir_binary_remove(state, key)
           :ets.delete(state.ets, key)
-          CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
-          logical_key_index_delete(state, key)
           maybe_queue_lmdb_state_delete_after_publish(state, key)
         end
 
+        CompoundMemberIndex.delete(Map.get(state, :compound_member_index_name), key)
+        logical_key_index_delete(state, key)
         maybe_delete_prob_file_path(state, prob_path)
         apply_pending_locations(state, file_id, batch, locations, staged?)
       end
@@ -813,6 +815,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
         pending = Process.get(:sm_pending_writes, [])
         Process.put(:sm_pending_writes, [{:delete, key, prob_path} | pending])
         Process.put(:sm_pending_has_delete, true)
+
+        unmaterialized = Process.get(:sm_pending_unmaterialized_fast_delete_keys, [])
+        Process.put(:sm_pending_unmaterialized_fast_delete_keys, [key | unmaterialized])
+        :ok
       end
 
       defp standalone_staged_apply?, do: Process.get(@sm_standalone_staged_key) == true

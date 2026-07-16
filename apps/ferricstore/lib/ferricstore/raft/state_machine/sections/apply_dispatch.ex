@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       alias Ferricstore.Commands.HyperLogLog
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Raft.CommandStamp
+      alias Ferricstore.Raft.StateMachine.FlushDerivedState
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
@@ -45,6 +46,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       alias Ferricstore.Store.Shard.ZSetIndex
       alias Ferricstore.Store.Shard.CompoundMemberIndex
+      alias Ferricstore.Store.Shard.LogicalKeyIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -494,14 +496,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         with_apply_time(meta, fn ->
           old_count = state.applied_count
           flush_state = abort_flush_shard_transactions(state)
-          result = apply_flush_shard(flush_state)
+          flush_epoch = {physical_ms, logical}
 
-          new_state =
-            case result do
-              {:ok, _deleted} -> flush_state
-              {:error, _reason} -> state
+          {new_state, result} =
+            case prepare_flush_shard(flush_state, flush_epoch) do
+              {:ok, prepared_state} ->
+                case apply_flush_shard(prepared_state, current_ra_index()) do
+                  {:ok, flushed_state, deleted} ->
+                    notify_flush_final_accounting(prepared_state, flushed_state)
+                    {flushed_state, {:ok, deleted}}
+
+                  {:error, _reason} = error ->
+                    {state, error}
+                end
+
+              {:error, _reason} = error ->
+                {state, error}
             end
-            |> Map.put(:applied_count, old_count + 1)
+
+          new_state = Map.put(new_state, :applied_count, old_count + 1)
 
           maybe_release_cursor(meta, old_count, new_state, result)
         end)
@@ -520,32 +533,214 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
-      defp apply_flush_shard(state) do
-        try do
-          :ets.safe_fixtable(state.ets, true)
-
+      defp apply_flush_shard(state, ra_index) do
+        result =
           try do
-            match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
+            :ets.safe_fixtable(state.ets, true)
 
-            case apply_flush_shard_pages(
-                   state,
-                   :ets.select(state.ets, match_spec, @flush_shard_page_size),
-                   0
-                 ) do
-              {:ok, deleted} ->
-                _reset = CompoundMemberIndex.reset(Map.get(state, :compound_member_index_name))
-                _state = ZSetIndex.reset(state)
-                apply_state_put(:flow_due_catalog, Ferricstore.Flow.DueCatalog.new())
-                {:ok, deleted}
-
-              {:error, _reason} = error ->
-                error
+            try do
+              do_apply_flush_shard(state, ra_index)
+            after
+              :ets.safe_fixtable(state.ets, false)
             end
-          after
-            :ets.safe_fixtable(state.ets, false)
+          rescue
+            error in ArgumentError ->
+              {:error, {:flush_shard_keydir_unavailable, error}}
+
+            error ->
+              {:error, {:flush_shard_apply_exception, error}}
+          catch
+            kind, reason ->
+              {:error, {:flush_shard_apply_caught, kind, reason}}
           end
-        rescue
-          error in ArgumentError -> {:error, {:flush_shard_keydir_unavailable, error}}
+
+        normalize_flush_shard_apply_result(result)
+      end
+
+      defp do_apply_flush_shard(state, ra_index) do
+        match_spec = [{{:"$1", :_, :_, :_, :_, :_, :_}, [{:is_binary, :"$1"}], [:"$1"]}]
+
+        case apply_flush_shard_pages(
+               state,
+               :ets.select(state.ets, match_spec, @flush_shard_page_size),
+               0
+             ) do
+          {:ok, deleted} ->
+            flushed_state = consume_pending_state(state)
+
+            _reset =
+              CompoundMemberIndex.reset(Map.get(flushed_state, :compound_member_index_name))
+
+            _reset =
+              LogicalKeyIndex.reset(
+                Map.get(flushed_state, :logical_key_index_name),
+                Map.get(flushed_state, :logical_key_slots_name)
+              )
+
+            _state = ZSetIndex.reset(flushed_state)
+            apply_state_put(:flow_due_catalog, Ferricstore.Flow.DueCatalog.new())
+
+            with {:ok, finalized_state} <-
+                   FlushDerivedState.clear(flushed_state, ra_index),
+                 finalized_state = maybe_rotate_state_machine_active_file(finalized_state),
+                 :ok <- Promotion.remove_shard_dedicated_storage(finalized_state) do
+              {:ok, finalized_state, deleted}
+            else
+              {:error, _reason} = error -> error
+              other -> {:error, {:unexpected_flush_shard_cleanup_result, other}}
+            end
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp normalize_flush_shard_apply_result({:ok, _state, _deleted} = success), do: success
+
+      defp normalize_flush_shard_apply_result({:error, {:flush_shard_apply_failed, reason}}) do
+        {:error, {:flush_shard_apply_failed, reason}}
+      end
+
+      defp normalize_flush_shard_apply_result({:error, reason}),
+        do: {:error, {:flush_shard_apply_failed, reason}}
+
+      defp normalize_flush_shard_apply_result(other),
+        do: {:error, {:flush_shard_apply_failed, {:unexpected_result, other}}}
+
+      defp prepare_flush_shard(state, flush_epoch) do
+        latch_token = Promotion.acquire_shared_log_latch(state)
+
+        result =
+          try do
+            with :ok <- prepare_flush_shard_process(state, flush_epoch),
+                 {:ok, marker_flush} <-
+                   Promotion.flush_marker_tombstones(state, @flush_shard_page_size),
+                 {:ok, prepared_state} <-
+                   reconcile_flush_marker_active_file(state, marker_flush) do
+              {:ok, prepared_state, marker_flush}
+            else
+              {:error, reason} ->
+                {:error, {:bitcask_append_failed, {:flush_promoted_cleanup_failed, reason}}}
+
+              other ->
+                {:error,
+                 {:bitcask_append_failed,
+                  {:flush_promoted_cleanup_failed, {:unexpected_result, other}}}}
+            end
+          rescue
+            error ->
+              {:error,
+               {:bitcask_append_failed, {:flush_promoted_cleanup_failed, {:exception, error}}}}
+          catch
+            kind, reason ->
+              {:error, {:bitcask_append_failed, {:flush_promoted_cleanup_failed, {kind, reason}}}}
+          after
+            Promotion.release_compaction_latch(latch_token)
+          end
+
+        case result do
+          {:ok, prepared_state, marker_flush} ->
+            prepared_state = maybe_rotate_state_machine_active_file(prepared_state)
+            notify_flush_marker_accounting(state, prepared_state, marker_flush)
+            {:ok, prepared_state}
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp prepare_flush_shard_process(state, flush_epoch) do
+        case promotion_shard_pid(state) do
+          pid when pid == self() ->
+            :ok
+
+          pid when is_pid(pid) ->
+            try do
+              case GenServer.call(
+                     pid,
+                     {:prepare_promoted_flush_from_raft, flush_epoch},
+                     30_000
+                   ) do
+                :ok -> :ok
+                {:error, _reason} = error -> error
+                other -> {:error, {:unexpected_prepare_promoted_flush_reply, other}}
+              end
+            catch
+              :exit, reason -> {:error, {:promotion_worker_quiesce_failed, reason}}
+            end
+
+          nil ->
+            :ok
+        end
+      end
+
+      defp reconcile_flush_marker_active_file(state, %{marker_count: 0}), do: {:ok, state}
+
+      defp reconcile_flush_marker_active_file(
+             state,
+             %{active_file_id: file_id, active_file_path: file_path}
+           )
+           when is_integer(file_id) and file_id >= 0 and is_binary(file_path) do
+        case File.stat(file_path) do
+          {:ok, %{size: size}} when is_integer(size) and size >= 0 ->
+            {_old_total, dead_bytes} = Map.get(state.file_stats, file_id, {0, 0})
+            dead_bytes = min(max(dead_bytes, 0), size)
+
+            {:ok,
+             state
+             |> Map.put(:active_file_id, file_id)
+             |> Map.put(:active_file_path, file_path)
+             |> Map.put(:active_file_size, size)
+             |> Map.put(:file_stats, Map.put(state.file_stats, file_id, {size, dead_bytes}))}
+
+          {:error, reason} ->
+            {:error, {:promotion_marker_active_file_stat_failed, file_path, reason}}
+
+          other ->
+            {:error, {:promotion_marker_active_file_stat_failed, file_path, other}}
+        end
+      end
+
+      defp reconcile_flush_marker_active_file(_state, marker_flush),
+        do: {:error, {:invalid_promotion_marker_flush_accounting, marker_flush}}
+
+      defp notify_flush_marker_accounting(_old_state, _new_state, %{marker_count: 0}), do: :ok
+
+      defp notify_flush_marker_accounting(old_state, new_state, marker_flush) do
+        case promotion_shard_pid(old_state) do
+          pid when is_pid(pid) and pid != self() ->
+            if new_state.active_file_id == marker_flush.active_file_id and
+                 new_state.active_file_path == marker_flush.active_file_path do
+              GenServer.cast(
+                pid,
+                {:refresh_flush_marker_accounting, marker_flush.active_file_id,
+                 marker_flush.active_file_path}
+              )
+            else
+              GenServer.cast(pid, :sync_active_file_from_registry)
+            end
+
+          _missing_or_self ->
+            :ok
+        end
+      end
+
+      defp notify_flush_final_accounting(old_state, new_state) do
+        case promotion_shard_pid(old_state) do
+          pid when is_pid(pid) and pid != self() ->
+            if old_state.active_file_id == new_state.active_file_id and
+                 old_state.active_file_path == new_state.active_file_path do
+              GenServer.cast(
+                pid,
+                {:refresh_flush_marker_accounting, new_state.active_file_id,
+                 new_state.active_file_path}
+              )
+            else
+              GenServer.cast(pid, :sync_active_file_from_registry)
+            end
+
+          _missing_or_self ->
+            :ok
         end
       end
 
@@ -568,27 +763,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       defp apply_flush_shard_page(_state, []), do: {:ok, 0}
 
       defp apply_flush_shard_page(state, keys) do
-        case with_pending_writes(state, fn -> apply_delete_batch_keys(state, keys) end) do
-          results when is_list(results) ->
-            if length(results) == length(keys) and Enum.all?(results, &(&1 == :ok)) do
-              {:ok, length(keys)}
-            else
-              {:error, {:flush_shard_delete_failed, results}}
-            end
+        stream_roots = FlushDerivedState.stream_roots(state, keys)
 
-          {:error, _reason} = error ->
-            error
-
-          other ->
-            {:error, {:flush_shard_delete_failed, other}}
+        with :ok <- FlushDerivedState.clear_stream_roots(state, stream_roots),
+             results when is_list(results) <-
+               with_pending_writes(state, fn -> apply_delete_batch_keys(state, keys) end),
+             true <- length(results) == length(keys) and Enum.all?(results, &(&1 == :ok)) do
+          {:ok, length(keys)}
+        else
+          {:error, {:flush_shard_delete_failed, _reason}} = error -> error
+          {:error, reason} -> {:error, {:flush_shard_delete_failed, reason}}
+          false -> {:error, {:flush_shard_delete_failed, :invalid_delete_results}}
+          other -> {:error, {:flush_shard_delete_failed, other}}
         end
       end
 
-      defp flush_shard_preserved_key?(state, key) do
-        ServerCatalog.internal_key?(key) or
-          key == FlowKeys.shared_value_ref_backfill_key(state.shard_index) or
-          key == SharedRefBackfill.progress_key(state.shard_index)
-      end
+      defp flush_shard_preserved_key?(_state, key), do: ServerCatalog.internal_key?(key)
 
       def apply(meta, {:delete_prefix, prefix}, state) when is_binary(prefix) do
         with_apply_time(meta, fn ->
@@ -615,6 +805,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                   {:ok, {:batch, prepared_commands}} ->
                     with_pending_writes(state, fn ->
                       Enum.map_reduce(prepared_commands, old_count, fn cmd, count ->
+                        materialize_pending_fast_deletes(state)
                         result = apply_single(state, cmd)
                         {result, count + 1}
                       end)
