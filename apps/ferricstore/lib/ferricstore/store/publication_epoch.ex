@@ -224,6 +224,7 @@ defmodule Ferricstore.Store.PublicationEpoch do
         end
 
       _missing_or_invalid ->
+        _ = :atomics.compare_exchange(ref, position, epoch, epoch + 1)
         :ok
     end
   rescue

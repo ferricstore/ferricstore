@@ -30,4 +30,20 @@ defmodule Ferricstore.Store.PublicationEpochTest do
     assert Task.await(reader, 1_000) == :consistent
     assert :atomics.get(ctx.publication_epoch, 1) == 2
   end
+
+  test "a reader repairs an orphaned odd epoch with a missing latch entry" do
+    latch = :ets.new(:publication_epoch_missing_latch, [:set, :public])
+    epoch = :atomics.new(1, signed: false)
+    :atomics.put(epoch, 1, 1)
+
+    ctx = %{
+      publication_epoch: epoch,
+      latch_refs: {latch}
+    }
+
+    reader = Task.async(fn -> PublicationEpoch.read(ctx, [0], fn -> :consistent end) end)
+
+    assert Task.await(reader, 1_000) == :consistent
+    assert :atomics.get(epoch, 1) == 2
+  end
 end
