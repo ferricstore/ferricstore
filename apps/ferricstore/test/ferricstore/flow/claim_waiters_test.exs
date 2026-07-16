@@ -10,6 +10,7 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
   @timer_table :ferricstore_flow_claim_waiter_timers
   @source_path Path.expand("../../../lib/ferricstore/flow/claim_waiters.ex", __DIR__)
   @flow_source_path Path.expand("../../../lib/ferricstore/flow.ex", __DIR__)
+  @waiter_registration_timeout_ms 5_000
 
   setup do
     old_max_waiter_rows = Application.get_env(:ferricstore, :flow_claim_due_max_waiter_rows)
@@ -408,21 +409,57 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
   defp start_waiters(count, keys, opts \\ []) do
     parent = self()
 
-    for _ <- 1..count do
-      spawn(fn ->
-        ClaimWaiters.register(keys, self(), now_ms() + 1_000, opts)
-        send(parent, {:registered, self()})
+    pids =
+      for _ <- 1..count do
+        spawn(fn ->
+          parent_monitor = Process.monitor(parent)
 
-        receive do
-          {:flow_claim_due_wake, _key} -> send(parent, {:woke, self()})
-        after
-          1_000 -> :ok
-        end
-      end)
+          :ok =
+            ClaimWaiters.register(
+              keys,
+              self(),
+              now_ms() + @waiter_registration_timeout_ms + 1_000,
+              opts
+            )
+
+          send(parent, {:registered, self()})
+
+          receive do
+            {:flow_claim_due_wake, _key} ->
+              send(parent, {:woke, self()})
+
+            {:DOWN, ^parent_monitor, :process, ^parent, _reason} ->
+              :ok
+          end
+        end)
+      end
+
+    await_waiter_registrations(pids, @waiter_registration_timeout_ms)
+    pids
+  end
+
+  defp await_waiter_registrations(pids, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_waiter_registrations(MapSet.new(pids), deadline)
+  end
+
+  defp do_await_waiter_registrations(pending, deadline) do
+    if MapSet.size(pending) == 0 do
+      :ok
+    else
+      remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      receive do
+        {:registered, pid} ->
+          do_await_waiter_registrations(MapSet.delete(pending, pid), deadline)
+      after
+        remaining ->
+          flunk(
+            "#{MapSet.size(pending)} claim waiter registration(s) did not complete within " <>
+              "#{@waiter_registration_timeout_ms}ms"
+          )
+      end
     end
-    |> tap(fn pids ->
-      Enum.each(pids, fn pid -> assert_receive {:registered, ^pid}, 100 end)
-    end)
   end
 
   defp assert_receive_count(0), do: :ok
