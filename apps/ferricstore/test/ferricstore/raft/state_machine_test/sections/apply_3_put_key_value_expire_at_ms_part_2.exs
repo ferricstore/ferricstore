@@ -735,6 +735,47 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           assert {:ok, "value"} = NIF.v2_pread_at(live_path, offset)
         end
 
+        test "ignores an ActiveFile row owned by another shard data directory", %{
+          state: state,
+          ets: ets,
+          active_file_path: active_file_path,
+          shard_index: shard_index
+        } do
+          unrelated_dir =
+            Path.join(
+              System.tmp_dir!(),
+              "sm_unrelated_active_#{System.unique_integer([:positive])}"
+            )
+
+          unrelated_path = Path.join(unrelated_dir, "00099.log")
+          File.mkdir_p!(unrelated_dir)
+          File.touch!(unrelated_path)
+
+          Ferricstore.Store.ActiveFile.publish(
+            shard_index,
+            99,
+            unrelated_path,
+            unrelated_dir
+          )
+
+          on_exit(fn ->
+            Ferricstore.Store.ActiveFile.delete(shard_index)
+            File.rm_rf!(unrelated_dir)
+          end)
+
+          {_new_state, result} =
+            StateMachine.apply(%{}, {:put, "isolated_active_file", "value", 0}, state)
+
+          assert :ok = result
+
+          assert [{"isolated_active_file", "value", 0, _, 0, offset, value_size}] =
+                   :ets.lookup(ets, "isolated_active_file")
+
+          assert value_size > 0
+          assert {:ok, "value"} = NIF.v2_pread_at(active_file_path, offset)
+          assert {:ok, %{size: 0}} = File.stat(unrelated_path)
+        end
+
         test "Bitcask append errors fail quorum apply and roll back pending ETS", %{
           state: state,
           ets: ets

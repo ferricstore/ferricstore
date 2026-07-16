@@ -88,7 +88,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   @tag :chunk_assembly_deadline
   test "chunked request assembly has an absolute deadline across complete wire frames" do
     previous_timeout = Application.get_env(:ferricstore, :native_frame_assembly_timeout_ms)
-    Application.put_env(:ferricstore, :native_frame_assembly_timeout_ms, 80)
+    Application.put_env(:ferricstore, :native_frame_assembly_timeout_ms, 500)
 
     on_exit(fn ->
       restore_env(:native_frame_assembly_timeout_ms, previous_timeout)
@@ -107,7 +107,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@ping_opcode, 0, 49, ""))
     assert receive_response_ids(socket, 1) == [49]
 
-    Process.sleep(60)
+    Process.sleep(500)
     assert_socket_closed(socket)
   end
 

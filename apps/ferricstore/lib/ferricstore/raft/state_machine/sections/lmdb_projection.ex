@@ -736,10 +736,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       defp live_active_file(state) do
         try do
-          {file_id, file_path, _data_path} =
+          {file_id, file_path, shard_data_path} =
             Ferricstore.Store.ActiveFile.get(state.instance_ctx, state.shard_index)
 
-          if Ferricstore.FS.exists?(file_path) do
+          if active_file_shard_path?(state, shard_data_path) and
+               Ferricstore.FS.exists?(file_path) do
             {file_path, file_id}
           else
             :stale
@@ -748,6 +749,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           _ -> :stale
         end
       end
+
+      defp active_file_shard_path?(%{shard_data_path: shard_data_path}, shard_data_path),
+        do: true
+
+      defp active_file_shard_path?(
+             %{shard_data_path_expanded: expected_path},
+             shard_data_path
+           )
+           when is_binary(expected_path) and is_binary(shard_data_path) do
+        Path.expand(shard_data_path) == expected_path
+      end
+
+      defp active_file_shard_path?(_state, _shard_data_path), do: false
 
       defp do_delete(state, key) do
         # If the key has a pending background write, flush the BitcaskWriter
