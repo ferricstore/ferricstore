@@ -96,6 +96,49 @@ defmodule Ferricstore.Raft.WARaftSegmentReaderSecurityTest do
              )
   end
 
+  test "apply projection expiry follows the cluster-adjusted clock" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "waraft-hlc-expired-projection-#{System.unique_integer([:positive])}"
+      )
+
+    index = 74
+    file_id = {:waraft_apply_projection, index}
+    wall_ms = System.system_time(:millisecond)
+    ref = :persistent_term.get(:ferricstore_hlc_ref)
+    previous = :atomics.get(ref, 1)
+
+    on_exit(fn ->
+      :atomics.put(:persistent_term.get(:ferricstore_hlc_ref), 1, previous)
+      WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    :atomics.put(ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(data_dir, 0, index, [
+               {"hlc-expired", "must-stay-hidden", wall_ms + 30_000}
+             ])
+
+    assert :not_found =
+             WARaftSegmentReader.read_value_from_location(
+               %{data_dir: data_dir},
+               0,
+               file_id,
+               "hlc-expired"
+             )
+
+    assert {:ok, %{}} =
+             WARaftSegmentReader.read_values_from_location(
+               %{data_dir: data_dir},
+               0,
+               file_id,
+               ["hlc-expired"]
+             )
+  end
+
   test "apply projection compaction rolls back an interrupted directory swap" do
     data_dir =
       Path.join(

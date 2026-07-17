@@ -1,6 +1,7 @@
 defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
   @moduledoc false
 
+  alias Ferricstore.HLC
   alias Ferricstore.Raft.CommandStamp
 
   def live_expire_at?(0), do: true
@@ -15,7 +16,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
 
   def live_expire_at?(_expire_at_ms, _now_ms), do: false
 
-  def now_ms, do: System.system_time(:millisecond)
+  def now_ms, do: HLC.now_ms()
 
   def value_from_entry(entry, key) do
     case command_from_entry(entry) do
