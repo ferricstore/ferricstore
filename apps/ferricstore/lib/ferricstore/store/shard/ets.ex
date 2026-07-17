@@ -785,7 +785,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec coerce_float(term()) :: {:ok, float()} | :error
   @doc false
   def coerce_float(v) when is_float(v), do: {:ok, v}
-  def coerce_float(v) when is_integer(v), do: {:ok, v * 1.0}
+  def coerce_float(v) when is_integer(v), do: ValueCodec.number_to_float(v)
   def coerce_float(v) when is_binary(v), do: ValueCodec.parse_float(v)
 
   # -------------------------------------------------------------------

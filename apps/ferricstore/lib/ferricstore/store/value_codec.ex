@@ -56,6 +56,33 @@ defmodule Ferricstore.Store.ValueCodec do
     ArithmeticError -> :error
   end
 
+  @doc "Converts an integer or float to a finite BEAM float without raising."
+  @spec number_to_float(number()) :: {:ok, float()} | :error
+  def number_to_float(value) when is_float(value), do: {:ok, value}
+
+  def number_to_float(value) when is_integer(value) do
+    {:ok, value * 1.0}
+  rescue
+    ArithmeticError -> :error
+  end
+
+  def number_to_float(_value), do: :error
+
+  @doc "Adds numeric operands without allowing float conversion or arithmetic exceptions to escape."
+  @spec checked_float_add(term(), term()) :: {:ok, float()} | :error | :overflow
+  def checked_float_add(left, right) when is_float(left) and is_float(right) do
+    {:ok, left + right}
+  rescue
+    ArithmeticError -> :overflow
+  end
+
+  def checked_float_add(left, right) do
+    with {:ok, left_float} <- number_to_float(left),
+         {:ok, right_float} <- number_to_float(right) do
+      checked_float_add(left_float, right_float)
+    end
+  end
+
   @doc """
   Formats a float for Redis INCRBYFLOAT output: compact decimals, strips
   trailing zeros and unnecessary decimal point.

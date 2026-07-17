@@ -14,6 +14,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   """
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.ValueCodec
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -177,10 +178,13 @@ defmodule Ferricstore.Store.Shard.Writes do
 
       {:ok, value, expire_at_ms, state} ->
         with {:ok, float_val} <- direct_float_value(value),
-             new_val = float_val + delta,
+             {:ok, new_val} <- ValueCodec.checked_float_add(float_val, delta),
              {:ok, new_state} <- persist_direct_value(state, key, new_val, expire_at_ms) do
           {:reply, {:ok, new_val}, new_state}
         else
+          :overflow ->
+            {:reply, {:error, "ERR increment would produce NaN or Infinity"}, state}
+
           :error ->
             {:reply, {:error, "ERR value is not a valid float"}, state}
 

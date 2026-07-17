@@ -1472,22 +1472,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         end
 
         local_incr_float = fn key, delta ->
-          case local_get_meta.(key) do
-            nil ->
-              new_val = delta * 1.0
-              local_put.(key, new_val, 0)
-              {:ok, new_val}
+          {current, expire_at_ms} =
+            case local_get_meta.(key) do
+              nil -> {0.0, 0}
+              {value, expiry} -> {value, expiry}
+            end
 
-            {value, expire_at_ms} ->
-              case coerce_float(value) do
-                {:ok, float_val} ->
-                  new_val = float_val + delta
-                  local_put.(key, new_val, expire_at_ms)
-                  {:ok, new_val}
+          with {:ok, float_val} <- coerce_float(current),
+               {:ok, new_val} <- ValueCodec.checked_float_add(float_val, delta) do
+            case local_put.(key, new_val, expire_at_ms) do
+              :ok -> {:ok, new_val}
+              {:error, _reason} = error -> error
+            end
+          else
+            :overflow ->
+              {:error, "ERR increment would produce NaN or Infinity"}
 
-                :error ->
-                  {:error, "ERR value is not a valid float"}
-              end
+            :error ->
+              {:error, "ERR value is not a valid float"}
           end
         end
 

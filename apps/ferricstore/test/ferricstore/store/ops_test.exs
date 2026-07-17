@@ -231,6 +231,32 @@ defmodule Ferricstore.Store.OpsTest do
       end)
     end
 
+    test "INCR_FLOAT overflow leaves local transaction state unchanged" do
+      ctx = FerricStore.Instance.get(:default)
+      key = "ops:local_tx:float_overflow:#{System.unique_integer([:positive])}"
+      shard_index = Router.shard_for(ctx, key)
+      keydir = :ets.new(:ops_local_tx_float_overflow, [:set, :public])
+      entry = {key, "1e308", 0, LFU.initial(), 0, 0, 5}
+
+      try do
+        Process.put(:tx_pending_values, %{})
+        Process.put(:tx_deleted_keys, MapSet.new())
+        :ets.insert(keydir, entry)
+        tx = local_tx(ctx, shard_index, keydir, %{})
+
+        assert {:error, "ERR increment would produce NaN or Infinity"} ==
+                 Ops.incr_float(tx, key, 1.0e308)
+
+        assert [^entry] = :ets.lookup(keydir, key)
+        assert %{} == Process.get(:tx_pending_values)
+        refute_receive {:tx_pending_write, ^key, _value, _expire_at_ms}
+      after
+        Process.delete(:tx_pending_values)
+        Process.delete(:tx_deleted_keys)
+        :ets.delete(keydir)
+      end
+    end
+
     test "APPEND preserves an existing local transaction TTL" do
       assert_local_tx_rmw_preserves_ttl("base", fn tx, key ->
         assert {:ok, 9} == Ops.append(tx, key, "_tail")

@@ -210,28 +210,48 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             error
 
           nil ->
-            new_val = delta * 1.0
-            new_str = Float.to_string(new_val)
-
-            case do_compound_put(state, redis_key, compound_key, new_str, 0) do
-              :ok -> new_str
-              {:error, _reason} = error -> error
-            end
+            do_hincrbyfloat_put(state, redis_key, compound_key, 0.0, delta, 0)
 
           {value, expire_at_ms} ->
             case coerce_float(value) do
               {:ok, cur} ->
-                new_val = cur + delta
-                new_str = Float.to_string(new_val)
-
-                case do_compound_put(state, redis_key, compound_key, new_str, expire_at_ms) do
-                  :ok -> new_str
-                  {:error, _reason} = error -> error
-                end
+                do_hincrbyfloat_put(
+                  state,
+                  redis_key,
+                  compound_key,
+                  cur,
+                  delta,
+                  expire_at_ms
+                )
 
               :error ->
                 {:error, "ERR hash value is not a valid float"}
             end
+        end
+      end
+
+      defp do_hincrbyfloat_put(
+             state,
+             redis_key,
+             compound_key,
+             current,
+             delta,
+             expire_at_ms
+           ) do
+        case ValueCodec.checked_float_add(current, delta) do
+          {:ok, new_val} ->
+            new_str = Float.to_string(new_val)
+
+            case do_compound_put(state, redis_key, compound_key, new_str, expire_at_ms) do
+              :ok -> new_str
+              {:error, _reason} = error -> error
+            end
+
+          :overflow ->
+            {:error, "ERR increment would produce NaN or Infinity"}
+
+          :error ->
+            {:error, "ERR hash value is not a valid float"}
         end
       end
 
@@ -252,12 +272,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             current ->
               case current_zset_score(current) do
                 {:ok, current_score} ->
-                  new_score = current_score + increment * 1.0
-                  new_str = Float.to_string(new_score)
+                  case ValueCodec.checked_float_add(current_score, increment) do
+                    {:ok, new_score} ->
+                      new_str = Float.to_string(new_score)
 
-                  case do_compound_put(state, redis_key, compound_key, new_str, 0) do
-                    :ok -> new_str
-                    {:error, _reason} = error -> error
+                      case do_compound_put(state, redis_key, compound_key, new_str, 0) do
+                        :ok -> new_str
+                        {:error, _reason} = error -> error
+                      end
+
+                    :overflow ->
+                      {:error, "ERR resulting score is not a number (NaN)"}
+
+                    :error ->
+                      {:error, "ERR value is not a valid float"}
                   end
 
                 :error ->
@@ -276,10 +304,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             value -> to_string(value)
           end
 
-        case Float.parse(score_string) do
-          {score, ""} -> {:ok, score}
-          _invalid -> :error
-        end
+        ValueCodec.parse_float(score_string)
       end
 
       defp do_spop(_state, _redis_key, count, _seed)

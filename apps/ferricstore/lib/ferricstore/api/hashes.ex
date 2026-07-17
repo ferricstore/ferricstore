@@ -3,7 +3,7 @@ defmodule FerricStore.API.Hashes do
 
   import FerricStore.API.Store
   alias Ferricstore.Commands.Hash
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{Router, ValueCodec}
 
   @type key :: FerricStore.key()
   @type value :: FerricStore.value()
@@ -319,11 +319,17 @@ defmodule FerricStore.API.Hashes do
       {:ok, "0.15"}
 
   """
-  @spec hincrbyfloat(key(), binary(), float()) :: {:ok, binary()} | {:error, binary()}
+  @spec hincrbyfloat(key(), binary(), number()) :: {:ok, binary()} | {:error, binary()}
   def hincrbyfloat(key, field, amount) when is_number(amount) do
-    case Router.hincrbyfloat(default_ctx(), key, to_string(field), amount * 1.0) do
-      {:error, _} = err -> err
-      result_str -> {:ok, result_str}
+    case ValueCodec.number_to_float(amount) do
+      {:ok, increment} ->
+        case Router.hincrbyfloat(default_ctx(), key, to_string(field), increment) do
+          {:error, _} = err -> err
+          result_str -> {:ok, result_str}
+        end
+
+      :error ->
+        {:error, "ERR value is not a valid float"}
     end
   end
 

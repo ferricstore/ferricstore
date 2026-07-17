@@ -4,7 +4,7 @@ defmodule FerricStore.API.Strings do
   import FerricStore.API.Store
   alias Ferricstore.Commands.Strings
   alias Ferricstore.EmbeddedStringValidation
-  alias Ferricstore.Store.{ReadResult, Router}
+  alias Ferricstore.Store.{ReadResult, Router, ValueCodec}
 
   @type key :: FerricStore.key()
   @type value :: FerricStore.value()
@@ -294,13 +294,19 @@ defmodule FerricStore.API.Strings do
       {:ok, "80.25"}
 
   """
-  @spec incr_by_float(key(), float()) :: {:ok, binary()} | write_error()
+  @spec incr_by_float(key(), number()) :: {:ok, binary()} | write_error()
   def incr_by_float(key, amount) when is_number(amount) do
     ctx = default_ctx()
 
-    case Router.incr_float(ctx, key, amount * 1.0) do
-      {:ok, result} -> {:ok, result}
-      {:error, _} = err -> err
+    case ValueCodec.number_to_float(amount) do
+      {:ok, delta} ->
+        case Router.incr_float(ctx, key, delta) do
+          {:ok, result} -> {:ok, result}
+          {:error, _} = err -> err
+        end
+
+      :error ->
+        {:error, "ERR value is not a valid float"}
     end
   end
 

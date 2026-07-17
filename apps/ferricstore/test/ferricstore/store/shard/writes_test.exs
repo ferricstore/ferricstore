@@ -73,6 +73,60 @@ defmodule Ferricstore.Store.Shard.WritesTest do
     end
   end
 
+  test "direct INCRBYFLOAT rejects overflow without mutating or persisting" do
+    keydir = :ets.new(:writes_incr_float_overflow, [:set, :public])
+    state = direct_state(keydir)
+    value = "1e308"
+
+    Ferricstore.Store.Shard.ETS.ets_insert_with_location(
+      state,
+      "counter",
+      value,
+      0,
+      0,
+      0,
+      byte_size(value)
+    )
+
+    try do
+      assert {:reply, {:error, "ERR increment would produce NaN or Infinity"}, failed_state} =
+               Writes.handle_incr_float("counter", 1.0e308, {self(), make_ref()}, state)
+
+      assert {:hit, ^value, 0} =
+               Ferricstore.Store.Shard.ETS.ets_lookup(state, "counter")
+
+      assert failed_state.pending == []
+      assert failed_state.pending_count == 0
+      assert failed_state.write_version == state.write_version
+      assert failed_state.active_file_size == state.active_file_size
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "direct INCRBYFLOAT rejects an unrepresentable stored integer without raising" do
+    keydir = :ets.new(:writes_incr_float_stored_integer, [:set, :public])
+    state = direct_state(keydir)
+    value = String.to_integer(String.duplicate("9", 400))
+
+    :ets.insert(
+      keydir,
+      {"counter", value, 0, Ferricstore.Store.LFU.initial(), 0, 0, 1}
+    )
+
+    try do
+      assert {:reply, {:error, "ERR value is not a valid float"}, failed_state} =
+               Writes.handle_incr_float("counter", 1.0, {self(), make_ref()}, state)
+
+      assert [{"counter", ^value, 0, _lfu, 0, 0, 1}] = :ets.lookup(keydir, "counter")
+
+      assert failed_state.write_version == state.write_version
+      assert failed_state.active_file_size == state.active_file_size
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   test "direct prefix delete does not account dead bytes when its tombstone batch fails" do
     keydir = :ets.new(:writes_prefix_delete_failure, [:set, :public])
     state = direct_state(keydir)

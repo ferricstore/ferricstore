@@ -91,6 +91,15 @@ defmodule Ferricstore.ImplStringOptionsTest do
     assert {:ok, 0} = FerricStore.Impl.del(ctx, [])
   end
 
+  test "incr_float rejects integers outside the finite float range", %{ctx: ctx} do
+    huge = String.to_integer(String.duplicate("9", 400))
+
+    assert {:error, "ERR value is not a valid float"} =
+             FerricStore.Impl.incr_float(ctx, "impl:huge-float", huge)
+
+    assert {:ok, nil} = FerricStore.Impl.get(ctx, "impl:huge-float")
+  end
+
   test "mset accepts the map contract exposed by use FerricStore", %{ctx: ctx} do
     assert :ok =
              FerricStore.Impl.mset(ctx, %{

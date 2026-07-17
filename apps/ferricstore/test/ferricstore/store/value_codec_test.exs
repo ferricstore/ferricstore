@@ -35,4 +35,16 @@ defmodule Ferricstore.Store.ValueCodecTest do
       end
     end
   end
+
+  describe "checked float arithmetic" do
+    test "distinguishes invalid conversion from addition overflow" do
+      assert {:ok, 2.5} = ValueCodec.number_to_float(2.5)
+      assert {:ok, 2.0} = ValueCodec.number_to_float(2)
+      assert :error = ValueCodec.number_to_float(String.to_integer(String.duplicate("9", 400)))
+
+      assert {:ok, 3.5} = ValueCodec.checked_float_add(1.0, 2.5)
+      assert :overflow = ValueCodec.checked_float_add(1.0e308, 1.0e308)
+      assert :error = ValueCodec.checked_float_add(1.0, :invalid)
+    end
+  end
 end

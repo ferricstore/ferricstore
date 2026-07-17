@@ -2,7 +2,7 @@ defmodule FerricStore.Impl do
   @moduledoc "Elixir-native implementation of all FerricStore data-type operations, delegating to Router and command handlers."
 
   alias Ferricstore.EmbeddedStringValidation
-  alias Ferricstore.Store.{ReadResult, Router, TypeRegistry}
+  alias Ferricstore.Store.{ReadResult, Router, TypeRegistry, ValueCodec}
 
   alias Ferricstore.Commands.{
     Bloom,
@@ -101,10 +101,13 @@ defmodule FerricStore.Impl do
     Strings.handle_ast({:incrby, key, delta}, ctx)
   end
 
-  @spec incr_float(FerricStore.Instance.t(), binary(), float()) ::
+  @spec incr_float(FerricStore.Instance.t(), binary(), number()) ::
           {:ok, binary()} | {:error, binary()}
   def incr_float(ctx, key, delta) do
-    Strings.handle_ast({:incrbyfloat, key, delta / 1}, ctx)
+    case ValueCodec.number_to_float(delta) do
+      {:ok, float_delta} -> Strings.handle_ast({:incrbyfloat, key, float_delta}, ctx)
+      :error -> {:error, "ERR value is not a valid float"}
+    end
   end
 
   @spec mget(FerricStore.Instance.t(), [binary()]) ::

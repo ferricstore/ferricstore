@@ -348,6 +348,83 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       assert_in_delta result, 10.0, 0.001
     end
 
+    test "rejects INCRBYFLOAT overflow without changing replicated state", %{
+      state: state,
+      ets: ets
+    } do
+      key = "overflowing_float_counter"
+      {state, :ok} = StateMachine.apply(%{}, {:put, key, "1e308", 0}, state)
+      [before_entry] = :ets.lookup(ets, key)
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:incr_float, key, 1.0e308}, state)
+
+      assert result == {:error, "ERR increment would produce NaN or Infinity"}
+      assert :ets.lookup(ets, key) == [before_entry]
+    end
+
+    test "rejects HINCRBYFLOAT overflow without changing the hash field", %{
+      state: state,
+      ets: ets
+    } do
+      key = "overflowing_float_hash"
+      field = "counter"
+
+      {state, "1.0e308"} =
+        StateMachine.apply(%{}, {:hincrbyfloat, key, field, 1.0e308}, state)
+
+      compound_key = Ferricstore.Store.CompoundKey.hash_field(key, field)
+      [before_entry] = :ets.lookup(ets, compound_key)
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:hincrbyfloat, key, field, 1.0e308}, state)
+
+      assert result == {:error, "ERR increment would produce NaN or Infinity"}
+      assert :ets.lookup(ets, compound_key) == [before_entry]
+    end
+
+    test "rejects ZINCRBY overflow without changing the member score", %{
+      state: state,
+      ets: ets
+    } do
+      key = "overflowing_zset_score"
+      member = "member"
+
+      {state, initial_score} =
+        StateMachine.apply(%{}, {:zincrby, key, 1.0e308, member}, state)
+
+      assert {:ok, 1.0e308} = Ferricstore.Store.ValueCodec.parse_float(initial_score)
+      compound_key = Ferricstore.Store.CompoundKey.zset_member(key, member)
+      [before_entry] = :ets.lookup(ets, compound_key)
+
+      {_new_state, result} =
+        StateMachine.apply(%{}, {:zincrby, key, 1.0e308, member}, state)
+
+      assert result == {:error, "ERR resulting score is not a number (NaN)"}
+      assert :ets.lookup(ets, compound_key) == [before_entry]
+    end
+
+    test "transaction INCRBYFLOAT overflow does not stage a write", %{
+      state: state,
+      ets: ets
+    } do
+      key = "overflowing_transaction_float"
+      {state, :ok} = StateMachine.apply(%{}, {:put, key, "1e308", 0}, state)
+      [before_entry] = :ets.lookup(ets, key)
+
+      {:ok, prepared} =
+        Ferricstore.Commands.PreparedCommand.prepare("INCRBYFLOAT", [key, "1e308"])
+
+      {:ok, execution_entry} =
+        Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+
+      wrapped = {{:tx_execute, [execution_entry], nil}, stamp_metadata(HLC.now())}
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == [{:error, "ERR increment would produce NaN or Infinity"}]
+      assert :ets.lookup(ets, key) == [before_entry]
+    end
+
     test "rejects an apply-side expiry decision caused only by leader HLC drift", %{
       state: state,
       ets: ets

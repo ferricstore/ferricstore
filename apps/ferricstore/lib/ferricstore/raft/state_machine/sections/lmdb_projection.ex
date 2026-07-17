@@ -1040,7 +1040,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       # Coerces a value (integer, float, or binary) to float.
       defp coerce_float(v) when is_float(v), do: {:ok, v}
-      defp coerce_float(v) when is_integer(v), do: {:ok, v * 1.0}
+      defp coerce_float(v) when is_integer(v), do: ValueCodec.number_to_float(v)
       defp coerce_float(v) when is_binary(v), do: parse_float(v)
 
       # Atomic INCRBYFLOAT: reads current value, parses as float, adds delta,
@@ -1049,21 +1049,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         with :ok <- ensure_string_key(state, key) do
           case do_get_meta(state, key) do
             nil ->
-              new_val = delta * 1.0
-              do_put(state, key, new_val, 0)
-              {:ok, new_val}
+              do_increment_float_value(state, key, 0.0, delta, 0)
 
             {value, expire_at_ms} ->
               case coerce_float(value) do
                 {:ok, float_val} ->
-                  new_val = float_val + delta
-                  do_put(state, key, new_val, expire_at_ms)
-                  {:ok, new_val}
+                  do_increment_float_value(state, key, float_val, delta, expire_at_ms)
 
                 :error ->
                   {:error, "ERR value is not a valid float"}
               end
           end
+        end
+      end
+
+      defp do_increment_float_value(state, key, current, delta, expire_at_ms) do
+        case ValueCodec.checked_float_add(current, delta) do
+          {:ok, new_val} ->
+            case do_put(state, key, new_val, expire_at_ms) do
+              :ok -> {:ok, new_val}
+              {:error, _reason} = error -> error
+            end
+
+          :overflow ->
+            {:error, "ERR increment would produce NaN or Infinity"}
+
+          :error ->
+            {:error, "ERR value is not a valid float"}
         end
       end
 

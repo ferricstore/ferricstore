@@ -110,6 +110,15 @@ defmodule Ferricstore.EmbeddedExtendedStringsTest do
       assert_in_delta result, 7.5, 0.001
     end
 
+    test "rejects integers outside the finite float range without raising" do
+      huge = String.to_integer(String.duplicate("9", 400))
+
+      assert {:error, "ERR value is not a valid float"} =
+               FerricStore.incr_by_float("ibf:huge", huge)
+
+      assert {:ok, nil} = FerricStore.get("ibf:huge")
+    end
+
     test "incr_by_float on hash key returns WRONGTYPE and leaves hash unchanged" do
       assert :ok = FerricStore.hset("ibf:hash", %{"field" => "old"})
       assert {:error, "WRONGTYPE" <> _} = FerricStore.incr_by_float("ibf:hash", 1.5)

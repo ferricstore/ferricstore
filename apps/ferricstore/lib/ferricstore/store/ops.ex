@@ -11,7 +11,7 @@ defmodule Ferricstore.Store.Ops do
   without changing command handler logic.
   """
 
-  alias Ferricstore.Store.{ReadResult, Router}
+  alias Ferricstore.Store.{ReadResult, Router, ValueCodec}
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
@@ -491,26 +491,15 @@ defmodule Ferricstore.Store.Ops do
           error
 
         {current, expire_at_ms} ->
-          case current do
-            nil ->
-              new_val = delta * 1.0
-              ShardETS.ets_insert(tx.shard_state, key, new_val, 0)
-              LocalRead.tx_put_pending(key, new_val, 0)
-              send(self(), {:tx_pending_write, key, new_val, 0})
-              {:ok, new_val}
-
-            value ->
-              case ShardETS.coerce_float(value) do
-                {:ok, float_val} ->
-                  new_val = float_val + delta
-                  ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
-                  LocalRead.tx_put_pending(key, new_val, expire_at_ms)
-                  send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
-                  {:ok, new_val}
-
-                :error ->
-                  {:error, "ERR value is not a valid float"}
-              end
+          with {:ok, float_val} <- local_float_value(current),
+               {:ok, new_val} <- ValueCodec.checked_float_add(float_val, delta) do
+            ShardETS.ets_insert(tx.shard_state, key, new_val, expire_at_ms)
+            LocalRead.tx_put_pending(key, new_val, expire_at_ms)
+            send(self(), {:tx_pending_write, key, new_val, expire_at_ms})
+            {:ok, new_val}
+          else
+            :overflow -> {:error, "ERR increment would produce NaN or Infinity"}
+            :error -> {:error, "ERR value is not a valid float"}
           end
       end
     else
@@ -519,6 +508,9 @@ defmodule Ferricstore.Store.Ops do
   end
 
   def incr_float(store, key, delta) when is_map(store), do: store.incr_float.(key, delta)
+
+  defp local_float_value(nil), do: {:ok, 0.0}
+  defp local_float_value(value), do: ShardETS.coerce_float(value)
 
   # --- String mutation operations ---
 

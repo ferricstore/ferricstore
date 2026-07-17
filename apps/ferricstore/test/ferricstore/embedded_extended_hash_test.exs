@@ -134,6 +134,15 @@ defmodule Ferricstore.EmbeddedExtendedHashTest do
       {f, _} = Float.parse(result)
       assert_in_delta f, 3.14, 0.001
     end
+
+    test "rejects integers outside the finite float range without writing" do
+      huge = String.to_integer(String.duplicate("9", 400))
+
+      assert {:error, "ERR value is not a valid float"} =
+               FerricStore.hincrbyfloat("hif:huge", "val", huge)
+
+      assert {:ok, nil} = FerricStore.hget("hif:huge", "val")
+    end
   end
 
   describe "hsetnx/3" do
