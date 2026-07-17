@@ -42,7 +42,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         ValueCodec
       }
 
-      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ETS, ZSetIndex}
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -86,12 +86,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       end
 
       defp delete_expired_committed_entry(state, entry) do
-        if Keydir.delete_exact(state.ets, entry) do
-          track_keydir_binary_remove_entry(state, entry)
-          true
-        else
-          false
-        end
+        state
+        |> Map.put(:keydir, state.ets)
+        |> Map.put(:index, state.shard_index)
+        |> ETS.delete_exact_entry(entry)
       end
 
       @doc false
@@ -804,7 +802,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         case CompoundMemberIndex.keys_for_prefix(
                Map.get(state, :compound_member_index_name),
                prefix,
-               state.apply_context.compound_delete_member_budget
+               state.apply_context.compound_member_apply_budget
              ) do
           {:ok, compound_keys} ->
             do_compound_batch_delete(state, redis_key, compound_keys)
@@ -1179,14 +1177,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
                 {compound_key, ets_val, expire_at_ms, LFU.initial(), fid, offset, value_size}
               )
 
-              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), compound_key)
+              CompoundMemberIndex.put(
+                Map.get(state, :compound_member_index_name),
+                compound_key,
+                expire_at_ms
+              )
+
               sm_tx_put_pending(compound_key, value, expire_at_ms)
-
-              deleted = Process.get(:tx_deleted_keys, MapSet.new())
-
-              if MapSet.member?(deleted, compound_key) do
-                Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
-              end
 
               zset_index_put(state, redis_key, compound_key, disk_val)
             end)
@@ -1332,23 +1329,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         case NIF.v2_append_ops_batch(active, ops) do
           {:ok, locations} ->
             with :ok <- validate_promoted_tombstone_batch(locations, length(compound_keys)) do
-              deleted =
-                Enum.reduce(compound_keys, Process.get(:tx_deleted_keys, MapSet.new()), fn
-                  compound_key, acc ->
-                    track_keydir_binary_remove(state, compound_key)
-                    :ets.delete(state.ets, compound_key)
+              Enum.each(compound_keys, fn compound_key ->
+                track_keydir_binary_remove(state, compound_key)
+                :ets.delete(state.ets, compound_key)
 
-                    CompoundMemberIndex.delete(
-                      Map.get(state, :compound_member_index_name),
-                      compound_key
-                    )
+                CompoundMemberIndex.delete(
+                  Map.get(state, :compound_member_index_name),
+                  compound_key
+                )
 
-                    sm_tx_drop_pending(compound_key)
-                    zset_index_delete(state, redis_key, compound_key)
-                    MapSet.put(acc, compound_key)
-                end)
+                sm_tx_mark_deleted(compound_key)
+                zset_index_delete(state, redis_key, compound_key)
+              end)
 
-              Process.put(:tx_deleted_keys, deleted)
               queue_promoted_maintenance_after_flush(redis_key, maintenance)
 
               queue_promoted_revision_deletes_after_flush(
@@ -1468,13 +1461,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               {compound_key, value_for, expire_at_ms, LFU.initial(), fid, offset, value_size}
             )
 
-            CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), compound_key)
-            sm_tx_put_pending(compound_key, value, expire_at_ms)
-            deleted = Process.get(:tx_deleted_keys, MapSet.new())
+            CompoundMemberIndex.put(
+              Map.get(state, :compound_member_index_name),
+              compound_key,
+              expire_at_ms
+            )
 
-            if MapSet.member?(deleted, compound_key) do
-              Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
-            end
+            sm_tx_put_pending(compound_key, value, expire_at_ms)
 
             queue_promoted_maintenance_after_flush(redis_key, maintenance)
 

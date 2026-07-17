@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.Raft.ApplyContext
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Shard.Compound.Ops, as: CompoundOps
   alias Ferricstore.Store.Shard.CompoundMemberIndex
@@ -112,6 +113,41 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     assert {:ok, [^kept_key]} = CompoundMemberIndex.keys_for_prefix(index, kept_prefix)
   end
 
+  @tag :compound_cardinality_index
+  test "delete_prefix clears cardinality and expiry metadata before reinsertion", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("delete-count")
+    first_key = CompoundKey.hash_field("delete-count", "first")
+    second_key = CompoundKey.hash_field("delete-count", "second")
+    state = %{keydir: keydir}
+
+    Enum.each([first_key, second_key], fn compound_key ->
+      :ets.insert(keydir, {compound_key, "value", 100, 0, 0, 0, 5})
+      CompoundMemberIndex.put(index, compound_key, 100)
+    end)
+
+    CommandTime.with_now_ms(20, fn ->
+      assert {:ok, 2, 0} = CompoundMemberIndex.count_live_indexed(index, state, prefix, 0)
+    end)
+
+    assert :ok = CompoundMemberIndex.delete_prefix(index, prefix)
+
+    :ets.delete(keydir, first_key)
+    :ets.delete(keydir, second_key)
+    :ets.insert(keydir, {first_key, "new", 200, 0, 0, 0, 3})
+    CompoundMemberIndex.put(index, first_key, 200)
+
+    CommandTime.with_now_ms(20, fn ->
+      assert {:ok, 1, 0} = CompoundMemberIndex.count_live_indexed(index, state, prefix, 0)
+    end)
+
+    CommandTime.with_now_ms(150, fn ->
+      assert {:ok, 1, 0} = CompoundMemberIndex.count_live_indexed(index, state, prefix, 0)
+    end)
+  end
+
   test "keydir mutation helpers keep the compound catalog in sync", %{
     keydir: keydir,
     index: index
@@ -218,6 +254,174 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     assert :unavailable = CompoundMemberIndex.count_live(nil, %{}, "S:tags\0")
   end
 
+  @tag :compound_cardinality_index
+  test "indexed live count is constant-work for a large live collection", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("large-count")
+
+    Enum.each(1..1_000, fn i ->
+      compound_key = CompoundKey.hash_field("large-count", Integer.to_string(i))
+      :ets.insert(keydir, {compound_key, "value", 0, 0, 0, 0, 5})
+      CompoundMemberIndex.put(index, compound_key, 0)
+    end)
+
+    assert {:ok, 1_000, 0} =
+             CompoundMemberIndex.count_live_indexed(index, %{keydir: keydir}, prefix, 0)
+  end
+
+  @tag :compound_cardinality_index
+  test "indexed live count is idempotent across overwrites and deletes", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("idempotent-count")
+    compound_key = CompoundKey.hash_field("idempotent-count", "field")
+    state = %{keydir: keydir}
+
+    :ets.insert(keydir, {compound_key, "one", 0, 0, 0, 0, 3})
+    CompoundMemberIndex.put(index, compound_key, 0)
+    CompoundMemberIndex.put(index, compound_key, 0)
+    assert {:ok, 1, 0} = CompoundMemberIndex.count_live_indexed(index, state, prefix, 0)
+
+    CompoundMemberIndex.delete(index, compound_key)
+    CompoundMemberIndex.delete(index, compound_key)
+    assert {:ok, 0, 0} = CompoundMemberIndex.count_live_indexed(index, state, prefix, 0)
+  end
+
+  @tag :compound_cardinality_index
+  test "zero-count cleanup does not erase a concurrent member increment", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("count-race")
+    deleted_key = CompoundKey.hash_field("count-race", "deleted")
+    inserted_key = CompoundKey.hash_field("count-race", "inserted")
+    state = %{keydir: keydir}
+
+    :ets.insert(keydir, {deleted_key, "old", 0, 0, 0, 0, 3})
+    CompoundMemberIndex.put(index, deleted_key, 0)
+
+    Process.put(:ferricstore_compound_member_after_zero_count_hook, fn observed_prefix ->
+      assert observed_prefix == prefix
+      :ets.insert(keydir, {inserted_key, "new", 0, 0, 0, 0, 3})
+      CompoundMemberIndex.put(index, inserted_key, 0)
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_compound_member_after_zero_count_hook) end)
+
+    CompoundMemberIndex.delete(index, deleted_key)
+
+    assert {:ok, 1, 0} = CompoundMemberIndex.count_live_indexed(index, state, prefix, 0)
+    assert {:ok, [^inserted_key]} = CompoundMemberIndex.keys_for_prefix(index, prefix)
+  end
+
+  @tag :compound_cardinality_index
+  test "indexed live count cleans only due expiries within its work budget", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("expiring-count")
+    field_a = CompoundKey.hash_field("expiring-count", "a")
+    field_b = CompoundKey.hash_field("expiring-count", "b")
+
+    Enum.each([field_a, field_b], fn compound_key ->
+      :ets.insert(keydir, {compound_key, "value", 10, 0, 0, 0, 5})
+      CompoundMemberIndex.put(index, compound_key, 10)
+    end)
+
+    state = %{keydir: keydir}
+
+    CommandTime.with_now_ms(20, fn ->
+      assert {:error, :limit_exceeded} =
+               CompoundMemberIndex.count_live_indexed(index, state, prefix, 1)
+
+      assert {:ok, 0, 1} =
+               CompoundMemberIndex.count_live_indexed(index, state, prefix, 1)
+    end)
+  end
+
+  @tag :compound_cardinality_index
+  test "indexed live count replaces old expiry metadata on overwrite", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("expiry-overwrite")
+    compound_key = CompoundKey.hash_field("expiry-overwrite", "field")
+    state = %{keydir: keydir}
+
+    :ets.insert(keydir, {compound_key, "value", 100, 0, 0, 0, 5})
+    CompoundMemberIndex.put(index, compound_key, 10)
+    CompoundMemberIndex.put(index, compound_key, 100)
+
+    CommandTime.with_now_ms(20, fn ->
+      assert {:ok, 1, 0} =
+               CompoundMemberIndex.count_live_indexed(index, state, prefix, 0)
+    end)
+  end
+
+  @tag :compound_cardinality_index
+  test "stale cleanup preserves the expiry of a concurrently refreshed member", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("stale-refresh")
+    compound_key = CompoundKey.hash_field("stale-refresh", "field")
+    state = %{keydir: keydir, shard_data_path: nil, compound_member_index: index}
+
+    CompoundMemberIndex.put(index, compound_key, 10)
+
+    Process.put(:ferricstore_compound_member_after_stale_delete_hook, fn deleted_key ->
+      assert deleted_key == compound_key
+      :ets.insert(keydir, {compound_key, "new", 100, 0, 0, 0, 3})
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_compound_member_after_stale_delete_hook) end)
+
+    CommandTime.with_now_ms(20, fn ->
+      assert {:ok, []} = CompoundMemberIndex.scan_entries(index, state, prefix)
+    end)
+
+    CommandTime.with_now_ms(50, fn ->
+      assert {:ok, 1, 0} = CompoundMemberIndex.count_live_indexed(index, state, prefix, 0)
+    end)
+
+    CommandTime.with_now_ms(101, fn ->
+      assert {:ok, 0, 1} = CompoundMemberIndex.count_live_indexed(index, state, prefix, 1)
+    end)
+  end
+
+  @tag :compound_cardinality_index
+  test "due-expiry count cleanup restores a concurrently refreshed member", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("expiry-refresh")
+    compound_key = CompoundKey.hash_field("expiry-refresh", "field")
+    state = %{keydir: keydir}
+
+    :ets.insert(keydir, {compound_key, "old", 10, 0, 0, 0, 3})
+    CompoundMemberIndex.put(index, compound_key, 10)
+
+    Process.put(:ferricstore_compound_member_after_stale_delete_hook, fn deleted_key ->
+      assert deleted_key == compound_key
+      :ets.insert(keydir, {compound_key, "new", 100, 0, 0, 0, 3})
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_compound_member_after_stale_delete_hook) end)
+
+    CommandTime.with_now_ms(20, fn ->
+      assert {:ok, 1, 1} =
+               CompoundMemberIndex.count_live_indexed(index, state, prefix, 1)
+    end)
+
+    CommandTime.with_now_ms(101, fn ->
+      assert {:ok, 0, 1} =
+               CompoundMemberIndex.count_live_indexed(index, state, prefix, 1)
+    end)
+  end
+
   test "prefix count falls back to the keydir while an index is still empty", %{
     keydir: keydir
   } do
@@ -228,6 +432,34 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     state = %{keydir: keydir, compound_member_index: index}
 
     assert 1 = ShardETS.prefix_count_entries(state, CompoundKey.set_prefix("tags"))
+  end
+
+  @tag :compound_cardinality_index
+  test "normal prefix counts bound and resume due-expiry cleanup", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("normal-count-expiry")
+
+    Enum.each(["a", "b"], fn field ->
+      compound_key = CompoundKey.hash_field("normal-count-expiry", field)
+      :ets.insert(keydir, {compound_key, field, 10, 0, 0, 0, 1})
+      CompoundMemberIndex.put(index, compound_key, 10)
+    end)
+
+    state = %{
+      keydir: keydir,
+      compound_member_index: index,
+      apply_context: ApplyContext.new(compound_member_apply_budget: 1)
+    }
+
+    CommandTime.with_now_ms(20, fn ->
+      assert {:error,
+              {:storage_read_failed, {:compound_count_failed, :limit_exceeded}}} =
+               ShardETS.prefix_count_entries(state, prefix)
+
+      assert 0 = ShardETS.prefix_count_entries(state, prefix)
+    end)
   end
 
   test "a rebuilt empty index is authoritative for count and scan", %{
@@ -395,6 +627,25 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
 
     assert CompoundMemberIndex.scan_entries(index, state, CompoundKey.hash_prefix("hash")) ==
              {:ok, [{"live", "1"}]}
+  end
+
+  @tag :compound_cardinality_index
+  test "rebuild skips malformed cold compound rows from exact counts", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.hash_prefix("rebuild-cold")
+    valid_key = CompoundKey.hash_field("rebuild-cold", "valid")
+    malformed_key = CompoundKey.hash_field("rebuild-cold", "malformed")
+
+    :ets.insert(keydir, {valid_key, nil, 0, 0, 7, 99, 3})
+    :ets.insert(keydir, {malformed_key, nil, 0, 0, :deleted, :bad_offset, 3})
+
+    assert :ok = CompoundMemberIndex.rebuild(index, keydir)
+
+    assert {:ok, [^valid_key]} = CompoundMemberIndex.keys_for_prefix(index, prefix)
+    assert {:ok, 1, 0} =
+             CompoundMemberIndex.count_live_indexed(index, %{keydir: keydir}, prefix, 0)
   end
 
   @tag :hlc_drift_guard

@@ -10,50 +10,116 @@ defmodule Ferricstore.Store.Shard.Transaction do
   # Transaction execution handler
   # -------------------------------------------------------------------
 
-  @spec handle_tx_execute([TxAst.queue_entry()], binary() | nil, map()) ::
-          {:reply, [term()] | {:error, binary()}, map()}
-  @doc false
-  def handle_tx_execute(queue, sandbox_namespace, state) do
-    results = execute(queue, sandbox_namespace, LocalTxStore.new(state))
-    {:reply, results, state}
-  end
-
   @spec execute([TxAst.queue_entry()], binary() | nil, map()) ::
-          [term()] | {:error, binary()}
+          [term()] | {:error, term()}
   @doc false
-  def execute(queue, sandbox_namespace, store) when is_list(queue) and is_map(store) do
-    with :ok <- validate_queue(queue) do
-      Process.put(:tx_deleted_keys, MapSet.new())
-      Process.put(:tx_pending_values, %{})
+  def execute(_queue, _sandbox_namespace, %LocalTxStore{}),
+    do: {:error, :local_tx_store_not_supported}
 
-      try do
+  def execute(queue, sandbox_namespace, store) when is_list(queue) and is_map(store) do
+    with :ok <-
+           validate_queue(
+             queue,
+             Map.get(store, :transaction_command_budget, :unlimited)
+           ) do
+      with_execution_context(store, fn ->
         dispatch_queue(queue, sandbox_namespace, store)
-      after
-        Process.delete(:tx_deleted_keys)
-        Process.delete(:tx_pending_values)
-      end
+      end)
     end
   end
 
-  defp validate_queue(queue) do
-    if Enum.all?(queue, &ExecutionEntry.valid?/1) do
-      :ok
-    else
-      {:error, "ERR invalid transaction command"}
+  @doc false
+  @spec with_execution_context(map(), (-> result)) :: result when result: term()
+  def with_execution_context(store, fun) when is_map(store) and is_function(fun, 0) do
+    Process.put(:tx_deleted_keys, MapSet.new())
+    Process.put(:tx_pending_values, %{})
+    Process.put(:tx_pending_compound_keys, %{})
+    Process.put(:tx_deleted_compound_keys, %{})
+    Process.put(:tx_compound_member_work_used, 0)
+    Process.put(:tx_result_bytes_used, 0)
+
+    Process.put(
+      :tx_result_byte_budget,
+      Map.get(store, :transaction_result_byte_budget, :unlimited)
+    )
+
+    Process.put(:tx_current_command_precharged_bytes, 0)
+    Process.put(:tx_materialization_bytes_reserved, 0)
+    Process.put(:tx_result_read_projection, :none)
+    Process.put(:tx_compound_scan_projection, :pairs)
+
+    try do
+      fun.()
+    after
+      Process.delete(:tx_deleted_keys)
+      Process.delete(:tx_pending_values)
+      Process.delete(:tx_pending_compound_keys)
+      Process.delete(:tx_deleted_compound_keys)
+      Process.delete(:tx_compound_member_work_used)
+      Process.delete(:tx_result_bytes_used)
+      Process.delete(:tx_result_byte_budget)
+      Process.delete(:tx_current_command_precharged_bytes)
+      Process.delete(:tx_materialization_bytes_reserved)
+      Process.delete(:tx_result_read_projection)
+      Process.delete(:tx_compound_scan_projection)
     end
+  end
+
+  defp validate_queue(queue, :unlimited) do
+    validate_queue_entries(queue)
+  end
+
+  defp validate_queue(queue, budget) when is_integer(budget) and budget >= 0 do
+    queue
+    |> Enum.reduce_while(0, fn entry, count ->
+      cond do
+        not ExecutionEntry.valid?(entry) ->
+          {:halt, {:error, "ERR invalid transaction command"}}
+
+        count >= budget ->
+          {:halt, {:error, :transaction_command_budget_exceeded}}
+
+        true ->
+          {:cont, count + 1}
+      end
+    end)
+    |> case do
+      count when is_integer(count) -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_queue(_queue, _invalid_budget),
+    do: {:error, :invalid_transaction_command_budget}
+
+  defp validate_queue_entries(queue) do
+    if Enum.all?(queue, &ExecutionEntry.valid?/1),
+      do: :ok,
+      else: {:error, "ERR invalid transaction command"}
   end
 
   defp dispatch_queue(queue, sandbox_namespace, store) do
     queue
     |> Enum.reduce_while([], fn entry, results ->
+      Process.put(:tx_current_command_precharged_bytes, 0)
+      Process.put(:tx_materialization_bytes_reserved, 0)
+      Process.put(:tx_result_read_projection, result_read_projection(entry))
+      Process.put(:tx_compound_scan_projection, compound_scan_projection(entry))
+
       ast =
         entry
         |> TxAst.command_ast()
         |> TxAst.namespace_ast_keys(sandbox_namespace)
 
       case dispatch_entry(ast, store) do
-        {:ok, result} -> {:cont, [result | results]}
-        {:fatal, reason} -> {:halt, {:error, reason}}
+        {:ok, result} ->
+          case charge_transaction_result(result) do
+            :ok -> {:cont, [result | results]}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+
+        {:fatal, reason} ->
+          {:halt, {:error, reason}}
       end
     end)
     |> case do
@@ -62,6 +128,32 @@ defmodule Ferricstore.Store.Shard.Transaction do
     end
   end
 
+  defp result_read_projection(%ExecutionEntry{command: command, ast: ast}) do
+    cond do
+      command in ["GET", "GETSET", "GETDEL", "GETEX", "HGET", "HGETDEL", "HGETEX"] ->
+        :point
+
+      command in ["MGET", "HMGET"] ->
+        :batch
+
+      command == "SET" and set_returns_old_value?(ast) ->
+        :point
+
+      true ->
+        :none
+    end
+  end
+
+  defp set_returns_old_value?({:set, _key, _value, opts}) when is_list(opts),
+    do: :get in opts
+
+  defp set_returns_old_value?(_ast), do: false
+
+  defp compound_scan_projection(%ExecutionEntry{command: "HKEYS"}), do: :fields
+  defp compound_scan_projection(%ExecutionEntry{command: "SMEMBERS"}), do: :fields
+  defp compound_scan_projection(%ExecutionEntry{command: "HVALS"}), do: :values
+  defp compound_scan_projection(%ExecutionEntry{}), do: :pairs
+
   defp dispatch_entry(ast, store) do
     {:ok, Dispatcher.dispatch_ast(ast, store)}
   rescue
@@ -69,6 +161,130 @@ defmodule Ferricstore.Store.Shard.Transaction do
   catch
     :throw, {:transaction_store_failure, reason} -> {:fatal, reason}
     _kind, _reason -> {:fatal, "ERR transaction command failed during replicated apply"}
+  end
+
+  defp charge_transaction_result(result) do
+    case Process.get(:tx_result_byte_budget, :unlimited) do
+      :unlimited ->
+        :ok
+
+      budget when is_integer(budget) and budget >= 0 ->
+        used = Process.get(:tx_result_bytes_used, 0)
+        precharged = Process.get(:tx_current_command_precharged_bytes, 0)
+
+        case admit_result_bytes(result, budget, used, precharged) do
+          {:ok, new_used} ->
+            Process.put(:tx_result_bytes_used, new_used)
+            :ok
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      _invalid ->
+        {:error, :invalid_transaction_result_byte_budget}
+    end
+  end
+
+  @doc false
+  def __admit_result_bytes_for_test__(result, budget, used, precharged),
+    do: admit_result_bytes(result, budget, used, precharged)
+
+  defp admit_result_bytes(result, budget, used, precharged)
+       when is_integer(budget) and budget >= 0 and is_integer(used) and used >= 0 and
+              is_integer(precharged) and precharged >= 0 do
+    remaining = max(budget - used, 0)
+
+    case transaction_result_bytes_up_to(result, precharged + remaining) do
+      {:ok, total_bytes} ->
+        {:ok, used + max(total_bytes - precharged, 0)}
+
+      :limit_exceeded ->
+        {:error, :transaction_result_byte_budget_exceeded}
+
+      :invalid ->
+        {:error, :invalid_transaction_result}
+    end
+  end
+
+  defp transaction_result_bytes_up_to(value, limit) when is_binary(value),
+    do: admit_scalar_bytes(byte_size(value), limit)
+
+  defp transaction_result_bytes_up_to(value, limit) when is_integer(value),
+    do: value |> to_string() |> byte_size() |> admit_scalar_bytes(limit)
+
+  defp transaction_result_bytes_up_to(value, limit) when is_float(value),
+    do: value |> Float.to_string() |> byte_size() |> admit_scalar_bytes(limit)
+
+  defp transaction_result_bytes_up_to(value, limit) when is_atom(value),
+    do: value |> Atom.to_string() |> byte_size() |> admit_scalar_bytes(limit)
+
+  defp transaction_result_bytes_up_to(value, limit) when is_list(value),
+    do: transaction_list_bytes_up_to(value, limit, 0)
+
+  defp transaction_result_bytes_up_to(value, limit) when is_tuple(value),
+    do: transaction_tuple_bytes_up_to(value, 0, tuple_size(value), limit, 0)
+
+  defp transaction_result_bytes_up_to(value, limit) when is_map(value),
+    do: transaction_map_bytes_up_to(:maps.iterator(value), limit, 0)
+
+  defp transaction_result_bytes_up_to(_value, _limit), do: {:ok, 0}
+
+  defp admit_scalar_bytes(bytes, limit) when bytes <= limit, do: {:ok, bytes}
+  defp admit_scalar_bytes(_bytes, _limit), do: :limit_exceeded
+
+  defp transaction_list_bytes_up_to([], _remaining, total), do: {:ok, total}
+
+  defp transaction_list_bytes_up_to([item | rest], remaining, total) do
+    case transaction_result_bytes_up_to(item, remaining) do
+      {:ok, bytes} ->
+        transaction_list_bytes_up_to(rest, remaining - bytes, total + bytes)
+
+      error ->
+        error
+    end
+  end
+
+  defp transaction_list_bytes_up_to(_improper_tail, _remaining, _total), do: :invalid
+
+  defp transaction_tuple_bytes_up_to(_tuple, size, size, _remaining, total),
+    do: {:ok, total}
+
+  defp transaction_tuple_bytes_up_to(tuple, index, size, remaining, total) do
+    case transaction_result_bytes_up_to(elem(tuple, index), remaining) do
+      {:ok, bytes} ->
+        transaction_tuple_bytes_up_to(
+          tuple,
+          index + 1,
+          size,
+          remaining - bytes,
+          total + bytes
+        )
+
+      error ->
+        error
+    end
+  end
+
+  defp transaction_map_bytes_up_to(iterator, remaining, total) do
+    case :maps.next(iterator) do
+      :none ->
+        {:ok, total}
+
+      {key, value, next_iterator} ->
+        with {:ok, key_bytes} <- transaction_result_bytes_up_to(key, remaining),
+             {:ok, value_bytes} <-
+               transaction_result_bytes_up_to(value, remaining - key_bytes) do
+          transaction_map_bytes_up_to(
+            next_iterator,
+            remaining - key_bytes - value_bytes,
+            total + key_bytes + value_bytes
+          )
+        end
+
+      _invalid ->
+        :invalid
+    end
   end
 
   # -------------------------------------------------------------------

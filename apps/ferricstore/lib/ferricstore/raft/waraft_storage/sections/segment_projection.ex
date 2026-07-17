@@ -323,7 +323,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp segment_project_delete_prefix(sm_state, redis_key, prefix) do
         index = Map.get(sm_state, :compound_member_index_name)
-        budget = sm_state.apply_context.compound_delete_member_budget
+        budget = sm_state.apply_context.compound_member_apply_budget
 
         case CompoundMemberIndex.keys_for_prefix(index, prefix, budget) do
           {:ok, compound_keys} ->

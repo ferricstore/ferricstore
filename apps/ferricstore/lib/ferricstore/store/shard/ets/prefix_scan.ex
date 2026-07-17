@@ -630,11 +630,30 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
     index = compound_member_index_ref(state)
 
     if CompoundMemberIndex.supports_prefix?(prefix) and CompoundMemberIndex.ready?(index) do
-      CompoundMemberIndex.count_live(index, state, prefix)
+      case CompoundMemberIndex.count_live_indexed(
+             index,
+             state,
+             prefix,
+             compound_count_cleanup_budget(state)
+           ) do
+        {:ok, count, _inspected} -> {:ok, count}
+        {:error, _reason} = error -> error
+        :unavailable -> :unavailable
+      end
     else
       :unavailable
     end
   end
+
+  defp compound_count_cleanup_budget(%{apply_context: apply_context})
+       when is_map(apply_context) do
+    case Map.get(apply_context, :compound_member_apply_budget) do
+      budget when is_integer(budget) and budget > 0 -> budget
+      _missing_or_invalid -> 4_096
+    end
+  end
+
+  defp compound_count_cleanup_budget(_state), do: 4_096
 
   defp select_prefix_count_entries(state, keydir, prefix) do
     expiry_cutoff_ms =

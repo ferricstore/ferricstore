@@ -1198,12 +1198,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       end
 
       defp transaction_compound_prefix_keys(ctx, prefix, member_budget) do
-        case CompoundMemberIndex.keys_for_prefix(
+        case CompoundMemberIndex.live_keys_for_prefix(
                ctx.compound_member_index_name,
+               %{keydir: ctx.keydir},
                prefix,
                member_budget
              ) do
-          {:ok, catalog_keys} ->
+          {:ok, _catalog_keys, _inspected, :more} ->
+            {:error, :limit_exceeded}
+
+          {:ok, catalog_keys, inspected, :complete} ->
             deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
             base_keys =
@@ -1211,40 +1215,439 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
               |> MapSet.new()
               |> MapSet.difference(deleted)
 
-            Process.get(:tx_pending_values, %{})
-            |> Enum.reduce_while({:ok, base_keys}, fn {key, _value}, {:ok, keys} ->
-              cond do
-                not transaction_key_has_prefix?(key, prefix) ->
-                  {:cont, {:ok, keys}}
+            :tx_pending_compound_keys
+            |> sm_tx_compound_keys_for_prefix(prefix)
+            |> Enum.reduce_while({:ok, base_keys, inspected}, fn
+              _key, {:ok, _keys, work} when work >= member_budget ->
+                {:halt, {:error, :limit_exceeded}}
 
-                MapSet.member?(deleted, key) or MapSet.member?(keys, key) ->
-                  {:cont, {:ok, keys}}
+              key, {:ok, keys, work} ->
+                keys =
+                  if MapSet.member?(deleted, key) do
+                    keys
+                  else
+                    MapSet.put(keys, key)
+                  end
 
-                MapSet.size(keys) >= member_budget ->
-                  {:halt, {:error, :compound_delete_budget_exceeded}}
-
-                true ->
-                  {:cont, {:ok, MapSet.put(keys, key)}}
-              end
+                {:cont, {:ok, keys, work + 1}}
             end)
             |> case do
-              {:ok, keys} -> {:ok, keys |> MapSet.to_list() |> Enum.sort()}
-              {:error, :compound_delete_budget_exceeded} = error -> error
+              {:ok, keys, work} ->
+                {:ok, keys |> MapSet.to_list() |> Enum.sort(), work}
+
+              {:error, :limit_exceeded} = error ->
+                error
             end
 
           {:error, :limit_exceeded} ->
-            {:error, :compound_delete_budget_exceeded}
+            {:error, :limit_exceeded}
 
           :unavailable ->
             {:error, :compound_member_index_unavailable}
         end
       end
 
-      defp transaction_key_has_prefix?(key, prefix)
-           when is_binary(key) and byte_size(key) >= byte_size(prefix),
-           do: binary_part(key, 0, byte_size(prefix)) == prefix
+      defp transaction_compound_member_budget_remaining(anchor_state) do
+        max(
+          anchor_state.apply_context.compound_member_apply_budget -
+            Process.get(:tx_compound_member_work_used, 0),
+          0
+        )
+      end
 
-      defp transaction_key_has_prefix?(_key, _prefix), do: false
+      defp charge_transaction_compound_member_work!(count)
+           when is_integer(count) and count >= 0 do
+        used = Process.get(:tx_compound_member_work_used, 0)
+        Process.put(:tx_compound_member_work_used, used + count)
+        :ok
+      end
+
+      defp admit_transaction_compound_batch_work!(items, anchor_state) do
+        remaining = transaction_compound_member_budget_remaining(anchor_state)
+
+        case compound_batch_work_up_to(items, remaining, 0) do
+          {:ok, count} ->
+            charge_transaction_compound_member_work!(count)
+
+          :limit_exceeded ->
+            throw({
+              :transaction_store_failure,
+              :transaction_compound_mutation_budget_exceeded
+            })
+
+          :invalid ->
+            throw({:transaction_store_failure, :invalid_compound_mutation_batch})
+        end
+      end
+
+      defp compound_batch_work_up_to([], _remaining, count), do: {:ok, count}
+      defp compound_batch_work_up_to([_item | _rest], 0, _count), do: :limit_exceeded
+
+      defp compound_batch_work_up_to([_item | rest], remaining, count) do
+        compound_batch_work_up_to(rest, remaining - 1, count + 1)
+      end
+
+      defp compound_batch_work_up_to(_improper_tail, _remaining, _count), do: :invalid
+
+      defp transaction_result_byte_budget_remaining(anchor_state) do
+        max(
+          anchor_state.apply_context.transaction_result_byte_budget -
+            Process.get(:tx_result_bytes_used, 0),
+          0
+        )
+      end
+
+      defp charge_transaction_result_bytes!(bytes)
+           when is_integer(bytes) and bytes >= 0 do
+        used = Process.get(:tx_result_bytes_used, 0)
+        Process.put(:tx_result_bytes_used, used + bytes)
+
+        precharged = Process.get(:tx_current_command_precharged_bytes, 0)
+        Process.put(:tx_current_command_precharged_bytes, precharged + bytes)
+        :ok
+      end
+
+      defp transaction_compound_scan(
+             ctx,
+             redis_key,
+             prefix,
+             member_budget,
+             byte_budget,
+             projection
+           ) do
+        with {:ok, compound_keys, member_work} <-
+               transaction_compound_prefix_keys(ctx, prefix, member_budget) do
+          if projection == :fields do
+            transaction_compound_field_entries(
+              ctx,
+              compound_keys,
+              prefix,
+              byte_budget,
+              member_work
+            )
+          else
+            transaction_compound_value_entries(
+              ctx,
+              redis_key,
+              compound_keys,
+              prefix,
+              byte_budget,
+              projection,
+              member_work
+            )
+          end
+        end
+      end
+
+      defp transaction_compound_value_entries(
+             ctx,
+             redis_key,
+             compound_keys,
+             prefix,
+             byte_budget,
+             projection,
+             member_work
+           ) do
+        with {:ok, preflight_bytes} <-
+               transaction_compound_scan_preflight_bytes(
+                 ctx,
+                 compound_keys,
+                 prefix,
+                 projection
+               ) do
+          if preflight_bytes <= byte_budget do
+            previous_reserved = Process.get(:tx_materialization_bytes_reserved, 0)
+            previous_precharged = Process.get(:tx_blob_ref_storage_precharged, :undefined)
+
+            Process.put(
+              :tx_materialization_bytes_reserved,
+              previous_reserved + preflight_bytes
+            )
+
+            Process.put(:tx_blob_ref_storage_precharged, true)
+
+            try do
+              values = cross_shard_compound_batch_read(ctx, redis_key, compound_keys)
+              prefix_size = byte_size(prefix)
+
+              {entries, bytes} =
+                Enum.zip_reduce(compound_keys, values, {[], 0}, fn
+                  _compound_key, nil, acc ->
+                    acc
+
+                  compound_key, value, {entries, bytes} ->
+                    field =
+                      binary_part(
+                        compound_key,
+                        prefix_size,
+                        byte_size(compound_key) - prefix_size
+                      )
+
+                    {
+                      [{field, value} | entries],
+                      bytes +
+                        projected_compound_field_bytes(projection, byte_size(field)) +
+                        transaction_result_value_size(value)
+                    }
+                end)
+
+              if bytes <= byte_budget do
+                {:ok, Enum.reverse(entries), member_work, bytes}
+              else
+                {:error, :byte_limit_exceeded}
+              end
+            after
+              Process.put(:tx_materialization_bytes_reserved, previous_reserved)
+
+              case previous_precharged do
+                :undefined -> Process.delete(:tx_blob_ref_storage_precharged)
+                value -> Process.put(:tx_blob_ref_storage_precharged, value)
+              end
+            end
+          else
+            {:error, :byte_limit_exceeded}
+          end
+        end
+      end
+
+      defp transaction_compound_field_entries(
+             ctx,
+             compound_keys,
+             prefix,
+             byte_budget,
+             member_work
+           ) do
+        pending_keys = sm_tx_compound_keys_for_prefix(:tx_pending_compound_keys, prefix)
+        pending_values = Process.get(:tx_pending_values, %{})
+        expiry_context = ExpiryContext.capture()
+        prefix_size = byte_size(prefix)
+
+        compound_keys
+        |> Enum.reduce_while({:ok, [], 0}, fn compound_key, {:ok, entries, bytes} ->
+          live? =
+            if MapSet.member?(pending_keys, compound_key) do
+              transaction_pending_member_live?(
+                pending_keys,
+                pending_values,
+                compound_key,
+                expiry_context
+              )
+            else
+              cross_shard_ets_exists?(ctx, compound_key, expiry_context)
+            end
+
+          if live? do
+            field_size = byte_size(compound_key) - prefix_size
+            next_bytes = bytes + field_size
+
+            if next_bytes <= byte_budget do
+              field = binary_part(compound_key, prefix_size, field_size)
+              {:cont, {:ok, [{field, nil} | entries], next_bytes}}
+            else
+              {:halt, {:error, :byte_limit_exceeded}}
+            end
+          else
+            {:cont, {:ok, entries, bytes}}
+          end
+        end)
+        |> case do
+          {:ok, entries, bytes} ->
+            {:ok, Enum.reverse(entries), member_work, bytes}
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp transaction_compound_scan_preflight_bytes(
+             ctx,
+             compound_keys,
+             prefix,
+             projection
+           ) do
+        pending_values = Process.get(:tx_pending_values, %{})
+        expiry_context = ExpiryContext.capture()
+        prefix_size = byte_size(prefix)
+
+        Enum.reduce_while(compound_keys, {:ok, 0}, fn compound_key, {:ok, bytes} ->
+          field_bytes =
+            projected_compound_field_bytes(
+              projection,
+              byte_size(compound_key) - prefix_size
+            )
+
+          case Map.fetch(pending_values, compound_key) do
+            {:ok, {value, expire_at_ms}}
+            when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+              case ExpiryContext.classify(expiry_context, expire_at_ms) do
+                :live ->
+                  {:cont, {:ok, bytes + field_bytes + transaction_result_value_size(value)}}
+
+                :expired ->
+                  {:cont, {:ok, bytes}}
+
+                {:unsafe, reason} ->
+                  {:halt, {:error, reason}}
+              end
+
+            {:ok, invalid} ->
+              {:halt, {:error, {:invalid_pending_value, compound_key, invalid}}}
+
+            :error ->
+              transaction_compound_scan_preflight_keydir_bytes(
+                ctx,
+                compound_key,
+                field_bytes,
+                bytes,
+                expiry_context
+              )
+          end
+        end)
+      end
+
+      defp transaction_compound_scan_preflight_keydir_bytes(
+             ctx,
+             compound_key,
+             field_bytes,
+             bytes,
+             expiry_context
+           ) do
+        case :ets.lookup(ctx.keydir, compound_key) do
+          [
+            {^compound_key, value, expire_at_ms, _lfu, file_id, offset, value_size}
+          ]
+          when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+            case ExpiryContext.classify(expiry_context, expire_at_ms) do
+              :live ->
+                cond do
+                  value != nil ->
+                    {:cont, {:ok, bytes + field_bytes + transaction_result_value_size(value)}}
+
+                  valid_cross_shard_cold_location_value?(file_id, offset, value_size) ->
+                    {:cont, {:ok, bytes + field_bytes + value_size}}
+
+                  true ->
+                    {:halt,
+                     {:error,
+                      {:invalid_cold_location, compound_key, {file_id, offset, value_size}}}}
+                end
+
+              :expired ->
+                {:cont, {:ok, bytes}}
+
+              {:unsafe, reason} ->
+                {:halt, {:error, reason}}
+            end
+
+          [] ->
+            {:cont, {:ok, bytes}}
+
+          invalid ->
+            {:halt, {:error, {:invalid_keydir_entry, compound_key, invalid}}}
+        end
+      rescue
+        ArgumentError -> {:halt, {:error, :keydir_unavailable}}
+      end
+
+      defp projected_compound_field_bytes(:values, _field_bytes), do: 0
+      defp projected_compound_field_bytes(_projection, field_bytes), do: field_bytes
+
+      defp transaction_result_value_size(value) when is_binary(value), do: byte_size(value)
+
+      defp transaction_result_value_size(value) when is_integer(value),
+        do: value |> to_string() |> byte_size()
+
+      defp transaction_result_value_size(value) when is_float(value),
+        do: value |> ValueCodec.format_float() |> byte_size()
+
+      defp transaction_result_value_size(value),
+        do: value |> :erlang.term_to_binary() |> byte_size()
+
+      defp transaction_compound_count(ctx, prefix, member_budget) do
+        case CompoundMemberIndex.count_live_indexed(
+               ctx.compound_member_index_name,
+               %{keydir: ctx.keydir},
+               prefix,
+               member_budget
+             ) do
+          {:ok, base_count, inspected} ->
+            pending_keys = sm_tx_compound_keys_for_prefix(:tx_pending_compound_keys, prefix)
+            deleted_keys = sm_tx_compound_keys_for_prefix(:tx_deleted_compound_keys, prefix)
+            changed_keys = MapSet.union(pending_keys, deleted_keys)
+
+            if MapSet.size(changed_keys) > member_budget - inspected do
+              {:error, :limit_exceeded}
+            else
+              pending_values = Process.get(:tx_pending_values, %{})
+              expiry_context = ExpiryContext.capture()
+
+              delta =
+                Enum.reduce(changed_keys, 0, fn key, acc ->
+                  base_live? = cross_shard_ets_exists?(ctx, key, expiry_context)
+
+                  current_live? =
+                    transaction_pending_member_live?(
+                      pending_keys,
+                      pending_values,
+                      key,
+                      expiry_context
+                    )
+
+                  cond do
+                    current_live? and not base_live? -> acc + 1
+                    base_live? and not current_live? -> acc - 1
+                    true -> acc
+                  end
+                end)
+
+              {:ok, max(base_count + delta, 0), inspected + MapSet.size(changed_keys)}
+            end
+
+          {:error, :limit_exceeded} ->
+            {:error, :limit_exceeded}
+
+          {:error, reason} ->
+            {:error, reason}
+
+          :unavailable ->
+            {:error, :compound_member_index_unavailable}
+        end
+      end
+
+      defp transaction_pending_member_live?(
+             pending_keys,
+             pending_values,
+             key,
+             expiry_context
+           ) do
+        if MapSet.member?(pending_keys, key) do
+          case Map.fetch(pending_values, key) do
+            {:ok, {_value, expire_at_ms}}
+            when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+              case ExpiryContext.classify(expiry_context, expire_at_ms) do
+                :live ->
+                  true
+
+                :expired ->
+                  false
+
+                {:unsafe, reason} ->
+                  record_state_read_failure(reason)
+                  false
+              end
+
+            {:ok, invalid} ->
+              record_state_read_failure({:invalid_pending_value, key, invalid})
+              false
+
+            :error ->
+              record_state_read_failure({:missing_pending_value, key})
+              false
+          end
+        else
+          false
+        end
+      end
 
       # Builds a store map for a given shard_idx, usable by Dispatcher.dispatch.
       # For the anchor shard (matching state.shard_index), uses state directly.
@@ -1333,11 +1736,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end
 
           sm_tx_put_pending(key, pending_value, expire_at_ms)
-          deleted = Process.get(:tx_deleted_keys, MapSet.new())
-
-          if MapSet.member?(deleted, key) do
-            Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
-          end
 
           queue_cross_shard_pending_put(ctx, key, disk_val, expire_at_ms, value_for)
           cross_shard_transaction_hook({:staged_put, ctx.index, key})
@@ -1422,9 +1820,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             :ets.delete(ctx.keydir, key)
           end
 
-          sm_tx_drop_pending(key)
-          deleted = Process.get(:tx_deleted_keys, MapSet.new())
-          Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
+          sm_tx_mark_deleted(key)
           queue_cross_shard_pending_delete(ctx, key)
           cross_shard_transaction_hook({:staged_delete, ctx.index, key})
           :ok
@@ -1443,6 +1839,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           else
             case sm_tx_pending_meta(key) do
               {value, _exp} -> normalize_get_value(value)
+              :tx_deleted -> nil
               nil -> ctx |> cross_shard_ets_read(key) |> normalize_get_value()
             end
           end
@@ -1456,6 +1853,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             nil
           else
             case sm_tx_pending_meta(key) do
+              :tx_deleted -> nil
               nil -> cross_shard_ets_read_meta(ctx, key)
               meta -> meta
             end
@@ -1469,7 +1867,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           if MapSet.member?(deleted, key) do
             false
           else
-            sm_tx_pending_meta(key) != nil or cross_shard_ets_exists?(ctx, key)
+            case sm_tx_pending_meta(key) do
+              {_value, _expire_at_ms} -> true
+              :tx_deleted -> false
+              nil -> cross_shard_ets_exists?(ctx, key)
+            end
           end
         end
 
@@ -1693,7 +2095,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
           with :ok <- put_in_ctx.(ctx, compound_key, value, expire_at_ms) do
             with :ok <-
-                   queue_compound_indexes_put_after_flush(ctx, redis_key, compound_key, value) do
+                   queue_compound_indexes_put_after_flush(
+                     ctx,
+                     redis_key,
+                     compound_key,
+                     value,
+                     expire_at_ms
+                   ) do
               queue_promoted_revision_put_after_flush(
                 ctx.compound_revision_index_name,
                 compound_key
@@ -1720,8 +2128,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           ctx = promoted_target_ctx.(redis_key, dedicated_path)
 
           with :ok <- batch_put_in_ctx.(ctx, entries) do
-            Enum.each(entries, fn {compound_key, value, _expire_at_ms} ->
-              :ok = queue_compound_indexes_put_after_flush(ctx, redis_key, compound_key, value)
+            Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
+              :ok =
+                queue_compound_indexes_put_after_flush(
+                  ctx,
+                  redis_key,
+                  compound_key,
+                  value,
+                  expire_at_ms
+                )
 
               :ok =
                 queue_promoted_revision_put_after_flush(
@@ -1816,7 +2231,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             case promoted_compound_path(ctx, redis_key, compound_key) do
               nil ->
                 with :ok <- put_in_ctx.(ctx, compound_key, value, expire_at_ms) do
-                  queue_compound_indexes_put_after_flush(ctx, redis_key, compound_key, value)
+                  queue_compound_indexes_put_after_flush(
+                    ctx,
+                    redis_key,
+                    compound_key,
+                    value,
+                    expire_at_ms
+                  )
                 end
 
               dedicated_path ->
@@ -1824,6 +2245,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             end
           end,
           compound_batch_put: fn redis_key, entries ->
+            :ok = admit_transaction_compound_batch_work!(entries, anchor_state)
             ctx = ctx_for_key.(redis_key)
 
             case promoted_compound_batch_path(ctx, redis_key, entries) do
@@ -1833,13 +2255,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
               nil ->
                 :ok = batch_put_in_ctx.(ctx, entries)
 
-                Enum.each(entries, fn {compound_key, value, _expire_at_ms} ->
+                Enum.each(entries, fn {compound_key, value, expire_at_ms} ->
                   :ok =
                     queue_compound_indexes_put_after_flush(
                       ctx,
                       redis_key,
                       compound_key,
-                      value
+                      value,
+                      expire_at_ms
                     )
                 end)
 
@@ -1879,6 +2302,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             end
           end,
           compound_batch_delete: fn redis_key, compound_keys ->
+            :ok = admit_transaction_compound_batch_work!(compound_keys, anchor_state)
             ctx = ctx_for_key.(redis_key)
 
             case promoted_compound_batch_path(ctx, redis_key, compound_keys) do
@@ -1899,18 +2323,66 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end,
           compound_scan: fn redis_key, prefix ->
             ctx = ctx_for_key.(redis_key)
-            cross_shard_compound_scan(ctx, redis_key, prefix)
+            member_budget = transaction_compound_member_budget_remaining(anchor_state)
+            byte_budget = transaction_result_byte_budget_remaining(anchor_state)
+            projection = Process.get(:tx_compound_scan_projection, :pairs)
+
+            case transaction_compound_scan(
+                   ctx,
+                   redis_key,
+                   prefix,
+                   member_budget,
+                   byte_budget,
+                   projection
+                 ) do
+              {:ok, entries, member_work, result_bytes} ->
+                charge_transaction_compound_member_work!(member_work)
+                charge_transaction_result_bytes!(result_bytes)
+                entries
+
+              {:error, :limit_exceeded} ->
+                throw({
+                  :transaction_store_failure,
+                  :transaction_compound_read_budget_exceeded
+                })
+
+              {:error, :byte_limit_exceeded} ->
+                throw({
+                  :transaction_store_failure,
+                  :transaction_result_byte_budget_exceeded
+                })
+
+              {:error, reason} ->
+                throw({:transaction_store_failure, reason})
+            end
           end,
           compound_count: fn redis_key, prefix ->
             ctx = ctx_for_key.(redis_key)
-            cross_shard_prefix_count(ctx, prefix)
+            member_budget = transaction_compound_member_budget_remaining(anchor_state)
+
+            case transaction_compound_count(ctx, prefix, member_budget) do
+              {:ok, count, work} ->
+                charge_transaction_compound_member_work!(work)
+                count
+
+              {:error, :limit_exceeded} ->
+                throw({
+                  :transaction_store_failure,
+                  :transaction_compound_read_budget_exceeded
+                })
+
+              {:error, reason} ->
+                throw({:transaction_store_failure, reason})
+            end
           end,
           compound_delete_prefix: fn redis_key, prefix ->
             ctx = ctx_for_key.(redis_key)
-            member_budget = anchor_state.apply_context.compound_delete_member_budget
+            member_budget = transaction_compound_member_budget_remaining(anchor_state)
 
             case transaction_compound_prefix_keys(ctx, prefix, member_budget) do
-              {:ok, compound_keys} ->
+              {:ok, compound_keys, member_work} ->
+                charge_transaction_compound_member_work!(member_work)
+
                 case promoted_compound_path(ctx, redis_key, prefix) do
                   nil ->
                     Enum.each(compound_keys, fn key ->
@@ -1923,6 +2395,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
                   dedicated_path ->
                     promoted_delete_batch.(redis_key, compound_keys, dedicated_path)
                 end
+
+              {:error, :limit_exceeded} ->
+                throw({:transaction_store_failure, :compound_delete_budget_exceeded})
 
               {:error, reason} ->
                 throw({:transaction_store_failure, reason})
@@ -1998,7 +2473,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             Path.join(default_ctx.shard_data_path, "prob")
           end,
           shard_index: default_ctx.index,
-          data_dir: data_dir
+          data_dir: data_dir,
+          transaction_command_budget: anchor_state.apply_context.transaction_command_budget,
+          transaction_result_byte_budget:
+            anchor_state.apply_context.transaction_result_byte_budget
         }
       end
 

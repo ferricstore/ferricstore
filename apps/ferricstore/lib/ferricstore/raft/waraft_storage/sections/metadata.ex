@@ -203,11 +203,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       defp encode_persisted_apply_context(other), do: other
 
       defp decode_persisted_apply_context(
-             {:flow_apply_context_v1, _retention_ttl_ms, _history_hot, _history_max,
+             {:ferricstore_apply_context_v1, _retention_ttl_ms, _history_hot, _history_max,
               _max_history_hot, _max_history, _cleanup_keys, _cleanup_bytes, _history_scan,
               _value_scan, _hibernation_enabled, _hot_window_ms, _safety_margin_ms,
               _promote_window_ms, _late_promote_window_ms, _flow_max_batch_items,
-              _promotion_threshold, _compound_delete_member_budget, _max_value_size} = encoded
+              _promotion_threshold, _compound_member_apply_budget, _transaction_command_budget,
+              _transaction_result_byte_budget, _max_value_size} =
+               encoded
            ) do
         case Ferricstore.Raft.ApplyContext.decode(encoded) do
           {:ok, context} -> context

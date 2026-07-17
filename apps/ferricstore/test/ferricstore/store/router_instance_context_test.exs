@@ -3,9 +3,11 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
   alias Ferricstore.CommandTime
   alias Ferricstore.CrossShardOp
+  alias Ferricstore.Raft.ApplyContext
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Promotion
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Test.IsolatedInstance
   alias Ferricstore.Test.ShardHelpers
 
@@ -305,6 +307,44 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert "custom" == Router.get(ctx, key)
   end
 
+  @tag :direct_tx_atomicity
+  test "custom shard EXEC rolls back staged writes on a fatal result budget error", %{ctx: ctx} do
+    {read_key, staged_key} = same_shard_keys(ctx)
+    shard_index = Router.shard_for(ctx, read_key)
+    shard_name = elem(ctx.shard_names, shard_index)
+    shard_pid = Process.whereis(shard_name)
+    limited_context = ApplyContext.new(transaction_result_byte_budget: 5)
+
+    assert :ok = Router.put(ctx, read_key, "1234", 0)
+
+    :sys.replace_state(shard_pid, fn state ->
+      %{
+        state
+        | apply_context: limited_context,
+          apply_context_encoded: ApplyContext.encode(limited_context)
+      }
+    end)
+
+    entries =
+      Enum.map(
+        [
+          {"SET", [staged_key, "staged"]},
+          {"GET", [read_key]}
+        ],
+        fn {command, args} ->
+          {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare(command, args)
+          {:ok, entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+          entry
+        end
+      )
+
+    assert {:error, :transaction_result_byte_budget_exceeded} =
+             GenServer.call(shard_name, {:tx_execute, entries, nil})
+
+    assert nil == Router.get(ctx, staged_key)
+    assert "1234" == Router.get(ctx, read_key)
+  end
+
   test "custom compound put does not use the default Raft batcher", %{ctx: ctx} do
     key = "router:instance:async-compound:#{System.unique_integer([:positive])}"
     field_key = CompoundKey.hash_field(key, "field")
@@ -332,6 +372,30 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
     assert :ok = Router.compound_put(ctx, key, field_key, "field-value", 0)
     assert "field-value" == Router.compound_get(ctx, key, field_key)
+  end
+
+  @tag :compound_cardinality_index
+  test "lazy Router expiry removes exact compound catalog metadata", %{ctx: ctx} do
+    key = "router:instance:expired-compound:#{System.unique_integer([:positive])}"
+    field_key = CompoundKey.hash_field(key, "field")
+    prefix = CompoundKey.hash_prefix(key)
+    shard_index = Router.shard_for(ctx, key)
+    index = CompoundMemberIndex.table_name(ctx.name, shard_index)
+
+    assert :ok =
+             CommandTime.with_now_ms(5, fn ->
+               Router.compound_put(ctx, key, field_key, "value", 10)
+             end)
+
+    assert {:ok, [^field_key]} = CompoundMemberIndex.keys_for_prefix(index, prefix)
+
+    assert nil ==
+             CommandTime.with_now_ms(20, fn ->
+               Router.compound_get(ctx, key, field_key)
+             end)
+
+    assert {:ok, []} = CompoundMemberIndex.keys_for_prefix(index, prefix)
+    assert 0 = Router.compound_count(ctx, key, prefix)
   end
 
   test "custom write version survives shard process restart", %{ctx: ctx} do

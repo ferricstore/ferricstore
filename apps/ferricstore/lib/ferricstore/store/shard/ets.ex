@@ -323,7 +323,7 @@ defmodule Ferricstore.Store.Shard.ETS do
         {key, v, expire_at_ms, LFU.initial(), :pending, original_fid, original_vsize}
       )
 
-    CompoundMemberIndex.put(compound_member_index(state), key)
+    CompoundMemberIndex.put(compound_member_index(state), key, expire_at_ms)
     :ok = project_logical_key_put(state, key, value, expire_at_ms)
     true
   end
@@ -434,7 +434,7 @@ defmodule Ferricstore.Store.Shard.ETS do
         {key, v, expire_at_ms, LFU.initial(), file_id, offset, value_size}
       )
 
-    CompoundMemberIndex.put(compound_member_index(state), key)
+    CompoundMemberIndex.put(compound_member_index(state), key, expire_at_ms)
     :ok = project_logical_key_put(state, key, value, expire_at_ms)
     true
   end
@@ -482,7 +482,7 @@ defmodule Ferricstore.Store.Shard.ETS do
         true = :ets.insert(state.keydir, records)
 
         Enum.each(entries, fn {key, value, expire_at_ms} ->
-          CompoundMemberIndex.put(compound_member_index(state), key)
+          CompoundMemberIndex.put(compound_member_index(state), key, expire_at_ms)
           :ok = project_logical_key_put(state, key, value, expire_at_ms)
         end)
 
@@ -554,7 +554,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     case :ets.lookup(state.keydir, key) do
       [{^key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size}]
       when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
-        CompoundMemberIndex.put(compound_member_index(state), key)
+        CompoundMemberIndex.put(compound_member_index(state), key, expire_at_ms)
         project_logical_key_put(state, key, value, expire_at_ms)
 
       _missing_or_invalid ->

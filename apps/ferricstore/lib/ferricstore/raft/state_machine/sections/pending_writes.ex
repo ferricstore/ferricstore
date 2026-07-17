@@ -1042,7 +1042,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
           {key, ets_val, expire_at_ms, LFU.initial(), file_id, offset, value_size}
         )
 
-        CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+        CompoundMemberIndex.put(
+          Map.get(state, :compound_member_index_name),
+          key,
+          expire_at_ms
+        )
+
         logical_key_index_put(state, key, value, expire_at_ms)
         apply_fast_put_pending_locations(state, file_id, batch, locations, hot_threshold)
       end

@@ -20,7 +20,9 @@ defmodule Ferricstore.Raft.ApplyContext do
   @max_hibernation_window_ms @max_retention_ttl_ms
   @max_flow_batch_items 100_000
   @max_value_size 512 * 1_024 * 1_024
-  @max_compound_delete_member_budget 100_000
+  @max_compound_member_apply_budget 100_000
+  @max_transaction_command_budget 100_000
+  @max_transaction_result_byte_budget 64 * 1_024 * 1_024
 
   @default_retention_ttl_ms 604_800_000
   @default_history_hot_max_events 0
@@ -112,11 +114,21 @@ defmodule Ferricstore.Raft.ApplyContext do
                                                 :flow_hibernation_late_promote_window_ms,
                                                 5 * 60 * 1_000
                                               )
-  @default_compound_delete_member_budget Application.compile_env(
-                                           :ferricstore,
-                                           :compound_delete_member_budget,
-                                           4_096
-                                         )
+  @default_compound_member_apply_budget Application.compile_env(
+                                          :ferricstore,
+                                          :compound_member_apply_budget,
+                                          4_096
+                                        )
+  @default_transaction_result_byte_budget Application.compile_env(
+                                            :ferricstore,
+                                            :transaction_result_byte_budget,
+                                            8 * 1_024 * 1_024
+                                          )
+  @default_transaction_command_budget Application.compile_env(
+                                        :ferricstore,
+                                        :transaction_command_budget,
+                                        1_000
+                                      )
 
   @enforce_keys [:version]
   defstruct version: @version,
@@ -136,7 +148,9 @@ defmodule Ferricstore.Raft.ApplyContext do
             flow_hibernation_late_promote_window_ms: @default_hibernation_late_promote_window_ms,
             flow_max_batch_items: @default_flow_batch_items,
             promotion_threshold: @default_promotion_threshold,
-            compound_delete_member_budget: @default_compound_delete_member_budget,
+            compound_member_apply_budget: @default_compound_member_apply_budget,
+            transaction_command_budget: @default_transaction_command_budget,
+            transaction_result_byte_budget: @default_transaction_result_byte_budget,
             max_value_size: @default_max_value_size
 
   @type t :: %__MODULE__{
@@ -157,15 +171,19 @@ defmodule Ferricstore.Raft.ApplyContext do
           flow_hibernation_late_promote_window_ms: non_neg_integer(),
           flow_max_batch_items: pos_integer(),
           promotion_threshold: non_neg_integer(),
-          compound_delete_member_budget: pos_integer(),
+          compound_member_apply_budget: pos_integer(),
+          transaction_command_budget: pos_integer(),
+          transaction_result_byte_budget: pos_integer(),
           max_value_size: pos_integer()
         }
 
   @type encoded ::
-          {:flow_apply_context_v1, pos_integer(), pos_integer(), non_neg_integer(), pos_integer(),
+          {:ferricstore_apply_context_v1, pos_integer(), pos_integer(), non_neg_integer(),
+           pos_integer(),
            pos_integer(), pos_integer(), pos_integer(), pos_integer(), pos_integer(), boolean(),
            non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer(),
-           pos_integer(), non_neg_integer(), pos_integer(), pos_integer()}
+           pos_integer(), non_neg_integer(), pos_integer(), pos_integer(), pos_integer(),
+           pos_integer()}
 
   @spec default() :: t()
   def default, do: new([])
@@ -287,14 +305,30 @@ defmodule Ferricstore.Raft.ApplyContext do
         values
         |> Keyword.get(:promotion_threshold, @default_promotion_threshold)
         |> non_negative(@default_promotion_threshold),
-      compound_delete_member_budget:
+      compound_member_apply_budget:
         values
         |> Keyword.get(
-          :compound_delete_member_budget,
-          @default_compound_delete_member_budget
+          :compound_member_apply_budget,
+          @default_compound_member_apply_budget
         )
-        |> positive(@default_compound_delete_member_budget)
-        |> min(@max_compound_delete_member_budget),
+        |> positive(@default_compound_member_apply_budget)
+        |> min(@max_compound_member_apply_budget),
+      transaction_command_budget:
+        values
+        |> Keyword.get(
+          :transaction_command_budget,
+          @default_transaction_command_budget
+        )
+        |> positive(@default_transaction_command_budget)
+        |> min(@max_transaction_command_budget),
+      transaction_result_byte_budget:
+        values
+        |> Keyword.get(
+          :transaction_result_byte_budget,
+          @default_transaction_result_byte_budget
+        )
+        |> positive(@default_transaction_result_byte_budget)
+        |> min(@max_transaction_result_byte_budget),
       max_value_size:
         values
         |> Keyword.get(:max_value_size, @default_max_value_size)
@@ -327,7 +361,7 @@ defmodule Ferricstore.Raft.ApplyContext do
 
   @spec encode(t()) :: encoded()
   def encode(%__MODULE__{} = context) do
-    {:flow_apply_context_v1, context.flow_default_retention_ttl_ms,
+    {:ferricstore_apply_context_v1, context.flow_default_retention_ttl_ms,
      context.flow_default_history_hot_max_events, context.flow_default_history_max_events,
      context.flow_max_history_hot_max_events, context.flow_max_history_max_events,
      context.flow_retention_cleanup_key_budget, context.flow_retention_cleanup_byte_budget,
@@ -335,16 +369,19 @@ defmodule Ferricstore.Raft.ApplyContext do
      context.flow_hibernation_enabled, context.flow_hibernation_hot_window_ms,
      context.flow_hibernation_safety_margin_ms, context.flow_hibernation_promote_window_ms,
      context.flow_hibernation_late_promote_window_ms, context.flow_max_batch_items,
-     context.promotion_threshold, context.compound_delete_member_budget, context.max_value_size}
+     context.promotion_threshold, context.compound_member_apply_budget,
+     context.transaction_command_budget, context.transaction_result_byte_budget,
+     context.max_value_size}
   end
 
   @spec decode(term()) :: {:ok, t()} | {:error, :invalid_apply_context}
   def decode(
-        {:flow_apply_context_v1, retention_ttl_ms, history_hot, history_max, max_history_hot,
+        {:ferricstore_apply_context_v1, retention_ttl_ms, history_hot, history_max,
+         max_history_hot,
          max_history, cleanup_keys, cleanup_bytes, history_scan, value_scan, hibernation_enabled,
          hot_window_ms, safety_margin_ms, promote_window_ms, late_promote_window_ms,
-         flow_max_batch_items, promotion_threshold, compound_delete_member_budget, max_value_size} =
-          encoded
+         flow_max_batch_items, promotion_threshold, compound_member_apply_budget,
+         transaction_command_budget, transaction_result_byte_budget, max_value_size} = encoded
       ) do
     context =
       new(
@@ -364,7 +401,9 @@ defmodule Ferricstore.Raft.ApplyContext do
         flow_hibernation_late_promote_window_ms: late_promote_window_ms,
         flow_max_batch_items: flow_max_batch_items,
         promotion_threshold: promotion_threshold,
-        compound_delete_member_budget: compound_delete_member_budget,
+        compound_member_apply_budget: compound_member_apply_budget,
+        transaction_command_budget: transaction_command_budget,
+        transaction_result_byte_budget: transaction_result_byte_budget,
         max_value_size: max_value_size
       )
 

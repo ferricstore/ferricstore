@@ -31,7 +31,9 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     :flow_lmdb_value_cleanup_scan_limit,
     :flow_hibernation_enabled,
     :promotion_threshold,
-    :compound_delete_member_budget,
+    :compound_member_apply_budget,
+    :transaction_command_budget,
+    :transaction_result_byte_budget,
     :flow_max_batch_items,
     :max_value_size
   ]
@@ -52,6 +54,13 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     end)
 
     :ok
+  end
+
+  test "the replicated schema tag reflects store-wide apply ownership" do
+    assert :ferricstore_apply_context_v1 ==
+             ApplyContext.default()
+             |> ApplyContext.encode()
+             |> elem(0)
   end
 
   test "captured retention limits do not change while a command is applying" do
@@ -146,7 +155,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     old_shape =
       context
       |> ApplyContext.encode()
-      |> Tuple.delete_at(tuple_size(ApplyContext.encode(context)) - 3)
+      |> Tuple.delete_at(tuple_size(ApplyContext.encode(context)) - 5)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(old_shape)
   end
@@ -225,21 +234,59 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
 
-  test "compound delete work budget is bounded and preserved by the replicated context" do
-    context = ApplyContext.new(compound_delete_member_budget: 8)
+  test "compound member apply budget is bounded and preserved by the replicated context" do
+    context = ApplyContext.new(compound_member_apply_budget: 8)
 
-    assert context.compound_delete_member_budget == 8
+    assert context.compound_member_apply_budget == 8
     assert {:ok, ^context} = context |> ApplyContext.encode() |> ApplyContext.decode()
 
     hard_max = 100_000
 
-    assert ApplyContext.new(compound_delete_member_budget: hard_max + 1).compound_delete_member_budget ==
+    assert ApplyContext.new(compound_member_apply_budget: hard_max + 1).compound_member_apply_budget ==
+             hard_max
+
+    oversized =
+      context
+      |> ApplyContext.encode()
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 4, hard_max + 1)
+
+    assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
+  end
+
+  test "transaction result byte budget is bounded and preserved by the replicated context" do
+    context = ApplyContext.new(transaction_result_byte_budget: 4_096)
+
+    assert context.transaction_result_byte_budget == 4_096
+    assert {:ok, ^context} = context |> ApplyContext.encode() |> ApplyContext.decode()
+
+    hard_max = 64 * 1_024 * 1_024
+
+    assert ApplyContext.new(transaction_result_byte_budget: hard_max + 1).transaction_result_byte_budget ==
              hard_max
 
     oversized =
       context
       |> ApplyContext.encode()
       |> put_elem(tuple_size(ApplyContext.encode(context)) - 2, hard_max + 1)
+
+    assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
+  end
+
+  test "transaction command budget is bounded and preserved by the replicated context" do
+    context = ApplyContext.new(transaction_command_budget: 8)
+
+    assert context.transaction_command_budget == 8
+    assert {:ok, ^context} = context |> ApplyContext.encode() |> ApplyContext.decode()
+
+    hard_max = 100_000
+
+    assert ApplyContext.new(transaction_command_budget: hard_max + 1).transaction_command_budget ==
+             hard_max
+
+    oversized =
+      context
+      |> ApplyContext.encode()
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 3, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
@@ -256,7 +303,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 4, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 6, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
@@ -634,7 +681,8 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     assert {next_state, {:error, "ERR invalid replicated apply context"}} =
              StateMachine.apply(
                %{},
-               {:ferricstore_apply_context, {:flow_apply_context_v1, -1}, {:put, "k", "v", 0}},
+               {:ferricstore_apply_context, {:ferricstore_apply_context_v1, -1},
+                {:put, "k", "v", 0}},
                state
              )
 

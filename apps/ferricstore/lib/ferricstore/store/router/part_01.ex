@@ -25,7 +25,6 @@ defmodule Ferricstore.Store.Router.Part01 do
       alias Ferricstore.Store.BlobValue
       alias Ferricstore.Store.CompoundCommand
       alias Ferricstore.Store.CompoundKey
-      alias Ferricstore.Store.ExpiryTracker
       alias Ferricstore.Store.Keydir
       alias Ferricstore.Store.LFU
       alias Ferricstore.Store.ListOps
@@ -33,6 +32,7 @@ defmodule Ferricstore.Store.Router.Part01 do
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ETS, LogicalKeyIndex, ZSetIndex}
 
       defguardp valid_cold_file_ref(file_id, value_size)
                 when is_integer(file_id) and file_id >= 0 and is_integer(value_size) and
@@ -687,8 +687,11 @@ defmodule Ferricstore.Store.Router.Part01 do
       end
 
       defp delete_local_key(ctx, idx, keydir, file_path, key) do
-        track_keydir_binary_delete(ctx, idx, keydir, key)
-        :ets.delete(keydir, key)
+        case :ets.lookup(keydir, key) do
+          [entry] -> ETS.delete_exact_entry(router_shard_ets_state(ctx, idx, keydir), entry)
+          [] -> :ok
+        end
+
         Ferricstore.Store.BitcaskWriter.delete(ctx, idx, file_path, key)
       end
 
@@ -709,34 +712,30 @@ defmodule Ferricstore.Store.Router.Part01 do
         if delta != 0, do: :atomics.add(ctx.keydir_binary_bytes, idx + 1, delta)
       end
 
-      defp track_keydir_binary_delete(ctx, idx, keydir, key) do
-        bytes =
-          case :ets.lookup(keydir, key) do
-            [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
-            _ -> 0
-          end
-
-        if bytes > 0, do: :atomics.sub(ctx.keydir_binary_bytes, idx + 1, bytes)
-      end
-
-      defp track_keydir_binary_delete_known(ctx, idx, key, value) do
-        bytes = offheap_size(key) + offheap_size(value)
-        if bytes > 0, do: :atomics.sub(ctx.keydir_binary_bytes, idx + 1, bytes)
-      end
-
       defp delete_observed_keydir_entry(
              ctx,
              idx,
              keydir,
-             {key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size} = entry
+             {_key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size} = entry
            ) do
-        if Keydir.delete_exact(keydir, entry) do
-          track_keydir_binary_delete_known(ctx, idx, key, value)
-          ExpiryTracker.adjust(ctx, idx, expire_at_ms, 0)
-          true
-        else
-          false
-        end
+        ETS.delete_exact_entry(router_shard_ets_state(ctx, idx, keydir), entry)
+      end
+
+      defp router_shard_ets_state(ctx, idx, keydir) do
+        instance_name = Map.get(ctx, :name, :default)
+        {logical_keys, logical_slots} = LogicalKeyIndex.table_names(instance_name, idx)
+        {zset_index, zset_lookup} = ZSetIndex.table_names(instance_name, idx)
+
+        %{
+          instance_ctx: ctx,
+          index: idx,
+          keydir: keydir,
+          compound_member_index: CompoundMemberIndex.table_name(instance_name, idx),
+          logical_key_index: logical_keys,
+          logical_key_slots: logical_slots,
+          zset_score_index: zset_index,
+          zset_score_lookup: zset_lookup
+        }
       end
 
       defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)

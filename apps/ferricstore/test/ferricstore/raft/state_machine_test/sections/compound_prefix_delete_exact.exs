@@ -20,7 +20,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CompoundPrefixDeleteExact d
         field_a = CompoundKey.hash_field(redis_key, "a")
         field_b = CompoundKey.hash_field(redis_key, "b")
         index = state.compound_member_index_name
-        context = ApplyContext.new(compound_delete_member_budget: 1)
+        context = ApplyContext.new(compound_member_apply_budget: 1)
 
         CompoundMemberIndex.ensure_table!(index)
         CompoundMemberIndex.reset(index)
@@ -56,7 +56,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CompoundPrefixDeleteExact d
         field_b = CompoundKey.hash_field(redis_key, "b")
         staged_key = "tx-prefix-delete-must-roll-back"
         index = state.compound_member_index_name
-        context = ApplyContext.new(compound_delete_member_budget: 1)
+        context = ApplyContext.new(compound_member_apply_budget: 1)
 
         CompoundMemberIndex.ensure_table!(index)
         CompoundMemberIndex.reset(index)
@@ -104,7 +104,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CompoundPrefixDeleteExact d
         type_key = CompoundKey.type_key(redis_key)
         field = CompoundKey.hash_field(redis_key, "field")
         index = state.compound_member_index_name
-        context = ApplyContext.new(compound_delete_member_budget: 1)
+        context = ApplyContext.new(compound_member_apply_budget: 1)
 
         CompoundMemberIndex.ensure_table!(index)
         CompoundMemberIndex.reset(index)
@@ -140,7 +140,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CompoundPrefixDeleteExact d
         existing_field = CompoundKey.hash_field(redis_key, "existing")
         staged_field = CompoundKey.hash_field(redis_key, "staged")
         index = state.compound_member_index_name
-        context = ApplyContext.new(compound_delete_member_budget: 1)
+        context = ApplyContext.new(compound_member_apply_budget: 1)
 
         CompoundMemberIndex.ensure_table!(index)
         CompoundMemberIndex.reset(index)
@@ -189,7 +189,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CompoundPrefixDeleteExact d
         field_a = CompoundKey.hash_field(redis_key, "a")
         field_b = CompoundKey.hash_field(redis_key, "b")
         index = state.compound_member_index_name
-        context = ApplyContext.new(compound_delete_member_budget: 1)
+        context = ApplyContext.new(compound_member_apply_budget: 1)
 
         CompoundMemberIndex.ensure_table!(index)
         CompoundMemberIndex.reset(index)

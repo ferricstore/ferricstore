@@ -392,7 +392,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
           {compound_key, ets_value, expire_at_ms, LFU.initial(), fid, offset, value_size}
         )
 
-        CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), compound_key)
+        CompoundMemberIndex.put(
+          Map.get(state, :compound_member_index_name),
+          compound_key,
+          expire_at_ms
+        )
+
         sm_tx_put_pending(compound_key, logical_value, expire_at_ms)
         remove_tx_deleted_key(compound_key)
         zset_index_put(state, redis_key, compound_key, logical_value)
@@ -429,13 +434,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
            do: {compound_key, to_disk_binary(encoded_ref), expire_at_ms}
 
       defp remove_tx_deleted_key(compound_key) do
-        deleted = Process.get(:tx_deleted_keys, MapSet.new())
-
-        if MapSet.member?(deleted, compound_key) do
-          Process.put(:tx_deleted_keys, MapSet.delete(deleted, compound_key))
-        end
-
-        :ok
+        sm_tx_unmark_deleted(compound_key)
       end
 
       defp do_compound_put_blob_ref_validated(

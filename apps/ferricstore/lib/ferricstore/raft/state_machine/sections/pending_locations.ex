@@ -107,7 +107,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
                 {key, expected_value, expire_at_ms, lfu, file_id, offset, value_size}
               )
 
-              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+              CompoundMemberIndex.put(
+                Map.get(state, :compound_member_index_name),
+                key,
+                expire_at_ms
+              )
+
               logical_key_index_put(state, key, value, expire_at_ms)
               refs
 
@@ -155,7 +160,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
                 {key, nil, expire_at_ms, lfu, file_id, offset, value_size}
               )
 
-              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+              CompoundMemberIndex.put(
+                Map.get(state, :compound_member_index_name),
+                key,
+                expire_at_ms
+              )
+
               logical_key_index_put(state, key, value, expire_at_ms)
               refs
 
@@ -340,7 +350,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           delete_apply_projection_cache_for_pending_original(state, key, file_id)
           track_keydir_binary_delta(state, key, nil, expire_at_ms)
           :ets.insert(state.ets, {key, nil, expire_at_ms, lfu, file_id, offset, value_size})
-          CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+
+          CompoundMemberIndex.put(
+            Map.get(state, :compound_member_index_name),
+            key,
+            expire_at_ms
+          )
+
           logical_key_index_put(state, key, value, expire_at_ms)
         else
           expected_staged_size = byte_size(to_disk_binary(value))
@@ -375,7 +391,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
           if replaced > 0 do
             delete_apply_projection_cache_for_pending_original(state, key, file_id)
-            CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+
+            CompoundMemberIndex.put(
+              Map.get(state, :compound_member_index_name),
+              key,
+              expire_at_ms
+            )
+
             logical_key_index_put(state, key, value, expire_at_ms)
           end
         end
@@ -404,7 +426,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             {key, expected_value, expire_at_ms, LFU.initial(), file_id, offset, value_size}
           )
 
-          CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+          CompoundMemberIndex.put(
+            Map.get(state, :compound_member_index_name),
+            key,
+            expire_at_ms
+          )
+
           logical_key_index_put(state, key, value, expire_at_ms)
         else
           replaced =
@@ -452,13 +479,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
             if fallback_replaced > 0 do
               delete_apply_projection_cache_for_pending_original(state, key, file_id)
-              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+
+              CompoundMemberIndex.put(
+                Map.get(state, :compound_member_index_name),
+                key,
+                expire_at_ms
+              )
+
               logical_key_index_put(state, key, value, expire_at_ms)
             end
           else
             if replaced > 0 do
               delete_apply_projection_cache_for_pending_original(state, key, file_id)
-              CompoundMemberIndex.put(Map.get(state, :compound_member_index_name), key)
+
+              CompoundMemberIndex.put(
+                Map.get(state, :compound_member_index_name),
+                key,
+                expire_at_ms
+              )
+
               logical_key_index_put(state, key, value, expire_at_ms)
             end
           end

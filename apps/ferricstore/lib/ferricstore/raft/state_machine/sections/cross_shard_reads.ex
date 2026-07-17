@@ -185,8 +185,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                 {value, exp}
 
               :expired ->
-                sm_tx_drop_pending(key)
-                nil
+                sm_tx_mark_deleted(key)
+                :tx_deleted
 
               {:unsafe, reason} ->
                 record_state_read_failure(reason)
@@ -209,18 +209,82 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       defp sm_tx_put_pending(key, value, expire_at_ms) do
         pending = Process.get(:tx_pending_values, %{})
         Process.put(:tx_pending_values, Map.put(pending, key, {value, expire_at_ms}))
+        sm_tx_index_compound_key(:tx_pending_compound_keys, key)
 
-        deleted = Process.get(:tx_deleted_keys, MapSet.new())
-
-        if MapSet.member?(deleted, key) do
-          Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
-        end
+        sm_tx_unmark_deleted(key)
       end
 
       defp sm_tx_drop_pending(key) do
         pending = Process.get(:tx_pending_values, %{})
         Process.put(:tx_pending_values, Map.delete(pending, key))
+        sm_tx_unindex_compound_key(:tx_pending_compound_keys, key)
       end
+
+      defp sm_tx_mark_deleted(key) do
+        sm_tx_drop_pending(key)
+
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+        Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
+        sm_tx_index_compound_key(:tx_deleted_compound_keys, key)
+        :ok
+      end
+
+      defp sm_tx_unmark_deleted(key) do
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+        if MapSet.member?(deleted, key) do
+          Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
+        end
+
+        sm_tx_unindex_compound_key(:tx_deleted_compound_keys, key)
+        :ok
+      end
+
+      defp sm_tx_compound_keys_for_prefix(process_key, prefix) do
+        process_key
+        |> Process.get(%{})
+        |> Map.get(prefix, MapSet.new())
+      end
+
+      defp sm_tx_index_compound_key(process_key, key) do
+        case {Process.get(process_key), sm_tx_compound_prefix(key)} do
+          {index, {:ok, prefix}} when is_map(index) ->
+            keys = index |> Map.get(prefix, MapSet.new()) |> MapSet.put(key)
+            Process.put(process_key, Map.put(index, prefix, keys))
+
+          _not_in_transaction_or_not_compound ->
+            :ok
+        end
+      end
+
+      defp sm_tx_unindex_compound_key(process_key, key) do
+        case {Process.get(process_key), sm_tx_compound_prefix(key)} do
+          {index, {:ok, prefix}} when is_map(index) ->
+            keys = index |> Map.get(prefix, MapSet.new()) |> MapSet.delete(key)
+
+            if MapSet.size(keys) == 0 do
+              Process.put(process_key, Map.delete(index, prefix))
+            else
+              Process.put(process_key, Map.put(index, prefix, keys))
+            end
+
+          _not_in_transaction_or_not_compound ->
+            :ok
+        end
+      end
+
+      defp sm_tx_compound_prefix(key) when is_binary(key) do
+        case :binary.match(key, <<0>>) do
+          {position, 1} ->
+            prefix = binary_part(key, 0, position + 1)
+            if CompoundMemberIndex.supports_prefix?(prefix), do: {:ok, prefix}, else: :error
+
+          :nomatch ->
+            :error
+        end
+      end
+
+      defp sm_tx_compound_prefix(_key), do: :error
 
       defp sm_merge_tx_pending_prefix(results, prefix) do
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
@@ -270,8 +334,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       end
 
       defp cross_shard_ets_exists?(ctx, key) do
-        expiry_context = ExpiryContext.capture()
+        cross_shard_ets_exists?(ctx, key, ExpiryContext.capture())
+      end
 
+      defp cross_shard_ets_exists?(ctx, key, expiry_context) do
         try do
           case :ets.lookup(ctx.keydir, key) do
             [{^key, value, exp, _lfu, _fid, _off, _vsize} = entry]
@@ -334,7 +400,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             when is_integer(exp) and exp >= 0 ->
               case ExpiryContext.classify(expiry_context, exp) do
                 :live ->
-                  case cross_shard_live_value_meta(
+                  case cross_shard_live_value_meta_with_admission(
                          ctx,
                          data_path,
                          entry,
@@ -369,6 +435,39 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         end
       end
 
+      defp cross_shard_live_value_meta_with_admission(
+             ctx,
+             data_path,
+             {_key, nil, _exp, _lfu, _fid, _off, vsize} = entry,
+             expiry_context,
+             attempts_left
+           )
+           when is_integer(vsize) and vsize >= 0 do
+        if Process.get(:tx_result_read_projection, :none) == :point do
+          with_transaction_point_cold_reservation(vsize, fn ->
+            cross_shard_live_value_meta(
+              ctx,
+              data_path,
+              entry,
+              expiry_context,
+              attempts_left
+            )
+          end)
+        else
+          cross_shard_live_value_meta(ctx, data_path, entry, expiry_context, attempts_left)
+        end
+      end
+
+      defp cross_shard_live_value_meta_with_admission(
+             ctx,
+             data_path,
+             entry,
+             expiry_context,
+             attempts_left
+           ) do
+        cross_shard_live_value_meta(ctx, data_path, entry, expiry_context, attempts_left)
+      end
+
       defp cross_shard_live_value_meta(
              _ctx,
              _data_path,
@@ -388,6 +487,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
            )
            when valid_cold_location(fid, off, vsize) or
                   valid_waraft_segment_location(fid, off, vsize) do
+        ensure_transaction_point_cold_size!(ctx, vsize)
+
         case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
           {:ok, value} when is_binary(value) ->
             maybe_run_cold_read_success_hook(ctx, key)
@@ -559,9 +660,131 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
       defp cross_shard_materialize_cold_value(ctx, value) do
         threshold = BlobValue.threshold(Map.get(ctx, :instance_ctx))
+        reserve_transaction_blob_materialization!(value, threshold)
 
         BlobValue.maybe_materialize(ctx.data_dir, ctx.index, threshold, value)
       end
+
+      defp reserve_transaction_blob_materialization!(value, threshold)
+           when is_binary(value) and is_integer(threshold) and threshold > 0 do
+        case BlobRef.decode(value) do
+          {:ok, %BlobRef{size: logical_size}} ->
+            case Process.get(:tx_blob_ref_storage_precharged, false) do
+              {:point, base_reserved} ->
+                reserve_transaction_materialization_total!(base_reserved + logical_size)
+
+              :batch_without_blob_refs ->
+                reserve_transaction_materialization_bytes!(logical_size)
+
+              precharged when precharged != false ->
+                reserve_transaction_materialization_bytes!(
+                  max(logical_size - BlobRef.encoded_size(), 0)
+                )
+
+              false ->
+                :ok
+            end
+
+          :error ->
+            :ok
+        end
+      end
+
+      defp reserve_transaction_blob_materialization!(_value, _threshold), do: :ok
+
+      defp reserve_transaction_materialization_bytes!(bytes)
+           when is_integer(bytes) and bytes >= 0 do
+        case Process.get(:tx_result_byte_budget, :unlimited) do
+          :unlimited ->
+            :ok
+
+          budget when is_integer(budget) and budget >= 0 ->
+            used = Process.get(:tx_result_bytes_used, 0)
+            reserved = Process.get(:tx_materialization_bytes_reserved, 0)
+
+            if bytes <= budget - used - reserved do
+              Process.put(:tx_materialization_bytes_reserved, reserved + bytes)
+              :ok
+            else
+              throw({
+                :transaction_store_failure,
+                :transaction_result_byte_budget_exceeded
+              })
+            end
+
+          _invalid ->
+            throw({
+              :transaction_store_failure,
+              :invalid_transaction_result_byte_budget
+            })
+        end
+      end
+
+      defp reserve_transaction_materialization_total!(total)
+           when is_integer(total) and total >= 0 do
+        case Process.get(:tx_result_byte_budget, :unlimited) do
+          :unlimited ->
+            :ok
+
+          budget when is_integer(budget) and budget >= 0 ->
+            used = Process.get(:tx_result_bytes_used, 0)
+            reserved = Process.get(:tx_materialization_bytes_reserved, 0)
+
+            cond do
+              total <= reserved ->
+                :ok
+
+              total <= budget - used ->
+                Process.put(:tx_materialization_bytes_reserved, total)
+                :ok
+
+              true ->
+                throw({
+                  :transaction_store_failure,
+                  :transaction_result_byte_budget_exceeded
+                })
+            end
+
+          _invalid ->
+            throw({
+              :transaction_store_failure,
+              :invalid_transaction_result_byte_budget
+            })
+        end
+      end
+
+      defp with_transaction_point_cold_reservation(value_size, fun)
+           when is_integer(value_size) and value_size >= 0 and is_function(fun, 0) do
+        previous_mode = Process.get(:tx_blob_ref_storage_precharged, :undefined)
+        base_reserved = Process.get(:tx_materialization_bytes_reserved, 0)
+        Process.put(:tx_blob_ref_storage_precharged, {:point, base_reserved})
+
+        try do
+          fun.()
+        after
+          restore_transaction_blob_precharge_mode(previous_mode)
+        end
+      end
+
+      defp ensure_transaction_point_cold_size!(ctx, value_size)
+           when is_integer(value_size) and value_size >= 0 do
+        case Process.get(:tx_blob_ref_storage_precharged, false) do
+          {:point, base_reserved} ->
+            stored_bytes =
+              if potential_blob_ref_size?(ctx, value_size), do: 0, else: value_size
+
+            reserve_transaction_materialization_total!(base_reserved + stored_bytes)
+
+          _batch_or_unreserved ->
+            :ok
+        end
+      end
+
+      defp restore_transaction_blob_precharge_mode(:undefined),
+        do: Process.delete(:tx_blob_ref_storage_precharged)
+
+      defp restore_transaction_blob_precharge_mode(previous),
+        do: Process.put(:tx_blob_ref_storage_precharged, previous)
 
       defp record_cross_shard_read_failure(reason) do
         record_state_read_failure({:cold_value_unavailable, reason})
@@ -595,7 +818,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             when is_integer(exp) and exp >= 0 ->
               case ExpiryContext.classify(expiry_context, exp) do
                 :live ->
-                  cross_shard_live_value_meta(
+                  cross_shard_live_value_meta_with_admission(
                     ctx,
                     data_path,
                     entry,
@@ -934,31 +1157,48 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       end
 
       defp cross_shard_compound_read(ctx, redis_key, compound_key) do
-        case sm_tx_pending_meta(compound_key) do
-          {value, _exp} ->
-            value
+        if MapSet.member?(Process.get(:tx_deleted_keys, MapSet.new()), compound_key) do
+          nil
+        else
+          case sm_tx_pending_meta(compound_key) do
+            {value, _exp} ->
+              value
 
-          nil ->
-            case promoted_compound_path(ctx, redis_key, compound_key) do
-              nil -> cross_shard_ets_read(ctx, compound_key)
-              dedicated_path -> cross_shard_ets_read_from_path(ctx, compound_key, dedicated_path)
-            end
+            :tx_deleted ->
+              nil
+
+            nil ->
+              case promoted_compound_path(ctx, redis_key, compound_key) do
+                nil ->
+                  cross_shard_ets_read(ctx, compound_key)
+
+                dedicated_path ->
+                  cross_shard_ets_read_from_path(ctx, compound_key, dedicated_path)
+              end
+          end
         end
       end
 
       defp cross_shard_compound_read_meta(ctx, redis_key, compound_key) do
-        case sm_tx_pending_meta(compound_key) do
-          nil ->
-            case promoted_compound_path(ctx, redis_key, compound_key) do
-              nil ->
-                cross_shard_ets_read_meta(ctx, compound_key)
+        if MapSet.member?(Process.get(:tx_deleted_keys, MapSet.new()), compound_key) do
+          nil
+        else
+          case sm_tx_pending_meta(compound_key) do
+            :tx_deleted ->
+              nil
 
-              dedicated_path ->
-                cross_shard_ets_read_meta_from_path(ctx, compound_key, dedicated_path)
-            end
+            nil ->
+              case promoted_compound_path(ctx, redis_key, compound_key) do
+                nil ->
+                  cross_shard_ets_read_meta(ctx, compound_key)
 
-          meta ->
-            meta
+                dedicated_path ->
+                  cross_shard_ets_read_meta_from_path(ctx, compound_key, dedicated_path)
+              end
+
+            meta ->
+              meta
+          end
         end
       end
 
@@ -1034,40 +1274,105 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
       defp cross_shard_ets_batch_read_meta_from_path(ctx, keys, data_path) do
         expiry_context = ExpiryContext.capture()
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
         {warm_results, cold_reads} =
           keys
           |> Enum.with_index()
           |> Enum.reduce({%{}, []}, fn {key, index}, {results, cold} ->
-            case sm_tx_pending_meta(key) do
-              {value, exp} ->
-                {Map.put(results, index, {value, exp}), cold}
+            if MapSet.member?(deleted, key) do
+              {results, cold}
+            else
+              case sm_tx_pending_meta(key) do
+                {value, exp} ->
+                  {Map.put(results, index, {value, exp}), cold}
 
-              nil ->
-                cross_shard_collect_batch_ets(
-                  ctx,
-                  key,
-                  index,
-                  data_path,
-                  expiry_context,
-                  results,
-                  cold
-                )
+                :tx_deleted ->
+                  {results, cold}
+
+                nil ->
+                  cross_shard_collect_batch_ets(
+                    ctx,
+                    key,
+                    index,
+                    data_path,
+                    expiry_context,
+                    results,
+                    cold
+                  )
+              end
             end
           end)
 
+        ordered_cold_reads = Enum.reverse(cold_reads)
+
         results =
-          cross_shard_read_cold_meta_batch(
-            ctx,
-            warm_results,
-            Enum.reverse(cold_reads),
-            data_path,
-            expiry_context
-          )
+          with_transaction_batch_cold_reservation(ctx, warm_results, ordered_cold_reads, fn ->
+            cross_shard_read_cold_meta_batch(
+              ctx,
+              warm_results,
+              ordered_cold_reads,
+              data_path,
+              expiry_context
+            )
+          end)
 
         keys
         |> Enum.with_index()
         |> Enum.map(fn {_key, index} -> Map.get(results, index) end)
+      end
+
+      defp with_transaction_batch_cold_reservation(ctx, warm_results, cold_reads, fun)
+           when is_map(warm_results) and is_list(cold_reads) and is_function(fun, 0) do
+        case Process.get(:tx_blob_ref_storage_precharged, false) do
+          precharged when precharged != false ->
+            fun.()
+
+          false ->
+            if Process.get(:tx_result_read_projection, :none) == :batch do
+              base_reserved = Process.get(:tx_materialization_bytes_reserved, 0)
+
+              bytes =
+                Enum.reduce(warm_results, 0, fn
+                  {_index, {value, _expire_at_ms}}, total ->
+                    total + transaction_result_value_size(value)
+
+                  _invalid, total ->
+                    total
+                end)
+
+              bytes =
+                Enum.reduce(cold_reads, bytes, fn
+                  {_index, _key, _location,
+                   {_compound_key, nil, _expire_at_ms, _lfu, _file_id, _offset, value_size}},
+                  total
+                  when is_integer(value_size) and value_size >= 0 ->
+                    if potential_blob_ref_size?(ctx, value_size),
+                      do: total,
+                      else: total + value_size
+
+                  _invalid, total ->
+                    total
+                end)
+
+              previous_mode = Process.get(:tx_blob_ref_storage_precharged, :undefined)
+              Process.put(:tx_blob_ref_storage_precharged, :batch_without_blob_refs)
+
+              try do
+                reserve_transaction_materialization_total!(base_reserved + bytes)
+                fun.()
+              after
+                restore_transaction_blob_precharge_mode(previous_mode)
+              end
+            else
+              fun.()
+            end
+        end
+      end
+
+      defp potential_blob_ref_size?(ctx, value_size) do
+        BlobValue.threshold(Map.get(ctx, :instance_ctx)) > 0 and
+          BlobRef.encoded_size?(value_size)
       end
 
       defp cross_shard_collect_batch_ets(

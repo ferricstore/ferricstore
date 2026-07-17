@@ -3,6 +3,8 @@ defmodule Ferricstore.Transaction.Ast do
 
   alias Ferricstore.Transaction.ExecutionEntry
 
+  @derivation_namespace <<0, "ferricstore-execution-entry-key", 0>>
+
   @type queue_entry :: ExecutionEntry.t()
 
   @non_key_list_tags ~w(
@@ -115,6 +117,40 @@ defmodule Ferricstore.Transaction.Ast do
   end
 
   def namespace_ast_keys(ast, _ns), do: ast
+
+  @spec derive_command_keys(term()) :: [binary()]
+  def derive_command_keys(ast) do
+    ast
+    |> namespace_ast_keys(@derivation_namespace)
+    |> collect_derived_keys(ast, [])
+    |> Enum.reverse()
+  end
+
+  defp collect_derived_keys(transformed, original, acc)
+       when is_binary(transformed) and is_binary(original) do
+    if transformed == @derivation_namespace <> original, do: [original | acc], else: acc
+  end
+
+  defp collect_derived_keys(transformed, original, acc)
+       when is_tuple(transformed) and is_tuple(original) and
+              tuple_size(transformed) == tuple_size(original) do
+    collect_derived_tuple_keys(transformed, original, 0, tuple_size(original), acc)
+  end
+
+  defp collect_derived_keys([transformed | transformed_rest], [original | original_rest], acc) do
+    acc = collect_derived_keys(transformed, original, acc)
+    collect_derived_keys(transformed_rest, original_rest, acc)
+  end
+
+  defp collect_derived_keys([], [], acc), do: acc
+  defp collect_derived_keys(_transformed, _original, acc), do: acc
+
+  defp collect_derived_tuple_keys(_transformed, _original, size, size, acc), do: acc
+
+  defp collect_derived_tuple_keys(transformed, original, index, size, acc) do
+    acc = collect_derived_keys(elem(transformed, index), elem(original, index), acc)
+    collect_derived_tuple_keys(transformed, original, index + 1, size, acc)
+  end
 
   defp namespace_key(key, ns) when is_binary(key), do: ns <> key
   defp namespace_key(key, _ns), do: key

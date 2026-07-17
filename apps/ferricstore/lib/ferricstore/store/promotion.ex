@@ -1886,7 +1886,7 @@ defmodule Ferricstore.Store.Promotion do
       fn
         {key, _value, expire_at_ms, _lfu, _fid, _offset, _value_size}, :ok
         when is_binary(key) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
-          CompoundMemberIndex.put(index, key)
+          CompoundMemberIndex.put(index, key, expire_at_ms)
 
         row, :ok ->
           fail_recovery!(:index_shared_compound, keydir, shard_index, {:invalid_keydir_row, row})

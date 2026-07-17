@@ -69,7 +69,6 @@ defmodule Ferricstore.Store.Shard do
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
   alias Ferricstore.Store.Shard.NativeOps, as: ShardNativeOps
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
-  alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
   alias Ferricstore.Store.Shard.ZSetIndex
 

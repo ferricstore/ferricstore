@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.LocalTxStoreTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Store.{LocalTxStore, Ops}
-  alias Ferricstore.Store.Shard.ZSetIndex
+  alias Ferricstore.Store.Shard.{CompoundMemberIndex, Transaction, ZSetIndex}
 
   test "new preserves Raft zset index table names for transaction-local reads" do
     keydir = :ets.new(:local_tx_store_keydir, [:set, :public])
@@ -35,5 +35,60 @@ defmodule Ferricstore.Store.LocalTxStoreTest do
       :ets.delete(index)
       :ets.delete(keydir)
     end
+  end
+
+  @tag :local_tx_atomicity
+  test "the removed mutable LocalTx execution path rejects before writing" do
+    keydir = :ets.new(:local_tx_atomicity_keydir, [:set, :public])
+    compound_index = :ets.new(:local_tx_atomicity_compound_index, [:ordered_set, :public])
+    CompoundMemberIndex.reset(compound_index)
+
+    read_key = "local-tx-budget-read"
+    staged_key = "local-tx-budget-staged"
+    :ets.insert(keydir, {read_key, "1234", 0, 0, 0, 0, 4})
+
+    store = %LocalTxStore{
+      instance_ctx: nil,
+      shard_index: 0,
+      shard_state: %{
+        instance_ctx: nil,
+        keydir: keydir,
+        index: 0,
+        data_dir: "/tmp",
+        shard_data_path: "/tmp",
+        promoted_instances: %{},
+        compound_member_index: compound_index,
+        zset_score_index: nil,
+        zset_score_lookup: nil
+      }
+    }
+
+    entries =
+      Enum.map(
+        [
+          {"SET", [staged_key, "staged"]},
+          {"GET", [read_key]}
+        ],
+        fn {command, args} ->
+          {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare(command, args)
+          {:ok, entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+          entry
+        end
+      )
+
+    assert {:error, :local_tx_store_not_supported} = Transaction.execute(entries, nil, store)
+
+    assert [] = :ets.lookup(keydir, staged_key)
+  end
+
+  @tag :transaction_result_byte_budget
+  test "result byte admission stops before an oversized improper tail" do
+    assert {:error, :transaction_result_byte_budget_exceeded} =
+             Transaction.__admit_result_bytes_for_test__(
+               ["already-too-large" | :must_not_be_visited],
+               4,
+               0,
+               0
+             )
   end
 end

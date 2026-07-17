@@ -40,8 +40,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         ValueCodec
       }
 
-      alias Ferricstore.Store.Shard.ZSetIndex
-      alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
+      alias Ferricstore.Store.Shard.{ETS, ZSetIndex}
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
@@ -54,20 +53,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
       defp cross_shard_delete_keydir_entry(
              ctx,
-             {key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size} = entry
+             {_key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size} = entry
            ) do
-        if Keydir.delete_exact(ctx.keydir, entry) do
-          ref = keydir_binary_ref(ctx)
-
-          if ref do
-            bytes = binary_byte_size(key) + binary_byte_size(value)
-            if bytes > 0, do: :atomics.sub(ref, ctx.index + 1, bytes)
-          end
-
-          true
-        else
-          false
-        end
+        ETS.delete_exact_entry(ctx, entry)
       end
 
       @doc false
@@ -138,12 +126,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       # ---------------------------------------------------------------------------
       # Private: command execution
       # ---------------------------------------------------------------------------
-
-      defp do_tx_execute(state, queue, sandbox_namespace) do
-        case ShardTransaction.handle_tx_execute(queue, sandbox_namespace, state) do
-          {:reply, results, _state} -> results
-        end
-      end
 
       # 3-tuple async clauses (current shape, with origin node tag).
       #
@@ -992,16 +974,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_single(state, {:tx_execute, queue, sandbox_namespace}) when is_list(queue) do
-        do_tx_execute(state, queue, sandbox_namespace)
+        {:error,
+         {:invalid_transaction_apply_path,
+          {:tx_execute, length(queue), sandbox_namespace, state.shard_index}}}
       end
 
       defp apply_single(state, {:tx_execute, queue, sandbox_namespace, watched_keys})
            when is_list(queue) and is_map(watched_keys) do
-        case transaction_watches_clean?(watched_keys, state) do
-          :clean -> do_tx_execute(state, queue, sandbox_namespace)
-          :changed -> nil
-          {:error, reason} -> {:error, {:state_read_failed, reason}}
-        end
+        {:error,
+         {:invalid_transaction_apply_path,
+          {:tx_execute, length(queue), sandbox_namespace, map_size(watched_keys),
+           state.shard_index}}}
       end
 
       defp apply_single(state, {:watch_token, key}) when is_binary(key) do

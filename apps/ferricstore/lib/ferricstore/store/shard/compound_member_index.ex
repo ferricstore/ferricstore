@@ -6,6 +6,9 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   @separator <<0>>
   @ready_key :"$ferricstore_compound_member_index_ready"
+  @count_tag :"$ferricstore_compound_member_count"
+  @expiry_tag :"$ferricstore_compound_member_expiry"
+  @member_expiry_tag :"$ferricstore_compound_member_expiry_lookup"
 
   @waraft_location_tags [:waraft_segment, :waraft_projection, :waraft_apply_projection]
 
@@ -62,10 +65,17 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
         :ets.foldl(
           fn
-            {key, value, expire_at_ms, _lfu, file_id, _offset, _value_size}, :ok
+            {key, value, expire_at_ms, _lfu, file_id, offset, value_size}, :ok
             when is_binary(key) ->
-              if live_keydir_entry?(value, expire_at_ms, file_id, now) do
-                put(index, key)
+              if live_keydir_entry?(
+                   value,
+                   expire_at_ms,
+                   file_id,
+                   offset,
+                   value_size,
+                   now
+                 ) do
+                put(index, key, expire_at_ms)
               end
 
               :ok
@@ -98,42 +108,60 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   def supports_prefix?(<<"Z:", _rest::binary>> = prefix), do: member_prefix?(prefix)
   def supports_prefix?(<<"X:", _rest::binary>> = prefix), do: member_prefix?(prefix)
   def supports_prefix?(<<"XG:", _rest::binary>> = prefix), do: member_prefix?(prefix)
+  def supports_prefix?(<<"XM:", _rest::binary>> = prefix), do: member_prefix?(prefix)
   def supports_prefix?(_prefix), do: false
 
   @spec put(table_ref(), binary()) :: :ok
-  def put(nil, _compound_key), do: :ok
+  def put(table, compound_key), do: put(table, compound_key, 0)
 
-  def put(table, <<"H:", _rest::binary>> = compound_key),
-    do: put_compound_member(table, compound_key)
+  @spec put(table_ref(), binary(), non_neg_integer()) :: :ok
+  def put(nil, _compound_key, _expire_at_ms), do: :ok
 
-  def put(table, <<"L:", _rest::binary>> = compound_key),
-    do: put_compound_member(table, compound_key)
+  def put(table, <<"H:", _rest::binary>> = compound_key, expire_at_ms),
+    do: put_compound_member(table, compound_key, expire_at_ms)
 
-  def put(table, <<"S:", _rest::binary>> = compound_key),
-    do: put_compound_member(table, compound_key)
+  def put(table, <<"L:", _rest::binary>> = compound_key, expire_at_ms),
+    do: put_compound_member(table, compound_key, expire_at_ms)
 
-  def put(table, <<"Z:", _rest::binary>> = compound_key),
-    do: put_compound_member(table, compound_key)
+  def put(table, <<"S:", _rest::binary>> = compound_key, expire_at_ms),
+    do: put_compound_member(table, compound_key, expire_at_ms)
 
-  def put(table, <<"XG:", _rest::binary>> = compound_key),
-    do: put_compound_member(table, compound_key)
+  def put(table, <<"Z:", _rest::binary>> = compound_key, expire_at_ms),
+    do: put_compound_member(table, compound_key, expire_at_ms)
 
-  def put(table, <<"XM:", _rest::binary>> = compound_key),
-    do: put_compound_member(table, compound_key)
+  def put(table, <<"XG:", _rest::binary>> = compound_key, expire_at_ms),
+    do: put_compound_member(table, compound_key, expire_at_ms)
 
-  def put(table, <<"X:", _rest::binary>> = compound_key),
-    do: put_compound_member(table, compound_key)
+  def put(table, <<"XM:", _rest::binary>> = compound_key, expire_at_ms),
+    do: put_compound_member(table, compound_key, expire_at_ms)
 
-  def put(_table, _compound_key), do: :ok
+  def put(table, <<"X:", _rest::binary>> = compound_key, expire_at_ms),
+    do: put_compound_member(table, compound_key, expire_at_ms)
 
-  defp put_compound_member(table, compound_key) do
+  def put(_table, _compound_key, _expire_at_ms), do: :ok
+
+  defp put_compound_member(table, compound_key, expire_at_ms)
+       when is_integer(expire_at_ms) and expire_at_ms >= 0 do
     with tid when tid != :undefined <- writable_table_ref(table),
          {:ok, prefix, member} <- split_at_separator(compound_key) do
-      :ets.insert(tid, {{prefix, member}, compound_key})
+      index_key = {prefix, member}
+      new_member? = :ets.insert_new(tid, {index_key, compound_key})
+
+      unless new_member? do
+        :ets.insert(tid, {index_key, compound_key})
+      end
+
+      replace_member_expiry(tid, prefix, compound_key, expire_at_ms)
+
+      if new_member? do
+        increment_prefix_count(tid, prefix, 1)
+      end
     end
 
     :ok
   end
+
+  defp put_compound_member(_table, _compound_key, _expire_at_ms), do: :ok
 
   @spec delete(table_ref(), binary()) :: :ok
   def delete(nil, _compound_key), do: :ok
@@ -164,7 +192,14 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   defp delete_compound_member(table, compound_key) do
     with tid when tid != :undefined <- table_ref(table),
          {:ok, prefix, member} <- split_at_separator(compound_key) do
-      :ets.delete(tid, {prefix, member})
+      case :ets.take(tid, {prefix, member}) do
+        [{{^prefix, ^member}, _compound_key}] ->
+          delete_member_expiry(tid, prefix, compound_key)
+          increment_prefix_count(tid, prefix, -1)
+
+        [] ->
+          delete_member_expiry(tid, prefix, compound_key)
+      end
     end
 
     :ok
@@ -176,6 +211,8 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   def delete_prefix(table, prefix) when is_binary(prefix) do
     with tid when tid != :undefined <- table_ref(table) do
       delete_index_prefix(tid, prefix, first_key(tid, prefix))
+      delete_expiry_prefix(tid, prefix, first_expiry_key(tid, prefix))
+      :ets.delete(tid, {@count_tag, prefix})
     end
 
     :ok
@@ -232,6 +269,38 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   end
 
   def count_live(_table, _state, _prefix), do: :unavailable
+
+  @spec count_live_indexed(table_ref(), map(), binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer(), non_neg_integer()}
+          | {:error, :limit_exceeded | term()}
+          | :unavailable
+  def count_live_indexed(table, state, prefix, cleanup_budget)
+      when is_binary(prefix) and is_integer(cleanup_budget) and cleanup_budget >= 0 do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        expiry_context = ExpiryContext.capture()
+
+        case cleanup_due_expiries(
+               tid,
+               lookup_state(state),
+               prefix,
+               first_expiry_key(tid, prefix),
+               cleanup_budget,
+               0,
+               expiry_context
+             ) do
+          {:ok, inspected} -> {:ok, prefix_count(tid, prefix), inspected}
+          {:error, _reason} = error -> error
+        end
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def count_live_indexed(_table, _state, _prefix, _cleanup_budget), do: :unavailable
 
   @spec scan_entries(table_ref(), map(), binary()) :: {:ok, [{binary(), binary()}]} | :unavailable
   def scan_entries(table, state, prefix) when is_binary(prefix) do
@@ -312,6 +381,34 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   end
 
   def keys_for_prefix(_table, _prefix, _limit), do: :unavailable
+
+  @spec live_keys_for_prefix(table_ref(), map(), binary(), non_neg_integer()) ::
+          {:ok, [binary()], non_neg_integer(), :complete | :more}
+          | {:error, term()}
+          | :unavailable
+  def live_keys_for_prefix(table, state, prefix, limit)
+      when is_binary(prefix) and is_integer(limit) and limit >= 0 do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        do_live_keys_for_prefix(
+          tid,
+          lookup_state(state),
+          prefix,
+          first_key(tid, prefix),
+          limit,
+          [],
+          0,
+          ExpiryContext.capture()
+        )
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def live_keys_for_prefix(_table, _state, _prefix, _limit), do: :unavailable
 
   @doc false
   @spec scan_rows(table_ref(), map(), binary()) ::
@@ -569,12 +666,20 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   defp member_prefix?(prefix), do: :binary.last(prefix) == 0
 
-  defp live_keydir_entry?(_value, expire_at_ms, _file_id, now)
+  defp live_keydir_entry?(_value, expire_at_ms, _file_id, _offset, _value_size, now)
        when is_integer(expire_at_ms) and expire_at_ms != 0 and expire_at_ms <= now,
        do: false
 
-  defp live_keydir_entry?(nil, _expire_at_ms, :pending, _now), do: false
-  defp live_keydir_entry?(_value, _expire_at_ms, _file_id, _now), do: true
+  defp live_keydir_entry?(value, expire_at_ms, _file_id, _offset, _value_size, _now)
+       when value != nil and is_integer(expire_at_ms) and expire_at_ms >= 0,
+       do: true
+
+  defp live_keydir_entry?(nil, expire_at_ms, file_id, offset, value_size, _now)
+       when is_integer(expire_at_ms) and expire_at_ms >= 0,
+       do: valid_cold_location?(file_id, offset, value_size)
+
+  defp live_keydir_entry?(_value, _expire_at_ms, _file_id, _offset, _value_size, _now),
+    do: false
 
   defp split_at_separator(key) do
     case :binary.match(key, @separator) do
@@ -587,6 +692,145 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
         :ignore
     end
   end
+
+  defp replace_member_expiry(table, prefix, compound_key, expire_at_ms) do
+    delete_member_expiry(table, prefix, compound_key)
+
+    if expire_at_ms > 0 do
+      :ets.insert(table, {
+        {@member_expiry_tag, compound_key},
+        {prefix, expire_at_ms}
+      })
+
+      :ets.insert(table, {
+        {@expiry_tag, prefix, expire_at_ms, compound_key},
+        true
+      })
+    end
+  end
+
+  defp delete_member_expiry(table, _prefix, compound_key) do
+    case :ets.take(table, {@member_expiry_tag, compound_key}) do
+      [{{@member_expiry_tag, ^compound_key}, {stored_prefix, expire_at_ms}}] ->
+        :ets.delete(table, {@expiry_tag, stored_prefix, expire_at_ms, compound_key})
+
+      [] ->
+        :ok
+    end
+  end
+
+  defp increment_prefix_count(table, prefix, delta) do
+    count =
+      :ets.update_counter(
+        table,
+        {@count_tag, prefix},
+        {2, delta},
+        {{@count_tag, prefix}, 0}
+      )
+
+    if count <= 0 do
+      run_after_zero_count_hook(prefix)
+      :ets.delete_object(table, {{@count_tag, prefix}, count})
+    end
+
+    :ok
+  end
+
+  defp run_after_zero_count_hook(prefix) do
+    case Process.get(:ferricstore_compound_member_after_zero_count_hook) do
+      hook when is_function(hook, 1) -> hook.(prefix)
+      _missing -> :ok
+    end
+  end
+
+  defp prefix_count(table, prefix) do
+    case :ets.lookup(table, {@count_tag, prefix}) do
+      [{{@count_tag, ^prefix}, count}] when is_integer(count) and count > 0 -> count
+      _empty_or_invalid -> 0
+    end
+  end
+
+  defp first_expiry_key(table, prefix) do
+    :ets.next(table, {@expiry_tag, prefix, -1, <<>>})
+  end
+
+  defp cleanup_due_expiries(
+         _table,
+         _state,
+         _prefix,
+         :"$end_of_table",
+         _remaining,
+         inspected,
+         _expiry_context
+       ),
+       do: {:ok, inspected}
+
+  defp cleanup_due_expiries(
+         table,
+         state,
+         prefix,
+         {@expiry_tag, prefix, expire_at_ms, compound_key} = expiry_key,
+         remaining,
+         inspected,
+         expiry_context
+       ) do
+    case ExpiryContext.classify(expiry_context, expire_at_ms) do
+      :live ->
+        {:ok, inspected}
+
+      {:unsafe, reason} ->
+        {:error, reason}
+
+      :expired when remaining == 0 ->
+        {:error, :limit_exceeded}
+
+      :expired ->
+        next_key = :ets.next(table, expiry_key)
+
+        case keydir_member_row_status(state, compound_key, expiry_context) do
+          :stale ->
+            delete_stale_member(table, state, compound_key, expiry_context)
+
+            cleanup_due_expiries(
+              table,
+              state,
+              prefix,
+              next_key,
+              remaining - 1,
+              inspected + 1,
+              expiry_context
+            )
+
+          {:live,
+           {^compound_key, _value, current_expire_at_ms, _lfu, _file_id, _offset, _value_size}} ->
+            replace_member_expiry(table, prefix, compound_key, current_expire_at_ms)
+
+            cleanup_due_expiries(
+              table,
+              state,
+              prefix,
+              next_key,
+              remaining - 1,
+              inspected + 1,
+              expiry_context
+            )
+
+          {:error, reason} ->
+            {:error, {:invalid_indexed_member, compound_key, reason}}
+        end
+    end
+  end
+
+  defp cleanup_due_expiries(
+         _table,
+         _state,
+         _prefix,
+         _other_key,
+         _remaining,
+         inspected,
+         _expiry_context
+       ),
+       do: {:ok, inspected}
 
   defp scan_keys(table, prefix) do
     first = first_key(table, prefix)
@@ -1049,12 +1293,37 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   end
 
   defp delete_stale_member(table, state, compound_key, expiry_context \\ ExpiryContext.capture()) do
+    previous_expire_at_ms = member_expire_at_ms(table, compound_key)
     delete(table, compound_key)
+    run_after_stale_delete_hook(compound_key)
 
-    case keydir_member_status(lookup_state(state), compound_key, expiry_context) do
-      :live -> put(table, compound_key)
-      {:error, _reason} -> put(table, compound_key)
-      _missing_stale_or_invalid -> :ok
+    case keydir_member_row_status(lookup_state(state), compound_key, expiry_context) do
+      {:live, {^compound_key, _value, expire_at_ms, _lfu, _file_id, _offset, _value_size}} ->
+        put(table, compound_key, expire_at_ms)
+
+      {:error, _reason} ->
+        put(table, compound_key, previous_expire_at_ms)
+
+      _missing_stale_or_invalid ->
+        :ok
+    end
+  end
+
+  defp member_expire_at_ms(table, compound_key) do
+    case :ets.lookup(table, {@member_expiry_tag, compound_key}) do
+      [{{@member_expiry_tag, ^compound_key}, {_prefix, expire_at_ms}}]
+      when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+        expire_at_ms
+
+      _missing_or_invalid ->
+        0
+    end
+  end
+
+  defp run_after_stale_delete_hook(compound_key) do
+    case Process.get(:ferricstore_compound_member_after_stale_delete_hook) do
+      hook when is_function(hook, 1) -> hook.(compound_key)
+      _missing -> :ok
     end
   end
 
@@ -1146,15 +1415,138 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   defp do_scan_keys_bounded(_table, _prefix, _other_key, _remaining, acc),
     do: {:ok, Enum.reverse(acc)}
 
+  defp do_live_keys_for_prefix(
+         _table,
+         _state,
+         _prefix,
+         :"$end_of_table",
+         _remaining,
+         acc,
+         inspected,
+         _expiry_context
+       ),
+       do: {:ok, Enum.reverse(acc), inspected, :complete}
+
+  defp do_live_keys_for_prefix(
+         _table,
+         _state,
+         prefix,
+         {prefix, _member},
+         0,
+         acc,
+         inspected,
+         _expiry_context
+       ),
+       do: {:ok, Enum.reverse(acc), inspected, :more}
+
+  defp do_live_keys_for_prefix(
+         table,
+         state,
+         prefix,
+         {prefix, _member} = index_key,
+         remaining,
+         acc,
+         inspected,
+         expiry_context
+       ) do
+    next_key = :ets.next(table, index_key)
+
+    case :ets.lookup(table, index_key) do
+      [{^index_key, compound_key}] ->
+        case keydir_member_row_status(state, compound_key, expiry_context) do
+          {:live, _row} ->
+            do_live_keys_for_prefix(
+              table,
+              state,
+              prefix,
+              next_key,
+              remaining - 1,
+              [compound_key | acc],
+              inspected + 1,
+              expiry_context
+            )
+
+          :stale ->
+            delete_stale_member(table, state, compound_key, expiry_context)
+
+            do_live_keys_for_prefix(
+              table,
+              state,
+              prefix,
+              next_key,
+              remaining - 1,
+              acc,
+              inspected + 1,
+              expiry_context
+            )
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      [] ->
+        do_live_keys_for_prefix(
+          table,
+          state,
+          prefix,
+          next_key,
+          remaining - 1,
+          acc,
+          inspected + 1,
+          expiry_context
+        )
+    end
+  end
+
+  defp do_live_keys_for_prefix(
+         _table,
+         _state,
+         _prefix,
+         _other_key,
+         _remaining,
+         acc,
+         inspected,
+         _expiry_context
+       ),
+       do: {:ok, Enum.reverse(acc), inspected, :complete}
+
   defp delete_index_prefix(_table, _prefix, :"$end_of_table"), do: :ok
 
   defp delete_index_prefix(table, prefix, {prefix, _member} = index_key) do
     next_key = :ets.next(table, index_key)
-    :ets.delete(table, index_key)
+
+    case :ets.take(table, index_key) do
+      [{^index_key, compound_key}] -> delete_member_expiry(table, prefix, compound_key)
+      [] -> :ok
+    end
+
     delete_index_prefix(table, prefix, next_key)
   end
 
   defp delete_index_prefix(_table, _prefix, _other_key), do: :ok
+
+  defp delete_expiry_prefix(_table, _prefix, :"$end_of_table"), do: :ok
+
+  defp delete_expiry_prefix(
+         table,
+         prefix,
+         {@expiry_tag, prefix, _expire_at_ms, compound_key} = expiry_key
+       ) do
+    next_key = :ets.next(table, expiry_key)
+    :ets.delete(table, expiry_key)
+
+    case :ets.lookup(table, {@member_expiry_tag, compound_key}) do
+      [{{@member_expiry_tag, ^compound_key}, {^prefix, _current_expire_at_ms}}] ->
+        :ets.delete(table, {@member_expiry_tag, compound_key})
+
+      _missing_or_other_prefix ->
+        :ok
+    end
+
+    delete_expiry_prefix(table, prefix, next_key)
+  end
+
+  defp delete_expiry_prefix(_table, _prefix, _other_key), do: :ok
 
   defp do_any_live?(
          _table,

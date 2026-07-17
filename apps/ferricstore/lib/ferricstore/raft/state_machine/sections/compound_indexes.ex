@@ -60,9 +60,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
               compound_key
             )
 
-            sm_tx_drop_pending(compound_key)
-            deleted = Process.get(:tx_deleted_keys, MapSet.new())
-            Process.put(:tx_deleted_keys, MapSet.put(deleted, compound_key))
+            sm_tx_mark_deleted(compound_key)
             queue_promoted_maintenance_after_flush(redis_key, maintenance)
 
             queue_promoted_revision_delete_after_flush(
@@ -147,8 +145,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
-      defp queue_compound_indexes_put_after_flush(state, redis_key, compound_key, value) do
-        _ = queue_compound_member_index_op(state, {:put, compound_key})
+      defp queue_compound_indexes_put_after_flush(
+             state,
+             redis_key,
+             compound_key,
+             value,
+             expire_at_ms
+           ) do
+        _ = queue_compound_member_index_op(state, {:put, compound_key, expire_at_ms})
         _ = maybe_queue_zset_ready_empty_after_flush(state, redis_key, compound_key, value)
         _ = queue_zset_index_put_after_flush(state, redis_key, compound_key, value)
         :ok
@@ -162,13 +166,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
 
       defp queue_compound_member_index_op(
              %{compound_member_index_name: index},
-             {operation, compound_key}
+             {:put, compound_key, expire_at_ms}
            )
-           when index != nil and operation in [:put, :delete] do
+           when index != nil and is_integer(expire_at_ms) and expire_at_ms >= 0 do
         pending = Process.get(:sm_pending_compound_member_index_ops, [])
 
         Process.put(:sm_pending_compound_member_index_ops, [
-          {operation, index, compound_key} | pending
+          {:put, index, compound_key, expire_at_ms} | pending
+        ])
+
+        :ok
+      end
+
+      defp queue_compound_member_index_op(
+             %{compound_member_index_name: index},
+             {:delete, compound_key}
+           )
+           when index != nil do
+        pending = Process.get(:sm_pending_compound_member_index_ops, [])
+
+        Process.put(:sm_pending_compound_member_index_ops, [
+          {:delete, index, compound_key} | pending
         ])
 
         :ok
@@ -181,8 +199,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         |> Process.put([])
         |> Enum.reverse()
         |> Enum.each(fn
-          {:put, index, compound_key} -> CompoundMemberIndex.put(index, compound_key)
-          {:delete, index, compound_key} -> CompoundMemberIndex.delete(index, compound_key)
+          {:put, index, compound_key, expire_at_ms} ->
+            CompoundMemberIndex.put(index, compound_key, expire_at_ms)
+
+          {:delete, index, compound_key} ->
+            CompoundMemberIndex.delete(index, compound_key)
         end)
 
         :ok

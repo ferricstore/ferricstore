@@ -325,6 +325,23 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
              routing_scope: :keys
            } = entry
 
+    assert entry.read_keys == []
+    assert entry.write_keys == ["key"]
+    assert ExecutionEntry.mutates?(entry)
+    refute entry |> Map.put(:write_keys, []) |> ExecutionEntry.valid?()
+
+    refute entry
+           |> Map.merge(%{
+             ast: {:set, "victim", value},
+             command_keys: ["anchor"],
+             write_keys: ["anchor"]
+           })
+           |> ExecutionEntry.valid?()
+
+    assert {:ok, get_prepared} = Dispatcher.prepare_raw("GET", ["key"])
+    assert {:ok, get_entry} = ExecutionEntry.from_prepared(get_prepared)
+    refute ExecutionEntry.mutates?(get_entry)
+
     refute Map.has_key?(Map.from_struct(entry), :args)
 
     assert :erlang.external_size(entry) <

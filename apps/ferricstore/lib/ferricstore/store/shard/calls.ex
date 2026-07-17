@@ -21,7 +21,6 @@ defmodule Ferricstore.Store.Shard.Calls do
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       alias Ferricstore.Store.Shard.NativeOps, as: ShardNativeOps
       alias Ferricstore.Store.Shard.Reads, as: ShardReads
-      alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Writes, as: ShardWrites
       alias Ferricstore.Store.Shard.ZSetIndex
       require Logger
@@ -748,11 +747,47 @@ defmodule Ferricstore.Store.Shard.Calls do
       # -------------------------------------------------------------------
       def handle_call({:tx_execute, queue, sandbox_namespace}, _from, state) do
         maybe_route_default_waraft_write({:tx_execute, queue, sandbox_namespace}, state, fn ->
-          queue
-          |> ShardTransaction.handle_tx_execute(sandbox_namespace, state)
-          |> track_write_version_result(state)
+          apply_direct_tx_execute(queue, sandbox_namespace, state)
         end)
       end
+
+      defp apply_direct_tx_execute(queue, sandbox_namespace, state) do
+        command = {:tx_execute, queue, sandbox_namespace}
+
+        case Ferricstore.Raft.StateMachine.apply_standalone_command(
+               command,
+               direct_sm_state(state)
+             ) do
+          {new_sm_state, result} ->
+            new_state =
+              state
+              |> apply_direct_sm_state(new_sm_state)
+              |> maybe_bump_direct_tx_write_version(queue, result)
+
+            {:reply, result, new_state}
+
+          {new_sm_state, result, _effects} ->
+            new_state =
+              state
+              |> apply_direct_sm_state(new_sm_state)
+              |> maybe_bump_direct_tx_write_version(queue, result)
+
+            {:reply, result, new_state}
+        end
+      end
+
+      defp maybe_bump_direct_tx_write_version(state, queue, results)
+           when is_list(queue) and is_list(results) do
+        if Enum.any?(queue, &Ferricstore.Transaction.ExecutionEntry.mutates?/1) do
+          new_state = %{state | write_version: state.write_version + 1}
+          bump_shared_write_version(new_state, 1)
+          new_state
+        else
+          state
+        end
+      end
+
+      defp maybe_bump_direct_tx_write_version(state, _queue, _error), do: state
 
       # Check if a redis_key has been promoted to dedicated storage.
       def handle_call({:promoted?, redis_key}, from, state) do
