@@ -46,7 +46,7 @@ defmodule Ferricstore.Store.Promotion do
   """
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.HLC
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.{ActiveFile, AppendResult, BlobRef, BlobValue, CompoundKey, LFU}
   alias Ferricstore.Store.Shard.CompoundMemberIndex
@@ -550,7 +550,10 @@ defmodule Ferricstore.Store.Promotion do
     type_key = CompoundKey.type_key(redis_key)
     type_str = CompoundKey.encode_type(type)
     type_label = type_label(type)
-    now = HLC.now_ms()
+
+    now =
+      ExpiryContext.capture()
+      |> ExpiryContext.safe_expiry_cutoff_ms()
 
     entries_result =
       collect_promotion_entries(
@@ -793,7 +796,10 @@ defmodule Ferricstore.Store.Promotion do
       {all_markers, marker_actions} =
         plan_recovery_markers!(shard_data_path, keydir, shard_index)
 
-      now = HLC.now_ms()
+      now =
+        ExpiryContext.capture()
+        |> ExpiryContext.safe_expiry_cutoff_ms()
+
       build_shared_recovery_index!(shared_index, keydir, shard_index, all_markers != [])
 
       marker_actions_by_key = Enum.group_by(marker_actions, &elem(&1, 1))

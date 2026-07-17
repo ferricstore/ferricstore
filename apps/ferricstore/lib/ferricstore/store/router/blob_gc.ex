@@ -267,7 +267,9 @@ defmodule Ferricstore.Store.Router.BlobGC do
           x
       end
 
-    now = Ferricstore.HLC.now_ms()
+    now =
+      Ferricstore.ExpiryContext.capture()
+      |> Ferricstore.ExpiryContext.safe_expiry_cutoff_ms()
 
     with {:ok, keydir_refs} <- blob_gc_keydir_live_refs(ctx, idx, state, keydir, now),
          {:ok, lmdb_refs} <- blob_gc_flow_lmdb_live_refs(ctx, idx, now) do

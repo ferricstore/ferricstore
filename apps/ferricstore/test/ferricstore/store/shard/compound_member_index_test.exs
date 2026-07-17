@@ -355,6 +355,24 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
              {:ok, [{"live", "1"}]}
   end
 
+  @tag :hlc_drift_guard
+  test "rebuild keeps wall-live rows under an unsafe expiry context", %{
+    keydir: keydir,
+    index: index
+  } do
+    member_key = CompoundKey.hash_field("drifted-hash", "wall-live")
+    prefix = CompoundKey.hash_prefix("drifted-hash")
+    :ets.insert(keydir, {member_key, "1", 31_000, 0, 0, 0, 1})
+
+    assert :ok =
+             CommandTime.with_expiry_context(61_000, 1_000, fn ->
+               CompoundMemberIndex.rebuild(index, keydir)
+             end)
+
+    assert [{{^prefix, "wall-live"}, ^member_key}] =
+             :ets.lookup(index, {prefix, "wall-live"})
+  end
+
   test "member_slice returns a bounded deterministic window and wraps", %{
     keydir: keydir,
     index: index

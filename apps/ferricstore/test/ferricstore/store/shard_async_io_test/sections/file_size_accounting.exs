@@ -15,6 +15,46 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.FileSizeAccounting do
       alias Ferricstore.Store.ShardAsyncIoTest.SlowFlushWriter
 
       describe "file size accounting" do
+        @tag :hlc_drift_guard
+        test "recovery stats preserve wall-live bytes during unsafe HLC drift" do
+          dir =
+            Path.join(
+              System.tmp_dir!(),
+              "unsafe_drift_file_stats_#{System.unique_integer([:positive])}"
+            )
+
+          keydir = :ets.new(:unsafe_drift_file_stats, [:set])
+          hlc_ref = :persistent_term.get(:ferricstore_hlc_ref)
+          previous_hlc = :atomics.get(hlc_ref, 1)
+
+          try do
+            key = "wall-live-file-stats"
+            value_size = 8
+            total_bytes = 100
+            wall_ms = System.os_time(:millisecond)
+            expire_at_ms = wall_ms + 30_000
+
+            File.mkdir_p!(dir)
+            File.write!(Path.join(dir, "00000.log"), :binary.copy("x", total_bytes))
+
+            :ets.insert(
+              keydir,
+              {key, nil, expire_at_ms, LFU.initial(), 0, 0, value_size}
+            )
+
+            :atomics.put(hlc_ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+
+            live_bytes = 26 + byte_size(key) + value_size
+
+            assert ShardFlush.compute_file_stats(dir, keydir)[0] ==
+                     {total_bytes, total_bytes - live_bytes}
+          after
+            :atomics.put(hlc_ref, 1, previous_hlc)
+            :ets.delete(keydir)
+            File.rm_rf(dir)
+          end
+        end
+
         test "active_file_size tracks full record bytes after batch flush" do
           {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
           key = "size_accounting_#{:erlang.unique_integer([:positive])}"

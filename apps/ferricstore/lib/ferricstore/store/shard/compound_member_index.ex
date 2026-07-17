@@ -1,7 +1,6 @@
 defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   @moduledoc false
 
-  alias Ferricstore.CommandTime
   alias Ferricstore.ExpiryContext
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
@@ -56,7 +55,10 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
       index ->
         :ets.delete_all_objects(index)
-        now = CommandTime.now_ms()
+
+        now =
+          ExpiryContext.capture()
+          |> ExpiryContext.safe_expiry_cutoff_ms()
 
         :ets.foldl(
           fn

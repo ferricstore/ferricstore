@@ -176,6 +176,41 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           end
         end
 
+        @tag :hlc_drift_guard
+        test "manual compaction preserves wall-live records during unsafe HLC drift" do
+          {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+          hlc_ref = :persistent_term.get(:ferricstore_hlc_ref)
+          previous_hlc = :atomics.get(hlc_ref, 1)
+
+          try do
+            key = "unsafe_drift_compaction"
+            wall_ms = System.os_time(:millisecond)
+            expire_at_ms = wall_ms + 30_000
+
+            assert :ok = force_rotate_active_file(pid)
+            {source_id, source} = GenServer.call(pid, :get_active_file)
+
+            assert :ok = GenServer.call(pid, {:put, key, "wall-live", expire_at_ms})
+            assert :ok = GenServer.call(pid, :flush)
+            assert :ok = force_rotate_active_file(pid)
+
+            future_hlc_ms = wall_ms + 60_000
+            :atomics.put(hlc_ref, 1, Bitwise.bsl(future_hlc_ms, 16))
+
+            assert {:ok, {1, 0, _reclaimed}} =
+                     GenServer.call(pid, {:run_compaction, [source_id]})
+
+            assert File.exists?(source)
+
+            assert [
+                     {^key, _value, ^expire_at_ms, _lfu, ^source_id, _offset, _value_size}
+                   ] = :ets.lookup(:sys.get_state(pid).keydir, key)
+          after
+            :atomics.put(hlc_ref, 1, previous_hlc)
+            cleanup_shard(pid, ctx, dir)
+          end
+        end
+
         test "manual compaction reports all-dead source removal failure" do
           previous_trap_exit = Process.flag(:trap_exit, true)
 

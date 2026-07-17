@@ -354,6 +354,41 @@ defmodule Ferricstore.Store.PromotionRecoveryGuardTest do
     assert [] = :ets.lookup(ctx.keydir, marker)
   end
 
+  @tag :hlc_drift_guard
+  test "recovery preserves wall-live dedicated collections during unsafe HLC drift", ctx do
+    redis_key = "wall-live-dedicated"
+    put_marker(ctx, redis_key, "hash")
+    {:ok, dedicated_path} = Promotion.open_dedicated(ctx.data_dir, 0, :hash, redis_key)
+    dedicated_log = Promotion.find_active(dedicated_path)
+    type_key = CompoundKey.type_key(redis_key)
+    field_key = CompoundKey.hash_field(redis_key, "field")
+    wall_ms = System.os_time(:millisecond)
+    expire_at_ms = wall_ms + 30_000
+
+    assert {:ok, _locations} =
+             NIF.v2_append_batch(dedicated_log, [
+               {type_key, "hash", 0},
+               {field_key, "wall-live", expire_at_ms}
+             ])
+
+    hlc_ref = :persistent_term.get(:ferricstore_hlc_ref)
+    previous_hlc = :atomics.get(hlc_ref, 1)
+
+    try do
+      :atomics.put(hlc_ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+
+      assert %{^redis_key => %{path: ^dedicated_path}} =
+               Promotion.recover_promoted(ctx.shard_path, ctx.keydir, ctx.data_dir, 0)
+
+      assert [{^field_key, "wall-live", ^expire_at_ms, _lfu, 0, _offset, _value_size}] =
+               :ets.lookup(ctx.keydir, field_key)
+
+      assert File.dir?(dedicated_path)
+    after
+      :atomics.put(hlc_ref, 1, previous_hlc)
+    end
+  end
+
   test "expired cleanup intent survives a final tombstone failure", ctx do
     redis_key = "expired-cleanup-retry"
     {marker, _offset, _value_size} = put_marker(ctx, redis_key, "hash")

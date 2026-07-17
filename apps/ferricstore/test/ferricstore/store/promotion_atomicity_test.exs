@@ -304,6 +304,44 @@ defmodule Ferricstore.Store.PromotionAtomicityTest do
   # ---------------------------------------------------------------------------
 
   describe "full successful promotion" do
+    @tag :hlc_drift_guard
+    test "copies wall-live members during unsafe HLC drift", ctx do
+      {redis_key, [{member_key, member_value} | _entries]} =
+        seed_hash_entries(ctx.active_path, ctx.keydir)
+
+      wall_ms = System.os_time(:millisecond)
+      expire_at_ms = wall_ms + 30_000
+
+      assert {:ok, {offset, value_size}} =
+               NIF.v2_append_record(
+                 ctx.active_path,
+                 member_key,
+                 member_value,
+                 expire_at_ms
+               )
+
+      :ets.insert(
+        ctx.keydir,
+        {member_key, member_value, expire_at_ms, LFU.initial(), 0, offset, value_size}
+      )
+
+      hlc_ref = :persistent_term.get(:ferricstore_hlc_ref)
+      previous_hlc = :atomics.get(hlc_ref, 1)
+
+      try do
+        :atomics.put(hlc_ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+        assert {:ok, dedicated_path} = promote_hash(ctx, redis_key)
+        assert {:ok, records} = dedicated_path |> Promotion.find_active() |> NIF.v2_scan_file()
+
+        assert Enum.any?(records, fn
+                 {^member_key, _offset, _size, ^expire_at_ms, false} -> true
+                 _record -> false
+               end)
+      after
+        :atomics.put(hlc_ref, 1, previous_hlc)
+      end
+    end
+
     test "moves type metadata into the dedicated log", ctx do
       {redis_key, _entries} = seed_hash_entries(ctx.active_path, ctx.keydir)
       type_key = CompoundKey.type_key(redis_key)

@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.Shard.LogicalKeyIndexTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.HLC
   alias Ferricstore.Store.{CompoundKey, LFU}
   alias Ferricstore.Store.Shard.LogicalKeyIndex
@@ -71,6 +72,19 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndexTest do
 
     assert {:ok, ["plain", "users:1"]} =
              LogicalKeyIndex.all_live(ctx.ordered, ctx.keydir, now, 1)
+  end
+
+  @tag :hlc_drift_guard
+  test "rebuild keeps wall-live keys under an unsafe expiry context", ctx do
+    key = "wall-live-logical-key"
+    :ets.insert(ctx.keydir, {key, "value", 31_000, LFU.initial(), 0, 0, 5})
+
+    assert :ok =
+             CommandTime.with_expiry_context(61_000, 1_000, fn ->
+               LogicalKeyIndex.rebuild(ctx.ordered, ctx.slots, ctx.keydir)
+             end)
+
+    assert [{^key, _type, 31_000, ^key, _slot}] = :ets.lookup(ctx.ordered, key)
   end
 
   test "put and delete keep paging and random sampling exact", ctx do

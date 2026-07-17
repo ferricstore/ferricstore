@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
   @moduledoc false
 
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.HLC
   alias Ferricstore.Store.CompoundKey
@@ -65,14 +66,17 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
   @spec rebuild(table_ref(), table_ref(), table_ref(), binary() | nil) ::
           :ok | {:error, term()}
   def rebuild(ordered, slots, keydir, shard_path \\ nil) do
+    expiry_cutoff_ms =
+      ExpiryContext.capture()
+      |> ExpiryContext.safe_expiry_cutoff_ms()
+
     with {:ok, ordered_tid} <- fetch_table(ordered),
          {:ok, slots_tid} <- fetch_table(slots),
          {:ok, keydir_tid} <- fetch_table(keydir),
-         :ok <- warm_cold_type_metadata(keydir_tid, shard_path) do
+         :ok <- warm_cold_type_metadata(keydir_tid, shard_path, expiry_cutoff_ms) do
       :ets.delete_all_objects(ordered_tid)
       :ets.delete_all_objects(slots_tid)
       initialize_slot_metadata(slots_tid)
-      now = HLC.now_ms()
 
       result =
         :ets.foldl(
@@ -82,7 +86,7 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
 
             {storage_key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size}, :ok
             when is_binary(storage_key) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
-              if live_expiration?(expire_at_ms, now) do
+              if live_expiration?(expire_at_ms, expiry_cutoff_ms) do
                 put_projection_unlocked(
                   ordered_tid,
                   slots_tid,
@@ -117,11 +121,10 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
     ArgumentError -> {:error, :logical_key_index_unavailable}
   end
 
-  defp warm_cold_type_metadata(_keydir, nil), do: :ok
+  defp warm_cold_type_metadata(_keydir, nil, _expiry_cutoff_ms), do: :ok
 
-  defp warm_cold_type_metadata(keydir, shard_path) when is_binary(shard_path) do
-    now_ms = HLC.now_ms()
-
+  defp warm_cold_type_metadata(keydir, shard_path, expiry_cutoff_ms)
+       when is_binary(shard_path) do
     result =
       :ets.foldl(
         fn
@@ -132,7 +135,7 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
           {:ok, pending, pending_count}
           when is_integer(expire_at_ms) and expire_at_ms >= 0 and is_integer(file_id) and
                  file_id >= 0 and is_integer(offset) and offset >= 0 ->
-            if live_expiration?(expire_at_ms, now_ms) do
+            if live_expiration?(expire_at_ms, expiry_cutoff_ms) do
               pending = [{key, file_id, offset} | pending]
               pending_count = pending_count + 1
 

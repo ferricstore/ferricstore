@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Bitcask.NIF
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.Store.CompactionPlan
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       require Logger
@@ -156,6 +157,7 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
 
       defp run_compaction_worker(file_ids, state) do
         sp = state.shard_data_path
+        expiry_cutoff_ms = ExpiryContext.capture() |> ExpiryContext.safe_expiry_cutoff_ms()
 
         {total_written, total_dropped, total_reclaimed, compacted_file_ids, skipped_file_ids,
          failures} =
@@ -165,7 +167,7 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
             if fid == state.active_file_id do
               {written, dropped, reclaimed, compacted, skipped, failures}
             else
-              case compact_inactive_segment(state, fid) do
+              case compact_inactive_segment(state, fid, expiry_cutoff_ms) do
                 {:ok, copied, reclaimed_bytes} ->
                   {written + copied, dropped, reclaimed + reclaimed_bytes, [fid | compacted],
                    skipped, failures}
@@ -234,7 +236,7 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
         {reply, compacted_file_ids}
       end
 
-      defp compact_inactive_segment(state, fid) do
+      defp compact_inactive_segment(state, fid, expiry_cutoff_ms) do
         source = file_path(state.shard_data_path, fid)
         dest = Path.join(state.shard_data_path, "compact_#{fid}.log")
         old_size = compaction_file_size(source)
@@ -242,7 +244,7 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
         if match?({:ok, %File.Stat{type: :directory}}, File.lstat(source)) do
           finalize_empty_compaction_segment(state, fid, source, old_size, 0)
         else
-          case build_compaction_plan(state, fid, source, dest) do
+          case build_compaction_plan(state, fid, source, dest, expiry_cutoff_ms) do
             {:ok, %{plan_path: plan_path, live_count: 0, tombstone_count: tombstone_count}} ->
               remove_compaction_temp(state, dest)
 

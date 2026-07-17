@@ -54,6 +54,35 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalogTest do
     refute File.exists?(catalog.path)
   end
 
+  @tag :hlc_drift_guard
+  test "catalog preserves tombstones masking wall-live records during unsafe HLC drift", %{
+    shard_path: shard_path
+  } do
+    hlc_ref = :persistent_term.get(:ferricstore_hlc_ref)
+    previous_hlc = :atomics.get(hlc_ref, 1)
+    source_page = [record("masked", 30, true)]
+
+    assert {:ok, catalog} = CompactionTombstoneCatalog.open(shard_path, 7)
+
+    try do
+      wall_ms = System.os_time(:millisecond)
+      expire_at_ms = wall_ms + 30_000
+
+      assert :ok = CompactionTombstoneCatalog.record_source_page(catalog, source_page)
+      :atomics.put(hlc_ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+
+      assert :ok =
+               CompactionTombstoneCatalog.observe_lower_page(catalog, [
+                 record("masked", 1, false, expire_at_ms)
+               ])
+
+      assert {:ok, [30]} = CompactionTombstoneCatalog.needed_offsets(catalog, source_page)
+    after
+      :atomics.put(hlc_ref, 1, previous_hlc)
+      CompactionTombstoneCatalog.close(catalog)
+    end
+  end
+
   test "catalog rejects compressed or trailing candidate terms", %{shard_path: shard_path} do
     key = String.duplicate("key", 2_048)
     source = [record(key, 10, true)]

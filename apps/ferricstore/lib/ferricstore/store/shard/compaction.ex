@@ -146,10 +146,19 @@ defmodule Ferricstore.Store.Shard.Compaction do
       @compaction_source_page_records 4_096
       @compaction_plan_page_records 512
 
-      defp build_compaction_plan(state, fid, source, dest) do
+      defp build_compaction_plan(state, fid, source, dest, expiry_cutoff_ms) do
         with :ok <- prepare_compaction_temp(dest),
              {:ok, catalog} <- CompactionTombstoneCatalog.open(state.shard_data_path, fid) do
-          result = build_compaction_plan_with_catalog(state, fid, source, dest, catalog)
+          result =
+            build_compaction_plan_with_catalog(
+              state,
+              fid,
+              source,
+              dest,
+              catalog,
+              expiry_cutoff_ms
+            )
+
           close_result = CompactionTombstoneCatalog.close(catalog)
 
           case {result, close_result} do
@@ -170,10 +179,24 @@ defmodule Ferricstore.Store.Shard.Compaction do
         end
       end
 
-      defp build_compaction_plan_with_catalog(state, fid, source, dest, catalog) do
+      defp build_compaction_plan_with_catalog(
+             state,
+             fid,
+             source,
+             dest,
+             catalog,
+             expiry_cutoff_ms
+           ) do
         with {:ok, tombstone_keys} <-
                catalog_source_tombstones(state, source, catalog, 0, 0),
-             :ok <- resolve_tombstone_dependencies(state, fid, catalog, tombstone_keys),
+             :ok <-
+               resolve_tombstone_dependencies(
+                 state,
+                 fid,
+                 catalog,
+                 tombstone_keys,
+                 expiry_cutoff_ms
+               ),
              {:ok, writer} <- CompactionPlan.create(state.shard_data_path, fid) do
           case stream_compaction_source(
                  state,
@@ -184,7 +207,8 @@ defmodule Ferricstore.Store.Shard.Compaction do
                  writer,
                  0,
                  0,
-                 0
+                 0,
+                 expiry_cutoff_ms
                ) do
             {:ok, live_count, tombstone_count} ->
               case CompactionPlan.finish(writer) do
@@ -238,9 +262,16 @@ defmodule Ferricstore.Store.Shard.Compaction do
         end
       end
 
-      defp resolve_tombstone_dependencies(_state, _fid, _catalog, 0), do: :ok
+      defp resolve_tombstone_dependencies(_state, _fid, _catalog, 0, _expiry_cutoff_ms),
+        do: :ok
 
-      defp resolve_tombstone_dependencies(state, fid, catalog, candidate_count) do
+      defp resolve_tombstone_dependencies(
+             state,
+             fid,
+             catalog,
+             candidate_count,
+             expiry_cutoff_ms
+           ) do
         with {:ok, lower_files} <- lower_compaction_files(state.shard_data_path, fid) do
           started_at = System.monotonic_time()
 
@@ -250,7 +281,14 @@ defmodule Ferricstore.Store.Shard.Compaction do
                 {:halt, {:ok, resolved, scanned}}
 
               {lower_fid, path}, {:ok, resolved, scanned} ->
-                case catalog_lower_file(path, lower_fid, catalog, 0, 0) do
+                case catalog_lower_file(
+                       path,
+                       lower_fid,
+                       catalog,
+                       0,
+                       0,
+                       expiry_cutoff_ms
+                     ) do
                   {:ok, newly_resolved} ->
                     {:cont, {:ok, resolved + newly_resolved, scanned + 1}}
 
@@ -290,7 +328,14 @@ defmodule Ferricstore.Store.Shard.Compaction do
         end
       end
 
-      defp catalog_lower_file(path, fid, catalog, start_offset, resolved_count) do
+      defp catalog_lower_file(
+             path,
+             fid,
+             catalog,
+             start_offset,
+             resolved_count,
+             expiry_cutoff_ms
+           ) do
         case NIF.v2_scan_file_page(path, start_offset, @compaction_source_page_records) do
           {:ok, records, next_offset, done?}
           when is_list(records) and is_integer(next_offset) and next_offset >= start_offset and
@@ -298,7 +343,12 @@ defmodule Ferricstore.Store.Shard.Compaction do
             with :ok <-
                    validate_advancing_compaction_scan(records, start_offset, next_offset, done?),
                  {:ok, newly_resolved} <-
-                   CompactionTombstoneCatalog.observe_lower_page_count(catalog, records, fid) do
+                   CompactionTombstoneCatalog.observe_lower_page_count(
+                     catalog,
+                     records,
+                     fid,
+                     expiry_cutoff_ms
+                   ) do
               next_count = resolved_count + newly_resolved
 
               if done? do
@@ -307,7 +357,14 @@ defmodule Ferricstore.Store.Shard.Compaction do
                   {:error, reason} -> {:error, {:lower_segment_scan_failed, fid, reason}}
                 end
               else
-                catalog_lower_file(path, fid, catalog, next_offset, next_count)
+                catalog_lower_file(
+                  path,
+                  fid,
+                  catalog,
+                  next_offset,
+                  next_count,
+                  expiry_cutoff_ms
+                )
               end
             end
 
@@ -402,7 +459,8 @@ defmodule Ferricstore.Store.Shard.Compaction do
              writer,
              start_offset,
              live_count,
-             tombstone_count
+             tombstone_count,
+             expiry_cutoff_ms
            ) do
         case compaction_scan_source_page(state, source, start_offset) do
           {:ok, records, next_offset, done?}
@@ -411,7 +469,13 @@ defmodule Ferricstore.Store.Shard.Compaction do
             with :ok <-
                    validate_advancing_compaction_scan(records, start_offset, next_offset, done?),
                  {:ok, live_entries, tombstone_offsets} <-
-                   resolve_compaction_page(state, fid, catalog, records),
+                   resolve_compaction_page(
+                     state,
+                     fid,
+                     catalog,
+                     records,
+                     expiry_cutoff_ms
+                   ),
                  {:ok, plan_entries} <-
                    copy_compaction_page(
                      state,
@@ -439,7 +503,8 @@ defmodule Ferricstore.Store.Shard.Compaction do
                   writer,
                   next_offset,
                   next_live_count,
-                  next_tombstone_count
+                  next_tombstone_count,
+                  expiry_cutoff_ms
                 )
               end
             end
@@ -462,11 +527,9 @@ defmodule Ferricstore.Store.Shard.Compaction do
         end
       end
 
-      defp resolve_compaction_page(state, fid, catalog, records) do
-        now_ms = Ferricstore.HLC.now_ms()
-
+      defp resolve_compaction_page(state, fid, catalog, records, expiry_cutoff_ms) do
         with {:ok, markers, _all_tombstones, cold_candidates} <-
-               classify_compaction_records(state, fid, records, now_ms),
+               classify_compaction_records(state, fid, records, expiry_cutoff_ms),
              {:ok, cold_entries} <- resolve_compaction_cold_entries(state, fid, cold_candidates),
              {:ok, tombstone_offsets} <-
                CompactionTombstoneCatalog.needed_offsets(catalog, records) do

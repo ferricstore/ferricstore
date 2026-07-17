@@ -48,6 +48,43 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.BlobGarbageSweepIgnores
         refute File.exists?(path)
       end
 
+      @tag :hlc_drift_guard
+      test "blob garbage sweep preserves wall-live refs during unsafe HLC drift", %{
+        ctx: ctx,
+        keydir: keydir
+      } do
+        Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+        hlc_ref = :persistent_term.get(:ferricstore_hlc_ref)
+        previous_hlc = :atomics.get(hlc_ref, 1)
+
+        try do
+          key = "blob:gc:unsafe-drift-ref"
+          payload = :binary.copy("D", 1024)
+          wall_ms = System.os_time(:millisecond)
+          expire_at_ms = wall_ms + 30_000
+
+          assert {:ok, blob_ref} = BlobStore.put(ctx.data_dir, 0, payload)
+          encoded_ref = BlobRef.encode!(blob_ref)
+          path = BlobRef.path(ctx.data_dir, 0, blob_ref)
+          assert File.exists?(path)
+
+          :ets.insert(
+            keydir,
+            {key, encoded_ref, expire_at_ms, LFU.initial(), :memory, 0, byte_size(encoded_ref)}
+          )
+
+          :atomics.put(hlc_ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+
+          assert {:ok, %{deleted_files: 0, kept_files: 1}} =
+                   Router.sweep_blob_garbage(ctx)
+
+          assert File.exists?(path)
+        after
+          :atomics.put(hlc_ref, 1, previous_hlc)
+          Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+        end
+      end
+
       test "blob garbage sweep preserves live refs stored behind WARaft segment locations" do
         ctx =
           IsolatedInstance.checkout(

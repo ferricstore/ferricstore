@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.CompactionTombstoneCatalog do
   @moduledoc false
 
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.TermCodec
 
@@ -74,7 +75,11 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
 
   @spec observe_lower_page(t(), [record()]) :: :ok | {:error, term()}
   def observe_lower_page(%{path: path}, records) when is_list(records) do
-    case observe_lower_page_count(%{path: path}, records, 0) do
+    expiry_cutoff_ms =
+      ExpiryContext.capture()
+      |> ExpiryContext.safe_expiry_cutoff_ms()
+
+    case observe_lower_page_count(%{path: path}, records, 0, expiry_cutoff_ms) do
       {:ok, _newly_resolved} -> :ok
       {:error, _reason} = error -> error
     end
@@ -84,11 +89,25 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
           {:ok, non_neg_integer()} | {:error, term()}
   def observe_lower_page_count(%{path: path}, records, file_id)
       when is_list(records) and is_integer(file_id) and file_id >= 0 do
+    expiry_cutoff_ms =
+      ExpiryContext.capture()
+      |> ExpiryContext.safe_expiry_cutoff_ms()
+
+    observe_lower_page_count(%{path: path}, records, file_id, expiry_cutoff_ms)
+  end
+
+  @doc false
+  @spec observe_lower_page_count(t(), [record()], non_neg_integer(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def observe_lower_page_count(%{path: path}, records, file_id, expiry_cutoff_ms)
+      when is_list(records) and is_integer(file_id) and file_id >= 0 and
+             is_integer(expiry_cutoff_ms) and expiry_cutoff_ms >= 0 do
     keys = unique_catalog_keys(records)
 
     with {:ok, values} <- LMDB.get_many(path, keys),
          {:ok, candidates} <- decode_candidates(keys, values),
-         {:ok, updates, newly_resolved} <- lower_page_updates(records, candidates, file_id),
+         {:ok, updates, newly_resolved} <-
+           lower_page_updates(records, candidates, file_id, expiry_cutoff_ms),
          ops =
            Enum.map(updates, fn {catalog_key, {key, offset, state, resolved_fid}} ->
              {:put, catalog_key, encode_candidate(key, offset, state, resolved_fid)}
@@ -210,9 +229,7 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
 
   defp decode_candidates(_keys, _values), do: {:error, :catalog_result_count_mismatch}
 
-  defp lower_page_updates(records, candidates, file_id) do
-    now_ms = Ferricstore.HLC.now_ms()
-
+  defp lower_page_updates(records, candidates, file_id, expiry_cutoff_ms) do
     records
     |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn
       {key, _offset, _size, expire_at_ms, tombstone?} = record,
@@ -228,7 +245,7 @@ defmodule Ferricstore.Store.CompactionTombstoneCatalog do
 
           {^key, source_offset, _old_state, resolved_fid}
           when resolved_fid == nil or resolved_fid == file_id ->
-            state = dependency_state(record, now_ms)
+            state = dependency_state(record, expiry_cutoff_ms)
 
             next_newly_resolved =
               if resolved_fid == nil,

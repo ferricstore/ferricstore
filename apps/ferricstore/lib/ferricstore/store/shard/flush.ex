@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   @moduledoc "Async and sync Bitcask batch flush, file rotation, hint-file writing, and per-file dead-byte fragmentation tracking."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Store.AppendResult
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.Promotion
@@ -509,12 +510,14 @@ defmodule Ferricstore.Store.Shard.Flush do
         # (record_header + key + value per entry). Expired ETS rows are
         # already logically dead, even when the periodic sweep has not removed
         # them yet.
-        now_ms = Ferricstore.HLC.now_ms()
+        expiry_cutoff_ms =
+          ExpiryContext.capture()
+          |> ExpiryContext.safe_expiry_cutoff_ms()
 
         live_per_file =
           :ets.foldl(
             fn {key, _value, expire_at_ms, _lfu, fid, _off, vsize}, acc ->
-              if live_expiry?(expire_at_ms, now_ms) do
+              if live_expiry?(expire_at_ms, expiry_cutoff_ms) do
                 accumulate_live_bytes(acc, key, fid, vsize)
               else
                 acc
