@@ -178,8 +178,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
       data_dir: data_path,
       index: 0,
       zset_score_index: index,
-      zset_score_lookup: lookup,
-      zset_index_ready: MapSet.new()
+      zset_score_lookup: lookup
     }
 
     try do
@@ -206,8 +205,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     state = %{
       keydir: keydir,
       zset_score_index: index,
-      zset_score_lookup: lookup,
-      zset_index_ready: MapSet.new()
+      zset_score_lookup: lookup
     }
 
     try do
@@ -220,6 +218,32 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
       refute ZSetIndex.ready?(lookup, redis_key)
       assert [] == ZSetIndex.rank_range(index, redis_key, 0, 10, false)
       assert 0 == ZSetIndex.count(index, lookup, redis_key, :neg_inf, :inf)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "ensure stores readiness only in ETS and does not require per-state key retention", %{
+    index: index,
+    lookup: lookup
+  } do
+    keydir = :ets.new(:zset_index_ets_readiness, [:set, :public])
+    redis_key = "zs"
+    prefix = CompoundKey.zset_prefix(redis_key)
+
+    state = %{
+      keydir: keydir,
+      zset_score_index: index,
+      zset_score_lookup: lookup
+    }
+
+    try do
+      true =
+        :ets.insert(keydir, {CompoundKey.zset_member(redis_key, "member"), "1", 0, 0, 0, 0, 1})
+
+      assert {:ok, ^state} = ZSetIndex.ensure(state, redis_key, prefix, nil)
+      assert ZSetIndex.ready?(lookup, redis_key)
+      assert [{"member", 1.0}] == ZSetIndex.rank_range(index, redis_key, 0, 10, false)
     after
       :ets.delete(keydir)
     end

@@ -318,8 +318,7 @@ defmodule Ferricstore.Store.Shard.Startup do
              zset_score_lookup: zset_score_lookup,
              flow_index: flow_index,
              flow_lookup: flow_lookup,
-             flow_due_catalog: flow_due_catalog,
-             zset_index_ready: MapSet.new()
+             flow_due_catalog: flow_due_catalog
            }, {:continue, {:flush_interval, flush_ms}}}
         catch
           {:shard_init_failed, reason} -> {:stop, reason}

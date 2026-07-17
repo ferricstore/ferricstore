@@ -1422,8 +1422,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
           keydir: ctx.keydir,
           shard_data_path: ctx.shard_data_path,
           zset_score_index: ctx.zset_score_index_name,
-          zset_score_lookup: ctx.zset_score_lookup_name,
-          zset_index_ready: MapSet.new()
+          zset_score_lookup: ctx.zset_score_lookup_name
         }
 
         ZSetIndex.ensure(state, redis_key, prefix, data_path)

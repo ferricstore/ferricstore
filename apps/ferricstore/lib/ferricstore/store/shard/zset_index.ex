@@ -41,7 +41,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
                    entries
                  ) do
               :ok ->
-                {:ok, %{state | zset_index_ready: MapSet.put(state.zset_index_ready, redis_key)}}
+                {:ok, state}
 
               {:error, reason} ->
                 ReadResult.failure(reason)
@@ -258,10 +258,9 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
   def clear_ready_key(state, redis_key) do
     if ready_tables?(state) do
       clear_key(state.zset_score_index, state.zset_score_lookup, redis_key)
-      %{state | zset_index_ready: MapSet.delete(state.zset_index_ready, redis_key)}
-    else
-      state
     end
+
+    state
   end
 
   @spec reset(map()) :: map()
@@ -274,11 +273,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     |> zset_table(:zset_score_lookup, :zset_score_lookup_name)
     |> delete_all_objects()
 
-    if Map.has_key?(state, :zset_index_ready) do
-      Map.put(state, :zset_index_ready, MapSet.new())
-    else
-      state
-    end
+    state
   end
 
   defp zset_table(state, primary_key, fallback_key) do

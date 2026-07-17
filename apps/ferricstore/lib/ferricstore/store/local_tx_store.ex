@@ -35,8 +35,7 @@ defmodule Ferricstore.Store.LocalTxStore do
         compound_member_index:
           Map.get(state, :compound_member_index) || Map.get(state, :compound_member_index_name),
         zset_score_index: Map.get(state, :zset_score_index),
-        zset_score_lookup: Map.get(state, :zset_score_lookup),
-        zset_index_ready: Map.get(state, :zset_index_ready)
+        zset_score_lookup: Map.get(state, :zset_score_lookup)
       }
     }
   end
