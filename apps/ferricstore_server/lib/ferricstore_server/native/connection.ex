@@ -532,10 +532,12 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp handle_data(state, data) do
+    frame_limit = Chunks.logical_frame_limit(state)
+
     case FrameBuffer.append(
            state.buffer,
            data,
-           state.max_frame_bytes,
+           frame_limit,
            inbound_buffer_limit(state)
          ) do
       {:incomplete, buffer} ->
@@ -565,11 +567,12 @@ defmodule FerricstoreServer.Native.Connection do
   defp decode_buffer(state) do
     decode_started_us = monotonic_us()
     buffer = FrameBuffer.materialize(state.buffer)
+    frame_limit = Chunks.logical_frame_limit(state)
 
-    case Codec.decode_frames(buffer, state.max_frame_bytes) do
+    case Codec.decode_frames(buffer, frame_limit) do
       {:ok, frames, rest, continuation} ->
         decode_us = monotonic_us() - decode_started_us
-        next_buffer = FrameBuffer.from_binary(rest, state.max_frame_bytes)
+        next_buffer = FrameBuffer.from_binary(rest, frame_limit)
         decoded_bytes = Enum.reduce(frames, 0, &(frame_memory_bytes(&1) + &2))
         state = %{state | decoded_retained_bytes: state.decoded_retained_bytes + decoded_bytes}
 
@@ -627,11 +630,12 @@ defmodule FerricstoreServer.Native.Connection do
   defp maybe_reactivate_input(%{decode_paused: true} = state), do: state
   defp maybe_reactivate_input(state), do: state
 
-  defp inbound_buffer_limit(%{require_auth: true, authenticated: false} = state) do
-    min(FrameBuffer.max_buffer_bytes(), FrameBuffer.frame_bytes(state.preauth_max_frame_bytes))
-  end
-
-  defp inbound_buffer_limit(_state), do: FrameBuffer.max_buffer_bytes()
+  defp inbound_buffer_limit(state),
+    do:
+      min(
+        FrameBuffer.max_buffer_bytes(),
+        FrameBuffer.frame_bytes(Chunks.logical_frame_limit(state))
+      )
 
   defp put_inbound_buffer(state, buffer) do
     stats = FrameBuffer.stats(buffer)
@@ -1226,7 +1230,8 @@ defmodule FerricstoreServer.Native.Connection do
     with :ok <- validate_request_id(frame),
          :ok <- validate_request_flags(frame, state),
          {:ready, frame, state} <- Chunks.reassemble(frame, state),
-         {:ok, frame} <- Chunks.maybe_uncompress(frame, state) do
+         {:ok, frame} <- Chunks.maybe_uncompress(frame, state),
+         :ok <- Chunks.validate_logical_size(frame, state) do
       {:ok, frame, state}
     else
       {:pending, state} -> {:pending, state}

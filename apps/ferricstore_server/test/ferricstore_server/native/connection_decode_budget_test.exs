@@ -5,9 +5,11 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   alias FerricstoreServer.Native.Connection.{FrameBuffer, Responses}
   alias FerricstoreServer.Acl
 
+  @hello_opcode 0x0001
   @ping_opcode 0x0003
   @command_exec_opcode 0x0100
   @get_opcode 0x0101
+  @compressed_flag 0x08
   @no_reply_flag 0x10
   @more_chunks_flag 0x20
   @frame_count 129
@@ -432,6 +434,97 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert_socket_closed(socket)
   end
 
+  @tag :preauth_frame_budget
+  test "unauthenticated chunk streams cannot exceed the logical frame budget" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_unauthenticated_max_frame_bytes)
+
+    Application.put_env(:ferricstore, :native_unauthenticated_max_frame_bytes, 64)
+
+    on_exit(fn ->
+      restore_env(:native_unauthenticated_max_frame_bytes, previous_limit)
+    end)
+
+    username = "preauth-chunks-#{System.unique_integer([:positive])}"
+    assert :ok = Acl.set_user(username, ["on", ">secret", "+@all", "~*"])
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    body =
+      Codec.encode_value(%{
+        "message" => "PONG",
+        "padding" => String.duplicate("x", 80)
+      })
+
+    assert byte_size(body) > 64
+    split_at = div(byte_size(body), 2)
+    <<first::binary-size(split_at), second::binary>> = body
+    assert byte_size(first) <= 64
+    assert byte_size(second) <= 64
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               Codec.encode_frame(@ping_opcode, 1, 50, first, @more_chunks_flag)
+             )
+
+    assert {:error, :timeout} = :gen_tcp.recv(socket, 0, 25)
+    assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@ping_opcode, 1, 50, second))
+    assert [{50, 6}] = receive_response_statuses(socket, 1)
+  end
+
+  @tag :preauth_frame_budget
+  test "unauthenticated compressed frames cannot inflate past the logical frame budget" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_unauthenticated_max_frame_bytes)
+
+    previous_compression =
+      Application.get_env(:ferricstore, :native_request_compression_enabled)
+
+    Application.put_env(:ferricstore, :native_unauthenticated_max_frame_bytes, 64)
+    Application.put_env(:ferricstore, :native_request_compression_enabled, true)
+
+    on_exit(fn ->
+      restore_env(:native_unauthenticated_max_frame_bytes, previous_limit)
+      restore_env(:native_request_compression_enabled, previous_compression)
+    end)
+
+    username = "preauth-compression-#{System.unique_integer([:positive])}"
+    assert :ok = Acl.set_user(username, ["on", ">secret", "+@all", "~*"])
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    hello_body = Codec.encode_value(%{"compression" => "zlib"})
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               Codec.encode_frame(@hello_opcode, 0, 51, hello_body, @no_reply_flag)
+             )
+
+    assert {:error, :timeout} = :gen_tcp.recv(socket, 0, 25)
+
+    body =
+      Codec.encode_value(%{
+        "message" => "PONG",
+        "padding" => String.duplicate("x", 256)
+      })
+
+    compressed = :zlib.compress(body)
+    assert byte_size(body) > 64
+    assert byte_size(compressed) <= 64
+
+    assert :ok =
+             :gen_tcp.send(
+               socket,
+               Codec.encode_frame(@ping_opcode, 0, 52, compressed, @compressed_flag)
+             )
+
+    assert [{52, 6}] = receive_response_statuses(socket, 1)
+  end
+
   test "accepts a multi-megabyte frame sent as 64 KiB socket chunks" do
     socket = connect()
     on_exit(fn -> :gen_tcp.close(socket) end)
@@ -712,12 +805,13 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   end
 
   defp decode_response_statuses(
-         <<"FSNP", 0x81, _flags, _lane_id::unsigned-32, _opcode::unsigned-16,
+         <<"FSNP", 0x81, flags, _lane_id::unsigned-32, _opcode::unsigned-16,
            request_id::unsigned-64, body_len::unsigned-32, body_and_rest::binary>> = buffer,
          responses
        ) do
     if byte_size(body_and_rest) >= body_len do
       <<body::binary-size(body_len), rest::binary>> = body_and_rest
+      body = if Bitwise.band(flags, @compressed_flag) != 0, do: :zlib.uncompress(body), else: body
       <<status::unsigned-16, _value::binary>> = body
       decode_response_statuses(rest, [{request_id, status} | responses])
     else

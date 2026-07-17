@@ -9,23 +9,29 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
   def reassemble(frame, state) do
     key = chunk_key(frame)
     more? = Bitwise.band(flags(frame), @flag_more_chunks) != 0
+    frame_limit = logical_frame_limit(state)
 
     case {Map.fetch(state.chunk_buffers, key), more?} do
       {:error, false} ->
         {:ready, frame, state}
 
       {:error, true} ->
-        if map_size(state.chunk_buffers) >= state.max_pending_chunks do
-          {:error, "ERR native pending chunk stream limit exceeded", state}
-        else
-          start_pending_chunk(state, key, flags(frame), body(frame))
+        cond do
+          byte_size(body(frame)) > frame_limit ->
+            {:error, "ERR native chunked request exceeds max_frame_bytes", state}
+
+          map_size(state.chunk_buffers) >= state.max_pending_chunks ->
+            {:error, "ERR native pending chunk stream limit exceeded", state}
+
+          true ->
+            start_pending_chunk(state, key, flags(frame), body(frame))
         end
 
       {{:ok, {stored_flags, chunks, total_size, stream_token, bytes_token, deadline_ms}}, true} ->
         previous_size = total_size
         total_size = total_size + byte_size(body(frame))
 
-        if total_size > state.max_frame_bytes do
+        if total_size > frame_limit do
           state = drop_chunk(state, key, previous_size)
           {:error, "ERR native chunked request exceeds max_frame_bytes", state}
         else
@@ -47,7 +53,7 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
         total_size = total_size + byte_size(body(frame))
 
         cond do
-          total_size > state.max_frame_bytes ->
+          total_size > frame_limit ->
             state = drop_chunk(state, key, previous_size)
             {:error, "ERR native chunked request exceeds max_frame_bytes", state}
 
@@ -72,7 +78,7 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
 
   def maybe_uncompress(frame, state) do
     if Bitwise.band(flags(frame), @flag_compressed) != 0 do
-      case bounded_uncompress(body(frame), state.max_frame_bytes) do
+      case bounded_uncompress(body(frame), logical_frame_limit(state)) do
         {:ok, body} ->
           {:ok,
            put_frame(frame, Bitwise.band(flags(frame), Bitwise.bnot(@flag_compressed)), body)}
@@ -87,6 +93,28 @@ defmodule FerricstoreServer.Native.Connection.Chunks do
       {:ok, frame}
     end
   end
+
+  @spec validate_logical_size(tuple(), map()) :: :ok | {:error, binary()}
+  def validate_logical_size(frame, state) do
+    if byte_size(body(frame)) <= logical_frame_limit(state) do
+      :ok
+    else
+      {:error, "ERR native request exceeds max_frame_bytes"}
+    end
+  end
+
+  @spec logical_frame_limit(map()) :: pos_integer()
+  def logical_frame_limit(%{
+        require_auth: true,
+        authenticated: false,
+        preauth_max_frame_bytes: preauth_limit,
+        max_frame_bytes: max_frame_bytes
+      })
+      when is_integer(preauth_limit) and preauth_limit > 0 do
+    min(preauth_limit, max_frame_bytes)
+  end
+
+  def logical_frame_limit(%{max_frame_bytes: max_frame_bytes}), do: max_frame_bytes
 
   defp bounded_uncompress(compressed, max_bytes) do
     stream = :zlib.open()
