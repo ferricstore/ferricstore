@@ -635,7 +635,8 @@ defmodule Ferricstore.Raft.BlobCommand do
     entries
     |> Enum.reduce_while({:ok, [], []}, fn
       {compound_key, value, expire_at_ms}, {:ok, acc, external_payloads}
-      when is_binary(compound_key) and is_binary(value) ->
+      when is_binary(compound_key) and is_binary(value) and is_integer(expire_at_ms) and
+             expire_at_ms >= 0 ->
         if compound_blob_side_channel_key?(compound_key) and externalize?(value, threshold) do
           marker = {compound_key, :external, expire_at_ms}
           {:cont, {:ok, [marker | acc], [value | external_payloads]}}

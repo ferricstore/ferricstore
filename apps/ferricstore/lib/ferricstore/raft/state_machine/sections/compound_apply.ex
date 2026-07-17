@@ -108,6 +108,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
 
       defp apply_compound_batch_put_entries(state, redis_key, entries) do
         cond do
+          not valid_compound_put_entries?(entries) ->
+            {:error, :invalid_compound_batch_entry}
+
           not compound_put_entries_for_key?(redis_key, entries) ->
             {:error, :compound_batch_cross_key}
 
@@ -150,15 +153,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp apply_compound_blob_batch_put_entries(state, redis_key, entries) do
-        with true <- compound_blob_put_entries_for_key?(redis_key, entries),
-             :ok <- validate_raw_compound_blob_batch_target(state, redis_key, entries),
-             {:ok, prepared_entries} <- prepare_compound_blob_batch_entries(state, entries) do
-          compound_batch_checked_results(state, redis_key, entries, fn ->
-            do_compound_blob_batch_put(state, redis_key, prepared_entries)
-          end)
-        else
-          false -> {:error, :compound_batch_cross_key}
-          {:error, _reason} = error -> error
+        cond do
+          not valid_compound_blob_put_entries?(entries) ->
+            {:error, :invalid_compound_blob_batch_entry}
+
+          not compound_blob_put_entries_for_key?(redis_key, entries) ->
+            {:error, :compound_batch_cross_key}
+
+          true ->
+            with :ok <- validate_raw_compound_blob_batch_target(state, redis_key, entries),
+                 {:ok, prepared_entries} <- prepare_compound_blob_batch_entries(state, entries) do
+              compound_batch_checked_results(state, redis_key, entries, fn ->
+                do_compound_blob_batch_put(state, redis_key, prepared_entries)
+              end)
+            end
         end
       end
 
@@ -182,8 +190,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         end
       end
 
-      defp raw_compound_blob_key({compound_key, _value, _expire_at_ms, kind})
-           when is_binary(compound_key) and kind in [:value, :blob_ref],
+      defp raw_compound_blob_key({compound_key, value, expire_at_ms, kind})
+           when is_binary(compound_key) and is_binary(value) and is_integer(expire_at_ms) and
+                  expire_at_ms >= 0 and kind in [:value, :blob_ref],
            do: {:ok, compound_key}
 
       defp raw_compound_blob_key(_invalid),
@@ -193,11 +202,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         entries
         |> Enum.reduce_while({:ok, []}, fn
           {compound_key, value, expire_at_ms, :value}, {:ok, acc}
-          when is_binary(compound_key) and is_binary(value) and is_integer(expire_at_ms) ->
+          when is_binary(compound_key) and is_binary(value) and is_integer(expire_at_ms) and
+                 expire_at_ms >= 0 ->
             {:cont, {:ok, [{:value, compound_key, value, expire_at_ms} | acc]}}
 
           {compound_key, encoded_ref, expire_at_ms, :blob_ref}, {:ok, acc}
-          when is_binary(compound_key) and is_binary(encoded_ref) and is_integer(expire_at_ms) ->
+          when is_binary(compound_key) and is_binary(encoded_ref) and is_integer(expire_at_ms) and
+                 expire_at_ms >= 0 ->
             case materialize_blob_ref(state, encoded_ref) do
               {:ok, materialized} ->
                 {:cont,
@@ -450,11 +461,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         end)
       end
 
+      defp valid_compound_put_entries?(entries) do
+        Enum.all?(entries, fn
+          {compound_key, value, expire_at_ms} ->
+            is_binary(compound_key) and is_binary(value) and is_integer(expire_at_ms) and
+              expire_at_ms >= 0
+
+          _entry ->
+            false
+        end)
+      end
+
       defp compound_blob_put_entries_for_key?(redis_key, entries) do
         Enum.all?(entries, fn
           {compound_key, _value_or_ref, _expire_at_ms, kind}
           when is_binary(compound_key) and kind in [:value, :blob_ref] ->
             CompoundKey.extract_redis_key(compound_key) == redis_key
+
+          _entry ->
+            false
+        end)
+      end
+
+      defp valid_compound_blob_put_entries?(entries) do
+        Enum.all?(entries, fn
+          {compound_key, value_or_ref, expire_at_ms, kind} ->
+            is_binary(compound_key) and is_binary(value_or_ref) and is_integer(expire_at_ms) and
+              expire_at_ms >= 0 and kind in [:value, :blob_ref]
 
           _entry ->
             false

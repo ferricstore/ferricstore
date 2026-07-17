@@ -306,7 +306,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                   false
               end
 
-            _ ->
+            [entry] ->
+              record_state_read_failure({:invalid_keydir_entry, key, entry})
+              false
+
+            [] ->
               false
           end
         rescue
@@ -337,7 +341,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                   nil
               end
 
-            _ ->
+            [entry] ->
+              record_state_read_failure({:invalid_keydir_entry, key, entry})
+              nil
+
+            [] ->
               nil
           end
         rescue
@@ -438,7 +446,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                   nil
               end
 
-            _ ->
+            [entry] ->
+              record_state_read_failure({:invalid_keydir_entry, key, entry})
+              nil
+
+            [] ->
               nil
           end
         rescue
@@ -458,50 +470,56 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         prefix_len = byte_size(prefix)
 
         ms = [
-          {{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
+          {{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6", :"$7"},
            [
              {:andalso, {:is_binary, :"$1"},
               {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
                {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
-           ], [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}}]}
+           ], [:"$_"]}
         ]
 
         try do
           {tokens, cold_entries, _cold_count} =
             :ets.select(ctx.keydir, ms)
-            |> Enum.reduce({[], [], 0}, fn {key, value, exp, fid, off, vsize},
-                                           {tokens, cold_entries, cold_count} ->
-              case ExpiryContext.classify(expiry_context, exp) do
-                :live ->
-                  cond do
-                    value == nil and
-                        not valid_cross_shard_cold_location_value?(fid, off, vsize) ->
-                      record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+            |> Enum.reduce({[], [], 0}, fn
+              {key, value, exp, _lfu, fid, off, vsize} = keydir_entry,
+              {tokens, cold_entries, cold_count} ->
+                if is_integer(exp) and exp >= 0 do
+                  case ExpiryContext.classify(expiry_context, exp) do
+                    :live ->
+                      cond do
+                        value == nil and
+                            not valid_cross_shard_cold_location_value?(fid, off, vsize) ->
+                          record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                          {tokens, cold_entries, cold_count}
+
+                        value == nil and valid_cold_location(fid, off, vsize) ->
+                          field = sm_prefix_field(key)
+                          path = sm_file_path_from_path(data_path, fid)
+                          entry = {field, key, {:bitcask, path, off}}
+                          {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
+
+                        value == nil and valid_waraft_segment_location(fid, off, vsize) ->
+                          field = sm_prefix_field(key)
+                          entry = {field, key, {:waraft, fid}}
+                          {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
+
+                        true ->
+                          {[{:value, {sm_prefix_field(key), value}} | tokens], cold_entries,
+                           cold_count}
+                      end
+
+                    :expired ->
                       {tokens, cold_entries, cold_count}
 
-                    value == nil and valid_cold_location(fid, off, vsize) ->
-                      field = sm_prefix_field(key)
-                      path = sm_file_path_from_path(data_path, fid)
-                      entry = {field, key, {:bitcask, path, off}}
-                      {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
-
-                    value == nil and valid_waraft_segment_location(fid, off, vsize) ->
-                      field = sm_prefix_field(key)
-                      entry = {field, key, {:waraft, fid}}
-                      {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
-
-                    true ->
-                      {[{:value, {sm_prefix_field(key), value}} | tokens], cold_entries,
-                       cold_count}
+                    {:unsafe, reason} ->
+                      record_state_read_failure(reason)
+                      {tokens, cold_entries, cold_count}
                   end
-
-                :expired ->
+                else
+                  record_state_read_failure({:invalid_keydir_entry, key, keydir_entry})
                   {tokens, cold_entries, cold_count}
-
-                {:unsafe, reason} ->
-                  record_state_read_failure(reason)
-                  {tokens, cold_entries, cold_count}
-              end
+                end
             end)
 
           cold_values =
@@ -1150,39 +1168,47 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         expiry_context = ExpiryContext.capture()
 
         ms = [
-          {{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
+          {{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6", :"$7"},
            [
              {:andalso, {:is_binary, :"$1"},
               {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
                {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
-           ], [{{:"$2", :"$3", :"$4", :"$5", :"$6"}}]}
+           ], [:"$_"]}
         ]
 
         try do
           :ets.select(ctx.keydir, ms)
-          |> Enum.reduce(0, fn {value, exp, fid, off, vsize}, count ->
-            case ExpiryContext.classify(expiry_context, exp) do
-              :live ->
-                cond do
-                  value != nil ->
-                    count + 1
+          |> Enum.reduce(
+            0,
+            fn {key, value, exp, _lfu, fid, off, vsize} = keydir_entry, count ->
+              if is_integer(exp) and exp >= 0 do
+                case ExpiryContext.classify(expiry_context, exp) do
+                  :live ->
+                    cond do
+                      value != nil ->
+                        count + 1
 
-                  valid_cross_shard_cold_location_value?(fid, off, vsize) ->
-                    count + 1
+                      valid_cross_shard_cold_location_value?(fid, off, vsize) ->
+                        count + 1
 
-                  true ->
-                    record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                      true ->
+                        record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                        count
+                    end
+
+                  :expired ->
+                    count
+
+                  {:unsafe, reason} ->
+                    record_state_read_failure(reason)
                     count
                 end
-
-              :expired ->
+              else
+                record_state_read_failure({:invalid_keydir_entry, key, keydir_entry})
                 count
-
-              {:unsafe, reason} ->
-                record_state_read_failure(reason)
-                count
+              end
             end
-          end)
+          )
         rescue
           ArgumentError ->
             emit_cross_shard_keydir_unavailable(ctx, :cross_shard_prefix_count)

@@ -78,6 +78,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           [] ->
             # ETS miss -- try Bitcask for keys not yet in keydir
             warm_from_bitcask(state, key, expiry_context)
+
+          [entry] ->
+            record_state_read_failure({:invalid_keydir_entry, key, entry})
         end
       end
 

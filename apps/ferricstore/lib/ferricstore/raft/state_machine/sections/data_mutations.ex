@@ -250,32 +250,35 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
               error
 
             current ->
-              current_score =
-                case current do
-                  nil ->
-                    0.0
+              case current_zset_score(current) do
+                {:ok, current_score} ->
+                  new_score = current_score + increment * 1.0
+                  new_str = Float.to_string(new_score)
 
-                  {score_val, _expire_at_ms} ->
-                    score_str =
-                      case score_val do
-                        value when is_binary(value) -> value
-                        value -> to_string(value)
-                      end
+                  case do_compound_put(state, redis_key, compound_key, new_str, 0) do
+                    :ok -> new_str
+                    {:error, _reason} = error -> error
+                  end
 
-                    case Float.parse(score_str) do
-                      {score, ""} -> score
-                      _invalid -> 0.0
-                    end
-                end
-
-              new_score = current_score + increment * 1.0
-              new_str = Float.to_string(new_score)
-
-              case do_compound_put(state, redis_key, compound_key, new_str, 0) do
-                :ok -> new_str
-                {:error, _reason} = error -> error
+                :error ->
+                  {:error, "ERR value is not a valid float"}
               end
           end
+        end
+      end
+
+      defp current_zset_score(nil), do: {:ok, 0.0}
+
+      defp current_zset_score({score_value, _expire_at_ms}) do
+        score_string =
+          case score_value do
+            value when is_binary(value) -> value
+            value -> to_string(value)
+          end
+
+        case Float.parse(score_string) do
+          {score, ""} -> {:ok, score}
+          _invalid -> :error
         end
       end
 
@@ -563,6 +566,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
           [] ->
             {results, cold, [{index, key} | remote]}
+
+          [entry] ->
+            record_state_read_failure({:invalid_keydir_entry, key, entry})
+            {results, cold, remote}
         end
       rescue
         ArgumentError ->
@@ -847,19 +854,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # Writes type metadata on first use, returns :ok or wrongtype error.
       defp check_or_set_type(state, redis_key, type_key, expected_type) do
         case sm_store_compound_get(state, redis_key, type_key) do
+          {:error, _reason} = error ->
+            error
+
           nil ->
-            # No type metadata yet. Reject if the key already exists as a plain string.
-            if ets_has?(state.ets, redis_key) do
-              {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-            else
-              do_compound_put(state, redis_key, type_key, expected_type, 0)
-            end
+            check_or_create_type_for_plain_key(state, redis_key, type_key, expected_type)
 
           existing when is_binary(existing) and existing == expected_type ->
             :ok
 
           _other ->
             {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+      end
+
+      defp check_or_create_type_for_plain_key(state, redis_key, type_key, expected_type) do
+        case ets_lookup(state, redis_key) do
+          {:hit, _value, _expire_at_ms} ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+
+          :expired ->
+            do_compound_put(state, redis_key, type_key, expected_type, 0)
+
+          :miss ->
+            case Process.get(:sm_state_read_failure) do
+              nil -> do_compound_put(state, redis_key, type_key, expected_type, 0)
+              reason -> {:error, {:state_read_failed, reason}}
+            end
         end
       end
 

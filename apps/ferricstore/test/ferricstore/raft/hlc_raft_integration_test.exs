@@ -585,6 +585,185 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       assert :ets.lookup(ets, target_key) == []
     end
 
+    test "rejects negative expiry in compound batch entries before mutation", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "invalid_compound_batch_expiry"
+      field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
+      initial_size = File.stat!(state.active_file_path).size
+
+      wrapped =
+        {{:compound_batch_put, redis_key, [{field_key, "value", -1}]}, stamp_metadata(HLC.now())}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, :invalid_compound_batch_entry}
+      assert :ets.lookup(ets, field_key) == []
+      assert File.stat!(state.active_file_path).size == initial_size
+    end
+
+    test "rejects negative expiry in raw compound blob batches before mutation", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "invalid_compound_blob_batch_expiry"
+      field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
+      initial_size = File.stat!(state.active_file_path).size
+
+      wrapped =
+        {{:compound_blob_batch_put, redis_key, [{field_key, "value", -1, :value}]},
+         stamp_metadata(HLC.now())}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, :invalid_compound_blob_batch_entry}
+      assert :ets.lookup(ets, field_key) == []
+      assert File.stat!(state.active_file_path).size == initial_size
+    end
+
+    test "ZINCRBY rejects an invalid stored score without overwriting it", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "invalid_zset_score"
+      type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+      member_key = Ferricstore.Store.CompoundKey.zset_member(redis_key, "member")
+      member_entry = {member_key, "not-a-score", 0, Ferricstore.Store.LFU.initial(), 0, 0, 11}
+
+      :ets.insert(ets, {type_key, "zset", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+      :ets.insert(ets, member_entry)
+
+      wrapped =
+        {{:zincrby, redis_key, 1.0, "member"}, stamp_metadata(HLC.now())}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, "ERR value is not a valid float"}
+      assert :ets.lookup(ets, member_key) == [member_entry]
+    end
+
+    test "ZINCRBY can replace a plain string that is definitely expired", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "expired_string_to_zset"
+      type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+      member_key = Ferricstore.Store.CompoundKey.zset_member(redis_key, "member")
+      :ets.insert(ets, {redis_key, "old", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 3})
+
+      wrapped =
+        {{:zincrby, redis_key, 1.0, "member"}, %{hlc_ts: {61_000, 0}, wall_time_ms: 61_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == "1.0"
+      assert :ets.lookup(ets, redis_key) == []
+      assert [{^type_key, "zset", 0, _, _, _, _}] = :ets.lookup(ets, type_key)
+      assert [{^member_key, "1.0", 0, _, _, _, _}] = :ets.lookup(ets, member_key)
+    end
+
+    test "ZINCRBY fails closed when a plain string expiry is ambiguous", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "ambiguous_string_to_zset"
+      type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+      member_key = Ferricstore.Store.CompoundKey.zset_member(redis_key, "member")
+      entry = {redis_key, "old", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 3}
+      :ets.insert(ets, entry)
+
+      wrapped =
+        {{:zincrby, redis_key, 1.0, "member"}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, redis_key) == [entry]
+      assert :ets.lookup(ets, type_key) == []
+      assert :ets.lookup(ets, member_key) == []
+    end
+
+    test "direct RMW returns a storage error for malformed expiry metadata", %{
+      state: state,
+      ets: ets
+    } do
+      key = "malformed_direct_expiry"
+      entry = {key, "value", :invalid, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, entry)
+
+      wrapped = {{:getdel, key}, stamp_metadata(HLC.now())}
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result ==
+               {:error, {:state_read_failed, {:invalid_keydir_entry, key, entry}}}
+
+      assert :ets.lookup(ets, key) == [entry]
+    end
+
+    test "transaction reads return a storage error for malformed expiry metadata", %{
+      state: state,
+      ets: ets
+    } do
+      key = "malformed_transaction_expiry"
+      entry = {key, "value", :invalid, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, entry)
+
+      {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("PTTL", [key])
+      {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+      wrapped = {{:tx_execute, [execution_entry], nil}, stamp_metadata(HLC.now())}
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result ==
+               {:error, {:state_read_failed, {:invalid_keydir_entry, key, entry}}}
+
+      assert :ets.lookup(ets, key) == [entry]
+    end
+
+    test "transaction scans return a storage error for malformed expiry metadata", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "malformed_scan_expiry"
+      type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+      field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
+      field_entry = {field_key, "value", :invalid, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+      :ets.insert(ets, field_entry)
+
+      {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("HGETALL", [redis_key])
+      {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+      wrapped = {{:tx_execute, [execution_entry], nil}, stamp_metadata(HLC.now())}
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result ==
+               {:error, {:state_read_failed, {:invalid_keydir_entry, field_key, field_entry}}}
+
+      assert :ets.lookup(ets, field_key) == [field_entry]
+    end
+
+    test "transaction counts return a storage error for malformed expiry metadata", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "malformed_count_expiry"
+      type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+      field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
+      field_entry = {field_key, "value", :invalid, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+      :ets.insert(ets, field_entry)
+
+      {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("HLEN", [redis_key])
+      {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+      wrapped = {{:tx_execute, [execution_entry], nil}, stamp_metadata(HLC.now())}
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result ==
+               {:error, {:state_read_failed, {:invalid_keydir_entry, field_key, field_entry}}}
+
+      assert :ets.lookup(ets, field_key) == [field_entry]
+    end
+
     test "unwraps and processes an append command with hlc_ts metadata", %{
       state: state
     } do
