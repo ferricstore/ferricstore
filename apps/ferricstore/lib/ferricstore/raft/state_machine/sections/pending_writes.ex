@@ -654,21 +654,49 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         }
       end
 
-      defp append_pending_batch(file_path, batch) do
-        has_delete? = pending_batch_has_delete?(batch)
+      if Mix.env() == :test do
+        defp append_pending_batch(file_path, batch) do
+          case pending_append_test_hook(file_path, batch) do
+            :passthrough ->
+              append_pending_batch_by_mode(file_path, batch, pending_batch_has_delete?(batch))
 
-        if standalone_staged_apply?() do
-          append_pending_batch_sync(file_path, batch, has_delete?)
-        else
-          append_pending_batch_nosync(file_path, batch, has_delete?)
+            result ->
+              result
+          end
         end
-      end
 
-      defp append_pending_batch(file_path, batch, has_delete?) do
-        if standalone_staged_apply?() do
-          append_pending_batch_sync(file_path, batch, has_delete?)
-        else
-          append_pending_batch_nosync(file_path, batch, has_delete?)
+        defp append_pending_batch(file_path, batch, has_delete?) do
+          case pending_append_test_hook(file_path, batch) do
+            :passthrough -> append_pending_batch_by_mode(file_path, batch, has_delete?)
+            result -> result
+          end
+        end
+
+        defp pending_append_test_hook(file_path, batch) do
+          case Application.get_env(:ferricstore, :pending_append_hook) do
+            hook when is_function(hook, 2) -> hook.(file_path, batch)
+            _missing -> :passthrough
+          end
+        end
+
+        defp append_pending_batch_by_mode(file_path, batch, has_delete?) do
+          if standalone_staged_apply?(),
+            do: append_pending_batch_sync(file_path, batch, has_delete?),
+            else: append_pending_batch_nosync(file_path, batch, has_delete?)
+        end
+      else
+        defp append_pending_batch(file_path, batch) do
+          has_delete? = pending_batch_has_delete?(batch)
+
+          if standalone_staged_apply?(),
+            do: append_pending_batch_sync(file_path, batch, has_delete?),
+            else: append_pending_batch_nosync(file_path, batch, has_delete?)
+        end
+
+        defp append_pending_batch(file_path, batch, has_delete?) do
+          if standalone_staged_apply?(),
+            do: append_pending_batch_sync(file_path, batch, has_delete?),
+            else: append_pending_batch_nosync(file_path, batch, has_delete?)
         end
       end
 

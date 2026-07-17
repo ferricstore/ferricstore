@@ -405,6 +405,83 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           assert "committed" == Router.get(ctx, same_shard_key)
         end
 
+        @tag :promotion_string_overwrite_rollback
+        test "failed string overwrite preserves promoted hash storage" do
+          store = real_store()
+          key = ukey("failed_string_overwrite_promoted")
+          populate_hash(store, key, @test_threshold + 1)
+          assert_promoted(key)
+          {state_machine, ctx, _shard} = state_machine_for_promoted_key(key)
+
+          previous_hook = Application.get_env(:ferricstore, :pending_append_hook)
+
+          Application.put_env(:ferricstore, :pending_append_hook, fn _path, batch ->
+            if Enum.any?(batch, fn
+                 {:put, ^key, "replacement", 0} -> true
+                 _entry -> false
+               end) do
+              {:error, :enospc}
+            else
+              :passthrough
+            end
+          end)
+
+          on_exit(fn ->
+            if previous_hook do
+              Application.put_env(:ferricstore, :pending_append_hook, previous_hook)
+            else
+              Application.delete_env(:ferricstore, :pending_append_hook)
+            end
+          end)
+
+          assert {_state, {:error, {:bitcask_append_failed, :enospc}}} =
+                   Ferricstore.Raft.StateMachine.apply_standalone_command(
+                     {:put, key, "replacement", 0},
+                     state_machine
+                   )
+
+          Application.put_env(
+            :ferricstore,
+            :pending_append_hook,
+            fn _path, _batch -> :passthrough end
+          )
+
+          assert_promoted(key)
+          assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
+          assert @test_threshold + 1 == Hash.handle("HLEN", [key], store)
+          assert {:simple, "hash"} == Strings.handle("TYPE", [key], store)
+          assert nil == Router.get(ctx, key)
+        end
+
+        @tag :promotion_string_overwrite_commit
+        test "committed string overwrite removes promoted hash storage" do
+          store = real_store()
+          key = ukey("committed_string_overwrite_promoted")
+          populate_hash(store, key, @test_threshold + 1)
+          assert_promoted(key)
+          {state_machine, ctx, shard} = state_machine_for_promoted_key(key)
+          {_shard_state, promoted_instance} = promoted_state(shard, key)
+          dedicated_path = promoted_instance.path
+
+          assert {_state, :ok} =
+                   Ferricstore.Raft.StateMachine.apply_standalone_command(
+                     {:put, key, "replacement", 0},
+                     state_machine
+                   )
+
+          ShardHelpers.eventually(
+            fn -> not promoted?(key) end,
+            "promoted instance was not removed after committed string overwrite"
+          )
+
+          refute File.exists?(dedicated_path)
+          assert "replacement" == Router.get(ctx, key)
+          assert {:simple, "string"} == Strings.handle("TYPE", [key], store)
+
+          assert {:error, "WRONGTYPE" <> _rest} =
+                   Hash.handle("HGET", [key, "field_1"], store)
+        end
+
         @tag :promotion_tx_watch_support
         test "WATCH accepts an unchanged promoted hash and aborts after a field mutation" do
           store = real_store()

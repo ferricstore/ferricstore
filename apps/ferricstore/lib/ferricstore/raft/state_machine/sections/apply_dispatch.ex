@@ -115,7 +115,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           result =
             case check_fetch_or_compute_lock(state, redis_key, nil) do
               :ok ->
-                with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
+                apply_put_with_atomic_storage(state, key, value, expire_at_ms)
 
               {:error, _reason} = error ->
                 error
@@ -125,6 +125,48 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           new_state = %{state | applied_count: old_count + 1}
           maybe_release_cursor(meta, old_count, new_state, result)
         end)
+      end
+
+      defp apply_put_with_atomic_storage(state, key, value, expire_at_ms) do
+        if promoted_string_replacement?(state, key) do
+          apply_promoted_string_replacement(state, key, value, expire_at_ms)
+        else
+          with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
+        end
+      end
+
+      defp promoted_string_replacement?(state, key) do
+        not CompoundKey.internal_key?(key) and
+          Map.has_key?(Map.get(state, :promoted_instances, %{}), key)
+      end
+
+      defp apply_promoted_string_replacement(state, key, value, expire_at_ms) do
+        result =
+          with_cross_shard_pending_writes(state, fn ->
+            state
+            |> build_local_raft_tx_store()
+            |> then(
+              &Ferricstore.Commands.Strings.replace_string_key(
+                key,
+                value,
+                expire_at_ms,
+                &1
+              )
+            )
+          end)
+
+        case result do
+          {command_result, flushed_state} ->
+            apply_state_put(:pending_state, flushed_state)
+            command_result
+
+          {:error, reason, partial_state} ->
+            apply_state_put(:pending_state, partial_state)
+            {:error, reason}
+
+          command_result ->
+            command_result
+        end
       end
 
       def apply(meta, {:flow_policy_put, key, value, expire_at_ms}, state) do

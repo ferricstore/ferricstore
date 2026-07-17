@@ -148,6 +148,42 @@ defmodule Ferricstore.Store.Shard.Info do
         {:noreply, %{state | promoted_instances: Map.delete(state.promoted_instances, redis_key)}}
       end
 
+      def handle_info(
+            {:cleanup_promoted_after_commit, redis_key, type, dedicated_path},
+            state
+          )
+          when type in [:hash, :set, :zset] and is_binary(dedicated_path) do
+        try do
+          :ok =
+            Promotion.cleanup_promoted!(
+              redis_key,
+              type,
+              dedicated_path,
+              state.shard_data_path,
+              state.ets,
+              state.data_dir,
+              state.index,
+              state.instance_ctx
+            )
+
+          state =
+            state
+            |> cancel_promoted_compaction_retry(redis_key)
+            |> Map.update!(:promoted_compaction_pending, &MapSet.delete(&1, redis_key))
+
+          {:noreply,
+           %{state | promoted_instances: Map.delete(state.promoted_instances, redis_key)}}
+        rescue
+          error ->
+            Logger.error(
+              "Shard #{state.index}: post-commit promoted cleanup failed for " <>
+                "#{inspect(redis_key)}: #{Exception.format(:error, error, __STACKTRACE__)}"
+            )
+
+            {:stop, {:post_commit_promoted_cleanup_failed, redis_key}, state}
+        end
+      end
+
       def handle_info({:promoted_maintenance_after_commit, redis_key, maintenance}, state) do
         state = ShardCompound.apply_promoted_maintenance(state, redis_key, maintenance)
         {:noreply, ShardCompound.bump_promoted_writes(state, redis_key)}

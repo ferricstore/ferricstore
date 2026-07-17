@@ -1704,6 +1704,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           :ok
         end
 
+        stage_promoted_collection_removal = fn
+          ctx, redis_key, collection_type, dedicated_path
+          when collection_type in ["hash", "set", "zset"] ->
+            marker_key = Promotion.marker_key(redis_key)
+
+            type =
+              case collection_type do
+                "hash" -> :hash
+                "set" -> :set
+                "zset" -> :zset
+              end
+
+            with :ok <- delete_in_ctx.(ctx, marker_key) do
+              queue_compound_promotion_removal_after_flush(marker_key)
+              queue_promoted_storage_cleanup_after_flush(redis_key, type, dedicated_path)
+            end
+
+          _ctx, _redis_key, _collection_type, _dedicated_path ->
+            {:error, :invalid_promoted_type_marker}
+        end
+
         %{
           get: local_get,
           cache_scope: cache_scope,
@@ -1791,7 +1812,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
                 end
 
               dedicated_path ->
-                promoted_delete.(redis_key, compound_key, dedicated_path)
+                collection_type =
+                  if compound_key == CompoundKey.type_key(redis_key) do
+                    cross_shard_compound_read(ctx, redis_key, compound_key)
+                  end
+
+                with :ok <- promoted_delete.(redis_key, compound_key, dedicated_path) do
+                  if is_nil(collection_type) do
+                    :ok
+                  else
+                    stage_promoted_collection_removal.(
+                      ctx,
+                      redis_key,
+                      collection_type,
+                      dedicated_path
+                    )
+                  end
+                end
             end
           end,
           compound_batch_delete: fn redis_key, compound_keys ->
@@ -1922,6 +1959,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         end
       else
         defp cross_shard_transaction_hook(_event), do: :ok
+      end
+
+      defp queue_promoted_storage_cleanup_after_flush(redis_key, type, dedicated_path)
+           when is_binary(redis_key) and type in [:hash, :set, :zset] and
+                  is_binary(dedicated_path) do
+        pending = Process.get(:sm_pending_promoted_storage_cleanups, %{})
+
+        Process.put(
+          :sm_pending_promoted_storage_cleanups,
+          Map.put(pending, redis_key, {type, dedicated_path})
+        )
+
+        :ok
       end
     end
   end

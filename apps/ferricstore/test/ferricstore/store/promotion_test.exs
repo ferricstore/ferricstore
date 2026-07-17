@@ -187,6 +187,36 @@ defmodule Ferricstore.Store.PromotionTest do
     )
   end
 
+  defp state_machine_for_promoted_key(redis_key) do
+    ctx = FerricStore.Instance.get(:default)
+    idx = Router.shard_for(ctx, redis_key)
+    shard = Router.shard_name(ctx, idx)
+    shard_state = :sys.get_state(shard)
+
+    state_machine =
+      Ferricstore.Raft.StateMachine.init(%{
+        shard_index: idx,
+        data_dir: shard_state.data_dir,
+        shard_data_path: shard_state.shard_data_path,
+        active_file_id: shard_state.active_file_id,
+        active_file_path: shard_state.active_file_path,
+        active_file_size: shard_state.active_file_size,
+        file_stats: shard_state.file_stats,
+        ets: shard_state.ets,
+        instance_ctx: ctx,
+        instance_name: ctx.name,
+        promoted_instances: shard_state.promoted_instances,
+        apply_context: shard_state.apply_context,
+        compound_member_index_name: shard_state.compound_member_index,
+        zset_score_index_name: shard_state.zset_score_index,
+        zset_score_lookup_name: shard_state.zset_score_lookup,
+        logical_key_index_name: shard_state.logical_key_index,
+        logical_key_slots_name: shard_state.logical_key_slots
+      })
+
+    {state_machine, ctx, shard}
+  end
+
   # ---------------------------------------------------------------------------
   # Small hash stays in shared Bitcask (under threshold)
   # ---------------------------------------------------------------------------

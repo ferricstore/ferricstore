@@ -428,14 +428,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       defp dispatch_pending_compound_promotions(state) do
         case promotion_shard_pid(state) do
           pid when is_pid(pid) ->
+            cleanups = Process.get(:sm_pending_promoted_storage_cleanups, %{})
+
             Process.get(:sm_pending_promoted_maintenance, %{})
             |> Enum.each(fn {redis_key, maintenance} ->
               send(pid, {:promoted_maintenance_after_commit, redis_key, maintenance})
             end)
 
             Process.get(:sm_pending_compound_promotion_removals, MapSet.new())
+            |> Enum.reject(&Map.has_key?(cleanups, &1))
             |> Enum.each(fn redis_key ->
               send(pid, {:remove_promoted_after_commit, redis_key})
+            end)
+
+            Enum.each(cleanups, fn {redis_key, {type, dedicated_path}} ->
+              send(
+                pid,
+                {:cleanup_promoted_after_commit, redis_key, type, dedicated_path}
+              )
             end)
 
             Process.get(:sm_pending_compound_promotions, %{})
