@@ -285,8 +285,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         disk_entries = Enum.map(prepared_entries, &compound_blob_disk_entry/1)
         maintenance = promoted_batch_put_maintenance(state, disk_entries)
 
-        case NIF.v2_append_batch(active, disk_entries) do
-          {:ok, locations} when length(locations) == length(prepared_entries) ->
+        case validate_promoted_append_locations(
+               append_promoted_batch(active, disk_entries),
+               length(prepared_entries)
+             ) do
+          {:ok, locations} ->
             prepared_entries
             |> Enum.zip(locations)
             |> Enum.each(fn
@@ -324,9 +327,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             )
 
             :ok
-
-          {:ok, locations} ->
-            {:error, {:batch_result_mismatch, length(prepared_entries), locations}}
 
           {:error, _reason} = error ->
             error

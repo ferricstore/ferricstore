@@ -1,6 +1,13 @@
 defmodule Ferricstore.Store.AppendResult do
   @moduledoc false
 
+  @spec validate_location(term()) :: :ok | {:error, term()}
+  def validate_location({offset, record_size})
+      when is_integer(offset) and offset >= 0 and is_integer(record_size) and record_size >= 0,
+      do: :ok
+
+  def validate_location(location), do: {:error, {:invalid_location, 0, location}}
+
   @spec validate_locations(term(), non_neg_integer()) :: :ok | {:error, term()}
   def validate_locations(locations, expected_count)
       when is_list(locations) and is_integer(expected_count) and expected_count >= 0 do

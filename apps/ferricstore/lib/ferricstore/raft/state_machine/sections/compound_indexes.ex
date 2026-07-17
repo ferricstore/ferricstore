@@ -50,8 +50,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         active = Promotion.find_active(dedicated_path)
         maintenance = promoted_delete_maintenance(state, compound_key)
 
-        case NIF.v2_append_tombstone(active, compound_key) do
-          {:ok, _offset} ->
+        case validate_promoted_append_location(append_promoted_tombstone(active, compound_key)) do
+          {:ok, _location} ->
             track_keydir_binary_remove(state, compound_key)
             :ets.delete(state.ets, compound_key)
 

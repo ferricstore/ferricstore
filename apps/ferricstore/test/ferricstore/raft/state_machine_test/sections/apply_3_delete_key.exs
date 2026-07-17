@@ -487,6 +487,15 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
       end
 
       describe "pending batch location validation" do
+        @tag :append_result_validation
+        test "rejects a non-list native append result" do
+          assert {:error, {:bitcask_append_result_mismatch, {:invalid_locations, :bad_reply}}} =
+                   StateMachine.__validate_pending_locations__(
+                     [{:put, "k1", "v1", 0}],
+                     :bad_reply
+                   )
+        end
+
         test "rejects a result count that does not match the batch" do
           batch = [
             {:put, "k1", "v1", 0},
@@ -540,6 +549,31 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           ]
 
           assert :ok = StateMachine.__validate_pending_locations__(batch, locations)
+        end
+
+        @tag :append_result_validation
+        test "malformed successful append results fail apply without publishing", %{
+          state: state,
+          ets: ets
+        } do
+          key = "malformed-pending-append"
+          previous_hook = Application.get_env(:ferricstore, :pending_append_hook)
+
+          Application.put_env(:ferricstore, :pending_append_hook, fn _path, _batch ->
+            {:ok, :bad_reply}
+          end)
+
+          try do
+            assert {_state,
+                    {:error,
+                     {:bitcask_append_failed,
+                      {:bitcask_append_result_mismatch, {:invalid_locations, :bad_reply}}}}} =
+                     StateMachine.apply(%{}, {:put_batch, [{key, "value", 0}]}, state)
+
+            assert [] == :ets.lookup(ets, key)
+          after
+            restore_env(:pending_append_hook, previous_hook)
+          end
         end
       end
 

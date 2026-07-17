@@ -738,6 +738,58 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3SetKeyValueExpireAtMs
           assert [] == :ets.lookup(ets, new_field)
         end
 
+        @tag :append_result_validation
+        test "malformed promoted blob batch locations cannot publish a valid prefix", %{
+          state: state,
+          ets: ets,
+          shard_index: shard_index
+        } do
+          redis_key = "promoted_blob_malformed_append"
+          marker = Promotion.marker_key(redis_key)
+          existing = CompoundKey.hash_field(redis_key, "existing")
+          new_field = CompoundKey.hash_field(redis_key, "new")
+
+          dedicated_path =
+            Promotion.dedicated_path(state.data_dir, shard_index, :hash, redis_key)
+
+          File.mkdir_p!(dedicated_path)
+          File.touch!(Path.join(dedicated_path, "00000.log"))
+          :ets.insert(ets, {marker, "hash", 0, LFU.initial(), 0, 0, 4})
+          :ets.insert(ets, {existing, "old", 0, LFU.initial(), 0, 1, 3})
+          original = :ets.lookup(ets, existing)
+
+          assert {:ok, ref} = BlobStore.put(state.data_dir, shard_index, "new-value")
+
+          promoted_state = %{
+            state
+            | promoted_instances: %{redis_key => %{path: dedicated_path}}
+          }
+
+          Process.put(:ferricstore_promoted_append_hook, fn
+            :batch, _path, _payload -> {:ok, [{0, BlobRef.encoded_size()}, :bad_location]}
+          end)
+
+          try do
+            assert {_state,
+                    {:error,
+                     {:bitcask_append_result_mismatch, {:invalid_location, 1, :bad_location}}}} =
+                     StateMachine.apply(
+                       %{},
+                       {:compound_blob_batch_put, redis_key,
+                        [
+                          {existing, BlobRef.encode!(ref), 0, :blob_ref},
+                          {new_field, "new", 0, :value}
+                        ]},
+                       promoted_state
+                     )
+
+            assert original == :ets.lookup(ets, existing)
+            assert [] == :ets.lookup(ets, new_field)
+          after
+            Process.delete(:ferricstore_promoted_append_hook)
+          end
+        end
+
         test "compound blob batch put preserves old values when ref validation fails", %{
           state: state,
           ets: ets

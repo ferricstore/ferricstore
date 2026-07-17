@@ -26,6 +26,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       alias Ferricstore.HLC
 
       alias Ferricstore.Store.{
+        AppendResult,
         BitcaskWriter,
         BlobRef,
         BlobStore,
@@ -1123,8 +1124,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
         maintenance = promoted_batch_put_maintenance(state, disk_entries)
 
-        case NIF.v2_append_batch(active, disk_entries) do
-          {:ok, locations} when length(locations) == length(entries) ->
+        case validate_promoted_append_locations(
+               append_promoted_batch(active, disk_entries),
+               length(entries)
+             ) do
+          {:ok, locations} ->
             entries
             |> Enum.zip(disk_entries)
             |> Enum.zip(locations)
@@ -1158,9 +1162,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             )
 
             :ok
-
-          {:ok, locations} ->
-            {:error, {:batch_result_mismatch, length(entries), locations}}
 
           {:error, _reason} = error ->
             error
@@ -1417,7 +1418,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         fid = parse_fid_from_path(active)
         maintenance = promoted_put_maintenance(state, compound_key, disk_val)
 
-        case NIF.v2_append_record(active, compound_key, disk_val, expire_at_ms) do
+        case validate_promoted_append_location(
+               append_promoted_record(active, compound_key, disk_val, expire_at_ms)
+             ) do
           {:ok, {offset, _record_size}} ->
             value_size = byte_size(disk_val)
 
@@ -1448,6 +1451,73 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           {:error, _reason} = err ->
             err
         end
+      end
+
+      defp validate_promoted_append_location({:ok, location}) do
+        case AppendResult.validate_location(location) do
+          :ok -> {:ok, location}
+          {:error, reason} -> {:error, {:bitcask_append_result_mismatch, reason}}
+        end
+      end
+
+      defp validate_promoted_append_location({:error, reason}),
+        do: {:error, {:bitcask_append_failed, reason}}
+
+      defp validate_promoted_append_location(other) do
+        {:error, {:bitcask_append_result_mismatch, {:unexpected_result, other}}}
+      end
+
+      defp validate_promoted_append_locations({:ok, locations}, expected_count) do
+        case AppendResult.validate_locations(locations, expected_count) do
+          :ok -> {:ok, locations}
+          {:error, reason} -> {:error, {:bitcask_append_result_mismatch, reason}}
+        end
+      end
+
+      defp validate_promoted_append_locations({:error, reason}, _expected_count),
+        do: {:error, {:bitcask_append_failed, reason}}
+
+      defp validate_promoted_append_locations(other, _expected_count) do
+        {:error, {:bitcask_append_result_mismatch, {:unexpected_result, other}}}
+      end
+
+      if Mix.env() == :test do
+        defp append_promoted_record(path, key, value, expire_at_ms) do
+          case promoted_append_test_hook(:record, path, {key, value, expire_at_ms}) do
+            :passthrough -> NIF.v2_append_record(path, key, value, expire_at_ms)
+            result -> result
+          end
+        end
+
+        defp append_promoted_tombstone(path, key) do
+          case promoted_append_test_hook(:tombstone, path, key) do
+            :passthrough -> NIF.v2_append_tombstone(path, key)
+            result -> result
+          end
+        end
+
+        defp append_promoted_batch(path, entries) do
+          case promoted_append_test_hook(:batch, path, entries) do
+            :passthrough -> NIF.v2_append_batch(path, entries)
+            result -> result
+          end
+        end
+
+        defp promoted_append_test_hook(operation, path, payload) do
+          case Process.get(:ferricstore_promoted_append_hook) do
+            hook when is_function(hook, 3) -> hook.(operation, path, payload)
+            _missing -> :passthrough
+          end
+        end
+      else
+        defp append_promoted_record(path, key, value, expire_at_ms),
+          do: NIF.v2_append_record(path, key, value, expire_at_ms)
+
+        defp append_promoted_tombstone(path, key),
+          do: NIF.v2_append_tombstone(path, key)
+
+        defp append_promoted_batch(path, entries),
+          do: NIF.v2_append_batch(path, entries)
       end
     end
   end

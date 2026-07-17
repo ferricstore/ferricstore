@@ -3,6 +3,16 @@ defmodule Ferricstore.Store.AppendResultTest do
 
   alias Ferricstore.Store.AppendResult
 
+  test "validates one append location without a vector allocation" do
+    assert :ok = AppendResult.validate_location({0, 12})
+
+    assert {:error, {:invalid_location, 0, {-1, 12}}} =
+             AppendResult.validate_location({-1, 12})
+
+    assert {:error, {:invalid_location, 0, :bad_reply}} =
+             AppendResult.validate_location(:bad_reply)
+  end
+
   test "validates exact append location vectors without accepting a prefix" do
     assert :ok = AppendResult.validate_locations([{0, 12}, {12, 14}], 2)
 

@@ -204,6 +204,113 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.PromotedSingleMutationDurab
         assert_promoted_tombstone(log_path, old_member)
       end
 
+      @tag :promoted_single_mutation_durability
+      @tag :append_result_validation
+      test "malformed promoted put locations do not publish keydir state", %{
+        state: state,
+        ets: ets,
+        shard_index: shard_index
+      } do
+        redis_key = "promoted-malformed-single-put"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, shard_index, redis_key, :hash, [
+            {field_key, "old", 0}
+          ])
+
+        original = :ets.lookup(ets, field_key)
+
+        Process.put(:ferricstore_promoted_append_hook, fn
+          :record, _path, _payload -> {:ok, {-1, :bad_record_size}}
+        end)
+
+        try do
+          assert {_state,
+                  {:error,
+                   {:bitcask_append_result_mismatch,
+                    {:invalid_location, 0, {-1, :bad_record_size}}}}} =
+                   StateMachine.apply(%{}, {:compound_put, field_key, "new", 0}, state)
+
+          assert original == :ets.lookup(ets, field_key)
+        after
+          Process.delete(:ferricstore_promoted_append_hook)
+        end
+      end
+
+      @tag :promoted_single_mutation_durability
+      @tag :append_result_validation
+      test "malformed promoted tombstone locations do not delete keydir state", %{
+        state: state,
+        ets: ets,
+        shard_index: shard_index
+      } do
+        redis_key = "promoted-malformed-single-delete"
+        field_key = CompoundKey.hash_field(redis_key, "field")
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, shard_index, redis_key, :hash, [
+            {field_key, "old", 0}
+          ])
+
+        original = :ets.lookup(ets, field_key)
+
+        Process.put(:ferricstore_promoted_append_hook, fn
+          :tombstone, _path, _payload -> {:ok, :bad_location}
+        end)
+
+        try do
+          assert {_state,
+                  {:error,
+                   {:bitcask_append_result_mismatch, {:invalid_location, 0, :bad_location}}}} =
+                   StateMachine.apply(%{}, {:compound_delete, field_key}, state)
+
+          assert original == :ets.lookup(ets, field_key)
+        after
+          Process.delete(:ferricstore_promoted_append_hook)
+        end
+      end
+
+      @tag :promoted_single_mutation_durability
+      @tag :append_result_validation
+      test "malformed promoted batch locations cannot publish a valid prefix", %{
+        state: state,
+        ets: ets,
+        shard_index: shard_index
+      } do
+        redis_key = "promoted-malformed-batch"
+        existing = CompoundKey.hash_field(redis_key, "existing")
+        new_field = CompoundKey.hash_field(redis_key, "new")
+
+        {state, _log_path} =
+          promoted_single_fixture(state, ets, shard_index, redis_key, :hash, [
+            {existing, "old", 0}
+          ])
+
+        original = :ets.lookup(ets, existing)
+
+        Process.put(:ferricstore_promoted_append_hook, fn
+          :batch, _path, _payload -> {:ok, [{0, 3}, :bad_location]}
+        end)
+
+        try do
+          assert {_state,
+                  {:error,
+                   {:bitcask_append_result_mismatch, {:invalid_location, 1, :bad_location}}}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_batch_put, redis_key,
+                      [{existing, "new", 0}, {new_field, "new", 0}]},
+                     state
+                   )
+
+          assert original == :ets.lookup(ets, existing)
+          assert [] == :ets.lookup(ets, new_field)
+        after
+          Process.delete(:ferricstore_promoted_append_hook)
+        end
+      end
+
       defp promoted_single_fixture(state, ets, shard_index, redis_key, type, entries) do
         dedicated_path = Promotion.dedicated_path(state.data_dir, shard_index, type, redis_key)
         log_path = Path.join(dedicated_path, "00000.log")

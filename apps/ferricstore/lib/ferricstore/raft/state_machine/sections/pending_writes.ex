@@ -26,6 +26,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       alias Ferricstore.HLC
 
       alias Ferricstore.Store.{
+        AppendResult,
         BitcaskWriter,
         BlobRef,
         BlobStore,
@@ -832,15 +833,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
 
           case NIF.v2_append_batch(file_path, puts) do
             {:ok, locations} ->
-              tagged_locations =
-                Enum.map(locations, fn {offset, value_size} ->
-                  {:put, offset, value_size}
-                end)
-
-              {:ok, tagged_locations}
+              tag_put_append_locations(locations, length(puts))
 
             {:error, _reason} = error ->
               error
+
+            other ->
+              {:error, {:bitcask_append_result_mismatch, {:unexpected_result, other}}}
           end
         end
       end
@@ -864,16 +863,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
 
           case NIF.v2_append_batch_nosync(file_path, puts) do
             {:ok, locations} ->
-              tagged_locations =
-                Enum.map(locations, fn {offset, value_size} ->
-                  {:put, offset, value_size}
-                end)
-
-              {:ok, tagged_locations}
+              tag_put_append_locations(locations, length(puts))
 
             {:error, _reason} = error ->
               error
+
+            other ->
+              {:error, {:bitcask_append_result_mismatch, {:unexpected_result, other}}}
           end
+        end
+      end
+
+      defp tag_put_append_locations(locations, expected_count) do
+        case AppendResult.validate_locations(locations, expected_count) do
+          :ok ->
+            {:ok,
+             Enum.map(locations, fn {offset, value_size} ->
+               {:put, offset, value_size}
+             end)}
+
+          {:error, reason} ->
+            {:error, {:bitcask_append_result_mismatch, reason}}
         end
       end
 
@@ -901,10 +911,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
         end
       end
 
-      defp validate_append_result(_batch, append_result), do: append_result
+      defp validate_append_result(_batch, {:error, _reason} = error), do: error
 
-      defp validate_pending_locations(batch, locations) do
+      defp validate_append_result(_batch, append_result) do
+        {:error, {:bitcask_append_result_mismatch, {:unexpected_result, append_result}}}
+      end
+
+      defp validate_pending_locations(batch, locations)
+           when is_list(batch) and is_list(locations) do
         validate_pending_locations(batch, locations, 0)
+      end
+
+      defp validate_pending_locations(_batch, locations) do
+        {:error, {:bitcask_append_result_mismatch, {:invalid_locations, locations}}}
       end
 
       defp validate_pending_locations([], [], _index), do: :ok
