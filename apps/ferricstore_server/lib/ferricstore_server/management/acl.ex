@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Management.ACL do
   alias Ferricstore.TermCodec
   alias FerricstoreServer.Acl
   alias FerricstoreServer.Acl.CatalogProjector
+  alias FerricstoreServer.Connection.Auth, as: ConnectionAuth
 
   @catalog_value_tag :ferricstore_acl_user
   @max_catalog_value_bytes 1_048_576
@@ -453,7 +454,7 @@ defmodule FerricstoreServer.Management.ACL do
   end
 
   defp replace_catalog_users(store, desired, max_users, attempts) do
-    with {:ok, before_revision, _before_version} <- catalog_revision(store),
+    with {:ok, before_revision, before_version} <- catalog_revision(store),
          {:ok, entries} <- catalog_entries(store),
          {:ok, after_revision, _after_version} <- catalog_revision(store) do
       if before_revision == after_revision do
@@ -473,8 +474,10 @@ defmodule FerricstoreServer.Management.ACL do
                      map_size(desired),
                      max_users
                    ) do
-                {:ok, _revision} ->
-                  reconcile_catalog(store)
+                {:ok, revision} ->
+                  with :ok <- notify_catalog_replacement(before_version, revision) do
+                    reconcile_catalog(store)
+                  end
 
                 {:error, :stale_server_catalog_revision} when attempts > 1 ->
                   replace_catalog_users(store, desired, max_users, attempts - 1)
@@ -546,7 +549,10 @@ defmodule FerricstoreServer.Management.ACL do
              max_users
            ) do
         {:ok, encoded} ->
-          project_set_user(store, username, encoded, expected_revision)
+          with :ok <-
+                 notify_catalog_entry_change(:upsert, username, expected_revision, encoded) do
+            project_set_user(store, username, encoded, expected_revision)
+          end
 
         {:error, stale}
         when stale in [:stale_server_catalog_entry, :stale_server_catalog_revision] and
@@ -591,7 +597,10 @@ defmodule FerricstoreServer.Management.ACL do
                0
              ) do
           {:ok, encoded} ->
-            project_deleted_user(store, username, encoded, expected_revision)
+            with :ok <-
+                   notify_catalog_entry_change(:delete, username, expected_revision, encoded) do
+              project_deleted_user(store, username, encoded, expected_revision)
+            end
 
           {:error, stale}
           when stale in [:stale_server_catalog_entry, :stale_server_catalog_revision] and
@@ -641,7 +650,7 @@ defmodule FerricstoreServer.Management.ACL do
   end
 
   defp delete_catalog_users(store, usernames, attempts) do
-    with {:ok, before_revision, _before_version} <- catalog_revision(store),
+    with {:ok, before_revision, before_version} <- catalog_revision(store),
          {:ok, entries} <- catalog_entries(store),
          {:ok, after_revision, _after_version} <- catalog_revision(store) do
       if before_revision == after_revision do
@@ -658,8 +667,11 @@ defmodule FerricstoreServer.Management.ACL do
                  next_count,
                  next_count
                ) do
-            {:ok, _revision} ->
-              with :ok <- reconcile_catalog(store), do: {:ok, length(usernames)}
+            {:ok, revision} ->
+              with :ok <- notify_catalog_replacement(before_version, revision),
+                   :ok <- reconcile_catalog(store) do
+                {:ok, length(usernames)}
+              end
 
             {:error, :stale_server_catalog_revision} when attempts > 1 ->
               delete_catalog_users(store, usernames, attempts - 1)
@@ -774,8 +786,8 @@ defmodule FerricstoreServer.Management.ACL do
                  value,
                  max_users
                ) do
-            {:ok, _encoded} ->
-              :ok
+            {:ok, encoded} ->
+              notify_catalog_entry_change(:upsert, "default", expected_revision, encoded)
 
             {:error, stale}
             when stale in [:stale_server_catalog_entry, :stale_server_catalog_revision] and
@@ -829,6 +841,32 @@ defmodule FerricstoreServer.Management.ACL do
         {:error, :invalid_acl_catalog_entry}
     end
   end
+
+  defp notify_catalog_entry_change(kind, username, encoded_previous_revision, encoded)
+       when kind in [:upsert, :delete] and is_binary(username) and is_binary(encoded) do
+    with {:ok, previous_revision} <- decode_catalog_revision(encoded_previous_revision),
+         {:ok, %{version: revision}} <- ServerCatalog.decode_entry(encoded) do
+      ConnectionAuth.broadcast_acl_catalog_change(
+        kind,
+        username,
+        previous_revision,
+        revision
+      )
+    end
+  end
+
+  defp notify_catalog_replacement(previous_revision, encoded_revision)
+       when is_integer(previous_revision) and previous_revision >= -1 and
+              is_binary(encoded_revision) do
+    with {:ok, revision} <- ServerCatalog.decode_revision(encoded_revision) do
+      ConnectionAuth.broadcast_acl_catalog_change(:all, :all, previous_revision, revision)
+    end
+  end
+
+  defp decode_catalog_revision(nil), do: {:ok, -1}
+
+  defp decode_catalog_revision(encoded) when is_binary(encoded),
+    do: ServerCatalog.decode_revision(encoded)
 
   defp await_catalog_projection(revision) when is_integer(revision) and revision >= 0 do
     case Process.whereis(CatalogProjector) do

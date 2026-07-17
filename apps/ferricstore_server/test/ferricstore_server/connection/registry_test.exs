@@ -33,4 +33,30 @@ defmodule FerricstoreServer.Connection.RegistryTest do
 
     refute source =~ ":ets.tab2list"
   end
+
+  test "ACL membership lookup and replacement are indexed by username" do
+    base = System.unique_integer([:positive]) * 10
+    first = spawn(fn -> Process.sleep(:infinity) end)
+    second = spawn(fn -> Process.sleep(:infinity) end)
+
+    on_exit(fn ->
+      Process.exit(first, :kill)
+      Process.exit(second, :kill)
+      Registry.unregister(base + 1, first)
+      Registry.unregister(base + 2, second)
+    end)
+
+    assert :ok = Registry.register(base + 1, first, %{username: "alice"})
+    assert :ok = Registry.register(base + 2, second, %{username: "bob"})
+
+    assert Registry.acl_user_pids("alice") == [first]
+    assert Registry.acl_user_pids("bob") == [second]
+
+    assert :ok = Registry.replace_acl_user(base + 2, second, "bob", "alice")
+    assert MapSet.new(Registry.acl_user_pids("alice")) == MapSet.new([first, second])
+    assert Registry.acl_user_pids("bob") == []
+
+    assert :ok = Registry.unregister(base + 1, first)
+    assert Registry.acl_user_pids("alice") == [second]
+  end
 end

@@ -8,14 +8,21 @@ defmodule FerricstoreServer.Connection.Registry do
   """
 
   @table :ferricstore_server_connections
+  @acl_table :ferricstore_server_connection_acl_memberships
 
   @spec init_table() :: :ok
   def init_table do
-    case :ets.whereis(@table) do
+    ensure_table(@table, :set)
+    ensure_table(@acl_table, :bag)
+    :ok
+  end
+
+  defp ensure_table(table, type) do
+    case :ets.whereis(table) do
       :undefined ->
         try do
-          :ets.new(@table, [
-            :set,
+          :ets.new(table, [
+            type,
             :public,
             :named_table,
             {:read_concurrency, true},
@@ -28,8 +35,6 @@ defmodule FerricstoreServer.Connection.Registry do
       _tid ->
         :ok
     end
-
-    :ok
   end
 
   @type summary :: %{
@@ -46,7 +51,9 @@ defmodule FerricstoreServer.Connection.Registry do
   def register(client_id, pid \\ self(), summary \\ %{})
       when is_integer(client_id) and is_pid(pid) and is_map(summary) do
     init_table()
+    delete_acl_memberships(client_id)
     :ets.insert(@table, {client_id, pid, Map.put(summary, :client_id, client_id)})
+    maybe_add_summary_acl_user(client_id, pid, summary)
     :ok
   end
 
@@ -56,10 +63,12 @@ defmodule FerricstoreServer.Connection.Registry do
     init_table()
 
     case :ets.lookup(@table, client_id) do
-      [{^client_id, ^pid, _old_summary}] ->
+      [{^client_id, ^pid, old_summary}] ->
+        maybe_replace_summary_acl_user(client_id, pid, old_summary, summary)
         :ets.insert(@table, {client_id, pid, Map.put(summary, :client_id, client_id)})
 
       [{^client_id, ^pid}] ->
+        maybe_add_summary_acl_user(client_id, pid, summary)
         :ets.insert(@table, {client_id, pid, Map.put(summary, :client_id, client_id)})
 
       _ ->
@@ -74,12 +83,99 @@ defmodule FerricstoreServer.Connection.Registry do
     init_table()
 
     case :ets.lookup(@table, client_id) do
-      [{^client_id, ^pid, _summary}] -> :ets.delete(@table, client_id)
-      [{^client_id, ^pid}] -> :ets.delete(@table, client_id)
-      _ -> :ok
+      [{^client_id, ^pid, _summary}] ->
+        :ets.delete(@table, client_id)
+        delete_acl_memberships(client_id)
+
+      [{^client_id, ^pid}] ->
+        :ets.delete(@table, client_id)
+        delete_acl_memberships(client_id)
+
+      _ ->
+        :ok
     end
 
     :ok
+  end
+
+  @doc false
+  @spec add_acl_user(pos_integer(), pid(), binary()) :: :ok
+  def add_acl_user(client_id, pid, username)
+      when is_integer(client_id) and is_pid(pid) and is_binary(username) do
+    init_table()
+
+    if registered_connection?(client_id, pid) do
+      :ets.insert(@acl_table, [
+        {{:user, username}, client_id, pid},
+        {{:client, client_id}, username, pid}
+      ])
+    end
+
+    :ok
+  end
+
+  @doc false
+  @spec remove_acl_user(pos_integer(), pid(), binary()) :: :ok
+  def remove_acl_user(client_id, pid, username)
+      when is_integer(client_id) and is_pid(pid) and is_binary(username) do
+    init_table()
+    delete_acl_membership(client_id, pid, username)
+    :ok
+  end
+
+  @doc false
+  @spec replace_acl_user(pos_integer(), pid(), binary(), binary()) :: :ok
+  def replace_acl_user(client_id, pid, previous_username, username)
+      when is_integer(client_id) and is_pid(pid) and is_binary(previous_username) and
+             is_binary(username) do
+    if previous_username == username do
+      add_acl_user(client_id, pid, username)
+    else
+      :ok = add_acl_user(client_id, pid, username)
+      :ok = remove_acl_user(client_id, pid, previous_username)
+    end
+  end
+
+  @doc false
+  @spec acl_user_pids(binary()) :: [pid()]
+  def acl_user_pids(username) when is_binary(username) do
+    init_table()
+
+    @acl_table
+    |> :ets.lookup({:user, username})
+    |> Enum.reduce([], fn
+      {{:user, ^username}, client_id, pid}, pids when is_integer(client_id) and is_pid(pid) ->
+        if registered_connection?(client_id, pid) and Process.alive?(pid) do
+          [pid | pids]
+        else
+          delete_acl_membership(client_id, pid, username)
+          pids
+        end
+
+      _invalid, pids ->
+        pids
+    end)
+  end
+
+  @doc false
+  @spec all_pids() :: [pid()]
+  def all_pids do
+    init_table()
+
+    :ets.foldl(
+      fn
+        {client_id, pid, _summary}, pids when is_integer(client_id) and is_pid(pid) ->
+          collect_live_pid(client_id, pid, pids)
+
+        {client_id, pid}, pids when is_integer(client_id) and is_pid(pid) ->
+          collect_live_pid(client_id, pid, pids)
+
+        _invalid, pids ->
+          pids
+      end,
+      [],
+      @table
+    )
   end
 
   @type snapshot :: %{
@@ -122,7 +218,7 @@ defmodule FerricstoreServer.Connection.Registry do
     if Process.alive?(pid) do
       add_live_summary(client_id, pid, summary, acc, limit, now_ms)
     else
-      :ets.delete(@table, client_id)
+      unregister(client_id, pid)
       acc
     end
   end
@@ -132,7 +228,7 @@ defmodule FerricstoreServer.Connection.Registry do
     if Process.alive?(pid) do
       add_live_summary(client_id, pid, %{}, acc, limit, now_ms)
     else
-      :ets.delete(@table, client_id)
+      unregister(client_id, pid)
       acc
     end
   end
@@ -198,7 +294,7 @@ defmodule FerricstoreServer.Connection.Registry do
         if Process.alive?(pid) do
           {:ok, pid}
         else
-          :ets.delete(@table, client_id)
+          unregister(client_id, pid)
           {:error, :not_found}
         end
 
@@ -206,7 +302,7 @@ defmodule FerricstoreServer.Connection.Registry do
         if Process.alive?(pid) do
           {:ok, pid}
         else
-          :ets.delete(@table, client_id)
+          unregister(client_id, pid)
           {:error, :not_found}
         end
 
@@ -227,6 +323,68 @@ defmodule FerricstoreServer.Connection.Registry do
 
       {:error, :not_found} ->
         {:error, :not_found}
+    end
+  end
+
+  defp maybe_add_summary_acl_user(client_id, pid, %{username: username})
+       when is_binary(username),
+       do: add_acl_user(client_id, pid, username)
+
+  defp maybe_add_summary_acl_user(_client_id, _pid, _summary), do: :ok
+
+  defp maybe_replace_summary_acl_user(client_id, pid, old_summary, new_summary) do
+    previous_username = Map.get(old_summary, :username)
+    username = Map.get(new_summary, :username)
+
+    cond do
+      is_binary(previous_username) and is_binary(username) ->
+        replace_acl_user(client_id, pid, previous_username, username)
+
+      is_binary(username) ->
+        add_acl_user(client_id, pid, username)
+
+      is_binary(previous_username) ->
+        remove_acl_user(client_id, pid, previous_username)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp registered_connection?(client_id, pid) do
+    case :ets.lookup(@table, client_id) do
+      [{^client_id, ^pid, _summary}] -> true
+      [{^client_id, ^pid}] -> true
+      _other -> false
+    end
+  end
+
+  defp delete_acl_memberships(client_id) do
+    @acl_table
+    |> :ets.lookup({:client, client_id})
+    |> Enum.each(fn
+      {{:client, ^client_id}, username, pid} ->
+        delete_acl_membership(client_id, pid, username)
+
+      _invalid ->
+        :ok
+    end)
+
+    :ok
+  end
+
+  defp delete_acl_membership(client_id, pid, username) do
+    :ets.delete_object(@acl_table, {{:user, username}, client_id, pid})
+    :ets.delete_object(@acl_table, {{:client, client_id}, username, pid})
+    :ok
+  end
+
+  defp collect_live_pid(client_id, pid, pids) do
+    if Process.alive?(pid) do
+      [pid | pids]
+    else
+      unregister(client_id, pid)
+      pids
     end
   end
 end

@@ -2808,19 +2808,23 @@ defmodule FerricstoreServer.Native.Commands do
   defp binary_list(values) when is_list(values), do: Enum.filter(values, &is_binary/1)
   defp binary_list(_), do: []
 
-  defp complete_auth(username, state) do
-    AuditLog.log(:auth_success, %{username: username, client_ip: format_peer(state.peer)})
+  defp complete_auth(username, expected_auth_epoch, state)
+       when is_integer(expected_auth_epoch) and expected_auth_epoch >= 0 do
+    case ConnAuth.activate_authenticated_user(state, username, expected_auth_epoch) do
+      {:ok, state} ->
+        AuditLog.log(:auth_success, %{username: username, client_ip: format_peer(state.peer)})
+        ConnRegistry.update(state.client_id, self(), summary(state))
+        {:ok, "OK", state}
 
-    state = %{
-      state
-      | username: username,
-        authenticated: true,
-        require_auth: false,
-        acl_cache: ConnAuth.build_acl_cache(username)
-    }
+      {:error, :acl_changed_during_authentication} ->
+        auth_failure(username, state)
+        {:auth, "WRONGPASS invalid username-password pair or user is disabled.", state}
+    end
+  end
 
-    ConnRegistry.update(state.client_id, self(), summary(state))
-    {:ok, "OK", state}
+  defp complete_auth(username, _invalid_auth_epoch, state) do
+    auth_failure(username, state)
+    {:auth, "WRONGPASS invalid username-password pair or user is disabled.", state}
   end
 
   defp auth_failure(username, state) do
@@ -3689,7 +3693,20 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp do_auth(username, password, state) do
+    :ok = ConnAuth.begin_acl_authentication(state, username)
+    result = do_provisional_auth(username, password, state)
+
+    if match?({:ok, _response, _state}, result) do
+      result
+    else
+      :ok = ConnAuth.cancel_acl_authentication(state, username)
+      result
+    end
+  end
+
+  defp do_provisional_auth(username, password, state) do
     user = FerricstoreServer.Acl.get_user(username)
+    auth_epoch = Map.get(user || %{}, :auth_epoch)
 
     has_acl_password =
       case user do
@@ -3703,10 +3720,10 @@ defmodule FerricstoreServer.Native.Commands do
 
     cond do
       has_acl_password ->
-        acl_auth(username, password, state)
+        acl_auth(username, password, auth_epoch, state)
 
       username == "default" and constant_time_equal?(password, requirepass) ->
-        complete_auth(username, state)
+        complete_auth(username, auth_epoch, state)
 
       username == "default" and has_requirepass ->
         auth_failure(username, state)
@@ -3716,14 +3733,14 @@ defmodule FerricstoreServer.Native.Commands do
         if passwordless_acl_user? do
           auth_without_configured_password(username, password, state)
         else
-          acl_auth(username, password, state)
+          acl_auth(username, password, auth_epoch, state)
         end
 
       passwordless_acl_user? and not has_requirepass ->
         auth_without_configured_password(username, password, state)
 
       true ->
-        acl_auth(username, password, state)
+        acl_auth(username, password, auth_epoch, state)
     end
   end
 
@@ -3736,10 +3753,10 @@ defmodule FerricstoreServer.Native.Commands do
      state}
   end
 
-  defp acl_auth(username, password, state) do
+  defp acl_auth(username, password, auth_epoch, state) do
     case FerricstoreServer.Acl.authenticate(username, password) do
       {:ok, ^username} ->
-        complete_auth(username, state)
+        complete_auth(username, auth_epoch, state)
 
       {:error, reason} ->
         auth_failure(username, state)

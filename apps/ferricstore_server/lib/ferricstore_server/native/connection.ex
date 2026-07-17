@@ -220,93 +220,98 @@ defmodule FerricstoreServer.Native.Connection do
 
       :ok ->
         ctx = FerricStore.Instance.get(:default)
+        client_id = Responses.generate_client_id()
+        :ok = ConnRegistry.register(client_id, self(), %{username: "default"})
 
-        state =
-          %__MODULE__{
-            socket: socket,
-            transport: transport,
-            client_id: Responses.generate_client_id(),
-            client_name: nil,
-            created_at: System.monotonic_time(:millisecond),
-            peer: peer,
-            instance_ctx: ctx,
-            stats_counter: ctx.stats_counter,
-            require_auth: Commands.default_requires_auth?(),
-            acl_cache: FerricstoreServer.Connection.Auth.build_acl_cache("default"),
-            max_frame_bytes: max_frame_bytes,
-            resource_budget: Map.get(opts, :resource_budget, ResourceBudget),
-            preauth_max_frame_bytes: preauth_max_frame_bytes,
-            frame_assembly_timeout_ms: frame_assembly_timeout_ms,
-            multi_queue_byte_limit: min(max_frame_bytes * 2, 32 * 1024 * 1024),
-            watch_key_byte_limit: min(max_frame_bytes, 16 * 1024 * 1024),
-            max_pubsub_subscription_bytes:
-              positive_timeout!(
-                Map.get(opts, :max_pubsub_subscription_bytes) ||
-                  Application.get_env(
-                    :ferricstore,
-                    :native_max_pubsub_subscription_bytes_per_connection,
-                    16 * 1024 * 1024
-                  ),
-                :native_max_pubsub_subscription_bytes_per_connection
-              ),
-            max_lanes:
-              Map.get(opts, :max_lanes) ||
-                Application.get_env(:ferricstore, :native_max_lanes_per_connection, 1024),
-            lane_max_queue:
-              Map.get(opts, :lane_max_queue) ||
-                Application.get_env(:ferricstore, :native_lane_max_queue, 1024),
-            max_inflight_per_connection:
-              Application.get_env(:ferricstore, :native_max_inflight_per_connection, 4096),
-            max_inflight_per_lane:
-              Application.get_env(:ferricstore, :native_max_inflight_per_lane, 1024),
-            max_queued_request_bytes_per_connection:
-              positive_timeout!(
-                Map.get(opts, :max_queued_request_bytes_per_connection) ||
-                  Application.get_env(
-                    :ferricstore,
-                    :native_max_queued_request_bytes_per_connection,
-                    max(FrameBuffer.frame_bytes(max_frame_bytes), 64 * 1024 * 1024)
-                  ),
-                :native_max_queued_request_bytes_per_connection
-              ),
-            max_queued_request_bytes_per_lane:
-              positive_timeout!(
-                Map.get(opts, :max_queued_request_bytes_per_lane) ||
-                  Application.get_env(
-                    :ferricstore,
-                    :native_max_queued_request_bytes_per_lane,
-                    max(FrameBuffer.frame_bytes(max_frame_bytes), 32 * 1024 * 1024)
-                  ),
-                :native_max_queued_request_bytes_per_lane
-              ),
-            response_chunk_bytes: response_chunk_bytes,
-            max_pending_chunks:
-              Application.get_env(:ferricstore, :native_max_pending_chunks, 1024),
-            max_pending_chunk_bytes:
-              Application.get_env(
-                :ferricstore,
-                :native_max_pending_chunk_bytes,
-                64 * 1024 * 1024
-              ),
-            max_response_bytes: max_response_bytes,
-            max_outbound_bytes: max_outbound_bytes,
-            outbound_counter: OutboundBudget.new_counter(),
-            response_coalesce_max:
-              max(1, Application.get_env(:ferricstore, :native_response_coalesce_max, 64)),
-            response_coalesce_bytes:
-              Application.get_env(
-                :ferricstore,
-                :native_response_coalesce_bytes,
-                8 * 1024 * 1024
-              ),
-            idle_timeout_ms: Application.get_env(:ferricstore, :native_idle_timeout_ms, 90_000)
-          }
-          |> refresh_command_state()
-          |> remember_connection_state()
+        try do
+          state =
+            %__MODULE__{
+              socket: socket,
+              transport: transport,
+              client_id: client_id,
+              client_name: nil,
+              created_at: System.monotonic_time(:millisecond),
+              peer: peer,
+              instance_ctx: ctx,
+              stats_counter: ctx.stats_counter,
+              require_auth: Commands.default_requires_auth?(),
+              acl_cache: FerricstoreServer.Connection.Auth.build_acl_cache("default"),
+              max_frame_bytes: max_frame_bytes,
+              resource_budget: Map.get(opts, :resource_budget, ResourceBudget),
+              preauth_max_frame_bytes: preauth_max_frame_bytes,
+              frame_assembly_timeout_ms: frame_assembly_timeout_ms,
+              multi_queue_byte_limit: min(max_frame_bytes * 2, 32 * 1024 * 1024),
+              watch_key_byte_limit: min(max_frame_bytes, 16 * 1024 * 1024),
+              max_pubsub_subscription_bytes:
+                positive_timeout!(
+                  Map.get(opts, :max_pubsub_subscription_bytes) ||
+                    Application.get_env(
+                      :ferricstore,
+                      :native_max_pubsub_subscription_bytes_per_connection,
+                      16 * 1024 * 1024
+                    ),
+                  :native_max_pubsub_subscription_bytes_per_connection
+                ),
+              max_lanes:
+                Map.get(opts, :max_lanes) ||
+                  Application.get_env(:ferricstore, :native_max_lanes_per_connection, 1024),
+              lane_max_queue:
+                Map.get(opts, :lane_max_queue) ||
+                  Application.get_env(:ferricstore, :native_lane_max_queue, 1024),
+              max_inflight_per_connection:
+                Application.get_env(:ferricstore, :native_max_inflight_per_connection, 4096),
+              max_inflight_per_lane:
+                Application.get_env(:ferricstore, :native_max_inflight_per_lane, 1024),
+              max_queued_request_bytes_per_connection:
+                positive_timeout!(
+                  Map.get(opts, :max_queued_request_bytes_per_connection) ||
+                    Application.get_env(
+                      :ferricstore,
+                      :native_max_queued_request_bytes_per_connection,
+                      max(FrameBuffer.frame_bytes(max_frame_bytes), 64 * 1024 * 1024)
+                    ),
+                  :native_max_queued_request_bytes_per_connection
+                ),
+              max_queued_request_bytes_per_lane:
+                positive_timeout!(
+                  Map.get(opts, :max_queued_request_bytes_per_lane) ||
+                    Application.get_env(
+                      :ferricstore,
+                      :native_max_queued_request_bytes_per_lane,
+                      max(FrameBuffer.frame_bytes(max_frame_bytes), 32 * 1024 * 1024)
+                    ),
+                  :native_max_queued_request_bytes_per_lane
+                ),
+              response_chunk_bytes: response_chunk_bytes,
+              max_pending_chunks:
+                Application.get_env(:ferricstore, :native_max_pending_chunks, 1024),
+              max_pending_chunk_bytes:
+                Application.get_env(
+                  :ferricstore,
+                  :native_max_pending_chunk_bytes,
+                  64 * 1024 * 1024
+                ),
+              max_response_bytes: max_response_bytes,
+              max_outbound_bytes: max_outbound_bytes,
+              outbound_counter: OutboundBudget.new_counter(),
+              response_coalesce_max:
+                max(1, Application.get_env(:ferricstore, :native_response_coalesce_max, 64)),
+              response_coalesce_bytes:
+                Application.get_env(
+                  :ferricstore,
+                  :native_response_coalesce_bytes,
+                  8 * 1024 * 1024
+                ),
+              idle_timeout_ms: Application.get_env(:ferricstore, :native_idle_timeout_ms, 90_000)
+            }
+            |> refresh_command_state()
+            |> remember_connection_state()
 
-        Responses.join_acl_invalidation_group()
-        ConnRegistry.register(state.client_id, self(), Commands.summary(state))
-        loop(state)
+          ConnRegistry.update(state.client_id, self(), Commands.summary(state))
+          loop(state)
+        after
+          ConnRegistry.unregister(client_id, self())
+        end
     end
   end
 
@@ -499,11 +504,7 @@ defmodule FerricstoreServer.Native.Connection do
             loop(state)
         end
 
-      {:acl_invalidate, username, revision} ->
-        _status = FerricstoreServer.Acl.CatalogProjector.require_revision(revision)
-        handle_acl_invalidation(state, username)
-
-      {:acl_invalidate, username} ->
+      {:acl_invalidate, username, _revision} ->
         handle_acl_invalidation(state, username)
 
       {:native_lane_response, lane_id, iodata, request_bytes} ->
@@ -604,12 +605,12 @@ defmodule FerricstoreServer.Native.Connection do
   defp min_timeout(left, right), do: min(left, right)
 
   defp handle_acl_invalidation(state, username) do
-    refreshed_state =
-      FerricstoreServer.Connection.Auth.maybe_refresh_acl_cache(state, username)
-
-    ConnRegistry.update(refreshed_state.client_id, self(), Commands.summary(refreshed_state))
-
     if Responses.acl_invalidation_affects_session?(state, username) do
+      refreshed_state =
+        FerricstoreServer.Connection.Auth.maybe_refresh_acl_cache(state, username)
+
+      ConnRegistry.update(refreshed_state.client_id, self(), Commands.summary(refreshed_state))
+
       maybe_send_event(refreshed_state, "AUTH_INVALIDATED", %{
         username: Responses.invalidated_username(username),
         session_username: refreshed_state.username,
@@ -620,7 +621,7 @@ defmodule FerricstoreServer.Native.Connection do
       cleanup_connection(refreshed_state)
       state.transport.close(state.socket)
     else
-      loop(refreshed_state)
+      loop(state)
     end
   end
 

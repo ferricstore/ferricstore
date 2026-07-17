@@ -959,13 +959,11 @@ defmodule FerricstoreServer.Acl do
         }
 
         :ok =
-          broadcast_catalog_projection_invalidation(
+          broadcast_local_acl_invalidation(
             username,
-            expected_revision,
-            next_revision
+            projection_invalidation_revision(expected_revision, next_revision, version)
           )
 
-        maybe_mark_projection_ready(expected_revision)
         {:reply, :ok, maybe_schedule_auto_save(state)}
     end
   end
@@ -1007,13 +1005,11 @@ defmodule FerricstoreServer.Acl do
         }
 
         :ok =
-          broadcast_catalog_projection_invalidation(
+          broadcast_local_acl_invalidation(
             username,
-            expected_revision,
-            next_revision
+            projection_invalidation_revision(expected_revision, next_revision, version)
           )
 
-        maybe_mark_projection_ready(expected_revision)
         {:reply, :ok, maybe_schedule_auto_save(state)}
     end
   end
@@ -1037,8 +1033,7 @@ defmodule FerricstoreServer.Acl do
               catalog_revision: revision
           }
 
-          :ok = broadcast_acl_invalidation(:all, revision)
-          :ok = FerricstoreServer.Acl.CatalogProjector.mark_ready()
+          :ok = broadcast_local_acl_invalidation(:all, revision)
           {:reply, :ok, maybe_schedule_auto_save(state)}
         end
 
@@ -1055,7 +1050,7 @@ defmodule FerricstoreServer.Acl do
     :ets.delete_all_objects(ensure_active_table())
     :ok = Tables.clear_configured_user_witness()
     Tables.insert_default_user(auth_epoch)
-    :ok = broadcast_acl_invalidation(:all)
+    :ok = broadcast_local_acl_invalidation(:all, auth_epoch)
     :ok = FerricstoreServer.Acl.CatalogProjector.mark_stale(:acl_projection_reset)
 
     {:reply, :ok, %{state | auth_epoch: auth_epoch, catalog_versions: %{}, catalog_revision: -1}}
@@ -1106,17 +1101,8 @@ defmodule FerricstoreServer.Acl do
     end
   end
 
-  defp broadcast_acl_invalidation(username),
-    do: FerricstoreServer.Connection.Auth.broadcast_acl_invalidation(username)
-
-  defp broadcast_acl_invalidation(username, revision),
-    do: FerricstoreServer.Connection.Auth.broadcast_acl_invalidation(username, revision)
-
-  defp broadcast_catalog_projection_invalidation(username, :unknown, _revision),
-    do: broadcast_acl_invalidation(username)
-
-  defp broadcast_catalog_projection_invalidation(username, _expected_revision, revision),
-    do: broadcast_acl_invalidation(username, revision)
+  defp broadcast_local_acl_invalidation(username, revision),
+    do: FerricstoreServer.Connection.Auth.broadcast_local_acl_invalidation(username, revision)
 
   defp default_store do
     {:ok, FerricStore.Instance.get(:default)}
@@ -1182,8 +1168,6 @@ defmodule FerricstoreServer.Acl do
   defp next_catalog_projection_revision(state, :unknown, _version), do: state.catalog_revision
   defp next_catalog_projection_revision(_state, _expected_revision, version), do: version
 
-  defp maybe_mark_projection_ready(:unknown), do: :ok
-
-  defp maybe_mark_projection_ready(_expected_revision),
-    do: FerricstoreServer.Acl.CatalogProjector.mark_ready()
+  defp projection_invalidation_revision(:unknown, _revision, version), do: version
+  defp projection_invalidation_revision(_expected_revision, revision, _version), do: revision
 end

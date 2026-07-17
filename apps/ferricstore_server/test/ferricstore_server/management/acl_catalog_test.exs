@@ -8,6 +8,7 @@ defmodule FerricstoreServer.Management.ACLCatalogTest do
   alias FerricstoreServer.Acl
   alias FerricstoreServer.Acl.CatalogProjector
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
+  alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Management.ACL
 
   setup do
@@ -347,21 +348,40 @@ defmodule FerricstoreServer.Management.ACLCatalogTest do
     end
   end
 
-  @tag :acl_revision_invalidation
-  test "catalog projections invalidate sessions with the committed revision" do
-    group = ConnAuth.acl_pg_group()
-    :ok = :pg.join(group, group, self())
+  @tag :acl_revision_fence
+  test "revision fences revalidate a locally reset ACL projection" do
+    store = FerricStore.Instance.get(:default)
+    supervised_projector = Process.whereis(CatalogProjector)
+    :ok = :sys.suspend(supervised_projector)
 
     on_exit(fn ->
-      try do
-        :pg.leave(group, group, self())
-      catch
-        :error, _reason -> :ok
-      end
+      if Process.alive?(supervised_projector), do: :sys.resume(supervised_projector)
     end)
 
+    {:ok, projector} =
+      CatalogProjector.start_link(store: store, poll_interval_ms: 60_000, name: nil)
+
+    on_exit(fn ->
+      if Process.alive?(projector), do: GenServer.stop(projector)
+    end)
+
+    %{revision: revision, ready: true} = CatalogProjector.status(projector)
+    assert :ok = Acl.reset_projection!()
+    assert Acl.catalog_projection_revision() == -1
+
+    assert %{ready: true, revision: ^revision} =
+             CatalogProjector.require_revision(revision, projector)
+
+    assert Acl.catalog_projection_revision() == revision
+    assert Acl.get_user("default") != nil
+  end
+
+  @tag :acl_revision_invalidation
+  test "catalog projections invalidate sessions with the committed revision" do
     store = FerricStore.Instance.get(:default)
     username = "revision-invalidation-#{System.unique_integer([:positive])}"
+    client_id = System.unique_integer([:positive])
+    :ok = ConnRegistry.register(client_id, self(), %{username: username})
 
     assert :ok = ACL.set_user(username, ["on", "nopass"], store: store)
     revision = Acl.catalog_projection_revision()
@@ -370,13 +390,133 @@ defmodule FerricstoreServer.Management.ACLCatalogTest do
     assert {:ok, 1} = ACL.del_user(username, store: store)
   end
 
+  @tag :acl_revision_invalidation
+  test "durable user mutations advertise ordered changes to projectors" do
+    store = FerricStore.Instance.get(:default)
+    username = "projector-change-#{System.unique_integer([:positive])}"
+    observer = start_projector_observer()
+
+    previous_revision = durable_catalog_revision(store)
+    assert :ok = ACL.set_user(username, ["on", "nopass"], store: store)
+    revision = durable_catalog_revision(store)
+
+    assert_receive {:projector_observer, ^observer,
+                    {:acl_catalog_changed, :upsert, ^username, ^previous_revision, ^revision}}
+
+    assert {:ok, 1} = ACL.del_user(username, store: store)
+    delete_revision = durable_catalog_revision(store)
+
+    assert_receive {:projector_observer, ^observer,
+                    {:acl_catalog_changed, :delete, ^username, ^revision, ^delete_revision}}
+  end
+
   @tag :acl_projector_membership
-  test "supervised catalog projector joins the ACL revision invalidation group" do
+  test "supervised catalog projector joins the projector-only ACL group" do
     projector = Process.whereis(CatalogProjector)
-    group = ConnAuth.acl_pg_group()
+    scope = ConnAuth.acl_projector_scope()
+    group = ConnAuth.acl_projector_group()
 
     assert is_pid(projector)
-    assert projector in :pg.get_members(group, group)
+    assert projector in :pg.get_members(scope, group)
+  end
+
+  @tag :acl_targeted_projection
+  test "projector applies stable user upserts and deletes without a full catalog scan" do
+    store = FerricStore.Instance.get(:default)
+    username = "targeted-projection-#{System.unique_integer([:positive])}"
+    supervised_projector = Process.whereis(CatalogProjector)
+    :ok = :sys.suspend(supervised_projector)
+
+    on_exit(fn ->
+      if Process.alive?(supervised_projector), do: :sys.resume(supervised_projector)
+    end)
+
+    {:ok, projector} =
+      CatalogProjector.start_link(store: store, poll_interval_ms: 60_000, name: nil)
+
+    on_exit(fn ->
+      if Process.alive?(projector), do: GenServer.stop(projector)
+    end)
+
+    table = FerricstoreServer.Acl.Tables.active_table()
+    {:ok, value} = ACL.prepare_catalog_value(nil, username, ["on", "nopass", "+@all"])
+    {_encoded, previous_revision, revision} = direct_catalog_mutation(store, username, value)
+
+    trace_catalog_scans(projector)
+    on_exit(&stop_catalog_scan_trace/0)
+
+    send(
+      projector,
+      {:acl_catalog_changed, :upsert, username, previous_revision, revision}
+    )
+
+    assert %{ready: true, revision: ^revision} =
+             CatalogProjector.require_revision(revision, projector)
+
+    assert FerricstoreServer.Acl.Tables.active_table() == table
+    assert Acl.get_user(username).enabled
+    refute_catalog_scan(projector)
+
+    {_tombstone, delete_previous, delete_revision} =
+      direct_catalog_mutation(store, username, :deleted)
+
+    send(
+      projector,
+      {:acl_catalog_changed, :delete, username, delete_previous, delete_revision}
+    )
+
+    assert %{ready: true, revision: ^delete_revision} =
+             CatalogProjector.require_revision(delete_revision, projector)
+
+    assert FerricstoreServer.Acl.Tables.active_table() == table
+    assert Acl.get_user(username) == nil
+    refute_catalog_scan(projector)
+  end
+
+  @tag :acl_targeted_projection
+  test "projector reconciles exactly once when the catalog advances during notification" do
+    store = FerricStore.Instance.get(:default)
+    first = "projection-gap-first-#{System.unique_integer([:positive])}"
+    second = "projection-gap-second-#{System.unique_integer([:positive])}"
+    supervised_projector = Process.whereis(CatalogProjector)
+    :ok = :sys.suspend(supervised_projector)
+
+    on_exit(fn ->
+      if Process.alive?(supervised_projector), do: :sys.resume(supervised_projector)
+    end)
+
+    {:ok, projector} =
+      CatalogProjector.start_link(store: store, poll_interval_ms: 60_000, name: nil)
+
+    on_exit(fn ->
+      if Process.alive?(projector), do: GenServer.stop(projector)
+    end)
+
+    initial_table = FerricstoreServer.Acl.Tables.active_table()
+    {:ok, first_value} = ACL.prepare_catalog_value(nil, first, ["on", "nopass"])
+
+    {_first_encoded, initial_revision, first_revision} =
+      direct_catalog_mutation(store, first, first_value)
+
+    {:ok, second_value} = ACL.prepare_catalog_value(nil, second, ["on", "nopass"])
+
+    {_second_encoded, ^first_revision, second_revision} =
+      direct_catalog_mutation(store, second, second_value)
+
+    trace_catalog_scans(projector)
+    on_exit(&stop_catalog_scan_trace/0)
+    send(projector, {:acl_catalog_changed, :upsert, first, initial_revision, first_revision})
+
+    assert %{ready: true, revision: ^second_revision} =
+             CatalogProjector.require_revision(second_revision, projector)
+
+    assert Acl.get_user(first) != nil
+    assert Acl.get_user(second) != nil
+    refute FerricstoreServer.Acl.Tables.active_table() == initial_table
+
+    assert_receive {:trace, ^projector, :call, {Router, :server_catalog_entries, [_store, "acl"]}}
+
+    refute_catalog_scan(projector)
   end
 
   test "explicit reconciliation projects an authoritative full snapshot" do
@@ -455,5 +595,80 @@ defmodule FerricstoreServer.Management.ACLCatalogTest do
 
     assert {:ok, 1} = ACL.del_user(username, store: store)
     assert {:ok, nil} = Router.server_catalog_entry(store, "acl", username)
+  end
+
+  defp direct_catalog_mutation(store, username, value) do
+    {:ok, expected} = Router.server_catalog_entry(store, "acl", username)
+    {:ok, encoded_previous_revision} = Router.server_catalog_revision(store, "acl")
+
+    previous_revision =
+      case encoded_previous_revision do
+        nil ->
+          -1
+
+        encoded ->
+          {:ok, revision} = ServerCatalog.decode_revision(encoded)
+          revision
+      end
+
+    assert {:ok, encoded} =
+             Router.server_catalog_mutate(
+               store,
+               "acl",
+               username,
+               expected,
+               encoded_previous_revision,
+               value,
+               10_000
+             )
+
+    assert {:ok, %{version: revision}} = ServerCatalog.decode_entry(encoded)
+    {encoded, previous_revision, revision}
+  end
+
+  defp start_projector_observer do
+    parent = self()
+    scope = ConnAuth.acl_projector_scope()
+    group = ConnAuth.acl_projector_group()
+
+    observer =
+      spawn(fn ->
+        :ok = :pg.join(scope, group, self())
+        send(parent, {:projector_observer_ready, self()})
+        relay_projector_events(parent)
+      end)
+
+    assert_receive {:projector_observer_ready, ^observer}
+    on_exit(fn -> Process.exit(observer, :kill) end)
+    observer
+  end
+
+  defp relay_projector_events(parent) do
+    receive do
+      message ->
+        send(parent, {:projector_observer, self(), message})
+        relay_projector_events(parent)
+    end
+  end
+
+  defp durable_catalog_revision(store) do
+    assert {:ok, encoded} = Router.server_catalog_revision(store, "acl")
+    assert {:ok, revision} = ServerCatalog.decode_revision(encoded)
+    revision
+  end
+
+  defp trace_catalog_scans(projector) do
+    :erlang.trace_pattern({Router, :server_catalog_entries, 2}, true, [])
+    :erlang.trace(projector, true, [:call])
+  end
+
+  defp refute_catalog_scan(projector) do
+    refute_receive {:trace, ^projector, :call,
+                    {Router, :server_catalog_entries, [_store, "acl"]}},
+                   50
+  end
+
+  defp stop_catalog_scan_trace do
+    :erlang.trace_pattern({Router, :server_catalog_entries, 2}, false, [])
   end
 end

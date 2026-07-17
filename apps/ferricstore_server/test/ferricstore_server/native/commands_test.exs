@@ -1473,7 +1473,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
   @tag :acl_command_exec_replication
   test "COMMAND_EXEC dispatches replicated ACL mutations and invalidates cached sessions" do
-    join_acl_invalidation_group()
+    join_acl_invalidation_group("native-target")
 
     {status, payload, _state} =
       Commands.execute(
@@ -2459,8 +2459,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
   end
 
   test "replicated ACL disable denies rotated-out native service credential sessions only" do
-    join_acl_invalidation_group()
-
     assert :ok =
              Acl.set_user("platform_worker_old", [
                "on",
@@ -2485,6 +2483,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert_native_get_ok("tenant:a:key", old_state)
     assert_native_get_ok("tenant:a:key", new_state)
 
+    join_acl_invalidation_group("platform_worker_old")
     assert :ok = Acl.set_user("platform_worker_old", ["off"])
     assert_receive {:acl_invalidate, "platform_worker_old", _revision}
 
@@ -2497,7 +2496,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
   @tag :acl_direct_invalidation
   test "direct ACL mutations invalidate cached native permissions" do
-    join_acl_invalidation_group()
+    join_acl_invalidation_group("direct-revoke")
 
     assert :ok =
              Acl.set_user("direct-revoke", [
@@ -2521,8 +2520,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
   end
 
   test "replicated ACL delete denies active native service credential sessions" do
-    join_acl_invalidation_group()
-
     assert :ok =
              Acl.set_user("platform_revoke_abcd", [
                "on",
@@ -2535,6 +2532,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     state = state_as("platform_revoke_abcd")
     assert_native_get_ok("tenant:revoke:key", state)
 
+    join_acl_invalidation_group("platform_revoke_abcd")
     assert :ok = Acl.del_user("platform_revoke_abcd")
     assert_receive {:acl_invalidate, "platform_revoke_abcd", _revision}
 
@@ -2543,7 +2541,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   end
 
   test "replicated ACL delete of missing credential does not invalidate other sessions" do
-    join_acl_invalidation_group()
+    join_acl_invalidation_group("platform_other_abcd")
 
     assert :ok =
              Acl.set_user("platform_other_abcd", [
@@ -2696,17 +2694,10 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
   defp collect_binaries(_term), do: []
 
-  defp join_acl_invalidation_group do
-    group = ConnAuth.acl_pg_group()
-    :ok = :pg.join(group, group, self())
-
-    on_exit(fn ->
-      try do
-        :pg.leave(group, group, self())
-      catch
-        :error, _reason -> :ok
-      end
-    end)
+  defp join_acl_invalidation_group(username) do
+    client_id = System.unique_integer([:positive, :monotonic])
+    :ok = ConnRegistry.register(client_id, self(), %{username: username})
+    on_exit(fn -> ConnRegistry.unregister(client_id, self()) end)
   end
 
   defp put_platform_scoped_user(username) do

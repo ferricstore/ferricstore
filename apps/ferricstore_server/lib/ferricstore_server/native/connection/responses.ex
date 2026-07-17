@@ -59,12 +59,6 @@ defmodule FerricstoreServer.Native.Connection.Responses do
   def acl_invalidation_affects_session?(_state, :all), do: true
   def acl_invalidation_affects_session?(state, username), do: state.username == username
 
-  def join_acl_invalidation_group do
-    group = FerricstoreServer.Connection.Auth.acl_pg_group()
-    :pg.join(group, group, self())
-    :ok
-  end
-
   def coalesce_iodata_size(%{response_coalesce_bytes: limit}, iodata)
       when is_integer(limit) and limit > 0,
       do: IO.iodata_length(iodata)

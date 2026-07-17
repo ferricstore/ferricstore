@@ -128,9 +128,15 @@ defmodule FerricstoreServer.Acl.CatalogProjector do
     {:noreply, state}
   end
 
-  def handle_info({:acl_invalidate, _username, revision}, state)
-      when is_integer(revision) and revision >= 0 do
-    {:noreply, require_revision_state(state, revision)}
+  def handle_info(
+        {:acl_catalog_changed, kind, username, previous_revision, revision},
+        state
+      )
+      when kind in [:upsert, :delete, :all] and
+             (is_binary(username) or username == :all) and
+             is_integer(previous_revision) and previous_revision >= -1 and
+             is_integer(revision) and revision >= 0 do
+    {:noreply, project_catalog_change(state, kind, username, previous_revision, revision)}
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -257,10 +263,23 @@ defmodule FerricstoreServer.Acl.CatalogProjector do
          revision
        )
        when is_integer(current) and current >= revision and
-              (is_nil(target) or current >= target),
-       do: state
+              (is_nil(target) or current >= target) do
+    if revision_fence_satisfied?(state, revision) do
+      state
+    else
+      state
+      |> await_revision_state(revision)
+      |> poll()
+    end
+  end
 
   defp require_revision_state(state, revision) do
+    state
+    |> await_revision_state(revision)
+    |> poll()
+  end
+
+  defp await_revision_state(state, revision) do
     target_revision = max(state.target_revision || 0, revision)
 
     state = %{
@@ -274,7 +293,7 @@ defmodule FerricstoreServer.Acl.CatalogProjector do
       mark_stale({:awaiting_acl_catalog_revision, target_revision})
     end
 
-    poll(state)
+    state
   end
 
   defp revision_reaches_target?(revision, target)
@@ -285,8 +304,9 @@ defmodule FerricstoreServer.Acl.CatalogProjector do
   defp revision_reaches_target?(_revision, _target), do: false
 
   defp join_invalidation_group do
-    scope = FerricstoreServer.Connection.Auth.acl_pg_group()
-    :ok = :pg.join(scope, scope, self())
+    scope = FerricstoreServer.Connection.Auth.acl_projector_scope()
+    group = FerricstoreServer.Connection.Auth.acl_projector_group()
+    :ok = :pg.join(scope, group, self())
   catch
     :error, _reason -> :ok
     :exit, _reason -> :ok
@@ -326,5 +346,110 @@ defmodule FerricstoreServer.Acl.CatalogProjector do
     end
 
     :ok
+  end
+
+  defp project_catalog_change(state, _kind, _username, _previous_revision, revision)
+       when is_integer(state.revision) and state.revision >= revision do
+    if revision_fence_satisfied?(state, revision) do
+      state
+    else
+      require_revision_state(state, revision)
+    end
+  end
+
+  defp project_catalog_change(state, :all, :all, _previous_revision, revision) do
+    require_revision_state(state, revision)
+  end
+
+  defp project_catalog_change(state, kind, username, previous_revision, revision)
+       when kind in [:upsert, :delete] and is_binary(username) do
+    state = await_revision_state(state, revision)
+
+    if incremental_projection_base?(state, previous_revision) do
+      case stable_catalog_entry(state.store, kind, username, revision) do
+        {:ok, encoded} ->
+          project_stable_catalog_entry(
+            state,
+            username,
+            encoded,
+            previous_revision,
+            revision
+          )
+
+        {:error, _reason} ->
+          poll(state)
+      end
+    else
+      poll(state)
+    end
+  rescue
+    error -> projection_failed(state, {:exception, error})
+  catch
+    kind, reason -> projection_failed(state, {kind, reason})
+  end
+
+  defp project_catalog_change(state, _kind, _username, _previous_revision, revision),
+    do: require_revision_state(state, revision)
+
+  defp incremental_projection_base?(state, previous_revision) do
+    state.revision == previous_revision and
+      Acl.catalog_projection_revision() == previous_revision
+  end
+
+  defp stable_catalog_entry(store, kind, username, revision) do
+    with {:ok, ^revision} <- read_revision(store),
+         {:ok, encoded} <- read_catalog_entry(store, kind, username, revision),
+         {:ok, ^revision} <- read_revision(store) do
+      {:ok, encoded}
+    else
+      _changed_or_invalid -> {:error, :acl_catalog_changed_concurrently}
+    end
+  end
+
+  defp read_catalog_entry(store, :upsert, username, revision) do
+    case Router.server_catalog_entry(store, "acl", username) do
+      {:ok, encoded} when is_binary(encoded) ->
+        case ServerCatalog.decode_entry(encoded) do
+          {:ok, %{version: ^revision, value: value}} when is_binary(value) -> {:ok, encoded}
+          _invalid -> {:error, :invalid_acl_catalog_entry}
+        end
+
+      _missing_or_unavailable ->
+        {:error, :missing_acl_catalog_entry}
+    end
+  end
+
+  defp read_catalog_entry(store, :delete, username, revision) do
+    case Router.server_catalog_entry(store, "acl", username) do
+      {:ok, nil} -> {:ok, ServerCatalog.encode_entry(revision, :deleted)}
+      _present_or_unavailable -> {:error, :acl_catalog_delete_not_stable}
+    end
+  end
+
+  defp project_stable_catalog_entry(
+         state,
+         username,
+         encoded,
+         previous_revision,
+         revision
+       ) do
+    expected_revision =
+      if previous_revision == -1,
+        do: nil,
+        else: ServerCatalog.encode_revision(previous_revision)
+
+    with :ok <- Acl.project_catalog_entry(username, encoded, expected_revision),
+         {:ok, ^revision} <- read_revision(state.store),
+         ^revision <- Acl.catalog_projection_revision() do
+      projection_ready(state, revision)
+    else
+      _changed_or_failed -> poll(state)
+    end
+  end
+
+  defp revision_fence_satisfied?(state, revision) do
+    local_revision = Acl.catalog_projection_revision()
+    readiness_valid? = not state.publish_status or ready?()
+    readiness_valid? and is_integer(local_revision) and local_revision >= revision
   end
 end

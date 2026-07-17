@@ -10,13 +10,116 @@ defmodule FerricstoreServer.Connection.Auth do
   alias Ferricstore.Commands.{KeyDiscovery, PreparedCommand}
   alias FerricstoreServer.Acl.CatalogProjector
   alias FerricstoreServer.Acl.CommandCategories
+  alias FerricstoreServer.Connection.Registry
 
-  @acl_pg_group :ferricstore_acl_connections
+  @acl_projector_scope :ferricstore_acl_projector_scope
+  @acl_projector_group :ferricstore_acl_projectors
   @global_keyspace_enumeration_commands ~w(KEYS SCAN RANDOMKEY DBSIZE)
   @acl_subcommands ~w(CAT DELUSER GETUSER LIST LOAD LOG SAVE SETUSER WHOAMI)
 
-  @spec acl_pg_group() :: atom()
-  def acl_pg_group, do: @acl_pg_group
+  @spec acl_projector_scope() :: atom()
+  def acl_projector_scope, do: @acl_projector_scope
+
+  @doc false
+  @spec acl_projector_group() :: atom()
+  def acl_projector_group, do: @acl_projector_group
+
+  @doc false
+  @spec move_acl_invalidation_group(pos_integer(), binary(), binary()) :: :ok
+  def move_acl_invalidation_group(client_id, previous_username, username)
+      when is_integer(client_id) and is_binary(previous_username) and is_binary(username),
+      do: Registry.replace_acl_user(client_id, self(), previous_username, username)
+
+  @doc false
+  @spec begin_acl_authentication(map(), binary()) :: :ok
+  def begin_acl_authentication(%{client_id: client_id, username: username}, username)
+      when is_integer(client_id) and is_binary(username),
+      do: :ok
+
+  def begin_acl_authentication(%{client_id: client_id}, username)
+      when is_integer(client_id) and is_binary(username),
+      do: Registry.add_acl_user(client_id, self(), username)
+
+  @doc false
+  @spec cancel_acl_authentication(map(), binary()) :: :ok
+  def cancel_acl_authentication(%{client_id: client_id, username: username}, username)
+      when is_integer(client_id) and is_binary(username),
+      do: :ok
+
+  def cancel_acl_authentication(%{client_id: client_id}, username)
+      when is_integer(client_id) and is_binary(username),
+      do: Registry.remove_acl_user(client_id, self(), username)
+
+  @doc false
+  @spec activate_authenticated_user(map(), binary(), non_neg_integer()) ::
+          {:ok, map()} | {:error, :acl_changed_during_authentication}
+  def activate_authenticated_user(state, username, expected_auth_epoch)
+      when is_binary(username) and is_integer(expected_auth_epoch) and expected_auth_epoch >= 0 do
+    previous_username = state.username
+    :ok = Registry.add_acl_user(state.client_id, self(), username)
+
+    case {CatalogProjector.ready?(), FerricstoreServer.Acl.get_user(username)} do
+      {true, %{enabled: true, auth_epoch: ^expected_auth_epoch}} ->
+        cache = build_acl_cache(username)
+
+        if cache == :denied do
+          :ok = cancel_acl_authentication(state, username)
+          {:error, :acl_changed_during_authentication}
+        else
+          if previous_username != username do
+            :ok = Registry.remove_acl_user(state.client_id, self(), previous_username)
+          end
+
+          {:ok,
+           %{
+             state
+             | username: username,
+               authenticated: true,
+               require_auth: false,
+               acl_cache: cache
+           }}
+        end
+
+      _changed_or_unavailable ->
+        :ok = cancel_acl_authentication(state, username)
+        {:error, :acl_changed_during_authentication}
+    end
+  end
+
+  @doc false
+  @spec broadcast_local_acl_invalidation(binary() | :all, non_neg_integer()) :: :ok
+  def broadcast_local_acl_invalidation(username, revision)
+      when (is_binary(username) or username == :all) and is_integer(revision) and revision >= 0 do
+    pids =
+      case username do
+        :all -> Registry.all_pids()
+        username -> Registry.acl_user_pids(username)
+      end
+
+    Enum.each(pids, &send(&1, {:acl_invalidate, username, revision}))
+
+    :ok
+  end
+
+  @doc false
+  @spec broadcast_acl_catalog_change(
+          :upsert | :delete | :all,
+          binary() | :all,
+          integer(),
+          non_neg_integer()
+        ) :: :ok
+  def broadcast_acl_catalog_change(kind, username, previous_revision, revision)
+      when kind in [:upsert, :delete, :all] and (is_binary(username) or username == :all) and
+             is_integer(previous_revision) and previous_revision >= -1 and
+             is_integer(revision) and revision >= 0 do
+    message = {:acl_catalog_changed, kind, username, previous_revision, revision}
+
+    @acl_projector_scope
+    |> group_members(@acl_projector_group)
+    |> Enum.each(&send(&1, message))
+
+    :ok
+  end
 
   @spec user_requires_auth?(binary()) :: boolean()
   def user_requires_auth?(username) do
@@ -244,27 +347,11 @@ defmodule FerricstoreServer.Connection.Auth do
 
   def acl_command_name(cmd, _args, _ast), do: cmd
 
-  @spec broadcast_acl_invalidation(binary() | :all) :: :ok
-  def broadcast_acl_invalidation(username) do
-    broadcast_acl_invalidation_message({:acl_invalidate, username})
-  end
-
-  @spec broadcast_acl_invalidation(binary() | :all, non_neg_integer()) :: :ok
-  def broadcast_acl_invalidation(username, revision)
-      when is_integer(revision) and revision >= 0 do
-    broadcast_acl_invalidation_message({:acl_invalidate, username, revision})
-  end
-
-  defp broadcast_acl_invalidation_message(message) do
-    members =
-      try do
-        :pg.get_members(@acl_pg_group, @acl_pg_group)
-      catch
-        :error, _ -> []
-      end
-
-    for pid <- members, pid != self(), do: send(pid, message)
-    :ok
+  defp group_members(scope, group) do
+    :pg.get_members(scope, group)
+  catch
+    :error, _reason -> []
+    :exit, _reason -> []
   end
 
   @spec maybe_refresh_acl_cache(map(), binary() | :all) :: map()

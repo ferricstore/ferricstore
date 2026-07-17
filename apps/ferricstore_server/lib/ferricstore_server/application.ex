@@ -178,7 +178,7 @@ defmodule FerricstoreServer.Application do
   defp pg_child_spec do
     %{
       id: FerricstoreServer.PG,
-      start: {:pg, :start_link, [FerricstoreServer.Connection.Auth.acl_pg_group()]}
+      start: {:pg, :start_link, [FerricstoreServer.Connection.Auth.acl_projector_scope()]}
     }
   end
 
