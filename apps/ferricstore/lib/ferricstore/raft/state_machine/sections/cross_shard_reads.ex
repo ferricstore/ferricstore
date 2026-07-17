@@ -33,6 +33,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         ColdRead,
         CompoundKey,
         ExpiryTracker,
+        Keydir,
         LFU,
         ListOps,
         Promotion,
@@ -333,7 +334,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             when is_integer(exp) and exp >= 0 ->
               case ExpiryContext.classify(expiry_context, exp) do
                 :live ->
-                  cross_shard_live_value(ctx, data_path, key, value, fid, off, vsize)
+                  case cross_shard_live_value_meta(
+                         ctx,
+                         data_path,
+                         entry,
+                         expiry_context,
+                         @cold_location_retry_attempts
+                       ) do
+                    {materialized, _expire_at_ms} -> materialized
+                    nil -> nil
+                  end
 
                 :expired ->
                   cross_shard_delete_keydir_entry(ctx, entry)
@@ -359,34 +369,187 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         end
       end
 
-      defp cross_shard_live_value(_ctx, _data_path, _key, value, _fid, _off, _vsize)
+      defp cross_shard_live_value_meta(
+             _ctx,
+             _data_path,
+             {_key, value, exp, _lfu, _fid, _off, _vsize},
+             _expiry_context,
+             _attempts_left
+           )
            when value != nil,
-           do: value
+           do: {value, exp}
 
-      defp cross_shard_live_value(ctx, data_path, key, nil, fid, off, vsize)
+      defp cross_shard_live_value_meta(
+             ctx,
+             data_path,
+             {key, nil, exp, _lfu, fid, off, vsize} = observed_entry,
+             expiry_context,
+             attempts_left
+           )
            when valid_cold_location(fid, off, vsize) or
                   valid_waraft_segment_location(fid, off, vsize) do
         case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
           {:ok, value} when is_binary(value) ->
-            materialize_cross_shard_cold_value(ctx, value)
+            maybe_run_cold_read_success_hook(ctx, key)
+
+            case cross_shard_materialize_cold_value(ctx, value) do
+              {:ok, materialized} ->
+                if Keydir.replace_exact(ctx.keydir, observed_entry, observed_entry) do
+                  {materialized, exp}
+                else
+                  cross_shard_retry_changed_cold_read(
+                    ctx,
+                    data_path,
+                    key,
+                    expiry_context,
+                    attempts_left - 1,
+                    :cold_location_changed_after_read
+                  )
+                end
+
+              {:error, reason} ->
+                cross_shard_retry_failed_cold_read(
+                  ctx,
+                  data_path,
+                  observed_entry,
+                  expiry_context,
+                  attempts_left,
+                  {:blob_ref_unavailable, reason}
+                )
+            end
 
           {:ok, invalid} ->
-            record_cross_shard_read_failure({:invalid_value, invalid})
+            cross_shard_retry_failed_cold_read(
+              ctx,
+              data_path,
+              observed_entry,
+              expiry_context,
+              attempts_left,
+              {:invalid_value, invalid}
+            )
 
           {:error, reason} ->
-            record_cross_shard_read_failure(reason)
+            cross_shard_retry_failed_cold_read(
+              ctx,
+              data_path,
+              observed_entry,
+              expiry_context,
+              attempts_left,
+              reason
+            )
 
           :not_found ->
-            record_cross_shard_read_failure(:not_found)
+            cross_shard_retry_failed_cold_read(
+              ctx,
+              data_path,
+              observed_entry,
+              expiry_context,
+              attempts_left,
+              :not_found
+            )
 
           invalid ->
-            record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
+            cross_shard_retry_failed_cold_read(
+              ctx,
+              data_path,
+              observed_entry,
+              expiry_context,
+              attempts_left,
+              {:invalid_cold_read_result, invalid}
+            )
         end
       end
 
-      defp cross_shard_live_value(_ctx, _data_path, _key, nil, fid, off, vsize) do
+      defp cross_shard_live_value_meta(
+             _ctx,
+             _data_path,
+             {_key, nil, _exp, _lfu, fid, off, vsize},
+             _expiry_context,
+             _attempts_left
+           ) do
         record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
         nil
+      end
+
+      defp cross_shard_retry_failed_cold_read(
+             ctx,
+             data_path,
+             {_key, _value, _exp, _lfu, _fid, _off, _vsize} = observed_entry,
+             expiry_context,
+             attempts_left,
+             reason
+           ) do
+        if Keydir.replace_exact(ctx.keydir, observed_entry, observed_entry) do
+          record_cross_shard_read_failure(reason)
+        else
+          cross_shard_retry_changed_cold_read(
+            ctx,
+            data_path,
+            elem(observed_entry, 0),
+            expiry_context,
+            attempts_left - 1,
+            reason
+          )
+        end
+      end
+
+      defp cross_shard_retry_changed_cold_read(
+             _ctx,
+             _data_path,
+             _key,
+             _expiry_context,
+             attempts_left,
+             reason
+           )
+           when attempts_left <= 0 do
+        record_cross_shard_read_failure({:retry_budget_exhausted, reason})
+      end
+
+      defp cross_shard_retry_changed_cold_read(
+             ctx,
+             data_path,
+             key,
+             expiry_context,
+             attempts_left,
+             _reason
+           ) do
+        Process.sleep(@cold_location_retry_sleep_ms)
+
+        try do
+          case :ets.lookup(ctx.keydir, key) do
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize} = current_entry]
+            when is_integer(exp) and exp >= 0 ->
+              case ExpiryContext.classify(expiry_context, exp) do
+                :live ->
+                  cross_shard_live_value_meta(
+                    ctx,
+                    data_path,
+                    current_entry,
+                    expiry_context,
+                    attempts_left
+                  )
+
+                :expired ->
+                  cross_shard_delete_keydir_entry(ctx, current_entry)
+                  nil
+
+                {:unsafe, unsafe_reason} ->
+                  record_state_read_failure(unsafe_reason)
+                  nil
+              end
+
+            [invalid_entry] ->
+              record_state_read_failure({:invalid_keydir_entry, key, invalid_entry})
+              nil
+
+            [] ->
+              nil
+          end
+        rescue
+          ArgumentError ->
+            record_state_read_failure(:keydir_unavailable)
+            nil
+        end
       end
 
       # Reads value + expire_at_ms from a shard's keydir ETS table.
@@ -394,13 +557,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         cross_shard_ets_read_meta_from_path(ctx, key, ctx.shard_data_path)
       end
 
-      defp materialize_cross_shard_cold_value(ctx, value) do
+      defp cross_shard_materialize_cold_value(ctx, value) do
         threshold = BlobValue.threshold(Map.get(ctx, :instance_ctx))
 
-        case BlobValue.maybe_materialize(ctx.data_dir, ctx.index, threshold, value) do
-          {:ok, materialized} -> materialized
-          {:error, reason} -> record_cross_shard_read_failure({:blob_ref_unavailable, reason})
-        end
+        BlobValue.maybe_materialize(ctx.data_dir, ctx.index, threshold, value)
       end
 
       defp record_cross_shard_read_failure(reason) do
@@ -435,10 +595,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             when is_integer(exp) and exp >= 0 ->
               case ExpiryContext.classify(expiry_context, exp) do
                 :live ->
-                  case cross_shard_live_value(ctx, data_path, key, value, fid, off, vsize) do
-                    nil -> nil
-                    materialized -> {materialized, exp}
-                  end
+                  cross_shard_live_value_meta(
+                    ctx,
+                    data_path,
+                    entry,
+                    expiry_context,
+                    @cold_location_retry_attempts
+                  )
 
                 :expired ->
                   cross_shard_delete_keydir_entry(ctx, entry)
@@ -499,12 +662,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                         value == nil and valid_cold_location(fid, off, vsize) ->
                           field = sm_prefix_field(key)
                           path = sm_file_path_from_path(data_path, fid)
-                          entry = {field, key, {:bitcask, path, off}}
+                          entry = {field, key, {:bitcask, path, off}, keydir_entry}
                           {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
 
                         value == nil and valid_waraft_segment_location(fid, off, vsize) ->
                           field = sm_prefix_field(key)
-                          entry = {field, key, {:waraft, fid}}
+                          entry = {field, key, {:waraft, fid}, keydir_entry}
                           {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
 
                         true ->
@@ -528,7 +691,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
           cold_values =
             cold_entries
             |> Enum.reverse()
-            |> cross_shard_read_cold_batch(ctx)
+            |> cross_shard_read_cold_batch(ctx, data_path, expiry_context)
             |> List.to_tuple()
 
           tokens
@@ -551,52 +714,113 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         end
       end
 
-      defp cross_shard_read_cold_batch([], _ctx), do: []
+      defp cross_shard_read_cold_batch([], _ctx, _data_path, _expiry_context), do: []
 
-      defp cross_shard_read_cold_batch(entries, ctx) do
+      defp cross_shard_read_cold_batch(entries, ctx, data_path, expiry_context) do
         {bitcask_entries, waraft_entries} =
           Enum.split_with(entries, fn
-            {_field, _key, {:bitcask, _path, _off}} -> true
+            {_field, _key, {:bitcask, _path, _off}, _entry} -> true
             _entry -> false
           end)
 
         values_by_entry =
           %{}
-          |> cross_shard_read_cold_bitcask_values(ctx, bitcask_entries)
-          |> cross_shard_read_cold_waraft_values(ctx, waraft_entries)
+          |> cross_shard_read_cold_bitcask_values(
+            ctx,
+            bitcask_entries,
+            data_path,
+            expiry_context
+          )
+          |> cross_shard_read_cold_waraft_values(
+            ctx,
+            waraft_entries,
+            data_path,
+            expiry_context
+          )
 
         Enum.map(entries, fn entry -> Map.get(values_by_entry, entry) end)
       end
 
-      defp cross_shard_read_cold_bitcask_values(acc, _ctx, []), do: acc
+      defp cross_shard_read_cold_bitcask_values(
+             acc,
+             _ctx,
+             [],
+             _data_path,
+             _expiry_context
+           ),
+           do: acc
 
-      defp cross_shard_read_cold_bitcask_values(acc, ctx, entries) do
-        locations =
-          Enum.map(entries, fn {_field, key, {:bitcask, path, off}} -> {path, off, key} end)
+      defp cross_shard_read_cold_bitcask_values(
+             acc,
+             ctx,
+             entries,
+             data_path,
+             expiry_context
+           ) do
+        reads =
+          Enum.map(entries, fn {_field, key, {:bitcask, path, off}, entry} ->
+            {path, off, key, entry}
+          end)
 
-        values =
-          locations
-          |> Ferricstore.Store.ColdRead.pread_batch_keyed(@cold_read_timeout_ms)
-          |> normalize_state_machine_batch_values(length(entries))
+        {:ok, current_results} =
+          Ferricstore.Store.ColdRead.pread_batch_keyed_current(
+            reads,
+            fn key, entry ->
+              cross_shard_resolve_current_bitcask(
+                ctx,
+                data_path,
+                key,
+                entry,
+                expiry_context
+              )
+            end,
+            @cold_read_timeout_ms
+          )
 
-        emit_state_machine_batch_cold_errors(entries, values, fn {_field, _key,
-                                                                  {:bitcask, path, _off}} ->
-          path
-        end)
+        emit_state_machine_batch_cold_errors(
+          entries,
+          current_results,
+          fn {_field, _key, {:bitcask, path, _off}, _entry} -> path end
+        )
 
-        Enum.zip(entries, values)
+        Enum.zip(entries, current_results)
         |> Enum.reduce(acc, fn
-          {entry = {_field, _key, _location}, value}, acc when is_binary(value) ->
-            case materialize_cross_shard_cold_value(ctx, value) do
-              materialized when is_binary(materialized) ->
-                Map.put(acc, entry, cross_shard_cold_result(entry, materialized))
+          {entry = {field, key, _location, _observed_entry}, {:value, value, current_entry}}, acc
+          when is_binary(value) ->
+            maybe_run_cold_read_success_hook(ctx, key)
 
-              _failed ->
-                acc
+            case cross_shard_materialize_cold_value(ctx, value) do
+              {:ok, materialized} ->
+                case cross_shard_accept_current_batch_value(
+                       ctx,
+                       data_path,
+                       current_entry,
+                       materialized,
+                       expiry_context
+                     ) do
+                  {current, _exp} -> Map.put(acc, entry, {field, current})
+                  nil -> acc
+                end
+
+              {:error, reason} ->
+                case cross_shard_retry_failed_cold_read(
+                       ctx,
+                       data_path,
+                       current_entry,
+                       expiry_context,
+                       @cold_location_retry_attempts,
+                       {:blob_ref_unavailable, reason}
+                     ) do
+                  {current, _exp} -> Map.put(acc, entry, {field, current})
+                  nil -> acc
+                end
             end
 
           {_entry, {:error, reason}}, acc ->
             record_state_read_failure({:cold_value_unavailable, reason})
+            acc
+
+          {_entry, :missing}, acc ->
             acc
 
           {_entry, invalid}, acc ->
@@ -605,13 +829,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         end)
       end
 
-      defp cross_shard_read_cold_waraft_values(acc, _ctx, []), do: acc
+      defp cross_shard_read_cold_waraft_values(
+             acc,
+             _ctx,
+             [],
+             _data_path,
+             _expiry_context
+           ),
+           do: acc
 
-      defp cross_shard_read_cold_waraft_values(acc, ctx, entries) do
+      defp cross_shard_read_cold_waraft_values(
+             acc,
+             ctx,
+             entries,
+             data_path,
+             expiry_context
+           ) do
         entries
-        |> Enum.group_by(fn {_field, _key, {:waraft, fid}} -> fid end)
+        |> Enum.group_by(fn {_field, _key, {:waraft, fid}, _entry} -> fid end)
         |> Enum.reduce(acc, fn {fid, grouped}, acc ->
-          keys = Enum.map(grouped, fn {_field, key, _location} -> key end)
+          keys = Enum.map(grouped, fn {_field, key, _location, _entry} -> key end)
 
           case Ferricstore.Raft.WARaftSegmentReader.read_values_from_location(
                  ctx,
@@ -620,22 +857,47 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                  keys
                ) do
             {:ok, values_by_key} when is_map(values_by_key) ->
-              Enum.reduce(grouped, acc, fn entry = {_field, key, _location}, acc ->
-                case Map.fetch(values_by_key, key) do
-                  {:ok, value} when is_binary(value) ->
-                    case materialize_cross_shard_cold_value(ctx, value) do
-                      materialized when is_binary(materialized) ->
-                        Map.put(acc, entry, cross_shard_cold_result(entry, materialized))
+              Enum.reduce(
+                grouped,
+                acc,
+                fn entry = {field, key, _location, observed_entry}, acc ->
+                  case Map.fetch(values_by_key, key) do
+                    {:ok, value} when is_binary(value) ->
+                      maybe_run_cold_read_success_hook(ctx, key)
 
-                      _failed ->
-                        acc
-                    end
+                      case cross_shard_materialize_cold_value(ctx, value) do
+                        {:ok, materialized} ->
+                          case cross_shard_accept_current_batch_value(
+                                 ctx,
+                                 data_path,
+                                 observed_entry,
+                                 materialized,
+                                 expiry_context
+                               ) do
+                            {current, _exp} -> Map.put(acc, entry, {field, current})
+                            nil -> acc
+                          end
 
-                  _missing ->
-                    record_state_read_failure({:waraft_value_unavailable, :not_found})
-                    acc
+                        {:error, reason} ->
+                          case cross_shard_retry_failed_cold_read(
+                                 ctx,
+                                 data_path,
+                                 observed_entry,
+                                 expiry_context,
+                                 @cold_location_retry_attempts,
+                                 {:blob_ref_unavailable, reason}
+                               ) do
+                            {current, _exp} -> Map.put(acc, entry, {field, current})
+                            nil -> acc
+                          end
+                      end
+
+                    _missing ->
+                      record_state_read_failure({:waraft_value_unavailable, :not_found})
+                      acc
+                  end
                 end
-              end)
+              )
 
             {:error, reason} ->
               record_state_read_failure({:waraft_value_unavailable, reason})
@@ -647,18 +909,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
           end
         end)
       end
-
-      defp cross_shard_cold_result({field, _key, _location}, value), do: {field, value}
-
-      defp normalize_state_machine_batch_values({:ok, values}, count)
-           when is_list(values) and length(values) == count,
-           do: values
-
-      defp normalize_state_machine_batch_values({:ok, _bad_values}, count),
-        do: List.duplicate({:error, :batch_result_length_mismatch}, count)
-
-      defp normalize_state_machine_batch_values({:error, reason}, count),
-        do: List.duplicate({:error, reason}, count)
 
       defp emit_state_machine_batch_cold_errors(entries, values, path_fun) do
         entries
@@ -806,7 +1056,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             end
           end)
 
-        results = cross_shard_read_cold_meta_batch(ctx, warm_results, Enum.reverse(cold_reads))
+        results =
+          cross_shard_read_cold_meta_batch(
+            ctx,
+            warm_results,
+            Enum.reverse(cold_reads),
+            data_path,
+            expiry_context
+          )
 
         keys
         |> Enum.with_index()
@@ -843,10 +1100,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             case ExpiryContext.classify(expiry_context, exp) do
               :live when valid_cold_location(fid, off, vsize) ->
                 path = sm_file_path_from_path(data_path, fid)
-                {results, [{index, key, {:bitcask, path, off}, exp} | cold]}
+                {results, [{index, key, {:bitcask, path, off}, entry} | cold]}
 
               :live when valid_waraft_segment_location(fid, off, vsize) ->
-                {results, [{index, key, {:waraft, fid}, exp} | cold]}
+                {results, [{index, key, {:waraft, fid}, entry} | cold]}
 
               :live ->
                 record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
@@ -870,51 +1127,122 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
           {results, cold}
       end
 
-      defp cross_shard_read_cold_meta_batch(_ctx, results, []), do: results
+      defp cross_shard_read_cold_meta_batch(
+             _ctx,
+             results,
+             [],
+             _data_path,
+             _expiry_context
+           ),
+           do: results
 
-      defp cross_shard_read_cold_meta_batch(ctx, results, cold_reads) do
+      defp cross_shard_read_cold_meta_batch(
+             ctx,
+             results,
+             cold_reads,
+             data_path,
+             expiry_context
+           ) do
         {bitcask_reads, waraft_reads} =
           Enum.split_with(cold_reads, fn
-            {_index, _key, {:bitcask, _path, _off}, _exp} -> true
+            {_index, _key, {:bitcask, _path, _off}, _entry} -> true
             _read -> false
           end)
 
         results
-        |> cross_shard_read_cold_meta_bitcask_batch(ctx, bitcask_reads)
-        |> cross_shard_read_cold_meta_waraft_batch(ctx, waraft_reads)
+        |> cross_shard_read_cold_meta_bitcask_batch(
+          ctx,
+          bitcask_reads,
+          data_path,
+          expiry_context
+        )
+        |> cross_shard_read_cold_meta_waraft_batch(
+          ctx,
+          waraft_reads,
+          data_path,
+          expiry_context
+        )
       end
 
-      defp cross_shard_read_cold_meta_bitcask_batch(results, _ctx, []), do: results
+      defp cross_shard_read_cold_meta_bitcask_batch(
+             results,
+             _ctx,
+             [],
+             _data_path,
+             _expiry_context
+           ),
+           do: results
 
-      defp cross_shard_read_cold_meta_bitcask_batch(results, ctx, cold_reads) do
-        locations =
-          Enum.map(cold_reads, fn {_index, key, {:bitcask, path, off}, _exp} ->
-            {path, off, key}
+      defp cross_shard_read_cold_meta_bitcask_batch(
+             results,
+             ctx,
+             cold_reads,
+             data_path,
+             expiry_context
+           ) do
+        reads =
+          Enum.map(cold_reads, fn {_index, key, {:bitcask, path, off}, entry} ->
+            {path, off, key, entry}
           end)
 
-        values =
-          locations
-          |> Ferricstore.Store.ColdRead.pread_batch_keyed(@cold_read_timeout_ms)
-          |> normalize_state_machine_batch_values(length(cold_reads))
+        {:ok, current_results} =
+          Ferricstore.Store.ColdRead.pread_batch_keyed_current(
+            reads,
+            fn key, entry ->
+              cross_shard_resolve_current_bitcask(
+                ctx,
+                data_path,
+                key,
+                entry,
+                expiry_context
+              )
+            end,
+            @cold_read_timeout_ms
+          )
 
-        emit_state_machine_batch_cold_errors(cold_reads, values, fn
-          {_index, _key, {:bitcask, path, _off}, _exp} -> path
+        emit_state_machine_batch_cold_errors(cold_reads, current_results, fn
+          {_index, _key, {:bitcask, path, _off}, _entry} -> path
         end)
 
         cold_reads
-        |> Enum.zip(values)
+        |> Enum.zip(current_results)
         |> Enum.reduce(results, fn
-          {{index, _key, _location, exp}, value}, acc when is_binary(value) ->
-            case materialize_cross_shard_cold_value(ctx, value) do
-              materialized when is_binary(materialized) ->
-                Map.put(acc, index, {materialized, exp})
+          {{index, key, _location, _observed_entry}, {:value, value, current_entry}}, acc
+          when is_binary(value) ->
+            maybe_run_cold_read_success_hook(ctx, key)
 
-              _failed ->
-                acc
+            case cross_shard_materialize_cold_value(ctx, value) do
+              {:ok, materialized} ->
+                case cross_shard_accept_current_batch_value(
+                       ctx,
+                       data_path,
+                       current_entry,
+                       materialized,
+                       expiry_context
+                     ) do
+                  nil -> acc
+                  current -> Map.put(acc, index, current)
+                end
+
+              {:error, reason} ->
+                case cross_shard_retry_failed_cold_read(
+                       ctx,
+                       data_path,
+                       current_entry,
+                       expiry_context,
+                       @cold_location_retry_attempts,
+                       {:blob_ref_unavailable, reason}
+                     ) do
+                  nil -> acc
+                  current -> Map.put(acc, index, current)
+                end
             end
 
           {_read, {:error, reason}}, acc ->
             record_state_read_failure({:cold_value_unavailable, reason})
+            acc
+
+          {_read, :missing}, acc ->
             acc
 
           {_read, invalid}, acc ->
@@ -923,13 +1251,86 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         end)
       end
 
-      defp cross_shard_read_cold_meta_waraft_batch(results, _ctx, []), do: results
+      defp cross_shard_resolve_current_bitcask(
+             ctx,
+             data_path,
+             key,
+             _observed_entry,
+             expiry_context
+           ) do
+        case :ets.lookup(ctx.keydir, key) do
+          [{^key, value, exp, _lfu, fid, off, vsize} = current_entry]
+          when is_integer(exp) and exp >= 0 ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live when is_binary(value) ->
+                {:hot, value, current_entry}
 
-      defp cross_shard_read_cold_meta_waraft_batch(results, ctx, cold_reads) do
+              :live when valid_cold_location(fid, off, vsize) ->
+                path = sm_file_path_from_path(data_path, fid)
+                {:cold, path, off, current_entry}
+
+              :live ->
+                {:error, {:invalid_cold_location, {fid, off, vsize}}}
+
+              :expired ->
+                cross_shard_delete_keydir_entry(ctx, current_entry)
+                :missing
+
+              {:unsafe, reason} ->
+                {:error, reason}
+            end
+
+          [invalid_entry] ->
+            {:error, {:invalid_keydir_entry, key, invalid_entry}}
+
+          [] ->
+            :missing
+        end
+      rescue
+        ArgumentError -> {:error, :keydir_unavailable}
+      end
+
+      defp cross_shard_accept_current_batch_value(
+             ctx,
+             data_path,
+             {_key, _value, exp, _lfu, _fid, _off, _vsize} = current_entry,
+             materialized,
+             expiry_context
+           ) do
+        if Keydir.replace_exact(ctx.keydir, current_entry, current_entry) do
+          {materialized, exp}
+        else
+          cross_shard_retry_changed_cold_read(
+            ctx,
+            data_path,
+            elem(current_entry, 0),
+            expiry_context,
+            @cold_location_retry_attempts - 1,
+            :cold_location_changed_after_read
+          )
+        end
+      end
+
+      defp cross_shard_read_cold_meta_waraft_batch(
+             results,
+             _ctx,
+             [],
+             _data_path,
+             _expiry_context
+           ),
+           do: results
+
+      defp cross_shard_read_cold_meta_waraft_batch(
+             results,
+             ctx,
+             cold_reads,
+             data_path,
+             expiry_context
+           ) do
         cold_reads
-        |> Enum.group_by(fn {_index, _key, {:waraft, fid}, _exp} -> fid end)
+        |> Enum.group_by(fn {_index, _key, {:waraft, fid}, _entry} -> fid end)
         |> Enum.reduce(results, fn {fid, grouped}, acc ->
-          keys = Enum.map(grouped, fn {_index, key, _location, _exp} -> key end)
+          keys = Enum.map(grouped, fn {_index, key, _location, _entry} -> key end)
 
           case Ferricstore.Raft.WARaftSegmentReader.read_values_from_location(
                  ctx,
@@ -938,15 +1339,36 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                  keys
                ) do
             {:ok, values_by_key} when is_map(values_by_key) ->
-              Enum.reduce(grouped, acc, fn {index, key, _location, exp}, acc ->
+              Enum.reduce(grouped, acc, fn {index, key, _location, entry}, acc ->
                 case Map.fetch(values_by_key, key) do
                   {:ok, value} when is_binary(value) ->
-                    case materialize_cross_shard_cold_value(ctx, value) do
-                      materialized when is_binary(materialized) ->
-                        Map.put(acc, index, {materialized, exp})
+                    maybe_run_cold_read_success_hook(ctx, key)
 
-                      _failed ->
-                        acc
+                    case cross_shard_materialize_cold_value(ctx, value) do
+                      {:ok, materialized} ->
+                        case cross_shard_accept_current_batch_value(
+                               ctx,
+                               data_path,
+                               entry,
+                               materialized,
+                               expiry_context
+                             ) do
+                          nil -> acc
+                          current -> Map.put(acc, index, current)
+                        end
+
+                      {:error, reason} ->
+                        case cross_shard_retry_failed_cold_read(
+                               ctx,
+                               data_path,
+                               entry,
+                               expiry_context,
+                               @cold_location_retry_attempts,
+                               {:blob_ref_unavailable, reason}
+                             ) do
+                          nil -> acc
+                          current -> Map.put(acc, index, current)
+                        end
                     end
 
                   _missing ->

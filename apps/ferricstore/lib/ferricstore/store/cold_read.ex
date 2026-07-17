@@ -129,8 +129,16 @@ defmodule Ferricstore.Store.ColdRead do
       reads
       |> Enum.zip(values)
       |> Enum.map(fn
-        {{_path, _offset, _key, token}, value} when is_binary(value) ->
-          {:value, value, token}
+        {{path, offset, key, token}, value} when is_binary(value) ->
+          validate_successful_current_keyed_read(
+            path,
+            offset,
+            key,
+            token,
+            value,
+            resolve_current,
+            deadline_ms
+          )
 
         {{path, offset, key, token}, failed_value} ->
           retry_current_keyed_read(
@@ -145,6 +153,44 @@ defmodule Ferricstore.Store.ColdRead do
       end)
 
     {:ok, results}
+  end
+
+  defp validate_successful_current_keyed_read(
+         path,
+         offset,
+         key,
+         token,
+         value,
+         resolve_current,
+         deadline_ms
+       ) do
+    case call_current_keyed_resolver(resolve_current, key, token) do
+      {:hot, current_value, current_token} when is_binary(current_value) ->
+        {:value, current_value, current_token}
+
+      {:cold, ^path, ^offset, current_token} ->
+        {:value, value, current_token}
+
+      {:cold, current_path, current_offset, current_token}
+      when is_binary(current_path) and is_integer(current_offset) and current_offset >= 0 ->
+        retry_current_keyed_location(
+          current_path,
+          current_offset,
+          key,
+          current_token,
+          resolve_current,
+          deadline_ms
+        )
+
+      :missing ->
+        :missing
+
+      {:error, reason} ->
+        {:error, reason}
+
+      invalid ->
+        {:error, {:invalid_current_location, invalid}}
+    end
   end
 
   defp normalize_current_batch_values({:ok, values}, expected_count)
@@ -218,7 +264,15 @@ defmodule Ferricstore.Store.ColdRead do
       timeout_ms ->
         case pread_keyed(path, offset, key, timeout_ms) do
           {:ok, value} when is_binary(value) ->
-            {:value, value, token}
+            validate_successful_current_keyed_read(
+              path,
+              offset,
+              key,
+              token,
+              value,
+              resolve_current,
+              deadline_ms
+            )
 
           {:error, reason} ->
             retry_current_keyed_read(

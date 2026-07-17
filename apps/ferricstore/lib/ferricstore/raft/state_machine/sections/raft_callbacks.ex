@@ -487,6 +487,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
         append_pending_batch_sync(file_path, batch, batch_contains_delete?(batch))
       end
 
+      if Mix.env() == :test do
+        @doc false
+        def __sm_store_batch_get_for_test__(state, keys) when is_list(keys) do
+          init_pending_write_process_state(state)
+
+          try do
+            sm_store_batch_get(state, keys, &sm_file_path/2)
+          after
+            clear_pending_write_process_state()
+          end
+        end
+      end
+
       @doc false
       def __compensate_cross_shard_partial_writes_for_test__(
             state,

@@ -185,6 +185,157 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       assert [{^second, "new-2", 0, _, _, _, _}] = :ets.lookup(ets, second)
     end
 
+    test "transaction reads resolve the current row after a successful cold-read race", %{
+      state: state,
+      ets: ets
+    } do
+      key = "transaction_cold_success_replacement"
+
+      {:ok, {offset, value_size}} =
+        Ferricstore.Bitcask.NIF.v2_append_record(
+          state.active_file_path,
+          key,
+          "old-value",
+          0
+        )
+
+      :ets.insert(
+        ets,
+        {key, nil, 0, Ferricstore.Store.LFU.initial(), 0, offset, value_size}
+      )
+
+      replacement = {key, "new-value", 0, Ferricstore.Store.LFU.initial(), 0, 0, 9}
+
+      Process.put(:ferricstore_state_machine_cold_read_success_hook, fn _ctx, ^key ->
+        :ets.insert(ets, replacement)
+      end)
+
+      try do
+        {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("GET", [key])
+        {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+        wrapped = {{:tx_execute, [execution_entry], nil}, stamp_metadata(HLC.now())}
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert result == ["new-value"]
+        assert :ets.lookup(ets, key) == [replacement]
+      after
+        Process.delete(:ferricstore_state_machine_cold_read_success_hook)
+      end
+    end
+
+    test "transaction MGET revalidates successful cold batch reads", %{
+      state: state,
+      ets: ets
+    } do
+      key = "transaction_cold_batch_success_replacement"
+
+      {:ok, {offset, value_size}} =
+        Ferricstore.Bitcask.NIF.v2_append_record(
+          state.active_file_path,
+          key,
+          "old-value",
+          0
+        )
+
+      :ets.insert(
+        ets,
+        {key, nil, 0, Ferricstore.Store.LFU.initial(), 0, offset, value_size}
+      )
+
+      replacement = {key, "new-value", 0, Ferricstore.Store.LFU.initial(), 0, 0, 9}
+
+      Process.put(:ferricstore_state_machine_cold_read_success_hook, fn _ctx, ^key ->
+        :ets.insert(ets, replacement)
+      end)
+
+      try do
+        {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("MGET", [key])
+        {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+        wrapped = {{:tx_execute, [execution_entry], nil}, stamp_metadata(HLC.now())}
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert result == [["new-value"]]
+        assert :ets.lookup(ets, key) == [replacement]
+      after
+        Process.delete(:ferricstore_state_machine_cold_read_success_hook)
+      end
+    end
+
+    test "transaction HGETALL revalidates successful cold scan reads", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "transaction_cold_scan_success_replacement"
+      type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+      field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
+
+      {:ok, {offset, value_size}} =
+        Ferricstore.Bitcask.NIF.v2_append_record(
+          state.active_file_path,
+          field_key,
+          "old-value",
+          0
+        )
+
+      :ets.insert(ets, {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+
+      :ets.insert(
+        ets,
+        {field_key, nil, 0, Ferricstore.Store.LFU.initial(), 0, offset, value_size}
+      )
+
+      replacement = {field_key, "new-value", 0, Ferricstore.Store.LFU.initial(), 0, 0, 9}
+
+      Process.put(:ferricstore_state_machine_cold_read_success_hook, fn _ctx, ^field_key ->
+        :ets.insert(ets, replacement)
+      end)
+
+      try do
+        {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("HGETALL", [redis_key])
+        {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+        wrapped = {{:tx_execute, [execution_entry], nil}, stamp_metadata(HLC.now())}
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert result == [["field", "new-value"]]
+        assert :ets.lookup(ets, field_key) == [replacement]
+      after
+        Process.delete(:ferricstore_state_machine_cold_read_success_hook)
+      end
+    end
+
+    test "core batch reads revalidate a successful cold read before use", %{
+      state: state,
+      ets: ets
+    } do
+      key = "core_batch_cold_success_replacement"
+
+      {:ok, {offset, value_size}} =
+        Ferricstore.Bitcask.NIF.v2_append_record(
+          state.active_file_path,
+          key,
+          "old-value",
+          0
+        )
+
+      :ets.insert(
+        ets,
+        {key, nil, 0, Ferricstore.Store.LFU.initial(), 0, offset, value_size}
+      )
+
+      replacement = {key, "new-value", 0, Ferricstore.Store.LFU.initial(), 0, 0, 9}
+
+      Process.put(:ferricstore_state_machine_cold_read_success_hook, fn _state, ^key ->
+        :ets.insert(ets, replacement)
+      end)
+
+      try do
+        assert StateMachine.__sm_store_batch_get_for_test__(state, [key]) == ["new-value"]
+        assert :ets.lookup(ets, key) == [replacement]
+      after
+        Process.delete(:ferricstore_state_machine_cold_read_success_hook)
+      end
+    end
+
     test "unwraps and processes an incr_float command with hlc_ts metadata", %{
       state: state
     } do

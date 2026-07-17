@@ -164,7 +164,10 @@ defmodule Ferricstore.Store.ColdReadTest do
     assert {:ok, [{:value, "current-value", ^new_token}]} =
              ColdRead.pread_batch_keyed_current(
                [{source, old_offset, "key", old_token}],
-               fn "key", ^old_token -> {:cold, source, new_offset, new_token} end,
+               fn
+                 "key", ^old_token -> {:cold, source, new_offset, new_token}
+                 "key", ^new_token -> {:cold, source, new_offset, new_token}
+               end,
                5_000
              )
   end
@@ -180,6 +183,26 @@ defmodule Ferricstore.Store.ColdReadTest do
              ColdRead.pread_batch_keyed_current(
                [{missing_path, 0, "key", token}],
                fn "key", ^token -> {:hot, "hot-value", current_token} end,
+               5_000
+             )
+  end
+
+  test "current keyed batch reads revalidate successful disk values" do
+    dir =
+      Path.join(System.tmp_dir!(), "cold-read-success-race-#{System.unique_integer([:positive])}")
+
+    path = Path.join(dir, "00000.log")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    assert {:ok, [{offset, _size}]} = NIF.v2_append_batch(path, [{"key", "old-value", 0}])
+    old_token = {:keydir_row, :old}
+    new_token = {:keydir_row, :new}
+
+    assert {:ok, [{:value, "new-value", ^new_token}]} =
+             ColdRead.pread_batch_keyed_current(
+               [{path, offset, "key", old_token}],
+               fn "key", ^old_token -> {:hot, "new-value", new_token} end,
                5_000
              )
   end

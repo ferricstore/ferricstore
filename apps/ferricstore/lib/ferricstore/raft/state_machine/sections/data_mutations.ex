@@ -474,6 +474,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp sm_store_batch_get(state, keys, path_fun) do
         expiry_context = ExpiryContext.capture()
 
+        sm_store_batch_get(
+          state,
+          keys,
+          path_fun,
+          expiry_context,
+          @cold_location_retry_attempts
+        )
+      end
+
+      defp sm_store_batch_get(state, keys, path_fun, expiry_context, attempts_left) do
         {local_results, cold_reads, remote_entries} =
           keys
           |> Enum.with_index()
@@ -495,7 +505,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             local_results,
             Enum.reverse(cold_reads),
             path_fun,
-            expiry_context
+            expiry_context,
+            attempts_left
           )
 
         remote_entries
@@ -577,9 +588,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           {results, cold, remote}
       end
 
-      defp sm_store_read_cold_batch(_state, results, [], _path_fun, _expiry_context), do: results
+      defp sm_store_read_cold_batch(
+             _state,
+             results,
+             [],
+             _path_fun,
+             _expiry_context,
+             _attempts_left
+           ),
+           do: results
 
-      defp sm_store_read_cold_batch(state, results, cold_reads, path_fun, expiry_context) do
+      defp sm_store_read_cold_batch(
+             state,
+             results,
+             cold_reads,
+             path_fun,
+             expiry_context,
+             attempts_left
+           ) do
         {segment_reads, file_reads} =
           Enum.split_with(cold_reads, fn {_index, {_key, _value, _exp, _lfu, fid, off, _vsize}} ->
             valid_waraft_segment_location(fid, off, 0)
@@ -591,10 +617,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             results,
             file_reads,
             path_fun,
-            expiry_context
+            expiry_context,
+            attempts_left
           )
 
-        sm_store_read_waraft_segment_batch(state, results, segment_reads)
+        sm_store_read_waraft_segment_batch(
+          state,
+          results,
+          segment_reads,
+          path_fun,
+          expiry_context,
+          attempts_left
+        )
       end
 
       defp sm_store_read_bitcask_cold_batch(
@@ -602,7 +636,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
              results,
              [],
              _path_fun,
-             _expiry_context
+             _expiry_context,
+             _attempts_left
            ),
            do: results
 
@@ -611,7 +646,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
              results,
              cold_reads,
              path_fun,
-             expiry_context
+             expiry_context,
+             attempts_left
            ) do
         reads =
           Enum.map(cold_reads, fn {_index, {key, nil, _exp, _lfu, fid, off, _vsize} = entry} ->
@@ -647,16 +683,37 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         |> Enum.reduce(results, fn
           {{index, _observed_entry}, {:value, value, current_entry}, materialized}, acc
           when is_binary(value) and is_binary(materialized) ->
-            sm_store_maybe_warm_current_entry(state, current_entry, value)
-            Map.put(acc, index, materialized)
+            maybe_run_cold_read_success_hook(state, elem(current_entry, 0))
+
+            case sm_store_accept_current_batch_value(
+                   state,
+                   current_entry,
+                   value,
+                   materialized,
+                   path_fun,
+                   expiry_context,
+                   attempts_left
+                 ) do
+              {:ok, current} -> Map.put(acc, index, current)
+              :missing -> acc
+            end
 
           {{_index, _observed_entry}, {:error, reason}, _materialized}, acc ->
             record_state_read_failure({:cold_value_unavailable, reason})
             acc
 
-          {{_index, _observed_entry}, {:value, _value, _current_entry}, {:error, reason}}, acc ->
-            record_state_read_failure(reason)
-            acc
+          {{index, _observed_entry}, {:value, _value, current_entry}, {:error, reason}}, acc ->
+            case sm_store_retry_failed_current_batch_value(
+                   state,
+                   current_entry,
+                   path_fun,
+                   expiry_context,
+                   attempts_left,
+                   reason
+                 ) do
+              {:ok, current} -> Map.put(acc, index, current)
+              :missing -> acc
+            end
 
           {_read, _current_result, _materialized}, acc ->
             acc
@@ -702,26 +759,128 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         ArgumentError -> :missing
       end
 
-      defp sm_store_maybe_warm_current_entry(
+      defp sm_store_accept_current_batch_value(
              state,
              {key, nil, _exp, _lfu, _fid, _off, _vsize} = current_entry,
-             value
+             encoded_value,
+             encoded_value,
+             path_fun,
+             expiry_context,
+             attempts_left
            ) do
-        ets_value = value_for_ets(value, hot_cache_threshold(state))
+        ets_value = value_for_ets(encoded_value, hot_cache_threshold(state))
         replacement = put_elem(current_entry, 1, ets_value)
 
         if Keydir.replace_exact(state.ets, current_entry, replacement) do
           track_keydir_binary_warm(state, ets_value)
+          {:ok, encoded_value}
+        else
+          sm_store_retry_changed_batch_value(
+            state,
+            key,
+            path_fun,
+            expiry_context,
+            attempts_left - 1
+          )
         end
-
-        :ok
       end
 
-      defp sm_store_maybe_warm_current_entry(_state, _current_entry, _value), do: :ok
+      defp sm_store_accept_current_batch_value(
+             state,
+             {key, _value, _exp, _lfu, _fid, _off, _vsize} = current_entry,
+             _encoded_value,
+             materialized,
+             path_fun,
+             expiry_context,
+             attempts_left
+           ) do
+        if Keydir.replace_exact(state.ets, current_entry, current_entry) do
+          {:ok, materialized}
+        else
+          sm_store_retry_changed_batch_value(
+            state,
+            key,
+            path_fun,
+            expiry_context,
+            attempts_left - 1
+          )
+        end
+      end
 
-      defp sm_store_read_waraft_segment_batch(_state, results, []), do: results
+      defp sm_store_retry_failed_current_batch_value(
+             state,
+             {key, _value, _exp, _lfu, _fid, _off, _vsize} = current_entry,
+             path_fun,
+             expiry_context,
+             attempts_left,
+             reason
+           ) do
+        if Keydir.replace_exact(state.ets, current_entry, current_entry) do
+          record_state_read_failure(reason)
+          :missing
+        else
+          sm_store_retry_changed_batch_value(
+            state,
+            key,
+            path_fun,
+            expiry_context,
+            attempts_left - 1
+          )
+        end
+      end
 
-      defp sm_store_read_waraft_segment_batch(state, results, segment_reads) do
+      defp sm_store_retry_changed_batch_value(
+             _state,
+             _key,
+             _path_fun,
+             _expiry_context,
+             attempts_left
+           )
+           when attempts_left <= 0 do
+        record_state_read_failure({:cold_value_unavailable, :cold_location_changed_after_read})
+
+        :missing
+      end
+
+      defp sm_store_retry_changed_batch_value(
+             state,
+             key,
+             path_fun,
+             expiry_context,
+             attempts_left
+           ) do
+        Process.sleep(@cold_location_retry_sleep_ms)
+
+        case sm_store_batch_get(
+               state,
+               [key],
+               path_fun,
+               expiry_context,
+               attempts_left
+             ) do
+          [value] when is_binary(value) -> {:ok, value}
+          _missing_or_failed -> :missing
+        end
+      end
+
+      defp sm_store_read_waraft_segment_batch(
+             _state,
+             results,
+             [],
+             _path_fun,
+             _expiry_context,
+             _attempts_left
+           ),
+           do: results
+
+      defp sm_store_read_waraft_segment_batch(
+             state,
+             results,
+             segment_reads,
+             path_fun,
+             expiry_context,
+             attempts_left
+           ) do
         ctx = instance_ctx_for_state(state)
 
         Enum.reduce(segment_reads, results, fn
@@ -733,7 +892,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                    key
                  ) do
               {:ok, value} when is_binary(value) ->
-                sm_store_merge_segment_value(state, acc, index, entry, value)
+                maybe_run_cold_read_success_hook(state, key)
+
+                sm_store_merge_segment_value(
+                  state,
+                  acc,
+                  index,
+                  entry,
+                  value,
+                  path_fun,
+                  expiry_context,
+                  attempts_left
+                )
 
               {:error, reason} ->
                 record_state_read_failure({:waraft_value_unavailable, reason})
@@ -750,23 +920,48 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end)
       end
 
-      defp sm_store_merge_segment_value(state, acc, index, entry, value) do
+      defp sm_store_merge_segment_value(
+             state,
+             acc,
+             index,
+             entry,
+             value,
+             path_fun,
+             expiry_context,
+             attempts_left
+           ) do
         case BlobValue.maybe_materialize(
                Map.get(blob_apply_ctx(state), :data_dir),
                state.shard_index,
                BlobValue.threshold(blob_apply_ctx(state)),
                value
              ) do
-          {:ok, ^value} ->
-            sm_store_maybe_warm_current_entry(state, entry, value)
-            Map.put(acc, index, value)
-
           {:ok, materialized} when is_binary(materialized) ->
-            Map.put(acc, index, materialized)
+            case sm_store_accept_current_batch_value(
+                   state,
+                   entry,
+                   value,
+                   materialized,
+                   path_fun,
+                   expiry_context,
+                   attempts_left
+                 ) do
+              {:ok, current} -> Map.put(acc, index, current)
+              :missing -> acc
+            end
 
           {:error, reason} ->
-            record_state_read_failure({:blob_ref_unavailable, reason})
-            acc
+            case sm_store_retry_failed_current_batch_value(
+                   state,
+                   entry,
+                   path_fun,
+                   expiry_context,
+                   attempts_left,
+                   {:blob_ref_unavailable, reason}
+                 ) do
+              {:ok, current} -> Map.put(acc, index, current)
+              :missing -> acc
+            end
         end
       end
 
