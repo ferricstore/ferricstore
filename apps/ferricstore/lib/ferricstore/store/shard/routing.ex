@@ -555,21 +555,25 @@ defmodule Ferricstore.Store.Shard.Routing do
             {result, apply_direct_sm_state(state, new_sm_state)}
 
           {:error, reason, new_sm_state} ->
-            state =
-              state
-              |> apply_direct_sm_state(new_sm_state)
-              |> Map.put(:writes_paused, true)
-              |> Map.put(:last_flush_error, reason)
-
-            {{:error, {:standalone_durability_failed, reason}}, state}
+            state
+            |> apply_direct_sm_state(new_sm_state)
+            |> finish_standalone_cross_shard_error(reason)
 
           {:error, reason} ->
-            state =
-              state
-              |> Map.put(:writes_paused, true)
-              |> Map.put(:last_flush_error, reason)
+            finish_standalone_cross_shard_error(state, reason)
+        end
+      end
 
-            {{:error, {:standalone_durability_failed, reason}}, state}
+      defp finish_standalone_cross_shard_error(state, reason) do
+        if Ferricstore.Raft.ApplyFailure.storage_reason?(reason) do
+          state =
+            state
+            |> Map.put(:writes_paused, true)
+            |> Map.put(:last_flush_error, reason)
+
+          {{:error, {:standalone_durability_failed, reason}}, state}
+        else
+          {{:error, reason}, state}
         end
       end
 

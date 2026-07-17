@@ -208,7 +208,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
               _value_scan, _hibernation_enabled, _hot_window_ms, _safety_margin_ms,
               _promote_window_ms, _late_promote_window_ms, _flow_max_batch_items,
               _promotion_threshold, _compound_member_apply_budget, _transaction_command_budget,
-              _transaction_result_byte_budget, _max_value_size} =
+              _transaction_key_apply_budget, _transaction_result_byte_budget, _max_value_size} =
                encoded
            ) do
         case Ferricstore.Raft.ApplyContext.decode(encoded) do

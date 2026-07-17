@@ -337,6 +337,91 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
         assert [{^first_key, "one", _, _, _, _, _}] = :ets.lookup(ets, first_key)
       end
 
+      @tag :transaction_key_apply_budget
+      test "transaction key budget rejects oversized MSET before staging", %{
+        state: state,
+        ets: ets
+      } do
+        first_key = "tx-key-budget-mset-first"
+        second_key = "tx-key-budget-mset-second"
+        context = ApplyContext.new(transaction_key_apply_budget: 1)
+
+        {:ok, oversized} =
+          Ferricstore.Commands.PreparedCommand.prepare(
+            "MSET",
+            [first_key, "one", second_key, "two"]
+          )
+
+        {:ok, oversized_entry} =
+          Ferricstore.Transaction.ExecutionEntry.from_prepared(oversized)
+
+        limited_state = %{
+          state
+          | apply_context: context,
+            apply_context_encoded: ApplyContext.encode(context)
+        }
+
+        assert {_state, {:error, :transaction_key_apply_budget_exceeded}} =
+                 StateMachine.apply(
+                   %{},
+                   {:tx_execute, [oversized_entry], nil},
+                   limited_state
+                 )
+
+        assert [] = :ets.lookup(ets, first_key)
+        assert [] = :ets.lookup(ets, second_key)
+
+        {:ok, exact} =
+          Ferricstore.Commands.PreparedCommand.prepare("MSET", [first_key, "one"])
+
+        {:ok, exact_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(exact)
+
+        assert {_state, [:ok]} =
+                 StateMachine.apply(%{}, {:tx_execute, [exact_entry], nil}, limited_state)
+
+        assert [{^first_key, "one", _, _, _, _, _}] = :ets.lookup(ets, first_key)
+      end
+
+      @tag :transaction_key_apply_budget
+      test "transaction key budget rejects oversized MGET before dispatch", %{
+        state: state,
+        ets: ets
+      } do
+        first_key = "tx-key-budget-mget-first"
+        second_key = "tx-key-budget-mget-second"
+        context = ApplyContext.new(transaction_key_apply_budget: 1)
+
+        :ets.insert(ets, {first_key, "one", 0, LFU.initial(), 0, 0, 3})
+        :ets.insert(ets, {second_key, "two", 0, LFU.initial(), 0, 0, 3})
+
+        {:ok, oversized} =
+          Ferricstore.Commands.PreparedCommand.prepare("MGET", [first_key, second_key])
+
+        {:ok, oversized_entry} =
+          Ferricstore.Transaction.ExecutionEntry.from_prepared(oversized)
+
+        limited_state = %{
+          state
+          | apply_context: context,
+            apply_context_encoded: ApplyContext.encode(context)
+        }
+
+        assert {_state, {:error, :transaction_key_apply_budget_exceeded}} =
+                 StateMachine.apply(
+                   %{},
+                   {:tx_execute, [oversized_entry], nil},
+                   limited_state
+                 )
+
+        {:ok, exact} =
+          Ferricstore.Commands.PreparedCommand.prepare("MGET", [first_key])
+
+        {:ok, exact_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(exact)
+
+        assert {_state, [["one"]]} =
+                 StateMachine.apply(%{}, {:tx_execute, [exact_entry], nil}, limited_state)
+      end
+
       @tag :transaction_compound_mutation_budget
       test "transaction compound batch puts are admitted before staging", %{
         state: state,
@@ -368,7 +453,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
             apply_context_encoded: ApplyContext.encode(context)
         }
 
-        assert {_state, {:error, :transaction_compound_mutation_budget_exceeded}} =
+        assert {_state, {:error, :transaction_compound_read_budget_exceeded}} =
                  StateMachine.apply(
                    %{},
                    {:tx_execute, [oversized_entry], nil},
@@ -430,7 +515,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
             apply_context_encoded: ApplyContext.encode(context)
         }
 
-        assert {_state, {:error, :transaction_compound_mutation_budget_exceeded}} =
+        assert {_state, {:error, :transaction_compound_read_budget_exceeded}} =
                  StateMachine.apply(
                    %{},
                    {:tx_execute, [oversized_entry], nil},
@@ -440,6 +525,96 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
         assert [{^type_key, "hash", _, _, _, _, _}] = :ets.lookup(ets, type_key)
         assert [{^field_a, "one", _, _, _, _, _}] = :ets.lookup(ets, field_a)
         assert [{^field_b, "two", _, _, _, _, _}] = :ets.lookup(ets, field_b)
+      end
+
+      @tag :transaction_compound_batch_read_budget
+      test "transaction compound batch reads are admitted before storage access", %{
+        state: state,
+        ets: ets
+      } do
+        context = ApplyContext.new(compound_member_apply_budget: 1)
+
+        limited_state = %{
+          state
+          | apply_context: context,
+            apply_context_encoded: ApplyContext.encode(context)
+        }
+
+        fixtures = [
+          {
+            "HMGET",
+            "tx-compound-batch-read-hash",
+            "hash",
+            &CompoundKey.hash_field/2,
+            ["a", "b"],
+            ["one", "two"],
+            ["one"]
+          },
+          {
+            "SMISMEMBER",
+            "tx-compound-batch-read-set",
+            "set",
+            &CompoundKey.set_member/2,
+            ["a", "b"],
+            [<<1>>, <<1>>],
+            [1]
+          },
+          {
+            "ZMSCORE",
+            "tx-compound-batch-read-zset",
+            "zset",
+            &CompoundKey.zset_member/2,
+            ["a", "b"],
+            ["1", "2"],
+            ["1.0"]
+          }
+        ]
+
+        Enum.each(
+          fixtures,
+          fn {command, redis_key, type, compound_key_fun, members, values, exact_result} ->
+            type_key = CompoundKey.type_key(redis_key)
+            :ets.insert(ets, {type_key, type, 0, LFU.initial(), 0, 0, byte_size(type)})
+
+            Enum.zip(members, values)
+            |> Enum.each(fn {member, value} ->
+              compound_key = compound_key_fun.(redis_key, member)
+
+              :ets.insert(
+                ets,
+                {compound_key, value, 0, LFU.initial(), 0, 0, byte_size(value)}
+              )
+            end)
+
+            {:ok, oversized} =
+              Ferricstore.Commands.PreparedCommand.prepare(command, [redis_key | members])
+
+            {:ok, oversized_entry} =
+              Ferricstore.Transaction.ExecutionEntry.from_prepared(oversized)
+
+            assert {_state, {:error, :transaction_compound_read_budget_exceeded}} =
+                     StateMachine.apply(
+                       %{},
+                       {:tx_execute, [oversized_entry], nil},
+                       limited_state
+                     )
+
+            {:ok, exact} =
+              Ferricstore.Commands.PreparedCommand.prepare(command, [redis_key, hd(members)])
+
+            {:ok, exact_entry} =
+              Ferricstore.Transaction.ExecutionEntry.from_prepared(exact)
+
+            {_state, exact_apply_result} =
+              StateMachine.apply(
+                %{},
+                {:tx_execute, [exact_entry], nil},
+                limited_state
+              )
+
+            assert [^exact_result] = exact_apply_result
+          end
+        )
       end
 
       @tag :transaction_expired_overlay

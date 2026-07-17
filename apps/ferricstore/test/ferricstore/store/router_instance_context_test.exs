@@ -71,6 +71,25 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
                    1_000
   end
 
+  @tag :standalone_cross_shard_command_error
+  test "standalone cross-shard command errors do not pause the coordinator", %{ctx: ctx} do
+    {source, destination} = different_shard_keys(ctx)
+    coordinator = min(Router.shard_for(ctx, source), Router.shard_for(ctx, destination))
+    coordinator_name = elem(ctx.shard_names, coordinator)
+    coordinator_pid = Process.whereis(coordinator_name)
+
+    assert {:error, "ERR no such key"} =
+             Ferricstore.Commands.Generic.handle("RENAME", [source, destination], ctx)
+
+    assert %{writes_paused: false, last_flush_error: nil} = :sys.get_state(coordinator_pid)
+
+    coordinator_key =
+      if Router.shard_for(ctx, source) == coordinator, do: source, else: destination
+
+    assert :ok = Router.put(ctx, coordinator_key, "after-command-error", 0)
+    assert "after-command-error" == Router.get(ctx, coordinator_key)
+  end
+
   test "cross-shard publication does not expose a mixed batch snapshot", %{ctx: ctx} do
     {first, second} = different_shard_keys(ctx)
     assert :ok = Router.put(ctx, first, "old-1", 0)

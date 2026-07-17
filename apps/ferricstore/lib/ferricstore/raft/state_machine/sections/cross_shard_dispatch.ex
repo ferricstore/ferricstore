@@ -1262,10 +1262,68 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         :ok
       end
 
-      defp admit_transaction_compound_batch_work!(items, anchor_state) do
+      defp admit_transaction_compound_batch_read_work!(items, anchor_state) do
         remaining = transaction_compound_member_budget_remaining(anchor_state)
 
-        case compound_batch_work_up_to(items, remaining, 0) do
+        case compound_batch_read_work_up_to(items, remaining, 0, MapSet.new()) do
+          {:ok, count, read_keys} ->
+            charge_transaction_compound_member_work!(count)
+
+            Process.put(
+              :tx_current_command_compound_reads,
+              MapSet.union(
+                Process.get(:tx_current_command_compound_reads, MapSet.new()),
+                read_keys
+              )
+            )
+
+            :ok
+
+          :limit_exceeded ->
+            throw({
+              :transaction_store_failure,
+              :transaction_compound_read_budget_exceeded
+            })
+
+          :invalid ->
+            throw({:transaction_store_failure, :invalid_compound_read_batch})
+        end
+      end
+
+      defp compound_batch_read_work_up_to([], _remaining, count, read_keys),
+        do: {:ok, count, read_keys}
+
+      defp compound_batch_read_work_up_to([_item | _rest], 0, _count, _read_keys),
+        do: :limit_exceeded
+
+      defp compound_batch_read_work_up_to(
+             [key | rest],
+             remaining,
+             count,
+             read_keys
+           )
+           when is_binary(key) do
+        compound_batch_read_work_up_to(
+          rest,
+          remaining - 1,
+          count + 1,
+          MapSet.put(read_keys, key)
+        )
+      end
+
+      defp compound_batch_read_work_up_to(
+             _invalid,
+             _remaining,
+             _count,
+             _read_keys
+           ),
+           do: :invalid
+
+      defp admit_transaction_compound_batch_work!(items, anchor_state) do
+        remaining = transaction_compound_member_budget_remaining(anchor_state)
+        read_keys = Process.get(:tx_current_command_compound_reads, MapSet.new())
+
+        case compound_mutation_batch_work_up_to(items, read_keys, remaining, 0) do
           {:ok, count} ->
             charge_transaction_compound_member_work!(count)
 
@@ -1280,14 +1338,51 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         end
       end
 
-      defp compound_batch_work_up_to([], _remaining, count), do: {:ok, count}
-      defp compound_batch_work_up_to([_item | _rest], 0, _count), do: :limit_exceeded
+      defp compound_mutation_batch_work_up_to([], _read_keys, _remaining, count),
+        do: {:ok, count}
 
-      defp compound_batch_work_up_to([_item | rest], remaining, count) do
-        compound_batch_work_up_to(rest, remaining - 1, count + 1)
+      defp compound_mutation_batch_work_up_to(
+             [item | rest],
+             read_keys,
+             remaining,
+             count
+           ) do
+        case compound_mutation_key(item) do
+          {:ok, key} ->
+            if MapSet.member?(read_keys, key) do
+              compound_mutation_batch_work_up_to(rest, read_keys, remaining, count)
+            else
+              if remaining == 0 do
+                :limit_exceeded
+              else
+                compound_mutation_batch_work_up_to(
+                  rest,
+                  read_keys,
+                  remaining - 1,
+                  count + 1
+                )
+              end
+            end
+
+          :error ->
+            :invalid
+        end
       end
 
-      defp compound_batch_work_up_to(_improper_tail, _remaining, _count), do: :invalid
+      defp compound_mutation_batch_work_up_to(
+             _improper_tail,
+             _read_keys,
+             _remaining,
+             _count
+           ),
+           do: :invalid
+
+      defp compound_mutation_key(key) when is_binary(key), do: {:ok, key}
+
+      defp compound_mutation_key({key, _value, _expire_at_ms}) when is_binary(key),
+        do: {:ok, key}
+
+      defp compound_mutation_key(_invalid), do: :error
 
       defp transaction_result_byte_budget_remaining(anchor_state) do
         max(
@@ -2218,10 +2313,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             cross_shard_compound_read_meta(ctx, redis_key, compound_key)
           end,
           compound_batch_get: fn redis_key, compound_keys ->
+            :ok = admit_transaction_compound_batch_read_work!(compound_keys, anchor_state)
             ctx = ctx_for_key.(redis_key)
             cross_shard_compound_batch_read(ctx, redis_key, compound_keys)
           end,
           compound_batch_get_meta: fn redis_key, compound_keys ->
+            :ok = admit_transaction_compound_batch_read_work!(compound_keys, anchor_state)
             ctx = ctx_for_key.(redis_key)
             cross_shard_compound_batch_read_meta(ctx, redis_key, compound_keys)
           end,
@@ -2475,6 +2572,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           shard_index: default_ctx.index,
           data_dir: data_dir,
           transaction_command_budget: anchor_state.apply_context.transaction_command_budget,
+          transaction_key_apply_budget: anchor_state.apply_context.transaction_key_apply_budget,
           transaction_result_byte_budget:
             anchor_state.apply_context.transaction_result_byte_budget
         }

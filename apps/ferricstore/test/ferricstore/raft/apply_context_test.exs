@@ -33,6 +33,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     :promotion_threshold,
     :compound_member_apply_budget,
     :transaction_command_budget,
+    :transaction_key_apply_budget,
     :transaction_result_byte_budget,
     :flow_max_batch_items,
     :max_value_size
@@ -155,7 +156,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     old_shape =
       context
       |> ApplyContext.encode()
-      |> Tuple.delete_at(tuple_size(ApplyContext.encode(context)) - 5)
+      |> Tuple.delete_at(tuple_size(ApplyContext.encode(context)) - 6)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(old_shape)
   end
@@ -248,7 +249,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 4, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 5, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
@@ -286,6 +287,25 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 4, hard_max + 1)
+
+    assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
+  end
+
+  test "transaction key apply budget is bounded and preserved by the replicated context" do
+    context = ApplyContext.new(transaction_key_apply_budget: 8)
+
+    assert context.transaction_key_apply_budget == 8
+    assert {:ok, ^context} = context |> ApplyContext.encode() |> ApplyContext.decode()
+
+    hard_max = 100_000
+
+    assert ApplyContext.new(transaction_key_apply_budget: hard_max + 1).transaction_key_apply_budget ==
+             hard_max
+
+    oversized =
+      context
+      |> ApplyContext.encode()
       |> put_elem(tuple_size(ApplyContext.encode(context)) - 3, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
@@ -303,7 +323,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 6, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 7, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
