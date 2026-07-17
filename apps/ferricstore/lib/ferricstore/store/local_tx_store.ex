@@ -34,8 +34,10 @@ defmodule Ferricstore.Store.LocalTxStore do
         promoted_instances: Map.get(state, :promoted_instances, %{}),
         compound_member_index:
           Map.get(state, :compound_member_index) || Map.get(state, :compound_member_index_name),
-        zset_score_index: Map.get(state, :zset_score_index),
-        zset_score_lookup: Map.get(state, :zset_score_lookup)
+        zset_score_index:
+          Map.get(state, :zset_score_index) || Map.get(state, :zset_score_index_name),
+        zset_score_lookup:
+          Map.get(state, :zset_score_lookup) || Map.get(state, :zset_score_lookup_name)
       }
     }
   end
