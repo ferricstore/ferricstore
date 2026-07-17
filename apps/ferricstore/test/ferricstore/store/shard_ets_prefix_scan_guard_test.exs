@@ -7,6 +7,7 @@ defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS
+  alias Ferricstore.Store.Shard.ZSetIndex
 
   @prefix_scan_path Path.expand(
                       "../../../lib/ferricstore/store/shard/ets/prefix_scan.ex",
@@ -171,6 +172,42 @@ defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
       assert Enum.all?(expired_fields, fn field -> :ets.lookup(keydir, prefix <> field) == [] end)
       assert :ets.info(keydir, :size) == length(live_fields)
     after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "prefix expiry cleanup evicts a ready zset score-index member" do
+    keydir = :ets.new(:prefix_scan_zset_expiry_keydir, [:set, :public])
+    index = :ets.new(:prefix_scan_zset_expiry_index, [:ordered_set, :public])
+    lookup = :ets.new(:prefix_scan_zset_expiry_lookup, [:set, :public])
+    redis_key = "expired-zset"
+    member = "member"
+    prefix = CompoundKey.zset_prefix(redis_key)
+    compound_key = CompoundKey.zset_member(redis_key, member)
+    expired = {compound_key, "1", 1, 0, 0, 0, 1}
+
+    state = %{
+      keydir: keydir,
+      zset_score_index: index,
+      zset_score_lookup: lookup
+    }
+
+    try do
+      true = :ets.insert(keydir, expired)
+      :ok = ZSetIndex.mark_ready_empty(index, lookup, redis_key)
+      :ok = ZSetIndex.put_member(index, lookup, redis_key, member, "1")
+
+      assert [] =
+               CommandTime.with_now_ms(10, fn ->
+                 ETS.prefix_scan_entries(state, prefix, nil)
+               end)
+
+      assert [] == :ets.lookup(keydir, compound_key)
+      assert [] == ZSetIndex.rank_range(index, redis_key, 0, 10, false)
+      assert 0 == ZSetIndex.count(index, lookup, redis_key, :neg_inf, :inf)
+    after
+      :ets.delete(lookup)
+      :ets.delete(index)
       :ets.delete(keydir)
     end
   end

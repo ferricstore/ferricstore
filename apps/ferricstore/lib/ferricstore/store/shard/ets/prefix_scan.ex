@@ -2,9 +2,8 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   @moduledoc false
 
   alias Ferricstore.CommandTime
-  alias Ferricstore.Store.{BlobValue, ColdRead, Keydir, ReadResult}
+  alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult}
   alias Ferricstore.Store.Shard.CompoundMemberIndex
-  alias Ferricstore.Store.Shard.ETS.Accounting
 
   @cold_batch_read_timeout_ms 10_000
   @bounded_select_chunk_size 128
@@ -678,13 +677,13 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   def maybe_delete_expired_prefix_entry(state, keydir, entry),
     do: delete_prefix_entry(state, keydir, entry)
 
+  def delete_prefix_entry(%{keydir: keydir} = state, keydir, entry),
+    do: Ferricstore.Store.Shard.ETS.delete_exact_entry(state, entry)
+
   def delete_prefix_entry(state, keydir, entry) do
-    if Keydir.delete_exact(keydir, entry) do
-      Accounting.track_binary_delete_entry(state, entry)
-      true
-    else
-      false
-    end
+    state
+    |> Map.put(:keydir, keydir)
+    |> Ferricstore.Store.Shard.ETS.delete_exact_entry(entry)
   end
 
   defp file_path(shard_path, {:flow_history, file_id}) do
