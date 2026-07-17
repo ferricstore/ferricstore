@@ -385,9 +385,33 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec prob_write(FerricStore.Instance.t(), tuple()) :: term()
       def prob_write(ctx, command) do
+        with {:ok, key, idx} <- prob_write_route(ctx, command) do
+          raft_write(ctx, idx, key, command)
+        end
+      end
+
+      @doc false
+      @spec prob_write_route(FerricStore.Instance.t(), tuple()) ::
+              {:ok, binary(), non_neg_integer()} | {:error, binary()}
+      def prob_write_route(
+            ctx,
+            {:cms_merge, dst_key, src_keys, _weights, _create_params}
+          )
+          when is_binary(dst_key) and is_list(src_keys) do
+        idx = shard_for(ctx, dst_key)
+
+        if Enum.all?(src_keys, fn key ->
+             is_binary(key) and shard_for(ctx, key) == idx
+           end) do
+          {:ok, dst_key, idx}
+        else
+          {:error, "CROSSSLOT CMS.MERGE keys must hash to the same shard"}
+        end
+      end
+
+      def prob_write_route(ctx, command) do
         key = extract_prob_key(command)
-        idx = shard_for(ctx, key)
-        raft_write(ctx, idx, key, command)
+        {:ok, key, shard_for(ctx, key)}
       end
 
       defp extract_prob_key({:bloom_create, key, _, _, _}), do: key

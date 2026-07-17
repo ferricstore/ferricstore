@@ -327,7 +327,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           assert Enum.any?(records, &match?({"batch_cms", _off, _size, 0, false}, &1))
         end
 
-        test "CMS merge resolves replicated source keys through local shard paths" do
+        @tag :cms_merge_locality
+        test "CMS merge rejects source keys owned by another Raft shard" do
           root =
             Path.join(System.tmp_dir!(), "sm_cms_merge_#{System.unique_integer([:positive])}")
 
@@ -370,8 +371,62 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
                 state
               )
 
-            assert :ok = apply_result_value(apply_result)
+            assert {:error, "CROSSSLOT CMS.MERGE keys must hash to the same shard"} =
+                     apply_result_value(apply_result)
 
+            assert {:error, :enoent} = NIF.cms_file_query(dst_path, ["element"])
+          after
+            :ets.delete(ets)
+            FerricStore.Instance.cleanup(instance_name)
+            File.rm_rf!(root)
+          end
+        end
+
+        @tag :cms_merge_locality
+        test "CMS merge reads co-located sources from the applying shard" do
+          root =
+            Path.join(
+              System.tmp_dir!(),
+              "sm_cms_local_merge_#{System.unique_integer([:positive])}"
+            )
+
+          instance_name = :"sm_cms_local_merge_#{System.unique_integer([:positive])}"
+          ctx = FerricStore.Instance.build(instance_name, data_dir: root, shard_count: 4)
+
+          src_key = key_for_shard(ctx, "cms_local_src", 0)
+          dst_key = key_for_shard(ctx, "cms_local_dst", 0)
+          shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+          prob_dir = Path.join(shard_path, "prob")
+          src_path = prob_test_path(prob_dir, src_key, "cms")
+          dst_path = prob_test_path(prob_dir, dst_key, "cms")
+          ets = :ets.new(:"sm_cms_local_merge_#{System.unique_integer([:positive])}", [:set])
+
+          try do
+            File.mkdir_p!(prob_dir)
+            File.touch!(Path.join(shard_path, "00000.log"))
+
+            assert {:ok, _} = NIF.cms_file_create(src_path, 64, 4)
+            assert {:ok, _} = NIF.cms_file_incrby(src_path, [{"element", 9}])
+
+            state =
+              StateMachine.init(%{
+                shard_index: 0,
+                shard_data_path: shard_path,
+                active_file_id: 0,
+                active_file_path: Path.join(shard_path, "00000.log"),
+                ets: ets,
+                instance_ctx: ctx,
+                instance_name: instance_name
+              })
+
+            apply_result =
+              StateMachine.apply(
+                %{},
+                {:cms_merge, dst_key, [src_key], [1], %{width: 64, depth: 4}},
+                state
+              )
+
+            assert :ok = apply_result_value(apply_result)
             assert {:ok, [9]} = NIF.cms_file_query(dst_path, ["element"])
           after
             :ets.delete(ets)

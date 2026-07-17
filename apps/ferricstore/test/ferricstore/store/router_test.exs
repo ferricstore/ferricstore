@@ -56,6 +56,44 @@ defmodule Ferricstore.Store.RouterTest do
     end
   end
 
+  describe "probabilistic write routing" do
+    test "CMS.MERGE requires every source to share the destination shard" do
+      slot_map =
+        0..(SlotMap.num_slots() - 1)
+        |> Enum.map(&rem(&1, 2))
+        |> List.to_tuple()
+
+      ctx = %FerricStore.Instance{slot_map: slot_map, shard_count: 2}
+      destination = "cms-route-destination"
+      destination_shard = Router.shard_for(ctx, destination)
+
+      same_shard_source =
+        Enum.find_value(0..10_000, fn suffix ->
+          key = "cms-route-same-#{suffix}"
+          if Router.shard_for(ctx, key) == destination_shard, do: key
+        end)
+
+      other_shard_source =
+        Enum.find_value(0..10_000, fn suffix ->
+          key = "cms-route-other-#{suffix}"
+          if Router.shard_for(ctx, key) != destination_shard, do: key
+        end)
+
+      command =
+        {:cms_merge, destination, [same_shard_source], [1], %{width: 64, depth: 4}}
+
+      assert {:ok, ^destination, ^destination_shard} =
+               Router.prob_write_route(ctx, command)
+
+      cross_shard_command =
+        {:cms_merge, destination, [same_shard_source, other_shard_source], [1, 1],
+         %{width: 64, depth: 4}}
+
+      assert {:error, "CROSSSLOT CMS.MERGE keys must hash to the same shard"} =
+               Router.prob_write_route(ctx, cross_shard_command)
+    end
+  end
+
   describe "shard_name/1" do
     test "returns unique atoms per index" do
       names = Enum.map(0..3, fn i -> Router.shard_name(FerricStore.Instance.get(:default), i) end)

@@ -661,22 +661,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp cms_source_paths(state, src_keys) do
-        Enum.map(src_keys, &prob_path_for_key(state, &1, "cms"))
+        Enum.map(src_keys, &prob_path(state, &1, "cms"))
       end
 
-      defp prob_path_for_key(state, key, ext) do
-        prob_dir =
-          case instance_ctx_for_state(state) do
-            %FerricStore.Instance{} = ctx ->
-              idx = Router.shard_for(ctx, key)
-              shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-              Path.join(shard_path, "prob")
+      defp validate_cms_merge_locality(
+             state,
+             dst_key,
+             src_keys,
+             weights,
+             create_params
+           ) do
+        case instance_ctx_for_state(state) do
+          %FerricStore.Instance{} = ctx ->
+            command = {:cms_merge, dst_key, src_keys, weights, create_params}
 
-            _ ->
-              prob_dir(state)
-          end
+            case Router.prob_write_route(ctx, command) do
+              {:ok, ^dst_key, idx} when idx == state.shard_index ->
+                :ok
 
-        Ferricstore.ProbFile.path(prob_dir, key, ext)
+              {:ok, ^dst_key, _other_idx} ->
+                {:error, "CROSSSLOT CMS.MERGE keys must hash to the same shard"}
+
+              {:error, _reason} = error ->
+                error
+            end
+
+          _single_shard_state ->
+            :ok
+        end
       end
 
       # Returns the prob directory for this shard.

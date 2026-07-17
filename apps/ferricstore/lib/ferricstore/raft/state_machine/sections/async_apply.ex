@@ -1250,7 +1250,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           dst_path = prob_path(state, dst_key, "cms")
           src_paths = cms_source_paths(state, src_keys)
 
-          with :ok <- ensure_prob_dir(state) do
+          with :ok <-
+                 validate_cms_merge_locality(
+                   state,
+                   dst_key,
+                   src_keys,
+                   weights,
+                   create_params
+                 ),
+               :ok <- ensure_prob_dir(state) do
             case maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
               :ok -> NIF.cms_file_merge(dst_path, src_paths, weights)
               {:error, _reason} = error -> error
