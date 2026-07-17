@@ -45,33 +45,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
-      defp apply_cross_shard_pending_locations(keydir, file_id, entries, locations) do
-        Enum.zip(entries, locations)
-        |> only_latest_cross_shard_entries()
-        |> Enum.each(fn
-          {{:put, _idx, ^keydir, _file_path, ^file_id, key, ets_value, _disk_value, exp},
-           {:put, offset, value_size}} ->
-            try do
-              :ets.select_replace(keydir, [
-                {
-                  {key, ets_value, exp, :"$1", :pending, :_, :_},
-                  [],
-                  [{{key, ets_value, exp, :"$1", file_id, offset, value_size}}]
-                }
-              ])
-            rescue
-              ArgumentError -> :ok
-            end
-
-          {{:delete, _idx, ^keydir, _file_path, ^file_id, _key}, {:delete, _offset, _record_size}} ->
-            :ok
-        end)
-      end
-
       defp publish_cross_shard_pending_groups(state, successful_groups) do
         ref = keydir_binary_ref(state)
 
-        Enum.each(successful_groups, fn {_idx, _file_path, file_id, keydir, entries, locations} ->
+        Enum.each(successful_groups, fn {idx, _file_path, file_id, keydir, entries, locations} ->
           publish_cross_shard_pending_locations(
             state,
             ref,
@@ -80,6 +57,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             entries,
             locations
           )
+
+          cross_shard_transaction_hook({:published_group, idx})
         end)
       end
 

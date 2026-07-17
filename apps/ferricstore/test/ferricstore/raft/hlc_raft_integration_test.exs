@@ -121,6 +121,70 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       assert [{"b2", "v2", 0, _, _, _, _}] = :ets.lookup(ets, "b2")
     end
 
+    test "transaction writes stay unpublished until their append succeeds", %{
+      state: state,
+      ets: ets
+    } do
+      first = "unpublished_tx_first"
+      second = "unpublished_tx_second"
+      first_entry = {first, "old-1", 0, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      second_entry = {second, "old-2", 0, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, [first_entry, second_entry])
+
+      execution_entries =
+        Enum.map([{first, "new-1"}, {second, "new-2"}], fn {key, value} ->
+          {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("SET", [key, value])
+          {:ok, entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+          entry
+        end)
+
+      previous_hook = Application.get_env(:ferricstore, :cross_shard_transaction_hook)
+      parent = self()
+      release_ref = make_ref()
+
+      Application.put_env(:ferricstore, :cross_shard_transaction_hook, fn
+        {:staged_put, _shard_index, ^first} ->
+          send(
+            parent,
+            {:transaction_write_staged, self(), :ets.lookup(ets, first)}
+          )
+
+          receive do
+            {:continue_transaction, ^release_ref} -> :ok
+          after
+            2_000 -> :ok
+          end
+
+        _event ->
+          :ok
+      end)
+
+      on_exit(fn ->
+        if previous_hook do
+          Application.put_env(:ferricstore, :cross_shard_transaction_hook, previous_hook)
+        else
+          Application.delete_env(:ferricstore, :cross_shard_transaction_hook)
+        end
+      end)
+
+      wrapped = {{:tx_execute, execution_entries, nil}, stamp_metadata(HLC.now())}
+      transaction = Task.async(fn -> StateMachine.apply(%{}, wrapped, state) end)
+
+      assert_receive {:transaction_write_staged, apply_pid, [^first_entry]}, 1_000
+
+      try do
+        assert :ets.lookup(ets, first) == [first_entry]
+        assert :ets.lookup(ets, second) == [second_entry]
+      after
+        send(apply_pid, {:continue_transaction, release_ref})
+      end
+
+      {_new_state, result} = Task.await(transaction, 2_000)
+      assert result == [:ok, :ok]
+      assert [{^first, "new-1", 0, _, _, _, _}] = :ets.lookup(ets, first)
+      assert [{^second, "new-2", 0, _, _, _, _}] = :ets.lookup(ets, second)
+    end
+
     test "unwraps and processes an incr_float command with hlc_ts metadata", %{
       state: state
     } do

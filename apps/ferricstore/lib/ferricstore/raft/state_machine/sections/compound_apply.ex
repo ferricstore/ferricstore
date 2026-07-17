@@ -35,6 +35,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         LFU,
         ListOps,
         Promotion,
+        PublicationEpoch,
         Router,
         ValueCodec
       }
@@ -962,7 +963,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         Process.put(:sm_tx_promoted_latches, %{})
 
         try do
-          result = fun.() |> state_storage_failure_result()
+          result =
+            fun
+            |> run_with_invisible_transaction_staging()
+            |> state_storage_failure_result()
 
           case cross_shard_pending_error_result(result) do
             {:error, _reason} = error ->
@@ -972,11 +976,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
 
             nil ->
               case flush_cross_shard_pending_writes(state) do
-                {:ok, flushed_state} ->
-                  :ok = flush_pending_stream_cache_cleanups()
-                  :ok = flush_pending_compound_member_indexes()
-                  :ok = flush_pending_zset_indexes(flushed_state)
-                  :ok = flush_pending_flow_native_indexes(flushed_state)
+                {:ok, flushed_state, successful_groups} ->
+                  :ok =
+                    publish_cross_shard_transaction(flushed_state, successful_groups)
+
+                  :ok = dispatch_pending_compound_promotions(flushed_state)
 
                   case publish_pending_flow_history_projections(flushed_state) do
                     :ok ->
@@ -1050,6 +1054,67 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         end
       end
 
+      defp publish_cross_shard_transaction(state, successful_groups) do
+        with_cross_shard_publication_epochs(state, successful_groups, fn ->
+          publish_cross_shard_pending_groups(state, successful_groups)
+          :ok = flush_pending_stream_cache_cleanups()
+          :ok = flush_pending_compound_member_indexes()
+          :ok = flush_pending_zset_indexes(state)
+          :ok = flush_pending_flow_native_indexes(state)
+          :ok = publish_pending_compound_revisions(state)
+        end)
+      end
+
+      defp with_cross_shard_publication_epochs(state, successful_groups, fun)
+           when is_function(fun, 0) do
+        ctx = Map.get(state, :instance_ctx, %{})
+
+        tokens =
+          successful_groups
+          |> Enum.map(fn {idx, _file_path, _file_id, _keydir, _entries, _locations} -> idx end)
+          |> Enum.uniq()
+          |> Enum.sort()
+          |> acquire_cross_shard_publication_epochs(ctx, [])
+
+        try do
+          fun.()
+        after
+          Enum.each(tokens, &PublicationEpoch.end_write/1)
+        end
+      end
+
+      defp acquire_cross_shard_publication_epochs([], _ctx, tokens), do: tokens
+
+      defp acquire_cross_shard_publication_epochs([idx | indexes], ctx, tokens) do
+        token = PublicationEpoch.begin_write(ctx, idx)
+
+        try do
+          acquire_cross_shard_publication_epochs(indexes, ctx, [token | tokens])
+        rescue
+          error ->
+            PublicationEpoch.end_write(token)
+            reraise error, __STACKTRACE__
+        catch
+          kind, reason ->
+            PublicationEpoch.end_write(token)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+      end
+
+      defp run_with_invisible_transaction_staging(fun) when is_function(fun, 0) do
+        previous = Process.get(@sm_standalone_staged_key, :undefined)
+        Process.put(@sm_standalone_staged_key, true)
+
+        try do
+          fun.()
+        after
+          case previous do
+            :undefined -> Process.delete(@sm_standalone_staged_key)
+            value -> Process.put(@sm_standalone_staged_key, value)
+          end
+        end
+      end
+
       defp release_transaction_promotion_latches do
         :sm_tx_promoted_latches
         |> Process.get(%{})
@@ -1073,16 +1138,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp flush_cross_shard_pending_writes(state, pending) do
-        staged_publish? = standalone_staged_apply?()
+        journal? = standalone_staged_apply?()
 
         groups =
           pending
           |> Enum.group_by(&cross_shard_pending_target/1)
           |> Enum.sort_by(fn {target, _entries} -> target end)
 
-        case prepare_standalone_cross_shard_journal(state, staged_publish?, groups) do
+        case prepare_standalone_cross_shard_journal(state, journal?, groups) do
           {:ok, journal_txid} ->
-            flush_cross_shard_pending_groups(state, groups, staged_publish?, journal_txid)
+            flush_cross_shard_pending_groups(state, groups, journal_txid)
 
           {:error, reason} ->
             {:error, {:bitcask_append_failed, {:standalone_tx_prepare_failed, reason}}, state, [],
@@ -1093,7 +1158,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       defp flush_cross_shard_pending_groups(
              state,
              groups,
-             staged_publish?,
              journal_txid
            ) do
         groups
@@ -1105,10 +1169,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
 
             case validated_append_result do
               {:ok, locations} ->
-                unless staged_publish? do
-                  apply_cross_shard_pending_locations(keydir, file_id, entries, locations)
-                end
-
                 acc_state =
                   acc_state
                   |> track_cross_shard_append_bytes(
@@ -1132,11 +1192,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
           {:ok, flushed_state, successful_groups} ->
             case commit_standalone_cross_shard_journal(state, journal_txid) do
               :ok ->
-                if staged_publish? do
-                  publish_cross_shard_pending_groups(flushed_state, successful_groups)
-                end
-
-                {:ok, flushed_state}
+                {:ok, flushed_state, successful_groups}
 
               {:error, reason} ->
                 {:error, {:bitcask_append_failed, {:standalone_tx_commit_failed, reason}},

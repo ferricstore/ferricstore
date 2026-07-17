@@ -1319,6 +1319,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end
 
           queue_cross_shard_pending_put(ctx, key, disk_val, expire_at_ms, value_for)
+          cross_shard_transaction_hook({:staged_put, ctx.index, key})
           :ok
         end
 
@@ -1404,6 +1405,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           deleted = Process.get(:tx_deleted_keys, MapSet.new())
           Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
           queue_cross_shard_pending_delete(ctx, key)
+          cross_shard_transaction_hook({:staged_delete, ctx.index, key})
           :ok
         end
 
@@ -1909,6 +1911,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           shard_index: default_ctx.index,
           data_dir: data_dir
         }
+      end
+
+      if Mix.env() == :test do
+        defp cross_shard_transaction_hook(event) do
+          case Application.get_env(:ferricstore, :cross_shard_transaction_hook) do
+            hook when is_function(hook, 1) -> hook.(event)
+            _missing -> :ok
+          end
+        end
+      else
+        defp cross_shard_transaction_hook(_event), do: :ok
       end
     end
   end

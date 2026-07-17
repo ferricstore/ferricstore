@@ -69,6 +69,75 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
                    1_000
   end
 
+  test "cross-shard publication does not expose a mixed batch snapshot", %{ctx: ctx} do
+    {first, second} = different_shard_keys(ctx)
+    assert :ok = Router.put(ctx, first, "old-1", 0)
+    assert :ok = Router.put(ctx, second, "old-2", 0)
+
+    previous_hook = Application.get_env(:ferricstore, :cross_shard_transaction_hook)
+    calls = :atomics.new(1, signed: false)
+    parent = self()
+    release_ref = make_ref()
+
+    Application.put_env(:ferricstore, :cross_shard_transaction_hook, fn
+      {:published_group, shard_index} ->
+        if :atomics.add_get(calls, 1, 1) == 1 do
+          send(parent, {:first_transaction_group_published, self(), shard_index})
+
+          receive do
+            {:continue_publication, ^release_ref} -> :ok
+          after
+            2_000 -> :ok
+          end
+        end
+
+        :ok
+
+      _event ->
+        :ok
+    end)
+
+    on_exit(fn ->
+      if previous_hook do
+        Application.put_env(:ferricstore, :cross_shard_transaction_hook, previous_hook)
+      else
+        Application.delete_env(:ferricstore, :cross_shard_transaction_hook)
+      end
+    end)
+
+    writer =
+      Task.async(fn ->
+        CrossShardOp.execute(
+          [{first, :write}, {second, :write}],
+          fn store ->
+            :ok = store.put.(first, "new-1", 0)
+            :ok = store.put.(second, "new-2", 0)
+          end,
+          instance: ctx
+        )
+      end)
+
+    assert_receive {:first_transaction_group_published, publisher, _shard_index}, 1_000
+
+    reader =
+      Task.async(fn ->
+        send(parent, :cross_shard_batch_reader_started)
+        Router.batch_get(ctx, [first, second])
+      end)
+
+    assert_receive :cross_shard_batch_reader_started, 1_000
+
+    try do
+      refute Task.yield(reader, 100)
+    after
+      send(publisher, {:continue_publication, release_ref})
+    end
+
+    assert Task.await(writer, 2_000) == :ok
+    assert Task.await(reader, 2_000) == ["new-1", "new-2"]
+    assert Router.batch_get(ctx, [first, second]) == ["new-1", "new-2"]
+  end
+
   test "client death during cross-shard execution does not strand participant barriers", %{
     ctx: ctx
   } do
