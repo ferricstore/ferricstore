@@ -6,6 +6,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
     quote do
       alias Ferricstore.ErrorReasons
       alias Ferricstore.NamespaceConfig
+      alias Ferricstore.Raft.ApplyWork
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Raft.CommandBatching
       alias Ferricstore.Raft.CommandStamp
@@ -533,31 +534,42 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.CommitPath do
       defp prepare_commit_command(shard_index, command) do
         case fetch_context() do
           {:ok, %{apply_context: %Ferricstore.Raft.ApplyContext{} = apply_context} = ctx} ->
-            result =
-              try do
-                if BlobCommand.side_channel_candidate?(ctx, command) do
-                  BlobCommand.prepare_protected(ctx, shard_index, command,
-                    single_member?: single_member_waraft_group?(shard_index)
-                  )
-                else
-                  {:ok, command, nil}
+            with :ok <- ApplyWork.admit_command(apply_context, command) do
+              result =
+                try do
+                  if BlobCommand.side_channel_candidate?(ctx, command) do
+                    BlobCommand.prepare_protected(ctx, shard_index, command,
+                      single_member?: single_member_waraft_group?(shard_index)
+                    )
+                  else
+                    {:ok, command, nil}
+                  end
+                rescue
+                  error ->
+                    {:error, {:blob_prepare_failed, {error.__struct__, Exception.message(error)}}}
+                catch
+                  kind, reason ->
+                    {:error, {:blob_prepare_failed, {kind, reason}}}
                 end
-              rescue
-                error ->
-                  {:error, {:blob_prepare_failed, {error.__struct__, Exception.message(error)}}}
-              catch
-                kind, reason ->
-                  {:error, {:blob_prepare_failed, {kind, reason}}}
+
+              case result do
+                {:error, reason} = error ->
+                  emit_blob_prepare_failed(shard_index, command, reason)
+                  error
+
+                {:ok, prepared_command, blob_protection} ->
+                  wrapped_command =
+                    Ferricstore.Raft.ApplyContext.wrap_command(prepared_command, apply_context)
+
+                  case ApplyWork.admit_command(apply_context, wrapped_command) do
+                    :ok ->
+                      {:ok, wrapped_command, blob_protection}
+
+                    {:error, _reason} = error ->
+                      release_blob_protection_after_result(blob_protection, error)
+                      error
+                  end
               end
-
-            case result do
-              {:error, reason} = error ->
-                emit_blob_prepare_failed(shard_index, command, reason)
-                error
-
-              {:ok, prepared_command, blob_protection} ->
-                {:ok, Ferricstore.Raft.ApplyContext.wrap_command(prepared_command, apply_context),
-                 blob_protection}
             end
 
           {:ok, _missing_apply_context} ->
