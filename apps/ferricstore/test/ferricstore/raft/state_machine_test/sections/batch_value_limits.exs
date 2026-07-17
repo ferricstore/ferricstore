@@ -1209,6 +1209,39 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
         end
 
         @tag :direct_batch_apply_budget
+        test "direct zset batches reject compound fanout before score preparation", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "batch-budget:direct-zadd:preflight-order"
+          huge_score = :erlang.bsl(1, 20_000)
+
+          context =
+            Ferricstore.Raft.ApplyContext.new(
+              batch_command_apply_budget: 10,
+              compound_member_apply_budget: 1
+            )
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:error, :compound_member_apply_budget_exceeded}} =
+                   StateMachine.apply(
+                     %{},
+                     {:zadd_many_single,
+                      [{redis_key, 1.0, "first"}, {redis_key, huge_score, "second"}]},
+                     limited_state
+                   )
+
+          assert [] == :ets.lookup(ets, CompoundKey.type_key(redis_key))
+          assert [] == :ets.lookup(ets, CompoundKey.zset_member(redis_key, "first"))
+          assert [] == :ets.lookup(ets, CompoundKey.zset_member(redis_key, "second"))
+        end
+
+        @tag :direct_batch_apply_budget
         test "direct zset batches validate all entries before mutation", %{
           state: state,
           ets: ets

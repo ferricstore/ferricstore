@@ -1108,8 +1108,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
           admission =
             with {:ok, count} <- admit_batch_command_items(state, entries),
-                 {:ok, prepared_entries} <- prepare_zadd_many_single_entries(entries, []),
-                 {:ok, ^count} <- admit_compound_member_batch(state, entries) do
+                 {:ok, ^count} <- admit_compound_member_batch(state, entries),
+                 {:ok, prepared_entries} <- prepare_zadd_many_single_entries(entries, []) do
               {:ok, count, prepared_entries}
             end
 
