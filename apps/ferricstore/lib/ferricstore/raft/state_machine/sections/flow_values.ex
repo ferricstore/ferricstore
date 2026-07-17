@@ -159,23 +159,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp do_put(state, key, value, expire_at_ms) do
         case Ferricstore.Raft.ApplyLimits.validate_value(state, value) do
           :ok ->
-            with :ok <- maybe_clear_compound_data_structure_for_string_put(state, key) do
-              case maybe_externalize_apply_value(state, value) do
-                {:ok, :value, value} ->
-                  raw_put(state, key, value, expire_at_ms)
-
-                {:ok, :blob_ref, encoded_ref, materialized_value} ->
-                  raw_put_blob_ref(state, key, encoded_ref, expire_at_ms, materialized_value)
-
-                {:error, reason} = error ->
-                  record_state_write_failure(reason)
-                  error
-              end
-            end
+            do_put_value_validated(state, key, value, expire_at_ms)
 
           {:error, reason} = error ->
             record_state_write_failure(reason)
             error
+        end
+      end
+
+      defp do_put_value_validated(state, key, value, expire_at_ms) do
+        with :ok <- maybe_clear_compound_data_structure_for_string_put(state, key) do
+          case maybe_externalize_apply_value(state, value) do
+            {:ok, :value, value} ->
+              raw_put(state, key, value, expire_at_ms)
+
+            {:ok, :blob_ref, encoded_ref, materialized_value} ->
+              raw_put_blob_ref(state, key, encoded_ref, expire_at_ms, materialized_value)
+
+            {:error, reason} = error ->
+              record_state_write_failure(reason)
+              error
+          end
         end
       end
 

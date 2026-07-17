@@ -1325,6 +1325,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_put_batch_entries(state, entries) do
+        case validate_put_batch_entries(state, entries) do
+          :ok -> apply_value_validated_put_batch_entries(state, entries)
+          {:error, _reason} -> apply_put_batch_entries_with_value_errors(state, entries)
+        end
+      end
+
+      defp apply_value_validated_put_batch_entries(state, entries) do
         case prepare_apply_blob_command(state, {:put_batch, entries}) do
           {:ok, {:put_blob_batch, prepared_entries}} ->
             apply_put_blob_batch_entries(state, prepared_entries)
@@ -1340,8 +1347,59 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
+      defp validate_put_batch_entries(state, entries) do
+        Enum.reduce_while(entries, :ok, fn entry, :ok ->
+          case validate_put_batch_entry(state, entry) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp validate_put_batch_entry(state, {key, value, expire_at_ms})
+           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms),
+           do: Ferricstore.Raft.ApplyLimits.validate_value(state, value)
+
+      defp validate_put_batch_entry(_state, _entry),
+        do: {:error, :invalid_put_batch_entry}
+
+      defp apply_put_batch_entries_with_value_errors(state, entries) do
+        {valid_entries, result_slots} =
+          Enum.reduce(entries, {[], []}, fn entry, {valid_entries, result_slots} ->
+            case validate_put_batch_entry(state, entry) do
+              :ok -> {[entry | valid_entries], [:pending | result_slots]}
+              {:error, _reason} = error -> {valid_entries, [error | result_slots]}
+            end
+          end)
+
+        valid_entries = Enum.reverse(valid_entries)
+        result_slots = Enum.reverse(result_slots)
+
+        case apply_value_validated_put_batch_entries(state, valid_entries) do
+          valid_results when is_list(valid_results) ->
+            merge_put_batch_value_results(result_slots, valid_results)
+
+          {:error, _reason} = error ->
+            error
+
+          invalid ->
+            {:error, {:invalid_put_batch_result, invalid}}
+        end
+      end
+
+      defp merge_put_batch_value_results([:pending | slots], [result | results]),
+        do: [result | merge_put_batch_value_results(slots, results)]
+
+      defp merge_put_batch_value_results([result | slots], results),
+        do: [result | merge_put_batch_value_results(slots, results)]
+
+      defp merge_put_batch_value_results([], []), do: []
+
+      defp merge_put_batch_value_results(_slots, _results),
+        do: [{:error, :invalid_put_batch_result_count}]
+
       defp apply_atomic_string_batch(state, entries, operation, representation) do
-        with {:ok, keys} <- atomic_string_batch_keys(entries, representation),
+        with {:ok, keys} <- atomic_string_batch_keys(state, entries, representation),
              :ok <- atomic_string_batch_locks(state, keys),
              :ok <- atomic_string_batch_precondition(state, keys, operation),
              :ok <- atomic_string_batch_write(state, entries, representation) do
@@ -1352,11 +1410,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
-      defp atomic_string_batch_keys(entries, representation) do
+      defp atomic_string_batch_keys(state, entries, representation) do
         entries
         |> Enum.reduce_while({:ok, []}, fn entry, {:ok, keys} ->
-          case atomic_string_batch_key(entry, representation) do
+          case atomic_string_batch_key(state, entry, representation) do
             {:ok, key} -> {:cont, {:ok, [key | keys]}}
+            {:error, _reason} = error -> {:halt, error}
             :error -> {:halt, {:error, :invalid_atomic_string_batch_entry}}
           end
         end)
@@ -1366,16 +1425,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
-      defp atomic_string_batch_key({key, value, expire_at_ms}, :plain)
-           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms),
-           do: {:ok, key}
+      defp atomic_string_batch_key(state, {key, value, expire_at_ms}, :plain)
+           when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) do
+        with :ok <- Ferricstore.Raft.ApplyLimits.validate_value(state, value), do: {:ok, key}
+      end
 
-      defp atomic_string_batch_key({key, value, expire_at_ms, representation}, :blob)
+      defp atomic_string_batch_key(
+             state,
+             {key, value, expire_at_ms, representation},
+             :blob
+           )
            when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) and
-                  representation in [:value, :blob_ref],
-           do: {:ok, key}
+                  representation in [:value, :blob_ref] do
+        with :ok <- validate_atomic_batch_value(state, value, representation), do: {:ok, key}
+      end
 
-      defp atomic_string_batch_key(_entry, _representation), do: :error
+      defp atomic_string_batch_key(_state, _entry, _representation), do: :error
+
+      defp validate_atomic_batch_value(state, value, :value),
+        do: Ferricstore.Raft.ApplyLimits.validate_value(state, value)
+
+      defp validate_atomic_batch_value(state, encoded_ref, :blob_ref) do
+        case BlobRef.decode(encoded_ref) do
+          {:ok, ref} -> Ferricstore.Raft.ApplyLimits.validate_value_size(state, ref.size)
+          :error -> {:error, {:blob_ref_unavailable, :invalid_blob_ref}}
+        end
+      end
 
       defp atomic_string_batch_locks(state, keys) do
         Enum.reduce_while(keys, :ok, fn key, :ok ->
@@ -1403,7 +1478,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
       defp atomic_string_batch_write(state, entries, :plain) do
         state
-        |> apply_put_batch_entries(entries)
+        |> apply_value_validated_put_batch_entries(entries)
         |> atomic_string_batch_status()
       end
 
@@ -1457,7 +1532,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         case Map.get(state, :fetch_or_compute_locks, %{}) do
           locks when map_size(locks) == 0 ->
             Enum.map(entries, fn {key, value, expire_at_ms} ->
-              do_put(state, key, value, expire_at_ms)
+              do_put_value_validated(state, key, value, expire_at_ms)
             end)
 
           _locks ->
@@ -1465,7 +1540,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
               redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
               case check_fetch_or_compute_lock(state, redis_key, nil) do
-                :ok -> do_put(state, key, value, expire_at_ms)
+                :ok -> do_put_value_validated(state, key, value, expire_at_ms)
                 {:error, _reason} = error -> error
               end
             end)
@@ -1474,29 +1549,38 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
       defp apply_put_blob_batch_entries(state, entries) do
         with {:ok, prepared_entries} <- prepare_put_blob_batch_entries(state, entries) do
-          Enum.map(prepared_entries, fn
-            {:value, key, value, expire_at_ms} ->
-              do_put(state, key, value, expire_at_ms)
-
-            {:blob_ref, key, encoded_ref, expire_at_ms, _ref} ->
-              redis_key = CompoundKey.extract_redis_key(key)
-
-              case check_fetch_or_compute_lock(state, redis_key, nil) do
-                :ok -> do_put_blob_ref_ref_only_validated(state, key, encoded_ref, expire_at_ms)
-                {:error, _reason} = error -> error
-              end
-          end)
+          Enum.map(prepared_entries, &apply_put_blob_batch_entry(state, &1))
         end
       end
 
+      defp apply_put_blob_batch_entry(state, {:value, key, value, expire_at_ms}) do
+        with :ok <- check_put_blob_batch_lock(state, key) do
+          do_put(state, key, value, expire_at_ms)
+        end
+      end
+
+      defp apply_put_blob_batch_entry(
+             state,
+             {:blob_ref, key, encoded_ref, expire_at_ms, _ref}
+           ) do
+        with :ok <- check_put_blob_batch_lock(state, key) do
+          do_put_blob_ref_ref_only_validated(state, key, encoded_ref, expire_at_ms)
+        end
+      end
+
+      defp check_put_blob_batch_lock(state, key) do
+        redis_key = CompoundKey.extract_redis_key(key)
+        check_fetch_or_compute_lock(state, redis_key, nil)
+      end
+
       defp prepare_put_blob_batch_entries(state, entries) do
-        with {:ok, prepared, refs} <- decode_put_blob_batch_entries(entries),
+        with {:ok, prepared, refs} <- decode_put_blob_batch_entries(state, entries),
              :ok <- verify_blob_refs_for_apply(state, refs) do
           {:ok, prepared}
         end
       end
 
-      defp decode_put_blob_batch_entries(entries) do
+      defp decode_put_blob_batch_entries(state, entries) do
         entries
         |> Enum.reduce_while({:ok, [], []}, fn
           {key, value, expire_at_ms, :value}, {:ok, acc, refs}
@@ -1507,8 +1591,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           when is_binary(key) and is_binary(encoded_ref) and is_integer(expire_at_ms) ->
             case BlobRef.decode(encoded_ref) do
               {:ok, ref} ->
-                entry = {:blob_ref, key, encoded_ref, expire_at_ms, ref}
-                {:cont, {:ok, [entry | acc], [ref | refs]}}
+                case Ferricstore.Raft.ApplyLimits.validate_value_size(state, ref.size) do
+                  :ok ->
+                    entry = {:blob_ref, key, encoded_ref, expire_at_ms, ref}
+                    {:cont, {:ok, [entry | acc], [ref | refs]}}
+
+                  {:error, _reason} = error ->
+                    {:halt, error}
+                end
 
               :error ->
                 {:halt, {:error, {:blob_ref_unavailable, :invalid_blob_ref}}}
@@ -1588,7 +1678,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           end)
 
         Process.put(:sm_pending_writes, pending)
-        Process.put(:sm_pending_fast_put_batch, true)
+        if entries != [], do: Process.put(:sm_pending_fast_put_batch, true)
 
         Enum.reverse(results)
       end

@@ -31,6 +31,8 @@ Code.require_file(
   __DIR__
 )
 
+Code.require_file("state_machine_test/sections/batch_value_limits.exs", __DIR__)
+
 Code.require_file("state_machine_test/sections/flow_governance_limit.exs", __DIR__)
 
 Code.require_file("state_machine_test/sections/flow_index_rollback.exs", __DIR__)
@@ -429,6 +431,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   use Ferricstore.Raft.StateMachineTest.Sections.PromotedCompoundMemberIndex
   use Ferricstore.Raft.StateMachineTest.Sections.PromotedSingleMutationDurability
   use Ferricstore.Raft.StateMachineTest.Sections.CompoundPrefixDeleteExact
+  use Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits
 
   defp safe_delete_ets(table) do
     :ets.delete(table)
