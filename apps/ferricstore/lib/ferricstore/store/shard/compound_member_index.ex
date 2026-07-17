@@ -175,9 +175,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   def delete_prefix(table, prefix) when is_binary(prefix) do
     with tid when tid != :undefined <- table_ref(table) do
-      tid
-      |> scan_index_keys(prefix)
-      |> Enum.each(&:ets.delete(tid, &1))
+      delete_index_prefix(tid, prefix, first_key(tid, prefix))
     end
 
     :ok
@@ -593,11 +591,6 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   defp scan_keys(table, prefix) do
     first = first_key(table, prefix)
     do_scan_keys(table, prefix, first, [])
-  end
-
-  defp scan_index_keys(table, prefix) do
-    first = first_key(table, prefix)
-    do_scan_index_keys(table, prefix, first, [])
   end
 
   defp first_key(table, prefix) do
@@ -1153,12 +1146,15 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   defp do_scan_keys_bounded(_table, _prefix, _other_key, _remaining, acc),
     do: {:ok, Enum.reverse(acc)}
 
-  defp do_scan_index_keys(_table, _prefix, :"$end_of_table", acc), do: Enum.reverse(acc)
+  defp delete_index_prefix(_table, _prefix, :"$end_of_table"), do: :ok
 
-  defp do_scan_index_keys(table, prefix, {prefix, _member} = index_key, acc),
-    do: do_scan_index_keys(table, prefix, :ets.next(table, index_key), [index_key | acc])
+  defp delete_index_prefix(table, prefix, {prefix, _member} = index_key) do
+    next_key = :ets.next(table, index_key)
+    :ets.delete(table, index_key)
+    delete_index_prefix(table, prefix, next_key)
+  end
 
-  defp do_scan_index_keys(_table, _prefix, _other_key, acc), do: Enum.reverse(acc)
+  defp delete_index_prefix(_table, _prefix, _other_key), do: :ok
 
   defp do_any_live?(
          _table,

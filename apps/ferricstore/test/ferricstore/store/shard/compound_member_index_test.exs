@@ -7,6 +7,11 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
+  @index_source Path.expand(
+                  "../../../../lib/ferricstore/store/shard/compound_member_index.ex",
+                  __DIR__
+                )
+
   setup do
     keydir = :ets.new(:compound_member_index_keydir, [:set, :public])
     index = :ets.new(:compound_member_index, [:ordered_set, :public])
@@ -81,6 +86,30 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
 
     assert CompoundMemberIndex.scan_entries(index, state, CompoundKey.set_prefix(key)) ==
              {:ok, []}
+  end
+
+  test "delete_prefix streams the ordered namespace without materializing all index keys" do
+    source = File.read!(@index_source)
+    [_before, delete_prefix] = String.split(source, "def delete_prefix(table, prefix)", parts: 2)
+    [delete_prefix | _after] = String.split(delete_prefix, "@spec any_live?", parts: 2)
+
+    assert delete_prefix =~ "delete_index_prefix"
+    refute delete_prefix =~ "scan_index_keys"
+  end
+
+  test "delete_prefix removes only the requested namespace", %{index: index} do
+    deleted_prefix = CompoundKey.hash_prefix("delete")
+    kept_prefix = CompoundKey.hash_prefix("keep")
+    kept_key = CompoundKey.hash_field("keep", "field")
+
+    Enum.each(["a", "b", "c"], fn field ->
+      CompoundMemberIndex.put(index, CompoundKey.hash_field("delete", field))
+    end)
+
+    CompoundMemberIndex.put(index, kept_key)
+    assert :ok = CompoundMemberIndex.delete_prefix(index, deleted_prefix)
+    assert {:ok, []} = CompoundMemberIndex.keys_for_prefix(index, deleted_prefix)
+    assert {:ok, [^kept_key]} = CompoundMemberIndex.keys_for_prefix(index, kept_prefix)
   end
 
   test "keydir mutation helpers keep the compound catalog in sync", %{
