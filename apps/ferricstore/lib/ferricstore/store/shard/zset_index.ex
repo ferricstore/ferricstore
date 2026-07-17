@@ -302,6 +302,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
         :ok
 
       :error ->
+        clear_key(index_table, lookup_table, redis_key)
         :ok
     end
   end
@@ -316,6 +317,7 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
         :ok
 
       :error ->
+        clear_key(index_table, lookup_table, redis_key)
         :ok
     end
   end
@@ -324,8 +326,8 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec put_members(:ets.tid(), :ets.tid(), binary(), [{binary(), score_input()}]) :: :ok
   def put_members(index_table, lookup_table, redis_key, member_score_pairs) do
-    delta =
-      Enum.reduce(member_score_pairs, 0, fn {member, score_str}, acc ->
+    result =
+      Enum.reduce_while(member_score_pairs, 0, fn {member, score_str}, acc ->
         case parse_score(score_str) do
           {:ok, score} ->
             existing? =
@@ -341,15 +343,22 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
             :ets.insert(index_table, {{redis_key, @index_tag, score, member}, true})
             :ets.insert(lookup_table, {{redis_key, member}, score})
 
-            if existing?, do: acc, else: acc + 1
+            {:cont, if(existing?, do: acc, else: acc + 1)}
 
           :error ->
-            acc
+            {:halt, :invalid}
         end
       end)
 
-    if delta != 0 do
-      increment_count(lookup_table, redis_key, delta)
+    case result do
+      delta when is_integer(delta) and delta != 0 ->
+        increment_count(lookup_table, redis_key, delta)
+
+      delta when is_integer(delta) ->
+        :ok
+
+      :invalid ->
+        clear_key(index_table, lookup_table, redis_key)
     end
 
     :ok
@@ -357,26 +366,34 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec put_new_members(:ets.tid(), :ets.tid(), binary(), [{binary(), score_input()}]) :: :ok
   def put_new_members(index_table, lookup_table, redis_key, member_score_pairs) do
-    {index_entries, lookup_entries, count} =
-      Enum.reduce(member_score_pairs, {[], [], 0}, fn {member, score_input},
-                                                      {index_acc, lookup_acc, count} ->
-        case parse_score(score_input) do
-          {:ok, score} ->
-            {
-              [{{redis_key, @index_tag, score, member}, true} | index_acc],
-              [{{redis_key, member}, score} | lookup_acc],
-              count + 1
-            }
+    result =
+      Enum.reduce_while(member_score_pairs, {[], [], 0}, fn
+        {member, score_input}, {index_acc, lookup_acc, count} ->
+          case parse_score(score_input) do
+            {:ok, score} ->
+              {:cont,
+               {
+                 [{{redis_key, @index_tag, score, member}, true} | index_acc],
+                 [{{redis_key, member}, score} | lookup_acc],
+                 count + 1
+               }}
 
-          :error ->
-            {index_acc, lookup_acc, count}
-        end
+            :error ->
+              {:halt, :invalid}
+          end
       end)
 
-    if count > 0 do
-      :ets.insert(index_table, index_entries)
-      :ets.insert(lookup_table, lookup_entries)
-      increment_count(lookup_table, redis_key, count)
+    case result do
+      {index_entries, lookup_entries, count} when count > 0 ->
+        :ets.insert(index_table, index_entries)
+        :ets.insert(lookup_table, lookup_entries)
+        increment_count(lookup_table, redis_key, count)
+
+      {_index_entries, _lookup_entries, 0} ->
+        :ok
+
+      :invalid ->
+        clear_key(index_table, lookup_table, redis_key)
     end
 
     :ok

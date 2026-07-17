@@ -94,11 +94,50 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     assert 2 == ZSetIndex.member_rank(index, lookup, "zs", "b", false)
   end
 
+  test "bulk put invalidates the whole key when any score is invalid", %{
+    index: index,
+    lookup: lookup
+  } do
+    :ok = ZSetIndex.mark_ready_empty(index, lookup, "zs")
+    insert_members(index, lookup, "zs", [{"old", "1"}])
+
+    assert :ok =
+             ZSetIndex.put_members(index, lookup, "zs", [
+               {"before-invalid", "2"},
+               {"invalid", "not-a-score"},
+               {"after-invalid", "3"}
+             ])
+
+    refute ZSetIndex.ready?(lookup, "zs")
+    assert [] == ZSetIndex.rank_range(index, "zs", 0, 10, false)
+    assert 0 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
+  end
+
   test "bulk new put skips lookup and keeps count exact", %{index: index, lookup: lookup} do
     assert :ok == ZSetIndex.put_new_members(index, lookup, "zs", [{"a", 1}, {"b", 2.0}])
 
     assert 2 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
     assert [{"a", 1.0}, {"b", 2.0}] == ZSetIndex.rank_range(index, "zs", 0, 2, false)
+  end
+
+  test "new-member helpers invalidate readiness for an invalid score", %{
+    index: index,
+    lookup: lookup
+  } do
+    :ok = ZSetIndex.mark_ready_empty(index, lookup, "zs")
+    assert :ok = ZSetIndex.put_new_member(index, lookup, "zs", "invalid", "not-a-score")
+    refute ZSetIndex.ready?(lookup, "zs")
+
+    :ok = ZSetIndex.mark_ready_empty(index, lookup, "zs")
+
+    assert :ok =
+             ZSetIndex.put_new_members(index, lookup, "zs", [
+               {"valid", "1"},
+               {"invalid", "not-a-score"}
+             ])
+
+    refute ZSetIndex.ready?(lookup, "zs")
+    assert [] == ZSetIndex.rank_range(index, "zs", 0, 10, false)
   end
 
   test "ready empty clears stale entries before accepting tracked puts", %{
@@ -114,6 +153,23 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
 
     assert :ok == ZSetIndex.apply_put_to_tables(index, lookup, "zs", <<"Z:zs", 0, "new">>, "1")
     assert [{"new", 1.0}] == ZSetIndex.rank_range(index, "zs", 0, 10, false)
+  end
+
+  test "an invalid tracked score update invalidates the index instead of retaining an old score",
+       %{
+         index: index,
+         lookup: lookup
+       } do
+    compound_key = CompoundKey.zset_member("zs", "member")
+    :ok = ZSetIndex.mark_ready_empty(index, lookup, "zs")
+    :ok = ZSetIndex.put_member(index, lookup, "zs", "member", "1")
+
+    assert :ok =
+             ZSetIndex.apply_put_to_tables(index, lookup, "zs", compound_key, "not-a-score")
+
+    refute ZSetIndex.ready?(lookup, "zs")
+    assert [] == ZSetIndex.rank_range(index, "zs", 0, 10, false)
+    assert 0 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
   end
 
   test "new ready empty marks a proven-new zset without clearing stale entries", %{
