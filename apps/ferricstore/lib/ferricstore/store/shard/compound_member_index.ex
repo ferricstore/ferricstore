@@ -440,6 +440,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
           {:ok, []}
         else
           keydir = state |> lookup_state() |> Map.fetch!(:keydir)
+          expiry_context = ExpiryContext.capture()
           tail = max(total - start - requested, 0)
 
           if start <= tail do
@@ -451,6 +452,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                    :forward,
                    start,
                    requested,
+                   expiry_context,
                    []
                  ) do
               {:ok, rows} -> {:ok, Enum.reverse(rows)}
@@ -465,6 +467,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
               :backward,
               tail,
               requested,
+              expiry_context,
               []
             )
           end
@@ -621,6 +624,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          _direction,
          _skip,
          0,
+         _expiry_context,
          acc
        ),
        do: {:ok, acc}
@@ -633,6 +637,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          _direction,
          _skip,
          _remaining,
+         _expiry_context,
          acc
        ),
        do: {:ok, acc}
@@ -645,14 +650,15 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          direction,
          skip,
          remaining,
+         expiry_context,
          acc
        ) do
     next_key = row_slice_next_key(table, index_key, direction)
 
     case :ets.lookup(table, index_key) do
       [{^index_key, compound_key}] ->
-        case :ets.lookup(keydir, compound_key) do
-          [_row] when skip > 0 ->
+        case keydir_member_row_status(%{keydir: keydir}, compound_key, expiry_context) do
+          {:live, _row} when skip > 0 ->
             collect_row_slice(
               table,
               keydir,
@@ -661,10 +667,11 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
               direction,
               skip - 1,
               remaining,
+              expiry_context,
               acc
             )
 
-          [row] ->
+          {:live, row} ->
             collect_row_slice(
               table,
               keydir,
@@ -673,11 +680,12 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
               direction,
               0,
               remaining - 1,
+              expiry_context,
               [row | acc]
             )
 
-          [] ->
-            delete_stale_member(table, %{keydir: keydir}, compound_key)
+          :stale ->
+            delete_stale_member(table, %{keydir: keydir}, compound_key, expiry_context)
 
             collect_row_slice(
               table,
@@ -687,11 +695,12 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
               direction,
               skip,
               remaining,
+              expiry_context,
               acc
             )
 
-          malformed ->
-            {:error, {:invalid_indexed_member, compound_key, malformed}}
+          {:error, _reason} = error ->
+            error
         end
 
       _missing ->
@@ -703,6 +712,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
           direction,
           skip,
           remaining,
+          expiry_context,
           acc
         )
     end
@@ -716,6 +726,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          _direction,
          _skip,
          _remaining,
+         _expiry_context,
          acc
        ),
        do: {:ok, acc}
@@ -1002,10 +1013,17 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   defp pending_member_status(_pending_values, _compound_key, _expiry_context), do: :not_pending
 
   defp keydir_member_status(state, compound_key, expiry_context) do
+    case keydir_member_row_status(state, compound_key, expiry_context) do
+      {:live, _row} -> :live
+      status -> status
+    end
+  end
+
+  defp keydir_member_row_status(state, compound_key, expiry_context) do
     keydir = Map.get(state, :keydir) || Map.get(state, :ets)
 
     case :ets.lookup(keydir, compound_key) do
-      [{^compound_key, value, expire_at_ms, _lfu, file_id, offset, value_size}]
+      [{^compound_key, value, expire_at_ms, _lfu, file_id, offset, value_size} = row]
       when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
         case ExpiryContext.classify(expiry_context, expire_at_ms) do
           :expired ->
@@ -1017,10 +1035,10 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
           :live ->
             cond do
               value != nil ->
-                :live
+                {:live, row}
 
               valid_cold_location?(file_id, offset, value_size) ->
-                :live
+                {:live, row}
 
               true ->
                 {:error, {:invalid_cold_location, compound_key, {file_id, offset, value_size}}}

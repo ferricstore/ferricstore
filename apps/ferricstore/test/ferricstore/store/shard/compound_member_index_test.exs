@@ -500,6 +500,28 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     end)
   end
 
+  test "row_slice excludes expired catalog rows before applying positional bounds", %{
+    keydir: keydir,
+    index: index
+  } do
+    redis_key = "expiring-slice"
+    prefix = CompoundKey.hash_prefix(redis_key)
+
+    Enum.each([{"a", "first", 0}, {"b", "second", 0}, {"z", "expired", 1}], fn
+      {field, value, expire_at_ms} ->
+        compound_key = CompoundKey.hash_field(redis_key, field)
+        :ets.insert(keydir, {compound_key, value, expire_at_ms, 0, 0, 0, byte_size(value)})
+        CompoundMemberIndex.put(index, compound_key)
+    end)
+
+    state = %{keydir: keydir, compound_member_index: index}
+
+    assert [{"b", "second"}] =
+             CommandTime.with_now_ms(10, fn ->
+               ShardETS.prefix_scan_entries_slice(state, prefix, nil, 1, 1, 2)
+             end)
+  end
+
   test "scan_page returns bounded ordered pages and applies MATCH while walking the index", %{
     keydir: keydir,
     index: index
