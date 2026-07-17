@@ -574,6 +574,41 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
              )
   end
 
+  @tag :flow_native_planner_error
+  test "native claim planners return budget errors for oversized hydrated values" do
+    oversized_value = :binary.copy("v", 64 * 1_024 * 1_024 + 1)
+    candidates = [{"flow-1", 1.0}]
+    values = [oversized_value]
+
+    common_args = [
+      candidates,
+      values,
+      "type",
+      "queued",
+      "worker",
+      1_000,
+      1_000,
+      1,
+      "due:queued",
+      "due:running",
+      "state:queued",
+      "state:running",
+      "inflight",
+      "worker:index",
+      "state:"
+    ]
+
+    expected = {:error, "flow index native request exceeds safety budget"}
+    assert ^expected = apply(NativeOrderedIndex, :plan_claims, common_args)
+
+    assert ^expected =
+             apply(
+               NativeOrderedIndex,
+               :plan_claims_with_history,
+               common_args ++ ["history:"]
+             )
+  end
+
   test "range_slice returns members ordered by score then id", %{index: index, lookup: lookup} do
     assert :ok =
              OrderedIndex.put_members(index, lookup, "due:email", [

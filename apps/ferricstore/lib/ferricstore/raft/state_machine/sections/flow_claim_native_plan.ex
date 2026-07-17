@@ -109,17 +109,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
                     )
                   end)
 
-                case native_result do
-                  {:ok, native_plans, stale_due_ids, count} ->
-                    case flow_decode_native_claim_plans(native_plans) do
-                      {:ok, plans} when length(plans) == count -> {:ok, {plans, stale_due_ids}}
-                      :fallback -> :fallback
-                      _ -> :fallback
-                    end
-
-                  :fallback ->
-                    :fallback
-                end
+                flow_normalize_native_claim_result(native_result)
               end
             else
               _ -> :fallback
@@ -140,6 +130,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimNativePlan do
              _remaining
            ),
            do: :fallback
+
+      defp flow_normalize_native_claim_result({:ok, native_plans, stale_due_ids, count}) do
+        case flow_decode_native_claim_plans(native_plans) do
+          {:ok, plans} when length(plans) == count -> {:ok, {plans, stale_due_ids}}
+          _invalid_or_fallback -> :fallback
+        end
+      end
+
+      defp flow_normalize_native_claim_result(:fallback), do: :fallback
+      defp flow_normalize_native_claim_result({:error, _reason}), do: :fallback
+      defp flow_normalize_native_claim_result(_invalid), do: :fallback
+
+      @doc false
+      def __normalize_flow_native_claim_result_for_test__(result),
+        do: flow_normalize_native_claim_result(result)
 
       defp flow_native_claim_keys(due_key, type, state_filter, worker) do
         with {:ok, tag} <- flow_due_key_tag(due_key),

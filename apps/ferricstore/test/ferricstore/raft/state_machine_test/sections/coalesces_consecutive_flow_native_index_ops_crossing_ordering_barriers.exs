@@ -45,6 +45,17 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CoalescesConsecutiveFlowNat
                ] = StateMachine.__coalesce_flow_native_ops_for_test__(ops)
       end
 
+      @tag :flow_native_planner_error
+      test "native Flow claim planner errors and malformed replies use the Elixir fallback" do
+        assert :fallback =
+                 StateMachine.__normalize_flow_native_claim_result_for_test__(
+                   {:error, "flow index native request exceeds safety budget"}
+                 )
+
+        assert :fallback =
+                 StateMachine.__normalize_flow_native_claim_result_for_test__(:malformed)
+      end
+
       @tag :flow_native_postpublish_failure
       test "Flow state stays published when apply fails after native flush", %{state: state} do
         id = "flow-native-rollback"

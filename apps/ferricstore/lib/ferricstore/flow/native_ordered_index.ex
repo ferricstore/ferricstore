@@ -393,7 +393,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
           binary(),
           binary(),
           binary()
-        ) :: {:ok, [tuple()], [binary()], non_neg_integer()} | :fallback
+        ) :: {:ok, [tuple()], [binary()], non_neg_integer()} | :fallback | {:error, term()}
   def plan_claims(
         candidates,
         values,
@@ -447,7 +447,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
           binary(),
           binary(),
           binary()
-        ) :: {:ok, [tuple()], [binary()], non_neg_integer()} | :fallback
+        ) :: {:ok, [tuple()], [binary()], non_neg_integer()} | :fallback | {:error, term()}
   def plan_claims_with_history(
         candidates,
         values,

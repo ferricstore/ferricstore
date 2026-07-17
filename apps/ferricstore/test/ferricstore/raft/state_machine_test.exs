@@ -104,6 +104,8 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
 
   defdelegate __prepare_pending_flow_native_batches_for_test__(state), to: StateMachine
 
+  defdelegate __normalize_flow_native_claim_result_for_test__(result), to: StateMachine
+
   defdelegate __flow_read_claim_hot_values_for_test__(state, keys, priority, partition_key),
     to: StateMachine
 
