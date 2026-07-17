@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.Shard.ZSetIndex do
   @moduledoc false
 
+  alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
@@ -32,20 +33,18 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
             failure
 
           entries when is_list(entries) ->
-            :ets.insert(state.zset_score_lookup, {{:count, redis_key}, 0})
+            case build_cleared_key(
+                   state.zset_score_index,
+                   state.zset_score_lookup,
+                   redis_key,
+                   entries
+                 ) do
+              :ok ->
+                {:ok, %{state | zset_index_ready: MapSet.put(state.zset_index_ready, redis_key)}}
 
-            Enum.each(entries, fn {member, score_str} ->
-              put_member(
-                state.zset_score_index,
-                state.zset_score_lookup,
-                redis_key,
-                member,
-                score_str
-              )
-            end)
-
-            :ets.insert(state.zset_score_lookup, {{:ready, redis_key}, true})
-            {:ok, %{state | zset_index_ready: MapSet.put(state.zset_index_ready, redis_key)}}
+              {:error, reason} ->
+                ReadResult.failure(reason)
+            end
         end
     end
   end
@@ -434,11 +433,21 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
   def rebuild_key(index_table, lookup_table, redis_key, member_score_pairs) do
     with :ok <- validate_member_scores(member_score_pairs) do
       clear_key(index_table, lookup_table, redis_key)
-      :ets.insert(lookup_table, {{:count, redis_key}, 0})
-      put_new_members(index_table, lookup_table, redis_key, member_score_pairs)
-      :ets.insert(lookup_table, {{:ready, redis_key}, true})
-      :ok
+      populate_cleared_key(index_table, lookup_table, redis_key, member_score_pairs)
     end
+  end
+
+  defp build_cleared_key(index_table, lookup_table, redis_key, member_score_pairs) do
+    with :ok <- validate_member_scores(member_score_pairs) do
+      populate_cleared_key(index_table, lookup_table, redis_key, member_score_pairs)
+    end
+  end
+
+  defp populate_cleared_key(index_table, lookup_table, redis_key, member_score_pairs) do
+    :ets.insert(lookup_table, {{:count, redis_key}, 0})
+    put_new_members(index_table, lookup_table, redis_key, member_score_pairs)
+    :ets.insert(lookup_table, {{:ready, redis_key}, true})
+    :ok
   end
 
   defp validate_member_scores(member_score_pairs) do

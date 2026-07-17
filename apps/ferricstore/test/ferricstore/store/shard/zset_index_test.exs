@@ -193,6 +193,36 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     end
   end
 
+  test "ensure fails closed instead of publishing a partial index for an invalid score", %{
+    index: index,
+    lookup: lookup
+  } do
+    keydir = :ets.new(:zset_index_invalid_score, [:set, :public])
+    redis_key = "zs"
+    prefix = "Z:zs" <> <<0>>
+
+    state = %{
+      keydir: keydir,
+      zset_score_index: index,
+      zset_score_lookup: lookup,
+      zset_index_ready: MapSet.new()
+    }
+
+    try do
+      true = :ets.insert(keydir, {prefix <> "valid", "1", 0, 0, 0, 0, 1})
+      true = :ets.insert(keydir, {prefix <> "invalid", "not-a-score", 0, 0, 0, 0, 11})
+
+      assert {:error, {:storage_read_failed, {:invalid_score, "invalid", "not-a-score"}}} =
+               ZSetIndex.ensure(state, redis_key, prefix, nil)
+
+      refute ZSetIndex.ready?(lookup, redis_key)
+      assert [] == ZSetIndex.rank_range(index, redis_key, 0, 10, false)
+      assert 0 == ZSetIndex.count(index, lookup, redis_key, :neg_inf, :inf)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   defp insert_members(index, lookup, redis_key, members) do
     Enum.each(members, fn {member, score} ->
       ZSetIndex.put_member(index, lookup, redis_key, member, score)
