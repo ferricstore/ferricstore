@@ -9,6 +9,7 @@ defmodule FerricstoreServer.AuthRateLimiter do
   @default_max_attempts 10
   @default_window_ms 60_000
   @default_max_entries 10_000
+  @minimum_max_entries 2
   @max_username_bytes Rules.max_username_bytes()
   @max_password_bytes Password.max_password_bytes()
 
@@ -103,7 +104,13 @@ defmodule FerricstoreServer.AuthRateLimiter do
     now_ms = System.monotonic_time(:millisecond)
     window_ms = positive_env(:auth_rate_limit_window_ms, @default_window_ms)
     max_attempts = positive_env(:auth_rate_limit_max_attempts, @default_max_attempts)
-    max_entries = positive_env(:auth_rate_limit_max_entries, @default_max_entries)
+
+    max_entries =
+      positive_env(
+        :auth_rate_limit_max_entries,
+        @default_max_entries,
+        @minimum_max_entries
+      )
 
     state = maybe_discard_expired(state, now_ms, window_ms)
     keys = [{:ip, peer}, {:user, username}]
@@ -354,9 +361,9 @@ defmodule FerricstoreServer.AuthRateLimiter do
 
   defp validate_credentials(_username, _password), do: :ok
 
-  defp positive_env(key, default) do
+  defp positive_env(key, default, minimum \\ 1) do
     case Application.get_env(:ferricstore, key, default) do
-      value when is_integer(value) and value > 0 -> value
+      value when is_integer(value) and value >= minimum -> value
       _other -> default
     end
   end

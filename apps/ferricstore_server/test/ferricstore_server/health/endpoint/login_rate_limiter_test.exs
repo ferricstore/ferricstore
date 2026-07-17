@@ -2,6 +2,8 @@ defmodule FerricstoreServer.AuthRateLimiterTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
+  @runtime_config Path.expand("../../../../../../config/runtime.exs", __DIR__)
+
   alias FerricstoreServer.Acl
   alias FerricstoreServer.AuthRateLimiter
   alias FerricstoreServer.Acl.Password
@@ -105,6 +107,25 @@ defmodule FerricstoreServer.AuthRateLimiterTest do
     end
 
     assert AuthRateLimiter.info().entries <= 9
+  end
+
+  test "entry capacity smaller than one auth reservation is not accepted" do
+    Application.put_env(:ferricstore, :auth_rate_limit_max_entries, 1)
+
+    assert :ok = AuthRateLimiter.check({10, 1, 1, 1}, "minimum-capacity-user")
+    assert AuthRateLimiter.info().entries == 2
+  end
+
+  test "production config rejects an auth entry capacity below two" do
+    env_name = "FERRICSTORE_AUTH_RATE_LIMIT_MAX_ENTRIES"
+    previous = System.get_env(env_name)
+    System.put_env(env_name, "1")
+
+    on_exit(fn -> restore_system_env(env_name, previous) end)
+
+    assert_raise RuntimeError,
+                 "FERRICSTORE_AUTH_RATE_LIMIT_MAX_ENTRIES must be an integer greater than or equal to 2",
+                 fn -> Config.Reader.read!(@runtime_config, env: :prod) end
   end
 
   test "source ports share one IP bucket and a limited attempt skips password verification" do
@@ -274,4 +295,7 @@ defmodule FerricstoreServer.AuthRateLimiterTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  defp restore_system_env(name, nil), do: System.delete_env(name)
+  defp restore_system_env(name, value), do: System.put_env(name, value)
 end

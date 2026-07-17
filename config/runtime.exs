@@ -363,6 +363,16 @@ if config_env() == :prod do
     end
   end
 
+  minimum_integer_env = fn name, default, minimum ->
+    case Integer.parse(System.get_env(name, Integer.to_string(default))) do
+      {value, ""} when value >= minimum ->
+        value
+
+      _other ->
+        raise "#{name} must be an integer greater than or equal to #{minimum}"
+    end
+  end
+
   dashboard_cookie_secure =
     case System.get_env("FERRICSTORE_DASHBOARD_COOKIE_SECURE", "auto")
          |> String.trim()
@@ -430,7 +440,7 @@ if config_env() == :prod do
     auth_rate_limit_window_ms:
       positive_integer_env.("FERRICSTORE_AUTH_RATE_LIMIT_WINDOW_MS", 60_000),
     auth_rate_limit_max_entries:
-      positive_integer_env.("FERRICSTORE_AUTH_RATE_LIMIT_MAX_ENTRIES", 10_000)
+      minimum_integer_env.("FERRICSTORE_AUTH_RATE_LIMIT_MAX_ENTRIES", 10_000, 2)
 
   # ---------------------------------------------------------------------------
   # Connection
