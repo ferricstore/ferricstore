@@ -151,6 +151,37 @@ defmodule Ferricstore.Store.RouterTest do
     end
   end
 
+  describe "direct compound count" do
+    test "selected WARaft retains the compound-member index read state" do
+      source = Ferricstore.Test.SourceFiles.router_source()
+      {:ok, ast} = Code.string_to_quoted(source)
+
+      body =
+        ast
+        |> function_body(:compound_count, 3)
+        |> Macro.to_string()
+
+      assert body =~ "direct_compound_read_state(idx)"
+      refute body =~ "resolve_keydir(idx)"
+    end
+
+    test "counts live indexed members", %{} do
+      ctx = IsolatedInstance.checkout(shard_count: 1)
+      key = "router:indexed-count:#{System.unique_integer([:positive])}"
+      prefix = CompoundKey.hash_prefix(key)
+
+      on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+      assert :ok =
+               Router.compound_batch_put(ctx, key, [
+                 {CompoundKey.hash_field(key, "a"), "1", 0},
+                 {CompoundKey.hash_field(key, "b"), "2", 0}
+               ])
+
+      assert Router.compound_count(ctx, key, prefix) == 2
+    end
+  end
+
   describe "default quorum write ingress" do
     setup do
       ShardHelpers.flush_all_keys()
@@ -464,6 +495,25 @@ defmodule Ferricstore.Store.RouterTest do
     {_ast, bodies} =
       Macro.prewalk(ast, [], fn
         {:defp, _meta, [{^function_name, _call_meta, args}, body]} = node, acc
+        when length(args) == arity ->
+          {node, [body | acc]}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    bodies
+    |> Enum.reverse()
+    |> case do
+      [] -> flunk("missing #{function_name}/#{arity}")
+      bodies -> {:__block__, [], bodies}
+    end
+  end
+
+  defp function_body(ast, function_name, arity) do
+    {_ast, bodies} =
+      Macro.prewalk(ast, [], fn
+        {:def, _meta, [{^function_name, _call_meta, args}, body]} = node, acc
         when length(args) == arity ->
           {node, [body | acc]}
 

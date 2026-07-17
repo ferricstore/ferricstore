@@ -839,7 +839,7 @@ defmodule Ferricstore.Store.Router.Part10 do
 
         if selected_waraft_ctx?(ctx) do
           ctx
-          |> resolve_keydir(idx)
+          |> direct_compound_read_state(idx)
           |> Ferricstore.Store.Shard.ETS.prefix_count_entries(prefix)
         else
           case safe_read_call(ctx, idx, {:compound_count, redis_key, prefix}) do
