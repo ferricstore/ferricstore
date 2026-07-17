@@ -754,40 +754,53 @@ defmodule Ferricstore.Store.Shard.Calls do
       defp apply_direct_tx_execute(queue, sandbox_namespace, state) do
         command = {:tx_execute, queue, sandbox_namespace}
 
-        case Ferricstore.Raft.StateMachine.apply_standalone_command(
-               command,
-               direct_sm_state(state)
-             ) do
-          {new_sm_state, result} ->
-            new_state =
-              state
-              |> apply_direct_sm_state(new_sm_state)
-              |> maybe_bump_direct_tx_write_version(queue, result)
+        {apply_result, stats} =
+          Ferricstore.Raft.StateMachine.apply_standalone_command_with_stats(
+            command,
+            direct_sm_state(state)
+          )
 
-            {:reply, result, new_state}
+        case apply_result do
+          {new_sm_state, result} ->
+            finish_direct_tx_execute(state, new_sm_state, stats, result)
 
           {new_sm_state, result, _effects} ->
-            new_state =
-              state
-              |> apply_direct_sm_state(new_sm_state)
-              |> maybe_bump_direct_tx_write_version(queue, result)
-
-            {:reply, result, new_state}
+            finish_direct_tx_execute(state, new_sm_state, stats, result)
         end
       end
 
-      defp maybe_bump_direct_tx_write_version(state, queue, results)
-           when is_list(queue) and is_list(results) do
-        if Enum.any?(queue, &Ferricstore.Transaction.ExecutionEntry.mutates?/1) do
-          new_state = %{state | write_version: state.write_version + 1}
-          bump_shared_write_version(new_state, 1)
-          new_state
+      defp finish_direct_tx_execute(state, new_sm_state, _stats, {:error, reason} = error) do
+        new_state = apply_direct_sm_state(state, new_sm_state)
+
+        if Ferricstore.Raft.ApplyFailure.storage_reason?(reason) do
+          {:reply, {:error, {:standalone_durability_failed, reason}},
+           %{new_state | writes_paused: true, last_flush_error: reason}}
         else
-          state
+          {:reply, error, new_state}
         end
       end
 
-      defp maybe_bump_direct_tx_write_version(state, _queue, _error), do: state
+      defp finish_direct_tx_execute(state, new_sm_state, stats, result) do
+        new_state =
+          state
+          |> apply_direct_sm_state(new_sm_state)
+          |> maybe_bump_direct_tx_write_version(stats, result)
+
+        {:reply, result, new_state}
+      end
+
+      defp maybe_bump_direct_tx_write_version(
+             state,
+             %{published_mutations: count},
+             results
+           )
+           when is_integer(count) and count > 0 and is_list(results) do
+        new_state = %{state | write_version: state.write_version + 1}
+        bump_shared_write_version(new_state, 1)
+        new_state
+      end
+
+      defp maybe_bump_direct_tx_write_version(state, _stats, _result), do: state
 
       # Check if a redis_key has been promoted to dedicated storage.
       def handle_call({:promoted?, redis_key}, from, state) do

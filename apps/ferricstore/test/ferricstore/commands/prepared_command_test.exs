@@ -338,6 +338,14 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
            })
            |> ExecutionEntry.valid?()
 
+    refute entry
+           |> Map.merge(%{
+             command: "GET",
+             read_keys: ["key"],
+             write_keys: []
+           })
+           |> ExecutionEntry.valid?()
+
     assert {:ok, get_prepared} = Dispatcher.prepare_raw("GET", ["key"])
     assert {:ok, get_entry} = ExecutionEntry.from_prepared(get_prepared)
     refute ExecutionEntry.mutates?(get_entry)

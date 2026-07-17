@@ -293,6 +293,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       end
 
       @doc false
+      def apply_standalone_command_with_stats(command, state) do
+        previous = Process.get(:sm_standalone_apply_stats, :undefined)
+        Process.put(:sm_standalone_apply_stats, %{published_mutations: 0})
+
+        try do
+          result = apply_standalone_command(command, state)
+          {result, Process.get(:sm_standalone_apply_stats)}
+        after
+          case previous do
+            :undefined -> Process.delete(:sm_standalone_apply_stats)
+            value -> Process.put(:sm_standalone_apply_stats, value)
+          end
+        end
+      end
+
+      @doc false
       def apply_standalone_cross_shard(execute_fn, state) when is_function(execute_fn, 1) do
         apply_standalone(fn ->
           with_cross_shard_pending_writes(state, fn ->

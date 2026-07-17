@@ -5,7 +5,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
     quote do
       alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
       alias Ferricstore.Raft.WARaftStorage
-      alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey}
+      alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU}
+      alias Ferricstore.Store.Shard.CompoundMemberIndex
 
       describe "replicated batch value limits" do
         test "put_batch preserves per-entry results on the fast path", %{
@@ -502,6 +503,49 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
 
           assert [{^exact_key, "1234", 0, _lfu, {:waraft_segment, 42}, _offset, 4}] =
                    :ets.lookup(ets, exact_key)
+        end
+
+        @tag :segment_compound_count_failure
+        test "segment projection falls back when exact compound count cleanup is bounded", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "segment-count-bounded"
+          prefix = CompoundKey.hash_prefix(redis_key)
+          projected_key = CompoundKey.hash_field(redis_key, "new")
+          index = state.compound_member_index_name
+          expired_at_ms = Ferricstore.HLC.now_ms() - 1
+
+          context =
+            Ferricstore.Raft.ApplyContext.new(
+              compound_member_apply_budget: 1,
+              promotion_threshold: 1
+            )
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          CompoundMemberIndex.ensure_table!(index)
+          CompoundMemberIndex.reset(index)
+          on_exit(fn -> safe_delete_ets(index) end)
+
+          Enum.each(["a", "b"], fn field ->
+            compound_key = CompoundKey.hash_field(redis_key, field)
+            :ets.insert(ets, {compound_key, field, expired_at_ms, LFU.initial(), 0, 0, 1})
+            CompoundMemberIndex.put(index, compound_key, expired_at_ms)
+          end)
+
+          assert :unsupported =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:compound_put, projected_key, "value", 0},
+                     {:raft_log_pos, 43, 1},
+                     limited_state
+                   )
+
+          assert [] == :ets.lookup(ets, projected_key)
         end
       end
 

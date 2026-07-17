@@ -10,6 +10,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
       alias Ferricstore.Raft.StateMachine
       alias Ferricstore.Raft.CommandStamp
+      alias Ferricstore.Raft.ApplyFailure
       alias Ferricstore.Raft.WARaftSegmentReader
       alias Ferricstore.Raft.WARaftSegmentReader.CommandValues
       alias Ferricstore.Store.BlobRef
@@ -87,28 +88,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
       defp storage_block_reason({:error, reason}), do: reason
       defp storage_block_reason(reason), do: reason
 
-      defp storage_apply_failure?({:error, reason}), do: storage_apply_failure_reason?(reason)
-      defp storage_apply_failure?(_result), do: false
-
-      defp storage_apply_failure_reason?(:active_file_unavailable), do: true
-      defp storage_apply_failure_reason?(:invalid_preencoded_command), do: true
-      defp storage_apply_failure_reason?({:bitcask_append_failed, _reason}), do: true
-      defp storage_apply_failure_reason?({:bitcask_append_result_mismatch, _reason}), do: true
-      defp storage_apply_failure_reason?({:bitcask_writer_flush_failed, _reason}), do: true
-      defp storage_apply_failure_reason?({:blob_externalize_failed, _reason}), do: true
-      defp storage_apply_failure_reason?({:blob_ref_unavailable, _reason}), do: true
-      defp storage_apply_failure_reason?({:state_read_failed, _reason}), do: true
-      defp storage_apply_failure_reason?({:cross_shard_compensation_failed, _reason}), do: true
-      defp storage_apply_failure_reason?({:flow_history_projection_failed, _reason}), do: true
-      defp storage_apply_failure_reason?({:flush_shard_apply_failed, _reason}), do: true
-      defp storage_apply_failure_reason?({:batch_result_mismatch, _expected, _actual}), do: true
-
-      defp storage_apply_failure_reason?({:tombstone_batch_result_mismatch, _expected, _actual}),
-        do: true
-
-      defp storage_apply_failure_reason?({:fsync_dir_failed, _phase, _reason}), do: true
-      defp storage_apply_failure_reason?({:delete_prob_file_failed, _reason}), do: true
-      defp storage_apply_failure_reason?(_reason), do: false
+      defp storage_apply_failure?(result), do: ApplyFailure.storage_result?(result)
 
       defp persist_position(position, result, old_handle, handle) do
         new_handle =

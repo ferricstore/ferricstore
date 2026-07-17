@@ -2,7 +2,7 @@ defmodule Ferricstore.Raft.StateMachineTTBGuardTest do
   use ExUnit.Case, async: true
   @moduletag :raft
 
-  alias Ferricstore.Raft.CommandStamp
+  alias Ferricstore.Raft.{ApplyFailure, CommandStamp}
   alias Ferricstore.Raft.StateMachine
 
   test "malformed preencoded commands fail without crashing or mutating state" do
@@ -64,9 +64,7 @@ defmodule Ferricstore.Raft.StateMachineTTBGuardTest do
   end
 
   test "WARaft blocks malformed encodings but advances deterministic command errors" do
-    source = Ferricstore.Test.SourceFiles.waraft_storage_source()
-
-    assert source =~ "storage_apply_failure_reason?(:invalid_preencoded_command)"
-    refute source =~ "storage_apply_failure_reason?({:unknown_command, _command})"
+    assert ApplyFailure.storage_reason?(:invalid_preencoded_command)
+    refute ApplyFailure.storage_reason?({:unknown_command, :unsupported})
   end
 end

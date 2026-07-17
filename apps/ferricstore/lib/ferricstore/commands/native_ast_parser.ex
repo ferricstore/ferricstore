@@ -63,6 +63,21 @@ defmodule Ferricstore.Commands.NativeAstParser do
   end
 
   @doc false
+  @spec command_matches_ast?(binary(), term()) :: boolean()
+  def command_matches_ast?(command, ast) when is_binary(command) do
+    case Map.fetch(@command_tags, command) do
+      {:ok, expected_tag} -> ast_tag(ast) == expected_tag
+      :error -> false
+    end
+  end
+
+  def command_matches_ast?(_command, _ast), do: false
+
+  defp ast_tag(tag) when is_atom(tag), do: tag
+  defp ast_tag(tuple) when is_tuple(tuple) and tuple_size(tuple) > 0, do: elem(tuple, 0)
+  defp ast_tag(_ast), do: nil
+
+  @doc false
   @spec conservative_command_keys(binary(), [binary()]) :: [binary()]
   def conservative_command_keys(cmd, args) when cmd in @management_scoped_commands,
     do: management_command_keys(cmd, args)

@@ -1,7 +1,13 @@
 defmodule Ferricstore.Transaction.ExecutionEntry do
   @moduledoc false
 
-  alias Ferricstore.Commands.{KeyDiscovery, PreparedCommand, TransactionPolicy}
+  alias Ferricstore.Commands.{
+    KeyDiscovery,
+    NativeAstParser,
+    PreparedCommand,
+    TransactionPolicy
+  }
+
   alias Ferricstore.Transaction.Ast, as: TxAst
 
   @enforce_keys [:command, :ast, :routing_scope, :command_keys, :read_keys, :write_keys]
@@ -28,7 +34,8 @@ defmodule Ferricstore.Transaction.ExecutionEntry do
       })
       when routing_scope in [:none, :keys] and is_list(command_keys) and is_list(read_keys) and
              is_list(write_keys) do
-    if TransactionPolicy.safe?(command, ast, routing_scope) do
+    if NativeAstParser.command_matches_ast?(command, ast) and
+         TransactionPolicy.safe?(command, ast, routing_scope) do
       {:ok,
        %__MODULE__{
          command: command,
@@ -59,7 +66,8 @@ defmodule Ferricstore.Transaction.ExecutionEntry do
          true <- valid_keys?(write_keys) do
       description = KeyDiscovery.describe(command, ast, command_keys)
 
-      TxAst.derive_command_keys(ast) == command_keys and
+      NativeAstParser.command_matches_ast?(command, ast) and
+        TxAst.derive_command_keys(ast) == command_keys and
         TransactionPolicy.safe?(command, ast, routing_scope) and
         description.routing_scope == routing_scope and
         description.read_keys == read_keys and

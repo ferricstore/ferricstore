@@ -482,6 +482,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
           keydir: sm_state.ets,
           index: sm_state.shard_index,
           instance_ctx: sm_state.instance_ctx,
+          apply_context: sm_state.apply_context,
           compound_member_index: Map.get(sm_state, :compound_member_index_name),
           logical_key_index: Map.get(sm_state, :logical_key_index_name),
           logical_key_slots: Map.get(sm_state, :logical_key_slots_name)

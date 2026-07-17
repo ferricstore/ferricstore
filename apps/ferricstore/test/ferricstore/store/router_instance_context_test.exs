@@ -341,8 +341,84 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert {:error, :transaction_result_byte_budget_exceeded} =
              GenServer.call(shard_name, {:tx_execute, entries, nil})
 
+    assert %{writes_paused: false, last_flush_error: nil} = :sys.get_state(shard_pid)
     assert nil == Router.get(ctx, staged_key)
     assert "1234" == Router.get(ctx, read_key)
+    assert :ok = Router.put(ctx, staged_key, "after-governance-error", 0)
+  end
+
+  @tag :direct_tx_durability
+  test "custom shard EXEC pauses writes after a durability failure", %{ctx: ctx} do
+    {key, later_key} = same_shard_keys(ctx)
+    shard_index = Router.shard_for(ctx, key)
+    shard_name = elem(ctx.shard_names, shard_index)
+    shard_pid = Process.whereis(shard_name)
+    previous_hook = Application.get_env(:ferricstore, :standalone_durability_hook)
+
+    Application.put_env(:ferricstore, :standalone_durability_hook, fn _path, _batch ->
+      {:error, :enospc}
+    end)
+
+    on_exit(fn ->
+      if previous_hook do
+        Application.put_env(:ferricstore, :standalone_durability_hook, previous_hook)
+      else
+        Application.delete_env(:ferricstore, :standalone_durability_hook)
+      end
+    end)
+
+    {:ok, prepared_set} =
+      Ferricstore.Commands.PreparedCommand.prepare("SET", [key, "must-not-publish"])
+
+    {:ok, set_entry} =
+      Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared_set)
+
+    reason = {:bitcask_append_failed, :enospc}
+
+    assert {:error, {:standalone_durability_failed, ^reason}} =
+             GenServer.call(shard_name, {:tx_execute, [set_entry], nil})
+
+    assert %{writes_paused: true, last_flush_error: ^reason} = :sys.get_state(shard_pid)
+    assert nil == Router.get(ctx, key)
+    assert {:error, "ERR shard writes paused for sync"} = Router.put(ctx, later_key, "blocked", 0)
+  end
+
+  @tag :direct_tx_write_version
+  test "custom shard EXEC advances WATCH versions only for published mutations", %{ctx: ctx} do
+    {existing_key, missing_key} = same_shard_keys(ctx)
+    shard_index = Router.shard_for(ctx, existing_key)
+    shard_name = elem(ctx.shard_names, shard_index)
+
+    assert :ok = Router.put(ctx, existing_key, "original", 0)
+    before_noop = Router.get_version(ctx, existing_key)
+
+    noop_entries =
+      Enum.map(
+        [
+          {"SET", [existing_key, "ignored", "NX"]},
+          {"DEL", [missing_key]}
+        ],
+        fn {command, args} ->
+          {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare(command, args)
+          {:ok, entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+          entry
+        end
+      )
+
+    assert [nil, 0] = GenServer.call(shard_name, {:tx_execute, noop_entries, nil})
+    assert Router.get_version(ctx, existing_key) == before_noop
+    assert "original" == Router.get(ctx, existing_key)
+    assert nil == Router.get(ctx, missing_key)
+
+    {:ok, prepared_set} =
+      Ferricstore.Commands.PreparedCommand.prepare("SET", [missing_key, "written"])
+
+    {:ok, set_entry} =
+      Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared_set)
+
+    assert [:ok] = GenServer.call(shard_name, {:tx_execute, [set_entry], nil})
+    assert Router.get_version(ctx, existing_key) == before_noop + 1
+    assert "written" == Router.get(ctx, missing_key)
   end
 
   test "custom compound put does not use the default Raft batcher", %{ctx: ctx} do

@@ -178,7 +178,7 @@ defmodule Ferricstore.Raft.ApplyContext do
         }
 
   @type encoded ::
-          {:ferricstore_apply_context_v1, pos_integer(), pos_integer(), non_neg_integer(),
+          {:ferricstore_apply_context_v1, pos_integer(), non_neg_integer(), pos_integer(),
            pos_integer(),
            pos_integer(), pos_integer(), pos_integer(), pos_integer(), pos_integer(), boolean(),
            non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer(),

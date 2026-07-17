@@ -898,7 +898,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
               prefix ->
                 shard_state = shard_ets_state_from_sm(sm_state)
-                ShardETS.prefix_count_entries(shard_state, prefix) + write_count > threshold
+
+                case ShardETS.prefix_count_entries(shard_state, prefix) do
+                  count when is_integer(count) ->
+                    count + write_count > threshold
+
+                  _count_unavailable ->
+                    true
+                end
             end
         end
       end

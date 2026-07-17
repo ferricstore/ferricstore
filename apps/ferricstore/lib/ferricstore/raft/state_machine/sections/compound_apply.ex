@@ -1060,6 +1060,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             end
 
             :ok = publish_cross_shard_transaction(flushed_state, successful_groups)
+            record_standalone_published_mutations(successful_groups)
             :ok = dispatch_pending_compound_promotions(flushed_state)
 
             case publish_pending_flow_history_projections(flushed_state) do
@@ -1114,6 +1115,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
                  compensated_state}
             end
         end
+      end
+
+      defp record_standalone_published_mutations(successful_groups) do
+        case Process.get(:sm_standalone_apply_stats) do
+          %{published_mutations: published} = stats when is_integer(published) ->
+            count =
+              Enum.reduce(successful_groups, 0, fn
+                {_idx, _file_path, _file_id, _keydir, entries, _locations}, acc ->
+                  acc + length(entries)
+              end)
+
+            Process.put(
+              :sm_standalone_apply_stats,
+              %{stats | published_mutations: published + count}
+            )
+
+          _not_tracking ->
+            :ok
+        end
+
+        :ok
       end
 
       defp publish_cross_shard_transaction(state, successful_groups) do
