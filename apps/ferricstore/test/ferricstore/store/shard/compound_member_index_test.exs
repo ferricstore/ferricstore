@@ -146,6 +146,19 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     refute CompoundMemberIndex.any_live?(index, state, CompoundKey.set_prefix("missing"))
   end
 
+  test "any_live? accepts cold metadata without requiring a data path or disk read", %{
+    keydir: keydir,
+    index: index
+  } do
+    member_key = CompoundKey.set_member("cold-tags", "member")
+    prefix = CompoundKey.set_prefix("cold-tags")
+    :ets.insert(keydir, {member_key, nil, 0, 0, 7, 99, 1})
+    CompoundMemberIndex.put(index, member_key)
+
+    assert CompoundMemberIndex.any_live?(index, %{keydir: keydir}, prefix)
+    assert [{^member_key, nil, 0, 0, 7, 99, 1}] = :ets.lookup(keydir, member_key)
+  end
+
   test "any_live? uses the stamped command time for member expiry", %{
     keydir: keydir,
     index: index

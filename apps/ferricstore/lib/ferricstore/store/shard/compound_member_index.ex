@@ -1181,22 +1181,22 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
         if ignored_key?(ignored_keys, compound_key) do
           do_any_live?(table, state, prefix, next_key, ignored_keys, expiry_context)
         else
-          case ShardETS.ets_lookup_warm_result(state, compound_key, expiry_context) do
-            {:hit, _value, _expire_at_ms} ->
+          case ShardETS.ets_lookup_metadata(state, compound_key, expiry_context) do
+            {:live, _entry, _location} ->
               true
 
             :expired ->
-              delete_stale_member(table, state, compound_key)
+              delete_stale_member(table, state, compound_key, expiry_context)
               do_any_live?(table, state, prefix, next_key, ignored_keys, expiry_context)
 
             :miss ->
-              delete_stale_member(table, state, compound_key)
+              delete_stale_member(table, state, compound_key, expiry_context)
               do_any_live?(table, state, prefix, next_key, ignored_keys, expiry_context)
 
-            {:error, :cold_read_failed} ->
-              true
-
             {:error, {:storage_read_failed, _reason}} ->
+              :unavailable
+
+            {:error, _reason} ->
               :unavailable
           end
         end
@@ -1243,7 +1243,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
             do_count_live(table, state, prefix, next_key, count + 1, expiry_context)
 
           status when status in [:expired, :miss] ->
-            delete_stale_member(table, state, compound_key)
+            delete_stale_member(table, state, compound_key, expiry_context)
             do_count_live(table, state, prefix, next_key, count, expiry_context)
 
           {:error, {:storage_read_failed, _reason}} = failure ->
