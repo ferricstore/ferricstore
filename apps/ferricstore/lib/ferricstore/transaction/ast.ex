@@ -12,6 +12,10 @@ defmodule Ferricstore.Transaction.Ast do
     config debug hello module sandbox select slowlog
   )a
 
+  @flat_compound_member_tags ~w(
+    hdel hmget lpush lpushx rpush rpushx sadd smismember srem zmscore zrem
+  )a
+
   @spec normalize_entry(queue_entry()) :: {binary(), [term()], term()}
   def normalize_entry(%ExecutionEntry{command: command, ast: ast}), do: {command, [], ast}
 
@@ -117,6 +121,62 @@ defmodule Ferricstore.Transaction.Ast do
   end
 
   def namespace_ast_keys(ast, _ns), do: ast
+
+  @spec compound_member_work_up_to(term(), non_neg_integer() | :unlimited) ::
+          {:ok, non_neg_integer()} | :limit_exceeded | :invalid
+  def compound_member_work_up_to({:hset, [_key | pairs]}, limit),
+    do: count_pairs_up_to(pairs, limit, 0)
+
+  def compound_member_work_up_to({tag, [_key | members]}, limit)
+      when tag in @flat_compound_member_tags,
+      do: count_items_up_to(members, limit, 0)
+
+  def compound_member_work_up_to({:hsetex, _key, _ttl, pairs}, limit)
+      when is_list(pairs),
+      do: count_pairs_up_to(pairs, limit, 0)
+
+  def compound_member_work_up_to({tag, _key, fields}, limit)
+      when tag in [:hexpiretime, :hgetdel, :hpersist, :hpttl, :httl] and is_list(fields),
+      do: count_items_up_to(fields, limit, 0)
+
+  def compound_member_work_up_to({tag, _key, _ttl, fields}, limit)
+      when tag in [:hexpire, :hpexpire] and is_list(fields),
+      do: count_items_up_to(fields, limit, 0)
+
+  def compound_member_work_up_to({:hgetex, _key, _mode, fields}, limit)
+      when is_list(fields),
+      do: count_items_up_to(fields, limit, 0)
+
+  def compound_member_work_up_to({:zadd, _key, _opts, pairs}, limit)
+      when is_list(pairs),
+      do: count_items_up_to(pairs, limit, 0)
+
+  def compound_member_work_up_to(_ast, _limit), do: {:ok, 0}
+
+  defp count_items_up_to([], _remaining, count), do: {:ok, count}
+  defp count_items_up_to([_item | _rest], 0, _count), do: :limit_exceeded
+
+  defp count_items_up_to([_item | rest], :unlimited, count),
+    do: count_items_up_to(rest, :unlimited, count + 1)
+
+  defp count_items_up_to([_item | rest], remaining, count)
+       when is_integer(remaining) and remaining > 0,
+       do: count_items_up_to(rest, remaining - 1, count + 1)
+
+  defp count_items_up_to(_improper_tail, _remaining, _count), do: :invalid
+
+  defp count_pairs_up_to([], _remaining, count), do: {:ok, count}
+  defp count_pairs_up_to([_item | _rest], 0, _count), do: :limit_exceeded
+
+  defp count_pairs_up_to([_field, _value | rest], :unlimited, count),
+    do: count_pairs_up_to(rest, :unlimited, count + 1)
+
+  defp count_pairs_up_to([_field, _value | rest], remaining, count)
+       when is_integer(remaining) and remaining > 0,
+       do: count_pairs_up_to(rest, remaining - 1, count + 1)
+
+  defp count_pairs_up_to([_unpaired], _remaining, count), do: {:ok, count + 1}
+  defp count_pairs_up_to(_improper_tail, _remaining, _count), do: :invalid
 
   @spec derive_command_keys(term()) :: [binary()]
   def derive_command_keys(ast) do

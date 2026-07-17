@@ -67,4 +67,18 @@ defmodule Ferricstore.Raft.StateMachineTTBGuardTest do
     assert ApplyFailure.storage_reason?(:invalid_preencoded_command)
     refute ApplyFailure.storage_reason?({:unknown_command, :unsupported})
   end
+
+  test "WARaft blocks projection and internal rollback failures" do
+    for reason <- [
+          {:waraft_projection_failed, :forced_projection_failure},
+          {:hash_type_marker_rollback_failed, {:bitcask_append_failed, :enospc}, :ok},
+          {:compound_batch_mutate_rollback_failed, :write_failed, :ok, :restore_failed},
+          {:stream_metadata_rollback_failed, :write_failed, :entry_failed, :type_failed}
+        ] do
+      assert ApplyFailure.storage_reason?(reason)
+      assert ApplyFailure.storage_result?({:error, reason})
+    end
+
+    refute ApplyFailure.storage_reason?({:user_command_failed, :ordinary_error})
+  end
 end

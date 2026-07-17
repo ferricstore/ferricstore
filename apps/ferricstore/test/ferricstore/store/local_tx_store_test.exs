@@ -91,4 +91,24 @@ defmodule Ferricstore.Store.LocalTxStoreTest do
                0
              )
   end
+
+  @tag :transaction_prepared_compound_work
+  test "prepared compound fanout is rejected before dispatcher allocation or callbacks" do
+    {:ok, prepared} =
+      Ferricstore.Commands.PreparedCommand.prepare(
+        "HSET",
+        ["hash", "field-a", "one", "field-b", "two"]
+      )
+
+    {:ok, entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+
+    validation_only_store = %{
+      transaction_command_budget: 1,
+      transaction_key_apply_budget: 1,
+      compound_member_apply_budget: 1
+    }
+
+    assert {:error, :transaction_compound_read_budget_exceeded} =
+             Transaction.execute([entry], nil, validation_only_store)
+  end
 end

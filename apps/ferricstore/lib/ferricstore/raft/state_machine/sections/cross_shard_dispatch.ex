@@ -2571,6 +2571,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end,
           shard_index: default_ctx.index,
           data_dir: data_dir,
+          compound_member_apply_budget: anchor_state.apply_context.compound_member_apply_budget,
           transaction_command_budget: anchor_state.apply_context.transaction_command_budget,
           transaction_key_apply_budget: anchor_state.apply_context.transaction_key_apply_budget,
           transaction_result_byte_budget:

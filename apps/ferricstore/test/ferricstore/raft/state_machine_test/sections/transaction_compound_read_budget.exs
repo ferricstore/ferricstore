@@ -947,6 +947,83 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
         refute_received {:cold_batch_read, _key}
       end
 
+      @tag :transaction_batch_result_projection
+      test "multi-field HGETDEL and HGETEX preflight cold result bytes as batches", %{
+        state: state,
+        ets: ets,
+        active_file_path: active_file_path
+      } do
+        redis_key = "tx-result-budget-cold-hash-batch"
+        type_key = CompoundKey.type_key(redis_key)
+        fields = ["a", "b"]
+        index = state.compound_member_index_name
+
+        CompoundMemberIndex.ensure_table!(index)
+        CompoundMemberIndex.reset(index)
+        on_exit(fn -> safe_delete_ets(index) end)
+
+        :ets.insert(ets, {type_key, "hash", 0, LFU.initial(), 0, 0, 4})
+
+        compound_keys =
+          Enum.map(fields, fn field ->
+            compound_key = CompoundKey.hash_field(redis_key, field)
+
+            {:ok, {offset, value_size}} =
+              NIF.v2_append_record(active_file_path, compound_key, "123", 0)
+
+            :ets.insert(
+              ets,
+              {compound_key, nil, 0, LFU.initial(), 0, offset, value_size}
+            )
+
+            CompoundMemberIndex.put(index, compound_key, 0)
+            compound_key
+          end)
+
+        original_rows =
+          Map.new(compound_keys, fn compound_key ->
+            {compound_key, :ets.lookup(ets, compound_key)}
+          end)
+
+        context = ApplyContext.new(transaction_result_byte_budget: 5)
+
+        limited_state = %{
+          state
+          | apply_context: context,
+            apply_context_encoded: ApplyContext.encode(context)
+        }
+
+        test_pid = self()
+
+        Process.put(:ferricstore_state_machine_cold_read_success_hook, fn _ctx, key ->
+          send(test_pid, {:cold_hash_batch_read, key})
+        end)
+
+        on_exit(fn ->
+          Process.delete(:ferricstore_state_machine_cold_read_success_hook)
+        end)
+
+        Enum.each(["HGETDEL", "HGETEX"], fn command ->
+          {:ok, prepared} =
+            Ferricstore.Commands.PreparedCommand.prepare(
+              command,
+              [redis_key, "FIELDS", "2" | fields]
+            )
+
+          {:ok, entry} =
+            Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+
+          assert {_state, {:error, :transaction_result_byte_budget_exceeded}} =
+                   StateMachine.apply(%{}, {:tx_execute, [entry], nil}, limited_state)
+
+          refute_received {:cold_hash_batch_read, _key}
+
+          Enum.each(compound_keys, fn compound_key ->
+            assert Map.fetch!(original_rows, compound_key) == :ets.lookup(ets, compound_key)
+          end)
+        end)
+      end
+
       @tag :transaction_internal_read_budget
       test "small APPEND result may read a larger cold source value", %{
         state: state,

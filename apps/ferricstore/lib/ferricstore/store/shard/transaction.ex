@@ -21,7 +21,8 @@ defmodule Ferricstore.Store.Shard.Transaction do
            validate_queue(
              queue,
              Map.get(store, :transaction_command_budget, :unlimited),
-             Map.get(store, :transaction_key_apply_budget, :unlimited)
+             Map.get(store, :transaction_key_apply_budget, :unlimited),
+             Map.get(store, :compound_member_apply_budget, :unlimited)
            ) do
       with_execution_context(store, fn ->
         dispatch_queue(queue, sandbox_namespace, store)
@@ -68,10 +69,15 @@ defmodule Ferricstore.Store.Shard.Transaction do
     end
   end
 
-  defp validate_queue(queue, command_budget, key_budget) do
+  defp validate_queue(queue, command_budget, key_budget, compound_budget) do
     with {:ok, command_budget} <- normalize_queue_budget(command_budget, :command),
-         {:ok, key_budget} <- normalize_queue_budget(key_budget, :key) do
-      validate_queue_entries(queue, command_budget, key_budget, 0, 0)
+         {:ok, key_budget} <- normalize_queue_budget(key_budget, :key),
+         {:ok, compound_budget} <- normalize_queue_budget(compound_budget, :compound) do
+      validate_queue_entries(
+        queue,
+        %{commands: command_budget, keys: key_budget, compound: compound_budget},
+        %{commands: 0, keys: 0, compound: 0}
+      )
     end
   end
 
@@ -86,52 +92,59 @@ defmodule Ferricstore.Store.Shard.Transaction do
   defp normalize_queue_budget(_invalid, :key),
     do: {:error, :invalid_transaction_key_apply_budget}
 
-  defp validate_queue_entries([], _command_budget, _key_budget, _commands, _key_work),
-    do: :ok
+  defp normalize_queue_budget(_invalid, :compound),
+    do: {:error, :invalid_compound_member_apply_budget}
+
+  defp validate_queue_entries([], _budgets, _used), do: :ok
 
   defp validate_queue_entries(
-         [_entry | _rest],
-         command_budget,
-         _key_budget,
-         commands,
-         _key_work
-       )
-       when is_integer(command_budget) and commands >= command_budget,
-       do: {:error, :transaction_command_budget_exceeded}
-
-  defp validate_queue_entries(
-         [%ExecutionEntry{command_keys: command_keys} = entry | rest],
-         command_budget,
-         key_budget,
-         commands,
-         key_work
+         [%ExecutionEntry{command_keys: command_keys, ast: ast} = entry | rest],
+         budgets,
+         used
        ) do
-    remaining = remaining_queue_budget(key_budget, key_work)
-
-    with {:ok, entry_key_work} <- key_work_up_to(command_keys, remaining, 0),
+    with false <- queue_budget_exhausted?(budgets.commands, used.commands),
+         {:ok, entry_key_work} <-
+           admit_entry_key_work(command_keys, budgets.keys, used.keys),
+         {:ok, entry_compound_work} <-
+           admit_entry_compound_work(ast, budgets.compound, used.compound),
          true <- ExecutionEntry.valid?(entry) do
       validate_queue_entries(
         rest,
-        command_budget,
-        key_budget,
-        commands + 1,
-        key_work + entry_key_work
+        budgets,
+        %{
+          commands: used.commands + 1,
+          keys: used.keys + entry_key_work,
+          compound: used.compound + entry_compound_work
+        }
       )
     else
-      :limit_exceeded -> {:error, :transaction_key_apply_budget_exceeded}
+      true -> {:error, :transaction_command_budget_exceeded}
+      {:error, _reason} = error -> error
       false -> {:error, "ERR invalid transaction command"}
+    end
+  end
+
+  defp validate_queue_entries([_invalid | _rest], _budgets, _used),
+    do: {:error, "ERR invalid transaction command"}
+
+  defp queue_budget_exhausted?(:unlimited, _used), do: false
+  defp queue_budget_exhausted?(budget, used), do: used >= budget
+
+  defp admit_entry_key_work(command_keys, budget, used) do
+    case key_work_up_to(command_keys, remaining_queue_budget(budget, used), 0) do
+      {:ok, count} -> {:ok, count}
+      :limit_exceeded -> {:error, :transaction_key_apply_budget_exceeded}
       :invalid -> {:error, "ERR invalid transaction command"}
     end
   end
 
-  defp validate_queue_entries(
-         [_invalid | _rest],
-         _command_budget,
-         _key_budget,
-         _commands,
-         _key_work
-       ),
-       do: {:error, "ERR invalid transaction command"}
+  defp admit_entry_compound_work(ast, budget, used) do
+    case TxAst.compound_member_work_up_to(ast, remaining_queue_budget(budget, used)) do
+      {:ok, count} -> {:ok, count}
+      :limit_exceeded -> {:error, :transaction_compound_read_budget_exceeded}
+      :invalid -> {:error, "ERR invalid transaction command"}
+    end
+  end
 
   defp remaining_queue_budget(:unlimited, _used), do: :unlimited
   defp remaining_queue_budget(budget, used), do: max(budget - used, 0)
@@ -179,10 +192,10 @@ defmodule Ferricstore.Store.Shard.Transaction do
 
   defp result_read_projection(%ExecutionEntry{command: command, ast: ast}) do
     cond do
-      command in ["GET", "GETSET", "GETDEL", "GETEX", "HGET", "HGETDEL", "HGETEX"] ->
+      command in ["GET", "GETSET", "GETDEL", "GETEX", "HGET"] ->
         :point
 
-      command in ["MGET", "HMGET"] ->
+      command in ["MGET", "HMGET", "HGETDEL", "HGETEX"] ->
         :batch
 
       command == "SET" and set_returns_old_value?(ast) ->

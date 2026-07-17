@@ -28,6 +28,7 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
                             :blob_ref_unavailable,
                             :cross_shard_compensation_failed,
                             :flow_history_projection_failed,
+                            :waraft_projection_failed,
                             :state_read_failed,
                             :delete_prob_file_failed,
                             :storage_blocked,

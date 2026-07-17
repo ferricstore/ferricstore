@@ -359,6 +359,20 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     assert {:error, _reason} = ExecutionEntry.from_prepared(unsafe)
   end
 
+  test "compound work preflight stops at the replicated boundary" do
+    oversized_improper_ast =
+      {:hset, ["key", "field-a", "one", "field-b", "two" | :must_not_be_visited]}
+
+    assert :limit_exceeded =
+             TransactionAst.compound_member_work_up_to(oversized_improper_ast, 1)
+
+    assert {:ok, 2} =
+             TransactionAst.compound_member_work_up_to(
+               {:hmget, ["key", "field-a", "field-b"]},
+               2
+             )
+  end
+
   test "a literal wildcard data key remains routable" do
     assert {:ok, prepared} = Dispatcher.prepare_raw("GET", ["*"])
     assert prepared.acl_keys == ["*"]
