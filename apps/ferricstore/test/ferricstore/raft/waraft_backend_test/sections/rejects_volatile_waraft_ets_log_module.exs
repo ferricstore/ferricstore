@@ -689,7 +689,11 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         end
       end
 
-      test "fetch-or-compute lock expiry uses stamped command time on replay", %{ctx: ctx} do
+      @tag :stamped_lock_replay
+      test "fetch-or-compute lock expiry uses stamped command time on replay", %{
+        ctx: ctx,
+        root: root
+      } do
         previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
 
         try do
@@ -719,6 +723,31 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
                    })
 
           assert "old" == Router.get(ctx, key)
+
+          assert :ok = WARaftBackend.stop()
+          storage_root = waraft_storage_root(root, 0)
+          metadata = waraft_latest_storage_metadata(root, 0)
+          File.rm_rf!(Path.join(storage_root, "segment_projection_log"))
+
+          write_waraft_storage_metadata!(
+            root,
+            0,
+            Map.put(metadata, :position, {:raft_log_pos, 1, 1})
+          )
+
+          FerricStore.Instance.cleanup(ctx.name)
+          restarted_ctx = build_ctx(root)
+
+          try do
+            assert :ok =
+                     WARaftBackend.start(restarted_ctx,
+                       log_module: :ferricstore_waraft_spike_segment_log
+                     )
+
+            assert "old" == Router.get(restarted_ctx, key)
+          after
+            FerricStore.Instance.cleanup(restarted_ctx.name)
+          end
         after
           restore_env(:waraft_storage_apply_mode, previous_mode)
         end

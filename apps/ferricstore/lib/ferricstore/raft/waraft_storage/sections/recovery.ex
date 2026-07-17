@@ -512,14 +512,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
            do: {:ok, sm_state, %{history: %{}}}
 
       defp recover_segment_projected_command(command, position, sm_state) do
-        case segment_project_command(decoded_replay_command(command), position, sm_state) do
-          {:ok, next_sm_state, _result, applied_increment} ->
-            {:ok, bump_segment_projected_applied_count(next_sm_state, applied_increment),
-             %{history: %{}}}
+        with_segment_projection_command_time(command, fn ->
+          case segment_project_command(decoded_replay_command(command), position, sm_state) do
+            {:ok, next_sm_state, _result, applied_increment} ->
+              {:ok, bump_segment_projected_applied_count(next_sm_state, applied_increment),
+               %{history: %{}}}
 
-          :unsupported ->
-            recover_segment_projected_state_machine_command(command, position, sm_state)
-        end
+            :unsupported ->
+              recover_segment_projected_state_machine_command(command, position, sm_state)
+          end
+        end)
       end
 
       defp recover_segment_projected_state_machine_command(command, position, sm_state) do
