@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.CommandTime
 
   @scan_page_records 4_096
 
@@ -18,7 +19,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Log do
   @spec scan_event_value(binary(), binary()) :: {:ok, binary()} | :miss | {:error, term()}
   def scan_event_value(shard_data_path, target_key) do
     file_path = history_file_path(shard_data_path, 0)
-    now_ms = System.system_time(:millisecond)
+    now_ms = CommandTime.now_ms()
 
     with {:ok, location} <-
            reduce_metadata_pages(file_path, :miss, fn record, location ->

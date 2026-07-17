@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.HistoryProjectorStreamingScanTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.CommandTime
   alias Ferricstore.Flow.HistoryProjector.Log
 
   test "production history scans fold bounded metadata pages" do
@@ -61,5 +62,30 @@ defmodule Ferricstore.Flow.HistoryProjectorStreamingScanTest do
              NIF.v2_append_batch(history_path, [{"expired", "secret", expired_at_ms}])
 
     assert :miss = Log.scan_event_value(dir, "expired")
+  end
+
+  test "history scan expiry uses the stamped apply clock" do
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_history_apply_time_scan_#{System.unique_integer([:positive])}"
+      )
+
+    history_dir = Path.join(dir, "history")
+    history_path = Path.join(history_dir, "00000.log")
+    File.mkdir_p!(history_dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    wall_ms = System.system_time(:millisecond)
+
+    assert {:ok, [_location]} =
+             NIF.v2_append_batch(history_path, [
+               {"apply-expired", "must-stay-hidden", wall_ms + 30_000}
+             ])
+
+    assert :miss =
+             CommandTime.with_now_ms(wall_ms + 60_000, fn ->
+               Log.scan_event_value(dir, "apply-expired")
+             end)
   end
 end
