@@ -198,6 +198,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       # ETS entries with real file_id/offset. Called at the end of every apply/3
       # — no :pending entries remain after this returns.
       defp flush_pending_writes(state) do
+        case prepare_pending_flow_native_batches(state) do
+          :ok ->
+            do_flush_pending_writes(state)
+
+          {:error, _reason} = error ->
+            rollback_pending_writes(state)
+            error
+        end
+      end
+
+      defp do_flush_pending_writes(state) do
         :ok = flush_pending_lmdb(state)
 
         case Process.put(:sm_pending_writes, []) do
@@ -261,6 +272,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             case validated_append_result do
               {:ok, locations} ->
                 clear_disk_pressure(state)
+                Process.put(:sm_pending_storage_published?, true)
                 publish_pending_batch(state, file_id, batch, locations)
 
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
@@ -287,6 +299,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
             case validate_append_result(batch, {:ok, locations}) do
               {:ok, ^locations} ->
                 clear_disk_pressure(state)
+                Process.put(:sm_pending_storage_published?, true)
                 publish_pending_batch(state, file_id, batch, locations)
 
                 observe_pending_lmdb_mirror_enqueue(state, enqueue_pending_lmdb_mirror(state))
@@ -329,35 +342,108 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       end
 
       defp flush_pending_flow_native_indexes(state) do
-        case Process.put(:sm_pending_flow_native_ops, []) do
+        Process.put(:sm_pending_flow_native_ops, [])
+
+        case Process.put(:sm_pending_flow_native_batches, []) do
           [] ->
             :ok
 
-          ops when is_list(ops) ->
-            batches =
-              ops
-              |> Enum.reverse()
-              |> normalize_flow_native_ops(state)
-              |> coalesce_flow_native_ops()
-
+          batches when is_list(batches) ->
             if batches != [] do
               Process.put(:sm_pending_flow_native_flush?, true)
             end
 
-            batches
-            |> Enum.each(fn {native, batch_ops} ->
-              NativeFlowIndex.apply_batch(native, batch_ops)
-              after_flow_native_apply_batch_hook(native, batch_ops)
-            end)
+            case apply_flow_native_batches(batches) do
+              :ok ->
+                flow_flush_pending_due_catalog_keys(state)
 
-            flow_flush_pending_due_catalog_keys(state)
+              {:error, reason} ->
+                Logger.error(
+                  "Flow native index apply failed; rebuilding from committed keydir: #{inspect(reason)}"
+                )
+
+                with :ok <- reset_flow_native_index_from_keydir(state) do
+                  flow_flush_pending_due_catalog_keys(state)
+                end
+            end
 
           _ ->
             :ok
         end
       end
 
+      defp prepare_pending_flow_native_batches(state) do
+        ops = Process.get(:sm_pending_flow_native_ops, [])
+
+        with true <- is_list(ops),
+             batches <-
+               ops
+               |> Enum.reverse()
+               |> normalize_flow_native_ops(state)
+               |> coalesce_flow_native_ops(),
+             {:ok, prepared} <- chunk_flow_native_batches(batches),
+             :ok <- before_flow_native_prepare_commit_hook(prepared) do
+          Process.put(:sm_pending_flow_native_batches, prepared)
+          Process.put(:sm_pending_flow_native_ops, [])
+          :ok
+        else
+          false -> {:error, :invalid_pending_flow_native_ops}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp chunk_flow_native_batches(batches) do
+        Enum.reduce_while(batches, {:ok, []}, fn {native, batch_ops}, {:ok, prepared} ->
+          case NativeFlowIndex.chunk_batch_ops(batch_ops) do
+            {:ok, chunks} ->
+              next =
+                Enum.reduce(chunks, prepared, fn chunk_ops, acc ->
+                  [{native, chunk_ops} | acc]
+                end)
+
+              {:cont, {:ok, next}}
+
+            {:error, _reason} = error ->
+              {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, prepared} -> {:ok, Enum.reverse(prepared)}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp apply_flow_native_batches(batches) do
+        Enum.reduce_while(batches, :ok, fn {native, batch_ops}, :ok ->
+          case apply_flow_native_batch(native, batch_ops) do
+            :ok ->
+              after_flow_native_apply_batch_hook(native, batch_ops)
+              {:cont, :ok}
+
+            {:error, _reason} = error ->
+              {:halt, error}
+
+            invalid ->
+              {:halt, {:error, {:invalid_flow_native_apply_result, invalid}}}
+          end
+        end)
+      end
+
       if Mix.env() == :test do
+        defp before_flow_native_prepare_commit_hook(prepared) do
+          case Process.get(:ferricstore_state_machine_flow_native_prepare_hook) do
+            hook when is_function(hook, 1) -> hook.(prepared)
+            _ -> :ok
+          end
+        end
+
+        defp apply_flow_native_batch(native, batch_ops) do
+          case Process.get(:ferricstore_state_machine_flow_native_apply_hook) do
+            hook when is_function(hook, 2) -> hook.(native, batch_ops)
+            _ -> NativeFlowIndex.apply_batch(native, batch_ops)
+          end
+        end
+
         defp after_flow_native_apply_batch_hook(native, batch_ops) do
           case Process.get(:ferricstore_state_machine_after_flow_native_apply_batch_hook) do
             hook when is_function(hook, 2) -> hook.(native, batch_ops)
@@ -365,11 +451,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
           end
         end
       else
+        defp before_flow_native_prepare_commit_hook(_prepared), do: :ok
+
+        defp apply_flow_native_batch(native, batch_ops),
+          do: NativeFlowIndex.apply_batch(native, batch_ops)
+
         defp after_flow_native_apply_batch_hook(_native, _batch_ops), do: :ok
       end
 
       @doc false
       def __coalesce_flow_native_ops_for_test__(ops), do: coalesce_flow_native_ops(ops)
+
+      @doc false
+      def __prepare_pending_flow_native_batches_for_test__(state),
+        do: prepare_pending_flow_native_batches(state)
 
       @doc false
       def __flow_history_projection_shards_for_test__(ctx, state, entries) do

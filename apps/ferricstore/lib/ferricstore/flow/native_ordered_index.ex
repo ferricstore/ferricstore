@@ -7,6 +7,9 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   @busy_retry_initial_ms 1
   @busy_retry_max_ms 8
   @native_page_size 4_096
+  @max_request_items 100_000
+  @max_request_bytes 64 * 1_024 * 1_024
+  @request_too_large "flow index native request exceeds safety budget"
 
   @type resource :: reference()
   @type score_input :: binary() | integer() | float()
@@ -265,7 +268,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   def delete_count(resource, key),
     do: retry_busy(fn -> NIF.flow_index_delete_count(resource, key) end)
 
-  @spec apply_batch(resource(), [tuple()]) :: :ok
+  @spec apply_batch(resource(), [tuple()]) :: :ok | {:error, term()}
   def apply_batch(_resource, []), do: :ok
 
   def apply_batch(resource, ops) do
@@ -299,6 +302,39 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
       prepend_reversed_groups(claim_entries)
     )
   end
+
+  @doc false
+  @spec batch_budget(tuple()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, binary()}
+  def batch_budget({:put_entries, entries}), do: entry_batch_budget(entries, {0, 0})
+  def batch_budget({:put_new_entries, entries}), do: entry_batch_budget(entries, {0, 0})
+  def batch_budget({:move_entries, entries}), do: move_batch_budget(entries, {0, 0})
+
+  def batch_budget({:delete_members, key, members}) when is_binary(key),
+    do: delete_batch_budget(key, members, {0, 0})
+
+  def batch_budget({:apply_claim_entries, entries}), do: claim_batch_budget(entries, {0, 0})
+  def batch_budget(_invalid), do: {:error, "invalid native Flow index operation"}
+
+  @doc false
+  @spec validate_request_budget(non_neg_integer(), non_neg_integer()) ::
+          :ok | {:error, binary()}
+  def validate_request_budget(items, bytes)
+      when is_integer(items) and items >= 0 and is_integer(bytes) and bytes >= 0 do
+    if items <= @max_request_items and bytes <= @max_request_bytes,
+      do: :ok,
+      else: {:error, @request_too_large}
+  end
+
+  @doc false
+  @spec chunk_batch_ops([tuple()]) :: {:ok, [[tuple()]]} | {:error, binary()}
+  def chunk_batch_ops(ops) when is_list(ops) do
+    with {:ok, chunks} <- split_batch_ops(ops, []) do
+      {:ok, pack_batch_chunks(chunks, [], {0, 0}, [])}
+    end
+  end
+
+  def chunk_batch_ops(_invalid), do: {:error, "invalid native Flow index batch"}
 
   @spec claim_due_candidates(
           resource(),
@@ -451,6 +487,211 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   end
 
   defp registry_key(index_table, lookup_table), do: {@registry_key, index_table, lookup_table}
+
+  defp split_batch_ops([], chunks), do: {:ok, Enum.reverse(chunks)}
+
+  defp split_batch_ops([op | ops], chunks) do
+    with {:ok, op_chunks} <- split_batch_op(op) do
+      split_batch_ops(ops, Enum.reverse(op_chunks, chunks))
+    end
+  end
+
+  defp split_batch_op(op) do
+    case batch_budget(op) do
+      {:ok, budget} ->
+        {:ok, [{op, budget}]}
+
+      {:error, @request_too_large} ->
+        split_oversized_batch_op(op)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp split_oversized_batch_op({:put_entries, entries}) when is_list(entries),
+    do: split_batch_entries(entries, :put_entries, nil, [], {0, 0}, [])
+
+  defp split_oversized_batch_op({:put_new_entries, entries}) when is_list(entries),
+    do: split_batch_entries(entries, :put_new_entries, nil, [], {0, 0}, [])
+
+  defp split_oversized_batch_op({:move_entries, entries}) when is_list(entries),
+    do: split_batch_entries(entries, :move_entries, nil, [], {0, 0}, [])
+
+  defp split_oversized_batch_op({:delete_members, key, members})
+       when is_binary(key) and is_list(members),
+       do: split_batch_entries(members, :delete_members, key, [], {0, 0}, [])
+
+  defp split_oversized_batch_op({:apply_claim_entries, entries}) when is_list(entries),
+    do: split_batch_entries(entries, :apply_claim_entries, nil, [], {0, 0}, [])
+
+  defp split_oversized_batch_op(_invalid),
+    do: {:error, "invalid native Flow index operation"}
+
+  defp split_batch_entries([], _tag, _context, [], _budget, chunks),
+    do: {:ok, Enum.reverse(chunks)}
+
+  defp split_batch_entries([], tag, context, entries, budget, chunks) do
+    chunk = {build_batch_op(tag, context, Enum.reverse(entries)), budget}
+    {:ok, Enum.reverse([chunk | chunks])}
+  end
+
+  defp split_batch_entries(
+         [entry | entries],
+         tag,
+         context,
+         current_entries,
+         {items, bytes} = budget,
+         chunks
+       ) do
+    with {:ok, {entry_items, entry_bytes}} <- batch_entry_budget(tag, context, entry) do
+      next_budget = {items + entry_items, bytes + entry_bytes}
+
+      case validate_request_budget(elem(next_budget, 0), elem(next_budget, 1)) do
+        :ok ->
+          split_batch_entries(
+            entries,
+            tag,
+            context,
+            [entry | current_entries],
+            next_budget,
+            chunks
+          )
+
+        {:error, _reason} = error when current_entries == [] ->
+          error
+
+        {:error, _reason} ->
+          chunk = {build_batch_op(tag, context, Enum.reverse(current_entries)), budget}
+
+          split_batch_entries(
+            [entry | entries],
+            tag,
+            context,
+            [],
+            {0, 0},
+            [chunk | chunks]
+          )
+      end
+    end
+  end
+
+  defp batch_entry_budget(tag, context, entry) do
+    tag
+    |> build_batch_op(context, [entry])
+    |> batch_budget()
+  end
+
+  defp build_batch_op(:put_entries, _context, entries), do: {:put_entries, entries}
+  defp build_batch_op(:put_new_entries, _context, entries), do: {:put_new_entries, entries}
+  defp build_batch_op(:move_entries, _context, entries), do: {:move_entries, entries}
+
+  defp build_batch_op(:delete_members, key, members),
+    do: {:delete_members, key, members}
+
+  defp build_batch_op(:apply_claim_entries, _context, entries),
+    do: {:apply_claim_entries, entries}
+
+  defp pack_batch_chunks([], [], _budget, batches), do: Enum.reverse(batches)
+
+  defp pack_batch_chunks([], current, _budget, batches),
+    do: Enum.reverse([Enum.reverse(current) | batches])
+
+  defp pack_batch_chunks(
+         [{op, {op_items, op_bytes}} | chunks],
+         current,
+         {items, bytes},
+         batches
+       ) do
+    next_budget = {items + op_items, bytes + op_bytes}
+
+    case validate_request_budget(elem(next_budget, 0), elem(next_budget, 1)) do
+      :ok ->
+        pack_batch_chunks(chunks, [op | current], next_budget, batches)
+
+      {:error, _reason} when current != [] ->
+        pack_batch_chunks(
+          [{op, {op_items, op_bytes}} | chunks],
+          [],
+          {0, 0},
+          [Enum.reverse(current) | batches]
+        )
+    end
+  end
+
+  defp entry_batch_budget([], budget), do: {:ok, budget}
+
+  defp entry_batch_budget([{key, member, _score} | entries], budget)
+       when is_binary(key) and is_binary(member) do
+    with {:ok, next_budget} <- add_batch_budget(budget, 1, byte_size(key) + byte_size(member)) do
+      entry_batch_budget(entries, next_budget)
+    end
+  end
+
+  defp entry_batch_budget(_invalid, _budget),
+    do: {:error, "invalid native Flow index entry"}
+
+  defp move_batch_budget([], budget), do: {:ok, budget}
+
+  defp move_batch_budget([{from_key, to_key, member, _score} | entries], budget)
+       when is_binary(from_key) and is_binary(to_key) and is_binary(member) do
+    bytes = byte_size(from_key) + byte_size(to_key) + byte_size(member)
+
+    with {:ok, next_budget} <- add_batch_budget(budget, 1, bytes) do
+      move_batch_budget(entries, next_budget)
+    end
+  end
+
+  defp move_batch_budget(_invalid, _budget),
+    do: {:error, "invalid native Flow index move"}
+
+  defp delete_batch_budget(_key, [], budget), do: {:ok, budget}
+
+  defp delete_batch_budget(key, [member | members], budget) when is_binary(member) do
+    with {:ok, next_budget} <-
+           add_batch_budget(budget, 1, byte_size(key) + byte_size(member)) do
+      delete_batch_budget(key, members, next_budget)
+    end
+  end
+
+  defp delete_batch_budget(_key, _invalid, _budget),
+    do: {:error, "invalid native Flow index delete"}
+
+  defp claim_batch_budget([], budget), do: {:ok, budget}
+
+  defp claim_batch_budget(
+         [
+           {id, from_due_key, _from_due_score, to_due_key, _to_due_score, from_state_key,
+            _from_state_score, to_state_key, _to_state_score, inflight_key, worker_key,
+            _lease_score}
+           | entries
+         ],
+         budget
+       )
+       when is_binary(id) and is_binary(from_due_key) and is_binary(to_due_key) and
+              is_binary(from_state_key) and is_binary(to_state_key) and is_binary(inflight_key) and
+              is_binary(worker_key) do
+    bytes =
+      byte_size(id) * 6 + byte_size(from_due_key) + byte_size(to_due_key) +
+        byte_size(from_state_key) + byte_size(to_state_key) + byte_size(inflight_key) +
+        byte_size(worker_key)
+
+    with {:ok, next_budget} <- add_batch_budget(budget, 6, bytes) do
+      claim_batch_budget(entries, next_budget)
+    end
+  end
+
+  defp claim_batch_budget(_invalid, _budget),
+    do: {:error, "invalid native Flow index claim"}
+
+  defp add_batch_budget({items, bytes}, item_increment, byte_increment) do
+    next = {items + item_increment, bytes + byte_increment}
+
+    case validate_request_budget(elem(next, 0), elem(next, 1)) do
+      :ok -> {:ok, next}
+      {:error, _reason} = error -> error
+    end
+  end
 
   @doc false
   def __retry_busy_for_test__(fun, sleep_fun)

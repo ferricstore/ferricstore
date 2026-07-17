@@ -45,7 +45,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CoalescesConsecutiveFlowNat
                ] = StateMachine.__coalesce_flow_native_ops_for_test__(ops)
       end
 
-      test "Flow native index rolls back when apply fails after native flush", %{state: state} do
+      @tag :flow_native_postpublish_failure
+      test "Flow state stays published when apply fails after native flush", %{state: state} do
         id = "flow-native-rollback"
         type = "native-rollback"
         partition_key = "tenant-native-rollback"
@@ -77,7 +78,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CoalescesConsecutiveFlowNat
           Process.delete(:ferricstore_state_machine_after_flow_native_apply_batch_hook)
         end
 
-        assert [] = :ets.lookup(state.ets, state_key)
+        assert [{^state_key, _value, 0, _lfu, _file_id, _offset, _value_size}] =
+                 :ets.lookup(state.ets, state_key)
 
         assert native =
                  Ferricstore.Flow.NativeOrderedIndex.get(
@@ -85,7 +87,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CoalescesConsecutiveFlowNat
                    state.flow_lookup_name
                  )
 
-        assert [] =
+        assert [{^id, 1_000.0}] =
                  Ferricstore.Flow.NativeOrderedIndex.range_slice(
                    native,
                    due_key,

@@ -910,13 +910,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
         case Process.get(:sm_pending_flow_native_ops, :undefined) do
           ops when is_list(ops) ->
             Process.put(:sm_pending_flow_native_ops, [{native, op} | ops])
+            :ok
 
           _ ->
             NativeFlowIndex.apply_batch(native, [op])
         end
-
-        :ok
       end
+
+      @doc false
+      def __flow_native_apply_or_queue_for_test__(native, op),
+        do: flow_native_apply_or_queue(native, op)
 
       defp flow_native_ops_queued? do
         is_list(Process.get(:sm_pending_flow_native_ops, :undefined))

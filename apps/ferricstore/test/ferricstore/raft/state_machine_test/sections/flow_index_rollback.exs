@@ -10,6 +10,142 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowIndexRollback do
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, Promotion}
 
       describe "Flow index rollback" do
+        @tag :flow_native_apply_error
+        test "native Flow index apply errors are returned before durable publication" do
+          native = Ferricstore.Flow.NativeOrderedIndex.new()
+          oversized_key = :binary.copy("k", 64 * 1_024 * 1_024 + 1)
+          op = {:put_entries, [{oversized_key, "member", 1.0}]}
+          expected = {:error, "flow index native request exceeds safety budget"}
+
+          assert ^expected =
+                   StateMachine.__flow_native_apply_or_queue_for_test__(native, op)
+
+          Process.put(:sm_pending_flow_native_ops, [])
+
+          try do
+            assert :ok =
+                     StateMachine.__flow_native_apply_or_queue_for_test__(native, op)
+
+            assert ^expected =
+                     StateMachine.__prepare_pending_flow_native_batches_for_test__(%{})
+
+            assert [{^native, ^op}] = Process.get(:sm_pending_flow_native_ops)
+          after
+            Process.delete(:sm_pending_flow_native_ops)
+            Process.delete(:sm_pending_flow_native_batches)
+          end
+        end
+
+        @tag :flow_native_precommit_guard
+        test "native Flow index preparation failures happen before durable append", %{
+          state: state,
+          ets: ets,
+          active_file_path: active_file_path
+        } do
+          id = "flow-native-precommit"
+          partition_key = "tenant-native-precommit"
+          state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+          previous_append_hook = Application.get_env(:ferricstore, :pending_append_hook)
+          parent = self()
+
+          Application.put_env(:ferricstore, :pending_append_hook, fn _path, _batch ->
+            send(parent, :flow_native_append_called)
+            :passthrough
+          end)
+
+          Process.put(:ferricstore_state_machine_flow_native_prepare_hook, fn _prepared ->
+            {:error, :injected_flow_native_prepare_failure}
+          end)
+
+          try do
+            {_new_state, {:error, :injected_flow_native_prepare_failure}} =
+              StateMachine.apply(
+                %{system_time: 1_000},
+                {:flow_create, state_key,
+                 %{
+                   id: id,
+                   type: "native-precommit",
+                   state: "queued",
+                   partition_key: partition_key,
+                   now_ms: 1_000,
+                   run_at_ms: 1_000
+                 }},
+                state
+              )
+
+            refute_received :flow_native_append_called
+            assert {:ok, %{size: 0}} = File.stat(active_file_path)
+            assert [] == :ets.lookup(ets, state_key)
+          after
+            Process.delete(:ferricstore_state_machine_flow_native_prepare_hook)
+
+            if previous_append_hook == nil,
+              do: Application.delete_env(:ferricstore, :pending_append_hook),
+              else: Application.put_env(:ferricstore, :pending_append_hook, previous_append_hook)
+          end
+        end
+
+        @tag :flow_native_repair
+        test "native Flow index apply failures rebuild from committed keydir", %{
+          state: state,
+          ets: ets,
+          active_file_path: active_file_path
+        } do
+          :ets.new(state.zset_score_index_name, [:ordered_set, :public, :named_table])
+          :ets.new(state.zset_score_lookup_name, [:set, :public, :named_table])
+
+          on_exit(fn ->
+            safe_delete_ets(state.zset_score_index_name)
+            safe_delete_ets(state.zset_score_lookup_name)
+          end)
+
+          id = "flow-native-repair"
+          type = "native-repair"
+          partition_key = "tenant-native-repair"
+          state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+          due_key = Ferricstore.Flow.Keys.due_key(type, "queued", 0, partition_key)
+          state_index_key = Ferricstore.Flow.Keys.state_index_key(type, "queued", partition_key)
+
+          Process.put(:ferricstore_state_machine_flow_native_apply_hook, fn _native, _batch_ops ->
+            {:error, :injected_flow_native_apply_failure}
+          end)
+
+          try do
+            {_new_state, :ok} =
+              StateMachine.apply(
+                %{system_time: 1_000},
+                {:flow_create, state_key,
+                 %{
+                   id: id,
+                   type: type,
+                   state: "queued",
+                   partition_key: partition_key,
+                   now_ms: 1_000,
+                   run_at_ms: 1_000
+                 }},
+                state
+              )
+          after
+            Process.delete(:ferricstore_state_machine_flow_native_apply_hook)
+          end
+
+          assert {:ok, %{size: size}} = File.stat(active_file_path)
+          assert size > 0
+
+          assert [{^state_key, _value, 0, _lfu, _file_id, _offset, _value_size}] =
+                   :ets.lookup(ets, state_key)
+
+          native =
+            Ferricstore.Flow.NativeOrderedIndex.get(
+              state.flow_index_name,
+              state.flow_lookup_name
+            )
+
+          assert 1 == Ferricstore.Flow.NativeOrderedIndex.count_all(native, due_key)
+          assert 1 == Ferricstore.Flow.NativeOrderedIndex.count_all(native, state_index_key)
+        end
+
+        @tag :flow_native_append_rollback
         test "rolls back native Flow index mutations when apply append fails", %{
           state: state,
           dir: dir
@@ -57,7 +193,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowIndexRollback do
                    0
         end
 
-        test "fails closed when native Flow index rollback cannot decode existing state", %{
+        @tag :flow_native_fatal_repair
+        test "does not roll back published storage when native Flow index repair fails", %{
           state: state,
           ets: ets
         } do
@@ -86,9 +223,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowIndexRollback do
               "tenant-index-rollback-trigger"
             )
 
-          Process.put(:ferricstore_state_machine_after_flow_native_apply_batch_hook, fn _native,
-                                                                                        _ops ->
-            raise "injected post-native failure"
+          Process.put(:ferricstore_state_machine_flow_native_apply_hook, fn _native, _ops ->
+            {:error, :injected_native_apply_failure}
           end)
 
           try do
@@ -108,11 +244,14 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowIndexRollback do
                            )
                          end
           after
-            Process.delete(:ferricstore_state_machine_after_flow_native_apply_batch_hook)
+            Process.delete(:ferricstore_state_machine_flow_native_apply_hook)
           end
 
           assert [{^corrupt_key, "corrupt", 0, _lfu, :memory, 0, 7}] =
                    :ets.lookup(ets, corrupt_key)
+
+          assert [{^state_key, _value, 0, _lfu, _file_id, _offset, _value_size}] =
+                   :ets.lookup(ets, state_key)
         end
       end
 

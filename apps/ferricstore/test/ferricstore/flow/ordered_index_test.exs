@@ -985,6 +985,73 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
     assert [{"flow-1", 4.0}] = NativeOrderedIndex.rank_range(native, "later", 0, 10, false)
   end
 
+  @tag :flow_native_chunking
+  test "native batch chunking applies requests above the item ceiling" do
+    native = NativeOrderedIndex.new()
+
+    entries =
+      Enum.map(0..100_000, fn index ->
+        {"chunked:index", Integer.to_string(index), index}
+      end)
+
+    ops = [{:put_entries, entries}]
+    expected = {:error, "flow index native request exceeds safety budget"}
+    assert ^expected = NativeOrderedIndex.apply_batch(native, ops)
+
+    assert {:ok, [first_chunk, second_chunk]} =
+             NativeOrderedIndex.chunk_batch_ops(ops)
+
+    assert :ok = NativeOrderedIndex.apply_batch(native, first_chunk)
+    assert :ok = NativeOrderedIndex.apply_batch(native, second_chunk)
+    assert 100_001 == NativeOrderedIndex.count_all(native, "chunked:index")
+    assert {:ok, zero_score} = NativeOrderedIndex.score_of(native, "chunked:index", "0")
+    assert zero_score == 0.0
+    assert {:ok, 100_000.0} = NativeOrderedIndex.score_of(native, "chunked:index", "100000")
+  end
+
+  @tag :flow_native_chunking
+  test "native batch chunking bounds aggregate request bytes without copying binaries" do
+    member = :binary.copy("m", 65_535)
+    entries = List.duplicate({"byte:index", member, 1.0}, 1_025)
+    ops = [{:put_entries, entries}]
+
+    assert {:ok, chunks} = NativeOrderedIndex.chunk_batch_ops(ops)
+    assert length(chunks) == 2
+
+    assert 1_025 ==
+             Enum.sum(
+               Enum.map(chunks, fn [{:put_entries, chunk_entries}] ->
+                 length(chunk_entries)
+               end)
+             )
+
+    Enum.each(chunks, fn chunk ->
+      assert :ok =
+               Enum.reduce(chunk, :ok, fn op, :ok ->
+                 assert {:ok, {items, bytes}} = NativeOrderedIndex.batch_budget(op)
+                 NativeOrderedIndex.validate_request_budget(items, bytes)
+               end)
+    end)
+  end
+
+  @tag :flow_native_chunking
+  test "native batch chunking applies the six-item claim weight" do
+    claim =
+      {"flow", "due:queued", 1.0, "due:running", 2.0, "state:queued", 1.0, "state:running", 2.0,
+       "inflight", "worker", 3.0}
+
+    ops = [{:apply_claim_entries, List.duplicate(claim, 16_667)}]
+
+    assert {:ok,
+            [
+              [{:apply_claim_entries, first_chunk}],
+              [{:apply_claim_entries, second_chunk}]
+            ]} = NativeOrderedIndex.chunk_batch_ops(ops)
+
+    assert length(first_chunk) == 16_666
+    assert length(second_chunk) == 1
+  end
+
   test "native take_due returns due members in order and removes them" do
     native = NativeOrderedIndex.new()
 

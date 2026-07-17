@@ -976,75 +976,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
               error
 
             nil ->
-              case flush_cross_shard_pending_writes(state) do
-                {:ok, flushed_state, successful_groups} ->
-                  :ok =
-                    publish_cross_shard_transaction(flushed_state, successful_groups)
+              case prepare_pending_flow_native_batches(state) do
+                :ok ->
+                  flush_prepared_cross_shard_pending_writes(state, result)
 
-                  :ok = dispatch_pending_compound_promotions(flushed_state)
-
-                  case publish_pending_flow_history_projections(flushed_state) do
-                    :ok ->
-                      observe_pending_lmdb_mirror_enqueue(
-                        state,
-                        enqueue_pending_lmdb_mirror(state)
-                      )
-
-                      {result, flushed_state}
-
-                    {:error, reason} ->
-                      handle_flow_history_projection_publish_failure(flushed_state, reason)
-
-                      observe_pending_lmdb_mirror_enqueue(
-                        state,
-                        enqueue_pending_lmdb_mirror(state)
-                      )
-
-                      {result, flushed_state}
-                  end
-
-                {:error, reason, partial_state, successful_groups, journal_txid} ->
-                  case compensate_cross_shard_partial_writes(
-                         partial_state,
-                         successful_groups,
-                         Process.get(:sm_cross_shard_pending_originals, %{})
-                       ) do
-                    {:ok, compensated_state} ->
-                      case abort_standalone_cross_shard_journal(state, journal_txid) do
-                        :ok ->
-                          rollback_cross_shard_pending_writes(state)
-                          rollback_pending_writes(state)
-                          {:error, reason, compensated_state}
-
-                        {:error, abort_reason} ->
-                          rollback_cross_shard_pending_writes(state)
-                          rollback_pending_writes(state)
-                          block_release_cursor_for_apply()
-
-                          {:error,
-                           {:cross_shard_compensation_failed,
-                            {:standalone_tx_abort_failed, abort_reason}}, compensated_state}
-                      end
-
-                    {:error, compensation_reason, compensated_state} ->
-                      rollback_cross_shard_pending_writes(state)
-                      rollback_pending_writes(state)
-                      block_release_cursor_for_apply()
-
-                      {:error, {:cross_shard_compensation_failed, compensation_reason},
-                       compensated_state}
-                  end
+                {:error, _reason} = error ->
+                  rollback_cross_shard_pending_writes(state)
+                  rollback_pending_writes(state)
+                  error
               end
           end
         rescue
           error ->
-            rollback_cross_shard_pending_writes(state)
-            rollback_pending_writes(state)
+            rollback_cross_shard_pending_writes_unless_published(state)
             reraise error, __STACKTRACE__
         catch
           kind, reason ->
-            rollback_cross_shard_pending_writes(state)
-            rollback_pending_writes(state)
+            rollback_cross_shard_pending_writes_unless_published(state)
             :erlang.raise(kind, reason, __STACKTRACE__)
         after
           release_transaction_promotion_latches()
@@ -1052,6 +1000,79 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
           Process.delete(:sm_cross_shard_pending_originals)
           Process.delete(:sm_tx_promoted_latches)
           clear_pending_write_process_state()
+        end
+      end
+
+      defp rollback_cross_shard_pending_writes_unless_published(state) do
+        unless Process.get(:sm_pending_storage_published?, false) do
+          rollback_cross_shard_pending_writes(state)
+          rollback_pending_writes(state)
+        end
+
+        :ok
+      end
+
+      defp flush_prepared_cross_shard_pending_writes(state, result) do
+        case flush_cross_shard_pending_writes(state) do
+          {:ok, flushed_state, successful_groups} ->
+            if successful_groups != [] do
+              Process.put(:sm_pending_storage_published?, true)
+            end
+
+            :ok = publish_cross_shard_transaction(flushed_state, successful_groups)
+            :ok = dispatch_pending_compound_promotions(flushed_state)
+
+            case publish_pending_flow_history_projections(flushed_state) do
+              :ok ->
+                observe_pending_lmdb_mirror_enqueue(
+                  state,
+                  enqueue_pending_lmdb_mirror(state)
+                )
+
+                {result, flushed_state}
+
+              {:error, reason} ->
+                handle_flow_history_projection_publish_failure(flushed_state, reason)
+
+                observe_pending_lmdb_mirror_enqueue(
+                  state,
+                  enqueue_pending_lmdb_mirror(state)
+                )
+
+                {result, flushed_state}
+            end
+
+          {:error, reason, partial_state, successful_groups, journal_txid} ->
+            case compensate_cross_shard_partial_writes(
+                   partial_state,
+                   successful_groups,
+                   Process.get(:sm_cross_shard_pending_originals, %{})
+                 ) do
+              {:ok, compensated_state} ->
+                case abort_standalone_cross_shard_journal(state, journal_txid) do
+                  :ok ->
+                    rollback_cross_shard_pending_writes(state)
+                    rollback_pending_writes(state)
+                    {:error, reason, compensated_state}
+
+                  {:error, abort_reason} ->
+                    rollback_cross_shard_pending_writes(state)
+                    rollback_pending_writes(state)
+                    block_release_cursor_for_apply()
+
+                    {:error,
+                     {:cross_shard_compensation_failed,
+                      {:standalone_tx_abort_failed, abort_reason}}, compensated_state}
+                end
+
+              {:error, compensation_reason, compensated_state} ->
+                rollback_cross_shard_pending_writes(state)
+                rollback_pending_writes(state)
+                block_release_cursor_for_apply()
+
+                {:error, {:cross_shard_compensation_failed, compensation_reason},
+                 compensated_state}
+            end
         end
       end
 

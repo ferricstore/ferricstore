@@ -402,15 +402,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
           end
         rescue
           error ->
-            rollback_pending_writes(state)
+            rollback_pending_writes_unless_published(state)
             reraise error, __STACKTRACE__
         catch
           kind, reason ->
-            rollback_pending_writes(state)
+            rollback_pending_writes_unless_published(state)
             :erlang.raise(kind, reason, __STACKTRACE__)
         after
           clear_pending_write_process_state()
         end
+      end
+
+      defp rollback_pending_writes_unless_published(state) do
+        unless Process.get(:sm_pending_storage_published?, false) do
+          rollback_pending_writes(state)
+        end
+
+        :ok
       end
 
       defp init_pending_write_process_state(state) do
