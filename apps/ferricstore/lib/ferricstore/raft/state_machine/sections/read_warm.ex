@@ -689,8 +689,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             do_compound_batch_delete(state, redis_key, compound_keys)
           end,
           compound_batch_mutate: fn redis_key, compound_keys, entries ->
-            with :ok <- do_compound_batch_delete(state, redis_key, compound_keys),
-                 :ok <- do_compound_batch_put(state, redis_key, entries) do
+            with {:ok, _count} <-
+                   admit_compound_member_mutation(state, compound_keys, entries),
+                 :ok <-
+                   do_compound_batch_delete_admitted(state, redis_key, compound_keys),
+                 :ok <- do_compound_batch_put_admitted(state, redis_key, entries) do
               :ok
             end
           end,
@@ -872,6 +875,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       defp do_compound_batch_put(_state, _redis_key, []), do: :ok
 
       defp do_compound_batch_put(state, redis_key, entries) do
+        with {:ok, _count} <- admit_compound_member_batch(state, entries) do
+          do_compound_batch_put_admitted(state, redis_key, entries)
+        end
+      end
+
+      defp do_compound_batch_put_admitted(_state, _redis_key, []), do: :ok
+
+      defp do_compound_batch_put_admitted(state, redis_key, entries) do
         with :ok <- validate_compound_batch_values(state, entries) do
           do_compound_batch_put_value_validated(state, redis_key, entries)
         end
@@ -1222,6 +1233,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       defp do_compound_batch_delete(_state, _redis_key, []), do: :ok
 
       defp do_compound_batch_delete(state, redis_key, compound_keys) do
+        with {:ok, _count} <- admit_compound_member_batch(state, compound_keys) do
+          do_compound_batch_delete_admitted(state, redis_key, compound_keys)
+        end
+      end
+
+      defp do_compound_batch_delete_admitted(_state, _redis_key, []), do: :ok
+
+      defp do_compound_batch_delete_admitted(state, redis_key, compound_keys) do
         first_path = promoted_compound_path(state, redis_key, hd(compound_keys))
 
         if Enum.all?(compound_keys, fn compound_key ->

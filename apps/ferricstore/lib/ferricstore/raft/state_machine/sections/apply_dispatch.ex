@@ -1079,12 +1079,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         with_apply_time(meta, fn ->
           old_count = state.applied_count
 
-          write_result =
-            with_pending_writes(state, fn ->
-              apply_compound_batch_put_entries(state, redis_key, entries)
-            end)
+          {applied_increment, write_result} =
+            case admit_compound_member_batch(state, entries) do
+              {:ok, count} ->
+                result =
+                  with_pending_writes(state, fn ->
+                    apply_compound_batch_put_entries_admitted(state, redis_key, entries)
+                  end)
 
-          finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
+                {count, result}
+
+              {:error, _reason} = error ->
+                {1, error}
+            end
+
+          finish_hot_batch_apply(meta, old_count, state, applied_increment, write_result)
         end)
       end
 
@@ -1093,12 +1102,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         with_apply_time(meta, fn ->
           old_count = state.applied_count
 
-          write_result =
-            with_pending_writes(state, fn ->
-              apply_compound_blob_batch_put_entries(state, redis_key, entries)
-            end)
+          {applied_increment, write_result} =
+            case admit_compound_member_batch(state, entries) do
+              {:ok, count} ->
+                result =
+                  with_pending_writes(state, fn ->
+                    apply_compound_blob_batch_put_entries_admitted(
+                      state,
+                      redis_key,
+                      entries
+                    )
+                  end)
 
-          finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
+                {count, result}
+
+              {:error, _reason} = error ->
+                {1, error}
+            end
+
+          finish_hot_batch_apply(meta, old_count, state, applied_increment, write_result)
         end)
       end
 
@@ -1128,12 +1150,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         with_apply_time(meta, fn ->
           old_count = state.applied_count
 
-          write_result =
-            with_pending_writes(state, fn ->
-              apply_compound_batch_delete_keys(state, redis_key, compound_keys)
-            end)
+          {applied_increment, write_result} =
+            case admit_compound_member_batch(state, compound_keys) do
+              {:ok, count} ->
+                result =
+                  with_pending_writes(state, fn ->
+                    apply_compound_batch_delete_keys_admitted(
+                      state,
+                      redis_key,
+                      compound_keys
+                    )
+                  end)
 
-          finish_hot_batch_apply(meta, old_count, state, length(compound_keys), write_result)
+                {count, result}
+
+              {:error, _reason} = error ->
+                {1, error}
+            end
+
+          finish_hot_batch_apply(meta, old_count, state, applied_increment, write_result)
         end)
       end
 

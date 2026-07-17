@@ -108,6 +108,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp apply_compound_batch_put_entries(state, redis_key, entries) do
+        with {:ok, _count} <- admit_compound_member_batch(state, entries) do
+          apply_compound_batch_put_entries_admitted(state, redis_key, entries)
+        end
+      end
+
+      defp apply_compound_batch_put_entries_admitted(state, redis_key, entries) do
         cond do
           not valid_compound_put_entries?(entries) ->
             {:error, :invalid_compound_batch_entry}
@@ -123,6 +129,51 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             end
         end
       end
+
+      defp admit_compound_member_batch(
+             %{apply_context: %{compound_member_apply_budget: budget}},
+             entries
+           )
+           when is_list(entries) and is_integer(budget) and budget > 0 do
+        count_compound_members_up_to(entries, budget, 0)
+      end
+
+      defp admit_compound_member_batch(
+             %{apply_context: %{compound_member_apply_budget: budget}},
+             _invalid
+           )
+           when is_integer(budget) and budget > 0,
+           do: {:error, :invalid_compound_batch_entry}
+
+      defp admit_compound_member_batch(_state, _entries),
+        do: {:error, :invalid_compound_member_apply_budget}
+
+      defp admit_compound_member_mutation(
+             %{apply_context: %{compound_member_apply_budget: budget}},
+             deletes,
+             puts
+           )
+           when is_list(deletes) and is_list(puts) and is_integer(budget) and budget > 0 do
+        with {:ok, delete_count} <- count_compound_members_up_to(deletes, budget, 0),
+             {:ok, put_count} <-
+               count_compound_members_up_to(puts, budget - delete_count, 0) do
+          {:ok, delete_count + put_count}
+        end
+      end
+
+      defp admit_compound_member_mutation(state, _deletes, _puts),
+        do: admit_compound_member_batch(state, :invalid)
+
+      defp count_compound_members_up_to([], _remaining, count), do: {:ok, count}
+
+      defp count_compound_members_up_to([_entry | _rest], 0, _count),
+        do: {:error, :compound_member_apply_budget_exceeded}
+
+      defp count_compound_members_up_to([_entry | rest], remaining, count),
+        do: count_compound_members_up_to(rest, remaining - 1, count + 1)
+
+      defp count_compound_members_up_to(_improper_tail, _remaining, _count),
+        do: {:error, :invalid_compound_batch_entry}
 
       defp do_apply_compound_batch_put_entries_unlocked(state, redis_key, entries) do
         with :ok <- validate_compound_batch_target(state, redis_key, entries) do
@@ -156,6 +207,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp apply_compound_blob_batch_put_entries(state, redis_key, entries) do
+        with {:ok, _count} <- admit_compound_member_batch(state, entries) do
+          apply_compound_blob_batch_put_entries_admitted(state, redis_key, entries)
+        end
+      end
+
+      defp apply_compound_blob_batch_put_entries_admitted(state, redis_key, entries) do
         cond do
           not valid_compound_blob_put_entries?(entries) ->
             {:error, :invalid_compound_blob_batch_entry}
@@ -469,13 +526,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp apply_compound_batch_delete_keys(state, redis_key, compound_keys) do
+        with {:ok, _count} <- admit_compound_member_batch(state, compound_keys) do
+          apply_compound_batch_delete_keys_admitted(state, redis_key, compound_keys)
+        end
+      end
+
+      defp apply_compound_batch_delete_keys_admitted(state, redis_key, compound_keys) do
         cond do
           not compound_delete_keys_for_key?(redis_key, compound_keys) ->
             {:error, :compound_batch_cross_key}
 
           true ->
             compound_batch_checked_results(state, redis_key, compound_keys, fn ->
-              do_compound_batch_delete(state, redis_key, compound_keys)
+              do_compound_batch_delete_admitted(state, redis_key, compound_keys)
             end)
         end
       end

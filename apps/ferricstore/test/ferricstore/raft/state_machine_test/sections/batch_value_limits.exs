@@ -5,7 +5,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
     quote do
       alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
       alias Ferricstore.Raft.WARaftStorage
-      alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU}
+      alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, ListOps}
       alias Ferricstore.Store.Shard.CompoundMemberIndex
 
       describe "replicated batch value limits" do
@@ -384,6 +384,272 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
 
           assert [{^exact_key, "1234", 0, _lfu, _fid, _offset, 4}] =
                    :ets.lookup(ets, exact_key)
+        end
+
+        @tag :compound_batch_apply_budget
+        test "compound batch put rejects member fanout before mutation", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "batch-budget:compound-put"
+          first = CompoundKey.hash_field(redis_key, "first")
+          second = CompoundKey.hash_field(redis_key, "second")
+
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:error, :compound_member_apply_budget_exceeded}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_batch_put, redis_key,
+                      [{first, "one", 0}, {second, "two", 0}]},
+                     limited_state
+                   )
+
+          assert [] == :ets.lookup(ets, first)
+          assert [] == :ets.lookup(ets, second)
+
+          assert {:ok, []} =
+                   CompoundMemberIndex.keys_for_prefix(
+                     limited_state.compound_member_index_name,
+                     CompoundKey.hash_prefix(redis_key)
+                   )
+        end
+
+        @tag :compound_batch_apply_budget
+        test "compound batch delete rejects member fanout before mutation", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "batch-budget:compound-delete"
+          first = CompoundKey.hash_field(redis_key, "first")
+          second = CompoundKey.hash_field(redis_key, "second")
+          entries = [{first, "one", 0}, {second, "two", 0}]
+
+          assert {seeded_state, {:ok, [:ok, :ok]}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_batch_put, redis_key, entries},
+                     state
+                   )
+
+          rows_before = Map.new([first, second], &{&1, :ets.lookup(ets, &1)})
+          prefix = CompoundKey.hash_prefix(redis_key)
+
+          assert {:ok, keys_before} =
+                   CompoundMemberIndex.keys_for_prefix(
+                     seeded_state.compound_member_index_name,
+                     prefix
+                   )
+
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 1)
+
+          limited_state = %{
+            seeded_state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:error, :compound_member_apply_budget_exceeded}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_batch_delete, redis_key, [first, second]},
+                     limited_state
+                   )
+
+          assert rows_before == Map.new([first, second], &{&1, :ets.lookup(ets, &1)})
+
+          assert {:ok, ^keys_before} =
+                   CompoundMemberIndex.keys_for_prefix(
+                     limited_state.compound_member_index_name,
+                     prefix
+                   )
+        end
+
+        @tag :compound_batch_apply_budget
+        test "compound blob batch put rejects member fanout before materialization", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "batch-budget:compound-blob-put"
+          first = CompoundKey.hash_field(redis_key, "first")
+          second = CompoundKey.hash_field(redis_key, "second")
+
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:error, :compound_member_apply_budget_exceeded}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_blob_batch_put, redis_key,
+                      [{first, "one", 0, :value}, {second, "two", 0, :value}]},
+                     limited_state
+                   )
+
+          assert [] == :ets.lookup(ets, first)
+          assert [] == :ets.lookup(ets, second)
+
+          assert {:ok, []} =
+                   CompoundMemberIndex.keys_for_prefix(
+                     limited_state.compound_member_index_name,
+                     CompoundKey.hash_prefix(redis_key)
+                   )
+        end
+
+        @tag :compound_batch_apply_budget
+        test "list rebalance admits its cumulative delete and put footprint", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "batch-budget:list-rebalance"
+          type_key = CompoundKey.type_key(redis_key)
+          meta_key = CompoundKey.list_meta_key(redis_key)
+          first = CompoundKey.list_element(redis_key, 0)
+          second = CompoundKey.list_element(redis_key, 1)
+
+          entries = [
+            {type_key, "list", 0},
+            {meta_key, ListOps.encode_meta({2, -1, 2}), 0},
+            {first, "a", 0},
+            {second, "b", 0}
+          ]
+
+          assert {seeded_state, {:ok, [:ok, :ok, :ok, :ok]}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_batch_put, redis_key, entries},
+                     state
+                   )
+
+          keys = Enum.map(entries, &elem(&1, 0))
+          rows_before = Map.new(keys, &{&1, :ets.lookup(ets, &1)})
+          prefix = CompoundKey.list_prefix(redis_key)
+
+          assert {:ok, members_before} =
+                   CompoundMemberIndex.keys_for_prefix(
+                     seeded_state.compound_member_index_name,
+                     prefix
+                   )
+
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 5)
+
+          limited_state = %{
+            seeded_state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:error, :compound_member_apply_budget_exceeded}} =
+                   StateMachine.apply(
+                     %{},
+                     {:list_op, redis_key, {:linsert, :after, "a", "x"}},
+                     limited_state
+                   )
+
+          assert rows_before == Map.new(keys, &{&1, :ets.lookup(ets, &1)})
+
+          assert {:ok, ^members_before} =
+                   CompoundMemberIndex.keys_for_prefix(
+                     limited_state.compound_member_index_name,
+                     prefix
+                   )
+        end
+
+        @tag :compound_batch_apply_budget
+        test "rejected compound batches still advance release cursor accounting", %{
+          state: state
+        } do
+          redis_key = "batch-budget:release-cursor"
+          first = CompoundKey.hash_field(redis_key, "first")
+          second = CompoundKey.hash_field(redis_key, "second")
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context),
+              release_cursor_interval: 1
+          }
+
+          meta = %{index: 42, term: 1, system_time: Ferricstore.HLC.now_ms()}
+
+          assert {new_state,
+                  {:applied_at, 42, {:error, :compound_member_apply_budget_exceeded}}, effects} =
+                   StateMachine.apply(
+                     meta,
+                     {:compound_batch_put, redis_key,
+                      [{first, "one", 0}, {second, "two", 0}]},
+                     limited_state
+                   )
+
+          assert new_state.applied_count == limited_state.applied_count + 1
+          assert new_state.pending_release_cursor_index == 42
+          assert Enum.any?(effects, &match?({:send_msg, _, {:locally_applied, 42}, _}, &1))
+        end
+
+        @tag :compound_batch_apply_budget
+        test "compound batch admission rejects improper tails deterministically", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "batch-budget:improper"
+          compound_key = CompoundKey.hash_field(redis_key, "field")
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 2)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          commands = [
+            {:compound_batch_put, redis_key, [{compound_key, "value", 0} | :invalid_tail]},
+            {:compound_blob_batch_put, redis_key,
+             [{compound_key, "value", 0, :value} | :invalid_tail]},
+            {:compound_batch_delete, redis_key, [compound_key | :invalid_tail]}
+          ]
+
+          Enum.each(commands, fn command ->
+            assert {_state, {:error, :invalid_compound_batch_entry}} =
+                     StateMachine.apply(%{}, command, limited_state)
+
+            assert [] == :ets.lookup(ets, compound_key)
+          end)
+        end
+
+        @tag :compound_batch_apply_budget
+        test "compound batch member budget is inclusive", %{state: state, ets: ets} do
+          redis_key = "batch-budget:inclusive"
+          first = CompoundKey.hash_field(redis_key, "first")
+          second = CompoundKey.hash_field(redis_key, "second")
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 2)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:ok, [:ok, :ok]}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_batch_put, redis_key,
+                      [{first, "one", 0}, {second, "two", 0}]},
+                     limited_state
+                   )
+
+          assert [{^first, "one", 0, _lfu, _file_id, _offset, 3}] = :ets.lookup(ets, first)
+          assert [{^second, "two", 0, _lfu, _file_id, _offset, 3}] = :ets.lookup(ets, second)
         end
 
         @tag :compound_batch_value_limits
