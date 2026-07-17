@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.Router.Part06 do
     quote do
       alias Ferricstore.CommandTime
       alias Ferricstore.ErrorReasons
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.Locator
@@ -482,14 +483,18 @@ defmodule Ferricstore.Store.Router.Part06 do
       @doc false
       def flow_get_with_status(ctx, id, partition_key) when is_binary(id) do
         key = Ferricstore.Flow.Keys.state_key(id, partition_key)
-        now_ms = CommandTime.now_ms()
+        expiry_context = ExpiryContext.capture()
+        now_ms = ExpiryContext.now_ms(expiry_context)
 
         if flow_state_expired_or_deleted?(ctx, key, now_ms) do
           nil
         else
-          case flow_hot_value(ctx, key, now_ms) do
+          case flow_hot_value(ctx, key, expiry_context) do
             {:ok, value} ->
               value
+
+            :unavailable ->
+              :unavailable
 
             :fallback ->
               case flow_batch_get_with_status(ctx, [id], partition_key) do
@@ -500,11 +505,11 @@ defmodule Ferricstore.Store.Router.Part06 do
         end
       end
 
-      defp flow_hot_value(ctx, key, now_ms) do
+      defp flow_hot_value(ctx, key, expiry_context) do
         shard_index = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, shard_index)
 
-        case ets_get_full(ctx, shard_index, keydir, key, now_ms) do
+        case ets_get_full(ctx, shard_index, keydir, key, expiry_context) do
           {:hit, value, _lfu} when is_binary(value) ->
             if flow_terminal_record_expired?(value, CommandTime.now_ms()),
               do: {:ok, nil},
@@ -512,6 +517,9 @@ defmodule Ferricstore.Store.Router.Part06 do
 
           :expired ->
             {:ok, nil}
+
+          :hlc_drift_exceeded ->
+            :unavailable
 
           _cold_missing_or_unavailable ->
             :fallback

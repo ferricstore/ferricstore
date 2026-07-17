@@ -45,7 +45,8 @@ defmodule Ferricstore.Store.Router.Part10 do
       def compound_batch_get(ctx, redis_key, compound_keys) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = Ferricstore.ExpiryContext.capture()
+        now = Ferricstore.ExpiryContext.now_ms(expiry_context)
         waraft? = selected_waraft_ctx?(ctx)
 
         if promoted_compound_collection?(keydir, redis_key, now) and
@@ -60,7 +61,7 @@ defmodule Ferricstore.Store.Router.Part10 do
         else
           {results, {fallback_keys, hot_hits}} =
             Enum.map_reduce(compound_keys, {[], []}, fn compound_key, {fallback_keys, hot_hits} ->
-              case ets_get_full(ctx, idx, keydir, compound_key, now) do
+              case ets_get_full(ctx, idx, keydir, compound_key, expiry_context) do
                 {:hit, value, lfu} ->
                   {{:value, value}, {fallback_keys, [{keydir, compound_key, lfu} | hot_hits]}}
 
@@ -75,7 +76,7 @@ defmodule Ferricstore.Store.Router.Part10 do
                          file_id,
                          offset,
                          value_size,
-                         now
+                         expiry_context
                        ) do
                     {:ok, value} -> {{:value, value}, {fallback_keys, hot_hits}}
                     :fallback -> {:fallback, {[compound_key | fallback_keys], hot_hits}}
@@ -90,6 +91,9 @@ defmodule Ferricstore.Store.Router.Part10 do
                 {:invalid, entry} ->
                   {{:value, ReadResult.failure({:invalid_keydir_entry, entry})},
                    {fallback_keys, hot_hits}}
+
+                :hlc_drift_exceeded ->
+                  {{:value, ReadResult.failure(:hlc_drift_exceeded)}, {fallback_keys, hot_hits}}
 
                 _other ->
                   {:fallback, {[compound_key | fallback_keys], hot_hits}}
@@ -274,12 +278,20 @@ defmodule Ferricstore.Store.Router.Part10 do
       def compound_get_meta(ctx, redis_key, compound_key) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = Ferricstore.ExpiryContext.capture()
+        now = Ferricstore.ExpiryContext.now_ms(expiry_context)
 
         if promoted_data_compound_key?(keydir, redis_key, compound_key, now) do
           fallback_compound_get_meta(ctx, idx, redis_key, compound_key)
         else
-          compound_get_meta_from_keydir(ctx, idx, keydir, redis_key, compound_key, now)
+          compound_get_meta_from_keydir(
+            ctx,
+            idx,
+            keydir,
+            redis_key,
+            compound_key,
+            expiry_context
+          )
         end
       end
 
@@ -310,6 +322,9 @@ defmodule Ferricstore.Store.Router.Part10 do
                 )
             end
 
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
+
           terminal when terminal in [:miss, :expired] ->
             if selected_waraft_ctx?(ctx) do
               nil
@@ -337,7 +352,8 @@ defmodule Ferricstore.Store.Router.Part10 do
       def compound_batch_get_meta(ctx, redis_key, compound_keys) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = Ferricstore.ExpiryContext.capture()
+        now = Ferricstore.ExpiryContext.now_ms(expiry_context)
         waraft? = selected_waraft_ctx?(ctx)
 
         if promoted_compound_collection?(keydir, redis_key, now) and
@@ -352,7 +368,7 @@ defmodule Ferricstore.Store.Router.Part10 do
         else
           {results, {fallback_keys, hot_hits}} =
             Enum.map_reduce(compound_keys, {[], []}, fn compound_key, {fallback_keys, hot_hits} ->
-              case ets_get_meta_full(ctx, idx, keydir, compound_key, now) do
+              case ets_get_meta_full(ctx, idx, keydir, compound_key, expiry_context) do
                 {:hit, value, expire_at_ms, lfu} ->
                   {{:value, {value, expire_at_ms}},
                    {fallback_keys, [{keydir, compound_key, lfu} | hot_hits]}}
@@ -367,7 +383,7 @@ defmodule Ferricstore.Store.Router.Part10 do
                          file_id,
                          offset,
                          value_size,
-                         now,
+                         expiry_context,
                          expire_at_ms
                        ) do
                     {:ok, meta} -> {{:value, meta}, {fallback_keys, hot_hits}}
@@ -383,6 +399,9 @@ defmodule Ferricstore.Store.Router.Part10 do
                 {:invalid, entry} ->
                   {{:value, ReadResult.failure({:invalid_keydir_entry, entry})},
                    {fallback_keys, hot_hits}}
+
+                :hlc_drift_exceeded ->
+                  {{:value, ReadResult.failure(:hlc_drift_exceeded)}, {fallback_keys, hot_hits}}
 
                 _other ->
                   {:fallback, {[compound_key | fallback_keys], hot_hits}}
@@ -628,9 +647,9 @@ defmodule Ferricstore.Store.Router.Part10 do
         do: CompoundCommand.normalize_batch_reply(result, expected_count)
 
       defp origin_compound_get(ctx, idx, keydir, compound_key) do
-        now = HLC.now_ms()
+        expiry_context = Ferricstore.ExpiryContext.capture()
 
-        case ets_get_full(ctx, idx, keydir, compound_key, now) do
+        case ets_get_full(ctx, idx, keydir, compound_key, expiry_context) do
           {:hit, value, _lfu} ->
             value
 
@@ -650,7 +669,7 @@ defmodule Ferricstore.Store.Router.Part10 do
                        keydir,
                        compound_key,
                        {file_id, offset, value_size},
-                       now
+                       expiry_context
                      ) do
                   {:cold, value, retry_file_id, retry_offset} ->
                     warm_ets_after_cold_read(
@@ -670,8 +689,14 @@ defmodule Ferricstore.Store.Router.Part10 do
 
                   :miss ->
                     nil
+
+                  {:error, {:storage_read_failed, _reason}} = failure ->
+                    failure
                 end
             end
+
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
 
           _ ->
             nil

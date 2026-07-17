@@ -48,8 +48,15 @@ defmodule Ferricstore.Raft.WARaftSegmentReader.CommandValues do
     end
   end
 
-  def decode_replay_command({inner_command, %{hlc_ts: {physical_ms, logical}}})
-      when is_tuple(inner_command) and is_integer(physical_ms) and is_integer(logical) do
+  def decode_replay_command(
+        {inner_command,
+         %{
+           hlc_ts: {physical_ms, logical},
+           wall_time_ms: wall_time_ms
+         }}
+      )
+      when is_tuple(inner_command) and is_integer(physical_ms) and is_integer(logical) and
+             is_integer(wall_time_ms) and wall_time_ms >= 0 and wall_time_ms <= physical_ms do
     decode_replay_command(inner_command)
   end
 

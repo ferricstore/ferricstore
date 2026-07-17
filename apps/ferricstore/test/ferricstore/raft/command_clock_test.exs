@@ -11,17 +11,28 @@ defmodule Ferricstore.Raft.CommandClockTest do
     test "wraps a raft command with an HLC timestamp" do
       command = {:put, "clock_key", "value", 0}
 
-      assert {^command, %{hlc_ts: {physical_ms, logical}}} = CommandClock.stamp(command)
+      assert {^command, %{hlc_ts: {physical_ms, logical}, wall_time_ms: wall_time_ms}} =
+               CommandClock.stamp(command)
+
       assert is_integer(physical_ms)
       assert physical_ms > 0
       assert is_integer(logical)
       assert logical >= 0
+      assert wall_time_ms > 0
+      assert wall_time_ms <= physical_ms
     end
 
     test "does not restamp an already stamped command" do
-      stamped = {{:delete, "clock_key"}, %{hlc_ts: {123_456, 7}}}
+      stamped =
+        {{:delete, "clock_key"}, %{hlc_ts: {123_456, 7}, wall_time_ms: 123_000}}
 
       assert ^stamped = CommandClock.stamp(stamped)
+    end
+
+    test "rejects the removed stamp shape without a wall snapshot" do
+      assert_raise ArgumentError, fn ->
+        CommandClock.stamp({{:delete, "clock_key"}, %{hlc_ts: {123_456, 7}}})
+      end
     end
   end
 
@@ -30,7 +41,11 @@ defmodule Ferricstore.Raft.CommandClockTest do
       command = {:batch, [{:put, "clock_a", "a", 0}, {:delete, "clock_b"}]}
 
       assert {:ttb, binary} = CommandClock.to_ttb(command)
-      assert {^command, %{hlc_ts: {_physical_ms, _logical}}} = :erlang.binary_to_term(binary)
+
+      assert {^command, %{hlc_ts: {_physical_ms, _logical}, wall_time_ms: wall_time_ms}} =
+               :erlang.binary_to_term(binary)
+
+      assert is_integer(wall_time_ms)
     end
   end
 

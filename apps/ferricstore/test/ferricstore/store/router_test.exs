@@ -271,6 +271,171 @@ defmodule Ferricstore.Store.RouterTest do
     end
   end
 
+  describe "HLC drift guard" do
+    setup do
+      ctx = IsolatedInstance.checkout(shard_count: 1)
+      on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+      {:ok, ctx: ctx}
+    end
+
+    test "GET fails closed without deleting a TTL row that is only HLC-expired", %{ctx: ctx} do
+      key = "hlc-drift:get:#{System.unique_integer([:positive])}"
+      wall_ms = System.system_time(:millisecond)
+      expire_at_ms = wall_ms + 30_000
+      assert :ok = Router.put(ctx, key, "value", expire_at_ms)
+
+      keydir = elem(ctx.keydir_refs, 0)
+      [row] = :ets.lookup(keydir, key)
+      ref = :persistent_term.get(:ferricstore_hlc_ref)
+      previous = :atomics.get(ref, 1)
+
+      on_exit(fn ->
+        :atomics.put(:persistent_term.get(:ferricstore_hlc_ref), 1, previous)
+      end)
+
+      :atomics.put(ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+      assert Ferricstore.HLC.drift_exceeded?()
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} = Router.get(ctx, key)
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.get_meta(ctx, key)
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.expire_at_ms(ctx, key)
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.value_size(ctx, key)
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.object_lfu(ctx, key)
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.getrange(ctx, key, 0, -1)
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.get_file_ref(ctx, key)
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.get_with_file_ref(ctx, key)
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.read_shard_value(ctx, 0, key)
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert [{:error, {:storage_read_failed, :hlc_drift_exceeded}}] =
+               Router.batch_get(ctx, [key])
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert [{:error, {:storage_read_failed, :hlc_drift_exceeded}}] =
+               Router.batch_get_on_route_keys(ctx, [{key, key}])
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert [{:error, {:storage_read_failed, :hlc_drift_exceeded}}] =
+               Router.batch_get_with_file_refs(ctx, [key], 0)
+
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert Router.exists?(ctx, key)
+      assert Router.exists_fast?(ctx, key)
+      assert :ets.lookup(keydir, key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.get_keydir_file_ref(ctx, key)
+
+      assert :ets.lookup(keydir, key) == [row]
+    end
+
+    test "compound reads fail closed without deleting an HLC-only expired member", %{ctx: ctx} do
+      redis_key = "hlc-drift:compound:#{System.unique_integer([:positive])}"
+      compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
+      wall_ms = System.system_time(:millisecond)
+      expire_at_ms = wall_ms + 30_000
+      assert :ok = Router.compound_put(ctx, redis_key, compound_key, "value", expire_at_ms)
+
+      keydir = elem(ctx.keydir_refs, 0)
+      [row] = :ets.lookup(keydir, compound_key)
+      ref = :persistent_term.get(:ferricstore_hlc_ref)
+      previous = :atomics.get(ref, 1)
+
+      on_exit(fn ->
+        :atomics.put(:persistent_term.get(:ferricstore_hlc_ref), 1, previous)
+      end)
+
+      :atomics.put(ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.compound_get(ctx, redis_key, compound_key)
+
+      assert :ets.lookup(keydir, compound_key) == [row]
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               Router.compound_get_meta(ctx, redis_key, compound_key)
+
+      assert :ets.lookup(keydir, compound_key) == [row]
+
+      assert [{:error, {:storage_read_failed, :hlc_drift_exceeded}}] =
+               Router.compound_batch_get(ctx, redis_key, [compound_key])
+
+      assert :ets.lookup(keydir, compound_key) == [row]
+
+      assert [{:error, {:storage_read_failed, :hlc_drift_exceeded}}] =
+               Router.compound_batch_get_meta(ctx, redis_key, [compound_key])
+
+      assert :ets.lookup(keydir, compound_key) == [row]
+
+      assert [{:error, {:storage_read_failed, :hlc_drift_exceeded}}] =
+               Router.compound_batch_get_on_route_keys(ctx, [{redis_key, compound_key}])
+
+      assert :ets.lookup(keydir, compound_key) == [row]
+    end
+
+    test "cold retry preserves the original drift decision", %{ctx: ctx} do
+      key = "hlc-drift:retry:#{System.unique_integer([:positive])}"
+      keydir = elem(ctx.keydir_refs, 0)
+      wall_ms = System.system_time(:millisecond)
+      expire_at_ms = wall_ms + 30_000
+      file_id = {:waraft_segment, 999_999_991}
+      unsafe_row = {key, nil, expire_at_ms, 0, file_id, 0, 5}
+      :ets.insert(keydir, {key, nil, 0, 0, file_id, 0, 5})
+
+      ref = :persistent_term.get(:ferricstore_hlc_ref)
+      previous = :atomics.get(ref, 1)
+
+      on_exit(fn ->
+        Process.delete(:ferricstore_router_cold_location_miss_hook)
+        :atomics.put(:persistent_term.get(:ferricstore_hlc_ref), 1, previous)
+      end)
+
+      Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+        :ets.insert(keydir, unsafe_row)
+      end)
+
+      :atomics.put(ref, 1, Bitwise.bsl(wall_ms + 60_000, 16))
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} = Router.get(ctx, key)
+      assert :ets.lookup(keydir, key) == [unsafe_row]
+    end
+  end
+
   defp private_function_var_names(ast, function_name, arity) do
     {_ast, vars} =
       Macro.prewalk(ast, MapSet.new(), fn

@@ -15,12 +15,16 @@ defmodule Ferricstore.Raft.StateMachineTTBGuardTest do
   test "the stamped-command codec rejects non-current external-term forms" do
     {:ttb, current} = CommandStamp.to_ttb({:put, "key", "value", 0})
 
-    assert {:ok, {{:put, "key", "value", 0}, %{hlc_ts: {_physical, _logical}}}} =
+    assert {:ok,
+            {{:put, "key", "value", 0},
+             %{hlc_ts: {_physical, _logical}, wall_time_ms: wall_time_ms}}} =
              CommandStamp.decode_ttb(current)
+
+    assert is_integer(wall_time_ms)
 
     compressed =
       :erlang.term_to_binary(
-        {{:put, "key", String.duplicate("value", 1_024), 0}, %{hlc_ts: {1, 0}}},
+        {{:put, "key", String.duplicate("value", 1_024), 0}, %{hlc_ts: {1, 0}, wall_time_ms: 1}},
         compressed: 9
       )
 
@@ -33,6 +37,30 @@ defmodule Ferricstore.Raft.StateMachineTTBGuardTest do
 
     assert {:error, :invalid_preencoded_command} =
              CommandStamp.decode_ttb(:erlang.term_to_binary({:put, "key", "value", 0}))
+
+    assert {:error, :invalid_preencoded_command} =
+             CommandStamp.decode_ttb(
+               :erlang.term_to_binary(
+                 {{:put, "key", "value", 0}, %{hlc_ts: {1, 0}}},
+                 minor_version: 2
+               )
+             )
+
+    assert {:error, :invalid_preencoded_command} =
+             CommandStamp.decode_ttb(
+               :erlang.term_to_binary(
+                 {{:put, "key", "value", 0}, %{hlc_ts: {1, 0}, wall_time_ms: 2}},
+                 minor_version: 2
+               )
+             )
+
+    assert {:error, :invalid_preencoded_command} =
+             CommandStamp.decode_ttb(
+               :erlang.term_to_binary(
+                 {"not-a-command", %{hlc_ts: {1, 0}, wall_time_ms: 1}},
+                 minor_version: 2
+               )
+             )
   end
 
   test "WARaft blocks malformed encodings but advances deterministic command errors" do

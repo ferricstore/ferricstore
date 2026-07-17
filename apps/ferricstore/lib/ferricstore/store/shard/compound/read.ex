@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.Shard.Compound.Read do
   @moduledoc false
 
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
@@ -36,13 +37,15 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
   end
 
   defp compound_batch_get_mixed(dedicated_path, compound_keys, state) do
+    expiry_context = ExpiryContext.capture()
+
     {results, {state, shared_entries, _shared_count, dedicated_entries, _dedicated_count}} =
       Enum.map_reduce(compound_keys, {state, [], 0, [], 0}, fn compound_key,
                                                                {state, shared_entries,
                                                                 shared_count, dedicated_entries,
                                                                 dedicated_count} ->
         if Promoted.shared_log_compound_key?(compound_key) do
-          case ShardETS.ets_lookup(state, compound_key) do
+          case ShardETS.ets_lookup(state, compound_key, expiry_context) do
             {:hit, value, _exp} ->
               {{:value, value},
                {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
@@ -57,6 +60,10 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
 
             {:error, :invalid_keydir_entry} ->
               {{:value, @storage_read_failure},
+               {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              {{:value, failure},
                {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
 
             :expired ->
@@ -75,7 +82,7 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
               end
           end
         else
-          case ShardETS.ets_lookup(state, compound_key) do
+          case ShardETS.ets_lookup(state, compound_key, expiry_context) do
             {:hit, value, _exp} ->
               {{:value, value},
                {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
@@ -90,6 +97,10 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
 
             {:error, :invalid_keydir_entry} ->
               {{:value, @storage_read_failure},
+               {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
+
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              {{:value, failure},
                {state, shared_entries, shared_count, dedicated_entries, dedicated_count}}
 
             :expired ->
@@ -126,10 +137,12 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
   end
 
   defp compound_batch_get_shared(compound_keys, state) do
+    expiry_context = ExpiryContext.capture()
+
     {results, {state, cold_entries, _cold_count}} =
       Enum.map_reduce(compound_keys, {state, [], 0}, fn compound_key,
                                                         {state, cold_entries, cold_count} ->
-        case ShardETS.ets_lookup(state, compound_key) do
+        case ShardETS.ets_lookup(state, compound_key, expiry_context) do
           {:hit, value, _exp} ->
             {{:value, value}, {state, cold_entries, cold_count}}
 
@@ -140,6 +153,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
 
           {:error, :invalid_keydir_entry} ->
             {{:value, @storage_read_failure}, {state, cold_entries, cold_count}}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {{:value, failure}, {state, cold_entries, cold_count}}
 
           :expired ->
             {{:value, nil}, {state, cold_entries, cold_count}}
@@ -172,9 +188,11 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
   end
 
   defp compound_batch_get_dedicated(dedicated_path, compound_keys, state) do
+    expiry_context = ExpiryContext.capture()
+
     {results, {cold_entries, _cold_count}} =
       Enum.map_reduce(compound_keys, {[], 0}, fn compound_key, {cold_entries, cold_count} ->
-        case ShardETS.ets_lookup(state, compound_key) do
+        case ShardETS.ets_lookup(state, compound_key, expiry_context) do
           {:hit, value, _exp} ->
             {{:value, value}, {cold_entries, cold_count}}
 
@@ -185,6 +203,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
 
           {:error, :invalid_keydir_entry} ->
             {{:value, @storage_read_failure}, {cold_entries, cold_count}}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {{:value, failure}, {cold_entries, cold_count}}
 
           :expired ->
             {{:value, nil}, {cold_entries, cold_count}}
@@ -349,6 +370,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
           {:error, :cold_read_failed} ->
             {@storage_read_failure, state}
 
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {failure, state}
+
           :expired ->
             {nil, state}
 
@@ -371,6 +395,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
 
           {:error, :invalid_keydir_entry} ->
             {@storage_read_failure, state}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {failure, state}
 
           _cold_or_miss ->
             case Promoted.promoted_read(dedicated_path, compound_key, state) do
@@ -422,10 +449,12 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
   end
 
   defp compound_batch_get_meta_shared(_redis_key, compound_keys, state) do
+    expiry_context = ExpiryContext.capture()
+
     {results, {state, cold_entries, _cold_count}} =
       Enum.map_reduce(compound_keys, {state, [], 0}, fn compound_key,
                                                         {state, cold_entries, cold_count} ->
-        case ShardETS.ets_lookup(state, compound_key) do
+        case ShardETS.ets_lookup(state, compound_key, expiry_context) do
           {:hit, value, expire_at_ms} ->
             {{:value, {value, expire_at_ms}}, {state, cold_entries, cold_count}}
 
@@ -436,6 +465,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
 
           {:error, :invalid_keydir_entry} ->
             {{:value, @storage_read_failure}, {state, cold_entries, cold_count}}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {{:value, failure}, {state, cold_entries, cold_count}}
 
           :expired ->
             {{:value, nil}, {state, cold_entries, cold_count}}
@@ -479,9 +511,11 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
   end
 
   defp compound_batch_get_meta_dedicated(dedicated_path, compound_keys, state) do
+    expiry_context = ExpiryContext.capture()
+
     {results, {cold_entries, _cold_count}} =
       Enum.map_reduce(compound_keys, {[], 0}, fn compound_key, {cold_entries, cold_count} ->
-        case ShardETS.ets_lookup(state, compound_key) do
+        case ShardETS.ets_lookup(state, compound_key, expiry_context) do
           {:hit, value, expire_at_ms} ->
             {{:value, {value, expire_at_ms}}, {cold_entries, cold_count}}
 
@@ -492,6 +526,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
 
           {:error, :invalid_keydir_entry} ->
             {{:value, @storage_read_failure}, {cold_entries, cold_count}}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {{:value, failure}, {cold_entries, cold_count}}
 
           :expired ->
             {{:value, nil}, {cold_entries, cold_count}}
@@ -537,6 +574,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
           {:error, :cold_read_failed} ->
             {@storage_read_failure, state}
 
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {failure, state}
+
           :expired ->
             {nil, state}
 
@@ -559,6 +599,9 @@ defmodule Ferricstore.Store.Shard.Compound.Read do
 
           {:error, :invalid_keydir_entry} ->
             {@storage_read_failure, state}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {failure, state}
 
           _cold_or_miss ->
             case Promoted.promoted_read(dedicated_path, compound_key, state) do

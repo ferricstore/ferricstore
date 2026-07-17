@@ -111,6 +111,10 @@ defmodule Ferricstore.Store.Router.Part03 do
 
                     {{:value, nil},
                      {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
+
+                  {:error, {:storage_read_failed, _reason}} = failure ->
+                    {{:value, failure},
+                     {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
                 end
             end
         end
@@ -163,9 +167,9 @@ defmodule Ferricstore.Store.Router.Part03 do
         Enum.map(value_indexes, fn index -> elem(unique_values, index) end)
       end
 
-      defp read_waraft_segment_batch_materialized([]), do: []
+      defp read_waraft_segment_batch_materialized([], _expiry_context), do: []
 
-      defp read_waraft_segment_batch_materialized(entries) do
+      defp read_waraft_segment_batch_materialized(entries, expiry_context) do
         entries
         |> Enum.with_index()
         |> Enum.group_by(
@@ -175,20 +179,22 @@ defmodule Ferricstore.Store.Router.Part03 do
           fn indexed_entry -> indexed_entry end
         )
         |> Enum.reduce(%{}, &read_waraft_segment_group/2)
-        |> waraft_segment_results(entries)
+        |> waraft_segment_results(entries, expiry_context)
       end
 
       defp read_waraft_segment_batch_file_ref_or_materialized(
              [],
              _min_file_ref_size,
-             _validate_blob_ref?
+             _validate_blob_ref?,
+             _expiry_context
            ),
            do: []
 
       defp read_waraft_segment_batch_file_ref_or_materialized(
              entries,
              min_file_ref_size,
-             validate_blob_ref?
+             validate_blob_ref?,
+             expiry_context
            ) do
         entries
         |> Enum.with_index()
@@ -201,7 +207,7 @@ defmodule Ferricstore.Store.Router.Part03 do
         |> Enum.reduce(%{}, fn group, acc ->
           read_waraft_segment_file_ref_group(group, min_file_ref_size, validate_blob_ref?, acc)
         end)
-        |> waraft_segment_results(entries)
+        |> waraft_segment_results(entries, expiry_context)
       end
 
       defp read_waraft_segment_file_ref_group(
@@ -365,7 +371,7 @@ defmodule Ferricstore.Store.Router.Part03 do
         end)
       end
 
-      defp waraft_segment_results(result_by_index, entries) do
+      defp waraft_segment_results(result_by_index, entries, expiry_context) do
         entries
         |> Enum.with_index()
         |> Enum.map(fn {{ctx, idx, keydir, key, file_id, offset, value_size}, index} ->
@@ -377,7 +383,7 @@ defmodule Ferricstore.Store.Router.Part03 do
                 keydir,
                 key,
                 {file_id, offset, value_size},
-                HLC.now_ms(),
+                expiry_context,
                 {:error, reason}
               )
 
@@ -391,7 +397,7 @@ defmodule Ferricstore.Store.Router.Part03 do
                 keydir,
                 key,
                 {file_id, offset, value_size},
-                HLC.now_ms(),
+                expiry_context,
                 :not_found
               )
           end

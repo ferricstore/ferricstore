@@ -77,7 +77,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       ets: ets
     } do
       hlc_ts = HLC.now()
-      wrapped = {{:put, "hlc_key", "hlc_val", 0}, %{hlc_ts: hlc_ts}}
+      wrapped = {{:put, "hlc_key", "hlc_val", 0}, stamp_metadata(hlc_ts)}
 
       {new_state, result} = StateMachine.apply(%{}, wrapped, state)
 
@@ -97,7 +97,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
       # Now delete it with an HLC-wrapped command
       hlc_ts = HLC.now()
-      wrapped = {{:delete, "del_hlc"}, %{hlc_ts: hlc_ts}}
+      wrapped = {{:delete, "del_hlc"}, stamp_metadata(hlc_ts)}
       {state3, result} = StateMachine.apply(%{}, wrapped, state2)
 
       assert result == :ok
@@ -111,7 +111,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     } do
       hlc_ts = HLC.now()
       batch = [{:put, "b1", "v1", 0}, {:put, "b2", "v2", 0}]
-      wrapped = {{:batch, batch}, %{hlc_ts: hlc_ts}}
+      wrapped = {{:batch, batch}, stamp_metadata(hlc_ts)}
 
       {new_state, {:ok, results}} = StateMachine.apply(%{}, wrapped, state)
 
@@ -125,12 +125,464 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       state: state
     } do
       hlc_ts = HLC.now()
-      wrapped = {{:incr_float, "counter", 10.0}, %{hlc_ts: hlc_ts}}
+      wrapped = {{:incr_float, "counter", 10.0}, stamp_metadata(hlc_ts)}
 
       {new_state, {:ok, result}} = StateMachine.apply(%{}, wrapped, state)
 
       assert new_state.applied_count == 1
       assert_in_delta result, 10.0, 0.001
+    end
+
+    test "rejects an apply-side expiry decision caused only by leader HLC drift", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_getdel"
+      entry = {key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, entry)
+
+      wrapped =
+        {{:getdel, key}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, key) == [entry]
+    end
+
+    test "rechecks drift safety when a cold location changes during apply", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_cold_retry"
+      initial_entry = {key, nil, 91_000, Ferricstore.Store.LFU.initial(), 9_999, 0, 5}
+      unsafe_entry = {key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, initial_entry)
+
+      Process.put(:ferricstore_state_machine_cold_location_miss_hook, fn ->
+        :ets.insert(ets, unsafe_entry)
+      end)
+
+      try do
+        wrapped =
+          {{:getdel, key}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+        assert :ets.lookup(ets, key) == [unsafe_entry]
+      after
+        Process.delete(:ferricstore_state_machine_cold_location_miss_hook)
+      end
+    end
+
+    test "resolves the current row when a successful cold read races replacement", %{
+      state: state,
+      ets: ets
+    } do
+      key = "cold_success_replacement"
+
+      {:ok, {offset, value_size}} =
+        Ferricstore.Bitcask.NIF.v2_append_record(
+          state.active_file_path,
+          key,
+          "old-value",
+          0
+        )
+
+      :ets.insert(
+        ets,
+        {key, nil, 0, Ferricstore.Store.LFU.initial(), 0, offset, value_size}
+      )
+
+      Process.put(:ferricstore_state_machine_cold_read_success_hook, fn _state, ^key ->
+        :ets.insert(
+          ets,
+          {key, "new-value", 0, Ferricstore.Store.LFU.initial(), 0, 0, 9}
+        )
+      end)
+
+      try do
+        wrapped = {{:getdel, key}, stamp_metadata(HLC.now())}
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert result == "new-value"
+        assert :ets.lookup(ets, key) == []
+      after
+        Process.delete(:ferricstore_state_machine_cold_read_success_hook)
+      end
+    end
+
+    test "bounds cold-read retries across continuously changing locations", %{
+      state: state,
+      ets: ets
+    } do
+      key = "cold_retry_global_budget"
+      :ets.insert(ets, {key, nil, 0, Ferricstore.Store.LFU.initial(), 9_000, 0, 5})
+      Process.put(:cold_retry_hook_count, 0)
+
+      Process.put(:ferricstore_state_machine_cold_location_miss_hook, fn ->
+        count = Process.get(:cold_retry_hook_count, 0) + 1
+        Process.put(:cold_retry_hook_count, count)
+
+        if count <= 12 do
+          :ets.insert(
+            ets,
+            {key, nil, 0, Ferricstore.Store.LFU.initial(), 9_000 + count, 0, 5}
+          )
+        else
+          :ets.insert(ets, {key, "eventual-value", 0, Ferricstore.Store.LFU.initial(), 0, 0, 14})
+        end
+      end)
+
+      try do
+        wrapped = {{:getdel, key}, stamp_metadata(HLC.now())}
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert {:error,
+                {:state_read_failed, {:cold_value_unavailable, {_file_id, 0, 5}, _reason}}} =
+                 result
+
+        assert Process.get(:cold_retry_hook_count) <= 8
+      after
+        Process.delete(:ferricstore_state_machine_cold_location_miss_hook)
+        Process.delete(:cold_retry_hook_count)
+      end
+    end
+
+    test "rejects transaction reads whose expiry depends on leader HLC drift", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_transaction"
+      entry = {key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, entry)
+
+      {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("PTTL", [key])
+      {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+
+      wrapped =
+        {{:tx_execute, [execution_entry], nil}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, key) == [entry]
+    end
+
+    test "rejects transaction EXISTS when leader HLC drift makes expiry unsafe", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_exists"
+      entry = {key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, entry)
+
+      {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("EXISTS", [key])
+      {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+
+      wrapped =
+        {{:tx_execute, [execution_entry], nil}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, key) == [entry]
+    end
+
+    test "rejects transaction MGET when leader HLC drift makes expiry unsafe", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_mget"
+      entry = {key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, entry)
+
+      {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("MGET", [key])
+      {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+
+      wrapped =
+        {{:tx_execute, [execution_entry], nil}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, key) == [entry]
+    end
+
+    test "rejects transaction HGETALL instead of returning a partial drifted scan", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "drift_guarded_hgetall"
+      type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+      field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
+      field_entry = {field_key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+      :ets.insert(ets, field_entry)
+
+      {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("HGETALL", [redis_key])
+      {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+
+      wrapped =
+        {{:tx_execute, [execution_entry], nil}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, field_key) == [field_entry]
+    end
+
+    test "rejects transaction HLEN instead of undercounting a drifted hash", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "drift_guarded_hlen"
+      type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+      field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
+      field_entry = {field_key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+      :ets.insert(ets, field_entry)
+
+      {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("HLEN", [redis_key])
+      {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+
+      wrapped =
+        {{:tx_execute, [execution_entry], nil}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, field_key) == [field_entry]
+    end
+
+    test "rejects promoted hash RMW when leader HLC drift makes the field ambiguous", %{
+      state: state,
+      ets: ets
+    } do
+      redis_key = "drift_guarded_promoted_hash"
+      field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
+      field_entry = {field_key, "10", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 2}
+      :ets.insert(ets, field_entry)
+
+      dedicated_path =
+        Ferricstore.Store.Promotion.dedicated_path(
+          state.data_dir,
+          state.shard_index,
+          :hash,
+          redis_key
+        )
+
+      File.mkdir_p!(dedicated_path)
+      File.touch!(Path.join(dedicated_path, "00000.log"))
+
+      state =
+        Map.put(state, :promoted_instances, %{
+          redis_key => %{path: dedicated_path, type: :hash}
+        })
+
+      wrapped =
+        {{:hincrby, redis_key, "field", 1}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, field_key) == [field_entry]
+    end
+
+    test "retains an unsafe same-apply pending value and marks the read failure" do
+      key = "drift_guarded_pending"
+      pending = %{key => {"value", 31_000}}
+
+      Ferricstore.CommandTime.with_expiry_context(61_000, 1_000, fn ->
+        Process.put(:sm_pending_values, pending)
+        Process.put(:sm_state_read_failure, nil)
+
+        try do
+          assert StateMachine.__sm_pending_value_meta_for_test__(key) == :miss
+          assert Process.get(:sm_state_read_failure) == :hlc_drift_exceeded
+          assert Process.get(:sm_pending_values) == pending
+        after
+          Process.delete(:sm_pending_values)
+          Process.delete(:sm_state_read_failure)
+        end
+      end)
+    end
+
+    test "does not let another owner steal a wall-live fetch-or-compute lease", %{
+      state: state
+    } do
+      key = "drift_guarded_fetch_lease"
+      owner = "original-owner"
+      expire_at_ms = 31_000
+
+      state =
+        state
+        |> Map.put(:fetch_or_compute_locks, %{key => {owner, expire_at_ms}})
+        |> Map.put(
+          :fetch_or_compute_lock_expiries,
+          :gb_trees.enter({expire_at_ms, key}, owner, :gb_trees.empty())
+        )
+
+      outcome_key = Ferricstore.FetchOrCompute.Outcome.key(key)
+
+      wrapped =
+        {{:fetch_or_compute_lock, key, outcome_key, "other-owner", 91_000},
+         %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, :hlc_drift_exceeded}
+      assert new_state.fetch_or_compute_locks == state.fetch_or_compute_locks
+      assert new_state.fetch_or_compute_lock_expiries == state.fetch_or_compute_lock_expiries
+    end
+
+    test "an unrelated ambiguous lease does not block a disjoint acquisition", %{
+      state: state
+    } do
+      existing_key = "drift_guarded_existing_lease"
+      new_key = "drift_guarded_disjoint_lease"
+      existing_owner = "existing-owner"
+      new_owner = "new-owner"
+      existing_expire_at_ms = 31_000
+      new_expire_at_ms = 91_000
+
+      state =
+        state
+        |> Map.put(:fetch_or_compute_locks, %{
+          existing_key => {existing_owner, existing_expire_at_ms}
+        })
+        |> Map.put(
+          :fetch_or_compute_lock_expiries,
+          :gb_trees.enter(
+            {existing_expire_at_ms, existing_key},
+            existing_owner,
+            :gb_trees.empty()
+          )
+        )
+
+      outcome_key = Ferricstore.FetchOrCompute.Outcome.key(new_key)
+
+      wrapped =
+        {{:fetch_or_compute_lock, new_key, outcome_key, new_owner, new_expire_at_ms},
+         %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == :ok
+
+      assert new_state.fetch_or_compute_locks == %{
+               existing_key => {existing_owner, existing_expire_at_ms},
+               new_key => {new_owner, new_expire_at_ms}
+             }
+    end
+
+    test "does not bypass a wall-live fetch-or-compute lease for ordinary writes", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_fetch_write"
+      owner = "lease-owner"
+      expire_at_ms = 31_000
+
+      state =
+        state
+        |> Map.put(:fetch_or_compute_locks, %{key => {owner, expire_at_ms}})
+        |> Map.put(
+          :fetch_or_compute_lock_expiries,
+          :gb_trees.enter({expire_at_ms, key}, owner, :gb_trees.empty())
+        )
+
+      wrapped =
+        {{:put, key, "new-value", 0}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, :hlc_drift_exceeded}
+      assert :ets.lookup(ets, key) == []
+      assert new_state.fetch_or_compute_locks == state.fetch_or_compute_locks
+      assert new_state.fetch_or_compute_lock_expiries == state.fetch_or_compute_lock_expiries
+    end
+
+    test "does not acquire a lease when the prior outcome has unsafe expiry", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_fetch_outcome"
+      owner = "new-owner"
+      outcome_key = Ferricstore.FetchOrCompute.Outcome.key(key)
+      outcome_entry = {outcome_key, "failure", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 7}
+      :ets.insert(ets, outcome_entry)
+
+      wrapped =
+        {{:fetch_or_compute_lock, key, outcome_key, owner, 91_000},
+         %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert new_state.fetch_or_compute_locks == state.fetch_or_compute_locks
+      assert new_state.fetch_or_compute_lock_expiries == state.fetch_or_compute_lock_expiries
+      assert :ets.lookup(ets, outcome_key) == [outcome_entry]
+    end
+
+    test "rejects lifecycle expiry candidates caused only by leader HLC drift", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_expiry_sweep"
+      entry = {key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, entry)
+
+      wrapped =
+        {{:expire_if_batch, [{key, 31_000}]}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, key) == [entry]
+    end
+
+    test "WATCH token creation rejects drift-ambiguous expiry", %{
+      state: state,
+      ets: ets
+    } do
+      key = "drift_guarded_watch_token"
+      entry = {key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, entry)
+
+      wrapped =
+        {{:watch_token, key}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, :hlc_drift_exceeded}
+      assert :ets.lookup(ets, key) == [entry]
+    end
+
+    test "WATCH validation returns a storage error and aborts on ambiguous expiry", %{
+      state: state,
+      ets: ets
+    } do
+      watched_key = "drift_guarded_watch_fence"
+      target_key = "drift_guarded_watch_target"
+      entry = {watched_key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
+      :ets.insert(ets, entry)
+
+      {:ok, prepared} =
+        Ferricstore.Commands.PreparedCommand.prepare("SET", [target_key, "new-value"])
+
+      {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+
+      wrapped =
+        {{:tx_execute, [execution_entry], nil, %{watched_key => :missing}},
+         %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}}
+
+      {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+      assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+      assert :ets.lookup(ets, watched_key) == [entry]
+      assert :ets.lookup(ets, target_key) == []
     end
 
     test "unwraps and processes an append command with hlc_ts metadata", %{
@@ -139,7 +591,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       {state2, :ok} = StateMachine.apply(%{}, {:put, "app_key", "hello", 0}, state)
 
       hlc_ts = HLC.now()
-      wrapped = {{:append, "app_key", " world"}, %{hlc_ts: hlc_ts}}
+      wrapped = {{:append, "app_key", " world"}, stamp_metadata(hlc_ts)}
 
       {_state3, {:ok, new_len}} = StateMachine.apply(%{}, wrapped, state2)
 
@@ -173,7 +625,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       remote_phys = System.os_time(:millisecond) + 50
       remote_ts = {remote_phys, 0}
 
-      wrapped = {{:put, "merge_test", "val", 0}, %{hlc_ts: remote_ts}}
+      wrapped = {{:put, "merge_test", "val", 0}, stamp_metadata(remote_ts)}
       {_new_state, :ok} = StateMachine.apply(%{}, wrapped, state)
 
       # After apply, the local HLC should have merged the remote timestamp.
@@ -188,7 +640,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
       # Send a command with a timestamp from the past
       remote_ts = {current_phys - 1000, 0}
-      wrapped = {{:put, "past_test", "val", 0}, %{hlc_ts: remote_ts}}
+      wrapped = {{:put, "past_test", "val", 0}, stamp_metadata(remote_ts)}
       {_new_state, :ok} = StateMachine.apply(%{}, wrapped, state)
 
       # HLC should not have regressed
@@ -202,7 +654,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       state_acc =
         Enum.reduce(1..100, state, fn i, acc ->
           hlc_ts = HLC.now()
-          wrapped = {{:put, "drift_key_#{i}", "v#{i}", 0}, %{hlc_ts: hlc_ts}}
+          wrapped = {{:put, "drift_key_#{i}", "v#{i}", 0}, stamp_metadata(hlc_ts)}
           {new_state, :ok} = StateMachine.apply(%{}, wrapped, acc)
           new_state
         end)
@@ -222,7 +674,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       # Try to incr_float it with an HLC-wrapped command -- should fail but still merge HLC
       remote_phys = System.os_time(:millisecond) + 25
       remote_ts = {remote_phys, 0}
-      wrapped = {{:incr_float, "not_a_float", 1.0}, %{hlc_ts: remote_ts}}
+      wrapped = {{:incr_float, "not_a_float", 1.0}, stamp_metadata(remote_ts)}
 
       {_state3, {:error, _reason}} = StateMachine.apply(%{}, wrapped, state2)
 
@@ -271,7 +723,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
         Enum.reduce(1..2, state, fn i, acc ->
           hlc_ts = HLC.now()
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          wrapped = {{:getdel, "rc_hlc_#{i}"}, %{hlc_ts: hlc_ts}}
+          wrapped = {{:getdel, "rc_hlc_#{i}"}, stamp_metadata(hlc_ts)}
           {new_state, {:applied_at, _, nil}, _effects} = StateMachine.apply(meta, wrapped, acc)
           new_state
         end)
@@ -281,7 +733,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       # The 3rd apply should emit release_cursor
       hlc_ts = HLC.now()
       meta = %{index: 3, term: 1, system_time: System.os_time(:millisecond)}
-      wrapped = {{:getdel, "rc_hlc_3"}, %{hlc_ts: hlc_ts}}
+      wrapped = {{:getdel, "rc_hlc_3"}, stamp_metadata(hlc_ts)}
 
       {new_state, {:applied_at, _, nil}, effects} =
         StateMachine.apply(meta, wrapped, state_before)
@@ -334,7 +786,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       # Simulate the exact format that Batcher.stamp_hlc/1 produces
       inner_cmd = {:put, "stamped_key", "stamped_val", 0}
       hlc_ts = {System.os_time(:millisecond), 42}
-      stamped = {inner_cmd, %{hlc_ts: hlc_ts}}
+      stamped = {inner_cmd, stamp_metadata(hlc_ts)}
 
       {new_state, result} = StateMachine.apply(%{}, stamped, state)
 
@@ -345,7 +797,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     test "wrapped batch command format is correctly handled", %{state: state} do
       batch = [{:put, "bk1", "bv1", 0}, {:put, "bk2", "bv2", 0}]
       hlc_ts = {System.os_time(:millisecond), 0}
-      stamped = {{:batch, batch}, %{hlc_ts: hlc_ts}}
+      stamped = {{:batch, batch}, stamp_metadata(hlc_ts)}
 
       {new_state, {:ok, results}} = StateMachine.apply(%{}, stamped, state)
 
@@ -357,8 +809,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       # Simulate a remote leader with a very high logical counter.
       # This tests that the HLC merge handles high logical values.
       remote_physical = System.os_time(:millisecond) + 50
-      hlc_ts = {remote_physical, 99_999}
-      stamped = {{:put, "high_log_key", "val", 0}, %{hlc_ts: hlc_ts}}
+      hlc_ts = {remote_physical, 65_535}
+      stamped = {{:put, "high_log_key", "val", 0}, stamp_metadata(hlc_ts)}
 
       {_new_state, :ok} = StateMachine.apply(%{}, stamped, state)
 
@@ -375,7 +827,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
   describe "edge cases" do
     test "wrapped command with zero timestamp is handled gracefully", %{state: state} do
       hlc_ts = {0, 0}
-      wrapped = {{:put, "zero_ts", "val", 0}, %{hlc_ts: hlc_ts}}
+      wrapped = {{:put, "zero_ts", "val", 0}, stamp_metadata(hlc_ts)}
 
       {new_state, result} = StateMachine.apply(%{}, wrapped, state)
 
@@ -387,7 +839,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       timestamps =
         Enum.reduce(1..50, {state, []}, fn i, {acc, ts_list} ->
           hlc_ts = HLC.now()
-          wrapped = {{:put, "mono_#{i}", "v#{i}", 0}, %{hlc_ts: hlc_ts}}
+          wrapped = {{:put, "mono_#{i}", "v#{i}", 0}, stamp_metadata(hlc_ts)}
           {new_state, :ok} = StateMachine.apply(%{}, wrapped, acc)
 
           # Record the HLC after each apply
@@ -405,4 +857,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       end)
     end
   end
+
+  defp stamp_metadata({physical_ms, _logical} = hlc_ts),
+    do: %{hlc_ts: hlc_ts, wall_time_ms: physical_ms}
 end

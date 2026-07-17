@@ -51,6 +51,58 @@ defmodule Ferricstore.Store.KeydirConcurrencyTest do
     end
   end
 
+  test "state-machine expiry cleanup cannot delete or misaccount a replacement" do
+    table = new_keydir()
+    key = "state-machine-exact-delete"
+    old_value = :binary.copy("o", 100)
+    new_value = :binary.copy("n", 120)
+    observed = {key, old_value, 10, LFU.initial(), 1, 20, 100}
+    replacement = {key, new_value, 0, LFU.initial(), 2, 40, 120}
+    binary_bytes = :atomics.new(1, signed: true)
+    :atomics.put(binary_bytes, 1, byte_size(new_value))
+
+    ctx = %{
+      keydir: table,
+      index: 0,
+      instance_ctx: %{keydir_binary_bytes: binary_bytes, shard_count: 1}
+    }
+
+    try do
+      true = :ets.insert(table, replacement)
+
+      refute Ferricstore.Raft.StateMachine.__cross_shard_delete_keydir_entry_for_test__(
+               ctx,
+               observed
+             )
+
+      assert :ets.lookup(table, key) == [replacement]
+      assert :atomics.get(binary_bytes, 1) == byte_size(new_value)
+    after
+      :ets.delete(table)
+    end
+  end
+
+  test "local state-machine expiry cleanup requires the exact observed row" do
+    table = new_keydir()
+    key = "state-machine-local-exact-delete"
+    observed = {key, "old", 10, LFU.initial(), 1, 20, 3}
+    replacement = {key, "new", 0, LFU.initial(), 2, 40, 3}
+    state = %{ets: table, shard_index: 0, instance_ctx: nil}
+
+    try do
+      true = :ets.insert(table, replacement)
+
+      refute Ferricstore.Raft.StateMachine.__delete_expired_committed_entry_for_test__(
+               state,
+               observed
+             )
+
+      assert :ets.lookup(table, key) == [replacement]
+    after
+      :ets.delete(table)
+    end
+  end
+
   test "compaction relocation cannot overwrite a replacement committed after planning" do
     table = new_keydir()
     key = "keydir-cas-compaction"

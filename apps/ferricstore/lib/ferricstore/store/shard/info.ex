@@ -1164,6 +1164,9 @@ defmodule Ferricstore.Store.Shard.Info do
 
           {:error, :invalid_keydir_entry} ->
             {:reply, from, ReadResult.failure(:invalid_keydir_entry)}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {:reply, from, failure}
         end
       end
 
@@ -1196,6 +1199,9 @@ defmodule Ferricstore.Store.Shard.Info do
 
           {:error, :invalid_keydir_entry} ->
             {:reply, from, ReadResult.failure(:invalid_keydir_entry)}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {:reply, from, failure}
         end
       end
 

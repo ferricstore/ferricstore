@@ -559,6 +559,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
+      defp track_keydir_binary_remove_entry(
+             state,
+             {key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size}
+           ) do
+        ExpiryTracker.adjust(
+          expiry_instance_ctx(state),
+          state.shard_index,
+          expire_at_ms,
+          0
+        )
+
+        if ref = keydir_binary_ref(state) do
+          bytes = binary_byte_size(key) + binary_byte_size(value)
+          if bytes > 0, do: :atomics.sub(ref, state.shard_index + 1, bytes)
+        end
+      end
+
       # Tracks off-heap binary bytes when warming a cold key (nil -> value).
       defp track_keydir_binary_warm(state, new_ets_val) do
         ref = keydir_binary_ref(state)

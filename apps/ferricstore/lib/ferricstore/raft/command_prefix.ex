@@ -23,8 +23,10 @@ defmodule Ferricstore.Raft.CommandPrefix do
 
   def extract({:async, _origin, inner}) when is_tuple(inner), do: extract(inner)
 
-  def extract({inner, %{hlc_ts: {physical_ms, logical}}})
-      when is_tuple(inner) and is_integer(physical_ms) and is_integer(logical),
+  def extract({inner, %{hlc_ts: {physical_ms, logical}, wall_time_ms: wall_time_ms}})
+      when is_tuple(inner) and is_integer(physical_ms) and physical_ms >= 0 and
+             is_integer(logical) and logical >= 0 and is_integer(wall_time_ms) and
+             wall_time_ms >= 0 and wall_time_ms <= physical_ms,
       do: extract(inner)
 
   def extract(command) when is_tuple(command) do

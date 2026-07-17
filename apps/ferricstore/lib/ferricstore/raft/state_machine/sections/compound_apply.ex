@@ -97,7 +97,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
 
               case check_fetch_or_compute_lock(state, redis_key, nil) do
                 :ok -> do_delete(state, key)
-                {:error, :key_locked} -> {:error, :key_locked}
+                {:error, _reason} = error -> error
               end
             end)
 

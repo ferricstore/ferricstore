@@ -1,28 +1,36 @@
 defmodule Ferricstore.Transaction.WatchToken do
   @moduledoc false
 
+  alias Ferricstore.ExpiryContext
+
   @raft_location_tags [:waraft_segment, :waraft_projection, :waraft_apply_projection]
 
-  @spec from_entry(tuple() | [tuple()] | [], non_neg_integer(), (-> binary() | nil)) ::
-          term() | {:error, :watch_value_unavailable}
-  def from_entry([], _now_ms, _materialize), do: :missing
+  @spec from_entry(tuple() | [tuple()] | [], ExpiryContext.t(), (-> binary() | nil)) ::
+          term() | {:error, :watch_value_unavailable | :hlc_drift_exceeded}
+  def from_entry([], _expiry_context, _materialize), do: :missing
 
-  def from_entry([entry], now_ms, materialize),
-    do: from_entry(entry, now_ms, materialize)
+  def from_entry([entry], expiry_context, materialize),
+    do: from_entry(entry, expiry_context, materialize)
 
   def from_entry(
         {_key, value, expire_at_ms, _lfu, file_id, _offset, _value_size},
-        now_ms,
+        expiry_context,
         materialize
       )
-      when is_integer(expire_at_ms) and is_integer(now_ms) and is_function(materialize, 0) do
-    if expire_at_ms != 0 and expire_at_ms <= now_ms do
-      :missing
-    else
-      case raft_version(file_id) do
-        {:ok, version} -> {:watch, {:raft, version}, expire_at_ms}
-        :error -> content_token(value, expire_at_ms, materialize)
-      end
+      when is_integer(expire_at_ms) and expire_at_ms >= 0 and is_tuple(expiry_context) and
+             is_function(materialize, 0) do
+    case ExpiryContext.classify(ExpiryContext.normalize(expiry_context), expire_at_ms) do
+      :expired ->
+        :missing
+
+      {:unsafe, reason} ->
+        {:error, reason}
+
+      :live ->
+        case raft_version(file_id) do
+          {:ok, version} -> {:watch, {:raft, version}, expire_at_ms}
+          :error -> content_token(value, expire_at_ms, materialize)
+        end
     end
   end
 

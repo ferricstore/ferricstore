@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.Router.Part09 do
     quote do
       alias Ferricstore.CommandTime
       alias Ferricstore.ErrorReasons
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.InternalKey
@@ -414,7 +415,8 @@ defmodule Ferricstore.Store.Router.Part09 do
       def exists?(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
+        now = ExpiryContext.now_ms(expiry_context)
 
         try do
           case :ets.lookup(keydir, key) do
@@ -424,8 +426,14 @@ defmodule Ferricstore.Store.Router.Part09 do
 
             [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
             when is_integer(exp) and exp > 0 and exp <= now ->
-              delete_observed_keydir_entry(ctx, idx, keydir, entry)
-              false
+              case ExpiryContext.classify(expiry_context, exp) do
+                {:unsafe, :hlc_drift_exceeded} ->
+                  true
+
+                :expired ->
+                  delete_observed_keydir_entry(ctx, idx, keydir, entry)
+                  false
+              end
 
             [] ->
               false
@@ -451,7 +459,8 @@ defmodule Ferricstore.Store.Router.Part09 do
       def exists_fast?(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
+        now = ExpiryContext.now_ms(expiry_context)
 
         try do
           case :ets.lookup(keydir, key) do
@@ -461,8 +470,14 @@ defmodule Ferricstore.Store.Router.Part09 do
 
             [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
             when is_integer(exp) and exp > 0 and exp <= now ->
-              delete_observed_keydir_entry(ctx, idx, keydir, entry)
-              false
+              case ExpiryContext.classify(expiry_context, exp) do
+                {:unsafe, :hlc_drift_exceeded} ->
+                  true
+
+                :expired ->
+                  delete_observed_keydir_entry(ctx, idx, keydir, entry)
+                  false
+              end
 
             [] ->
               false
@@ -976,7 +991,8 @@ defmodule Ferricstore.Store.Router.Part09 do
       def get_keydir_file_ref(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
+        now = ExpiryContext.now_ms(expiry_context)
 
         try do
           case :ets.lookup(keydir, key) do
@@ -996,8 +1012,14 @@ defmodule Ferricstore.Store.Router.Part09 do
 
             [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
             when is_integer(exp) and exp > 0 and exp <= now ->
-              delete_observed_keydir_entry(ctx, idx, keydir, entry)
-              :miss
+              case ExpiryContext.classify(expiry_context, exp) do
+                {:unsafe, :hlc_drift_exceeded} ->
+                  ReadResult.failure(:hlc_drift_exceeded)
+
+                :expired ->
+                  delete_observed_keydir_entry(ctx, idx, keydir, entry)
+                  :miss
+              end
 
             [] ->
               :miss
@@ -1244,12 +1266,13 @@ defmodule Ferricstore.Store.Router.Part09 do
       def compound_get(ctx, redis_key, compound_key) do
         idx = shard_for(ctx, redis_key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
+        now = ExpiryContext.now_ms(expiry_context)
 
         if promoted_data_compound_key?(keydir, redis_key, compound_key, now) do
           fallback_compound_get(ctx, idx, redis_key, compound_key)
         else
-          compound_get_from_keydir(ctx, idx, keydir, redis_key, compound_key, now)
+          compound_get_from_keydir(ctx, idx, keydir, redis_key, compound_key, expiry_context)
         end
       end
 
@@ -1292,6 +1315,9 @@ defmodule Ferricstore.Store.Router.Part09 do
                   now
                 )
             end
+
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
 
           terminal when terminal in [:miss, :expired] ->
             if selected_waraft_ctx?(ctx) do

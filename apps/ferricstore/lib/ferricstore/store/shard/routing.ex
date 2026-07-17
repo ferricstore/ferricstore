@@ -877,7 +877,8 @@ defmodule Ferricstore.Store.Shard.Routing do
         standalone_command_keys(command)
       end
 
-      defp standalone_command_keys({command, %{hlc_ts: _remote_ts}}) when is_tuple(command) do
+      defp standalone_command_keys({command, %{hlc_ts: _remote_ts, wall_time_ms: wall_time_ms}})
+           when is_tuple(command) and is_integer(wall_time_ms) do
         standalone_command_keys(command)
       end
 

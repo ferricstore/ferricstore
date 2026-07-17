@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.Router.Part04 do
     quote do
       alias Ferricstore.CommandTime
       alias Ferricstore.ErrorReasons
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.Locator
@@ -127,6 +128,9 @@ defmodule Ferricstore.Store.Router.Part04 do
           {:invalid, entry} ->
             {:read_error, {:invalid_keydir_entry, entry}}
 
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
+
           :no_table ->
             {:read_error, :keydir_unavailable}
 
@@ -154,6 +158,9 @@ defmodule Ferricstore.Store.Router.Part04 do
 
           :miss ->
             nil
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
         end
       end
 
@@ -293,6 +300,9 @@ defmodule Ferricstore.Store.Router.Part04 do
           {:invalid, entry} ->
             {:read_error, {:invalid_keydir_entry, entry}}
 
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
+
           :no_table ->
             {:read_error, :keydir_unavailable}
 
@@ -313,6 +323,9 @@ defmodule Ferricstore.Store.Router.Part04 do
 
           :miss ->
             nil
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
         end
       end
 
@@ -440,9 +453,9 @@ defmodule Ferricstore.Store.Router.Part04 do
       def get_meta(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
 
-        case ets_get_meta_full(ctx, idx, keydir, key, now) do
+        case ets_get_meta_full(ctx, idx, keydir, key, expiry_context) do
           {:hit, value, expire_at_ms, lfu} ->
             sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
             {value, expire_at_ms}
@@ -467,7 +480,7 @@ defmodule Ferricstore.Store.Router.Part04 do
                        keydir,
                        key,
                        {file_id, offset, value_size},
-                       now,
+                       expiry_context,
                        failure
                      ) do
                   {:cold, value, retry_expire_at_ms, retry_file_id, retry_offset} ->
@@ -512,7 +525,7 @@ defmodule Ferricstore.Store.Router.Part04 do
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now,
+                  expiry_context,
                   read_error
                 )
 
@@ -523,7 +536,7 @@ defmodule Ferricstore.Store.Router.Part04 do
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now,
+                  expiry_context,
                   read_error
                 )
             end
@@ -535,6 +548,9 @@ defmodule Ferricstore.Store.Router.Part04 do
 
           {:invalid, entry} ->
             Ferricstore.Store.ReadResult.failure({:invalid_keydir_entry, entry})
+
+          :hlc_drift_exceeded ->
+            Ferricstore.Store.ReadResult.failure(:hlc_drift_exceeded)
 
           :expired ->
             record_keyspace_miss(ctx, key)
@@ -567,11 +583,13 @@ defmodule Ferricstore.Store.Router.Part04 do
       This is used by expiry-time commands so cold large values do not pay a
       Bitcask pread just to report TTL metadata.
       """
-      @spec expire_at_ms(FerricStore.Instance.t(), binary()) :: non_neg_integer() | nil
+      @spec expire_at_ms(FerricStore.Instance.t(), binary()) ::
+              non_neg_integer() | nil | ReadResult.failure()
       def expire_at_ms(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
+        now = ExpiryContext.now_ms(expiry_context)
 
         try do
           case :ets.lookup(keydir, key) do
@@ -581,8 +599,14 @@ defmodule Ferricstore.Store.Router.Part04 do
 
             [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
             when is_integer(exp) and exp > 0 and exp <= now ->
-              delete_observed_keydir_entry(ctx, idx, keydir, entry)
-              nil
+              case ExpiryContext.classify(expiry_context, exp) do
+                {:unsafe, :hlc_drift_exceeded} ->
+                  ReadResult.failure(:hlc_drift_exceeded)
+
+                :expired ->
+                  delete_observed_keydir_entry(ctx, idx, keydir, entry)
+                  nil
+              end
 
             [] ->
               nil
@@ -606,7 +630,8 @@ defmodule Ferricstore.Store.Router.Part04 do
       def value_size(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
+        now = ExpiryContext.now_ms(expiry_context)
 
         try do
           case :ets.lookup(keydir, key) do
@@ -646,8 +671,14 @@ defmodule Ferricstore.Store.Router.Part04 do
 
             [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
             when is_integer(exp) and exp > 0 and exp <= now ->
-              delete_observed_keydir_entry(ctx, idx, keydir, entry)
-              nil
+              case ExpiryContext.classify(expiry_context, exp) do
+                {:unsafe, :hlc_drift_exceeded} ->
+                  ReadResult.failure(:hlc_drift_exceeded)
+
+                :expired ->
+                  delete_observed_keydir_entry(ctx, idx, keydir, entry)
+                  nil
+              end
 
             [] ->
               nil
@@ -661,11 +692,13 @@ defmodule Ferricstore.Store.Router.Part04 do
       end
 
       @doc false
-      @spec object_lfu(FerricStore.Instance.t(), binary()) :: non_neg_integer() | nil
+      @spec object_lfu(FerricStore.Instance.t(), binary()) ::
+              non_neg_integer() | nil | ReadResult.failure()
       def object_lfu(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
+        now = ExpiryContext.now_ms(expiry_context)
 
         try do
           case :ets.lookup(keydir, key) do
@@ -675,8 +708,14 @@ defmodule Ferricstore.Store.Router.Part04 do
 
             [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
             when is_integer(exp) and exp > 0 and exp <= now ->
-              delete_observed_keydir_entry(ctx, idx, keydir, entry)
-              nil
+              case ExpiryContext.classify(expiry_context, exp) do
+                {:unsafe, :hlc_drift_exceeded} ->
+                  ReadResult.failure(:hlc_drift_exceeded)
+
+                :expired ->
+                  delete_observed_keydir_entry(ctx, idx, keydir, entry)
+                  nil
+              end
 
             [] ->
               nil
@@ -701,9 +740,9 @@ defmodule Ferricstore.Store.Router.Part04 do
       def getrange(ctx, key, start_idx, end_idx) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
 
-        case ets_get_full(ctx, idx, keydir, key, now) do
+        case ets_get_full(ctx, idx, keydir, key, expiry_context) do
           {:hit, value, lfu} ->
             sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
             range_from_value(value, start_idx, end_idx)
@@ -720,7 +759,7 @@ defmodule Ferricstore.Store.Router.Part04 do
               value_size,
               start_idx,
               end_idx,
-              now
+              expiry_context
             )
 
           {:cold, file_id, offset, value_size}
@@ -740,7 +779,7 @@ defmodule Ferricstore.Store.Router.Part04 do
                   {file_id, offset, value_size},
                   start_idx,
                   end_idx,
-                  now,
+                  expiry_context,
                   :not_found
                 )
 
@@ -753,7 +792,7 @@ defmodule Ferricstore.Store.Router.Part04 do
                   {file_id, offset, value_size},
                   start_idx,
                   end_idx,
-                  now,
+                  expiry_context,
                   reason
                 )
             end
@@ -763,6 +802,9 @@ defmodule Ferricstore.Store.Router.Part04 do
 
           {:invalid, entry} ->
             ReadResult.failure({:invalid_keydir_entry, entry})
+
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
 
           :expired ->
             record_keyspace_miss(ctx, key)

@@ -35,7 +35,17 @@ defmodule Ferricstore.Store.CompoundMemberCatalogReadinessTest do
                {:cont, [row | rows]}
              end)
 
-    assert :unavailable = CompoundMemberIndex.member_slice(index, state, prefix, "", 1, 1, %{})
+    assert :unavailable =
+             CompoundMemberIndex.member_slice(
+               index,
+               state,
+               prefix,
+               "",
+               1,
+               {:replicated_apply, 1},
+               %{}
+             )
+
     assert :unavailable = CompoundMemberIndex.row_slice(index, state, prefix, 0, 1, 2)
     assert :unavailable = CompoundMemberIndex.scan_page(index, state, prefix, 0, 10, nil)
   end

@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   @moduledoc false
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @separator <<0>>
@@ -196,7 +197,14 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
         :unavailable
 
       tid ->
-        do_any_live?(tid, lookup_state(state), prefix, first_key(tid, prefix), ignored_keys)
+        do_any_live?(
+          tid,
+          lookup_state(state),
+          prefix,
+          first_key(tid, prefix),
+          ignored_keys,
+          ExpiryContext.capture()
+        )
     end
   end
 
@@ -210,7 +218,14 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
         :unavailable
 
       tid ->
-        do_count_live(tid, lookup_state(state), prefix, first_key(tid, prefix), 0)
+        do_count_live(
+          tid,
+          lookup_state(state),
+          prefix,
+          first_key(tid, prefix),
+          0,
+          ExpiryContext.capture()
+        )
     end
   rescue
     ArgumentError -> :unavailable
@@ -226,12 +241,13 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
       tid ->
         lookup_state = lookup_state(state)
+        expiry_context = ExpiryContext.capture()
 
         entries =
           tid
           |> scan_keys(prefix)
           |> Enum.reduce_while([], fn compound_key, acc ->
-            case ShardETS.ets_lookup(lookup_state, compound_key) do
+            case ShardETS.ets_lookup(lookup_state, compound_key, expiry_context) do
               {:hit, value, _expire_at_ms} when is_binary(value) ->
                 {:cont, [{member_from_key(compound_key, prefix), value} | acc]}
 
@@ -242,6 +258,9 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                 {:halt, :unavailable}
 
               {:error, :invalid_keydir_entry} ->
+                {:halt, :unavailable}
+
+              {:error, {:storage_read_failed, _reason}} ->
                 {:halt, :unavailable}
 
               :expired ->
@@ -341,15 +360,17 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
           binary(),
           binary(),
           non_neg_integer(),
-          non_neg_integer(),
+          ExpiryContext.t(),
           map() | MapSet.t()
         ) :: {:ok, [binary()]} | {:error, term()} | :unavailable
-  def member_slice(_table, _state, _prefix, _start_member, 0, _now_ms, _pending_values),
+  def member_slice(_table, _state, _prefix, _start_member, 0, _expiry_context, _pending_values),
     do: {:ok, []}
 
-  def member_slice(table, state, prefix, start_member, count, now_ms, pending_values)
+  def member_slice(table, state, prefix, start_member, count, expiry_context, pending_values)
       when is_binary(prefix) and is_binary(start_member) and is_integer(count) and count > 0 and
-             is_integer(now_ms) and now_ms >= 0 do
+             is_tuple(expiry_context) do
+    expiry_context = ExpiryContext.normalize(expiry_context)
+
     case ready_table_ref(table) do
       :undefined ->
         :unavailable
@@ -365,7 +386,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                  prefix,
                  first,
                  count,
-                 now_ms,
+                 expiry_context,
                  pending_values,
                  :to_end,
                  []
@@ -377,7 +398,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                  prefix,
                  first_key(tid, prefix),
                  remaining,
-                 now_ms,
+                 expiry_context,
                  pending_values,
                  {:before, start_key},
                  acc
@@ -476,7 +497,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
       tid ->
         lookup_state = lookup_state(state)
-        now_ms = CommandTime.now_ms()
+        expiry_context = ExpiryContext.capture()
         first = scan_page_start_key(tid, prefix, cursor)
 
         case collect_scan_page(
@@ -486,7 +507,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                first,
                count,
                match_pattern,
-               now_ms,
+               expiry_context,
                [],
                nil
              ) do
@@ -706,7 +727,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          _prefix,
          _index_key,
          0,
-         _now_ms,
+         _expiry_context,
          _pending_values,
          _boundary,
          acc
@@ -719,7 +740,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          _prefix,
          :"$end_of_table",
          remaining,
-         _now_ms,
+         _expiry_context,
          _pending_values,
          _boundary,
          acc
@@ -732,7 +753,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          prefix,
          {prefix, member} = index_key,
          remaining,
-         now_ms,
+         expiry_context,
          pending_values,
          boundary,
          acc
@@ -742,7 +763,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
       case :ets.lookup(table, index_key) do
         [{^index_key, compound_key}] ->
-          case indexed_member_status(state, compound_key, now_ms, pending_values) do
+          case indexed_member_status(state, compound_key, expiry_context, pending_values) do
             :live ->
               collect_member_slice(
                 table,
@@ -750,7 +771,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                 prefix,
                 next_key,
                 remaining - 1,
-                now_ms,
+                expiry_context,
                 pending_values,
                 boundary,
                 [member | acc]
@@ -763,14 +784,14 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                 prefix,
                 next_key,
                 remaining,
-                now_ms,
+                expiry_context,
                 pending_values,
                 boundary,
                 acc
               )
 
             :stale ->
-              delete_stale_member(table, state, compound_key, now_ms)
+              delete_stale_member(table, state, compound_key, expiry_context)
 
               collect_member_slice(
                 table,
@@ -778,7 +799,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                 prefix,
                 next_key,
                 remaining,
-                now_ms,
+                expiry_context,
                 pending_values,
                 boundary,
                 acc
@@ -795,7 +816,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
             prefix,
             next_key,
             remaining,
-            now_ms,
+            expiry_context,
             pending_values,
             boundary,
             acc
@@ -812,7 +833,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          _prefix,
          _other_key,
          remaining,
-         _now_ms,
+         _expiry_context,
          _pending_values,
          _boundary,
          acc
@@ -829,7 +850,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          index_key,
          0,
          _match_pattern,
-         _now_ms,
+         _expiry_context,
          acc,
          last_inspected
        ),
@@ -842,7 +863,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          :"$end_of_table",
          _remaining,
          _match_pattern,
-         _now_ms,
+         _expiry_context,
          acc,
          last_inspected
        ),
@@ -855,7 +876,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          {prefix, member} = index_key,
          remaining,
          match_pattern,
-         now_ms,
+         expiry_context,
          acc,
          _last_inspected
        ) do
@@ -864,7 +885,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
     case :ets.lookup(table, index_key) do
       [{^index_key, compound_key}] ->
-        case keydir_member_status(state, compound_key, now_ms) do
+        case keydir_member_status(state, compound_key, expiry_context) do
           :live ->
             cond do
               not scan_member_matches?(member, match_pattern) ->
@@ -875,7 +896,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                   next_key,
                   remaining,
                   match_pattern,
-                  now_ms,
+                  expiry_context,
                   acc,
                   member
                 )
@@ -888,14 +909,14 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
                   next_key,
                   remaining,
                   match_pattern,
-                  now_ms,
+                  expiry_context,
                   [member | acc],
                   member
                 )
             end
 
           :stale ->
-            delete_stale_member(table, state, compound_key, now_ms)
+            delete_stale_member(table, state, compound_key, expiry_context)
 
             collect_scan_page(
               table,
@@ -904,7 +925,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
               next_key,
               remaining,
               match_pattern,
-              now_ms,
+              expiry_context,
               acc,
               member
             )
@@ -921,7 +942,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
           next_key,
           remaining,
           match_pattern,
-          now_ms,
+          expiry_context,
           acc,
           member
         )
@@ -935,7 +956,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
          other_key,
          _remaining,
          _match_pattern,
-         _now_ms,
+         _expiry_context,
          acc,
          last_inspected
        ),
@@ -944,24 +965,29 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   defp scan_member_matches?(_member, nil), do: true
   defp scan_member_matches?(member, pattern), do: Ferricstore.GlobMatcher.match?(member, pattern)
 
-  defp indexed_member_status(state, compound_key, now_ms, pending_values) do
-    case pending_member_status(pending_values, compound_key, now_ms) do
-      :not_pending -> keydir_member_status(state, compound_key, now_ms)
+  defp indexed_member_status(state, compound_key, expiry_context, pending_values) do
+    case pending_member_status(pending_values, compound_key, expiry_context) do
+      :not_pending -> keydir_member_status(state, compound_key, expiry_context)
       status -> status
     end
   end
 
-  defp pending_member_status(%MapSet{} = pending_values, compound_key, _now_ms) do
+  defp pending_member_status(%MapSet{} = pending_values, compound_key, _expiry_context) do
     if MapSet.member?(pending_values, compound_key), do: :pending_skip, else: :not_pending
   end
 
-  defp pending_member_status(pending_values, compound_key, now_ms) when is_map(pending_values) do
+  defp pending_member_status(pending_values, compound_key, expiry_context)
+       when is_map(pending_values) do
     case Map.fetch(pending_values, compound_key) do
       {:ok, :deleted} ->
         :pending_skip
 
       {:ok, {_value, expire_at_ms}} ->
-        if live_expiration?(expire_at_ms, now_ms), do: :live, else: :pending_skip
+        case ExpiryContext.classify(expiry_context, expire_at_ms) do
+          :live -> :live
+          :expired -> :pending_skip
+          {:unsafe, reason} -> {:error, reason}
+        end
 
       {:ok, invalid} ->
         {:error, {:invalid_pending_value, compound_key, invalid}}
@@ -971,26 +997,32 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
     end
   end
 
-  defp pending_member_status(_pending_values, _compound_key, _now_ms), do: :not_pending
+  defp pending_member_status(_pending_values, _compound_key, _expiry_context), do: :not_pending
 
-  defp keydir_member_status(state, compound_key, now_ms) do
+  defp keydir_member_status(state, compound_key, expiry_context) do
     keydir = Map.get(state, :keydir) || Map.get(state, :ets)
 
     case :ets.lookup(keydir, compound_key) do
       [{^compound_key, value, expire_at_ms, _lfu, file_id, offset, value_size}]
       when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
-        cond do
-          not live_expiration?(expire_at_ms, now_ms) ->
+        case ExpiryContext.classify(expiry_context, expire_at_ms) do
+          :expired ->
             :stale
 
-          value != nil ->
-            :live
+          {:unsafe, reason} ->
+            {:error, reason}
 
-          valid_cold_location?(file_id, offset, value_size) ->
-            :live
+          :live ->
+            cond do
+              value != nil ->
+                :live
 
-          true ->
-            {:error, {:invalid_cold_location, compound_key, {file_id, offset, value_size}}}
+              valid_cold_location?(file_id, offset, value_size) ->
+                :live
+
+              true ->
+                {:error, {:invalid_cold_location, compound_key, {file_id, offset, value_size}}}
+            end
         end
 
       [] ->
@@ -1003,17 +1035,15 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
     ArgumentError -> {:error, :keydir_unavailable}
   end
 
-  defp delete_stale_member(table, state, compound_key, now_ms \\ CommandTime.now_ms()) do
+  defp delete_stale_member(table, state, compound_key, expiry_context \\ ExpiryContext.capture()) do
     delete(table, compound_key)
 
-    case keydir_member_status(lookup_state(state), compound_key, now_ms) do
+    case keydir_member_status(lookup_state(state), compound_key, expiry_context) do
       :live -> put(table, compound_key)
+      {:error, _reason} -> put(table, compound_key)
       _missing_stale_or_invalid -> :ok
     end
   end
-
-  defp live_expiration?(0, _now_ms), do: true
-  defp live_expiration?(expire_at_ms, now_ms), do: expire_at_ms > now_ms
 
   defp valid_cold_location?(file_id, offset, value_size)
        when is_integer(file_id) and file_id >= 0 and is_integer(offset) and offset >= 0 and
@@ -1110,65 +1140,117 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   defp do_scan_index_keys(_table, _prefix, _other_key, acc), do: Enum.reverse(acc)
 
-  defp do_any_live?(_table, _state, _prefix, :"$end_of_table", _ignored_keys), do: false
+  defp do_any_live?(
+         _table,
+         _state,
+         _prefix,
+         :"$end_of_table",
+         _ignored_keys,
+         _expiry_context
+       ),
+       do: false
 
-  defp do_any_live?(table, state, prefix, {prefix, _member} = index_key, ignored_keys) do
+  defp do_any_live?(
+         table,
+         state,
+         prefix,
+         {prefix, _member} = index_key,
+         ignored_keys,
+         expiry_context
+       ) do
     next_key = :ets.next(table, index_key)
 
     case :ets.lookup(table, index_key) do
       [{^index_key, compound_key}] ->
         if ignored_key?(ignored_keys, compound_key) do
-          do_any_live?(table, state, prefix, next_key, ignored_keys)
+          do_any_live?(table, state, prefix, next_key, ignored_keys, expiry_context)
         else
-          case ShardETS.ets_lookup_warm_result(state, compound_key) do
+          case ShardETS.ets_lookup_warm_result(state, compound_key, expiry_context) do
             {:hit, _value, _expire_at_ms} ->
               true
 
             :expired ->
               delete_stale_member(table, state, compound_key)
-              do_any_live?(table, state, prefix, next_key, ignored_keys)
+              do_any_live?(table, state, prefix, next_key, ignored_keys, expiry_context)
 
             :miss ->
               delete_stale_member(table, state, compound_key)
-              do_any_live?(table, state, prefix, next_key, ignored_keys)
+              do_any_live?(table, state, prefix, next_key, ignored_keys, expiry_context)
 
             {:error, :cold_read_failed} ->
               true
+
+            {:error, {:storage_read_failed, _reason}} ->
+              :unavailable
           end
         end
 
       _missing ->
-        do_any_live?(table, state, prefix, next_key, ignored_keys)
+        do_any_live?(table, state, prefix, next_key, ignored_keys, expiry_context)
     end
   end
 
-  defp do_any_live?(_table, _state, _prefix, _other_key, _ignored_keys), do: false
+  defp do_any_live?(
+         _table,
+         _state,
+         _prefix,
+         _other_key,
+         _ignored_keys,
+         _expiry_context
+       ),
+       do: false
 
-  defp do_count_live(_table, _state, _prefix, :"$end_of_table", count), do: {:ok, count}
+  defp do_count_live(
+         _table,
+         _state,
+         _prefix,
+         :"$end_of_table",
+         count,
+         _expiry_context
+       ),
+       do: {:ok, count}
 
-  defp do_count_live(table, state, prefix, {prefix, _member} = index_key, count) do
+  defp do_count_live(
+         table,
+         state,
+         prefix,
+         {prefix, _member} = index_key,
+         count,
+         expiry_context
+       ) do
     next_key = :ets.next(table, index_key)
 
     case :ets.lookup(table, index_key) do
       [{^index_key, compound_key}] ->
-        case ShardETS.ets_lookup_metadata(state, compound_key) do
+        case ShardETS.ets_lookup_metadata(state, compound_key, expiry_context) do
           {:live, _entry, _location} ->
-            do_count_live(table, state, prefix, next_key, count + 1)
+            do_count_live(table, state, prefix, next_key, count + 1, expiry_context)
 
           status when status in [:expired, :miss] ->
             delete_stale_member(table, state, compound_key)
-            do_count_live(table, state, prefix, next_key, count)
+            do_count_live(table, state, prefix, next_key, count, expiry_context)
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
 
           {:error, reason} ->
             {:error, {:invalid_indexed_member, compound_key, reason}}
         end
 
       _missing ->
-        do_count_live(table, state, prefix, next_key, count)
+        do_count_live(table, state, prefix, next_key, count, expiry_context)
     end
   end
 
-  defp do_count_live(_table, _state, _prefix, _other_key, count), do: {:ok, count}
+  defp do_count_live(
+         _table,
+         _state,
+         _prefix,
+         _other_key,
+         count,
+         _expiry_context
+       ),
+       do: {:ok, count}
 
   defp ignored_key?(%MapSet{} = ignored_keys, compound_key),
     do: MapSet.member?(ignored_keys, compound_key)

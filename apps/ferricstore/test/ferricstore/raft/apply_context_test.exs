@@ -494,7 +494,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     trusted = ApplyContext.new(flow_default_history_max_events: 23)
     injected = ApplyContext.new(flow_default_history_max_events: 99)
     flow_command = {:flow_create, "state-key", %{id: "id", type: "email"}}
-    stamp = %{hlc_ts: {1_234, 0}}
+    stamp = %{hlc_ts: {1_234, 0}, wall_time_ms: 1_234}
 
     assert {{:ferricstore_apply_context, encoded, ^flow_command}, ^stamp} =
              ApplyContext.wrap_command({flow_command, stamp}, trusted)

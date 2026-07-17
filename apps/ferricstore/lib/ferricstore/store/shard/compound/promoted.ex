@@ -141,6 +141,9 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
       {:error, :invalid_keydir_entry} ->
         {:error, :invalid_keydir_entry}
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
       result when result in [:expired, :miss] ->
         {:ok, nil}
     end

@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.Shard.ETS do
   @moduledoc "ETS keydir operations: lookup, insert, delete, cold-read warming, LFU touch, hot-cache threshold enforcement, and prefix scans."
 
-  alias Ferricstore.CommandTime
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.LogicalKeyIndex
   alias Ferricstore.Store.Shard.ETS.Accounting
@@ -55,9 +55,22 @@ defmodule Ferricstore.Store.Shard.ETS do
           | :expired
           | :miss
           | {:error, :invalid_keydir_entry}
+          | ReadResult.failure()
   @doc false
-  def ets_lookup(%{keydir: keydir} = state, key) do
-    now = CommandTime.now_ms()
+  def ets_lookup(%{keydir: _keydir} = state, key) do
+    ets_lookup(state, key, ExpiryContext.capture())
+  end
+
+  @doc false
+  @spec ets_lookup(map(), binary(), ExpiryContext.t()) ::
+          {:hit, term(), non_neg_integer()}
+          | {:cold, term(), non_neg_integer(), non_neg_integer(), non_neg_integer()}
+          | :expired
+          | :miss
+          | {:error, :invalid_keydir_entry}
+          | ReadResult.failure()
+  def ets_lookup(%{keydir: keydir} = state, key, expiry_context) do
+    now = ExpiryContext.now_ms(expiry_context)
 
     case :ets.lookup(keydir, key) do
       [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
@@ -107,8 +120,14 @@ defmodule Ferricstore.Store.Shard.ETS do
 
       [{^key, _value, exp, _lfu, _fid, _off, _vsize} = expired_entry]
       when is_integer(exp) and exp > 0 and exp <= now ->
-        delete_exact_entry(state, expired_entry)
-        :expired
+        case ExpiryContext.classify(expiry_context, exp) do
+          {:unsafe, :hlc_drift_exceeded} ->
+            ReadResult.failure(:hlc_drift_exceeded)
+
+          :expired ->
+            delete_exact_entry(state, expired_entry)
+            :expired
+        end
 
       [] ->
         :miss
@@ -124,14 +143,18 @@ defmodule Ferricstore.Store.Shard.ETS do
           | :expired
           | :miss
           | {:error, :invalid_keydir_entry}
+          | ReadResult.failure()
 
   @doc false
   @spec ets_lookup_metadata(map(), binary()) :: metadata_lookup()
-  def ets_lookup_metadata(state, key), do: ets_lookup_metadata(state, key, CommandTime.now_ms())
+  def ets_lookup_metadata(state, key),
+    do: ets_lookup_metadata(state, key, ExpiryContext.capture())
 
   @doc false
-  @spec ets_lookup_metadata(map(), binary(), non_neg_integer()) :: metadata_lookup()
-  def ets_lookup_metadata(%{keydir: keydir} = state, key, now) do
+  @spec ets_lookup_metadata(map(), binary(), ExpiryContext.t()) :: metadata_lookup()
+  def ets_lookup_metadata(%{keydir: keydir} = state, key, expiry_context) do
+    now = ExpiryContext.now_ms(expiry_context)
+
     case :ets.lookup(keydir, key) do
       [{^key, value, exp, _lfu, _fid, _off, _vsize} = entry]
       when value != nil and is_integer(exp) and (exp == 0 or exp > now) ->
@@ -154,8 +177,14 @@ defmodule Ferricstore.Store.Shard.ETS do
 
       [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
       when is_integer(exp) and exp > 0 and exp <= now ->
-        delete_exact_entry(state, entry)
-        :expired
+        case ExpiryContext.classify(expiry_context, exp) do
+          {:unsafe, :hlc_drift_exceeded} ->
+            ReadResult.failure(:hlc_drift_exceeded)
+
+          :expired ->
+            delete_exact_entry(state, entry)
+            :expired
+        end
 
       [] ->
         :miss
@@ -166,10 +195,25 @@ defmodule Ferricstore.Store.Shard.ETS do
   end
 
   @spec ets_lookup_warm_result(map(), binary()) ::
-          {:hit, term(), non_neg_integer()} | :expired | :miss | {:error, :cold_read_failed}
+          {:hit, term(), non_neg_integer()}
+          | :expired
+          | :miss
+          | {:error, :cold_read_failed}
+          | ReadResult.failure()
   @doc false
   def ets_lookup_warm_result(state, key) do
-    case ets_lookup(state, key) do
+    ets_lookup_warm_result(state, key, ExpiryContext.capture())
+  end
+
+  @doc false
+  @spec ets_lookup_warm_result(map(), binary(), ExpiryContext.t()) ::
+          {:hit, term(), non_neg_integer()}
+          | :expired
+          | :miss
+          | {:error, :cold_read_failed}
+          | ReadResult.failure()
+  def ets_lookup_warm_result(state, key, expiry_context) do
+    case ets_lookup(state, key, expiry_context) do
       {:cold, fid, off, vsize, exp} when valid_waraft_segment_location(fid, off, vsize) ->
         case PrefixScan.read_waraft_segment_value(state, fid, key) do
           {:ok, value} when is_binary(value) ->
@@ -203,7 +247,8 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec pending_cold?(map(), binary()) :: boolean()
   @doc false
   def pending_cold?(%{keydir: keydir} = state, key) do
-    now = CommandTime.now_ms()
+    expiry_context = ExpiryContext.capture()
+    now = ExpiryContext.now_ms(expiry_context)
 
     case :ets.lookup(keydir, key) do
       [{^key, nil, exp, _lfu, :pending, _off, _vsize}]
@@ -212,8 +257,14 @@ defmodule Ferricstore.Store.Shard.ETS do
 
       [{^key, nil, exp, _lfu, :pending, _off, _vsize} = entry]
       when is_integer(exp) and exp > 0 and exp <= now ->
-        delete_exact_entry(state, entry)
-        false
+        case ExpiryContext.classify(expiry_context, exp) do
+          {:unsafe, :hlc_drift_exceeded} ->
+            true
+
+          :expired ->
+            delete_exact_entry(state, entry)
+            false
+        end
 
       [{^key, nil, _invalid_exp, _lfu, :pending, _off, _vsize}] ->
         true
@@ -226,7 +277,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec prefix_has_pending_cold?(:ets.tid(), binary()) :: boolean()
   @doc false
   def prefix_has_pending_cold?(keydir, prefix) do
-    now = CommandTime.now_ms()
+    now = ExpiryContext.capture() |> ExpiryContext.safe_expiry_cutoff_ms()
     prefix_len = byte_size(prefix)
 
     ms = [
@@ -637,6 +688,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   def warm_from_store(state, key) do
     case ets_lookup_warm_result(state, key) do
       {:hit, value, _exp} -> value
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
       {:error, reason} -> ReadResult.failure(reason)
       result when result in [:expired, :miss] -> nil
     end
@@ -650,6 +702,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   def warm_meta_from_store(state, key) do
     case ets_lookup_warm_result(state, key) do
       {:hit, value, exp} -> {value, exp}
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
       {:error, reason} -> ReadResult.failure(reason)
       result when result in [:expired, :miss] -> nil
     end

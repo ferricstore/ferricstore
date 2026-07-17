@@ -121,6 +121,45 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.SpopRemovesTypeMarkerFinalS
         assert [_row] = :ets.lookup(ets, type_key)
       end
 
+      @tag :hlc_drift_guard
+      test "SPOP rejects a member whose expiry is ambiguous under leader HLC drift", %{
+        state: state,
+        ets: ets
+      } do
+        setup_pop_indexes(state)
+        key = "spop:hlc-drift"
+        type_key = CompoundKey.type_key(key)
+        member_key = CompoundKey.set_member(key, "wall-live")
+        member_entry = {member_key, "1", 31_000, LFU.initial(), 0, 0, 1}
+
+        :ets.insert(
+          ets,
+          {type_key, CompoundKey.encode_type(:set), 0, LFU.initial(), 0, 0, 3}
+        )
+
+        :ets.insert(ets, member_entry)
+        CompoundMemberIndex.put(state.compound_member_index_name, member_key)
+
+        result =
+          apply_result_value(
+            StateMachine.apply(
+              %{index: 12},
+              {{:spop, key, 1}, %{hlc_ts: {61_000, 0}, wall_time_ms: 1_000}},
+              state
+            )
+          )
+
+        assert result == {:error, {:state_read_failed, :hlc_drift_exceeded}}
+        assert :ets.lookup(ets, member_key) == [member_entry]
+        assert [_row] = :ets.lookup(ets, type_key)
+
+        assert [{{_, "wall-live"}, ^member_key}] =
+                 :ets.lookup(
+                   state.compound_member_index_name,
+                   {CompoundKey.set_prefix(key), "wall-live"}
+                 )
+      end
+
       @tag :compound_member_index_readiness
       test "SPOP refuses an unready partial member catalog without mutation", %{
         state: state,

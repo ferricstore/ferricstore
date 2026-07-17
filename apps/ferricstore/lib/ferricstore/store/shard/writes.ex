@@ -558,6 +558,9 @@ defmodule Ferricstore.Store.Shard.Writes do
 
       {:error, :cold_read_failed} ->
         {:error, state}
+
+      {:error, {:storage_read_failed, _reason}} ->
+        {:error, state}
     end
   end
 

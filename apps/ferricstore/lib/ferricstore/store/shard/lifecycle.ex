@@ -2,7 +2,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @moduledoc "Shard startup, recovery, expiry sweeping, and graceful shutdown."
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.HLC
+  alias Ferricstore.ExpiryContext
 
   alias Ferricstore.Store.{
     CompactionTombstoneCatalog,
@@ -296,20 +296,23 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @doc false
   def do_expiry_sweep(state, opts \\ []) do
     force? = Keyword.get(opts, :force, false)
-    now = HLC.now_ms()
+
+    expiry_cutoff_ms =
+      ExpiryContext.capture()
+      |> ExpiryContext.safe_expiry_cutoff_ms()
 
     cond do
       force? ->
-        do_expiry_sweep_scan(state, now)
+        do_expiry_sweep_scan(state, expiry_cutoff_ms)
 
       ExpiryTracker.count_for_state(state) == 0 ->
         recover_sweep_if_needed(state)
 
-      not ExpiryTracker.due_for_state?(state, now) and not memory_pressure?(state) ->
+      not ExpiryTracker.due_for_state?(state, expiry_cutoff_ms) and not memory_pressure?(state) ->
         recover_sweep_if_needed(state)
 
       true ->
-        do_expiry_sweep_scan(state, now)
+        do_expiry_sweep_scan(state, expiry_cutoff_ms)
     end
   end
 

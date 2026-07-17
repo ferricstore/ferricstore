@@ -255,7 +255,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           assert {^state, {:error, {:unknown_command, ^command}}} =
                    StateMachine.apply(
                      %{system_time: local_now},
-                     {command, %{hlc_ts: {stamped_now, 0}}},
+                     {command, %{hlc_ts: {stamped_now, 0}, wall_time_ms: stamped_now}},
                      state
                    )
 
@@ -277,7 +277,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           {_new_state, {:ok, [{:error, {:unknown_command, ^command}}]}} =
             StateMachine.apply(
               %{system_time: local_now},
-              {{:batch, [command]}, %{hlc_ts: {stamped_now, 0}}},
+              {{:batch, [command]}, %{hlc_ts: {stamped_now, 0}, wall_time_ms: stamped_now}},
               state
             )
 
@@ -302,7 +302,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             StateMachine.apply(
               %{system_time: local_now},
               {{:ratelimit_add, "malformed_stamped_ratelimit", window_ms, 10, 1},
-               %{hlc_ts: {stamped_now, 0}}},
+               %{hlc_ts: {stamped_now, 0}, wall_time_ms: stamped_now}},
               state
             )
 
@@ -339,7 +339,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           {_new_state, ["denied", ^previous_count, 0, ^window_ms]} =
             StateMachine.apply(
               %{system_time: apply_now},
-              {{:ratelimit_add, key, window_ms, previous_count, 1}, %{hlc_ts: {apply_now, 0}}},
+              {{:ratelimit_add, key, window_ms, previous_count, 1},
+               %{hlc_ts: {apply_now, 0}, wall_time_ms: apply_now}},
               state
             )
         end

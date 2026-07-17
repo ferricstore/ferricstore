@@ -12,6 +12,7 @@ defmodule Ferricstore.Store.Router.Part01 do
 
       alias Ferricstore.CommandTime
       alias Ferricstore.ErrorReasons
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.Locator
@@ -93,13 +94,17 @@ defmodule Ferricstore.Store.Router.Part01 do
       def read_shard_value(ctx, idx, key)
           when is_integer(idx) and idx >= 0 and is_binary(key) do
         keydir = resolve_keydir(ctx, idx)
+        expiry_context = ExpiryContext.capture()
 
-        case ets_get_full(ctx, idx, keydir, key, HLC.now_ms()) do
+        case ets_get_full(ctx, idx, keydir, key, expiry_context) do
           {:hit, value, _lfu} ->
             {:ok, value}
 
           result when result in [:miss, :expired] ->
             {:ok, nil}
+
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
 
           _cold_or_unavailable ->
             if selected_waraft_ctx?(ctx) do
@@ -894,9 +899,9 @@ defmodule Ferricstore.Store.Router.Part01 do
       def get_file_ref(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
 
-        case ets_get_full(ctx, idx, keydir, key, now) do
+        case ets_get_full(ctx, idx, keydir, key, expiry_context) do
           {:hit, _value, _lfu} ->
             # Hot key — value is in ETS, sendfile not applicable.
             nil
@@ -917,11 +922,14 @@ defmodule Ferricstore.Store.Router.Part01 do
                        keydir,
                        key,
                        {file_id, offset, value_size},
-                       now
+                       expiry_context
                      ) do
                   {:cold_ref, retry_path, value_offset, retry_size} ->
                     Stats.record_cold_read(ctx, key)
                     {retry_path, value_offset, retry_size}
+
+                  {:error, {:storage_read_failed, _reason}} = failure ->
+                    failure
 
                   _ ->
                     record_keyspace_miss(ctx, key)
@@ -950,6 +958,9 @@ defmodule Ferricstore.Store.Router.Part01 do
 
           {:invalid, entry} ->
             ReadResult.failure({:invalid_keydir_entry, entry})
+
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
 
           :expired ->
             record_keyspace_miss(ctx, key)

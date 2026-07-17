@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.Router.Part02 do
     quote do
       alias Ferricstore.CommandTime
       alias Ferricstore.ErrorReasons
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.Locator
@@ -30,9 +31,9 @@ defmodule Ferricstore.Store.Router.Part02 do
       defp do_get_with_file_ref(ctx, key, validate_blob_ref?) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
 
-        case ets_get_full(ctx, idx, keydir, key, now) do
+        case ets_get_full(ctx, idx, keydir, key, expiry_context) do
           {:hit, value, lfu} ->
             sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
             {:hot, value}
@@ -61,7 +62,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                        keydir,
                        key,
                        {file_id, offset, value_size},
-                       now
+                       expiry_context
                      ) do
                   {:cold_ref, retry_path, value_offset, retry_size} ->
                     Stats.record_cold_read(ctx, key)
@@ -73,6 +74,9 @@ defmodule Ferricstore.Store.Router.Part02 do
                   :miss ->
                     record_keyspace_miss(ctx, key)
                     :miss
+
+                  {:error, {:storage_read_failed, _reason}} = failure ->
+                    failure
                 end
             end
 
@@ -95,7 +99,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now,
+                  expiry_context,
                   validate_blob_ref?
                 )
 
@@ -106,7 +110,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now,
+                  expiry_context,
                   validate_blob_ref?
                 )
             end
@@ -118,6 +122,9 @@ defmodule Ferricstore.Store.Router.Part02 do
 
           {:invalid, entry} ->
             ReadResult.failure({:invalid_keydir_entry, entry})
+
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
 
           :expired ->
             record_keyspace_miss(ctx, key)
@@ -390,6 +397,9 @@ defmodule Ferricstore.Store.Router.Part02 do
           {:invalid, entry} ->
             {:read_error, {:invalid_keydir_entry, entry}}
 
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
+
           :no_table ->
             {:read_error, :keydir_unavailable}
 
@@ -432,6 +442,9 @@ defmodule Ferricstore.Store.Router.Part02 do
           :miss ->
             record_keyspace_miss(ctx, key)
             :miss
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
         end
       end
 
@@ -455,7 +468,10 @@ defmodule Ferricstore.Store.Router.Part02 do
 
       # Like ets_get but returns file ref info for cold entries and LFU counter for hits.
       # Single lookup provides everything needed — no second ETS read for bookkeeping.
-      defp ets_get_full(ctx, idx, keydir, key, now) do
+      defp ets_get_full(ctx, idx, keydir, key, expiry_context) do
+        expiry_context = ExpiryContext.normalize(expiry_context)
+        now = ExpiryContext.now_ms(expiry_context)
+
         try do
           case :ets.lookup(keydir, key) do
             [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
@@ -497,9 +513,14 @@ defmodule Ferricstore.Store.Router.Part02 do
 
             [{^key, _value, exp, _lfu, _fid, _off, _vsize} = expired_entry]
             when is_integer(exp) and exp > 0 and exp <= now ->
-              delete_observed_keydir_entry(ctx, idx, keydir, expired_entry)
+              case ExpiryContext.classify(expiry_context, exp) do
+                {:unsafe, :hlc_drift_exceeded} ->
+                  :hlc_drift_exceeded
 
-              :expired
+                :expired ->
+                  delete_observed_keydir_entry(ctx, idx, keydir, expired_entry)
+                  :expired
+              end
 
             [entry] ->
               {:invalid, entry}
@@ -512,7 +533,10 @@ defmodule Ferricstore.Store.Router.Part02 do
         end
       end
 
-      defp ets_get_meta_full(ctx, idx, keydir, key, now) do
+      defp ets_get_meta_full(ctx, idx, keydir, key, expiry_context) do
+        expiry_context = ExpiryContext.normalize(expiry_context)
+        now = ExpiryContext.now_ms(expiry_context)
+
         try do
           case :ets.lookup(keydir, key) do
             [{^key, value, exp, lfu, _fid, _off, _vsize}]
@@ -537,9 +561,14 @@ defmodule Ferricstore.Store.Router.Part02 do
 
             [{^key, _value, exp, _lfu, _fid, _off, _vsize} = expired_entry]
             when is_integer(exp) and exp > 0 and exp <= now ->
-              delete_observed_keydir_entry(ctx, idx, keydir, expired_entry)
+              case ExpiryContext.classify(expiry_context, exp) do
+                {:unsafe, :hlc_drift_exceeded} ->
+                  :hlc_drift_exceeded
 
-              :expired
+                :expired ->
+                  delete_observed_keydir_entry(ctx, idx, keydir, expired_entry)
+                  :expired
+              end
 
             [entry] ->
               {:invalid, entry}
@@ -568,9 +597,9 @@ defmodule Ferricstore.Store.Router.Part02 do
       def get(ctx, key) do
         idx = shard_for(ctx, key)
         keydir = resolve_keydir(ctx, idx)
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
 
-        case ets_get_full(ctx, idx, keydir, key, now) do
+        case ets_get_full(ctx, idx, keydir, key, expiry_context) do
           {:hit, value, lfu} ->
             sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
             value
@@ -599,7 +628,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                        keydir,
                        key,
                        {file_id, offset, value_size},
-                       now,
+                       expiry_context,
                        failure
                      ) do
                   {:cold, value, retry_file_id, retry_offset} ->
@@ -644,7 +673,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now,
+                  expiry_context,
                   read_error
                 )
 
@@ -655,7 +684,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                   keydir,
                   key,
                   {file_id, offset, value_size},
-                  now,
+                  expiry_context,
                   read_error
                 )
             end
@@ -665,6 +694,9 @@ defmodule Ferricstore.Store.Router.Part02 do
 
           {:invalid, entry} ->
             ReadResult.failure({:invalid_keydir_entry, entry})
+
+          :hlc_drift_exceeded ->
+            ReadResult.failure(:hlc_drift_exceeded)
 
           :expired ->
             record_keyspace_miss(ctx, key)
@@ -743,10 +775,11 @@ defmodule Ferricstore.Store.Router.Part02 do
       def batch_get_bounded(ctx, keys, max_value_bytes)
           when is_list(keys) and is_integer(max_value_bytes) and max_value_bytes >= 0 do
         PublicationEpoch.read(ctx, publication_shards(ctx, keys), fn ->
-          read_plan = do_batch_get_with_file_refs(ctx, keys, 0, :bounded)
+          expiry_context = ExpiryContext.capture()
+          read_plan = do_batch_get_with_file_refs(ctx, keys, 0, :bounded, expiry_context)
 
           with {:ok, _planned_reads?} <- batch_get_preflight(read_plan, max_value_bytes) do
-            values = materialize_bounded_batch_values(read_plan)
+            values = materialize_bounded_batch_values(read_plan, expiry_context)
 
             case batch_get_preflight(values, max_value_bytes) do
               {:ok, _file_refs?} -> {:ok, values}
@@ -763,10 +796,11 @@ defmodule Ferricstore.Store.Router.Part02 do
       def batch_get_each_bounded(ctx, keys, max_value_bytes)
           when is_list(keys) and is_integer(max_value_bytes) and max_value_bytes >= 0 do
         PublicationEpoch.read(ctx, publication_shards(ctx, keys), fn ->
-          read_plan = do_batch_get_with_file_refs(ctx, keys, 0, :bounded)
+          expiry_context = ExpiryContext.capture()
+          read_plan = do_batch_get_with_file_refs(ctx, keys, 0, :bounded, expiry_context)
 
           with :ok <- batch_get_each_preflight(read_plan, max_value_bytes) do
-            values = materialize_bounded_batch_values(read_plan)
+            values = materialize_bounded_batch_values(read_plan, expiry_context)
 
             case batch_get_each_preflight(values, max_value_bytes) do
               :ok -> {:ok, values}
@@ -845,9 +879,7 @@ defmodule Ferricstore.Store.Router.Part02 do
       defp batch_get_preflight_value(value) when is_binary(value), do: {byte_size(value), false}
       defp batch_get_preflight_value(nil), do: {0, false}
 
-      defp materialize_bounded_batch_values(read_plan) do
-        now = HLC.now_ms()
-
+      defp materialize_bounded_batch_values(read_plan, expiry_context) do
         {cold_plans, blob_plans} =
           read_plan
           |> Enum.with_index()
@@ -872,9 +904,9 @@ defmodule Ferricstore.Store.Router.Part02 do
             {_value, _index} -> []
           end)
 
-        cold_results = materialize_bounded_cold_plans(Enum.reverse(cold_plans), now)
-        waraft_results = materialize_bounded_waraft_plans(waraft_plans)
-        blob_results = materialize_bounded_blob_plans(Enum.reverse(blob_plans), now)
+        cold_results = materialize_bounded_cold_plans(Enum.reverse(cold_plans), expiry_context)
+        waraft_results = materialize_bounded_waraft_plans(waraft_plans, expiry_context)
+        blob_results = materialize_bounded_blob_plans(Enum.reverse(blob_plans), expiry_context)
 
         read_plan
         |> Enum.with_index()
@@ -902,11 +934,11 @@ defmodule Ferricstore.Store.Router.Part02 do
         indexes |> Enum.zip(values) |> Map.new()
       end
 
-      defp materialize_bounded_waraft_plans([]), do: %{}
+      defp materialize_bounded_waraft_plans([], _expiry_context), do: %{}
 
-      defp materialize_bounded_waraft_plans(indexed_entries) do
+      defp materialize_bounded_waraft_plans(indexed_entries, expiry_context) do
         {indexes, entries} = Enum.unzip(indexed_entries)
-        values = read_waraft_segment_batch_materialized(entries)
+        values = read_waraft_segment_batch_materialized(entries, expiry_context)
         indexes |> Enum.zip(values) |> Map.new()
       end
 
@@ -964,7 +996,7 @@ defmodule Ferricstore.Store.Router.Part02 do
       end
 
       defp do_batch_get(ctx, keys, byte_limit, fixed_shard_index) do
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
         bookkeeping = hot_read_bookkeeping_start(ctx)
 
         plan =
@@ -983,7 +1015,7 @@ defmodule Ferricstore.Store.Router.Part02 do
 
               {result, cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping,
                value_bytes} =
-                case ets_get_full(ctx, idx, keydir, key, now) do
+                case ets_get_full(ctx, idx, keydir, key, expiry_context) do
                   {:hit, value, lfu} ->
                     bookkeeping = hot_read_bookkeeping_add(bookkeeping, keydir, key, lfu)
 
@@ -1013,6 +1045,12 @@ defmodule Ferricstore.Store.Router.Part02 do
 
                   {:invalid, entry} ->
                     failure = ReadResult.failure({:invalid_keydir_entry, entry})
+
+                    {{:value, failure}, cold_entries, cold_count, waraft_entries, waraft_count,
+                     bookkeeping, 0}
+
+                  :hlc_drift_exceeded ->
+                    failure = ReadResult.failure(:hlc_drift_exceeded)
 
                     {{:value, failure}, cold_entries, cold_count, waraft_entries, waraft_count,
                      bookkeeping, 0}
@@ -1060,13 +1098,13 @@ defmodule Ferricstore.Store.Router.Part02 do
             cold_values =
               cold_entries
               |> Enum.reverse()
-              |> read_cold_batch_async(now)
+              |> read_cold_batch_async(expiry_context)
               |> List.to_tuple()
 
             waraft_values =
               waraft_entries
               |> Enum.reverse()
-              |> read_waraft_segment_batch_materialized()
+              |> read_waraft_segment_batch_materialized(expiry_context)
               |> List.to_tuple()
 
             values =
@@ -1110,7 +1148,7 @@ defmodule Ferricstore.Store.Router.Part02 do
               binary() | nil
             ]
       def batch_get_on_route_keys(ctx, route_lookup_pairs) do
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
         bookkeeping = hot_read_bookkeeping_start(ctx)
 
         {results, bookkeeping} =
@@ -1119,13 +1157,16 @@ defmodule Ferricstore.Store.Router.Part02 do
             idx = shard_for(ctx, route_key)
             keydir = resolve_keydir(ctx, idx)
 
-            case ets_get_full(ctx, idx, keydir, lookup_key, now) do
+            case ets_get_full(ctx, idx, keydir, lookup_key, expiry_context) do
               {:hit, value, lfu} ->
                 bookkeeping = hot_read_bookkeeping_add(bookkeeping, keydir, lookup_key, lfu)
                 {value, bookkeeping}
 
               {:cold, _file_id, _offset, _value_size} ->
                 {routed_get_fallback(ctx, idx, lookup_key), bookkeeping}
+
+              :hlc_drift_exceeded ->
+                {ReadResult.failure(:hlc_drift_exceeded), bookkeeping}
 
               :expired ->
                 record_keyspace_miss(ctx, lookup_key)
@@ -1177,14 +1218,34 @@ defmodule Ferricstore.Store.Router.Part02 do
       pread path.
       """
       @spec batch_get_with_file_refs(FerricStore.Instance.t(), [binary()], non_neg_integer()) :: [
-              binary() | nil | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}
+              binary()
+              | nil
+              | {:file_ref, binary(), non_neg_integer(), non_neg_integer()}
+              | ReadResult.failure()
             ]
       def batch_get_with_file_refs(ctx, keys, min_file_ref_size) do
         do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, true)
       end
 
       defp do_batch_get_with_file_refs(ctx, keys, min_file_ref_size, validate_blob_ref?) do
-        now = HLC.now_ms()
+        expiry_context = ExpiryContext.capture()
+
+        do_batch_get_with_file_refs(
+          ctx,
+          keys,
+          min_file_ref_size,
+          validate_blob_ref?,
+          expiry_context
+        )
+      end
+
+      defp do_batch_get_with_file_refs(
+             ctx,
+             keys,
+             min_file_ref_size,
+             validate_blob_ref?,
+             expiry_context
+           ) do
         bookkeeping = hot_read_bookkeeping_start(ctx)
 
         {results, {cold_entries, _cold_count, waraft_entries, _waraft_count, bookkeeping}} =
@@ -1195,7 +1256,7 @@ defmodule Ferricstore.Store.Router.Part02 do
             idx = shard_for(ctx, key)
             keydir = resolve_keydir(ctx, idx)
 
-            case ets_get_full(ctx, idx, keydir, key, now) do
+            case ets_get_full(ctx, idx, keydir, key, expiry_context) do
               {:hit, value, lfu} ->
                 bookkeeping = hot_read_bookkeeping_add(bookkeeping, keydir, key, lfu)
 
@@ -1221,7 +1282,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                   waraft_entries,
                   waraft_count,
                   bookkeeping,
-                  now,
+                  expiry_context,
                   validate_blob_ref?
                 )
 
@@ -1251,6 +1312,12 @@ defmodule Ferricstore.Store.Router.Part02 do
                 {{:value, failure},
                  {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
 
+              :hlc_drift_exceeded ->
+                failure = ReadResult.failure(:hlc_drift_exceeded)
+
+                {{:value, failure},
+                 {cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping}}
+
               :expired ->
                 record_keyspace_miss(ctx, key)
 
@@ -1276,7 +1343,11 @@ defmodule Ferricstore.Store.Router.Part02 do
         cold_values =
           cold_entries
           |> Enum.reverse()
-          |> read_cold_batch_file_ref_async(now, min_file_ref_size, validate_blob_ref?)
+          |> read_cold_batch_file_ref_async(
+            expiry_context,
+            min_file_ref_size,
+            validate_blob_ref?
+          )
           |> List.to_tuple()
 
         waraft_values =
@@ -1284,7 +1355,8 @@ defmodule Ferricstore.Store.Router.Part02 do
           |> Enum.reverse()
           |> read_waraft_segment_batch_file_ref_or_materialized(
             min_file_ref_size,
-            validate_blob_ref?
+            validate_blob_ref?,
+            expiry_context
           )
           |> List.to_tuple()
 

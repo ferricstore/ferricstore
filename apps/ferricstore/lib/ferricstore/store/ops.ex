@@ -137,6 +137,7 @@ defmodule Ferricstore.Store.Ops do
           case ShardETS.ets_lookup_metadata(tx.shard_state, key) do
             {:live, {^key, _value, exp, _lfu, _fid, _off, _vsize}, _location} -> exp
             {:error, :invalid_keydir_entry} -> ReadResult.failure(:invalid_keydir_entry)
+            {:error, {:storage_read_failed, _reason}} = failure -> failure
             :expired -> nil
             :miss -> nil
           end
@@ -194,6 +195,9 @@ defmodule Ferricstore.Store.Ops do
               {:error, :invalid_keydir_entry} ->
                 ReadResult.failure(:invalid_keydir_entry)
 
+              {:error, {:storage_read_failed, _reason}} = failure ->
+                failure
+
               :expired ->
                 nil
 
@@ -244,6 +248,9 @@ defmodule Ferricstore.Store.Ops do
           {:error, :invalid_keydir_entry} ->
             ReadResult.failure(:invalid_keydir_entry)
 
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            failure
+
           :expired ->
             nil
 
@@ -288,6 +295,9 @@ defmodule Ferricstore.Store.Ops do
 
               {:error, :invalid_keydir_entry} ->
                 ReadResult.failure(:invalid_keydir_entry)
+
+              {:error, {:storage_read_failed, _reason}} = failure ->
+                failure
 
               _ ->
                 nil

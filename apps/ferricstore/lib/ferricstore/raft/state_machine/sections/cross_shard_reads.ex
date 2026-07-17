@@ -14,6 +14,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -171,17 +172,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
       defp sm_tx_pending_meta(key) do
         pending = Process.get(:tx_pending_values, %{})
+        expiry_context = ExpiryContext.capture()
 
         case Map.get(pending, key) do
-          {value, 0} ->
-            {value, 0}
+          {value, exp} when is_integer(exp) and exp >= 0 ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live ->
+                {value, exp}
 
-          {value, exp} ->
-            if exp > apply_now_ms() do
-              {value, exp}
-            else
-              sm_tx_drop_pending(key)
-              nil
+              :expired ->
+                sm_tx_drop_pending(key)
+                nil
+
+              {:unsafe, reason} ->
+                record_state_read_failure(reason)
+                nil
             end
 
           nil ->
@@ -215,6 +220,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
       defp sm_merge_tx_pending_prefix(results, prefix) do
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
+        expiry_context = ExpiryContext.capture()
         prefix_len = byte_size(prefix)
 
         base =
@@ -225,17 +231,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         Process.get(:tx_pending_values, %{})
         |> Enum.reduce(base, fn
           {key, {value, exp}}, acc when is_binary(key) and byte_size(key) >= prefix_len ->
-            if String.starts_with?(key, prefix) and not MapSet.member?(deleted, key) and
-                 (exp == 0 or exp > apply_now_ms()) do
-              field =
-                case :binary.split(key, <<0>>) do
-                  [_pre, sub] -> sub
-                  _ -> key
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live ->
+                if String.starts_with?(key, prefix) and not MapSet.member?(deleted, key) do
+                  field =
+                    case :binary.split(key, <<0>>) do
+                      [_pre, sub] -> sub
+                      _ -> key
+                    end
+
+                  Map.put(acc, field, value)
+                else
+                  acc
                 end
 
-              Map.put(acc, field, value)
-            else
-              acc
+              :expired ->
+                acc
+
+              {:unsafe, reason} ->
+                record_state_read_failure(reason)
+                acc
             end
 
           _other, acc ->
@@ -251,28 +266,45 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       end
 
       defp cross_shard_ets_exists?(ctx, key) do
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
         try do
           case :ets.lookup(ctx.keydir, key) do
-            [{^key, value, exp, _lfu, _fid, _off, _vsize}]
-            when value != nil and (exp == 0 or exp > now) ->
-              true
+            [{^key, value, exp, _lfu, _fid, _off, _vsize} = entry]
+            when value != nil and is_integer(exp) and exp >= 0 ->
+              case ExpiryContext.classify(expiry_context, exp) do
+                :live ->
+                  true
 
-            [{^key, nil, exp, _lfu, fid, off, vsize}]
-            when (exp == 0 or exp > now) and
-                   (valid_cold_location(fid, off, vsize) or
-                      valid_waraft_segment_location(fid, off, vsize)) ->
-              true
+                :expired ->
+                  cross_shard_delete_keydir_entry(ctx, entry)
+                  false
 
-            [{^key, value, exp, _lfu, _fid, _off, _vsize}]
-            when exp != 0 and exp <= now ->
-              cross_shard_delete_keydir_entry(ctx, key, value)
-              false
+                {:unsafe, reason} ->
+                  record_state_read_failure(reason)
+                  false
+              end
 
-            [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
-              record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
-              false
+            [{^key, nil, exp, _lfu, fid, off, vsize} = entry]
+            when is_integer(exp) and exp >= 0 ->
+              case ExpiryContext.classify(expiry_context, exp) do
+                :live
+                when valid_cold_location(fid, off, vsize) or
+                       valid_waraft_segment_location(fid, off, vsize) ->
+                  true
+
+                :live ->
+                  record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                  false
+
+                :expired ->
+                  cross_shard_delete_keydir_entry(ctx, entry)
+                  false
+
+                {:unsafe, reason} ->
+                  record_state_read_failure(reason)
+                  false
+              end
 
             _ ->
               false
@@ -286,46 +318,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       end
 
       defp cross_shard_ets_read_from_path(ctx, key, data_path) do
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
         try do
           case :ets.lookup(ctx.keydir, key) do
-            [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-              value
+            [{^key, value, exp, _lfu, fid, off, vsize} = entry]
+            when is_integer(exp) and exp >= 0 ->
+              case ExpiryContext.classify(expiry_context, exp) do
+                :live ->
+                  cross_shard_live_value(ctx, data_path, key, value, fid, off, vsize)
 
-            [{^key, nil, 0, _lfu, fid, off, vsize}]
-            when valid_cold_location(fid, off, vsize) or
-                   valid_waraft_segment_location(fid, off, vsize) ->
-              case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
-                {:ok, v} when is_binary(v) -> materialize_cross_shard_cold_value(ctx, v)
-                {:ok, invalid} -> record_cross_shard_read_failure({:invalid_value, invalid})
-                {:error, reason} -> record_cross_shard_read_failure(reason)
-                :not_found -> record_cross_shard_read_failure(:not_found)
-                invalid -> record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
+                :expired ->
+                  cross_shard_delete_keydir_entry(ctx, entry)
+                  nil
+
+                {:unsafe, reason} ->
+                  record_state_read_failure(reason)
+                  nil
               end
-
-            [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-              value
-
-            [{^key, nil, exp, _lfu, fid, off, vsize}]
-            when exp > now and
-                   (valid_cold_location(fid, off, vsize) or
-                      valid_waraft_segment_location(fid, off, vsize)) ->
-              case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
-                {:ok, v} when is_binary(v) -> materialize_cross_shard_cold_value(ctx, v)
-                {:ok, invalid} -> record_cross_shard_read_failure({:invalid_value, invalid})
-                {:error, reason} -> record_cross_shard_read_failure(reason)
-                :not_found -> record_cross_shard_read_failure(:not_found)
-                invalid -> record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
-              end
-
-            [{^key, nil, exp, _lfu, _fid, _off, _vsize}]
-            when exp != 0 and exp <= now ->
-              cross_shard_delete_keydir_entry(ctx, key, nil)
-              nil
-
-            [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
-              record_cross_shard_read_failure({:invalid_cold_location, {fid, off, vsize}})
 
             _ ->
               nil
@@ -336,6 +346,36 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             record_state_read_failure(:keydir_unavailable)
             nil
         end
+      end
+
+      defp cross_shard_live_value(_ctx, _data_path, _key, value, _fid, _off, _vsize)
+           when value != nil,
+           do: value
+
+      defp cross_shard_live_value(ctx, data_path, key, nil, fid, off, vsize)
+           when valid_cold_location(fid, off, vsize) or
+                  valid_waraft_segment_location(fid, off, vsize) do
+        case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
+          {:ok, value} when is_binary(value) ->
+            materialize_cross_shard_cold_value(ctx, value)
+
+          {:ok, invalid} ->
+            record_cross_shard_read_failure({:invalid_value, invalid})
+
+          {:error, reason} ->
+            record_cross_shard_read_failure(reason)
+
+          :not_found ->
+            record_cross_shard_read_failure(:not_found)
+
+          invalid ->
+            record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
+        end
+      end
+
+      defp cross_shard_live_value(_ctx, _data_path, _key, nil, fid, off, vsize) do
+        record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+        nil
       end
 
       # Reads value + expire_at_ms from a shard's keydir ETS table.
@@ -376,46 +416,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       defp cross_shard_read_cold_value(_ctx, _data_path, _key, _fid, _off, _value_size), do: :miss
 
       defp cross_shard_ets_read_meta_from_path(ctx, key, data_path) do
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
         try do
           case :ets.lookup(ctx.keydir, key) do
-            [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-              {value, 0}
+            [{^key, value, exp, _lfu, fid, off, vsize} = entry]
+            when is_integer(exp) and exp >= 0 ->
+              case ExpiryContext.classify(expiry_context, exp) do
+                :live ->
+                  case cross_shard_live_value(ctx, data_path, key, value, fid, off, vsize) do
+                    nil -> nil
+                    materialized -> {materialized, exp}
+                  end
 
-            [{^key, nil, 0, _lfu, fid, off, vsize}]
-            when valid_cold_location(fid, off, vsize) or
-                   valid_waraft_segment_location(fid, off, vsize) ->
-              case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
-                {:ok, v} when is_binary(v) -> {materialize_cross_shard_cold_value(ctx, v), 0}
-                {:ok, invalid} -> record_cross_shard_read_failure({:invalid_value, invalid})
-                {:error, reason} -> record_cross_shard_read_failure(reason)
-                :not_found -> record_cross_shard_read_failure(:not_found)
-                invalid -> record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
+                :expired ->
+                  cross_shard_delete_keydir_entry(ctx, entry)
+                  nil
+
+                {:unsafe, reason} ->
+                  record_state_read_failure(reason)
+                  nil
               end
-
-            [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-              {value, exp}
-
-            [{^key, nil, exp, _lfu, fid, off, vsize}]
-            when exp > now and
-                   (valid_cold_location(fid, off, vsize) or
-                      valid_waraft_segment_location(fid, off, vsize)) ->
-              case cross_shard_read_cold_value(ctx, data_path, key, fid, off, vsize) do
-                {:ok, v} when is_binary(v) -> {materialize_cross_shard_cold_value(ctx, v), exp}
-                {:ok, invalid} -> record_cross_shard_read_failure({:invalid_value, invalid})
-                {:error, reason} -> record_cross_shard_read_failure(reason)
-                :not_found -> record_cross_shard_read_failure(:not_found)
-                invalid -> record_cross_shard_read_failure({:invalid_cold_read_result, invalid})
-              end
-
-            [{^key, nil, exp, _lfu, _fid, _off, _vsize}]
-            when exp != 0 and exp <= now ->
-              cross_shard_delete_keydir_entry(ctx, key, nil)
-              nil
-
-            [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
-              record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
 
             _ ->
               nil
@@ -433,7 +454,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       end
 
       defp cross_shard_prefix_scan_from_path(ctx, prefix, data_path) do
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
         prefix_len = byte_size(prefix)
 
         ms = [
@@ -450,27 +471,36 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             :ets.select(ctx.keydir, ms)
             |> Enum.reduce({[], [], 0}, fn {key, value, exp, fid, off, vsize},
                                            {tokens, cold_entries, cold_count} ->
-              cond do
-                exp != 0 and exp <= now ->
+              case ExpiryContext.classify(expiry_context, exp) do
+                :live ->
+                  cond do
+                    value == nil and
+                        not valid_cross_shard_cold_location_value?(fid, off, vsize) ->
+                      record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                      {tokens, cold_entries, cold_count}
+
+                    value == nil and valid_cold_location(fid, off, vsize) ->
+                      field = sm_prefix_field(key)
+                      path = sm_file_path_from_path(data_path, fid)
+                      entry = {field, key, {:bitcask, path, off}}
+                      {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
+
+                    value == nil and valid_waraft_segment_location(fid, off, vsize) ->
+                      field = sm_prefix_field(key)
+                      entry = {field, key, {:waraft, fid}}
+                      {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
+
+                    true ->
+                      {[{:value, {sm_prefix_field(key), value}} | tokens], cold_entries,
+                       cold_count}
+                  end
+
+                :expired ->
                   {tokens, cold_entries, cold_count}
 
-                value == nil and not valid_cross_shard_cold_location_value?(fid, off, vsize) ->
-                  record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                {:unsafe, reason} ->
+                  record_state_read_failure(reason)
                   {tokens, cold_entries, cold_count}
-
-                value == nil and valid_cold_location(fid, off, vsize) ->
-                  field = sm_prefix_field(key)
-                  path = sm_file_path_from_path(data_path, fid)
-                  entry = {field, key, {:bitcask, path, off}}
-                  {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
-
-                value == nil and valid_waraft_segment_location(fid, off, vsize) ->
-                  field = sm_prefix_field(key)
-                  entry = {field, key, {:waraft, fid}}
-                  {[{:cold, cold_count} | tokens], [entry | cold_entries], cold_count + 1}
-
-                true ->
-                  {[{:value, {sm_prefix_field(key), value}} | tokens], cold_entries, cold_count}
               end
             end)
 
@@ -732,7 +762,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
       end
 
       defp cross_shard_ets_batch_read_meta_from_path(ctx, keys, data_path) do
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
         {warm_results, cold_reads} =
           keys
@@ -743,7 +773,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
                 {Map.put(results, index, {value, exp}), cold}
 
               nil ->
-                cross_shard_collect_batch_ets(ctx, key, index, data_path, now, results, cold)
+                cross_shard_collect_batch_ets(
+                  ctx,
+                  key,
+                  index,
+                  data_path,
+                  expiry_context,
+                  results,
+                  cold
+                )
             end
           end)
 
@@ -754,44 +792,53 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         |> Enum.map(fn {_key, index} -> Map.get(results, index) end)
       end
 
-      defp cross_shard_collect_batch_ets(ctx, key, index, data_path, now, results, cold) do
+      defp cross_shard_collect_batch_ets(
+             ctx,
+             key,
+             index,
+             data_path,
+             expiry_context,
+             results,
+             cold
+           ) do
         case :ets.lookup(ctx.keydir, key) do
-          [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-            {Map.put(results, index, {value, 0}), cold}
+          [{^key, value, exp, _lfu, _fid, _off, _vsize} = entry]
+          when value != nil and is_integer(exp) and exp >= 0 ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live ->
+                {Map.put(results, index, {value, exp}), cold}
 
-          [{^key, nil, 0, _lfu, fid, off, vsize}]
-          when valid_cold_location(fid, off, vsize) ->
-            path = sm_file_path_from_path(data_path, fid)
-            {results, [{index, key, {:bitcask, path, off}, 0} | cold]}
+              :expired ->
+                cross_shard_delete_keydir_entry(ctx, entry)
+                {results, cold}
 
-          [{^key, nil, 0, _lfu, fid, off, vsize}]
-          when valid_waraft_segment_location(fid, off, vsize) ->
-            {results, [{index, key, {:waraft, fid}, 0} | cold]}
+              {:unsafe, reason} ->
+                record_state_read_failure(reason)
+                {results, cold}
+            end
 
-          [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-            {Map.put(results, index, {value, exp}), cold}
+          [{^key, nil, exp, _lfu, fid, off, vsize} = entry]
+          when is_integer(exp) and exp >= 0 ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live when valid_cold_location(fid, off, vsize) ->
+                path = sm_file_path_from_path(data_path, fid)
+                {results, [{index, key, {:bitcask, path, off}, exp} | cold]}
 
-          [{^key, nil, exp, _lfu, fid, off, vsize}]
-          when exp > now and valid_cold_location(fid, off, vsize) ->
-            path = sm_file_path_from_path(data_path, fid)
-            {results, [{index, key, {:bitcask, path, off}, exp} | cold]}
+              :live when valid_waraft_segment_location(fid, off, vsize) ->
+                {results, [{index, key, {:waraft, fid}, exp} | cold]}
 
-          [{^key, nil, exp, _lfu, fid, off, vsize}]
-          when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
-            {results, [{index, key, {:waraft, fid}, exp} | cold]}
+              :live ->
+                record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                {results, cold}
 
-          [{^key, value, exp, _lfu, _fid, _off, _vsize}]
-          when exp != 0 and exp <= now ->
-            cross_shard_delete_keydir_entry(ctx, key, value)
-            {results, cold}
+              :expired ->
+                cross_shard_delete_keydir_entry(ctx, entry)
+                {results, cold}
 
-          [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
-            record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
-            {results, cold}
-
-          [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-            cross_shard_delete_keydir_entry(ctx, key, nil)
-            {results, cold}
+              {:unsafe, reason} ->
+                record_state_read_failure(reason)
+                {results, cold}
+            end
 
           _ ->
             {results, cold}
@@ -1100,7 +1147,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
 
       defp cross_shard_prefix_count(ctx, prefix) do
         prefix_len = byte_size(prefix)
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
         ms = [
           {{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
@@ -1114,18 +1161,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         try do
           :ets.select(ctx.keydir, ms)
           |> Enum.reduce(0, fn {value, exp, fid, off, vsize}, count ->
-            cond do
-              exp != 0 and exp <= now ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live ->
+                cond do
+                  value != nil ->
+                    count + 1
+
+                  valid_cross_shard_cold_location_value?(fid, off, vsize) ->
+                    count + 1
+
+                  true ->
+                    record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                    count
+                end
+
+              :expired ->
                 count
 
-              value != nil ->
-                count + 1
-
-              valid_cross_shard_cold_location_value?(fid, off, vsize) ->
-                count + 1
-
-              true ->
-                record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+              {:unsafe, reason} ->
+                record_state_read_failure(reason)
                 count
             end
           end)

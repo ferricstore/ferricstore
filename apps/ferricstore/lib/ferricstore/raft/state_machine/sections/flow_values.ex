@@ -1156,7 +1156,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
 
         case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok -> do_put_blob_ref(state, key, encoded_ref, expire_at_ms)
-          {:error, :key_locked} -> {:error, :key_locked}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -1165,7 +1165,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
 
         case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok -> do_put_blob_ref_ref_only(state, key, encoded_ref, expire_at_ms)
-          {:error, :key_locked} -> {:error, :key_locked}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -1189,7 +1189,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
 
         case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok -> do_set_blob_ref(state, key, encoded_ref, expire_at_ms, opts)
-          {:error, :key_locked} -> {:error, :key_locked}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -1305,8 +1305,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
           :ok ->
             do_compound_put_blob_ref(state, redis_key, compound_key, encoded_ref, expire_at_ms)
 
-          {:error, :key_locked} ->
-            {:error, :key_locked}
+          {:error, _reason} = error ->
+            error
         end
       end
     end

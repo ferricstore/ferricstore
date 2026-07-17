@@ -32,6 +32,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         ColdRead,
         CompoundKey,
         ExpiryTracker,
+        Keydir,
         LFU,
         ListOps,
         Promotion,
@@ -51,16 +52,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           offset >= 0 and is_integer(value_size) and value_size >= 0
       end
 
-      defp cross_shard_delete_keydir_entry(ctx, key, value) do
-        ref = keydir_binary_ref(ctx)
+      defp cross_shard_delete_keydir_entry(
+             ctx,
+             {key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size} = entry
+           ) do
+        if Keydir.delete_exact(ctx.keydir, entry) do
+          ref = keydir_binary_ref(ctx)
 
-        if ref do
-          bytes = binary_byte_size(key) + binary_byte_size(value)
-          if bytes > 0, do: :atomics.sub(ref, ctx.index + 1, bytes)
+          if ref do
+            bytes = binary_byte_size(key) + binary_byte_size(value)
+            if bytes > 0, do: :atomics.sub(ref, ctx.index + 1, bytes)
+          end
+
+          true
+        else
+          false
         end
-
-        :ets.delete(ctx.keydir, key)
       end
+
+      @doc false
+      def __cross_shard_delete_keydir_entry_for_test__(ctx, entry),
+        do: cross_shard_delete_keydir_entry(ctx, entry)
 
       defp parse_fid_from_path(path) do
         path
@@ -288,7 +300,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
         case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok -> do_put(state, key, value, expire_at_ms)
-          {:error, :key_locked} -> {:error, :key_locked}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -317,7 +329,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
         case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok -> do_set(state, key, value, expire_at_ms, opts)
-          {:error, :key_locked} -> {:error, :key_locked}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -330,7 +342,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
         case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok -> do_delete(state, key)
-          {:error, :key_locked} -> {:error, :key_locked}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -359,8 +371,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
               build_compound_store(state)
             )
 
-          {:error, :key_locked} ->
-            {:error, :key_locked}
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -369,7 +381,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
         case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok -> do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
-          {:error, :key_locked} -> {:error, :key_locked}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -389,8 +401,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           :ok ->
             apply_hset_single(state, key, field, value)
 
-          {:error, :key_locked} ->
-            {:error, :key_locked}
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -450,8 +462,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           :ok ->
             apply_list_push_single(state, key, value, :left)
 
-          {:error, :key_locked} ->
-            {:error, :key_locked}
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -460,8 +472,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           :ok ->
             apply_list_push_single(state, key, value, :right)
 
-          {:error, :key_locked} ->
-            {:error, :key_locked}
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -608,8 +620,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
               build_compound_store(state)
             )
 
-          {:error, :key_locked} ->
-            {:error, :key_locked}
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -618,8 +630,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           :ok ->
             apply_srem_single(state, key, member)
 
-          {:error, :key_locked} ->
-            {:error, :key_locked}
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -628,8 +640,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           :ok ->
             apply_zadd_single(state, key, score, member)
 
-          {:error, :key_locked} ->
-            {:error, :key_locked}
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -638,8 +650,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
           :ok ->
             apply_zrem_single(state, key, member)
 
-          {:error, :key_locked} ->
-            {:error, :key_locked}
+          {:error, _reason} = error ->
+            error
         end
       end
 
@@ -694,8 +706,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
             :ok ->
               apply_zadd_single(state, key, score, member)
 
-            {:error, :key_locked} ->
-              {:error, :key_locked}
+            {:error, _reason} = error ->
+              error
           end
         end)
       end
@@ -859,7 +871,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
         case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok -> do_compound_delete(state, redis_key, compound_key)
-          {:error, :key_locked} -> {:error, :key_locked}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -875,7 +887,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
         case check_fetch_or_compute_lock(state, redis_key, nil) do
           :ok -> do_compound_delete_prefix(state, redis_key, prefix)
-          {:error, :key_locked} -> {:error, :key_locked}
+          {:error, _reason} = error -> error
         end
       end
 
@@ -985,10 +997,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
       defp apply_single(state, {:tx_execute, queue, sandbox_namespace, watched_keys})
            when is_list(queue) and is_map(watched_keys) do
-        if transaction_watches_clean?(watched_keys, state) do
-          do_tx_execute(state, queue, sandbox_namespace)
-        else
-          nil
+        case transaction_watches_clean?(watched_keys, state) do
+          :clean -> do_tx_execute(state, queue, sandbox_namespace)
+          :changed -> nil
+          {:error, reason} -> {:error, {:state_read_failed, reason}}
         end
       end
 
@@ -1454,7 +1466,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
               case check_fetch_or_compute_lock(state, redis_key, nil) do
                 :ok -> do_put(state, key, value, expire_at_ms)
-                {:error, :key_locked} -> {:error, :key_locked}
+                {:error, _reason} = error -> error
               end
             end)
         end
@@ -1471,7 +1483,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
 
               case check_fetch_or_compute_lock(state, redis_key, nil) do
                 :ok -> do_put_blob_ref_ref_only_validated(state, key, encoded_ref, expire_at_ms)
-                {:error, :key_locked} -> {:error, :key_locked}
+                {:error, _reason} = error -> error
               end
           end)
         end

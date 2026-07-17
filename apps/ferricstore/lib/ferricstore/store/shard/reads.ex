@@ -2,8 +2,8 @@ defmodule Ferricstore.Store.Shard.Reads do
   @moduledoc "Shard read-path handlers: ETS hot lookup, cold-key pread from Bitcask, exists check, and key enumeration."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Flow.InternalKey
-  alias Ferricstore.HLC
   alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
@@ -45,6 +45,9 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       {:error, :invalid_keydir_entry} ->
         {:reply, @invalid_keydir_failure, state}
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        {:reply, failure, state}
 
       {:cold, fid, off, vsize, exp} ->
         case read_cold_raw(state, fid, off, key) do
@@ -209,7 +212,11 @@ defmodule Ferricstore.Store.Shard.Reads do
       timeout_ms ->
         parent = self()
         job_ref = make_ref()
-        read_state = get_many_read_state(state)
+
+        read_state =
+          state
+          |> get_many_read_state()
+          |> Map.put(:expiry_context, ExpiryContext.capture())
 
         {pid, monitor_ref} =
           spawn_monitor(fn ->
@@ -361,7 +368,7 @@ defmodule Ferricstore.Store.Shard.Reads do
       keys
       |> Enum.with_index()
       |> Enum.reduce({%{}, [], []}, fn {key, index}, {results, file_reads, segment_reads} ->
-        case ShardETS.ets_lookup(state, key) do
+        case ShardETS.ets_lookup(state, key, state.expiry_context) do
           {:hit, value, _expire_at_ms} ->
             {Map.put(results, index, value), file_reads, segment_reads}
 
@@ -373,6 +380,9 @@ defmodule Ferricstore.Store.Shard.Reads do
 
           {:error, :invalid_keydir_entry} ->
             {Map.put(results, index, @invalid_keydir_failure), file_reads, segment_reads}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            {Map.put(results, index, failure), file_reads, segment_reads}
 
           {:cold, fid, off, vsize, exp}
           when valid_waraft_segment_location(fid, off, vsize) ->
@@ -528,6 +538,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:error, :invalid_keydir_entry} ->
         {:reply, @invalid_keydir_failure, state}
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        {:reply, failure, state}
+
       {:cold, fid, off, vsize, exp} when valid_waraft_segment_location(fid, off, vsize) ->
         case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
@@ -572,6 +585,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:error, :invalid_keydir_entry} ->
         {:reply, @invalid_keydir_failure, state}
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        {:reply, failure, state}
+
       {:cold, fid, off, vsize, _exp} when valid_waraft_segment_location(fid, off, vsize) ->
         {:reply, nil, state}
 
@@ -602,6 +618,9 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       {:error, :invalid_keydir_entry} ->
         {:reply, @invalid_keydir_failure, state}
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        {:reply, failure, state}
 
       {:cold, fid, off, vsize, exp} ->
         case read_cold_raw(state, fid, off, key) do
@@ -637,6 +656,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:error, :invalid_keydir_entry} ->
         {:reply, @invalid_keydir_failure, state}
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        {:reply, failure, state}
+
       {:cold, fid, off, vsize, exp} when valid_waraft_segment_location(fid, off, vsize) ->
         case read_cold_raw(state, fid, off, key) do
           {:ok, value} when is_binary(value) ->
@@ -660,7 +682,8 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  @spec handle_exists(binary(), map()) :: {:reply, boolean(), map()}
+  @spec handle_exists(binary(), map()) ::
+          {:reply, boolean() | ReadResult.failure(), map()}
   @doc false
   def handle_exists(key, state) do
     case ShardETS.ets_lookup(state, key) do
@@ -677,6 +700,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:error, :invalid_keydir_entry} ->
         {:reply, true, state}
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        {:reply, failure, state}
+
       :miss ->
         if ShardETS.pending_cold?(state, key) do
           {:reply, true, state}
@@ -686,7 +712,7 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  @spec handle_keys(map()) :: {:reply, [binary()], map()}
+  @spec handle_keys(map()) :: {:reply, [binary()] | ReadResult.failure(), map()}
   @doc false
   def handle_keys(state) do
     # ETS is the read model for live keys, including pending writes that have
@@ -723,6 +749,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:error, :invalid_keydir_entry} ->
         @invalid_keydir_failure
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
       :miss ->
         nil
     end
@@ -736,6 +765,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:cold, fid, off, vsize, _exp} ->
         p = ShardETS.file_path(state.shard_data_path, fid)
         validated_file_ref(p, off, key, vsize)
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
 
       _ ->
         nil
@@ -775,6 +807,9 @@ defmodule Ferricstore.Store.Shard.Reads do
       {:error, :invalid_keydir_entry} ->
         @invalid_keydir_failure
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
       :miss ->
         nil
     end
@@ -806,6 +841,9 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       {:error, :invalid_keydir_entry} ->
         ReadResult.failure(:invalid_keydir_entry)
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
     end
   end
 
@@ -923,26 +961,42 @@ defmodule Ferricstore.Store.Shard.Reads do
   defp blob_side_channel_threshold(%{instance_ctx: ctx}), do: BlobValue.threshold(ctx)
   defp blob_side_channel_threshold(_state), do: 0
 
-  @spec live_keys(map()) :: [binary()]
+  @spec live_keys(map()) :: [binary()] | ReadResult.failure()
   @doc false
   def live_keys(state) do
-    now = HLC.now_ms()
+    expiry_context = ExpiryContext.capture()
+    now = ExpiryContext.now_ms(expiry_context)
 
-    {live_keys, expired_entries} =
+    {live_keys, expired_entries, failure} =
       :ets.foldl(
         fn
-          {_key, _value, exp, _lfu, _fid, _off, _vsize} = entry, {live, expired}
-          when is_integer(exp) and exp > 0 and exp <= now ->
-            {live, [entry | expired]}
+          _entry, {live, expired, {:error, {:storage_read_failed, _reason}} = failure} ->
+            {live, expired, failure}
 
-          {key, _value, _exp, _lfu, _fid, _off, _vsize}, {live, expired} ->
-            {[key | live], expired}
+          {_key, _value, exp, _lfu, _fid, _off, _vsize} = entry, {live, expired, nil}
+          when is_integer(exp) and exp > 0 and exp <= now ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              {:unsafe, :hlc_drift_exceeded} ->
+                {live, expired, ReadResult.failure(:hlc_drift_exceeded)}
+
+              :expired ->
+                {live, [entry | expired], nil}
+            end
+
+          {key, _value, _exp, _lfu, _fid, _off, _vsize}, {live, expired, nil} ->
+            {[key | live], expired, nil}
         end,
-        {[], []},
+        {[], [], nil},
         state.keydir
       )
 
-    Enum.each(expired_entries, &ShardETS.delete_exact_entry(state, &1))
-    Enum.reject(live_keys, &InternalKey.internal?/1)
+    case failure do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
+      nil ->
+        Enum.each(expired_entries, &ShardETS.delete_exact_entry(state, &1))
+        Enum.reject(live_keys, &InternalKey.internal?/1)
+    end
   end
 end

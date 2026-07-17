@@ -33,9 +33,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   HLC timestamps are piggybacked on replicated commands. Submit paths stamp each
   log entry with the leader's current HLC timestamp before appending it.
-  When `apply/3` processes a command carrying an `hlc_ts` metadata map, it
+  When `apply/3` processes a command carrying HLC and wall-time metadata, it
   calls `HLC.update/1` to merge the leader's clock into the local node's HLC
-  and uses the stamped physical millisecond for TTL and lock expiry decisions.
+  and uses the immutable leader clock snapshot for TTL and lock-expiry decisions.
 
   In single-node mode this merge is a no-op (the node merges its own
   timestamp). In multi-node clusters, followers use this to stay
@@ -44,8 +44,9 @@ defmodule Ferricstore.Raft.StateMachine do
 
   Commands may arrive in two forms:
 
-    * **Wrapped**: `{inner_command, %{hlc_ts: {physical_ms, logical}}}` --
-      the metadata map carries the leader's HLC timestamp for merging.
+    * **Wrapped**:
+      `{inner_command, %{hlc_ts: {physical_ms, logical}, wall_time_ms: wall_ms}}` --
+      the metadata carries the leader's HLC and wall snapshot.
     * **Unwrapped**: ordinary commands that do not consume replicated Flow limits
       without HLC merging.
 

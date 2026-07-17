@@ -335,8 +335,7 @@ defmodule Ferricstore.Raft.ApplyContext do
      context.flow_hibernation_enabled, context.flow_hibernation_hot_window_ms,
      context.flow_hibernation_safety_margin_ms, context.flow_hibernation_promote_window_ms,
      context.flow_hibernation_late_promote_window_ms, context.flow_max_batch_items,
-     context.promotion_threshold,
-     context.compound_delete_member_budget, context.max_value_size}
+     context.promotion_threshold, context.compound_delete_member_budget, context.max_value_size}
   end
 
   @spec decode(term()) :: {:ok, t()} | {:error, :invalid_apply_context}
@@ -344,8 +343,8 @@ defmodule Ferricstore.Raft.ApplyContext do
         {:flow_apply_context_v1, retention_ttl_ms, history_hot, history_max, max_history_hot,
          max_history, cleanup_keys, cleanup_bytes, history_scan, value_scan, hibernation_enabled,
          hot_window_ms, safety_margin_ms, promote_window_ms, late_promote_window_ms,
-         flow_max_batch_items, promotion_threshold, compound_delete_member_budget,
-         max_value_size} = encoded
+         flow_max_batch_items, promotion_threshold, compound_delete_member_budget, max_value_size} =
+          encoded
       ) do
     context =
       new(
@@ -474,9 +473,16 @@ defmodule Ferricstore.Raft.ApplyContext do
     end
   end
 
-  defp context_command_shape?({inner, %{hlc_ts: {physical_ms, logical}}})
+  defp context_command_shape?(
+         {inner,
+          %{
+            hlc_ts: {physical_ms, logical},
+            wall_time_ms: wall_time_ms
+          }}
+       )
        when is_tuple(inner) and is_integer(physical_ms) and physical_ms >= 0 and
-              is_integer(logical) and logical >= 0,
+              is_integer(logical) and logical >= 0 and is_integer(wall_time_ms) and
+              wall_time_ms >= 0,
        do: true
 
   defp context_command_shape?(command)
@@ -486,11 +492,16 @@ defmodule Ferricstore.Raft.ApplyContext do
   defp context_command_shape?(_command), do: false
 
   defp wrap_sanitized_command(
-         {inner, %{hlc_ts: {physical_ms, logical}} = metadata} = command,
+         {inner,
+          %{
+            hlc_ts: {physical_ms, logical},
+            wall_time_ms: wall_time_ms
+          } = metadata} = command,
          context
        )
        when is_tuple(inner) and is_integer(physical_ms) and physical_ms >= 0 and
-              is_integer(logical) and logical >= 0 do
+              is_integer(logical) and logical >= 0 and is_integer(wall_time_ms) and
+              wall_time_ms >= 0 do
     case wrap_sanitized_command(inner, context) do
       ^inner -> command
       wrapped -> {wrapped, metadata}
@@ -578,11 +589,16 @@ defmodule Ferricstore.Raft.ApplyContext do
   end
 
   defp sanitize_reserved_wrappers(
-         {inner, %{hlc_ts: {physical_ms, logical}} = metadata} = command,
+         {inner,
+          %{
+            hlc_ts: {physical_ms, logical},
+            wall_time_ms: wall_time_ms
+          } = metadata} = command,
          context
        )
        when is_tuple(inner) and is_integer(physical_ms) and physical_ms >= 0 and
-              is_integer(logical) and logical >= 0 do
+              is_integer(logical) and logical >= 0 and is_integer(wall_time_ms) and
+              wall_time_ms >= 0 do
     case sanitize_reserved_wrappers(inner, context) do
       ^inner -> command
       sanitized -> {sanitized, metadata}
@@ -618,9 +634,16 @@ defmodule Ferricstore.Raft.ApplyContext do
   defp flow_command?({:flow_policy_fence, _installs, inner}), do: flow_command?(inner)
   defp flow_command?({:async, _origin, inner}), do: flow_command?(inner)
 
-  defp flow_command?({inner, %{hlc_ts: {physical_ms, logical}}})
+  defp flow_command?(
+         {inner,
+          %{
+            hlc_ts: {physical_ms, logical},
+            wall_time_ms: wall_time_ms
+          }}
+       )
        when is_tuple(inner) and is_integer(physical_ms) and physical_ms >= 0 and
-              is_integer(logical) and logical >= 0,
+              is_integer(logical) and logical >= 0 and is_integer(wall_time_ms) and
+              wall_time_ms >= 0,
        do: flow_command?(inner)
 
   defp flow_command?({:flow_shared_ref_write, _shard_index, inner}) when is_tuple(inner),

@@ -13,6 +13,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Raft.ApplyLimits
       alias Ferricstore.Flow
@@ -115,6 +116,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       defp apply_flow_single_with_telemetry(state, command_shape, attrs, fun) do
         item_count = flow_apply_item_count(attrs)
         started_at = System.monotonic_time()
+
         result =
           with :ok <- ApplyLimits.validate_flow_batch(state, attrs),
                :ok <- ApplyLimits.validate_flow_time(attrs, apply_now_ms()) do
@@ -483,10 +485,35 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
       defp apply_control_with_time(meta, state, fun) do
         with_apply_time(meta, fn ->
-          {new_state, result} = fun.()
-          old_count = state.applied_count
-          new_state = %{new_state | applied_count: old_count + 1}
-          maybe_release_cursor(meta, old_count, new_state, result)
+          previous_failure =
+            Process.get(:sm_state_read_failure, :__ferricstore_control_read_failure_unset__)
+
+          Process.put(:sm_state_read_failure, nil)
+
+          try do
+            {candidate_state, candidate_result} = fun.()
+
+            {new_state, result} =
+              case Process.get(:sm_state_read_failure) do
+                nil ->
+                  {candidate_state, candidate_result}
+
+                reason ->
+                  {state, {:error, {:state_read_failed, reason}}}
+              end
+
+            old_count = state.applied_count
+            new_state = %{new_state | applied_count: old_count + 1}
+            maybe_release_cursor(meta, old_count, new_state, result)
+          after
+            case previous_failure do
+              :__ferricstore_control_read_failure_unset__ ->
+                Process.delete(:sm_state_read_failure)
+
+              failure ->
+                Process.put(:sm_state_read_failure, failure)
+            end
+          end
         end)
       end
 
@@ -741,22 +768,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       end
 
       defp transaction_watches_clean?(watched_keys, _state) when map_size(watched_keys) == 0,
-        do: true
+        do: :clean
 
       defp transaction_watches_clean?(watched_keys, state) when is_map(watched_keys) do
         watched_keys
         |> Enum.sort_by(&elem(&1, 0))
         |> Enum.reduce_while(@transaction_watch_max_entries, fn {key, saved_token}, remaining ->
           if match?({:error, _reason}, saved_token) do
-            {:halt, false}
+            {:halt, :changed}
           else
             case transaction_watch_token_with_budget(state, key, remaining) do
               {:ok, ^saved_token, cost} -> {:cont, remaining - cost}
-              _changed_or_unavailable -> {:halt, false}
+              {:ok, _changed_token, _cost} -> {:halt, :changed}
+              {:error, reason} -> {:halt, {:error, reason}}
             end
           end
         end)
-        |> is_integer()
+        |> case do
+          remaining when is_integer(remaining) -> :clean
+          result -> result
+        end
       end
 
       defp transaction_watch_token(state, key) when is_binary(key) do
@@ -938,34 +969,39 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         if promoted_compound_path(state, redis_key, storage_key) == nil do
           transaction_storage_watch_token(state, storage_key, entry)
         else
-          if expire_at_ms != 0 and expire_at_ms <= apply_now_ms() do
-            :missing
-          else
-            case Ferricstore.Store.Shard.CompoundRevisionIndex.revision_token(
-                   Map.get(state, :compound_revision_index_name),
-                   storage_key
-                 ) do
-              {:ok, {epoch, revision}} ->
-                {:watch, {:dedicated_revision, epoch, revision}, expire_at_ms}
+          case ExpiryContext.classify(ExpiryContext.capture(), expire_at_ms) do
+            :expired ->
+              :missing
 
-              :missing ->
-                transaction_storage_watch_token(state, storage_key, entry)
+            {:unsafe, reason} ->
+              {:error, reason}
 
-              :unavailable ->
-                {:error, :watch_state_unavailable}
-            end
+            :live ->
+              case Ferricstore.Store.Shard.CompoundRevisionIndex.revision_token(
+                     Map.get(state, :compound_revision_index_name),
+                     storage_key
+                   ) do
+                {:ok, {epoch, revision}} ->
+                  {:watch, {:dedicated_revision, epoch, revision}, expire_at_ms}
+
+                :missing ->
+                  transaction_storage_watch_token(state, storage_key, entry)
+
+                :unavailable ->
+                  {:error, :watch_state_unavailable}
+              end
           end
         end
       end
 
       defp transaction_compound_storage_watch_token(state, redis_key, storage_key, entry) do
-        Ferricstore.Transaction.WatchToken.from_entry(entry, apply_now_ms(), fn ->
+        Ferricstore.Transaction.WatchToken.from_entry(entry, ExpiryContext.capture(), fn ->
           sm_store_compound_get(state, redis_key, storage_key)
         end)
       end
 
       defp transaction_storage_watch_token(state, storage_key, entry) do
-        Ferricstore.Transaction.WatchToken.from_entry(entry, apply_now_ms(), fn ->
+        Ferricstore.Transaction.WatchToken.from_entry(entry, ExpiryContext.capture(), fn ->
           do_get(state, storage_key)
         end)
       end

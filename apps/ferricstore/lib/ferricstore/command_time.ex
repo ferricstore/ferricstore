@@ -10,6 +10,7 @@ defmodule Ferricstore.CommandTime do
   alias Ferricstore.HLC
 
   @apply_now_key :ferricstore_raft_apply_now_ms
+  @apply_wall_key :ferricstore_raft_apply_wall_ms
   @apply_now_unset :__ferricstore_raft_apply_now_unset__
 
   @doc """
@@ -24,22 +25,62 @@ defmodule Ferricstore.CommandTime do
     Process.get(@apply_now_key) || HLC.now_ms()
   end
 
+  @doc false
+  @spec apply_now_ms() :: {:ok, non_neg_integer()} | :none
+  def apply_now_ms do
+    case Process.get(@apply_now_key, @apply_now_unset) do
+      @apply_now_unset -> :none
+      now_ms -> {:ok, now_ms}
+    end
+  end
+
+  @doc false
+  @spec apply_wall_ms() :: {:ok, non_neg_integer()} | :none
+  def apply_wall_ms do
+    case Process.get(@apply_wall_key, @apply_now_unset) do
+      @apply_now_unset -> :none
+      wall_ms -> {:ok, wall_ms}
+    end
+  end
+
   @doc """
   Runs `fun` with a stamped Raft apply time visible to command modules.
   """
   @spec with_now_ms(non_neg_integer(), (-> result)) :: result when result: term()
   def with_now_ms(now_ms, fun)
       when is_integer(now_ms) and now_ms >= 0 and is_function(fun, 0) do
-    previous = Process.get(@apply_now_key, @apply_now_unset)
+    previous_now = Process.get(@apply_now_key, @apply_now_unset)
+    previous_wall = Process.get(@apply_wall_key, @apply_now_unset)
     Process.put(@apply_now_key, now_ms)
+    Process.delete(@apply_wall_key)
 
     try do
       fun.()
     after
-      case previous do
-        @apply_now_unset -> Process.delete(@apply_now_key)
-        value -> Process.put(@apply_now_key, value)
-      end
+      restore_process_value(@apply_now_key, previous_now)
+      restore_process_value(@apply_wall_key, previous_wall)
     end
   end
+
+  @doc false
+  @spec with_expiry_context(non_neg_integer(), non_neg_integer(), (-> result)) :: result
+        when result: term()
+  def with_expiry_context(now_ms, wall_ms, fun)
+      when is_integer(now_ms) and now_ms >= 0 and is_integer(wall_ms) and wall_ms >= 0 and
+             is_function(fun, 0) do
+    previous_now = Process.get(@apply_now_key, @apply_now_unset)
+    previous_wall = Process.get(@apply_wall_key, @apply_now_unset)
+    Process.put(@apply_now_key, now_ms)
+    Process.put(@apply_wall_key, wall_ms)
+
+    try do
+      fun.()
+    after
+      restore_process_value(@apply_now_key, previous_now)
+      restore_process_value(@apply_wall_key, previous_wall)
+    end
+  end
+
+  defp restore_process_value(key, @apply_now_unset), do: Process.delete(key)
+  defp restore_process_value(key, value), do: Process.put(key, value)
 end

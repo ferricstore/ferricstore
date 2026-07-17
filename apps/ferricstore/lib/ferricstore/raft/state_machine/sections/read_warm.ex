@@ -14,6 +14,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -32,6 +33,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         ColdRead,
         CompoundKey,
         ExpiryTracker,
+        Keydir,
         LFU,
         ListOps,
         Promotion,
@@ -45,7 +47,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       alias Ferricstore.Transaction.Ast, as: TxAst
 
       defp ets_lookup_committed(state, key) do
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
         case committed_keydir_lookup(state, key) do
           [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
@@ -53,38 +55,75 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
           [{^key, nil, 0, _lfu, _fid, _off, _vsize}] ->
             # Cold key -- try Bitcask
-            warm_from_bitcask(state, key)
+            warm_from_bitcask(state, key, expiry_context)
 
-          [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-            {:hit, value, exp}
+          [{^key, value, exp, _lfu, _fid, _off, _vsize} = entry]
+          when is_integer(exp) and exp > 0 ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live when value != nil ->
+                {:hit, value, exp}
 
-          [{^key, nil, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
-            # Cold key with valid TTL -- try Bitcask
-            warm_from_bitcask_with_exp(state, key, exp)
+              :live ->
+                # Cold key with valid TTL -- try Bitcask
+                warm_from_bitcask_with_exp(state, key, exp, expiry_context)
 
-          [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
-            track_keydir_binary_remove_known(state, key, value)
-            safe_ets_delete(state.ets, key)
-            :expired
+              :expired ->
+                delete_expired_committed_entry(state, entry)
+                :expired
+
+              {:unsafe, reason} ->
+                record_state_read_failure(reason)
+            end
 
           [] ->
             # ETS miss -- try Bitcask for keys not yet in keydir
-            warm_from_bitcask(state, key)
+            warm_from_bitcask(state, key, expiry_context)
         end
       end
+
+      defp delete_expired_committed_entry(state, entry) do
+        if Keydir.delete_exact(state.ets, entry) do
+          track_keydir_binary_remove_entry(state, entry)
+          true
+        else
+          false
+        end
+      end
+
+      @doc false
+      def __delete_expired_committed_entry_for_test__(state, entry),
+        do: delete_expired_committed_entry(state, entry)
 
       # v2: warms a cold key from disk using the location stored in the ETS
       # 7-tuple. If the key has a cold entry (value=nil, fid/off known), reads
       # the value via pread_at and updates ETS. For truly missing keys (not in
       # ETS at all after recover_keydir), returns :miss.
-      defp warm_from_bitcask(state, key) do
+      defp warm_from_bitcask(state, key, expiry_context) do
         case committed_keydir_lookup(state, key) do
-          [{^key, nil, _exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-            warm_from_disk(state, key, 0, fid, off, vsize)
+          [{^key, nil, exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
+            warm_from_disk(
+              state,
+              key,
+              exp,
+              fid,
+              off,
+              vsize,
+              expiry_context,
+              @cold_location_retry_attempts
+            )
 
-          [{^key, nil, _exp, _lfu, fid, off, vsize}]
+          [{^key, nil, exp, _lfu, fid, off, vsize}]
           when valid_waraft_segment_location(fid, off, vsize) ->
-            warm_from_waraft_segment(state, key, 0, fid, off, vsize)
+            warm_from_waraft_segment(
+              state,
+              key,
+              exp,
+              fid,
+              off,
+              vsize,
+              expiry_context,
+              @cold_location_retry_attempts
+            )
 
           [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
             record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
@@ -101,14 +140,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         ArgumentError -> []
       end
 
-      defp warm_from_bitcask_with_exp(state, key, exp) do
+      defp warm_from_bitcask_with_exp(state, key, exp, expiry_context) do
         case committed_keydir_lookup(state, key) do
           [{^key, nil, _exp, _lfu, fid, off, vsize}] when valid_cold_location(fid, off, vsize) ->
-            warm_from_disk(state, key, exp, fid, off, vsize)
+            warm_from_disk(
+              state,
+              key,
+              exp,
+              fid,
+              off,
+              vsize,
+              expiry_context,
+              @cold_location_retry_attempts
+            )
 
           [{^key, nil, _exp, _lfu, fid, off, vsize}]
           when valid_waraft_segment_location(fid, off, vsize) ->
-            warm_from_waraft_segment(state, key, exp, fid, off, vsize)
+            warm_from_waraft_segment(
+              state,
+              key,
+              exp,
+              fid,
+              off,
+              vsize,
+              expiry_context,
+              @cold_location_retry_attempts
+            )
 
           [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
             record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
@@ -122,34 +179,46 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       # Reads a value from disk at the given file_id + offset, warms ETS, and
       # returns {:hit, value, expire_at_ms}.
       # Applies the hot_cache_max_value_size threshold when re-warming ETS.
-      defp warm_from_disk(state, key, expire_at_ms, fid, off, vsize) do
+      defp warm_from_disk(
+             state,
+             key,
+             expire_at_ms,
+             fid,
+             off,
+             vsize,
+             expiry_context,
+             attempts_left
+           ) do
         path = sm_file_path(state, fid)
         original_location = {fid, off, vsize}
 
+        observed_entry =
+          observed_cold_entry(state, key, expire_at_ms, fid, off, vsize)
+
         case read_cold_async(path, off, key) do
           {:ok, value} when is_binary(value) ->
+            maybe_run_cold_read_success_hook(state, key)
+
             case materialize_cold_blob_value(state, value) do
-              {:ok, ^value} ->
-                v = value_for_ets(value, hot_cache_threshold(state))
-                # Cold -> warm: previous ETS value was nil, only new value bytes matter.
-                track_keydir_binary_warm(state, v)
-
-                safe_ets_insert(
-                  state.ets,
-                  {key, v, expire_at_ms, LFU.initial(), fid, off, byte_size(value)}
-                )
-
-                {:hit, value, expire_at_ms}
-
               {:ok, materialized} ->
-                {:hit, materialized, expire_at_ms}
+                accept_current_cold_read(
+                  state,
+                  key,
+                  observed_entry,
+                  value,
+                  materialized,
+                  original_location,
+                  expiry_context,
+                  attempts_left
+                )
 
               {:error, reason} ->
                 retry_warm_from_changed_cold_location(
                   state,
                   key,
                   original_location,
-                  @cold_location_retry_attempts,
+                  expiry_context,
+                  attempts_left - 1,
                   {:blob_ref_unavailable, reason}
                 )
             end
@@ -159,7 +228,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               state,
               key,
               original_location,
-              @cold_location_retry_attempts,
+              expiry_context,
+              attempts_left - 1,
               reason
             )
 
@@ -168,19 +238,124 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               state,
               key,
               original_location,
-              @cold_location_retry_attempts,
+              expiry_context,
+              attempts_left - 1,
               {:invalid_cold_read_result, other}
             )
         end
+      end
+
+      defp observed_cold_entry(state, key, expire_at_ms, fid, off, vsize) do
+        case committed_keydir_lookup(state, key) do
+          [
+            {^key, nil, ^expire_at_ms, _lfu, ^fid, ^off, ^vsize} = entry
+          ] ->
+            entry
+
+          _changed_or_missing ->
+            nil
+        end
+      end
+
+      defp accept_current_cold_read(
+             state,
+             key,
+             {key, nil, expire_at_ms, _lfu, _fid, _off, _vsize} = observed_entry,
+             value,
+             value,
+             original_location,
+             expiry_context,
+             attempts_left
+           ) do
+        ets_value = value_for_ets(value, hot_cache_threshold(state))
+        replacement = put_elem(observed_entry, 1, ets_value)
+
+        if Keydir.replace_exact(state.ets, observed_entry, replacement) do
+          track_keydir_binary_warm(state, ets_value)
+          {:hit, value, expire_at_ms}
+        else
+          retry_after_changed_successful_cold_read(
+            state,
+            key,
+            observed_entry,
+            original_location,
+            expiry_context,
+            attempts_left - 1
+          )
+        end
+      end
+
+      defp accept_current_cold_read(
+             state,
+             key,
+             {key, nil, expire_at_ms, _lfu, _fid, _off, _vsize} = observed_entry,
+             _encoded_value,
+             materialized,
+             original_location,
+             expiry_context,
+             attempts_left
+           ) do
+        if Keydir.replace_exact(state.ets, observed_entry, observed_entry) do
+          {:hit, materialized, expire_at_ms}
+        else
+          retry_after_changed_successful_cold_read(
+            state,
+            key,
+            observed_entry,
+            original_location,
+            expiry_context,
+            attempts_left - 1
+          )
+        end
+      end
+
+      defp accept_current_cold_read(
+             state,
+             key,
+             nil,
+             _encoded_value,
+             _materialized,
+             original_location,
+             expiry_context,
+             attempts_left
+           ) do
+        retry_after_changed_successful_cold_read(
+          state,
+          key,
+          nil,
+          original_location,
+          expiry_context,
+          attempts_left - 1
+        )
+      end
+
+      defp retry_after_changed_successful_cold_read(
+             state,
+             key,
+             _observed_entry,
+             original_location,
+             expiry_context,
+             attempts_left
+           ) do
+        retry_warm_from_changed_cold_location(
+          state,
+          key,
+          original_location,
+          expiry_context,
+          attempts_left,
+          :cold_location_changed_after_read
+        )
       end
 
       defp retry_warm_from_changed_cold_location(
              _state,
              _key,
              original_location,
-             0,
+             _expiry_context,
+             attempts_left,
              reason
-           ) do
+           )
+           when attempts_left <= 0 do
         record_state_read_failure({:cold_value_unavailable, original_location, reason})
       end
 
@@ -188,44 +363,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
              state,
              key,
              original_location,
+             expiry_context,
              attempts_left,
              reason
            ) do
         maybe_run_cold_location_miss_hook()
         Process.sleep(@cold_location_retry_sleep_ms)
-        now = apply_now_ms()
 
         case committed_keydir_lookup(state, key) do
-          [{^key, value, exp, _lfu, _fid, _off, _vsize}]
-          when value != nil and (exp == 0 or exp > now) ->
-            {:hit, value, exp}
+          [{^key, _value, exp, _lfu, _fid, _off, _vsize} = entry]
+          when is_integer(exp) and exp >= 0 ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live ->
+                retry_warm_from_live_entry(
+                  state,
+                  key,
+                  entry,
+                  original_location,
+                  expiry_context,
+                  attempts_left,
+                  reason
+                )
 
-          [{^key, nil, exp, _lfu, fid, off, vsize}]
-          when (exp == 0 or exp > now) and valid_cold_location(fid, off, vsize) ->
-            if {fid, off, vsize} == original_location do
-              retry_warm_from_changed_cold_location(
-                state,
-                key,
-                original_location,
-                attempts_left - 1,
-                reason
-              )
-            else
-              warm_from_disk(state, key, exp, fid, off, vsize)
-            end
+              :expired ->
+                :miss
 
-          [{^key, nil, exp, _lfu, fid, off, vsize}]
-          when (exp == 0 or exp > now) and valid_waraft_segment_location(fid, off, vsize) ->
-            if {fid, off, vsize} == original_location do
-              retry_warm_from_changed_cold_location(
-                state,
-                key,
-                original_location,
-                attempts_left - 1,
-                reason
-              )
-            else
-              warm_from_waraft_segment(state, key, exp, fid, off, vsize)
+              {:unsafe, unsafe_reason} ->
+                record_state_read_failure(unsafe_reason)
             end
 
           _ ->
@@ -233,8 +397,88 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         end
       end
 
-      defp warm_from_waraft_segment(state, key, expire_at_ms, fid, off, vsize) do
+      defp retry_warm_from_live_entry(
+             _state,
+             key,
+             {key, value, exp, _lfu, _fid, _off, _vsize},
+             _original_location,
+             _expiry_context,
+             _attempts_left,
+             _reason
+           )
+           when value != nil do
+        {:hit, value, exp}
+      end
+
+      defp retry_warm_from_live_entry(
+             state,
+             key,
+             {key, nil, exp, _lfu, fid, off, vsize},
+             _original_location,
+             expiry_context,
+             attempts_left,
+             _reason
+           )
+           when valid_cold_location(fid, off, vsize) do
+        warm_from_disk(
+          state,
+          key,
+          exp,
+          fid,
+          off,
+          vsize,
+          expiry_context,
+          attempts_left
+        )
+      end
+
+      defp retry_warm_from_live_entry(
+             state,
+             key,
+             {key, nil, exp, _lfu, fid, off, vsize},
+             _original_location,
+             expiry_context,
+             attempts_left,
+             _reason
+           )
+           when valid_waraft_segment_location(fid, off, vsize) do
+        warm_from_waraft_segment(
+          state,
+          key,
+          exp,
+          fid,
+          off,
+          vsize,
+          expiry_context,
+          attempts_left
+        )
+      end
+
+      defp retry_warm_from_live_entry(
+             _state,
+             _key,
+             _entry,
+             _original_location,
+             _expiry_context,
+             _attempts_left,
+             _reason
+           ),
+           do: :miss
+
+      defp warm_from_waraft_segment(
+             state,
+             key,
+             expire_at_ms,
+             fid,
+             off,
+             vsize,
+             expiry_context,
+             attempts_left
+           ) do
         original_location = {fid, off, vsize}
+
+        observed_entry =
+          observed_cold_entry(state, key, expire_at_ms, fid, off, vsize)
 
         case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
                instance_ctx_for_state(state),
@@ -243,27 +487,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
                key
              ) do
           {:ok, value} when is_binary(value) ->
+            maybe_run_cold_read_success_hook(state, key)
+
             case materialize_cold_blob_value(state, value) do
-              {:ok, ^value} ->
-                v = value_for_ets(value, hot_cache_threshold(state))
-                track_keydir_binary_warm(state, v)
-
-                safe_ets_insert(
-                  state.ets,
-                  {key, v, expire_at_ms, LFU.initial(), fid, off, byte_size(value)}
-                )
-
-                {:hit, value, expire_at_ms}
-
               {:ok, materialized} ->
-                {:hit, materialized, expire_at_ms}
+                accept_current_cold_read(
+                  state,
+                  key,
+                  observed_entry,
+                  value,
+                  materialized,
+                  original_location,
+                  expiry_context,
+                  attempts_left
+                )
 
               {:error, reason} ->
                 retry_warm_from_changed_cold_location(
                   state,
                   key,
                   original_location,
-                  @cold_location_retry_attempts,
+                  expiry_context,
+                  attempts_left - 1,
                   {:blob_ref_unavailable, reason}
                 )
             end
@@ -273,7 +518,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               state,
               key,
               original_location,
-              @cold_location_retry_attempts,
+              expiry_context,
+              attempts_left - 1,
               reason
             )
 
@@ -282,7 +528,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
               state,
               key,
               original_location,
-              @cold_location_retry_attempts,
+              expiry_context,
+              attempts_left - 1,
               {:invalid_waraft_read_result, other}
             )
         end
@@ -291,6 +538,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       defp maybe_run_cold_location_miss_hook do
         case Process.get(:ferricstore_state_machine_cold_location_miss_hook) do
           fun when is_function(fun, 0) -> fun.()
+          _ -> :ok
+        end
+      end
+
+      defp maybe_run_cold_read_success_hook(state, key) do
+        case Process.get(:ferricstore_state_machine_cold_read_success_hook) do
+          fun when is_function(fun, 2) -> fun.(state, key)
           _ -> :ok
         end
       end
@@ -584,6 +838,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
       defp sm_store_compound_get(state, redis_key, compound_key) do
         case sm_store_compound_get_meta(state, redis_key, compound_key) do
+          {:error, _reason} = error -> error
           {value, _expire_at_ms} -> value
           nil -> nil
         end

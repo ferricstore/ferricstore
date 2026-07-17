@@ -719,7 +719,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
           assert {:error, :key_locked} =
                    WARaftBackend.write(0, {
                      {:put, key, "new", 0},
-                     %{hlc_ts: {stamped_now, 0}}
+                     %{hlc_ts: {stamped_now, 0}, wall_time_ms: stamped_now}
                    })
 
           assert "old" == Router.get(ctx, key)

@@ -22,6 +22,45 @@ defmodule Ferricstore.Store.ShardETSTest do
     :ok
   end
 
+  test "lookup fails closed without deleting an HLC-only expired row" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:hlc-drift"
+    row = {key, "value", 31_000, LFU.initial(), 0, 0, 5}
+    state = %{keydir: keydir}
+    context = {:request, 61_000, 1_000}
+    :ets.insert(keydir, row)
+
+    try do
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               ShardETS.ets_lookup(state, key, context)
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               ShardETS.ets_lookup_metadata(state, key, context)
+
+      assert :ets.lookup(keydir, key) == [row]
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "lookup uses the replicated leader wall snapshot during apply" do
+    keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
+    key = "ets:replicated-hlc-drift"
+    row = {key, "value", 31_000, LFU.initial(), 0, 0, 5}
+    state = %{keydir: keydir}
+    :ets.insert(keydir, row)
+
+    try do
+      assert Ferricstore.CommandTime.with_expiry_context(61_000, 1_000, fn ->
+               ShardETS.ets_lookup(state, key)
+             end) == {:error, {:storage_read_failed, :hlc_drift_exceeded}}
+
+      assert :ets.lookup(keydir, key) == [row]
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   test "fresh no-ttl location batch inserts records and batches binary accounting" do
     keydir = :ets.new(:"shard_ets_#{System.unique_integer([:positive])}", [:set, :public])
     ref = :atomics.new(1, signed: true)

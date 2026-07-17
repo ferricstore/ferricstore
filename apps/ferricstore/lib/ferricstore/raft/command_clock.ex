@@ -1,9 +1,10 @@
 defmodule Ferricstore.Raft.CommandClock do
   @moduledoc """
-  Stamps Raft commands with a leader-side HLC timestamp before they enter the log.
+  Stamps Raft commands with one leader-side HLC and wall-clock snapshot before
+  they enter the log.
 
-  The state machine uses the stamped physical millisecond for TTL and lock expiry
-  decisions, making replay deterministic across replicas.
+  The state machine uses both values for TTL and lock-expiry decisions, making
+  clock-drift rejection deterministic across replicas.
   """
 
   alias Ferricstore.Raft.CommandStamp
@@ -11,7 +12,8 @@ defmodule Ferricstore.Raft.CommandClock do
   alias Ferricstore.Raft.WARaftBackend
 
   @type hlc_ts :: {non_neg_integer(), non_neg_integer()}
-  @type stamped_command :: {term(), %{hlc_ts: hlc_ts()}}
+  @type stamped_command ::
+          {term(), %{hlc_ts: hlc_ts(), wall_time_ms: non_neg_integer()}}
 
   @spec stamp(term()) :: stamped_command()
   def stamp(command), do: CommandStamp.stamp(command)

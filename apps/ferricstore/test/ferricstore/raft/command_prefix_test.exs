@@ -12,8 +12,8 @@ defmodule Ferricstore.Raft.CommandPrefixTest do
       {:ferricstore_apply_context, <<1>>, command},
       {:flow_policy_fence, [], command},
       {:flow_shared_ref_write, 2, command},
-      {:async, :"origin@node", command},
-      {command, %{hlc_ts: {1, 0}}},
+      {:async, :origin@node, command},
+      {command, %{hlc_ts: {1, 0}, wall_time_ms: 1}},
       CommandStamp.to_ttb(command)
     ]
 
@@ -25,8 +25,7 @@ defmodule Ferricstore.Raft.CommandPrefixTest do
     inner = {:put, "other:key", "value", 0}
 
     command =
-      {:ferricstore_latency_trace,
-       {:origin_checked, "tenant:key", inner, nil, 0, "value", 0}}
+      {:ferricstore_latency_trace, {:origin_checked, "tenant:key", inner, nil, 0, "value", 0}}
 
     assert CommandPrefix.extract(command) == "tenant"
   end

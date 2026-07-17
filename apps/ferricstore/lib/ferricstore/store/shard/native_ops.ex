@@ -334,11 +334,15 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         ) :: {:reply, [term()] | {:error, term()}, map()}
   @doc false
   def handle_ratelimit_add_direct(key, window_ms, max, count, state) do
-    now = Ferricstore.HLC.now_ms()
+    expiry_context = Ferricstore.ExpiryContext.capture()
+    now = Ferricstore.ExpiryContext.now_ms(expiry_context)
 
-    case ShardETS.ets_lookup_warm_result(state, key) do
+    case ShardETS.ets_lookup_warm_result(state, key, expiry_context) do
       {:error, :cold_read_failed} ->
         {:reply, {:error, "ERR cold read failed"}, state}
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        {:reply, failure, state}
 
       {:hit, value, _exp} ->
         value
@@ -565,6 +569,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         {:hit, _value, _exp} -> true
         {:cold, _fid, _off, _vsize, _exp} -> true
         {:error, :invalid_keydir_entry} -> true
+        {:error, {:storage_read_failed, _reason}} -> true
         _ -> false
       end
     end)
@@ -1128,7 +1133,10 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # -------------------------------------------------------------------
 
   @spec resolve_for_native(map(), binary()) ::
-          {{:hit, term(), non_neg_integer()}, map()} | {:expired, map()} | {:missing, map()}
+          {{:hit, term(), non_neg_integer()}, map()}
+          | {:expired, map()}
+          | {:missing, map()}
+          | {ReadResult.failure(), map()}
   @doc false
   def resolve_for_native(state, key) do
     case ShardETS.ets_lookup_warm_result(state, key) do
@@ -1144,11 +1152,15 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
         case ShardReads.do_get_meta(state, key) do
           nil -> {:missing, state}
+          {:error, {:storage_read_failed, _reason}} = failure -> {failure, state}
           {value, exp} -> {{:hit, value, exp}, state}
         end
 
       {:error, :cold_read_failed} ->
         {:error, state}
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        {failure, state}
     end
   end
 

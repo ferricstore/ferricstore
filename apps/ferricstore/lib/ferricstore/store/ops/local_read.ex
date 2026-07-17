@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
   @moduledoc false
 
   alias Ferricstore.BatchResult
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.HLC
   alias Ferricstore.Store.BlobRef
   alias Ferricstore.Store.BlobValue
@@ -83,11 +84,16 @@ defmodule Ferricstore.Store.Ops.LocalRead do
         {value, 0}
 
       {value, exp} ->
-        if exp > HLC.now_ms() do
-          {value, exp}
-        else
-          tx_drop_pending(key)
-          nil
+        case ExpiryContext.classify(ExpiryContext.capture(), exp) do
+          :live ->
+            {value, exp}
+
+          {:unsafe, :hlc_drift_exceeded} ->
+            {value, exp}
+
+          :expired ->
+            tx_drop_pending(key)
+            nil
         end
 
       nil ->
@@ -139,6 +145,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
           {:hit, _value, _exp} -> true
           {:cold, _fid, _off, _vsize, _exp} -> true
           {:error, :invalid_keydir_entry} -> true
+          {:error, {:storage_read_failed, _reason}} -> true
           :expired -> false
           :miss -> false
         end
@@ -208,7 +215,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
   end
 
   def local_batch_read_meta(tx, keys, data_path) do
-    now = HLC.now_ms()
+    expiry_context = ExpiryContext.capture()
 
     {warm_results, cold_reads} =
       keys
@@ -219,7 +226,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
             {Map.put(results, index, {value, exp}), cold}
 
           nil ->
-            local_batch_collect_ets(tx, key, index, data_path, now, results, cold)
+            local_batch_collect_ets(tx, key, index, data_path, expiry_context, results, cold)
         end
       end)
 
@@ -438,6 +445,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
       {:hit, value, _exp} -> value
       :expired -> nil
       :miss -> nil
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
       {:error, reason} -> ReadResult.failure(reason)
     end
   end
@@ -447,6 +455,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
       {:hit, value, exp} -> {value, exp}
       :expired -> nil
       :miss -> nil
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
       {:error, reason} -> ReadResult.failure(reason)
     end
   end
@@ -521,8 +530,8 @@ defmodule Ferricstore.Store.Ops.LocalRead do
     )
   end
 
-  defp local_batch_collect_ets(tx, key, index, data_path, now, results, cold) do
-    case ShardETS.ets_lookup_metadata(tx.shard_state, key, now) do
+  defp local_batch_collect_ets(tx, key, index, data_path, expiry_context, results, cold) do
+    case ShardETS.ets_lookup_metadata(tx.shard_state, key, expiry_context) do
       {:live, {^key, value, exp, _lfu, _fid, _off, _vsize}, :hot} ->
         {Map.put(results, index, {value, exp}), cold}
 
@@ -546,6 +555,9 @@ defmodule Ferricstore.Store.Ops.LocalRead do
 
       {:error, :invalid_keydir_entry} ->
         {Map.put(results, index, ReadResult.failure(:invalid_keydir_entry)), cold}
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        {Map.put(results, index, failure), cold}
 
       result when result in [:expired, :miss] ->
         {results, cold}
@@ -663,6 +675,9 @@ defmodule Ferricstore.Store.Ops.LocalRead do
       {:error, :invalid_keydir_entry} ->
         {:error, :invalid_keydir_entry}
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
       result when result in [:expired, :miss] ->
         :missing
     end
@@ -752,6 +767,9 @@ defmodule Ferricstore.Store.Ops.LocalRead do
       {:error, :invalid_keydir_entry} ->
         @cold_read_error
 
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
+
       :expired ->
         nil
 
@@ -766,6 +784,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
       :expired -> {nil, 0}
       :miss -> {nil, 0}
       {:error, :cold_read_failed} -> @cold_read_error
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
     end
   end
 
@@ -775,6 +794,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
       :expired -> nil
       :miss -> nil
       {:error, :cold_read_failed} -> @cold_read_error
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
     end
   end
 
@@ -798,6 +818,9 @@ defmodule Ferricstore.Store.Ops.LocalRead do
 
       {:error, :invalid_keydir_entry} ->
         ReadResult.failure(:invalid_keydir_entry)
+
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        failure
 
       result when result in [:expired, :miss] ->
         nil

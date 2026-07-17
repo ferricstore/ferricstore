@@ -218,6 +218,33 @@ defmodule Ferricstore.ExpirySweepTest do
       assert Router.get(FerricStore.Instance.get(:default), key) == "alive_value"
     end
 
+    test "forced sweep uses the wall-safe cutoff while HLC expiry is ambiguous" do
+      keydir = :ets.new(:drift_safe_expiry_sweep, [:set, :public])
+      entry = {"wall-live", "value", 31_000, 0, 0, 0, 5}
+      :ets.insert(keydir, entry)
+
+      state = %{
+        index: 0,
+        keydir: keydir,
+        instance_ctx: nil,
+        file_stats: %{},
+        promoted_instances: %{},
+        active_file_path: "00000.log",
+        sweep_at_ceiling_count: 0,
+        sweep_struggling: false
+      }
+
+      try do
+        Ferricstore.CommandTime.with_expiry_context(61_000, 1_000, fn ->
+          Ferricstore.Store.Shard.Lifecycle.do_expiry_sweep(state, force: true)
+        end)
+
+        assert :ets.lookup(keydir, "wall-live") == [entry]
+      after
+        :ets.delete(keydir)
+      end
+    end
+
     test "expired keys are not returned by GET after sweep" do
       key = ukey("get_after_sweep")
       past = System.os_time(:millisecond) - 500

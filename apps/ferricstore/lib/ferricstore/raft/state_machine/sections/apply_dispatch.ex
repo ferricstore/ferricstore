@@ -14,6 +14,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Raft.CommandStamp
       alias Ferricstore.Raft.StateMachine.FlushDerivedState
@@ -116,8 +117,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               :ok ->
                 with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
 
-              {:error, :key_locked} ->
-                {:error, :key_locked}
+              {:error, _reason} = error ->
+                error
             end
 
           old_count = state.applied_count
@@ -346,8 +347,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               :ok ->
                 with_pending_writes(state, fn -> do_set(state, key, value, expire_at_ms, opts) end)
 
-              {:error, :key_locked} ->
-                {:error, :key_locked}
+              {:error, _reason} = error ->
+                error
             end
 
           old_count = state.applied_count
@@ -371,8 +372,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               :ok ->
                 with_pending_writes(state, fn -> do_delete(state, key) end)
 
-              {:error, :key_locked} ->
-                {:error, :key_locked}
+              {:error, _reason} = error ->
+                error
             end
 
           old_count = state.applied_count
@@ -383,26 +384,38 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:expire_if_batch, entries}, state) when is_list(entries) do
         apply_pending_with_time(meta, state, fn ->
-          do_expire_if_batch(state, entries, apply_now_ms())
+          do_expire_if_batch(state, entries, ExpiryContext.capture())
         end)
       end
 
-      defp do_expire_if_batch(state, entries, now_ms) do
+      defp do_expire_if_batch(state, entries, expiry_context) do
         matched_keys =
           Enum.reduce(entries, MapSet.new(), fn
             {key, expected_expire_at_ms}, acc
             when is_binary(key) and is_integer(expected_expire_at_ms) and
-                   expected_expire_at_ms > 0 and expected_expire_at_ms <= now_ms ->
-              redis_key = CompoundKey.extract_redis_key(key)
-
-              case {:ets.lookup(state.ets, key),
-                    check_fetch_or_compute_lock(state, redis_key, nil)} do
-                {[{^key, _value, ^expected_expire_at_ms, _lfu, _file_id, _offset, _value_size}],
-                 :ok} ->
-                  MapSet.put(acc, key)
-
-                _stale_or_locked ->
+                   expected_expire_at_ms > 0 ->
+              case ExpiryContext.classify(expiry_context, expected_expire_at_ms) do
+                :live ->
                   acc
+
+                {:unsafe, reason} ->
+                  record_state_read_failure(reason)
+                  acc
+
+                :expired ->
+                  redis_key = CompoundKey.extract_redis_key(key)
+
+                  case {:ets.lookup(state.ets, key),
+                        check_fetch_or_compute_lock(state, redis_key, nil)} do
+                    {[
+                       {^key, _value, ^expected_expire_at_ms, _lfu, _file_id, _offset,
+                        _value_size}
+                     ], :ok} ->
+                      MapSet.put(acc, key)
+
+                    _stale_or_locked ->
+                      acc
+                  end
               end
 
             _invalid, acc ->
@@ -982,8 +995,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                   )
                 end)
 
-              {:error, :key_locked} ->
-                {:error, :key_locked}
+              {:error, _reason} = error ->
+                error
             end
 
           old_count = state.applied_count
@@ -1003,8 +1016,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                   do_compound_put(state, redis_key, compound_key, value, expire_at_ms)
                 end)
 
-              {:error, :key_locked} ->
-                {:error, :key_locked}
+              {:error, _reason} = error ->
+                error
             end
 
           old_count = state.applied_count
@@ -1058,8 +1071,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                   do_compound_delete(state, redis_key, compound_key)
                 end)
 
-              {:error, :key_locked} ->
-                {:error, :key_locked}
+              {:error, _reason} = error ->
+                error
             end
 
           old_count = state.applied_count
@@ -1093,8 +1106,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                   do_compound_delete_prefix(state, redis_key, prefix)
                 end)
 
-              {:error, :key_locked} ->
-                {:error, :key_locked}
+              {:error, _reason} = error ->
+                error
             end
 
           old_count = state.applied_count
@@ -2132,12 +2145,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end
       end
 
-      def apply(meta, {inner_command, %{hlc_ts: {physical_ms, _logical} = remote_ts}}, state)
-          when is_tuple(inner_command) and is_integer(physical_ms) do
+      def apply(
+            meta,
+            {inner_command,
+             %{
+               hlc_ts: {physical_ms, _logical} = remote_ts,
+               wall_time_ms: wall_time_ms
+             }},
+            state
+          )
+          when is_tuple(inner_command) and is_integer(physical_ms) and is_integer(wall_time_ms) do
         merge_hlc(remote_ts)
 
         __MODULE__.apply(
-          Map.put(meta, :system_time, physical_ms),
+          Map.merge(meta, %{system_time: physical_ms, expiry_wall_time: wall_time_ms}),
           inner_command,
           state
         )

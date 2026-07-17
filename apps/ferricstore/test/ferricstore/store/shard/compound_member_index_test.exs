@@ -370,7 +370,15 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     state = %{keydir: keydir}
 
     assert {:ok, ["c", "d", "a"]} =
-             CompoundMemberIndex.member_slice(index, state, prefix, "c", 3, 10, %{})
+             CompoundMemberIndex.member_slice(
+               index,
+               state,
+               prefix,
+               "c",
+               3,
+               {:replicated_apply, 10},
+               %{}
+             )
   end
 
   test "member_slice skips pending deletes and accepts valid cold locations", %{
@@ -393,9 +401,38 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
                prefix,
                "a",
                2,
-               10,
+               {:replicated_apply, 10},
                %{deleted_key => :deleted}
              )
+  end
+
+  test "member_slice fails closed without deleting drift-ambiguous members", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.set_prefix("drifted-members")
+    member_key = CompoundKey.set_member("drifted-members", "member")
+    index_key = {prefix, "member"}
+    entry = {member_key, "1", 31_000, 0, 0, 0, 1}
+    :ets.insert(keydir, entry)
+    CompoundMemberIndex.put(index, member_key)
+
+    state = %{keydir: keydir, shard_data_path: nil, compound_member_index: index}
+    expiry_context = {:replicated_apply, 61_000, 1_000}
+
+    assert {:error, :hlc_drift_exceeded} =
+             CompoundMemberIndex.member_slice(
+               index,
+               state,
+               prefix,
+               "",
+               1,
+               expiry_context,
+               %{}
+             )
+
+    assert :ets.lookup(keydir, member_key) == [entry]
+    assert :ets.lookup(index, index_key) == [{index_key, member_key}]
   end
 
   test "member_slice reports malformed live keydir rows", %{keydir: keydir, index: index} do
@@ -412,7 +449,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
                prefix,
                "",
                1,
-               10,
+               {:replicated_apply, 10},
                %{}
              )
   end
@@ -517,6 +554,15 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
   end
 
   test "zero member_slice does not require index or keydir tables" do
-    assert {:ok, []} = CompoundMemberIndex.member_slice(nil, %{}, "S:tags\0", "", 0, 10, %{})
+    assert {:ok, []} =
+             CompoundMemberIndex.member_slice(
+               nil,
+               %{},
+               "S:tags\0",
+               "",
+               0,
+               {:replicated_apply, 10},
+               %{}
+             )
   end
 end

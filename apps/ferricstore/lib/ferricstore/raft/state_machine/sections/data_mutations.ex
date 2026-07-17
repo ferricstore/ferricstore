@@ -14,6 +14,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
+      alias Ferricstore.ExpiryContext
       alias Ferricstore.FetchOrCompute.Outcome, as: FetchOrComputeOutcome
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
@@ -161,6 +162,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
 
         case sm_store_compound_get_meta(state, redis_key, compound_key) do
+          {:error, _reason} = error ->
+            error
+
           nil ->
             if delta > @int64_max or delta < @int64_min do
               {:error, "ERR increment or decrement would overflow"}
@@ -202,6 +206,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
 
         case sm_store_compound_get_meta(state, redis_key, compound_key) do
+          {:error, _reason} = error ->
+            error
+
           nil ->
             new_val = delta * 1.0
             new_str = Float.to_string(new_val)
@@ -238,30 +245,36 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         with :ok <- check_or_set_type(state, redis_key, type_key, expected_type) do
           compound_key = Ferricstore.Store.CompoundKey.zset_member(redis_key, member)
 
-          current_score =
-            case sm_store_compound_get_meta(state, redis_key, compound_key) do
-              nil ->
-                0.0
+          case sm_store_compound_get_meta(state, redis_key, compound_key) do
+            {:error, _reason} = error ->
+              error
 
-              {score_val, _expire_at_ms} ->
-                score_str =
-                  case score_val do
-                    v when is_binary(v) -> v
-                    v -> to_string(v)
-                  end
+            current ->
+              current_score =
+                case current do
+                  nil ->
+                    0.0
 
-                case Float.parse(score_str) do
-                  {s, ""} -> s
-                  _ -> 0.0
+                  {score_val, _expire_at_ms} ->
+                    score_str =
+                      case score_val do
+                        value when is_binary(value) -> value
+                        value -> to_string(value)
+                      end
+
+                    case Float.parse(score_str) do
+                      {score, ""} -> score
+                      _invalid -> 0.0
+                    end
                 end
-            end
 
-          new_score = current_score + increment * 1.0
-          new_str = Float.to_string(new_score)
+              new_score = current_score + increment * 1.0
+              new_str = Float.to_string(new_score)
 
-          case do_compound_put(state, redis_key, compound_key, new_str, 0) do
-            :ok -> new_str
-            {:error, _reason} = error -> error
+              case do_compound_put(state, redis_key, compound_key, new_str, 0) do
+                :ok -> new_str
+                {:error, _reason} = error -> error
+              end
           end
         end
       end
@@ -291,7 +304,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
                    prefix,
                    cursor,
                    pop_count,
-                   apply_now_ms(),
+                   ExpiryContext.capture(),
                    Process.get(:sm_pending_values, %{})
                  ) do
               {:ok, selected} ->
@@ -418,21 +431,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       end
 
       defp sm_store_compound_get_meta(state, redis_key, compound_key) do
-        case sm_store_compound_path_fun(state, redis_key, compound_key) do
-          nil ->
-            do_get_meta(state, compound_key)
+        result =
+          case sm_store_compound_path_fun(state, redis_key, compound_key) do
+            nil ->
+              do_get_meta(state, compound_key)
 
-          path_fun ->
-            case sm_store_batch_get(state, [compound_key], path_fun) do
-              [value] when is_binary(value) ->
-                case :ets.lookup(state.ets, compound_key) do
-                  [{^compound_key, _ets_value, exp, _lfu, _fid, _off, _vsize}] -> {value, exp}
-                  _ -> nil
-                end
+            path_fun ->
+              case sm_store_batch_get(state, [compound_key], path_fun) do
+                [value] when is_binary(value) ->
+                  case :ets.lookup(state.ets, compound_key) do
+                    [{^compound_key, _ets_value, exp, _lfu, _fid, _off, _vsize}] ->
+                      {value, exp}
 
-              _ ->
-                nil
-            end
+                    _ ->
+                      nil
+                  end
+
+                _ ->
+                  nil
+              end
+          end
+
+        case Process.get(:sm_state_read_failure) do
+          reason when reason not in [nil, :outside_apply] ->
+            {:error, {:state_read_failed, reason}}
+
+          _no_failure ->
+            result
         end
       end
 
@@ -444,15 +469,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       end
 
       defp sm_store_batch_get(state, keys, path_fun) do
+        expiry_context = ExpiryContext.capture()
+
         {local_results, cold_reads, remote_entries} =
           keys
           |> Enum.with_index()
           |> Enum.reduce({%{}, [], []}, fn {key, index}, {results, cold, remote} ->
-            sm_store_collect_batch_get(state, key, index, results, cold, remote)
+            sm_store_collect_batch_get(
+              state,
+              key,
+              index,
+              expiry_context,
+              results,
+              cold,
+              remote
+            )
           end)
 
         results =
-          sm_store_read_cold_batch(state, local_results, Enum.reverse(cold_reads), path_fun)
+          sm_store_read_cold_batch(
+            state,
+            local_results,
+            Enum.reverse(cold_reads),
+            path_fun,
+            expiry_context
+          )
 
         remote_entries
         |> Enum.reverse()
@@ -460,51 +501,65 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         |> values_for_indexes(keys)
       end
 
-      defp sm_store_collect_batch_get(state, key, index, results, cold, remote) do
+      defp sm_store_collect_batch_get(
+             state,
+             key,
+             index,
+             expiry_context,
+             results,
+             cold,
+             remote
+           ) do
         case sm_pending_value_meta(key) do
           {:hit, value, _exp} ->
             {Map.put(results, index, value), cold, remote}
 
           :miss ->
-            sm_store_collect_committed_batch_get(state, key, index, results, cold, remote)
+            sm_store_collect_committed_batch_get(
+              state,
+              key,
+              index,
+              expiry_context,
+              results,
+              cold,
+              remote
+            )
         end
       end
 
-      defp sm_store_collect_committed_batch_get(state, key, index, results, cold, remote) do
-        now = apply_now_ms()
-
+      defp sm_store_collect_committed_batch_get(
+             state,
+             key,
+             index,
+             expiry_context,
+             results,
+             cold,
+             remote
+           ) do
         case :ets.lookup(state.ets, key) do
-          [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-            {Map.put(results, index, value), cold, remote}
+          [{^key, value, exp, _lfu, fid, off, vsize} = entry]
+          when is_integer(exp) and exp >= 0 ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live when value != nil ->
+                {Map.put(results, index, value), cold, remote}
 
-          [{^key, nil, 0, _lfu, fid, off, vsize} = entry]
-          when valid_cold_location(fid, off, vsize) ->
-            {results, [{index, entry} | cold], remote}
+              :live
+              when valid_cold_location(fid, off, vsize) or
+                     valid_waraft_segment_location(fid, off, vsize) ->
+                {results, [{index, entry} | cold], remote}
 
-          [{^key, nil, 0, _lfu, fid, off, vsize} = entry]
-          when valid_waraft_segment_location(fid, off, vsize) ->
-            {results, [{index, entry} | cold], remote}
+              :live ->
+                record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
+                {results, cold, remote}
 
-          [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-            {Map.put(results, index, value), cold, remote}
+              :expired ->
+                delete_expired_committed_entry(state, entry)
+                {results, cold, [{index, key} | remote]}
 
-          [{^key, nil, exp, _lfu, fid, off, vsize} = entry]
-          when exp > now and valid_cold_location(fid, off, vsize) ->
-            {results, [{index, entry} | cold], remote}
-
-          [{^key, nil, exp, _lfu, fid, off, vsize} = entry]
-          when exp > now and valid_waraft_segment_location(fid, off, vsize) ->
-            {results, [{index, entry} | cold], remote}
-
-          [{^key, value, exp, _lfu, _fid, _off, _vsize}]
-          when exp != 0 and exp <= now ->
-            track_keydir_binary_remove_known(state, key, value)
-            :ets.delete(state.ets, key)
-            {results, cold, [{index, key} | remote]}
-
-          [{^key, nil, _exp, _lfu, fid, off, vsize}] ->
-            record_state_read_failure({:invalid_cold_location, {fid, off, vsize}})
-            {results, cold, remote}
+              {:unsafe, reason} ->
+                record_state_read_failure(reason)
+                {results, cold, remote}
+            end
 
           [] ->
             {results, cold, [{index, key} | remote]}
@@ -515,23 +570,42 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           {results, cold, remote}
       end
 
-      defp sm_store_read_cold_batch(_state, results, [], _path_fun), do: results
+      defp sm_store_read_cold_batch(_state, results, [], _path_fun, _expiry_context), do: results
 
-      defp sm_store_read_cold_batch(state, results, cold_reads, path_fun) do
+      defp sm_store_read_cold_batch(state, results, cold_reads, path_fun, expiry_context) do
         {segment_reads, file_reads} =
           Enum.split_with(cold_reads, fn {_index, {_key, _value, _exp, _lfu, fid, off, _vsize}} ->
             valid_waraft_segment_location(fid, off, 0)
           end)
 
         results =
-          sm_store_read_bitcask_cold_batch(state, results, file_reads, path_fun)
+          sm_store_read_bitcask_cold_batch(
+            state,
+            results,
+            file_reads,
+            path_fun,
+            expiry_context
+          )
 
         sm_store_read_waraft_segment_batch(state, results, segment_reads)
       end
 
-      defp sm_store_read_bitcask_cold_batch(_state, results, [], _path_fun), do: results
+      defp sm_store_read_bitcask_cold_batch(
+             _state,
+             results,
+             [],
+             _path_fun,
+             _expiry_context
+           ),
+           do: results
 
-      defp sm_store_read_bitcask_cold_batch(state, results, cold_reads, path_fun) do
+      defp sm_store_read_bitcask_cold_batch(
+             state,
+             results,
+             cold_reads,
+             path_fun,
+             expiry_context
+           ) do
         reads =
           Enum.map(cold_reads, fn {_index, {key, nil, _exp, _lfu, fid, off, _vsize} = entry} ->
             {path_fun.(state, fid), off, key, entry}
@@ -540,7 +614,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         {:ok, current_results} =
           Ferricstore.Store.ColdRead.pread_batch_keyed_current(
             reads,
-            fn key, entry -> sm_store_resolve_current_bitcask(state, path_fun, key, entry) end,
+            fn key, entry ->
+              sm_store_resolve_current_bitcask(
+                state,
+                path_fun,
+                key,
+                entry,
+                expiry_context
+              )
+            end,
             @cold_read_timeout_ms
           )
 
@@ -578,24 +660,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp sm_store_current_read_value({:error, reason}), do: {:error, reason}
       defp sm_store_current_read_value(:missing), do: nil
 
-      defp sm_store_resolve_current_bitcask(state, path_fun, key, _observed_entry) do
-        now = apply_now_ms()
-
+      defp sm_store_resolve_current_bitcask(
+             state,
+             path_fun,
+             key,
+             _observed_entry,
+             expiry_context
+           ) do
         case :ets.lookup(state.ets, key) do
-          [{^key, value, 0, _lfu, _fid, _off, _vsize} = entry] when is_binary(value) ->
-            {:hot, value, entry}
+          [{^key, value, exp, _lfu, fid, off, vsize} = entry]
+          when is_integer(exp) and exp >= 0 ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live when is_binary(value) ->
+                {:hot, value, entry}
 
-          [{^key, value, exp, _lfu, _fid, _off, _vsize} = entry]
-          when exp > now and is_binary(value) ->
-            {:hot, value, entry}
+              :live when valid_cold_location(fid, off, vsize) ->
+                {:cold, path_fun.(state, fid), off, entry}
 
-          [{^key, nil, 0, _lfu, fid, off, vsize} = entry]
-          when valid_cold_location(fid, off, vsize) ->
-            {:cold, path_fun.(state, fid), off, entry}
+              :live ->
+                :missing
 
-          [{^key, nil, exp, _lfu, fid, off, vsize} = entry]
-          when exp > now and valid_cold_location(fid, off, vsize) ->
-            {:cold, path_fun.(state, fid), off, entry}
+              :expired ->
+                :missing
+
+              {:unsafe, reason} ->
+                record_state_read_failure(reason)
+                :missing
+            end
 
           _ ->
             :missing
@@ -908,43 +999,75 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp do_acquire_fetch_or_compute_locks(state, keys, owner_ref, expire_at_ms) do
         locks = Map.get(state, :fetch_or_compute_locks, %{})
         {state, expiry_index} = ensure_fetch_or_compute_lock_expiry_index(state, locks)
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
-        {locks, expiry_index} =
-          prune_fetch_or_compute_lock_expiries(
-            locks,
-            expiry_index,
-            now,
-            @fetch_or_compute_lock_prune_batch
-          )
+        case prune_fetch_or_compute_lock_expiries(
+               locks,
+               expiry_index,
+               expiry_context,
+               @fetch_or_compute_lock_prune_batch
+             ) do
+          {:error, reason} ->
+            {state, {:error, reason}}
 
-        indexed_state = put_fetch_or_compute_lock_state(state, locks, expiry_index)
+          {:ok, pruned_locks, pruned_expiry_index} ->
+            indexed_state =
+              put_fetch_or_compute_lock_state(state, pruned_locks, pruned_expiry_index)
 
-        conflict =
-          Enum.find(keys, fn key ->
-            case Map.get(locks, key) do
-              nil -> false
-              {^owner_ref, _exp} -> false
-              {_other, exp} -> exp > now
+            case fetch_or_compute_lock_conflict(
+                   keys,
+                   pruned_locks,
+                   owner_ref,
+                   expiry_context
+                 ) do
+              {:error, reason} ->
+                {state, {:error, reason}}
+
+              :conflict ->
+                {indexed_state, {:error, :keys_locked}}
+
+              :ok ->
+                {new_locks, new_expiry_index} =
+                  Enum.reduce(
+                    keys,
+                    {pruned_locks, pruned_expiry_index},
+                    fn key, {lock_acc, index_acc} ->
+                      index_acc =
+                        remove_fetch_or_compute_lock_expiry(
+                          index_acc,
+                          key,
+                          Map.get(lock_acc, key)
+                        )
+
+                      {
+                        Map.put(lock_acc, key, {owner_ref, expire_at_ms}),
+                        :gb_trees.enter({expire_at_ms, key}, owner_ref, index_acc)
+                      }
+                    end
+                  )
+
+                {put_fetch_or_compute_lock_state(state, new_locks, new_expiry_index), :ok}
             end
-          end)
-
-        if conflict do
-          {indexed_state, {:error, :keys_locked}}
-        else
-          {new_locks, new_expiry_index} =
-            Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
-              index_acc =
-                remove_fetch_or_compute_lock_expiry(index_acc, key, Map.get(lock_acc, key))
-
-              {
-                Map.put(lock_acc, key, {owner_ref, expire_at_ms}),
-                :gb_trees.enter({expire_at_ms, key}, owner_ref, index_acc)
-              }
-            end)
-
-          {put_fetch_or_compute_lock_state(state, new_locks, new_expiry_index), :ok}
         end
+      end
+
+      defp fetch_or_compute_lock_conflict(keys, locks, owner_ref, expiry_context) do
+        Enum.reduce_while(keys, :ok, fn key, :ok ->
+          case Map.get(locks, key) do
+            nil ->
+              {:cont, :ok}
+
+            {^owner_ref, _expire_at_ms} ->
+              {:cont, :ok}
+
+            {_other_owner, expire_at_ms} ->
+              case ExpiryContext.classify(expiry_context, expire_at_ms) do
+                :live -> {:halt, :conflict}
+                :expired -> {:cont, :ok}
+                {:unsafe, reason} -> {:halt, {:error, reason}}
+              end
+          end
+        end)
       end
 
       # Unlocks keys owned by the given owner_ref.
@@ -973,31 +1096,41 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp do_release_fetch_or_compute_locks_owned(state, keys, owner_ref) do
         locks = Map.get(state, :fetch_or_compute_locks, %{})
         {state, expiry_index} = ensure_fetch_or_compute_lock_expiry_index(state, locks)
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
-        owns_all? =
-          Enum.all?(keys, fn key ->
-            case Map.get(locks, key) do
-              {^owner_ref, expire_at_ms} when expire_at_ms > now -> true
-              _missing_expired_or_other_owner -> false
-            end
-          end)
+        case fetch_or_compute_owned_lock_status(keys, locks, owner_ref, expiry_context) do
+          :ok ->
+            {new_locks, new_expiry_index} =
+              Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
+                lock = Map.fetch!(lock_acc, key)
 
-        if owns_all? do
-          {new_locks, new_expiry_index} =
-            Enum.reduce(keys, {locks, expiry_index}, fn key, {lock_acc, index_acc} ->
-              lock = Map.fetch!(lock_acc, key)
+                {
+                  Map.delete(lock_acc, key),
+                  remove_fetch_or_compute_lock_expiry(index_acc, key, lock)
+                }
+              end)
 
-              {
-                Map.delete(lock_acc, key),
-                remove_fetch_or_compute_lock_expiry(index_acc, key, lock)
-              }
-            end)
+            {put_fetch_or_compute_lock_state(state, new_locks, new_expiry_index), :ok}
 
-          {put_fetch_or_compute_lock_state(state, new_locks, new_expiry_index), :ok}
-        else
-          {state, {:error, :not_lock_owner}}
+          {:error, reason} ->
+            {state, {:error, reason}}
         end
+      end
+
+      defp fetch_or_compute_owned_lock_status(keys, locks, owner_ref, expiry_context) do
+        Enum.reduce_while(keys, :ok, fn key, :ok ->
+          case Map.get(locks, key) do
+            {^owner_ref, expire_at_ms} ->
+              case ExpiryContext.classify(expiry_context, expire_at_ms) do
+                :live -> {:cont, :ok}
+                :expired -> {:halt, {:error, :not_lock_owner}}
+                {:unsafe, reason} -> {:halt, {:error, reason}}
+              end
+
+            _missing_or_other_owner ->
+              {:halt, {:error, :not_lock_owner}}
+          end
+        end)
       end
 
       defp ensure_fetch_or_compute_lock_expiry_index(state, locks) do
@@ -1015,27 +1148,45 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end
       end
 
-      defp prune_fetch_or_compute_lock_expiries(locks, expiry_index, _now, 0),
-        do: {locks, expiry_index}
+      defp prune_fetch_or_compute_lock_expiries(locks, expiry_index, _expiry_context, 0),
+        do: {:ok, locks, expiry_index}
 
-      defp prune_fetch_or_compute_lock_expiries(locks, expiry_index, now, remaining) do
+      defp prune_fetch_or_compute_lock_expiries(
+             locks,
+             expiry_index,
+             expiry_context,
+             remaining
+           ) do
         if :gb_trees.is_empty(expiry_index) do
-          {locks, expiry_index}
+          {:ok, locks, expiry_index}
         else
           {{expire_at_ms, key}, indexed_owner} = :gb_trees.smallest(expiry_index)
 
-          if expire_at_ms > now do
-            {locks, expiry_index}
-          else
-            expiry_index = :gb_trees.delete({expire_at_ms, key}, expiry_index)
+          case Map.get(locks, key) do
+            {^indexed_owner, ^expire_at_ms} ->
+              case ExpiryContext.classify(expiry_context, expire_at_ms) do
+                :live ->
+                  {:ok, locks, expiry_index}
 
-            locks =
-              case Map.get(locks, key) do
-                {^indexed_owner, ^expire_at_ms} -> Map.delete(locks, key)
-                _missing_or_renewed -> locks
+                :expired ->
+                  prune_fetch_or_compute_lock_expiries(
+                    Map.delete(locks, key),
+                    :gb_trees.delete({expire_at_ms, key}, expiry_index),
+                    expiry_context,
+                    remaining - 1
+                  )
+
+                {:unsafe, _reason} ->
+                  {:ok, locks, expiry_index}
               end
 
-            prune_fetch_or_compute_lock_expiries(locks, expiry_index, now, remaining - 1)
+            _missing_or_renewed ->
+              prune_fetch_or_compute_lock_expiries(
+                locks,
+                :gb_trees.delete({expire_at_ms, key}, expiry_index),
+                expiry_context,
+                remaining - 1
+              )
           end
         end
       end
@@ -1130,34 +1281,36 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       # mutations must prove that their exact owner still holds a live lock.
       defp check_fetch_or_compute_lock(state, key, nil) do
         locks = Map.get(state, :fetch_or_compute_locks, %{})
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
         case Map.get(locks, key) do
-          nil -> :ok
-          {_owner_ref, expire_at_ms} when expire_at_ms <= now -> :ok
-          {_owner_ref, _expire_at_ms} -> {:error, :key_locked}
+          nil ->
+            :ok
+
+          {_owner_ref, expire_at_ms} ->
+            case ExpiryContext.classify(expiry_context, expire_at_ms) do
+              :live -> {:error, :key_locked}
+              :expired -> :ok
+              {:unsafe, reason} -> {:error, reason}
+            end
         end
       end
 
       defp check_fetch_or_compute_lock(state, key, owner_ref) do
         locks = Map.get(state, :fetch_or_compute_locks, %{})
-        now = apply_now_ms()
+        expiry_context = ExpiryContext.capture()
 
         case Map.get(locks, key) do
-          {^owner_ref, expire_at_ms} when expire_at_ms > now ->
-            :ok
-
-          {^owner_ref, _expired_at_ms} ->
-            {:error, :key_lock_expired}
-
           nil ->
             {:error, :key_not_locked}
 
-          {_other_owner, expire_at_ms} when expire_at_ms <= now ->
-            {:error, :key_lock_expired}
-
-          {_other_owner, _expire_at_ms} ->
-            {:error, :key_locked}
+          {lock_owner, expire_at_ms} ->
+            case ExpiryContext.classify(expiry_context, expire_at_ms) do
+              :live when lock_owner == owner_ref -> :ok
+              :live -> {:error, :key_locked}
+              :expired -> {:error, :key_lock_expired}
+              {:unsafe, reason} -> {:error, reason}
+            end
         end
       end
 
@@ -1234,26 +1387,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
 
       defp sm_pending_value_meta(key) do
         pending = Process.get(:sm_pending_values)
+        expiry_context = ExpiryContext.capture()
 
         case pending && Map.get(pending, key) do
           :deleted ->
             :miss
 
-          {value, 0} ->
-            {:hit, value, 0}
+          {value, exp} when is_integer(exp) and exp >= 0 ->
+            case ExpiryContext.classify(expiry_context, exp) do
+              :live ->
+                {:hit, value, exp}
 
-          {value, exp} ->
-            if exp > apply_now_ms() do
-              {:hit, value, exp}
-            else
-              Process.put(:sm_pending_values, Map.delete(pending, key))
-              :miss
+              :expired ->
+                Process.put(:sm_pending_values, Map.delete(pending, key))
+                :miss
+
+              {:unsafe, reason} ->
+                record_state_read_failure(reason)
+                :miss
             end
 
           _ ->
             :miss
         end
       end
+
+      @doc false
+      def __sm_pending_value_meta_for_test__(key), do: sm_pending_value_meta(key)
     end
   end
 end

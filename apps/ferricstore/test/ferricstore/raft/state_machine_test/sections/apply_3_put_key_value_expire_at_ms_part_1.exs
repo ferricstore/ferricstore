@@ -150,7 +150,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           {_new_state, result} =
             StateMachine.apply(
               %{system_time: meta_now},
-              {{:put, "hlc_time_locked", "value", 0}, %{hlc_ts: {hlc_now, 0}}},
+              {{:put, "hlc_time_locked", "value", 0},
+               %{hlc_ts: {hlc_now, 0}, wall_time_ms: hlc_now}},
               locked_state
             )
 
@@ -171,7 +172,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             StateMachine.apply(
               %{system_time: local_now},
               {{:tx_execute, [{"SETEX", ["stamped_setex", "5", "value"]}], nil},
-               %{hlc_ts: {stamped_now, 0}}},
+               %{hlc_ts: {stamped_now, 0}, wall_time_ms: stamped_now}},
               state
             )
 
@@ -871,7 +872,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             StateMachine.apply(
               %{system_time: local_now},
               {{:tx_execute, [{"PEXPIRE", ["stamped_pexpire", "5000"]}], nil},
-               %{hlc_ts: {stamped_now, 0}}},
+               %{hlc_ts: {stamped_now, 0}, wall_time_ms: stamped_now}},
               state
             )
 
@@ -900,7 +901,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               %{system_time: local_now},
               {{:tx_execute,
                 [{"PEXPIREAT", ["stamped_pexpireat", Integer.to_string(expire_at_ms)]}], nil},
-               %{hlc_ts: {stamped_now, 0}}},
+               %{hlc_ts: {stamped_now, 0}, wall_time_ms: stamped_now}},
               state
             )
 
@@ -925,7 +926,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           {_new_state, [5_000]} =
             StateMachine.apply(
               %{system_time: local_now},
-              {{:tx_execute, [{"PTTL", ["stamped_pttl"]}], nil}, %{hlc_ts: {stamped_now, 0}}},
+              {{:tx_execute, [{"PTTL", ["stamped_pttl"]}], nil},
+               %{hlc_ts: {stamped_now, 0}, wall_time_ms: stamped_now}},
               state
             )
         end

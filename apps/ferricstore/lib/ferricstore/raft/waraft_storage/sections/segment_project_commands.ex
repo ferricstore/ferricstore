@@ -888,17 +888,28 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
       end
 
       defp with_segment_projection_command_time(
-             {_inner_command, %{hlc_ts: {physical_ms, logical} = remote_ts}},
+             {_inner_command,
+              %{
+                hlc_ts: {physical_ms, logical} = remote_ts,
+                wall_time_ms: wall_time_ms
+              }},
              fun
            )
-           when is_integer(physical_ms) and is_integer(logical) do
-        _ = HLC.update(remote_ts)
-        CommandTime.with_now_ms(physical_ms, fun)
-      rescue
-        _ -> CommandTime.with_now_ms(physical_ms, fun)
+           when is_integer(physical_ms) and is_integer(logical) and is_integer(wall_time_ms) do
+        try do
+          _ = HLC.update(remote_ts)
+        rescue
+          _error -> :ok
+        end
+
+        CommandTime.with_expiry_context(physical_ms, wall_time_ms, fun)
       end
 
       defp with_segment_projection_command_time(_command, fun), do: fun.()
+
+      @doc false
+      def __with_segment_projection_command_time_for_test__(command, fun),
+        do: with_segment_projection_command_time(command, fun)
 
       defp emit_segment_projection_apply_telemetry(
              sm_state,

@@ -27,8 +27,9 @@ defmodule Ferricstore.Raft.CommandBatching do
 
   def barrier_kind({:async, _origin, inner}) when is_tuple(inner), do: barrier_kind(inner)
 
-  def barrier_kind({inner, %{hlc_ts: {_physical_ms, _logical}}}) when is_tuple(inner),
-    do: barrier_kind(inner)
+  def barrier_kind({inner, %{hlc_ts: {_physical_ms, _logical}, wall_time_ms: wall_time_ms}})
+      when is_tuple(inner) and is_integer(wall_time_ms),
+      do: barrier_kind(inner)
 
   def barrier_kind(_command), do: nil
 

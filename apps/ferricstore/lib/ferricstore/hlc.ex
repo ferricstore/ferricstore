@@ -57,10 +57,6 @@ defmodule Ferricstore.HLC do
   `Ferricstore.CommandTime.now_ms/0` instead. It falls back to HLC outside
   Raft and returns the stamped log-entry time during state-machine apply.
 
-  When receiving a Raft heartbeat with a piggybacked timestamp:
-
-      :ok = Ferricstore.HLC.update(remote_timestamp)
-
   ## Timestamp representation
 
   A timestamp is a 2-tuple `{physical_ms, logical}` where:
@@ -74,25 +70,18 @@ defmodule Ferricstore.HLC do
 
   ## Cross-node synchronization
 
-  HLC sync across nodes currently happens via Raft heartbeats (~6/sec), giving
-  ~150ms max drift. This is sufficient for all current use cases:
-
-    * **Read-your-writes** on the writing node: guaranteed by local apply
-      barriers on committed entries.
-    * **Cross-node reads** after quorum write: guaranteed by Raft consensus —
-      all quorum nodes applied the command before the write returns.
-    * **TTL expiry**: second-granularity TTLs are unaffected by 150ms drift.
-    * **Cross-shard WATCH**: uses keydir/version tokens, not timestamps.
+  HLC sync across nodes currently happens when replicated commands are
+  applied. Heartbeat-only propagation requires support in the WARaft
+  transport and is not part of the current contract.
 
   ### Per-command HLC stamping
 
   Raft write paths stamp commands before submission via
   `Ferricstore.Raft.CommandClock`. The state machine handles commands wrapped
-  as `{inner_command, %{hlc_ts: {physical_ms, logical}}}`. When `apply/3`
-  processes a wrapped command, it calls `update/1` to merge the leader's
-  clock into the follower's HLC and uses the stamped physical millisecond
-  for TTL and lock expiry decisions. This gives deterministic per-command
-  causal time instead of follower-local apply time.
+  with both `hlc_ts` and `wall_time_ms`. When `apply/3` processes a wrapped
+  command, it merges the leader's HLC and installs the replicated clock
+  snapshot for TTL and lock-expiry decisions. This gives deterministic
+  per-command causal time and deterministic drift rejection.
 
   This is important for:
 
@@ -102,8 +91,8 @@ defmodule Ferricstore.HLC do
     2. **Cross-node causal ordering** — if a feature needs "write A
        happened-before write B" guarantees across nodes beyond Raft log
        ordering (e.g., conflict resolution in multi-leader setups).
-    3. **Observed drift exceeding 500ms** — if heartbeat intervals increase
-       due to network issues or overloaded nodes.
+    3. **Observed drift exceeding 500ms** — replicas make the same expiry
+       decision without consulting follower-local wall clocks.
 
   Submit commands through `Ferricstore.Raft.CommandClock`:
 
@@ -206,12 +195,20 @@ defmodule Ferricstore.HLC do
   """
   @spec now() :: timestamp()
   def now do
+    {timestamp, _wall_ms} = now_with_wall()
+    timestamp
+  end
+
+  @doc false
+  @spec now_with_wall() :: {timestamp(), non_neg_integer()}
+  def now_with_wall do
     case atomics_ref() do
       nil ->
-        {System.os_time(:millisecond), 0}
+        wall_ms = System.os_time(:millisecond)
+        {{wall_ms, 0}, wall_ms}
 
       ref ->
-        hlc_now_packed(ref)
+        hlc_now_packed_with_wall(ref)
     end
   end
 
@@ -233,15 +230,9 @@ defmodule Ferricstore.HLC do
   @doc """
   Merges a remote HLC timestamp received from another node.
 
-  Called in two contexts:
-
-    * **Raft heartbeats** (~6 calls/sec) -- the leader's HLC timestamp is
-      piggybacked on heartbeat RPCs. This is the current sync mechanism,
-      giving ~150ms max drift between nodes.
-    * **Per-command stamping** (not wired up) -- if commands are wrapped as
-      `{inner_command, %{hlc_ts: ts}}`, the state machine calls `update/1`
-      during `apply/3` on each follower, giving per-command causal sync.
-      See the module doc for when to enable this.
+  Replicated command apply calls this with the leader timestamp. Heartbeat
+  propagation can use the same function once the WARaft transport carries
+  replication metadata.
 
   This is lock-free on the normal path. Remote timestamp merges use the same
   packed atomic as `now/0` and publish with compare-and-swap, so state-machine
@@ -299,6 +290,37 @@ defmodule Ferricstore.HLC do
   def drift_exceeded? do
     drift_ms() >= @drift_reject_ms
   end
+
+  @doc false
+  @spec read_snapshot_ms() :: {non_neg_integer(), non_neg_integer()}
+  def read_snapshot_ms do
+    wall = System.os_time(:millisecond)
+
+    case atomics_ref() do
+      nil ->
+        {wall, wall}
+
+      ref ->
+        {physical, _logical} = unpack(:atomics.get(ref, @slot))
+        {max(physical, wall), wall}
+    end
+  end
+
+  @doc false
+  @spec unsafe_expiry?(non_neg_integer(), non_neg_integer(), non_neg_integer()) :: boolean()
+  def unsafe_expiry?(expire_at_ms, now_ms, wall_ms)
+      when is_integer(expire_at_ms) and expire_at_ms > 0 and is_integer(now_ms) and
+             is_integer(wall_ms) do
+    unsafe_drift?(now_ms, wall_ms) and expire_at_ms > wall_ms and
+      expire_at_ms <= now_ms
+  end
+
+  def unsafe_expiry?(_expire_at_ms, _now_ms, _wall_ms), do: false
+
+  @doc false
+  @spec unsafe_drift?(non_neg_integer(), non_neg_integer()) :: boolean()
+  def unsafe_drift?(now_ms, wall_ms) when is_integer(now_ms) and is_integer(wall_ms),
+    do: now_ms - wall_ms >= @drift_reject_ms
 
   @doc """
   Compares two HLC timestamps.
@@ -409,18 +431,19 @@ defmodule Ferricstore.HLC do
   #
   # Logical overflow (>65535 per ms): spills into physical bits,
   # effectively advancing the clock by 1ms. This is correct behavior.
-  defp hlc_now_packed(ref) do
+  defp hlc_now_packed_with_wall(ref) do
     current = :atomics.get(ref, @slot)
+    wall_ms = System.os_time(:millisecond)
 
     if current == @max_packed do
-      unpack(current)
+      {unpack(current), wall_ms}
     else
-      wall_packed = pack(System.os_time(:millisecond), 0)
+      wall_packed = pack(wall_ms, 0)
       target = max(wall_packed, current + 1)
 
       case :atomics.compare_exchange(ref, @slot, current, target) do
-        :ok -> unpack(target)
-        _actual -> hlc_now_packed(ref)
+        :ok -> {unpack(target), wall_ms}
+        _actual -> hlc_now_packed_with_wall(ref)
       end
     end
   end
