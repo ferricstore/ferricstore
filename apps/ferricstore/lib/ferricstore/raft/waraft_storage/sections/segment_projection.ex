@@ -26,15 +26,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       @segment_flush_page_size 512
 
-      defp prepare_segment_blob_batch_entries(entries) do
+      defp prepare_segment_blob_batch_entries(sm_state, entries) do
         entries
         |> Enum.reduce_while({:ok, [], []}, fn
           {key, value, expire_at_ms, :value}, {:ok, prepared, encoded_refs}
           when is_binary(key) and is_binary(value) ->
-            if non_neg_integer?(expire_at_ms) do
-              {:cont, {:ok, [{:value, key, value, expire_at_ms} | prepared], encoded_refs}}
-            else
-              {:halt, {:unsupported, :invalid_blob_batch_entry}}
+            cond do
+              not non_neg_integer?(expire_at_ms) ->
+                {:halt, {:unsupported, :invalid_blob_batch_entry}}
+
+              Ferricstore.Raft.ApplyLimits.validate_value(sm_state, value) != :ok ->
+                {:halt, {:unsupported, :value_limit}}
+
+              true ->
+                {:cont, {:ok, [{:value, key, value, expire_at_ms} | prepared], encoded_refs}}
             end
 
           {key, encoded_ref, expire_at_ms, :blob_ref}, {:ok, prepared, encoded_refs}
@@ -59,17 +64,25 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
         end
       end
 
-      defp prepare_segment_compound_blob_batch_entries(redis_key, entries) do
+      defp prepare_segment_compound_blob_batch_entries(sm_state, redis_key, entries) do
         entries
         |> Enum.reduce_while({:ok, [], []}, fn
           {compound_key, value, expire_at_ms, :value}, {:ok, prepared, encoded_refs}
           when is_binary(compound_key) and is_binary(value) ->
-            if compound_key_for_redis_key?(redis_key, compound_key) and
-                 non_neg_integer?(expire_at_ms) do
-              {:cont,
-               {:ok, [{:value, compound_key, value, expire_at_ms} | prepared], encoded_refs}}
-            else
-              {:halt, {:unsupported, :invalid_compound_blob_batch_entry}}
+            cond do
+              not compound_key_for_redis_key?(redis_key, compound_key) or
+                  not non_neg_integer?(expire_at_ms) ->
+                {:halt, {:unsupported, :invalid_compound_blob_batch_entry}}
+
+              true ->
+                case Ferricstore.Raft.ApplyLimits.validate_value(sm_state, value) do
+                  :ok ->
+                    {:cont,
+                     {:ok, [{:value, compound_key, value, expire_at_ms} | prepared], encoded_refs}}
+
+                  {:error, _reason} = error ->
+                    {:halt, error}
+                end
             end
 
           {compound_key, encoded_ref, expire_at_ms, :blob_ref}, {:ok, prepared, encoded_refs}
@@ -98,24 +111,38 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       defp verify_segment_blob_refs(_sm_state, []), do: :ok
 
       defp verify_segment_blob_refs(sm_state, encoded_refs) do
-        with {:ok, refs} <- decode_segment_blob_refs(encoded_refs),
-             :ok <- BlobStore.verify_many(sm_state.data_dir, sm_state.shard_index, refs) do
-          :ok
-        else
-          {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
+        case decode_segment_blob_refs(sm_state, encoded_refs) do
+          {:ok, refs} ->
+            case BlobStore.verify_many(sm_state.data_dir, sm_state.shard_index, refs) do
+              :ok -> :ok
+              {:error, reason} -> {:error, {:blob_ref_unavailable, reason}}
+            end
+
+          {:value_error, error} ->
+            error
+
+          {:blob_error, reason} ->
+            {:error, {:blob_ref_unavailable, reason}}
         end
       end
 
-      defp decode_segment_blob_refs(encoded_refs) do
+      defp decode_segment_blob_refs(sm_state, encoded_refs) do
         Enum.reduce_while(encoded_refs, {:ok, []}, fn encoded_ref, {:ok, refs} ->
           case BlobRef.decode(encoded_ref) do
-            {:ok, ref} -> {:cont, {:ok, [ref | refs]}}
-            :error -> {:halt, {:error, :invalid_blob_ref}}
+            {:ok, ref} ->
+              case Ferricstore.Raft.ApplyLimits.validate_value_size(sm_state, ref.size) do
+                :ok -> {:cont, {:ok, [ref | refs]}}
+                {:error, _reason} = error -> {:halt, {:value_error, error}}
+              end
+
+            :error ->
+              {:halt, {:blob_error, :invalid_blob_ref}}
           end
         end)
         |> case do
           {:ok, refs} -> {:ok, Enum.reverse(refs)}
-          {:error, _reason} = error -> error
+          {:value_error, _error} = error -> error
+          {:blob_error, _reason} = error -> error
         end
       end
 

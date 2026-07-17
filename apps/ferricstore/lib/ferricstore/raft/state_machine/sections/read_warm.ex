@@ -818,12 +818,35 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       end
 
       defp do_compound_put(state, redis_key, compound_key, value, expire_at_ms) do
+        case Ferricstore.Raft.ApplyLimits.validate_value(state, value) do
+          :ok ->
+            do_compound_put_value_validated(
+              state,
+              redis_key,
+              compound_key,
+              value,
+              expire_at_ms
+            )
+
+          {:error, reason} = error ->
+            record_state_write_failure(reason)
+            error
+        end
+      end
+
+      defp do_compound_put_value_validated(
+             state,
+             redis_key,
+             compound_key,
+             value,
+             expire_at_ms
+           ) do
         dedicated_path = promoted_compound_path(state, redis_key, compound_key)
 
         result =
           case dedicated_path do
             nil ->
-              do_put(state, compound_key, value, expire_at_ms)
+              do_put_value_validated(state, compound_key, value, expire_at_ms)
 
             path ->
               do_promoted_compound_put(state, redis_key, compound_key, value, expire_at_ms, path)
@@ -851,6 +874,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       defp do_compound_batch_put(_state, _redis_key, []), do: :ok
 
       defp do_compound_batch_put(state, redis_key, entries) do
+        with :ok <- validate_compound_batch_values(state, entries) do
+          do_compound_batch_put_value_validated(state, redis_key, entries)
+        end
+      end
+
+      defp do_compound_batch_put_value_validated(_state, _redis_key, []), do: :ok
+
+      defp do_compound_batch_put_value_validated(state, redis_key, entries) do
         case compound_batch_put_target(state, redis_key, entries) do
           :shared ->
             do_shared_compound_batch_put_fast(state, redis_key, entries)
@@ -882,7 +913,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
       defp do_compound_batch_put_generic(state, redis_key, entries) do
         Enum.reduce_while(entries, :ok, fn {compound_key, value, expire_at_ms}, :ok ->
-          case do_compound_put(state, redis_key, compound_key, value, expire_at_ms) do
+          case do_compound_put_value_validated(
+                 state,
+                 redis_key,
+                 compound_key,
+                 value,
+                 expire_at_ms
+               ) do
             :ok -> {:cont, :ok}
             {:error, _reason} = error -> {:halt, error}
           end

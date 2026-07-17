@@ -116,9 +116,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             {:error, :compound_batch_cross_key}
 
           true ->
-            compound_batch_checked_results(state, redis_key, entries, fn ->
-              do_apply_compound_batch_put_entries_unlocked(state, redis_key, entries)
-            end)
+            with :ok <- validate_compound_batch_values(state, entries) do
+              compound_batch_checked_results(state, redis_key, entries, fn ->
+                do_apply_compound_batch_put_entries_unlocked(state, redis_key, entries)
+              end)
+            end
         end
       end
 
@@ -133,7 +135,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
               end
 
             {:ok, {:compound_batch_put, ^redis_key, ^entries}} ->
-              do_compound_batch_put(state, redis_key, entries)
+              do_compound_batch_put_value_validated(state, redis_key, entries)
 
             {:ok, _other} ->
               {:error, :invalid_compound_batch_entry}
@@ -162,13 +164,46 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             {:error, :compound_batch_cross_key}
 
           true ->
-            with :ok <- validate_raw_compound_blob_batch_target(state, redis_key, entries),
+            with :ok <- validate_compound_blob_batch_values(state, entries),
+                 :ok <- validate_raw_compound_blob_batch_target(state, redis_key, entries),
                  {:ok, prepared_entries} <- prepare_compound_blob_batch_entries(state, entries) do
               compound_batch_checked_results(state, redis_key, entries, fn ->
                 do_compound_blob_batch_put(state, redis_key, prepared_entries)
               end)
             end
         end
+      end
+
+      defp validate_compound_batch_values(state, entries) do
+        Enum.reduce_while(entries, :ok, fn
+          {_compound_key, value, _expire_at_ms}, :ok ->
+            case Ferricstore.Raft.ApplyLimits.validate_value(state, value) do
+              :ok -> {:cont, :ok}
+              {:error, _reason} = error -> {:halt, error}
+            end
+        end)
+      end
+
+      defp validate_compound_blob_batch_values(state, entries) do
+        Enum.reduce_while(entries, :ok, fn
+          {_compound_key, value, _expire_at_ms, :value}, :ok ->
+            case Ferricstore.Raft.ApplyLimits.validate_value(state, value) do
+              :ok -> {:cont, :ok}
+              {:error, _reason} = error -> {:halt, error}
+            end
+
+          {_compound_key, encoded_ref, _expire_at_ms, :blob_ref}, :ok ->
+            case BlobRef.decode(encoded_ref) do
+              {:ok, ref} ->
+                case Ferricstore.Raft.ApplyLimits.validate_value_size(state, ref.size) do
+                  :ok -> {:cont, :ok}
+                  {:error, _reason} = error -> {:halt, error}
+                end
+
+              :error ->
+                {:halt, {:error, {:blob_ref_unavailable, :invalid_blob_ref}}}
+            end
+        end)
       end
 
       defp validate_raw_compound_blob_batch_target(_state, _redis_key, []), do: :ok
@@ -252,7 +287,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
         prepared_entries
         |> Enum.reduce_while(:ok, fn
           {:value, compound_key, value, expire_at_ms}, :ok ->
-            case do_compound_put(state, redis_key, compound_key, value, expire_at_ms) do
+            case do_compound_put_value_validated(
+                   state,
+                   redis_key,
+                   compound_key,
+                   value,
+                   expire_at_ms
+                 ) do
               :ok -> {:cont, :ok}
               {:error, _reason} = error -> {:halt, error}
             end

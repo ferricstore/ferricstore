@@ -4,6 +4,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
+      alias Ferricstore.Raft.WARaftStorage
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey}
 
       describe "replicated batch value limits" do
@@ -322,6 +323,185 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
                    :ets.lookup(ets, existing_key)
 
           assert [] == :ets.lookup(ets, "batch-limit:blob:msetnx:invalid-ref")
+        end
+
+        @tag :compound_batch_value_limits
+        test "compound batches reject an oversized member atomically", %{
+          state: state,
+          ets: ets,
+          shard_index: shard_index
+        } do
+          state = batch_value_limit_state(state, 4)
+          error = {:error, "ERR value too large (5 bytes, max 4 bytes)"}
+
+          for {command_tag, representation, prefix} <- [
+                {:compound_batch_put, :plain, "plain"},
+                {:compound_blob_batch_put, :value, "blob-inline"}
+              ] do
+            redis_key = "batch-limit:compound:#{prefix}"
+            valid = CompoundKey.hash_field(redis_key, "valid")
+            oversized = CompoundKey.hash_field(redis_key, "oversized")
+
+            command =
+              case representation do
+                :plain ->
+                  {command_tag, redis_key, [{valid, "1234", 0}, {oversized, "12345", 0}]}
+
+                :value ->
+                  {command_tag, redis_key,
+                   [{valid, "1234", 0, :value}, {oversized, "12345", 0, :value}]}
+              end
+
+            assert {_state, ^error} = StateMachine.apply(%{}, command, state)
+            assert [] == :ets.lookup(ets, valid)
+            assert [] == :ets.lookup(ets, oversized)
+          end
+
+          redis_key = "batch-limit:compound:blob-ref"
+          ref_key = CompoundKey.hash_field(redis_key, "oversized")
+          assert {:ok, ref} = BlobStore.put(state.data_dir, shard_index, "12345")
+
+          assert {_state, ^error} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_blob_batch_put, redis_key,
+                      [{ref_key, BlobRef.encode!(ref), 0, :blob_ref}]},
+                     state
+                   )
+
+          assert [] == :ets.lookup(ets, ref_key)
+
+          exact_key = CompoundKey.hash_field("batch-limit:compound:exact", "field")
+
+          assert {_state, {:ok, [:ok]}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_batch_put, "batch-limit:compound:exact",
+                      [{exact_key, "1234", 0}]},
+                     state
+                   )
+
+          assert [{^exact_key, "1234", 0, _lfu, _fid, _offset, 4}] =
+                   :ets.lookup(ets, exact_key)
+        end
+
+        @tag :compound_batch_value_limits
+        test "promoted compound batches validate all values before append", %{
+          state: state,
+          ets: ets,
+          shard_index: shard_index
+        } do
+          redis_key = "batch-limit:promoted-compound"
+          existing = CompoundKey.hash_field(redis_key, "existing")
+          new_field = CompoundKey.hash_field(redis_key, "new")
+
+          {state, _log_path} =
+            promoted_single_fixture(state, ets, shard_index, redis_key, :hash, [
+              {existing, "old", 0}
+            ])
+
+          state = batch_value_limit_state(state, 4)
+          original = :ets.lookup(ets, existing)
+
+          assert {_state, {:error, "ERR value too large (5 bytes, max 4 bytes)"}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_batch_put, redis_key,
+                      [{existing, "12345", 0}, {new_field, "1234", 0}]},
+                     state
+                   )
+
+          assert original == :ets.lookup(ets, existing)
+          assert [] == :ets.lookup(ets, new_field)
+
+          assert {_state, {:error, "ERR value too large (5 bytes, max 4 bytes)"}} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_put, existing, "12345", 0},
+                     state
+                   )
+
+          assert original == :ets.lookup(ets, existing)
+        end
+
+        @tag :segment_value_limit_projection
+        test "segment projection preflights value limits before any prefix mutation", %{
+          state: state,
+          ets: ets,
+          shard_index: shard_index
+        } do
+          state = batch_value_limit_state(state, 4)
+          position = {:raft_log_pos, 42, 1}
+          error = {:error, "ERR value too large (5 bytes, max 4 bytes)"}
+          batch_valid = "segment-unit:batch-valid"
+          batch_oversized = "segment-unit:batch-oversized"
+
+          assert :unsupported =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:put_batch, [{batch_valid, "1234", 0}, {batch_oversized, "12345", 0}]},
+                     position,
+                     state
+                   )
+
+          assert [] == :ets.lookup(ets, batch_valid)
+          assert [] == :ets.lookup(ets, batch_oversized)
+
+          generic_valid = "segment-unit:generic-valid"
+          generic_oversized = "segment-unit:generic-oversized"
+
+          assert :unsupported =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:batch,
+                      [
+                        {:put, generic_valid, "1234", 0},
+                        {:put, generic_oversized, "12345", 0}
+                      ]},
+                     position,
+                     state
+                   )
+
+          assert [] == :ets.lookup(ets, generic_valid)
+          assert [] == :ets.lookup(ets, generic_oversized)
+
+          redis_key = "segment-unit:compound"
+          compound_valid = CompoundKey.hash_field(redis_key, "valid")
+          compound_oversized = CompoundKey.hash_field(redis_key, "oversized")
+
+          assert :unsupported =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:compound_batch_put, redis_key,
+                      [{compound_valid, "1234", 0}, {compound_oversized, "12345", 0}]},
+                     position,
+                     state
+                   )
+
+          assert [] == :ets.lookup(ets, compound_valid)
+          assert [] == :ets.lookup(ets, compound_oversized)
+
+          assert {:ok, ref} = BlobStore.put(state.data_dir, shard_index, "12345")
+          encoded_ref = BlobRef.encode!(ref)
+
+          assert {:ok, _same_state, ^error, 0} =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:put_blob_batch,
+                      [{"segment-unit:blob-oversized", encoded_ref, 0, :blob_ref}]},
+                     position,
+                     state
+                   )
+
+          assert [] == :ets.lookup(ets, "segment-unit:blob-oversized")
+
+          exact_key = "segment-unit:exact"
+
+          assert {:ok, _new_state, :ok, 1} =
+                   WARaftStorage.__segment_project_command_for_test__(
+                     {:put, exact_key, "1234", 0},
+                     position,
+                     state
+                   )
+
+          assert [{^exact_key, "1234", 0, _lfu, {:waraft_segment, 42}, _offset, 4}] =
+                   :ets.lookup(ets, exact_key)
         end
       end
 

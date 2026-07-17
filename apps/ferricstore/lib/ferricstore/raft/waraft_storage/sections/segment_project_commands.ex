@@ -211,7 +211,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
       defp segment_project_command({:put_blob_batch, entries}, position, sm_state)
            when is_list(entries) do
-        with {:ok, prepared, encoded_refs} <- prepare_segment_blob_batch_entries(entries),
+        with {:ok, prepared, encoded_refs} <-
+               prepare_segment_blob_batch_entries(sm_state, entries),
              true <- segment_project_prepared_string_overwrites_safe?(sm_state, prepared),
              :ok <- verify_segment_blob_refs(sm_state, encoded_refs) do
           {new_sm_state, results, applied_count} =
@@ -293,7 +294,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
              sm_state
            )
            when is_binary(redis_key) and is_list(entries) do
-        case segment_compound_batch_put_shape(redis_key, entries) do
+        case segment_compound_batch_put_shape(sm_state, redis_key, entries) do
           {:ok, last_compound_key, count} ->
             case segment_project_check_fetch_or_compute_lock(sm_state, redis_key, nil) do
               :ok ->
@@ -332,7 +333,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
            )
            when is_binary(redis_key) and is_list(entries) do
         with {:ok, prepared, encoded_refs} <-
-               prepare_segment_compound_blob_batch_entries(redis_key, entries),
+               prepare_segment_compound_blob_batch_entries(sm_state, redis_key, entries),
              true <-
                segment_projectable_prepared_compound_blob_batch?(sm_state, redis_key, prepared),
              :ok <- verify_segment_blob_refs(sm_state, encoded_refs) do
@@ -612,6 +613,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
       defp segment_projectable_put?(sm_state, key, value, expire_at_ms) do
         is_binary(key) and is_binary(value) and non_neg_integer?(expire_at_ms) and
+          Ferricstore.Raft.ApplyLimits.validate_value(sm_state, value) == :ok and
           segment_projection_fast_key?(key) and
           not segment_blob_candidate?(sm_state, value) and
           segment_project_string_overwrite_safe?(sm_state, key)
@@ -626,8 +628,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
       defp segment_project_batch_string_overwrites_safe?(sm_state, entries) do
         Enum.all?(entries, fn
-          {key, _value, _expire_at_ms} when is_binary(key) ->
-            segment_project_string_overwrite_safe?(sm_state, key)
+          {key, value, _expire_at_ms} when is_binary(key) and is_binary(value) ->
+            Ferricstore.Raft.ApplyLimits.validate_value(sm_state, value) == :ok and
+              segment_project_string_overwrite_safe?(sm_state, key)
 
           _invalid ->
             false
@@ -730,11 +733,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
            ) do
         compound_key_for_redis_key?(redis_key, compound_key) and is_binary(value) and
           non_neg_integer?(expire_at_ms) and
+          Ferricstore.Raft.ApplyLimits.validate_value(sm_state, value) == :ok and
           segment_shared_compound_projection_safe?(sm_state, redis_key, compound_key, 1)
       end
 
       defp segment_projectable_compound_batch_put?(sm_state, redis_key, entries) do
-        case segment_compound_batch_put_shape(redis_key, entries) do
+        case segment_compound_batch_put_shape(sm_state, redis_key, entries) do
           {:ok, last_compound_key, count} ->
             segment_compound_batch_target_safe?(
               sm_state,
@@ -748,12 +752,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
         end
       end
 
-      defp segment_compound_batch_put_shape(redis_key, entries) do
+      defp segment_compound_batch_put_shape(sm_state, redis_key, entries) do
         Enum.reduce_while(entries, {:ok, nil, 0}, fn
           {compound_key, value, expire_at_ms}, {:ok, _last_compound_key, count}
           when is_binary(value) ->
             if compound_key_for_redis_key?(redis_key, compound_key) and
-                 non_neg_integer?(expire_at_ms) do
+                 non_neg_integer?(expire_at_ms) and
+                 Ferricstore.Raft.ApplyLimits.validate_value(sm_state, value) == :ok do
               {:cont, {:ok, compound_key, count + 1}}
             else
               {:halt, :error}
@@ -1046,6 +1051,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
               owner_ref
             ),
             do: segment_project_check_fetch_or_compute_lock(sm_state, key, owner_ref)
+
+        @doc false
+        def __segment_project_command_for_test__(command, position, sm_state),
+          do: segment_project_command(command, position, sm_state)
       end
 
       defp emit_segment_projection_apply_telemetry(

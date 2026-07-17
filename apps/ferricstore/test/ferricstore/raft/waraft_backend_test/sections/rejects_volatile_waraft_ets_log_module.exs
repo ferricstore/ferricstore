@@ -734,6 +734,77 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         end
       end
 
+      @tag :segment_value_limit_guard
+      test "segment projection enforces replicated value limits for every batch shape", %{
+        ctx: ctx
+      } do
+        previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+        apply_context = Ferricstore.Raft.ApplyContext.new(max_value_size: 4)
+        limited_ctx = %{ctx | apply_context: apply_context, max_value_size: 4}
+        error = {:error, "ERR value too large (5 bytes, max 4 bytes)"}
+
+        try do
+          Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+
+          assert :ok =
+                   WARaftBackend.start(limited_ctx,
+                     log_module: :ferricstore_waraft_spike_segment_log
+                   )
+
+          assert ^error = WARaftBackend.write(0, {:put, "segment-limit:put", "12345", 0})
+          assert nil == Router.get(limited_ctx, "segment-limit:put")
+
+          assert {:ok, [:ok, ^error]} =
+                   WARaftBackend.write(
+                     0,
+                     {:put_batch,
+                      [
+                        {"segment-limit:batch-valid", "1234", 0},
+                        {"segment-limit:batch-oversized", "12345", 0}
+                      ]}
+                   )
+
+          assert "1234" == Router.get(limited_ctx, "segment-limit:batch-valid")
+          assert nil == Router.get(limited_ctx, "segment-limit:batch-oversized")
+
+          assert {:ok, ref} = BlobStore.put(limited_ctx.data_dir, 0, "12345")
+          encoded_ref = BlobRef.encode!(ref)
+
+          assert ^error =
+                   WARaftBackend.write(
+                     0,
+                     {:put_blob_batch, [{"segment-limit:blob-ref", encoded_ref, 0, :blob_ref}]}
+                   )
+
+          assert nil == Router.get(limited_ctx, "segment-limit:blob-ref")
+
+          redis_key = "segment-limit:compound"
+          valid_field = CompoundKey.hash_field(redis_key, "valid")
+          oversized_field = CompoundKey.hash_field(redis_key, "oversized")
+
+          assert ^error =
+                   WARaftBackend.write(
+                     0,
+                     {:compound_batch_put, redis_key,
+                      [{valid_field, "1234", 0}, {oversized_field, "12345", 0}]}
+                   )
+
+          assert nil == Router.compound_get(limited_ctx, redis_key, valid_field)
+          assert nil == Router.compound_get(limited_ctx, redis_key, oversized_field)
+
+          assert ^error =
+                   WARaftBackend.write(
+                     0,
+                     {:compound_blob_batch_put, redis_key,
+                      [{oversized_field, "12345", 0, :value}]}
+                   )
+
+          assert nil == Router.compound_get(limited_ctx, redis_key, oversized_field)
+        after
+          restore_env(:waraft_storage_apply_mode, previous_mode)
+        end
+      end
+
       test "unified segment fast path stays enabled for unrelated fetch-or-compute locks", %{
         ctx: ctx
       } do
