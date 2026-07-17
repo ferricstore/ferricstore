@@ -14,6 +14,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
       alias Ferricstore.Commands.HyperLogLog
+      alias Ferricstore.Commands.ProbParameters
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Hibernation
@@ -760,7 +761,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp create_bloom_metadata(state, key, num_bits, num_hashes, prob_meta) do
         path = prob_path(state, key, "bloom")
 
-        with :ok <- ensure_prob_dir(state),
+        with :ok <- validate_bloom_dimensions(num_bits, num_hashes),
+             :ok <- ensure_prob_dir(state),
              :ok <-
                prob_create_and_fsync(
                  state,
@@ -784,10 +786,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
 
       defp bloom_meta_with_path(_prob_meta, path), do: {:bloom_meta, %{path: path}}
 
+      defp validate_bloom_dimensions(num_bits, num_hashes) do
+        case ProbParameters.validate_bloom_dimensions(num_bits, num_hashes) do
+          :ok -> :ok
+          {:error, _reason} -> {:error, :invalid_bloom_dimensions}
+        end
+      end
+
       defp create_cms_metadata(state, key, width, depth) do
         path = prob_path(state, key, "cms")
 
-        with :ok <- ensure_prob_dir(state),
+        with :ok <- validate_cms_dimensions(width, depth),
+             :ok <- ensure_prob_dir(state),
              :ok <- prob_create_and_fsync(state, path, NIF.cms_file_create(path, width, depth)) do
           meta_val = {:cms_meta, %{width: width, depth: depth}}
           do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
@@ -795,12 +805,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
-      defp maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
+      defp maybe_create_cms_merge_dst(state, dst_path, dst_key, width, depth) do
         if Ferricstore.FS.exists?(dst_path) do
           :ok
         else
-          %{width: width, depth: depth} = create_params
-
           with :ok <-
                  prob_create_and_fsync(
                    state,
@@ -814,10 +822,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
+      defp validate_cms_create_params(%{width: width, depth: depth}) do
+        with :ok <- validate_cms_dimensions(width, depth) do
+          {:ok, width, depth}
+        end
+      end
+
+      defp validate_cms_create_params(_invalid),
+        do: {:error, :invalid_cms_dimensions}
+
+      defp validate_cms_dimensions(width, depth) do
+        case ProbParameters.validate_cms_dimensions(width, depth) do
+          :ok -> :ok
+          {:error, _reason} -> {:error, :invalid_cms_dimensions}
+        end
+      end
+
       defp create_cuckoo_metadata(state, key, capacity, bucket_size) do
         path = prob_path(state, key, "cuckoo")
 
-        with :ok <- ensure_prob_dir(state),
+        with :ok <- validate_cuckoo_parameters(capacity, bucket_size),
+             :ok <- ensure_prob_dir(state),
              :ok <-
                prob_create_and_fsync(
                  state,
@@ -830,10 +855,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
+      defp validate_cuckoo_parameters(capacity, bucket_size) do
+        case ProbParameters.validate_cuckoo_parameters(capacity, bucket_size) do
+          :ok -> :ok
+          {:error, _reason} -> {:error, :invalid_cuckoo_parameters}
+        end
+      end
+
       defp create_topk_metadata(state, key, k, width, depth) do
         path = prob_path(state, key, "topk")
 
-        with :ok <- ensure_prob_dir(state),
+        with :ok <- validate_topk_parameters(k, width, depth),
+             :ok <- ensure_prob_dir(state),
              :ok <-
                prob_create_and_fsync(
                  state,
@@ -843,6 +876,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
           meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth}}
           do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
           :ok
+        end
+      end
+
+      defp validate_topk_parameters(k, width, depth) do
+        case ProbParameters.validate_topk_parameters(k, width, depth) do
+          :ok -> :ok
+          {:error, _reason} -> {:error, :invalid_topk_parameters}
         end
       end
 
@@ -905,16 +945,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp normalize_prob_create_result(other), do: {:error, {:unexpected_prob_nif_result, other}}
 
       # Auto-creates a bloom filter file if it doesn't exist.
-      defp auto_create_bloom_if_needed(state, path, key, auto_create_params) do
+      defp validate_bloom_auto_create_params(nil), do: {:ok, nil}
+
+      defp validate_bloom_auto_create_params(
+             %{num_bits: num_bits, num_hashes: num_hashes} = params
+           ) do
+        with :ok <- validate_bloom_dimensions(num_bits, num_hashes) do
+          {:ok, {num_bits, num_hashes, params}}
+        end
+      end
+
+      defp validate_bloom_auto_create_params(_invalid),
+        do: {:error, :invalid_bloom_dimensions}
+
+      defp auto_create_bloom_if_needed(state, path, key, validated_params) do
         cond do
           Ferricstore.FS.exists?(path) ->
             :ok
 
-          auto_create_params ->
-            %{num_bits: nb, num_hashes: nh} = auto_create_params
+          not is_nil(validated_params) ->
+            {num_bits, num_hashes, params} = validated_params
 
-            with :ok <- prob_create_and_fsync(state, path, NIF.bloom_file_create(path, nb, nh)) do
-              meta_val = {:bloom_meta, Map.merge(auto_create_params, %{path: path})}
+            with :ok <-
+                   prob_create_and_fsync(
+                     state,
+                     path,
+                     NIF.bloom_file_create(path, num_bits, num_hashes)
+                   ) do
+              meta_val = {:bloom_meta, Map.put(params, :path, path)}
               do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
               :ok
             end
@@ -933,16 +991,32 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       # Auto-creates a cuckoo filter file if it doesn't exist.
-      defp auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
+      defp validate_cuckoo_auto_create_params(nil), do: {:ok, nil}
+
+      defp validate_cuckoo_auto_create_params(%{capacity: capacity, bucket_size: bucket_size}) do
+        with :ok <- validate_cuckoo_parameters(capacity, bucket_size) do
+          {:ok, {capacity, bucket_size}}
+        end
+      end
+
+      defp validate_cuckoo_auto_create_params(_invalid),
+        do: {:error, :invalid_cuckoo_parameters}
+
+      defp auto_create_cuckoo_if_needed(state, path, key, validated_params) do
         cond do
           Ferricstore.FS.exists?(path) ->
             :ok
 
-          auto_create_params ->
-            %{capacity: cap, bucket_size: bs} = auto_create_params
+          not is_nil(validated_params) ->
+            {capacity, bucket_size} = validated_params
 
-            with :ok <- prob_create_and_fsync(state, path, NIF.cuckoo_file_create(path, cap, bs)) do
-              meta_val = {:cuckoo_meta, %{capacity: cap}}
+            with :ok <-
+                   prob_create_and_fsync(
+                     state,
+                     path,
+                     NIF.cuckoo_file_create(path, capacity, bucket_size)
+                   ) do
+              meta_val = {:cuckoo_meta, %{capacity: capacity}}
               do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
               :ok
             end

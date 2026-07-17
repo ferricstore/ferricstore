@@ -1610,8 +1610,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           path = prob_path(state, key, "bloom")
 
-          with :ok <- ensure_prob_dir(state) do
-            case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
+          with {:ok, validated_params} <-
+                 validate_bloom_auto_create_params(auto_create_params),
+               :ok <- ensure_prob_dir(state) do
+            case auto_create_bloom_if_needed(state, path, key, validated_params) do
               :ok -> NIF.bloom_file_add(path, element)
               {:error, _reason} = error -> error
             end
@@ -1624,10 +1626,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           command = {:bloom_madd, key, elements, auto_create_params}
 
           with :ok <- admit_apply_command_work(state, command),
+               {:ok, validated_params} <-
+                 validate_bloom_auto_create_params(auto_create_params),
                :ok <- ensure_prob_dir(state) do
             path = prob_path(state, key, "bloom")
 
-            case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
+            case auto_create_bloom_if_needed(state, path, key, validated_params) do
               :ok -> NIF.bloom_file_madd(path, elements)
               {:error, _reason} = error -> error
             end
@@ -1659,6 +1663,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           command = {:cms_merge, dst_key, src_keys, weights, create_params}
 
           with :ok <- admit_apply_command_work(state, command),
+               {:ok, width, depth} <- validate_cms_create_params(create_params),
                :ok <-
                  validate_cms_merge_locality(
                    state,
@@ -1671,7 +1676,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
             dst_path = prob_path(state, dst_key, "cms")
             src_paths = cms_source_paths(state, src_keys)
 
-            case maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
+            case maybe_create_cms_merge_dst(state, dst_path, dst_key, width, depth) do
               :ok -> NIF.cms_file_merge(dst_path, src_paths, weights)
               {:error, _reason} = error -> error
             end
@@ -1691,8 +1696,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           path = prob_path(state, key, "cuckoo")
 
-          with :ok <- ensure_prob_dir(state) do
-            case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
+          with {:ok, validated_params} <-
+                 validate_cuckoo_auto_create_params(auto_create_params),
+               :ok <- ensure_prob_dir(state) do
+            case auto_create_cuckoo_if_needed(state, path, key, validated_params) do
               :ok -> NIF.cuckoo_file_add(path, element)
               {:error, _reason} = error -> error
             end
@@ -1704,8 +1711,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           path = prob_path(state, key, "cuckoo")
 
-          with :ok <- ensure_prob_dir(state) do
-            case auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
+          with {:ok, validated_params} <-
+                 validate_cuckoo_auto_create_params(auto_create_params),
+               :ok <- ensure_prob_dir(state) do
+            case auto_create_cuckoo_if_needed(state, path, key, validated_params) do
               :ok -> NIF.cuckoo_file_addnx(path, element)
               {:error, _reason} = error -> error
             end

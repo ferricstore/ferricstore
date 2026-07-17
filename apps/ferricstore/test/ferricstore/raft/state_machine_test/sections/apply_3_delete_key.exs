@@ -916,6 +916,264 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
       end
 
       describe "apply/3 probabilistic native failures" do
+        @tag :prob_command_validation
+        test "Bloom create rejects malformed dimensions before side effects", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          invalid_dimensions = [
+            {nil, 1},
+            {1, nil},
+            {0, 1},
+            {1, 0},
+            {8_589_934_593, 1},
+            {1, 1_025}
+          ]
+
+          Enum.reduce(invalid_dimensions, state, fn {num_bits, num_hashes}, acc_state ->
+            key = "bloom_create_invalid:#{System.unique_integer([:positive])}"
+            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+
+            assert {next_state, {:error, :invalid_bloom_dimensions}} =
+                     StateMachine.apply(
+                       %{},
+                       {:bloom_create, key, num_bits, num_hashes, {:bloom_meta, %{}}},
+                       acc_state
+                     )
+
+            refute File.exists?(path)
+            assert [] == :ets.lookup(ets, key)
+            next_state
+          end)
+
+          refute File.exists?(Path.join(dir, "prob"))
+        end
+
+        @tag :prob_command_validation
+        test "Bloom auto-create rejects malformed parameter maps before side effects", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          invalid_params = [
+            %{},
+            %{num_bits: nil, num_hashes: 1},
+            %{num_bits: 1, num_hashes: 0},
+            %{num_bits: 8_589_934_593, num_hashes: 1},
+            %{num_bits: 1, num_hashes: 1_025}
+          ]
+
+          command_builders = [
+            fn key, params -> {:bloom_add, key, "item", params} end,
+            fn key, params -> {:bloom_madd, key, ["item"], params} end
+          ]
+
+          Enum.reduce(command_builders, state, fn build_command, command_state ->
+            Enum.reduce(invalid_params, command_state, fn params, acc_state ->
+              key = "bloom_auto_invalid:#{System.unique_integer([:positive])}"
+              path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+
+              assert {next_state, {:error, :invalid_bloom_dimensions}} =
+                       StateMachine.apply(%{}, build_command.(key, params), acc_state)
+
+              refute File.exists?(path)
+              assert [] == :ets.lookup(ets, key)
+              next_state
+            end)
+          end)
+
+          refute File.exists?(Path.join(dir, "prob"))
+        end
+
+        @tag :prob_command_validation
+        test "Cuckoo create rejects malformed parameters before side effects", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          invalid_parameters = [
+            {nil, 4},
+            {0, 4},
+            {268_435_457, 4},
+            {1, nil},
+            {1, 0},
+            {1, 1},
+            {1, 5}
+          ]
+
+          Enum.reduce(invalid_parameters, state, fn {capacity, bucket_size}, acc_state ->
+            key = "cuckoo_create_invalid:#{System.unique_integer([:positive])}"
+            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
+
+            assert {next_state, {:error, :invalid_cuckoo_parameters}} =
+                     StateMachine.apply(
+                       %{},
+                       {:cuckoo_create, key, capacity, bucket_size},
+                       acc_state
+                     )
+
+            refute File.exists?(path)
+            assert [] == :ets.lookup(ets, key)
+            next_state
+          end)
+
+          refute File.exists?(Path.join(dir, "prob"))
+        end
+
+        @tag :prob_command_validation
+        test "Cuckoo auto-create rejects malformed parameter maps before side effects", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          invalid_params = [
+            %{},
+            %{capacity: nil, bucket_size: 4},
+            %{capacity: 0, bucket_size: 4},
+            %{capacity: 268_435_457, bucket_size: 4},
+            %{capacity: 1, bucket_size: 0},
+            %{capacity: 1, bucket_size: 1}
+          ]
+
+          command_builders = [
+            fn key, params -> {:cuckoo_add, key, "item", params} end,
+            fn key, params -> {:cuckoo_addnx, key, "item", params} end
+          ]
+
+          Enum.reduce(command_builders, state, fn build_command, command_state ->
+            Enum.reduce(invalid_params, command_state, fn params, acc_state ->
+              key = "cuckoo_auto_invalid:#{System.unique_integer([:positive])}"
+              path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
+
+              assert {next_state, {:error, :invalid_cuckoo_parameters}} =
+                       StateMachine.apply(%{}, build_command.(key, params), acc_state)
+
+              refute File.exists?(path)
+              assert [] == :ets.lookup(ets, key)
+              next_state
+            end)
+          end)
+
+          refute File.exists?(Path.join(dir, "prob"))
+        end
+
+        @tag :prob_command_validation
+        test "TopK create rejects malformed parameters before side effects", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          invalid_parameters = [
+            {nil, 1, 1},
+            {1, nil, 1},
+            {1, 1, nil},
+            {0, 1, 1},
+            {1, 0, 1},
+            {1, 1, 0},
+            {100_001, 1, 1},
+            {1, 1_048_577, 1},
+            {1, 1, 1_048_577}
+          ]
+
+          Enum.reduce(invalid_parameters, state, fn {k, width, depth}, acc_state ->
+            key = "topk_create_invalid:#{System.unique_integer([:positive])}"
+            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "topk")
+
+            assert {next_state, {:error, :invalid_topk_parameters}} =
+                     StateMachine.apply(
+                       %{},
+                       {:topk_create, key, k, width, depth},
+                       acc_state
+                     )
+
+            refute File.exists?(path)
+            assert [] == :ets.lookup(ets, key)
+            next_state
+          end)
+
+          refute File.exists?(Path.join(dir, "prob"))
+        end
+
+        @tag :prob_command_validation
+        test "CMS merge rejects malformed destination dimensions before side effects", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          invalid_params = [
+            nil,
+            %{},
+            %{width: 0, depth: 1},
+            %{width: 1, depth: 0},
+            %{width: 16_777_217, depth: 1},
+            %{width: 1, depth: 1_025}
+          ]
+
+          Enum.reduce(invalid_params, state, fn params, acc_state ->
+            key = "cms_merge_invalid:#{System.unique_integer([:positive])}"
+            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+
+            assert {next_state, {:error, :invalid_cms_dimensions}} =
+                     StateMachine.apply(
+                       %{},
+                       {:cms_merge, key, [], [], params},
+                       acc_state
+                     )
+
+            refute File.exists?(path)
+            assert [] == :ets.lookup(ets, key)
+            next_state
+          end)
+
+          refute File.exists?(Path.join(dir, "prob"))
+        end
+
+        @tag :prob_command_validation
+        test "probabilistic parameter validation is preserved in generic batches", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          commands = [
+            {"batch_invalid_bloom_create",
+             {:bloom_create, "batch_invalid_bloom_create", nil, 1, {:bloom_meta, %{}}},
+             :invalid_bloom_dimensions, "bloom"},
+            {"batch_invalid_bloom_add", {:bloom_add, "batch_invalid_bloom_add", "item", %{}},
+             :invalid_bloom_dimensions, "bloom"},
+            {"batch_invalid_bloom_madd", {:bloom_madd, "batch_invalid_bloom_madd", ["item"], %{}},
+             :invalid_bloom_dimensions, "bloom"},
+            {"batch_invalid_cms_create", {:cms_create, "batch_invalid_cms_create", nil, 1},
+             :invalid_cms_dimensions, "cms"},
+            {"batch_invalid_cms_merge", {:cms_merge, "batch_invalid_cms_merge", [], [], %{}},
+             :invalid_cms_dimensions, "cms"},
+            {"batch_invalid_cuckoo_create",
+             {:cuckoo_create, "batch_invalid_cuckoo_create", nil, 4}, :invalid_cuckoo_parameters,
+             "cuckoo"},
+            {"batch_invalid_cuckoo_add", {:cuckoo_add, "batch_invalid_cuckoo_add", "item", %{}},
+             :invalid_cuckoo_parameters, "cuckoo"},
+            {"batch_invalid_cuckoo_addnx",
+             {:cuckoo_addnx, "batch_invalid_cuckoo_addnx", "item", %{}},
+             :invalid_cuckoo_parameters, "cuckoo"},
+            {"batch_invalid_topk_create", {:topk_create, "batch_invalid_topk_create", nil, 1, 1},
+             :invalid_topk_parameters, "topk"}
+          ]
+
+          {_next_state, {:ok, results}} =
+            StateMachine.apply(%{}, {:batch, Enum.map(commands, &elem(&1, 1))}, state)
+
+          assert results ==
+                   Enum.map(commands, fn {_key, _command, reason, _ext} -> {:error, reason} end)
+
+          Enum.each(commands, fn {key, _command, _reason, ext} ->
+            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, ext)
+            refute File.exists?(path)
+            assert [] == :ets.lookup(ets, key)
+          end)
+
+          refute File.exists?(Path.join(dir, "prob"))
+        end
+
         @tag :prob_long_key_path
         test "replicated creates use bounded sidecar filenames for long keys", %{
           state: state,
