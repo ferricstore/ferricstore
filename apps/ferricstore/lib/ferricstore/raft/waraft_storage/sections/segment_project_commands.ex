@@ -214,16 +214,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
         with {:ok, prepared, encoded_refs} <- prepare_segment_blob_batch_entries(entries),
              true <- segment_project_prepared_string_overwrites_safe?(sm_state, prepared),
              :ok <- verify_segment_blob_refs(sm_state, encoded_refs) do
-          new_sm_state =
-            Enum.reduce(prepared, sm_state, fn
-              {:value, key, value, expire_at_ms}, acc ->
-                segment_project_put(acc, key, value, expire_at_ms, position)
+          {new_sm_state, results, applied_count} =
+            segment_project_put_blob_batch(prepared, position, sm_state)
 
-              {:blob_ref, key, encoded_ref, expire_at_ms}, acc ->
-                segment_project_put_blob_ref(acc, key, encoded_ref, expire_at_ms, position)
-            end)
-
-          {:ok, new_sm_state, {:ok, List.duplicate(:ok, length(entries))}, length(entries)}
+          {:ok, new_sm_state, {:ok, results}, applied_count}
         else
           {:unsupported, _reason} ->
             :unsupported
@@ -236,23 +230,98 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
         end
       end
 
+      defp segment_project_put_blob_batch(prepared, position, sm_state) do
+        locks = Map.get(sm_state, :fetch_or_compute_locks, %{})
+
+        if map_size(locks) == 0 do
+          count = length(prepared)
+
+          new_sm_state =
+            Enum.reduce(prepared, sm_state, fn
+              {:value, key, value, expire_at_ms}, acc ->
+                segment_project_put(acc, key, value, expire_at_ms, position)
+
+              {:blob_ref, key, encoded_ref, expire_at_ms}, acc ->
+                segment_project_put_blob_ref(acc, key, encoded_ref, expire_at_ms, position)
+            end)
+
+          {new_sm_state, List.duplicate(:ok, count), count}
+        else
+          prepared
+          |> Enum.reduce({sm_state, [], 0}, fn
+            {:value, key, value, expire_at_ms}, {acc, results, count} ->
+              redis_key = CompoundKey.extract_redis_key(key)
+
+              case segment_project_check_fetch_or_compute_lock(acc, redis_key, nil) do
+                :ok ->
+                  next = segment_project_put(acc, key, value, expire_at_ms, position)
+                  {next, [:ok | results], count + 1}
+
+                {:error, _reason} = error ->
+                  {acc, [error | results], count}
+              end
+
+            {:blob_ref, key, encoded_ref, expire_at_ms}, {acc, results, count} ->
+              redis_key = CompoundKey.extract_redis_key(key)
+
+              case segment_project_check_fetch_or_compute_lock(acc, redis_key, nil) do
+                :ok ->
+                  next =
+                    segment_project_put_blob_ref(
+                      acc,
+                      key,
+                      encoded_ref,
+                      expire_at_ms,
+                      position
+                    )
+
+                  {next, [:ok | results], count + 1}
+
+                {:error, _reason} = error ->
+                  {acc, [error | results], count}
+              end
+          end)
+          |> then(fn {new_sm_state, results, count} ->
+            {new_sm_state, Enum.reverse(results), count}
+          end)
+        end
+      end
+
       defp segment_project_command(
              {:compound_batch_put, redis_key, entries},
              position,
              sm_state
            )
            when is_binary(redis_key) and is_list(entries) do
-        if segment_projectable_compound_batch_put?(sm_state, redis_key, entries) do
-          new_sm_state =
-            Enum.reduce(entries, sm_state, fn {compound_key, value, expire_at_ms}, acc ->
-              acc
-              |> segment_project_put(compound_key, value, expire_at_ms, position)
-              |> segment_project_zset_put(redis_key, compound_key, value)
-            end)
+        case segment_compound_batch_put_shape(redis_key, entries) do
+          {:ok, last_compound_key, count} ->
+            case segment_project_check_fetch_or_compute_lock(sm_state, redis_key, nil) do
+              :ok ->
+                if segment_compound_batch_target_safe?(
+                     sm_state,
+                     redis_key,
+                     last_compound_key,
+                     count
+                   ) do
+                  new_sm_state =
+                    Enum.reduce(entries, sm_state, fn
+                      {compound_key, value, expire_at_ms}, acc ->
+                        acc
+                        |> segment_project_put(compound_key, value, expire_at_ms, position)
+                        |> segment_project_zset_put(redis_key, compound_key, value)
+                    end)
 
-          {:ok, new_sm_state, {:ok, List.duplicate(:ok, length(entries))}, length(entries)}
-        else
-          :unsupported
+                  {:ok, new_sm_state, {:ok, List.duplicate(:ok, count)}, count}
+                else
+                  :unsupported
+                end
+
+              {:error, _reason} = error ->
+                {:ok, sm_state, {:ok, List.duplicate(error, count)}, 0}
+            end
+
+          :error ->
+            :unsupported
         end
       end
 
@@ -267,20 +336,33 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
              true <-
                segment_projectable_prepared_compound_blob_batch?(sm_state, redis_key, prepared),
              :ok <- verify_segment_blob_refs(sm_state, encoded_refs) do
-          new_sm_state =
-            Enum.reduce(prepared, sm_state, fn
-              {:value, compound_key, value, expire_at_ms}, acc ->
-                acc
-                |> segment_project_put(compound_key, value, expire_at_ms, position)
-                |> segment_project_zset_put(redis_key, compound_key, value)
+          count = length(entries)
 
-              {:blob_ref, compound_key, encoded_ref, expire_at_ms}, acc ->
-                acc
-                |> segment_project_put_blob_ref(compound_key, encoded_ref, expire_at_ms, position)
-                |> segment_project_zset_put(redis_key, compound_key, encoded_ref)
-            end)
+          case segment_project_check_fetch_or_compute_lock(sm_state, redis_key, nil) do
+            :ok ->
+              new_sm_state =
+                Enum.reduce(prepared, sm_state, fn
+                  {:value, compound_key, value, expire_at_ms}, acc ->
+                    acc
+                    |> segment_project_put(compound_key, value, expire_at_ms, position)
+                    |> segment_project_zset_put(redis_key, compound_key, value)
 
-          {:ok, new_sm_state, {:ok, List.duplicate(:ok, length(entries))}, length(entries)}
+                  {:blob_ref, compound_key, encoded_ref, expire_at_ms}, acc ->
+                    acc
+                    |> segment_project_put_blob_ref(
+                      compound_key,
+                      encoded_ref,
+                      expire_at_ms,
+                      position
+                    )
+                    |> segment_project_zset_put(redis_key, compound_key, encoded_ref)
+                end)
+
+              {:ok, new_sm_state, {:ok, List.duplicate(:ok, count)}, count}
+
+            {:error, _reason} = error ->
+              {:ok, sm_state, {:ok, List.duplicate(error, count)}, 0}
+          end
         else
           {:unsupported, _reason} ->
             :unsupported
@@ -322,19 +404,29 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
              sm_state
            )
            when is_binary(redis_key) and is_list(compound_keys) do
-        if segment_shared_compound_projection_safe?(sm_state, redis_key) and
-             Enum.all?(compound_keys, &compound_key_for_redis_key?(redis_key, &1)) do
-          new_sm_state =
-            Enum.reduce(compound_keys, sm_state, fn compound_key, acc ->
-              acc
-              |> segment_project_delete(compound_key)
-              |> segment_project_zset_delete(redis_key, compound_key)
-            end)
+        case segment_compound_batch_delete_shape(redis_key, compound_keys) do
+          {:ok, count} ->
+            case segment_project_check_fetch_or_compute_lock(sm_state, redis_key, nil) do
+              :ok ->
+                if segment_shared_compound_projection_safe?(sm_state, redis_key) do
+                  new_sm_state =
+                    Enum.reduce(compound_keys, sm_state, fn compound_key, acc ->
+                      acc
+                      |> segment_project_delete(compound_key)
+                      |> segment_project_zset_delete(redis_key, compound_key)
+                    end)
 
-          {:ok, new_sm_state, {:ok, List.duplicate(:ok, length(compound_keys))},
-           length(compound_keys)}
-        else
-          :unsupported
+                  {:ok, new_sm_state, {:ok, List.duplicate(:ok, count)}, count}
+                else
+                  :unsupported
+                end
+
+              {:error, _reason} = error ->
+                {:ok, sm_state, {:ok, List.duplicate(error, count)}, 0}
+            end
+
+          :error ->
+            :unsupported
         end
       end
 
@@ -642,30 +734,61 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
       end
 
       defp segment_projectable_compound_batch_put?(sm_state, redis_key, entries) do
-        case List.last(entries) do
-          {compound_key, _value, _expire_at_ms} ->
-            Enum.all?(entries, &segment_projectable_compound_put_shape?(redis_key, &1)) and
-              segment_shared_compound_projection_safe?(
-                sm_state,
-                redis_key,
-                compound_key,
-                length(entries)
-              )
+        case segment_compound_batch_put_shape(redis_key, entries) do
+          {:ok, last_compound_key, count} ->
+            segment_compound_batch_target_safe?(
+              sm_state,
+              redis_key,
+              last_compound_key,
+              count
+            )
 
-          nil ->
-            true
-
-          _entry ->
+          :error ->
             false
         end
       end
 
-      defp segment_projectable_compound_put_shape?(redis_key, {compound_key, value, expire_at_ms}) do
-        compound_key_for_redis_key?(redis_key, compound_key) and is_binary(value) and
-          non_neg_integer?(expire_at_ms)
+      defp segment_compound_batch_put_shape(redis_key, entries) do
+        Enum.reduce_while(entries, {:ok, nil, 0}, fn
+          {compound_key, value, expire_at_ms}, {:ok, _last_compound_key, count}
+          when is_binary(value) ->
+            if compound_key_for_redis_key?(redis_key, compound_key) and
+                 non_neg_integer?(expire_at_ms) do
+              {:cont, {:ok, compound_key, count + 1}}
+            else
+              {:halt, :error}
+            end
+
+          _entry, _acc ->
+            {:halt, :error}
+        end)
       end
 
-      defp segment_projectable_compound_put_shape?(_redis_key, _entry), do: false
+      defp segment_compound_batch_target_safe?(_sm_state, _redis_key, nil, 0), do: true
+
+      defp segment_compound_batch_target_safe?(
+             sm_state,
+             redis_key,
+             compound_key,
+             count
+           ) do
+        segment_shared_compound_projection_safe?(
+          sm_state,
+          redis_key,
+          compound_key,
+          count
+        )
+      end
+
+      defp segment_compound_batch_delete_shape(redis_key, compound_keys) do
+        Enum.reduce_while(compound_keys, {:ok, 0}, fn compound_key, {:ok, count} ->
+          if compound_key_for_redis_key?(redis_key, compound_key) do
+            {:cont, {:ok, count + 1}}
+          else
+            {:halt, :error}
+          end
+        end)
+      end
 
       defp segment_projectable_prepared_compound_blob_batch?(sm_state, redis_key, prepared) do
         case List.last(prepared) do

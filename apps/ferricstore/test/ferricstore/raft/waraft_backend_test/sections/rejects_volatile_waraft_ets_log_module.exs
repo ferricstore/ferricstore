@@ -656,6 +656,84 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RejectsVolatileWaraftEtsLo
         end
       end
 
+      @tag :segment_compound_lock_guard
+      test "segment blob and compound batches preserve fetch-or-compute locks", %{
+        ctx: ctx
+      } do
+        previous_mode = Application.get_env(:ferricstore, :waraft_storage_apply_mode)
+
+        try do
+          Application.put_env(:ferricstore, :waraft_storage_apply_mode, :segment_keydir)
+
+          assert :ok = WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+
+          owner = "segment-compound-lock-owner"
+          expires_at = Ferricstore.HLC.now_ms() + 60_000
+          redis_key = "segment-lock:compound"
+          field_a = CompoundKey.hash_field(redis_key, "a")
+          field_b = CompoundKey.hash_field(redis_key, "b")
+          inline_locked = "segment-lock:blob-inline"
+          inline_free = "segment-lock:blob-free"
+          blob_value = "free-blob-value"
+
+          assert {:ok, [:ok, :ok]} =
+                   WARaftBackend.write(
+                     0,
+                     {:compound_batch_put, redis_key,
+                      [{field_a, "old-a", 0}, {field_b, "old-b", 0}]}
+                   )
+
+          assert :ok = WARaftBackend.write(0, {:put, inline_locked, "old", 0})
+          assert {:ok, ref} = BlobStore.put(ctx.data_dir, 0, blob_value)
+          encoded_ref = BlobRef.encode!(ref)
+
+          for key <- [redis_key, inline_locked] do
+            assert :ok =
+                     WARaftBackend.write(
+                       0,
+                       {:fetch_or_compute_lock, key, Ferricstore.FetchOrCompute.Outcome.key(key),
+                        owner, expires_at}
+                     )
+          end
+
+          assert {:ok, [{:error, :key_locked}, {:error, :key_locked}]} =
+                   WARaftBackend.write(
+                     0,
+                     {:compound_batch_put, redis_key,
+                      [{field_a, "new-a", 0}, {field_b, "new-b", 0}]}
+                   )
+
+          assert {:ok, [{:error, :key_locked}]} =
+                   WARaftBackend.write(
+                     0,
+                     {:compound_blob_batch_put, redis_key, [{field_a, "blob-new", 0, :value}]}
+                   )
+
+          assert {:ok, [{:error, :key_locked}, {:error, :key_locked}]} =
+                   WARaftBackend.write(
+                     0,
+                     {:compound_batch_delete, redis_key, [field_a, field_b]}
+                   )
+
+          assert {:ok, [{:error, :key_locked}, :ok]} =
+                   WARaftBackend.write(
+                     0,
+                     {:put_blob_batch,
+                      [
+                        {inline_locked, "new", 0, :value},
+                        {inline_free, encoded_ref, 0, :blob_ref}
+                      ]}
+                   )
+
+          assert "old-a" == Router.compound_get(ctx, redis_key, field_a)
+          assert "old-b" == Router.compound_get(ctx, redis_key, field_b)
+          assert "old" == Router.get(ctx, inline_locked)
+          assert blob_value == Router.get(ctx, inline_free)
+        after
+          restore_env(:waraft_storage_apply_mode, previous_mode)
+        end
+      end
+
       test "unified segment fast path stays enabled for unrelated fetch-or-compute locks", %{
         ctx: ctx
       } do
