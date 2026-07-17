@@ -428,6 +428,46 @@ defmodule FerricstoreServer.Native.Connection do
 
         loop(state)
 
+      {:native_blocking_done, _meta, pid} ->
+        case take_blocked_request(state, pid) do
+          {nil, state} ->
+            loop(state)
+
+          {request, state} ->
+            Process.demonitor(request.monitor_ref, [:flush])
+            loop(finish_inflight(state, request.lane_id))
+        end
+
+      {:native_blocking_response_budgeted, _meta, pid, status, value, %OutboundBudget{} = lease} ->
+        case take_blocked_request(state, pid) do
+          {nil, state} ->
+            OutboundBudget.release(lease)
+            acknowledge_blocking_outbound_release(pid, lease)
+            loop(state)
+
+          {request, state} ->
+            Process.demonitor(request.monitor_ref, [:flush])
+            state = finish_inflight(state, request.lane_id)
+            result = send_guarded_blocking_response(state, request, status, value, lease)
+            acknowledge_blocking_outbound_release(pid, lease)
+
+            case result do
+              :ok -> loop(state)
+              {:error, _reason} -> close_for_outbound_failure(state)
+            end
+        end
+
+      {:native_blocking_outbound_overflow, _meta, pid} ->
+        case take_blocked_request(state, pid) do
+          {nil, state} ->
+            loop(state)
+
+          {request, state} ->
+            Process.demonitor(request.monitor_ref, [:flush])
+            state = finish_inflight(state, request.lane_id)
+            close_for_outbound_failure(state)
+        end
+
       {:native_blocking_response, _meta, pid, status, value} ->
         case take_blocked_request(state, pid) do
           {nil, state} ->
@@ -1656,6 +1696,49 @@ defmodule FerricstoreServer.Native.Connection do
   defp close_for_outbound_failure(state) do
     cleanup_connection(state)
     state.transport.close(state.socket)
+  end
+
+  defp send_guarded_blocking_response(state, request, status, value, lease) do
+    case safe_encode_guarded_blocking_response(state, request, status, value) do
+      {:ok, iodata} ->
+        case OutboundBudget.ensure_iodata(lease, iodata) do
+          {:ok, lease} ->
+            try do
+              native_send(state, iodata, :response)
+            after
+              OutboundBudget.release(lease)
+            end
+
+          {:error, reason} ->
+            OutboundBudget.release(lease)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        OutboundBudget.release(lease)
+        {:error, reason}
+    end
+  end
+
+  defp safe_encode_guarded_blocking_response(state, request, status, value) do
+    {:ok,
+     Responses.encode_response(
+       state,
+       request.opcode,
+       request.lane_id,
+       request.request_id,
+       status,
+       value
+     )}
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp acknowledge_blocking_outbound_release(pid, %OutboundBudget{resource_token: token}) do
+    send(pid, {:native_blocking_outbound_released, token})
+    :ok
   end
 
   defp send_lane_responses(state, lane_id, iodata) do

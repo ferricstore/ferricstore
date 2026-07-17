@@ -7,9 +7,10 @@ defmodule FerricstoreServer.Native.Blocking do
   alias Ferricstore.Commands.List, as: ListCmd
   alias Ferricstore.Commands.Stream, as: StreamCmd
   alias Ferricstore.Waiters
-  alias FerricstoreServer.Native.{ResourceBudget, Session}
+  alias FerricstoreServer.Native.{OutboundBudget, ResourceBudget, Session}
 
   @blocking_commands MapSet.new(~w(BLPOP BRPOP BLMOVE BLMPOP XREAD XREADGROUP))
+  @delivery_overhead_bytes 128
 
   @spec blocking_command?(binary()) :: boolean()
   def blocking_command?(cmd) when is_binary(cmd), do: MapSet.member?(@blocking_commands, cmd)
@@ -48,7 +49,7 @@ defmodule FerricstoreServer.Native.Blocking do
                   {status, value} =
                     run_blocking(prepared.command, prepared.args, prepared.ast, ctx)
 
-                  send(parent, {:native_blocking_response, meta, self(), status, value})
+                  deliver_result(parent, meta, status, value, state)
                 end)
               after
                 ResourceBudget.release(budget, budget_token)
@@ -87,6 +88,39 @@ defmodule FerricstoreServer.Native.Blocking do
         Process.exit(pid, :kill)
         Process.demonitor(monitor_ref, [:flush])
         {:error, :busy, "ERR native blocking worker start timed out"}
+    end
+  end
+
+  defp deliver_result(parent, %{no_reply: true} = meta, _status, _value, _state) do
+    send(parent, {:native_blocking_done, meta, self()})
+  end
+
+  defp deliver_result(parent, meta, status, value, state) do
+    if Map.has_key?(state, :outbound_counter) do
+      bytes = :erlang.external_size({meta, status, value}) + @delivery_overhead_bytes
+
+      case OutboundBudget.reserve_bytes(state, self(), bytes) do
+        {:ok, lease} ->
+          send(
+            parent,
+            {:native_blocking_response_budgeted, meta, self(), status, value, lease}
+          )
+
+          await_outbound_release(lease)
+
+        {:error, _reason} ->
+          send(parent, {:native_blocking_outbound_overflow, meta, self()})
+      end
+    else
+      send(parent, {:native_blocking_response, meta, self(), status, value})
+    end
+  rescue
+    _error -> send(parent, {:native_blocking_outbound_overflow, meta, self()})
+  end
+
+  defp await_outbound_release(%OutboundBudget{resource_token: token}) do
+    receive do
+      {:native_blocking_outbound_released, ^token} -> :ok
     end
   end
 

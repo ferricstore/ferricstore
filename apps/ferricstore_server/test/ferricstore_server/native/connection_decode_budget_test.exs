@@ -345,6 +345,52 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert receive_response_ids(socket, 1) == [232]
   end
 
+  @tag :native_outbound_byte_budget
+  test "blocking results release outbound capacity after socket send" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
+
+    Application.put_env(:ferricstore, :native_max_outbound_bytes_per_connection, 1_024 * 1_024)
+
+    on_exit(fn ->
+      restore_env(:native_max_outbound_bytes_per_connection, previous_limit)
+    end)
+
+    key = "native:blocking:outbound-send:#{System.unique_integer([:positive, :monotonic])}"
+    assert {:ok, 1} = FerricStore.rpush(key, [:binary.copy("v", 256)])
+    on_exit(fn -> FerricStore.del(key) end)
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    assert :ok = :gen_tcp.send(socket, command_exec_frame(241, "BLPOP", [key, "1"]))
+    assert [{241, 0}] = receive_response_statuses(socket, 1)
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
+  end
+
+  @tag :native_outbound_byte_budget
+  test "blocking result overflow closes the connection" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
+
+    Application.put_env(:ferricstore, :native_max_outbound_bytes_per_connection, 200)
+
+    on_exit(fn ->
+      restore_env(:native_max_outbound_bytes_per_connection, previous_limit)
+    end)
+
+    key = "native:blocking:outbound-close:#{System.unique_integer([:positive, :monotonic])}"
+    assert {:ok, 1} = FerricStore.rpush(key, [:binary.copy("v", 256)])
+    on_exit(fn -> FerricStore.del(key) end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    assert :ok = :gen_tcp.send(socket, command_exec_frame(242, "BLPOP", [key, "1"]))
+    assert_socket_closed(socket)
+  end
+
   @tag :inflight_idle_timeout
   test "idle timeout does not terminate an active blocking request" do
     previous_timeout = Application.get_env(:ferricstore, :native_idle_timeout_ms)
