@@ -30,11 +30,11 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   @spec handle_cas(binary(), term(), binary(), non_neg_integer() | nil, map()) ::
           {:reply, term(), map()}
   @doc false
-  def handle_cas(key, expected, new_value, ttl_ms, state) do
+  def handle_cas(key, expected, new_value, expire_at_ms, state) do
     if state.raft? do
-      handle_cas_raft(key, expected, new_value, ttl_ms, state)
+      handle_cas_raft(key, expected, new_value, expire_at_ms, state)
     else
-      handle_cas_direct(key, expected, new_value, ttl_ms, state)
+      handle_cas_direct(key, expected, new_value, expire_at_ms, state)
     end
   end
 
@@ -126,10 +126,10 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     |> Kernel.>(0)
   end
 
-  defp handle_cas_direct(key, expected, new_value, ttl_ms, state) do
+  defp handle_cas_direct(key, expected, new_value, expire_at_ms, state) do
     case resolve_for_native(state, key) do
       {{:hit, ^expected, old_exp}, state} ->
-        expire = if ttl_ms, do: Ferricstore.HLC.now_ms() + ttl_ms, else: old_exp
+        expire = expire_at_ms || old_exp
 
         case persist_direct_value(state, key, new_value, expire) do
           {:ok, new_state} -> {:reply, 1, new_state}
@@ -152,11 +152,11 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   @spec handle_lock(binary(), binary(), non_neg_integer(), map()) :: {:reply, term(), map()}
   @doc false
-  def handle_lock(key, owner, ttl_ms, state) do
+  def handle_lock(key, owner, expire_at_ms, state) do
     if state.raft? do
-      handle_lock_raft(key, owner, ttl_ms, state)
+      handle_lock_raft(key, owner, expire_at_ms, state)
     else
-      handle_lock_direct(key, owner, ttl_ms, state)
+      handle_lock_direct(key, owner, expire_at_ms, state)
     end
   end
 
@@ -173,12 +173,10 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  defp handle_lock_direct(key, owner, ttl_ms, state) do
-    expire = Ferricstore.HLC.now_ms() + ttl_ms
-
+  defp handle_lock_direct(key, owner, expire_at_ms, state) do
     case resolve_for_native(state, key) do
       {{:hit, ^owner, _exp}, state} ->
-        case persist_direct_value(state, key, owner, expire) do
+        case persist_direct_value(state, key, owner, expire_at_ms) do
           {:ok, new_state} -> {:reply, :ok, new_state}
           {:error, reason, rolled_back_state} -> {:reply, {:error, reason}, rolled_back_state}
         end
@@ -190,7 +188,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         {:reply, {:error, "ERR cold read failed"}, state}
 
       {_, state} ->
-        case persist_direct_value(state, key, owner, expire) do
+        case persist_direct_value(state, key, owner, expire_at_ms) do
           {:ok, new_state} -> {:reply, :ok, new_state}
           {:error, reason, rolled_back_state} -> {:reply, {:error, reason}, rolled_back_state}
         end
@@ -252,11 +250,11 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   @spec handle_extend(binary(), binary(), non_neg_integer(), map()) :: {:reply, term(), map()}
   @doc false
-  def handle_extend(key, owner, ttl_ms, state) do
+  def handle_extend(key, owner, expire_at_ms, state) do
     if state.raft? do
-      handle_extend_raft(key, owner, ttl_ms, state)
+      handle_extend_raft(key, owner, expire_at_ms, state)
     else
-      handle_extend_direct(key, owner, ttl_ms, state)
+      handle_extend_direct(key, owner, expire_at_ms, state)
     end
   end
 
@@ -273,12 +271,10 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  defp handle_extend_direct(key, owner, ttl_ms, state) do
-    new_expire = Ferricstore.HLC.now_ms() + ttl_ms
-
+  defp handle_extend_direct(key, owner, expire_at_ms, state) do
     case resolve_for_native(state, key) do
       {{:hit, ^owner, _exp}, state} ->
-        case persist_direct_value(state, key, owner, new_expire) do
+        case persist_direct_value(state, key, owner, expire_at_ms) do
           {:ok, new_state} -> {:reply, 1, new_state}
           {:error, reason, rolled_back_state} -> {:reply, {:error, reason}, rolled_back_state}
         end

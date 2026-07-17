@@ -95,6 +95,35 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
     end
   end
 
+  test "direct native handlers preserve Router-provided absolute expiry deadlines" do
+    keydir = new_keydir("absolute_expiry")
+    state = %{direct_state(keydir) | flush_in_flight: :in_flight}
+    cas_deadline = Ferricstore.HLC.now_ms() + 60_000
+    lock_deadline = cas_deadline + 60_000
+    extend_deadline = lock_deadline + 60_000
+    put_persisted(state, "cas", "old", 0)
+    put_persisted(state, "lock", "owner", cas_deadline)
+
+    try do
+      assert {:reply, 1, _cas_state} =
+               NativeOps.handle_cas("cas", "old", "new", cas_deadline, state)
+
+      assert {:hit, "new", ^cas_deadline} = ShardETS.ets_lookup(state, "cas")
+
+      assert {:reply, :ok, lock_state} =
+               NativeOps.handle_lock("lock", "owner", lock_deadline, state)
+
+      assert {:hit, "owner", ^lock_deadline} = ShardETS.ets_lookup(state, "lock")
+
+      assert {:reply, 1, _extended_state} =
+               NativeOps.handle_extend("lock", "owner", extend_deadline, lock_state)
+
+      assert {:hit, "owner", ^extend_deadline} = ShardETS.ets_lookup(state, "lock")
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   test "rate-limit rollover preserves counters above float integer precision" do
     dir =
       Path.join(
