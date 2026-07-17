@@ -280,6 +280,15 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
     refute body =~ "checked_lmove("
   end
 
+  test "raft list writes submit one atomic state-machine command" do
+    source = File.read!(@native_ops_path)
+    body = function_body(source, "handle_list_op_raft")
+
+    assert body =~ "forced_quorum_call(state.index, {:list_op, key, operation})"
+    refute body =~ "ListOps.execute"
+    refute body =~ "build_list_compound_store_raft"
+  end
+
   test "direct list compound_put does not update ETS when Bitcask append fails" do
     keydir = :ets.new(:"native_ops_test_#{System.unique_integer([:positive])}", [:set, :public])
     compound_key = CompoundKey.list_element("list", 0)

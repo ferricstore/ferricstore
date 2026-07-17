@@ -550,17 +550,15 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   end
 
   defp handle_list_op_raft(key, operation, state) do
-    store = build_list_compound_store_raft(key, state)
-    type_store = type_check_store(store, state)
+    result = forced_quorum_call(state.index, {:list_op, key, operation})
 
-    case ensure_list_type_for_operation(key, operation, type_store) do
-      :ok ->
-        result = Ferricstore.Store.ListOps.execute(key, store, operation)
+    case result do
+      {:error, _reason} ->
+        {:reply, result, state}
+
+      _successful_result ->
         new_version = state.write_version + 1
         {:reply, result, %{state | write_version: new_version}}
-
-      {:error, _} = err ->
-        {:reply, err, state}
     end
   end
 
