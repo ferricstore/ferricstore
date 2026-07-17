@@ -43,6 +43,47 @@ defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
              end)
   end
 
+  test "prefix scans fail closed without deleting a drift-ambiguous row" do
+    keydir = :ets.new(:prefix_scan_drift_keydir, [:set, :public])
+    index = :ets.new(:prefix_scan_drift_index, [:ordered_set, :public])
+    CompoundMemberIndex.reset(index)
+
+    redis_key = "drifted-prefix"
+    prefix = CompoundKey.hash_prefix(redis_key)
+    field_key = CompoundKey.hash_field(redis_key, "field")
+    row = {field_key, "value", 31_000, 0, 0, 0, 5}
+    :ets.insert(keydir, row)
+    CompoundMemberIndex.put(index, field_key)
+
+    state = %{keydir: keydir, compound_member_index: index}
+
+    try do
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               CommandTime.with_expiry_context(61_000, 1_000, fn ->
+                 ETS.prefix_scan_entries(state, prefix, nil)
+               end)
+
+      limits = %{
+        max_entries: :unlimited,
+        max_bytes: :unlimited,
+        entry_overhead: 0,
+        include_values: true,
+        fields_only: false
+      }
+
+      assert {:error, {:storage_read_failed, :hlc_drift_exceeded}} =
+               CommandTime.with_expiry_context(61_000, 1_000, fn ->
+                 ETS.prefix_scan_entries_bounded(state, prefix, nil, limits)
+               end)
+
+      assert :ets.lookup(keydir, field_key) == [row]
+      assert [{{^prefix, "field"}, ^field_key}] = :ets.lookup(index, {prefix, "field"})
+    after
+      :ets.delete(index)
+      :ets.delete(keydir)
+    end
+  end
+
   @tag :exact_cold_prefix_scan
   test "exact compound-index scans hydrate cold rows without abandoning the catalog" do
     root = Path.join(System.tmp_dir!(), "exact_cold_prefix_#{System.unique_integer()}")

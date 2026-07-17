@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   @moduledoc false
 
-  alias Ferricstore.CommandTime
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult}
   alias Ferricstore.Store.Shard.CompoundMemberIndex
 
@@ -157,47 +157,55 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   end
 
   defp do_prefix_scan_rows(state, keydir, _prefix, shard_data_path, rows) do
-    now = CommandTime.now_ms()
+    expiry_context = ExpiryContext.capture()
 
     {tokens, {cold_entries, _cold_count}} =
       Enum.reduce(rows, {[], {[], 0}}, fn
         {key, value, exp, _lfu, fid, off, vsize} = observed,
         {tokens, {cold_entries, cold_count}} ->
-          cond do
-            is_integer(exp) and exp > 0 and exp <= now ->
+          case prefix_expiry_status(expiry_context, exp) do
+            :expired ->
               maybe_delete_expired_prefix_entry(state, keydir, observed)
               {tokens, {cold_entries, cold_count}}
 
-            value == nil and
-                not (valid_cold_location(fid, off, vsize) or
-                       flow_history_cold_location?(fid, off, vsize) or
-                         valid_waraft_segment_location(fid, off, vsize)) ->
-              failure = ReadResult.failure({:invalid_prefix_scan_location, key})
+            {:error, reason} ->
+              failure = ReadResult.failure(reason)
               {[{:failure, failure} | tokens], {cold_entries, cold_count}}
 
-            value == nil and valid_waraft_segment_location(fid, off, vsize) and state != nil ->
-              case read_waraft_segment_value(state, fid, key) do
-                {:ok, segment_value} ->
-                  {[{:value, {prefix_field(key), segment_value}} | tokens],
-                   {cold_entries, cold_count}}
+            :live ->
+              cond do
+                value == nil and
+                    not (valid_cold_location(fid, off, vsize) or
+                           flow_history_cold_location?(fid, off, vsize) or
+                             valid_waraft_segment_location(fid, off, vsize)) ->
+                  failure = ReadResult.failure({:invalid_prefix_scan_location, key})
+                  {[{:failure, failure} | tokens], {cold_entries, cold_count}}
 
-                {:error, reason} ->
-                  failure = ReadResult.failure({:waraft_prefix_value_unavailable, reason})
+                value == nil and valid_waraft_segment_location(fid, off, vsize) and
+                    state != nil ->
+                  case read_waraft_segment_value(state, fid, key) do
+                    {:ok, segment_value} ->
+                      {[{:value, {prefix_field(key), segment_value}} | tokens],
+                       {cold_entries, cold_count}}
+
+                    {:error, reason} ->
+                      failure = ReadResult.failure({:waraft_prefix_value_unavailable, reason})
+                      {[{:failure, failure} | tokens], {cold_entries, cold_count}}
+                  end
+
+                value == nil and shard_data_path != nil ->
+                  field = prefix_field(key)
+                  file_path = file_path(shard_data_path, fid)
+                  entry = {field, key, file_path, off}
+                  {[{:cold, cold_count} | tokens], {[entry | cold_entries], cold_count + 1}}
+
+                value != nil ->
+                  {[{:value, {prefix_field(key), value}} | tokens], {cold_entries, cold_count}}
+
+                true ->
+                  failure = ReadResult.failure(:prefix_scan_data_path_unavailable)
                   {[{:failure, failure} | tokens], {cold_entries, cold_count}}
               end
-
-            value == nil and shard_data_path != nil ->
-              field = prefix_field(key)
-              file_path = file_path(shard_data_path, fid)
-              entry = {field, key, file_path, off}
-              {[{:cold, cold_count} | tokens], {[entry | cold_entries], cold_count + 1}}
-
-            value != nil ->
-              {[{:value, {prefix_field(key), value}} | tokens], {cold_entries, cold_count}}
-
-            true ->
-              failure = ReadResult.failure(:prefix_scan_data_path_unavailable)
-              {[{:failure, failure} | tokens], {cold_entries, cold_count}}
           end
       end)
 
@@ -225,7 +233,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   end
 
   defp bounded_prefix_row_reducer(state, keydir, prefix, limits) do
-    now = CommandTime.now_ms()
+    expiry_context = ExpiryContext.capture()
     prefix_len = byte_size(prefix)
     max_entries = Map.get(limits, :max_entries, :unlimited)
     max_bytes = Map.get(limits, :max_bytes, :unlimited)
@@ -234,33 +242,37 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
 
     fn
       {key, value, exp, _lfu, fid, off, vsize} = observed, {rows, count, bytes} ->
-        cond do
-          is_integer(exp) and exp > 0 and exp <= now ->
+        case prefix_expiry_status(expiry_context, exp) do
+          :expired ->
             maybe_delete_expired_prefix_entry(state, keydir, observed)
             {:cont, {rows, count, bytes}}
 
-          value == nil and not valid_prefix_location?(fid, off, vsize) ->
-            {:halt, ReadResult.failure({:invalid_prefix_scan_location, key})}
+          {:error, reason} ->
+            {:halt, ReadResult.failure(reason)}
 
-          true ->
-            value_bytes = if include_values, do: prefix_value_size(value, vsize), else: 0
-
-            if is_integer(value_bytes) do
-              next_count = count + 1
-              next_bytes = bytes + byte_size(key) - prefix_len + entry_overhead + value_bytes
-
-              cond do
-                limit_exceeded?(next_count, max_entries) ->
-                  {:halt, {:error, :collection_response_limit}}
-
-                limit_exceeded?(next_bytes, max_bytes) ->
-                  {:halt, {:error, :response_byte_limit}}
-
-                true ->
-                  {:cont, {[observed | rows], next_count, next_bytes}}
-              end
+          :live ->
+            if value == nil and not valid_prefix_location?(fid, off, vsize) do
+              {:halt, ReadResult.failure({:invalid_prefix_scan_location, key})}
             else
-              {:halt, ReadResult.failure({:invalid_prefix_value_size, key})}
+              value_bytes = if include_values, do: prefix_value_size(value, vsize), else: 0
+
+              if is_integer(value_bytes) do
+                next_count = count + 1
+                next_bytes = bytes + byte_size(key) - prefix_len + entry_overhead + value_bytes
+
+                cond do
+                  limit_exceeded?(next_count, max_entries) ->
+                    {:halt, {:error, :collection_response_limit}}
+
+                  limit_exceeded?(next_bytes, max_bytes) ->
+                    {:halt, {:error, :response_byte_limit}}
+
+                  true ->
+                    {:cont, {[observed | rows], next_count, next_bytes}}
+                end
+              else
+                {:halt, ReadResult.failure({:invalid_prefix_value_size, key})}
+              end
             end
         end
 
@@ -316,18 +328,24 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   end
 
   defp prefix_fields_from_rows(rows, prefix) do
-    now = CommandTime.now_ms()
     prefix_len = byte_size(prefix)
 
-    Enum.reduce(rows, [], fn
-      {_key, _value, exp, _lfu, _fid, _off, _vsize}, acc
-      when is_integer(exp) and exp > 0 and exp <= now ->
-        acc
-
-      {key, _value, _exp, _lfu, _fid, _off, _vsize}, acc ->
-        [binary_part(key, prefix_len, byte_size(key) - prefix_len) | acc]
+    Enum.reduce(rows, [], fn {key, _value, _exp, _lfu, _fid, _off, _vsize}, acc ->
+      [binary_part(key, prefix_len, byte_size(key) - prefix_len) | acc]
     end)
   end
+
+  defp prefix_expiry_status(expiry_context, expire_at_ms)
+       when is_integer(expire_at_ms) and expire_at_ms >= 0 do
+    case ExpiryContext.classify(expiry_context, expire_at_ms) do
+      :live -> :live
+      :expired -> :expired
+      {:unsafe, reason} -> {:error, reason}
+    end
+  end
+
+  defp prefix_expiry_status(_expiry_context, expire_at_ms),
+    do: {:error, {:invalid_expire_at_ms, expire_at_ms}}
 
   defp select_prefix_rows(_state, keydir, prefix) do
     :ets.select(keydir, prefix_rows_match_spec(prefix))
@@ -407,7 +425,10 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
     do: do_prefix_scan_fields(nil, keydir, prefix)
 
   def do_prefix_scan_fields(state, keydir, prefix) do
-    now = CommandTime.now_ms()
+    expiry_cutoff_ms =
+      ExpiryContext.capture()
+      |> ExpiryContext.safe_expiry_cutoff_ms()
+
     prefix_len = byte_size(prefix)
 
     prefix_guard =
@@ -416,7 +437,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
         {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
 
     live_exp_guard =
-      {:andalso, {:is_integer, :"$3"}, {:orelse, {:==, :"$3", 0}, {:>, :"$3", now}}}
+      {:andalso, {:is_integer, :"$3"}, {:orelse, {:==, :"$3", 0}, {:>, :"$3", expiry_cutoff_ms}}}
 
     ms = [
       {{:"$1", :_, :"$3", :_, :_, :_, :_}, [{:andalso, prefix_guard, live_exp_guard}], [:"$1"]}
@@ -425,7 +446,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
     fields = collect_prefix_fields(keydir, ms)
 
     if state != nil do
-      delete_expired_prefix_entries(state, keydir, prefix, prefix_len, now)
+      delete_expired_prefix_entries(state, keydir, prefix, prefix_len, expiry_cutoff_ms)
     end
 
     fields
@@ -616,7 +637,10 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   end
 
   defp select_prefix_count_entries(state, keydir, prefix) do
-    now = CommandTime.now_ms()
+    expiry_cutoff_ms =
+      ExpiryContext.capture()
+      |> ExpiryContext.safe_expiry_cutoff_ms()
+
     prefix_len = byte_size(prefix)
 
     prefix_guard =
@@ -625,7 +649,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
         {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}
 
     live_exp_guard =
-      {:andalso, {:is_integer, :"$3"}, {:orelse, {:==, :"$3", 0}, {:>, :"$3", now}}}
+      {:andalso, {:is_integer, :"$3"}, {:orelse, {:==, :"$3", 0}, {:>, :"$3", expiry_cutoff_ms}}}
 
     live_ms = [
       {{:"$1", :_, :"$3", :_, :_, :_, :_}, [{:andalso, prefix_guard, live_exp_guard}], [true]}
@@ -634,7 +658,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
     count = :ets.select_count(keydir, live_ms)
 
     if state != nil do
-      delete_expired_prefix_entries(state, keydir, prefix, prefix_len, now)
+      delete_expired_prefix_entries(state, keydir, prefix, prefix_len, expiry_cutoff_ms)
     end
 
     count
