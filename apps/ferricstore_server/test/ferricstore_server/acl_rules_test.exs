@@ -31,4 +31,69 @@ defmodule FerricstoreServer.Acl.RulesTest do
     assert {:error, reason} = Rules.validate_rule_limits(List.duplicate("on", 16_385))
     assert reason =~ "more than 16384 rule tokens"
   end
+
+  test "SETUSER hashes only the final effective password" do
+    test_pid = self()
+
+    hasher = fn password ->
+      send(test_pid, {:hashed_password, password})
+      "hashed:" <> password
+    end
+
+    assert {:ok, %{password: "hashed:final"}} =
+             Rules.apply_rules(
+               base_user(),
+               [">first", ">second", "nopass", ">final"],
+               hasher
+             )
+
+    assert_receive {:hashed_password, "final"}
+    refute_receive {:hashed_password, _password}
+
+    assert {:ok, %{password: nil}} =
+             Rules.apply_rules(base_user(), [">first", ">second", "resetpass"], hasher)
+
+    refute_receive {:hashed_password, _password}
+  end
+
+  test "SETUSER does not hash when a later rule or final state is invalid" do
+    test_pid = self()
+
+    hasher = fn password ->
+      send(test_pid, {:hashed_password, password})
+      "hashed:" <> password
+    end
+
+    assert {:error, reason} =
+             Rules.apply_rules(base_user(), [">secret", "+unknown-command"], hasher)
+
+    assert reason =~ "Unknown command"
+    refute_receive {:hashed_password, _password}
+
+    user_at_pattern_limit = %{
+      base_user()
+      | keys:
+          List.duplicate(
+            {"tenant:*", :read, ~r/^tenant:/},
+            Rules.max_patterns()
+          )
+    }
+
+    assert {:error, retained_reason} =
+             Rules.apply_rules(user_at_pattern_limit, [">secret", "~another:*"], hasher)
+
+    assert retained_reason =~ "more than 4096 key patterns"
+    refute_receive {:hashed_password, _password}
+  end
+
+  defp base_user do
+    %{
+      enabled: true,
+      password: nil,
+      commands: MapSet.new(),
+      denied_commands: MapSet.new(),
+      keys: [],
+      channels: []
+    }
+  end
 end

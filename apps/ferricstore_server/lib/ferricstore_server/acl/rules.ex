@@ -62,10 +62,17 @@ defmodule FerricstoreServer.Acl.Rules do
 
   @spec apply_rules(user(), [binary()]) :: {:ok, user()} | {:error, binary()}
   def apply_rules(user, rules) do
+    apply_rules(user, rules, &Password.hash/1)
+  end
+
+  @doc false
+  @spec apply_rules(user(), [binary()], (binary() -> binary())) ::
+          {:ok, user()} | {:error, binary()}
+  def apply_rules(user, rules, password_hasher) when is_function(password_hasher, 1) do
     with :ok <- validate_rule_limits(rules),
-         {:ok, updated} <- apply_rules(user, rules, []),
+         {:ok, updated, password_action} <- apply_rules_deferred(user, rules, [], :unchanged),
          :ok <- validate_retained_pattern_limits(updated) do
-      {:ok, updated}
+      {:ok, materialize_password(updated, password_action, password_hasher)}
     end
   end
 
@@ -152,21 +159,42 @@ defmodule FerricstoreServer.Acl.Rules do
 
   defp list_within_limit?(_invalid, _remaining), do: false
 
-  defp apply_rules(user, [], pending_key_patterns),
-    do: {:ok, flush_pending_key_patterns(user, pending_key_patterns)}
+  defp apply_rules_deferred(user, [], pending_key_patterns, password_action) do
+    {:ok, flush_pending_key_patterns(user, pending_key_patterns), password_action}
+  end
 
-  defp apply_rules(user, [rule | rest], pending_key_patterns) do
-    case parse_key_rule(user, rule, pending_key_patterns) do
-      {:ok, updated, next_pending} ->
-        apply_rules(updated, rest, next_pending)
+  defp apply_rules_deferred(user, [rule | rest], pending_key_patterns, password_action) do
+    case deferred_password_action(rule) do
+      {:ok, next_password_action} ->
+        apply_rules_deferred(user, rest, pending_key_patterns, next_password_action)
 
-      :not_key_rule ->
-        case parse_rule(user, rule) do
-          {:ok, updated} -> apply_rules(updated, rest, pending_key_patterns)
-          {:error, _} = err -> err
+      :not_password_rule ->
+        case parse_key_rule(user, rule, pending_key_patterns) do
+          {:ok, updated, next_pending} ->
+            apply_rules_deferred(updated, rest, next_pending, password_action)
+
+          :not_key_rule ->
+            case parse_rule(user, rule) do
+              {:ok, updated} ->
+                apply_rules_deferred(updated, rest, pending_key_patterns, password_action)
+
+              {:error, _} = err ->
+                err
+            end
         end
     end
   end
+
+  defp deferred_password_action(">" <> password), do: {:ok, {:hash, password}}
+  defp deferred_password_action("nopass"), do: {:ok, :clear}
+  defp deferred_password_action("resetpass"), do: {:ok, :clear}
+  defp deferred_password_action(_rule), do: :not_password_rule
+
+  defp materialize_password(user, :unchanged, _password_hasher), do: user
+  defp materialize_password(user, :clear, _password_hasher), do: %{user | password: nil}
+
+  defp materialize_password(user, {:hash, password}, password_hasher),
+    do: %{user | password: password_hasher.(password)}
 
   @spec parse_rule(user(), binary()) :: {:ok, user()} | {:error, binary()}
   def parse_rule(user, "on"), do: {:ok, %{user | enabled: true}}
