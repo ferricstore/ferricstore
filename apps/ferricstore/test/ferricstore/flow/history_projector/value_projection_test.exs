@@ -2,6 +2,8 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjectionTest do
   use ExUnit.Case, async: true
   @moduletag :flow
 
+  alias Ferricstore.CommandTime
+  alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.HistoryProjector.ValueProjection
 
   test "projected value work is split into bounded batches" do
@@ -81,5 +83,28 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjectionTest do
                keydir,
                ref
              )
+  end
+
+  test "projected LMDB value expiry uses the stamped command clock" do
+    unique = System.unique_integer([:positive])
+    shard_data_path = Path.join(System.tmp_dir!(), "ferricstore_projected_value_hlc_#{unique}")
+    path = LMDB.path(shard_data_path)
+    ref = "projected-value-hlc-#{unique}"
+    wall_ms = System.system_time(:millisecond)
+
+    on_exit(fn ->
+      _ = LMDB.release(path, 1_000)
+      File.rm_rf!(shard_data_path)
+    end)
+
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, ref, LMDB.encode_value("expired-projection", wall_ms + 30_000)}
+             ])
+
+    assert {[], [^ref]} =
+             CommandTime.with_now_ms(wall_ms + 60_000, fn ->
+               ValueProjection.split_projected_flow_value_refs(shard_data_path, [ref])
+             end)
   end
 end

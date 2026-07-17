@@ -1,6 +1,7 @@
 defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
   @moduledoc false
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Flow.HistoryProjector
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Store.BlobRef
@@ -186,7 +187,7 @@ defmodule Ferricstore.Flow.HistoryProjector.ValueProjection do
 
         case Ferricstore.Flow.LMDB.get_many(path, refs) do
           {:ok, results} when length(results) == length(refs) ->
-            now_ms = System.system_time(:millisecond)
+            now_ms = CommandTime.now_ms()
 
             Enum.zip(refs, results)
             |> Enum.reduce({[], []}, fn
