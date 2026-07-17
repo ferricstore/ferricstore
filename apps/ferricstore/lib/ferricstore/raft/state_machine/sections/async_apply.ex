@@ -666,9 +666,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
       end
 
       defp apply_zadd_single(state, key, score, member) do
+        with true <- is_binary(key) and is_binary(member),
+             {:ok, normalized_score} <- normalize_zadd_score(score) do
+          apply_zadd_single_normalized(state, key, normalized_score, member)
+        else
+          _invalid -> {:error, :invalid_zadd_score}
+        end
+      end
+
+      defp apply_zadd_single_normalized(state, key, score, member) do
         type_key = CompoundKey.type_key(key)
         member_key = CompoundKey.zset_member(key, member)
-        score_str = Float.to_string(score * 1.0)
+        score_str = Float.to_string(score)
 
         case sm_store_compound_get(state, key, type_key) do
           nil ->
@@ -682,11 +691,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
+      defp normalize_zadd_score(score) when is_float(score) do
+        if score == score and score <= 1.7976931348623157e308 and
+             score >= -1.7976931348623157e308 do
+          {:ok, score}
+        else
+          {:error, :invalid_zadd_score}
+        end
+      end
+
+      defp normalize_zadd_score(score) when is_integer(score) do
+        try do
+          normalize_zadd_score(score * 1.0)
+        rescue
+          ArithmeticError -> {:error, :invalid_zadd_score}
+        end
+      end
+
+      defp normalize_zadd_score(_score), do: {:error, :invalid_zadd_score}
+
       defp apply_zadd_many_single_entries(state, entries) do
         Enum.map(entries, fn {key, score, member} ->
           case check_fetch_or_compute_lock(state, key, nil) do
             :ok ->
-              apply_zadd_single(state, key, score, member)
+              apply_zadd_single_normalized(state, key, score, member)
 
             {:error, _reason} = error ->
               error

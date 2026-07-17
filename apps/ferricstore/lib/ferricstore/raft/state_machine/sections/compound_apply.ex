@@ -108,7 +108,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp apply_compound_batch_put_entries(state, redis_key, entries) do
-        with {:ok, _count} <- admit_compound_member_batch(state, entries) do
+        with {:ok, _count} <- admit_compound_batch_apply(state, entries) do
           apply_compound_batch_put_entries_admitted(state, redis_key, entries)
         end
       end
@@ -147,6 +147,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
 
       defp admit_compound_member_batch(_state, _entries),
         do: {:error, :invalid_compound_member_apply_budget}
+
+      defp admit_compound_batch_apply(state, entries) do
+        with {:ok, count} <- admit_batch_command_items(state, entries),
+             {:ok, ^count} <- admit_compound_member_batch(state, entries) do
+          {:ok, count}
+        end
+      end
 
       defp admit_compound_member_mutation(
              %{apply_context: %{compound_member_apply_budget: budget}},
@@ -207,7 +214,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp apply_compound_blob_batch_put_entries(state, redis_key, entries) do
-        with {:ok, _count} <- admit_compound_member_batch(state, entries) do
+        with {:ok, _count} <- admit_compound_batch_apply(state, entries) do
           apply_compound_blob_batch_put_entries_admitted(state, redis_key, entries)
         end
       end
@@ -526,7 +533,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
       end
 
       defp apply_compound_batch_delete_keys(state, redis_key, compound_keys) do
-        with {:ok, _count} <- admit_compound_member_batch(state, compound_keys) do
+        with {:ok, _count} <- admit_compound_batch_apply(state, compound_keys) do
           apply_compound_batch_delete_keys_admitted(state, redis_key, compound_keys)
         end
       end

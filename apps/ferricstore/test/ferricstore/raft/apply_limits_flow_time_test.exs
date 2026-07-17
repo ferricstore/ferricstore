@@ -68,7 +68,6 @@ defmodule Ferricstore.Raft.ApplyLimitsFlowTimeTest do
            |> length() == 3
   end
 
-
   test "replicated apply context bounds the total structural batch footprint" do
     state = %{apply_context: ApplyContext.new(flow_max_batch_items: 2)}
 
@@ -79,6 +78,9 @@ defmodule Ferricstore.Raft.ApplyLimitsFlowTimeTest do
 
     assert {:error, "ERR flow batch item count exceeds maximum 2"} =
              ApplyLimits.validate_flow_batch(state, %{records: [%{}, %{}], children: [%{}]})
+
+    assert {:error, "ERR flow batch items must be proper lists"} =
+             ApplyLimits.validate_flow_batch(state, %{records: [%{} | :invalid_tail]})
   end
 
   test "both Flow apply wrappers enforce the replicated batch invariant" do

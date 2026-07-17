@@ -6,7 +6,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
       alias Ferricstore.Raft.StateMachineTest.CurrentStateMachine, as: StateMachine
       alias Ferricstore.Raft.WARaftStorage
       alias Ferricstore.Store.{BlobRef, BlobStore, CompoundKey, LFU, ListOps}
-      alias Ferricstore.Store.Shard.CompoundMemberIndex
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
 
       describe "replicated batch value limits" do
         test "put_batch preserves per-entry results on the fast path", %{
@@ -406,8 +406,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
           assert {_state, {:error, :compound_member_apply_budget_exceeded}} =
                    StateMachine.apply(
                      %{},
-                     {:compound_batch_put, redis_key,
-                      [{first, "one", 0}, {second, "two", 0}]},
+                     {:compound_batch_put, redis_key, [{first, "one", 0}, {second, "two", 0}]},
                      limited_state
                    )
 
@@ -583,12 +582,11 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
 
           meta = %{index: 42, term: 1, system_time: Ferricstore.HLC.now_ms()}
 
-          assert {new_state,
-                  {:applied_at, 42, {:error, :compound_member_apply_budget_exceeded}}, effects} =
+          assert {new_state, {:applied_at, 42, {:error, :compound_member_apply_budget_exceeded}},
+                  effects} =
                    StateMachine.apply(
                      meta,
-                     {:compound_batch_put, redis_key,
-                      [{first, "one", 0}, {second, "two", 0}]},
+                     {:compound_batch_put, redis_key, [{first, "one", 0}, {second, "two", 0}]},
                      limited_state
                    )
 
@@ -620,7 +618,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
           ]
 
           Enum.each(commands, fn command ->
-            assert {_state, {:error, :invalid_compound_batch_entry}} =
+            assert {_state, {:error, :invalid_batch_command_list}} =
                      StateMachine.apply(%{}, command, limited_state)
 
             assert [] == :ets.lookup(ets, compound_key)
@@ -643,13 +641,731 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.BatchValueLimits do
           assert {_state, {:ok, [:ok, :ok]}} =
                    StateMachine.apply(
                      %{},
-                     {:compound_batch_put, redis_key,
-                      [{first, "one", 0}, {second, "two", 0}]},
+                     {:compound_batch_put, redis_key, [{first, "one", 0}, {second, "two", 0}]},
                      limited_state
                    )
 
           assert [{^first, "one", 0, _lfu, _file_id, _offset, 3}] = :ets.lookup(ets, first)
           assert [{^second, "two", 0, _lfu, _file_id, _offset, 3}] = :ets.lookup(ets, second)
+        end
+
+        @tag :generic_batch_apply_budget
+        test "generic batches share one compound member budget", %{state: state, ets: ets} do
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          for {suffix, wrap} <- [
+                {"flat", & &1},
+                {"nested", &[{:batch, &1}]}
+              ] do
+            redis_key = "batch-budget:generic:#{suffix}"
+            first = CompoundKey.hash_field(redis_key, "first")
+            second = CompoundKey.hash_field(redis_key, "second")
+
+            commands = [
+              {:compound_batch_put, redis_key, [{first, "one", 0}]},
+              {:compound_batch_put, redis_key, [{second, "two", 0}]}
+            ]
+
+            assert {_state, {:error, :compound_member_apply_budget_exceeded}} =
+                     StateMachine.apply(%{}, {:batch, wrap.(commands)}, limited_state)
+
+            assert [] == :ets.lookup(ets, first)
+            assert [] == :ets.lookup(ets, second)
+          end
+        end
+
+        @tag :generic_batch_apply_budget
+        test "generic batches count singleton compound mutations cumulatively", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "batch-budget:generic-singletons"
+          first = CompoundKey.hash_field(redis_key, "first")
+          second = CompoundKey.hash_field(redis_key, "second")
+          context = Ferricstore.Raft.ApplyContext.new(compound_member_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:error, :compound_member_apply_budget_exceeded}} =
+                   StateMachine.apply(
+                     %{},
+                     {:batch,
+                      [
+                        {:compound_put, first, "one", 0},
+                        {:compound_put, second, "two", 0}
+                      ]},
+                     limited_state
+                   )
+
+          assert [] == :ets.lookup(ets, first)
+          assert [] == :ets.lookup(ets, second)
+        end
+
+        @tag :generic_batch_apply_budget
+        test "generic batches admit inner item footprints before dispatch", %{
+          state: state,
+          ets: ets
+        } do
+          context =
+            Ferricstore.Raft.ApplyContext.new(
+              batch_command_apply_budget: 1,
+              compound_member_apply_budget: 10
+            )
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          commands = [
+            {:mset,
+             [
+               {"batch-budget:generic-mset:first", "one", 0},
+               {"batch-budget:generic-mset:second", "two", 0}
+             ]},
+            {:pfadd, "batch-budget:generic-pfadd", ["first", "second"]},
+            {:list_op, "batch-budget:generic-lpush", {:lpush, ["first", "second"]}}
+          ]
+
+          Enum.each(commands, fn command ->
+            assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                     StateMachine.apply(%{}, {:batch, [command]}, limited_state)
+          end)
+
+          for key <- [
+                "batch-budget:generic-mset:first",
+                "batch-budget:generic-mset:second",
+                "batch-budget:generic-pfadd"
+              ] do
+            assert [] == :ets.lookup(ets, key)
+          end
+
+          assert [] ==
+                   :ets.lookup(
+                     ets,
+                     CompoundKey.type_key("batch-budget:generic-lpush")
+                   )
+        end
+
+        @tag :generic_batch_apply_budget
+        test "apply work admission follows async and trace wrappers", %{
+          state: state,
+          ets: ets
+        } do
+          context = Ferricstore.Raft.ApplyContext.new(batch_command_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          for {suffix, command} <- [
+                {"async",
+                 {:async, :remote_budget_origin,
+                  {:mset,
+                   [
+                     {"batch-budget:wrapped:async:first", "one", 0},
+                     {"batch-budget:wrapped:async:second", "two", 0}
+                   ]}}},
+                {"trace",
+                 {:ferricstore_latency_trace,
+                  {:mset,
+                   [
+                     {"batch-budget:wrapped:trace:first", "one", 0},
+                     {"batch-budget:wrapped:trace:second", "two", 0}
+                   ]}}}
+              ] do
+            assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                     StateMachine.apply(%{}, {:batch, [command]}, limited_state)
+
+            assert [] == :ets.lookup(ets, "batch-budget:wrapped:#{suffix}:first")
+            assert [] == :ets.lookup(ets, "batch-budget:wrapped:#{suffix}:second")
+          end
+
+          direct_async =
+            {:async, :remote_budget_origin,
+             {:mset,
+              [
+                {"batch-budget:wrapped:direct:first", "one", 0},
+                {"batch-budget:wrapped:direct:second", "two", 0}
+              ]}}
+
+          assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                   StateMachine.apply(%{}, direct_async, limited_state)
+
+          assert [] == :ets.lookup(ets, "batch-budget:wrapped:direct:first")
+          assert [] == :ets.lookup(ets, "batch-budget:wrapped:direct:second")
+        end
+
+        @tag :generic_batch_apply_budget
+        test "generic batch normalization bounds leaves and structural visits", %{
+          state: state,
+          ets: ets
+        } do
+          context = Ferricstore.Raft.ApplyContext.new(batch_command_apply_budget: 2)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          exact_entries = [
+            {"batch-budget:command:exact:first", "one", 0},
+            {"batch-budget:command:exact:second", "two", 0}
+          ]
+
+          assert {_state, {:ok, [:ok, :ok]}} =
+                   StateMachine.apply(
+                     %{},
+                     {:batch, [{:put_batch, exact_entries}]},
+                     limited_state
+                   )
+
+          oversized_entries = [
+            {"batch-budget:command:oversized:first", "one", 0},
+            {"batch-budget:command:oversized:second", "two", 0},
+            {"batch-budget:command:oversized:third", "three", 0}
+          ]
+
+          assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                   StateMachine.apply(
+                     %{},
+                     {:batch, [{:put_batch, oversized_entries}]},
+                     limited_state
+                   )
+
+          Enum.each(oversized_entries, fn {key, _value, _expire_at_ms} ->
+            assert [] == :ets.lookup(ets, key)
+          end)
+
+          too_deep =
+            Enum.reduce(1..5, [], fn _depth, nested ->
+              [{:batch, nested}]
+            end)
+
+          assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                   StateMachine.apply(%{}, {:batch, too_deep}, limited_state)
+        end
+
+        @tag :generic_batch_apply_budget
+        test "generic batch normalization rejects improper command tails", %{
+          state: state,
+          ets: ets
+        } do
+          key = "batch-budget:command:improper"
+          commands = [{:put, key, "value", 0} | :invalid_tail]
+
+          assert {_state, {:error, :invalid_batch_command_list}} =
+                   Ferricstore.Raft.StateMachine.apply(%{}, {:batch, commands}, state)
+
+          assert [] == :ets.lookup(ets, key)
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct put batches reject command fanout before mutation", %{
+          state: state,
+          ets: ets
+        } do
+          entries = [
+            {"batch-budget:direct-put:first", "one", 0},
+            {"batch-budget:direct-put:second", "two", 0}
+          ]
+
+          context = Ferricstore.Raft.ApplyContext.new(batch_command_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                   StateMachine.apply(%{}, {:put_batch, entries}, limited_state)
+
+          Enum.each(entries, fn {key, _value, _expire_at_ms} ->
+            assert [] == :ets.lookup(ets, key)
+          end)
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct blob put batches reject command fanout before materialization", %{
+          state: state,
+          ets: ets
+        } do
+          entries = [
+            {"batch-budget:direct-blob:first", "one", 0, :value},
+            {"batch-budget:direct-blob:second", "two", 0, :value}
+          ]
+
+          context = Ferricstore.Raft.ApplyContext.new(batch_command_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                   StateMachine.apply(%{}, {:put_blob_batch, entries}, limited_state)
+
+          Enum.each(entries, fn {key, _value, _expire_at_ms, _kind} ->
+            assert [] == :ets.lookup(ets, key)
+          end)
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct delete batches reject command fanout before mutation", %{
+          state: state,
+          ets: ets
+        } do
+          entries = [
+            {"batch-budget:direct-delete:first", "one", 0},
+            {"batch-budget:direct-delete:second", "two", 0}
+          ]
+
+          assert {seeded_state, {:ok, [:ok, :ok]}} =
+                   StateMachine.apply(%{}, {:put_batch, entries}, state)
+
+          rows_before =
+            Map.new(entries, fn {key, _value, _expire_at_ms} ->
+              {key, :ets.lookup(ets, key)}
+            end)
+
+          context = Ferricstore.Raft.ApplyContext.new(batch_command_apply_budget: 1)
+
+          limited_state = %{
+            seeded_state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          keys = Enum.map(entries, &elem(&1, 0))
+
+          assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                   StateMachine.apply(%{}, {:delete_batch, keys}, limited_state)
+
+          assert rows_before == Map.new(keys, &{&1, :ets.lookup(ets, &1)})
+        end
+
+        @tag :direct_batch_apply_budget
+        test "delete batches reject malformed keys before mutation", %{
+          state: state,
+          ets: ets
+        } do
+          key = "batch-budget:direct-delete:malformed"
+
+          assert {seeded_state, :ok} =
+                   StateMachine.apply(%{}, {:put, key, "value", 0}, state)
+
+          row_before = :ets.lookup(ets, key)
+          command = {:delete_batch, [key, :malformed]}
+
+          assert {_state, {:error, :invalid_delete_batch_key}} =
+                   StateMachine.apply(%{}, command, seeded_state)
+
+          assert row_before == :ets.lookup(ets, key)
+
+          assert {_state, {:error, :invalid_delete_batch_key}} =
+                   StateMachine.apply(%{}, {:batch, [command]}, seeded_state)
+
+          assert row_before == :ets.lookup(ets, key)
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct expiry batches reject command fanout before scanning", %{
+          state: state,
+          ets: ets
+        } do
+          expired_at_ms = Ferricstore.HLC.now_ms() - 1_000
+
+          entries = [
+            {"batch-budget:direct-expire:first", "one", expired_at_ms},
+            {"batch-budget:direct-expire:second", "two", expired_at_ms}
+          ]
+
+          assert {seeded_state, {:ok, [:ok, :ok]}} =
+                   StateMachine.apply(%{}, {:put_batch, entries}, state)
+
+          rows_before =
+            Map.new(entries, fn {key, _value, _expire_at_ms} ->
+              {key, :ets.lookup(ets, key)}
+            end)
+
+          context = Ferricstore.Raft.ApplyContext.new(batch_command_apply_budget: 1)
+
+          limited_state = %{
+            seeded_state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          expiry_entries =
+            Enum.map(entries, fn {key, _value, expire_at_ms} ->
+              {key, expire_at_ms}
+            end)
+
+          assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                   StateMachine.apply(
+                     %{system_time: expired_at_ms + 1_000},
+                     {:expire_if_batch, expiry_entries},
+                     limited_state
+                   )
+
+          assert rows_before ==
+                   Map.new(expiry_entries, fn {key, _expire_at_ms} ->
+                     {key, :ets.lookup(ets, key)}
+                   end)
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct expiry batches reject malformed entries before mutation", %{
+          state: state,
+          ets: ets
+        } do
+          expired_at_ms = Ferricstore.HLC.now_ms() - 1_000
+          key = "batch-budget:direct-expire:malformed"
+
+          assert {seeded_state, :ok} =
+                   StateMachine.apply(
+                     %{},
+                     {:put, key, "value", expired_at_ms},
+                     state
+                   )
+
+          row_before = :ets.lookup(ets, key)
+
+          assert {_state, {:error, :invalid_expire_if_batch_entry}} =
+                   StateMachine.apply(
+                     %{system_time: expired_at_ms + 1_000},
+                     {:expire_if_batch, [{key, expired_at_ms}, :malformed]},
+                     seeded_state
+                   )
+
+          assert row_before == :ets.lookup(ets, key)
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct expiry batches share one compound member budget across keys", %{
+          state: state,
+          ets: ets
+        } do
+          expired_at_ms = Ferricstore.HLC.now_ms() - 1_000
+          first = CompoundKey.hash_field("batch-budget:expire-compound:first", "field")
+          second = CompoundKey.hash_field("batch-budget:expire-compound:second", "field")
+
+          assert {first_state, :ok} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_put, first, "one", expired_at_ms},
+                     state
+                   )
+
+          assert {seeded_state, :ok} =
+                   StateMachine.apply(
+                     %{},
+                     {:compound_put, second, "two", expired_at_ms},
+                     first_state
+                   )
+
+          rows_before = %{first => :ets.lookup(ets, first), second => :ets.lookup(ets, second)}
+
+          context =
+            Ferricstore.Raft.ApplyContext.new(
+              batch_command_apply_budget: 10,
+              compound_member_apply_budget: 1
+            )
+
+          limited_state = %{
+            seeded_state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          assert {_state, {:error, :compound_member_apply_budget_exceeded}} =
+                   StateMachine.apply(
+                     %{system_time: expired_at_ms + 1_000},
+                     {:expire_if_batch, [{first, expired_at_ms}, {second, expired_at_ms}]},
+                     limited_state
+                   )
+
+          assert rows_before == %{
+                   first => :ets.lookup(ets, first),
+                   second => :ets.lookup(ets, second)
+                 }
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct atomic string batches reject command fanout before mutation", %{
+          state: state,
+          ets: ets
+        } do
+          context = Ferricstore.Raft.ApplyContext.new(batch_command_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          for {tag, blob?} <- [
+                {:mset, false},
+                {:msetnx, false},
+                {:mset_blob_batch, true},
+                {:msetnx_blob_batch, true}
+              ] do
+            first = "batch-budget:#{tag}:first"
+            second = "batch-budget:#{tag}:second"
+
+            entries =
+              if blob? do
+                [{first, "one", 0, :value}, {second, "two", 0, :value}]
+              else
+                [{first, "one", 0}, {second, "two", 0}]
+              end
+
+            assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                     StateMachine.apply(%{}, {tag, entries}, limited_state)
+
+            assert [] == :ets.lookup(ets, first)
+            assert [] == :ets.lookup(ets, second)
+          end
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct zset batches enforce command and compound member budgets", %{
+          state: state,
+          ets: ets
+        } do
+          Enum.each(
+            [
+              {state.zset_score_index_name, :ordered_set},
+              {state.zset_score_lookup_name, :set}
+            ],
+            fn {table, type} ->
+              if :ets.whereis(table) == :undefined do
+                :ets.new(table, [type, :public, :named_table])
+              else
+                :ets.delete_all_objects(table)
+              end
+            end
+          )
+
+          on_exit(fn ->
+            safe_delete_ets(state.zset_score_index_name)
+            safe_delete_ets(state.zset_score_lookup_name)
+          end)
+
+          for {suffix, options, expected_error} <- [
+                {"commands", [batch_command_apply_budget: 1, compound_member_apply_budget: 10],
+                 :batch_command_apply_budget_exceeded},
+                {"members", [batch_command_apply_budget: 10, compound_member_apply_budget: 1],
+                 :compound_member_apply_budget_exceeded}
+              ] do
+            redis_key = "batch-budget:direct-zadd:#{suffix}"
+            first_member = CompoundKey.zset_member(redis_key, "first")
+            second_member = CompoundKey.zset_member(redis_key, "second")
+            context = Ferricstore.Raft.ApplyContext.new(options)
+
+            limited_state = %{
+              state
+              | apply_context: context,
+                apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+            }
+
+            assert {_state, {:error, ^expected_error}} =
+                     StateMachine.apply(
+                       %{},
+                       {:zadd_many_single,
+                        [{redis_key, 1.0, "first"}, {redis_key, 2.0, "second"}]},
+                       limited_state
+                     )
+
+            assert [] == :ets.lookup(ets, CompoundKey.type_key(redis_key))
+            assert [] == :ets.lookup(ets, first_member)
+            assert [] == :ets.lookup(ets, second_member)
+
+            assert [] ==
+                     ZSetIndex.range(
+                       state.zset_score_index_name,
+                       redis_key,
+                       :neg_inf,
+                       :inf,
+                       false
+                     )
+          end
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct zset batches validate all entries before mutation", %{
+          state: state,
+          ets: ets
+        } do
+          redis_key = "batch-budget:direct-zadd:malformed"
+          first_member = CompoundKey.zset_member(redis_key, "first")
+
+          assert {_state, {:error, :invalid_zadd_many_single_entry}} =
+                   StateMachine.apply(
+                     %{},
+                     {:zadd_many_single, [{redis_key, 1.0, "first"}, :malformed]},
+                     state
+                   )
+
+          assert [] == :ets.lookup(ets, CompoundKey.type_key(redis_key))
+          assert [] == :ets.lookup(ets, first_member)
+        end
+
+        @tag :direct_batch_apply_budget
+        test "zset single and batch score preparation rejects overflowing numbers", %{
+          state: state,
+          ets: ets
+        } do
+          huge_score = :erlang.bsl(1, 20_000)
+          single_key = "batch-budget:zadd-score:single"
+
+          assert {_state, {:error, :invalid_zadd_score}} =
+                   StateMachine.apply(
+                     %{},
+                     {:zadd_single, single_key, huge_score, "member"},
+                     state
+                   )
+
+          assert [] == :ets.lookup(ets, CompoundKey.type_key(single_key))
+          assert [] == :ets.lookup(ets, CompoundKey.zset_member(single_key, "member"))
+
+          batch_key = "batch-budget:zadd-score:batch"
+
+          assert {_state, {:error, :invalid_zadd_many_single_entry}} =
+                   StateMachine.apply(
+                     %{},
+                     {:zadd_many_single,
+                      [{batch_key, 1.0, "first"}, {batch_key, huge_score, "second"}]},
+                     state
+                   )
+
+          assert [] == :ets.lookup(ets, CompoundKey.type_key(batch_key))
+          assert [] == :ets.lookup(ets, CompoundKey.zset_member(batch_key, "first"))
+          assert [] == :ets.lookup(ets, CompoundKey.zset_member(batch_key, "second"))
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct list pushes reject item fanout before type claiming", %{
+          state: state,
+          ets: ets
+        } do
+          context =
+            Ferricstore.Raft.ApplyContext.new(
+              batch_command_apply_budget: 1,
+              compound_member_apply_budget: 10
+            )
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          for tag <- [:lpush, :lpushx, :rpush, :rpushx] do
+            redis_key = "batch-budget:direct-list:#{tag}"
+
+            assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                     StateMachine.apply(
+                       %{},
+                       {:list_op, redis_key, {tag, ["first", "second"]}},
+                       limited_state
+                     )
+
+            assert [] == :ets.lookup(ets, CompoundKey.type_key(redis_key))
+            assert [] == :ets.lookup(ets, CompoundKey.list_meta_key(redis_key))
+          end
+        end
+
+        @tag :direct_batch_apply_budget
+        test "direct list-bearing commands reject item fanout before execution", %{
+          state: state,
+          ets: ets
+        } do
+          context = Ferricstore.Raft.ApplyContext.new(batch_command_apply_budget: 1)
+
+          limited_state = %{
+            state
+            | apply_context: context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(context)
+          }
+
+          commands = [
+            {:pfadd, "batch-budget:direct-pfadd", ["first", "second"]},
+            {:pfmerge, "batch-budget:direct-pfmerge", ["source-a", "source-b"], ["sketch"]},
+            {:bloom_madd, "batch-budget:direct-bloom", ["first", "second"], nil},
+            {:cms_incrby, "batch-budget:direct-cms", [{"first", 1}, {"second", 1}]},
+            {:cms_merge, "batch-budget:direct-cms-merge", ["source"], [1, 2], nil},
+            {:topk_add, "batch-budget:direct-topk-add", ["first", "second"]},
+            {:topk_incrby, "batch-budget:direct-topk-incr", [{"first", 1}, {"second", 1}]},
+            {:watch_tokens,
+             ["batch-budget:direct-watch:first", "batch-budget:direct-watch:second"]}
+          ]
+
+          Enum.each(commands, fn command ->
+            assert {_state, {:error, :batch_command_apply_budget_exceeded}} =
+                     StateMachine.apply(%{}, command, limited_state)
+          end)
+
+          for key <- [
+                "batch-budget:direct-pfadd",
+                "batch-budget:direct-pfmerge",
+                "batch-budget:direct-bloom",
+                "batch-budget:direct-cms",
+                "batch-budget:direct-cms-merge",
+                "batch-budget:direct-topk-add",
+                "batch-budget:direct-topk-incr"
+              ] do
+            assert [] == :ets.lookup(ets, key)
+          end
+        end
+
+        @tag :empty_batch_release_cursor
+        test "empty replicated batches advance release cursor accounting", %{state: state} do
+          commands = [
+            {:batch, []},
+            {:put_batch, []},
+            {:put_blob_batch, []},
+            {:delete_batch, []},
+            {:zadd_many_single, []},
+            {:compound_batch_put, "batch-budget:empty:put", []},
+            {:compound_blob_batch_put, "batch-budget:empty:blob", []},
+            {:compound_batch_delete, "batch-budget:empty:delete", []}
+          ]
+
+          initial_state = %{state | release_cursor_interval: 1}
+
+          Enum.reduce(Enum.with_index(commands, 1), initial_state, fn {command, index}, current ->
+            meta = %{index: index, term: 1, system_time: Ferricstore.HLC.now_ms()}
+
+            assert {next_state, {:applied_at, ^index, {:ok, []}}, effects} =
+                     StateMachine.apply(meta, command, current)
+
+            assert next_state.applied_count == current.applied_count + 1
+            assert next_state.pending_release_cursor_index == index
+
+            assert Enum.any?(
+                     effects,
+                     &match?({:send_msg, _, {:locally_applied, ^index}, _}, &1)
+                   )
+
+            next_state
+          end)
         end
 
         @tag :compound_batch_value_limits

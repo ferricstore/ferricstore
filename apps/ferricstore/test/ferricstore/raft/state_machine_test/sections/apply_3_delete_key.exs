@@ -526,7 +526,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             StateMachine.apply(%{}, {:batch, []}, state)
 
           assert results == []
-          assert new_state.applied_count == 0
+          assert new_state.applied_count == 1
         end
 
         test "large batch (100 commands)", %{state: state} do

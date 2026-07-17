@@ -105,7 +105,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       # Async single-command path. Delegates to apply_single which handles
       # origin-skip via the embedded origin node tag.
       def apply(meta, {:async, _origin, _inner_cmd} = cmd, state) do
-        apply_pending_with_time(meta, state, fn -> apply_single(state, cmd) end)
+        apply_pending_with_time(meta, state, fn ->
+          with :ok <- admit_apply_command_work(state, cmd) do
+            apply_single(state, cmd)
+          end
+        end)
       end
 
       def apply(meta, {:put, key, value, expire_at_ms}, state) do
@@ -184,7 +188,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       def apply(meta, {:flow_policy_fence, installs, command}, state)
           when is_list(installs) and is_tuple(command) do
         apply_pending_with_time(meta, state, fn ->
-          apply_flow_policy_fence(state, installs, command)
+          wrapped = {:flow_policy_fence, installs, command}
+
+          with :ok <- admit_apply_command_work(state, wrapped) do
+            apply_flow_policy_fence(state, installs, command)
+          end
         end)
       end
 
@@ -426,11 +434,56 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:expire_if_batch, entries}, state) when is_list(entries) do
         apply_pending_with_time(meta, state, fn ->
-          do_expire_if_batch(state, entries, ExpiryContext.capture())
+          with {:ok, _count} <- admit_batch_command_items(state, entries) do
+            do_expire_if_batch(state, entries, ExpiryContext.capture())
+          end
         end)
       end
 
       defp do_expire_if_batch(state, entries, expiry_context) do
+        with :ok <- validate_expire_if_batch_entries(entries),
+             :ok <- admit_expire_if_compound_work(state, entries) do
+          do_expire_if_batch_validated(state, entries, expiry_context)
+        end
+      end
+
+      defp validate_expire_if_batch_entries([]), do: :ok
+
+      defp validate_expire_if_batch_entries([
+             {key, expected_expire_at_ms} | rest
+           ])
+           when is_binary(key) and is_integer(expected_expire_at_ms) and
+                  expected_expire_at_ms > 0,
+           do: validate_expire_if_batch_entries(rest)
+
+      defp validate_expire_if_batch_entries(_invalid),
+        do: {:error, :invalid_expire_if_batch_entry}
+
+      defp admit_expire_if_compound_work(
+             %{apply_context: %{compound_member_apply_budget: budget}},
+             entries
+           )
+           when is_integer(budget) and budget > 0,
+           do: count_expire_if_compound_work(entries, budget)
+
+      defp admit_expire_if_compound_work(_state, _entries),
+        do: {:error, :invalid_compound_member_apply_budget}
+
+      defp count_expire_if_compound_work([], _remaining), do: :ok
+
+      defp count_expire_if_compound_work([{key, _expire_at_ms} | rest], remaining) do
+        if CompoundKey.internal_key?(key) do
+          if remaining > 0 do
+            count_expire_if_compound_work(rest, remaining - 1)
+          else
+            {:error, :compound_member_apply_budget_exceeded}
+          end
+        else
+          count_expire_if_compound_work(rest, remaining)
+        end
+      end
+
+      defp do_expire_if_batch_validated(state, entries, expiry_context) do
         matched_keys =
           Enum.reduce(entries, MapSet.new(), fn
             {key, expected_expire_at_ms}, acc
@@ -496,52 +549,64 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       end
 
       def apply(meta, {:put_batch, entries}, state) when is_list(entries) do
+        apply_hot_batch_with_command_budget(meta, state, entries, fn ->
+          apply_put_batch_entries(state, entries)
+        end)
+      end
+
+      defp apply_hot_batch_with_command_budget(meta, state, items, fun)
+           when is_function(fun, 0) do
         with_apply_time(meta, fn ->
           old_count = state.applied_count
 
-          write_result =
-            with_pending_writes(state, fn ->
-              apply_put_batch_entries(state, entries)
-            end)
+          {applied_increment, write_result} =
+            case admit_batch_command_items(state, items) do
+              {:ok, count} ->
+                {max(count, 1), with_pending_writes(state, fun)}
 
-          finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
+              {:error, _reason} = error ->
+                {1, error}
+            end
+
+          finish_hot_batch_apply(meta, old_count, state, applied_increment, write_result)
         end)
       end
 
       def apply(meta, {:mset, entries}, state) when is_list(entries) do
         apply_pending_with_time(meta, state, fn ->
-          apply_atomic_string_batch(state, entries, :mset, :plain)
+          with {:ok, _count} <- admit_batch_command_items(state, entries) do
+            apply_atomic_string_batch(state, entries, :mset, :plain)
+          end
         end)
       end
 
       def apply(meta, {:mset_blob_batch, entries}, state) when is_list(entries) do
         apply_pending_with_time(meta, state, fn ->
-          apply_atomic_string_batch(state, entries, :mset, :blob)
+          with {:ok, _count} <- admit_batch_command_items(state, entries) do
+            apply_atomic_string_batch(state, entries, :mset, :blob)
+          end
         end)
       end
 
       def apply(meta, {:msetnx, entries}, state) when is_list(entries) do
         apply_pending_with_time(meta, state, fn ->
-          apply_atomic_string_batch(state, entries, :msetnx, :plain)
+          with {:ok, _count} <- admit_batch_command_items(state, entries) do
+            apply_atomic_string_batch(state, entries, :msetnx, :plain)
+          end
         end)
       end
 
       def apply(meta, {:msetnx_blob_batch, entries}, state) when is_list(entries) do
         apply_pending_with_time(meta, state, fn ->
-          apply_atomic_string_batch(state, entries, :msetnx, :blob)
+          with {:ok, _count} <- admit_batch_command_items(state, entries) do
+            apply_atomic_string_batch(state, entries, :msetnx, :blob)
+          end
         end)
       end
 
       def apply(meta, {:put_blob_batch, entries}, state) when is_list(entries) do
-        with_apply_time(meta, fn ->
-          old_count = state.applied_count
-
-          write_result =
-            with_pending_writes(state, fn ->
-              apply_put_blob_batch_entries(state, entries)
-            end)
-
-          finish_hot_batch_apply(meta, old_count, state, length(entries), write_result)
+        apply_hot_batch_with_command_budget(meta, state, entries, fn ->
+          apply_put_blob_batch_entries(state, entries)
         end)
       end
 
@@ -576,17 +641,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       end
 
       def apply(meta, {:delete_batch, keys}, state) when is_list(keys) do
-        with_apply_time(meta, fn ->
-          old_count = state.applied_count
-
-          write_result =
-            with_pending_writes(state, fn ->
-              apply_delete_batch_keys(state, keys)
-            end)
-
-          finish_hot_batch_apply(meta, old_count, state, length(keys), write_result)
+        apply_hot_batch_with_command_budget(meta, state, keys, fn ->
+          with :ok <- validate_delete_batch_keys(keys) do
+            apply_delete_batch_keys(state, keys)
+          end
         end)
       end
+
+      defp validate_delete_batch_keys([]), do: :ok
+
+      defp validate_delete_batch_keys([key | rest]) when is_binary(key),
+        do: validate_delete_batch_keys(rest)
+
+      defp validate_delete_batch_keys(_invalid),
+        do: {:error, :invalid_delete_batch_key}
 
       defp apply_flush_shard(state, ra_index) do
         result =
@@ -878,49 +946,72 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:batch, commands}, state) when is_list(commands) do
         with_apply_time(meta, fn ->
-          commands = normalize_generic_batch_commands(commands)
           old_count = state.applied_count
-          applied_increment = length(commands)
 
-          # All commands in a batch share one pending-writes buffer so they
-          # are flushed in a single v2_append_batch_nosync NIF call.
-          write_result =
-            case generic_batch_barrier_kind(commands) do
-              nil ->
-                case prepare_apply_blob_command(state, {:batch, commands}) do
-                  {:ok, {:batch, prepared_commands}} ->
-                    with_pending_writes(state, fn ->
-                      Enum.map_reduce(prepared_commands, old_count, fn cmd, count ->
-                        materialize_pending_fast_deletes(state)
-                        result = apply_single(state, cmd)
-                        {result, count + 1}
-                      end)
-                    end)
+          case normalize_generic_batch_commands(commands, state) do
+            {:ok, normalized_commands, applied_increment} ->
+              apply_normalized_generic_batch(
+                meta,
+                state,
+                normalized_commands,
+                old_count,
+                applied_increment
+              )
 
-                  {:ok, prepared_command} ->
-                    with_pending_writes(state, fn ->
-                      result = apply_single(state, prepared_command)
-                      {List.wrap(result), old_count + applied_increment}
-                    end)
-
-                  {:error, _reason} = error ->
-                    error
-                end
-
-              barrier_kind ->
-                {:error, {:batch_barrier_command, barrier_kind}}
-            end
-
-          case write_result do
             {:error, _reason} = error ->
-              new_state = %{state | applied_count: old_count + applied_increment}
+              new_state = %{state | applied_count: old_count + 1}
               maybe_release_cursor(meta, old_count, new_state, error)
-
-            {results, new_count} ->
-              new_state = %{state | applied_count: new_count}
-              maybe_release_cursor(meta, old_count, new_state, {:ok, results})
           end
         end)
+      end
+
+      defp apply_normalized_generic_batch(
+             meta,
+             state,
+             commands,
+             old_count,
+             applied_increment
+           ) do
+        applied_increment = max(applied_increment, 1)
+
+        # All commands in a batch share one pending-writes buffer so they
+        # are flushed in a single v2_append_batch_nosync NIF call.
+        write_result =
+          case generic_batch_barrier_kind(commands) do
+            nil ->
+              case prepare_apply_blob_command(state, {:batch, commands}) do
+                {:ok, {:batch, prepared_commands}} ->
+                  with_pending_writes(state, fn ->
+                    Enum.map_reduce(prepared_commands, old_count, fn cmd, count ->
+                      materialize_pending_fast_deletes(state)
+                      result = apply_single(state, cmd)
+                      {result, count + 1}
+                    end)
+                  end)
+
+                {:ok, prepared_command} ->
+                  with_pending_writes(state, fn ->
+                    result = apply_single(state, prepared_command)
+                    {List.wrap(result), old_count + applied_increment}
+                  end)
+
+                {:error, _reason} = error ->
+                  error
+              end
+
+            barrier_kind ->
+              {:error, {:batch_barrier_command, barrier_kind}}
+          end
+
+        case write_result do
+          {:error, _reason} = error ->
+            new_state = %{state | applied_count: old_count + applied_increment}
+            maybe_release_cursor(meta, old_count, new_state, error)
+
+          {results, new_count} ->
+            new_state = %{state | applied_count: max(new_count, old_count + applied_increment)}
+            maybe_release_cursor(meta, old_count, new_state, {:ok, results})
+        end
       end
 
       defp generic_batch_barrier_kind(commands) do
@@ -946,13 +1037,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       # the logical operation into compound list rows inside one pending-write scope.
       def apply(meta, {:list_op, key, operation}, state) do
         with_apply_time(meta, fn ->
-          result = with_pending_writes(state, fn -> do_checked_list_op(state, key, operation) end)
+          result =
+            with_pending_writes(state, fn ->
+              with :ok <- admit_list_operation_apply(state, operation) do
+                do_checked_list_op(state, key, operation)
+              end
+            end)
 
           old_count = state.applied_count
           new_state = %{state | applied_count: old_count + 1}
           maybe_release_cursor(meta, old_count, new_state, result)
         end)
       end
+
+      defp admit_list_operation_apply(state, {tag, elements})
+           when tag in [:lpush, :lpushx, :rpush, :rpushx] do
+        with {:ok, count} <- admit_batch_command_items(state, elements),
+             {:ok, ^count} <- admit_compound_member_batch(state, elements) do
+          :ok
+        end
+      end
+
+      defp admit_list_operation_apply(_state, _operation), do: :ok
 
       def apply(meta, {:list_op_lmove, src_key, dst_key, from_dir, to_dir}, state) do
         apply_pending_with_time(meta, state, fn ->
@@ -1000,22 +1106,58 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         with_apply_time(meta, fn ->
           old_count = state.applied_count
 
-          write_result =
-            with_pending_writes(state, fn ->
-              {apply_zadd_many_single_entries(state, entries), old_count + length(entries)}
-            end)
+          admission =
+            with {:ok, count} <- admit_batch_command_items(state, entries),
+                 {:ok, prepared_entries} <- prepare_zadd_many_single_entries(entries, []),
+                 {:ok, ^count} <- admit_compound_member_batch(state, entries) do
+              {:ok, count, prepared_entries}
+            end
 
-          case write_result do
+          case admission do
             {:error, _reason} = error ->
-              new_state = %{state | applied_count: old_count + length(entries)}
+              new_state = %{state | applied_count: old_count + 1}
               maybe_release_cursor(meta, old_count, new_state, error)
 
-            {results, new_count} ->
-              new_state = %{state | applied_count: new_count}
-              maybe_release_cursor(meta, old_count, new_state, {:ok, results})
+            {:ok, count, prepared_entries} ->
+              applied_increment = max(count, 1)
+
+              write_result =
+                with_pending_writes(state, fn ->
+                  {apply_zadd_many_single_entries(state, prepared_entries),
+                   old_count + applied_increment}
+                end)
+
+              case write_result do
+                {:error, _reason} = error ->
+                  new_state = %{state | applied_count: old_count + applied_increment}
+                  maybe_release_cursor(meta, old_count, new_state, error)
+
+                {results, new_count} ->
+                  new_state = %{state | applied_count: new_count}
+                  maybe_release_cursor(meta, old_count, new_state, {:ok, results})
+              end
           end
         end)
       end
+
+      defp prepare_zadd_many_single_entries([], acc), do: {:ok, Enum.reverse(acc)}
+
+      defp prepare_zadd_many_single_entries([{key, score, member} | rest], acc)
+           when is_binary(key) and is_binary(member) do
+        case normalize_zadd_score(score) do
+          {:ok, normalized_score} ->
+            prepare_zadd_many_single_entries(
+              rest,
+              [{key, normalized_score, member} | acc]
+            )
+
+          {:error, :invalid_zadd_score} ->
+            {:error, :invalid_zadd_many_single_entry}
+        end
+      end
+
+      defp prepare_zadd_many_single_entries(_invalid, _acc),
+        do: {:error, :invalid_zadd_many_single_entry}
 
       def apply(meta, {:zrem_single, key, member}, state) do
         apply_pending_with_time(meta, state, fn ->
@@ -1080,14 +1222,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           old_count = state.applied_count
 
           {applied_increment, write_result} =
-            case admit_compound_member_batch(state, entries) do
+            case admit_compound_batch_apply(state, entries) do
               {:ok, count} ->
                 result =
                   with_pending_writes(state, fn ->
                     apply_compound_batch_put_entries_admitted(state, redis_key, entries)
                   end)
 
-                {count, result}
+                {max(count, 1), result}
 
               {:error, _reason} = error ->
                 {1, error}
@@ -1103,7 +1245,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           old_count = state.applied_count
 
           {applied_increment, write_result} =
-            case admit_compound_member_batch(state, entries) do
+            case admit_compound_batch_apply(state, entries) do
               {:ok, count} ->
                 result =
                   with_pending_writes(state, fn ->
@@ -1114,7 +1256,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                     )
                   end)
 
-                {count, result}
+                {max(count, 1), result}
 
               {:error, _reason} = error ->
                 {1, error}
@@ -1151,7 +1293,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           old_count = state.applied_count
 
           {applied_increment, write_result} =
-            case admit_compound_member_batch(state, compound_keys) do
+            case admit_compound_batch_apply(state, compound_keys) do
               {:ok, count} ->
                 result =
                   with_pending_writes(state, fn ->
@@ -1162,7 +1304,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                     )
                   end)
 
-                {count, result}
+                {max(count, 1), result}
 
               {:error, _reason} = error ->
                 {1, error}
@@ -1261,19 +1403,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:pfadd, key, elements}, state) do
         apply_pending_with_time(meta, state, fn ->
-          HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+          command = {:pfadd, key, elements}
+
+          with :ok <- admit_apply_command_work(state, command) do
+            HyperLogLog.handle_ast({:pfadd, [key | elements]}, build_string_value_store(state))
+          end
         end)
       end
 
       def apply(meta, {:pfmerge, dest_key, source_sketches}, state) do
         apply_pending_with_time(meta, state, fn ->
-          do_pfmerge(state, dest_key, source_sketches)
+          command = {:pfmerge, dest_key, source_sketches}
+
+          with :ok <- admit_apply_command_work(state, command) do
+            do_pfmerge(state, dest_key, source_sketches)
+          end
         end)
       end
 
-      def apply(meta, {:pfmerge, dest_key, _source_keys, source_sketches}, state) do
+      def apply(meta, {:pfmerge, dest_key, source_keys, source_sketches}, state) do
         apply_pending_with_time(meta, state, fn ->
-          do_pfmerge(state, dest_key, source_sketches)
+          command = {:pfmerge, dest_key, source_keys, source_sketches}
+
+          with :ok <- admit_apply_command_work(state, command) do
+            do_pfmerge(state, dest_key, source_sketches)
+          end
         end)
       end
 
@@ -1467,9 +1621,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:bloom_madd, key, elements, auto_create_params}, state) do
         apply_prob_with_time(meta, state, fn ->
-          path = prob_path(state, key, "bloom")
+          command = {:bloom_madd, key, elements, auto_create_params}
 
-          with :ok <- ensure_prob_dir(state) do
+          with :ok <- admit_apply_command_work(state, command),
+               :ok <- ensure_prob_dir(state) do
+            path = prob_path(state, key, "bloom")
+
             case auto_create_bloom_if_needed(state, path, key, auto_create_params) do
               :ok -> NIF.bloom_file_madd(path, elements)
               {:error, _reason} = error -> error
@@ -1488,17 +1645,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:cms_incrby, key, items}, state) do
         apply_prob_with_time(meta, state, fn ->
-          path = prob_path(state, key, "cms")
-          NIF.cms_file_incrby(path, items)
+          command = {:cms_incrby, key, items}
+
+          with :ok <- admit_apply_command_work(state, command) do
+            path = prob_path(state, key, "cms")
+            NIF.cms_file_incrby(path, items)
+          end
         end)
       end
 
       def apply(meta, {:cms_merge, dst_key, src_keys, weights, create_params}, state) do
         apply_prob_with_time(meta, state, fn ->
-          dst_path = prob_path(state, dst_key, "cms")
-          src_paths = cms_source_paths(state, src_keys)
+          command = {:cms_merge, dst_key, src_keys, weights, create_params}
 
-          with :ok <-
+          with :ok <- admit_apply_command_work(state, command),
+               :ok <-
                  validate_cms_merge_locality(
                    state,
                    dst_key,
@@ -1507,6 +1668,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                    create_params
                  ),
                :ok <- ensure_prob_dir(state) do
+            dst_path = prob_path(state, dst_key, "cms")
+            src_paths = cms_source_paths(state, src_keys)
+
             case maybe_create_cms_merge_dst(state, dst_path, dst_key, create_params) do
               :ok -> NIF.cms_file_merge(dst_path, src_paths, weights)
               {:error, _reason} = error -> error
@@ -1566,15 +1730,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:topk_add, key, elements}, state) do
         apply_prob_with_time(meta, state, fn ->
-          path = prob_path(state, key, "topk")
-          NIF.topk_file_add_v2(path, elements)
+          command = {:topk_add, key, elements}
+
+          with :ok <- admit_apply_command_work(state, command) do
+            path = prob_path(state, key, "topk")
+            NIF.topk_file_add_v2(path, elements)
+          end
         end)
       end
 
       def apply(meta, {:topk_incrby, key, pairs}, state) do
         apply_prob_with_time(meta, state, fn ->
-          path = prob_path(state, key, "topk")
-          NIF.topk_file_incrby_v2(path, pairs)
+          command = {:topk_incrby, key, pairs}
+
+          with :ok <- admit_apply_command_work(state, command) do
+            path = prob_path(state, key, "topk")
+            NIF.topk_file_incrby_v2(path, pairs)
+          end
         end)
       end
 
@@ -1592,7 +1764,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       end
 
       def apply(meta, {:watch_tokens, keys}, state) when is_list(keys) do
-        apply_pending_with_time(meta, state, fn -> transaction_watch_tokens(state, keys) end)
+        apply_pending_with_time(meta, state, fn ->
+          with :ok <- admit_apply_command_work(state, {:watch_tokens, keys}) do
+            transaction_watch_tokens(state, keys)
+          end
+        end)
       end
 
       # -- Flow --

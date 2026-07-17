@@ -44,6 +44,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
+      @generic_single_compound_apply_tags [
+        :compound_delete,
+        :compound_put,
+        :compound_put_blob_ref,
+        :hincrby,
+        :hincrbyfloat,
+        :hset_single,
+        :lpush_single,
+        :rpush_single,
+        :sadd_single,
+        :srem_single,
+        :zadd_single,
+        :zincrby,
+        :zrem_single
+      ]
+
       defp apply_cross_shard_tx(meta, _shard_batches, _watched_keys, state),
         do: reject_cross_shard_tx(meta, state)
 
@@ -105,39 +121,621 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
         end)
       end
 
-      defp normalize_generic_batch_commands(commands) when is_list(commands) do
-        Enum.flat_map(commands, &expand_generic_batch_command/1)
+      defp normalize_generic_batch_commands(
+             commands,
+             %{
+               apply_context: %{
+                 batch_command_apply_budget: command_budget,
+                 compound_member_apply_budget: compound_budget
+               }
+             }
+           )
+           when is_list(commands) and is_integer(command_budget) and command_budget > 0 and
+                  is_integer(compound_budget) and compound_budget > 0 do
+        normalize_generic_batch_frames(
+          [{:commands, commands}],
+          [],
+          0,
+          command_budget,
+          command_budget * 2,
+          compound_budget
+        )
       end
 
-      defp expand_generic_batch_command({:batch, commands}) when is_list(commands) do
-        normalize_generic_batch_commands(commands)
+      defp normalize_generic_batch_commands(_commands, _state),
+        do: {:error, :invalid_batch_apply_budget}
+
+      defp admit_batch_command_items(
+             %{apply_context: %{batch_command_apply_budget: budget}},
+             items
+           )
+           when is_list(items) and is_integer(budget) and budget > 0 do
+        count_batch_command_items_up_to(items, budget, 0)
       end
 
-      defp expand_generic_batch_command({:put_batch, entries}) when is_list(entries) do
-        Enum.map(entries, fn
-          {key, value, expire_at_ms} -> {:put, key, value, expire_at_ms}
-          invalid -> {:invalid_put_batch_entry, invalid}
-        end)
+      defp admit_batch_command_items(
+             %{apply_context: %{batch_command_apply_budget: budget}},
+             _invalid
+           )
+           when is_integer(budget) and budget > 0,
+           do: {:error, :invalid_batch_command_list}
+
+      defp admit_batch_command_items(_state, _items),
+        do: {:error, :invalid_batch_apply_budget}
+
+      defp count_batch_command_items_up_to([], _remaining, count), do: {:ok, count}
+
+      defp count_batch_command_items_up_to([_item | _rest], 0, _count),
+        do: {:error, :batch_command_apply_budget_exceeded}
+
+      defp count_batch_command_items_up_to([_item | rest], remaining, count),
+        do: count_batch_command_items_up_to(rest, remaining - 1, count + 1)
+
+      defp count_batch_command_items_up_to(_improper_tail, _remaining, _count),
+        do: {:error, :invalid_batch_command_list}
+
+      defp normalize_generic_batch_frames(
+             [],
+             acc,
+             count,
+             _command_remaining,
+             _visit_remaining,
+             _compound_remaining
+           ),
+           do: {:ok, Enum.reverse(acc), count}
+
+      defp normalize_generic_batch_frames(
+             [{_kind, []} | frames],
+             acc,
+             count,
+             command_remaining,
+             visit_remaining,
+             compound_remaining
+           ) do
+        normalize_generic_batch_frames(
+          frames,
+          acc,
+          count,
+          command_remaining,
+          visit_remaining,
+          compound_remaining
+        )
       end
 
-      defp expand_generic_batch_command({:put_blob_batch, entries}) when is_list(entries) do
-        Enum.map(entries, fn
-          {key, value, expire_at_ms, :value} ->
-            {:put, key, value, expire_at_ms}
+      defp normalize_generic_batch_frames(
+             [{_kind, [_item | _rest]} | _frames],
+             _acc,
+             _count,
+             _command_remaining,
+             0,
+             _compound_remaining
+           ),
+           do: {:error, :batch_command_apply_budget_exceeded}
 
-          {key, encoded_ref, expire_at_ms, :blob_ref} ->
-            {:put_blob_ref, key, encoded_ref, expire_at_ms}
+      defp normalize_generic_batch_frames(
+             [{:commands, [command | rest]} | frames],
+             acc,
+             count,
+             command_remaining,
+             visit_remaining,
+             compound_remaining
+           ) do
+        next_frames = [{:commands, rest} | frames]
+        visit_remaining = visit_remaining - 1
 
-          invalid ->
-            {:invalid_put_blob_batch_entry, invalid}
-        end)
+        case command do
+          {:batch, nested} when is_list(nested) ->
+            normalize_generic_batch_frames(
+              [{:commands, nested} | next_frames],
+              acc,
+              count,
+              command_remaining,
+              visit_remaining,
+              compound_remaining
+            )
+
+          {:put_batch, entries} when is_list(entries) ->
+            normalize_generic_batch_frames(
+              [{:put_entries, entries} | next_frames],
+              acc,
+              count,
+              command_remaining,
+              visit_remaining,
+              compound_remaining
+            )
+
+          {:put_blob_batch, entries} when is_list(entries) ->
+            normalize_generic_batch_frames(
+              [{:put_blob_entries, entries} | next_frames],
+              acc,
+              count,
+              command_remaining,
+              visit_remaining,
+              compound_remaining
+            )
+
+          {:delete_batch, keys} when is_list(keys) ->
+            normalize_generic_batch_frames(
+              [{:delete_keys, keys} | next_frames],
+              acc,
+              count,
+              command_remaining,
+              visit_remaining,
+              compound_remaining
+            )
+
+          leaf ->
+            normalize_generic_batch_leaf(
+              leaf,
+              next_frames,
+              acc,
+              count,
+              command_remaining,
+              visit_remaining,
+              compound_remaining
+            )
+        end
       end
 
-      defp expand_generic_batch_command({:delete_batch, keys}) when is_list(keys) do
-        Enum.map(keys, &{:delete, &1})
+      defp normalize_generic_batch_frames(
+             [{:delete_keys, [key | rest]} | frames],
+             acc,
+             count,
+             command_remaining,
+             visit_remaining,
+             compound_remaining
+           )
+           when is_binary(key) do
+        normalize_generic_batch_leaf(
+          {:delete, key},
+          [{:delete_keys, rest} | frames],
+          acc,
+          count,
+          command_remaining,
+          visit_remaining - 1,
+          compound_remaining
+        )
       end
 
-      defp expand_generic_batch_command(command), do: [command]
+      defp normalize_generic_batch_frames(
+             [{:delete_keys, [_invalid | _rest]} | _frames],
+             _acc,
+             _count,
+             _command_remaining,
+             _visit_remaining,
+             _compound_remaining
+           ),
+           do: {:error, :invalid_delete_batch_key}
+
+      defp normalize_generic_batch_frames(
+             [{kind, [entry | rest]} | frames],
+             acc,
+             count,
+             command_remaining,
+             visit_remaining,
+             compound_remaining
+           )
+           when kind in [:put_entries, :put_blob_entries] do
+        leaf = normalize_generic_batch_entry(kind, entry)
+
+        normalize_generic_batch_leaf(
+          leaf,
+          [{kind, rest} | frames],
+          acc,
+          count,
+          command_remaining,
+          visit_remaining - 1,
+          compound_remaining
+        )
+      end
+
+      defp normalize_generic_batch_frames(
+             [{_kind, _improper_tail} | _frames],
+             _acc,
+             _count,
+             _command_remaining,
+             _visit_remaining,
+             _compound_remaining
+           ),
+           do: {:error, :invalid_batch_command_list}
+
+      defp normalize_generic_batch_leaf(
+             _leaf,
+             _frames,
+             _acc,
+             _count,
+             0,
+             _visit_remaining,
+             _compound_remaining
+           ),
+           do: {:error, :batch_command_apply_budget_exceeded}
+
+      defp normalize_generic_batch_leaf(
+             leaf,
+             frames,
+             acc,
+             count,
+             command_remaining,
+             visit_remaining,
+             compound_remaining
+           ) do
+        with {:ok, next_command_remaining, next_compound_remaining, next_visit_remaining} <-
+               consume_apply_command_work(
+                 leaf,
+                 command_remaining,
+                 compound_remaining,
+                 visit_remaining
+               ) do
+          normalize_generic_batch_frames(
+            frames,
+            [leaf | acc],
+            count + 1,
+            next_command_remaining,
+            next_visit_remaining,
+            next_compound_remaining
+          )
+        end
+      end
+
+      defp normalize_generic_batch_entry(:put_entries, {key, value, expire_at_ms}),
+        do: {:put, key, value, expire_at_ms}
+
+      defp normalize_generic_batch_entry(:put_entries, invalid),
+        do: {:invalid_put_batch_entry, invalid}
+
+      defp normalize_generic_batch_entry(
+             :put_blob_entries,
+             {key, value, expire_at_ms, :value}
+           ),
+           do: {:put, key, value, expire_at_ms}
+
+      defp normalize_generic_batch_entry(
+             :put_blob_entries,
+             {key, encoded_ref, expire_at_ms, :blob_ref}
+           ),
+           do: {:put_blob_ref, key, encoded_ref, expire_at_ms}
+
+      defp normalize_generic_batch_entry(:put_blob_entries, invalid),
+        do: {:invalid_put_blob_batch_entry, invalid}
+
+      defp consume_generic_batch_command_work({tag, entries}, remaining)
+           when tag in [
+                  :mset,
+                  :mset_blob_batch,
+                  :msetnx,
+                  :msetnx_blob_batch,
+                  :tx_execute,
+                  :watch_tokens,
+                  :zadd_many_single
+                ],
+           do: consume_generic_batch_items(entries, remaining)
+
+      defp consume_generic_batch_command_work(
+             {tag, _redis_key, entries},
+             remaining
+           )
+           when tag in [:compound_batch_delete, :compound_batch_put, :compound_blob_batch_put],
+           do: consume_generic_batch_items(entries, remaining)
+
+      defp consume_generic_batch_command_work({:tx_execute, queue, _namespace}, remaining),
+        do: consume_generic_batch_items(queue, remaining)
+
+      defp consume_generic_batch_command_work(
+             {:tx_execute, queue, _namespace, _watched_keys},
+             remaining
+           ),
+           do: consume_generic_batch_items(queue, remaining)
+
+      defp consume_generic_batch_command_work({:pfadd, _key, elements}, remaining),
+        do: consume_generic_batch_items(elements, remaining)
+
+      defp consume_generic_batch_command_work({:pfmerge, _key, sketches}, remaining),
+        do: consume_generic_batch_items(sketches, remaining)
+
+      defp consume_generic_batch_command_work(
+             {:pfmerge, _key, source_keys, sketches},
+             remaining
+           ),
+           do: consume_generic_batch_pair_items(source_keys, sketches, remaining)
+
+      defp consume_generic_batch_command_work(
+             {:list_op, _key, {tag, elements}},
+             remaining
+           )
+           when tag in [:lpush, :lpushx, :rpush, :rpushx],
+           do: consume_generic_batch_items(elements, remaining)
+
+      defp consume_generic_batch_command_work(
+             {:bloom_madd, _key, elements, _auto_create},
+             remaining
+           ),
+           do: consume_generic_batch_items(elements, remaining)
+
+      defp consume_generic_batch_command_work({:cms_incrby, _key, items}, remaining),
+        do: consume_generic_batch_items(items, remaining)
+
+      defp consume_generic_batch_command_work(
+             {:cms_merge, _key, source_keys, weights, _create_params},
+             remaining
+           ),
+           do: consume_generic_batch_pair_items(source_keys, weights, remaining)
+
+      defp consume_generic_batch_command_work({:topk_add, _key, elements}, remaining),
+        do: consume_generic_batch_items(elements, remaining)
+
+      defp consume_generic_batch_command_work({:topk_incrby, _key, pairs}, remaining),
+        do: consume_generic_batch_items(pairs, remaining)
+
+      defp consume_generic_batch_command_work(_command, remaining),
+        do: consume_generic_batch_unit(remaining)
+
+      defp consume_generic_batch_items(items, remaining) do
+        case count_batch_command_items_up_to(items, remaining, 0) do
+          {:ok, 0} -> consume_generic_batch_unit(remaining)
+          {:ok, count} -> {:ok, remaining - count}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp consume_generic_batch_pair_items(first, second, remaining),
+        do: count_generic_batch_pairs(first, second, remaining, 0)
+
+      defp count_generic_batch_pairs([], [], remaining, 0),
+        do: consume_generic_batch_unit(remaining)
+
+      defp count_generic_batch_pairs([], [], remaining, count),
+        do: {:ok, remaining - count}
+
+      defp count_generic_batch_pairs(
+             [_first | first_rest],
+             [_second | second_rest],
+             remaining,
+             count
+           )
+           when remaining - count >= 2,
+           do: count_generic_batch_pairs(first_rest, second_rest, remaining, count + 2)
+
+      defp count_generic_batch_pairs([_first | _], [_second | _], _remaining, _count),
+        do: {:error, :batch_command_apply_budget_exceeded}
+
+      defp count_generic_batch_pairs(first, second, _remaining, _count)
+           when first == [] or second == [],
+           do: {:error, :batch_pair_cardinality_mismatch}
+
+      defp count_generic_batch_pairs(_first, _second, _remaining, _count),
+        do: {:error, :invalid_batch_command_list}
+
+      defp consume_generic_batch_unit(remaining) when remaining > 0,
+        do: {:ok, remaining - 1}
+
+      defp consume_generic_batch_unit(0),
+        do: {:error, :batch_command_apply_budget_exceeded}
+
+      defp admit_apply_command_work(
+             %{
+               apply_context: %{
+                 batch_command_apply_budget: command_budget,
+                 compound_member_apply_budget: compound_budget
+               }
+             },
+             command
+           )
+           when is_integer(command_budget) and command_budget > 0 and
+                  is_integer(compound_budget) and compound_budget > 0 do
+        case consume_apply_command_work(
+               command,
+               command_budget,
+               compound_budget,
+               command_budget * 2
+             ) do
+          {:ok, _command_remaining, _compound_remaining, _visit_remaining} -> :ok
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp admit_apply_command_work(_state, _command),
+        do: {:error, :invalid_batch_apply_budget}
+
+      defp consume_apply_command_work(
+             {:async, _origin, inner},
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           ),
+           do:
+             consume_wrapped_apply_command(
+               inner,
+               command_remaining,
+               compound_remaining,
+               visit_remaining
+             )
+
+      defp consume_apply_command_work(
+             {:ferricstore_latency_trace, inner},
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           ),
+           do:
+             consume_wrapped_apply_command(
+               inner,
+               command_remaining,
+               compound_remaining,
+               visit_remaining
+             )
+
+      defp consume_apply_command_work(
+             {:ferricstore_apply_context, _encoded, inner},
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           ),
+           do:
+             consume_wrapped_apply_command(
+               inner,
+               command_remaining,
+               compound_remaining,
+               visit_remaining
+             )
+
+      defp consume_apply_command_work(
+             {:flow_shared_ref_write, _shard_index, inner},
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           ),
+           do:
+             consume_wrapped_apply_command(
+               inner,
+               command_remaining,
+               compound_remaining,
+               visit_remaining
+             )
+
+      defp consume_apply_command_work(
+             {:flow_policy_fence, installs, inner},
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           ) do
+        with {:ok, next_command_remaining} <-
+               consume_generic_batch_optional_items(installs, command_remaining) do
+          consume_wrapped_apply_command(
+            inner,
+            next_command_remaining,
+            compound_remaining,
+            visit_remaining
+          )
+        end
+      end
+
+      defp consume_apply_command_work(
+             {:origin_checked, _key, inner, _before_value, _before_expire_at_ms, _expected_value,
+              _expire_at_ms},
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           ),
+           do:
+             consume_wrapped_apply_command(
+               inner,
+               command_remaining,
+               compound_remaining,
+               visit_remaining
+             )
+
+      defp consume_apply_command_work(
+             {:origin_checked, _key, inner, _expected_value, _expire_at_ms},
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           ),
+           do:
+             consume_wrapped_apply_command(
+               inner,
+               command_remaining,
+               compound_remaining,
+               visit_remaining
+             )
+
+      defp consume_apply_command_work(
+             {inner, metadata},
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           )
+           when is_tuple(inner) and is_map(metadata),
+           do:
+             consume_wrapped_apply_command(
+               inner,
+               command_remaining,
+               compound_remaining,
+               visit_remaining
+             )
+
+      defp consume_apply_command_work(
+             command,
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           ) do
+        with {:ok, next_command_remaining} <-
+               consume_generic_batch_command_work(command, command_remaining),
+             {:ok, next_compound_remaining} <-
+               consume_generic_batch_compound_work(command, compound_remaining) do
+          {:ok, next_command_remaining, next_compound_remaining, visit_remaining}
+        end
+      end
+
+      defp consume_wrapped_apply_command(
+             _inner,
+             _command_remaining,
+             _compound_remaining,
+             0
+           ),
+           do: {:error, :batch_command_apply_budget_exceeded}
+
+      defp consume_wrapped_apply_command(
+             inner,
+             command_remaining,
+             compound_remaining,
+             visit_remaining
+           ),
+           do:
+             consume_apply_command_work(
+               inner,
+               command_remaining,
+               compound_remaining,
+               visit_remaining - 1
+             )
+
+      defp consume_generic_batch_optional_items(items, remaining) do
+        case count_batch_command_items_up_to(items, remaining, 0) do
+          {:ok, count} -> {:ok, remaining - count}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp consume_generic_batch_compound_work(
+             {tag, _redis_key, entries},
+             remaining
+           )
+           when tag in [:compound_batch_put, :compound_blob_batch_put, :compound_batch_delete] do
+        case count_compound_members_up_to(entries, remaining, 0) do
+          {:ok, count} -> {:ok, remaining - count}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp consume_generic_batch_compound_work({:zadd_many_single, entries}, remaining) do
+        case count_compound_members_up_to(entries, remaining, 0) do
+          {:ok, count} -> {:ok, remaining - count}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp consume_generic_batch_compound_work(
+             {:list_op, _key, {tag, elements}},
+             remaining
+           )
+           when tag in [:lpush, :lpushx, :rpush, :rpushx] do
+        case count_compound_members_up_to(elements, remaining, 0) do
+          {:ok, count} -> {:ok, remaining - count}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp consume_generic_batch_compound_work(command, remaining)
+           when is_tuple(command) and tuple_size(command) > 0 and
+                  elem(command, 0) in @generic_single_compound_apply_tags do
+        if remaining > 0 do
+          {:ok, remaining - 1}
+        else
+          {:error, :compound_member_apply_budget_exceeded}
+        end
+      end
+
+      defp consume_generic_batch_compound_work(_command, remaining), do: {:ok, remaining}
 
       defp finish_hot_batch_apply(
              meta,

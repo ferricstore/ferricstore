@@ -36,7 +36,8 @@ defmodule Ferricstore.Raft.ApplyLimits do
   end
 
   @spec validate_instance_value_size(map(), non_neg_integer()) :: :ok | {:error, binary()}
-  def validate_instance_value_size(ctx, size) when is_map(ctx) and is_integer(size) and size >= 0 do
+  def validate_instance_value_size(ctx, size)
+      when is_map(ctx) and is_integer(size) and size >= 0 do
     max =
       case Map.get(ctx, :max_value_size, @default_max_value_size) do
         configured when is_integer(configured) and configured > 0 ->
@@ -71,6 +72,9 @@ defmodule Ferricstore.Raft.ApplyLimits do
     else
       :limit_exceeded ->
         {:error, "ERR flow batch item count exceeds maximum #{max_items}"}
+
+      :invalid_list ->
+        {:error, "ERR flow batch items must be proper lists"}
     end
   end
 
@@ -271,6 +275,8 @@ defmodule Ferricstore.Raft.ApplyLimits do
 
   defp consume_flow_batch_list([_item | rest], remaining),
     do: consume_flow_batch_list(rest, remaining - 1)
+
+  defp consume_flow_batch_list(_improper_tail, _remaining), do: :invalid_list
 
   @spec append_size(non_neg_integer(), non_neg_integer()) :: non_neg_integer()
   def append_size(current_size, suffix_size), do: current_size + suffix_size

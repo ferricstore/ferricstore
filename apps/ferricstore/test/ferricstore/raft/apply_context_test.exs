@@ -31,6 +31,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     :flow_lmdb_value_cleanup_scan_limit,
     :flow_hibernation_enabled,
     :promotion_threshold,
+    :batch_command_apply_budget,
     :compound_member_apply_budget,
     :transaction_command_budget,
     :transaction_key_apply_budget,
@@ -254,6 +255,25 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
 
+  test "batch command apply budget is bounded and preserved by the replicated context" do
+    context = ApplyContext.new(batch_command_apply_budget: 8)
+
+    assert context.batch_command_apply_budget == 8
+    assert {:ok, ^context} = context |> ApplyContext.encode() |> ApplyContext.decode()
+
+    hard_max = 100_000
+
+    assert ApplyContext.new(batch_command_apply_budget: hard_max + 1).batch_command_apply_budget ==
+             hard_max
+
+    oversized =
+      context
+      |> ApplyContext.encode()
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 6, hard_max + 1)
+
+    assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
+  end
+
   test "transaction result byte budget is bounded and preserved by the replicated context" do
     context = ApplyContext.new(transaction_result_byte_budget: 4_096)
 
@@ -323,7 +343,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 7, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 8, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
