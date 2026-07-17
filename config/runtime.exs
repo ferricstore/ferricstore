@@ -536,6 +536,10 @@ if config_env() == :prod do
       String.to_integer(
         System.get_env("FERRICSTORE_NATIVE_MAX_GLOBAL_INBOUND_BUFFER_BYTES", "268435456")
       ),
+    native_max_global_session_bytes:
+      String.to_integer(
+        System.get_env("FERRICSTORE_NATIVE_MAX_GLOBAL_SESSION_BYTES", "268435456")
+      ),
     native_trace_enabled: boolean_env.("FERRICSTORE_NATIVE_TRACE_ENABLED", false),
     native_trusted_request_context_users: native_trusted_request_context_users,
     native_idle_timeout_ms:

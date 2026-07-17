@@ -93,6 +93,7 @@ defmodule FerricstoreServer.Native.Connection do
     multi_queue_bytes: 0,
     multi_queue_byte_limit: 32 * 1024 * 1024,
     multi_error: false,
+    session_byte_token: nil,
     watched_keys: %{},
     watched_key_bytes: 0,
     watch_key_limit: 10_000,
@@ -1267,7 +1268,7 @@ defmodule FerricstoreServer.Native.Connection do
   defp cleanup_connection(state) do
     unless Process.get(@cleanup_done_key, false) do
       Process.put(@cleanup_done_key, true)
-      Session.cleanup_pubsub(state)
+      _cleared_state = Session.clear(state)
       Ferricstore.Flow.ClaimWaiters.cleanup(self())
       Ferricstore.Commands.Stream.cleanup_stream_waiters(self())
       InboundBudget.release(state.resource_budget, state.inbound_buffer_token)
@@ -1461,6 +1462,7 @@ defmodule FerricstoreServer.Native.Connection do
       multi_queue_bytes: state.multi_queue_bytes,
       multi_queue_byte_limit: state.multi_queue_byte_limit,
       multi_error: state.multi_error,
+      session_byte_token: state.session_byte_token,
       watched_keys: state.watched_keys,
       watched_key_bytes: state.watched_key_bytes,
       watch_key_limit: state.watch_key_limit,

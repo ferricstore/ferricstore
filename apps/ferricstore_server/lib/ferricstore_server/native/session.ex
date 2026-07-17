@@ -253,26 +253,44 @@ defmodule FerricstoreServer.Native.Session do
         {:error, "ERR WATCH byte limit exceeded (max #{byte_limit} bytes)", state}
 
       true ->
-        case Router.watch_tokens(state.instance_ctx, watched_keys) do
-          %{} = tokens ->
-            {:ok, "OK",
-             %{
-               state
-               | watched_keys: Map.merge(state.watched_keys, tokens),
-                 watched_key_bytes: resulting_key_bytes
-             }}
+        previous_bytes = retained_session_bytes(state)
 
-          {:error, reason} ->
-            {:error, "ERR WATCH unavailable: #{inspect(reason)}", state}
+        case reserve_retained_session_bytes(
+               state,
+               Map.get(state, :multi_queue_bytes, 0) + resulting_key_bytes
+             ) do
+          {:ok, reserved_state} ->
+            case safe_watch_tokens(state.instance_ctx, watched_keys) do
+              %{} = tokens ->
+                {:ok, "OK",
+                 %{
+                   reserved_state
+                   | watched_keys: Map.merge(state.watched_keys, tokens),
+                     watched_key_bytes: resulting_key_bytes
+                 }}
+
+              {:error, reason} ->
+                restore_retained_session_bytes(reserved_state, previous_bytes)
+                {:error, "ERR WATCH unavailable: #{inspect(reason)}", state}
+
+              {:server_not_ready, reason} ->
+                restore_retained_session_bytes(reserved_state, previous_bytes)
+                {:error, "ERR server not ready: #{inspect(reason)}", state}
+            end
+
+          {:error, {:limit, :session_bytes}} ->
+            {:error, "ERR native global retained session byte limit reached", state}
+
+          {:error, _reason} ->
+            {:error, "ERR native retained session budget unavailable", state}
         end
     end
-  catch
-    :exit, {reason, _} ->
-      {:error, "ERR server not ready: #{inspect(reason)}", state}
   end
 
-  defp execute_session_command("UNWATCH", _args, _ast, _keys, state),
-    do: {:ok, "OK", %{state | watched_keys: %{}, watched_key_bytes: 0}}
+  defp execute_session_command("UNWATCH", _args, _ast, _keys, state) do
+    state = %{state | watched_keys: %{}, watched_key_bytes: 0}
+    {:ok, "OK", shrink_retained_session_bytes(state, Map.get(state, :multi_queue_bytes, 0))}
+  end
 
   defp execute_session_command(_cmd, _args, _ast, _keys, state),
     do: {:bad_request, "ERR native command is not a session command", state}
@@ -314,17 +332,32 @@ defmodule FerricstoreServer.Native.Session do
        "ERR MULTI queue byte limit exceeded (max #{byte_limit} bytes), transaction discarded",
        clear_transaction(state)}
     else
-      {:ok, "QUEUED",
-       %{
-         state
-         | multi_queue: [prepared | state.multi_queue],
-           multi_queue_count: state.multi_queue_count + 1,
-           multi_queue_bytes: queued_bytes + command_bytes
-       }}
+      resulting_queue_bytes = queued_bytes + command_bytes
+      resulting_retained_bytes = Map.get(state, :watched_key_bytes, 0) + resulting_queue_bytes
+
+      case reserve_retained_session_bytes(state, resulting_retained_bytes) do
+        {:ok, state} ->
+          {:ok, "QUEUED",
+           %{
+             state
+             | multi_queue: [prepared | state.multi_queue],
+               multi_queue_count: state.multi_queue_count + 1,
+               multi_queue_bytes: resulting_queue_bytes
+           }}
+
+        {:error, {:limit, :session_bytes}} ->
+          {:error, "ERR native global retained session byte limit reached",
+           %{state | multi_error: true}}
+
+        {:error, _reason} ->
+          {:error, "ERR native retained session budget unavailable", %{state | multi_error: true}}
+      end
     end
   end
 
   defp clear_transaction(state) do
+    state = release_retained_session_bytes(state)
+
     %{
       state
       | multi_state: :none,
@@ -335,6 +368,63 @@ defmodule FerricstoreServer.Native.Session do
         watched_keys: %{},
         watched_key_bytes: 0
     }
+  end
+
+  defp safe_watch_tokens(instance_ctx, watched_keys) do
+    Router.watch_tokens(instance_ctx, watched_keys)
+  catch
+    :exit, {reason, _} -> {:server_not_ready, reason}
+  end
+
+  defp retained_session_bytes(state),
+    do: Map.get(state, :multi_queue_bytes, 0) + Map.get(state, :watched_key_bytes, 0)
+
+  defp reserve_retained_session_bytes(state, target_bytes) do
+    budget = Map.get(state, :resource_budget, ResourceBudget)
+
+    case {Map.get(state, :session_byte_token), target_bytes} do
+      {token, 0} when is_reference(token) ->
+        ResourceBudget.release(budget, token)
+        {:ok, Map.put(state, :session_byte_token, nil)}
+
+      {token, _positive} when is_reference(token) ->
+        case ResourceBudget.resize(budget, token, target_bytes) do
+          :ok -> {:ok, state}
+          {:error, _reason} = error -> error
+        end
+
+      {_none, 0} ->
+        {:ok, Map.put(state, :session_byte_token, nil)}
+
+      {_none, _positive} ->
+        case ResourceBudget.acquire(budget, :session_bytes, self(), target_bytes) do
+          {:ok, token} -> {:ok, Map.put(state, :session_byte_token, token)}
+          {:error, _reason} = error -> error
+        end
+    end
+  end
+
+  defp shrink_retained_session_bytes(state, target_bytes) do
+    case reserve_retained_session_bytes(state, target_bytes) do
+      {:ok, state} -> state
+      {:error, _reason} -> Map.put(state, :session_byte_token, nil)
+    end
+  end
+
+  defp restore_retained_session_bytes(state, previous_bytes) do
+    _state = shrink_retained_session_bytes(state, previous_bytes)
+    :ok
+  end
+
+  defp release_retained_session_bytes(state) do
+    case Map.get(state, :session_byte_token) do
+      token when is_reference(token) ->
+        ResourceBudget.release(Map.get(state, :resource_budget, ResourceBudget), token)
+        Map.put(state, :session_byte_token, nil)
+
+      _none ->
+        state
+    end
   end
 
   defp reauthorize_transaction(queue, state) do

@@ -10,7 +10,8 @@ defmodule FerricstoreServer.Native.ResourceBudget do
     :chunk_streams,
     :chunk_bytes,
     :inbound_bytes,
-    :subscription_bytes
+    :subscription_bytes,
+    :session_bytes
   ]
   @resource_indexes @resources |> Enum.with_index(1) |> Map.new()
 
@@ -704,6 +705,12 @@ defmodule FerricstoreServer.Native.ResourceBudget do
         Application.get_env(
           :ferricstore,
           :native_max_global_subscription_bytes,
+          256 * 1024 * 1024
+        ),
+      session_bytes:
+        Application.get_env(
+          :ferricstore,
+          :native_max_global_session_bytes,
           256 * 1024 * 1024
         )
     }

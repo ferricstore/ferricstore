@@ -167,7 +167,8 @@ defmodule FerricstoreServer.Native.LaneTest do
                chunk_streams: 0,
                chunk_bytes: 0,
                inbound_bytes: 0,
-               subscription_bytes: 0
+               subscription_bytes: 0,
+               session_bytes: 0
              }
            end)
 
