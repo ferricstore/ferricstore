@@ -724,11 +724,9 @@ defmodule FerricstoreServer.Native.Connection do
         cond do
           state.multi_state == :queuing and opcode(frame) != @op_command_exec ->
             response =
-              Responses.encode_response(
+              maybe_encode_response(
+                frame,
                 state,
-                opcode(frame),
-                lane_id(frame),
-                request_id(frame),
                 :bad_request,
                 "ERR native MULTI requires COMMAND_EXEC frames until EXEC or DISCARD"
               )
@@ -765,11 +763,9 @@ defmodule FerricstoreServer.Native.Connection do
 
           lane_id(frame) == @control_lane ->
             response =
-              Responses.encode_response(
+              maybe_encode_response(
+                frame,
                 state,
-                opcode(frame),
-                lane_id(frame),
-                request_id(frame),
                 :bad_request,
                 "ERR native data commands cannot use control lane 0"
               )
@@ -796,11 +792,9 @@ defmodule FerricstoreServer.Native.Connection do
 
       {:error, reason, state} ->
         response =
-          Responses.encode_response(
+          maybe_encode_response(
+            raw_frame,
             state,
-            opcode(raw_frame),
-            lane_id(raw_frame),
-            request_id(raw_frame),
             :bad_request,
             reason
           )
@@ -825,49 +819,54 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp dispatch_control_frame(frame, rest, state, responses, decode_us) do
-    case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
-      {:ok, payload} ->
-        Commands.mark_command_seen(state)
-        {status, value, state} = Commands.execute(opcode(frame), payload, state)
-        state = refresh_command_state_and_lanes(state)
-
-        response =
-          Responses.encode_response(
-            state,
-            opcode(frame),
-            lane_id(frame),
-            request_id(frame),
-            status,
-            value
-          )
-
-        cond do
-          state.close_after_reply ->
-            {[response | responses], state}
-
-          no_reply?(frame) ->
-            dispatch_frames(rest, state, responses, decode_us)
-
-          true ->
-            dispatch_frames(rest, state, [response | responses], decode_us)
-        end
-
-      {:error, reason} ->
-        response =
-          Responses.encode_response(
-            state,
-            opcode(frame),
-            lane_id(frame),
-            request_id(frame),
-            :bad_request,
-            reason
-          )
-
-        if no_reply?(frame) do
-          dispatch_frames(rest, state, responses, decode_us)
+    case execute_control_frame(frame, state) do
+      {:reply, response, state} ->
+        if state.close_after_reply do
+          {maybe_prepend_response(frame, response, responses), state}
         else
-          dispatch_frames(rest, state, [response | responses], decode_us)
+          dispatch_frames(
+            rest,
+            state,
+            maybe_prepend_response(frame, response, responses),
+            decode_us
+          )
         end
+    end
+  end
+
+  defp execute_control_frame(frame, state) do
+    budget = state.resource_budget
+
+    case ResourceBudget.acquire(budget, :executions, self(), 1) do
+      {:ok, token} ->
+        try do
+          case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
+            {:ok, payload} ->
+              Commands.mark_command_seen(state)
+              {status, value, state} = Commands.execute(opcode(frame), payload, state)
+              state = refresh_command_state_and_lanes(state)
+              {:reply, maybe_encode_response(frame, state, status, value), state}
+
+            {:error, reason} ->
+              {:reply, maybe_encode_response(frame, state, :bad_request, reason), state}
+          end
+        after
+          ResourceBudget.release_async(budget, token)
+        end
+
+      {:error, {:limit, :executions}} ->
+        {:reply,
+         maybe_encode_response(
+           frame,
+           state,
+           :busy,
+           "ERR native global execution limit exceeded"
+         ), state}
+
+      {:error, _reason} ->
+        {:reply,
+         maybe_encode_response(frame, state, :busy, "ERR native resource budget unavailable"),
+         state}
     end
   end
 
@@ -879,22 +878,14 @@ defmodule FerricstoreServer.Native.Connection do
         case dispatch_native_session_payload(frame, payload, state) do
           {:reply, status, value, state} ->
             state = refresh_command_state_and_lanes(state)
+            response = maybe_encode_response(frame, state, status, value)
 
-            response =
-              Responses.encode_response(
-                state,
-                opcode(frame),
-                lane_id(frame),
-                request_id(frame),
-                status,
-                value
-              )
-
-            if no_reply?(frame) do
-              dispatch_frames(rest, state, responses, decode_us)
-            else
-              dispatch_frames(rest, state, [response | responses], decode_us)
-            end
+            dispatch_frames(
+              rest,
+              state,
+              maybe_prepend_response(frame, response, responses),
+              decode_us
+            )
 
           {:blocked, state} ->
             state = refresh_command_state_and_lanes(state)
@@ -902,21 +893,14 @@ defmodule FerricstoreServer.Native.Connection do
         end
 
       {:error, reason} ->
-        response =
-          Responses.encode_response(
-            state,
-            opcode(frame),
-            lane_id(frame),
-            request_id(frame),
-            :bad_request,
-            reason
-          )
+        response = maybe_encode_response(frame, state, :bad_request, reason)
 
-        if no_reply?(frame) do
-          dispatch_frames(rest, state, responses, decode_us)
-        else
-          dispatch_frames(rest, state, [response | responses], decode_us)
-        end
+        dispatch_frames(
+          rest,
+          state,
+          maybe_prepend_response(frame, response, responses),
+          decode_us
+        )
     end
   end
 
@@ -991,9 +975,23 @@ defmodule FerricstoreServer.Native.Connection do
   defp execute_native_session_prepared(%PreparedCommand{} = prepared, state),
     do: Session.execute_prepared(prepared, state)
 
-  defp maybe_prepend_response(frame, response, responses) do
-    if no_reply?(frame), do: responses, else: [response | responses]
+  defp maybe_encode_response(frame, state, status, value) do
+    if no_reply?(frame) do
+      nil
+    else
+      Responses.encode_response(
+        state,
+        opcode(frame),
+        lane_id(frame),
+        request_id(frame),
+        status,
+        value
+      )
+    end
   end
+
+  defp maybe_prepend_response(_frame, nil, responses), do: responses
+  defp maybe_prepend_response(_frame, response, responses), do: [response | responses]
 
   defp native_session_frame?(frame, state) do
     opcode(frame) == @op_command_exec and
@@ -1024,15 +1022,7 @@ defmodule FerricstoreServer.Native.Connection do
 
     case reserve_inflight(state, lane_id(frame)) do
       {:error, reason} ->
-        response =
-          Responses.encode_response(
-            state,
-            opcode(frame),
-            lane_id(frame),
-            request_id(frame),
-            :busy,
-            reason
-          )
+        response = maybe_encode_response(frame, state, :busy, reason)
 
         dispatch_frames(
           rest,
@@ -1070,11 +1060,9 @@ defmodule FerricstoreServer.Native.Connection do
       {:ok, lane_pid, state} ->
         if lane_backlog_full?(state, lane_id(frame)) do
           response =
-            Responses.encode_response(
+            maybe_encode_response(
+              frame,
               state,
-              opcode(frame),
-              lane_id(frame),
-              request_id(frame),
               :busy,
               %{
                 "code" => "lane_queue_full",
@@ -1113,15 +1101,7 @@ defmodule FerricstoreServer.Native.Connection do
               dispatch_frames(rest, state, responses, decode_us, lane_batches)
 
             {:error, reason, state} ->
-              response =
-                Responses.encode_response(
-                  state,
-                  opcode(frame),
-                  lane_id(frame),
-                  request_id(frame),
-                  :busy,
-                  reason
-                )
+              response = maybe_encode_response(frame, state, :busy, reason)
 
               dispatch_frames(
                 rest,
@@ -1134,15 +1114,7 @@ defmodule FerricstoreServer.Native.Connection do
         end
 
       {:error, reason} ->
-        response =
-          Responses.encode_response(
-            state,
-            opcode(frame),
-            lane_id(frame),
-            request_id(frame),
-            :busy,
-            reason
-          )
+        response = maybe_encode_response(frame, state, :busy, reason)
 
         dispatch_frames(
           rest,

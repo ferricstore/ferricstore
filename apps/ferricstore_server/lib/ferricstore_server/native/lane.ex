@@ -851,23 +851,47 @@ defmodule FerricstoreServer.Native.Lane do
   defp plain_set_response(value), do: {:ok, value}
 
   defp execute_frame({:native_trace, frame, trace}, command_state) do
-    response = execute_frame_with_response({:native_trace, frame, trace}, command_state)
-
     if no_reply?(frame) do
+      execute_frame_without_response({:native_trace, frame, trace}, command_state)
       :noreply
     else
-      response
+      execute_frame_with_response({:native_trace, frame, trace}, command_state)
     end
   end
 
   defp execute_frame(frame, command_state) do
-    response =
-      execute_frame_with_response(frame, command_state)
-
     if no_reply?(frame) do
+      execute_frame_without_response(frame, command_state)
       :noreply
     else
-      response
+      execute_frame_with_response(frame, command_state)
+    end
+  end
+
+  defp execute_frame_without_response(
+         {:native_trace, {_lane_id, opcode, _request_id, flags, body}, trace},
+         command_state
+       ) do
+    case Codec.decode_body(opcode, flags, body) do
+      {:ok, payload} ->
+        Commands.mark_command_seen(command_state)
+        _result = execute_traced_command(opcode, payload, command_state, trace)
+        :ok
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp execute_frame_without_response({_lane_id, opcode, _request_id, flags, body}, command_state) do
+    case Codec.decode_body(opcode, flags, body) do
+      {:ok, payload} ->
+        Commands.mark_command_seen(command_state)
+        _result = Commands.execute(opcode, payload, command_state)
+        :ok
+
+      {:error, _reason} ->
+        :ok
     end
   end
 

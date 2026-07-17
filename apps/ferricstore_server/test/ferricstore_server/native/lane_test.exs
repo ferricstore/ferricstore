@@ -11,6 +11,7 @@ defmodule FerricstoreServer.Native.LaneTest do
   @op_fetch_or_compute_result 0x010C
   @lane_id 7
   @op_hget 0x0111
+  @flag_no_reply 0x10
   @receive_timeout 5_000
 
   defmodule AuditedResourceLimits do
@@ -198,6 +199,37 @@ defmodule FerricstoreServer.Native.LaneTest do
     assert length(responses) == 2
     assert_ok_response(Enum.at(responses, 0), @op_set, 21)
     assert_ok_response(Enum.at(responses, 1), @op_set, 22)
+  end
+
+  test "NO_REPLY lane commands execute without encoding a response" do
+    key = "native:lane:no-reply:#{System.unique_integer([:positive, :monotonic])}"
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
+
+    on_exit(fn ->
+      Lane.stop(pid)
+      FerricStore.del(key)
+    end)
+
+    :erlang.trace_pattern({Codec, :encode_command_response_frames, 6}, true, [])
+    :erlang.trace(pid, true, [:call])
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: :erlang.trace(pid, false, [:call])
+      :erlang.trace_pattern({Codec, :encode_command_response_frames, 6}, false, [])
+    end)
+
+    frame =
+      {@lane_id, @op_set, 23, @flag_no_reply,
+       Codec.encode_value(%{"key" => key, "value" => "stored"})}
+
+    Lane.enqueue(pid, frame)
+
+    assert_receive {:native_lane_done, @lane_id}, @receive_timeout
+    assert eventually(fn -> FerricStore.get(key) == {:ok, "stored"} end)
+
+    refute_receive {:trace, ^pid, :call,
+                    {Codec, :encode_command_response_frames,
+                     [@op_set, @lane_id, 23, _status, _value, _opts]}}
   end
 
   test "batched GET and SET frames cannot bypass reserved-key authorization" do

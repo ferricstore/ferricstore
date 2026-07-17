@@ -4,9 +4,11 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
   alias FerricstoreServer.Native.{Codec, Listener, ResourceBudget}
   alias FerricstoreServer.Native.Connection.{FrameBuffer, Responses}
   alias FerricstoreServer.Acl
+  alias FerricstoreServer.Connection.Registry, as: ConnRegistry
 
   @hello_opcode 0x0001
   @ping_opcode 0x0003
+  @options_opcode 0x000B
   @command_exec_opcode 0x0100
   @get_opcode 0x0101
   @compressed_flag 0x08
@@ -253,6 +255,73 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
 
     assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@ping_opcode, 0, 223, ""))
     assert receive_response_ids(socket, 1) == [223]
+  end
+
+  test "NO_REPLY control commands skip response encoding" do
+    existing_pids = connection_pids()
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    connection_pid = wait_for_new_connection(existing_pids)
+
+    :erlang.trace_pattern({Responses, :encode_response, 6}, true, [])
+    :erlang.trace(connection_pid, true, [:call])
+
+    on_exit(fn ->
+      if Process.alive?(connection_pid),
+        do: :erlang.trace(connection_pid, false, [:call])
+
+      :erlang.trace_pattern({Responses, :encode_response, 6}, false, [])
+    end)
+
+    requests =
+      [
+        Codec.encode_frame(@options_opcode, 0, 224, "", @no_reply_flag),
+        command_exec_frame(227, "MULTI", [], @no_reply_flag),
+        command_exec_frame(228, "DISCARD", [], @no_reply_flag),
+        Codec.encode_frame(@ping_opcode, 0, 225, "")
+      ]
+      |> IO.iodata_to_binary()
+
+    assert :ok = :gen_tcp.send(socket, requests)
+    assert receive_response_ids(socket, 1) == [225]
+
+    assert_receive {:trace, ^connection_pid, :call,
+                    {Responses, :encode_response, [_state, @ping_opcode, 0, 225, :ok, _value]}}
+
+    refute_receive {:trace, ^connection_pid, :call,
+                    {Responses, :encode_response,
+                     [_state, @options_opcode, 0, 224, _status, _value]}}
+
+    for request_id <- [227, 228] do
+      refute_receive {:trace, ^connection_pid, :call,
+                      {Responses, :encode_response,
+                       [_state, @command_exec_opcode, 0, ^request_id, _status, _value]}}
+    end
+  end
+
+  @tag :control_execution_budget
+  test "control commands consume global execution capacity" do
+    execution_limit =
+      Application.get_env(
+        :ferricstore,
+        :native_max_global_executions,
+        max(System.schedulers_online(), 1) * 8
+      )
+
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).executions == 0 end)
+
+    assert {:ok, budget_token} =
+             ResourceBudget.acquire(ResourceBudget, :executions, self(), execution_limit)
+
+    on_exit(fn -> ResourceBudget.release(ResourceBudget, budget_token) end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    assert :ok =
+             :gen_tcp.send(socket, Codec.encode_frame(@options_opcode, 0, 226, ""))
+
+    assert [{226, 4}] = receive_response_statuses(socket, 1)
   end
 
   test "NO_REPLY suppresses delayed native blocking responses" do
@@ -691,6 +760,27 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
       )
 
     socket
+  end
+
+  defp connection_pids do
+    ConnRegistry.snapshot(10_000).clients
+    |> MapSet.new(& &1.pid)
+  end
+
+  defp wait_for_new_connection(existing_pids, attempts \\ 100)
+
+  defp wait_for_new_connection(_existing_pids, 0),
+    do: flunk("native connection did not register")
+
+  defp wait_for_new_connection(existing_pids, attempts) do
+    case Enum.find(connection_pids(), &(not MapSet.member?(existing_pids, &1))) do
+      nil ->
+        Process.sleep(10)
+        wait_for_new_connection(existing_pids, attempts - 1)
+
+      pid ->
+        pid
+    end
   end
 
   defp large_ping_frame(request_id) do
