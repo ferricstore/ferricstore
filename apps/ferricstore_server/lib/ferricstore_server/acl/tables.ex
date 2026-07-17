@@ -26,6 +26,10 @@ defmodule FerricstoreServer.Acl.Tables do
     ArgumentError -> @table
   end
 
+  @doc false
+  @spec read((:ets.tid() | atom() -> result)) :: result when result: term()
+  def read(fun) when is_function(fun, 1), do: read(fun, 3)
+
   @spec insert_default_user(non_neg_integer()) :: true
   def insert_default_user(auth_epoch \\ 0) do
     :ets.insert(
@@ -66,8 +70,6 @@ defmodule FerricstoreServer.Acl.Tables do
       _none ->
         false
     end
-  rescue
-    ArgumentError -> false
   end
 
   @doc false
@@ -100,9 +102,15 @@ defmodule FerricstoreServer.Acl.Tables do
   @spec cleanup_retired_table(:ets.tid()) :: :ok
   def cleanup_retired_table(table) do
     cond do
-      table == active_table() -> :ok
-      :ets.info(table) == :undefined -> :ok
-      true -> :ets.delete(table)
+      table == active_table() ->
+        :ok
+
+      :ets.info(table) == :undefined ->
+        :ok
+
+      true ->
+        :ets.delete(table)
+        :ok
     end
   rescue
     ArgumentError -> :ok
@@ -142,15 +150,34 @@ defmodule FerricstoreServer.Acl.Tables do
     ]
 
     witness =
-      case :ets.select(active_table(), match_spec, 1) do
+      case read(fn table -> :ets.select(table, match_spec, 1) end) do
         {[username], _continuation} -> username
         :"$end_of_table" -> nil
       end
 
     put_configured_user_witness(witness)
-  rescue
-    ArgumentError -> put_configured_user_witness(nil)
   end
+
+  defp read(_fun, 0), do: raise(ArgumentError, "ACL active table generation unavailable")
+
+  defp read(fun, attempts) do
+    table = active_table()
+
+    try do
+      result = fun.(table)
+
+      if published_active_table() == table do
+        result
+      else
+        read(fun, attempts - 1)
+      end
+    rescue
+      ArgumentError -> read(fun, attempts - 1)
+    end
+  end
+
+  defp published_active_table,
+    do: :persistent_term.get(@active_table_key, @table)
 
   defp configured_user_witness(users) do
     Enum.find_value(users, fn

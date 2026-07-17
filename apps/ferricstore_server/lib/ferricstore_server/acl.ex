@@ -272,7 +272,7 @@ defmodule FerricstoreServer.Acl do
   """
   @spec get_user(binary()) :: user() | nil
   def get_user(username) do
-    case :ets.lookup(Tables.active_table(), username) do
+    case Tables.read(fn table -> :ets.lookup(table, username) end) do
       [{^username, user}] -> user
       [] -> nil
     end
@@ -280,7 +280,7 @@ defmodule FerricstoreServer.Acl do
 
   @doc false
   @spec user_count() :: non_neg_integer()
-  def user_count, do: :ets.info(Tables.active_table(), :size)
+  def user_count, do: Tables.read(fn table -> :ets.info(table, :size) end)
 
   @doc """
   Returns a list of all users in Redis ACL LIST format.
@@ -294,8 +294,7 @@ defmodule FerricstoreServer.Acl do
   """
   @spec list_users() :: [binary()]
   def list_users do
-    Tables.active_table()
-    |> :ets.tab2list()
+    Tables.read(&:ets.tab2list/1)
     |> Enum.sort_by(fn {name, _} -> name end)
     |> Enum.map(&Formatter.format_user_rule/1)
   end
@@ -442,17 +441,17 @@ defmodule FerricstoreServer.Acl do
 
   defp maybe_upgrade_password_hash(username, password, stored_hash) do
     if Password.needs_rehash?(stored_hash) do
-      table = Tables.active_table()
+      Tables.read(fn table ->
+        case :ets.lookup(table, username) do
+          [{^username, %{password: ^stored_hash} = user}] ->
+            updated = %{user | password: Password.hash(password)}
+            :ets.insert(table, {username, updated})
+            Tables.update_configured_user_witness(username, updated)
 
-      case :ets.lookup(table, username) do
-        [{^username, %{password: ^stored_hash} = user}] ->
-          updated = %{user | password: Password.hash(password)}
-          :ets.insert(table, {username, updated})
-          Tables.update_configured_user_witness(username, updated)
-
-        _stale_or_missing ->
-          :ok
-      end
+          _stale_or_missing ->
+            :ok
+        end
+      end)
     end
 
     :ok

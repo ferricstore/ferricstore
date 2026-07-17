@@ -12,7 +12,7 @@ defmodule FerricstoreServer.Acl.Protection do
   @spec has_configured_users?() :: boolean()
   def has_configured_users? do
     requirepass_configured?() or
-      configured_users_in_table?(Tables.active_table())
+      configured_users_in_table?()
   end
 
   @spec localhost?({:inet.ip_address(), :inet.port_number()} | nil) :: boolean()
@@ -59,14 +59,8 @@ defmodule FerricstoreServer.Acl.Protection do
     :exit, _ -> false
   end
 
-  defp configured_users_in_table?(table) do
-    if table_exists?(table), do: Tables.configured_user?(table), else: false
-  rescue
-    ArgumentError -> false
-  end
-
-  defp table_exists?(table) do
-    :ets.info(table) != :undefined
+  defp configured_users_in_table? do
+    Tables.read(fn table -> Tables.configured_user?(table) end)
   rescue
     ArgumentError -> false
   end

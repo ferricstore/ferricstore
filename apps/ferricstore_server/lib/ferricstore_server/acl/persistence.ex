@@ -27,9 +27,7 @@ defmodule FerricstoreServer.Acl.Persistence do
       {:error, _} = err -> throw(err)
     end
 
-    entries =
-      Tables.active_table()
-      |> :ets.tab2list()
+    entries = Tables.read(&:ets.tab2list/1)
 
     generated_at = DateTime.utc_now() |> DateTime.to_iso8601()
 
