@@ -40,7 +40,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         ValueCodec
       }
 
-      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ZSetIndex}
+      alias Ferricstore.Store.Shard.{CompoundMemberIndex, CompoundRevisionIndex, ZSetIndex}
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -58,6 +58,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             zset_score_index_name: anchor_state.zset_score_index_name,
             zset_score_lookup_name: anchor_state.zset_score_lookup_name,
             compound_member_index_name: Map.get(anchor_state, :compound_member_index_name),
+            compound_revision_index_name: Map.get(anchor_state, :compound_revision_index_name),
             flow_index_name: Map.get(anchor_state, :flow_index_name),
             flow_lookup_name: Map.get(anchor_state, :flow_lookup_name),
             promoted_instances: Map.get(anchor_state, :promoted_instances, %{})
@@ -92,6 +93,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
             zset_score_index_name: zset_score_index_name,
             zset_score_lookup_name: zset_score_lookup_name,
             compound_member_index_name: CompoundMemberIndex.table_name(instance_name, shard_idx),
+            compound_revision_index_name:
+              CompoundRevisionIndex.table_name(instance_name, shard_idx),
             flow_index_name: flow_index_name,
             flow_lookup_name: flow_lookup_name
           }

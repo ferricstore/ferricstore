@@ -170,6 +170,7 @@ defmodule Ferricstore.Store.Shard do
     write_pause_leases: %{},
     write_pause_monitors: %{},
     compound_member_index: nil,
+    compound_revision_index: nil,
     logical_key_index: nil,
     logical_key_slots: nil,
     zset_score_index: nil,

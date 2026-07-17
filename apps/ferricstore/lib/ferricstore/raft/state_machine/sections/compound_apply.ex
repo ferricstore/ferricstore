@@ -319,6 +319,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             queue_promoted_maintenance_after_flush(redis_key, maintenance)
 
             queue_promoted_revision_puts_after_flush(
+              Map.get(state, :compound_revision_index_name),
               Enum.map(prepared_entries, &compound_blob_key/1)
             )
 

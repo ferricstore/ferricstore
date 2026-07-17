@@ -18,6 +18,7 @@ defmodule Ferricstore.Store.Shard.Startup do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       alias Ferricstore.Store.Shard.CompoundMemberIndex
+      alias Ferricstore.Store.Shard.CompoundRevisionIndex
       alias Ferricstore.Store.Shard.LogicalKeyIndex
       alias Ferricstore.Store.Shard.NativeOps, as: ShardNativeOps
       alias Ferricstore.Store.Shard.Reads, as: ShardReads
@@ -134,6 +135,8 @@ defmodule Ferricstore.Store.Shard.Startup do
           instance_name = if ctx, do: ctx.name, else: :default
           compound_member_index = CompoundMemberIndex.table_name(instance_name, index)
           CompoundMemberIndex.ensure_table!(compound_member_index)
+          compound_revision_index = CompoundRevisionIndex.table_name(instance_name, index)
+          CompoundRevisionIndex.ensure_table!(compound_revision_index)
 
           {logical_key_index, logical_key_slots} =
             LogicalKeyIndex.table_names(instance_name, index)
@@ -308,6 +311,7 @@ defmodule Ferricstore.Store.Shard.Startup do
              get_many_waraft_batch: get_many_waraft_batch,
              promoted_compaction_retry_ms: promoted_compaction_retry_ms,
              compound_member_index: compound_member_index,
+             compound_revision_index: compound_revision_index,
              logical_key_index: logical_key_index,
              logical_key_slots: logical_key_slots,
              zset_score_index: zset_score_index,

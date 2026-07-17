@@ -521,6 +521,59 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           assert "unchanged" == Router.get(ctx, same_shard_key)
         end
 
+        @tag :promotion_tx_watch_revision
+        test "WATCH aborts after a promoted field is changed by a transaction" do
+          store = real_store()
+          key = ukey("tx_watch_promoted_revision")
+          ctx = FerricStore.Instance.get(:default)
+          idx = Router.shard_for(ctx, key)
+          shard = Router.shard_name(ctx, idx)
+
+          same_shard_key =
+            Enum.find_value(0..100_000, fn i ->
+              candidate = "tx_promoted_watch_revision_#{System.unique_integer([:positive])}_#{i}"
+              if Router.shard_for(ctx, candidate) == idx, do: candidate
+            end)
+
+          populate_hash(store, key, @test_threshold + 1)
+          assert_promoted(key)
+          compound_key = CompoundKey.hash_field(key, "field_1")
+          revision_index = Ferricstore.Store.Shard.CompoundRevisionIndex.table_name(ctx.name, idx)
+
+          assert :missing =
+                   Ferricstore.Store.Shard.CompoundRevisionIndex.revision_token(
+                     revision_index,
+                     compound_key
+                   )
+
+          watched = Router.watch_token(ctx, key)
+          refute match?({:error, _reason}, watched)
+
+          assert [0] =
+                   GenServer.call(
+                     shard,
+                     {:tx_execute, [prepared_tx_entry("HSET", [key, "field_1", "changed"])], nil}
+                   )
+
+          assert {:ok, {_epoch, revision_after}} =
+                   Ferricstore.Store.Shard.CompoundRevisionIndex.revision_token(
+                     revision_index,
+                     compound_key
+                   )
+
+          assert revision_after > 0
+
+          assert nil ==
+                   Ferricstore.Test.PreparedTransactionCoordinator.execute(
+                     [{"SET", [same_shard_key, "must-not-commit"]}],
+                     %{key => watched},
+                     nil
+                   )
+
+          assert "changed" == Hash.handle("HGET", [key, "field_1"], store)
+          assert nil == Router.get(ctx, same_shard_key)
+        end
+
         @tag :promotion_tx_crossslot
         test "cross-shard transaction rejects cold promoted HGET without mutation" do
           store = real_store()

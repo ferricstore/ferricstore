@@ -5,7 +5,9 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
   @moduletag :global_state
 
   alias Ferricstore.HLC
+  alias Ferricstore.CrossShardOp
   alias Ferricstore.Store.{CompoundKey, Router}
+  alias Ferricstore.Store.Shard.CompoundRevisionIndex
   alias Ferricstore.Store.Shard.Compound, as: ShardCompound
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
   alias Ferricstore.Test.IsolatedInstance
@@ -189,6 +191,60 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
     assert size_after < div(size_before, 10)
   end
 
+  @tag :promotion_routed_revision
+  test "routed promoted mutations publish revisions to the target shard table" do
+    ctx =
+      IsolatedInstance.checkout(
+        shard_count: 2,
+        hot_cache_max_value_size: 1_000_000,
+        promotion_threshold: 1
+      )
+
+    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+    promoted_key = key_for_shard(ctx, 1, "remote_promoted_revision")
+    anchor_key = key_for_shard(ctx, 0, "remote_promoted_anchor")
+    field = CompoundKey.hash_field(promoted_key, "field")
+
+    assert :ok = put_hash_type(ctx, promoted_key)
+    assert :ok = Router.compound_put(ctx, promoted_key, field, "before", 0)
+
+    assert :ok =
+             Router.compound_put(
+               ctx,
+               promoted_key,
+               CompoundKey.hash_field(promoted_key, "trigger"),
+               "value",
+               0
+             )
+
+    promoted_shard = elem(ctx.shard_names, 1)
+    assert GenServer.call(promoted_shard, {:promoted?, promoted_key}, 30_000)
+
+    anchor_revision = CompoundRevisionIndex.table_name(ctx.name, 0)
+    target_revision = CompoundRevisionIndex.table_name(ctx.name, 1)
+    assert :missing = CompoundRevisionIndex.revision_token(anchor_revision, field)
+    assert :missing = CompoundRevisionIndex.revision_token(target_revision, field)
+
+    assert :ok =
+             CrossShardOp.execute(
+               [{anchor_key, :write}, {promoted_key, :write}],
+               fn store ->
+                 :ok = store.compound_put.(promoted_key, field, "after", 0)
+                 :ok = store.put.(anchor_key, "touch", 0)
+               end,
+               instance: ctx
+             )
+
+    assert :missing = CompoundRevisionIndex.revision_token(anchor_revision, field)
+
+    assert {:ok, {_epoch, revision}} =
+             CompoundRevisionIndex.revision_token(target_revision, field)
+
+    assert revision > 0
+    assert "after" = Router.compound_get(ctx, promoted_key, field)
+  end
+
   defp put_hash_type(ctx, redis_key) do
     Router.compound_put(
       ctx,
@@ -197,6 +253,13 @@ defmodule Ferricstore.Store.PromotionInstanceContextTest do
       CompoundKey.encode_type(:hash),
       0
     )
+  end
+
+  defp key_for_shard(ctx, shard_index, prefix) do
+    Enum.find_value(0..100_000, fn suffix ->
+      key = "#{prefix}:#{suffix}"
+      if Router.shard_for(ctx, key) == shard_index, do: key
+    end)
   end
 
   defp await_compacted_promoted_info(shard, redis_key, attempts \\ 100)

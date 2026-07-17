@@ -64,7 +64,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
             deleted = Process.get(:tx_deleted_keys, MapSet.new())
             Process.put(:tx_deleted_keys, MapSet.put(deleted, compound_key))
             queue_promoted_maintenance_after_flush(redis_key, maintenance)
-            queue_promoted_revision_delete_after_flush(compound_key)
+
+            queue_promoted_revision_delete_after_flush(
+              Map.get(state, :compound_revision_index_name),
+              compound_key
+            )
+
             :ok
 
           {:error, _reason} = err ->

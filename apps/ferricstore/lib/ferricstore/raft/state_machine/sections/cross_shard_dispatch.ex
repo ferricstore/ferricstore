@@ -1669,7 +1669,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           ctx = promoted_target_ctx.(redis_key, dedicated_path)
 
           with :ok <- put_in_ctx.(ctx, compound_key, value, expire_at_ms) do
-            queue_compound_indexes_put_after_flush(ctx, redis_key, compound_key, value)
+            with :ok <-
+                   queue_compound_indexes_put_after_flush(ctx, redis_key, compound_key, value) do
+              queue_promoted_revision_put_after_flush(
+                ctx.compound_revision_index_name,
+                compound_key
+              )
+            end
           end
         end
 
@@ -1677,7 +1683,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           ctx = promoted_target_ctx.(redis_key, dedicated_path)
 
           with :ok <- delete_in_ctx.(ctx, compound_key) do
-            queue_compound_indexes_delete_after_flush(ctx, redis_key, compound_key)
+            with :ok <-
+                   queue_compound_indexes_delete_after_flush(ctx, redis_key, compound_key) do
+              queue_promoted_revision_delete_after_flush(
+                ctx.compound_revision_index_name,
+                compound_key
+              )
+            end
           end
         end
 
@@ -1687,6 +1699,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           with :ok <- batch_put_in_ctx.(ctx, entries) do
             Enum.each(entries, fn {compound_key, value, _expire_at_ms} ->
               :ok = queue_compound_indexes_put_after_flush(ctx, redis_key, compound_key, value)
+
+              :ok =
+                queue_promoted_revision_put_after_flush(
+                  ctx.compound_revision_index_name,
+                  compound_key
+                )
             end)
 
             :ok
@@ -1699,6 +1717,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           Enum.each(compound_keys, fn compound_key ->
             :ok = delete_in_ctx.(ctx, compound_key)
             :ok = queue_compound_indexes_delete_after_flush(ctx, redis_key, compound_key)
+
+            :ok =
+              queue_promoted_revision_delete_after_flush(
+                ctx.compound_revision_index_name,
+                compound_key
+              )
           end)
 
           :ok

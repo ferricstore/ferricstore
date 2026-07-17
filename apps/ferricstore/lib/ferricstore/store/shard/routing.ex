@@ -106,6 +106,7 @@ defmodule Ferricstore.Store.Shard.Routing do
           instance_ctx: state.instance_ctx,
           instance_name: if(state.instance_ctx, do: state.instance_ctx.name, else: :default),
           compound_member_index_name: state.compound_member_index,
+          compound_revision_index_name: state.compound_revision_index,
           zset_score_index_name: state.zset_score_index,
           zset_score_lookup_name: state.zset_score_lookup,
           logical_key_index_name: state.logical_key_index,

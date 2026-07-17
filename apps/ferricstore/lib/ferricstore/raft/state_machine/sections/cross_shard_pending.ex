@@ -460,16 +460,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         :ok
       end
 
-      defp publish_pending_compound_revisions(state) do
-        table = Map.get(state, :compound_revision_index_name)
-
+      defp publish_pending_compound_revisions(_state) do
         Process.get(:sm_pending_compound_revision_ops, [])
         |> Enum.reverse()
         |> Enum.each(fn
-          {:put, key, revision} ->
+          {:put, table, key, revision} ->
             Ferricstore.Store.Shard.CompoundRevisionIndex.put(table, key, revision)
 
-          {:delete, key} ->
+          {:delete, table, key} ->
             Ferricstore.Store.Shard.CompoundRevisionIndex.delete(table, key)
         end)
 

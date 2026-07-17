@@ -1069,34 +1069,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
         :ok
       end
 
-      defp queue_promoted_revision_puts_after_flush(keys) when is_list(keys) do
+      defp queue_promoted_revision_puts_after_flush(table, keys) when is_list(keys) do
         revision = promoted_logical_revision()
         ops = Process.get(:sm_pending_compound_revision_ops, [])
 
         Process.put(
           :sm_pending_compound_revision_ops,
-          Enum.reduce(keys, ops, fn key, acc -> [{:put, key, revision} | acc] end)
+          Enum.reduce(keys, ops, fn key, acc -> [{:put, table, key, revision} | acc] end)
         )
 
         :ok
       end
 
-      defp queue_promoted_revision_put_after_flush(key),
-        do: queue_promoted_revision_puts_after_flush([key])
+      defp queue_promoted_revision_put_after_flush(table, key),
+        do: queue_promoted_revision_puts_after_flush(table, [key])
 
-      defp queue_promoted_revision_deletes_after_flush(keys) when is_list(keys) do
+      defp queue_promoted_revision_deletes_after_flush(table, keys) when is_list(keys) do
         ops = Process.get(:sm_pending_compound_revision_ops, [])
 
         Process.put(
           :sm_pending_compound_revision_ops,
-          Enum.reduce(keys, ops, fn key, acc -> [{:delete, key} | acc] end)
+          Enum.reduce(keys, ops, fn key, acc -> [{:delete, table, key} | acc] end)
         )
 
         :ok
       end
 
-      defp queue_promoted_revision_delete_after_flush(key),
-        do: queue_promoted_revision_deletes_after_flush([key])
+      defp queue_promoted_revision_delete_after_flush(table, key),
+        do: queue_promoted_revision_deletes_after_flush(table, [key])
 
       defp promoted_logical_revision do
         current_ra_index() ||
@@ -1153,6 +1153,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             queue_promoted_maintenance_after_flush(redis_key, maintenance)
 
             queue_promoted_revision_puts_after_flush(
+              Map.get(state, :compound_revision_index_name),
               Enum.map(entries, fn {compound_key, _value, _expire_at_ms} -> compound_key end)
             )
 
@@ -1311,7 +1312,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
 
               Process.put(:tx_deleted_keys, deleted)
               queue_promoted_maintenance_after_flush(redis_key, maintenance)
-              queue_promoted_revision_deletes_after_flush(compound_keys)
+
+              queue_promoted_revision_deletes_after_flush(
+                Map.get(state, :compound_revision_index_name),
+                compound_keys
+              )
+
               :ok
             end
 
@@ -1431,7 +1437,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
             end
 
             queue_promoted_maintenance_after_flush(redis_key, maintenance)
-            queue_promoted_revision_put_after_flush(compound_key)
+
+            queue_promoted_revision_put_after_flush(
+              Map.get(state, :compound_revision_index_name),
+              compound_key
+            )
 
             :ok
 
