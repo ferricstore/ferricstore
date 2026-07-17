@@ -1,7 +1,9 @@
 defmodule Ferricstore.Store.Shard.ZSetIndexTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.ReadResult
+  alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.ZSetIndex
 
   setup do
@@ -219,6 +221,72 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
       assert [] == ZSetIndex.rank_range(index, redis_key, 0, 10, false)
       assert 0 == ZSetIndex.count(index, lookup, redis_key, :neg_inf, :inf)
     after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "exact keydir deletion evicts an expired member from a ready score index", %{
+    index: index,
+    lookup: lookup
+  } do
+    keydir = :ets.new(:zset_index_exact_delete, [:set, :public])
+    redis_key = "zs"
+    member = "expired"
+    compound_key = CompoundKey.zset_member(redis_key, member)
+    expired = {compound_key, "1", 1, 0, 0, 0, 1}
+
+    state = %{
+      keydir: keydir,
+      zset_score_index: index,
+      zset_score_lookup: lookup
+    }
+
+    try do
+      true = :ets.insert(keydir, expired)
+      :ok = ZSetIndex.mark_ready_empty(index, lookup, redis_key)
+      :ok = ZSetIndex.put_member(index, lookup, redis_key, member, "1")
+
+      assert ShardETS.delete_exact_entry(state, expired)
+      assert [] == ZSetIndex.rank_range(index, redis_key, 0, 10, false)
+      assert 0 == ZSetIndex.count(index, lookup, redis_key, :neg_inf, :inf)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "exact keydir deletion preserves a concurrently renewed score index member", %{
+    index: index,
+    lookup: lookup
+  } do
+    keydir = :ets.new(:zset_index_exact_delete_renewal, [:set, :public])
+    redis_key = "zs"
+    member = "renewed"
+    compound_key = CompoundKey.zset_member(redis_key, member)
+    expired = {compound_key, "1", 1, 0, 0, 0, 1}
+    replacement = {compound_key, "2", 0, 0, 1, 10, 1}
+
+    state = %{
+      keydir: keydir,
+      zset_score_index: index,
+      zset_score_lookup: lookup
+    }
+
+    try do
+      true = :ets.insert(keydir, expired)
+      :ok = ZSetIndex.mark_ready_empty(index, lookup, redis_key)
+      :ok = ZSetIndex.put_member(index, lookup, redis_key, member, "1")
+
+      Process.put(:ferricstore_after_exact_keydir_delete_hook, fn _state, ^expired ->
+        true = :ets.insert(keydir, replacement)
+        :ok = ZSetIndex.put_member(index, lookup, redis_key, member, "2")
+      end)
+
+      assert ShardETS.delete_exact_entry(state, expired)
+      assert [^replacement] = :ets.lookup(keydir, compound_key)
+      assert [{member, 2.0}] == ZSetIndex.rank_range(index, redis_key, 0, 10, false)
+      assert 1 == ZSetIndex.count(index, lookup, redis_key, :neg_inf, :inf)
+    after
+      Process.delete(:ferricstore_after_exact_keydir_delete_hook)
       :ets.delete(keydir)
     end
   end

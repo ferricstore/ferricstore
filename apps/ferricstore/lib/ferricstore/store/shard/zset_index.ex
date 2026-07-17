@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.Shard.ZSetIndex do
   @moduledoc false
 
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -428,6 +429,39 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     :ok
   end
 
+  @doc false
+  @spec reconcile_exact_delete(map(), binary()) :: :ok
+  def reconcile_exact_delete(state, <<"Z:", _rest::binary>> = compound_key) do
+    case state_tables(state) do
+      {index_table, lookup_table} ->
+        redis_key = CompoundKey.extract_redis_key(compound_key)
+
+        if ready_key?(lookup_table, redis_key) do
+          prefix = CompoundKey.zset_prefix(redis_key)
+          member = CompoundKey.extract_subkey(compound_key, prefix)
+          delete_member(index_table, lookup_table, redis_key, member)
+
+          restore_current_member(
+            state,
+            index_table,
+            lookup_table,
+            redis_key,
+            member,
+            compound_key
+          )
+        end
+
+        :ok
+
+      :unavailable ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  def reconcile_exact_delete(_state, _key), do: :ok
+
   @spec rebuild_key(:ets.tid(), :ets.tid(), binary(), [{binary(), score_input()}]) ::
           :ok | {:error, {:invalid_score, binary(), term()}}
   def rebuild_key(index_table, lookup_table, redis_key, member_score_pairs) do
@@ -469,6 +503,47 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
   defp increment_count(lookup_table, redis_key, delta) do
     :ets.update_counter(lookup_table, {:count, redis_key}, {2, delta}, {{:count, redis_key}, 0})
     :ok
+  end
+
+  defp restore_current_member(
+         state,
+         index_table,
+         lookup_table,
+         redis_key,
+         member,
+         compound_key
+       ) do
+    keydir = Map.fetch!(state, :keydir)
+
+    case :ets.lookup(keydir, compound_key) do
+      [
+        {^compound_key, score_input, expire_at_ms, _lfu, _file_id, _offset, _value_size}
+      ] ->
+        expiry_context = ExpiryContext.capture()
+
+        with true <- score_input != nil,
+             :live <- ExpiryContext.classify(expiry_context, expire_at_ms),
+             {:ok, score} <- parse_score(score_input) do
+          put_member(index_table, lookup_table, redis_key, member, score)
+        else
+          _unavailable_or_invalid ->
+            clear_key(index_table, lookup_table, redis_key)
+        end
+
+      _missing ->
+        :ok
+    end
+  end
+
+  defp state_tables(state) do
+    index_table = Map.get(state, :zset_score_index) || Map.get(state, :zset_score_index_name)
+    lookup_table = Map.get(state, :zset_score_lookup) || Map.get(state, :zset_score_lookup_name)
+
+    if index_table != nil and lookup_table != nil do
+      {index_table, lookup_table}
+    else
+      :unavailable
+    end
   end
 
   defp delete_index_entries(_table, :"$end_of_table", _redis_key), do: :ok
