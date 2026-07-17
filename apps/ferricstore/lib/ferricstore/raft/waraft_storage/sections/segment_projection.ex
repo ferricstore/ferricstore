@@ -259,7 +259,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
              key
            )
            when is_binary(key) do
-        now = HLC.now_ms()
+        now = storage_expiry_cutoff_ms()
 
         case :ets.lookup(keydir, key) do
           [{^key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size}]
@@ -335,7 +335,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
 
       defp apply_segment_projection_entries(sm_state, projection_root, entries)
            when is_binary(projection_root) do
-        now = HLC.now_ms()
+        now = storage_expiry_cutoff_ms()
 
         entries
         |> Enum.with_index(1)
@@ -356,7 +356,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       end
 
       defp apply_segment_projection_entries(sm_state, position, entries) do
-        now = HLC.now_ms()
+        now = storage_expiry_cutoff_ms()
 
         Enum.reduce(entries, sm_state, fn {key, value, expire_at_ms}, acc ->
           if live_expire_at?(expire_at_ms, now) do
@@ -365,6 +365,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
             acc
           end
         end)
+      end
+
+      if Mix.env() == :test do
+        @doc false
+        def __apply_segment_projection_entries_for_test__(sm_state, position, entries) do
+          apply_segment_projection_entries(sm_state, position, entries)
+        end
       end
 
       defp segment_project_recovered_projection_entry(
@@ -596,7 +603,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
       defp recover_apply_projection_value_locator_record(_log_index, _entry, acc), do: acc
 
       defp recover_apply_projection_value_locator_entries(sm_state, index, entries) do
-        now = HLC.now_ms()
+        now = storage_expiry_cutoff_ms()
 
         entries =
           Enum.flat_map(entries, fn

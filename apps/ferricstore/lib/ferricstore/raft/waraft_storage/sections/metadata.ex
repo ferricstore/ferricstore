@@ -311,7 +311,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              instance_ctx: ctx,
              shard_index: shard_index
            }) do
-        now = HLC.now_ms()
+        now = storage_expiry_cutoff_ms()
 
         case segment_projection_entries_from_keydir(keydir, ctx, shard_index, now) do
           :unavailable ->
@@ -330,6 +330,23 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       defp collect_segment_projected_entries_strict(_sm_state),
         do: {:error, :bad_segment_projection_state}
 
+      if Mix.env() == :test do
+        @doc false
+        def __collect_segment_projected_entries_for_test__(sm_state) do
+          collect_segment_projected_entries_strict(sm_state)
+        end
+
+        @doc false
+        def __segment_projection_checkpoint_relocations_for_test__(
+              ctx,
+              shard_index,
+              entries,
+              trim_index
+            ) do
+          segment_projection_checkpoint_relocations(ctx, shard_index, entries, trim_index)
+        end
+      end
+
       defp collect_segment_projection_relocations(ctx, shard_index) do
         keydir = elem(ctx.keydir_refs, shard_index)
 
@@ -345,7 +362,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              instance_ctx: ctx,
              shard_index: shard_index
            }) do
-        now = HLC.now_ms()
+        now = storage_expiry_cutoff_ms()
 
         case segment_projection_relocations_from_keydir(keydir, ctx, shard_index, now) do
           :unavailable ->
@@ -391,7 +408,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
 
       defp segment_projection_checkpoint_relocations(ctx, shard_index, entries, trim_index) do
         keydir = elem(ctx.keydir_refs, shard_index)
-        now = HLC.now_ms()
+        now = storage_expiry_cutoff_ms()
 
         entry_by_key =
           entries
@@ -479,6 +496,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
 
       defp prepare_segment_value_pins_for_trim(root_dir, ctx, shard_index, trim_index, page_limit) do
         lmdb_path = flow_lmdb_path(ctx, shard_index)
+        expiry_cutoff_ms = storage_expiry_cutoff_ms()
 
         do_prepare_segment_value_pins_for_trim(
           root_dir,
@@ -488,7 +506,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
           trim_index,
           <<>>,
           page_limit,
-          0
+          0,
+          expiry_cutoff_ms
         )
       rescue
         error -> {:error, {:prepare_segment_value_pins_for_trim_failed, error}}
@@ -502,7 +521,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              trim_index,
              after_key,
              page_limit,
-             count
+             count,
+             expiry_cutoff_ms
            ) do
         case FlowLMDB.segment_value_pin_entries_before_page(
                lmdb_path,
@@ -512,9 +532,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              ) do
           {:ok, pins, next_after_key, done?} ->
             with {:ok, relocations} <-
-                   segment_value_pin_relocations_from_pins(ctx, shard_index, pins),
+                   segment_value_pin_relocations_from_pins(
+                     ctx,
+                     shard_index,
+                     pins,
+                     expiry_cutoff_ms
+                   ),
                  :ok <- write_apply_projection_value_pins(root_dir, relocations),
-                 :ok <- relocate_segment_value_pins(ctx, shard_index, relocations) do
+                 :ok <-
+                   relocate_segment_value_pins(
+                     ctx,
+                     shard_index,
+                     relocations,
+                     expiry_cutoff_ms
+                   ) do
               next_count = count + length(relocations)
 
               if done? do
@@ -528,7 +559,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                   trim_index,
                   next_after_key,
                   page_limit,
-                  next_count
+                  next_count,
+                  expiry_cutoff_ms
                 )
               end
             end
@@ -538,10 +570,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
       end
 
-      defp segment_value_pin_relocations_from_pins(ctx, shard_index, pins) do
+      defp segment_value_pin_relocations_from_pins(
+             ctx,
+             shard_index,
+             pins,
+             expiry_cutoff_ms
+           ) do
         pins
         |> Enum.reduce_while({:ok, []}, fn pin, {:ok, acc} ->
-          case segment_value_pin_relocation_from_pin(ctx, shard_index, pin) do
+          case segment_value_pin_relocation_from_pin(
+                 ctx,
+                 shard_index,
+                 pin,
+                 expiry_cutoff_ms
+               ) do
             {:ok, relocation} -> {:cont, {:ok, [relocation | acc]}}
             {:error, reason} -> {:halt, {:error, reason}}
           end
@@ -562,12 +604,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                offset: offset,
                value_size: value_size,
                pin_key: pin_key
-             }
+             },
+             expiry_cutoff_ms
            )
            when is_binary(key) and valid_segment_backed_file_id(file_id) and is_integer(offset) and
                   offset >= 0 and is_integer(value_size) and value_size >= 0 and
                   is_binary(pin_key) do
-        if expired_segment_value_pin?(expire_at_ms) do
+        if expired_segment_value_pin?(expire_at_ms, expiry_cutoff_ms) do
           {:ok,
            %{
              key: key,
@@ -592,7 +635,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
       end
 
-      defp segment_value_pin_relocation_from_pin(_ctx, _shard_index, pin),
+      defp segment_value_pin_relocation_from_pin(_ctx, _shard_index, pin, _expiry_cutoff_ms),
         do: {:error, {:bad_segment_value_pin, pin}}
 
       defp segment_value_pin_relocation_from_live_pin(
@@ -626,11 +669,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
       end
 
-      defp expired_segment_value_pin?(expire_at_ms)
+      defp expired_segment_value_pin?(expire_at_ms, expiry_cutoff_ms)
            when is_integer(expire_at_ms) and expire_at_ms > 0,
-           do: not live_expire_at?(expire_at_ms, HLC.now_ms())
+           do: not live_expire_at?(expire_at_ms, expiry_cutoff_ms)
 
-      defp expired_segment_value_pin?(_expire_at_ms), do: false
+      defp expired_segment_value_pin?(_expire_at_ms, _expiry_cutoff_ms), do: false
 
       defp write_apply_projection_value_pins(_root_dir, []), do: :ok
 
@@ -725,14 +768,22 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              trim_index,
              retention_lmdb_path
            ) do
+        expiry_cutoff_ms = storage_expiry_cutoff_ms()
+
         with {:ok, keydir_entries} <-
-               collect_apply_projection_keydir_retention(ctx, shard_index, trim_index),
+               collect_apply_projection_keydir_retention(
+                 ctx,
+                 shard_index,
+                 trim_index,
+                 expiry_cutoff_ms
+               ),
              {:ok, pin_entries} <-
                collect_apply_projection_pin_retention(
                  ctx,
                  shard_index,
                  trim_index,
-                 retention_lmdb_path
+                 retention_lmdb_path,
+                 expiry_cutoff_ms
                ),
              {:ok, entries_by_ref} <-
                merge_apply_projection_retention_entries(keydir_entries, pin_entries) do
@@ -753,16 +804,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         end
       end
 
-      defp collect_apply_projection_keydir_retention(ctx, shard_index, trim_index) do
+      defp collect_apply_projection_keydir_retention(
+             ctx,
+             shard_index,
+             trim_index,
+             expiry_cutoff_ms
+           ) do
         keydir = elem(ctx.keydir_refs, shard_index)
-        now = HLC.now_ms()
 
         case reduce_keydir_rows_while(keydir, [], fn
                {key, value, expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
                 _value_size},
                acc
                when is_binary(key) and is_integer(index) and index > 0 and index < trim_index ->
-                 if live_expire_at?(expire_at_ms, now) do
+                 if live_expire_at?(expire_at_ms, expiry_cutoff_ms) do
                    case apply_projection_retention_entry(
                           ctx,
                           shard_index,
@@ -791,7 +846,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              ctx,
              shard_index,
              trim_index,
-             lmdb_path
+             lmdb_path,
+             expiry_cutoff_ms
            ) do
         do_collect_apply_projection_pin_retention(
           ctx,
@@ -799,7 +855,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
           lmdb_path,
           trim_index,
           <<>>,
-          []
+          [],
+          expiry_cutoff_ms
         )
       end
 
@@ -809,7 +866,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              lmdb_path,
              trim_index,
              after_key,
-             acc
+             acc,
+             expiry_cutoff_ms
            ) do
         case FlowLMDB.segment_value_pin_entries_before_page(
                lmdb_path,
@@ -823,7 +881,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                    shard_index,
                    lmdb_path,
                    pins,
-                   acc
+                   acc,
+                   expiry_cutoff_ms
                  ) do
               {:ok, next_acc} when done? ->
                 {:ok, Enum.reverse(next_acc)}
@@ -835,7 +894,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                   lmdb_path,
                   trim_index,
                   next_after_key,
-                  next_acc
+                  next_acc,
+                  expiry_cutoff_ms
                 )
 
               {:error, _reason} = error ->
@@ -852,7 +912,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              shard_index,
              lmdb_path,
              pins,
-             acc
+             acc,
+             expiry_cutoff_ms
            ) do
         Enum.reduce_while(pins, {:ok, acc}, fn
           %{
@@ -870,7 +931,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                    key,
                    file_id,
                    offset,
-                   value_size
+                   value_size,
+                   expiry_cutoff_ms
                  ) do
               :current ->
                 case apply_projection_retention_entry(
@@ -1024,19 +1086,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
         error -> {:error, {:relocate_segment_projection_keydir_from_checkpoint_failed, error}}
       end
 
-      defp relocate_segment_value_pins(_ctx, _shard_index, []), do: :ok
+      defp relocate_segment_value_pins(_ctx, _shard_index, [], _expiry_cutoff_ms), do: :ok
 
       defp relocate_segment_value_pins(
              ctx,
              shard_index,
-             relocations
+             relocations,
+             expiry_cutoff_ms
            ) do
         lmdb_path = flow_lmdb_path(ctx, shard_index)
 
         ops =
           relocations
           |> Enum.reduce_while({:ok, []}, fn relocation, {:ok, acc} ->
-            case segment_value_pin_relocation_ops(lmdb_path, relocation) do
+            case segment_value_pin_relocation_ops(
+                   lmdb_path,
+                   relocation,
+                   expiry_cutoff_ms
+                 ) do
               {:ok, relocation_ops} -> {:cont, {:ok, [relocation_ops | acc]}}
               {:error, reason} -> {:halt, {:error, reason}}
             end
@@ -1064,7 +1131,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                source_offset: source_offset,
                source_value_size: source_value_size,
                source_pin_key: source_pin_key
-             }
+             },
+             expiry_cutoff_ms
            ) do
         with :current <-
                current_segment_value_pin_locator(
@@ -1072,7 +1140,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                  key,
                  source_file_id,
                  source_offset,
-                 source_value_size
+                 source_value_size,
+                 expiry_cutoff_ms
                ) do
           case source_file_id do
             {:waraft_apply_projection, index} when is_integer(index) and index > 0 ->
@@ -1111,11 +1180,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              key,
              source_file_id,
              source_offset,
-             source_value_size
+             source_value_size,
+             expiry_cutoff_ms
            ) do
         case FlowLMDB.get(lmdb_path, key) do
           {:ok, blob} ->
-            case FlowLMDB.decode_value_locator(blob, HLC.now_ms()) do
+            case FlowLMDB.decode_value_locator(blob, expiry_cutoff_ms) do
               {:ok, {^source_file_id, ^source_offset, ^source_value_size}} -> :current
               _expired_or_changed -> :changed_or_deleted
             end

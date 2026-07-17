@@ -2,6 +2,7 @@ defmodule Ferricstore.Raft.WARaftStorage do
   @moduledoc false
 
   alias Ferricstore.CommandTime
+  alias Ferricstore.ExpiryContext
   alias Ferricstore.HLC
   alias Ferricstore.Flow.HistoryProjector
   alias Ferricstore.Flow.Keys, as: FlowKeys
@@ -53,6 +54,11 @@ defmodule Ferricstore.Raft.WARaftStorage do
                    is_integer(elem(file_id, 1)) and elem(file_id, 1) > 0
 
   @type handle :: map()
+
+  defp storage_expiry_cutoff_ms do
+    ExpiryContext.capture()
+    |> ExpiryContext.safe_expiry_cutoff_ms()
+  end
 
   use Ferricstore.Raft.WARaftStorage.Sections.Lifecycle
   use Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands

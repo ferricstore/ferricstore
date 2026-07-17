@@ -632,7 +632,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.ApplyResult do
 
       defp run_segment_projection_checkpoint(root_dir, ctx, shard_index, position, keydir) do
         with_segment_projection_lock(root_dir, fn ->
-          now = HLC.now_ms()
+          now = storage_expiry_cutoff_ms()
 
           case segment_projection_entries_from_keydir(keydir, ctx, shard_index, now) do
             :unavailable ->

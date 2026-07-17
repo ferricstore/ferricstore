@@ -738,7 +738,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
 
       defp segment_live_promotion_marker?(sm_state, redis_key) do
         marker_key = Promotion.marker_key(redis_key)
-        now = CommandTime.now_ms()
+        now = storage_expiry_cutoff_ms()
 
         case :ets.lookup(Map.fetch!(sm_state, :ets), marker_key) do
           [{^marker_key, type, expire_at_ms, _lfu, _fid, _offset, _value_size}]
@@ -836,7 +836,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
         if map_size(locks) == 0 do
           :ok
         else
-          now = CommandTime.now_ms()
+          now = storage_expiry_cutoff_ms()
 
           case Map.get(locks, key) do
             nil ->
@@ -910,6 +910,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
       @doc false
       def __with_segment_projection_command_time_for_test__(command, fun),
         do: with_segment_projection_command_time(command, fun)
+
+      if Mix.env() == :test do
+        @doc false
+        def __segment_live_promotion_marker_for_test__(sm_state, redis_key),
+          do: segment_live_promotion_marker?(sm_state, redis_key)
+
+        @doc false
+        def __segment_project_check_fetch_or_compute_lock_for_test__(
+              sm_state,
+              key,
+              owner_ref
+            ),
+            do: segment_project_check_fetch_or_compute_lock(sm_state, key, owner_ref)
+      end
 
       defp emit_segment_projection_apply_telemetry(
              sm_state,
