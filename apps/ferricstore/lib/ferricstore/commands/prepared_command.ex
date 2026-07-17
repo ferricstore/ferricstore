@@ -73,6 +73,19 @@ defmodule Ferricstore.Commands.PreparedCommand do
     %{read: prepared.read_keys, write: prepared.write_keys}
   end
 
+  @doc """
+  Detaches binaries that would retain a larger parent binary.
+
+  Prepared commands normally live only for one request, so preparation keeps
+  decoder sub-binaries without copying. Long-lived consumers such as MULTI
+  queues must call this at their retention boundary.
+  """
+  @spec detach_retained_binaries(t()) :: t()
+  def detach_retained_binaries(%__MODULE__{} = prepared) do
+    {detached, _copies} = detach_term(prepared, %{})
+    detached
+  end
+
   @spec shard_indexes(t(), FerricStore.Instance.t() | shard_resolver()) :: [term()]
   def shard_indexes(%__MODULE__{routing_keys: keys}, resolver) when is_function(resolver, 1) do
     keys
@@ -98,4 +111,48 @@ defmodule Ferricstore.Commands.PreparedCommand do
 
   defp resolve_shard(key, resolver) when is_function(resolver, 1), do: resolver.(key)
   defp resolve_shard(key, store), do: Router.shard_for(store, key)
+
+  defp detach_term(binary, copies) when is_binary(binary) do
+    case copies do
+      %{^binary => detached} ->
+        {detached, copies}
+
+      _missing ->
+        detached =
+          if :binary.referenced_byte_size(binary) > byte_size(binary),
+            do: :binary.copy(binary),
+            else: binary
+
+        {detached, Map.put(copies, binary, detached)}
+    end
+  end
+
+  defp detach_term([head | tail], copies) do
+    {detached_head, copies} = detach_term(head, copies)
+    {detached_tail, copies} = detach_term(tail, copies)
+    {[detached_head | detached_tail], copies}
+  end
+
+  defp detach_term([], copies), do: {[], copies}
+
+  defp detach_term(tuple, copies) when is_tuple(tuple) do
+    {items, copies} =
+      tuple
+      |> Tuple.to_list()
+      |> detach_term(copies)
+
+    {List.to_tuple(items), copies}
+  end
+
+  defp detach_term(map, copies) when is_map(map) do
+    map
+    |> :maps.to_list()
+    |> Enum.reduce({%{}, copies}, fn {key, value}, {detached_map, copies} ->
+      {detached_key, copies} = detach_term(key, copies)
+      {detached_value, copies} = detach_term(value, copies)
+      {Map.put(detached_map, detached_key, detached_value), copies}
+    end)
+  end
+
+  defp detach_term(term, copies), do: {term, copies}
 end

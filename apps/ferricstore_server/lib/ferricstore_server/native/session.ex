@@ -231,6 +231,7 @@ defmodule FerricstoreServer.Native.Session do
       keys
       |> Enum.map(&namespace_key(Map.get(state, :sandbox_namespace), &1))
       |> Enum.uniq()
+      |> Enum.map(&detach_retained_binary/1)
 
     new_keys = Enum.reject(watched_keys, &Map.has_key?(state.watched_keys, &1))
     resulting_key_count = map_size(state.watched_keys) + length(new_keys)
@@ -303,6 +304,7 @@ defmodule FerricstoreServer.Native.Session do
   end
 
   defp queue_transaction_command_within_byte_limit(prepared, state) do
+    prepared = PreparedCommand.detach_retained_binaries(prepared)
     command_bytes = :erlang.external_size(prepared)
     queued_bytes = Map.get(state, :multi_queue_bytes, 0)
     byte_limit = Map.get(state, :multi_queue_byte_limit, @default_multi_queue_byte_limit)
@@ -610,6 +612,12 @@ defmodule FerricstoreServer.Native.Session do
 
   defp namespace_key(nil, key), do: key
   defp namespace_key(namespace, key) when is_binary(namespace), do: namespace <> key
+
+  defp detach_retained_binary(binary) do
+    if :binary.referenced_byte_size(binary) > byte_size(binary),
+      do: :binary.copy(binary),
+      else: binary
+  end
 
   defp native_tx_result({:error, _reason} = error), do: native_value(error)
   defp native_tx_result(nil), do: nil

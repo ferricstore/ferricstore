@@ -10,6 +10,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   alias Ferricstore.Commands.PreparedCommand
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
+  alias FerricstoreServer.Native.Codec
   alias FerricstoreServer.Native.Commands
   alias FerricstoreServer.Native.Session
   alias Ferricstore.Stats
@@ -1331,7 +1332,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     {index, lookup} =
       Ferricstore.Store.Shard.ZSetIndex.table_names(ctx.name, shard_index)
 
-    :ok = Ferricstore.Store.Shard.ZSetIndex.mark_new_ready_empty(index, lookup, key)
+    :ok = Ferricstore.Store.Shard.ZSetIndex.mark_ready_empty(index, lookup, key)
     :ok = Ferricstore.Store.Shard.ZSetIndex.put_member(index, lookup, key, "stale", "1")
 
     true =
@@ -2265,6 +2266,33 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert rejected_state.multi_queue_bytes == 0
   end
 
+  test "native MULTI detaches queued arguments from the decoded request frame" do
+    retained_value = :binary.copy("v", 65)
+
+    body =
+      Codec.encode_value(%{
+        "command" => "SET",
+        "args" => ["detached-multi-key", retained_value],
+        "ignored_padding" => :binary.copy("p", 1_000_000)
+      })
+
+    assert {:ok, payload} = Codec.decode_body(@op_command_exec, 0, body)
+
+    assert {:ok, "OK", multi_state} =
+             Session.execute(
+               %{"command" => "MULTI", "args" => []},
+               session_state_as("default")
+             )
+
+    assert {:ok, "QUEUED", queued_state} = Session.execute(payload, multi_state)
+    assert [%PreparedCommand{args: [_key, queued_value]}] = queued_state.multi_queue
+    assert queued_value == retained_value
+
+    for binary <- collect_binaries(hd(queued_state.multi_queue)) do
+      assert :binary.referenced_byte_size(binary) == byte_size(binary)
+    end
+  end
+
   test "native WATCH enforces connection limits before submitting Raft commands" do
     tag = System.unique_integer([:positive, :monotonic])
     keys = Enum.map(1..3, &"native-watch-limit:{#{tag}}:#{&1}")
@@ -2285,6 +2313,25 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert rejected_state.watched_keys == %{}
     assert rejected_state.watched_key_bytes == 0
     assert raft_position(shard_index) == before_position
+  end
+
+  test "native WATCH detaches retained keys from the decoded request frame" do
+    key =
+      "native-watch-detached:{#{System.unique_integer([:positive, :monotonic])}}:" <>
+        :binary.copy("k", 65)
+
+    body =
+      Codec.encode_value(%{
+        "command" => "WATCH",
+        "args" => [key],
+        "ignored_padding" => :binary.copy("p", 1_000_000)
+      })
+
+    assert {:ok, payload} = Codec.decode_body(@op_command_exec, 0, body)
+    assert {:ok, "OK", watched_state} = Session.execute(payload, session_state_as("default"))
+    assert [{stored_key, _token}] = Map.to_list(watched_state.watched_keys)
+    assert stored_key == key
+    assert :binary.referenced_byte_size(stored_key) == byte_size(stored_key)
   end
 
   test "native WATCH batches same-shard tokens into one Raft entry" do
@@ -2627,6 +2674,27 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     index
   end
+
+  defp collect_binaries(binary) when is_binary(binary), do: [binary]
+
+  defp collect_binaries([head | tail]),
+    do: collect_binaries(head) ++ collect_binaries(tail)
+
+  defp collect_binaries([]), do: []
+
+  defp collect_binaries(tuple) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> collect_binaries()
+  end
+
+  defp collect_binaries(map) when is_map(map) do
+    map
+    |> :maps.to_list()
+    |> Enum.flat_map(fn {key, value} -> collect_binaries(key) ++ collect_binaries(value) end)
+  end
+
+  defp collect_binaries(_term), do: []
 
   defp join_acl_invalidation_group do
     group = ConnAuth.acl_pg_group()
