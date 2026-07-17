@@ -1197,22 +1197,43 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         :ok
       end
 
-      defp transaction_compound_prefix_keys(ctx, prefix) do
-        case CompoundMemberIndex.keys_for_prefix(ctx.compound_member_index_name, prefix) do
+      defp transaction_compound_prefix_keys(ctx, prefix, member_budget) do
+        case CompoundMemberIndex.keys_for_prefix(
+               ctx.compound_member_index_name,
+               prefix,
+               member_budget
+             ) do
           {:ok, catalog_keys} ->
             deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
-            keys =
-              Process.get(:tx_pending_values, %{})
-              |> Map.keys()
-              |> Enum.reduce(MapSet.new(catalog_keys), fn key, acc ->
-                if transaction_key_has_prefix?(key, prefix), do: MapSet.put(acc, key), else: acc
-              end)
+            base_keys =
+              catalog_keys
+              |> MapSet.new()
               |> MapSet.difference(deleted)
-              |> MapSet.to_list()
-              |> Enum.sort()
 
-            {:ok, keys}
+            Process.get(:tx_pending_values, %{})
+            |> Enum.reduce_while({:ok, base_keys}, fn {key, _value}, {:ok, keys} ->
+              cond do
+                not transaction_key_has_prefix?(key, prefix) ->
+                  {:cont, {:ok, keys}}
+
+                MapSet.member?(deleted, key) or MapSet.member?(keys, key) ->
+                  {:cont, {:ok, keys}}
+
+                MapSet.size(keys) >= member_budget ->
+                  {:halt, {:error, :compound_delete_budget_exceeded}}
+
+                true ->
+                  {:cont, {:ok, MapSet.put(keys, key)}}
+              end
+            end)
+            |> case do
+              {:ok, keys} -> {:ok, keys |> MapSet.to_list() |> Enum.sort()}
+              {:error, :compound_delete_budget_exceeded} = error -> error
+            end
+
+          {:error, :limit_exceeded} ->
+            {:error, :compound_delete_budget_exceeded}
 
           :unavailable ->
             {:error, :compound_member_index_unavailable}
@@ -1886,20 +1907,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end,
           compound_delete_prefix: fn redis_key, prefix ->
             ctx = ctx_for_key.(redis_key)
+            member_budget = anchor_state.apply_context.compound_delete_member_budget
 
-            with {:ok, compound_keys} <- transaction_compound_prefix_keys(ctx, prefix) do
-              case promoted_compound_path(ctx, redis_key, prefix) do
-                nil ->
-                  Enum.each(compound_keys, fn key ->
-                    :ok = delete_in_ctx.(ctx, key)
-                    :ok = queue_compound_indexes_delete_after_flush(ctx, redis_key, key)
-                  end)
+            case transaction_compound_prefix_keys(ctx, prefix, member_budget) do
+              {:ok, compound_keys} ->
+                case promoted_compound_path(ctx, redis_key, prefix) do
+                  nil ->
+                    Enum.each(compound_keys, fn key ->
+                      :ok = delete_in_ctx.(ctx, key)
+                      :ok = queue_compound_indexes_delete_after_flush(ctx, redis_key, key)
+                    end)
 
-                  :ok
+                    :ok
 
-                dedicated_path ->
-                  promoted_delete_batch.(redis_key, compound_keys, dedicated_path)
-              end
+                  dedicated_path ->
+                    promoted_delete_batch.(redis_key, compound_keys, dedicated_path)
+                end
+
+              {:error, reason} ->
+                throw({:transaction_store_failure, reason})
             end
           end,
           zset_score_range: fn redis_key, min_bound, max_bound, reverse? ->

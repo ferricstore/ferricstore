@@ -188,6 +188,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
                         {:error, _reason} = error ->
                           error
                       end
+                    catch
+                      {:transaction_store_failure, reason} -> {:error, reason}
                     after
                       Process.delete(:tx_deleted_keys)
                       Process.delete(:tx_pending_values)

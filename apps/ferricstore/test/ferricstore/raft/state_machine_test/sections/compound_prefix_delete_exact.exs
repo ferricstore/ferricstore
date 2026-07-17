@@ -44,6 +44,141 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.CompoundPrefixDeleteExact d
         assert [_row] = :ets.lookup(ets, field_b)
       end
 
+      @tag :transaction_compound_delete_budget
+      test "transaction DEL rejects compound work above the replicated member budget atomically",
+           %{
+             state: state,
+             ets: ets
+           } do
+        redis_key = "tx-prefix-delete-budget"
+        type_key = CompoundKey.type_key(redis_key)
+        field_a = CompoundKey.hash_field(redis_key, "a")
+        field_b = CompoundKey.hash_field(redis_key, "b")
+        staged_key = "tx-prefix-delete-must-roll-back"
+        index = state.compound_member_index_name
+        context = ApplyContext.new(compound_delete_member_budget: 1)
+
+        CompoundMemberIndex.ensure_table!(index)
+        CompoundMemberIndex.reset(index)
+        on_exit(fn -> safe_delete_ets(index) end)
+
+        :ets.insert(ets, {type_key, "hash", 0, LFU.initial(), 0, 0, 4})
+
+        Enum.each([field_a, field_b], fn key ->
+          :ets.insert(ets, {key, "value", 0, LFU.initial(), 0, 0, 5})
+          CompoundMemberIndex.put(index, key)
+        end)
+
+        {:ok, prepared_set} =
+          Ferricstore.Commands.PreparedCommand.prepare("SET", [staged_key, "staged"])
+
+        {:ok, prepared_del} = Ferricstore.Commands.PreparedCommand.prepare("DEL", [redis_key])
+
+        entries =
+          Enum.map([prepared_set, prepared_del], fn prepared ->
+            {:ok, entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+            entry
+          end)
+
+        limited_state = %{
+          state
+          | apply_context: context,
+            apply_context_encoded: ApplyContext.encode(context)
+        }
+
+        assert {_state, {:error, :compound_delete_budget_exceeded}} =
+                 StateMachine.apply(%{}, {:tx_execute, entries, nil}, limited_state)
+
+        assert [] = :ets.lookup(ets, staged_key)
+        assert [_row] = :ets.lookup(ets, type_key)
+        assert [_row] = :ets.lookup(ets, field_a)
+        assert [_row] = :ets.lookup(ets, field_b)
+      end
+
+      @tag :transaction_compound_delete_budget
+      test "transaction DEL admits a collection exactly at the replicated member budget", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "tx-prefix-delete-budget-boundary"
+        type_key = CompoundKey.type_key(redis_key)
+        field = CompoundKey.hash_field(redis_key, "field")
+        index = state.compound_member_index_name
+        context = ApplyContext.new(compound_delete_member_budget: 1)
+
+        CompoundMemberIndex.ensure_table!(index)
+        CompoundMemberIndex.reset(index)
+        on_exit(fn -> safe_delete_ets(index) end)
+
+        :ets.insert(ets, {type_key, "hash", 0, LFU.initial(), 0, 0, 4})
+        :ets.insert(ets, {field, "value", 0, LFU.initial(), 0, 0, 5})
+        CompoundMemberIndex.put(index, field)
+
+        {:ok, prepared_del} = Ferricstore.Commands.PreparedCommand.prepare("DEL", [redis_key])
+        {:ok, del_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared_del)
+
+        limited_state = %{
+          state
+          | apply_context: context,
+            apply_context_encoded: ApplyContext.encode(context)
+        }
+
+        assert {_state, [1]} =
+                 StateMachine.apply(%{}, {:tx_execute, [del_entry], nil}, limited_state)
+
+        assert [] = :ets.lookup(ets, type_key)
+        assert [] = :ets.lookup(ets, field)
+      end
+
+      @tag :transaction_compound_delete_budget
+      test "transaction DEL counts members staged earlier in the same transaction", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "tx-pending-prefix-delete-budget"
+        type_key = CompoundKey.type_key(redis_key)
+        existing_field = CompoundKey.hash_field(redis_key, "existing")
+        staged_field = CompoundKey.hash_field(redis_key, "staged")
+        index = state.compound_member_index_name
+        context = ApplyContext.new(compound_delete_member_budget: 1)
+
+        CompoundMemberIndex.ensure_table!(index)
+        CompoundMemberIndex.reset(index)
+        on_exit(fn -> safe_delete_ets(index) end)
+
+        :ets.insert(ets, {type_key, "hash", 0, LFU.initial(), 0, 0, 4})
+        :ets.insert(ets, {existing_field, "original", 0, LFU.initial(), 0, 0, 8})
+        CompoundMemberIndex.put(index, existing_field)
+
+        {:ok, prepared_hset} =
+          Ferricstore.Commands.PreparedCommand.prepare("HSET", [
+            redis_key,
+            "staged",
+            "pending"
+          ])
+
+        {:ok, prepared_del} = Ferricstore.Commands.PreparedCommand.prepare("DEL", [redis_key])
+
+        entries =
+          Enum.map([prepared_hset, prepared_del], fn prepared ->
+            {:ok, entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+            entry
+          end)
+
+        limited_state = %{
+          state
+          | apply_context: context,
+            apply_context_encoded: ApplyContext.encode(context)
+        }
+
+        assert {_state, {:error, :compound_delete_budget_exceeded}} =
+                 StateMachine.apply(%{}, {:tx_execute, entries, nil}, limited_state)
+
+        assert [_row] = :ets.lookup(ets, type_key)
+        assert [{^existing_field, "original", _, _, _, _, _}] = :ets.lookup(ets, existing_field)
+        assert [] = :ets.lookup(ets, staged_field)
+      end
+
       @tag :compound_prefix_delete_exact
       test "string overwrite preserves the collection when its bounded cleanup is rejected", %{
         state: state,
