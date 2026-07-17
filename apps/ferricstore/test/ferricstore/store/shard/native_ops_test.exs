@@ -334,6 +334,30 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
     end
   end
 
+  test "direct list no-op writes preserve the shard write version" do
+    keydir = new_keydir("list_noop_write")
+    state = direct_state(keydir)
+
+    try do
+      assert {:reply, nil, ^state} =
+               NativeOps.handle_list_op("missing", {:lpop, 1}, state)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
+  test "direct LMOVE with a missing source preserves the shard write version" do
+    keydir = new_keydir("lmove_noop_write")
+    state = direct_state(keydir)
+
+    try do
+      assert {:reply, nil, ^state} =
+               NativeOps.handle_list_op_lmove("missing", "destination", :left, :right, state)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   test "direct list writes reject a malformed live plain-string row" do
     keydir = new_keydir("list_invalid_plain_row")
     state = direct_state(keydir)

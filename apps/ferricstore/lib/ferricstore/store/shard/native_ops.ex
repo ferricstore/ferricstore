@@ -566,13 +566,19 @@ defmodule Ferricstore.Store.Shard.NativeOps do
         :ok ->
           result = Ferricstore.Store.ListOps.execute(key, store, operation)
 
-          state =
+          new_state =
             state
             |> apply_direct_dead_bytes()
             |> refresh_direct_file_accounting()
-            |> maybe_advance_list_write_version(result)
 
-          {:reply, result, state}
+          new_state =
+            maybe_advance_list_write_version(
+              new_state,
+              result,
+              direct_list_storage_changed?(state, new_state)
+            )
+
+          {:reply, result, new_state}
 
         {:error, _} = err ->
           {:reply, err, state}
@@ -582,10 +588,17 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  defp maybe_advance_list_write_version(state, {:error, _reason}), do: state
+  defp maybe_advance_list_write_version(state, {:error, _reason}, _mutated?), do: state
 
-  defp maybe_advance_list_write_version(state, _successful_result),
+  defp maybe_advance_list_write_version(state, _successful_result, true),
     do: %{state | write_version: state.write_version + 1}
+
+  defp maybe_advance_list_write_version(state, _successful_result, false), do: state
+
+  defp direct_list_storage_changed?(before, after_state) do
+    before.active_file_id != after_state.active_file_id or
+      before.active_file_size != after_state.active_file_size
+  end
 
   # Builds a store suitable for TypeRegistry.check_type by adding exists?
   # to the compound store. The compound store lacks exists? which TypeRegistry
@@ -655,13 +668,19 @@ defmodule Ferricstore.Store.Shard.NativeOps do
           {:reply, result, state}
 
         _ ->
-          state =
+          new_state =
             state
             |> apply_direct_dead_bytes()
             |> refresh_direct_file_accounting()
-            |> maybe_advance_list_write_version(result)
 
-          {:reply, result, state}
+          new_state =
+            maybe_advance_list_write_version(
+              new_state,
+              result,
+              direct_list_storage_changed?(state, new_state)
+            )
+
+          {:reply, result, new_state}
       end
     after
       reset_direct_dead_bytes()
