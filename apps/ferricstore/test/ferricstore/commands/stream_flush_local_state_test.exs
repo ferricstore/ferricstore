@@ -29,6 +29,22 @@ defmodule Ferricstore.Commands.StreamFlushLocalStateTest do
     assert stream_table_size(Ferricstore.Stream.Groups) == 0
     assert stream_table_size(Ferricstore.Stream.Index) == 0
     assert stream_table_size(:ferricstore_stream_waiters) == 0
+    assert_receive {:stream_waiter_notify, ^key}
+  end
+
+  test "embedded flushdb clears scoped stream state and notifies waiters" do
+    ctx = FerricStore.Instance.get(:default)
+    key = "stream_embedded_flush_#{System.unique_integer([:positive])}"
+
+    assert {:ok, _id} = FerricStore.xadd(key, ["field", "value"])
+    assert :ok = Stream.register_stream_waiter(key, self(), "0-0", ctx)
+    assert Stream.stream_waiter_count(key, ctx) == 1
+
+    assert :ok = FerricStore.flushdb()
+
+    assert Stream.stream_waiter_count(key, ctx) == 0
+    assert_receive {:stream_waiter_notify, ^key}
+    assert :ets.lookup(Ferricstore.Stream.Meta, {ctx.name, key}) == []
   end
 
   defp stream_table_size(table) do

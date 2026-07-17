@@ -74,6 +74,7 @@ defmodule FerricStore.API.Store do
     ctx = default_ctx()
 
     %{
+      instance_ctx: ctx,
       get: fn k -> Router.get(ctx, k) end,
       get_meta: fn k -> Router.get_meta(ctx, k) end,
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,
@@ -270,6 +271,7 @@ defmodule FerricStore.API.Store do
     ctx = default_ctx()
 
     %{
+      instance_ctx: ctx,
       get: fn k -> Router.get(ctx, k) end,
       get_meta: fn k -> Router.get_meta(ctx, k) end,
       batch_get: fn keys -> Router.batch_get(ctx, keys) end,

@@ -338,6 +338,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
           Ferricstore.LatencyTrace.maybe_span "server_zset_index_update_us" do
             flush_pending_zset_indexes(state)
           end
+
+          flush_pending_stream_cache_cleanups()
         end)
       end
 

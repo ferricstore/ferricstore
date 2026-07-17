@@ -404,6 +404,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
             Ferricstore.Store.CompoundKey.zset_prefix(key)
           )
 
+      defp clear_compound_prefix_for_string_put(state, key, "stream") do
+        with :ok <-
+               do_compound_delete_prefix(
+                 state,
+                 key,
+                 Ferricstore.Store.CompoundKey.stream_prefix(key)
+               ),
+             :ok <-
+               do_compound_delete_prefix(
+                 state,
+                 key,
+                 Ferricstore.Store.CompoundKey.stream_group_prefix(key)
+               ),
+             :ok <-
+               do_compound_delete(
+                 state,
+                 key,
+                 Ferricstore.Store.CompoundKey.stream_meta_key(key)
+               ) do
+          queue_stream_cache_cleanup({state.instance_name, key})
+        end
+      end
+
       defp clear_compound_prefix_for_string_put(_state, _key, _type), do: :ok
 
       # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 defmodule FerricstoreServer.Native.BlockingTest do
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Store.Router
   alias FerricstoreServer.Native.{Blocking, ResourceBudget, Session}
 
   setup do
@@ -116,6 +117,121 @@ defmodule FerricstoreServer.Native.BlockingTest do
     for _ <- 1..20_000, do: send(worker, {:waiter_notify, key})
 
     assert_receive {:native_blocking_response, ^meta, ^worker, :ok, nil}, 500
+    assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}, 500
+  end
+
+  test "XREAD remains wakeable when a stream is deleted and immediately recreated" do
+    key = "native:blocking:stream-recreate:#{System.unique_integer([:positive])}"
+    ctx = FerricStore.Instance.get(:default)
+    assert {:ok, old_id} = FerricStore.xadd(key, ["field", "old"])
+
+    assert {:ok, prepared} =
+             Session.prepare_command(%{
+               "command" => "XREAD",
+               "args" => ["BLOCK", "0", "STREAMS", key, old_id]
+             })
+
+    state = %{
+      instance_ctx: ctx,
+      acl_cache: :full_access,
+      require_auth: false,
+      authenticated: true
+    }
+
+    meta = %{request_id: make_ref()}
+    assert {:ok, worker, monitor_ref} = Blocking.start_prepared(prepared, state, meta)
+
+    on_exit(fn ->
+      if Process.alive?(worker), do: Process.exit(worker, :kill)
+      FerricStore.del(key)
+    end)
+
+    assert wait_until(fn ->
+             Ferricstore.Commands.Stream.stream_waiter_count(key, ctx) == 1
+           end) == :ok
+
+    assert {:ok, 1} = FerricStore.del(key)
+    assert {:ok, new_id} = FerricStore.xadd(key, ["field", "new"])
+
+    assert_receive {:native_blocking_response, ^meta, ^worker, :ok, result}, 1_000
+    assert new_id in List.flatten(result)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}, 500
+  end
+
+  test "XREAD wakes with WRONGTYPE when SET replaces its stream" do
+    key = "native:blocking:stream-overwrite:#{System.unique_integer([:positive])}"
+    ctx = FerricStore.Instance.get(:default)
+    assert {:ok, old_id} = FerricStore.xadd(key, ["field", "old"])
+
+    assert {:ok, prepared} =
+             Session.prepare_command(%{
+               "command" => "XREAD",
+               "args" => ["BLOCK", "0", "STREAMS", key, old_id]
+             })
+
+    state = %{
+      instance_ctx: ctx,
+      acl_cache: :full_access,
+      require_auth: false,
+      authenticated: true
+    }
+
+    meta = %{request_id: make_ref()}
+    assert {:ok, worker, monitor_ref} = Blocking.start_prepared(prepared, state, meta)
+
+    on_exit(fn ->
+      if Process.alive?(worker), do: Process.exit(worker, :kill)
+      FerricStore.del(key)
+    end)
+
+    assert wait_until(fn ->
+             Ferricstore.Commands.Stream.stream_waiter_count(key, ctx) == 1
+           end) == :ok
+
+    assert :ok = FerricStore.set(key, "replacement")
+
+    assert_receive {:native_blocking_response, ^meta, ^worker, :error, reason}, 1_000
+    assert reason =~ "WRONGTYPE"
+    assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}, 500
+    assert {:ok, "replacement"} = FerricStore.get(key)
+    assert Router.compound_count(ctx, key, Ferricstore.Store.CompoundKey.stream_prefix(key)) == 0
+  end
+
+  test "XREAD remains wakeable across FLUSHDB and immediate recreation" do
+    key = "native:blocking:stream-flush:#{System.unique_integer([:positive])}"
+    ctx = FerricStore.Instance.get(:default)
+    assert {:ok, old_id} = FerricStore.xadd(key, ["field", "old"])
+
+    assert {:ok, prepared} =
+             Session.prepare_command(%{
+               "command" => "XREAD",
+               "args" => ["BLOCK", "0", "STREAMS", key, old_id]
+             })
+
+    state = %{
+      instance_ctx: ctx,
+      acl_cache: :full_access,
+      require_auth: false,
+      authenticated: true
+    }
+
+    meta = %{request_id: make_ref()}
+    assert {:ok, worker, monitor_ref} = Blocking.start_prepared(prepared, state, meta)
+
+    on_exit(fn ->
+      if Process.alive?(worker), do: Process.exit(worker, :kill)
+      FerricStore.del(key)
+    end)
+
+    assert wait_until(fn ->
+             Ferricstore.Commands.Stream.stream_waiter_count(key, ctx) == 1
+           end) == :ok
+
+    assert :ok = FerricStore.flushdb()
+    assert {:ok, new_id} = FerricStore.xadd(key, ["field", "new"])
+
+    assert_receive {:native_blocking_response, ^meta, ^worker, :ok, result}, 1_000
+    assert new_id in List.flatten(result)
     assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}, 500
   end
 

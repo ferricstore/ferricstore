@@ -2,12 +2,12 @@ defmodule Ferricstore.Stream.LocalState do
   @moduledoc false
 
   alias Ferricstore.Commands.Stream.CacheKey
+  alias Ferricstore.Commands.Stream.Waiters
 
   @tables [
     Ferricstore.Stream.Meta,
     Ferricstore.Stream.Groups,
-    Ferricstore.Stream.Index,
-    :ferricstore_stream_waiters
+    Ferricstore.Stream.Index
   ]
 
   @spec clear() :: :ok
@@ -23,6 +23,7 @@ defmodule Ferricstore.Stream.LocalState do
       end
     end)
 
+    Waiters.notify_scope(store)
     :ok
   end
 
@@ -39,10 +40,6 @@ defmodule Ferricstore.Stream.LocalState do
   defp clear_table(Ferricstore.Stream.Index = table, {:ok, scope}) do
     delete_scoped(table, {{{:ready, {:"$1", :_}}, :_}, scope})
     delete_scoped(table, {{{{:"$1", :_}, :_, :_}, :_, :_}, scope})
-  end
-
-  defp clear_table(:ferricstore_stream_waiters = table, {:ok, scope}) do
-    delete_scoped(table, {{{:"$1", :_}, :_, :_, :_}, scope})
   end
 
   defp delete_scoped(table, {head, scope}) do

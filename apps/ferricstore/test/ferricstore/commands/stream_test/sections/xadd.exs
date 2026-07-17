@@ -29,6 +29,51 @@ defmodule Ferricstore.Commands.StreamTest.Sections.Xadd do
           assert [] == store.compound_scan.(key, "X:" <> key <> <<0>>)
         end
 
+        test "SET notifies stream waiters only after the replacement is visible" do
+          base = MockStore.make()
+          key = ustream()
+          parent = self()
+
+          assert "1-0" = Stream.handle("XADD", [key, "1-0", "field", "old"], base)
+          assert :ok = Stream.register_stream_waiter(key, self(), "1-0", base)
+
+          store =
+            Map.put(base, :put, fn ^key, value, expire_at_ms ->
+              send(parent, {:replacement_put_waiting, self()})
+
+              receive do
+                :continue_replacement_put -> base.put.(key, value, expire_at_ms)
+              end
+            end)
+
+          replacement = Task.async(fn -> Strings.handle("SET", [key, "string"], store) end)
+          assert_receive {:replacement_put_waiting, put_pid}
+          refute_receive {:stream_waiter_notify, ^key}
+
+          send(put_pid, :continue_replacement_put)
+          assert :ok = Task.await(replacement)
+          assert_receive {:stream_waiter_notify, ^key}
+          assert "string" = base.get.(key)
+        end
+
+        test "failed SET restores the stream and keeps its waiter registered" do
+          base = MockStore.make()
+          key = ustream()
+
+          assert "1-0" = Stream.handle("XADD", [key, "1-0", "field", "old"], base)
+          assert :ok = Stream.register_stream_waiter(key, self(), "1-0", base)
+
+          store =
+            Map.put(base, :put, fn ^key, "string", 0 ->
+              {:error, :disk_full}
+            end)
+
+          assert {:error, :disk_full} = Strings.handle("SET", [key, "string"], store)
+          refute_receive {:stream_waiter_notify, ^key}
+          assert 1 = Stream.stream_waiter_count(key, base)
+          assert [["1-0", "field", "old"]] = Stream.handle("XRANGE", [key, "-", "+"], base)
+        end
+
         test "XADD with multiple field-value pairs" do
           store = MockStore.make()
           key = ustream()

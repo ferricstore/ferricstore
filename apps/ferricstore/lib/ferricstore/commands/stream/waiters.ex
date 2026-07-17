@@ -156,27 +156,54 @@ defmodule Ferricstore.Commands.Stream.Waiters do
 
       _ref ->
         cache_key = CacheKey.build(store, stream_key)
-        entries = :ets.lookup(@stream_waiters_table, cache_key)
-
-        Enum.each(entries, fn {_cache_key, pid, _last_id, _reg_at} ->
-          send(pid, {:stream_waiter_notify, stream_key})
-        end)
-
-        :ets.match_delete(@stream_waiters_table, {cache_key, :_, :_, :_})
+        notify_cache_key(cache_key, stream_key)
         :ok
     end
   end
 
-  @spec clear(binary(), term()) :: :ok
-  def clear(stream_key, store) do
-    if :ets.whereis(@stream_waiters_table) != :undefined do
-      :ets.match_delete(
-        @stream_waiters_table,
-        {CacheKey.build(store, stream_key), :_, :_, :_}
-      )
+  @spec notify_scope(term()) :: :ok
+  def notify_scope(store) do
+    case :ets.whereis(@stream_waiters_table) do
+      :undefined ->
+        :ok
+
+      _ref ->
+        scope = CacheKey.scope(store)
+        :ets.safe_fixtable(@stream_waiters_table, true)
+
+        try do
+          notify_scope_keys(:ets.first(@stream_waiters_table), scope)
+        after
+          :ets.safe_fixtable(@stream_waiters_table, false)
+        end
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp notify_scope_keys(:"$end_of_table", _scope), do: :ok
+
+  defp notify_scope_keys(cache_key, scope) do
+    next_key = :ets.next(@stream_waiters_table, cache_key)
+
+    if cache_key_in_scope?(cache_key, scope) do
+      notify_cache_key(cache_key, CacheKey.raw(cache_key))
     end
 
-    :ok
+    notify_scope_keys(next_key, scope)
+  end
+
+  defp cache_key_in_scope?(_cache_key, :unscoped), do: true
+  defp cache_key_in_scope?(cache_key, {:ok, scope}), do: CacheKey.in_scope?(cache_key, scope)
+
+  defp notify_cache_key(cache_key, stream_key) do
+    @stream_waiters_table
+    |> :ets.lookup(cache_key)
+    |> Enum.each(fn {^cache_key, pid, _last_id, _reg_at} ->
+      send(pid, {:stream_waiter_notify, stream_key})
+    end)
+
+    :ets.match_delete(@stream_waiters_table, {cache_key, :_, :_, :_})
   end
 
   defp ensure_table do

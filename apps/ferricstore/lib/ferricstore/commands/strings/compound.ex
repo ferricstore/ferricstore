@@ -24,8 +24,18 @@ defmodule Ferricstore.Commands.Strings.Compound do
 
   @spec replace_string_key(binary(), binary(), non_neg_integer(), map()) :: :ok | {:error, term()}
   def replace_string_key(key, value, expire_at_ms, store) do
-    with :ok <- clear_data_structure(key, store) do
-      Ops.put(store, key, value, expire_at_ms)
+    case clear_data_structure_with_type(key, store) do
+      {:ok, replaced_type, backup} ->
+        case Ops.put(store, key, value, expire_at_ms) do
+          :ok ->
+            cleanup_replaced_stream(key, replaced_type, store)
+
+          {:error, _reason} = error ->
+            restore_compound_clear_backup(key, backup, store, error)
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -57,6 +67,12 @@ defmodule Ferricstore.Commands.Strings.Compound do
 
   @spec clear_data_structure(binary(), map()) :: :ok | {:error, term()}
   def clear_data_structure(key, store) do
+    with {:ok, replaced_type, _backup} <- clear_data_structure_with_type(key, store) do
+      cleanup_replaced_stream(key, replaced_type, store)
+    end
+  end
+
+  defp clear_data_structure_with_type(key, store) do
     if Ops.has_compound?(store) do
       type_key = CompoundKey.type_key(key)
 
@@ -65,13 +81,13 @@ defmodule Ferricstore.Commands.Strings.Compound do
           ReadResult.command_error(failure)
 
         nil ->
-          :ok
+          {:ok, nil, :unsupported}
 
         type ->
           case compound_clear_backup(key, type, store) do
             {:ok, backup} ->
               case delete_compound_data_for_replacement(key, type, type_key, store) do
-                :ok -> :ok
+                :ok -> {:ok, type, backup}
                 {:error, _} = error -> restore_compound_clear_backup(key, backup, store, error)
               end
 
@@ -80,7 +96,7 @@ defmodule Ferricstore.Commands.Strings.Compound do
           end
       end
     else
-      :ok
+      {:ok, nil, :unsupported}
     end
   end
 
@@ -90,10 +106,14 @@ defmodule Ferricstore.Commands.Strings.Compound do
   defp delete_compound_data_for_replacement(key, type, type_key, store) do
     with :ok <- clear_compound_prefix(key, type, store),
          :ok <- Ops.compound_delete(store, key, type_key) do
-      if type == "stream", do: Delete.cleanup_stream_metadata(key, store)
       :ok
     end
   end
+
+  defp cleanup_replaced_stream(key, "stream", store),
+    do: Delete.cleanup_stream_metadata(key, store)
+
+  defp cleanup_replaced_stream(_key, _type, _store), do: :ok
 
   defp clear_compound_prefix(key, "hash", store),
     do: Ops.compound_delete_prefix(store, key, CompoundKey.hash_prefix(key))

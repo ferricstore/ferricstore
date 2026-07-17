@@ -52,6 +52,7 @@ defmodule Ferricstore.Commands.StreamInstanceIsolationTest do
     assert :ok = Stream.clear_local_state(store_a)
     assert 0 = Stream.stream_waiter_count(key, store_a)
     assert 1 = Stream.stream_waiter_count(key, store_b)
+    assert_receive {:stream_waiter_notify, ^key}
 
     assert :ok = Stream.notify_stream_waiters(key, store_b)
     assert_receive {:stream_waiter_notify, ^key}

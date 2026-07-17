@@ -278,7 +278,10 @@ defmodule FerricstoreServer.Native.Blocking do
                 StreamCmd.register_stream_waiter(key, self(), id, store)
               end)
 
-              wait_stream_loop(deadline, stream_ids, store, read_fun)
+              case read_fun.() do
+                nil -> wait_stream_loop(deadline, stream_ids, store, read_fun)
+                other -> native_result(other)
+              end
 
             other ->
               native_result(other)

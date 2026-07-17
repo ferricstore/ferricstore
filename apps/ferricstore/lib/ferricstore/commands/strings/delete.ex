@@ -13,7 +13,7 @@ defmodule Ferricstore.Commands.Strings.Delete do
 
   def cleanup_stream_metadata(key, store) do
     Meta.cleanup_local(key, store)
-    Waiters.clear(key, store)
+    Waiters.notify(key, store)
   end
 
   def do_del_key(key, store) do
