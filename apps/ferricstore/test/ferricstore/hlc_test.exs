@@ -78,6 +78,32 @@ defmodule Ferricstore.HLCTest do
       assert physical >= wall_before
       assert physical <= wall_after + 1
     end
+
+    test "saturates instead of wrapping past the maximum packed timestamp" do
+      ref = :persistent_term.get(:ferricstore_hlc_ref)
+      max_physical = Bitwise.bsl(1, 48) - 1
+      max_logical = Bitwise.bsl(1, 16) - 1
+      max_packed = Bitwise.bsl(1, 64) - 1
+      :atomics.put(ref, 1, max_packed)
+
+      assert HLC.now() == {max_physical, max_logical}
+      assert :atomics.get(ref, 1) == max_packed
+    end
+
+    test "concurrent near-limit calls cannot race through the saturation point" do
+      ref = :persistent_term.get(:ferricstore_hlc_ref)
+      max_timestamp = {Bitwise.bsl(1, 48) - 1, Bitwise.bsl(1, 16) - 1}
+      max_packed = Bitwise.bsl(1, 64) - 1
+      :atomics.put(ref, 1, max_packed - 1)
+
+      results =
+        1..50
+        |> Enum.map(fn _ -> Task.async(&HLC.now/0) end)
+        |> Task.await_many()
+
+      assert Enum.all?(results, &(&1 == max_timestamp))
+      assert :atomics.get(ref, 1) == max_packed
+    end
   end
 
   describe "supervised restart" do

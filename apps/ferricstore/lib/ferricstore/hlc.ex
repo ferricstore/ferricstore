@@ -188,9 +188,9 @@ defmodule Ferricstore.HLC do
   counter are packed into one 64-bit integer, so updates are truly atomic
   with no torn-read races.
 
-  On the common path (same millisecond), uses `add_get(ref, 1, 1)` which
-  atomically increments the logical counter with zero contention. CAS is
-  only used at millisecond boundaries.
+  The packed timestamp is advanced with compare-and-swap. This prevents a
+  concurrent remote merge at the 64-bit limit from racing a local increment
+  through unsigned wraparound.
 
   Falls back to `{System.os_time(:millisecond), 0}` when the HLC GenServer
   has not been started.
@@ -407,31 +407,21 @@ defmodule Ferricstore.HLC do
 
   # Lock-free HLC now() using a single packed 64-bit atomic.
   #
-  # Common path (same millisecond): add_get(ref, 1, 1) — atomically
-  # increments the logical counter with zero contention.
-  #
-  # Millisecond boundary: CAS to jump the packed value forward.
-  # If CAS fails, another process already advanced — just add_get.
-  #
   # Logical overflow (>65535 per ms): spills into physical bits,
   # effectively advancing the clock by 1ms. This is correct behavior.
   defp hlc_now_packed(ref) do
-    wall_packed = pack(System.os_time(:millisecond), 0)
     current = :atomics.get(ref, @slot)
 
-    if wall_packed > current do
-      # Wall clock is ahead — try to jump forward via CAS.
-      case :atomics.compare_exchange(ref, @slot, current, wall_packed) do
-        :ok ->
-          unpack(wall_packed)
-
-        _actual ->
-          # Another process already advanced. Increment by 1.
-          unpack(:atomics.add_get(ref, @slot, 1))
-      end
+    if current == @max_packed do
+      unpack(current)
     else
-      # Same or earlier wall clock — just increment logical by 1.
-      unpack(:atomics.add_get(ref, @slot, 1))
+      wall_packed = pack(System.os_time(:millisecond), 0)
+      target = max(wall_packed, current + 1)
+
+      case :atomics.compare_exchange(ref, @slot, current, target) do
+        :ok -> unpack(target)
+        _actual -> hlc_now_packed(ref)
+      end
     end
   end
 
