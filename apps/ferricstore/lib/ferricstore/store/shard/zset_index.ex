@@ -422,16 +422,33 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
 
   @spec clear_key(:ets.tid(), :ets.tid(), binary()) :: :ok
   def clear_key(index_table, lookup_table, redis_key) do
-    delete_index_entries(index_table, :ets.next(index_table, first_before(redis_key)), redis_key)
-    :ets.match_delete(lookup_table, {{redis_key, :_}, :_})
+    expected_count = count_all(lookup_table, redis_key)
+
+    deleted_count =
+      delete_index_entries(
+        index_table,
+        lookup_table,
+        :ets.next(index_table, first_before(redis_key)),
+        redis_key,
+        0
+      )
+
+    if deleted_count != expected_count do
+      :ets.match_delete(lookup_table, {{redis_key, :_}, :_})
+    end
+
     :ets.delete(lookup_table, {:ready, redis_key})
     :ets.delete(lookup_table, {:count, redis_key})
     :ok
   end
 
   @doc false
-  @spec reconcile_exact_delete(map(), binary()) :: :ok
-  def reconcile_exact_delete(state, <<"Z:", _rest::binary>> = compound_key) do
+  @spec reconcile_exact_delete(map(), tuple()) :: :ok
+  def reconcile_exact_delete(
+        state,
+        {<<"Z:", _rest::binary>> = compound_key, _value, _expire_at_ms, _lfu, _file_id, _offset,
+         _value_size}
+      ) do
     case state_tables(state) do
       {index_table, lookup_table} ->
         redis_key = CompoundKey.extract_redis_key(compound_key)
@@ -460,7 +477,29 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     ArgumentError -> :ok
   end
 
-  def reconcile_exact_delete(_state, _key), do: :ok
+  def reconcile_exact_delete(
+        state,
+        {<<"T:", _rest::binary>> = type_key, deleted_type, _expire_at_ms, _lfu, _file_id, _offset,
+         _value_size}
+      ) do
+    case state_tables(state) do
+      {index_table, lookup_table} ->
+        redis_key = CompoundKey.extract_redis_key(type_key)
+
+        if deleted_type == "zset" or ready_key?(lookup_table, redis_key) do
+          clear_key(index_table, lookup_table, redis_key)
+        end
+
+        :ok
+
+      :unavailable ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  def reconcile_exact_delete(_state, _entry), do: :ok
 
   @spec rebuild_key(:ets.tid(), :ets.tid(), binary(), [{binary(), score_input()}]) ::
           :ok | {:error, {:invalid_score, binary(), term()}}
@@ -546,18 +585,33 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     end
   end
 
-  defp delete_index_entries(_table, :"$end_of_table", _redis_key), do: :ok
+  defp delete_index_entries(
+         _index_table,
+         _lookup_table,
+         :"$end_of_table",
+         _redis_key,
+         deleted_count
+       ),
+       do: deleted_count
 
-  defp delete_index_entries(table, key, redis_key) do
-    next = :ets.next(table, key)
+  defp delete_index_entries(index_table, lookup_table, key, redis_key, deleted_count) do
+    next = :ets.next(index_table, key)
 
     case key do
-      {^redis_key, @index_tag, _score, _member} ->
-        :ets.delete(table, key)
-        delete_index_entries(table, next, redis_key)
+      {^redis_key, @index_tag, _score, member} ->
+        :ets.delete(index_table, key)
+        :ets.delete(lookup_table, {redis_key, member})
+
+        delete_index_entries(
+          index_table,
+          lookup_table,
+          next,
+          redis_key,
+          deleted_count + 1
+        )
 
       _ ->
-        :ok
+        deleted_count
     end
   end
 

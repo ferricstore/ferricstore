@@ -103,10 +103,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
              key
            )
            when index != nil and lookup != nil do
+        operation = zset_index_delete_op(index, lookup, redis_key, key)
+
         if standalone_staged_apply?() do
-          queue_pending_zset_index_op({:delete, index, lookup, redis_key, key})
+          queue_pending_zset_index_op(operation)
         else
-          apply_zset_index_delete(index, lookup, redis_key, key)
+          apply_pending_zset_index_op(operation)
         end
 
         :ok
@@ -132,10 +134,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
              key
            )
            when index != nil and lookup != nil do
-        queue_pending_zset_index_op({:delete, index, lookup, redis_key, key})
+        queue_pending_zset_index_op(zset_index_delete_op(index, lookup, redis_key, key))
       end
 
       defp queue_zset_index_delete_after_flush(_state, _redis_key, _key), do: :ok
+
+      defp zset_index_delete_op(index, lookup, redis_key, key) do
+        if key == CompoundKey.type_key(redis_key) do
+          {:clear, index, lookup, redis_key}
+        else
+          {:delete, index, lookup, redis_key, key}
+        end
+      end
 
       defp queue_compound_indexes_put_after_flush(state, redis_key, compound_key, value) do
         _ = queue_compound_member_index_op(state, {:put, compound_key})

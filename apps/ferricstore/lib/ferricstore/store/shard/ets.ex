@@ -517,7 +517,7 @@ defmodule Ferricstore.Store.Shard.ETS do
       key = elem(entry, 0)
       CompoundMemberIndex.delete(compound_member_index(state), key)
       :ok = project_logical_key_delete(state, key)
-      :ok = ZSetIndex.reconcile_exact_delete(state, key)
+      :ok = ZSetIndex.reconcile_exact_delete(state, entry)
       restore_current_derived_indexes(state, key)
       true
     else

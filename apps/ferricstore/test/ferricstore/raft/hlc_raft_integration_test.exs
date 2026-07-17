@@ -758,6 +758,51 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       assert :ets.lookup(ets, key) == [entry]
     end
 
+    test "type-marker expiry invalidates a ready zset index before members are swept", %{
+      state: state,
+      ets: ets
+    } do
+      suffix = System.unique_integer([:positive])
+      index = :"raft_type_expiry_zset_index_#{suffix}"
+      lookup = :"raft_type_expiry_zset_lookup_#{suffix}"
+      :ets.new(index, [:ordered_set, :public, :named_table])
+      :ets.new(lookup, [:set, :public, :named_table])
+
+      redis_key = "partially-swept-zset"
+      type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+      member_key = Ferricstore.Store.CompoundKey.zset_member(redis_key, "old")
+      type_entry = {type_key, "zset", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 4}
+      member_entry = {member_key, "1", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 1}
+
+      state = %{
+        state
+        | zset_score_index_name: index,
+          zset_score_lookup_name: lookup
+      }
+
+      try do
+        :ets.insert(ets, [type_entry, member_entry])
+        :ok = Ferricstore.Store.Shard.ZSetIndex.mark_ready_empty(index, lookup, redis_key)
+        :ok = Ferricstore.Store.Shard.ZSetIndex.put_member(index, lookup, redis_key, "old", "1")
+
+        wrapped =
+          {{:expire_if_batch, [{type_key, 31_000}]}, %{hlc_ts: {61_000, 0}, wall_time_ms: 61_000}}
+
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert result == [true]
+        assert :ets.lookup(ets, type_key) == []
+        assert :ets.lookup(ets, member_key) == [member_entry]
+        refute Ferricstore.Store.Shard.ZSetIndex.ready?(lookup, redis_key)
+
+        assert Ferricstore.Store.Shard.ZSetIndex.rank_range(index, redis_key, 0, 10, false) ==
+                 []
+      after
+        :ets.delete(lookup)
+        :ets.delete(index)
+      end
+    end
+
     test "WATCH token creation rejects drift-ambiguous expiry", %{
       state: state,
       ets: ets

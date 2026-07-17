@@ -291,6 +291,36 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     end
   end
 
+  test "exact zset type-marker deletion invalidates all indexed members", %{
+    index: index,
+    lookup: lookup
+  } do
+    keydir = :ets.new(:zset_index_type_expiry, [:set, :public])
+    redis_key = "zs"
+    type_key = CompoundKey.type_key(redis_key)
+    expired_type = {type_key, "zset", 1, 0, 0, 0, 4}
+
+    state = %{
+      keydir: keydir,
+      zset_score_index: index,
+      zset_score_lookup: lookup
+    }
+
+    try do
+      true = :ets.insert(keydir, expired_type)
+      :ok = ZSetIndex.mark_ready_empty(index, lookup, redis_key)
+      :ok = ZSetIndex.put_member(index, lookup, redis_key, "old-a", "1")
+      :ok = ZSetIndex.put_member(index, lookup, redis_key, "old-b", "2")
+
+      assert ShardETS.delete_exact_entry(state, expired_type)
+      refute ZSetIndex.ready?(lookup, redis_key)
+      assert [] == ZSetIndex.rank_range(index, redis_key, 0, 10, false)
+      assert 0 == ZSetIndex.count(index, lookup, redis_key, :neg_inf, :inf)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   defp insert_members(index, lookup, redis_key, members) do
     Enum.each(members, fn {member, score} ->
       ZSetIndex.put_member(index, lookup, redis_key, member, score)
