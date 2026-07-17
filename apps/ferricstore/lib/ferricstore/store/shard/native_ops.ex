@@ -145,6 +145,9 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       {:missing, state} ->
         {:reply, nil, state}
 
+      {{:error, {:storage_read_failed, _reason}} = failure, state} ->
+        {:reply, failure, state}
+
       {:error, state} ->
         {:reply, {:error, "ERR cold read failed"}, state}
     end
@@ -183,6 +186,9 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
       {{:hit, _other, _exp}, state} ->
         {:reply, {:error, "DISTLOCK lock is held by another owner"}, state}
+
+      {{:error, {:storage_read_failed, _reason}} = failure, state} ->
+        {:reply, failure, state}
 
       {:error, state} ->
         {:reply, {:error, "ERR cold read failed"}, state}
@@ -240,6 +246,9 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       {{:hit, _other, _exp}, state} ->
         {:reply, {:error, "DISTLOCK caller is not the lock owner"}, state}
 
+      {{:error, {:storage_read_failed, _reason}} = failure, state} ->
+        {:reply, failure, state}
+
       {:error, state} ->
         {:reply, {:error, "ERR cold read failed"}, state}
 
@@ -281,6 +290,9 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
       {{:hit, _other, _exp}, state} ->
         {:reply, {:error, "DISTLOCK caller is not the lock owner"}, state}
+
+      {{:error, {:storage_read_failed, _reason}} = failure, state} ->
+        {:reply, failure, state}
 
       {:error, state} ->
         {:reply, {:error, "ERR cold read failed"}, state}

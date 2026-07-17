@@ -95,6 +95,31 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
     end
   end
 
+  test "direct atomic handlers return storage read failures without mutation" do
+    keydir = new_keydir("atomic_read_failure")
+    state = direct_state(keydir)
+    key = "unsafe-expiry"
+    put_persisted(state, key, "owner", 31_000)
+    failure = {:error, {:storage_read_failed, :hlc_drift_exceeded}}
+
+    handlers = [
+      fn -> NativeOps.handle_cas(key, "owner", "new", nil, state) end,
+      fn -> NativeOps.handle_lock(key, "owner", 120_000, state) end,
+      fn -> NativeOps.handle_unlock(key, "owner", state) end,
+      fn -> NativeOps.handle_extend(key, "owner", 120_000, state) end
+    ]
+
+    try do
+      Ferricstore.CommandTime.with_expiry_context(61_000, 1_000, fn ->
+        Enum.each(handlers, fn handler ->
+          assert {:reply, ^failure, ^state} = handler.()
+        end)
+      end)
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   test "direct native handlers preserve Router-provided absolute expiry deadlines" do
     keydir = new_keydir("absolute_expiry")
     state = %{direct_state(keydir) | flush_in_flight: :in_flight}
