@@ -1,7 +1,8 @@
 defmodule FerricstoreServer.Native.SessionSubscriptionBudgetTest do
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Native.ResourceBudget
+  alias Ferricstore.PubSub
+  alias FerricstoreServer.Native.{OutboundBudget, ResourceBudget}
   alias FerricstoreServer.Native.Session
 
   @tag :native_subscription_budget
@@ -41,6 +42,48 @@ defmodule FerricstoreServer.Native.SessionSubscriptionBudgetTest do
 
     Session.clear(state)
     assert ResourceBudget.usage(budget).subscription_bytes == 0
+  end
+
+  @tag :native_subscription_budget
+  test "subscriptions reserve outbound bytes before pubsub mailbox delivery" do
+    budget = :"native_subscription_delivery_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {ResourceBudget,
+       name: budget,
+       limits: %{
+         executions: 1,
+         lanes: 1,
+         blocking_requests: 1,
+         chunk_streams: 1,
+         chunk_bytes: 1,
+         inbound_bytes: 1,
+         subscription_bytes: 1_000,
+         session_bytes: 1,
+         outbound_bytes: 1_000
+       }}
+    )
+
+    counter = OutboundBudget.new_counter()
+
+    state =
+      budget
+      |> session_state(1_000)
+      |> Map.merge(%{outbound_counter: counter, max_outbound_bytes: 1_000})
+
+    assert {:ok, _ack, subscribed} =
+             Session.execute(%{"command" => "SUBSCRIBE", "args" => ["guarded-channel"]}, state)
+
+    assert PubSub.publish("guarded-channel", "payload") == 1
+
+    assert_receive {:pubsub_message, "guarded-channel", "payload", %OutboundBudget{} = lease}
+    assert OutboundBudget.usage(counter) > 0
+    assert ResourceBudget.usage(budget).outbound_bytes > 0
+
+    assert :ok = OutboundBudget.release(lease)
+    Session.clear(subscribed)
+    assert OutboundBudget.usage(counter) == 0
+    assert ResourceBudget.usage(budget).outbound_bytes == 0
   end
 
   defp session_state(budget, max_subscription_bytes) do

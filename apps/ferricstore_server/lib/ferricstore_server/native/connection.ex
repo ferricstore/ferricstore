@@ -21,6 +21,7 @@ defmodule FerricstoreServer.Native.Connection do
     Codec,
     Commands,
     Lane,
+    OutboundBudget,
     ResourceBudget,
     Session
   }
@@ -65,6 +66,8 @@ defmodule FerricstoreServer.Native.Connection do
     :max_pending_chunks,
     :max_pending_chunk_bytes,
     :max_response_bytes,
+    :max_outbound_bytes,
+    :outbound_counter,
     :response_coalesce_max,
     :response_coalesce_bytes,
     :command_state,
@@ -182,6 +185,27 @@ defmodule FerricstoreServer.Native.Connection do
         max_frame_bytes
       )
 
+    max_response_bytes =
+      positive_timeout!(
+        Application.get_env(
+          :ferricstore,
+          :native_max_response_bytes,
+          64 * 1024 * 1024
+        ),
+        :native_max_response_bytes
+      )
+
+    max_outbound_bytes =
+      positive_timeout!(
+        Map.get(opts, :max_outbound_bytes) ||
+          Application.get_env(
+            :ferricstore,
+            :native_max_outbound_bytes_per_connection,
+            max(max_response_bytes * 2, 128 * 1024 * 1024)
+          ),
+        :native_max_outbound_bytes_per_connection
+      )
+
     :ok = transport.setopts(socket, active: :once)
 
     peer =
@@ -264,15 +288,9 @@ defmodule FerricstoreServer.Native.Connection do
                 :native_max_pending_chunk_bytes,
                 64 * 1024 * 1024
               ),
-            max_response_bytes:
-              positive_timeout!(
-                Application.get_env(
-                  :ferricstore,
-                  :native_max_response_bytes,
-                  64 * 1024 * 1024
-                ),
-                :native_max_response_bytes
-              ),
+            max_response_bytes: max_response_bytes,
+            max_outbound_bytes: max_outbound_bytes,
+            outbound_counter: OutboundBudget.new_counter(),
             response_coalesce_max:
               max(1, Application.get_env(:ferricstore, :native_response_coalesce_max, 64)),
             response_coalesce_bytes:
@@ -362,6 +380,13 @@ defmodule FerricstoreServer.Native.Connection do
         maybe_send_event(state, "FLOW_WAKE", Commands.flow_wake_event_payload(state))
         loop(state)
 
+      {:pubsub_message, channel, message, %OutboundBudget{} = lease} ->
+        send_guarded_pubsub_event(
+          state,
+          lease,
+          Session.pubsub_payload(:message, channel, nil, message)
+        )
+
       {:pubsub_message, channel, message} ->
         native_send(
           state,
@@ -378,6 +403,13 @@ defmodule FerricstoreServer.Native.Connection do
         )
 
         loop(state)
+
+      {:pubsub_pmessage, pattern, channel, message, %OutboundBudget{} = lease} ->
+        send_guarded_pubsub_event(
+          state,
+          lease,
+          Session.pubsub_payload(:pmessage, channel, pattern, message)
+        )
 
       {:pubsub_pmessage, pattern, channel, message} ->
         native_send(
@@ -440,11 +472,31 @@ defmodule FerricstoreServer.Native.Connection do
       {:native_lane_response, lane_id, iodata} ->
         loop(send_lane_responses(state, lane_id, iodata))
 
+      {:native_lane_response_budgeted, lane_id, iodata, request_bytes, lease} ->
+        loop(send_lane_response_budgeted(state, lane_id, iodata, request_bytes, lease))
+
       {:native_lane_responses, lane_id, iodata_list, done_count, request_bytes} ->
         loop(send_lane_responses(state, lane_id, iodata_list, done_count, request_bytes))
 
       {:native_lane_responses, lane_id, iodata_list, done_count} ->
         loop(send_lane_responses(state, lane_id, iodata_list, done_count))
+
+      {:native_lane_responses_budgeted, lane_id, iodata_list, done_count, request_bytes, lease} ->
+        loop(
+          send_lane_responses_budgeted(
+            state,
+            lane_id,
+            iodata_list,
+            done_count,
+            request_bytes,
+            lease
+          )
+        )
+
+      {:native_lane_outbound_overflow, lane_id, done_count, request_bytes} ->
+        state = finish_inflight(state, lane_id, done_count, request_bytes)
+        cleanup_connection(state)
+        transport.close(socket)
 
       {:native_lane_done, lane_id, request_bytes} ->
         loop(finish_inflight(state, lane_id, 1, request_bytes))
@@ -1450,6 +1502,8 @@ defmodule FerricstoreServer.Native.Connection do
       max_frame_bytes: state.max_frame_bytes,
       response_chunk_bytes: state.response_chunk_bytes,
       max_response_bytes: state.max_response_bytes,
+      max_outbound_bytes: state.max_outbound_bytes,
+      outbound_counter: state.outbound_counter,
       resource_budget: state.resource_budget,
       close_after_reply: false
     }
@@ -1557,40 +1611,130 @@ defmodule FerricstoreServer.Native.Connection do
     :ok
   end
 
+  defp send_guarded_pubsub_event(state, lease, pubsub_payload) do
+    event_payload = %{
+      "event" => "PUBSUB_MESSAGE",
+      "payload" => pubsub_payload,
+      "at_ms" => System.system_time(:millisecond)
+    }
+
+    case safe_encode_guarded_event(state, event_payload) do
+      {:ok, iodata} ->
+        case OutboundBudget.ensure_iodata(lease, iodata) do
+          {:ok, lease} ->
+            result =
+              try do
+                native_send(state, iodata, :event)
+              after
+                OutboundBudget.release(lease)
+              end
+
+            case result do
+              :ok -> loop(state)
+              {:error, _reason} -> close_for_outbound_failure(state)
+            end
+
+          {:error, _reason} ->
+            OutboundBudget.release(lease)
+            close_for_outbound_failure(state)
+        end
+
+      {:error, _reason} ->
+        OutboundBudget.release(lease)
+        close_for_outbound_failure(state)
+    end
+  end
+
+  defp safe_encode_guarded_event(state, payload) do
+    {:ok, Responses.encode_event(state, Commands.event_opcode(), payload)}
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp close_for_outbound_failure(state) do
+    cleanup_connection(state)
+    state.transport.close(state.socket)
+  end
+
   defp send_lane_responses(state, lane_id, iodata) do
-    send_lane_responses(state, lane_id, [iodata], 1, 0)
+    send_lane_responses(state, lane_id, [iodata], 1, 0, [])
   end
 
   defp send_lane_responses(state, lane_id, iodata_list, done_count) do
-    send_lane_responses(state, lane_id, iodata_list, done_count, 0)
+    send_lane_responses(state, lane_id, iodata_list, done_count, 0, [])
   end
 
   defp send_lane_responses(state, lane_id, iodata_list, done_count, request_bytes) do
+    send_lane_responses(state, lane_id, iodata_list, done_count, request_bytes, [])
+  end
+
+  defp send_lane_response_budgeted(state, lane_id, iodata, request_bytes, lease) do
+    send_lane_responses(state, lane_id, [iodata], 1, request_bytes, [lease])
+  end
+
+  defp send_lane_responses_budgeted(
+         state,
+         lane_id,
+         iodata,
+         done_count,
+         request_bytes,
+         lease
+       ) do
+    send_lane_responses(state, lane_id, iodata, done_count, request_bytes, [lease])
+  end
+
+  defp send_lane_responses(
+         state,
+         lane_id,
+         iodata_list,
+         done_count,
+         request_bytes,
+         leases
+       ) do
     state = finish_inflight(state, lane_id, done_count, request_bytes)
     responses = Enum.reverse(iodata_list)
 
-    {state, responses} =
+    {state, responses, leases} =
       collect_ready_lane_responses(
         state,
         responses,
         done_count,
-        Responses.coalesce_iodata_size(state, responses)
+        Responses.coalesce_iodata_size(state, responses),
+        leases
       )
 
-    native_send(state, Enum.reverse(responses), :response)
+    try do
+      native_send(state, Enum.reverse(responses), :response)
+    after
+      Enum.each(leases, &OutboundBudget.release/1)
+    end
+
     state
   end
 
-  defp collect_ready_lane_responses(state, acc, scanned, bytes) do
+  defp collect_ready_lane_responses(state, acc, scanned, bytes, leases) do
     cond do
       scanned >= state.response_coalesce_max ->
-        {state, acc}
+        {state, acc, leases}
 
       Responses.coalesce_bytes_reached?(state, bytes) ->
-        {state, acc}
+        {state, acc, leases}
 
       true ->
         receive do
+          {:native_lane_response_budgeted, lane_id, iodata, request_bytes, lease} ->
+            state = finish_inflight(state, lane_id, 1, request_bytes)
+
+            collect_ready_lane_responses(
+              state,
+              [iodata | acc],
+              scanned + 1,
+              Responses.coalesce_add_iodata_size(state, bytes, iodata),
+              [lease | leases]
+            )
+
           {:native_lane_response, lane_id, iodata, request_bytes} ->
             state = finish_inflight(state, lane_id, 1, request_bytes)
 
@@ -1598,7 +1742,8 @@ defmodule FerricstoreServer.Native.Connection do
               state,
               [iodata | acc],
               scanned + 1,
-              Responses.coalesce_add_iodata_size(state, bytes, iodata)
+              Responses.coalesce_add_iodata_size(state, bytes, iodata),
+              leases
             )
 
           {:native_lane_response, lane_id, iodata} ->
@@ -1608,7 +1753,20 @@ defmodule FerricstoreServer.Native.Connection do
               state,
               [iodata | acc],
               scanned + 1,
-              Responses.coalesce_add_iodata_size(state, bytes, iodata)
+              Responses.coalesce_add_iodata_size(state, bytes, iodata),
+              leases
+            )
+
+          {:native_lane_responses_budgeted, lane_id, iodata_list, done_count, request_bytes,
+           lease} ->
+            state = finish_inflight(state, lane_id, done_count, request_bytes)
+
+            collect_ready_lane_responses(
+              state,
+              Enum.reverse(iodata_list) ++ acc,
+              scanned + done_count,
+              Responses.coalesce_add_iodata_size(state, bytes, iodata_list),
+              [lease | leases]
             )
 
           {:native_lane_responses, lane_id, iodata_list, done_count, request_bytes} ->
@@ -1618,7 +1776,8 @@ defmodule FerricstoreServer.Native.Connection do
               state,
               Enum.reverse(iodata_list) ++ acc,
               scanned + done_count,
-              Responses.coalesce_add_iodata_size(state, bytes, iodata_list)
+              Responses.coalesce_add_iodata_size(state, bytes, iodata_list),
+              leases
             )
 
           {:native_lane_responses, lane_id, iodata_list, done_count} ->
@@ -1628,26 +1787,27 @@ defmodule FerricstoreServer.Native.Connection do
               state,
               Enum.reverse(iodata_list) ++ acc,
               scanned + done_count,
-              Responses.coalesce_add_iodata_size(state, bytes, iodata_list)
+              Responses.coalesce_add_iodata_size(state, bytes, iodata_list),
+              leases
             )
 
           {:native_lane_done, lane_id, request_bytes} ->
             state = finish_inflight(state, lane_id, 1, request_bytes)
-            collect_ready_lane_responses(state, acc, scanned + 1, bytes)
+            collect_ready_lane_responses(state, acc, scanned + 1, bytes, leases)
 
           {:native_lane_done, lane_id} ->
             state = finish_inflight(state, lane_id)
-            collect_ready_lane_responses(state, acc, scanned + 1, bytes)
+            collect_ready_lane_responses(state, acc, scanned + 1, bytes, leases)
 
           {:native_lane_done_many, lane_id, done_count, request_bytes} ->
             state = finish_inflight(state, lane_id, done_count, request_bytes)
-            collect_ready_lane_responses(state, acc, scanned + done_count, bytes)
+            collect_ready_lane_responses(state, acc, scanned + done_count, bytes, leases)
 
           {:native_lane_done_many, lane_id, done_count} ->
             state = finish_inflight(state, lane_id, done_count)
-            collect_ready_lane_responses(state, acc, scanned + done_count, bytes)
+            collect_ready_lane_responses(state, acc, scanned + done_count, bytes, leases)
         after
-          0 -> {state, acc}
+          0 -> {state, acc, leases}
         end
     end
   end

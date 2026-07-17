@@ -8,7 +8,7 @@ defmodule FerricstoreServer.Native.Session do
   alias Ferricstore.Transaction.Coordinator, as: TxCoordinator
   alias FerricstoreServer.Acl.Protection
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
-  alias FerricstoreServer.Native.ResourceBudget
+  alias FerricstoreServer.Native.{OutboundBudget, ResourceBudget}
 
   @max_subscriptions 100_000
   @max_multi_queue_size 100_000
@@ -524,7 +524,14 @@ defmodule FerricstoreServer.Native.Session do
             detached = Map.new(new_values, &{&1, :binary.copy(&1)})
             detached_values = Map.values(detached)
 
-            case safe_pubsub_update(subscribe_fun, detached_values) do
+            guarded_subscribe_fun = fn values, pid ->
+              case install_pubsub_delivery_guard(reserved_state, pid) do
+                :ok -> subscribe_fun.(values, pid)
+                {:error, _reason} = error -> error
+              end
+            end
+
+            case safe_pubsub_update(guarded_subscribe_fun, detached_values) do
               :ok ->
                 {acks, updated_state} =
                   Enum.map_reduce(values, reserved_state, fn value, acc ->
@@ -662,6 +669,27 @@ defmodule FerricstoreServer.Native.Session do
   catch
     kind, reason -> {:error, {kind, reason}}
   end
+
+  defp install_pubsub_delivery_guard(
+         %{
+           outbound_counter: counter,
+           max_outbound_bytes: max_bytes,
+           resource_budget: resource_budget
+         },
+         pid
+       ) do
+    budget_state = %{
+      outbound_counter: counter,
+      max_outbound_bytes: max_bytes,
+      resource_budget: resource_budget
+    }
+
+    PS.set_delivery_guard(pid, fn bytes ->
+      OutboundBudget.reserve_bytes(budget_state, pid, bytes)
+    end)
+  end
+
+  defp install_pubsub_delivery_guard(_state, _pid), do: :ok
 
   defp subscription_set_bytes(values),
     do: Enum.reduce(values, 0, &(subscription_entry_bytes(&1) + &2))

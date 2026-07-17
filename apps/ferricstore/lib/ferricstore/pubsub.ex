@@ -26,6 +26,9 @@ defmodule Ferricstore.PubSub do
 
     * `:ferricstore_pubsub_monitors` — one monitor row per active subscriber.
 
+    * `:ferricstore_pubsub_delivery_guards` — optional per-subscriber admission
+      callbacks used by network servers before mailbox delivery.
+
   The tables are owned by a `GenServer` (`Ferricstore.PubSub`) so they survive
   the lifetime of the application and are cleaned up on shutdown.
 
@@ -54,6 +57,8 @@ defmodule Ferricstore.PubSub do
   @patterns_table :ferricstore_pubsub_patterns
   @pattern_cache_table :ferricstore_pubsub_pattern_cache
   @monitors_table :ferricstore_pubsub_monitors
+  @delivery_guards_table :ferricstore_pubsub_delivery_guards
+  @delivery_overhead_bytes 128
 
   @type channel :: binary()
   @type pattern :: binary()
@@ -247,8 +252,10 @@ defmodule Ferricstore.PubSub do
         :ets.foldl(
           fn {pattern, pid, matcher}, count ->
             if pattern_matches?(channel, matcher) do
-              send(pid, {:pubsub_pmessage, pattern, channel, message})
-              count + 1
+              case deliver_pattern(pid, pattern, channel, message) do
+                :sent -> count + 1
+                :rejected -> count
+              end
             else
               count
             end
@@ -375,6 +382,19 @@ defmodule Ferricstore.PubSub do
     GenServer.call(__MODULE__, {:cleanup, pid})
   end
 
+  @doc false
+  @spec set_delivery_guard(pid(), (non_neg_integer() -> {:ok, term()} | {:error, term()})) :: :ok
+  def set_delivery_guard(pid, guard)
+      when is_pid(pid) and pid == self() and is_function(guard, 1) do
+    GenServer.call(__MODULE__, {:set_delivery_guard, pid, guard})
+  end
+
+  @doc false
+  @spec clear_delivery_guard(pid()) :: :ok
+  def clear_delivery_guard(pid) when is_pid(pid) and pid == self() do
+    GenServer.call(__MODULE__, {:clear_delivery_guard, pid})
+  end
+
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
@@ -401,6 +421,14 @@ defmodule Ferricstore.PubSub do
     ])
 
     :ets.new(@monitors_table, [:named_table, :set, :protected, read_concurrency: true])
+
+    :ets.new(@delivery_guards_table, [
+      :named_table,
+      :set,
+      :protected,
+      read_concurrency: true
+    ])
+
     {:ok, %{}}
   end
 
@@ -432,6 +460,20 @@ defmodule Ferricstore.PubSub do
   def handle_call({:pattern_unsubscription_changed, patterns, pid}, _from, state) do
     delete_pattern_subscriptions(patterns, pid)
     rebuild_patterns(patterns)
+    demonitor_if_unused(pid)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:set_delivery_guard, pid, guard}, _from, state) do
+    :ets.insert(@delivery_guards_table, {pid, guard})
+    ensure_monitor_local(pid)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:clear_delivery_guard, pid}, _from, state) do
+    :ets.delete(@delivery_guards_table, pid)
     demonitor_if_unused(pid)
     {:reply, :ok, state}
   end
@@ -573,6 +615,8 @@ defmodule Ferricstore.PubSub do
     if subscribed?(pid) do
       :ok
     else
+      :ets.delete(@delivery_guards_table, pid)
+
       case :ets.lookup(@monitors_table, pid) do
         [{^pid, ref}] ->
           Process.demonitor(ref, [:flush])
@@ -592,6 +636,7 @@ defmodule Ferricstore.PubSub do
   defp cleanup_pid(pid) do
     :ets.match_delete(@channels_table, {:_, pid})
     :ets.match_delete(@patterns_table, {:_, pid, :_})
+    :ets.delete(@delivery_guards_table, pid)
   end
 
   defp rebuild_exact_channels([]), do: :ok
@@ -655,11 +700,74 @@ defmodule Ferricstore.PubSub do
   defp unique_channels([], _seen, acc), do: acc
 
   defp publish_exact_pids([pid | rest], channel, message, count) do
-    send(pid, {:pubsub_message, channel, message})
-    publish_exact_pids(rest, channel, message, count + 1)
+    next_count =
+      case deliver_exact(pid, channel, message) do
+        :sent -> count + 1
+        :rejected -> count
+      end
+
+    publish_exact_pids(rest, channel, message, next_count)
   end
 
   defp publish_exact_pids([], _channel, _message, count), do: count
+
+  defp deliver_exact(pid, channel, message) do
+    bytes = byte_size(channel) + byte_size(message) + @delivery_overhead_bytes
+
+    case reserve_delivery(pid, bytes) do
+      {:ok, nil} ->
+        send(pid, {:pubsub_message, channel, message})
+        :sent
+
+      {:ok, lease} ->
+        send(pid, {:pubsub_message, channel, message, lease})
+        :sent
+
+      :rejected ->
+        reject_slow_subscriber(pid)
+    end
+  end
+
+  defp deliver_pattern(pid, pattern, channel, message) do
+    bytes =
+      byte_size(pattern) + byte_size(channel) + byte_size(message) + @delivery_overhead_bytes
+
+    case reserve_delivery(pid, bytes) do
+      {:ok, nil} ->
+        send(pid, {:pubsub_pmessage, pattern, channel, message})
+        :sent
+
+      {:ok, lease} ->
+        send(pid, {:pubsub_pmessage, pattern, channel, message, lease})
+        :sent
+
+      :rejected ->
+        reject_slow_subscriber(pid)
+    end
+  end
+
+  defp reserve_delivery(pid, bytes) do
+    case :ets.lookup(@delivery_guards_table, pid) do
+      [] ->
+        {:ok, nil}
+
+      [{^pid, guard}] ->
+        case guard.(bytes) do
+          {:ok, lease} -> {:ok, lease}
+          {:error, _reason} -> :rejected
+          _invalid -> :rejected
+        end
+    end
+  rescue
+    _error -> :rejected
+  catch
+    _kind, _reason -> :rejected
+  end
+
+  defp reject_slow_subscriber(pid) do
+    Process.exit(pid, {:shutdown, :pubsub_outbound_overflow})
+    :rejected
+  end
 
   defp pattern_matcher(pattern) do
     if byte_size(pattern) > 1024 do

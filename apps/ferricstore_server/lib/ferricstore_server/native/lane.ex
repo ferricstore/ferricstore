@@ -11,7 +11,7 @@ defmodule FerricstoreServer.Native.Lane do
   alias Ferricstore.{LatencyTrace, Stats}
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.{ReadResult, Router}
-  alias FerricstoreServer.Native.{Codec, Commands, ResourceBudget}
+  alias FerricstoreServer.Native.{Codec, Commands, OutboundBudget, ResourceBudget}
 
   @flag_trace 0x01
   @flag_custom_payload 0x02
@@ -130,7 +130,7 @@ defmodule FerricstoreServer.Native.Lane do
         send_lane_done(owner, lane_id, request_bytes)
 
       {:ok, iodata} ->
-        send_lane_response(owner, lane_id, iodata, request_bytes)
+        send_lane_response(owner, lane_id, iodata, request_bytes, command_state)
 
       {:error, reason} ->
         if frame_no_reply?(frame) do
@@ -140,7 +140,8 @@ defmodule FerricstoreServer.Native.Lane do
             owner,
             lane_id,
             execution_budget_error_response(frame, command_state, reason),
-            request_bytes
+            request_bytes,
+            command_state
           )
         end
     end
@@ -178,8 +179,11 @@ defmodule FerricstoreServer.Native.Lane do
       end
 
     case responses do
-      [] -> send_lane_done_many(owner, lane_id, done_count, request_bytes)
-      _ -> send_lane_responses(owner, lane_id, responses, done_count, request_bytes)
+      [] ->
+        send_lane_done_many(owner, lane_id, done_count, request_bytes)
+
+      _ ->
+        send_lane_responses(owner, lane_id, responses, done_count, request_bytes, command_state)
     end
   end
 
@@ -193,17 +197,61 @@ defmodule FerricstoreServer.Native.Lane do
   defp take_frame_accounting({:native_accounted_frame, frame, bytes}), do: {frame, bytes}
   defp take_frame_accounting(frame), do: {frame, 0}
 
-  defp send_lane_response(owner, lane_id, iodata, 0),
+  defp send_lane_response(owner, lane_id, iodata, request_bytes, command_state) do
+    case reserve_outbound(command_state, iodata) do
+      :unbudgeted ->
+        send_lane_response_unbudgeted(owner, lane_id, iodata, request_bytes)
+
+      {:ok, lease} ->
+        send(owner, {:native_lane_response_budgeted, lane_id, iodata, request_bytes, lease})
+
+      {:error, _reason} ->
+        send(owner, {:native_lane_outbound_overflow, lane_id, 1, request_bytes})
+    end
+  end
+
+  defp send_lane_response_unbudgeted(owner, lane_id, iodata, 0),
     do: send(owner, {:native_lane_response, lane_id, iodata})
 
-  defp send_lane_response(owner, lane_id, iodata, request_bytes),
+  defp send_lane_response_unbudgeted(owner, lane_id, iodata, request_bytes),
     do: send(owner, {:native_lane_response, lane_id, iodata, request_bytes})
 
-  defp send_lane_responses(owner, lane_id, responses, done_count, 0),
+  defp send_lane_responses(
+         owner,
+         lane_id,
+         responses,
+         done_count,
+         request_bytes,
+         command_state
+       ) do
+    case reserve_outbound(command_state, responses) do
+      :unbudgeted ->
+        send_lane_responses_unbudgeted(owner, lane_id, responses, done_count, request_bytes)
+
+      {:ok, lease} ->
+        send(
+          owner,
+          {:native_lane_responses_budgeted, lane_id, responses, done_count, request_bytes, lease}
+        )
+
+      {:error, _reason} ->
+        send(owner, {:native_lane_outbound_overflow, lane_id, done_count, request_bytes})
+    end
+  end
+
+  defp send_lane_responses_unbudgeted(owner, lane_id, responses, done_count, 0),
     do: send(owner, {:native_lane_responses, lane_id, responses, done_count})
 
-  defp send_lane_responses(owner, lane_id, responses, done_count, request_bytes),
+  defp send_lane_responses_unbudgeted(owner, lane_id, responses, done_count, request_bytes),
     do: send(owner, {:native_lane_responses, lane_id, responses, done_count, request_bytes})
+
+  defp reserve_outbound(command_state, iodata) do
+    if Map.has_key?(command_state, :outbound_counter) do
+      OutboundBudget.reserve_iodata(command_state, self(), iodata)
+    else
+      :unbudgeted
+    end
+  end
 
   defp send_lane_done(owner, lane_id, 0), do: send(owner, {:native_lane_done, lane_id})
 

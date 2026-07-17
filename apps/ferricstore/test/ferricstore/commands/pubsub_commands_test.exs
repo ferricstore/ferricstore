@@ -29,9 +29,10 @@ defmodule Ferricstore.Commands.PubSubTest do
             :ferricstore_pubsub_patterns,
             :ferricstore_pubsub_channel_cache,
             :ferricstore_pubsub_pattern_cache,
-            :ferricstore_pubsub_monitors
+            :ferricstore_pubsub_monitors,
+            :ferricstore_pubsub_delivery_guards
           ] do
-        :ets.delete_all_objects(table)
+        if :ets.whereis(table) != :undefined, do: :ets.delete_all_objects(table)
       end
 
       state
@@ -84,6 +85,43 @@ defmodule Ferricstore.Commands.PubSubTest do
       PubSub.subscribe("ch", self())
       assert PubSubCmd.handle("PUBLISH", ["ch", "data"]) == 1
       assert_receive {:pubsub_message, "ch", "data"}
+    end
+
+    test "guarded subscribers reserve delivery bytes before mailbox insertion" do
+      test_pid = self()
+
+      assert :ok =
+               PubSub.set_delivery_guard(self(), fn bytes ->
+                 send(test_pid, {:delivery_reserved, bytes})
+                 {:ok, :delivery_lease}
+               end)
+
+      PubSub.subscribe("guarded", self())
+
+      assert PubSubCmd.handle("PUBLISH", ["guarded", "payload"]) == 1
+      assert_receive {:delivery_reserved, bytes}
+      assert bytes >= byte_size("guarded") + byte_size("payload")
+      assert_receive {:pubsub_message, "guarded", "payload", :delivery_lease}
+    end
+
+    test "a delivery guard failure disconnects the slow subscriber without queueing payload" do
+      parent = self()
+
+      subscriber =
+        spawn(fn ->
+          :ok = PubSub.set_delivery_guard(self(), fn _bytes -> {:error, :limit} end)
+          PubSub.subscribe("overloaded", self())
+          send(parent, {:subscriber_ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      monitor = Process.monitor(subscriber)
+      assert_receive {:subscriber_ready, ^subscriber}
+
+      assert PubSubCmd.handle("PUBLISH", ["overloaded", "payload"]) == 0
+
+      assert_receive {:DOWN, ^monitor, :process, ^subscriber,
+                      {:shutdown, :pubsub_outbound_overflow}}
     end
 
     test "to channel with multiple subscribers returns count" do

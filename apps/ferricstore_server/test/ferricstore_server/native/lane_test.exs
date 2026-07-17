@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Native.LaneTest do
   use ExUnit.Case, async: false
   @moduletag :global_state
 
-  alias FerricstoreServer.Native.{Codec, Lane, ResourceBudget}
+  alias FerricstoreServer.Native.{Codec, Lane, OutboundBudget, ResourceBudget}
 
   @op_pipeline 0x000E
   @op_get 0x0101
@@ -169,7 +169,8 @@ defmodule FerricstoreServer.Native.LaneTest do
                chunk_bytes: 0,
                inbound_bytes: 0,
                subscription_bytes: 0,
-               session_bytes: 0
+               session_bytes: 0,
+               outbound_bytes: 0
              }
            end)
 
@@ -230,6 +231,59 @@ defmodule FerricstoreServer.Native.LaneTest do
     refute_receive {:trace, ^pid, :call,
                     {Codec, :encode_command_response_frames,
                      [@op_set, @lane_id, 23, _status, _value, _opts]}}
+  end
+
+  test "lane responses retain exact outbound capacity until the owner releases them" do
+    budget = start_outbound_budget(1_000)
+    counter = OutboundBudget.new_counter()
+
+    command_state =
+      command_state()
+      |> Map.merge(%{
+        resource_budget: budget,
+        outbound_counter: counter,
+        max_outbound_bytes: 1_000
+      })
+
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state)
+    on_exit(fn -> Lane.stop(pid) end)
+
+    Lane.enqueue(pid, set_frame(24, "native:lane:outbound:leased", "value"))
+
+    assert_receive {:native_lane_response_budgeted, @lane_id, response, 0, lease},
+                   @receive_timeout
+
+    response_bytes = IO.iodata_length(response)
+    assert OutboundBudget.usage(counter) == response_bytes
+    assert ResourceBudget.usage(budget).outbound_bytes == response_bytes
+
+    assert :ok = OutboundBudget.release(lease)
+    assert OutboundBudget.usage(counter) == 0
+    assert ResourceBudget.usage(budget).outbound_bytes == 0
+  end
+
+  test "lane response overflow emits a bounded close signal instead of the response" do
+    budget = start_outbound_budget(1_000)
+    counter = OutboundBudget.new_counter()
+
+    command_state =
+      command_state()
+      |> Map.merge(%{
+        resource_budget: budget,
+        outbound_counter: counter,
+        max_outbound_bytes: 16
+      })
+
+    {:ok, pid} = Lane.start_link(self(), @lane_id, command_state)
+    on_exit(fn -> Lane.stop(pid) end)
+
+    Lane.enqueue(pid, set_frame(25, "native:lane:outbound:overflow", "value"))
+
+    assert_receive {:native_lane_outbound_overflow, @lane_id, 1, 0}, @receive_timeout
+    refute_receive {:native_lane_response_budgeted, @lane_id, _response, _bytes, _lease}
+    refute_receive {:native_lane_response, @lane_id, _response}
+    assert OutboundBudget.usage(counter) == 0
+    assert ResourceBudget.usage(budget).outbound_bytes == 0
   end
 
   test "batched GET and SET frames cannot bypass reserved-key authorization" do
@@ -544,6 +598,28 @@ defmodule FerricstoreServer.Native.LaneTest do
       compact_flow_responses: false,
       response_chunk_bytes: 0
     }
+  end
+
+  defp start_outbound_budget(outbound_bytes) do
+    name = :"native_lane_outbound_budget_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {ResourceBudget,
+       name: name,
+       limits: %{
+         executions: 1,
+         lanes: 1,
+         blocking_requests: 1,
+         chunk_streams: 1,
+         chunk_bytes: 1,
+         inbound_bytes: 1,
+         subscription_bytes: 1,
+         session_bytes: 1,
+         outbound_bytes: outbound_bytes
+       }}
+    )
+
+    name
   end
 
   defp install_audited_resource_limits do

@@ -400,6 +400,100 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
            }
   end
 
+  @tag :native_outbound_byte_budget
+  test "lane responses close a connection before crossing its outbound byte ceiling" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
+
+    Application.put_env(:ferricstore, :native_max_outbound_bytes_per_connection, 16)
+
+    on_exit(fn ->
+      restore_env(:native_max_outbound_bytes_per_connection, previous_limit)
+    end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    body = Codec.encode_value(%{"key" => "native:outbound:connection-limit"})
+    assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@get_opcode, 1, 237, body))
+    assert_socket_closed(socket)
+  end
+
+  @tag :native_outbound_byte_budget
+  test "lane responses close when global outbound capacity is exhausted" do
+    global_limit =
+      Application.get_env(
+        :ferricstore,
+        :native_max_global_outbound_bytes,
+        512 * 1024 * 1024
+      )
+
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
+
+    assert {:ok, holder} =
+             ResourceBudget.acquire(ResourceBudget, :outbound_bytes, self(), global_limit)
+
+    on_exit(fn -> ResourceBudget.release(ResourceBudget, holder) end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    body = Codec.encode_value(%{"key" => "native:outbound:global-limit"})
+    assert :ok = :gen_tcp.send(socket, Codec.encode_frame(@get_opcode, 1, 238, body))
+    assert_socket_closed(socket)
+  end
+
+  @tag :native_outbound_byte_budget
+  test "pubsub events release guarded outbound capacity after socket send" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
+
+    Application.put_env(:ferricstore, :native_max_outbound_bytes_per_connection, 1_024 * 1_024)
+
+    on_exit(fn ->
+      restore_env(:native_max_outbound_bytes_per_connection, previous_limit)
+    end)
+
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
+
+    channel = "native:outbound:pubsub:#{System.unique_integer([:positive, :monotonic])}"
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    assert :ok = :gen_tcp.send(socket, command_exec_frame(239, "SUBSCRIBE", [channel]))
+    assert [{239, 0}] = receive_response_statuses(socket, 1)
+
+    assert Ferricstore.PubSub.publish(channel, :binary.copy("p", 256)) == 1
+    assert {:ok, event} = :gen_tcp.recv(socket, 0, @receive_timeout)
+    assert byte_size(event) > 256
+
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).outbound_bytes == 0 end)
+  end
+
+  @tag :native_outbound_byte_budget
+  test "pubsub closes a slow subscriber before queueing an over-limit event" do
+    previous_limit =
+      Application.get_env(:ferricstore, :native_max_outbound_bytes_per_connection)
+
+    Application.put_env(:ferricstore, :native_max_outbound_bytes_per_connection, 200)
+
+    on_exit(fn ->
+      restore_env(:native_max_outbound_bytes_per_connection, previous_limit)
+    end)
+
+    channel =
+      "native:outbound:pubsub-overflow:#{System.unique_integer([:positive, :monotonic])}"
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    assert :ok = :gen_tcp.send(socket, command_exec_frame(240, "SUBSCRIBE", [channel]))
+    assert [{240, 0}] = receive_response_statuses(socket, 1)
+
+    assert Ferricstore.PubSub.publish(channel, :binary.copy("p", 256)) == 0
+    assert_socket_closed(socket)
+  end
+
   test "keeps fragmented multi-megabyte frames chunked until the frame is complete" do
     frame = large_ping_frame(43)
     chunks = binary_chunks(frame, @socket_chunk_bytes)

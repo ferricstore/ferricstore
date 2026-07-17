@@ -496,6 +496,10 @@ if config_env() == :prod do
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_RESPONSE_CHUNK_BYTES", "0")),
     native_max_response_bytes:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_MAX_RESPONSE_BYTES", "67108864")),
+    native_max_outbound_bytes_per_connection:
+      String.to_integer(
+        System.get_env("FERRICSTORE_NATIVE_MAX_OUTBOUND_BYTES_PER_CONNECTION", "134217728")
+      ),
     native_response_coalesce_max:
       String.to_integer(System.get_env("FERRICSTORE_NATIVE_RESPONSE_COALESCE_MAX", "64")),
     native_response_coalesce_bytes:
@@ -539,6 +543,10 @@ if config_env() == :prod do
     native_max_global_session_bytes:
       String.to_integer(
         System.get_env("FERRICSTORE_NATIVE_MAX_GLOBAL_SESSION_BYTES", "268435456")
+      ),
+    native_max_global_outbound_bytes:
+      String.to_integer(
+        System.get_env("FERRICSTORE_NATIVE_MAX_GLOBAL_OUTBOUND_BYTES", "536870912")
       ),
     native_trace_enabled: boolean_env.("FERRICSTORE_NATIVE_TRACE_ENABLED", false),
     native_trusted_request_context_users: native_trusted_request_context_users,
