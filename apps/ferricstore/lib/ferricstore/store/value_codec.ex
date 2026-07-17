@@ -67,12 +67,24 @@ defmodule Ferricstore.Store.ValueCodec do
   def format_float(val) when is_float(val) do
     formatted = :erlang.float_to_binary(val, [:short])
 
-    case :binary.match(formatted, ".") do
+    case :binary.match(formatted, "e") do
+      {exponent_offset, 1} ->
+        mantissa = binary_part(formatted, 0, exponent_offset)
+        exponent = binary_part(formatted, exponent_offset, byte_size(formatted) - exponent_offset)
+        trim_float_mantissa(mantissa) <> exponent
+
       :nomatch ->
-        formatted
+        trim_float_mantissa(formatted)
+    end
+  end
+
+  defp trim_float_mantissa(mantissa) do
+    case :binary.match(mantissa, ".") do
+      :nomatch ->
+        mantissa
 
       _ ->
-        formatted
+        mantissa
         |> String.trim_trailing("0")
         |> String.trim_trailing(".")
     end

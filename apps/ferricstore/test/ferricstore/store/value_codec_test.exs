@@ -23,4 +23,16 @@ defmodule Ferricstore.Store.ValueCodecTest do
       assert is_float(value)
     end
   end
+
+  describe "float formatting" do
+    test "trims only the mantissa in scientific notation" do
+      assert ValueCodec.format_float(1.0e20) == "1e20"
+      assert ValueCodec.format_float(1.23e10) == "1.23e10"
+      assert ValueCodec.format_float(1.0e-10) == "1e-10"
+
+      for value <- [1.0e20, 1.23e10, 1.0e-10] do
+        assert {:ok, ^value} = value |> ValueCodec.format_float() |> ValueCodec.parse_float()
+      end
+    end
+  end
 end
