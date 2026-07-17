@@ -206,16 +206,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
 
       defp queue_zset_index_ready_empty_after_flush(_state, _redis_key), do: :ok
 
-      defp queue_zset_index_new_ready_empty_after_flush(
-             %{zset_score_index_name: index, zset_score_lookup_name: lookup},
-             redis_key
-           )
-           when index != nil and lookup != nil do
-        queue_pending_zset_index_op({:new_ready_empty, index, lookup, redis_key})
-      end
-
-      defp queue_zset_index_new_ready_empty_after_flush(_state, _redis_key), do: :ok
-
       defp queue_zset_index_new_put_after_flush(
              %{zset_score_index_name: index, zset_score_lookup_name: lookup},
              redis_key,
@@ -292,10 +282,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         apply_zset_index_ready_empty(index, lookup, redis_key)
       end
 
-      defp apply_pending_zset_index_op({:new_ready_empty, index, lookup, redis_key}) do
-        apply_zset_index_new_ready_empty(index, lookup, redis_key)
-      end
-
       defp apply_pending_zset_index_op({:new_put, index, lookup, redis_key, member, score}) do
         apply_zset_index_new_put(index, lookup, redis_key, member, score)
       end
@@ -322,15 +308,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
-      defp apply_zset_index_new_ready_empty(index, lookup, redis_key) do
-        if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
-          ZSetIndex.mark_new_ready_empty(index, lookup, redis_key)
-        end
-      end
-
       defp apply_zset_index_new_put(index, lookup, redis_key, member, score) do
         if zset_index_tables?(%{zset_score_index_name: index, zset_score_lookup_name: lookup}) do
-          ZSetIndex.mark_new_ready_empty(index, lookup, redis_key)
+          ZSetIndex.mark_ready_empty(index, lookup, redis_key)
           ZSetIndex.put_new_member(index, lookup, redis_key, member, score)
         end
       end

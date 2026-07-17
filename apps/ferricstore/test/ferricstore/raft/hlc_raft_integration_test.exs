@@ -923,6 +923,49 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       assert [{^member_key, "1.0", 0, _, _, _, _}] = :ets.lookup(ets, member_key)
     end
 
+    test "creating a zset clears unexpected stale score-index members", %{
+      state: state
+    } do
+      suffix = System.unique_integer([:positive])
+      index = :"raft_new_zset_index_#{suffix}"
+      lookup = :"raft_new_zset_lookup_#{suffix}"
+      :ets.new(index, [:ordered_set, :public, :named_table])
+      :ets.new(lookup, [:set, :public, :named_table])
+
+      redis_key = "recreated-zset"
+
+      state = %{
+        state
+        | zset_score_index_name: index,
+          zset_score_lookup_name: lookup
+      }
+
+      try do
+        :ok = Ferricstore.Store.Shard.ZSetIndex.mark_ready_empty(index, lookup, redis_key)
+        :ok = Ferricstore.Store.Shard.ZSetIndex.put_member(index, lookup, redis_key, "stale", "1")
+
+        wrapped = {{:zadd_single, redis_key, 2.0, "new"}, stamp_metadata(HLC.now())}
+        {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
+
+        assert result == 1
+        assert Ferricstore.Store.Shard.ZSetIndex.ready?(lookup, redis_key)
+
+        assert Ferricstore.Store.Shard.ZSetIndex.rank_range(index, redis_key, 0, 10, false) ==
+                 [{"new", 2.0}]
+
+        assert Ferricstore.Store.Shard.ZSetIndex.count(
+                 index,
+                 lookup,
+                 redis_key,
+                 :neg_inf,
+                 :inf
+               ) == 1
+      after
+        :ets.delete(lookup)
+        :ets.delete(index)
+      end
+    end
+
     test "ZINCRBY fails closed when a plain string expiry is ambiguous", %{
       state: state,
       ets: ets

@@ -172,18 +172,6 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     assert 0 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
   end
 
-  test "new ready empty marks a proven-new zset without clearing stale entries", %{
-    index: index,
-    lookup: lookup
-  } do
-    insert_members(index, lookup, "zs", [{"old", "99"}])
-
-    assert :ok == ZSetIndex.mark_new_ready_empty(index, lookup, "zs")
-    assert ZSetIndex.ready?(lookup, "zs")
-    assert 1 == ZSetIndex.count(index, lookup, "zs", :neg_inf, :inf)
-    assert [{"old", 99.0}] == ZSetIndex.rank_range(index, "zs", 0, 10, false)
-  end
-
   test "bulk delete removes only present members and keeps count exact", %{
     index: index,
     lookup: lookup
