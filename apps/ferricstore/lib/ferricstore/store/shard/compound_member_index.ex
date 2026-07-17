@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   @moduledoc false
 
-  alias Ferricstore.HLC
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @separator <<0>>
@@ -55,7 +55,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
       index ->
         :ets.delete_all_objects(index)
-        now = HLC.now_ms()
+        now = CommandTime.now_ms()
 
         :ets.foldl(
           fn
@@ -476,7 +476,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
       tid ->
         lookup_state = lookup_state(state)
-        now_ms = HLC.now_ms()
+        now_ms = CommandTime.now_ms()
         first = scan_page_start_key(tid, prefix, cursor)
 
         case collect_scan_page(
@@ -1003,7 +1003,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
     ArgumentError -> {:error, :keydir_unavailable}
   end
 
-  defp delete_stale_member(table, state, compound_key, now_ms \\ HLC.now_ms()) do
+  defp delete_stale_member(table, state, compound_key, now_ms \\ CommandTime.now_ms()) do
     delete(table, compound_key)
 
     case keydir_member_status(lookup_state(state), compound_key, now_ms) do

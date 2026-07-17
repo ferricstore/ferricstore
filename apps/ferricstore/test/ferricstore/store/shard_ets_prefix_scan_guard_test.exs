@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.ReadResult
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.CompoundKey
@@ -25,6 +26,20 @@ defmodule Ferricstore.Store.ShardETSPrefixScanGuardTest do
 
     refute Regex.match?(~r/(?<!_)v2_pread_at\(/, source),
            "expected Shard.ETS prefix scan cold path to avoid blocking v2_pread_at/2"
+  end
+
+  test "prefix scans use the stamped command time for expiry" do
+    keydir = :ets.new(:prefix_scan_stamped_time, [:set, :public])
+    prefix = CompoundKey.hash_prefix("stamped-time")
+    field_key = CompoundKey.hash_field("stamped-time", "field")
+    local_now = Ferricstore.HLC.now_ms()
+    expire_at_ms = local_now - 1
+    :ets.insert(keydir, {field_key, "value", expire_at_ms, 0, 0, 0, 5})
+
+    assert [{"field", "value"}] =
+             CommandTime.with_now_ms(local_now - 10_000, fn ->
+               ETS.prefix_scan_entries(keydir, prefix, nil)
+             end)
   end
 
   @tag :exact_cold_prefix_scan

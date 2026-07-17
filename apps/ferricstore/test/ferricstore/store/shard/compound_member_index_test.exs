@@ -1,6 +1,7 @@
 defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Shard.Compound.Ops, as: CompoundOps
   alias Ferricstore.Store.Shard.CompoundMemberIndex
@@ -57,8 +58,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
       shard_data_path: nil
     }
 
-    assert {:reply,
-            {:error, {:storage_read_failed, :compound_member_index_unavailable}}, state} ==
+    assert {:reply, {:error, {:storage_read_failed, :compound_member_index_unavailable}}, state} ==
              CompoundOps.handle_compound_scan_page(
                key,
                prefix,
@@ -115,6 +115,26 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
 
     assert CompoundMemberIndex.any_live?(index, state, CompoundKey.set_prefix("tags"))
     refute CompoundMemberIndex.any_live?(index, state, CompoundKey.set_prefix("missing"))
+  end
+
+  test "any_live? uses the stamped command time for member expiry", %{
+    keydir: keydir,
+    index: index
+  } do
+    member_key = CompoundKey.set_member("stamped-tags", "member")
+    prefix = CompoundKey.set_prefix("stamped-tags")
+    local_now = Ferricstore.HLC.now_ms()
+    expire_at_ms = local_now - 1
+    :ets.insert(keydir, {member_key, "1", expire_at_ms, 0, 0, 0, 1})
+    CompoundMemberIndex.put(index, member_key)
+    state = %{keydir: keydir, shard_data_path: nil, compound_member_index: index}
+
+    assert CommandTime.with_now_ms(local_now - 10_000, fn ->
+             CompoundMemberIndex.any_live?(index, state, prefix)
+           end)
+
+    assert [{^member_key, "1", ^expire_at_ms, _lfu, 0, 0, 1}] =
+             :ets.lookup(keydir, member_key)
   end
 
   test "any_live? drops stale index entries", %{keydir: keydir, index: index} do

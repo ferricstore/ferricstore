@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   @moduledoc false
 
-  alias Ferricstore.HLC
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.{BlobValue, ColdRead, Keydir, ReadResult}
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS.Accounting
@@ -158,7 +158,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   end
 
   defp do_prefix_scan_rows(state, keydir, _prefix, shard_data_path, rows) do
-    now = HLC.now_ms()
+    now = CommandTime.now_ms()
 
     {tokens, {cold_entries, _cold_count}} =
       Enum.reduce(rows, {[], {[], 0}}, fn
@@ -226,7 +226,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   end
 
   defp bounded_prefix_row_reducer(state, keydir, prefix, limits) do
-    now = HLC.now_ms()
+    now = CommandTime.now_ms()
     prefix_len = byte_size(prefix)
     max_entries = Map.get(limits, :max_entries, :unlimited)
     max_bytes = Map.get(limits, :max_bytes, :unlimited)
@@ -317,7 +317,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   end
 
   defp prefix_fields_from_rows(rows, prefix) do
-    now = HLC.now_ms()
+    now = CommandTime.now_ms()
     prefix_len = byte_size(prefix)
 
     Enum.reduce(rows, [], fn
@@ -408,7 +408,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
     do: do_prefix_scan_fields(nil, keydir, prefix)
 
   def do_prefix_scan_fields(state, keydir, prefix) do
-    now = HLC.now_ms()
+    now = CommandTime.now_ms()
     prefix_len = byte_size(prefix)
 
     prefix_guard =
@@ -617,7 +617,7 @@ defmodule Ferricstore.Store.Shard.ETS.PrefixScan do
   end
 
   defp select_prefix_count_entries(state, keydir, prefix) do
-    now = HLC.now_ms()
+    now = CommandTime.now_ms()
     prefix_len = byte_size(prefix)
 
     prefix_guard =

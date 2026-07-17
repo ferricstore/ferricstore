@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.Shard.ETS do
   @moduledoc "ETS keydir operations: lookup, insert, delete, cold-read warming, LFU touch, hot-cache threshold enforcement, and prefix scans."
 
-  alias Ferricstore.HLC
+  alias Ferricstore.CommandTime
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.LogicalKeyIndex
   alias Ferricstore.Store.Shard.ETS.Accounting
@@ -57,7 +57,7 @@ defmodule Ferricstore.Store.Shard.ETS do
           | {:error, :invalid_keydir_entry}
   @doc false
   def ets_lookup(%{keydir: keydir} = state, key) do
-    now = HLC.now_ms()
+    now = CommandTime.now_ms()
 
     case :ets.lookup(keydir, key) do
       [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
@@ -127,7 +127,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
   @doc false
   @spec ets_lookup_metadata(map(), binary()) :: metadata_lookup()
-  def ets_lookup_metadata(state, key), do: ets_lookup_metadata(state, key, HLC.now_ms())
+  def ets_lookup_metadata(state, key), do: ets_lookup_metadata(state, key, CommandTime.now_ms())
 
   @doc false
   @spec ets_lookup_metadata(map(), binary(), non_neg_integer()) :: metadata_lookup()
@@ -203,7 +203,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec pending_cold?(map(), binary()) :: boolean()
   @doc false
   def pending_cold?(%{keydir: keydir} = state, key) do
-    now = HLC.now_ms()
+    now = CommandTime.now_ms()
 
     case :ets.lookup(keydir, key) do
       [{^key, nil, exp, _lfu, :pending, _off, _vsize}]
@@ -226,7 +226,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec prefix_has_pending_cold?(:ets.tid(), binary()) :: boolean()
   @doc false
   def prefix_has_pending_cold?(keydir, prefix) do
-    now = HLC.now_ms()
+    now = CommandTime.now_ms()
     prefix_len = byte_size(prefix)
 
     ms = [
