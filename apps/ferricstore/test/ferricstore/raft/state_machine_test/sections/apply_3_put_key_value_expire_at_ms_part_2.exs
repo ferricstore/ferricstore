@@ -345,6 +345,36 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             )
         end
 
+        @tag :ratelimit_denied_noop
+        test "non-rotating ratelimit denials avoid replicated storage writes", %{
+          state: state,
+          ets: ets,
+          active_file_path: active_file_path
+        } do
+          key = "ratelimit_denied_noop"
+          apply_now = Ferricstore.HLC.now_ms()
+          window_ms = 60_000
+          expire_at_ms = apply_now + window_ms * 2
+          encoded = Ferricstore.Store.ValueCodec.encode_ratelimit(10, apply_now, 0)
+
+          :ets.insert(
+            ets,
+            {key, encoded, expire_at_ms, Ferricstore.Store.LFU.initial(), 0, 0,
+             byte_size(encoded)}
+          )
+
+          {new_state, ["denied", 10, 0, ^window_ms]} =
+            StateMachine.apply(
+              %{system_time: apply_now},
+              {{:ratelimit_add, key, window_ms, 10, 1},
+               %{hlc_ts: {apply_now, 0}, wall_time_ms: apply_now}},
+              state
+            )
+
+          assert new_state.active_file_size == state.active_file_size
+          assert {:ok, %{size: 0}} = File.stat(active_file_path)
+        end
+
         test "rejects rate-limit commands that embed an apply timestamp", %{
           state: state,
           ets: ets

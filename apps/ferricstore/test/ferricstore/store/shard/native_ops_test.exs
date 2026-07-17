@@ -124,6 +124,24 @@ defmodule Ferricstore.Store.Shard.NativeOpsTest do
     end
   end
 
+  test "non-rotating rate-limit denials do not queue redundant writes" do
+    keydir = new_keydir("ratelimit_denied_noop")
+    state = %{direct_state(keydir) | flush_in_flight: :in_flight}
+    window_ms = 60_000
+    now = Ferricstore.HLC.now_ms()
+    encoded = Ferricstore.Store.ValueCodec.encode_ratelimit(10, now, 0)
+    put_persisted(state, "limit", encoded, now + window_ms * 2)
+
+    try do
+      assert {:reply, ["denied", 10, 0, ttl_ms], ^state} =
+               NativeOps.handle_ratelimit_add_direct("limit", window_ms, 10, 1, state)
+
+      assert ttl_ms > 0
+    after
+      :ets.delete(keydir)
+    end
+  end
+
   test "rate-limit rollover preserves counters above float integer precision" do
     dir =
       Path.join(

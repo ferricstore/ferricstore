@@ -340,13 +340,30 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       {:error, {:storage_read_failed, _reason}} = failure ->
         {:reply, failure, state}
 
-      {:hit, value, _exp} ->
+      {:hit, value, expire_at_ms} ->
         value
         |> decode_ratelimit(now)
-        |> apply_ratelimit_add_direct(key, window_ms, max, count, now, state)
+        |> apply_ratelimit_add_direct(
+          key,
+          window_ms,
+          max,
+          count,
+          now,
+          state,
+          {:existing, value, expire_at_ms}
+        )
 
       _missing_or_expired ->
-        apply_ratelimit_add_direct({0, now, 0}, key, window_ms, max, count, now, state)
+        apply_ratelimit_add_direct(
+          {0, now, 0},
+          key,
+          window_ms,
+          max,
+          count,
+          now,
+          state,
+          :missing
+        )
     end
   end
 
@@ -357,7 +374,8 @@ defmodule Ferricstore.Store.Shard.NativeOps do
          max,
          count,
          now,
-         state
+         state,
+         original
        ) do
     # Rotate windows
     {cur_count, cur_start, prv_count} =
@@ -384,14 +402,29 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
     ms_until_reset = max(0, cur_start + window_ms - now)
 
-    case persist_direct_value(state, key, value, expire_at_ms) do
-      {:ok, new_state} ->
-        {:reply, [status, final_count, remaining, ms_until_reset], new_state}
+    reply = [status, final_count, remaining, ms_until_reset]
 
-      {:error, reason, rolled_back_state} ->
-        {:reply, {:error, reason}, rolled_back_state}
+    if status == "denied" and rate_limit_state_unchanged?(original, value, expire_at_ms) do
+      {:reply, reply, state}
+    else
+      case persist_direct_value(state, key, value, expire_at_ms) do
+        {:ok, new_state} ->
+          {:reply, reply, new_state}
+
+        {:error, reason, rolled_back_state} ->
+          {:reply, {:error, reason}, rolled_back_state}
+      end
     end
   end
+
+  defp rate_limit_state_unchanged?(
+         {:existing, value, expire_at_ms},
+         value,
+         expire_at_ms
+       ),
+       do: true
+
+  defp rate_limit_state_unchanged?(_original, _value, _expire_at_ms), do: false
 
   defp persist_direct_value(state, key, value, expire_at_ms) do
     previous_entry = :ets.lookup(state.keydir, key)

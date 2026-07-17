@@ -1543,10 +1543,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp do_ratelimit_add(state, key, window_ms, max, count) do
         now = apply_now_ms()
 
-        {cur_count, cur_start, prv_count} =
+        {{cur_count, cur_start, prv_count}, original} =
           case ets_lookup(state, key) do
-            {:hit, value, _exp} -> decode_ratelimit(value, now)
-            _ -> {0, now, 0}
+            {:hit, value, expire_at_ms} ->
+              {decode_ratelimit(value, now), {:existing, value, expire_at_ms}}
+
+            _ ->
+              {{0, now, 0}, :missing}
           end
 
         # Rotate windows
@@ -1572,10 +1575,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             {"allowed", new_eff, max(0, max - new_eff), value}
           end
 
-        do_put(state, key, value, expire_at_ms)
+        unless status == "denied" and
+                 rate_limit_state_unchanged?(original, value, expire_at_ms) do
+          do_put(state, key, value, expire_at_ms)
+        end
+
         ms_until_reset = max(0, cur_start + window_ms - now)
         [status, final_count, remaining, ms_until_reset]
       end
+
+      defp rate_limit_state_unchanged?(
+             {:existing, value, expire_at_ms},
+             value,
+             expire_at_ms
+           ),
+           do: true
+
+      defp rate_limit_state_unchanged?(_original, _value, _expire_at_ms), do: false
 
       # Delegates to the shared ValueCodec to avoid duplication with shard.ex.
       defp encode_ratelimit(cur, start, prev), do: ValueCodec.encode_ratelimit(cur, start, prev)
