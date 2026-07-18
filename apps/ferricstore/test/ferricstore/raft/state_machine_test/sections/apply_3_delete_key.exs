@@ -2506,21 +2506,22 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             {1, 1_025}
           ]
 
-          Enum.reduce(invalid_dimensions, state, fn {num_bits, num_hashes}, acc_state ->
-            key = "bloom_create_invalid:#{System.unique_integer([:positive])}"
-            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+          _state =
+            Enum.reduce(invalid_dimensions, state, fn {num_bits, num_hashes}, acc_state ->
+              key = "bloom_create_invalid:#{System.unique_integer([:positive])}"
+              path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
 
-            assert {next_state, {:error, :invalid_bloom_dimensions}} =
-                     StateMachine.apply(
-                       %{},
-                       {:bloom_create, key, num_bits, num_hashes, {:bloom_meta, %{}}},
-                       acc_state
-                     )
+              assert {next_state, {:error, :invalid_bloom_dimensions}} =
+                       StateMachine.apply(
+                         %{},
+                         {:bloom_create, key, num_bits, num_hashes, {:bloom_meta, %{}}},
+                         acc_state
+                       )
 
-            refute File.exists?(path)
-            assert [] == :ets.lookup(ets, key)
-            next_state
-          end)
+              refute File.exists?(path)
+              assert [] == :ets.lookup(ets, key)
+              next_state
+            end)
 
           refute File.exists?(Path.join(dir, "prob"))
         end
@@ -2544,19 +2545,20 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             fn key, params -> {:bloom_madd, key, ["item"], params} end
           ]
 
-          Enum.reduce(command_builders, state, fn build_command, command_state ->
-            Enum.reduce(invalid_params, command_state, fn params, acc_state ->
-              key = "bloom_auto_invalid:#{System.unique_integer([:positive])}"
-              path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+          _state =
+            Enum.reduce(command_builders, state, fn build_command, command_state ->
+              Enum.reduce(invalid_params, command_state, fn params, acc_state ->
+                key = "bloom_auto_invalid:#{System.unique_integer([:positive])}"
+                path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
 
-              assert {next_state, {:error, :invalid_bloom_dimensions}} =
-                       StateMachine.apply(%{}, build_command.(key, params), acc_state)
+                assert {next_state, {:error, :invalid_bloom_dimensions}} =
+                         StateMachine.apply(%{}, build_command.(key, params), acc_state)
 
-              refute File.exists?(path)
-              assert [] == :ets.lookup(ets, key)
-              next_state
+                refute File.exists?(path)
+                assert [] == :ets.lookup(ets, key)
+                next_state
+              end)
             end)
-          end)
 
           refute File.exists?(Path.join(dir, "prob"))
         end
@@ -2577,21 +2579,22 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             {1, 5}
           ]
 
-          Enum.reduce(invalid_parameters, state, fn {capacity, bucket_size}, acc_state ->
-            key = "cuckoo_create_invalid:#{System.unique_integer([:positive])}"
-            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
+          _state =
+            Enum.reduce(invalid_parameters, state, fn {capacity, bucket_size}, acc_state ->
+              key = "cuckoo_create_invalid:#{System.unique_integer([:positive])}"
+              path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
 
-            assert {next_state, {:error, :invalid_cuckoo_parameters}} =
-                     StateMachine.apply(
-                       %{},
-                       {:cuckoo_create, key, capacity, bucket_size},
-                       acc_state
-                     )
+              assert {next_state, {:error, :invalid_cuckoo_parameters}} =
+                       StateMachine.apply(
+                         %{},
+                         {:cuckoo_create, key, capacity, bucket_size},
+                         acc_state
+                       )
 
-            refute File.exists?(path)
-            assert [] == :ets.lookup(ets, key)
-            next_state
-          end)
+              refute File.exists?(path)
+              assert [] == :ets.lookup(ets, key)
+              next_state
+            end)
 
           refute File.exists?(Path.join(dir, "prob"))
         end
@@ -2616,19 +2619,20 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             fn key, params -> {:cuckoo_addnx, key, "item", params} end
           ]
 
-          Enum.reduce(command_builders, state, fn build_command, command_state ->
-            Enum.reduce(invalid_params, command_state, fn params, acc_state ->
-              key = "cuckoo_auto_invalid:#{System.unique_integer([:positive])}"
-              path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
+          _state =
+            Enum.reduce(command_builders, state, fn build_command, command_state ->
+              Enum.reduce(invalid_params, command_state, fn params, acc_state ->
+                key = "cuckoo_auto_invalid:#{System.unique_integer([:positive])}"
+                path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
 
-              assert {next_state, {:error, :invalid_cuckoo_parameters}} =
-                       StateMachine.apply(%{}, build_command.(key, params), acc_state)
+                assert {next_state, {:error, :invalid_cuckoo_parameters}} =
+                         StateMachine.apply(%{}, build_command.(key, params), acc_state)
 
-              refute File.exists?(path)
-              assert [] == :ets.lookup(ets, key)
-              next_state
+                refute File.exists?(path)
+                assert [] == :ets.lookup(ets, key)
+                next_state
+              end)
             end)
-          end)
 
           refute File.exists?(Path.join(dir, "prob"))
         end
@@ -2651,21 +2655,22 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             {1, 1, 1_048_577}
           ]
 
-          Enum.reduce(invalid_parameters, state, fn {k, width, depth}, acc_state ->
-            key = "topk_create_invalid:#{System.unique_integer([:positive])}"
-            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "topk")
+          _state =
+            Enum.reduce(invalid_parameters, state, fn {k, width, depth}, acc_state ->
+              key = "topk_create_invalid:#{System.unique_integer([:positive])}"
+              path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "topk")
 
-            assert {next_state, {:error, :invalid_topk_parameters}} =
-                     StateMachine.apply(
-                       %{},
-                       {:topk_create, key, k, width, depth},
-                       acc_state
-                     )
+              assert {next_state, {:error, :invalid_topk_parameters}} =
+                       StateMachine.apply(
+                         %{},
+                         {:topk_create, key, k, width, depth},
+                         acc_state
+                       )
 
-            refute File.exists?(path)
-            assert [] == :ets.lookup(ets, key)
-            next_state
-          end)
+              refute File.exists?(path)
+              assert [] == :ets.lookup(ets, key)
+              next_state
+            end)
 
           refute File.exists?(Path.join(dir, "prob"))
         end
@@ -2685,21 +2690,22 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             %{width: 1, depth: 1_025}
           ]
 
-          Enum.reduce(invalid_params, state, fn params, acc_state ->
-            key = "cms_merge_invalid:#{System.unique_integer([:positive])}"
-            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          _state =
+            Enum.reduce(invalid_params, state, fn params, acc_state ->
+              key = "cms_merge_invalid:#{System.unique_integer([:positive])}"
+              path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
 
-            assert {next_state, {:error, :invalid_cms_dimensions}} =
-                     StateMachine.apply(
-                       %{},
-                       {:cms_merge, key, [], [], params},
-                       acc_state
-                     )
+              assert {next_state, {:error, :invalid_cms_dimensions}} =
+                       StateMachine.apply(
+                         %{},
+                         {:cms_merge, key, [], [], params},
+                         acc_state
+                       )
 
-            refute File.exists?(path)
-            assert [] == :ets.lookup(ets, key)
-            next_state
-          end)
+              refute File.exists?(path)
+              assert [] == :ets.lookup(ets, key)
+              next_state
+            end)
 
           refute File.exists?(Path.join(dir, "prob"))
         end
