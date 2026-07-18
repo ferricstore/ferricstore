@@ -162,9 +162,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         reset_keydir!(ctx, shard_index, keydir)
         ShardLifecycle.recover_keydir(shard_data_path, keydir, shard_index, ctx)
 
-        promoted_instances =
-          Promotion.recover_promoted(shard_data_path, keydir, data_dir, shard_index, ctx)
-
         instance_name = ctx.name
         compound_member_index = CompoundMemberIndex.table_name(instance_name, shard_index)
         ensure_ets_table!(compound_member_index, :ordered_set)
@@ -224,7 +221,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           active_file_size: active_file_size,
           ets: keydir,
           instance_ctx: ctx,
-          promoted_instances: promoted_instances,
+          promoted_instances: %{},
           apply_context: resolve_persisted_apply_context(persisted_apply_context, ctx),
           instance_name: instance_name,
           compound_member_index_name: compound_member_index,
@@ -337,7 +334,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
             end
 
           {:error, :enoent} ->
-            {:ok, sm_state, 0, metadata_position}
+            {:ok, recover_promoted_instances(sm_state), 0, metadata_position}
 
           {:error, reason} ->
             {:error, reason}
@@ -348,7 +345,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         sm_state
         |> reset_segment_projection_base()
         |> apply_segment_projection_entries(projection_source, entries)
-        |> retain_projected_promoted_instances()
+        |> recover_promoted_instances()
       end
 
       defp reset_segment_projection_base(
@@ -374,13 +371,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         Map.put(sm_state, :flow_due_catalog, Ferricstore.Flow.DueCatalog.new())
       end
 
-      defp retain_projected_promoted_instances(%{ets: keydir} = sm_state) do
+      defp recover_promoted_instances(
+             %{
+               shard_data_path: shard_data_path,
+               ets: keydir,
+               data_dir: data_dir,
+               shard_index: shard_index,
+               instance_ctx: ctx
+             } = sm_state
+           ) do
         promoted_instances =
-          sm_state
-          |> Map.get(:promoted_instances, %{})
-          |> Map.filter(fn {redis_key, _promoted} ->
-            :ets.member(keydir, Promotion.marker_key(redis_key))
-          end)
+          Promotion.recover_promoted(shard_data_path, keydir, data_dir, shard_index, ctx)
 
         Map.put(sm_state, :promoted_instances, promoted_instances)
       end

@@ -216,6 +216,8 @@ defmodule Ferricstore.Test.ShardHelpers do
         _, _ -> :ok
       end
     end
+
+    :ok
   end
 
   @doc """

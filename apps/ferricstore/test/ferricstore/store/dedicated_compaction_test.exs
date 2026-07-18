@@ -594,6 +594,47 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   # ---------------------------------------------------------------------------
 
   describe "edge cases" do
+    @tag :stale_promotion_marker_restart
+    test "segment projection ignores a stale physical promotion marker on restart" do
+      store = real_store()
+      live_key = ukey("live_marker_restart")
+      promote_hash(store, live_key)
+
+      key = ukey("stale_marker_restart")
+      ctx = FerricStore.Instance.get(:default)
+      shard_idx = Router.shard_for(ctx, key)
+      marker_key = CompoundKey.promotion_marker_key(key)
+
+      assert [] = :ets.lookup(elem(ctx.keydir_refs, shard_idx), marker_key)
+      refute File.dir?(dedicated_dir(key))
+      assert :ok = ShardHelpers.flush_all_shards()
+
+      {_active_file_id, active_file_path, _shard_data_path} =
+        Ferricstore.Store.ActiveFile.get(ctx, shard_idx)
+
+      server_started? =
+        Enum.any?(Application.started_applications(), fn {app, _description, _version} ->
+          app == :ferricstore_server
+        end)
+
+      if server_started?, do: assert(:ok = Application.stop(:ferricstore_server))
+      assert :ok = Application.stop(:ferricstore)
+      _ = Ferricstore.Raft.WARaftBackend.stop()
+
+      assert {:ok, _location} = NIF.v2_append_record(active_file_path, marker_key, "hash", 0)
+      assert :ok = NIF.v2_fsync(active_file_path)
+
+      assert {:ok, _started} = Application.ensure_all_started(:ferricstore)
+
+      if server_started? do
+        assert {:ok, _started} = Application.ensure_all_started(:ferricstore_server)
+      end
+
+      assert :ok = ShardHelpers.wait_default_pipeline_ready()
+      assert {:ok, "none"} = FerricStore.type(key)
+      assert "value_1" == Hash.handle("HGET", [live_key, "field_1"], real_store())
+    end
+
     test "compaction with all fields deleted" do
       store = real_store()
       key = ukey("all_del")
