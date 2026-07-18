@@ -1,11 +1,13 @@
 defmodule Ferricstore.Raft.CommandClockTest do
   use ExUnit.Case, async: false
   @moduletag :raft
+  @moduletag :global_state
 
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.CommandClock
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
 
   describe "stamp/1" do
     test "wraps a raft command with an HLC timestamp" do
@@ -99,9 +101,13 @@ defmodule Ferricstore.Raft.CommandClockTest do
         assert is_integer(pipe_index)
         assert "iv" == Router.get(ctx, "clock:w pipe")
       after
-        _ = WARaftBackend.stop()
-        FerricStore.Instance.cleanup(ctx.name)
-        File.rm_rf!(root)
+        try do
+          _ = WARaftBackend.stop()
+          FerricStore.Instance.cleanup(ctx.name)
+          File.rm_rf!(root)
+        after
+          ShardHelpers.restore_default_waraft!()
+        end
       end
     end
   end

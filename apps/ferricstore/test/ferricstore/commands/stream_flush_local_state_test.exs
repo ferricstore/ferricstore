@@ -1,9 +1,15 @@
 defmodule Ferricstore.Commands.StreamFlushLocalStateTest do
   @moduledoc false
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Commands.{Server, Stream}
-  alias Ferricstore.Test.MockStore
+  alias Ferricstore.Test.{MockStore, ShardHelpers}
+
+  setup_all do
+    assert :ok = ShardHelpers.flush_all_keys()
+    :ok
+  end
 
   setup do
     clear_stream_tables()
