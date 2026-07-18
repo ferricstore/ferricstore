@@ -267,9 +267,7 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     :erlang.trace(connection_pid, true, [:call])
 
     on_exit(fn ->
-      if Process.alive?(connection_pid),
-        do: :erlang.trace(connection_pid, false, [:call])
-
+      disable_call_trace(connection_pid)
       :erlang.trace_pattern({Responses, :encode_response, 6}, false, [])
     end)
 
@@ -297,6 +295,10 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
                       {Responses, :encode_response,
                        [_state, @command_exec_opcode, 0, ^request_id, _status, _value]}}
     end
+
+    connection_monitor = Process.monitor(connection_pid)
+    :ok = :gen_tcp.close(socket)
+    assert_receive {:DOWN, ^connection_monitor, :process, ^connection_pid, _reason}
   end
 
   @tag :control_execution_budget
@@ -940,6 +942,12 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
+
+  defp disable_call_trace(pid) do
+    :erlang.trace(pid, false, [:call])
+  rescue
+    ArgumentError -> false
+  end
 
   defp eventually(fun, attempts \\ 100)
 

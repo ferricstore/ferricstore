@@ -278,7 +278,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
             end
           )
 
-        assert {_state, {:error, :compound_member_index_unavailable}} =
+        assert {_state, {:error, {:state_read_failed, :compound_member_index_unavailable}}} =
                  StateMachine.apply(%{}, {:tx_execute, entries, nil}, state)
 
         assert [] = :ets.lookup(ets, staged_key)
@@ -289,7 +289,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
         {:ok, hlen_entry} =
           Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared_hlen)
 
-        assert {_state, {:error, :compound_member_index_unavailable}} =
+        assert {_state, {:error, {:state_read_failed, :compound_member_index_unavailable}}} =
                  StateMachine.apply(%{}, {:tx_execute, [hlen_entry], nil}, state)
 
         assert [_row] = :ets.lookup(ets, type_key)

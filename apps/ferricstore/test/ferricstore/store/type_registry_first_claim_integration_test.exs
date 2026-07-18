@@ -3,6 +3,13 @@ defmodule Ferricstore.Store.TypeRegistryFirstClaimIntegrationTest do
 
   @moduletag :global_state
 
+  alias Ferricstore.Test.ShardHelpers
+
+  setup do
+    ShardHelpers.reset_memory_guard_pressure()
+    :ok
+  end
+
   test "concurrent replicated creators preserve the first compound type" do
     ctx = FerricStore.Instance.get(:default)
     key = "replicated-type-claim:#{System.unique_integer([:positive])}"
@@ -17,7 +24,8 @@ defmodule Ferricstore.Store.TypeRegistryFirstClaimIntegrationTest do
       |> Enum.map(&Task.async/1)
       |> Task.await_many(10_000)
 
-    assert Enum.count(results, &match?({:ok, 1}, &1)) == 1
+    assert Enum.count(results, &match?({:ok, 1}, &1)) == 1,
+           "expected one first type claim, got: #{inspect(results)}"
 
     assert Enum.count(results, fn
              {:error, message} when is_binary(message) -> String.contains?(message, "WRONGTYPE")

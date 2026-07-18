@@ -404,7 +404,7 @@ defmodule Ferricstore.Store.Router.Part11 do
 
       defp direct_zset_members(ctx, idx, redis_key) do
         idx
-        |> direct_compound_scan(ctx, CompoundKey.zset_prefix(redis_key))
+        |> direct_compound_scan(ctx, redis_key, CompoundKey.zset_prefix(redis_key))
         |> ReadResult.map_success(fn entries ->
           Enum.flat_map(entries, fn {member, score_str} ->
             case Float.parse(score_str) do

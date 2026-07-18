@@ -215,7 +215,7 @@ defmodule FerricstoreServer.Native.LaneTest do
     :erlang.trace(pid, true, [:call])
 
     on_exit(fn ->
-      if Process.alive?(pid), do: :erlang.trace(pid, false, [:call])
+      disable_call_trace(pid)
       :erlang.trace_pattern({Codec, :encode_command_response_frames, 6}, false, [])
     end)
 
@@ -690,6 +690,12 @@ defmodule FerricstoreServer.Native.LaneTest do
   defp compact_bin(value) do
     value = IO.iodata_to_binary(value)
     [<<byte_size(value)::unsigned-32>>, value]
+  end
+
+  defp disable_call_trace(pid) do
+    :erlang.trace(pid, false, [:call])
+  rescue
+    ArgumentError -> false
   end
 
   defp assert_ok_response(iodata, opcode, request_id) do

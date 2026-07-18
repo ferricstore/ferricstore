@@ -17,6 +17,64 @@ defmodule Ferricstore.Test.ShardHelpers do
   @default_waraft_context_key {{WARaftBackend, :context}, :ferricstore_waraft_backend}
 
   @doc """
+  Builds the command store used by default-instance integration tests.
+
+  Compound mutations go through `Router` so the fixture exercises the same
+  replicated write path as production commands.
+  """
+  @spec router_store(FerricStore.Instance.t()) :: map()
+  def router_store(ctx \\ FerricStore.Instance.get(:default)) do
+    %{
+      get: fn key -> Router.get(ctx, key) end,
+      get_meta: fn key -> Router.get_meta(ctx, key) end,
+      batch_get: fn keys -> Router.batch_get(ctx, keys) end,
+      put: fn key, value, expire_at_ms -> Router.put(ctx, key, value, expire_at_ms) end,
+      delete: fn key -> Router.delete(ctx, key) end,
+      exists?: fn key -> Router.exists?(ctx, key) end,
+      keys: fn -> Router.keys(ctx) end,
+      flush: fn -> :ok end,
+      dbsize: fn -> Router.dbsize(ctx) end,
+      list_op: fn key, operation -> Router.list_op(ctx, key, operation) end,
+      compound_get: fn redis_key, compound_key ->
+        Router.compound_get(ctx, redis_key, compound_key)
+      end,
+      compound_get_meta: fn redis_key, compound_key ->
+        Router.compound_get_meta(ctx, redis_key, compound_key)
+      end,
+      compound_batch_get: fn redis_key, compound_keys ->
+        Router.compound_batch_get(ctx, redis_key, compound_keys)
+      end,
+      compound_batch_get_meta: fn redis_key, compound_keys ->
+        Router.compound_batch_get_meta(ctx, redis_key, compound_keys)
+      end,
+      compound_type_claim: fn redis_key, type ->
+        Router.compound_type_claim(ctx, redis_key, type)
+      end,
+      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+        Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
+      end,
+      compound_batch_put: fn redis_key, entries ->
+        Router.compound_batch_put(ctx, redis_key, entries)
+      end,
+      compound_delete: fn redis_key, compound_key ->
+        Router.compound_delete(ctx, redis_key, compound_key)
+      end,
+      compound_batch_delete: fn redis_key, compound_keys ->
+        Router.compound_batch_delete(ctx, redis_key, compound_keys)
+      end,
+      compound_scan: fn redis_key, prefix ->
+        Router.compound_scan(ctx, redis_key, prefix)
+      end,
+      compound_count: fn redis_key, prefix ->
+        Router.compound_count(ctx, redis_key, prefix)
+      end,
+      compound_delete_prefix: fn redis_key, prefix ->
+        Router.compound_delete_prefix(ctx, redis_key, prefix)
+      end
+    }
+  end
+
+  @doc """
   Replaces and replicates the immutable apply context for the default test instance.
 
   Returns an opaque snapshot for `restore_default_apply_context/1`.

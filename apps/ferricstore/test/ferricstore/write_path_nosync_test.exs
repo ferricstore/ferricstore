@@ -74,12 +74,15 @@ defmodule Ferricstore.WritePathNosyncTest do
 
     test "SET with TTL — key expires correctly" do
       key = ukey("sm")
-      expire_at = System.os_time(:millisecond) + 100
+      expire_at = Ferricstore.HLC.now_ms() + 2_000
       Router.put(FerricStore.Instance.get(:default), key, "ephemeral", expire_at)
 
       assert "ephemeral" == Router.get(FerricStore.Instance.get(:default), key)
-      Process.sleep(150)
-      assert nil == Router.get(FerricStore.Instance.get(:default), key)
+
+      ShardHelpers.eventually(
+        fn -> is_nil(Router.get(FerricStore.Instance.get(:default), key)) end,
+        "TTL key should expire"
+      )
     end
 
     test "after BitcaskWriter flush, data is readable from cold path" do

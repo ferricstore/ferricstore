@@ -774,6 +774,14 @@ defmodule Ferricstore.Store.PromotionTest.Sections.SmallHashStaysInSharedBitcask
           [{^cold_field_key, _value, exp, lfu, fid, off, vsize}] =
             :ets.lookup(keydir, cold_field_key)
 
+          assert {:ok, "value_1"} =
+                   Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+                     ctx,
+                     idx,
+                     fid,
+                     cold_field_key
+                   )
+
           :ets.insert(keydir, {cold_field_key, nil, exp, lfu, fid, off, vsize})
 
           assert 1 == Hash.handle("HSET", [key, "extra_field", "extra_value"], store)

@@ -3,13 +3,7 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
   Raft edge-case tests for data structure write commands.
 
   Verifies that Hash, List, Set, and Sorted Set commands operate correctly
-  through the full Raft path: Shard GenServer -> Batcher -> ra -> StateMachine
-  -> ETS + Bitcask.
-
-  Each test dispatches commands via the store map, which routes compound
-  operations through the Shard GenServer. The Shard delegates writes to
-  the Raft Batcher, which batches them into ra log entries. The StateMachine
-  `apply/3` callback then writes to ETS and Bitcask deterministically.
+  through the public Router and replicated state-machine path.
   """
 
   use ExUnit.Case, async: false
@@ -37,126 +31,8 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
   # Generate unique keys to avoid cross-test pollution
   defp ukey(base), do: "raft_ds_#{base}_#{:rand.uniform(9_999_999)}"
 
-  # Build the store map that routes through the Shard GenServer,
-  # which in turn routes writes through Raft.
-  defp build_store(redis_key) do
-    shard =
-      Router.shard_name(
-        FerricStore.Instance.get(:default),
-        Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-      )
-
-    %{
-      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
-      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
-      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
-      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
-      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
-      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
-      list_op: fn k, op -> Router.list_op(FerricStore.Instance.get(:default), k, op) end,
-      compound_get: fn _redis_key, compound_key ->
-        GenServer.call(shard, {:compound_get, redis_key, compound_key})
-      end,
-      compound_get_meta: fn _redis_key, compound_key ->
-        GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
-      end,
-      compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-        GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
-      end,
-      compound_delete: fn _redis_key, compound_key ->
-        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
-      end,
-      compound_scan: fn _redis_key, prefix ->
-        GenServer.call(shard, {:compound_scan, redis_key, prefix})
-      end,
-      compound_count: fn _redis_key, prefix ->
-        GenServer.call(shard, {:compound_count, redis_key, prefix})
-      end,
-      compound_delete_prefix: fn _redis_key, prefix ->
-        GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
-      end
-    }
-  end
-
-  # Build a store map where compound operations route to the redis_key's
-  # owning shard. Unlike build_store/1, the redis_key in the callbacks is
-  # passed through from the caller (the command module), so multi-key
-  # operations that query the type registry with the actual redis_key
-  # still route correctly.
-  defp build_dynamic_store do
-    %{
-      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
-      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
-      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
-      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
-      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
-      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
-      list_op: fn k, op -> Router.list_op(FerricStore.Instance.get(:default), k, op) end,
-      compound_get: fn redis_key, compound_key ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_get, redis_key, compound_key})
-      end,
-      compound_get_meta: fn redis_key, compound_key ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
-      end,
-      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
-      end,
-      compound_delete: fn redis_key, compound_key ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
-      end,
-      compound_scan: fn redis_key, prefix ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_scan, redis_key, prefix})
-      end,
-      compound_count: fn redis_key, prefix ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_count, redis_key, prefix})
-      end,
-      compound_delete_prefix: fn redis_key, prefix ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
-      end
-    }
-  end
+  defp build_store(_redis_key), do: ShardHelpers.router_store()
+  defp build_dynamic_store, do: ShardHelpers.router_store()
 
   alias Ferricstore.Commands.Hash
   alias Ferricstore.Commands.List, as: ListCmd

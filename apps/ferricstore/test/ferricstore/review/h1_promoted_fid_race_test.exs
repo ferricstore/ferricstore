@@ -8,7 +8,7 @@ defmodule Ferricstore.Review.H1PromotedFidRaceTest do
     subsequent pread-based reads return nil or wrong data.
 
   WARaft applies promoted writes through the Raft state machine, not through
-  the legacy shard dedicated-compaction telemetry path. This test verifies
+  the direct shard dedicated-compaction telemetry path. This test verifies
   the durable read invariant under heavy promoted overwrite load without
   depending on that stale telemetry event.
   """
@@ -41,81 +41,7 @@ defmodule Ferricstore.Review.H1PromotedFidRaceTest do
     end)
   end
 
-  defp real_store do
-    %{
-      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
-      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
-      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
-      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
-      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
-      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
-      flush: fn -> :ok end,
-      dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
-      compound_get: fn redis_key, compound_key ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_get, redis_key, compound_key})
-      end,
-      compound_get_meta: fn redis_key, compound_key ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
-      end,
-      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
-      end,
-      compound_delete: fn redis_key, compound_key ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
-      end,
-      compound_scan: fn redis_key, prefix ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_scan, redis_key, prefix})
-      end,
-      compound_count: fn redis_key, prefix ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_count, redis_key, prefix})
-      end,
-      compound_delete_prefix: fn redis_key, prefix ->
-        shard =
-          Router.shard_name(
-            FerricStore.Instance.get(:default),
-            Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-          )
-
-        GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
-      end
-    }
-  end
+  defp real_store, do: ShardHelpers.router_store()
 
   defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
 

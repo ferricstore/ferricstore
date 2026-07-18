@@ -710,7 +710,7 @@ defmodule Ferricstore.Store.Router.Part10 do
 
         if selected_waraft_ctx?(ctx) do
           idx
-          |> direct_compound_scan(ctx, prefix)
+          |> direct_compound_scan(ctx, redis_key, prefix)
           |> ReadResult.map_success(&Enum.sort_by(&1, fn {field, _value} -> field end))
         else
           case safe_read_call(ctx, idx, {:compound_scan, redis_key, prefix}) do
@@ -726,7 +726,7 @@ defmodule Ferricstore.Store.Router.Part10 do
         idx = shard_for(ctx, redis_key)
 
         if selected_waraft_ctx?(ctx) do
-          direct_compound_scan(idx, ctx, prefix)
+          direct_compound_scan(idx, ctx, redis_key, prefix)
         else
           case safe_read_call(ctx, idx, {:compound_scan, redis_key, prefix}) do
             {:ok, results} -> results
@@ -849,12 +849,14 @@ defmodule Ferricstore.Store.Router.Part10 do
         end
       end
 
-      defp direct_compound_scan(idx, ctx, prefix) do
-        shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+      defp direct_compound_scan(idx, ctx, redis_key, prefix) do
+        state = direct_compound_read_state(ctx, idx)
 
-        ctx
-        |> direct_compound_read_state(idx)
-        |> Ferricstore.Store.Shard.ETS.prefix_scan_entries(prefix, shard_data_path)
+        data_path =
+          Ferricstore.Store.Shard.Compound.Promoted.promoted_store(state, redis_key) ||
+            state.shard_data_path
+
+        Ferricstore.Store.Shard.ETS.prefix_scan_entries(state, prefix, data_path)
       end
 
       defp direct_compound_fields(ctx, idx, prefix) do
