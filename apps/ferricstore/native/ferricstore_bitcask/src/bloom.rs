@@ -285,7 +285,7 @@ fn bloom_stage_transactional_madd(
         }
         run_start = run_end;
     }
-    if results.iter().any(|result| *result == 1) {
+    if results.contains(&1) {
         images.push(crate::prob_txn::AfterImage::new(
             24,
             count.to_le_bytes().to_vec(),

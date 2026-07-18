@@ -87,7 +87,7 @@ fn cuckoo_bucket_count(capacity: u32, bucket_size: u8) -> Result<u32, String> {
 
     let capacity = u64::from(capacity);
     let bucket_size = u64::from(bucket_size);
-    let num_buckets = (capacity + bucket_size - 1) / bucket_size;
+    let num_buckets = capacity.div_ceil(bucket_size);
     u32::try_from(num_buckets).map_err(|_| "cuckoo bucket count overflow".into())
 }
 
