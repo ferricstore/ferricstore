@@ -279,6 +279,31 @@ defmodule Ferricstore.Bitcask.FsNifTest do
     end
   end
 
+  describe "atomic sidecar copy/link replacement" do
+    test "copy replacement streams new bytes into a distinct inode", %{tmp: tmp} do
+      source = Path.join(tmp, "copy-source")
+      destination = Path.join(tmp, "copy-destination")
+      File.write!(source, :binary.copy("payload", 1_024))
+      File.write!(destination, "old")
+
+      assert :ok = NIF.fs_copy_replace_sync_nofollow(source, destination)
+      assert File.read!(destination) == File.read!(source)
+      refute File.stat!(destination).inode == File.stat!(source).inode
+    end
+
+    test "hard-link replacement is constant-space and leaves the source intact", %{tmp: tmp} do
+      source = Path.join(tmp, "link-source")
+      destination = Path.join(tmp, "link-destination")
+      File.write!(source, :binary.copy("payload", 1_024))
+      File.write!(destination, "old")
+
+      assert :ok = NIF.fs_hard_link_replace_sync_nofollow(source, destination)
+      assert File.read!(destination) == File.read!(source)
+      assert File.stat!(destination).inode == File.stat!(source).inode
+      assert File.exists?(source)
+    end
+  end
+
   describe "fs_ls/1" do
     test "lists entries (names only)", %{tmp: tmp} do
       File.write!(Path.join(tmp, "one"), "")

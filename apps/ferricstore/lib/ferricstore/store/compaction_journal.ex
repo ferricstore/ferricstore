@@ -119,10 +119,17 @@ defmodule Ferricstore.Store.CompactionJournal do
 
   defp recover_one(shard_path, journal_path) do
     with {:ok, payload} <- Ferricstore.FS.read_nofollow(journal_path, @max_journal_bytes),
-         {:ok, fid, tx_id} <- decode_journal(payload) do
-      transaction = transaction(shard_path, fid, tx_id)
+         {:ok, fid, tx_id} <- decode_journal(payload),
+         transaction = transaction(shard_path, fid, tx_id),
+         :ok <- validate_journal_identity(journal_path, transaction) do
       recover_transaction(transaction)
     end
+  end
+
+  defp validate_journal_identity(journal_path, %{journal: journal_path}), do: :ok
+
+  defp validate_journal_identity(journal_path, %{journal: expected}) do
+    {:error, {:journal_identity_mismatch, journal_path, expected}}
   end
 
   defp recover_transaction(transaction) do
@@ -241,8 +248,12 @@ defmodule Ferricstore.Store.CompactionJournal do
     with {:ok, term} <- TermCodec.decode(payload) do
       case term do
         {:ferricstore_compaction_swap, @journal_version, fid, tx_id}
-        when is_integer(fid) and fid >= 0 and is_binary(tx_id) and byte_size(tx_id) > 0 ->
-          {:ok, fid, tx_id}
+        when is_integer(fid) and fid >= 0 and is_binary(tx_id) ->
+          if valid_tx_id?(tx_id) do
+            {:ok, fid, tx_id}
+          else
+            {:error, :invalid_journal}
+          end
 
         _invalid ->
           {:error, :invalid_journal}
@@ -251,6 +262,18 @@ defmodule Ferricstore.Store.CompactionJournal do
       {:error, :invalid_external_term} -> {:error, :invalid_journal}
     end
   end
+
+  defp valid_tx_id?(tx_id) when byte_size(tx_id) == 22 do
+    case Base.url_decode64(tx_id, padding: false) do
+      {:ok, decoded} when byte_size(decoded) == 16 ->
+        Base.url_encode64(decoded, padding: false) == tx_id
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp valid_tx_id?(_tx_id), do: false
 
   defp journal_name?(name) do
     String.starts_with?(name, @journal_prefix) and String.ends_with?(name, @journal_suffix)

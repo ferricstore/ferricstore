@@ -48,6 +48,15 @@ defmodule Ferricstore.Raft.ApplyFailure do
   def storage_reason?({:fsync_dir_failed, _phase, _reason}), do: true
   def storage_reason?({:delete_prob_file_failed, _reason}), do: true
 
+  def storage_reason?({:prob_sidecar_publish_failed, _final_path, _staged_path, _reason}),
+    do: true
+
+  def storage_reason?({:prob_sidecar_delete_failed, _path, _reason}), do: true
+
+  def storage_reason?({:prob_dir_create_failed, _reason}), do: true
+  def storage_reason?({:prob_sidecar_create_failed, _reason}), do: true
+  def storage_reason?({:prob_sidecar_apply_failed, _operation, _reason}), do: true
+
   def storage_reason?(reason) when is_tuple(reason) and tuple_size(reason) > 1,
     do: MapSet.member?(@rollback_failure_tags, elem(reason, 0))
 

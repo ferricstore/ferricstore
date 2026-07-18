@@ -368,12 +368,19 @@ defmodule Ferricstore.Commands.TopKTest do
       assert result == ["b", 50, "a", 10]
     end
 
-    test "LIST WITHCOUNT flattens NIF count results in one pass" do
+    test "LIST WITHCOUNT uses one native snapshot" do
       source = File.read!(Path.expand("../../../lib/ferricstore/commands/topk.ex", __DIR__))
 
-      assert source =~ "topk_items_with_counts(items, counts, [])"
-      refute source =~ "Enum.zip(items, counts)"
-      refute source =~ "Enum.flat_map(fn {elem, count} -> [elem, count] end)"
+      with_count_source =
+        source
+        |> String.split("defp do_list_with_count_after_type_check", parts: 2)
+        |> List.last()
+        |> String.split("defp do_reserve", parts: 2)
+        |> List.first()
+
+      assert with_count_source =~ "NIF.topk_file_list_with_count_async"
+      refute with_count_source =~ "NIF.topk_file_list_v2_async"
+      refute with_count_source =~ "NIF.topk_file_count_v2_async"
     end
 
     test "LIST WITHCOUNT option is case-insensitive" do

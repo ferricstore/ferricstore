@@ -5,6 +5,8 @@ defmodule Ferricstore.Commands.CompoundSnapshot do
 
   @type entry :: {binary(), binary(), non_neg_integer()}
 
+  @prob_types ["bloom", "cms", "cuckoo", "topk"]
+
   @spec supported?(term()) :: boolean()
   def supported?(%FerricStore.Instance{}), do: true
   def supported?(%Ferricstore.Store.LocalTxStore{}), do: true
@@ -15,14 +17,30 @@ defmodule Ferricstore.Commands.CompoundSnapshot do
   def supported?(_store), do: false
 
   @spec snapshot(binary(), binary(), map()) :: {:ok, [entry()]} | ReadResult.failure()
-  def snapshot(key, type, store) when type in ["hash", "list", "set", "zset", "stream"] do
+  def snapshot(key, type_marker, store) when is_binary(type_marker) do
+    snapshot_normalized(key, CompoundKey.type_name(type_marker), store)
+  end
+
+  def snapshot(_key, _type, _store), do: ReadResult.failure(:invalid_compound_type)
+
+  defp snapshot_normalized(key, type, store) when type in @prob_types do
+    with {:ok, value_entries} <- plain_value_entry(key, store),
+         {:ok, type_entries} <-
+           meta_entry(key, CompoundKey.type_key(key), type, store) do
+      {:ok, value_entries ++ type_entries}
+    end
+  end
+
+  defp snapshot_normalized(key, type, store)
+       when type in ["hash", "list", "set", "zset", "stream"] do
     with {:ok, meta_entries} <- meta_entries(key, type, store),
          {:ok, member_entries} <- member_entries(key, type, store) do
       {:ok, meta_entries ++ member_entries}
     end
   end
 
-  def snapshot(_key, _type, _store), do: ReadResult.failure(:invalid_compound_type)
+  defp snapshot_normalized(_key, _type, _store),
+    do: ReadResult.failure(:invalid_compound_type)
 
   @spec value_snapshot(binary(), binary(), map()) :: {:ok, [entry()]} | ReadResult.failure()
   def value_snapshot(key, type, store) when type in ["hash", "list", "set", "zset", "stream"] do
@@ -129,6 +147,14 @@ defmodule Ferricstore.Commands.CompoundSnapshot do
       {:error, {:storage_read_failed, _reason}} = failure -> failure
       nil -> {:ok, []}
       value -> {:ok, [{compound_key, value, 0}]}
+    end
+  end
+
+  defp plain_value_entry(key, store) do
+    case Ops.get_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
+      nil -> {:ok, []}
+      {value, expire_at_ms} -> {:ok, [{key, value, expire_at_ms}]}
     end
   end
 

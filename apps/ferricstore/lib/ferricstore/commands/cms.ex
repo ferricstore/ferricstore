@@ -8,13 +8,12 @@ defmodule Ferricstore.Commands.CMS do
   """
 
   alias Ferricstore.Bitcask.{Async, NIF}
-  alias Ferricstore.Commands.ProbType
+  alias Ferricstore.Commands.{ProbParameters, ProbType}
   alias Ferricstore.ProbFile
 
   @prob_read_timeout_ms 5_000
   @max_cms_depth 1_024
   @max_cms_counters 16_777_216
-  @max_merge_sources 10_000
   @max_batch_items 10_000
   @max_int64 9_223_372_036_854_775_807
   @min_int64 -9_223_372_036_854_775_808
@@ -62,7 +61,8 @@ defmodule Ferricstore.Commands.CMS do
          :ok <- ProbType.check_expected(dst, :cms, store),
          :ok <- check_source_types(src_keys, store),
          {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
-         :ok <- validate_sketch_dims(store, src_keys, first_w, first_d) do
+         :ok <- validate_merge_work(length(src_keys), first_w, first_d),
+         :ok <- validate_sketch_dims(store, tl(src_keys), first_w, first_d) do
       create_params = %{width: first_w, depth: first_d}
       result = do_prob_write(store, {:cms_merge, dst, src_keys, weights, create_params})
       normalize_result(result)
@@ -131,7 +131,8 @@ defmodule Ferricstore.Commands.CMS do
          :ok <- ProbType.check_expected(dst, :cms, store),
          :ok <- check_source_types(src_keys, store),
          {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
-         :ok <- validate_sketch_dims(store, src_keys, first_w, first_d) do
+         :ok <- validate_merge_work(numkeys, first_w, first_d),
+         :ok <- validate_sketch_dims(store, tl(src_keys), first_w, first_d) do
       create_params = %{width: first_w, depth: first_d}
       result = do_prob_write(store, {:cms_merge, dst, src_keys, weights, create_params})
       normalize_result(result)
@@ -475,10 +476,24 @@ defmodule Ferricstore.Commands.CMS do
   defp validate_cms_merge_args(_src_keys, _weights),
     do: {:error, "ERR CMS: invalid merge arguments"}
 
-  defp validate_merge_source_count(count) when count <= @max_merge_sources, do: :ok
+  defp validate_merge_source_count(count) do
+    case ProbParameters.validate_cms_merge_source_count(count) do
+      :ok ->
+        :ok
 
-  defp validate_merge_source_count(_count),
-    do: {:error, "ERR CMS: too many source keys (maximum #{@max_merge_sources})"}
+      {:error, :cms_merge_source_limit_exceeded} ->
+        {:error,
+         "ERR CMS: too many source keys (maximum #{ProbParameters.cms_merge_source_limit()})"}
+    end
+  end
+
+  defp validate_merge_work(source_count, width, depth) do
+    case ProbParameters.validate_cms_merge_work(source_count, width, depth) do
+      :ok -> :ok
+      {:error, :cms_merge_work_limit_exceeded} -> {:error, "ERR CMS: merge work limit exceeded"}
+      {:error, _invalid_dimensions} -> {:error, "ERR CMS: invalid merge dimensions"}
+    end
+  end
 
   defp validate_cms_merge_pairs([], []), do: :ok
 

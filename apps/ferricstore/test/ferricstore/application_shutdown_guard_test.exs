@@ -25,6 +25,29 @@ defmodule Ferricstore.ApplicationShutdownGuardTest do
              )
   end
 
+  test "shutdown fallback fsyncs only canonical Bitcask segments" do
+    parent = self()
+    data_dir = "/tmp/ferricstore-shutdown-canonical"
+    shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+
+    assert :ok =
+             Ferricstore.Application.fsync_bitcask_for_shutdown(1, data_dir,
+               active_file_path: fn 0 -> nil end,
+               exists?: fn _path -> false end,
+               list_log_files: fn ^shard_dir ->
+                 {:ok, ["notes.log", "0.log", "compact_0.log", "00000.hint", "00000.log"]}
+               end,
+               fsync: fn path ->
+                 send(parent, {:fsynced, path})
+                 :ok
+               end
+             )
+
+    assert_receive {:fsynced, path}
+    assert path == Path.join(shard_dir, "00000.log")
+    refute_receive {:fsynced, _other}
+  end
+
   test "flow projection shutdown reports one suspend exit without retrying" do
     calls = :atomics.new(1, signed: false)
 

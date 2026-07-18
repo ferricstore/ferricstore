@@ -124,6 +124,53 @@ defmodule Ferricstore.Store.StandaloneTxLogTest do
     assert File.exists?(tx_log_path)
   end
 
+  test "recover rejects duplicate prepare ids instead of replacing the original undo plan" do
+    data_dir = tmp_dir()
+    File.mkdir_p!(data_dir)
+    tx_log_path = Path.join(data_dir, "standalone_cross_shard_tx.log")
+    first_path = Path.join(data_dir, "shard_0/000000.data")
+    second_path = Path.join(data_dir, "shard_1/000000.data")
+
+    first =
+      encode_entry(
+        {:ferricstore_standalone_cross_shard_tx_v1, :prepare, "duplicate-txid",
+         [{first_path, [{:put, "key", "first", 0}]}]}
+      )
+
+    second =
+      encode_entry(
+        {:ferricstore_standalone_cross_shard_tx_v1, :prepare, "duplicate-txid",
+         [{second_path, [{:put, "key", "second", 0}]}]}
+      )
+
+    File.write!(tx_log_path, first <> "\n" <> second <> "\n")
+
+    assert {:error, {:corrupt_entries, 1}} = StandaloneTxLog.recover(data_dir)
+    refute File.exists?(first_path)
+    refute File.exists?(second_path)
+  end
+
+  test "recover rejects terminal markers that precede their prepare" do
+    data_dir = tmp_dir()
+    File.mkdir_p!(data_dir)
+    tx_log_path = Path.join(data_dir, "standalone_cross_shard_tx.log")
+    file_path = Path.join(data_dir, "shard_0/000000.data")
+
+    terminal =
+      encode_entry({:ferricstore_standalone_cross_shard_tx_v1, :commit, "reordered-txid"})
+
+    prepare =
+      encode_entry(
+        {:ferricstore_standalone_cross_shard_tx_v1, :prepare, "reordered-txid",
+         [{file_path, [{:put, "key", "value", 0}]}]}
+      )
+
+    File.write!(tx_log_path, terminal <> "\n" <> prepare <> "\n")
+
+    assert {:error, {:corrupt_entries, 1}} = StandaloneTxLog.recover(data_dir)
+    refute File.exists?(file_path)
+  end
+
   test "recover rejects compressed or trailing current-format entries" do
     for kind <- [:compressed, :trailing] do
       data_dir = Path.join(tmp_dir(), Atom.to_string(kind))

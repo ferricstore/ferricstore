@@ -267,18 +267,77 @@ defmodule Ferricstore.Commands.Generic do
     CrossShardOp.execute(
       [{key, :read_write}, {newkey, :write}],
       fn unified_store ->
-        case key_meta(unified_store, key) do
+        case maybe_key_lifecycle(unified_store, {:rename, key, newkey}) do
+          :not_prob -> rename_non_prob_key(key, newkey, unified_store)
+          result -> result
+        end
+      end,
+      store: store
+    )
+  end
+
+  defp rename_non_prob_key(key, newkey, store) do
+    case key_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      nil ->
+        {:error, "ERR no such key"}
+
+      _expire_at_ms when key == newkey ->
+        :ok
+
+      _expire_at_ms ->
+        case key_entry(store, key) do
           {:error, {:storage_read_failed, _reason}} = failure ->
             ReadResult.command_error(failure)
 
           nil ->
             {:error, "ERR no such key"}
 
-          _expire_at_ms when key == newkey ->
-            :ok
+          entry ->
+            case rename_entry(key, newkey, entry, store) do
+              :ok -> :ok
+              {:error, _} = error -> error
+            end
+        end
+    end
+  end
 
-          _expire_at_ms ->
-            case key_entry(unified_store, key) do
+  defp renamenx_key(key, newkey, store) do
+    CrossShardOp.execute(
+      [{key, :read_write}, {newkey, :write}],
+      fn unified_store ->
+        case maybe_key_lifecycle(unified_store, {:renamenx, key, newkey}) do
+          :not_prob -> renamenx_non_prob_key(key, newkey, unified_store)
+          result -> result
+        end
+      end,
+      store: store
+    )
+  end
+
+  defp renamenx_non_prob_key(key, newkey, store) do
+    case key_meta(store, key) do
+      {:error, {:storage_read_failed, _reason}} = failure ->
+        ReadResult.command_error(failure)
+
+      nil ->
+        {:error, "ERR no such key"}
+
+      _expire_at_ms when key == newkey ->
+        0
+
+      _expire_at_ms ->
+        case key_exists?(store, newkey) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
+          {:ok, true} ->
+            0
+
+          {:ok, false} ->
+            case key_entry(store, key) do
               {:error, {:storage_read_failed, _reason}} = failure ->
                 ReadResult.command_error(failure)
 
@@ -286,59 +345,29 @@ defmodule Ferricstore.Commands.Generic do
                 {:error, "ERR no such key"}
 
               entry ->
-                case rename_entry(key, newkey, entry, unified_store) do
-                  :ok -> :ok
+                case rename_entry(key, newkey, entry, store) do
+                  :ok -> 1
                   {:error, _} = error -> error
                 end
             end
         end
-      end,
-      store: store
-    )
+    end
   end
 
-  defp renamenx_key(key, newkey, store) do
-    CrossShardOp.execute(
-      [{key, :read_write}, {newkey, :write}],
-      fn unified_store ->
-        case key_meta(unified_store, key) do
-          {:error, {:storage_read_failed, _reason}} = failure ->
-            ReadResult.command_error(failure)
+  defp maybe_key_lifecycle(store, command) when is_map(store) do
+    case Map.get(store, :key_lifecycle) do
+      lifecycle when is_function(lifecycle, 1) -> lifecycle.(command)
+      _not_replicated -> maybe_prob_lifecycle(store, command)
+    end
+  end
 
-          nil ->
-            {:error, "ERR no such key"}
+  defp maybe_key_lifecycle(_store, _command), do: :not_prob
 
-          _expire_at_ms when key == newkey ->
-            # Same key -- always 0 since destination "exists"
-            0
-
-          _expire_at_ms ->
-            case key_exists?(unified_store, newkey) do
-              {:error, {:storage_read_failed, _reason}} = failure ->
-                ReadResult.command_error(failure)
-
-              {:ok, true} ->
-                0
-
-              {:ok, false} ->
-                case key_entry(unified_store, key) do
-                  {:error, {:storage_read_failed, _reason}} = failure ->
-                    ReadResult.command_error(failure)
-
-                  nil ->
-                    {:error, "ERR no such key"}
-
-                  entry ->
-                    case rename_entry(key, newkey, entry, unified_store) do
-                      :ok -> 1
-                      {:error, _} = error -> error
-                    end
-                end
-            end
-        end
-      end,
-      store: store
-    )
+  defp maybe_prob_lifecycle(store, command) do
+    case Map.get(store, :prob_lifecycle) do
+      lifecycle when is_function(lifecycle, 1) -> lifecycle.(command)
+      _unsupported -> :not_prob
+    end
   end
 
   defp key_meta(store, key) do
@@ -603,6 +632,13 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_copy(source, destination, replace?, store) do
+    case maybe_key_lifecycle(store, {:copy, source, destination, replace?}) do
+      :not_prob -> do_copy_non_prob(source, destination, replace?, store)
+      result -> result
+    end
+  end
+
+  defp do_copy_non_prob(source, destination, replace?, store) do
     case key_meta(store, source) do
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)

@@ -76,19 +76,25 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
     flush_delay_ms = Keyword.get(opts, :flush_delay_ms, @default_flush_delay_ms)
     retry_delay_ms = Keyword.get(opts, :retry_delay_ms, @default_retry_delay_ms)
     durable_index = ReplaySafeIndex.read(shard_data_path)
+    requested_index = max(durable_index, published_requested_index(instance_ctx, shard_index))
     publish_initial_durable(instance_ctx, shard_index, durable_index)
 
-    {:ok,
-     %{
-       shard_index: shard_index,
-       shard_data_path: shard_data_path,
-       instance_ctx: instance_ctx,
-       durable_index: durable_index,
-       requested_index: durable_index,
-       flush_delay_ms: flush_delay_ms,
-       retry_delay_ms: retry_delay_ms,
-       flush_ref: nil
-     }}
+    state = %{
+      shard_index: shard_index,
+      shard_data_path: shard_data_path,
+      instance_ctx: instance_ctx,
+      durable_index: durable_index,
+      requested_index: requested_index,
+      flush_delay_ms: flush_delay_ms,
+      retry_delay_ms: retry_delay_ms,
+      flush_ref: nil
+    }
+
+    if requested_index > durable_index do
+      {:ok, schedule_flush(state)}
+    else
+      {:ok, state}
+    end
   end
 
   @impl true
@@ -190,6 +196,22 @@ defmodule Ferricstore.Raft.ReplaySafeIndexWriter do
   end
 
   defp publish_requested(_instance_ctx, _shard_index, _index), do: :ok
+
+  defp published_requested_index(
+         %{replay_safe_requested_index: requested_index},
+         shard_index
+       )
+       when is_reference(requested_index) do
+    if shard_index < :atomics.info(requested_index).size do
+      :atomics.get(requested_index, shard_index + 1)
+    else
+      0
+    end
+  rescue
+    _ -> 0
+  end
+
+  defp published_requested_index(_instance_ctx, _shard_index), do: 0
 
   defp record_persist_failure(%{replay_safe_persist_failures: failures}, shard_index)
        when is_reference(failures) do

@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -78,7 +77,31 @@ fn cuckoo_bucket_bytes(
     Ok(bytes)
 }
 
+fn cuckoo_bucket_count(capacity: u32, bucket_size: u8) -> Result<u32, String> {
+    if capacity == 0 {
+        return Err("capacity must be > 0".into());
+    }
+    if bucket_size == 0 {
+        return Err("bucket_size must be > 0".into());
+    }
+
+    let capacity = u64::from(capacity);
+    let bucket_size = u64::from(bucket_size);
+    let num_buckets = (capacity + bucket_size - 1) / bucket_size;
+    u32::try_from(num_buckets).map_err(|_| "cuckoo bucket count overflow".into())
+}
+
 fn cuckoo_file_size(
+    num_buckets: u32,
+    bucket_size: u8,
+    fingerprint_size: u8,
+) -> Result<u64, String> {
+    cuckoo_mutation_token_offset(num_buckets, bucket_size, fingerprint_size)?
+        .checked_add(crate::prob_txn::TOKEN_SIZE as u64)
+        .ok_or_else(|| "cuckoo file size overflow".into())
+}
+
+fn cuckoo_mutation_token_offset(
     num_buckets: u32,
     bucket_size: u8,
     fingerprint_size: u8,
@@ -89,7 +112,7 @@ fn cuckoo_file_size(
             bucket_size,
             fingerprint_size,
         )?)
-        .ok_or_else(|| "cuckoo file size overflow".into())
+        .ok_or_else(|| "cuckoo mutation token offset overflow".into())
 }
 
 fn cuckoo_num_items_after_insert(num_items: u64) -> Result<u64, String> {
@@ -235,10 +258,7 @@ fn cuckoo_file_alternate_bucket(bucket: usize, fp: &[u8], num_buckets: u32) -> u
     ((fp_hash % modulus + modulus - bucket as u64) % modulus) as usize
 }
 
-fn cuckoo_file_candidate_buckets(
-    primary: usize,
-    alternate: usize,
-) -> impl Iterator<Item = usize> {
+fn cuckoo_file_candidate_buckets(primary: usize, alternate: usize) -> impl Iterator<Item = usize> {
     std::iter::once(primary).chain((alternate != primary).then_some(alternate))
 }
 
@@ -314,13 +334,16 @@ fn cuckoo_file_read_slot_staged(
     )
 }
 
-fn cuckoo_file_try_eviction(
+fn cuckoo_file_stage_eviction(
     file: &File,
     hdr: &CuckooFileHeader,
     fp: Vec<u8>,
     start_bucket: usize,
-) -> Result<bool, String> {
+) -> Result<Option<HashMap<(usize, usize), Vec<u8>>>, String> {
     let mut staged: HashMap<(usize, usize), Vec<u8>> = HashMap::new();
+    staged
+        .try_reserve(hdr.max_kicks as usize + 1)
+        .map_err(|_| "cuckoo eviction allocation failed".to_string())?;
     let mut cur_fp = fp;
     let mut cur_bucket = start_bucket;
 
@@ -353,19 +376,7 @@ fn cuckoo_file_try_eviction(
 
             if s.iter().all(|&b| b == 0) {
                 staged.insert((alt, slot_idx), evicted);
-
-                for ((bucket, slot), value) in staged {
-                    cuckoo_file_write_slot(
-                        file,
-                        bucket,
-                        slot,
-                        hdr.bucket_size,
-                        hdr.fingerprint_size,
-                        &value,
-                    )?;
-                }
-
-                return Ok(true);
+                return Ok(Some(staged));
             }
         }
 
@@ -373,7 +384,223 @@ fn cuckoo_file_try_eviction(
         cur_bucket = alt;
     }
 
-    Ok(false)
+    Ok(None)
+}
+
+fn cuckoo_file_try_eviction(
+    file: &File,
+    hdr: &CuckooFileHeader,
+    fp: Vec<u8>,
+    start_bucket: usize,
+) -> Result<bool, String> {
+    let Some(staged) = cuckoo_file_stage_eviction(file, hdr, fp, start_bucket)? else {
+        return Ok(false);
+    };
+    let mut updates = staged.into_iter().collect::<Vec<_>>();
+    updates.sort_unstable_by_key(|((bucket, slot), _)| (*bucket, *slot));
+    for ((bucket, slot), value) in updates {
+        cuckoo_file_write_slot(
+            file,
+            bucket,
+            slot,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+            &value,
+        )?;
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Copy)]
+enum CuckooMutation {
+    Add,
+    AddNx,
+    Delete,
+}
+
+struct CuckooMutationPlan {
+    result: u64,
+    images: Vec<crate::prob_txn::AfterImage>,
+}
+
+fn cuckoo_slot_after_image(
+    hdr: &CuckooFileHeader,
+    bucket: usize,
+    slot: usize,
+    value: Vec<u8>,
+) -> crate::prob_txn::AfterImage {
+    crate::prob_txn::AfterImage::new(
+        cuckoo_file_slot_offset(bucket, slot, hdr.bucket_size, hdr.fingerprint_size),
+        value,
+    )
+}
+
+fn cuckoo_insert_plan(
+    file: &File,
+    hdr: &CuckooFileHeader,
+    element: &[u8],
+    add_nx: bool,
+) -> Result<CuckooMutationPlan, String> {
+    let (fingerprint, primary) =
+        cuckoo_file_fingerprint_and_bucket(element, hdr.fingerprint_size as usize, hdr.num_buckets);
+    let alternate = cuckoo_file_alternate_bucket(primary, &fingerprint, hdr.num_buckets);
+
+    if add_nx {
+        for bucket in cuckoo_file_candidate_buckets(primary, alternate) {
+            for slot in 0..hdr.bucket_size as usize {
+                if cuckoo_file_read_slot(file, bucket, slot, hdr.bucket_size, hdr.fingerprint_size)?
+                    == fingerprint
+                {
+                    return Ok(CuckooMutationPlan {
+                        result: 0,
+                        images: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    let next_num_items = cuckoo_num_items_after_insert(hdr.num_items)?;
+    for bucket in cuckoo_file_candidate_buckets(primary, alternate) {
+        for slot in 0..hdr.bucket_size as usize {
+            let current =
+                cuckoo_file_read_slot(file, bucket, slot, hdr.bucket_size, hdr.fingerprint_size)?;
+            if current.iter().all(|byte| *byte == 0) {
+                return Ok(CuckooMutationPlan {
+                    result: 1,
+                    images: vec![
+                        cuckoo_slot_after_image(hdr, bucket, slot, fingerprint),
+                        crate::prob_txn::AfterImage::new(
+                            OFF_NUM_ITEMS,
+                            next_num_items.to_le_bytes().to_vec(),
+                        ),
+                    ],
+                });
+            }
+        }
+    }
+
+    let Some(staged) = cuckoo_file_stage_eviction(file, hdr, fingerprint, primary)? else {
+        return Err("filter is full".into());
+    };
+    let mut updates = staged.into_iter().collect::<Vec<_>>();
+    updates.sort_unstable_by_key(|((bucket, slot), _)| (*bucket, *slot));
+    let mut images = Vec::new();
+    images
+        .try_reserve_exact(updates.len() + 1)
+        .map_err(|_| "cuckoo mutation journal allocation failed".to_string())?;
+    for ((bucket, slot), value) in updates {
+        images.push(cuckoo_slot_after_image(hdr, bucket, slot, value));
+    }
+    images.push(crate::prob_txn::AfterImage::new(
+        OFF_NUM_ITEMS,
+        next_num_items.to_le_bytes().to_vec(),
+    ));
+    Ok(CuckooMutationPlan { result: 1, images })
+}
+
+fn cuckoo_delete_plan(
+    file: &File,
+    hdr: &CuckooFileHeader,
+    element: &[u8],
+) -> Result<CuckooMutationPlan, String> {
+    let (fingerprint, primary) =
+        cuckoo_file_fingerprint_and_bucket(element, hdr.fingerprint_size as usize, hdr.num_buckets);
+    let alternate = cuckoo_file_alternate_bucket(primary, &fingerprint, hdr.num_buckets);
+
+    for bucket in cuckoo_file_candidate_buckets(primary, alternate) {
+        for slot in 0..hdr.bucket_size as usize {
+            if cuckoo_file_read_slot(file, bucket, slot, hdr.bucket_size, hdr.fingerprint_size)?
+                == fingerprint
+            {
+                let next_num_items = cuckoo_num_items_after_delete(hdr.num_items)?;
+                let next_num_deletes = cuckoo_num_deletes_after_delete(hdr.num_deletes)?;
+                return Ok(CuckooMutationPlan {
+                    result: 1,
+                    images: vec![
+                        cuckoo_slot_after_image(
+                            hdr,
+                            bucket,
+                            slot,
+                            vec![0; hdr.fingerprint_size as usize],
+                        ),
+                        crate::prob_txn::AfterImage::new(
+                            OFF_NUM_ITEMS,
+                            next_num_items.to_le_bytes().to_vec(),
+                        ),
+                        crate::prob_txn::AfterImage::new(
+                            OFF_NUM_DELETES,
+                            next_num_deletes.to_le_bytes().to_vec(),
+                        ),
+                    ],
+                });
+            }
+        }
+    }
+
+    Ok(CuckooMutationPlan {
+        result: 0,
+        images: Vec::new(),
+    })
+}
+
+fn cuckoo_decode_mutation_result(result: &[u8]) -> Result<u64, String> {
+    match result {
+        [value @ 0..=1] => Ok(u64::from(*value)),
+        _ => Err("invalid cuckoo mutation receipt result".into()),
+    }
+}
+
+fn cuckoo_transactional_mutation(
+    file: &File,
+    receipt_path: &Path,
+    header: &CuckooFileHeader,
+    element: &[u8],
+    mutation: CuckooMutation,
+    token: crate::prob_txn::MutationToken,
+) -> Result<u64, String> {
+    let token_offset = cuckoo_mutation_token_offset(
+        header.num_buckets,
+        header.bucket_size,
+        header.fingerprint_size,
+    )?;
+    let file_size = cuckoo_file_size(
+        header.num_buckets,
+        header.bucket_size,
+        header.fingerprint_size,
+    )?;
+    match crate::prob_txn::begin(file, receipt_path, token, token_offset, file_size)? {
+        crate::prob_txn::MutationDecision::Replay(result) => cuckoo_decode_mutation_result(&result),
+        crate::prob_txn::MutationDecision::Stale => match mutation {
+            CuckooMutation::Add => Ok(1),
+            CuckooMutation::AddNx | CuckooMutation::Delete => Ok(0),
+        },
+        crate::prob_txn::MutationDecision::Apply => {
+            let current = cuckoo_read_header(file)?;
+            if current.num_buckets != header.num_buckets
+                || current.bucket_size != header.bucket_size
+                || current.fingerprint_size != header.fingerprint_size
+                || current.max_kicks != header.max_kicks
+            {
+                return Err("cuckoo layout changed while mutation lock was held".into());
+            }
+            let plan = match mutation {
+                CuckooMutation::Add => cuckoo_insert_plan(file, &current, element, false)?,
+                CuckooMutation::AddNx => cuckoo_insert_plan(file, &current, element, true)?,
+                CuckooMutation::Delete => cuckoo_delete_plan(file, &current, element)?,
+            };
+            crate::prob_txn::commit(
+                file,
+                receipt_path,
+                token,
+                token_offset,
+                file_size,
+                plan.images,
+                vec![plan.result as u8],
+            )?;
+            Ok(plan.result)
+        }
+    }
 }
 
 /// Error type for file open operations distinguishing not-found from other errors.

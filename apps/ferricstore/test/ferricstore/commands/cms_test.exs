@@ -404,7 +404,7 @@ defmodule Ferricstore.Commands.CMSTest do
       assert [26] = CMS.handle("CMS.QUERY", ["dst", "a"], store)
     end
 
-    test "merges into existing destination (additive)" do
+    test "overwrites an existing destination and is idempotent" do
       store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["dst", "100", "7"], store)
       :ok = CMS.handle("CMS.INITBYDIM", ["src1", "100", "7"], store)
@@ -412,7 +412,10 @@ defmodule Ferricstore.Commands.CMSTest do
       CMS.handle("CMS.INCRBY", ["src1", "a", "5"], store)
 
       assert :ok = CMS.handle("CMS.MERGE", ["dst", "1", "src1"], store)
-      assert [15] = CMS.handle("CMS.QUERY", ["dst", "a"], store)
+      assert [5] = CMS.handle("CMS.QUERY", ["dst", "a"], store)
+
+      assert :ok = CMS.handle("CMS.MERGE", ["dst", "1", "src1"], store)
+      assert [5] = CMS.handle("CMS.QUERY", ["dst", "a"], store)
     end
 
     test "returns error when source sketches have different dimensions" do

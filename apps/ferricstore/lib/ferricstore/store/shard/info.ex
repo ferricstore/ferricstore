@@ -404,7 +404,7 @@ defmodule Ferricstore.Store.Shard.Info do
       end
 
       def handle_info(
-            {:DOWN, monitor_ref, :process, owner_pid, _reason},
+            {:DOWN, monitor_ref, :process, owner_pid, reason},
             %{
               standalone_write_barrier: %{
                 monitor_ref: monitor_ref,
@@ -412,7 +412,10 @@ defmodule Ferricstore.Store.Shard.Info do
               }
             } = state
           ) do
-        {:noreply, release_standalone_write_barrier(state)}
+        # The coordinator may have died after syncing cross-shard records but
+        # before publishing this shard's ETS keydir. Restarting forces startup
+        # journal recovery and a disk-backed keydir rebuild before writes resume.
+        {:stop, {:shutdown, {:standalone_cross_shard_owner_down, reason}}, state}
       end
 
       def handle_info({:DOWN, monitor_ref, :process, owner_pid, _reason}, state) do

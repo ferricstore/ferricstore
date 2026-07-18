@@ -644,11 +644,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
       end
 
       defp rollback_pending_prob_creates(state) do
-        :sm_pending_prob_creates
-        |> Process.get([])
-        |> Enum.uniq()
-        |> Enum.each(fn path ->
-          cleanup_created_prob_file(state, path)
+        :sm_pending_prob_paths
+        |> Process.get(%{by_final: %{}})
+        |> Map.get(:by_final, %{})
+        |> Enum.each(fn {_final_path, create_path} ->
+          cleanup_created_prob_file(state, create_path)
+          cleanup_created_prob_file(state, prob_mutation_receipt_path(create_path))
         end)
       end
 
@@ -790,6 +791,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         # Without this, a background PUT arriving after the tombstone would
         # resurrect the key on recovery (Bitcask last-record-wins semantics).
         with :ok <- flush_pending_for_key(state, key) do
+          prob_type =
+            if CompoundKey.internal_key?(key), do: nil, else: prob_type_marker(state, key)
+
           prob_path = prob_file_path_for_delete(state, key)
 
           case resolve_active_file(state) do
@@ -798,38 +802,47 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
               {:error, :active_file_unavailable}
 
             {_file_path, _file_id} ->
-              if cross_shard_pending_active?() do
-                ctx = cross_shard_pending_ctx(state)
-                record_cross_shard_pending_original(ctx, key)
+              with :ok <- maybe_delete_prob_type_marker(state, key, prob_type) do
+                if cross_shard_pending_active?() do
+                  ctx = cross_shard_pending_ctx(state)
+                  record_cross_shard_pending_original(ctx, key)
 
-                track_keydir_binary_delta_for_keydir(
-                  state,
-                  ctx.keydir,
-                  ctx.index,
-                  key,
-                  nil,
-                  0
-                )
+                  track_keydir_binary_delta_for_keydir(
+                    state,
+                    ctx.keydir,
+                    ctx.index,
+                    key,
+                    nil,
+                    0
+                  )
 
-                :ets.delete(ctx.keydir, key)
-                queue_cross_shard_pending_delete(ctx, key)
-                maybe_queue_lmdb_state_delete_after_publish(state, key)
-              else
-                record_pending_original(state, key)
-                queue_pending_delete(key, prob_path)
+                  :ets.delete(ctx.keydir, key)
+                  queue_cross_shard_pending_delete(ctx, key)
+                  maybe_queue_lmdb_state_delete_after_publish(state, key)
+                else
+                  record_pending_original(state, key)
+                  queue_pending_delete(key, prob_path)
 
-                unless standalone_staged_apply?() do
-                  track_keydir_binary_remove(state, key)
-                  :ets.delete(state.ets, key)
-                  maybe_queue_lmdb_state_delete(state, key)
+                  unless standalone_staged_apply?() do
+                    track_keydir_binary_remove(state, key)
+                    :ets.delete(state.ets, key)
+                    maybe_queue_lmdb_state_delete(state, key)
+                  end
                 end
-              end
 
-              queue_compound_promotion_removal_after_flush(key)
-              :ok
+                queue_compound_promotion_removal_after_flush(key)
+                :ok
+              end
           end
         end
       end
+
+      defp maybe_delete_prob_type_marker(state, key, type)
+           when type in [:bloom, :cms, :cuckoo, :topk] do
+        do_delete(state, CompoundKey.type_key(key))
+      end
+
+      defp maybe_delete_prob_type_marker(_state, _key, _type), do: :ok
 
       defp queue_compound_promotion_removal_after_flush(<<"PM:", _::binary>> = marker_key) do
         redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(marker_key)

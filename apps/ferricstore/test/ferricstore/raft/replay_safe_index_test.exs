@@ -322,6 +322,48 @@ defmodule Ferricstore.Raft.ReplaySafeIndexTest do
     File.rm_rf(dir)
   end
 
+  test "writer restart resumes the highest published request without another request" do
+    shard_index = 0
+    dir = tmp_dir()
+    durable = :atomics.new(1, signed: false)
+    requested = :atomics.new(1, signed: false)
+    instance_name = :"replay_safe_resume_#{System.unique_integer([:positive])}"
+
+    instance_ctx = %{
+      name: instance_name,
+      replay_safe_index: durable,
+      replay_safe_requested_index: requested
+    }
+
+    {:ok, writer} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        instance_ctx: instance_ctx,
+        flush_delay_ms: 1_000
+      )
+
+    assert :requested = ReplaySafeIndexWriter.request(instance_ctx, shard_index, dir, 890)
+    GenServer.stop(writer)
+
+    assert ReplaySafeIndex.read(dir) == 0
+    assert :atomics.get(requested, 1) == 890
+
+    {:ok, writer2} =
+      ReplaySafeIndexWriter.start_link(
+        shard_index: shard_index,
+        shard_data_path: dir,
+        instance_ctx: instance_ctx,
+        retry_delay_ms: 10
+      )
+
+    assert wait_until(fn -> ReplaySafeIndex.read(dir) == 890 end)
+    assert :atomics.get(durable, 1) == 890
+
+    GenServer.stop(writer2)
+    File.rm_rf(dir)
+  end
+
   defp tmp_dir do
     suffix = "#{System.os_time(:nanosecond)}_#{System.unique_integer([:positive])}"
     Path.join(System.tmp_dir!(), "replay_safe_index_#{suffix}")

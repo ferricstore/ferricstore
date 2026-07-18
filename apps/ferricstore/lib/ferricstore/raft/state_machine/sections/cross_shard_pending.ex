@@ -292,6 +292,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
         do: %{data_dir: data_dir}
 
       defp record_cross_shard_pending_original(ctx, key) do
+        queue_cross_shard_prob_cleanup(ctx, key)
+
         originals = Process.get(:sm_cross_shard_pending_originals, %{})
         original_key = {ctx.keydir, key}
 
@@ -309,6 +311,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             Map.put(originals, original_key, {ctx.index, original})
           )
         end
+      end
+
+      defp queue_cross_shard_prob_cleanup(ctx, key) do
+        unless CompoundKey.internal_key?(key) do
+          type_key = CompoundKey.type_key(key)
+
+          marker =
+            case sm_tx_pending_meta(type_key) do
+              {value, _expire_at_ms} -> value
+              :tx_deleted -> nil
+              nil -> cross_shard_ets_read(ctx, type_key)
+            end
+
+          case prob_type_from_marker(marker) do
+            type when type in [:bloom, :cms, :cuckoo, :topk] ->
+              path =
+                ctx.shard_data_path
+                |> Path.join("prob")
+                |> Ferricstore.ProbFile.path(key, prob_extension(type))
+
+              queue_pending_prob_delete(path)
+
+            _missing_or_non_prob ->
+              :ok
+          end
+        end
+
+        :ok
       end
 
       defp queue_cross_shard_pending_put(ctx, key, disk_value, expire_at_ms, ets_value) do
@@ -384,16 +414,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
 
             case flush_result do
               :ok ->
-                publish_pending_compound_revisions(state)
-                dispatch_pending_compound_promotions(state)
-
-                case publish_pending_flow_history_projections(state) do
+                case publish_pending_prob_files(state) do
                   :ok ->
-                    result
+                    publish_pending_compound_revisions(state)
+                    dispatch_pending_compound_promotions(state)
 
-                  {:error, reason} ->
-                    handle_flow_history_projection_publish_failure(state, reason)
-                    result
+                    case publish_pending_flow_history_projections(state) do
+                      :ok ->
+                        result
+
+                      {:error, reason} ->
+                        handle_flow_history_projection_publish_failure(state, reason)
+                        result
+                    end
+
+                  {:error, _reason} = error ->
+                    error
                 end
 
               {:error, _reason} = error ->
@@ -410,6 +446,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             :erlang.raise(kind, reason, __STACKTRACE__)
         after
           clear_pending_write_process_state()
+        end
+      end
+
+      defp publish_pending_prob_files(state) do
+        with :ok <- publish_pending_prob_creates() do
+          publish_pending_prob_deletes(state)
         end
       end
 

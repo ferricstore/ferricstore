@@ -1,4 +1,33 @@
-/// Create a new cuckoo filter file with the given capacity and bucket_size.
+fn cuckoo_file_mutate_at(
+    path: &str,
+    receipt_path: &str,
+    element: &[u8],
+    mutation_index: u64,
+    mutation_ordinal: u64,
+    mutation: CuckooMutation,
+) -> Result<u64, FileOpenError> {
+    let token = crate::prob_txn::MutationToken::new(mutation_index, mutation_ordinal);
+    if token == crate::prob_txn::MutationToken::ZERO {
+        return Err(FileOpenError::Other(
+            "cuckoo mutation token must be non-zero".into(),
+        ));
+    }
+    let file = cuckoo_file_open_rw(path)?;
+    let header = cuckoo_read_header(&file).map_err(FileOpenError::Other)?;
+    let result = cuckoo_transactional_mutation(
+        &file,
+        Path::new(receipt_path),
+        &header,
+        element,
+        mutation,
+        token,
+    )
+    .map_err(FileOpenError::Other)?;
+    crate::fadvise_dontneed(&file, 0, 0);
+    Ok(result)
+}
+
+/// Create a new cuckoo filter with at least `capacity` item slots.
 /// Uses fingerprint_size=1 and max_kicks=500.
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
 #[rustler::nif(schedule = "DirtyIo")]
@@ -9,16 +38,13 @@ pub fn cuckoo_file_create(
     capacity: u32,
     bucket_size: u8,
 ) -> NifResult<Term> {
-    if capacity == 0 {
-        return Ok((atoms::error(), "capacity must be > 0").encode(env));
-    }
-    if bucket_size == 0 {
-        return Ok((atoms::error(), "bucket_size must be > 0").encode(env));
-    }
-
     let fingerprint_size = FILE_DEFAULT_FINGERPRINT_SIZE as u8;
     let max_kicks = FILE_DEFAULT_MAX_KICKS;
-    let file_size = match cuckoo_file_size(capacity, bucket_size, fingerprint_size) {
+    let num_buckets = match cuckoo_bucket_count(capacity, bucket_size) {
+        Ok(count) => count,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
+    let file_size = match cuckoo_file_size(num_buckets, bucket_size, fingerprint_size) {
         Ok(size) => size,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
@@ -38,7 +64,7 @@ pub fn cuckoo_file_create(
     let mut header = [0u8; HEADER_SIZE];
     header[0..2].copy_from_slice(&MAGIC);
     header[2] = VERSION;
-    header[3..7].copy_from_slice(&capacity.to_le_bytes());
+    header[3..7].copy_from_slice(&num_buckets.to_le_bytes());
     header[7] = bucket_size;
     header[8] = fingerprint_size;
     header[9..11].copy_from_slice(&max_kicks.to_le_bytes());
@@ -173,6 +199,30 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 
     crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::error(), "filter is full").encode(env))
+}
+
+/// Add an element using a deterministic Raft mutation token.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn cuckoo_file_add_at<'a>(
+    env: Env<'a>,
+    path: String,
+    receipt_path: String,
+    element: Binary<'a>,
+    mutation_index: u64,
+    mutation_ordinal: u64,
+) -> NifResult<Term<'a>> {
+    match cuckoo_file_mutate_at(
+        &path,
+        &receipt_path,
+        element.as_slice(),
+        mutation_index,
+        mutation_ordinal,
+        CuckooMutation::Add,
+    ) {
+        Ok(result) => Ok((atoms::ok(), result).encode(env)),
+        Err(error) => Ok(encode_file_open_error(env, error)),
+    }
 }
 
 /// Add an element only if it does not already exist.
@@ -320,6 +370,30 @@ pub fn cuckoo_file_addnx<'a>(
     Ok((atoms::error(), "filter is full").encode(env))
 }
 
+/// Add an element if absent using a deterministic Raft mutation token.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn cuckoo_file_addnx_at<'a>(
+    env: Env<'a>,
+    path: String,
+    receipt_path: String,
+    element: Binary<'a>,
+    mutation_index: u64,
+    mutation_ordinal: u64,
+) -> NifResult<Term<'a>> {
+    match cuckoo_file_mutate_at(
+        &path,
+        &receipt_path,
+        element.as_slice(),
+        mutation_index,
+        mutation_ordinal,
+        CuckooMutation::AddNx,
+    ) {
+        Ok(result) => Ok((atoms::ok(), result).encode(env)),
+        Err(error) => Ok(encode_file_open_error(env, error)),
+    }
+}
+
 /// Delete one occurrence of an element from a cuckoo filter file.
 /// Returns `{:ok, 0}` (not found) or `{:ok, 1}` (deleted), or `{:error, reason}`.
 #[rustler::nif(schedule = "DirtyIo")]
@@ -437,6 +511,30 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 
     crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), 0u64).encode(env))
+}
+
+/// Delete an element using a deterministic Raft mutation token.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn cuckoo_file_del_at<'a>(
+    env: Env<'a>,
+    path: String,
+    receipt_path: String,
+    element: Binary<'a>,
+    mutation_index: u64,
+    mutation_ordinal: u64,
+) -> NifResult<Term<'a>> {
+    match cuckoo_file_mutate_at(
+        &path,
+        &receipt_path,
+        element.as_slice(),
+        mutation_index,
+        mutation_ordinal,
+        CuckooMutation::Delete,
+    ) {
+        Ok(result) => Ok((atoms::ok(), result).encode(env)),
+        Err(error) => Ok(encode_file_open_error(env, error)),
+    }
 }
 
 /// Check if an element may exist in a cuckoo filter file.
@@ -621,8 +719,8 @@ pub fn cuckoo_file_exists_async<'a>(
 
     crate::async_io::runtime().spawn(async move {
         let result = blocking_task
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -675,8 +773,8 @@ pub fn cuckoo_file_mexists_async<'a>(
 
     crate::async_io::runtime().spawn(async move {
         let result = blocking_task
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -744,8 +842,8 @@ pub fn cuckoo_file_count_async<'a>(
 
     crate::async_io::runtime().spawn(async move {
         let result = blocking_task
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -798,8 +896,8 @@ pub fn cuckoo_file_info_async(
 
     crate::async_io::runtime().spawn(async move {
         let result = blocking_task
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {

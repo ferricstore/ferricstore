@@ -55,6 +55,7 @@ rustler::atoms! {
     directory_not_empty,
     invalid_path,
     symlink,
+    cross_device,
     too_large,
     other,
 }
@@ -76,6 +77,7 @@ fn encode_error<'a>(env: Env<'a>, err: &io::Error) -> Term<'a> {
             Some(libc::ENOTEMPTY) => directory_not_empty(),
             Some(libc::EINVAL) => invalid_path(),
             Some(libc::ELOOP) => symlink(),
+            Some(libc::EXDEV) => cross_device(),
             _ => other(),
         },
     };
@@ -440,13 +442,147 @@ fn fs_copy_sync_nofollow(env: Env<'_>, source: String, dest: String) -> NifResul
     }
 }
 
+/// Stream a locked regular file into an atomically replaced destination.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fs_copy_replace_sync_nofollow(
+    env: Env<'_>,
+    source: String,
+    dest: String,
+) -> NifResult<Term<'_>> {
+    if let Err(term) = validate_path(env, &source) {
+        return Ok(term);
+    }
+    if let Err(term) = validate_path(env, &dest) {
+        return Ok(term);
+    }
+
+    let result = copy_replace_sync_nofollow(Path::new(&source), Path::new(&dest));
+    let _ = consume_timeslice(env, 1);
+    match result {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(error) => Ok(encode_error(env, &error)),
+    }
+}
+
+fn copy_replace_sync_nofollow(source: &Path, dest: &Path) -> io::Result<()> {
+    let mut source_file = crate::open_random_read_locked(source)?;
+    let source_metadata = source_file.metadata()?;
+    let mut staged = crate::create_staged_locked_nofollow(dest)?;
+
+    let copied = io::copy(&mut *source_file, &mut *staged)?;
+    if copied != source_metadata.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "sidecar source changed while copying: expected {} bytes, copied {copied}",
+                source_metadata.len()
+            ),
+        ));
+    }
+
+    staged.set_permissions(source_metadata.permissions())?;
+    staged.publish()
+}
+
+/// Publish another hard link to a locked regular file under `dest`.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fs_hard_link_replace_sync_nofollow(
+    env: Env<'_>,
+    source: String,
+    dest: String,
+) -> NifResult<Term<'_>> {
+    if let Err(term) = validate_path(env, &source) {
+        return Ok(term);
+    }
+    if let Err(term) = validate_path(env, &dest) {
+        return Ok(term);
+    }
+
+    let result = hard_link_replace_sync_nofollow(Path::new(&source), Path::new(&dest));
+    let _ = consume_timeslice(env, 1);
+    match result {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(error) => Ok(encode_error(env, &error)),
+    }
+}
+
+#[cfg(unix)]
+fn hard_link_replace_sync_nofollow(source: &Path, dest: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let source_file = crate::open_random_read_locked(source)?;
+    let source_metadata = source_file.metadata()?;
+    let parent = dest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+
+    let temp_path = create_hard_link_temp(source, parent, file_name)?;
+    let result = (|| {
+        let linked_file = crate::open_random_read(&temp_path)?;
+        let linked_metadata = linked_file.metadata()?;
+        if source_metadata.dev() != linked_metadata.dev()
+            || source_metadata.ino() != linked_metadata.ino()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sidecar source changed while creating hard link",
+            ));
+        }
+
+        crate::path_open::rename_nofollow(&temp_path, dest)?;
+        sync_directory_nofollow(parent)
+    })();
+
+    if result.is_err() {
+        let _ = crate::path_open::remove_file_nofollow(&temp_path);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn create_hard_link_temp(
+    source: &Path,
+    parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> io::Result<std::path::PathBuf> {
+    for _ in 0..128 {
+        let sequence = ATOMIC_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_name = format!(
+            ".{}.ferric-link-{}-{sequence}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        );
+        let temp_path = parent.join(temp_name);
+
+        match std::fs::hard_link(source, &temp_path) {
+            Ok(()) => return Ok(temp_path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate exclusive hard-link temporary path",
+    ))
+}
+
+#[cfg(not(unix))]
+fn hard_link_replace_sync_nofollow(source: &Path, dest: &Path) -> io::Result<()> {
+    copy_replace_sync_nofollow(source, dest)
+}
+
 fn copy_sync_nofollow(source: &Path, dest: &Path) -> io::Result<()> {
-    let mut source_file = open_file_nofollow(source.to_string_lossy().as_ref())?;
+    let mut source_file = crate::open_random_read_locked(source)?;
     let source_metadata = source_file.metadata()?;
     let mut dest_file = create_copy_destination_nofollow(dest)?;
 
     let result = (|| {
-        let copied = io::copy(&mut source_file, &mut dest_file)?;
+        let copied = io::copy(&mut *source_file, &mut dest_file)?;
         if copied != source_metadata.len() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

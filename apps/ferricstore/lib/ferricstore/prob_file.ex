@@ -39,12 +39,96 @@ defmodule Ferricstore.ProbFile do
   @spec staged_filename?(term()) :: boolean()
   def staged_filename?("." <> filename) do
     case String.split(filename, ".ferric-sidecar-", parts: 2) do
-      [destination, sequence] when sequence != "" -> valid_filename?(destination)
-      _other -> false
+      [destination, sequence] when sequence != "" ->
+        valid_filename?(destination) or pending_create_filename?(destination) or
+          mutation_filename?(destination) or pending_mutation_filename?(destination)
+
+      _other ->
+        false
     end
   end
 
   def staged_filename?(_filename), do: false
+
+  @spec pending_create_filename?(term()) :: boolean()
+  def pending_create_filename?(filename) when is_binary(filename) do
+    suffix = ".pending-create"
+    destination_size = byte_size(filename) - byte_size(suffix)
+
+    if destination_size > 0 do
+      case filename do
+        <<destination::binary-size(destination_size), ^suffix::binary>> ->
+          valid_filename?(destination)
+
+        _other ->
+          false
+      end
+    else
+      false
+    end
+  end
+
+  def pending_create_filename?(_filename), do: false
+
+  @spec mutation_filename?(term()) :: boolean()
+  def mutation_filename?(filename) when is_binary(filename) do
+    case mutation_target_filename(filename) do
+      {:ok, _target} -> true
+      :error -> false
+    end
+  end
+
+  def mutation_filename?(_filename), do: false
+
+  @spec mutation_target_filename(term()) :: {:ok, binary()} | :error
+  def mutation_target_filename(filename) when is_binary(filename) do
+    suffix = ".mutation"
+    target_size = byte_size(filename) - byte_size(suffix)
+
+    if target_size > 0 do
+      case filename do
+        <<target::binary-size(target_size), ^suffix::binary>> ->
+          if valid_filename?(target), do: {:ok, target}, else: :error
+
+        _other ->
+          :error
+      end
+    else
+      :error
+    end
+  end
+
+  def mutation_target_filename(_filename), do: :error
+
+  @spec pending_mutation_filename?(term()) :: boolean()
+  def pending_mutation_filename?(filename) when is_binary(filename) do
+    case pending_mutation_target_filename(filename) do
+      {:ok, _target} -> true
+      :error -> false
+    end
+  end
+
+  def pending_mutation_filename?(_filename), do: false
+
+  @spec pending_mutation_target_filename(term()) :: {:ok, binary()} | :error
+  def pending_mutation_target_filename(filename) when is_binary(filename) do
+    suffix = ".pending-create.mutation"
+    target_size = byte_size(filename) - byte_size(suffix)
+
+    if target_size > 0 do
+      case filename do
+        <<target::binary-size(target_size), ^suffix::binary>> ->
+          if valid_filename?(target), do: {:ok, target}, else: :error
+
+        _other ->
+          :error
+      end
+    else
+      :error
+    end
+  end
+
+  def pending_mutation_target_filename(_filename), do: :error
 
   defp valid_digest?(digest) when byte_size(digest) == @digest_hex_bytes do
     digest

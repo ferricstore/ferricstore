@@ -36,6 +36,7 @@ defmodule Ferricstore.Raft.CommandBatchingTest do
           :flow_policy_migration_step,
           :flow_policy_put,
           :flush_shard,
+          :key_lifecycle,
           :server_catalog_mutate,
           :server_catalog_replace,
           :ttb,

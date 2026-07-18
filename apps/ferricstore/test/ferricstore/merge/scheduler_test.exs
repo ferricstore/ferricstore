@@ -188,6 +188,59 @@ defmodule Ferricstore.Merge.SchedulerTest do
       end
     end
 
+    test "init rejects noncanonical segment aliases" do
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_noncanonical_segment_#{System.unique_integer([:positive])}"
+        )
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      File.mkdir_p!(shard_dir)
+      File.write!(Path.join(shard_dir, "000000.log"), "alias")
+
+      try do
+        assert {:stop,
+                {:merge_log_file_count_failed, 0,
+                 {:noncanonical_segment_filename, "000000.log", "00000.log"}}} =
+                 Scheduler.init(
+                   shard_index: 0,
+                   data_dir: data_dir,
+                   merge_config: %{mode: :hot, min_files_for_merge: 100}
+                 )
+      after
+        File.rm_rf!(data_dir)
+      end
+    end
+
+    test "init does not count numeric symlinks as local segments" do
+      data_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "scheduler_segment_symlink_#{System.unique_integer([:positive])}"
+        )
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+      external = Path.join(data_dir, "external.log")
+      File.mkdir_p!(shard_dir)
+      File.write!(Path.join(shard_dir, "00000.log"), "local")
+      File.write!(external, "external")
+      File.ln_s!(external, Path.join(shard_dir, "00001.log"))
+
+      try do
+        assert {:ok, state} =
+                 Scheduler.init(
+                   shard_index: 0,
+                   data_dir: data_dir,
+                   merge_config: %{mode: :hot, min_files_for_merge: 100}
+                 )
+
+        assert state.file_count == 1
+      after
+        File.rm_rf!(data_dir)
+      end
+    end
+
     test "init fails closed when interrupted merge recovery fails" do
       data_dir =
         Path.join(

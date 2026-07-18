@@ -5,6 +5,12 @@ defmodule Ferricstore.Commands.Strings.Range do
   alias Ferricstore.Store.{Ops, ReadResult}
 
   def getrange_parsed(key, start_idx, end_idx, store) do
+    with :ok <- Compound.ensure_string_key(key, store) do
+      do_getrange_parsed(key, start_idx, end_idx, store)
+    end
+  end
+
+  defp do_getrange_parsed(key, start_idx, end_idx, store) do
     case metadata_value_size(store, key) do
       {:error, {:storage_read_failed, _reason}} = failure ->
         ReadResult.command_error(failure)

@@ -508,6 +508,18 @@ defmodule Ferricstore.Commands.Strings do
             ReadResult.command_error(failure)
         end
 
+      {:ok, <<131, _rest::binary>> = value} ->
+        case Compound.data_structure_status(key, store) do
+          :compound ->
+            @wrongtype_error
+
+          :plain ->
+            {:ok, value}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+        end
+
       {:ok, value} ->
         {:ok, value}
 
@@ -559,11 +571,25 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   defp mget_keys(keys, store) do
-    values = Ops.batch_get(store, keys)
+    values =
+      keys
+      |> Enum.zip(Ops.batch_get(store, keys))
+      |> Enum.map(fn
+        {key, <<131, _rest::binary>> = value} -> mget_external_term_value(key, value, store)
+        {_key, value} -> value
+      end)
 
     case ReadResult.first_failure(values) do
       nil -> values
       failure -> ReadResult.command_error(failure)
+    end
+  end
+
+  defp mget_external_term_value(key, value, store) do
+    case Compound.data_structure_status(key, store) do
+      :compound -> nil
+      :plain -> value
+      {:error, {:storage_read_failed, _reason}} = failure -> failure
     end
   end
 
@@ -789,6 +815,9 @@ defmodule Ferricstore.Commands.Strings do
             ReadResult.command_error(failure)
         end
 
+      <<131, _rest::binary>> = value ->
+        classify_external_term_string_value(key, value, store)
+
       value when is_binary(value) ->
         {:value, value}
 
@@ -799,6 +828,14 @@ defmodule Ferricstore.Commands.Strings do
 
   def ensure_string_key(key, store) do
     Compound.ensure_string_key(key, store)
+  end
+
+  defp classify_external_term_string_value(key, value, store) do
+    case Compound.data_structure_status(key, store) do
+      :compound -> @wrongtype_error
+      :plain -> {:value, value}
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+    end
   end
 
   defp read_string_size(key, store) do
@@ -819,7 +856,16 @@ defmodule Ferricstore.Commands.Strings do
         end
 
       size ->
-        {:size, size}
+        case Compound.data_structure_status(key, store) do
+          :compound ->
+            @wrongtype_error
+
+          :plain ->
+            {:size, size}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+        end
     end
   end
 

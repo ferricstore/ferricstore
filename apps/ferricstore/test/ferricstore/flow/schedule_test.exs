@@ -766,6 +766,46 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert Enum.map(schedules, & &1.id) == [later_id]
   end
 
+  test "schedule list fails closed when a partition exceeds its candidate scan limit" do
+    previous = Application.get_env(:ferricstore, :flow_schedule_list_scan_limit)
+
+    on_exit(fn ->
+      case previous do
+        nil -> Application.delete_env(:ferricstore, :flow_schedule_list_scan_limit)
+        value -> Application.put_env(:ferricstore, :flow_schedule_list_scan_limit, value)
+      end
+    end)
+
+    Application.put_env(:ferricstore, :flow_schedule_list_scan_limit, 2)
+    id_prefix = unique_flow_id("schedule-list-overflow")
+
+    schedule_ids =
+      Enum.reduce_while(0..10_000, %{}, fn suffix, ids_by_bucket ->
+        id = id_prefix <> ":" <> Integer.to_string(suffix)
+        bucket = :erlang.phash2(id, 256)
+        ids = [id | Map.get(ids_by_bucket, bucket, [])]
+
+        if length(ids) == 3 do
+          {:halt, Enum.reverse(ids)}
+        else
+          {:cont, Map.put(ids_by_bucket, bucket, ids)}
+        end
+      end)
+
+    for {id, at_ms} <- Enum.with_index(schedule_ids, 4_000) do
+      assert {:ok, _schedule} =
+               FerricStore.flow_schedule_create(id,
+                 kind: :one_shot,
+                 at_ms: at_ms,
+                 now_ms: 3_999,
+                 target: [id: id <> ":target", type: "schedule-list-overflow-target"]
+               )
+    end
+
+    assert {:error, "ERR flow schedule query candidate limit exceeded (2)"} =
+             FerricStore.flow_schedule_list(count: 1)
+  end
+
   test "schedule due ranges exclude terminal schedules without a next run" do
     now_ms = 3_975
     schedule_id = unique_flow_id("schedule-list-terminal-range")

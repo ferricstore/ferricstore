@@ -83,7 +83,9 @@ defmodule Ferricstore.Commands.Strings.Compound do
         nil ->
           {:ok, nil, :unsupported}
 
-        type ->
+        type_marker ->
+          type = CompoundKey.type_name(type_marker)
+
           case compound_clear_backup(key, type, store) do
             {:ok, backup} ->
               case delete_compound_data_for_replacement(key, type, type_key, store) do
@@ -104,11 +106,18 @@ defmodule Ferricstore.Commands.Strings.Compound do
   def scanned_key(prefix, key), do: CompoundSnapshot.scanned_key(prefix, key)
 
   defp delete_compound_data_for_replacement(key, type, type_key, store) do
-    with :ok <- clear_compound_prefix(key, type, store),
+    with :ok <- delete_prob_metadata_for_replacement(key, type, store),
+         :ok <- clear_compound_prefix(key, type, store),
          :ok <- Ops.compound_delete(store, key, type_key) do
       :ok
     end
   end
+
+  defp delete_prob_metadata_for_replacement(key, type, store)
+       when type in ["bloom", "cms", "cuckoo", "topk"],
+       do: Ops.delete(store, key)
+
+  defp delete_prob_metadata_for_replacement(_key, _type, _store), do: :ok
 
   defp cleanup_replaced_stream(key, "stream", store),
     do: Delete.cleanup_stream_metadata(key, store)

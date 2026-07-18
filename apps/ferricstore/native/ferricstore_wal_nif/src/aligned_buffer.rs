@@ -19,6 +19,7 @@ pub struct AlignedBuffer {
     ptr: *mut u8,
     len: usize,
     capacity: usize,
+    base_capacity: usize,
 }
 
 // Safety: AlignedBuffer owns its memory and only accessed under Mutex
@@ -40,6 +41,7 @@ impl AlignedBuffer {
             ptr,
             len: 0,
             capacity,
+            base_capacity: capacity,
         }
     }
 
@@ -88,6 +90,7 @@ impl AlignedBuffer {
 
         let old_ptr = self.ptr;
         let old_len = self.len;
+        let old_capacity = self.capacity;
         let padded_len = round_up(old_len, ALIGNMENT);
 
         // Zero-fill the padding region so recovery sees clean zeros
@@ -98,14 +101,15 @@ impl AlignedBuffer {
         }
 
         // Allocate a fresh buffer for new writes
-        self.ptr = alloc_aligned(self.capacity);
+        self.ptr = alloc_aligned(self.base_capacity);
         self.len = 0;
+        self.capacity = self.base_capacity;
 
         TakenBuffer {
             ptr: old_ptr,
             logical_len: old_len,
             padded_len,
-            allocation_size: self.capacity,
+            allocation_size: old_capacity,
         }
     }
 
@@ -326,6 +330,21 @@ mod tests {
         // Verify data integrity after grow
         let taken = buf.take();
         assert_eq!(&taken.as_padded_slice()[..ALIGNMENT * 3], &data[..]);
+    }
+
+    #[test]
+    fn test_take_releases_grown_producer_capacity() {
+        let mut buf = AlignedBuffer::new();
+        let data = vec![0xABu8; INITIAL_CAPACITY * 4];
+        buf.extend(&data);
+        let grown_capacity = buf.capacity;
+        assert!(grown_capacity >= data.len());
+
+        let taken = buf.take();
+
+        assert_eq!(taken.allocation_size, grown_capacity);
+        assert_eq!(taken.as_logical_slice(), data);
+        assert_eq!(buf.capacity, INITIAL_CAPACITY);
     }
 
     #[test]

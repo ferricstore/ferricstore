@@ -44,6 +44,42 @@ defmodule Ferricstore.Cluster.TargetDataProbeTest do
     assert {:ok, true} = Target.probe_target_log_files(node(), root, ["00000.log"])
   end
 
+  test "unrelated log-suffixed files are not treated as Bitcask state", %{root: root} do
+    unrelated = Path.join(root, "notes.log")
+    assert {:ok, _locations} = NIF.v2_append_batch(unrelated, [{"user-key", "value", 0}])
+
+    assert {:ok, false} = Target.probe_target_log_files(node(), root, ["notes.log"])
+  end
+
+  test "noncanonical segment aliases fail the target data probe", %{root: root} do
+    alias_path = Path.join(root, "0.log")
+    assert {:ok, _locations} = NIF.v2_append_batch(alias_path, [{"user-key", "value", 0}])
+
+    assert {:error,
+            {:target_data_probe_failed, target,
+             {:noncanonical_segment_filename, "0.log", "00000.log"}}} =
+             Target.probe_target_log_files(node(), root, ["0.log"])
+
+    assert target == node()
+  end
+
+  test "Bitcask log probes reject numeric symlinks without scanning them", %{root: root} do
+    outside = root <> "_log_outside"
+    external_log = Path.join(outside, "external.log")
+    link = Path.join(root, "00001.log")
+
+    on_exit(fn -> File.rm_rf!(outside) end)
+
+    File.mkdir_p!(outside)
+    assert {:ok, _locations} = NIF.v2_append_batch(external_log, [{"user-key", "value", 0}])
+    File.ln_s!(external_log, link)
+
+    assert {:error, {:target_data_probe_failed, target, {:symlink, ^link}}} =
+             Target.probe_target_log_files(node(), root, ["00001.log"])
+
+    assert target == node()
+  end
+
   test "file-tree probes reject symlink roots without traversing them", %{root: root} do
     outside = root <> "_outside"
     link = Path.join(root, "dedicated")

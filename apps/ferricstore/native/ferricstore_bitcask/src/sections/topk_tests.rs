@@ -23,8 +23,10 @@ fn create_topk_file(
     depth: u32,
 ) -> String {
     let path = dir.join(name);
-    let file_size =
-        TOPK_HEADER_SIZE + (width as usize * depth as usize * 8) + (k as usize * HEAP_ENTRY_SIZE);
+    let file_size = TOPK_HEADER_SIZE
+        + (width as usize * depth as usize * 8)
+        + (k as usize * HEAP_ENTRY_SIZE)
+        + crate::prob_txn::TOKEN_SIZE;
 
     let mut file = File::create(&path).unwrap();
     let mut header = [0u8; TOPK_HEADER_SIZE];
@@ -246,65 +248,116 @@ fn cms_increment_rejects_overflow_without_mutating() {
 #[test]
 fn heap_add_and_eviction() {
     let k = 3;
-    let mut entries: Vec<V2HeapEntry> = Vec::new();
-    let mut fingerprints: HashSet<Vec<u8>> = HashSet::new();
+    let mut heap = V2IndexedHeap::new(Vec::new(), k, 4).unwrap();
 
     // Add 3 elements (heap has room, no eviction)
-    assert_eq!(
-        v2_heap_add(&mut entries, &mut fingerprints, k, b"a", 10),
-        None
-    );
-    assert_eq!(
-        v2_heap_add(&mut entries, &mut fingerprints, k, b"b", 20),
-        None
-    );
-    assert_eq!(
-        v2_heap_add(&mut entries, &mut fingerprints, k, b"c", 30),
-        None
-    );
-    assert_eq!(entries.len(), 3);
+    assert_eq!(heap.add(b"a", 10), None);
+    assert_eq!(heap.add(b"b", 20), None);
+    assert_eq!(heap.add(b"c", 30), None);
+    assert_eq!(heap.entries.len(), 3);
 
     // Add a 4th element with higher count => evicts "a" (count=10, the min)
-    let evicted = v2_heap_add(&mut entries, &mut fingerprints, k, b"d", 40);
+    let evicted = heap.add(b"d", 40);
     assert_eq!(evicted, Some(b"a".to_vec()));
-    assert_eq!(entries.len(), 3);
-    assert!(!fingerprints.contains(b"a".as_slice()));
-    assert!(fingerprints.contains(b"d".as_slice()));
+    assert_eq!(heap.entries.len(), 3);
+    assert!(!heap.positions.contains_key(b"a".as_slice()));
+    assert!(heap.positions.contains_key(b"d".as_slice()));
 }
 
 #[test]
 fn heap_add_no_eviction_when_new_is_too_small() {
     let k = 2;
-    let mut entries: Vec<V2HeapEntry> = Vec::new();
-    let mut fingerprints: HashSet<Vec<u8>> = HashSet::new();
+    let mut heap = V2IndexedHeap::new(Vec::new(), k, 3).unwrap();
 
-    v2_heap_add(&mut entries, &mut fingerprints, k, b"a", 100);
-    v2_heap_add(&mut entries, &mut fingerprints, k, b"b", 200);
+    heap.add(b"a", 100);
+    heap.add(b"b", 200);
 
     // New element with count=50 is less than min(100), no eviction
-    let evicted = v2_heap_add(&mut entries, &mut fingerprints, k, b"c", 50);
+    let evicted = heap.add(b"c", 50);
     assert_eq!(evicted, None);
-    assert_eq!(entries.len(), 2);
-    assert!(!fingerprints.contains(b"c".as_slice()));
+    assert_eq!(heap.entries.len(), 2);
+    assert!(!heap.positions.contains_key(b"c".as_slice()));
 }
 
 #[test]
 fn heap_add_update_existing() {
     let k = 3;
-    let mut entries: Vec<V2HeapEntry> = Vec::new();
-    let mut fingerprints: HashSet<Vec<u8>> = HashSet::new();
+    let mut heap = V2IndexedHeap::new(Vec::new(), k, 2).unwrap();
 
-    v2_heap_add(&mut entries, &mut fingerprints, k, b"a", 10);
-    v2_heap_add(&mut entries, &mut fingerprints, k, b"b", 20);
+    heap.add(b"a", 10);
+    heap.add(b"b", 20);
 
     // Update "a" with new count
-    let evicted = v2_heap_add(&mut entries, &mut fingerprints, k, b"a", 50);
+    let evicted = heap.add(b"a", 50);
     assert_eq!(evicted, None); // no eviction, just update
-    assert_eq!(entries.len(), 2);
+    assert_eq!(heap.entries.len(), 2);
 
     // Find "a" and verify count was updated
-    let a_entry = entries.iter().find(|e| e.element == b"a").unwrap();
+    let a_entry = heap
+        .entries
+        .iter()
+        .find(|e| e.element == b"a")
+        .unwrap();
     assert_eq!(a_entry.count, 50);
+}
+
+#[test]
+fn heap_add_keeps_the_minimum_at_the_root() {
+    let k = 4;
+    let mut heap = V2IndexedHeap::new(Vec::new(), k, 3).unwrap();
+
+    heap.add(b"high", 50);
+    heap.add(b"low", 10);
+    heap.add(b"middle", 30);
+
+    assert_eq!(heap.entries[0].element, b"low");
+
+    heap.add(b"low", 60);
+
+    assert_eq!(heap.entries[0].element, b"middle");
+    assert_eq!(heap.entries[0].count, 30);
+}
+
+#[test]
+fn indexed_heap_rebuilds_unsorted_entries_and_keeps_positions_consistent() {
+    let entries = vec![
+        V2HeapEntry {
+            element: b"high".to_vec(),
+            count: 90,
+        },
+        V2HeapEntry {
+            element: b"low".to_vec(),
+            count: 10,
+        },
+        V2HeapEntry {
+            element: b"middle".to_vec(),
+            count: 50,
+        },
+    ];
+    let mut heap = V2IndexedHeap::new(entries, 3, 2).unwrap();
+
+    assert_eq!(heap.entries[0].element, b"low");
+    heap.add(b"low", 100);
+    assert_eq!(heap.entries[0].element, b"middle");
+    assert_eq!(heap.add(b"new", 75), Some(b"middle".to_vec()));
+
+    for (index, entry) in heap.entries.iter().enumerate() {
+        assert_eq!(heap.positions.get(entry.element.as_slice()), Some(&index));
+        let left = index * 2 + 1;
+        let right = left + 1;
+        if left < heap.entries.len() {
+            assert!(!V2IndexedHeap::entry_precedes(
+                &heap.entries[left],
+                entry
+            ));
+        }
+        if right < heap.entries.len() {
+            assert!(!V2IndexedHeap::entry_precedes(
+                &heap.entries[right],
+                entry
+            ));
+        }
+    }
 }
 
 #[test]
@@ -428,25 +481,18 @@ fn topk_add_elements(path: &str, elements: &[&str]) -> Vec<Option<String>> {
     let file = crate::open_random_rw(std::path::Path::new(path)).unwrap();
     let (k, width, depth, heap_len) = v2_read_header(&file).unwrap();
     let mut counters = v2_read_cms(&file, width, depth).unwrap();
-    let mut heap_entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
-    let mut fingerprints: HashSet<Vec<u8>> =
-        heap_entries.iter().map(|e| e.element.clone()).collect();
+    let heap_entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
+    let mut heap = V2IndexedHeap::new(heap_entries, k, elements.len()).unwrap();
 
     let mut results = Vec::new();
     for &elem in elements {
         let estimated = v2_cms_increment(&mut counters, width, depth, elem.as_bytes(), 1).unwrap();
-        let evicted = v2_heap_add(
-            &mut heap_entries,
-            &mut fingerprints,
-            k,
-            elem.as_bytes(),
-            estimated,
-        );
+        let evicted = heap.add(elem.as_bytes(), estimated);
         results.push(evicted.map(|value| String::from_utf8(value).unwrap()));
     }
 
     v2_write_cms(&file, &counters).unwrap();
-    v2_write_heap(&file, width, depth, &heap_entries).unwrap();
+    v2_write_heap(&file, width, depth, &heap.entries).unwrap();
     results
 }
 
@@ -455,23 +501,17 @@ fn topk_incrby_one(path: &str, element: &str, count: i64) -> Option<String> {
     let file = crate::open_random_rw(std::path::Path::new(path)).unwrap();
     let (k, width, depth, heap_len) = v2_read_header(&file).unwrap();
     let mut counters = v2_read_cms(&file, width, depth).unwrap();
-    let mut heap_entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
-    let mut fingerprints: HashSet<Vec<u8>> =
-        heap_entries.iter().map(|e| e.element.clone()).collect();
+    let heap_entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
+    let mut heap = V2IndexedHeap::new(heap_entries, k, 1).unwrap();
 
     let estimated =
         v2_cms_increment(&mut counters, width, depth, element.as_bytes(), count).unwrap();
-    let evicted = v2_heap_add(
-        &mut heap_entries,
-        &mut fingerprints,
-        k,
-        element.as_bytes(),
-        estimated,
-    )
+    let evicted = heap
+        .add(element.as_bytes(), estimated)
     .map(|value| String::from_utf8(value).unwrap());
 
     v2_write_cms(&file, &counters).unwrap();
-    v2_write_heap(&file, width, depth, &heap_entries).unwrap();
+    v2_write_heap(&file, width, depth, &heap.entries).unwrap();
     evicted
 }
 

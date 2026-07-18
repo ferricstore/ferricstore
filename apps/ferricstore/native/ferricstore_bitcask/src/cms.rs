@@ -6,7 +6,8 @@
 //! ## File layout
 //!
 //! ```text
-//! [magic: 8B][width: u64 LE][depth: u64 LE][count: u64 LE][counters: i64 LE * width * depth]
+//! [magic: 8B][width: u64 LE][depth: u64 LE][count: u64 LE]
+//! [counters: i64 LE * width * depth][mutation token: 16B]
 //! ```
 //!
 //! Header size: 32 bytes. Magic: `CMS_FIL1` (0x434D535F46494C31).
@@ -33,8 +34,11 @@ const YIELD_CHECK_INTERVAL: usize = 64;
 const MMAP_MAGIC: u64 = 0x434D_535F_4649_4C31; // "CMS_FIL1"
 /// Header size for mmap files (magic + width + depth + count = 4 * 8 = 32).
 const MMAP_HEADER_SIZE: usize = 32;
+const MUTATION_TOKEN_SIZE: u64 = crate::prob_txn::TOKEN_SIZE as u64;
 const MAX_CMS_DEPTH: u64 = 1024;
 const MAX_CMS_COUNTERS: u64 = 16_777_216;
+const MAX_CMS_MERGE_SOURCES: usize = 128;
+const MAX_CMS_MERGE_COUNTER_VISITS: u64 = MAX_CMS_COUNTERS;
 const CMS_MERGE_CHUNK_COUNTERS: usize = 8_192;
 
 mod atoms {
@@ -105,9 +109,15 @@ fn cms_counter_bytes(width: u64, depth: u64) -> Result<u64, String> {
         .ok_or_else(|| "CMS counter region size overflow".into())
 }
 
-fn cms_file_size(width: u64, depth: u64) -> Result<u64, String> {
+fn cms_mutation_token_offset(width: u64, depth: u64) -> Result<u64, String> {
     (MMAP_HEADER_SIZE as u64)
         .checked_add(cms_counter_bytes(width, depth)?)
+        .ok_or_else(|| "CMS mutation token offset overflow".into())
+}
+
+fn cms_file_size(width: u64, depth: u64) -> Result<u64, String> {
+    cms_mutation_token_offset(width, depth)?
+        .checked_add(MUTATION_TOKEN_SIZE)
         .ok_or_else(|| "CMS file size overflow".into())
 }
 
@@ -126,28 +136,25 @@ fn cms_next_merge_total_count(
     src_count: u64,
     weight: i64,
 ) -> Result<u64, String> {
-    let delta = (src_count as u128)
-        .checked_mul(weight.unsigned_abs() as u128)
+    let delta = i128::from(src_count)
+        .checked_mul(i128::from(weight))
         .ok_or_else(|| "CMS total count overflow".to_string())?;
-
-    if weight >= 0 {
-        let next = (total_count as u128)
-            .checked_add(delta)
-            .ok_or_else(|| "CMS total count overflow".to_string())?;
-        u64::try_from(next).map_err(|_| "CMS total count overflow".to_string())
-    } else if delta >= total_count as u128 {
-        Ok(0)
-    } else {
-        Ok((total_count as u128 - delta) as u64)
+    let next = i128::from(total_count)
+        .checked_add(delta)
+        .ok_or_else(|| "CMS total count overflow".to_string())?;
+    if next < 0 {
+        return Err("CMS total count cannot be negative".to_string());
     }
+
+    u64::try_from(next).map_err(|_| "CMS total count overflow".to_string())
 }
 
 fn cms_finalize_merge_counter(acc: i128) -> Result<i64, String> {
     if acc < 0 {
-        Ok(0)
-    } else {
-        i64::try_from(acc).map_err(|_| "CMS counter overflow".to_string())
+        return Err("CMS counter cannot be negative".to_string());
     }
+
+    i64::try_from(acc).map_err(|_| "CMS counter overflow".to_string())
 }
 
 fn cms_read_exact_at(file: &File, buf: &mut [u8], offset: u64, label: &str) -> Result<(), String> {
@@ -217,6 +224,126 @@ fn cms_stage_increments<'a>(
     })
 }
 
+fn cms_query_counts<'a>(
+    file: &File,
+    width: u64,
+    depth: u64,
+    elements: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<Vec<i64>, String> {
+    let mut counts = Vec::new();
+    let mut buf = [0_u8; 8];
+
+    for element in elements {
+        let indices = hash_indices_standalone(element, width, depth);
+        let mut min_val = i64::MAX;
+        for (row, col) in indices.into_iter().enumerate() {
+            let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
+            cms_read_exact_at(file, &mut buf, offset, "counter")?;
+            min_val = min_val.min(i64::from_le_bytes(buf));
+        }
+        counts.push(min_val);
+    }
+
+    Ok(counts)
+}
+
+fn cms_encode_counts(counts: &[i64]) -> Result<Vec<u8>, String> {
+    let encoded_len = counts
+        .len()
+        .checked_mul(8)
+        .ok_or_else(|| "CMS mutation result size overflow".to_string())?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(encoded_len)
+        .map_err(|_| "CMS mutation result allocation failed".to_string())?;
+    for count in counts {
+        encoded.extend_from_slice(&count.to_le_bytes());
+    }
+    Ok(encoded)
+}
+
+fn cms_decode_counts(encoded: &[u8], expected_count: usize) -> Result<Vec<i64>, String> {
+    let expected_len = expected_count
+        .checked_mul(8)
+        .ok_or_else(|| "CMS mutation result size overflow".to_string())?;
+    if encoded.len() != expected_len {
+        return Err("CMS mutation receipt result length mismatch".into());
+    }
+
+    let mut counts = Vec::new();
+    counts
+        .try_reserve_exact(expected_count)
+        .map_err(|_| "CMS mutation result allocation failed".to_string())?;
+    for bytes in encoded.chunks_exact(8) {
+        counts.push(i64::from_le_bytes(bytes.try_into().unwrap()));
+    }
+    Ok(counts)
+}
+
+fn cms_transactional_incrby(
+    file: &File,
+    receipt_path: &Path,
+    width: u64,
+    depth: u64,
+    items: &[(&[u8], i64)],
+    token: crate::prob_txn::MutationToken,
+) -> Result<Vec<i64>, String> {
+    let token_offset = cms_mutation_token_offset(width, depth)?;
+    let expected_file_size = cms_file_size(width, depth)?;
+
+    match crate::prob_txn::begin(file, receipt_path, token, token_offset, expected_file_size)? {
+        crate::prob_txn::MutationDecision::Replay(result) => {
+            cms_decode_counts(&result, items.len())
+        }
+
+        crate::prob_txn::MutationDecision::Stale => cms_query_counts(
+            file,
+            width,
+            depth,
+            items.iter().map(|(element, _)| *element),
+        ),
+
+        crate::prob_txn::MutationDecision::Apply => {
+            // Recovery in begin() may have advanced the durable total count.
+            let (_, _, total_count) = cms_file_read_header(file)?;
+            let plan = cms_stage_increments(
+                file,
+                width,
+                depth,
+                total_count,
+                items.iter().map(|(element, count)| (*element, *count)),
+            )?;
+
+            let mut images = Vec::new();
+            images
+                .try_reserve_exact(plan.updates.len() + 1)
+                .map_err(|_| "CMS mutation journal allocation failed".to_string())?;
+            for (offset, next_value) in &plan.updates {
+                images.push(crate::prob_txn::AfterImage::new(
+                    *offset,
+                    next_value.to_le_bytes().to_vec(),
+                ));
+            }
+            images.push(crate::prob_txn::AfterImage::new(
+                24,
+                plan.total_count.to_le_bytes().to_vec(),
+            ));
+
+            let result = cms_encode_counts(&plan.counts)?;
+            crate::prob_txn::commit(
+                file,
+                receipt_path,
+                token,
+                token_offset,
+                expected_file_size,
+                images,
+                result,
+            )?;
+            Ok(plan.counts)
+        }
+    }
+}
+
 /// Read the CMS file header (width, depth, count) via pread.
 /// Returns `(width, depth, count)` or an error string.
 fn cms_file_read_header(file: &File) -> Result<(u64, u64, u64), String> {
@@ -250,6 +377,18 @@ fn cms_file_read_header(file: &File) -> Result<(u64, u64, u64), String> {
     }
 
     Ok((width, depth, count))
+}
+
+pub(crate) fn recover_sidecar(path: &Path) -> Result<(), String> {
+    let file = crate::open_random_rw_locked(path)
+        .map_err(|error| format!("open CMS sidecar for recovery: {error}"))?;
+    let (width, depth, _count) = cms_file_read_header(&file)?;
+    crate::prob_txn::recover(
+        &file,
+        path,
+        cms_mutation_token_offset(width, depth)?,
+        cms_file_size(width, depth)?,
+    )
 }
 
 /// Map an `io::Error` to either the `:enoent` atom or a string, for
@@ -397,6 +536,52 @@ pub fn cms_file_incrby<'a>(
     Ok((atoms::ok(), plan.counts).encode(env))
 }
 
+/// Increment a CMS using a deterministic Raft mutation token.
+///
+/// A committed token is replay-safe and older tokens never rewrite newer data.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn cms_file_incrby_at<'a>(
+    env: Env<'a>,
+    path: String,
+    receipt_path: String,
+    items: Vec<(rustler::Binary<'a>, i64)>,
+    mutation_index: u64,
+    mutation_ordinal: u64,
+) -> NifResult<Term<'a>> {
+    let token = crate::prob_txn::MutationToken::new(mutation_index, mutation_ordinal);
+    if token == crate::prob_txn::MutationToken::ZERO {
+        return Ok((atoms::error(), "CMS mutation token must be non-zero").encode(env));
+    }
+
+    let path = Path::new(&path);
+    let receipt_path = Path::new(&receipt_path);
+    let file = match crate::open_random_rw_locked(path) {
+        Ok(file) => file,
+        Err(error) => return Ok(map_io_error(&error).encode(env)),
+    };
+    let (width, depth, _) = match cms_file_read_header(&file) {
+        Ok(header) => header,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+
+    let mut borrowed_items = Vec::new();
+    if borrowed_items.try_reserve_exact(items.len()).is_err() {
+        return Ok((atoms::error(), "CMS mutation input allocation failed").encode(env));
+    }
+    for (element, count) in &items {
+        borrowed_items.push((element.as_slice(), *count));
+    }
+
+    match cms_transactional_incrby(&file, receipt_path, width, depth, &borrowed_items, token) {
+        Ok(counts) => {
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok((atoms::ok(), counts).encode(env))
+        }
+        Err(error) => Ok((atoms::error(), error).encode(env)),
+    }
+}
+
 /// Query elements in a CMS file via pread.
 ///
 /// `elements` is a list of binaries.
@@ -465,10 +650,128 @@ pub fn cms_file_info(env: Env, path: String) -> NifResult<Term> {
     Ok((atoms::ok(), (width, depth, count)).encode(env))
 }
 
+struct CmsMergePlan {
+    images: Vec<crate::prob_txn::AfterImage>,
+}
+
+fn cms_stage_merge(
+    env: Env<'_>,
+    dst_width: u64,
+    dst_depth: u64,
+    source_files: &[File],
+    weights: &[i64],
+) -> Result<CmsMergePlan, String> {
+    if source_files.len() != weights.len() {
+        return Err("src_paths and weights must have the same length".into());
+    }
+
+    let merge_counter_visits = dst_width
+        .checked_mul(dst_depth)
+        .and_then(|counter_count| counter_count.checked_mul(source_files.len() as u64))
+        .ok_or_else(|| "CMS merge work overflow".to_string())?;
+    if merge_counter_visits > MAX_CMS_MERGE_COUNTER_VISITS {
+        return Err("CMS merge work limit exceeded".into());
+    }
+
+    let mut source_counts = Vec::new();
+    source_counts
+        .try_reserve_exact(source_files.len())
+        .map_err(|_| "CMS merge source metadata allocation failed".to_string())?;
+    for source_file in source_files {
+        let (source_width, source_depth, source_count) = cms_file_read_header(source_file)?;
+        if source_width != dst_width || source_depth != dst_depth {
+            return Err("width/depth mismatch".into());
+        }
+        source_counts.push(source_count);
+    }
+
+    if source_files.is_empty() {
+        return Ok(CmsMergePlan { images: Vec::new() });
+    }
+
+    let mut next_dst_count = 0;
+    for (source_count, weight) in source_counts.iter().zip(weights) {
+        next_dst_count = cms_next_merge_total_count(next_dst_count, *source_count, *weight)?;
+    }
+
+    let total_counters = usize::try_from(dst_width * dst_depth)
+        .map_err(|_| "CMS counter count exceeds platform size".to_string())?;
+    let chunk_count = total_counters.div_ceil(CMS_MERGE_CHUNK_COUNTERS);
+    let mut images = Vec::new();
+    images
+        .try_reserve_exact(chunk_count + 1)
+        .map_err(|_| "CMS merge journal allocation failed".to_string())?;
+
+    let chunk_bytes = CMS_MERGE_CHUNK_COUNTERS * 8;
+    let mut source_chunk = Vec::new();
+    let mut accumulators = Vec::new();
+    source_chunk
+        .try_reserve_exact(chunk_bytes)
+        .map_err(|_| "CMS merge allocation failed".to_string())?;
+    accumulators
+        .try_reserve_exact(CMS_MERGE_CHUNK_COUNTERS)
+        .map_err(|_| "CMS merge allocation failed".to_string())?;
+
+    for chunk_start in (0..total_counters).step_by(CMS_MERGE_CHUNK_COUNTERS) {
+        let counter_count = (total_counters - chunk_start).min(CMS_MERGE_CHUNK_COUNTERS);
+        let byte_count = counter_count * 8;
+        let offset = MMAP_HEADER_SIZE as u64 + chunk_start as u64 * 8;
+
+        accumulators.clear();
+        accumulators.resize(counter_count, 0_i128);
+        for (source_file, weight) in source_files.iter().zip(weights) {
+            source_chunk.resize(byte_count, 0);
+            cms_read_exact_at(source_file, &mut source_chunk, offset, "source chunk")?;
+            for (accumulator, bytes) in accumulators.iter_mut().zip(source_chunk.chunks_exact(8)) {
+                let source_value = i64::from_le_bytes(bytes.try_into().unwrap());
+                let delta = i128::from(source_value) * i128::from(*weight);
+                *accumulator = accumulator
+                    .checked_add(delta)
+                    .ok_or_else(|| "CMS counter overflow".to_string())?;
+            }
+        }
+
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(byte_count)
+            .map_err(|_| "CMS merge output allocation failed".to_string())?;
+        for accumulator in &accumulators {
+            output.extend_from_slice(&cms_finalize_merge_counter(*accumulator)?.to_le_bytes());
+        }
+        images.push(crate::prob_txn::AfterImage::new(offset, output));
+        let _ = consume_timeslice(env, 1);
+    }
+
+    images.push(crate::prob_txn::AfterImage::new(
+        24,
+        next_dst_count.to_le_bytes().to_vec(),
+    ));
+    Ok(CmsMergePlan { images })
+}
+
+fn cms_apply_merge_plan(
+    env: Env<'_>,
+    destination: &File,
+    plan: &CmsMergePlan,
+) -> Result<(), String> {
+    for (index, image) in plan.images.iter().enumerate() {
+        crate::write_all_at(
+            destination,
+            &image.bytes,
+            image.offset,
+            "cms merge after-image",
+        )?;
+        if index % YIELD_CHECK_INTERVAL == 0 && index > 0 {
+            let _ = consume_timeslice(env, 1);
+        }
+    }
+    crate::prob_fsync(destination)
+}
+
 /// Merge source CMS files (with weights) into a destination file via pread/pwrite.
 ///
-/// For each counter position: read dst counter, add weighted src counters,
-/// clamp negatives to 0, write back. Updates dst count.
+/// For each counter position, replace the destination with the weighted sum
+/// of the source counters. Updates the destination count to the same sum.
 ///
 /// Returns `:ok` or `{:error, reason}`.
 #[rustler::nif(schedule = "DirtyIo")]
@@ -486,6 +789,13 @@ pub fn cms_file_merge(
         )
             .encode(env));
     }
+    if src_paths.len() > MAX_CMS_MERGE_SOURCES {
+        return Ok((
+            atoms::error(),
+            format!("CMS merge accepts at most {MAX_CMS_MERGE_SOURCES} sources"),
+        )
+            .encode(env));
+    }
 
     let source_paths = src_paths
         .iter()
@@ -497,134 +807,143 @@ pub fn cms_file_merge(
     };
     let dst_file = &merge_files.destination;
 
-    let (dst_width, dst_depth, dst_count) = match cms_file_read_header(dst_file) {
+    let (dst_width, dst_depth, _) = match cms_file_read_header(dst_file) {
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
-
-    // Every descriptor is locked before dimensions or counters are read.
-    let mut src_files: Vec<(&File, u64)> = Vec::with_capacity(merge_files.sources.len());
-    for src_file in &merge_files.sources {
-        let (src_width, src_depth, src_count) = match cms_file_read_header(src_file) {
-            Ok(h) => h,
-            Err(e) => return Ok((atoms::error(), e).encode(env)),
-        };
-
-        if src_width != dst_width || src_depth != dst_depth {
-            return Ok((atoms::error(), "width/depth mismatch").encode(env));
+    let plan = match cms_stage_merge(env, dst_width, dst_depth, &merge_files.sources, &weights) {
+        Ok(plan) => plan,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    if !plan.images.is_empty() {
+        if let Err(error) = cms_apply_merge_plan(env, dst_file, &plan) {
+            return Ok((atoms::error(), error).encode(env));
         }
-
-        src_files.push((src_file, src_count));
-    }
-
-    if src_files.is_empty() {
-        return Ok(atoms::ok().encode(env));
-    }
-
-    let mut next_dst_count = dst_count;
-    for (j, (_, src_count)) in src_files.iter().enumerate() {
-        next_dst_count = match cms_next_merge_total_count(next_dst_count, *src_count, weights[j]) {
-            Ok(next_dst_count) => next_dst_count,
-            Err(e) => return Ok((atoms::error(), e).encode(env)),
-        };
-    }
-
-    let total_counters = usize::try_from(dst_width * dst_depth)
-        .map_err(|_| rustler::Error::Term(Box::new("CMS counter count exceeds platform size")))?;
-    let mut merged_counters = Vec::new();
-    if merged_counters.try_reserve_exact(total_counters).is_err() {
-        return Ok((atoms::error(), "CMS merge allocation failed").encode(env));
-    }
-
-    let chunk_bytes = CMS_MERGE_CHUNK_COUNTERS * 8;
-    let mut dst_chunk = Vec::new();
-    let mut src_chunk = Vec::new();
-    let mut accumulators = Vec::new();
-    if dst_chunk.try_reserve_exact(chunk_bytes).is_err()
-        || src_chunk.try_reserve_exact(chunk_bytes).is_err()
-        || accumulators
-            .try_reserve_exact(CMS_MERGE_CHUNK_COUNTERS)
-            .is_err()
-    {
-        return Ok((atoms::error(), "CMS merge allocation failed").encode(env));
-    }
-
-    for chunk_start in (0..total_counters).step_by(CMS_MERGE_CHUNK_COUNTERS) {
-        let counter_count = (total_counters - chunk_start).min(CMS_MERGE_CHUNK_COUNTERS);
-        let byte_count = counter_count * 8;
-        let offset = MMAP_HEADER_SIZE as u64 + chunk_start as u64 * 8;
-
-        dst_chunk.resize(byte_count, 0);
-        if let Err(e) = cms_read_exact_at(dst_file, &mut dst_chunk, offset, "destination chunk") {
-            return Ok((atoms::error(), e).encode(env));
-        }
-
-        accumulators.clear();
-        for bytes in dst_chunk.chunks_exact(8) {
-            accumulators.push(i128::from(i64::from_le_bytes(bytes.try_into().unwrap())));
-        }
-
-        for (j, (src_file, _)) in src_files.iter().enumerate() {
-            src_chunk.resize(byte_count, 0);
-            if let Err(e) = cms_read_exact_at(src_file, &mut src_chunk, offset, "source chunk") {
-                return Ok((atoms::error(), e).encode(env));
-            }
-
-            for (accumulator, bytes) in accumulators.iter_mut().zip(src_chunk.chunks_exact(8)) {
-                let src_val = i64::from_le_bytes(bytes.try_into().unwrap());
-                let delta = i128::from(src_val) * i128::from(weights[j]);
-                *accumulator = match accumulator.checked_add(delta) {
-                    Some(next) => next,
-                    None => return Ok((atoms::error(), "CMS counter overflow").encode(env)),
-                };
-            }
-        }
-
-        for accumulator in &accumulators {
-            let value = match cms_finalize_merge_counter(*accumulator) {
-                Ok(value) => value,
-                Err(e) => return Ok((atoms::error(), e).encode(env)),
-            };
-            merged_counters.push(value);
-        }
-
-        let _ = consume_timeslice(env, 1);
-    }
-
-    let mut output_chunk = Vec::new();
-    if output_chunk.try_reserve_exact(chunk_bytes).is_err() {
-        return Ok((atoms::error(), "CMS merge allocation failed").encode(env));
-    }
-
-    for (chunk_index, values) in merged_counters.chunks(CMS_MERGE_CHUNK_COUNTERS).enumerate() {
-        output_chunk.clear();
-        for value in values {
-            output_chunk.extend_from_slice(&value.to_le_bytes());
-        }
-
-        let offset = MMAP_HEADER_SIZE as u64 + (chunk_index * CMS_MERGE_CHUNK_COUNTERS) as u64 * 8;
-        if let Err(e) = crate::write_all_at(dst_file, &output_chunk, offset, "cms counter chunk") {
-            return Ok((atoms::error(), e).encode(env));
-        }
-
-        let _ = consume_timeslice(env, 1);
-    }
-
-    if let Err(e) = crate::write_all_at(dst_file, &next_dst_count.to_le_bytes(), 24, "cms count") {
-        return Ok((atoms::error(), e).encode(env));
-    }
-
-    // Durability: fsync the destination before returning. Sources are
-    // read-only during merge so they don't need fsync.
-    if let Err(e) = crate::prob_fsync(dst_file) {
-        return Ok((atoms::error(), e).encode(env));
     }
 
     crate::fadvise_dontneed(dst_file, 0, 0);
-    for (src_file, _) in &src_files {
+    for src_file in &merge_files.sources {
         crate::fadvise_dontneed(src_file, 0, 0);
     }
 
+    Ok(atoms::ok().encode(env))
+}
+
+/// Merge CMS sources using a deterministic Raft mutation token.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn cms_file_merge_at(
+    env: Env<'_>,
+    dst_path: String,
+    receipt_path: String,
+    src_paths: Vec<String>,
+    weights: Vec<i64>,
+    mutation_index: u64,
+    mutation_ordinal: u64,
+) -> NifResult<Term<'_>> {
+    if src_paths.len() != weights.len() {
+        return Ok((
+            atoms::error(),
+            "src_paths and weights must have the same length",
+        )
+            .encode(env));
+    }
+    if src_paths.len() > MAX_CMS_MERGE_SOURCES {
+        return Ok((
+            atoms::error(),
+            format!("CMS merge accepts at most {MAX_CMS_MERGE_SOURCES} sources"),
+        )
+            .encode(env));
+    }
+
+    let token = crate::prob_txn::MutationToken::new(mutation_index, mutation_ordinal);
+    if token == crate::prob_txn::MutationToken::ZERO {
+        return Ok((atoms::error(), "CMS mutation token must be non-zero").encode(env));
+    }
+    let destination_path = Path::new(&dst_path);
+    let receipt_path = Path::new(&receipt_path);
+
+    // A replay must not depend on source files that may have been removed by
+    // later commands. Check the destination token before opening the lock set.
+    {
+        let destination = match crate::open_random_rw_locked(destination_path) {
+            Ok(file) => file,
+            Err(error) => return Ok(map_io_error(&error).encode(env)),
+        };
+        let (width, depth, _) = match cms_file_read_header(&destination) {
+            Ok(header) => header,
+            Err(error) => return Ok((atoms::error(), error).encode(env)),
+        };
+        let token_offset = match cms_mutation_token_offset(width, depth) {
+            Ok(offset) => offset,
+            Err(error) => return Ok((atoms::error(), error).encode(env)),
+        };
+        let file_size = match cms_file_size(width, depth) {
+            Ok(size) => size,
+            Err(error) => return Ok((atoms::error(), error).encode(env)),
+        };
+        match crate::prob_txn::begin(&destination, receipt_path, token, token_offset, file_size) {
+            Ok(
+                crate::prob_txn::MutationDecision::Replay(_)
+                | crate::prob_txn::MutationDecision::Stale,
+            ) => return Ok(atoms::ok().encode(env)),
+            Ok(crate::prob_txn::MutationDecision::Apply) => {}
+            Err(error) => return Ok((atoms::error(), error).encode(env)),
+        }
+    }
+
+    let source_paths = src_paths
+        .iter()
+        .map(|path| Path::new(path.as_str()))
+        .collect::<Vec<_>>();
+    let merge_files = match crate::open_random_merge_locked(destination_path, &source_paths) {
+        Ok(files) => files,
+        Err(error) => return Ok(map_io_error(&error).encode(env)),
+    };
+    let destination = &merge_files.destination;
+    let (width, depth, _) = match cms_file_read_header(destination) {
+        Ok(header) => header,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    let token_offset = match cms_mutation_token_offset(width, depth) {
+        Ok(offset) => offset,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    let file_size = match cms_file_size(width, depth) {
+        Ok(size) => size,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    match crate::prob_txn::begin(destination, receipt_path, token, token_offset, file_size) {
+        Ok(
+            crate::prob_txn::MutationDecision::Replay(_) | crate::prob_txn::MutationDecision::Stale,
+        ) => return Ok(atoms::ok().encode(env)),
+        Ok(crate::prob_txn::MutationDecision::Apply) => {}
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    }
+
+    let plan = match cms_stage_merge(env, width, depth, &merge_files.sources, &weights) {
+        Ok(plan) => plan,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    if plan.images.is_empty() {
+        return Ok(atoms::ok().encode(env));
+    }
+    if let Err(error) = crate::prob_txn::commit(
+        destination,
+        receipt_path,
+        token,
+        token_offset,
+        file_size,
+        plan.images,
+        Vec::new(),
+    ) {
+        return Ok((atoms::error(), error).encode(env));
+    }
+
+    crate::fadvise_dontneed(destination, 0, 0);
+    for source in &merge_files.sources {
+        crate::fadvise_dontneed(source, 0, 0);
+    }
     Ok(atoms::ok().encode(env))
 }
 

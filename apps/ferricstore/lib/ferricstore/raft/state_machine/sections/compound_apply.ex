@@ -60,9 +60,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             when expire_at_ms != 0 and expire_at_ms <= now_ms ->
               {:halt, :fallback}
 
+            [{^key, <<131, _rest::binary>>, _expire_at_ms, _lfu, _file_id, _offset, _value_size}] ->
+              {:halt, :fallback}
+
             [{^key, value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}]
             when is_binary(value) ->
-              {:cont, {:ok, [{key, prob_file_path_from_delete_value(state, key, value)} | acc]}}
+              {:cont, {:ok, [{key, nil} | acc]}}
 
             [] ->
               {:cont, {:ok, [{key, nil} | acc]}}
@@ -71,23 +74,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
               {:halt, :fallback}
           end
         end)
-      end
-
-      defp prob_file_path_from_delete_value(state, key, value) when is_binary(value) do
-        case safe_binary_to_term(value) do
-          {:bloom_meta, meta} when is_map(meta) -> prob_path(state, key, "bloom")
-          {:cms_meta, meta} when is_map(meta) -> prob_path(state, key, "cms")
-          {:cuckoo_meta, meta} when is_map(meta) -> prob_path(state, key, "cuckoo")
-          {:topk_meta, meta} when is_map(meta) -> prob_path(state, key, "topk")
-          _ -> nil
-        end
-      end
-
-      defp safe_binary_to_term(value) do
-        case Ferricstore.TermCodec.decode(value) do
-          {:ok, term} -> term
-          {:error, :invalid_external_term} -> :not_term
-        end
       end
 
       defp apply_delete_batch_keys(state, keys) do
@@ -1131,26 +1117,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
 
             :ok = publish_cross_shard_transaction(flushed_state, successful_groups)
             record_standalone_published_mutations(successful_groups)
-            :ok = dispatch_pending_compound_promotions(flushed_state)
 
-            case publish_pending_flow_history_projections(flushed_state) do
+            case publish_pending_prob_files(flushed_state) do
               :ok ->
-                observe_pending_lmdb_mirror_enqueue(
-                  state,
-                  enqueue_pending_lmdb_mirror(state)
-                )
+                :ok = dispatch_pending_compound_promotions(flushed_state)
 
-                {result, flushed_state}
+                case publish_pending_flow_history_projections(flushed_state) do
+                  :ok ->
+                    observe_pending_lmdb_mirror_enqueue(
+                      state,
+                      enqueue_pending_lmdb_mirror(state)
+                    )
 
-              {:error, reason} ->
-                handle_flow_history_projection_publish_failure(flushed_state, reason)
+                    {result, flushed_state}
 
-                observe_pending_lmdb_mirror_enqueue(
-                  state,
-                  enqueue_pending_lmdb_mirror(state)
-                )
+                  {:error, reason} ->
+                    handle_flow_history_projection_publish_failure(flushed_state, reason)
 
-                {result, flushed_state}
+                    observe_pending_lmdb_mirror_enqueue(
+                      state,
+                      enqueue_pending_lmdb_mirror(state)
+                    )
+
+                    {result, flushed_state}
+                end
+
+              {:error, _reason} = error ->
+                {error, flushed_state}
             end
 
           {:error, reason, partial_state, successful_groups, journal_txid} ->

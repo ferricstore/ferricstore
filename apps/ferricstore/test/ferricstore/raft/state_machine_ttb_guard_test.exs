@@ -71,6 +71,10 @@ defmodule Ferricstore.Raft.StateMachineTTBGuardTest do
   test "WARaft blocks projection and internal rollback failures" do
     for reason <- [
           {:waraft_projection_failed, :forced_projection_failure},
+          {:prob_sidecar_publish_failed, "/prob/final", "/prob/staged", :eio},
+          {:prob_dir_create_failed, {:not_directory, "blocked parent"}},
+          {:prob_sidecar_create_failed, :eio},
+          {:prob_sidecar_apply_failed, :cms_incrby, :eio},
           {:hash_type_marker_rollback_failed, {:bitcask_append_failed, :enospc}, :ok},
           {:compound_batch_mutate_rollback_failed, :write_failed, :ok, :restore_failed},
           {:stream_metadata_rollback_failed, :write_failed, :entry_failed, :type_failed}

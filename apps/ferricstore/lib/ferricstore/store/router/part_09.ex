@@ -428,6 +428,41 @@ defmodule Ferricstore.Store.Router.Part09 do
       defp extract_prob_key({:topk_add, key, _}), do: key
       defp extract_prob_key({:topk_incrby, key, _}), do: key
 
+      @doc false
+      @spec key_lifecycle(FerricStore.Instance.t(), tuple()) :: term()
+      def key_lifecycle(ctx, command) do
+        with {:ok, key, idx} <- key_lifecycle_route(ctx, command) do
+          raft_write(ctx, idx, key, {:key_lifecycle, command})
+        end
+      end
+
+      @doc false
+      @spec key_lifecycle_route(FerricStore.Instance.t(), tuple()) ::
+              {:ok, binary(), non_neg_integer()} | {:error, binary()}
+      def key_lifecycle_route(ctx, {operation, source, destination})
+          when operation in [:rename, :renamenx] and is_binary(source) and
+                 is_binary(destination) do
+        route_key_lifecycle(ctx, source, destination)
+      end
+
+      def key_lifecycle_route(ctx, {:copy, source, destination, replace?})
+          when is_binary(source) and is_binary(destination) and is_boolean(replace?) do
+        route_key_lifecycle(ctx, source, destination)
+      end
+
+      def key_lifecycle_route(_ctx, _invalid),
+        do: {:error, "ERR invalid key lifecycle command"}
+
+      defp route_key_lifecycle(ctx, source, destination) do
+        source_idx = shard_for(ctx, source)
+
+        if shard_for(ctx, destination) == source_idx do
+          {:ok, source, source_idx}
+        else
+          {:error, "CROSSSLOT Keys in request don't hash to the same slot"}
+        end
+      end
+
       @doc """
       Returns `true` if `key` exists and is not expired.
 

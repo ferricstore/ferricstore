@@ -15,6 +15,132 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
       alias Ferricstore.Raft.WARaftBackendTest.LabelCounter
       alias Ferricstore.Raft.WARaftBackendTest.OversizedLabel
 
+      @tag :snapshot_swap_phase_durability
+      test "snapshot install syncs rollback backups before promoting staged payload", %{
+        root: root,
+        ctx: ctx
+      } do
+        snapshot_path = Path.join(root, "snapshot-backup-sync")
+        position = {:raft_log_pos, 0, 0}
+        File.mkdir_p!(Path.join(snapshot_path, "data"))
+
+        File.write!(
+          Path.join(snapshot_path, "ferricstore_snapshot.term"),
+          :erlang.term_to_binary(%{
+            version: 1,
+            position: position,
+            label: nil,
+            config: nil,
+            apply_context: ctx.apply_context,
+            payload_dirs: [:data],
+            empty_payload_dirs: [:data]
+          })
+        )
+
+        handle = %{
+          ctx: ctx,
+          shard_index: 0,
+          root_dir: Path.join([root, "waraft", "ferricstore_waraft_backend.1"]),
+          sm_state: nil,
+          position: position,
+          label: nil,
+          config: nil
+        }
+
+        previous_fsync_hook =
+          Application.get_env(:ferricstore, :waraft_storage_fsync_dir_hook)
+
+        Process.put(:snapshot_backup_root_synced, false)
+
+        try do
+          Application.put_env(:ferricstore, :waraft_storage_fsync_dir_hook, fn path ->
+            if String.starts_with?(Path.basename(path), "snapshot_install_backup.") do
+              Process.put(:snapshot_backup_root_synced, true)
+            end
+
+            :ok
+          end)
+
+          Process.put(:ferricstore_waraft_snapshot_install_hook, fn
+            {:before_promote, _kind, _dest} ->
+              if Process.get(:snapshot_backup_root_synced, false) do
+                :ok
+              else
+                {:error, :rollback_backup_not_durable}
+              end
+
+            _event ->
+              :ok
+          end)
+
+          assert {:ok, _handle} =
+                   WARaftStorage.open_snapshot(snapshot_path, position, handle)
+        after
+          restore_env(:waraft_storage_fsync_dir_hook, previous_fsync_hook)
+          Process.delete(:ferricstore_waraft_snapshot_install_hook)
+          Process.delete(:snapshot_backup_root_synced)
+        end
+      end
+
+      @tag :snapshot_missing_dir_rollback
+      test "failed snapshot install removes staged data for an initially absent directory", %{
+        root: root,
+        ctx: ctx
+      } do
+        snapshot_path = Path.join(root, "snapshot-missing-dir-rollback")
+        snapshot_prob_path = Path.join(snapshot_path, "prob")
+        position = {:raft_log_pos, 0, 0}
+        File.mkdir_p!(snapshot_prob_path)
+        File.write!(Path.join(snapshot_prob_path, "snapshot-only.marker"), "staged")
+
+        File.write!(
+          Path.join(snapshot_path, "ferricstore_snapshot.term"),
+          :erlang.term_to_binary(%{
+            version: 1,
+            position: position,
+            label: nil,
+            config: nil,
+            apply_context: ctx.apply_context,
+            payload_dirs: [:prob],
+            empty_payload_dirs: []
+          })
+        )
+
+        root_dir = Path.join([root, "waraft", "ferricstore_waraft_backend.1"])
+        live_prob_path = Path.join([root, "prob", "shard_0"])
+        File.rm_rf!(live_prob_path)
+
+        handle = %{
+          ctx: ctx,
+          shard_index: 0,
+          root_dir: root_dir,
+          sm_state: nil,
+          position: position,
+          label: nil,
+          config: nil
+        }
+
+        previous_fsync_hook =
+          Application.get_env(:ferricstore, :waraft_storage_metadata_fsync_file_hook)
+
+        try do
+          Application.put_env(:ferricstore, :waraft_storage_metadata_fsync_file_hook, fn path ->
+            if String.starts_with?(Path.basename(path), "ferricstore_storage.term.tmp.") do
+              {:error, :injected_metadata_publish_failure}
+            else
+              :ok
+            end
+          end)
+
+          assert {:error, {:fsync_file, _path, :injected_metadata_publish_failure}} =
+                   WARaftStorage.open_snapshot(snapshot_path, position, handle)
+        after
+          restore_env(:waraft_storage_metadata_fsync_file_hook, previous_fsync_hook)
+        end
+
+        refute File.exists?(Path.join(live_prob_path, "snapshot-only.marker"))
+      end
+
       test "storage rejects snapshot payload dir removed after verification", %{
         root: root,
         ctx: ctx

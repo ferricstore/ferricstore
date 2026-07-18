@@ -709,8 +709,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                  :ok <- Promotion.remove_shard_dedicated_storage(finalized_state) do
               {:ok, finalized_state, deleted}
             else
-              {:error, _reason} = error -> error
-              other -> {:error, {:unexpected_flush_shard_cleanup_result, other}}
+              {:error, _reason} = error ->
+                error
+
+              other ->
+                {:error, {:unexpected_flush_shard_cleanup_result, other}}
             end
 
           {:error, _reason} = error ->
@@ -982,11 +985,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               case prepare_apply_blob_command(state, {:batch, commands}) do
                 {:ok, {:batch, prepared_commands}} ->
                   with_pending_writes(state, fn ->
-                    Enum.map_reduce(prepared_commands, old_count, fn cmd, count ->
-                      materialize_pending_fast_deletes(state)
-                      result = apply_single(state, cmd)
-                      {result, count + 1}
-                    end)
+                    apply_generic_batch_commands(state, prepared_commands, old_count)
                   end)
 
                 {:ok, prepared_command} ->
@@ -1011,6 +1010,30 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           {results, new_count} ->
             new_state = %{state | applied_count: max(new_count, old_count + applied_increment)}
             maybe_release_cursor(meta, old_count, new_state, {:ok, results})
+        end
+      end
+
+      defp apply_generic_batch_commands(state, commands, old_count) do
+        commands
+        |> Enum.reduce_while({[], old_count}, fn command, {results, count} ->
+          materialize_pending_fast_deletes(state)
+          result = apply_single(state, command)
+
+          case result do
+            {:error, reason} = error ->
+              if Ferricstore.Raft.ApplyFailure.storage_reason?(reason) do
+                {:halt, error}
+              else
+                {:cont, {[error | results], count + 1}}
+              end
+
+            success ->
+              {:cont, {[success | results], count + 1}}
+          end
+        end)
+        |> case do
+          {:error, _reason} = error -> error
+          {results, new_count} -> {Enum.reverse(results), new_count}
         end
       end
 
@@ -1612,10 +1635,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
           with {:ok, validated_params} <-
                  validate_bloom_auto_create_params(auto_create_params),
+               {:ok, key_status} <- classify_prob_key(state, key, :bloom),
                :ok <- ensure_prob_dir(state) do
-            case auto_create_bloom_if_needed(state, path, key, validated_params) do
-              :ok -> NIF.bloom_file_add(path, element)
-              {:error, _reason} = error -> error
+            case auto_create_bloom_if_needed(state, path, key, key_status, validated_params) do
+              {:ok, mutation_path} ->
+                with {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do
+                  normalize_prob_mutation_result(
+                    :bloom_add,
+                    NIF.bloom_file_add_at(
+                      mutation_path,
+                      mutation_path,
+                      element,
+                      mutation_index,
+                      mutation_ordinal
+                    )
+                  )
+                end
+
+              {:error, _reason} = error ->
+                normalize_prob_mutation_result(:bloom_add, error)
             end
           end
         end)
@@ -1628,12 +1666,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
           with :ok <- admit_apply_command_work(state, command),
                {:ok, validated_params} <-
                  validate_bloom_auto_create_params(auto_create_params),
+               {:ok, key_status} <- classify_prob_key(state, key, :bloom),
                :ok <- ensure_prob_dir(state) do
             path = prob_path(state, key, "bloom")
 
-            case auto_create_bloom_if_needed(state, path, key, validated_params) do
-              :ok -> NIF.bloom_file_madd(path, elements)
-              {:error, _reason} = error -> error
+            case auto_create_bloom_if_needed(state, path, key, key_status, validated_params) do
+              {:ok, mutation_path} ->
+                with {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do
+                  normalize_prob_mutation_result(
+                    :bloom_madd,
+                    NIF.bloom_file_madd_at(
+                      mutation_path,
+                      mutation_path,
+                      elements,
+                      mutation_index,
+                      mutation_ordinal
+                    )
+                  )
+                end
+
+              {:error, _reason} = error ->
+                normalize_prob_mutation_result(:bloom_madd, error)
             end
           end
         end)
@@ -1651,9 +1704,21 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           command = {:cms_incrby, key, items}
 
-          with :ok <- admit_apply_command_work(state, command) do
+          with :ok <- admit_apply_command_work(state, command),
+               :ok <- require_existing_prob_key(state, key, :cms),
+               {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do
             path = prob_path(state, key, "cms")
-            NIF.cms_file_incrby(path, items)
+
+            normalize_prob_mutation_result(
+              :cms_incrby,
+              NIF.cms_file_incrby_at(
+                path,
+                path,
+                items,
+                mutation_index,
+                mutation_ordinal
+              )
+            )
           end
         end)
       end
@@ -1664,6 +1729,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
           with :ok <- admit_apply_command_work(state, command),
                {:ok, width, depth} <- validate_cms_create_params(create_params),
+               :ok <- validate_cms_merge_apply_work(src_keys, width, depth),
+               {:ok, dst_status} <- classify_prob_key(state, dst_key, :cms),
                :ok <-
                  validate_cms_merge_locality(
                    state,
@@ -1672,13 +1739,36 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                    weights,
                    create_params
                  ),
+               :ok <- require_existing_prob_keys(state, src_keys, :cms),
                :ok <- ensure_prob_dir(state) do
             dst_path = prob_path(state, dst_key, "cms")
             src_paths = cms_source_paths(state, src_keys)
 
-            case maybe_create_cms_merge_dst(state, dst_path, dst_key, width, depth) do
-              :ok -> NIF.cms_file_merge(dst_path, src_paths, weights)
-              {:error, _reason} = error -> error
+            case maybe_create_cms_merge_dst(
+                   state,
+                   dst_path,
+                   dst_key,
+                   dst_status,
+                   width,
+                   depth
+                 ) do
+              {:ok, mutation_path} ->
+                with {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do
+                  normalize_prob_mutation_result(
+                    :cms_merge,
+                    NIF.cms_file_merge_at(
+                      mutation_path,
+                      mutation_path,
+                      src_paths,
+                      weights,
+                      mutation_index,
+                      mutation_ordinal
+                    )
+                  )
+                end
+
+              {:error, _reason} = error ->
+                normalize_prob_mutation_result(:cms_merge, error)
             end
           end
         end)
@@ -1698,10 +1788,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
           with {:ok, validated_params} <-
                  validate_cuckoo_auto_create_params(auto_create_params),
+               {:ok, key_status} <- classify_prob_key(state, key, :cuckoo),
                :ok <- ensure_prob_dir(state) do
-            case auto_create_cuckoo_if_needed(state, path, key, validated_params) do
-              :ok -> NIF.cuckoo_file_add(path, element)
-              {:error, _reason} = error -> error
+            case auto_create_cuckoo_if_needed(state, path, key, key_status, validated_params) do
+              {:ok, mutation_path} ->
+                with {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do
+                  normalize_prob_mutation_result(
+                    :cuckoo_add,
+                    NIF.cuckoo_file_add_at(
+                      mutation_path,
+                      mutation_path,
+                      element,
+                      mutation_index,
+                      mutation_ordinal
+                    )
+                  )
+                end
+
+              {:error, _reason} = error ->
+                normalize_prob_mutation_result(:cuckoo_add, error)
             end
           end
         end)
@@ -1713,10 +1818,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
           with {:ok, validated_params} <-
                  validate_cuckoo_auto_create_params(auto_create_params),
+               {:ok, key_status} <- classify_prob_key(state, key, :cuckoo),
                :ok <- ensure_prob_dir(state) do
-            case auto_create_cuckoo_if_needed(state, path, key, validated_params) do
-              :ok -> NIF.cuckoo_file_addnx(path, element)
-              {:error, _reason} = error -> error
+            case auto_create_cuckoo_if_needed(state, path, key, key_status, validated_params) do
+              {:ok, mutation_path} ->
+                with {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do
+                  normalize_prob_mutation_result(
+                    :cuckoo_addnx,
+                    NIF.cuckoo_file_addnx_at(
+                      mutation_path,
+                      mutation_path,
+                      element,
+                      mutation_index,
+                      mutation_ordinal
+                    )
+                  )
+                end
+
+              {:error, _reason} = error ->
+                normalize_prob_mutation_result(:cuckoo_addnx, error)
             end
           end
         end)
@@ -1724,8 +1844,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
       def apply(meta, {:cuckoo_del, key, element}, state) do
         apply_prob_with_time(meta, state, fn ->
-          path = prob_path(state, key, "cuckoo")
-          NIF.cuckoo_file_del(path, element)
+          with :ok <- require_existing_prob_key(state, key, :cuckoo) do
+            path = prob_path(state, key, "cuckoo")
+
+            with {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do
+              normalize_prob_mutation_result(
+                :cuckoo_del,
+                NIF.cuckoo_file_del_at(
+                  path,
+                  path,
+                  element,
+                  mutation_index,
+                  mutation_ordinal
+                )
+              )
+            end
+          end
         end)
       end
 
@@ -1741,9 +1875,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           command = {:topk_add, key, elements}
 
-          with :ok <- admit_apply_command_work(state, command) do
+          with :ok <- admit_apply_command_work(state, command),
+               :ok <- require_existing_prob_key(state, key, :topk) do
             path = prob_path(state, key, "topk")
-            NIF.topk_file_add_v2(path, elements)
+
+            with {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do
+              normalize_prob_mutation_result(
+                :topk_add,
+                NIF.topk_file_add_v2_at(
+                  path,
+                  path,
+                  elements,
+                  mutation_index,
+                  mutation_ordinal
+                )
+              )
+            end
           end
         end)
       end
@@ -1752,10 +1899,71 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         apply_prob_with_time(meta, state, fn ->
           command = {:topk_incrby, key, pairs}
 
-          with :ok <- admit_apply_command_work(state, command) do
+          with :ok <- admit_apply_command_work(state, command),
+               :ok <- require_existing_prob_key(state, key, :topk) do
             path = prob_path(state, key, "topk")
-            NIF.topk_file_incrby_v2(path, pairs)
+
+            with {:ok, mutation_index, mutation_ordinal} <- next_prob_mutation_token(state) do
+              normalize_prob_mutation_result(
+                :topk_incrby,
+                NIF.topk_file_incrby_v2_at(
+                  path,
+                  path,
+                  pairs,
+                  mutation_index,
+                  mutation_ordinal
+                )
+              )
+            end
           end
+        end)
+      end
+
+      def apply(meta, {:key_lifecycle, {operation, source, destination} = command}, state)
+          when operation in [:rename, :renamenx] and is_binary(source) and
+                 is_binary(destination) do
+        apply_key_lifecycle(meta, state, command)
+      end
+
+      def apply(meta, {:key_lifecycle, {:copy, source, destination, replace?} = command}, state)
+          when is_binary(source) and is_binary(destination) and is_boolean(replace?) do
+        apply_key_lifecycle(meta, state, command)
+      end
+
+      def apply(meta, {:key_lifecycle, _invalid}, state) do
+        apply_prob_with_time(meta, state, fn ->
+          {:error, :invalid_key_lifecycle_command}
+        end)
+      end
+
+      defp apply_key_lifecycle(meta, state, command) do
+        with_apply_time(meta, fn ->
+          with_current_ra_index(meta, fn ->
+            old_count = state.applied_count
+
+            write_result =
+              with :ok <- admit_apply_command_work(state, {:key_lifecycle, command}) do
+                with_cross_shard_pending_writes(state, fn ->
+                  state
+                  |> build_local_raft_tx_store()
+                  |> then(&Dispatcher.dispatch_ast(command, &1))
+                end)
+              end
+
+            case write_result do
+              {:error, _reason} = error ->
+                new_state = %{state | applied_count: old_count + 1}
+                maybe_release_cursor(meta, old_count, new_state, error)
+
+              {:error, reason, flushed_state} ->
+                new_state = %{flushed_state | applied_count: old_count + 1}
+                maybe_release_cursor(meta, old_count, new_state, {:error, reason})
+
+              {result, flushed_state} ->
+                new_state = %{flushed_state | applied_count: old_count + 1}
+                maybe_release_cursor(meta, old_count, new_state, result)
+            end
+          end)
         end)
       end
 

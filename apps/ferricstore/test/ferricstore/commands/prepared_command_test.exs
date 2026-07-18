@@ -121,8 +121,14 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     assert {:ok, copy} = Dispatcher.prepare_raw("COPY", ["source", "destination"])
 
     assert copy.acl_keys == ["source", "destination"]
-    assert copy.read_keys == ["source"]
+    assert copy.read_keys == ["source", "destination"]
     assert copy.write_keys == ["destination"]
+
+    assert {:ok, copy_replace} =
+             Dispatcher.prepare_raw("COPY", ["source", "destination", "REPLACE"])
+
+    assert copy_replace.read_keys == ["source"]
+    assert copy_replace.write_keys == ["destination"]
 
     assert {:ok, rename} = Dispatcher.prepare_raw("RENAME", ["source", "destination"])
     assert rename.read_keys == ["source"]
@@ -137,6 +143,20 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     assert {:ok, pfmerge} = Dispatcher.prepare_raw("PFMERGE", ["destination", "source"])
     assert pfmerge.read_keys == ["destination", "source"]
     assert pfmerge.write_keys == ["destination"]
+  end
+
+  test "conditional writes retain the keys whose prior state controls the result" do
+    for {command, args, keys} <- [
+          {"SET", ["key", "value", "NX"], ["key"]},
+          {"SET", ["key", "value", "XX"], ["key"]},
+          {"SETNX", ["key", "value"], ["key"]},
+          {"MSETNX", ["first", "one", "second", "two"], ["first", "second"]},
+          {"RENAMENX", ["source", "destination"], ["source", "destination"]}
+        ] do
+      assert {:ok, prepared} = Dispatcher.prepare_raw(command, args)
+      assert prepared.read_keys == keys
+      assert prepared.write_keys == keys
+    end
   end
 
   test "read-modify-write commands and SET GET retain read access" do

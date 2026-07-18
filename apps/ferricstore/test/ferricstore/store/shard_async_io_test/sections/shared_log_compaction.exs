@@ -113,6 +113,38 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
           end
         end
 
+        @tag :noncanonical_compaction_alias
+        test "manual compaction rejects noncanonical lower segment aliases created after startup" do
+          {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+          try do
+            shard_path = Path.join([dir, "data", "shard_0"])
+            key = "compaction-noncanonical-lower-alias"
+
+            assert :ok = GenServer.call(pid, {:put, key, "lower-value", 0})
+            assert :ok = GenServer.call(pid, :flush)
+            assert :ok = force_rotate_active_file(pid)
+            assert :ok = GenServer.call(pid, {:delete, key})
+            assert :ok = GenServer.call(pid, :flush)
+            assert :ok = force_rotate_active_file(pid)
+
+            alias_path = Path.join(shard_path, "0.log")
+            assert {:ok, [_location]} = NIF.v2_append_batch(alias_path, [{key, "alias", 0}])
+
+            assert {:error,
+                    {:compaction_failed,
+                     [
+                       {1,
+                        {:compaction_plan_failed,
+                         {:noncanonical_segment_filename, "0.log", "00000.log"}}}
+                     ]}} = GenServer.call(pid, {:run_compaction, [1]})
+
+            assert File.exists?(Path.join(shard_path, "00001.log"))
+          after
+            cleanup_shard(pid, ctx, dir)
+          end
+        end
+
         test "manual compaction skips the registry active log after external rotation" do
           {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
 
@@ -732,10 +764,6 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
 
           hint_path = Path.join([dir, "data", "shard_0", "00000.hint"])
           assert File.exists?(hint_path)
-          alternate_hint_path = Path.join([dir, "data", "shard_0", "00000000000000000000.hint"])
-          File.cp!(hint_path, alternate_hint_path)
-          File.rm!(hint_path)
-          assert File.exists?(alternate_hint_path)
 
           :ok = GenServer.call(pid1, {:delete, a})
           :ok = GenServer.call(pid1, :flush)
@@ -758,6 +786,33 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
 
           assert nil == GenServer.call(pid2, {:get, a})
           assert "live-b" == GenServer.call(pid2, {:get, b})
+        end
+
+        @tag :noncanonical_hint_alias
+        test "compaction does not treat noncanonical hint aliases as supported files" do
+          {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+          try do
+            key = "compact_hint_alias_#{:erlang.unique_integer([:positive])}"
+            :ok = GenServer.call(pid, {:put, key, "value", 0})
+            :ok = GenServer.call(pid, :flush)
+
+            state = :sys.get_state(pid)
+            assert :ok = ShardFlush.write_hint_for_file(state, 0)
+
+            shard_path = Path.join([dir, "data", "shard_0"])
+            canonical_hint = Path.join(shard_path, "00000.hint")
+            alias_hint = Path.join(shard_path, "0.hint")
+            File.cp!(canonical_hint, alias_hint)
+
+            :ok = force_rotate_active_file(pid)
+            assert {:ok, {_copied, 0, _reclaimed}} = GenServer.call(pid, {:run_compaction, [0]})
+
+            refute File.exists?(canonical_hint)
+            assert File.exists?(alias_hint)
+          after
+            cleanup_shard(pid, ctx, dir)
+          end
         end
 
         test "does not drop tombstone-only files while older values can resurrect" do

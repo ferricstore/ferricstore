@@ -91,6 +91,17 @@ defmodule Ferricstore.Store.PromotionRecoveryGuardTest do
     assert Promotion.find_active(dedicated_path) == active_path
   end
 
+  test "dedicated active-file discovery rejects noncanonical segment aliases", ctx do
+    dedicated_path = Path.join(ctx.data_dir, "dedicated-segment-alias-guard")
+    File.mkdir_p!(dedicated_path)
+    File.touch!(Path.join(dedicated_path, "00000.log"))
+    File.touch!(Path.join(dedicated_path, "0.log"))
+
+    assert_raise RuntimeError, ~r/noncanonical_segment_filename/, fn ->
+      Promotion.find_active(dedicated_path)
+    end
+  end
+
   test "dedicated active-file discovery fails closed when the directory cannot be listed", ctx do
     invalid_path = Path.join(ctx.data_dir, "dedicated-not-a-directory")
     File.write!(invalid_path, "not a directory")

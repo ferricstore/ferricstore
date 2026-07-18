@@ -327,7 +327,13 @@ defmodule Ferricstore.Store.StandaloneTxLog do
       encoded ->
         case decode_line(encoded, data_dir) do
           {:ok, entry} ->
-            reduce_journal(rest, data_dir, accumulate_pending(entry, pending_state), skipped)
+            case accumulate_pending(entry, pending_state) do
+              {:ok, next_pending_state} ->
+                reduce_journal(rest, data_dir, next_pending_state, skipped)
+
+              :error ->
+                reduce_journal(rest, data_dir, pending_state, skipped + 1)
+            end
 
           :error ->
             reduce_journal(rest, data_dir, pending_state, skipped + 1)
@@ -352,10 +358,10 @@ defmodule Ferricstore.Store.StandaloneTxLog do
          {@magic, :prepare, txid, groups},
          {order, prepares, terminals}
        ) do
-    if Map.has_key?(prepares, txid) do
-      {order, Map.put(prepares, txid, groups), terminals}
+    if Map.has_key?(prepares, txid) or MapSet.member?(terminals, txid) do
+      :error
     else
-      {[txid | order], Map.put(prepares, txid, groups), terminals}
+      {:ok, {[txid | order], Map.put(prepares, txid, groups), terminals}}
     end
   end
 
@@ -363,8 +369,13 @@ defmodule Ferricstore.Store.StandaloneTxLog do
          {@magic, terminal, txid},
          {order, prepares, terminals}
        )
-       when terminal in [:commit, :abort],
-       do: {order, Map.delete(prepares, txid), MapSet.put(terminals, txid)}
+       when terminal in [:commit, :abort] do
+    if Map.has_key?(prepares, txid) and not MapSet.member?(terminals, txid) do
+      {:ok, {order, Map.delete(prepares, txid), MapSet.put(terminals, txid)}}
+    else
+      :error
+    end
+  end
 
   defp trim_line_ending(line) when is_binary(line) do
     line

@@ -655,7 +655,9 @@ defmodule Ferricstore.Application do
     case list_log_files.(shard_path) do
       {:ok, files} ->
         files
-        |> Enum.filter(&String.ends_with?(&1, ".log"))
+        |> Enum.filter(fn filename ->
+          match?({:ok, _file_id}, Ferricstore.Store.SegmentFilename.parse(filename))
+        end)
         |> Enum.reduce(:ok, fn filename, acc ->
           path = Path.join(shard_path, filename)
 

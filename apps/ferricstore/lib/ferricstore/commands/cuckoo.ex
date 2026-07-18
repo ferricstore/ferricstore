@@ -14,7 +14,7 @@ defmodule Ferricstore.Commands.Cuckoo do
   @prob_read_timeout_ms 5_000
   @default_capacity 1024
   @bucket_size 4
-  @max_capacity 268_435_456
+  @max_capacity 1_073_741_824
   @max_batch_items 10_000
 
   # -------------------------------------------------------------------

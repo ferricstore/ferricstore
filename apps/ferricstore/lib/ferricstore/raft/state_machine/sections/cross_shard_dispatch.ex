@@ -2569,6 +2569,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           prob_dir: fn ->
             Path.join(default_ctx.shard_data_path, "prob")
           end,
+          prob_dir_for: fn key ->
+            key
+            |> ctx_for_key.()
+            |> Map.fetch!(:shard_data_path)
+            |> Path.join("prob")
+          end,
+          prob_file_lifecycle: :replicated,
+          prob_lifecycle: fn command ->
+            apply_prob_lifecycle_locally(anchor_state, command, fn ->
+              build_transaction_store(shard_idx, anchor_state, routing_mode)
+            end)
+          end,
           shard_index: default_ctx.index,
           data_dir: data_dir,
           compound_member_apply_budget: anchor_state.apply_context.compound_member_apply_budget,

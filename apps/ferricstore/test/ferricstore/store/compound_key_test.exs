@@ -26,6 +26,16 @@ defmodule Ferricstore.Store.CompoundKeyTest do
       end
     end
 
+    test "probabilistic type markers retain their Raft create token" do
+      for type <- [:bloom, :cms, :cuckoo, :topk], token <- [-1, 0, 42] do
+        marker = CompoundKey.encode_prob_type(type, token)
+
+        assert CompoundKey.decode_type(marker) == type
+        assert CompoundKey.decode_prob_type(marker) == {:ok, {type, token}}
+        assert CompoundKey.type_name(marker) == CompoundKey.encode_type(type)
+      end
+    end
+
     test "encodes to expected strings" do
       assert "hash" == CompoundKey.encode_type(:hash)
       assert "list" == CompoundKey.encode_type(:list)

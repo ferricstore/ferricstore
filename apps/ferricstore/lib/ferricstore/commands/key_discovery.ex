@@ -83,7 +83,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   ))
 
   @read_write_key_commands MapSet.new(~w(
-    APPEND SETRANGE INCR DECR INCRBY DECRBY INCRBYFLOAT GETSET GETDEL GETEX
+    SETNX MSETNX APPEND SETRANGE INCR DECR INCRBY DECRBY INCRBYFLOAT GETSET GETDEL GETEX
     HSET HDEL HINCRBY HINCRBYFLOAT HSETNX HEXPIRE HPEXPIRE HPERSIST HGETDEL HGETEX HSETEX
     LPUSH RPUSH LPOP RPOP LSET LINSERT LTRIM LREM LPUSHX RPUSHX BLPOP BRPOP BLMPOP
     SADD SREM SPOP ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX SETBIT PFADD GEOADD
@@ -324,8 +324,24 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   end
 
   defp footprint("SET", {:set, _key, _value, opts}, keys) when is_list(opts) do
-    if :get in opts, do: {keys, keys}, else: {[], keys}
+    if Enum.any?(opts, &(&1 in [:get, :nx, :xx, :keepttl])),
+      do: {keys, keys},
+      else: {[], keys}
   end
+
+  defp footprint(
+         "COPY",
+         {:copy, source, destination, false},
+         _keys
+       ),
+       do: {[source, destination], [destination]}
+
+  defp footprint(
+         "COPY",
+         {:copy, source, destination, true},
+         _keys
+       ),
+       do: {[source], [destination]}
 
   defp footprint(
          _command,
@@ -340,6 +356,11 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   defp footprint(command, [source, destination | _rest])
        when command == "COPY",
        do: {[source], [destination]}
+
+  defp footprint("RENAMENX", [source, destination | _rest]) do
+    keys = Enum.uniq([source, destination])
+    {keys, keys}
+  end
 
   defp footprint("PFMERGE", [destination | sources]) do
     {Enum.uniq([destination | sources]), [destination]}

@@ -808,6 +808,9 @@ defmodule Ferricstore.Bitcask.NIF do
   def v2_append_batch_async(_caller_pid, _correlation_id, _path, _records),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec prob_file_recover(binary(), binary()) :: :ok | {:error, term()}
+  def prob_file_recover(_path, _extension), do: :erlang.nif_error(:nif_not_loaded)
+
   # -- Stateless pread/pwrite Bloom NIFs --
   @spec bloom_file_create(binary(), non_neg_integer(), non_neg_integer()) ::
           :ok | {:error, term()}
@@ -816,8 +819,28 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec bloom_file_add(binary(), binary()) :: :ok | {:error, term()}
   def bloom_file_add(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec bloom_file_add_at(
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: {:ok, 0 | 1} | {:error, term()}
+  def bloom_file_add_at(_path, _receipt_path, _element, _mutation_index, _mutation_ordinal),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec bloom_file_madd(binary(), [binary()]) :: :ok | {:error, term()}
   def bloom_file_madd(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec bloom_file_madd_at(
+          binary(),
+          binary(),
+          [binary()],
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: {:ok, [0 | 1]} | {:error, term()}
+  def bloom_file_madd_at(_path, _receipt_path, _elements, _mutation_index, _mutation_ordinal),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec bloom_file_exists(binary(), binary()) :: {:ok, boolean()} | {:error, term()}
   def bloom_file_exists(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
@@ -856,6 +879,16 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec cms_file_incrby(binary(), [{binary(), non_neg_integer()}]) :: :ok | {:error, term()}
   def cms_file_incrby(_path, _items), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec cms_file_incrby_at(
+          binary(),
+          binary(),
+          [{binary(), integer()}],
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: {:ok, [integer()]} | {:error, term()}
+  def cms_file_incrby_at(_path, _receipt_path, _items, _mutation_index, _mutation_ordinal),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec cms_file_query(binary(), [binary()]) :: {:ok, [non_neg_integer()]} | {:error, term()}
   def cms_file_query(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
 
@@ -865,6 +898,24 @@ defmodule Ferricstore.Bitcask.NIF do
 
   @spec cms_file_merge(binary(), [binary()], [number()]) :: :ok | {:error, term()}
   def cms_file_merge(_dst_path, _src_paths, _weights), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec cms_file_merge_at(
+          binary(),
+          binary(),
+          [binary()],
+          [integer()],
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: :ok | {:error, term()}
+  def cms_file_merge_at(
+        _dst_path,
+        _receipt_path,
+        _src_paths,
+        _weights,
+        _mutation_index,
+        _mutation_ordinal
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 
   # -- Async CMS read NIFs (Tokio spawn_blocking) --
   @spec cms_file_query_async(pid(), term(), binary(), [binary()]) :: :ok | {:error, term()}
@@ -883,11 +934,26 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec cuckoo_file_add(binary(), binary()) :: :ok | {:error, term()}
   def cuckoo_file_add(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec cuckoo_file_add_at(binary(), binary(), binary(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, 0 | 1} | {:error, term()}
+  def cuckoo_file_add_at(_path, _receipt_path, _element, _mutation_index, _mutation_ordinal),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec cuckoo_file_addnx(binary(), binary()) :: {:ok, boolean()} | {:error, term()}
   def cuckoo_file_addnx(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec cuckoo_file_addnx_at(binary(), binary(), binary(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, 0 | 1} | {:error, term()}
+  def cuckoo_file_addnx_at(_path, _receipt_path, _element, _mutation_index, _mutation_ordinal),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec cuckoo_file_del(binary(), binary()) :: :ok | {:error, term()}
   def cuckoo_file_del(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec cuckoo_file_del_at(binary(), binary(), binary(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, 0 | 1} | {:error, term()}
+  def cuckoo_file_del_at(_path, _receipt_path, _element, _mutation_index, _mutation_ordinal),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec cuckoo_file_exists(binary(), binary()) :: {:ok, boolean()} | {:error, term()}
   def cuckoo_file_exists(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
@@ -928,18 +994,53 @@ defmodule Ferricstore.Bitcask.NIF do
   def topk_file_create_v2(_path, _k, _width, _depth),
     do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec topk_file_add_v2(binary(), [binary()]) :: {:ok, [binary() | nil]} | {:error, term()}
+  @spec topk_file_add_v2(binary(), [binary()]) :: [binary() | nil] | {:error, term()}
   def topk_file_add_v2(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec topk_file_add_v2_at(
+          binary(),
+          binary(),
+          [binary()],
+          non_neg_integer(),
+          pos_integer()
+        ) :: [binary() | nil] | {:error, term()}
+  def topk_file_add_v2_at(
+        _path,
+        _receipt_path,
+        _elements,
+        _mutation_index,
+        _mutation_ordinal
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   @spec topk_file_incrby_v2(binary(), [{binary(), non_neg_integer()}]) ::
-          {:ok, [binary() | nil]} | {:error, term()}
+          [binary() | nil] | {:error, term()}
   def topk_file_incrby_v2(_path, _pairs), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec topk_file_incrby_v2_at(
+          binary(),
+          binary(),
+          [{binary(), non_neg_integer()}],
+          non_neg_integer(),
+          pos_integer()
+        ) :: [binary() | nil] | {:error, term()}
+  def topk_file_incrby_v2_at(
+        _path,
+        _receipt_path,
+        _pairs,
+        _mutation_index,
+        _mutation_ordinal
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 
   @spec topk_file_query_v2(binary(), [binary()]) :: {:ok, [boolean()]} | {:error, term()}
   def topk_file_query_v2(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec topk_file_list_v2(binary()) :: {:ok, [{binary(), non_neg_integer()}]} | {:error, term()}
   def topk_file_list_v2(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec topk_file_list_with_count(binary()) :: [binary() | non_neg_integer()] | {:error, term()}
+  def topk_file_list_with_count(_path), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec topk_file_count_v2(binary(), [binary()]) :: {:ok, [non_neg_integer()]} | {:error, term()}
   def topk_file_count_v2(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
@@ -955,6 +1056,10 @@ defmodule Ferricstore.Bitcask.NIF do
 
   @spec topk_file_list_v2_async(pid(), term(), binary()) :: :ok | {:error, term()}
   def topk_file_list_v2_async(_caller_pid, _correlation_id, _path),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec topk_file_list_with_count_async(pid(), term(), binary()) :: :ok | {:error, term()}
+  def topk_file_list_with_count_async(_caller_pid, _correlation_id, _path),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @spec topk_file_count_v2_async(pid(), term(), binary(), [binary()]) :: :ok | {:error, term()}
@@ -1046,6 +1151,15 @@ defmodule Ferricstore.Bitcask.NIF do
   @doc "Stream-copy a regular file into a new destination without following final symlinks."
   @spec fs_copy_sync_nofollow(binary(), binary()) :: :ok | fs_error()
   def fs_copy_sync_nofollow(_source, _dest), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Stream-copy a locked regular file and atomically replace the destination."
+  @spec fs_copy_replace_sync_nofollow(binary(), binary()) :: :ok | fs_error()
+  def fs_copy_replace_sync_nofollow(_source, _dest), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Atomically replace the destination with a hard link to a locked regular file."
+  @spec fs_hard_link_replace_sync_nofollow(binary(), binary()) :: :ok | fs_error()
+  def fs_hard_link_replace_sync_nofollow(_source, _dest),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Append one binary and fdatasync it without following a final symlink."
   @spec fs_append_sync_nofollow(binary(), binary()) :: :ok | fs_error()

@@ -174,7 +174,16 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           LogicalKeyIndex.table_names(instance_name, shard_index)
 
         LogicalKeyIndex.ensure_tables!(logical_key_index, logical_key_slots)
-        rebuild_logical_key_index!(logical_key_index, logical_key_slots, keydir, shard_index)
+
+        rebuild_logical_key_index!(
+          logical_key_index,
+          logical_key_slots,
+          keydir,
+          shard_index,
+          shard_data_path
+        )
+
+        ShardLifecycle.validate_prob_files(shard_data_path, shard_index, keydir)
 
         {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, shard_index)
         ensure_ets_table!(zset_score_index, :ordered_set)
@@ -275,8 +284,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           sm_state.logical_key_index_name,
           sm_state.logical_key_slots_name,
           keydir,
-          shard_index
+          shard_index,
+          shard_data_path
         )
+
+        ShardLifecycle.validate_prob_files(shard_data_path, shard_index, keydir)
 
         Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
           shard_data_path,
@@ -298,8 +310,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         |> StateMachine.__flow_due_catalog_from_native_for_recovery__()
       end
 
-      defp rebuild_logical_key_index!(ordered, slots, keydir, shard_index) do
-        case LogicalKeyIndex.rebuild(ordered, slots, keydir) do
+      defp rebuild_logical_key_index!(ordered, slots, keydir, shard_index, shard_data_path) do
+        case LogicalKeyIndex.rebuild(ordered, slots, keydir, shard_data_path) do
           :ok ->
             :ok
 

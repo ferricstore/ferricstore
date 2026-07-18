@@ -3,6 +3,7 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
 
   alias Ferricstore.CommandTime
   alias Ferricstore.CrossShardOp
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.ApplyContext
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.CompoundKey
@@ -90,6 +91,35 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert "after-command-error" == Router.get(ctx, coordinator_key)
   end
 
+  test "standalone cross-shard callbacks cannot read undeclared keys", %{ctx: ctx} do
+    {first, second} = different_shard_keys(ctx)
+    undeclared = first <> ":undeclared"
+    assert :ok = Router.put(ctx, undeclared, "secret", 0)
+
+    assert {:error, {:cross_shard_footprint_violation, :read, ^undeclared}} =
+             CrossShardOp.execute(
+               [{first, :read}, {second, :read}],
+               fn store -> store.get.(undeclared) end,
+               instance: ctx
+             )
+
+    assert "secret" == Router.get(ctx, undeclared)
+  end
+
+  test "standalone cross-shard callbacks cannot write read-only keys", %{ctx: ctx} do
+    {first, second} = different_shard_keys(ctx)
+    assert :ok = Router.put(ctx, first, "original", 0)
+
+    assert {:error, {:cross_shard_footprint_violation, :write, ^first}} =
+             CrossShardOp.execute(
+               [{first, :read}, {second, :read}],
+               fn store -> store.put.(first, "replacement", 0) end,
+               instance: ctx
+             )
+
+    assert "original" == Router.get(ctx, first)
+  end
+
   test "cross-shard publication does not expose a mixed batch snapshot", %{ctx: ctx} do
     {first, second} = different_shard_keys(ctx)
     assert :ok = Router.put(ctx, first, "old-1", 0)
@@ -157,6 +187,98 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert Task.await(writer, 2_000) == :ok
     assert Task.await(reader, 2_000) == ["new-1", "new-2"]
     assert Router.batch_get(ctx, [first, second]) == ["new-1", "new-2"]
+  end
+
+  test "coordinator death after journal commit restarts participants before releasing barriers",
+       %{
+         ctx: ctx
+       } do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    {first, second} = different_shard_keys(ctx)
+    assert :ok = Router.put(ctx, first, "old-1", 0)
+    assert :ok = Router.put(ctx, second, "old-2", 0)
+
+    first_index = Router.shard_for(ctx, first)
+    second_index = Router.shard_for(ctx, second)
+    coordinator_index = min(first_index, second_index)
+    participant_index = max(first_index, second_index)
+    coordinator_name = Router.shard_name(ctx, coordinator_index)
+    participant_name = Router.shard_name(ctx, participant_index)
+    coordinator_pid = Process.whereis(coordinator_name)
+    participant_pid = Process.whereis(participant_name)
+    parent = self()
+    fsync_calls = :atomics.new(1, signed: false)
+    previous_hook = Application.get_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+
+    Application.put_env(:ferricstore, :standalone_tx_log_fsync_dir_hook, fn path ->
+      :ok = NIF.v2_fsync_dir(path)
+
+      if :atomics.add_get(fsync_calls, 1, 1) == 2 do
+        send(parent, :standalone_journal_commit_durable)
+        Process.exit(self(), :kill)
+      end
+
+      :ok
+    end)
+
+    on_exit(fn ->
+      if previous_hook do
+        Application.put_env(:ferricstore, :standalone_tx_log_fsync_dir_hook, previous_hook)
+      else
+        Application.delete_env(:ferricstore, :standalone_tx_log_fsync_dir_hook)
+      end
+    end)
+
+    spawn(fn ->
+      result =
+        CrossShardOp.execute(
+          [{first, :write}, {second, :write}],
+          fn store ->
+            :ok = store.put.(first, "new-1", 0)
+            :ok = store.put.(second, "new-2", 0)
+          end,
+          instance: ctx
+        )
+
+      send(parent, {:cross_shard_crash_result, result})
+    end)
+
+    assert_receive :standalone_journal_commit_durable, 2_000
+
+    assert_receive {:cross_shard_crash_result,
+                    {:error, {:standalone_cross_shard_failed, _reason}}},
+                   5_000
+
+    assert_receive {:EXIT, ^coordinator_pid, :killed}, 2_000
+    assert Process.whereis(coordinator_name) == nil
+
+    assert :ok =
+             ShardHelpers.eventually(
+               fn ->
+                 Process.whereis(participant_name) == nil
+               end,
+               "participant released a potentially stale keydir instead of restarting",
+               100,
+               20
+             )
+
+    assert_receive {:EXIT, ^participant_pid, _reason}, 2_000
+
+    for index <- [coordinator_index, participant_index] do
+      assert {:ok, _pid} =
+               Ferricstore.Store.Shard.start_link(
+                 index: index,
+                 data_dir: ctx.data_dir,
+                 instance_ctx: ctx
+               )
+    end
+
+    values = Router.batch_get(ctx, [first, second])
+
+    assert values == ["new-1", "new-2"],
+           "recovered #{inspect(values)} for shard indexes #{inspect([first_index, second_index])}"
   end
 
   test "client death during cross-shard execution does not strand participant barriers", %{
@@ -260,8 +382,13 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
     {source, destination} = different_shard_keys(ctx)
-    coordinator = min(Router.shard_for(ctx, source), Router.shard_for(ctx, destination))
+    source_index = Router.shard_for(ctx, source)
+    destination_index = Router.shard_for(ctx, destination)
+    coordinator = min(source_index, destination_index)
+    participant = max(source_index, destination_index)
     coordinator_name = elem(ctx.shard_names, coordinator)
+    participant_name = elem(ctx.shard_names, participant)
+    participant_pid = Process.whereis(participant_name)
 
     assert 2 = Router.list_op(ctx, source, {:rpush, ["first", "second"]})
 
@@ -290,17 +417,29 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert_receive {:EXIT, _pid, :kill}, 1_000
     assert Process.whereis(coordinator_name) == nil
 
+    assert :ok =
+             ShardHelpers.eventually(
+               fn -> Process.whereis(participant_name) == nil end,
+               "participant released a potentially stale keydir instead of restarting",
+               100,
+               20
+             )
+
+    assert_receive {:EXIT, ^participant_pid, _reason}, 2_000
+
     assert :persistent_term.get(
              {Ferricstore.Store.StandaloneTxLog, Path.expand(ctx.data_dir)},
              false
            ) == false
 
-    assert {:ok, _pid} =
-             Ferricstore.Store.Shard.start_link(
-               index: coordinator,
-               data_dir: ctx.data_dir,
-               instance_ctx: ctx
-             )
+    for index <- [coordinator, participant] do
+      assert {:ok, _pid} =
+               Ferricstore.Store.Shard.start_link(
+                 index: index,
+                 data_dir: ctx.data_dir,
+                 instance_ctx: ctx
+               )
+    end
 
     assert_receive {:standalone_recovery, [:ferricstore, :standalone_tx_log, :recover],
                     %{pending: 1, replayed: 1}, %{status: :ok}},

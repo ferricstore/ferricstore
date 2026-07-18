@@ -49,6 +49,16 @@ defmodule Ferricstore.CrossShardOpTest do
              )
   end
 
+  test "invalid key footprints are rejected before invoking a direct-store callback" do
+    direct_store = %{get: fn _key -> nil end}
+    execute = fn _store -> flunk("invalid footprint callback must not run") end
+
+    for invalid <- [[{"key", :invalid}], [{123, :read}], :not_a_list] do
+      assert {:error, "ERR invalid cross-shard key footprint"} ==
+               CrossShardOp.execute(invalid, execute, store: direct_store)
+    end
+  end
+
   test "SMOVE rejects independent Raft groups without mutation" do
     ctx = FerricStore.Instance.get(:default)
     [source, destination] = ShardHelpers.keys_on_different_shards(2)

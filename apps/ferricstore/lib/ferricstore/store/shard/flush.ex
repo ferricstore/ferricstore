@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   alias Ferricstore.Store.AppendResult
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.Promotion
+  alias Ferricstore.Store.SegmentFilename
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   require Logger
@@ -548,11 +549,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   defp accumulate_live_bytes(acc, _key, _fid, _vsize), do: acc
 
   defp regular_log_file(shard_path, name) do
-    with true <- String.ends_with?(name, ".log"),
-         false <- String.starts_with?(name, "compact_"),
-         stem <- String.trim_trailing(name, ".log"),
-         {fid, ""} <- Integer.parse(stem),
-         true <- fid >= 0,
+    with {:ok, fid} <- SegmentFilename.parse(name),
          {:ok, %File.Stat{type: :regular, size: size}} <-
            File.lstat(Path.join(shard_path, name)) do
       {:ok, fid, size}

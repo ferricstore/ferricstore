@@ -31,6 +31,7 @@ defmodule Ferricstore.Store.Shard.Compaction do
       alias Ferricstore.Store.HintMetadata
       alias Ferricstore.Store.Keydir
       alias Ferricstore.Store.Router
+      alias Ferricstore.Store.SegmentFilename
       alias Ferricstore.Store.SegmentLock
       alias Ferricstore.Store.Shard.Compound, as: ShardCompound
       alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -59,11 +60,10 @@ defmodule Ferricstore.Store.Shard.Compaction do
 
       defp remove_hint_for_file(shard_path, fid) do
         # Compaction rewrites or invalidates offsets in the paired log file.
-        # Dropping every numeric alias for this fid forces startup to scan the log
-        # instead of trusting stale offsets that can hide or resurrect keys.
-        with {:ok, files} <- Ferricstore.FS.ls(shard_path),
-             hint_names = hint_names_for_file(files, fid),
-             :ok <- remove_hint_files(shard_path, hint_names) do
+        # Only the canonical paired hint is part of the storage namespace.
+        hint_name = SegmentFilename.format(fid, ".hint")
+
+        with :ok <- remove_hint_files(shard_path, [hint_name]) do
           :ok
         else
           {:error, reason} = error ->
@@ -72,27 +72,6 @@ defmodule Ferricstore.Store.Shard.Compaction do
             )
 
             error
-        end
-      end
-
-      defp hint_names_for_file(files, fid) do
-        files
-        |> Enum.filter(&(hint_file_id(&1) == fid))
-        |> case do
-          [] -> ["#{String.pad_leading(Integer.to_string(fid), 5, "0")}.hint"]
-          names -> names
-        end
-      end
-
-      defp hint_file_id(name) do
-        with true <- String.ends_with?(name, ".hint"),
-             false <- String.starts_with?(name, "compact_"),
-             stem <- String.trim_trailing(name, ".hint"),
-             {parsed, ""} <- Integer.parse(stem),
-             true <- parsed >= 0 do
-          parsed
-        else
-          _ -> nil
         end
       end
 
@@ -310,21 +289,27 @@ defmodule Ferricstore.Store.Shard.Compaction do
 
       defp lower_compaction_files(shard_path, fid) do
         with {:ok, files} <- Ferricstore.FS.ls(shard_path) do
-          lower_files =
-            files
-            |> Enum.flat_map(fn name ->
-              with true <- String.ends_with?(name, ".log"),
-                   false <- String.starts_with?(name, "compact_"),
-                   {lower_fid, ""} <- Integer.parse(String.trim_trailing(name, ".log")),
-                   true <- lower_fid < fid do
-                [{lower_fid, Path.join(shard_path, name)}]
-              else
-                _ -> []
-              end
-            end)
-            |> Enum.sort_by(fn {lower_fid, _path} -> -lower_fid end)
+          case Enum.reduce_while(files, {:ok, []}, fn name, {:ok, lower_files} ->
+                 case SegmentFilename.parse(name) do
+                   {:ok, lower_fid} when lower_fid < fid ->
+                     {:cont, {:ok, [{lower_fid, Path.join(shard_path, name)} | lower_files]}}
 
-          {:ok, lower_files}
+                   {:ok, _same_or_higher_fid} ->
+                     {:cont, {:ok, lower_files}}
+
+                   :skip ->
+                     {:cont, {:ok, lower_files}}
+
+                   {:error, reason} ->
+                     {:halt, {:error, reason}}
+                 end
+               end) do
+            {:ok, lower_files} ->
+              {:ok, Enum.sort_by(lower_files, fn {lower_fid, _path} -> -lower_fid end)}
+
+            {:error, _reason} = error ->
+              error
+          end
         end
       end
 

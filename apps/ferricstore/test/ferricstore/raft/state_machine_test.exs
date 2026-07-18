@@ -91,6 +91,7 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   defdelegate apply_waraft_segment_command(command, meta, state, writer), to: StateMachine
   defdelegate apply_standalone_command(command, state), to: StateMachine
   defdelegate apply_standalone_command(command, meta, state), to: StateMachine
+  defdelegate apply_standalone_cross_shard(execute_fn, state), to: StateMachine
 
   defdelegate __apply_pending_locations_for_test__(state, file_id, batch, locations),
     to: StateMachine
@@ -106,6 +107,12 @@ defmodule Ferricstore.Raft.StateMachineTest.CurrentStateMachine do
   defdelegate __observe_tagged_lmdb_enqueue_failure_for_test__(state, reason), to: StateMachine
   defdelegate __safe_ets_select_page_for_test__(table, spec, limit), to: StateMachine
   defdelegate __append_pending_batch_sync_for_test__(path, batch), to: StateMachine
+
+  defdelegate __prob_create_and_fsync_for_test__(state, create_path, final_path, create_result),
+    to: StateMachine
+
+  defdelegate __prob_lifecycle_replay_type_for_test__(store, command, lifecycle_id),
+    to: StateMachine
 
   defdelegate __flow_native_apply_or_queue_for_test__(native, op), to: StateMachine
 

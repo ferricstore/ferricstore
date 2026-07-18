@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.CompactionJournalTest do
   alias Ferricstore.Flow.{LMDB, Locator}
   alias Ferricstore.Store.{CompactionJournal, CompactionPlan, CompactionTombstoneCatalog}
   alias Ferricstore.Store.Shard.Lifecycle
+  alias Ferricstore.TermCodec
 
   setup do
     shard_path =
@@ -187,6 +188,50 @@ defmodule Ferricstore.Store.CompactionJournalTest do
       File.write!(path, payload)
       assert {:error, {^name, :invalid_journal}} = CompactionJournal.recover_all(shard_path)
     end
+  end
+
+  test "recovery rejects a journal whose payload targets another file", %{
+    shard_path: shard_path
+  } do
+    name = "compaction_swap_0.txn"
+    path = Path.join(shard_path, name)
+    tx_id = Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+
+    File.write!(
+      path,
+      TermCodec.encode({:ferricstore_compaction_swap, 1, 1, tx_id})
+    )
+
+    File.write!(Path.join(shard_path, "00001.log"), "unrelated")
+    unrelated_plan = empty_plan!(shard_path, 1)
+
+    assert {:error, {^name, {:journal_identity_mismatch, ^path, expected}}} =
+             CompactionJournal.recover_all(shard_path)
+
+    assert expected == Path.join(shard_path, "compaction_swap_1.txn")
+    assert File.exists?(path)
+    assert File.exists?(unrelated_plan)
+    assert File.read!(Path.join(shard_path, "00001.log")) == "unrelated"
+  end
+
+  test "recovery rejects a noncanonical transaction id before touching artifacts", %{
+    shard_path: shard_path
+  } do
+    name = "compaction_swap_0.txn"
+    path = Path.join(shard_path, name)
+    source = Path.join(shard_path, "00000.log")
+    File.write!(source, "source")
+    plan_path = empty_plan!(shard_path, 0)
+
+    File.write!(
+      path,
+      TermCodec.encode({:ferricstore_compaction_swap, 1, 0, "not-a-transaction-id"})
+    )
+
+    assert {:error, {^name, :invalid_journal}} = CompactionJournal.recover_all(shard_path)
+    assert File.exists?(path)
+    assert File.exists?(plan_path)
+    assert File.read!(source) == "source"
   end
 
   defp empty_plan!(shard_path, fid) do

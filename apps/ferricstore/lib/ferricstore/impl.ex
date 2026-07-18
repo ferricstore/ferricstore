@@ -1050,6 +1050,7 @@ defmodule FerricStore.Impl do
       ratelimit_add: fn key, w, m, c -> Router.ratelimit_add(ctx, key, w, m, c) end,
       list_op: fn key, op -> Router.list_op(ctx, key, op) end,
       prob_write: fn cmd -> Router.prob_write(ctx, cmd) end,
+      key_lifecycle: fn command -> Router.key_lifecycle(ctx, command) end,
       prob_dir: fn ->
         # For compound store, use shard 0's prob dir as default
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, 0)

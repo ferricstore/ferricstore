@@ -3,7 +3,7 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{ColdRead, CompoundKey, Promotion}
+  alias Ferricstore.Store.{ColdRead, CompoundKey, Promotion, SegmentFilename}
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
@@ -338,6 +338,9 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
               end
 
             :skip ->
+              acc
+
+            {:error, _noncanonical} ->
               acc
           end
         end)
@@ -810,6 +813,9 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
 
             :skip ->
               {:cont, :ok}
+
+            {:error, reason} ->
+              {:halt, {:error, reason}}
           end
         end)
 
@@ -839,15 +845,7 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
   end
 
   defp dedicated_log_file_id(name) do
-    with true <- String.ends_with?(name, ".log"),
-         false <- String.starts_with?(name, "compact_"),
-         stem <- String.trim_trailing(name, ".log"),
-         {fid, ""} <- Integer.parse(stem),
-         true <- fid >= 0 do
-      {:ok, fid}
-    else
-      _ -> :skip
-    end
+    SegmentFilename.parse(name)
   end
 
   @spec promoted_prefix_for(map(), binary()) :: binary() | nil

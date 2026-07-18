@@ -437,7 +437,7 @@ defmodule Ferricstore.Commands.ProbBugHuntTest.Sections.ProbabilisticDirectWrite
           assert est >= 80
         end
 
-        test "merge into existing destination adds to existing counts" do
+        test "merge into existing destination replaces its counts" do
           store = MockStore.make()
           :ok = CMS.handle("CMS.INITBYDIM", ["dst", "200", "5"], store)
           :ok = CMS.handle("CMS.INITBYDIM", ["src", "200", "5"], store)
@@ -448,7 +448,7 @@ defmodule Ferricstore.Commands.ProbBugHuntTest.Sections.ProbabilisticDirectWrite
           assert :ok = CMS.handle("CMS.MERGE", ["dst", "1", "src"], store)
 
           [est] = CMS.handle("CMS.QUERY", ["dst", "a"], store)
-          assert est >= 150
+          assert est == 50
         end
 
         test "merge with different dimensions returns error" do

@@ -293,66 +293,45 @@ defmodule Ferricstore.Commands.TopK do
   defp do_list_with_count_after_type_check(key, store) do
     path = prob_path(store, key, "topk")
 
-    # First: get list (async, await)
-    items =
-      case await_nif(fn proxy, corr_id ->
-             NIF.topk_file_list_v2_async(proxy, corr_id, path)
-           end) do
-        {:ok, result} ->
-          result
-
-        {:error, "enoent"} ->
-          missing_or_wrongtype(key, store, {:error, "ERR TOPK: key does not exist"})
-
-        {:error, :timeout} ->
-          {:error, "ERR timeout"}
-
-        {:error, reason} ->
-          {:error, "ERR topk list failed: #{reason}"}
-      end
-
-    case items do
-      {:error, _} = err ->
-        err
-
-      items when is_list(items) ->
-        # Second: get counts (async, await)
-        case await_nif(fn proxy, corr_id ->
-               NIF.topk_file_count_v2_async(proxy, corr_id, path, items)
-             end) do
-          {:ok, counts} ->
-            case combine_items_counts(items, counts) do
-              {:ok, result} -> result
-              {:error, _message} = error -> error
-            end
-
-          {:error, "enoent"} ->
-            {:error, "ERR TOPK: key does not exist"}
-
-          {:error, :timeout} ->
-            {:error, "ERR timeout"}
-
-          {:error, reason} ->
-            {:error, "ERR topk list failed: #{reason}"}
+    case await_nif(fn proxy, corr_id ->
+           NIF.topk_file_list_with_count_async(proxy, corr_id, path)
+         end) do
+      {:ok, result} ->
+        case normalize_list_with_count_response(result) do
+          {:ok, response} -> response
+          {:error, _message} = error -> error
         end
+
+      {:error, "enoent"} ->
+        missing_or_wrongtype(key, store, {:error, "ERR TOPK: key does not exist"})
+
+      {:error, :timeout} ->
+        {:error, "ERR timeout"}
+
+      {:error, reason} ->
+        {:error, "ERR topk list failed: #{reason}"}
     end
   end
 
   @doc false
-  @spec combine_items_counts(term(), term()) :: {:ok, list()} | {:error, binary()}
-  def combine_items_counts(items, counts) when is_list(items) and is_list(counts) do
-    topk_items_with_counts(items, counts, [])
+  @spec normalize_list_with_count_response(term()) :: {:ok, list()} | {:error, binary()}
+  def normalize_list_with_count_response(response) when is_list(response) do
+    if valid_list_with_count_response?(response) do
+      {:ok, response}
+    else
+      invalid_count_response()
+    end
   end
 
-  def combine_items_counts(_items, _counts), do: invalid_count_response()
+  def normalize_list_with_count_response(_response), do: invalid_count_response()
 
-  defp topk_items_with_counts([item | items], [count | counts], acc)
-       when is_binary(item) and is_integer(count) and count >= 0 do
-    topk_items_with_counts(items, counts, [count, item | acc])
-  end
+  defp valid_list_with_count_response?([]), do: true
 
-  defp topk_items_with_counts([], [], acc), do: {:ok, Enum.reverse(acc)}
-  defp topk_items_with_counts(_items, _counts, _acc), do: invalid_count_response()
+  defp valid_list_with_count_response?([item, count | rest])
+       when is_binary(item) and is_integer(count) and count >= 0,
+       do: valid_list_with_count_response?(rest)
+
+  defp valid_list_with_count_response?(_response), do: false
 
   defp invalid_count_response, do: {:error, "ERR TOPK: invalid count response"}
 

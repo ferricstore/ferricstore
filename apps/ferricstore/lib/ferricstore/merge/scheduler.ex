@@ -49,6 +49,7 @@ defmodule Ferricstore.Merge.Scheduler do
 
   alias Ferricstore.Merge.{Manifest, Semaphore}
   alias Ferricstore.Store.Router
+  alias Ferricstore.Store.SegmentFilename
 
   require Logger
 
@@ -943,19 +944,15 @@ defmodule Ferricstore.Merge.Scheduler do
     case Ferricstore.FS.ls(shard_data_dir) do
       {:ok, entries} ->
         Enum.reduce_while(entries, {:ok, []}, fn name, {:ok, acc} ->
-          if bitcask_log_file?(name) do
-            {file_id, ""} = name |> Path.rootname() |> Integer.parse()
-            path = Path.join(shard_data_dir, name)
+          case regular_log_file_stat(shard_data_dir, name) do
+            {:ok, file_id, %{mtime: mtime_s}} ->
+              {:cont, {:ok, [{file_id, mtime_s * 1_000} | acc]}}
 
-            case File.stat(path, time: :posix) do
-              {:ok, %{mtime: mtime_s}} ->
-                {:cont, {:ok, [{file_id, mtime_s * 1_000} | acc]}}
+            :skip ->
+              {:cont, {:ok, acc}}
 
-              {:error, reason} ->
-                {:halt, {:error, {:log_file_stat_failed, path, reason}}}
-            end
-          else
-            {:cont, {:ok, acc}}
+            {:error, reason} ->
+              {:halt, {:error, reason}}
           end
         end)
 
@@ -982,7 +979,13 @@ defmodule Ferricstore.Merge.Scheduler do
   defp count_existing_log_files(shard_data_dir) do
     case Ferricstore.FS.ls(shard_data_dir) do
       {:ok, entries} ->
-        {:ok, Enum.count(entries, &bitcask_log_file?/1)}
+        Enum.reduce_while(entries, {:ok, 0}, fn name, {:ok, count} ->
+          case regular_log_file_stat(shard_data_dir, name) do
+            {:ok, _file_id, _stat} -> {:cont, {:ok, count + 1}}
+            :skip -> {:cont, {:ok, count}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
 
       {:error, reason} ->
         Logger.error(
@@ -997,13 +1000,15 @@ defmodule Ferricstore.Merge.Scheduler do
     case Ferricstore.FS.ls(shard_data_dir) do
       {:ok, entries} ->
         Enum.reduce_while(entries, {:ok, []}, fn name, {:ok, acc} ->
-          if bitcask_log_file?(name) do
-            case log_file_size(shard_data_dir, name) do
-              {:ok, file_size} -> {:cont, {:ok, [file_size | acc]}}
-              {:error, reason} -> {:halt, {:error, reason}}
-            end
-          else
-            {:cont, {:ok, acc}}
+          case regular_log_file_stat(shard_data_dir, name) do
+            {:ok, file_id, %{size: size}} ->
+              {:cont, {:ok, [{file_id, size} | acc]}}
+
+            :skip ->
+              {:cont, {:ok, acc}}
+
+            {:error, reason} ->
+              {:halt, {:error, reason}}
           end
         end)
 
@@ -1012,22 +1017,27 @@ defmodule Ferricstore.Merge.Scheduler do
     end
   end
 
-  defp log_file_size(shard_data_dir, name) do
-    {file_id, ""} = name |> Path.rootname() |> Integer.parse()
-    path = Path.join(shard_data_dir, name)
+  defp regular_log_file_stat(shard_data_dir, name) do
+    case SegmentFilename.parse(name) do
+      {:ok, file_id} ->
+        path = Path.join(shard_data_dir, name)
 
-    case File.stat(path) do
-      {:ok, %{size: size}} -> {:ok, {file_id, size}}
-      {:error, reason} -> {:error, {:log_file_stat_failed, path, reason}}
-    end
-  end
+        case File.lstat(path, time: :posix) do
+          {:ok, %File.Stat{type: :regular} = stat} ->
+            {:ok, file_id, stat}
 
-  defp bitcask_log_file?(name) do
-    with true <- String.ends_with?(name, ".log"),
-         {_, ""} <- name |> Path.rootname() |> Integer.parse() do
-      true
-    else
-      _ -> false
+          {:ok, _non_regular} ->
+            :skip
+
+          {:error, reason} ->
+            {:error, {:log_file_stat_failed, path, reason}}
+        end
+
+      :skip ->
+        :skip
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

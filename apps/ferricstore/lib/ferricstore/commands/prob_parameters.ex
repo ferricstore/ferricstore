@@ -5,8 +5,10 @@ defmodule Ferricstore.Commands.ProbParameters do
   @max_bloom_hashes 1_024
   @max_cms_depth 1_024
   @max_cms_counters 16_777_216
+  @max_cms_merge_sources 128
+  @max_cms_merge_counter_visits @max_cms_counters
   @cuckoo_bucket_size 4
-  @max_cuckoo_capacity 268_435_456
+  @max_cuckoo_capacity 1_073_741_824
   @max_topk_k 100_000
   @max_topk_counters 1_048_576
 
@@ -17,6 +19,8 @@ defmodule Ferricstore.Commands.ProbParameters do
           | :invalid_cms_dimensions
           | :cms_depth_exceeded
           | :cms_counter_limit_exceeded
+          | :cms_merge_source_limit_exceeded
+          | :cms_merge_work_limit_exceeded
           | :invalid_cuckoo_parameters
           | :cuckoo_capacity_limit_exceeded
           | :unsupported_cuckoo_bucket_size
@@ -54,6 +58,32 @@ defmodule Ferricstore.Commands.ProbParameters do
 
   def validate_cms_dimensions(_width, _depth),
     do: {:error, :invalid_cms_dimensions}
+
+  @spec cms_merge_source_limit() :: pos_integer()
+  def cms_merge_source_limit, do: @max_cms_merge_sources
+
+  @spec validate_cms_merge_source_count(term()) :: :ok | {:error, validation_error()}
+  def validate_cms_merge_source_count(count)
+      when is_integer(count) and count > 0 and count <= @max_cms_merge_sources,
+      do: :ok
+
+  def validate_cms_merge_source_count(_count),
+    do: {:error, :cms_merge_source_limit_exceeded}
+
+  @spec validate_cms_merge_work(term(), term(), term()) ::
+          :ok | {:error, validation_error()}
+  def validate_cms_merge_work(source_count, width, depth) do
+    with :ok <- validate_cms_merge_source_count(source_count),
+         :ok <- validate_cms_dimensions(width, depth) do
+      counter_count = width * depth
+
+      if source_count <= div(@max_cms_merge_counter_visits, counter_count) do
+        :ok
+      else
+        {:error, :cms_merge_work_limit_exceeded}
+      end
+    end
+  end
 
   @spec validate_cuckoo_parameters(term(), term()) :: :ok | {:error, validation_error()}
   def validate_cuckoo_parameters(capacity, bucket_size)

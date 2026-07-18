@@ -17,7 +17,7 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
   @type_warm_batch_size 4_096
   @expiry_purge_budget 256
   @random_stale_cleanup_budget 64
-  @types ~w(hash list set zset stream)
+  @types ~w(hash list set zset stream bloom cms cuckoo topk)
 
   @type table_ref :: atom() | :ets.tid() | nil
   @type cursor :: 0 | {:after, binary()}
@@ -72,37 +72,18 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
 
     with {:ok, ordered_tid} <- fetch_table(ordered),
          {:ok, slots_tid} <- fetch_table(slots),
-         {:ok, keydir_tid} <- fetch_table(keydir),
-         :ok <- warm_cold_type_metadata(keydir_tid, shard_path, expiry_cutoff_ms) do
+         {:ok, keydir_tid} <- fetch_table(keydir) do
       :ets.delete_all_objects(ordered_tid)
       :ets.delete_all_objects(slots_tid)
       initialize_slot_metadata(slots_tid)
 
       result =
-        :ets.foldl(
-          fn
-            _row, {:error, _reason} = error ->
-              error
-
-            {storage_key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size}, :ok
-            when is_binary(storage_key) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
-              if live_expiration?(expire_at_ms, expiry_cutoff_ms) do
-                put_projection_unlocked(
-                  ordered_tid,
-                  slots_tid,
-                  storage_key,
-                  value,
-                  expire_at_ms
-                )
-              else
-                :ok
-              end
-
-            row, :ok ->
-              {:error, {:invalid_keydir_row, row}}
-          end,
-          :ok,
-          keydir_tid
+        rebuild_projection_rows(
+          keydir_tid,
+          ordered_tid,
+          slots_tid,
+          shard_path,
+          expiry_cutoff_ms
         )
 
       case result do
@@ -121,56 +102,112 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
     ArgumentError -> {:error, :logical_key_index_unavailable}
   end
 
-  defp warm_cold_type_metadata(_keydir, nil, _expiry_cutoff_ms), do: :ok
-
-  defp warm_cold_type_metadata(keydir, shard_path, expiry_cutoff_ms)
-       when is_binary(shard_path) do
+  defp rebuild_projection_rows(keydir, ordered, slots, shard_path, expiry_cutoff_ms) do
     result =
       :ets.foldl(
         fn
           _row, {:error, _reason} = error ->
             error
 
-          {<<"T:", _rest::binary>> = key, nil, expire_at_ms, _lfu, file_id, offset, _value_size},
+          {storage_key, _value, expire_at_ms, _lfu, _file_id, _offset, _value_size} = row,
           {:ok, pending, pending_count}
-          when is_integer(expire_at_ms) and expire_at_ms >= 0 and is_integer(file_id) and
-                 file_id >= 0 and is_integer(offset) and offset >= 0 ->
-            if live_expiration?(expire_at_ms, expiry_cutoff_ms) do
-              pending = [{key, file_id, offset} | pending]
-              pending_count = pending_count + 1
+          when is_binary(storage_key) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+            observe_rebuild_row(storage_key)
 
-              if pending_count >= @type_warm_batch_size do
-                case warm_type_batch(keydir, shard_path, pending) do
-                  :ok -> {:ok, [], 0}
-                  {:error, _reason} = error -> error
-                end
-              else
-                {:ok, pending, pending_count}
-              end
-            else
-              {:ok, pending, pending_count}
-            end
+            project_rebuild_row(
+              row,
+              keydir,
+              ordered,
+              slots,
+              shard_path,
+              expiry_cutoff_ms,
+              {pending, pending_count}
+            )
 
-          {<<"T:", _rest::binary>> = key, nil, _expire_at_ms, _lfu, file_id, offset, _value_size},
-          {:ok, _pending, _pending_count}
-          when not is_integer(file_id) or file_id < 0 or not is_integer(offset) or offset < 0 ->
-            {:error, {:invalid_type_metadata_location, key, file_id, offset}}
-
-          _row, {:ok, pending, pending_count} ->
-            {:ok, pending, pending_count}
+          row, {:ok, _pending, _pending_count} ->
+            {:error, {:invalid_keydir_row, row}}
         end,
         {:ok, [], 0},
         keydir
       )
 
     case result do
-      {:ok, [], 0} -> :ok
-      {:ok, pending, _pending_count} -> warm_type_batch(keydir, shard_path, pending)
-      {:error, _reason} = error -> error
+      {:ok, [], 0} ->
+        :ok
+
+      {:ok, pending, _pending_count} ->
+        warm_type_batch(keydir, ordered, slots, shard_path, pending)
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp warm_type_batch(keydir, shard_path, pending) do
+  defp project_rebuild_row(
+         {<<"T:", _rest::binary>> = key, nil, expire_at_ms, _lfu, file_id, offset, _value_size},
+         keydir,
+         ordered,
+         slots,
+         shard_path,
+         expiry_cutoff_ms,
+         {pending, pending_count}
+       ) do
+    cond do
+      not is_integer(file_id) or file_id < 0 or not is_integer(offset) or offset < 0 ->
+        {:error, {:invalid_type_metadata_location, key, file_id, offset}}
+
+      not live_expiration?(expire_at_ms, expiry_cutoff_ms) ->
+        {:ok, pending, pending_count}
+
+      not is_binary(shard_path) ->
+        {:error, {:invalid_type_metadata, key, nil}}
+
+      true ->
+        pending = [{key, file_id, offset} | pending]
+        pending_count = pending_count + 1
+
+        if pending_count >= @type_warm_batch_size do
+          case warm_type_batch(keydir, ordered, slots, shard_path, pending) do
+            :ok -> {:ok, [], 0}
+            {:error, _reason} = error -> error
+          end
+        else
+          {:ok, pending, pending_count}
+        end
+    end
+  end
+
+  defp project_rebuild_row(
+         {storage_key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size},
+         _keydir,
+         ordered,
+         slots,
+         _shard_path,
+         expiry_cutoff_ms,
+         {pending, pending_count}
+       ) do
+    if live_expiration?(expire_at_ms, expiry_cutoff_ms) do
+      case put_projection_unlocked(ordered, slots, storage_key, value, expire_at_ms) do
+        :ok -> {:ok, pending, pending_count}
+        {:error, _reason} = error -> error
+      end
+    else
+      {:ok, pending, pending_count}
+    end
+  end
+
+  if Mix.env() == :test do
+    defp observe_rebuild_row(storage_key) do
+      case Process.get(:ferricstore_logical_key_rebuild_visit_hook) do
+        hook when is_function(hook, 1) -> hook.(storage_key)
+        _missing -> :ok
+      end
+    end
+  else
+    defp observe_rebuild_row(_storage_key), do: :ok
+  end
+
+  defp warm_type_batch(keydir, ordered, slots, shard_path, pending) do
     pending
     |> Enum.group_by(fn {_key, file_id, _offset} -> file_id end)
     |> Enum.reduce_while(:ok, fn {file_id, rows}, :ok ->
@@ -180,13 +217,22 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
 
       case Ferricstore.Bitcask.NIF.v2_pread_batch(file_path, offsets) do
         {:ok, values} when length(values) == length(rows) ->
-          if Enum.all?(values, &(&1 in @types)) do
-            Enum.zip(rows, values)
-            |> Enum.each(fn {{key, _file_id, _offset}, value} ->
-              :ets.update_element(keydir, key, {2, value})
-            end)
+          if Enum.all?(values, &(CompoundKey.type_name(&1) in @types)) do
+            result =
+              Enum.zip(rows, values)
+              |> Enum.reduce_while(:ok, fn {{key, _file_id, _offset}, value}, :ok ->
+                true = :ets.update_element(keydir, key, {2, value})
 
-            {:cont, :ok}
+                case put_projection_unlocked(ordered, slots, key, value, 0) do
+                  :ok -> {:cont, :ok}
+                  {:error, _reason} = error -> {:halt, error}
+                end
+              end)
+
+            case result do
+              :ok -> {:cont, :ok}
+              {:error, _reason} = error -> {:halt, error}
+            end
           else
             {:halt, {:error, :invalid_type_metadata_values}}
           end
@@ -553,8 +599,10 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
   end
 
   defp logical_projection(<<"T:", _rest::binary>> = storage_key, value) do
-    if value in @types do
-      {:ok, CompoundKey.extract_redis_key(storage_key), value}
+    type = CompoundKey.type_name(value)
+
+    if type in @types do
+      {:ok, CompoundKey.extract_redis_key(storage_key), type}
     else
       {:error, {:invalid_type_metadata, storage_key, value}}
     end
@@ -571,13 +619,27 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndex do
   defp put_projection_unlocked(ordered, slots, storage_key, value, expire_at_ms) do
     case logical_projection(storage_key, value) do
       {:ok, logical_key, type} ->
-        upsert_logical(ordered, slots, logical_key, type, expire_at_ms, storage_key)
+        if lower_priority_value_projection?(ordered, logical_key, storage_key) do
+          :ok
+        else
+          upsert_logical(ordered, slots, logical_key, type, expire_at_ms, storage_key)
+        end
 
       :ignore ->
         :ok
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp lower_priority_value_projection?(_ordered, _logical_key, <<"T:", _rest::binary>>),
+    do: false
+
+  defp lower_priority_value_projection?(ordered, logical_key, _storage_key) do
+    case :ets.lookup(ordered, logical_key) do
+      [{^logical_key, _type, _expire_at_ms, <<"T:", _rest::binary>>, _slot}] -> true
+      _missing_or_value_projection -> false
     end
   end
 

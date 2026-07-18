@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
       alias Ferricstore.Bitcask.NIF
       alias Ferricstore.ExpiryContext
       alias Ferricstore.Store.CompactionPlan
+      alias Ferricstore.Store.SegmentFilename
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       require Logger
 
@@ -429,14 +430,9 @@ defmodule Ferricstore.Store.Shard.Calls.Admin do
       end
 
       defp admin_log_file_id(name) when is_binary(name) do
-        with true <- String.ends_with?(name, ".log"),
-             false <- String.starts_with?(name, "compact_"),
-             stem <- String.trim_trailing(name, ".log"),
-             {fid, ""} <- Integer.parse(stem),
-             true <- fid >= 0 do
-          fid
-        else
-          _invalid -> nil
+        case SegmentFilename.parse(name) do
+          {:ok, fid} -> fid
+          _invalid_or_unrelated -> nil
         end
       end
 

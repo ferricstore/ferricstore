@@ -204,8 +204,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
         with :ok <- reset_dir(backup_root),
              :ok <- maybe_backup_segment_projection(handle.root_dir, backup_root, specs),
              :ok <- move_live_dirs_to_backup(specs, backup_root),
-             :ok <- move_staged_dirs_live(specs, staging_root) do
-          fsync_snapshot_parent_dirs(specs)
+             :ok <- fsync_snapshot_swap_phase(backup_root, specs),
+             :ok <- move_staged_dirs_live(specs, staging_root),
+             :ok <- fsync_snapshot_swap_phase(staging_root, specs) do
+          :ok
         else
           {:error, reason} = error ->
             {:error, reason || error}
@@ -272,12 +274,21 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
               {:halt, {:error, {:backup_live_dir, kind, :not_directory}}}
 
             {:error, :enoent} ->
-              {:cont, :ok}
+              case create_missing_live_dir_backup(backup) do
+                :ok -> {:cont, :ok}
+                {:error, reason} -> {:halt, {:error, {:backup_live_dir, kind, reason}}}
+              end
 
             {:error, reason} ->
               {:halt, {:error, {:backup_live_dir, kind, reason}}}
           end
         end)
+      end
+
+      defp create_missing_live_dir_backup(backup) do
+        with :ok <- Ferricstore.FS.mkdir_p(backup) do
+          fsync_dir(backup)
+        end
       end
 
       defp move_staged_dirs_live(specs, staging_root) do
@@ -368,6 +379,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotInstall do
             {:error, reason} -> {:halt, {:error, reason}}
           end
         end)
+      end
+
+      defp fsync_snapshot_swap_phase(phase_root, specs) do
+        with :ok <- fsync_dir(phase_root) do
+          fsync_snapshot_parent_dirs(specs)
+        end
       end
 
       defp maybe_run_snapshot_install_hook(event) do

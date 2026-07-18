@@ -46,7 +46,7 @@ defmodule Ferricstore.Store.CompoundKey do
 
   alias Ferricstore.Flow.InternalKey
 
-  @type data_type :: :hash | :list | :set | :zset | :stream
+  @type data_type :: :hash | :list | :set | :zset | :stream | :bloom | :cms | :cuckoo | :topk
 
   # -------------------------------------------------------------------
   # Type metadata keys
@@ -83,6 +83,19 @@ defmodule Ferricstore.Store.CompoundKey do
   def encode_type(:set), do: "set"
   def encode_type(:zset), do: "zset"
   def encode_type(:stream), do: "stream"
+  def encode_type(:bloom), do: "bloom"
+  def encode_type(:cms), do: "cms"
+  def encode_type(:cuckoo), do: "cuckoo"
+  def encode_type(:topk), do: "topk"
+
+  @doc false
+  @spec encode_prob_type(:bloom | :cms | :cuckoo | :topk, integer()) :: binary()
+  def encode_prob_type(type, create_token)
+      when type in [:bloom, :cms, :cuckoo, :topk] and is_integer(create_token) and
+             create_token >= -9_223_372_036_854_775_808 and
+             create_token <= 9_223_372_036_854_775_807 do
+    <<encode_type(type)::binary, 0, create_token::signed-integer-size(64)>>
+  end
 
   @doc """
   Decodes a stored type string back to the data type atom.
@@ -99,6 +112,47 @@ defmodule Ferricstore.Store.CompoundKey do
   def decode_type("set"), do: :set
   def decode_type("zset"), do: :zset
   def decode_type("stream"), do: :stream
+  def decode_type("bloom"), do: :bloom
+  def decode_type("cms"), do: :cms
+  def decode_type("cuckoo"), do: :cuckoo
+  def decode_type("topk"), do: :topk
+  def decode_type(<<"bloom", 0, _create_token::signed-integer-size(64)>>), do: :bloom
+  def decode_type(<<"cms", 0, _create_token::signed-integer-size(64)>>), do: :cms
+  def decode_type(<<"cuckoo", 0, _create_token::signed-integer-size(64)>>), do: :cuckoo
+  def decode_type(<<"topk", 0, _create_token::signed-integer-size(64)>>), do: :topk
+
+  @doc false
+  @spec decode_prob_type(binary()) ::
+          {:ok, {:bloom | :cms | :cuckoo | :topk, integer() | nil}} | :error
+  def decode_prob_type("bloom"), do: {:ok, {:bloom, nil}}
+  def decode_prob_type("cms"), do: {:ok, {:cms, nil}}
+  def decode_prob_type("cuckoo"), do: {:ok, {:cuckoo, nil}}
+  def decode_prob_type("topk"), do: {:ok, {:topk, nil}}
+
+  def decode_prob_type(<<"bloom", 0, create_token::signed-integer-size(64)>>),
+    do: {:ok, {:bloom, create_token}}
+
+  def decode_prob_type(<<"cms", 0, create_token::signed-integer-size(64)>>),
+    do: {:ok, {:cms, create_token}}
+
+  def decode_prob_type(<<"cuckoo", 0, create_token::signed-integer-size(64)>>),
+    do: {:ok, {:cuckoo, create_token}}
+
+  def decode_prob_type(<<"topk", 0, create_token::signed-integer-size(64)>>),
+    do: {:ok, {:topk, create_token}}
+
+  def decode_prob_type(_marker), do: :error
+
+  @doc false
+  @spec type_name(binary()) :: binary()
+  def type_name(marker) when marker in ["hash", "list", "set", "zset", "stream"], do: marker
+
+  def type_name(marker) do
+    case decode_prob_type(marker) do
+      {:ok, {type, _create_token}} -> encode_type(type)
+      :error -> marker
+    end
+  end
 
   # -------------------------------------------------------------------
   # Hash compound keys

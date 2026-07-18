@@ -13,7 +13,7 @@ defmodule Ferricstore.Commands.ProbType do
   @max_bloom_hashes 1_024
   @max_cms_depth 1_024
   @max_cms_counters 16_777_216
-  @max_cuckoo_capacity 268_435_456
+  @max_cuckoo_capacity 1_073_741_824
   @max_topk_k 100_000
   @max_topk_counters 1_048_576
 
@@ -43,7 +43,7 @@ defmodule Ferricstore.Commands.ProbType do
 
   def register(store, key, meta) when is_map(store) do
     if Map.has_key?(store, :put) do
-      Ops.put(store, key, TermCodec.encode(meta), 0)
+      register_metadata(store, key, meta)
     else
       :ok
     end
@@ -51,10 +51,48 @@ defmodule Ferricstore.Commands.ProbType do
 
   def register(_store, _key, _meta), do: :ok
 
+  defp register_metadata(store, key, meta) do
+    if has_type_registry?(store) do
+      register_metadata_with_type_marker(store, key, meta)
+    else
+      Ops.put(store, key, TermCodec.encode(meta), 0)
+    end
+  end
+
+  defp register_metadata_with_type_marker(store, key, meta) do
+    type = metadata_type(meta)
+
+    if type in [:bloom, :cms, :cuckoo, :topk] do
+      case TypeRegistry.check_or_set_status(key, type, store) do
+        {:ok, :created} -> put_registered_metadata(store, key, meta, true)
+        :ok -> put_registered_metadata(store, key, meta, false)
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, :invalid_probabilistic_metadata}
+    end
+  end
+
+  defp put_registered_metadata(store, key, meta, marker_created?) do
+    case Ops.put(store, key, TermCodec.encode(meta), 0) do
+      :ok ->
+        :ok
+
+      {:error, _reason} = error ->
+        if marker_created?, do: TypeRegistry.delete_type(key, store)
+        error
+
+      invalid ->
+        if marker_created?, do: TypeRegistry.delete_type(key, store)
+        {:error, {:invalid_probabilistic_metadata_put_result, invalid}}
+    end
+  end
+
   @doc false
   @spec finalize_created_file(binary(), {:ok, term()}, (-> :ok | {:error, term()})) ::
           {:ok, term()} | {:error, term()}
-  def finalize_created_file(path, {:ok, _resource} = created, commit) when is_function(commit, 0) do
+  def finalize_created_file(path, {:ok, _resource} = created, commit)
+      when is_function(commit, 0) do
     case commit.() do
       :ok ->
         created
@@ -89,10 +127,10 @@ defmodule Ferricstore.Commands.ProbType do
   end
 
   defp stored_type(key, store) do
-    case raw_value_type(key, store) do
-      {:error, _reason} = error -> error
-      nil -> registry_type(key, store)
-      type -> type
+    if has_type_registry?(store) do
+      registry_type(key, store)
+    else
+      raw_value_type(key, store)
     end
   end
 
@@ -149,23 +187,72 @@ defmodule Ferricstore.Commands.ProbType do
   @doc false
   @spec metadata_type(term()) :: :bloom | :cms | :cuckoo | :topk | :other
   def metadata_type({:bloom_meta, metadata}) when is_map(metadata) do
-    if valid_bloom_metadata?(metadata), do: :bloom, else: :other
+    with {:ok, metadata} <- metadata_without_create_token(metadata),
+         true <- valid_bloom_metadata?(metadata) do
+      :bloom
+    else
+      _invalid -> :other
+    end
   end
 
   def metadata_type({:cms_meta, metadata}) when is_map(metadata) do
-    if valid_cms_metadata?(metadata), do: :cms, else: :other
+    with {:ok, metadata} <- metadata_without_create_token(metadata),
+         true <- valid_cms_metadata?(metadata) do
+      :cms
+    else
+      _invalid -> :other
+    end
   end
 
   def metadata_type({:cuckoo_meta, metadata}) when is_map(metadata) do
-    if valid_cuckoo_metadata?(metadata), do: :cuckoo, else: :other
+    with {:ok, metadata} <- metadata_without_create_token(metadata),
+         true <- valid_cuckoo_metadata?(metadata) do
+      :cuckoo
+    else
+      _invalid -> :other
+    end
   end
 
   def metadata_type({:topk_meta, metadata}) when is_map(metadata) do
-    if valid_topk_metadata?(metadata), do: :topk, else: :other
+    with {:ok, metadata} <- metadata_without_create_token(metadata),
+         true <- valid_topk_metadata?(metadata) do
+      :topk
+    else
+      _invalid -> :other
+    end
   end
 
   def metadata_type({:topk_path, path}) when is_binary(path) and byte_size(path) > 0, do: :topk
   def metadata_type(_term), do: :other
+
+  defp metadata_without_create_token(metadata) do
+    case Map.fetch(metadata, :create_token) do
+      :error ->
+        metadata_without_lifecycle_id(metadata)
+
+      {:ok, token} when is_integer(token) ->
+        metadata
+        |> Map.delete(:create_token)
+        |> metadata_without_lifecycle_id()
+
+      {:ok, _invalid} ->
+        :error
+    end
+  end
+
+  defp metadata_without_lifecycle_id(metadata) do
+    case Map.fetch(metadata, :lifecycle_id) do
+      :error ->
+        {:ok, metadata}
+
+      {:ok, {token, digest}}
+      when is_integer(token) and is_binary(digest) and byte_size(digest) == 16 ->
+        {:ok, Map.delete(metadata, :lifecycle_id)}
+
+      {:ok, _invalid} ->
+        :error
+    end
+  end
 
   defp decode_term_type(nil), do: nil
   defp decode_term_type(term), do: metadata_type(term)
@@ -248,6 +335,10 @@ defmodule Ferricstore.Commands.ProbType do
       case TypeRegistry.get_type(key, store) do
         {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
         "none" -> nil
+        "bloom" -> :bloom
+        "cms" -> :cms
+        "cuckoo" -> :cuckoo
+        "topk" -> :topk
         _type -> :other
       end
     end

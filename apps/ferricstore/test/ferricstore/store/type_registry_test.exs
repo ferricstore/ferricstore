@@ -1,7 +1,7 @@
 defmodule Ferricstore.Store.TypeRegistryTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Store.TypeRegistry
+  alias Ferricstore.Store.{CompoundKey, TypeRegistry}
 
   test "check_or_set propagates type marker write errors" do
     store = %{
@@ -31,5 +31,20 @@ defmodule Ferricstore.Store.TypeRegistryTest do
 
     assert {:ok, :created} = TypeRegistry.check_or_set_status("shared", :hash, store)
     assert_receive {:claimed, :hash}
+  end
+
+  test "probabilistic type checks accept replay-stamped type markers" do
+    marker = CompoundKey.encode_prob_type(:bloom, 42)
+
+    store = %{
+      compound_get: fn "filter", compound_key ->
+        assert compound_key == CompoundKey.type_key("filter")
+        marker
+      end
+    }
+
+    assert :ok = TypeRegistry.check_or_set_status("filter", :bloom, store)
+    assert :ok = TypeRegistry.serialized_claim_status("filter", :bloom, store)
+    assert :ok = TypeRegistry.check_type("filter", :bloom, store)
   end
 end

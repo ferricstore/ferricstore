@@ -5,6 +5,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
   alias Ferricstore.Merge.Scheduler, as: MergeScheduler
   alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Raft.WARaftBackend
+  alias Ferricstore.Store.SegmentFilename
   alias FerricstoreServer.Health.Dashboard.StorageSnapshotCache
 
   import FerricstoreServer.Health.Dashboard.Format, only: [safe_ets_size: 1]
@@ -392,8 +393,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     case File.lstat(path) do
       {:ok, %{type: :regular, size: size}} ->
         file = Path.basename(path)
-        data_files = if String.ends_with?(file, ".log"), do: 1, else: 0
-        hint_files = if String.ends_with?(file, ".hint"), do: 1, else: 0
+        {data_files, hint_files} = storage_file_counts(file)
 
         shard_totals =
           add_shard_storage_total(
@@ -489,9 +489,9 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
     case File.lstat(path) do
       {:ok, %{type: :regular, size: size}} ->
         file = Path.basename(path)
+        {data_files, hint_files} = storage_file_counts(file)
 
-        {size, if(String.ends_with?(file, ".log"), do: 1, else: 0),
-         if(String.ends_with?(file, ".hint"), do: 1, else: 0)}
+        {size, data_files, hint_files}
 
       {:ok, %{type: :directory}} ->
         case Ferricstore.FS.ls(path) do
@@ -510,6 +510,19 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Operational do
 
       {:error, _reason} ->
         {0, 0, 0}
+    end
+  end
+
+  defp storage_file_counts(file) do
+    case SegmentFilename.parse(file) do
+      {:ok, _file_id} ->
+        {1, 0}
+
+      _not_a_canonical_log ->
+        case SegmentFilename.parse(file, ".hint") do
+          {:ok, _file_id} -> {0, 1}
+          _not_a_canonical_hint -> {0, 0}
+        end
     end
   end
 

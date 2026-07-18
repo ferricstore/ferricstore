@@ -7,6 +7,7 @@ defmodule Ferricstore.Commands.Server.Info do
   alias Ferricstore.Stats
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.ReadResult
+  alias Ferricstore.Store.SegmentFilename
 
   @last_save_key {Ferricstore.Commands.Server, :last_save_unix_seconds}
 
@@ -360,24 +361,25 @@ defmodule Ferricstore.Commands.Server.Info do
           try do
             case Ferricstore.FS.ls(shard_dir) do
               {:ok, files} ->
-                data = Enum.filter(files, &String.ends_with?(&1, ".log"))
-                hints = Enum.filter(files, &String.ends_with?(&1, ".hint"))
+                Enum.reduce(files, {0, 0, 0}, fn file, {data_count, hint_count, total} ->
+                  path = Path.join(shard_dir, file)
 
-                total =
-                  Enum.reduce(files, 0, fn f, acc ->
-                    path = Path.join(shard_dir, f)
+                  case File.lstat(path) do
+                    {:ok, %File.Stat{type: :regular, size: size}} ->
+                      case canonical_bitcask_file_kind(file) do
+                        :data -> {data_count + 1, hint_count, total + size}
+                        :hint -> {data_count, hint_count + 1, total + size}
+                        :other -> {data_count, hint_count, total + size}
+                      end
 
-                    case File.stat(path) do
-                      {:ok, %{size: size}} ->
-                        acc + size
+                    {:ok, _non_regular} ->
+                      {data_count, hint_count, total}
 
-                      {:error, reason} ->
-                        emit_info_bitcask_scan_failed(:stat_shard_file, i, path, reason)
-                        acc
-                    end
-                  end)
-
-                {length(data), length(hints), total}
+                    {:error, reason} ->
+                      emit_info_bitcask_scan_failed(:stat_shard_file, i, path, reason)
+                      {data_count, hint_count, total}
+                  end
+                end)
 
               {:error, reason} ->
                 emit_info_bitcask_scan_failed(:list_shard_dir, i, shard_dir, reason)
@@ -591,6 +593,19 @@ defmodule Ferricstore.Commands.Server.Info do
     fields = [{"distinct_prefixes", Integer.to_string(distinct_prefixes)} | prefix_fields]
 
     format_section("Keydir_Analysis", fields)
+  end
+
+  defp canonical_bitcask_file_kind(file) do
+    case SegmentFilename.parse(file) do
+      {:ok, _file_id} ->
+        :data
+
+      _not_a_canonical_log ->
+        case SegmentFilename.parse(file, ".hint") do
+          {:ok, _file_id} -> :hint
+          _not_a_canonical_hint -> :other
+        end
+    end
   end
 
   defp waraft_info_fields(shard_index) do

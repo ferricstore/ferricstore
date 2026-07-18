@@ -10,7 +10,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     ExpiryTracker,
     HintMetadata,
     LFU,
-    Router
+    Router,
+    SegmentFilename
   }
 
   alias Ferricstore.Store.CompactionJournal
@@ -68,6 +69,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   defp discover_active_file_after_compaction_recovery(shard_path) do
     case Ferricstore.FS.ls(shard_path) do
       {:ok, files} ->
+        validate_canonical_numeric_file_names!(files)
+
         # Clean up leftover compaction temp files from a previous crash.
         # These are always incomplete — if compaction had finished, the
         # rename would have replaced the original and the temp is gone.
@@ -95,6 +98,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   def recover_keydir(shard_path, keydir, shard_index, instance_ctx \\ nil) do
     case Ferricstore.FS.ls(shard_path) do
       {:ok, files} ->
+        validate_canonical_numeric_file_names!(files)
+
         log_files =
           files
           |> Enum.filter(&regular_log_file?(shard_path, &1))
@@ -400,10 +405,10 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Probabilistic sidecars
   # -------------------------------------------------------------------
 
-  @spec validate_prob_files(binary(), non_neg_integer()) :: :ok
+  @spec validate_prob_files(binary(), non_neg_integer(), :ets.tid() | atom() | nil) :: :ok
   @doc false
-  def validate_prob_files(shard_data_path, index) do
-    case ProbFiles.validate(shard_data_path, index) do
+  def validate_prob_files(shard_data_path, index, keydir \\ nil) do
+    case ProbFiles.validate(shard_data_path, index, keydir) do
       :ok ->
         :ok
 
@@ -497,7 +502,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     do: match?({:ok, _file_id, _size}, regular_numeric_file(shard_path, name, ".hint"))
 
   defp regular_numeric_file(shard_path, name, suffix) do
-    with file_id when is_integer(file_id) <- numeric_file_id(name, suffix),
+    with {:ok, file_id} <- SegmentFilename.parse(name, suffix),
          {:ok, %File.Stat{type: :regular, size: size}} <-
            File.lstat(Path.join(shard_path, name)) do
       {:ok, file_id, size}
@@ -506,15 +511,20 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end
   end
 
-  defp numeric_file_id(name, suffix) do
-    with true <- String.ends_with?(name, suffix),
-         false <- String.starts_with?(name, "compact_"),
-         stem <- String.trim_trailing(name, suffix),
-         {fid, ""} <- Integer.parse(stem),
-         true <- fid >= 0 do
-      fid
-    else
-      _ -> nil
+  defp validate_canonical_numeric_file_names!(files) do
+    Enum.each(files, fn name ->
+      validate_canonical_numeric_file_name!(name, ".log")
+      validate_canonical_numeric_file_name!(name, ".hint")
+    end)
+  end
+
+  defp validate_canonical_numeric_file_name!(name, suffix) do
+    case SegmentFilename.parse(name, suffix) do
+      {:error, {kind, ^name, canonical}} ->
+        raise "#{kind}: #{inspect(name)} aliases #{inspect(canonical)}"
+
+      _valid_or_unrelated ->
+        :ok
     end
   end
 

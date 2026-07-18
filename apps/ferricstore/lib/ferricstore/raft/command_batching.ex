@@ -23,6 +23,7 @@ defmodule Ferricstore.Raft.CommandBatching do
     :flow_policy_migration_step,
     :flow_policy_put,
     :flush_shard,
+    :key_lifecycle,
     :put_batch,
     :put_blob_batch,
     :server_catalog_mutate,

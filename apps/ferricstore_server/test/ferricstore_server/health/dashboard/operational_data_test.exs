@@ -114,6 +114,18 @@ defmodule FerricstoreServer.Health.Dashboard.OperationalDataTest do
     assert Operational.scan_storage_tree(data_dir) == {0, 0, 0}
   end
 
+  test "storage scans count only canonical Bitcask segment and hint files", %{
+    data_dir: data_dir
+  } do
+    File.write!(Path.join(data_dir, "00000.log"), "data")
+    File.write!(Path.join(data_dir, "00000.hint"), "hint")
+    File.write!(Path.join(data_dir, "0.log"), "alias")
+    File.write!(Path.join(data_dir, "notes.log"), "notes")
+    File.write!(Path.join(data_dir, "compact_0.log"), "temp")
+
+    assert Operational.scan_storage_tree(data_dir) == {22, 1, 1}
+  end
+
   test "concurrent storage callers share one refresh", %{data_dir: data_dir} do
     test_pid = self()
 

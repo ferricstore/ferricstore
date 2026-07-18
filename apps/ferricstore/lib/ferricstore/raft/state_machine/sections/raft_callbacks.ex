@@ -977,6 +977,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
       defp clear_stale_pending_state do
         Process.delete(@sm_apply_state_key)
         Process.delete(:sm_pending_flow_due_catalog_keys)
+        Process.delete(:sm_prob_mutation_ordinal)
         :ok
       end
 

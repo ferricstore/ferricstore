@@ -10,7 +10,7 @@ defmodule Ferricstore.Flow.Schedule do
 
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow
-  alias Ferricstore.Flow.{Internal, Keys, MutationAttrs}
+  alias Ferricstore.Flow.{Internal, Keys, MutationAttrs, RecordRead}
   alias Ferricstore.Store.Router
 
   @schedule_type "__ferricstore_schedule"
@@ -33,7 +33,9 @@ defmodule Ferricstore.Flow.Schedule do
   @default_definition_max_bytes 32 * 1024
   @default_inline_value_max_bytes 8 * 1024
   @default_timezone "Etc/UTC"
+  @default_list_scan_limit 1_000
   @max_exact_integer 9_007_199_254_740_991
+  @terminal_states ["completed", "failed", "cancelled"]
   @timestamp_limit_error "ERR flow schedule next_run_at_ms exceeds maximum #{@max_exact_integer}"
 
   @type schedule_id :: binary()
@@ -939,9 +941,11 @@ defmodule Ferricstore.Flow.Schedule do
     do: {:error, "ERR flow schedule has no next run time"}
 
   defp list_state(ctx, state, count, rev?, filters) do
+    scan_limit = list_scan_limit()
+
     schedule_partition_keys()
     |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
-      case list_partition(ctx, state, partition_key, count, rev?, filters, count, %{}) do
+      case list_partition(ctx, state, partition_key, count, rev?, filters, scan_limit) do
         {:ok, schedules} -> {:cont, {:ok, [schedules | acc]}}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -952,57 +956,57 @@ defmodule Ferricstore.Flow.Schedule do
     end
   end
 
-  defp list_partition(ctx, state, partition_key, count, rev?, filters, scan_count, cache) do
-    with {:ok, records} <- list_partition_records(ctx, state, partition_key, scan_count, rev?),
-         {:ok, schedules, cache} <- hydrate_schedule_records(ctx, records, cache) do
+  defp list_partition(ctx, state, partition_key, count, rev?, filters, scan_limit) do
+    with {:ok, records} <- list_partition_records(ctx, state, partition_key, scan_limit + 1),
+         {:ok, records} <- enforce_list_scan_limit(records, scan_limit),
+         {:ok, schedules, _cache} <- hydrate_schedule_records(ctx, records, %{}) do
       matches =
         schedules
         |> Enum.reject(&is_nil/1)
         |> Enum.filter(&schedule_matches_filters?(&1, filters))
 
-      if length(records) < scan_count or scan_count >= 1_000 do
-        direction = if rev?, do: :desc, else: :asc
+      direction = if rev?, do: :desc, else: :asc
 
-        {:ok,
-         matches
-         |> Enum.sort_by(&{schedule_sort_due(&1), &1.id}, direction)
-         |> Enum.take(count)}
-      else
-        next_scan_count = min(scan_count * 2, 1_000)
-
-        list_partition(
-          ctx,
-          state,
-          partition_key,
-          count,
-          rev?,
-          filters,
-          next_scan_count,
-          cache
-        )
-      end
+      {:ok,
+       matches
+       |> Enum.sort_by(&{schedule_sort_due(&1), &1.id}, direction)
+       |> Enum.take(count)}
     end
   end
 
-  defp list_partition_records(ctx, state, partition_key, count, rev?) do
-    opts =
-      Internal.put(
-        state: state,
-        partition_key: partition_key,
-        count: count,
-        rev: rev?,
-        include_cold: true,
-        consistent_projection: true
-      )
+  defp list_partition_records(ctx, state, partition_key, count) do
+    query = %{
+      count: count,
+      from_ms: nil,
+      to_ms: nil,
+      rev?: false,
+      before_id: nil,
+      state: state,
+      terminal_only?: state in @terminal_states
+    }
 
-    result =
-      if Ferricstore.Flow.LMDB.terminal_state?(state) do
-        Flow.terminals(ctx, @schedule_type, opts)
-      else
-        Flow.list(ctx, @schedule_type, opts)
-      end
+    RecordRead.list_records(
+      ctx,
+      @schedule_type,
+      state,
+      partition_key,
+      count,
+      query,
+      true,
+      true,
+      @terminal_states,
+      count
+    )
+  end
 
-    result
+  defp enforce_list_scan_limit(records, scan_limit) do
+    case Enum.split(records, scan_limit) do
+      {bounded, []} ->
+        {:ok, bounded}
+
+      {_bounded, _overflow} ->
+        {:error, "ERR flow schedule query candidate limit exceeded (#{scan_limit})"}
+    end
   end
 
   defp hydrate_schedule_records(ctx, records, cache) do
@@ -1071,6 +1075,17 @@ defmodule Ferricstore.Flow.Schedule do
     case Keyword.get(opts, :count, 100) do
       value when is_integer(value) and value > 0 -> {:ok, min(value, 1_000)}
       _ -> {:error, "ERR flow schedule count must be a positive integer"}
+    end
+  end
+
+  defp list_scan_limit do
+    case Application.get_env(
+           :ferricstore,
+           :flow_schedule_list_scan_limit,
+           @default_list_scan_limit
+         ) do
+      value when is_integer(value) and value > 0 -> min(value, @default_list_scan_limit)
+      _invalid -> @default_list_scan_limit
     end
   end
 

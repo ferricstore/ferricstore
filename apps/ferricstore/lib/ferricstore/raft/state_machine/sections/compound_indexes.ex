@@ -344,7 +344,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp maybe_clear_compound_data_structure_for_string_put(state, key) do
-        if Ferricstore.Store.CompoundKey.internal_key?(key) do
+        if Process.get(:sm_prob_metadata_put?, false) or
+             Ferricstore.Store.CompoundKey.internal_key?(key) do
           :ok
         else
           type_key = Ferricstore.Store.CompoundKey.type_key(key)
@@ -353,7 +354,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
             nil ->
               :ok
 
-            type ->
+            type_marker ->
+              type = CompoundKey.type_name(type_marker)
+
               with :ok <- clear_compound_prefix_for_string_put(state, key, type) do
                 do_delete(state, type_key)
               end
@@ -447,6 +450,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
                ) do
           queue_stream_cache_cleanup({state.instance_name, key})
         end
+      end
+
+      defp clear_compound_prefix_for_string_put(state, key, type)
+           when type in ["bloom", "cms", "cuckoo", "topk"] do
+        queue_pending_prob_delete(prob_path(state, key, prob_extension(type)))
       end
 
       defp clear_compound_prefix_for_string_put(_state, _key, _type), do: :ok
@@ -660,6 +668,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       # Private: probabilistic data structure helpers
       # ---------------------------------------------------------------------------
 
+      defp next_prob_mutation_token(state) do
+        mutation_index = current_ra_index() || Map.get(state, :applied_count, 0) + 1
+        mutation_ordinal = Process.get(:sm_prob_mutation_ordinal, 0) + 1
+
+        if mutation_index in 0..18_446_744_073_709_551_615 and
+             mutation_ordinal in 1..18_446_744_073_709_551_615 do
+          Process.put(:sm_prob_mutation_ordinal, mutation_ordinal)
+          {:ok, mutation_index, mutation_ordinal}
+        else
+          {:error, :invalid_probabilistic_mutation_token}
+        end
+      end
+
       # Shorthand for the common prob command pattern: bump applied count +
       # maybe release cursor.
       defp bump_applied(meta, state, result) do
@@ -678,9 +699,510 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
-      defp prob_path(state, key, ext) do
-        Ferricstore.ProbFile.path(prob_dir(state), key, ext)
+      defp apply_prob_lifecycle_locally(state, command, store_builder)
+           when is_function(store_builder, 0) do
+        store = store_builder.()
+        lifecycle_id = prob_lifecycle_id(state, command)
+
+        case prob_lifecycle_replay_type(store, command, lifecycle_id) do
+          {:ok, type} ->
+            replay_prob_lifecycle(state, store, command, type)
+
+          :not_replay ->
+            apply_new_prob_lifecycle(state, store, command, lifecycle_id)
+
+          {:error, _reason} = error ->
+            error
+        end
       end
+
+      defp apply_new_prob_lifecycle(state, store, command, lifecycle_id) do
+        source = elem(command, 1)
+
+        case prob_lifecycle_source(store, source) do
+          {:ok, type, encoded_metadata, expire_at_ms} ->
+            execute_prob_lifecycle(
+              state,
+              store,
+              command,
+              type,
+              encoded_metadata,
+              expire_at_ms,
+              lifecycle_id
+            )
+
+          :not_prob ->
+            :not_prob
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp prob_lifecycle_source(store, source) do
+        case Ferricstore.Store.TypeRegistry.get_type(source, store) do
+          type when type in ["bloom", "cms", "cuckoo", "topk"] ->
+            with {:ok, type} <- prob_type_atom(type) do
+              case Ferricstore.Store.Ops.get_meta(store, source) do
+                {encoded_metadata, expire_at_ms}
+                when is_binary(encoded_metadata) and is_integer(expire_at_ms) ->
+                  {:ok, type, encoded_metadata, expire_at_ms}
+
+                nil ->
+                  {:error, {:prob_sidecar_apply_failed, :lifecycle, :missing_metadata}}
+
+                {:error, _reason} = error ->
+                  error
+
+                _invalid ->
+                  {:error, {:prob_sidecar_apply_failed, :lifecycle, :invalid_metadata}}
+              end
+            end
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            Ferricstore.Store.ReadResult.command_error(failure)
+
+          _non_prob ->
+            :not_prob
+        end
+      end
+
+      defp execute_prob_lifecycle(
+             state,
+             store,
+             {:rename, source, destination} = command,
+             type,
+             encoded_metadata,
+             expire_at_ms,
+             lifecycle_id
+           ) do
+        cond do
+          source == destination ->
+            :ok
+
+          true ->
+            with :ok <- replace_prob_lifecycle_destination(store, destination, true),
+                 {:ok, destination_path} <-
+                   stage_prob_lifecycle_sidecar(state, store, source, destination, type, :rename),
+                 :ok <-
+                   write_prob_lifecycle_metadata(
+                     state,
+                     store,
+                     destination,
+                     type,
+                     encoded_metadata,
+                     expire_at_ms,
+                     destination_path,
+                     lifecycle_id
+                   ),
+                 :ok <- delete_prob_lifecycle_source(store, source) do
+              :ok
+            else
+              {:error, _reason} = error -> normalize_prob_lifecycle_error(command, error)
+            end
+        end
+      end
+
+      defp execute_prob_lifecycle(
+             state,
+             store,
+             {:renamenx, source, destination} = command,
+             type,
+             encoded_metadata,
+             expire_at_ms,
+             lifecycle_id
+           ) do
+        cond do
+          source == destination ->
+            0
+
+          true ->
+            case prob_lifecycle_destination_exists?(store, destination) do
+              {:ok, true} ->
+                0
+
+              {:ok, false} ->
+                with {:ok, destination_path} <-
+                       stage_prob_lifecycle_sidecar(
+                         state,
+                         store,
+                         source,
+                         destination,
+                         type,
+                         :rename
+                       ),
+                     :ok <-
+                       write_prob_lifecycle_metadata(
+                         state,
+                         store,
+                         destination,
+                         type,
+                         encoded_metadata,
+                         expire_at_ms,
+                         destination_path,
+                         lifecycle_id
+                       ),
+                     :ok <- delete_prob_lifecycle_source(store, source) do
+                  1
+                else
+                  {:error, _reason} = error -> normalize_prob_lifecycle_error(command, error)
+                end
+
+              {:error, _reason} = error ->
+                error
+            end
+        end
+      end
+
+      defp execute_prob_lifecycle(
+             state,
+             store,
+             {:copy, source, destination, replace?} = command,
+             type,
+             encoded_metadata,
+             expire_at_ms,
+             lifecycle_id
+           )
+           when is_boolean(replace?) do
+        cond do
+          source == destination ->
+            if replace?, do: 1, else: 0
+
+          true ->
+            case prob_lifecycle_destination_exists?(store, destination) do
+              {:ok, true} when not replace? ->
+                0
+
+              {:ok, destination_exists?} ->
+                with :ok <-
+                       replace_prob_lifecycle_destination(
+                         store,
+                         destination,
+                         destination_exists?
+                       ),
+                     {:ok, destination_path} <-
+                       stage_prob_lifecycle_sidecar(
+                         state,
+                         store,
+                         source,
+                         destination,
+                         type,
+                         :copy
+                       ),
+                     :ok <-
+                       write_prob_lifecycle_metadata(
+                         state,
+                         store,
+                         destination,
+                         type,
+                         encoded_metadata,
+                         expire_at_ms,
+                         destination_path,
+                         lifecycle_id
+                       ) do
+                  1
+                else
+                  {:error, _reason} = error -> normalize_prob_lifecycle_error(command, error)
+                end
+
+              {:error, _reason} = error ->
+                error
+            end
+        end
+      end
+
+      defp replace_prob_lifecycle_destination(_store, _destination, false), do: :ok
+
+      defp replace_prob_lifecycle_destination(store, destination, true) do
+        case Ferricstore.Commands.Strings.Delete.do_del_key(destination, store) do
+          result when result in [true, false, :ok] -> :ok
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp delete_prob_lifecycle_source(store, source) do
+        case Ferricstore.Commands.Strings.Delete.do_del_key(source, store) do
+          result when result in [true, :ok] -> :ok
+          false -> {:error, {:prob_sidecar_apply_failed, :rename, :source_disappeared}}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp prob_lifecycle_destination_exists?(store, destination) do
+        case Ferricstore.Store.TypeRegistry.get_type(destination, store) do
+          "none" ->
+            {:ok, false}
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            Ferricstore.Store.ReadResult.command_error(failure)
+
+          _type ->
+            {:ok, true}
+        end
+      end
+
+      defp stage_prob_lifecycle_sidecar(state, store, source, destination, type, mode) do
+        extension = prob_extension(type)
+        source_path = prob_store_path(store, source, extension)
+        destination_path = prob_store_canonical_path(store, destination, extension)
+        create_path = pending_prob_create_path(destination_path)
+
+        with :ok <- ensure_prob_lifecycle_dir(state, Path.dirname(destination_path)),
+             :ok <- copy_prob_lifecycle_sidecar(source_path, create_path, mode) do
+          record_pending_prob_lifecycle_create(create_path, destination_path)
+          {:ok, destination_path}
+        end
+      end
+
+      defp ensure_prob_lifecycle_dir(state, dir) do
+        if Ferricstore.FS.exists?(dir) do
+          :ok
+        else
+          case Ferricstore.FS.mkdir_p(dir) do
+            :ok -> prob_fsync_dir(Path.dirname(dir), :create_prob_dir)
+            {:error, reason} -> {:error, {:prob_dir_create_failed, reason}}
+          end
+        end
+      end
+
+      defp copy_prob_lifecycle_sidecar(source_path, create_path, :rename) do
+        case NIF.fs_hard_link_replace_sync_nofollow(source_path, create_path) do
+          :ok ->
+            :ok
+
+          {:error, {:cross_device, _reason}} ->
+            copy_prob_lifecycle_sidecar(source_path, create_path, :copy)
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp copy_prob_lifecycle_sidecar(source_path, create_path, :copy) do
+        NIF.fs_copy_replace_sync_nofollow(source_path, create_path)
+      end
+
+      defp write_prob_lifecycle_metadata(
+             state,
+             store,
+             destination,
+             type,
+             encoded_metadata,
+             expire_at_ms,
+             destination_path,
+             lifecycle_id
+           ) do
+        with {:ok, copied_metadata} <-
+               encode_prob_lifecycle_metadata(
+                 state,
+                 encoded_metadata,
+                 type,
+                 destination_path,
+                 lifecycle_id
+               ),
+             :ok <- Ferricstore.Store.Ops.put(store, destination, copied_metadata, expire_at_ms) do
+          Ferricstore.Store.Ops.compound_put(
+            store,
+            destination,
+            CompoundKey.type_key(destination),
+            CompoundKey.encode_prob_type(type, prob_create_token(state)),
+            0
+          )
+        end
+      end
+
+      defp encode_prob_lifecycle_metadata(
+             state,
+             encoded_metadata,
+             type,
+             destination_path,
+             lifecycle_id
+           ) do
+        with {:ok, {tag, metadata} = decoded} <- Ferricstore.TermCodec.decode(encoded_metadata),
+             true <- is_atom(tag) and is_map(metadata),
+             ^type <- Ferricstore.Commands.ProbType.metadata_type(decoded) do
+          metadata =
+            metadata
+            |> Map.put(:create_token, prob_create_token(state))
+            |> Map.put(:lifecycle_id, lifecycle_id)
+            |> maybe_replace_prob_metadata_path(destination_path)
+
+          {:ok, Ferricstore.TermCodec.encode({tag, metadata})}
+        else
+          _invalid -> {:error, {:prob_sidecar_apply_failed, :lifecycle, :invalid_metadata}}
+        end
+      end
+
+      defp maybe_replace_prob_metadata_path(metadata, destination_path) do
+        if Map.has_key?(metadata, :path) do
+          Map.put(metadata, :path, destination_path)
+        else
+          metadata
+        end
+      end
+
+      defp prob_lifecycle_replay_type(store, command, lifecycle_id) do
+        destination = elem(command, 2)
+
+        case Ferricstore.Store.Ops.compound_get(
+               store,
+               destination,
+               CompoundKey.type_key(destination)
+             ) do
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            Ferricstore.Store.ReadResult.command_error(failure)
+
+          marker when is_binary(marker) ->
+            prob_lifecycle_replay_metadata(store, destination, marker, lifecycle_id)
+
+          _missing_or_invalid_marker ->
+            :not_replay
+        end
+      end
+
+      defp prob_lifecycle_replay_metadata(store, destination, marker, lifecycle_id) do
+        with {:ok, {type, _token}} <- CompoundKey.decode_prob_type(marker),
+             true <- type in [:bloom, :cms, :cuckoo, :topk] do
+          case Ferricstore.Store.Ops.get_meta(store, destination) do
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              Ferricstore.Store.ReadResult.command_error(failure)
+
+            {encoded_metadata, expire_at_ms}
+            when is_binary(encoded_metadata) and is_integer(expire_at_ms) ->
+              decode_prob_lifecycle_replay_type(encoded_metadata, lifecycle_id, type)
+
+            _missing_or_invalid_metadata ->
+              :not_replay
+          end
+        else
+          _invalid_marker -> :not_replay
+        end
+      end
+
+      defp decode_prob_lifecycle_replay_type(encoded_metadata, lifecycle_id, type) do
+        with {:ok, {_tag, metadata}} <- Ferricstore.TermCodec.decode(encoded_metadata),
+             true <- is_map(metadata),
+             ^lifecycle_id <- Map.get(metadata, :lifecycle_id) do
+          {:ok, type}
+        else
+          _not_replay -> :not_replay
+        end
+      end
+
+      if Mix.env() == :test do
+        def __prob_lifecycle_replay_type_for_test__(store, command, lifecycle_id) do
+          prob_lifecycle_replay_type(store, command, lifecycle_id)
+        end
+      end
+
+      defp replay_prob_lifecycle(state, store, command, type) do
+        source = elem(command, 1)
+        destination = elem(command, 2)
+        mode = if elem(command, 0) in [:rename, :renamenx], do: :rename, else: :copy
+
+        with :ok <-
+               repair_prob_lifecycle_destination(state, store, source, destination, type, mode),
+             :ok <- maybe_replay_prob_source_delete(store, command, source, type) do
+          case elem(command, 0) do
+            :rename -> :ok
+            :renamenx -> 1
+            :copy -> 1
+          end
+        end
+      end
+
+      defp repair_prob_lifecycle_destination(state, store, source, destination, type, mode) do
+        extension = prob_extension(type)
+        destination_path = prob_store_canonical_path(store, destination, extension)
+        create_path = pending_prob_create_path(destination_path)
+
+        cond do
+          Ferricstore.FS.exists?(create_path) ->
+            record_pending_prob_lifecycle_create(create_path, destination_path)
+            :ok
+
+          Ferricstore.FS.exists?(destination_path) ->
+            queue_pending_prob_delete_path(prob_mutation_receipt_path(destination_path))
+            prob_fsync_dir(Path.dirname(destination_path), :publish_prob_file)
+
+          true ->
+            source_path = prob_store_path(store, source, extension)
+
+            with :ok <- ensure_prob_lifecycle_dir(state, Path.dirname(destination_path)),
+                 :ok <- copy_prob_lifecycle_sidecar(source_path, create_path, mode) do
+              record_pending_prob_lifecycle_create(create_path, destination_path)
+              :ok
+            end
+        end
+      end
+
+      defp maybe_replay_prob_source_delete(
+             store,
+             {operation, _source, _destination},
+             source,
+             type
+           )
+           when operation in [:rename, :renamenx] do
+        source_path = prob_store_canonical_path(store, source, prob_extension(type))
+        queue_pending_prob_delete(source_path)
+        queue_pending_prob_delete(pending_prob_create_path(source_path))
+
+        :ok
+      end
+
+      defp maybe_replay_prob_source_delete(_store, _command, _source, _type), do: :ok
+
+      defp prob_store_path(store, key, extension) do
+        final_path = prob_store_canonical_path(store, key, extension)
+
+        case Process.get(:sm_pending_prob_paths) do
+          %{by_final: paths} -> Map.get(paths, final_path, final_path)
+          _not_pending -> final_path
+        end
+      end
+
+      defp prob_store_canonical_path(store, key, extension) do
+        prob_dir = store.prob_dir_for.(key)
+        Ferricstore.ProbFile.path(prob_dir, key, extension)
+      end
+
+      defp prob_lifecycle_id(state, command) do
+        digest =
+          command
+          |> :erlang.term_to_binary(minor_version: 2)
+          |> then(&:crypto.hash(:sha256, &1))
+          |> binary_part(0, 16)
+
+        {prob_create_token(state), digest}
+      end
+
+      defp prob_type_atom("bloom"), do: {:ok, :bloom}
+      defp prob_type_atom("cms"), do: {:ok, :cms}
+      defp prob_type_atom("cuckoo"), do: {:ok, :cuckoo}
+      defp prob_type_atom("topk"), do: {:ok, :topk}
+      defp prob_type_atom(_type), do: {:error, :invalid_probabilistic_type}
+
+      defp normalize_prob_lifecycle_error(command, {:error, reason}) do
+        if Ferricstore.Raft.ApplyFailure.storage_reason?(reason) do
+          {:error, reason}
+        else
+          {:error, {:prob_sidecar_apply_failed, elem(command, 0), reason}}
+        end
+      end
+
+      defp prob_path(state, key, ext) do
+        final_path = prob_canonical_path(state, key, ext)
+
+        case Process.get(:sm_pending_prob_paths) do
+          %{by_final: paths} -> Map.get(paths, final_path, final_path)
+          _not_in_pending_apply -> final_path
+        end
+      end
+
+      defp prob_canonical_path(state, key, ext),
+        do: Ferricstore.ProbFile.path(prob_dir(state), key, ext)
+
+      defp pending_prob_create_path(final_path), do: final_path <> ".pending-create"
 
       defp cms_source_paths(state, src_keys) do
         Enum.map(src_keys, &prob_path(state, &1, "cms"))
@@ -726,16 +1248,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         if Ferricstore.FS.exists?(dir) do
           :ok
         else
-          Ferricstore.FS.mkdir_p!(dir)
-          prob_fsync_dir(Path.dirname(dir), :create_prob_dir)
+          case Ferricstore.FS.mkdir_p(dir) do
+            :ok -> prob_fsync_dir(Path.dirname(dir), :create_prob_dir)
+            {:error, reason} -> {:error, {:prob_dir_create_failed, reason}}
+          end
         end
-      end
-
-      # Called immediately after a `*_file_create` NIF to make the new
-      # filename entry durable. The NIF already fsynced the file's data;
-      # this fsyncs the directory so the entry itself is durable.
-      defp prob_fsync_dir(state) do
-        prob_fsync_dir(prob_dir(state), :prob_file_dir)
       end
 
       defp prob_fsync_dir(path, phase) do
@@ -759,24 +1276,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp create_bloom_metadata(state, key, num_bits, num_hashes, prob_meta) do
-        path = prob_path(state, key, "bloom")
+        final_path = prob_canonical_path(state, key, "bloom")
+        create_path = pending_prob_create_path(final_path)
 
         with :ok <- validate_bloom_dimensions(num_bits, num_hashes),
+             :ok <-
+               ensure_prob_create_allowed(state, key, :bloom, "ERR item exists", create_path),
              :ok <- ensure_prob_dir(state),
              :ok <-
                prob_create_and_fsync(
                  state,
-                 path,
-                 NIF.bloom_file_create(path, num_bits, num_hashes)
+                 create_path,
+                 final_path,
+                 NIF.bloom_file_create(create_path, num_bits, num_hashes)
                ) do
-          do_put(
+          put_prob_metadata(
             state,
             key,
-            Ferricstore.TermCodec.encode(bloom_meta_with_path(prob_meta, path)),
+            :bloom,
+            bloom_meta_with_path(prob_meta, final_path),
             0
           )
-
-          :ok
         end
       end
 
@@ -786,6 +1306,146 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
 
       defp bloom_meta_with_path(_prob_meta, path), do: {:bloom_meta, %{path: path}}
 
+      defp put_prob_metadata(state, key, type, metadata, expire_at_ms) do
+        previous = Process.get(:sm_prob_metadata_put?, :undefined)
+        Process.put(:sm_prob_metadata_put?, true)
+        encoded_metadata = encode_prob_metadata(state, metadata)
+
+        try do
+          with :ok <- do_put(state, key, encoded_metadata, expire_at_ms) do
+            do_compound_put(
+              state,
+              key,
+              CompoundKey.type_key(key),
+              CompoundKey.encode_prob_type(type, prob_create_token(state)),
+              0
+            )
+          end
+        after
+          case previous do
+            :undefined -> Process.delete(:sm_prob_metadata_put?)
+            value -> Process.put(:sm_prob_metadata_put?, value)
+          end
+        end
+      end
+
+      defp encode_prob_metadata(state, {tag, metadata}) when is_atom(tag) and is_map(metadata) do
+        metadata
+        |> Map.put(:create_token, prob_create_token(state))
+        |> then(&Ferricstore.TermCodec.encode({tag, &1}))
+      end
+
+      defp prob_create_token(state) do
+        current_ra_index() || -(Map.get(state, :applied_count, 0) + 1)
+      end
+
+      defp ensure_prob_create_allowed(
+             state,
+             key,
+             expected_type,
+             exists_error,
+             _pending_path
+           ) do
+        case classify_prob_key(state, key, expected_type) do
+          {:ok, :missing} ->
+            :ok
+
+          {:ok, :existing} ->
+            {:error, exists_error}
+
+          {:ok, :replay} ->
+            :ok
+
+          {:error, _reason} = error ->
+            error
+        end
+      end
+
+      defp classify_prob_key(state, key, expected_type) do
+        case prob_type_marker_with_token(state, key) do
+          nil ->
+            classify_untyped_prob_key(state, key)
+
+          {^expected_type, create_token} ->
+            cond do
+              pending_prob_create?(state, key, expected_type) ->
+                {:ok, :existing}
+
+              create_token == prob_create_token(state) ->
+                {:ok, :replay}
+
+              true ->
+                {:ok, :existing}
+            end
+
+          _other ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+      end
+
+      defp pending_prob_create?(state, key, type) do
+        final_path = prob_canonical_path(state, key, prob_extension(type))
+
+        case Process.get(:sm_pending_prob_paths) do
+          %{by_final: %{^final_path => _create_path}} -> true
+          _not_pending -> false
+        end
+      end
+
+      defp classify_untyped_prob_key(state, key) do
+        if is_nil(do_get(state, key)) do
+          {:ok, :missing}
+        else
+          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+      end
+
+      defp require_existing_prob_key(state, key, expected_type) do
+        case classify_prob_key(state, key, expected_type) do
+          {:ok, status} when status in [:existing, :replay] -> :ok
+          {:ok, :missing} -> {:error, :enoent}
+          {:error, _reason} = error -> error
+        end
+      end
+
+      defp require_existing_prob_keys(state, keys, expected_type) do
+        Enum.reduce_while(keys, :ok, fn key, :ok ->
+          case require_existing_prob_key(state, key, expected_type) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
+
+      defp prob_type_marker(state, key) do
+        case prob_type_marker_with_token(state, key) do
+          {type, _create_token} -> type
+          missing_or_other -> missing_or_other
+        end
+      end
+
+      defp prob_type_marker_with_token(state, key) do
+        state
+        |> do_get(CompoundKey.type_key(key))
+        |> prob_type_marker_data()
+      end
+
+      defp prob_type_marker_data(nil), do: nil
+
+      defp prob_type_marker_data(marker) do
+        case CompoundKey.decode_prob_type(marker) do
+          {:ok, type_and_token} -> type_and_token
+          :error -> :other
+        end
+      end
+
+      defp prob_type_from_marker(marker) do
+        case prob_type_marker_data(marker) do
+          {type, _create_token} -> type
+          missing_or_other -> missing_or_other
+        end
+      end
+
       defp validate_bloom_dimensions(num_bits, num_hashes) do
         case ProbParameters.validate_bloom_dimensions(num_bits, num_hashes) do
           :ok -> :ok
@@ -794,30 +1454,79 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp create_cms_metadata(state, key, width, depth) do
-        path = prob_path(state, key, "cms")
+        final_path = prob_canonical_path(state, key, "cms")
+        create_path = pending_prob_create_path(final_path)
 
         with :ok <- validate_cms_dimensions(width, depth),
+             :ok <-
+               ensure_prob_create_allowed(
+                 state,
+                 key,
+                 :cms,
+                 "ERR item already exists",
+                 create_path
+               ),
              :ok <- ensure_prob_dir(state),
-             :ok <- prob_create_and_fsync(state, path, NIF.cms_file_create(path, width, depth)) do
+             :ok <-
+               prob_create_and_fsync(
+                 state,
+                 create_path,
+                 final_path,
+                 NIF.cms_file_create(create_path, width, depth)
+               ) do
           meta_val = {:cms_meta, %{width: width, depth: depth}}
-          do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
-          :ok
+          put_prob_metadata(state, key, :cms, meta_val, 0)
         end
       end
 
-      defp maybe_create_cms_merge_dst(state, dst_path, dst_key, width, depth) do
-        if Ferricstore.FS.exists?(dst_path) do
-          :ok
+      defp maybe_create_cms_merge_dst(
+             _state,
+             dst_path,
+             _dst_key,
+             :existing,
+             _width,
+             _depth
+           ) do
+        if Ferricstore.FS.exists?(dst_path), do: {:ok, dst_path}, else: {:error, :enoent}
+      end
+
+      defp maybe_create_cms_merge_dst(
+             state,
+             final_path,
+             dst_key,
+             :replay,
+             width,
+             depth
+           ) do
+        if Ferricstore.FS.exists?(final_path) do
+          {:ok, final_path}
         else
+          maybe_create_cms_merge_dst(state, final_path, dst_key, :missing, width, depth)
+        end
+      end
+
+      defp maybe_create_cms_merge_dst(state, final_path, dst_key, status, width, depth)
+           when status == :missing do
+        create_path = pending_prob_create_path(final_path)
+
+        with :ok <-
+               prob_create_and_fsync(
+                 state,
+                 create_path,
+                 final_path,
+                 NIF.cms_file_create(create_path, width, depth)
+               ) do
+          meta_val = {:cms_meta, %{width: width, depth: depth}}
+
           with :ok <-
-                 prob_create_and_fsync(
+                 put_prob_metadata(
                    state,
-                   dst_path,
-                   NIF.cms_file_create(dst_path, width, depth)
+                   dst_key,
+                   :cms,
+                   meta_val,
+                   0
                  ) do
-            meta_val = {:cms_meta, %{width: width, depth: depth}}
-            do_put(state, dst_key, Ferricstore.TermCodec.encode(meta_val), 0)
-            :ok
+            {:ok, create_path}
           end
         end
       end
@@ -831,6 +1540,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp validate_cms_create_params(_invalid),
         do: {:error, :invalid_cms_dimensions}
 
+      defp validate_cms_merge_apply_work(src_keys, width, depth) when is_list(src_keys) do
+        ProbParameters.validate_cms_merge_work(length(src_keys), width, depth)
+      end
+
+      defp validate_cms_merge_apply_work(_src_keys, _width, _depth),
+        do: {:error, :cms_merge_source_limit_exceeded}
+
       defp validate_cms_dimensions(width, depth) do
         case ProbParameters.validate_cms_dimensions(width, depth) do
           :ok -> :ok
@@ -839,19 +1555,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp create_cuckoo_metadata(state, key, capacity, bucket_size) do
-        path = prob_path(state, key, "cuckoo")
+        final_path = prob_canonical_path(state, key, "cuckoo")
+        create_path = pending_prob_create_path(final_path)
 
         with :ok <- validate_cuckoo_parameters(capacity, bucket_size),
+             :ok <-
+               ensure_prob_create_allowed(
+                 state,
+                 key,
+                 :cuckoo,
+                 "ERR item exists",
+                 create_path
+               ),
              :ok <- ensure_prob_dir(state),
              :ok <-
                prob_create_and_fsync(
                  state,
-                 path,
-                 NIF.cuckoo_file_create(path, capacity, bucket_size)
+                 create_path,
+                 final_path,
+                 NIF.cuckoo_file_create(create_path, capacity, bucket_size)
                ) do
           meta_val = {:cuckoo_meta, %{capacity: capacity}}
-          do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
-          :ok
+          put_prob_metadata(state, key, :cuckoo, meta_val, 0)
         end
       end
 
@@ -863,19 +1588,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp create_topk_metadata(state, key, k, width, depth) do
-        path = prob_path(state, key, "topk")
+        final_path = prob_canonical_path(state, key, "topk")
+        create_path = pending_prob_create_path(final_path)
 
         with :ok <- validate_topk_parameters(k, width, depth),
+             :ok <-
+               ensure_prob_create_allowed(
+                 state,
+                 key,
+                 :topk,
+                 "ERR item already exists",
+                 create_path
+               ),
              :ok <- ensure_prob_dir(state),
              :ok <-
                prob_create_and_fsync(
                  state,
-                 path,
-                 NIF.topk_file_create_v2(path, k, width, depth)
+                 create_path,
+                 final_path,
+                 NIF.topk_file_create_v2(create_path, k, width, depth)
                ) do
-          meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth}}
-          do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
-          :ok
+          meta_val = {:topk_meta, %{path: final_path, k: k, width: width, depth: depth}}
+          put_prob_metadata(state, key, :topk, meta_val, 0)
         end
       end
 
@@ -886,27 +1620,239 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         end
       end
 
-      defp prob_create_and_fsync(state, path, create_result) do
+      defp prob_create_and_fsync(state, create_path, final_path, create_result) do
         case normalize_prob_create_result(create_result) do
           :ok ->
-            case normalize_prob_create_result(prob_fsync_dir(state)) do
-              :ok ->
-                record_pending_prob_create(path)
-                :ok
+            # Native sidecar creation syncs both the file and its parent before
+            # returning. The apply boundary only needs to sync the later rename.
+            record_pending_prob_create(create_path, final_path)
+            :ok
 
-              {:error, _reason} = error ->
-                cleanup_created_prob_file(state, path)
-                error
-            end
-
-          {:error, _reason} = error ->
-            error
+          {:error, reason} ->
+            cleanup_created_prob_file(state, create_path)
+            {:error, {:prob_sidecar_create_failed, reason}}
         end
       end
 
-      defp record_pending_prob_create(path) when is_binary(path) do
-        pending = Process.get(:sm_pending_prob_creates, [])
-        Process.put(:sm_pending_prob_creates, [path | pending])
+      if Mix.env() == :test do
+        def __prob_create_and_fsync_for_test__(state, create_path, final_path, create_result) do
+          prob_create_and_fsync(state, create_path, final_path, create_result)
+        end
+      end
+
+      defp record_pending_prob_create(create_path, final_path)
+           when is_binary(create_path) and is_binary(final_path) do
+        creates = Process.get(:sm_pending_prob_creates, %{})
+        Process.put(:sm_pending_prob_creates, Map.put(creates, final_path, create_path))
+
+        paths = Process.get(:sm_pending_prob_paths, %{by_final: %{}, by_create: %{}})
+
+        Process.put(:sm_pending_prob_paths, %{
+          by_final: Map.put(paths.by_final, final_path, create_path),
+          by_create: Map.put(paths.by_create, create_path, final_path)
+        })
+
+        case Process.get(:sm_pending_prob_deletes) do
+          %MapSet{} = deletes ->
+            deletes =
+              deletes
+              |> MapSet.delete(final_path)
+              |> MapSet.delete(create_path)
+              |> MapSet.delete(prob_mutation_receipt_path(final_path))
+              |> MapSet.delete(prob_mutation_receipt_path(create_path))
+
+            Process.put(:sm_pending_prob_deletes, deletes)
+
+          _not_in_pending_apply ->
+            :ok
+        end
+      end
+
+      defp record_pending_prob_lifecycle_create(create_path, final_path) do
+        record_pending_prob_create(create_path, final_path)
+        queue_pending_prob_delete_path(prob_mutation_receipt_path(final_path))
+      end
+
+      defp queue_pending_prob_delete(nil), do: :ok
+
+      defp queue_pending_prob_delete(path) when is_binary(path) do
+        case {
+          Process.get(:sm_pending_prob_deletes),
+          Process.get(:sm_pending_prob_creates, %{}),
+          Process.get(:sm_pending_prob_paths)
+        } do
+          {%MapSet{} = pending, %{} = creates, %{by_create: by_create, by_final: by_final}} ->
+            case Map.get(by_create, path) do
+              final_path when is_binary(final_path) ->
+                Process.put(:sm_pending_prob_creates, Map.delete(creates, final_path))
+
+                pending =
+                  put_pending_prob_delete_paths(pending, [
+                    path,
+                    final_path,
+                    prob_mutation_receipt_path(path),
+                    prob_mutation_receipt_path(final_path)
+                  ])
+
+                Process.put(:sm_pending_prob_deletes, pending)
+
+              nil ->
+                if Map.has_key?(by_final, path) do
+                  # The tombstone captured the old canonical path before a
+                  # replacement was staged. Publishing the replacement owns
+                  # that path now; only generation-specific cleanup may remain.
+                  :ok
+                else
+                  pending =
+                    put_pending_prob_delete_paths(pending, [
+                      path,
+                      prob_mutation_receipt_path(path)
+                    ])
+
+                  Process.put(:sm_pending_prob_deletes, pending)
+                end
+            end
+
+          _not_in_pending_apply ->
+            :ok
+        end
+
+        :ok
+      end
+
+      defp put_pending_prob_delete_paths(pending, paths) do
+        Enum.reduce(paths, pending, &MapSet.put(&2, &1))
+      end
+
+      defp queue_pending_prob_delete_path(path) when is_binary(path) do
+        case Process.get(:sm_pending_prob_deletes) do
+          %MapSet{} = pending -> Process.put(:sm_pending_prob_deletes, MapSet.put(pending, path))
+          _not_in_pending_apply -> :ok
+        end
+
+        :ok
+      end
+
+      defp prob_mutation_receipt_path(path) when is_binary(path), do: path <> ".mutation"
+
+      defp publish_pending_prob_creates do
+        creates =
+          :sm_pending_prob_creates
+          |> Process.get(%{})
+          |> Enum.sort_by(&elem(&1, 0))
+
+        with :ok <- rename_pending_prob_creates(creates) do
+          fsync_pending_prob_create_dirs(creates)
+        end
+      end
+
+      defp rename_pending_prob_creates(creates) do
+        Enum.reduce_while(creates, :ok, fn {final_path, create_path}, :ok ->
+          with :ok <- Ferricstore.FS.rename(create_path, final_path),
+               :ok <- publish_pending_prob_receipt(create_path, final_path) do
+            {:cont, :ok}
+          else
+            {:error, reason} ->
+              {:halt, prob_sidecar_publish_error(final_path, create_path, reason)}
+          end
+        end)
+      end
+
+      defp publish_pending_prob_receipt(create_path, final_path) do
+        create_receipt = prob_mutation_receipt_path(create_path)
+        final_receipt = prob_mutation_receipt_path(final_path)
+
+        case Ferricstore.FS.rename(create_receipt, final_receipt) do
+          :ok ->
+            :ok
+
+          {:error, {:not_found, _message}} ->
+            case Ferricstore.FS.rm(final_receipt) do
+              :ok -> :ok
+              {:error, {:not_found, _message}} -> :ok
+              {:error, reason} -> {:error, {:delete_stale_prob_receipt_failed, reason}}
+            end
+
+          {:error, reason} ->
+            {:error, {:publish_prob_receipt_failed, reason}}
+        end
+      end
+
+      defp fsync_pending_prob_create_dirs(creates) do
+        creates
+        |> Enum.reduce(%{}, fn {final_path, create_path}, dirs ->
+          Map.put_new(dirs, Path.dirname(final_path), {final_path, create_path})
+        end)
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.reduce_while(:ok, fn {dir, {final_path, create_path}}, :ok ->
+          case prob_fsync_dir(dir, :publish_prob_file) do
+            :ok ->
+              {:cont, :ok}
+
+            {:error, reason} ->
+              {:halt, prob_sidecar_publish_error(final_path, create_path, reason)}
+          end
+        end)
+      end
+
+      defp prob_sidecar_publish_error(final_path, create_path, reason) do
+        {:error, {:prob_sidecar_publish_failed, final_path, create_path, reason}}
+      end
+
+      defp publish_pending_prob_deletes(state) do
+        deletes =
+          :sm_pending_prob_deletes
+          |> Process.get(MapSet.new())
+          |> Enum.sort()
+
+        with :ok <- remove_pending_prob_files(state, deletes) do
+          fsync_pending_prob_delete_dirs(state, deletes)
+        end
+      end
+
+      defp remove_pending_prob_files(state, deletes) do
+        Enum.reduce_while(deletes, :ok, fn path, :ok ->
+          case Ferricstore.FS.rm(path) do
+            :ok ->
+              {:cont, :ok}
+
+            {:error, {:not_found, _message}} ->
+              {:cont, :ok}
+
+            {:error, reason} ->
+              {:halt, prob_sidecar_delete_error(state, path, {:delete_prob_file_failed, reason})}
+          end
+        end)
+      rescue
+        error ->
+          path = List.first(deletes)
+          prob_sidecar_delete_error(state, path, {:delete_prob_file_exception, error})
+      catch
+        :exit, reason ->
+          path = List.first(deletes)
+          prob_sidecar_delete_error(state, path, {:delete_prob_file_exit, reason})
+      end
+
+      defp fsync_pending_prob_delete_dirs(state, deletes) do
+        deletes
+        |> Enum.reduce(%{}, fn path, dirs ->
+          Map.put_new(dirs, Path.dirname(path), path)
+        end)
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.reduce_while(:ok, fn {dir, path}, :ok ->
+          case prob_fsync_dir(dir, :delete_prob_files) do
+            :ok ->
+              {:cont, :ok}
+
+            {:error, reason} ->
+              {:halt, prob_sidecar_delete_error(state, path, reason)}
+          end
+        end)
+      end
+
+      defp prob_sidecar_delete_error(state, path, reason) do
+        emit_prob_sidecar_delete_failed(state, path, reason)
+        {:error, {:prob_sidecar_delete_failed, path, reason}}
       end
 
       defp cleanup_created_prob_file(state, path) when is_binary(path) do
@@ -944,6 +1890,43 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp normalize_prob_create_result({:error, _reason} = error), do: error
       defp normalize_prob_create_result(other), do: {:error, {:unexpected_prob_nif_result, other}}
 
+      defp normalize_prob_mutation_result(operation, {:error, reason} = error) do
+        if prob_mutation_semantic_error?(operation, reason) do
+          error
+        else
+          {:error, {:prob_sidecar_apply_failed, operation, reason}}
+        end
+      end
+
+      defp normalize_prob_mutation_result(_operation, result), do: result
+
+      defp prob_mutation_semantic_error?(operation, reason)
+           when operation in [:cuckoo_add, :cuckoo_addnx] do
+        reason == "filter is full"
+      end
+
+      defp prob_mutation_semantic_error?(:cms_incrby, reason) when is_binary(reason) do
+        String.starts_with?(reason, ["CMS counter overflow", "CMS total count overflow"])
+      end
+
+      defp prob_mutation_semantic_error?(:cms_merge, reason) when is_binary(reason) do
+        reason in [
+          "src_paths and weights must have the same length",
+          "width/depth mismatch"
+        ] or String.starts_with?(reason, ["CMS counter overflow", "CMS total count overflow"])
+      end
+
+      defp prob_mutation_semantic_error?(operation, reason)
+           when operation in [:topk_add, :topk_incrby] and is_binary(reason) do
+        reason == "TopK increment must be positive" or
+          String.starts_with?(reason, [
+            "TopK element length ",
+            "TopK CMS counter overflow"
+          ])
+      end
+
+      defp prob_mutation_semantic_error?(_operation, _reason), do: false
+
       # Auto-creates a bloom filter file if it doesn't exist.
       defp validate_bloom_auto_create_params(nil), do: {:ok, nil}
 
@@ -958,27 +1941,56 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp validate_bloom_auto_create_params(_invalid),
         do: {:error, :invalid_bloom_dimensions}
 
-      defp auto_create_bloom_if_needed(state, path, key, validated_params) do
-        cond do
-          Ferricstore.FS.exists?(path) ->
-            :ok
+      defp auto_create_bloom_if_needed(_state, path, _key, :existing, _validated_params) do
+        if Ferricstore.FS.exists?(path), do: {:ok, path}, else: {:error, :enoent}
+      end
 
-          not is_nil(validated_params) ->
-            {num_bits, num_hashes, params} = validated_params
+      defp auto_create_bloom_if_needed(_state, _path, _key, :missing, nil),
+        do: {:error, :enoent}
 
-            with :ok <-
-                   prob_create_and_fsync(
-                     state,
-                     path,
-                     NIF.bloom_file_create(path, num_bits, num_hashes)
-                   ) do
-              meta_val = {:bloom_meta, Map.put(params, :path, path)}
-              do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
-              :ok
-            end
+      defp auto_create_bloom_if_needed(
+             state,
+             final_path,
+             key,
+             :replay,
+             validated_params
+           ) do
+        if Ferricstore.FS.exists?(final_path) do
+          {:ok, final_path}
+        else
+          auto_create_bloom_if_needed(state, final_path, key, :missing, validated_params)
+        end
+      end
 
-          true ->
-            :ok
+      defp auto_create_bloom_if_needed(
+             state,
+             final_path,
+             key,
+             status,
+             {num_bits, num_hashes, params}
+           )
+           when status == :missing do
+        create_path = pending_prob_create_path(final_path)
+
+        with :ok <-
+               prob_create_and_fsync(
+                 state,
+                 create_path,
+                 final_path,
+                 NIF.bloom_file_create(create_path, num_bits, num_hashes)
+               ) do
+          meta_val = {:bloom_meta, Map.put(params, :path, final_path)}
+
+          with :ok <-
+                 put_prob_metadata(
+                   state,
+                   key,
+                   :bloom,
+                   meta_val,
+                   0
+                 ) do
+            {:ok, create_path}
+          end
         end
       end
 
@@ -1002,79 +2014,79 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp validate_cuckoo_auto_create_params(_invalid),
         do: {:error, :invalid_cuckoo_parameters}
 
-      defp auto_create_cuckoo_if_needed(state, path, key, validated_params) do
-        cond do
-          Ferricstore.FS.exists?(path) ->
-            :ok
+      defp auto_create_cuckoo_if_needed(_state, path, _key, :existing, _validated_params) do
+        if Ferricstore.FS.exists?(path), do: {:ok, path}, else: {:error, :enoent}
+      end
 
-          not is_nil(validated_params) ->
-            {capacity, bucket_size} = validated_params
+      defp auto_create_cuckoo_if_needed(_state, _path, _key, :missing, nil),
+        do: {:error, :enoent}
 
-            with :ok <-
-                   prob_create_and_fsync(
-                     state,
-                     path,
-                     NIF.cuckoo_file_create(path, capacity, bucket_size)
-                   ) do
-              meta_val = {:cuckoo_meta, %{capacity: capacity}}
-              do_put(state, key, Ferricstore.TermCodec.encode(meta_val), 0)
-              :ok
-            end
-
-          true ->
-            :ok
+      defp auto_create_cuckoo_if_needed(
+             state,
+             final_path,
+             key,
+             :replay,
+             validated_params
+           ) do
+        if Ferricstore.FS.exists?(final_path) do
+          {:ok, final_path}
+        else
+          auto_create_cuckoo_if_needed(state, final_path, key, :missing, validated_params)
         end
       end
 
-      # Enhanced do_delete that cleans up prob files.
-      # When a key's value is a prob metadata marker, delete the associated file.
+      defp auto_create_cuckoo_if_needed(
+             state,
+             final_path,
+             key,
+             :missing,
+             {capacity, bucket_size}
+           ) do
+        create_path = pending_prob_create_path(final_path)
+
+        with :ok <-
+               prob_create_and_fsync(
+                 state,
+                 create_path,
+                 final_path,
+                 NIF.cuckoo_file_create(create_path, capacity, bucket_size)
+               ) do
+          meta_val = {:cuckoo_meta, %{capacity: capacity}}
+
+          with :ok <-
+                 put_prob_metadata(
+                   state,
+                   key,
+                   :cuckoo,
+                   meta_val,
+                   0
+                 ) do
+            {:ok, create_path}
+          end
+        end
+      end
+
       defp prob_file_path_for_delete(state, key) do
         if CompoundKey.internal_key?(key) do
           nil
         else
-          case do_get(state, key) do
-            nil ->
-              nil
+          case prob_type_marker(state, key) do
+            type when type in [:bloom, :cms, :cuckoo, :topk] ->
+              prob_path(state, key, prob_extension(type))
 
-            value when is_binary(value) ->
-              prob_file_path_from_delete_value(state, key, value)
-
-            _ ->
+            _missing_or_non_prob ->
               nil
           end
         end
       end
 
-      defp maybe_delete_prob_file_path(_state, nil), do: :ok
+      defp prob_extension(:bloom), do: "bloom"
+      defp prob_extension(:cms), do: "cms"
+      defp prob_extension(:cuckoo), do: "cuckoo"
+      defp prob_extension(:topk), do: "topk"
+      defp prob_extension(type) when is_binary(type), do: type
 
-      defp maybe_delete_prob_file_path(state, path) do
-        result =
-          try do
-            case Ferricstore.FS.rm(path) do
-              :ok -> prob_fsync_dir(state)
-              {:error, {:not_found, _}} -> :ok
-              {:error, reason} -> {:error, {:delete_prob_file_failed, reason}}
-              other -> {:error, {:unexpected_delete_prob_file_result, other}}
-            end
-          rescue
-            error -> {:error, {:delete_prob_file_exception, error}}
-          catch
-            :exit, reason -> {:error, {:delete_prob_file_exit, reason}}
-          end
-
-        case result do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            Logger.warning(
-              "StateMachine probabilistic sidecar delete failed for #{path}: #{inspect(reason)}"
-            )
-
-            emit_prob_sidecar_delete_failed(state, path, reason)
-            :ok
-        end
-      end
+      defp maybe_delete_prob_file_path(_state, path), do: queue_pending_prob_delete(path)
 
       defp emit_prob_sidecar_delete_failed(state, path, reason) do
         :telemetry.execute(

@@ -3,7 +3,7 @@
 //! Uses pread/pwrite on a fixed-layout file: header + CMS counters + min-heap.
 //! No mmap, no ResourceArc — fully stateless NIF functions.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
@@ -24,6 +24,7 @@ const MAX_TOPK_CMS_COUNTERS: usize = 1_048_576;
 
 struct TopKLayout {
     heap_offset: usize,
+    token_offset: u64,
     file_size: u64,
 }
 
@@ -80,12 +81,17 @@ fn topk_layout(k: usize, width: usize, depth: usize) -> Result<TopKLayout, Strin
     let heap_bytes = k
         .checked_mul(HEAP_ENTRY_SIZE)
         .ok_or_else(|| "TopK heap byte size overflow".to_string())?;
-    let file_size = heap_offset
+    let token_offset = heap_offset
         .checked_add(heap_bytes)
         .ok_or_else(|| "TopK file size overflow".to_string())?;
+    let file_size = token_offset
+        .checked_add(crate::prob_txn::TOKEN_SIZE)
+        .ok_or_else(|| "TopK mutation footer size overflow".to_string())?;
 
     Ok(TopKLayout {
         heap_offset,
+        token_offset: u64::try_from(token_offset)
+            .map_err(|_| "TopK mutation footer offset exceeds u64".to_string())?,
         file_size: u64::try_from(file_size)
             .map_err(|_| "TopK file size exceeds u64".to_string())?,
     })
@@ -124,6 +130,7 @@ fn topk_read_exact_at(file: &File, buf: &mut [u8], offset: u64, label: &str) -> 
 // [header: 64 bytes]
 // [CMS counters: width * depth * 8 bytes (i64 each)]
 // [heap entries: k * HEAP_ENTRY_SIZE bytes]
+// [mutation token: 16 bytes]
 // ```
 //
 // Header (64 bytes):
@@ -200,20 +207,179 @@ fn v2_read_cms(file: &File, width: usize, depth: usize) -> Result<Vec<i64>, Stri
     Ok(counters)
 }
 
-/// Helper: write all CMS counters back to the file.
-fn v2_write_cms(file: &File, counters: &[i64]) -> Result<(), String> {
-    let byte_len = counters.len() * 8;
-    let mut buf = vec![0u8; byte_len];
+fn v2_encode_cms(counters: &[i64]) -> Result<Vec<u8>, String> {
+    let byte_len = counters
+        .len()
+        .checked_mul(8)
+        .ok_or_else(|| "TopK CMS encoding size overflow".to_string())?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(byte_len)
+        .map_err(|_| "TopK CMS encoding allocation failed".to_string())?;
+    buf.resize(byte_len, 0);
     for (i, &val) in counters.iter().enumerate() {
         buf[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
     }
-    crate::write_all_at(file, &buf, TOPK_HEADER_SIZE as u64, "topk cms")
+    Ok(buf)
+}
+
+/// Helper: write all CMS counters back to the file.
+#[cfg(test)]
+fn v2_write_cms(file: &File, counters: &[i64]) -> Result<(), String> {
+    let encoded = v2_encode_cms(counters)?;
+    crate::write_all_at(file, &encoded, TOPK_HEADER_SIZE as u64, "topk cms")
 }
 
 /// A heap entry read from file.
 struct V2HeapEntry {
     element: Vec<u8>,
     count: i64,
+}
+
+struct V2IndexedHeap {
+    entries: Vec<V2HeapEntry>,
+    positions: HashMap<Vec<u8>, usize>,
+    capacity: usize,
+}
+
+impl V2IndexedHeap {
+    fn new(
+        mut entries: Vec<V2HeapEntry>,
+        capacity: usize,
+        incoming_count: usize,
+    ) -> Result<Self, String> {
+        if entries.len() > capacity {
+            return Err("TopK heap length exceeds k".into());
+        }
+
+        let additional = incoming_count.min(capacity - entries.len());
+        entries
+            .try_reserve_exact(additional)
+            .map_err(|_| "out of memory while reserving TopK heap".to_string())?;
+
+        let indexed_count = entries
+            .len()
+            .checked_add(additional)
+            .ok_or_else(|| "TopK heap index size overflow".to_string())?;
+        let mut positions = HashMap::new();
+        positions
+            .try_reserve(indexed_count)
+            .map_err(|_| "out of memory while reserving TopK heap index".to_string())?;
+
+        for (index, entry) in entries.iter().enumerate() {
+            if positions.insert(entry.element.clone(), index).is_some() {
+                return Err("TopK heap contains a duplicate element".into());
+            }
+        }
+
+        let mut heap = Self {
+            entries,
+            positions,
+            capacity,
+        };
+        for index in (0..heap.entries.len() / 2).rev() {
+            heap.sift_down(index);
+        }
+        Ok(heap)
+    }
+
+    fn entry_precedes(left: &V2HeapEntry, right: &V2HeapEntry) -> bool {
+        left.count < right.count
+            || (left.count == right.count && left.element.as_slice() < right.element.as_slice())
+    }
+
+    fn swap(&mut self, left: usize, right: usize) {
+        if left == right {
+            return;
+        }
+
+        let Self {
+            entries, positions, ..
+        } = self;
+        entries.swap(left, right);
+        *positions
+            .get_mut(entries[left].element.as_slice())
+            .expect("TopK heap index must contain the swapped element") = left;
+        *positions
+            .get_mut(entries[right].element.as_slice())
+            .expect("TopK heap index must contain the swapped element") = right;
+    }
+
+    fn sift_up(&mut self, mut index: usize) {
+        while index > 0 {
+            let parent = (index - 1) / 2;
+            if !Self::entry_precedes(&self.entries[index], &self.entries[parent]) {
+                break;
+            }
+            self.swap(index, parent);
+            index = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut index: usize) {
+        loop {
+            let left = index * 2 + 1;
+            if left >= self.entries.len() {
+                break;
+            }
+
+            let right = left + 1;
+            let child = if right < self.entries.len()
+                && Self::entry_precedes(&self.entries[right], &self.entries[left])
+            {
+                right
+            } else {
+                left
+            };
+            if !Self::entry_precedes(&self.entries[child], &self.entries[index]) {
+                break;
+            }
+            self.swap(index, child);
+            index = child;
+        }
+    }
+
+    fn add(&mut self, element: &[u8], estimated: i64) -> Option<Vec<u8>> {
+        if let Some(index) = self.positions.get(element).copied() {
+            let previous = self.entries[index].count;
+            self.entries[index].count = estimated;
+            if estimated < previous {
+                self.sift_up(index);
+            } else if estimated > previous {
+                self.sift_down(index);
+            }
+            return None;
+        }
+
+        if self.entries.len() < self.capacity {
+            let index = self.entries.len();
+            let indexed_element = element.to_vec();
+            self.entries.push(V2HeapEntry {
+                element: indexed_element.clone(),
+                count: estimated,
+            });
+            self.positions.insert(indexed_element, index);
+            self.sift_up(index);
+            return None;
+        }
+
+        if estimated <= self.entries[0].count {
+            return None;
+        }
+
+        let indexed_element = element.to_vec();
+        let evicted = std::mem::replace(
+            &mut self.entries[0],
+            V2HeapEntry {
+                element: indexed_element.clone(),
+                count: estimated,
+            },
+        )
+        .element;
+        self.positions.remove(evicted.as_slice());
+        self.positions.insert(indexed_element, 0);
+        self.sift_down(0);
+        Some(evicted)
+    }
 }
 
 fn v2_query_fingerprints(entries: &[V2HeapEntry]) -> HashSet<&[u8]> {
@@ -263,18 +429,15 @@ fn v2_read_heap(
     Ok(entries)
 }
 
-/// Helper: write all heap entries + update heap_len in header.
-fn v2_write_heap(
-    file: &File,
-    width: usize,
-    depth: usize,
-    entries: &[V2HeapEntry],
-) -> Result<(), String> {
-    let heap_base = heap_offset(width, depth) as u64;
-
-    // Write heap entries
-    let byte_len = entries.len() * HEAP_ENTRY_SIZE;
-    let mut buf = vec![0u8; byte_len];
+fn v2_encode_heap(entries: &[V2HeapEntry]) -> Result<Vec<u8>, String> {
+    let byte_len = entries
+        .len()
+        .checked_mul(HEAP_ENTRY_SIZE)
+        .ok_or_else(|| "TopK heap encoding size overflow".to_string())?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(byte_len)
+        .map_err(|_| "TopK heap encoding allocation failed".to_string())?;
+    buf.resize(byte_len, 0);
     for (i, entry) in entries.iter().enumerate() {
         let base = i * HEAP_ENTRY_SIZE;
         buf[base..base + 8].copy_from_slice(&entry.count.to_le_bytes());
@@ -287,10 +450,22 @@ fn v2_write_heap(
         }
         buf[base + 8..base + 12].copy_from_slice(&(len as u32).to_le_bytes());
         buf[base + 12..base + 12 + len].copy_from_slice(&elem_bytes[..len]);
-        // rest is already zeroed
     }
-    if byte_len > 0 {
-        crate::write_all_at(file, &buf, heap_base, "topk heap")?;
+    Ok(buf)
+}
+
+/// Helper: write all heap entries + update heap_len in header.
+#[cfg(test)]
+fn v2_write_heap(
+    file: &File,
+    width: usize,
+    depth: usize,
+    entries: &[V2HeapEntry],
+) -> Result<(), String> {
+    let heap_base = heap_offset(width, depth) as u64;
+    let encoded = v2_encode_heap(entries)?;
+    if !encoded.is_empty() {
+        crate::write_all_at(file, &encoded, heap_base, "topk heap")?;
     }
 
     // Update heap_len in header at offset 20.
@@ -347,58 +522,209 @@ fn v2_cms_estimate(counters: &[i64], width: usize, depth: usize, element: &[u8])
     min_count
 }
 
-/// Helper: add an element to the in-memory heap entries with CMS increment.
-/// Returns the evicted element name if an eviction occurred.
-fn v2_heap_add(
-    entries: &mut Vec<V2HeapEntry>,
-    fingerprints: &mut HashSet<Vec<u8>>,
-    k: usize,
-    element: &[u8],
-    estimated: i64,
-) -> Option<Vec<u8>> {
-    // Already tracked? Update count in-place.
-    if fingerprints.contains(element) {
-        for entry in entries.iter_mut() {
-            if entry.element == element {
-                entry.count = estimated;
-                break;
+struct V2MutationPlan {
+    images: Vec<crate::prob_txn::AfterImage>,
+    results: Vec<Option<Vec<u8>>>,
+}
+
+fn v2_stage_mutation(file: &File, updates: &[(&[u8], i64)]) -> Result<V2MutationPlan, String> {
+    let (k, width, depth, heap_len) = v2_read_header(file)?;
+    let layout = topk_layout(k, width, depth)?;
+    let mut counters = v2_read_cms(file, width, depth)?;
+    let heap_entries = v2_read_heap(file, width, depth, heap_len, k)?;
+    let mut heap = V2IndexedHeap::new(heap_entries, k, updates.len())?;
+
+    let mut results = Vec::new();
+    results
+        .try_reserve_exact(updates.len())
+        .map_err(|_| "TopK mutation result allocation failed".to_string())?;
+    for (element, increment) in updates {
+        let estimated = v2_cms_increment(&mut counters, width, depth, element, *increment)?;
+        results.push(heap.add(element, estimated));
+    }
+
+    let mut images = Vec::new();
+    images
+        .try_reserve_exact(3)
+        .map_err(|_| "TopK mutation journal allocation failed".to_string())?;
+    images.push(crate::prob_txn::AfterImage::new(
+        TOPK_HEADER_SIZE as u64,
+        v2_encode_cms(&counters)?,
+    ));
+    let heap_bytes = v2_encode_heap(&heap.entries)?;
+    if !heap_bytes.is_empty() {
+        images.push(crate::prob_txn::AfterImage::new(
+            u64::try_from(layout.heap_offset)
+                .map_err(|_| "TopK heap offset exceeds u64".to_string())?,
+            heap_bytes,
+        ));
+    }
+    let heap_len = u32::try_from(heap.entries.len())
+        .map_err(|_| "TopK heap length exceeds u32".to_string())?;
+    images.push(crate::prob_txn::AfterImage::new(
+        20,
+        heap_len.to_le_bytes().to_vec(),
+    ));
+
+    Ok(V2MutationPlan { images, results })
+}
+
+fn v2_encode_mutation_results(results: &[Option<Vec<u8>>]) -> Result<Vec<u8>, String> {
+    let count = u32::try_from(results.len())
+        .map_err(|_| "TopK mutation result count exceeds u32".to_string())?;
+    let payload_size = results.iter().try_fold(4_usize, |size, result| {
+        size.checked_add(4)
+            .and_then(|next| {
+                result
+                    .as_ref()
+                    .map_or(Some(next), |value| next.checked_add(value.len()))
+            })
+            .ok_or_else(|| "TopK mutation result size overflow".to_string())
+    })?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(payload_size)
+        .map_err(|_| "TopK mutation result encoding allocation failed".to_string())?;
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for result in results {
+        match result {
+            None => encoded.extend_from_slice(&u32::MAX.to_le_bytes()),
+            Some(value) => {
+                let length = u32::try_from(value.len())
+                    .map_err(|_| "TopK mutation result element exceeds u32".to_string())?;
+                encoded.extend_from_slice(&length.to_le_bytes());
+                encoded.extend_from_slice(value);
             }
         }
-        return None;
     }
+    Ok(encoded)
+}
 
-    // Heap has room
-    if entries.len() < k {
-        entries.push(V2HeapEntry {
-            element: element.to_vec(),
-            count: estimated,
-        });
-        fingerprints.insert(element.to_vec());
-        return None;
+fn v2_decode_mutation_results(
+    encoded: &[u8],
+    expected_count: usize,
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let count_bytes = encoded
+        .get(0..4)
+        .ok_or_else(|| "truncated TopK mutation result".to_string())?;
+    let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+    if count != expected_count {
+        return Err("TopK mutation result cardinality mismatch".into());
     }
+    let mut results = Vec::new();
+    results
+        .try_reserve_exact(count)
+        .map_err(|_| "TopK mutation result allocation failed".to_string())?;
+    let mut cursor = 4_usize;
+    for _ in 0..count {
+        let length_end = cursor
+            .checked_add(4)
+            .ok_or_else(|| "TopK mutation result offset overflow".to_string())?;
+        let length_bytes = encoded
+            .get(cursor..length_end)
+            .ok_or_else(|| "truncated TopK mutation result".to_string())?;
+        let length = u32::from_le_bytes(length_bytes.try_into().unwrap());
+        cursor = length_end;
+        if length == u32::MAX {
+            results.push(None);
+            continue;
+        }
+        let length = length as usize;
+        if length > MAX_ELEMENT_LEN {
+            return Err("TopK mutation result element exceeds maximum length".into());
+        }
+        let value_end = cursor
+            .checked_add(length)
+            .ok_or_else(|| "TopK mutation result length overflow".to_string())?;
+        let value = encoded
+            .get(cursor..value_end)
+            .ok_or_else(|| "truncated TopK mutation result".to_string())?;
+        results.push(Some(value.to_vec()));
+        cursor = value_end;
+    }
+    if cursor != encoded.len() {
+        return Err("TopK mutation result contains trailing bytes".into());
+    }
+    Ok(results)
+}
 
-    // Heap full: find min and check if new element beats it
-    let mut min_idx = 0;
-    let mut min_count = entries[0].count;
-    for (i, entry) in entries.iter().enumerate().skip(1) {
-        if entry.count < min_count {
-            min_count = entry.count;
-            min_idx = i;
+fn v2_stale_mutation_results(count: usize) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let mut results = Vec::new();
+    results
+        .try_reserve_exact(count)
+        .map_err(|_| "TopK stale result allocation failed".to_string())?;
+    results.resize_with(count, || None);
+    Ok(results)
+}
+
+fn v2_apply_mutation_plan(file: &File, plan: &V2MutationPlan) -> Result<(), String> {
+    for image in &plan.images {
+        crate::write_all_at(
+            file,
+            &image.bytes,
+            image.offset,
+            "TopK mutation after-image",
+        )?;
+    }
+    crate::prob_fsync(file)
+}
+
+fn v2_transactional_mutation(
+    file: &File,
+    receipt_path: &Path,
+    updates: &[(&[u8], i64)],
+    token: crate::prob_txn::MutationToken,
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let (k, width, depth, _) = v2_read_header(file)?;
+    let layout = topk_layout(k, width, depth)?;
+    match crate::prob_txn::begin(
+        file,
+        receipt_path,
+        token,
+        layout.token_offset,
+        layout.file_size,
+    )? {
+        crate::prob_txn::MutationDecision::Replay(result) => {
+            v2_decode_mutation_results(&result, updates.len())
+        }
+        crate::prob_txn::MutationDecision::Stale => v2_stale_mutation_results(updates.len()),
+        crate::prob_txn::MutationDecision::Apply => {
+            let plan = v2_stage_mutation(file, updates)?;
+            let encoded_result = v2_encode_mutation_results(&plan.results)?;
+            crate::prob_txn::commit(
+                file,
+                receipt_path,
+                token,
+                layout.token_offset,
+                layout.file_size,
+                plan.images,
+                encoded_result,
+            )?;
+            Ok(plan.results)
         }
     }
+}
 
-    if estimated > min_count {
-        let evicted = entries[min_idx].element.clone();
-        fingerprints.remove(&evicted);
-        entries[min_idx] = V2HeapEntry {
-            element: element.to_vec(),
-            count: estimated,
-        };
-        fingerprints.insert(element.to_vec());
-        Some(evicted)
-    } else {
-        None
+fn v2_encode_result_terms<'a>(
+    env: Env<'a>,
+    results: Vec<Option<Vec<u8>>>,
+) -> Result<Term<'a>, String> {
+    let mut terms = Vec::new();
+    terms
+        .try_reserve_exact(results.len())
+        .map_err(|_| "TopK result term allocation failed".to_string())?;
+    for result in results {
+        match result {
+            None => terms.push(atoms::nil().encode(env)),
+            Some(value) => {
+                let mut binary = OwnedBinary::new(value.len())
+                    .ok_or_else(|| "TopK result binary allocation failed".to_string())?;
+                binary.as_mut_slice().copy_from_slice(&value);
+                terms.push(Binary::from_owned(binary, env).encode(env));
+            }
+        }
     }
+    Ok(terms.encode(env))
 }
 
 /// Create a new TopK file at the given path.
@@ -488,73 +814,78 @@ pub fn topk_file_add_v2<'a>(
         Err(e) => return Ok((atoms::error(), format!("open: {e}")).encode(env)),
     };
 
-    let (k, width, depth, heap_len) = match v2_read_header(&file) {
-        Ok(h) => h,
-        Err(e) => return Ok((atoms::error(), e).encode(env)),
-    };
-
-    let mut counters = match v2_read_cms(&file, width, depth) {
-        Ok(c) => c,
-        Err(e) => return Ok((atoms::error(), e).encode(env)),
-    };
-
-    let mut heap_entries = match v2_read_heap(&file, width, depth, heap_len, k) {
-        Ok(h) => h,
-        Err(e) => return Ok((atoms::error(), e).encode(env)),
-    };
-
-    let mut fingerprints: HashSet<Vec<u8>> =
-        heap_entries.iter().map(|e| e.element.clone()).collect();
-
-    let mut results: Vec<Term<'a>> = Vec::with_capacity(elements.len());
-    for elem_bin in &elements {
-        let elem_bytes = elem_bin.as_slice();
-        let estimated = match v2_cms_increment(&mut counters, width, depth, elem_bytes, 1) {
-            Ok(estimated) => estimated,
-            Err(e) => return Ok((atoms::error(), e).encode(env)),
-        };
-        match v2_heap_add(
-            &mut heap_entries,
-            &mut fingerprints,
-            k,
-            elem_bytes,
-            estimated,
-        ) {
-            Some(evicted) => {
-                let evicted_bytes = evicted.as_slice();
-                match OwnedBinary::new(evicted_bytes.len()) {
-                    Some(mut ob) => {
-                        ob.as_mut_slice().copy_from_slice(evicted_bytes);
-                        results.push(Binary::from_owned(ob, env).encode(env));
-                    }
-                    None => {
-                        results.push(atoms::nil().encode(env));
-                    }
-                }
-            }
-            None => {
-                results.push(atoms::nil().encode(env));
-            }
-        }
+    let mut updates = Vec::new();
+    if updates.try_reserve_exact(elements.len()).is_err() {
+        return Ok((atoms::error(), "TopK mutation input allocation failed").encode(env));
     }
-
-    // Write back modified data
-    if let Err(e) = v2_write_cms(&file, &counters) {
-        return Ok((atoms::error(), e).encode(env));
+    for element in &elements {
+        updates.push((element.as_slice(), 1));
     }
-    if let Err(e) = v2_write_heap(&file, width, depth, &heap_entries) {
-        return Ok((atoms::error(), e).encode(env));
-    }
-    // Durability: fsync before returning. TopK is NOT idempotent under
-    // Raft replay (heap state + counter RMW), so relying on
-    // pagecache flush + replay corrupts state on kernel panic. See
-    // background fsync design notes.
-    if let Err(e) = crate::prob_fsync(&file) {
-        return Ok((atoms::error(), e).encode(env));
+    let plan = match v2_stage_mutation(&file, &updates) {
+        Ok(plan) => plan,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    if let Err(error) = v2_apply_mutation_plan(&file, &plan) {
+        return Ok((atoms::error(), error).encode(env));
     }
 
     crate::fadvise_dontneed(&file, 0, 0);
-    Ok(results.encode(env))
+    match v2_encode_result_terms(env, plan.results) {
+        Ok(term) => Ok(term),
+        Err(error) => Ok((atoms::error(), error).encode(env)),
+    }
+}
+
+/// Add elements using a deterministic Raft mutation token.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_add_v2_at<'a>(
+    env: Env<'a>,
+    path: String,
+    receipt_path: String,
+    elements: Vec<Binary<'a>>,
+    mutation_index: u64,
+    mutation_ordinal: u64,
+) -> NifResult<Term<'a>> {
+    if let Some(len) = elements
+        .iter()
+        .map(|element| element.as_slice().len())
+        .find(|len| *len > MAX_ELEMENT_LEN)
+    {
+        return Ok((
+            atoms::error(),
+            format!("TopK element length {len} exceeds {MAX_ELEMENT_LEN}"),
+        )
+            .encode(env));
+    }
+    let token = crate::prob_txn::MutationToken::new(mutation_index, mutation_ordinal);
+    if token == crate::prob_txn::MutationToken::ZERO {
+        return Ok((atoms::error(), "TopK mutation token must be non-zero").encode(env));
+    }
+    let file = match crate::open_random_rw_locked(Path::new(&path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((atoms::error(), atoms::enoent()).encode(env));
+        }
+        Err(error) => return Ok((atoms::error(), format!("open: {error}")).encode(env)),
+    };
+    let mut updates = Vec::new();
+    if updates.try_reserve_exact(elements.len()).is_err() {
+        return Ok((atoms::error(), "TopK mutation input allocation failed").encode(env));
+    }
+    for element in &elements {
+        updates.push((element.as_slice(), 1));
+    }
+    let results = match v2_transactional_mutation(&file, Path::new(&receipt_path), &updates, token)
+    {
+        Ok(results) => results,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    crate::fadvise_dontneed(&file, 0, 0);
+    match v2_encode_result_terms(env, results) {
+        Ok(term) => Ok(term),
+        Err(error) => Ok((atoms::error(), error).encode(env)),
+    }
 }
 
 /// Increment elements by specified amounts in a file-backed TopK.
@@ -591,70 +922,81 @@ pub fn topk_file_incrby_v2<'a>(
         Err(e) => return Ok((atoms::error(), format!("open: {e}")).encode(env)),
     };
 
-    let (k, width, depth, heap_len) = match v2_read_header(&file) {
-        Ok(h) => h,
-        Err(e) => return Ok((atoms::error(), e).encode(env)),
-    };
-
-    let mut counters = match v2_read_cms(&file, width, depth) {
-        Ok(c) => c,
-        Err(e) => return Ok((atoms::error(), e).encode(env)),
-    };
-
-    let mut heap_entries = match v2_read_heap(&file, width, depth, heap_len, k) {
-        Ok(h) => h,
-        Err(e) => return Ok((atoms::error(), e).encode(env)),
-    };
-
-    let mut fingerprints: HashSet<Vec<u8>> =
-        heap_entries.iter().map(|e| e.element.clone()).collect();
-
-    let mut results: Vec<Term<'a>> = Vec::with_capacity(pairs.len());
-    for (elem_bin, count) in &pairs {
-        let elem_bytes = elem_bin.as_slice();
-        let estimated = match v2_cms_increment(&mut counters, width, depth, elem_bytes, *count) {
-            Ok(estimated) => estimated,
-            Err(e) => return Ok((atoms::error(), e).encode(env)),
-        };
-        match v2_heap_add(
-            &mut heap_entries,
-            &mut fingerprints,
-            k,
-            elem_bytes,
-            estimated,
-        ) {
-            Some(evicted) => {
-                let evicted_bytes = evicted.as_slice();
-                match OwnedBinary::new(evicted_bytes.len()) {
-                    Some(mut ob) => {
-                        ob.as_mut_slice().copy_from_slice(evicted_bytes);
-                        results.push(Binary::from_owned(ob, env).encode(env));
-                    }
-                    None => {
-                        results.push(atoms::nil().encode(env));
-                    }
-                }
-            }
-            None => {
-                results.push(atoms::nil().encode(env));
-            }
-        }
+    let mut updates = Vec::new();
+    if updates.try_reserve_exact(pairs.len()).is_err() {
+        return Ok((atoms::error(), "TopK mutation input allocation failed").encode(env));
     }
-
-    // Write back modified data
-    if let Err(e) = v2_write_cms(&file, &counters) {
-        return Ok((atoms::error(), e).encode(env));
+    for (element, count) in &pairs {
+        updates.push((element.as_slice(), *count));
     }
-    if let Err(e) = v2_write_heap(&file, width, depth, &heap_entries) {
-        return Ok((atoms::error(), e).encode(env));
-    }
-    // Durability: fsync — see comment in topk_file_add_v2.
-    if let Err(e) = crate::prob_fsync(&file) {
-        return Ok((atoms::error(), e).encode(env));
+    let plan = match v2_stage_mutation(&file, &updates) {
+        Ok(plan) => plan,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    if let Err(error) = v2_apply_mutation_plan(&file, &plan) {
+        return Ok((atoms::error(), error).encode(env));
     }
 
     crate::fadvise_dontneed(&file, 0, 0);
-    Ok(results.encode(env))
+    match v2_encode_result_terms(env, plan.results) {
+        Ok(term) => Ok(term),
+        Err(error) => Ok((atoms::error(), error).encode(env)),
+    }
+}
+
+/// Increment elements using a deterministic Raft mutation token.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_incrby_v2_at<'a>(
+    env: Env<'a>,
+    path: String,
+    receipt_path: String,
+    pairs: Vec<(Binary<'a>, i64)>,
+    mutation_index: u64,
+    mutation_ordinal: u64,
+) -> NifResult<Term<'a>> {
+    if pairs.iter().any(|(_element, count)| *count <= 0) {
+        return Ok((atoms::error(), "TopK increment must be positive").encode(env));
+    }
+    if let Some(len) = pairs
+        .iter()
+        .map(|(element, _count)| element.as_slice().len())
+        .find(|len| *len > MAX_ELEMENT_LEN)
+    {
+        return Ok((
+            atoms::error(),
+            format!("TopK element length {len} exceeds {MAX_ELEMENT_LEN}"),
+        )
+            .encode(env));
+    }
+    let token = crate::prob_txn::MutationToken::new(mutation_index, mutation_ordinal);
+    if token == crate::prob_txn::MutationToken::ZERO {
+        return Ok((atoms::error(), "TopK mutation token must be non-zero").encode(env));
+    }
+    let file = match crate::open_random_rw_locked(Path::new(&path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((atoms::error(), atoms::enoent()).encode(env));
+        }
+        Err(error) => return Ok((atoms::error(), format!("open: {error}")).encode(env)),
+    };
+    let mut updates = Vec::new();
+    if updates.try_reserve_exact(pairs.len()).is_err() {
+        return Ok((atoms::error(), "TopK mutation input allocation failed").encode(env));
+    }
+    for (element, count) in &pairs {
+        updates.push((element.as_slice(), *count));
+    }
+    let results = match v2_transactional_mutation(&file, Path::new(&receipt_path), &updates, token)
+    {
+        Ok(results) => results,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    crate::fadvise_dontneed(&file, 0, 0);
+    match v2_encode_result_terms(env, results) {
+        Ok(term) => Ok(term),
+        Err(error) => Ok((atoms::error(), error).encode(env)),
+    }
 }
 
 /// Query whether elements are in the top-K heap of a file-backed TopK.
@@ -745,6 +1087,61 @@ pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
 
     crate::fadvise_dontneed(&file, 0, 0);
     Ok(result_terms.encode(env))
+}
+
+fn v2_list_with_counts(file: &File) -> Result<Vec<(Vec<u8>, i64)>, String> {
+    let (k, width, depth, heap_len) = v2_read_header(file)?;
+    let mut heap_entries = v2_read_heap(file, width, depth, heap_len, k)?;
+    let counters = v2_read_cms(file, width, depth)?;
+
+    heap_entries.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.element.cmp(&b.element))
+    });
+
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(heap_entries.len())
+        .map_err(|_| "TopK list allocation failed".to_string())?;
+    for entry in heap_entries {
+        let count = v2_cms_estimate(&counters, width, depth, &entry.element);
+        result.push((entry.element, count));
+    }
+    Ok(result)
+}
+
+/// List elements and their CMS estimates from one locked file snapshot.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_list_with_count(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
+    let file = match crate::open_random_read_locked(Path::new(&path)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((atoms::error(), atoms::enoent()).encode(env));
+        }
+        Err(e) => return Ok((atoms::error(), format!("open: {e}")).encode(env)),
+    };
+
+    let entries = match v2_list_with_counts(&file) {
+        Ok(entries) => entries,
+        Err(e) => return Ok((atoms::error(), e).encode(env)),
+    };
+    let mut terms = Vec::new();
+    if terms.try_reserve_exact(entries.len() * 2).is_err() {
+        return Ok((atoms::error(), "TopK list allocation failed").encode(env));
+    }
+    for (element, count) in entries {
+        let Some(mut binary) = OwnedBinary::new(element.len()) else {
+            return Ok((atoms::error(), "out of memory").encode(env));
+        };
+        binary.as_mut_slice().copy_from_slice(&element);
+        terms.push(Binary::from_owned(binary, env).encode(env));
+        terms.push(count.encode(env));
+    }
+
+    crate::fadvise_dontneed(&file, 0, 0);
+    Ok(terms.encode(env))
 }
 
 /// Return CMS count estimates for the given elements from a file-backed TopK.
@@ -933,6 +1330,79 @@ pub fn topk_file_list_v2_async(
     Ok(atoms::ok().encode(env))
 }
 
+/// Async TopK list-with-count from one locked file snapshot.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn topk_file_list_with_count_async(
+    env: Env<'_>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+) -> NifResult<Term<'_>> {
+    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+        let file = crate::open_random_read_locked(Path::new(&path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "enoent".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        let result = v2_list_with_counts(&file);
+        crate::fadvise_dontneed(&file, 0, 0);
+        result
+    }) {
+        Ok(task) => task,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+
+    crate::async_io::runtime().spawn(async move {
+        let result = blocking_task
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(entries) => {
+                let mut terms = Vec::new();
+                if terms.try_reserve_exact(entries.len() * 2).is_err() {
+                    return (
+                        atoms::tokio_complete(),
+                        correlation_id,
+                        atoms::error(),
+                        "TopK list allocation failed",
+                    )
+                        .encode(env);
+                }
+
+                for (element, count) in entries {
+                    let Some(mut binary) = OwnedBinary::new(element.len()) else {
+                        return (
+                            atoms::tokio_complete(),
+                            correlation_id,
+                            atoms::error(),
+                            "out of memory",
+                        )
+                            .encode(env);
+                    };
+                    binary.as_mut_slice().copy_from_slice(&element);
+                    terms.push(Binary::from_owned(binary, env).encode(env));
+                    terms.push(count.encode(env));
+                }
+
+                (atoms::tokio_complete(), correlation_id, atoms::ok(), terms).encode(env)
+            }
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
 /// Async topk count: spawns on Tokio, sends CMS estimates to `caller_pid`.
 #[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
@@ -1038,6 +1508,14 @@ pub fn topk_file_info_v2_async(
         });
     });
     Ok(atoms::ok().encode(env))
+}
+
+pub(crate) fn recover_sidecar(path: &Path) -> Result<(), String> {
+    let file = crate::open_random_rw_locked(path)
+        .map_err(|error| format!("open TopK sidecar for recovery: {error}"))?;
+    let (k, width, depth, _heap_len) = v2_read_header(&file)?;
+    let layout = topk_layout(k, width, depth)?;
+    crate::prob_txn::recover(&file, path, layout.token_offset, layout.file_size)
 }
 
 // ---------------------------------------------------------------------------

@@ -48,7 +48,17 @@ defmodule Ferricstore.Store.Promotion do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.ExpiryContext
   alias Ferricstore.Raft.WARaftSegmentReader
-  alias Ferricstore.Store.{ActiveFile, AppendResult, BlobRef, BlobValue, CompoundKey, LFU}
+
+  alias Ferricstore.Store.{
+    ActiveFile,
+    AppendResult,
+    BlobRef,
+    BlobValue,
+    CompoundKey,
+    LFU,
+    SegmentFilename
+  }
+
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
@@ -2427,34 +2437,32 @@ defmodule Ferricstore.Store.Promotion do
   defp list_log_files_result(dir) do
     case Ferricstore.FS.ls(dir) do
       {:ok, files} ->
-        cleanup_leftover_compaction_temp_files(dir, files)
-
-        log_files =
-          files
-          |> Enum.flat_map(fn name ->
-            case numeric_log_file_id(dir, name) do
-              {:ok, fid} -> [{fid, Path.join(dir, name)}]
-              :skip -> []
-            end
-          end)
-          |> Enum.sort_by(fn {fid, _} -> fid end)
-
-        {:ok, log_files}
+        with {:ok, log_files} <- collect_log_files(dir, files) do
+          cleanup_leftover_compaction_temp_files(dir, files)
+          {:ok, Enum.sort_by(log_files, fn {fid, _path} -> fid end)}
+        end
 
       {:error, _reason} = error ->
         error
     end
   end
 
+  defp collect_log_files(dir, files) do
+    Enum.reduce_while(files, {:ok, []}, fn name, {:ok, acc} ->
+      case numeric_log_file_id(dir, name) do
+        {:ok, fid} -> {:cont, {:ok, [{fid, Path.join(dir, name)} | acc]}}
+        :skip -> {:cont, {:ok, acc}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
   defp numeric_log_file_id(dir, name) do
-    with true <- String.ends_with?(name, ".log"),
-         false <- String.starts_with?(name, "compact_"),
-         stem <- String.trim_trailing(name, ".log"),
-         {fid, ""} <- Integer.parse(stem),
-         true <- fid >= 0,
+    with {:ok, fid} <- SegmentFilename.parse(name),
          {:ok, %File.Stat{type: :regular}} <- File.lstat(Path.join(dir, name)) do
       {:ok, fid}
     else
+      {:error, _reason} = error -> error
       _ -> :skip
     end
   end

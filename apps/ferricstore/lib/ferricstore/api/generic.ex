@@ -478,7 +478,7 @@ defmodule FerricStore.API.Generic do
         failure
 
       type when is_binary(type) ->
-        type
+        Ferricstore.Store.CompoundKey.type_name(type)
 
       nil ->
         type_without_catalog_marker(ctx, store, key)

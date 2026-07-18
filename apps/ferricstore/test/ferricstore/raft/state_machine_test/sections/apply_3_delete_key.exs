@@ -29,8 +29,8 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           {_s3, :ok} = StateMachine.apply(%{}, {:delete, "k"}, s2)
         end
 
-        @tag :prob_metadata_path_confinement
-        test "delete never trusts a probabilistic metadata path from the stored value", %{
+        @tag :prob_type_catalog
+        test "delete does not treat user string bytes as probabilistic metadata", %{
           state: state,
           dir: dir
         } do
@@ -52,7 +52,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           {_state3, :ok} = StateMachine.apply(%{}, {:delete, key}, state2)
 
           assert File.read!(victim) == "keep"
-          refute File.exists?(expected_sidecar)
+          assert File.read!(expected_sidecar) == "sidecar"
         end
 
         test "missing active file fails delete and keeps ETS entry", %{state: state, ets: ets} do
@@ -92,16 +92,16 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           assert File.exists?(prob_path)
         end
 
-        test "prob sidecar cleanup fsync failure emits telemetry", %{
+        @tag :prob_sidecar_delete_durability
+        test "prob sidecar cleanup fsync failure is a typed storage error", %{
           state: state,
           dir: dir,
           shard_index: shard_index
         } do
           key = "prob_delete_fsync_telemetry"
           prob_dir = Path.join(dir, "prob")
-          File.mkdir_p!(prob_dir)
           prob_path = Ferricstore.ProbFile.path(prob_dir, key, "cms")
-          File.write!(prob_path, "cms")
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
 
           handler_id = {__MODULE__, self(), :prob_sidecar_delete_failed}
 
@@ -124,17 +124,56 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             Process.delete(:ferricstore_prob_fsync_dir_hook)
           end)
 
-          meta = :erlang.term_to_binary({:cms_meta, %{width: 1, depth: 1}})
-          {state2, :ok} = StateMachine.apply(%{}, {:put, key, meta, 0}, state)
-          {_state3, :ok} = StateMachine.apply(%{}, {:delete, key}, state2)
+          assert {_state, {:error, reason}} =
+                   StateMachine.apply(%{}, {:delete, key}, state)
+
+          assert {:prob_sidecar_delete_failed, ^prob_path,
+                  {:fsync_dir_failed, :delete_prob_files, :eio}} = reason
+
+          assert Ferricstore.Raft.ApplyFailure.storage_reason?(reason)
 
           assert_receive {:prob_sidecar_delete_failed,
                           [:ferricstore, :prob, :sidecar_delete_failed], %{count: 1},
                           %{
                             shard_index: ^shard_index,
                             path: ^prob_path,
-                            reason: {:fsync_dir_failed, :prob_file_dir, :eio}
+                            reason: {:fsync_dir_failed, :delete_prob_files, :eio}
                           }}
+        end
+
+        @tag :prob_sidecar_delete_durability
+        test "batch delete fsyncs the sidecar directory once", %{state: state, dir: dir} do
+          first = "batched-delete-cms"
+          second = "batched-delete-topk"
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, first, 64, 4}, state)
+          {state, :ok} = StateMachine.apply(%{}, {:topk_create, second, 10, 32, 4}, state)
+
+          prob_dir = Path.join(dir, "prob")
+          hook_count_key = {__MODULE__, :prob_batch_delete_fsync_count}
+          Process.put(hook_count_key, 0)
+
+          Process.put(:ferricstore_prob_fsync_dir_hook, fn
+            ^prob_dir ->
+              Process.put(hook_count_key, Process.get(hook_count_key, 0) + 1)
+              :ok
+
+            _other_dir ->
+              :ok
+          end)
+
+          try do
+            assert {_state, {:ok, [:ok, :ok]}} =
+                     StateMachine.apply(
+                       %{},
+                       {:batch, [{:delete, first}, {:delete, second}]},
+                       state
+                     )
+
+            assert Process.get(hook_count_key) == 1
+          after
+            Process.delete(:ferricstore_prob_fsync_dir_hook)
+            Process.delete(hook_count_key)
+          end
         end
 
         test "append failure rolls back deleted entry in a mixed batch", %{state: state, ets: ets} do
@@ -405,9 +444,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             File.mkdir_p!(prob_dir)
             File.touch!(Path.join(shard_path, "00000.log"))
 
-            assert {:ok, _} = NIF.cms_file_create(src_path, 64, 4)
-            assert {:ok, _} = NIF.cms_file_incrby(src_path, [{"element", 9}])
-
             state =
               StateMachine.init(%{
                 shard_index: 0,
@@ -418,6 +454,11 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
                 instance_ctx: ctx,
                 instance_name: instance_name
               })
+
+            {state, :ok} = StateMachine.apply(%{}, {:cms_create, src_key, 64, 4}, state)
+
+            {state, {:ok, [9]}} =
+              StateMachine.apply(%{}, {:cms_incrby, src_key, [{"element", 9}]}, state)
 
             apply_result =
               StateMachine.apply(
@@ -916,6 +957,1540 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
       end
 
       describe "apply/3 probabilistic native failures" do
+        @tag :prob_storage_failure
+        test "probabilistic directory creation returns a typed storage error", %{
+          state: state,
+          dir: dir
+        } do
+          blocked_parent = Path.join(dir, "prob-parent-is-a-file")
+          File.write!(blocked_parent, "not-a-directory")
+          blocked_state = %{state | shard_data_path: Path.join(blocked_parent, "shard")}
+
+          assert {_state, {:error, {:prob_dir_create_failed, _reason}}} =
+                   StateMachine.apply(
+                     %{},
+                     {:cms_create, "blocked-prob-dir", 64, 4},
+                     blocked_state
+                   )
+        end
+
+        @tag :prob_storage_failure
+        test "probabilistic sidecar creation returns a typed storage error", %{
+          state: state,
+          dir: dir
+        } do
+          key = "blocked-prob-sidecar-create"
+          prob_dir = Path.join(dir, "prob")
+          path = Ferricstore.ProbFile.path(prob_dir, key, "cms")
+          File.mkdir_p!(path <> ".pending-create")
+
+          assert {_state, {:error, reason}} =
+                   StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+
+          assert {:prob_sidecar_create_failed, _native_reason} = reason
+          assert Ferricstore.Raft.ApplyFailure.storage_reason?(reason)
+        end
+
+        @tag :prob_storage_failure
+        test "native create failure removes a visible uncommitted sidecar", %{
+          state: state,
+          dir: dir
+        } do
+          create_path = Path.join(dir, "visible-uncommitted.pending-create")
+          final_path = Path.join(dir, "visible-uncommitted.cms")
+          File.write!(create_path, "uncommitted")
+
+          assert {:error, {:prob_sidecar_create_failed, :directory_fsync_failed}} =
+                   StateMachine.__prob_create_and_fsync_for_test__(
+                     state,
+                     create_path,
+                     final_path,
+                     {:error, :directory_fsync_failed}
+                   )
+
+          refute File.exists?(create_path)
+          refute File.exists?(final_path)
+        end
+
+        @tag :prob_storage_failure
+        test "missing probabilistic sidecars stop every replicated mutation", %{
+          state: state,
+          dir: dir
+        } do
+          cases = [
+            {:bloom_add, "missing-bloom-add", "bloom",
+             {:bloom_create, "missing-bloom-add", 128, 3,
+              {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}},
+             {:bloom_add, "missing-bloom-add", "item", nil}},
+            {:bloom_madd, "missing-bloom-madd", "bloom",
+             {:bloom_create, "missing-bloom-madd", 128, 3,
+              {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}},
+             {:bloom_madd, "missing-bloom-madd", ["item"], nil}},
+            {:cms_incrby, "missing-cms-incrby", "cms", {:cms_create, "missing-cms-incrby", 64, 4},
+             {:cms_incrby, "missing-cms-incrby", [{"item", 1}]}},
+            {:cuckoo_add, "missing-cuckoo-add", "cuckoo",
+             {:cuckoo_create, "missing-cuckoo-add", 64, 4},
+             {:cuckoo_add, "missing-cuckoo-add", "item", nil}},
+            {:cuckoo_addnx, "missing-cuckoo-addnx", "cuckoo",
+             {:cuckoo_create, "missing-cuckoo-addnx", 64, 4},
+             {:cuckoo_addnx, "missing-cuckoo-addnx", "item", nil}},
+            {:cuckoo_del, "missing-cuckoo-del", "cuckoo",
+             {:cuckoo_create, "missing-cuckoo-del", 64, 4},
+             {:cuckoo_del, "missing-cuckoo-del", "item"}},
+            {:topk_add, "missing-topk-add", "topk", {:topk_create, "missing-topk-add", 10, 32, 4},
+             {:topk_add, "missing-topk-add", ["item"]}},
+            {:topk_incrby, "missing-topk-incrby", "topk",
+             {:topk_create, "missing-topk-incrby", 10, 32, 4},
+             {:topk_incrby, "missing-topk-incrby", [{"item", 1}]}}
+          ]
+
+          Enum.reduce(cases, state, fn {operation, key, extension, create, mutation}, acc ->
+            {created_state, :ok} = StateMachine.apply(%{}, create, acc)
+            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, extension)
+            File.rm!(path)
+
+            {next_state, {:error, reason}} = StateMachine.apply(%{}, mutation, created_state)
+
+            assert {:prob_sidecar_apply_failed, ^operation, :enoent} = reason
+            assert Ferricstore.Raft.ApplyFailure.storage_reason?(reason)
+            next_state
+          end)
+        end
+
+        @tag :prob_storage_failure
+        test "missing probabilistic sidecars stop batched mutations", %{
+          state: state,
+          dir: dir
+        } do
+          key = "missing-batched-cms-incrby"
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+          later_key = "batch-command-after-missing-sidecar"
+
+          bloom_meta =
+            {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}
+
+          {state, :ok} =
+            StateMachine.apply(
+              %{},
+              {:bloom_create, later_key, 128, 3, bloom_meta},
+              state
+            )
+
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          later_path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), later_key, "bloom")
+          File.rm!(path)
+
+          assert {_state, {:error, {:prob_sidecar_apply_failed, :cms_incrby, :enoent}}} =
+                   StateMachine.apply(
+                     %{},
+                     {:batch,
+                      [
+                        {:cms_incrby, key, [{"item", 1}]},
+                        {:bloom_add, later_key, "must-not-run", nil}
+                      ]},
+                     state
+                   )
+
+          assert {:ok, 0} = NIF.bloom_file_exists(later_path, "must-not-run")
+        end
+
+        @tag :prob_storage_failure
+        test "deterministic probabilistic command errors remain ordinary results", %{
+          state: state
+        } do
+          key = "topk-semantic-error"
+          {state, :ok} = StateMachine.apply(%{}, {:topk_create, key, 10, 32, 4}, state)
+
+          assert {_state, {:error, "TopK increment must be positive"}} =
+                   StateMachine.apply(
+                     %{},
+                     {:topk_incrby, key, [{"item", 0}]},
+                     state
+                   )
+
+          refute Ferricstore.Raft.ApplyFailure.storage_reason?("TopK increment must be positive")
+        end
+
+        @tag :prob_sidecar_replay
+        test "create removes a staged sidecar left before metadata commit", %{
+          state: state,
+          dir: dir
+        } do
+          key = "stale-staged-prob-create"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          staged_path = path <> ".pending-create"
+
+          File.mkdir_p!(Path.dirname(staged_path))
+          assert {:ok, :ok} = NIF.cms_file_create(staged_path, 32, 2)
+          assert File.regular?(staged_path)
+
+          assert {_state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+
+          refute File.exists?(staged_path)
+          assert {:ok, {64, 4, 0}} = NIF.cms_file_info(path)
+        end
+
+        @tag :prob_sidecar_replay
+        test "create replay repairs a rename that was not directory-durable", %{
+          state: state,
+          dir: dir
+        } do
+          key = "replayed-prob-create"
+          command = {:cms_create, key, 64, 4}
+          ra_index = 8_100_001
+          prob_dir = Path.join(dir, "prob")
+          path = Ferricstore.ProbFile.path(prob_dir, key, "cms")
+          hook_count_key = {__MODULE__, :prob_publish_fsync_count}
+          Process.put(hook_count_key, 0)
+
+          Process.put(:ferricstore_prob_fsync_dir_hook, fn
+            ^prob_dir ->
+              count = Process.get(hook_count_key, 0) + 1
+              Process.put(hook_count_key, count)
+              if count == 1, do: {:error, :eio}, else: :ok
+
+            _other_dir ->
+              :ok
+          end)
+
+          try do
+            assert {failed_state,
+                    {:applied_at, ^ra_index,
+                     {:error,
+                      {:prob_sidecar_publish_failed, ^path, _staged_path,
+                       {:fsync_dir_failed, :publish_prob_file, :eio}}}}, _effects} =
+                     StateMachine.apply(
+                       %{index: ra_index, system_time: 1_000},
+                       command,
+                       state
+                     )
+
+            assert File.regular?(path)
+            Process.delete(:ferricstore_prob_fsync_dir_hook)
+
+            assert {replayed_state, {:applied_at, ^ra_index, :ok}, _effects} =
+                     StateMachine.apply(
+                       %{index: ra_index, system_time: 1_000},
+                       command,
+                       failed_state
+                     )
+
+            assert {:ok, {64, 4, 0}} = NIF.cms_file_info(path)
+
+            next_index = ra_index + 1
+
+            assert {_state, {:applied_at, ^next_index, {:error, "ERR item already exists"}},
+                    _effects} =
+                     StateMachine.apply(
+                       %{index: next_index, system_time: 1_001},
+                       command,
+                       replayed_state
+                     )
+          after
+            Process.delete(:ferricstore_prob_fsync_dir_hook)
+            Process.delete(hook_count_key)
+          end
+        end
+
+        @tag :prob_sidecar_replay
+        test "auto-create mutation replay rebuilds instead of double-applying", %{
+          state: state,
+          dir: dir
+        } do
+          key = "replayed-cuckoo-auto-create"
+          auto_params = %{capacity: 64, bucket_size: 4}
+          command = {:cuckoo_add, key, "item", auto_params}
+          ra_index = 8_100_002
+          prob_dir = Path.join(dir, "prob")
+          path = Ferricstore.ProbFile.path(prob_dir, key, "cuckoo")
+          hook_count_key = {__MODULE__, :prob_auto_publish_fsync_count}
+          Process.put(hook_count_key, 0)
+
+          Process.put(:ferricstore_prob_fsync_dir_hook, fn
+            ^prob_dir ->
+              count = Process.get(hook_count_key, 0) + 1
+              Process.put(hook_count_key, count)
+              if count == 1, do: {:error, :eio}, else: :ok
+
+            _other_dir ->
+              :ok
+          end)
+
+          try do
+            assert {failed_state,
+                    {:applied_at, ^ra_index,
+                     {:error,
+                      {:prob_sidecar_publish_failed, ^path, _staged_path,
+                       {:fsync_dir_failed, :publish_prob_file, :eio}}}}, _effects} =
+                     StateMachine.apply(
+                       %{index: ra_index, system_time: 1_000},
+                       command,
+                       state
+                     )
+
+            Process.delete(:ferricstore_prob_fsync_dir_hook)
+
+            assert {_replayed_state, {:applied_at, ^ra_index, {:ok, 1}}, _effects} =
+                     StateMachine.apply(
+                       %{index: ra_index, system_time: 1_000},
+                       command,
+                       failed_state
+                     )
+
+            assert {:ok, {_buckets, 4, _fingerprint_size, 1, 0, _slots, _max_kicks}} =
+                     NIF.cuckoo_file_info(path)
+
+            assert {:ok, 1} = NIF.cuckoo_file_exists(path, "item")
+          after
+            Process.delete(:ferricstore_prob_fsync_dir_hook)
+            Process.delete(hook_count_key)
+          end
+        end
+
+        @tag :prob_sidecar_replay
+        test "created sidecars replay same-batch mutations exactly once", %{
+          state: state,
+          dir: dir
+        } do
+          key = "replayed-created-cms-mutation"
+
+          command =
+            {:batch,
+             [
+               {:cms_create, key, 64, 4},
+               {:cms_incrby, key, [{"item", 7}]}
+             ]}
+
+          ra_index = 8_100_003
+          prob_dir = Path.join(dir, "prob")
+          path = Ferricstore.ProbFile.path(prob_dir, key, "cms")
+          hook_count_key = {__MODULE__, :prob_batch_publish_fsync_count}
+          Process.put(hook_count_key, 0)
+
+          Process.put(:ferricstore_prob_fsync_dir_hook, fn
+            ^prob_dir ->
+              count = Process.get(hook_count_key, 0) + 1
+              Process.put(hook_count_key, count)
+              if count == 1, do: {:error, :eio}, else: :ok
+
+            _other_dir ->
+              :ok
+          end)
+
+          try do
+            assert {failed_state,
+                    {:applied_at, ^ra_index,
+                     {:error,
+                      {:prob_sidecar_publish_failed, ^path, _staged_path,
+                       {:fsync_dir_failed, :publish_prob_file, :eio}}}}, _effects} =
+                     StateMachine.apply(
+                       %{index: ra_index, system_time: 1_000},
+                       command,
+                       state
+                     )
+
+            assert {:ok, [7]} = NIF.cms_file_query(path, ["item"])
+            Process.delete(:ferricstore_prob_fsync_dir_hook)
+
+            assert {_replayed_state, {:applied_at, ^ra_index, {:ok, [:ok, {:ok, [7]}]}}, _effects} =
+                     StateMachine.apply(
+                       %{index: ra_index, system_time: 1_000},
+                       command,
+                       failed_state
+                     )
+
+            assert {:ok, [7]} = NIF.cms_file_query(path, ["item"])
+          after
+            Process.delete(:ferricstore_prob_fsync_dir_hook)
+            Process.delete(hook_count_key)
+          end
+        end
+
+        @tag :prob_apply_ordering
+        test "same-batch duplicate probabilistic creates remain deterministic errors", %{
+          state: state,
+          dir: dir
+        } do
+          key = "duplicate-created-in-batch"
+          create = {:cms_create, key, 64, 4}
+
+          assert {_state, {:ok, [:ok, {:error, "ERR item already exists"}]}} =
+                   StateMachine.apply(%{}, {:batch, [create, create]}, state)
+
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          assert {:ok, {64, 4, 0}} = NIF.cms_file_info(path)
+        end
+
+        @tag :prob_apply_ordering
+        test "mutations cannot use a sidecar after its logical key was deleted", %{
+          state: state,
+          dir: dir
+        } do
+          cases = [
+            {"deleted-before-cms-mutation", "cms",
+             {:cms_create, "deleted-before-cms-mutation", 64, 4},
+             {:cms_incrby, "deleted-before-cms-mutation", [{"item", 1}]}},
+            {"deleted-before-cuckoo-mutation", "cuckoo",
+             {:cuckoo_create, "deleted-before-cuckoo-mutation", 64, 4},
+             {:cuckoo_del, "deleted-before-cuckoo-mutation", "item"}},
+            {"deleted-before-topk-mutation", "topk",
+             {:topk_create, "deleted-before-topk-mutation", 10, 32, 4},
+             {:topk_add, "deleted-before-topk-mutation", ["item"]}}
+          ]
+
+          Enum.reduce(cases, state, fn {key, extension, create, mutation}, acc_state ->
+            {created_state, :ok} = StateMachine.apply(%{}, create, acc_state)
+
+            {next_state, result} =
+              StateMachine.apply(%{}, {:batch, [{:delete, key}, mutation]}, created_state)
+
+            assert {:ok, [_deleted, {:error, :enoent}]} = result
+
+            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, extension)
+            refute File.exists?(path)
+            next_state
+          end)
+        end
+
+        @tag :prob_apply_ordering
+        test "CMS merge cannot read a source deleted earlier in the batch", %{
+          state: state,
+          dir: dir
+        } do
+          source = "deleted-cms-merge-source"
+          destination = "cms-merge-destination"
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, source, 64, 4}, state)
+
+          {state, {:ok, [5]}} =
+            StateMachine.apply(%{}, {:cms_incrby, source, [{"item", 5}]}, state)
+
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, destination, 64, 4}, state)
+
+          {_state, result} =
+            StateMachine.apply(
+              %{},
+              {:batch,
+               [
+                 {:delete, source},
+                 {:cms_merge, destination, [source], [1], %{width: 64, depth: 4}}
+               ]},
+              state
+            )
+
+          assert {:ok, [_deleted, {:error, :enoent}]} = result
+
+          destination_path =
+            Ferricstore.ProbFile.path(Path.join(dir, "prob"), destination, "cms")
+
+          assert {:ok, [0]} = NIF.cms_file_query(destination_path, ["item"])
+        end
+
+        @tag :prob_hot_path
+        test "existing probabilistic mutations do not load cold metadata", %{
+          state: state,
+          ets: ets
+        } do
+          key = "cold-prob-metadata-mutation"
+
+          metadata =
+            {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}
+
+          {state, :ok} =
+            StateMachine.apply(%{}, {:bloom_create, key, 128, 3, metadata}, state)
+
+          assert true = :ets.update_element(ets, key, {2, nil})
+
+          Process.put(:ferricstore_state_machine_cold_read_success_hook, fn _ctx, ^key ->
+            flunk("probabilistic mutation loaded cold metadata")
+          end)
+
+          try do
+            ra_index = 8_100_004
+
+            assert {_state, {:applied_at, ^ra_index, {:ok, 1}}, _effects} =
+                     StateMachine.apply(
+                       %{index: ra_index, system_time: 1_000},
+                       {:bloom_add, key, "item",
+                        %{
+                          num_bits: 128,
+                          num_hashes: 3,
+                          capacity: 32,
+                          error_rate: 0.01
+                        }},
+                       state
+                     )
+          after
+            Process.delete(:ferricstore_state_machine_cold_read_success_hook)
+          end
+        end
+
+        @tag :prob_type_catalog
+        test "probabilistic creates publish exact replicated type markers", %{
+          state: state,
+          ets: ets
+        } do
+          commands = [
+            {"catalog_bloom", "bloom",
+             {:bloom_create, "catalog_bloom", 128, 3,
+              {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}}},
+            {"catalog_cms", "cms", {:cms_create, "catalog_cms", 64, 4}},
+            {"catalog_cuckoo", "cuckoo", {:cuckoo_create, "catalog_cuckoo", 64, 4}},
+            {"catalog_topk", "topk", {:topk_create, "catalog_topk", 10, 32, 4}}
+          ]
+
+          Enum.reduce(commands, state, fn {key, expected_type, command}, acc_state ->
+            {next_state, :ok} = StateMachine.apply(%{}, command, acc_state)
+            type_key = CompoundKey.type_key(key)
+            expected_type_atom = String.to_existing_atom(expected_type)
+
+            assert [{^type_key, type_marker, 0, _lfu, _file_id, _offset, _size}] =
+                     :ets.lookup(ets, type_key)
+
+            assert {:ok, {^expected_type_atom, create_token}} =
+                     CompoundKey.decode_prob_type(type_marker)
+
+            assert is_integer(create_token)
+
+            next_state
+          end)
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "string puts remove replaced probabilistic sidecars after publish", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          creates = [
+            {"replace_bloom", "bloom",
+             {:bloom_create, "replace_bloom", 128, 3,
+              {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}}},
+            {"replace_cms", "cms", {:cms_create, "replace_cms", 64, 4}},
+            {"replace_cuckoo", "cuckoo", {:cuckoo_create, "replace_cuckoo", 64, 4}},
+            {"replace_topk", "topk", {:topk_create, "replace_topk", 10, 32, 4}}
+          ]
+
+          Enum.reduce(creates, state, fn {key, ext, create}, acc_state ->
+            {acc_state, :ok} = StateMachine.apply(%{}, create, acc_state)
+            path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, ext)
+            assert File.exists?(path)
+
+            {next_state, :ok} =
+              StateMachine.apply(%{}, {:put, key, "string-value", 0}, acc_state)
+
+            refute File.exists?(path)
+            assert [] == :ets.lookup(ets, CompoundKey.type_key(key))
+
+            assert [{^key, "string-value", 0, _lfu, _file_id, _offset, 12}] =
+                     :ets.lookup(ets, key)
+
+            next_state
+          end)
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "failed string put keeps probabilistic metadata and sidecar", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "failed_prob_replacement"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+          original_entry = :ets.lookup(ets, key)
+          original_type_entry = :ets.lookup(ets, CompoundKey.type_key(key))
+          assert File.exists?(path)
+
+          file_id = 9_200_000 + :erlang.unique_integer([:positive])
+          bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+          File.mkdir_p!(bad_active_path)
+          bad_state = %{state | active_file_id: file_id, active_file_path: bad_active_path}
+
+          {_state, {:error, {:bitcask_append_failed, _reason}}} =
+            StateMachine.apply(%{}, {:put, key, "string-value", 0}, bad_state)
+
+          assert original_entry == :ets.lookup(ets, key)
+          assert original_type_entry == :ets.lookup(ets, CompoundKey.type_key(key))
+          assert File.exists?(path)
+          assert {:ok, {_width, _depth, _count}} = NIF.cms_file_info(path)
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "same-batch probabilistic sidecar cleanup follows the final logical value", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          auto_params = %{
+            num_bits: 9586,
+            num_hashes: 7,
+            capacity: 1000,
+            error_rate: 0.01
+          }
+
+          recreate_key = "batch_prob_recreate"
+
+          recreate_path =
+            Ferricstore.ProbFile.path(Path.join(dir, "prob"), recreate_key, "bloom")
+
+          create =
+            {:bloom_create, recreate_key, 128, 3,
+             {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}}
+
+          {state, :ok} = StateMachine.apply(%{}, create, state)
+
+          {state, {:ok, 1}} =
+            StateMachine.apply(%{}, {:bloom_add, recreate_key, "old-item", nil}, state)
+
+          assert File.regular?(recreate_path <> ".mutation")
+
+          {state, {:ok, [:ok, :ok, {:ok, _added}]}} =
+            StateMachine.apply(
+              %{},
+              {:batch,
+               [
+                 {:put, recreate_key, "temporary-string", 0},
+                 {:delete, recreate_key},
+                 {:bloom_add, recreate_key, "fresh-item", auto_params}
+               ]},
+              state
+            )
+
+          assert File.exists?(recreate_path)
+          assert {:ok, 1} = NIF.bloom_file_exists(recreate_path, "fresh-item")
+          assert {:ok, 0} = NIF.bloom_file_exists(recreate_path, "old-item")
+          assert File.regular?(recreate_path <> ".mutation")
+
+          assert [{^recreate_key, encoded_meta, 0, _lfu, _file_id, _offset, _size}] =
+                   :ets.lookup(ets, recreate_key)
+
+          assert {:ok, {:bloom_meta, _metadata}} = Ferricstore.TermCodec.decode(encoded_meta)
+
+          overwrite_key = "batch_prob_overwrite"
+
+          overwrite_path =
+            Ferricstore.ProbFile.path(Path.join(dir, "prob"), overwrite_key, "bloom")
+
+          {_state, {:ok, [{:ok, _added}, :ok]}} =
+            StateMachine.apply(
+              %{},
+              {:batch,
+               [
+                 {:bloom_add, overwrite_key, "discarded-item", auto_params},
+                 {:put, overwrite_key, "final-string", 0}
+               ]},
+              state
+            )
+
+          refute File.exists?(overwrite_path)
+
+          assert [{^overwrite_key, "final-string", 0, _lfu, _file_id, _offset, 12}] =
+                   :ets.lookup(ets, overwrite_key)
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "failed delete and auto-create batch restores the original sidecar", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "failed_prob_recreate"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+
+          meta =
+            {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}
+
+          {state, :ok} = StateMachine.apply(%{}, {:bloom_create, key, 128, 3, meta}, state)
+          {state, {:ok, 1}} = StateMachine.apply(%{}, {:bloom_add, key, "keep-me", nil}, state)
+          original_entry = :ets.lookup(ets, key)
+          original_receipt = File.read!(path <> ".mutation")
+
+          file_id = 9_300_000 + :erlang.unique_integer([:positive])
+          bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+          File.mkdir_p!(bad_active_path)
+          bad_state = %{state | active_file_id: file_id, active_file_path: bad_active_path}
+
+          auto_params = %{
+            num_bits: 9586,
+            num_hashes: 7,
+            capacity: 1000,
+            error_rate: 0.01
+          }
+
+          {_state, {:error, {:bitcask_append_failed, _reason}}} =
+            StateMachine.apply(
+              %{},
+              {:batch, [{:delete, key}, {:bloom_add, key, "new-item", auto_params}]},
+              bad_state
+            )
+
+          assert original_entry == :ets.lookup(ets, key)
+          assert File.exists?(path)
+          assert {:ok, 1} = NIF.bloom_file_exists(path, "keep-me")
+          assert {:ok, 0} = NIF.bloom_file_exists(path, "new-item")
+          assert File.read!(path <> ".mutation") == original_receipt
+          refute File.exists?(path <> ".pending-create.mutation")
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "rollback removes a staged sidecar deleted later in the batch", %{
+          state: state,
+          dir: dir
+        } do
+          key = "rolled-back-created-then-overwritten"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          staged_path = path <> ".pending-create"
+          file_id = 9_350_000 + :erlang.unique_integer([:positive])
+          bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+          File.mkdir_p!(bad_active_path)
+          bad_state = %{state | active_file_id: file_id, active_file_path: bad_active_path}
+
+          assert {_state, {:error, {:bitcask_append_failed, _reason}}} =
+                   StateMachine.apply(
+                     %{},
+                     {:batch,
+                      [
+                        {:cms_create, key, 64, 4},
+                        {:put, key, "final-string", 0}
+                      ]},
+                     bad_state
+                   )
+
+          refute File.exists?(path)
+          refute File.exists?(staged_path)
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "batch create fsyncs the sidecar directory once", %{state: state, dir: dir} do
+          prob_dir = Path.join(dir, "prob")
+          hook_count_key = {__MODULE__, :prob_batch_create_fsync_count}
+          Process.put(hook_count_key, 0)
+
+          Process.put(:ferricstore_prob_fsync_dir_hook, fn
+            ^prob_dir ->
+              Process.put(hook_count_key, Process.get(hook_count_key, 0) + 1)
+              :ok
+
+            _other_dir ->
+              :ok
+          end)
+
+          try do
+            assert {_state, {:ok, [:ok, :ok]}} =
+                     StateMachine.apply(
+                       %{},
+                       {:batch,
+                        [
+                          {:cms_create, "batched-fsync-cms", 64, 4},
+                          {:topk_create, "batched-fsync-topk", 10, 32, 4}
+                        ]},
+                       state
+                     )
+
+            assert Process.get(hook_count_key) == 1
+          after
+            Process.delete(:ferricstore_prob_fsync_dir_hook)
+            Process.delete(hook_count_key)
+          end
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "put batches remove replaced probabilistic sidecars", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "fast_batch_prob_replacement"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+          assert File.exists?(path)
+
+          {_state, {:ok, [:ok]}} =
+            StateMachine.apply(%{}, {:put_batch, [{key, "string-value", 0}]}, state)
+
+          refute File.exists?(path)
+          assert [] == :ets.lookup(ets, CompoundKey.type_key(key))
+
+          assert [{^key, "string-value", 0, _lfu, _file_id, _offset, 12}] =
+                   :ets.lookup(ets, key)
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "plain put batches do not read overwritten cold values", %{state: state, ets: ets} do
+          key = "cold_batch_overwrite"
+          {state, :ok} = StateMachine.apply(%{}, {:put, key, "old-value", 0}, state)
+          assert true = :ets.update_element(ets, key, {2, nil})
+
+          Process.put(:ferricstore_state_machine_cold_read_success_hook, fn _ctx, ^key ->
+            flunk("plain put batch performed a cold read")
+          end)
+
+          try do
+            {_state, {:ok, [:ok]}} =
+              StateMachine.apply(%{}, {:put_batch, [{key, "new-value", 0}]}, state)
+          after
+            Process.delete(:ferricstore_state_machine_cold_read_success_hook)
+          end
+
+          assert [{^key, "new-value", 0, _lfu, _file_id, _offset, 9}] = :ets.lookup(ets, key)
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "standalone transaction replacement publishes probabilistic cleanup", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "transaction_prob_replacement"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+          assert File.exists?(path)
+
+          execute = fn store ->
+            Ferricstore.Commands.Strings.replace_string_key(key, "string-value", 0, store)
+          end
+
+          assert {:ok, _flushed_state} = StateMachine.apply_standalone_cross_shard(execute, state)
+
+          refute File.exists?(path)
+          assert [] == :ets.lookup(ets, CompoundKey.type_key(key))
+
+          assert [{^key, "string-value", 0, _lfu, _file_id, _offset, 12}] =
+                   :ets.lookup(ets, key)
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "standalone RENAME moves probabilistic metadata, type, and sidecar", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          source = "transaction_prob_rename_source"
+          destination = "transaction_prob_rename_destination"
+          prob_dir = Path.join(dir, "prob")
+          source_path = Ferricstore.ProbFile.path(prob_dir, source, "cms")
+          destination_path = Ferricstore.ProbFile.path(prob_dir, destination, "cms")
+
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, source, 64, 4}, state)
+
+          {state, {:ok, [7]}} =
+            StateMachine.apply(%{}, {:cms_incrby, source, [{"item", 7}]}, state)
+
+          execute = fn store ->
+            Ferricstore.Commands.Generic.handle_ast({:rename, source, destination}, store)
+          end
+
+          assert {:ok, _flushed_state} = StateMachine.apply_standalone_cross_shard(execute, state)
+
+          refute File.exists?(source_path)
+          assert {:ok, [7]} = NIF.cms_file_query(destination_path, ["item"])
+          assert [] == :ets.lookup(ets, source)
+          assert [] == :ets.lookup(ets, CompoundKey.type_key(source))
+          assert [{_, _, _, _, _, _, _}] = :ets.lookup(ets, destination)
+          assert [{_, _, _, _, _, _, _}] = :ets.lookup(ets, CompoundKey.type_key(destination))
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "replicated lifecycle command moves a probabilistic key", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          source = "replicated_prob_rename_source"
+          destination = "replicated_prob_rename_destination"
+          prob_dir = Path.join(dir, "prob")
+          source_path = Ferricstore.ProbFile.path(prob_dir, source, "cms")
+          destination_path = Ferricstore.ProbFile.path(prob_dir, destination, "cms")
+
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, source, 64, 4}, state)
+
+          {state, {:ok, [7]}} =
+            StateMachine.apply(%{}, {:cms_incrby, source, [{"item", 7}]}, state)
+
+          {renamed_state, :ok} =
+            StateMachine.apply(
+              %{},
+              {:key_lifecycle, {:rename, source, destination}},
+              state
+            )
+
+          refute File.exists?(source_path)
+          assert {:ok, [7]} = NIF.cms_file_query(destination_path, ["item"])
+          assert [] == :ets.lookup(ets, source)
+          assert [] == :ets.lookup(ets, CompoundKey.type_key(source))
+          assert [{_, _, _, _, _, _, _}] = :ets.lookup(ets, destination)
+          assert [{_, _, _, _, _, _, _}] = :ets.lookup(ets, CompoundKey.type_key(destination))
+          assert renamed_state.applied_count == state.applied_count + 1
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "lifecycle replay propagates metadata storage read failures" do
+          destination = "replay-read-failure-destination"
+          lifecycle_id = {71, <<0::128>>}
+          type_key = CompoundKey.type_key(destination)
+          marker = CompoundKey.encode_prob_type(:cms, 71)
+
+          store = %{
+            compound_get: fn
+              ^destination, ^type_key -> marker
+              _redis_key, _compound_key -> nil
+            end,
+            get_meta: fn ^destination ->
+              Ferricstore.Store.ReadResult.failure(:missing_file)
+            end
+          }
+
+          assert {:error, "ERR storage read failed"} =
+                   StateMachine.__prob_lifecycle_replay_type_for_test__(
+                     store,
+                     {:rename, "source", destination},
+                     lifecycle_id
+                   )
+        end
+
+        @tag :prob_mutation_replay
+        test "CMS mutation replay at the same Raft index is idempotent", %{
+          state: state,
+          dir: dir
+        } do
+          key = "cms_same_raft_index_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+
+          Process.put(:sm_current_ra_index, 77)
+
+          try do
+            {state, {:ok, [3]}} =
+              StateMachine.apply(%{}, {:cms_incrby, key, [{"item", 3}]}, state)
+
+            {_state, {:ok, [3]}} =
+              StateMachine.apply(%{}, {:cms_incrby, key, [{"item", 3}]}, state)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert {:ok, [3]} = NIF.cms_file_query(path, ["item"])
+        end
+
+        @tag :prob_mutation_replay
+        test "CMS merge replay at the same Raft index is idempotent when destination is a source",
+             %{
+               state: state,
+               dir: dir
+             } do
+          key = "cms_same_raft_index_merge_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+          {state, {:ok, [5]}} = StateMachine.apply(%{}, {:cms_incrby, key, [{"item", 5}]}, state)
+
+          command = {:cms_merge, key, [key], [2], %{width: 64, depth: 4}}
+          Process.put(:sm_current_ra_index, 78)
+
+          try do
+            {state, :ok} = StateMachine.apply(%{}, command, state)
+            {_state, :ok} = StateMachine.apply(%{}, command, state)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert {:ok, [10]} = NIF.cms_file_query(path, ["item"])
+        end
+
+        @tag :prob_mutation_replay
+        test "Bloom add replay at the same Raft index preserves the original reply", %{
+          state: state,
+          dir: dir
+        } do
+          key = "bloom_same_raft_index_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+
+          metadata =
+            {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}
+
+          {state, :ok} =
+            StateMachine.apply(%{}, {:bloom_create, key, 128, 3, metadata}, state)
+
+          Process.put(:sm_current_ra_index, 79)
+
+          try do
+            {state, {:ok, 1}} = StateMachine.apply(%{}, {:bloom_add, key, "item", nil}, state)
+            {_state, {:ok, 1}} = StateMachine.apply(%{}, {:bloom_add, key, "item", nil}, state)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert {:ok, 1} = NIF.bloom_file_card(path)
+        end
+
+        @tag :prob_mutation_replay
+        test "Bloom madd replay preserves ordered duplicate-element replies", %{
+          state: state,
+          dir: dir
+        } do
+          key = "bloom_madd_same_raft_index_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+
+          metadata =
+            {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}
+
+          {state, :ok} =
+            StateMachine.apply(%{}, {:bloom_create, key, 128, 3, metadata}, state)
+
+          command = {:bloom_madd, key, ["first", "second", "first"], nil}
+          Process.put(:sm_current_ra_index, 80)
+
+          try do
+            {state, {:ok, [1, 1, 0]}} = StateMachine.apply(%{}, command, state)
+            {_state, {:ok, [1, 1, 0]}} = StateMachine.apply(%{}, command, state)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert {:ok, 2} = NIF.bloom_file_card(path)
+        end
+
+        @tag :prob_mutation_replay
+        test "Bloom auto-create replay reuses the published sidecar", %{
+          state: state,
+          dir: dir
+        } do
+          key = "bloom_auto_create_same_raft_index_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+
+          auto_params = %{
+            num_bits: 128,
+            num_hashes: 3,
+            capacity: 32,
+            error_rate: 0.01
+          }
+
+          command = {:bloom_add, key, "item", auto_params}
+          Process.put(:sm_current_ra_index, 81)
+
+          try do
+            {state, {:ok, 1}} = StateMachine.apply(%{}, command, state)
+            published_inode = File.stat!(path).inode
+            pending_receipt = path <> ".pending-create.mutation"
+            File.rename!(path <> ".mutation", pending_receipt)
+
+            {_state, {:ok, 1}} = StateMachine.apply(%{}, command, state)
+            assert File.stat!(path).inode == published_inode
+            assert File.regular?(path <> ".mutation")
+            refute File.exists?(pending_receipt)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert {:ok, 1} = NIF.bloom_file_card(path)
+        end
+
+        @tag :prob_mutation_replay
+        test "Cuckoo add replay does not insert a duplicate fingerprint", %{
+          state: state,
+          dir: dir
+        } do
+          key = "cuckoo_add_same_raft_index_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
+          {state, :ok} = StateMachine.apply(%{}, {:cuckoo_create, key, 128, 4}, state)
+
+          Process.put(:sm_current_ra_index, 82)
+
+          try do
+            {state, {:ok, 1}} = StateMachine.apply(%{}, {:cuckoo_add, key, "item", nil}, state)
+            {_state, {:ok, 1}} = StateMachine.apply(%{}, {:cuckoo_add, key, "item", nil}, state)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert {:ok, 1} = NIF.cuckoo_file_count(path, "item")
+        end
+
+        @tag :prob_mutation_replay
+        test "Cuckoo addnx replay preserves the successful insert reply", %{
+          state: state,
+          dir: dir
+        } do
+          key = "cuckoo_addnx_same_raft_index_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
+          {state, :ok} = StateMachine.apply(%{}, {:cuckoo_create, key, 128, 4}, state)
+
+          Process.put(:sm_current_ra_index, 83)
+
+          try do
+            {state, {:ok, 1}} =
+              StateMachine.apply(%{}, {:cuckoo_addnx, key, "item", nil}, state)
+
+            {_state, {:ok, 1}} =
+              StateMachine.apply(%{}, {:cuckoo_addnx, key, "item", nil}, state)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert {:ok, 1} = NIF.cuckoo_file_count(path, "item")
+        end
+
+        @tag :prob_mutation_replay
+        test "Cuckoo delete replay removes only the originally deleted occurrence", %{
+          state: state,
+          dir: dir
+        } do
+          key = "cuckoo_delete_same_raft_index_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
+          {state, :ok} = StateMachine.apply(%{}, {:cuckoo_create, key, 128, 4}, state)
+          {state, {:ok, 1}} = StateMachine.apply(%{}, {:cuckoo_add, key, "item", nil}, state)
+          {state, {:ok, 1}} = StateMachine.apply(%{}, {:cuckoo_add, key, "item", nil}, state)
+
+          Process.put(:sm_current_ra_index, 84)
+
+          try do
+            {state, {:ok, 1}} = StateMachine.apply(%{}, {:cuckoo_del, key, "item"}, state)
+            {_state, {:ok, 1}} = StateMachine.apply(%{}, {:cuckoo_del, key, "item"}, state)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert {:ok, 1} = NIF.cuckoo_file_count(path, "item")
+
+          assert {:ok, {_buckets, _bucket_size, _fp_size, 1, 1, _slots, _kicks}} =
+                   NIF.cuckoo_file_info(path)
+        end
+
+        @tag :prob_mutation_replay
+        test "TopK add replay at the same Raft index increments once", %{
+          state: state,
+          dir: dir
+        } do
+          key = "topk_add_same_raft_index_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "topk")
+          {state, :ok} = StateMachine.apply(%{}, {:topk_create, key, 4, 128, 4}, state)
+
+          Process.put(:sm_current_ra_index, 85)
+
+          try do
+            {state, [nil]} = StateMachine.apply(%{}, {:topk_add, key, ["item"]}, state)
+            {_state, [nil]} = StateMachine.apply(%{}, {:topk_add, key, ["item"]}, state)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert [1] = NIF.topk_file_count_v2(path, ["item"])
+        end
+
+        @tag :prob_mutation_replay
+        test "TopK incrby replay preserves the original eviction reply", %{
+          state: state,
+          dir: dir
+        } do
+          key = "topk_incrby_same_raft_index_replay"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "topk")
+          {state, :ok} = StateMachine.apply(%{}, {:topk_create, key, 1, 128, 4}, state)
+          {state, [nil]} = StateMachine.apply(%{}, {:topk_incrby, key, [{"first", 1}]}, state)
+
+          Process.put(:sm_current_ra_index, 86)
+
+          try do
+            {state, ["first"]} =
+              StateMachine.apply(%{}, {:topk_incrby, key, [{"second", 2}]}, state)
+
+            {_state, ["first"]} =
+              StateMachine.apply(%{}, {:topk_incrby, key, [{"second", 2}]}, state)
+          after
+            Process.delete(:sm_current_ra_index)
+          end
+
+          assert [2] = NIF.topk_file_count_v2(path, ["second"])
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "standalone COPY creates an independent probabilistic sidecar", %{
+          state: state,
+          dir: dir
+        } do
+          source = "transaction_prob_copy_source"
+          destination = "transaction_prob_copy_destination"
+          prob_dir = Path.join(dir, "prob")
+          source_path = Ferricstore.ProbFile.path(prob_dir, source, "cms")
+          destination_path = Ferricstore.ProbFile.path(prob_dir, destination, "cms")
+
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, source, 64, 4}, state)
+
+          {state, {:ok, [7]}} =
+            StateMachine.apply(%{}, {:cms_incrby, source, [{"item", 7}]}, state)
+
+          execute = fn store ->
+            Ferricstore.Commands.Generic.handle_ast({:copy, source, destination, false}, store)
+          end
+
+          assert {1, copied_state} = StateMachine.apply_standalone_cross_shard(execute, state)
+          assert {:ok, [7]} = NIF.cms_file_query(source_path, ["item"])
+          assert {:ok, [7]} = NIF.cms_file_query(destination_path, ["item"])
+          refute File.stat!(source_path).inode == File.stat!(destination_path).inode
+
+          {_, {:ok, [10]}} =
+            StateMachine.apply(%{}, {:cms_incrby, destination, [{"item", 3}]}, copied_state)
+
+          assert {:ok, [7]} = NIF.cms_file_query(source_path, ["item"])
+          assert {:ok, [10]} = NIF.cms_file_query(destination_path, ["item"])
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "standalone COPY REPLACE removes the old destination sidecar", %{
+          state: state,
+          dir: dir
+        } do
+          source = "transaction_prob_copy_replace_source"
+          destination = "transaction_prob_copy_replace_destination"
+          prob_dir = Path.join(dir, "prob")
+          source_path = Ferricstore.ProbFile.path(prob_dir, source, "cms")
+          destination_path = Ferricstore.ProbFile.path(prob_dir, destination, "cms")
+          old_destination_path = Ferricstore.ProbFile.path(prob_dir, destination, "bloom")
+
+          bloom_meta =
+            {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}
+
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, source, 64, 4}, state)
+
+          {state, {:ok, [9]}} =
+            StateMachine.apply(%{}, {:cms_incrby, source, [{"item", 9}]}, state)
+
+          {state, :ok} =
+            StateMachine.apply(%{}, {:bloom_create, destination, 128, 3, bloom_meta}, state)
+
+          {state, {:ok, 1}} =
+            StateMachine.apply(%{}, {:bloom_add, destination, "old", nil}, state)
+
+          execute = fn store ->
+            Ferricstore.Commands.Generic.handle_ast({:copy, source, destination, true}, store)
+          end
+
+          assert {1, _copied_state} = StateMachine.apply_standalone_cross_shard(execute, state)
+          assert File.exists?(source_path)
+          refute File.exists?(old_destination_path)
+          assert {:ok, [9]} = NIF.cms_file_query(destination_path, ["item"])
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "same-type COPY REPLACE discards the destination mutation receipt", %{
+          state: state,
+          dir: dir
+        } do
+          source = "transaction_prob_copy_receipt_source"
+          destination = "transaction_prob_copy_receipt_destination"
+          prob_dir = Path.join(dir, "prob")
+          source_path = Ferricstore.ProbFile.path(prob_dir, source, "cms")
+          destination_path = Ferricstore.ProbFile.path(prob_dir, destination, "cms")
+
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, source, 64, 4}, state)
+
+          {state, {:ok, [9]}} =
+            StateMachine.apply(%{}, {:cms_incrby, source, [{"item", 9}]}, state)
+
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, destination, 64, 4}, state)
+
+          {state, {:ok, [4]}} =
+            StateMachine.apply(%{}, {:cms_incrby, destination, [{"item", 4}]}, state)
+
+          assert File.regular?(source_path <> ".mutation")
+          assert File.regular?(destination_path <> ".mutation")
+
+          execute = fn store ->
+            Ferricstore.Commands.Generic.handle_ast({:copy, source, destination, true}, store)
+          end
+
+          assert {1, copied_state} = StateMachine.apply_standalone_cross_shard(execute, state)
+          refute File.exists?(destination_path <> ".mutation")
+
+          {_state, mutation_result} =
+            StateMachine.apply(%{}, {:cms_incrby, destination, [{"item", 1}]}, copied_state)
+
+          assert mutation_result == {:ok, [10]}
+
+          assert {:ok, [9]} = NIF.cms_file_query(source_path, ["item"])
+          assert {:ok, [10]} = NIF.cms_file_query(destination_path, ["item"])
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "failed standalone COPY rolls back its staged sidecar", %{state: state, dir: dir} do
+          source = "failed_transaction_prob_copy_source"
+          destination = "failed_transaction_prob_copy_destination"
+          prob_dir = Path.join(dir, "prob")
+          source_path = Ferricstore.ProbFile.path(prob_dir, source, "cms")
+          destination_path = Ferricstore.ProbFile.path(prob_dir, destination, "cms")
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, source, 64, 4}, state)
+
+          file_id = 9_500_000 + :erlang.unique_integer([:positive])
+          bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+          File.mkdir_p!(bad_active_path)
+          bad_state = %{state | active_file_id: file_id, active_file_path: bad_active_path}
+
+          execute = fn store ->
+            Ferricstore.Commands.Generic.handle_ast({:copy, source, destination, false}, store)
+          end
+
+          assert {:error, {:bitcask_append_failed, _reason}, _partial_state} =
+                   StateMachine.apply_standalone_cross_shard(execute, bad_state)
+
+          assert File.exists?(source_path)
+          refute File.exists?(destination_path)
+          refute File.exists?(destination_path <> ".pending-create")
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "standalone RENAME replay repairs publication without duplicating the sidecar", %{
+          state: state,
+          dir: dir
+        } do
+          source = "replayed_transaction_prob_rename_source"
+          destination = "replayed_transaction_prob_rename_destination"
+          prob_dir = Path.join(dir, "prob")
+          source_path = Ferricstore.ProbFile.path(prob_dir, source, "cms")
+          destination_path = Ferricstore.ProbFile.path(prob_dir, destination, "cms")
+          hook_count_key = {__MODULE__, :prob_rename_replay_fsync_count}
+          Process.put(hook_count_key, 0)
+
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, source, 64, 4}, state)
+
+          {state, {:ok, [11]}} =
+            StateMachine.apply(%{}, {:cms_incrby, source, [{"item", 11}]}, state)
+
+          execute = fn store ->
+            Ferricstore.Commands.Generic.handle_ast({:rename, source, destination}, store)
+          end
+
+          Process.put(:ferricstore_prob_fsync_dir_hook, fn
+            ^prob_dir ->
+              count = Process.get(hook_count_key, 0) + 1
+              Process.put(hook_count_key, count)
+              if count == 1, do: {:error, :eio}, else: :ok
+
+            _other_dir ->
+              :ok
+          end)
+
+          try do
+            assert {{:error,
+                     {:prob_sidecar_publish_failed, ^destination_path, _staged_path,
+                      {:fsync_dir_failed, :publish_prob_file, :eio}}}, failed_state} =
+                     StateMachine.apply_standalone_cross_shard(execute, state)
+
+            assert File.exists?(source_path)
+            assert File.exists?(destination_path)
+
+            assert {:ok, replayed_state} =
+                     StateMachine.apply_standalone_cross_shard(execute, failed_state)
+
+            refute File.exists?(source_path)
+            assert {:ok, [11]} = NIF.cms_file_query(destination_path, ["item"])
+            assert replayed_state.shard_index == state.shard_index
+          after
+            Process.delete(:ferricstore_prob_fsync_dir_hook)
+            Process.delete(hook_count_key)
+          end
+        end
+
+        @tag :prob_sidecar_lifecycle
+        test "failed standalone transaction replacement preserves probabilistic state", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "failed_transaction_prob_replacement"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+          original_entry = :ets.lookup(ets, key)
+          original_type_entry = :ets.lookup(ets, CompoundKey.type_key(key))
+
+          file_id = 9_400_000 + :erlang.unique_integer([:positive])
+          bad_active_path = Path.join(state.shard_data_path, "#{file_id}.log")
+          File.mkdir_p!(bad_active_path)
+          bad_state = %{state | active_file_id: file_id, active_file_path: bad_active_path}
+
+          execute = fn store ->
+            Ferricstore.Commands.Strings.replace_string_key(key, "string-value", 0, store)
+          end
+
+          assert {:error, {:bitcask_append_failed, _reason}, _partial_state} =
+                   StateMachine.apply_standalone_cross_shard(execute, bad_state)
+
+          assert File.exists?(path)
+          assert original_entry == :ets.lookup(ets, key)
+          assert original_type_entry == :ets.lookup(ets, CompoundKey.type_key(key))
+        end
+
+        @tag :prob_apply_ordering
+        test "Bloom create cannot replace an existing replicated filter", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "bloom_duplicate_create"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+
+          first_meta =
+            {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}
+
+          {state, :ok} =
+            StateMachine.apply(%{}, {:bloom_create, key, 128, 3, first_meta}, state)
+
+          assert {:ok, _added} = NIF.bloom_file_add(path, "keep-me")
+          original_entry = :ets.lookup(ets, key)
+          assert {:ok, original_info} = NIF.bloom_file_info(path)
+
+          second_meta =
+            {:bloom_meta, %{num_bits: 256, num_hashes: 4, capacity: 64, error_rate: 0.01}}
+
+          {_state, {:error, "ERR item exists"}} =
+            StateMachine.apply(%{}, {:bloom_create, key, 256, 4, second_meta}, state)
+
+          assert original_entry == :ets.lookup(ets, key)
+          assert {:ok, ^original_info} = NIF.bloom_file_info(path)
+          assert {:ok, 1} = NIF.bloom_file_exists(path, "keep-me")
+        end
+
+        @tag :prob_apply_ordering
+        test "CMS create cannot replace an existing replicated sketch", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "cms_duplicate_create"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cms")
+
+          {state, :ok} = StateMachine.apply(%{}, {:cms_create, key, 64, 4}, state)
+          assert {:ok, [7]} = NIF.cms_file_incrby(path, [{"keep-me", 7}])
+          original_entry = :ets.lookup(ets, key)
+          assert {:ok, original_info} = NIF.cms_file_info(path)
+
+          {_state, {:error, "ERR item already exists"}} =
+            StateMachine.apply(%{}, {:cms_create, key, 128, 4}, state)
+
+          assert original_entry == :ets.lookup(ets, key)
+          assert {:ok, ^original_info} = NIF.cms_file_info(path)
+          assert {:ok, [7]} = NIF.cms_file_query(path, ["keep-me"])
+        end
+
+        @tag :prob_apply_ordering
+        test "Cuckoo create cannot replace an existing replicated filter", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "cuckoo_duplicate_create"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
+
+          {state, :ok} = StateMachine.apply(%{}, {:cuckoo_create, key, 64, 4}, state)
+          assert {:ok, _added} = NIF.cuckoo_file_add(path, "keep-me")
+          original_entry = :ets.lookup(ets, key)
+          assert {:ok, original_info} = NIF.cuckoo_file_info(path)
+
+          {_state, {:error, "ERR item exists"}} =
+            StateMachine.apply(%{}, {:cuckoo_create, key, 128, 4}, state)
+
+          assert original_entry == :ets.lookup(ets, key)
+          assert {:ok, ^original_info} = NIF.cuckoo_file_info(path)
+          assert {:ok, 1} = NIF.cuckoo_file_exists(path, "keep-me")
+        end
+
+        @tag :prob_apply_ordering
+        test "TopK create cannot replace an existing replicated sketch", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "topk_duplicate_create"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "topk")
+
+          {state, :ok} = StateMachine.apply(%{}, {:topk_create, key, 10, 32, 4}, state)
+          assert [_evicted] = NIF.topk_file_add_v2(path, ["keep-me"])
+          assert [1] = NIF.topk_file_count_v2(path, ["keep-me"])
+          original_entry = :ets.lookup(ets, key)
+          original_info = NIF.topk_file_info_v2(path)
+
+          {_state, {:error, "ERR item already exists"}} =
+            StateMachine.apply(%{}, {:topk_create, key, 20, 32, 4}, state)
+
+          assert original_entry == :ets.lookup(ets, key)
+          assert ^original_info = NIF.topk_file_info_v2(path)
+          assert [1] = NIF.topk_file_count_v2(path, ["keep-me"])
+        end
+
+        @tag :prob_apply_ordering
+        test "Bloom auto-create cannot overwrite a string ordered before apply", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "bloom_stale_auto_create"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "bloom")
+          {state, :ok} = StateMachine.apply(%{}, {:put, key, "string-value", 0}, state)
+          original_entry = :ets.lookup(ets, key)
+
+          auto_params = %{
+            num_bits: 9586,
+            num_hashes: 7,
+            capacity: 1000,
+            error_rate: 0.01
+          }
+
+          {_state, {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}} =
+            StateMachine.apply(%{}, {:bloom_add, key, "item", auto_params}, state)
+
+          assert original_entry == :ets.lookup(ets, key)
+          refute File.exists?(path)
+        end
+
+        @tag :prob_apply_ordering
+        test "Cuckoo auto-create cannot overwrite a string ordered before apply", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          key = "cuckoo_stale_auto_create"
+          path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, "cuckoo")
+          {state, :ok} = StateMachine.apply(%{}, {:put, key, "string-value", 0}, state)
+          original_entry = :ets.lookup(ets, key)
+          auto_params = %{capacity: 1024, bucket_size: 4}
+
+          {_state, {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}} =
+            StateMachine.apply(%{}, {:cuckoo_addnx, key, "item", auto_params}, state)
+
+          assert original_entry == :ets.lookup(ets, key)
+          refute File.exists?(path)
+        end
+
+        @tag :prob_apply_ordering
+        test "probabilistic create commands reject a string at apply time", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          commands = [
+            {"bloom_create_over_string", "bloom",
+             {:bloom_create, "bloom_create_over_string", 128, 3,
+              {:bloom_meta, %{num_bits: 128, num_hashes: 3, capacity: 32, error_rate: 0.01}}}},
+            {"cms_create_over_string", "cms", {:cms_create, "cms_create_over_string", 64, 4}},
+            {"cuckoo_create_over_string", "cuckoo",
+             {:cuckoo_create, "cuckoo_create_over_string", 64, 4}},
+            {"topk_create_over_string", "topk",
+             {:topk_create, "topk_create_over_string", 10, 32, 4}}
+          ]
+
+          Enum.reduce(commands, state, fn {key, ext, command}, acc_state ->
+            {acc_state, :ok} =
+              StateMachine.apply(%{}, {:put, key, "string-value", 0}, acc_state)
+
+            original_entry = :ets.lookup(ets, key)
+
+            {next_state,
+             {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}} =
+              StateMachine.apply(%{}, command, acc_state)
+
+            assert original_entry == :ets.lookup(ets, key)
+            refute File.exists?(Ferricstore.ProbFile.path(Path.join(dir, "prob"), key, ext))
+            next_state
+          end)
+        end
+
         @tag :prob_command_validation
         test "Bloom create rejects malformed dimensions before side effects", %{
           state: state,
@@ -995,7 +2570,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           invalid_parameters = [
             {nil, 4},
             {0, 4},
-            {268_435_457, 4},
+            {1_073_741_825, 4},
             {1, nil},
             {1, 0},
             {1, 1},
@@ -1031,7 +2606,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             %{},
             %{capacity: nil, bucket_size: 4},
             %{capacity: 0, bucket_size: 4},
-            %{capacity: 268_435_457, bucket_size: 4},
+            %{capacity: 1_073_741_825, bucket_size: 4},
             %{capacity: 1, bucket_size: 0},
             %{capacity: 1, bucket_size: 1}
           ]
@@ -1126,6 +2701,31 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             next_state
           end)
 
+          refute File.exists?(Path.join(dir, "prob"))
+        end
+
+        @tag :prob_command_validation
+        test "CMS merge apply rejects excessive source and counter work before side effects", %{
+          state: state,
+          ets: ets,
+          dir: dir
+        } do
+          source_limited =
+            {:cms_merge, "source-limited-dst", List.duplicate("source", 129),
+             List.duplicate(1, 129), %{width: 1, depth: 1}}
+
+          work_limited =
+            {:cms_merge, "work-limited-dst", List.duplicate("source", 128),
+             List.duplicate(1, 128), %{width: 131_073, depth: 1}}
+
+          {state, {:error, :cms_merge_source_limit_exceeded}} =
+            StateMachine.apply(%{}, source_limited, state)
+
+          {state, {:ok, [{:error, :cms_merge_work_limit_exceeded}]}} =
+            StateMachine.apply(%{}, {:batch, [work_limited]}, state)
+
+          assert [] == :ets.lookup(ets, "source-limited-dst")
+          assert [] == :ets.lookup(ets, "work-limited-dst")
           refute File.exists?(Path.join(dir, "prob"))
         end
 

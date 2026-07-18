@@ -171,12 +171,13 @@ defmodule Ferricstore.Store.Shard.WritesTest do
     end
   end
 
-  test "file size inspection ignores nonnumeric filenames and numeric symlinks" do
+  test "file size inspection ignores noncanonical aliases, nonnumeric filenames, and symlinks" do
     dir =
       Path.join(System.tmp_dir!(), "writes_file_sizes_#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "00000.log"), "valid")
+    File.write!(Path.join(dir, "000000.log"), "alias")
     File.write!(Path.join(dir, "not-a-segment.log"), "noise")
 
     external =

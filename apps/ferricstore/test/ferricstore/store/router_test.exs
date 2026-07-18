@@ -92,6 +92,41 @@ defmodule Ferricstore.Store.RouterTest do
       assert {:error, "CROSSSLOT CMS.MERGE keys must hash to the same shard"} =
                Router.prob_write_route(ctx, cross_shard_command)
     end
+
+    test "probabilistic key lifecycle requires source and destination on one shard" do
+      slot_map =
+        0..(SlotMap.num_slots() - 1)
+        |> Enum.map(&rem(&1, 2))
+        |> List.to_tuple()
+
+      ctx = %FerricStore.Instance{slot_map: slot_map, shard_count: 2}
+      source = "prob-lifecycle-source"
+      source_shard = Router.shard_for(ctx, source)
+
+      same_shard_destination =
+        Enum.find_value(0..10_000, fn suffix ->
+          key = "prob-lifecycle-same-#{suffix}"
+          if Router.shard_for(ctx, key) == source_shard, do: key
+        end)
+
+      other_shard_destination =
+        Enum.find_value(0..10_000, fn suffix ->
+          key = "prob-lifecycle-other-#{suffix}"
+          if Router.shard_for(ctx, key) != source_shard, do: key
+        end)
+
+      assert {:ok, ^source, ^source_shard} =
+               Router.key_lifecycle_route(
+                 ctx,
+                 {:rename, source, same_shard_destination}
+               )
+
+      assert {:error, "CROSSSLOT Keys in request don't hash to the same slot"} =
+               Router.key_lifecycle_route(
+                 ctx,
+                 {:copy, source, other_shard_destination, false}
+               )
+    end
   end
 
   describe "shard_name/1" do

@@ -181,7 +181,7 @@ defmodule Ferricstore.Store.ShardAccountingTest do
 
       try do
         File.mkdir_p!(dir)
-        File.write!(Path.join(dir, "0.log"), :binary.copy("x", 100))
+        File.write!(Path.join(dir, "00000.log"), :binary.copy("x", 100))
         :ets.insert(keydir, {key, nil, 0, LFU.initial(), 0, 1, 0})
 
         stats = ShardFlush.compute_file_stats(dir, keydir)
@@ -207,12 +207,32 @@ defmodule Ferricstore.Store.ShardAccountingTest do
 
       try do
         File.mkdir_p!(dir)
-        File.write!(Path.join(dir, "0.log"), :binary.copy("x", 100))
+        File.write!(Path.join(dir, "00000.log"), :binary.copy("x", 100))
         :ets.insert(keydir, {key, nil, expired_at, LFU.initial(), 0, 1, 0})
 
         stats = ShardFlush.compute_file_stats(dir, keydir)
 
         assert stats[0] == {100, 100}
+      after
+        File.rm_rf(dir)
+        :ets.delete(keydir)
+      end
+    end
+
+    test "recomputed file_stats ignore noncanonical aliases of canonical segments" do
+      keydir = new_keydir()
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore-accounting-alias-#{System.unique_integer([:positive])}"
+        )
+
+      try do
+        File.mkdir_p!(dir)
+        File.write!(Path.join(dir, "000000.log"), "alias")
+
+        assert ShardFlush.compute_file_stats(dir, keydir) == %{}
       after
         File.rm_rf(dir)
         :ets.delete(keydir)

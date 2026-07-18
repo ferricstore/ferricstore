@@ -55,6 +55,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     topk_file_incrby_v2
     topk_file_query_v2
     topk_file_list_v2
+    topk_file_list_with_count
     topk_file_count_v2
     topk_file_info_v2
   )
@@ -68,6 +69,8 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     fs_ls
     fs_read_nofollow
     fs_copy_sync_nofollow
+    fs_copy_replace_sync_nofollow
+    fs_hard_link_replace_sync_nofollow
     fs_append_sync_nofollow
     fs_append_sync_nofollow_bounded
     fs_atomic_replace_nofollow

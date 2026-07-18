@@ -74,6 +74,64 @@ defmodule Ferricstore.Store.Shard.LogicalKeyIndexTest do
              LogicalKeyIndex.all_live(ctx.ordered, ctx.keydir, now, 1)
   end
 
+  @tag :prob_type_catalog
+  test "rebuild lets exact probabilistic markers override metadata value rows", ctx do
+    key = "catalog-prob"
+    metadata = Ferricstore.TermCodec.encode({:cms_meta, %{width: 32, depth: 4}})
+
+    :ets.insert(ctx.keydir, [
+      {key, metadata, 0, LFU.initial(), 0, 0, byte_size(metadata)},
+      {CompoundKey.type_key(key), "cms", 0, LFU.initial(), 0, byte_size(metadata), 3}
+    ])
+
+    assert :ok = LogicalKeyIndex.rebuild(ctx.ordered, ctx.slots, ctx.keydir)
+
+    assert [{^key, "cms", 0, _storage_key, _slot}] = :ets.lookup(ctx.ordered, key)
+
+    assert {:ok, {0, [^key]}} =
+             LogicalKeyIndex.scan_page(ctx.ordered, ctx.keydir, 0, 10, nil, "cms", HLC.now_ms())
+
+    assert {:ok, {0, []}} =
+             LogicalKeyIndex.scan_page(
+               ctx.ordered,
+               ctx.keydir,
+               0,
+               10,
+               nil,
+               "string",
+               HLC.now_ms()
+             )
+  end
+
+  @tag :logical_rebuild_single_pass
+  test "rebuild visits each keydir row once while preserving type precedence", ctx do
+    key = "single-pass-catalog"
+    metadata = Ferricstore.TermCodec.encode({:cms_meta, %{width: 32, depth: 4}})
+    keydir = :ets.new(:logical_key_index_ordered_keydir, [:ordered_set, :public])
+
+    :ets.insert(keydir, [
+      {key, metadata, 0, LFU.initial(), 0, 0, byte_size(metadata)},
+      {"plain-single-pass", "value", 0, LFU.initial(), 0, byte_size(metadata), 5},
+      {CompoundKey.type_key(key), CompoundKey.encode_prob_type(:cms, 11), 0, LFU.initial(), 0,
+       byte_size(metadata) + 5, 12}
+    ])
+
+    counter = :counters.new(1, [:atomics])
+
+    Process.put(:ferricstore_logical_key_rebuild_visit_hook, fn _storage_key ->
+      :counters.add(counter, 1, 1)
+    end)
+
+    try do
+      assert :ok = LogicalKeyIndex.rebuild(ctx.ordered, ctx.slots, keydir)
+    after
+      Process.delete(:ferricstore_logical_key_rebuild_visit_hook)
+    end
+
+    assert :counters.get(counter, 1) == 3
+    assert [{^key, "cms", 0, _storage_key, _slot}] = :ets.lookup(ctx.ordered, key)
+  end
+
   @tag :hlc_drift_guard
   test "rebuild keeps wall-live keys under an unsafe expiry context", ctx do
     key = "wall-live-logical-key"

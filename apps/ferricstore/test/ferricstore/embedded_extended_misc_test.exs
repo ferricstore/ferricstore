@@ -143,6 +143,33 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
     assert {:ok, nil} = FerricStore.get(destination)
   end
 
+  test "key transfer APIs preserve probabilistic sidecars through Raft" do
+    source = "prob:{key-lifecycle}:source"
+    copied = "prob:{key-lifecycle}:copied"
+    renamed = "prob:{key-lifecycle}:renamed"
+    occupied = "prob:{key-lifecycle}:occupied"
+
+    assert :ok = FerricStore.cms_initbydim(source, 64, 4)
+    assert {:ok, [7]} = FerricStore.cms_incrby(source, [{"item", 7}])
+    assert {:ok, "cms"} = FerricStore.type(source)
+
+    assert {:ok, true} = FerricStore.copy(source, copied)
+    assert {:ok, [7]} = FerricStore.cms_query(source, ["item"])
+    assert {:ok, [7]} = FerricStore.cms_query(copied, ["item"])
+
+    assert {:ok, [10]} = FerricStore.cms_incrby(copied, [{"item", 3}])
+    assert {:ok, [7]} = FerricStore.cms_query(source, ["item"])
+
+    assert :ok = FerricStore.rename(source, renamed)
+    assert {:ok, [7]} = FerricStore.cms_query(renamed, ["item"])
+    assert {:ok, "none"} = FerricStore.type(source)
+
+    assert :ok = FerricStore.set(occupied, "keep")
+    assert {:ok, false} = FerricStore.renamenx(renamed, occupied)
+    assert {:ok, [7]} = FerricStore.cms_query(renamed, ["item"])
+    assert {:ok, "keep"} = FerricStore.get(occupied)
+  end
+
   # ===========================================================================
   # TYPE / RANDOMKEY
   # ===========================================================================

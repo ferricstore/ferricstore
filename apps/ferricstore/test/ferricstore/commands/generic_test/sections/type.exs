@@ -78,6 +78,21 @@ defmodule Ferricstore.Commands.GenericTest.Sections.Type do
       end
 
       describe "RENAME" do
+        test "RENAME delegates replicated key lifecycle without reading locally" do
+          parent = self()
+
+          store = %{
+            get: fn _key -> flunk("replicated RENAME must not read outside Raft apply") end,
+            key_lifecycle: fn command ->
+              send(parent, {:key_lifecycle, command})
+              :ok
+            end
+          }
+
+          assert :ok = Generic.handle("RENAME", ["source", "destination"], store)
+          assert_receive {:key_lifecycle, {:rename, "source", "destination"}}
+        end
+
         test "RENAME renames key" do
           store = MockStore.make(%{"old" => {"v", 0}})
           assert :ok = Generic.handle("RENAME", ["old", "new"], store)
@@ -216,6 +231,21 @@ defmodule Ferricstore.Commands.GenericTest.Sections.Type do
       end
 
       describe "RENAMENX" do
+        test "RENAMENX returns its replicated lifecycle result" do
+          parent = self()
+
+          store = %{
+            get: fn _key -> flunk("replicated RENAMENX must not read outside Raft apply") end,
+            key_lifecycle: fn command ->
+              send(parent, {:key_lifecycle, command})
+              0
+            end
+          }
+
+          assert 0 = Generic.handle("RENAMENX", ["source", "destination"], store)
+          assert_receive {:key_lifecycle, {:renamenx, "source", "destination"}}
+        end
+
         test "RENAMENX returns 1 when destination doesn't exist" do
           store = MockStore.make(%{"old" => {"v", 0}})
           assert 1 == Generic.handle("RENAMENX", ["old", "new"], store)
@@ -276,6 +306,21 @@ defmodule Ferricstore.Commands.GenericTest.Sections.Type do
       end
 
       describe "COPY" do
+        test "COPY returns its replicated lifecycle result" do
+          parent = self()
+
+          store = %{
+            get: fn _key -> flunk("replicated COPY must not read outside Raft apply") end,
+            key_lifecycle: fn command ->
+              send(parent, {:key_lifecycle, command})
+              1
+            end
+          }
+
+          assert 1 = Generic.handle("COPY", ["source", "destination", "REPLACE"], store)
+          assert_receive {:key_lifecycle, {:copy, "source", "destination", true}}
+        end
+
         test "COPY copies value to new key" do
           store = MockStore.make(%{"src" => {"v", 0}})
           assert 1 == Generic.handle("COPY", ["src", "dst"], store)

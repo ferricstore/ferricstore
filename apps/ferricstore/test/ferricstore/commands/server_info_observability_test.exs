@@ -62,4 +62,27 @@ defmodule Ferricstore.Commands.ServerInfoObservabilityTest do
       :telemetry.detach(handler_id)
     end
   end
+
+  test "INFO bitcask counts only canonical regular segment and hint files", %{
+    root: root,
+    store: store
+  } do
+    shard_dir = Ferricstore.DataDir.shard_data_path(root, 0)
+    outside = Path.join(root, "outside.log")
+    File.mkdir_p!(shard_dir)
+    File.write!(Path.join(shard_dir, "00000.log"), "data")
+    File.write!(Path.join(shard_dir, "00000.hint"), "hint")
+    File.write!(Path.join(shard_dir, "0.log"), "alias")
+    File.write!(Path.join(shard_dir, "notes.log"), "unrelated")
+    File.write!(Path.join(shard_dir, "compact_0.log"), "temporary")
+    File.write!(outside, "outside")
+    File.ln_s!(outside, Path.join(shard_dir, "00001.log"))
+    File.ln_s!(outside, Path.join(shard_dir, "00001.hint"))
+
+    info = Server.handle("INFO", ["bitcask"], store)
+
+    assert info =~ "shard_0_data_file_count:1"
+    assert info =~ "shard_0_hint_file_count:1"
+    assert info =~ "shard_0_merge_candidates:0"
+  end
 end

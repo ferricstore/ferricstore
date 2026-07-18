@@ -8,8 +8,9 @@ defmodule Ferricstore.Store.Shard.Lifecycle.Shutdown do
 
   @spec do_terminate(term(), map()) :: :ok
   @doc false
-  def do_terminate(_reason, state) do
+  def do_terminate(reason, state) do
     t0 = System.monotonic_time(:microsecond)
+    recovery_required? = cross_shard_recovery_required?(reason)
 
     # Step 1: drain any in-flight async flush and flush remaining pending
     # writes synchronously to guarantee all data hits disk before exit.
@@ -29,6 +30,9 @@ defmodule Ferricstore.Store.Shard.Lifecycle.Shutdown do
     # can rebuild the keydir from hints instead of replaying the full log.
     hint_result =
       cond do
+        recovery_required? ->
+          {:error, :cross_shard_recovery_required}
+
         pending_flush_result != :ok ->
           {:error, :unflushed_pending_writes}
 
@@ -73,6 +77,11 @@ defmodule Ferricstore.Store.Shard.Lifecycle.Shutdown do
 
     :ok
   end
+
+  defp cross_shard_recovery_required?({:shutdown, {:standalone_cross_shard_owner_down, _reason}}),
+    do: true
+
+  defp cross_shard_recovery_required?(_reason), do: false
 
   defp shutdown_errors(pending_flush_result, hint_result, hint_dir_fsync_result, fsync_result) do
     []

@@ -45,6 +45,18 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           assert {:ok, [1, 1, 1]} = NIF.bloom_file_mexists(path, ["a", "b", "c"])
         end
 
+        @tag :bloom_work_admission
+        test "bloom_file_madd rejects excessive hash work before mutation" do
+          dir = make_prob_dir("nif_bloom_madd_work_limit")
+          path = Path.join(dir, "work-limit.bloom")
+          elements = Enum.map(1..129, &"item-#{&1}")
+
+          assert {:ok, :ok} = NIF.bloom_file_create(path, 1_048_576, 1_024)
+          assert {:error, reason} = NIF.bloom_file_madd(path, elements)
+          assert reason =~ "work limit"
+          assert {:ok, 0} = NIF.bloom_file_card(path)
+        end
+
         test "bloom_file_card returns correct count" do
           dir = make_prob_dir("nif_bloom_card")
           path = Path.join(dir, "card.bloom")
@@ -166,7 +178,7 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           assert :ok = NIF.cms_file_merge(dst, [], [])
         end
 
-        test "cms_file_merge where dst already has data" do
+        test "cms_file_merge overwrites data already in dst" do
           dir = make_prob_dir("nif_cms_merge_dst")
           dst = Path.join(dir, "dst.cms")
           src = Path.join(dir, "src.cms")
@@ -177,12 +189,13 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
           NIF.cms_file_incrby(dst, [{"item", 10}])
           NIF.cms_file_incrby(src, [{"item", 20}])
 
-          # Merge: dst += src * 1
           assert :ok = NIF.cms_file_merge(dst, [src], [1])
 
-          # Query: should be 10 + 20 = 30
           assert {:ok, [count]} = NIF.cms_file_query(dst, ["item"])
-          assert count >= 30
+          assert count == 20
+
+          assert :ok = NIF.cms_file_merge(dst, [src], [1])
+          assert {:ok, [20]} = NIF.cms_file_query(dst, ["item"])
         end
 
         test "cms_file_merge rejects counter overflow without mutating destination" do
@@ -193,12 +206,52 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
 
           assert {:ok, :ok} = NIF.cms_file_create(dst, 100, 5)
           assert {:ok, :ok} = NIF.cms_file_create(src, 100, 5)
-          assert {:ok, [^max_i64]} = NIF.cms_file_incrby(dst, [{"hot", max_i64}])
-          assert {:ok, [1]} = NIF.cms_file_incrby(src, [{"hot", 1}])
+          assert {:ok, [7]} = NIF.cms_file_incrby(dst, [{"hot", 7}])
+          assert {:ok, [^max_i64]} = NIF.cms_file_incrby(src, [{"hot", max_i64}])
 
-          assert {:error, reason} = NIF.cms_file_merge(dst, [src], [1])
+          assert {:error, reason} = NIF.cms_file_merge(dst, [src], [2])
           assert reason =~ "overflow"
-          assert {:ok, [^max_i64]} = NIF.cms_file_query(dst, ["hot"])
+          assert {:ok, [7]} = NIF.cms_file_query(dst, ["hot"])
+        end
+
+        test "cms_file_merge rejects negative results without mutating destination" do
+          dir = make_prob_dir("nif_cms_merge_negative")
+          dst = Path.join(dir, "dst.cms")
+          src = Path.join(dir, "src.cms")
+
+          assert {:ok, :ok} = NIF.cms_file_create(dst, 100, 5)
+          assert {:ok, :ok} = NIF.cms_file_create(src, 100, 5)
+          assert {:ok, [7]} = NIF.cms_file_incrby(dst, [{"hot", 7}])
+          assert {:ok, [5]} = NIF.cms_file_incrby(src, [{"hot", 5}])
+
+          assert {:error, reason} = NIF.cms_file_merge(dst, [src], [-1])
+          assert reason =~ "negative"
+          assert {:ok, [7]} = NIF.cms_file_query(dst, ["hot"])
+        end
+
+        test "cms_file_merge can use the destination as a source" do
+          dir = make_prob_dir("nif_cms_merge_self")
+          dst = Path.join(dir, "dst.cms")
+
+          assert {:ok, :ok} = NIF.cms_file_create(dst, 100, 5)
+          assert {:ok, [7]} = NIF.cms_file_incrby(dst, [{"hot", 7}])
+
+          assert :ok = NIF.cms_file_merge(dst, [dst], [2])
+          assert {:ok, [14]} = NIF.cms_file_query(dst, ["hot"])
+        end
+
+        @tag :cms_merge_admission
+        test "cms_file_merge rejects excessive sources before opening them" do
+          dir = make_prob_dir("nif_cms_merge_source_limit")
+          dst = Path.join(dir, "dst.cms")
+          missing_sources = List.duplicate(Path.join(dir, "missing.cms"), 129)
+
+          assert {:ok, :ok} = NIF.cms_file_create(dst, 1, 1)
+
+          assert {:error, reason} =
+                   NIF.cms_file_merge(dst, missing_sources, List.duplicate(1, 129))
+
+          assert reason =~ "at most 128 sources"
         end
 
         test "cuckoo_file_create and roundtrip" do
@@ -379,6 +432,16 @@ defmodule Ferricstore.ProbEdgeCasesTest.Sections.NifLevelEdgeCases do
 
           result = NIF.topk_file_list_v2(path)
           assert result == []
+        end
+
+        @tag :topk_atomic_list
+        test "topk_file_list_with_count returns items and CMS counts from one snapshot" do
+          dir = make_prob_dir("nif_topk_list_with_count")
+          path = Path.join(dir, "with-count.topk")
+
+          assert {:ok, :ok} = NIF.topk_file_create_v2(path, 5, 8, 7)
+          assert [nil, nil] = NIF.topk_file_incrby_v2(path, [{"a", 10}, {"b", 50}])
+          assert ["b", 50, "a", 10] = NIF.topk_file_list_with_count(path)
         end
 
         test "topk eviction returns correct evicted elements" do

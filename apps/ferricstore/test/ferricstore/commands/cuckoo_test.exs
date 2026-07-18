@@ -27,8 +27,22 @@ defmodule Ferricstore.Commands.CuckooTest do
     test "creates a new cuckoo filter with specified capacity" do
       store = ProbMockStore.make_cuckoo()
       assert :ok = Cuckoo.handle("CF.RESERVE", ["mycf", "1024"], store)
+
+      info = list_to_info_map(Cuckoo.handle("CF.INFO", ["mycf"], store))
+      assert info["Number of buckets"] == 256
+      assert info["Size"] == 1024
+
       # Verify filter works by adding an element
       assert 1 = Cuckoo.handle("CF.ADD", ["mycf", "test"], store)
+    end
+
+    test "rounds requested item capacity up to a whole bucket" do
+      store = ProbMockStore.make_cuckoo()
+      assert :ok = Cuckoo.handle("CF.RESERVE", ["cf", "5"], store)
+
+      info = list_to_info_map(Cuckoo.handle("CF.INFO", ["cf"], store))
+      assert info["Number of buckets"] == 2
+      assert info["Size"] == 8
     end
 
     test "uses key-specific probabilistic directory when available" do
@@ -411,7 +425,8 @@ defmodule Ferricstore.Commands.CuckooTest do
       assert is_list(result)
 
       info = list_to_info_map(result)
-      assert info["Number of buckets"] >= 1024
+      assert info["Number of buckets"] == 256
+      assert info["Size"] == 1024
       assert info["Number of items inserted"] == 1
       assert info["Number of items deleted"] == 0
       assert info["Bucket size"] >= 1
@@ -561,7 +576,8 @@ defmodule Ferricstore.Commands.CuckooTest do
       store = ProbMockStore.make_cuckoo()
       Cuckoo.handle("CF.ADD", ["cf", "hello"], store)
       info = list_to_info_map(Cuckoo.handle("CF.INFO", ["cf"], store))
-      assert info["Number of buckets"] == 1024
+      assert info["Number of buckets"] == 256
+      assert info["Size"] == 1024
     end
   end
 

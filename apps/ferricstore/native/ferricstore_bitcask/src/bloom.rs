@@ -3,7 +3,7 @@
 //! Each Bloom filter is stored as a file on disk. The file layout is:
 //!
 //! ```text
-//! [header: 32 bytes][bit array: ceil(num_bits / 8) bytes]
+//! [header: 32 bytes][bit array: ceil(num_bits / 8) bytes][mutation token: 16 bytes]
 //! ```
 //!
 //! Header (32 bytes, little-endian):
@@ -38,6 +38,7 @@ const HEADER_SIZE: usize = 32;
 const MAX_NUM_HASHES: u32 = 1024;
 const MAX_BLOOM_BYTES: u64 = 1 << 30;
 const MAX_BLOOM_BITS: u64 = MAX_BLOOM_BYTES * 8;
+const MAX_BLOOM_HASH_VISITS: usize = 131_072;
 
 // ---------------------------------------------------------------------------
 // NIF atoms
@@ -67,19 +68,268 @@ fn file_hash_positions(element: &[u8], num_bits: u64, num_hashes: u32) -> Vec<u6
 }
 
 fn bloom_file_size(num_bits: u64) -> Result<u64, String> {
+    bloom_mutation_token_offset(num_bits)?
+        .checked_add(crate::prob_txn::TOKEN_SIZE as u64)
+        .ok_or_else(|| "bloom file size overflow".into())
+}
+
+fn bloom_mutation_token_offset(num_bits: u64) -> Result<u64, String> {
     if num_bits > MAX_BLOOM_BITS {
         return Err(format!("bloom bit array exceeds {MAX_BLOOM_BYTES} bytes"));
     }
     let byte_count = num_bits.div_ceil(8);
     (HEADER_SIZE as u64)
         .checked_add(byte_count)
-        .ok_or_else(|| "bloom file size overflow".into())
+        .ok_or_else(|| "bloom mutation token offset overflow".into())
 }
 
 fn bloom_count_after_add(count: u64) -> Result<u64, String> {
     count
         .checked_add(1)
         .ok_or_else(|| "bloom count overflow".into())
+}
+
+fn validate_bloom_batch_work(item_count: usize, num_hashes: u32) -> Result<(), String> {
+    let visits = item_count
+        .checked_mul(num_hashes as usize)
+        .ok_or_else(|| "bloom batch work overflow".to_string())?;
+    if visits > MAX_BLOOM_HASH_VISITS {
+        return Err(format!(
+            "bloom batch work limit exceeded ({visits} hash visits, maximum {MAX_BLOOM_HASH_VISITS})"
+        ));
+    }
+    Ok(())
+}
+
+fn bloom_load_touched_bytes(
+    file: &File,
+    offsets: &[u64],
+    touched: &mut HashMap<u64, (u8, u8)>,
+) -> Result<(), String> {
+    let mut buffer = Vec::new();
+    let mut run_start = 0;
+
+    while run_start < offsets.len() {
+        let mut run_end = run_start + 1;
+        while run_end < offsets.len() && offsets[run_end] == offsets[run_end - 1] + 1 {
+            run_end += 1;
+        }
+
+        buffer.resize(run_end - run_start, 0);
+        bloom_read_exact_at(file, &mut buffer, offsets[run_start], "bit run")?;
+        for (&offset, &byte) in offsets[run_start..run_end].iter().zip(&buffer) {
+            touched.insert(offset, (byte, byte));
+        }
+        run_start = run_end;
+    }
+
+    Ok(())
+}
+
+fn bloom_store_touched_bytes(
+    file: &File,
+    offsets: &[u64],
+    touched: &HashMap<u64, (u8, u8)>,
+) -> Result<(), String> {
+    let mut buffer = Vec::new();
+    let mut run_start = 0;
+
+    while run_start < offsets.len() {
+        let mut run_end = run_start + 1;
+        while run_end < offsets.len() && offsets[run_end] == offsets[run_end - 1] + 1 {
+            run_end += 1;
+        }
+
+        let changed = offsets[run_start..run_end]
+            .iter()
+            .any(|offset| touched[offset].0 != touched[offset].1);
+        if changed {
+            buffer.clear();
+            buffer.extend(
+                offsets[run_start..run_end]
+                    .iter()
+                    .map(|offset| touched[offset].1),
+            );
+            crate::write_all_at(file, &buffer, offsets[run_start], "bloom bit run")?;
+        }
+        run_start = run_end;
+    }
+
+    Ok(())
+}
+
+fn bloom_encode_results(results: &[u32]) -> Result<Vec<u8>, String> {
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(results.len())
+        .map_err(|_| "bloom mutation result allocation failed".to_string())?;
+    for result in results {
+        match result {
+            0 => encoded.push(0),
+            1 => encoded.push(1),
+            _ => return Err("invalid bloom mutation result".into()),
+        }
+    }
+    Ok(encoded)
+}
+
+fn bloom_decode_results(encoded: &[u8], expected_count: usize) -> Result<Vec<u32>, String> {
+    if encoded.len() != expected_count {
+        return Err("bloom mutation receipt result length mismatch".into());
+    }
+    let mut results = Vec::new();
+    results
+        .try_reserve_exact(expected_count)
+        .map_err(|_| "bloom mutation result allocation failed".to_string())?;
+    for result in encoded {
+        match result {
+            0 => results.push(0),
+            1 => results.push(1),
+            _ => return Err("invalid bloom mutation receipt result".into()),
+        }
+    }
+    Ok(results)
+}
+
+fn bloom_stale_results(count: usize) -> Result<Vec<u32>, String> {
+    let mut results = Vec::new();
+    results
+        .try_reserve_exact(count)
+        .map_err(|_| "bloom mutation result allocation failed".to_string())?;
+    results.resize(count, 0);
+    Ok(results)
+}
+
+fn bloom_stage_transactional_madd(
+    env: Env<'_>,
+    file: &File,
+    num_bits: u64,
+    num_hashes: u32,
+    mut count: u64,
+    elements: &[&[u8]],
+) -> Result<(Vec<u32>, Vec<crate::prob_txn::AfterImage>), String> {
+    validate_bloom_batch_work(elements.len(), num_hashes)?;
+
+    let mut element_masks = Vec::new();
+    element_masks
+        .try_reserve_exact(elements.len())
+        .map_err(|_| "bloom batch allocation failed".to_string())?;
+    let mut touched = HashMap::new();
+    touched
+        .try_reserve(MAX_BLOOM_HASH_VISITS.min(elements.len() * num_hashes as usize))
+        .map_err(|_| "bloom batch allocation failed".to_string())?;
+
+    for element in elements {
+        let positions = file_hash_positions(element, num_bits, num_hashes);
+        let mut masks = Vec::new();
+        masks
+            .try_reserve_exact(positions.len())
+            .map_err(|_| "bloom batch allocation failed".to_string())?;
+        for position in positions {
+            let offset = HEADER_SIZE as u64 + position / 8;
+            let mask = 1_u8 << (position % 8) as u8;
+            touched.entry(offset).or_insert((0, 0));
+            masks.push((offset, mask));
+        }
+        element_masks.push(masks);
+    }
+
+    let mut offsets = touched.keys().copied().collect::<Vec<_>>();
+    offsets.sort_unstable();
+    bloom_load_touched_bytes(file, &offsets, &mut touched)?;
+
+    let mut results = Vec::new();
+    results
+        .try_reserve_exact(elements.len())
+        .map_err(|_| "bloom batch allocation failed".to_string())?;
+    for (index, masks) in element_masks.iter().enumerate() {
+        let mut any_new = false;
+        for (offset, mask) in masks {
+            let (_original, current) = touched.get_mut(offset).unwrap();
+            if (*current & mask) == 0 {
+                *current |= mask;
+                any_new = true;
+            }
+        }
+        if any_new {
+            count = bloom_count_after_add(count)?;
+        }
+        results.push(u32::from(any_new));
+        if index % YIELD_CHECK_INTERVAL == 0 && index > 0 {
+            let _ = consume_timeslice(env, 1);
+        }
+    }
+
+    let mut images = Vec::new();
+    images
+        .try_reserve_exact(offsets.len().saturating_add(1))
+        .map_err(|_| "bloom mutation journal allocation failed".to_string())?;
+    let mut run_start = 0;
+    while run_start < offsets.len() {
+        let mut run_end = run_start + 1;
+        while run_end < offsets.len() && offsets[run_end] == offsets[run_end - 1] + 1 {
+            run_end += 1;
+        }
+
+        let run = &offsets[run_start..run_end];
+        if run
+            .iter()
+            .any(|offset| touched[offset].0 != touched[offset].1)
+        {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(run.len())
+                .map_err(|_| "bloom mutation journal allocation failed".to_string())?;
+            bytes.extend(run.iter().map(|offset| touched[offset].1));
+            images.push(crate::prob_txn::AfterImage::new(run[0], bytes));
+        }
+        run_start = run_end;
+    }
+    if results.iter().any(|result| *result == 1) {
+        images.push(crate::prob_txn::AfterImage::new(
+            24,
+            count.to_le_bytes().to_vec(),
+        ));
+    }
+    Ok((results, images))
+}
+
+fn bloom_transactional_madd(
+    env: Env<'_>,
+    file: &File,
+    receipt_path: &Path,
+    num_bits: u64,
+    num_hashes: u32,
+    elements: &[&[u8]],
+    token: crate::prob_txn::MutationToken,
+) -> Result<Vec<u32>, String> {
+    let token_offset = bloom_mutation_token_offset(num_bits)?;
+    let file_size = bloom_file_size(num_bits)?;
+    match crate::prob_txn::begin(file, receipt_path, token, token_offset, file_size)? {
+        crate::prob_txn::MutationDecision::Replay(result) => {
+            bloom_decode_results(&result, elements.len())
+        }
+        crate::prob_txn::MutationDecision::Stale => bloom_stale_results(elements.len()),
+        crate::prob_txn::MutationDecision::Apply => {
+            let (current_bits, current_hashes, count) = file_read_header(file)?;
+            if current_bits != num_bits || current_hashes != num_hashes {
+                return Err("bloom layout changed while mutation lock was held".into());
+            }
+            let (results, images) =
+                bloom_stage_transactional_madd(env, file, num_bits, num_hashes, count, elements)?;
+            let encoded_result = bloom_encode_results(&results)?;
+            crate::prob_txn::commit(
+                file,
+                receipt_path,
+                token,
+                token_offset,
+                file_size,
+                images,
+                encoded_result,
+            )?;
+            Ok(results)
+        }
+    }
 }
 
 fn bloom_read_exact_at(
@@ -142,6 +392,18 @@ fn file_read_header(file: &File) -> Result<(u64, u32, u64), String> {
     }
 
     Ok((num_bits, num_hashes, count))
+}
+
+pub(crate) fn recover_sidecar(path: &Path) -> Result<(), String> {
+    let file = crate::open_random_rw_locked(path)
+        .map_err(|error| format!("open bloom sidecar for recovery: {error}"))?;
+    let (num_bits, _num_hashes, _count) = file_read_header(&file)?;
+    crate::prob_txn::recover(
+        &file,
+        path,
+        bloom_mutation_token_offset(num_bits)?,
+        bloom_file_size(num_bits)?,
+    )
 }
 
 /// Map an IO error to either `:enoent` atom or a string reason.
@@ -295,6 +557,48 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
     Ok((atoms::ok(), u32::from(any_new)).encode(env))
 }
 
+/// Add one element using a deterministic Raft mutation token.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn bloom_file_add_at<'a>(
+    env: Env<'a>,
+    path: String,
+    receipt_path: String,
+    element: Binary<'a>,
+    mutation_index: u64,
+    mutation_ordinal: u64,
+) -> NifResult<Term<'a>> {
+    let token = crate::prob_txn::MutationToken::new(mutation_index, mutation_ordinal);
+    if token == crate::prob_txn::MutationToken::ZERO {
+        return Ok((atoms::error(), "bloom mutation token must be non-zero").encode(env));
+    }
+    let path = Path::new(&path);
+    let file = match crate::open_random_rw_locked(path) {
+        Ok(file) => file,
+        Err(error) => return Ok(encode_file_error(env, map_io_error(&error))),
+    };
+    let (num_bits, num_hashes, _) = match file_read_header(&file) {
+        Ok(header) => header,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    let elements = [element.as_slice()];
+    match bloom_transactional_madd(
+        env,
+        &file,
+        Path::new(&receipt_path),
+        num_bits,
+        num_hashes,
+        &elements,
+        token,
+    ) {
+        Ok(results) => {
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok((atoms::ok(), results[0]).encode(env))
+        }
+        Err(error) => Ok((atoms::error(), error).encode(env)),
+    }
+}
+
 /// Add multiple elements to a bloom filter file via pread/pwrite.
 /// Returns `{:ok, [0|1, ...]}` with one result per element.
 /// Returns `{:error, :enoent}` if the file does not exist.
@@ -314,42 +618,55 @@ pub fn bloom_file_madd<'a>(
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
+    if let Err(e) = validate_bloom_batch_work(elements.len(), num_hashes) {
+        return Ok((atoms::error(), e).encode(env));
+    }
 
-    let mut results: Vec<u32> = Vec::with_capacity(elements.len());
-    let max_new_items = u64::try_from(elements.len()).unwrap_or(u64::MAX);
-    let overflow_possible = count.checked_add(max_new_items).is_none();
-    let mut pending_bits = if overflow_possible {
-        Some(HashMap::new())
-    } else {
-        None
-    };
+    let mut element_masks = Vec::new();
+    if element_masks.try_reserve_exact(elements.len()).is_err() {
+        return Ok((atoms::error(), "bloom batch allocation failed").encode(env));
+    }
+    let mut touched = HashMap::new();
+    if touched
+        .try_reserve(MAX_BLOOM_HASH_VISITS.min(elements.len() * num_hashes as usize))
+        .is_err()
+    {
+        return Ok((atoms::error(), "bloom batch allocation failed").encode(env));
+    }
 
-    for (i, element) in elements.iter().enumerate() {
+    for element in &elements {
         let positions = file_hash_positions(element.as_slice(), num_bits, num_hashes);
+        let mut masks = Vec::new();
+        if masks.try_reserve_exact(positions.len()).is_err() {
+            return Ok((atoms::error(), "bloom batch allocation failed").encode(env));
+        }
+        for pos in positions {
+            let offset = HEADER_SIZE as u64 + pos / 8;
+            let mask = 1u8 << (pos % 8) as u8;
+            touched.entry(offset).or_insert((0, 0));
+            masks.push((offset, mask));
+        }
+        element_masks.push(masks);
+    }
+
+    let mut offsets: Vec<u64> = touched.keys().copied().collect();
+    offsets.sort_unstable();
+    if let Err(e) = bloom_load_touched_bytes(&file, &offsets, &mut touched) {
+        return Ok((atoms::error(), e).encode(env));
+    }
+
+    let mut results: Vec<u32> = Vec::new();
+    if results.try_reserve_exact(elements.len()).is_err() {
+        return Ok((atoms::error(), "bloom batch allocation failed").encode(env));
+    }
+
+    for (i, masks) in element_masks.iter().enumerate() {
         let mut any_new = false;
 
-        for pos in positions {
-            let byte_index = pos / 8;
-            let bit_offset = (pos % 8) as u8;
-            let file_offset = HEADER_SIZE as u64 + byte_index;
-
-            let mut buf = [0u8; 1];
-            if let Err(e) = bloom_read_exact_at(&file, &mut buf, file_offset, "bit") {
-                return Ok((atoms::error(), e).encode(env));
-            }
-
-            let mask = 1u8 << bit_offset;
-            if let Some(pending_bits) = pending_bits.as_mut() {
-                let current = *pending_bits.entry(file_offset).or_insert(buf[0]);
-                if (current & mask) == 0 {
-                    pending_bits.insert(file_offset, current | mask);
-                    any_new = true;
-                }
-            } else if (buf[0] & mask) == 0 {
-                buf[0] |= mask;
-                if let Err(e) = crate::write_all_at(&file, &buf, file_offset, "bloom bit") {
-                    return Ok((atoms::error(), e).encode(env));
-                }
+        for (offset, mask) in masks {
+            let (_original, current) = touched.get_mut(offset).unwrap();
+            if (*current & mask) == 0 {
+                *current |= mask;
                 any_new = true;
             }
         }
@@ -367,12 +684,13 @@ pub fn bloom_file_madd<'a>(
         }
     }
 
-    if let Some(pending_bits) = pending_bits {
-        for (file_offset, byte) in pending_bits {
-            if let Err(e) = crate::write_all_at(&file, &[byte], file_offset, "bloom bit") {
-                return Ok((atoms::error(), e).encode(env));
-            }
-        }
+    if results.iter().all(|result| *result == 0) {
+        crate::fadvise_dontneed(&file, 0, 0);
+        return Ok((atoms::ok(), results).encode(env));
+    }
+
+    if let Err(e) = bloom_store_touched_bytes(&file, &offsets, &touched) {
+        return Ok((atoms::error(), e).encode(env));
     }
 
     // Write final count once after all additions.
@@ -387,6 +705,54 @@ pub fn bloom_file_madd<'a>(
 
     crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), results).encode(env))
+}
+
+/// Add multiple elements using a deterministic Raft mutation token.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn bloom_file_madd_at<'a>(
+    env: Env<'a>,
+    path: String,
+    receipt_path: String,
+    elements: Vec<Binary<'a>>,
+    mutation_index: u64,
+    mutation_ordinal: u64,
+) -> NifResult<Term<'a>> {
+    let token = crate::prob_txn::MutationToken::new(mutation_index, mutation_ordinal);
+    if token == crate::prob_txn::MutationToken::ZERO {
+        return Ok((atoms::error(), "bloom mutation token must be non-zero").encode(env));
+    }
+    let path = Path::new(&path);
+    let file = match crate::open_random_rw_locked(path) {
+        Ok(file) => file,
+        Err(error) => return Ok(encode_file_error(env, map_io_error(&error))),
+    };
+    let (num_bits, num_hashes, _) = match file_read_header(&file) {
+        Ok(header) => header,
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
+    };
+    let mut borrowed_elements = Vec::new();
+    if borrowed_elements.try_reserve_exact(elements.len()).is_err() {
+        return Ok((atoms::error(), "bloom mutation input allocation failed").encode(env));
+    }
+    for element in &elements {
+        borrowed_elements.push(element.as_slice());
+    }
+    match bloom_transactional_madd(
+        env,
+        &file,
+        Path::new(&receipt_path),
+        num_bits,
+        num_hashes,
+        &borrowed_elements,
+        token,
+    ) {
+        Ok(results) => {
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok((atoms::ok(), results).encode(env))
+        }
+        Err(error) => Ok((atoms::error(), error).encode(env)),
+    }
 }
 
 /// Check if an element may exist in a bloom filter file via pread.
@@ -408,7 +774,6 @@ pub fn bloom_file_exists<'a>(
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
-
     let positions = file_hash_positions(element.as_slice(), num_bits, num_hashes);
 
     for pos in positions {
@@ -450,6 +815,9 @@ pub fn bloom_file_mexists<'a>(
         Ok(h) => h,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
+    if let Err(e) = validate_bloom_batch_work(elements.len(), num_hashes) {
+        return Ok((atoms::error(), e).encode(env));
+    }
 
     let mut results: Vec<u32> = Vec::with_capacity(elements.len());
 
@@ -605,6 +973,7 @@ pub fn bloom_file_mexists_async<'a>(
             }
         })?;
         let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
+        validate_bloom_batch_work(elements_owned.len(), num_hashes)?;
         let mut results: Vec<u32> = Vec::with_capacity(elements_owned.len());
         for element in &elements_owned {
             let positions = file_hash_positions(element, num_bits, num_hashes);

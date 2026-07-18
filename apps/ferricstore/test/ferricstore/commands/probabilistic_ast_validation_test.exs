@@ -1,7 +1,17 @@
 defmodule Ferricstore.Commands.ProbabilisticAstValidationTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TDigest, TopK}
+  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, ProbParameters, TDigest, TopK}
+
+  test "CMS merge work is bounded by source descriptors and counter visits" do
+    assert :ok = ProbParameters.validate_cms_merge_work(128, 131_072, 1)
+
+    assert {:error, :cms_merge_source_limit_exceeded} =
+             ProbParameters.validate_cms_merge_work(129, 1, 1)
+
+    assert {:error, :cms_merge_work_limit_exceeded} =
+             ProbParameters.validate_cms_merge_work(128, 131_073, 1)
+  end
 
   test "BF.RESERVE validates types and native sizing limits before storage access" do
     parent = self()
@@ -44,7 +54,7 @@ defmodule Ferricstore.Commands.ProbabilisticAstValidationTest do
       prob_write: fn command -> send(parent, {:storage_access, :prob_write, command}) end
     }
 
-    for capacity <- [0, -1, "1024", 268_435_457] do
+    for capacity <- [0, -1, "1024", 1_073_741_825] do
       assert {:error, message} = Cuckoo.handle_ast({:cf_reserve, "key", capacity}, store)
       assert is_binary(message)
     end

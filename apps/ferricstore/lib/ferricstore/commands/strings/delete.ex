@@ -40,8 +40,10 @@ defmodule Ferricstore.Commands.Strings.Delete do
           {:error, _reason} = error -> error
         end
 
-      type_str ->
-        case delete_compound_key_data(key, type_str, compound_prefix(key, type_str), store) do
+      type_marker ->
+        type_str = CompoundKey.type_name(type_marker)
+
+        case delete_typed_key_data(key, type_str, store) do
           :ok -> true
           {:error, _reason} = error -> error
         end
@@ -65,6 +67,18 @@ defmodule Ferricstore.Commands.Strings.Delete do
   defp compound_prefix(key, "zset"), do: CompoundKey.zset_prefix(key)
   defp compound_prefix(key, "stream"), do: CompoundKey.stream_prefix(key)
   defp compound_prefix(_key, _unknown), do: nil
+
+  defp delete_typed_key_data(key, type, store)
+       when type in ["bloom", "cms", "cuckoo", "topk"] do
+    with :ok <- maybe_delete_prob_file(key, store),
+         :ok <- Ops.delete(store, key),
+         :ok <- TypeRegistry.delete_type(key, store) do
+      :ok
+    end
+  end
+
+  defp delete_typed_key_data(key, type, store),
+    do: delete_compound_key_data(key, type, compound_prefix(key, type), store)
 
   defp delete_plain_key_if_exists(key, store) do
     if Ops.exists?(store, key) do
@@ -124,6 +138,7 @@ defmodule Ferricstore.Commands.Strings.Delete do
 
   defp maybe_delete_prob_file(_key, %FerricStore.Instance{}), do: :ok
   defp maybe_delete_prob_file(_key, %Ferricstore.Store.LocalTxStore{}), do: :ok
+  defp maybe_delete_prob_file(_key, %{prob_file_lifecycle: :replicated}), do: :ok
   defp maybe_delete_prob_file(_key, %{prob_write: write_fn}) when is_function(write_fn), do: :ok
 
   defp maybe_delete_prob_file(key, store) when is_map(store) do

@@ -7,6 +7,7 @@ defmodule Ferricstore.Cluster.Manager.Target do
   alias Ferricstore.Cluster.TargetMarker
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.Cluster, as: RaftCluster
+  alias Ferricstore.Store.SegmentFilename
 
   @membership_operation_timeout_ms 5_000
   @target_log_probe_page_size 1_024
@@ -238,26 +239,46 @@ defmodule Ferricstore.Cluster.Manager.Target do
 
   def probe_target_log_files(target_node, shard_path, files) do
     Enum.reduce_while(files, {:ok, false}, fn file, {:ok, false} ->
-      if String.ends_with?(file, ".log") do
-        path = Path.join(shard_path, file)
+      case SegmentFilename.parse(file) do
+        {:ok, _file_id} ->
+          case probe_target_log_file(target_node, Path.join(shard_path, file)) do
+            {:ok, true} -> {:halt, {:ok, true}}
+            {:ok, false} -> {:cont, {:ok, false}}
+            {:error, _reason} = error -> {:halt, error}
+          end
 
-        case :erpc.call(target_node, __MODULE__, :bitcask_log_has_user_data, [path], 5_000) do
-          {:ok, true} ->
-            {:halt, {:ok, true}}
+        :skip ->
+          {:cont, {:ok, false}}
 
-          {:ok, false} ->
-            {:cont, {:ok, false}}
-
-          {:error, reason} ->
-            {:halt, {:error, {:target_data_probe_failed, target_node, {:scan, path, reason}}}}
-
-          other ->
-            {:halt, {:error, {:target_data_probe_failed, target_node, {:scan, path, other}}}}
-        end
-      else
-        {:cont, {:ok, false}}
+        {:error, reason} ->
+          {:halt, {:error, {:target_data_probe_failed, target_node, reason}}}
       end
     end)
+  end
+
+  defp probe_target_log_file(target_node, path) do
+    case target_lstat(target_node, path) do
+      {:ok, %{type: :regular}} ->
+        case :erpc.call(target_node, __MODULE__, :bitcask_log_has_user_data, [path], 5_000) do
+          {:ok, value} when is_boolean(value) ->
+            {:ok, value}
+
+          {:error, reason} ->
+            {:error, {:target_data_probe_failed, target_node, {:scan, path, reason}}}
+
+          other ->
+            {:error, {:target_data_probe_failed, target_node, {:scan, path, other}}}
+        end
+
+      {:ok, %{type: :symlink}} ->
+        {:error, {:target_data_probe_failed, target_node, {:symlink, path}}}
+
+      {:ok, _non_regular} ->
+        {:ok, false}
+
+      {:error, reason} ->
+        {:error, {:target_data_probe_failed, target_node, {:lstat, path, reason}}}
+    end
   end
 
   @doc false

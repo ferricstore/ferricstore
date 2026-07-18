@@ -44,6 +44,65 @@ defmodule Ferricstore.Store.ShardLifecycleInstanceContextTest do
     assert {:ok, "new"} = NIF.v2_pread_at(Path.join(shard_path, "100000.log"), offset)
   end
 
+  test "startup rejects duplicate segment ids encoded by noncanonical filenames" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_segment_alias_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Path.join(tmp, "shard_0")
+    File.mkdir_p!(shard_path)
+
+    on_exit(fn -> File.rm_rf!(tmp) end)
+
+    assert {:ok, _} =
+             NIF.v2_append_record(Path.join(shard_path, "00000.log"), "canonical", "value", 0)
+
+    assert {:ok, _} =
+             NIF.v2_append_record(Path.join(shard_path, "0.log"), "alias", "value", 0)
+
+    assert_raise RuntimeError, ~r/noncanonical_segment_filename/, fn ->
+      ShardLifecycle.discover_active_file(shard_path)
+    end
+  end
+
+  test "keydir recovery rejects noncanonical hint aliases before applying records" do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lifecycle_hint_alias_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Path.join(tmp, "shard_0")
+    File.mkdir_p!(shard_path)
+
+    keydir =
+      :ets.new(:"lifecycle_hint_alias_#{System.unique_integer([:positive])}", [:set, :public])
+
+    on_exit(fn ->
+      try do
+        :ets.delete(keydir)
+      rescue
+        _ -> :ok
+      end
+
+      File.rm_rf!(tmp)
+    end)
+
+    assert {:ok, _} =
+             NIF.v2_append_record(Path.join(shard_path, "00000.log"), "canonical", "value", 0)
+
+    File.write!(Path.join(shard_path, "00000.hint"), "canonical hint identity")
+    File.write!(Path.join(shard_path, "0.hint"), "duplicate hint identity")
+
+    assert_raise RuntimeError, ~r/noncanonical_hint_filename/, fn ->
+      ShardLifecycle.recover_keydir(shard_path, keydir, 0)
+    end
+
+    assert :ets.tab2list(keydir) == []
+  end
+
   test "recover_keydir ignores leftover compact temp logs" do
     tmp =
       Path.join(

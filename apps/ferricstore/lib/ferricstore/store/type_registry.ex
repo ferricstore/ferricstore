@@ -84,19 +84,20 @@ defmodule Ferricstore.Store.TypeRegistry do
           write_type_marker_created(redis_key, type_key, expected, store)
         end
 
-      ^expected ->
-        :ok
+      actual ->
+        if matching_type_marker?(actual, expected) do
+          :ok
+        else
+          case get_type(redis_key, store) do
+            {:error, {:storage_read_failed, _reason}} = failure ->
+              failure
 
-      _other_type ->
-        case get_type(redis_key, store) do
-          {:error, {:storage_read_failed, _reason}} = failure ->
-            failure
+            "none" ->
+              write_type_marker_created(redis_key, type_key, expected, store)
 
-          "none" ->
-            write_type_marker_created(redis_key, type_key, expected, store)
-
-          _live_type ->
-            {:error, @wrongtype_msg}
+            _live_type ->
+              {:error, @wrongtype_msg}
+          end
         end
     end
   end
@@ -119,11 +120,8 @@ defmodule Ferricstore.Store.TypeRegistry do
           write_type_marker_created(redis_key, type_key, expected, store)
         end
 
-      ^expected ->
-        :ok
-
-      _other_type ->
-        {:error, @wrongtype_msg}
+      actual ->
+        if matching_type_marker?(actual, expected), do: :ok, else: {:error, @wrongtype_msg}
     end
   end
 
@@ -181,8 +179,8 @@ defmodule Ferricstore.Store.TypeRegistry do
 
   @doc false
   @spec resolve_type_marker(binary(), binary(), map()) :: binary() | ReadResult.failure()
-  def resolve_type_marker(redis_key, type_str, store) do
-    live_type_or_none(redis_key, type_str, store)
+  def resolve_type_marker(redis_key, type_marker, store) do
+    live_type_or_none(redis_key, CompoundKey.type_name(type_marker), store)
   end
 
   defp plain_string_type(redis_key, store) do
@@ -297,14 +295,15 @@ defmodule Ferricstore.Store.TypeRegistry do
           :ok
         end
 
-      ^expected ->
-        :ok
-
-      _other_type ->
-        case get_type(redis_key, store) do
-          {:error, {:storage_read_failed, _reason}} = failure -> failure
-          "none" -> :ok
-          _live_type -> {:error, @wrongtype_msg}
+      actual ->
+        if matching_type_marker?(actual, expected) do
+          :ok
+        else
+          case get_type(redis_key, store) do
+            {:error, {:storage_read_failed, _reason}} = failure -> failure
+            "none" -> :ok
+            _live_type -> {:error, @wrongtype_msg}
+          end
         end
     end
   end
@@ -316,6 +315,10 @@ defmodule Ferricstore.Store.TypeRegistry do
     redis_key
     |> check_type(type, store)
     |> ReadResult.command_result()
+  end
+
+  defp matching_type_marker?(actual, expected) do
+    CompoundKey.type_name(actual) == expected
   end
 
   # Check if the store supports `exists?` — closure maps may omit it.
