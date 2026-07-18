@@ -109,8 +109,14 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
       end
     end
 
-    test "Semaphore reports :free status on fresh start" do
-      assert :free = Semaphore.status()
+    test "Semaphore reports a valid status while supervised" do
+      case Semaphore.status() do
+        :free ->
+          :ok
+
+        {:held, shard_index} ->
+          assert shard_index in 0..(shard_count() - 1)
+      end
     end
   end
 

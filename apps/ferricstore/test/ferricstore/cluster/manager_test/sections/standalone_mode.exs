@@ -64,17 +64,7 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
 
         test "node_status probes shards concurrently" do
           parent = self()
-
-          Process.put(:ferricstore_cluster_manager_node_status_members_hook, fn shard_idx,
-                                                                                _timeout ->
-            send(parent, {:membership_probe, shard_idx})
-            Process.sleep(80)
-            {:ok, [{:member, shard_idx}], {:leader, shard_idx}}
-          end)
-
-          on_exit(fn ->
-            Process.delete(:ferricstore_cluster_manager_node_status_members_hook)
-          end)
+          release_ref = make_ref()
 
           state = %{
             mode: :cluster,
@@ -88,23 +78,39 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
             shard_count: 4
           }
 
-          started_at = System.monotonic_time(:millisecond)
+          status_task =
+            Task.async(fn ->
+              Process.put(
+                :ferricstore_cluster_manager_node_status_members_hook,
+                fn shard_idx, _timeout ->
+                  send(parent, {:membership_probe_started, shard_idx, self()})
 
-          assert {:reply, status, ^state} =
-                   Manager.handle_call(
-                     {:node_status, 1_000},
-                     {self(), make_ref()},
-                     state
-                   )
+                  receive do
+                    {:release_membership_probe, ^release_ref} ->
+                      {:ok, [{:member, shard_idx}], {:leader, shard_idx}}
+                  end
+                end
+              )
 
-          elapsed_ms = System.monotonic_time(:millisecond) - started_at
+              Manager.handle_call(
+                {:node_status, 1_000},
+                {self(), make_ref()},
+                state
+              )
+            end)
 
-          assert elapsed_ms < 220
+          probe_pids =
+            for shard_idx <- 0..3 do
+              assert_receive {:membership_probe_started, ^shard_idx, probe_pid}, 1_000
+              probe_pid
+            end
+
+          Enum.each(probe_pids, fn probe_pid ->
+            send(probe_pid, {:release_membership_probe, release_ref})
+          end)
+
+          assert {:reply, status, ^state} = Task.await(status_task, 2_000)
           assert status.shards[3] == %{members: [{:member, 3}], leader: {:leader, 3}}
-
-          for shard_idx <- 0..3 do
-            assert_received {:membership_probe, ^shard_idx}
-          end
         end
 
         test "node_status/0 shard entries contain members and leader" do

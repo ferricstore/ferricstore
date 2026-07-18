@@ -234,6 +234,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   defp do_flush_all_keys(ctx) do
+    reset_hlc_drift()
     reset_server_auth_state()
     reset_memory_guard_pressure()
     reset_runtime_pressure_state()
@@ -280,6 +281,13 @@ defmodule Ferricstore.Test.ShardHelpers do
     Enum.each(0..(current_ctx.shard_count - 1), fn shard_index ->
       Ferricstore.Flow.LMDBWriter.Telemetry.clear_mirror_degraded(current_ctx, shard_index)
     end)
+  end
+
+  defp reset_hlc_drift do
+    case :persistent_term.get(:ferricstore_hlc_ref, nil) do
+      ref when is_reference(ref) -> :atomics.put(ref, 1, 0)
+      _missing -> :ok
+    end
   end
 
   def reset_server_auth_state do

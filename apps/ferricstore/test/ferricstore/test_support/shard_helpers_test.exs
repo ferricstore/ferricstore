@@ -4,6 +4,7 @@ defmodule Ferricstore.Test.ShardHelpersTest do
 
   alias Ferricstore.MemoryGuard
   alias Ferricstore.Flow.Governance.LimitCache
+  alias Ferricstore.HLC
   alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.{CompoundKey, DiskPressure, Promotion, Router}
@@ -163,6 +164,21 @@ defmodule Ferricstore.Test.ShardHelpersTest do
     for slot <- 1..original_ctx.shard_count do
       assert :atomics.get(degraded, slot) == 0
     end
+  end
+
+  test "flush_all_keys clears leaked HLC drift" do
+    ref = :persistent_term.get(:ferricstore_hlc_ref)
+    previous = :atomics.get(ref, 1)
+
+    on_exit(fn ->
+      :atomics.put(:persistent_term.get(:ferricstore_hlc_ref), 1, previous)
+    end)
+
+    :ok = HLC.update({System.os_time(:millisecond) + 2_000, 0})
+    assert HLC.drift_exceeded?()
+
+    assert :ok = ShardHelpers.flush_all_keys()
+    refute HLC.drift_exceeded?()
   end
 
   test "flush_all_keys returns only after the default Ra pipeline is apply-ready" do
