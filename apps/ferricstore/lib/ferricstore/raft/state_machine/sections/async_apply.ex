@@ -691,14 +691,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end
       end
 
-      defp normalize_zadd_score(score) when is_float(score) do
-        if score == score and score <= 1.7976931348623157e308 and
-             score >= -1.7976931348623157e308 do
-          {:ok, score}
-        else
-          {:error, :invalid_zadd_score}
-        end
-      end
+      defp normalize_zadd_score(score) when is_float(score), do: {:ok, score}
 
       defp normalize_zadd_score(score) when is_integer(score) do
         try do
