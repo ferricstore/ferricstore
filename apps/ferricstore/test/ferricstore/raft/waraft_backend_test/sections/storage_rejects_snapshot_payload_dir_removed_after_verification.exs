@@ -852,6 +852,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
                inspect(reason)
       end
 
+      @tag :snapshot_journal_cleanup_failure
       test "snapshot install journal cleanup failure restores previous storage metadata", %{
         root: root
       } do

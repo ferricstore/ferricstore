@@ -422,18 +422,43 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
           fn ->
             with :ok <- flush_apply_projection_snapshot_payload(handle),
                  :ok <-
-                   compact_apply_projection_log(
+                   compact_snapshot_apply_projection_log(
                      root_dir,
                      ctx,
                      shard_index,
                      apply_projection_snapshot_trim_index(position),
-                     snapshot_flow_lmdb_path(snapshot_path)
+                     snapshot_path
                    ),
                  :ok <- copy_storage_dirs_to_snapshot(snapshot_path, handle) do
               :ok
             end
           end
         )
+      end
+
+      defp compact_snapshot_apply_projection_log(
+             root_dir,
+             ctx,
+             shard_index,
+             trim_index,
+             snapshot_path
+           ) do
+        lmdb_path = snapshot_flow_lmdb_path(snapshot_path)
+
+        result =
+          compact_apply_projection_log(root_dir, ctx, shard_index, trim_index, lmdb_path)
+
+        case {result, FlowLMDB.release(lmdb_path)} do
+          {result, :ok} ->
+            result
+
+          {:ok, {:error, reason}} ->
+            {:error, {:release_snapshot_flow_lmdb_failed, reason}}
+
+          {{:error, compaction_reason}, {:error, release_reason}} ->
+            {:error,
+             {:compact_and_release_snapshot_flow_lmdb_failed, compaction_reason, release_reason}}
+        end
       end
 
       defp snapshot_flow_lmdb_path(snapshot_path),
