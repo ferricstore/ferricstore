@@ -508,6 +508,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.RestartRecoversMissingCurr
                  {:ok, "dedicated-payload"}
       end
 
+      @tag :snapshot_segment_projection_install
       test "snapshot install persists installed segment projection across restart", %{root: root} do
         source_root = Path.join(root, "projection-source")
         target_root = Path.join(root, "projection-target")

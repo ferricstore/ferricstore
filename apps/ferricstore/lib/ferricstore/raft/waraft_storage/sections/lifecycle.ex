@@ -528,7 +528,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Lifecycle do
               handle.shard_index,
               Map.get(metadata, :apply_context)
             )
-            |> apply_segment_projection_entries(projection_source, segment_projection_entries)
+            |> replace_with_segment_projection(projection_source, segment_projection_entries)
+            |> rebuild_indexes_from_segment_keydir(handle.ctx, handle.shard_index)
 
           new_handle =
             handle

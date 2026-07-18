@@ -513,6 +513,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.StorageRejectsSnapshotPayl
                  Ferricstore.Raft.WARaftStorage.open_snapshot(snapshot_path, position, handle)
       end
 
+      @tag :snapshot_payload_scan_failure
       test "snapshot creation fails closed when copied payload emptiness cannot be scanned", %{
         root: root
       } do

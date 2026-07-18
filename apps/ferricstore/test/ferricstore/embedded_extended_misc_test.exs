@@ -143,7 +143,8 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
     assert {:ok, nil} = FerricStore.get(destination)
   end
 
-  test "key transfer APIs preserve probabilistic sidecars through Raft" do
+  @tag :prob_key_lifecycle_restart
+  test "probabilistic key transfers stay deleted across FLUSHDB restart" do
     source = "prob:{key-lifecycle}:source"
     copied = "prob:{key-lifecycle}:copied"
     renamed = "prob:{key-lifecycle}:renamed"
@@ -168,6 +169,17 @@ defmodule Ferricstore.EmbeddedExtendedMiscTest do
     assert {:ok, false} = FerricStore.renamenx(renamed, occupied)
     assert {:ok, [7]} = FerricStore.cms_query(renamed, ["item"])
     assert {:ok, "keep"} = FerricStore.get(occupied)
+
+    ctx = FerricStore.Instance.get(:default)
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, renamed)
+    marker_key = Ferricstore.Store.CompoundKey.type_key(renamed)
+
+    assert :ok = Ferricstore.Test.ShardHelpers.flush_all_keys()
+    assert [] = :ets.lookup(elem(ctx.keydir_refs, shard_index), marker_key)
+    assert :ok = Ferricstore.Raft.WARaftBackend.stop()
+    assert :ok = Ferricstore.Raft.WARaftBackend.start(ctx)
+    assert :ok = Ferricstore.Test.ShardHelpers.wait_default_pipeline_ready()
+    assert {:ok, "none"} = FerricStore.type(renamed)
   end
 
   # ===========================================================================

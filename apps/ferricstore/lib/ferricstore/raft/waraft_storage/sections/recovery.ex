@@ -183,10 +183,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           shard_data_path
         )
 
-        # Bitcask recovery is not authoritative until segment projection and WAL
-        # replay finish, so exact orphan cleanup must wait for the rebuilt keydir.
-        ShardLifecycle.validate_prob_files(shard_data_path, shard_index)
-
         {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, shard_index)
         ensure_ets_table!(zset_score_index, :ordered_set)
         ensure_ets_table!(zset_score_lookup, :set)
@@ -335,7 +331,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
         case read_segment_projection_log(projection_root) do
           {:ok, projection} ->
             with {:ok, entries} <- validate_segment_projection_entries(projection) do
-              {:ok, apply_segment_projection_entries(sm_state, projection_root, entries),
+              {:ok, replace_with_segment_projection(sm_state, projection_root, entries),
                position_index(projection.position),
                max_raft_position(metadata_position, projection.position)}
             end
@@ -346,6 +342,47 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           {:error, reason} ->
             {:error, reason}
         end
+      end
+
+      defp replace_with_segment_projection(sm_state, projection_source, entries) do
+        sm_state
+        |> reset_segment_projection_base()
+        |> apply_segment_projection_entries(projection_source, entries)
+        |> retain_projected_promoted_instances()
+      end
+
+      defp reset_segment_projection_base(
+             %{instance_ctx: ctx, shard_index: shard_index, ets: keydir} = sm_state
+           ) do
+        reset_keydir!(ctx, shard_index, keydir)
+        _ = CompoundMemberIndex.reset(Map.get(sm_state, :compound_member_index_name))
+
+        _ =
+          LogicalKeyIndex.reset(
+            Map.get(sm_state, :logical_key_index_name),
+            Map.get(sm_state, :logical_key_slots_name)
+          )
+
+        _ = ZSetIndex.reset(sm_state)
+
+        _ =
+          Ferricstore.Flow.NativeOrderedIndex.reset(
+            Map.get(sm_state, :flow_index_name),
+            Map.get(sm_state, :flow_lookup_name)
+          )
+
+        Map.put(sm_state, :flow_due_catalog, Ferricstore.Flow.DueCatalog.new())
+      end
+
+      defp retain_projected_promoted_instances(%{ets: keydir} = sm_state) do
+        promoted_instances =
+          sm_state
+          |> Map.get(:promoted_instances, %{})
+          |> Map.filter(fn {redis_key, _promoted} ->
+            :ets.member(keydir, Promotion.marker_key(redis_key))
+          end)
+
+        Map.put(sm_state, :promoted_instances, promoted_instances)
       end
 
       defp segment_recovery_target_position(_root_dir, metadata, base_position) do

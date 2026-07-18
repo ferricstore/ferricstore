@@ -448,7 +448,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
         result =
           compact_apply_projection_log(root_dir, ctx, shard_index, trim_index, lmdb_path)
 
-        case {result, FlowLMDB.release(lmdb_path)} do
+        release_result =
+          if FlowLMDB.env_present?(lmdb_path), do: FlowLMDB.release(lmdb_path), else: :ok
+
+        case {result, release_result} do
           {result, :ok} ->
             result
 

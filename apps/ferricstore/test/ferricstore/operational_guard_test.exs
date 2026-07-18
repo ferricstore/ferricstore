@@ -4,6 +4,7 @@ defmodule Ferricstore.OperationalGuardTest do
 
   alias Ferricstore.Flow.Admission
   alias Ferricstore.OperationalGuard
+  alias Ferricstore.Test.Eventually
   alias Ferricstore.Test.Utils
 
   setup do
@@ -368,9 +369,12 @@ defmodule Ferricstore.OperationalGuardTest do
     )
 
     assert_receive {:memory_pressure, :panic}
-    assert Admission.reject_new_creates?()
-    assert Admission.status().reason == :rss_pressure
-    assert OperationalGuard.reject_flow_creates?()
+
+    Eventually.assert_eventually(fn ->
+      assert Admission.reject_new_creates?()
+      assert Admission.status().reason == :rss_pressure
+      assert OperationalGuard.reject_flow_creates?()
+    end)
   end
 
   test "rss pressure reclaims idle LMDB mmap cache" do
