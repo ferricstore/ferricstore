@@ -242,7 +242,11 @@ defmodule Ferricstore.Store.Shard.Startup do
           raft? = false
 
           profile_startup_phase(index, :validate_prob_files, fn ->
-            ShardLifecycle.validate_prob_files(path, index, keydir)
+            unless raft_projection_owner?(ctx) do
+              ShardLifecycle.validate_prob_files(path, index, keydir)
+            end
+
+            :ok
           end)
 
           # Publish active file metadata to ActiveFile registry

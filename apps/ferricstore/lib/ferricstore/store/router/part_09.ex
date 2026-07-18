@@ -913,7 +913,15 @@ defmodule Ferricstore.Store.Router.Part09 do
       end
 
       defp delete_expired_logical_entry(ctx, shard_index, keydir, observed_entry) do
-        _deleted = delete_observed_keydir_entry(ctx, shard_index, keydir, observed_entry)
+        _deleted =
+          delete_observed_keydir_entry(
+            ctx,
+            shard_index,
+            keydir,
+            observed_entry,
+            false
+          )
+
         :ok
       end
 

@@ -928,6 +928,8 @@ mod retired_store_architecture_tests {
 #[cfg(test)]
 mod lmdb_cache_tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
 
     #[cfg(unix)]
     #[test]
@@ -959,5 +961,55 @@ mod lmdb_cache_tests {
             flags.contains(heed::EnvFlags::NO_READ_AHEAD),
             "startup prefix scans should not force the OS to fault huge LMDB files into RSS"
         );
+    }
+
+    #[test]
+    fn lmdb_release_waits_for_an_acquired_store_lease() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("leased-db");
+        let path_string = path.to_str().unwrap().to_owned();
+        let store = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
+
+        let mut wtxn = store.env.write_txn().unwrap();
+        store.db.put(&mut wtxn, b"key", b"value").unwrap();
+        wtxn.commit().unwrap();
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(store);
+        });
+
+        acquired_rx.recv().unwrap();
+        let cache_key = std::fs::canonicalize(&path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let stores = LMDB_STORES.get().unwrap();
+
+        {
+            let mut guard = stores.lock().unwrap();
+            assert_eq!(
+                release_lmdb_cache_entry(&mut guard, &cache_key),
+                LmdbCacheRelease::Busy(1)
+            );
+        }
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        {
+            let mut guard = stores.lock().unwrap();
+            assert_eq!(
+                release_lmdb_cache_entry(&mut guard, &cache_key),
+                LmdbCacheRelease::Released(1)
+            );
+        }
+
+        let reopened = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
+        let rtxn = reopened.env.read_txn().unwrap();
+        assert_eq!(reopened.db.get(&rtxn, b"key").unwrap(), Some(b"value".as_slice()));
     }
 }

@@ -2,6 +2,7 @@ defmodule Ferricstore.Raft.WARaftStorageExpiryContextTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Raft.WARaftStorage
+  alias Ferricstore.Raft.ApplyContext
   alias Ferricstore.Store.LFU
 
   setup do
@@ -76,7 +77,12 @@ defmodule Ferricstore.Raft.WARaftStorageExpiryContextTest do
 
     state =
       WARaftStorage.__apply_segment_projection_entries_for_test__(
-        %{ets: keydir, shard_index: 0, instance_ctx: nil},
+        %{
+          ets: keydir,
+          shard_index: 0,
+          instance_ctx: nil,
+          apply_context: ApplyContext.new([])
+        },
         :snapshot_restore,
         [{key, value, expire_at_ms}]
       )

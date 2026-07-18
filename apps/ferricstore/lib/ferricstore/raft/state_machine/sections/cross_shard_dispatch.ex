@@ -1242,6 +1242,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           {:error, :limit_exceeded} ->
             {:error, :limit_exceeded}
 
+          {:error, reason} ->
+            {:error, reason}
+
           :unavailable ->
             {:error, :compound_member_index_unavailable}
         end
@@ -2450,6 +2453,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
                 })
 
               {:error, reason} ->
+                record_state_read_failure(reason)
                 throw({:transaction_store_failure, reason})
             end
           end,
@@ -2469,6 +2473,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
                 })
 
               {:error, reason} ->
+                record_state_read_failure(reason)
                 throw({:transaction_store_failure, reason})
             end
           end,

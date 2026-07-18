@@ -18,6 +18,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
   alias Ferricstore.HLC
   alias Ferricstore.Raft.StateMachine
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
 
   # ---------------------------------------------------------------------------
   # Setup: create a temporary Bitcask store, ETS tables, and reset HLC
@@ -283,6 +284,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
         ets,
         {field_key, nil, 0, Ferricstore.Store.LFU.initial(), 0, offset, value_size}
       )
+
+      CompoundMemberIndex.put(state.compound_member_index_name, field_key)
 
       replacement = {field_key, "new-value", 0, Ferricstore.Store.LFU.initial(), 0, 0, 9}
 
@@ -612,6 +615,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       field_entry = {field_key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
       :ets.insert(ets, {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
       :ets.insert(ets, field_entry)
+      CompoundMemberIndex.put(state.compound_member_index_name, field_key, 31_000)
 
       {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("HGETALL", [redis_key])
       {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
@@ -635,6 +639,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       field_entry = {field_key, "value", 31_000, Ferricstore.Store.LFU.initial(), 0, 0, 5}
       :ets.insert(ets, {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
       :ets.insert(ets, field_entry)
+      CompoundMemberIndex.put(state.compound_member_index_name, field_key, 31_000)
 
       {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("HLEN", [redis_key])
       {:ok, execution_entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
@@ -1109,6 +1114,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
       field_entry = {field_key, "value", :invalid, Ferricstore.Store.LFU.initial(), 0, 0, 5}
       :ets.insert(ets, {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+      :ets.insert(ets, {field_key, "value", 0, Ferricstore.Store.LFU.initial(), 0, 0, 5})
+      CompoundMemberIndex.put(state.compound_member_index_name, field_key)
       :ets.insert(ets, field_entry)
 
       {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("HGETALL", [redis_key])
@@ -1117,7 +1124,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
 
       assert result ==
-               {:error, {:state_read_failed, {:invalid_keydir_entry, field_key, field_entry}}}
+               {:error, {:state_read_failed, {:invalid_keydir_entry, field_key, [field_entry]}}}
 
       assert :ets.lookup(ets, field_key) == [field_entry]
     end
@@ -1131,6 +1138,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       field_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, "field")
       field_entry = {field_key, "value", :invalid, Ferricstore.Store.LFU.initial(), 0, 0, 5}
       :ets.insert(ets, {type_key, "hash", 0, Ferricstore.Store.LFU.initial(), 0, 0, 4})
+      :ets.insert(ets, {field_key, "value", 1, Ferricstore.Store.LFU.initial(), 0, 0, 5})
+      CompoundMemberIndex.put(state.compound_member_index_name, field_key, 1)
       :ets.insert(ets, field_entry)
 
       {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare("HLEN", [redis_key])
@@ -1139,7 +1148,10 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       {_new_state, result} = StateMachine.apply(%{}, wrapped, state)
 
       assert result ==
-               {:error, {:state_read_failed, {:invalid_keydir_entry, field_key, field_entry}}}
+               {:error,
+                {:state_read_failed,
+                 {:invalid_indexed_member, field_key,
+                  {:invalid_keydir_entry, field_key, [field_entry]}}}}
 
       assert :ets.lookup(ets, field_key) == [field_entry]
     end

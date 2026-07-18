@@ -183,7 +183,9 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           shard_data_path
         )
 
-        ShardLifecycle.validate_prob_files(shard_data_path, shard_index, keydir)
+        # Bitcask recovery is not authoritative until segment projection and WAL
+        # replay finish, so exact orphan cleanup must wait for the rebuilt keydir.
+        ShardLifecycle.validate_prob_files(shard_data_path, shard_index)
 
         {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, shard_index)
         ensure_ets_table!(zset_score_index, :ordered_set)

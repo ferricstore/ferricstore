@@ -209,6 +209,23 @@ fn lmdb_store_cell_busy(cell: &Arc<LmdbStoreCell>) -> bool {
             .is_some_and(|store| Arc::strong_count(store) > 1)
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum LmdbCacheRelease {
+    Busy(usize),
+    Released(usize),
+}
+
+fn release_lmdb_cache_entry(
+    stores: &mut std::collections::HashMap<String, Arc<LmdbStoreCell>>,
+    cache_key: &str,
+) -> LmdbCacheRelease {
+    if stores.get(cache_key).is_some_and(lmdb_store_cell_busy) {
+        LmdbCacheRelease::Busy(1)
+    } else {
+        LmdbCacheRelease::Released(usize::from(stores.remove(cache_key).is_some()))
+    }
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn lmdb_get<'a>(env: Env<'a>, path: String, key: Binary<'a>, map_size: u64) -> NifResult<Term<'a>> {
@@ -764,15 +781,10 @@ fn lmdb_release<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
         Err(_) => return Ok((atoms::error(), "lmdb cache poisoned").encode(env)),
     };
 
-    if guard
-        .get(&cache_key)
-        .is_some_and(lmdb_store_cell_busy)
-    {
-        return Ok((atoms::busy(), 1usize).encode(env));
+    match release_lmdb_cache_entry(&mut guard, &cache_key) {
+        LmdbCacheRelease::Busy(count) => Ok((atoms::busy(), count).encode(env)),
+        LmdbCacheRelease::Released(count) => Ok((atoms::ok(), count).encode(env)),
     }
-
-    let released = usize::from(guard.remove(&cache_key).is_some());
-    Ok((atoms::ok(), released).encode(env))
 }
 
 fn lmdb_write_batch_impl<'a>(

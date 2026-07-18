@@ -593,7 +593,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
       end
     end
 
-    test "runtime log stat failures preserve fragmentation for retry" do
+    test "symlinked log files are ignored without scheduling a retry" do
       data_dir =
         Path.join(
           System.tmp_dir!(),
@@ -622,18 +622,21 @@ defmodule Ferricstore.Merge.SchedulerTest do
 
       try do
         GenServer.cast(pid, {:fragmentation, [0], 2})
+        _state_after_cast = :sys.get_state(pid)
 
         ShardHelpers.eventually(
           fn ->
             state = :sys.get_state(pid)
-            not state.merging and is_reference(state.retry_ref)
+
+            not state.merging and is_nil(state.retry_ref) and
+              state.fragmentation_candidates == []
           end,
-          "failed log stat did not schedule a retry",
+          "symlinked log file was not rejected as a non-regular entry",
           20,
           10
         )
 
-        assert GenServer.call(pid, :status).fragmentation_candidates == [0]
+        assert GenServer.call(pid, :status).fragmentation_candidates == []
       after
         if Process.alive?(pid), do: GenServer.stop(pid)
         if Process.alive?(semaphore), do: GenServer.stop(semaphore)

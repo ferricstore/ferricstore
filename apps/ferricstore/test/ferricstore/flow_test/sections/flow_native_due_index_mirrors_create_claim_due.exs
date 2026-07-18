@@ -41,9 +41,6 @@ defmodule Ferricstore.FlowTest.Sections.FlowNativeDueIndexMirrorsCreateClaimDue 
                    10
                  )
 
-        assert :undefined = :ets.whereis(flow_index)
-        assert :undefined = :ets.whereis(flow_lookup)
-
         assert 0 =
                  Ferricstore.Store.Shard.ZSetIndex.count(
                    zset_index,

@@ -494,10 +494,11 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
             {"batch_topk_create_fail", {:topk_create, "batch_topk_create_fail", 10, 8, 7}}
           ]
 
-          {_state, {:ok, results}} =
+          apply_result =
             StateMachine.apply(%{}, {:batch, Enum.map(commands, &elem(&1, 1))}, state)
 
-          assert Enum.all?(results, &match?({:error, _}, &1))
+          assert {:error, reason} = apply_result_value(apply_result)
+          assert Ferricstore.Raft.ApplyFailure.storage_reason?(reason)
 
           for {key, _cmd} <- commands do
             assert [] == :ets.lookup(ets, key)

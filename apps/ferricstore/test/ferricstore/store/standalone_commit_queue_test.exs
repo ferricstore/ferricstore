@@ -31,12 +31,14 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
     assert "value" == Router.get(ctx, "queue:barrier-owner")
   end
 
-  test "cross-shard participant releases its barrier when the coordinator dies" do
+  test "cross-shard participant shuts down for journal recovery when the coordinator dies" do
     {pid, ctx, data_dir} = start_shard([])
+    Process.unlink(pid)
     on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
 
     owner_token = make_ref()
     parent = self()
+    shard_monitor = Process.monitor(pid)
 
     owner =
       spawn(fn ->
@@ -48,18 +50,11 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
       end)
 
     assert_receive {:barrier_acquired, :ok}, 1_000
-
-    pending =
-      :gen_server.send_request(
-        pid,
-        {:standalone_commit, {:put, "queue:barrier-owner-down", "value", 0}}
-      )
-
-    assert %{waiting_count: 1} = GenServer.call(pid, :standalone_commit_debug)
     Process.exit(owner, :kill)
 
-    assert {:reply, :ok} = :gen_server.receive_response(pending, 5_000)
-    assert "value" == Router.get(ctx, "queue:barrier-owner-down")
+    assert_receive {:DOWN, ^shard_monitor, :process, ^pid,
+                    {:shutdown, {:standalone_cross_shard_owner_down, :killed}}},
+                   5_000
   end
 
   test "waiting commits are bounded without changing FIFO apply order" do

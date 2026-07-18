@@ -15,9 +15,29 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbFiles do
     prob_dir = Path.join(shard_data_path, "prob")
 
     case Ferricstore.FS.ls(prob_dir) do
-      {:ok, files} -> validate_files(prob_dir, files, shard_index, keydir)
-      {:error, {:not_found, _message}} -> :ok
-      {:error, reason} -> {:error, {:list_prob_dir_failed, prob_dir, reason}}
+      {:ok, files} ->
+        validate_files(prob_dir, files, shard_index, keydir)
+
+      {:error, {:not_found, _message}} ->
+        validate_missing_directory(prob_dir, shard_index, keydir)
+
+      {:error, reason} ->
+        {:error, {:list_prob_dir_failed, prob_dir, reason}}
+    end
+  end
+
+  defp validate_missing_directory(_prob_dir, _shard_index, nil), do: :ok
+
+  defp validate_missing_directory(prob_dir, shard_index, keydir) do
+    case reconcile_exact_catalog(
+           prob_dir,
+           MapSet.new(),
+           MapSet.new(),
+           keydir,
+           shard_index
+         ) do
+      {:ok, _reconciled?, _mutation_receipts} -> :ok
+      {:error, _reason} = error -> error
     end
   end
 
@@ -197,8 +217,13 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbFiles do
          keydir,
          shard_index
        ) do
+    expiry_cutoff_ms =
+      Ferricstore.ExpiryContext.capture()
+      |> Ferricstore.ExpiryContext.safe_expiry_cutoff_ms()
+
     with {:ok, keydir} <- fetch_keydir(keydir),
-         {:ok, orphan_files} <- catalog_orphans(keydir, canonical_files) do
+         {:ok, orphan_files} <-
+           catalog_orphans(keydir, canonical_files, expiry_cutoff_ms) do
       remove_catalog_orphans(
         prob_dir,
         orphan_files,
@@ -271,13 +296,13 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbFiles do
 
   defp fetch_keydir(_keydir), do: {:error, :prob_type_catalog_unavailable}
 
-  defp catalog_orphans(keydir, canonical_files) do
+  defp catalog_orphans(keydir, canonical_files, expiry_cutoff_ms) do
     :ets.foldl(
       fn
         _row, {:error, _reason} = error ->
           error
 
-        {<<"T:", _rest::binary>> = storage_key, value, _expire_at_ms, _lfu, _file_id, _offset,
+        {<<"T:", _rest::binary>> = storage_key, value, expire_at_ms, _lfu, _file_id, _offset,
          _value_size},
         {:ok, orphan_files} ->
           case CompoundKey.type_name(value) do
@@ -287,7 +312,13 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbFiles do
                 |> CompoundKey.extract_redis_key()
                 |> ProbFile.filename(type)
 
-              {:ok, MapSet.delete(orphan_files, filename)}
+              reconcile_catalog_sidecar(
+                orphan_files,
+                storage_key,
+                filename,
+                expire_at_ms,
+                expiry_cutoff_ms
+              )
 
             type when is_binary(type) ->
               {:ok, orphan_files}
@@ -303,6 +334,35 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbFiles do
       keydir
     )
   end
+
+  defp reconcile_catalog_sidecar(
+         orphan_files,
+         storage_key,
+         filename,
+         expire_at_ms,
+         expiry_cutoff_ms
+       )
+       when is_integer(expire_at_ms) and expire_at_ms >= 0 do
+    cond do
+      expire_at_ms != 0 and expire_at_ms <= expiry_cutoff_ms ->
+        {:ok, orphan_files}
+
+      MapSet.member?(orphan_files, filename) ->
+        {:ok, MapSet.delete(orphan_files, filename)}
+
+      true ->
+        {:error, {:missing_prob_sidecar, storage_key, filename}}
+    end
+  end
+
+  defp reconcile_catalog_sidecar(
+         _orphan_files,
+         storage_key,
+         _filename,
+         expire_at_ms,
+         _expiry_cutoff_ms
+       ),
+       do: {:error, {:invalid_prob_type_catalog_expiry, storage_key, expire_at_ms}}
 
   defp validate_regular_file(prob_dir, filename) do
     case File.lstat(Path.join(prob_dir, filename)) do

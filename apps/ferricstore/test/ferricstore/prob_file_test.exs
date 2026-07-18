@@ -126,6 +126,86 @@ defmodule Ferricstore.ProbFileTest do
     refute File.exists?(Path.join(prob_dir, pending_filename))
   end
 
+  test "exact startup reconciliation rejects a missing live sidecar" do
+    root =
+      Path.join(System.tmp_dir!(), "prob_file_missing_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(root, "prob"))
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    keydir = :ets.new(:prob_file_missing_keydir, [:set, :public])
+    key = "missing-live-cms"
+    filename = ProbFile.filename(key, "cms")
+    storage_key = CompoundKey.type_key(key)
+
+    :ets.insert(
+      keydir,
+      {storage_key, CompoundKey.encode_prob_type(:cms, 7), 0, 0, 0, 0, 10}
+    )
+
+    assert {:error, {:missing_prob_sidecar, ^storage_key, ^filename}} =
+             ProbFiles.validate(root, 0, keydir)
+
+    :ets.insert(
+      keydir,
+      {storage_key, CompoundKey.encode_prob_type(:cms, 7), :invalid, 0, 0, 0, 10}
+    )
+
+    assert {:error, {:invalid_prob_type_catalog_expiry, ^storage_key, :invalid}} =
+             ProbFiles.validate(root, 0, keydir)
+  end
+
+  test "exact startup reconciliation rejects a missing sidecar directory" do
+    root =
+      Path.join(System.tmp_dir!(), "prob_file_missing_dir_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    keydir = :ets.new(:prob_file_missing_dir_keydir, [:set, :public])
+    key = "missing-dir-cms"
+    filename = ProbFile.filename(key, "cms")
+    storage_key = CompoundKey.type_key(key)
+
+    :ets.insert(
+      keydir,
+      {storage_key, CompoundKey.encode_prob_type(:cms, 7), 0, 0, 0, 0, 10}
+    )
+
+    assert {:error, {:missing_prob_sidecar, ^storage_key, ^filename}} =
+             ProbFiles.validate(root, 0, keydir)
+
+    :ets.insert(
+      keydir,
+      {storage_key, CompoundKey.encode_prob_type(:cms, 7), 1, 0, 0, 0, 10}
+    )
+
+    assert :ok = ProbFiles.validate(root, 0, keydir)
+  end
+
+  test "exact startup reconciliation removes sidecars owned only by expired markers" do
+    root =
+      Path.join(System.tmp_dir!(), "prob_file_expired_#{System.unique_integer([:positive])}")
+
+    prob_dir = Path.join(root, "prob")
+    File.mkdir_p!(prob_dir)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    keydir = :ets.new(:prob_file_expired_keydir, [:set, :public])
+    key = "expired-cms"
+    filename = ProbFile.filename(key, "cms")
+
+    :ets.insert(
+      keydir,
+      {CompoundKey.type_key(key), CompoundKey.encode_prob_type(:cms, 7), 1, 0, 0, 0, 10}
+    )
+
+    File.write!(Path.join(prob_dir, filename), "expired")
+
+    assert :ok = ProbFiles.validate(root, 0, keydir)
+    refute File.exists?(Path.join(prob_dir, filename))
+  end
+
   test "startup validation recovers an interrupted probabilistic mutation" do
     root =
       Path.join(System.tmp_dir!(), "prob_file_recovery_#{System.unique_integer([:positive])}")

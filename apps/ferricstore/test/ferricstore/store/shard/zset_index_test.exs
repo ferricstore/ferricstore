@@ -10,11 +10,6 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     index = :ets.new(:zset_index_test, [:ordered_set])
     lookup = :ets.new(:zset_lookup_test, [:set])
 
-    on_exit(fn ->
-      delete_table(index)
-      delete_table(lookup)
-    end)
-
     {:ok, index: index, lookup: lookup}
   end
 
@@ -393,11 +388,5 @@ defmodule Ferricstore.Store.Shard.ZSetIndexTest do
     Enum.each(members, fn {member, score} ->
       ZSetIndex.put_member(index, lookup, redis_key, member, score)
     end)
-  end
-
-  defp delete_table(table) do
-    if :ets.info(table) != :undefined do
-      :ets.delete(table)
-    end
   end
 end

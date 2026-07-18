@@ -510,20 +510,32 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec delete_exact_entry(map(), tuple()) :: boolean()
   @doc false
   def delete_exact_entry(state, entry) do
+    delete_exact_entry(state, entry, true)
+  end
+
+  @spec delete_exact_entry(map(), tuple(), boolean()) :: boolean()
+  @doc false
+  def delete_exact_entry(state, entry, update_logical_projection?)
+      when is_boolean(update_logical_projection?) do
     if Keydir.delete_exact(state.keydir, entry) do
       delete_apply_projection_cache_entry(state, entry)
       maybe_run_after_exact_keydir_delete_hook(state, entry)
       Accounting.track_binary_delete_entry(state, entry)
       key = elem(entry, 0)
       CompoundMemberIndex.delete(compound_member_index(state), key)
-      :ok = project_logical_key_delete(state, key)
+      maybe_project_logical_key_delete(state, key, update_logical_projection?)
       :ok = ZSetIndex.reconcile_exact_delete(state, entry)
-      restore_current_derived_indexes(state, key)
+      restore_current_derived_indexes(state, key, update_logical_projection?)
       true
     else
       false
     end
   end
+
+  defp maybe_project_logical_key_delete(state, key, true),
+    do: project_logical_key_delete(state, key)
+
+  defp maybe_project_logical_key_delete(_state, _key, false), do: :ok
 
   defp delete_apply_projection_cache_entry(
          %{index: shard_index, instance_ctx: %{data_dir: data_dir}},
@@ -550,12 +562,19 @@ defmodule Ferricstore.Store.Shard.ETS do
     end
   end
 
-  defp restore_current_derived_indexes(state, key) do
+  defp restore_current_derived_indexes(state, key, update_logical_projection?) do
     case :ets.lookup(state.keydir, key) do
       [{^key, value, expire_at_ms, _lfu, _file_id, _offset, _value_size}]
       when is_integer(expire_at_ms) and expire_at_ms >= 0 ->
         CompoundMemberIndex.put(compound_member_index(state), key, expire_at_ms)
-        project_logical_key_put(state, key, value, expire_at_ms)
+
+        maybe_project_logical_key_put(
+          state,
+          key,
+          value,
+          expire_at_ms,
+          update_logical_projection?
+        )
 
       _missing_or_invalid ->
         :ok
@@ -563,6 +582,11 @@ defmodule Ferricstore.Store.Shard.ETS do
   rescue
     ArgumentError -> :ok
   end
+
+  defp maybe_project_logical_key_put(state, key, value, expire_at_ms, true),
+    do: project_logical_key_put(state, key, value, expire_at_ms)
+
+  defp maybe_project_logical_key_put(_state, _key, _value, _expire_at_ms, false), do: :ok
 
   # -------------------------------------------------------------------
   # Hot cache threshold / value coercion

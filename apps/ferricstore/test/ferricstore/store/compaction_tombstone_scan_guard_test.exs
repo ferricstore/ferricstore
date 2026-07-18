@@ -8,7 +8,7 @@ defmodule Ferricstore.Store.CompactionTombstoneScanGuardTest do
     assert compaction =~ "CompactionTombstoneCatalog.record_source_page_count"
     assert compaction =~ "CompactionTombstoneCatalog.observe_lower_page_count"
     assert compaction =~ "NIF.v2_scan_file_page"
-    assert compaction =~ "Enum.sort_by(fn {lower_fid, _path} -> -lower_fid end)"
+    assert compaction =~ "Enum.sort_by(lower_files, fn {lower_fid, _path} -> -lower_fid end)"
     assert compaction =~ "when resolved >= candidate_count"
 
     assert catalog =~ ":crypto.hash(:sha256, key)"

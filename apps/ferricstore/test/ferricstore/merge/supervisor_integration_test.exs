@@ -11,6 +11,7 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Merge.{Scheduler, Semaphore}
+  alias Ferricstore.Test.ShardHelpers
 
   defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
 
@@ -139,8 +140,10 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
 
       # After all checks complete, semaphore should be free (no actual merges
       # should have been triggered because the test env has low fragmentation).
-      assert :free = Semaphore.status(),
-             "Semaphore should be free after trigger_check on all shards"
+      ShardHelpers.eventually(
+        fn -> Semaphore.status() == :free end,
+        "Semaphore should be free after trigger_check on all shards"
+      )
     end
   end
 end

@@ -30,29 +30,39 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     io_uring_available
   )
   @dirty_io_probabilistic_nifs ~w(
+    prob_file_recover
     bloom_file_create
     bloom_file_add
+    bloom_file_add_at
     bloom_file_madd
+    bloom_file_madd_at
     bloom_file_exists
     bloom_file_mexists
     bloom_file_card
     bloom_file_info
     cms_file_create
     cms_file_incrby
+    cms_file_incrby_at
     cms_file_query
     cms_file_info
     cms_file_merge
+    cms_file_merge_at
     cuckoo_file_create
     cuckoo_file_add
+    cuckoo_file_add_at
     cuckoo_file_addnx
+    cuckoo_file_addnx_at
     cuckoo_file_del
+    cuckoo_file_del_at
     cuckoo_file_exists
     cuckoo_file_mexists
     cuckoo_file_count
     cuckoo_file_info
     topk_file_create_v2
     topk_file_add_v2
+    topk_file_add_v2_at
     topk_file_incrby_v2
+    topk_file_incrby_v2_at
     topk_file_query_v2
     topk_file_list_v2
     topk_file_list_with_count

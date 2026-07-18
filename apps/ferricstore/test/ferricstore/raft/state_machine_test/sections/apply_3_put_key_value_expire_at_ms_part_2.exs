@@ -126,6 +126,11 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
              {:waraft_apply_projection, projection_index}, 0, byte_size("hash-value")}
           )
 
+          Ferricstore.Store.Shard.CompoundMemberIndex.put(
+            state.compound_member_index_name,
+            field_key
+          )
+
           {_new_state, [["field", "hash-value"]]} =
             StateMachine.apply(
               %{system_time: Ferricstore.HLC.now_ms()},
@@ -212,7 +217,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             assert {:error, {:state_read_failed, :keydir_unavailable}} = result
             assert_keydir_unavailable_event(:cross_shard_get)
             assert_keydir_unavailable_event(:cross_shard_get_meta)
-            assert_keydir_unavailable_event(:cross_shard_prefix_count)
+            assert_keydir_unavailable_event(:cross_shard_exists)
           after
             :telemetry.detach(handler_id)
           end

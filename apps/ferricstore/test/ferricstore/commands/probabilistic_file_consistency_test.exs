@@ -65,9 +65,19 @@ defmodule Ferricstore.Commands.ProbabilisticFileConsistencyTest do
     store = MockStore.make()
     assert :ok = TopK.handle("TOPK.RESERVE", ["tracker", "5"], store)
     assert [nil] = TopK.handle("TOPK.ADD", ["tracker", "member"], store)
-    assert :ok = store.put.("tracker", "plain string value", 0)
 
-    assert {:error, message} = TopK.handle("TOPK.QUERY", ["tracker", "member"], store)
+    type_key = Ferricstore.Store.CompoundKey.type_key("tracker")
+    compound_get = store.compound_get
+
+    string_store =
+      store
+      |> Map.put(:get, fn "tracker" -> "plain string value" end)
+      |> Map.put(:compound_get, fn
+        "tracker", ^type_key -> nil
+        redis_key, compound_key -> compound_get.(redis_key, compound_key)
+      end)
+
+    assert {:error, message} = TopK.handle("TOPK.QUERY", ["tracker", "member"], string_store)
     assert message =~ "WRONGTYPE"
   end
 end

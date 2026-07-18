@@ -5,14 +5,23 @@ defmodule FerricstoreServer.PreparedCommandAclTest do
   alias FerricstoreServer.Acl
   alias FerricstoreServer.Connection.Auth
 
-  test "prepared COPY footprint checks source read and destination write access" do
+  test "prepared COPY without REPLACE requires destination read/write access" do
     assert {:ok, prepared} = Dispatcher.prepare_raw("COPY", ["source:key", "destination:key"])
+
+    assert {:error, _reason} =
+             Auth.check_keys_cached(
+               cache([
+                 pattern("source:*", :read),
+                 pattern("destination:*", :write)
+               ]),
+               prepared
+             )
 
     assert :ok =
              Auth.check_keys_cached(
                cache([
                  pattern("source:*", :read),
-                 pattern("destination:*", :write)
+                 pattern("destination:*", :rw)
                ]),
                prepared
              )
@@ -27,6 +36,20 @@ defmodule FerricstoreServer.PreparedCommandAclTest do
              )
 
     assert reason =~ "keys mentioned"
+  end
+
+  test "prepared COPY with REPLACE only reads the source and writes the destination" do
+    assert {:ok, prepared} =
+             Dispatcher.prepare_raw("COPY", ["source:key", "destination:key", "REPLACE"])
+
+    assert :ok =
+             Auth.check_keys_cached(
+               cache([
+                 pattern("source:*", :read),
+                 pattern("destination:*", :write)
+               ]),
+               prepared
+             )
   end
 
   test "prepared RENAME footprint requires source read/write and destination write" do

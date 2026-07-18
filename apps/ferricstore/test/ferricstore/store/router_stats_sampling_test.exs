@@ -113,7 +113,7 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
 
     for {name, arity} <- [
           {:do_batch_get, 4},
-          {:do_batch_get_with_file_refs, 4},
+          {:do_batch_get_with_file_refs, 5},
           {:compound_batch_get, 3}
         ] do
       body = find_function_body!(ast, name, arity)
@@ -131,6 +131,11 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
 
     assert contains_call?(bounded_body, :do_batch_get, 4),
            "do_batch_get/3 must delegate to the shared batched-read implementation"
+
+    file_ref_wrapper = find_function_body!(ast, :do_batch_get_with_file_refs, 4)
+
+    assert contains_call?(file_ref_wrapper, :do_batch_get_with_file_refs, 5),
+           "do_batch_get_with_file_refs/4 must capture expiry once and delegate to /5"
 
     batch_body = find_function_body!(ast, :batch_get, 2)
 

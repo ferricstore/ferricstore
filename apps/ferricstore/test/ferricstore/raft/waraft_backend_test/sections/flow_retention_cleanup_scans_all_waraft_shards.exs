@@ -457,6 +457,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
         end
       end
 
+      @tag :prob_waraft_restart
       test "probabilistic merge commands survive WARaft restart", %{root: root, ctx: ctx} do
         suffix = System.unique_integer([:positive])
 

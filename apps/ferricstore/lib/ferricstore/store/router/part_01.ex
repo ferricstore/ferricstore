@@ -718,7 +718,22 @@ defmodule Ferricstore.Store.Router.Part01 do
              keydir,
              {_key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size} = entry
            ) do
-        ETS.delete_exact_entry(router_shard_ets_state(ctx, idx, keydir), entry)
+        delete_observed_keydir_entry(ctx, idx, keydir, entry, true)
+      end
+
+      defp delete_observed_keydir_entry(
+             ctx,
+             idx,
+             keydir,
+             {_key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size} = entry,
+             update_logical_projection?
+           )
+           when is_boolean(update_logical_projection?) do
+        ETS.delete_exact_entry(
+          router_shard_ets_state(ctx, idx, keydir),
+          entry,
+          update_logical_projection?
+        )
       end
 
       defp router_shard_ets_state(ctx, idx, keydir) do

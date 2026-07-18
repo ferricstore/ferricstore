@@ -84,7 +84,7 @@ defmodule Ferricstore.Cluster.FlowStateMetaRetentionClusterTest do
 
       cleaner = hd(remaining)
 
-      assert cleanup_after_failover(cleaner.name, now + 2_000, length(specs)) >= length(specs)
+      assert :ok = cleanup_after_failover(cleaner.name, now + 2_000, specs)
 
       Enum.each(specs, fn spec ->
         eventually(fn ->
@@ -210,32 +210,32 @@ defmodule Ferricstore.Cluster.FlowStateMetaRetentionClusterTest do
   end
 
   defp flow_absent?({:ok, nil}), do: true
-  defp flow_absent?({:error, _reason}), do: true
+  defp flow_absent?({:error, "ERR flow not found"}), do: true
   defp flow_absent?(_other), do: false
 
-  defp cleanup_after_failover(node_name, now_ms, expected, attempts \\ 120, cleaned \\ 0)
+  defp cleanup_after_failover(node_name, now_ms, specs, attempts \\ 120)
 
-  defp cleanup_after_failover(_node_name, _now_ms, expected, _attempts, cleaned)
-       when cleaned >= expected,
-       do: cleaned
-
-  defp cleanup_after_failover(node_name, now_ms, expected, attempts, cleaned)
-       when attempts > 0 do
-    assert {:ok, result} =
+  defp cleanup_after_failover(node_name, now_ms, specs, attempts) when attempts > 0 do
+    assert {:ok, _result} =
              remote_flow(node_name, :flow_retention_cleanup, [[limit: 20, now_ms: now_ms]])
 
-    cleaned = cleaned + result.flows
+    all_absent? =
+      Enum.all?(specs, fn spec ->
+        node_name
+        |> remote_flow(:flow_get, [spec.id, [partition_key: spec.partition_key]])
+        |> flow_absent?()
+      end)
 
-    if cleaned >= expected do
-      cleaned
+    if all_absent? do
+      :ok
     else
       Process.sleep(250)
-      cleanup_after_failover(node_name, now_ms, expected, attempts - 1, cleaned)
+      cleanup_after_failover(node_name, now_ms, specs, attempts - 1)
     end
   end
 
-  defp cleanup_after_failover(_node_name, _now_ms, expected, 0, cleaned) do
-    flunk("retention cleanup removed #{cleaned} of #{expected} flows after failover")
+  defp cleanup_after_failover(_node_name, _now_ms, specs, 0) do
+    flunk("retention cleanup left flows after failover: #{inspect(Enum.map(specs, & &1.id))}")
   end
 
   defp eventually(fun, attempts \\ 120, interval_ms \\ 250)

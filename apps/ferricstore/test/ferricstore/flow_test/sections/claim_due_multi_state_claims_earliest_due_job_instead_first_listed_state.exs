@@ -786,10 +786,12 @@ defmodule Ferricstore.FlowTest.Sections.ClaimDueMultiStateClaimsEarliestDueJobIn
         assert retried.version == created.version
         assert retried.created_at_ms == created.created_at_ms
 
-        assert {:ok, hydrated} =
-                 FerricStore.flow_get(id, full: true, payload_max_bytes: byte_size(payload))
+        assert {:ok, capped} =
+                 FerricStore.flow_get(id, full: true, payload_max_bytes: 65_536)
 
-        assert hydrated.payload == payload
+        assert capped.payload_omitted == true
+        assert capped.payload_size == encoded_value_size(payload)
+        refute Map.has_key?(capped, :payload)
 
         assert {:error, "ERR flow idempotency conflict"} =
                  flow_create_and_get(id,

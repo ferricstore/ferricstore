@@ -654,7 +654,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowDetailPoliciesRete
 
           File.mkdir_p!(history_dir)
           File.mkdir_p!(waraft_dir)
-          File.write!(Path.join(shard_dir, "active.log"), String.duplicate("a", 7))
+          File.write!(Path.join(shard_dir, "00000.log"), String.duplicate("a", 7))
           File.write!(Path.join(history_dir, "history.segment"), String.duplicate("b", 11))
           File.write!(Path.join(waraft_dir, "raft.segment"), String.duplicate("c", 13))
 
