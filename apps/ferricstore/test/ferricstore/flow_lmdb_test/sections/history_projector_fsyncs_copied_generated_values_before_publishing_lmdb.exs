@@ -200,12 +200,26 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
         on_exit(fn -> File.rm_rf!(data_dir) end)
         Ferricstore.DataDir.ensure_layout!(data_dir, 1)
 
-        start_supervised!(
-          {Ferricstore.Flow.LMDBWriter,
-           shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
-        )
+        writer =
+          start_supervised!(
+            {Ferricstore.Flow.LMDBWriter,
+             shard_index: shard_index, data_dir: data_dir, instance_name: instance_name}
+          )
 
         assert :ok = Ferricstore.Flow.LMDBWriter.suspend_all(instance_name, 1, flush: false)
+
+        stale_generation = :atomics.new(3, signed: false)
+        outbox = Ferricstore.Flow.LMDBWriter.projection_outbox_name(instance_name, shard_index)
+
+        true =
+          :ets.insert(
+            outbox,
+            {System.unique_integer([:monotonic, :positive]), stale_generation, key, 1}
+          )
+
+        GenServer.cast(writer, {:projection_outbox_available, stale_generation})
+        _state = :sys.get_state(writer)
+        assert :ets.info(outbox, :size) == 1
 
         assert {:error, :writer_suspended} =
                  Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [
@@ -213,6 +227,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
                  ])
 
         assert :ok = Ferricstore.Flow.LMDBWriter.resume_all(instance_name, 1)
+
+        resumed_state = :sys.get_state(writer)
+        assert is_reference(resumed_state.timer_ref)
 
         assert :ok =
                  Ferricstore.Flow.LMDBWriter.enqueue(instance_name, shard_index, [

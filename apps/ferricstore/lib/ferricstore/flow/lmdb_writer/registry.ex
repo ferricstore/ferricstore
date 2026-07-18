@@ -55,10 +55,19 @@ defmodule Ferricstore.Flow.LMDBWriter.Registry do
   def normalize_projection_outbox_entries(_entries),
     do: {:error, :invalid_projection_outbox_entries}
 
-  def projection_outbox_rows(entries) do
+  def projection_outbox_rows(entries, generation) when is_reference(generation) do
     Enum.map(entries, fn {state_key, version} ->
-      {System.unique_integer([:monotonic, :positive]), state_key, version}
+      {System.unique_integer([:monotonic, :positive]), generation, state_key, version}
     end)
+  end
+
+  def put_projection_dirty_marker(tid, instance_name, shard_index, generation)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 and
+             is_reference(generation) do
+    token = System.unique_integer([:monotonic, :positive])
+    do_put_projection_dirty_marker(tid, instance_name, shard_index, generation, token)
+  rescue
+    ArgumentError -> {:error, :projection_outbox_not_started}
   end
 
   def mark_instance_suspended(instance_name) when is_atom(instance_name) do
@@ -93,4 +102,92 @@ defmodule Ferricstore.Flow.LMDBWriter.Registry do
 
   def enqueue_seq_key(instance_name, shard_index),
     do: {@owner, :enqueue_seq, instance_name, shard_index}
+
+  defp do_put_projection_dirty_marker(
+         tid,
+         instance_name,
+         shard_index,
+         generation,
+         token
+       ) do
+    replacement = {:dirty, generation, token}
+
+    case :ets.lookup(tid, :dirty) do
+      [] ->
+        cond do
+          not current_enqueue_generation?(instance_name, shard_index, generation) ->
+            {:error, :writer_restarted}
+
+          :ets.insert_new(tid, replacement) ->
+            :ok
+
+          true ->
+            do_put_projection_dirty_marker(
+              tid,
+              instance_name,
+              shard_index,
+              generation,
+              token
+            )
+        end
+
+      [{:dirty, ^generation, current_token}]
+      when is_integer(current_token) and current_token >= token ->
+        :ok
+
+      [{:dirty, ^generation, _current_token} = current] ->
+        replace_projection_dirty_marker(
+          tid,
+          current,
+          replacement,
+          instance_name,
+          shard_index,
+          generation,
+          token
+        )
+
+      [current] ->
+        if current_enqueue_generation?(instance_name, shard_index, generation) do
+          replace_projection_dirty_marker(
+            tid,
+            current,
+            replacement,
+            instance_name,
+            shard_index,
+            generation,
+            token
+          )
+        else
+          {:error, :writer_restarted}
+        end
+    end
+  end
+
+  defp replace_projection_dirty_marker(
+         tid,
+         current,
+         replacement,
+         instance_name,
+         shard_index,
+         generation,
+         token
+       ) do
+    case :ets.select_replace(tid, [{current, [], [{:const, replacement}]}]) do
+      1 ->
+        :ok
+
+      0 ->
+        do_put_projection_dirty_marker(
+          tid,
+          instance_name,
+          shard_index,
+          generation,
+          token
+        )
+    end
+  end
+
+  defp current_enqueue_generation?(instance_name, shard_index, generation) do
+    :persistent_term.get(enqueue_seq_key(instance_name, shard_index), nil) == generation
+  end
 end

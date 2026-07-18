@@ -13,6 +13,13 @@ defmodule Ferricstore.Flow.LMDBWriter.EnqueueControl do
     Ferricstore.Flow.LMDBWriter.Registry.publish_enqueue_seq(instance_name, shard_index, ref)
   end
 
+  def rotate_enqueue_seq(instance_name, shard_index)
+      when is_atom(instance_name) and is_integer(shard_index) and shard_index >= 0 do
+    ref = :atomics.new(@enqueue_ops_queued, signed: false)
+    publish_enqueue_seq(instance_name, shard_index, ref)
+    ref
+  end
+
   def enqueue_seq_key(instance_name, shard_index) do
     Ferricstore.Flow.LMDBWriter.Registry.enqueue_seq_key(instance_name, shard_index)
   end

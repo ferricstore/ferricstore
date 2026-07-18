@@ -477,6 +477,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StateMachineStillRequiresLmdbMirror
         instance_name = :"flow_lmdb_snapshot_prepare_#{System.unique_integer([:positive])}"
         shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
         key = "flow:{flow:test}:state:snapshot-prepare"
+        stale_key = "flow:{flow:test}:state:snapshot-prepare-stale"
+        degraded = :atomics.new(1, signed: false)
 
         on_exit(fn ->
           restore_env(:flow_lmdb_mode, old_mode)
@@ -486,13 +488,17 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StateMachineStillRequiresLmdbMirror
 
         Ferricstore.DataDir.ensure_layout!(data_dir, 1)
 
-        start_supervised!(
-          {Ferricstore.Flow.LMDBWriter,
-           shard_index: shard_index,
-           data_dir: data_dir,
-           instance_ctx: %{name: instance_name},
-           instance_name: instance_name}
-        )
+        writer =
+          start_supervised!(
+            {Ferricstore.Flow.LMDBWriter,
+             shard_index: shard_index,
+             data_dir: data_dir,
+             instance_ctx: %{
+               name: instance_name,
+               flow_lmdb_mirror_degraded: degraded
+             },
+             instance_name: instance_name}
+          )
 
         path = Ferricstore.Flow.LMDB.path(shard_data_path)
 
@@ -522,8 +528,28 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StateMachineStillRequiresLmdbMirror
                    shard_index
                  )
 
-        writer =
-          Process.whereis(Ferricstore.Flow.LMDBWriter.name(instance_name, shard_index))
+        seq_ref =
+          :persistent_term.get(
+            {Ferricstore.Flow.LMDBWriter, :enqueue_seq, instance_name, shard_index}
+          )
+
+        seq = :atomics.add_get(seq_ref, 1, 1)
+
+        assert :ok = GenServer.call(writer, :prepare_snapshot_install)
+
+        GenServer.cast(writer, {:enqueue, seq, [{:put, stale_key, "stale"}], [], {seq_ref, 0}})
+        _state = :sys.get_state(writer)
+
+        assert :atomics.get(degraded, 1) == 0
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.resume_after_snapshot_install(
+                   instance_name,
+                   shard_index
+                 )
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+        assert :not_found = Ferricstore.Flow.LMDB.get(path, stale_key)
 
         :sys.replace_state(writer, &Map.put(&1, :terminal_atomic_write?, true))
 

@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
   setup do
     table = Registry.ensure_projection_outbox!(@instance_name, @shard_index)
     :ets.delete_all_objects(table)
+    generation = :atomics.new(3, signed: false)
 
     on_exit(fn ->
       case :ets.whereis(Registry.projection_outbox_name(@instance_name, @shard_index)) do
@@ -19,19 +20,27 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
       end
     end)
 
-    {:ok, state: %{instance_name: @instance_name, shard_index: @shard_index}, table: table}
+    {:ok,
+     state: %{
+       instance_name: @instance_name,
+       shard_index: @shard_index,
+       enqueue_seq: generation
+     },
+     table: table,
+     generation: generation}
   end
 
   test "takes projection entries in bounded sequence-ordered batches", %{
     state: state,
-    table: table
+    table: table,
+    generation: generation
   } do
-    :ets.insert(table, {:dirty, true})
+    :ets.insert(table, {:dirty, generation, 1})
 
     :ets.insert(
       table,
       for sequence <- 1..2_000 do
-        {sequence, "F:#{sequence}", sequence}
+        {sequence, generation, "F:#{sequence}", sequence}
       end
     )
 
@@ -40,14 +49,14 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
     assert length(first) == 1_024
     assert Enum.map(first, &elem(&1, 0)) == Enum.to_list(1..1_024)
     assert Outbox.projection_outbox_pending?(state)
-    assert :ets.lookup(table, :dirty) == [{:dirty, true}]
+    assert :ets.lookup(table, :dirty) == [{:dirty, generation, 1}]
 
     second = Outbox.take_projection_outbox_entries(state)
 
     assert length(second) == 976
     assert Enum.map(second, &elem(&1, 0)) == Enum.to_list(1_025..2_000)
     refute Outbox.projection_outbox_pending?(state)
-    assert :ets.lookup(table, :dirty) == [{:dirty, true}]
+    assert :ets.lookup(table, :dirty) == [{:dirty, generation, 1}]
   end
 
   test "does not copy the complete outbox before applying its batch limit" do
@@ -57,14 +66,85 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
     refute source =~ ":ets.tab2list"
   end
 
+  test "does not clear a dirty marker replaced during reconciliation", %{
+    state: state,
+    table: table,
+    generation: generation
+  } do
+    :ets.insert(table, {:dirty, generation, 1})
+    marker = Outbox.projection_dirty_marker(state)
+
+    :ets.insert(table, {:dirty, generation, 2})
+
+    assert :ok = Outbox.clear_projection_dirty_marker(state, marker)
+    assert :ets.lookup(table, :dirty) == [{:dirty, generation, 2}]
+  end
+
+  test "does not clear a dirty marker before its notification is handled", %{
+    state: state,
+    table: table,
+    generation: generation
+  } do
+    :ets.insert(table, {:dirty, generation, 1})
+    state = Map.put(state, :projection_dirty?, false)
+
+    assert {^state, :ok} = Outbox.maybe_reconcile_dirty_projection_with_reply(state, :ok)
+    assert :ets.lookup(table, :dirty) == [{:dirty, generation, 1}]
+  end
+
+  test "coalesces current dirty markers without allowing stale generations to overwrite", %{
+    table: table,
+    generation: generation
+  } do
+    Registry.publish_enqueue_seq(@instance_name, @shard_index, generation)
+
+    on_exit(fn ->
+      :persistent_term.erase(Registry.enqueue_seq_key(@instance_name, @shard_index))
+    end)
+
+    assert :ok =
+             Registry.put_projection_dirty_marker(
+               table,
+               @instance_name,
+               @shard_index,
+               generation
+             )
+
+    [{:dirty, ^generation, first_token}] = :ets.lookup(table, :dirty)
+
+    assert :ok =
+             Registry.put_projection_dirty_marker(
+               table,
+               @instance_name,
+               @shard_index,
+               generation
+             )
+
+    [{:dirty, ^generation, second_token} = current] = :ets.lookup(table, :dirty)
+    assert second_token > first_token
+
+    stale_generation = :atomics.new(3, signed: false)
+
+    assert {:error, :writer_restarted} =
+             Registry.put_projection_dirty_marker(
+               table,
+               @instance_name,
+               @shard_index,
+               stale_generation
+             )
+
+    assert :ets.lookup(table, :dirty) == [current]
+  end
+
   test "reports remaining work after adding one bounded batch to pending state", %{
     state: identity,
-    table: table
+    table: table,
+    generation: generation
   } do
     :ets.insert(
       table,
       for sequence <- 1..1_025 do
-        {sequence, "F:#{sequence}", sequence}
+        {sequence, generation, "F:#{sequence}", sequence}
       end
     )
 

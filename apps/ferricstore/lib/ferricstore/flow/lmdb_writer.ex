@@ -218,10 +218,31 @@ defmodule Ferricstore.Flow.LMDBWriter do
             )
 
           tid ->
-            case insert_projection_outbox_rows(tid, projection_outbox_rows(entries)) do
-              :ok ->
-                GenServer.cast(pid, :projection_outbox_available)
-                :ok
+            with {:ok, {generation, 0} = reservation} <-
+                   EnqueueControl.reserve_queued_ops(instance_name, shard_index, 0),
+                 true <-
+                   EnqueueControl.current_generation?(
+                     instance_name,
+                     shard_index,
+                     pid,
+                     reservation
+                   ),
+                 :ok <-
+                   insert_projection_outbox_rows(
+                     tid,
+                     projection_outbox_rows(entries, generation)
+                   ) do
+              GenServer.cast(pid, {:projection_outbox_available, generation})
+              :ok
+            else
+              false ->
+                writer_unavailable(
+                  :projection_outbox_enqueue,
+                  instance_name,
+                  shard_index,
+                  :writer_restarted,
+                  entry_count
+                )
 
               {:error, reason} ->
                 writer_unavailable(
@@ -275,11 +296,43 @@ defmodule Ferricstore.Flow.LMDBWriter do
             )
 
           tid ->
-            if :ets.insert_new(tid, {:dirty, true}) do
-              GenServer.cast(pid, :projection_dirty)
-            end
+            with {:ok, {generation, 0} = reservation} <-
+                   EnqueueControl.reserve_queued_ops(instance_name, shard_index, 0),
+                 true <-
+                   EnqueueControl.current_generation?(
+                     instance_name,
+                     shard_index,
+                     pid,
+                     reservation
+                   ),
+                 :ok <-
+                   put_projection_dirty_marker(
+                     tid,
+                     instance_name,
+                     shard_index,
+                     generation
+                   ) do
+              GenServer.cast(pid, {:projection_dirty, generation})
+              :ok
+            else
+              false ->
+                writer_unavailable(
+                  :projection_dirty,
+                  instance_name,
+                  shard_index,
+                  :writer_restarted,
+                  1
+                )
 
-            :ok
+              {:error, reason} ->
+                writer_unavailable(
+                  :projection_dirty,
+                  instance_name,
+                  shard_index,
+                  reason,
+                  1
+                )
+            end
         end
 
       true ->
@@ -389,8 +442,17 @@ defmodule Ferricstore.Flow.LMDBWriter do
     Ferricstore.Flow.LMDBWriter.Registry.normalize_projection_outbox_entries(entries)
   end
 
-  defp projection_outbox_rows(entries) do
-    Ferricstore.Flow.LMDBWriter.Registry.projection_outbox_rows(entries)
+  defp projection_outbox_rows(entries, generation) do
+    Ferricstore.Flow.LMDBWriter.Registry.projection_outbox_rows(entries, generation)
+  end
+
+  defp put_projection_dirty_marker(tid, instance_name, shard_index, generation) do
+    Ferricstore.Flow.LMDBWriter.Registry.put_projection_dirty_marker(
+      tid,
+      instance_name,
+      shard_index,
+      generation
+    )
   end
 
   defp clear_instance_suspended(instance_name) when is_atom(instance_name) do
@@ -414,8 +476,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     previous_generation =
       EnqueueControl.previous_writer_generation(instance_name, shard_index)
 
-    enqueue_seq = :atomics.new(3, signed: false)
-    EnqueueControl.publish_enqueue_seq(instance_name, shard_index, enqueue_seq)
+    enqueue_seq = EnqueueControl.rotate_enqueue_seq(instance_name, shard_index)
 
     state = Config.initial_state(opts, instance_name, shard_index, data_dir, enqueue_seq)
 
@@ -448,25 +509,31 @@ defmodule Ferricstore.Flow.LMDBWriter do
       )
       when is_integer(seq) and seq >= 0 and is_list(ops) and is_list(after_flush) and
              is_reference(reservation_ref) and is_integer(reserved_ops) and reserved_ops >= 0 do
-    state =
-      if state.suspended? do
-        mark_mirror_degraded(state.instance_ctx, state.shard_index, :enqueue_after_suspend)
+    if reservation_ref == state.enqueue_seq do
+      state =
+        if state.suspended? do
+          mark_mirror_degraded(state.instance_ctx, state.shard_index, :enqueue_after_suspend)
+          state
+        else
+          enqueue_and_maybe_flush(ops, after_flush, state)
+        end
+
+      release_enqueue_reservation(state, reservation)
+
+      state =
         state
-      else
-        enqueue_and_maybe_flush(ops, after_flush, state)
-      end
+        |> EnqueueControl.mark_enqueue_processed(seq)
+        |> EnqueueControl.maybe_reply_flush_waiters()
 
-    release_enqueue_reservation(state, reservation)
-
-    state =
-      state
-      |> EnqueueControl.mark_enqueue_processed(seq)
-      |> EnqueueControl.maybe_reply_flush_waiters()
-
-    {:noreply, state}
+      {:noreply, state}
+    else
+      _ = EnqueueControl.release_queued_ops(reservation)
+      {:noreply, state}
+    end
   end
 
-  def handle_cast(:projection_outbox_available, state) do
+  def handle_cast({:projection_outbox_available, generation}, state)
+      when is_reference(generation) do
     cond do
       writer_suspended?(state) ->
         {:noreply, state}
@@ -476,11 +543,17 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
-  def handle_cast(:projection_dirty, state) do
-    if writer_suspended?(state) do
-      {:noreply, state}
-    else
-      {:noreply, ensure_projection_outbox_timer(%{state | projection_dirty?: true})}
+  def handle_cast({:projection_dirty, generation}, state) when is_reference(generation) do
+    cond do
+      generation != state.enqueue_seq ->
+        Outbox.clear_projection_dirty_generation(state, generation)
+        {:noreply, state}
+
+      writer_suspended?(state) ->
+        {:noreply, %{state | projection_dirty?: true}}
+
+      true ->
+        {:noreply, ensure_projection_outbox_timer(%{state | projection_dirty?: true})}
     end
   end
 
@@ -497,7 +570,14 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   def handle_cast(:resume, state) do
-    {:noreply, %{state | suspended?: false}}
+    state = %{state | suspended?: false}
+
+    if state.projection_dirty? or Outbox.projection_dirty_marker(state) != :none or
+         Outbox.projection_outbox_pending?(state) do
+      {:noreply, ensure_projection_outbox_timer(state)}
+    else
+      {:noreply, state}
+    end
   end
 
   @impl true
@@ -508,15 +588,20 @@ defmodule Ferricstore.Flow.LMDBWriter do
       )
       when is_list(ops) and is_list(after_flush) and is_reference(reservation_ref) and
              is_integer(reserved_ops) and reserved_ops >= 0 do
-    {reply, state} =
-      if writer_suspended?(state) do
-        {{:error, :writer_suspended}, state}
-      else
-        {:ok, enqueue_without_flush(ops, after_flush, state)}
-      end
+    if reservation_ref == state.enqueue_seq do
+      {reply, state} =
+        if writer_suspended?(state) do
+          {{:error, :writer_suspended}, state}
+        else
+          {:ok, enqueue_without_flush(ops, after_flush, state)}
+        end
 
-    release_enqueue_reservation(state, reservation)
-    {:reply, reply, state}
+      release_enqueue_reservation(state, reservation)
+      {:reply, reply, state}
+    else
+      _ = EnqueueControl.release_queued_ops(reservation)
+      {:reply, {:error, :writer_restarted}, state}
+    end
   end
 
   def handle_call(:flush, from, state) do
@@ -571,8 +656,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
     Outbox.clear_projection_outbox(state)
 
-    processed = EnqueueControl.enqueue_seq_target(state)
-    EnqueueControl.publish_processed_enqueue_seq(state.enqueue_seq, processed)
+    enqueue_seq = EnqueueControl.rotate_enqueue_seq(state.instance_name, state.shard_index)
     Enum.each(state.flush_waiters, fn {from, _target} -> GenServer.reply(from, :ok) end)
 
     state = %{
@@ -585,7 +669,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
         timer_ref: nil,
         projection_dirty?: false,
         terminal_atomic_write?: false,
-        processed_enqueue_seq: processed,
+        enqueue_seq: enqueue_seq,
+        processed_enqueue_seq: 0,
         processed_enqueue_gaps: MapSet.new(),
         flush_waiters: []
     }
@@ -599,8 +684,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
     Outbox.clear_projection_outbox(state)
 
-    processed = EnqueueControl.enqueue_seq_target(state)
-    EnqueueControl.publish_processed_enqueue_seq(state.enqueue_seq, processed)
+    enqueue_seq = EnqueueControl.rotate_enqueue_seq(state.instance_name, state.shard_index)
     Enum.each(state.flush_waiters, fn {from, _target} -> GenServer.reply(from, :ok) end)
 
     state = %{
@@ -616,7 +700,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
         lmdb_ready: false,
         suspended?: suspended?,
         projection_dirty?: false,
-        processed_enqueue_seq: processed,
+        enqueue_seq: enqueue_seq,
+        processed_enqueue_seq: 0,
         processed_enqueue_gaps: MapSet.new(),
         flush_waiters: []
     }
@@ -704,18 +789,10 @@ defmodule Ferricstore.Flow.LMDBWriter do
     state.suspended? or instance_suspended?(state.instance_name)
   end
 
-  defp release_enqueue_reservation(state, {reservation_ref, _reserved_ops} = reservation) do
+  defp release_enqueue_reservation(state, reservation) do
     case EnqueueControl.release_queued_ops(reservation) do
       :ok ->
-        if reservation_ref == state.enqueue_seq do
-          :ok
-        else
-          mark_mirror_degraded(
-            state.instance_ctx,
-            state.shard_index,
-            :enqueue_reservation_generation_mismatch
-          )
-        end
+        :ok
 
       {:error, reason} ->
         mark_mirror_degraded(

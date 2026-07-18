@@ -47,25 +47,48 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
     table = LMDBWriter.projection_outbox_name(state.instance_name, state.shard_index)
 
     case :ets.whereis(table) do
-      :undefined -> []
-      tid -> take_projection_entries(tid, first_projection_entry_key(tid), limit, [])
+      :undefined ->
+        []
+
+      tid ->
+        take_projection_entries(
+          tid,
+          first_projection_entry_key(tid),
+          state.enqueue_seq,
+          limit,
+          @projection_outbox_batch_size,
+          []
+        )
     end
   rescue
     ArgumentError -> []
   end
 
-  defp take_projection_entries(_tid, @end_of_table, _remaining, acc), do: Enum.reverse(acc)
-  defp take_projection_entries(_tid, _key, 0, acc), do: Enum.reverse(acc)
+  defp take_projection_entries(_tid, @end_of_table, _generation, _remaining, _scan, acc),
+    do: Enum.reverse(acc)
 
-  defp take_projection_entries(tid, key, remaining, acc) do
+  defp take_projection_entries(_tid, _key, _generation, 0, _scan, acc),
+    do: Enum.reverse(acc)
+
+  defp take_projection_entries(_tid, _key, _generation, _remaining, 0, acc),
+    do: Enum.reverse(acc)
+
+  defp take_projection_entries(tid, key, generation, remaining, scan, acc) do
     next_key = next_projection_entry_key(tid, key)
 
     case :ets.take(tid, key) do
-      [{^key, _state_key, _version} = entry] ->
-        take_projection_entries(tid, next_key, remaining - 1, [entry | acc])
+      [{^key, ^generation, _state_key, _version} = entry] ->
+        take_projection_entries(
+          tid,
+          next_key,
+          generation,
+          remaining - 1,
+          scan - 1,
+          [entry | acc]
+        )
 
       _other ->
-        take_projection_entries(tid, next_key, remaining, acc)
+        take_projection_entries(tid, next_key, generation, remaining, scan - 1, acc)
     end
   end
 
@@ -84,7 +107,7 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
 
   def projection_outbox_items(state, entries) do
     entries
-    |> Enum.reduce({[], []}, fn {_seq, state_key, version}, {ops, after_flush} ->
+    |> Enum.reduce({[], []}, fn {_seq, _generation, state_key, version}, {ops, after_flush} ->
       action = projection_outbox_after_flush(state, state_key, version)
 
       after_flush =
@@ -116,11 +139,17 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
     end
   end
 
+  def maybe_reconcile_dirty_projection_with_reply(%{projection_dirty?: false} = state, :ok),
+    do: {state, :ok}
+
   def maybe_reconcile_dirty_projection_with_reply(state, :ok) do
+    marker = projection_dirty_marker(state)
+
     case reconcile_dirty_projection(state) do
       :ok ->
-        clear_projection_dirty_marker(state)
-        {%{state | projection_dirty?: false}, :ok}
+        clear_projection_dirty_marker(state, marker)
+        dirty? = projection_dirty_marker(state) != :none
+        {%{state | projection_dirty?: dirty?}, :ok}
 
       {:error, reason} ->
         LMDBWriter.record_flush_failure(state.instance_ctx, state.shard_index)
@@ -163,10 +192,59 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
 
   def reconcile_dirty_projection(_state), do: :ok
 
-  def clear_projection_dirty_marker(state) do
+  def projection_dirty_marker(state) do
     case :ets.whereis(LMDBWriter.projection_outbox_name(state.instance_name, state.shard_index)) do
-      :undefined -> :ok
-      tid -> :ets.delete(tid, :dirty)
+      :undefined ->
+        :none
+
+      tid ->
+        case :ets.lookup(tid, :dirty) do
+          [{:dirty, generation, token}]
+          when generation == state.enqueue_seq and is_integer(token) ->
+            {generation, token}
+
+          _other ->
+            :none
+        end
+    end
+  rescue
+    ArgumentError -> :none
+  end
+
+  def clear_projection_dirty_marker(_state, :none), do: :ok
+
+  def clear_projection_dirty_marker(state, {generation, token})
+      when is_reference(generation) and is_integer(token) do
+    delete_projection_dirty_marker(state, {:dirty, generation, token})
+  end
+
+  def clear_projection_dirty_generation(state, generation) when is_reference(generation) do
+    case :ets.whereis(LMDBWriter.projection_outbox_name(state.instance_name, state.shard_index)) do
+      :undefined ->
+        :ok
+
+      tid ->
+        case :ets.lookup(tid, :dirty) do
+          [{:dirty, ^generation, _token} = marker] ->
+            :ets.delete_object(tid, marker)
+            :ok
+
+          _other ->
+            :ok
+        end
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp delete_projection_dirty_marker(state, marker) do
+    case :ets.whereis(LMDBWriter.projection_outbox_name(state.instance_name, state.shard_index)) do
+      :undefined ->
+        :ok
+
+      tid ->
+        :ets.delete_object(tid, marker)
+        :ok
     end
   rescue
     ArgumentError -> :ok

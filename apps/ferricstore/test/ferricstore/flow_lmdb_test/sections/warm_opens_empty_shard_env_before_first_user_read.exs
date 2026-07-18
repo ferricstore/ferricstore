@@ -579,6 +579,87 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
         assert {:ok, "v1"} = Ferricstore.Flow.LMDB.get(path, key)
       end
 
+      test "writer discard rejects projection work reserved before the reset" do
+        old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+        Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+
+        data_dir =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_flow_lmdb_async_discard_barrier_#{System.unique_integer([:positive])}"
+          )
+
+        shard_index = 0
+        instance_name = :"flow_lmdb_async_discard_barrier_#{System.unique_integer([:positive])}"
+        key = "flow:{flow:test}:state:async-discard-barrier"
+        sync_key = "flow:{flow:test}:state:sync-discard-barrier"
+        outbox_key = "flow:{flow:test}:state:outbox-discard-barrier"
+        degraded = :atomics.new(1, signed: false)
+
+        on_exit(fn ->
+          restore_env(:flow_lmdb_flush_interval_ms, old_flush_interval)
+          File.rm_rf!(data_dir)
+        end)
+
+        Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+        writer =
+          start_supervised!(
+            {Ferricstore.Flow.LMDBWriter,
+             shard_index: shard_index,
+             data_dir: data_dir,
+             instance_ctx: %{
+               name: instance_name,
+               flow_lmdb_mirror_degraded: degraded
+             }}
+          )
+
+        path =
+          data_dir
+          |> Ferricstore.DataDir.shard_data_path(shard_index)
+          |> Ferricstore.Flow.LMDB.path()
+
+        seq_ref =
+          :persistent_term.get(
+            {Ferricstore.Flow.LMDBWriter, :enqueue_seq, instance_name, shard_index}
+          )
+
+        seq = :atomics.add_get(seq_ref, 1, 1)
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.discard(instance_name, shard_index)
+
+        assert {:error, :writer_restarted} =
+                 GenServer.call(
+                   writer,
+                   {:enqueue, [{:put, sync_key, "stale"}], [], {seq_ref, 0}}
+                 )
+
+        GenServer.cast(writer, {:enqueue, seq, [{:put, key, "stale"}], [], {seq_ref, 0}})
+
+        outbox = Ferricstore.Flow.LMDBWriter.projection_outbox_name(instance_name, shard_index)
+
+        true =
+          :ets.insert(
+            outbox,
+            {System.unique_integer([:monotonic, :positive]), seq_ref, outbox_key, 1}
+          )
+
+        GenServer.cast(writer, {:projection_outbox_available, seq_ref})
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+        assert :not_found = Ferricstore.Flow.LMDB.get(path, key)
+        assert :not_found = Ferricstore.Flow.LMDB.get(path, sync_key)
+        assert :ets.info(outbox, :size) == 0
+        assert :atomics.get(degraded, 1) == 0
+
+        true = :ets.insert(outbox, {:dirty, seq_ref, 1})
+        GenServer.cast(writer, {:projection_dirty, seq_ref})
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+        assert :ets.info(outbox, :size) == 0
+        assert :atomics.get(degraded, 1) == 0
+      end
+
       test "writer async enqueue preserves after-flush callbacks without LMDB ops" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
         old_flush_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
