@@ -1,8 +1,15 @@
 defmodule Ferricstore.FlowPolicyGenerationTest do
   use ExUnit.Case, async: false
+  @moduletag :global_state
 
   alias Ferricstore.Flow.{Keys, RetryPolicy}
   alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
+
+  setup do
+    assert :ok = ShardHelpers.flush_all_keys()
+    :ok
+  end
 
   test "policy generations are always allocated and advance monotonically" do
     ctx = FerricStore.Instance.get(:default)

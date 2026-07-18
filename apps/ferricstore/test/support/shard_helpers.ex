@@ -82,6 +82,8 @@ defmodule Ferricstore.Test.ShardHelpers do
   @spec replace_default_apply_context(keyword() | map()) :: map()
   def replace_default_apply_context(overrides) when is_list(overrides) or is_map(overrides) do
     wait_shards_alive()
+    ensure_default_waraft_started()
+    wait_default_waraft_ready(10_000)
     instance_key = {FerricStore.Instance, :default}
     original_instance = FerricStore.Instance.get(:default)
     original_backend = :persistent_term.get(@default_waraft_context_key)

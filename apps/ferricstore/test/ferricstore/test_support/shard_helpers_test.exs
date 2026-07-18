@@ -199,6 +199,25 @@ defmodule Ferricstore.Test.ShardHelpersTest do
     assert :ok = ShardHelpers.wait_default_quorum_writable(5_000)
   end
 
+  test "replace_default_apply_context restarts a stopped WARaft backend" do
+    ctx = FerricStore.Instance.get(:default)
+
+    on_exit(fn ->
+      _ = WARaftBackend.start(ctx)
+      ShardHelpers.wait_default_pipeline_ready(30_000)
+    end)
+
+    assert :ok = WARaftBackend.stop()
+
+    snapshot =
+      ShardHelpers.replace_default_apply_context(promotion_threshold: 1)
+
+    on_exit(fn -> ShardHelpers.restore_default_apply_context(snapshot) end)
+
+    assert WARaftBackend.context!(:ferricstore_waraft_backend).apply_context.promotion_threshold ==
+             1
+  end
+
   test "restore_default_waraft! replaces a stopped foreign backend" do
     default_ctx = FerricStore.Instance.get(:default)
     name = :"shard_helpers_foreign_#{System.unique_integer([:positive])}"
