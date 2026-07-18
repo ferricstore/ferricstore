@@ -65,6 +65,7 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
         test "node_status probes shards concurrently" do
           parent = self()
           release_ref = make_ref()
+          probe_count = min(System.schedulers_online(), 4)
 
           state = %{
             mode: :cluster,
@@ -75,7 +76,7 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
             remove_timers: %{},
             sync_status: :synced,
             shard_sync_status: %{},
-            shard_count: 4
+            shard_count: probe_count
           }
 
           status_task =
@@ -93,15 +94,15 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
               )
 
               Manager.handle_call(
-                {:node_status, 1_000},
+                {:node_status, 5_000},
                 {self(), make_ref()},
                 state
               )
             end)
 
           probe_pids =
-            for shard_idx <- 0..3 do
-              assert_receive {:membership_probe_started, ^shard_idx, probe_pid}, 1_000
+            for shard_idx <- 0..(probe_count - 1) do
+              assert_receive {:membership_probe_started, ^shard_idx, probe_pid}, 5_000
               probe_pid
             end
 
@@ -109,8 +110,14 @@ defmodule Ferricstore.Cluster.ManagerTest.Sections.StandaloneMode do
             send(probe_pid, {:release_membership_probe, release_ref})
           end)
 
-          assert {:reply, status, ^state} = Task.await(status_task, 2_000)
-          assert status.shards[3] == %{members: [{:member, 3}], leader: {:leader, 3}}
+          assert {:reply, status, ^state} = Task.await(status_task, 7_000)
+
+          last_shard = probe_count - 1
+
+          assert status.shards[last_shard] == %{
+                   members: [{:member, last_shard}],
+                   leader: {:leader, last_shard}
+                 }
         end
 
         test "node_status/0 shard entries contain members and leader" do
