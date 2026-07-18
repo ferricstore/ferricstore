@@ -94,18 +94,34 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
           :ok = ensure_started()
         end)
 
-        profile_startup_phase(:stop_existing_backend, %{shard_count: ctx.shard_count}, fn ->
-          _ = stop()
-          :ok
-        end)
+        with_startup_write_fence(fn ->
+          profile_startup_phase(:stop_existing_backend, %{shard_count: ctx.shard_count}, fn ->
+            _ = stop()
+            :ok
+          end)
 
-        case profile_startup_phase(
-               :ensure_storage_runtime,
-               %{shard_count: ctx.shard_count},
-               fn -> RuntimeSupervisor.ensure_started() end
-             ) do
-          :ok -> start_after_storage_runtime(ctx, opts, config)
-          {:error, _reason} = error -> cleanup_failed_start(error)
+          case profile_startup_phase(
+                 :ensure_storage_runtime,
+                 %{shard_count: ctx.shard_count},
+                 fn -> RuntimeSupervisor.ensure_started() end
+               ) do
+            :ok -> start_after_storage_runtime(ctx, opts, config)
+            {:error, _reason} = error -> cleanup_failed_start(error)
+          end
+        end)
+      end
+
+      @doc false
+      @spec starting?() :: boolean()
+      def starting?, do: :persistent_term.get(@starting_key, false) == true
+
+      defp with_startup_write_fence(fun) when is_function(fun, 0) do
+        :persistent_term.put(@starting_key, true)
+
+        try do
+          fun.()
+        after
+          :persistent_term.erase(@starting_key)
         end
       end
 

@@ -3,6 +3,7 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   use GenServer
 
+  alias Ferricstore.Raft.WARaftBackend
   alias Ferricstore.Raft.WARaftBackend.SyncGate.TableOwner
 
   @pause_key {__MODULE__, :pause}
@@ -36,22 +37,40 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
   @spec enter(non_neg_integer()) :: {:ok, token()} | {:error, term()}
   def enter(shard_index) when is_integer(shard_index) and shard_index >= 0 do
     with {:ok, token} <- claim(shard_index) do
-      case pause_pid(shard_index) do
-        nil ->
-          {:ok, token}
-
-        pid ->
-          leave(token)
-
-          case await(pid, :infinity) do
-            :ok -> enter(shard_index)
-            {:error, _reason} = error -> error
-          end
-      end
+      admit_or_wait(token)
     end
   end
 
   def enter(shard_index), do: {:error, {:invalid_shard_index, shard_index}}
+
+  defp admit_or_wait(token) do
+    if WARaftBackend.starting?() do
+      reject_startup_admission(token)
+    else
+      wait_for_pause_or_admit(token)
+    end
+  end
+
+  defp reject_startup_admission(token) do
+    leave(token)
+    {:error, :backend_unavailable}
+  end
+
+  defp wait_for_pause_or_admit({shard_index, _admission_ref} = token) do
+    case pause_pid(shard_index) do
+      nil -> {:ok, token}
+      pid -> wait_for_pause(shard_index, token, pid)
+    end
+  end
+
+  defp wait_for_pause(shard_index, token, pid) do
+    leave(token)
+
+    case await(pid, :infinity) do
+      :ok -> enter(shard_index)
+      {:error, _reason} = error -> error
+    end
+  end
 
   @spec enter_many([non_neg_integer()]) :: {:ok, [token()]} | {:error, term()}
   def enter_many(shard_indexes) when is_list(shard_indexes) do
@@ -100,18 +119,36 @@ defmodule Ferricstore.Raft.WARaftBackend.SyncGate do
 
   defp do_enter_many(shard_indexes) do
     with {:ok, tokens} <- claim_many(shard_indexes) do
-      case active_pauses(tokens) do
-        [] ->
-          {:ok, tokens}
+      admit_many_or_wait(shard_indexes, tokens)
+    end
+  end
 
-        pauses ->
-          Enum.each(tokens, &leave/1)
+  defp admit_many_or_wait(shard_indexes, tokens) do
+    if WARaftBackend.starting?() do
+      reject_startup_admissions(tokens)
+    else
+      wait_for_pauses_or_admit(shard_indexes, tokens)
+    end
+  end
 
-          case await_pauses(pauses) do
-            :ok -> do_enter_many(shard_indexes)
-            {:error, _reason} = error -> error
-          end
-      end
+  defp reject_startup_admissions(tokens) do
+    Enum.each(tokens, &leave/1)
+    {:error, :backend_unavailable}
+  end
+
+  defp wait_for_pauses_or_admit(shard_indexes, tokens) do
+    case active_pauses(tokens) do
+      [] -> {:ok, tokens}
+      pauses -> wait_for_pauses(shard_indexes, tokens, pauses)
+    end
+  end
+
+  defp wait_for_pauses(shard_indexes, tokens, pauses) do
+    Enum.each(tokens, &leave/1)
+
+    case await_pauses(pauses) do
+      :ok -> do_enter_many(shard_indexes)
+      {:error, _reason} = error -> error
     end
   end
 

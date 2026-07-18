@@ -18,7 +18,7 @@ All notable changes to FerricStore will be documented here.
 - Added a shared prepared-command contract for parsing, ACL keys, routing keys, and read/write footprints, and moved Flow apply limits into a compact replicated context persisted with WARaft recovery metadata.
 - Canonicalized the beta-only Flow command, projection outbox, and dirty-marker contracts and removed obsolete compatibility paths.
 - Fenced direct LMDB enqueues, outbox rows, and reconciliation markers by writer generation so destructive resets and snapshots cannot publish stale projection work.
-- Made WARaft projection recovery authoritative, hardened promotion recovery and compaction resource release, and prevented deleted projected values from being resurrected.
+- Made WARaft projection recovery authoritative, fenced client writes during restart recovery, hardened promotion recovery and compaction resource release, and prevented deleted projected values from being resurrected.
 - Made expiry, scheduling, history, replay, and maintenance decisions deterministic from replicated command time and HLC state.
 - Bounded batch, transaction, frame, response, allocation, fan-out, reindex, and cleanup work while preserving targeted hot paths and projection batching.
 - Hardened ACL, protected-mode, TLS, path, corruption, admission, rate-governance, and global-concurrency enforcement to fail closed.

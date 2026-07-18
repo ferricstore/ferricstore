@@ -18,6 +18,7 @@ defmodule Ferricstore.Raft.WARaftBackend do
   @sup_id :ferricstore_waraft_backend_sup
   @timeout 10_000
   @context_key {__MODULE__, :context}
+  @starting_key {__MODULE__, :starting}
   @inflight_bytes_key {__MODULE__, :inflight_commit_bytes}
   @max_inflight_bytes_key {__MODULE__, :max_inflight_commit_bytes}
   @shard_count_key {__MODULE__, :shard_count}
