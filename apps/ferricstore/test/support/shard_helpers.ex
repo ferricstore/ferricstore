@@ -261,6 +261,8 @@ defmodule Ferricstore.Test.ShardHelpers do
       Ferricstore.Store.DiskPressure.clear(ctx, i)
     end)
 
+    reset_flow_lmdb_mirror_health()
+
     # Fully reset namespace config overrides so per-prefix commit windows
     # cannot leak across tests and alter batching timings.
     Ferricstore.NamespaceConfig.reset_all()
@@ -270,6 +272,14 @@ defmodule Ferricstore.Test.ShardHelpers do
     reset_keydir_binary_counters(ctx, shard_count)
     reset_memory_guard_pressure()
     :ok
+  end
+
+  defp reset_flow_lmdb_mirror_health do
+    current_ctx = FerricStore.Instance.get(:default)
+
+    Enum.each(0..(current_ctx.shard_count - 1), fn shard_index ->
+      Ferricstore.Flow.LMDBWriter.Telemetry.clear_mirror_degraded(current_ctx, shard_index)
+    end)
   end
 
   def reset_server_auth_state do

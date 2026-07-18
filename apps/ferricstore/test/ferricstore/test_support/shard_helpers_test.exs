@@ -141,6 +141,30 @@ defmodule Ferricstore.Test.ShardHelpersTest do
     refute MemoryGuard.skip_promotion?()
   end
 
+  test "flush_all_keys clears mirror degradation from the current instance context" do
+    instance_key = {FerricStore.Instance, :default}
+    original_ctx = FerricStore.Instance.get(:default)
+    degraded = :atomics.new(original_ctx.shard_count, signed: false)
+    updated_ctx = %{original_ctx | flow_lmdb_mirror_degraded: degraded}
+
+    :persistent_term.put(instance_key, updated_ctx)
+
+    on_exit(fn ->
+      :persistent_term.put(instance_key, original_ctx)
+      ShardHelpers.flush_all_keys()
+    end)
+
+    for slot <- 1..original_ctx.shard_count do
+      :atomics.put(degraded, slot, 1)
+    end
+
+    assert :ok = ShardHelpers.flush_all_keys()
+
+    for slot <- 1..original_ctx.shard_count do
+      assert :atomics.get(degraded, slot) == 0
+    end
+  end
+
   test "flush_all_keys returns only after the default Ra pipeline is apply-ready" do
     ShardHelpers.flush_all_keys()
 
