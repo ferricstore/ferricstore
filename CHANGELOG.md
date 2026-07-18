@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.8.0 - 2026-07-18
+
 - Default governance effect lookups to the Flow ID auto-partition when no explicit partition is provided.
 - Added type-level and per-Flow `max_active_ms` limits with durable timeout failure history, cold-record enforcement, and parent/child coordination.
 - Exposed maximum active runtime through embedded, native TCP, workflow, and dashboard policy surfaces, including an `infinity` override.
@@ -14,6 +16,18 @@ All notable changes to FerricStore will be documented here.
 - Added monotonic internal Flow policy generations and command-captured policy snapshots so policy-sensitive work remains deterministic across independently ordered Raft groups without replacing public policy versions.
 - Replaced synchronous Flow policy reindex scans with a durable exact-type catalog, bounded resumable catalog backfill, and replicated migration plans whose explicit candidates are safe to replay on every replica.
 - Added a shared prepared-command contract for parsing, ACL keys, routing keys, and read/write footprints, and moved Flow apply limits into a compact replicated context persisted with WARaft recovery metadata.
+- Canonicalized the beta-only Flow command, projection outbox, and dirty-marker contracts and removed obsolete compatibility paths.
+- Fenced direct LMDB enqueues, outbox rows, and reconciliation markers by writer generation so destructive resets and snapshots cannot publish stale projection work.
+- Made WARaft projection recovery authoritative, hardened promotion recovery and compaction resource release, and prevented deleted projected values from being resurrected.
+- Made expiry, scheduling, history, replay, and maintenance decisions deterministic from replicated command time and HLC state.
+- Bounded batch, transaction, frame, response, allocation, fan-out, reindex, and cleanup work while preserving targeted hot paths and projection batching.
+- Hardened ACL, protected-mode, TLS, path, corruption, admission, rate-governance, and global-concurrency enforcement to fail closed.
+
+## 0.7.5 - 2026-07-08
+
+- Added dashboard views for Flow details, capabilities, messaging, streams, Pub/Sub, and security state.
+- Added bounded stream and Pub/Sub activity logs with ACL-filtered dashboard live payloads.
+- Expanded health endpoint routing, dashboard access checks, and observability coverage.
 
 ## 0.7.4 - 2026-07-07
 
