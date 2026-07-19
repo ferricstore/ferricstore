@@ -165,6 +165,16 @@ defmodule Ferricstore.Bitcask.NIF do
   def flow_index_claim_due_candidates(_resource, _keys, _max_score, _limit, _max_scan),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec flow_index_fifo_lane_heads(flow_index_resource(), binary(), [binary()]) ::
+          [{binary(), binary(), float() | nil}]
+  def flow_index_fifo_lane_heads(_resource, _due_key, _lane_keys),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_index_fifo_lane_heads_many(flow_index_resource(), [{binary(), binary()}]) ::
+          [{binary(), binary(), binary(), float() | nil}]
+  def flow_index_fifo_lane_heads_many(_resource, _due_lane_keys),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec flow_index_due_keys_present(flow_index_resource(), [binary()], float()) :: [binary()]
   def flow_index_due_keys_present(_resource, _keys, _max_score),
     do: :erlang.nif_error(:nif_not_loaded)

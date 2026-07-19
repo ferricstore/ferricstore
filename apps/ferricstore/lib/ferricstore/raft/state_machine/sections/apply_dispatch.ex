@@ -179,9 +179,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
-      def apply(meta, {:flow_policy_allocate, key, value, expire_at_ms}, state) do
-        apply_flow_pending_with_time(meta, state, :flow_policy_allocate, %{items: 1}, fn ->
-          do_flow_policy_allocate(state, key, value, expire_at_ms)
+      def apply(
+            meta,
+            {:flow_policy_patch_allocate, key, patch, replace?, expected_generation},
+            state
+          ) do
+        apply_flow_pending_with_time(meta, state, :flow_policy_patch_allocate, %{items: 1}, fn ->
+          do_flow_policy_patch_allocate(state, key, patch, replace?, expected_generation)
         end)
       end
 

@@ -1163,6 +1163,18 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
             claimed
 
           {:ok, %{keys: due_keys} = page} ->
+            policy = flow_read_policy(state, type)
+
+            due_keys =
+              flow_order_fifo_catalog_due_keys(
+                state,
+                policy,
+                type,
+                state_filter,
+                due_keys,
+                selection.catalog.entries
+              )
+
             case flow_claim_due_scan_catalog_page_keys(
                    state,
                    due_keys,

@@ -846,6 +846,70 @@ pub fn flow_index_claim_due_candidates<'a>(
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
+pub fn flow_index_fifo_lane_heads<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<FlowOrderedIndexResource>,
+    due_key: Binary<'a>,
+    lane_keys_term: Term<'a>,
+) -> NifResult<Term<'a>> {
+    let Some(lane_keys) =
+        decode_bounded_list::<Binary<'a>>(lane_keys_term, MAX_FLOW_INDEX_REQUEST_ITEMS)?
+    else {
+        return Ok((crate::atoms::error(), FLOW_INDEX_REQUEST_TOO_LARGE).encode(env));
+    };
+
+    let mut budget = FlowIndexRequestBudget::new();
+    budget.add_item([due_key.as_slice()]);
+    for lane_key in &lane_keys {
+        budget.add_item([lane_key.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let rows = {
+        let index = try_index_guard!(env, read_index(&resource));
+        let lane_key_refs = lane_keys
+            .iter()
+            .map(|lane_key| lane_key.as_slice())
+            .collect::<Vec<_>>();
+        index.fifo_lane_heads(due_key.as_slice(), &lane_key_refs)
+    };
+
+    encode_owned_fifo_lane_heads(env, rows)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn flow_index_fifo_lane_heads_many<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<FlowOrderedIndexResource>,
+    due_lane_keys_term: Term<'a>,
+) -> NifResult<Term<'a>> {
+    let Some(due_lane_keys) = decode_bounded_list::<(Binary<'a>, Binary<'a>)>(
+        due_lane_keys_term,
+        MAX_FLOW_INDEX_REQUEST_ITEMS,
+    )?
+    else {
+        return Ok((crate::atoms::error(), FLOW_INDEX_REQUEST_TOO_LARGE).encode(env));
+    };
+
+    let mut budget = FlowIndexRequestBudget::new();
+    for (due_key, lane_key) in &due_lane_keys {
+        budget.add_item([due_key.as_slice(), lane_key.as_slice()]);
+    }
+    enforce_flow_index_request_budget!(env, budget);
+
+    let rows = {
+        let index = try_index_guard!(env, read_index(&resource));
+        let key_refs = due_lane_keys
+            .iter()
+            .map(|(due_key, lane_key)| (due_key.as_slice(), lane_key.as_slice()))
+            .collect::<Vec<_>>();
+        index.fifo_lane_heads_many(&key_refs)
+    };
+
+    encode_owned_fifo_lane_heads_many(env, rows)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
 pub fn flow_index_due_keys_present<'a>(
     env: Env<'a>,
     resource: ResourceArc<FlowOrderedIndexResource>,
@@ -2664,6 +2728,68 @@ impl FlowOrderedIndex {
         rows
     }
 
+    fn fifo_lane_heads(
+        &self,
+        due_key: &[u8],
+        lane_keys: &[&[u8]],
+    ) -> Vec<(Vec<u8>, Vec<u8>, Option<f64>)> {
+        let mut rows = Vec::with_capacity(lane_keys.len());
+
+        for lane_key in lane_keys {
+            let lower = OrderedEntry {
+                key: (*lane_key).to_vec(),
+                score: Score(f64::NEG_INFINITY),
+                member: Vec::new(),
+            };
+
+            let Some(entry) = self.ordered.range(lower..).next() else {
+                continue;
+            };
+
+            if entry.key.as_slice() != *lane_key || entry.member.len() <= 16 {
+                continue;
+            }
+
+            let due_score = self.lookup_score(due_key, &entry.member[16..]).copied();
+            rows.push(((*lane_key).to_vec(), entry.member.clone(), due_score));
+        }
+
+        rows
+    }
+
+    fn fifo_lane_heads_many(
+        &self,
+        due_lane_keys: &[(&[u8], &[u8])],
+    ) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Option<f64>)> {
+        let mut rows = Vec::with_capacity(due_lane_keys.len());
+
+        for (due_key, lane_key) in due_lane_keys {
+            let lower = OrderedEntry {
+                key: (*lane_key).to_vec(),
+                score: Score(f64::NEG_INFINITY),
+                member: Vec::new(),
+            };
+
+            let Some(entry) = self.ordered.range(lower..).next() else {
+                continue;
+            };
+
+            if entry.key.as_slice() != *lane_key || entry.member.len() <= 16 {
+                continue;
+            }
+
+            let due_score = self.lookup_score(due_key, &entry.member[16..]).copied();
+            rows.push((
+                (*due_key).to_vec(),
+                (*lane_key).to_vec(),
+                entry.member.clone(),
+                due_score,
+            ));
+        }
+
+        rows
+    }
+
     fn claim_due_candidates_single_key(
         &self,
         key: &[u8],
@@ -3593,6 +3719,57 @@ fn encode_owned_key_member_score_runs<'a>(
     Ok(terms.encode(env))
 }
 
+fn encode_owned_fifo_lane_heads<'a>(
+    env: Env<'a>,
+    rows: Vec<(Vec<u8>, Vec<u8>, Option<f64>)>,
+) -> NifResult<Term<'a>> {
+    let mut terms = Vec::with_capacity(rows.len());
+
+    for (lane_key, member, due_score) in rows {
+        let score_term = match due_score {
+            Some(score) => score.encode(env),
+            None => crate::atoms::nil().encode(env),
+        };
+
+        terms.push(
+            (
+                binary_term(env, &lane_key)?,
+                binary_term(env, &member)?,
+                score_term,
+            )
+                .encode(env),
+        );
+    }
+
+    Ok(terms.encode(env))
+}
+
+fn encode_owned_fifo_lane_heads_many<'a>(
+    env: Env<'a>,
+    rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Option<f64>)>,
+) -> NifResult<Term<'a>> {
+    let mut terms = Vec::with_capacity(rows.len());
+
+    for (due_key, lane_key, member, due_score) in rows {
+        let score_term = match due_score {
+            Some(score) => score.encode(env),
+            None => crate::atoms::nil().encode(env),
+        };
+
+        terms.push(
+            (
+                binary_term(env, &due_key)?,
+                binary_term(env, &lane_key)?,
+                binary_term(env, &member)?,
+                score_term,
+            )
+                .encode(env),
+        );
+    }
+
+    Ok(terms.encode(env))
+}
+
 fn encode_owned_binaries<'a>(env: Env<'a>, values: Vec<Vec<u8>>) -> NifResult<Term<'a>> {
     let mut terms = Vec::with_capacity(values.len());
 
@@ -3926,6 +4103,8 @@ mod tests {
             "flow_index_delete_entries",
             "flow_index_apply_batch",
             "flow_index_claim_due_candidates",
+            "flow_index_fifo_lane_heads",
+            "flow_index_fifo_lane_heads_many",
             "flow_index_due_keys_present",
             "flow_index_count_many",
             "flow_index_earliest_due_score",

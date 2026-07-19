@@ -463,6 +463,457 @@ defmodule Ferricstore.Flow.InvariantTest do
                )
     end
 
+    test "fifo limit one reclaims an expired lane head before its queued follower" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-limit-one-reclaim-type")
+      partition_key = "tenant:fifo-limit-one-reclaim:#{suffix}"
+      first_id = "z-fifo-limit-one-reclaim-first:#{suffix}"
+      second_id = "a-fifo-limit-one-reclaim-second:#{suffix}"
+
+      put_fifo_policy!(type)
+      create_fifo_flow!(first_id, type, partition_key, now_ms: 1_000, run_at_ms: 2_000)
+      create_fifo_flow!(second_id, type, partition_key, now_ms: 1_001, run_at_ms: 2_000)
+
+      assert {:ok, [%{id: ^first_id}]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 lease_ms: 50,
+                 worker: "old-worker",
+                 now_ms: 2_000
+               )
+
+      assert {:ok, [reclaimed]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 lease_ms: 50,
+                 worker: "new-worker",
+                 now_ms: 2_100
+               )
+
+      assert reclaimed.id == first_id
+      assert reclaimed.lease_owner == "new-worker"
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "follower-worker",
+                 now_ms: 2_101
+               )
+    end
+
+    test "fifo keeps a cold lane head ahead of a hot due follower" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-cold-head-type")
+      partition_key = "tenant:fifo-cold-head:#{suffix}"
+      first_id = "z-fifo-cold-head-first:#{suffix}"
+      second_id = "a-fifo-cold-head-second:#{suffix}"
+      ctx = FerricStore.Instance.get(:default)
+
+      put_fifo_policy!(type)
+      create_fifo_flow!(first_id, type, partition_key, now_ms: 1_000, run_at_ms: 1_000_000)
+      create_fifo_flow!(second_id, type, partition_key, now_ms: 1_001, run_at_ms: 2_000)
+
+      state_key = Ferricstore.Flow.Keys.state_key(first_id, partition_key)
+      shard_index = Ferricstore.Store.Router.shard_for(ctx, state_key)
+
+      {index_table, lookup_table} =
+        Ferricstore.Flow.OrderedIndex.table_names(ctx.name, shard_index)
+
+      assert :ok =
+               Ferricstore.Flow.OrderedIndex.delete_member(
+                 index_table,
+                 lookup_table,
+                 Ferricstore.Flow.Keys.state_index_key(type, "queued", partition_key),
+                 first_id
+               )
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+    end
+
+    test "fifo claims a due lane head beyond the bounded follower scan window" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-deep-head-type")
+      partition_key = "tenant:fifo-deep-head:#{suffix}"
+      head_id = "fifo-deep-head:#{suffix}"
+
+      followers =
+        Enum.map(1..80, fn index ->
+          %{id: "fifo-deep-follower-#{index}:#{suffix}", run_at_ms: 1_000}
+        end)
+
+      put_fifo_policy!(type)
+
+      assert :ok =
+               FerricStore.flow_create_many(
+                 partition_key,
+                 [%{id: head_id, run_at_ms: 2_000} | followers],
+                 type: type,
+                 state: "queued",
+                 now_ms: 500
+               )
+
+      assert {:ok, %{next_run_at_ms: 2_000}} =
+               FerricStore.flow_get(head_id, partition_key: partition_key)
+
+      assert {:ok, %{next_run_at_ms: 1_000}} =
+               FerricStore.flow_get(hd(followers).id, partition_key: partition_key)
+
+      assert {:ok, [%{id: ^head_id}]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+    end
+
+    test "fifo preserves global due order when a deep lane head is injected" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-deep-order-type")
+      partition_key = "tenant:fifo-deep-order:#{suffix}"
+      later_head_id = "fifo-deep-order-later:#{suffix}"
+      earlier_head_id = "fifo-deep-order-earlier:#{suffix}"
+
+      followers =
+        Enum.map(1..80, fn index ->
+          %{id: "fifo-deep-order-follower-#{index}:#{suffix}", run_at_ms: 1_000}
+        end)
+
+      put_fifo_policy!(type, ["first", "second"])
+
+      assert :ok =
+               FerricStore.flow_create_many(
+                 partition_key,
+                 [%{id: later_head_id, run_at_ms: 2_000} | followers],
+                 type: type,
+                 state: "first",
+                 now_ms: 500
+               )
+
+      assert :ok =
+               FerricStore.flow_create(earlier_head_id,
+                 type: type,
+                 state: "second",
+                 partition_key: partition_key,
+                 now_ms: 600,
+                 run_at_ms: 1_500
+               )
+
+      assert {:ok, [%{id: ^earlier_head_id}]} =
+               FerricStore.flow_claim_due(type,
+                 state: :any,
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+    end
+
+    test "fifo times out an expired lane head injected beyond the bounded scan window" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-deep-timeout-type")
+      partition_key = "tenant:fifo-deep-timeout:#{suffix}"
+      head_id = "fifo-deep-timeout-head:#{suffix}"
+
+      followers =
+        Enum.map(1..80, fn index ->
+          %{id: "fifo-deep-timeout-follower-#{index}:#{suffix}", run_at_ms: 1_000}
+        end)
+
+      put_fifo_policy!(type)
+
+      assert :ok =
+               FerricStore.flow_create(head_id,
+                 type: type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 max_active_ms: 100,
+                 now_ms: 500,
+                 run_at_ms: 2_000
+               )
+
+      assert :ok =
+               FerricStore.flow_create_many(partition_key, followers,
+                 type: type,
+                 state: "queued",
+                 now_ms: 600
+               )
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+
+      assert {:ok, %{state: "failed", error: %{reason: "max_active_ms"}}} =
+               FerricStore.flow_get(head_id,
+                 partition_key: partition_key,
+                 full: true
+               )
+
+      first_follower_id = hd(followers).id
+
+      assert {:ok, [%{id: ^first_follower_id}]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_001
+               )
+    end
+
+    test "fifo times out an expired follower while a live lane head blocks claims" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-follower-timeout-type")
+      partition_key = "tenant:fifo-follower-timeout:#{suffix}"
+      head_id = "fifo-follower-timeout-head:#{suffix}"
+      follower_id = "fifo-follower-timeout-follower:#{suffix}"
+
+      put_fifo_policy!(type)
+
+      create_fifo_flow!(head_id, type, partition_key, now_ms: 500, run_at_ms: 3_000)
+
+      assert :ok =
+               FerricStore.flow_create(follower_id,
+                 type: type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 max_active_ms: 100,
+                 now_ms: 600,
+                 run_at_ms: 1_000
+               )
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+
+      assert {:ok, %{state: "queued"}} =
+               FerricStore.flow_get(head_id, partition_key: partition_key)
+
+      assert {:ok, %{state: "failed", error: %{reason: "max_active_ms"}}} =
+               FerricStore.flow_get(follower_id,
+                 partition_key: partition_key,
+                 full: true
+               )
+    end
+
+    test "fifo unlinks a cancelled middle entry without disturbing lane order" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-middle-cancel-type")
+      partition_key = "tenant:fifo-middle-cancel:#{suffix}"
+      first_id = "fifo-middle-cancel-first:#{suffix}"
+      second_id = "fifo-middle-cancel-second:#{suffix}"
+      third_id = "fifo-middle-cancel-third:#{suffix}"
+
+      put_fifo_policy!(type)
+
+      for {id, now_ms} <- [{first_id, 1_000}, {second_id, 1_001}, {third_id, 1_002}] do
+        create_fifo_flow!(id, type, partition_key, now_ms: now_ms, run_at_ms: 2_000)
+      end
+
+      assert :ok =
+               FerricStore.flow_cancel(second_id,
+                 partition_key: partition_key,
+                 fencing_token: 0,
+                 now_ms: 1_500
+               )
+
+      assert {:ok, [first]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+
+      assert first.id == first_id
+
+      assert :ok =
+               FerricStore.flow_complete(first.id, first.lease_token,
+                 fencing_token: first.fencing_token,
+                 partition_key: partition_key,
+                 now_ms: 2_100
+               )
+
+      assert {:ok, [%{id: ^third_id}]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_101
+               )
+    end
+
+    test "enabling fifo on a populated state uses its existing state-entry order" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-activation-type")
+      partition_key = "tenant:fifo-activation:#{suffix}"
+      first_id = "z-fifo-activation-first:#{suffix}"
+      second_id = "a-fifo-activation-second:#{suffix}"
+
+      create_fifo_flow!(first_id, type, partition_key, now_ms: 1_000, run_at_ms: 2_000)
+      create_fifo_flow!(second_id, type, partition_key, now_ms: 1_001, run_at_ms: 2_000)
+      put_fifo_policy!(type)
+
+      assert {:ok, [%{id: ^first_id}]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_000
+               )
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 10,
+                 worker: "fifo-worker",
+                 now_ms: 2_001
+               )
+    end
+
+    test "enabling fifo waits for already leased lane members to drain" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-activation-drain-type")
+      partition_key = "tenant:fifo-activation-drain:#{suffix}"
+      first_id = "fifo-activation-drain-first:#{suffix}"
+      second_id = "fifo-activation-drain-second:#{suffix}"
+
+      create_fifo_flow!(first_id, type, partition_key, now_ms: 1_000, run_at_ms: 5_000)
+      create_fifo_flow!(second_id, type, partition_key, now_ms: 1_001, run_at_ms: 2_000)
+
+      assert {:ok, [running]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "parallel-worker",
+                 now_ms: 2_000
+               )
+
+      assert running.id == second_id
+      put_fifo_policy!(type)
+
+      assert {:ok, []} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 5_000
+               )
+
+      assert :ok =
+               FerricStore.flow_complete(running.id, running.lease_token,
+                 fencing_token: running.fencing_token,
+                 partition_key: partition_key,
+                 now_ms: 5_100
+               )
+
+      assert {:ok, [%{id: ^first_id}]} =
+               FerricStore.flow_claim_due(type,
+                 state: "queued",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 5_101
+               )
+    end
+
+    test "step_continue records a fresh logical state entry order before fifo activation" do
+      suffix = System.unique_integer([:positive])
+      type = unique_flow_id("flow-invariant-fifo-step-entry-type")
+      partition_key = "tenant:fifo-step-entry:#{suffix}"
+      transitioning_id = "fifo-step-entry-transitioning:#{suffix}"
+      waiting_id = "fifo-step-entry-waiting:#{suffix}"
+
+      assert :ok =
+               FerricStore.flow_create(transitioning_id,
+                 type: type,
+                 state: "reserve",
+                 partition_key: partition_key,
+                 now_ms: 1_000,
+                 run_at_ms: 2_000
+               )
+
+      assert :ok =
+               FerricStore.flow_create(waiting_id,
+                 type: type,
+                 state: "charge",
+                 partition_key: partition_key,
+                 now_ms: 1_001,
+                 run_at_ms: 2_200
+               )
+
+      assert {:ok, [claimed]} =
+               FerricStore.flow_claim_due(type,
+                 state: "reserve",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "parallel-worker",
+                 now_ms: 2_000
+               )
+
+      assert {:ok, continued} =
+               FerricStore.flow_step_continue(
+                 transitioning_id,
+                 claimed.lease_token,
+                 "reserve",
+                 "charge",
+                 partition_key: partition_key,
+                 fencing_token: claimed.fencing_token,
+                 worker: "parallel-worker",
+                 now_ms: 2_100
+               )
+
+      assert :ok =
+               FerricStore.flow_retry(transitioning_id, continued.lease_token,
+                 partition_key: partition_key,
+                 fencing_token: continued.fencing_token,
+                 run_at_ms: 2_200,
+                 now_ms: 2_101,
+                 error: %{reason: "retry"}
+               )
+
+      put_fifo_policy!(type, ["charge"])
+
+      assert {:ok, [%{id: ^waiting_id}]} =
+               FerricStore.flow_claim_due(type,
+                 state: "charge",
+                 partition_key: partition_key,
+                 limit: 1,
+                 worker: "fifo-worker",
+                 now_ms: 2_200
+               )
+    end
+
     test "fifo lane unblocks when the running flow transitions out of the fifo state" do
       suffix = System.unique_integer([:positive])
       type = unique_flow_id("flow-invariant-fifo-transition-unblock-type")

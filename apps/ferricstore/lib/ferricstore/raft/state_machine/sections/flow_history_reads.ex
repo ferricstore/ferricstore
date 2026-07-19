@@ -886,6 +886,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
         end
       end
 
+      defp flow_native_delete_entries(_state, []), do: :ok
+
+      defp flow_native_delete_entries(state, entries) do
+        case flow_native_index(state) do
+          nil -> {:error, :flow_native_index_unavailable}
+          native -> flow_native_apply_or_queue(native, {:delete_entries, entries})
+        end
+      end
+
       defp flow_native_apply_claim_entries(_state, []), do: :ok
 
       defp flow_native_apply_claim_entries(state, entries) do

@@ -409,6 +409,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
 
       defp validate_flow_policy_guard(
              state,
+             %{state_key: state_key, absent: true}
+           )
+           when is_binary(state_key) do
+        target_state = cross_shard_state_for_key(state, state_key)
+
+        case flow_read_record_by_key(target_state, state_key) do
+          nil -> :ok
+          _present -> {:error, "ERR stale flow policy target"}
+        end
+      end
+
+      defp validate_flow_policy_guard(
+             state,
              %{state_key: state_key, type: expected_type, incarnation: expected_incarnation}
            )
            when is_binary(state_key) and is_binary(expected_type) and expected_type != "" and

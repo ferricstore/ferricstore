@@ -135,6 +135,11 @@ defmodule FerricStore.API.Flow do
   @doc """
   Stores retry/backpressure and lifecycle policy defaults for a Flow type.
 
+  Updates patch the current policy by default, including nested state settings.
+  Pass `replace: true` for a full replacement, or `expected_generation: n` for
+  compare-and-swap. Successful set/get responses include the replicated,
+  monotonic `:generation`.
+
   `:max_active_ms` is type-level and applies to newly created Flows. A create
   option overrides it for one Flow; `:infinity` disables the type default for
   that Flow. Command-local retry policy still wins over retry defaults.
@@ -150,7 +155,8 @@ defmodule FerricStore.API.Flow do
   def flow_policy_set(_type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
-  Returns effective retry/backpressure policy for a Flow type or state.
+  Returns effective retry/backpressure policy for a Flow type or state,
+  including its replicated monotonic `:generation`.
   """
   @spec flow_policy_get(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_policy_get(type, opts \\ [])

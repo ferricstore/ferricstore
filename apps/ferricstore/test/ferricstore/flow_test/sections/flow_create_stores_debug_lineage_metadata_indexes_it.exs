@@ -870,6 +870,9 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                    now_ms: 2_000
                  )
 
+        created_sequence =
+          flow_parent_lane_sequence("parent", "dispatch", partition, parent)
+
         assert {:ok, waiting} =
                  flow_spawn_children_and_get(
                    parent,
@@ -890,6 +893,11 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
                  )
 
         assert waiting.state == "waiting_children"
+
+        waiting_sequence =
+          flow_parent_lane_sequence("parent", "waiting_children", partition, parent)
+
+        assert waiting_sequence > created_sequence
         assert waiting.child_groups["fanout-1"]["summary"]["completed"] == 0
 
         claimed_a = create_claimed_flow_child(child_a, partition, "worker-a")
@@ -904,6 +912,10 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
 
         assert {:ok, still_waiting} = FerricStore.flow_get(parent, partition_key: partition)
         assert still_waiting.state == "waiting_children"
+
+        assert flow_parent_lane_sequence("parent", "waiting_children", partition, parent) ==
+                 waiting_sequence
+
         assert still_waiting.child_groups["fanout-1"]["summary"]["completed"] == 1
         child_a_result = still_waiting.child_groups["fanout-1"]["results"][child_a]
         assert child_a_result["status"] == "completed"
@@ -920,8 +932,36 @@ defmodule Ferricstore.FlowTest.Sections.FlowCreateStoresDebugLineageMetadataInde
 
         assert {:ok, done_parent} = FerricStore.flow_get(parent, partition_key: partition)
         assert done_parent.state == "children_done"
+
+        assert flow_parent_lane_sequence("parent", "children_done", partition, parent) >
+                 waiting_sequence
+
         assert done_parent.child_groups["fanout-1"]["resolved"] == "success"
         assert done_parent.child_groups["fanout-1"]["summary"]["completed"] == 2
+      end
+
+      defp flow_parent_lane_sequence(type, state, partition_key, id) do
+        ctx = FerricStore.Instance.get(:default)
+        state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+        shard_index = Ferricstore.Store.Router.shard_for(ctx, state_key)
+
+        {index, lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(ctx.name, shard_index)
+
+        native = Ferricstore.Flow.NativeOrderedIndex.get(index, lookup)
+        lane_key = Ferricstore.Flow.FifoLane.lane_key(type, state, partition_key)
+
+        assert [{member, _score}] =
+                 Ferricstore.Flow.NativeOrderedIndex.rank_range(
+                   native,
+                   lane_key,
+                   0,
+                   0,
+                   false
+                 )
+
+        assert {:ok, {sequence, ^id}} = Ferricstore.Flow.FifoLane.decode_member(member)
+        sequence
       end
     end
   end

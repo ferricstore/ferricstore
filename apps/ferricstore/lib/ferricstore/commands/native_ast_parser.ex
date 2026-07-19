@@ -2082,6 +2082,12 @@ defmodule Ferricstore.Commands.NativeAstParser do
           Keyword.has_key?(opts, :max_active_ms) ->
             {:error, "ERR flow max_active_ms is type-level only"}
 
+          Keyword.has_key?(opts, :expected_generation) ->
+            {:error, "ERR flow expected_generation is type-level only"}
+
+          Keyword.has_key?(opts, :replace) ->
+            {:error, "ERR flow replace is type-level only"}
+
           true ->
             {:ok, opts}
         end
@@ -2110,6 +2116,15 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
       "MAX_ACTIVE_MS" ->
         policy_positive_or_infinity(:policy, :max_active_ms, value)
+
+      "EXPECTED_GENERATION" ->
+        policy_non_negative(:policy, :expected_generation, value)
+
+      "REPLACE" ->
+        case parse_bool(value) do
+          {:ok, replace?} -> {:policy, {:replace, replace?}}
+          {:error, _reason} -> {:error, "ERR flow replace must be boolean"}
+        end
 
       "INDEXED_STATE_META" ->
         {:policy, {:indexed_state_meta, value}}

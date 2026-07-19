@@ -22,6 +22,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.PolicyAttributeCatalog
+      alias Ferricstore.Flow.PolicyPatch
       alias Ferricstore.Flow.RetryPolicy
       alias Ferricstore.Flow.StateMeta
       alias Ferricstore.HLC
@@ -321,9 +322,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       defp flow_record_logical_state(_record), do: nil
 
       defp flow_stamp_state_enter_seq_on_change(state, record, next) do
-        if flow_record_logical_state(record) != flow_record_logical_state(next) and
-             Map.get(next, :state) != "running" and
-             not Ferricstore.Flow.LMDB.terminal_state?(Map.get(next, :state)) do
+        next_logical_state = flow_record_logical_state(next)
+
+        if flow_record_logical_state(record) != next_logical_state and
+             not Ferricstore.Flow.LMDB.terminal_state?(next_logical_state) do
           Map.put(next, :state_enter_seq, flow_next_state_enter_seq(state))
         else
           next
@@ -549,6 +551,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       end
 
       defp flow_apply_parent_update(state, record, next, event, now_ms) do
+        next = flow_stamp_state_enter_seq_on_change(state, record, next)
         plans = [{record, next}]
 
         with :ok <- flow_transition_move_indexes(state, plans),
@@ -820,31 +823,85 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
         end
       end
 
-      defp do_flow_policy_allocate(state, key, value, expire_at_ms) do
+      defp do_flow_policy_patch_allocate(
+             state,
+             key,
+             patch,
+             replace?,
+             expected_generation
+           )
+           when is_map(patch) and is_boolean(replace?) do
         case FlowKeys.policy_type(key) do
           {:ok, type} ->
-            case RetryPolicy.decode_flow_policy_entry(value) do
-              {:ok, {0, %{type: ^type} = policy}} ->
-                with {:ok, {stored_generation, _stored_value}} <-
-                       flow_stored_policy_generation_strict(state, key),
-                     {:ok, migration_generation} <-
-                       flow_policy_strict_migration_high_water(state, type),
-                     high_water <- max(stored_generation, migration_generation),
-                     {:ok, generation} <-
-                       Ferricstore.Flow.PolicyMigration.next_generation(high_water),
-                     encoded <- RetryPolicy.encode_flow_policy(policy, generation),
-                     :ok <- do_flow_policy_put(state, key, encoded, expire_at_ms) do
-                  {:ok, encoded}
-                end
-
-              _invalid ->
-                {:error, "ERR invalid flow policy value"}
+            with {:ok, {stored_generation, stored_value}} <-
+                   flow_stored_policy_generation_strict(state, key),
+                 :ok <-
+                   flow_policy_expected_generation_matches(
+                     stored_generation,
+                     expected_generation
+                   ),
+                 {:ok, stored_policy} <- flow_decode_stored_policy(stored_value, type),
+                 policy_attrs <- PolicyPatch.policy_attrs(stored_policy, patch, replace?),
+                 {:ok, policy} <-
+                   RetryPolicy.normalize_flow_policy(
+                     type,
+                     policy_attrs,
+                     raft_apply_context(state)
+                   ),
+                 {:ok, migration_generation} <-
+                   flow_policy_strict_migration_high_water(state, type),
+                 high_water <- max(stored_generation, migration_generation),
+                 {:ok, generation} <-
+                   Ferricstore.Flow.PolicyMigration.next_generation(high_water),
+                 encoded <- RetryPolicy.encode_flow_policy(policy, generation),
+                 :ok <- do_flow_policy_put(state, key, encoded, 0) do
+              {:ok, encoded}
             end
 
           :error ->
             {:error, "ERR invalid flow policy key"}
         end
       end
+
+      defp do_flow_policy_patch_allocate(
+             _state,
+             _key,
+             _patch,
+             _replace?,
+             _expected_generation
+           ),
+           do: {:error, "ERR invalid flow policy patch"}
+
+      defp flow_decode_stored_policy(nil, _type), do: {:ok, nil}
+
+      defp flow_decode_stored_policy(value, type) when is_binary(value) do
+        case RetryPolicy.decode_flow_policy_entry(value) do
+          {:ok, {_generation, %{type: ^type} = policy}} ->
+            {:ok, policy}
+
+          _invalid ->
+            {:error, "ERR corrupt flow policy high-water"}
+        end
+      end
+
+      defp flow_policy_expected_generation_matches(_stored_generation, nil), do: :ok
+
+      defp flow_policy_expected_generation_matches(stored_generation, expected_generation)
+           when is_integer(expected_generation) and expected_generation >= 0 do
+        cond do
+          expected_generation > RetryPolicy.max_policy_generation() ->
+            {:error, "ERR invalid flow policy generation"}
+
+          expected_generation == stored_generation ->
+            :ok
+
+          true ->
+            {:error, "ERR stale flow policy generation"}
+        end
+      end
+
+      defp flow_policy_expected_generation_matches(_stored_generation, _expected_generation),
+        do: {:error, "ERR invalid flow policy generation"}
 
       defp flow_apply_versioned_policy_put(
              state,

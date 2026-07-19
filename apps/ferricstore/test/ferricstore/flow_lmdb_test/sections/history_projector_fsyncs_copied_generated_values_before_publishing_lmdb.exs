@@ -440,6 +440,97 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
         assert wait_until_true(fn -> :ets.lookup(fixture.source_keydir, state_key) == [] end, 20)
       end
 
+      test "live dirty projection repair does not mutate hot Flow indexes" do
+        fixture = start_active_lmdb_projection_fixture!("lagged-dirty-hot-boundary")
+
+        record =
+          active_lmdb_record("flow-lagged-hot-boundary", "lagged-hot-boundary", "queued",
+            partition_key: fixture.partition_key,
+            updated_at_ms: 40,
+            next_run_at_ms: 50,
+            version: 9
+          )
+
+        state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+        encoded = Ferricstore.Flow.encode_record(record)
+
+        :ets.insert(
+          fixture.source_keydir,
+          {state_key, encoded, 0, {:flow_state_version, record.version, 0}, :hot, 0,
+           byte_size(encoded)}
+        )
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(
+            fixture.instance_name,
+            fixture.shard_index
+          )
+
+        native = Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+        sentinel_key = "sentinel:hot-index"
+        :ok = Ferricstore.Flow.NativeOrderedIndex.put_member(native, sentinel_key, "keep", 1)
+
+        {zset_index, zset_lookup} =
+          Ferricstore.Store.Shard.ZSetIndex.table_names(
+            fixture.instance_name,
+            fixture.shard_index
+          )
+
+        :ets.new(zset_index, [:ordered_set, :named_table, :public])
+        :ets.new(zset_lookup, [:set, :named_table, :public])
+
+        on_exit(fn ->
+          Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+          if :ets.info(zset_index) != :undefined, do: :ets.delete(zset_index)
+          if :ets.info(zset_lookup) != :undefined, do: :ets.delete(zset_lookup)
+        end)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.mark_projection_dirty(
+                   fixture.instance_name,
+                   fixture.shard_index
+                 )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.flush(
+                   fixture.instance_name,
+                   fixture.shard_index
+                 )
+
+        state_index_key =
+          Ferricstore.Flow.Keys.state_index_key(record.type, record.state, record.partition_key)
+
+        assert [{"keep", 1.0}] =
+                 Ferricstore.Flow.NativeOrderedIndex.rank_range(
+                   native,
+                   sentinel_key,
+                   0,
+                   0,
+                   false
+                 )
+
+        assert [] =
+                 Ferricstore.Flow.NativeOrderedIndex.rank_range(
+                   native,
+                   state_index_key,
+                   0,
+                   0,
+                   false
+                 )
+
+        assert [] =
+                 Ferricstore.Store.Shard.ZSetIndex.range(
+                   zset_index,
+                   state_index_key,
+                   :neg_inf,
+                   :inf,
+                   false
+                 )
+
+        assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
+        assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+      end
+
       test "empty rebuild does not open LMDB" do
         data_dir =
           Path.join(
@@ -617,7 +708,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
 
         Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
 
-        assert :ok =
+        assert {:error,
+                {:flow_lmdb_reconcile_unhealthy,
+                 %{lmdb_errors: 1, cold_read_errors: 0, history_lmdb_errors: 1}}} =
                  Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
                    shard_path,
                    keydir,
@@ -772,6 +865,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
           next_run_at_ms: 10,
           priority: 0,
           partition_key: "tenant-waraft",
+          state_enter_seq: 1,
           root_flow_id: "flow-waraft-rebuild"
         }
 

@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.Policy do
   @moduledoc false
 
   alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.PolicyPatch
   alias Ferricstore.Flow.RetryPolicy
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
@@ -11,16 +12,11 @@ defmodule Ferricstore.Flow.Policy do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
          :ok <- validate_key_size(Keys.policy_key(type)),
-         {:ok, policy} <- RetryPolicy.normalize_flow_policy(type, opts) do
-      case Router.flow_policy_put_all(
-             ctx,
-             Keys.policy_key(type),
-             RetryPolicy.encode_flow_policy(policy),
-             0
-           ) do
-        :ok -> {:ok, response(type, policy, Keyword.get(opts, :state))}
-        {:error, _reason} = error -> error
-      end
+         {:ok, response_state} <- optional_binary_or_nil(opts, :state, nil),
+         {:ok, expected_generation} <- optional_expected_generation(opts),
+         {:ok, replace?} <- optional_boolean(opts, :replace, false),
+         patch <- PolicyPatch.from_opts(opts) do
+      do_set(ctx, type, patch, response_state, expected_generation, replace?)
     end
   end
 
@@ -34,8 +30,8 @@ defmodule Ferricstore.Flow.Policy do
          :ok <- validate_type(type),
          {:ok, state} <- optional_binary_or_nil(opts, :state, nil),
          :ok <- validate_key_size(Keys.policy_key(type)),
-         {:ok, policy} <- read(ctx, type) do
-      {:ok, response(type, policy, state)}
+         {:ok, {generation, policy}} <- read_entry(ctx, type) do
+      {:ok, response(type, generation, policy, state)}
     end
   end
 
@@ -57,16 +53,29 @@ defmodule Ferricstore.Flow.Policy do
   end
 
   defp read_entry(ctx, type) do
-    case Stats.with_cache_tracking_disabled(fn ->
-           Router.get(ctx, Keys.policy_key(type))
-         end) do
+    result =
+      Stats.with_cache_tracking_disabled(fn ->
+        Router.read_shard_value(ctx, 0, Keys.policy_key(type))
+      end)
+
+    case result do
+      {:ok, value} -> decode_entry(value, type)
+      :unavailable -> {:error, "ERR flow policy shard not available"}
+      {:error, _reason} -> {:error, "ERR flow policy read failed"}
+      _invalid -> {:error, "ERR flow policy read failed"}
+    end
+  end
+
+  defp decode_entry(value, type) do
+    case value do
       nil ->
         {:ok, {0, nil}}
 
       value when is_binary(value) ->
         case RetryPolicy.decode_flow_policy_entry(value) do
-          {:ok, entry} -> {:ok, entry}
+          {:ok, {generation, %{type: ^type} = policy}} -> {:ok, {generation, policy}}
           :error -> {:error, "ERR flow policy is corrupt"}
+          _mismatched -> {:error, "ERR flow policy is corrupt"}
         end
 
       _other ->
@@ -74,11 +83,34 @@ defmodule Ferricstore.Flow.Policy do
     end
   end
 
-  defp response(type, policy, nil) do
+  defp do_set(ctx, type, patch, response_state, expected_generation, replace?) do
+    case Router.flow_policy_patch_all(
+           ctx,
+           Keys.policy_key(type),
+           patch,
+           replace?,
+           expected_generation
+         ) do
+      {:ok, value} when is_binary(value) ->
+        case RetryPolicy.decode_flow_policy_entry(value) do
+          {:ok, {generation, installed_policy}} ->
+            {:ok, response(type, generation, installed_policy, response_state)}
+
+          :error ->
+            {:error, "ERR flow policy allocation failed"}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp response(type, generation, policy, nil) do
     states = Map.get(policy || %{}, :states, %{})
 
     %{
       type: type,
+      generation: generation,
       version: Map.get(policy || %{}, :version),
       max_active_ms: RetryPolicy.resolve_max_active_ms(policy),
       retry: RetryPolicy.resolve(policy, nil, nil),
@@ -100,10 +132,11 @@ defmodule Ferricstore.Flow.Policy do
     }
   end
 
-  defp response(type, policy, state) when is_binary(state) do
+  defp response(type, generation, policy, state) when is_binary(state) do
     %{
       type: type,
       state: state,
+      generation: generation,
       version: Map.get(policy || %{}, :version),
       mode: RetryPolicy.state_mode(policy, state),
       max_active_ms: RetryPolicy.resolve_max_active_ms(policy),
@@ -142,6 +175,30 @@ defmodule Ferricstore.Flow.Policy do
       nil -> {:ok, nil}
       value when is_binary(value) -> {:ok, value}
       _ -> {:error, "ERR flow #{key} must be a string"}
+    end
+  end
+
+  defp optional_expected_generation(opts) do
+    case Keyword.get(opts, :expected_generation) do
+      nil ->
+        {:ok, nil}
+
+      generation when is_integer(generation) and generation >= 0 ->
+        if generation <= RetryPolicy.max_policy_generation() do
+          {:ok, generation}
+        else
+          {:error, "ERR flow expected_generation must be a non-negative integer"}
+        end
+
+      _invalid ->
+        {:error, "ERR flow expected_generation must be a non-negative integer"}
+    end
+  end
+
+  defp optional_boolean(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_boolean(value) -> {:ok, value}
+      _invalid -> {:error, "ERR flow #{key} must be boolean"}
     end
   end
 

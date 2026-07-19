@@ -54,13 +54,19 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
 
   test "active reverse index accepts only bounded unique active-index keys" do
     active_keys =
-      for score <- 1..5 do
+      for score <- 1..6 do
         IndexCodec.active_index_key("index", "id-#{score}", score)
       end
 
-    assert {:ok, ^active_keys} =
+    encoded = IndexCodec.encode_active_index_reverse_value(active_keys)
+
+    assert {:ok, {:flow_active_reverse, ^active_keys, nil}} = TermCodec.decode(encoded)
+    assert {:ok, ^active_keys} = IndexCodec.decode_active_index_reverse_value(encoded)
+    assert :missing = IndexCodec.decode_active_index_reverse_lane_value(encoded)
+
+    assert :error =
              active_keys
-             |> IndexCodec.encode_active_index_reverse_value()
+             |> TermCodec.encode()
              |> IndexCodec.decode_active_index_reverse_value()
 
     malformed = TermCodec.encode([hd(active_keys), 42, List.last(active_keys)])
@@ -69,7 +75,7 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
     for invalid <- [
           ["flow-terminal-count:index"],
           [hd(active_keys), hd(active_keys)],
-          active_keys ++ [IndexCodec.active_index_key("index", "overflow", 6)]
+          active_keys ++ [IndexCodec.active_index_key("index", "overflow", 7)]
         ] do
       assert :error =
                invalid
@@ -80,6 +86,37 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
         IndexCodec.encode_active_index_reverse_value(invalid)
       end
     end
+  end
+
+  test "active reverse metadata accepts the full due-any running projection" do
+    record = %{
+      id: "flow-id",
+      type: "job",
+      state: "running",
+      run_state: "queued",
+      state_enter_seq: 7,
+      updated_at_ms: 10,
+      next_run_at_ms: 20,
+      lease_deadline_ms: 20,
+      lease_owner: "worker-a",
+      created_at_ms: 1,
+      max_active_ms: 100,
+      priority: 0,
+      partition_key: "tenant-a"
+    }
+
+    active_keys =
+      record
+      |> Ferricstore.Flow.LMDB.active_projection_entries(due_any?: true)
+      |> Enum.map(fn {index_key, id, score} ->
+        Ferricstore.Flow.LMDB.active_index_key(index_key, id, score)
+      end)
+
+    assert length(active_keys) == 6
+    lane_entry = Ferricstore.Flow.FifoLane.index_entry(record)
+
+    encoded = IndexCodec.encode_active_index_reverse_value(active_keys, lane_entry)
+    assert {:ok, ^active_keys} = IndexCodec.decode_active_index_reverse_value(encoded)
   end
 
   test "terminal index decoding requires the exact counted schema" do

@@ -22,7 +22,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
-      alias Ferricstore.Flow.RetryPolicy
       alias Ferricstore.HLC
 
       alias Ferricstore.Store.{
@@ -97,8 +96,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
         remaining = limit - length(claimed)
         batch_size = min(max(remaining, 32), max_scan - scanned)
 
+        policy = flow_read_policy(state, type)
+
         candidates =
-          NativeFlowIndex.claim_due_candidates(native, due_keys, now_ms, batch_size, batch_size)
+          native
+          |> NativeFlowIndex.claim_due_candidates(due_keys, now_ms, batch_size, batch_size)
+          |> then(
+            &flow_replace_fifo_candidate_runs(
+              state,
+              policy,
+              type,
+              state_filter,
+              due_keys,
+              &1,
+              now_ms
+            )
+          )
 
         candidate_count = flow_claim_candidate_group_count(candidates)
 
@@ -644,12 +657,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              claimed_count,
              claimed
            ) do
-        with {:ok, candidates, deferred_timeout_records} <-
-               flow_timeout_expired_claim_candidates(
+        with {:ok, candidates, records, deferred_timeout_records, fifo_planning?} <-
+               flow_prepare_claim_candidates(
                  state,
                  due_key,
+                 type,
+                 expected_state,
                  partition_key,
                  candidates,
+                 remaining,
                  now_ms
                ) do
           {plans, stale_due_ids} =
@@ -663,7 +679,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
               now_ms,
               partition_key,
               candidates,
-              remaining
+              records,
+              remaining,
+              fifo_planning?
             )
 
           phase_meta =
@@ -696,28 +714,78 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
         end
       end
 
-      defp flow_timeout_expired_claim_candidates(
+      defp flow_prepare_claim_candidates(
              state,
              due_key,
+             type,
+             state_filter,
              partition_key,
              candidates,
+             remaining,
              now_ms
            ) do
-        records = flow_read_claim_candidate_records(state, partition_key, due_key, candidates)
+        phase_meta =
+          state
+          |> flow_claim_due_phase_meta(partition_key, nil, remaining)
+          |> Map.merge(%{candidates: length(candidates)})
 
-        if Enum.any?(records, fn
+        records =
+          flow_claim_due_phase(:hydrate_records, phase_meta, fn ->
+            flow_read_claim_candidate_records(state, partition_key, due_key, candidates)
+          end)
+
+        policy = flow_read_policy(state, type)
+        fifo_planning? = flow_claim_fifo_planning?(policy, type, state_filter, due_key)
+
+        {selected_candidates, selected_records} =
+          flow_apply_fifo_candidate_ordering(
+            state,
+            policy,
+            type,
+            state_filter,
+            due_key,
+            partition_key,
+            now_ms,
+            candidates,
+            records,
+            fifo_planning?
+          )
+
+        {timeout_candidates, timeout_records} =
+          flow_timeout_candidate_union(
+            candidates,
+            records,
+            selected_candidates,
+            selected_records,
+            fifo_planning?
+          )
+
+        if Enum.any?(timeout_records, fn
              record when is_map(record) -> flow_active_timeout_expired_record?(record, now_ms)
              _other -> false
            end) do
-          flow_timeout_expired_claim_candidates_fresh(
-            state,
-            due_key,
-            partition_key,
-            candidates,
-            now_ms
-          )
+          case flow_timeout_expired_claim_candidates_fresh(
+                 state,
+                 due_key,
+                 partition_key,
+                 timeout_candidates,
+                 now_ms
+               ) do
+            {:ok, active_candidates, active_records, deferred_timeout_records} ->
+              {active_candidates, active_records} =
+                flow_select_preordered_candidates(
+                  active_candidates,
+                  active_records,
+                  selected_candidates
+                )
+
+              {:ok, active_candidates, active_records, deferred_timeout_records, fifo_planning?}
+
+            {:error, _reason} = error ->
+              error
+          end
         else
-          {:ok, candidates, []}
+          {:ok, selected_candidates, selected_records, [], fifo_planning?}
         end
       end
 
@@ -728,29 +796,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              candidates,
              now_ms
            ) do
-        candidates
-        |> Enum.reduce_while({:ok, [], []}, fn candidate, {:ok, active_acc, deferred_acc} ->
-          record =
-            case flow_read_claim_candidate_records(
-                   state,
-                   partition_key,
-                   due_key,
-                   [candidate]
-                 ) do
-              [record] -> record
-              _other -> nil
-            end
+        records =
+          flow_read_claim_candidate_records(state, partition_key, due_key, candidates)
 
-          case flow_maybe_timeout_claim_record(state, record, now_ms) do
-            :active -> {:cont, {:ok, [candidate | active_acc], deferred_acc}}
-            :deferred -> {:cont, {:ok, active_acc, [record | deferred_acc]}}
-            :timed_out -> {:cont, {:ok, active_acc, deferred_acc}}
-            {:error, _reason} = error -> {:halt, error}
+        candidates
+        |> Enum.zip(records)
+        |> Enum.reduce_while(
+          {:ok, [], [], []},
+          fn {candidate, record}, {:ok, candidate_acc, record_acc, deferred_acc} ->
+            case flow_maybe_timeout_claim_record(state, record, now_ms) do
+              :active ->
+                {:cont, {:ok, [candidate | candidate_acc], [record | record_acc], deferred_acc}}
+
+              :deferred ->
+                {:cont, {:ok, candidate_acc, record_acc, [record | deferred_acc]}}
+
+              :timed_out ->
+                {:cont, {:ok, candidate_acc, record_acc, deferred_acc}}
+
+              {:error, _reason} = error ->
+                {:halt, error}
+            end
           end
-        end)
+        )
         |> case do
-          {:ok, active_candidates, deferred_timeout_records} ->
-            {:ok, Enum.reverse(active_candidates), Enum.reverse(deferred_timeout_records)}
+          {:ok, active_candidates, active_records, deferred_timeout_records} ->
+            {:ok, Enum.reverse(active_candidates), Enum.reverse(active_records),
+             Enum.reverse(deferred_timeout_records)}
 
           {:error, _reason} = error ->
             error
@@ -824,10 +896,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              now_ms,
              partition_key,
              candidates,
-             remaining
+             records,
+             remaining,
+             fifo_planning?
            ) do
-        if flow_governance_limit_active?() or
-             flow_claim_fifo_planning?(state, type, state_filter, due_key) do
+        if flow_governance_limit_active?() or fifo_planning? do
           flow_plan_claim_candidates_elixir(
             state,
             due_key,
@@ -838,6 +911,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
             now_ms,
             partition_key,
             candidates,
+            records,
             remaining
           )
         else
@@ -867,6 +941,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
                 now_ms,
                 partition_key,
                 candidates,
+                records,
                 remaining
               )
           end
@@ -883,28 +958,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              now_ms,
              partition_key,
              candidates,
+             records,
              remaining
            ) do
         phase_meta =
           state
           |> flow_claim_due_phase_meta(partition_key, nil, remaining)
           |> Map.merge(%{candidates: length(candidates)})
-
-        records =
-          flow_claim_due_phase(:hydrate_records, phase_meta, fn ->
-            flow_read_claim_candidate_records(state, partition_key, due_key, candidates)
-          end)
-
-        {candidates, records} =
-          flow_apply_fifo_candidate_ordering(
-            state,
-            type,
-            state_filter,
-            due_key,
-            now_ms,
-            candidates,
-            records
-          )
 
         {plans, stale_due_ids, _count} =
           flow_claim_due_phase(:plan_candidates, phase_meta, fn ->
@@ -922,245 +982,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
 
         {Enum.reverse(plans), Enum.reverse(stale_due_ids)}
       end
-
-      defp flow_claim_fifo_planning?(state, type, state_filter, due_key) do
-        policy = flow_read_policy(state, type)
-
-        cond do
-          is_binary(state_filter) ->
-            RetryPolicy.state_fifo?(policy, state_filter)
-
-          is_list(state_filter) ->
-            case flow_due_key_state(type, due_key) do
-              {:ok, flow_state} ->
-                flow_state in state_filter and RetryPolicy.state_fifo?(policy, flow_state)
-
-              :any ->
-                Enum.any?(state_filter, &RetryPolicy.state_fifo?(policy, &1))
-
-              :error ->
-                false
-            end
-
-          match?({:exclude, _state_filter, _exclude_states}, state_filter) ->
-            flow_claim_fifo_planning_for_exclusion?(policy, state_filter, due_key, type)
-
-          true ->
-            case flow_due_key_state(type, due_key) do
-              {:ok, flow_state} -> RetryPolicy.state_fifo?(policy, flow_state)
-              :any -> MapSet.size(RetryPolicy.fifo_states(policy)) > 0
-              :error -> false
-            end
-        end
-      end
-
-      defp flow_claim_fifo_planning_for_exclusion?(
-             policy,
-             {:exclude, state_filter, exclude_states},
-             due_key,
-             type
-           ) do
-        case flow_due_key_state(type, due_key) do
-          {:ok, flow_state} ->
-            flow_state not in exclude_states and RetryPolicy.state_fifo?(policy, flow_state)
-
-          :any ->
-            policy
-            |> RetryPolicy.fifo_states()
-            |> Enum.any?(fn flow_state ->
-              flow_state not in exclude_states and
-                flow_claim_state_match?(state_filter, flow_state)
-            end)
-
-          :error ->
-            false
-        end
-      end
-
-      defp flow_due_key_state(type, due_key) when is_binary(type) and is_binary(due_key) do
-        encoded_type = FlowKeys.index_component(type)
-        marker = "}:d:" <> encoded_type <> ":"
-
-        case :binary.match(due_key, marker) do
-          {pos, len} ->
-            start = pos + len
-            rest = binary_part(due_key, start, byte_size(due_key) - start)
-
-            case :binary.match(rest, ":p") do
-              {state_len, _priority_len} when state_len > 0 ->
-                rest
-                |> binary_part(0, state_len)
-                |> Base.url_decode64(padding: false)
-
-              _other ->
-                :error
-            end
-
-          :nomatch ->
-            if :binary.match(due_key, "}:da:" <> encoded_type <> ":p") == :nomatch do
-              :error
-            else
-              :any
-            end
-        end
-      end
-
-      defp flow_due_key_state(_type, _due_key), do: :error
-
-      defp flow_apply_fifo_candidate_ordering(
-             state,
-             type,
-             state_filter,
-             due_key,
-             now_ms,
-             candidates,
-             records
-           ) do
-        if flow_claim_fifo_planning?(state, type, state_filter, due_key) do
-          candidates
-          |> Enum.zip(records)
-          |> flow_filter_fifo_candidate_pairs(state, now_ms)
-          |> Enum.unzip()
-        else
-          {candidates, records}
-        end
-      end
-
-      defp flow_filter_fifo_candidate_pairs(pairs, state, now_ms) do
-        classified =
-          pairs
-          |> Enum.with_index()
-          |> Enum.map(fn {{_candidate, record} = pair, idx} ->
-            {idx, flow_fifo_candidate_lane(state, record, now_ms), pair}
-          end)
-
-        fifo_pairs =
-          classified
-          |> Enum.filter(fn {_idx, lane, _pair} -> match?({:fifo, _lane}, lane) end)
-          |> Enum.group_by(fn {_idx, {:fifo, lane}, _pair} -> lane end)
-          |> Enum.flat_map(fn {lane, entries} ->
-            flow_select_fifo_lane_candidate(state, lane, entries, now_ms)
-          end)
-
-        pass_through =
-          classified
-          |> Enum.filter(fn
-            {_idx, {:fifo, _lane}, _pair} -> false
-            _entry -> true
-          end)
-          |> Enum.map(fn {idx, _lane, pair} -> {idx, pair} end)
-
-        (fifo_pairs ++ pass_through)
-        |> Enum.sort_by(fn {idx, _pair} -> idx end)
-        |> Enum.map(fn {_idx, pair} -> pair end)
-      end
-
-      defp flow_select_fifo_lane_candidate(state, lane, entries, now_ms) do
-        cond do
-          flow_fifo_lane_active?(state, lane, now_ms) ->
-            []
-
-          true ->
-            head_id = flow_fifo_lane_head_id(state, lane)
-
-            entries
-            |> Enum.find_value(fn {idx, {:fifo, _lane},
-                                   {{candidate_id, _due_score}, record} = pair} ->
-              record_id = Map.get(record || %{}, :id)
-
-              if head_id in [candidate_id, record_id] do
-                {idx, pair}
-              else
-                nil
-              end
-            end)
-            |> case do
-              nil -> []
-              selected -> [selected]
-            end
-        end
-      end
-
-      defp flow_fifo_candidate_lane(_state, nil, _now_ms), do: :stale
-
-      defp flow_fifo_candidate_lane(state, record, _now_ms) when is_map(record) do
-        flow_state = flow_record_logical_state(record)
-        policy = flow_read_policy(state, Map.get(record, :type))
-
-        if RetryPolicy.state_fifo?(policy, flow_state) do
-          {:fifo, {Map.get(record, :type), flow_state, Map.get(record, :partition_key)}}
-        else
-          :parallel
-        end
-      end
-
-      defp flow_fifo_lane_active?(_state, {_type, _flow_state, nil}, _now_ms), do: false
-
-      defp flow_fifo_lane_active?(state, {type, flow_state, partition_key}, now_ms) do
-        key = FlowKeys.inflight_index_key(type, partition_key)
-
-        case flow_index_count_all(state, key) do
-          count when count > 0 ->
-            state
-            |> flow_index_rank_range(key, 0, count - 1, false)
-            |> Enum.any?(fn {id, _score} ->
-              case flow_read_record(state, id, partition_key) do
-                %{state: "running"} = running ->
-                  flow_record_logical_state(running) == flow_state and
-                    flow_live_lease?(running, now_ms)
-
-                _other ->
-                  false
-              end
-            end)
-
-          _count ->
-            false
-        end
-      end
-
-      defp flow_fifo_lane_head_id(_state, {_type, _flow_state, nil}), do: nil
-
-      defp flow_fifo_lane_head_id(state, {type, flow_state, partition_key}) do
-        key = FlowKeys.state_index_key(type, flow_state, partition_key)
-
-        case flow_index_count_all(state, key) do
-          count when count > 0 ->
-            state
-            |> flow_index_rank_range(key, 0, count - 1, false)
-            |> Enum.flat_map(fn {id, _score} ->
-              case flow_read_record(state, id, partition_key) do
-                %{id: record_id, type: ^type} = record
-                when is_binary(record_id) ->
-                  if flow_record_logical_state(record) == flow_state do
-                    [record]
-                  else
-                    []
-                  end
-
-                _other ->
-                  []
-              end
-            end)
-            |> Enum.min_by(&flow_fifo_record_order/1, fn -> nil end)
-            |> case do
-              %{id: id} -> id
-              _other -> nil
-            end
-
-          _count ->
-            nil
-        end
-      end
-
-      defp flow_fifo_record_order(%{state_enter_seq: seq, id: id}) when is_integer(seq),
-        do: {0, seq, id}
-
-      defp flow_fifo_record_order(%{created_at_ms: created_at_ms, id: id})
-           when is_integer(created_at_ms),
-           do: {1, created_at_ms, id}
-
-      defp flow_fifo_record_order(%{id: id}), do: {2, id}
 
       defp flow_plan_claim_candidate_records(
              candidates,

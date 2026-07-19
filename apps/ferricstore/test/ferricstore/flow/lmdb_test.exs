@@ -107,6 +107,24 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
     end
   end
 
+  test "active projection includes due-any only when that index is enabled" do
+    record = %{
+      id: "flow-id",
+      type: "job",
+      state: "queued",
+      updated_at_ms: 10,
+      next_run_at_ms: 20,
+      priority: 1,
+      partition_key: "tenant-a"
+    }
+
+    due_any_entry =
+      {Ferricstore.Flow.Keys.due_any_key("job", 1, "tenant-a"), "flow-id", 20}
+
+    refute due_any_entry in LMDB.active_projection_entries(record, due_any?: false)
+    assert due_any_entry in LMDB.active_projection_entries(record, due_any?: true)
+  end
+
   test "LMDB map sizes remain valid when mutable configuration is malformed" do
     Application.put_env(:ferricstore, :flow_lmdb_map_size, "huge")
     assert LMDB.map_size() == 16 * 1024 * 1024 * 1024

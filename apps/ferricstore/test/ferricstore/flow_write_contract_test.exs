@@ -640,6 +640,24 @@ defmodule Ferricstore.FlowWriteContractTest do
     refute source =~ ":ets.delete(state.flow_lookup_name"
   end
 
+  test "fifo lane maintenance bypasses unrelated due-catalog bookkeeping" do
+    source =
+      File.read!("lib/ferricstore/raft/state_machine/sections/flow_fifo_lane.ex")
+
+    assert source =~ "flow_native_put_new_entries"
+    assert source =~ "flow_native_delete_entries"
+    refute source =~ "flow_index_put_new_entries"
+    refute source =~ "flow_index_delete_members"
+
+    ordering_source =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "flow_filter_fifo_candidate_pairs"
+      )
+
+    refute ordering_source =~ "Enum.sort_by"
+  end
+
   test "flow secondary indexes are not backed by ETS tables at boot or rebuild" do
     sources =
       [
@@ -1568,12 +1586,13 @@ defmodule Ferricstore.FlowWriteContractTest do
     state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
 
     assert [_, policy_put_source] =
-             String.split(router_source, "      def flow_policy_put_all", parts: 2)
+             String.split(router_source, "      def flow_policy_patch_all", parts: 2)
 
     assert [policy_put_source, _] =
              String.split(policy_put_source, "      def flow_get", parts: 2)
 
-    assert policy_put_source =~ "{:flow_policy_allocate, key, value, expire_at_ms}"
+    assert policy_put_source =~ "{:flow_policy_patch_allocate,"
+    assert policy_put_source =~ "key, patch, replace?, expected_generation}"
     assert policy_put_source =~ "flow_policy_install_remaining_shards"
     assert policy_put_source =~ "versioned_value"
     assert router_source =~ "Task.async_stream"
@@ -1581,7 +1600,7 @@ defmodule Ferricstore.FlowWriteContractTest do
     refute router_source =~ "{:cross_shard_tx, shard_batches}"
 
     assert state_machine_source =~ "apply_flow_policy_fence"
-    assert state_machine_source =~ "do_flow_policy_allocate"
+    assert state_machine_source =~ "do_flow_policy_patch_allocate"
     assert state_machine_source =~ "validate_flow_policy_fence"
     assert state_machine_source =~ "install_flow_policy_fence"
   end

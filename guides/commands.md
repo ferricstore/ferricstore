@@ -78,6 +78,32 @@ The limit is measured from Flow creation, is type-level rather than state-level,
 and includes queued, scheduled, running, and retry time. An overdue Flow fails
 with history reason `max_active_ms`.
 
+Configure execution ordering independently for each state in the type policy:
+
+```text
+FLOW.POLICY.SET order STATE queued MODE FIFO STATE review MODE PARALLEL
+```
+
+States are parallel unless configured otherwise. FIFO is a property of the
+type/state/partition lane, so it cannot be overridden by an individual create,
+transition, or claim command. FIFO states require a partition key and do not
+support priority ordering.
+
+Policy updates patch the existing snapshot by default, including nested state
+settings. Use `REPLACE TRUE` for an intentional full replacement. Both
+`FLOW.POLICY.SET` and `FLOW.POLICY.GET` return the replicated monotonic
+`generation`. A caller that read generation 7 can require compare-and-swap:
+
+```text
+FLOW.POLICY.SET order EXPECTED_GENERATION 7 STATE queued MODE FIFO
+```
+
+A mismatched generation returns `ERR stale flow policy generation` without
+changing the policy. Enabling FIFO on a populated state uses the existing
+durable state-entry order. Already-issued parallel leases are not revoked; new
+claims remain blocked behind the earliest active lane entry while those leases
+drain.
+
 Use attributes for values you want to filter or count by, such as tenant,
 region, campaign, device group, or model. Use value refs for large bytes or
 state-specific data. Attribute query projection is asynchronous, so use

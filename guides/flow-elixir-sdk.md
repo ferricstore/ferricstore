@@ -19,9 +19,11 @@ Start with one state that completes or retries:
 defmodule EmailFlow do
   use FerricStore.Flow.Workflow,
     type: "email",
+    partition_by: [:recipient_id],
     initial_state: :queued
 
   state :queued do
+    mode :fifo
     lease_ms 30_000
     on_ok complete()
     on_error retry_or: :failed
@@ -36,9 +38,12 @@ end
 Create and run one unit of work:
 
 ```elixir
+{:ok, _policy} = EmailFlow.install_policy()
+
 {:ok, _flow} =
   EmailFlow.create(%{
     id: "email-1",
+    recipient_id: "user-1",
     payload: "welcome:user-1"
   })
 
@@ -150,8 +155,13 @@ Attrs:
 become:
 
 ```elixir
-partition_key: "t1:i9"
+partition_key: "fpk:2:t12:i9"
 ```
+
+Each component is encoded as its byte length, `":"`, and its bytes after the
+`"fpk:"` prefix. This makes component boundaries unambiguous even when values
+contain `":"`. Other SDKs must implement the same encoding when they derive
+partition keys. Explicit `partition_key` values are passed through unchanged.
 
 Same partition goes to the same shard and keeps ordered Flow behavior.
 
@@ -161,6 +171,25 @@ state is used.
 ## State DSL
 
 `state name do ... end` declares SDK defaults and action rules.
+
+### `mode`
+
+Durable execution mode for this state:
+
+```elixir
+state :queued do
+  mode :fifo
+end
+
+state :review do
+  mode :parallel
+end
+```
+
+Modes are installed by `install_policy/1` through `FLOW.POLICY.SET`; they are
+not attached to individual create, transition, or claim commands. States with
+no declared mode are parallel. FIFO lanes are scoped by Flow type, state, and
+partition key.
 
 ### `lease_ms`
 
@@ -270,7 +299,7 @@ This calls `flow_create/2` with:
 ```elixir
 type: "billing",
 state: "created",
-partition_key: "tenant-a:invoice-123"
+partition_key: "fpk:8:tenant-a11:invoice-123"
 ```
 
 `create_many/2` accepts a list of attrs:
@@ -505,7 +534,7 @@ BillingFlow.get(id, payload: true, payload_max_bytes: 64_000)
 
 ## Installing Policy
 
-The DSL can write retry policy defaults into Flow:
+The DSL can write state execution modes and retry policy defaults into Flow:
 
 ```elixir
 BillingFlow.install_policy()
@@ -516,6 +545,18 @@ This calls:
 ```elixir
 FerricStore.flow_policy_set("billing", states: ...)
 ```
+
+`BillingFlow.install_policy/1` treats the workflow module as the source of truth
+and replaces the stored policy by default, so removing a declaration also
+removes it from the installed policy. Pass `replace: false` only when the
+workflow declaration should patch an existing policy.
+
+Direct `FerricStore.flow_policy_set/2` calls patch by default: omitted type
+fields, states, and nested state settings are preserved. Successful set/get
+responses include the monotonic `generation`; pass
+`expected_generation: generation` when the caller must reject a stale update.
+Concurrent implicit patches are merged atomically by the policy allocator
+without losing either patch.
 
 Command-local retry policy still wins over stored policy. This is useful when
 you want production defaults set once at boot.

@@ -20,6 +20,7 @@ defmodule FerricStore.Flow.Workflow do
           initial_state: :created
 
         state :created do
+          mode :fifo
           lease_ms 60_000
           claim_payload true, max_bytes: 64_000
           retry max_retries: 8,
@@ -60,7 +61,8 @@ defmodule FerricStore.Flow.Workflow do
       `FerricStore`. Use this to point at a `use FerricStore` instance module in
       embedded mode or a fake module in tests.
     * `:partition_by` - list of attr keys used to build `partition_key`. Values
-      are joined with `":"`. Same partition keeps ordering on the same shard.
+      use a collision-free, length-prefixed encoding. Same components produce
+      the same partition and keep ordering on the same shard.
     * `:initial_state` - state used by `create/2`. Defaults to first declared
       state.
 
@@ -68,6 +70,8 @@ defmodule FerricStore.Flow.Workflow do
 
   `state/2` declares defaults for claim and worker behavior:
 
+    * `mode :fifo | :parallel` - durable execution mode installed for this
+      state. Undeclared states are parallel.
     * `lease_ms n` - default lease used by `claim_due/2`.
     * `claim_payload boolean, max_bytes: n` - default payload hydration policy
       for claims.
@@ -156,6 +160,7 @@ defmodule FerricStore.Flow.Workflow do
       import FerricStore.Flow.Workflow,
         only: [
           state: 2,
+          mode: 1,
           retry: 1,
           lease_ms: 1,
           claim_payload: 1,
@@ -189,6 +194,16 @@ defmodule FerricStore.Flow.Workflow do
                                @flow_sdk_state_config,
                                :retry,
                                unquote(opts)
+                             )
+    end
+  end
+
+  defmacro mode(value) do
+    quote do
+      @flow_sdk_state_config FerricStore.Flow.Workflow.put_state_config(
+                               @flow_sdk_state_config,
+                               :mode,
+                               unquote(value)
                              )
     end
   end
@@ -293,11 +308,13 @@ defmodule FerricStore.Flow.Workflow do
       end
 
       @doc """
-      Installs the retry policy declared in this workflow module into the
-      embedded Flow policy store.
+      Installs the state execution and retry policy declared in this workflow
+      module into the embedded Flow policy store. Workflow declarations replace
+      the stored policy by default; pass `replace: false` for an explicit patch.
       """
       def install_policy(opts \\ []) when is_list(opts) do
         policy = FerricStore.Flow.Workflow.policy_opts(unquote(escaped_states))
+        opts = Keyword.put_new(opts, :replace, true)
         unquote(store).flow_policy_set(unquote(type), Keyword.merge(policy, opts))
       end
 
@@ -694,10 +711,14 @@ defmodule FerricStore.Flow.Workflow do
             _ -> retry
           end
 
-        if retry do
-          Map.put(acc, name, retry: retry)
-        else
+        state_policy =
+          [mode: Map.get(config, :mode, :parallel), retry: retry]
+          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+        if state_policy == [] do
           acc
+        else
+          Map.put(acc, name, state_policy)
         end
       end)
 
@@ -889,8 +910,16 @@ defmodule FerricStore.Flow.Workflow do
       end
     end)
     |> case do
-      {:ok, parts} -> {:ok, parts |> Enum.reverse() |> Enum.join(":")}
-      {:error, _reason} = error -> error
+      {:ok, parts} ->
+        partition_key =
+          parts
+          |> Enum.reverse()
+          |> Ferricstore.Flow.PartitionKey.encode_components()
+
+        {:ok, partition_key}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

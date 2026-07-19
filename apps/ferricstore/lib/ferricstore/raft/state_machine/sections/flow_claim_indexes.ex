@@ -105,10 +105,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
       defp flow_claim_move_indexes(_state, []), do: :ok
 
       defp flow_claim_move_indexes(state, plans) do
-        case flow_claim_move_indexes_fast(state, plans) do
-          :ok -> flow_claim_move_due_any_indexes(state, plans)
-          {:error, _reason} = error -> error
-          :fallback -> flow_claim_move_indexes_generic(state, plans)
+        with :ok <- flow_lane_move_plans(state, plans) do
+          case flow_claim_move_indexes_fast(state, plans) do
+            :ok -> flow_claim_move_due_any_indexes(state, plans)
+            {:error, _reason} = error -> error
+            :fallback -> flow_claim_move_indexes_generic(state, plans)
+          end
         end
       end
 
@@ -651,7 +653,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
       defp flow_transition_move_indexes(_state, []), do: :ok
 
       defp flow_transition_move_indexes(state, plans) do
-        with :ok <- flow_transition_move_due_indexes(state, plans),
+        with :ok <- flow_lane_move_plans(state, plans),
+             :ok <- flow_transition_move_due_indexes(state, plans),
              :ok <- flow_transition_move_state_indexes(state, plans),
              :ok <- flow_transition_move_metadata_indexes(state, plans),
              :ok <- flow_transition_move_active_timeout_indexes(state, plans),
@@ -662,7 +665,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
       end
 
       defp flow_terminal_transition_move_indexes(state, plans) do
-        with :ok <- flow_transition_move_due_indexes(state, plans),
+        with :ok <- flow_lane_move_plans(state, plans),
+             :ok <- flow_transition_move_due_indexes(state, plans),
              :ok <- flow_transition_move_state_indexes(state, plans),
              :ok <- flow_transition_move_metadata_indexes(state, plans),
              :ok <- flow_transition_move_active_timeout_indexes(state, plans),

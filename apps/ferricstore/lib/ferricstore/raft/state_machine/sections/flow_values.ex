@@ -564,7 +564,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
                  flow_encode(record),
                  flow_state_record_expire_at(record),
                  record
-               ) do
+               ),
+             :ok <- flow_lane_insert_record(state, record) do
           flow_enqueue_governance_release_intents(state, [{key, record}])
         end
       end

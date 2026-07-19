@@ -70,6 +70,70 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
     assert length(page_sizes) > 1
   end
 
+  test "state entry scans do not misclassify reducer failures as a missing keydir" do
+    keydir = :ets.new(:lmdb_rebuilder_reducer_failure_keydir, [:set])
+    state_key = Keys.state_key("flow-reducer-failure")
+    true = :ets.insert(keydir, {state_key, "value", 0, 0, 0, 1, 5})
+
+    assert_raise ArgumentError, "projection reducer failed", fn ->
+      LMDBRebuilder.__reduce_state_entries_for_test__(keydir, :acc, fn _entries, _acc ->
+        raise ArgumentError, "projection reducer failed"
+      end)
+    end
+  end
+
+  test "online reconciliation preserves active metadata for keydir-evicted cold flows" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_reconcile_cold_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    keydir = :ets.new(:lmdb_rebuilder_cold_preservation_keydir, [:set])
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    cold = active_record("cold-flow", "tenant-cold", 1)
+    cold_state_key = Keys.state_key(cold.id, cold.partition_key)
+    cold_reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(cold_state_key)
+    cold_encoded = Ferricstore.Flow.encode_record(cold)
+
+    cold_ops =
+      [
+        {:put, cold_state_key, Ferricstore.Flow.LMDB.encode_value(cold_encoded, 0)}
+        | Ferricstore.Flow.LMDB.active_timeout_index_put_ops(cold_state_key, cold, 0)
+      ]
+
+    assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, cold_ops)
+    assert {:ok, cold_reverse} = Ferricstore.Flow.LMDB.get(lmdb_path, cold_reverse_key)
+
+    hot = active_record("hot-flow", "tenant-hot", 2)
+    hot_state_key = Keys.state_key(hot.id, hot.partition_key)
+    hot_encoded = Ferricstore.Flow.encode_record(hot)
+
+    true =
+      :ets.insert(
+        keydir,
+        {hot_state_key, hot_encoded, 0, 0, :hot, 0, byte_size(hot_encoded)}
+      )
+
+    assert :ok =
+             LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               0,
+               nil,
+               nil,
+               nil,
+               nil,
+               nil
+             )
+
+    assert {:ok, ^cold_reverse} = Ferricstore.Flow.LMDB.get(lmdb_path, cold_reverse_key)
+  end
+
   test "history rebuild staging retains exact latest events without an all-events map" do
     history_key = "f:{f}:h:flow-1"
 
@@ -93,5 +157,23 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
       File.read!(Path.expand("../../../lib/ferricstore/flow/lmdb_rebuilder.ex", __DIR__))
 
     refute source =~ "history_entries_by_key"
+  end
+
+  defp active_record(id, partition_key, sequence) do
+    %{
+      id: id,
+      type: "job",
+      state: "queued",
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: sequence,
+      updated_at_ms: sequence,
+      next_run_at_ms: 10_000,
+      priority: 0,
+      partition_key: partition_key,
+      state_enter_seq: sequence,
+      root_flow_id: id
+    }
   end
 end

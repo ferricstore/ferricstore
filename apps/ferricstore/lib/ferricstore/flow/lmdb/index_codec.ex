@@ -5,7 +5,10 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
 
   @u64_decimal_zero_pad "00000000000000000000"
   @max_u64 18_446_744_073_709_551_615
-  @max_active_reverse_keys 5
+  @max_active_reverse_keys 6
+  @max_lane_key_bytes 1_048_576
+  @max_lane_member_bytes 65_551
+  @active_reverse_tag :flow_active_reverse
 
   def terminal_index_prefix(state_index_key) when is_binary(state_index_key) do
     "flow-terminal-index:" <> state_index_key <> <<0>>
@@ -263,16 +266,50 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
 
   def encode_active_index_reverse_value(active_keys) when is_list(active_keys) do
     if valid_active_reverse_keys?(active_keys) do
-      TermCodec.encode(active_keys)
+      TermCodec.encode({@active_reverse_tag, active_keys, nil})
     else
       raise ArgumentError, "active reverse index keys are invalid"
     end
   end
 
+  def encode_active_index_reverse_value(active_keys, {lane_key, lane_member, lane_score})
+      when is_list(active_keys) and lane_score in [-1, 0] do
+    if valid_active_reverse_keys?(active_keys, true) and
+         valid_fifo_lane_identity?(lane_key, lane_member) do
+      TermCodec.encode({@active_reverse_tag, active_keys, {lane_key, lane_member, lane_score}})
+    else
+      raise ArgumentError, "active reverse index metadata is invalid"
+    end
+  end
+
   def decode_active_index_reverse_value(blob) when is_binary(blob) do
+    case decode_active_index_reverse_metadata(blob) do
+      {:ok, {active_keys, _lane_entry}} -> {:ok, active_keys}
+      :error -> :error
+    end
+  end
+
+  def decode_active_index_reverse_lane_value(blob) when is_binary(blob) do
+    case decode_active_index_reverse_metadata(blob) do
+      {:ok, {_active_keys, nil}} -> :missing
+      {:ok, {_active_keys, lane_entry}} -> {:ok, lane_entry}
+      :error -> :error
+    end
+  end
+
+  def decode_active_index_reverse_metadata(blob) when is_binary(blob) do
     case TermCodec.decode(blob) do
-      {:ok, active_keys} when is_list(active_keys) ->
-        if valid_active_reverse_keys?(active_keys), do: {:ok, active_keys}, else: :error
+      {:ok, {@active_reverse_tag, active_keys, nil}} when is_list(active_keys) ->
+        if valid_active_reverse_keys?(active_keys), do: {:ok, {active_keys, nil}}, else: :error
+
+      {:ok, {@active_reverse_tag, active_keys, {lane_key, lane_member, lane_score}}}
+      when is_list(active_keys) and lane_score in [-1, 0] ->
+        if valid_active_reverse_keys?(active_keys, true) and
+             valid_fifo_lane_identity?(lane_key, lane_member) do
+          {:ok, {active_keys, {lane_key, lane_member, lane_score}}}
+        else
+          :error
+        end
 
       _ ->
         :error
@@ -282,20 +319,31 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   end
 
   defp valid_active_reverse_keys?(active_keys),
-    do: valid_active_reverse_keys?(active_keys, MapSet.new(), 0)
+    do: valid_active_reverse_keys?(active_keys, false)
 
-  defp valid_active_reverse_keys?([], _seen, count), do: count > 0
+  defp valid_active_reverse_keys?(active_keys, allow_empty?),
+    do: valid_active_reverse_keys?(active_keys, MapSet.new(), 0, allow_empty?)
 
-  defp valid_active_reverse_keys?([key | rest], seen, count)
+  defp valid_active_reverse_keys?([], _seen, count, allow_empty?),
+    do: count > 0 or allow_empty?
+
+  defp valid_active_reverse_keys?([key | rest], seen, count, allow_empty?)
        when is_binary(key) and count < @max_active_reverse_keys do
     if String.starts_with?(key, active_index_global_prefix()) and not MapSet.member?(seen, key) do
-      valid_active_reverse_keys?(rest, MapSet.put(seen, key), count + 1)
+      valid_active_reverse_keys?(rest, MapSet.put(seen, key), count + 1, allow_empty?)
     else
       false
     end
   end
 
-  defp valid_active_reverse_keys?(_invalid, _seen, _count), do: false
+  defp valid_active_reverse_keys?(_invalid, _seen, _count, _allow_empty?), do: false
+
+  defp valid_fifo_lane_identity?(lane_key, <<_sequence::unsigned-big-128, id::binary>>)
+       when is_binary(lane_key) and lane_key != "" and byte_size(lane_key) <= @max_lane_key_bytes and
+              id != "" and byte_size(id) + 16 <= @max_lane_member_bytes,
+       do: String.starts_with?(lane_key, "f:") and String.contains?(lane_key, ":fl:1:")
+
+  defp valid_fifo_lane_identity?(_lane_key, _lane_member), do: false
 
   def encode_terminal_index_value(id, updated_at_ms, expire_at_ms, state_key, count_key)
       when is_binary(id) and is_integer(updated_at_ms) and updated_at_ms >= 0 and

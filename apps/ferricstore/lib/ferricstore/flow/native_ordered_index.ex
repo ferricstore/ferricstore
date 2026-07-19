@@ -286,6 +286,14 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         {:delete_members, key, members}, {puts, put_news, moves, deletes, claims} ->
           {puts, put_news, moves, [{key, members} | deletes], claims}
 
+        {:delete_entries, entries}, {puts, put_news, moves, deletes, claims} ->
+          grouped =
+            entries
+            |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+            |> Map.to_list()
+
+          {puts, put_news, moves, Enum.reverse(grouped, deletes), claims}
+
         {:apply_claim_entries, entries}, {puts, put_news, moves, deletes, claims} ->
           {puts, put_news, moves, deletes, [entries | claims]}
 
@@ -312,6 +320,9 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
 
   def batch_budget({:delete_members, key, members}) when is_binary(key),
     do: delete_batch_budget(key, members, {0, 0})
+
+  def batch_budget({:delete_entries, entries}),
+    do: delete_entries_batch_budget(entries, {0, 0})
 
   def batch_budget({:apply_claim_entries, entries}), do: claim_batch_budget(entries, {0, 0})
   def batch_budget(_invalid), do: {:error, "invalid native Flow index operation"}
@@ -351,6 +362,23 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
       {:ok, score} -> NIF.flow_index_claim_due_candidates(resource, keys, score, limit, max_scan)
       :error -> []
     end
+  end
+
+  @spec fifo_lane_heads(resource(), binary(), [binary()]) ::
+          [{binary(), binary(), float() | nil}]
+  def fifo_lane_heads(_resource, _due_key, []), do: []
+
+  def fifo_lane_heads(resource, due_key, lane_keys)
+      when is_binary(due_key) and is_list(lane_keys) do
+    NIF.flow_index_fifo_lane_heads(resource, due_key, lane_keys)
+  end
+
+  @spec fifo_lane_heads_many(resource(), [{binary(), binary()}]) ::
+          [{binary(), binary(), binary(), float() | nil}]
+  def fifo_lane_heads_many(_resource, []), do: []
+
+  def fifo_lane_heads_many(resource, due_lane_keys) when is_list(due_lane_keys) do
+    NIF.flow_index_fifo_lane_heads_many(resource, due_lane_keys)
   end
 
   @spec due_keys_present(resource(), [binary()], score_input()) :: [binary()]
@@ -522,6 +550,9 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
        when is_binary(key) and is_list(members),
        do: split_batch_entries(members, :delete_members, key, [], {0, 0}, [])
 
+  defp split_oversized_batch_op({:delete_entries, entries}) when is_list(entries),
+    do: split_batch_entries(entries, :delete_entries, nil, [], {0, 0}, [])
+
   defp split_oversized_batch_op({:apply_claim_entries, entries}) when is_list(entries),
     do: split_batch_entries(entries, :apply_claim_entries, nil, [], {0, 0}, [])
 
@@ -589,6 +620,8 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   defp build_batch_op(:delete_members, key, members),
     do: {:delete_members, key, members}
 
+  defp build_batch_op(:delete_entries, _context, entries), do: {:delete_entries, entries}
+
   defp build_batch_op(:apply_claim_entries, _context, entries),
     do: {:apply_claim_entries, entries}
 
@@ -655,6 +688,19 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   end
 
   defp delete_batch_budget(_key, _invalid, _budget),
+    do: {:error, "invalid native Flow index delete"}
+
+  defp delete_entries_batch_budget([], budget), do: {:ok, budget}
+
+  defp delete_entries_batch_budget([{key, member} | entries], budget)
+       when is_binary(key) and is_binary(member) do
+    with {:ok, next_budget} <-
+           add_batch_budget(budget, 1, byte_size(key) + byte_size(member)) do
+      delete_entries_batch_budget(entries, next_budget)
+    end
+  end
+
+  defp delete_entries_batch_budget(_invalid, _budget),
     do: {:error, "invalid native Flow index delete"}
 
   defp claim_batch_budget([], budget), do: {:ok, budget}

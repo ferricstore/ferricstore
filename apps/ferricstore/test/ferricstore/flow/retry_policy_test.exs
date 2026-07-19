@@ -23,4 +23,23 @@ defmodule Ferricstore.Flow.RetryPolicyTest do
     refute Map.has_key?(policy, :max_active_ms)
     assert policy.states == %{"queued" => %{}}
   end
+
+  test "each state retains its independently configured execution mode" do
+    assert {:ok, policy} =
+             RetryPolicy.normalize_flow_policy("ordered-policy",
+               states: %{
+                 "queued" => [mode: :fifo],
+                 "review" => [mode: :parallel]
+               }
+             )
+
+    assert RetryPolicy.state_mode(policy, "queued") == :fifo
+    assert RetryPolicy.state_mode(policy, "review") == :parallel
+    assert RetryPolicy.state_mode(policy, "undeclared") == :parallel
+    assert RetryPolicy.fifo_states(policy) == MapSet.new(["queued"])
+    assert RetryPolicy.any_fifo_state?(policy)
+    assert RetryPolicy.any_fifo_state?(policy, &(&1 == "queued"))
+    refute RetryPolicy.any_fifo_state?(policy, &(&1 == "review"))
+    refute RetryPolicy.any_fifo_state?(nil)
+  end
 end

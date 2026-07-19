@@ -69,15 +69,45 @@ defmodule Ferricstore.Flow.RetryPolicy do
   end
 
   def normalize_flow_policy(type, attrs) when is_binary(type) and is_map(attrs) do
+    do_normalize_flow_policy(type, attrs, max_history_max_events())
+  end
+
+  def normalize_flow_policy(_type, _attrs),
+    do: {:error, "ERR flow policy must be a map or keyword list"}
+
+  @spec normalize_flow_policy(binary(), term(), ApplyContext.t()) ::
+          {:ok, map()} | {:error, binary()}
+  def normalize_flow_policy(type, opts, %ApplyContext{} = context)
+      when is_binary(type) and is_list(opts) do
+    if Keyword.keyword?(opts) do
+      normalize_flow_policy(type, Map.new(opts), context)
+    else
+      {:error, "ERR flow opts must be a keyword list"}
+    end
+  end
+
+  def normalize_flow_policy(type, attrs, %ApplyContext{} = context)
+      when is_binary(type) and is_map(attrs) do
+    do_normalize_flow_policy(type, attrs, context.flow_max_history_max_events)
+  end
+
+  def normalize_flow_policy(_type, _attrs, %ApplyContext{}),
+    do: {:error, "ERR flow policy must be a map or keyword list"}
+
+  defp do_normalize_flow_policy(type, attrs, history_max_events_limit) do
     with :ok <- reject_top_level_state_mode(attrs),
          {:ok, version} <- optional_policy_version(attrs),
          {:ok, max_active_ms} <- optional_max_active_ms(attrs),
          {:ok, retry} <- optional_retry_override(attrs),
-         {:ok, retention} <- optional_retention_override(attrs),
+         {:ok, retention} <- optional_retention_override(attrs, history_max_events_limit),
          {:ok, indexed_attributes} <- optional_indexed_attributes(attrs),
          {:ok, indexed_state_meta} <- optional_indexed_state_meta(attrs),
          {:ok, governance} <- optional_governance(attrs),
-         {:ok, states} <- normalize_state_policies(fetch_policy(attrs, :states, "states", %{})) do
+         {:ok, states} <-
+           normalize_state_policies(
+             fetch_policy(attrs, :states, "states", %{}),
+             history_max_events_limit
+           ) do
       policy =
         %{
           type: type,
@@ -98,9 +128,6 @@ defmodule Ferricstore.Flow.RetryPolicy do
       end
     end
   end
-
-  def normalize_flow_policy(_type, _attrs),
-    do: {:error, "ERR flow policy must be a map or keyword list"}
 
   @spec normalize_override(term()) :: {:ok, map() | nil} | {:error, binary()}
   def normalize_override(nil), do: {:ok, nil}
@@ -149,6 +176,25 @@ defmodule Ferricstore.Flow.RetryPolicy do
   def state_mode(_flow_policy, _state), do: :parallel
 
   def state_fifo?(flow_policy, state), do: state_mode(flow_policy, state) == :fifo
+
+  def any_fifo_state?(%{states: states}) when is_map(states) do
+    Enum.any?(states, fn
+      {_state, %{mode: :fifo}} -> true
+      _other -> false
+    end)
+  end
+
+  def any_fifo_state?(_flow_policy), do: false
+
+  def any_fifo_state?(%{states: states}, predicate)
+      when is_map(states) and is_function(predicate, 1) do
+    Enum.any?(states, fn
+      {state, %{mode: :fifo}} -> predicate.(state)
+      _other -> false
+    end)
+  end
+
+  def any_fifo_state?(_flow_policy, _predicate), do: false
 
   def fifo_states(%{states: states}) when is_map(states) do
     states
@@ -241,20 +287,27 @@ defmodule Ferricstore.Flow.RetryPolicy do
   def governance(%{governance: governance}) when is_map(governance), do: governance
   def governance(_policy), do: nil
 
-  def normalize_retention_override(nil), do: {:ok, nil}
+  def normalize_retention_override(retention) do
+    normalize_retention_override(retention, max_history_max_events())
+  end
 
-  def normalize_retention_override(retention) when is_list(retention) do
+  defp normalize_retention_override(nil, _history_max_events_limit), do: {:ok, nil}
+
+  defp normalize_retention_override(retention, history_max_events_limit)
+       when is_list(retention) do
     if Keyword.keyword?(retention) do
-      retention |> Map.new() |> normalize_retention_override()
+      normalize_retention_override(Map.new(retention), history_max_events_limit)
     else
       {:error, "ERR flow retention policy must be a map or keyword list"}
     end
   end
 
-  def normalize_retention_override(retention) when is_map(retention) do
+  defp normalize_retention_override(retention, history_max_events_limit)
+       when is_map(retention) do
     with {:ok, ttl_ms} <- optional_retention_ttl_ms(retention),
          {:ok, nil} <- optional_history_hot_max_events(retention),
-         {:ok, history_max_events} <- optional_history_max_events(retention) do
+         {:ok, history_max_events} <-
+           optional_history_max_events(retention, history_max_events_limit) do
       override =
         %{}
         |> maybe_put(:ttl_ms, ttl_ms)
@@ -264,7 +317,7 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
-  def normalize_retention_override(_retention),
+  defp normalize_retention_override(_retention, _history_max_events_limit),
     do: {:error, "ERR flow retention policy must be a map or keyword list"}
 
   @spec encode_flow_policy(map()) :: binary()
@@ -513,11 +566,11 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
-  defp optional_retention_override(attrs) do
+  defp optional_retention_override(attrs, history_max_events_limit) do
     if has_policy_key?(attrs, :retention, "retention") do
       attrs
       |> fetch_policy(:retention, "retention", nil)
-      |> normalize_retention_override()
+      |> normalize_retention_override(history_max_events_limit)
     else
       {:ok, nil}
     end
@@ -561,14 +614,15 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
-  defp normalize_state_policies(states) when is_map(states) do
+  defp normalize_state_policies(states, history_max_events_limit) when is_map(states) do
     Enum.reduce_while(states, {:ok, %{}}, fn {state, policy}, {:ok, acc} ->
       with {:ok, state} <- normalize_state_name(state),
            {:ok, policy} <- policy_map(policy),
            :ok <- reject_state_level_max_active_ms(policy),
            {:ok, mode} <- optional_state_mode(policy),
            {:ok, retry} <- optional_retry_override(policy),
-           {:ok, retention} <- optional_retention_override(policy),
+           {:ok, retention} <-
+             optional_retention_override(policy, history_max_events_limit),
            {:ok, governance} <- optional_governance(policy) do
         {:cont,
          {:ok,
@@ -588,20 +642,20 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end)
   end
 
-  defp normalize_state_policies(states) when is_list(states) do
+  defp normalize_state_policies(states, history_max_events_limit) when is_list(states) do
     cond do
       Keyword.keyword?(states) ->
-        states |> Map.new() |> normalize_state_policies()
+        normalize_state_policies(Map.new(states), history_max_events_limit)
 
       Enum.all?(states, &state_policy_pair?/1) ->
-        states |> Map.new() |> normalize_state_policies()
+        normalize_state_policies(Map.new(states), history_max_events_limit)
 
       true ->
         {:error, "ERR flow policy states must be a map, keyword list, or state-policy pair list"}
     end
   end
 
-  defp normalize_state_policies(_states),
+  defp normalize_state_policies(_states, _history_max_events_limit),
     do: {:error, "ERR flow policy states must be a map or keyword list"}
 
   defp normalize_state_name(state) when is_binary(state) and state != "running" and state != "",
@@ -749,29 +803,29 @@ defmodule Ferricstore.Flow.RetryPolicy do
     end
   end
 
-  defp optional_history_max_events(policy) do
+  defp optional_history_max_events(policy, history_max_events_limit) do
     if has_policy_key?(policy, :history_max_events, "history_max_events") do
       policy
       |> fetch_policy(:history_max_events, "history_max_events", nil)
-      |> validate_history_max_events()
+      |> validate_history_max_events(history_max_events_limit)
     else
       {:ok, nil}
     end
   end
 
-  defp validate_history_max_events(value) when is_integer(value) and value > 0 do
-    max = max_history_max_events()
-
-    if value <= max do
+  defp validate_history_max_events(value, history_max_events_limit)
+       when is_integer(value) and value > 0 do
+    if value <= history_max_events_limit do
       {:ok, value}
     else
-      {:error, "ERR flow retention history_max_events must be between 1 and #{max}"}
+      {:error,
+       "ERR flow retention history_max_events must be between 1 and #{history_max_events_limit}"}
     end
   end
 
-  defp validate_history_max_events(_value) do
-    max = max_history_max_events()
-    {:error, "ERR flow retention history_max_events must be between 1 and #{max}"}
+  defp validate_history_max_events(_value, history_max_events_limit) do
+    {:error,
+     "ERR flow retention history_max_events must be between 1 and #{history_max_events_limit}"}
   end
 
   defp normalize_resolved_retention_caps(retention) do

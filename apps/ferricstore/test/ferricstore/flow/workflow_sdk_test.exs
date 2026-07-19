@@ -133,6 +133,23 @@ defmodule FerricStore.Flow.WorkflowSDKTest do
     end
   end
 
+  defmodule OrderedFlow do
+    use FerricStore.Flow.Workflow,
+      type: "ordered",
+      store: FerricStore.Flow.WorkflowSDKTest.Store,
+      partition_by: [:tenant_id],
+      initial_state: :queued
+
+    state :queued do
+      mode(:fifo)
+      retry(max_retries: 2)
+    end
+
+    state :review do
+      mode(:parallel)
+    end
+  end
+
   defmodule WorkerWorkflow do
     def claim_due(state, opts) do
       send(test_pid(), {:worker_claim_due, state, opts})
@@ -178,14 +195,32 @@ defmodule FerricStore.Flow.WorkflowSDKTest do
                correlation_id: "order-1"
              })
 
-    assert record.partition_key == "tenant-a:invoice-1"
+    assert record.partition_key == "fpk:8:tenant-a9:invoice-1"
 
     assert_received {:flow_create, "f1", create_opts}
     assert create_opts[:type] == "billing"
     assert create_opts[:state] == "created"
-    assert create_opts[:partition_key] == "tenant-a:invoice-1"
+    assert create_opts[:partition_key] == "fpk:8:tenant-a9:invoice-1"
     assert create_opts[:payload] == %{amount: 42}
     assert create_opts[:correlation_id] == "order-1"
+  end
+
+  test "derived partition keys cannot collide through component delimiters" do
+    assert {:ok, first} =
+             BillingFlow.create(%{
+               id: "f-partition-first",
+               tenant_id: "a:b",
+               invoice_id: "c"
+             })
+
+    assert {:ok, second} =
+             BillingFlow.create(%{
+               id: "f-partition-second",
+               tenant_id: "a",
+               invoice_id: "b:c"
+             })
+
+    refute first.partition_key == second.partition_key
   end
 
   test "create_many groups by shard in core by passing per-item partition keys" do
@@ -198,8 +233,8 @@ defmodule FerricStore.Flow.WorkflowSDKTest do
     assert_received {:flow_create_many, nil, items, opts}
 
     assert items == [
-             %{id: "f1", partition_key: "tenant-a:1"},
-             %{id: "f2", partition_key: "tenant-b:2"}
+             %{id: "f1", partition_key: "fpk:8:tenant-a1:1"},
+             %{id: "f2", partition_key: "fpk:8:tenant-b1:2"}
            ]
 
     assert opts[:type] == "billing"
@@ -248,7 +283,7 @@ defmodule FerricStore.Flow.WorkflowSDKTest do
              id: "child-1",
              type: "billing",
              state: "created",
-             partition_key: "tenant-a:invoice-1",
+             partition_key: "fpk:8:tenant-a9:invoice-1",
              payload: %{amount: 10}
            } =
              BillingFlow.child(%{
@@ -394,14 +429,42 @@ defmodule FerricStore.Flow.WorkflowSDKTest do
                      [
                        states: %{
                          "created" => [
+                           mode: :parallel,
                            retry: [
                              max_retries: 8,
                              backoff: [kind: :fixed, base_ms: 1_000, max_ms: 60_000],
                              exhausted_to: "failed"
                            ]
-                         ]
-                       }
+                         ],
+                         "charged" => [mode: :parallel]
+                       },
+                       replace: true
                      ]}
+  end
+
+  test "install_policy writes each declared state execution mode" do
+    assert {:ok, _} = OrderedFlow.install_policy()
+
+    assert_received {:flow_policy_set, "ordered",
+                     [
+                       states: %{
+                         "queued" => [
+                           mode: :fifo,
+                           retry: [max_retries: 2]
+                         ],
+                         "review" => [mode: :parallel]
+                       },
+                       replace: true
+                     ]}
+  end
+
+  test "install_policy can explicitly patch an existing policy" do
+    assert {:ok, _} = OrderedFlow.install_policy(replace: false, max_active_ms: 30_000)
+
+    assert_received {:flow_policy_set, "ordered", opts}
+    assert opts[:replace] == false
+    assert opts[:max_active_ms] == 30_000
+    assert opts[:states]["queued"][:mode] == :fifo
   end
 
   test "worker polls claim_due and applies ok result" do

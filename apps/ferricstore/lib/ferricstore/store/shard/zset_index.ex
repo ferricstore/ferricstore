@@ -258,6 +258,21 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
     state
   end
 
+  @spec clear_key_prefix(:ets.tid(), :ets.tid(), binary()) :: :ok
+  def clear_key_prefix(index_table, lookup_table, prefix)
+      when is_binary(prefix) and prefix != "" do
+    clear_key_prefix(index_table, lookup_table, prefix, fn _redis_key -> true end)
+  end
+
+  @spec clear_key_prefix(:ets.tid(), :ets.tid(), binary(), (binary() -> boolean())) :: :ok
+  def clear_key_prefix(index_table, lookup_table, prefix, predicate)
+      when is_binary(prefix) and prefix != "" and is_function(predicate, 1) do
+    first = :ets.next(index_table, first_before(prefix))
+    clear_key_prefix_entries(index_table, lookup_table, prefix, predicate, first)
+  rescue
+    ArgumentError -> :ok
+  end
+
   @spec reset(map()) :: map()
   def reset(state) when is_map(state) do
     state
@@ -285,6 +300,48 @@ defmodule Ferricstore.Store.Shard.ZSetIndex do
   rescue
     ArgumentError -> :ok
   end
+
+  defp clear_key_prefix_entries(
+         _index_table,
+         _lookup_table,
+         _prefix,
+         _predicate,
+         :"$end_of_table"
+       ),
+       do: :ok
+
+  defp clear_key_prefix_entries(
+         index_table,
+         lookup_table,
+         prefix,
+         predicate,
+         {redis_key, @index_tag, _score, _member}
+       )
+       when is_binary(redis_key) do
+    if String.starts_with?(redis_key, prefix) do
+      next = :ets.next(index_table, first_after(redis_key))
+      if predicate.(redis_key), do: clear_key(index_table, lookup_table, redis_key)
+
+      clear_key_prefix_entries(
+        index_table,
+        lookup_table,
+        prefix,
+        predicate,
+        next
+      )
+    else
+      :ok
+    end
+  end
+
+  defp clear_key_prefix_entries(
+         _index_table,
+         _lookup_table,
+         _prefix,
+         _predicate,
+         _unexpected_key
+       ),
+       do: :ok
 
   @spec put_member(:ets.tid(), :ets.tid(), binary(), binary(), binary()) :: :ok
   def put_member(index_table, lookup_table, redis_key, member, score_str) do

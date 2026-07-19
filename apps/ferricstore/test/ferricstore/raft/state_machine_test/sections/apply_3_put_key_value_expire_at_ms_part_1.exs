@@ -550,7 +550,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
         end
 
         @tag :flow_policy_atomicity
-        test "policy allocation ignores unrelated keydir size", %{state: state, ets: ets} do
+        test "policy patch allocation ignores unrelated keydir size", %{state: state, ets: ets} do
           filler_rows =
             Enum.map(1..10_001, fn index ->
               key = "unrelated:#{index}"
@@ -568,12 +568,10 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
               indexed_state_meta: "version"
             )
 
-          policy_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy)
-
           {_new_state, {:ok, stored_value}} =
             StateMachine.apply(
               %{system_time: Ferricstore.HLC.now_ms()},
-              {:flow_policy_allocate, policy_key, policy_value, 0},
+              {:flow_policy_patch_allocate, policy_key, policy, true, nil},
               state
             )
 
@@ -594,7 +592,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
         end
 
         @tag :flow_policy_generation
-        test "policy allocation advances high-water and stale installs cannot overwrite", %{
+        test "policy patch allocation advances high-water and stale installs cannot overwrite", %{
           state: state,
           ets: ets
         } do
@@ -608,7 +606,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 2_000)
 
           stored_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(old_policy, 3)
-          input_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(new_policy)
 
           {_state, :ok} =
             StateMachine.apply(
@@ -620,7 +617,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
           {_state, {:ok, allocated_value}} =
             StateMachine.apply(
               %{system_time: 2_000},
-              {:flow_policy_allocate, policy_key, input_value, 0},
+              {:flow_policy_patch_allocate, policy_key, new_policy, true, nil},
               state
             )
 

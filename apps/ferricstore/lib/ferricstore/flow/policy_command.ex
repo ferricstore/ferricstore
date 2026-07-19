@@ -173,6 +173,9 @@ defmodule Ferricstore.Flow.PolicyCommand do
 
             {:ok, stamped, cache}
           end
+
+        %{guard: guard} when is_map(guard) ->
+          {:ok, Map.put(attrs, :policy_guard, guard), cache}
       end
     end
   end
@@ -255,7 +258,13 @@ defmodule Ferricstore.Flow.PolicyCommand do
 
     case Router.flow_get_with_status(ctx, id, partition_key) do
       nil ->
-        {:ok, nil}
+        {:ok,
+         %{
+           guard: %{
+             state_key: Keys.state_key(id, partition_key),
+             absent: true
+           }
+         }}
 
       :unavailable ->
         {:error, "ERR flow state shard not available"}

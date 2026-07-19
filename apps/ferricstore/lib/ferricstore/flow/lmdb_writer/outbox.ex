@@ -166,21 +166,17 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
         {:error, :source_keydir_unavailable}
 
       keydir ->
-        {zset_index, zset_lookup} =
-          Ferricstore.Store.Shard.ZSetIndex.table_names(state.instance_name, state.shard_index)
-
-        {flow_index, flow_lookup} =
-          Ferricstore.Flow.NativeOrderedIndex.table_names(state.instance_name, state.shard_index)
-
+        # Raft apply owns the hot indexes. Replaying a concurrently changing
+        # keydir from the lagged projector may only repair the cold projection.
         Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
           state.shard_data_path,
           keydir,
           state.shard_index,
           state.instance_ctx,
-          zset_index,
-          zset_lookup,
-          flow_index,
-          flow_lookup,
+          nil,
+          nil,
+          nil,
+          nil,
           prune_terminal_keydir?: true
         )
     end

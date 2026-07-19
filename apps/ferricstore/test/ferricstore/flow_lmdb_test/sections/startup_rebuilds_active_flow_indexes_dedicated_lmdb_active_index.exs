@@ -19,6 +19,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
         shard_index = 0
         source_keydir = :ets.new(:flow_lmdb_active_rebuild_source, [:set])
         empty_recovery_keydir = :ets.new(:flow_lmdb_active_rebuild_empty, [:set])
+        zset_score_index = :ets.new(:flow_lmdb_active_rebuild_score_index, [:ordered_set])
+        zset_score_lookup = :ets.new(:flow_lmdb_active_rebuild_score_lookup, [:set])
 
         on_exit(fn ->
           restore_env(:flow_lmdb_state_rebuild_scan_limit, old_scan_limit)
@@ -26,6 +28,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
 
           if :ets.info(empty_recovery_keydir) != :undefined,
             do: :ets.delete(empty_recovery_keydir)
+
+          if :ets.info(zset_score_index) != :undefined, do: :ets.delete(zset_score_index)
+          if :ets.info(zset_score_lookup) != :undefined, do: :ets.delete(zset_score_lookup)
 
           File.rm_rf!(data_dir)
         end)
@@ -46,6 +51,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
           next_run_at_ms: 10,
           priority: 0,
           partition_key: "tenant-active",
+          state_enter_seq: 1,
+          parent_flow_id: "parent-active",
           root_flow_id: "flow-active"
         }
 
@@ -68,6 +75,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
                  ])
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
+        assert :ok = stop_supervised!(Ferricstore.Flow.LMDBWriter)
 
         assert :ok =
                  Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
@@ -122,6 +130,526 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
                    false,
                    0,
                    :all
+                 )
+
+        lane_key =
+          Ferricstore.Flow.FifoLane.lane_key(record.type, record.state, record.partition_key)
+
+        lane_member = Ferricstore.Flow.FifoLane.member(record.state_enter_seq, record.id)
+        native = Ferricstore.Flow.NativeOrderedIndex.get(flow_index, flow_lookup)
+
+        assert [{^lane_member, lane_score}] =
+                 Ferricstore.Flow.NativeOrderedIndex.rank_range(
+                   native,
+                   lane_key,
+                   0,
+                   0,
+                   false
+                 )
+
+        assert lane_score == 0.0
+
+        parent_index_key =
+          Ferricstore.Flow.Keys.parent_index_key(record.parent_flow_id, record.partition_key)
+
+        assert [{record.id, 2.0}] ==
+                 Ferricstore.Flow.NativeOrderedIndex.rank_range(
+                   native,
+                   parent_index_key,
+                   0,
+                   0,
+                   false
+                 )
+
+        reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+        assert {:ok, reverse_value} = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
+
+        assert {:ok, active_keys} =
+                 Ferricstore.Flow.LMDB.decode_active_index_reverse_value(reverse_value)
+
+        missing_active_key = hd(active_keys)
+
+        assert {:ok, missing_active_value} =
+                 Ferricstore.Flow.LMDB.get(lmdb_path, missing_active_key)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+                   {:delete, missing_active_key}
+                 ])
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        assert {:error, {:missing_active_index_projection, ^missing_active_key}} =
+                 Ferricstore.Flow.LMDBRebuilder.ActiveIndexes.rebuild_flow_indexes_from_lmdb(
+                   lmdb_path,
+                   nil,
+                   nil,
+                   flow_index,
+                   flow_lookup
+                 )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+                   {:put, missing_active_key, missing_active_value}
+                 ])
+
+        corrupt_reverse =
+          Ferricstore.Flow.LMDB.encode_active_index_reverse_value(
+            active_keys,
+            {lane_key, Ferricstore.Flow.FifoLane.member(record.state_enter_seq, "other-flow"), 0}
+          )
+
+        stale_index_key =
+          Ferricstore.Flow.Keys.state_index_key(
+            "stale-startup",
+            "queued",
+            "tenant-active"
+          )
+
+        stale_id = "stale-startup-flow"
+        stale_score = 3
+
+        stale_active_key =
+          Ferricstore.Flow.LMDB.active_index_key(stale_index_key, stale_id, stale_score)
+
+        stale_active_value =
+          Ferricstore.Flow.LMDB.encode_active_index_value(
+            stale_index_key,
+            stale_id,
+            stale_score,
+            0,
+            state_key
+          )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+                   {:put, stale_active_key, stale_active_value}
+                 ])
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        assert {:error, {:active_index_reverse_membership_mismatch, ^stale_active_key}} =
+                 Ferricstore.Flow.LMDBRebuilder.ActiveIndexes.rebuild_flow_indexes_from_lmdb(
+                   lmdb_path,
+                   nil,
+                   nil,
+                   flow_index,
+                   flow_lookup
+                 )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+                   {:delete, stale_active_key},
+                   {:put, reverse_key, corrupt_reverse}
+                 ])
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        assert {:error, {:fifo_lane_reverse_owner_mismatch, ^reverse_key}} =
+                 Ferricstore.Flow.LMDBRebuilder.ActiveIndexes.rebuild_flow_indexes_from_lmdb(
+                   lmdb_path,
+                   nil,
+                   nil,
+                   flow_index,
+                   flow_lookup
+                 )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+                   {:put, stale_active_key, stale_active_value},
+                   Ferricstore.Flow.LMDB.flush_in_progress_delete_op()
+                 ])
+
+        refute Ferricstore.Flow.LMDB.flush_in_progress?(lmdb_path)
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        unrelated_zset_key = "f:{customer}:sorted-set"
+
+        :ok =
+          Ferricstore.Store.Shard.ZSetIndex.put_members(
+            zset_score_index,
+            zset_score_lookup,
+            stale_index_key,
+            [{stale_id, "3"}]
+          )
+
+        :ok =
+          Ferricstore.Store.Shard.ZSetIndex.put_members(
+            zset_score_index,
+            zset_score_lookup,
+            unrelated_zset_key,
+            [{"keep", "7"}]
+          )
+
+        test_pid = self()
+        handler_id = {:fifo_lane_corrupt_startup_repair, make_ref()}
+
+        :ok =
+          :telemetry.attach(
+            handler_id,
+            [:ferricstore, :flow, :lmdb_startup_rebuild],
+            fn _event, measurements, metadata, _config ->
+              send(test_pid, {:fifo_lane_corrupt_startup_repair, measurements, metadata})
+            end,
+            nil
+          )
+
+        on_exit(fn -> :telemetry.detach(handler_id) end)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+                   shard_path,
+                   source_keydir,
+                   shard_index,
+                   %{name: :default, keydir_refs: {source_keydir}},
+                   zset_score_index,
+                   zset_score_lookup,
+                   flow_index,
+                   flow_lookup,
+                   shared_ref_backfill?: false
+                 )
+
+        assert_receive {:fifo_lane_corrupt_startup_repair, repair_measurements,
+                        %{reason: {:active_index_reverse_membership_mismatch, ^stale_active_key}}}
+
+        assert repair_measurements == %{
+                 lmdb_active_rebuilt: 0,
+                 full_reconcile: 1,
+                 lmdb_errors: 1
+               }
+
+        refute Ferricstore.Flow.LMDB.flush_in_progress?(lmdb_path)
+
+        repaired_native = Ferricstore.Flow.NativeOrderedIndex.get(flow_index, flow_lookup)
+
+        assert [{^lane_member, repaired_lane_score}] =
+                 Ferricstore.Flow.NativeOrderedIndex.rank_range(
+                   repaired_native,
+                   lane_key,
+                   0,
+                   0,
+                   false
+                 )
+
+        assert repaired_lane_score == 0.0
+
+        assert [] ==
+                 Ferricstore.Flow.NativeOrderedIndex.rank_range(
+                   repaired_native,
+                   stale_index_key,
+                   0,
+                   0,
+                   false
+                 )
+
+        assert [] ==
+                 Ferricstore.Store.Shard.ZSetIndex.range(
+                   zset_score_index,
+                   stale_index_key,
+                   :neg_inf,
+                   :inf,
+                   false
+                 )
+
+        assert [{"keep", 7.0}] ==
+                 Ferricstore.Store.Shard.ZSetIndex.range(
+                   zset_score_index,
+                   unrelated_zset_key,
+                   :neg_inf,
+                   :inf,
+                   false
+                 )
+      end
+
+      test "startup repair clears a corrupt active projection for an empty authoritative keydir" do
+        data_dir =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_flow_lmdb_empty_projection_repair_#{System.unique_integer([:positive])}"
+          )
+
+        shard_index = 0
+        keydir = :ets.new(:flow_lmdb_empty_projection_repair, [:set])
+
+        on_exit(fn ->
+          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+          File.rm_rf!(data_dir)
+        end)
+
+        Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+        lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+        state_key = Ferricstore.Flow.Keys.state_key("stale-empty", "tenant-empty")
+        index_key = Ferricstore.Flow.Keys.state_index_key("job", "queued", "tenant-empty")
+        active_key = Ferricstore.Flow.LMDB.active_index_key(index_key, "stale-empty", 10)
+
+        active_value =
+          Ferricstore.Flow.LMDB.encode_active_index_value(
+            index_key,
+            "stale-empty",
+            10,
+            0,
+            state_key
+          )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+                   {:put, active_key, active_value}
+                 ])
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(:default, shard_index)
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+                   shard_path,
+                   keydir,
+                   shard_index,
+                   %{name: :default, keydir_refs: {keydir}},
+                   nil,
+                   nil,
+                   flow_index,
+                   flow_lookup,
+                   shared_ref_backfill?: false
+                 )
+
+        assert {:ok, []} =
+                 Ferricstore.Flow.LMDB.prefix_entries_after(
+                   lmdb_path,
+                   Ferricstore.Flow.LMDB.active_index_global_prefix(),
+                   <<>>,
+                   10
+                 )
+
+        refute Ferricstore.Flow.LMDB.flush_in_progress?(lmdb_path)
+      end
+
+      test "startup durably repairs an opaque corrupt active reverse before serving" do
+        data_dir =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_flow_lmdb_corrupt_reverse_#{System.unique_integer([:positive])}"
+          )
+
+        shard_index = 0
+        keydir = :ets.new(:flow_lmdb_corrupt_reverse_keydir, [:set])
+
+        on_exit(fn ->
+          if :ets.info(keydir) != :undefined, do: :ets.delete(keydir)
+          File.rm_rf!(data_dir)
+        end)
+
+        Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+        lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+        record =
+          active_lmdb_record("corrupt-reverse-flow", "corrupt-reverse", "queued",
+            partition_key: "tenant-corrupt-reverse",
+            updated_at_ms: 10,
+            next_run_at_ms: 20
+          )
+
+        state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+        encoded = Ferricstore.Flow.encode_record(record)
+        reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+
+        :ets.insert(keydir, {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)})
+
+        {active_ops, _reverse_value} =
+          Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, record, 0)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(
+                   lmdb_path,
+                   [
+                     {:put, state_key, Ferricstore.Flow.LMDB.encode_value(encoded, 0)}
+                     | active_ops
+                   ] ++ [{:put, reverse_key, "corrupt"}]
+                 )
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(:default, shard_index)
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        startup = fn ->
+          Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
+            shard_path,
+            keydir,
+            shard_index,
+            %{name: :default, keydir_refs: {keydir}},
+            nil,
+            nil,
+            flow_index,
+            flow_lookup,
+            shared_ref_backfill?: false
+          )
+        end
+
+        assert :ok = startup.()
+        refute Ferricstore.Flow.LMDB.flush_in_progress?(lmdb_path)
+        assert {:ok, repaired_reverse} = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
+
+        assert {:ok, _active_keys} =
+                 Ferricstore.Flow.LMDB.decode_active_index_reverse_value(repaired_reverse)
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+        assert :ok = startup.()
+        refute Ferricstore.Flow.LMDB.flush_in_progress?(lmdb_path)
+      end
+
+      test "startup rejects a valid-shaped lane reverse that disagrees with its state record" do
+        data_dir =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_flow_lmdb_wrong_lane_#{System.unique_integer([:positive])}"
+          )
+
+        shard_index = 0
+
+        on_exit(fn -> File.rm_rf!(data_dir) end)
+
+        Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+        lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+        record =
+          active_lmdb_record("wrong-lane-flow", "orders", "queued",
+            partition_key: "tenant-wrong-lane",
+            updated_at_ms: 10,
+            next_run_at_ms: 20,
+            state_enter_seq: 42
+          )
+
+        state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+        reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+        encoded = Ferricstore.Flow.encode_record(record)
+
+        {active_ops, reverse_value} =
+          Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, record, 0)
+
+        assert {:ok, active_keys} =
+                 Ferricstore.Flow.LMDB.decode_active_index_reverse_value(reverse_value)
+
+        wrong_lane_key =
+          Ferricstore.Flow.FifoLane.lane_key(
+            "other-type",
+            "other-state",
+            record.partition_key
+          )
+
+        wrong_reverse =
+          Ferricstore.Flow.LMDB.encode_active_index_reverse_value(
+            active_keys,
+            {wrong_lane_key, Ferricstore.Flow.FifoLane.member(42, record.id), 0}
+          )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(
+                   lmdb_path,
+                   [
+                     {:put, state_key, Ferricstore.Flow.LMDB.encode_value(encoded, 0)}
+                     | active_ops
+                   ] ++ [{:put, reverse_key, wrong_reverse}]
+                 )
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(
+            :wrong_lane_reverse,
+            shard_index
+          )
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        assert {:error, {:fifo_lane_reverse_record_mismatch, ^reverse_key}} =
+                 Ferricstore.Flow.LMDBRebuilder.ActiveIndexes.rebuild_flow_indexes_from_lmdb(
+                   lmdb_path,
+                   nil,
+                   nil,
+                   flow_index,
+                   flow_lookup
+                 )
+      end
+
+      test "startup rejects a partial hot active projection" do
+        data_dir =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore_flow_lmdb_partial_active_#{System.unique_integer([:positive])}"
+          )
+
+        shard_index = 0
+
+        on_exit(fn -> File.rm_rf!(data_dir) end)
+
+        Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+        lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+
+        record =
+          active_lmdb_record("partial-active-flow", "orders", "queued",
+            partition_key: "tenant-partial-active",
+            updated_at_ms: 10,
+            next_run_at_ms: 20,
+            state_enter_seq: 42
+          )
+
+        state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+        reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+        encoded = Ferricstore.Flow.encode_record(record)
+
+        {active_ops, reverse_value} =
+          Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, record, 0)
+
+        assert {:ok, active_keys} =
+                 Ferricstore.Flow.LMDB.decode_active_index_reverse_value(reverse_value)
+
+        state_index_key =
+          Ferricstore.Flow.Keys.state_index_key(record.type, record.state, record.partition_key)
+
+        retained_active_key =
+          Enum.find(active_keys, &String.contains?(&1, state_index_key <> <<0>>))
+
+        retained_active_op =
+          Enum.find(active_ops, fn
+            {:put, ^retained_active_key, _value} -> true
+            _other -> false
+          end)
+
+        lane_entry = Ferricstore.Flow.FifoLane.index_entry(record)
+
+        partial_reverse =
+          Ferricstore.Flow.LMDB.encode_active_index_reverse_value(
+            [retained_active_key],
+            lane_entry
+          )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+                   {:put, state_key, Ferricstore.Flow.LMDB.encode_value(encoded, 0)},
+                   retained_active_op,
+                   {:put, reverse_key, partial_reverse}
+                 ])
+
+        {flow_index, flow_lookup} =
+          Ferricstore.Flow.NativeOrderedIndex.table_names(
+            :partial_active_projection,
+            shard_index
+          )
+
+        Ferricstore.Flow.NativeOrderedIndex.reset(flow_index, flow_lookup)
+
+        assert {:error, {:active_index_reverse_projection_mismatch, ^reverse_key}} =
+                 Ferricstore.Flow.LMDBRebuilder.ActiveIndexes.rebuild_flow_indexes_from_lmdb(
+                   lmdb_path,
+                   nil,
+                   nil,
+                   flow_index,
+                   flow_lookup
                  )
       end
 
@@ -505,18 +1033,18 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
           )
 
         state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+        encoded = Ferricstore.Flow.encode_record(record)
+
+        {active_ops, _reverse_value} =
+          Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, record, 0)
 
         assert :ok =
                  Ferricstore.Flow.LMDB.write_batch(
                    lmdb_path,
-                   elem(
-                     Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(
-                       state_key,
-                       record,
-                       0
-                     ),
-                     0
-                   )
+                   [
+                     {:put, state_key, Ferricstore.Flow.LMDB.encode_value(encoded, 0)}
+                     | active_ops
+                   ]
                  )
 
         {flow_index, flow_lookup} =
@@ -744,11 +1272,15 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
                 )
 
               state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+              encoded = Ferricstore.Flow.encode_record(record)
 
-              elem(
-                Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, record, 0),
-                0
-              )
+              {active_ops, _reverse_value} =
+                Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(state_key, record, 0)
+
+              [
+                {:put, state_key, Ferricstore.Flow.LMDB.encode_value(encoded, 0)}
+                | active_ops
+              ]
             end)
 
           assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, ops)

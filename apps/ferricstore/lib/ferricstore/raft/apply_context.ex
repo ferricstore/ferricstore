@@ -64,7 +64,7 @@ defmodule Ferricstore.Raft.ApplyContext do
     :flow_policy_attribute_catalog_repair,
     :flow_policy_attribute_catalog_repair_request,
     :flow_policy_migration_step,
-    :flow_policy_allocate,
+    :flow_policy_patch_allocate,
     :flow_policy_put,
     :flow_reschedule,
     :flow_retention_cleanup,

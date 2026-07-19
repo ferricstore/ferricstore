@@ -525,6 +525,20 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     assert opts[:max_active_ms] == :infinity
   end
 
+  test "parses Flow policy compare-and-swap and replacement controls through native AST" do
+    assert {:ok, "FLOW.POLICY.SET", _args, {:flow_policy_set, "checkout", opts}, ["checkout"]} =
+             NativeAstParser.parse("flow.policy.set", [
+               "checkout",
+               "EXPECTED_GENERATION",
+               "7",
+               "REPLACE",
+               "TRUE"
+             ])
+
+    assert opts[:expected_generation] == 7
+    assert opts[:replace] == true
+  end
+
   test "rejects state-level Flow policy indexed attributes through native AST" do
     assert {:ok, "FLOW.POLICY.SET", _args,
             {:flow_policy_set, "checkout",

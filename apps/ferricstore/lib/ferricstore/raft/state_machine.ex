@@ -242,6 +242,7 @@ defmodule Ferricstore.Raft.StateMachine do
   use Ferricstore.Raft.StateMachine.Sections.CompoundApply
   use Ferricstore.Raft.StateMachine.Sections.CrossShardPending
   use Ferricstore.Raft.StateMachine.Sections.FlowCreate
+  use Ferricstore.Raft.StateMachine.Sections.FlowFifoLane
   use Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration
   use Ferricstore.Raft.StateMachine.Sections.FlowGovernanceLimit
   use Ferricstore.Raft.StateMachine.Sections.FlowGovernanceReleaseOutbox

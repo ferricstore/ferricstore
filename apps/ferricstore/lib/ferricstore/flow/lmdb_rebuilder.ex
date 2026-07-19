@@ -9,6 +9,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.PolicyMigration
   alias Ferricstore.Flow.SharedRefBackfill
+  alias Ferricstore.Store.Shard.ZSetIndex
 
   @batch_size 512
   @default_history_projection_page_size 4_096
@@ -106,6 +107,11 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       with {:ok, state_entries_present?} <- state_entries_present?(keydir),
            {:ok, marker_started?} <-
              begin_reconcile_marker(lmdb_path, state_entries_present?),
+           :ok <-
+             maybe_reset_active_projection(
+               lmdb_path,
+               Keyword.get(opts, :reset_active_projection?, false)
+             ),
            {:ok, stats} <-
              reduce_state_entries(
                keydir,
@@ -182,9 +188,18 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           %{shard_index: shard_index}
         )
 
-        if healthy? and Keyword.get(opts, :rotate_policy_source?, false),
-          do: PolicyMigration.rotate_source_token(lmdb_path),
-          else: :ok
+        cond do
+          not healthy? ->
+            {:error,
+             {:flow_lmdb_reconcile_unhealthy,
+              Map.take(stats, [:lmdb_errors, :cold_read_errors, :history_lmdb_errors])}}
+
+          Keyword.get(opts, :rotate_policy_source?, false) ->
+            PolicyMigration.rotate_source_token(lmdb_path)
+
+          true ->
+            :ok
+        end
       end
     after
       Process.delete(:flow_lmdb_rebuild_cold_read_errors)
@@ -219,82 +234,94 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     result =
       cond do
         Keyword.get(opts, :force_full_reconcile?, false) ->
-          :ok =
-            reconcile_shard(
-              shard_path,
-              keydir,
-              shard_index,
-              instance_ctx,
-              zset_score_index,
-              zset_score_lookup,
-              flow_index,
-              flow_lookup,
-              rotate_policy_source?: true
-            )
+          case reconcile_shard(
+                 shard_path,
+                 keydir,
+                 shard_index,
+                 instance_ctx,
+                 zset_score_index,
+                 zset_score_lookup,
+                 flow_index,
+                 flow_lookup,
+                 rotate_policy_source?: true,
+                 reset_active_projection?: true
+               ) do
+            :ok ->
+              :telemetry.execute(
+                [:ferricstore, :flow, :lmdb_startup_rebuild],
+                %{lmdb_active_rebuilt: 0, full_reconcile: 1},
+                %{
+                  shard_index: shard_index,
+                  mode: :default_waraft_active_projection,
+                  reason: Keyword.get(opts, :reason, :forced_full_reconcile)
+                }
+              )
 
-          :telemetry.execute(
-            [:ferricstore, :flow, :lmdb_startup_rebuild],
-            %{lmdb_active_rebuilt: 0, full_reconcile: 1},
-            %{
-              shard_index: shard_index,
-              mode: :default_waraft_active_projection,
-              reason: Keyword.get(opts, :reason, :forced_full_reconcile)
-            }
-          )
+              :ok
 
-          :ok
+            {:error, _reason} = error ->
+              error
+          end
 
         LMDB.flush_in_progress?(lmdb_path) ->
-          :ok =
-            reconcile_shard(
-              shard_path,
-              keydir,
-              shard_index,
-              instance_ctx,
-              zset_score_index,
-              zset_score_lookup,
-              flow_index,
-              flow_lookup,
-              rotate_policy_source?: true
-            )
+          case reconcile_shard(
+                 shard_path,
+                 keydir,
+                 shard_index,
+                 instance_ctx,
+                 zset_score_index,
+                 zset_score_lookup,
+                 flow_index,
+                 flow_lookup,
+                 rotate_policy_source?: true,
+                 reset_active_projection?: true
+               ) do
+            :ok ->
+              :telemetry.execute(
+                [:ferricstore, :flow, :lmdb_startup_rebuild],
+                %{lmdb_active_rebuilt: 0, full_reconcile: 1},
+                %{
+                  shard_index: shard_index,
+                  mode: :default_waraft_active_projection,
+                  reason: :incomplete_lmdb_flush
+                }
+              )
 
-          :telemetry.execute(
-            [:ferricstore, :flow, :lmdb_startup_rebuild],
-            %{lmdb_active_rebuilt: 0, full_reconcile: 1},
-            %{
-              shard_index: shard_index,
-              mode: :default_waraft_active_projection,
-              reason: :incomplete_lmdb_flush
-            }
-          )
+              :ok
 
-          :ok
+            {:error, _reason} = error ->
+              error
+          end
 
         not LMDB.env_present?(lmdb_path) ->
-          :ok =
-            reconcile_shard(
-              shard_path,
-              keydir,
-              shard_index,
-              instance_ctx,
-              zset_score_index,
-              zset_score_lookup,
-              flow_index,
-              flow_lookup,
-              rotate_policy_source?: true
-            )
+          case reconcile_shard(
+                 shard_path,
+                 keydir,
+                 shard_index,
+                 instance_ctx,
+                 zset_score_index,
+                 zset_score_lookup,
+                 flow_index,
+                 flow_lookup,
+                 rotate_policy_source?: true,
+                 reset_active_projection?: true
+               ) do
+            :ok ->
+              :telemetry.execute(
+                [:ferricstore, :flow, :lmdb_startup_rebuild],
+                %{lmdb_active_rebuilt: 0, full_reconcile: 1},
+                %{
+                  shard_index: shard_index,
+                  mode: :default_waraft_active_projection,
+                  reason: :missing_lmdb_env
+                }
+              )
 
-          :telemetry.execute(
-            [:ferricstore, :flow, :lmdb_startup_rebuild],
-            %{lmdb_active_rebuilt: 0, full_reconcile: 1},
-            %{
-              shard_index: shard_index,
-              mode: :default_waraft_active_projection,
-              reason: :missing_lmdb_env
-            }
-          )
+              :ok
 
-          :ok
+            {:error, _reason} = error ->
+              error
+          end
 
         true ->
           case ActiveIndexes.rebuild_flow_indexes_from_lmdb(
@@ -314,24 +341,17 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
               :ok
 
             {:error, reason} ->
-              _ = LMDB.write_batch(lmdb_path, [LMDB.flush_in_progress_put_op()])
-
-              ColdState.publish_mirror_health(instance_ctx, shard_index, %{
-                lmdb_errors: 1,
-                cold_read_errors: 0
-              })
-
-              :telemetry.execute(
-                [:ferricstore, :flow, :lmdb_startup_rebuild],
-                %{lmdb_active_rebuilt: 0, full_reconcile: 0, lmdb_errors: 1},
-                %{
-                  shard_index: shard_index,
-                  mode: :default_waraft_active_projection,
-                  reason: reason
-                }
+              repair_invalid_startup_active_projection(
+                shard_path,
+                keydir,
+                shard_index,
+                instance_ctx,
+                zset_score_index,
+                zset_score_lookup,
+                flow_index,
+                flow_lookup,
+                reason
               )
-
-              :ok
           end
       end
 
@@ -380,6 +400,94 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         opts
       )
     end
+  end
+
+  defp repair_invalid_startup_active_projection(
+         shard_path,
+         keydir,
+         shard_index,
+         instance_ctx,
+         zset_score_index,
+         zset_score_lookup,
+         flow_index,
+         flow_lookup,
+         reason
+       ) do
+    lmdb_path = LMDB.path(shard_path)
+
+    result =
+      with :ok <-
+             reset_startup_active_indexes(
+               zset_score_index,
+               zset_score_lookup,
+               flow_index,
+               flow_lookup
+             ) do
+        reconcile_shard(
+          shard_path,
+          keydir,
+          shard_index,
+          instance_ctx,
+          zset_score_index,
+          zset_score_lookup,
+          flow_index,
+          flow_lookup,
+          rotate_policy_source?: true,
+          reset_active_projection?: true
+        )
+      end
+
+    :telemetry.execute(
+      [:ferricstore, :flow, :lmdb_startup_rebuild],
+      %{lmdb_active_rebuilt: 0, full_reconcile: 1, lmdb_errors: 1},
+      %{
+        shard_index: shard_index,
+        mode: :default_waraft_active_projection,
+        reason: reason
+      }
+    )
+
+    case {result, LMDB.flush_in_progress?(lmdb_path)} do
+      {:ok, false} ->
+        :ok
+
+      {{:error, _repair_reason} = error, _marker_state} ->
+        error
+
+      {_invalid_or_unhealthy, _marker_state} ->
+        {:error, {:flow_lmdb_startup_reconcile_failed, reason}}
+    end
+  end
+
+  defp reset_startup_active_indexes(
+         zset_score_index,
+         zset_score_lookup,
+         flow_index,
+         flow_lookup
+       ) do
+    with :ok <- reset_startup_flow_score_index(zset_score_index, zset_score_lookup) do
+      reset_startup_flow_index(flow_index, flow_lookup)
+    end
+  end
+
+  defp reset_startup_flow_score_index(nil, _zset_score_lookup), do: :ok
+  defp reset_startup_flow_score_index(_zset_score_index, nil), do: :ok
+
+  defp reset_startup_flow_score_index(zset_score_index, zset_score_lookup) do
+    ZSetIndex.clear_key_prefix(
+      zset_score_index,
+      zset_score_lookup,
+      "f:{",
+      &Ferricstore.Flow.InternalKey.internal?/1
+    )
+  end
+
+  defp reset_startup_flow_index(nil, _flow_lookup), do: :ok
+  defp reset_startup_flow_index(_flow_index, nil), do: :ok
+
+  defp reset_startup_flow_index(flow_index, flow_lookup) do
+    _resource = NativeFlowIndex.reset(flow_index, flow_lookup)
+    :ok
   end
 
   defp maybe_run_shared_ref_backfill(
@@ -531,10 +639,26 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                 key
               )
 
-            reconcile_ops = [state_put_op | attribute_ops]
+            {active_ops, next_read_errors} =
+              case LMDB.active_index_delete_ops_result(lmdb_path, key) do
+                {:ok, active_delete_ops} ->
+                  {active_put_ops, _reverse_value} =
+                    LMDB.active_index_put_ops_with_reverse(
+                      key,
+                      record,
+                      projection_expire_at_ms
+                    )
+
+                  {active_delete_ops ++ active_put_ops, read_errors}
+
+                {:error, _reason} ->
+                  {[], read_errors + 1}
+              end
+
+            reconcile_ops = [state_put_op | active_ops ++ attribute_ops]
 
             {:lists.reverse(reconcile_ops, ops), prunes, [{key, record} | active], counts,
-             read_errors}
+             next_read_errors}
           end
       end)
 
@@ -633,6 +757,44 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
       end
     else
       {:ok, false}
+    end
+  end
+
+  defp maybe_reset_active_projection(_lmdb_path, false), do: :ok
+
+  defp maybe_reset_active_projection(lmdb_path, true) do
+    [LMDB.active_index_global_prefix(), LMDB.active_by_state_global_prefix()]
+    |> Enum.reduce_while(:ok, fn prefix, :ok ->
+      case delete_projection_prefix(lmdb_path, prefix, <<>>) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp delete_projection_prefix(lmdb_path, prefix, after_key) do
+    case LMDB.prefix_entries_after(lmdb_path, prefix, after_key, @batch_size) do
+      {:ok, []} ->
+        :ok
+
+      {:ok, entries} when is_list(entries) ->
+        case List.last(entries) do
+          {last_key, _value} when is_binary(last_key) and last_key > after_key ->
+            delete_ops = Enum.map(entries, fn {key, _value} -> {:delete, key} end)
+
+            with :ok <- LMDB.write_batch(lmdb_path, delete_ops) do
+              delete_projection_prefix(lmdb_path, prefix, last_key)
+            end
+
+          _invalid ->
+            {:error, :invalid_active_projection_page}
+        end
+
+      {:error, _reason} = error ->
+        error
+
+      _invalid ->
+        {:error, :invalid_active_projection_page}
     end
   end
 
@@ -1315,20 +1477,15 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp reduce_state_entries(keydir, acc, reducer) when is_function(reducer, 2) do
-    :ets.safe_fixtable(keydir, true)
-
-    try do
-      {:ok,
-       reduce_state_entry_chunks(
-         :ets.select(keydir, keydir_match_spec(), @batch_size),
-         acc,
-         reducer
-       )}
-    after
-      :ets.safe_fixtable(keydir, false)
+    with :ok <- safe_fix_keydir(keydir) do
+      try do
+        with {:ok, page} <- safe_select_initial_state_entry_page(keydir) do
+          reduce_state_entry_chunks(page, acc, reducer)
+        end
+      after
+        safe_unfix_keydir(keydir)
+      end
     end
-  rescue
-    ArgumentError -> {:error, :source_keydir_unavailable}
   end
 
   @doc false
@@ -1343,12 +1500,41 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     end
   end
 
-  defp reduce_state_entry_chunks(:"$end_of_table", acc, _reducer), do: acc
+  defp reduce_state_entry_chunks(:"$end_of_table", acc, _reducer), do: {:ok, acc}
 
   defp reduce_state_entry_chunks({entries, continuation}, acc, reducer) do
     state_entries = Enum.filter(entries, &flow_state_entry?/1)
     acc = if state_entries == [], do: acc, else: reducer.(state_entries, acc)
-    reduce_state_entry_chunks(:ets.select(continuation), acc, reducer)
+
+    with {:ok, page} <- safe_select_state_entry_page(continuation) do
+      reduce_state_entry_chunks(page, acc, reducer)
+    end
+  end
+
+  defp safe_fix_keydir(keydir) do
+    :ets.safe_fixtable(keydir, true)
+    :ok
+  rescue
+    ArgumentError -> {:error, :source_keydir_unavailable}
+  end
+
+  defp safe_unfix_keydir(keydir) do
+    :ets.safe_fixtable(keydir, false)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp safe_select_initial_state_entry_page(keydir) do
+    {:ok, :ets.select(keydir, keydir_match_spec(), @batch_size)}
+  rescue
+    ArgumentError -> {:error, :source_keydir_unavailable}
+  end
+
+  defp safe_select_state_entry_page(continuation) do
+    {:ok, :ets.select(continuation)}
+  rescue
+    ArgumentError -> {:error, :source_keydir_unavailable}
   end
 
   defp state_entries_present?(keydir) do

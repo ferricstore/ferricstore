@@ -444,7 +444,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
         case flow_put_state_records_batch(state, key_records) do
           :ok ->
-            :ok
+            flow_lane_insert_records(state, records)
 
           :fallback ->
             Enum.reduce_while(key_records, :ok, fn {key, record}, :ok ->
@@ -464,7 +464,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
         case flow_put_new_state_records_batch(state, key_records) do
           :ok ->
-            :ok
+            flow_lane_insert_records(state, Enum.map(plans, &Map.fetch!(&1, :record)))
 
           :fallback ->
             Enum.reduce_while(key_records, :ok, fn {key, record}, :ok ->

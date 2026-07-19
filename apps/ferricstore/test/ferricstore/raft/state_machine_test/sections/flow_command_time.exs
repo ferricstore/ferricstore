@@ -528,17 +528,17 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               state
             )
 
-          {_state, {:error, "ERR invalid flow policy value"}} =
+          {_state, {:error, "ERR invalid flow policy patch"}} =
             StateMachine.apply(
               %{system_time: 1_003},
-              {:flow_policy_allocate, policy_key, invalid_value, 0},
+              {:flow_policy_patch_allocate, policy_key, invalid_value, true, nil},
               state
             )
 
-          {_state, {:error, "ERR invalid flow policy value"}} =
+          {_state, {:error, "ERR invalid flow policy patch"}} =
             StateMachine.apply(
               %{system_time: 1_004},
-              {:flow_policy_allocate, policy_key, mismatched_value, 0},
+              {:flow_policy_patch_allocate, policy_key, mismatched_value, true, nil},
               state
             )
 
@@ -547,7 +547,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "policy allocation stamps generations and rejects generationless payloads", %{
+        test "policy patch allocation stamps generations and rejects non-map payloads", %{
           state: state,
           ets: ets
         } do
@@ -559,12 +559,10 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               max_active_ms: 1_000
             )
 
-          current_input = Ferricstore.Flow.RetryPolicy.encode_flow_policy(current_policy)
-
           {_state, {:ok, current_value}} =
             StateMachine.apply(
               %{system_time: 1_000},
-              {:flow_policy_allocate, current_key, current_input, 0},
+              {:flow_policy_patch_allocate, current_key, current_policy, true, nil},
               state
             )
 
@@ -584,10 +582,10 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           beta_input = :erlang.term_to_binary({:flow_policy_v1, beta_policy})
 
-          {_state, {:error, "ERR invalid flow policy value"}} =
+          {_state, {:error, "ERR invalid flow policy patch"}} =
             StateMachine.apply(
               %{system_time: 2_000},
-              {:flow_policy_allocate, beta_key, beta_input, 0},
+              {:flow_policy_patch_allocate, beta_key, beta_input, true, nil},
               state
             )
 
@@ -598,12 +596,10 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               max_active_ms: 3_000
             )
 
-          updated_input = Ferricstore.Flow.RetryPolicy.encode_flow_policy(updated_policy)
-
           {_state, {:ok, updated_value}} =
             StateMachine.apply(
               %{system_time: 3_000},
-              {:flow_policy_allocate, current_key, updated_input, 0},
+              {:flow_policy_patch_allocate, current_key, updated_policy, true, nil},
               state
             )
 
@@ -612,6 +608,88 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           assert {:ok, {2, ^updated_policy}} =
                    Ferricstore.Flow.RetryPolicy.decode_flow_policy_entry(updated_value)
+        end
+
+        @tag :flow_policy_generation
+        test "policy patch allocation rejects an out-of-range expected generation", %{
+          state: state,
+          ets: ets
+        } do
+          type = "invalid-expected-policy-generation"
+          policy_key = Ferricstore.Flow.Keys.policy_key(type)
+
+          {:ok, policy} =
+            Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type,
+              max_active_ms: 1_000
+            )
+
+          max_generation = Ferricstore.Flow.RetryPolicy.max_policy_generation()
+
+          {_state, {:error, "ERR invalid flow policy generation"}} =
+            StateMachine.apply(
+              %{system_time: 1_000},
+              {:flow_policy_patch_allocate, policy_key, policy, true, max_generation + 1},
+              state
+            )
+
+          assert [] = :ets.lookup(ets, policy_key)
+        end
+
+        @tag :flow_policy_generation
+        test "policy patch validation uses replicated limits instead of runtime config", %{
+          state: state,
+          ets: ets
+        } do
+          old_max = Application.get_env(:ferricstore, :flow_max_history_max_events)
+          on_exit(fn -> restore_env(:flow_max_history_max_events, old_max) end)
+
+          Application.put_env(:ferricstore, :flow_max_history_max_events, 1)
+
+          permissive_context =
+            Ferricstore.Raft.ApplyContext.new(flow_max_history_max_events: 100)
+
+          permissive_state = %{
+            state
+            | apply_context: permissive_context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(permissive_context)
+          }
+
+          accepted_type = "replicated-policy-limit-accepted"
+          accepted_key = Ferricstore.Flow.Keys.policy_key(accepted_type)
+
+          {_state, {:ok, accepted_value}} =
+            StateMachine.apply(
+              %{system_time: 1_000},
+              {:flow_policy_patch_allocate, accepted_key, %{retention: %{history_max_events: 50}},
+               true, nil},
+              permissive_state
+            )
+
+          assert {:ok, {1, %{retention: %{history_max_events: 50}}}} =
+                   Ferricstore.Flow.RetryPolicy.decode_flow_policy_entry(accepted_value)
+
+          Application.put_env(:ferricstore, :flow_max_history_max_events, 1_000)
+
+          restrictive_context =
+            Ferricstore.Raft.ApplyContext.new(flow_max_history_max_events: 10)
+
+          restrictive_state = %{
+            state
+            | apply_context: restrictive_context,
+              apply_context_encoded: Ferricstore.Raft.ApplyContext.encode(restrictive_context)
+          }
+
+          rejected_key = Ferricstore.Flow.Keys.policy_key("replicated-policy-limit-rejected")
+
+          {_state, {:error, "ERR flow retention history_max_events must be between 1 and 10"}} =
+            StateMachine.apply(
+              %{system_time: 2_000},
+              {:flow_policy_patch_allocate, rejected_key, %{retention: %{history_max_events: 50}},
+               true, nil},
+              restrictive_state
+            )
+
+          assert [] = :ets.lookup(ets, rejected_key)
         end
 
         @tag :flow_policy_generation
@@ -824,7 +902,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "policy allocation fails closed on corrupt migration high-water state", %{
+        test "policy patch allocation fails closed on corrupt migration high-water state", %{
           state: state,
           ets: ets
         } do
@@ -845,7 +923,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 2_000)
 
             stored_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(stored_policy, 3)
-            input_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(new_policy)
             corrupt_value = "corrupt-policy-migration-high-water"
 
             Enum.each([{policy_key, stored_value}, {high_water_key, corrupt_value}], fn {key,
@@ -856,7 +933,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               )
             end)
 
-            command = {:flow_policy_allocate, policy_key, input_value, 0}
+            command = {:flow_policy_patch_allocate, policy_key, new_policy, true, nil}
 
             {_state, {:error, "ERR corrupt flow policy migration high-water"}} =
               StateMachine.apply(%{system_time: 1_000}, command, state)
@@ -870,7 +947,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "policy allocation and install fail closed on a corrupt stored high-water", %{
+        test "policy patch allocation and install fail closed on a corrupt stored high-water", %{
           state: state,
           ets: ets
         } do
@@ -881,7 +958,6 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
           {:ok, policy} =
             Ferricstore.Flow.RetryPolicy.normalize_flow_policy(type, max_active_ms: 2_000)
 
-          allocation_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy)
           install_value = Ferricstore.Flow.RetryPolicy.encode_flow_policy(policy, 4)
 
           :ets.insert(
@@ -892,7 +968,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           Enum.each(
             [
-              {:flow_policy_allocate, policy_key, allocation_value, 0},
+              {:flow_policy_patch_allocate, policy_key, policy, true, nil},
               {:flow_policy_put, policy_key, install_value, 0}
             ],
             fn command ->
@@ -906,7 +982,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
         end
 
         @tag :flow_policy_generation
-        test "captured empty context does not fall back to local policy after a missing-record race",
+        test "an absent target guard rejects a flow created before apply",
              %{
                state: state,
                ets: ets
@@ -949,7 +1025,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
 
           created = flow_record!(state, state_key)
 
-          {_state, :ok} =
+          {_state, {:error, "ERR stale flow policy target"}} =
             StateMachine.apply(
               %{system_time: 2_000},
               {:flow_transition, state_key,
@@ -959,13 +1035,13 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
                  to_state: "processing",
                  fencing_token: created.fencing_token,
                  partition_key: partition_key,
+                 policy_guard: %{state_key: state_key, absent: true},
                  policy_reference_captured: true
                }},
               state
             )
 
-          transitioned = flow_record!(state, state_key)
-          assert Ferricstore.Flow.StateMeta.indexed_key(transitioned) == nil
+          assert flow_record!(state, state_key).state == "queued"
         end
 
         @tag :flow_policy_generation

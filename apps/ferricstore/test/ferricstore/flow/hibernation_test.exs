@@ -251,6 +251,17 @@ defmodule Ferricstore.Flow.HibernationTest do
 
     assert Enum.any?(ops, &match?({:put, _reverse_key, ^park_key}, &1))
 
+    active_reverse_key =
+      LMDB.active_by_state_key_key("flow/state/tenant-1/flow-1")
+
+    assert {:put, ^active_reverse_key, active_reverse_value} =
+             Enum.find(ops, &match?({:put, ^active_reverse_key, _value}, &1))
+
+    assert {:ok, []} = LMDB.decode_active_index_reverse_value(active_reverse_value)
+
+    assert {:ok, {_lane_key, _lane_member, 0}} =
+             LMDB.decode_active_index_reverse_lane_value(active_reverse_value)
+
     refute Enum.any?(ops, fn
              {:put, "flow-active-index:" <> _rest, _value} -> true
              _other -> false
@@ -308,6 +319,14 @@ defmodule Ferricstore.Flow.HibernationTest do
              Enum.find(ops, &match?({:put, ^reverse_key, _value}, &1))
 
     assert {:ok, [^active_key]} = LMDB.decode_active_index_reverse_value(reverse_value)
+
+    expected_lane_key =
+      Ferricstore.Flow.FifoLane.lane_key("email", "waiting", "tenant-1")
+
+    expected_lane_member = Ferricstore.Flow.FifoLane.member(1, "flow-1")
+
+    assert {:ok, {^expected_lane_key, ^expected_lane_member, 0}} =
+             LMDB.decode_active_index_reverse_lane_value(reverse_value)
 
     state_active_key =
       LMDB.active_index_key(
@@ -376,6 +395,9 @@ defmodule Ferricstore.Flow.HibernationTest do
 
     assert {:ok, reverse_value} = LMDB.get(lmdb_path, LMDB.active_by_state_key_key(state_key))
     assert {:ok, [^active_key]} = LMDB.decode_active_index_reverse_value(reverse_value)
+
+    assert {:ok, {_lane_key, _lane_member, 0}} =
+             LMDB.decode_active_index_reverse_lane_value(reverse_value)
   end
 
   test "demotion rejects corrupt active reverse metadata before writing cold rows" do
@@ -1216,6 +1238,7 @@ defmodule Ferricstore.Flow.HibernationTest do
         type: "email",
         state: "waiting",
         run_state: "waiting",
+        state_enter_seq: 1,
         version: 1,
         updated_at_ms: 1_000,
         next_run_at_ms: 900_000,

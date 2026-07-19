@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.LMDB do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.FifoLane
   alias Ferricstore.Flow.LMDB.Access
   alias Ferricstore.Flow.LMDB.ValueLocator
   alias Ferricstore.TermCodec
@@ -9,6 +10,11 @@ defmodule Ferricstore.Flow.LMDB do
   @default_map_size 16 * 1024 * 1024 * 1024
   @release_retry_interval_ms 5
   @max_u64 18_446_744_073_709_551_615
+  @flow_due_any_index_enabled Application.compile_env(
+                                :ferricstore,
+                                :flow_due_any_index,
+                                false
+                              )
 
   def enabled?, do: true
   def projection_enabled?, do: true
@@ -506,7 +512,7 @@ defmodule Ferricstore.Flow.LMDB do
 
   def active_index_put_ops_with_reverse(state_key, record, expire_at_ms)
       when is_binary(state_key) and is_map(record) and is_integer(expire_at_ms) do
-    entries = active_flow_index_entries(record)
+    entries = active_projection_entries(record)
 
     active_ops =
       Enum.map(entries, fn {index_key, id, score} ->
@@ -516,7 +522,10 @@ defmodule Ferricstore.Flow.LMDB do
       end)
 
     active_keys = Enum.map(active_ops, fn {:put, key, _value} -> key end)
-    reverse_value = encode_active_index_reverse_value(active_keys)
+
+    # Carry lane identity in the existing reverse row so restart recovery does
+    # not need another durable index row or a full keydir scan.
+    reverse_value = encode_active_index_reverse_value(active_keys, active_lane_entry!(record))
 
     {
       [{:put, active_by_state_key_key(state_key), reverse_value} | active_ops],
@@ -527,6 +536,7 @@ defmodule Ferricstore.Flow.LMDB do
   def active_timeout_index_put_ops(state_key, record, expire_at_ms)
       when is_binary(state_key) and is_map(record) and is_integer(expire_at_ms) do
     cleanup_ops = record |> active_non_timeout_index_delete_ops() |> Enum.uniq()
+    lane_entry = active_lane_entry!(record)
 
     case active_timeout_deadline(record) do
       {:ok, deadline_ms} ->
@@ -542,7 +552,7 @@ defmodule Ferricstore.Flow.LMDB do
             state_key
           )
 
-        reverse_value = encode_active_index_reverse_value([active_key])
+        reverse_value = encode_active_index_reverse_value([active_key], lane_entry)
 
         cleanup_ops ++
           [
@@ -551,7 +561,18 @@ defmodule Ferricstore.Flow.LMDB do
           ]
 
       :none ->
-        cleanup_ops ++ [{:delete, active_by_state_key_key(state_key)}]
+        reverse_value = encode_active_index_reverse_value([], lane_entry)
+        cleanup_ops ++ [{:put, active_by_state_key_key(state_key), reverse_value}]
+    end
+  end
+
+  defp active_lane_entry!(record) do
+    case FifoLane.index_entry(record) do
+      {lane_key, lane_member, lane_score} when lane_score in [-1, 0] ->
+        {lane_key, lane_member, lane_score}
+
+      _terminal_or_invalid ->
+        raise ArgumentError, "active flow lane identity is invalid"
     end
   end
 
@@ -559,7 +580,7 @@ defmodule Ferricstore.Flow.LMDB do
     timeout_index_key = Ferricstore.Flow.Keys.active_timeout_index_key()
 
     record
-    |> active_flow_index_entries()
+    |> active_projection_entries()
     |> Enum.reject(fn {index_key, _id, _score} -> index_key == timeout_index_key end)
     |> Enum.map(fn {index_key, id, score} ->
       {:delete, active_index_key(index_key, id, score)}
@@ -783,8 +804,18 @@ defmodule Ferricstore.Flow.LMDB do
   def encode_active_index_reverse_value(active_keys),
     do: Ferricstore.Flow.LMDB.IndexCodec.encode_active_index_reverse_value(active_keys)
 
+  def encode_active_index_reverse_value(active_keys, lane_entry),
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.encode_active_index_reverse_value(active_keys, lane_entry)
+
   def decode_active_index_reverse_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_active_index_reverse_value(blob)
+
+  def decode_active_index_reverse_lane_value(blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_active_index_reverse_lane_value(blob)
+
+  def decode_active_index_reverse_metadata(blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_active_index_reverse_metadata(blob)
 
   def delete_state_artifacts(path, state_key) when is_binary(path) and is_binary(state_key) do
     reverse_key = terminal_by_state_key_key(state_key)
@@ -1054,7 +1085,28 @@ defmodule Ferricstore.Flow.LMDB do
   def decode_history_index_location(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_history_index_location(blob)
 
-  defp active_flow_index_entries(record) do
+  @doc false
+  def active_projection_entries(record) when is_map(record),
+    do: active_flow_index_entries(record, @flow_due_any_index_enabled)
+
+  @doc false
+  def active_projection_entries(record, opts) when is_map(record) and is_list(opts) do
+    case Keyword.fetch(opts, :due_any?) do
+      {:ok, due_any?} when is_boolean(due_any?) -> active_flow_index_entries(record, due_any?)
+      _invalid -> raise ArgumentError, "active projection options are invalid"
+    end
+  end
+
+  @doc false
+  def active_timeout_projection_entries(record) when is_map(record) do
+    timeout_index_key = Ferricstore.Flow.Keys.active_timeout_index_key()
+
+    record
+    |> active_flow_index_entries(@flow_due_any_index_enabled)
+    |> Enum.filter(fn {index_key, _id, _score} -> index_key == timeout_index_key end)
+  end
+
+  defp active_flow_index_entries(record, due_any?) when is_boolean(due_any?) do
     id = Map.fetch!(record, :id)
     type = Map.fetch!(record, :type)
     state = Map.fetch!(record, :state)
@@ -1064,6 +1116,7 @@ defmodule Ferricstore.Flow.LMDB do
 
     [{state_index_key, id, updated_score}]
     |> maybe_add_due_active_entry(record, partition_key)
+    |> maybe_add_due_any_active_entry(record, partition_key, due_any?)
     |> maybe_add_running_active_entries(record, partition_key)
     |> maybe_add_active_timeout_entry(record)
   end
@@ -1108,6 +1161,20 @@ defmodule Ferricstore.Flow.LMDB do
   end
 
   defp maybe_add_due_active_entry(entries, _record, _partition_key), do: entries
+
+  defp maybe_add_due_any_active_entry(
+         entries,
+         %{next_run_at_ms: next_run_at_ms} = record,
+         partition_key,
+         true
+       )
+       when is_integer(next_run_at_ms) do
+    priority = Map.get(record, :priority, 0)
+    due_key = Ferricstore.Flow.Keys.due_any_key(record.type, priority, partition_key)
+    [{due_key, record.id, normalize_ms(next_run_at_ms)} | entries]
+  end
+
+  defp maybe_add_due_any_active_entry(entries, _record, _partition_key, _due_any?), do: entries
 
   defp maybe_add_running_active_entries(
          entries,

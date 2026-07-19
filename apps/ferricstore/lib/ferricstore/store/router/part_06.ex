@@ -10,6 +10,7 @@ defmodule Ferricstore.Store.Router.Part06 do
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.Locator
+      alias Ferricstore.Flow.RetryPolicy
       alias Ferricstore.Raft.ReplyAwaiter
       alias Ferricstore.Stats
       alias Ferricstore.Store.BlobRef
@@ -158,40 +159,51 @@ defmodule Ferricstore.Store.Router.Part06 do
       end
 
       @doc false
-      def flow_policy_put_all(ctx, key, value, expire_at_ms) do
+      def flow_policy_patch_all(ctx, key, patch, replace?, expected_generation \\ nil) do
         cond do
+          not is_binary(key) ->
+            {:error, "ERR invalid flow policy key"}
+
           byte_size(key) > @max_key_size ->
             {:error, "ERR key too large (max #{@max_key_size} bytes)"}
 
-          is_binary(value) and byte_size(value) >= @max_value_size ->
-            {:error, "ERR value too large (max #{@max_value_size} bytes)"}
+          not is_map(patch) ->
+            {:error, "ERR flow policy patch must be a map"}
+
+          not is_boolean(replace?) ->
+            {:error, "ERR flow replace must be boolean"}
+
+          not is_nil(expected_generation) and
+              (not is_integer(expected_generation) or expected_generation < 0 or
+                 expected_generation > RetryPolicy.max_policy_generation()) ->
+            {:error, "ERR invalid flow policy generation"}
 
           true ->
-            case check_keydir_full(ctx, key) do
-              :ok ->
-                case raft_write(
-                       ctx,
-                       0,
-                       key,
-                       {:flow_policy_allocate, key, value, expire_at_ms}
-                     ) do
-                  {:ok, versioned_value} when is_binary(versioned_value) ->
-                    flow_policy_install_remaining_shards(
-                      ctx,
-                      key,
-                      versioned_value,
-                      expire_at_ms
-                    )
+            with :ok <- RetryPolicy.validate_flow_policy_snapshot_size(patch),
+                 :ok <- check_keydir_full(ctx, key) do
+              case raft_write(
+                     ctx,
+                     0,
+                     key,
+                     {:flow_policy_patch_allocate, key, patch, replace?, expected_generation}
+                   ) do
+                {:ok, versioned_value} when is_binary(versioned_value) ->
+                  with :ok <-
+                         flow_policy_install_remaining_shards(
+                           ctx,
+                           key,
+                           versioned_value,
+                           0
+                         ) do
+                    {:ok, versioned_value}
+                  end
 
-                  {:error, _reason} = error ->
-                    error
+                {:error, _reason} = error ->
+                  error
 
-                  _other ->
-                    {:error, "ERR flow policy allocation failed"}
-                end
-
-              {:error, _} = err ->
-                err
+                _other ->
+                  {:error, "ERR flow policy allocation failed"}
+              end
             end
         end
       end

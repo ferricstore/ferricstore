@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.9.0 - 2026-07-19
+
+- Added durable per-state FIFO/parallel Flow execution, with exact partition-lane ordering across hibernation and restart, plus `mode :fifo | :parallel` declarations in the Elixir workflow DSL.
+- Made direct Flow policy updates merge atomically by default with replicated generation compare-and-swap; set/get responses now expose `generation`, while workflow `install_policy/1` replaces its declaration snapshot by default.
+- Changed workflow-derived composite partition keys to collision-free length-prefixed encoding. Explicit partition keys are unchanged.
+- Fixed LMDB startup recovery to fall back to synchronous keydir reconciliation when an active Flow projection is invalid, and to rebuild the durable active projection before serving claims.
+
 ## 0.8.0 - 2026-07-18
 
 - Default governance effect lookups to the Flow ID auto-partition when no explicit partition is provided.
