@@ -319,6 +319,9 @@ defmodule FerricstoreServer.Native.CommandsTest do
       assert "max_active_ms" in payload.schemas[command]["fields"]
     end
 
+    assert "expected_generation" in payload.schemas["FLOW.POLICY.SET"]["fields"]
+    assert "replace" in payload.schemas["FLOW.POLICY.SET"]["fields"]
+
     assert "parent_flow_id" in payload.schemas["FLOW.CREATE"]["fields"]
     assert "root_flow_id" in payload.schemas["FLOW.CREATE"]["fields"]
     refute "parent_id" in payload.schemas["FLOW.CREATE"]["fields"]
@@ -366,6 +369,11 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert payload.route.endpoint.host == payload.route.host
     assert payload.route.endpoint.native_port == payload.route.native_port
     refute Map.has_key?(payload.route, String.to_atom("resp" <> "_port"))
+
+    policy_fields = payload.capabilities.schemas["FLOW.POLICY.SET"]["fields"]
+    assert "expected_generation" in policy_fields
+    assert "replace" in policy_fields
+
     assert new_state.client_name == "sdk-a"
   end
 
@@ -650,6 +658,65 @@ defmodule FerricstoreServer.Native.CommandsTest do
              Commands.execute(
                @op_flow_policy_set,
                %{"type" => type, "max_active_ms" => 30_000},
+               state()
+             )
+  end
+
+  test "FLOW.POLICY.SET supports patch, replacement, and generation CAS through native opcode" do
+    type = "native-policy-cas-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert {:ok,
+            %{
+              generation: 1,
+              max_active_ms: 1_000,
+              states: %{"queued" => %{mode: :fifo}}
+            }, _state} =
+             Commands.execute(
+               @op_flow_policy_set,
+               %{
+                 "type" => type,
+                 "max_active_ms" => 1_000,
+                 "states" => %{"queued" => %{"mode" => "fifo"}}
+               },
+               state()
+             )
+
+    assert {:ok,
+            %{
+              generation: 2,
+              max_active_ms: 2_000,
+              states: %{"queued" => %{mode: :fifo}}
+            }, _state} =
+             Commands.execute(
+               @op_flow_policy_set,
+               %{
+                 "type" => type,
+                 "expected_generation" => 1,
+                 "replace" => false,
+                 "max_active_ms" => 2_000
+               },
+               state()
+             )
+
+    assert {:error, "ERR stale flow policy generation", _state} =
+             Commands.execute(
+               @op_flow_policy_set,
+               %{
+                 "type" => type,
+                 "expected_generation" => 1,
+                 "max_active_ms" => 3_000
+               },
+               state()
+             )
+
+    assert {:ok, %{generation: 3, max_active_ms: nil, states: %{}}, _state} =
+             Commands.execute(
+               @op_flow_policy_set,
+               %{
+                 "type" => type,
+                 "expected_generation" => 2,
+                 "replace" => true
+               },
                state()
              )
   end

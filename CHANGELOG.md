@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.9.1 - 2026-07-19
+
+- Advertised and accepted `expected_generation` and `replace` in typed-native `FLOW.POLICY.SET`, aligning native SDK policy CAS and replacement with the embedded and textual command paths.
+
 ## 0.9.0 - 2026-07-19
 
 - Added durable per-state FIFO/parallel Flow execution, with exact partition-lane ordering across hibernation and restart, plus `mode :fifo | :parallel` declarations in the Elixir workflow DSL.

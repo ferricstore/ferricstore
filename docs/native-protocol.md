@@ -398,7 +398,8 @@ FLOW.CREATE:
  "max_active_ms": 60000}
 
 FLOW.POLICY.SET:
-{"type": "email", "max_active_ms": 300000}
+{"type": "email", "expected_generation": 7, "replace": false,
+ "max_active_ms": 300000}
 
 FLOW.CLAIM_DUE:
 {"type": "email", "state": "queued", "worker": "w1", "limit": 100, "lease_ms": 30000}
@@ -420,6 +421,11 @@ FLOW.SEARCH:
 Typed `payload`, `result`, and `error` values stay binary-safe and structured at
 the protocol layer. Storage behavior is unchanged: commands still use current
 FerricFlow value/ref rules.
+
+`FLOW.POLICY.SET` patches the current policy by default. Set `replace` to `true`
+to replace the complete snapshot, and pass a non-negative `expected_generation`
+for compare-and-swap. Successful policy reads and writes include the monotonic
+`generation`; a mismatch returns `ERR stale flow policy generation`.
 
 Flow `attributes` are small indexed metadata values for list/stats/dashboard
 filters. They are not payload bytes and are projected asynchronously for query
