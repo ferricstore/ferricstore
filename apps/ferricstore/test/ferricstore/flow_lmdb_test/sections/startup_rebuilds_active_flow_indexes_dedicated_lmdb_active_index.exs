@@ -362,6 +362,62 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupRebuildsActiveFlowIndexesDed
                  )
       end
 
+      test "active-index rebuild validates hibernated state from its cold park" do
+        fixture = start_active_lmdb_projection_fixture!("cold-active-rebuild")
+        now_ms = System.system_time(:millisecond)
+
+        record =
+          active_lmdb_record("cold-active-flow", "cold-active", "waiting",
+            partition_key: fixture.partition_key,
+            updated_at_ms: now_ms,
+            next_run_at_ms: now_ms + 300_000
+          )
+          |> Map.merge(%{created_at_ms: now_ms, max_active_ms: 600_000})
+
+        state_key = project_active_lmdb_record!(fixture, record)
+        state_value = Ferricstore.Flow.encode_record(record)
+        reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
+        assert {:ok, reverse_value} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, reverse_key)
+
+        locator =
+          Ferricstore.Flow.Locator.new!(
+            flow_id: record.id,
+            kind: :state,
+            version: record.version,
+            raft_index: 1,
+            file_id: {:flow_state, fixture.shard_index},
+            offset: 0,
+            value_size: byte_size(state_value)
+          )
+
+        assert {:ok, demotion_ops} =
+                 Ferricstore.Flow.Hibernation.demotion_ops_result(%{
+                   locator: locator,
+                   record: Map.put(record, :state_key, state_key),
+                   state_value: state_value,
+                   active_index_reverse_value: reverse_value
+                 })
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(fixture.lmdb_path, [
+                   {:delete, state_key} | demotion_ops
+                 ])
+
+        assert :not_found = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
+
+        assert {:ok, active_count} =
+                 Ferricstore.Flow.LMDBRebuilder.ActiveIndexes.rebuild_flow_indexes_from_lmdb(
+                   fixture.lmdb_path,
+                   nil,
+                   nil,
+                   nil,
+                   nil
+                 )
+
+        assert active_count ==
+                 length(Ferricstore.Flow.LMDB.active_timeout_projection_entries(record))
+      end
+
       test "startup repair clears a corrupt active projection for an empty authoritative keydir" do
         data_dir =
           Path.join(

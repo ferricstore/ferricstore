@@ -27,6 +27,107 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
     assert :erts_debug.same(commands, stamped)
   end
 
+  test "ordered batches stamp later commands against an earlier Flow target" do
+    keydir = :ets.new(:ordered_batch_policy_stamp, [:set, :public])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    ctx = %{
+      keydir_refs: {keydir},
+      shard_names: {:ordered_batch_policy_stamp_shard_must_not_be_read}
+    }
+
+    id = "ordered-batch-flow"
+    type = "ordered-batch-policy"
+    partition_key = "ordered-batch-tenant"
+    state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+    commands = [
+      {state_key,
+       {:flow_create, state_key,
+        %{id: id, type: type, state: "queued", partition_key: partition_key}}},
+      {state_key,
+       {:flow_transition, state_key,
+        %{
+          id: id,
+          from_state: "queued",
+          to_state: "ready",
+          partition_key: partition_key
+        }}}
+    ]
+
+    assert {:ok, [create, transition]} = PolicyCommand.stamp_many(ctx, commands)
+    assert {_key, create_command} = create
+    assert {_key, transition_command} = transition
+
+    assert {[_install], {:flow_create, ^state_key, create_attrs}} =
+             unwrap_policy_fence(create_command)
+
+    assert {[], {:flow_transition, ^state_key, transition_attrs}} =
+             unwrap_policy_fence(transition_command)
+
+    assert %{type: ^type, generation: 0, digest: digest} = create_attrs.policy_ref
+    assert transition_attrs.policy_ref == create_attrs.policy_ref
+    assert byte_size(digest) == 32
+    refute Map.has_key?(transition_attrs, :policy_guard)
+  end
+
+  test "an explicit type overrides an earlier target for the same batch key" do
+    keydir = :ets.new(:explicit_batch_policy_stamp, [:set, :public])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    ctx = %{
+      keydir_refs: {keydir},
+      shard_names: {:explicit_batch_policy_stamp_shard_must_not_be_read}
+    }
+
+    state_key = "same-batch-route"
+
+    commands = [
+      {state_key,
+       {:flow_create, state_key,
+        %{id: "first-flow", type: "first-type", state: "queued", partition_key: "tenant"}}},
+      {state_key,
+       {:flow_create, state_key,
+        %{id: "second-flow", type: "second-type", state: "queued", partition_key: "tenant"}}}
+    ]
+
+    assert {:ok, [first, second]} = PolicyCommand.stamp_many(ctx, commands)
+    assert {_key, first_command} = first
+    assert {_key, second_command} = second
+
+    assert {[_install], {:flow_create, ^state_key, first_attrs}} =
+             unwrap_policy_fence(first_command)
+
+    assert {[_install], {:flow_create, ^state_key, second_attrs}} =
+             unwrap_policy_fence(second_command)
+
+    assert first_attrs.policy_ref.type == "first-type"
+    assert second_attrs.policy_ref.type == "second-type"
+  end
+
+  test "mixed policy batches preserve zero-arity opaque commands" do
+    keydir = :ets.new(:mixed_batch_policy_stamp, [:set, :public])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    state_key = "mixed-policy-route"
+
+    commands = [
+      {state_key,
+       {:flow_create, state_key,
+        %{id: "mixed-flow", type: "mixed-type", state: "queued", partition_key: "tenant"}}},
+      {"opaque-route", {}}
+    ]
+
+    assert {:ok, [_stamped, {"opaque-route", {}}]} =
+             PolicyCommand.stamp_many(
+               %{
+                 keydir_refs: {keydir},
+                 shard_names: {:mixed_batch_policy_stamp_shard_must_not_be_read}
+               },
+               commands
+             )
+  end
+
   test "malformed policy-sensitive commands fail before policy reads" do
     assert {:error, "ERR flow policy-sensitive command attrs must be a map"} =
              PolicyCommand.stamp(:context_must_not_be_read, {:flow_create, "state-key", :invalid})

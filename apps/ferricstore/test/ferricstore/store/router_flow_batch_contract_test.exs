@@ -4,6 +4,22 @@ defmodule Ferricstore.Store.RouterFlowBatchContractTest do
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Store.Router
 
+  test "flow create persists the same automatic partition used for routing" do
+    ctx = FerricStore.Instance.get(:default)
+    id = unique_flow_id("router-auto-partition")
+    partition_key = Ferricstore.Flow.Keys.auto_partition_key(id)
+
+    assert :ok =
+             Router.flow_create(ctx, %{
+               id: id,
+               type: "router-auto-partition",
+               state: "queued"
+             })
+
+    assert {:ok, %{id: ^id, partition_key: ^partition_key}} =
+             FerricStore.flow_get(id, partition_key: partition_key)
+  end
+
   test "flow create batch dispatches create commands without transition-only matching" do
     ctx = FerricStore.Instance.get(:default)
     id = unique_flow_id("router-create-batch")

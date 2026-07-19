@@ -882,7 +882,11 @@ defmodule Ferricstore.Store.Router.Part06 do
 
       @doc false
       def flow_create(ctx, %{id: id} = attrs) when is_binary(id) do
-        key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
+        partition_key =
+          Map.get(attrs, :partition_key) || Ferricstore.Flow.Keys.auto_partition_key(id)
+
+        attrs = Map.put(attrs, :partition_key, partition_key)
+        key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
         cond do
           byte_size(key) > @max_key_size ->

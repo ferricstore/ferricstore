@@ -4,6 +4,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
   alias Ferricstore.Flow
   alias Ferricstore.Flow.FifoLane
   alias Ferricstore.Flow.LMDB
+  alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Store.Shard.ZSetIndex
 
@@ -384,14 +385,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     reverse_keys = Enum.map(state_keys, &LMDB.active_by_state_key_key/1)
 
     with {:ok, reverse_results} <- LMDB.get_many(lmdb_path, reverse_keys),
-         {:ok, state_results} <- LMDB.get_many(lmdb_path, state_keys),
+         {:ok, record_results} <- authoritative_record_results(lmdb_path, state_keys, now_ms),
          {:ok, ownership} <-
            active_index_projection_ownership(
              state_keys,
              reverse_keys,
              reverse_results,
-             state_results,
-             now_ms
+             record_results
            ) do
       with {:ok, active_entries} <- validate_active_index_projection_rows(rows, ownership) do
         {:ok,
@@ -408,23 +408,23 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
          state_keys,
          reverse_keys,
          reverse_results,
-         state_results,
-         now_ms
+         record_results
        )
        when length(state_keys) == length(reverse_keys) and
               length(state_keys) == length(reverse_results) and
-              length(state_keys) == length(state_results) do
-    [state_keys, reverse_keys, reverse_results, state_results]
+              length(state_keys) == length(record_results) do
+    [state_keys, reverse_keys, reverse_results, record_results]
     |> Enum.zip()
     |> Enum.reduce_while({:ok, %{}}, fn
-      {state_key, reverse_key, {:ok, reverse_blob}, {:ok, state_blob}}, {:ok, acc}
-      when is_binary(reverse_blob) and is_binary(state_blob) ->
+      {state_key, reverse_key, {:ok, reverse_blob}, {:ok, {source, record}}}, {:ok, acc}
+      when is_binary(reverse_blob) and source in [:hot, :cold] and is_map(record) ->
         with {:ok, active_keys} <- LMDB.decode_active_index_reverse_value(reverse_blob),
-             {:ok, {record, authoritative_entries}} <-
-               decode_authoritative_active_entries(state_blob, state_key, now_ms) do
+             {:ok, authoritative_entries} <-
+               authoritative_active_entries(source, record, state_key) do
           hot_projection? =
-            MapSet.new(active_keys) ==
-              active_projection_key_set(LMDB.active_projection_entries(record))
+            source == :hot and
+              MapSet.new(active_keys) ==
+                active_projection_key_set(LMDB.active_projection_entries(record))
 
           metadata = %{
             active_keys: MapSet.new(active_keys),
@@ -439,6 +439,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
           {:error, _reason} = error -> {:halt, error}
         end
 
+      {_state_key, _reverse_key, _reverse_result, {:error, _reason} = error}, _acc ->
+        {:halt, error}
+
       {_state_key, reverse_key, _reverse_result, _state_result}, _acc ->
         {:halt, {:error, {:invalid_active_reverse_value, reverse_key}}}
     end)
@@ -448,8 +451,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
          _state_keys,
          _reverse_keys,
          _reverse_results,
-         _state_results,
-         _now_ms
+         _record_results
        ),
        do: {:error, :active_index_projection_lookup_mismatch}
 
@@ -482,10 +484,14 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     end
   end
 
-  defp decode_authoritative_active_entries(blob, state_key, now_ms) when is_binary(blob) do
-    with {:ok, record} <- decode_authoritative_record(blob, state_key, now_ms) do
-      {:ok, {record, MapSet.new(LMDB.active_projection_entries(record))}}
-    end
+  defp authoritative_active_entries(:hot, record, state_key) when is_map(record) do
+    {:ok, MapSet.new(LMDB.active_projection_entries(record))}
+  rescue
+    _error -> {:error, {:active_index_record_mismatch, state_key}}
+  end
+
+  defp authoritative_active_entries(:cold, record, state_key) when is_map(record) do
+    {:ok, MapSet.new(LMDB.active_timeout_projection_entries(record))}
   rescue
     _error -> {:error, {:active_index_record_mismatch, state_key}}
   end
@@ -635,10 +641,14 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     prefix = LMDB.active_by_state_global_prefix()
 
     with {:ok, reverse_rows} <- decode_fifo_lane_reverse_rows(entries, prefix),
-         {:ok, state_results} <-
-           LMDB.get_many(lmdb_path, Enum.map(reverse_rows, &Map.fetch!(&1, :state_key))),
+         {:ok, record_results} <-
+           authoritative_record_results(
+             lmdb_path,
+             Enum.map(reverse_rows, &Map.fetch!(&1, :state_key)),
+             now_ms
+           ),
          {:ok, lane_entries} <-
-           validate_fifo_lane_reverse_records(reverse_rows, state_results, now_ms),
+           validate_fifo_lane_reverse_records(reverse_rows, record_results),
          :ok <- validate_referenced_active_index_rows(lmdb_path, reverse_rows, now_ms) do
       {:ok, lane_entries}
     end
@@ -683,22 +693,20 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     end
   end
 
-  defp validate_fifo_lane_reverse_records(reverse_rows, state_results, now_ms)
-       when length(reverse_rows) == length(state_results) do
+  defp validate_fifo_lane_reverse_records(reverse_rows, record_results)
+       when length(reverse_rows) == length(record_results) do
     reverse_rows
-    |> Enum.zip(state_results)
+    |> Enum.zip(record_results)
     |> Enum.reduce_while({:ok, []}, fn
       {%{
          reverse_key: reverse_key,
-         state_key: state_key,
          lane_key: lane_key,
          lane_member: lane_member,
          lane_score: lane_score,
          active_keys: active_keys
-       }, {:ok, blob}},
+       }, {:ok, {_source, record}}},
       {:ok, acc} ->
-        with {:ok, record} <- decode_authoritative_record(blob, state_key, now_ms),
-             {^lane_key, ^lane_member, ^lane_score} = entry <- FifoLane.index_entry(record),
+        with {^lane_key, ^lane_member, ^lane_score} = entry <- FifoLane.index_entry(record),
              :ok <- validate_active_reverse_projection(reverse_key, active_keys, record) do
           {:cont, {:ok, [entry | acc]}}
         else
@@ -718,8 +726,79 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     end
   end
 
-  defp validate_fifo_lane_reverse_records(_reverse_rows, _state_results, _now_ms),
+  defp validate_fifo_lane_reverse_records(_reverse_rows, _record_results),
     do: {:error, :fifo_lane_reverse_state_result_mismatch}
+
+  defp authoritative_record_results(lmdb_path, state_keys, now_ms) do
+    with {:ok, primary_results} <- LMDB.get_many(lmdb_path, state_keys) do
+      missing_state_keys =
+        [state_keys, primary_results]
+        |> Enum.zip()
+        |> Enum.flat_map(fn
+          {state_key, :not_found} -> [state_key]
+          {_state_key, {:ok, _blob}} -> []
+        end)
+
+      park_keys = Enum.map(missing_state_keys, &LMDB.cold_park_key_for_state_key/1)
+
+      with {:ok, park_results} <- LMDB.get_many(lmdb_path, park_keys) do
+        park_results_by_state_key = Map.new(Enum.zip(missing_state_keys, park_results))
+
+        results =
+          [state_keys, primary_results]
+          |> Enum.zip()
+          |> Enum.map(fn
+            {state_key, {:ok, blob}} ->
+              with {:ok, record} <- decode_authoritative_record(blob, state_key, now_ms) do
+                {:ok, {:hot, record}}
+              end
+
+            {state_key, :not_found} ->
+              decode_authoritative_cold_record(
+                Map.fetch!(park_results_by_state_key, state_key),
+                state_key
+              )
+          end)
+
+        {:ok, results}
+      end
+    end
+  end
+
+  defp decode_authoritative_cold_record({:ok, park_blob}, state_key)
+       when is_binary(park_blob) and is_binary(state_key) do
+    with {:ok,
+          %{
+            locator: %Locator{kind: :state} = locator,
+            state_key: ^state_key,
+            state_value: state_value
+          } = park} <- LMDB.decode_cold_park(park_blob),
+         true <- is_binary(state_value),
+         record when is_map(record) <- Flow.decode_record(state_value),
+         true <-
+           Ferricstore.Flow.Keys.state_key(record.id, Map.get(record, :partition_key)) ==
+             state_key,
+         true <- locator.flow_id == Map.get(record, :id),
+         true <- locator.version == Map.get(record, :version),
+         true <- cold_park_matches_record?(park, record) do
+      {:ok, {:cold, record}}
+    else
+      _invalid -> {:error, {:active_index_record_mismatch, state_key}}
+    end
+  rescue
+    _error -> {:error, {:active_index_record_mismatch, state_key}}
+  end
+
+  defp decode_authoritative_cold_record(_missing_or_invalid, state_key),
+    do: {:error, {:active_index_record_mismatch, state_key}}
+
+  defp cold_park_matches_record?(park, record) do
+    Map.get(park, :type) == Map.get(record, :type) and
+      Map.get(park, :state) == Map.get(record, :state) and
+      Map.get(park, :partition_key) == Map.get(record, :partition_key) and
+      Map.get(park, :due_at_ms) == Map.get(record, :next_run_at_ms) and
+      Map.get(park, :priority, 0) == Map.get(record, :priority, 0)
+  end
 
   defp validate_active_reverse_projection(reverse_key, active_keys, record) do
     actual = MapSet.new(active_keys)

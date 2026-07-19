@@ -306,7 +306,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           end
 
         with {:ok, {hibernation_ops, hibernation_after_flush}} <-
-               pending_flow_hibernation_mirror_items(state),
+               pending_flow_hibernation_mirror_items(state, pending_ops),
              ops = pending_ops ++ hibernation_ops,
              after_flush = after_flush ++ hibernation_after_flush,
              :ok <- enqueue_lmdb_projection_dirty_groups(state, dirty_projection_shards),
@@ -321,17 +321,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         end
       end
 
-      defp pending_flow_hibernation_mirror_items(state) do
+      defp pending_flow_hibernation_mirror_items(state, pending_ops) do
+        pending_projections =
+          pending_flow_state_projections(pending_ops, Map.get(state, :shard_index, 0))
+
         case Process.put(:sm_pending_flow_hibernation_candidates, []) do
           pending when is_list(pending) ->
             pending
-            |> Enum.reverse()
+            |> coalesce_pending_flow_hibernation_candidates()
             |> Enum.reduce_while({:ok, {[], []}}, fn
               {key, record, state_value}, {:ok, acc} ->
-                reduce_flow_hibernation_candidate(state, key, record, state_value, acc)
+                reduce_flow_hibernation_candidate(
+                  state,
+                  key,
+                  record,
+                  state_value,
+                  pending_projections,
+                  acc
+                )
 
               {key, record}, {:ok, acc} ->
-                reduce_flow_hibernation_candidate(state, key, record, nil, acc)
+                reduce_flow_hibernation_candidate(
+                  state,
+                  key,
+                  record,
+                  nil,
+                  pending_projections,
+                  acc
+                )
             end)
             |> case do
               {:ok, {reversed_ops, reversed_after_flush}} ->
@@ -346,14 +363,46 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         end
       end
 
+      @doc false
+      def __coalesce_pending_flow_hibernation_candidates_for_test__(pending)
+          when is_list(pending),
+          do: coalesce_pending_flow_hibernation_candidates(pending)
+
+      defp coalesce_pending_flow_hibernation_candidates(pending) do
+        pending
+        |> Enum.reduce({MapSet.new(), []}, fn
+          {key, _record, _state_value} = candidate, {seen, selected} when is_binary(key) ->
+            select_latest_hibernation_candidate(key, candidate, seen, selected)
+
+          {key, _record} = candidate, {seen, selected} when is_binary(key) ->
+            select_latest_hibernation_candidate(key, candidate, seen, selected)
+        end)
+        |> elem(1)
+      end
+
+      defp select_latest_hibernation_candidate(key, candidate, seen, selected) do
+        if MapSet.member?(seen, key) do
+          {seen, selected}
+        else
+          {MapSet.put(seen, key), [candidate | selected]}
+        end
+      end
+
       defp reduce_flow_hibernation_candidate(
              state,
              key,
              record,
              state_value,
+             pending_projections,
              {ops_acc, after_acc}
            ) do
-        case flow_hibernation_candidate_items(state, key, record, state_value) do
+        case flow_hibernation_candidate_items(
+               state,
+               key,
+               record,
+               state_value,
+               pending_projections
+             ) do
           {:ok, {ops, after_flush}} ->
             {:cont, {:ok, {Enum.reverse(ops, ops_acc), Enum.reverse(after_flush, after_acc)}}}
 
@@ -365,10 +414,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         end
       end
 
-      defp flow_hibernation_candidate_items(state, key, record, state_value) do
-        with {:ok, locator} <- flow_hibernation_locator_from_hot(state, key, record),
+      defp flow_hibernation_candidate_items(
+             state,
+             key,
+             record,
+             state_value,
+             pending_projections
+           ) do
+        with {:ok, locator} <-
+               flow_hibernation_locator_from_hot(state, key, record, state_value),
              {:ok, active_index_reverse_value} <-
-               flow_hibernation_active_index_reverse(state, key),
+               flow_hibernation_active_index_reverse(state, key, record, pending_projections),
              {:ok, ops} <-
                Hibernation.demotion_ops_result(%{
                  locator: locator,
@@ -405,36 +461,95 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         end
       end
 
-      defp flow_hibernation_active_index_reverse(state, key) do
-        case Ferricstore.Flow.LMDB.get(
-               flow_lmdb_record_path(state),
-               Ferricstore.Flow.LMDB.active_by_state_key_key(key)
-             ) do
-          {:ok, reverse_value} when is_binary(reverse_value) -> {:ok, reverse_value}
-          :not_found -> {:ok, nil}
-          {:error, _reason} = error -> error
-          other -> {:error, {:invalid_active_index_reverse_read, other}}
+      defp flow_hibernation_active_index_reverse(state, key, record, pending_projections) do
+        case Map.get(pending_projections, {state.shard_index, key}, :none) do
+          {:ok, projected_record} ->
+            flow_hibernation_projected_active_reverse(key, projected_record)
+
+          :from_source ->
+            flow_hibernation_projected_active_reverse(key, record)
+
+          {:error, _reason} = error ->
+            error
+
+          :none ->
+            case Ferricstore.Flow.LMDB.get(
+                   flow_lmdb_record_path(state),
+                   Ferricstore.Flow.LMDB.active_by_state_key_key(key)
+                 ) do
+              {:ok, reverse_value} when is_binary(reverse_value) -> {:ok, reverse_value}
+              :not_found -> {:ok, nil}
+              {:error, _reason} = error -> error
+              other -> {:error, {:invalid_active_index_reverse_read, other}}
+            end
         end
       end
 
-      defp flow_hibernation_locator_from_hot(state, key, record) do
+      defp pending_flow_state_projections(pending_ops, default_shard_index) do
+        Enum.reduce(pending_ops, %{}, fn
+          {:project_flow_state, key, value, _expire_at_ms}, acc when is_binary(key) ->
+            Map.put(
+              acc,
+              {default_shard_index, key},
+              decode_pending_flow_projection(value)
+            )
+
+          {:project_flow_state_from_source, key}, acc when is_binary(key) ->
+            Map.put(acc, {default_shard_index, key}, :from_source)
+
+          {:lmdb_shard, shard_index, {:project_flow_state, key, value, _expire_at_ms}}, acc
+          when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
+            Map.put(acc, {shard_index, key}, decode_pending_flow_projection(value))
+
+          {:lmdb_shard, shard_index, {:project_flow_state_from_source, key}}, acc
+          when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
+            Map.put(acc, {shard_index, key}, :from_source)
+
+          _other, acc ->
+            acc
+        end)
+      end
+
+      defp decode_pending_flow_projection(value) when is_binary(value) do
+        case Flow.decode_record(value) do
+          record when is_map(record) -> {:ok, record}
+          _invalid -> {:error, :invalid_pending_flow_projection}
+        end
+      rescue
+        _error -> {:error, :invalid_pending_flow_projection}
+      end
+
+      defp flow_hibernation_projected_active_reverse(key, record) when is_map(record) do
+        {_ops, reverse_value} =
+          Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(key, record, 0)
+
+        {:ok, reverse_value}
+      rescue
+        _error -> {:error, :invalid_pending_active_index_projection}
+      end
+
+      defp flow_hibernation_locator_from_hot(state, key, record, state_value) do
         version = Map.get(record, :version, 0)
         ra_index = current_ra_index() || version
 
         case :ets.lookup(state.ets, key) do
-          [{^key, _value, expire_at_ms, _lfu, file_id, offset, value_size}]
+          [{^key, current_value, expire_at_ms, _lfu, file_id, offset, value_size}]
           when valid_cold_location(file_id, offset, value_size) or
                  valid_waraft_segment_location(file_id, offset, value_size) ->
-            Locator.new(
-              flow_id: Map.fetch!(record, :id),
-              kind: :state,
-              version: version,
-              raft_index: ra_index,
-              file_id: file_id,
-              offset: offset,
-              value_size: value_size,
-              expire_at_ms: expire_at_ms
-            )
+            if flow_hibernation_candidate_current?(current_value, state_value, record) do
+              Locator.new(
+                flow_id: Map.fetch!(record, :id),
+                kind: :state,
+                version: version,
+                raft_index: ra_index,
+                file_id: file_id,
+                offset: offset,
+                value_size: value_size,
+                expire_at_ms: expire_at_ms
+              )
+            else
+              :skip
+            end
 
           _ ->
             :skip
@@ -443,6 +558,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         ArgumentError -> :skip
         KeyError -> :skip
       end
+
+      @doc false
+      def __flow_hibernation_candidate_current_for_test__(current_value, state_value, record),
+        do: flow_hibernation_candidate_current?(current_value, state_value, record)
+
+      defp flow_hibernation_candidate_current?(current_value, state_value, _record)
+           when is_binary(current_value) and is_binary(state_value),
+           do: current_value == state_value
+
+      defp flow_hibernation_candidate_current?(current_value, nil, record)
+           when is_binary(current_value) and is_map(record) do
+        case Flow.decode_record(current_value) do
+          ^record -> true
+          _stale_or_invalid -> false
+        end
+      rescue
+        _error -> false
+      end
+
+      defp flow_hibernation_candidate_current?(_current_value, _state_value, _record), do: false
 
       defp flow_hibernation_eviction_record(record) do
         Map.take(record, [

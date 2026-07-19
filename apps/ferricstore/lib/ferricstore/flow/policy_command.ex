@@ -94,12 +94,18 @@ defmodule Ferricstore.Flow.PolicyCommand do
 
   defp do_stamp_many(ctx, keyed_commands) do
     keyed_commands
-    |> Enum.reduce_while({:ok, [], %{}}, fn {key, command}, {:ok, stamped, cache} ->
-      case stamp_command(ctx, command, cache) do
+    |> Enum.reduce_while({:ok, [], %{}, %{}}, fn {key, command}, {:ok, stamped, cache, targets} ->
+      target = Map.get(targets, key, :lookup)
+
+      case stamp_command(ctx, command, cache, target) do
         {:ok, next, next_cache} ->
           case validate_stamped_snapshot_size(next) do
-            :ok -> {:cont, {:ok, [{key, next} | stamped], next_cache}}
-            {:error, _reason} = error -> {:halt, error}
+            :ok ->
+              next_targets = remember_batch_target(targets, key, next)
+              {:cont, {:ok, [{key, next} | stamped], next_cache, next_targets}}
+
+            {:error, _reason} = error ->
+              {:halt, error}
           end
 
         {:error, _reason} = error ->
@@ -107,7 +113,7 @@ defmodule Ferricstore.Flow.PolicyCommand do
       end
     end)
     |> case do
-      {:ok, stamped, cache} ->
+      {:ok, stamped, cache, _targets} ->
         stamped = Enum.reverse(stamped)
         stamped = fence_keyed_commands(ctx, stamped, cache)
 
@@ -124,13 +130,18 @@ defmodule Ferricstore.Flow.PolicyCommand do
   defp stamp_command(_ctx, command, cache) when tuple_size(command) == 0,
     do: {:ok, command, cache}
 
-  defp stamp_command(ctx, command, cache) do
+  defp stamp_command(ctx, command, cache), do: stamp_command(ctx, command, cache, :lookup)
+
+  defp stamp_command(_ctx, command, cache, _target) when tuple_size(command) == 0,
+    do: {:ok, command, cache}
+
+  defp stamp_command(ctx, command, cache, target) do
     op = elem(command, 0)
     attrs = elem(command, tuple_size(command) - 1)
 
     if policy_sensitive_op?(op) do
       if is_map(attrs) do
-        with {:ok, attrs, cache} <- stamp_attrs(ctx, attrs, cache) do
+        with {:ok, attrs, cache} <- stamp_attrs(ctx, attrs, cache, target) do
           attrs =
             attrs
             |> compact_nested_policy_refs()
@@ -158,11 +169,15 @@ defmodule Ferricstore.Flow.PolicyCommand do
   end
 
   defp stamp_attrs(ctx, attrs, cache) do
+    stamp_attrs(ctx, attrs, cache, :lookup)
+  end
+
+  defp stamp_attrs(ctx, attrs, cache, target) do
     attrs = Map.drop(attrs, @internal_keys)
 
     with {:ok, attrs, cache} <- stamp_attrs_list(ctx, attrs, :records, cache),
          {:ok, attrs, cache} <- stamp_attrs_list(ctx, attrs, :children, cache),
-         {:ok, target} <- attrs_policy_target(ctx, attrs) do
+         {:ok, target} <- attrs_policy_target(ctx, attrs, target) do
       case target do
         nil ->
           {:ok, attrs, cache}
@@ -177,6 +192,20 @@ defmodule Ferricstore.Flow.PolicyCommand do
         %{guard: guard} when is_map(guard) ->
           {:ok, Map.put(attrs, :policy_guard, guard), cache}
       end
+    end
+  end
+
+  defp remember_batch_target(targets, _key, command) when tuple_size(command) == 0, do: targets
+
+  defp remember_batch_target(targets, key, command) do
+    attrs = elem(command, tuple_size(command) - 1)
+
+    case attrs do
+      %{policy_ref: %{type: type}} when is_binary(type) and type != "" ->
+        Map.put(targets, key, {:known, type})
+
+      _other ->
+        targets
     end
   end
 
@@ -249,6 +278,16 @@ defmodule Ferricstore.Flow.PolicyCommand do
         {:ok, attrs, cache}
     end
   end
+
+  defp attrs_policy_target(_ctx, %{type: type}, _target)
+       when is_binary(type) and type != "",
+       do: {:ok, %{type: type}}
+
+  defp attrs_policy_target(_ctx, _attrs, {:known, type})
+       when is_binary(type) and type != "",
+       do: {:ok, %{type: type}}
+
+  defp attrs_policy_target(ctx, attrs, :lookup), do: attrs_policy_target(ctx, attrs)
 
   defp attrs_policy_target(_ctx, %{type: type}) when is_binary(type) and type != "",
     do: {:ok, %{type: type}}

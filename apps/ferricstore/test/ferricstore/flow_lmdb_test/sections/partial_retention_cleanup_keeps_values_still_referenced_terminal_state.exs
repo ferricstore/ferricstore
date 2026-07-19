@@ -684,7 +684,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.PartialRetentionCleanupKeepsValuesS
 
         :ets.insert(keydir, {state_key, nil, 0, 0, 99, 0, 16})
 
-        assert :ok =
+        assert {:error,
+                {:flow_lmdb_reconcile_unhealthy,
+                 %{cold_read_errors: 1, history_lmdb_errors: 0, lmdb_errors: 0}}} =
                  Ferricstore.Flow.LMDBRebuilder.reconcile_shard(
                    shard_path,
                    keydir,

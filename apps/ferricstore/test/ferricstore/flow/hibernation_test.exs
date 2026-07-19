@@ -400,6 +400,35 @@ defmodule Ferricstore.Flow.HibernationTest do
              LMDB.decode_active_index_reverse_lane_value(reverse_value)
   end
 
+  test "re-demotion accepts the exact timeout-only active projection" do
+    state_key = Keys.state_key("flow-1", "tenant-1")
+
+    candidate =
+      candidate()
+      |> put_in([:record, :state_key], state_key)
+      |> put_in([:record, :created_at_ms], 1_000)
+      |> put_in([:record, :max_active_ms], 5_000)
+
+    timeout_ops = LMDB.active_timeout_index_put_ops(state_key, candidate.record, 0)
+    reverse_key = LMDB.active_by_state_key_key(state_key)
+
+    assert {:put, ^reverse_key, reverse_value} =
+             Enum.find(timeout_ops, &match?({:put, ^reverse_key, _}, &1))
+
+    timeout_key =
+      LMDB.active_index_key(Keys.active_timeout_index_key(), state_key, 6_000)
+
+    assert {:ok, demotion_ops} =
+             candidate
+             |> Map.put(:active_index_reverse_value, reverse_value)
+             |> Hibernation.demotion_ops_result()
+
+    assert {:delete, timeout_key} in demotion_ops
+
+    assert {:put, ^timeout_key, _value} =
+             Enum.find(demotion_ops, &match?({:put, ^timeout_key, _}, &1))
+  end
+
   test "demotion rejects corrupt active reverse metadata before writing cold rows" do
     test_pid = self()
     candidate = Map.put(candidate(), :active_index_reverse_value, "corrupt-reverse")

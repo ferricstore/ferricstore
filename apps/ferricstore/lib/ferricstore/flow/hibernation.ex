@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Hibernation do
   @moduledoc false
 
-  alias Ferricstore.Flow.{ClaimWaiters, Keys, LMDB, Locator}
+  alias Ferricstore.Flow.{ClaimWaiters, FifoLane, Keys, LMDB, Locator}
   alias Ferricstore.Raft.ApplyContext
 
   @default_hot_window_ms Application.compile_env(
@@ -1546,8 +1546,9 @@ defmodule Ferricstore.Flow.Hibernation do
 
   defp previous_active_index_cleanup_ops(state_key, record, reverse_value)
        when is_binary(reverse_value) do
-    with {:ok, reverse_keys} <- LMDB.decode_active_index_reverse_value(reverse_value),
-         true <- active_reverse_owned_by_record?(reverse_keys, state_key, record) do
+    with {:ok, {reverse_keys, lane_entry}} <-
+           LMDB.decode_active_index_reverse_metadata(reverse_value),
+         true <- active_reverse_owned_by_record?(reverse_keys, lane_entry, state_key, record) do
       LMDB.active_index_delete_ops_from_reverse_result(state_key, reverse_value)
     else
       :error -> {:error, :invalid_active_index_reverse}
@@ -1559,24 +1560,23 @@ defmodule Ferricstore.Flow.Hibernation do
   defp previous_active_index_cleanup_ops(_state_key, _record, _invalid),
     do: {:error, :invalid_active_index_reverse}
 
-  defp active_reverse_owned_by_record?(reverse_keys, state_key, record)
-       when is_list(reverse_keys) do
-    {projection_ops, _reverse_value} =
-      LMDB.active_index_put_ops_with_reverse(state_key, record, 0)
+  defp active_reverse_owned_by_record?(reverse_keys, lane_entry, state_key, record)
+       when is_list(reverse_keys) and is_map(record) do
+    actual_keys = MapSet.new(reverse_keys)
+    hot_keys = active_projection_key_set(LMDB.active_projection_entries(record))
+    cold_keys = active_projection_key_set(LMDB.active_timeout_projection_entries(record))
 
-    expected_keys =
-      projection_ops
-      |> Enum.reduce(MapSet.new(), fn
-        {:put, key, _value}, acc ->
-          if String.starts_with?(key, LMDB.active_index_global_prefix()),
-            do: MapSet.put(acc, key),
-            else: acc
+    Ferricstore.Flow.Keys.state_key(record.id, Map.get(record, :partition_key)) == state_key and
+      lane_entry == FifoLane.index_entry(record) and
+      (actual_keys == hot_keys or actual_keys == cold_keys)
+  rescue
+    _error -> false
+  end
 
-        _other, acc ->
-          acc
-      end)
-
-    MapSet.new(reverse_keys) == expected_keys and MapSet.size(expected_keys) <= 5
+  defp active_projection_key_set(entries) do
+    MapSet.new(entries, fn {index_key, id, score} ->
+      LMDB.active_index_key(index_key, id, score)
+    end)
   end
 
   defp validate_demotion_candidates(candidates) do
