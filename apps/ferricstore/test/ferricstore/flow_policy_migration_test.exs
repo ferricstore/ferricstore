@@ -7,6 +7,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
   alias Ferricstore.Flow.NativeOrderedIndex
   alias Ferricstore.Flow.PolicyMigration
   alias Ferricstore.Flow.PolicyMigrationWorker
+  alias Ferricstore.Flow.Query.SourceCatalog
   alias Ferricstore.Flow.RetryPolicy
   alias Ferricstore.Store.Router
 
@@ -1168,6 +1169,11 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
                now_ms: requested_now_ms
              )
 
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index, 30_000)
+    assert {:ok, {:put, source_catalog_key, ^state_key}} =
+             SourceCatalog.put_op(catalog_key, state_key)
+    assert {:ok, ^state_key} = LMDB.get(flow_lmdb_path(ctx, shard_index), source_catalog_key)
+
     assert {:ok, [claim]} =
              FerricStore.flow_claim_due(type,
                partition_key: @partition,
@@ -1233,6 +1239,8 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     assert [] = :ets.lookup(keydir, registry_key)
     assert [] = :ets.lookup(keydir, guard_key)
     assert [] = :ets.lookup(keydir, catalog_key)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index, 30_000)
+    assert :not_found = LMDB.get(flow_lmdb_path(ctx, shard_index), source_catalog_key)
 
     assert {:ok, _} =
              Router.flow_policy_catalog_backfill_step(ctx, shard_index, %{

@@ -150,20 +150,31 @@ defmodule Ferricstore.Flow.LMDBIndexReadTest do
 
   test "raw prefix discovery applies its candidate limit globally across LMDB paths" do
     {ctx, [path_0, path_1]} = tmp_lmdb_paths(2)
-    index_key_prefix = "attribute:"
+    index_key_prefix =
+      Ferricstore.Flow.Keys.attribute_index_prefix("job", "queued", "color", "tenant-a")
+
+    index_key = fn value ->
+      Ferricstore.Flow.Keys.attribute_index_key(
+        "job",
+        "queued",
+        "color",
+        Ferricstore.Flow.Attributes.index_value(value),
+        "tenant-a"
+      )
+    end
 
     assert :ok =
              LMDB.write_batch(path_0, [
-               query_index_put("attribute:a", "a-1", 1, 0),
-               query_index_put("attribute:c", "c-1", 3, 0),
-               query_index_put("attribute:e", "e-1", 5, 0)
+               query_index_put(index_key.("a"), "a-1", 1, 0),
+               query_index_put(index_key.("c"), "c-1", 3, 0),
+               query_index_put(index_key.("e"), "e-1", 5, 0)
              ])
 
     assert :ok =
              LMDB.write_batch(path_1, [
-               query_index_put("attribute:b", "b-1", 2, 0),
-               query_index_put("attribute:d", "d-1", 4, 0),
-               query_index_put("attribute:f", "f-1", 6, 0)
+               query_index_put(index_key.("b"), "b-1", 2, 0),
+               query_index_put(index_key.("d"), "d-1", 4, 0),
+               query_index_put(index_key.("f"), "f-1", 6, 0)
              ])
 
     assert {:ok, chunks} =
@@ -191,8 +202,7 @@ defmodule Ferricstore.Flow.LMDBIndexReadTest do
   end
 
   defp query_index_put(index_key, id, updated_at_ms, expire_at_ms) do
-    key = LMDB.query_index_key(index_key, id, updated_at_ms)
-    value = LMDB.encode_query_index_value(id, updated_at_ms, expire_at_ms)
+    {key, value} = LMDB.query_index_entry(index_key, id, updated_at_ms, expire_at_ms)
     {:put, key, value}
   end
 

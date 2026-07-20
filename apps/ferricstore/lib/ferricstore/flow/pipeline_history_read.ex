@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
   @moduledoc false
 
   alias Ferricstore.BatchResult
+  alias Ferricstore.Flow.ScopeBinding
 
   @batch_read_error {:error, "ERR flow history batch read result mismatch"}
 
@@ -25,7 +26,8 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
   defp split_hot_cold_ops(history_ops) do
     {hot_ops, cold_ops} =
       Enum.reduce(history_ops, {[], []}, fn
-        {_idx, _id, _partition_key, _history_key, _query, false, false, %{enabled?: false}} = op,
+        {_idx, _id, _partition_key, _history_key, _query, false, false, %{enabled?: false},
+         _expected_metadata} = op,
         {hot_acc, cold_acc} ->
           {[op | hot_acc], cold_acc}
 
@@ -41,7 +43,8 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
   defp cold_results(cold_ops, ctx, callbacks) do
     {consistent_ops, direct_ops} =
       Enum.split_with(cold_ops, fn
-        {_idx, _id, _partition_key, _history_key, _query, _include_cold?, true, _value_return} ->
+        {_idx, _id, _partition_key, _history_key, _query, _include_cold?, true, _value_return,
+         _expected_metadata} ->
           true
 
         _op ->
@@ -58,7 +61,7 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
         {:error, _reason} = error ->
           Map.new(consistent_ops, fn
             {idx, _id, _partition_key, _history_key, _query, _include_cold?, _consistent?,
-             _value_return} ->
+             _value_return, _expected_metadata} ->
               {idx, error}
           end)
       end
@@ -68,20 +71,22 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
 
   defp read_cold_ops(cold_ops, ctx, callbacks, consistent_already_prepared?) do
     Map.new(cold_ops, fn {idx, id, partition_key, history_key, query, include_cold?, consistent?,
-                          value_return} ->
+                          value_return, expected_metadata} ->
       read_consistent? = if consistent_already_prepared?, do: false, else: consistent?
 
       {idx,
-       callbacks.read.(
-         ctx,
-         id,
-         partition_key,
-         history_key,
-         query,
-         include_cold?,
-         read_consistent?,
-         value_return
-       )}
+       with {:ok, scoped_ctx} <- ScopeBinding.put_resolved_read_scope(ctx, expected_metadata) do
+         callbacks.read.(
+           scoped_ctx,
+           id,
+           partition_key,
+           history_key,
+           query,
+           include_cold?,
+           read_consistent?,
+           value_return
+         )
+       end}
     end)
   end
 
@@ -99,9 +104,9 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
 
     {ready_results, requests} =
       Enum.reduce(history_ops, {%{}, []}, fn {idx, id, partition_key, history_key, query, false,
-                                              false, value_return} = op,
+                                              false, value_return, expected_metadata} = op,
                                              {ready_acc, request_acc} ->
-        case Map.fetch(context_by_flow, {id, partition_key}) do
+        case Map.fetch(context_by_flow, {id, partition_key, expected_metadata}) do
           {:ok, {:error, _reason} = error} ->
             {Map.put(ready_acc, idx, error), request_acc}
 
@@ -125,7 +130,7 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
               {ready_acc,
                [
                  {op, idx, id, partition_key, history_key, query, start_idx, stop_idx, false,
-                  value_return, decode_context}
+                  value_return, expected_metadata, decode_context}
                  | request_acc
                ]}
             end
@@ -139,7 +144,8 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
 
     router_requests =
       Enum.map(requests, fn {_op, _idx, _id, _partition_key, history_key, _query, start_idx,
-                             stop_idx, reverse?, _value_return, _decode_context} ->
+                             stop_idx, reverse?, _value_return, _expected_metadata,
+                             _decode_context} ->
         {history_key, start_idx, stop_idx, reverse?}
       end)
 
@@ -155,8 +161,10 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
         :unavailable ->
           fallback_results =
             Map.new(requests, fn {_op, idx, _id, _partition_key, history_key, query, _start_idx,
-                                  _stop_idx, _reverse?, value_return, _decode_context} ->
-              {idx, callbacks.fallback.(ctx, history_key, query, value_return)}
+                                  _stop_idx, _reverse?, value_return, expected_metadata,
+                                  _decode_context} ->
+              {idx,
+               fallback(ctx, history_key, query, value_return, expected_metadata, callbacks)}
             end)
 
           Map.merge(ready_results, fallback_results)
@@ -170,7 +178,7 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
   defp hot_rank_results(requests, rank_results, ctx, callbacks) do
     case BatchResult.map_exact(requests, rank_results, fn
            {_op, idx, id, partition_key, history_key, query, _start_idx, _stop_idx, _reverse?,
-            value_return, decode_context},
+            value_return, expected_metadata, decode_context},
            rank_result ->
              {idx,
               result_from_rank(
@@ -181,6 +189,7 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
                 query,
                 rank_result,
                 value_return,
+                expected_metadata,
                 decode_context,
                 callbacks
               )}
@@ -192,7 +201,8 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
 
   defp failed_hot_results(requests) do
     Map.new(requests, fn {_op, idx, _id, _partition_key, _history_key, _query, _start_idx,
-                          _stop_idx, _reverse?, _value_return, _decode_context} ->
+                          _stop_idx, _reverse?, _value_return, _expected_metadata,
+                          _decode_context} ->
       {idx, @batch_read_error}
     end)
   end
@@ -205,10 +215,11 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
          query,
          [],
          value_return,
+         expected_metadata,
          _decode_context,
          callbacks
        ),
-       do: callbacks.fallback.(ctx, history_key, query, value_return)
+       do: fallback(ctx, history_key, query, value_return, expected_metadata, callbacks)
 
   defp result_from_rank(
          ctx,
@@ -218,6 +229,7 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
          query,
          event_refs,
          value_return,
+         expected_metadata,
          decode_context,
          callbacks
        ) do
@@ -230,6 +242,7 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
              history_key,
              event_ids,
              value_return,
+             expected_metadata,
              decode_context,
              callbacks
            ) do
@@ -257,8 +270,8 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
     flows =
       Enum.map(history_ops, fn
         {_idx, id, partition_key, _history_key, _query, _include_cold?, _consistent?,
-         _value_return} ->
-          {id, partition_key}
+         _value_return, expected_metadata} ->
+          {id, partition_key, expected_metadata}
       end)
 
     case callbacks do
@@ -302,19 +315,22 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
          history_key,
          event_ids,
          value_return,
+         expected_metadata,
          decode_context,
          %{from_event_ids_with_context: from_event_ids_with_context}
        )
        when is_function(from_event_ids_with_context, 7) and not is_nil(decode_context) do
-    from_event_ids_with_context.(
-      ctx,
-      id,
-      partition_key,
-      history_key,
-      event_ids,
-      value_return,
-      decode_context
-    )
+    with {:ok, scoped_ctx} <- ScopeBinding.put_resolved_read_scope(ctx, expected_metadata) do
+      from_event_ids_with_context.(
+        scoped_ctx,
+        id,
+        partition_key,
+        history_key,
+        event_ids,
+        value_return,
+        decode_context
+      )
+    end
   end
 
   defp from_event_ids(
@@ -324,9 +340,25 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
          history_key,
          event_ids,
          value_return,
+         expected_metadata,
          _decode_context,
          callbacks
        ) do
-    callbacks.from_event_ids.(ctx, id, partition_key, history_key, event_ids, value_return)
+    with {:ok, scoped_ctx} <- ScopeBinding.put_resolved_read_scope(ctx, expected_metadata) do
+      callbacks.from_event_ids.(
+        scoped_ctx,
+        id,
+        partition_key,
+        history_key,
+        event_ids,
+        value_return
+      )
+    end
+  end
+
+  defp fallback(ctx, history_key, query, value_return, expected_metadata, callbacks) do
+    with {:ok, scoped_ctx} <- ScopeBinding.put_resolved_read_scope(ctx, expected_metadata) do
+      callbacks.fallback.(scoped_ctx, history_key, query, value_return)
+    end
   end
 end

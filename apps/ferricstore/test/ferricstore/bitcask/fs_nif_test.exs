@@ -227,6 +227,38 @@ defmodule Ferricstore.Bitcask.FsNifTest do
     end
   end
 
+  describe "fs_read_private_nofollow/2" do
+    test "reads only a private regular file", %{tmp: tmp} do
+      path = Path.join(tmp, "cursor.key")
+      File.write!(path, :binary.copy(<<0x5A>>, 32))
+      File.chmod!(path, 0o600)
+
+      assert {:ok, key} = NIF.fs_read_private_nofollow(path, 32)
+      assert key == :binary.copy(<<0x5A>>, 32)
+    end
+
+    test "rejects group or world permissions on the opened file", %{tmp: tmp} do
+      path = Path.join(tmp, "cursor.key")
+      File.write!(path, :binary.copy(<<0x5A>>, 32))
+      File.chmod!(path, 0o640)
+
+      assert {:error, {:insecure_permissions, message}} =
+               NIF.fs_read_private_nofollow(path, 32)
+
+      assert message =~ "private"
+    end
+
+    test "rejects a final-component symlink", %{tmp: tmp} do
+      target = Path.join(tmp, "real.key")
+      link = Path.join(tmp, "cursor.key")
+      File.write!(target, :binary.copy(<<0x5A>>, 32))
+      File.chmod!(target, 0o600)
+      File.ln_s!(target, link)
+
+      assert {:error, {:symlink, _}} = NIF.fs_read_private_nofollow(link, 32)
+    end
+  end
+
   describe "fs_append_sync_nofollow_bounded/3" do
     test "rejects growth past the cap without changing the file", %{tmp: tmp} do
       path = Path.join(tmp, "standalone.txlog")

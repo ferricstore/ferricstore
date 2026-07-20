@@ -61,6 +61,34 @@ defmodule Ferricstore.Raft.ServerCatalogApplyTest do
              ServerCatalog.decode_entry(replacement_encoded)
   end
 
+  test "standalone zero-index metadata still produces monotonic catalog versions", %{state: state} do
+    create = catalog_mutation("alice", nil, nil, "first", 10)
+
+    assert {state, {:ok, first}} =
+             apply_result(StateMachine.apply(%{index: 0}, create, state))
+
+    assert {:ok, %{version: first_version}} = ServerCatalog.decode_entry(first)
+
+    state = %{state | applied_count: 0}
+
+    replace =
+      catalog_mutation(
+        "alice",
+        first,
+        ServerCatalog.encode_revision(first_version),
+        "second",
+        10
+      )
+
+    assert {_state, {:ok, second}} =
+             apply_result(StateMachine.apply(%{index: 0}, replace, state))
+
+    assert {:ok, %{version: second_version, value: "second"}} =
+             ServerCatalog.decode_entry(second)
+
+    assert second_version > first_version
+  end
+
   test "live entry limits are enforced atomically inside apply", %{state: state} do
     assert {state, {:ok, _alice}} =
              apply_result(

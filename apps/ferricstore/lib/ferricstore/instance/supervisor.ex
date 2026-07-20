@@ -99,6 +99,12 @@ defmodule FerricStore.Instance.Supervisor do
         end)
       end
 
+    query_index_provider_children =
+      case FerricStore.Flow.QueryIndexProvider.child_specs(ctx) do
+        {:ok, specs} -> specs
+        {:error, reason} -> raise "Flow query index provider startup failed: #{inspect(reason)}"
+      end
+
     retention_sweeper_children =
       if name == :default do
         []
@@ -177,6 +183,7 @@ defmodule FerricStore.Instance.Supervisor do
       cleanup_children ++
         merge_children ++
         bitcask_writer_children ++
+        query_index_provider_children ++
         flow_lmdb_writer_children ++
         [
           Supervisor.child_spec(

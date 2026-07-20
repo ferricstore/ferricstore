@@ -26,8 +26,20 @@ defmodule Ferricstore.Flow.RecordProjection do
     :state_meta
   ]
 
-  def public(record) when is_map(record),
-    do: Map.drop(record, [:incarnation, :state_enter_seq, :governance_limit])
+  alias Ferricstore.Flow.StorageScope
+
+  def public(record) when is_map(record) do
+    record =
+      case StorageScope.logical_partition_key(record) do
+        {:ok, partition_key} ->
+          Map.put(record, :partition_key, partition_key)
+
+        {:error, :invalid_flow_system_metadata} ->
+          raise ArgumentError, "invalid Flow storage scope"
+      end
+
+    Map.drop(record, [:incarnation, :state_enter_seq, :governance_limit, :system_metadata])
+  end
 
   def public(record), do: record
 
@@ -35,7 +47,9 @@ defmodule Ferricstore.Flow.RecordProjection do
   def public_result({:ok, records}) when is_list(records), do: {:ok, Enum.map(records, &public/1)}
   def public_result(result), do: result
 
-  def meta(record) when is_map(record), do: :maps.with(@meta_keys, record)
+  def meta(record) when is_map(record),
+    do: record |> public() |> then(&:maps.with(@meta_keys, &1))
+
   def meta(record), do: record
 
   def maybe_meta(record, opts) do

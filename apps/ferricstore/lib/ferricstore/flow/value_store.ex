@@ -4,7 +4,7 @@ defmodule Ferricstore.Flow.ValueStore do
   alias Ferricstore.BatchResult
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Codec
-  alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.{Keys, ScopeBinding}
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Stats
   alias Ferricstore.Store.{BlobValue, ColdRead, ReadResult, Router}
@@ -41,7 +41,9 @@ defmodule Ferricstore.Flow.ValueStore do
                 return_mode
               )
 
-            Router.flow_named_value_put(ctx, attrs)
+            with {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :named_value_put, attrs) do
+              Router.flow_named_value_put(ctx, attrs)
+            end
           end
         else
           ref_id = shared_value_ref_id()

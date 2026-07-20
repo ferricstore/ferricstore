@@ -2,7 +2,16 @@ defmodule Ferricstore.Flow.ClaimWaiterSchedulerTest do
   use ExUnit.Case, async: false
   @moduletag :flow
 
-  alias Ferricstore.Flow.{ClaimWaiters, ClaimWaiterScheduler, LMDB, Locator}
+  alias Ferricstore.Flow.{
+    ClaimWaiters,
+    ClaimWaiterScheduler,
+    Keys,
+    LMDB,
+    Locator,
+    StorageScope
+  }
+
+  alias Ferricstore.Store.Router
 
   test "schedule_next_due fails closed for unsupported inputs" do
     assert ClaimWaiterScheduler.schedule_next_due(%{}, :bad_type, :any, nil, :any, nil) == :ok
@@ -18,6 +27,33 @@ defmodule Ferricstore.Flow.ClaimWaiterSchedulerTest do
 
     assert source =~ "Router.flow_earliest_due_score"
     refute source =~ "Router.flow_due_count_keys"
+  end
+
+  test "scoped auto scheduling uses one aggregate probe instead of per-bucket fanout" do
+    scope = <<11::unsigned-big-64>>
+
+    partitions =
+      Enum.map(Keys.auto_partition_keys(), fn logical_partition ->
+        assert {:ok, physical_partition} =
+                 StorageScope.physical_partition_key(logical_partition, scope)
+
+        physical_partition
+      end)
+
+    calls =
+      traced_router_calls(fn ->
+        ClaimWaiterScheduler.schedule_next_due(
+          %{},
+          "email",
+          "queued",
+          nil,
+          partitions,
+          0
+        )
+      end)
+
+    assert calls.rank == 0
+    assert calls.aggregate <= 1
   end
 
   test "unbounded due-count-key router and shard endpoints are not compiled" do
@@ -365,6 +401,33 @@ defmodule Ferricstore.Flow.ClaimWaiterSchedulerTest do
     refute ClaimWaiterScheduler.__cold_partition_match_for_test__("__flow_auto__:01", :auto)
     refute ClaimWaiterScheduler.__cold_partition_match_for_test__("__flow_auto__:256", :auto)
     refute ClaimWaiterScheduler.__cold_partition_match_for_test__("__flow_auto__:manual", :auto)
+
+    tenant_scope = <<11::unsigned-big-64>>
+    other_scope = <<22::unsigned-big-64>>
+
+    assert {:ok, scoped_auto} =
+             StorageScope.physical_partition_key("__flow_auto__:17", tenant_scope)
+
+    assert {:ok, scoped_explicit} =
+             StorageScope.physical_partition_key("explicit", tenant_scope)
+
+    assert {:ok, other_tenant_auto} =
+             StorageScope.physical_partition_key("__flow_auto__:17", other_scope)
+
+    assert ClaimWaiterScheduler.__cold_partition_match_for_test__(
+             scoped_auto,
+             {:scoped_auto, tenant_scope}
+           )
+
+    refute ClaimWaiterScheduler.__cold_partition_match_for_test__(
+             scoped_explicit,
+             {:scoped_auto, tenant_scope}
+           )
+
+    refute ClaimWaiterScheduler.__cold_partition_match_for_test__(
+             other_tenant_auto,
+             {:scoped_auto, tenant_scope}
+           )
   end
 
   defp traced_prefix_call_count(fun) do
@@ -383,6 +446,46 @@ defmodule Ferricstore.Flow.ClaimWaiterSchedulerTest do
       collect_prefix_calls(pid, 0)
     after
       :erlang.trace_pattern({LMDB, :prefix_entries, 3}, false, [:local])
+    end
+  end
+
+  defp traced_router_calls(fun) do
+    parent = self()
+
+    pid =
+      spawn(fn ->
+        receive do
+          :run ->
+            result = fun.()
+            send(parent, {:router_schedule_done, self(), result})
+        end
+      end)
+
+    1 = :erlang.trace(pid, true, [:call, {:tracer, parent}])
+    1 = :erlang.trace_pattern({Router, :flow_index_rank_range, 5}, true, [:local])
+    1 = :erlang.trace_pattern({Router, :flow_earliest_due_score, 4}, true, [:local])
+    send(pid, :run)
+
+    try do
+      collect_router_calls(pid, %{rank: 0, aggregate: 0})
+    after
+      :erlang.trace_pattern({Router, :flow_index_rank_range, 5}, false, [:local])
+      :erlang.trace_pattern({Router, :flow_earliest_due_score, 4}, false, [:local])
+    end
+  end
+
+  defp collect_router_calls(pid, counts) do
+    receive do
+      {:trace, ^pid, :call, {Router, :flow_index_rank_range, _arguments}} ->
+        collect_router_calls(pid, Map.update!(counts, :rank, &(&1 + 1)))
+
+      {:trace, ^pid, :call, {Router, :flow_earliest_due_score, _arguments}} ->
+        collect_router_calls(pid, Map.update!(counts, :aggregate, &(&1 + 1)))
+
+      {:router_schedule_done, ^pid, :ok} ->
+        counts
+    after
+      5_000 -> flunk("scoped auto scheduling did not complete")
     end
   end
 

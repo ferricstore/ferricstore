@@ -22,6 +22,7 @@ defmodule FerricstoreServer.Native.Connection do
     Commands,
     Lane,
     OutboundBudget,
+    RequestContext,
     ResourceBudget,
     Session
   }
@@ -70,6 +71,7 @@ defmodule FerricstoreServer.Native.Connection do
     :outbound_counter,
     :response_coalesce_max,
     :response_coalesce_bytes,
+    :trusted_request_context_users,
     :command_state,
     :idle_timeout_ms,
     :resource_budget,
@@ -236,6 +238,9 @@ defmodule FerricstoreServer.Native.Connection do
               stats_counter: ctx.stats_counter,
               require_auth: Commands.default_requires_auth?(),
               acl_cache: FerricstoreServer.Connection.Auth.build_acl_cache("default"),
+              trusted_request_context_users:
+                Map.get(opts, :trusted_request_context_users) ||
+                  RequestContext.configured_trusted_users(),
               max_frame_bytes: max_frame_bytes,
               resource_budget: Map.get(opts, :resource_budget, ResourceBudget),
               preauth_max_frame_bytes: preauth_max_frame_bytes,
@@ -1519,6 +1524,7 @@ defmodule FerricstoreServer.Native.Connection do
       require_auth: state.require_auth,
       username: state.username,
       acl_cache: state.acl_cache,
+      trusted_request_context_users: state.trusted_request_context_users,
       event_subscriptions: state.event_subscriptions,
       flow_wake_subscription: state.flow_wake_subscription,
       multi_state: state.multi_state,

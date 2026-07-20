@@ -9,6 +9,7 @@ defmodule Ferricstore.Flow.RecordRead do
   alias Ferricstore.Flow.RAMIndexRead
   alias Ferricstore.Flow.RecordLoader
   alias Ferricstore.Flow.RecordQuery
+  alias Ferricstore.Flow.ScopeBinding
   alias Ferricstore.Store.Router
 
   def list_records(
@@ -130,7 +131,7 @@ defmodule Ferricstore.Flow.RecordRead do
         terminal_states,
         scan_limit
       ) do
-    sources = terminal_query_sources(state, partition_key, terminal_states)
+    sources = terminal_query_sources(ctx, state, partition_key, terminal_states)
 
     RecordQuery.bounded_filtered_records(
       sources,
@@ -313,7 +314,7 @@ defmodule Ferricstore.Flow.RecordRead do
   end
 
   def root_record(ctx, root_flow_id, :auto) do
-    root_record(ctx, root_flow_id, Keys.auto_partition_key(root_flow_id))
+    root_record(ctx, root_flow_id, ScopeBinding.auto_partition_key(ctx, root_flow_id))
   end
 
   def root_record(ctx, root_flow_id, partition_key) do
@@ -326,7 +327,7 @@ defmodule Ferricstore.Flow.RecordRead do
 
   def stuck_records(ctx, type, :auto, cutoff, count) do
     RecordQuery.bounded_auto_partition_records(
-      Keys.auto_partition_keys(),
+      ScopeBinding.auto_partition_keys(ctx),
       count,
       false,
       fn partition_key, fetch_count ->
@@ -351,12 +352,12 @@ defmodule Ferricstore.Flow.RecordRead do
     end
   end
 
-  defp terminal_query_sources(state, partition_key, terminal_states) do
+  defp terminal_query_sources(ctx, state, partition_key, terminal_states) do
     states = if state == "any", do: terminal_states, else: [state]
 
     partitions =
       if partition_key == :auto,
-        do: Keys.auto_partition_keys(),
+        do: ScopeBinding.auto_partition_keys(ctx),
         else: [partition_key]
 
     for source_partition <- partitions,
@@ -701,7 +702,7 @@ defmodule Ferricstore.Flow.RecordRead do
          _scan_limit
        ) do
     RecordQuery.bounded_auto_partition_filtered_records(
-      Keys.auto_partition_keys(),
+      ScopeBinding.auto_partition_keys(ctx),
       count,
       RAMIndexRead.reverse?(query),
       fn partition_key, fetch_count, scan_budget ->
@@ -788,7 +789,7 @@ defmodule Ferricstore.Flow.RecordRead do
   end
 
   defp auto_hot_rank_sources(ctx, type, state) do
-    with {:ok, candidates} <- auto_hot_rank_candidates(type, state) do
+    with {:ok, candidates} <- auto_hot_rank_candidates(ctx, type, state) do
       case Router.flow_index_count_all_many(
              ctx,
              Enum.map(candidates, fn {_partition_key, index_key} -> index_key end)
@@ -813,8 +814,8 @@ defmodule Ferricstore.Flow.RecordRead do
     end
   end
 
-  defp auto_hot_rank_candidates(type, state) do
-    Keys.auto_partition_keys()
+  defp auto_hot_rank_candidates(ctx, type, state) do
+    ScopeBinding.auto_partition_keys(ctx)
     |> Enum.reduce_while({:ok, []}, fn partition_key, {:ok, acc} ->
       index_key = Keys.state_index_key(type, state, partition_key)
 

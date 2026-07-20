@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.Query.CompositeProjection
   alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.TermCodec
@@ -19,40 +20,46 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   def expand_ops(state, ops) do
-    initial = %{
-      ops: [],
-      counts: %{},
-      count_values: %{},
-      terminal_values: %{},
-      terminal_reverse_values: %{},
-      active_reverse_values: %{},
-      pending_terminal_count_put_news: MapSet.new(),
-      terminal_count_inits: state.terminal_count_inits,
-      terminal_atomic_write?: false
-    }
+    with {:ok, definitions} <- query_index_definitions(state) do
+      expansion_state = Map.put(state, :query_index_definitions, definitions)
 
-    Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
-      case expand_op(state, op, acc) do
-        {:ok, acc} -> {:cont, {:ok, acc}}
-        {:error, _reason} = error -> {:halt, error}
+      initial = %{
+        ops: [],
+        counts: %{},
+        count_values: %{},
+        terminal_values: %{},
+        terminal_reverse_values: %{},
+        active_reverse_values: %{},
+        composite_projection_cache: CompositeProjection.new_cache(),
+        pending_terminal_count_put_news: MapSet.new(),
+        terminal_count_inits: state.terminal_count_inits,
+        terminal_atomic_write?: false
+      }
+
+      Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
+        case expand_op(expansion_state, op, acc) do
+          {:ok, acc} -> {:cont, {:ok, acc}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok,
+         %{
+           ops: expanded,
+           terminal_count_inits: terminal_count_inits,
+           terminal_atomic_write?: terminal_atomic_write?
+         }} ->
+          state =
+            expansion_state
+            |> Map.delete(:query_index_definitions)
+            |> Map.put(:terminal_count_inits, terminal_count_inits)
+            |> Map.put(:terminal_atomic_write?, terminal_atomic_write?)
+
+          {:ok, Enum.reverse(expanded), state}
+
+        {:error, _reason} = error ->
+          error
       end
-    end)
-    |> case do
-      {:ok,
-       %{
-         ops: expanded,
-         terminal_count_inits: terminal_count_inits,
-         terminal_atomic_write?: terminal_atomic_write?
-       }} ->
-        state =
-          state
-          |> Map.put(:terminal_count_inits, terminal_count_inits)
-          |> Map.put(:terminal_atomic_write?, terminal_atomic_write?)
-
-        {:ok, Enum.reverse(expanded), state}
-
-      {:error, _reason} = error ->
-        error
     end
   end
 
@@ -76,10 +83,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def expand_op(state, {:project_flow_state_from_source, key}, acc) when is_binary(key) do
     case read_source_value(state, key) do
       {:ok, value, expire_at_ms} ->
-        expand_flow_state_value(state.path, key, value, expire_at_ms, acc)
+        expand_flow_state_value(state, key, value, expire_at_ms, acc)
 
       :not_found ->
-        expand_missing_flow_state_projection(state.path, key, acc)
+        expand_missing_flow_state_projection(state, key, acc)
 
       {:error, _reason} = error ->
         error
@@ -88,19 +95,26 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
   def expand_op(state, {:project_flow_state, key, value, expire_at_ms}, acc)
       when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) do
-    expand_flow_state_value(state.path, key, value, expire_at_ms, acc)
+    expand_flow_state_value(state, key, value, expire_at_ms, acc)
   end
 
   def expand_op(%{path: path}, op, acc), do: expand_path_op(path, op, acc)
 
-  def expand_flow_state_value(path, key, value, expire_at_ms, acc) do
+  def expand_flow_state_value(%{path: path} = projection_state, key, value, expire_at_ms, acc) do
     wrapper = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
 
     with {:ok, acc} <- expand_path_op(path, {:put, key, wrapper}, acc) do
       case decode_flow_record_value(wrapper) do
         {:ok, record} ->
           projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
-          expand_flow_state_projection(path, key, projection_expire_at_ms, record, acc)
+
+          expand_flow_state_projection(
+            projection_state,
+            key,
+            projection_expire_at_ms,
+            record,
+            acc
+          )
 
         :error ->
           {:error, :invalid_flow_state_projection}
@@ -108,7 +122,40 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  def expand_flow_state_projection(path, state_key, expire_at_ms, record, acc) do
+  def expand_flow_state_value(path, key, value, expire_at_ms, acc) when is_binary(path) do
+    expand_flow_state_value(
+      %{path: path, query_index_definitions: []},
+      key,
+      value,
+      expire_at_ms,
+      acc
+    )
+  end
+
+  def expand_flow_state_projection(
+        %{path: path} = projection_state,
+        state_key,
+        expire_at_ms,
+        record,
+        acc
+      ) do
+    with {:ok, acc} <- standard_flow_state_projection(path, state_key, expire_at_ms, record, acc) do
+      expand_composite_projection(projection_state, state_key, expire_at_ms, record, acc)
+    end
+  end
+
+  def expand_flow_state_projection(path, state_key, expire_at_ms, record, acc)
+      when is_binary(path) do
+    expand_flow_state_projection(
+      %{path: path, query_index_definitions: []},
+      state_key,
+      expire_at_ms,
+      record,
+      acc
+    )
+  end
+
+  defp standard_flow_state_projection(path, state_key, expire_at_ms, record, acc) do
     if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
       with {:ok, acc} <- maybe_expand_stale_active_delete(path, state_key, acc) do
         expand_path_op(
@@ -157,10 +204,74 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  def expand_missing_flow_state_projection(path, state_key, acc) do
+  def expand_missing_flow_state_projection(%{path: path} = projection_state, state_key, acc) do
     with {:ok, acc} <- maybe_expand_stale_terminal_delete(path, state_key, acc),
-         {:ok, acc} <- maybe_expand_stale_active_delete(path, state_key, acc) do
-      {:ok, prepend_ops(acc, [{:delete, state_key}])}
+         {:ok, acc} <- maybe_expand_stale_active_delete(path, state_key, acc),
+         acc = prepend_ops(acc, [{:delete, state_key}]) do
+      expand_composite_removal(projection_state, state_key, acc)
+    end
+  end
+
+  def expand_missing_flow_state_projection(path, state_key, acc) when is_binary(path) do
+    expand_missing_flow_state_projection(
+      %{path: path, query_index_definitions: []},
+      state_key,
+      acc
+    )
+  end
+
+  defp query_index_definitions(%{instance_ctx: instance_ctx, shard_index: shard_index})
+       when is_integer(shard_index) and shard_index >= 0 do
+    FerricStore.Flow.QueryIndexProvider.projection_definitions(instance_ctx, shard_index)
+  end
+
+  defp query_index_definitions(_state), do: {:ok, []}
+
+  defp expand_composite_projection(
+         %{path: path, query_index_definitions: definitions},
+         state_key,
+         expire_at_ms,
+         record,
+         acc
+       ) do
+    cache = Map.get(acc, :composite_projection_cache, CompositeProjection.new_cache())
+
+    case CompositeProjection.reconcile(
+           path,
+           state_key,
+           record,
+           expire_at_ms,
+           definitions,
+           cache
+         ) do
+      {:ok, ops, cache} ->
+        {:ok, acc |> Map.put(:composite_projection_cache, cache) |> prepend_ops(ops)}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp expand_composite_removal(
+         %{query_index_definitions: []},
+         _state_key,
+         acc
+       ),
+       do: {:ok, acc}
+
+  defp expand_composite_removal(
+         %{path: path, query_index_definitions: definitions},
+         state_key,
+         acc
+       ) do
+    cache = Map.get(acc, :composite_projection_cache, CompositeProjection.new_cache())
+
+    case CompositeProjection.remove(path, state_key, definitions, cache) do
+      {:ok, ops, cache} ->
+        {:ok, acc |> Map.put(:composite_projection_cache, cache) |> prepend_ops(ops)}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -1198,8 +1309,15 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
     entries
     |> Enum.map(fn {index_key, _id, score} ->
-      query_key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
-      value = Ferricstore.Flow.LMDB.encode_query_index_value(id, score, expire_at_ms, state_key)
+      {query_key, value} =
+        Ferricstore.Flow.LMDB.query_index_entry(
+          index_key,
+          id,
+          score,
+          expire_at_ms,
+          state_key
+        )
+
       {:put, query_key, value}
     end)
   end
@@ -1314,8 +1432,14 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         :correlation -> Ferricstore.Flow.Keys.correlation_index_key(value, partition_key)
       end
 
-    query_key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
-    value = Ferricstore.Flow.LMDB.encode_query_index_value(id, score, expire_at_ms, state_key)
+    {query_key, value} =
+      Ferricstore.Flow.LMDB.query_index_entry(
+        index_key,
+        id,
+        score,
+        expire_at_ms,
+        state_key
+      )
 
     [{:put, query_key, value} | ops]
   end

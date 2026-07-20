@@ -3,6 +3,33 @@ defmodule Ferricstore.Store.StandaloneCommitQueueTest do
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard
+  alias Ferricstore.ServerCatalog
+
+  test "catalog versions advance across separate standalone flushes" do
+    {pid, ctx, data_dir} = start_shard([])
+    on_exit(fn -> cleanup_shard(pid, ctx, data_dir) end)
+
+    assert {:ok, first} =
+             Router.server_catalog_mutate(ctx, "queue-catalog", "subject", nil, nil, "first", 10)
+
+    assert {:ok, %{version: first_version}} = ServerCatalog.decode_entry(first)
+
+    assert {:ok, second} =
+             Router.server_catalog_mutate(
+               ctx,
+               "queue-catalog",
+               "subject",
+               first,
+               ServerCatalog.encode_revision(first_version),
+               "second",
+               10
+             )
+
+    assert {:ok, %{version: second_version, value: "second"}} =
+             ServerCatalog.decode_entry(second)
+
+    assert second_version > first_version
+  end
 
   test "cross-shard barrier release is scoped to the acquiring operation" do
     {pid, ctx, data_dir} = start_shard([])

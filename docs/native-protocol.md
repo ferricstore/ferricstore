@@ -73,7 +73,8 @@ the client does not need the server result.
 
 Most command bodies may include `deadline_ms`, an absolute server Unix
 millisecond deadline. If the deadline is already expired when dispatch begins,
-the command returns `deadline_exceeded` and is not executed.
+the command returns `deadline_exceeded` and is not executed. The field must be
+a non-negative integer; `0` disables the deadline for that request.
 
 Chunking:
 
@@ -363,6 +364,7 @@ FERRICSTORE.KEY_INFO: {"key": "k", "args": ["k"]}
 0x022E FLOW.ATTRIBUTES
 0x022F FLOW.ATTRIBUTE_VALUES
 0x0230 FLOW.SEARCH
+0x0231 FLOW.QUERY
 0x0240 FLOW.EFFECT.RESERVE
 0x0241 FLOW.EFFECT.CONFIRM
 0x0242 FLOW.EFFECT.FAIL
@@ -416,6 +418,11 @@ FLOW.STATS:
 FLOW.SEARCH:
 {"type": "email", "state": "queued", "attributes": {"tenant": "acme"},
  "state_meta": {"queued": {"version": "1"}}, "consistent_projection": true}
+
+FLOW.QUERY:
+{"version": "FQL1",
+ "query": "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD",
+ "params": {"partition": "tenant-a", "flow_id": "flow-1"}}
 ```
 
 Typed `payload`, `result`, and `error` values stay binary-safe and structured at
@@ -438,6 +445,70 @@ search on that Flow type. Metadata for one state does not replace metadata
 stored for another state. Changing or removing `INDEXED_STATE_META` rewrites
 existing Flow records for that type so LMDB query rows are backfilled or deleted
 for the affected key.
+
+### FLOW.QUERY and FQL1
+
+`FLOW.QUERY` is the versioned Flow read envelope. The OSS default query provider
+is deliberately limited to an exact authoritative record lookup:
+
+```text
+[EXPLAIN] FROM runs
+WHERE partition_key = <value> AND run_id = <value>
+RETURN RECORD[;]
+```
+
+The two predicates may appear in either order. A value is either a single-quoted
+keyword literal or a named parameter such as `@flow_id`; doubled single quotes
+escape a quote inside a literal. Named parameter values must be non-empty
+binaries. Query text is limited to 16 KiB and 32 lexical tokens. Bound
+partition keys are limited to 65,535 bytes, and bound run IDs are limited so
+the resulting physical point key remains within the store key-size ceiling.
+
+The OSS provider rejects every other source, field, predicate, return shape, and
+FQL version before storage access. In particular, a run-id-only query is not
+accepted because records with explicit partition keys require the partition for
+an exact physical lookup. This path delegates directly to the existing
+`FLOW.GET` point read and never performs a scan or materializes a candidate set.
+
+Enterprise installs a separate capability-negotiated provider for bounded
+record collections, event history, lineage reads, and exact `RETURN COUNT`.
+Clients must check the advertised query shapes rather than infer Enterprise
+support from the `FQL1` language version.
+
+`RETURN RECORD` returns a structural allowlist, not the complete internal Flow
+record. It includes identity, type/state/version, priority, partition,
+timestamps, attempts/run state, maximum active time, and parent/root/correlation
+identifiers. It excludes payload/result/error and named-value references,
+attributes, state metadata, child bookkeeping, worker/lease/fencing tokens and
+owners, parent partition keys, retention controls, and unknown future fields.
+
+Prefixing the query with `EXPLAIN` returns
+`ferric.flow.query.point-explain/v1`. The plan is deterministic and redacts
+literal and bound parameter values. It reports only the structural point-read
+bounds that this operator enforces. The OSS provider does not advertise the broader
+`ferric.flow.query/v1` or `ferric.flow.explain/v1` Platform contracts until it
+implements tenant scope, workload budgets, cursors, quality evidence, and the
+approved collection plans. Enterprise advertises those contracts when its
+provider is installed. Query failures use fixed, value-free error codes and
+messages. A point-read storage outage returns `query_storage_unavailable` and is
+marked retryable and safe to retry; an execution-provider defect returns the
+non-retryable `query_engine_failure` error. A decoded primary record that does
+not match the bound partition and run ID returns the non-retryable
+`query_storage_inconsistent` error without exposing the record.
+
+Trusted native proxies may attach `request_context` with `subject`, `tenant`,
+and `scopes`. Trust is configured by
+`FERRICSTORE_NATIVE_TRUSTED_REQUEST_CONTEXT_USERS` and frozen when a connection
+is accepted, so configuration changes apply to new connections. Subject and
+tenant values are limited to 4 KiB. Scopes are limited to 64 entries of at most
+1 KiB each, with duplicates removed. Oversized trusted contexts fail before
+query-provider dispatch; untrusted connection contexts are ignored. Query text
+and parameters are fully redacted from the slow log.
+
+`FLOW.QUERY` is parsed and bound once through the shared prepared-command
+contract before authorization or routing. The mandatory partition becomes the
+ACL resource and shard-routing key; execution consumes the same prepared AST so
+authorization cannot diverge from the query that reaches storage.
 
 ## Client management and reroute behavior
 

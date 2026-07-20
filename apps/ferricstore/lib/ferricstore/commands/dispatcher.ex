@@ -511,7 +511,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
-      when tag in ~w(flow_create flow_value_put flow_signal flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_search flow_attributes flow_terminals flow_failures flow_info flow_stuck flow_history flow_retention_cleanup)a,
+      when tag in ~w(flow_create flow_value_put flow_signal flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_search flow_query flow_attributes flow_terminals flow_failures flow_info flow_stuck flow_history flow_retention_cleanup)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
@@ -527,7 +527,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
-      when tag in ~w(flow_extend_lease flow_complete flow_retry flow_fail flow_attribute_values)a,
+      when tag in ~w(flow_extend_lease flow_complete flow_retry flow_fail flow_attribute_values flow_query)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
@@ -763,8 +763,10 @@ defmodule Ferricstore.Commands.Dispatcher do
   @doc """
   Prepares a raw command once for parsing, key authorization, and routing.
   """
-  @spec prepare_raw(binary(), [term()]) :: {:ok, PreparedCommand.t()} | {:error, binary()}
-  def prepare_raw(name, args), do: PreparedCommand.prepare(name, args)
+  @spec prepare_raw(binary(), [term()], keyword()) ::
+          {:ok, PreparedCommand.t()} | {:error, binary()}
+  def prepare_raw(name, args, opts \\ []) when is_list(opts),
+    do: PreparedCommand.prepare(name, args, opts)
 
   @doc """
   Dispatches a raw command name and argument list through the canonical command
@@ -788,6 +790,18 @@ defmodule Ferricstore.Commands.Dispatcher do
   """
   @spec dispatch_prepared(PreparedCommand.t(), map(), keyword()) :: term()
   def dispatch_prepared(%PreparedCommand{} = prepared, store, opts \\ []) do
+    execute_prepared(
+      prepared,
+      store,
+      fn -> dispatch_prepared_ast(prepared, store) end,
+      opts
+    )
+  end
+
+  @doc false
+  @spec execute_prepared(PreparedCommand.t(), map(), (-> term()), keyword()) :: term()
+  def execute_prepared(%PreparedCommand{} = prepared, store, executor, opts \\ [])
+      when is_function(executor, 0) and is_list(opts) do
     start = Keyword.get_lazy(opts, :started_at_us, fn -> System.monotonic_time(:microsecond) end)
 
     result =
@@ -795,12 +809,12 @@ defmodule Ferricstore.Commands.Dispatcher do
         :ok ->
           case check_raw_resource_limits(
                  prepared.command,
-                 prepared.args,
+                 prepared_resource_limit_args(prepared),
                  prepared.acl_keys,
                  store
                ) do
             :ok ->
-              result = dispatch_prepared_ast(prepared, store)
+              result = executor.()
               record_raw_activity(result, prepared.command, prepared.acl_keys, store)
               result
 
@@ -855,6 +869,9 @@ defmodule Ferricstore.Commands.Dispatcher do
   catch
     _kind, _reason -> :ok
   end
+
+  defp prepared_resource_limit_args(%PreparedCommand{command: "FLOW.QUERY"}), do: []
+  defp prepared_resource_limit_args(%PreparedCommand{args: args}), do: args
 
   defp check_raw_resource_limits(_cmd, _args, [], _store), do: :ok
 

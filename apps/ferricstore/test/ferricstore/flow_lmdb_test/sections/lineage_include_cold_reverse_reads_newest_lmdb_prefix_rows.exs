@@ -71,7 +71,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
             query_key = Ferricstore.Flow.LMDB.query_index_key(query_index_key, id, updated_at_ms)
 
             query_value =
-              Ferricstore.Flow.LMDB.encode_query_index_value(id, updated_at_ms, 0, state_key)
+              Ferricstore.Flow.LMDB.encode_query_index_value(
+                query_index_key,
+                id,
+                updated_at_ms,
+                0,
+                state_key
+              )
 
             [{:put, state_key, state_value}, {:put, query_key, query_value}]
           end)
@@ -120,7 +126,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
           Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key)
 
         stale_query_key = Ferricstore.Flow.LMDB.query_index_key(stale_index_key, stale_id, 10)
-        stale_query_value = Ferricstore.Flow.LMDB.encode_query_index_value(stale_id, 10, 0)
+
+        stale_query_value =
+          Ferricstore.Flow.LMDB.encode_query_index_value(stale_index_key, stale_id, 10, 0)
 
         lmdb_path =
           ctx.data_dir

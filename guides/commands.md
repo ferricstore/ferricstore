@@ -52,7 +52,7 @@ data-structure commands. They are exposed through native TCP mode and the embedd
 `FLOW.REWIND`, `FLOW.LIST`, `FLOW.STATS`, `FLOW.BY_PARENT`, `FLOW.BY_ROOT`,
 `FLOW.BY_CORRELATION`, `FLOW.INFO`, `FLOW.STUCK`, `FLOW.HISTORY`,
 `FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.POLICY.SET`, `FLOW.POLICY.GET`,
-`FLOW.SEARCH`, and `FLOW.RETENTION_CLEANUP`.
+`FLOW.SEARCH`, `FLOW.QUERY`, and `FLOW.RETENTION_CLEANUP`.
 
 Flow attributes are small indexed metadata fields for query and dashboard
 filters. They are separate from payload and named value refs:
@@ -64,6 +64,33 @@ FLOW.LIST order STATE queued ATTRIBUTE tenant acme COUNT 100
 FLOW.STATS order STATE queued ATTRIBUTE tenant acme
 FLOW.SEARCH TYPE order STATE queued ATTRIBUTE tenant acme CONSISTENT_PROJECTION true
 ```
+
+Use `FLOW.QUERY` as the versioned read/query envelope. The OSS default provider
+supports the authoritative point-record path:
+
+```text
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'order-1' RETURN RECORD"
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD" partition tenant-a flow_id order-1
+FLOW.QUERY FQL1 "EXPLAIN FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD" partition tenant-a flow_id order-1
+```
+
+Both `partition_key` and `run_id` are required, though their predicate order is
+interchangeable. Enterprise installs the bounded collection provider and
+advertises its additional shapes through capability negotiation, including:
+
+```text
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND state = 'failed' ORDER BY updated_at_ms DESC LIMIT 50 RETURN RECORDS" partition tenant-a
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND type = 'order' RETURN COUNT" partition tenant-a
+```
+
+The OSS point provider rejects collection scans, run-id-only lookups, history,
+lineage, counts, ordering, pagination, and other return shapes. See
+[Flow Query Architecture](../docs/flow-query.md) for the Enterprise contract and
+mandatory bounds.
+
+The returned record is a structural query projection. It does not include
+payload/result/error refs, named values, arbitrary attributes or state
+metadata, child bookkeeping, or worker lease/fencing credentials.
 
 Bound the total non-terminal lifetime of a Flow with a type policy or a
 per-create override:

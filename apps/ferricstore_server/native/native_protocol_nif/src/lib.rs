@@ -1,5 +1,7 @@
 use rustler::{Binary, Encoder, Env, ListIterator, NifResult, OwnedBinary, Term};
 
+mod fql;
+
 const MAGIC: &[u8; 4] = b"FSNP";
 const VERSION: u8 = 1;
 const RESPONSE_DIRECTION: u8 = 0x80;
@@ -27,6 +29,163 @@ struct FrameSlice<'a> {
 enum CompactClaimMode {
     Base,
     State,
+}
+
+#[rustler::nif]
+fn parse_fql<'a>(env: Env<'a>, query: Binary<'a>) -> NifResult<Term<'a>> {
+    match fql::parse(query.as_slice()) {
+        Ok(parsed) => {
+            let mode = match parsed.mode {
+                fql::Mode::Execute => atoms::execute(),
+                fql::Mode::Explain => atoms::explain(),
+            };
+            let source = match parsed.source {
+                fql::Source::Runs => atoms::runs(),
+                fql::Source::Events => atoms::events(),
+            };
+            let shape = match parsed.shape {
+                fql::Shape::Point => atoms::point(),
+                fql::Shape::Collection => atoms::collection(),
+                fql::Shape::History => atoms::history(),
+                fql::Shape::Count => atoms::count(),
+            };
+            let predicates = parsed
+                .predicates
+                .into_iter()
+                .map(|predicate| encode_fql_predicate(env, predicate))
+                .collect::<NifResult<Vec<_>>>()?;
+            let order_by = parsed
+                .order_by
+                .into_iter()
+                .map(|order| encode_fql_order(env, order))
+                .collect::<NifResult<Vec<_>>>()?;
+            let cursor = match parsed.cursor {
+                Some(value) => encode_fql_value(env, value)?,
+                None => atoms::nil().encode(env),
+            };
+            let limit = match parsed.limit {
+                Some(limit) => (limit as u64).encode(env),
+                None => atoms::nil().encode(env),
+            };
+
+            Ok(rustler::types::tuple::make_tuple(
+                env,
+                &[
+                    atoms::ok().encode(env),
+                    mode.encode(env),
+                    source.encode(env),
+                    shape.encode(env),
+                    predicates.encode(env),
+                    order_by.encode(env),
+                    limit,
+                    cursor,
+                ],
+            ))
+        }
+        Err(error) => {
+            let reason = match error {
+                fql::ParseError::InvalidParameterType => atoms::invalid_parameter_type(),
+                fql::ParseError::InvalidSyntax => atoms::invalid_syntax(),
+                fql::ParseError::QueryTooLarge => atoms::query_too_large(),
+                fql::ParseError::UnsupportedField => atoms::unsupported_field(),
+                fql::ParseError::UnsupportedQueryShape => atoms::unsupported_query_shape(),
+                fql::ParseError::UnsupportedSource => atoms::unsupported_source(),
+            };
+
+            Ok((atoms::error(), reason).encode(env))
+        }
+    }
+}
+
+fn encode_fql_predicate<'a>(env: Env<'a>, predicate: fql::Predicate) -> NifResult<Term<'a>> {
+    match predicate {
+        fql::Predicate::Eq(field, value) => Ok((
+            atoms::eq(),
+            encode_fql_field(env, field)?,
+            encode_fql_value(env, value)?,
+        )
+            .encode(env)),
+        fql::Predicate::In(field, values) => {
+            let values = values
+                .into_iter()
+                .map(|value| encode_fql_value(env, value))
+                .collect::<NifResult<Vec<_>>>()?;
+            Ok((atoms::in_operator(), encode_fql_field(env, field)?, values).encode(env))
+        }
+        fql::Predicate::Range(field, lower, upper) => Ok((
+            atoms::range(),
+            encode_fql_field(env, field)?,
+            encode_fql_value(env, lower)?,
+            encode_fql_value(env, upper)?,
+        )
+            .encode(env)),
+        fql::Predicate::TimeWindow(field, lower, upper) => Ok((
+            atoms::time_window(),
+            encode_fql_field(env, field)?,
+            encode_fql_value(env, lower)?,
+            encode_fql_value(env, upper)?,
+        )
+            .encode(env)),
+        fql::Predicate::IsNull(field) => Ok((
+            atoms::is_operator(),
+            encode_fql_field(env, field)?,
+            atoms::null(),
+        )
+            .encode(env)),
+        fql::Predicate::IsMissing(field) => Ok((
+            atoms::is_operator(),
+            encode_fql_field(env, field)?,
+            atoms::missing(),
+        )
+            .encode(env)),
+    }
+}
+
+fn encode_fql_order<'a>(env: Env<'a>, order: fql::Order) -> NifResult<Term<'a>> {
+    let direction = match order.direction {
+        fql::Direction::Asc => atoms::asc(),
+        fql::Direction::Desc => atoms::desc(),
+    };
+    Ok((encode_fql_field(env, order.field)?, direction).encode(env))
+}
+
+fn encode_fql_field<'a>(env: Env<'a>, field: fql::Field) -> NifResult<Binary<'a>> {
+    encode_fql_binary(env, field.external_name)
+}
+
+fn encode_fql_value<'a>(env: Env<'a>, value: fql::QueryValue) -> NifResult<Term<'a>> {
+    match value {
+        fql::QueryValue::LiteralKeyword(value) => Ok((
+            atoms::literal(),
+            atoms::keyword(),
+            encode_fql_binary(env, value)?,
+        )
+            .encode(env)),
+        fql::QueryValue::LiteralInteger(value) => {
+            Ok((atoms::literal(), atoms::integer(), value).encode(env))
+        }
+        fql::QueryValue::Parameter(value_type, name) => {
+            let value_type = match value_type {
+                fql::ValueType::Keyword => atoms::keyword(),
+                fql::ValueType::Integer => atoms::integer(),
+                fql::ValueType::Dynamic => atoms::dynamic(),
+            };
+            Ok((
+                atoms::parameter(),
+                value_type,
+                encode_fql_binary(env, name)?,
+            )
+                .encode(env))
+        }
+    }
+}
+
+fn encode_fql_binary<'a>(env: Env<'a>, value: Vec<u8>) -> NifResult<Binary<'a>> {
+    let mut binary = OwnedBinary::new(value.len())
+        .ok_or_else(|| rustler::Error::Term(Box::new("FQL value allocation failed")))?;
+    binary.as_mut_slice().copy_from_slice(&value);
+
+    Ok(Binary::from_owned(binary, env))
 }
 
 // One pass may still copy one configured max-size frame, which can exceed a normal scheduler slice.
@@ -576,7 +735,35 @@ mod atoms {
         error,
         nil,
         more,
-        done
+        done,
+        execute,
+        explain,
+        point,
+        collection,
+        history,
+        count,
+        runs,
+        events,
+        literal,
+        parameter,
+        keyword,
+        integer,
+        dynamic,
+        eq,
+        in_operator = "in",
+        range,
+        time_window,
+        is_operator = "is",
+        null,
+        missing,
+        asc,
+        desc,
+        invalid_parameter_type,
+        invalid_syntax,
+        query_too_large,
+        unsupported_field,
+        unsupported_query_shape,
+        unsupported_source
     }
 }
 

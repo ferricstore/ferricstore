@@ -260,6 +260,9 @@ defmodule Ferricstore.SlowLog do
       {"AUTH", _args} ->
         [copy_arg(command), @redacted]
 
+      {"FLOW.QUERY", _args} ->
+        [copy_arg(command), @redacted]
+
       {"CONFIG", [subcommand, key, _value | _rest]}
       when is_binary(subcommand) and is_binary(key) ->
         if String.upcase(subcommand) == "SET" and Ferricstore.Config.sensitive_param?(key) do

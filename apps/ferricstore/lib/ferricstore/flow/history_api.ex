@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.HistoryAPI do
   @moduledoc false
 
-  alias Ferricstore.Flow.{HistoryRead, PayloadReturn}
+  alias Ferricstore.Flow.{HistoryRead, Keys, PayloadReturn, ScopeBinding}
   alias Ferricstore.Store.Router
 
   import Ferricstore.Flow.Options,
@@ -18,8 +18,110 @@ defmodule Ferricstore.Flow.HistoryAPI do
 
   def history(ctx, id, opts) when is_binary(id) and is_list(opts) do
     with {:ok,
-          {partition_key, history_key, query, include_cold?, consistent_projection?, value_return}} <-
-           prepare(id, opts) do
+          {partition_key, _logical_history_key, query, include_cold?, consistent_projection?,
+           value_return}} <- prepare(id, opts),
+         {:ok, partition_key, expected_metadata} <-
+           ScopeBinding.bind_read_partition(ctx, :events, id, partition_key),
+         {:ok, result} <-
+           read_bound(
+             ctx,
+             id,
+             partition_key,
+             expected_metadata,
+             query,
+             include_cold?,
+             consistent_projection?,
+             value_return
+           ) do
+      {:ok, result}
+    end
+  end
+
+  def history(_ctx, id, _opts) when not is_binary(id),
+    do: {:error, "ERR flow id must be a non-empty string"}
+
+  def history(_ctx, _id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc false
+  def history_resolved(ctx, id, opts, expected_metadata)
+      when is_map(ctx) and is_binary(id) and is_list(opts) and is_map(expected_metadata) do
+    with {:ok,
+          {partition_key, _logical_history_key, query, include_cold?, consistent_projection?,
+           value_return}} <- prepare(id, opts),
+         {:ok, partition_key, expected_metadata} <-
+           ScopeBinding.bind_resolved_read_partition(id, partition_key, expected_metadata) do
+      read_bound(
+        ctx,
+        id,
+        partition_key,
+        expected_metadata,
+        query,
+        include_cold?,
+        consistent_projection?,
+        value_return
+      )
+    end
+  end
+
+  def history_resolved(_ctx, _id, _opts, _expected_metadata),
+    do: {:error, "ERR invalid Flow system metadata"}
+
+  @doc false
+  def history_page_resolved(
+        ctx,
+        id,
+        partition_key,
+        expected_metadata,
+        limit,
+        before_event,
+        direction
+      )
+      when is_map(ctx) and is_binary(id) and is_binary(partition_key) and
+             is_map(expected_metadata) and is_integer(limit) and limit > 0 and
+             (is_nil(before_event) or is_binary(before_event)) and direction in [:asc, :desc] do
+    with {:ok, physical_partition, expected_metadata} <-
+           ScopeBinding.bind_resolved_read_partition(id, partition_key, expected_metadata),
+         {:ok, ctx} <- ScopeBinding.put_resolved_read_scope(ctx, expected_metadata),
+         history_key = Keys.history_key(id, physical_partition),
+         :ok <- validate_key_size(history_key),
+         {:ok, value_return} <- PayloadReturn.history_options([]) do
+      HistoryRead.read_page(
+        ctx,
+        id,
+        physical_partition,
+        history_key,
+        limit,
+        before_event,
+        direction,
+        value_return
+      )
+    end
+  end
+
+  def history_page_resolved(
+        _ctx,
+        _id,
+        _partition_key,
+        _expected_metadata,
+        _limit,
+        _before_event,
+        _direction
+      ),
+      do: {:error, "ERR invalid Flow history page"}
+
+  defp read_bound(
+         ctx,
+         id,
+         partition_key,
+         expected_metadata,
+         query,
+         include_cold?,
+         consistent_projection?,
+         value_return
+       ) do
+    with {:ok, ctx} <- ScopeBinding.put_resolved_read_scope(ctx, expected_metadata),
+         history_key = Keys.history_key(id, partition_key),
+         :ok <- validate_key_size(history_key) do
       HistoryRead.read(
         ctx,
         id,
@@ -32,11 +134,6 @@ defmodule Ferricstore.Flow.HistoryAPI do
       )
     end
   end
-
-  def history(_ctx, id, _opts) when not is_binary(id),
-    do: {:error, "ERR flow id must be a non-empty string"}
-
-  def history(_ctx, _id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc false
   def prepare(id, opts) when is_binary(id) and is_list(opts) do

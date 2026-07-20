@@ -11,8 +11,9 @@
 //!   mkdir and directory enumeration are not bounded to one syscall.
 //!
 //! - **Bounded file reads and streaming copies** (`fs_read_nofollow`,
-//!   `fs_copy_sync_nofollow`) run on DirtyIo. Reads avoid an intermediate
-//!   `Vec`, and copies keep large snapshot payloads out of BEAM memory.
+//!   `fs_read_private_nofollow`, `fs_copy_sync_nofollow`) run on DirtyIo.
+//!   Reads avoid an intermediate `Vec`, and copies keep large snapshot
+//!   payloads out of BEAM memory.
 //!
 //! - **Async long I/O** (`fs_rm_rf_async`): spawns on Tokio, sends
 //!   `{:tokio_complete, corr_id, :ok | :error, reason}` to the caller.
@@ -55,6 +56,7 @@ rustler::atoms! {
     directory_not_empty,
     invalid_path,
     symlink,
+    insecure_permissions,
     cross_device,
     too_large,
     other,
@@ -366,11 +368,57 @@ fn fs_read_nofollow(env: Env<'_>, path: String, max_bytes: u64) -> NifResult<Ter
         return Ok(t);
     }
 
-    let mut file = match open_file_nofollow(&path) {
+    let file = match open_file_nofollow(&path) {
         Ok(file) => file,
         Err(error) => return Ok(encode_error(env, &error)),
     };
 
+    read_opened_file(env, file, max_bytes)
+}
+
+/// Read a regular file through a no-follow descriptor and reject group/world
+/// permissions on that same descriptor. This is intended for persisted secret
+/// material where a separate `lstat` permission check would be racy.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fs_read_private_nofollow(env: Env<'_>, path: String, max_bytes: u64) -> NifResult<Term<'_>> {
+    if let Err(term) = validate_path(env, &path) {
+        return Ok(term);
+    }
+
+    let file = match open_file_nofollow(&path) {
+        Ok(file) => file,
+        Err(error) => return Ok(encode_error(env, &error)),
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return Ok(encode_error(env, &error)),
+        };
+
+        if metadata.mode() & 0o077 != 0 {
+            return Ok((
+                atoms::error(),
+                (
+                    insecure_permissions(),
+                    "file must be private to its owner (mode 0600 or stricter)",
+                ),
+            )
+                .encode(env));
+        }
+    }
+
+    read_opened_file(env, file, max_bytes)
+}
+
+fn read_opened_file<'a>(
+    env: Env<'a>,
+    mut file: std::fs::File,
+    max_bytes: u64,
+) -> NifResult<Term<'a>> {
     let size = match file.metadata() {
         Ok(metadata) => metadata.len(),
         Err(error) => return Ok(encode_error(env, &error)),

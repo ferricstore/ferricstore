@@ -21,7 +21,7 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
       {IndexCodec.encode_count(1), &IndexCodec.decode_count/1, :error},
       {IndexCodec.encode_terminal_index_value("id", 10, 20, "state", "count"),
        &IndexCodec.decode_terminal_index_value/1, :error},
-      {IndexCodec.encode_query_index_value("id", 10, 20, "state"),
+      {IndexCodec.encode_query_index_value("index", "id", 10, 20, "state"),
        &IndexCodec.decode_query_index_value/1, :error},
       {IndexCodec.encode_history_index_value("event", 10, "compound", 20),
        &IndexCodec.decode_history_index_value/1, :error},
@@ -165,13 +165,13 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
   test "query index values reject coercion and out-of-range timestamps" do
     for updated_at_ms <- [-1, 1.5, "10", "1.5ms", nil, 18_446_744_073_709_551_616] do
       assert_raise ArgumentError, fn ->
-        IndexCodec.encode_query_index_value("id", updated_at_ms, 0, "state")
+        IndexCodec.encode_query_index_value("index", "id", updated_at_ms, 0, "state")
       end
     end
 
     for expire_at_ms <- [-1, 1.5, "10", 18_446_744_073_709_551_616] do
       assert_raise ArgumentError, fn ->
-        IndexCodec.encode_query_index_value("id", 10, expire_at_ms, "state")
+        IndexCodec.encode_query_index_value("index", "id", 10, expire_at_ms, "state")
       end
     end
   end

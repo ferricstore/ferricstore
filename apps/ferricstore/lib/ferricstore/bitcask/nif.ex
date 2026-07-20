@@ -682,6 +682,11 @@ defmodule Ferricstore.Bitcask.NIF do
           {:ok, [{:ok, binary()} | :not_found]} | {:error, term()}
   def lmdb_get_many(_path, _keys, _map_size), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_get_many_bounded(binary(), [binary()], pos_integer(), non_neg_integer()) ::
+          {:ok, [{:ok, binary()} | :not_found], non_neg_integer()} | {:error, term()}
+  def lmdb_get_many_bounded(_path, _keys, _max_bytes, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_put(binary(), binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
   def lmdb_put(_path, _key, _value, _map_size), do: :erlang.nif_error(:nif_not_loaded)
 
@@ -736,6 +741,28 @@ defmodule Ferricstore.Bitcask.NIF do
         _path,
         _prefix,
         _after_key,
+        _max_items,
+        _max_bytes,
+        _map_size
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_range_entries_bounded(
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          pos_integer(),
+          pos_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, [{binary(), binary()}], boolean(), non_neg_integer()}
+          | {:error, term()}
+  def lmdb_range_entries_bounded(
+        _path,
+        _prefix,
+        _after_key,
+        _before_key,
         _max_items,
         _max_bytes,
         _map_size
@@ -1157,6 +1184,10 @@ defmodule Ferricstore.Bitcask.NIF do
   """
   @spec fs_read_nofollow(binary(), non_neg_integer()) :: {:ok, binary()} | fs_error()
   def fs_read_nofollow(_path, _max_bytes), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Read a private regular file without following a final symlink."
+  @spec fs_read_private_nofollow(binary(), non_neg_integer()) :: {:ok, binary()} | fs_error()
+  def fs_read_private_nofollow(_path, _max_bytes), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Stream-copy a regular file into a new destination without following final symlinks."
   @spec fs_copy_sync_nofollow(binary(), binary()) :: :ok | fs_error()

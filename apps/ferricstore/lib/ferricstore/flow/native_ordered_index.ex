@@ -142,6 +142,41 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   def range_slice(
         resource,
         key,
+        {:cursor_after, cursor_score, cursor_member},
+        max_bound,
+        false,
+        offset,
+        count
+      )
+      when is_binary(cursor_member) and
+             (count == :all or (is_integer(count) and count >= 0)) do
+    case parse_score(cursor_score) do
+      {:ok, parsed_cursor_score} ->
+        {min_kind, min_score} = encode_min_bound({:inclusive, parsed_cursor_score})
+        {max_kind, max_score} = encode_max_bound(max_bound)
+
+        collect_range_pages(
+          resource,
+          key,
+          min_kind,
+          min_score,
+          max_kind,
+          max_score,
+          false,
+          offset,
+          count,
+          {parsed_cursor_score, cursor_member},
+          []
+        )
+
+      :error ->
+        []
+    end
+  end
+
+  def range_slice(
+        resource,
+        key,
         min_bound,
         {:cursor_before, cursor_score, cursor_member},
         true,

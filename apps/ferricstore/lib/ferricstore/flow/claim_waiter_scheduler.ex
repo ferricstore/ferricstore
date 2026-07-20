@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.ClaimWaiterScheduler do
   @moduledoc false
 
-  alias Ferricstore.Flow.ClaimWaiters
+  alias Ferricstore.Flow.{ClaimWaiters, Keys, StorageScope}
   alias Ferricstore.Store.Router
 
   @claim_due_cold_schedule_horizon_ms Application.compile_env(
@@ -25,6 +25,7 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
   def schedule_next_due(ctx, type, state_filter, priority, partition_filter, wait_horizon_ms)
       when is_binary(type) do
     cold_horizon_ms = cold_horizon_ms(wait_horizon_ms)
+    partition_filter = compact_partition_filter(partition_filter)
 
     case {schedule_states(state_filter), schedule_partitions(partition_filter)} do
       {{:ok, states}, {:ok, partitions}} ->
@@ -137,6 +138,12 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
 
   defp hot_due_prefixes(partition_filter) when partition_filter in [nil, :any], do: {:ok, []}
   defp hot_due_prefixes(:auto), do: {:ok, ["f:{fa:"]}
+
+  defp hot_due_prefixes({:scoped_auto, scope}) do
+    with {:ok, partitions} <- scoped_auto_partitions(scope) do
+      {:ok, Enum.map(partitions, &hot_due_partition_prefix/1)}
+    end
+  end
 
   defp hot_due_prefixes(partition_keys) when is_list(partition_keys) do
     case schedule_binary_list(partition_keys) do
@@ -468,7 +475,17 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
        do: true
 
   defp cold_partition_match?(partition, :auto) when is_binary(partition),
-    do: Ferricstore.Flow.Keys.auto_partition_key?(partition)
+    do: Keys.auto_partition_key?(partition)
+
+  defp cold_partition_match?(partition, {:scoped_auto, scope})
+       when is_binary(partition) and is_binary(scope) do
+    with {:ok, ^scope} <- StorageScope.physical_scope_prefix(partition),
+         {:ok, logical_partition} <- StorageScope.logical_partition_key(partition, scope) do
+      Keys.auto_partition_key?(logical_partition)
+    else
+      _unscoped_mismatched_or_invalid -> false
+    end
+  end
 
   defp cold_partition_match?(partition, partitions)
        when is_binary(partition) and is_list(partitions),
@@ -502,8 +519,39 @@ defmodule Ferricstore.Flow.ClaimWaiterScheduler do
     end
   end
 
+  defp notify_partitions({:scoped_auto, scope}) do
+    case StorageScope.physical_partition_key(hd(Keys.auto_partition_keys()), scope) do
+      {:ok, representative} -> [representative]
+      {:error, _reason} -> [:any]
+    end
+  end
+
   defp notify_partitions(partition) when is_binary(partition), do: [partition]
   defp notify_partitions(partition), do: [partition]
+
+  defp compact_partition_filter(partitions) when is_list(partitions) do
+    case StorageScope.scoped_auto_partition_scope(partitions) do
+      {:ok, scope} -> {:scoped_auto, scope}
+      :error -> partitions
+    end
+  end
+
+  defp compact_partition_filter(partition_filter), do: partition_filter
+
+  defp scoped_auto_partitions(scope) when is_binary(scope) and scope != "" do
+    Enum.reduce_while(Keys.auto_partition_keys(), {:ok, []}, fn logical, {:ok, acc} ->
+      case StorageScope.physical_partition_key(logical, scope) do
+        {:ok, physical} -> {:cont, {:ok, [physical | acc]}}
+        {:error, _reason} -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      :error -> :unsupported
+    end
+  end
+
+  defp scoped_auto_partitions(_scope), do: :unsupported
 
   defp schedule_next_due_key(ctx, type, state, priority, partition_key) do
     key = Ferricstore.Flow.Keys.due_key(type, state, priority, partition_key)

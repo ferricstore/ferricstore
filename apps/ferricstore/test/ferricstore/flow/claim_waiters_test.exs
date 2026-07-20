@@ -3,7 +3,7 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
   @moduletag :flow
   @moduletag :global_state
 
-  alias Ferricstore.Flow.ClaimWaiters
+  alias Ferricstore.Flow.{ClaimWaiters, Keys, StorageScope}
   alias Ferricstore.Test.ShardHelpers
 
   @table :ferricstore_flow_claim_waiters
@@ -247,6 +247,23 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
     assert ClaimWaiters.total_count() == 0
   end
 
+  test "broad shared-scope waiters stay compact without cross-scope wakeups" do
+    tenant_a_partitions = scoped_auto_partitions(<<11::unsigned-big-64>>)
+    tenant_b_partitions = scoped_auto_partitions(<<22::unsigned-big-64>>)
+    keys = ClaimWaiters.wait_keys("email", "queued", 0, tenant_a_partitions)
+
+    assert length(keys) == 1
+    assert :ok = ClaimWaiters.register(keys, self(), now_ms() + 1_000)
+
+    assert ClaimWaiters.notify_ready("email", "queued", 0, hd(tenant_b_partitions), 1) == 0
+    refute_receive {:flow_claim_due_wake, _key}, 25
+    assert ClaimWaiters.total_count() == 1
+
+    assert ClaimWaiters.notify_ready("email", "queued", 0, hd(tenant_a_partitions), 1) == 1
+    assert_receive {:flow_claim_due_wake, _key}, 100
+    assert ClaimWaiters.total_count() == 0
+  end
+
   test "notify skips expired waiters" do
     keys = ClaimWaiters.wait_keys("email", "queued", 0, "p1")
 
@@ -402,6 +419,15 @@ defmodule Ferricstore.Flow.ClaimWaitersTest do
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)
+
+  defp scoped_auto_partitions(scope) do
+    Enum.map(Keys.auto_partition_keys(), fn logical_partition ->
+      assert {:ok, physical_partition} =
+               StorageScope.physical_partition_key(logical_partition, scope)
+
+      physical_partition
+    end)
+  end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)

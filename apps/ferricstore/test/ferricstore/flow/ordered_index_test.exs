@@ -89,6 +89,34 @@ defmodule Ferricstore.Flow.OrderedIndexTest do
              )
   end
 
+  test "forward range cursor seeks after an exact score and member", %{
+    index: index,
+    lookup: lookup
+  } do
+    native = NativeOrderedIndex.get(index, lookup)
+
+    tied =
+      for number <- 1..200 do
+        {"state:tied", "flow-#{String.pad_leading(Integer.to_string(number), 3, "0")}", 10}
+      end
+
+    :ok = NativeOrderedIndex.put_entries(native, tied ++ [{"state:tied", "newer", 11}])
+
+    assert NativeOrderedIndex.range_slice(
+             native,
+             "state:tied",
+             {:cursor_after, 10, "flow-050"},
+             :inf,
+             false,
+             0,
+             10
+           ) ==
+             for(
+               number <- 51..60,
+               do: {"flow-#{String.pad_leading(Integer.to_string(number), 3, "0")}", 10.0}
+             )
+  end
+
   test "range slice NIF runs on a dirty CPU scheduler" do
     source =
       File.read!(Path.expand("../../../native/ferricstore_bitcask/src/flow_index.rs", __DIR__))

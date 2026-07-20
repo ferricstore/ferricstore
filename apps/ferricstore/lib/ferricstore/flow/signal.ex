@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Signal do
   @moduledoc false
 
-  alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.{Keys, ScopeBinding}
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Store.Router
 
@@ -12,7 +12,8 @@ defmodule Ferricstore.Flow.Signal do
     started = FlowTelemetry.start_time()
 
     result =
-      with {:ok, attrs} <- attrs(id, opts) do
+      with {:ok, attrs} <- attrs(id, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :signal, attrs) do
         Router.flow_signal(ctx, attrs)
       end
 

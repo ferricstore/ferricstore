@@ -49,7 +49,7 @@ defmodule Ferricstore.Flow.ReadAPITest do
   end
 
   test "attribute discovery fails closed on corrupt query-index values" do
-    {raw_prefix, key} = discovery_query_key("blue")
+    {raw_prefix, key, _index_key} = discovery_query_key("blue")
 
     assert {:error, {:invalid_query_index_value, ^key}} =
              ReadAPI.__attribute_value_counts_from_chunks_for_test__(
@@ -61,8 +61,8 @@ defmodule Ferricstore.Flow.ReadAPITest do
   end
 
   test "attribute discovery rejects query-index key and value mismatches" do
-    {raw_prefix, key} = discovery_query_key("blue")
-    value = LMDB.encode_query_index_value("other-flow", 1, 0)
+    {raw_prefix, key, index_key} = discovery_query_key("blue")
+    value = LMDB.encode_query_index_value(index_key, "other-flow", 1, 0)
 
     assert {:error, {:invalid_query_index_value, ^key}} =
              ReadAPI.__attribute_value_counts_from_chunks_for_test__(
@@ -75,8 +75,24 @@ defmodule Ferricstore.Flow.ReadAPITest do
 
   test "attribute discovery decodes typed values inside query-index key components" do
     attribute_value = "blue\0north"
-    {raw_prefix, key} = discovery_query_key(attribute_value)
-    value = LMDB.encode_query_index_value("flow-1", 1, 0)
+    {raw_prefix, key, index_key} = discovery_query_key(attribute_value)
+    value = LMDB.encode_query_index_value(index_key, "flow-1", 1, 0)
+
+    assert {:ok, %{^attribute_value => 1}} =
+             ReadAPI.__attribute_value_counts_from_chunks_for_test__(
+               [{"unused", [{key, value}]}],
+               raw_prefix,
+               10,
+               fn _path, _ops -> flunk("live values must not be deleted") end
+             )
+  end
+
+  test "attribute discovery retains maximum-size string values outside the LMDB key" do
+    attribute_value = :binary.copy("v", 256)
+    {raw_prefix, key, index_key} = discovery_query_key(attribute_value)
+    value = LMDB.encode_query_index_value(index_key, "flow-1", 1, 0)
+
+    assert byte_size(key) <= 511
 
     assert {:ok, %{^attribute_value => 1}} =
              ReadAPI.__attribute_value_counts_from_chunks_for_test__(
@@ -88,8 +104,8 @@ defmodule Ferricstore.Flow.ReadAPITest do
   end
 
   test "attribute discovery propagates expired query-index deletion failures" do
-    {raw_prefix, key} = discovery_query_key("blue")
-    value = LMDB.encode_query_index_value("flow-1", 1, 1)
+    {raw_prefix, key, index_key} = discovery_query_key("blue")
+    value = LMDB.encode_query_index_value(index_key, "flow-1", 1, 1)
 
     assert {:error, :disk_full} =
              ReadAPI.__attribute_value_counts_from_chunks_for_test__(
@@ -122,12 +138,19 @@ defmodule Ferricstore.Flow.ReadAPITest do
   test "relationship queries scan auto partitions instead of passing atoms into key builders" do
     shard = start_supervised!({EmptyIndexShard, self()})
 
+    assert {:ok, metadata_snapshot} =
+             FerricStore.Flow.MetadataExtension.configure(
+               FerricStore.Flow.MetadataExtension.Disabled,
+               []
+             )
+
     ctx = %FerricStore.Instance{
       name: :read_api_auto_relationship_test,
       data_dir: System.tmp_dir!(),
       shard_count: 1,
       slot_map: List.duplicate(0, 1_024) |> List.to_tuple(),
-      shard_names: {shard}
+      shard_names: {shard},
+      flow_metadata_snapshot: metadata_snapshot
     }
 
     assert {:ok, []} = ReadAPI.by_parent(ctx, "parent-1", partition_key: :auto, count: 1)
@@ -177,6 +200,10 @@ defmodule Ferricstore.Flow.ReadAPITest do
         "partition-1"
       )
 
-    {LMDB.query_index_raw_prefix(index_key_prefix), LMDB.query_index_key(index_key, "flow-1", 1)}
+    {
+      LMDB.query_index_raw_prefix(index_key_prefix),
+      LMDB.query_index_key(index_key, "flow-1", 1),
+      index_key
+    }
   end
 end

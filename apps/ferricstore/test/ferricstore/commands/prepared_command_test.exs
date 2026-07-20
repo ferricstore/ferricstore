@@ -2,6 +2,8 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.{Dispatcher, KeyDiscovery, PreparedCommand}
+  alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.Query.Request
   alias Ferricstore.Transaction.ExecutionEntry
   alias Ferricstore.Transaction.Ast, as: TransactionAst
 
@@ -39,6 +41,83 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
 
     assert partitioned.command_keys == ["tenant-a"]
     assert partitioned.acl_keys == ["tenant-a"]
+  end
+
+  test "FLOW.QUERY preparation binds once and shares tenant ACL, routing, and read scope" do
+    query =
+      "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
+
+    assert {:ok, prepared} =
+             Dispatcher.prepare_raw("FLOW.QUERY", [
+               "FQL1",
+               query,
+               "partition",
+               "tenant-a",
+               "flow_id",
+               "run-123"
+             ])
+
+    assert {:flow_query,
+            %Request{
+              predicate:
+                {:and,
+                 [
+                   {:eq, :partition_key, {:literal, :keyword, "tenant-a"}},
+                   {:eq, :run_id, {:literal, :keyword, "run-123"}}
+                 ]}
+            }} = prepared.ast
+
+    assert prepared.command_keys == ["tenant-a"]
+    assert prepared.acl_keys == ["tenant-a"]
+    assert prepared.routing_scope == :keys
+    assert prepared.routing_keys == [Keys.state_key("", "tenant-a")]
+    assert prepared.read_keys == ["tenant-a"]
+    assert prepared.write_keys == []
+    assert prepared.transaction_mode == :request
+  end
+
+  test "FLOW.QUERY text preparation decodes declared integer parameters and rejects bad input" do
+    query =
+      "FROM runs WHERE partition_key = @tenant AND updated_at_ms FROM @from TO @until " <>
+        "ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS"
+
+    assert {:ok, prepared} =
+             Dispatcher.prepare_raw("FLOW.QUERY", [
+               "FQL1",
+               query,
+               "tenant",
+               "tenant-a",
+               "from",
+               "100",
+               "until",
+               "200"
+             ])
+
+    assert {:flow_query,
+            %Request{
+              predicate:
+                {:and,
+                 [
+                   {:eq, :partition_key, {:literal, :keyword, "tenant-a"}},
+                   {:time_window, :updated_at_ms, {:literal, :integer, 100},
+                    {:literal, :integer, 200}}
+                 ]}
+            }} = prepared.ast
+
+    assert {:error, "ERR FQL1 parameter has an invalid type"} =
+             Dispatcher.prepare_raw("FLOW.QUERY", [
+               "FQL1",
+               query,
+               "tenant",
+               "tenant-a",
+               "from",
+               "not-an-integer",
+               "until",
+               "200"
+             ])
+
+    assert {:error, "ERR FQL1 query shape is not supported"} =
+             Dispatcher.prepare_raw("FLOW.QUERY", ["FQL1", "FROM runs RETURN RECORDS"])
   end
 
   test "KeyDiscovery describe keeps the command key contract" do

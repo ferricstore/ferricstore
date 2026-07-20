@@ -195,6 +195,12 @@ defmodule Ferricstore.Application do
           )
         end)
 
+      query_index_provider_children =
+        case FerricStore.Flow.QueryIndexProvider.child_specs(default_ctx) do
+          {:ok, specs} -> specs
+          {:error, reason} -> raise "Flow query index provider startup failed: #{inspect(reason)}"
+        end
+
       # Optional libcluster node discovery (DNS, Kubernetes labels, or gossip).
       # When topologies are configured, Cluster.Supervisor is the first child so
       # that node discovery begins before the store is ready to serve traffic.
@@ -258,6 +264,7 @@ defmodule Ferricstore.Application do
               id: Ferricstore.Store.KeydirTableOwner.table_heir_name(default_ctx)
             )
           ] ++
+          query_index_provider_children ++
           bitcask_writer_children ++
           [{Ferricstore.Flow.LMDBFlushCoordinator, []}] ++
           flow_lmdb_writer_children ++

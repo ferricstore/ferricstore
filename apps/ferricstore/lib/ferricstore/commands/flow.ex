@@ -45,7 +45,8 @@ defmodule Ferricstore.Commands.Flow do
   def handle_ast({:flow_create_many, partition_key, items, opts}, store)
       when (is_binary(partition_key) or is_nil(partition_key)) and is_list(items) and
              is_list(opts) do
-    Ferricstore.Flow.create_many(flow_ctx(store), partition_key, items, opts) |> normalize_result()
+    Ferricstore.Flow.create_many(flow_ctx(store), partition_key, items, opts)
+    |> normalize_result()
   end
 
   def handle_ast({:flow_spawn_children, parent_id, children, opts}, store)
@@ -102,7 +103,8 @@ defmodule Ferricstore.Commands.Flow do
   def handle_ast({:flow_cancel_many, partition_key, items, opts}, store)
       when (is_binary(partition_key) or is_nil(partition_key)) and is_list(items) and
              is_list(opts) do
-    Ferricstore.Flow.cancel_many(flow_ctx(store), partition_key, items, opts) |> normalize_result()
+    Ferricstore.Flow.cancel_many(flow_ctx(store), partition_key, items, opts)
+    |> normalize_result()
   end
 
   def handle_ast({:flow_transition, id, from_state, to_state, opts}, store)
@@ -158,6 +160,16 @@ defmodule Ferricstore.Commands.Flow do
 
   def handle_ast({:flow_search, opts}, store) when is_list(opts) do
     Ferricstore.Flow.search(flow_ctx(store), opts) |> normalize_result()
+  end
+
+  def handle_ast({:flow_query, %Ferricstore.Flow.Query.Request{} = request}, store) do
+    case Ferricstore.Flow.Query.execute(flow_ctx(store), request) do
+      {:error, reason} when is_atom(reason) ->
+        {:error, Ferricstore.Flow.Query.error_message(reason)}
+
+      result ->
+        normalize_result(result)
+    end
   end
 
   def handle_ast({:flow_attributes, type, opts}, store)

@@ -470,7 +470,13 @@ defmodule Ferricstore.Store.Router.Part05 do
         do: normalize_batch_write_result(result, expected_count)
 
       defp batch_quorum_commands(ctx, keyed_commands) do
-        batch_quorum_commands(ctx, keyed_commands, nil)
+        if ctx.name == :default do
+          batch_quorum_commands(ctx, keyed_commands, nil)
+        else
+          Enum.map(keyed_commands, fn {key, command} ->
+            raft_write(ctx, shard_for(ctx, key), key, command)
+          end)
+        end
       end
 
       @doc false

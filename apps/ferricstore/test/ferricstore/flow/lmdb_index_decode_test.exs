@@ -15,8 +15,7 @@ defmodule Ferricstore.Flow.LMDBIndexDecodeTest do
   end
 
   test "query entries keep live rows and reject malformed values" do
-    key = LMDB.query_index_key("parent:p1", "flow-1", 100)
-    value = LMDB.encode_query_index_value("flow-1", 100, 0, "state-key")
+    {key, value} = LMDB.query_index_entry("parent:p1", "flow-1", 100, 0, "state-key")
 
     assert {:error, {:invalid_query_index_value, "bad"}} =
              LMDBIndexDecode.query_entries(
@@ -32,6 +31,16 @@ defmodule Ferricstore.Flow.LMDBIndexDecodeTest do
 
     assert LMDBIndexDecode.history_entries([{key, value}], "unused", 999) ==
              {:ok, [{"event-1", 100}]}
+  end
+
+  test "query history decoding skips expired rows without deleting them" do
+    path = tmp_lmdb_path()
+    key = LMDB.history_index_key("history:flow-1", "event-1", 100)
+    value = LMDB.encode_history_index_value("event-1", 100, "history-key", 10)
+
+    assert :ok = LMDB.write_batch(path, [{:put, key, value}])
+    assert LMDBIndexDecode.history_query_entries([{key, value}], 11) == {:ok, []}
+    assert {:ok, ^value} = LMDB.get(path, key)
   end
 
   test "ordered index entries reject key and value identity mismatches" do
@@ -51,7 +60,7 @@ defmodule Ferricstore.Flow.LMDBIndexDecodeTest do
              LMDBIndexDecode.terminal_entries([{terminal_key, terminal_value}], "unused", 999)
 
     query_key = LMDB.query_index_key("parent:p1", "flow-1", 100)
-    query_value = LMDB.encode_query_index_value("flow-1", 101, 0, "state-key")
+    query_value = LMDB.encode_query_index_value("parent:p1", "flow-1", 101, 0, "state-key")
 
     assert {:error, {:invalid_query_index_value, ^query_key}} =
              LMDBIndexDecode.query_entries([{query_key, query_value}], "unused", 999)
@@ -65,14 +74,37 @@ defmodule Ferricstore.Flow.LMDBIndexDecodeTest do
 
   test "query entries delete expired rows" do
     path = tmp_lmdb_path()
-    key = LMDB.query_index_key("parent:p1", "flow-1", 100)
-    value = LMDB.encode_query_index_value("flow-1", 100, 10, "state-key")
+    {key, value} = LMDB.query_index_entry("parent:p1", "flow-1", 100, 10, "state-key")
 
     assert :ok = LMDB.write_batch(path, [{:put, key, value}])
     assert {:ok, ^value} = LMDB.get(path, key)
 
     assert LMDBIndexDecode.query_entries([{key, value}], path, 11) == {:ok, []}
     assert LMDB.get(path, key) == :not_found
+  end
+
+  test "query read decoding skips expired rows without deleting them" do
+    path = tmp_lmdb_path()
+
+    {expired_key, expired_value} =
+      LMDB.query_index_entry("parent:p1", "expired", 100, 10, "expired-state")
+
+    {live_key, live_value} =
+      LMDB.query_index_entry("parent:p1", "live", 101, 0, "live-state")
+
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, expired_key, expired_value},
+               {:put, live_key, live_value}
+             ])
+
+    assert {:ok, [{"live", 101, "live-state"}]} =
+             LMDBIndexDecode.query_entries_readonly(
+               [{expired_key, expired_value}, {live_key, live_value}],
+               11
+             )
+
+    assert {:ok, ^expired_value} = LMDB.get(path, expired_key)
   end
 
   @tag :lmdb_reverse_before_cursor

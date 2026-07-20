@@ -4,11 +4,13 @@ defmodule Ferricstore.Flow.HistoryRead do
   alias Ferricstore.BatchResult
   alias Ferricstore.CommandTime
   alias Ferricstore.Flow.Codec
+  alias Ferricstore.Flow.ScopeBinding
   alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
 
   @max_history_max_events 1_000_000
   @default_history_lmdb_sweep_limit 10_000
+  @maximum_exact_integer 9_007_199_254_740_991
 
   def read(ctx, id, partition_key, history_key, query, false, consistent?, value_return) do
     with :ok <- maybe_flush_history_projector(ctx, history_key, consistent?),
@@ -65,6 +67,266 @@ defmodule Ferricstore.Flow.HistoryRead do
       end
     end
   end
+
+  @doc false
+  def read_page(
+        ctx,
+        id,
+        partition_key,
+        history_key,
+        limit,
+        before_event,
+        direction,
+        value_return
+      )
+      when is_map(ctx) and is_binary(id) and is_binary(partition_key) and
+             is_binary(history_key) and is_integer(limit) and limit > 0 and
+             (is_nil(before_event) or is_binary(before_event)) and direction in [:asc, :desc] do
+    with :ok <- maybe_flush_history_projector(ctx, history_key, true),
+         {:ok, state_exists?} <- state_exists(ctx, id, partition_key) do
+      if state_exists? do
+        read_existing_page(
+          ctx,
+          id,
+          partition_key,
+          history_key,
+          limit,
+          before_event,
+          direction,
+          value_return
+        )
+      else
+        {:ok, %{events: [], has_more: false, continuation: nil, scanned_entries: 0}}
+      end
+    end
+  end
+
+  defp read_existing_page(
+         ctx,
+         id,
+         partition_key,
+         history_key,
+         limit,
+         before_event,
+         direction,
+         value_return
+       ) do
+    fetch_count = limit + 1
+
+    with {:ok, hot_refs} <-
+           hot_page_refs(ctx, history_key, fetch_count, before_event, direction),
+         {:ok, cold_refs} <-
+           cold_page_refs(ctx, history_key, fetch_count, before_event, direction),
+         {:ok, merged_page} <-
+           select_page_refs(hot_refs, cold_refs.refs, fetch_count, direction),
+         :ok <- validate_page_coverage(merged_page.refs, fetch_count, cold_refs.exhausted?),
+         selected <- Enum.take(merged_page.refs, limit),
+         event_ids <- Enum.map(merged_page.refs, &elem(&1, 0)),
+         {:ok, candidate_events} <-
+           from_event_ids_for_page(
+             ctx,
+             id,
+             partition_key,
+             history_key,
+             event_ids,
+             value_return
+           ) do
+      events = Enum.take(candidate_events, limit)
+      has_more = length(merged_page.refs) > limit
+      continuation = if has_more, do: selected |> List.last() |> elem(0), else: nil
+      memory_high_water_bytes = :erlang.external_size(candidate_events, minor_version: 2)
+
+      {:ok,
+       %{
+         events: events,
+         has_more: has_more,
+         continuation: continuation,
+         scanned_entries: length(hot_refs) + cold_refs.scanned_entries,
+         hydrated_records: length(event_ids),
+         duplicate_entries: merged_page.duplicate_entries,
+         memory_high_water_bytes: memory_high_water_bytes
+       }}
+    end
+  end
+
+  defp hot_page_refs(ctx, history_key, count, nil, direction) do
+    ctx
+    |> Router.flow_index_rank_range(history_key, 0, count - 1, direction == :desc)
+    |> normalize_page_hot_refs()
+  end
+
+  defp hot_page_refs(ctx, history_key, count, boundary_event, :asc) do
+    cursor = {:cursor_after, Ferricstore.Flow.HistoryEvent.ms(boundary_event), boundary_event}
+
+    ctx
+    |> Router.flow_index_score_range_slice(
+      history_key,
+      cursor,
+      :inf,
+      false,
+      0,
+      count
+    )
+    |> normalize_page_hot_refs()
+  end
+
+  defp hot_page_refs(ctx, history_key, count, boundary_event, :desc) do
+    cursor = {:cursor_before, Ferricstore.Flow.HistoryEvent.ms(boundary_event), boundary_event}
+
+    ctx
+    |> Router.flow_index_score_range_slice(
+      history_key,
+      :neg_inf,
+      cursor,
+      true,
+      0,
+      count
+    )
+    |> normalize_page_hot_refs()
+  end
+
+  defp cold_page_refs(ctx, history_key, count, boundary_event, direction) do
+    shard_index = Router.shard_for(ctx, history_key)
+
+    with :ok <- maybe_flush_lmdb_shard(ctx, shard_index, true),
+         :ok <- require_lmdb_mirror_healthy_shard(ctx, history_key, shard_index) do
+      path =
+        ctx.data_dir
+        |> Ferricstore.DataDir.shard_data_path(shard_index)
+        |> Ferricstore.Flow.LMDB.path()
+
+      prefix = Ferricstore.Flow.LMDB.history_index_prefix(history_key)
+      now_ms = CommandTime.now_ms()
+
+      with {:ok, entries} <-
+             cold_page_entries(
+               path,
+               prefix,
+               history_key,
+               boundary_event,
+               direction,
+               count
+             ),
+           {:ok, decoded} <-
+             Ferricstore.Flow.LMDBIndexDecode.history_query_entries(entries, now_ms),
+           {:ok, decoded} <- normalize_page_refs(decoded) do
+        {:ok,
+         %{
+           refs: decoded,
+           scanned_entries: length(entries),
+           exhausted?: length(entries) < count
+         }}
+      end
+    end
+  end
+
+  defp cold_page_entries(path, prefix, _history_key, nil, direction, count),
+    do: Ferricstore.Flow.LMDB.prefix_entries(path, prefix, count, direction == :desc)
+
+  defp cold_page_entries(path, prefix, history_key, boundary_event, direction, count) do
+    boundary_key =
+      Ferricstore.Flow.LMDB.history_index_key(
+        history_key,
+        boundary_event,
+        Ferricstore.Flow.HistoryEvent.ms(boundary_event)
+      )
+
+    case direction do
+      :asc ->
+        Ferricstore.Flow.LMDB.prefix_entries_after(path, prefix, boundary_key, count)
+
+      :desc ->
+        Ferricstore.Flow.LMDB.prefix_entries_reverse_before(
+          path,
+          prefix,
+          boundary_key,
+          count
+        )
+    end
+  end
+
+  defp select_page_refs(hot_refs, cold_refs, count, direction) do
+    refs = hot_refs ++ cold_refs
+
+    unique_refs =
+      refs
+      |> Enum.sort_by(fn {event_id, score} -> {score, event_id} end, direction)
+      |> Enum.uniq_by(&elem(&1, 0))
+
+    {:ok,
+     %{
+       refs: Enum.take(unique_refs, count),
+       duplicate_entries: length(refs) - length(unique_refs)
+     }}
+  end
+
+  defp normalize_page_hot_refs(result) do
+    with {:ok, refs} <- normalize_hot_refs(result), do: normalize_page_refs(refs)
+  end
+
+  defp normalize_page_refs(refs) when is_list(refs) do
+    refs
+    |> Enum.reduce_while({:ok, []}, fn
+      {event_id, score}, {:ok, acc} when is_binary(event_id) ->
+        with {:ok, event_ms} <- canonical_event_ms(event_id),
+             {:ok, normalized_score} <- normalize_page_score(score),
+             true <- event_ms == normalized_score do
+          {:cont, {:ok, [{event_id, event_ms} | acc]}}
+        else
+          _invalid -> {:halt, {:error, :query_storage_inconsistent}}
+        end
+
+      _invalid, _acc ->
+        {:halt, {:error, :query_storage_inconsistent}}
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp canonical_event_ms(event_id) do
+    case :binary.split(event_id, "-", [:global]) do
+      [milliseconds, version] ->
+        with {:ok, ms} <- canonical_event_integer(milliseconds),
+             {:ok, _version} <- canonical_event_integer(version) do
+          {:ok, ms}
+        end
+
+      _invalid ->
+        {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp canonical_event_integer(value) do
+    case Integer.parse(value) do
+      {number, ""} when number >= 0 and number <= @maximum_exact_integer ->
+        if value == Integer.to_string(number),
+          do: {:ok, number},
+          else: {:error, :query_storage_inconsistent}
+
+      _invalid ->
+        {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp normalize_page_score(score) when is_integer(score) and score >= 0,
+    do: {:ok, score}
+
+  defp normalize_page_score(score) when is_float(score) and score >= 0 do
+    normalized = trunc(score)
+    if score == normalized, do: {:ok, normalized}, else: {:error, :query_storage_inconsistent}
+  end
+
+  defp normalize_page_score(_score), do: {:error, :query_storage_inconsistent}
+
+  defp validate_page_coverage(refs, count, _cold_exhausted?) when length(refs) >= count,
+    do: :ok
+
+  defp validate_page_coverage(_refs, _count, true), do: :ok
+
+  defp validate_page_coverage(_refs, _count, false),
+    do: {:error, :query_scan_budget_exceeded}
 
   if Mix.env() == :test do
     def lmdb_query_scan_count_for_test(count, reverse? \\ false),
@@ -167,6 +429,7 @@ defmodule Ferricstore.Flow.HistoryRead do
     ctx
     |> Router.flow_get(id, partition_key)
     |> decode_context_read(id)
+    |> ScopeBinding.verify_context_read_result(ctx)
   rescue
     _ -> {:error, "ERR storage read failed"}
   end
@@ -423,6 +686,70 @@ defmodule Ferricstore.Flow.HistoryRead do
         value_return,
         decode_context
       ) do
+    case do_from_event_ids_with_context(
+           ctx,
+           id,
+           partition_key,
+           history_key,
+           event_ids,
+           value_return,
+           decode_context
+         ) do
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      result -> result
+    end
+  end
+
+  defp from_event_ids_for_page(
+         ctx,
+         id,
+         partition_key,
+         history_key,
+         event_ids,
+         value_return
+       ) do
+    with {:ok, decode_context} <- decode_context(ctx, id, partition_key),
+         {:ok, events} <-
+           do_from_event_ids_with_context(
+             ctx,
+             id,
+             partition_key,
+             history_key,
+             event_ids,
+             value_return,
+             decode_context
+           ),
+         true <- exact_events?(events, event_ids) do
+      {:ok, events}
+    else
+      {:error, {:storage_read_failed, {:cold_value_read_failed, _event_id, reason}}}
+      when reason in [
+             :missing_history_value_location,
+             :invalid_history_index_location,
+             :invalid_history_index_result
+           ] ->
+        {:error, :query_storage_inconsistent}
+
+      {:error, {:storage_read_failed, _reason}} ->
+        {:error, :query_storage_unavailable}
+
+      false ->
+        {:error, :query_storage_inconsistent}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp do_from_event_ids_with_context(
+         ctx,
+         id,
+         partition_key,
+         history_key,
+         event_ids,
+         value_return,
+         decode_context
+       ) do
     compound_keys =
       Enum.map(event_ids, &Ferricstore.Flow.Keys.stream_entry_key(id, &1, partition_key))
 
@@ -445,10 +772,17 @@ defmodule Ferricstore.Flow.HistoryRead do
        entries
        |> Enum.map(&Ferricstore.Flow.HistoryEntry.to_tuple/1)
        |> Ferricstore.Flow.HistoryValues.hydrate(ctx, value_return)}
-    else
-      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
     end
   end
+
+  defp exact_events?(events, event_ids) when is_list(events) do
+    Enum.map(events, fn
+      {event_id, _fields} when is_binary(event_id) -> event_id
+      _invalid -> :invalid
+    end) == event_ids
+  end
+
+  defp exact_events?(_events, _event_ids), do: false
 
   def hot_fallback_scan(ctx, history_key, query, value_return) do
     prefix = "X:" <> history_key <> <<0>>
@@ -572,6 +906,7 @@ defmodule Ferricstore.Flow.HistoryRead do
   defp decode_context_by_state_key(ctx, state_key, id) do
     Ferricstore.Stats.with_cache_tracking_disabled(fn -> Router.get(ctx, state_key) end)
     |> decode_context_read(id)
+    |> ScopeBinding.verify_context_read_result(ctx)
   rescue
     _ -> {:error, "ERR storage read failed"}
   end

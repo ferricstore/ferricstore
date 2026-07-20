@@ -14,7 +14,15 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   `claim_due` tests.
   """
 
-  alias Ferricstore.Flow.{ClaimFilter, ClaimWaiters, Internal, PayloadReturn}
+  alias Ferricstore.Flow.{
+    ClaimFilter,
+    ClaimScope,
+    ClaimWaiters,
+    Internal,
+    PayloadReturn,
+    StorageScope
+  }
+
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Store.Router
 
@@ -64,6 +72,21 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   def result(ctx, type, opts), do: result(ctx, type, opts, :allow)
 
   def result(ctx, type, opts, cold_due_mode) do
+    do_result(ctx, type, opts, cold_due_mode, :resolve)
+  end
+
+  @doc false
+  def result_resolved(ctx, type, opts, expected_metadata) do
+    result_resolved(ctx, type, opts, expected_metadata, :allow)
+  end
+
+  @doc false
+  def result_resolved(ctx, type, opts, expected_metadata, cold_due_mode)
+      when is_map(expected_metadata) do
+    do_result(ctx, type, opts, cold_due_mode, {:resolved, expected_metadata})
+  end
+
+  defp do_result(ctx, type, opts, cold_due_mode, scope_binding) do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
          :ok <- Internal.reject_reserved_type(type, opts),
@@ -106,40 +129,79 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:cold_due_mode, cold_due_mode)
 
-      case router_result_with_governance_limit(
-             ctx,
-             attrs,
-             reclaim_expired?,
-             reclaim_ratio,
-             governance_limit
-           ) do
-        {:ok, records} when is_list(records) ->
-          {:ok, return_records(ctx, records, payload_return, return_mode, named_values)}
+      with {:ok, attrs, expected_metadata} <-
+             bind_claim_scope(ctx, attrs, scope_binding),
+           :ok <-
+             validate_claim_due_key_lengths(
+               type,
+               state,
+               priority,
+               Map.get(attrs, :partition_keys) || Map.get(attrs, :partition_key),
+               Router.max_key_size()
+             ) do
+        case router_result_with_governance_limit(
+               ctx,
+               attrs,
+               reclaim_expired?,
+               reclaim_ratio,
+               governance_limit
+             ) do
+          {:ok, records} when is_list(records) ->
+            with :ok <- ClaimScope.verify_records(records, expected_metadata) do
+              {:ok, return_records(ctx, records, payload_return, return_mode, named_values)}
+            end
 
-        other ->
-          other
+          other ->
+            other
+        end
       end
     end
   end
 
+  defp bind_claim_scope(ctx, attrs, :resolve), do: ClaimScope.bind_attrs(ctx, attrs)
+
+  defp bind_claim_scope(_ctx, attrs, {:resolved, expected_metadata}),
+    do: ClaimScope.bind_resolved_attrs(attrs, expected_metadata)
+
   def blocking_result(ctx, type, opts, block_ms) do
-    case result(ctx, type, opts, :block) do
+    with {:ok, expected_metadata} <- ClaimScope.resolve(ctx),
+         {:ok, scoped_wait_opts} <- scoped_wait_opts(opts, expected_metadata) do
+      do_blocking_result(ctx, type, opts, scoped_wait_opts, expected_metadata, block_ms)
+    end
+  end
+
+  defp do_blocking_result(ctx, type, opts, scoped_wait_opts, expected_metadata, block_ms) do
+    case result_resolved(ctx, type, opts, expected_metadata, :block) do
       {:ok, [_ | _]} = claimed ->
         claimed
 
       {:ok, []} ->
-        with {:ok, keys, limit} <- wait_registration(type, opts) do
+        with {:ok, keys, limit} <- wait_registration(type, scoped_wait_opts) do
           deadline = block_deadline(block_ms)
 
           with :ok <- ClaimWaiters.register(keys, self(), waiter_deadline(deadline), limit: limit) do
             try do
-              case result(ctx, type, opts, :block) do
+              case result_resolved(ctx, type, opts, expected_metadata, :block) do
                 {:ok, [_ | _]} = claimed ->
                   claimed
 
                 {:ok, []} ->
-                  schedule_next_due(ctx, type, wait_opts_with_horizon(opts, deadline))
-                  wait_loop(ctx, type, opts, deadline, keys, limit)
+                  schedule_next_due(
+                    ctx,
+                    type,
+                    wait_opts_with_horizon(scoped_wait_opts, deadline)
+                  )
+
+                  wait_loop(
+                    ctx,
+                    type,
+                    opts,
+                    scoped_wait_opts,
+                    expected_metadata,
+                    deadline,
+                    keys,
+                    limit
+                  )
 
                 other ->
                   other
@@ -155,6 +217,28 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
     end
   end
 
+  defp scoped_wait_opts(opts, expected_metadata) do
+    with {:ok, partition_key, partition_keys} <- optional_claim_partitions(opts),
+         attrs <-
+           %{partition_key: partition_key}
+           |> maybe_put_attr(:partition_keys, partition_keys),
+         {:ok, scoped_attrs, _expected_metadata} <-
+           ClaimScope.bind_resolved_attrs(attrs, expected_metadata) do
+      opts =
+        opts
+        |> Keyword.delete(:partition_key)
+        |> Keyword.delete(:partition_keys)
+
+      case Map.get(scoped_attrs, :partition_keys) do
+        [_ | _] = scoped_partition_keys ->
+          {:ok, Keyword.put(opts, :partition_keys, scoped_partition_keys)}
+
+        nil ->
+          {:ok, Keyword.put(opts, :partition_key, Map.get(scoped_attrs, :partition_key))}
+      end
+    end
+  end
+
   def wait_registration(type, opts) when is_binary(type) and is_list(opts) do
     with {:ok, keys} <- wait_keys(type, opts),
          {:ok, limit} <- optional_claim_limit(opts) do
@@ -162,13 +246,33 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
     end
   end
 
+  @doc false
+  @spec wait_registration(map(), binary(), keyword()) ::
+          {:ok, [ClaimWaiters.waiter_key()], pos_integer()} | {:error, binary()}
+  def wait_registration(ctx, type, opts)
+      when is_map(ctx) and is_binary(type) and is_list(opts) do
+    with {:ok, expected_metadata} <- ClaimScope.resolve(ctx),
+         {:ok, scoped_wait_opts} <- scoped_wait_opts(opts, expected_metadata) do
+      wait_registration(type, scoped_wait_opts)
+    end
+  end
+
+  def wait_registration(_ctx, _type, _opts), do: {:error, "ERR invalid Flow claim scope"}
+
   def wait_keys(type, opts) when is_binary(type) and is_list(opts) do
     with {:ok, state} <- optional_claim_states(opts),
          {:ok, priority} <- optional_priority_or_nil(opts),
          {:ok, partition_key, partition_keys} <- optional_claim_partitions(opts),
          partition_filter = partition_keys || partition_key,
-         :ok <- ClaimFilter.validate_footprint(state, partition_filter),
-         :ok <- validate_claim_due_keys(type, state, priority, partition_filter) do
+         :ok <- validate_wait_footprint(state, partition_filter),
+         :ok <-
+           validate_claim_due_key_lengths(
+             type,
+             state,
+             priority,
+             partition_filter,
+             Router.max_key_size()
+           ) do
       {:ok, ClaimWaiters.wait_keys(type, state, priority, partition_filter)}
     end
   end
@@ -178,7 +282,7 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
          {:ok, partition_key, partition_keys} <- optional_claim_partitions(opts),
          {:ok, priority} <- optional_priority_or_nil(opts),
          partition_filter = partition_keys || partition_key,
-         :ok <- ClaimFilter.validate_footprint(state_filter, partition_filter) do
+         :ok <- validate_wait_footprint(state_filter, partition_filter) do
       Ferricstore.Flow.ClaimWaiterScheduler.schedule_next_due(
         ctx,
         type,
@@ -193,6 +297,16 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   end
 
   def schedule_next_due(_ctx, _type, _opts), do: :ok
+
+  defp validate_wait_footprint(state, partition_filter) when is_list(partition_filter) do
+    case StorageScope.scoped_auto_partition_scope(partition_filter) do
+      {:ok, _scope} -> ClaimFilter.validate_footprint(state, :auto)
+      :error -> ClaimFilter.validate_footprint(state, partition_filter)
+    end
+  end
+
+  defp validate_wait_footprint(state, partition_filter),
+    do: ClaimFilter.validate_footprint(state, partition_filter)
 
   def return_records(_ctx, records, _payload_return, :jobs, _named_values),
     do: Enum.map(records, &job_response/1)
@@ -245,20 +359,43 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
 
   def normal_state_filter(state), do: state
 
-  defp wait_loop(ctx, type, opts, deadline, keys, limit) do
+  defp wait_loop(
+         ctx,
+         type,
+         opts,
+         scoped_wait_opts,
+         expected_metadata,
+         deadline,
+         keys,
+         limit
+       ) do
     waiter_message = ClaimWaiters.message()
     wait_ms = wait_ms(deadline)
 
     receive do
       {^waiter_message, _key} ->
-        case result(ctx, type, opts, :block) do
+        case result_resolved(ctx, type, opts, expected_metadata, :block) do
           {:ok, []} ->
             if expired?(deadline) do
               {:ok, []}
             else
               with :ok <- reregister_waiters(keys, deadline, limit) do
-                schedule_next_due(ctx, type, wait_opts_with_horizon(opts, deadline))
-                wait_loop(ctx, type, opts, deadline, keys, limit)
+                schedule_next_due(
+                  ctx,
+                  type,
+                  wait_opts_with_horizon(scoped_wait_opts, deadline)
+                )
+
+                wait_loop(
+                  ctx,
+                  type,
+                  opts,
+                  scoped_wait_opts,
+                  expected_metadata,
+                  deadline,
+                  keys,
+                  limit
+                )
               end
             end
 
@@ -541,6 +678,8 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   defp router_maybe(ctx, attrs), do: Router.flow_claim_due(ctx, attrs)
 
   defp job_response(record) do
+    record = Ferricstore.Flow.RecordProjection.public(record)
+
     %{
       id: Map.get(record, :id),
       type: Map.get(record, :type),
@@ -553,6 +692,8 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   end
 
   defp job_compact_response(record) do
+    record = Ferricstore.Flow.RecordProjection.public(record)
+
     [
       Map.get(record, :id),
       Map.get(record, :partition_key),
@@ -562,6 +703,8 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   end
 
   defp job_compact_attrs_response(record) do
+    record = Ferricstore.Flow.RecordProjection.public(record)
+
     [
       Map.get(record, :id),
       Map.get(record, :partition_key),
@@ -572,6 +715,8 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   end
 
   defp job_compact_state_response(record) do
+    record = Ferricstore.Flow.RecordProjection.public(record)
+
     [
       Map.get(record, :id),
       Map.get(record, :partition_key),
@@ -582,6 +727,8 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
   end
 
   defp job_compact_state_attrs_response(record) do
+    record = Ferricstore.Flow.RecordProjection.public(record)
+
     [
       Map.get(record, :id),
       Map.get(record, :partition_key),
@@ -622,8 +769,11 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
       {:ok, value} when is_integer(value) and value > @max_exact_ms ->
         {:error, "ERR flow now_ms exceeds maximum #{@max_exact_ms}"}
 
-      {:ok, _value} -> {:error, "ERR flow now_ms must be a non-negative integer"}
-      :error -> {:ok, nil}
+      {:ok, _value} ->
+        {:error, "ERR flow now_ms must be a non-negative integer"}
+
+      :error ->
+        {:ok, nil}
     end
   end
 
@@ -635,7 +785,8 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
       value when is_integer(value) and value > @max_exact_ms ->
         {:error, "ERR flow #{key} exceeds maximum #{@max_exact_ms}"}
 
-      _ -> {:error, "ERR flow #{key} must be a positive integer"}
+      _ ->
+        {:error, "ERR flow #{key} must be a positive integer"}
     end
   end
 

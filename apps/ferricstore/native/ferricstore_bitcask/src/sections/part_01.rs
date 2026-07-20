@@ -37,6 +37,9 @@ mod atoms {
         value,
         fallback,
         compare_failed,
+        range_entry_too_large,
+        batch_value_budget_exceeded,
+        batch_key_budget_exceeded,
     }
 }
 

@@ -10,6 +10,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
       alias Ferricstore.Flow
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.PolicyMigration
+      alias Ferricstore.Flow.Query.SourceCatalog, as: FlowQuerySourceCatalog
       alias Ferricstore.Flow.RetryPolicy
       alias Ferricstore.Flow.StateMeta
 
@@ -604,7 +605,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
                      generation
                    ),
                  :ok <- flow_queue_type_descriptor_barrier(state, exact_type) do
-              flow_queue_policy_catalog_projection(exact_type, catalog_key, generation)
+              flow_queue_policy_catalog_projection(
+                exact_type,
+                catalog_key,
+                generation,
+                state_key
+              )
             else
               false -> {:error, "ERR flow type catalog ownership mismatch"}
               {:error, _reason} = error -> error
@@ -614,6 +620,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
             if is_nil(do_get(state, catalog_key)) do
               with_lmdb_mirror_shard(state, fn ->
                 queue_pending_lmdb_mirror_delete(catalog_key)
+                flow_delete_query_source_catalog_projection(catalog_key)
               end)
 
               :ok
@@ -679,7 +686,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
             if flow_catalog_owned?(catalog, type, state_key) do
               with {:ok, _revision} <- flow_ensure_type_descriptor(state, type, false),
                    :ok <- flow_queue_type_descriptor_barrier(state, type) do
-                flow_queue_policy_catalog_projection(type, catalog_key, generation)
+                flow_queue_policy_catalog_projection(type, catalog_key, generation, state_key)
               end
             else
               {:error, "ERR flow type catalog ownership mismatch"}
@@ -821,11 +828,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
 
           :error ->
             if is_nil(do_get(state, catalog_key)) do
-              flow_delete_policy_catalog_projection(
-                job.type,
-                catalog_key,
-                projected_generation
-              )
+              with :ok <-
+                     flow_delete_policy_catalog_projection(
+                       job.type,
+                       catalog_key,
+                       projected_generation
+                     ) do
+                flow_delete_query_source_catalog_projection(catalog_key)
+              end
             else
               {:error, "ERR flow type catalog entry is corrupt"}
             end
@@ -863,7 +873,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
             flow_queue_policy_catalog_projection(
               job.type,
               catalog_key,
-              catalog.migration_generation
+              catalog.migration_generation,
+              catalog.state_key
             )
           end
         else
@@ -1221,7 +1232,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
              expire_at_ms,
              previous_generation
            ) do
-        with {:ok, %{migration_generation: generation}} <-
+        with {:ok, %{migration_generation: generation, state_key: state_key}} <-
                PolicyMigration.decode_catalog(value) do
           if flow_value_and_expiry_match?(state, key, value, expire_at_ms) do
             :ok
@@ -1234,7 +1245,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
                   flow_delete_policy_catalog_projection(type, key, previous_generation)
                 end
 
-                flow_queue_policy_catalog_projection(type, key, generation)
+                flow_queue_policy_catalog_projection(type, key, generation, state_key)
               end)
 
               :ok
@@ -1250,18 +1261,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
           with_lmdb_mirror_shard(state, fn ->
             queue_pending_lmdb_mirror_delete(key)
             flow_delete_policy_catalog_projection(type, key, generation)
+            flow_delete_query_source_catalog_projection(key)
           end)
 
           :ok
         end
       end
 
-      defp flow_queue_policy_catalog_projection(type, catalog_key, generation) do
-        queue_pending_lmdb_mirror_op(
-          {:put, FlowKeys.policy_catalog_projection_key(type, catalog_key, generation), <<1>>}
-        )
+      defp flow_queue_policy_catalog_projection(type, catalog_key, generation, state_key) do
+        case FlowQuerySourceCatalog.put_op(catalog_key, state_key) do
+          {:ok, source_catalog_op} ->
+            queue_pending_lmdb_mirror_op(
+              {:put, FlowKeys.policy_catalog_projection_key(type, catalog_key, generation), <<1>>}
+            )
 
-        :ok
+            queue_pending_lmdb_mirror_op(source_catalog_op)
+            :ok
+
+          {:error, _reason} ->
+            {:error, "ERR invalid flow query source catalog entry"}
+        end
       end
 
       defp flow_delete_policy_catalog_projection(type, catalog_key, generation) do
@@ -1270,6 +1289,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
         )
 
         :ok
+      end
+
+      defp flow_delete_query_source_catalog_projection(catalog_key) do
+        case FlowQuerySourceCatalog.delete_op(catalog_key) do
+          {:ok, op} ->
+            queue_pending_lmdb_mirror_op(op)
+            :ok
+
+          {:error, _reason} ->
+            {:error, "ERR invalid flow query source catalog entry"}
+        end
       end
 
       defp flow_maybe_delete_old_policy_catalog_projection(

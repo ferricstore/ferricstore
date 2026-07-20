@@ -26,16 +26,16 @@ defmodule Ferricstore.Flow.PipelineRead do
                                                 {get_acc, history_acc, other_acc, keyed_acc,
                                                  result_acc} ->
         case command do
-          {:get, id, partition_key, payload_return} ->
-            {[{idx, id, partition_key, payload_return} | get_acc], history_acc, other_acc,
-             keyed_acc, result_acc}
+          {:get, id, partition_key, payload_return, expected_metadata} ->
+            {[{idx, id, partition_key, payload_return, expected_metadata} | get_acc], history_acc,
+             other_acc, keyed_acc, result_acc}
 
           {:history, id, partition_key, history_key, query, include_cold?, consistent?,
-           value_return} ->
+           value_return, expected_metadata} ->
             {get_acc,
              [
                {idx, id, partition_key, history_key, query, include_cold?, consistent?,
-                value_return}
+                value_return, expected_metadata}
                | history_acc
              ], other_acc, keyed_acc, result_acc}
 
@@ -108,8 +108,8 @@ defmodule Ferricstore.Flow.PipelineRead do
     |> Enum.with_index()
     |> Enum.reduce_while({:ok, []}, fn {command, idx}, {:ok, acc} ->
       case command do
-        {:get, id, partition_key, payload_return} ->
-          {:cont, {:ok, [{idx, id, partition_key, payload_return} | acc]}}
+        {:get, id, partition_key, payload_return, expected_metadata} ->
+          {:cont, {:ok, [{idx, id, partition_key, payload_return, expected_metadata} | acc]}}
 
         _other ->
           {:halt, :fallback}
@@ -122,13 +122,13 @@ defmodule Ferricstore.Flow.PipelineRead do
   end
 
   defp fast_get_payload_disabled?(get_ops) do
-    Enum.all?(get_ops, fn {_idx, _id, _partition_key, payload_return} ->
+    Enum.all?(get_ops, fn {_idx, _id, _partition_key, payload_return, _expected_metadata} ->
       not Map.fetch!(payload_return, :enabled?)
     end)
   end
 
   defp fast_get_results(
-         [{_idx, _id, partition_key, _payload_return} | rest] = get_ops,
+         [{_idx, _id, partition_key, _payload_return, _expected_metadata} | rest] = get_ops,
          ctx,
          callbacks
        ) do
@@ -151,21 +151,26 @@ defmodule Ferricstore.Flow.PipelineRead do
 
   defp same_partition?([], _partition_key), do: true
 
-  defp same_partition?([{_idx, _id, partition_key, _payload_return} | rest], partition_key),
-    do: same_partition?(rest, partition_key)
+  defp same_partition?(
+         [{_idx, _id, partition_key, _payload_return, _expected_metadata} | rest],
+         partition_key
+       ),
+       do: same_partition?(rest, partition_key)
 
   defp same_partition?(_get_ops, _partition_key), do: false
 
   defp fast_get_partitioned_results(get_ops, ctx, callbacks, batch_get) do
     get_ops
-    |> Enum.group_by(fn {_idx, _id, partition_key, _payload_return} -> partition_key end)
+    |> Enum.group_by(fn {_idx, _id, partition_key, _payload_return, _expected_metadata} ->
+      partition_key
+    end)
     |> Enum.flat_map(fn {partition_key, group} ->
       case get_group_results(group, ctx, callbacks, batch_get, partition_key) do
         {:ok, indexed_results} ->
           indexed_results
 
         {:error, _reason} ->
-          Enum.map(group, fn {idx, _id, _partition_key, _payload_return} ->
+          Enum.map(group, fn {idx, _id, _partition_key, _payload_return, _expected_metadata} ->
             {idx, @batch_read_error}
           end)
       end
@@ -173,12 +178,21 @@ defmodule Ferricstore.Flow.PipelineRead do
   end
 
   defp get_group_results(group, ctx, callbacks, batch_get, partition_key) do
-    ids = Enum.map(group, fn {_idx, id, _partition_key, _payload_return} -> id end)
+    ids =
+      Enum.map(group, fn {_idx, id, _partition_key, _payload_return, _expected_metadata} ->
+        id
+      end)
+
     values = batch_get.(ctx, ids, partition_key)
 
     BatchResult.map_exact(group, values, fn
-      {idx, _id, _partition_key, _payload_return}, value ->
-        {idx, callbacks.decode_get.(value)}
+      {idx, _id, _partition_key, payload_return, expected_metadata}, value ->
+        result =
+          callbacks
+          |> decode_get(value, payload_return, expected_metadata)
+          |> project_get_result(payload_return)
+
+        {idx, result}
     end)
   end
 
@@ -194,20 +208,27 @@ defmodule Ferricstore.Flow.PipelineRead do
 
     decoded =
       get_ops
-      |> Enum.group_by(fn {_idx, _id, partition_key, _payload_return} -> partition_key end)
+      |> Enum.group_by(fn {_idx, _id, partition_key, _payload_return, _expected_metadata} ->
+        partition_key
+      end)
       |> Enum.flat_map(fn {partition_key, group} ->
-        ids = Enum.map(group, fn {_idx, id, _partition_key, _payload_return} -> id end)
+        ids =
+          Enum.map(group, fn {_idx, id, _partition_key, _payload_return, _expected_metadata} ->
+            id
+          end)
+
         values = batch_get.(ctx, ids, partition_key)
 
         case BatchResult.map_exact(group, values, fn
-               {idx, _id, _partition_key, payload_return}, value ->
-                 {idx, callbacks.decode_get.(value), payload_return}
+               {idx, _id, _partition_key, payload_return, expected_metadata}, value ->
+                 {idx, decode_get(callbacks, value, payload_return, expected_metadata),
+                  payload_return}
              end) do
           {:ok, group_decoded} ->
             group_decoded
 
           {:error, _reason} ->
-            Enum.map(group, fn {idx, _id, _partition_key, payload_return} ->
+            Enum.map(group, fn {idx, _id, _partition_key, payload_return, _expected_metadata} ->
               {idx, @batch_read_error, payload_return}
             end)
         end
@@ -232,15 +253,16 @@ defmodule Ferricstore.Flow.PipelineRead do
       records
       |> Enum.reverse()
       |> Enum.group_by(fn {_idx, _record, payload_return} ->
-        {Map.fetch!(payload_return, :enabled?), Map.fetch!(payload_return, :max_bytes)}
+        {Map.fetch!(payload_return, :enabled?), Map.fetch!(payload_return, :max_bytes),
+         Map.get(payload_return, :record_return, :record)}
       end)
       |> Enum.flat_map(fn
-        {{false, _max_bytes}, entries} ->
-          Enum.map(entries, fn {idx, record, _payload_return} ->
-            {idx, {:ok, RecordProjection.public(record)}}
+        {{false, _max_bytes, _record_return}, entries} ->
+          Enum.map(entries, fn {idx, record, payload_return} ->
+            {idx, project_get_result({:ok, record}, payload_return)}
           end)
 
-        {{true, max_bytes}, entries} ->
+        {{true, max_bytes, _record_return}, entries} ->
           hydrated_records =
             ValueHydration.payload_records(
               ctx,
@@ -249,8 +271,8 @@ defmodule Ferricstore.Flow.PipelineRead do
             )
 
           case BatchResult.map_exact(entries, hydrated_records, fn
-                 {idx, _record, _payload_return}, record ->
-                   {idx, {:ok, RecordProjection.public(record)}}
+                 {idx, _record, payload_return}, record ->
+                   {idx, project_get_result({:ok, record}, payload_return)}
                end) do
             {:ok, results} ->
               results
@@ -264,4 +286,23 @@ defmodule Ferricstore.Flow.PipelineRead do
 
     pass_through ++ hydrated
   end
+
+  defp decode_get(callbacks, value, payload_return, expected_metadata) do
+    decoder =
+      case Map.get(payload_return, :record_return, :record) do
+        :meta -> Map.get(callbacks, :decode_get_meta, Map.fetch!(callbacks, :decode_get))
+        :record -> Map.fetch!(callbacks, :decode_get)
+      end
+
+    decoder.(value, expected_metadata)
+  end
+
+  defp project_get_result({:ok, %{} = record}, payload_return) do
+    case Map.get(payload_return, :record_return, :record) do
+      :meta -> {:ok, RecordProjection.meta(record)}
+      :record -> {:ok, RecordProjection.public(record)}
+    end
+  end
+
+  defp project_get_result(result, _payload_return), do: result
 end

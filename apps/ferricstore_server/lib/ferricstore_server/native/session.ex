@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Native.Session do
 
   alias Ferricstore.PubSub, as: PS
   alias Ferricstore.Commands.{PreparedCommand, TransactionPolicy}
+  alias FerricstoreServer.Native.FQLParser
   alias Ferricstore.Flow.InternalKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Transaction.Coordinator, as: TxCoordinator
@@ -38,7 +39,7 @@ defmodule FerricstoreServer.Native.Session do
   def prepare_command(payload) when is_map(payload) do
     with {:ok, command} <- require_binary(payload, "command"),
          {:ok, args} <- raw_command_args(payload) do
-      Ferricstore.Commands.Dispatcher.prepare_raw(command, args)
+      Ferricstore.Commands.Dispatcher.prepare_raw(command, args, flow_query_parser: FQLParser)
     end
   end
 

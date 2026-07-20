@@ -3,6 +3,7 @@ defmodule Ferricstore.Flow.RecordLoader do
 
   alias Ferricstore.Flow.Codec
   alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.ScopeBinding
   alias Ferricstore.Store.ReadResult
   alias Ferricstore.Store.Router
 
@@ -14,6 +15,7 @@ defmodule Ferricstore.Flow.RecordLoader do
         ctx
         |> Router.flow_batch_get(ids, partition_key)
         |> decode_values(&safe_decode_record/1)
+        |> ScopeBinding.verify_context_read_result(ctx)
 
       _too_large ->
         {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}
@@ -31,6 +33,7 @@ defmodule Ferricstore.Flow.RecordLoader do
         ctx
         |> Router.batch_get(keys)
         |> decode_values(&safe_decode_record/1)
+        |> ScopeBinding.verify_context_read_result(ctx)
 
       _too_large ->
         {:error, "ERR key too large (max #{Router.max_key_size()} bytes)"}

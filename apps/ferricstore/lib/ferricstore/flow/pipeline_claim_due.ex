@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.PipelineClaimDue do
   @moduledoc false
 
   alias Ferricstore.BatchResult
-  alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.{ClaimScope, Keys}
   alias Ferricstore.Store.Router
 
   def results([], _ctx, acc, stats, _callbacks), do: {Enum.reverse(acc), stats}
@@ -198,20 +198,25 @@ defmodule Ferricstore.Flow.PipelineClaimDue do
   defp route_state(_state), do: "queued"
 
   defp hydrated_result(ctx, claim, {:ok, records}, callbacks) when is_list(records) do
-    {:ok,
-     callbacks.return_records.(
-       ctx,
-       records,
-       claim.payload_return,
-       claim.return_mode,
-       claim.named_values
-     )}
+    with :ok <- ClaimScope.verify_records(records, Map.get(claim, :expected_metadata, %{})) do
+      {:ok,
+       callbacks.return_records.(
+         ctx,
+         records,
+         claim.payload_return,
+         claim.return_mode,
+         claim.named_values
+       )}
+    end
   end
 
   defp hydrated_result(_ctx, _claim, other, _callbacks), do: other
 
-  defp execute_run(ctx, [%{type: type, opts: opts}], stats, callbacks) do
-    {[callbacks.claim_due_result.(ctx, type, opts)], %{stats | groups: stats.groups + 1}}
+  defp execute_run(ctx, [%{type: type, opts: opts} = claim], stats, callbacks) do
+    metadata = Map.get(claim, :expected_metadata, %{})
+
+    {[callbacks.claim_due_result.(ctx, type, opts, metadata)],
+     %{stats | groups: stats.groups + 1}}
   end
 
   defp execute_run(
@@ -237,7 +242,12 @@ defmodule Ferricstore.Flow.PipelineClaimDue do
     combined_opts = Keyword.put(opts, :limit, total_limit)
 
     results =
-      case callbacks.claim_due_result.(ctx, type, combined_opts) do
+      case callbacks.claim_due_result.(
+             ctx,
+             type,
+             combined_opts,
+             Map.get(hd(claims), :expected_metadata, %{})
+           ) do
         {:ok, records} ->
           split_records(records, claims, [])
 
@@ -288,6 +298,7 @@ defmodule Ferricstore.Flow.PipelineClaimDue do
         hd(claims).payload_return,
         hd(claims).return_mode,
         hd(claims).named_values,
+        Map.get(hd(claims), :expected_metadata, %{}),
         callbacks
       )
     else
@@ -330,10 +341,21 @@ defmodule Ferricstore.Flow.PipelineClaimDue do
     end)
   end
 
-  defp hydrate_results(results, ctx, payload_return, return_mode, named_values, callbacks) do
+  defp hydrate_results(
+         results,
+         ctx,
+         payload_return,
+         return_mode,
+         named_values,
+         expected_metadata,
+         callbacks
+       ) do
     Enum.map(results, fn
       {:ok, records} ->
-        {:ok, callbacks.return_records.(ctx, records, payload_return, return_mode, named_values)}
+        with :ok <- ClaimScope.verify_records(records, expected_metadata) do
+          {:ok,
+           callbacks.return_records.(ctx, records, payload_return, return_mode, named_values)}
+        end
 
       other ->
         other

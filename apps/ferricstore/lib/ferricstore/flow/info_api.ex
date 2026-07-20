@@ -4,8 +4,8 @@ defmodule Ferricstore.Flow.InfoAPI do
   alias Ferricstore.Flow.InfoCountRead
   alias Ferricstore.Flow.InfoCounts
   alias Ferricstore.Flow.LMDBIndexRead
-  alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.IndexZSet
+  alias Ferricstore.Flow.ScopeBinding
   alias Ferricstore.Store.Router
 
   @default_state "queued"
@@ -18,8 +18,11 @@ defmodule Ferricstore.Flow.InfoAPI do
     with :ok <- validate_opts(opts),
          :ok <- validate_type(type),
          {:ok, partition_key} <- optional_auto_partition_key(opts),
+         logical_partition_key = partition_key,
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          {:ok, counts, inflight} <-
            counts(
              ctx,
@@ -31,7 +34,7 @@ defmodule Ferricstore.Flow.InfoAPI do
       {:ok,
        counts
        |> Map.put(:type, type)
-       |> Map.put(:partition_key, response_partition_key(partition_key))
+       |> Map.put(:partition_key, response_partition_key(logical_partition_key))
        |> Map.put(:inflight, inflight)}
     end
   end
@@ -44,7 +47,7 @@ defmodule Ferricstore.Flow.InfoAPI do
   defp counts(ctx, type, :auto, include_cold?, consistent?) do
     zero_counts = InfoCounts.zero_counts(@default_state, @terminal_states)
 
-    Keys.auto_partition_keys()
+    ScopeBinding.auto_partition_keys(ctx)
     |> Enum.reduce_while({:ok, zero_counts, 0}, fn partition_key,
                                                    {:ok, counts_acc, inflight_acc} ->
       case counts(ctx, type, partition_key, include_cold?, consistent?) do

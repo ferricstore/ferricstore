@@ -2,11 +2,32 @@ defmodule Ferricstore.Flow.PipelineReadCommandTest do
   use ExUnit.Case, async: true
   @moduletag :flow
 
+  alias FerricStore.Flow.MetadataExtension
   alias Ferricstore.Flow.PipelineReadCommand
 
-  test "command parses get with default payload return" do
-    assert {:get, "id", nil, %{enabled?: false, max_bytes: _}} =
-             PipelineReadCommand.command(:ctx, {:get, "id", []})
+  setup do
+    {:ok, snapshot} =
+      MetadataExtension.configure(FerricStore.Flow.MetadataExtension.Disabled, [])
+
+    {:ok, ctx: %{flow_metadata_snapshot: snapshot}}
+  end
+
+  test "command parses get with default payload return and sealed scope", %{ctx: ctx} do
+    assert {:get, "id", partition_key, %{enabled?: false, max_bytes: _}, %{}} =
+             PipelineReadCommand.command(ctx, {:get, "id", []})
+
+    assert String.starts_with?(partition_key, "__flow_auto__:")
+  end
+
+  test "command preserves metadata-only return shape", %{ctx: ctx} do
+    assert {:get, "id", _partition_key, %{enabled?: false, max_bytes: _, record_return: :meta},
+            %{}} =
+             PipelineReadCommand.command(ctx, {:get, "id", [return: :meta]})
+  end
+
+  test "scope-sensitive commands fail closed for a malformed context" do
+    assert PipelineReadCommand.command(:ctx, {:get, "id", []}) ==
+             {:error, "ERR Flow metadata extension is unavailable"}
   end
 
   test "command rejects unsupported operation" do
@@ -33,11 +54,12 @@ defmodule Ferricstore.Flow.PipelineReadCommandTest do
     assert PipelineReadCommand.decode_get({:error, "ERR backend"}) == {:error, "ERR backend"}
   end
 
-  test "history command uses the direct history preparation contract" do
-    assert {:history, "flow-1", nil, _history_key, query, true, true,
-            %{enabled?: false, max_bytes: _}} =
-             PipelineReadCommand.command(:ctx, {:history, "flow-1", []})
+  test "history command uses the direct history preparation contract", %{ctx: ctx} do
+    assert {:history, "flow-1", partition_key, _history_key, query, true, true,
+            %{enabled?: false, max_bytes: _}, %{}} =
+             PipelineReadCommand.command(ctx, {:history, "flow-1", []})
 
+    assert String.starts_with?(partition_key, "__flow_auto__:")
     assert query.count == 10_000
   end
 

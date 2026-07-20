@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow do
   alias Ferricstore.Flow.Codec
   alias Ferricstore.Flow.PayloadReturn
   alias Ferricstore.Flow.RecordProjection
+  alias Ferricstore.Flow.ScopeBinding
   alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
   alias Ferricstore.Store.Router
 
@@ -16,7 +17,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.create_attrs(id, opts) do
+      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.create_attrs(id, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :create, attrs) do
         ctx
         |> Router.flow_create(attrs)
         |> maybe_notify_claim_waiters(attrs, :state)
@@ -46,7 +48,8 @@ defmodule Ferricstore.Flow do
                type,
                initial_state,
                opts
-             ) do
+             ),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :start_and_claim, attrs) do
         Router.flow_start_and_claim(ctx, attrs)
         |> maybe_return_start_and_claim(ctx, return_mode)
       end
@@ -69,7 +72,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs_list} <- run_steps_many_attrs(items, opts) do
+      with {:ok, attrs_list} <- run_steps_many_attrs(items, opts),
+           {:ok, attrs_list} <- ScopeBinding.bind_mutations(ctx, :run_steps_many, attrs_list) do
         Router.flow_run_steps_many(ctx, attrs_list)
       end
 
@@ -389,9 +393,15 @@ defmodule Ferricstore.Flow do
     valid_attrs = Enum.map(valid, fn {_idx, attrs} -> attrs end)
 
     valid_results =
-      ctx
-      |> Router.flow_create_batch(valid_attrs)
-      |> maybe_notify_claim_waiters(valid_attrs, :state)
+      case ScopeBinding.bind_mutations(ctx, :create_batch, valid_attrs) do
+        {:ok, scoped_attrs} ->
+          ctx
+          |> Router.flow_create_batch(scoped_attrs)
+          |> maybe_notify_claim_waiters(scoped_attrs, :state)
+
+        {:error, _reason} = error ->
+          List.duplicate(error, length(valid_attrs))
+      end
 
     indexed_results =
       valid
@@ -420,7 +430,10 @@ defmodule Ferricstore.Flow do
            {:ok, attrs_list} <-
              Ferricstore.Flow.MutationAttrs.create_many_attrs(items, opts, partition_key),
            :ok <-
-             Ferricstore.Flow.MutationAttrs.validate_unique_create_ids(attrs_list, independent?) do
+             Ferricstore.Flow.MutationAttrs.validate_unique_create_ids(attrs_list, independent?),
+           {:ok, attrs_list} <- ScopeBinding.bind_mutations(ctx, :create_many, attrs_list),
+           {:ok, partition_key} <-
+             ScopeBinding.batch_partition_key(partition_key, attrs_list) do
         if independent? do
           result =
             if return_mode == :ok_on_success do
@@ -455,7 +468,8 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, attrs} <-
-             Ferricstore.Flow.MutationAttrs.spawn_children_attrs(parent_id, children, opts) do
+             Ferricstore.Flow.MutationAttrs.spawn_children_attrs(parent_id, children, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :spawn_children, attrs) do
         Router.flow_spawn_children(ctx, attrs)
       end
 
@@ -478,14 +492,61 @@ defmodule Ferricstore.Flow do
          {:ok, payload_return} <- PayloadReturn.options(opts, false),
          {:ok, named_values} <- named_value_return_opts(opts),
          {:ok, partition_key} <- optional_partition_key(opts),
-         :ok <- validate_key_size(__MODULE__.Keys.state_key(id, partition_key)) do
-      case Router.flow_get_with_status(ctx, id, partition_key) do
+         {:ok, physical_partition_key, expected_metadata} <-
+           ScopeBinding.bind_read_partition(ctx, :runs, id, partition_key) do
+      get_bound_record(
+        ctx,
+        id,
+        physical_partition_key,
+        expected_metadata,
+        payload_return,
+        named_values
+      )
+    end
+  end
+
+  @doc false
+  def get_resolved(ctx, id, opts, expected_metadata)
+      when is_binary(id) and is_list(opts) and is_map(expected_metadata) do
+    with :ok <- validate_id(id),
+         :ok <- validate_opts(opts),
+         :ok <- Ferricstore.Flow.Internal.reject_reserved_id(id, opts),
+         {:ok, payload_return} <- PayloadReturn.options(opts, false),
+         {:ok, named_values} <- named_value_return_opts(opts),
+         {:ok, partition_key} <- optional_partition_key(opts),
+         {:ok, physical_partition_key, expected_metadata} <-
+           ScopeBinding.bind_resolved_read_partition(id, partition_key, expected_metadata) do
+      get_bound_record(
+        ctx,
+        id,
+        physical_partition_key,
+        expected_metadata,
+        payload_return,
+        named_values
+      )
+    end
+  end
+
+  def get_resolved(_ctx, _id, _opts, _expected_metadata),
+    do: {:error, "ERR invalid Flow system metadata"}
+
+  defp get_bound_record(
+         ctx,
+         id,
+         physical_partition_key,
+         expected_metadata,
+         payload_return,
+         named_values
+       ) do
+    with :ok <- validate_key_size(__MODULE__.Keys.state_key(id, physical_partition_key)) do
+      case Router.flow_get_with_status(ctx, id, physical_partition_key) do
         nil ->
           {:ok, nil}
 
         value when is_binary(value) ->
           value
           |> safe_decode_record()
+          |> ScopeBinding.verify_read_result(expected_metadata)
           |> then(&Ferricstore.Flow.ValueHydration.payload_result(ctx, &1, payload_return))
           |> Ferricstore.Flow.ValueHydration.named_value_result(ctx, named_values)
           |> Ferricstore.Flow.RecordProjection.public_result()
@@ -678,6 +739,7 @@ defmodule Ferricstore.Flow do
       with {:ok, return_mode, mutation_opts} <- extend_lease_return_mode(opts),
            {:ok, attrs} <-
              Ferricstore.Flow.MutationAttrs.extend_lease_attrs(id, lease_token, mutation_opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :extend_lease, attrs),
            attrs = flow_stamp_governance_command_time(attrs),
            :ok <- maybe_renew_governance_limit(ctx, attrs) do
         ctx
@@ -693,7 +755,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.complete_attrs(id, lease_token, opts) do
+      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.complete_attrs(id, lease_token, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :complete, attrs) do
         Router.flow_complete(ctx, attrs)
       end
       |> normalize_committed_error()
@@ -719,7 +782,10 @@ defmodule Ferricstore.Flow do
              Ferricstore.Flow.MutationAttrs.validate_unique_transition_ids(
                attrs_list,
                independent?
-             ) do
+             ),
+           {:ok, attrs_list} <- ScopeBinding.bind_mutations(ctx, :complete_many, attrs_list),
+           {:ok, partition_key} <-
+             ScopeBinding.batch_partition_key(partition_key, attrs_list) do
         complete_result =
           cond do
             independent? ->
@@ -754,7 +820,8 @@ defmodule Ferricstore.Flow do
 
     result =
       with {:ok, attrs} <-
-             Ferricstore.Flow.MutationAttrs.transition_attrs(id, from_state, to_state, opts) do
+             Ferricstore.Flow.MutationAttrs.transition_attrs(id, from_state, to_state, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :transition, attrs) do
         ctx
         |> Router.flow_transition(attrs)
         |> maybe_notify_claim_waiters(attrs, :to_state)
@@ -790,7 +857,10 @@ defmodule Ferricstore.Flow do
              Ferricstore.Flow.MutationAttrs.validate_unique_transition_ids(
                attrs_list,
                independent?
-             ) do
+             ),
+           {:ok, attrs_list} <- ScopeBinding.bind_mutations(ctx, :transition_many, attrs_list),
+           {:ok, partition_key} <-
+             ScopeBinding.batch_partition_key(partition_key, attrs_list) do
         transition_result =
           if independent? do
             ctx
@@ -833,7 +903,8 @@ defmodule Ferricstore.Flow do
                from_state,
                to_state,
                opts
-             ) do
+             ),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :step_continue, attrs) do
         Router.flow_step_continue(ctx, attrs)
         |> maybe_return_step_continue(ctx, return_mode)
       end
@@ -893,7 +964,14 @@ defmodule Ferricstore.Flow do
     valid = Enum.reverse(valid)
 
     valid_results =
-      Router.flow_transition_batch(ctx, Enum.map(valid, fn {_idx, attrs} -> attrs end))
+      valid
+      |> Enum.map(fn {_idx, attrs} -> attrs end)
+      |> then(fn attrs_list ->
+        case ScopeBinding.bind_mutations(ctx, :transition_batch, attrs_list) do
+          {:ok, scoped_attrs} -> Router.flow_transition_batch(ctx, scoped_attrs)
+          {:error, _reason} = error -> List.duplicate(error, length(attrs_list))
+        end
+      end)
 
     indexed_results =
       valid
@@ -930,32 +1008,92 @@ defmodule Ferricstore.Flow do
     do: [{:error, "ERR flow opts must be a keyword list"}]
 
   defp pipeline_write_batch_with(ctx, ops, terminal_batch) do
-    command_callbacks = %{
-      create_attrs: &Ferricstore.Flow.MutationAttrs.create_attrs/2,
-      start_and_claim_attrs: &Ferricstore.Flow.MutationAttrs.start_and_claim_attrs/4,
-      transition_attrs: &Ferricstore.Flow.MutationAttrs.transition_attrs/4,
-      step_continue_attrs: &Ferricstore.Flow.MutationAttrs.step_continue_attrs/5,
-      named_value_attrs: &Ferricstore.Flow.ValueStore.named_value_attrs/2,
-      signal_attrs: &Ferricstore.Flow.Signal.attrs/2,
-      complete_attrs: &Ferricstore.Flow.MutationAttrs.complete_attrs/3,
-      retry_attrs: &Ferricstore.Flow.MutationAttrs.retry_attrs/3,
-      fail_attrs: &Ferricstore.Flow.MutationAttrs.fail_attrs/3,
-      cancel_attrs: &Ferricstore.Flow.MutationAttrs.cancel_attrs/2,
-      rewind_attrs: &Ferricstore.Flow.MutationAttrs.rewind_attrs/2,
-      terminal_batch: terminal_batch
-    }
-
-    results =
-      Ferricstore.Flow.PipelineWrite.batch_independent(ctx, ops, %{
-        start: &flow_start_time/0,
-        command: fn op -> Ferricstore.Flow.PipelineWriteCommand.command(op, command_callbacks) end,
-        notify: &maybe_notify_claim_waiters/3,
-        observe: &FlowTelemetry.observe_batch/3,
+    with {:ok, metadata} <- ScopeBinding.resolve_mutation(ctx, :pipeline_write_batch) do
+      command_callbacks = %{
+        create_attrs: fn id, opts ->
+          id
+          |> Ferricstore.Flow.MutationAttrs.create_attrs(opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
+        start_and_claim_attrs: fn id, type, state, opts ->
+          id
+          |> Ferricstore.Flow.MutationAttrs.start_and_claim_attrs(type, state, opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
+        transition_attrs: fn id, from_state, to_state, opts ->
+          id
+          |> Ferricstore.Flow.MutationAttrs.transition_attrs(from_state, to_state, opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
+        step_continue_attrs: fn id, lease_token, from_state, to_state, opts ->
+          id
+          |> Ferricstore.Flow.MutationAttrs.step_continue_attrs(
+            lease_token,
+            from_state,
+            to_state,
+            opts
+          )
+          |> scope_pipeline_attrs(metadata)
+        end,
+        named_value_attrs: fn value, opts ->
+          value
+          |> Ferricstore.Flow.ValueStore.named_value_attrs(opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
+        signal_attrs: fn id, opts ->
+          id
+          |> Ferricstore.Flow.Signal.attrs(opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
+        complete_attrs: fn id, lease_token, opts ->
+          id
+          |> Ferricstore.Flow.MutationAttrs.complete_attrs(lease_token, opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
+        retry_attrs: fn id, lease_token, opts ->
+          id
+          |> Ferricstore.Flow.MutationAttrs.retry_attrs(lease_token, opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
+        fail_attrs: fn id, lease_token, opts ->
+          id
+          |> Ferricstore.Flow.MutationAttrs.fail_attrs(lease_token, opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
+        cancel_attrs: fn id, opts ->
+          id
+          |> Ferricstore.Flow.MutationAttrs.cancel_attrs(opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
+        rewind_attrs: fn id, opts ->
+          id
+          |> Ferricstore.Flow.MutationAttrs.rewind_attrs(opts)
+          |> scope_pipeline_attrs(metadata)
+        end,
         terminal_batch: terminal_batch
-      })
+      }
 
-    pipeline_write_return_results(ctx, ops, results)
+      results =
+        Ferricstore.Flow.PipelineWrite.batch_independent(ctx, ops, %{
+          start: &flow_start_time/0,
+          command: fn op ->
+            Ferricstore.Flow.PipelineWriteCommand.command(op, command_callbacks)
+          end,
+          notify: &maybe_notify_claim_waiters/3,
+          observe: &FlowTelemetry.observe_batch/3,
+          terminal_batch: terminal_batch
+        })
+
+      pipeline_write_return_results(ctx, ops, results)
+    else
+      {:error, _reason} = error -> List.duplicate(error, length(ops))
+    end
   end
+
+  defp scope_pipeline_attrs({:ok, attrs}, metadata),
+    do: ScopeBinding.bind_resolved(attrs, metadata)
+
+  defp scope_pipeline_attrs({:error, _reason} = error, _metadata), do: error
 
   defp pipeline_write_return_results(ctx, ops, results)
        when is_list(ops) and is_list(results) and length(ops) == length(results) do
@@ -1031,6 +1169,7 @@ defmodule Ferricstore.Flow do
     {results, stats} =
       ops
       |> Enum.map(&Ferricstore.Flow.PipelineClaimDueCommand.command(&1, command_callbacks))
+      |> then(&Ferricstore.Flow.ClaimScope.bind_prepared_commands(ctx, &1))
       |> pipeline_claim_due_results(ctx, [], %{groups: 0, coalesced_calls: 0, batched_calls: 0})
 
     :telemetry.execute(
@@ -1049,11 +1188,14 @@ defmodule Ferricstore.Flow do
   def pipeline_read_batch(_ctx, []), do: []
 
   def pipeline_read_batch(ctx, ops) when is_list(ops) do
+    ctx = Ferricstore.Flow.PipelineReadCommand.prepare_context(ctx, ops)
+
     Ferricstore.Flow.PipelineRead.batch(ctx, ops, %{
       start: &flow_start_time/0,
       command: &Ferricstore.Flow.PipelineReadCommand.command/2,
       batch_get: &Ferricstore.Store.Router.flow_batch_get/3,
-      decode_get: &Ferricstore.Flow.PipelineReadCommand.decode_get/1,
+      decode_get: &Ferricstore.Flow.PipelineReadCommand.decode_get/2,
+      decode_get_meta: &Ferricstore.Flow.PipelineReadCommand.decode_get_meta/2,
       history_results: &Ferricstore.Flow.PipelineReadCommand.history_results/2,
       observe: &FlowTelemetry.observe_pipeline_read_batch/2
     })
@@ -1067,7 +1209,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.retry_attrs(id, lease_token, opts) do
+      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.retry_attrs(id, lease_token, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :retry, attrs) do
         ctx
         |> Router.flow_retry(attrs)
         |> maybe_release_governance_limit(ctx, opts)
@@ -1083,7 +1226,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.reschedule_attrs(id, lease_token, opts) do
+      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.reschedule_attrs(id, lease_token, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :reschedule, attrs) do
         ctx
         |> Router.flow_reschedule(attrs)
         |> maybe_notify_claim_waiters(attrs, :state)
@@ -1107,7 +1251,10 @@ defmodule Ferricstore.Flow do
              Ferricstore.Flow.MutationAttrs.validate_unique_transition_ids(
                attrs_list,
                independent?
-             ) do
+             ),
+           {:ok, attrs_list} <- ScopeBinding.bind_mutations(ctx, :retry_many, attrs_list),
+           {:ok, partition_key} <-
+             ScopeBinding.batch_partition_key(partition_key, attrs_list) do
         retry_result =
           if independent? do
             ctx
@@ -1134,7 +1281,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.fail_attrs(id, lease_token, opts) do
+      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.fail_attrs(id, lease_token, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :fail, attrs) do
         Router.flow_fail(ctx, attrs)
       end
       |> maybe_release_governance_limit(ctx, opts)
@@ -1157,7 +1305,10 @@ defmodule Ferricstore.Flow do
              Ferricstore.Flow.MutationAttrs.validate_unique_transition_ids(
                attrs_list,
                independent?
-             ) do
+             ),
+           {:ok, attrs_list} <- ScopeBinding.bind_mutations(ctx, :fail_many, attrs_list),
+           {:ok, partition_key} <-
+             ScopeBinding.batch_partition_key(partition_key, attrs_list) do
         fail_result =
           if independent? do
             flow_terminal_many_independent(ctx, :fail, attrs_list)
@@ -1180,7 +1331,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.cancel_attrs(id, opts) do
+      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.cancel_attrs(id, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :cancel, attrs) do
         Router.flow_cancel(ctx, attrs)
       end
       |> maybe_release_governance_limit(ctx, opts)
@@ -1203,7 +1355,10 @@ defmodule Ferricstore.Flow do
              Ferricstore.Flow.MutationAttrs.validate_unique_transition_ids(
                attrs_list,
                independent?
-             ) do
+             ),
+           {:ok, attrs_list} <- ScopeBinding.bind_mutations(ctx, :cancel_many, attrs_list),
+           {:ok, partition_key} <-
+             ScopeBinding.batch_partition_key(partition_key, attrs_list) do
         cancel_result =
           if independent? do
             flow_terminal_many_independent(ctx, :cancel, attrs_list)
@@ -1228,7 +1383,8 @@ defmodule Ferricstore.Flow do
     started = flow_start_time()
 
     result =
-      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.rewind_attrs(id, opts) do
+      with {:ok, attrs} <- Ferricstore.Flow.MutationAttrs.rewind_attrs(id, opts),
+           {:ok, attrs} <- ScopeBinding.bind_mutation(ctx, :rewind, attrs) do
         ctx
         |> Router.flow_rewind(attrs)
         |> maybe_notify_claim_waiters(attrs, :any)
@@ -1580,7 +1736,7 @@ defmodule Ferricstore.Flow do
 
   defp pipeline_claim_due_results(commands, ctx, acc, stats) do
     Ferricstore.Flow.PipelineClaimDue.results(commands, ctx, acc, stats, %{
-      claim_due_result: &Ferricstore.Flow.ClaimDueAPI.result/3,
+      claim_due_result: &Ferricstore.Flow.ClaimDueAPI.result_resolved/4,
       return_records: &Ferricstore.Flow.ClaimDueAPI.return_records/5,
       normal_attrs: &Ferricstore.Flow.ClaimDueAPI.normal_attrs/3,
       normal_state_filter: &Ferricstore.Flow.ClaimDueAPI.normal_state_filter/1

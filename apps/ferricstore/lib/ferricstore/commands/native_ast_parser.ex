@@ -9,8 +9,10 @@ defmodule Ferricstore.Commands.NativeAstParser do
   """
 
   alias Ferricstore.Commands.{Catalog, CollectionScan, Extension}
+  alias Ferricstore.Flow.Query.Limits
 
   @max_flow_ref_size 4096
+  @max_flow_query_parameters Limits.max_parameters()
   @min_int64 -9_223_372_036_854_775_808
   @max_int64 9_223_372_036_854_775_807
   @max_blocking_timeout_ms 0xFFFFFFFF
@@ -700,6 +702,16 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp make_ast("FLOW.SEARCH", :flow_search, opts),
     do: {:flow_search, parse_flow_search_options(opts)}
+
+  defp make_ast("FLOW.QUERY", :flow_query, [version, query | params]) do
+    case parse_flow_query_params(params) do
+      {:ok, parsed_params} -> {:flow_query, version, query, parsed_params}
+      {:error, reason} -> {:flow_query, {:error, reason}}
+    end
+  end
+
+  defp make_ast("FLOW.QUERY", :flow_query, _args),
+    do: {:flow_query, {:error, "ERR wrong number of arguments for 'flow.query' command"}}
 
   defp make_ast("FLOW.ATTRIBUTES", :flow_attributes, [type | opts]),
     do: {:flow_attributes, type, parse_flow_options(opts, spec(:index_query))}
@@ -1934,6 +1946,26 @@ defmodule Ferricstore.Commands.NativeAstParser do
   end
 
   defp parse_flow_search_options(_args, _acc), do: {:error, "ERR syntax error"}
+
+  defp parse_flow_query_params(params), do: parse_flow_query_params(params, %{})
+
+  defp parse_flow_query_params([], params), do: {:ok, params}
+
+  defp parse_flow_query_params([_name, _value | _rest], params)
+       when map_size(params) >= @max_flow_query_parameters,
+       do: {:error, "ERR FLOW.QUERY accepts at most 64 named parameters"}
+
+  defp parse_flow_query_params([name, value | rest], params)
+       when is_binary(name) and name != "" do
+    if Map.has_key?(params, name) do
+      {:error, "ERR FLOW.QUERY parameter names must be unique"}
+    else
+      parse_flow_query_params(rest, Map.put(params, name, value))
+    end
+  end
+
+  defp parse_flow_query_params(_params, _acc),
+    do: {:error, "ERR FLOW.QUERY parameters must be name/value pairs"}
 
   defp parse_flow_policy_set_options(args),
     do: parse_flow_policy_set_options(args, [], [], [], [], [])

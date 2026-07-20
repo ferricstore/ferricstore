@@ -196,37 +196,75 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimDue do
                priority: priority
              } = attrs
            ) do
-        with_flow_governance_limit(attrs, fn ->
-          now_ms = flow_attrs_now_ms(attrs)
-          partition_key = Map.get(attrs, :partition_keys) || Map.get(attrs, :partition_key)
+        with_flow_claim_scope(attrs, fn ->
+          with_flow_governance_limit(attrs, fn ->
+            now_ms = flow_attrs_now_ms(attrs)
+            partition_key = Map.get(attrs, :partition_keys) || Map.get(attrs, :partition_key)
 
-          flow_claim_due_phase(
-            :total,
-            flow_claim_due_phase_meta(state, partition_key, priority, limit),
-            fn ->
-              state_filter =
-                flow_claim_state_filter(state_filter, Map.get(attrs, :exclude_states, []))
+            flow_claim_due_phase(
+              :total,
+              flow_claim_due_phase_meta(state, partition_key, priority, limit),
+              fn ->
+                state_filter =
+                  flow_claim_state_filter(state_filter, Map.get(attrs, :exclude_states, []))
 
-              case flow_claim_due_priorities(
-                     state,
-                     attrs,
-                     type,
-                     state_filter,
-                     worker,
-                     lease_ms,
-                     now_ms,
-                     partition_key,
-                     flow_claim_priorities(priority),
-                     limit,
-                     []
-                   ) do
-                {:error, _reason} = error -> error
-                claimed -> {:ok, claimed}
+                case flow_claim_due_priorities(
+                       state,
+                       attrs,
+                       type,
+                       state_filter,
+                       worker,
+                       lease_ms,
+                       now_ms,
+                       partition_key,
+                       flow_claim_priorities(priority),
+                       limit,
+                       []
+                     ) do
+                  {:error, _reason} = error -> error
+                  claimed -> {:ok, claimed}
+                end
               end
-            end
-          )
+            )
+          end)
         end)
       end
+
+      defp with_flow_claim_scope(attrs, fun) when is_map(attrs) and is_function(fun, 0) do
+        case Map.fetch(attrs, :system_metadata) do
+          :error ->
+            fun.()
+
+          {:ok, metadata} when is_map(metadata) ->
+            previous = Process.get(:sm_flow_claim_scope, :undefined)
+            Process.put(:sm_flow_claim_scope, metadata)
+
+            try do
+              fun.()
+            after
+              case previous do
+                :undefined -> Process.delete(:sm_flow_claim_scope)
+                value -> Process.put(:sm_flow_claim_scope, value)
+              end
+            end
+
+          {:ok, _invalid} ->
+            {:error, "ERR invalid replicated Flow scope"}
+        end
+      end
+
+      defp flow_claim_scope_active? do
+        Process.get(:sm_flow_claim_scope, :undefined) != :undefined
+      end
+
+      defp flow_claim_scope_match?(record) when is_map(record) do
+        case Process.get(:sm_flow_claim_scope, :undefined) do
+          :undefined -> true
+          expected -> Map.get(record, :system_metadata, %{}) == expected
+        end
+      end
+
+      defp flow_claim_scope_match?(_record), do: false
 
       defp with_flow_governance_limit(attrs, fun) when is_map(attrs) and is_function(fun, 0) do
         case Map.get(attrs, :governance_limit) do

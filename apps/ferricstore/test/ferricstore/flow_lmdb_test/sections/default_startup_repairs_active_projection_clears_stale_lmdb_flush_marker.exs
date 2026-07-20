@@ -290,9 +290,17 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
         state_key = Ferricstore.Flow.Keys.state_key("flow-query-value", "tenant-query-value")
 
         value =
-          Ferricstore.Flow.LMDB.encode_query_index_value("flow-query-value", 42, 1_000, state_key)
+          Ferricstore.Flow.LMDB.encode_query_index_value(
+            "query-index",
+            "flow-query-value",
+            42,
+            1_000,
+            state_key
+          )
 
-        assert {:ok, {"flow-query-value", 42, 1_000, ^state_key}} =
+        assert {:ok,
+                {_family_digest, _index_digest, nil, "flow-query-value", 42, 1_000,
+                 ^state_key}} =
                  Ferricstore.Flow.LMDB.decode_query_index_value(value)
 
         obsolete_expiring = :erlang.term_to_binary({"flow-query-value", 43, 2_000})

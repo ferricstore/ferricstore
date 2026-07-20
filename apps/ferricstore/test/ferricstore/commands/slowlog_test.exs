@@ -211,7 +211,7 @@ defmodule Ferricstore.Commands.SlowLogTest do
       end
     end
 
-    test "redacts authentication and configuration secrets before enqueueing" do
+    test "redacts authentication, configuration, and query secrets before enqueueing" do
       original = SlowLog.threshold()
       SlowLog.set_threshold(0)
 
@@ -225,6 +225,17 @@ defmodule Ferricstore.Commands.SlowLogTest do
         100
       )
 
+      SlowLog.maybe_log(
+        [
+          "FLOW.QUERY",
+          "FQL1",
+          "FROM runs WHERE partition_key = 'query-secret' AND run_id = @id RETURN RECORD",
+          "id",
+          "parameter-secret"
+        ],
+        100
+      )
+
       assert :pong = GenServer.call(SlowLog, :ping)
 
       stored = SlowLog.get() |> Enum.map(fn {_id, _ts, _duration, command} -> command end)
@@ -233,9 +244,12 @@ defmodule Ferricstore.Commands.SlowLogTest do
       refute serialized =~ "auth-secret"
       refute serialized =~ "config-secret"
       refute serialized =~ "acl-secret"
+      refute serialized =~ "query-secret"
+      refute serialized =~ "parameter-secret"
       assert ["AUTH", "[redacted]"] in stored
       assert ["CONFIG", "SET", "requirepass", "[redacted]"] in stored
       assert ["ACL", "SETUSER", "alice", "[redacted]"] in stored
+      assert ["FLOW.QUERY", "[redacted]"] in stored
     end
 
     test "bounds stored argument count and bytes" do

@@ -67,6 +67,11 @@ defmodule FerricStore.Instance do
           sync_flush_timeout_ms: non_neg_integer(),
           max_active_file_size: non_neg_integer(),
           apply_context: Ferricstore.Raft.ApplyContext.t(),
+          query_engine: module(),
+          query_capabilities: FerricStore.Flow.QueryEngine.capability_manifest(),
+          query_index_provider: module(),
+          flow_metadata_extension: module(),
+          flow_metadata_snapshot: FerricStore.Flow.MetadataExtension.Snapshot.t(),
           read_sample_rate: non_neg_integer(),
           eviction_policy: atom(),
           max_memory_bytes: non_neg_integer(),
@@ -128,6 +133,11 @@ defmodule FerricStore.Instance do
     :sync_flush_timeout_ms,
     :max_active_file_size,
     :apply_context,
+    :query_engine,
+    :query_capabilities,
+    :query_index_provider,
+    :flow_metadata_extension,
+    :flow_metadata_snapshot,
     :read_sample_rate,
     :eviction_policy,
     :max_memory_bytes,
@@ -154,7 +164,21 @@ defmodule FerricStore.Instance do
     shard_count = Keyword.get(opts, :shard_count, 4)
     data_dir = Keyword.get(opts, :data_dir, "data")
     data_dir_expanded = Path.expand(data_dir)
-    apply_context = Ferricstore.Raft.ApplyContext.from_runtime(opts)
+    query_engine = FerricStore.Flow.QueryEngine.configured_implementation(opts)
+    query_capabilities = FerricStore.Flow.QueryEngine.capabilities_for(query_engine)
+    query_index_provider = FerricStore.Flow.QueryIndexProvider.configured_implementation(opts)
+    flow_metadata_extension = FerricStore.Flow.MetadataExtension.configured_implementation(opts)
+
+    flow_metadata_snapshot =
+      case FerricStore.Flow.MetadataExtension.configure(flow_metadata_extension, opts) do
+        {:ok, snapshot} -> snapshot
+        {:error, reason} -> raise "Flow metadata extension startup failed: #{inspect(reason)}"
+      end
+
+    apply_context =
+      opts
+      |> Ferricstore.Raft.ApplyContext.from_runtime()
+      |> Ferricstore.Raft.ApplyContext.with_flow_metadata(flow_metadata_snapshot)
 
     # Slot map: 1024 slots -> shard indices. Use the shared builder so
     # Router.shard_for/2 and CLUSTER.SLOTS expose the same ownership.
@@ -549,6 +573,11 @@ defmodule FerricStore.Instance do
         ),
       max_active_file_size: Keyword.get(opts, :max_active_file_size, 8 * 1024 * 1024 * 1024),
       apply_context: apply_context,
+      query_engine: query_engine,
+      query_capabilities: query_capabilities,
+      query_index_provider: query_index_provider,
+      flow_metadata_extension: flow_metadata_extension,
+      flow_metadata_snapshot: flow_metadata_snapshot,
       read_sample_rate: Keyword.get(opts, :read_sample_rate, 100),
       eviction_policy: Keyword.get(opts, :eviction_policy, :volatile_lfu),
       max_memory_bytes: max_memory_bytes,

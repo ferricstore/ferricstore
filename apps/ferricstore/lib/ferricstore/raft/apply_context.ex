@@ -38,6 +38,7 @@ defmodule Ferricstore.Raft.ApplyContext do
   @default_max_value_size 1_048_576
   @default_batch_command_apply_budget 20_000
   @default_promotion_threshold 100
+  @empty_flow_metadata_digest <<0::256>>
 
   @flow_command_tags [
     :ferricstore_apply_context_barrier,
@@ -161,7 +162,11 @@ defmodule Ferricstore.Raft.ApplyContext do
             transaction_command_budget: @default_transaction_command_budget,
             transaction_key_apply_budget: @default_transaction_key_apply_budget,
             transaction_result_byte_budget: @default_transaction_result_byte_budget,
-            max_value_size: @default_max_value_size
+            max_value_size: @default_max_value_size,
+            flow_metadata_mode: :dedicated,
+            flow_metadata_generation: 0,
+            flow_metadata_schema_digest: @empty_flow_metadata_digest,
+            flow_metadata_fields: %{}
 
   @type t :: %__MODULE__{
           version: pos_integer(),
@@ -186,15 +191,14 @@ defmodule Ferricstore.Raft.ApplyContext do
           transaction_command_budget: pos_integer(),
           transaction_key_apply_budget: pos_integer(),
           transaction_result_byte_budget: pos_integer(),
-          max_value_size: pos_integer()
+          max_value_size: pos_integer(),
+          flow_metadata_mode: :dedicated | :shared,
+          flow_metadata_generation: non_neg_integer(),
+          flow_metadata_schema_digest: <<_::256>>,
+          flow_metadata_fields: %{optional(non_neg_integer()) => map()}
         }
 
-  @type encoded ::
-          {:ferricstore_apply_context_v1, pos_integer(), non_neg_integer(), pos_integer(),
-           pos_integer(), pos_integer(), pos_integer(), pos_integer(), pos_integer(),
-           pos_integer(), boolean(), non_neg_integer(), non_neg_integer(), non_neg_integer(),
-           non_neg_integer(), pos_integer(), non_neg_integer(), pos_integer(), pos_integer(),
-           pos_integer(), pos_integer(), pos_integer(), pos_integer()}
+  @type encoded :: tuple()
 
   @spec default() :: t()
   def default, do: new([])
@@ -203,6 +207,8 @@ defmodule Ferricstore.Raft.ApplyContext do
   def new(values) when is_map(values), do: values |> Map.to_list() |> new()
 
   def new(values) when is_list(values) do
+    flow_metadata = normalize_flow_metadata!(values)
+
     max_history =
       values
       |> Keyword.get(:flow_max_history_max_events, @default_max_history_max_events)
@@ -360,7 +366,33 @@ defmodule Ferricstore.Raft.ApplyContext do
         values
         |> Keyword.get(:max_value_size, @default_max_value_size)
         |> positive(@default_max_value_size)
-        |> min(@max_value_size)
+        |> min(@max_value_size),
+      flow_metadata_mode: flow_metadata.mode,
+      flow_metadata_generation: flow_metadata.generation,
+      flow_metadata_schema_digest: flow_metadata.schema_digest,
+      flow_metadata_fields: flow_metadata.fields
+    }
+  end
+
+  @spec with_flow_metadata(t(), FerricStore.Flow.MetadataExtension.Snapshot.t()) :: t()
+  def with_flow_metadata(
+        %__MODULE__{} = context,
+        %FerricStore.Flow.MetadataExtension.Snapshot{} = snapshot
+      ) do
+    flow_metadata =
+      normalize_flow_metadata!(
+        flow_metadata_mode: snapshot.mode,
+        flow_metadata_generation: snapshot.generation,
+        flow_metadata_schema_digest: snapshot.schema_digest,
+        flow_metadata_fields: canonical_flow_metadata_fields(snapshot.fields)
+      )
+
+    %{
+      context
+      | flow_metadata_mode: flow_metadata.mode,
+        flow_metadata_generation: flow_metadata.generation,
+        flow_metadata_schema_digest: flow_metadata.schema_digest,
+        flow_metadata_fields: flow_metadata.fields
     }
   end
 
@@ -370,7 +402,13 @@ defmodule Ferricstore.Raft.ApplyContext do
 
     __struct__()
     |> Map.from_struct()
-    |> Map.delete(:version)
+    |> Map.drop([
+      :version,
+      :flow_metadata_mode,
+      :flow_metadata_generation,
+      :flow_metadata_schema_digest,
+      :flow_metadata_fields
+    ])
     |> Map.keys()
     |> Enum.reduce(overrides, fn key, acc ->
       if Keyword.has_key?(acc, key) do
@@ -399,7 +437,7 @@ defmodule Ferricstore.Raft.ApplyContext do
      context.promotion_threshold, context.batch_command_apply_budget,
      context.compound_member_apply_budget, context.transaction_command_budget,
      context.transaction_key_apply_budget, context.transaction_result_byte_budget,
-     context.max_value_size}
+     context.max_value_size, encode_flow_metadata(context)}
   end
 
   @spec decode(term()) :: {:ok, t()} | {:error, :invalid_apply_context}
@@ -409,8 +447,11 @@ defmodule Ferricstore.Raft.ApplyContext do
          hibernation_enabled, hot_window_ms, safety_margin_ms, promote_window_ms,
          late_promote_window_ms, flow_max_batch_items, promotion_threshold,
          batch_command_apply_budget, compound_member_apply_budget, transaction_command_budget,
-         transaction_key_apply_budget, transaction_result_byte_budget, max_value_size} = encoded
+         transaction_key_apply_budget, transaction_result_byte_budget, max_value_size,
+         encoded_flow_metadata} = encoded
       ) do
+    flow_metadata = decode_flow_metadata!(encoded_flow_metadata)
+
     context =
       new(
         flow_default_retention_ttl_ms: retention_ttl_ms,
@@ -434,7 +475,11 @@ defmodule Ferricstore.Raft.ApplyContext do
         transaction_command_budget: transaction_command_budget,
         transaction_key_apply_budget: transaction_key_apply_budget,
         transaction_result_byte_budget: transaction_result_byte_budget,
-        max_value_size: max_value_size
+        max_value_size: max_value_size,
+        flow_metadata_mode: flow_metadata.mode,
+        flow_metadata_generation: flow_metadata.generation,
+        flow_metadata_schema_digest: flow_metadata.schema_digest,
+        flow_metadata_fields: flow_metadata.fields
       )
 
     if encode(context) == encoded do
@@ -442,6 +487,8 @@ defmodule Ferricstore.Raft.ApplyContext do
     else
       {:error, :invalid_apply_context}
     end
+  rescue
+    ArgumentError -> {:error, :invalid_apply_context}
   end
 
   def decode(_invalid), do: {:error, :invalid_apply_context}
@@ -741,6 +788,104 @@ defmodule Ferricstore.Raft.ApplyContext do
 
   defp tuple_has_flow_command?(term, index, size) do
     nested_flow_command?(elem(term, index)) or tuple_has_flow_command?(term, index + 1, size)
+  end
+
+  defp canonical_flow_metadata_fields(fields) when is_map(fields) do
+    Map.new(fields, fn {id, field} ->
+      {id, Map.take(field, [:version, :type, :role, :required_in])}
+    end)
+  end
+
+  defp encode_flow_metadata(%__MODULE__{
+         flow_metadata_mode: :dedicated,
+         flow_metadata_generation: 0,
+         flow_metadata_fields: fields
+       })
+       when map_size(fields) == 0,
+       do: nil
+
+  defp encode_flow_metadata(%__MODULE__{} = context) do
+    {context.flow_metadata_mode, context.flow_metadata_generation,
+     context.flow_metadata_schema_digest,
+     context.flow_metadata_fields |> Enum.sort_by(&elem(&1, 0))}
+  end
+
+  defp decode_flow_metadata!(nil) do
+    %{
+      mode: :dedicated,
+      generation: 0,
+      schema_digest: @empty_flow_metadata_digest,
+      fields: %{}
+    }
+  end
+
+  defp decode_flow_metadata!({mode, generation, schema_digest, fields}) do
+    normalize_flow_metadata!(
+      flow_metadata_mode: mode,
+      flow_metadata_generation: generation,
+      flow_metadata_schema_digest: schema_digest,
+      flow_metadata_fields: fields
+    )
+  end
+
+  defp decode_flow_metadata!(_invalid),
+    do: raise(ArgumentError, "invalid Flow metadata apply context")
+
+  defp normalize_flow_metadata!(values) do
+    mode = Keyword.get(values, :flow_metadata_mode, :dedicated)
+    generation = Keyword.get(values, :flow_metadata_generation, 0)
+    schema_digest = Keyword.get(values, :flow_metadata_schema_digest, @empty_flow_metadata_digest)
+    raw_fields = Keyword.get(values, :flow_metadata_fields, %{})
+
+    with true <- mode in [:dedicated, :shared],
+         true <-
+           is_integer(generation) and generation >= 0 and generation <= 0xFFFF_FFFF_FFFF_FFFF,
+         true <- is_binary(schema_digest) and byte_size(schema_digest) == 32,
+         {:ok, fields} <- normalize_flow_metadata_fields(raw_fields),
+         true <- valid_flow_metadata_fields?(fields),
+         true <- mode == :dedicated or shared_scope_field?(fields) do
+      %{
+        mode: mode,
+        generation: generation,
+        schema_digest: schema_digest,
+        fields: fields
+      }
+    else
+      _invalid -> raise ArgumentError, "invalid Flow metadata apply context"
+    end
+  end
+
+  defp normalize_flow_metadata_fields(fields) when is_map(fields) and map_size(fields) <= 16,
+    do: {:ok, fields}
+
+  defp normalize_flow_metadata_fields(fields) when is_list(fields) and length(fields) <= 16 do
+    normalized = Map.new(fields)
+
+    if map_size(normalized) == length(fields),
+      do: {:ok, normalized},
+      else: :error
+  end
+
+  defp normalize_flow_metadata_fields(_fields), do: :error
+
+  defp valid_flow_metadata_fields?(fields) do
+    Enum.all?(fields, fn
+      {id, %{version: version, type: type, role: role, required_in: required_in}}
+      when is_integer(id) and id > 0 and id <= 0xFFFF and is_integer(version) and version > 0 and
+             type in [:uint64, :int64, :keyword, :boolean, :datetime] and
+             role in [:isolation_scope, :system_metadata] and
+             required_in in [:shared, :always, :optional] ->
+        true
+
+      _invalid ->
+        false
+    end)
+  end
+
+  defp shared_scope_field?(fields) do
+    Enum.any?(fields, fn {_id, field} ->
+      field.role == :isolation_scope and field.required_in in [:shared, :always]
+    end)
   end
 
   defp positive(value, _default) when is_integer(value) and value > 0, do: value

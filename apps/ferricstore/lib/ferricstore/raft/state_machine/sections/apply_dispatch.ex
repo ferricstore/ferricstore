@@ -2299,7 +2299,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         with :ok <- validate_server_catalog_expected(expected_encoded),
              :ok <- validate_server_catalog_revision(expected_revision),
              {:ok, key, revision_key, count_key, encoded, revision} <-
-               encode_server_catalog_mutation(meta, state, namespace, subject, value) do
+               encode_server_catalog_mutation(
+                 meta,
+                 namespace,
+                 subject,
+                 expected_encoded,
+                 expected_revision,
+                 value
+               ) do
           with_pending_writes(state, fn ->
             apply_server_catalog_cas(
               state,
@@ -2385,7 +2392,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         if current_revision != expected_revision do
           {:error, :stale_server_catalog_revision}
         else
-          version = server_catalog_version(meta, state)
+          version = server_catalog_version(meta, nil, current_revision)
           revision = Ferricstore.ServerCatalog.encode_revision(version)
 
           with {:ok, current_count} <-
@@ -2608,8 +2615,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end
       end
 
-      defp encode_server_catalog_mutation(meta, state, namespace, subject, value) do
-        version = server_catalog_version(meta, state)
+      defp encode_server_catalog_mutation(
+             meta,
+             namespace,
+             subject,
+             expected_encoded,
+             expected_revision,
+             value
+           ) do
+        version = server_catalog_version(meta, expected_encoded, expected_revision)
 
         {:ok, Ferricstore.ServerCatalog.entry_key(namespace, subject),
          Ferricstore.ServerCatalog.revision_key(namespace),
@@ -2620,11 +2634,31 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         ArgumentError -> {:error, :invalid_server_catalog_mutation}
       end
 
-      defp server_catalog_version(meta, state) do
+      defp server_catalog_version(meta, encoded_entry, encoded_revision) do
+        next_durable_version =
+          max(
+            server_catalog_entry_version(encoded_entry),
+            server_catalog_revision_version(encoded_revision)
+          ) + 1
+
         case Map.get(meta, :index) do
-          index when is_integer(index) and index >= 0 -> index
-          _missing -> Map.get(state, :applied_count, 0) + 1
+          index when is_integer(index) and index > 0 -> max(index, next_durable_version)
+          _missing -> next_durable_version
         end
+      end
+
+      defp server_catalog_entry_version(nil), do: 0
+
+      defp server_catalog_entry_version(encoded) do
+        {:ok, %{version: version}} = Ferricstore.ServerCatalog.decode_entry(encoded)
+        version
+      end
+
+      defp server_catalog_revision_version(nil), do: 0
+
+      defp server_catalog_revision_version(encoded) do
+        {:ok, version} = Ferricstore.ServerCatalog.decode_revision(encoded)
+        version
       end
 
       def apply(

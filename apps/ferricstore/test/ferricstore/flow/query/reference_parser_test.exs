@@ -1,0 +1,417 @@
+defmodule Ferricstore.Flow.Query.ReferenceParserTest do
+  use ExUnit.Case, async: true
+
+  alias Ferricstore.Flow.Query.{Binder, ReferenceParser, Request}
+  alias Ferricstore.Store.Router
+
+  describe "parse/1" do
+    test "parses the bounded run point-read shape" do
+      assert {:ok,
+              %Request{
+                version: 1,
+                mode: :execute,
+                source: :runs,
+                predicate:
+                  {:and,
+                   [
+                     {:eq, :partition_key, {:literal, :keyword, "tenant-a"}},
+                     {:eq, :run_id, {:literal, :keyword, "run-123"}}
+                   ]},
+                order_by: [],
+                limit: 1,
+                return: :record
+              }} =
+               ReferenceParser.parse(
+                 "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'run-123' RETURN RECORD"
+               )
+    end
+
+    test "parses a run-id point read that uses the canonical auto partition" do
+      assert {:ok,
+              %Request{
+                source: :runs,
+                predicate: {:and, [{:eq, :run_id, {:literal, :keyword, "run-auto"}}]},
+                order_by: [],
+                limit: 1,
+                return: :record
+              }} = ReferenceParser.parse("FROM runs WHERE run_id = 'run-auto' RETURN RECORD")
+    end
+
+    test "parses bounded direct event history" do
+      query =
+        "FROM events WHERE run_id = @run_id " <>
+          "ORDER BY event_id DESC LIMIT 25 RETURN RECORDS"
+
+      assert {:ok,
+              %Request{
+                source: :events,
+                predicate: {:and, [{:eq, :run_id, {:parameter, :keyword, "run_id"}}]},
+                order_by: [{:event_id, :desc}],
+                limit: 25,
+                return: :record
+              }} = ReferenceParser.parse(query)
+    end
+
+    test "parses a partition-contained parent lineage query" do
+      query =
+        "FROM runs WHERE partition_key = @partition AND parent_flow_id = @parent " <>
+          "ORDER BY updated_at_ms DESC LIMIT 25 RETURN RECORDS"
+
+      assert {:ok,
+              %Request{
+                source: :runs,
+                predicate:
+                  {:and,
+                   [
+                     {:eq, :partition_key, {:parameter, :keyword, "partition"}},
+                     {:eq, :parent_flow_id, {:parameter, :keyword, "parent"}}
+                   ]},
+                order_by: [{:updated_at_ms, :desc}],
+                limit: 25,
+                return: :record
+              }} = ReferenceParser.parse(query)
+    end
+
+    test "normalizes keywords and supports a trailing semicolon" do
+      assert {:ok,
+              %Request{
+                predicate:
+                  {:and,
+                   [
+                     {:eq, :partition_key, {:literal, :keyword, "partition"}},
+                     {:eq, :run_id, {:literal, :keyword, "Run''42"}}
+                   ]}
+              }} =
+               ReferenceParser.parse(
+                 "from RUNS where RUN_ID = 'Run''''42' and PARTITION_KEY = 'partition' return record;"
+               )
+    end
+
+    test "parses EXPLAIN and named parameters without binding values" do
+      assert {:ok,
+              %Request{
+                mode: :explain,
+                predicate:
+                  {:and,
+                   [
+                     {:eq, :partition_key, {:parameter, :keyword, "partition"}},
+                     {:eq, :run_id, {:parameter, :keyword, "flow_id"}}
+                   ]}
+              }} =
+               ReferenceParser.parse(
+                 "EXPLAIN FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
+               )
+    end
+
+    test "parses bounded collection equality, IN, time window, order, and limit" do
+      query =
+        "FROM runs WHERE partition_key = @tenant " <>
+          "AND state IN ('failed', 'completed') " <>
+          "AND updated_at_ms FROM @from TO @until " <>
+          "ORDER BY updated_at_ms DESC LIMIT 25 RETURN RECORDS"
+
+      assert {:ok,
+              %Request{
+                mode: :execute,
+                predicate:
+                  {:and,
+                   [
+                     {:eq, :partition_key, {:parameter, :keyword, "tenant"}},
+                     {:in, :state,
+                      [
+                        {:literal, :keyword, "failed"},
+                        {:literal, :keyword, "completed"}
+                      ]},
+                     {:time_window, :updated_at_ms, {:parameter, :integer, "from"},
+                      {:parameter, :integer, "until"}}
+                   ]},
+                order_by: [{:updated_at_ms, :desc}],
+                limit: 25,
+                return: :record
+              }} = ReferenceParser.parse(query)
+    end
+
+    test "parses an optional parameterized collection cursor" do
+      query =
+        "FROM runs WHERE partition_key = @tenant " <>
+          "ORDER BY updated_at_ms DESC LIMIT 25 " <>
+          "CURSOR @page RETURN RECORDS"
+
+      assert {:ok,
+              %Request{
+                cursor: {:parameter, :keyword, "page"},
+                limit: 25,
+                order_by: [{:updated_at_ms, :desc}]
+              }} = ReferenceParser.parse(query)
+
+      assert {:error, :unsupported_query_shape} =
+               ReferenceParser.parse(
+                 "FROM runs WHERE partition_key = @tenant ORDER BY run_id ASC LIMIT 10 " <>
+                   "CURSOR 'token-in-query-text' RETURN RECORDS"
+               )
+
+      assert {:error, :unsupported_query_shape} =
+               ReferenceParser.parse(
+                 "FROM runs WHERE partition_key = @tenant AND run_id = @id " <>
+                   "CURSOR @page RETURN RECORD"
+               )
+    end
+
+    test "parses inclusive ranges and explicit null or missing predicates" do
+      for {syntax, expected} <- [
+            {"priority BETWEEN 1 AND 5", {:range, :priority, integer(1), integer(5)}},
+            {"attribute.region IS NULL", {:is, {:attribute, "region"}, :null}},
+            {"attribute.region IS MISSING", {:is, {:attribute, "region"}, :missing}}
+          ] do
+        query =
+          "EXPLAIN FROM runs WHERE partition_key = 'tenant-a' AND #{syntax} " <>
+            "ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS;"
+
+        assert {:ok, %Request{mode: :explain, predicate: {:and, [_tenant, ^expected]}}} =
+                 ReferenceParser.parse(query)
+      end
+    end
+
+    test "parses a bounded scalar count without row ordering or pagination" do
+      query =
+        "EXPLAIN FROM runs WHERE partition_key = @partition " <>
+          "AND type = 'payment' AND state = 'failed' RETURN COUNT;"
+
+      assert {:ok,
+              %Request{
+                mode: :explain,
+                source: :runs,
+                predicate:
+                  {:and,
+                   [
+                     {:eq, :partition_key, {:parameter, :keyword, "partition"}},
+                     {:eq, :type, {:literal, :keyword, "payment"}},
+                     {:eq, :state, {:literal, :keyword, "failed"}}
+                   ]},
+                order_by: [],
+                limit: nil,
+                cursor: nil,
+                return: :count
+              }} = ReferenceParser.parse(query)
+
+      for invalid <- [
+            "FROM events WHERE partition_key = 'p' RETURN COUNT",
+            "FROM runs WHERE partition_key = 'p' ORDER BY updated_at_ms DESC LIMIT 1 RETURN COUNT",
+            "FROM runs WHERE partition_key = 'p' LIMIT 1 RETURN COUNT",
+            "FROM runs WHERE partition_key = 'p' CURSOR @page RETURN COUNT"
+          ] do
+        assert {:error, :unsupported_query_shape} = ReferenceParser.parse(invalid)
+      end
+    end
+
+    test "rejects collection queries without explicit bounds or malformed IN lists" do
+      for query <- [
+            "FROM runs WHERE partition_key = 'tenant-a' RETURN RECORDS",
+            "FROM runs WHERE partition_key = 'tenant-a' LIMIT 10 RETURN RECORDS",
+            "FROM runs WHERE partition_key = 'tenant-a' AND state IN () LIMIT 10 RETURN RECORDS",
+            "FROM runs WHERE partition_key = 'tenant-a' AND state IN ('a',) LIMIT 10 RETURN RECORDS"
+          ] do
+        assert {:error, :unsupported_query_shape} = ReferenceParser.parse(query)
+      end
+    end
+
+    test "rejects unbounded and unsupported query shapes" do
+      assert {:error, :unsupported_query_shape} =
+               ReferenceParser.parse("FROM runs RETURN RECORDS")
+
+      assert {:error, :unsupported_field} =
+               ReferenceParser.parse(
+                 "FROM runs WHERE tenant_ref = 'forged' AND run_id = 'one' RETURN RECORD"
+               )
+
+      assert {:error, :unsupported_query_shape} =
+               ReferenceParser.parse(
+                 "FROM runs WHERE partition_key = 'p' OR run_id = 'two' RETURN RECORD"
+               )
+    end
+
+    test "rejects oversized input before tokenization" do
+      query =
+        "FROM runs WHERE partition_key = 'p' AND run_id = '" <>
+          String.duplicate("x", 16_385) <> "' RETURN RECORD"
+
+      assert {:error, :query_too_large} = ReferenceParser.parse(query)
+    end
+
+    test "rejects huge integer literals without constructing an unbounded integer" do
+      query =
+        "FROM runs WHERE partition_key = 'tenant-a' AND priority BETWEEN " <>
+          String.duplicate("9", 8_000) <>
+          " AND 9 ORDER BY run_id ASC LIMIT 1 RETURN RECORDS"
+
+      assert {:error, :invalid_parameter_type} = ReferenceParser.parse(query)
+    end
+  end
+
+  describe "bind/2" do
+    test "binds a named keyword parameter" do
+      {:ok, request} =
+        ReferenceParser.parse(
+          "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
+        )
+
+      assert {:ok,
+              %Request{
+                predicate:
+                  {:and,
+                   [
+                     {:eq, :partition_key, {:literal, :keyword, "tenant-a"}},
+                     {:eq, :run_id, {:literal, :keyword, "run-123"}}
+                   ]}
+              }} =
+               Binder.bind(request, %{"partition" => "tenant-a", "flow_id" => "run-123"})
+    end
+
+    test "binds repeated, mixed, and literal-only values exactly" do
+      {:ok, repeated} =
+        ReferenceParser.parse(
+          "FROM runs WHERE partition_key = @id AND run_id = @id RETURN RECORD"
+        )
+
+      assert {:ok,
+              %Request{
+                predicate:
+                  {:and,
+                   [
+                     {:eq, :partition_key, {:literal, :keyword, "same"}},
+                     {:eq, :run_id, {:literal, :keyword, "same"}}
+                   ]}
+              }} = Binder.bind(repeated, %{"id" => "same"})
+
+      {:ok, mixed} =
+        ReferenceParser.parse(
+          "FROM runs WHERE partition_key = 'tenant-a' AND run_id = @id RETURN RECORD"
+        )
+
+      assert {:ok, _bound} = Binder.bind(mixed, %{"id" => "run-123"})
+
+      {:ok, literals} =
+        ReferenceParser.parse(
+          "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'run-123' RETURN RECORD"
+        )
+
+      assert {:ok, ^literals} = Binder.bind(literals, %{})
+      assert {:error, :unexpected_parameter} = Binder.bind(literals, %{"unused" => "secret"})
+    end
+
+    test "fails closed on missing, mistyped, and unused parameters" do
+      {:ok, request} =
+        ReferenceParser.parse(
+          "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
+        )
+
+      assert {:error, :missing_parameter} = Binder.bind(request, %{})
+
+      assert {:error, :invalid_parameter_type} =
+               Binder.bind(request, %{"partition" => "tenant-a", "flow_id" => 123})
+
+      assert {:error, :unexpected_parameter} =
+               Binder.bind(request, %{
+                 "partition" => "tenant-a",
+                 "flow_id" => "run-123",
+                 "unused" => "secret"
+               })
+
+      assert {:error, :invalid_parameters} =
+               Binder.bind(request, %{partition: "tenant-a", flow_id: "run-123"})
+    end
+
+    test "rejects unsupported canonical predicates without raising" do
+      request = %Request{
+        mode: :execute,
+        source: :runs,
+        predicate: {:and, [{:eq, :run_id, {:parameter, :keyword, "flow_id"}}]},
+        order_by: [],
+        limit: 1,
+        return: :payload
+      }
+
+      assert {:error, :unsupported_query_shape} =
+               Binder.bind(request, %{"flow_id" => "run-123"})
+    end
+
+    test "rejects malformed canonical envelopes before binding" do
+      {:ok, request} =
+        ReferenceParser.parse(
+          "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
+        )
+
+      params = %{"partition" => "tenant-a", "flow_id" => "run-123"}
+
+      assert {:error, :unsupported_query_shape} =
+               Binder.bind(%{request | source: :events}, params)
+
+      for malformed <- [
+            %{request | mode: :invalid},
+            %{request | order_by: [{:run_id, :asc}]},
+            %{request | limit: 2},
+            %{request | return: :payload}
+          ] do
+        assert {:error, :unsupported_query_shape} = Binder.bind(malformed, params)
+      end
+    end
+
+    test "rejects malformed canonical values without raising" do
+      request =
+        Request.point_read(
+          :execute,
+          {:parameter, :keyword, 123},
+          {:literal, :keyword, "run-123"}
+        )
+
+      assert {:error, :invalid_parameter_type} = Binder.bind(request, %{})
+    end
+
+    test "rejects oversized bound values before planning" do
+      {:ok, request} =
+        ReferenceParser.parse(
+          "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
+        )
+
+      oversized = String.duplicate("x", Router.max_key_size() + 1)
+
+      assert {:error, :query_value_too_large} =
+               Binder.bind(request, %{"partition" => oversized, "flow_id" => "run-123"})
+
+      assert {:error, :query_value_too_large} =
+               Binder.bind(request, %{"partition" => "tenant-a", "flow_id" => oversized})
+    end
+
+    test "accepts exact storage-key boundaries and rejects the next byte" do
+      {:ok, request} =
+        ReferenceParser.parse(
+          "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
+        )
+
+      state_key_overhead = byte_size("f:{f:" <> String.duplicate("x", 43) <> "}:s:")
+      max_run_id_bytes = Router.max_key_size() - state_key_overhead
+      max_partition = String.duplicate("p", Router.max_key_size())
+      max_run_id = String.duplicate("r", max_run_id_bytes)
+
+      assert {:ok, _bound} =
+               Binder.bind(request, %{"partition" => max_partition, "flow_id" => "r"})
+
+      assert {:ok, _bound} =
+               Binder.bind(request, %{"partition" => "p", "flow_id" => max_run_id})
+
+      assert {:error, :query_value_too_large} =
+               Binder.bind(request, %{
+                 "partition" => max_partition <> "p",
+                 "flow_id" => "r"
+               })
+
+      assert {:error, :query_value_too_large} =
+               Binder.bind(request, %{
+                 "partition" => "p",
+                 "flow_id" => max_run_id <> "r"
+               })
+    end
+  end
+
+  defp integer(value), do: {:literal, :integer, value}
+end

@@ -9,9 +9,17 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   @max_lane_key_bytes 1_048_576
   @max_lane_member_bytes 65_551
   @active_reverse_tag :flow_active_reverse
+  @max_raw_index_component_bytes 128
+  @max_raw_identity_component_bytes 256
+  @digest_component_tag <<0xFF, 0x01>>
+  @query_index_key_tag <<0xFE, ?q>>
+  @query_index_value_tag :flow_query_index
+  @query_index_markers ["}:i:a:", "}:i:at:", "}:i:as:", "}:i:ap:", "}:i:sm:"]
+  @max_query_discovery_component_bytes 1_024
 
   def terminal_index_prefix(state_index_key) when is_binary(state_index_key) do
-    "flow-terminal-index:" <> state_index_key <> <<0>>
+    "flow-terminal-index:" <>
+      bounded_component(state_index_key, @max_raw_index_component_bytes) <> <<0>>
   end
 
   def terminal_index_global_prefix, do: "flow-terminal-index:"
@@ -19,7 +27,7 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   def terminal_index_key(state_index_key, id, updated_at_ms)
       when is_binary(state_index_key) and is_binary(id) and is_integer(updated_at_ms) and
              updated_at_ms >= 0 and updated_at_ms <= @max_u64 do
-    terminal_index_prefix(state_index_key) <> pad_u64(updated_at_ms) <> <<0>> <> id
+    ordered_index_key(terminal_index_prefix(state_index_key), id, updated_at_ms)
   end
 
   def terminal_index_key(_state_index_key, _id, _updated_at_ms),
@@ -29,7 +37,8 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
     do: ordered_index_entry_key?(key, terminal_index_global_prefix(), id, updated_at_ms)
 
   def terminal_count_key(state_index_key) when is_binary(state_index_key) do
-    "flow-terminal-count:" <> state_index_key
+    "flow-terminal-count:" <>
+      bounded_component(state_index_key, @max_raw_index_component_bytes)
   end
 
   def terminal_count_prefix, do: "flow-terminal-count:"
@@ -39,7 +48,9 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   def terminal_expire_key(expire_at_ms, terminal_key)
       when is_integer(expire_at_ms) and expire_at_ms > 0 and expire_at_ms <= @max_u64 and
              is_binary(terminal_key) do
-    terminal_expire_prefix() <> pad_u64(expire_at_ms) <> <<0>> <> terminal_key
+    terminal_expire_prefix() <>
+      pad_u64(expire_at_ms) <>
+      <<0>> <> bounded_component(terminal_key, @max_raw_identity_component_bytes)
   end
 
   def terminal_expire_key(0, terminal_key) when is_binary(terminal_key), do: nil
@@ -48,7 +59,8 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
     do: raise(ArgumentError, "terminal expiration must be an unsigned 64-bit integer")
 
   def terminal_by_state_key_key(state_key) when is_binary(state_key) do
-    "flow-terminal-by-state:" <> state_key
+    "flow-terminal-by-state:" <>
+      bounded_component(state_key, @max_raw_identity_component_bytes)
   end
 
   def terminal_by_state_global_prefix, do: "flow-terminal-by-state:"
@@ -56,13 +68,14 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   def active_index_global_prefix, do: "flow-active-index:"
 
   def active_index_prefix(index_key) when is_binary(index_key) do
-    active_index_global_prefix() <> index_key <> <<0>>
+    active_index_global_prefix() <>
+      bounded_component(index_key, @max_raw_index_component_bytes) <> <<0>>
   end
 
   def active_index_key(index_key, id, score)
       when is_binary(index_key) and is_binary(id) and is_integer(score) and score >= 0 and
              score <= @max_u64 do
-    active_index_prefix(index_key) <> pad_u64(score) <> <<0>> <> id
+    ordered_index_key(active_index_prefix(index_key), id, score)
   end
 
   def active_index_key(_index_key, _id, _score),
@@ -76,7 +89,8 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   def active_index_entry_key?(_key, _index_key, _id, _score), do: false
 
   def active_by_state_key_key(state_key) when is_binary(state_key) do
-    "flow-active-by-state:" <> state_key
+    "flow-active-by-state:" <>
+      bounded_component(state_key, @max_raw_identity_component_bytes)
   end
 
   def active_by_state_global_prefix, do: "flow-active-by-state:"
@@ -84,33 +98,70 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   def query_index_global_prefix, do: "flow-query-index:"
 
   def query_index_raw_prefix(index_key_prefix) when is_binary(index_key_prefix) do
-    query_index_global_prefix() <> index_key_prefix
+    query_index_global_prefix() <> @query_index_key_tag <> digest(index_key_prefix)
   end
 
   def query_index_prefix(index_key) when is_binary(index_key) do
-    query_index_raw_prefix(index_key) <> <<0>>
+    index_key
+    |> query_index_descriptor()
+    |> query_index_prefix_from_descriptor()
   end
 
   def query_index_key(index_key, id, updated_at_ms)
       when is_binary(index_key) and is_binary(id) and is_integer(updated_at_ms) and
              updated_at_ms >= 0 and updated_at_ms <= @max_u64 do
-    query_index_prefix(index_key) <> pad_u64(updated_at_ms) <> <<0>> <> id
+    index_key
+    |> query_index_descriptor()
+    |> query_index_key_from_descriptor(id, updated_at_ms)
   end
 
   def query_index_key(_index_key, _id, _updated_at_ms),
     do: raise(ArgumentError, "query index time must be an unsigned 64-bit integer")
 
-  def query_index_entry_key?(key, id, updated_at_ms),
-    do: ordered_index_entry_key?(key, query_index_global_prefix(), id, updated_at_ms)
+  def query_index_entry_key?(key, family_digest, index_digest, id, updated_at_ms)
+      when is_binary(key) and is_binary(family_digest) and byte_size(family_digest) == 32 and
+             is_binary(index_digest) and byte_size(index_digest) == 32 and is_binary(id) and
+             is_integer(updated_at_ms) and updated_at_ms >= 0 and updated_at_ms <= @max_u64 do
+    key ==
+      query_index_key_from_digests(family_digest, index_digest, id, updated_at_ms)
+  end
+
+  def query_index_entry_key?(_key, _family_digest, _index_digest, _id, _updated_at_ms),
+    do: false
+
+  def query_index_entry(index_key, id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil)
+
+  def query_index_entry(index_key, id, updated_at_ms, expire_at_ms, state_key)
+      when is_binary(index_key) and is_binary(id) and is_integer(updated_at_ms) and
+             updated_at_ms >= 0 and updated_at_ms <= @max_u64 and is_integer(expire_at_ms) and
+             expire_at_ms >= 0 and expire_at_ms <= @max_u64 and
+             (is_binary(state_key) or is_nil(state_key)) do
+    descriptor = query_index_descriptor(index_key)
+
+    {
+      query_index_key_from_descriptor(descriptor, id, updated_at_ms),
+      encode_query_index_value_from_descriptor(
+        descriptor,
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key
+      )
+    }
+  end
+
+  def query_index_entry(_index_key, _id, _updated_at_ms, _expire_at_ms, _state_key),
+    do: raise(ArgumentError, "query index fields are invalid")
 
   def history_index_prefix(history_key) when is_binary(history_key) do
-    "flow-history-index:" <> history_key <> <<0>>
+    "flow-history-index:" <>
+      bounded_component(history_key, @max_raw_index_component_bytes) <> <<0>>
   end
 
   def history_index_key(history_key, event_id, event_ms)
       when is_binary(history_key) and is_binary(event_id) and is_integer(event_ms) and
              event_ms >= 0 and event_ms <= @max_u64 do
-    history_index_prefix(history_key) <> pad_u64(event_ms) <> <<0>> <> event_id
+    ordered_index_key(history_index_prefix(history_key), event_id, event_ms)
   end
 
   def history_index_key(_history_key, _event_id, _event_ms),
@@ -128,7 +179,9 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   def history_expire_key(expire_at_ms, history_index_key)
       when is_integer(expire_at_ms) and expire_at_ms > 0 and expire_at_ms <= @max_u64 and
              is_binary(history_index_key) do
-    history_expire_prefix() <> pad_u64(expire_at_ms) <> <<0>> <> history_index_key
+    history_expire_prefix() <>
+      pad_u64(expire_at_ms) <>
+      <<0>> <> bounded_component(history_index_key, @max_raw_identity_component_bytes)
   end
 
   def history_expire_key(0, history_index_key) when is_binary(history_index_key), do: nil
@@ -139,7 +192,9 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   def history_flow_expire_key(expire_at_ms, history_key)
       when is_integer(expire_at_ms) and expire_at_ms > 0 and expire_at_ms <= @max_u64 and
              is_binary(history_key) do
-    history_flow_expire_prefix() <> pad_u64(expire_at_ms) <> <<0>> <> history_key
+    history_flow_expire_prefix() <>
+      pad_u64(expire_at_ms) <>
+      <<0>> <> bounded_component(history_key, @max_raw_identity_component_bytes)
   end
 
   def history_flow_expire_key(0, history_key) when is_binary(history_key), do: nil
@@ -227,16 +282,24 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
     _ -> :error
   end
 
-  def encode_query_index_value(id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil)
+  def encode_query_index_value(index_key, id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil)
 
-  def encode_query_index_value(id, updated_at_ms, expire_at_ms, state_key)
-      when is_binary(id) and is_integer(updated_at_ms) and updated_at_ms >= 0 and
+  def encode_query_index_value(index_key, id, updated_at_ms, expire_at_ms, state_key)
+      when is_binary(index_key) and is_binary(id) and is_integer(updated_at_ms) and
+             updated_at_ms >= 0 and
              updated_at_ms <= @max_u64 and is_integer(expire_at_ms) and expire_at_ms >= 0 and
              expire_at_ms <= @max_u64 and (is_binary(state_key) or is_nil(state_key)) do
-    TermCodec.encode({id, updated_at_ms, expire_at_ms, state_key})
+    index_key
+    |> query_index_descriptor()
+    |> encode_query_index_value_from_descriptor(
+      id,
+      updated_at_ms,
+      expire_at_ms,
+      state_key
+    )
   end
 
-  def encode_query_index_value(_id, _updated_at_ms, _expire_at_ms, _state_key),
+  def encode_query_index_value(_index_key, _id, _updated_at_ms, _expire_at_ms, _state_key),
     do: raise(ArgumentError, "query index fields are invalid")
 
   def encode_active_index_value(index_key, id, score, expire_at_ms, state_key)
@@ -418,12 +481,21 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
 
   def decode_query_index_value(blob) when is_binary(blob) do
     case TermCodec.decode(blob) do
-      {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
-      when is_binary(id) and is_integer(updated_at_ms) and updated_at_ms >= 0 and
+      {:ok,
+       {@query_index_value_tag, family_digest, index_digest, discovery_component, id,
+        updated_at_ms, expire_at_ms, state_key}}
+      when is_binary(family_digest) and byte_size(family_digest) == 32 and
+             is_binary(index_digest) and byte_size(index_digest) == 32 and
+             (is_nil(discovery_component) or
+                (is_binary(discovery_component) and
+                   byte_size(discovery_component) <= @max_query_discovery_component_bytes)) and
+             is_binary(id) and is_integer(updated_at_ms) and updated_at_ms >= 0 and
              updated_at_ms <= @max_u64 and is_integer(expire_at_ms) and expire_at_ms >= 0 and
              expire_at_ms <= @max_u64 and
              (is_binary(state_key) or is_nil(state_key)) ->
-        {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
+        {:ok,
+         {family_digest, index_digest, discovery_component, id, updated_at_ms, expire_at_ms,
+          state_key}}
 
       _ ->
         :error
@@ -515,10 +587,111 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
     end
   end
 
+  defp ordered_index_key(prefix, id, time) do
+    prefix <>
+      pad_u64(time) <>
+      <<0>> <> bounded_component(id, @max_raw_identity_component_bytes)
+  end
+
+  defp query_index_descriptor(index_key) do
+    {family, discovery_component} = query_index_family(index_key)
+    {digest(family), digest(index_key), discovery_component}
+  end
+
+  defp query_index_family(index_key) do
+    case :binary.match(index_key, "=") do
+      {separator_offset, 1} ->
+        if query_discovery_index?(index_key, separator_offset) do
+          component_offset = separator_offset + 1
+          component_size = byte_size(index_key) - component_offset
+
+          if component_size > @max_query_discovery_component_bytes do
+            raise ArgumentError, "query index discovery component is too large"
+          end
+
+          {
+            binary_part(index_key, 0, component_offset),
+            binary_part(index_key, component_offset, component_size)
+          }
+        else
+          {index_key, nil}
+        end
+
+      :nomatch ->
+        {index_key, nil}
+    end
+  end
+
+  defp query_discovery_index?(index_key, separator_offset) do
+    case :binary.match(index_key, "}:i:") do
+      {index_kind_offset, _size} ->
+        Enum.any?(@query_index_markers, fn marker ->
+          case :binary.match(index_key, marker) do
+            {^index_kind_offset, _size} -> index_kind_offset < separator_offset
+            _other -> false
+          end
+        end)
+
+      :nomatch ->
+        false
+    end
+  end
+
+  defp query_index_prefix_from_descriptor({family_digest, index_digest, _component}) do
+    query_index_global_prefix() <>
+      @query_index_key_tag <> family_digest <> index_digest <> <<0>>
+  end
+
+  defp query_index_key_from_descriptor(
+         {family_digest, index_digest, _component},
+         id,
+         updated_at_ms
+       ) do
+    query_index_key_from_digests(family_digest, index_digest, id, updated_at_ms)
+  end
+
+  defp query_index_key_from_digests(family_digest, index_digest, id, updated_at_ms) do
+    query_index_global_prefix() <>
+      @query_index_key_tag <>
+      family_digest <>
+      index_digest <>
+      <<0>> <>
+      pad_u64(updated_at_ms) <>
+      <<0>> <> bounded_component(id, @max_raw_identity_component_bytes)
+  end
+
+  defp encode_query_index_value_from_descriptor(
+         {family_digest, index_digest, discovery_component},
+         id,
+         updated_at_ms,
+         expire_at_ms,
+         state_key
+       ) do
+    TermCodec.encode(
+      {@query_index_value_tag, family_digest, index_digest, discovery_component, id,
+       updated_at_ms, expire_at_ms, state_key}
+    )
+  end
+
+  defp digest(value), do: :crypto.hash(:sha256, value)
+
+  defp bounded_component(value, max_raw_bytes) do
+    if byte_size(value) <= max_raw_bytes and
+         not String.starts_with?(value, @digest_component_tag) do
+      value
+    else
+      @digest_component_tag <> :crypto.hash(:sha256, value)
+    end
+  end
+
   defp ordered_index_entry_key?(key, prefix, id, time)
        when is_binary(key) and is_binary(prefix) and is_binary(id) and is_integer(time) and
               time >= 0 and time <= @max_u64 do
-    suffix = <<0>> <> pad_u64(time) <> <<0>> <> id
+    suffix =
+      <<0>> <>
+        pad_u64(time) <>
+        <<0>> <> bounded_component(id, @max_raw_identity_component_bytes)
+
     prefix_size = byte_size(prefix)
     suffix_size = byte_size(suffix)
     key_size = byte_size(key)

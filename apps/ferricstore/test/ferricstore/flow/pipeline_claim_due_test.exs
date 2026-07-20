@@ -8,7 +8,7 @@ defmodule Ferricstore.Flow.PipelineClaimDueTest do
 
   defp callbacks do
     %{
-      claim_due_result: fn _ctx, _type, opts ->
+      claim_due_result: fn _ctx, _type, opts, _expected_metadata ->
         limit = Keyword.fetch!(opts, :limit)
         {:ok, Enum.map(1..limit, &%{id: "job-#{&1}"})}
       end,

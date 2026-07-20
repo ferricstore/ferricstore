@@ -373,7 +373,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
                    path,
                    Enum.map(stale_indexes, fn index_key ->
                      key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, 1)
-                     value = Ferricstore.Flow.LMDB.encode_query_index_value(id, 1, 0)
+                     value =
+                       Ferricstore.Flow.LMDB.encode_query_index_value(index_key, id, 1, 0)
+
                      {:put, key, value}
                    end)
                  )
@@ -787,7 +789,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
         query_key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, 10)
 
         wrapped = Ferricstore.Flow.LMDB.encode_value("FSF2bad", 0)
-        query_value = Ferricstore.Flow.LMDB.encode_query_index_value(id, 10, 0)
+        query_value = Ferricstore.Flow.LMDB.encode_query_index_value(index_key, id, 10, 0)
 
         lmdb_path =
           ctx.data_dir
@@ -865,7 +867,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
         query_key = Ferricstore.Flow.LMDB.query_index_key(query_index_key, id, updated_at_ms)
 
         query_value =
-          Ferricstore.Flow.LMDB.encode_query_index_value(id, updated_at_ms, 0, state_key)
+          Ferricstore.Flow.LMDB.encode_query_index_value(
+            query_index_key,
+            id,
+            updated_at_ms,
+            0,
+            state_key
+          )
 
         lmdb_path =
           ctx.data_dir

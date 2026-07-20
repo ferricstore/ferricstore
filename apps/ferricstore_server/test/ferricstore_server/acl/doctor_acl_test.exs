@@ -19,9 +19,11 @@ defmodule FerricstoreServer.ACL.DoctorACLTest do
     assert MapSet.member?(read, "FLOW.ATTRIBUTES")
     assert MapSet.member?(read, "FLOW.ATTRIBUTE_VALUES")
     assert MapSet.member?(read, "FLOW.SEARCH")
+    assert MapSet.member?(read, "FLOW.QUERY")
     assert MapSet.member?(flow, "FLOW.ATTRIBUTES")
     assert MapSet.member?(flow, "FLOW.ATTRIBUTE_VALUES")
     assert MapSet.member?(flow, "FLOW.SEARCH")
+    assert MapSet.member?(flow, "FLOW.QUERY")
   end
 
   test "flow effect governance commands have read/write ACL categories" do

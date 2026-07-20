@@ -34,8 +34,8 @@ defmodule Ferricstore.Test.IsolatedInstance do
 
     shard_count = Keyword.get(opts, :shard_count, 2)
 
-    ctx =
-      FerricStore.Instance.build(name,
+    instance_opts =
+      [
         data_dir: tmp_dir,
         shard_count: shard_count,
         max_memory_bytes: Keyword.get(opts, :max_memory_bytes, 256 * 1024 * 1024),
@@ -54,7 +54,17 @@ defmodule Ferricstore.Test.IsolatedInstance do
         read_sample_rate: Keyword.get(opts, :read_sample_rate, 1),
         lfu_decay_time: 1,
         lfu_log_factor: 10
+      ]
+      |> Keyword.merge(
+        Keyword.take(opts, [
+          :flow_metadata_extension,
+          :flow_tenancy_mode,
+          :query_engine,
+          :query_index_provider
+        ])
       )
+
+    ctx = FerricStore.Instance.build(name, instance_opts)
 
     # Ensure data dir layout (ETS tables created by Shard.init)
     Ferricstore.DataDir.ensure_layout!(tmp_dir, shard_count)

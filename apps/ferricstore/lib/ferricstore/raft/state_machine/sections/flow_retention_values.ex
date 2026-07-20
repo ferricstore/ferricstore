@@ -464,56 +464,60 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionValues do
              now_ms,
              due_score
            ) do
-        case record do
-          nil ->
-            :delete_due
+        if is_map(record) and not flow_claim_scope_match?(record) do
+          {:skip, flow_claim_restore_due_score(record, due_score)}
+        else
+          case record do
+            nil ->
+              :delete_due
 
-          %{type: record_type} when record_type != type ->
-            {:skip, flow_claim_restore_due_score(record, due_score)}
+            %{type: record_type} when record_type != type ->
+              {:skip, flow_claim_restore_due_score(record, due_score)}
 
-          %{state: record_state} = record ->
-            cond do
-              flow_claim_state_excluded?(state_filter, record_state) ->
-                {:skip, flow_claim_restore_due_score(record, due_score)}
+            %{state: record_state} = record ->
+              cond do
+                flow_claim_state_excluded?(state_filter, record_state) ->
+                  {:skip, flow_claim_restore_due_score(record, due_score)}
 
-              not flow_claim_record_due_ready?(record, now_ms) ->
-                {:skip, flow_claim_restore_due_score(record, due_score)}
+                not flow_claim_record_due_ready?(record, now_ms) ->
+                  {:skip, flow_claim_restore_due_score(record, due_score)}
 
-              flow_claim_state_match?(state_filter, record_state) ->
-                next_version = Map.fetch!(record, :version) + 1
-                next_fencing_token = Map.get(record, :fencing_token, 0) + 1
-                deadline_ms = now_ms + lease_ms
+                flow_claim_state_match?(state_filter, record_state) ->
+                  next_version = Map.fetch!(record, :version) + 1
+                  next_fencing_token = Map.get(record, :fencing_token, 0) + 1
+                  deadline_ms = now_ms + lease_ms
 
-                token =
-                  worker <>
-                    ":" <>
-                    Integer.to_string(now_ms) <> ":" <> Integer.to_string(next_fencing_token)
+                  token =
+                    worker <>
+                      ":" <>
+                      Integer.to_string(now_ms) <> ":" <> Integer.to_string(next_fencing_token)
 
-                next =
-                  flow_claim_next_record(
-                    record,
-                    next_version,
-                    next_fencing_token,
-                    worker,
-                    token,
-                    deadline_ms,
-                    now_ms
-                  )
-                  |> flow_bind_governance_limit()
+                  next =
+                    flow_claim_next_record(
+                      record,
+                      next_version,
+                      next_fencing_token,
+                      worker,
+                      token,
+                      deadline_ms,
+                      now_ms
+                    )
+                    |> flow_bind_governance_limit()
 
-                with {:ok, from_due_score} <- flow_claim_numeric_score(due_score),
-                     :ok <- flow_validate_claim_next_record_keys(next) do
-                  {:ok, record, next, from_due_score}
-                else
-                  _ -> {:skip, flow_claim_restore_due_score(record, due_score)}
-                end
+                  with {:ok, from_due_score} <- flow_claim_numeric_score(due_score),
+                       :ok <- flow_validate_claim_next_record_keys(next) do
+                    {:ok, record, next, from_due_score}
+                  else
+                    _ -> {:skip, flow_claim_restore_due_score(record, due_score)}
+                  end
 
-              true ->
-                :delete_due
-            end
+                true ->
+                  :delete_due
+              end
 
-          _record ->
-            :delete_due
+            _record ->
+              :delete_due
+          end
         end
       end
 

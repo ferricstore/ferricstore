@@ -46,6 +46,7 @@ defmodule Ferricstore.MixProject do
         "../../guides/best-practices.md",
         "../../docs/flow-vs-temporal-usage.md",
         "../../docs/benchmarks.md",
+        "../../docs/flow-query.md",
         "../../docs/flow-production-readiness.md",
         "../../docs/flow-retry-policy.md",
         "../../docs/testing.md"

@@ -7,6 +7,8 @@ defmodule Ferricstore.Flow.ClaimWaiters do
   `claim_due` command, which remains atomic through the replicated write path.
   """
 
+  alias Ferricstore.Flow.StorageScope
+
   @table :ferricstore_flow_claim_waiters
   @timer_table :ferricstore_flow_claim_waiter_timers
   @capacity_lock_table :ferricstore_flow_claim_waiter_capacity_lock
@@ -14,6 +16,7 @@ defmodule Ferricstore.Flow.ClaimWaiters do
   @any_state :any_state
   @any_priority :any_priority
   @any_partition :any_partition
+  @scope_partition :scope_partition
   @message :flow_claim_due_wake
   @max_wait_key_rows 64
   @default_max_waiter_rows 100_000
@@ -23,7 +26,9 @@ defmodule Ferricstore.Flow.ClaimWaiters do
   @scheduled_prune_page_size 64
   @capacity_prune_page_size 256
 
-  @type waiter_key :: {binary(), binary() | atom(), non_neg_integer() | atom(), binary() | atom()}
+  @type partition_wait_key :: binary() | atom() | {:scope_partition, binary()}
+  @type waiter_key ::
+          {binary(), binary() | atom(), non_neg_integer() | atom(), partition_wait_key()}
 
   @spec init() :: :ok
   def init do
@@ -604,7 +609,13 @@ defmodule Ferricstore.Flow.ClaimWaiters do
   defp ready_priority_keys(priority) when is_integer(priority), do: [priority, @any_priority]
   defp ready_priority_keys(_priority), do: [@any_priority]
 
-  defp ready_partition_keys(partition) when is_binary(partition), do: [partition, @any_partition]
+  defp ready_partition_keys(partition) when is_binary(partition) do
+    case StorageScope.physical_scope_prefix(partition) do
+      {:ok, scope} -> [partition, {@scope_partition, scope}, @any_partition]
+      :unscoped -> [partition, @any_partition]
+    end
+  end
+
   defp ready_partition_keys(_partition), do: [@any_partition]
 
   defp wait_binary_list_keys(items, fallback) when is_list(items) do
@@ -629,13 +640,27 @@ defmodule Ferricstore.Flow.ClaimWaiters do
           compact_wait_key_dimensions([@any_state], partition_keys)
 
         length(partition_keys) > 1 ->
-          compact_wait_key_dimensions(state_keys, [@any_partition])
+          compact_wait_key_dimensions(state_keys, compact_partition_keys(partition_keys))
 
         true ->
           {state_keys, partition_keys}
       end
     end
   end
+
+  defp compact_partition_keys([first | rest]) do
+    with {:ok, scope} <- StorageScope.physical_scope_prefix(first),
+         true <-
+           Enum.all?(rest, fn partition ->
+             StorageScope.physical_scope_prefix(partition) == {:ok, scope}
+           end) do
+      [{@scope_partition, scope}]
+    else
+      _unscoped_or_mixed -> [@any_partition]
+    end
+  end
+
+  defp compact_partition_keys(_partitions), do: [@any_partition]
 
   defp scheduled_due_at_ms(due_at_ms) when is_integer(due_at_ms) do
     bucket = @scheduled_due_bucket_ms

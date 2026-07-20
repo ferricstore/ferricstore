@@ -576,6 +576,15 @@ defmodule Ferricstore.Commands.Catalog.Entries do
       summary: "Searches workflow records by indexed attributes and state metadata."
     },
     %{
+      name: "flow.query",
+      arity: -3,
+      flags: ["readonly"],
+      first_key: 0,
+      last_key: 0,
+      step: 0,
+      summary: "Runs a bounded versioned FQL query over workflow records."
+    },
+    %{
       name: "flow.failures",
       arity: -2,
       flags: ["readonly"],

@@ -5,6 +5,7 @@ defmodule Ferricstore.FlowCodecTest do
   alias Ferricstore.Flow
   alias Ferricstore.Flow.Codec.Support
   alias Ferricstore.Flow.RecordProjection
+  alias Ferricstore.Flow.StorageScope
 
   test "record codec round trips small and nil fields" do
     record = base_record()
@@ -53,6 +54,31 @@ defmodule Ferricstore.FlowCodecTest do
     refute Map.has_key?(RecordProjection.public(record), :governance_limit)
   end
 
+  test "record codec round trips sealed system metadata without exposing it" do
+    record =
+      base_record()
+      |> Map.put(:partition_key, "logical-partition")
+      |> Map.put(:system_metadata, %{
+        0x8001 => {1, :uint64, :isolation_scope, 42}
+      })
+
+    assert {:ok, physical_partition} = StorageScope.physical_partition_key(record)
+    record = Map.put(record, :partition_key, physical_partition)
+
+    assert Flow.encode_record(record) == Flow.encode_record_elixir(record)
+    assert record == record |> Flow.encode_record() |> Flow.decode_record()
+    public = RecordProjection.public(record)
+    assert public.partition_key == "logical-partition"
+    refute Map.has_key?(public, :system_metadata)
+  end
+
+  test "empty system metadata keeps dedicated record bytes unchanged" do
+    record = base_record()
+
+    assert Flow.encode_record(record) ==
+             record |> Map.put(:system_metadata, %{}) |> Flow.encode_record()
+  end
+
   test "record codec rejects governance metadata outside the current exact shape" do
     invalid_limits = [
       %{scope: "flow-running:test", shard_id: 7, reservation_id: "reservation-123"},
@@ -99,8 +125,14 @@ defmodule Ferricstore.FlowCodecTest do
       encoded = Flow.encode_record_elixir(record)
 
       assert_raise ArgumentError, "invalid flow record", fn -> Flow.decode_record(encoded) end
-      assert_raise ArgumentError, "invalid flow record", fn -> Flow.decode_record_elixir(encoded) end
-      assert_raise ArgumentError, "invalid flow record", fn -> Flow.decode_record_meta(encoded) end
+
+      assert_raise ArgumentError, "invalid flow record", fn ->
+        Flow.decode_record_elixir(encoded)
+      end
+
+      assert_raise ArgumentError, "invalid flow record", fn ->
+        Flow.decode_record_meta(encoded)
+      end
     end)
   end
 
@@ -113,7 +145,8 @@ defmodule Ferricstore.FlowCodecTest do
       %{"__indexed_state_meta__" => %{"invalid" => true}},
       %{"__incarnation__" => -1},
       %{"__state_enter_seq__" => "1"},
-      %{"__governance_limit__" => %{"scope" => "missing-required-fields"}}
+      %{"__governance_limit__" => %{"scope" => "missing-required-fields"}},
+      %{"__system_metadata__" => "not-sealed-metadata"}
     ]
 
     Enum.each(invalid_sidecars, fn child_groups ->

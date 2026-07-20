@@ -900,7 +900,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimScan do
              remaining,
              fifo_planning?
            ) do
-        if flow_governance_limit_active?() or fifo_planning? do
+        if flow_governance_limit_active?() or fifo_planning? or flow_claim_scope_active?() do
           flow_plan_claim_candidates_elixir(
             state,
             due_key,

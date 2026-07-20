@@ -17,6 +17,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
       alias Ferricstore.Raft.BlobCommand
       alias Ferricstore.Raft.ApplyLimits
       alias Ferricstore.Flow
+      alias Ferricstore.Flow.CommandScope
       alias Ferricstore.Flow.Hibernation
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Locator
@@ -93,7 +94,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
             started_at = System.monotonic_time()
 
             result =
-              with :ok <- ApplyLimits.validate_flow_batch(state, attrs),
+              with :ok <- CommandScope.validate(state, attrs),
+                   :ok <- ApplyLimits.validate_flow_batch(state, attrs),
                    :ok <- ApplyLimits.validate_flow_time(attrs, apply_now_ms()) do
                 with_flow_policy_references(state, command_shape, attrs, fn ->
                   with_pending_writes(state, fun)
@@ -118,7 +120,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
         started_at = System.monotonic_time()
 
         result =
-          with :ok <- ApplyLimits.validate_flow_batch(state, attrs),
+          with :ok <- CommandScope.validate(state, attrs),
+               :ok <- ApplyLimits.validate_flow_batch(state, attrs),
                :ok <- ApplyLimits.validate_flow_time(attrs, apply_now_ms()) do
             with_flow_policy_references(state, command_shape, attrs, fun)
           end

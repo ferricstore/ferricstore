@@ -17,11 +17,12 @@ defmodule FerricstoreServer.Native.Commands do
   alias Ferricstore.{AuditLog, Stats}
   alias Ferricstore.Commands.{PreparedCommand, Strings}
   alias Ferricstore.Flow.{ClaimDueAPI, ClaimWaiters}
-  alias Ferricstore.Flow.Codec, as: FlowCodec
   alias Ferricstore.Flow.InternalKey
-  alias Ferricstore.Flow.Keys, as: FlowKeys
   alias Ferricstore.Flow.RecordProjection, as: FlowRecordProjection
-  alias Ferricstore.Flow.Telemetry, as: FlowTelemetry
+  alias Ferricstore.Flow.Query.Error, as: FlowQueryError
+  alias Ferricstore.Flow.Query.ExecutionContext, as: FlowQueryExecutionContext
+  alias Ferricstore.Flow.Query.Limits, as: FlowQueryLimits
+  alias Ferricstore.Flow.Query.Request, as: FlowQueryRequest
   alias Ferricstore.Store.{CompoundKey, ListOps, Ops, PublicationEpoch, ReadResult, Router}
   alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.SlotMap
@@ -29,6 +30,9 @@ defmodule FerricstoreServer.Native.Commands do
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Registry, as: ConnRegistry
   alias FerricstoreServer.Native.Codec
+  alias FerricstoreServer.Native.FQLParser
+  alias FerricstoreServer.Native.FlowQuery
+  alias FerricstoreServer.Native.RequestContext
   alias FerricstoreServer.Native.RouteMetadata
 
   @list_position_step 1_000_000_000
@@ -36,6 +40,8 @@ defmodule FerricstoreServer.Native.Commands do
   @default_max_response_bytes 64 * 1024 * 1024
   @internal_server_error "ERR internal server error"
   @wrongtype_error {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+  @flow_query_prepared_key :__prepared_flow_query__
+  @max_flow_query_parameters FlowQueryLimits.max_parameters()
 
   @op_hello 0x0001
   @op_auth 0x0002
@@ -155,6 +161,7 @@ defmodule FerricstoreServer.Native.Commands do
   @op_flow_attributes 0x022E
   @op_flow_attribute_values 0x022F
   @op_flow_search 0x0230
+  @op_flow_query 0x0231
   @op_flow_effect_reserve 0x0240
   @op_flow_effect_confirm 0x0241
   @op_flow_effect_fail 0x0242
@@ -304,6 +311,7 @@ defmodule FerricstoreServer.Native.Commands do
     @op_flow_attributes => "FLOW.ATTRIBUTES",
     @op_flow_attribute_values => "FLOW.ATTRIBUTE_VALUES",
     @op_flow_search => "FLOW.SEARCH",
+    @op_flow_query => "FLOW.QUERY",
     @op_flow_effect_reserve => "FLOW.EFFECT.RESERVE",
     @op_flow_effect_confirm => "FLOW.EFFECT.CONFIRM",
     @op_flow_effect_fail => "FLOW.EFFECT.FAIL",
@@ -335,6 +343,10 @@ defmodule FerricstoreServer.Native.Commands do
             |> Map.merge(@kv_commands)
             |> Map.merge(@admin_commands)
             |> Map.merge(@flow_commands)
+
+  @flow_request_context_opcodes @flow_commands
+                                |> Map.keys()
+                                |> List.delete(@op_flow_query)
 
   @supported_compressions ["none"]
   @supported_auth ["password", "acl-password"]
@@ -553,9 +565,10 @@ defmodule FerricstoreServer.Native.Commands do
 
     with :ok <- authorize_acl_projection(),
          :ok <- check_deadline(payload),
+         {:ok, payload} <- prepare_native_payload(opcode, payload),
          :ok <- authorize_public_opcode(opcode, payload),
          :ok <- check_native_resource_limits(opcode, payload, state) do
-      do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
+      execute_prepared_native(opcode, payload, state) |> record_native_activity(opcode, payload)
     else
       {:error, reason} -> {:error, FerricStore.ResourceLimits.error_message(reason), state}
       {:error, status, reason} -> {status, reason, state}
@@ -574,10 +587,12 @@ defmodule FerricstoreServer.Native.Commands do
     with {:ok, command} <- fetch_command(opcode),
          :ok <- authorize_acl_projection(),
          :ok <- check_deadline(payload),
-         :ok <- authorize(command, opcode, payload, state),
+         :ok <- authorize_command(command, state),
+         {:ok, payload} <- prepare_native_payload(opcode, payload),
+         :ok <- authorize_keys(command, opcode, payload, state),
          :ok <- authorize_public_opcode(opcode, payload),
          :ok <- check_native_resource_limits(opcode, payload, state) do
-      do_execute(opcode, payload, state) |> record_native_activity(opcode, payload)
+      execute_prepared_native(opcode, payload, state) |> record_native_activity(opcode, payload)
     else
       {:error, reason} -> {:error, FerricStore.ResourceLimits.error_message(reason), state}
       {:error, status, reason} -> {status, reason, state}
@@ -602,6 +617,30 @@ defmodule FerricstoreServer.Native.Commands do
 
     {:error, @internal_server_error, state}
   end
+
+  defp execute_prepared_native(opcode, payload, state)
+       when opcode in @flow_request_context_opcodes do
+    case RequestContext.from_payload(payload, state) do
+      {:ok, request_context} when map_size(request_context) == 0 ->
+        do_execute(opcode, payload, state)
+
+      {:ok, request_context} ->
+        execution_state =
+          Map.put(
+            state,
+            :instance_ctx,
+            attach_request_context(state.instance_ctx, request_context)
+          )
+
+        {status, result, result_state} = do_execute(opcode, payload, execution_state)
+        {status, result, Map.put(result_state, :instance_ctx, state.instance_ctx)}
+
+      {:error, reason} ->
+        {:bad_request, reason, state}
+    end
+  end
+
+  defp execute_prepared_native(opcode, payload, state), do: do_execute(opcode, payload, state)
 
   defp record_native_activity({:ok, _payload, %{instance_ctx: store}} = result, opcode, payload) do
     keys = keys(opcode, payload)
@@ -659,6 +698,8 @@ defmodule FerricstoreServer.Native.Commands do
       _other -> []
     end)
   end
+
+  defp native_resource_limit_args(@op_flow_query, _payload), do: []
 
   defp native_resource_limit_args(_opcode, payload) when is_map(payload) do
     payload
@@ -834,7 +875,7 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_subscribe_events, payload, state) do
     with {:ok, events} <- event_list(payload),
-         {:ok, state} <- maybe_subscribe_flow_wake(state, events, Map.get(payload, "flow_wake")) do
+         {:ok, state} <- maybe_subscribe_flow_wake(state, events, payload) do
       state = subscribe_events(state, events)
       {:ok, event_subscription_payload(state), state}
     else
@@ -858,10 +899,10 @@ defmodule FerricstoreServer.Native.Commands do
   defp do_execute(@op_command_exec, payload, state) do
     with {:ok, command} <- require_binary(payload, "command"),
          {:ok, args} <- raw_command_args(payload),
-         {:ok, request_context} <- request_context(payload, state) do
+         {:ok, request_context} <- RequestContext.from_payload(payload, state) do
       with {:ok, prepared} <- prepared_raw_command(payload, command, args),
            :ok <- authorize_raw_command(prepared, state) do
-        dispatch_command_exec(prepared, state, request_context)
+        dispatch_command_exec(prepared, state, request_context, Map.get(payload, "deadline_ms"))
       else
         {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
         {:error, status, reason} -> {status, reason, state}
@@ -1397,6 +1438,23 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
+  defp do_execute(@op_flow_query, payload, state) do
+    with {:ok, request} <- prepared_flow_query(payload),
+         {:ok, request_context} <- RequestContext.from_payload(payload, state) do
+      store =
+        FlowQueryExecutionContext.attach(
+          state.instance_ctx,
+          request_context,
+          Map.get(payload, "deadline_ms")
+        )
+
+      flow_query_prepared_reply(store, request, state)
+    else
+      {:error, reason} when is_binary(reason) -> {:bad_request, reason, state}
+      {:error, status, reason} -> {status, reason, state}
+    end
+  end
+
   defp do_execute(@op_flow_effect_reserve, payload, state) do
     with {:ok, id} <- require_binary(payload, "id"),
          {:ok, effect_key} <- require_binary(payload, "effect_key"),
@@ -1923,6 +1981,42 @@ defmodule FerricstoreServer.Native.Commands do
     result |> raw_result_to_native() |> result_to_reply(state)
   end
 
+  defp dispatch_command_exec(
+         %PreparedCommand{ast: {:flow_query, %Ferricstore.Flow.Query.Request{} = request}} =
+           prepared,
+         state,
+         request_context,
+         deadline_ms
+       ) do
+    store = FlowQueryExecutionContext.attach(state.instance_ctx, request_context, deadline_ms)
+
+    prepared
+    |> Ferricstore.Commands.Dispatcher.execute_prepared(
+      store,
+      fn -> FlowQuery.execute_prepared(store, request) end
+    )
+    |> flow_query_result_to_reply(state)
+  end
+
+  defp dispatch_command_exec(prepared, state, request_context, _deadline_ms),
+    do: dispatch_command_exec(prepared, state, request_context)
+
+  defp flow_query_prepared_reply(store, request, state) do
+    store
+    |> FlowQuery.execute_prepared(request)
+    |> flow_query_result_to_reply(state)
+  end
+
+  defp flow_query_result_to_reply(result, state) do
+    case result do
+      {:error, reason} when is_atom(reason) ->
+        {FlowQueryError.status(reason), FlowQueryError.payload(reason), state}
+
+      result ->
+        result_to_reply(result, state)
+    end
+  end
+
   defp ferricstore_metrics_result(parsed_args, state) do
     parsed_args
     |> handle_metrics(state)
@@ -1946,100 +2040,6 @@ defmodule FerricstoreServer.Native.Commands do
   defp raw_command_args(%{"args" => nil}), do: {:ok, []}
   defp raw_command_args(payload) when not is_map_key(payload, "args"), do: {:ok, []}
   defp raw_command_args(_payload), do: {:error, "ERR native COMMAND_EXEC args must be a list"}
-
-  defp request_context(payload, state) when is_map(payload) do
-    case Map.get(payload, "request_context") do
-      nil -> {:ok, %{}}
-      %{} = context -> trusted_request_context(context, state)
-      _other -> invalid_request_context(state)
-    end
-  end
-
-  defp request_context(_payload, _state), do: {:ok, %{}}
-
-  defp trusted_request_context(context, state) do
-    if trusted_request_context_connection?(state) do
-      {:ok, normalize_request_context(context)}
-    else
-      {:ok, %{}}
-    end
-  end
-
-  defp invalid_request_context(state) do
-    if trusted_request_context_connection?(state) do
-      {:error, "ERR native request_context must be an object"}
-    else
-      {:ok, %{}}
-    end
-  end
-
-  defp trusted_request_context_connection?(state) do
-    users = trusted_request_context_users()
-    username = Map.get(state, :username)
-
-    "*" in users or (is_binary(username) and username in users)
-  end
-
-  defp trusted_request_context_users do
-    case Application.get_env(:ferricstore, :native_trusted_request_context_users, []) do
-      users when is_list(users) ->
-        users
-        |> Enum.flat_map(&trusted_request_context_user/1)
-        |> Enum.uniq()
-
-      users when is_binary(users) ->
-        String.split(users, [",", " "], trim: true)
-
-      :all ->
-        ["*"]
-
-      _other ->
-        []
-    end
-  end
-
-  defp trusted_request_context_user(user) when is_binary(user), do: [user]
-  defp trusted_request_context_user(user) when is_atom(user), do: [Atom.to_string(user)]
-  defp trusted_request_context_user(_user), do: []
-
-  defp normalize_request_context(%{} = context) do
-    %{}
-    |> put_context_value("subject", context_value(context, "subject", :subject))
-    |> put_context_value("tenant", context_value(context, "tenant", :tenant))
-    |> put_context_scopes(context_value(context, "scopes", :scopes))
-  end
-
-  defp put_context_value(payload, _key, value) when value in [nil, ""], do: payload
-
-  defp put_context_value(payload, key, value) when is_binary(value),
-    do: Map.put(payload, key, value)
-
-  defp put_context_value(payload, _key, _value), do: payload
-
-  defp put_context_scopes(payload, scopes) do
-    scopes =
-      scopes
-      |> normalize_context_scopes()
-      |> Enum.uniq()
-
-    case scopes do
-      [] -> payload
-      scopes -> Map.put(payload, "scopes", scopes)
-    end
-  end
-
-  defp normalize_context_scopes(scopes) when is_binary(scopes) do
-    String.split(scopes, [",", " "], trim: true)
-  end
-
-  defp normalize_context_scopes(scopes) when is_list(scopes),
-    do: Enum.filter(scopes, &is_binary/1)
-
-  defp normalize_context_scopes(_scopes), do: []
-
-  defp context_value(%{} = context, string_key, atom_key) do
-    Map.get(context, string_key) || Map.get(context, atom_key)
-  end
 
   defp attach_request_context(store, request_context) when request_context == %{}, do: store
 
@@ -2269,34 +2269,43 @@ defmodule FerricstoreServer.Native.Commands do
     end
   end
 
-  defp authorize("HELLO", _opcode, _payload, _state), do: :ok
-  defp authorize("OPTIONS", _opcode, _payload, _state), do: :ok
-  defp authorize("STARTUP", _opcode, _payload, _state), do: :ok
-  defp authorize("AUTH", _opcode, _payload, _state), do: :ok
-  defp authorize("COMMAND_EXEC", _opcode, _payload, _state), do: :ok
+  defp authorize_command(command, _state)
+       when command in ["HELLO", "OPTIONS", "STARTUP", "AUTH", "COMMAND_EXEC"],
+       do: :ok
 
-  defp authorize(command, opcode, payload, state) do
+  defp authorize_command(command, state) do
     cond do
       state.require_auth and not state.authenticated ->
         {:error, :auth, "NOAUTH Authentication required."}
 
       true ->
-        with :ok <- ConnAuth.check_command_cached(state.acl_cache, command),
-             :ok <-
-               check_key_acl_cached(state.acl_cache, opcode, payload) do
-          :ok
-        else
-          {:error, reason} ->
-            FerricstoreServer.Acl.Protection.log_command_denied(
-              state.username,
-              command,
-              format_peer(state.peer),
-              state.client_id
-            )
-
-            {:error, :noperm, reason}
+        case ConnAuth.check_command_cached(state.acl_cache, command) do
+          :ok -> :ok
+          {:error, reason} -> authorization_denied(command, reason, state)
         end
     end
+  end
+
+  defp authorize_keys(command, _opcode, _payload, _state)
+       when command in ["HELLO", "OPTIONS", "STARTUP", "AUTH", "COMMAND_EXEC"],
+       do: :ok
+
+  defp authorize_keys(command, opcode, payload, state) do
+    case check_key_acl_cached(state.acl_cache, opcode, payload) do
+      :ok -> :ok
+      {:error, reason} -> authorization_denied(command, reason, state)
+    end
+  end
+
+  defp authorization_denied(command, reason, state) do
+    FerricstoreServer.Acl.Protection.log_command_denied(
+      state.username,
+      command,
+      format_peer(state.peer),
+      state.client_id
+    )
+
+    {:error, :noperm, reason}
   end
 
   defp authorize_public_opcode(opcode, payload) do
@@ -2346,12 +2355,16 @@ defmodule FerricstoreServer.Native.Commands do
         if prepared.command == String.upcase(command) do
           {:ok, prepared}
         else
-          Ferricstore.Commands.Dispatcher.prepare_raw(command, args)
+          prepare_raw_command(command, args)
         end
 
       _not_prepared ->
-        Ferricstore.Commands.Dispatcher.prepare_raw(command, args)
+        prepare_raw_command(command, args)
     end
+  end
+
+  defp prepare_raw_command(command, args) do
+    Ferricstore.Commands.Dispatcher.prepare_raw(command, args, flow_query_parser: FQLParser)
   end
 
   @flow_partition_or_id_opcodes [
@@ -2471,6 +2484,19 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp keys(opcode, payload) when opcode in [@op_flow_get, @op_flow_history],
     do: flow_partition_or_global(payload)
+
+  defp keys(@op_flow_query, payload) do
+    case Map.get(payload, @flow_query_prepared_key) do
+      %FlowQueryRequest{} = request ->
+        case Ferricstore.Flow.Query.partition_key(request) do
+          {:ok, partition_key} -> [partition_key]
+          {:error, _reason} -> ["*"]
+        end
+
+      _not_prepared ->
+        ["*"]
+    end
+  end
 
   defp keys(opcode, payload) when opcode in @flow_partition_or_id_opcodes,
     do: flow_partition_or_fallback(payload, [Map.get(payload, "id")])
@@ -2981,6 +3007,7 @@ defmodule FerricstoreServer.Native.Commands do
         field: "deadline_ms",
         clock: "server_unix_ms"
       },
+      flow_query: FerricStore.Flow.QueryEngine.capabilities(state.instance_ctx),
       schemas: schema_payload(),
       events: @supported_events,
       opcodes: supported_opcodes()
@@ -3169,6 +3196,10 @@ defmodule FerricstoreServer.Native.Commands do
           "values",
           "deadline_ms"
         ]
+      },
+      "FLOW.QUERY" => %{
+        "required" => ["version", "query"],
+        "fields" => ["version", "query", "params", "deadline_ms"]
       },
       "FLOW.LIST" => %{
         "required" => ["type"],
@@ -3659,7 +3690,8 @@ defmodule FerricstoreServer.Native.Commands do
     _ -> 0
   end
 
-  defp check_deadline(%{"deadline_ms" => deadline_ms}) when is_integer(deadline_ms) do
+  defp check_deadline(%{"deadline_ms" => deadline_ms})
+       when is_integer(deadline_ms) and deadline_ms >= 0 do
     if deadline_ms > 0 and deadline_ms < System.system_time(:millisecond) do
       {:error, :error,
        %{
@@ -3672,6 +3704,17 @@ defmodule FerricstoreServer.Native.Commands do
     else
       :ok
     end
+  end
+
+  defp check_deadline(%{"deadline_ms" => _invalid}) do
+    {:error, :bad_request,
+     %{
+       "code" => "invalid_deadline",
+       "message" => "ERR native request deadline must be a non-negative integer",
+       "retryable" => false,
+       "safe_to_retry" => false,
+       "retry_after_ms" => 0
+     }}
   end
 
   defp check_deadline(_payload), do: :ok
@@ -3797,6 +3840,55 @@ defmodule FerricstoreServer.Native.Commands do
     case Map.get(payload, key) do
       value when is_map(value) -> {:ok, value}
       _ -> {:error, "ERR native field #{key} must be a map"}
+    end
+  end
+
+  @flow_query_payload_fields ["version", "query", "params", "deadline_ms", "request_context"]
+
+  defp prepare_native_payload(@op_flow_query, payload) do
+    with :ok <- validate_flow_query_payload(payload),
+         {:ok, version} <- require_binary(payload, "version"),
+         {:ok, query} <- require_binary(payload, "query"),
+         {:ok, params} <- optional_query_params(payload),
+         {:ok, request} <- FlowQuery.prepare(version, query, params) do
+      {:ok, Map.put(payload, @flow_query_prepared_key, request)}
+    else
+      {:error, reason} when is_atom(reason) ->
+        {:error, FlowQueryError.status(reason), FlowQueryError.payload(reason)}
+
+      {:error, reason} when is_binary(reason) ->
+        {:error, :bad_request, reason}
+    end
+  end
+
+  defp prepare_native_payload(_opcode, payload), do: {:ok, payload}
+
+  defp prepared_flow_query(payload) do
+    case Map.get(payload, @flow_query_prepared_key) do
+      %FlowQueryRequest{} = request -> {:ok, request}
+      _missing -> {:error, "ERR native FLOW.QUERY was not prepared"}
+    end
+  end
+
+  defp validate_flow_query_payload(payload) do
+    if map_size(payload) <= length(@flow_query_payload_fields) and
+         Enum.all?(Map.keys(payload), &(&1 in @flow_query_payload_fields)) do
+      :ok
+    else
+      {:error, "ERR native FLOW.QUERY contains unsupported fields"}
+    end
+  end
+
+  defp optional_query_params(payload) do
+    case Map.get(payload, "params", %{}) do
+      params when is_map(params) and map_size(params) <= @max_flow_query_parameters ->
+        {:ok, params}
+
+      params when is_map(params) ->
+        {:error, "ERR native FLOW.QUERY accepts at most 64 named parameters"}
+
+      _invalid ->
+        {:error, "ERR native field params must be a map"}
     end
   end
 
@@ -4063,8 +4155,7 @@ defmodule FerricstoreServer.Native.Commands do
 
       requested? ->
         with {:ok, events} <- event_list(%{"events" => events}),
-             {:ok, state} <-
-               maybe_subscribe_flow_wake(state, events, Map.get(payload, "flow_wake")) do
+             {:ok, state} <- maybe_subscribe_flow_wake(state, events, payload) do
           {:ok, subscribe_events(state, events)}
         else
           {:error, reason} -> {:error, :bad_request, reason}
@@ -4085,7 +4176,9 @@ defmodule FerricstoreServer.Native.Commands do
     Map.put(state, :event_subscriptions, Enum.reduce(events, current, &MapSet.delete(&2, &1)))
   end
 
-  defp maybe_subscribe_flow_wake(state, events, flow_wake) do
+  defp maybe_subscribe_flow_wake(state, events, payload) do
+    flow_wake = if is_map(payload), do: Map.get(payload, "flow_wake")
+
     cond do
       "FLOW_WAKE" not in events ->
         {:ok, state}
@@ -4094,7 +4187,7 @@ defmodule FerricstoreServer.Native.Commands do
         {:ok, state}
 
       is_map(flow_wake) ->
-        with {:ok, subscription} <- flow_wake_subscription(flow_wake) do
+        with {:ok, subscription} <- flow_wake_subscription(payload, flow_wake, state) do
           state = unsubscribe_flow_wake(state)
 
           case ClaimWaiters.register(subscription.keys, self(), 0, limit: subscription.limit) do
@@ -4125,10 +4218,12 @@ defmodule FerricstoreServer.Native.Commands do
     Map.put(state, :flow_wake_subscription, nil)
   end
 
-  defp flow_wake_subscription(payload) do
-    with {:ok, type} <- require_binary(payload, "type"),
-         {:ok, opts} <- flow_opts(payload, ["type"]),
-         {:ok, keys, limit} <- ClaimDueAPI.wait_registration(type, opts) do
+  defp flow_wake_subscription(payload, flow_wake, state) do
+    with {:ok, request_context} <- RequestContext.from_payload(payload, state),
+         {:ok, type} <- require_binary(flow_wake, "type"),
+         {:ok, opts} <- flow_opts(flow_wake, ["type"]),
+         store = attach_request_context(state.instance_ctx, request_context),
+         {:ok, keys, limit} <- ClaimDueAPI.wait_registration(store, type, opts) do
       {:ok, %{type: type, keys: keys, limit: limit}}
     end
   end
@@ -4173,7 +4268,7 @@ defmodule FerricstoreServer.Native.Commands do
   defp normalize_event(_event), do: nil
 
   defp execute_typed_pipeline(payload, state) do
-    with {:ok, request_context} <- request_context(payload, state),
+    with {:ok, request_context} <- RequestContext.from_payload(payload, state),
          {:ok, commands} <- pipeline_commands(payload),
          {:ok, atomicity} <- pipeline_atomicity(payload),
          :ok <- authorize_pipeline_public_keys(commands),
@@ -4185,12 +4280,16 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp execute_compact_pipeline(mode, items, payload, state) do
-    with :ok <- validate_compact_pipeline(mode, items, payload, state) do
+    with {:ok, request_context} <- RequestContext.from_payload(payload, state),
+         :ok <- validate_compact_pipeline(mode, items, payload, state) do
       return_format = compact_pipeline_return_format(payload)
+
+      scoped_state =
+        Map.put(state, :instance_ctx, attach_request_context(state.instance_ctx, request_context))
 
       fast_path_result =
         if FerricStore.ResourceLimits.default_implementation?() do
-          execute_compact_pipeline_fast_path(mode, items, return_format, state)
+          execute_compact_pipeline_fast_path(mode, items, return_format, scoped_state)
         else
           :fallback
         end
@@ -4204,7 +4303,7 @@ defmodule FerricstoreServer.Native.Commands do
 
         :fallback ->
           with {:ok, commands} <- compact_pipeline_commands(mode, items) do
-            execute_pipeline_commands(commands, return_format, state, %{})
+            execute_pipeline_commands(commands, return_format, state, request_context)
           else
             {:error, reason} -> {:bad_request, reason, state}
           end
@@ -4218,9 +4317,20 @@ defmodule FerricstoreServer.Native.Commands do
   defp compact_pipeline_return_format(payload), do: pipeline_return_format(payload)
 
   defp execute_pipeline_commands(commands, return_format, state, request_context) do
+    fast_path_state =
+      if request_context == %{} do
+        state
+      else
+        Map.put(
+          state,
+          :instance_ctx,
+          attach_request_context(state.instance_ctx, request_context)
+        )
+      end
+
     fast_path_result =
       if FerricStore.ResourceLimits.default_implementation?() do
-        execute_pipeline_fast_path(commands, state)
+        execute_pipeline_fast_path(commands, fast_path_state)
       else
         :fallback
       end
@@ -4281,7 +4391,7 @@ defmodule FerricstoreServer.Native.Commands do
   defp maybe_prepare_pipeline_command(@op_command_exec, body) do
     with {:ok, command} <- require_binary(body, "command"),
          {:ok, args} <- raw_command_args(body),
-         {:ok, prepared} <- Ferricstore.Commands.Dispatcher.prepare_raw(command, args) do
+         {:ok, prepared} <- prepare_raw_command(command, args) do
       Map.put(body, :__prepared_command__, prepared)
     else
       _invalid_command -> body
@@ -4307,7 +4417,7 @@ defmodule FerricstoreServer.Native.Commands do
       _not_prepared ->
         with {:ok, command} <- require_binary(body, "command"),
              {:ok, args} <- raw_command_args(body),
-             {:ok, prepared} <- Ferricstore.Commands.Dispatcher.prepare_raw(command, args) do
+             {:ok, prepared} <- prepare_raw_command(command, args) do
           InternalKey.authorize_command(prepared.command, prepared.acl_keys)
         else
           _parse_or_validation_error -> :ok
@@ -6654,109 +6764,16 @@ defmodule FerricstoreServer.Native.Commands do
   defp flow_get_read_ops(_mode, ops), do: ops
 
   defp compact_flow_get_results(ctx, mode, ops) do
-    started = FlowTelemetry.start_time()
     read_ops = flow_get_read_ops(mode, ops)
-
-    if compact_flow_get_valid_ops?(read_ops) do
-      results =
-        case read_ops do
-          [] ->
-            []
-
-          [{:flow_get, _id, opts} | rest] ->
-            partition_key = Keyword.get(opts, :partition_key)
-
-            if compact_flow_get_same_partition?(rest, partition_key) do
-              compact_flow_get_same_partition_results(ctx, read_ops, partition_key, mode)
-            else
-              compact_flow_get_partitioned_results(ctx, read_ops, mode)
-            end
-        end
-
-      FlowTelemetry.observe_pipeline_read_batch(started, read_ops)
-      results
-    else
-      Ferricstore.Flow.pipeline_read_batch(ctx, read_ops)
-    end
+    Ferricstore.Flow.pipeline_read_batch(ctx, read_ops)
   end
 
-  defp compact_flow_get_valid_ops?(ops), do: Enum.all?(ops, &compact_flow_get_valid_op?/1)
-
-  defp compact_flow_get_valid_op?({:flow_get, id, opts}) when is_binary(id) and id != "" do
-    partition_key = Keyword.get(opts, :partition_key)
-    max_key_size = Router.max_key_size()
-
-    cond do
-      is_binary(partition_key) and partition_key == "" ->
-        false
-
-      byte_size(id) + 53 <= max_key_size ->
-        true
-
-      true ->
-        byte_size(FlowKeys.state_key(id, partition_key)) <= max_key_size
-    end
+  defp maybe_compact_flow_get_meta_results(results, 17) do
+    Enum.map(results, fn
+      {:ok, %{} = record} -> {:ok, FlowRecordProjection.meta(record)}
+      result -> result
+    end)
   end
-
-  defp compact_flow_get_valid_op?(_op), do: false
-
-  defp compact_flow_get_same_partition?([], _partition_key), do: true
-
-  defp compact_flow_get_same_partition?([{:flow_get, _id, opts} | rest], partition_key),
-    do:
-      Keyword.get(opts, :partition_key) == partition_key and
-        compact_flow_get_same_partition?(rest, partition_key)
-
-  defp compact_flow_get_same_partition?(_ops, _partition_key), do: false
-
-  defp compact_flow_get_same_partition_results(ctx, ops, partition_key, mode) do
-    ids = Enum.map(ops, fn {:flow_get, id, _opts} -> id end)
-
-    ctx
-    |> Router.flow_batch_get(ids, partition_key)
-    |> Enum.map(&compact_flow_get_decode(&1, mode))
-  end
-
-  defp compact_flow_get_partitioned_results(ctx, ops, mode) do
-    indexed_pairs =
-      ops
-      |> Enum.with_index()
-      |> Enum.group_by(fn {{:flow_get, _id, opts}, _idx} -> Keyword.get(opts, :partition_key) end)
-      |> Enum.flat_map(fn {partition_key, group} ->
-        ids = Enum.map(group, fn {{:flow_get, id, _opts}, _idx} -> id end)
-        values = Router.flow_batch_get(ctx, ids, partition_key)
-
-        group
-        |> Enum.zip(values)
-        |> Enum.map(fn {{{:flow_get, _id, _opts}, idx}, value} ->
-          {idx, compact_flow_get_decode(value, mode)}
-        end)
-      end)
-      |> Map.new()
-
-    for idx <- 0..(length(ops) - 1), do: Map.fetch!(indexed_pairs, idx)
-  end
-
-  defp compact_flow_get_decode(nil), do: {:ok, nil}
-
-  defp compact_flow_get_decode(value) when is_binary(value) do
-    {:ok, FlowCodec.decode_record(value)}
-  rescue
-    _ -> {:ok, nil}
-  end
-
-  defp compact_flow_get_decode({:error, _reason} = error), do: error
-  defp compact_flow_get_decode(_value), do: {:ok, nil}
-
-  defp compact_flow_get_decode(value, 17) when is_binary(value) do
-    {:ok, FlowCodec.decode_record_meta(value)}
-  rescue
-    _ -> {:ok, nil}
-  end
-
-  defp compact_flow_get_decode(value, _mode), do: compact_flow_get_decode(value)
-
-  defp maybe_compact_flow_get_meta_results(results, 17), do: results
 
   defp maybe_compact_flow_get_meta_results(results, _mode), do: results
 
@@ -7561,8 +7578,9 @@ defmodule FerricstoreServer.Native.Commands do
     {result, state}
   end
 
-  defp command_body_with_request_context(@op_command_exec, body, request_context)
-       when is_map(body) and map_size(request_context) > 0 do
+  defp command_body_with_request_context(opcode, body, request_context)
+       when opcode in [@op_command_exec, @op_flow_query] and
+              is_map(body) and map_size(request_context) > 0 do
     Map.put(body, "request_context", request_context)
   end
 
@@ -7579,6 +7597,7 @@ defmodule FerricstoreServer.Native.Commands do
           |> Map.drop([
             "opts",
             "deadline_ms",
+            "request_context",
             :__wire_flow_items_normalized__,
             :__wire_flow_opts__ | drop_keys
           ])

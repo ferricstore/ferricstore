@@ -231,7 +231,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 1, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 2, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
@@ -250,7 +250,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 5, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 6, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
@@ -269,7 +269,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 6, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 7, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
@@ -288,7 +288,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 2, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 3, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
@@ -307,7 +307,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 4, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 5, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
@@ -326,7 +326,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 3, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 4, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end
@@ -343,7 +343,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     oversized =
       context
       |> ApplyContext.encode()
-      |> put_elem(tuple_size(ApplyContext.encode(context)) - 8, hard_max + 1)
+      |> put_elem(tuple_size(ApplyContext.encode(context)) - 9, hard_max + 1)
 
     assert {:error, :invalid_apply_context} = ApplyContext.decode(oversized)
   end

@@ -25,6 +25,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       alias Ferricstore.Flow.PolicyPatch
       alias Ferricstore.Flow.RetryPolicy
       alias Ferricstore.Flow.StateMeta
+      alias Ferricstore.Flow.SystemMetadata
       alias Ferricstore.HLC
 
       alias Ferricstore.Store.{
@@ -289,6 +290,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
           run_state: nil,
           child_groups: %{}
         }
+        |> SystemMetadata.put_record(Map.get(attrs, :system_metadata, %{}))
         |> flow_put_record_attributes(Map.get(attrs, :attributes))
         |> StateMeta.apply_update(attrs)
         |> flow_stamp_terminal_retention(now_ms)

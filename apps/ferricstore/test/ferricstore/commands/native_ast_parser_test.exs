@@ -153,6 +153,35 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     end
   end
 
+  test "FLOW.QUERY keeps FQL version, query text, and named parameters distinct" do
+    query =
+      "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
+
+    assert {:ok, "FLOW.QUERY", _args,
+            {:flow_query, "FQL1", ^query, %{"partition" => "tenant-a", "flow_id" => "run-123"}},
+            ["*"]} =
+             NativeAstParser.parse("FLOW.QUERY", [
+               "FQL1",
+               query,
+               "partition",
+               "tenant-a",
+               "flow_id",
+               "run-123"
+             ])
+
+    assert {:ok, "FLOW.QUERY", _args, {:flow_query, {:error, error}}, ["*"]} =
+             NativeAstParser.parse("FLOW.QUERY", ["FQL1", query, "dangling"])
+
+    assert error =~ "parameter"
+
+    params = Enum.flat_map(1..65, fn index -> ["parameter_#{index}", "value"] end)
+
+    assert {:ok, "FLOW.QUERY", _args, {:flow_query, {:error, too_many_error}}, ["*"]} =
+             NativeAstParser.parse("FLOW.QUERY", ["FQL1", query | params])
+
+    assert too_many_error =~ "at most 64"
+  end
+
   test "parses hot string command ASTs directly" do
     assert {:ok, "GET", ["k"], {:get, "k"}, ["k"]} = NativeAstParser.parse("get", ["k"])
 

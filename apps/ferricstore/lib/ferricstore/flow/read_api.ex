@@ -13,6 +13,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Flow.RecordQuery
   alias Ferricstore.Flow.RecordRead
+  alias Ferricstore.Flow.ScopeBinding
   alias Ferricstore.Flow.StateMeta
   alias Ferricstore.Flow.TerminalQuery
 
@@ -34,6 +35,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          {:ok, records} <-
            list_records(
              ctx,
@@ -69,6 +72,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          :ok <- validate_search_filters(attributes, state_meta),
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          :ok <-
            validate_indexed_search_attributes(
              ctx,
@@ -99,7 +104,8 @@ defmodule Ferricstore.Flow.ReadAPI do
        |> Enum.filter(&StateMeta.matches?(&1, state_meta))
        |> RecordQuery.sort_by_update()
        |> RecordQuery.maybe_reverse(query.rev?)
-       |> Enum.take(count)}
+       |> Enum.take(count)
+       |> Enum.map(&RecordProjection.public/1)}
     end
   end
 
@@ -114,6 +120,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          {:ok, names} <- policy_indexed_attributes(ctx, type),
          {:ok, entries} <-
            attribute_name_entries(ctx, type, state, partition_key, names, consistent_projection?) do
@@ -141,6 +149,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          {:ok, names} <- policy_indexed_attributes(ctx, type),
          true <- attr_name in names,
          {:ok, entries} <-
@@ -179,6 +189,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, from_ms} <- optional_non_neg_integer(opts, :from_ms, nil),
          {:ok, to_ms} <- optional_non_neg_integer(opts, :to_ms, nil),
          :ok <- validate_ms_range(from_ms, to_ms),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          query = %{from_ms: from_ms, to_ms: to_ms, rev?: rev?},
          {:ok, records} <-
            RecordRead.terminal_records(
@@ -198,7 +210,8 @@ defmodule Ferricstore.Flow.ReadAPI do
        |> RecordQuery.filter_by_ms(from_ms, to_ms)
        |> RecordQuery.sort_by_update()
        |> RecordQuery.maybe_reverse(rev?)
-       |> Enum.take(count)}
+       |> Enum.take(count)
+       |> Enum.map(&RecordProjection.public/1)}
     end
   end
 
@@ -229,6 +242,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          {:ok, records} <-
            related_index_records(
              ctx,
@@ -242,14 +257,16 @@ defmodule Ferricstore.Flow.ReadAPI do
                  IndexQuery.record_matches?(record, query, @terminal_states)
              end
            ) do
-      {:ok,
-       RecordRead.filter_index_records(
-         records,
-         :parent_flow_id,
-         parent_flow_id,
-         query,
-         @terminal_states
-       )}
+      result =
+        RecordRead.filter_index_records(
+          records,
+          :parent_flow_id,
+          parent_flow_id,
+          query,
+          @terminal_states
+        )
+
+      {:ok, Enum.map(result, &RecordProjection.public/1)}
     end
   end
 
@@ -269,6 +286,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          {:ok, indexed_records} <-
            related_index_records(
              ctx,
@@ -288,14 +307,16 @@ defmodule Ferricstore.Flow.ReadAPI do
         |> Enum.reject(&is_nil/1)
         |> Enum.uniq_by(&Map.get(&1, :id))
 
-      {:ok,
-       RecordRead.filter_index_records(
-         records,
-         :root_flow_id,
-         root_flow_id,
-         query,
-         @terminal_states
-       )}
+      result =
+        RecordRead.filter_index_records(
+          records,
+          :root_flow_id,
+          root_flow_id,
+          query,
+          @terminal_states
+        )
+
+      {:ok, Enum.map(result, &RecordProjection.public/1)}
     end
   end
 
@@ -315,6 +336,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          {:ok, records} <-
            related_index_records(
              ctx,
@@ -328,14 +351,16 @@ defmodule Ferricstore.Flow.ReadAPI do
                  IndexQuery.record_matches?(record, query, @terminal_states)
              end
            ) do
-      {:ok,
-       RecordRead.filter_index_records(
-         records,
-         :correlation_id,
-         correlation_id,
-         query,
-         @terminal_states
-       )}
+      result =
+        RecordRead.filter_index_records(
+          records,
+          :correlation_id,
+          correlation_id,
+          query,
+          @terminal_states
+        )
+
+      {:ok, Enum.map(result, &RecordProjection.public/1)}
     end
   end
 
@@ -355,8 +380,10 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, older_than_ms} <- optional_non_neg_integer(opts, :older_than_ms, 0),
          {:ok, now_ms} <- optional_non_neg_integer(opts, :now_ms, CommandTime.now_ms()),
          cutoff = now_ms - older_than_ms,
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          {:ok, records} <- RecordRead.stuck_records(ctx, type, partition_key, cutoff, count) do
-      {:ok, records}
+      {:ok, Enum.map(records, &RecordProjection.public/1)}
     end
   end
 
@@ -374,6 +401,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, attributes} <- Attributes.from_opts(opts),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, true),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
          {:ok, count} <-
            stats_count_records(
              ctx,
@@ -446,7 +475,7 @@ defmodule Ferricstore.Flow.ReadAPI do
 
   defp stats_state_count(ctx, type, state, :auto, _consistent?) do
     state_keys =
-      Keys.auto_partition_keys()
+      ScopeBinding.auto_partition_keys(ctx)
       |> Enum.map(&{state, Keys.state_index_key(type, state, &1)})
 
     with :ok <- validate_index_keys(state_keys),
@@ -477,7 +506,7 @@ defmodule Ferricstore.Flow.ReadAPI do
        ) do
     scan_limit = stats_attribute_scan_limit()
 
-    Keys.auto_partition_keys()
+    ScopeBinding.auto_partition_keys(ctx)
     |> Enum.reduce_while({:ok, 0, scan_limit}, fn partition_key, {:ok, total, remaining} ->
       case stats_count_attribute_exact_partition(
              ctx,
@@ -684,7 +713,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          consistent_projection?
        ) do
     RecordQuery.bounded_auto_partition_records(
-      Keys.auto_partition_keys(),
+      ScopeBinding.auto_partition_keys(ctx),
       query.count,
       query.rev?,
       fn partition_key, fetch_count ->
@@ -741,7 +770,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          match_fun
        ) do
     RecordQuery.bounded_auto_partition_filtered_records(
-      Keys.auto_partition_keys(),
+      ScopeBinding.auto_partition_keys(ctx),
       query.count,
       query.rev?,
       fn partition_key, fetch_count, scan_budget ->
@@ -802,7 +831,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          match_fun
        ) do
     RecordQuery.bounded_auto_partition_filtered_records(
-      Keys.auto_partition_keys(),
+      ScopeBinding.auto_partition_keys(ctx),
       query.count,
       query.rev?,
       fn partition_key, fetch_count, scan_budget ->
@@ -1095,7 +1124,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   defp attribute_filter_values(value), do: [value]
 
   defp attribute_candidate_count(ctx, type, state, :auto, name, value, consistent?) do
-    Keys.auto_partition_keys()
+    ScopeBinding.auto_partition_keys(ctx)
     |> Enum.reduce_while({:ok, 0}, fn partition_key, {:ok, acc} ->
       case attribute_candidate_count(ctx, type, state, partition_key, name, value, consistent?) do
         {:ok, count} -> {:cont, {:ok, acc + count}}
@@ -1152,7 +1181,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   end
 
   defp state_meta_candidate_count(ctx, type, meta_state, :auto, name, value, consistent?) do
-    Keys.auto_partition_keys()
+    ScopeBinding.auto_partition_keys(ctx)
     |> Enum.reduce_while({:ok, 0}, fn partition_key, {:ok, acc} ->
       case state_meta_candidate_count(
              ctx,
@@ -1195,7 +1224,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          match_fun
        ) do
     RecordQuery.bounded_auto_partition_filtered_records(
-      Keys.auto_partition_keys(),
+      ScopeBinding.auto_partition_keys(ctx),
       query.count,
       query.rev?,
       fn partition_key, fetch_count, scan_budget ->
@@ -1293,7 +1322,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   end
 
   defp attribute_name_count(ctx, type, state, :auto, name, consistent?) do
-    partition_keys = Keys.auto_partition_keys()
+    partition_keys = ScopeBinding.auto_partition_keys(ctx)
     scan_limit = discovery_auto_bucket_scan_limit(partition_keys)
 
     partition_keys
@@ -1388,7 +1417,7 @@ defmodule Ferricstore.Flow.ReadAPI do
   end
 
   defp attribute_value_entries(ctx, type, state, attr_name, :auto, consistent?) do
-    auto_partition_keys = Keys.auto_partition_keys()
+    auto_partition_keys = ScopeBinding.auto_partition_keys(ctx)
     scan_limit = discovery_auto_bucket_scan_limit(auto_partition_keys)
 
     auto_partition_keys
@@ -1529,24 +1558,28 @@ defmodule Ferricstore.Flow.ReadAPI do
        ) do
     Enum.reduce_while(entries, {:ok, initial}, fn
       {key, value}, {:ok, acc} when is_binary(key) and is_binary(value) ->
-        case classify_fun.(path, key, value, now_ms) do
-          {:ok, true} ->
-            case attribute_value_from_query_key(key, raw_prefix) do
-              {:ok, attribute_value} ->
-                {:cont, {:ok, Map.update(acc, attribute_value, 1, &(&1 + 1))}}
+        if String.starts_with?(key, raw_prefix) do
+          case classify_fun.(path, key, value, now_ms) do
+            {:ok, {:live, discovery_component}} ->
+              case attribute_value_from_query_component(discovery_component) do
+                {:ok, attribute_value} ->
+                  {:cont, {:ok, Map.update(acc, attribute_value, 1, &(&1 + 1))}}
 
-              :error ->
-                {:halt, {:error, {:invalid_query_index_key, key}}}
-            end
+                :error ->
+                  {:halt, {:error, {:invalid_query_index_key, key}}}
+              end
 
-          {:ok, false} ->
-            {:cont, {:ok, acc}}
+            {:ok, :expired} ->
+              {:cont, {:ok, acc}}
 
-          {:error, _reason} = error ->
-            {:halt, error}
+            {:error, _reason} = error ->
+              {:halt, error}
 
-          invalid ->
-            {:halt, {:error, {:invalid_query_index_classification, invalid}}}
+            invalid ->
+              {:halt, {:error, {:invalid_query_index_classification, invalid}}}
+          end
+        else
+          {:halt, {:error, {:invalid_query_index_key, key}}}
         end
 
       invalid, _acc ->
@@ -1560,17 +1593,25 @@ defmodule Ferricstore.Flow.ReadAPI do
   defp live_query_index_value?(path, key, value, now_ms, delete_fun)
        when is_function(delete_fun, 2) do
     case Ferricstore.Flow.LMDB.decode_query_index_value(value) do
-      {:ok, {id, updated_at_ms, expire_at_ms, _state_key}} ->
+      {:ok,
+       {family_digest, index_digest, discovery_component, id, updated_at_ms, expire_at_ms,
+        _state_key}} ->
         cond do
-          not Ferricstore.Flow.LMDB.query_index_entry_key?(key, id, updated_at_ms) ->
+          not Ferricstore.Flow.LMDB.query_index_entry_key?(
+            key,
+            family_digest,
+            index_digest,
+            id,
+            updated_at_ms
+          ) ->
             {:error, {:invalid_query_index_value, key}}
 
           expire_at_ms <= 0 or expire_at_ms > now_ms ->
-            {:ok, true}
+            {:ok, {:live, discovery_component}}
 
           true ->
             case delete_fun.(path, [{:delete, key}]) do
-              :ok -> {:ok, false}
+              :ok -> {:ok, :expired}
               {:error, _reason} = error -> error
               invalid -> {:error, {:invalid_query_index_delete_result, invalid}}
             end
@@ -1581,33 +1622,14 @@ defmodule Ferricstore.Flow.ReadAPI do
     end
   end
 
-  defp attribute_value_from_query_key(key, raw_prefix) do
-    prefix_size = byte_size(raw_prefix)
-
-    cond do
-      byte_size(key) <= prefix_size ->
-        :error
-
-      binary_part(key, 0, prefix_size) != raw_prefix ->
-        :error
-
-      true ->
-        rest = binary_part(key, prefix_size, byte_size(key) - prefix_size)
-
-        case :binary.match(rest, <<0>>) do
-          {value_size, 1} ->
-            encoded_value = binary_part(rest, 0, value_size)
-
-            case Keys.decode_index_component(encoded_value) do
-              {:ok, index_value} -> {:ok, Attributes.decode_index_value(index_value)}
-              :error -> :error
-            end
-
-          :nomatch ->
-            :error
-        end
+  defp attribute_value_from_query_component(encoded_value) when is_binary(encoded_value) do
+    case Keys.decode_index_component(encoded_value) do
+      {:ok, index_value} -> {:ok, Attributes.decode_index_value(index_value)}
+      :error -> :error
     end
   end
+
+  defp attribute_value_from_query_component(_invalid), do: :error
 
   @doc false
   def __attribute_value_counts_from_chunks_for_test__(

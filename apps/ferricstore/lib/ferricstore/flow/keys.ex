@@ -303,8 +303,10 @@ defmodule Ferricstore.Flow.Keys do
   def policy_migration_job_key?(_key), do: false
 
   def policy_catalog_projection_prefix(type) when is_binary(type) and type != "" do
-    <<0, "fpc:1:", digest(type)::binary, ?:>>
+    policy_catalog_projection_global_prefix() <> digest(type) <> ":"
   end
+
+  def policy_catalog_projection_global_prefix, do: <<0, "fpc:1:">>
 
   def policy_catalog_projection_key(type, catalog_key, generation)
       when is_binary(type) and type != "" and is_binary(catalog_key) and
@@ -315,29 +317,35 @@ defmodule Ferricstore.Flow.Keys do
 
   def decode_policy_catalog_projection_key(type, key)
       when is_binary(type) and type != "" and is_binary(key) do
-    prefix = policy_catalog_projection_prefix(type)
-
-    case key do
-      <<^prefix::binary, generation::unsigned-big-64, catalog_key::binary>>
-      when catalog_key != "" ->
-        case type_catalog_descriptor_key_from_member(catalog_key) do
-          {:ok, descriptor_key} ->
-            if descriptor_key == type_catalog_descriptor_key(type) do
-              {:ok, %{catalog_key: catalog_key, migration_generation: generation}}
-            else
-              :error
-            end
-
-          :error ->
-            :error
-        end
-
-      _invalid ->
-        :error
+    with {:ok, decoded} <- decode_policy_catalog_projection_key(key),
+         true <- decoded.type_digest == digest(type) do
+      {:ok, Map.delete(decoded, :type_digest)}
+    else
+      _invalid -> :error
     end
   end
 
   def decode_policy_catalog_projection_key(_type, _key), do: :error
+
+  def decode_policy_catalog_projection_key(key) when is_binary(key) do
+    prefix = policy_catalog_projection_global_prefix()
+
+    with <<^prefix::binary, type_digest::binary-size(43), ?:,
+           generation::unsigned-big-64, catalog_key::binary>> when catalog_key != "" <- key,
+         true <- valid_digest?(type_digest),
+         {:ok, ^type_digest} <- type_catalog_digest_from_member(catalog_key) do
+      {:ok,
+       %{
+         catalog_key: catalog_key,
+         migration_generation: generation,
+         type_digest: type_digest
+       }}
+    else
+      _invalid -> :error
+    end
+  end
+
+  def decode_policy_catalog_projection_key(_key), do: :error
 
   def policy_type("f:" <> @global_tag <> ":policy:" <> type) when type != "", do: {:ok, type}
   def policy_type(_key), do: :error
@@ -662,6 +670,17 @@ defmodule Ferricstore.Flow.Keys do
   end
 
   def state_key?(key), do: internal_key_with_remainder?(key, "}:s:")
+
+  @doc false
+  @spec run_id_from_state_key(binary()) :: {:ok, binary()} | :error
+  def run_id_from_state_key(state_key) when is_binary(state_key) do
+    case split_internal_flow_key(state_key, "}:s:") do
+      {:ok, _tag_prefix, id} when id != "" -> {:ok, id}
+      _invalid -> :error
+    end
+  end
+
+  def run_id_from_state_key(_state_key), do: :error
 
   def retention_guard_key_from_state_key(state_key) when is_binary(state_key) do
     with {:ok, tag_prefix, id} <- split_internal_flow_key(state_key, "}:s:"),

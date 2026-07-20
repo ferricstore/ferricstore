@@ -143,6 +143,137 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
     assert Access.map_size() == LMDB.map_size()
   end
 
+  test "oversized Flow state keys remain logical across LMDB point access" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_long_state_key_#{System.unique_integer([:positive])}"
+      )
+
+    state_key =
+      Ferricstore.Flow.Keys.state_key(
+        :binary.copy("r", 60_000),
+        "tenant-a"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert byte_size(state_key) > 511
+    assert :ok = LMDB.write_batch(path, [{:put_new, state_key, "v1"}])
+    assert {:ok, "v1"} = LMDB.get(path, state_key)
+    assert {:ok, "v1"} = Access.get(path, state_key)
+    assert {:ok, [{:ok, "v1"}, :not_found]} = LMDB.get_many(path, [state_key, "missing"])
+
+    assert {:ok, [{:ok, "v1"}], 2} =
+             LMDB.get_many_bounded(path, [state_key], 2)
+
+    assert {:ok, [{^state_key, {:value, "v1"}}]} =
+             LMDB.write_batch_with_originals(path, [
+               {:compare, state_key, "v1"},
+               {:put, state_key, "v2"}
+             ])
+
+    assert {:error, {:compare_failed, ^state_key}} =
+             LMDB.write_batch(path, [{:compare, state_key, "stale"}])
+
+    assert {:ok, "v2"} = LMDB.get(path, state_key)
+    assert :ok = LMDB.write_batch(path, [{:compare, state_key, "v2"}, {:delete, state_key}])
+    assert :not_found = LMDB.get(path, state_key)
+
+    assert {:error, :batch_key_budget_exceeded} =
+             LMDB.get_many_bounded(path, List.duplicate(state_key, 140), 1)
+  end
+
+  test "ordered Flow indexes compact oversized identities without losing their range prefix" do
+    id = :binary.copy("r", 60_000)
+    state_key = Ferricstore.Flow.Keys.state_key(id, "tenant-a")
+    history_key = Ferricstore.Flow.Keys.history_key(id, "tenant-a")
+
+    active_key = LMDB.active_index_key("state-index", id, 10)
+    terminal_key = LMDB.terminal_index_key("state-index", id, 10)
+    query_key = LMDB.query_index_key("query-index", id, 10)
+    history_index_key = LMDB.history_index_key(history_key, id, 10)
+
+    keys = [
+      active_key,
+      terminal_key,
+      query_key,
+      history_index_key,
+      LMDB.active_by_state_key_key(state_key),
+      LMDB.terminal_by_state_key_key(state_key),
+      LMDB.terminal_expire_key(20, terminal_key),
+      LMDB.history_expire_key(20, history_index_key),
+      LMDB.history_flow_expire_key(20, history_key)
+    ]
+
+    assert Enum.all?(keys, &(byte_size(&1) <= 511))
+    assert String.starts_with?(active_key, LMDB.active_index_prefix("state-index"))
+    assert String.starts_with?(terminal_key, LMDB.terminal_index_prefix("state-index"))
+    assert String.starts_with?(query_key, LMDB.query_index_prefix("query-index"))
+    assert String.starts_with?(history_index_key, LMDB.history_index_prefix(history_key))
+    assert LMDB.active_index_entry_key?(active_key, "state-index", id, 10)
+    assert LMDB.terminal_index_entry_key?(terminal_key, id, 10)
+    query_value = LMDB.encode_query_index_value("query-index", id, 10)
+
+    assert {:ok, {family_digest, index_digest, nil, ^id, 10, 0, nil}} =
+             LMDB.decode_query_index_value(query_value)
+
+    assert LMDB.query_index_entry_key?(query_key, family_digest, index_digest, id, 10)
+    assert LMDB.history_index_entry_key?(history_index_key, id, 10)
+  end
+
+  test "query indexes bound maximum attribute values while preserving discovery families" do
+    value = :binary.copy("v", 256)
+
+    index_key =
+      Ferricstore.Flow.Keys.attribute_index_key(
+        "invoice",
+        "completed",
+        "external_reference",
+        Ferricstore.Flow.Attributes.index_value(value),
+        "tenant-a"
+      )
+
+    family =
+      Ferricstore.Flow.Keys.attribute_index_prefix(
+        "invoice",
+        "completed",
+        "external_reference",
+        "tenant-a"
+      )
+
+    key = LMDB.query_index_key(index_key, "run-1", 10)
+
+    assert byte_size(key) <= 511
+    assert String.starts_with?(key, LMDB.query_index_prefix(index_key))
+    assert String.starts_with?(key, LMDB.query_index_raw_prefix(family))
+
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_large_attribute_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(path) end)
+
+    assert :ok = LMDB.write_batch(path, [{:put, key, "entry"}])
+    assert {:ok, [{^key, "entry"}]} = LMDB.prefix_entries(path, LMDB.query_index_prefix(index_key), 1)
+    assert {:ok, [{^key, "entry"}]} = LMDB.prefix_entries(path, LMDB.query_index_raw_prefix(family), 1)
+  end
+
+  test "query index family parsing ignores attribute-like text inside opaque identities" do
+    index_key =
+      Ferricstore.Flow.Keys.parent_index_key(
+        "opaque}:i:a:forged=value",
+        "tenant-a"
+      )
+
+    key = LMDB.query_index_key(index_key, "run-1", 10)
+
+    assert String.starts_with?(key, LMDB.query_index_raw_prefix(index_key))
+    assert String.starts_with?(key, LMDB.query_index_prefix(index_key))
+  end
+
   test "LMDB environment discovery rejects symlinked directories and database files" do
     root =
       Path.join(

@@ -10,6 +10,8 @@ defmodule Ferricstore.Flow.LMDB do
   @default_map_size 16 * 1024 * 1024 * 1024
   @release_retry_interval_ms 5
   @max_u64 18_446_744_073_709_551_615
+  @max_bounded_range_items 100_000
+  @max_bounded_range_bytes 64 * 1_024 * 1_024
   @flow_due_any_index_enabled Application.compile_env(
                                 :ferricstore,
                                 :flow_due_any_index,
@@ -82,7 +84,7 @@ defmodule Ferricstore.Flow.LMDB do
   def decode_value(blob, _now_ms) when is_binary(blob), do: :error
 
   def get(path, key) when is_binary(path) and is_binary(key) do
-    if Ferricstore.FS.dir?(path), do: NIF.lmdb_get(path, key, map_size()), else: :not_found
+    Access.get(path, key)
   end
 
   def encode_value_locator(expire_at_ms, file_id, offset, value_size),
@@ -176,6 +178,10 @@ defmodule Ferricstore.Flow.LMDB do
 
   def get_many(path, keys) when is_binary(path) and is_list(keys), do: Access.get_many(path, keys)
 
+  def get_many_bounded(path, keys, max_bytes)
+      when is_binary(path) and is_list(keys) and is_integer(max_bytes) and max_bytes > 0,
+      do: Access.get_many_bounded(path, keys, max_bytes)
+
   def warm(path) when is_binary(path) do
     case NIF.lmdb_get(path, <<0>>, map_size()) do
       {:ok, _value} -> :ok
@@ -187,7 +193,7 @@ defmodule Ferricstore.Flow.LMDB do
   def write_batch(_path, []), do: :ok
 
   def write_batch(path, ops) when is_binary(path) and is_list(ops) do
-    NIF.lmdb_write_batch(path, ops, map_size())
+    Access.write_batch(path, ops)
   end
 
   def clear_all(data_dir, shard_count)
@@ -311,7 +317,7 @@ defmodule Ferricstore.Flow.LMDB do
   def write_batch_with_originals(_path, []), do: {:ok, []}
 
   def write_batch_with_originals(path, ops) when is_binary(path) and is_list(ops) do
-    NIF.lmdb_write_batch_with_originals(path, ops, map_size())
+    Access.write_batch_with_originals(path, ops)
   end
 
   def prefix_entries(path, prefix, limit)
@@ -431,6 +437,48 @@ defmodule Ferricstore.Flow.LMDB do
       {:ok, []}
     end
   end
+
+  def range_entries_bounded(path, prefix, after_key, before_key, max_items, max_bytes)
+      when is_binary(path) and is_binary(prefix) and prefix != "" and is_binary(after_key) and
+             is_binary(before_key) and is_integer(max_items) and max_items > 0 and
+             max_items <= @max_bounded_range_items and is_integer(max_bytes) and max_bytes > 0 and
+             max_bytes <= @max_bounded_range_bytes do
+    if valid_range_bound?(prefix, after_key) and valid_range_bound?(prefix, before_key) and
+         valid_range_order?(after_key, before_key) do
+      if Ferricstore.FS.dir?(path) do
+        NIF.lmdb_range_entries_bounded(
+          path,
+          prefix,
+          after_key,
+          before_key,
+          max_items,
+          max_bytes,
+          map_size()
+        )
+      else
+        {:ok, [], true, 0}
+      end
+    else
+      {:error, :invalid_lmdb_range}
+    end
+  end
+
+  def range_entries_bounded(
+        _path,
+        _prefix,
+        _after_key,
+        _before_key,
+        _max_items,
+        _max_bytes
+      ),
+      do: {:error, :invalid_lmdb_range}
+
+  defp valid_range_bound?(_prefix, ""), do: true
+  defp valid_range_bound?(prefix, key), do: String.starts_with?(key, prefix)
+
+  defp valid_range_order?(_after_key, ""), do: true
+  defp valid_range_order?("", _before_key), do: true
+  defp valid_range_order?(after_key, before_key), do: after_key < before_key
 
   def prefix_entries(path, prefix, limit, false), do: prefix_entries(path, prefix, limit)
 
@@ -697,8 +745,25 @@ defmodule Ferricstore.Flow.LMDB do
   def query_index_key(index_key, id, updated_at_ms),
     do: Ferricstore.Flow.LMDB.IndexCodec.query_index_key(index_key, id, updated_at_ms)
 
-  def query_index_entry_key?(key, id, updated_at_ms),
-    do: Ferricstore.Flow.LMDB.IndexCodec.query_index_entry_key?(key, id, updated_at_ms)
+  def query_index_entry_key?(key, family_digest, index_digest, id, updated_at_ms),
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.query_index_entry_key?(
+        key,
+        family_digest,
+        index_digest,
+        id,
+        updated_at_ms
+      )
+
+  def query_index_entry(index_key, id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil),
+    do:
+      Ferricstore.Flow.LMDB.IndexCodec.query_index_entry(
+        index_key,
+        id,
+        updated_at_ms,
+        expire_at_ms,
+        state_key
+      )
 
   def history_index_prefix(history_key),
     do: Ferricstore.Flow.LMDB.IndexCodec.history_index_prefix(history_key)
@@ -779,9 +844,10 @@ defmodule Ferricstore.Flow.LMDB do
   def decode_history_flow_expire_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_history_flow_expire_value(blob)
 
-  def encode_query_index_value(id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil),
+  def encode_query_index_value(index_key, id, updated_at_ms, expire_at_ms \\ 0, state_key \\ nil),
     do:
       Ferricstore.Flow.LMDB.IndexCodec.encode_query_index_value(
+        index_key,
         id,
         updated_at_ms,
         expire_at_ms,

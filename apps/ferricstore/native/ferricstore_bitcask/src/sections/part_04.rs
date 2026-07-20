@@ -291,6 +291,101 @@ fn lmdb_get_many<'a>(
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
+fn lmdb_get_many_bounded<'a>(
+    env: Env<'a>,
+    path: String,
+    keys: Term<'a>,
+    max_bytes: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    const MAX_KEYS: usize = 4_096;
+    const MAX_KEY_BYTES: usize = 8 * 1_024 * 1_024;
+
+    let key_count = keys.list_length()?;
+
+    if key_count > MAX_KEYS {
+        return Ok((atoms::error(), atoms::batch_key_budget_exceeded()).encode(env));
+    }
+
+    let mut decoded_keys = Vec::with_capacity(key_count);
+    let mut key_bytes = 0_usize;
+
+    for key in keys.into_list_iterator()? {
+        let key = key.decode::<Binary<'a>>()?;
+        let Some(next_key_bytes) = key_bytes.checked_add(key.as_slice().len()) else {
+            return Ok((atoms::error(), atoms::batch_key_budget_exceeded()).encode(env));
+        };
+
+        if next_key_bytes > MAX_KEY_BYTES {
+            return Ok((atoms::error(), atoms::batch_key_budget_exceeded()).encode(env));
+        }
+
+        key_bytes = next_key_bytes;
+        decoded_keys.push(key);
+    }
+
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let mut values = Vec::with_capacity(decoded_keys.len());
+            let mut total_bytes = 0_u64;
+
+            for key in &decoded_keys {
+                match store.db.get(&rtxn, key.as_slice()) {
+                    Ok(Some(value)) => {
+                        let Ok(value_bytes) = u64::try_from(value.len()) else {
+                            return Ok(
+                                (atoms::error(), atoms::batch_value_budget_exceeded()).encode(env),
+                            );
+                        };
+
+                        let Some(next_total) = total_bytes.checked_add(value_bytes) else {
+                            return Ok(
+                                (atoms::error(), atoms::batch_value_budget_exceeded()).encode(env),
+                            );
+                        };
+
+                        if next_total > max_bytes {
+                            return Ok(
+                                (atoms::error(), atoms::batch_value_budget_exceeded()).encode(env),
+                            );
+                        }
+
+                        total_bytes = next_total;
+                        values.push(Some(value));
+                    }
+                    Ok(None) => values.push(None),
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                }
+            }
+
+            let mut results = Vec::with_capacity(values.len());
+
+            for value in values {
+                match value {
+                    Some(value) => {
+                        let mut binary = OwnedBinary::new(value.len()).ok_or_else(|| {
+                            rustler::Error::Term(Box::new("failed to allocate binary"))
+                        })?;
+                        binary.as_mut_slice().copy_from_slice(value);
+                        results.push((atoms::ok(), binary.release(env)).encode(env));
+                    }
+                    None => results.push(atoms::not_found().encode(env)),
+                }
+            }
+
+            Ok((atoms::ok(), results, total_bytes).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
 fn lmdb_put<'a>(
     env: Env<'a>,
     path: String,
@@ -584,6 +679,86 @@ fn lmdb_prefix_entries_after_bounded<'a>(
             }
 
             Ok((atoms::ok(), entries).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_range_entries_bounded<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    after_key: Binary<'a>,
+    before_key: Binary<'a>,
+    max_items: u64,
+    max_bytes: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let start = if after_key.as_slice().is_empty() {
+                std::ops::Bound::Included(prefix.as_slice())
+            } else {
+                std::ops::Bound::Excluded(after_key.as_slice())
+            };
+            let upper = before_key.as_slice();
+            let end = if upper.is_empty() {
+                std::ops::Bound::Unbounded
+            } else {
+                std::ops::Bound::Excluded(upper)
+            };
+            let range = (start, end);
+            let iter = match store.db.range(&rtxn, &range) {
+                Ok(iter) => iter,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let item_cap = usize::try_from(max_items).unwrap_or(usize::MAX);
+            let byte_cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let mut entries = Vec::new();
+            let mut entry_bytes = 0usize;
+            let mut exhausted = true;
+
+            for item in iter {
+                let (key, value) = match item {
+                    Ok(entry) => entry,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                };
+
+                if !key.starts_with(prefix.as_slice()) {
+                    break;
+                }
+
+                if entries.len() >= item_cap {
+                    exhausted = false;
+                    break;
+                }
+
+                let row_bytes = key.len().saturating_add(value.len());
+                if row_bytes > byte_cap && entries.is_empty() {
+                    return Ok((atoms::error(), atoms::range_entry_too_large()).encode(env));
+                }
+
+                let next_bytes = entry_bytes.saturating_add(row_bytes);
+                if next_bytes > byte_cap {
+                    exhausted = false;
+                    break;
+                }
+
+                let key_term = binary_term(env, key)?;
+                let value_term = binary_term(env, value)?;
+                entries.push((key_term, value_term).encode(env));
+                entry_bytes = next_bytes;
+            }
+
+            Ok((atoms::ok(), entries, exhausted, entry_bytes).encode(env))
         }
         Err(e) => Ok((atoms::error(), e).encode(env)),
     }

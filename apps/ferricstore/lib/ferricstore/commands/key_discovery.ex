@@ -2,6 +2,9 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   @moduledoc false
 
   alias Ferricstore.Commands.{Extension, NativeAstParser, TransactionPolicy}
+  alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.Query
+  alias Ferricstore.Flow.Query.Request
 
   @type result :: {:ok, [binary()]} | :not_dynamic
   @type access :: :read | :write | :rw
@@ -46,7 +49,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     EXISTS TYPE OBJECT MEMORY TTL PTTL EXPIRETIME PEXPIRETIME
     KEY_INFO ROUTE ROUTE_BATCH CLUSTER.KEYSLOT FERRICSTORE.KEY_INFO FERRICSTORE.CAPABILITIES
     FERRICSTORE.TELEMETRY WATCH
-    FLOW.GET FLOW.POLICY.GET FLOW.LIST FLOW.SEARCH FLOW.BY_PARENT FLOW.BY_ROOT
+    FLOW.GET FLOW.POLICY.GET FLOW.LIST FLOW.SEARCH FLOW.QUERY FLOW.BY_PARENT FLOW.BY_ROOT
     FLOW.BY_CORRELATION FLOW.INFO FLOW.STUCK FLOW.STATS FLOW.ATTRIBUTES
     FLOW.ATTRIBUTE_VALUES FLOW.EFFECT.GET FLOW.GOVERNANCE.LEDGER FLOW.GOVERNANCE.OVERVIEW
     FLOW.APPROVAL.GET FLOW.APPROVAL.LIST FLOW.CIRCUIT.GET FLOW.BUDGET.GET FLOW.BUDGET.LIST
@@ -131,12 +134,20 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA
   )
 
-  @spec prepare(binary(), [term()]) :: {:ok, prepared_description()} | {:error, binary()}
-  def prepare(name, args) do
+  @spec prepare(binary(), [term()], keyword()) ::
+          {:ok, prepared_description()} | {:error, binary()}
+  def prepare(name, args, opts \\ []) when is_list(opts) do
     case NativeAstParser.parse(name, args) do
       {:ok, command, parsed_args, {:unknown, unknown_command, _unknown_args}, _parser_keys}
       when unknown_command == command ->
         prepare_extension(command, parsed_args)
+
+      {:ok, "FLOW.QUERY", _parsed_args, {:flow_query, {:error, reason}}, _discovered_keys}
+      when is_binary(reason) ->
+        {:error, reason}
+
+      {:ok, "FLOW.QUERY", parsed_args, {:flow_query, version, query, params}, _discovered_keys} ->
+        prepare_flow_query(parsed_args, version, query, params, opts)
 
       {:ok, command, parsed_args, ast, discovered_keys} ->
         prepared_ast =
@@ -150,6 +161,23 @@ defmodule Ferricstore.Commands.KeyDiscovery do
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp prepare_flow_query(parsed_args, version, query, params, opts) do
+    parser = Keyword.get(opts, :flow_query_parser, Ferricstore.Flow.Query.ReferenceParser)
+
+    with {:ok, %Request{} = request} <- Query.prepare_text(version, query, params, parser),
+         {:ok, partition_key} <- Query.partition_key(request) do
+      {:ok,
+       describe_prepared(
+         "FLOW.QUERY",
+         parsed_args,
+         {:flow_query, request},
+         [partition_key]
+       )}
+    else
+      {:error, reason} when is_atom(reason) -> {:error, Query.error_message(reason)}
     end
   end
 
@@ -297,7 +325,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
 
   defp discovery_metadata(command, ast, acl_keys) do
     {read_keys, write_keys} = footprint(command, ast, acl_keys)
-    {routing_scope, routing_keys} = routing(command, acl_keys)
+    {routing_scope, routing_keys} = routing(command, ast, acl_keys)
     transaction_mode = TransactionPolicy.mode(command, ast, routing_scope)
     {read_keys, write_keys, routing_scope, routing_keys, transaction_mode}
   end
@@ -308,7 +336,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
 
   @spec route_keys(binary(), [binary()]) :: [binary()]
   def route_keys(command, keys) when is_binary(command) and is_list(keys),
-    do: command |> String.upcase() |> routing(keys) |> elem(1)
+    do: command |> String.upcase() |> routing(nil, keys) |> elem(1)
 
   @spec command_access_type(binary()) :: access()
   def command_access_type(command) when is_binary(command) do
@@ -388,14 +416,21 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   defp access_footprint(:write, keys), do: {[], keys}
   defp access_footprint(:rw, keys), do: {keys, keys}
 
-  defp routing("FLOW." <> _rest, _keys), do: {:coordinated, []}
+  defp routing("FLOW.QUERY", {:flow_query, %Request{} = request}, _keys) do
+    case Query.partition_key(request) do
+      {:ok, partition_key} -> {:keys, [Keys.state_key("", partition_key)]}
+      {:error, _reason} -> {:coordinated, []}
+    end
+  end
 
-  defp routing(command, _keys) when command in @coordinated_routing_commands,
+  defp routing("FLOW." <> _rest, _ast, _keys), do: {:coordinated, []}
+
+  defp routing(command, _ast, _keys) when command in @coordinated_routing_commands,
     do: {:coordinated, []}
 
-  defp routing(command, _keys) when command in @acl_only_routing_commands, do: {:none, []}
-  defp routing(_command, []), do: {:none, []}
-  defp routing(_command, keys), do: {:keys, keys}
+  defp routing(command, _ast, _keys) when command in @acl_only_routing_commands, do: {:none, []}
+  defp routing(_command, _ast, []), do: {:none, []}
+  defp routing(_command, _ast, keys), do: {:keys, keys}
 
   defp counted_keys(count, keys) do
     case Integer.parse(count) do

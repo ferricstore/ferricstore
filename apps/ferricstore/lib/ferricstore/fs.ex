@@ -30,6 +30,7 @@ defmodule Ferricstore.FS do
           | :directory_not_empty
           | :invalid_path
           | :symlink
+          | :insecure_permissions
           | :too_large
           | :other
 
@@ -62,6 +63,9 @@ defmodule Ferricstore.FS do
 
   @spec read_nofollow(binary(), non_neg_integer()) :: {:ok, binary()} | fs_error()
   def read_nofollow(path, max_bytes), do: NIF.fs_read_nofollow(path, max_bytes)
+
+  @spec read_private_nofollow(binary(), non_neg_integer()) :: {:ok, binary()} | fs_error()
+  def read_private_nofollow(path, max_bytes), do: NIF.fs_read_private_nofollow(path, max_bytes)
 
   @spec copy_sync_nofollow(binary(), binary()) :: :ok | fs_error()
   def copy_sync_nofollow(source, dest), do: NIF.fs_copy_sync_nofollow(source, dest)
@@ -178,6 +182,7 @@ defmodule Ferricstore.FS do
   defp fmt_reason({:directory_not_empty, _}), do: :enotempty
   defp fmt_reason({:invalid_path, msg}), do: msg
   defp fmt_reason({:symlink, _}), do: :eloop
+  defp fmt_reason({:insecure_permissions, _}), do: :eacces
   defp fmt_reason({:other, msg}), do: msg
   defp fmt_reason(other), do: inspect(other)
 end

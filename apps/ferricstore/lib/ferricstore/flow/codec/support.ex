@@ -15,6 +15,7 @@ defmodule Ferricstore.Flow.Codec.Support do
   @record_incarnation_key "__incarnation__"
   @record_state_enter_seq_key "__state_enter_seq__"
   @record_governance_limit_key "__governance_limit__"
+  @record_system_metadata_key "__system_metadata__"
   @history_value_refs_key "value_refs"
   @history_attributes_key "attributes"
   @history_state_meta_key "state_meta"
@@ -292,11 +293,12 @@ defmodule Ferricstore.Flow.Codec.Support do
     incarnation = Map.get(record, :incarnation)
     state_enter_seq = Map.get(record, :state_enter_seq)
     governance_limit = encode_governance_limit(Map.get(record, :governance_limit))
+    system_metadata = Ferricstore.Flow.SystemMetadata.record(record)
 
     if map_size(refs) == 0 and map_size(attributes) == 0 and indexed_attributes == [] and
          map_size(state_meta) == 0 and is_nil(indexed_state_meta) and
          not is_integer(incarnation) and not is_integer(state_enter_seq) and
-         is_nil(governance_limit) do
+         is_nil(governance_limit) and map_size(system_metadata) == 0 do
       encode_child_groups(child_groups)
     else
       child_groups
@@ -308,6 +310,7 @@ defmodule Ferricstore.Flow.Codec.Support do
       |> maybe_put_record_incarnation(incarnation)
       |> maybe_put_record_state_enter_seq(state_enter_seq)
       |> maybe_put_record_governance_limit(governance_limit)
+      |> maybe_put_record_system_metadata(system_metadata)
       |> encode_child_groups()
     end
   end
@@ -338,6 +341,9 @@ defmodule Ferricstore.Flow.Codec.Support do
     {governance_limit, child_groups} =
       Map.pop(child_groups, @record_governance_limit_key, nil)
 
+    {encoded_system_metadata, child_groups} =
+      Map.pop(child_groups, @record_system_metadata_key, nil)
+
     with {:ok, value_refs} <- decode_value_refs_strict(encoded_refs),
          {:ok, attributes} <- Ferricstore.Flow.Attributes.normalize(encoded_attributes),
          {:ok, indexed_attributes} <-
@@ -346,9 +352,10 @@ defmodule Ferricstore.Flow.Codec.Support do
          {:ok, indexed_state_meta} <-
            Ferricstore.Flow.StateMeta.normalize_indexed_key(indexed_state_meta),
          {:ok, incarnation} <- decode_optional_nonnegative_integer(incarnation),
-         {:ok, state_enter_seq} <- decode_optional_nonnegative_integer(state_enter_seq) do
+         {:ok, state_enter_seq} <- decode_optional_nonnegative_integer(state_enter_seq),
+         {:ok, system_metadata} <- decode_system_metadata(encoded_system_metadata) do
       {child_groups, value_refs, attributes, indexed_attributes, state_meta, indexed_state_meta,
-       incarnation, state_enter_seq, decode_governance_limit(governance_limit)}
+       incarnation, state_enter_seq, decode_governance_limit(governance_limit), system_metadata}
     else
       _ -> raise ArgumentError, "invalid flow record sidecar"
     end
@@ -402,6 +409,20 @@ defmodule Ferricstore.Flow.Codec.Support do
     do: Map.put(groups, @record_governance_limit_key, limit)
 
   def maybe_put_record_governance_limit(groups, _limit), do: groups
+
+  def maybe_put_record_system_metadata(groups, metadata)
+      when is_map(metadata) and map_size(metadata) > 0,
+      do:
+        Map.put(
+          groups,
+          @record_system_metadata_key,
+          Ferricstore.Flow.SystemMetadata.encode(metadata)
+        )
+
+  def maybe_put_record_system_metadata(groups, _metadata), do: groups
+
+  defp decode_system_metadata(nil), do: {:ok, %{}}
+  defp decode_system_metadata(encoded), do: Ferricstore.Flow.SystemMetadata.decode(encoded)
 
   def encode_governance_limit(nil), do: nil
 
