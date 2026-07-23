@@ -133,6 +133,49 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
     assert :not_found = LMDB.get(path, LMDB.active_by_state_key_key(state_key))
   end
 
+  test "writer coalescing keeps the highest record version regardless of arrival order" do
+    path = tmp_lmdb_path()
+    state_key = Ferricstore.Flow.Keys.state_key("run-coalesce-fence", "tenant-a")
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "runs_by_state_updated",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:state, :asc}, {:updated_at_ms, :desc}]
+      })
+
+    writer_state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{
+        query_index_provider: Provider,
+        test_pid: self(),
+        definitions: [definition]
+      },
+      terminal_count_inits: MapSet.new()
+    }
+
+    terminal = encoded_record("failed", 3, 300, "run-coalesce-fence")
+    stale = encoded_record("running", 2, 200, "run-coalesce-fence")
+
+    assert {:ok, ops, _state} =
+             ProjectionOps.expand_ops(writer_state, [
+               {:project_flow_state, state_key, terminal, 0},
+               {:project_flow_query_state, state_key, stale, 0}
+             ])
+
+    assert :ok = LMDB.write_batch(path, ops)
+    assert {:ok, wrapper} = LMDB.get(path, state_key)
+
+    assert {:ok, %{state: "failed", version: 3}} =
+             ProjectionOps.decode_flow_record_value(wrapper)
+
+    assert {:ok, reverse_blob} = LMDB.get(path, CompositeIndex.reverse_key(state_key))
+    assert {:ok, [entry_key]} = CompositeIndex.decode_reverse_value(reverse_blob, state_key)
+    assert {:ok, entry_blob} = LMDB.get(path, entry_key)
+    assert {:ok, %{record_version: 3}} = CompositeIndex.decode_entry_value(entry_blob)
+  end
+
   test "composite projection hydrates records whose logical state key exceeds LMDB limits" do
     path = tmp_lmdb_path()
     id = :binary.copy("r", 60_000)
@@ -251,6 +294,104 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
     assert {:ok, _counter} = LMDB.get(path, counter_key)
     expected_entry_value = entry.value
     assert {:ok, ^expected_entry_value} = LMDB.get(path, entry.key)
+  end
+
+  test "writer re-expands a projection after a concurrent reverse compare conflict" do
+    data_dir = tmp_data_dir()
+    instance_name = :"composite_retry_writer_#{System.unique_integer([:positive])}"
+    first_id = "run-retry-a"
+    first_key = Ferricstore.Flow.Keys.state_key(first_id, "tenant-a")
+    second_key = Ferricstore.Flow.Keys.state_key("run-retry-b", "tenant-a")
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "runs_by_state_updated",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:state, :asc}, {:updated_at_ms, :desc}]
+      })
+
+    instance_ctx = %{
+      name: instance_name,
+      data_dir: data_dir,
+      shard_count: 1,
+      query_index_provider: Provider,
+      test_pid: self(),
+      definitions: [definition]
+    }
+
+    on_exit(fn ->
+      Ferricstore.FaultInjection.clear_hook()
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(Ferricstore.DataDir.shard_data_path(data_dir, 0))
+
+    assert {:ok, _pid} =
+             Ferricstore.Flow.LMDBWriter.start_link(
+               shard_index: 0,
+               data_dir: data_dir,
+               instance_ctx: instance_ctx
+             )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, 0, [
+               {:project_flow_query_state, first_key, encoded_record("running", 1, 100, first_id),
+                0},
+               {:project_flow_query_state, second_key,
+                encoded_record("running", 1, 100, "run-retry-b"), 0}
+             ])
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> LMDB.path()
+
+    parent = self()
+    hits = :atomics.new(1, signed: false)
+
+    Ferricstore.FaultInjection.put_hook(fn
+      :before_flow_lmdb_flush_write, %{instance_name: ^instance_name} ->
+        if :atomics.add_get(hits, 1, 1) == 1 do
+          send(parent, {:projection_write_paused, self()})
+
+          receive do
+            :continue_projection_write -> :ok
+          end
+        end
+
+        :ok
+
+      _point, _metadata ->
+        :ok
+    end)
+
+    spawn_link(fn ->
+      result = Ferricstore.Flow.LMDBWriter.flush(instance_name, 0, 30_000)
+      send(parent, {:projection_flush_result, result})
+    end)
+
+    assert_receive {:projection_write_paused, writer}, 5_000
+
+    old_record =
+      "waiting"
+      |> encoded_record(0, 50, first_id)
+      |> Ferricstore.Flow.decode_record()
+
+    assert {:ok, [old_entry]} = CompositeIndex.entries(definition, old_record, first_key, 0)
+    old_reverse = CompositeIndex.encode_reverse_value(first_key, [old_entry.key])
+
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, old_entry.key, old_entry.value},
+               {:put, CompositeIndex.reverse_key(first_key), old_reverse}
+             ])
+
+    send(writer, :continue_projection_write)
+
+    assert_receive {:projection_flush_result, flush_result}, 10_000
+    assert flush_result == :ok
+    assert :atomics.get(hits, 1) >= 2
+    assert :not_found = LMDB.get(path, old_entry.key)
   end
 
   defp composite_key?(key) do

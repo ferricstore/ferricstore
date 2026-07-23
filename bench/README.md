@@ -100,6 +100,10 @@ BENCH_CANDIDATE_SECTION=prefetch BENCH_WARMUP=0.1 BENCH_TIME=0.75 \
   BENCH_MEMORY_TIME=0 MIX_ENV=bench mix run --no-start \
   bench/query_planner_projection_candidates_bench.exs
 
+BENCH_CANDIDATE_SECTION=projection-batch BENCH_PROJECTION_BATCH_RECORDS=1,64,512 \
+  BENCH_WARMUP=0.1 BENCH_TIME=0.75 BENCH_MEMORY_TIME=0 MIX_ENV=bench \
+  mix run --no-start bench/query_planner_projection_candidates_bench.exs
+
 BENCH_CANDIDATE_SECTION=composite BENCH_WARMUP=0.1 BENCH_TIME=0.75 \
   BENCH_MEMORY_TIME=0 MIX_ENV=bench mix run --no-start \
   bench/query_planner_native_read_candidates_bench.exs

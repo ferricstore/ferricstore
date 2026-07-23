@@ -81,17 +81,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         :ok
       end
 
-      defp queue_pending_lmdb_projection_outbox(state_key, version)
-           when is_binary(state_key) and is_integer(version) do
+      defp queue_pending_lmdb_projection_outbox(state_key, version, mode)
+           when is_binary(state_key) and is_integer(version) and mode in [:full, :query_only] do
         pending = Process.get(:sm_pending_lmdb_projection_outbox, [])
 
         item =
           case Process.get(:sm_pending_lmdb_mirror_shard) do
             shard_index when is_integer(shard_index) and shard_index >= 0 ->
-              {:lmdb_shard, shard_index, {state_key, version}}
+              {:lmdb_shard, shard_index, {mode, state_key, version}}
 
             _other ->
-              {state_key, version}
+              {mode, state_key, version}
           end
 
         Process.put(:sm_pending_lmdb_projection_outbox, [item | pending])
@@ -326,17 +326,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         with {:ok, {hibernation_ops, hibernation_after_flush}} <-
                pending_flow_hibernation_mirror_items(state, pending_ops),
              ops = pending_ops ++ hibernation_ops,
-             after_flush = after_flush ++ hibernation_after_flush,
-             :ok <- enqueue_lmdb_projection_dirty_groups(state, dirty_projection_shards),
-             :ok <- enqueue_lmdb_projection_outbox_groups(state, projection_outbox_entries) do
-          case ops do
-            [] ->
-              :ok
+             after_flush = after_flush ++ hibernation_after_flush do
+          # Same-sender ordering makes the sequenced mirror reservation visible before
+          # outbox or dirty notifications. Evaluate every enqueue so recovery markers
+          # are still published when an earlier enqueue reports an error.
+          mirror_result = enqueue_pending_lmdb_mirror_work(state, ops, after_flush)
+          outbox_result = enqueue_lmdb_projection_outbox_groups(state, projection_outbox_entries)
+          dirty_result = enqueue_lmdb_projection_dirty_groups(state, dirty_projection_shards)
 
-            [_ | _] ->
-              enqueue_lmdb_mirror_groups(state, ops, after_flush)
-          end
+          first_lmdb_projection_enqueue_error([
+            mirror_result,
+            outbox_result,
+            dirty_result
+          ])
         end
+      end
+
+      defp enqueue_pending_lmdb_mirror_work(_state, [], _after_flush), do: :ok
+
+      defp enqueue_pending_lmdb_mirror_work(state, ops, after_flush),
+        do: enqueue_lmdb_mirror_groups(state, ops, after_flush)
+
+      defp first_lmdb_projection_enqueue_error(results) do
+        Enum.find(results, :ok, &(&1 != :ok))
       end
 
       defp pending_flow_hibernation_mirror_items(state, pending_ops) do
@@ -522,10 +534,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           {:project_flow_state_from_source, key}, acc when is_binary(key) ->
             Map.put(acc, {default_shard_index, key}, :from_source)
 
+          {:project_flow_state_from_source, key, _version}, acc when is_binary(key) ->
+            Map.put(acc, {default_shard_index, key}, :from_source)
+
           {:project_flow_query_state, key, _value, _expire_at_ms}, acc when is_binary(key) ->
             Map.put(acc, {default_shard_index, key}, :query_only)
 
           {:project_flow_query_state_from_source, key}, acc when is_binary(key) ->
+            Map.put(acc, {default_shard_index, key}, :query_only)
+
+          {:project_flow_query_state_from_source, key, _version}, acc when is_binary(key) ->
             Map.put(acc, {default_shard_index, key}, :query_only)
 
           {:lmdb_shard, shard_index, {:project_flow_state, key, value, _expire_at_ms}}, acc
@@ -536,11 +554,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
             Map.put(acc, {shard_index, key}, :from_source)
 
+          {:lmdb_shard, shard_index, {:project_flow_state_from_source, key, _version}}, acc
+          when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
+            Map.put(acc, {shard_index, key}, :from_source)
+
           {:lmdb_shard, shard_index, {:project_flow_query_state, key, _value, _expire_at_ms}}, acc
           when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
             Map.put(acc, {shard_index, key}, :query_only)
 
           {:lmdb_shard, shard_index, {:project_flow_query_state_from_source, key}}, acc
+          when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
+            Map.put(acc, {shard_index, key}, :query_only)
+
+          {:lmdb_shard, shard_index, {:project_flow_query_state_from_source, key, _version}}, acc
           when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
             Map.put(acc, {shard_index, key}, :query_only)
 

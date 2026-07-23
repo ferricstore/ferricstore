@@ -38,10 +38,10 @@ defmodule Ferricstore.Flow.LMDBWriter.Registry do
   def normalize_projection_outbox_entries(entries) when is_list(entries) do
     entries
     |> Enum.reduce_while({:ok, []}, fn
-      {state_key, version}, {:ok, acc}
-      when is_binary(state_key) and state_key != "" and is_integer(version) and version >= 0 and
-             version <= @max_exact_integer ->
-        {:cont, {:ok, [{state_key, version} | acc]}}
+      {mode, state_key, version}, {:ok, acc}
+      when mode in [:full, :query_only] and is_binary(state_key) and state_key != "" and
+             is_integer(version) and version >= 0 and version <= @max_exact_integer ->
+        {:cont, {:ok, [{mode, state_key, version} | acc]}}
 
       _invalid, _acc ->
         {:halt, {:error, :invalid_projection_outbox_entries}}
@@ -56,8 +56,8 @@ defmodule Ferricstore.Flow.LMDBWriter.Registry do
     do: {:error, :invalid_projection_outbox_entries}
 
   def projection_outbox_rows(entries, generation) when is_reference(generation) do
-    Enum.map(entries, fn {state_key, version} ->
-      {System.unique_integer([:monotonic, :positive]), generation, state_key, version}
+    Enum.map(entries, fn {mode, state_key, version} ->
+      {System.unique_integer([:monotonic, :positive]), generation, mode, state_key, version}
     end)
   end
 

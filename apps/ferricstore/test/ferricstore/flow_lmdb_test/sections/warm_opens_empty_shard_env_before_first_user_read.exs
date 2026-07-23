@@ -641,7 +641,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
         true =
           :ets.insert(
             outbox,
-            {System.unique_integer([:monotonic, :positive]), seq_ref, outbox_key, 1}
+            {System.unique_integer([:monotonic, :positive]), seq_ref, :full, outbox_key, 1}
           )
 
         GenServer.cast(writer, {:projection_outbox_available, seq_ref})

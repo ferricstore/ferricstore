@@ -701,6 +701,102 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
     assert ProjectionOps.__normalize_source_pending_config_for_test__(-1, -1) == {100, 1}
   end
 
+  test "versioned source projection waits for the expected record version" do
+    path = tmp_lmdb_path("versioned_source")
+    keydir = :ets.new(:versioned_projection_source, [:set, :public])
+    state_key = Ferricstore.Flow.Keys.state_key("versioned-flow", "tenant-a")
+
+    stale =
+      active_flow_record("versioned-flow", "jobs", "tenant-a")
+      |> Map.put(:version, 2)
+      |> Ferricstore.Flow.encode_record()
+
+    current =
+      active_flow_record("versioned-flow", "jobs", "tenant-a")
+      |> Map.merge(%{version: 3, state: "failed", updated_at_ms: 30, next_run_at_ms: nil})
+      |> Ferricstore.Flow.encode_record()
+
+    :ets.insert(keydir, {state_key, stale, 0, 0, :hot, 0, byte_size(stale)})
+
+    updater =
+      Task.async(fn ->
+        Process.sleep(5)
+        :ets.insert(keydir, {state_key, current, 0, 0, :hot, 0, byte_size(current)})
+      end)
+
+    state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{keydir_refs: {keydir}},
+      terminal_count_inits: MapSet.new()
+    }
+
+    assert {:ok, ops, _state} =
+             ProjectionOps.expand_ops(state, [
+               {:project_flow_state_from_source, state_key, 3}
+             ])
+
+    Task.await(updater)
+    assert :ok = LMDB.write_batch(path, ops)
+    assert {:ok, wrapper} = LMDB.get(path, state_key)
+    assert {:ok, %{version: 3, state: "failed"}} = ProjectionOps.decode_flow_record_value(wrapper)
+  end
+
+  test "coalescing preserves the highest expected source version" do
+    path = tmp_lmdb_path("coalesced_source_version")
+    keydir = :ets.new(:coalesced_projection_source, [:set, :public])
+    state_key = Ferricstore.Flow.Keys.state_key("coalesced-flow", "tenant-a")
+
+    stale =
+      active_flow_record("coalesced-flow", "jobs", "tenant-a")
+      |> Map.merge(%{version: 2, state: "failed", updated_at_ms: 20, next_run_at_ms: nil})
+      |> Ferricstore.Flow.encode_record()
+
+    :ets.insert(keydir, {state_key, stale, 0, 0, :hot, 0, byte_size(stale)})
+
+    state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{keydir_refs: {keydir}},
+      terminal_count_inits: MapSet.new()
+    }
+
+    assert {:error, {:source_version_unavailable, 3}} =
+             ProjectionOps.expand_ops(state, [
+               {:project_flow_state_from_source, state_key, 3},
+               {:project_flow_state_from_source, state_key, 2}
+             ])
+  end
+
+  test "versioned source projection cleans up a record deleted before outbox drain" do
+    path = tmp_lmdb_path("deleted_versioned_source")
+    keydir = :ets.new(:deleted_versioned_projection_source, [:set, :public])
+    state_key = Ferricstore.Flow.Keys.state_key("deleted-flow", "tenant-a")
+
+    projected =
+      active_flow_record("deleted-flow", "jobs", "tenant-a")
+      |> Map.merge(%{version: 3, state: "failed", updated_at_ms: 30, next_run_at_ms: nil})
+      |> Ferricstore.Flow.encode_record()
+      |> LMDB.encode_value(0)
+
+    assert :ok = LMDB.write_batch(path, [{:put, state_key, projected}])
+    :ets.insert(keydir, {state_key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
+
+    state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{keydir_refs: {keydir}},
+      terminal_count_inits: MapSet.new()
+    }
+
+    assert {:ok, ops, _state} =
+             ProjectionOps.expand_ops(state, [
+               {:project_flow_state_from_source, state_key, 3}
+             ])
+
+    assert {:delete, state_key} in ops
+  end
+
   defp tmp_lmdb_path(prefix) do
     path =
       Path.join(

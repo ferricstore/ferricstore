@@ -2,12 +2,22 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
   @moduledoc false
 
   alias Ferricstore.Flow.LMDBWriter
+  alias Ferricstore.Flow.LMDBWriter.EnqueueControl
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
 
   @projection_outbox_batch_size 1_024
+  @max_exact_integer 9_007_199_254_740_991
   @end_of_table :"$end_of_table"
 
   def drain_projection_outbox(state) do
+    if EnqueueControl.enqueue_seq_target(state) > Map.get(state, :processed_enqueue_seq, 0) do
+      {state, projection_outbox_pending?(state)}
+    else
+      do_drain_projection_outbox(state)
+    end
+  end
+
+  defp do_drain_projection_outbox(state) do
     capacity = max(@projection_outbox_batch_size - Map.get(state, :count, 0), 0)
     entries = take_projection_outbox_entries(state, capacity)
 
@@ -77,7 +87,9 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
     next_key = next_projection_entry_key(tid, key)
 
     case :ets.take(tid, key) do
-      [{^key, ^generation, _state_key, _version} = entry] ->
+      [{^key, ^generation, mode, state_key, version} = entry]
+      when mode in [:full, :query_only] and is_binary(state_key) and state_key != "" and
+             is_integer(version) and version >= 0 and version <= @max_exact_integer ->
         take_projection_entries(
           tid,
           next_key,
@@ -107,16 +119,20 @@ defmodule Ferricstore.Flow.LMDBWriter.Outbox do
 
   def projection_outbox_items(state, entries) do
     entries
-    |> Enum.reduce({[], []}, fn {_seq, _generation, state_key, version}, {ops, after_flush} ->
-      action = projection_outbox_after_flush(state, state_key, version)
+    |> Enum.reduce({[], []}, fn
+      {_seq, _generation, :full, state_key, version}, {ops, after_flush} ->
+        action = projection_outbox_after_flush(state, state_key, version)
 
-      after_flush =
-        case action do
-          nil -> after_flush
-          action -> [action | after_flush]
-        end
+        after_flush =
+          case action do
+            nil -> after_flush
+            action -> [action | after_flush]
+          end
 
-      {[{:project_flow_state_from_source, state_key} | ops], after_flush}
+        {[{:project_flow_state_from_source, state_key, version} | ops], after_flush}
+
+      {_seq, _generation, :query_only, state_key, version}, {ops, after_flush} ->
+        {[{:project_flow_query_state_from_source, state_key, version} | ops], after_flush}
     end)
     |> then(fn {ops, after_flush} -> {Enum.reverse(ops), Enum.reverse(after_flush)} end)
   end

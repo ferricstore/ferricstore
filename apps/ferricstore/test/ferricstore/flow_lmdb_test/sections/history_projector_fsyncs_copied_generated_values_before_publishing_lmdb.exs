@@ -441,7 +441,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
                  Ferricstore.Flow.LMDBWriter.enqueue_projection_outbox(
                    fixture.instance_name,
                    fixture.shard_index,
-                   [{state_key, completed.version}]
+                   [{:full, state_key, completed.version}]
                  )
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)

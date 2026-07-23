@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Flow.Query.CompositeProjection
+  alias Ferricstore.Flow.Query.{CompositeProjection, Limits}
   alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.TermCodec
@@ -12,6 +12,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   @max_source_pending_retries 1_000
   @max_source_pending_sleep_ms 100
   @max_source_pending_wait_ms 5_000
+  @min_composite_prefetch_records 2
+  @max_composite_prefetch_records Limits.max_projection_page_records()
   @history_projection_page_size 1_024
   @terminal_states ["completed", "failed", "cancelled"]
 
@@ -28,6 +30,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     with {:ok, definitions} <- query_index_definitions(state) do
       expansion_state = Map.put(state, :query_index_definitions, definitions)
       ops = coalesce_flow_state_projections(ops)
+      projection_keys = projection_prefetch_keys(ops)
 
       initial = %{
         ops: [],
@@ -36,7 +39,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         terminal_values: %{},
         terminal_reverse_values: %{},
         active_reverse_values: %{},
-        composite_projection_cache: CompositeProjection.new_cache(),
+        composite_projection_cache:
+          maybe_prefetch_composite_reverse_values(expansion_state, projection_keys, definitions),
         pending_terminal_count_put_news: MapSet.new(),
         terminal_count_inits: state.terminal_count_inits,
         terminal_atomic_write?: false,
@@ -76,24 +80,122 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   defp coalesce_flow_state_projections(ops) do
-    {coalesced, _seen} =
-      ops
-      |> Enum.reverse()
-      |> Enum.reduce({[], MapSet.new()}, fn op, {acc, seen} ->
-        case flow_state_projection_key(op) do
-          {:ok, state_key} ->
-            if MapSet.member?(seen, state_key) do
-              {acc, seen}
-            else
-              {[op | acc], MapSet.put(seen, state_key)}
-            end
+    winners = projection_winners(ops, 0, %{})
+    retain_projection_winners(ops, winners, 0, [])
+  end
 
-          :error ->
-            {[op | acc], seen}
-        end
-      end)
+  defp projection_prefetch_keys(ops),
+    do: projection_prefetch_keys(ops, [], 0)
 
-    coalesced
+  defp projection_prefetch_keys([], acc, _count), do: Enum.reverse(acc)
+
+  defp projection_prefetch_keys([op | rest], acc, count) do
+    case flow_state_projection_key(op) do
+      {:ok, state_key} when count < @max_composite_prefetch_records ->
+        projection_prefetch_keys(rest, [state_key | acc], count + 1)
+
+      {:ok, _state_key} ->
+        :too_many
+
+      :error ->
+        projection_prefetch_keys(rest, acc, count)
+    end
+  end
+
+  defp maybe_prefetch_composite_reverse_values(_state, _state_keys, []),
+    do: CompositeProjection.new_cache()
+
+  defp maybe_prefetch_composite_reverse_values(
+         %{path: path},
+         state_keys,
+         _definitions
+       )
+       when is_binary(path) and is_list(state_keys) and
+              length(state_keys) >= @min_composite_prefetch_records and
+              length(state_keys) <= @max_composite_prefetch_records do
+    cache = CompositeProjection.new_cache()
+
+    case CompositeProjection.prefetch_reverse_values(path, state_keys, cache) do
+      {:ok, prefetched} -> prefetched
+      {:error, _reason} -> cache
+    end
+  end
+
+  defp maybe_prefetch_composite_reverse_values(_state, _state_keys, _definitions),
+    do: CompositeProjection.new_cache()
+
+  defp projection_winners([], _index, winners), do: winners
+
+  defp projection_winners([op | rest], index, winners) do
+    winners =
+      case flow_state_projection_key(op) do
+        {:ok, state_key} ->
+          candidate = {index, op, nil}
+
+          Map.update(winners, state_key, candidate, fn winner ->
+            preferred_projection(winner, candidate)
+          end)
+
+        :error ->
+          winners
+      end
+
+    projection_winners(rest, index + 1, winners)
+  end
+
+  defp retain_projection_winners([], _winners, _index, acc), do: Enum.reverse(acc)
+
+  defp retain_projection_winners([op | rest], winners, index, acc) do
+    acc =
+      case flow_state_projection_key(op) do
+        {:ok, state_key} ->
+          case Map.fetch!(winners, state_key) do
+            {^index, _winner, _rank} -> [op | acc]
+            {_other_index, _winner, _rank} -> acc
+          end
+
+        :error ->
+          [op | acc]
+      end
+
+    retain_projection_winners(rest, winners, index + 1, acc)
+  end
+
+  defp preferred_projection({old_index, old_op, old_rank}, {new_index, new_op, _new_rank}) do
+    old_rank = old_rank || projection_rank(old_op)
+    new_rank = projection_rank(new_op)
+
+    if new_rank >= old_rank,
+      do: {new_index, new_op, new_rank},
+      else: {old_index, old_op, old_rank}
+  end
+
+  defp projection_rank({:project_flow_state_from_source, _state_key}), do: {3, 0, 1}
+
+  defp projection_rank({:project_flow_state_from_source, _state_key, expected_version}),
+    do: {3, expected_version, 1}
+
+  defp projection_rank({:project_flow_query_state_from_source, _state_key}), do: {3, 0, 0}
+
+  defp projection_rank({:project_flow_query_state_from_source, _state_key, expected_version}),
+    do: {3, expected_version, 0}
+
+  defp projection_rank({:project_flow_state, _state_key, value, _expire_at_ms}),
+    do: inline_projection_rank(value, 1)
+
+  defp projection_rank({:project_flow_query_state, _state_key, value, _expire_at_ms}),
+    do: inline_projection_rank(value, 0)
+
+  defp inline_projection_rank(value, full_projection?) when is_binary(value) do
+    case Ferricstore.Flow.decode_record(value) do
+      %{version: version} when is_integer(version) and version >= 0 ->
+        {1, version, full_projection?}
+
+      _invalid ->
+        {2, 0, full_projection?}
+    end
+  rescue
+    _error -> {2, 0, full_projection?}
   end
 
   defp flow_state_projection_key({:project_flow_state, state_key, _value, _expire_at_ms})
@@ -104,12 +206,20 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
        when is_binary(state_key),
        do: {:ok, state_key}
 
+  defp flow_state_projection_key({:project_flow_state_from_source, state_key, version})
+       when is_binary(state_key) and is_integer(version) and version >= 0,
+       do: {:ok, state_key}
+
   defp flow_state_projection_key({:project_flow_query_state, state_key, _value, _expire_at_ms})
        when is_binary(state_key),
        do: {:ok, state_key}
 
   defp flow_state_projection_key({:project_flow_query_state_from_source, state_key})
        when is_binary(state_key),
+       do: {:ok, state_key}
+
+  defp flow_state_projection_key({:project_flow_query_state_from_source, state_key, version})
+       when is_binary(state_key) and is_integer(version) and version >= 0,
        do: {:ok, state_key}
 
   defp flow_state_projection_key(_op), do: :error
@@ -144,6 +254,20 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
+  def expand_op(state, {:project_flow_state_from_source, key, expected_version}, acc)
+      when is_binary(key) and is_integer(expected_version) and expected_version >= 0 do
+    case read_source_value_at_version(state, key, expected_version) do
+      {:ok, value, expire_at_ms} ->
+        expand_flow_state_value(state, key, value, expire_at_ms, acc)
+
+      :not_found ->
+        expand_missing_flow_state_projection(state, key, acc)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
   def expand_op(state, {:project_flow_state, key, value, expire_at_ms}, acc)
       when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) do
     expand_flow_state_value(state, key, value, expire_at_ms, acc)
@@ -152,6 +276,20 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def expand_op(state, {:project_flow_query_state_from_source, key}, acc)
       when is_binary(key) do
     case read_source_value(state, key) do
+      {:ok, value, expire_at_ms} ->
+        expand_flow_query_state_value(state, key, value, expire_at_ms, acc)
+
+      :not_found ->
+        expand_missing_flow_query_state_projection(state, key, acc)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def expand_op(state, {:project_flow_query_state_from_source, key, expected_version}, acc)
+      when is_binary(key) and is_integer(expected_version) and expected_version >= 0 do
+    case read_source_value_at_version(state, key, expected_version) do
       {:ok, value, expire_at_ms} ->
         expand_flow_query_state_value(state, key, value, expire_at_ms, acc)
 
@@ -173,9 +311,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def expand_flow_state_value(%{path: path} = projection_state, key, value, expire_at_ms, acc) do
     wrapper = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
 
-    with {:ok, acc} <- expand_path_op(path, {:put, key, wrapper}, acc) do
-      case decode_flow_record_value(wrapper) do
-        {:ok, record} ->
+    case decode_flow_record_value(wrapper) do
+      {:ok, record} ->
+        with {:ok, acc} <- expand_path_op(path, {:put, key, wrapper}, acc) do
           projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
 
           expand_flow_state_projection(
@@ -185,10 +323,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
             record,
             acc
           )
+        end
 
-        :error ->
-          {:error, :invalid_flow_state_projection}
-      end
+      :error ->
+        {:error, :invalid_flow_state_projection}
     end
   end
 
@@ -210,10 +348,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
          acc
        ) do
     wrapper = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
-    acc = prepend_ops(acc, [{:put, key, wrapper}])
 
     case decode_flow_record_value(wrapper) do
       {:ok, record} ->
+        acc = prepend_ops(acc, [{:put, key, wrapper}])
         projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
 
         expand_composite_projection(
@@ -507,6 +645,128 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       normalize_source_pending_config(pending_retries, source_pending_sleep_ms())
 
     do_read_source_value(state, key, pending_retries, pending_sleep_ms)
+  end
+
+  defp read_source_value_at_version(state, key, expected_version) do
+    {pending_retries, pending_sleep_ms} = source_pending_config()
+
+    do_read_source_value_at_version(
+      state,
+      key,
+      expected_version,
+      pending_retries,
+      pending_sleep_ms
+    )
+  end
+
+  defp do_read_source_value_at_version(
+         state,
+         key,
+         expected_version,
+         pending_retries,
+         pending_sleep_ms
+       ) do
+    case do_read_source_value(state, key, 0, pending_sleep_ms) do
+      {:ok, value, _expire_at_ms} = result ->
+        case source_flow_record_version(value) do
+          {:ok, version} when version >= expected_version ->
+            result
+
+          {:ok, _stale_version} ->
+            retry_versioned_source_read(
+              state,
+              key,
+              expected_version,
+              pending_retries,
+              pending_sleep_ms,
+              :stale
+            )
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      :not_found ->
+        retry_versioned_source_read(
+          state,
+          key,
+          expected_version,
+          pending_retries,
+          pending_sleep_ms,
+          :not_found
+        )
+
+      {:error, {:source_pending, ^key}} ->
+        retry_versioned_source_read(
+          state,
+          key,
+          expected_version,
+          pending_retries,
+          pending_sleep_ms,
+          :pending
+        )
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp retry_versioned_source_read(
+         _state,
+         _key,
+         expected_version,
+         0,
+         _pending_sleep_ms,
+         :stale
+       ),
+       do: {:error, {:source_version_unavailable, expected_version}}
+
+  defp retry_versioned_source_read(
+         _state,
+         _key,
+         _expected_version,
+         0,
+         _pending_sleep_ms,
+         :not_found
+       ),
+       do: :not_found
+
+  defp retry_versioned_source_read(
+         _state,
+         key,
+         _expected_version,
+         0,
+         _pending_sleep_ms,
+         :pending
+       ),
+       do: {:error, {:source_pending, key}}
+
+  defp retry_versioned_source_read(
+         state,
+         key,
+         expected_version,
+         pending_retries,
+         pending_sleep_ms,
+         _reason
+       ) do
+    Process.sleep(pending_sleep_ms)
+
+    do_read_source_value_at_version(
+      state,
+      key,
+      expected_version,
+      pending_retries - 1,
+      pending_sleep_ms
+    )
+  end
+
+  defp source_flow_record_version(value) when is_binary(value) do
+    case Ferricstore.Flow.decode_record(value) do
+      %{version: version} when is_integer(version) and version >= 0 -> {:ok, version}
+      _invalid -> {:error, :invalid_source_flow_record_version}
+    end
+  rescue
+    _error -> {:error, :invalid_source_flow_record_version}
   end
 
   defp do_read_source_value(state, key, pending_retries, pending_sleep_ms) do

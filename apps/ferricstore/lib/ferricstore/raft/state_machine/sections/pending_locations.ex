@@ -1103,12 +1103,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
               maybe_queue_lmdb_terminal_state_prune_after_flush(state, state_key, record)
 
             terminal? ->
-              case Ferricstore.Flow.LMDB.mode() do
-                :lagged ->
-                  if query_projection?, do: queue_pending_lmdb_projection_dirty(), else: :ok
+              if query_projection? do
+                queue_pending_lmdb_projection_outbox(
+                  state_key,
+                  Map.fetch!(record, :version),
+                  :query_only
+                )
 
-                _mode ->
-                  queue_pending_lmdb_projection_outbox(state_key, Map.fetch!(record, :version))
+                queue_pending_lmdb_projection_dirty()
+              else
+                :ok
               end
 
             lifecycle_projection? ->

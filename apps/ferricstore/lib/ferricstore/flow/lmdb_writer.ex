@@ -30,6 +30,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   require Logger
 
+  @max_compare_conflict_retries 3
+
   @doc false
   def __timer_flush_decision_for_test__(state, now)
       when is_map(state) and is_integer(now) do
@@ -980,23 +982,43 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp flush_ops_and_marker_with_permit(state, ops, started_at) do
     try do
-      with {:ok, state} <- maybe_ensure_lmdb_ready(state, ops),
-           {:ok, ops, state} <- ProjectionOps.expand_ops(state, ops),
-           :ok <-
-             Ferricstore.FaultInjection.maybe_pause(:before_flow_lmdb_flush_write, %{
-               instance_name: state.instance_name,
-               shard_index: state.shard_index,
-               op_count: length(ops),
-               requested_index: state.requested_index
-             }),
-           :ok <- write_ops_chunked(state, ops),
-           {:ok, state} <- persist_requested(state, started_at) do
-        {:ok, state, length(ops)}
-      else
-        {:error, reason} -> {:error, reason, state}
-      end
+      do_flush_ops_and_marker_with_permit(
+        state,
+        ops,
+        started_at,
+        @max_compare_conflict_retries
+      )
     catch
       kind, reason -> {:error, {kind, reason}, state}
+    end
+  end
+
+  defp do_flush_ops_and_marker_with_permit(state, source_ops, started_at, retries_remaining) do
+    with {:ok, ready_state} <- maybe_ensure_lmdb_ready(state, source_ops),
+         {:ok, expanded_ops, projected_state} <-
+           ProjectionOps.expand_ops(ready_state, source_ops),
+         :ok <-
+           Ferricstore.FaultInjection.maybe_pause(:before_flow_lmdb_flush_write, %{
+             instance_name: projected_state.instance_name,
+             shard_index: projected_state.shard_index,
+             op_count: length(expanded_ops),
+             requested_index: projected_state.requested_index
+           }),
+         :ok <- write_ops_chunked(projected_state, expanded_ops),
+         {:ok, persisted_state} <- persist_requested(projected_state, started_at) do
+      {:ok, persisted_state, length(expanded_ops)}
+    else
+      {:error, {:compare_failed, _key}}
+      when retries_remaining > 0 ->
+        do_flush_ops_and_marker_with_permit(
+          state,
+          source_ops,
+          started_at,
+          retries_remaining - 1
+        )
+
+      {:error, reason} ->
+        {:error, reason, state}
     end
   end
 

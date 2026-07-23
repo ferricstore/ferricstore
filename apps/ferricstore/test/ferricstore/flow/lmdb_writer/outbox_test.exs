@@ -40,7 +40,7 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
     :ets.insert(
       table,
       for sequence <- 1..2_000 do
-        {sequence, generation, "F:#{sequence}", sequence}
+        {sequence, generation, :full, "F:#{sequence}", sequence}
       end
     )
 
@@ -64,6 +64,24 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
       File.read!(Path.expand("../../../../lib/ferricstore/flow/lmdb_writer/outbox.ex", __DIR__))
 
     refute source =~ ":ets.tab2list"
+  end
+
+  test "drops malformed public outbox rows while preserving valid work", %{
+    state: state,
+    table: table,
+    generation: generation
+  } do
+    :ets.insert(table, [
+      {1, generation, :invalid, "F:invalid-mode", 1},
+      {2, generation, :full, "F:invalid-version", -1},
+      {3, generation, :query_only, "F:valid", 3}
+    ])
+
+    assert Outbox.take_projection_outbox_entries(state) == [
+             {3, generation, :query_only, "F:valid", 3}
+           ]
+
+    refute Outbox.projection_outbox_pending?(state)
   end
 
   test "does not clear a dirty marker replaced during reconciliation", %{
@@ -144,7 +162,7 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
     :ets.insert(
       table,
       for sequence <- 1..1_025 do
-        {sequence, generation, "F:#{sequence}", sequence}
+        {sequence, generation, :full, "F:#{sequence}", sequence}
       end
     )
 
@@ -168,6 +186,48 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
     assert :ets.info(table, :size) == 1
 
     if drained.timer_ref, do: Process.cancel_timer(drained.timer_ref)
+  end
+
+  test "does not overtake earlier sequence-numbered projection enqueues", %{
+    state: identity,
+    table: table,
+    generation: generation
+  } do
+    :atomics.put(generation, 1, 1)
+    :ets.insert(table, {1, generation, :full, "F:terminal", 3})
+
+    state =
+      Map.merge(identity, %{
+        processed_enqueue_seq: 0,
+        pending: [],
+        pending_after_flush: [],
+        count: 0,
+        first_pending_at: nil,
+        last_enqueue_at: nil
+      })
+
+    assert {^state, true} = Outbox.drain_projection_outbox(state)
+    assert :ets.lookup(table, 1) == [{1, generation, :full, "F:terminal", 3}]
+  end
+
+  test "carries the expected record version into source projection work", %{
+    state: state,
+    generation: generation
+  } do
+    assert {[{:project_flow_state_from_source, "F:terminal", 7}], []} =
+             Outbox.projection_outbox_items(state, [
+               {1, generation, :full, "F:terminal", 7}
+             ])
+  end
+
+  test "query-only outbox work never schedules terminal hot-index pruning", %{
+    state: state,
+    generation: generation
+  } do
+    assert {[{:project_flow_query_state_from_source, "F:terminal", 7}], []} =
+             Outbox.projection_outbox_items(state, [
+               {1, generation, :query_only, "F:terminal", 7}
+             ])
   end
 
   test "keeps a retry timer after dirty projection reconciliation fails" do
@@ -225,16 +285,17 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
   end
 
   test "projection outbox normalization rejects malformed entries without partial enqueue" do
-    assert {:ok, [{"state-a", 1}, {"state-b", 2}]} =
+    assert {:ok, [{:full, "state-a", 1}, {:query_only, "state-b", 2}]} =
              Registry.normalize_projection_outbox_entries([
-               {"state-a", 1},
-               {"state-b", 2}
+               {:full, "state-a", 1},
+               {:query_only, "state-b", 2}
              ])
 
     for entries <- [
-          [{"state-a", 1}, {"", 2}],
-          [{"state-a", 1}, {"state-b", -1}],
-          [{"state-a", 1}, :invalid],
+          [{:full, "state-a", 1}, {:full, "", 2}],
+          [{:full, "state-a", 1}, {:full, "state-b", -1}],
+          [{:full, "state-a", 1}, {:invalid, "state-b", 2}],
+          [{:full, "state-a", 1}, :invalid],
           :invalid
         ] do
       assert {:error, :invalid_projection_outbox_entries} =

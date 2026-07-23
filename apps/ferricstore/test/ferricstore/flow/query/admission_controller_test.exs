@@ -167,8 +167,8 @@ defmodule Ferricstore.Flow.Query.AdmissionControllerTest do
     assert {:error, :query_engine_failure} =
              AdmissionController.acquire(server, :instance, "timed-out", 10)
 
-    send(controller, :continue_index_check)
     assert_receive {:pin_result, {:error, :query_engine_failure}}
+    send(controller, :continue_index_check)
 
     eventually(fn ->
       match?(%{node_count: 1, node_memory_bytes: 10}, :sys.get_state(server))
