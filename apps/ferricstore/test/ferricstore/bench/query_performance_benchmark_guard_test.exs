@@ -130,6 +130,7 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
 
     assert source =~ "QueryPerformance.benchee_options"
     assert source =~ "preflight_inputs!"
+    assert source =~ "FQLPlannerContext.start!"
   end
 
   test "scheduler benchmark measures saturation throughput and heartbeat tail latency" do
@@ -386,6 +387,8 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
     assert benchmark_workflow =~ "git rev-parse --verify --end-of-options"
     assert benchmark_workflow =~ "rounds must be an integer from 1 through 5"
     assert benchmark_workflow =~ "Configure benchmark result paths"
+    assert benchmark_workflow =~ ~s(BENCH_HARNESS: ${{ github.workspace }})
+    assert benchmark_workflow =~ ~s("$BENCH_HARNESS/bench/fql_parser_bench.exs")
     assert benchmark_workflow =~ ~s(BASELINE_RESULTS=$RUNNER_TEMP/baseline-results)
     refute benchmark_workflow =~ ~s(${{ runner.temp }})
   end

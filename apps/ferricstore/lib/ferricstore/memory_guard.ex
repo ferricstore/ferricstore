@@ -69,7 +69,7 @@ defmodule Ferricstore.MemoryGuard do
 
   ## Atomics flags (lock-free hot-path reads)
 
-  Three flags published to atomics via persistent_term (~5ns read):
+  Three flags published to instance-owned atomics (~5ns read):
 
     * **slot 1: `keydir_full`** -- set at `:reject` (95%). Gates new key writes
       in `Router.check_keydir_full/1`. Updates to existing keys still allowed.
@@ -154,6 +154,7 @@ defmodule Ferricstore.MemoryGuard do
     :keydir_max_ram,
     :hot_cache_max_ram,
     :hot_cache_min_ram,
+    :pressure_flags,
     # Effective memory limit: cgroup limit or host RAM.
     # Used for RSS-based pressure detection.
     :memory_limit,
@@ -166,6 +167,7 @@ defmodule Ferricstore.MemoryGuard do
   @doc "Starts the MemoryGuard GenServer."
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
+    opts = Keyword.put_new_lazy(opts, :pressure_flags, &default_pressure_flags/0)
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
@@ -184,7 +186,7 @@ defmodule Ferricstore.MemoryGuard do
   @doc """
   Returns true if memory pressure is at or above the reject threshold.
 
-  Reads from `:persistent_term` (~5ns) instead of GenServer.call (~1-5us).
+  Reads the default instance's atomics instead of GenServer.call (~1-5us).
   The value is updated by `perform_check/1` every 100ms.
   """
   @spec reject_writes?() :: boolean()
@@ -195,7 +197,7 @@ defmodule Ferricstore.MemoryGuard do
   @doc """
   Returns true if keydir memory usage is at or above 95% of `keydir_max_ram`.
 
-  Reads from `:persistent_term` (~5ns) instead of GenServer.call (~1-5us).
+  Reads the default instance's atomics instead of GenServer.call (~1-5us).
   The value is updated by `perform_check/1` every 100ms. The staleness
   window (100ms) is acceptable since memory pressure changes slowly.
 
@@ -232,7 +234,7 @@ defmodule Ferricstore.MemoryGuard do
 
   Set at `:pressure` level (85%+). Prevents evict/re-promote thrashing
   where MemoryGuard evicts values and the next GET re-caches them.
-  Reads from atomics via persistent_term (~5ns).
+  Reads the default instance's atomics (~5ns).
   """
   @spec skip_promotion?() :: boolean()
   def skip_promotion? do
@@ -335,6 +337,7 @@ defmodule Ferricstore.MemoryGuard do
       hot_cache_max_ram: hot_cache_max_ram,
       hot_cache_max_mode: hot_cache_max_mode,
       hot_cache_min_ram: hot_cache_min_ram,
+      pressure_flags: Keyword.get(opts, :pressure_flags),
       memory_limit: memory_limit,
       last_pressure_level: :ok,
       last_hot_cache_budget: initial_budget,
@@ -871,7 +874,7 @@ defmodule Ferricstore.MemoryGuard do
   end
 
   defp publish_pressure_flags(stats, state) do
-    case default_pressure_flags() do
+    case state.pressure_flags do
       nil ->
         :ok
 

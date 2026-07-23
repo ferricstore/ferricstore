@@ -849,10 +849,10 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorWriterProjectsTerminalHistory
                    now_ms: 3
                  )
 
-        assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 2
+        assert :atomics.get(ctx.flow_lmdb_mirror_enqueue_failures, 1) == 3
         assert :atomics.get(ctx.flow_lmdb_mirror_degraded, 1) == 1
 
-        for _ <- 1..2 do
+        for _ <- 1..3 do
           assert_receive {:flow_lmdb_mirror_degraded,
                           [:ferricstore, :flow, :lmdb_mirror, :degraded], %{count: 1},
                           %{shard_index: 0, reason: :writer_not_started}}

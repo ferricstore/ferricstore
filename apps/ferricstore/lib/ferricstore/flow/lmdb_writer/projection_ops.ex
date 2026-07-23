@@ -104,6 +104,14 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
        when is_binary(state_key),
        do: {:ok, state_key}
 
+  defp flow_state_projection_key({:project_flow_query_state, state_key, _value, _expire_at_ms})
+       when is_binary(state_key),
+       do: {:ok, state_key}
+
+  defp flow_state_projection_key({:project_flow_query_state_from_source, state_key})
+       when is_binary(state_key),
+       do: {:ok, state_key}
+
   defp flow_state_projection_key(_op), do: :error
 
   def expand_op(state, {:project_kv_from_source, key}, acc) when is_binary(key) do
@@ -141,6 +149,25 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     expand_flow_state_value(state, key, value, expire_at_ms, acc)
   end
 
+  def expand_op(state, {:project_flow_query_state_from_source, key}, acc)
+      when is_binary(key) do
+    case read_source_value(state, key) do
+      {:ok, value, expire_at_ms} ->
+        expand_flow_query_state_value(state, key, value, expire_at_ms, acc)
+
+      :not_found ->
+        expand_missing_flow_query_state_projection(state, key, acc)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def expand_op(state, {:project_flow_query_state, key, value, expire_at_ms}, acc)
+      when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) do
+    expand_flow_query_state_value(state, key, value, expire_at_ms, acc)
+  end
+
   def expand_op(%{path: path}, op, acc), do: expand_path_op(path, op, acc)
 
   def expand_flow_state_value(%{path: path} = projection_state, key, value, expire_at_ms, acc) do
@@ -173,6 +200,33 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       expire_at_ms,
       acc
     )
+  end
+
+  defp expand_flow_query_state_value(
+         projection_state,
+         key,
+         value,
+         expire_at_ms,
+         acc
+       ) do
+    wrapper = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
+    acc = prepend_ops(acc, [{:put, key, wrapper}])
+
+    case decode_flow_record_value(wrapper) do
+      {:ok, record} ->
+        projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
+
+        expand_composite_projection(
+          projection_state,
+          key,
+          projection_expire_at_ms,
+          record,
+          acc
+        )
+
+      :error ->
+        {:error, :invalid_flow_state_projection}
+    end
   end
 
   def expand_flow_state_projection(
@@ -261,6 +315,11 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       state_key,
       acc
     )
+  end
+
+  defp expand_missing_flow_query_state_projection(projection_state, state_key, acc) do
+    acc = prepend_ops(acc, [{:delete, state_key}])
+    expand_composite_removal(projection_state, state_key, acc)
   end
 
   defp query_index_definitions(%{instance_ctx: instance_ctx, shard_index: shard_index})

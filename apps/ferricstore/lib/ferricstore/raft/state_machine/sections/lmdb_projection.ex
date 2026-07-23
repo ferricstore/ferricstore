@@ -63,6 +63,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         :ok
       end
 
+      defp queue_pending_lmdb_flow_query_state_projection(state_key, value, expire_at_ms)
+           when is_binary(state_key) and is_binary(value) and is_integer(expire_at_ms) do
+        queue_pending_lmdb_mirror_op({:project_flow_query_state, state_key, value, expire_at_ms})
+
+        :ok
+      end
+
+      defp queue_pending_lmdb_flow_query_state_projection(state_key, _value, _expire_at_ms)
+           when is_binary(state_key) do
+        queue_pending_lmdb_flow_query_state_projection_from_source(state_key)
+      end
+
+      defp queue_pending_lmdb_flow_query_state_projection_from_source(state_key)
+           when is_binary(state_key) do
+        queue_pending_lmdb_mirror_op({:project_flow_query_state_from_source, state_key})
+        :ok
+      end
+
       defp queue_pending_lmdb_projection_outbox(state_key, version)
            when is_binary(state_key) and is_integer(version) do
         pending = Process.get(:sm_pending_lmdb_projection_outbox, [])
@@ -469,19 +487,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           :from_source ->
             flow_hibernation_projected_active_reverse(key, record)
 
+          :query_only ->
+            flow_hibernation_persisted_active_reverse(state, key)
+
           {:error, _reason} = error ->
             error
 
           :none ->
-            case Ferricstore.Flow.LMDB.get(
-                   flow_lmdb_record_path(state),
-                   Ferricstore.Flow.LMDB.active_by_state_key_key(key)
-                 ) do
-              {:ok, reverse_value} when is_binary(reverse_value) -> {:ok, reverse_value}
-              :not_found -> {:ok, nil}
-              {:error, _reason} = error -> error
-              other -> {:error, {:invalid_active_index_reverse_read, other}}
-            end
+            flow_hibernation_persisted_active_reverse(state, key)
+        end
+      end
+
+      defp flow_hibernation_persisted_active_reverse(state, key) do
+        case Ferricstore.Flow.LMDB.get(
+               flow_lmdb_record_path(state),
+               Ferricstore.Flow.LMDB.active_by_state_key_key(key)
+             ) do
+          {:ok, reverse_value} when is_binary(reverse_value) -> {:ok, reverse_value}
+          :not_found -> {:ok, nil}
+          {:error, _reason} = error -> error
+          other -> {:error, {:invalid_active_index_reverse_read, other}}
         end
       end
 
@@ -497,6 +522,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           {:project_flow_state_from_source, key}, acc when is_binary(key) ->
             Map.put(acc, {default_shard_index, key}, :from_source)
 
+          {:project_flow_query_state, key, _value, _expire_at_ms}, acc when is_binary(key) ->
+            Map.put(acc, {default_shard_index, key}, :query_only)
+
+          {:project_flow_query_state_from_source, key}, acc when is_binary(key) ->
+            Map.put(acc, {default_shard_index, key}, :query_only)
+
           {:lmdb_shard, shard_index, {:project_flow_state, key, value, _expire_at_ms}}, acc
           when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
             Map.put(acc, {shard_index, key}, decode_pending_flow_projection(value))
@@ -504,6 +535,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
           {:lmdb_shard, shard_index, {:project_flow_state_from_source, key}}, acc
           when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
             Map.put(acc, {shard_index, key}, :from_source)
+
+          {:lmdb_shard, shard_index, {:project_flow_query_state, key, _value, _expire_at_ms}}, acc
+          when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
+            Map.put(acc, {shard_index, key}, :query_only)
+
+          {:lmdb_shard, shard_index, {:project_flow_query_state_from_source, key}}, acc
+          when is_integer(shard_index) and shard_index >= 0 and is_binary(key) ->
+            Map.put(acc, {shard_index, key}, :query_only)
 
           _other, acc ->
             acc

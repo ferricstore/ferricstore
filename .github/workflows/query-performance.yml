@@ -126,6 +126,7 @@ jobs:
           BASELINE_DIR: ${{ steps.baseline.outputs.dir }}
           BASELINE_AVAILABLE: ${{ steps.baseline.outputs.available }}
           REQUESTED_ROUNDS: ${{ inputs.rounds }}
+          BENCH_HARNESS: ${{ github.workspace }}
         run: |
           set -euo pipefail
           rounds="${REQUESTED_ROUNDS:-3}"
@@ -144,10 +145,10 @@ jobs:
               cd "$repo"
               export BENCH_SAVE="$output/round-$round"
               BENCH_ALLOC_ITERATIONS=10000 cargo bench --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --bench fql_allocations
-              mix run --no-start bench/fql_parser_bench.exs
-              mix run --no-start bench/fql_scheduler_bench.exs
-              mix run --no-start bench/flow_query_native_index_bench.exs
-              mix run --no-start bench/flow_query_lmdb_bench.exs
+              mix run --no-start "$BENCH_HARNESS/bench/fql_parser_bench.exs"
+              mix run --no-start "$BENCH_HARNESS/bench/fql_scheduler_bench.exs"
+              mix run --no-start "$BENCH_HARNESS/bench/flow_query_native_index_bench.exs"
+              mix run --no-start "$BENCH_HARNESS/bench/flow_query_lmdb_bench.exs"
             )
           }
 

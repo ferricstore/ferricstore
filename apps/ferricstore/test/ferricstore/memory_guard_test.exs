@@ -141,10 +141,6 @@ defmodule Ferricstore.MemoryGuardTest do
 
       GenServer.stop(pid)
       :telemetry.detach(handler_id)
-
-      # Reset global persistent_term keys contaminated by the dedicated instance.
-      MemoryGuard.set_reject_writes(false)
-      MemoryGuard.set_keydir_full(false)
     end
   end
 
@@ -244,6 +240,28 @@ defmodule Ferricstore.MemoryGuardTest do
       GenServer.stop(pid)
     end
 
+    test "dedicated MemoryGuard does not publish pressure to the default instance" do
+      MemoryGuard.reset_pressure_flags()
+
+      {:ok, pid} =
+        GenServer.start_link(MemoryGuard,
+          interval_ms: 60_000,
+          max_memory_bytes: 1,
+          keydir_max_ram: 1,
+          shard_count: 4,
+          eviction_policy: :noeviction
+        )
+
+      send(pid, :check)
+      assert GenServer.call(pid, :reject_writes?)
+
+      refute MemoryGuard.keydir_full?()
+      refute MemoryGuard.reject_writes?()
+      refute MemoryGuard.skip_promotion?()
+
+      GenServer.stop(pid)
+    end
+
     test "max_memory_bytes 0 disables RSS pressure for unlimited deployments" do
       key = {FerricStore.Instance, :default}
       previous = :persistent_term.get(key, :__missing__)
@@ -299,12 +317,6 @@ defmodule Ferricstore.MemoryGuardTest do
       assert result == true
 
       GenServer.stop(pid)
-
-      # Reset the global persistent_term that the dedicated instance contaminated.
-      # The perform_check/1 in MemoryGuard writes to global :persistent_term keys
-      # regardless of which instance runs it, so we must restore them.
-      MemoryGuard.set_reject_writes(false)
-      MemoryGuard.set_keydir_full(false)
     end
   end
 

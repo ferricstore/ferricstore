@@ -199,12 +199,21 @@ defmodule FerricstoreServer.Native.LaneTest do
     {:ok, pid} = Lane.start_link(self(), @lane_id, command_state())
     on_exit(fn -> Lane.stop(pid) end)
 
-    Lane.enqueue_many(pid, [
+    frames = [
       set_frame(21, "native:lane:coalesce:batched:a", "a"),
       set_frame(22, "native:lane:coalesce:batched:b", "b")
-    ])
+    ]
 
-    assert_receive {:native_lane_responses, @lane_id, responses, 2}, 50
+    :erlang.suspend_process(pid)
+
+    try do
+      Lane.enqueue_many(pid, frames)
+      assert {:messages, [{:native_lane_frames, ^frames}]} = Process.info(pid, :messages)
+    after
+      :erlang.resume_process(pid)
+    end
+
+    assert_receive {:native_lane_responses, @lane_id, responses, 2}, @receive_timeout
     assert length(responses) == 2
     assert_ok_response(Enum.at(responses, 0), @op_set, 21)
     assert_ok_response(Enum.at(responses, 1), @op_set, 22)

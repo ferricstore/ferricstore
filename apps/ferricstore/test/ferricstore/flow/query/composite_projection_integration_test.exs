@@ -92,6 +92,47 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
            end)
   end
 
+  test "query-only projection writes hydration and composite rows without lifecycle indexes" do
+    path = tmp_lmdb_path()
+    state_key = Ferricstore.Flow.Keys.state_key("run-query-only", "tenant-a")
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "runs_by_state",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:state, :asc}]
+      })
+
+    writer_state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{
+        query_index_provider: Provider,
+        test_pid: self(),
+        definitions: [definition]
+      },
+      terminal_count_inits: MapSet.new()
+    }
+
+    encoded = encoded_record("running", 1, 100, "run-query-only")
+
+    assert {:ok, ops, _state} =
+             ProjectionOps.expand_ops(writer_state, [
+               {:project_flow_query_state, state_key, encoded, 0}
+             ])
+
+    for terminal_state <- ["completed", "failed", "cancelled"] do
+      index_key = Ferricstore.Flow.Keys.state_index_key("invoice", terminal_state, "tenant-a")
+      count_key = LMDB.terminal_count_key(index_key)
+      refute Enum.any?(ops, &(is_tuple(&1) and count_key in Tuple.to_list(&1)))
+    end
+
+    assert :ok = LMDB.write_batch(path, ops)
+    assert {:ok, _wrapper} = LMDB.get(path, state_key)
+    assert {:ok, _reverse} = LMDB.get(path, CompositeIndex.reverse_key(state_key))
+    assert :not_found = LMDB.get(path, LMDB.active_by_state_key_key(state_key))
+  end
+
   test "composite projection hydrates records whose logical state key exceeds LMDB limits" do
     path = tmp_lmdb_path()
     id = :binary.copy("r", 60_000)

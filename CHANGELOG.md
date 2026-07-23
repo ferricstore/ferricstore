@@ -11,6 +11,7 @@ All notable changes to FerricStore will be documented here.
 - Unified point, history, lineage, fixed-index, composite, and count plans under `ferric.flow.query.result/v1` and `ferric.flow.explain/v1`, with one edition-neutral capability manifest containing every executable shape.
 - Added memory-weighted query admission, pressure-aware index backfill, aggregate native merge limits, batched selected-plan statistics probes, exact one-pass response accounting, and resumable bounded-prefix LMDB hydration.
 - Bounded fixed-index fallback candidate hydration to one maximum result page plus look-ahead, and kept namespace quota accounting distinct from Flow secondary indexes.
+- Isolated query-only LMDB projection from scheduler and terminal lifecycle indexes, and bound MemoryGuard pressure publication to the supervised default guard so auxiliary guards cannot alter production admission state.
 
 ## 0.9.1 - 2026-07-19
 

@@ -2,6 +2,7 @@
 #   MIX_ENV=bench mix run --no-start bench/fql_parser_bench.exs
 
 Code.require_file("support/query_performance.exs", __DIR__)
+Code.require_file("support/fql_planner_context.exs", __DIR__)
 
 alias Ferricstore.Bench.QueryPerformance
 alias Ferricstore.Flow.Query.{Binder, ReferenceParser}
@@ -116,13 +117,16 @@ planner_query =
   "EXPLAIN FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
 
 planner_params = %{"partition" => "tenant-a", "flow_id" => "run-123"}
-{:ok, _explain} = FlowQuery.execute(%{}, "FQL1", planner_query, planner_params)
+{planner_ctx, planner_admission} = Ferricstore.Bench.FQLPlannerContext.start!()
+{:ok, _explain} = FlowQuery.execute(planner_ctx, "FQL1", planner_query, planner_params)
 
 Benchee.run(
   %{
     "Rust parse + bind + explain planner" => fn ->
-      FlowQuery.execute(%{}, "FQL1", planner_query, planner_params)
+      FlowQuery.execute(planner_ctx, "FQL1", planner_query, planner_params)
     end
   },
   QueryPerformance.benchee_options("fql-explain-planner")
 )
+
+GenServer.stop(planner_admission)

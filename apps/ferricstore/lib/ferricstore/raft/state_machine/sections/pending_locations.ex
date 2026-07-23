@@ -1093,24 +1093,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
            )
            when is_map(record) do
         with_lmdb_mirror_shard(state, fn ->
-          projection_required? = flow_record_requires_lmdb_projection?(state, record)
+          lifecycle_projection? = flow_record_has_indexed_attributes?(record)
+          query_projection? = query_index_projection_enabled?(state)
+          terminal? = Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state))
 
           cond do
-            projection_required? and is_binary(value) and is_integer(expire_at_ms) ->
+            lifecycle_projection? and is_binary(value) and is_integer(expire_at_ms) ->
               queue_pending_lmdb_flow_state_projection(state_key, value, expire_at_ms)
               maybe_queue_lmdb_terminal_state_prune_after_flush(state, state_key, record)
 
-            Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) ->
+            terminal? ->
               case Ferricstore.Flow.LMDB.mode() do
                 :lagged ->
-                  :ok
+                  if query_projection?, do: queue_pending_lmdb_projection_dirty(), else: :ok
 
                 _mode ->
                   queue_pending_lmdb_projection_outbox(state_key, Map.fetch!(record, :version))
               end
 
-            projection_required? ->
+            lifecycle_projection? ->
               queue_pending_lmdb_flow_state_projection_from_source(state_key)
+
+            query_projection? ->
+              queue_pending_lmdb_flow_query_state_projection(
+                state_key,
+                value,
+                expire_at_ms
+              )
 
             true ->
               :ok
@@ -1127,11 +1136,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       defp flow_record_has_indexed_attributes?(_record), do: false
 
       defp flow_record_requires_lmdb_projection?(state, record) when is_map(record) do
-        QueryIndexProvider.enabled?(Map.get(state, :instance_ctx, %{})) or
+        query_index_projection_enabled?(state) or
           flow_record_has_indexed_attributes?(record)
       end
 
       defp flow_record_requires_lmdb_projection?(_state, _record), do: false
+
+      defp query_index_projection_enabled?(state) do
+        QueryIndexProvider.enabled?(Map.get(state, :instance_ctx, %{}))
+      end
 
       defp maybe_queue_lmdb_terminal_state_prune_after_flush(state, state_key, record)
            when is_binary(state_key) and is_map(record) do
