@@ -60,7 +60,7 @@ defmodule FerricstoreServer.Health.ProbeEndpoint do
     {:ok, socket} = :ranch.handshake(ref)
     :ok = transport.setopts(socket, active: false, buffer: @max_request_bytes)
 
-    request_deadline = System.monotonic_time(:millisecond) + @request_timeout_ms
+    request_deadline = System.monotonic_time(:millisecond) + request_timeout_ms(opts)
 
     case read_request(socket, transport, <<>>, request_deadline) do
       {:ok, "GET", "/health/live"} ->
@@ -79,6 +79,12 @@ defmodule FerricstoreServer.Health.ProbeEndpoint do
     transport.close(socket)
     :ok
   end
+
+  defp request_timeout_ms(%{request_timeout_ms: timeout_ms})
+       when is_integer(timeout_ms) and timeout_ms > 0,
+       do: timeout_ms
+
+  defp request_timeout_ms(_opts), do: @request_timeout_ms
 
   defp ready_response(opts) do
     ready_response_fun = Map.get(opts, :ready_response_fun, &Probes.ready_response/0)

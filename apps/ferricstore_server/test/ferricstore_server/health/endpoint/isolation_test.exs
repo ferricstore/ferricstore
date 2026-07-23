@@ -76,8 +76,13 @@ defmodule FerricstoreServer.Health.Endpoint.IsolationTest do
   end
 
   test "probe request deadline is not extended by trickled bytes" do
+    {listener, port} =
+      start_probe_listener!(max_connections: 1, request_timeout_ms: 1_000)
+
+    on_exit(fn -> :ranch.stop_listener(listener) end)
+
     {:ok, socket} =
-      :gen_tcp.connect({127, 0, 0, 1}, Endpoint.probe_port(), [
+      :gen_tcp.connect({127, 0, 0, 1}, port, [
         :binary,
         active: false,
         packet: :raw
@@ -86,11 +91,13 @@ defmodule FerricstoreServer.Health.Endpoint.IsolationTest do
     on_exit(fn -> :gen_tcp.close(socket) end)
 
     :ok = :gen_tcp.send(socket, "G")
-    Process.sleep(160)
+    Process.sleep(300)
     :ok = :gen_tcp.send(socket, "E")
-    Process.sleep(160)
+    Process.sleep(300)
+    :ok = :gen_tcp.send(socket, "T")
+    Process.sleep(500)
 
-    assert {:ok, response} = :gen_tcp.recv(socket, 0, 50)
+    assert {:ok, response} = :gen_tcp.recv(socket, 0, 300)
     assert response =~ "HTTP/1.1 400 Bad Request"
   end
 
