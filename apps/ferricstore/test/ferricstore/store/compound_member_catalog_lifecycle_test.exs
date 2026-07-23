@@ -326,10 +326,7 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     try do
       GenServer.stop(pid, :normal, 5_000)
     catch
-      :exit, {:noproc, _call} -> :ok
-      :exit, :noproc -> :ok
-      :exit, {:shutdown, _call} -> :ok
-      :exit, :shutdown -> :ok
+      :exit, _reason -> :ok
     end
   end
 end
