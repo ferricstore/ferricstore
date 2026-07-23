@@ -175,8 +175,6 @@ defmodule Ferricstore.Flow.RetentionSweeperTest do
     assert_receive {:cleanup_called, second_at, [limit: 5, continuation: "next"]},
                    500
 
-    refute_receive {:cleanup_called, _third_at, _opts}, 50
-
     assert_receive {:cleanup_called, third_at, [limit: 5, continuation: "next"]}, 250
     assert third_at - second_at >= 80
   end
