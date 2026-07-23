@@ -64,8 +64,8 @@ FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND type = @type AND
 ```
 
 Use `FLOW.QUERY` as the versioned read/query envelope. The OSS default provider
-supports authoritative point/history reads and its advertised fixed-index
-collection shapes:
+supports authoritative point/history reads and every bounded shape advertised
+by the capability manifest:
 
 ```text
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'order-1' RETURN RECORD"
@@ -76,18 +76,19 @@ FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND parent_flow_id =
 
 Collection reads require one `partition_key` equality. A point read that omits
 it addresses only the run ID's deterministic auto-partition; explicitly
-partitioned runs require the predicate. Enterprise installs the composite collection provider and
-advertises its additional count, cursor, planner, and index-management
-capabilities through negotiation.
+partitioned runs require the predicate. The OSS default includes bounded
+composite collections, exact `RETURN COUNT`, cursors, statistics, index status,
+and full explain analysis. Enterprise uses the same provider and adds metadata
+scope and governance integration without changing the query contracts.
 
 ```text
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND state = 'failed' ORDER BY updated_at_ms DESC LIMIT 50 RETURN RECORDS" partition tenant-a
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND type = 'order' RETURN COUNT" partition tenant-a
 ```
 
-OSS rejects unadvertised composite counts, cursors, and arbitrary predicate or
-ordering combinations. See [Flow Query Architecture](../docs/flow-query.md) for
-the exact capability contract and mandatory bounds.
+All editions reject unadvertised shapes and predicate or ordering combinations
+that have no bounded plan. See [Flow Query Architecture](../docs/flow-query.md)
+for the exact capability contract and mandatory bounds.
 
 The returned record is a structural query projection including attributes and
 state metadata. It excludes payload/result/error refs, named values, child
