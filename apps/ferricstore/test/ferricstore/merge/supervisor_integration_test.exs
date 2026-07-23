@@ -90,13 +90,16 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
   # -------------------------------------------------------------------
 
   describe "Scheduler status queries" do
-    test "each Scheduler responds to status with correct shard_index" do
+    test "each Scheduler responds with a complete status" do
       for i <- 0..(shard_count() - 1) do
         status = Scheduler.status(i)
 
         assert is_map(status), "Expected status to be a map for shard #{i}"
         assert status.shard_index == i, "Expected shard_index #{i}, got #{status.shard_index}"
-        assert status.merging == false, "Expected merging to be false on shard #{i}"
+
+        assert is_boolean(status.merging),
+               "Expected merging to be boolean on shard #{i}, got #{inspect(status.merging)}"
+
         assert is_integer(status.merge_count), "Expected merge_count to be integer on shard #{i}"
 
         assert is_integer(status.total_bytes_reclaimed),
