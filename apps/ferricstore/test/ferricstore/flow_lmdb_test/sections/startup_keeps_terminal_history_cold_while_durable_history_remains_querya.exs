@@ -271,7 +271,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
                  })
 
         assert {:ok, completed} =
-                 Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
+                 Ferricstore.CommandTime.with_now_ms(0, fn ->
+                   Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
+                 end)
 
         assert completed.state == "completed"
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
@@ -291,9 +293,14 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
         assert {:ok, _blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
         assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
 
-        Process.sleep(40)
+        assert {:ok, nil} =
+                 Ferricstore.CommandTime.with_now_ms(
+                   completed.terminal_retention_until_ms,
+                   fn ->
+                     Ferricstore.Flow.get(ctx, completed.id, partition_key: partition_key)
+                   end
+                 )
 
-        assert {:ok, nil} = Ferricstore.Flow.get(ctx, completed.id, partition_key: partition_key)
         assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
         assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
         assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
@@ -348,7 +355,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
                  })
 
         assert {:ok, completed} =
-                 Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
+                 Ferricstore.CommandTime.with_now_ms(0, fn ->
+                   Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
+                 end)
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, 1)
         assert :ok = Ferricstore.Flow.HistoryProjector.flush(ctx, 0, 120_000)
@@ -373,12 +382,10 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
 
         assert history_count_before >= 3
 
-        Process.sleep(40)
-
         assert {:ok, 1} =
                  Ferricstore.Flow.LMDB.sweep_expired_terminal(
                    lmdb_path,
-                   System.os_time(:millisecond),
+                   completed.terminal_retention_until_ms,
                    100
                  )
 

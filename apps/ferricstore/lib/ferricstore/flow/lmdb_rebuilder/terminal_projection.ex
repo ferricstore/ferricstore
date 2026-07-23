@@ -3,17 +3,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
 
   alias Ferricstore.Flow
   alias Ferricstore.Flow.LMDB
+  alias Ferricstore.Flow.LMDBRebuilder.TerminalState
 
   @default_scan_page_size 4_096
   @max_scan_page_size 65_536
-
-  def persist_terminal_counts(%{terminal_counts: counts} = stats, lmdb_path) do
-    if map_size(counts) == 0 and not Ferricstore.FS.dir?(lmdb_path) do
-      stats
-    else
-      do_persist_terminal_counts(stats, counts, lmdb_path)
-    end
-  end
 
   def cleanup_stale_terminal_ops(lmdb_path, state_key, record) do
     reverse_key = LMDB.terminal_by_state_key_key(state_key)
@@ -31,7 +24,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
         {:ok, []}
 
       {:ok, terminal_key} when is_binary(terminal_key) ->
-        case LMDB.terminal_index_delete_ops_result(lmdb_path, terminal_key, nil) do
+        case LMDB.terminal_index_reconcile_delete_ops_result(lmdb_path, terminal_key, nil) do
           {:ok, terminal_ops} -> {:ok, [{:delete, reverse_key} | terminal_ops]}
           {:error, _reason} = error -> error
         end
@@ -44,28 +37,39 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
     end
   end
 
-  def cleanup_stale_terminal_reverse_ops(lmdb_path, keydir, decode_entry_fun)
+  def cleanup_stale_terminal_reverse(lmdb_path, keydir, decode_entry_fun)
       when is_function(decode_entry_fun, 1) do
     LMDB.reduce_prefix_entries(
       lmdb_path,
       LMDB.terminal_by_state_global_prefix(),
       terminal_projection_page_size(),
-      [],
-      fn entries, reversed_ops ->
-        case cleanup_stale_terminal_reverse_scan_result(
-               {:ok, entries},
-               keydir,
-               decode_entry_fun,
-               fn terminal_key, state_key ->
-                 LMDB.terminal_index_delete_ops_result(lmdb_path, terminal_key, state_key)
-               end
-             ) do
-          {:ok, ops} -> {:ok, :lists.reverse(ops, reversed_ops)}
-          {:error, _reason} = error -> error
+      0,
+      fn entries, op_count ->
+        with {:ok, state_keys} <- terminal_reverse_state_keys(entries),
+             {:ok, statuses} <-
+               TerminalState.statuses(lmdb_path, keydir, state_keys, decode_entry_fun),
+             {:ok, ops} <-
+               cleanup_stale_terminal_reverse_scan_result(
+                 {:ok, entries},
+                 fn terminal_key, state_key ->
+                   LMDB.terminal_index_reconcile_delete_ops_result(
+                     lmdb_path,
+                     terminal_key,
+                     state_key
+                   )
+                 end,
+                 fn state_key ->
+                   case Map.fetch(statuses, state_key) do
+                     {:ok, status} -> {:ok, status}
+                     :error -> {:error, :missing_terminal_state_status}
+                   end
+                 end
+               ),
+             :ok <- LMDB.write_batch(lmdb_path, ops) do
+          {:ok, op_count + length(ops)}
         end
       end
     )
-    |> reverse_ops_result()
   end
 
   @doc false
@@ -73,9 +77,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
     do:
       cleanup_stale_terminal_reverse_scan_result(
         result,
-        keydir,
-        decode_entry_fun,
-        fn _terminal_key, _state_key -> {:ok, []} end
+        fn _terminal_key, _state_key -> {:ok, []} end,
+        &terminal_state_status_for_test(keydir, &1, decode_entry_fun)
       )
 
   @doc false
@@ -88,38 +91,49 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
       do:
         cleanup_stale_terminal_reverse_scan_result(
           result,
-          keydir,
-          decode_entry_fun,
-          delete_fun
+          delete_fun,
+          &terminal_state_status_for_test(keydir, &1, decode_entry_fun)
         )
 
   defp cleanup_stale_terminal_reverse_scan_result(
          {:ok, entries},
-         keydir,
-         decode_entry_fun,
-         delete_fun
+         delete_fun,
+         status_fun
        )
-       when is_list(entries) do
+       when is_list(entries) and is_function(status_fun, 1) do
     entries
     |> Enum.reduce_while({:ok, []}, fn
       {reverse_key, terminal_key}, {:ok, reversed_ops}
       when is_binary(reverse_key) and is_binary(terminal_key) ->
         case terminal_state_key_from_reverse_key(reverse_key) do
           {:ok, state_key} ->
-            if terminal_state_key?(keydir, state_key, decode_entry_fun) do
-              {:cont, {:ok, reversed_ops}}
-            else
-              case delete_fun.(terminal_key, nil) do
-                {:ok, terminal_ops} when is_list(terminal_ops) ->
-                  entry_ops = [{:delete, reverse_key} | terminal_ops]
-                  {:cont, {:ok, :lists.reverse(entry_ops, reversed_ops)}}
+            case status_fun.(state_key) do
+              {:ok, status} when status in [:terminal, :retained_terminal] ->
+                {:cont, {:ok, reversed_ops}}
 
-                {:error, _reason} = error ->
-                  {:halt, error}
+              {:ok, status} when status in [:active, :missing] ->
+                delete_state_key = if status == :missing, do: state_key, else: nil
 
-                invalid ->
-                  {:halt, {:error, {:invalid_terminal_delete_plan, invalid}}}
-              end
+                case delete_fun.(terminal_key, delete_state_key) do
+                  {:ok, terminal_ops} when is_list(terminal_ops) ->
+                    entry_ops =
+                      if is_binary(delete_state_key) do
+                        terminal_ops
+                      else
+                        [{:delete, reverse_key} | terminal_ops]
+                      end
+
+                    {:cont, {:ok, :lists.reverse(entry_ops, reversed_ops)}}
+
+                  {:error, _reason} = error ->
+                    {:halt, error}
+
+                  invalid ->
+                    {:halt, {:error, {:invalid_terminal_delete_plan, invalid}}}
+                end
+
+              {:error, _reason} = error ->
+                {:halt, error}
             end
 
           :error ->
@@ -137,14 +151,17 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
 
   defp cleanup_stale_terminal_reverse_scan_result(
          {:error, _reason} = error,
-         _keydir,
-         _decode_fun,
-         _delete_fun
+         _delete_fun,
+         _status_fun
        ),
        do: error
 
-  defp cleanup_stale_terminal_reverse_scan_result(invalid, _keydir, _decode_fun, _delete_fun),
-    do: {:error, {:invalid_terminal_reverse_scan, invalid}}
+  defp cleanup_stale_terminal_reverse_scan_result(
+         invalid,
+         _delete_fun,
+         _status_fun
+       ),
+       do: {:error, {:invalid_terminal_reverse_scan, invalid}}
 
   def query_metadata_index_ops(record, expire_at_ms) do
     partition_key = Map.get(record, :partition_key)
@@ -183,138 +200,6 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
     metadata_ops ++ attribute_ops
   end
 
-  defp do_persist_terminal_counts(stats, counts, lmdb_path) do
-    page_size = terminal_count_reconcile_page_size()
-
-    scan_fun = fn page_fun ->
-      scan_existing_terminal_count_pages(lmdb_path, page_size, page_fun)
-    end
-
-    write_fun = fn ops -> LMDB.write_batch(lmdb_path, ops) end
-
-    case reconcile_terminal_counts(counts, page_size, scan_fun, write_fun) do
-      :ok ->
-        stats
-
-      {:error, _reason} ->
-        %{stats | lmdb_errors: stats.lmdb_errors + 1}
-    end
-  end
-
-  @doc false
-  def __reconcile_terminal_counts_for_test__(counts, page_size, scan_fun, write_fun),
-    do: reconcile_terminal_counts(counts, page_size, scan_fun, write_fun)
-
-  defp reconcile_terminal_counts(counts, page_size, scan_fun, write_fun)
-       when is_map(counts) and is_integer(page_size) and page_size > 0 and
-              is_function(scan_fun, 1) and is_function(write_fun, 1) do
-    with :ok <- write_desired_terminal_count_pages(counts, page_size, write_fun),
-         :ok <- delete_stale_terminal_count_pages(counts, scan_fun, write_fun) do
-      :ok
-    end
-  end
-
-  defp write_desired_terminal_count_pages(counts, page_size, write_fun) do
-    counts
-    |> Stream.map(fn {count_key, count} ->
-      {:put, count_key, LMDB.encode_count(count)}
-    end)
-    |> Stream.chunk_every(page_size)
-    |> Enum.reduce_while(:ok, fn ops, :ok ->
-      case write_terminal_count_batch(ops, write_fun) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp delete_stale_terminal_count_pages(counts, scan_fun, write_fun) do
-    case scan_fun.(fn entries ->
-           with {:ok, ops} <-
-                  stale_terminal_count_delete_ops_result({:ok, entries}, counts),
-                :ok <- write_terminal_count_batch(ops, write_fun) do
-             :ok
-           end
-         end) do
-      :ok -> :ok
-      {:error, _reason} = error -> error
-      invalid -> {:error, {:invalid_terminal_count_scan, invalid}}
-    end
-  end
-
-  defp scan_existing_terminal_count_pages(lmdb_path, page_size, page_fun) do
-    LMDB.reduce_prefix_entries(
-      lmdb_path,
-      LMDB.terminal_count_prefix(),
-      page_size,
-      :ok,
-      fn entries, :ok ->
-        case page_fun.(entries) do
-          :ok -> {:ok, :ok}
-          {:error, _reason} = error -> error
-          invalid -> {:error, {:invalid_terminal_count_page_result, invalid}}
-        end
-      end
-    )
-    |> case do
-      {:ok, :ok} -> :ok
-      {:error, _reason} = error -> error
-      invalid -> {:error, {:invalid_terminal_count_scan, invalid}}
-    end
-  end
-
-  @doc false
-  def __stale_terminal_count_delete_ops_result_for_test__(result, counts),
-    do: stale_terminal_count_delete_ops_result(result, counts)
-
-  defp stale_terminal_count_delete_ops_result({:ok, entries}, counts)
-       when is_list(entries) and is_map(counts) do
-    entries
-    |> Enum.reduce_while({:ok, []}, fn
-      {key, value}, {:ok, reversed_ops} when is_binary(key) and is_binary(value) ->
-        if Map.has_key?(counts, key) do
-          {:cont, {:ok, reversed_ops}}
-        else
-          {:cont, {:ok, [{:delete, key} | reversed_ops]}}
-        end
-
-      _invalid, _acc ->
-        {:halt, {:error, :invalid_terminal_count_scan_entry}}
-    end)
-    |> case do
-      {:ok, reversed_ops} -> {:ok, Enum.reverse(reversed_ops)}
-      {:error, _reason} = error -> error
-    end
-  end
-
-  defp stale_terminal_count_delete_ops_result(
-         {:error, _reason} = error,
-         _counts
-       ),
-       do: error
-
-  defp stale_terminal_count_delete_ops_result(invalid, _counts),
-    do: {:error, {:invalid_terminal_count_scan, invalid}}
-
-  defp write_terminal_count_batch([], _write_fun), do: :ok
-
-  defp write_terminal_count_batch(ops, write_fun) do
-    case write_fun.(ops) do
-      :ok -> :ok
-      {:error, _reason} = error -> error
-      invalid -> {:error, {:invalid_terminal_count_write, invalid}}
-    end
-  end
-
-  defp terminal_count_reconcile_page_size do
-    :ferricstore
-    |> Application.get_env(
-      :flow_lmdb_rebuild_count_key_page_size,
-      @default_scan_page_size
-    )
-    |> normalize_scan_page_size()
-  end
-
   defp cleanup_stale_terminal_ops_by_id(lmdb_path, state_key, %{id: id, type: type} = record)
        when is_binary(id) and is_binary(type) do
     partition_key = Map.get(record, :partition_key)
@@ -350,19 +235,34 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
 
   defp terminal_state_key_from_reverse_key(_reverse_key), do: :error
 
-  defp terminal_state_key?(keydir, state_key, decode_entry_fun) when is_binary(state_key) do
-    case :ets.lookup(keydir, state_key) do
-      [entry] ->
-        case decode_entry_fun.(entry) do
-          [{_key, _value, _expire_at_ms, record}] ->
-            LMDB.terminal_state?(Map.get(record, :state))
-
-          _ ->
-            false
+  defp terminal_reverse_state_keys(entries) when is_list(entries) do
+    Enum.reduce_while(entries, {:ok, []}, fn
+      {reverse_key, terminal_key}, {:ok, state_keys}
+      when is_binary(reverse_key) and is_binary(terminal_key) ->
+        case terminal_state_key_from_reverse_key(reverse_key) do
+          {:ok, state_key} -> {:cont, {:ok, [state_key | state_keys]}}
+          :error -> {:halt, {:error, :invalid_terminal_reverse_key}}
         end
 
-      _ ->
-        false
+      invalid, _acc ->
+        {:halt, {:error, {:invalid_terminal_reverse_entry, invalid}}}
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp terminal_state_status_for_test(keydir, state_key, decode_entry_fun) do
+    case TerminalState.statuses_with_reader(
+           keydir,
+           [state_key],
+           decode_entry_fun,
+           fn state_keys -> {:ok, List.duplicate(:not_found, length(state_keys))} end
+         ) do
+      {:ok, %{^state_key => status}} -> {:ok, status}
+      {:error, _reason} = error -> error
+      _invalid -> {:error, :invalid_terminal_state_status}
     end
   end
 
@@ -385,7 +285,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
                current_state_key,
                nil_state_key_only?,
                fn terminal_key, delete_state_key ->
-                 LMDB.terminal_index_delete_ops_result(
+                 LMDB.terminal_index_reconcile_delete_ops_result(
                    lmdb_path,
                    terminal_key,
                    delete_state_key

@@ -403,6 +403,64 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
              )
   end
 
+  test "terminal reconciliation delete planning defers count repair" do
+    terminal_key = LMDB.terminal_index_key("state-index", "flow-id", 10)
+    state_key = "state-key"
+    count_key = LMDB.terminal_count_key("state-index")
+    terminal_value = LMDB.encode_terminal_index_value("flow-id", 10, 20, state_key, count_key)
+    expire_key = LMDB.terminal_expire_key(20, terminal_key)
+    reverse_key = LMDB.terminal_by_state_key_key(state_key)
+
+    assert {:ok, ops} =
+             LMDB.__terminal_index_reconcile_delete_ops_result_for_test__(
+               terminal_key,
+               state_key,
+               {:ok, terminal_value}
+             )
+
+    assert {:compare, terminal_key, terminal_value} in ops
+    assert {:compare, reverse_key, terminal_key} in ops
+
+    assert {:compare, expire_key,
+            LMDB.encode_terminal_expire_value(terminal_key, state_key, count_key)} in ops
+
+    assert {:delete, terminal_key} in ops
+    assert {:delete, state_key} in ops
+    assert {:delete, reverse_key} in ops
+    assert {:delete, expire_key} in ops
+
+    refute Enum.any?(ops, fn
+             {_kind, ^count_key} -> true
+             {_kind, ^count_key, _value} -> true
+             _other -> false
+           end)
+
+    assert {:error, :invalid_terminal_index_value} =
+             LMDB.__terminal_index_reconcile_delete_ops_result_for_test__(
+               terminal_key,
+               state_key,
+               {:ok, "corrupt"}
+             )
+  end
+
+  test "terminal reconciliation removes an orphan reverse when its index is missing" do
+    terminal_key = LMDB.terminal_index_key("state-index", "flow-id", 10)
+    state_key = "state-key"
+    reverse_key = LMDB.terminal_by_state_key_key(state_key)
+
+    assert {:ok, ops} =
+             LMDB.__terminal_index_reconcile_delete_ops_result_for_test__(
+               terminal_key,
+               state_key,
+               :not_found
+             )
+
+    assert {:compare_missing, terminal_key} in ops
+    assert {:compare, reverse_key, terminal_key} in ops
+    assert {:delete, state_key} in ops
+    assert {:delete, reverse_key} in ops
+  end
+
   test "state artifact terminal reverse reads preserve storage failures" do
     assert {:ok, nil} = LMDB.__terminal_reverse_read_for_test__(:not_found)
     assert {:ok, "terminal-key"} = LMDB.__terminal_reverse_read_for_test__({:ok, "terminal-key"})

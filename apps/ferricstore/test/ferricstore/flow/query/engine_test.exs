@@ -438,8 +438,13 @@ defmodule Ferricstore.Flow.Query.EngineTest do
                  "failed" => "failed"
                })
 
-      assert {:ok, %{records: [%{id: ^hot_failed_id}]}} =
+      assert {:ok, %{records: terminal_records}} =
                Query.execute(ctx, plain_terminal_request)
+
+      assert Enum.map(terminal_records, & &1.id) == [
+               "failed-eu-#{suffix}",
+               hot_failed_id
+             ]
     after
       IsolatedInstance.checkin(ctx)
     end

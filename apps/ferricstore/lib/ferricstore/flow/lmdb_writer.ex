@@ -975,7 +975,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp flush_ops_and_marker(state, ops, started_at) do
-    LMDBFlushCoordinator.with_permit(state.instance_name, fn ->
+    LMDBFlushCoordinator.with_shard_permit(state.instance_name, state.shard_index, fn ->
       flush_ops_and_marker_with_permit(state, ops, started_at)
     end)
   end

@@ -2,10 +2,12 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   @moduledoc false
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.LMDB
+  alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBRebuilder.ActiveIndexes
   alias Ferricstore.Flow.LMDBRebuilder.ColdState
+  alias Ferricstore.Flow.LMDBRebuilder.TerminalCounts
   alias Ferricstore.Flow.LMDBRebuilder.TerminalProjection
-  alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.PolicyMigration
   alias Ferricstore.Flow.SharedRefBackfill
@@ -98,7 +100,47 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         flow_index \\ nil,
         flow_lookup \\ nil,
         opts \\ []
+      )
+
+  def reconcile_shard(
+        shard_path,
+        keydir,
+        shard_index,
+        instance_ctx,
+        zset_score_index,
+        zset_score_lookup,
+        flow_index,
+        flow_lookup,
+        opts
       ) do
+    instance_name = Map.get(instance_ctx || %{}, :name, :default)
+
+    LMDBFlushCoordinator.with_shard_permit(instance_name, shard_index, fn ->
+      do_reconcile_shard(
+        shard_path,
+        keydir,
+        shard_index,
+        instance_ctx,
+        zset_score_index,
+        zset_score_lookup,
+        flow_index,
+        flow_lookup,
+        opts
+      )
+    end)
+  end
+
+  defp do_reconcile_shard(
+         shard_path,
+         keydir,
+         shard_index,
+         instance_ctx,
+         zset_score_index,
+         zset_score_lookup,
+         flow_index,
+         flow_lookup,
+         opts
+       ) do
     lmdb_path = LMDB.path(shard_path)
     prune_terminal_keydir? = Keyword.get(opts, :prune_terminal_keydir?, false)
     Process.put(:flow_lmdb_rebuild_cold_read_errors, 0)
@@ -133,7 +175,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                  )
                end
              ) do
-        stats = TerminalProjection.persist_terminal_counts(stats, lmdb_path)
+        stats = TerminalCounts.persist(stats, lmdb_path)
 
         lmdb_active_rebuild_result =
           ActiveIndexes.rebuild_flow_indexes_from_lmdb(
@@ -179,8 +221,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
         telemetry_stats =
           stats
-          |> Map.put(:terminal_count_keys, map_size(stats.terminal_counts))
-          |> Map.delete(:terminal_counts)
+          |> Map.put_new(:terminal_count_keys, 0)
 
         :telemetry.execute(
           [:ferricstore, :flow, :lmdb_rebuild],
@@ -561,9 +602,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        ) do
     decoded = ColdState.read_and_decode(entries, shard_path, shard_index, instance_ctx)
 
-    {ops, terminal_prunes, active_records, terminal_counts, projection_read_errors} =
-      Enum.reduce(decoded, {[], [], [], acc.terminal_counts, 0}, fn
-        {key, value, expire_at_ms, record}, {ops, prunes, active, counts, read_errors} ->
+    {ops, terminal_prunes, active_records, projection_read_errors} =
+      Enum.reduce(decoded, {[], [], [], 0}, fn
+        {key, value, expire_at_ms, record}, {ops, prunes, active, read_errors} ->
           state_put_op = {:put, key, LMDB.encode_value(value, expire_at_ms)}
 
           if LMDB.terminal_state?(Map.get(record, :state)) do
@@ -626,7 +667,6 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
               :lists.reverse(reconcile_ops, ops),
               [{key, record} | prunes],
               active,
-              Map.update(counts, count_key, 1, &(&1 + 1)),
               next_read_errors
             }
           else
@@ -657,7 +697,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
             reconcile_ops = [state_put_op | active_ops ++ attribute_ops]
 
-            {:lists.reverse(reconcile_ops, ops), prunes, [{key, record} | active], counts,
+            {:lists.reverse(reconcile_ops, ops), prunes, [{key, record} | active],
              next_read_errors}
           end
       end)
@@ -704,8 +744,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
             active: acc.active + length(active_records),
             lmdb_errors:
               acc.lmdb_errors + projection_read_errors +
-                if(cleanup_result == :ok, do: 0, else: 1),
-            terminal_counts: terminal_counts
+                if(cleanup_result == :ok, do: 0, else: 1)
         }
 
       {:error, _reason} ->
@@ -724,27 +763,28 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   end
 
   defp initial_reconcile_stats(lmdb_path, keydir, shard_path) do
-    {cleanup_ops, scan_errors} =
-      case TerminalProjection.cleanup_stale_terminal_reverse_ops(lmdb_path, keydir, fn entry ->
-             ColdState.read_and_decode([entry], shard_path)
-           end) do
-        {:ok, cleanup_ops} -> {cleanup_ops, 0}
-        {:error, _reason} -> {[], 1}
+    {cleanup_op_count, scan_errors} =
+      case cleanup_stale_terminal_reverse(lmdb_path, keydir, shard_path) do
+        {:ok, cleanup_op_count} -> {cleanup_op_count, 0}
+        {:error, _reason} -> {0, 1}
       end
-
-    cleanup_result = LMDB.write_batch(lmdb_path, cleanup_ops)
 
     %{
       seen: 0,
       lmdb: 0,
       terminal: 0,
       active: 0,
-      lmdb_errors: scan_errors + if(cleanup_result == :ok, do: 0, else: 1),
+      lmdb_errors: scan_errors,
       cold_read_errors: 0,
-      terminal_counts: %{},
       terminal_reverse_cleanup_scans: 1,
-      terminal_reverse_cleanup_ops: length(cleanup_ops)
+      terminal_reverse_cleanup_ops: cleanup_op_count
     }
+  end
+
+  defp cleanup_stale_terminal_reverse(lmdb_path, keydir, shard_path) do
+    TerminalProjection.cleanup_stale_terminal_reverse(lmdb_path, keydir, fn entry ->
+      ColdState.read_and_decode([entry], shard_path)
+    end)
   end
 
   defp begin_reconcile_marker(lmdb_path, state_entries_present?) do

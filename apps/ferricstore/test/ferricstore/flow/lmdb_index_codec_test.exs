@@ -21,6 +21,8 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
       {IndexCodec.encode_count(1), &IndexCodec.decode_count/1, :error},
       {IndexCodec.encode_terminal_index_value("id", 10, 20, "state", "count"),
        &IndexCodec.decode_terminal_index_value/1, :error},
+      {IndexCodec.encode_terminal_index_value("id", 10, 20, "state", "count"),
+       &IndexCodec.decode_terminal_index_entry/1, :error},
       {IndexCodec.encode_query_index_value("index", "id", 10, 20, "state"),
        &IndexCodec.decode_query_index_value/1, :error},
       {IndexCodec.encode_history_index_value("event", 10, "compound", 20),
@@ -121,8 +123,13 @@ defmodule Ferricstore.Flow.LMDB.IndexCodecTest do
 
   test "terminal index decoding requires the exact counted schema" do
     count_less = TermCodec.encode({"id", 10, 20, "state"})
+    encoded = IndexCodec.encode_terminal_index_value("id", 10, 20, "state", "count")
+
+    assert {:ok, {"id", 10, 20, "state", "count"}} =
+             IndexCodec.decode_terminal_index_entry(encoded)
 
     assert :error = IndexCodec.decode_terminal_index_value(count_less)
+    assert :error = IndexCodec.decode_terminal_index_entry(count_less)
     assert :missing = IndexCodec.terminal_index_count_key(count_less)
   end
 

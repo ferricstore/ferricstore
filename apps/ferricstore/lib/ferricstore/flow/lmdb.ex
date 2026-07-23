@@ -1092,6 +1092,15 @@ defmodule Ferricstore.Flow.LMDB do
     )
   end
 
+  def terminal_index_reconcile_delete_ops_result(path, terminal_key, state_key)
+      when is_binary(path) and is_binary(terminal_key) do
+    terminal_index_reconcile_delete_ops_from_result(
+      terminal_key,
+      state_key,
+      get(path, terminal_key)
+    )
+  end
+
   defp strict_terminal_index_delete_ops_result(path, terminal_key, state_key) do
     case get(path, terminal_key) do
       :not_found ->
@@ -1122,6 +1131,75 @@ defmodule Ferricstore.Flow.LMDB do
     )
   end
 
+  @doc false
+  def __terminal_index_reconcile_delete_ops_result_for_test__(
+        terminal_key,
+        state_key,
+        terminal_result
+      ) do
+    terminal_index_reconcile_delete_ops_from_result(terminal_key, state_key, terminal_result)
+  end
+
+  defp terminal_index_reconcile_delete_ops_from_result(
+         terminal_key,
+         state_key,
+         :not_found
+       )
+       when is_binary(state_key) do
+    {:ok,
+     [{:compare_missing, terminal_key} | terminal_index_base_delete_ops(terminal_key, state_key)]}
+  end
+
+  defp terminal_index_reconcile_delete_ops_from_result(
+         terminal_key,
+         _state_key,
+         :not_found
+       ),
+       do: {:ok, [{:compare_missing, terminal_key}]}
+
+  defp terminal_index_reconcile_delete_ops_from_result(
+         _terminal_key,
+         _state_key,
+         {:error, _reason} = error
+       ),
+       do: error
+
+  defp terminal_index_reconcile_delete_ops_from_result(
+         terminal_key,
+         state_key,
+         {:ok, terminal_value}
+       )
+       when is_binary(terminal_value) do
+    with {:ok, {id, updated_at_ms, expire_at_ms, stored_state_key, count_key}} <-
+           decode_terminal_index_entry(terminal_value),
+         true <- terminal_index_entry_key?(terminal_key, id, updated_at_ms),
+         :ok <- validate_terminal_delete_state_key(state_key, stored_state_key) do
+      ops =
+        terminal_key
+        |> terminal_index_base_delete_ops(state_key)
+        |> prepend_terminal_expire_delete(
+          terminal_key,
+          expire_at_ms,
+          stored_state_key,
+          count_key
+        )
+
+      {:ok, [{:compare, terminal_key, terminal_value} | ops]}
+    else
+      false -> {:error, :invalid_terminal_index_value}
+      :missing -> {:error, :invalid_terminal_index_value}
+      :error -> {:error, :invalid_terminal_index_value}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp terminal_index_reconcile_delete_ops_from_result(
+         _terminal_key,
+         _state_key,
+         _invalid
+       ),
+       do: {:error, :invalid_terminal_index_read}
+
   defp terminal_index_delete_ops_from_results(
          terminal_key,
          _state_key,
@@ -1146,11 +1224,10 @@ defmodule Ferricstore.Flow.LMDB do
          count_reader
        )
        when is_binary(terminal_value) do
-    with {:ok, {id, updated_at_ms, expire_at_ms, stored_state_key}} <-
-           decode_terminal_index_value(terminal_value),
+    with {:ok, {id, updated_at_ms, expire_at_ms, stored_state_key, count_key}} <-
+           decode_terminal_index_entry(terminal_value),
          true <- terminal_index_entry_key?(terminal_key, id, updated_at_ms),
          :ok <- validate_terminal_delete_state_key(state_key, stored_state_key),
-         {:ok, count_key} <- terminal_index_count_key(terminal_value),
          {:ok, count, count_value} <- terminal_count_from_read_result(count_reader.(count_key)) do
       ops =
         terminal_key
@@ -1294,6 +1371,9 @@ defmodule Ferricstore.Flow.LMDB do
 
   def decode_terminal_index_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_index_value(blob)
+
+  def decode_terminal_index_entry(blob),
+    do: Ferricstore.Flow.LMDB.IndexCodec.decode_terminal_index_entry(blob)
 
   def decode_query_index_value(blob),
     do: Ferricstore.Flow.LMDB.IndexCodec.decode_query_index_value(blob)

@@ -1,156 +1,7 @@
 defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjectionTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBRebuilder.TerminalProjection
-
-  setup do
-    previous =
-      Application.fetch_env(
-        :ferricstore,
-        :flow_lmdb_rebuild_count_key_page_size
-      )
-
-    Application.put_env(:ferricstore, :flow_lmdb_rebuild_count_key_page_size, 2)
-
-    on_exit(fn ->
-      case previous do
-        {:ok, value} ->
-          Application.put_env(:ferricstore, :flow_lmdb_rebuild_count_key_page_size, value)
-
-        :error ->
-          Application.delete_env(:ferricstore, :flow_lmdb_rebuild_count_key_page_size)
-      end
-    end)
-
-    :ok
-  end
-
-  test "terminal count reconciliation deletes stale count keys and writes exact counts" do
-    path =
-      Path.join(
-        System.tmp_dir!(),
-        "ferricstore-terminal-count-reconcile-#{System.unique_integer([:positive])}"
-      )
-
-    on_exit(fn -> File.rm_rf!(path) end)
-
-    existing_key = LMDB.terminal_count_key("state:completed")
-    new_key = LMDB.terminal_count_key("state:failed")
-    stale_state_index_key = "state:cancelled"
-    stale_a = LMDB.terminal_count_key(stale_state_index_key)
-    stale_b = LMDB.terminal_count_key("state:removed")
-
-    assert :ok =
-             LMDB.write_batch(path, [
-               {:put, existing_key, LMDB.encode_count(99)},
-               {:put, stale_a, LMDB.encode_count(7)},
-               {:put, stale_b, LMDB.encode_count(11)}
-             ])
-
-    stats = %{
-      terminal_counts: %{existing_key => 3, new_key => 5},
-      lmdb_errors: 0
-    }
-
-    assert ^stats = TerminalProjection.persist_terminal_counts(stats, path)
-    assert {:ok, value} = LMDB.get(path, existing_key)
-    assert value == LMDB.encode_count(3)
-    assert {:ok, value} = LMDB.get(path, new_key)
-    assert value == LMDB.encode_count(5)
-    assert :not_found = LMDB.get(path, stale_a)
-    assert :not_found = LMDB.get(path, stale_b)
-    assert {:ok, [0]} = LMDB.terminal_counts(path, [stale_state_index_key])
-
-    assert ^stats = TerminalProjection.persist_terminal_counts(stats, path)
-    assert :not_found = LMDB.get(path, stale_a)
-    assert :not_found = LMDB.get(path, stale_b)
-  end
-
-  test "terminal count reconciliation uses bounded retryable write pages" do
-    desired_a = LMDB.terminal_count_key("state:a")
-    desired_b = LMDB.terminal_count_key("state:b")
-    desired_c = LMDB.terminal_count_key("state:c")
-    stale_a = LMDB.terminal_count_key("state:stale-a")
-    stale_b = LMDB.terminal_count_key("state:stale-b")
-    counts = %{desired_a => 2, desired_b => 3, desired_c => 5}
-
-    pages = [
-      [{desired_a, LMDB.encode_count(1)}, {stale_a, LMDB.encode_count(7)}],
-      [{desired_b, LMDB.encode_count(1)}, {stale_b, LMDB.encode_count(11)}],
-      [{desired_c, LMDB.encode_count(1)}]
-    ]
-
-    parent = self()
-
-    scan_fun = fn page_fun ->
-      Enum.reduce_while(pages, :ok, fn page, :ok ->
-        case page_fun.(page) do
-          :ok -> {:cont, :ok}
-          {:error, _reason} = error -> {:halt, error}
-        end
-      end)
-    end
-
-    write_fun = fn ops ->
-      send(parent, {:terminal_count_batch, ops})
-      :ok
-    end
-
-    assert :ok =
-             TerminalProjection.__reconcile_terminal_counts_for_test__(
-               counts,
-               2,
-               scan_fun,
-               write_fun
-             )
-
-    batches =
-      for _index <- 1..4 do
-        assert_receive {:terminal_count_batch, ops}
-        ops
-      end
-
-    assert Enum.all?(batches, &(length(&1) <= 2))
-
-    {put_batches, delete_batches} =
-      Enum.split_while(batches, fn ops ->
-        Enum.all?(ops, &match?({:put, _key, _value}, &1))
-      end)
-
-    assert length(put_batches) == 2
-    assert length(delete_batches) == 2
-
-    assert MapSet.new(List.flatten(put_batches)) ==
-             MapSet.new([
-               {:put, desired_a, LMDB.encode_count(2)},
-               {:put, desired_b, LMDB.encode_count(3)},
-               {:put, desired_c, LMDB.encode_count(5)}
-             ])
-
-    assert MapSet.new(List.flatten(delete_batches)) ==
-             MapSet.new([{:delete, stale_a}, {:delete, stale_b}])
-  end
-
-  test "terminal count reconciliation does not delete stale keys after a desired write failure" do
-    desired_key = LMDB.terminal_count_key("state:desired")
-    parent = self()
-
-    scan_fun = fn _page_fun ->
-      send(parent, :terminal_count_scan_started)
-      :ok
-    end
-
-    assert {:error, :busy} =
-             TerminalProjection.__reconcile_terminal_counts_for_test__(
-               %{desired_key => 1},
-               1,
-               scan_fun,
-               fn _ops -> {:error, :busy} end
-             )
-
-    refute_receive :terminal_count_scan_started
-  end
 
   test "terminal reverse scans preserve backend failures" do
     keydir = :ets.new(:terminal_projection_reverse_keydir, [:set])
@@ -180,21 +31,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjectionTest do
                {:ok, [{reverse_key, "terminal-key"}]},
                keydir,
                fn _entry -> [] end,
-               fn "terminal-key", nil -> {:error, :busy} end
-             )
-  end
-
-  test "terminal count-key scans preserve backend failures" do
-    assert {:ok, [{:delete, "count-b"}]} =
-             TerminalProjection.__stale_terminal_count_delete_ops_result_for_test__(
-               {:ok, [{"count-a", "1"}, {"count-b", "2"}]},
-               %{"count-a" => 1}
-             )
-
-    assert {:error, :busy} =
-             TerminalProjection.__stale_terminal_count_delete_ops_result_for_test__(
-               {:error, :busy},
-               %{}
+               fn "terminal-key", ^state_key -> {:error, :busy} end
              )
   end
 
@@ -248,6 +85,12 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjectionTest do
         )
       )
 
-    refute source =~ "LMDB.terminal_index_global_prefix()"
+    [_before, cleanup_source] =
+      String.split(source, "defp cleanup_stale_terminal_ops_by_id(", parts: 2)
+
+    [cleanup_source, _after] =
+      String.split(cleanup_source, "defp terminal_state_key_from_reverse_key", parts: 2)
+
+    refute cleanup_source =~ "LMDB.terminal_index_global_prefix()"
   end
 end

@@ -270,7 +270,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
                  Ferricstore.Flow.complete(ctx, id, claimed.lease_token,
                    partition_key: partition_key,
                    fencing_token: claimed.fencing_token,
-                   ttl_ms: 40,
+                   ttl_ms: 60_000,
                    now_ms: 2_000
                  )
 

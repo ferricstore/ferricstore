@@ -464,13 +464,23 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   end
 
   def decode_terminal_index_value(blob) when is_binary(blob) do
+    case decode_terminal_index_entry(blob) do
+      {:ok, {id, updated_at_ms, expire_at_ms, state_key, _count_key}} ->
+        {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
+
+      :error ->
+        :error
+    end
+  end
+
+  def decode_terminal_index_entry(blob) when is_binary(blob) do
     case TermCodec.decode(blob) do
       {:ok, {id, updated_at_ms, expire_at_ms, state_key, count_key}}
       when is_binary(id) and is_integer(updated_at_ms) and updated_at_ms >= 0 and
              updated_at_ms <= @max_u64 and is_integer(expire_at_ms) and expire_at_ms >= 0 and
              expire_at_ms <= @max_u64 and
              (is_binary(state_key) or is_nil(state_key)) and is_binary(count_key) ->
-        {:ok, {id, updated_at_ms, expire_at_ms, state_key}}
+        {:ok, {id, updated_at_ms, expire_at_ms, state_key, count_key}}
 
       _ ->
         :error
@@ -563,19 +573,13 @@ defmodule Ferricstore.Flow.LMDB.IndexCodec do
   end
 
   def terminal_index_count_key(blob) when is_binary(blob) do
-    case TermCodec.decode(blob) do
-      {:ok, {id, updated_at_ms, expire_at_ms, state_key, count_key}}
-      when is_binary(id) and is_integer(updated_at_ms) and updated_at_ms >= 0 and
-             updated_at_ms <= @max_u64 and is_integer(expire_at_ms) and expire_at_ms >= 0 and
-             expire_at_ms <= @max_u64 and
-             (is_binary(state_key) or is_nil(state_key)) and is_binary(count_key) ->
+    case decode_terminal_index_entry(blob) do
+      {:ok, {_id, _updated_at_ms, _expire_at_ms, _state_key, count_key}} ->
         {:ok, count_key}
 
-      _ ->
+      :error ->
         :missing
     end
-  rescue
-    _ -> :missing
   end
 
   defp pad_u64(value) do
