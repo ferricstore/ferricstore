@@ -329,7 +329,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
   test "cancel stores inline reason payload as an owned terminal value" do
     id = unique_id("flow-value-cancel-reason")
     reason = %{code: "user_cancelled", details: String.duplicate("x", 256)}
-    now_ms = System.os_time(:millisecond)
+    now_ms = Ferricstore.HLC.now_ms()
 
     assert :ok =
              FerricStore.flow_create(id,
