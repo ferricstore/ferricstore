@@ -7,6 +7,7 @@ All notable changes to FerricStore will be documented here.
 ## 0.10.1 - 2026-07-23
 
 - Fixed the standalone container build to package the OSS query-index catalog required during startup.
+- Fixed LMDB reconciliation to preserve valid cold terminal projections, remove stale reverse rows, rebuild exact terminal counts in bounded pages, and serialize writers with reconciliation per shard without blocking independent shards.
 - Added native-port startup smoke tests for every CI image and each release architecture before publishing a multi-arch manifest.
 
 ## 0.10.0 - 2026-07-23
