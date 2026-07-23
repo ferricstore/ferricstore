@@ -385,6 +385,9 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
     assert benchmark_workflow =~ "BENCH_REQUIRE_COLD_CACHE: \"1\""
     assert benchmark_workflow =~ "git rev-parse --verify --end-of-options"
     assert benchmark_workflow =~ "rounds must be an integer from 1 through 5"
+    assert benchmark_workflow =~ "Configure benchmark result paths"
+    assert benchmark_workflow =~ ~s(BASELINE_RESULTS=$RUNNER_TEMP/baseline-results)
+    refute benchmark_workflow =~ ~s(${{ runner.temp }})
   end
 
   defp read!(path) do

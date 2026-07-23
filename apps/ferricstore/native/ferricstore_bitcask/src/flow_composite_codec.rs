@@ -125,26 +125,20 @@ mod composite_entry_codec_tests {
         assert!(valid_flow_tag(b"fa:0"));
         assert!(valid_flow_tag(b"fa:255"));
         assert!(valid_flow_tag(
-            &[b'f', b':']
-                .into_iter()
-                .chain([b'A'; 43])
-                .collect::<Vec<_>>()
+            &(*b"f:").into_iter().chain([b'A'; 43]).collect::<Vec<_>>()
         ));
 
         assert!(!valid_flow_tag(b"invalid"));
         assert!(!valid_flow_tag(b"fa:00"));
         assert!(!valid_flow_tag(b"fa:256"));
         assert!(!valid_flow_tag(
-            &[b'f', b':']
-                .into_iter()
-                .chain([b'A'; 42])
-                .collect::<Vec<_>>()
+            &(*b"f:").into_iter().chain([b'A'; 42]).collect::<Vec<_>>()
         ));
 
         let mut invalid_final = [b'A'; 43];
         invalid_final[42] = b'B';
         assert!(!valid_flow_tag(
-            &[b'f', b':']
+            &(*b"f:")
                 .into_iter()
                 .chain(invalid_final)
                 .collect::<Vec<_>>()

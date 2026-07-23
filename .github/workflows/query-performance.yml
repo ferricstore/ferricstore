@@ -40,10 +40,6 @@ jobs:
     name: Same-host query benchmark comparison
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    env:
-      BASELINE_RESULTS: ${{ runner.temp }}/baseline-results
-      CURRENT_RESULTS: ${{ runner.temp }}/current-results
-      CRITERION_RESULTS: ${{ runner.temp }}/criterion-results
     steps:
       - uses: actions/checkout@v6
         with:
@@ -55,6 +51,15 @@ jobs:
           otp-version: "28"
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure benchmark result paths
+        shell: bash
+        run: |
+          {
+            echo "BASELINE_RESULTS=$RUNNER_TEMP/baseline-results"
+            echo "CURRENT_RESULTS=$RUNNER_TEMP/current-results"
+            echo "CRITERION_RESULTS=$RUNNER_TEMP/criterion-results"
+          } >> "$GITHUB_ENV"
 
       - name: Install cold-cache tooling
         run: |
