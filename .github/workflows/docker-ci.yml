@@ -41,6 +41,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Smoke-test published CI image startup
+        run: >-
+          scripts/smoke-docker-image.sh
+          "ghcr.io/${{ github.repository }}:ci-${{ github.sha }}"
+
       - name: Summary
         run: |
           echo "Published image:" >> "$GITHUB_STEP_SUMMARY"

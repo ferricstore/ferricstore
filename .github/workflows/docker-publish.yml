@@ -93,6 +93,11 @@ jobs:
           cache-from: type=gha,scope=ferricstore-${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=ferricstore-${{ matrix.suffix }}
 
+      - name: Smoke-test published architecture image startup
+        run: >-
+          scripts/smoke-docker-image.sh
+          "${IMAGE}:${{ needs.version.outputs.version }}-${{ matrix.suffix }}"
+
   manifest:
     name: Publish multi-arch manifest
     needs: [version, build]

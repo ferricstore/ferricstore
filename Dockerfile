@@ -39,6 +39,7 @@ COPY config/config.exs config/prod.exs config/runtime.exs config/
 COPY apps/ferricstore/native apps/ferricstore/native
 COPY apps/ferricstore/lib apps/ferricstore/lib
 COPY apps/ferricstore/src apps/ferricstore/src
+COPY apps/ferricstore/priv/flow_query apps/ferricstore/priv/flow_query
 COPY apps/ferricstore_server/native apps/ferricstore_server/native
 COPY apps/ferricstore_server/lib apps/ferricstore_server/lib
 COPY rel rel

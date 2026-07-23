@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.10.1 - 2026-07-23
+
+- Fixed the standalone container build to package the OSS query-index catalog required during startup.
+- Added native-port startup smoke tests for every CI image and each release architecture before publishing a multi-arch manifest.
+
 ## 0.10.0 - 2026-07-23
 
 - Added the complete cost-aware `FLOW.QUERY` planner, composite index lifecycle, bounded executor, statistics, actionable diagnostics, index management, and `EXPLAIN`/`EXPLAIN ANALYZE` UX to OSS; Enterprise consumes the same implementation and contracts.

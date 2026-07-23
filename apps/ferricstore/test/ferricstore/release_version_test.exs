@@ -2,7 +2,7 @@ defmodule Ferricstore.ReleaseVersionTest do
   use ExUnit.Case, async: true
 
   @repo_root Path.expand("../../../..", __DIR__)
-  @release_version "0.10.0"
+  @release_version "0.10.1"
 
   @project_files [
     "mix.exs",
@@ -73,6 +73,22 @@ defmodule Ferricstore.ReleaseVersionTest do
 
     assert changelog =~ "## Unreleased"
     assert changelog =~ "## #{@release_version} - "
+  end
+
+  test "container release packages the query catalog and smoke-tests startup" do
+    dockerfile = read!("Dockerfile")
+
+    assert dockerfile =~
+             "COPY apps/ferricstore/priv/flow_query apps/ferricstore/priv/flow_query"
+
+    assert File.exists?(Path.join(@repo_root, "scripts/smoke-docker-image.sh"))
+
+    for workflow <- [
+          ".github/workflows/docker-ci.yml",
+          ".github/workflows/docker-publish.yml"
+        ] do
+      assert read!(workflow) =~ "scripts/smoke-docker-image.sh"
+    end
   end
 
   test "Hex package inputs contain no removed protocol artifacts" do
