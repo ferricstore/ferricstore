@@ -1,37 +1,36 @@
 # bench/router_write_bench.exs
 #
-# Measures concurrent write throughput through the full Router + Shard stack.
+# Measures concurrent write throughput through Router and the configured
+# replicated storage backend.
 #
-# This benchmark is the realistic picture of ferricstore's write capacity.
-# Unlike write_backend_bench.exs (which hits a single NIF store directly),
-# here every write goes through:
+# This intentionally excludes native-protocol parsing, framing, sockets, and
+# client scheduling. Every measured write goes through:
 #
-#   TCP client
-#     → Router.put/3          (key hashes to one of 4 shards)
-#       → Shard GenServer     (writes ETS immediately, appends to pending list)
-#         → NIF.put_batch_async (submitted to io_uring ring, returns {:pending, op_id})
-#           → kernel pwrite + fsync  (async, off the GenServer's critical path)
-#             → {:io_complete, op_id, :ok}  (sent back to the Shard)
+#   Router.put/4
+#     -> key admission and shard routing
+#       -> the active Raft backend and its batcher
+#         -> replicated state-machine apply and durable log acknowledgement
 #
-# The Shard GenServer is the serialization point per shard. With 4 shards,
-# 4 writes to different shards can be in-flight simultaneously — the group-
-# commit batching happens *per shard* on a 1ms timer.
+# Writes to different shard groups can be in flight independently. Concurrency
+# also gives the backend an opportunity to batch commits within each group.
 #
 # Benchmark sections:
 #
 #   1. Single shard, N concurrent writers  — isolates one Shard's capacity
 #      (same key space, all writes hash to the same shard)
 #
-#   2. All 4 shards, N concurrent writers  — distributed key space, full
+#   2. All shards, N concurrent writers    — distributed key space, full
 #      sharding benefit visible
 #
 #   3. Writes/second scaling curve         — total throughput as N grows:
 #      4, 16, 64, 256 writers on all shards
 #
 # Run locally:
-#   MIX_ENV=bench mix run bench/router_write_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/router_write_bench.exs
 
 alias Ferricstore.Store.Router
+
+Logger.configure(level: :warning)
 
 bench_warmup = System.get_env("BENCH_WARMUP", "2") |> String.to_integer()
 bench_time = System.get_env("BENCH_TIME", "5") |> String.to_integer()
@@ -46,11 +45,12 @@ Application.put_env(:ferricstore, :data_dir, bench_data_dir)
 Application.put_env(:ferricstore, :native_port, 0)
 {:ok, _} = Application.ensure_all_started(:ferricstore)
 
-shard_count = Application.compile_env(:ferricstore, :shard_count, 4)
+ctx = FerricStore.Instance.get(:default)
+shard_count = ctx.shard_count
 
 IO.puts("""
 === Router Write Throughput Benchmark ===
-Shards: #{shard_count}  |  Flush interval: 1ms  |  Async: io_uring (Linux) / sync fallback
+Shards: #{shard_count}  |  Backend: #{Ferricstore.Raft.Backend.running_or_selected()}
 Warmup: #{bench_warmup}s  |  Run: #{bench_time}s per scenario
 """)
 
@@ -63,14 +63,14 @@ defmodule RouterBench do
 
   # Spawn N tasks each calling Router.put once with a unique key.
   # Returns :ok when all tasks finish. Unique keys spread across shards.
-  def concurrent_puts(n, counter, prefix) do
+  def concurrent_puts(ctx, n, counter, prefix) do
     base = :counters.get(counter, 1)
     :counters.add(counter, 1, n)
 
     0..(n - 1)
     |> Enum.map(fn i ->
       Task.async(fn ->
-        Router.put("#{prefix}_#{base + i}", "v", 0)
+        :ok = Router.put(ctx, "#{prefix}_#{base + i}", "v", 0)
       end)
     end)
     |> Task.await_many(30_000)
@@ -80,7 +80,7 @@ defmodule RouterBench do
 
   # Same but all keys hash to the same shard (used for single-shard isolation).
   # We pre-compute a set of keys that all map to shard 0.
-  def same_shard_puts(n, keys, counter) do
+  def same_shard_puts(ctx, n, keys, counter) do
     base = :counters.get(counter, 1)
     :counters.add(counter, 1, n)
     key_count = length(keys)
@@ -88,7 +88,7 @@ defmodule RouterBench do
     0..(n - 1)
     |> Enum.map(fn i ->
       key = Enum.at(keys, rem(base + i, key_count))
-      Task.async(fn -> Router.put(key, "v_#{base + i}", 0) end)
+      Task.async(fn -> :ok = Router.put(ctx, key, "v_#{base + i}", 0) end)
     end)
     |> Task.await_many(30_000)
 
@@ -96,10 +96,10 @@ defmodule RouterBench do
   end
 
   # Find `n` keys that all hash to shard 0.
-  def keys_for_shard(shard_idx, count, shard_count) do
+  def keys_for_shard(ctx, shard_idx, count) do
     Stream.iterate(0, &(&1 + 1))
     |> Stream.filter(fn i ->
-      Router.shard_for("shard_key_#{i}", shard_count) == shard_idx
+      Router.shard_for(ctx, "shard_key_#{i}") == shard_idx
     end)
     |> Enum.take(count)
     |> Enum.map(fn i -> "shard_key_#{i}" end)
@@ -107,7 +107,7 @@ defmodule RouterBench do
 end
 
 # Pre-compute keys that all route to shard 0 (for single-shard section)
-shard0_keys = RouterBench.keys_for_shard(0, 500, shard_count)
+shard0_keys = RouterBench.keys_for_shard(ctx, 0, 500)
 IO.puts("Pre-computed #{length(shard0_keys)} keys routing to shard 0.\n")
 
 # ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ IO.puts("Pre-computed #{length(shard0_keys)} keys routing to shard 0.\n")
 # ---------------------------------------------------------------------------
 
 IO.puts("--- Section 1: Single-shard capacity (all writes → shard 0) ---\n")
-IO.puts("This shows the throughput ceiling of ONE GenServer + ONE io_uring ring.\n")
+IO.puts("This isolates one replicated shard group's write path.\n")
 
 single_shard_counter = :counters.new(1, [:atomics])
 
@@ -124,7 +124,7 @@ single_shard_scenarios =
     {
       "#{String.pad_leading(to_string(n), 3)} writers → 1 shard",
       fn ->
-        RouterBench.same_shard_puts(n, shard0_keys, single_shard_counter)
+        RouterBench.same_shard_puts(ctx, n, shard0_keys, single_shard_counter)
       end
     }
   end)
@@ -158,7 +158,7 @@ all_shards_scenarios =
     {
       "#{String.pad_leading(to_string(n), 3)} writers → #{shard_count} shards",
       fn ->
-        RouterBench.concurrent_puts(n, all_shards_counter, "rw#{n}")
+        RouterBench.concurrent_puts(ctx, n, all_shards_counter, "rw#{n}")
       end
     }
   end)
@@ -179,13 +179,13 @@ Benchee.run(
 # Section 3: Writes/second summary — total entries written per second
 # ---------------------------------------------------------------------------
 
-IO.puts("\n--- Section 3: Total writes/second (batches/s × N writers) ---\n")
+IO.puts("\n--- Section 3: Direct writes/second sample ---\n")
 
-IO.puts("Calculating from Section 2 results above:\n")
+IO.puts("Running a separate fixed-iteration sample through all shards:\n")
 
 IO.puts(
   String.pad_trailing("writers", 10) <>
-    String.pad_trailing("batches/s (above)", 22) <>
+    String.pad_trailing("batches/s", 22) <>
     "total writes/s"
 )
 
@@ -201,7 +201,7 @@ for n <- [4, 16, 64, 256] do
   {elapsed_us, _} =
     :timer.tc(fn ->
       for _ <- 1..iterations do
-        RouterBench.concurrent_puts(n, counter, "summary_#{n}")
+        RouterBench.concurrent_puts(ctx, n, counter, "summary_#{n}")
       end
     end)
 
@@ -219,37 +219,22 @@ end
 
 IO.puts("""
 
-=== What this means for ferricstore ===
+=== Interpreting these results ===
 
-Ferricstore serves native-protocol clients over TCP. Each SET command is one
-Router.put call on the server side. The numbers above translate directly to
-how many SET commands per second ferricstore can handle durably (fsynced).
+These are server-side Router write numbers, not end-to-end native SET
+throughput. Native clients additionally pay connection scheduling, frame
+decoding, command preparation, ACL checks, response encoding, and network I/O.
 
-Key properties of the write path:
-
-  1. ETS write is immediate — readers see the value the instant PUT returns,
-     before the fsync completes. No read-your-writes gap for the caller.
-
-  2. io_uring is non-blocking — the Shard GenServer's message loop is never
-     stalled waiting for disk. It submits SQEs and moves on to the next
-     client message immediately.
-
-  3. Group-commit batching — writes arriving in the same 1ms window are
-     flushed together in one NIF.put_batch_async call (one fsync for N writes).
-     More concurrent writers → more batching → higher writes/fsync ratio.
-
-  4. Shard parallelism — 4 independent shards means 4 parallel write paths.
-     A key hashed to shard 1 does not wait for a flush in-flight on shard 2.
-     Scaling shard_count scales write throughput linearly until disk becomes
-     the bottleneck.
-
-  5. Durability guarantee — every write is kernel-managed (in the io_uring
-     ring) before the GenServer call returns. A process kill after :ok loses
-     no data; the kernel completes the pwrite+fsync regardless.
+Each successful sample has completed the active replicated backend's
+acknowledgement contract. The durable Raft log is authoritative; derived
+Bitcask projections may checkpoint asynchronously and are recoverable by log
+replay. Compare runs only when the backend, shard count, hardware, storage,
+warmup, and duration are equivalent.
 """)
 
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 
+:ok = Application.stop(:ferricstore)
 File.rm_rf!(bench_data_dir)

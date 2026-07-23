@@ -70,8 +70,9 @@ jobs:
           BENCH_WARMUP: ${{ github.event.inputs.warmup || '3' }}
           BENCH_TIME: ${{ github.event.inputs.time || '10' }}
         run: |
+          set -o pipefail
           echo "::group::Router Write Benchmark Output"
-          mix run bench/router_write_bench.exs 2>&1 | tee bench/output/router_write_results.txt
+          mix run --no-start bench/router_write_bench.exs 2>&1 | tee bench/output/router_write_results.txt
           echo "::endgroup::"
 
       - name: Run TCP benchmark
@@ -79,9 +80,10 @@ jobs:
           BENCH_WARMUP: ${{ github.event.inputs.warmup || '3' }}
           BENCH_TIME: ${{ github.event.inputs.time || '10' }}
         run: |
+          set -o pipefail
           echo "::group::TCP Benchmark Output"
           if [ -f bench/tcp_bench.exs ]; then
-            mix run bench/tcp_bench.exs 2>&1 | tee bench/output/tcp_results.txt
+            mix run --no-start bench/tcp_bench.exs 2>&1 | tee bench/output/tcp_results.txt
           else
             echo "::notice::bench/tcp_bench.exs is not present in this OSS tree; native TCP benchmarks live outside this workflow." | tee bench/output/tcp_results.txt
           fi
@@ -92,8 +94,9 @@ jobs:
           BENCH_WARMUP: ${{ github.event.inputs.warmup || '3' }}
           BENCH_TIME: ${{ github.event.inputs.time || '10' }}
         run: |
+          set -o pipefail
           echo "::group::Commands Benchmark Output"
-          mix run bench/commands_bench.exs 2>&1 | tee bench/output/commands_results.txt
+          mix run --no-start bench/commands_bench.exs 2>&1 | tee bench/output/commands_results.txt
           echo "::endgroup::"
 
       - name: Print summary

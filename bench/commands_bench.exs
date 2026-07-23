@@ -3,12 +3,14 @@
 # Benchmarks for the command dispatcher layer.
 #
 # Run:
-#   MIX_ENV=bench mix run bench/commands_bench.exs
+#   MIX_ENV=bench mix run --no-start bench/commands_bench.exs
 #
 # Starts the full application so Router/Shard GenServers are available.
 
 alias Ferricstore.Commands.Dispatcher
 alias Ferricstore.Store.Router
+
+Logger.configure(level: :warning)
 
 bench_warmup = System.get_env("BENCH_WARMUP", "2") |> String.to_integer()
 bench_time = System.get_env("BENCH_TIME", "5") |> String.to_integer()
@@ -24,6 +26,7 @@ Application.put_env(:ferricstore, :data_dir, bench_data_dir)
 Application.put_env(:ferricstore, :native_port, 0)
 
 {:ok, _} = Application.ensure_all_started(:ferricstore)
+ctx = FerricStore.Instance.get(:default)
 
 IO.puts("=== Command Dispatcher Benchmarks ===")
 IO.puts("Data dir: #{bench_data_dir}\n")
@@ -33,17 +36,18 @@ IO.puts("Data dir: #{bench_data_dir}\n")
 # ---------------------------------------------------------------------------
 
 store = %{
-  get: &Router.get/1,
-  get_meta: &Router.get_meta/1,
-  put: &Router.put/3,
-  delete: &Router.delete/1,
-  exists?: &Router.exists?/1,
-  keys: &Router.keys/0,
+  __instance_ctx__: ctx,
+  get: fn key -> Router.get(ctx, key) end,
+  get_meta: fn key -> Router.get_meta(ctx, key) end,
+  put: fn key, value, expire_at -> Router.put(ctx, key, value, expire_at) end,
+  delete: fn key -> Router.delete(ctx, key) end,
+  exists?: fn key -> Router.exists?(ctx, key) end,
+  keys: fn -> Router.keys(ctx) end,
   flush: fn ->
-    Enum.each(Router.keys(), &Router.delete/1)
+    Enum.each(Router.keys(ctx), &Router.delete(ctx, &1))
     :ok
   end,
-  dbsize: &Router.dbsize/0
+  dbsize: fn -> Router.dbsize(ctx) end
 }
 
 # ---------------------------------------------------------------------------
@@ -52,11 +56,11 @@ store = %{
 
 # 1000 keys for KEYS and MGET benchmarks
 Enum.each(1..1000, fn i ->
-  Router.put("cmd_key_#{i}", "cmd_value_#{i}", 0)
+  :ok = Router.put(ctx, "cmd_key_#{i}", "cmd_value_#{i}", 0)
 end)
 
 # Pre-read to warm ETS
-Enum.each(1..1000, fn i -> Router.get("cmd_key_#{i}") end)
+Enum.each(1..1000, fn i -> Router.get(ctx, "cmd_key_#{i}") end)
 
 # 100 keys for MGET
 keys_100 = Enum.map(1..100, fn i -> "cmd_key_#{i}" end)
@@ -76,29 +80,35 @@ counter = :counters.new(1, [:atomics])
 Benchee.run(
   %{
     "Dispatch GET: key present" => fn ->
-      _val = Dispatcher.dispatch("GET", ["cmd_key_1"], store)
+      "cmd_value_1" = Dispatcher.dispatch_raw("GET", ["cmd_key_1"], store)
     end,
     "Dispatch GET: key absent" => fn ->
-      _val = Dispatcher.dispatch("GET", ["nonexistent_key"], store)
+      nil = Dispatcher.dispatch_raw("GET", ["nonexistent_key"], store)
     end,
     "Dispatch SET: simple" => fn ->
       idx = :counters.get(counter, 1)
       :counters.add(counter, 1, 1)
-      Dispatcher.dispatch("SET", ["set_bench_#{idx}", "value"], store)
+      :ok = Dispatcher.dispatch_raw("SET", ["set_bench_#{idx}", "value"], store)
     end,
     "Dispatch SET: with EX 100" => fn ->
       idx = :counters.get(counter, 1)
       :counters.add(counter, 1, 1)
-      Dispatcher.dispatch("SET", ["set_ex_bench_#{idx}", "value", "EX", "100"], store)
+
+      :ok =
+        Dispatcher.dispatch_raw(
+          "SET",
+          ["set_ex_bench_#{idx}", "value", "EX", "100"],
+          store
+        )
     end,
     "Dispatch MGET: 100 keys" => fn ->
-      Dispatcher.dispatch("MGET", keys_100, store)
+      ["cmd_value_1" | _rest] = Dispatcher.dispatch_raw("MGET", keys_100, store)
     end,
     "Dispatch MSET: 100 pairs" => fn ->
-      Dispatcher.dispatch("MSET", kv_pairs_100, store)
+      :ok = Dispatcher.dispatch_raw("MSET", kv_pairs_100, store)
     end,
     "Dispatch KEYS: * (1000 keys)" => fn ->
-      Dispatcher.dispatch("KEYS", ["*"], store)
+      [_first | _rest] = Dispatcher.dispatch_raw("KEYS", ["*"], store)
     end
   },
   time: bench_time,
@@ -115,4 +125,5 @@ Benchee.run(
 # ---------------------------------------------------------------------------
 
 IO.puts("\nCleaning up bench data directory: #{bench_data_dir}")
+:ok = Application.stop(:ferricstore)
 File.rm_rf!(bench_data_dir)

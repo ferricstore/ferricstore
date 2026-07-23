@@ -88,6 +88,32 @@ defmodule Ferricstore.GitHubActionsGuardTest do
              "mix test apps/ferricstore_server/test --only shard_kill --timeout 120000"
   end
 
+  test "benchmark pipelines fail closed and use the instance-scoped Router contract" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/bench.yml"))
+    router_bench = File.read!(Path.join(@repo_root, "bench/router_write_bench.exs"))
+    commands_bench = File.read!(Path.join(@repo_root, "bench/commands_bench.exs"))
+
+    assert count_occurrences(workflow, "set -o pipefail") == 3
+    assert count_occurrences(workflow, "mix run --no-start") == 3
+    assert router_bench =~ "ctx = FerricStore.Instance.get(:default)"
+    assert router_bench =~ "shard_count = ctx.shard_count"
+    assert router_bench =~ "Router.put(ctx,"
+    assert router_bench =~ "Router.shard_for(ctx,"
+    assert router_bench =~ "Logger.configure(level: :warning)"
+    refute router_bench =~ "Application.compile_env(:ferricstore, :shard_count"
+
+    assert commands_bench =~ "__instance_ctx__: ctx"
+    assert commands_bench =~ "Router.put(ctx,"
+    assert commands_bench =~ "Logger.configure(level: :warning)"
+    assert commands_bench =~ "Dispatcher.dispatch_raw("
+    refute commands_bench =~ "Dispatcher.dispatch("
+    refute commands_bench =~ "put: &Router.put/3"
+
+    bench_config = File.read!(Path.join(@repo_root, "config/bench.exs"))
+    assert count_occurrences(bench_config, "native_port:") == 1
+    assert bench_config =~ ~s|System.get_env("FERRICSTORE_NATIVE_PORT", "0")|
+  end
+
   test "every app test path in the workflow exists" do
     workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
 
