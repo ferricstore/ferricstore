@@ -12,6 +12,8 @@ All notable changes to FerricStore will be documented here.
 - Added memory-weighted query admission, pressure-aware index backfill, aggregate native merge limits, batched selected-plan statistics probes, exact one-pass response accounting, and resumable bounded-prefix LMDB hydration.
 - Bounded fixed-index fallback candidate hydration to one maximum result page plus look-ahead, and kept namespace quota accounting distinct from Flow secondary indexes.
 - Isolated query-only LMDB projection from scheduler and terminal lifecycle indexes, and bound MemoryGuard pressure publication to the supervised default guard so auxiliary guards cannot alter production admission state.
+- Added lossless unsigned 64-bit native values for query catalog versions, registry epochs, and lifecycle counters while retaining the existing signed integer tag for ordinary command values.
+- Added the `ferric.flow.query.indexes/v1` index-status contract to query capability negotiation so clients reject incompatible management responses during `HELLO` instead of after a query.
 
 ## 0.9.1 - 2026-07-19
 

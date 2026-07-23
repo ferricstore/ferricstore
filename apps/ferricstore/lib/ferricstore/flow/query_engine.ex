@@ -15,6 +15,7 @@ defmodule FerricStore.Flow.QueryEngine do
           request_contract: binary() | nil,
           result_contract: binary() | nil,
           explain_contract: binary() | nil,
+          index_status_contract: binary() | nil,
           capabilities: [binary()],
           language_versions: [binary()],
           shapes: [binary()]
@@ -29,6 +30,7 @@ defmodule FerricStore.Flow.QueryEngine do
     :request_contract,
     :result_contract,
     :explain_contract,
+    :index_status_contract,
     :capabilities,
     :language_versions,
     :shapes
@@ -37,6 +39,7 @@ defmodule FerricStore.Flow.QueryEngine do
     request_contract: nil,
     result_contract: nil,
     explain_contract: nil,
+    index_status_contract: nil,
     capabilities: [],
     language_versions: [],
     shapes: []
@@ -160,6 +163,7 @@ defmodule FerricStore.Flow.QueryEngine do
     request_contract = Map.get(manifest, :request_contract)
     result_contract = Map.get(manifest, :result_contract)
     explain_contract = Map.get(manifest, :explain_contract)
+    index_status_contract = Map.get(manifest, :index_status_contract)
     capabilities = Map.get(manifest, :capabilities)
     language_versions = Map.get(manifest, :language_versions)
     shapes = Map.get(manifest, :shapes)
@@ -168,6 +172,7 @@ defmodule FerricStore.Flow.QueryEngine do
          valid_request_contract?(request_contract) and
          valid_optional_contract?(result_contract) and
          valid_optional_contract?(explain_contract) and
+         valid_optional_contract?(index_status_contract) and
          valid_string_list?(capabilities) and
          valid_string_list?(language_versions) and
          valid_string_list?(shapes) and
@@ -177,6 +182,7 @@ defmodule FerricStore.Flow.QueryEngine do
            request_contract,
            result_contract,
            explain_contract,
+           index_status_contract,
            capabilities,
            language_versions,
            shapes
@@ -185,6 +191,7 @@ defmodule FerricStore.Flow.QueryEngine do
         request_contract: request_contract,
         result_contract: result_contract,
         explain_contract: explain_contract,
+        index_status_contract: index_status_contract,
         capabilities: capabilities,
         language_versions: language_versions,
         shapes: shapes
@@ -213,19 +220,28 @@ defmodule FerricStore.Flow.QueryEngine do
   defp valid_manifest_string?(value),
     do: is_binary(value) and value != "" and byte_size(value) <= 128
 
-  defp coherent_capability_surface?(nil, nil, nil, [], [], []), do: true
+  defp coherent_capability_surface?(nil, nil, nil, nil, [], [], []), do: true
 
   defp coherent_capability_surface?(
          request_contract,
          result_contract,
          explain_contract,
+         index_status_contract,
          capabilities,
          language_versions,
          shapes
        ) do
     is_binary(request_contract) and is_binary(result_contract) and
       (is_nil(explain_contract) or is_binary(explain_contract)) and
+      coherent_index_status_contract?(index_status_contract, capabilities) and
       capabilities != [] and language_versions != [] and shapes != []
+  end
+
+  defp coherent_index_status_contract?(contract, capabilities) do
+    advertised? = "flow_query_index_status_v1" in capabilities
+
+    (advertised? and contract == Surface.index_status_contract()) or
+      (not advertised? and is_nil(contract))
   end
 
   defp context_implementation(%{query_engine: implementation}) when is_atom(implementation),

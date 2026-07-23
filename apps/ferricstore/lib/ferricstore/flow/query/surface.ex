@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.Query.Surface do
   @request_contract "ferric.flow.query.request/v1"
   @default_result_contract "ferric.flow.query.result/v1"
   @default_explain_contract "ferric.flow.explain/v1"
+  @index_status_contract "ferric.flow.query.indexes/v1"
   @spec language_versions() :: [binary()]
   def language_versions, do: @language_versions
 
@@ -25,6 +26,9 @@ defmodule Ferricstore.Flow.Query.Surface do
   @spec default_result_contract() :: binary()
   def default_result_contract, do: @default_result_contract
 
+  @spec index_status_contract() :: binary()
+  def index_status_contract, do: @index_status_contract
+
   @spec supported_language_versions?(term()) :: boolean()
   def supported_language_versions?(versions) when is_list(versions),
     do: Enum.all?(versions, &(&1 in @language_versions))
@@ -40,6 +44,7 @@ defmodule Ferricstore.Flow.Query.Surface do
       request_contract: @request_contract,
       result_contract: @default_result_contract,
       explain_contract: @default_explain_contract,
+      index_status_contract: @index_status_contract,
       capabilities: [
         "flow_query_v1",
         "flow_explain_v1",

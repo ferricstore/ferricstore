@@ -162,10 +162,12 @@ scheduler count and rejects mismatched systems. Set
 `BENCH_ALLOW_SYSTEM_MISMATCH=1` only for exploratory comparisons where hardware
 noise is explicitly acceptable.
 
-`.github/workflows/query-performance.yml` performs three paired rounds on one
-Linux runner and compares the median of each round's medians. The normal test
-workflow only compiles the benchmark binaries and runs deterministic allocation
-ceilings; noisy wall-clock thresholds are not used as PR tests.
+`.github/workflows/query-performance.yml` performs five paired rounds on one
+Linux runner. A regression gates only when all five same-round ratios exceed
+the budget, a one-sided sign test with `p < 0.05`; noisy or order-dependent
+slowdowns remain visible in the artifact without blocking a release. The normal
+test workflow only compiles the benchmark binaries and runs deterministic
+allocation ceilings; noisy wall-clock thresholds are not used as PR tests.
 
 For Linux hardware-counter and cache evidence, install `vmtouch`, `perf`, and
 `cargo-flamegraph`, then run:

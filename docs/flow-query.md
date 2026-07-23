@@ -14,13 +14,16 @@ integrations; it does not replace the planner or its wire contracts.
 Clients must negotiate capabilities rather than infer collection support from
 the FQL language version.
 
-| Surface | Request contract | Result contract | Explain contract | Shapes |
-| --- | --- | --- | --- | --- |
-| OSS default, also used by Enterprise | `ferric.flow.query.request/v1` | `ferric.flow.query.result/v1` | `ferric.flow.explain/v1` | every advertised bounded point, history, lineage, fixed-index, composite collection, and count shape |
+| Surface | Request contract | Result contract | Explain contract | Index status contract | Shapes |
+| --- | --- | --- | --- | --- | --- |
+| OSS default, also used by Enterprise | `ferric.flow.query.request/v1` | `ferric.flow.query.result/v1` | `ferric.flow.explain/v1` | `ferric.flow.query.indexes/v1` | every advertised bounded point, history, lineage, fixed-index, composite collection, and count shape |
 
 The shared surface advertises `FQL1`, `flow_query_v1`, `flow_explain_v1`,
 `flow_explain_analyze_v1`,
 `flow_composite_index_v1`, and `flow_query_index_status_v1`.
+Its `index_status_contract` field is `ferric.flow.query.indexes/v1`; clients
+must validate it during capability negotiation before issuing index-status
+requests.
 
 The capability manifest is validated and frozen in the immutable instance
 context. Runtime application-environment changes cannot replace the query

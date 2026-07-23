@@ -10,7 +10,7 @@ on:
       rounds:
         description: Paired benchmark rounds per revision
         required: false
-        default: "3"
+        default: "5"
         type: string
   schedule:
     - cron: "17 2 * * 0"
@@ -129,9 +129,9 @@ jobs:
           BENCH_HARNESS: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          rounds="${REQUESTED_ROUNDS:-3}"
-          if ! [[ "$rounds" =~ ^[1-9][0-9]*$ ]] || (( rounds > 5 )); then
-            echo "rounds must be an integer from 1 through 5" >&2
+          rounds="${REQUESTED_ROUNDS:-5}"
+          if [[ "$rounds" != "5" ]]; then
+            echo "rounds must be 5 so the paired sign test has p < 0.05" >&2
             exit 2
           fi
 

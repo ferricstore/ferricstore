@@ -105,6 +105,7 @@ rejected if decompressed bytes exceed `max_frame_bytes`.
 5 array:  u32 count + values
 6 map:    u32 count + repeated u32 key_len + key bytes + value
 7 f64
+8 unsigned u64
 ```
 
 Response body starts with a `u16` status code followed by one typed value.
@@ -481,8 +482,9 @@ owners, parent partition keys, retention controls, and unknown future fields.
 Prefixing the query with `EXPLAIN` returns `ferric.flow.explain/v1`. The plan is
 deterministic and redacts literal and bound parameter values. The capability
 manifest advertises `ferric.flow.query.request/v1`,
-`ferric.flow.query.result/v1`, `ferric.flow.explain/v1`, every executable shape,
-and `flow_explain_analyze_v1`. `EXPLAIN ANALYZE` performs a fresh bounded
+`ferric.flow.query.result/v1`, `ferric.flow.explain/v1`,
+`ferric.flow.query.indexes/v1`, every executable shape, and
+`flow_explain_analyze_v1`. `EXPLAIN ANALYZE` performs a fresh bounded
 execution, rejects cursors, and returns actual resource usage without records
 or count values. Providers that do not advertise that capability reject the
 analyzed shape. Query failures use fixed, value-free error codes and

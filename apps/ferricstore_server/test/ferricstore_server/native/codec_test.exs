@@ -76,7 +76,10 @@ defmodule FerricstoreServer.Native.CodecTest do
         encoded_map_entry("command", Codec.encode_value("MULTI")),
         encoded_map_entry("args", nested_args),
         encoded_map_entry("command", Codec.encode_value("GET")),
-        encoded_map_entry("metadata", Codec.encode_value(%{"trace" => true}))
+        encoded_map_entry(
+          "metadata",
+          Codec.encode_value(%{"trace" => true, "epoch" => 0xFFFF_FFFF_FFFF_FFFF})
+        )
       ])
 
     assert {:ok, "GET"} = Codec.peek_command_name(0, body)
@@ -183,6 +186,13 @@ defmodule FerricstoreServer.Native.CodecTest do
 
     encoded = Codec.encode_value(value)
     assert {:ok, ^value} = Codec.decode_body(encoded)
+  end
+
+  test "typed values round-trip the full unsigned 64-bit domain" do
+    value = 0xFFFF_FFFF_FFFF_FFFF
+
+    assert <<8, ^value::unsigned-64>> = Codec.encode_value(value)
+    assert {:ok, ^value} = Codec.decode_body(Codec.encode_value(value))
   end
 
   test "typed value decoder rejects containers over configured item limit" do

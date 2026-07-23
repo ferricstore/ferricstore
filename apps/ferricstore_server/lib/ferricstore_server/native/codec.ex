@@ -2150,6 +2150,9 @@ defmodule FerricstoreServer.Native.Codec do
   defp decode_value(<<7, value::float-64, rest::binary>>, _limits, _depth, remaining),
     do: {:ok, value, rest, remaining}
 
+  defp decode_value(<<8, value::unsigned-64, rest::binary>>, _limits, _depth, remaining),
+    do: {:ok, value, rest, remaining}
+
   defp decode_value(<<>>, _limits, _depth, _remaining),
     do: {:error, "ERR native value is empty"}
 
@@ -2283,7 +2286,7 @@ defmodule FerricstoreServer.Native.Codec do
          _depth,
          remaining
        )
-       when tag in [3, 7],
+       when tag in [3, 7, 8],
        do: {:ok, rest, remaining}
 
   defp skip_encoded_value(<<4, len::unsigned-32, rest::binary>>, _limits, _depth, remaining) do

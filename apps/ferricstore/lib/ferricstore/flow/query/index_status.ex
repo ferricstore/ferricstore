@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.IndexStatus do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.{Field, IndexDefinition}
+  alias Ferricstore.Flow.Query.{Field, IndexDefinition, Surface}
 
   alias Ferricstore.Flow.Query.{
     IndexLifecycleWorker,
@@ -10,8 +10,6 @@ defmodule Ferricstore.Flow.Query.IndexStatus do
     StatisticsStore,
     StatisticsWorker
   }
-
-  @contract_version "ferric.flow.query.indexes/v1"
 
   @spec fetch(map(), binary() | nil, keyword()) ::
           {:ok, map()}
@@ -35,7 +33,7 @@ defmodule Ferricstore.Flow.Query.IndexStatus do
 
       {:ok,
        %{
-         "contract_version" => @contract_version,
+         "contract_version" => Surface.index_status_contract(),
          "observed_at_ms" => now_ms,
          "registry" => %{
            "epoch" => overview.epoch,

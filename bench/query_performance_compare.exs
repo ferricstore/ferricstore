@@ -1,9 +1,12 @@
 # Compare two BENCH_SAVE result directories produced on the same pinned host.
-# A median slowdown above BENCH_REGRESSION_LIMIT (default 0.15) fails the run.
+# A slowdown reproduced across five pairs above BENCH_REGRESSION_LIMIT
+# (default 0.15) fails the run.
 
 defmodule Ferricstore.Bench.QueryPerformanceCompare do
   @default_regression_limit 0.15
+  @minimum_paired_rounds 5
   @system_identity_fields ~w(os architecture cpu_model otp elixir schedulers_online)
+  @compared_fields ~w(median_ns operation_median_ns memory_median_bytes ops_per_second)
 
   def run(argv) do
     {baseline_path, current_path} = parse_args(argv)
@@ -14,6 +17,7 @@ defmodule Ferricstore.Bench.QueryPerformanceCompare do
     ensure_comparable_systems!(baseline.systems, current.systems)
 
     missing = Map.keys(baseline.metrics) -- Map.keys(current.metrics)
+    pairing_errors = pairing_errors(baseline.metrics, current.metrics)
 
     regressions =
       baseline.metrics
@@ -32,18 +36,24 @@ defmodule Ferricstore.Bench.QueryPerformanceCompare do
       Enum.each(missing, &IO.puts(:stderr, "  missing #{&1}"))
     end
 
+    if pairing_errors != [] do
+      IO.puts(:stderr, "Benchmark round pairing errors:")
+      Enum.each(pairing_errors, &IO.puts(:stderr, "  #{&1}"))
+    end
+
     if regressions != [] do
       IO.puts(:stderr, "Query performance regressions:")
       Enum.each(regressions, &IO.puts(:stderr, "  #{&1}"))
     end
 
-    if missing != [] or regressions != [] do
+    if missing != [] or pairing_errors != [] or regressions != [] do
       System.halt(1)
     end
 
     IO.puts(
       "Query performance comparison passed: #{map_size(baseline.metrics)} scenarios, " <>
-        "median limit=#{percent(regression_limit)}, memory limit=#{percent(memory_limit)}"
+        "reproducible paired-round limit=#{percent(regression_limit)}, " <>
+        "memory limit=#{percent(memory_limit)}"
     )
   end
 
@@ -67,17 +77,44 @@ defmodule Ferricstore.Bench.QueryPerformanceCompare do
       suite = Map.fetch!(payload, "suite")
       metrics = extract_metrics(payload, suite)
       system = Map.get(payload, "system", %{})
+      round = benchmark_round(path, file)
 
       merged =
-        Map.merge(acc.metrics, metrics, fn _key, existing, metric ->
-          [metric | List.wrap(existing)]
+        Enum.reduce(metrics, acc.metrics, fn {key, metric}, inner ->
+          Map.update(inner, key, [{round, metric}], &[{round, metric} | &1])
         end)
 
       %{metrics: merged, systems: MapSet.put(acc.systems, system)}
     end)
     |> Map.update!(:metrics, fn metrics ->
-      Map.new(metrics, fn {key, values} -> {key, aggregate_metrics(List.wrap(values))} end)
+      Map.new(metrics, fn {key, values} -> {key, summarize_metrics(values)} end)
     end)
+  end
+
+  defp benchmark_round(root, file) do
+    if File.dir?(root) do
+      case file |> Path.relative_to(root) |> Path.split() do
+        [round | _rest] -> if Regex.match?(~r/^round-[1-9][0-9]*$/, round), do: round
+        _other -> nil
+      end
+    end
+  end
+
+  defp summarize_metrics(entries) do
+    rounds =
+      Enum.reduce(entries, %{}, fn
+        {nil, _metric}, acc ->
+          acc
+
+        {round, metric}, acc ->
+          if Map.has_key?(acc, round), do: raise("duplicate benchmark metric for #{round}")
+          Map.put(acc, round, metric)
+      end)
+
+    %{
+      aggregate: entries |> Enum.map(&elem(&1, 1)) |> aggregate_metrics(),
+      rounds: rounds
+    }
   end
 
   defp extract_metrics(payload, suite) do
@@ -137,6 +174,60 @@ defmodule Ferricstore.Bench.QueryPerformanceCompare do
     System.get_env("BENCH_ALLOW_SYSTEM_MISMATCH", "0") in ["1", "true", "TRUE"]
   end
 
+  defp pairing_errors(baseline, current) do
+    baseline
+    |> Enum.flat_map(fn {key, baseline_metric} ->
+      case current[key] do
+        nil ->
+          []
+
+        current_metric ->
+          baseline_rounds = baseline_metric.rounds |> Map.keys() |> MapSet.new()
+          current_rounds = current_metric.rounds |> Map.keys() |> MapSet.new()
+
+          cond do
+            baseline_rounds != current_rounds ->
+              [
+                "#{key} rounds differ: baseline=#{inspect(Enum.sort(baseline_rounds))} " <>
+                  "current=#{inspect(Enum.sort(current_rounds))}"
+              ]
+
+            MapSet.size(baseline_rounds) in 1..(@minimum_paired_rounds - 1) ->
+              [
+                "#{key} requires at least #{@minimum_paired_rounds} paired rounds; " <>
+                  "found #{MapSet.size(baseline_rounds)}"
+              ] ++ field_pairing_errors(key, baseline_metric.rounds, current_metric.rounds)
+
+            true ->
+              field_pairing_errors(key, baseline_metric.rounds, current_metric.rounds)
+          end
+      end
+    end)
+  end
+
+  defp field_pairing_errors(key, baseline_rounds, current_rounds) do
+    Enum.flat_map(@compared_fields, fn field ->
+      baseline_fields = numeric_field_rounds(baseline_rounds, field)
+      current_fields = numeric_field_rounds(current_rounds, field)
+
+      if MapSet.size(baseline_fields) == 0 or baseline_fields == current_fields do
+        []
+      else
+        [
+          "#{key} #{field} rounds differ: baseline=#{inspect(Enum.sort(baseline_fields))} " <>
+            "current=#{inspect(Enum.sort(current_fields))}"
+        ]
+      end
+    end)
+  end
+
+  defp numeric_field_rounds(rounds, field) do
+    rounds
+    |> Enum.reduce(MapSet.new(), fn {round, metric}, acc ->
+      if is_number(metric[field]), do: MapSet.put(acc, round), else: acc
+    end)
+  end
+
   defp aggregate_metrics(metrics) do
     fields = metrics |> Enum.flat_map(&Map.keys/1) |> Enum.uniq()
 
@@ -166,17 +257,25 @@ defmodule Ferricstore.Bench.QueryPerformanceCompare do
   end
 
   defp compare_value(regressions, key, field, baseline, current, limit) do
-    baseline_value = baseline[field]
-    current_value = current[field]
+    baseline_value = baseline.aggregate[field]
+    current_value = current.aggregate[field]
+    paired = paired_ratio(baseline.rounds, current.rounds, field)
 
-    if is_number(baseline_value) and baseline_value > 0 and is_number(current_value) and
-         current_value > baseline_value * (1.0 + limit) do
-      change = current_value / baseline_value - 1.0
+    {change, reproduced?} =
+      case paired do
+        %{median: ratio, ratios: ratios} ->
+          {ratio - 1.0, Enum.all?(ratios, &(&1 > 1.0 + limit))}
+
+        nil ->
+          change = aggregate_increase(baseline_value, current_value)
+          {change, is_number(change) and change > limit}
+      end
+
+    if reproduced? do
+      evidence = comparison_evidence(paired, baseline_value, current_value)
 
       [
-        "#{key} #{field} increased #{percent(change)} " <>
-          "(#{format_number(baseline_value)} -> #{format_number(current_value)}, " <>
-          "limit #{percent(limit)})"
+        "#{key} #{field} increased #{percent(change)} (#{evidence}, limit #{percent(limit)})"
         | regressions
       ]
     else
@@ -185,23 +284,68 @@ defmodule Ferricstore.Bench.QueryPerformanceCompare do
   end
 
   defp compare_decrease(regressions, key, field, baseline, current, limit) do
-    baseline_value = baseline[field]
-    current_value = current[field]
+    baseline_value = baseline.aggregate[field]
+    current_value = current.aggregate[field]
+    paired = paired_ratio(baseline.rounds, current.rounds, field)
 
-    if is_number(baseline_value) and baseline_value > 0 and is_number(current_value) and
-         current_value < baseline_value * (1.0 - limit) do
-      change = 1.0 - current_value / baseline_value
+    {change, reproduced?} =
+      case paired do
+        %{median: ratio, ratios: ratios} ->
+          {1.0 - ratio, Enum.all?(ratios, &(&1 < 1.0 - limit))}
+
+        nil ->
+          change = aggregate_decrease(baseline_value, current_value)
+          {change, is_number(change) and change > limit}
+      end
+
+    if reproduced? do
+      evidence = comparison_evidence(paired, baseline_value, current_value)
 
       [
-        "#{key} #{field} decreased #{percent(change)} " <>
-          "(#{format_number(baseline_value)} -> #{format_number(current_value)}, " <>
-          "limit #{percent(limit)})"
+        "#{key} #{field} decreased #{percent(change)} (#{evidence}, limit #{percent(limit)})"
         | regressions
       ]
     else
       regressions
     end
   end
+
+  defp paired_ratio(baseline_rounds, current_rounds, field) do
+    ratios =
+      baseline_rounds
+      |> Map.keys()
+      |> Enum.sort()
+      |> Enum.flat_map(fn round ->
+        baseline = get_in(baseline_rounds, [round, field])
+        current = get_in(current_rounds, [round, field])
+
+        if is_number(baseline) and baseline > 0 and is_number(current),
+          do: [current / baseline],
+          else: []
+      end)
+
+    if ratios == [],
+      do: nil,
+      else: %{median: median(ratios), ratios: ratios, count: length(ratios)}
+  end
+
+  defp aggregate_increase(baseline, current)
+       when is_number(baseline) and baseline > 0 and is_number(current),
+       do: current / baseline - 1.0
+
+  defp aggregate_increase(_baseline, _current), do: nil
+
+  defp aggregate_decrease(baseline, current)
+       when is_number(baseline) and baseline > 0 and is_number(current),
+       do: 1.0 - current / baseline
+
+  defp aggregate_decrease(_baseline, _current), do: nil
+
+  defp comparison_evidence(%{median: ratio, count: count}, _baseline, _current),
+    do: "paired-round ratio=#{Float.round(ratio, 4)} across #{count} pairs"
+
+  defp comparison_evidence(nil, baseline, current),
+    do: "#{format_number(baseline)} -> #{format_number(current)}"
 
   defp ratio_env(name, default) do
     case System.get_env(name) do

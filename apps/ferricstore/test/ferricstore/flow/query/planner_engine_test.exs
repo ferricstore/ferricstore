@@ -71,6 +71,7 @@ defmodule Ferricstore.Flow.Query.PlannerEngineTest do
              request_contract: "ferric.flow.query.request/v1",
              result_contract: "ferric.flow.query.result/v1",
              explain_contract: "ferric.flow.explain/v1",
+             index_status_contract: "ferric.flow.query.indexes/v1",
              capabilities: [
                "flow_query_v1",
                "flow_explain_v1",

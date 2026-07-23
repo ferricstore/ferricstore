@@ -99,6 +99,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
         request_contract: "ferric.flow.query.request/v1",
         result_contract: "test.flow.query.result/v1",
         explain_contract: "test.flow.explain/v1",
+        index_status_contract: nil,
         capabilities: ["test_query_v1"],
         language_versions: ["FQL1"],
         shapes: ["runs_by_partition_and_run_id_record"]
@@ -128,6 +129,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
         request_contract: "ferric.flow.query.request/v1",
         result_contract: "ferric.flow.query.result/v1",
         explain_contract: "ferric.flow.explain/v1",
+        index_status_contract: nil,
         capabilities: ["flow_query_v1", "flow_composite_index_v1"],
         language_versions: ["FQL1"],
         shapes: [
@@ -150,6 +152,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
         request_contract: "future.query.request/v1",
         result_contract: "future.query.result/v1",
         explain_contract: nil,
+        index_status_contract: nil,
         capabilities: ["future_query_v1"],
         language_versions: ["FQL2"],
         shapes: ["collection_scan"]
@@ -169,6 +172,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
         request_contract: nil,
         result_contract: "detached.result/v1",
         explain_contract: "detached.explain/v1",
+        index_status_contract: nil,
         capabilities: ["detached_explain_v1"],
         language_versions: ["FQL1"],
         shapes: ["runs_by_partition_and_run_id_record"]
@@ -188,6 +192,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
         request_contract: "future.flow.query.request/v2",
         result_contract: "test.flow.query.result/v1",
         explain_contract: nil,
+        index_status_contract: nil,
         capabilities: ["test_query_v1"],
         language_versions: ["FQL1"],
         shapes: ["runs_by_partition_and_run_id_record"]
@@ -814,6 +819,20 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     end
   end
 
+  test "index status capability and response contract are advertised coherently" do
+    manifest = Ferricstore.Flow.Query.Surface.default_capability_manifest()
+
+    for forged <- [
+          Map.put(manifest, :index_status_contract, nil),
+          Map.put(manifest, :index_status_contract, "future.flow.query.indexes/v2"),
+          Map.update!(manifest, :capabilities, &List.delete(&1, "flow_query_index_status_v1"))
+        ] do
+      assert_raise ArgumentError, "query capability manifest is invalid", fn ->
+        FerricStore.Flow.QueryEngine.capabilities(%{query_capabilities: forged})
+      end
+    end
+  end
+
   test "default capabilities advertise the complete cost-aware planner surface" do
     assert FerricStore.Flow.QueryEngine.capabilities_for(CollectionCapabilityEngine) ==
              CollectionCapabilityEngine.capabilities()
@@ -836,6 +855,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     assert manifest.request_contract == "ferric.flow.query.request/v1"
     assert manifest.result_contract == "ferric.flow.query.result/v1"
     assert manifest.explain_contract == "ferric.flow.explain/v1"
+    assert manifest.index_status_contract == "ferric.flow.query.indexes/v1"
     refute Map.has_key?(manifest, :query_contract)
   end
 

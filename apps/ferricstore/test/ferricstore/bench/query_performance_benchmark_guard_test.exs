@@ -243,6 +243,123 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
     assert criterion_export =~ "fql-rust-criterion.json"
   end
 
+  test "benchmark comparison does not gate an unreproduced paired-round slowdown" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_paired_benchmark_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    baseline = Path.join(root, "baseline")
+    current = Path.join(root, "current")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    # Four slow pairs out of five are not enough to reject runner noise with a
+    # one-sided sign test at p < 0.05. A release gate must be reproducible.
+    write_benchmark_rounds!(baseline, [1_000, 1_000, 1_000, 1_000, 1_000])
+    write_benchmark_rounds!(current, [1_300, 1_300, 1_300, 1_300, 1_000])
+
+    {output, status} =
+      System.cmd(
+        "mix",
+        ["run", "--no-start", @compare, baseline, current],
+        cd: @root,
+        env: [{"BENCH_REGRESSION_LIMIT", "0.15"}],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+    assert output =~ "paired-round"
+  end
+
+  test "benchmark comparison rejects a regression reproduced across five paired rounds" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_regressed_benchmark_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    baseline = Path.join(root, "baseline")
+    current = Path.join(root, "current")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    write_benchmark_rounds!(baseline, [1_000, 1_000, 1_000, 1_000, 1_000])
+    write_benchmark_rounds!(current, [1_300, 1_300, 1_300, 1_300, 1_300])
+
+    {output, status} =
+      System.cmd(
+        "mix",
+        ["run", "--no-start", @compare, baseline, current],
+        cd: @root,
+        env: [{"BENCH_REGRESSION_LIMIT", "0.15"}],
+        stderr_to_stdout: true
+      )
+
+    assert status == 1
+    assert output =~ "median_ns increased 30.0%"
+    assert output =~ "paired-round ratio=1.3 across 5 pairs"
+  end
+
+  test "benchmark comparison rejects statistically underpowered paired evidence" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_underpowered_benchmark_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    baseline = Path.join(root, "baseline")
+    current = Path.join(root, "current")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    write_benchmark_rounds!(baseline, [1_000, 1_000, 1_000])
+    write_benchmark_rounds!(current, [1_300, 1_300, 1_300])
+
+    {output, status} =
+      System.cmd(
+        "mix",
+        ["run", "--no-start", @compare, baseline, current],
+        cd: @root,
+        stderr_to_stdout: true
+      )
+
+    assert status == 1
+    assert output =~ "requires at least 5 paired rounds"
+  end
+
+  test "benchmark comparison rejects incomplete field-level round pairing" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_incomplete_benchmark_#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    baseline = Path.join(root, "baseline")
+    current = Path.join(root, "current")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    complete = %{"median_ns" => 1_000, "memory_median_bytes" => 256}
+    write_benchmark_metric_rounds!(baseline, List.duplicate(complete, 5))
+
+    write_benchmark_metric_rounds!(current, [
+      complete,
+      %{"median_ns" => 1_000},
+      complete,
+      complete,
+      complete
+    ])
+
+    {output, status} =
+      System.cmd(
+        "mix",
+        ["run", "--no-start", @compare, baseline, current],
+        cd: @root,
+        stderr_to_stdout: true
+      )
+
+    assert status == 1
+    assert output =~ "memory_median_bytes rounds differ"
+  end
+
   test "query-planner candidate gates preserve correctness before measuring speed" do
     lmdb = read!(@lmdb_candidates)
     multishard = read!(@multishard_candidates)
@@ -384,8 +501,10 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
     assert benchmark_workflow =~ "query_performance_criterion_export.exs"
     assert benchmark_workflow =~ "BENCH_REGRESSION_LIMIT: \"0.15\""
     assert benchmark_workflow =~ "BENCH_REQUIRE_COLD_CACHE: \"1\""
+    assert benchmark_workflow =~ ~s(default: "5")
+    assert benchmark_workflow =~ ~s(REQUESTED_ROUNDS:-5)
     assert benchmark_workflow =~ "git rev-parse --verify --end-of-options"
-    assert benchmark_workflow =~ "rounds must be an integer from 1 through 5"
+    assert benchmark_workflow =~ "rounds must be 5 so the paired sign test has p < 0.05"
     assert benchmark_workflow =~ "Configure benchmark result paths"
     assert benchmark_workflow =~ ~s(BENCH_HARNESS: ${{ github.workspace }})
     assert benchmark_workflow =~ ~s("$BENCH_HARNESS/bench/fql_parser_bench.exs")
@@ -396,5 +515,38 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
   defp read!(path) do
     assert File.regular?(path), "required benchmark file is missing: #{path}"
     File.read!(path)
+  end
+
+  defp write_benchmark_rounds!(root, medians) do
+    metrics = Enum.map(medians, &%{"median_ns" => &1})
+    write_benchmark_metric_rounds!(root, metrics)
+  end
+
+  defp write_benchmark_metric_rounds!(root, metrics) do
+    metrics
+    |> Enum.with_index(1)
+    |> Enum.each(fn {metric, round} ->
+      path = Path.join([root, "round-#{round}", "paired.json"])
+      File.mkdir_p!(Path.dirname(path))
+
+      File.write!(
+        path,
+        Jason.encode!(%{
+          "version" => 1,
+          "suite" => "paired",
+          "system" => %{
+            "os" => "unix/linux",
+            "architecture" => "x86_64",
+            "cpu_model" => "test",
+            "otp" => "28",
+            "elixir" => "1.19",
+            "schedulers_online" => 4
+          },
+          "scenarios" => %{
+            "scenario" => metric
+          }
+        })
+      )
+    end)
   end
 end

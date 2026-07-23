@@ -3,6 +3,7 @@ defmodule Ferricstore.NativeValueCodec do
 
   @minimum_integer -0x8000_0000_0000_0000
   @maximum_integer 0x7FFF_FFFF_FFFF_FFFF
+  @maximum_unsigned_integer 0xFFFF_FFFF_FFFF_FFFF
 
   @spec encode(term()) :: binary()
   def encode(nil), do: <<0>>
@@ -13,8 +14,12 @@ defmodule Ferricstore.NativeValueCodec do
       when is_integer(value) and value >= @minimum_integer and value <= @maximum_integer,
       do: <<3, value::signed-64>>
 
+  def encode(value)
+      when is_integer(value) and value > @maximum_integer and value <= @maximum_unsigned_integer,
+      do: <<8, value::unsigned-64>>
+
   def encode(value) when is_integer(value),
-    do: raise(ArgumentError, "native integers must fit in signed 64 bits")
+    do: raise(ArgumentError, "native integers must fit in signed or unsigned 64 bits")
 
   def encode(value) when is_binary(value) do
     length = byte_size(value)
@@ -62,8 +67,13 @@ defmodule Ferricstore.NativeValueCodec do
        when is_integer(value) and value >= @minimum_integer and value <= @maximum_integer,
        do: size + 9
 
+  defp encoded_size(value, size)
+       when is_integer(value) and value > @maximum_integer and
+              value <= @maximum_unsigned_integer,
+       do: size + 9
+
   defp encoded_size(value, _size) when is_integer(value),
-    do: raise(ArgumentError, "native integers must fit in signed 64 bits")
+    do: raise(ArgumentError, "native integers must fit in signed or unsigned 64 bits")
 
   defp encoded_size(value, size) when is_binary(value), do: size + 5 + byte_size(value)
 
@@ -99,6 +109,11 @@ defmodule Ferricstore.NativeValueCodec do
 
   defp consume(value, remaining)
        when is_integer(value) and value >= @minimum_integer and value <= @maximum_integer,
+       do: consume_bytes(remaining, 9)
+
+  defp consume(value, remaining)
+       when is_integer(value) and value > @maximum_integer and
+              value <= @maximum_unsigned_integer,
        do: consume_bytes(remaining, 9)
 
   defp consume(value, _remaining) when is_integer(value), do: :error

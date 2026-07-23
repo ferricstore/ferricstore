@@ -499,6 +499,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
         request_contract: "ferric.flow.query.request/v1",
         result_contract: "enterprise.query.result/v1",
         explain_contract: "enterprise.explain/v1",
+        index_status_contract: nil,
         capabilities: ["enterprise_query_v1"],
         language_versions: ["FQL1"],
         shapes: ["runs_by_partition_and_run_id_record"]
@@ -614,6 +615,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
              request_contract: "ferric.flow.query.request/v1",
              result_contract: "ferric.flow.query.result/v1",
              explain_contract: "ferric.flow.explain/v1",
+             index_status_contract: "ferric.flow.query.indexes/v1",
              capabilities: [
                "flow_query_v1",
                "flow_explain_v1",
