@@ -21,7 +21,6 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
 
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
-  alias Ferricstore.Test.ShardHelpers
 
   setup do
     ctx = FerricStore.Instance.get(:default)
@@ -129,19 +128,10 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
   describe "expired_keys" do
     test "increments when expiry sweep removes a key", %{ctx: ctx} do
       key = unique_key("sweep_target")
-      expire_at = System.os_time(:millisecond) + 200
-      put_and_verify(ctx, key, "value", expire_at)
+      expired_at = System.os_time(:millisecond) - 1_000
+      assert :ok = Router.put(ctx, key, "value", expired_at)
 
       before = Stats.expired_keys(ctx)
-
-      ShardHelpers.eventually(
-        fn ->
-          System.os_time(:millisecond) > expire_at
-        end,
-        "key not expired yet",
-        40,
-        10
-      )
 
       for i <- 0..(ctx.shard_count - 1) do
         shard = elem(ctx.shard_names, i)
@@ -152,25 +142,16 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
     end
 
     test "increments by the number of keys removed in a sweep", %{ctx: ctx} do
-      expire_at = System.os_time(:millisecond) + 200
+      expired_at = System.os_time(:millisecond) - 1_000
 
       keys =
         Enum.map(0..4, fn i ->
           key = unique_key("sweep_multi_#{i}")
-          put_and_verify(ctx, key, "val", expire_at)
+          assert :ok = Router.put(ctx, key, "val", expired_at)
           key
         end)
 
       before = Stats.expired_keys(ctx)
-
-      ShardHelpers.eventually(
-        fn ->
-          System.os_time(:millisecond) > expire_at
-        end,
-        "keys not expired yet",
-        40,
-        10
-      )
 
       for i <- 0..(ctx.shard_count - 1) do
         shard = elem(ctx.shard_names, i)
