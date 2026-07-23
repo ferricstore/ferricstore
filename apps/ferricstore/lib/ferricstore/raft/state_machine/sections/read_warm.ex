@@ -764,7 +764,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
           keydir: state.ets,
           index: state.shard_index,
           instance_ctx: state.instance_ctx,
-          compound_member_index: Map.get(state, :compound_member_index_name)
+          compound_member_index: Map.get(state, :compound_member_index_name),
+          logical_key_index: Map.get(state, :logical_key_index_name),
+          logical_key_slots: Map.get(state, :logical_key_slots_name),
+          namespace_usage_index: Map.get(state, :namespace_usage_index_name),
+          namespace_usage_expiry: Map.get(state, :namespace_usage_expiry_name),
+          blob_side_channel_threshold_bytes: Map.get(state, :blob_side_channel_threshold_bytes, 0)
         }
       end
 

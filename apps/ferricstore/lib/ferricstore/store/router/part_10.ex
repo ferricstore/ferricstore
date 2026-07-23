@@ -720,6 +720,43 @@ defmodule Ferricstore.Store.Router.Part10 do
         end
       end
 
+      @doc false
+      @spec compound_scan_slice(
+              FerricStore.Instance.t(),
+              binary(),
+              binary(),
+              non_neg_integer(),
+              non_neg_integer(),
+              non_neg_integer()
+            ) :: [{binary(), binary()}] | ReadResult.failure()
+      def compound_scan_slice(ctx, redis_key, prefix, start, count, total) do
+        idx = shard_for(ctx, redis_key)
+
+        if selected_waraft_ctx?(ctx) do
+          state = direct_compound_read_state(ctx, idx)
+
+          data_path =
+            Ferricstore.Store.Shard.Compound.Promoted.promoted_store(state, redis_key) ||
+              state.shard_data_path
+
+          Ferricstore.Store.Shard.ETS.prefix_scan_entries_slice(
+            state,
+            prefix,
+            data_path,
+            start,
+            count,
+            total
+          )
+        else
+          request = {:compound_scan_slice, redis_key, prefix, start, count, total}
+
+          case safe_read_call(ctx, idx, request) do
+            {:ok, results} -> results
+            :unavailable -> ReadResult.failure(:shard_unavailable)
+          end
+        end
+      end
+
       @spec compound_scan_raw(FerricStore.Instance.t(), binary(), binary()) ::
               [{binary(), binary()}] | ReadResult.failure()
       def compound_scan_raw(ctx, redis_key, prefix) do

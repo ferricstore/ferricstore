@@ -384,6 +384,9 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec flow_record_decode(binary()) :: {:ok, list()} | :error
   def flow_record_decode(_value), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec flow_records_decode([binary()]) :: {:ok, [list()]} | :error
+  def flow_records_decode(_values), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec flow_record_decode_meta(binary()) :: {:ok, list()} | :error
   def flow_record_decode_meta(_value), do: :erlang.nif_error(:nif_not_loaded)
 
@@ -687,6 +690,17 @@ defmodule Ferricstore.Bitcask.NIF do
   def lmdb_get_many_bounded(_path, _keys, _max_bytes, _map_size),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_get_many_prefix_bounded(
+          binary(),
+          [binary()],
+          pos_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, [{:ok, binary()} | :not_found], non_neg_integer(), boolean()}
+          | {:error, term()}
+  def lmdb_get_many_prefix_bounded(_path, _keys, _max_bytes, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_put(binary(), binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
   def lmdb_put(_path, _key, _value, _map_size), do: :erlang.nif_error(:nif_not_loaded)
 
@@ -768,6 +782,43 @@ defmodule Ferricstore.Bitcask.NIF do
         _map_size
       ),
       do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_composite_range_entries_bounded(
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          pos_integer(),
+          pos_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok,
+           [
+             {binary(), binary(), binary(), non_neg_integer(), non_neg_integer(), pos_integer()}
+           ], boolean(), non_neg_integer()}
+          | {:error, term()}
+  def lmdb_composite_range_entries_bounded(
+        _path,
+        _prefix,
+        _after_key,
+        _before_key,
+        _max_items,
+        _max_bytes,
+        _map_size
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec lmdb_prefix_merge_entries(
+          [binary()],
+          binary(),
+          non_neg_integer(),
+          pos_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, [{non_neg_integer(), binary(), binary()}], non_neg_integer()}
+          | {:error, term()}
+  def lmdb_prefix_merge_entries(_paths, _prefix, _limit, _max_bytes, _map_size),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec lmdb_prefix_entries_reverse(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
           {:ok, [{binary(), binary()}]} | {:error, term()}

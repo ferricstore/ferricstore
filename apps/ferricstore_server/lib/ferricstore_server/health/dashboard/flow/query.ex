@@ -1,6 +1,7 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   @moduledoc false
 
+  alias Ferricstore.Flow.Query.Builder
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
   alias FerricstoreServer.Health.QueryDecoder
 
@@ -269,47 +270,61 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   defp normalize_flow_lineage_mode(_mode), do: "root"
 
   defp flow_lineage_query_result(%{target: nil}) do
-    %{status: :idle, records: [], command: "FLOW.BY_ROOT", message: "Enter a lineage id"}
+    %{status: :idle, records: [], command: "FLOW.QUERY", message: "Enter a lineage id"}
+  end
+
+  defp flow_lineage_query_result(%{partition_key: nil}) do
+    %{status: :idle, records: [], command: "FLOW.QUERY", message: "Enter a partition key"}
   end
 
   defp flow_lineage_query_result(%{target: target, mode: mode} = filters) do
-    opts =
-      [
-        count: filters.limit,
-        include_cold: true,
-        consistent_projection: true
-      ]
-      |> maybe_put_query_opt(:partition_key, filters.partition_key)
-      |> Enum.reverse()
-
-    {command, fun} =
+    kind =
       case mode do
-        "parent" ->
-          {"FLOW.BY_PARENT", fn -> flow_dashboard_flow_by_parent(target, opts) end}
-
-        "correlation" ->
-          {"FLOW.BY_CORRELATION", fn -> flow_dashboard_flow_by_correlation(target, opts) end}
-
-        _ ->
-          {"FLOW.BY_ROOT", fn -> flow_dashboard_flow_by_root(target, opts) end}
+        "parent" -> :by_parent
+        "correlation" -> :by_correlation
+        _ -> :by_root
       end
 
-    case bounded_dashboard_call(fun, flow_dashboard_list_fetch_timeout_ms(), :lineage) do
-      {:ok, {:ok, records}} when is_list(records) ->
-        %{status: :ok, command: command, records: records, message: "#{length(records)} records"}
+    with {:ok, built} <-
+           Builder.build(kind, %{
+             partition_key: filters.partition_key,
+             id: target,
+             limit: filters.limit
+           }) do
+      query_fun = fn -> flow_dashboard_flow_query(built.query, built.params) end
 
-      {:ok, {:error, reason}} ->
-        %{status: :error, command: command, records: [], message: inspect(reason)}
+      case bounded_dashboard_call(query_fun, flow_dashboard_list_fetch_timeout_ms(), :lineage) do
+        {:ok, {:ok, %{records: records}}} when is_list(records) ->
+          lineage_success(records)
 
-      {:error, :timeout} ->
-        %{status: :timeout, command: command, records: [], message: "query timed out"}
+        {:ok, {:ok, records}} when is_list(records) ->
+          lineage_success(records)
 
+        {:ok, {:error, reason}} ->
+          %{status: :error, command: "FLOW.QUERY", records: [], message: inspect(reason)}
+
+        {:error, :timeout} ->
+          %{status: :timeout, command: "FLOW.QUERY", records: [], message: "query timed out"}
+
+        {:error, reason} ->
+          %{status: :error, command: "FLOW.QUERY", records: [], message: inspect(reason)}
+
+        _ ->
+          %{
+            status: :error,
+            command: "FLOW.QUERY",
+            records: [],
+            message: "unexpected query result"
+          }
+      end
+    else
       {:error, reason} ->
-        %{status: :error, command: command, records: [], message: inspect(reason)}
-
-      _ ->
-        %{status: :error, command: command, records: [], message: "unexpected query result"}
+        %{status: :error, command: "FLOW.QUERY", records: [], message: inspect(reason)}
     end
+  end
+
+  defp lineage_success(records) do
+    %{status: :ok, command: "FLOW.QUERY", records: records, message: "#{length(records)} records"}
   end
 
   defp flow_lineage_summary(records) do
@@ -371,6 +386,9 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     case flow_query_plan(filters) do
       {:ok, command, fun} ->
         case bounded_dashboard_call(fun, flow_dashboard_list_fetch_timeout_ms(), :query) do
+          {:ok, {:ok, %{records: rows}}} when is_list(rows) ->
+            %{status: :ok, command: command, rows: rows, message: "#{length(rows)} row(s)"}
+
           {:ok, {:ok, rows}} when is_list(rows) ->
             %{status: :ok, command: command, rows: rows, message: "#{length(rows)} row(s)"}
 
@@ -407,6 +425,20 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     {:idle, flow_query_kind_command(kind), "Enter an id"}
   end
 
+  defp flow_query_plan(%{kind: kind, partition_key: partition_key})
+       when kind in [
+              "list",
+              "search",
+              "terminals",
+              "failures",
+              "stuck",
+              "by_parent",
+              "by_root",
+              "by_correlation"
+            ] and (not is_binary(partition_key) or partition_key == "") do
+    {:idle, "FLOW.QUERY", "Enter a partition key"}
+  end
+
   defp flow_query_plan(%{kind: "history", id: id} = filters) do
     opts =
       [count: filters.limit, values: false, consistent_projection: true]
@@ -417,18 +449,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
   end
 
   defp flow_query_plan(%{kind: "by_parent", id: id} = filters) do
-    opts = flow_query_index_opts(filters)
-    {:ok, "FLOW.BY_PARENT", fn -> flow_dashboard_flow_by_parent(id, opts) end}
+    query_builder_plan(:by_parent, Map.put(query_builder_filters(filters), :id, id))
   end
 
   defp flow_query_plan(%{kind: "by_root", id: id} = filters) do
-    opts = flow_query_index_opts(filters)
-    {:ok, "FLOW.BY_ROOT", fn -> flow_dashboard_flow_by_root(id, opts) end}
+    query_builder_plan(:by_root, Map.put(query_builder_filters(filters), :id, id))
   end
 
   defp flow_query_plan(%{kind: "by_correlation", id: id} = filters) do
-    opts = flow_query_index_opts(filters)
-    {:ok, "FLOW.BY_CORRELATION", fn -> flow_dashboard_flow_by_correlation(id, opts) end}
+    query_builder_plan(:by_correlation, Map.put(query_builder_filters(filters), :id, id))
   end
 
   defp flow_query_plan(%{kind: "search"} = filters) do
@@ -436,41 +465,30 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     state_meta = flow_query_state_meta_filter(filters)
 
     if is_nil(attributes) and is_nil(state_meta) do
-      {:idle, "FLOW.SEARCH", "Enter an indexed attribute or state metadata filter"}
+      {:idle, "FLOW.QUERY", "Enter an indexed attribute or state metadata filter"}
     else
-      opts =
-        [
-          type: filters.type,
-          count: filters.limit,
-          consistent_projection: true
-        ]
-        |> maybe_put_query_opt(:state, filters.state)
-        |> maybe_put_query_opt(:partition_key, filters.partition_key)
-        |> maybe_put_query_opt(:from_ms, filters.from_ms)
-        |> maybe_put_query_opt(:to_ms, filters.to_ms)
-        |> maybe_put_query_opt(:rev, if(filters.rev, do: true, else: nil))
-        |> maybe_put_query_opt(:attributes, attributes)
-        |> maybe_put_query_opt(:state_meta, state_meta)
-        |> Enum.reverse()
+      filters =
+        filters
+        |> query_builder_filters()
+        |> maybe_put_builder_filter(:attribute, single_attribute(attributes))
+        |> maybe_put_builder_filter(:state_meta, single_state_meta(state_meta))
 
-      {:ok, "FLOW.SEARCH", fn -> flow_dashboard_flow_search(opts) end}
+      query_builder_plan(:search, filters)
     end
   end
 
-  defp flow_query_plan(%{kind: "terminals", type: type} = filters) do
-    opts = flow_query_terminal_opts(filters)
-    {:ok, "FLOW.TERMINALS", fn -> flow_dashboard_flow_terminals(type, opts) end}
-  end
+  defp flow_query_plan(%{kind: "terminals"} = filters),
+    do: query_builder_plan(:terminals, query_builder_filters(filters))
 
-  defp flow_query_plan(%{kind: "failures", type: type} = filters) do
-    opts = flow_query_terminal_opts(filters)
-    {:ok, "FLOW.FAILURES", fn -> flow_dashboard_flow_failures(type, opts) end}
-  end
+  defp flow_query_plan(%{kind: "failures"} = filters),
+    do: query_builder_plan(:failures, query_builder_filters(filters))
 
-  defp flow_query_plan(%{kind: "stuck", type: type} = filters) do
-    opts = flow_query_index_opts(filters)
-    {:ok, "FLOW.STUCK", fn -> flow_dashboard_flow_stuck(type, opts) end}
-  end
+  defp flow_query_plan(%{kind: "stuck"} = filters),
+    do:
+      query_builder_plan(
+        :stuck,
+        Map.put(query_builder_filters(filters), :now_ms, System.system_time(:millisecond))
+      )
 
   defp flow_query_plan(%{kind: "stats", type: type} = filters) do
     opts =
@@ -480,13 +498,53 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
     {:ok, "FLOW.STATS", fn -> flow_dashboard_flow_stats(type, opts) end}
   end
 
-  defp flow_query_plan(%{type: type} = filters) do
-    opts =
-      flow_query_index_opts(filters)
-      |> maybe_put_query_opt(:state, filters.state)
+  defp flow_query_plan(filters), do: query_builder_plan(:list, query_builder_filters(filters))
 
-    {:ok, "FLOW.LIST", fn -> flow_dashboard_flow_list(type, opts) end}
+  defp query_builder_plan(kind, filters) do
+    case Builder.build(kind, filters) do
+      {:ok, built} ->
+        {:ok, "FLOW.QUERY", fn -> flow_dashboard_flow_query(built.query, built.params) end}
+
+      {:error, reason} ->
+        {:idle, "FLOW.QUERY", query_builder_message(reason)}
+    end
   end
+
+  defp query_builder_filters(filters) do
+    %{
+      partition_key: filters.partition_key,
+      type: filters.type,
+      state: filters.state,
+      limit: filters.limit,
+      direction: if(filters.rev, do: :desc, else: :asc),
+      from_ms: filters.from_ms,
+      to_ms: filters.to_ms
+    }
+  end
+
+  defp single_attribute(attributes) when is_map(attributes) and map_size(attributes) == 1 do
+    Enum.at(attributes, 0)
+  end
+
+  defp single_attribute(_attributes), do: nil
+
+  defp single_state_meta(state_meta) when is_map(state_meta) and map_size(state_meta) == 1 do
+    [{state, values}] = Map.to_list(state_meta)
+
+    if is_map(values) and map_size(values) == 1 do
+      [{name, value}] = Map.to_list(values)
+      {state, name, value}
+    end
+  end
+
+  defp single_state_meta(_state_meta), do: nil
+
+  defp maybe_put_builder_filter(filters, _key, nil), do: filters
+  defp maybe_put_builder_filter(filters, key, value), do: Map.put(filters, key, value)
+
+  defp query_builder_message(:query_partition_required), do: "Enter a partition key"
+  defp query_builder_message(:query_filter_required), do: "Enter a query filter"
+  defp query_builder_message(reason), do: inspect(reason)
 
   defp flow_query_index_opts(filters) do
     [
@@ -519,22 +577,16 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Query do
 
   defp flow_query_state_meta_filter(_filters), do: nil
 
-  defp flow_query_terminal_opts(filters) do
-    filters
-    |> flow_query_index_opts()
-    |> maybe_put_query_opt(:state, filters.state)
-  end
-
-  defp flow_query_kind_command("terminals"), do: "FLOW.TERMINALS"
-  defp flow_query_kind_command("search"), do: "FLOW.SEARCH"
+  defp flow_query_kind_command("terminals"), do: "FLOW.QUERY"
+  defp flow_query_kind_command("search"), do: "FLOW.QUERY"
   defp flow_query_kind_command("stats"), do: "FLOW.STATS"
-  defp flow_query_kind_command("failures"), do: "FLOW.FAILURES"
-  defp flow_query_kind_command("stuck"), do: "FLOW.STUCK"
+  defp flow_query_kind_command("failures"), do: "FLOW.QUERY"
+  defp flow_query_kind_command("stuck"), do: "FLOW.QUERY"
   defp flow_query_kind_command("history"), do: "FLOW.HISTORY"
-  defp flow_query_kind_command("by_parent"), do: "FLOW.BY_PARENT"
-  defp flow_query_kind_command("by_root"), do: "FLOW.BY_ROOT"
-  defp flow_query_kind_command("by_correlation"), do: "FLOW.BY_CORRELATION"
-  defp flow_query_kind_command(_kind), do: "FLOW.LIST"
+  defp flow_query_kind_command("by_parent"), do: "FLOW.QUERY"
+  defp flow_query_kind_command("by_root"), do: "FLOW.QUERY"
+  defp flow_query_kind_command("by_correlation"), do: "FLOW.QUERY"
+  defp flow_query_kind_command(_kind), do: "FLOW.QUERY"
 
   defp flow_signals_filters_from_opts(opts) when is_list(opts) do
     %{

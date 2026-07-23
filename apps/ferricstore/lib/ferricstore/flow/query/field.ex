@@ -48,6 +48,10 @@ defmodule Ferricstore.Flow.Query.Field do
                   ])
 
   @builtin_fields Map.values(@builtins)
+  @supported_external_names @builtins
+                            |> Map.keys()
+                            |> Kernel.++(["attribute.<name>", "state_meta.<state>.<name>"])
+                            |> Enum.sort()
 
   @type builtin ::
           :partition_key
@@ -73,6 +77,10 @@ defmodule Ferricstore.Flow.Query.Field do
   @spec missing() :: {:ferric_query, :missing}
   def missing, do: @missing
 
+  @doc false
+  @spec supported_external_names() :: [binary()]
+  def supported_external_names, do: @supported_external_names
+
   @spec parse(binary()) :: {:ok, t()} | {:error, :unsupported_field}
   def parse(value) when is_binary(value) do
     normalized = ascii_downcase(value)
@@ -91,10 +99,10 @@ defmodule Ferricstore.Flow.Query.Field do
   @spec valid?(term()) :: boolean()
   def valid?(field) when is_atom(field), do: field in @builtin_fields
 
-  def valid?({:attribute, name}), do: valid_metadata_name?(name)
+  def valid?({:attribute, name}), do: valid_metadata_key?(name)
 
   def valid?({:state_meta, state, name}),
-    do: valid_metadata_name?(state) and valid_metadata_name?(name)
+    do: valid_state_name?(state) and valid_metadata_key?(name)
 
   def valid?(_field), do: false
 
@@ -116,8 +124,20 @@ defmodule Ferricstore.Flow.Query.Field do
   def metadata?(_field), do: false
 
   @spec external_name(t()) :: binary()
-  def external_name({:attribute, name}), do: "attribute." <> name
-  def external_name({:state_meta, state, name}), do: "state_meta." <> state <> "." <> name
+  def external_name({:attribute, name}) do
+    if valid_unquoted_name?(name),
+      do: "attribute." <> name,
+      else: "attribute[" <> quote_segment(name) <> "]"
+  end
+
+  def external_name({:state_meta, state, name}) do
+    if valid_unquoted_name?(state) and valid_unquoted_name?(name) do
+      "state_meta." <> state <> "." <> name
+    else
+      "state_meta[" <> quote_segment(state) <> "][" <> quote_segment(name) <> "]"
+    end
+  end
+
   def external_name(field) when is_atom(field), do: Atom.to_string(field)
 
   @spec fetch(map(), t()) :: {:ok, term()} | :missing
@@ -149,15 +169,23 @@ defmodule Ferricstore.Flow.Query.Field do
   def fetch(_record, _field), do: :missing
 
   defp parse_metadata(value) do
+    cond do
+      prefix?(value, "attribute[") -> parse_bracket_attribute(value)
+      prefix?(value, "state_meta[") -> parse_bracket_state_meta(value)
+      true -> parse_unquoted_metadata(value)
+    end
+  end
+
+  defp parse_unquoted_metadata(value) do
     case :binary.split(value, ".", [:global]) do
       [prefix, name] ->
-        if ascii_downcase(prefix) == "attribute" and valid_metadata_name?(name),
+        if ascii_downcase(prefix) == "attribute" and valid_unquoted_name?(name),
           do: {:ok, {:attribute, name}},
           else: unsupported_field()
 
       [prefix, state, name] ->
-        if ascii_downcase(prefix) == "state_meta" and valid_metadata_name?(state) and
-             valid_metadata_name?(name),
+        if ascii_downcase(prefix) == "state_meta" and valid_unquoted_name?(state) and
+             valid_unquoted_name?(name),
            do: {:ok, {:state_meta, state, name}},
            else: unsupported_field()
 
@@ -166,12 +194,62 @@ defmodule Ferricstore.Flow.Query.Field do
     end
   end
 
+  defp parse_bracket_attribute(value) do
+    rest = binary_part(value, byte_size("attribute"), byte_size(value) - byte_size("attribute"))
+
+    with {:ok, name, ""} <- take_bracket_segment(rest),
+         true <- valid_metadata_key?(name) do
+      {:ok, {:attribute, name}}
+    else
+      _invalid -> unsupported_field()
+    end
+  end
+
+  defp parse_bracket_state_meta(value) do
+    rest = binary_part(value, byte_size("state_meta"), byte_size(value) - byte_size("state_meta"))
+
+    with {:ok, state, rest} <- take_bracket_segment(rest),
+         {:ok, name, ""} <- take_bracket_segment(rest),
+         true <- valid_state_name?(state),
+         true <- valid_metadata_key?(name) do
+      {:ok, {:state_meta, state, name}}
+    else
+      _invalid -> unsupported_field()
+    end
+  end
+
+  defp take_bracket_segment(<<"['", rest::binary>>), do: take_quoted_segment(rest, [])
+  defp take_bracket_segment(_value), do: :error
+
+  defp take_quoted_segment(<<"''", rest::binary>>, acc),
+    do: take_quoted_segment(rest, [?' | acc])
+
+  defp take_quoted_segment(<<"']", rest::binary>>, acc),
+    do: {:ok, acc |> Enum.reverse() |> :erlang.list_to_binary(), rest}
+
+  defp take_quoted_segment(<<byte, rest::binary>>, acc),
+    do: take_quoted_segment(rest, [byte | acc])
+
+  defp take_quoted_segment(<<>>, _acc), do: :error
+
+  defp valid_metadata_key?(name),
+    do: valid_metadata_name?(name) and not String.starts_with?(name, "__")
+
+  defp valid_state_name?(name), do: valid_metadata_name?(name)
+
   defp valid_metadata_name?(name)
+       when is_binary(name) and name != "" and byte_size(name) <= @max_metadata_name_bytes do
+    String.valid?(name)
+  end
+
+  defp valid_metadata_name?(_name), do: false
+
+  defp valid_unquoted_name?(name)
        when is_binary(name) and name != "" and byte_size(name) <= @max_metadata_name_bytes do
     not String.starts_with?(name, "__") and valid_metadata_bytes?(name)
   end
 
-  defp valid_metadata_name?(_name), do: false
+  defp valid_unquoted_name?(_name), do: false
 
   defp valid_metadata_bytes?(<<>>), do: true
 
@@ -180,6 +258,17 @@ defmodule Ferricstore.Flow.Query.Field do
        do: valid_metadata_bytes?(rest)
 
   defp valid_metadata_bytes?(_name), do: false
+
+  defp quote_segment(value), do: "'" <> String.replace(value, "'", "''") <> "'"
+
+  defp prefix?(value, prefix) when byte_size(value) >= byte_size(prefix) do
+    value
+    |> binary_part(0, byte_size(prefix))
+    |> ascii_downcase()
+    |> Kernel.==(prefix)
+  end
+
+  defp prefix?(_value, _prefix), do: false
 
   defp fetch_map(map, atom_key, string_key) do
     case Map.fetch(map, atom_key) do

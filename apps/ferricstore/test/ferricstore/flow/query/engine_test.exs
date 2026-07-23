@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Flow.{Keys, Query}
-  alias Ferricstore.Flow.Query.{Error, Limits}
+  alias Ferricstore.Flow.Query.{Builder, Engine, Error, Limits}
   alias Ferricstore.Flow.Query.{MandatoryScope, Request}
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.IsolatedInstance
@@ -52,6 +52,41 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     def execute(_ctx, _request), do: {:error, :provider_private_error}
   end
 
+  defmodule DiagnosticEngine do
+    @behaviour FerricStore.Flow.QueryEngine
+
+    @impl true
+    def execute(_ctx, _request) do
+      {:error,
+       Error.new(:query_no_bounded_plan,
+         detail: "No active index bounds the requested predicates.",
+         hint: "Create an index whose leading fields match the equality predicates.",
+         context: %{"planner_reason" => "no_active_bounded_index"}
+       )}
+    end
+  end
+
+  defmodule InvalidDiagnosticEngine do
+    @behaviour FerricStore.Flow.QueryEngine
+
+    @impl true
+    def execute(_ctx, _request), do: {:error, %Error{reason: :provider_private_error}}
+  end
+
+  defmodule ForgedDiagnosticEngine do
+    @behaviour FerricStore.Flow.QueryEngine
+
+    @impl true
+    def execute(_ctx, _request) do
+      {:error,
+       %Error{
+         reason: :query_no_bounded_plan,
+         detail: String.duplicate("provider-secret", 100),
+         context: %{"provider_state" => self()}
+       }}
+    end
+  end
+
   defmodule CapabilityEngine do
     @behaviour FerricStore.Flow.QueryEngine
 
@@ -61,7 +96,8 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     @impl true
     def capabilities do
       %{
-        query_contract: "test.flow.query/v1",
+        request_contract: "ferric.flow.query.request/v1",
+        result_contract: "test.flow.query.result/v1",
         explain_contract: "test.flow.explain/v1",
         capabilities: ["test_query_v1"],
         language_versions: ["FQL1"],
@@ -89,7 +125,8 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     @impl true
     def capabilities do
       %{
-        query_contract: "ferric.flow.query/v1",
+        request_contract: "ferric.flow.query.request/v1",
+        result_contract: "ferric.flow.query.result/v1",
         explain_contract: "ferric.flow.explain/v1",
         capabilities: ["flow_query_v1", "flow_composite_index_v1"],
         language_versions: ["FQL1"],
@@ -110,7 +147,8 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     @impl true
     def capabilities do
       %{
-        query_contract: "future.query/v1",
+        request_contract: "future.query.request/v1",
+        result_contract: "future.query.result/v1",
         explain_contract: nil,
         capabilities: ["future_query_v1"],
         language_versions: ["FQL2"],
@@ -128,9 +166,29 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     @impl true
     def capabilities do
       %{
-        query_contract: nil,
+        request_contract: nil,
+        result_contract: "detached.result/v1",
         explain_contract: "detached.explain/v1",
         capabilities: ["detached_explain_v1"],
+        language_versions: ["FQL1"],
+        shapes: ["runs_by_partition_and_run_id_record"]
+      }
+    end
+  end
+
+  defmodule MismatchedRequestContractEngine do
+    @behaviour FerricStore.Flow.QueryEngine
+
+    @impl true
+    def execute(_ctx, _request), do: {:ok, nil}
+
+    @impl true
+    def capabilities do
+      %{
+        request_contract: "future.flow.query.request/v2",
+        result_contract: "test.flow.query.result/v1",
+        explain_contract: nil,
+        capabilities: ["test_query_v1"],
         language_versions: ["FQL1"],
         shapes: ["runs_by_partition_and_run_id_record"]
       }
@@ -150,7 +208,12 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     :ok
   end
 
-  test "EXPLAIN rejects a canonical request without a supported physical path" do
+  test "the embedded API exposes the canonical Flow query entry point" do
+    assert {:module, FerricStore} = Code.ensure_loaded(FerricStore)
+    assert function_exported?(FerricStore, :flow_query, 2)
+  end
+
+  test "the direct exact-path engine rejects an unsupported physical path" do
     request =
       Request.collection(
         :explain,
@@ -160,7 +223,426 @@ defmodule Ferricstore.Flow.Query.EngineTest do
         :record
       )
 
-    assert {:error, :unsupported_query_shape} = Query.execute(%{}, request)
+    assert {:error, :unsupported_query_shape} = Engine.execute(%{}, request)
+  end
+
+  test "default query execution uses the bounded state/type index for collection reads" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "query-list-#{suffix}"
+
+    try do
+      assert :ok =
+               Ferricstore.Flow.create(ctx, "wanted-#{suffix}",
+                 type: "invoice",
+                 state: "queued",
+                 partition_key: partition,
+                 now_ms: 1_000
+               )
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, "other-#{suffix}",
+                 type: "email",
+                 state: "queued",
+                 partition_key: partition,
+                 now_ms: 2_000
+               )
+
+      assert {:ok, %{query: query, params: params}} =
+               Builder.build(:list, %{
+                 partition_key: partition,
+                 type: "invoice",
+                 state: "queued"
+               })
+
+      assert {:ok, request} = Query.prepare_reference("FQL1", query, params)
+
+      assert {:ok, %{records: [%{id: id, partition_key: ^partition}]}} =
+               Query.execute(ctx, request)
+
+      assert id == "wanted-#{suffix}"
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "default query execution preserves bounded metadata and terminal reads" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "query-search-#{suffix}"
+    type = "invoice-#{suffix}"
+    now_ms = System.system_time(:millisecond)
+
+    try do
+      assert {:ok, _policy} =
+               Ferricstore.Flow.policy_set(ctx, type, indexed_attributes: ["region"])
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, "queued-eu-#{suffix}",
+                 type: type,
+                 state: "queued",
+                 partition_key: partition,
+                 attributes: %{"region" => "eu"},
+                 now_ms: now_ms
+               )
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, "queued-us-#{suffix}",
+                 type: type,
+                 state: "queued",
+                 partition_key: partition,
+                 attributes: %{"region" => "us"},
+                 now_ms: now_ms + 1
+               )
+
+      assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+      assert {:ok, search} =
+               Builder.build(:search, %{
+                 partition_key: partition,
+                 type: type,
+                 state: "queued",
+                 attribute: {"region", "eu"}
+               })
+
+      assert {:ok, search_request} =
+               Query.prepare_reference("FQL1", search.query, search.params)
+
+      assert {:ok, %{records: [%{id: search_id}]}} = Query.execute(ctx, search_request)
+      assert search_id == "queued-eu-#{suffix}"
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, "failed-eu-#{suffix}",
+                 type: type,
+                 state: "failed",
+                 partition_key: partition,
+                 now_ms: now_ms + 2
+               )
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, "failed-us-#{suffix}",
+                 type: type,
+                 state: "failed",
+                 partition_key: partition,
+                 now_ms: now_ms + 3
+               )
+
+      assert {:ok, terminals} =
+               Builder.build(:failures, %{partition_key: partition, type: type})
+
+      assert {:ok, terminal_request} =
+               Query.prepare_reference("FQL1", terminals.query, terminals.params)
+
+      assert {:ok, %{records: terminal_records}} = Query.execute(ctx, terminal_request)
+      assert Enum.map(terminal_records, & &1.id) == ["failed-eu-#{suffix}", "failed-us-#{suffix}"]
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "default metadata queries do not invent a queued-state filter" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "query-metadata-state-#{suffix}"
+    type = "invoice-metadata-state-#{suffix}"
+
+    try do
+      assert {:ok, _policy} =
+               Ferricstore.Flow.policy_set(ctx, type, indexed_attributes: ["region"])
+
+      for {id, state, now_ms} <- [
+            {"queued-eu-#{suffix}", "queued", 1_000},
+            {"failed-eu-#{suffix}", "failed", 2_000},
+            {"cancelled-eu-#{suffix}", "cancelled", 2_500},
+            {"queued-us-#{suffix}", "queued", 3_000}
+          ] do
+        region = if String.contains?(id, "-eu-"), do: "eu", else: "us"
+
+        assert :ok =
+                 Ferricstore.Flow.create(ctx, id,
+                   type: type,
+                   state: state,
+                   partition_key: partition,
+                   attributes: %{"region" => region},
+                   now_ms: now_ms
+                 )
+      end
+
+      assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+      assert {:ok, built} =
+               Builder.build(:search, %{
+                 partition_key: partition,
+                 type: type,
+                 attribute: {"region", "eu"}
+               })
+
+      assert {:ok, request} = Query.prepare_reference("FQL1", built.query, built.params)
+      assert {:ok, %{records: records}} = Query.execute(ctx, request)
+
+      assert Enum.map(records, & &1.id) == [
+               "queued-eu-#{suffix}",
+               "failed-eu-#{suffix}",
+               "cancelled-eu-#{suffix}"
+             ]
+
+      terminal_query =
+        "FROM runs WHERE partition_key = @partition AND type = @type " <>
+          "AND state IN (@completed, @failed) " <>
+          "AND attribute.region = @region " <>
+          "ORDER BY updated_at_ms ASC LIMIT 10 RETURN RECORDS"
+
+      assert {:ok, terminal_request} =
+               Query.prepare_reference("FQL1", terminal_query, %{
+                 "partition" => partition,
+                 "type" => type,
+                 "completed" => "completed",
+                 "failed" => "failed",
+                 "region" => "eu"
+               })
+
+      assert {:ok, %{records: [%{id: failed_id}]}} = Query.execute(ctx, terminal_request)
+      assert failed_id == "failed-eu-#{suffix}"
+
+      hot_failed_id = "hot-failed-#{suffix}"
+      hot_cancelled_id = "hot-cancelled-#{suffix}"
+
+      for {id, state, now_ms} <- [
+            {hot_failed_id, "failed", 4_000},
+            {hot_cancelled_id, "cancelled", 5_000}
+          ] do
+        assert :ok =
+                 Ferricstore.Flow.create(ctx, id,
+                   type: type,
+                   state: state,
+                   partition_key: partition,
+                   now_ms: now_ms
+                 )
+      end
+
+      plain_terminal_query =
+        "FROM runs WHERE partition_key = @partition AND type = @type " <>
+          "AND state IN (@completed, @failed) " <>
+          "ORDER BY updated_at_ms ASC LIMIT 10 RETURN RECORDS"
+
+      assert {:ok, plain_terminal_request} =
+               Query.prepare_reference("FQL1", plain_terminal_query, %{
+                 "partition" => partition,
+                 "type" => type,
+                 "completed" => "completed",
+                 "failed" => "failed"
+               })
+
+      assert {:ok, %{records: [%{id: ^hot_failed_id}]}} =
+               Query.execute(ctx, plain_terminal_request)
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "default query execution preserves bounded lineage and inflight reads" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "query-specialized-#{suffix}"
+    type = "query-running-#{suffix}"
+    parent_id = "parent-#{suffix}"
+    child_id = "child-#{suffix}"
+    running_id = "running-#{suffix}"
+
+    try do
+      assert :ok =
+               Ferricstore.Flow.create(ctx, child_id,
+                 type: type,
+                 state: "queued",
+                 partition_key: partition,
+                 parent_flow_id: parent_id,
+                 root_flow_id: parent_id,
+                 run_at_ms: 10_000,
+                 now_ms: 1_000
+               )
+
+      assert {:ok, lineage} =
+               Builder.build(:by_parent, %{partition_key: partition, id: parent_id})
+
+      assert {:ok, lineage_request} =
+               Query.prepare_reference("FQL1", lineage.query, lineage.params)
+
+      assert {:ok, %{records: [%{id: ^child_id}]}} = Query.execute(ctx, lineage_request)
+
+      failed_child_id = "failed-child-#{suffix}"
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, failed_child_id,
+                 type: type,
+                 state: "failed",
+                 partition_key: partition,
+                 parent_flow_id: parent_id,
+                 root_flow_id: parent_id,
+                 now_ms: 2_000
+               )
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, "cancelled-child-#{suffix}",
+                 type: type,
+                 state: "cancelled",
+                 partition_key: partition,
+                 parent_flow_id: parent_id,
+                 root_flow_id: parent_id,
+                 now_ms: 2_500
+               )
+
+      terminal_lineage_query =
+        "FROM runs WHERE partition_key = @partition AND parent_flow_id = @parent " <>
+          "AND state IN (@completed, @failed) " <>
+          "ORDER BY updated_at_ms ASC LIMIT 10 RETURN RECORDS"
+
+      assert {:ok, terminal_lineage_request} =
+               Query.prepare_reference("FQL1", terminal_lineage_query, %{
+                 "partition" => partition,
+                 "parent" => parent_id,
+                 "completed" => "completed",
+                 "failed" => "failed"
+               })
+
+      assert {:ok, %{records: [%{id: ^failed_child_id}]}} =
+               Query.execute(ctx, terminal_lineage_request)
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, running_id,
+                 type: type,
+                 partition_key: partition,
+                 run_at_ms: 1_000,
+                 now_ms: 1_000
+               )
+
+      assert {:ok, [%{id: ^running_id}]} =
+               Ferricstore.Flow.claim_due(ctx, type,
+                 partition_key: partition,
+                 worker: "worker-1",
+                 lease_ms: 50,
+                 limit: 1,
+                 now_ms: 1_000
+               )
+
+      assert {:ok, stuck} =
+               Builder.build(:stuck, %{
+                 partition_key: partition,
+                 type: type,
+                 now_ms: 1_051
+               })
+
+      assert {:ok, stuck_request} = Query.prepare_reference("FQL1", stuck.query, stuck.params)
+      assert {:ok, %{records: [%{id: ^running_id}]}} = Query.execute(ctx, stuck_request)
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "default stuck queries honor descending lease-deadline order before limiting" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "query-stuck-order-#{suffix}"
+    type = "query-stuck-order-#{suffix}"
+    earlier_id = "running-earlier-#{suffix}"
+    later_id = "running-later-#{suffix}"
+
+    try do
+      assert :ok =
+               Ferricstore.Flow.create(ctx, earlier_id,
+                 type: type,
+                 partition_key: partition,
+                 run_at_ms: 1_000,
+                 now_ms: 1_000
+               )
+
+      assert {:ok, [%{id: ^earlier_id}]} =
+               Ferricstore.Flow.claim_due(ctx, type,
+                 partition_key: partition,
+                 worker: "worker-earlier",
+                 lease_ms: 50,
+                 limit: 1,
+                 now_ms: 1_000
+               )
+
+      assert :ok =
+               Ferricstore.Flow.create(ctx, later_id,
+                 type: type,
+                 partition_key: partition,
+                 run_at_ms: 1_000,
+                 now_ms: 1_000
+               )
+
+      assert {:ok, [%{id: ^later_id}]} =
+               Ferricstore.Flow.claim_due(ctx, type,
+                 partition_key: partition,
+                 worker: "worker-later",
+                 lease_ms: 100,
+                 limit: 1,
+                 now_ms: 1_000
+               )
+
+      assert {:ok, built} =
+               Builder.build(:stuck, %{
+                 partition_key: partition,
+                 type: type,
+                 now_ms: 1_101,
+                 direction: :desc,
+                 limit: 1
+               })
+
+      assert {:ok, request} = Query.prepare_reference("FQL1", built.query, built.params)
+      assert {:ok, %{records: [%{id: ^later_id}]}} = Query.execute(ctx, request)
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "stuck queries enforce both lease-deadline bounds without widening the index read" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "query-stuck-window-#{suffix}"
+    type = "query-stuck-window-#{suffix}"
+    too_old_id = "running-too-old-#{suffix}"
+    in_window_id = "running-in-window-#{suffix}"
+
+    try do
+      for {id, lease_ms, worker} <- [
+            {too_old_id, 50, "worker-old"},
+            {in_window_id, 100, "worker-window"}
+          ] do
+        assert :ok =
+                 Ferricstore.Flow.create(ctx, id,
+                   type: type,
+                   partition_key: partition,
+                   run_at_ms: 1_000,
+                   now_ms: 1_000
+                 )
+
+        assert {:ok, [%{id: ^id}]} =
+                 Ferricstore.Flow.claim_due(ctx, type,
+                   partition_key: partition,
+                   worker: worker,
+                   lease_ms: lease_ms,
+                   limit: 1,
+                   now_ms: 1_000
+                 )
+      end
+
+      assert {:ok, built} =
+               Builder.build(:stuck, %{
+                 partition_key: partition,
+                 type: type,
+                 from_ms: 1_075,
+                 to_ms: 1_200,
+                 now_ms: 1_200,
+                 limit: 10
+               })
+
+      assert {:ok, request} = Query.prepare_reference("FQL1", built.query, built.params)
+      assert {:ok, %{records: [%{id: ^in_window_id}]}} = Query.execute(ctx, request)
+    after
+      IsolatedInstance.checkin(ctx)
+    end
   end
 
   test "malformed canonical envelopes never reach an installed query engine" do
@@ -322,15 +804,92 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     assert FerricStore.Flow.QueryEngine.capabilities(ctx) == CapabilityEngine.capabilities()
   end
 
-  test "accepts the bounded collection shape produced by the canonical FQL1 parser" do
+  test "cached capability manifests cannot bypass request-contract validation" do
+    forged =
+      CapabilityEngine.capabilities()
+      |> Map.put(:request_contract, "future.flow.query.request/v2")
+
+    assert_raise ArgumentError, "query capability manifest is invalid", fn ->
+      FerricStore.Flow.QueryEngine.capabilities(%{query_capabilities: forged})
+    end
+  end
+
+  test "default capabilities advertise the complete cost-aware planner surface" do
     assert FerricStore.Flow.QueryEngine.capabilities_for(CollectionCapabilityEngine) ==
              CollectionCapabilityEngine.capabilities()
 
-    assert Ferricstore.Flow.Query.Surface.default_capability_manifest().shapes == [
-             "runs_by_run_id_record",
-             "runs_by_partition_and_run_id_record",
-             "events_by_run_id_ordered_records"
-           ]
+    default_shapes = Ferricstore.Flow.Query.Surface.default_capability_manifest().shapes
+
+    assert "runs_by_partition_predicates_ordered_records" in default_shapes
+    assert "runs_by_partition_predicates_count" in default_shapes
+
+    manifest = Ferricstore.Flow.Query.Surface.default_capability_manifest()
+
+    assert "flow_query_v1" in manifest.capabilities
+    assert "flow_composite_index_v1" in manifest.capabilities
+    assert "flow_explain_v1" in manifest.capabilities
+  end
+
+  test "default capabilities expose the shared bounded response contract" do
+    manifest = Ferricstore.Flow.Query.Surface.default_capability_manifest()
+
+    assert manifest.request_contract == "ferric.flow.query.request/v1"
+    assert manifest.result_contract == "ferric.flow.query.result/v1"
+    assert manifest.explain_contract == "ferric.flow.explain/v1"
+    refute Map.has_key?(manifest, :query_contract)
+  end
+
+  test "every default EXPLAIN path matches the advertised OSS contract" do
+    manifest = Ferricstore.Flow.Query.Surface.default_capability_manifest()
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+
+    requests = [
+      Request.point_read(
+        :explain,
+        {:literal, :keyword, "tenant-a"},
+        {:literal, :keyword, "run-123"}
+      ),
+      Request.history(
+        :explain,
+        [{:eq, :run_id, {:literal, :keyword, "run-123"}}],
+        :asc,
+        10
+      ),
+      Request.collection(
+        :explain,
+        [
+          {:eq, :partition_key, {:literal, :keyword, "tenant-a"}},
+          {:eq, :type, {:literal, :keyword, "invoice"}},
+          {:eq, :state, {:literal, :keyword, "queued"}}
+        ],
+        [{:updated_at_ms, :desc}],
+        10,
+        :record
+      )
+    ]
+
+    try do
+      responses =
+        Enum.map(requests, fn request ->
+          assert {:ok, %{version: version} = response} = Query.execute(ctx, request)
+          assert manifest.explain_contract == version
+          response
+        end)
+
+      assert responses |> Enum.map(&(Map.keys(&1) |> Enum.sort())) |> Enum.uniq() |> length() == 1
+
+      for response <- responses do
+        assert is_binary(response.query_fingerprint)
+        assert response.status == "planned"
+        assert is_map(response.plan)
+        assert is_map(response.estimate)
+        assert is_map(response.bounds)
+        assert is_map(response.quality)
+        assert is_map(response.decision)
+      end
+    after
+      IsolatedInstance.checkin(ctx)
+    end
   end
 
   test "capability support predicates fail closed for malformed provider values" do
@@ -338,7 +897,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     refute Ferricstore.Flow.Query.Surface.supported_shapes?(%{"shape" => true})
   end
 
-  test "capability vocabulary distinguishes the specialized lineage shapes" do
+  test "default capabilities advertise every bounded lineage shape" do
     lineage_shapes = [
       "runs_by_partition_parent_ordered_records",
       "runs_by_partition_root_ordered_records",
@@ -348,7 +907,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     assert Ferricstore.Flow.Query.Surface.supported_shapes?(lineage_shapes)
 
     default_shapes = Ferricstore.Flow.Query.Surface.default_capability_manifest().shapes
-    refute Enum.any?(lineage_shapes, &(&1 in default_shapes))
+    assert Enum.all?(lineage_shapes, &(&1 in default_shapes))
   end
 
   test "instance construction rejects an invalid query engine" do
@@ -390,9 +949,15 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     end
   end
 
-  test "capability negotiation rejects a surface without a query contract" do
+  test "capability negotiation rejects a surface without a complete request/result pair" do
     assert_raise ArgumentError, ~r/query capability manifest/, fn ->
       FerricStore.Flow.QueryEngine.capabilities_for(IncoherentCapabilitiesEngine)
+    end
+  end
+
+  test "capability negotiation rejects a request contract the parser cannot produce" do
+    assert_raise ArgumentError, ~r/query capability manifest/, fn ->
+      FerricStore.Flow.QueryEngine.capabilities_for(MismatchedRequestContractEngine)
     end
   end
 
@@ -426,6 +991,39 @@ defmodule Ferricstore.Flow.Query.EngineTest do
 
     assert Error.status(:query_engine_failure) == :error
     refute Error.message(:query_engine_failure) =~ "secret"
+  end
+
+  test "query engine preserves canonical structured diagnostics" do
+    request =
+      Request.point_read(
+        :execute,
+        {:literal, :keyword, "tenant-a"},
+        {:literal, :keyword, "run-123"}
+      )
+
+    assert {:error,
+            %Error{
+              reason: :query_no_bounded_plan,
+              detail: "No active index bounds the requested predicates.",
+              hint: "Create an index whose leading fields match the equality predicates.",
+              context: %{"planner_reason" => "no_active_bounded_index"}
+            }} =
+             FerricStore.Flow.QueryEngine.execute(
+               %{query_engine: DiagnosticEngine},
+               request
+             )
+
+    assert {:error, :query_engine_failure} =
+             FerricStore.Flow.QueryEngine.execute(
+               %{query_engine: InvalidDiagnosticEngine},
+               request
+             )
+
+    assert {:error, :query_engine_failure} =
+             FerricStore.Flow.QueryEngine.execute(
+               %{query_engine: ForgedDiagnosticEngine},
+               request
+             )
   end
 
   test "point-read storage outages remain structured and safe to retry" do
@@ -474,7 +1072,9 @@ defmodule Ferricstore.Flow.Query.EngineTest do
         return: :record
       }
 
-      assert {:ok, %{id: ^id, partition_key: partition}} = Query.execute(ctx, request)
+      assert {:ok, %{records: [%{id: ^id, partition_key: partition}]}} =
+               Query.execute(ctx, request)
+
       assert partition == Keys.auto_partition_key(id)
     after
       IsolatedInstance.checkin(ctx)
@@ -497,7 +1097,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
         return: :record
       }
 
-      assert {:ok, [%{event_id: event_id, fields: %{"event" => "created"}}]} =
+      assert {:ok, %{records: [%{event_id: event_id, fields: %{"event" => "created"}}]}} =
                Query.execute(ctx, request)
 
       assert is_binary(event_id)
@@ -560,6 +1160,37 @@ defmodule Ferricstore.Flow.Query.EngineTest do
       assert MapSet.disjoint?(MapSet.new(ids(first)), MapSet.new(ids(second)))
       assert length(Enum.uniq(ids(first) ++ ids(second))) == 4
       assert ids(first) ++ ids(second) == Enum.sort(ids(first) ++ ids(second))
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "missing runs return a complete empty history page contract" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    id = "query-history-missing-#{System.unique_integer([:positive, :monotonic])}"
+
+    try do
+      request = Request.history(:execute, [eq(:run_id, id)], :asc, 2)
+
+      assert {:ok,
+              %{
+                records: [],
+                has_more: false,
+                continuation: nil,
+                scanned_entries: 0,
+                hydrated_records: 0,
+                duplicate_entries: 0,
+                memory_high_water_bytes: memory_high_water_bytes
+              }} =
+               Ferricstore.Flow.Query.Engine.execute_history_page_resolved(
+                 ctx,
+                 request,
+                 MandatoryScope.dedicated(),
+                 nil
+               )
+
+      assert is_integer(memory_high_water_bytes)
+      assert memory_high_water_bytes >= 0
     after
       IsolatedInstance.checkin(ctx)
     end

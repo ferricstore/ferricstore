@@ -2,14 +2,18 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   @moduledoc false
 
   alias Ferricstore.Flow.{Keys, LMDB}
-  alias Ferricstore.Flow.Query.{CompositeProjection, IndexDefinition}
+  alias Ferricstore.Flow.Query.{CompositeProjection, IndexDefinition, Limits}
   alias Ferricstore.Store.Router
 
-  @max_page_records 16
+  @max_page_records Limits.max_projection_page_records()
   @max_definitions 16
+  @max_projection_definitions 32
   @max_exact_integer 9_007_199_254_740_991
   @max_expiry 0xFFFF_FFFF_FFFF_FFFF
   @max_projection_operation_bytes 16 * 1_024 * 1_024
+
+  @spec max_page_records() :: pos_integer()
+  def max_page_records, do: @max_page_records
 
   def project_page(ctx, shard_index, records, definitions),
     do: project_page(ctx, shard_index, records, definitions, [])
@@ -45,6 +49,8 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
              is_list(definitions) and length(definitions) <= @max_definitions and is_list(opts) do
     with :ok <- validate_context(ctx, shard_index),
          :ok <- validate_definitions(definitions),
+         {:ok, projection_definitions} <-
+           projection_definitions(ctx, shard_index, definitions, opts),
          :ok <- validate_records(records),
          {:ok, operation_budget} <- projection_budget(opts),
          {:ok, ops} <-
@@ -52,6 +58,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
              lmdb_path(ctx, shard_index),
              records,
              definitions,
+             projection_definitions,
              operation_budget
            ),
          :ok <- LMDB.write_batch(lmdb_path(ctx, shard_index), ops),
@@ -71,32 +78,44 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   def project_page(_ctx, _shard_index, _records, _definitions, _opts),
     do: {:error, :invalid_query_backfill_projection}
 
-  defp projection_ops(path, records, definitions, operation_budget) do
-    initial_cache = CompositeProjection.new_cache()
+  defp projection_ops(path, records, definitions, projection_definitions, operation_budget) do
+    state_keys = Enum.map(records, & &1.state_key)
 
-    Enum.reduce_while(records, {:ok, [], initial_cache, 0}, fn record, {:ok, acc, cache, bytes} ->
-      with {:ok, action, state_key, projected, expire_at_ms} <- validate_record(record),
-           {:ok, ops, cache} <-
-             projection_action(
-               action,
-               path,
-               state_key,
-               projected,
-               expire_at_ms,
-               definitions,
-               cache
-             ),
-           next_bytes <- bytes + operation_bytes(ops),
-           true <- next_bytes <= operation_budget do
-        {:cont, {:ok, :lists.reverse(ops, acc), cache, next_bytes}}
-      else
-        false -> {:halt, {:error, :query_backfill_projection_budget_exceeded}}
-        {:error, _reason} = error -> {:halt, error}
+    with {:ok, initial_cache} <-
+           CompositeProjection.prefetch_reverse_values(
+             path,
+             state_keys,
+             CompositeProjection.new_cache()
+           ) do
+      Enum.reduce_while(
+        records,
+        {:ok, [], initial_cache, 0},
+        fn record, {:ok, acc, cache, bytes} ->
+          with {:ok, action, state_key, projected, expire_at_ms} <- validate_record(record),
+               {:ok, ops, cache} <-
+                 projection_action(
+                   action,
+                   path,
+                   state_key,
+                   projected,
+                   expire_at_ms,
+                   definitions,
+                   projection_definitions,
+                   cache
+                 ),
+               next_bytes <- bytes + operation_bytes(ops),
+               true <- next_bytes <= operation_budget do
+            {:cont, {:ok, :lists.reverse(ops, acc), cache, next_bytes}}
+          else
+            false -> {:halt, {:error, :query_backfill_projection_budget_exceeded}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end
+      )
+      |> case do
+        {:ok, reversed, _cache, _bytes} -> {:ok, Enum.reverse(reversed)}
+        {:error, _reason} = error -> error
       end
-    end)
-    |> case do
-      {:ok, reversed, _cache, _bytes} -> {:ok, Enum.reverse(reversed)}
-      {:error, _reason} = error -> error
     end
   end
 
@@ -136,20 +155,38 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
          record,
          expire_at_ms,
          definitions,
+         projection_definitions,
          cache
        ) do
-    CompositeProjection.reconcile(
+    CompositeProjection.reconcile_subset(
       path,
       state_key,
       record,
       expire_at_ms,
       definitions,
+      projection_definitions,
       cache
     )
   end
 
-  defp projection_action(:remove, path, state_key, _record, _expiry, definitions, cache),
-    do: CompositeProjection.remove(path, state_key, definitions, cache)
+  defp projection_action(
+         :remove,
+         path,
+         state_key,
+         _record,
+         _expiry,
+         definitions,
+         projection_definitions,
+         cache
+       ),
+       do:
+         CompositeProjection.remove_subset(
+           path,
+           state_key,
+           definitions,
+           projection_definitions,
+           cache
+         )
 
   defp validate_definitions([%IndexDefinition{} | _] = definitions) do
     if Enum.all?(definitions, &(IndexDefinition.validate(&1) == :ok)),
@@ -159,6 +196,23 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
 
   defp validate_definitions(_definitions),
     do: {:error, :invalid_query_backfill_definitions}
+
+  defp projection_definitions(ctx, shard_index, definitions, opts) do
+    result =
+      case Keyword.fetch(opts, :projection_definitions) do
+        {:ok, configured} -> {:ok, configured}
+        :error -> FerricStore.Flow.QueryIndexProvider.projection_definitions(ctx, shard_index)
+      end
+
+    with {:ok, projected} when is_list(projected) <- result,
+         all <- Enum.uniq_by(definitions ++ projected, &IndexDefinition.storage_prefix/1),
+         true <- length(all) <= @max_projection_definitions,
+         true <- Enum.all?(all, &(IndexDefinition.validate(&1) == :ok)) do
+      {:ok, all}
+    else
+      _invalid -> {:error, :invalid_query_backfill_projection_definitions}
+    end
+  end
 
   defp projection_budget(opts) do
     case Keyword.get(opts, :max_operation_bytes, @max_projection_operation_bytes) do
@@ -184,13 +238,13 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   defp verify_current_records(_ctx, _shard_index, [], _opts), do: :ok
 
   defp verify_current_records(ctx, shard_index, records, opts) do
-    read_values = Keyword.get(opts, :read_values_fun, &Router.read_shard_values/3)
+    read_entries = Keyword.get(opts, :read_entries_fun, &Router.read_shard_entries/3)
     state_keys = Enum.map(records, & &1.state_key)
 
-    if is_function(read_values, 3) do
-      case read_values.(ctx, shard_index, state_keys) do
-        {:ok, values} when is_list(values) and length(values) == length(records) ->
-          verify_values(records, values)
+    if is_function(read_entries, 3) do
+      case read_entries.(ctx, shard_index, state_keys) do
+        {:ok, entries} when is_list(entries) and length(entries) == length(records) ->
+          verify_entries(records, entries)
 
         :unavailable ->
           {:error, :query_backfill_primary_unavailable}
@@ -206,25 +260,32 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
     end
   end
 
-  defp verify_values(records, values) do
-    Enum.zip(records, values)
+  defp verify_entries(records, entries) do
+    Enum.zip(records, entries)
     |> Enum.reduce_while(:ok, fn
       {%{record: nil}, nil}, :ok ->
         {:cont, :ok}
 
-      {%{record: expected, state_key: state_key}, encoded}, :ok
-      when is_map(expected) and is_binary(encoded) ->
+      {%{
+         record: expected,
+         state_key: state_key,
+         expire_at_ms: expected_expire_at_ms
+       }, {encoded, current_expire_at_ms}},
+      :ok
+      when is_map(expected) and is_binary(encoded) and is_integer(current_expire_at_ms) ->
         case decode_record(encoded) do
           {:ok, current} ->
-            if same_record_version?(expected, current, state_key),
-              do: {:cont, :ok},
-              else: {:halt, {:error, :query_backfill_concurrent_change}}
+            if current_expire_at_ms == expected_expire_at_ms and
+                 same_record_version?(expected, current, state_key),
+               do: {:cont, :ok},
+               else: {:halt, {:error, :query_backfill_concurrent_change}}
 
           {:error, _reason} = error ->
             {:halt, error}
         end
 
-      {%{record: nil}, encoded}, :ok when is_binary(encoded) ->
+      {%{record: nil}, {encoded, expire_at_ms}}, :ok
+      when is_binary(encoded) and is_integer(expire_at_ms) ->
         {:halt, {:error, :query_backfill_concurrent_change}}
 
       {%{record: expected}, nil}, :ok when is_map(expected) ->

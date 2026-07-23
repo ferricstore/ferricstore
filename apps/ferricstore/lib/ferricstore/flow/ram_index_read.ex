@@ -28,7 +28,7 @@ defmodule Ferricstore.Flow.RAMIndexRead do
     case Router.flow_index_score_range_slice(
            ctx,
            index_key,
-           min_bound(query.from_ms),
+           min_bound(query),
            max_bound(query),
            query.rev?,
            0,
@@ -47,8 +47,13 @@ defmodule Ferricstore.Flow.RAMIndexRead do
   def maybe_reverse(entries, true), do: Enum.reverse(entries)
   def maybe_reverse(entries, false), do: entries
 
+  def min_bound(%{rev?: false, from_ms: from_ms, after_id: after_id})
+      when is_integer(from_ms) and is_binary(after_id) and after_id != "",
+      do: {:cursor_after, from_ms, after_id}
+
+  def min_bound(%{from_ms: from_ms}), do: min_score_bound(from_ms)
   def min_bound(nil), do: :neg_inf
-  def min_bound(ms), do: {:inclusive, ms}
+  def min_bound(ms), do: min_score_bound(ms)
 
   def max_bound(%{rev?: true, to_ms: to_ms, before_id: before_id})
       when is_integer(to_ms) and is_binary(before_id) and before_id != "",
@@ -57,4 +62,7 @@ defmodule Ferricstore.Flow.RAMIndexRead do
   def max_bound(%{to_ms: to_ms}), do: max_bound(to_ms)
   def max_bound(nil), do: :pos_inf
   def max_bound(ms), do: {:inclusive, ms}
+
+  defp min_score_bound(nil), do: :neg_inf
+  defp min_score_bound(ms), do: {:inclusive, ms}
 end

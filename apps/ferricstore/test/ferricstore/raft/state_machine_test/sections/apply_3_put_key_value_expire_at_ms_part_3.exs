@@ -189,6 +189,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3PutKeyValueExpireAtMs
             StateMachine.apply(%{index: 11}, {:put, "after-skip", "value", 0}, state)
 
           assert next_state.skip_below_index == 0
+
           assert [{"after-skip", "value", 0, _lfu, _fid, _off, _vsize}] =
                    :ets.lookup(ets, "after-skip")
         end

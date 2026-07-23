@@ -19,7 +19,9 @@ defmodule Ferricstore.Flow.Query.RecordProjection do
     :max_active_ms,
     :parent_flow_id,
     :root_flow_id,
-    :correlation_id
+    :correlation_id,
+    :attributes,
+    :state_meta
   ]
 
   @spec project_result({:ok, map() | nil} | {:error, term()}) ::

@@ -904,31 +904,39 @@ pub fn bloom_file_exists_async<'a>(
     path: String,
     element: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let element_owned = element.as_slice().to_vec();
-    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
-        let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "enoent".to_string()
-            } else {
-                e.to_string()
+    let input_bytes = match crate::async_io::checked_input_bytes([element.len()]) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+    let blocking_task = match crate::async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || element.as_slice().to_vec(),
+        move |element_owned| {
+            let file =
+                crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        "enoent".to_string()
+                    } else {
+                        e.to_string()
+                    }
+                })?;
+            let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
+            let positions = file_hash_positions(&element_owned, num_bits, num_hashes);
+            for pos in positions {
+                let byte_index = pos / 8;
+                let bit_offset = (pos % 8) as u8;
+                let file_offset = HEADER_SIZE as u64 + byte_index;
+                let mut buf = [0u8; 1];
+                bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
+                if (buf[0] & (1u8 << bit_offset)) == 0 {
+                    crate::fadvise_dontneed(&file, 0, 0);
+                    return Ok(0u32);
+                }
             }
-        })?;
-        let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
-        let positions = file_hash_positions(&element_owned, num_bits, num_hashes);
-        for pos in positions {
-            let byte_index = pos / 8;
-            let bit_offset = (pos % 8) as u8;
-            let file_offset = HEADER_SIZE as u64 + byte_index;
-            let mut buf = [0u8; 1];
-            bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
-            if (buf[0] & (1u8 << bit_offset)) == 0 {
-                crate::fadvise_dontneed(&file, 0, 0);
-                return Ok(0u32);
-            }
-        }
-        crate::fadvise_dontneed(&file, 0, 0);
-        Ok(1u32)
-    }) {
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(1u32)
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };
@@ -963,37 +971,51 @@ pub fn bloom_file_mexists_async<'a>(
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
-    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
-        let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "enoent".to_string()
-            } else {
-                e.to_string()
-            }
-        })?;
-        let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
-        validate_bloom_batch_work(elements_owned.len(), num_hashes)?;
-        let mut results: Vec<u32> = Vec::with_capacity(elements_owned.len());
-        for element in &elements_owned {
-            let positions = file_hash_positions(element, num_bits, num_hashes);
-            let mut found = true;
-            for pos in positions {
-                let byte_index = pos / 8;
-                let bit_offset = (pos % 8) as u8;
-                let file_offset = HEADER_SIZE as u64 + byte_index;
-                let mut buf = [0u8; 1];
-                bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
-                if (buf[0] & (1u8 << bit_offset)) == 0 {
-                    found = false;
-                    break;
+    let input_bytes =
+        match crate::async_io::checked_input_bytes(elements.iter().map(|element| element.len())) {
+            Ok(bytes) => bytes,
+            Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+        };
+    let blocking_task = match crate::async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || {
+            elements
+                .iter()
+                .map(|element| element.as_slice().to_vec())
+                .collect::<Vec<_>>()
+        },
+        move |elements_owned| {
+            let file =
+                crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        "enoent".to_string()
+                    } else {
+                        e.to_string()
+                    }
+                })?;
+            let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
+            validate_bloom_batch_work(elements_owned.len(), num_hashes)?;
+            let mut results: Vec<u32> = Vec::with_capacity(elements_owned.len());
+            for element in &elements_owned {
+                let positions = file_hash_positions(element, num_bits, num_hashes);
+                let mut found = true;
+                for pos in positions {
+                    let byte_index = pos / 8;
+                    let bit_offset = (pos % 8) as u8;
+                    let file_offset = HEADER_SIZE as u64 + byte_index;
+                    let mut buf = [0u8; 1];
+                    bloom_read_exact_at(&file, &mut buf, file_offset, "bit")?;
+                    if (buf[0] & (1u8 << bit_offset)) == 0 {
+                        found = false;
+                        break;
+                    }
                 }
+                results.push(u32::from(found));
             }
-            results.push(u32::from(found));
-        }
-        crate::fadvise_dontneed(&file, 0, 0);
-        Ok(results)
-    }) {
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(results)
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };

@@ -5,7 +5,8 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   alias FerricstoreServer.Health.Endpoint.FlowPaths
   alias FerricstoreServer.Health.QueryDecoder
 
-  @type requirement :: {binary(), keyword()}
+  @type command_requirement :: {binary(), keyword()}
+  @type requirement :: command_requirement() | [command_requirement()]
 
   @spec dashboard_path?(binary()) :: boolean()
   def dashboard_path?("/dashboard"), do: true
@@ -40,28 +41,28 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
       "/dashboard/streams" -> {"XINFO", []}
       "/dashboard/pubsub" -> {"PUBSUB", []}
       "/dashboard/prefixes" -> {"SCAN", key: {"*", :read}}
-      "/dashboard/flow" -> {"FLOW.LIST", []}
+      "/dashboard/flow" -> {"FLOW.QUERY", []}
       "/dashboard/flow/lookup" -> flow_lookup_requirement(query)
-      "/dashboard/flow/states" -> {"FLOW.LIST", []}
-      "/dashboard/flow/workers" -> {"FLOW.LIST", []}
-      "/dashboard/flow/due" -> {"FLOW.LIST", []}
+      "/dashboard/flow/states" -> {"FLOW.QUERY", []}
+      "/dashboard/flow/workers" -> {"FLOW.QUERY", []}
+      "/dashboard/flow/due" -> {"FLOW.QUERY", []}
       "/dashboard/flow/schedules" -> {"FLOW.SCHEDULE.LIST", key: {"*", :read}}
-      "/dashboard/flow/failures" -> flow_index_view_requirement("FLOW.FAILURES", query)
+      "/dashboard/flow/failures" -> flow_index_view_requirement("FLOW.QUERY", query)
       "/dashboard/flow/lineage" -> flow_lineage_requirement(query)
       "/dashboard/flow/query" -> flow_query_requirement(query)
       "/dashboard/flow/signals" -> {"FLOW.HISTORY", []}
       "/dashboard/flow/policies" -> {"FLOW.POLICY.GET", []}
-      "/dashboard/flow/governance" -> {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}}
-      "/dashboard/flow/retention" -> {"FLOW.LIST", []}
+      "/dashboard/flow/governance" -> flow_governance_requirement(query)
+      "/dashboard/flow/retention" -> {"FLOW.QUERY", []}
       "/dashboard/flow/config" -> {"CONFIG", []}
-      "/dashboard/flow/projections" -> {"FLOW.LIST", []}
+      "/dashboard/flow/projections" -> {"FLOW.QUERY", []}
       "/dashboard/api/overview" -> {"INFO", []}
-      "/dashboard/api/flow" -> {"FLOW.LIST", []}
-      "/dashboard/api/flow/states" -> {"FLOW.LIST", []}
-      "/dashboard/api/flow/workers" -> {"FLOW.LIST", []}
-      "/dashboard/api/flow/due" -> {"FLOW.LIST", []}
+      "/dashboard/api/flow" -> {"FLOW.QUERY", []}
+      "/dashboard/api/flow/states" -> {"FLOW.QUERY", []}
+      "/dashboard/api/flow/workers" -> {"FLOW.QUERY", []}
+      "/dashboard/api/flow/due" -> {"FLOW.QUERY", []}
       "/dashboard/api/flow/signals" -> {"FLOW.HISTORY", []}
-      "/dashboard/api/flow/projections" -> {"FLOW.LIST", []}
+      "/dashboard/api/flow/projections" -> {"FLOW.QUERY", []}
       "/dashboard/api/flow/value" -> flow_value_requirement(query)
       "/dashboard/api/slowlog" -> {"SLOWLOG", []}
       "/dashboard/api/merge" -> {"INFO", []}
@@ -89,7 +90,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
         {"FLOW.POLICY.SET", []}
 
       "/dashboard/flow/retention" ->
-        {"FLOW.LIST", []}
+        {"FLOW.QUERY", []}
 
       "/dashboard/flow/schedules" ->
         {"FLOW.SCHEDULE.LIST", []}
@@ -112,7 +113,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     {"FLOW.RETENTION_CLEANUP", key: {"*", :write}}
   end
 
-  def flow_retention_form_requirement(_params), do: {"FLOW.LIST", []}
+  def flow_retention_form_requirement(_params), do: {"FLOW.QUERY", []}
 
   @spec flow_policy_form_requirement(map()) :: requirement()
   def flow_policy_form_requirement(params) do
@@ -213,6 +214,29 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
     end
   end
 
+  defp flow_governance_requirement(query) do
+    overview = {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}}
+    params = QueryDecoder.decode(query)
+
+    required_query_params = ~w(meta_partition_key meta_type meta_state meta_key meta_value)
+
+    if Enum.all?(required_query_params, &present_query_param?(params, &1)) do
+      partition_key = params |> Map.fetch!("meta_partition_key") |> String.trim()
+      [overview, {"FLOW.QUERY", key: {partition_key, :read}}]
+    else
+      overview
+    end
+  rescue
+    _ -> {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}}
+  end
+
+  defp present_query_param?(params, key) do
+    case Map.get(params, key) do
+      value when is_binary(value) -> String.trim(value) != ""
+      _other -> false
+    end
+  end
+
   defp flow_lookup_requirement(query) do
     id =
       query
@@ -288,24 +312,12 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
   end
 
   defp flow_lineage_requirement(query) do
-    mode =
-      query
-      |> QueryDecoder.decode()
-      |> Map.get("mode", "root")
-
-    command =
-      case mode do
-        "parent" -> "FLOW.BY_PARENT"
-        "correlation" -> "FLOW.BY_CORRELATION"
-        _ -> "FLOW.BY_ROOT"
-      end
-
     case flow_partition_key_from_query(query) do
-      "" -> {command, []}
-      partition_key -> {command, key: {partition_key, :read}}
+      "" -> {"FLOW.QUERY", []}
+      partition_key -> {"FLOW.QUERY", key: {partition_key, :read}}
     end
   rescue
-    _ -> {"FLOW.BY_ROOT", []}
+    _ -> {"FLOW.QUERY", []}
   end
 
   defp flow_query_requirement(query) do
@@ -323,7 +335,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
     flow_query_key_requirement(command, kind, key, partition_key, type)
   rescue
-    _ -> {"FLOW.LIST", []}
+    _ -> {"FLOW.QUERY", []}
   end
 
   defp flow_index_view_requirement(command, query) do
@@ -368,20 +380,13 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirements do
 
   defp flow_query_command_requirement(kind) when is_binary(kind) do
     case kind do
-      "terminals" -> "FLOW.TERMINALS"
-      "search" -> "FLOW.SEARCH"
-      "failures" -> "FLOW.FAILURES"
-      "stuck" -> "FLOW.STUCK"
       "stats" -> "FLOW.STATS"
       "history" -> "FLOW.HISTORY"
-      "by_parent" -> "FLOW.BY_PARENT"
-      "by_root" -> "FLOW.BY_ROOT"
-      "by_correlation" -> "FLOW.BY_CORRELATION"
-      _ -> "FLOW.LIST"
+      _ -> "FLOW.QUERY"
     end
   end
 
-  defp flow_query_command_requirement(_kind), do: "FLOW.LIST"
+  defp flow_query_command_requirement(_kind), do: "FLOW.QUERY"
 
   defp flow_rewind_or_default_requirement("/dashboard/flow/" <> encoded_action) do
     cond do

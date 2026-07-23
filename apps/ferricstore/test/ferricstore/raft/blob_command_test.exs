@@ -385,6 +385,31 @@ defmodule Ferricstore.Raft.BlobCommandTest do
     assert_flow_blob_marker(root, marker, payload)
   end
 
+  test "prepares atomic invocation Flow payloads without changing catalog admission", %{
+    ctx: ctx,
+    root: root
+  } do
+    payload = :binary.copy("A", 1024)
+    catalog = %{namespace: "invocations", subject: "invocation-1", value: "record"}
+
+    command =
+      {:flow_create_with_catalog, "state-key", catalog,
+       %{
+         id: "invocation-1",
+         type: "invocation",
+         state: "queued",
+         partition_key: "tenant-a",
+         payload: payload
+       }}
+
+    assert BlobCommand.side_channel_candidate?(ctx, command)
+
+    assert {:ok, {:flow_create_with_catalog, "state-key", ^catalog, %{payload: marker}}} =
+             BlobCommand.prepare(ctx, 0, command, single_member?: true)
+
+    assert_flow_blob_marker(root, marker, payload)
+  end
+
   test "keeps idempotent Flow named value maps inline to preserve digest semantics", %{ctx: ctx} do
     value = :binary.copy("D", 1024)
 

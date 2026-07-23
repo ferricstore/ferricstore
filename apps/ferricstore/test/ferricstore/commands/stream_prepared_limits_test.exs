@@ -29,8 +29,7 @@ defmodule Ferricstore.Commands.StreamPreparedLimitsTest do
 
     assert @integer_error ==
              Stream.handle_ast(
-               {:xreadgroup, "group", "consumer",
-                {1, {:block, timeout}, [{"stream", ">"}]}},
+               {:xreadgroup, "group", "consumer", {1, {:block, timeout}, [{"stream", ">"}]}},
                store
              )
   end

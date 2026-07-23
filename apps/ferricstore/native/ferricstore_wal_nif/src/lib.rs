@@ -156,10 +156,10 @@ fn pread<'a>(
     offset: u64,
     len: u64,
 ) -> NifResult<(Atom, Binary<'a>)> {
-    let data = handle.pread(offset, len)?;
+    let read_len = handle.pread_len(offset, len)?;
     let mut binary =
-        OwnedBinary::new(data.len()).ok_or(rustler::Error::Term(Box::new("alloc_failed")))?;
-    binary.as_mut_slice().copy_from_slice(&data);
+        OwnedBinary::new(read_len).ok_or(rustler::Error::Term(Box::new("alloc_failed")))?;
+    handle.pread_into(offset, binary.as_mut_slice())?;
     Ok((atoms::ok(), binary.release(env)))
 }
 

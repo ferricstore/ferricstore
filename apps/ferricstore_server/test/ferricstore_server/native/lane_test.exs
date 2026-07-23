@@ -47,6 +47,14 @@ defmodule FerricstoreServer.Native.LaneTest do
     end
 
     @impl true
+    def acquire_command(command, args, keys, opts) do
+      with :ok <- check_command(command, args, keys, opts), do: {:ok, nil}
+    end
+
+    @impl true
+    def release_command(_lease, _opts), do: :ok
+
+    @impl true
     def record_activity(keys, _opts) do
       send(test_pid(), {:resource_activity, keys})
       :ok

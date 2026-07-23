@@ -455,6 +455,23 @@ mod integration {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn nif_pread_fills_the_final_binary_without_an_intermediate_copy() {
+        let source = include_str!("lib.rs");
+        let pread = source
+            .split("fn pread<'a>(")
+            .nth(1)
+            .expect("pread NIF exists")
+            .split("/// Reserve disk space")
+            .next()
+            .expect("pread NIF has a bounded body");
+
+        assert!(pread.contains("OwnedBinary::new(read_len)"));
+        assert!(pread.contains("handle.pread_into(offset, binary.as_mut_slice())"));
+        assert!(!pread.contains("copy_from_slice"));
+        assert!(!pread.contains("Vec<"));
+    }
+
+    #[test]
     fn test_pread_various_offsets() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pread.wal").to_str().unwrap().to_string();
@@ -463,10 +480,13 @@ mod integration {
         handle.buffer_write(b"0123456789ABCDEF").unwrap();
         handle.close().unwrap();
 
-        assert_eq!(&handle.pread(HDR, 4).unwrap(), b"0123");
-        assert_eq!(&handle.pread(HDR + 4, 4).unwrap(), b"4567");
-        assert_eq!(&handle.pread(HDR + 10, 6).unwrap(), b"ABCDEF");
-        assert_eq!(&handle.pread(HDR, 16).unwrap(), b"0123456789ABCDEF");
+        assert_eq!(handle.pread(HDR, 4).unwrap().as_slice(), b"0123");
+        assert_eq!(handle.pread(HDR + 4, 4).unwrap().as_slice(), b"4567");
+        assert_eq!(handle.pread(HDR + 10, 6).unwrap().as_slice(), b"ABCDEF");
+        assert_eq!(
+            handle.pread(HDR, 16).unwrap().as_slice(),
+            b"0123456789ABCDEF"
+        );
     }
 
     #[test]
@@ -483,7 +503,7 @@ mod integration {
         handle.buffer_write(b"ABCDE").unwrap();
         handle.close().unwrap();
 
-        assert_eq!(&handle.pread(HDR + 2, 1).unwrap(), b"C");
+        assert_eq!(handle.pread(HDR + 2, 1).unwrap().as_slice(), b"C");
     }
 
     #[test]
@@ -500,7 +520,7 @@ mod integration {
         handle.buffer_write(b"12345").unwrap();
         handle.close().unwrap();
 
-        assert_eq!(&handle.pread(HDR + 4, 1).unwrap(), b"5");
+        assert_eq!(handle.pread(HDR + 4, 1).unwrap().as_slice(), b"5");
     }
 
     #[test]
@@ -556,7 +576,7 @@ mod integration {
 
         let result = handle.pread(HDR, 1024 * 1024).unwrap();
         assert_eq!(result.len(), 1024 * 1024);
-        assert_eq!(&result[..], &data[..]);
+        assert_eq!(result.as_slice(), data.as_slice());
     }
 
     // -----------------------------------------------------------------------

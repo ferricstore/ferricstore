@@ -1,7 +1,7 @@
 <% data = assigns.data %>
 <% filters = data.filters %>
 <div class="flow-policy-panel">
-  <div class="section-title">Lineage Lookup <%= info_icon("Uses FLOW.BY_PARENT, FLOW.BY_ROOT, or FLOW.BY_CORRELATION with cold projection enabled. Payload bytes are not read.") %></div>
+  <div class="section-title">Lineage Lookup <%= info_icon("Uses a partition-bound FLOW.QUERY lineage plan. Payload bytes are not read.") %></div>
   <form class="flow-filter-form" action="/dashboard/flow/lineage" method="get">
     <label>
       Query

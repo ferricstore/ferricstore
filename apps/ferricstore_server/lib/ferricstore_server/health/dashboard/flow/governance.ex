@@ -1,18 +1,19 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
   @moduledoc false
 
+  alias Ferricstore.Flow.Query.Builder
   alias FerricstoreServer.Health.QueryDecoder
 
   import FerricstoreServer.Health.Dashboard.Flow.Calls,
     only: [
       bounded_dashboard_call: 3,
-      flow_dashboard_flow_search: 1,
+      flow_dashboard_flow_query: 2,
       flow_dashboard_list_fetch_timeout_ms: 0
     ]
 
   @default_limit 100
-  @max_limit 500
-  @state_meta_idle "Enter workflow type, metadata state, key, and value"
+  @max_limit 100
+  @state_meta_idle "Enter partition, workflow type, metadata state, key, and value"
 
   def opts_from_query(query) when is_binary(query) do
     params = QueryDecoder.decode(query)
@@ -171,33 +172,36 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
   defp collect_state_meta_result(filters) do
     case state_meta_search_opts(filters) do
       {:idle, message} ->
-        %{status: :idle, command: "FLOW.SEARCH", rows: [], message: message}
+        %{status: :idle, command: "FLOW.QUERY", rows: [], message: message}
 
       {:error, reason} ->
-        %{status: :error, command: "FLOW.SEARCH", rows: [], message: reason}
+        %{status: :error, command: "FLOW.QUERY", rows: [], message: inspect(reason)}
 
-      {:ok, opts} ->
+      {:ok, %{query: query, params: params}} ->
         case bounded_dashboard_call(
-               fn -> flow_dashboard_flow_search(opts) end,
+               fn -> flow_dashboard_flow_query(query, params) end,
                flow_dashboard_list_fetch_timeout_ms(),
                :governance_state_meta
              ) do
           {:ok, {:ok, rows}} when is_list(rows) ->
-            %{status: :ok, command: "FLOW.SEARCH", rows: rows, message: "#{length(rows)} row(s)"}
+            query_result(rows)
+
+          {:ok, {:ok, %{records: rows}}} when is_list(rows) ->
+            query_result(rows)
 
           {:ok, {:error, reason}} ->
-            %{status: :error, command: "FLOW.SEARCH", rows: [], message: inspect(reason)}
+            %{status: :error, command: "FLOW.QUERY", rows: [], message: inspect(reason)}
 
           {:error, :timeout} ->
-            %{status: :timeout, command: "FLOW.SEARCH", rows: [], message: "query timed out"}
+            %{status: :timeout, command: "FLOW.QUERY", rows: [], message: "query timed out"}
 
           {:error, reason} ->
-            %{status: :error, command: "FLOW.SEARCH", rows: [], message: inspect(reason)}
+            %{status: :error, command: "FLOW.QUERY", rows: [], message: inspect(reason)}
 
           _other ->
             %{
               status: :error,
-              command: "FLOW.SEARCH",
+              command: "FLOW.QUERY",
               rows: [],
               message: "unexpected query result"
             }
@@ -206,21 +210,18 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
   end
 
   defp state_meta_search_opts(filters) when is_map(filters) do
-    with {:ok, type} <- required_filter(filters, :meta_type),
+    with {:ok, partition_key} <- required_filter(filters, :meta_partition_key),
+         {:ok, type} <- required_filter(filters, :meta_type),
          {:ok, state} <- required_filter(filters, :meta_state),
          {:ok, key} <- required_filter(filters, :meta_key),
          {:ok, raw_value} <- required_filter(filters, :meta_value),
          {:ok, value} <- parse_meta_value(raw_value, Map.get(filters, :meta_value_type, "string")) do
-      opts =
-        [
-          type: type,
-          state_meta: %{state => %{key => value}},
-          count: Map.get(filters, :limit, @default_limit),
-          consistent_projection: true
-        ]
-        |> maybe_put_opt(:partition_key, Map.get(filters, :meta_partition_key))
-
-      {:ok, opts}
+      Builder.build(:search, %{
+        partition_key: partition_key,
+        type: type,
+        state_meta: {state, key, value},
+        limit: Map.get(filters, :limit, @default_limit)
+      })
     else
       {:missing, _key} -> {:idle, @state_meta_idle}
       {:error, _reason} = error -> error
@@ -258,9 +259,8 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Governance do
 
   defp parse_meta_value(value, _type), do: {:ok, value}
 
-  defp maybe_put_opt(opts, _key, nil), do: opts
-  defp maybe_put_opt(opts, _key, ""), do: opts
-  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
+  defp query_result(rows),
+    do: %{status: :ok, command: "FLOW.QUERY", rows: rows, message: "#{length(rows)} row(s)"}
 
   defp positive_integer(params, key, default) do
     case params |> Map.get(key, "") |> to_string() |> String.trim() |> Integer.parse() do

@@ -25,6 +25,7 @@ defmodule Ferricstore.Raft.ApplyContext do
   @max_transaction_command_budget 100_000
   @max_transaction_key_apply_budget 100_000
   @max_transaction_result_byte_budget 64 * 1_024 * 1_024
+  @max_u64 0xFFFF_FFFF_FFFF_FFFF
 
   @default_retention_ttl_ms 604_800_000
   @default_history_hot_max_events 0
@@ -53,6 +54,7 @@ defmodule Ferricstore.Raft.ApplyContext do
     :flow_cross_terminal,
     :flow_cross_terminal_many,
     :flow_create,
+    :flow_create_with_catalog,
     :flow_create_many,
     :flow_create_pipeline_batch,
     :flow_extend_lease,
@@ -839,7 +841,7 @@ defmodule Ferricstore.Raft.ApplyContext do
 
     with true <- mode in [:dedicated, :shared],
          true <-
-           is_integer(generation) and generation >= 0 and generation <= 0xFFFF_FFFF_FFFF_FFFF,
+           is_integer(generation) and generation >= 0 and generation <= @max_u64,
          true <- is_binary(schema_digest) and byte_size(schema_digest) == 32,
          {:ok, fields} <- normalize_flow_metadata_fields(raw_fields),
          true <- valid_flow_metadata_fields?(fields),
@@ -872,6 +874,7 @@ defmodule Ferricstore.Raft.ApplyContext do
     Enum.all?(fields, fn
       {id, %{version: version, type: type, role: role, required_in: required_in}}
       when is_integer(id) and id > 0 and id <= 0xFFFF and is_integer(version) and version > 0 and
+             version <= @max_u64 and
              type in [:uint64, :int64, :keyword, :boolean, :datetime] and
              role in [:isolation_scope, :system_metadata] and
              required_in in [:shared, :always, :optional] ->

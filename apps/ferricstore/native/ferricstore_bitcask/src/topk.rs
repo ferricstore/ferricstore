@@ -727,6 +727,22 @@ fn v2_encode_result_terms<'a>(
     Ok(terms.encode(env))
 }
 
+fn allocate_topk_items_with<T>(
+    items: &[Vec<u8>],
+    mut allocate: impl FnMut(&[u8]) -> Option<T>,
+) -> Result<Vec<T>, &'static str> {
+    let mut allocated = Vec::new();
+    allocated
+        .try_reserve_exact(items.len())
+        .map_err(|_| "TopK result term allocation failed")?;
+
+    for item in items {
+        allocated.push(allocate(item.as_slice()).ok_or("TopK result binary allocation failed")?);
+    }
+
+    Ok(allocated)
+}
+
 /// Create a new TopK file at the given path.
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
 #[rustler::nif(schedule = "DirtyIo")]
@@ -1219,26 +1235,40 @@ pub fn topk_file_query_v2_async<'a>(
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
-    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
-        let p = std::path::Path::new(&path);
-        let file = crate::open_random_read_locked(p).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "enoent".to_string()
-            } else {
-                e.to_string()
-            }
-        })?;
-        let (k, width, depth, heap_len) = v2_read_header(&file)?;
-        let heap_entries = v2_read_heap(&file, width, depth, heap_len, k).map_err(|e| e.clone())?;
-        let fingerprints = v2_query_fingerprints(&heap_entries);
-        let results: Vec<i32> = elements_owned
-            .iter()
-            .map(|elem| i32::from(fingerprints.contains(elem.as_slice())))
-            .collect();
-        crate::fadvise_dontneed(&file, 0, 0);
-        Ok(results)
-    }) {
+    let input_bytes =
+        match crate::async_io::checked_input_bytes(elements.iter().map(|element| element.len())) {
+            Ok(bytes) => bytes,
+            Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+        };
+    let blocking_task = match crate::async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || {
+            elements
+                .iter()
+                .map(|element| element.as_slice().to_vec())
+                .collect::<Vec<_>>()
+        },
+        move |elements_owned| {
+            let p = std::path::Path::new(&path);
+            let file = crate::open_random_read_locked(p).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (k, width, depth, heap_len) = v2_read_header(&file)?;
+            let heap_entries =
+                v2_read_heap(&file, width, depth, heap_len, k).map_err(|e| e.clone())?;
+            let fingerprints = v2_query_fingerprints(&heap_entries);
+            let results: Vec<i32> = elements_owned
+                .iter()
+                .map(|elem| i32::from(fingerprints.contains(elem.as_slice())))
+                .collect();
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(results)
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };
@@ -1305,19 +1335,26 @@ pub fn topk_file_list_v2_async(
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
-            Ok(items) => {
-                let terms: Vec<rustler::Term<'_>> = items
-                    .iter()
-                    .map(|item| match OwnedBinary::new(item.len()) {
-                        Some(mut ob) => {
-                            ob.as_mut_slice().copy_from_slice(item);
-                            rustler::Binary::from_owned(ob, env).encode(env)
-                        }
-                        None => atoms::error().encode(env),
-                    })
-                    .collect();
-                (atoms::tokio_complete(), correlation_id, atoms::ok(), terms).encode(env)
-            }
+            Ok(items) => match allocate_topk_items_with(&items, |item| {
+                let mut binary = OwnedBinary::new(item.len())?;
+                binary.as_mut_slice().copy_from_slice(item);
+                Some(binary)
+            }) {
+                Ok(binaries) => {
+                    let terms: Vec<rustler::Term<'_>> = binaries
+                        .into_iter()
+                        .map(|binary| rustler::Binary::from_owned(binary, env).encode(env))
+                        .collect();
+                    (atoms::tokio_complete(), correlation_id, atoms::ok(), terms).encode(env)
+                }
+                Err(reason) => (
+                    atoms::tokio_complete(),
+                    correlation_id,
+                    atoms::error(),
+                    reason,
+                )
+                    .encode(env),
+            },
             Err(reason) => (
                 atoms::tokio_complete(),
                 correlation_id,
@@ -1413,25 +1450,38 @@ pub fn topk_file_count_v2_async<'a>(
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
-    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
-        let p = std::path::Path::new(&path);
-        let file = crate::open_random_read_locked(p).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "enoent".to_string()
-            } else {
-                e.to_string()
-            }
-        })?;
-        let (_k, width, depth, _heap_len) = v2_read_header(&file)?;
-        let counters = v2_read_cms(&file, width, depth).map_err(|e| e.clone())?;
-        let results: Vec<i64> = elements_owned
-            .iter()
-            .map(|elem| v2_cms_estimate(&counters, width, depth, elem))
-            .collect();
-        crate::fadvise_dontneed(&file, 0, 0);
-        Ok(results)
-    }) {
+    let input_bytes =
+        match crate::async_io::checked_input_bytes(elements.iter().map(|element| element.len())) {
+            Ok(bytes) => bytes,
+            Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+        };
+    let blocking_task = match crate::async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || {
+            elements
+                .iter()
+                .map(|element| element.as_slice().to_vec())
+                .collect::<Vec<_>>()
+        },
+        move |elements_owned| {
+            let p = std::path::Path::new(&path);
+            let file = crate::open_random_read_locked(p).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (_k, width, depth, _heap_len) = v2_read_header(&file)?;
+            let counters = v2_read_cms(&file, width, depth).map_err(|e| e.clone())?;
+            let results: Vec<i64> = elements_owned
+                .iter()
+                .map(|elem| v2_cms_estimate(&counters, width, depth, elem))
+                .collect();
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(results)
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };

@@ -1,9 +1,10 @@
 # :bench — long-running throughput/latency benchmarks; run with `mix test --include bench`
 # :linux_io_uring — tests that require Linux + io_uring kernel support (≥ 5.1).
 #   Always excluded from the default run (`mix test`) on all platforms.
-#   In CI, the dedicated workflow step runs them with `mix test --only linux_io_uring`
-#   only when io_uring is confirmed available on the runner.
-#   Locally on Linux, run them with `mix test --include linux_io_uring`.
+#   In CI, the dedicated workflow requires io_uring support and runs them with
+#   `mix test --only linux_io_uring`; unavailable support fails the Linux job.
+#   Locally on Linux, run them with
+#   `FERRICSTORE_REQUIRE_IO_URING=1 mix test --include linux_io_uring`.
 # :large_alloc — tests that allocate ≥ 512 MiB in-process to verify the size
 #   guard fires. Excluded by default to avoid OOM on CI runners with < 2 GB RAM.
 #   Run locally with `mix test --include large_alloc`.

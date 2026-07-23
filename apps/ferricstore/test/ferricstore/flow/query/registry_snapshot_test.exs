@@ -18,7 +18,12 @@ defmodule Ferricstore.Flow.Query.RegistrySnapshotTest do
 
   test "rejects forged registered definitions and unbounded generation counters" do
     valid = registered(1, 1, :active)
-    forged_definition = %{valid.definition | fields: [{:state, :asc, :hashed} | tl(valid.definition.fields)]}
+
+    forged_definition = %{
+      valid.definition
+      | fields: [{:state, :asc, :hashed} | tl(valid.definition.fields)]
+    }
+
     forged = %{valid | definition: forged_definition}
 
     assert {:error, :invalid_query_index_snapshot} =

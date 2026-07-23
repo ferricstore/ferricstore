@@ -41,6 +41,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
 
       alias Ferricstore.Store.Shard.ZSetIndex
       alias Ferricstore.Store.Shard.LogicalKeyIndex
+      alias Ferricstore.Store.Shard.NamespaceUsageIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -113,6 +114,23 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
 
         LogicalKeyIndex.ensure_tables!(logical_key_index_name, logical_key_slots_name)
 
+        {default_namespace_usage, default_namespace_usage_expiry} =
+          NamespaceUsageIndex.table_names(
+            Map.get(config, :instance_name, :default),
+            config.shard_index
+          )
+
+        namespace_usage_index_name =
+          Map.get(config, :namespace_usage_index_name, default_namespace_usage)
+
+        namespace_usage_expiry_name =
+          Map.get(config, :namespace_usage_expiry_name, default_namespace_usage_expiry)
+
+        NamespaceUsageIndex.ensure_tables!(
+          namespace_usage_index_name,
+          namespace_usage_expiry_name
+        )
+
         %{
           shard_index: config.shard_index,
           shard_data_path: config.shard_data_path,
@@ -156,6 +174,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.Init do
           compound_revision_index_name: compound_revision_index_name(config),
           logical_key_index_name: logical_key_index_name,
           logical_key_slots_name: logical_key_slots_name,
+          namespace_usage_index_name: namespace_usage_index_name,
+          namespace_usage_expiry_name: namespace_usage_expiry_name,
           flow_index_name:
             Map.get(config, :flow_index_name) ||
               elem(

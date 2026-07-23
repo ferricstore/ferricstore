@@ -114,6 +114,15 @@ defmodule FerricstoreServer.Health.Endpoint.Auth do
   defp authorize_acl_requirement(username, {"*", opts}),
     do: require_enabled_acl_user({"*", opts}, username)
 
+  defp authorize_acl_requirement(username, requirements) when is_list(requirements) do
+    Enum.reduce_while(requirements, :ok, fn requirement, :ok ->
+      case authorize_acl_requirement(username, requirement) do
+        :ok -> {:cont, :ok}
+        {:forbidden, _requirement, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
   defp authorize_acl_requirement(username, {command, opts}) do
     with :ok <- Acl.check_command(username, command),
          :ok <- authorize_acl_key(username, command, opts) do

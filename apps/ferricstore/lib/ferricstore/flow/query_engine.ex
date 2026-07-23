@@ -2,9 +2,9 @@ defmodule FerricStore.Flow.QueryEngine do
   @moduledoc """
   Installable execution boundary for canonical Flow queries.
 
-  OSS uses the exact-path default engine. Editions may install an engine that
-  injects trusted mandatory scope, authorization, budgets, and alternate
-  physical planners after parsing and parameter binding.
+  OSS uses the bounded cost-aware planner. Extensions may inject trusted
+  mandatory scope, authorization, budgets, and index metadata through the
+  existing instance behaviours after parsing and parameter binding.
   """
 
   alias Ferricstore.Flow.Query.{Error, ExecutionContext, Request, Surface}
@@ -12,7 +12,8 @@ defmodule FerricStore.Flow.QueryEngine do
   @type context :: FerricStore.Instance.t() | ExecutionContext.t() | map()
   @type result :: {:ok, term()} | {:error, term()}
   @type capability_manifest :: %{
-          query_contract: binary() | nil,
+          request_contract: binary() | nil,
+          result_contract: binary() | nil,
           explain_contract: binary() | nil,
           capabilities: [binary()],
           language_versions: [binary()],
@@ -24,8 +25,17 @@ defmodule FerricStore.Flow.QueryEngine do
   @optional_callbacks capabilities: 0
 
   @default_implementation FerricStore.Flow.QueryEngine.Default
+  @capability_manifest_keys [
+    :request_contract,
+    :result_contract,
+    :explain_contract,
+    :capabilities,
+    :language_versions,
+    :shapes
+  ]
   @unavailable_capabilities %{
-    query_contract: nil,
+    request_contract: nil,
+    result_contract: nil,
     explain_contract: nil,
     capabilities: [],
     language_versions: [],
@@ -65,7 +75,8 @@ defmodule FerricStore.Flow.QueryEngine do
   end
 
   @spec capabilities(context()) :: capability_manifest()
-  def capabilities(%{query_capabilities: capabilities}), do: capabilities
+  def capabilities(%{query_capabilities: capabilities}),
+    do: validate_capability_manifest!(capabilities)
 
   def capabilities(ctx) do
     ctx
@@ -146,13 +157,16 @@ defmodule FerricStore.Flow.QueryEngine do
   end
 
   defp validate_capability_manifest!(%{} = manifest) do
-    query_contract = Map.get(manifest, :query_contract)
+    request_contract = Map.get(manifest, :request_contract)
+    result_contract = Map.get(manifest, :result_contract)
     explain_contract = Map.get(manifest, :explain_contract)
     capabilities = Map.get(manifest, :capabilities)
     language_versions = Map.get(manifest, :language_versions)
     shapes = Map.get(manifest, :shapes)
 
-    if valid_optional_contract?(query_contract) and
+    if Map.keys(manifest) |> Enum.sort() == Enum.sort(@capability_manifest_keys) and
+         valid_request_contract?(request_contract) and
+         valid_optional_contract?(result_contract) and
          valid_optional_contract?(explain_contract) and
          valid_string_list?(capabilities) and
          valid_string_list?(language_versions) and
@@ -160,14 +174,16 @@ defmodule FerricStore.Flow.QueryEngine do
          Surface.supported_language_versions?(language_versions) and
          Surface.supported_shapes?(shapes) and
          coherent_capability_surface?(
-           query_contract,
+           request_contract,
+           result_contract,
            explain_contract,
            capabilities,
            language_versions,
            shapes
          ) do
       %{
-        query_contract: query_contract,
+        request_contract: request_contract,
+        result_contract: result_contract,
         explain_contract: explain_contract,
         capabilities: capabilities,
         language_versions: language_versions,
@@ -185,6 +201,9 @@ defmodule FerricStore.Flow.QueryEngine do
   defp valid_optional_contract?(nil), do: true
   defp valid_optional_contract?(value), do: valid_manifest_string?(value)
 
+  defp valid_request_contract?(nil), do: true
+  defp valid_request_contract?(value), do: value == Surface.request_contract()
+
   defp valid_string_list?(values) when is_list(values) and length(values) <= 32 do
     Enum.all?(values, &valid_manifest_string?/1) and length(Enum.uniq(values)) == length(values)
   end
@@ -194,18 +213,19 @@ defmodule FerricStore.Flow.QueryEngine do
   defp valid_manifest_string?(value),
     do: is_binary(value) and value != "" and byte_size(value) <= 128
 
-  defp coherent_capability_surface?(nil, nil, [], [], []), do: true
+  defp coherent_capability_surface?(nil, nil, nil, [], [], []), do: true
 
   defp coherent_capability_surface?(
-         query_contract,
+         request_contract,
+         result_contract,
          explain_contract,
-         _capabilities,
+         capabilities,
          language_versions,
          shapes
        ) do
-    is_binary(query_contract) and
+    is_binary(request_contract) and is_binary(result_contract) and
       (is_nil(explain_contract) or is_binary(explain_contract)) and
-      language_versions != [] and shapes != []
+      capabilities != [] and language_versions != [] and shapes != []
   end
 
   defp context_implementation(%{query_engine: implementation}) when is_atom(implementation),
@@ -217,6 +237,10 @@ defmodule FerricStore.Flow.QueryEngine do
   defp context_implementation(_ctx), do: @default_implementation
 
   defp normalize_result({:ok, _value} = result), do: result
+
+  defp normalize_result({:error, %Error{} = error} = result) do
+    if Error.valid?(error), do: result, else: {:error, :query_engine_failure}
+  end
 
   defp normalize_result({:error, reason} = result) when is_atom(reason) do
     if Error.known?(reason), do: result, else: {:error, :query_engine_failure}
@@ -231,7 +255,7 @@ defmodule FerricStore.Flow.QueryEngine.Default do
   @behaviour FerricStore.Flow.QueryEngine
 
   @impl true
-  def execute(ctx, request), do: Ferricstore.Flow.Query.Engine.execute(ctx, request)
+  def execute(ctx, request), do: Ferricstore.Flow.Query.PlannerEngine.execute(ctx, request)
 
   @impl true
   def capabilities, do: Ferricstore.Flow.Query.Surface.default_capability_manifest()

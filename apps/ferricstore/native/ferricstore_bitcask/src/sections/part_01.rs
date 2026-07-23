@@ -1,7 +1,7 @@
 
 use rustler::{Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term};
 use std::os::unix::fs::FileExt;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 /// A resource that owns a value buffer read from the Bitcask log.
 ///
@@ -38,8 +38,10 @@ mod atoms {
         fallback,
         compare_failed,
         range_entry_too_large,
+        prefix_merge_byte_budget_exceeded,
         batch_value_budget_exceeded,
         batch_key_budget_exceeded,
+        invalid_composite_entry,
     }
 }
 
@@ -69,6 +71,15 @@ type LmdbStoreCell = OnceLock<Result<Arc<LmdbStore>, String>>;
 static LMDB_STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<LmdbStoreCell>>>> =
     OnceLock::new();
 
+struct LmdbValidatedPath {
+    cache_key: String,
+    store: Weak<LmdbStore>,
+}
+
+static LMDB_VALIDATED_PATHS: OnceLock<
+    RwLock<std::collections::HashMap<String, LmdbValidatedPath>>,
+> = OnceLock::new();
+
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
     if let Err(error) = async_io::initialize() {
@@ -95,10 +106,9 @@ fn load(env: Env, _info: Term) -> bool {
 // triggers ~128KB of readahead on pages that will never be used (bloom bits,
 // CMS counters, Bitcask cold reads are all hash-indexed random access).
 //
-// FADV_DONTNEED: hints the kernel to evict the pages we just read. For
-// Bitcask cold reads, the value is promoted to ETS — the page cache copy
-// is never needed again. For prob reads, parallel stateless access means
-// no single reader benefits from caching. Saves page cache for hot data.
+// FADV_DONTNEED is reserved for explicit Bitcask record ranges after a cold
+// value is promoted to ETS. A zero length would mean "to end of file" on
+// Linux, so whole-file requests are ignored to preserve shared warm pages.
 //
 // On non-Linux (macOS), posix_fadvise is not available — these are no-ops.
 // ---------------------------------------------------------------------------
@@ -471,7 +481,7 @@ pub(crate) fn open_append_nofollow(
     let file = crate::path_open::open_file_nofollow(
         path,
         libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
-        0o666,
+        0o600,
     )?;
 
     #[cfg(not(unix))]
@@ -482,7 +492,7 @@ pub(crate) fn open_append_nofollow(
         options.open(path)?
     };
 
-    ensure_regular_file(&file, "append target")?;
+    ensure_private_storage_file(&file, "append target")?;
 
     Ok(file)
 }
@@ -495,9 +505,9 @@ pub(crate) fn open_rw_create_nofollow(
     let file = crate::path_open::open_file_nofollow(
         path,
         libc::O_RDWR | libc::O_CREAT,
-        0o666,
+        0o600,
     )?;
-    ensure_regular_file(&file, "random-access log target")?;
+    ensure_private_storage_file(&file, "random-access log target")?;
     Ok(file)
 }
 
@@ -527,7 +537,7 @@ pub fn create_truncate_nofollow(path: &std::path::Path) -> std::io::Result<std::
     let file = crate::path_open::open_file_nofollow(
         path,
         libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-        0o666,
+        0o600,
     )?;
 
     #[cfg(not(unix))]
@@ -538,8 +548,35 @@ pub fn create_truncate_nofollow(path: &std::path::Path) -> std::io::Result<std::
         options.open(path)?
     };
 
-    ensure_regular_file(&file, "truncate target")?;
+    ensure_private_storage_file(&file, "truncate target")?;
     Ok(file)
+}
+
+#[cfg(unix)]
+fn ensure_private_storage_file(file: &std::fs::File, description: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{description} is not a regular file"),
+        ));
+    }
+    if private_storage_mode_needs_repair(metadata.permissions().mode()) {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_storage_file(file: &std::fs::File, description: &str) -> std::io::Result<()> {
+    ensure_regular_file(file, description)
+}
+
+#[cfg(unix)]
+fn private_storage_mode_needs_repair(mode: u32) -> bool {
+    mode & 0o7777 != 0o600
 }
 
 #[cfg(not(unix))]
@@ -569,8 +606,12 @@ pub fn fadvise_random(_file: &std::fs::File) {}
 
 /// Hint the kernel to evict pages at [offset, offset+len] from page cache.
 #[cfg(target_os = "linux")]
+#[inline]
 pub fn fadvise_dontneed(file: &std::fs::File, offset: i64, len: i64) {
     use std::os::unix::io::AsRawFd;
+    let Some((offset, len)) = bounded_dontneed_range(offset, len) else {
+        return;
+    };
     unsafe {
         libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_DONTNEED);
     }
@@ -578,6 +619,11 @@ pub fn fadvise_dontneed(file: &std::fs::File, offset: i64, len: i64) {
 
 #[cfg(not(target_os = "linux"))]
 pub fn fadvise_dontneed(_file: &std::fs::File, _offset: i64, _len: i64) {}
+
+#[cfg(any(target_os = "linux", test))]
+fn bounded_dontneed_range(offset: i64, len: i64) -> Option<(i64, i64)> {
+    (offset >= 0 && len > 0).then_some((offset, len))
+}
 
 /// Fsync a directory so that filename-to-inode mappings (dir entries) are
 /// durable. Required after `File::create`, `rename`, `remove_file`, or

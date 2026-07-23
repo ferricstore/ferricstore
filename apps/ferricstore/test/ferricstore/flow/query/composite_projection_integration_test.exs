@@ -1,9 +1,9 @@
 defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
-  alias Ferricstore.Flow.Query.{CompositeIndex, IndexDefinition}
+  alias Ferricstore.Flow.Query.{CompositeCounter, CompositeIndex, IndexDefinition}
 
   defmodule Provider do
     @behaviour FerricStore.Flow.QueryIndexProvider
@@ -132,6 +132,86 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
              CompositeIndex.decode_entry_value(entry_blob)
   end
 
+  test "writer chunks never split one composite projection transaction" do
+    old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
+    old_interval = Application.get_env(:ferricstore, :flow_lmdb_flush_interval_ms)
+    old_chunk_ops = Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_ops)
+    old_chunk_pause = Application.get_env(:ferricstore, :flow_lmdb_flush_chunk_pause_ms)
+
+    Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_interval_ms, 60_000)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_chunk_ops, 1)
+    Application.put_env(:ferricstore, :flow_lmdb_flush_chunk_pause_ms, 20)
+
+    data_dir = tmp_data_dir()
+    instance_name = :"composite_atomic_writer_#{System.unique_integer([:positive])}"
+    state_key = Ferricstore.Flow.Keys.state_key("run-1", "tenant-a")
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "runs_by_state_updated",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:state, :asc}, {:updated_at_ms, :desc}],
+        count_prefixes: [2]
+      })
+
+    encoded = encoded_record("running", 1, 100)
+    record = Ferricstore.Flow.decode_record(encoded)
+    assert {:ok, [entry]} = CompositeIndex.entries(definition, record, state_key, 0)
+    assert {:ok, prefixes} = CompositeCounter.prefixes_for_keys([definition], [entry.key])
+    [{^definition, counter_prefix}] = MapSet.to_list(prefixes)
+    counter_key = CompositeCounter.key(definition, counter_prefix)
+
+    instance_ctx = %{
+      name: instance_name,
+      data_dir: data_dir,
+      shard_count: 1,
+      query_index_provider: Provider,
+      test_pid: self(),
+      definitions: [definition]
+    }
+
+    on_exit(fn ->
+      restore_env(:flow_lmdb_mode, old_mode)
+      restore_env(:flow_lmdb_flush_interval_ms, old_interval)
+      restore_env(:flow_lmdb_flush_chunk_ops, old_chunk_ops)
+      restore_env(:flow_lmdb_flush_chunk_pause_ms, old_chunk_pause)
+      File.rm_rf!(data_dir)
+    end)
+
+    File.mkdir_p!(Ferricstore.DataDir.shard_data_path(data_dir, 0))
+
+    assert {:ok, _pid} =
+             Ferricstore.Flow.LMDBWriter.start_link(
+               shard_index: 0,
+               data_dir: data_dir,
+               instance_ctx: instance_ctx
+             )
+
+    assert :ok =
+             Ferricstore.Flow.LMDBWriter.enqueue(instance_name, 0, [
+               {:project_flow_state, state_key, encoded, 0}
+             ])
+
+    path =
+      data_dir
+      |> Ferricstore.DataDir.shard_data_path(0)
+      |> LMDB.path()
+
+    parent = self()
+
+    spawn_link(fn ->
+      send(parent, {:composite_flush, Ferricstore.Flow.LMDBWriter.flush(instance_name, 0)})
+    end)
+
+    assert :ok =
+             await_flush_without_partial_projection(path, entry.key, counter_key, 5_000)
+
+    assert {:ok, _counter} = LMDB.get(path, counter_key)
+    expected_entry_value = entry.value
+    assert {:ok, ^expected_entry_value} = LMDB.get(path, entry.key)
+  end
+
   defp composite_key?(key) do
     String.starts_with?(key, IndexDefinition.global_storage_prefix()) or
       String.starts_with?(key, CompositeIndex.reverse_prefix())
@@ -186,4 +266,41 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
 
     path
   end
+
+  defp tmp_data_dir do
+    Path.join(
+      System.tmp_dir!(),
+      "ferricstore_composite_atomic_writer_#{System.unique_integer([:positive])}"
+    )
+  end
+
+  defp await_flush_without_partial_projection(path, entry_key, counter_key, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_flush_without_partial_projection(path, entry_key, counter_key, deadline)
+  end
+
+  defp do_await_flush_without_partial_projection(path, entry_key, counter_key, deadline) do
+    assert {:ok, [entry, counter]} = LMDB.get_many(path, [entry_key, counter_key])
+    entry? = match?({:ok, _value}, entry)
+    counter? = match?({:ok, _value}, counter)
+
+    assert entry? == counter?, "composite index entry and counter became partially visible"
+
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:composite_flush, result} ->
+        result
+    after
+      min(remaining_ms, 2) ->
+        if remaining_ms == 0 do
+          flunk("timed out waiting for composite LMDB flush")
+        else
+          do_await_flush_without_partial_projection(path, entry_key, counter_key, deadline)
+        end
+    end
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 end

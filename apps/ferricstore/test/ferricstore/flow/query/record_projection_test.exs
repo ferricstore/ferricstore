@@ -3,7 +3,7 @@ defmodule Ferricstore.Flow.Query.RecordProjectionTest do
 
   alias Ferricstore.Flow.Query.RecordProjection
 
-  test "projects only structural query fields" do
+  test "projects structural and bounded user metadata fields" do
     record = %{
       id: "run-1",
       type: "email",
@@ -26,7 +26,8 @@ defmodule Ferricstore.Flow.Query.RecordProjectionTest do
       retention_ttl_ms: 60_000,
       parent_partition_key: "secret-parent-partition",
       payload_ref: "secret-payload-ref",
-      attributes: %{"secret" => true},
+      attributes: %{"region" => "eu"},
+      state_meta: %{"review" => %{"ai.model" => "gpt-5"}},
       future_internal_field: "must-not-leak"
     }
 
@@ -49,7 +50,9 @@ defmodule Ferricstore.Flow.Query.RecordProjectionTest do
                :max_active_ms,
                :parent_flow_id,
                :root_flow_id,
-               :correlation_id
+               :correlation_id,
+               :attributes,
+               :state_meta
              ])
   end
 

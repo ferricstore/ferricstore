@@ -16,7 +16,12 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   @terminal_states ["completed", "failed", "cancelled"]
 
   def expand_ops(state, []) do
-    {:ok, [], Map.put(state, :terminal_atomic_write?, false)}
+    state =
+      state
+      |> Map.put(:terminal_atomic_write?, false)
+      |> Map.put(:write_group_sizes, [])
+
+    {:ok, [], state}
   end
 
   def expand_ops(state, ops) do
@@ -33,12 +38,16 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
         composite_projection_cache: CompositeProjection.new_cache(),
         pending_terminal_count_put_news: MapSet.new(),
         terminal_count_inits: state.terminal_count_inits,
-        terminal_atomic_write?: false
+        terminal_atomic_write?: false,
+        op_count: 0,
+        write_group_sizes: []
       }
 
       Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
+        before_count = acc.op_count
+
         case expand_op(expansion_state, op, acc) do
-          {:ok, acc} -> {:cont, {:ok, acc}}
+          {:ok, acc} -> {:cont, {:ok, record_write_group(acc, before_count)}}
           {:error, _reason} = error -> {:halt, error}
         end
       end)
@@ -47,13 +56,15 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
          %{
            ops: expanded,
            terminal_count_inits: terminal_count_inits,
-           terminal_atomic_write?: terminal_atomic_write?
+           terminal_atomic_write?: terminal_atomic_write?,
+           write_group_sizes: reversed_group_sizes
          }} ->
           state =
             expansion_state
             |> Map.delete(:query_index_definitions)
             |> Map.put(:terminal_count_inits, terminal_count_inits)
             |> Map.put(:terminal_atomic_write?, terminal_atomic_write?)
+            |> Map.put(:write_group_sizes, Enum.reverse(reversed_group_sizes))
 
           {:ok, Enum.reverse(expanded), state}
 
@@ -1155,7 +1166,21 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  def prepend_ops(acc, ops), do: %{acc | ops: :lists.reverse(ops, acc.ops)}
+  def prepend_ops(acc, ops) do
+    acc = %{acc | ops: :lists.reverse(ops, acc.ops)}
+
+    case acc do
+      %{op_count: count} -> %{acc | op_count: count + length(ops)}
+      _without_count -> acc
+    end
+  end
+
+  defp record_write_group(%{op_count: after_count} = acc, before_count)
+       when after_count > before_count do
+    %{acc | write_group_sizes: [after_count - before_count | acc.write_group_sizes]}
+  end
+
+  defp record_write_group(acc, _before_count), do: acc
 
   def history_project_from_index_entries(nil, _flow_lookup, _history_key), do: []
   def history_project_from_index_entries(_flow_index, nil, _history_key), do: []

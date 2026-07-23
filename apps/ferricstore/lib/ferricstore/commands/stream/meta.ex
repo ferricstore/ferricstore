@@ -120,6 +120,13 @@ defmodule Ferricstore.Commands.Stream.Meta do
     end
   end
 
+  @doc false
+  @spec empty_entry_bytes(binary()) :: pos_integer()
+  def empty_entry_bytes(key) when is_binary(key) do
+    encoded = TermCodec.encode({:stream_meta, 0, "0-0", "0-0", 0, 0})
+    byte_size(CompoundKey.stream_meta_key(key)) + byte_size(encoded)
+  end
+
   @spec cleanup_local(binary()) :: true
   def cleanup_local(stream_key), do: cleanup_local(stream_key, nil)
 

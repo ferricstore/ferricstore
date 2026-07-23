@@ -1003,7 +1003,7 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp dispatch_native_session_payload(frame, payload, state) do
-    case Session.prepare_command(payload) do
+    case Session.prepare_authorized(payload, state) do
       {:ok, prepared} ->
         cond do
           state.multi_state == :queuing ->
@@ -1039,6 +1039,9 @@ defmodule FerricstoreServer.Native.Connection do
           true ->
             {:reply, :bad_request, "ERR native command is not a session command", state}
         end
+
+      {:error, status, reason} ->
+        {:reply, status, reason, state}
 
       {:error, reason} ->
         {:reply, :bad_request, reason, state}

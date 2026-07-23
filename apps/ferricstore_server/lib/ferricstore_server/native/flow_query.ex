@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Native.FlowQuery do
   @moduledoc false
 
   alias Ferricstore.Flow.Query
-  alias Ferricstore.Flow.Query.{Binder, Request}
+  alias Ferricstore.Flow.Query.{Binder, Error, Request}
   alias FerricstoreServer.Native.FQLParser
 
   @spec execute(FerricStore.Instance.t() | map(), binary(), binary(), map()) ::
@@ -13,12 +13,15 @@ defmodule FerricstoreServer.Native.FlowQuery do
     end
   end
 
-  @spec prepare(binary(), binary(), map()) :: {:ok, Request.t()} | {:error, atom()}
+  @spec prepare(binary(), binary(), map()) :: {:ok, Request.t()} | {:error, Error.t()}
   def prepare(version, query, params) do
     with :ok <- Query.validate_version(version),
-         {:ok, request} <- FQLParser.parse(query),
+         {:ok, request} <- FQLParser.parse_diagnostic(query),
          {:ok, bound} <- Binder.bind(request, params) do
       {:ok, bound}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} when is_atom(reason) -> {:error, Error.new(reason)}
     end
   end
 

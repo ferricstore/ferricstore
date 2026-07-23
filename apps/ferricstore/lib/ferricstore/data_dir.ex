@@ -95,11 +95,29 @@ defmodule Ferricstore.DataDir do
   defp maybe_create_dir(created_dirs, path, phase) do
     created? = not Ferricstore.FS.dir?(path)
     Ferricstore.FS.mkdir_p!(path)
+    permissions_changed? = ensure_private_directory!(path)
 
-    if created? do
+    if created? or permissions_changed? do
       [{phase, path} | created_dirs]
     else
       created_dirs
+    end
+  end
+
+  defp ensure_private_directory!(path) do
+    case :os.type() do
+      {:unix, _} ->
+        %{mode: mode} = File.stat!(path)
+
+        if Bitwise.band(mode, 0o777) == 0o700 do
+          false
+        else
+          File.chmod!(path, 0o700)
+          true
+        end
+
+      _other ->
+        false
     end
   end
 

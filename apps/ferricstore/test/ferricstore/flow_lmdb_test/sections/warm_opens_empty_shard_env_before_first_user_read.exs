@@ -243,7 +243,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
                    10_000
                  )
 
-        assert {:ok, [{^first_key, ^first_value}]} =
+        assert {:error, :range_entry_too_large} =
                  Ferricstore.Flow.LMDB.prefix_entries_after_bounded(
                    path,
                    prefix,

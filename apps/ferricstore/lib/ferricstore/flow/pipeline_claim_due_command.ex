@@ -186,7 +186,8 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommand do
       value when is_integer(value) and value > @max_exact_ms ->
         {:error, "ERR flow #{key} exceeds maximum #{@max_exact_ms}"}
 
-      _ -> {:error, "ERR flow #{key} must be a positive integer"}
+      _ ->
+        {:error, "ERR flow #{key} must be a positive integer"}
     end
   end
 

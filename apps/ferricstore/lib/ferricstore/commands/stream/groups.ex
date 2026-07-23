@@ -7,6 +7,8 @@ defmodule Ferricstore.Commands.Stream.Groups do
 
   @groups_table Ferricstore.Stream.Groups
   @group_locks_table Ferricstore.Stream.GroupLocks
+  @max_stream_id "18446744073709551615-18446744073709551615"
+  @max_u64 18_446_744_073_709_551_615
 
   @spec lookup(map(), binary(), binary()) ::
           :missing | {:ok, binary(), map(), map()} | {:error, binary()}
@@ -42,6 +44,31 @@ defmodule Ferricstore.Commands.Stream.Groups do
       cache(store, key, group, last_delivered, consumers, pending)
       :ok
     end
+  end
+
+  @doc false
+  @spec pending_growth_bound(binary(), non_neg_integer()) :: non_neg_integer()
+  def pending_growth_bound(consumer, count)
+      when is_binary(consumer) and is_integer(count) and count >= 0 do
+    empty_map_size = :erlang.external_size(%{})
+
+    consumer_entry_size =
+      :erlang.external_size(%{consumer => @max_u64}) - empty_map_size
+
+    pending_entry_size =
+      :erlang.external_size(%{@max_stream_id => {consumer, @max_u64}}) - empty_map_size
+
+    byte_size(@max_stream_id) + consumer_entry_size + count * pending_entry_size
+  end
+
+  @doc false
+  @spec initial_entry_bytes(binary(), binary(), binary()) :: pos_integer()
+  def initial_entry_bytes(stream_key, group, last_delivered)
+      when is_binary(stream_key) and is_binary(group) and group != "" and
+             is_binary(last_delivered) and last_delivered != "" do
+    key = group_key(stream_key, group)
+    value = encode_state(last_delivered, %{}, %{})
+    byte_size(key) + byte_size(value)
   end
 
   @spec count(binary(), map()) :: non_neg_integer() | ReadResult.failure()

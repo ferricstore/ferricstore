@@ -454,8 +454,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     }
 
     CommandTime.with_now_ms(20, fn ->
-      assert {:error,
-              {:storage_read_failed, {:compound_count_failed, :limit_exceeded}}} =
+      assert {:error, {:storage_read_failed, {:compound_count_failed, :limit_exceeded}}} =
                ShardETS.prefix_count_entries(state, prefix)
 
       assert 0 = ShardETS.prefix_count_entries(state, prefix)
@@ -644,6 +643,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     assert :ok = CompoundMemberIndex.rebuild(index, keydir)
 
     assert {:ok, [^valid_key]} = CompoundMemberIndex.keys_for_prefix(index, prefix)
+
     assert {:ok, 1, 0} =
              CompoundMemberIndex.count_live_indexed(index, %{keydir: keydir}, prefix, 0)
   end

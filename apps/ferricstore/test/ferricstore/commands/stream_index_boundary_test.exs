@@ -18,6 +18,23 @@ defmodule Ferricstore.Commands.StreamIndexBoundaryTest do
     assert {^id, ^id} = Index.first_last(key)
   end
 
+  test "count_after is exclusive, bounded, and allocation-free" do
+    Tables.ensure_all()
+    key = "stream-count-after-#{System.unique_integer([:positive])}"
+    on_exit(fn -> Index.clear(key) end)
+
+    Enum.each(1..5, fn sequence ->
+      Index.insert_entry(key, "1-#{sequence}", "compound-#{sequence}")
+    end)
+
+    Index.mark_ready(key)
+
+    assert 0 == Index.count_after(key, {1, 5}, :infinity, nil)
+    assert 3 == Index.count_after(key, {1, 2}, :infinity, nil)
+    assert 2 == Index.count_after(key, {1, 2}, 2, nil)
+    assert 0 == Index.count_after(key, {1, 2}, 0, nil)
+  end
+
   test "index rebuild fails closed on a corrupt persisted stream ID" do
     Tables.ensure_all()
     key = "stream-corrupt-#{System.unique_integer([:positive])}"

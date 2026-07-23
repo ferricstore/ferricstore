@@ -9,9 +9,13 @@ defmodule Ferricstore.Commands.Extension do
   Providers declare command metadata with `commands/0` and execute commands
   with `handle/3`. The core dispatcher uses this metadata for routing and key
   ACL extraction, while leaving command semantics in the provider module.
+  `access` describes the command's key footprint. `acl_categories` independently
+  controls category grants and defaults to `READ` or `WRITE` for the matching
+  access mode.
   """
 
   @type access :: :read | :write | :rw
+  @type acl_category :: atom() | binary()
 
   @type prepared :: %{
           ast: {:extension_command, module(), binary(), [binary()], access()},
@@ -26,6 +30,7 @@ defmodule Ferricstore.Commands.Extension do
           optional(:last_key) => integer(),
           optional(:step) => integer(),
           optional(:access) => access(),
+          optional(:acl_categories) => [acl_category()],
           optional(:summary) => binary()
         }
 
@@ -35,6 +40,18 @@ defmodule Ferricstore.Commands.Extension do
   @optional_callbacks keys: 2
 
   alias Ferricstore.Commands.Catalog.Entries
+
+  @retired_command_names ~w(
+    FLOW.LIST
+    FLOW.SEARCH
+    FLOW.TERMINALS
+    FLOW.FAILURES
+    FLOW.STUCK
+    FLOW.BY_PARENT
+    FLOW.BY_ROOT
+    FLOW.BY_CORRELATION
+  )
+  @core_modules [Ferricstore.Flow.Query.Commands]
 
   @default_entry %{
     arity: -1,
@@ -46,9 +63,14 @@ defmodule Ferricstore.Commands.Extension do
     summary: "Extension command."
   }
 
-  @doc "Returns configured provider modules."
+  @doc "Returns intrinsic OSS and configured provider modules."
   @spec modules() :: [module()]
   def modules do
+    (@core_modules ++ configured_modules())
+    |> Enum.uniq()
+  end
+
+  defp configured_modules do
     case Application.get_env(:ferricstore, :command_extensions, []) do
       nil -> []
       module when is_atom(module) -> [module]
@@ -83,6 +105,17 @@ defmodule Ferricstore.Commands.Extension do
   @spec non_shadowing_command_names_upper() :: MapSet.t(binary())
   def non_shadowing_command_names_upper do
     non_shadowing_commands()
+    |> Enum.map(&String.upcase(&1.name))
+    |> MapSet.new()
+  end
+
+  @doc "Returns non-shadowing command names assigned to an ACL category."
+  @spec non_shadowing_command_names_in_acl_category(binary()) :: MapSet.t(binary())
+  def non_shadowing_command_names_in_acl_category(category) when is_binary(category) do
+    category = String.upcase(category)
+
+    non_shadowing_commands()
+    |> Enum.filter(&(category in &1.acl_categories))
     |> Enum.map(&String.upcase(&1.name))
     |> MapSet.new()
   end
@@ -223,20 +256,28 @@ defmodule Ferricstore.Commands.Extension do
     case entry_value(entry, :name) do
       name when is_binary(name) and name != "" ->
         upper = String.upcase(name)
-        flags = normalize_flags(entry_value(entry, :flags, @default_entry.flags))
 
-        [
-          %{
-            name: String.downcase(upper),
-            arity: normalize_int(entry_value(entry, :arity, @default_entry.arity)),
-            flags: flags,
-            first_key: normalize_int(entry_value(entry, :first_key, @default_entry.first_key)),
-            last_key: normalize_int(entry_value(entry, :last_key, @default_entry.last_key)),
-            step: normalize_int(entry_value(entry, :step, @default_entry.step)),
-            access: normalize_access(entry_value(entry, :access), flags),
-            summary: normalize_summary(entry_value(entry, :summary, @default_entry.summary))
-          }
-        ]
+        if upper in @retired_command_names do
+          []
+        else
+          flags = normalize_flags(entry_value(entry, :flags, @default_entry.flags))
+          access = normalize_access(entry_value(entry, :access), flags)
+
+          [
+            %{
+              name: String.downcase(upper),
+              arity: normalize_int(entry_value(entry, :arity, @default_entry.arity)),
+              flags: flags,
+              first_key: normalize_int(entry_value(entry, :first_key, @default_entry.first_key)),
+              last_key: normalize_int(entry_value(entry, :last_key, @default_entry.last_key)),
+              step: normalize_int(entry_value(entry, :step, @default_entry.step)),
+              access: access,
+              acl_categories:
+                normalize_acl_categories(entry_value(entry, :acl_categories), access),
+              summary: normalize_summary(entry_value(entry, :summary, @default_entry.summary))
+            }
+          ]
+        end
 
       _other ->
         []
@@ -272,6 +313,22 @@ defmodule Ferricstore.Commands.Extension do
       true -> :rw
     end
   end
+
+  defp normalize_acl_categories(nil, :read), do: ["READ"]
+  defp normalize_acl_categories(nil, :write), do: ["WRITE"]
+  defp normalize_acl_categories(nil, :rw), do: []
+
+  defp normalize_acl_categories(categories, _access) when is_list(categories) do
+    categories
+    |> Enum.flat_map(fn
+      category when is_atom(category) -> [category |> Atom.to_string() |> String.upcase()]
+      category when is_binary(category) and category != "" -> [String.upcase(category)]
+      _invalid -> []
+    end)
+    |> Enum.uniq()
+  end
+
+  defp normalize_acl_categories(_invalid, access), do: normalize_acl_categories(nil, access)
 
   defp normalize_summary(summary) when is_binary(summary), do: summary
   defp normalize_summary(_summary), do: @default_entry.summary

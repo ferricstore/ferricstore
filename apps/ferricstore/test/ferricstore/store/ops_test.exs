@@ -10,6 +10,7 @@ defmodule Ferricstore.Store.OpsTest do
   alias Ferricstore.Store.LocalTxStore
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.Router
+  alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Bitcask.NIF
 
   @ops_path Path.expand("../../../lib/ferricstore/store/ops.ex", __DIR__)
@@ -908,6 +909,42 @@ defmodule Ferricstore.Store.OpsTest do
         end
       after
         :telemetry.detach(handler_id)
+      end
+    end
+  end
+
+  describe "LocalTxStore bounded compound reads" do
+    test "slice does not materialize rows outside the requested list window" do
+      ctx = FerricStore.Instance.get(:default)
+      redis_key = "ops:local_tx:slice:#{System.unique_integer([:positive])}"
+      shard_index = Router.shard_for(ctx, redis_key)
+      prefix = CompoundKey.list_prefix(redis_key)
+      keydir = :ets.new(:local_tx_slice_keydir, [:set, :public])
+      index = :ets.new(:local_tx_slice_index, [:ordered_set, :public])
+      CompoundMemberIndex.reset(index)
+
+      try do
+        Enum.each(0..2, fn position ->
+          compound_key = CompoundKey.list_element(redis_key, position)
+
+          row =
+            if position < 2,
+              do: {compound_key, "value-#{position}", 0, 0, 0, 0, 7},
+              else: {compound_key, nil, 0, 0, :invalid, 0, 1}
+
+          :ets.insert(keydir, row)
+          CompoundMemberIndex.put(index, compound_key)
+        end)
+
+        tx =
+          local_tx(ctx, shard_index, keydir, %{})
+          |> put_in([Access.key(:shard_state), :compound_member_index], index)
+
+        assert [{_first, "value-0"}, {_second, "value-1"}] =
+                 Ops.compound_scan_slice(tx, redis_key, prefix, 0, 2, 3)
+      after
+        :ets.delete(index)
+        :ets.delete(keydir)
       end
     end
   end

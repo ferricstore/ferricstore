@@ -902,6 +902,28 @@ defmodule Ferricstore.Store.Router.Part06 do
       end
 
       @doc false
+      def flow_create_with_catalog(ctx, %{id: id} = attrs, catalog)
+          when is_binary(id) and is_map(catalog) do
+        partition_key =
+          Map.get(attrs, :partition_key) || Ferricstore.Flow.Keys.auto_partition_key(id)
+
+        attrs = Map.put(attrs, :partition_key, partition_key)
+        key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+        cond do
+          byte_size(key) > @max_key_size ->
+            {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+
+          flow_create_admission_rejected?(ctx, key) ->
+            flow_create_overloaded_error()
+
+          true ->
+            idx = shard_for(ctx, key)
+            raft_write(ctx, idx, key, {:flow_create_with_catalog, key, catalog, attrs})
+        end
+      end
+
+      @doc false
       def flow_named_value_put(ctx, %{id: id} = attrs) when is_binary(id) do
         key = Ferricstore.Flow.Keys.state_key(id, Map.get(attrs, :partition_key))
 

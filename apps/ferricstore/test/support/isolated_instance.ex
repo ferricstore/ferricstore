@@ -69,6 +69,7 @@ defmodule Ferricstore.Test.IsolatedInstance do
     # Ensure data dir layout (ETS tables created by Shard.init)
     Ferricstore.DataDir.ensure_layout!(tmp_dir, shard_count)
     :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(tmp_dir, shard_count)
+    start_query_services(ctx)
 
     for i <- 0..(shard_count - 1) do
       {:ok, _pid} =
@@ -152,6 +153,7 @@ defmodule Ferricstore.Test.IsolatedInstance do
     end
 
     Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+    stop_query_services(ctx)
 
     for i <- 0..(ctx.shard_count - 1) do
       _ = Ferricstore.Flow.HistoryProjector.flush(ctx, i, 5_000)
@@ -223,4 +225,22 @@ defmodule Ferricstore.Test.IsolatedInstance do
 
     :ok
   end
+
+  defp start_query_services(%{query_index_provider: Ferricstore.Flow.Query.IndexProvider} = ctx) do
+    {:ok, _pid} = Ferricstore.Flow.Query.IndexSupervisor.start_link(instance_ctx: ctx)
+    :ok
+  end
+
+  defp start_query_services(_ctx), do: :ok
+
+  defp stop_query_services(%{query_index_provider: Ferricstore.Flow.Query.IndexProvider} = ctx) do
+    case Process.whereis(Ferricstore.Flow.Query.IndexSupervisor.supervisor_name(ctx)) do
+      nil -> :ok
+      pid -> Supervisor.stop(pid, :normal, 5_000)
+    end
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp stop_query_services(_ctx), do: :ok
 end

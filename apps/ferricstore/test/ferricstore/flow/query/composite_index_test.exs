@@ -40,12 +40,74 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
     assert value.expire_at_ms == 5_000
     assert CompositeIndex.entry_key_matches_record?(definition, record, state_key, entry.key)
 
+    assert CompositeIndex.entry_key_matches_record_validated?(
+             definition,
+             record,
+             state_key,
+             entry.key
+           )
+
+    assert {:ok, matcher} =
+             CompositeIndex.prepare_record_matcher_validated(
+               definition,
+               nil,
+               "tenant-secret"
+             )
+
+    assert CompositeIndex.entry_key_matches_record_validated?(matcher, record, entry.key)
+
     refute CompositeIndex.entry_key_matches_record?(
              definition,
              record("run-1", "tenant-secret", 99),
              state_key,
              entry.key
            )
+
+    refute CompositeIndex.entry_key_matches_record_validated?(
+             definition,
+             record("run-1", "tenant-secret", 99),
+             state_key,
+             entry.key
+           )
+
+    refute CompositeIndex.entry_key_matches_record_validated?(
+             matcher,
+             record("run-1", "tenant-secret", 99),
+             entry.key
+           )
+  end
+
+  test "entry values use the bounded compact codec and reject the pre-beta ETF shape", %{
+    definition: definition
+  } do
+    state_key = Keys.state_key("run-1", "tenant-a")
+
+    assert {:ok, [entry]} =
+             CompositeIndex.entries(
+               definition,
+               record("run-1", "tenant-a", 100),
+               state_key,
+               5_000
+             )
+
+    assert entry.value ==
+             <<1, 5::unsigned-big-32, 3::unsigned-big-64, 5_000::unsigned-big-64, "run-1",
+               state_key::binary>>
+
+    old_etf =
+      TermCodec.encode({:flow_composite_entry, 1, "run-1", state_key, 3, 5_000})
+
+    assert :error = CompositeIndex.decode_entry_value(old_etf)
+
+    for invalid <- [
+          <<1>>,
+          <<1, 0::unsigned-big-32, 3::unsigned-big-64, 0::unsigned-big-64, state_key::binary>>,
+          <<1, 5::unsigned-big-32, 3::unsigned-big-64, 0::unsigned-big-64, "run-1">>,
+          <<2, 5::unsigned-big-32, 3::unsigned-big-64, 0::unsigned-big-64, "run-1",
+            state_key::binary>>
+        ] do
+      assert :error = CompositeIndex.decode_entry_value(invalid)
+    end
   end
 
   test "shared layout derives its hidden prefix from sealed metadata, not index values", %{
@@ -404,13 +466,16 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
 
     keys = Enum.map(entries, & &1.key)
     reverse_key = CompositeIndex.reverse_key(state_key)
-    reverse_value = CompositeIndex.encode_reverse_value(state_key, keys)
+    reverse_value = CompositeIndex.encode_reverse_value(state_key, keys, 5_000)
     other_state_key = Keys.state_key("run-2", "tenant-a")
 
     assert byte_size(reverse_key) == byte_size(CompositeIndex.reverse_key(other_state_key))
     assert {:ok, ^keys} = CompositeIndex.decode_reverse_value(reverse_value, state_key)
 
-    assert {:ok, {^state_key, ^keys}} =
+    assert {:ok, %{keys: ^keys, expire_at_ms: 5_000}} =
+             CompositeIndex.decode_reverse_state(reverse_value, state_key)
+
+    assert {:ok, {^state_key, ^keys, 5_000}} =
              CompositeIndex.decode_reverse_row(reverse_key, reverse_value)
 
     assert :error =

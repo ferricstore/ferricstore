@@ -154,16 +154,11 @@ defmodule Ferricstore.Commands.Flow do
     Ferricstore.Flow.rewind(flow_ctx(store), id, opts) |> normalize_result()
   end
 
-  def handle_ast({:flow_list, type, opts}, store) when is_binary(type) and is_list(opts) do
-    Ferricstore.Flow.list(flow_ctx(store), type, opts) |> normalize_result()
-  end
-
-  def handle_ast({:flow_search, opts}, store) when is_list(opts) do
-    Ferricstore.Flow.search(flow_ctx(store), opts) |> normalize_result()
-  end
-
   def handle_ast({:flow_query, %Ferricstore.Flow.Query.Request{} = request}, store) do
     case Ferricstore.Flow.Query.execute(flow_ctx(store), request) do
+      {:error, %Ferricstore.Flow.Query.Error{} = error} ->
+        {:error, Ferricstore.Flow.Query.Error.format(error)}
+
       {:error, reason} when is_atom(reason) ->
         {:error, Ferricstore.Flow.Query.error_message(reason)}
 
@@ -187,37 +182,8 @@ defmodule Ferricstore.Commands.Flow do
     Ferricstore.Flow.stats(flow_ctx(store), type, opts) |> normalize_result()
   end
 
-  def handle_ast({:flow_terminals, type, opts}, store)
-      when is_binary(type) and is_list(opts) do
-    Ferricstore.Flow.terminals(flow_ctx(store), type, opts) |> normalize_result()
-  end
-
-  def handle_ast({:flow_failures, type, opts}, store) when is_binary(type) and is_list(opts) do
-    Ferricstore.Flow.failures(flow_ctx(store), type, opts) |> normalize_result()
-  end
-
-  def handle_ast({:flow_by_parent, parent_flow_id, opts}, store)
-      when is_binary(parent_flow_id) and is_list(opts) do
-    Ferricstore.Flow.by_parent(flow_ctx(store), parent_flow_id, opts) |> normalize_result()
-  end
-
-  def handle_ast({:flow_by_root, root_flow_id, opts}, store)
-      when is_binary(root_flow_id) and is_list(opts) do
-    Ferricstore.Flow.by_root(flow_ctx(store), root_flow_id, opts) |> normalize_result()
-  end
-
-  def handle_ast({:flow_by_correlation, correlation_id, opts}, store)
-      when is_binary(correlation_id) and is_list(opts) do
-    Ferricstore.Flow.by_correlation(flow_ctx(store), correlation_id, opts)
-    |> normalize_result()
-  end
-
   def handle_ast({:flow_info, type, opts}, store) when is_binary(type) and is_list(opts) do
     Ferricstore.Flow.info(flow_ctx(store), type, opts) |> normalize_result()
-  end
-
-  def handle_ast({:flow_stuck, type, opts}, store) when is_binary(type) and is_list(opts) do
-    Ferricstore.Flow.stuck(flow_ctx(store), type, opts) |> normalize_result()
   end
 
   def handle_ast({:flow_history, id, opts}, store) when is_binary(id) and is_list(opts) do
@@ -248,6 +214,7 @@ defmodule Ferricstore.Commands.Flow do
   defp normalize_value({event_id, fields}) when is_binary(event_id),
     do: [event_id, normalize_map(fields)]
 
+  defp normalize_value(value) when is_list(value), do: Enum.map(value, &normalize_value/1)
   defp normalize_value(value) when is_map(value), do: normalize_map(value)
   defp normalize_value(value), do: value
 

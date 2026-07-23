@@ -12,6 +12,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
   alias Ferricstore.Store.Router
 
   @partition "policy-migration-partition"
+  @staging_root <<0, "fpcw:1:">>
 
   defmodule EmbeddedPolicyMigration do
     use FerricStore, shard_count: 1
@@ -919,7 +920,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     GenServer.stop(pid)
   end
 
-  test "catalog pagination requires a final proof after exact-full and byte-truncated pages" do
+  test "catalog pagination enforces raw and hydrated byte bounds before final proof" do
     ctx = FerricStore.Instance.get(:default)
     shard_index = 0
     type = unique_flow_id("bounded-page")
@@ -934,8 +935,15 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     :ok = LMDB.write_batch(lmdb_path, Enum.map(keys, &{:put, &1, <<1>>}))
     on_exit(fn -> LMDB.write_batch(lmdb_path, Enum.map(keys, &{:delete, &1})) end)
 
-    assert {:ok, %{entries: [_], done?: false}} =
+    assert {:error, :range_entry_too_large} =
              PolicyMigration.catalog_page(ctx, shard_index, type, 1, 2, 1)
+
+    raw_row_bytes = keys |> Enum.min() |> byte_size() |> Kernel.+(1)
+
+    assert {:error, {:policy_migration_entry_too_large, hydrated_entry_bytes, ^raw_row_bytes}} =
+             PolicyMigration.catalog_page(ctx, shard_index, type, 1, 2, raw_row_bytes)
+
+    assert hydrated_entry_bytes > raw_row_bytes
 
     assert {:ok, %{entries: [_, _], done?: false}} =
              PolicyMigration.catalog_page(ctx, shard_index, type, 1, 2, 1_024 * 1_024)
@@ -980,6 +988,24 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
 
     run_token = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
     :ok = PolicyMigration.snapshot_primary_keydir(ctx, shard_index, run_token, 10, 1_024)
+
+    staging_prefix = @staging_root <> run_token <> <<0>>
+
+    assert {:ok, [{stage_key, stage_value} | _]} =
+             LMDB.prefix_entries(lmdb_path, staging_prefix, 1)
+
+    raw_row_bytes = byte_size(stage_key) + byte_size(stage_value)
+
+    assert {:error, {:policy_migration_entry_too_large, candidate_bytes, ^raw_row_bytes}} =
+             PolicyMigration.backfill_page(
+               ctx,
+               shard_index,
+               PolicyMigration.work_cursor(run_token),
+               10,
+               raw_row_bytes
+             )
+
+    assert candidate_bytes > raw_row_bytes
 
     candidates = staged_backfill_candidates(ctx, shard_index, run_token, [], 100)
     assert Enum.any?(candidates, &match?(%{kind: :state, state_key: ^state_key}, &1))
@@ -1170,8 +1196,10 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
              )
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, shard_index, 30_000)
+
     assert {:ok, {:put, source_catalog_key, ^state_key}} =
              SourceCatalog.put_op(catalog_key, state_key)
+
     assert {:ok, ^state_key} = LMDB.get(flow_lmdb_path(ctx, shard_index), source_catalog_key)
 
     assert {:ok, [claim]} =

@@ -14,8 +14,7 @@ defmodule Ferricstore.Commands.NativeAstParserContractTest do
                {tag, "collection", 0, [match: "field:*", count: 25]}
 
       assert ast(command, ["collection", "0", "COUNT", "10001"]) ==
-               {tag, "collection", 0,
-                {:error, "ERR value is not an integer or out of range"}}
+               {tag, "collection", 0, {:error, "ERR value is not an integer or out of range"}}
 
       assert ast(command, ["collection", "0", "TYPE", "hash"]) ==
                {tag, "collection", 0, {:error, "ERR syntax error"}}
@@ -123,8 +122,8 @@ defmodule Ferricstore.Commands.NativeAstParserContractTest do
            ]) ==
              {:flow_signal, "flow-1", drop_values: ["temporary"], values: [{"result", "ok"}]}
 
-    assert ast("FLOW.SEARCH", ["attribute", "tenant", "acme"]) ==
-             {:flow_search, attributes: %{"tenant" => "acme"}}
+    assert ast("FLOW.QUERY", ["FQL1", "FROM runs WHERE type = @type", "type", "checkout"]) ==
+             {:flow_query, "FQL1", "FROM runs WHERE type = @type", %{"type" => "checkout"}}
 
     assert ast("FLOW.CLAIM_DUE", [
              "job",
@@ -135,8 +134,7 @@ defmodule Ferricstore.Commands.NativeAstParserContractTest do
              "tenant-a",
              "tenant-b"
            ]) ==
-             {:flow_claim_due, "job",
-              [full: false, partition_keys: ["tenant-a", "tenant-b"]]}
+             {:flow_claim_due, "job", [full: false, partition_keys: ["tenant-a", "tenant-b"]]}
 
     assert ast("FLOW.CLAIM_DUE", ["job", "partitions", "2", "tenant-a"]) ==
              {:flow_claim_due, "job", {:error, "ERR flow partition_keys count mismatch"}}
@@ -157,7 +155,7 @@ defmodule Ferricstore.Commands.NativeAstParserContractTest do
              "payload"
            ]) ==
              {:flow_spawn_children, "parent",
-             [{"child", [partition_key: "tenant", type: "job", payload: "payload"]}], []}
+              [{"child", [partition_key: "tenant", type: "job", payload: "payload"]}], []}
   end
 
   test "repeated Flow list options preserve order without append-based quadratic accumulation" do

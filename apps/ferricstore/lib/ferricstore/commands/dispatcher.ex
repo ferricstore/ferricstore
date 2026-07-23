@@ -511,7 +511,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _args} = ast, store)
-      when tag in ~w(flow_create flow_value_put flow_signal flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_list flow_search flow_query flow_attributes flow_terminals flow_failures flow_info flow_stuck flow_history flow_retention_cleanup)a,
+      when tag in ~w(flow_create flow_value_put flow_signal flow_get flow_claim_due flow_reclaim flow_complete flow_transition flow_retry flow_fail flow_cancel flow_rewind flow_query flow_attributes flow_info flow_history flow_retention_cleanup)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
@@ -519,7 +519,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Native.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(flow_create flow_value_put flow_signal flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_list flow_attributes flow_stats flow_terminals flow_failures flow_by_parent flow_by_root flow_by_correlation flow_info flow_stuck flow_history flow_create_many flow_complete_many flow_retry_many flow_fail_many flow_cancel_many)a,
+      when tag in ~w(flow_create flow_value_put flow_signal flow_get flow_policy_set flow_policy_get flow_claim_due flow_reclaim flow_cancel flow_rewind flow_attributes flow_stats flow_info flow_history flow_create_many flow_complete_many flow_retry_many flow_fail_many flow_cancel_many)a,
       do: Flow.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
@@ -807,16 +807,9 @@ defmodule Ferricstore.Commands.Dispatcher do
     result =
       case authorize_public_keys(prepared.command, prepared.acl_keys) do
         :ok ->
-          case check_raw_resource_limits(
-                 prepared.command,
-                 prepared_resource_limit_args(prepared),
-                 prepared.acl_keys,
-                 store
-               ) do
-            :ok ->
-              result = executor.()
-              record_raw_activity(result, prepared.command, prepared.acl_keys, store)
-              result
+          case acquire_raw_resource_lease(prepared, store) do
+            {:ok, lease} ->
+              execute_with_resource_lease(lease, prepared, store, executor)
 
             {:error, reason} ->
               {:error, FerricStore.ResourceLimits.error_message(reason)}
@@ -855,12 +848,16 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   defp authorize_public_keys(cmd, keys), do: InternalKey.authorize_command(cmd, keys)
 
-  defp record_raw_activity({:error, _reason}, _cmd, _keys, _store), do: :ok
-  defp record_raw_activity(_result, _cmd, [], _store), do: :ok
+  defp record_raw_activity({:error, _reason}, _cmd, _keys, _write_keys, _store), do: :ok
+  defp record_raw_activity(_result, _cmd, [], _write_keys, _store), do: :ok
 
-  defp record_raw_activity(_result, cmd, keys, store) do
+  defp record_raw_activity(_result, cmd, keys, write_keys, store) do
     if data_plane_activity_command?(cmd) do
-      FerricStore.ResourceLimits.record_activity(keys, store: store)
+      FerricStore.ResourceLimits.record_activity(keys,
+        store: store,
+        command_checked: true,
+        write_keys: write_keys
+      )
     else
       :ok
     end
@@ -873,13 +870,48 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp prepared_resource_limit_args(%PreparedCommand{command: "FLOW.QUERY"}), do: []
   defp prepared_resource_limit_args(%PreparedCommand{args: args}), do: args
 
-  defp check_raw_resource_limits(_cmd, _args, [], _store), do: :ok
+  defp execute_with_resource_lease(lease, prepared, store, executor) do
+    try do
+      result = executor.()
 
-  defp check_raw_resource_limits(cmd, args, keys, store) do
-    if data_plane_activity_command?(cmd) do
-      FerricStore.ResourceLimits.check_command(cmd, args, keys, store: store)
+      record_raw_activity(
+        result,
+        prepared.command,
+        prepared.acl_keys,
+        prepared.write_keys,
+        store
+      )
+
+      result
+    after
+      release_raw_resource_lease(lease, store)
+    end
+  end
+
+  defp release_raw_resource_lease(nil, _store), do: :ok
+
+  defp release_raw_resource_lease(lease, store) do
+    FerricStore.ResourceLimits.release_command(lease, store: store)
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp acquire_raw_resource_lease(%PreparedCommand{acl_keys: []}, _store), do: {:ok, nil}
+
+  defp acquire_raw_resource_lease(%PreparedCommand{} = prepared, store) do
+    if data_plane_activity_command?(prepared.command) do
+      FerricStore.ResourceLimits.acquire_command(
+        prepared.command,
+        prepared_resource_limit_args(prepared),
+        prepared.acl_keys,
+        store: store,
+        read_keys: prepared.read_keys,
+        write_keys: prepared.write_keys
+      )
     else
-      :ok
+      {:ok, nil}
     end
   rescue
     _error -> {:error, :resource_limit_check_failed}

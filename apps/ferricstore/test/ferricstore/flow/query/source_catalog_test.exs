@@ -40,8 +40,7 @@ defmodule Ferricstore.Flow.Query.SourceCatalogTest do
     catalog_key = Keys.type_catalog_member_key("invoice", state_key)
     projection_key = Keys.policy_catalog_projection_key("invoice", catalog_key, 7)
 
-    assert {:ok,
-            %{catalog_key: ^catalog_key, migration_generation: 7, type_digest: type_digest}} =
+    assert {:ok, %{catalog_key: ^catalog_key, migration_generation: 7, type_digest: type_digest}} =
              Keys.decode_policy_catalog_projection_key(projection_key)
 
     assert byte_size(type_digest) == 43
@@ -80,11 +79,58 @@ defmodule Ferricstore.Flow.Query.SourceCatalogTest do
     end
 
     assert {:error, {:compare_failed, ^catalog_key}} =
-             SourceCatalog.bootstrap_page(ctx, 0, 1, 1_024 * 1_024,
-               write_batch_fun: write_batch
-             )
+             SourceCatalog.bootstrap_page(ctx, 0, 1, 1_024 * 1_024, write_batch_fun: write_batch)
 
     assert :not_found = LMDB.get(path, source_key)
+  end
+
+  test "bootstrap cannot overwrite a source row replaced after collision validation", %{ctx: ctx} do
+    state_key = Keys.state_key("expected", "tenant-a")
+    conflicting_state_key = Keys.state_key("conflicting", "tenant-a")
+    catalog_key = Keys.type_catalog_member_key("invoice", state_key)
+    projection_key = Keys.policy_catalog_projection_key("invoice", catalog_key, 1)
+    catalog = PolicyMigration.encode_catalog("invoice", state_key, 1)
+    path = lmdb_path(ctx)
+
+    assert {:ok, {:put, source_key, ^state_key}} = SourceCatalog.put_op(catalog_key, state_key)
+
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, catalog_key, LMDB.encode_value(catalog, 0)},
+               {:put, projection_key, <<1>>}
+             ])
+
+    write_batch = fn ^path, ops ->
+      assert :ok = LMDB.write_batch(path, [{:put, source_key, conflicting_state_key}])
+      LMDB.write_batch(path, ops)
+    end
+
+    assert {:error, {:compare_failed, ^source_key}} =
+             SourceCatalog.bootstrap_page(ctx, 0, 1, 1_024 * 1_024, write_batch_fun: write_batch)
+
+    assert {:ok, ^conflicting_state_key} = LMDB.get(path, source_key)
+  end
+
+  test "bootstrap rejects a corrupt durable completion marker", %{ctx: ctx} do
+    path = lmdb_path(ctx)
+    assert :ok = LMDB.write_batch(path, [{:put, <<0, "fqsc:c">>, "not-complete"}])
+
+    assert {:error, :corrupt_query_source_catalog_complete} =
+             SourceCatalog.bootstrap_page(ctx, 0, 1, 1_024)
+  end
+
+  test "bootstrap counts the durable completion marker against the page budget", %{ctx: ctx} do
+    parent = self()
+
+    write_batch = fn _path, _ops ->
+      send(parent, :unexpected_write)
+      :ok
+    end
+
+    assert {:error, :query_source_catalog_page_too_large} =
+             SourceCatalog.bootstrap_page(ctx, 0, 1, 1, write_batch_fun: write_batch)
+
+    refute_received :unexpected_write
   end
 
   defp lmdb_path(ctx) do

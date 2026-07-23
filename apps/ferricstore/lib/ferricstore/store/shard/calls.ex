@@ -50,6 +50,13 @@ defmodule Ferricstore.Store.Shard.Calls do
       def handle_call({:get_many, _keys, _deadline_ms}, _from, state),
         do: {:reply, {:error, "ERR invalid shard batch read request"}, state}
 
+      def handle_call({:get_many_entries, keys, deadline_ms}, from, state)
+          when is_list(keys) and is_integer(deadline_ms),
+          do: ShardReads.handle_get_many_entries(keys, from, deadline_ms, state)
+
+      def handle_call({:get_many_entries, _keys, _deadline_ms}, _from, state),
+        do: {:reply, {:error, "ERR invalid shard batch read request"}, state}
+
       def handle_call({:get_file_ref, key}, _from, state),
         do: ShardReads.handle_get_file_ref(key, state)
 
@@ -481,6 +488,21 @@ defmodule Ferricstore.Store.Shard.Calls do
 
       def handle_call({:compound_scan, redis_key, prefix}, _from, state) do
         ShardCompound.handle_compound_scan(redis_key, prefix, state)
+      end
+
+      def handle_call(
+            {:compound_scan_slice, redis_key, prefix, start, count, total},
+            _from,
+            state
+          ) do
+        ShardCompound.handle_compound_scan_slice(
+          redis_key,
+          prefix,
+          start,
+          count,
+          total,
+          state
+        )
       end
 
       def handle_call({:compound_scan_bounded, redis_key, prefix, limits}, _from, state) do

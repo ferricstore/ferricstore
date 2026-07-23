@@ -699,8 +699,14 @@ pub fn cuckoo_file_exists_async<'a>(
     path: String,
     element: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let element_owned = element.as_slice().to_vec();
-    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+    let input_bytes = match crate::async_io::checked_input_bytes([element.len()]) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+    let blocking_task = match crate::async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || element.as_slice().to_vec(),
+        move |element_owned| {
         let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 "enoent".to_string()
@@ -712,7 +718,8 @@ pub fn cuckoo_file_exists_async<'a>(
         let result = cuckoo_file_exists_in_open_file(&file, &hdr, &element_owned)?;
         crate::fadvise_dontneed(&file, 0, 0);
         Ok(result)
-    }) {
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };
@@ -747,11 +754,20 @@ pub fn cuckoo_file_mexists_async<'a>(
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let elements_owned: Vec<Vec<u8>> = elements
-        .iter()
-        .map(|element| element.as_slice().to_vec())
-        .collect();
-    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+    let input_bytes =
+        match crate::async_io::checked_input_bytes(elements.iter().map(|element| element.len())) {
+            Ok(bytes) => bytes,
+            Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+        };
+    let blocking_task = match crate::async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || {
+            elements
+                .iter()
+                .map(|element| element.as_slice().to_vec())
+                .collect::<Vec<_>>()
+        },
+        move |elements_owned| {
         let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 "enoent".to_string()
@@ -766,7 +782,8 @@ pub fn cuckoo_file_mexists_async<'a>(
         }
         crate::fadvise_dontneed(&file, 0, 0);
         Ok(results)
-    }) {
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };
@@ -801,8 +818,14 @@ pub fn cuckoo_file_count_async<'a>(
     path: String,
     element: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let element_owned = element.as_slice().to_vec();
-    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
+    let input_bytes = match crate::async_io::checked_input_bytes([element.len()]) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+    let blocking_task = match crate::async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || element.as_slice().to_vec(),
+        move |element_owned| {
         let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 "enoent".to_string()
@@ -835,7 +858,8 @@ pub fn cuckoo_file_count_async<'a>(
         }
         crate::fadvise_dontneed(&file, 0, 0);
         Ok(total)
-    }) {
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };

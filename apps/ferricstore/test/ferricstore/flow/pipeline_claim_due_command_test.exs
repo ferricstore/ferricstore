@@ -79,8 +79,7 @@ defmodule Ferricstore.Flow.PipelineClaimDueCommandTest do
   test "rejects lease durations that cannot produce exact Flow index deadlines" do
     assert {:error, "ERR flow lease_ms exceeds maximum 9007199254740991"} =
              PipelineClaimDueCommand.command(
-               {:claim_due, "email",
-                [worker: "worker-a", lease_ms: 9_007_199_254_740_992]},
+               {:claim_due, "email", [worker: "worker-a", lease_ms: 9_007_199_254_740_992]},
                callbacks()
              )
   end

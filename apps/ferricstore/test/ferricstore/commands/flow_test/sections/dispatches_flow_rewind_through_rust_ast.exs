@@ -332,8 +332,9 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowRewindThroughRust
         assert "flow.policy.get" in names
         assert "flow.retention_cleanup" in names
         assert "flow.claim_due" in names
-        assert "flow.failures" in names
-        assert "flow.terminals" in names
+        assert "flow.query" in names
+        refute "flow.failures" in names
+        refute "flow.terminals" in names
         assert "flow.complete" in names
         assert "flow.rewind" in names
 

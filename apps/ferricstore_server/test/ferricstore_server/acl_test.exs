@@ -63,6 +63,41 @@ defmodule FerricstoreServer.AclTest do
     def handle("PING", _args, _store), do: {:ok, "shadowed"}
   end
 
+  defmodule AdministrativeReadExtension do
+    @behaviour Ferricstore.Commands.Extension
+
+    @impl true
+    def commands do
+      [
+        %{
+          name: "EXT.INDEXES",
+          arity: 1,
+          flags: ["readonly"],
+          first_key: 0,
+          last_key: 0,
+          step: 0,
+          access: :read,
+          acl_categories: [:admin],
+          summary: "Inspect extension indexes"
+        },
+        %{
+          name: "EXT.STATUS",
+          arity: 1,
+          flags: ["readonly"],
+          first_key: 0,
+          last_key: 0,
+          step: 0,
+          access: :read,
+          summary: "Read extension status"
+        }
+      ]
+    end
+
+    @impl true
+    def handle("EXT.INDEXES", _args, _store), do: {:ok, []}
+    def handle("EXT.STATUS", _args, _store), do: {:ok, []}
+  end
+
   setup do
     previous_extensions = Application.get_env(:ferricstore, :command_extensions)
     Application.delete_env(:ferricstore, :command_extensions)
@@ -342,6 +377,42 @@ defmodule FerricstoreServer.AclTest do
       Application.put_env(:ferricstore, :command_extensions, [ShadowingReadExtension])
 
       assert :rw = CommandCategories.command_access_type("PING")
+    end
+
+    test "extension ACL categories are independent from key access type" do
+      Application.put_env(:ferricstore, :command_extensions, [AdministrativeReadExtension])
+
+      assert {:ok, read} = CommandCategories.category_commands("READ")
+      assert {:ok, admin} = CommandCategories.category_commands("ADMIN")
+      assert {:ok, all} = CommandCategories.category_commands("ALL")
+
+      refute MapSet.member?(read, "EXT.INDEXES")
+      assert MapSet.member?(admin, "EXT.INDEXES")
+      assert MapSet.member?(all, "EXT.INDEXES")
+      assert :read = CommandCategories.command_access_type("EXT.INDEXES")
+
+      assert MapSet.member?(read, "EXT.STATUS")
+      refute MapSet.member?(admin, "EXT.STATUS")
+      assert MapSet.member?(all, "EXT.STATUS")
+
+      categories = CommandCategories.categories()
+      refute MapSet.member?(categories["READ"], "EXT.INDEXES")
+      assert MapSet.member?(categories["ADMIN"], "EXT.INDEXES")
+      assert MapSet.member?(categories["ALL"], "EXT.INDEXES")
+      assert MapSet.member?(categories["READ"], "EXT.STATUS")
+    end
+
+    test "the intrinsic query-index status command is admin-only" do
+      assert {:ok, read} = CommandCategories.category_commands("READ")
+      assert {:ok, flow} = CommandCategories.category_commands("FLOW")
+      assert {:ok, admin} = CommandCategories.category_commands("ADMIN")
+      assert {:ok, all} = CommandCategories.category_commands("ALL")
+
+      refute MapSet.member?(read, "FLOW.QUERY.INDEXES")
+      refute MapSet.member?(flow, "FLOW.QUERY.INDEXES")
+      assert MapSet.member?(admin, "FLOW.QUERY.INDEXES")
+      assert MapSet.member?(all, "FLOW.QUERY.INDEXES")
+      assert :read = CommandCategories.command_access_type("FLOW.QUERY.INDEXES")
     end
 
     test "+command is case-insensitive (stored uppercased)" do

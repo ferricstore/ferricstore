@@ -532,6 +532,28 @@ defmodule Ferricstore.InstanceTest do
       assert :ets.whereis(latch_1) == :undefined
     end
 
+    test "releases native Flow index resources" do
+      name = :"cleanup_flow_index_#{System.unique_integer([:positive])}"
+      on_exit(fn -> FerricStore.Instance.cleanup(name) end)
+
+      _ctx =
+        FerricStore.Instance.build(name,
+          data_dir: Path.join(System.tmp_dir!(), Atom.to_string(name)),
+          shard_count: 2
+        )
+
+      {index_0, lookup_0} = Ferricstore.Flow.NativeOrderedIndex.table_names(name, 0)
+      {index_1, lookup_1} = Ferricstore.Flow.NativeOrderedIndex.table_names(name, 1)
+
+      assert is_reference(Ferricstore.Flow.NativeOrderedIndex.reset(index_0, lookup_0))
+      assert is_reference(Ferricstore.Flow.NativeOrderedIndex.reset(index_1, lookup_1))
+
+      FerricStore.Instance.cleanup(name)
+
+      assert nil == Ferricstore.Flow.NativeOrderedIndex.get(index_0, lookup_0)
+      assert nil == Ferricstore.Flow.NativeOrderedIndex.get(index_1, lookup_1)
+    end
+
     test "failed custom startup cleans cached context and ETS tables" do
       root =
         Path.join(

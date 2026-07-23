@@ -1117,7 +1117,7 @@ defmodule FerricstoreServer.Native.CodecTest do
             }} = Codec.decode_body(0x020C, 0x02, body)
   end
 
-  test "decodes compact FLOW.LIST request body" do
+  test "rejects the retired compact FLOW.LIST request marker" do
     body =
       <<
         0x9F,
@@ -1127,13 +1127,8 @@ defmodule FerricstoreServer.Native.CodecTest do
         1
       >>
 
-    assert {:ok,
-            %{
-              "type" => "email",
-              "state" => "queued",
-              "count" => 500,
-              "return" => "meta"
-            }} = Codec.decode_body(0x020E, 0x02, body)
+    assert {:error, "ERR native custom request payload is unsupported"} =
+             Codec.decode_body(0x020E, 0x02, body)
   end
 
   test "decodes compact FLOW.COMPLETE_MANY request body" do

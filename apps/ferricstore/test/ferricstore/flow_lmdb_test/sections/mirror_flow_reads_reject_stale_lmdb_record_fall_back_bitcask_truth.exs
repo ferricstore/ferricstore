@@ -373,6 +373,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
                    path,
                    Enum.map(stale_indexes, fn index_key ->
                      key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, 1)
+
                      value =
                        Ferricstore.Flow.LMDB.encode_query_index_value(index_key, id, 1, 0)
 

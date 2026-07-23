@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.CommandBatching do
     :flow_governance_limit_catalog_outbox_ack,
     :flow_governance_release_outbox_ack,
     :flow_governance_release_outbox_mark_completed,
+    :flow_create_with_catalog,
     :flow_policy_attribute_catalog_repair,
     :flow_policy_attribute_catalog_repair_request,
     :flow_policy_catalog_backfill_step,

@@ -45,10 +45,11 @@ defmodule Ferricstore.Commands.Geo.Parsing do
   def validate_geoadd_ast(_flags, _pairs), do: {:error, "ERR syntax error"}
 
   def validate_geosearch_ast_opts(opts) when is_list(opts) do
-    keys = Enum.map(opts, fn
-      {key, _value} when is_atom(key) -> key
-      _invalid -> :invalid
-    end)
+    keys =
+      Enum.map(opts, fn
+        {key, _value} when is_atom(key) -> key
+        _invalid -> :invalid
+      end)
 
     cond do
       not Keyword.keyword?(opts) ->
@@ -169,7 +170,9 @@ defmodule Ferricstore.Commands.Geo.Parsing do
 
   defp validate_optional_count(nil), do: :ok
   defp validate_optional_count(count) when is_integer(count) and count > 0, do: :ok
-  defp validate_optional_count(_count), do: {:error, "ERR value is not an integer or out of range"}
+
+  defp validate_optional_count(_count),
+    do: {:error, "ERR value is not an integer or out of range"}
 
   defp validate_optional_sort(nil), do: :ok
   defp validate_optional_sort(sort) when sort in [:asc, :desc], do: :ok

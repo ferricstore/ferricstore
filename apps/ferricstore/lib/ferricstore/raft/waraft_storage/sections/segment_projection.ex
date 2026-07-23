@@ -485,7 +485,11 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
           apply_context: sm_state.apply_context,
           compound_member_index: Map.get(sm_state, :compound_member_index_name),
           logical_key_index: Map.get(sm_state, :logical_key_index_name),
-          logical_key_slots: Map.get(sm_state, :logical_key_slots_name)
+          logical_key_slots: Map.get(sm_state, :logical_key_slots_name),
+          namespace_usage_index: Map.get(sm_state, :namespace_usage_index_name),
+          namespace_usage_expiry: Map.get(sm_state, :namespace_usage_expiry_name),
+          blob_side_channel_threshold_bytes:
+            Map.get(sm_state, :blob_side_channel_threshold_bytes, 0)
         }
       end
 

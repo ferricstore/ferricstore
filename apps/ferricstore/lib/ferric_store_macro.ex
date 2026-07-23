@@ -370,6 +370,10 @@ defmodule FerricStore.Macro do
         FerricStore.Impl.flow_get(__instance__(), id, opts)
       end
 
+      def flow_query(query, params \\ %{}) do
+        FerricStore.Impl.flow_query(__instance__(), query, params)
+      end
+
       def flow_policy_set(type, opts) do
         FerricStore.Impl.flow_policy_set(__instance__(), type, opts)
       end

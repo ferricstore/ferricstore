@@ -2,27 +2,40 @@
 
 `FLOW.QUERY` is the versioned, bounded read surface for Flow runs. FQL1 parses
 into one canonical request type before authorization, routing, planning, or
-execution. FerricStore OSS supplies the parser, stable semantics, point-read
-operator, composite-index primitives, and lifecycle projection hooks.
-FerricStore Enterprise installs the collection planner, online index registry,
-bounded executor, cursor service, statistics, and EXPLAIN contract.
+execution. FerricStore OSS owns the complete query implementation: the parser,
+stable semantics, cost-aware planner, point/history/fixed/composite operators,
+online index registry and lifecycle, bounded executor, cursor service,
+statistics, management surface, and EXPLAIN contract. FerricStore Enterprise
+uses this OSS surface unchanged and adds its metadata scope and governance
+integrations; it does not replace the planner or its wire contracts.
 
 ## Capability Negotiation
 
 Clients must negotiate capabilities rather than infer collection support from
 the FQL language version.
 
-| Edition surface | Query contract | Shapes |
-| --- | --- | --- |
-| OSS default | `ferric.flow.query.point/v1` | exact tenant + run ID |
-| Enterprise | `ferric.flow.query/v1` | exact point and bounded collection |
+| Surface | Request contract | Result contract | Explain contract | Shapes |
+| --- | --- | --- | --- | --- |
+| OSS default, also used by Enterprise | `ferric.flow.query.request/v1` | `ferric.flow.query.result/v1` | `ferric.flow.explain/v1` | every advertised bounded point, history, lineage, fixed-index, composite collection, and count shape |
 
-Both advertise `FQL1`. Enterprise additionally advertises
-`flow_query_v1`, `flow_explain_v1`, and `flow_composite_index_v1`.
+The shared surface advertises `FQL1`, `flow_query_v1`, `flow_explain_v1`,
+`flow_explain_analyze_v1`,
+`flow_composite_index_v1`, and `flow_query_index_status_v1`.
 
 The capability manifest is validated and frozen in the immutable instance
 context. Runtime application-environment changes cannot replace the query
 engine of an existing instance.
+
+The default engine advertises the full list returned by the parser's canonical
+shape classifier. A client must still use that `shapes` list rather than assume
+that every syntactically valid FQL1 request has a physical plan. The list
+includes the general `runs_by_partition_predicates_ordered_records` and count
+shapes as well as the fixed-path
+`runs_by_partition_type_state_ordered_records`,
+`runs_by_partition_type_terminals_ordered_records`,
+`runs_by_partition_metadata_ordered_records`, and
+`runs_by_partition_type_running_lease_deadline_ordered_records` shapes. A fixed
+path remains a bounded fallback while a matching composite generation builds.
 
 ## FQL1 Surface
 
@@ -41,7 +54,7 @@ FROM runs
 WHERE partition_key = @tenant
   AND state IN ('failed', 'completed')
   AND updated_at_ms FROM @from_ms TO @until_ms
-ORDER BY updated_at_ms DESC, run_id DESC
+ORDER BY updated_at_ms DESC
 LIMIT 50
 CURSOR @cursor
 RETURN RECORDS
@@ -57,8 +70,12 @@ WHERE partition_key = @tenant
 RETURN COUNT
 ```
 
-Prefix the request with `EXPLAIN` to return a redacted physical plan instead of
-records. `CURSOR` is optional and accepts a named parameter only.
+Prefix the request with `EXPLAIN` to return a redacted physical plan without
+executing it. Clients that negotiated `flow_explain_analyze_v1` may use
+`EXPLAIN ANALYZE` to execute the same bounded read and return actual usage
+without records or count values. Both modes run a fresh plan and reject
+`CURSOR`; ordinary collection execution may use an optional named-parameter
+cursor.
 
 Supported predicates are:
 
@@ -70,20 +87,103 @@ Supported predicates are:
 - `field IS MISSING`.
 
 Collection queries require exactly one `partition_key` equality. Record results
-also require one or two non-metadata `ORDER BY` fields, a positive bounded
-`LIMIT`, and `RETURN RECORDS`. Count results use `RETURN COUNT` and reject
-ordering, limits, and cursors. A second partition predicate is rejected as
-ambiguous before authorization or routing.
+also require one or two non-metadata integer `ORDER BY` fields, a positive
+bounded `LIMIT`, and `RETURN RECORDS`. Stable pagination adds an implicit opaque
+run-identity tie breaker, so clients must not add `run_id` to `ORDER BY`. Count
+results use `RETURN COUNT` and reject ordering, limits, and cursors. A second
+partition predicate is rejected as ambiguous before authorization or routing.
 
 The parser accepts typed string and signed-integer literals plus exact named
 parameters. The binder rejects missing parameters, extra parameters, and type
 mismatches. Query text is limited to 16 KiB, 256 tokens, 12 predicates, 20
 values per `IN`, two order fields, 64 parameters, and 100 result records.
 
+Simple metadata names use dotted selectors such as `attribute.region` and
+`state_meta.review.risk_tier`. Legal names containing dots, spaces, or quotes
+use bracket selectors: `attribute['customer.region']` and
+`state_meta['review.v2']['ai.model']`. A single quote inside a bracket name is
+escaped as `''`. Field names are part of the validated query shape and cannot
+be supplied as value parameters; predicate values should remain named
+parameters.
+
 Production native traffic uses the bounded Rust parser. The independent Elixir
 parser is the differential-test oracle. Both produce
 `%Ferricstore.Flow.Query.Request{version: 1}` and validate the same canonical
 shape.
+
+## Beta Command Consolidation
+
+`FLOW.QUERY` is the only native record-collection command. The beta commands
+`FLOW.LIST`, `FLOW.SEARCH`, `FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.STUCK`,
+`FLOW.BY_PARENT`, `FLOW.BY_ROOT`, and `FLOW.BY_CORRELATION` are removed, not
+aliases. Their indexed physical operators remain internal implementation
+details.
+
+| Former workload | FQL1 predicates and order |
+| --- | --- |
+| type/state list | `partition_key`, `type`, one `state`; order `updated_at_ms` |
+| attribute or state metadata search | partition plus indexed metadata equality; order `updated_at_ms` |
+| terminal/failure records | partition, type, terminal state equality/`IN`; order `updated_at_ms` |
+| stuck leases | partition, type, running state, bounded `lease_deadline_ms`; order `lease_deadline_ms` |
+| parent/root/correlation lineage | partition plus the matching lineage ID; order `updated_at_ms` |
+
+Native SDKs send opcode `0x0231` with `version`, `query`, and `params`. Textual
+`COMMAND_EXEC` clients send `FLOW.QUERY FQL1 <query> [name value ...]`. SDKs
+should remove old methods or implement them locally as typed query builders;
+they must not probe or retry the removed opcodes.
+
+## Authorization
+
+Query execution and plan inspection use separate command permissions:
+
+| FQL mode | Required command permission |
+| --- | --- |
+| ordinary execution | `FLOW.QUERY` |
+| `EXPLAIN` | `FLOW.QUERY.EXPLAIN` |
+| `EXPLAIN ANALYZE` | both `FLOW.QUERY` and `FLOW.QUERY.EXPLAIN` |
+
+`FLOW.QUERY.EXPLAIN` is an authorization-only capability, not a callable wire
+command. It belongs to `@admin`, not `@read` or `@flow`, and may be granted
+directly when broader administrative access is inappropriate. For
+example, a scoped plan-inspection account can use `-@all
++FLOW.QUERY.EXPLAIN %R~tenant-a:*`; an analysis account additionally needs
+`+FLOW.QUERY`. The `FLOW.QUERY.INDEXES` permission is independently
+administrative and likewise belongs to `@admin`, not `@read` or `@flow`.
+
+Command authorization does not replace data-scope authorization. Every mode
+uses the bound collection partition from the same prepared request for ACL key
+checks. A run-ID-only point read derives and authorizes the deterministic
+auto-partition; it cannot find an explicitly partitioned run. An
+explain-only account therefore cannot inspect another permitted command's
+tenant or bypass its key patterns. Authorization failures identify the missing
+command permission without exposing query values.
+
+## Actionable Diagnostics
+
+Structured query failures keep a stable `code` and `message` and may add
+`detail`, `hint`, `position`, and value-redacted `context`. Positions are
+one-based and include a byte offset plus line and UTF-8 character-column
+coordinates. Syntax diagnostics
+point at the invalid token or the end of an incomplete query. Unsupported-field
+diagnostics include the sorted built-in field list plus
+documented dotted and bracket metadata forms. Neither the rejected
+identifier nor literal values are copied into the response.
+
+A `query_no_bounded_plan` failure reports redacted predicate operator/field
+shapes, requested ordering, the planner rejection reason, and a concrete
+suggested composite-index layout. Predicates that cannot fit that definition
+are called out as residuals. Exact count suggestions identify the counter
+prefix only when every predicate fits. Raw RESP errors carry the same position and useful hint text;
+structured native responses retain the complete context map.
+
+OSS exposes `FLOW.QUERY.INDEXES [index-id]` when
+`flow_query_index_status_v1` is advertised. With no argument it returns the
+bounded catalog; an ID filters all generations of that logical index. The
+response includes registry epoch, catalog version, definition version, build
+ID, fields, workloads, queryability, build/validation/retirement phase counts
+and counters, validation failure evidence, service availability, and aggregated
+statistics freshness. Resume cursors, physical keys, scope digests, tenant
+values, and query literals are never returned.
 
 ## Stable Semantics
 
@@ -161,15 +261,35 @@ a partial success after exhausting a scan, byte, hydration, memory, response,
 or wall-time budget.
 
 `EXPLAIN` uses the same bound request and planner as execution. It includes the
-selected logical index and generation, path, order mode, redacted constraint
-shapes, residual predicates, estimates, evidence age/confidence, alternatives,
-and all hard bounds. It omits literal values, tenant names, run IDs, physical
-keys, cursors, and scope digests. Output is deterministic for the same
-catalog, statistics, and request shape.
+selected logical index, generation, and build ID; path and order mode; redacted
+constraint shapes and residual predicates; normalized estimates; statistics
+freshness; hard bounds; mandatory-scope enforcement without scope values;
+resource pressure; the selection reason; and bounded alternative comparisons.
+Pressure distinguishes expected utilization from the conservative hard
+execution ceiling. Rejected plans carry the same actionable diagnostic as
+execution, including a suggested index and `FLOW.QUERY.INDEXES` guidance.
+
+`EXPLAIN ANALYZE` additionally executes that admitted plan under the normal
+scan, byte, hydration, result, response, memory, and deadline ceilings. Its
+`actual` object is the validated shared result usage map for the
+discarded query response; `actual.response_bytes` therefore measures the query
+response that would have been returned, not the EXPLAIN envelope. The pressure
+table adds actual utilization and the actual limiting resource. Planner-memory
+estimates remain `null` externally because encoded literal lengths affect that
+internal enforcement value. Static `EXPLAIN` does not enqueue statistics probes;
+ordinary execution and `EXPLAIN ANALYZE` may refresh missing statistics through
+the bounded background worker.
+
+Both modes omit literal values, tenant names, run IDs, records, count values,
+physical keys, cursors, and scope digests. Static output is deterministic for
+the same catalog, statistics, and request shape. The beta
+`ferric.flow.explain/v1` contract was updated in place: external estimate and
+bound names use `scanned_entries` and `scanned_bytes`, and index objects now
+include `build_id`.
 
 ## Execution Bounds
 
-Enterprise defaults are:
+Default limits are:
 
 | Resource | Default |
 | --- | ---: |
@@ -201,11 +321,11 @@ response assembly. Process monitors reclaim leaked admission leases.
 
 ## Cursor And Response Contract
 
-Collection responses use `ferric.flow.query/v1`:
+All editions use `ferric.flow.query.result/v1` for collection responses:
 
 ```text
 %{
-  version: "ferric.flow.query/v1",
+  version: "ferric.flow.query.result/v1",
   records: [...],
   page: %{has_more: boolean, cursor: binary | nil},
   quality: %{
@@ -223,17 +343,19 @@ or record array:
 
 ```text
 %{
-  version: "ferric.flow.query/v1",
+  version: "ferric.flow.query.result/v1",
   result: %{kind: "count", value: non_neg_integer},
   quality: %{...},
   usage: %{...bounded counters...}
 }
 ```
 
-Records are an allowlisted structural projection. Payload, result, error and
-named-value references, arbitrary attributes and state metadata, child
+Records are an allowlisted structural projection. Attributes and state metadata
+are returned; payload, result, error and named-value references, child
 bookkeeping, lease/worker ownership, fencing tokens, retention controls, and
-unknown future fields are not returned.
+unknown future fields are not returned. Point, fixed-index, and composite
+execution all return the same versioned result envelope; there is no
+edition-specific or bare-list response contract.
 
 Cursors are opaque `fqc1_` AEAD tokens with a default five-minute TTL. The
 32-byte key is configured per instance or created once as a private, fsynced
@@ -283,11 +405,17 @@ cleanup.
 
 ## Performance Evidence
 
-`ferricstore_enterprise/bench/flow_query_index_bench.exs` measures every launch
+`bench/flow_query_index_bench.exs` measures every launch
 index through real LMDB projection and end-to-end planning/execution. It emits
 read latency percentiles, write operations and logical bytes per record,
 logical and physical storage growth, and backfill throughput. See the adjacent
 benchmark README for representative and smoke commands.
+
+The OSS repository also provides open-loop and query-shape soak runners, parser
+allocation and Criterion suites, plus
+NIF scheduler, native ordered-index, and LMDB cache benchmarks under `bench/`.
+See `bench/README.md` for the full matrix, Linux profiling requirements, and
+the same-host 15% median regression comparison.
 
 Publish release evidence from at least three runs on identical hardware and
 durability settings, using both a representative production distribution and a

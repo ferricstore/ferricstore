@@ -76,6 +76,35 @@ defmodule Ferricstore.Flow.LMDBBoundedRangeTest do
     assert byte_size(second) == 600
   end
 
+  test "returns a resumable bounded point-read prefix without copying the rejected suffix", %{
+    path: path
+  } do
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, "record:1", String.duplicate("a", 600)},
+               {:put, "record:2", String.duplicate("b", 600)},
+               {:put, "record:3", String.duplicate("c", 200)}
+             ])
+
+    assert {:ok, [{:ok, first}], 600, false} =
+             LMDB.get_many_prefix_bounded(
+               path,
+               ["record:1", "record:2", "record:3"],
+               1_000
+             )
+
+    assert byte_size(first) == 600
+
+    assert {:ok, [{:ok, second}, {:ok, third}], 800, true} =
+             LMDB.get_many_prefix_bounded(path, ["record:2", "record:3"], 1_000)
+
+    assert byte_size(second) == 600
+    assert byte_size(third) == 200
+
+    assert {:error, :batch_value_budget_exceeded} =
+             LMDB.get_many_prefix_bounded(path, ["record:1"], 599)
+  end
+
   test "rejects an oversized bounded point-read key list", %{path: path} do
     assert {:error, :batch_key_budget_exceeded} =
              LMDB.get_many_bounded(path, List.duplicate("missing", 4_097), 1_024)

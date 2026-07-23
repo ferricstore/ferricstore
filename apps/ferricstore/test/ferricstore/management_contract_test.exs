@@ -106,6 +106,14 @@ defmodule FerricStore.ManagementContractTest do
 
       :ok
     end
+
+    @impl true
+    def acquire_command(command, args, keys, opts) do
+      with :ok <- check_command(command, args, keys, opts), do: {:ok, nil}
+    end
+
+    @impl true
+    def release_command(_lease, _opts), do: :ok
   end
 
   defmodule FakeNamespace do
@@ -243,6 +251,15 @@ defmodule FerricStore.ManagementContractTest do
     assert :ok = FerricStore.ResourceLimits.release(nil)
     assert :ok = FerricStore.ResourceLimits.record_activity(["tenant:namespace:key"])
 
+    assert {:ok, nil} =
+             FerricStore.ResourceLimits.acquire_command(
+               "SET",
+               ["tenant:namespace:key", "v"],
+               ["tenant:namespace:key"]
+             )
+
+    assert :ok = FerricStore.ResourceLimits.release_command(nil)
+
     assert :ok =
              FerricStore.ResourceLimits.check_command("SET", ["tenant:namespace:key", "v"], [
                "tenant:namespace:key"
@@ -270,6 +287,19 @@ defmodule FerricStore.ManagementContractTest do
 
     assert_receive {:command_check, "SET", ["tenant:namespace:key", "value"],
                     ["tenant:namespace:key"], true}
+
+    assert {:ok, nil} =
+             FerricStore.ResourceLimits.acquire_command(
+               "SET",
+               ["tenant:namespace:key", "leased"],
+               ["tenant:namespace:key"],
+               store: MockStore.make()
+             )
+
+    assert_receive {:command_check, "SET", ["tenant:namespace:key", "leased"],
+                    ["tenant:namespace:key"], true}
+
+    assert :ok = FerricStore.ResourceLimits.release_command(nil, store: MockStore.make())
   end
 
   test "FERRICSTORE.QUOTA delegates to configured resource limit implementation" do

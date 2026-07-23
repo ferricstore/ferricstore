@@ -13,6 +13,7 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
   alias Ferricstore.Store.Router
 
   @default_terminal_lmdb_sweep_limit 10_000
+  @raw_prefix_merge_max_bytes 16 * 1_024 * 1_024
 
   def terminal_ids(
         ctx,
@@ -256,22 +257,7 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
 
       ctx
       |> lmdb_paths_for_index(index_key_prefix, partition_key)
-      |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
-        case LMDB.prefix_entries(path, prefix, count) do
-          {:ok, entries} -> {:cont, {:ok, [{path, entries} | acc]}}
-          {:error, _reason} = error -> {:halt, error}
-        end
-      end)
-      |> case do
-        {:ok, chunks} ->
-          chunks
-          |> Enum.reverse()
-          |> limit_raw_path_chunks(count)
-          |> then(&{:ok, &1})
-
-        {:error, _reason} = error ->
-          error
-      end
+      |> raw_prefix_path_chunks(prefix, count)
     end
   end
 
@@ -310,23 +296,38 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
     {bounded_entries, exhausted?}
   end
 
-  defp limit_raw_path_chunks(chunks, count) do
-    selected_by_path =
-      chunks
-      |> Enum.flat_map(fn {path, entries} -> Enum.map(entries, &{path, &1}) end)
-      |> Enum.sort_by(fn {_path, {key, _value}} -> key end)
-      |> Enum.take(count)
-      |> Enum.group_by(
-        fn {path, _entry} -> path end,
-        fn {_path, entry} -> entry end
-      )
+  defp raw_prefix_path_chunks([], _prefix, _count), do: {:ok, []}
 
-    Enum.flat_map(chunks, fn {path, _entries} ->
-      case Map.fetch(selected_by_path, path) do
-        {:ok, entries} -> [{path, entries}]
-        :error -> []
-      end
-    end)
+  defp raw_prefix_path_chunks([path], prefix, count) do
+    case LMDB.prefix_entries(path, prefix, count) do
+      {:ok, []} -> {:ok, []}
+      {:ok, entries} -> {:ok, [{path, entries}]}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp raw_prefix_path_chunks(paths, prefix, count) do
+    with {:ok, rows, _scanned} <-
+           LMDB.prefix_merge_entries(paths, prefix, count, @raw_prefix_merge_max_bytes) do
+      entries_by_source =
+        Enum.group_by(
+          rows,
+          fn {source, _key, _value} -> source end,
+          fn {_source, key, value} -> {key, value} end
+        )
+
+      chunks =
+        paths
+        |> Enum.with_index()
+        |> Enum.flat_map(fn {path, source} ->
+          case Map.fetch(entries_by_source, source) do
+            {:ok, entries} -> [{path, entries}]
+            :error -> []
+          end
+        end)
+
+      {:ok, chunks}
+    end
   end
 
   defp query_entry_within_far_bound?({key, _value}, prefix, %{rev?: true, from_ms: from_ms})
@@ -340,6 +341,17 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
   end
 
   defp query_entry_within_far_bound?(_entry, _prefix, _query), do: true
+
+  defp finalize_query_window([{path, entries, path_exhausted?}], count, _query, now_ms) do
+    selected_entries = Enum.take(entries, count)
+    scanned_count = length(selected_entries)
+    exhausted? = length(entries) <= count and path_exhausted?
+
+    with {:ok, decoded_entries} <-
+           LMDBIndexDecode.query_entries(selected_entries, path, now_ms) do
+      {:ok, IndexMerge.query_entries_from_chunks([decoded_entries]), exhausted?, scanned_count}
+    end
+  end
 
   defp finalize_query_window(path_windows, count, query, now_ms) do
     raw_entries = ranked_raw_entries(path_windows, query)
@@ -448,6 +460,22 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
     end
   end
 
+  defp finalize_terminal_window([{path, entries, path_exhausted?}], count, query, now_ms) do
+    selected_entries = Enum.take(entries, count)
+    scanned_count = length(selected_entries)
+    exhausted? = length(entries) <= count and path_exhausted?
+
+    with {:ok, decoded_entries} <-
+           LMDBIndexDecode.terminal_entries(selected_entries, path, now_ms) do
+      {:ok,
+       IndexMerge.terminal_entries_from_chunks(
+         [decoded_entries],
+         count,
+         RAMIndexRead.reverse?(query)
+       ), exhausted?, scanned_count}
+    end
+  end
+
   defp finalize_terminal_window(path_windows, count, query, now_ms) do
     raw_entries = ranked_raw_entries(path_windows, query)
     selected_entries = Enum.take(raw_entries, count)
@@ -482,8 +510,13 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
 
   defp terminal_scan_count(count, nil, _default_scan_limit), do: count
 
-  defp terminal_scan_count(count, %{from_ms: nil, to_ms: nil, rev?: false}, _default_scan_limit),
-    do: count
+  defp terminal_scan_count(count, query, default_scan_limit) when is_map(query) do
+    if Map.get(query, :from_ms) == nil and Map.get(query, :to_ms) == nil and
+         Map.get(query, :after_id) == nil and Map.get(query, :before_id) == nil and
+         Map.get(query, :rev?, false) == false,
+       do: count,
+       else: query_scan_count(count, default_scan_limit)
+  end
 
   defp terminal_scan_count(count, _query, default_scan_limit),
     do: query_scan_count(count, default_scan_limit)
@@ -522,6 +555,20 @@ defmodule Ferricstore.Flow.LMDBIndexRead do
 
   defp query_prefix_entries(path, prefix, limit, %{rev?: true}) do
     LMDB.prefix_entries(path, prefix, limit, true)
+  end
+
+  defp query_prefix_entries(path, prefix, limit, %{
+         rev?: false,
+         from_ms: from_ms,
+         after_id: after_id
+       })
+       when is_integer(from_ms) and from_ms >= 0 and is_binary(after_id) and after_id != "" do
+    LMDB.prefix_entries_after(
+      path,
+      prefix,
+      LMDBQueryWindow.cursor_seek_key(prefix, from_ms, after_id),
+      limit
+    )
   end
 
   defp query_prefix_entries(path, prefix, limit, %{from_ms: from_ms})

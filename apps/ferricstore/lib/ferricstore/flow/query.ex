@@ -38,6 +38,21 @@ defmodule Ferricstore.Flow.Query do
   end
 
   @doc false
+  @spec prepare_text_diagnostic(binary(), binary(), map(), module()) ::
+          {:ok, Request.t()} | {:error, Error.t()}
+  def prepare_text_diagnostic(version, query, params, parser \\ ReferenceParser)
+      when is_atom(parser) do
+    with :ok <- validate_version(version),
+         {:ok, request} <- parse_diagnostic(parser, query),
+         {:ok, bound} <- Binder.bind_text(request, params) do
+      {:ok, bound}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} when is_atom(reason) -> {:error, Error.new(reason)}
+    end
+  end
+
+  @doc false
   @spec partition_key(Request.t()) :: {:ok, binary()} | {:error, :unsupported_query_shape}
   def partition_key(%Request{predicate: {:and, predicates}}) when is_list(predicates) do
     case Enum.find(predicates, &match?({:eq, :partition_key, _value}, &1)) do
@@ -74,6 +89,17 @@ defmodule Ferricstore.Flow.Query do
     if Surface.supported_version?(version),
       do: :ok,
       else: {:error, :unsupported_query_version}
+  end
+
+  defp parse_diagnostic(parser, query) do
+    if function_exported?(parser, :parse_diagnostic, 1) do
+      parser.parse_diagnostic(query)
+    else
+      case parser.parse(query) do
+        {:error, reason} when is_atom(reason) -> {:error, Error.diagnose(reason, query)}
+        result -> result
+      end
+    end
   end
 
   @spec error_message(atom()) :: binary()

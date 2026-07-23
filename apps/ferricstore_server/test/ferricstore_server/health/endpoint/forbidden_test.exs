@@ -4,9 +4,9 @@ defmodule FerricstoreServer.Health.Endpoint.ForbiddenTest do
   alias FerricstoreServer.Health.Endpoint.Forbidden
 
   test "requirement_details includes command rule" do
-    assert Forbidden.requirement_details("FLOW.LIST") == %{
-             required_command: "FLOW.LIST",
-             required_acl_rule: "+FLOW.LIST"
+    assert Forbidden.requirement_details("FLOW.QUERY") == %{
+             required_command: "FLOW.QUERY",
+             required_acl_rule: "+FLOW.QUERY"
            }
   end
 

@@ -19,6 +19,9 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
+const REQUIRE_IO_URING_ENV: &str = "FERRICSTORE_REQUIRE_IO_URING";
+static REQUIRE_IO_URING: OnceLock<bool> = OnceLock::new();
+
 // On Linux, bring in the synchronous uring backend.
 #[cfg(target_os = "linux")]
 pub mod uring;
@@ -515,6 +518,19 @@ pub fn detect_io_uring() -> bool {
     }
 }
 
+fn io_uring_required() -> bool {
+    *REQUIRE_IO_URING.get_or_init(|| {
+        io_uring_required_from_env_value(std::env::var(REQUIRE_IO_URING_ENV).ok().as_deref())
+    })
+}
+
+fn io_uring_required_from_env_value(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
+}
+
 /// Create the best available `IoBackend` for `path`.
 ///
 /// On Linux with a kernel that supports `io_uring` (≥ 5.1), returns a
@@ -525,11 +541,23 @@ pub fn detect_io_uring() -> bool {
 /// Returns an `io::Error` if the file cannot be opened.
 pub fn create_backend(path: &Path) -> io::Result<Box<dyn IoBackend>> {
     #[cfg(target_os = "linux")]
-    if detect_io_uring() {
-        if let Ok(backend) = uring::UringBackend::open(path) {
-            return Ok(Box::new(backend));
-            // Ring probe succeeded but open failed (unlikely): fall through.
+    match uring::UringBackend::open(path) {
+        Ok(backend) => return Ok(Box::new(backend)),
+        Err(error) if io_uring_required() => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("io_uring is required but unavailable: {error}"),
+            ));
         }
+        Err(_unavailable) => {}
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if io_uring_required() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "io_uring is required but this target is not Linux",
+        ));
     }
 
     Ok(Box::new(SyncBackend::open(path)?))
@@ -542,20 +570,14 @@ pub fn create_backend(path: &Path) -> io::Result<Box<dyn IoBackend>> {
 /// wastes allocator bandwidth (256KB alloc + dealloc per NIF call). This
 /// factory uses an 8KB buffer which is sufficient for single-record writes.
 ///
-/// On Linux with `io_uring`, falls back to `create_backend` since the uring
-/// backend does not use `BufWriter`.
+/// Stateless calls deliberately use the synchronous backend. Constructing and
+/// destroying an io_uring instance around one small write costs more than the
+/// positioned write it replaces and can exhaust per-process ring resources.
 ///
 /// # Errors
 ///
 /// Returns an `io::Error` if the file cannot be opened.
 pub fn create_backend_small(path: &Path) -> io::Result<Box<dyn IoBackend>> {
-    #[cfg(target_os = "linux")]
-    if detect_io_uring() {
-        if let Ok(backend) = uring::UringBackend::open(path) {
-            return Ok(Box::new(backend));
-        }
-    }
-
     Ok(Box::new(SyncBackend::open_small_buffer(path)?))
 }
 
@@ -576,6 +598,51 @@ mod tests {
     fn detect_io_uring_returns_bool_without_panic() {
         // Just ensure the function runs without panicking on any platform.
         let _ = detect_io_uring();
+    }
+
+    #[test]
+    fn backend_factories_do_not_create_probe_or_stateless_rings() {
+        let source = include_str!("mod.rs");
+        let create = source
+            .split("pub fn create_backend(path")
+            .nth(1)
+            .unwrap()
+            .split("pub fn create_backend_small")
+            .next()
+            .unwrap();
+        let create_small = source
+            .split("pub fn create_backend_small(path")
+            .nth(1)
+            .unwrap()
+            .split("// ---------------------------------------------------------------------------\n// Tests")
+            .next()
+            .unwrap();
+
+        assert!(!create.contains("detect_io_uring"));
+        assert_eq!(create.matches("UringBackend::open").count(), 1);
+        assert!(!create_small.contains("detect_io_uring"));
+        assert!(!create_small.contains("UringBackend::open"));
+    }
+
+    #[test]
+    fn required_io_uring_mode_is_explicit_and_fail_closed() {
+        assert!(!io_uring_required_from_env_value(None));
+        assert!(!io_uring_required_from_env_value(Some("")));
+        assert!(!io_uring_required_from_env_value(Some("0")));
+        assert!(io_uring_required_from_env_value(Some("1")));
+        assert!(io_uring_required_from_env_value(Some("true")));
+
+        let source = include_str!("mod.rs");
+        let create = source
+            .split("pub fn create_backend(path")
+            .nth(1)
+            .unwrap()
+            .split("pub fn create_backend_small")
+            .next()
+            .unwrap();
+
+        assert!(create.contains("io_uring_required()"));
+        assert!(create.contains("return Err"));
     }
 
     #[test]

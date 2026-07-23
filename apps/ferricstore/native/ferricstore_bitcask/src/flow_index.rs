@@ -1870,7 +1870,39 @@ pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term
         return Ok(crate::atoms::error().encode(env));
     };
 
-    let fields = vec![
+    Ok((crate::atoms::ok(), flow_record_fields(env, &record)?).encode(env))
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn flow_records_decode<'a>(env: Env<'a>, values_term: Term<'a>) -> NifResult<Term<'a>> {
+    let Some(values) = decode_bounded_list::<Binary<'a>>(values_term, MAX_FLOW_INDEX_PAGE_ITEMS)?
+    else {
+        return Ok(crate::atoms::error().encode(env));
+    };
+
+    let mut total_bytes = 0usize;
+    let mut decoded = Vec::with_capacity(values.len());
+
+    for value in &values {
+        let Some(next_total) = total_bytes.checked_add(value.len()) else {
+            return Ok(crate::atoms::error().encode(env));
+        };
+        if next_total > MAX_FLOW_INDEX_REQUEST_BYTES {
+            return Ok(crate::atoms::error().encode(env));
+        }
+        total_bytes = next_total;
+
+        let Some(record) = decode_flow_record(value.as_slice()) else {
+            return Ok(crate::atoms::error().encode(env));
+        };
+        decoded.push(flow_record_fields(env, &record)?);
+    }
+
+    Ok((crate::atoms::ok(), decoded).encode(env))
+}
+
+fn flow_record_fields<'a>(env: Env<'a>, record: &FlowRecordParts<'_>) -> NifResult<Vec<Term<'a>>> {
+    Ok(vec![
         binary_term(env, record.id)?,
         binary_term(env, record.flow_type)?,
         binary_term(env, record.state)?,
@@ -1901,9 +1933,7 @@ pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term
         option_binary_term(env, record.run_state)?,
         option_binary_term(env, record.rewound_to_event_id)?,
         binary_term(env, record.child_groups_encoded)?,
-    ];
-
-    Ok((crate::atoms::ok(), fields).encode(env))
+    ])
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -4352,6 +4382,7 @@ mod tests {
             "flow_record_plan_claims_with_history",
             "flow_record_encode",
             "flow_record_decode",
+            "flow_records_decode",
             "flow_record_decode_meta",
             "flow_records_terminal_after_noop",
             "flow_history_encode",

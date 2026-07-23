@@ -152,51 +152,58 @@ defmodule FerricstoreServer.Health.DashboardTest do
 
   test "Flow governance metadata panel stays idle until query is complete" do
     parent = self()
-    previous_search = Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun)
+    previous_query = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
 
-    Application.put_env(:ferricstore, :flow_dashboard_flow_search_fun, fn opts ->
-      send(parent, {:flow_search_called, opts})
+    Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn query, params ->
+      send(parent, {:flow_query_called, query, params})
       {:ok, []}
     end)
 
-    on_exit(fn -> restore_env(:flow_dashboard_flow_search_fun, previous_search) end)
+    on_exit(fn -> restore_env(:flow_dashboard_flow_query_fun, previous_query) end)
 
     data = Dashboard.collect_flow_governance_page(meta_type: "ai-review")
     html = Dashboard.render_flow_governance_page(data)
 
     assert data.state_meta_result.status == :idle
     assert String.contains?(html, "State Metadata")
-    assert String.contains?(html, "Enter workflow type, metadata state, key, and value")
-    refute_received {:flow_search_called, _opts}
+
+    assert String.contains?(
+             html,
+             "Enter partition, workflow type, metadata state, key, and value"
+           )
+
+    refute_received {:flow_query_called, _query, _params}
   end
 
-  test "Flow governance metadata panel queries indexed state_meta with bounded options" do
+  test "Flow governance metadata panel uses a bounded parameterized query" do
     parent = self()
-    previous_search = Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun)
+    previous_query = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
 
-    Application.put_env(:ferricstore, :flow_dashboard_flow_search_fun, fn opts ->
-      send(parent, {:flow_search_called, opts})
+    Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn query, params ->
+      send(parent, {:flow_query_called, query, params})
 
       {:ok,
-       [
-         %{
-           id: "flow-1",
-           type: "ai-review",
-           state: "approved",
-           partition_key: "tenant-a",
-           updated_at_ms: 1_000,
-           indexed_state_meta: "ai.model",
-           state_meta: %{
-             "review" => %{
-               "ai.model" => "gpt-5",
-               "risk_tier" => "high"
+       %{
+         records: [
+           %{
+             id: "flow-1",
+             type: "ai-review",
+             state: "approved",
+             partition_key: "tenant-a",
+             updated_at_ms: 1_000,
+             indexed_state_meta: "ai.model",
+             state_meta: %{
+               "review" => %{
+                 "ai.model" => "gpt-5",
+                 "risk_tier" => "high"
+               }
              }
            }
-         }
-       ]}
+         ]
+       }}
     end)
 
-    on_exit(fn -> restore_env(:flow_dashboard_flow_search_fun, previous_search) end)
+    on_exit(fn -> restore_env(:flow_dashboard_flow_query_fun, previous_query) end)
 
     data =
       Dashboard.collect_flow_governance_page(
@@ -209,17 +216,20 @@ defmodule FerricstoreServer.Health.DashboardTest do
         limit: 5
       )
 
-    assert_receive {:flow_search_called, opts}
-    assert Keyword.fetch!(opts, :type) == "ai-review"
-    assert Keyword.fetch!(opts, :partition_key) == "tenant-a"
-    assert Keyword.fetch!(opts, :count) == 5
-    assert Keyword.fetch!(opts, :consistent_projection) == true
-    assert Keyword.fetch!(opts, :state_meta) == %{"review" => %{"ai.model" => "gpt-5"}}
+    assert_receive {:flow_query_called, query, params}
+    assert query =~ "partition_key = @partition_key"
+    assert query =~ "state_meta['review']['ai.model']"
+    assert query =~ "LIMIT 5 RETURN RECORDS"
+    refute query =~ "tenant-a"
+    refute query =~ "gpt-5"
+    assert params["partition_key"] == "tenant-a"
+    assert params["type"] == "ai-review"
+    assert params["state_meta_value"] == "gpt-5"
 
     html = Dashboard.render_flow_governance_page(data)
 
     assert data.state_meta_result.status == :ok
-    assert String.contains?(html, "FLOW.SEARCH")
+    assert String.contains?(html, "FLOW.QUERY")
     assert String.contains?(html, "flow-1")
     assert String.contains?(html, "ai.model=gpt-5")
     assert String.contains?(html, "risk_tier=high")
@@ -286,18 +296,18 @@ defmodule FerricstoreServer.Health.DashboardTest do
   end
 
   test "Flow governance metadata panel reports timeout instead of blocking dashboard" do
-    previous_search = Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun)
+    previous_query = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
     previous_timeout = Application.get_env(:ferricstore, :flow_dashboard_list_fetch_timeout_ms)
 
     Application.put_env(:ferricstore, :flow_dashboard_list_fetch_timeout_ms, 10)
 
-    Application.put_env(:ferricstore, :flow_dashboard_flow_search_fun, fn _opts ->
+    Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn _query, _params ->
       Process.sleep(1_000)
       {:ok, []}
     end)
 
     on_exit(fn ->
-      restore_env(:flow_dashboard_flow_search_fun, previous_search)
+      restore_env(:flow_dashboard_flow_query_fun, previous_query)
       restore_env(:flow_dashboard_list_fetch_timeout_ms, previous_timeout)
     end)
 
@@ -308,6 +318,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
         meta_key: "risk_tier",
         meta_value: "high",
         meta_value_type: "string",
+        meta_partition_key: "tenant-a",
         limit: 5
       )
 

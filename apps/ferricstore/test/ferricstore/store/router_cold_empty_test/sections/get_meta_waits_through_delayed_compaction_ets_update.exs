@@ -276,6 +276,7 @@ defmodule Ferricstore.Store.RouterColdEmptyTest.Sections.GetMetaWaitsThroughDela
         before_misses = Stats.keyspace_misses(ctx)
 
         assert {:error, {:storage_read_failed, _reason}} = Router.getrange(ctx, key, 0, 2)
+
         assert {:error, "ERR storage read failed"} =
                  Ferricstore.Commands.Strings.handle("GETRANGE", [key, "0", "2"], ctx)
 

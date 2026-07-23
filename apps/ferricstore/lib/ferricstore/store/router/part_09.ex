@@ -261,8 +261,20 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec server_catalog_entry(FerricStore.Instance.t(), binary(), binary()) ::
               {:ok, binary() | nil} | :unavailable | {:error, atom()}
       def server_catalog_entry(ctx, namespace, subject) do
+        server_catalog_entry_on_shard(ctx, 0, namespace, subject)
+      end
+
+      @doc false
+      @spec server_catalog_entry_on_shard(
+              FerricStore.Instance.t(),
+              non_neg_integer(),
+              binary(),
+              binary()
+            ) :: {:ok, binary() | nil} | :unavailable | {:error, atom()}
+      def server_catalog_entry_on_shard(ctx, shard_index, namespace, subject)
+          when is_integer(shard_index) and shard_index >= 0 do
         key = Ferricstore.ServerCatalog.entry_key(namespace, subject)
-        read_shard_value(ctx, 0, key)
+        read_shard_value(ctx, shard_index, key)
       rescue
         ArgumentError -> {:error, :invalid_server_catalog_key}
       end
@@ -271,8 +283,19 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec server_catalog_revision(FerricStore.Instance.t(), binary()) ::
               {:ok, binary() | nil} | :unavailable | {:error, atom()}
       def server_catalog_revision(ctx, namespace) do
+        server_catalog_revision_on_shard(ctx, 0, namespace)
+      end
+
+      @doc false
+      @spec server_catalog_revision_on_shard(
+              FerricStore.Instance.t(),
+              non_neg_integer(),
+              binary()
+            ) :: {:ok, binary() | nil} | :unavailable | {:error, atom()}
+      def server_catalog_revision_on_shard(ctx, shard_index, namespace)
+          when is_integer(shard_index) and shard_index >= 0 do
         key = Ferricstore.ServerCatalog.revision_key(namespace)
-        read_shard_value(ctx, 0, key)
+        read_shard_value(ctx, shard_index, key)
       rescue
         ArgumentError -> {:error, :invalid_server_catalog_key}
       end
@@ -281,9 +304,20 @@ defmodule Ferricstore.Store.Router.Part09 do
       @spec server_catalog_entries(FerricStore.Instance.t(), binary()) ::
               {:ok, [{binary(), binary()}]} | :unavailable | {:error, atom()}
       def server_catalog_entries(ctx, namespace) do
+        server_catalog_entries_on_shard(ctx, 0, namespace)
+      end
+
+      @doc false
+      @spec server_catalog_entries_on_shard(
+              FerricStore.Instance.t(),
+              non_neg_integer(),
+              binary()
+            ) :: {:ok, [{binary(), binary()}]} | :unavailable | {:error, atom()}
+      def server_catalog_entries_on_shard(ctx, shard_index, namespace)
+          when is_integer(shard_index) and shard_index >= 0 do
         prefix = Ferricstore.ServerCatalog.prefix(namespace)
 
-        case safe_read_call(ctx, 0, {:scan_prefix, prefix}) do
+        case safe_read_call(ctx, shard_index, {:scan_prefix, prefix}) do
           {:ok, entries} when is_list(entries) ->
             decode_server_catalog_subjects(namespace, entries)
 

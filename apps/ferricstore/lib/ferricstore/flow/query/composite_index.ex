@@ -8,8 +8,9 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   @hash_tag 0x50
   @scope_tag 0x70
   @entry_identity_tag 0x60
+  @entry_identity_bytes 33
+  @entry_value_version 1
   @reverse_prefix "flow-composite-reverse:1:"
-  @entry_value_tag :flow_composite_entry
   @reverse_value_tag :flow_composite_reverse
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
   @max_exact_integer 9_007_199_254_740_991
@@ -28,8 +29,15 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
           index_version: pos_integer()
         }
 
+  @opaque record_matcher ::
+            {:flow_composite_record_matcher, binary(), [IndexDefinition.field_spec()]}
+
   @spec max_entries_per_record() :: pos_integer()
   def max_entries_per_record, do: @max_reverse_entries
+
+  @doc false
+  @spec max_reverse_value_bytes() :: pos_integer()
+  def max_reverse_value_bytes, do: @max_reverse_value_bytes
 
   @spec entries(IndexDefinition.t(), map(), binary(), non_neg_integer()) ::
           {:ok, [entry()]} | {:error, atom()}
@@ -42,8 +50,30 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
       when is_map(record) and is_binary(state_key) and state_key != "" and
              byte_size(state_key) <= @max_state_key_bytes and
              is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 do
-    with :ok <- IndexDefinition.validate(definition),
-         {:ok, id} <- required_binary(record, :run_id),
+    with :ok <- IndexDefinition.validate(definition) do
+      entries_validated(definition, record, state_key, expire_at_ms)
+    end
+  end
+
+  def entries(%IndexDefinition{}, record, _state_key, _expire_at_ms) when is_map(record),
+    do: {:error, :invalid_composite_record}
+
+  def entries(%IndexDefinition{}, _record, _state_key, _expire_at_ms),
+    do: {:error, :invalid_composite_record}
+
+  @doc false
+  @spec entries_validated(IndexDefinition.t(), map(), binary(), non_neg_integer()) ::
+          {:ok, [entry()]} | {:error, atom()}
+  def entries_validated(
+        %IndexDefinition{} = definition,
+        record,
+        state_key,
+        expire_at_ms
+      )
+      when is_map(record) and is_binary(state_key) and state_key != "" and
+             byte_size(state_key) <= @max_state_key_bytes and
+             is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 do
+    with {:ok, id} <- required_binary(record, :run_id),
          :ok <- validate_record_owner(record, id, state_key),
          {:ok, scope_prefix} <- record_scope_prefix(definition, record),
          {:ok, projection_record} <- logical_projection_record(record),
@@ -64,10 +94,11 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
     end
   end
 
-  def entries(%IndexDefinition{}, record, _state_key, _expire_at_ms) when is_map(record),
-    do: {:error, :invalid_composite_record}
+  def entries_validated(%IndexDefinition{}, record, _state_key, _expire_at_ms)
+      when is_map(record),
+      do: {:error, :invalid_composite_record}
 
-  def entries(%IndexDefinition{}, _record, _state_key, _expire_at_ms),
+  def entries_validated(%IndexDefinition{}, _record, _state_key, _expire_at_ms),
     do: {:error, :invalid_composite_record}
 
   @spec encode_prefix(IndexDefinition.t(), [term()]) :: {:ok, binary()} | {:error, atom()}
@@ -106,25 +137,39 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
 
   @spec encode_reverse_value(binary(), [binary()]) :: binary()
   def encode_reverse_value(state_key, keys)
+      when is_binary(state_key) and is_list(keys),
+      do: encode_reverse_value(state_key, keys, 0)
+
+  @spec encode_reverse_value(binary(), [binary()], non_neg_integer()) :: binary()
+  def encode_reverse_value(state_key, keys, expire_at_ms)
       when is_binary(state_key) and state_key != "" and
-             byte_size(state_key) <= @max_state_key_bytes and is_list(keys) do
+             byte_size(state_key) <= @max_state_key_bytes and is_list(keys) and
+             is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 do
     with {:ok, id} <- Keys.run_id_from_state_key(state_key),
          true <- valid_reverse_keys?(keys, id) do
-      TermCodec.encode({@reverse_value_tag, 1, state_key, keys})
+      TermCodec.encode({@reverse_value_tag, 1, state_key, keys, expire_at_ms})
     else
       _invalid -> raise ArgumentError, "composite reverse keys are invalid"
     end
   end
 
-  @spec decode_reverse_value(binary(), binary()) :: {:ok, [binary()]} | :error
-  def decode_reverse_value(blob, expected_state_key)
+  def encode_reverse_value(_state_key, _keys, _expire_at_ms),
+    do: raise(ArgumentError, "composite reverse keys are invalid")
+
+  @spec decode_reverse_state(binary(), binary()) ::
+          {:ok, %{keys: [binary()], expire_at_ms: non_neg_integer()}} | :error
+  def decode_reverse_state(blob, expected_state_key)
       when is_binary(blob) and byte_size(blob) <= @max_reverse_value_bytes and
              is_binary(expected_state_key) and expected_state_key != "" and
              byte_size(expected_state_key) <= @max_state_key_bytes do
     with {:ok, id} <- Keys.run_id_from_state_key(expected_state_key) do
       case TermCodec.decode(blob) do
-        {:ok, {@reverse_value_tag, 1, ^expected_state_key, keys}} when is_list(keys) ->
-          if valid_reverse_keys?(keys, id), do: {:ok, keys}, else: :error
+        {:ok, {@reverse_value_tag, 1, ^expected_state_key, keys, expire_at_ms}}
+        when is_list(keys) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
+               expire_at_ms <= @max_u64 ->
+          if valid_reverse_keys?(keys, id),
+            do: {:ok, %{keys: keys, expire_at_ms: expire_at_ms}},
+            else: :error
 
         _other ->
           :error
@@ -134,20 +179,35 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
     _error -> :error
   end
 
+  def decode_reverse_state(_blob, _expected_state_key), do: :error
+
+  @spec decode_reverse_value(binary(), binary()) :: {:ok, [binary()]} | :error
+  def decode_reverse_value(blob, expected_state_key)
+      when is_binary(blob) and byte_size(blob) <= @max_reverse_value_bytes and
+             is_binary(expected_state_key) and expected_state_key != "" and
+             byte_size(expected_state_key) <= @max_state_key_bytes do
+    case decode_reverse_state(blob, expected_state_key) do
+      {:ok, %{keys: keys}} -> {:ok, keys}
+      :error -> :error
+    end
+  end
+
   def decode_reverse_value(_blob, _expected_state_key), do: :error
 
-  @spec decode_reverse_row(binary(), binary()) :: {:ok, {binary(), [binary()]}} | :error
+  @spec decode_reverse_row(binary(), binary()) ::
+          {:ok, {binary(), [binary()], non_neg_integer()}} | :error
   def decode_reverse_row(key, blob)
       when is_binary(key) and is_binary(blob) and
              byte_size(blob) <= @max_reverse_value_bytes do
     case TermCodec.decode(blob) do
-      {:ok, {@reverse_value_tag, 1, state_key, keys}}
+      {:ok, {@reverse_value_tag, 1, state_key, keys, expire_at_ms}}
       when is_binary(state_key) and state_key != "" and
-             byte_size(state_key) <= @max_state_key_bytes and is_list(keys) ->
+             byte_size(state_key) <= @max_state_key_bytes and is_list(keys) and
+             is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 ->
         with {:ok, id} <- Keys.run_id_from_state_key(state_key),
              true <- key == reverse_key(state_key),
              true <- valid_reverse_keys?(keys, id) do
-          {:ok, {state_key, keys}}
+          {:ok, {state_key, keys, expire_at_ms}}
         else
           _invalid -> :error
         end
@@ -164,30 +224,24 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   @spec decode_entry_value(binary()) :: {:ok, map()} | :error
   def decode_entry_value(blob)
       when is_binary(blob) and byte_size(blob) <= @max_entry_value_bytes do
-    case TermCodec.decode(blob) do
-      {:ok, {@entry_value_tag, 1, id, state_key, record_version, expire_at_ms}}
-      when is_binary(id) and id != "" and is_binary(state_key) and state_key != "" and
-             byte_size(id) <= @max_run_id_bytes and
-             byte_size(state_key) <= @max_state_key_bytes and
-             is_integer(record_version) and record_version >= 0 and
-             record_version <= @max_exact_integer and
-             is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 ->
-        case Keys.run_id_from_state_key(state_key) do
-          {:ok, ^id} ->
-            {:ok,
-             %{
-               id: id,
-               state_key: state_key,
-               record_version: record_version,
-               expire_at_ms: expire_at_ms
-             }}
-
-          _invalid ->
-            :error
-        end
-
-      _other ->
-        :error
+    with <<@entry_value_version, id_bytes::unsigned-big-32, record_version::unsigned-big-64,
+           expire_at_ms::unsigned-big-64, payload::binary>> <-
+           blob,
+         true <- id_bytes > 0 and id_bytes <= @max_run_id_bytes,
+         true <- id_bytes < byte_size(payload),
+         <<id::binary-size(id_bytes), state_key::binary>> <- payload,
+         true <- byte_size(state_key) <= @max_state_key_bytes,
+         true <- record_version <= @max_exact_integer,
+         {:ok, ^id} <- Keys.run_id_from_state_key(state_key) do
+      {:ok,
+       %{
+         id: id,
+         state_key: state_key,
+         record_version: record_version,
+         expire_at_ms: expire_at_ms
+       }}
+    else
+      _invalid -> :error
     end
   rescue
     _error -> :error
@@ -212,8 +266,24 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   def entry_key_matches_record?(%IndexDefinition{} = definition, record, state_key, key)
       when is_map(record) and is_binary(state_key) and state_key != "" and is_binary(key) and
              byte_size(key) <= @lmdb_max_key_bytes do
-    with :ok <- IndexDefinition.validate(definition),
-         {:ok, id} <- required_binary(record, :run_id),
+    with :ok <- IndexDefinition.validate(definition) do
+      entry_key_matches_record_validated?(definition, record, state_key, key)
+    else
+      _invalid -> false
+    end
+  rescue
+    _error -> false
+  end
+
+  def entry_key_matches_record?(_definition, _record, _state_key, _key), do: false
+
+  @doc false
+  @spec entry_key_matches_record_validated?(IndexDefinition.t(), map(), binary(), binary()) ::
+          boolean()
+  def entry_key_matches_record_validated?(%IndexDefinition{} = definition, record, state_key, key)
+      when is_map(record) and is_binary(state_key) and state_key != "" and is_binary(key) and
+             byte_size(key) <= @lmdb_max_key_bytes do
+    with {:ok, id} <- required_binary(record, :run_id),
          :ok <- validate_record_owner(record, id, state_key),
          {:ok, scope_prefix} <- record_scope_prefix(definition, record),
          {:ok, projection_record} <- logical_projection_record(record),
@@ -234,7 +304,56 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
     _error -> false
   end
 
-  def entry_key_matches_record?(_definition, _record, _state_key, _key), do: false
+  def entry_key_matches_record_validated?(_definition, _record, _state_key, _key), do: false
+
+  @doc false
+  @spec prepare_record_matcher_validated(
+          IndexDefinition.t(),
+          binary() | nil,
+          binary()
+        ) :: {:ok, record_matcher()} | {:error, atom()}
+  def prepare_record_matcher_validated(
+        %IndexDefinition{fields: [{:partition_key, :asc, :hashed} | fields]} = definition,
+        scope_prefix,
+        logical_partition
+      )
+      when (is_binary(scope_prefix) or is_nil(scope_prefix)) and is_binary(logical_partition) and
+             logical_partition != "" do
+    with {:ok, prefix} <-
+           encode_validated_prefix(definition, scope_prefix, [logical_partition]) do
+      {:ok, {:flow_composite_record_matcher, prefix, fields}}
+    end
+  end
+
+  def prepare_record_matcher_validated(%IndexDefinition{}, _scope_prefix, _logical_partition),
+    do: {:error, :invalid_composite_record_matcher}
+
+  @doc false
+  @spec entry_key_matches_record_validated?(record_matcher(), map(), binary()) :: boolean()
+  def entry_key_matches_record_validated?(
+        {:flow_composite_record_matcher, prefix, fields},
+        record,
+        key
+      )
+      when is_binary(prefix) and prefix != "" and is_list(fields) and is_map(record) and
+             is_binary(key) and byte_size(key) <= @lmdb_max_key_bytes do
+    prefix_bytes = byte_size(prefix)
+    component_bytes = byte_size(key) - prefix_bytes - @entry_identity_bytes
+
+    if component_bytes >= 0 and String.starts_with?(key, prefix) do
+      components = binary_part(key, prefix_bytes, component_bytes)
+      identity = binary_part(key, prefix_bytes + component_bytes, @entry_identity_bytes)
+
+      match?(<<@entry_identity_tag, _run_ref::binary-size(32)>>, identity) and
+        key_components_match?(components, fields, record)
+    else
+      false
+    end
+  rescue
+    _error -> false
+  end
+
+  def entry_key_matches_record_validated?(_matcher, _record, _key), do: false
 
   defp required_binary(record, field) do
     case Field.fetch(record, field) do
@@ -510,7 +629,8 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   end
 
   defp encode_entry_value(id, state_key, record_version, expire_at_ms) do
-    TermCodec.encode({@entry_value_tag, 1, id, state_key, record_version, expire_at_ms})
+    <<@entry_value_version, byte_size(id)::unsigned-big-32, record_version::unsigned-big-64,
+      expire_at_ms::unsigned-big-64, id::binary, state_key::binary>>
   end
 
   defp valid_reverse_keys?(keys, id) when length(keys) <= @max_reverse_entries do

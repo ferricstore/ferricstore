@@ -97,6 +97,50 @@ defmodule Ferricstore.Flow.Query.CompositeRangeTest do
     assert Enum.map(second, & &1.id) == ["one"]
   end
 
+  test "fused LMDB range returns validated source rows and exact byte accounting", %{
+    path: path,
+    definition: definition
+  } do
+    record = record("one", "tenant-a", 100)
+    write_records!(path, definition, [record])
+    assert {:ok, range} = CompositeRange.prefix(definition, ["tenant-a", "failed"])
+
+    assert {:ok,
+            [
+              {storage_key, "one", state_key, 1, 0, storage_bytes}
+            ], true, scanned_bytes} =
+             LMDB.composite_range_entries_bounded(
+               path,
+               range.prefix,
+               range.after_key,
+               range.before_key,
+               10,
+               16_384
+             )
+
+    assert state_key == Keys.state_key("one", "tenant-a")
+    assert String.starts_with?(storage_key, range.prefix)
+    assert storage_bytes == scanned_bytes
+
+    invalid_state_key = "f:{invalid}:s:one"
+
+    invalid_value =
+      <<1, 3::unsigned-big-32, 1::unsigned-big-64, 0::unsigned-big-64, "one",
+        invalid_state_key::binary>>
+
+    assert :ok = LMDB.write_batch(path, [{:put, storage_key, invalid_value}])
+
+    assert {:error, :invalid_composite_entry} =
+             LMDB.composite_range_entries_bounded(
+               path,
+               range.prefix,
+               range.after_key,
+               range.before_key,
+               10,
+               16_384
+             )
+  end
+
   test "maps inclusive bounds correctly for an ascending ordered field", %{path: path} do
     definition =
       IndexDefinition.new!(%{

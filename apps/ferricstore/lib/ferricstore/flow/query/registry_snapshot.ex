@@ -34,8 +34,7 @@ defmodule Ferricstore.Flow.Query.RegistrySnapshot do
          true <- Enum.all?(indexes, &(RegisteredIndex.validate(&1) == :ok)),
          :ok <- validate_unique(indexes),
          :ok <- validate_projection_budget(indexes) do
-      {:ok,
-       %__MODULE__{epoch: epoch, catalog_version: catalog_version, indexes: indexes}}
+      {:ok, %__MODULE__{epoch: epoch, catalog_version: catalog_version, indexes: indexes}}
     else
       false -> {:error, :invalid_query_index_snapshot}
       {:error, _reason} = error -> error
@@ -68,8 +67,8 @@ defmodule Ferricstore.Flow.Query.RegistrySnapshot do
 
     if length(logical) == length(Enum.uniq(logical)) and
          length(physical) == length(Enum.uniq(physical)),
-      do: :ok,
-      else: {:error, :duplicate_query_index}
+       do: :ok,
+       else: {:error, :duplicate_query_index}
   end
 
   defp validate_projection_budget(indexes) do
@@ -87,7 +86,7 @@ defmodule Ferricstore.Flow.Query.RegistrySnapshot do
     if Enum.any?(fields, fn {field, _direction, _encoding} ->
          match?({:attribute, _name}, field)
        end),
-      do: 16,
-      else: 1
+       do: 16,
+       else: 1
   end
 end

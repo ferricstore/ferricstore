@@ -287,6 +287,26 @@ defmodule Ferricstore.Raft.BlobCommand do
          %{data_dir: data_dir},
          shard_index,
          threshold,
+         {:flow_create_with_catalog, key, catalog, attrs} = command
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_map(catalog) and is_map(attrs) do
+    case FlowAttrs.prepare_flow_attrs(data_dir, shard_index, threshold, attrs) do
+      {:ok, prepared_attrs, true} ->
+        {:ok, {:flow_create_with_catalog, key, catalog, prepared_attrs}}
+
+      {:ok, _prepared_attrs, false} ->
+        {:ok, command}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp prepare_enabled(
+         %{data_dir: data_dir},
+         shard_index,
+         threshold,
          {:flow_terminal_pipeline_batch, op, key, attrs} = command
        )
        when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
@@ -411,6 +431,10 @@ defmodule Ferricstore.Raft.BlobCommand do
 
   defp command_candidate?({:flow_policy_fence, _installs, command}, threshold),
     do: command_candidate?(command, threshold)
+
+  defp command_candidate?({:flow_create_with_catalog, _key, catalog, attrs}, threshold)
+       when is_map(catalog) and is_map(attrs),
+       do: FlowAttrs.flow_attrs_candidate?(attrs, threshold)
 
   defp command_candidate?({:flow_terminal_pipeline_batch, op, _key, attrs}, threshold)
        when is_atom(op) and is_map(attrs) do

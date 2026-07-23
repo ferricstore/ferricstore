@@ -73,7 +73,8 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
   alias Ferricstore.Store.Shard.{
     CompoundMemberIndex,
     CompoundRevisionIndex,
-    LogicalKeyIndex
+    LogicalKeyIndex,
+    NamespaceUsageIndex
   }
 
   alias Ferricstore.Test.IsolatedInstance
@@ -104,6 +105,7 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     catalog = CompoundMemberIndex.table_name(ctx.name, 0)
     revision = CompoundRevisionIndex.table_name(ctx.name, 0)
     {logical_keys, logical_slots} = LogicalKeyIndex.table_names(ctx.name, 0)
+    {namespace_usage, namespace_usage_expiry} = NamespaceUsageIndex.table_names(ctx.name, 0)
     key = CompoundKey.set_member("catalog-owner-crash", "member")
     row = {key, "1", 0, 0, 0, 0, 1}
 
@@ -114,6 +116,8 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     revision_tid = :ets.whereis(revision)
     logical_keys_tid = :ets.whereis(logical_keys)
     logical_slots_tid = :ets.whereis(logical_slots)
+    namespace_usage_tid = :ets.whereis(namespace_usage)
+    namespace_usage_expiry_tid = :ets.whereis(namespace_usage_expiry)
     keydir_owner = :ets.info(keydir, :owner)
 
     Process.unlink(owner)
@@ -126,6 +130,8 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     assert revision_tid == :ets.whereis(revision)
     assert logical_keys_tid == :ets.whereis(logical_keys)
     assert logical_slots_tid == :ets.whereis(logical_slots)
+    assert namespace_usage_tid == :ets.whereis(namespace_usage)
+    assert namespace_usage_expiry_tid == :ets.whereis(namespace_usage_expiry)
     assert [^row] = :ets.lookup(keydir, key)
 
     assert {:ok, [^key]} =
@@ -142,6 +148,8 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     assert restarted_owner == :ets.info(revision, :owner)
     assert restarted_owner == :ets.info(logical_keys, :owner)
     assert restarted_owner == :ets.info(logical_slots, :owner)
+    assert restarted_owner == :ets.info(namespace_usage, :owner)
+    assert restarted_owner == :ets.info(namespace_usage_expiry, :owner)
   end
 
   test "a restarted keydir heir is rearmed before a later owner crash", %{

@@ -65,6 +65,54 @@ defmodule Ferricstore.Flow.RecordQueryTest do
     assert RecordQuery.flatten_chunks(chunks) == [1, 2, 3, 4]
   end
 
+  test "bounded ordered chunk merge preserves ascending rank and first-source duplicates" do
+    chunks = [
+      [
+        %{id: "a", updated_at_ms: 1, owner: :first},
+        %{id: "duplicate", updated_at_ms: 3, owner: :first},
+        %{id: "z", updated_at_ms: 9, owner: :first}
+      ],
+      [
+        %{id: "b", updated_at_ms: 2, owner: :second},
+        %{id: "duplicate", updated_at_ms: 3, owner: :second},
+        %{id: "c", updated_at_ms: 4, owner: :second}
+      ],
+      []
+    ]
+
+    assert RecordQuery.merge_ordered_record_chunks(chunks, 4, false) == [
+             %{id: "a", updated_at_ms: 1, owner: :first},
+             %{id: "b", updated_at_ms: 2, owner: :second},
+             %{id: "duplicate", updated_at_ms: 3, owner: :first},
+             %{id: "c", updated_at_ms: 4, owner: :second}
+           ]
+  end
+
+  test "bounded ordered chunk merge preserves descending rank and first-source duplicates" do
+    chunks = [
+      [
+        %{id: "z", updated_at_ms: 9, owner: :first},
+        %{id: "duplicate", updated_at_ms: 3, owner: :first},
+        %{id: "a", updated_at_ms: 1, owner: :first}
+      ],
+      [
+        %{id: "c", updated_at_ms: 4, owner: :second},
+        %{id: "duplicate", updated_at_ms: 3, owner: :second},
+        %{id: "b", updated_at_ms: 2, owner: :second}
+      ]
+    ]
+
+    assert RecordQuery.merge_ordered_record_chunks(chunks, 4, true) == [
+             %{id: "z", updated_at_ms: 9, owner: :first},
+             %{id: "c", updated_at_ms: 4, owner: :second},
+             %{id: "duplicate", updated_at_ms: 3, owner: :first},
+             %{id: "b", updated_at_ms: 2, owner: :second}
+           ]
+
+    assert RecordQuery.merge_ordered_record_chunks(chunks, 0, true) == []
+    assert RecordQuery.merge_ordered_record_chunks([], 10, true) == []
+  end
+
   test "auto-partition merge caps each fetch and fails instead of returning an inexact prefix" do
     parent = self()
 

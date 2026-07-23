@@ -1,11 +1,16 @@
 defmodule Ferricstore.Commands.NativeAstParserTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.NativeAstParser
+  alias Ferricstore.Commands.{Extension, NativeAstParser}
   alias FerricstoreServer.Acl.CommandCategories
 
   @protocol_control_commands ~w(PIPELINE)
+  @authorization_only_commands ~w(FLOW.QUERY.EXPLAIN)
   @not_implemented_redis_commands ~w(DUMP MIGRATE RESTORE SHUTDOWN SORT)
+  @removed_flow_collection_commands ~w(
+    FLOW.LIST FLOW.SEARCH FLOW.TERMINALS FLOW.FAILURES FLOW.STUCK
+    FLOW.BY_PARENT FLOW.BY_ROOT FLOW.BY_CORRELATION
+  )
 
   test "rejects nonconvertible command arguments without raising" do
     for invalid <- [%{}, {:tuple, "value"}, [0xD800]] do
@@ -37,6 +42,7 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
       CommandCategories.categories()
       |> Map.fetch!("ALL")
       |> Enum.reject(&(&1 in @protocol_control_commands))
+      |> Enum.reject(&(&1 in @authorization_only_commands))
       |> Enum.reject(&(&1 in @not_implemented_redis_commands))
       |> Enum.reject(&native_parser_covers?(&1, supported))
       |> Enum.sort()
@@ -44,12 +50,16 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     assert unsupported == []
   end
 
-  test "parses every ACL-visible command family without unknown AST fallback" do
+  test "parses every built-in ACL-visible command family without unknown AST fallback" do
+    extension_names = Extension.command_names_upper()
+
     commands =
       CommandCategories.categories()
       |> Map.fetch!("ALL")
       |> Enum.reject(&(&1 in @protocol_control_commands))
+      |> Enum.reject(&(&1 in @authorization_only_commands))
       |> Enum.reject(&(&1 in @not_implemented_redis_commands))
+      |> Enum.reject(&MapSet.member?(extension_names, &1))
 
     for command <- commands do
       {name, args} = parser_call(command)
@@ -73,11 +83,15 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
     end
   end
 
-  test "every Flow command has a non-empty ACL scope" do
+  test "every built-in Flow data command has a non-empty ACL scope" do
+    extension_names = Extension.command_names_upper()
+
     commands =
       CommandCategories.categories()
       |> Map.fetch!("ALL")
       |> Enum.filter(&String.starts_with?(&1, "FLOW."))
+      |> Enum.reject(&(&1 in @authorization_only_commands))
+      |> Enum.reject(&MapSet.member?(extension_names, &1))
 
     for command <- commands do
       {name, args} = parser_call(command)
@@ -180,6 +194,13 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              NativeAstParser.parse("FLOW.QUERY", ["FQL1", query | params])
 
     assert too_many_error =~ "at most 64"
+  end
+
+  test "removed Flow collection commands have no parser route" do
+    for command <- @removed_flow_collection_commands do
+      assert {:ok, ^command, [], {:unknown, ^command, []}, []} =
+               NativeAstParser.parse(command, [])
+    end
   end
 
   test "parses hot string command ASTs directly" do
@@ -435,41 +456,6 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
 
     assert {:ok, "FLOW.HISTORY", _args, {:flow_history, "flow-1", []}, ["*"]} =
              NativeAstParser.parse("flow.history", ["flow-1"])
-
-    assert {:ok, "FLOW.LIST", _args, {:flow_list, "checkout", [partition_key: "tenant:a"]},
-            ["tenant:a"]} =
-             NativeAstParser.parse("flow.list", ["checkout", "PARTITION", "tenant:a"])
-
-    assert {:ok, "FLOW.SEARCH", _args, {:flow_search, search_opts}, ["tenant:a"]} =
-             NativeAstParser.parse("flow.search", [
-               "TYPE",
-               "checkout",
-               "ATTRIBUTE",
-               "tenant",
-               "acme",
-               "COUNT",
-               "10",
-               "PARTITION",
-               "tenant:a"
-             ])
-
-    assert search_opts[:type] == "checkout"
-    assert search_opts[:attributes] == %{"tenant" => "acme"}
-    assert search_opts[:count] == 10
-    assert search_opts[:partition_key] == "tenant:a"
-
-    assert {:ok, "FLOW.SEARCH", _args, {:flow_search, search_opts}, ["*"]} =
-             NativeAstParser.parse("flow.search", [
-               "TYPE",
-               "checkout",
-               "STATE_META",
-               "running",
-               "step",
-               "charge"
-             ])
-
-    assert search_opts[:type] == "checkout"
-    assert search_opts[:state_meta] == %{"running" => %{"step" => "charge"}}
 
     assert {:ok, "FLOW.ATTRIBUTES", _args,
             {:flow_attributes, "checkout", [partition_key: "tenant:a"]}, ["tenant:a"]} =

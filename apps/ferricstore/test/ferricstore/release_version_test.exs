@@ -2,7 +2,7 @@ defmodule Ferricstore.ReleaseVersionTest do
   use ExUnit.Case, async: true
 
   @repo_root Path.expand("../../../..", __DIR__)
-  @release_version "0.9.1"
+  @release_version "0.10.0"
 
   @project_files [
     "mix.exs",
@@ -73,6 +73,15 @@ defmodule Ferricstore.ReleaseVersionTest do
 
     assert changelog =~ "## Unreleased"
     assert changelog =~ "## #{@release_version} - "
+  end
+
+  test "Hex package inputs contain no removed protocol artifacts" do
+    refute File.exists?(
+             Path.join(
+               @repo_root,
+               "apps/ferricstore/checksum-Elixir.Ferricstore.Resp.ParserNif.exs"
+             )
+           )
   end
 
   defp read!(relative_path), do: File.read!(Path.join(@repo_root, relative_path))

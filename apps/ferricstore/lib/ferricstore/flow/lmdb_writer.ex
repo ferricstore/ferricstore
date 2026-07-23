@@ -669,6 +669,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         timer_ref: nil,
         projection_dirty?: false,
         terminal_atomic_write?: false,
+        write_group_sizes: [],
         enqueue_seq: enqueue_seq,
         processed_enqueue_seq: 0,
         processed_enqueue_gaps: MapSet.new(),
@@ -697,6 +698,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
         timer_ref: nil,
         terminal_count_inits: MapSet.new(),
         terminal_atomic_write?: false,
+        write_group_sizes: [],
         lmdb_ready: false,
         suspended?: suspended?,
         projection_dirty?: false,
@@ -965,7 +967,8 @@ defmodule Ferricstore.Flow.LMDBWriter do
         first_pending_at: nil,
         last_enqueue_at: nil,
         timer_ref: nil,
-        terminal_atomic_write?: false
+        terminal_atomic_write?: false,
+        write_group_sizes: []
     }
   end
 
@@ -1028,7 +1031,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
       true ->
         with :ok <- write_ops(state.path, [Ferricstore.Flow.LMDB.flush_in_progress_put_op()]),
-             :ok <- write_op_chunks(state, ops, chunk_ops),
+             :ok <- write_op_groups(state, ops, chunk_ops),
              :ok <- write_ops(state.path, [Ferricstore.Flow.LMDB.flush_in_progress_delete_op()]) do
           :ok
         end
@@ -1041,19 +1044,76 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp flush_chunk_ops(_state), do: Config.default_flush_chunk_ops()
 
-  defp write_op_chunks(state, ops, chunk_ops) do
-    ops
-    |> Enum.chunk_every(chunk_ops)
-    |> Enum.reduce_while(:ok, fn chunk, :ok ->
-      case write_ops(state.path, chunk) do
-        :ok ->
-          maybe_pause_between_flush_chunks(state)
-          {:cont, :ok}
+  defp write_op_groups(state, ops, chunk_ops) do
+    case Map.get(state, :write_group_sizes) do
+      sizes when is_list(sizes) ->
+        write_op_groups(state, ops, sizes, chunk_ops, [], 0)
 
-        {:error, _reason} = error ->
-          {:halt, error}
-      end
-    end)
+      _invalid ->
+        {:error, :invalid_lmdb_write_groups}
+    end
+  end
+
+  defp write_op_groups(state, [], [], _chunk_ops, pending_groups, _pending_count),
+    do: write_pending_groups(state, pending_groups)
+
+  defp write_op_groups(
+         state,
+         ops,
+         [size | sizes],
+         chunk_ops,
+         pending_groups,
+         pending_count
+       )
+       when is_integer(size) and size > 0 do
+    case Enum.split(ops, size) do
+      {group, rest} when length(group) == size ->
+        cond do
+          pending_count == 0 and size > chunk_ops ->
+            with :ok <- write_ops_and_pause(state, group) do
+              write_op_groups(state, rest, sizes, chunk_ops, [], 0)
+            end
+
+          pending_count + size <= chunk_ops ->
+            write_op_groups(
+              state,
+              rest,
+              sizes,
+              chunk_ops,
+              [group | pending_groups],
+              pending_count + size
+            )
+
+          true ->
+            with :ok <- write_pending_groups(state, pending_groups) do
+              write_op_groups(state, ops, [size | sizes], chunk_ops, [], 0)
+            end
+        end
+
+      _invalid ->
+        {:error, :invalid_lmdb_write_groups}
+    end
+  end
+
+  defp write_op_groups(_state, _ops, _sizes, _chunk_ops, _pending_groups, _pending_count),
+    do: {:error, :invalid_lmdb_write_groups}
+
+  defp write_pending_groups(_state, []), do: :ok
+
+  defp write_pending_groups(state, reversed_groups) do
+    ops = reversed_groups |> Enum.reverse() |> List.flatten()
+    write_ops_and_pause(state, ops)
+  end
+
+  defp write_ops_and_pause(state, ops) do
+    case write_ops(state.path, ops) do
+      :ok ->
+        maybe_pause_between_flush_chunks(state)
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp maybe_pause_between_flush_chunks(%{flush_chunk_pause_ms: pause_ms})

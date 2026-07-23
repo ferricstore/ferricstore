@@ -49,10 +49,9 @@ data-structure commands. They are exposed through native TCP mode and the embedd
 `FLOW.EXTEND_LEASE`, `FLOW.COMPLETE`, `FLOW.COMPLETE_MANY`, `FLOW.RETRY`,
 `FLOW.RETRY_MANY`, `FLOW.FAIL`, `FLOW.FAIL_MANY`, `FLOW.CANCEL`,
 `FLOW.CANCEL_MANY`, `FLOW.TRANSITION`, `FLOW.TRANSITION_MANY`,
-`FLOW.REWIND`, `FLOW.LIST`, `FLOW.STATS`, `FLOW.BY_PARENT`, `FLOW.BY_ROOT`,
-`FLOW.BY_CORRELATION`, `FLOW.INFO`, `FLOW.STUCK`, `FLOW.HISTORY`,
-`FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.POLICY.SET`, `FLOW.POLICY.GET`,
-`FLOW.SEARCH`, `FLOW.QUERY`, and `FLOW.RETENTION_CLEANUP`.
+`FLOW.REWIND`, `FLOW.STATS`, `FLOW.INFO`, `FLOW.HISTORY`,
+`FLOW.POLICY.SET`, `FLOW.POLICY.GET`, `FLOW.ATTRIBUTES`,
+`FLOW.ATTRIBUTE_VALUES`, `FLOW.QUERY`, and `FLOW.RETENTION_CLEANUP`.
 
 Flow attributes are small indexed metadata fields for query and dashboard
 filters. They are separate from payload and named value refs:
@@ -60,37 +59,39 @@ filters. They are separate from payload and named value refs:
 ```text
 FLOW.CREATE order-1 TYPE order STATE queued ATTRIBUTE tenant acme ATTRIBUTE region us
 FLOW.TRANSITION order-1 queued charged LEASE_TOKEN <token> FENCING 1 ATTRIBUTE_MERGE phase charge
-FLOW.LIST order STATE queued ATTRIBUTE tenant acme COUNT 100
 FLOW.STATS order STATE queued ATTRIBUTE tenant acme
-FLOW.SEARCH TYPE order STATE queued ATTRIBUTE tenant acme CONSISTENT_PROJECTION true
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state AND attribute.tenant = @tenant ORDER BY updated_at_ms ASC LIMIT 100 RETURN RECORDS" partition tenant-a type order state queued tenant acme
 ```
 
 Use `FLOW.QUERY` as the versioned read/query envelope. The OSS default provider
-supports the authoritative point-record path:
+supports authoritative point/history reads and its advertised fixed-index
+collection shapes:
 
 ```text
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'order-1' RETURN RECORD"
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD" partition tenant-a flow_id order-1
 FLOW.QUERY FQL1 "EXPLAIN FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD" partition tenant-a flow_id order-1
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND parent_flow_id = @parent ORDER BY updated_at_ms DESC LIMIT 50 RETURN RECORDS" partition tenant-a parent checkout-root
 ```
 
-Both `partition_key` and `run_id` are required, though their predicate order is
-interchangeable. Enterprise installs the bounded collection provider and
-advertises its additional shapes through capability negotiation, including:
+Collection reads require one `partition_key` equality. A point read that omits
+it addresses only the run ID's deterministic auto-partition; explicitly
+partitioned runs require the predicate. Enterprise installs the composite collection provider and
+advertises its additional count, cursor, planner, and index-management
+capabilities through negotiation.
 
 ```text
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND state = 'failed' ORDER BY updated_at_ms DESC LIMIT 50 RETURN RECORDS" partition tenant-a
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND type = 'order' RETURN COUNT" partition tenant-a
 ```
 
-The OSS point provider rejects collection scans, run-id-only lookups, history,
-lineage, counts, ordering, pagination, and other return shapes. See
-[Flow Query Architecture](../docs/flow-query.md) for the Enterprise contract and
-mandatory bounds.
+OSS rejects unadvertised composite counts, cursors, and arbitrary predicate or
+ordering combinations. See [Flow Query Architecture](../docs/flow-query.md) for
+the exact capability contract and mandatory bounds.
 
-The returned record is a structural query projection. It does not include
-payload/result/error refs, named values, arbitrary attributes or state
-metadata, child bookkeeping, or worker lease/fencing credentials.
+The returned record is a structural query projection including attributes and
+state metadata. It excludes payload/result/error refs, named values, child
+bookkeeping, and worker lease/fencing credentials.
 
 Bound the total non-terminal lifetime of a Flow with a type policy or a
 per-create override:
@@ -144,7 +145,7 @@ for that state and does not overwrite metadata stored for earlier states:
 FLOW.POLICY.SET order INDEXED_STATE_META version
 FLOW.CREATE order-1 TYPE order STATE accept STATE_META version 1
 FLOW.COMPLETE order-1 <lease-token> FENCING <fencing-token> STATE_META version 3
-FLOW.SEARCH TYPE order STATE accept STATE_META accept version 1
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND type = @type AND state_meta.accept.version = @version ORDER BY updated_at_ms ASC LIMIT 100 RETURN RECORDS" partition tenant-a type order version 1
 ```
 
 Only one state metadata key can be indexed per Flow type. Non-indexed state

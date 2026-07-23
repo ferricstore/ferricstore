@@ -13,6 +13,7 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
   @max_page_items 256
   @max_page_bytes 16 * 1_024 * 1_024
   @cleanup_page_bytes 2 * 1_024 * 1_024
+  @max_expiry 0xFFFF_FFFF_FFFF_FFFF
 
   @spec staging_prefix(binary()) :: binary()
   def staging_prefix(build_id) when is_binary(build_id) and build_id != "" do
@@ -23,22 +24,44 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
           {:ok,
            %{done?: boolean(), scanned_keys: non_neg_integer(), staged_states: non_neg_integer()}}
           | {:error, term()}
-  def snapshot_page(ctx, shard_index, build_id, max_items, max_bytes)
+  def snapshot_page(ctx, shard_index, build_id, max_items, max_bytes),
+    do: snapshot_page(ctx, shard_index, build_id, max_items, max_bytes, [])
+
+  @doc false
+  @spec snapshot_page(
+          map(),
+          non_neg_integer(),
+          binary(),
+          pos_integer(),
+          pos_integer(),
+          keyword()
+        ) :: {:ok, map()} | {:error, term()}
+  def snapshot_page(ctx, shard_index, build_id, max_items, max_bytes, opts)
       when is_integer(max_items) and max_items > 0 and max_items <= @max_page_items and
-             is_integer(max_bytes) and max_bytes > 0 and max_bytes <= @max_page_bytes do
-    with :ok <- validate_context(ctx, shard_index, build_id),
+             is_integer(max_bytes) and max_bytes > 0 and max_bytes <= @max_page_bytes and
+             is_list(opts) do
+    with {:ok, write_batch} <- write_batch_fun(opts),
+         :ok <- validate_context(ctx, shard_index, build_id),
          path <- lmdb_path(ctx, shard_index),
-         false <- snapshot_complete?(path, build_id) do
-      bootstrap_or_snapshot(ctx, shard_index, path, build_id, max_items, max_bytes)
+         {:ok, false} <- snapshot_complete?(path, build_id) do
+      bootstrap_or_snapshot(
+        ctx,
+        shard_index,
+        path,
+        build_id,
+        max_items,
+        max_bytes,
+        write_batch
+      )
     else
-      true -> {:ok, %{done?: true, scanned_keys: 0, staged_states: 0}}
+      {:ok, true} -> {:ok, %{done?: true, scanned_keys: 0, staged_states: 0}}
       {:error, _reason} = error -> error
     end
   rescue
     error in [ArgumentError] -> {:error, {:query_backfill_snapshot_failed, error}}
   end
 
-  def snapshot_page(_ctx, _shard_index, _build_id, _max_items, _max_bytes),
+  def snapshot_page(_ctx, _shard_index, _build_id, _max_items, _max_bytes, _opts),
     do: {:error, :invalid_query_backfill_snapshot_request}
 
   @spec staging_page(
@@ -166,10 +189,18 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
   defp validate_context(_ctx, _shard_index, _build_id),
     do: {:error, :invalid_query_backfill_context}
 
-  defp bootstrap_or_snapshot(ctx, shard_index, path, build_id, max_items, max_bytes) do
+  defp bootstrap_or_snapshot(
+         ctx,
+         shard_index,
+         path,
+         build_id,
+         max_items,
+         max_bytes,
+         write_batch
+       ) do
     case SourceCatalog.bootstrap_page(ctx, shard_index, max_items, max_bytes) do
       {:ok, %{done?: true}} ->
-        snapshot_catalog_page(path, build_id, max_items, max_bytes)
+        snapshot_catalog_page(path, build_id, max_items, max_bytes, write_batch)
 
       {:ok, %{done?: false, scanned_keys: scanned_keys}} when scanned_keys > 0 ->
         {:ok, %{done?: false, scanned_keys: scanned_keys, staged_states: 0}}
@@ -185,7 +216,7 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
     end
   end
 
-  defp snapshot_catalog_page(path, build_id, max_items, max_bytes) do
+  defp snapshot_catalog_page(path, build_id, max_items, max_bytes, write_batch) do
     with {:ok, cursor} <- load_snapshot_cursor(path, build_id),
          {:ok, page} <- SourceCatalog.page(path, cursor, max_items, max_bytes),
          :ok <-
@@ -195,7 +226,8 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
              page.state_keys,
              page.cursor,
              page.done?,
-             max_bytes
+             max_bytes,
+             write_batch
            ) do
       {:ok,
        %{
@@ -235,7 +267,8 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
          state_keys,
          next_cursor,
          done?,
-         max_bytes
+         max_bytes,
+         write_batch
        ) do
     prefix = staging_prefix(build_id)
     staged = Enum.map(state_keys, &{prefix <> digest(&1), &1})
@@ -251,7 +284,11 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
       with {:ok, current, _read_bytes} <- bounded_staging_values(path, keys, max_bytes),
            {:ok, puts} <- collision_safe_puts(staged, current) do
         tail_ops = snapshot_tail_ops(build_id, next_cursor, done?)
-        LMDB.write_batch(path, puts ++ tail_ops)
+        ops = puts ++ tail_ops
+
+        if operation_bytes(ops) <= max_bytes,
+          do: write_batch.(path, ops),
+          else: {:error, :query_backfill_snapshot_page_too_large}
       end
     else
       {:error, :query_backfill_snapshot_page_too_large}
@@ -262,10 +299,10 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
     Enum.zip(staged, current)
     |> Enum.reduce_while({:ok, []}, fn
       {{key, state_key}, :not_found}, {:ok, acc} ->
-        {:cont, {:ok, [{:put, key, state_key} | acc]}}
+        {:cont, {:ok, [{:put, key, state_key}, {:compare_missing, key} | acc]}}
 
-      {{_key, state_key}, {:ok, state_key}}, {:ok, acc} ->
-        {:cont, {:ok, acc}}
+      {{key, state_key}, {:ok, state_key}}, {:ok, acc} ->
+        {:cont, {:ok, [{:compare, key, state_key} | acc]}}
 
       {{_key, _state_key}, {:ok, _other}}, _acc ->
         {:halt, {:error, :query_backfill_staging_hash_collision}}
@@ -309,8 +346,23 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
     ]
   end
 
-  defp snapshot_complete?(path, build_id),
-    do: LMDB.get(path, snapshot_complete_key(build_id)) == {:ok, build_id}
+  defp operation_bytes(ops) do
+    Enum.reduce(ops, 0, fn
+      {:put, key, value}, total -> total + byte_size(key) + byte_size(value)
+      {:compare, key, value}, total -> total + byte_size(key) + byte_size(value)
+      {:compare_missing, key}, total -> total + byte_size(key)
+      {:delete, key}, total -> total + byte_size(key)
+    end)
+  end
+
+  defp snapshot_complete?(path, build_id) do
+    case LMDB.get(path, snapshot_complete_key(build_id)) do
+      :not_found -> {:ok, false}
+      {:ok, ^build_id} -> {:ok, true}
+      {:ok, _invalid} -> {:error, :invalid_query_backfill_snapshot_complete_marker}
+      {:error, _reason} = error -> error
+    end
+  end
 
   defp decode_staging_rows(prefix, rows) do
     Enum.reduce_while(rows, {:ok, []}, fn
@@ -329,13 +381,13 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
   end
 
   defp hydrate_records(ctx, shard_index, state_keys, max_bytes, opts) do
-    read_values = Keyword.get(opts, :read_values_fun, &Router.read_shard_values/3)
+    read_entries = Keyword.get(opts, :read_entries_fun, &Router.read_shard_entries/3)
     decode_record = Keyword.get(opts, :decode_record_fun, &decode_record/1)
 
-    if is_function(read_values, 3) and is_function(decode_record, 1) do
-      case read_values.(ctx, shard_index, state_keys) do
-        {:ok, values} when is_list(values) and length(values) == length(state_keys) ->
-          decode_current_records(state_keys, values, decode_record, max_bytes)
+    if is_function(read_entries, 3) and is_function(decode_record, 1) do
+      case read_entries.(ctx, shard_index, state_keys) do
+        {:ok, entries} when is_list(entries) and length(entries) == length(state_keys) ->
+          decode_current_records(state_keys, entries, decode_record, max_bytes)
 
         :unavailable ->
           {:error, :query_backfill_primary_unavailable}
@@ -351,14 +403,16 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
     end
   end
 
-  defp decode_current_records(state_keys, values, decode_record, max_bytes) do
-    Enum.zip(state_keys, values)
+  defp decode_current_records(state_keys, entries, decode_record, max_bytes) do
+    Enum.zip(state_keys, entries)
     |> Enum.reduce_while({:ok, [], 0}, fn
       {state_key, nil}, {:ok, acc, bytes} ->
         tombstone = %{state_key: state_key, record: nil, expire_at_ms: 0}
         {:cont, {:ok, [tombstone | acc], bytes}}
 
-      {state_key, encoded}, {:ok, acc, bytes} when is_binary(encoded) ->
+      {state_key, {encoded, expire_at_ms}}, {:ok, acc, bytes}
+      when is_binary(encoded) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
+             expire_at_ms <= @max_expiry ->
         next_bytes = bytes + byte_size(encoded)
 
         if next_bytes > max_bytes do
@@ -370,7 +424,7 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
                 projected = %{
                   state_key: state_key,
                   record: record,
-                  expire_at_ms: record_expiry(record)
+                  expire_at_ms: expire_at_ms
                 }
 
                 {:cont, {:ok, [projected | acc], next_bytes}}
@@ -409,12 +463,6 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
     end
   end
 
-  defp record_expiry(%{terminal_retention_until_ms: expiry})
-       when is_integer(expiry) and expiry > 0,
-       do: expiry
-
-  defp record_expiry(_record), do: 0
-
   defp effective_page_items(ctx, max_items, max_bytes) do
     max_value_size =
       case Map.get(ctx, :max_value_size, 1_048_576) do
@@ -448,6 +496,13 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp write_batch_fun(opts) do
+    case Keyword.get(opts, :write_batch_fun, &LMDB.write_batch/2) do
+      fun when is_function(fun, 2) -> {:ok, fun}
+      _invalid -> {:error, :invalid_query_backfill_snapshot_writer}
     end
   end
 

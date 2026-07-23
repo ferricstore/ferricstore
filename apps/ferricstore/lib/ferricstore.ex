@@ -499,6 +499,7 @@ defmodule FerricStore do
   defdelegate flow_create_many(partition_key, items, opts \\ []), to: FlowAPI
   defdelegate flow_spawn_children(parent_id, children, opts \\ []), to: FlowAPI
   defdelegate flow_get(id, opts \\ []), to: FlowAPI
+  defdelegate flow_query(query, params \\ %{}), to: FlowAPI
   defdelegate flow_policy_set(type, opts), to: FlowAPI
   defdelegate flow_policy_get(type, opts \\ []), to: FlowAPI
   defdelegate flow_claim_due(type, opts), to: FlowAPI

@@ -173,7 +173,7 @@ defmodule Ferricstore.Flow.Query.ReferenceEvaluatorTest do
         Request.collection(
           :execute,
           [{:eq, :partition_key, literal("tenant-a")}, {:eq, :priority, value}],
-          [],
+          [{:updated_at_ms, :asc}],
           10,
           :record
         )
@@ -191,7 +191,7 @@ defmodule Ferricstore.Flow.Query.ReferenceEvaluatorTest do
           {:eq, :partition_key, literal("tenant-a")},
           {:range, :priority, integer(1), literal("9")}
         ],
-        [],
+        [{:updated_at_ms, :asc}],
         10,
         :record
       )
@@ -208,7 +208,7 @@ defmodule Ferricstore.Flow.Query.ReferenceEvaluatorTest do
           {:eq, :partition_key, {:parameter, :keyword, "tenant"}},
           {:range, :updated_at_ms, integer(1), {:parameter, :integer, "until"}}
         ],
-        [],
+        [{:updated_at_ms, :asc}],
         10,
         :record
       )
@@ -225,7 +225,7 @@ defmodule Ferricstore.Flow.Query.ReferenceEvaluatorTest do
         Request.collection(
           :execute,
           [{:eq, :partition_key, literal("tenant-a")}, predicate],
-          [],
+          [{:updated_at_ms, :asc}],
           10,
           :record
         )

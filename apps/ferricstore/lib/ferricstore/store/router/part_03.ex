@@ -144,11 +144,17 @@ defmodule Ferricstore.Store.Router.Part03 do
          {[entry | cold_entries], cold_count + 1, waraft_entries, waraft_count, bookkeeping}}
       end
 
-      defp read_cold_batch_async([], _now), do: []
+      defp read_cold_batch_async(entries, now), do: read_cold_batch_async(entries, now, :values)
 
-      defp read_cold_batch_async(entries, now) do
+      defp read_cold_batch_async([], _now, _mode), do: []
+
+      defp read_cold_batch_async(entries, now, mode) do
         {unique_entries, value_indexes} = dedupe_cold_batch_entries(entries)
-        unique_values = read_unique_cold_batch_async(unique_entries, now) |> List.to_tuple()
+
+        unique_values =
+          unique_entries
+          |> read_unique_cold_batch_async(now, mode)
+          |> List.to_tuple()
 
         Enum.map(value_indexes, fn index -> elem(unique_values, index) end)
       end
@@ -167,9 +173,12 @@ defmodule Ferricstore.Store.Router.Part03 do
         Enum.map(value_indexes, fn index -> elem(unique_values, index) end)
       end
 
-      defp read_waraft_segment_batch_materialized([], _expiry_context), do: []
+      defp read_waraft_segment_batch_materialized(entries, expiry_context),
+        do: read_waraft_segment_batch_materialized(entries, expiry_context, :values)
 
-      defp read_waraft_segment_batch_materialized(entries, expiry_context) do
+      defp read_waraft_segment_batch_materialized([], _expiry_context, _mode), do: []
+
+      defp read_waraft_segment_batch_materialized(entries, expiry_context, mode) do
         entries
         |> Enum.with_index()
         |> Enum.group_by(
@@ -179,7 +188,7 @@ defmodule Ferricstore.Store.Router.Part03 do
           fn indexed_entry -> indexed_entry end
         )
         |> Enum.reduce(%{}, &read_waraft_segment_group/2)
-        |> waraft_segment_results(entries, expiry_context)
+        |> waraft_segment_results(entries, expiry_context, mode)
       end
 
       defp read_waraft_segment_batch_file_ref_or_materialized(
@@ -371,37 +380,90 @@ defmodule Ferricstore.Store.Router.Part03 do
         end)
       end
 
-      defp waraft_segment_results(result_by_index, entries, expiry_context) do
+      defp waraft_segment_results(result_by_index, entries, expiry_context),
+        do: waraft_segment_results(result_by_index, entries, expiry_context, :values)
+
+      defp waraft_segment_results(result_by_index, entries, expiry_context, mode) do
         entries
         |> Enum.with_index()
         |> Enum.map(fn {{ctx, idx, keydir, key, file_id, offset, value_size}, index} ->
           case Map.fetch(result_by_index, index) do
             {:ok, {:waraft_read_error, reason}} ->
-              retry_changed_waraft_segment_value_read_result(
+              retry_changed_waraft_batch_result(
                 ctx,
                 idx,
                 keydir,
                 key,
                 {file_id, offset, value_size},
                 expiry_context,
-                {:error, reason}
+                {:error, reason},
+                mode
               )
 
             {:ok, value} ->
               value
 
             :error ->
-              retry_changed_waraft_segment_value_read_result(
+              retry_changed_waraft_batch_result(
                 ctx,
                 idx,
                 keydir,
                 key,
                 {file_id, offset, value_size},
                 expiry_context,
-                :not_found
+                :not_found,
+                mode
               )
           end
         end)
+      end
+
+      defp retry_changed_waraft_batch_result(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             expiry_context,
+             read_error,
+             :values
+           ) do
+        retry_changed_waraft_segment_value_read_result(
+          ctx,
+          idx,
+          keydir,
+          key,
+          original_location,
+          expiry_context,
+          read_error
+        )
+      end
+
+      defp retry_changed_waraft_batch_result(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             expiry_context,
+             read_error,
+             :entries
+           ) do
+        case retry_changed_waraft_segment_meta_read_result(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               expiry_context,
+               read_error
+             ) do
+          {value, expire_at_ms} when is_binary(value) and is_integer(expire_at_ms) ->
+            {:batch_entry, value, expire_at_ms}
+
+          other ->
+            other
+        end
       end
 
       defp read_waraft_segment_values(ctx, idx, file_id, keys, count) do
@@ -482,7 +544,7 @@ defmodule Ferricstore.Store.Router.Part03 do
         {path, offset, key}
       end
 
-      defp read_unique_cold_batch_async(entries, now) do
+      defp read_unique_cold_batch_async(entries, now, mode) do
         locations =
           Enum.map(entries, fn {_ctx, _idx, _keydir, key, path, _file_id, offset, _value_size} ->
             {path, offset, key}
@@ -530,41 +592,89 @@ defmodule Ferricstore.Store.Router.Part03 do
           {{ctx, idx, keydir, key, _path, file_id, offset, value_size}, value_or_error} ->
             failure = storage_read_failure(:cold_value_unavailable, value_or_error)
 
-            case retry_changed_cold_value_result(
-                   ctx,
-                   idx,
-                   keydir,
-                   key,
-                   {file_id, offset, value_size},
-                   now,
-                   failure
-                 ) do
-              {:cold, value, retry_file_id, retry_offset} ->
-                Stats.record_cold_read(ctx, key)
-
-                warm_ets_after_cold_read(
-                  ctx,
-                  idx,
-                  keydir,
-                  key,
-                  value,
-                  retry_file_id,
-                  retry_offset
-                )
-
-                value
-
-              {:hot, value} ->
-                value
-
-              :miss ->
-                record_keyspace_miss(ctx, key)
-                nil
-
-              {:error, {:storage_read_failed, _reason}} = failure ->
-                failure
-            end
+            retry_changed_cold_batch_result(
+              ctx,
+              idx,
+              keydir,
+              key,
+              {file_id, offset, value_size},
+              now,
+              failure,
+              mode
+            )
         end)
+      end
+
+      defp retry_changed_cold_batch_result(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             failure,
+             :values
+           ) do
+        case retry_changed_cold_value_result(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               failure
+             ) do
+          {:cold, value, retry_file_id, retry_offset} ->
+            Stats.record_cold_read(ctx, key)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, value, retry_file_id, retry_offset)
+            value
+
+          {:hot, value} ->
+            value
+
+          :miss ->
+            record_keyspace_miss(ctx, key)
+            nil
+
+          {:error, {:storage_read_failed, _reason}} = read_failure ->
+            read_failure
+        end
+      end
+
+      defp retry_changed_cold_batch_result(
+             ctx,
+             idx,
+             keydir,
+             key,
+             original_location,
+             now,
+             failure,
+             :entries
+           ) do
+        case retry_changed_cold_meta_result(
+               ctx,
+               idx,
+               keydir,
+               key,
+               original_location,
+               now,
+               failure
+             ) do
+          {:cold, value, expire_at_ms, retry_file_id, retry_offset} ->
+            Stats.record_cold_read(ctx, key)
+            warm_ets_after_cold_read(ctx, idx, keydir, key, value, retry_file_id, retry_offset)
+            {:batch_entry, value, expire_at_ms}
+
+          {:hot, value, expire_at_ms} ->
+            {:batch_entry, value, expire_at_ms}
+
+          :miss ->
+            record_keyspace_miss(ctx, key)
+            nil
+
+          {:error, {:storage_read_failed, _reason}} = read_failure ->
+            read_failure
+        end
       end
 
       defp materialize_cold_batch_values(entry_values) do

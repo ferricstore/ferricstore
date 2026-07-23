@@ -163,8 +163,7 @@ defmodule Ferricstore.Flow.PipelineHistoryRead do
             Map.new(requests, fn {_op, idx, _id, _partition_key, history_key, query, _start_idx,
                                   _stop_idx, _reverse?, value_return, expected_metadata,
                                   _decode_context} ->
-              {idx,
-               fallback(ctx, history_key, query, value_return, expected_metadata, callbacks)}
+              {idx, fallback(ctx, history_key, query, value_return, expected_metadata, callbacks)}
             end)
 
           Map.merge(ready_results, fallback_results)

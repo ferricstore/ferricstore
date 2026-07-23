@@ -40,7 +40,8 @@ defmodule Ferricstore.Commands.PreparedCommand do
 
   @type shard_resolver :: (binary() -> term())
 
-  @spec prepare(binary(), [term()], keyword()) :: {:ok, t()} | {:error, binary()}
+  @spec prepare(binary(), [term()], keyword()) ::
+          {:ok, t()} | {:error, binary() | Ferricstore.Flow.Query.Error.t()}
   def prepare(name, args, opts \\ []) when is_list(opts) do
     case KeyDiscovery.prepare(name, args, opts) do
       {:ok, description} -> {:ok, from_description(description)}

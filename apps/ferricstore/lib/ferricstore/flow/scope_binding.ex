@@ -193,8 +193,8 @@ defmodule Ferricstore.Flow.ScopeBinding do
          record when is_map(record) -> Map.get(record, :system_metadata, %{}) == expected_metadata
          _invalid -> false
        end),
-      do: {:ok, records},
-      else: {:error, "NOPERM Flow scope is not authorized"}
+       do: {:ok, records},
+       else: {:error, "NOPERM Flow scope is not authorized"}
   end
 
   def verify_read_result(result, _expected_metadata), do: result

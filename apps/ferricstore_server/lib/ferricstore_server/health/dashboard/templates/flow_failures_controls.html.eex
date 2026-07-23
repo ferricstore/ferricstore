@@ -10,7 +10,7 @@
     </label>
     <label>
       Partition
-      <input class="flow-search-input mono" type="search" name="partition_key" value="<%= escape_attr(filters.partition_key || "") %>" placeholder="optional" title="Filter by Flow partition key">
+      <input class="flow-search-input mono" type="search" name="partition_key" value="<%= escape_attr(filters.partition_key || "") %>" placeholder="required for exact" title="Partition key required by exact queries">
     </label>
     <label>
       ID contains
@@ -20,11 +20,11 @@
       Limit
       <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="200" name="limit" value="<%= filters.limit %>" title="Maximum rows to render">
     </label>
-    <label class="flow-check-label" title="Run exact FLOW.FAILURES and FLOW.STUCK queries. This can be slower than the default sampled view under load.">
+    <label class="flow-check-label" title="Run bounded exact FLOW.QUERY plans for failures and expired leases in the selected partition.">
       <input type="checkbox" name="exact" value="true" <%= if Map.get(filters, :scan_exact, false), do: "checked", else: "" %>>
       Exact scan
     </label>
     <button class="flow-search-button" type="submit">Apply</button>
   </form>
-  <span class="flow-filter-note">Default view uses the bounded dashboard sample. Enable Exact scan for FLOW.FAILURES/FLOW.STUCK queries. Actions are explicit.</span>
+  <span class="flow-filter-note">Default view uses the bounded dashboard sample. Exact scan requires a partition and uses FLOW.QUERY. Actions are explicit.</span>
 </div>

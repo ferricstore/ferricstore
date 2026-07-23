@@ -24,6 +24,41 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.DirectWaraftShardReadsPres
         assert ^expected = Ferricstore.Store.Router.read_shard_values(ctx, 0, [good_key, bad_key])
       end
 
+      @tag :direct_waraft_entry_retry
+      test "direct WARaft entry retries keep values paired with their current expiry", %{ctx: ctx} do
+        assert :ok =
+                 Ferricstore.Raft.WARaftBackend.start(ctx,
+                   log_module: :ferricstore_waraft_spike_segment_log
+                 )
+
+        key = "direct-waraft-entry-retry"
+        keydir = elem(ctx.keydir_refs, 0)
+        old_expire_at_ms = Ferricstore.HLC.now_ms() + 60_000
+        new_expire_at_ms = old_expire_at_ms + 60_000
+
+        :ets.insert(
+          keydir,
+          {key, nil, old_expire_at_ms, Ferricstore.Store.LFU.initial(), 99_999, 0, 3}
+        )
+
+        Process.put(:ferricstore_router_pread_batch_keyed_result, {:error, :forced_read_failure})
+
+        Process.put(:ferricstore_router_cold_location_miss_hook, fn ->
+          :ets.insert(
+            keydir,
+            {key, "new", new_expire_at_ms, Ferricstore.Store.LFU.initial(), :hot, 0, 3}
+          )
+        end)
+
+        try do
+          assert {:ok, [{"new", ^new_expire_at_ms}]} =
+                   Ferricstore.Store.Router.read_shard_entries(ctx, 0, [key])
+        after
+          Process.delete(:ferricstore_router_pread_batch_keyed_result)
+          Process.delete(:ferricstore_router_cold_location_miss_hook)
+        end
+      end
+
       @tag :explicit_waraft_shard_read
       test "direct WARaft shard reads honor the explicitly selected shard" do
         assert :ok = Ferricstore.Raft.WARaftBackend.stop()

@@ -167,6 +167,22 @@ defmodule Ferricstore.Flow.Query.IndexDefinitionTest do
              })
   end
 
+  test "shares exact identity validation with management projections" do
+    assert IndexDefinition.valid_id?("index-a:v1.test")
+    assert IndexDefinition.valid_id?(String.duplicate("x", 64))
+
+    refute IndexDefinition.valid_id?("")
+    refute IndexDefinition.valid_id?(String.duplicate("x", 65))
+    refute IndexDefinition.valid_id?("contains space")
+    refute IndexDefinition.valid_id?("contains/slash")
+    refute IndexDefinition.valid_id?(<<0>>)
+
+    assert IndexDefinition.valid_version?(1)
+    assert IndexDefinition.valid_version?(0xFFFF_FFFF_FFFF_FFFF)
+    refute IndexDefinition.valid_version?(0)
+    refute IndexDefinition.valid_version?(0x1_0000_0000_0000_0000)
+  end
+
   test "allowed definitions have a proven worst-case LMDB key below 512 bytes" do
     assert {:ok, definition} =
              IndexDefinition.new(%{

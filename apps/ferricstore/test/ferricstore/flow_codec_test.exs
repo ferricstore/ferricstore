@@ -3,6 +3,7 @@ defmodule Ferricstore.FlowCodecTest do
   @moduletag :flow
 
   alias Ferricstore.Flow
+  alias Ferricstore.Flow.Codec
   alias Ferricstore.Flow.Codec.Support
   alias Ferricstore.Flow.RecordProjection
   alias Ferricstore.Flow.StorageScope
@@ -34,6 +35,39 @@ defmodule Ferricstore.FlowCodecTest do
 
     assert decoded == Flow.decode_record_elixir(Flow.encode_record_elixir(record))
     assert decoded == record
+  end
+
+  test "batch record decoding preserves order and matches single-record decoding" do
+    records =
+      for ordinal <- 1..32 do
+        base_record()
+        |> Map.put(:id, "flow-#{ordinal}")
+        |> Map.put(:root_flow_id, "flow-#{ordinal}")
+        |> Map.put(:version, ordinal)
+        |> Map.put(:updated_at_ms, 110 + ordinal)
+      end
+
+    encoded = Enum.map(records, &Flow.encode_record/1)
+
+    assert Codec.decode_records(encoded) == Enum.map(encoded, &Flow.decode_record/1)
+    assert Codec.decode_records([]) == []
+  end
+
+  test "batch record decoding rejects malformed input atomically and enforces its page bound" do
+    encoded = Flow.encode_record(base_record())
+    semantically_invalid = base_record() |> Map.put(:id, "") |> Flow.encode_record_elixir()
+
+    assert_raise ArgumentError, "invalid flow record batch", fn ->
+      Codec.decode_records([encoded, "not-a-flow-record", encoded])
+    end
+
+    assert_raise ArgumentError, "invalid flow record batch", fn ->
+      Codec.decode_records([encoded, semantically_invalid, encoded])
+    end
+
+    assert_raise ArgumentError, "invalid flow record batch", fn ->
+      Codec.decode_records(List.duplicate(encoded, 4_097))
+    end
   end
 
   test "record codec round trips private governance reservation identity" do

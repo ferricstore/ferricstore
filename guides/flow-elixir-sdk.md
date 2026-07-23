@@ -526,6 +526,10 @@ BillingFlow.children(parent_job)
 BillingFlow.waiting_children(parent_job)
 ```
 
+These are embedded Elixir conveniences backed by the same indexed read
+operators. Native SDKs must use `FLOW.QUERY`; the former record-collection wire
+commands are not aliases and are not advertised.
+
 By default, `get/2` does not hydrate payload. Ask for payload explicitly:
 
 ```elixir

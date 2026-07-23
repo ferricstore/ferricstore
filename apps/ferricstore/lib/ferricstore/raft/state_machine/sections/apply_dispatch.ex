@@ -48,6 +48,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       alias Ferricstore.Store.Shard.ZSetIndex
       alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.LogicalKeyIndex
+      alias Ferricstore.Store.Shard.NamespaceUsageIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -702,6 +703,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
               LogicalKeyIndex.reset(
                 Map.get(flushed_state, :logical_key_index_name),
                 Map.get(flushed_state, :logical_key_slots_name)
+              )
+
+            _reset =
+              NamespaceUsageIndex.reset(
+                Map.get(flushed_state, :namespace_usage_index_name),
+                Map.get(flushed_state, :namespace_usage_expiry_name)
               )
 
             _state = ZSetIndex.reset(flushed_state)
@@ -2000,6 +2007,17 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:flow_create_with_catalog, _key, catalog, attrs}, state)
+          when is_map(attrs) and is_map(catalog) do
+        apply_flow_pending_with_time(meta, state, :flow_create, attrs, fn ->
+          with {:ok, encoded_catalog} <-
+                 apply_server_catalog_mutation_pending(meta, state, catalog),
+               :ok <- do_flow_create(state, attrs) do
+            {:ok, encoded_catalog}
+          end
+        end)
+      end
+
       def apply(meta, {:flow_create_many, _key, attrs}, state) when is_map(attrs) do
         apply_flow_pending_with_time(meta, state, :flow_create_many, attrs, fn ->
           do_flow_create_many(state, attrs)
@@ -2296,32 +2314,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
                   (is_nil(expected_revision) or is_binary(expected_revision)) and
                   (is_binary(value) or value == :deleted) and
                   is_integer(max_live_entries) and max_live_entries >= 0 do
-        with :ok <- validate_server_catalog_expected(expected_encoded),
-             :ok <- validate_server_catalog_revision(expected_revision),
-             {:ok, key, revision_key, count_key, encoded, revision} <-
-               encode_server_catalog_mutation(
-                 meta,
-                 namespace,
-                 subject,
-                 expected_encoded,
-                 expected_revision,
-                 value
-               ) do
-          with_pending_writes(state, fn ->
-            apply_server_catalog_cas(
-              state,
-              key,
-              revision_key,
-              count_key,
-              expected_encoded,
-              expected_revision,
-              encoded,
-              revision,
-              value,
-              max_live_entries
-            )
-          end)
-        end
+        with_pending_writes(state, fn ->
+          apply_server_catalog_mutation_pending(meta, state, %{
+            namespace: namespace,
+            subject: subject,
+            expected_encoded: expected_encoded,
+            expected_revision: expected_revision,
+            value: value,
+            max_live_entries: max_live_entries
+          })
+        end)
       end
 
       defp apply_server_catalog_mutation(
@@ -2335,6 +2337,52 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
              _max_live_entries
            ),
            do: {:error, :invalid_server_catalog_mutation}
+
+      defp apply_server_catalog_mutation_pending(
+             meta,
+             state,
+             %{
+               namespace: namespace,
+               subject: subject,
+               expected_encoded: expected_encoded,
+               expected_revision: expected_revision,
+               value: value,
+               max_live_entries: max_live_entries
+             }
+           )
+           when is_binary(namespace) and is_binary(subject) and
+                  (is_nil(expected_encoded) or is_binary(expected_encoded)) and
+                  (is_nil(expected_revision) or is_binary(expected_revision)) and
+                  (is_binary(value) or value == :deleted) and
+                  is_integer(max_live_entries) and max_live_entries >= 0 do
+        with :ok <- validate_server_catalog_expected(expected_encoded),
+             :ok <- validate_server_catalog_revision(expected_revision),
+             {:ok, key, revision_key, count_key, encoded, revision} <-
+               encode_server_catalog_mutation(
+                 meta,
+                 namespace,
+                 subject,
+                 expected_encoded,
+                 expected_revision,
+                 value
+               ) do
+          apply_server_catalog_cas(
+            state,
+            key,
+            revision_key,
+            count_key,
+            expected_encoded,
+            expected_revision,
+            encoded,
+            revision,
+            value,
+            max_live_entries
+          )
+        end
+      end
+
+      defp apply_server_catalog_mutation_pending(_meta, _state, _catalog),
+        do: {:error, :invalid_server_catalog_mutation}
 
       defp apply_server_catalog_replacement(
              meta,

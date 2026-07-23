@@ -41,6 +41,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
 
       alias Ferricstore.Store.Shard.ZSetIndex
       alias Ferricstore.Store.Shard.LogicalKeyIndex
+      alias Ferricstore.Store.Shard.NamespaceUsageIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -79,17 +80,34 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardPending do
             :ets.insert(keydir, {key, ets_value, exp, LFU.initial(), file_id, offset, value_size})
             {logical_keys, logical_slots} = logical_key_index_tables(state, idx)
             :ok = LogicalKeyIndex.put(logical_keys, logical_slots, key, ets_value, exp)
+            {namespace_usage, namespace_usage_expiry} = namespace_usage_tables(state, idx)
+
+            :ok =
+              NamespaceUsageIndex.put(
+                namespace_usage,
+                namespace_usage_expiry,
+                key,
+                ets_value,
+                exp,
+                blob_threshold_bytes: Map.get(state, :blob_side_channel_threshold_bytes, 0)
+              )
 
           {{:delete, idx, ^keydir, _file_path, ^file_id, key}, {:delete, _offset, _record_size}} ->
             track_cross_shard_keydir_binary_publish(ref, keydir, idx, key, nil)
             :ets.delete(keydir, key)
             {logical_keys, logical_slots} = logical_key_index_tables(state, idx)
             :ok = LogicalKeyIndex.delete(logical_keys, logical_slots, key)
+            {namespace_usage, namespace_usage_expiry} = namespace_usage_tables(state, idx)
+            :ok = NamespaceUsageIndex.delete(namespace_usage, namespace_usage_expiry, key)
         end)
       end
 
       defp logical_key_index_tables(state, shard_index) do
         LogicalKeyIndex.table_names(Map.get(state, :instance_name, :default), shard_index)
+      end
+
+      defp namespace_usage_tables(state, shard_index) do
+        NamespaceUsageIndex.table_names(Map.get(state, :instance_name, :default), shard_index)
       end
 
       defp track_cross_shard_keydir_binary_publish(nil, _keydir, _shard_index, _key, _new_value),

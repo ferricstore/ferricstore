@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
   setup do
     suffix = System.unique_integer([:positive, :monotonic])
     data_dir = Path.join(System.tmp_dir!(), "ferricstore_query_backfill_#{suffix}")
+
     ctx = %{
       data_dir: data_dir,
       shard_count: 1,
@@ -63,11 +64,13 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
       second_key => encoded_record("short", "tenant-a", 2)
     }
 
-    read_values = fn _ctx, 0, keys -> {:ok, Enum.map(keys, &Map.get(values, &1))} end
+    read_entries = fn _ctx, 0, keys ->
+      {:ok, Enum.map(keys, &{Map.fetch!(values, &1), 0})}
+    end
 
     assert {:ok, first_page} =
              BackfillSource.page(ctx, 0, build_id, "", 1, 2 * 1_024 * 1_024,
-               read_values_fun: read_values
+               read_entries_fun: read_entries
              )
 
     assert length(first_page.records) == 1
@@ -76,7 +79,7 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
 
     assert {:ok, second_page} =
              BackfillSource.page(ctx, 0, build_id, first_page.cursor, 1, 2 * 1_024 * 1_024,
-               read_values_fun: read_values
+               read_entries_fun: read_entries
              )
 
     assert length(second_page.records) == 1
@@ -144,6 +147,42 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
              BackfillSource.snapshot_page(ctx, 0, build_id, 1, 512)
   end
 
+  test "snapshot cannot overwrite a staging row replaced after collision validation", %{ctx: ctx} do
+    state_key = Keys.state_key("candidate", "tenant-a")
+    conflicting_state_key = Keys.state_key("conflicting", "tenant-a")
+    put_catalog_member!(ctx, "invoice", state_key, 0)
+    snapshot_all!(ctx, "bootstrap-primer", 1)
+
+    build_id = "collision-race"
+    staging_key = BackfillSource.staging_prefix(build_id) <> :crypto.hash(:sha256, state_key)
+    path = lmdb_path(ctx)
+
+    write_batch = fn ^path, ops ->
+      assert :ok = LMDB.write_batch(path, [{:put, staging_key, conflicting_state_key}])
+      LMDB.write_batch(path, ops)
+    end
+
+    assert {:error, {:compare_failed, ^staging_key}} =
+             BackfillSource.snapshot_page(ctx, 0, build_id, 1, 1_024 * 1_024,
+               write_batch_fun: write_batch
+             )
+
+    assert {:ok, ^conflicting_state_key} = LMDB.get(path, staging_key)
+  end
+
+  test "rejects a corrupt durable snapshot completion marker", %{ctx: ctx} do
+    build_id = "corrupt-complete"
+
+    marker_key =
+      "flow-query-backfill:1:" <>
+        :crypto.hash(:sha256, build_id) <> ":snapshot-complete"
+
+    assert :ok = LMDB.write_batch(lmdb_path(ctx), [{:put, marker_key, "another-build"}])
+
+    assert {:error, :invalid_query_backfill_snapshot_complete_marker} =
+             BackfillSource.snapshot_page(ctx, 0, build_id, 1, 1_024)
+  end
+
   test "rejects malformed decoded record ownership without raising", %{ctx: ctx} do
     build_id = "malformed-owner"
     state_key = Keys.state_key("candidate", "tenant-a")
@@ -152,7 +191,7 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
 
     assert {:error, :corrupt_query_backfill_record} =
              BackfillSource.page(ctx, 0, build_id, "", 1, 1_024,
-               read_values_fun: fn _ctx, 0, [^state_key] -> {:ok, ["encoded"]} end,
+               read_entries_fun: fn _ctx, 0, [^state_key] -> {:ok, [{"encoded", 0}]} end,
                decode_record_fun: fn "encoded" ->
                  {:ok, %{id: "candidate", partition_key: %{malformed: true}}}
                end
@@ -175,12 +214,30 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
 
     assert {:ok, page} =
              BackfillSource.page(ctx, 0, build_id, "", 1, 1_024,
-               read_values_fun: fn _ctx, 0, [^state_key] -> {:ok, [nil]} end
+               read_entries_fun: fn _ctx, 0, [^state_key] -> {:ok, [nil]} end
              )
 
     assert page.done?
     assert page.scanned_entries == 1
     assert page.records == [%{state_key: state_key, record: nil, expire_at_ms: 0}]
+  end
+
+  test "preserves the primary storage expiry for active records", %{ctx: ctx} do
+    build_id = "active-expiry"
+    state_key = Keys.state_key("active", "tenant-a")
+    expiry = 9_000_000_000_000
+    encoded = encoded_record("active", "tenant-a", 1)
+    put_catalog_member!(ctx, "invoice", state_key, 0)
+    snapshot_all!(ctx, build_id, 1)
+
+    assert {:ok, page} =
+             BackfillSource.page(ctx, 0, build_id, "", 1, 1_024,
+               read_entries_fun: fn _ctx, 0, [^state_key] ->
+                 {:ok, [{encoded, expiry}]}
+               end
+             )
+
+    assert [%{state_key: ^state_key, expire_at_ms: ^expiry}] = page.records
   end
 
   defp snapshot_all!(ctx, build_id, page_size) do

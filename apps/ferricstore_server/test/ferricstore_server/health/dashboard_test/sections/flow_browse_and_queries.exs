@@ -132,7 +132,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           flow_type = "dashboard-cold-terminal-#{System.unique_integer([:positive])}"
           hot_id = "dashboard-cold-terminal-hot-#{System.unique_integer([:positive])}"
           terminal_id = "dashboard-cold-terminal-done-#{System.unique_integer([:positive])}"
-          previous_list = Application.get_env(:ferricstore, :flow_dashboard_flow_list_fun)
+          previous_query = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
           test_pid = self()
 
           assert :ok =
@@ -143,8 +143,8 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
                      now_ms: 1_000
                    )
 
-          Application.put_env(:ferricstore, :flow_dashboard_flow_list_fun, fn ^flow_type, opts ->
-            send(test_pid, {:terminal_list_dashboard_opts, opts})
+          Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn query, params ->
+            send(test_pid, {:terminal_dashboard_query, query, params})
 
             {:ok,
              [
@@ -160,15 +160,21 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
              ]}
           end)
 
-          on_exit(fn -> restore_env(:flow_dashboard_flow_list_fun, previous_list) end)
+          on_exit(fn -> restore_env(:flow_dashboard_flow_query_fun, previous_query) end)
 
-          data = Dashboard.collect_flow_states_page(state: "completed", limit: 25)
+          data =
+            Dashboard.collect_flow_states_page(
+              type: flow_type,
+              state: "completed",
+              partition_key: "tenant-cold-terminal",
+              limit: 25
+            )
 
-          assert_receive {:terminal_list_dashboard_opts, opts}
-          assert opts[:state] == "completed"
-          assert opts[:include_cold] == true
-          assert opts[:consistent_projection] == true
-          assert opts[:count] >= 25
+          assert_receive {:terminal_dashboard_query, query, params}
+          assert query =~ "LIMIT 25 RETURN RECORDS"
+          assert params["partition_key"] == "tenant-cold-terminal"
+          assert params["type"] == flow_type
+          assert params["state"] == "completed"
 
           assert Enum.any?(data.records, &(Map.get(&1, :id) == terminal_id))
           assert Enum.any?(data.states, &(&1.state == "completed" and &1.count >= 1))
@@ -180,7 +186,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           flow_type = "dashboard-slow-terminal-#{System.unique_integer([:positive])}"
           hot_id = "dashboard-slow-terminal-hot-#{System.unique_integer([:positive])}"
           terminal_id = "dashboard-slow-terminal-done-#{System.unique_integer([:positive])}"
-          previous_list = Application.get_env(:ferricstore, :flow_dashboard_flow_list_fun)
+          previous_query = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
 
           previous_detail_timeout =
             Application.get_env(:ferricstore, :flow_dashboard_detail_fetch_timeout_ms)
@@ -195,7 +201,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
 
           Application.put_env(:ferricstore, :flow_dashboard_detail_fetch_timeout_ms, 10)
 
-          Application.put_env(:ferricstore, :flow_dashboard_flow_list_fun, fn ^flow_type, _opts ->
+          Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn _query, _params ->
             Process.sleep(50)
 
             {:ok,
@@ -213,11 +219,17 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           end)
 
           on_exit(fn ->
-            restore_env(:flow_dashboard_flow_list_fun, previous_list)
+            restore_env(:flow_dashboard_flow_query_fun, previous_query)
             restore_env(:flow_dashboard_detail_fetch_timeout_ms, previous_detail_timeout)
           end)
 
-          data = Dashboard.collect_flow_states_page(state: "completed", limit: 25)
+          data =
+            Dashboard.collect_flow_states_page(
+              type: flow_type,
+              state: "completed",
+              partition_key: "tenant-slow-terminal",
+              limit: 25
+            )
 
           assert Enum.any?(data.records, &(Map.get(&1, :id) == terminal_id))
         end
@@ -283,7 +295,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert {:ok, %{state: "failed"}} =
                    FerricStore.flow_get(fail_id, partition_key: partition_key)
 
-          data = Dashboard.collect_flow_states_page(type: flow_type)
+          data = Dashboard.collect_flow_states_page(type: flow_type, partition_key: partition_key)
 
           assert Enum.any?(data.records, &(Map.get(&1, :id) == complete_id))
           assert Enum.any?(data.records, &(Map.get(&1, :id) == fail_id))
@@ -538,58 +550,76 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
         end
 
         test "failures page does not run exact failure/stuck queries unless requested" do
-          previous_failures = Application.get_env(:ferricstore, :flow_dashboard_flow_failures_fun)
-          previous_stuck = Application.get_env(:ferricstore, :flow_dashboard_flow_stuck_fun)
+          previous_query = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
           test_pid = self()
 
-          Application.put_env(:ferricstore, :flow_dashboard_flow_failures_fun, fn type, _opts ->
-            send(test_pid, {:exact_failure_scan, type})
-            {:ok, []}
-          end)
-
-          Application.put_env(:ferricstore, :flow_dashboard_flow_stuck_fun, fn type, _opts ->
-            send(test_pid, {:exact_stuck_scan, type})
+          Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn query, params ->
+            send(test_pid, {:exact_flow_query, query, params})
             {:ok, []}
           end)
 
           on_exit(fn ->
-            restore_env(:flow_dashboard_flow_failures_fun, previous_failures)
-            restore_env(:flow_dashboard_flow_stuck_fun, previous_stuck)
+            restore_env(:flow_dashboard_flow_query_fun, previous_query)
           end)
 
           _data = Dashboard.collect_flow_failures_page(type: "email")
-          refute_received {:exact_failure_scan, "email"}
-          refute_received {:exact_stuck_scan, "email"}
+          refute_received {:exact_flow_query, _query, _params}
 
-          _data = Dashboard.collect_flow_failures_page(type: "email", scan_exact: true)
-          assert_received {:exact_failure_scan, "email"}
-          assert_received {:exact_stuck_scan, "email"}
+          _data =
+            Dashboard.collect_flow_failures_page(
+              type: "email",
+              partition_key: "tenant-a",
+              scan_exact: true
+            )
+
+          assert_received {:exact_flow_query, failure_query,
+                           %{
+                             "partition_key" => "tenant-a",
+                             "state" => "failed",
+                             "type" => "email"
+                           }}
+
+          assert failure_query =~ "state = @state"
+
+          assert_received {:exact_flow_query, stuck_query,
+                           %{
+                             "partition_key" => "tenant-a",
+                             "state" => "running",
+                             "type" => "email"
+                           } = stuck_params}
+
+          assert stuck_query =~
+                   "lease_deadline_ms BETWEEN @lease_from_ms AND @lease_to_ms"
+
+          assert stuck_params["lease_from_ms"] == 0
+          assert is_integer(stuck_params["lease_to_ms"])
+          assert stuck_params["lease_to_ms"] >= 0
         end
 
         test "exact failure scan errors are visible and not collapsed to authoritative zero" do
-          previous_failures = Application.get_env(:ferricstore, :flow_dashboard_flow_failures_fun)
-          previous_stuck = Application.get_env(:ferricstore, :flow_dashboard_flow_stuck_fun)
+          previous_query = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
 
-          Application.put_env(:ferricstore, :flow_dashboard_flow_failures_fun, fn _type, _opts ->
-            {:error, :backend_down}
-          end)
-
-          Application.put_env(:ferricstore, :flow_dashboard_flow_stuck_fun, fn _type, _opts ->
-            {:ok, []}
+          Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn _query, params ->
+            if params["state"] == "failed", do: {:error, :backend_down}, else: {:ok, []}
           end)
 
           on_exit(fn ->
-            restore_env(:flow_dashboard_flow_failures_fun, previous_failures)
-            restore_env(:flow_dashboard_flow_stuck_fun, previous_stuck)
+            restore_env(:flow_dashboard_flow_query_fun, previous_query)
           end)
 
-          data = Dashboard.collect_flow_failures_page(type: "email", scan_exact: true)
+          data =
+            Dashboard.collect_flow_failures_page(
+              type: "email",
+              partition_key: "tenant-a",
+              scan_exact: true
+            )
+
           html = Dashboard.render_flow_failures_page(data)
 
           assert data.exact_scan_status.failures == {:error, :backend_down}
           assert data.exact_scan_status.stuck == :ok
           assert String.contains?(html, "Exact scan issue")
-          assert String.contains?(html, "FLOW.FAILURES")
+          assert String.contains?(html, "FLOW.QUERY")
           assert String.contains?(html, "backend_down")
         end
 
@@ -621,37 +651,47 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert_received {:signal_history_scan, ^id}
         end
 
-        test "lineage page uses injected root query and renders graph/table components" do
-          previous = Application.get_env(:ferricstore, :flow_dashboard_flow_by_root_fun)
+        test "lineage page uses the canonical query and renders graph/table components" do
+          previous = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
           test_pid = self()
 
-          Application.put_env(:ferricstore, :flow_dashboard_flow_by_root_fun, fn "root-1", opts ->
-            send(test_pid, {:lineage_opts, opts})
+          Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn query, params ->
+            send(test_pid, {:lineage_query, query, params})
 
             {:ok,
-             [
-               %{
-                 id: "child-1",
-                 type: "order",
-                 state: "queued",
-                 root_flow_id: "root-1",
-                 parent_flow_id: "root-1",
-                 correlation_id: "order-1",
-                 updated_at_ms: 1_000
-               }
-             ]}
+             %{
+               records: [
+                 %{
+                   id: "child-1",
+                   type: "order",
+                   state: "queued",
+                   root_flow_id: "root-1",
+                   parent_flow_id: "root-1",
+                   correlation_id: "order-1",
+                   updated_at_ms: 1_000
+                 }
+               ]
+             }}
           end)
 
-          on_exit(fn -> restore_env(:flow_dashboard_flow_by_root_fun, previous) end)
+          on_exit(fn -> restore_env(:flow_dashboard_flow_query_fun, previous) end)
 
-          data = Dashboard.collect_flow_lineage_page(mode: "root", target: "root-1", limit: 10)
+          data =
+            Dashboard.collect_flow_lineage_page(
+              mode: "root",
+              target: "root-1",
+              partition_key: "tenant-a",
+              limit: 10
+            )
+
           html = Dashboard.render_flow_lineage_page(data)
 
-          assert_receive {:lineage_opts, opts}
-          assert opts[:include_cold] == true
-          assert opts[:consistent_projection] == true
-          assert opts[:count] == 10
-          assert data.result.command == "FLOW.BY_ROOT"
+          assert_receive {:lineage_query, query, params}
+          assert query =~ "root_flow_id = @lineage_id"
+          assert query =~ "LIMIT 10"
+          assert params["partition_key"] == "tenant-a"
+          assert params["lineage_id"] == "root-1"
+          assert data.result.command == "FLOW.QUERY"
           assert String.contains?(html, "Flow Lineage")
           assert String.contains?(html, "Lineage Map")
           assert String.contains?(html, "child-1")
@@ -695,7 +735,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
               sample_limit: 400,
               result: %{
                 status: :ok,
-                command: "FLOW.LIST",
+                command: "FLOW.QUERY",
                 message: "1 row",
                 rows: [
                   %{
@@ -709,7 +749,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
             })
 
           assert String.contains?(html, "Safe Query Explorer")
-          assert String.contains?(html, "FLOW.LIST")
+          assert String.contains?(html, "FLOW.QUERY")
           assert String.contains?(html, "Workflow Type")
           assert String.contains?(html, "State")
           assert String.contains?(html, "From UTC")
@@ -757,26 +797,28 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
           assert String.contains?(html, "count")
         end
 
-        test "query explorer runs FLOW.SEARCH with indexed attributes and state metadata" do
-          previous_search = Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun)
+        test "query explorer parameterizes attribute and state metadata queries" do
+          previous_search = Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun)
           test_pid = self()
 
-          Application.put_env(:ferricstore, :flow_dashboard_flow_search_fun, fn opts ->
-            send(test_pid, {:flow_search_opts, opts})
+          Application.put_env(:ferricstore, :flow_dashboard_flow_query_fun, fn query, params ->
+            send(test_pid, {:flow_query, query, params})
 
             {:ok,
-             [
-               %{
-                 id: "search-flow",
-                 type: "email",
-                 state: "queued",
-                 partition_key: "tenant-a",
-                 updated_at_ms: 1_000
-               }
-             ]}
+             %{
+               records: [
+                 %{
+                   id: "search-flow",
+                   type: "email",
+                   state: "queued",
+                   partition_key: "tenant-a",
+                   updated_at_ms: 1_000
+                 }
+               ]
+             }}
           end)
 
-          on_exit(fn -> restore_env(:flow_dashboard_flow_search_fun, previous_search) end)
+          on_exit(fn -> restore_env(:flow_dashboard_flow_query_fun, previous_search) end)
 
           data =
             Dashboard.collect_flow_query_page(
@@ -791,17 +833,20 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
               limit: 7
             )
 
-          assert_receive {:flow_search_opts, opts}
-          assert Keyword.fetch!(opts, :type) == "email"
-          assert Keyword.fetch!(opts, :partition_key) == "tenant-a"
-          assert Keyword.fetch!(opts, :count) == 7
-          assert Keyword.fetch!(opts, :consistent_projection) == true
-          assert Keyword.fetch!(opts, :attributes) == %{"tenant" => "acme"}
-          assert Keyword.fetch!(opts, :state_meta) == %{"review" => %{"risk_tier" => "high"}}
+          assert_receive {:flow_query, query, params}
+          assert query =~ "attribute.tenant = @attribute_value"
+          assert query =~ "state_meta.review.risk_tier = @state_meta_value"
+          assert query =~ "LIMIT 7"
+          refute query =~ "acme"
+          refute query =~ "high"
+          assert params["partition_key"] == "tenant-a"
+          assert params["type"] == "email"
+          assert params["attribute_value"] == "acme"
+          assert params["state_meta_value"] == "high"
 
           html = Dashboard.render_flow_query_page(data)
 
-          assert String.contains?(html, "FLOW.SEARCH")
+          assert String.contains?(html, "FLOW.QUERY")
           assert String.contains?(html, "State meta state")
           assert String.contains?(html, "search-flow")
         end
@@ -811,7 +856,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowBrowseAndQueries d
             Dashboard.collect_flow_query_page(kind: "by_correlation", id: "corr-1")
             |> Dashboard.render_flow_query_page()
 
-          assert String.contains?(html, "FLOW.BY_CORRELATION")
+          assert String.contains?(html, "FLOW.QUERY")
           assert String.contains?(html, "Correlation ID")
           assert String.contains?(html, "Partition")
           assert String.contains?(html, "From UTC")

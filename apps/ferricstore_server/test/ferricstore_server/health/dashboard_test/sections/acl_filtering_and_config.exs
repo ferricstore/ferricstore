@@ -129,7 +129,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               ">secret",
               "%R~shared-type",
               "-@all",
-              "+FLOW.LIST"
+              "+FLOW.QUERY"
             ])
 
           assert FerricstoreServer.Health.Dashboard.Access.filter_flow_records_for_acl(
@@ -649,7 +649,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               ">secret",
               "~tenant-a:*",
               "-@all",
-              "+FLOW.LIST"
+              "+FLOW.QUERY"
             ])
 
           denied_records =
@@ -751,7 +751,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               ">secret",
               "~tenant-a:*",
               "-@all",
-              "+FLOW.LIST"
+              "+FLOW.QUERY"
             ])
 
           restricted_data =
@@ -898,7 +898,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
               ">secret",
               "~*",
               "-@all",
-              "+FLOW.LIST"
+              "+FLOW.QUERY"
             ])
 
           login =
@@ -941,7 +941,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFilteringAndConfig 
             ])
 
           assert extract_status_code(denied) == 403
-          assert Jason.decode!(extract_body(denied))["required_acl_rule"] == "+FLOW.LIST"
+          assert Jason.decode!(extract_body(denied))["required_acl_rule"] == "+FLOW.QUERY"
         end
       end
 

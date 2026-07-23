@@ -50,6 +50,18 @@ defmodule Ferricstore.Store.Shard.Compound do
   def handle_compound_scan(redis_key, prefix, state),
     do: Ops.handle_compound_scan(redis_key, prefix, state)
 
+  @spec handle_compound_scan_slice(
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          map()
+        ) :: {:reply, term(), map()}
+  @doc false
+  def handle_compound_scan_slice(redis_key, prefix, start, count, total, state),
+    do: Ops.handle_compound_scan_slice(redis_key, prefix, start, count, total, state)
+
   @spec handle_compound_scan_bounded(binary(), binary(), map(), map()) ::
           {:reply, term(), map()}
   @doc false

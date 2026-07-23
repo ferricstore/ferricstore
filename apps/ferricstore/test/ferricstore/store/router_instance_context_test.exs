@@ -32,6 +32,15 @@ defmodule Ferricstore.Store.RouterInstanceContextTest do
     assert ["first"] = Router.list_op(ctx, destination, {:lrange, 0, -1})
   end
 
+  test "Router shard entry batches preserve absolute expiry", %{ctx: ctx} do
+    key = "batch-entry:#{System.unique_integer([:positive, :monotonic])}"
+    expire_at_ms = System.system_time(:millisecond) + 60_000
+    assert :ok = Router.put(ctx, key, "value", expire_at_ms)
+
+    assert {:ok, [{"value", ^expire_at_ms}]} =
+             Router.read_shard_entries(ctx, Router.shard_for(ctx, key), [key])
+  end
+
   test "Router cross-shard LMOVE works inside a non-Raft instance", %{ctx: ctx} do
     handler_id =
       "standalone-cross-shard-journal-#{System.unique_integer([:positive, :monotonic])}"

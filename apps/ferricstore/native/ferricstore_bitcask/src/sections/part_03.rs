@@ -284,9 +284,14 @@ fn v2_pread_at_key_async<'a>(
     offset: u64,
     expected_key: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let expected_key = expected_key.as_slice().to_vec();
-
-    let blocking_task = match async_io::try_spawn_blocking(move || {
+    let input_bytes = match async_io::checked_input_bytes([expected_key.len()]) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+    let blocking_task = match async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || expected_key.as_slice().to_vec(),
+        move |expected_key| {
         let p = std::path::Path::new(&path);
         open_random_read(p)
             .map_err(|e| log::LogError(e.to_string()))
@@ -302,7 +307,8 @@ fn v2_pread_at_key_async<'a>(
                 }
                 value
             })
-    }) {
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };
@@ -685,17 +691,26 @@ fn v2_pread_batch_path_key_async<'a>(
     reads: Vec<(u64, Binary<'a>)>,
 ) -> NifResult<Term<'a>> {
     let count = reads.len();
-    let reads: Vec<(usize, u64, Vec<u8>)> = reads
-        .into_iter()
-        .enumerate()
-        .map(|(index, (offset, key))| (index, offset, key.as_slice().to_vec()))
-        .collect();
-
-    let blocking_task = match async_io::try_spawn_blocking(move || {
+    let input_bytes =
+        match async_io::checked_input_bytes(reads.iter().map(|(_offset, key)| key.len())) {
+            Ok(bytes) => bytes,
+            Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+        };
+    let blocking_task = match async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || {
+            reads
+                .iter()
+                .enumerate()
+                .map(|(index, (offset, key))| (index, *offset, key.as_slice().to_vec()))
+                .collect::<Vec<_>>()
+        },
+        move |reads| {
         let mut values = vec![BatchReadValue::Nil; count];
         apply_grouped_pread_results(&mut values, pread_batch_for_path_keyed(path, reads)?);
         Ok(values)
-    }) {
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };
@@ -772,18 +787,29 @@ fn v2_pread_batch_grouped_key_async<'a>(
     correlation_id: u64,
     groups: Vec<(String, Vec<(usize, u64, Binary<'a>)>)>,
 ) -> NifResult<Term<'a>> {
-    let groups: Vec<(String, Vec<(usize, u64, Vec<u8>)>)> = groups
-        .into_iter()
-        .map(|(path, reads)| {
-            let reads = reads
-                .into_iter()
-                .map(|(index, offset, key)| (index, offset, key.as_slice().to_vec()))
-                .collect();
-            (path, reads)
-        })
-        .collect();
-
-    let blocking_task = match async_io::try_spawn_blocking(move || {
+    let input_bytes = match async_io::checked_input_bytes(groups.iter().flat_map(|(_path, reads)| {
+        reads.iter().map(|(_index, _offset, key)| key.len())
+    })) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
+    let blocking_task = match async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || {
+            groups
+                .iter()
+                .map(|(path, reads)| {
+                    let reads = reads
+                        .iter()
+                        .map(|(index, offset, key)| {
+                            (*index, *offset, key.as_slice().to_vec())
+                        })
+                        .collect();
+                    (path.clone(), reads)
+                })
+                .collect::<Vec<_>>()
+        },
+        move |groups| {
         let count = match validate_grouped_keyed_pread_groups(&groups) {
             Ok(count) => count,
             Err(reason) => return Err(reason),
@@ -793,7 +819,8 @@ fn v2_pread_batch_grouped_key_async<'a>(
             apply_grouped_pread_results(&mut values, pread_batch_for_path_keyed(path, reads)?);
         }
         Ok(values)
-    }) {
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };

@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.10.0 - 2026-07-23
+
+- Added the complete cost-aware `FLOW.QUERY` planner, composite index lifecycle, bounded executor, statistics, actionable diagnostics, index management, and `EXPLAIN`/`EXPLAIN ANALYZE` UX to OSS; Enterprise consumes the same implementation and contracts.
+- Removed the beta wire commands `FLOW.LIST`, `FLOW.SEARCH`, `FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.STUCK`, `FLOW.BY_PARENT`, `FLOW.BY_ROOT`, and `FLOW.BY_CORRELATION`; clients must use `FLOW.QUERY` and negotiate its advertised shapes.
+- Unified point, history, lineage, fixed-index, composite, and count plans under `ferric.flow.query.result/v1` and `ferric.flow.explain/v1`, with one edition-neutral capability manifest containing every executable shape.
+- Added memory-weighted query admission, pressure-aware index backfill, aggregate native merge limits, batched selected-plan statistics probes, exact one-pass response accounting, and resumable bounded-prefix LMDB hydration.
+- Bounded fixed-index fallback candidate hydration to one maximum result page plus look-ahead, and kept namespace quota accounting distinct from Flow secondary indexes.
+
 ## 0.9.1 - 2026-07-19
 
 - Advertised and accepted `expected_generation` and `replace` in typed-native `FLOW.POLICY.SET`, aligning native SDK policy CAS and replacement with the embedded and textual command paths.

@@ -505,9 +505,11 @@ defmodule Ferricstore.Commands.Cluster do
   defp effective_shard_count(_store) do
     case default_instance() do
       %FerricStore.Instance{shard_count: shard_count}
-      when is_integer(shard_count) and shard_count > 0 -> shard_count
+      when is_integer(shard_count) and shard_count > 0 ->
+        shard_count
 
-      _none -> configured_shard_count()
+      _none ->
+        configured_shard_count()
     end
   end
 

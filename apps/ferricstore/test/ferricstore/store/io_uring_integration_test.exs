@@ -3,8 +3,8 @@ defmodule Ferricstore.Store.IoUringIntegrationTest do
   Linux io_uring integration coverage for the async Bitcask write path.
 
   The test is excluded from default `mix test` by the `:linux_io_uring` tag.
-  CI runs it only after the loaded NIF reports that io_uring is available on
-  the Linux runner.
+  CI requires the loaded NIF to report io_uring availability before running
+  this test; unavailable kernel support fails the Linux job.
   """
 
   use ExUnit.Case, async: false
@@ -15,6 +15,7 @@ defmodule Ferricstore.Store.IoUringIntegrationTest do
 
   test "async append and fsync persist records when io_uring is available" do
     assert {:unix, :linux} == :os.type()
+    assert "1" == System.fetch_env!("FERRICSTORE_REQUIRE_IO_URING")
     assert NIF.io_uring_available()
 
     dir =

@@ -4,7 +4,13 @@ defmodule Ferricstore.Store.KeydirTableOwner do
   use GenServer
 
   alias Ferricstore.Store.ETSTableHeir
-  alias Ferricstore.Store.Shard.{CompoundMemberIndex, CompoundRevisionIndex, LogicalKeyIndex}
+
+  alias Ferricstore.Store.Shard.{
+    CompoundMemberIndex,
+    CompoundRevisionIndex,
+    LogicalKeyIndex,
+    NamespaceUsageIndex
+  }
 
   @heir_retry_ms 10
 
@@ -112,6 +118,13 @@ defmodule Ferricstore.Store.KeydirTableOwner do
           ensure_table(logical_keys, :ordered_set, heir)
           ensure_table(logical_slots, :set, heir)
           LogicalKeyIndex.ensure_tables!(logical_keys, logical_slots)
+
+          {namespace_usage, namespace_usage_expiry} =
+            NamespaceUsageIndex.table_names(instance_name, shard_index)
+
+          ensure_table(namespace_usage, :ordered_set, heir)
+          ensure_table(namespace_usage_expiry, :ordered_set, heir)
+          NamespaceUsageIndex.ensure_tables!(namespace_usage, namespace_usage_expiry)
         end)
       end
     end)
@@ -179,11 +192,16 @@ defmodule Ferricstore.Store.KeydirTableOwner do
             {logical_keys, logical_slots} =
               LogicalKeyIndex.table_names(instance_name, shard_index)
 
+            {namespace_usage, namespace_usage_expiry} =
+              NamespaceUsageIndex.table_names(instance_name, shard_index)
+
             [
               CompoundMemberIndex.table_name(instance_name, shard_index),
               CompoundRevisionIndex.table_name(instance_name, shard_index),
               logical_keys,
-              logical_slots
+              logical_slots,
+              namespace_usage,
+              namespace_usage_expiry
             ]
           end)
       end)

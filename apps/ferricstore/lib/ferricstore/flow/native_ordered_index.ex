@@ -56,6 +56,25 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
     :ok
   end
 
+  @spec unregister(index_name(), index_name()) :: :ok
+  def unregister(index_table, lookup_table) do
+    :persistent_term.erase(registry_key(index_table, lookup_table))
+    :ok
+  end
+
+  @spec unregister_all(atom(), non_neg_integer()) :: :ok
+  def unregister_all(instance_name, shard_count)
+      when is_atom(instance_name) and is_integer(shard_count) and shard_count >= 0 do
+    if shard_count > 0 do
+      Enum.each(0..(shard_count - 1), fn shard_index ->
+        {index_table, lookup_table} = table_names(instance_name, shard_index)
+        unregister(index_table, lookup_table)
+      end)
+    end
+
+    :ok
+  end
+
   @spec get(index_name(), index_name()) :: resource() | nil
   def get(index_table, lookup_table) do
     :persistent_term.get(registry_key(index_table, lookup_table), nil)

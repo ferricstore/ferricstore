@@ -210,6 +210,15 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
 
   defp requirement_allowed?(user, {"*", _opts}), do: Acl.check_permission(user, "*")
 
+  defp requirement_allowed?(user, requirements) when is_list(requirements) do
+    Enum.reduce_while(requirements, :ok, fn requirement, :ok ->
+      case requirement_allowed?(user, requirement) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
   defp requirement_allowed?(user, {command, opts}) do
     with :ok <- Acl.check_command(user, command) do
       check_requirement_key(user, opts)
@@ -244,11 +253,21 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
 
   defp requirement_command({command, _opts}), do: command
 
+  defp requirement_command(requirements) when is_list(requirements),
+    do: requirements |> Enum.map(&requirement_command/1) |> Enum.join(", ")
+
   defp requirement_key({_command, opts}) do
     case Keyword.get(opts, :key) do
       {key, access} -> "#{access}:#{key}"
       nil -> ""
     end
+  end
+
+  defp requirement_key(requirements) when is_list(requirements) do
+    requirements
+    |> Enum.map(&requirement_key/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join(", ")
   end
 
   defp format_requirement({command, opts}) do
@@ -257,4 +276,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Security do
       key -> "#{command} #{key}"
     end
   end
+
+  defp format_requirement(requirements) when is_list(requirements),
+    do: requirements |> Enum.map(&format_requirement/1) |> Enum.join(" AND ")
 end

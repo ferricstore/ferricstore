@@ -66,11 +66,10 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   )
 
   @flow_read ~w(
-    FLOW.GET FLOW.POLICY.GET FLOW.LIST FLOW.SEARCH FLOW.QUERY FLOW.BY_PARENT FLOW.BY_ROOT FLOW.BY_CORRELATION
-    FLOW.INFO FLOW.STUCK FLOW.STATS FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.EFFECT.GET
+    FLOW.GET FLOW.POLICY.GET FLOW.QUERY FLOW.INFO FLOW.STATS FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.EFFECT.GET
     FLOW.GOVERNANCE.LEDGER FLOW.GOVERNANCE.OVERVIEW FLOW.APPROVAL.GET FLOW.APPROVAL.LIST
     FLOW.CIRCUIT.GET FLOW.BUDGET.GET FLOW.BUDGET.LIST FLOW.LIMIT.GET FLOW.LIMIT.LIST
-    FLOW.HISTORY FLOW.TERMINALS FLOW.FAILURES FLOW.SCHEDULE.GET FLOW.SCHEDULE.LIST
+    FLOW.HISTORY FLOW.SCHEDULE.GET FLOW.SCHEDULE.LIST
   )
   @flow_write ~w(
     FLOW.CREATE FLOW.CREATE_MANY FLOW.VALUE.PUT FLOW.SIGNAL FLOW.SPAWN_CHILDREN FLOW.POLICY.SET FLOW.CLAIM_DUE
@@ -119,7 +118,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
     CLUSTER.HEALTH CLUSTER.STATS CLUSTER.KEYSLOT CLUSTER.SLOTS CLUSTER.STATUS
     CLUSTER.JOIN CLUSTER.LEAVE CLUSTER.FAILOVER
     CLUSTER.PROMOTE CLUSTER.DEMOTE CLUSTER.ROLE
-    FERRICSTORE.CONFIG FERRICSTORE.HOTNESS FERRICSTORE.METRICS FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FLOW.RETENTION_CLEANUP
+    FERRICSTORE.CONFIG FERRICSTORE.HOTNESS FERRICSTORE.METRICS FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FLOW.RETENTION_CLEANUP FLOW.QUERY.EXPLAIN
   ) ++ @client_admin_commands ++ @acl_subcommands
 
   @dangerous_commands ~w(
@@ -204,7 +203,19 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   }
 
   @spec categories() :: %{binary() => MapSet.t(binary())}
-  def categories, do: @category_map
+  def categories do
+    Enum.reduce(Extension.non_shadowing_commands(), @category_map, fn command, categories ->
+      command_name = String.upcase(command.name)
+      categories = Map.update!(categories, "ALL", &MapSet.put(&1, command_name))
+
+      Enum.reduce(command.acl_categories, categories, fn category, categories ->
+        case Map.fetch(categories, category) do
+          {:ok, commands} -> Map.put(categories, category, MapSet.put(commands, command_name))
+          :error -> categories
+        end
+      end)
+    end)
+  end
 
   @spec category_names() :: [binary()]
   def category_names, do: Map.keys(@category_map) |> Enum.sort()
@@ -215,18 +226,27 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   @spec category_commands(binary()) :: {:ok, MapSet.t(binary())} | :error
   def category_commands(category) when is_binary(category) do
     case String.upcase(category) do
-      "READ" -> {:ok, MapSet.union(@read_commands, extension_commands_by_access(:read))}
-      "WRITE" -> {:ok, MapSet.union(@write_commands, extension_commands_by_access(:write))}
-      "ALL" -> {:ok, MapSet.union(Map.fetch!(@category_map, "ALL"), extension_commands())}
-      category -> Map.fetch(@category_map, category)
+      "ALL" ->
+        {:ok, MapSet.union(Map.fetch!(@category_map, "ALL"), extension_commands())}
+
+      category ->
+        case Map.fetch(@category_map, category) do
+          {:ok, commands} ->
+            {:ok, MapSet.union(commands, extension_commands_in_acl_category(category))}
+
+          :error ->
+            :error
+        end
     end
   end
 
   @spec read_commands() :: MapSet.t(binary())
-  def read_commands, do: MapSet.union(@read_commands, extension_commands_by_access(:read))
+  def read_commands,
+    do: MapSet.union(@read_commands, extension_commands_in_acl_category("READ"))
 
   @spec write_commands() :: MapSet.t(binary())
-  def write_commands, do: MapSet.union(@write_commands, extension_commands_by_access(:write))
+  def write_commands,
+    do: MapSet.union(@write_commands, extension_commands_in_acl_category("WRITE"))
 
   @spec acl_supported_commands() :: MapSet.t(binary())
   def acl_supported_commands,
@@ -239,10 +259,6 @@ defmodule FerricstoreServer.Acl.CommandCategories do
     Extension.non_shadowing_command_names_upper()
   end
 
-  defp extension_commands_by_access(access) do
-    Extension.non_shadowing_commands()
-    |> Enum.filter(&(Map.get(&1, :access, :rw) == access))
-    |> Enum.map(&String.upcase(&1.name))
-    |> MapSet.new()
-  end
+  defp extension_commands_in_acl_category(category),
+    do: Extension.non_shadowing_command_names_in_acl_category(category)
 end

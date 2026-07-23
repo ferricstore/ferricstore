@@ -61,6 +61,7 @@ pub mod async_io;
 pub mod bloom;
 pub mod cms;
 pub mod cuckoo;
+mod flow_composite_codec;
 pub mod flow_index;
 pub mod fs_nif;
 pub mod hint;

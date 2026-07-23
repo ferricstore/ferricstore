@@ -100,6 +100,14 @@ jobs:
       - name: Run Rust tests (native_protocol_nif)
         run: cargo test --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml
 
+      - name: Compile native query performance benchmarks
+        run: |
+          cargo bench --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --bench fql_parser --bench fql_allocations --no-run
+
+      - name: Enforce native FQL allocation ceilings
+        run: |
+          BENCH_ALLOC_ITERATIONS=1000 cargo bench --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --bench fql_allocations
+
       - name: Build NIF (release)
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
@@ -117,14 +125,13 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
-      - name: Run Linux io_uring integration tests when available
+      - name: Run Linux io_uring integration tests (required)
+        env:
+          FERRICSTORE_REQUIRE_IO_URING: "1"
         run: |
-          set -e
+          set -euo pipefail
           echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo unknown)"
-          if ! mix run -e 'if Ferricstore.Bitcask.NIF.io_uring_available(), do: System.halt(0), else: System.halt(1)'; then
-            echo "::notice::io_uring unavailable on this runner; skipping tagged Linux io_uring tests"
-            exit 0
-          fi
+          mix run -e 'unless Ferricstore.Bitcask.NIF.io_uring_available(), do: raise("io_uring is required for the Linux CI integration suite")'
           mix test apps/ferricstore/test/ferricstore/store/io_uring_integration_test.exs --only linux_io_uring --timeout 120000
 
       - name: Credo
@@ -586,7 +593,7 @@ jobs:
 
       # io_uring tests run in build-ubuntu:
       # - Rust-level backend tests via cargo test.
-      # - Elixir :linux_io_uring integration tests when the runner supports io_uring.
+      # - Required Elixir :linux_io_uring integration tests; unavailable support fails CI.
 
       - uses: actions/upload-artifact@v7
         if: always()

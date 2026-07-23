@@ -36,22 +36,52 @@ const BLOCKING_THREADS_ENV: &str = "FERRICSTORE_TOKIO_BLOCKING_THREADS";
 const BLOCKING_ADMISSION_MULTIPLIER: usize = 4;
 const MIN_OUTSTANDING_BLOCKING_JOBS: usize = 128;
 const MAX_OUTSTANDING_BLOCKING_JOBS: usize = 4_096;
+const DEFAULT_MAX_OUTSTANDING_BLOCKING_BYTES: usize = 512 * 1024 * 1024;
+const MIN_OUTSTANDING_BLOCKING_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OUTSTANDING_BLOCKING_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const BLOCKING_BYTES_ENV: &str = "FERRICSTORE_TOKIO_BLOCKING_BYTES";
 pub const BLOCKING_OVERLOAD_ERROR: &str = "native async IO overloaded";
+pub const ASYNC_INPUT_TOO_LARGE_ERROR: &str = "native async IO request too large";
+pub const MAX_ASYNC_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const ASYNC_COPIED_INPUT_OVERHEAD_BYTES: usize = 64;
+
+/// Returns a conservative estimate of the owned copy retained by a blocking
+/// job. Charging each binary for its vector/tuple storage also bounds requests
+/// containing very large numbers of empty values.
+pub fn checked_input_bytes(
+    lengths: impl IntoIterator<Item = usize>,
+) -> Result<usize, &'static str> {
+    lengths.into_iter().try_fold(0usize, |total, length| {
+        total
+            .checked_add(length)
+            .and_then(|next| next.checked_add(ASYNC_COPIED_INPUT_OVERHEAD_BYTES))
+            .filter(|next| *next <= MAX_ASYNC_INPUT_BYTES)
+            .ok_or(ASYNC_INPUT_TOO_LARGE_ERROR)
+    })
+}
 
 struct BlockingAdmission {
     active: AtomicUsize,
+    active_bytes: AtomicUsize,
     limit: usize,
+    byte_limit: usize,
 }
 
 impl BlockingAdmission {
-    const fn new(limit: usize) -> Self {
+    const fn new(limit: usize, byte_limit: usize) -> Self {
         Self {
             active: AtomicUsize::new(0),
+            active_bytes: AtomicUsize::new(0),
             limit,
+            byte_limit,
         }
     }
 
-    fn try_acquire(&self) -> Result<BlockingPermit<'_>, &'static str> {
+    fn try_acquire(&self, input_bytes: usize) -> Result<BlockingPermit<'_>, &'static str> {
+        if input_bytes > self.byte_limit {
+            return Err(BLOCKING_OVERLOAD_ERROR);
+        }
+
         let mut active = self.active.load(Ordering::Acquire);
 
         loop {
@@ -65,8 +95,35 @@ impl BlockingAdmission {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(BlockingPermit { admission: self }),
+                Ok(_) => break,
                 Err(observed) => active = observed,
+            }
+        }
+
+        let mut active_bytes = self.active_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next_bytes) = active_bytes.checked_add(input_bytes) else {
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                return Err(BLOCKING_OVERLOAD_ERROR);
+            };
+            if next_bytes > self.byte_limit {
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                return Err(BLOCKING_OVERLOAD_ERROR);
+            }
+
+            match self.active_bytes.compare_exchange_weak(
+                active_bytes,
+                next_bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(BlockingPermit {
+                        admission: self,
+                        input_bytes,
+                    });
+                }
+                Err(observed) => active_bytes = observed,
             }
         }
     }
@@ -74,10 +131,19 @@ impl BlockingAdmission {
 
 struct BlockingPermit<'a> {
     admission: &'a BlockingAdmission,
+    input_bytes: usize,
 }
 
 impl Drop for BlockingPermit<'_> {
     fn drop(&mut self) {
+        let previous_bytes = self
+            .admission
+            .active_bytes
+            .fetch_sub(self.input_bytes, Ordering::AcqRel);
+        debug_assert!(
+            previous_bytes >= self.input_bytes,
+            "blocking byte counter underflow"
+        );
         let previous = self.admission.active.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "blocking admission counter underflow");
     }
@@ -141,16 +207,50 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let permit = blocking_admission().try_acquire()?;
+    let permit = blocking_admission().try_acquire(0)?;
     Ok(runtime().spawn_blocking(move || {
         let _permit = permit;
         job()
     }))
 }
 
+pub fn try_spawn_blocking_with_input<P, I, F, R>(
+    input_bytes: usize,
+    prepare: P,
+    job: F,
+) -> Result<JoinHandle<R>, &'static str>
+where
+    P: FnOnce() -> I,
+    I: Send + 'static,
+    F: FnOnce(I) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (permit, input) = try_prepare_with_admission(blocking_admission(), input_bytes, prepare)?;
+    Ok(runtime().spawn_blocking(move || {
+        let _permit = permit;
+        job(input)
+    }))
+}
+
+fn try_prepare_with_admission<'a, P, I>(
+    admission: &'a BlockingAdmission,
+    input_bytes: usize,
+    prepare: P,
+) -> Result<(BlockingPermit<'a>, I), &'static str>
+where
+    P: FnOnce() -> I,
+{
+    let permit = admission.try_acquire(input_bytes)?;
+    Ok((permit, prepare()))
+}
+
 fn blocking_admission() -> &'static BlockingAdmission {
-    BLOCKING_ADMISSION
-        .get_or_init(|| BlockingAdmission::new(blocking_admission_limit(blocking_thread_cap())))
+    BLOCKING_ADMISSION.get_or_init(|| {
+        BlockingAdmission::new(
+            blocking_admission_limit(blocking_thread_cap()),
+            blocking_byte_limit(),
+        )
+    })
 }
 
 fn blocking_admission_limit(blocking_threads: usize) -> usize {
@@ -169,6 +269,19 @@ fn blocking_thread_cap_from_env_value(raw: Option<&str>) -> usize {
         .clamp(MIN_BLOCKING_THREADS, MAX_BLOCKING_THREADS)
 }
 
+fn blocking_byte_limit() -> usize {
+    blocking_byte_limit_from_env_value(std::env::var(BLOCKING_BYTES_ENV).ok().as_deref())
+}
+
+fn blocking_byte_limit_from_env_value(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_OUTSTANDING_BLOCKING_BYTES)
+        .clamp(
+            MIN_OUTSTANDING_BLOCKING_BYTES,
+            MAX_OUTSTANDING_BLOCKING_BYTES,
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +297,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_blocking_byte_limit_from_env_value() {
+        assert_eq!(
+            blocking_byte_limit_from_env_value(None),
+            DEFAULT_MAX_OUTSTANDING_BLOCKING_BYTES
+        );
+        assert_eq!(
+            blocking_byte_limit_from_env_value(Some("bad")),
+            DEFAULT_MAX_OUTSTANDING_BLOCKING_BYTES
+        );
+        assert_eq!(
+            blocking_byte_limit_from_env_value(Some("33554432")),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            blocking_byte_limit_from_env_value(Some("0")),
+            MIN_OUTSTANDING_BLOCKING_BYTES
+        );
+        assert_eq!(
+            blocking_byte_limit_from_env_value(Some("18446744073709551615")),
+            MAX_OUTSTANDING_BLOCKING_BYTES
+        );
+    }
+
+    #[test]
     fn blocking_admission_limit_bounds_the_active_pool_and_waiting_queue() {
         assert_eq!(blocking_admission_limit(1), 128);
         assert_eq!(blocking_admission_limit(16), 128);
@@ -194,20 +331,74 @@ mod tests {
 
     #[test]
     fn blocking_admission_rejects_overload_and_recovers_when_permits_drop() {
-        let admission = BlockingAdmission::new(2);
-        let first = admission.try_acquire().unwrap();
-        let second = admission.try_acquire().unwrap();
+        let admission = BlockingAdmission::new(2, 16);
+        let first = admission.try_acquire(4).unwrap();
+        let second = admission.try_acquire(4).unwrap();
 
         assert!(matches!(
-            admission.try_acquire(),
+            admission.try_acquire(4),
             Err(BLOCKING_OVERLOAD_ERROR)
         ));
 
         drop(first);
-        let replacement = admission.try_acquire().unwrap();
+        let replacement = admission.try_acquire(4).unwrap();
         drop(second);
         drop(replacement);
         assert_eq!(admission.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn blocking_admission_enforces_and_releases_the_byte_budget() {
+        let admission = BlockingAdmission::new(8, 10);
+        let first = admission.try_acquire(6).unwrap();
+
+        assert_eq!(admission.active_bytes.load(Ordering::Acquire), 6);
+        assert!(matches!(
+            admission.try_acquire(5),
+            Err(BLOCKING_OVERLOAD_ERROR)
+        ));
+        assert_eq!(admission.active.load(Ordering::Acquire), 1);
+        assert_eq!(admission.active_bytes.load(Ordering::Acquire), 6);
+
+        drop(first);
+        assert_eq!(admission.active.load(Ordering::Acquire), 0);
+        assert_eq!(admission.active_bytes.load(Ordering::Acquire), 0);
+        assert!(admission.try_acquire(10).is_ok());
+    }
+
+    #[test]
+    fn rejected_input_is_not_prepared_or_copied() {
+        let admission = BlockingAdmission::new(1, 4);
+        let mut prepared = false;
+        let result = try_prepare_with_admission(&admission, 5, || {
+            prepared = true;
+            vec![0; 5]
+        });
+
+        assert!(matches!(result, Err(BLOCKING_OVERLOAD_ERROR)));
+        assert!(!prepared);
+    }
+
+    #[test]
+    fn async_input_bytes_are_checked_before_copying() {
+        let empty_copy_bytes = checked_input_bytes([0]).unwrap();
+        assert!(empty_copy_bytes >= std::mem::size_of::<Vec<u8>>());
+        assert_eq!(
+            checked_input_bytes((0..=MAX_ASYNC_INPUT_BYTES / empty_copy_bytes).map(|_| 0)),
+            Err(ASYNC_INPUT_TOO_LARGE_ERROR)
+        );
+        assert_eq!(
+            checked_input_bytes([MAX_ASYNC_INPUT_BYTES - empty_copy_bytes]).unwrap(),
+            MAX_ASYNC_INPUT_BYTES
+        );
+        assert_eq!(
+            checked_input_bytes([MAX_ASYNC_INPUT_BYTES, 1]),
+            Err(ASYNC_INPUT_TOO_LARGE_ERROR)
+        );
+        assert_eq!(
+            checked_input_bytes([usize::MAX, 1]),
+            Err(ASYNC_INPUT_TOO_LARGE_ERROR)
+        );
     }
 
     #[test]

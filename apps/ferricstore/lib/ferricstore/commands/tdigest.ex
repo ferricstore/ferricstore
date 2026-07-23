@@ -158,6 +158,34 @@ defmodule Ferricstore.Commands.TDigest do
     end
   end
 
+  @doc false
+  @spec encoded_empty_size(pos_integer()) :: pos_integer()
+  def encoded_empty_size(compression)
+      when is_integer(compression) and compression > 0 and compression <= @max_compression do
+    compression
+    |> Core.new()
+    |> serialize()
+    |> TermCodec.encode()
+    |> byte_size()
+  end
+
+  @doc false
+  @spec encoded_size_after_add(term(), [binary()]) :: {:ok, pos_integer()} | {:error, term()}
+  def encoded_size_after_add(raw, value_args) when is_list(value_args) do
+    with {:ok, values} <- parse_float_list(value_args),
+         {:ok, digest} <- decode_raw_digest(raw),
+         :ok <- validate_observation_capacity(digest, length(values)) do
+      size =
+        digest
+        |> Core.add_many(values)
+        |> serialize()
+        |> TermCodec.encode()
+        |> byte_size()
+
+      {:ok, size}
+    end
+  end
+
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 

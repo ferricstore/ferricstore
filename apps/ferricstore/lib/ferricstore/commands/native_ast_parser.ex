@@ -9,6 +9,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   """
 
   alias Ferricstore.Commands.{Catalog, CollectionScan, Extension}
+  alias Ferricstore.Commands.Catalog.Entries
   alias Ferricstore.Flow.Query.Limits
 
   @max_flow_ref_size 4096
@@ -46,7 +47,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   @management_scoped_commands ~w(FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY)
 
   @command_tags Map.new(
-                  Enum.map(Catalog.names(), &String.upcase/1),
+                  Enum.map(Entries.names(), &String.upcase/1),
                   fn upper ->
                     tag =
                       upper |> String.downcase() |> String.replace(".", "_") |> String.to_atom()
@@ -273,22 +274,11 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {"NOW", :now_ms, :non_negative},
       {"INDEPENDENT", :independent, :boolean}
     ],
-    list: [
+    stats: [
       {"STATE", :state, :binary},
       {"COUNT", :count, {:positive, :count}},
       {"PARTITION", :partition_key, :partition},
       {"INCLUDE_COLD", :include_cold, :boolean},
-      {"CONSISTENT_PROJECTION", :consistent_projection, :boolean}
-    ],
-    search: [
-      {"TYPE", :type, :binary},
-      {"STATE", :state, :binary},
-      {"COUNT", :count, {:positive, :count}},
-      {"PARTITION", :partition_key, :partition},
-      {"FROM_MS", :from_ms, :non_negative},
-      {"TO_MS", :to_ms, :non_negative},
-      {"REV", :rev, :boolean},
-      {"TERMINAL_ONLY", :terminal_only, :boolean},
       {"CONSISTENT_PROJECTION", :consistent_projection, :boolean}
     ],
     index_query: [
@@ -319,12 +309,6 @@ defmodule Ferricstore.Commands.NativeAstParser do
       {"VALUES", :values, :boolean},
       {"PAYLOAD_MAX_BYTES", :payload_max_bytes, :non_negative},
       {"MAXBYTES", :payload_max_bytes, :non_negative}
-    ],
-    stuck: [
-      {"COUNT", :count, {:positive, :count}},
-      {"OLDER_THAN", :older_than_ms, :non_negative},
-      {"NOW", :now_ms, :non_negative},
-      {"PARTITION", :partition_key, :partition}
     ],
     retention_cleanup: [
       {"LIMIT", :limit, {:positive, :limit}},
@@ -697,12 +681,6 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp make_ast("FLOW.REWIND", :flow_rewind, [id | opts]),
     do: {:flow_rewind, id, parse_flow_options(opts, spec(:rewind))}
 
-  defp make_ast("FLOW.LIST", :flow_list, [type | opts]),
-    do: {:flow_list, type, parse_flow_options(opts, spec(:list))}
-
-  defp make_ast("FLOW.SEARCH", :flow_search, opts),
-    do: {:flow_search, parse_flow_search_options(opts)}
-
   defp make_ast("FLOW.QUERY", :flow_query, [version, query | params]) do
     case parse_flow_query_params(params) do
       {:ok, parsed_params} -> {:flow_query, version, query, parsed_params}
@@ -720,28 +698,10 @@ defmodule Ferricstore.Commands.NativeAstParser do
     do: {:flow_attribute_values, type, attr, parse_flow_options(opts, spec(:index_query))}
 
   defp make_ast("FLOW.STATS", :flow_stats, [type | opts]),
-    do: {:flow_stats, type, parse_flow_options(opts, spec(:list))}
-
-  defp make_ast("FLOW.TERMINALS", :flow_terminals, [type | opts]),
-    do: {:flow_terminals, type, parse_flow_options(opts, spec(:index_query))}
-
-  defp make_ast("FLOW.FAILURES", :flow_failures, [type | opts]),
-    do: {:flow_failures, type, parse_flow_options(opts, spec(:index_query))}
-
-  defp make_ast("FLOW.BY_PARENT", :flow_by_parent, [id | opts]),
-    do: {:flow_by_parent, id, parse_flow_options(opts, spec(:index_query))}
-
-  defp make_ast("FLOW.BY_ROOT", :flow_by_root, [id | opts]),
-    do: {:flow_by_root, id, parse_flow_options(opts, spec(:index_query))}
-
-  defp make_ast("FLOW.BY_CORRELATION", :flow_by_correlation, [id | opts]),
-    do: {:flow_by_correlation, id, parse_flow_options(opts, spec(:index_query))}
+    do: {:flow_stats, type, parse_flow_options(opts, spec(:stats))}
 
   defp make_ast("FLOW.INFO", :flow_info, [type | opts]),
     do: {:flow_info, type, parse_flow_options(opts, spec(:partition))}
-
-  defp make_ast("FLOW.STUCK", :flow_stuck, [type | opts]),
-    do: {:flow_stuck, type, parse_flow_options(opts, spec(:stuck))}
 
   defp make_ast("FLOW.HISTORY", :flow_history, [id | opts]),
     do: {:flow_history, id, parse_flow_options(opts, spec(:history))}
@@ -1038,23 +998,13 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp flow_ast_keys({tag, _selector, opts})
        when tag in [
-              :flow_list,
               :flow_attributes,
               :flow_stats,
-              :flow_terminals,
-              :flow_failures,
-              :flow_info,
-              :flow_stuck,
-              :flow_by_parent,
-              :flow_by_root,
-              :flow_by_correlation
+              :flow_info
             ] and is_list(opts),
        do: flow_partition_query_keys(opts, :query)
 
   defp flow_ast_keys({:flow_attribute_values, _type, _attribute, opts}) when is_list(opts),
-    do: flow_partition_query_keys(opts, :query)
-
-  defp flow_ast_keys({:flow_search, opts}) when is_list(opts),
     do: flow_partition_query_keys(opts, :query)
 
   defp flow_ast_keys({:flow_retention_cleanup, opts}) when is_list(opts), do: ["*"]
@@ -1921,32 +1871,6 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp parse_flow_signal_opts(_args, _acc), do: {:error, "ERR syntax error"}
 
-  defp parse_flow_search_options(args), do: parse_flow_search_options(args, [])
-
-  defp parse_flow_search_options([], acc), do: Enum.reverse(acc)
-
-  defp parse_flow_search_options([name | rest], acc) do
-    case {String.upcase(name), rest} do
-      {"ATTRIBUTE", [key, value | tail]} ->
-        parse_flow_search_options(tail, merge_map_opt(:attributes, key, value, acc))
-
-      {"STATE_META", [state, key, value | tail]} ->
-        parse_flow_search_options(tail, merge_nested_map_opt(:state_meta, state, key, value, acc))
-
-      {_option, [value | tail]} ->
-        case parse_flow_option(name, value, spec(:search)) do
-          {:ok, nil} -> parse_flow_search_options(tail, acc)
-          {:ok, opt} -> parse_flow_search_options(tail, [opt | acc])
-          {:error, reason} -> {:error, reason}
-        end
-
-      _invalid ->
-        {:error, "ERR syntax error"}
-    end
-  end
-
-  defp parse_flow_search_options(_args, _acc), do: {:error, "ERR syntax error"}
-
   defp parse_flow_query_params(params), do: parse_flow_query_params(params, %{})
 
   defp parse_flow_query_params([], params), do: {:ok, params}
@@ -2505,14 +2429,6 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp merge_map_opt(key, attr_key, attr_value, acc) do
     Keyword.update(acc, key, %{attr_key => attr_value}, &Map.put(&1, attr_key, attr_value))
-  end
-
-  defp merge_nested_map_opt(key, outer_key, inner_key, inner_value, acc) do
-    Keyword.update(acc, key, %{outer_key => %{inner_key => inner_value}}, fn existing ->
-      Map.update(existing, outer_key, %{inner_key => inner_value}, fn nested ->
-        Map.put(nested, inner_key, inner_value)
-      end)
-    end)
   end
 
   defp append_list_opt(key, value, acc), do: Keyword.update(acc, key, [value], &[value | &1])

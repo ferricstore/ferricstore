@@ -1,31 +1,29 @@
 defmodule Ferricstore.Flow.Query.Surface do
   @moduledoc false
 
-  @language_versions ["FQL1"]
-  @default_shapes [
-    "runs_by_run_id_record",
-    "runs_by_partition_and_run_id_record",
-    "events_by_run_id_ordered_records"
-  ]
-  @parser_shapes [
-    "runs_by_run_id_record",
-    "runs_by_partition_and_run_id_record",
-    "runs_by_partition_predicates_ordered_records",
-    "runs_by_partition_parent_ordered_records",
-    "runs_by_partition_root_ordered_records",
-    "runs_by_partition_correlation_ordered_records",
-    "runs_by_partition_predicates_count",
-    "events_by_run_id_ordered_records"
-  ]
+  alias Ferricstore.Flow.Query.Shape
 
+  @language_versions ["FQL1"]
+  @request_contract "ferric.flow.query.request/v1"
+  @default_result_contract "ferric.flow.query.result/v1"
+  @default_explain_contract "ferric.flow.explain/v1"
   @spec language_versions() :: [binary()]
   def language_versions, do: @language_versions
 
   @spec shapes() :: [binary()]
-  def shapes, do: @parser_shapes
+  defdelegate shapes, to: Shape, as: :known_names
 
   @spec supported_version?(term()) :: boolean()
   def supported_version?(version), do: version in @language_versions
+
+  @spec default_explain_contract() :: binary()
+  def default_explain_contract, do: @default_explain_contract
+
+  @spec request_contract() :: binary()
+  def request_contract, do: @request_contract
+
+  @spec default_result_contract() :: binary()
+  def default_result_contract, do: @default_result_contract
 
   @spec supported_language_versions?(term()) :: boolean()
   def supported_language_versions?(versions) when is_list(versions),
@@ -34,19 +32,23 @@ defmodule Ferricstore.Flow.Query.Surface do
   def supported_language_versions?(_versions), do: false
 
   @spec supported_shapes?(term()) :: boolean()
-  def supported_shapes?(shapes) when is_list(shapes),
-    do: Enum.all?(shapes, &(&1 in @parser_shapes))
-
-  def supported_shapes?(_shapes), do: false
+  defdelegate supported_shapes?(shapes), to: Shape, as: :known_names?
 
   @spec default_capability_manifest() :: FerricStore.Flow.QueryEngine.capability_manifest()
   def default_capability_manifest do
     %{
-      query_contract: "ferric.flow.query/v1",
-      explain_contract: "ferric.flow.explain/v1",
-      capabilities: ["flow_query_point_v1", "flow_query_history_v1"],
+      request_contract: @request_contract,
+      result_contract: @default_result_contract,
+      explain_contract: @default_explain_contract,
+      capabilities: [
+        "flow_query_v1",
+        "flow_explain_v1",
+        "flow_explain_analyze_v1",
+        "flow_composite_index_v1",
+        "flow_query_index_status_v1"
+      ],
       language_versions: @language_versions,
-      shapes: @default_shapes
+      shapes: Shape.execution_names()
     }
   end
 end

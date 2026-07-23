@@ -330,8 +330,9 @@ defmodule Ferricstore.Flow.Keys do
   def decode_policy_catalog_projection_key(key) when is_binary(key) do
     prefix = policy_catalog_projection_global_prefix()
 
-    with <<^prefix::binary, type_digest::binary-size(43), ?:,
-           generation::unsigned-big-64, catalog_key::binary>> when catalog_key != "" <- key,
+    with <<^prefix::binary, type_digest::binary-size(43), ?:, generation::unsigned-big-64,
+           catalog_key::binary>>
+         when catalog_key != "" <- key,
          true <- valid_digest?(type_digest),
          {:ok, ^type_digest} <- type_catalog_digest_from_member(catalog_key) do
       {:ok,

@@ -329,7 +329,6 @@ FERRICSTORE.KEY_INFO: {"key": "k", "args": ["k"]}
 0x020B FLOW.VALUE.PUT
 0x020C FLOW.VALUE.MGET
 0x020D FLOW.SIGNAL
-0x020E FLOW.LIST
 0x020F FLOW.CREATE_MANY
 0x0210 FLOW.COMPLETE_MANY
 0x0211 FLOW.TRANSITION_MANY
@@ -338,13 +337,7 @@ FERRICSTORE.KEY_INFO: {"key": "k", "args": ["k"]}
 0x0214 FLOW.CANCEL_MANY
 0x0215 FLOW.RECLAIM
 0x0216 FLOW.REWIND
-0x0217 FLOW.TERMINALS
-0x0218 FLOW.FAILURES
-0x0219 FLOW.BY_PARENT
-0x021A FLOW.BY_ROOT
-0x021B FLOW.BY_CORRELATION
 0x021C FLOW.INFO
-0x021D FLOW.STUCK
 0x021E FLOW.POLICY.SET
 0x021F FLOW.POLICY.GET
 0x0220 FLOW.SPAWN_CHILDREN
@@ -363,7 +356,6 @@ FERRICSTORE.KEY_INFO: {"key": "k", "args": ["k"]}
 0x022D FLOW.STATS
 0x022E FLOW.ATTRIBUTES
 0x022F FLOW.ATTRIBUTE_VALUES
-0x0230 FLOW.SEARCH
 0x0231 FLOW.QUERY
 0x0240 FLOW.EFFECT.RESERVE
 0x0241 FLOW.EFFECT.CONFIRM
@@ -392,6 +384,12 @@ FERRICSTORE.KEY_INFO: {"key": "k", "args": ["k"]}
 0x0258 FLOW.BUDGET.RELEASE
 ```
 
+There are no compatibility opcodes for the former record-collection commands
+`FLOW.LIST`, `FLOW.SEARCH`, `FLOW.TERMINALS`, `FLOW.FAILURES`, `FLOW.STUCK`,
+`FLOW.BY_PARENT`, `FLOW.BY_ROOT`, or `FLOW.BY_CORRELATION`. Their previous
+numeric values are unsupported. Clients must discover `0x0231 FLOW.QUERY` and
+its shapes from `OPTIONS`.
+
 Flow bodies are maps with command fields plus options. For example:
 
 ```text
@@ -415,14 +413,10 @@ FLOW.VALUE.MGET:
 FLOW.STATS:
 {"type": "email", "state": "queued", "attributes": {"tenant": "acme"}}
 
-FLOW.SEARCH:
-{"type": "email", "state": "queued", "attributes": {"tenant": "acme"},
- "state_meta": {"queued": {"version": "1"}}, "consistent_projection": true}
-
 FLOW.QUERY:
 {"version": "FQL1",
- "query": "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD",
- "params": {"partition": "tenant-a", "flow_id": "flow-1"}}
+ "query": "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state ORDER BY updated_at_ms DESC LIMIT 50 RETURN RECORDS",
+ "params": {"partition": "tenant-a", "type": "email", "state": "failed"}}
 ```
 
 Typed `payload`, `result`, and `error` values stay binary-safe and structured at
@@ -434,7 +428,7 @@ to replace the complete snapshot, and pass a non-negative `expected_generation`
 for compare-and-swap. Successful policy reads and writes include the monotonic
 `generation`; a mismatch returns `ERR stale flow policy generation`.
 
-Flow `attributes` are small indexed metadata values for list/stats/dashboard
+Flow `attributes` are small indexed metadata values for query/stats/dashboard
 filters. They are not payload bytes and are projected asynchronously for query
 use.
 
@@ -449,49 +443,56 @@ for the affected key.
 ### FLOW.QUERY and FQL1
 
 `FLOW.QUERY` is the versioned Flow read envelope. The OSS default query provider
-is deliberately limited to an exact authoritative record lookup:
+supports authoritative point reads, bounded event history, and the fixed-index
+collection shapes listed by `OPTIONS`. A point read is:
 
 ```text
-[EXPLAIN] FROM runs
-WHERE partition_key = <value> AND run_id = <value>
+[EXPLAIN [ANALYZE]] FROM runs
+WHERE [partition_key = <value> AND] run_id = <value>
 RETURN RECORD[;]
 ```
 
-The two predicates may appear in either order. A value is either a single-quoted
-keyword literal or a named parameter such as `@flow_id`; doubled single quotes
-escape a quote inside a literal. Named parameter values must be non-empty
-binaries. Query text is limited to 16 KiB and 32 lexical tokens. Bound
-partition keys are limited to 65,535 bytes, and bound run IDs are limited so
-the resulting physical point key remains within the store key-size ceiling.
+The predicates may appear in either order. Omitting `partition_key` addresses
+only the run ID's deterministic auto-partition and routes directly to it;
+explicitly partitioned records require the predicate. Collection queries always
+require one partition equality, one or two integer `ORDER BY` fields, a limit
+of at most 100, and `RETURN RECORDS`. OSS executes its advertised fixed and
+composite shapes and never falls back to an unbounded record scan.
 
-The OSS provider rejects every other source, field, predicate, return shape, and
-FQL version before storage access. In particular, a run-id-only query is not
-accepted because records with explicit partition keys require the partition for
-an exact physical lookup. This path delegates directly to the existing
-`FLOW.GET` point read and never performs a scan or materializes a candidate set.
+A value is either a typed literal or a named parameter such as `@flow_id`;
+doubled single quotes escape a quote inside a string literal. Query text is
+limited to 16 KiB and 256 lexical tokens. Bound partition keys are limited to
+65,535 bytes, and bound run IDs are limited so the resulting physical point key
+remains within the store key-size ceiling.
 
-Enterprise installs a separate capability-negotiated provider for bounded
-record collections, event history, lineage reads, and exact `RETURN COUNT`.
-Clients must check the advertised query shapes rather than infer Enterprise
-support from the `FQL1` language version.
+The OSS default includes bounded composite collections, exact `RETURN COUNT`,
+cursors, statistics, index status, and full explain analysis. Enterprise uses
+the same provider and adds metadata-scope and governance integration. Clients
+must check advertised query shapes rather than infer support from the `FQL1`
+language version.
 
 `RETURN RECORD` returns a structural allowlist, not the complete internal Flow
 record. It includes identity, type/state/version, priority, partition,
-timestamps, attempts/run state, maximum active time, and parent/root/correlation
-identifiers. It excludes payload/result/error and named-value references,
-attributes, state metadata, child bookkeeping, worker/lease/fencing tokens and
+timestamps, attempts/run state, maximum active time, parent/root/correlation
+identifiers, attributes, and state metadata. It excludes payload/result/error
+and named-value references, child bookkeeping, worker/lease/fencing tokens and
 owners, parent partition keys, retention controls, and unknown future fields.
 
-Prefixing the query with `EXPLAIN` returns
-`ferric.flow.query.point-explain/v1`. The plan is deterministic and redacts
-literal and bound parameter values. It reports only the structural point-read
-bounds that this operator enforces. The OSS provider does not advertise the broader
-`ferric.flow.query/v1` or `ferric.flow.explain/v1` Platform contracts until it
-implements tenant scope, workload budgets, cursors, quality evidence, and the
-approved collection plans. Enterprise advertises those contracts when its
-provider is installed. Query failures use fixed, value-free error codes and
-messages. A point-read storage outage returns `query_storage_unavailable` and is
-marked retryable and safe to retry; an execution-provider defect returns the
+Prefixing the query with `EXPLAIN` returns `ferric.flow.explain/v1`. The plan is
+deterministic and redacts literal and bound parameter values. The capability
+manifest advertises `ferric.flow.query.request/v1`,
+`ferric.flow.query.result/v1`, `ferric.flow.explain/v1`, every executable shape,
+and `flow_explain_analyze_v1`. `EXPLAIN ANALYZE` performs a fresh bounded
+execution, rejects cursors, and returns actual resource usage without records
+or count values. Providers that do not advertise that capability reject the
+analyzed shape. Query failures use fixed, value-free error codes and
+messages. Parser failures additionally return a one-based byte offset plus line
+and UTF-8 character-column positions, with bounded `detail` and `hint` strings. Unsupported fields include
+a sorted `context.supported_fields` list. No-plan failures include
+only redacted predicate shapes, ordering, and a suggested index layout; literal
+values, rejected identifiers, tenant data, and physical keys are omitted. A
+point-read storage outage returns `query_storage_unavailable` and is marked
+retryable and safe to retry; an execution-provider defect returns the
 non-retryable `query_engine_failure` error. A decoded primary record that does
 not match the bound partition and run ID returns the non-retryable
 `query_storage_inconsistent` error without exposing the record.
@@ -506,9 +507,20 @@ query-provider dispatch; untrusted connection contexts are ignored. Query text
 and parameters are fully redacted from the slow log.
 
 `FLOW.QUERY` is parsed and bound once through the shared prepared-command
-contract before authorization or routing. The mandatory partition becomes the
-ACL resource and shard-routing key; execution consumes the same prepared AST so
-authorization cannot diverge from the query that reaches storage.
+contract before authorization or routing. A collection query's mandatory
+partition becomes the ACL resource and shard-routing key; execution consumes
+the same prepared AST so authorization cannot diverge from the query that
+reaches storage. A point lookup without a partition derives the run ID's
+auto-partition for both ACL and routing.
+
+ACL command authorization is also derived from that prepared request. Ordinary
+execution requires `FLOW.QUERY`, static `EXPLAIN` requires the separate
+administrative `FLOW.QUERY.EXPLAIN` permission, and `EXPLAIN ANALYZE` requires
+both because it executes the admitted plan. `FLOW.QUERY.EXPLAIN` is not included
+in `@read` or `@flow`; it may be granted explicitly. All three modes still
+enforce the bound or derived partition through the caller's read-key patterns.
+The
+dedicated `0x0231` opcode and `COMMAND_EXEC` apply the same checks.
 
 ## Client management and reroute behavior
 

@@ -10,6 +10,7 @@ defmodule Ferricstore.Store.ValueCodec do
   alias Ferricstore.HLC
 
   @integer_float_fast_path_bytes 32
+  @ratelimit_encoded_size 24
 
   # ---------------------------------------------------------------------------
   # Integer parsing
@@ -129,6 +130,10 @@ defmodule Ferricstore.Store.ValueCodec do
   """
   @spec encode_ratelimit(integer(), integer(), integer()) :: binary()
   def encode_ratelimit(cur, start, prev), do: <<cur::64, start::64, prev::64>>
+
+  @doc false
+  @spec ratelimit_encoded_size() :: 24
+  def ratelimit_encoded_size, do: @ratelimit_encoded_size
 
   @doc """
   Decodes rate limiter state from its fixed-width 24-byte binary format.

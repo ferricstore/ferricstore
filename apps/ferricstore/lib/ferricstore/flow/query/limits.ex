@@ -17,6 +17,7 @@ defmodule Ferricstore.Flow.Query.Limits do
   @min_cursor_bytes 16
   @max_cursor_bytes 4_096
   @max_sort_key_bytes 2_512
+  @max_projection_page_records 64
 
   @spec max_query_bytes() :: pos_integer()
   def max_query_bytes, do: @max_query_bytes
@@ -50,6 +51,9 @@ defmodule Ferricstore.Flow.Query.Limits do
 
   @spec max_sort_key_bytes() :: pos_integer()
   def max_sort_key_bytes, do: @max_sort_key_bytes
+
+  @spec max_projection_page_records() :: pos_integer()
+  def max_projection_page_records, do: @max_projection_page_records
 
   @spec max_partition_key_bytes() :: pos_integer()
   def max_partition_key_bytes, do: Router.max_key_size()

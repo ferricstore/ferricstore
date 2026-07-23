@@ -18,12 +18,23 @@ defmodule FerricstoreServer.ACL.DoctorACLTest do
 
     assert MapSet.member?(read, "FLOW.ATTRIBUTES")
     assert MapSet.member?(read, "FLOW.ATTRIBUTE_VALUES")
-    assert MapSet.member?(read, "FLOW.SEARCH")
     assert MapSet.member?(read, "FLOW.QUERY")
     assert MapSet.member?(flow, "FLOW.ATTRIBUTES")
     assert MapSet.member?(flow, "FLOW.ATTRIBUTE_VALUES")
-    assert MapSet.member?(flow, "FLOW.SEARCH")
     assert MapSet.member?(flow, "FLOW.QUERY")
+  end
+
+  test "Flow query explain is a separate administrative ACL permission" do
+    assert {:ok, read} = CommandCategories.category_commands("READ")
+    assert {:ok, flow} = CommandCategories.category_commands("FLOW")
+    assert {:ok, admin} = CommandCategories.category_commands("ADMIN")
+    assert {:ok, all} = CommandCategories.category_commands("ALL")
+
+    refute MapSet.member?(read, "FLOW.QUERY.EXPLAIN")
+    refute MapSet.member?(flow, "FLOW.QUERY.EXPLAIN")
+    assert MapSet.member?(admin, "FLOW.QUERY.EXPLAIN")
+    assert MapSet.member?(all, "FLOW.QUERY.EXPLAIN")
+    assert MapSet.member?(CommandCategories.acl_supported_commands(), "FLOW.QUERY.EXPLAIN")
   end
 
   test "flow effect governance commands have read/write ACL categories" do

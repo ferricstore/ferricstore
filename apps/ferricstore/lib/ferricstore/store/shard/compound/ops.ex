@@ -84,6 +84,54 @@ defmodule Ferricstore.Store.Shard.Compound.Ops do
     end
   end
 
+  @spec handle_compound_scan_slice(
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          map()
+        ) :: {:reply, term(), map()}
+  @doc false
+  def handle_compound_scan_slice(redis_key, prefix, start, count, total, state) do
+    case Promoted.promoted_store(state, redis_key) do
+      nil ->
+        state =
+          if ShardETS.prefix_has_pending_cold?(state.keydir, prefix) do
+            state
+            |> ShardFlush.await_in_flight()
+            |> ShardFlush.flush_pending_sync()
+          else
+            state
+          end
+
+        results =
+          ShardETS.prefix_scan_entries_slice(
+            state,
+            prefix,
+            state.shard_data_path,
+            start,
+            count,
+            total
+          )
+
+        {:reply, results, state}
+
+      dedicated_path ->
+        results =
+          ShardETS.prefix_scan_entries_slice(
+            state,
+            prefix,
+            dedicated_path,
+            start,
+            count,
+            total
+          )
+
+        {:reply, results, state}
+    end
+  end
+
   @spec handle_compound_scan_bounded(binary(), binary(), map(), map()) ::
           {:reply, term(), map()}
   @doc false

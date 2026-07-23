@@ -128,6 +128,19 @@ defmodule Ferricstore.Commands.CatalogTest do
       assert length(Catalog.names()) == Catalog.count()
     end
 
+    test "exposes FLOW.QUERY as the only Flow record collection command" do
+      names = MapSet.new(Catalog.names())
+
+      assert MapSet.member?(names, "flow.query")
+
+      for obsolete <- ~w(
+            flow.list flow.search flow.terminals flow.failures flow.stuck
+            flow.by_parent flow.by_root flow.by_correlation
+          ) do
+        refute MapSet.member?(names, obsolete)
+      end
+    end
+
     test "includes major commands" do
       names = Catalog.names()
 
@@ -368,7 +381,19 @@ defmodule Ferricstore.Commands.CatalogTest do
                  "tenant:a:partition"
                ])
 
-      assert {:ok, ["*"]} = Catalog.get_keys("FLOW.LIST", ["tenant:a:type"])
+      query =
+        "FROM runs WHERE partition_key = @partition AND type = @type " <>
+          "ORDER BY created_at_ms ASC LIMIT 10 RETURN RECORDS"
+
+      assert {:ok, ["tenant:a"]} =
+               Catalog.get_keys("FLOW.QUERY", [
+                 "FQL1",
+                 query,
+                 "partition",
+                 "tenant:a",
+                 "type",
+                 "checkout"
+               ])
     end
 
     test "Flow claim selectors use global ACL scope instead of literal selector names" do

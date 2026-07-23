@@ -99,10 +99,31 @@ defmodule FerricStore.Flow.QueryIndexProviderTest do
     )
 
     assert ctx.query_index_provider == Provider
+
     assert {:ok, %RegistrySnapshot{epoch: 7}} =
              FerricStore.Flow.QueryIndexProvider.snapshot(ctx, 0)
 
     assert_received {:snapshot, 0}
+  end
+
+  test "uses the OSS composite-index provider without edition configuration" do
+    name = :"oss_query_index_provider_#{System.unique_integer([:positive, :monotonic])}"
+    Application.delete_env(:ferricstore, FerricStore.Flow.QueryIndexProvider)
+
+    ctx =
+      FerricStore.Instance.build(name,
+        shard_count: 1,
+        data_dir: Path.join(System.tmp_dir!(), Atom.to_string(name))
+      )
+
+    on_exit(fn -> FerricStore.Instance.cleanup(name) end)
+
+    assert FerricStore.Flow.QueryIndexProvider.configured_implementation([]) ==
+             Ferricstore.Flow.Query.IndexProvider
+
+    assert ctx.query_index_provider == Ferricstore.Flow.Query.IndexProvider
+    assert FerricStore.Flow.QueryIndexProvider.enabled?(ctx)
+    assert {:ok, [_supervisor]} = FerricStore.Flow.QueryIndexProvider.child_specs(ctx)
   end
 
   test "separates projection indexes from query-visible active indexes" do

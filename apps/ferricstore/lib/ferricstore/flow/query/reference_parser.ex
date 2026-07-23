@@ -33,6 +33,19 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
 
   def parse(_query), do: {:error, :invalid_syntax}
 
+  defp parse_mode([{:word, explain}, {:word, analyze} | rest]) do
+    cond do
+      keyword?(explain, "EXPLAIN") and keyword?(analyze, "ANALYZE") ->
+        {:ok, :analyze, rest}
+
+      keyword?(explain, "EXPLAIN") ->
+        {:ok, :explain, [{:word, analyze} | rest]}
+
+      true ->
+        {:ok, :execute, [{:word, explain}, {:word, analyze} | rest]}
+    end
+  end
+
   defp parse_mode([{:word, word} | rest]) do
     if keyword?(word, "EXPLAIN"),
       do: {:ok, :explain, rest},
@@ -100,26 +113,57 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
     end
   end
 
-  defp parse_predicate([{:word, field_name}, :equals, value | rest]) do
-    with {:ok, field} <- Field.parse(field_name),
-         {:ok, value} <- parse_value(value, field) do
-      {:ok, {:eq, field, value}, rest}
+  defp parse_predicate(tokens) do
+    with {:ok, field, rest} <- parse_field_tokens(tokens) do
+      parse_predicate_operator(field, rest)
     end
   end
 
-  defp parse_predicate([{:word, field_name}, {:word, operator} | rest]) do
-    with {:ok, field} <- Field.parse(field_name) do
-      parse_named_predicate(field, operator, rest)
-    end
+  defp parse_predicate_operator(field, [:equals, value | rest]) do
+    with {:ok, value} <- parse_value(value, field), do: {:ok, {:eq, field, value}, rest}
   end
 
-  defp parse_predicate([{:word, field_name} | _rest]) do
-    with {:ok, _field} <- Field.parse(field_name) do
-      {:error, :unsupported_query_shape}
-    end
+  defp parse_predicate_operator(field, [{:word, operator} | rest]),
+    do: parse_named_predicate(field, operator, rest)
+
+  defp parse_predicate_operator(_field, _tokens), do: {:error, :unsupported_query_shape}
+
+  defp parse_field_tokens([
+         {:word, prefix},
+         :left_bracket,
+         {:string, state},
+         :right_bracket,
+         :left_bracket,
+         {:string, name},
+         :right_bracket
+         | rest
+       ]) do
+    field = {:state_meta, state, name}
+
+    if keyword?(prefix, "STATE_META") and Field.valid?(field),
+      do: {:ok, field, rest},
+      else: {:error, :unsupported_field}
   end
 
-  defp parse_predicate(_tokens), do: {:error, :unsupported_query_shape}
+  defp parse_field_tokens([
+         {:word, prefix},
+         :left_bracket,
+         {:string, name},
+         :right_bracket
+         | rest
+       ]) do
+    field = {:attribute, name}
+
+    if keyword?(prefix, "ATTRIBUTE") and Field.valid?(field),
+      do: {:ok, field, rest},
+      else: {:error, :unsupported_field}
+  end
+
+  defp parse_field_tokens([{:word, field_name} | rest]) do
+    with {:ok, field} <- Field.parse(field_name), do: {:ok, field, rest}
+  end
+
+  defp parse_field_tokens(_tokens), do: {:error, :unsupported_query_shape}
 
   defp parse_named_predicate(field, operator, [:left_paren | rest]) do
     if keyword?(operator, "IN") do
@@ -372,6 +416,12 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
 
   defp tokenize(<<?), rest::binary>>, tokens, count),
     do: tokenize(rest, [:right_paren | tokens], count + 1)
+
+  defp tokenize(<<?[, rest::binary>>, tokens, count),
+    do: tokenize(rest, [:left_bracket | tokens], count + 1)
+
+  defp tokenize(<<?], rest::binary>>, tokens, count),
+    do: tokenize(rest, [:right_bracket | tokens], count + 1)
 
   defp tokenize(<<?,, rest::binary>>, tokens, count),
     do: tokenize(rest, [:comma | tokens], count + 1)

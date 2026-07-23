@@ -5,6 +5,8 @@ defmodule Ferricstore.Flow.LMDBIndexReadTest do
   alias Ferricstore.Flow.LMDBIndexRead
   alias Ferricstore.Flow.LMDB
 
+  @prefix_merge_max_bytes 16 * 1_024 * 1_024
+
   setup do
     previous = Application.get_env(:ferricstore, :flow_lmdb_terminal_sweep_limit)
 
@@ -109,6 +111,33 @@ defmodule Ferricstore.Flow.LMDBIndexReadTest do
              )
   end
 
+  test "single-shard reverse query windows retain semantic order for digest-backed ids" do
+    {ctx, path} = tmp_lmdb_context()
+    index_key = "parent:p1"
+
+    ids = [String.duplicate("z", 300), String.duplicate("a", 300), String.duplicate("m", 300)]
+
+    assert :ok =
+             LMDB.write_batch(
+               path,
+               Enum.map(ids, &query_index_put(index_key, &1, 100, 0))
+             )
+
+    query = %{from_ms: nil, to_ms: nil, rev?: true, before_id: nil}
+
+    assert {:ok, entries, true, 3} =
+             LMDBIndexRead.query_entries_window_with_count(
+               ctx,
+               index_key,
+               nil,
+               3,
+               false,
+               query
+             )
+
+    assert Enum.map(entries, fn {id, _updated_at_ms, _state_key} -> id end) == Enum.sort(ids)
+  end
+
   test "exact terminal windows sweep canonical expired rows before reporting exhaustion" do
     {ctx, path} = tmp_lmdb_context()
     index_key = "state:completed"
@@ -148,8 +177,44 @@ defmodule Ferricstore.Flow.LMDBIndexReadTest do
              )
   end
 
+  test "single-shard reverse terminal windows retain semantic order for digest-backed ids" do
+    {ctx, path} = tmp_lmdb_context()
+    index_key = "state:completed"
+    count_key = LMDB.terminal_count_key(index_key)
+    ids = [String.duplicate("z", 300), String.duplicate("a", 300), String.duplicate("m", 300)]
+
+    terminal_ops =
+      Enum.flat_map(ids, fn id ->
+        terminal_index_put_ops(index_key, count_key, id, 100, 0)
+      end)
+
+    assert :ok =
+             LMDB.write_batch(
+               path,
+               [{:put, count_key, LMDB.encode_count(length(ids))} | terminal_ops]
+             )
+
+    query = %{from_ms: nil, to_ms: nil, rev?: true}
+
+    assert {:ok, entries, true, 3} =
+             LMDBIndexRead.terminal_entries_window_with_count(
+               ctx,
+               index_key,
+               "completed",
+               nil,
+               3,
+               true,
+               false,
+               query,
+               ["completed"]
+             )
+
+    assert Enum.map(entries, fn {id, _updated_at_ms} -> id end) == Enum.sort(ids, :desc)
+  end
+
   test "raw prefix discovery applies its candidate limit globally across LMDB paths" do
     {ctx, [path_0, path_1]} = tmp_lmdb_paths(2)
+
     index_key_prefix =
       Ferricstore.Flow.Keys.attribute_index_prefix("job", "queued", "color", "tenant-a")
 
@@ -186,7 +251,106 @@ defmodule Ferricstore.Flow.LMDBIndexReadTest do
                false
              )
 
-    assert Enum.sum(Enum.map(chunks, fn {_path, entries} -> length(entries) end)) == 3
+    raw_prefix = LMDB.query_index_raw_prefix(index_key_prefix)
+    assert {:ok, entries_0} = LMDB.prefix_entries(path_0, raw_prefix, 3)
+    assert {:ok, entries_1} = LMDB.prefix_entries(path_1, raw_prefix, 3)
+
+    assert chunks == reference_raw_path_chunks([{path_0, entries_0}, {path_1, entries_1}], 3)
+  end
+
+  test "native prefix merge preserves duplicate rows, source ownership, and scan bounds" do
+    {_ctx, [path_0, path_1]} = tmp_lmdb_paths(2)
+    prefix = "merge:"
+
+    assert :ok =
+             LMDB.write_batch(path_0, [
+               {:put, prefix <> "a", "a-0"},
+               {:put, prefix <> "c", "c-0"},
+               {:put, prefix <> "e", "e-0"}
+             ])
+
+    assert :ok =
+             LMDB.write_batch(path_1, [
+               {:put, prefix <> "a", "a-1"},
+               {:put, prefix <> "b", "b-1"},
+               {:put, prefix <> "d", "d-1"}
+             ])
+
+    assert {:ok,
+            [
+              {0, "merge:a", "a-0"},
+              {1, "merge:a", "a-1"},
+              {1, "merge:b", "b-1"},
+              {0, "merge:c", "c-0"}
+            ], scanned} = LMDB.prefix_merge_entries([path_0, path_1], prefix, 4, 40)
+
+    assert scanned <= 8
+    assert {:ok, [], 0} = LMDB.prefix_merge_entries([path_0, path_1], prefix, 0, 1)
+
+    assert {:error, :prefix_merge_byte_budget_exceeded} =
+             LMDB.prefix_merge_entries([path_0, path_1], prefix, 4, 39)
+
+    assert {:error, :invalid_lmdb_prefix_merge} =
+             LMDB.prefix_merge_entries([], prefix, 4, @prefix_merge_max_bytes)
+
+    assert {:error, :invalid_lmdb_prefix_merge} =
+             LMDB.prefix_merge_entries([path_0], "", 4, @prefix_merge_max_bytes)
+
+    assert {:error, :invalid_lmdb_prefix_merge} =
+             LMDB.prefix_merge_entries([path_0], prefix, 4, 0)
+  end
+
+  test "prefix merge applies the byte cap to the globally selected rows" do
+    {_ctx, [path_0, path_1]} = tmp_lmdb_paths(2)
+    prefix = "merge-cap:"
+    selected_key = prefix <> "a"
+
+    assert :ok = LMDB.write_batch(path_0, [{:put, prefix <> "z", :binary.copy("z", 4_096)}])
+    assert :ok = LMDB.write_batch(path_1, [{:put, selected_key, "v"}])
+    selected_bytes = byte_size(selected_key) + 1
+
+    assert {:ok, [{1, ^selected_key, "v"}], 2} =
+             LMDB.prefix_merge_entries([path_0, path_1], prefix, 1, selected_bytes)
+
+    assert {:error, :prefix_merge_byte_budget_exceeded} =
+             LMDB.prefix_merge_entries([path_0, path_1], prefix, 1, selected_bytes - 1)
+  end
+
+  test "raw prefix discovery preserves the bounded LMDB order for one shard" do
+    {ctx, path} = tmp_lmdb_context()
+
+    index_key_prefix =
+      Ferricstore.Flow.Keys.attribute_index_prefix("job", "queued", "color", "tenant-a")
+
+    puts =
+      Enum.map(1..5, fn index ->
+        index_key =
+          Ferricstore.Flow.Keys.attribute_index_key(
+            "job",
+            "queued",
+            "color",
+            Ferricstore.Flow.Attributes.index_value("value-#{index}"),
+            "tenant-a"
+          )
+
+        query_index_put(index_key, "flow-#{index}", index, 0)
+      end)
+
+    assert :ok = LMDB.write_batch(path, puts)
+
+    raw_prefix = LMDB.query_index_raw_prefix(index_key_prefix)
+    assert {:ok, all_entries} = LMDB.prefix_entries(path, raw_prefix, 10)
+
+    assert {:ok, [{^path, entries}]} =
+             LMDBIndexRead.query_prefix_raw_entries(
+               ctx,
+               index_key_prefix,
+               nil,
+               3,
+               false
+             )
+
+    assert entries == Enum.take(all_entries, 3)
   end
 
   test "terminal expiry sweep limits remain positive when configuration is malformed" do
@@ -244,5 +408,24 @@ defmodule Ferricstore.Flow.LMDBIndexReadTest do
       end)
 
     {%{data_dir: data_dir, shard_count: shard_count}, paths}
+  end
+
+  defp reference_raw_path_chunks(chunks, count) do
+    selected_by_path =
+      chunks
+      |> Enum.flat_map(fn {path, entries} -> Enum.map(entries, &{path, &1}) end)
+      |> Enum.sort_by(fn {_path, {key, _value}} -> key end)
+      |> Enum.take(count)
+      |> Enum.group_by(
+        fn {path, _entry} -> path end,
+        fn {_path, entry} -> entry end
+      )
+
+    Enum.flat_map(chunks, fn {path, _entries} ->
+      case Map.fetch(selected_by_path, path) do
+        {:ok, entries} -> [{path, entries}]
+        :error -> []
+      end
+    end)
   end
 end

@@ -56,6 +56,31 @@ defmodule Ferricstore.Flow.LMDB.Access do
 
   def get_many_bounded(_path, _keys, _max_bytes), do: {:error, :badarg}
 
+  def get_many_prefix_bounded(_path, [], max_bytes)
+      when is_integer(max_bytes) and max_bytes > 0,
+      do: {:ok, [], 0, true}
+
+  def get_many_prefix_bounded(path, keys, max_bytes)
+      when is_binary(path) and is_list(keys) and is_integer(max_bytes) and max_bytes > 0 do
+    with {:ok, key_count, compact?} <- bounded_binary_key_count(keys, 0, 0, false) do
+      result =
+        if Ferricstore.FS.dir?(path) do
+          NIF.lmdb_get_many_prefix_bounded(
+            path,
+            physical_keys(keys, compact?),
+            max_bytes,
+            map_size()
+          )
+        else
+          {:ok, List.duplicate(:not_found, key_count), 0, true}
+        end
+
+      normalize_get_many_prefix_bounded_result(result, key_count, max_bytes)
+    end
+  end
+
+  def get_many_prefix_bounded(_path, _keys, _max_bytes), do: {:error, :badarg}
+
   defp bounded_binary_key_count([], count, _bytes, compact?),
     do: {:ok, count, compact?}
 
@@ -89,6 +114,14 @@ defmodule Ferricstore.Flow.LMDB.Access do
   @doc false
   def __normalize_get_many_result_for_test__(result, expected_count),
     do: normalize_get_many_result(result, expected_count)
+
+  @doc false
+  def __normalize_get_many_prefix_bounded_result_for_test__(
+        result,
+        expected_count,
+        max_bytes
+      ),
+      do: normalize_get_many_prefix_bounded_result(result, expected_count, max_bytes)
 
   defp normalize_get_many_result({:ok, results}, expected_count)
        when is_list(results) and is_integer(expected_count) and expected_count >= 0 do
@@ -125,6 +158,40 @@ defmodule Ferricstore.Flow.LMDB.Access do
     do: error
 
   defp normalize_get_many_bounded_result(invalid, _count, _max_bytes),
+    do: {:error, {:invalid_batch_envelope, invalid}}
+
+  defp normalize_get_many_prefix_bounded_result(
+         {:ok, results, bytes, complete?},
+         expected_count,
+         max_bytes
+       )
+       when is_list(results) and is_integer(bytes) and bytes >= 0 and bytes <= max_bytes and
+              is_boolean(complete?) do
+    returned_count = length(results)
+
+    valid_count? =
+      (complete? and returned_count == expected_count) or
+        (not complete? and returned_count > 0 and returned_count < expected_count)
+
+    with true <- valid_count?,
+         :ok <- validate_get_many_results(results, returned_count, 0),
+         ^bytes <- result_value_bytes(results, 0) do
+      {:ok, results, bytes, complete?}
+    else
+      false -> {:error, {:batch_result_mismatch, expected_count, returned_count}}
+      {:error, _reason} = error -> error
+      _mismatched_bytes -> {:error, :invalid_batch_value_bytes}
+    end
+  end
+
+  defp normalize_get_many_prefix_bounded_result(
+         {:error, _reason} = error,
+         _count,
+         _max_bytes
+       ),
+       do: error
+
+  defp normalize_get_many_prefix_bounded_result(invalid, _count, _max_bytes),
     do: {:error, {:invalid_batch_envelope, invalid}}
 
   defp result_value_bytes([], bytes), do: bytes

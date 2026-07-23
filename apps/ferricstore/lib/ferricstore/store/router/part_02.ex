@@ -992,10 +992,19 @@ defmodule Ferricstore.Store.Router.Part02 do
 
       defp do_batch_get_from_shard(ctx, idx, keys, byte_limit)
            when is_integer(idx) and idx >= 0 do
-        do_batch_get(ctx, keys, byte_limit, idx)
+        do_batch_get(ctx, keys, byte_limit, idx, :values)
+      end
+
+      defp do_batch_get_entries_from_shard(ctx, idx, keys, byte_limit)
+           when is_integer(idx) and idx >= 0 do
+        do_batch_get(ctx, keys, byte_limit, idx, :entries)
       end
 
       defp do_batch_get(ctx, keys, byte_limit, fixed_shard_index) do
+        do_batch_get(ctx, keys, byte_limit, fixed_shard_index, :values)
+      end
+
+      defp do_batch_get(ctx, keys, byte_limit, fixed_shard_index, result_mode) do
         expiry_context = ExpiryContext.capture()
         bookkeeping = hot_read_bookkeeping_start(ctx)
 
@@ -1015,30 +1024,31 @@ defmodule Ferricstore.Store.Router.Part02 do
 
               {result, cold_entries, cold_count, waraft_entries, waraft_count, bookkeeping,
                value_bytes} =
-                case ets_get_full(ctx, idx, keydir, key, expiry_context) do
-                  {:hit, value, lfu} ->
+                case ets_get_meta_full(ctx, idx, keydir, key, expiry_context) do
+                  {:hit, value, expire_at_ms, lfu} ->
                     bookkeeping = hot_read_bookkeeping_add(bookkeeping, keydir, key, lfu)
 
-                    {{:value, value}, cold_entries, cold_count, waraft_entries, waraft_count,
-                     bookkeeping, batch_get_value_bytes(value)}
+                    {{:value, batch_get_result(value, expire_at_ms, result_mode)}, cold_entries,
+                     cold_count, waraft_entries, waraft_count, bookkeeping,
+                     batch_get_value_bytes(value)}
 
-                  {:cold, file_id, offset, value_size}
+                  {:cold, file_id, offset, value_size, expire_at_ms}
                   when valid_cold_location(file_id, offset, value_size) ->
                     path = cold_file_path(ctx, idx, file_id)
                     entry = {ctx, idx, keydir, key, path, file_id, offset, value_size}
 
-                    {{:cold, cold_count}, [entry | cold_entries], cold_count + 1, waraft_entries,
-                     waraft_count, bookkeeping, value_size}
+                    {{:cold, cold_count, expire_at_ms}, [entry | cold_entries], cold_count + 1,
+                     waraft_entries, waraft_count, bookkeeping, value_size}
 
-                  {:cold, file_id, offset, value_size}
+                  {:cold, file_id, offset, value_size, expire_at_ms}
                   when valid_waraft_segment_location(file_id, offset, value_size) ->
                     entry = {ctx, idx, keydir, key, file_id, offset, value_size}
 
-                    {{:waraft, waraft_count}, cold_entries, cold_count, [entry | waraft_entries],
-                     waraft_count + 1, bookkeeping, value_size}
+                    {{:waraft, waraft_count, expire_at_ms}, cold_entries, cold_count,
+                     [entry | waraft_entries], waraft_count + 1, bookkeeping, value_size}
 
-                  {:cold, _file_id, _offset, _value_size} ->
-                    result = batch_get_fallback_value(ctx, idx, key)
+                  {:cold, _file_id, _offset, _value_size, _expire_at_ms} ->
+                    result = batch_get_fallback_value(ctx, idx, key, result_mode)
 
                     {{:value, result}, cold_entries, cold_count, waraft_entries, waraft_count,
                      bookkeeping, batch_get_value_bytes(result)}
@@ -1068,7 +1078,7 @@ defmodule Ferricstore.Store.Router.Part02 do
                      bookkeeping, 0}
 
                   :no_table ->
-                    result = batch_get_fallback_value(ctx, idx, key)
+                    result = batch_get_fallback_value(ctx, idx, key, result_mode)
 
                     {{:value, result}, cold_entries, cold_count, waraft_entries, waraft_count,
                      bookkeeping, batch_get_value_bytes(result)}
@@ -1098,31 +1108,41 @@ defmodule Ferricstore.Store.Router.Part02 do
             cold_values =
               cold_entries
               |> Enum.reverse()
-              |> read_cold_batch_async(expiry_context)
+              |> read_cold_batch_async(expiry_context, result_mode)
               |> List.to_tuple()
 
             waraft_values =
               waraft_entries
               |> Enum.reverse()
-              |> read_waraft_segment_batch_materialized(expiry_context)
+              |> read_waraft_segment_batch_materialized(expiry_context, result_mode)
               |> List.to_tuple()
 
             values =
               results
               |> Enum.reverse()
               |> Enum.map(fn
-                {:value, value} -> value
-                {:cold, index} -> elem(cold_values, index)
-                {:waraft, index} -> elem(waraft_values, index)
+                {:value, value} ->
+                  value
+
+                {:cold, index, expire_at_ms} ->
+                  batch_get_result(elem(cold_values, index), expire_at_ms, result_mode)
+
+                {:waraft, index, expire_at_ms} ->
+                  batch_get_result(elem(waraft_values, index), expire_at_ms, result_mode)
               end)
 
             {:ok, values}
         end
       end
 
-      defp batch_get_fallback_value(ctx, idx, key) do
+      defp batch_get_fallback_value(ctx, idx, key),
+        do: batch_get_fallback_value(ctx, idx, key, :values)
+
+      defp batch_get_fallback_value(ctx, idx, key, result_mode) do
+        request = if result_mode == :entries, do: {:get_meta, key}, else: {:get, key}
+
         result =
-          case safe_read_call(ctx, idx, {:get, key}) do
+          case safe_read_call(ctx, idx, request) do
             {:ok, value} -> value
             :unavailable -> ReadResult.failure(:shard_unavailable)
           end
@@ -1137,8 +1157,25 @@ defmodule Ferricstore.Store.Router.Part02 do
       end
 
       defp batch_get_value_bytes(value) when is_binary(value), do: byte_size(value)
+
+      defp batch_get_value_bytes({value, expire_at_ms})
+           when is_binary(value) and is_integer(expire_at_ms),
+           do: byte_size(value)
+
       defp batch_get_value_bytes(nil), do: 0
       defp batch_get_value_bytes({:error, {:storage_read_failed, _reason}}), do: 0
+
+      defp batch_get_result(value, _expire_at_ms, :values), do: value
+
+      defp batch_get_result({:batch_entry, value, expire_at_ms}, _planned_expire_at_ms, :entries)
+           when is_binary(value) and is_integer(expire_at_ms),
+           do: {value, expire_at_ms}
+
+      defp batch_get_result(value, expire_at_ms, :entries)
+           when is_binary(value) and is_integer(expire_at_ms),
+           do: {value, expire_at_ms}
+
+      defp batch_get_result(value, _expire_at_ms, :entries), do: value
 
       defp batch_get_byte_limit_exceeded?(:unlimited, _response_bytes), do: false
       defp batch_get_byte_limit_exceeded?(limit, response_bytes), do: response_bytes > limit

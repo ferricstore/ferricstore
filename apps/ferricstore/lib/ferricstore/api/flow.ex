@@ -133,6 +133,23 @@ defmodule FerricStore.API.Flow do
   def flow_get(_id, _opts), do: {:error, "ERR flow opts must be a keyword list"}
 
   @doc """
+  Executes an FQL1 query through the configured Flow query engine.
+
+  Named parameters remain typed and are bound before routing or execution.
+  """
+  @spec flow_query(binary(), map()) :: {:ok, term()} | {:error, term()}
+  def flow_query(query, params \\ %{})
+
+  def flow_query(query, params) when is_binary(query) and is_map(params) do
+    Ferricstore.Flow.Query.execute_reference(default_ctx(), "FQL1", query, params)
+  end
+
+  def flow_query(query, _params) when not is_binary(query),
+    do: {:error, :invalid_query_text}
+
+  def flow_query(_query, _params), do: {:error, :invalid_parameters}
+
+  @doc """
   Stores retry/backpressure and lifecycle policy defaults for a Flow type.
 
   Updates patch the current policy by default, including nested state settings.

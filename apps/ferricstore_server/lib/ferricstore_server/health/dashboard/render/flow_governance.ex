@@ -58,8 +58,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       <select class="flow-search-input mono" name="meta_value_type" title="State metadata value type">
         #{state_meta_value_type_options(Map.get(filters, :meta_value_type))}
       </select>
-      <input class="flow-search-input mono" type="search" name="meta_partition_key" value="#{escape_attr(Map.get(filters, :meta_partition_key, "") || "")}" placeholder="partition optional" title="Optional partition key">
-      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="500" name="limit" value="#{Map.get(filters, :limit, 100)}" title="Maximum records returned">
+      <input class="flow-search-input mono" type="search" name="meta_partition_key" value="#{escape_attr(Map.get(filters, :meta_partition_key, "") || "")}" placeholder="partition required" title="Required partition key" required>
+      <input class="flow-search-input mono flow-filter-limit" type="number" min="1" max="100" name="limit" value="#{Map.get(filters, :limit, 100)}" title="Maximum records returned">
       <button class="flow-search-button" type="submit">Search</button>
     </form>
     """
@@ -69,9 +69,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
     result =
       Map.get(data, :state_meta_result, %{
         status: :idle,
-        command: "FLOW.SEARCH",
+        command: "FLOW.QUERY",
         rows: [],
-        message: "Enter workflow type, metadata state, key, and value"
+        message: "Enter partition, workflow type, metadata state, key, and value"
       })
 
     filters = Map.get(data, :filters, %{})
@@ -85,7 +85,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowGovernance do
       end
 
     """
-    <div class="section-title">State Metadata Results <span class="badge badge-idle">#{escape(Map.get(result, :command, "FLOW.SEARCH"))}</span></div>
+    <div class="section-title">State Metadata Results <span class="badge badge-idle">#{escape(Map.get(result, :command, "FLOW.QUERY"))}</span></div>
     #{state_meta_status(result)}
     <table>
       <thead><tr><th>ID</th><th>Type</th><th>Current State</th><th>Metadata State</th><th>Indexed Key</th><th>Metadata</th><th>Updated</th></tr></thead>

@@ -35,17 +35,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Calls do
     end
   end
 
-  def flow_dashboard_flow_list(type, opts) do
-    case Application.get_env(:ferricstore, :flow_dashboard_flow_list_fun) do
-      fun when is_function(fun, 2) -> fun.(type, opts)
-      _ -> FerricStore.flow_list(type, opts)
-    end
-  end
-
-  def flow_dashboard_flow_search(opts) do
-    case Application.get_env(:ferricstore, :flow_dashboard_flow_search_fun) do
-      fun when is_function(fun, 1) -> fun.(opts)
-      _ -> FerricStore.flow_search(opts)
+  def flow_dashboard_flow_query(query, params) do
+    case Application.get_env(:ferricstore, :flow_dashboard_flow_query_fun) do
+      fun when is_function(fun, 2) -> fun.(query, params)
+      _ -> FerricStore.flow_query(query, params)
     end
   end
 
@@ -56,52 +49,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Calls do
     end
   end
 
-  def flow_dashboard_flow_terminals(type, opts) do
-    case Application.get_env(:ferricstore, :flow_dashboard_flow_terminals_fun) do
-      fun when is_function(fun, 2) -> fun.(type, opts)
-      _ -> FerricStore.flow_terminals(type, opts)
-    end
-  end
-
-  def flow_dashboard_flow_failures(type, opts) do
-    case Application.get_env(:ferricstore, :flow_dashboard_flow_failures_fun) do
-      fun when is_function(fun, 2) -> fun.(type, opts)
-      _ -> FerricStore.flow_failures(type, opts)
-    end
-  end
-
-  def flow_dashboard_flow_stuck(type, opts) do
-    case Application.get_env(:ferricstore, :flow_dashboard_flow_stuck_fun) do
-      fun when is_function(fun, 2) -> fun.(type, opts)
-      _ -> FerricStore.flow_stuck(type, opts)
-    end
-  end
-
   def flow_dashboard_flow_reclaim(type, opts) do
     case Application.get_env(:ferricstore, :flow_dashboard_flow_reclaim_fun) do
       fun when is_function(fun, 2) -> fun.(type, opts)
       _ -> FerricStore.flow_reclaim(type, opts)
-    end
-  end
-
-  def flow_dashboard_flow_by_parent(parent_id, opts) do
-    case Application.get_env(:ferricstore, :flow_dashboard_flow_by_parent_fun) do
-      fun when is_function(fun, 2) -> fun.(parent_id, opts)
-      _ -> FerricStore.flow_by_parent(parent_id, opts)
-    end
-  end
-
-  def flow_dashboard_flow_by_root(root_id, opts) do
-    case Application.get_env(:ferricstore, :flow_dashboard_flow_by_root_fun) do
-      fun when is_function(fun, 2) -> fun.(root_id, opts)
-      _ -> FerricStore.flow_by_root(root_id, opts)
-    end
-  end
-
-  def flow_dashboard_flow_by_correlation(correlation_id, opts) do
-    case Application.get_env(:ferricstore, :flow_dashboard_flow_by_correlation_fun) do
-      fun when is_function(fun, 2) -> fun.(correlation_id, opts)
-      _ -> FerricStore.flow_by_correlation(correlation_id, opts)
     end
   end
 

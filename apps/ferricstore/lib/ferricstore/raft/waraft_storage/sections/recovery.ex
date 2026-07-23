@@ -19,6 +19,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
       alias Ferricstore.Store.Shard.ETS, as: ShardETS
       alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.LogicalKeyIndex
+      alias Ferricstore.Store.Shard.NamespaceUsageIndex
+      alias Ferricstore.Store.NamespaceUsage
       alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
       alias Ferricstore.Store.Shard.ZSetIndex
 
@@ -172,12 +174,24 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
 
         LogicalKeyIndex.ensure_tables!(logical_key_index, logical_key_slots)
 
+        {namespace_usage_index, namespace_usage_expiry} =
+          NamespaceUsageIndex.table_names(instance_name, shard_index)
+
+        NamespaceUsageIndex.ensure_tables!(namespace_usage_index, namespace_usage_expiry)
+
         rebuild_logical_key_index!(
           logical_key_index,
           logical_key_slots,
           keydir,
           shard_index,
           shard_data_path
+        )
+
+        rebuild_namespace_usage_index!(
+          namespace_usage_index,
+          namespace_usage_expiry,
+          keydir,
+          ctx
         )
 
         {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, shard_index)
@@ -227,6 +241,8 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           compound_member_index_name: compound_member_index,
           logical_key_index_name: logical_key_index,
           logical_key_slots_name: logical_key_slots,
+          namespace_usage_index_name: namespace_usage_index,
+          namespace_usage_expiry_name: namespace_usage_expiry,
           zset_score_index_name: zset_score_index,
           zset_score_lookup_name: zset_score_lookup,
           flow_index_name: flow_index,
@@ -283,6 +299,13 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           shard_data_path
         )
 
+        rebuild_namespace_usage_index!(
+          sm_state.namespace_usage_index_name,
+          sm_state.namespace_usage_expiry_name,
+          keydir,
+          ctx
+        )
+
         ShardLifecycle.validate_prob_files(shard_data_path, shard_index, keydir)
 
         Ferricstore.Flow.LMDBRebuilder.reconcile_startup_shard(
@@ -312,6 +335,20 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
 
           {:error, reason} ->
             raise "failed to rebuild logical key index on shard #{shard_index}: #{inspect(reason)}"
+        end
+      end
+
+      defp rebuild_namespace_usage_index!(usage, expiry, keydir, ctx) do
+        case NamespaceUsageIndex.rebuild_tracked(
+               usage,
+               expiry,
+               keydir,
+               now_ms: System.system_time(:millisecond),
+               blob_threshold_bytes: BlobValue.threshold(ctx),
+               entry_bytes_fun: &NamespaceUsage.entry_bytes(ctx, &1)
+             ) do
+          :ok -> :ok
+          {:error, reason} -> raise "failed to rebuild namespace usage index: #{inspect(reason)}"
         end
       end
 
@@ -358,6 +395,12 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Recovery do
           LogicalKeyIndex.reset(
             Map.get(sm_state, :logical_key_index_name),
             Map.get(sm_state, :logical_key_slots_name)
+          )
+
+        _ =
+          NamespaceUsageIndex.reset(
+            Map.get(sm_state, :namespace_usage_index_name),
+            Map.get(sm_state, :namespace_usage_expiry_name)
           )
 
         _ = ZSetIndex.reset(sm_state)

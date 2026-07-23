@@ -498,7 +498,10 @@ defmodule Ferricstore.Commands.SortedSet do
 
   def handle_ast({:zrandmember, key}, store), do: Reads.zrandmember_one(key, store)
   def handle_ast({:zrandmember, _key, {:error, reason}}, _store), do: {:error, reason}
-  def handle_ast({:zrandmember, _key, {:error, reason}, _with_scores}, _store), do: {:error, reason}
+
+  def handle_ast({:zrandmember, _key, {:error, reason}, _with_scores}, _store),
+    do: {:error, reason}
+
   def handle_ast({:zrandmember, _key, _count, {:error, reason}}, _store), do: {:error, reason}
 
   def handle_ast({:zrandmember, key, count, with_scores}, store),

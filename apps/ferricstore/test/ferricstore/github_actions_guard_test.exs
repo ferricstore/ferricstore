@@ -149,6 +149,36 @@ defmodule Ferricstore.GitHubActionsGuardTest do
     assert root_mix =~ ~s({:mix_audit, "~> 2.1")
   end
 
+  test "Linux io_uring integration coverage is mandatory" do
+    workflow = File.read!(Path.join(@repo_root, ".github/workflows/test.yml"))
+
+    integration_test =
+      File.read!(
+        Path.join(
+          @repo_root,
+          "apps/ferricstore/test/ferricstore/store/io_uring_integration_test.exs"
+        )
+      )
+
+    io_uring_step =
+      workflow
+      |> String.split("- name: Run Linux io_uring integration tests", parts: 2)
+      |> List.last()
+      |> String.split("- name: Credo", parts: 2)
+      |> List.first()
+
+    assert io_uring_step =~ "Ferricstore.Bitcask.NIF.io_uring_available()"
+    assert io_uring_step =~ ~s(FERRICSTORE_REQUIRE_IO_URING: "1")
+    assert io_uring_step =~ "io_uring is required for the Linux CI integration suite"
+
+    assert io_uring_step =~
+             "mix test apps/ferricstore/test/ferricstore/store/io_uring_integration_test.exs --only linux_io_uring"
+
+    refute io_uring_step =~ "skipping tagged Linux io_uring tests"
+    refute io_uring_step =~ "exit 0"
+    assert integration_test =~ "System.fetch_env!(\"FERRICSTORE_REQUIRE_IO_URING\")"
+  end
+
   defp workflow_paths, do: Path.wildcard(@workflow_glob)
 
   defp count_occurrences(source, pattern) do

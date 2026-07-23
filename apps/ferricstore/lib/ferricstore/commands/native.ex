@@ -148,7 +148,7 @@ defmodule Ferricstore.Commands.Native do
 
   def handle_ast({:lock, key, owner, ttl_ms}, store)
       when is_integer(ttl_ms) and ttl_ms > 0 and ttl_ms <= @max_ttl_ms,
-    do: Ops.lock(store, key, owner, ttl_ms)
+      do: Ops.lock(store, key, owner, ttl_ms)
 
   def handle_ast({:lock, _key, _owner, _ttl_ms}, _store), do: integer_error()
 
@@ -161,7 +161,7 @@ defmodule Ferricstore.Commands.Native do
 
   def handle_ast({:extend, key, owner, ttl_ms}, store)
       when is_integer(ttl_ms) and ttl_ms > 0 and ttl_ms <= @max_ttl_ms,
-    do: Ops.extend(store, key, owner, ttl_ms)
+      do: Ops.extend(store, key, owner, ttl_ms)
 
   def handle_ast({:extend, _key, _owner, _ttl_ms}, _store), do: integer_error()
 
@@ -246,21 +246,31 @@ defmodule Ferricstore.Commands.Native do
       type when is_binary(type) ->
         alive? = type != "none"
 
-        {value_size, expire_at_ms, hot_status} = resolve_key_info(alive?, keydir, key, now)
-        ttl_ms = compute_ttl_ms(alive?, expire_at_ms, now)
+        {stored_size, expire_at_ms, hot_status} = resolve_key_info(alive?, keydir, key, now)
 
-        [
-          "type",
-          type,
-          "value_size",
-          Integer.to_string(value_size),
-          "ttl_ms",
-          Integer.to_string(ttl_ms),
-          "hot_cache_status",
-          hot_status,
-          "last_write_shard",
-          Integer.to_string(idx)
-        ]
+        case key_info_value_size(type, ctx, key, stored_size) do
+          value_size when is_integer(value_size) and value_size >= 0 ->
+            ttl_ms = compute_ttl_ms(alive?, expire_at_ms, now)
+
+            [
+              "type",
+              type,
+              "value_size",
+              Integer.to_string(value_size),
+              "ttl_ms",
+              Integer.to_string(ttl_ms),
+              "hot_cache_status",
+              hot_status,
+              "last_write_shard",
+              Integer.to_string(idx)
+            ]
+
+          {:error, {:storage_read_failed, _reason}} = failure ->
+            ReadResult.command_error(failure)
+
+          _invalid ->
+            {:error, "ERR storage read failed"}
+        end
 
       _invalid ->
         {:error, "ERR storage read failed"}
@@ -271,6 +281,15 @@ defmodule Ferricstore.Commands.Native do
 
   defp resolve_key_info(false, _keydir, _key, _now), do: {0, 0, "cold"}
   defp resolve_key_info(true, keydir, key, now), do: ets_key_info(keydir, key, now)
+
+  defp key_info_value_size("string", ctx, key, stored_size) do
+    case Router.value_size(ctx, key) do
+      nil -> stored_size
+      result -> result
+    end
+  end
+
+  defp key_info_value_size(_type, _ctx, _key, stored_size), do: stored_size
 
   defp compute_ttl_ms(false, _expire_at_ms, _now), do: -2
   defp compute_ttl_ms(true, 0, _now), do: -1

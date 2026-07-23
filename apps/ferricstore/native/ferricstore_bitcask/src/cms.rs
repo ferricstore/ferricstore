@@ -961,32 +961,46 @@ pub fn cms_file_query_async<'a>(
     path: String,
     elements: Vec<rustler::Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
-    let blocking_task = match crate::async_io::try_spawn_blocking(move || {
-        let file = crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "enoent".to_string()
-            } else {
-                e.to_string()
+    let input_bytes =
+        match crate::async_io::checked_input_bytes(elements.iter().map(|element| element.len())) {
+            Ok(bytes) => bytes,
+            Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+        };
+    let blocking_task = match crate::async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || {
+            elements
+                .iter()
+                .map(|element| element.as_slice().to_vec())
+                .collect::<Vec<_>>()
+        },
+        move |elements_owned| {
+            let file =
+                crate::open_random_read_locked(std::path::Path::new(&path)).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        "enoent".to_string()
+                    } else {
+                        e.to_string()
+                    }
+                })?;
+            let (width, depth, _count) = cms_file_read_header(&file).map_err(|e| e.clone())?;
+            let mut counts: Vec<i64> = Vec::with_capacity(elements_owned.len());
+            let mut buf = [0u8; 8];
+            for element in &elements_owned {
+                let indices = hash_indices_standalone(element, width, depth);
+                let mut min_val = i64::MAX;
+                for (row, &col) in indices.iter().enumerate() {
+                    let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
+                    cms_read_exact_at(&file, &mut buf, offset, "counter")?;
+                    let val = i64::from_le_bytes(buf);
+                    min_val = min_val.min(val);
+                }
+                counts.push(min_val);
             }
-        })?;
-        let (width, depth, _count) = cms_file_read_header(&file).map_err(|e| e.clone())?;
-        let mut counts: Vec<i64> = Vec::with_capacity(elements_owned.len());
-        let mut buf = [0u8; 8];
-        for element in &elements_owned {
-            let indices = hash_indices_standalone(element, width, depth);
-            let mut min_val = i64::MAX;
-            for (row, &col) in indices.iter().enumerate() {
-                let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
-                cms_read_exact_at(&file, &mut buf, offset, "counter")?;
-                let val = i64::from_le_bytes(buf);
-                min_val = min_val.min(val);
-            }
-            counts.push(min_val);
-        }
-        crate::fadvise_dontneed(&file, 0, 0);
-        Ok(counts)
-    }) {
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(counts)
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };

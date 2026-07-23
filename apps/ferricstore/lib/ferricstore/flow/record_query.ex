@@ -114,6 +114,62 @@ defmodule Ferricstore.Flow.RecordQuery do
   def prepend_chunk(chunk, chunks), do: [chunk | chunks]
   def flatten_chunks(chunks), do: Enum.flat_map(chunks, & &1)
 
+  @spec merge_ordered_record_chunks([[map()]], non_neg_integer(), boolean()) :: [map()]
+  def merge_ordered_record_chunks(_chunks, count, _reverse?) when count <= 0, do: []
+  def merge_ordered_record_chunks([], _count, _reverse?), do: []
+
+  def merge_ordered_record_chunks(chunks, count, reverse?)
+      when is_list(chunks) and is_integer(count) and is_boolean(reverse?) do
+    heap =
+      chunks
+      |> Enum.with_index()
+      |> Enum.reduce(:gb_sets.empty(), fn
+        {[], _source}, heap ->
+          heap
+
+        {[record | rest], source}, heap ->
+          :gb_sets.add(ordered_heap_entry(record, rest, source, reverse?), heap)
+      end)
+
+    take_ordered_records(heap, count, reverse?, MapSet.new(), [])
+  end
+
+  defp take_ordered_records(_heap, 0, _reverse?, _seen, acc), do: Enum.reverse(acc)
+
+  defp take_ordered_records(heap, remaining, reverse?, seen, acc) do
+    if :gb_sets.is_empty(heap) do
+      Enum.reverse(acc)
+    else
+      {{_rank, _source_order, source, record, rest}, heap} =
+        if reverse?, do: :gb_sets.take_largest(heap), else: :gb_sets.take_smallest(heap)
+
+      heap =
+        case rest do
+          [] -> heap
+          [next | tail] -> :gb_sets.add(ordered_heap_entry(next, tail, source, reverse?), heap)
+        end
+
+      id = Map.get(record, :id)
+
+      if MapSet.member?(seen, id) do
+        take_ordered_records(heap, remaining, reverse?, seen, acc)
+      else
+        take_ordered_records(
+          heap,
+          remaining - 1,
+          reverse?,
+          MapSet.put(seen, id),
+          [record | acc]
+        )
+      end
+    end
+  end
+
+  defp ordered_heap_entry(record, rest, source, reverse?) do
+    source_order = if reverse?, do: -source, else: source
+    {update_rank(record), source_order, source, record, rest}
+  end
+
   defp auto_partition_candidate_limit do
     case Application.get_env(
            :ferricstore,

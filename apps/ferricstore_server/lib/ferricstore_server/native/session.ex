@@ -43,13 +43,47 @@ defmodule FerricstoreServer.Native.Session do
     end
   end
 
+  @spec prepare_authorized(map(), map()) ::
+          {:ok, PreparedCommand.t()} | {:error, atom(), binary()} | {:error, binary()}
+  def prepare_authorized(payload, state) when is_map(payload) and is_map(state) do
+    with :ok <- authorize_before_prepare(payload, state) do
+      prepare_command(payload)
+    end
+  end
+
   @spec execute(map(), map()) :: {:ok | :error | :bad_request | :auth | :noperm, term(), map()}
   def execute(payload, state) do
-    with {:ok, prepared} <- prepare_command(payload) do
+    with {:ok, prepared} <- prepare_authorized(payload, state) do
       execute_prepared(prepared, state)
     else
       {:error, status, reason} -> {status, reason, state}
       {:error, reason} -> {:bad_request, reason, state}
+    end
+  end
+
+  defp authorize_before_prepare(%{"command" => command}, state) when is_binary(command) do
+    case ConnAuth.acl_command_preflight_alternatives(command) do
+      [] -> :ok
+      commands -> authorize_any_command(commands, state)
+    end
+  end
+
+  defp authorize_before_prepare(_payload, _state), do: :ok
+
+  defp authorize_any_command(commands, state) do
+    cond do
+      Map.get(state, :require_auth) and not Map.get(state, :authenticated) ->
+        {:error, :auth, "NOAUTH Authentication required."}
+
+      true ->
+        case ConnAuth.check_any_command_cached(state.acl_cache, commands) do
+          :ok ->
+            :ok
+
+          {:error, command, reason} ->
+            log_acl_denial(state, command)
+            {:error, :noperm, reason}
+        end
     end
   end
 
@@ -69,18 +103,25 @@ defmodule FerricstoreServer.Native.Session do
         {:error, :auth, "NOAUTH Authentication required."}
 
       true ->
-        acl_cmd =
-          ConnAuth.acl_command_name(prepared.command, prepared.args, prepared.ast)
+        acl_commands =
+          ConnAuth.acl_command_names(prepared.command, prepared.args, prepared.ast)
 
         case InternalKey.authorize_command(prepared.command, prepared.acl_keys) do
           :ok ->
-            with :ok <- ConnAuth.check_command_cached(state.acl_cache, acl_cmd),
+            with :ok <- ConnAuth.check_commands_cached(state.acl_cache, acl_commands),
                  :ok <-
                    ConnAuth.check_prepared_resources_cached(state.acl_cache, prepared) do
               :ok
             else
+              {:error, acl_command, reason} ->
+                log_acl_denial(state, acl_command)
+                {:error, :noperm, reason}
+
               {:error, reason} ->
-                log_acl_denial(state, acl_cmd)
+                audit_command =
+                  ConnAuth.acl_command_name(prepared.command, prepared.args, prepared.ast)
+
+                log_acl_denial(state, audit_command)
                 {:error, :noperm, reason}
             end
 
@@ -432,13 +473,13 @@ defmodule FerricstoreServer.Native.Session do
     Enum.reduce_while(queue, :ok, fn entry, :ok ->
       prepared = transaction_prepared(entry)
 
-      acl_cmd =
-        ConnAuth.acl_command_name(prepared.command, prepared.args, prepared.ast)
+      acl_commands =
+        ConnAuth.acl_command_names(prepared.command, prepared.args, prepared.ast)
 
-      case {ConnAuth.check_command_cached(state.acl_cache, acl_cmd),
+      case {ConnAuth.check_commands_cached(state.acl_cache, acl_commands),
             ConnAuth.check_keys_cached(state.acl_cache, prepared)} do
         {:ok, :ok} -> {:cont, :ok}
-        {{:error, reason}, _} -> {:halt, {:error, reason}}
+        {{:error, _command, reason}, _} -> {:halt, {:error, reason}}
         {_, {:error, reason}} -> {:halt, {:error, reason}}
       end
     end)

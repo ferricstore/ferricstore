@@ -15,7 +15,9 @@ defmodule Ferricstore.Commands.Set.Destination do
 
   defp replace_destination(destination, members, backup, store) do
     case clear_set_store_destination(destination, store) do
-      :ok -> write_destination(destination, MapSet.to_list(members), backup, store)
+      :ok ->
+        write_destination(destination, MapSet.to_list(members), backup, store)
+
       {:error, _reason} = error ->
         restore_set_store_destination(error, destination, backup, store)
     end

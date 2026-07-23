@@ -9,10 +9,13 @@ defmodule Ferricstore.Flow.Query.Engine do
 
   alias Ferricstore.Flow.Query.{
     ExecutionContext,
+    FixedIndexExecutor,
     Limits,
     MandatoryScope,
     RecordProjection,
-    Request
+    Request,
+    Shape,
+    Surface
   }
 
   @point_fingerprint :crypto.hash(
@@ -40,19 +43,26 @@ defmodule Ferricstore.Flow.Query.Engine do
   end
 
   def execute(_ctx, %Request{source: :runs, mode: :explain} = request) do
-    with {:ok, _partition_key, _id, kind} <- point_values(request) do
-      {:ok, explain(kind)}
+    case point_values(request) do
+      {:ok, _partition_key, _id, kind} -> {:ok, explain(kind)}
+      {:error, :unsupported_query_shape} -> FixedIndexExecutor.execute(%{}, request)
     end
   end
 
   def execute(ctx, %Request{source: :runs, mode: :execute} = request) do
-    with {:ok, partition_key, id, _kind} <- point_values(request) do
-      ctx
-      |> ExecutionContext.instance_ctx()
-      |> Ferricstore.Flow.get(id, partition_key: partition_key)
-      |> normalize_point_result()
-      |> verify_point_result(partition_key, id)
-      |> RecordProjection.project_result()
+    case point_values(request) do
+      {:ok, partition_key, id, _kind} ->
+        ctx
+        |> ExecutionContext.instance_ctx()
+        |> Ferricstore.Flow.get(id, partition_key: partition_key)
+        |> normalize_point_result()
+        |> verify_point_result(partition_key, id)
+        |> RecordProjection.project_result()
+
+      {:error, :unsupported_query_shape} ->
+        ctx
+        |> ExecutionContext.instance_ctx()
+        |> FixedIndexExecutor.execute(request)
     end
   end
 
@@ -157,7 +167,7 @@ defmodule Ferricstore.Flow.Query.Engine do
       memory_high_water_bytes =
         max(
           page.memory_high_water_bytes,
-          :erlang.external_size({page.events, records}, minor_version: 2)
+          Ferricstore.TermMemory.bytes({page.events, records})
         )
 
       {:ok,
@@ -199,86 +209,25 @@ defmodule Ferricstore.Flow.Query.Engine do
   def execute_lineage_page_resolved(_ctx, _request, _scope, _boundary),
     do: {:error, :unsupported_query_shape}
 
-  defp point_values(%Request{
-         version: 1,
-         source: :runs,
-         predicate:
-           {:and,
-            [
-              {:eq, :partition_key, {:literal, :keyword, partition_key}},
-              {:eq, :run_id, {:literal, :keyword, id}}
-            ]},
-         order_by: [],
-         return: :record,
-         limit: 1
-       })
-       when is_binary(partition_key) and partition_key != "" and is_binary(id) and id != "" do
-    with :ok <- validate_point_value_size(partition_key, id) do
-      {:ok, partition_key, id, :explicit_partition}
+  defp point_values(%Request{} = request) do
+    with {:ok, descriptor} <- Shape.point_descriptor(request),
+         :ok <- validate_point_value_size(descriptor.partition_key, descriptor.run_id) do
+      kind = if descriptor.partitioning == :auto, do: :auto_partition, else: :explicit_partition
+      {:ok, descriptor.partition_key, descriptor.run_id, kind}
     end
   end
 
-  defp point_values(%Request{
-         version: 1,
-         source: :runs,
-         predicate: {:and, [{:eq, :run_id, {:literal, :keyword, id}}]},
-         order_by: [],
-         return: :record,
-         limit: 1
-       })
-       when is_binary(id) and id != "" do
-    partition_key = Ferricstore.Flow.Keys.auto_partition_key(id)
-
-    with :ok <- validate_point_value_size(partition_key, id) do
-      {:ok, partition_key, id, :auto_partition}
-    end
-  end
-
-  defp point_values(%Request{}), do: {:error, :unsupported_query_shape}
-
-  defp history_values(
-         %Request{
-           version: 1,
-           source: :events,
-           predicate: {:and, predicates},
-           order_by: [{:event_id, direction}],
-           limit: limit,
-           cursor: nil,
-           return: :record
-         } = request
-       )
-       when direction in [:asc, :desc] and is_list(predicates) and is_integer(limit) do
-    with {:ok, id} <- history_run_id(predicates),
-         {:ok, partition_key} <- Ferricstore.Flow.Query.partition_key(request) do
-      {:ok, partition_key, id, direction, limit}
+  defp history_values(%Request{cursor: nil} = request) do
+    with {:ok, descriptor} <- Shape.history_descriptor(request) do
+      {:ok, descriptor.partition_key, descriptor.run_id, descriptor.direction, descriptor.limit}
     end
   end
 
   defp history_values(%Request{}), do: {:error, :unsupported_query_shape}
 
-  defp history_page_values(
-         %Request{
-           version: 1,
-           source: :events,
-           predicate: {:and, predicates},
-           order_by: [{:event_id, direction}],
-           limit: limit,
-           return: :record
-         } = request
-       )
-       when direction in [:asc, :desc] and is_list(predicates) and is_integer(limit) do
-    with {:ok, id} <- history_run_id(predicates),
-         {:ok, partition_key} <- Ferricstore.Flow.Query.partition_key(request) do
-      {:ok, partition_key, id, direction, limit}
-    end
-  end
-
-  defp history_page_values(%Request{}), do: {:error, :unsupported_query_shape}
-
-  defp history_run_id(predicates) do
-    case Enum.filter(predicates, &match?({:eq, :run_id, _value}, &1)) do
-      [{:eq, :run_id, {:literal, :keyword, id}}] when is_binary(id) and id != "" -> {:ok, id}
-      _invalid -> {:error, :unsupported_query_shape}
+  defp history_page_values(%Request{} = request) do
+    with {:ok, descriptor} <- Shape.history_descriptor(request) do
+      {:ok, descriptor.partition_key, descriptor.run_id, descriptor.direction, descriptor.limit}
     end
   end
 
@@ -391,7 +340,7 @@ defmodule Ferricstore.Flow.Query.Engine do
       end
 
     %{
-      version: "ferric.flow.query.point-explain/v1",
+      version: Surface.default_explain_contract(),
       query_fingerprint: fingerprint,
       status: "planned",
       capabilities: %{
@@ -415,7 +364,7 @@ defmodule Ferricstore.Flow.Query.Engine do
 
   defp history_explain(direction) do
     %{
-      version: "ferric.flow.query.history-explain/v1",
+      version: Surface.default_explain_contract(),
       query_fingerprint:
         :crypto.hash(
           :sha256,

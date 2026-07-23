@@ -6,14 +6,40 @@ defmodule FerricstoreServer.Native.FQLParser do
   constructs the shared canonical request used by the binder and executor.
   """
 
-  alias Ferricstore.Flow.Query.{Field, Request}
+  alias Ferricstore.Flow.Query.{Error, Field, Request}
   alias FerricstoreServer.Native.NIF
 
   @spec parse(binary()) :: {:ok, Request.t()} | {:error, atom()}
   def parse(query) when is_binary(query) do
+    case parse_native(query) do
+      {:error, reason, _byte} -> {:error, reason}
+      result -> result
+    end
+  end
+
+  def parse(_query), do: {:error, :invalid_syntax}
+
+  @doc false
+  @spec parse_diagnostic(binary()) :: {:ok, Request.t()} | {:error, Error.t()}
+  def parse_diagnostic(query) when is_binary(query) do
+    case parse_native(query) do
+      {:error, reason, byte} when is_integer(byte) ->
+        {:error, Error.diagnose(reason, query, byte)}
+
+      {:error, reason, nil} ->
+        {:error, Error.new(reason)}
+
+      result ->
+        result
+    end
+  end
+
+  def parse_diagnostic(_query), do: {:error, Error.new(:invalid_syntax)}
+
+  defp parse_native(query) do
     case NIF.parse_fql(query) do
       {:ok, mode, source, shape, predicates, order_by, limit, cursor}
-      when mode in [:execute, :explain] and source in [:runs, :events] and
+      when mode in [:execute, :explain, :analyze] and source in [:runs, :events] and
              shape in [:point, :collection, :history, :count] and
              is_list(predicates) and is_list(order_by) and
              (is_integer(limit) or is_nil(limit)) ->
@@ -24,17 +50,18 @@ defmodule FerricstoreServer.Native.FQLParser do
                build_request(mode, source, shape, predicates, order_by, limit, cursor),
              :ok <- Request.validate_unbound(request) do
           {:ok, request}
+        else
+          {:error, reason} when is_atom(reason) -> {:error, reason, nil}
         end
 
-      {:error, reason} when is_atom(reason) ->
-        {:error, reason}
+      {:error, reason, byte}
+      when is_atom(reason) and is_integer(byte) and byte > 0 and byte <= byte_size(query) + 1 ->
+        {:error, reason, byte}
 
       _invalid_native_result ->
-        {:error, :invalid_syntax}
+        {:error, :invalid_syntax, nil}
     end
   end
-
-  def parse(_query), do: {:error, :invalid_syntax}
 
   defp decode_predicates([], acc), do: {:ok, Enum.reverse(acc)}
 

@@ -116,4 +116,22 @@ defmodule Ferricstore.Commands.StreamPersistedCodecTest do
                Stream.handle_ast({:xack, key, "group", ["1-0"]}, store)
     end
   end
+
+  test "pending growth bound covers deterministic consumer-group encoding" do
+    consumer = String.duplicate("consumer", 16)
+    timestamp = 18_446_744_073_709_551_615
+    ids = Enum.map(1..32, &"18446744073709551615-#{&1}")
+
+    before = Ferricstore.TermCodec.encode({:stream_group, 1, "0-0", %{}, %{}})
+
+    pending = Map.new(ids, &{&1, {consumer, timestamp}})
+
+    after_value =
+      Ferricstore.TermCodec.encode(
+        {:stream_group, 1, List.last(ids), %{consumer => timestamp}, pending}
+      )
+
+    assert byte_size(after_value) - byte_size(before) <=
+             Groups.pending_growth_bound(consumer, length(ids))
+  end
 end

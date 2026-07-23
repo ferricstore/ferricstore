@@ -44,8 +44,7 @@ defmodule Ferricstore.FlowRunStepsManyValidationTest do
   test "pipeline claim_due rejects inexact timestamps before routing" do
     assert [{:error, "ERR flow now_ms exceeds maximum 9007199254740991"}] =
              Flow.pipeline_claim_due_batch(:unused, [
-               {:claim_due, "email",
-                [worker: "worker", now_ms: 9_007_199_254_740_992]}
+               {:claim_due, "email", [worker: "worker", now_ms: 9_007_199_254_740_992]}
              ])
   end
 end

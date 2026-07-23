@@ -20,6 +20,79 @@ defmodule Ferricstore.Flow.Query.CompositeCounterTest do
     end
   end
 
+  test "counter values track the bounded subset that can expire" do
+    definition = definition()
+    assert {:ok, prefix} = CompositeIndex.encode_prefix(definition, ["tenant-a", "failed"])
+    blob = CompositeCounter.encode_value(prefix, 7, 3)
+
+    assert {:ok, %{count: 7, expiring_count: 3, physical_count: 7}} =
+             CompositeCounter.decode_state(blob, prefix)
+
+    assert {:ok, 7} = CompositeCounter.decode_value(blob, prefix)
+
+    assert_raise ArgumentError, fn ->
+      CompositeCounter.encode_value(prefix, 2, 3)
+    end
+  end
+
+  test "counter values can bind logical membership to a larger physical fanout" do
+    definition = definition()
+    assert {:ok, prefix} = CompositeIndex.encode_prefix(definition, ["tenant-a"])
+    blob = CompositeCounter.encode_value(prefix, 2, 1, 5)
+
+    assert {:ok, %{count: 2, expiring_count: 1, physical_count: 5}} =
+             CompositeCounter.decode_state(blob, prefix)
+
+    assert_raise ArgumentError, fn ->
+      CompositeCounter.encode_value(prefix, 3, 0, 2)
+    end
+  end
+
+  test "decodes a storage row only when its key, prefix, and definition agree" do
+    definition = definition()
+    other_definition = %{definition() | version: 2}
+    assert {:ok, prefix} = CompositeIndex.encode_prefix(definition, ["tenant-a", "failed"])
+    assert {:ok, other_prefix} = CompositeIndex.encode_prefix(definition, ["tenant-a"])
+    key = CompositeCounter.key(definition, prefix)
+    blob = CompositeCounter.encode_value(prefix, 7)
+
+    assert {:ok, %{prefix: ^prefix, count: 7}} =
+             CompositeCounter.decode_storage_entry(definition, key, blob)
+
+    assert :error = CompositeCounter.decode_storage_entry(definition, key <> <<0>>, blob)
+
+    assert :error =
+             CompositeCounter.decode_storage_entry(
+               definition,
+               key,
+               CompositeCounter.encode_value(other_prefix, 7)
+             )
+
+    assert :error = CompositeCounter.decode_storage_entry(other_definition, key, blob)
+  end
+
+  test "derives declared prefixes for one physical key in stable prefix order" do
+    definition = definition()
+
+    record = %{
+      id: "run-1",
+      partition_key: "tenant-a",
+      state: "failed",
+      version: 1,
+      updated_at_ms: 100
+    }
+
+    state_key = Ferricstore.Flow.Keys.state_key("run-1", "tenant-a")
+    assert {:ok, [entry]} = CompositeIndex.entries(definition, record, state_key, 0)
+    assert {:ok, tenant} = CompositeIndex.encode_prefix(definition, ["tenant-a"])
+    assert {:ok, state} = CompositeIndex.encode_prefix(definition, ["tenant-a", "failed"])
+
+    assert {:ok, [^tenant, ^state]} = CompositeCounter.prefixes_for_key(definition, entry.key)
+
+    assert {:error, :invalid_composite_counter_key} =
+             CompositeCounter.prefixes_for_key(definition, entry.key <> <<0>>)
+  end
+
   test "derives one run counter prefix per declared dimension despite trailing fanout" do
     definition =
       IndexDefinition.new!(%{
@@ -72,6 +145,7 @@ defmodule Ferricstore.Flow.Query.CompositeCounterTest do
     assert {:ok,
             %{
               counts: [7, 0, 3],
+              expiring_counts: [0, 0, 0],
               scanned_entries: 3,
               scanned_bytes: scanned_bytes,
               memory_bytes: memory_bytes

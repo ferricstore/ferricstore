@@ -49,11 +49,10 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     EXISTS TYPE OBJECT MEMORY TTL PTTL EXPIRETIME PEXPIRETIME
     KEY_INFO ROUTE ROUTE_BATCH CLUSTER.KEYSLOT FERRICSTORE.KEY_INFO FERRICSTORE.CAPABILITIES
     FERRICSTORE.TELEMETRY WATCH
-    FLOW.GET FLOW.POLICY.GET FLOW.LIST FLOW.SEARCH FLOW.QUERY FLOW.BY_PARENT FLOW.BY_ROOT
-    FLOW.BY_CORRELATION FLOW.INFO FLOW.STUCK FLOW.STATS FLOW.ATTRIBUTES
+    FLOW.GET FLOW.POLICY.GET FLOW.QUERY FLOW.INFO FLOW.STATS FLOW.ATTRIBUTES
     FLOW.ATTRIBUTE_VALUES FLOW.EFFECT.GET FLOW.GOVERNANCE.LEDGER FLOW.GOVERNANCE.OVERVIEW
     FLOW.APPROVAL.GET FLOW.APPROVAL.LIST FLOW.CIRCUIT.GET FLOW.BUDGET.GET FLOW.BUDGET.LIST
-    FLOW.LIMIT.GET FLOW.LIMIT.LIST FLOW.HISTORY FLOW.TERMINALS FLOW.FAILURES
+    FLOW.LIMIT.GET FLOW.LIMIT.LIST FLOW.HISTORY
     FLOW.SCHEDULE.GET FLOW.SCHEDULE.LIST FLOW.VALUE.MGET
   ))
 
@@ -135,7 +134,8 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   )
 
   @spec prepare(binary(), [term()], keyword()) ::
-          {:ok, prepared_description()} | {:error, binary()}
+          {:ok, prepared_description()}
+          | {:error, binary() | Ferricstore.Flow.Query.Error.t()}
   def prepare(name, args, opts \\ []) when is_list(opts) do
     case NativeAstParser.parse(name, args) do
       {:ok, command, parsed_args, {:unknown, unknown_command, _unknown_args}, _parser_keys}
@@ -167,7 +167,8 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   defp prepare_flow_query(parsed_args, version, query, params, opts) do
     parser = Keyword.get(opts, :flow_query_parser, Ferricstore.Flow.Query.ReferenceParser)
 
-    with {:ok, %Request{} = request} <- Query.prepare_text(version, query, params, parser),
+    with {:ok, %Request{} = request} <-
+           Query.prepare_text_diagnostic(version, query, params, parser),
          {:ok, partition_key} <- Query.partition_key(request) do
       {:ok,
        describe_prepared(
@@ -177,7 +178,10 @@ defmodule Ferricstore.Commands.KeyDiscovery do
          [partition_key]
        )}
     else
-      {:error, reason} when is_atom(reason) -> {:error, Query.error_message(reason)}
+      {:error, %Ferricstore.Flow.Query.Error{} = error} ->
+        if Keyword.get(opts, :flow_query_error_format) == :structured,
+          do: {:error, error},
+          else: {:error, Ferricstore.Flow.Query.Error.format(error)}
     end
   end
 

@@ -1,7 +1,7 @@
 defmodule Ferricstore.MixProject do
   use Mix.Project
 
-  @version "0.9.1"
+  @version "0.10.0"
 
   def project do
     [
@@ -66,6 +66,7 @@ defmodule Ferricstore.MixProject do
         "FerricFlow durable workflows and queues with native-protocol storage, Raft durability, and Bitcask persistence.",
       files: [
         "lib",
+        "priv/flow_query/index-catalog.json",
         "native/ferricstore_bitcask/.cargo",
         "native/ferricstore_bitcask/src",
         "native/ferricstore_bitcask/Cargo*",

@@ -311,14 +311,43 @@ impl WalHandle {
     }
 
     /// Read bytes from the WAL at offset. For recovery.
-    pub fn pread(&self, offset: u64, len: u64) -> Result<Vec<u8>, rustler::Error> {
+    pub fn pread_len(&self, offset: u64, len: u64) -> Result<usize, rustler::Error> {
+        let file = self
+            .read_file
+            .lock()
+            .map_err(|_| rustler::Error::Term(Box::new("read_mutex_poisoned")))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))?
+            .len();
+        background_thread::validated_pread_len(file_len, offset, len)
+            .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))
+    }
+
+    pub fn pread_into(&self, offset: u64, output: &mut [u8]) -> Result<(), rustler::Error> {
         let mut file = self
             .read_file
             .lock()
             .map_err(|_| rustler::Error::Term(Box::new("read_mutex_poisoned")))?;
 
-        background_thread::pread_from_file(&mut file, offset, len)
+        let file_len = file
+            .metadata()
+            .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))?
+            .len();
+        let requested = u64::try_from(output.len())
+            .map_err(|_| rustler::Error::Term(Box::new("pread length exceeds maximum")))?;
+        background_thread::validated_pread_len(file_len, offset, requested)
+            .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))?;
+        background_thread::pread_into_file(&mut file, offset, output)
             .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))
+    }
+
+    #[cfg(test)]
+    pub fn pread(&self, offset: u64, len: u64) -> Result<Vec<u8>, rustler::Error> {
+        let read_len = self.pread_len(offset, len)?;
+        let mut output = vec![0; read_len];
+        self.pread_into(offset, &mut output)?;
+        Ok(output)
     }
 }
 
@@ -612,7 +641,7 @@ mod tests {
 
         let hdr = background_thread::WAL_HEADER_SIZE;
         let data = handle.pread(hdr + 6, 5).unwrap();
-        assert_eq!(&data, b"pread");
+        assert_eq!(data.as_slice(), b"pread");
     }
 
     #[test]

@@ -146,8 +146,11 @@ defmodule Ferricstore.Commands.Blocking do
           {val, ""} when val >= 0 and val <= div(@max_timeout_ms, 1_000) ->
             {:ok, val * 1000}
 
-          {_val, ""} -> {:error, "ERR timeout is negative"}
-          _ -> {:error, "ERR timeout is not a float or out of range"}
+          {_val, ""} ->
+            {:error, "ERR timeout is negative"}
+
+          _ ->
+            {:error, "ERR timeout is not a float or out of range"}
         end
     end
   rescue

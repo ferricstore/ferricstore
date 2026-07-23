@@ -482,6 +482,51 @@ defmodule Ferricstore.Store.ListOpsTest do
     assert_received :destination_batch_written
   end
 
+  test "LMOVE reads only a bounded source boundary window" do
+    parent = self()
+    source_meta_key = CompoundKey.list_meta_key("src")
+    destination_meta_key = CompoundKey.list_meta_key("dst")
+    source_element_key = CompoundKey.list_element("src", 0)
+    destination_element_key = CompoundKey.list_element("dst", 0)
+
+    source_meta = {100, -1_000_000_000, 100_000_000_000}
+
+    store = %{
+      compound_get: fn
+        "src", ^source_meta_key -> ListOps.encode_meta(source_meta)
+        "dst", ^destination_meta_key -> nil
+      end,
+      compound_scan: fn _key, _prefix ->
+        flunk("LMOVE must not scan the full source list")
+      end,
+      compound_scan_slice: fn "src", _prefix, 0, 2, 100 ->
+        send(parent, :bounded_source_slice)
+
+        [
+          {CompoundKey.encode_position(0), "first"},
+          {CompoundKey.encode_position(500_000_000), "second"}
+        ]
+      end,
+      compound_batch_delete: fn "src", [^source_element_key] -> :ok end,
+      compound_put: fn "src", ^source_meta_key, encoded_meta, 0 ->
+        assert {99, -500_000_000, 100_000_000_000} == ListOps.decode_meta(encoded_meta)
+        :ok
+      end,
+      compound_batch_put: fn
+        "dst",
+        [
+          {^destination_element_key, "first", 0},
+          {^destination_meta_key, encoded_meta, 0}
+        ] ->
+          assert {1, -1_000_000_000, 1_000_000_000} == ListOps.decode_meta(encoded_meta)
+          :ok
+      end
+    }
+
+    assert "first" == ListOps.execute_lmove("src", "dst", store, :left, :right)
+    assert_received :bounded_source_slice
+  end
+
   test "LMOVE reports a failed source restore after a destination failure" do
     src_meta_key = CompoundKey.list_meta_key("src")
     src_element_key = CompoundKey.list_element("src", 0)

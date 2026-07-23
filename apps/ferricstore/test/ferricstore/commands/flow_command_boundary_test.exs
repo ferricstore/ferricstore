@@ -55,4 +55,23 @@ defmodule Ferricstore.Commands.FlowCommandBoundaryTest do
       assert {:error, ^expected} = Dispatcher.dispatch_prepared(prepared, %{})
     end
   end
+
+  test "Flow response normalization converts keys recursively inside lists" do
+    response = %{
+      decision: %{reason: "lowest_cost"},
+      alternatives: [
+        %{index: %{logical_id: "runs_by_state"}, comparison: %{cost_delta: 5}}
+      ]
+    }
+
+    assert %{
+             "decision" => %{"reason" => "lowest_cost"},
+             "alternatives" => [
+               %{
+                 "index" => %{"logical_id" => "runs_by_state"},
+                 "comparison" => %{"cost_delta" => 5}
+               }
+             ]
+           } = Flow.normalize_result({:ok, response})
+  end
 end

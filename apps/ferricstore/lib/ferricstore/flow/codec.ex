@@ -15,6 +15,7 @@ defmodule Ferricstore.Flow.Codec do
   @record_bin_magic "FSF5"
   @history_bin_magic "FSH2"
   @max_exact_integer 9_007_199_254_740_991
+  @max_record_decode_batch 4_096
 
   # FSF5 stores only the required mutable state fields inline. Optional fields
   # are controlled by the flag word below so nil/default values do not repeat on
@@ -237,6 +238,38 @@ defmodule Ferricstore.Flow.Codec do
   end
 
   def decode_record(_value), do: raise(ArgumentError, "invalid flow record")
+
+  @doc false
+  @spec decode_records([binary()]) :: [map()]
+  def decode_records([]), do: []
+
+  def decode_records(values) when is_list(values) do
+    case validate_record_batch(values, 0) do
+      {:ok, count} ->
+        case NIF.flow_records_decode(values) do
+          {:ok, decoded} when is_list(decoded) and length(decoded) == count ->
+            Enum.map(decoded, &decode_record_fields/1)
+
+          _invalid ->
+            raise ArgumentError, "invalid flow record batch"
+        end
+
+      :error ->
+        raise ArgumentError, "invalid flow record batch"
+    end
+  rescue
+    _error -> raise ArgumentError, "invalid flow record batch"
+  end
+
+  def decode_records(_values), do: raise(ArgumentError, "invalid flow record batch")
+
+  defp validate_record_batch([], count), do: {:ok, count}
+
+  defp validate_record_batch([@record_bin_magic <> _rest | values], count)
+       when count < @max_record_decode_batch,
+       do: validate_record_batch(values, count + 1)
+
+  defp validate_record_batch(_values, _count), do: :error
 
   def decode_record_meta(@record_bin_magic <> _rest = value) do
     case NIF.flow_record_decode_meta(value) do
@@ -1017,14 +1050,16 @@ defmodule Ferricstore.Flow.Codec do
   defp maybe_put_decoded_rewound_to_event_id(record, rewound_to_event_id),
     do: Map.put(record, :rewound_to_event_id, rewound_to_event_id)
 
-  defp validate_decoded_record!(%{
-         id: id,
-         type: type,
-         state: state,
-         version: version,
-         created_at_ms: created_at_ms,
-         updated_at_ms: updated_at_ms
-       } = record)
+  defp validate_decoded_record!(
+         %{
+           id: id,
+           type: type,
+           state: state,
+           version: version,
+           created_at_ms: created_at_ms,
+           updated_at_ms: updated_at_ms
+         } = record
+       )
        when is_binary(id) and id != "" and is_binary(type) and type != "" and is_binary(state) and
               state != "" and is_integer(version) and version >= 0 and
               version <= @max_exact_integer and is_integer(created_at_ms) and created_at_ms >= 0 and

@@ -9,6 +9,8 @@ defmodule Ferricstore.Flow.Attributes do
   @max_total_bytes 2_048
   @max_list_values 16
   @max_indexed_names 3
+  @min_i64 -0x8000_0000_0000_0000
+  @max_i64 0x7FFF_FFFF_FFFF_FFFF
 
   @type attrs :: %{optional(binary()) => binary() | integer() | float() | boolean() | [binary()]}
 
@@ -249,8 +251,20 @@ defmodule Ferricstore.Flow.Attributes do
     end
   end
 
-  defp normalize_value(value) when is_integer(value) or is_float(value) or is_boolean(value),
-    do: {:ok, value}
+  defp normalize_value(value)
+       when is_integer(value) and value >= @min_i64 and value <= @max_i64,
+       do: {:ok, value}
+
+  defp normalize_value(value) when is_integer(value),
+    do: {:error, "ERR flow attribute integer must fit in signed 64 bits"}
+
+  defp normalize_value(value) when is_float(value) do
+    if finite_float?(value),
+      do: {:ok, value},
+      else: {:error, "ERR flow attribute float must be finite"}
+  end
+
+  defp normalize_value(value) when is_boolean(value), do: {:ok, value}
 
   defp normalize_value(value) when is_atom(value) and not is_nil(value),
     do: value |> Atom.to_string() |> normalize_value()
@@ -288,6 +302,11 @@ defmodule Ferricstore.Flow.Attributes do
 
   defp normalize_list_value(_value),
     do: {:error, "ERR flow attribute list values must be strings"}
+
+  defp finite_float?(value) do
+    <<_sign::1, exponent::11, _fraction::52>> = <<value::float-big-64>>
+    exponent != 0x7FF
+  end
 
   defp validate_count(count) when count <= @max_attrs, do: :ok
   defp validate_count(_count), do: {:error, "ERR too many flow attributes"}

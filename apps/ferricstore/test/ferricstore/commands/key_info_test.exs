@@ -244,6 +244,32 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       info = parse_info(result)
       assert info["value_size"] == "10000"
     end
+
+    test "shows the logical size of a cold blob-backed string" do
+      ctx =
+        IsolatedInstance.checkout(
+          shard_count: 1,
+          blob_side_channel_threshold_bytes: 1,
+          hot_cache_max_value_size: 0
+        )
+
+      on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+      key = ukey("ki_blob_size")
+      value = :binary.copy("blob-value", 2_000)
+
+      assert :ok = Router.put(ctx, key, value, 0)
+      assert :ok = GenServer.call(elem(ctx.shard_names, 0), :flush, 5_000)
+
+      [{^key, nil, _expires, _lfu, _file_id, _offset, stored_size}] =
+        :ets.lookup(elem(ctx.keydir_refs, 0), key)
+
+      refute stored_size == byte_size(value)
+
+      info = Native.handle("KEY_INFO", [key], custom_store(ctx)) |> parse_info()
+      assert info["value_size"] == Integer.to_string(byte_size(value))
+      assert info["hot_cache_status"] == "cold"
+    end
   end
 
   # ===========================================================================

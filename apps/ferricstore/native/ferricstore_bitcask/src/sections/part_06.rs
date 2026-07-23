@@ -610,6 +610,21 @@ mod lmdb_cache_architecture_tests {
         assert!(lmdb_store.find("std::fs::canonicalize").unwrap()
             < lmdb_store.find("stores.lock()").unwrap());
     }
+
+}
+
+#[cfg(test)]
+mod lmdb_page_preallocation_tests {
+    use super::*;
+
+    #[test]
+    fn page_capacity_is_bounded_by_item_byte_and_allocation_limits() {
+        assert_eq!(lmdb_page_capacity(4_096, 64 * 1024 * 1024), 4_096);
+        assert_eq!(lmdb_page_capacity(25, 64 * 1024 * 1024), 25);
+        assert_eq!(lmdb_page_capacity(4_096, 2), 2);
+        assert_eq!(lmdb_page_capacity(usize::MAX, usize::MAX), 4_096);
+        assert_eq!(lmdb_page_capacity(4_096, 0), 0);
+    }
 }
 
 // ===========================================================================
@@ -964,6 +979,73 @@ mod lmdb_cache_tests {
     }
 
     #[test]
+    fn lmdb_store_reuses_an_exact_validated_path_without_more_filesystem_resolution() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let moved = dir.path().join("db-moved");
+        let path_string = path.to_str().unwrap().to_owned();
+
+        let first = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
+        std::fs::rename(&path, &moved).unwrap();
+        let second = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn lmdb_validated_path_cache_ignores_relative_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = lmdb_store(dir.path().to_str().unwrap(), 64 * 1024 * 1024).unwrap();
+        let relative = format!("relative-lmdb-path-{}", std::process::id());
+
+        remember_exact_lmdb_store(&relative, "unused-cache-key", &store).unwrap();
+
+        assert!(exact_lmdb_store(&relative, 64 * 1024 * 1024)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn lmdb_release_serializes_with_exact_path_lease_acquisition() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("release-race-db");
+        let path_string = path.to_str().unwrap().to_owned();
+        drop(lmdb_store(&path_string, 64 * 1024 * 1024).unwrap());
+
+        let (release_locked_tx, release_locked_rx) = mpsc::channel();
+        let (continue_release_tx, continue_release_rx) = mpsc::channel();
+        let release_path = path_string.clone();
+        let release = thread::spawn(move || {
+            release_lmdb_store_with_hook(&release_path, || {
+                release_locked_tx.send(()).unwrap();
+                continue_release_rx.recv().unwrap();
+            })
+            .unwrap()
+        });
+
+        release_locked_rx.recv().unwrap();
+        let (acquire_started_tx, acquire_started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let acquire_path = path_string.clone();
+        let acquire = thread::spawn(move || {
+            acquire_started_tx.send(()).unwrap();
+            let acquired = exact_lmdb_store(&acquire_path, 64 * 1024 * 1024).unwrap();
+            acquired_tx.send(acquired.is_some()).unwrap();
+        });
+
+        acquire_started_rx.recv().unwrap();
+        assert!(acquired_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+
+        continue_release_tx.send(()).unwrap();
+        assert_eq!(release.join().unwrap(), LmdbCacheRelease::Released(1));
+        assert!(!acquired_rx.recv().unwrap());
+        acquire.join().unwrap();
+    }
+
+    #[test]
     fn lmdb_release_waits_for_an_acquired_store_lease() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("leased-db");
@@ -1011,5 +1093,54 @@ mod lmdb_cache_tests {
         let reopened = lmdb_store(&path_string, 64 * 1024 * 1024).unwrap();
         let rtxn = reopened.env.read_txn().unwrap();
         assert_eq!(reopened.db.get(&rtxn, b"key").unwrap(), Some(b"value".as_slice()));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_storage_mode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_storage_mode_repairs_only_non_private_files() {
+        assert!(!private_storage_mode_needs_repair(0o600));
+        assert!(private_storage_mode_needs_repair(0o644));
+        assert!(private_storage_mode_needs_repair(0o700));
+        assert!(private_storage_mode_needs_repair(0o4600));
+    }
+
+    #[test]
+    fn newly_created_bitcask_and_probabilistic_files_are_owner_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let append_path = dir.path().join("data.log");
+        let sidecar_path = dir.path().join("filter.bloom");
+
+        drop(open_append_nofollow(&append_path).unwrap());
+        drop(create_truncate_nofollow(&sidecar_path).unwrap());
+
+        for path in [append_path, sidecar_path] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let existing_path = dir.path().join("existing.log");
+        std::fs::write(&existing_path, b"existing").unwrap();
+        std::fs::set_permissions(&existing_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_append_nofollow(&existing_path).unwrap());
+        let mode = std::fs::metadata(existing_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
+#[cfg(test)]
+mod page_cache_policy_tests {
+    use super::*;
+
+    #[test]
+    fn dontneed_requires_an_explicit_nonempty_record_range() {
+        assert_eq!(bounded_dontneed_range(0, 0), None);
+        assert_eq!(bounded_dontneed_range(64, 0), None);
+        assert_eq!(bounded_dontneed_range(-1, 64), None);
+        assert_eq!(bounded_dontneed_range(64, 128), Some((64, 128)));
     }
 }

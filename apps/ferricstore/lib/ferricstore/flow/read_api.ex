@@ -31,6 +31,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, state} <- flow_state(opts),
          {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, scan_limit} <- query_scan_limit(opts),
          {:ok, attributes} <- Attributes.from_opts(opts),
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
@@ -47,7 +48,8 @@ defmodule Ferricstore.Flow.ReadAPI do
              attributes,
              include_cold?,
              consistent_projection?,
-             query
+             query,
+             scan_limit
            ) do
       {:ok, maybe_project_meta(records, opts)}
     end
@@ -67,6 +69,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, state} <- optional_search_state(opts),
          {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, scan_limit} <- query_scan_limit(opts),
          {:ok, attributes} <- Attributes.from_opts(opts),
          {:ok, state_meta} <- StateMeta.query_from_opts(opts),
          :ok <- validate_search_filters(attributes, state_meta),
@@ -93,7 +96,8 @@ defmodule Ferricstore.Flow.ReadAPI do
              attributes,
              state_meta,
              query,
-             consistent_projection?
+             consistent_projection?,
+             scan_limit
            ) do
       {:ok,
        records
@@ -183,15 +187,27 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, state} <- flow_terminal_state(opts),
          {:ok, partition_key} <- optional_auto_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, scan_limit} <- query_scan_limit(opts),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
          {:ok, rev?} <- optional_boolean(opts, :rev, false),
          {:ok, from_ms} <- optional_non_neg_integer(opts, :from_ms, nil),
          {:ok, to_ms} <- optional_non_neg_integer(opts, :to_ms, nil),
+         {:ok, after_id} <- optional_after_id(opts),
+         {:ok, before_id} <- optional_before_id(opts),
          :ok <- validate_ms_range(from_ms, to_ms),
+         :ok <- validate_after_id_cursor(after_id, from_ms, rev?),
+         :ok <- validate_before_id_cursor(before_id, to_ms, rev?),
+         :ok <- validate_single_id_cursor(after_id, before_id),
          {:ok, ctx, partition_key, _metadata} <-
            ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
-         query = %{from_ms: from_ms, to_ms: to_ms, rev?: rev?},
+         query = %{
+           from_ms: from_ms,
+           to_ms: to_ms,
+           rev?: rev?,
+           after_id: after_id,
+           before_id: before_id
+         },
          {:ok, records} <-
            RecordRead.terminal_records(
              ctx,
@@ -203,7 +219,7 @@ defmodule Ferricstore.Flow.ReadAPI do
              consistent_projection?,
              query,
              @terminal_states,
-             @default_lmdb_query_scan_limit
+             scan_limit
            ) do
       {:ok,
        records
@@ -239,6 +255,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          :ok <- validate_id(parent_flow_id),
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, scan_limit} <- query_scan_limit(opts),
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
@@ -255,7 +272,8 @@ defmodule Ferricstore.Flow.ReadAPI do
              fn record ->
                Map.get(record, :parent_flow_id) == parent_flow_id and
                  IndexQuery.record_matches?(record, query, @terminal_states)
-             end
+             end,
+             scan_limit
            ) do
       result =
         RecordRead.filter_index_records(
@@ -283,6 +301,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          :ok <- validate_id(root_flow_id),
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, scan_limit} <- query_scan_limit(opts),
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
@@ -299,7 +318,8 @@ defmodule Ferricstore.Flow.ReadAPI do
              fn record ->
                Map.get(record, :root_flow_id) == root_flow_id and
                  IndexQuery.record_matches?(record, query, @terminal_states)
-             end
+             end,
+             scan_limit
            ),
          {:ok, root_record} <- RecordRead.root_record(ctx, root_flow_id, partition_key) do
       records =
@@ -333,6 +353,7 @@ defmodule Ferricstore.Flow.ReadAPI do
          :ok <- validate_id(correlation_id),
          {:ok, partition_key} <- optional_partition_key(opts),
          {:ok, count} <- flow_count(opts),
+         {:ok, scan_limit} <- query_scan_limit(opts),
          {:ok, query} <- flow_index_query_opts(opts, count),
          {:ok, include_cold?} <- optional_boolean(opts, :include_cold, false),
          {:ok, consistent_projection?} <- optional_boolean(opts, :consistent_projection, false),
@@ -349,7 +370,8 @@ defmodule Ferricstore.Flow.ReadAPI do
              fn record ->
                Map.get(record, :correlation_id) == correlation_id and
                  IndexQuery.record_matches?(record, query, @terminal_states)
-             end
+             end,
+             scan_limit
            ) do
       result =
         RecordRead.filter_index_records(
@@ -379,10 +401,12 @@ defmodule Ferricstore.Flow.ReadAPI do
          {:ok, count} <- flow_count(opts),
          {:ok, older_than_ms} <- optional_non_neg_integer(opts, :older_than_ms, 0),
          {:ok, now_ms} <- optional_non_neg_integer(opts, :now_ms, CommandTime.now_ms()),
+         {:ok, rev?} <- optional_boolean(opts, :rev, false),
          cutoff = now_ms - older_than_ms,
          {:ok, ctx, partition_key, _metadata} <-
            ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
-         {:ok, records} <- RecordRead.stuck_records(ctx, type, partition_key, cutoff, count) do
+         {:ok, records} <-
+           RecordRead.stuck_records(ctx, type, partition_key, cutoff, count, rev?) do
       {:ok, Enum.map(records, &RecordProjection.public/1)}
     end
   end
@@ -391,6 +415,58 @@ defmodule Ferricstore.Flow.ReadAPI do
     do: {:error, "ERR flow type must be a non-empty string"}
 
   def stuck(_ctx, _type, _opts), do: {:error, "ERR flow opts must be a keyword list"}
+
+  @doc false
+  @spec stuck_between(
+          map(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          pos_integer(),
+          boolean(),
+          {non_neg_integer(), binary()} | nil
+        ) :: {:ok, [map()]} | {:error, binary()}
+  def stuck_between(ctx, type, partition_key, from_ms, to_ms, count, reverse?, boundary \\ nil)
+
+  def stuck_between(ctx, type, partition_key, from_ms, to_ms, count, reverse?, boundary)
+      when is_binary(type) and is_binary(partition_key) and is_integer(from_ms) and
+             from_ms >= 0 and from_ms <= @max_exact_integer and is_integer(to_ms) and
+             to_ms >= from_ms and to_ms <= @max_exact_integer and is_integer(count) and
+             count > 0 and is_boolean(reverse?) and
+             (is_nil(boundary) or
+                (is_tuple(boundary) and tuple_size(boundary) == 2 and
+                   is_integer(elem(boundary, 0)) and elem(boundary, 0) >= 0 and
+                   is_binary(elem(boundary, 1)) and elem(boundary, 1) != "")) do
+    with :ok <- validate_type(type),
+         {:ok, ctx, partition_key, _metadata} <-
+           ScopeBinding.bind_read_partition_selector(ctx, :runs, partition_key),
+         {:ok, records} <-
+           RecordRead.stuck_records_between(
+             ctx,
+             type,
+             partition_key,
+             from_ms,
+             to_ms,
+             count,
+             reverse?,
+             boundary
+           ) do
+      {:ok, Enum.map(records, &RecordProjection.public/1)}
+    end
+  end
+
+  def stuck_between(
+        _ctx,
+        _type,
+        _partition_key,
+        _from_ms,
+        _to_ms,
+        _count,
+        _reverse?,
+        _boundary
+      ),
+      do: {:error, "ERR invalid flow stuck range"}
 
   def stats(ctx, type, opts \\ [])
 
@@ -632,7 +708,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          attributes,
          include_cold?,
          consistent_projection?,
-         query
+         query,
+         scan_limit
        )
        when map_size(attributes) == 0 do
     if state == "any" do
@@ -648,7 +725,7 @@ defmodule Ferricstore.Flow.ReadAPI do
         include_cold? or consistent_projection?,
         consistent_projection?,
         @terminal_states,
-        @default_lmdb_query_scan_limit
+        scan_limit
       )
     end
   end
@@ -662,7 +739,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          attributes,
          _include_cold?,
          consistent_projection?,
-         query
+         query,
+         scan_limit
        ) do
     with {:ok, {name, value}} <-
            select_attribute_filter(
@@ -688,7 +766,8 @@ defmodule Ferricstore.Flow.ReadAPI do
                  (state == "any" or Map.get(record, :state) == state) and
                  IndexQuery.record_matches?(record, query, @terminal_states) and
                  Attributes.matches?(record, attributes)
-             end
+             end,
+             scan_limit
            ) do
       {:ok,
        records
@@ -767,7 +846,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          value,
          query,
          consistent_projection?,
-         match_fun
+         match_fun,
+         scan_limit
        ) do
     RecordQuery.bounded_auto_partition_filtered_records(
       ScopeBinding.auto_partition_keys(ctx),
@@ -785,7 +865,7 @@ defmodule Ferricstore.Flow.ReadAPI do
             %{query | count: fetch_count},
             true,
             consistent_projection?,
-            scan_budget,
+            min(scan_budget, scan_limit),
             match_fun
           )
         end
@@ -802,7 +882,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          value,
          query,
          consistent_projection?,
-         match_fun
+         match_fun,
+         scan_limit
        ) do
     value = Attributes.index_value(value)
     index_key = attribute_index_key(type, state, name, value, partition_key)
@@ -815,7 +896,7 @@ defmodule Ferricstore.Flow.ReadAPI do
         query,
         true,
         consistent_projection?,
-        @default_lmdb_query_scan_limit,
+        scan_limit,
         match_fun
       )
     end
@@ -828,7 +909,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          include_cold?,
          consistent?,
          index_key_fun,
-         match_fun
+         match_fun,
+         scan_limit
        ) do
     RecordQuery.bounded_auto_partition_filtered_records(
       ScopeBinding.auto_partition_keys(ctx),
@@ -845,7 +927,7 @@ defmodule Ferricstore.Flow.ReadAPI do
             %{query | count: fetch_count},
             include_cold?,
             consistent?,
-            scan_budget,
+            min(scan_budget, scan_limit),
             match_fun
           )
         end
@@ -860,7 +942,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          include_cold?,
          consistent?,
          index_key_fun,
-         match_fun
+         match_fun,
+         scan_limit
        ) do
     index_key = index_key_fun.(partition_key)
 
@@ -872,7 +955,7 @@ defmodule Ferricstore.Flow.ReadAPI do
         query,
         include_cold?,
         consistent?,
-        @default_lmdb_query_scan_limit,
+        scan_limit,
         match_fun
       )
     end
@@ -970,7 +1053,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          attributes,
          state_meta,
          query,
-         consistent_projection?
+         consistent_projection?,
+         scan_limit
        )
        when map_size(state_meta) > 0 do
     with {:ok, {meta_state, name, value}} <-
@@ -990,7 +1074,8 @@ defmodule Ferricstore.Flow.ReadAPI do
             IndexQuery.record_matches?(record, query, @terminal_states) and
             Attributes.matches?(record, attributes) and
             StateMeta.matches?(record, state_meta)
-        end
+        end,
+        scan_limit
       )
     end
   end
@@ -1003,7 +1088,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          attributes,
          _state_meta,
          query,
-         consistent_projection?
+         consistent_projection?,
+         scan_limit
        ) do
     with {:ok, {name, value}} <-
            select_attribute_filter(
@@ -1028,7 +1114,8 @@ defmodule Ferricstore.Flow.ReadAPI do
             (is_nil(state) or Map.get(record, :state) == state) and
             IndexQuery.record_matches?(record, query, @terminal_states) and
             Attributes.matches?(record, attributes)
-        end
+        end,
+        scan_limit
       )
     end
   end
@@ -1221,7 +1308,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          value,
          query,
          consistent_projection?,
-         match_fun
+         match_fun,
+         scan_limit
        ) do
     RecordQuery.bounded_auto_partition_filtered_records(
       ScopeBinding.auto_partition_keys(ctx),
@@ -1241,7 +1329,7 @@ defmodule Ferricstore.Flow.ReadAPI do
             %{query | count: fetch_count},
             true,
             consistent_projection?,
-            scan_budget,
+            min(scan_budget, scan_limit),
             match_fun
           )
         end
@@ -1258,7 +1346,8 @@ defmodule Ferricstore.Flow.ReadAPI do
          value,
          query,
          consistent_projection?,
-         match_fun
+         match_fun,
+         scan_limit
        ) do
     value = StateMeta.index_value(value)
     index_key = Keys.state_meta_index_key(type, meta_state, name, value, partition_key)
@@ -1271,7 +1360,7 @@ defmodule Ferricstore.Flow.ReadAPI do
         query,
         true,
         consistent_projection?,
-        @default_lmdb_query_scan_limit,
+        scan_limit,
         match_fun
       )
     end
@@ -1746,6 +1835,17 @@ defmodule Ferricstore.Flow.ReadAPI do
     if Keyword.keyword?(opts), do: :ok, else: {:error, "ERR flow opts must be a keyword list"}
   end
 
+  defp query_scan_limit(opts) do
+    case Keyword.get(opts, :query_scan_limit, @default_lmdb_query_scan_limit) do
+      value
+      when is_integer(value) and value > 0 and value <= @default_lmdb_query_scan_limit ->
+        {:ok, value}
+
+      _invalid ->
+        {:error, "ERR flow query scan limit is invalid"}
+    end
+  end
+
   defp validate_id(id) when is_binary(id) and id != "", do: :ok
   defp validate_id(_id), do: {:error, "ERR flow id must be a non-empty string"}
 
@@ -1777,17 +1877,21 @@ defmodule Ferricstore.Flow.ReadAPI do
     with {:ok, from_ms} <- optional_non_neg_integer(opts, :from_ms, nil),
          {:ok, to_ms} <- optional_non_neg_integer(opts, :to_ms, nil),
          {:ok, rev?} <- optional_boolean(opts, :rev, false),
+         {:ok, after_id} <- optional_after_id(opts),
          {:ok, before_id} <- optional_before_id(opts),
          {:ok, state} <- optional_binary_or_nil(opts, :state, nil),
          {:ok, terminal_only?} <- optional_boolean(opts, :terminal_only, false),
          :ok <- validate_ms_range(from_ms, to_ms),
-         :ok <- validate_before_id_cursor(before_id, to_ms, rev?) do
+         :ok <- validate_after_id_cursor(after_id, from_ms, rev?),
+         :ok <- validate_before_id_cursor(before_id, to_ms, rev?),
+         :ok <- validate_single_id_cursor(after_id, before_id) do
       {:ok,
        %{
          count: count,
          from_ms: from_ms,
          to_ms: to_ms,
          rev?: rev?,
+         after_id: after_id,
          before_id: before_id,
          state: state,
          terminal_only?: terminal_only?
@@ -1863,6 +1967,16 @@ defmodule Ferricstore.Flow.ReadAPI do
     end
   end
 
+  defp optional_after_id(opts) do
+    case Keyword.fetch(opts, :after_id) do
+      :error -> {:ok, nil}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, value} when is_binary(value) and value != "" -> {:ok, value}
+      {:ok, ""} -> {:error, "ERR flow after_id must be a non-empty string"}
+      {:ok, _value} -> {:error, "ERR flow after_id must be a string"}
+    end
+  end
+
   defp optional_before_id(opts) do
     case Keyword.fetch(opts, :before_id) do
       :error -> {:ok, nil}
@@ -1873,11 +1987,23 @@ defmodule Ferricstore.Flow.ReadAPI do
     end
   end
 
+  defp validate_after_id_cursor(nil, _from_ms, _rev?), do: :ok
+  defp validate_after_id_cursor(_after_id, from_ms, false) when is_integer(from_ms), do: :ok
+
+  defp validate_after_id_cursor(_after_id, _from_ms, _rev?),
+    do: {:error, "ERR flow after_id requires rev: false and from_ms"}
+
   defp validate_before_id_cursor(nil, _to_ms, _rev?), do: :ok
   defp validate_before_id_cursor(_before_id, to_ms, true) when is_integer(to_ms), do: :ok
 
   defp validate_before_id_cursor(_before_id, _to_ms, _rev?),
     do: {:error, "ERR flow before_id requires rev: true and to_ms"}
+
+  defp validate_single_id_cursor(nil, _before_id), do: :ok
+  defp validate_single_id_cursor(_after_id, nil), do: :ok
+
+  defp validate_single_id_cursor(_after_id, _before_id),
+    do: {:error, "ERR flow after_id and before_id are mutually exclusive"}
 
   defp optional_boolean(opts, key, default) do
     case Keyword.get(opts, key, default) do

@@ -556,21 +556,60 @@ fn fs_hard_link_replace_sync_nofollow(
 
 #[cfg(unix)]
 fn hard_link_replace_sync_nofollow(source: &Path, dest: &Path) -> io::Result<()> {
+    hard_link_replace_sync_nofollow_with_hook(source, dest, || {})
+}
+
+#[cfg(unix)]
+fn hard_link_replace_sync_nofollow_with_hook(
+    source: &Path,
+    dest: &Path,
+    after_parent_open: impl FnOnce(),
+) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let source_file = crate::open_random_read_locked(source)?;
     let source_metadata = source_file.metadata()?;
-    let parent = dest
+    let source_parent = source
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name = dest
+    let destination_parent = dest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let source_name = source
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let destination_name = dest
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let source_name = CString::new(source_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
+    let destination_name = CString::new(destination_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
+    let source_directory = crate::path_open::open_directory_nofollow(source_parent)?;
+    let destination_directory = crate::path_open::open_directory_nofollow(destination_parent)?;
 
-    let temp_path = create_hard_link_temp(source, parent, file_name)?;
+    after_parent_open();
+
+    let temp_name = create_hard_link_temp_at(
+        &source_directory,
+        &source_name,
+        &destination_directory,
+        destination_name.as_c_str(),
+    )?;
     let result = (|| {
-        let linked_file = crate::open_random_read(&temp_path)?;
+        let linked_fd = unsafe {
+            libc::openat(
+                destination_directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if linked_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let linked_file = unsafe { std::fs::File::from_raw_fd(linked_fd) };
         let linked_metadata = linked_file.metadata()?;
         if source_metadata.dev() != linked_metadata.dev()
             || source_metadata.ino() != linked_metadata.ino()
@@ -581,35 +620,59 @@ fn hard_link_replace_sync_nofollow(source: &Path, dest: &Path) -> io::Result<()>
             ));
         }
 
-        crate::path_open::rename_nofollow(&temp_path, dest)?;
-        sync_directory_nofollow(parent)
+        let rename_result = unsafe {
+            libc::renameat(
+                destination_directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                destination_directory.as_raw_fd(),
+                destination_name.as_ptr(),
+            )
+        };
+        if rename_result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        destination_directory.sync_all()
     })();
 
     if result.is_err() {
-        let _ = crate::path_open::remove_file_nofollow(&temp_path);
+        let _ = unsafe { libc::unlinkat(destination_directory.as_raw_fd(), temp_name.as_ptr(), 0) };
     }
     result
 }
 
 #[cfg(unix)]
-fn create_hard_link_temp(
-    source: &Path,
-    parent: &Path,
-    file_name: &std::ffi::OsStr,
-) -> io::Result<std::path::PathBuf> {
+fn create_hard_link_temp_at(
+    source_directory: &std::fs::File,
+    source_name: &CString,
+    destination_directory: &std::fs::File,
+    destination_name: &std::ffi::CStr,
+) -> io::Result<CString> {
     for _ in 0..128 {
         let sequence = ATOMIC_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp_name = format!(
             ".{}.ferric-link-{}-{sequence}",
-            file_name.to_string_lossy(),
+            destination_name.to_string_lossy(),
             std::process::id()
         );
-        let temp_path = parent.join(temp_name);
+        let temp_name = CString::new(temp_name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
+        let link_result = unsafe {
+            libc::linkat(
+                source_directory.as_raw_fd(),
+                source_name.as_ptr(),
+                destination_directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                0,
+            )
+        };
 
-        match std::fs::hard_link(source, &temp_path) {
-            Ok(()) => return Ok(temp_path),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
+        if link_result == 0 {
+            return Ok(temp_name);
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
         }
     }
 
@@ -1056,6 +1119,36 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_replace_cannot_escape_when_destination_parent_is_swapped() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        let destination_parent = dir.path().join("destination");
+        let moved_parent = dir.path().join("destination-moved");
+        let outside = dir.path().join("outside");
+        fs::write(&source, b"sidecar").unwrap();
+        fs::create_dir(&destination_parent).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let destination = destination_parent.join("published");
+
+        hard_link_replace_sync_nofollow_with_hook(&source, &destination, || {
+            fs::rename(&destination_parent, &moved_parent).unwrap();
+            symlink(&outside, &destination_parent).unwrap();
+        })
+        .unwrap();
+
+        assert!(!outside.join("published").exists());
+        let published = moved_parent.join("published");
+        assert_eq!(fs::read(&published).unwrap(), b"sidecar");
+        assert_eq!(
+            fs::metadata(source).unwrap().ino(),
+            fs::metadata(published).unwrap().ino()
+        );
+    }
 
     // -----------------------------------------------------------------------
     // encode_error / encode_error_owned: error kind mapping

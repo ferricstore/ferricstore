@@ -32,7 +32,14 @@ defmodule Ferricstore.Store.Router.Part01 do
       alias Ferricstore.Store.Router
       alias Ferricstore.Store.SlotMap
       alias Ferricstore.Store.TypeRegistry
-      alias Ferricstore.Store.Shard.{CompoundMemberIndex, ETS, LogicalKeyIndex, ZSetIndex}
+
+      alias Ferricstore.Store.Shard.{
+        CompoundMemberIndex,
+        ETS,
+        LogicalKeyIndex,
+        NamespaceUsageIndex,
+        ZSetIndex
+      }
 
       defguardp valid_cold_file_ref(file_id, value_size)
                 when is_integer(file_id) and file_id >= 0 and is_integer(value_size) and
@@ -133,12 +140,7 @@ defmodule Ferricstore.Store.Router.Part01 do
 
           read_result =
             if selected_waraft_ctx?(ctx) do
-              {:ok, values} = do_batch_get_from_shard(ctx, idx, keys, :unlimited)
-
-              case ReadResult.first_failure(values) do
-                nil -> {:ok, values}
-                failure -> failure
-              end
+              do_batch_get_from_shard(ctx, idx, keys, :unlimited)
             else
               safe_read_call(
                 ctx,
@@ -148,19 +150,7 @@ defmodule Ferricstore.Store.Router.Part01 do
               )
             end
 
-          case read_result do
-            {:ok, values} when is_list(values) and length(values) == length(keys) ->
-              {:ok, values}
-
-            {:error, {:storage_read_failed, _reason}} = failure ->
-              failure
-
-            :unavailable ->
-              :unavailable
-
-            _invalid ->
-              {:error, "ERR invalid shard batch read response"}
-          end
+          normalize_shard_batch_read_result(read_result, length(keys))
         else
           {:error, "ERR invalid shard batch read request"}
         end
@@ -168,6 +158,64 @@ defmodule Ferricstore.Store.Router.Part01 do
 
       def read_shard_values(_ctx, _idx, _keys),
         do: {:error, "ERR invalid shard batch read request"}
+
+      @doc false
+      def read_shard_entries(ctx, idx, keys)
+          when is_integer(idx) and idx >= 0 and is_list(keys) and
+                 length(keys) <= @shard_batch_read_max_keys do
+        if Enum.all?(keys, fn key ->
+             is_binary(key) and byte_size(key) <= @shard_batch_read_max_key_size
+           end) and
+             Enum.reduce(keys, 0, fn key, total -> total + byte_size(key) end) <=
+               @shard_batch_read_max_key_bytes do
+          deadline_ms = System.monotonic_time(:millisecond) + @shard_batch_read_deadline_ms
+
+          read_result =
+            if selected_waraft_ctx?(ctx) do
+              do_batch_get_entries_from_shard(ctx, idx, keys, :unlimited)
+            else
+              safe_read_call(
+                ctx,
+                idx,
+                {:get_many_entries, keys, deadline_ms},
+                @shard_batch_read_call_timeout_ms
+              )
+            end
+
+          normalize_shard_batch_read_result(read_result, length(keys))
+        else
+          {:error, "ERR invalid shard batch read request"}
+        end
+      end
+
+      def read_shard_entries(_ctx, _idx, _keys),
+        do: {:error, "ERR invalid shard batch read request"}
+
+      defp normalize_shard_batch_read_result({:ok, values}, expected_count)
+           when is_list(values) and length(values) == expected_count do
+        result =
+          Enum.reduce_while(values, :ok, fn
+            {:error, {:storage_read_failed, _reason}} = failure, _status ->
+              {:halt, failure}
+
+            :unavailable, :ok ->
+              {:cont, :unavailable}
+
+            _value, status ->
+              {:cont, status}
+          end)
+
+        case result do
+          :ok -> {:ok, values}
+          :unavailable -> :unavailable
+          {:error, {:storage_read_failed, _reason}} = failure -> failure
+        end
+      end
+
+      defp normalize_shard_batch_read_result(:unavailable, _expected_count), do: :unavailable
+
+      defp normalize_shard_batch_read_result(_invalid, _expected_count),
+        do: {:error, "ERR invalid shard batch read response"}
 
       defp safe_write_call(ctx, idx, request) do
         GenServer.call(resolve_shard(ctx, idx), {:standalone_barrier_write, request})
@@ -739,6 +787,10 @@ defmodule Ferricstore.Store.Router.Part01 do
       defp router_shard_ets_state(ctx, idx, keydir) do
         instance_name = Map.get(ctx, :name, :default)
         {logical_keys, logical_slots} = LogicalKeyIndex.table_names(instance_name, idx)
+
+        {namespace_usage, namespace_usage_expiry} =
+          NamespaceUsageIndex.table_names(instance_name, idx)
+
         {zset_index, zset_lookup} = ZSetIndex.table_names(instance_name, idx)
 
         %{
@@ -748,6 +800,8 @@ defmodule Ferricstore.Store.Router.Part01 do
           compound_member_index: CompoundMemberIndex.table_name(instance_name, idx),
           logical_key_index: logical_keys,
           logical_key_slots: logical_slots,
+          namespace_usage_index: namespace_usage,
+          namespace_usage_expiry: namespace_usage_expiry,
           zset_score_index: zset_index,
           zset_score_lookup: zset_lookup
         }

@@ -5,9 +5,31 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
 
   alias Ferricstore.Flow.Query.{
     CompositeBackfill,
+    CompositeCounter,
     CompositeIndex,
     IndexDefinition
   }
+
+  defmodule Provider do
+    @behaviour FerricStore.Flow.QueryIndexProvider
+
+    @impl true
+    def snapshot(%{test_pid: test_pid, definitions: definitions}, shard_index) do
+      send(test_pid, {:projection_snapshot, shard_index})
+
+      indexes =
+        Enum.map(definitions, fn definition ->
+          Ferricstore.Flow.Query.RegisteredIndex.new!(definition, :active)
+        end)
+
+      {:ok,
+       Ferricstore.Flow.Query.RegistrySnapshot.new!(%{
+         epoch: 1,
+         catalog_version: 1,
+         indexes: indexes
+       })}
+    end
+  end
 
   test "projects a bounded record page for every definition in one LMDB transaction" do
     data_dir =
@@ -37,12 +59,12 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
       projected_record("two", 2)
     ]
 
-    verify_values = fn _ctx, 0, keys ->
+    verify_entries = fn _ctx, 0, keys ->
       versions = Map.new(records, &{&1.state_key, &1.record.version})
 
       {:ok,
        Enum.map(keys, fn key ->
-         encoded_record(key, Map.fetch!(versions, key))
+         {encoded_record(key, Map.fetch!(versions, key)), 0}
        end)}
     end
 
@@ -54,7 +76,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
               written_bytes: written_bytes
             }} =
              CompositeBackfill.project_page(ctx, 0, records, definitions,
-               read_values_fun: verify_values
+               read_entries_fun: verify_entries
              )
 
     assert write_ops >= 6
@@ -75,9 +97,146 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
     end
   end
 
+  test "backfilling a new definition preserves existing index and counter projections" do
+    data_dir = tmp_data_dir("preserve-existing")
+    record = projected_record("one", 1)
+
+    existing =
+      IndexDefinition.new!(%{
+        id: "existing_by_state",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:state, :asc}],
+        count_prefixes: [2]
+      })
+
+    added =
+      IndexDefinition.new!(%{
+        id: "added_by_updated",
+        version: 1,
+        fields: [{:partition_key, :asc}, {:updated_at_ms, :desc}],
+        count_prefixes: [1]
+      })
+
+    ctx = %{
+      data_dir: data_dir,
+      shard_count: 1,
+      query_index_provider: Provider,
+      test_pid: self(),
+      definitions: [existing]
+    }
+
+    read_entries = fn _ctx, 0, [state_key] ->
+      {:ok, [{encoded_record(state_key, record.record.version), record.expire_at_ms}]}
+    end
+
+    assert {:ok, _metrics} =
+             CompositeBackfill.project_page(ctx, 0, [record], [existing],
+               read_entries_fun: read_entries
+             )
+
+    assert_received {:projection_snapshot, 0}
+    refute_received {:projection_snapshot, 0}
+
+    assert {:ok, [existing_entry]} =
+             CompositeIndex.entries(
+               existing,
+               record.record,
+               record.state_key,
+               record.expire_at_ms
+             )
+
+    path = lmdb_path(data_dir)
+    assert {:ok, _value} = LMDB.get(path, existing_entry.key)
+    assert {:ok, 1} = CompositeCounter.read(path, existing, nil, ["tenant-a", "failed"])
+
+    build_ctx = %{ctx | definitions: [existing, added]}
+
+    assert {:ok, _metrics} =
+             CompositeBackfill.project_page(build_ctx, 0, [record], [added],
+               read_entries_fun: read_entries
+             )
+
+    assert_received {:projection_snapshot, 0}
+    refute_received {:projection_snapshot, 0}
+
+    assert {:ok, [added_entry]} =
+             CompositeIndex.entries(added, record.record, record.state_key, record.expire_at_ms)
+
+    assert {:ok, _value} = LMDB.get(path, existing_entry.key)
+    assert {:ok, _value} = LMDB.get(path, added_entry.key)
+    assert {:ok, 1} = CompositeCounter.read(path, existing, nil, ["tenant-a", "failed"])
+    assert {:ok, 1} = CompositeCounter.read(path, added, nil, ["tenant-a"])
+
+    assert {:ok, %{keys: keys}} =
+             path
+             |> LMDB.get(CompositeIndex.reverse_key(record.state_key))
+             |> then(fn {:ok, blob} ->
+               CompositeIndex.decode_reverse_state(blob, record.state_key)
+             end)
+
+    assert Enum.sort(keys) == Enum.sort([existing_entry.key, added_entry.key])
+
+    tombstone = %{state_key: record.state_key, record: nil, expire_at_ms: 0}
+
+    assert {:ok, _metrics} =
+             CompositeBackfill.project_page(build_ctx, 0, [tombstone], [added],
+               read_entries_fun: fn _ctx, 0, [state_key]
+                                    when state_key == record.state_key ->
+                 {:ok, [nil]}
+               end
+             )
+
+    assert_received {:projection_snapshot, 0}
+    refute_received {:projection_snapshot, 0}
+
+    assert {:ok, _value} = LMDB.get(path, existing_entry.key)
+    assert :not_found = LMDB.get(path, added_entry.key)
+    assert {:ok, 1} = CompositeCounter.read(path, existing, nil, ["tenant-a", "failed"])
+    assert {:ok, 0} = CompositeCounter.read(path, added, nil, ["tenant-a"])
+
+    assert {:ok, %{keys: [preserved_key]}} =
+             path
+             |> LMDB.get(CompositeIndex.reverse_key(record.state_key))
+             |> then(fn {:ok, blob} ->
+               CompositeIndex.decode_reverse_state(blob, record.state_key)
+             end)
+
+    assert preserved_key == existing_entry.key
+  end
+
+  test "projects the benchmarked 64-record page and reuses existing reverse ownership" do
+    data_dir = tmp_data_dir("page-64")
+    ctx = %{data_dir: data_dir, shard_count: 1}
+    definition = definition()
+    records = Enum.map(1..64, &projected_record("record-#{&1}", &1))
+
+    read_entries = fn _ctx, 0, state_keys ->
+      versions = Map.new(records, &{&1.state_key, &1.record.version})
+
+      {:ok,
+       Enum.map(state_keys, fn state_key ->
+         {encoded_record(state_key, Map.fetch!(versions, state_key)), 0}
+       end)}
+    end
+
+    assert CompositeBackfill.max_page_records() == 64
+
+    for _pass <- 1..2 do
+      assert {:ok, %{projected_records: 64, written_entries: 64}} =
+               CompositeBackfill.project_page(ctx, 0, records, [definition],
+                 read_entries_fun: read_entries
+               )
+    end
+
+    assert {:ok, 64} =
+             LMDB.prefix_count(lmdb_path(data_dir), IndexDefinition.storage_prefix(definition))
+  end
+
   test "rejects an oversized page before allocating projection state" do
-    records = List.duplicate(projected_record("one", 1), 17)
-    assert {:error, :query_backfill_page_too_large} = CompositeBackfill.project_page(%{}, 0, records, [])
+    records = List.duplicate(projected_record("one", 1), 65)
+
+    assert {:error, :query_backfill_page_too_large} =
+             CompositeBackfill.project_page(%{}, 0, records, [])
   end
 
   test "retries and then removes a record deleted during backfill" do
@@ -88,7 +247,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
 
     assert {:error, :query_backfill_concurrent_change} =
              CompositeBackfill.project_page(ctx, 0, [stale], [definition],
-               read_values_fun: fn _ctx, 0, [state_key] when state_key == stale.state_key ->
+               read_entries_fun: fn _ctx, 0, [state_key] when state_key == stale.state_key ->
                  {:ok, [nil]}
                end
              )
@@ -107,13 +266,26 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
 
     assert {:ok, %{projected_records: 1, written_entries: 0}} =
              CompositeBackfill.project_page(ctx, 0, [tombstone], [definition],
-               read_values_fun: fn _ctx, 0, [state_key] when state_key == stale.state_key ->
+               read_entries_fun: fn _ctx, 0, [state_key] when state_key == stale.state_key ->
                  {:ok, [nil]}
                end
              )
 
     assert :not_found = LMDB.get(lmdb_path(data_dir), entry.key)
     assert :not_found = LMDB.get(lmdb_path(data_dir), CompositeIndex.reverse_key(stale.state_key))
+  end
+
+  test "detects an expiry-only concurrent change after projection" do
+    data_dir = tmp_data_dir("expiry-race")
+    ctx = %{data_dir: data_dir, shard_count: 1}
+    record = %{projected_record("expiring", 1) | expire_at_ms: 1_000}
+
+    assert {:error, :query_backfill_concurrent_change} =
+             CompositeBackfill.project_page(ctx, 0, [record], [definition()],
+               read_entries_fun: fn _ctx, 0, [state_key] when state_key == record.state_key ->
+                 {:ok, [{encoded_record(state_key, record.record.version), 2_000}]}
+               end
+             )
   end
 
   test "rejects a forged definition before writing its namespace" do
@@ -123,10 +295,11 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
 
     assert {:error, :invalid_query_backfill_definitions} =
              CompositeBackfill.project_page(ctx, 0, [projected_record("one", 1)], [forged],
-               read_values_fun: fn _ctx, 0, _keys -> {:ok, []} end
+               read_entries_fun: fn _ctx, 0, _keys -> {:ok, []} end
              )
 
-    assert {:ok, []} = LMDB.prefix_entries(lmdb_path(data_dir), IndexDefinition.global_storage_prefix(), 10)
+    assert {:ok, []} =
+             LMDB.prefix_entries(lmdb_path(data_dir), IndexDefinition.global_storage_prefix(), 10)
   end
 
   test "rejects aggregate projection operations above the bounded page budget" do
@@ -150,7 +323,9 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
     assert {:error, :query_backfill_projection_budget_exceeded} =
              CompositeBackfill.project_page(ctx, 0, records, definitions,
                max_operation_bytes: 10_000,
-               read_values_fun: fn _ctx, _shard, _keys -> flunk("write budget checked too late") end
+               read_entries_fun: fn _ctx, _shard, _keys ->
+                 flunk("write budget checked too late")
+               end
              )
 
     assert {:ok, []} =

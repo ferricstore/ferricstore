@@ -24,6 +24,10 @@ defmodule Ferricstore.Store.ListOps do
   @max_encoded_meta_bytes 128
 
   @doc false
+  @spec max_encoded_meta_bytes() :: pos_integer()
+  def max_encoded_meta_bytes, do: @max_encoded_meta_bytes
+
+  @doc false
   @spec read_operation?(term()) :: boolean()
   def read_operation?(:llen), do: true
   def read_operation?({:lrange, _start, _stop}), do: true
@@ -51,50 +55,38 @@ defmodule Ferricstore.Store.ListOps do
       {0, _, _} ->
         nil
 
-      {_len, _left, _right} = src_meta ->
-        with {:ok, sorted} <- sorted_elements(src_key, store),
+      {src_len, _left, _right} = src_meta ->
+        with {:ok, {pos, element, remaining_meta}} <-
+               lmove_source_window(src_key, store, src_meta, from_dir),
              dst_meta when not is_tuple(dst_meta) or tuple_size(dst_meta) == 3 <-
                lmove_destination_meta(src_key, dst_key, src_meta, store) do
-          if sorted == [] do
-            nil
+          if src_key == dst_key and (from_dir == to_dir or src_len == 1) do
+            element
           else
-            {pos, element} =
-              case from_dir do
-                :left -> hd(sorted)
-                :right -> List.last(sorted)
-              end
+            with :ok <-
+                   remove_lmove_source(
+                     src_key,
+                     store,
+                     pos,
+                     element,
+                     src_meta,
+                     remaining_meta
+                   ) do
+              effective_dst_meta = if src_key == dst_key, do: remaining_meta, else: dst_meta
 
-            remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
+              case push_moved_element(dst_key, store, element, effective_dst_meta, to_dir) do
+                :ok ->
+                  element
 
-            if src_key == dst_key and (from_dir == to_dir or remaining == []) do
-              element
-            else
-              with :ok <-
-                     remove_lmove_source(
-                       src_key,
-                       store,
-                       pos,
-                       element,
-                       src_meta,
-                       remaining
-                     ) do
-                effective_dst_meta =
-                  if src_key == dst_key, do: lmove_meta_from_elements(remaining), else: dst_meta
-
-                case push_moved_element(dst_key, store, element, effective_dst_meta, to_dir) do
-                  :ok ->
-                    element
-
-                  {:error, _} = error ->
-                    rollback_lmove_source_result(
-                      src_key,
-                      store,
-                      pos,
-                      element,
-                      src_meta,
-                      error
-                    )
-                end
+                {:error, _} = error ->
+                  rollback_lmove_source_result(
+                    src_key,
+                    store,
+                    pos,
+                    element,
+                    src_meta,
+                    error
+                  )
               end
             end
           end
@@ -108,7 +100,68 @@ defmodule Ferricstore.Store.ListOps do
   defp lmove_destination_meta(src_key, src_key, src_meta, _store), do: src_meta
   defp lmove_destination_meta(_src_key, dst_key, _src_meta, store), do: read_meta(dst_key, store)
 
-  defp remove_lmove_source(src_key, store, pos, _element, _src_meta, []) do
+  defp lmove_source_window(key, store, {len, left_pos, right_pos}, direction) do
+    if bounded_slice_supported?(store) do
+      start = if direction == :left, do: 0, else: max(len - 2, 0)
+      count = min(len, 2)
+
+      with {:ok, window} <- sorted_slice(key, store, start, count, len),
+           true <- length(window) == count do
+        lmove_window_result(window, len, left_pos, right_pos, direction)
+      else
+        false -> {:error, "ERR storage read failed"}
+        {:error, _reason} = error -> error
+      end
+    else
+      lmove_source_window_by_scan(key, store, direction)
+    end
+  end
+
+  defp lmove_window_result([{pos, element}], 1, _left_pos, _right_pos, _direction),
+    do: {:ok, {pos, element, nil}}
+
+  defp lmove_window_result(
+         [{pos, element}, {next_pos, _next_element}],
+         len,
+         _left_pos,
+         right_pos,
+         :left
+       ),
+       do: {:ok, {pos, element, {len - 1, pos_to_int(next_pos) - @position_step, right_pos}}}
+
+  defp lmove_window_result(
+         [{previous_pos, _previous_element}, {pos, element}],
+         len,
+         left_pos,
+         _right_pos,
+         :right
+       ),
+       do: {:ok, {pos, element, {len - 1, left_pos, pos_to_int(previous_pos) + @position_step}}}
+
+  defp lmove_window_result(_window, _len, _left_pos, _right_pos, _direction),
+    do: {:error, "ERR storage read failed"}
+
+  defp lmove_source_window_by_scan(key, store, direction) do
+    with {:ok, sorted} <- sorted_elements(key, store),
+         false <- sorted == [] do
+      {pos, element} = if direction == :left, do: hd(sorted), else: List.last(sorted)
+      remaining = Enum.reject(sorted, fn {candidate, _value} -> candidate == pos end)
+      {:ok, {pos, element, lmove_meta_from_elements(remaining)}}
+    else
+      true -> {:error, "ERR storage read failed"}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp bounded_slice_supported?(%FerricStore.Instance{}), do: true
+  defp bounded_slice_supported?(%Ferricstore.Store.LocalTxStore{}), do: true
+
+  defp bounded_slice_supported?(store) when is_map(store),
+    do: is_function(Map.get(store, :compound_scan_slice), 5)
+
+  defp bounded_slice_supported?(_store), do: false
+
+  defp remove_lmove_source(src_key, store, pos, _element, _src_meta, nil) do
     compound_keys = [
       CompoundKey.list_element(src_key, pos),
       CompoundKey.list_meta_key(src_key)
@@ -119,9 +172,9 @@ defmodule Ferricstore.Store.ListOps do
     |> write_result()
   end
 
-  defp remove_lmove_source(src_key, store, pos, element, src_meta, remaining) do
+  defp remove_lmove_source(src_key, store, pos, element, src_meta, remaining_meta) do
     with :ok <- delete_elements(src_key, store, [{pos, element}]) do
-      case write_meta(src_key, store, lmove_meta_from_elements(remaining)) do
+      case write_meta(src_key, store, remaining_meta) do
         :ok ->
           :ok
 

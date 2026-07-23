@@ -16,6 +16,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   alias FerricstoreServer.Native.Codec
   alias FerricstoreServer.Native.Commands
   alias FerricstoreServer.Native.Session
+  alias Ferricstore.AuditLog
   alias Ferricstore.Stats
   alias Ferricstore.Test.IsolatedInstance
 
@@ -33,8 +34,16 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_get 0x0101
   @op_mget 0x0104
   @op_set 0x0102
+  @op_mset 0x0105
+  @op_cas 0x0106
+  @op_lock 0x0107
+  @op_ratelimit_add 0x010A
+  @op_fetch_or_compute_result 0x010C
   @op_hset 0x0110
   @op_hgetall 0x0113
+  @op_lpush 0x0120
+  @op_sadd 0x0130
+  @op_zadd 0x0140
   @op_smembers 0x0132
   @op_ferricstore_metrics 0x030F
   @op_flow_create 0x0201
@@ -42,13 +51,9 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_flow_claim_due 0x0203
   @op_flow_history 0x020A
   @op_flow_value_put 0x020B
-  @op_flow_list 0x020E
   @op_flow_create_many 0x020F
   @op_flow_complete_many 0x0210
   @op_flow_reclaim 0x0215
-  @op_flow_by_parent 0x0219
-  @op_flow_by_root 0x021A
-  @op_flow_by_correlation 0x021B
   @op_flow_policy_set 0x021E
   @op_flow_spawn_children 0x0220
   @op_flow_start_and_claim 0x0223
@@ -58,8 +63,17 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_flow_schedule_delete 0x0227
   @op_flow_schedule_fire 0x022A
   @op_flow_stats 0x022D
-  @op_flow_search 0x0230
   @op_flow_query 0x0231
+  @retired_flow_collection_opcodes [
+    0x020E,
+    0x0217,
+    0x0218,
+    0x0219,
+    0x021A,
+    0x021B,
+    0x021D,
+    0x0230
+  ]
   @op_flow_approval_request 0x0246
   @op_flow_approval_get 0x0249
   @op_flow_circuit_open 0x024A
@@ -385,7 +399,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
       {:ok,
        %{
-         compact: is_map(ctx) and map_size(ctx) <= 3,
+         compact: is_struct(ctx, Ferricstore.Flow.Query.ExecutionContext),
          instance_name: instance_ctx.name,
          mode: request.mode,
          request_context: request_context
@@ -463,6 +477,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
       send(self(), {:query_resource_check, command, args, keys})
       Process.get(:query_resource_check_result, :ok)
     end
+
+    @impl true
+    def acquire_command(command, args, keys, opts) do
+      with :ok <- check_command(command, args, keys, opts), do: {:ok, nil}
+    end
+
+    @impl true
+    def release_command(_lease, _opts), do: :ok
   end
 
   defmodule AdvertisedQueryEngine do
@@ -474,7 +496,8 @@ defmodule FerricstoreServer.Native.CommandsTest do
     @impl true
     def capabilities do
       %{
-        query_contract: "enterprise.query/v1",
+        request_contract: "ferric.flow.query.request/v1",
+        result_contract: "enterprise.query.result/v1",
         explain_contract: "enterprise.explain/v1",
         capabilities: ["enterprise_query_v1"],
         language_versions: ["FQL1"],
@@ -546,7 +569,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert payload.response_codecs.compact_response_opcodes == %{
              "flow_claim_jobs_v1" => [0x0203],
-             "flow_record_list_v1" => [0x020E, 0x0217, 0x0218, 0x0219, 0x021A, 0x021B, 0x021D],
              "flow_record_v1" => [0x0202],
              "kv_get_v1" => [0x0101],
              "kv_mget_v1" => [0x0104, 0x020C],
@@ -560,8 +582,16 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "FLOW.RUN_STEPS_MANY" in schema_names(payload)
     assert "FLOW.SCHEDULE.CREATE" in schema_names(payload)
     assert "FLOW.ATTRIBUTES" in schema_names(payload)
-    assert "FLOW.SEARCH" in opcode_names(payload)
     assert "FLOW.QUERY" in opcode_names(payload)
+
+    for obsolete <- ~w(
+          FLOW.LIST FLOW.SEARCH FLOW.TERMINALS FLOW.FAILURES FLOW.STUCK
+          FLOW.BY_PARENT FLOW.BY_ROOT FLOW.BY_CORRELATION
+        ) do
+      refute obsolete in opcode_names(payload)
+      refute Map.has_key?(payload.schemas, obsolete)
+    end
+
     assert "FLOW.BUDGET.RESERVE" in opcode_names(payload)
     assert "GET" in opcode_names(payload)
     assert "SET" in opcode_names(payload)
@@ -581,13 +611,29 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "replace" in payload.schemas["FLOW.POLICY.SET"]["fields"]
 
     assert payload.flow_query == %{
-             query_contract: "ferric.flow.query/v1",
+             request_contract: "ferric.flow.query.request/v1",
+             result_contract: "ferric.flow.query.result/v1",
              explain_contract: "ferric.flow.explain/v1",
-             capabilities: ["flow_query_point_v1", "flow_query_history_v1"],
+             capabilities: [
+               "flow_query_v1",
+               "flow_explain_v1",
+               "flow_explain_analyze_v1",
+               "flow_composite_index_v1",
+               "flow_query_index_status_v1"
+             ],
              language_versions: ["FQL1"],
              shapes: [
                "runs_by_run_id_record",
                "runs_by_partition_and_run_id_record",
+               "runs_by_partition_predicates_ordered_records",
+               "runs_by_partition_type_state_ordered_records",
+               "runs_by_partition_type_terminals_ordered_records",
+               "runs_by_partition_metadata_ordered_records",
+               "runs_by_partition_type_running_lease_deadline_ordered_records",
+               "runs_by_partition_parent_ordered_records",
+               "runs_by_partition_root_ordered_records",
+               "runs_by_partition_correlation_ordered_records",
+               "runs_by_partition_predicates_count",
                "events_by_run_id_ordered_records"
              ]
            }
@@ -622,7 +668,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     for command <- [
           "FLOW.GET",
-          "FLOW.LIST",
           "FLOW.HISTORY",
           "FLOW.RETRY",
           "FLOW.FAIL",
@@ -630,6 +675,13 @@ defmodule FerricstoreServer.Native.CommandsTest do
           "FLOW.POLICY.GET"
         ] do
       assert Map.has_key?(payload.schemas, command)
+    end
+  end
+
+  test "retired Flow collection opcodes are rejected" do
+    for opcode <- @retired_flow_collection_opcodes do
+      assert {:bad_request, message, _state} = Commands.execute(opcode, %{}, state())
+      assert message =~ "unsupported opcode"
     end
   end
 
@@ -1330,76 +1382,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert claimed == []
   end
 
-  test "FLOW.SEARCH returns indexed records through COMMAND_EXEC and native opcode" do
-    suffix = System.unique_integer([:positive, :monotonic])
-    type = "native-search-#{suffix}"
-    id = "native:search:#{suffix}"
-    partition = "native:search:#{suffix}:partition"
-    marker = "marker-#{suffix}"
-    now = System.system_time(:millisecond)
-
-    assert {:ok, _policy} =
-             FerricStore.flow_policy_set(type,
-               indexed_attributes: ["search_marker"],
-               indexed_state_meta: "version"
-             )
-
-    assert :ok =
-             FerricStore.flow_create(id,
-               type: type,
-               state: "searchable",
-               partition_key: partition,
-               attributes: %{"search_marker" => marker},
-               state_meta: %{"version" => "1"},
-               idempotent: true,
-               run_at_ms: now,
-               now_ms: now
-             )
-
-    command_exec_payload = %{
-      "command" => "FLOW.SEARCH",
-      "args" => [
-        "TYPE",
-        type,
-        "STATE",
-        "searchable",
-        "ATTRIBUTE",
-        "search_marker",
-        marker,
-        "STATE_META",
-        "searchable",
-        "version",
-        "1",
-        "PARTITION",
-        partition,
-        "COUNT",
-        "10",
-        "CONSISTENT_PROJECTION",
-        "true"
-      ]
-    }
-
-    assert {:ok, command_records, _state} =
-             Commands.execute(@op_command_exec, command_exec_payload, state())
-
-    assert id in flow_record_ids(command_records)
-
-    native_payload = %{
-      "type" => type,
-      "state" => "searchable",
-      "partition_key" => partition,
-      "attributes" => %{"search_marker" => marker},
-      "state_meta" => %{"searchable" => %{"version" => "1"}},
-      "count" => 10,
-      "consistent_projection" => true
-    }
-
-    assert {:ok, native_records, _state} =
-             Commands.execute(@op_flow_search, native_payload, state())
-
-    assert id in flow_record_ids(native_records)
-  end
-
   test "FLOW.QUERY executes a parameterized run lookup through the point-read path" do
     suffix = System.unique_integer([:positive, :monotonic])
     id = "native-query-#{suffix}"
@@ -1416,7 +1398,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     query =
       "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
 
-    assert {:ok, native_record, _state} =
+    assert {:ok, native_response, _state} =
              Commands.execute(
                @op_flow_query,
                %{
@@ -1427,9 +1409,12 @@ defmodule FerricstoreServer.Native.CommandsTest do
                state()
              )
 
-    assert native_record.id == id
+    assert native_response.version == "ferric.flow.query.result/v1"
+    assert native_response.page == %{has_more: false, cursor: nil}
+    assert [%{id: ^id} = native_record] = native_response.records
+    assert native_record.partition_key == partition
 
-    assert {:ok, command_record, _state} =
+    assert {:ok, command_response, _state} =
              Commands.execute(
                @op_command_exec,
                %{
@@ -1439,7 +1424,9 @@ defmodule FerricstoreServer.Native.CommandsTest do
                state()
              )
 
-    assert command_record.id == id
+    assert command_response.version == "ferric.flow.query.result/v1"
+    assert command_response.page == %{has_more: false, cursor: nil}
+    assert command_response.records == native_response.records
   end
 
   test "FLOW.QUERY preserves partition isolation for identical run IDs" do
@@ -1471,7 +1458,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
           {partition_a, "partition-a", "ready"},
           {partition_b, "partition-b", "waiting"}
         ] do
-      assert {:ok, record, _state} =
+      assert {:ok, response, _state} =
                Commands.execute(
                  @op_flow_query,
                  %{
@@ -1482,12 +1469,20 @@ defmodule FerricstoreServer.Native.CommandsTest do
                  state()
                )
 
+      assert response.version == "ferric.flow.query.result/v1"
+      assert response.page == %{has_more: false, cursor: nil}
+      assert [record] = response.records
       assert record.partition_key == partition
       assert record.type == expected_type
       assert record.state == expected_state
     end
 
-    assert {:ok, nil, _state} =
+    assert {:ok,
+            %{
+              version: "ferric.flow.query.result/v1",
+              records: [],
+              page: %{has_more: false, cursor: nil}
+            }, _state} =
              Commands.execute(
                @op_flow_query,
                %{
@@ -1517,18 +1512,21 @@ defmodule FerricstoreServer.Native.CommandsTest do
     query =
       "from RUNS where RUN_ID = '#{escaped_id}' and PARTITION_KEY = '#{partition}' return record;"
 
-    assert {:ok, record, _state} =
+    assert {:ok, response, _state} =
              Commands.execute(
                @op_flow_query,
                %{"version" => "FQL1", "query" => query},
                state()
              )
 
+    assert response.version == "ferric.flow.query.result/v1"
+    assert response.page == %{has_more: false, cursor: nil}
+    assert [record] = response.records
     assert record.id == id
     assert record.partition_key == partition
   end
 
-  test "FLOW.QUERY record projection excludes worker tokens, value refs, and arbitrary metadata" do
+  test "FLOW.QUERY record projection includes query metadata but excludes operational secrets" do
     suffix = System.unique_integer([:positive, :monotonic])
     id = "native-query-redaction-#{suffix}"
     partition = "native-query-redaction-partition-#{suffix}"
@@ -1540,10 +1538,11 @@ defmodule FerricstoreServer.Native.CommandsTest do
                partition_key: partition,
                payload: "payload-secret",
                attributes: %{"sensitive" => "attribute-secret"},
+               state_meta: %{"risk" => "metadata-secret"},
                now_ms: 1_000
              )
 
-    assert {:ok, record, _state} =
+    assert {:ok, response, _state} =
              Commands.execute(
                @op_flow_query,
                %{
@@ -1555,9 +1554,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
                state()
              )
 
+    assert response.version == "ferric.flow.query.result/v1"
+    assert response.page == %{has_more: false, cursor: nil}
+    assert [record] = response.records
     assert record.id == id
     assert record.type == "native-query-redaction"
     assert record.state == "ready"
+    assert record.attributes == %{"sensitive" => "attribute-secret"}
+    assert record.state_meta == %{"ready" => %{"risk" => "metadata-secret"}}
 
     for field <- [
           :lease_token,
@@ -1567,8 +1571,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
           :result_ref,
           :error_ref,
           :value_refs,
-          :attributes,
-          :state_meta,
           :child_groups,
           :retention_ttl_ms,
           :parent_partition_key
@@ -1576,7 +1578,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
       refute Map.has_key?(record, field)
     end
 
-    refute inspect(record) =~ "secret"
+    refute inspect(record) =~ "payload-secret"
   end
 
   test "FLOW.QUERY EXPLAIN is deterministic and redacts predicate values" do
@@ -1602,35 +1604,31 @@ defmodule FerricstoreServer.Native.CommandsTest do
     second = explain.("secret-run-two")
 
     assert first == second
-    assert first.version == "ferric.flow.query.point-explain/v1"
+    assert first.version == "ferric.flow.explain/v1"
     assert first.status == "planned"
+    assert first.plan.path == "primary_key"
 
-    assert first.capabilities == %{
-             requested: [],
-             available: ["flow_query_point_v1"],
-             missing: []
+    assert first.plan.index == %{
+             logical_id: "flow_runs_primary_v1",
+             generation: 1,
+             build_id: "flow_runs_primary_v1"
            }
 
-    assert first.plan.path == "primary_key"
-    assert first.plan.index == "flow_runs_primary_v1"
     assert first.plan.fallback_reason == "none"
-    assert first.estimate.scan_records == 1
+    assert first.plan.order == "native"
+    assert first.plan.range_count == 0
+    assert first.estimate.scanned_entries == 1
+    assert first.estimate.hard_scanned_entries == 1
     assert first.estimate.result_records == 1
-    assert first.bounds == %{scan_records: 1, result_records: 1, groups: 0}
-    refute Map.has_key?(first.estimate, :response_bytes)
-    refute Map.has_key?(first, :quality)
-    refute Map.has_key?(first, :budgets)
-
-    assert first |> Map.keys() |> Enum.sort() ==
-             Enum.sort([
-               :version,
-               :query_fingerprint,
-               :status,
-               :capabilities,
-               :plan,
-               :estimate,
-               :bounds
-             ])
+    assert first.stats.source == "primary_key"
+    assert first.stats.confidence == "exact"
+    assert first.quality.exactness == "authoritative"
+    assert first.quality.coverage == "complete"
+    assert first.decision.reason == "authoritative_primary_key"
+    assert first.actual == nil
+    assert first.diagnostic == nil
+    assert first.alternatives == []
+    assert first.bounds.result_records == 100
 
     refute inspect(first) =~ "secret-run"
   end
@@ -1653,6 +1651,91 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
 
     assert shape_error["code"] == "unsupported_query_shape"
+    assert shape_error["position"] == %{"byte" => 11, "line" => 1, "column" => 11}
+    assert is_binary(shape_error["detail"])
+    assert is_binary(shape_error["hint"])
+  end
+
+  test "FLOW.QUERY returns positioned, actionable parser diagnostics" do
+    assert {:bad_request, syntax_error, _state} =
+             Commands.execute(
+               @op_flow_query,
+               %{"version" => "FQL1", "query" => "FROM runs\nWHERE @"},
+               state()
+             )
+
+    assert syntax_error["code"] == "invalid_syntax"
+    assert syntax_error["position"] == %{"byte" => 17, "line" => 2, "column" => 7}
+    assert is_binary(syntax_error["detail"])
+    assert is_binary(syntax_error["hint"])
+
+    query =
+      "FROM runs WHERE tenant_secret = 'value-secret' " <>
+        "ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS"
+
+    assert {:bad_request, field_error, _state} =
+             Commands.execute(
+               @op_flow_query,
+               %{"version" => "FQL1", "query" => query},
+               state()
+             )
+
+    assert field_error["code"] == "unsupported_field"
+    assert field_error["position"] == %{"byte" => 17, "line" => 1, "column" => 17}
+    assert "partition_key" in field_error["context"]["supported_fields"]
+    refute inspect(field_error) =~ "tenant_secret"
+    refute inspect(field_error) =~ "value-secret"
+
+    assert {:bad_request, command_exec_error, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "FLOW.QUERY", "args" => ["FQL1", "FROM runs\nWHERE @"]},
+               state()
+             )
+
+    assert command_exec_error["code"] == "invalid_syntax"
+    assert command_exec_error["position"] == %{"byte" => 17, "line" => 2, "column" => 7}
+    assert is_binary(command_exec_error["detail"])
+    assert is_binary(command_exec_error["hint"])
+  end
+
+  test "FLOW.QUERY and COMMAND_EXEC return identical structured diagnostics" do
+    queries = [
+      "FROM runs\nWHERE @",
+      "FROM missing_source WHERE run_id = 'run-secret' RETURN RECORD",
+      "FROM runs WHERE missing_field = 'value-secret' RETURN COUNT",
+      "FROM runs WHERE partition_key = 'tenant-secret' RETURN RECORDS",
+      "FROM runs WHERE partition_key = 'tenant-secret' RETURN COUNT;;"
+    ]
+
+    for query <- queries do
+      assert {direct_status, direct_error, _state} =
+               Commands.execute(
+                 @op_flow_query,
+                 %{"version" => "FQL1", "query" => query},
+                 state()
+               )
+
+      assert {exec_status, exec_error, _state} =
+               Commands.execute(
+                 @op_command_exec,
+                 %{"command" => "FLOW.QUERY", "args" => ["FQL1", query]},
+                 state()
+               )
+
+      assert direct_status == :bad_request
+      assert exec_status == direct_status
+      assert exec_error == direct_error
+      assert %{"code" => code, "position" => position} = direct_error
+      assert is_binary(code)
+      assert %{"byte" => byte, "line" => line, "column" => column} = position
+      assert byte > 0 and byte <= byte_size(query) + 1
+      assert line > 0
+      assert column > 0
+      refute inspect(direct_error) =~ "run-secret"
+      refute inspect(direct_error) =~ "value-secret"
+      refute inspect(direct_error) =~ "tenant-secret"
+    end
   end
 
   test "FLOW.QUERY rejects malformed envelopes before provider dispatch" do
@@ -1686,21 +1769,26 @@ defmodule FerricstoreServer.Native.CommandsTest do
       "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD"
 
     cases = [
-      {["FQL1", query, "partition"], "parameters must be name/value pairs"},
-      {["FQL1", query, "partition", "one", "partition", "two"], "parameter names must be unique"},
-      {["FQL1", query, "one", "1", "two", "2", "three", "3"], "unexpected parameter"}
+      {["FQL1", query, "partition"], {:message, "parameters must be name/value pairs"}},
+      {["FQL1", query, "partition", "one", "partition", "two"],
+       {:message, "parameter names must be unique"}},
+      {["FQL1", query, "one", "1", "two", "2", "three", "3"], {:code, "unexpected_parameter"}}
     ]
 
     for {args, expected} <- cases do
-      assert {:bad_request, message, _state} =
+      assert {:bad_request, error, _state} =
                Commands.execute(
                  @op_command_exec,
                  %{"command" => "FLOW.QUERY", "args" => args},
                  state()
                )
 
-      assert message =~ expected
-      refute message =~ "wrong number of arguments"
+      case expected do
+        {:message, fragment} -> assert error =~ fragment
+        {:code, code} -> assert error["code"] == code
+      end
+
+      refute inspect(error) =~ "wrong number of arguments"
     end
   end
 
@@ -1769,6 +1857,28 @@ defmodule FerricstoreServer.Native.CommandsTest do
              Commands.execute(
                @op_flow_query,
                %{"version" => "FQL1", "query" => query},
+               query_state
+             )
+  end
+
+  test "FLOW.QUERY preserves EXPLAIN ANALYZE mode on both native command paths" do
+    query =
+      "EXPLAIN ANALYZE FROM runs WHERE partition_key = 'tenant-a' " <>
+        "AND run_id = 'run-123' RETURN RECORD"
+
+    query_state = state_with_query_engine(ContextQueryEngine)
+
+    assert {:ok, %{mode: :analyze, request_context: %{}}, _state} =
+             Commands.execute(
+               @op_flow_query,
+               %{"version" => "FQL1", "query" => query},
+               query_state
+             )
+
+    assert {:ok, %{mode: :analyze, request_context: %{}}, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "FLOW.QUERY", "args" => ["FQL1", query]},
                query_state
              )
   end
@@ -2031,25 +2141,35 @@ defmodule FerricstoreServer.Native.CommandsTest do
     query =
       "FROM runs WHERE partition_key = 'missing' AND run_id = 'missing' RETURN RECORD"
 
-    assert {:ok, nil, query_state} =
+    assert {:ok,
+            %{
+              version: "ferric.flow.query.result/v1",
+              records: [],
+              page: %{has_more: false, cursor: nil}
+            }, query_state} =
              Commands.execute(
                @op_flow_query,
                %{"version" => "FQL1", "query" => query},
                state()
              )
 
-    assert_received {:query_resource_check, "FLOW.QUERY", [], ["*"]}
-    assert_received {:query_resource_activity, ["*"]}
+    assert_received {:query_resource_check, "FLOW.QUERY", [], ["missing"]}
+    assert_received {:query_resource_activity, ["missing"]}
 
-    assert {:ok, nil, _state} =
+    assert {:ok,
+            %{
+              version: "ferric.flow.query.result/v1",
+              records: [],
+              page: %{has_more: false, cursor: nil}
+            }, _state} =
              Commands.execute(
                @op_command_exec,
                %{"command" => "FLOW.QUERY", "args" => ["FQL1", query]},
                query_state
              )
 
-    assert_received {:query_resource_check, "FLOW.QUERY", [], ["*"]}
-    assert_received {:query_resource_activity, ["*"]}
+    assert_received {:query_resource_check, "FLOW.QUERY", [], ["missing"]}
+    assert_received {:query_resource_activity, ["missing"]}
   end
 
   test "COMMAND_EXEC FLOW.QUERY rejects resource-limit failures before provider dispatch" do
@@ -2077,9 +2197,56 @@ defmodule FerricstoreServer.Native.CommandsTest do
                state_with_query_engine(NotifyingQueryEngine)
              )
 
-    assert_received {:query_resource_check, "FLOW.QUERY", [], ["*"]}
+    assert_received {:query_resource_check, "FLOW.QUERY", [], ["missing"]}
     refute_received :query_engine_called
     refute_received {:query_resource_activity, _keys}
+  end
+
+  test "native write commands expose canonical mutation arguments to resource governance" do
+    previous = Application.get_env(:ferricstore, FerricStore.ResourceLimits)
+    Application.put_env(:ferricstore, FerricStore.ResourceLimits, QueryResourceLimits)
+    Process.put(:query_resource_check_result, {:error, :footprint_probe})
+
+    on_exit(fn ->
+      case previous do
+        nil ->
+          Application.delete_env(:ferricstore, FerricStore.ResourceLimits)
+
+        implementation ->
+          Application.put_env(:ferricstore, FerricStore.ResourceLimits, implementation)
+      end
+    end)
+
+    key = "native:quota:#{System.unique_integer([:positive])}"
+
+    cases = [
+      {@op_mset, %{"pairs" => [[key <> ":a", "one"], [key <> ":b", "two"]]}, "MSET",
+       [key <> ":a", "one", key <> ":b", "two"], [key <> ":a", key <> ":b"]},
+      {@op_cas, %{"key" => key, "expected" => "old", "value" => "new", "ttl" => 0}, "CAS",
+       [key, "old", "new", 0], [key]},
+      {@op_lock, %{"key" => key, "owner" => "worker", "ttl_ms" => 1_000}, "LOCK",
+       [key, "worker", 1_000], [key]},
+      {@op_ratelimit_add, %{"key" => key, "window_ms" => 1_000, "max" => 5, "count" => 2},
+       "RATELIMIT.ADD", [key, 1_000, 5, 2], [key]},
+      {@op_fetch_or_compute_result,
+       %{"key" => key, "token" => "token", "value" => "computed", "ttl_ms" => 1_000},
+       "FETCH_OR_COMPUTE_RESULT", [key, "token", "computed", 1_000], [key]},
+      {@op_hset, %{"key" => key, "fields" => %{"a" => "one", "b" => "two"}}, "HSET",
+       [key, "a", "one", "b", "two"], [key]},
+      {@op_lpush, %{"key" => key, "values" => ["one", "two"]}, "LPUSH", [key, "one", "two"],
+       [key]},
+      {@op_sadd, %{"key" => key, "members" => ["one", "two"]}, "SADD", [key, "one", "two"],
+       [key]},
+      {@op_zadd, %{"key" => key, "items" => [[1, "one"], [2.5, "two"]]}, "ZADD",
+       [key, "1.0", "one", "2.5", "two"], [key]}
+    ]
+
+    Enum.each(cases, fn {opcode, payload, command, args, keys} ->
+      assert {:error, "ERR quota footprint_probe", _state} =
+               Commands.execute(opcode, payload, state())
+
+      assert_receive {:query_resource_check, ^command, ^args, ^keys}
+    end)
   end
 
   test "COMMAND_EXEC delegates configured extension commands" do
@@ -2094,6 +2261,25 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert status == :ok
     assert payload == ["read", "tenant:1"]
+  end
+
+  test "COMMAND_EXEC exposes the intrinsic OSS query-index status contract" do
+    assert {:ok,
+            %{
+              "contract_version" => "ferric.flow.query.indexes/v1",
+              "indexes" => indexes,
+              "registry" => %{"catalog_version" => catalog_version},
+              "services" => %{"registry" => "ready"}
+            }, _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{"command" => "FLOW.QUERY.INDEXES", "args" => []},
+               state()
+             )
+
+    assert is_integer(catalog_version) and catalog_version > 0
+    assert is_list(indexes) and indexes != []
+    assert Enum.all?(indexes, &is_binary(&1["id"]))
   end
 
   test "COMMAND_EXEC ignores request context unless the native user is trusted" do
@@ -2127,7 +2313,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
           "request_context" => %{
             "subject" => "client-1",
             "tenant" => "t1",
-            "scopes" => ["tenant:t1:write", nil]
+            "scopes" => ["tenant:t1:write"]
           }
         },
         state()
@@ -2140,6 +2326,22 @@ defmodule FerricstoreServer.Native.CommandsTest do
              "tenant" => "t1",
              "scopes" => ["tenant:t1:write"]
            }
+  end
+
+  test "COMMAND_EXEC rejects malformed trusted request-context scopes" do
+    Application.put_env(:ferricstore, :command_extensions, [TestExtension])
+    Application.put_env(:ferricstore, :native_trusted_request_context_users, ["default"])
+
+    assert {:bad_request, "ERR native request_context contains invalid authority", _state} =
+             Commands.execute(
+               @op_command_exec,
+               %{
+                 "command" => "EXT.CONTEXT",
+                 "args" => [],
+                 "request_context" => %{"scopes" => ["tenant:t1:write", nil]}
+               },
+               state()
+             )
   end
 
   test "PIPELINE attaches top-level trusted request context to extension commands" do
@@ -2815,44 +3017,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
     refute status == :noperm
   end
 
-  test "FLOW.SEARCH enforces scoped key boundaries" do
-    put_platform_scoped_user("platform_scoped")
-    state = state_as("platform_scoped")
-
-    assert {:noperm, message, _state} =
-             Commands.execute(
-               @op_command_exec,
-               %{
-                 "command" => "FLOW.SEARCH",
-                 "args" => [
-                   "TYPE",
-                   "checkout",
-                   "ATTRIBUTE",
-                   "tenant",
-                   "acme",
-                   "PARTITION",
-                   "tenant:b"
-                 ]
-               },
-               state
-             )
-
-    assert message =~ "keys mentioned"
-
-    assert {:noperm, message, _state} =
-             Commands.execute(
-               @op_flow_search,
-               %{
-                 "type" => "checkout",
-                 "attributes" => %{"tenant" => "acme"},
-                 "partition_key" => "tenant:b"
-               },
-               state
-             )
-
-    assert message =~ "keys mentioned"
-  end
-
   test "FLOW.QUERY authorizes the bound partition for dedicated and command-exec paths" do
     put_platform_scoped_user("platform_scoped")
     state = state_as("platform_scoped")
@@ -2877,12 +3041,263 @@ defmodule FerricstoreServer.Native.CommandsTest do
     end
 
     for {opcode, payload} <- requests.("tenant:a:partition") do
-      assert {:ok, nil, _state} = Commands.execute(opcode, payload, state)
+      assert {:ok,
+              %{
+                version: "ferric.flow.query.result/v1",
+                records: [],
+                page: %{has_more: false, cursor: nil}
+              }, _state} = Commands.execute(opcode, payload, state)
     end
 
     for {opcode, payload} <- requests.("tenant:b:partition") do
       assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
       assert message =~ "keys mentioned"
+    end
+  end
+
+  test "FLOW.QUERY requires a separate ACL permission for static EXPLAIN" do
+    put_query_user("query-executor", ["+FLOW.QUERY"])
+    put_query_user("query-explainer", ["+FLOW.QUERY.EXPLAIN"])
+
+    execute_query =
+      "FROM runs WHERE partition_key = 'tenant:a:partition' AND run_id = 'run-123' RETURN RECORD"
+
+    explain_query = "EXPLAIN " <> execute_query
+
+    executor = state_with_query_engine_as(ContextQueryEngine, "query-executor")
+    explainer = state_with_query_engine_as(ContextQueryEngine, "query-explainer")
+
+    for {opcode, payload} <- flow_query_requests(execute_query) do
+      assert {:ok, %{mode: :execute}, _state} = Commands.execute(opcode, payload, executor)
+
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, explainer)
+      assert message =~ "flow.query"
+    end
+
+    for {opcode, payload} <- flow_query_requests(explain_query) do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, executor)
+      assert message =~ "flow.query.explain"
+
+      assert {:ok, %{mode: :explain}, _state} = Commands.execute(opcode, payload, explainer)
+    end
+
+    outside_scope =
+      "EXPLAIN FROM runs WHERE partition_key = 'tenant:b:partition' " <>
+        "AND run_id = 'run-123' RETURN RECORD"
+
+    for {opcode, payload} <- flow_query_requests(outside_scope) do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, explainer)
+      assert message =~ "keys mentioned"
+    end
+  end
+
+  test "FLOW.QUERY EXPLAIN ANALYZE requires execute and explain ACL permissions" do
+    put_query_user("analyze-executor", ["+FLOW.QUERY"])
+    put_query_user("analyze-explainer", ["+FLOW.QUERY.EXPLAIN"])
+
+    put_query_user("query-analyzer", [
+      "+FLOW.QUERY",
+      "+FLOW.QUERY.EXPLAIN"
+    ])
+
+    query =
+      "EXPLAIN ANALYZE FROM runs WHERE partition_key = 'tenant:a:partition' " <>
+        "AND run_id = 'run-123' RETURN RECORD"
+
+    executor = state_with_query_engine_as(ContextQueryEngine, "analyze-executor")
+    explainer = state_with_query_engine_as(ContextQueryEngine, "analyze-explainer")
+    analyzer = state_with_query_engine_as(ContextQueryEngine, "query-analyzer")
+
+    for {opcode, payload} <- flow_query_requests(query) do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, executor)
+      assert message =~ "flow.query.explain"
+
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, explainer)
+      assert message =~ "flow.query'"
+
+      assert {:ok, %{mode: :analyze}, _state} = Commands.execute(opcode, payload, analyzer)
+    end
+  end
+
+  test "FLOW.QUERY key denials use one audit command across native envelopes" do
+    previous_audit_enabled = Application.get_env(:ferricstore, :audit_log_enabled)
+    Application.put_env(:ferricstore, :audit_log_enabled, true)
+
+    on_exit(fn ->
+      case previous_audit_enabled do
+        nil -> Application.delete_env(:ferricstore, :audit_log_enabled)
+        value -> Application.put_env(:ferricstore, :audit_log_enabled, value)
+      end
+
+      AuditLog.reset()
+    end)
+
+    put_query_user("audit-query-explainer", ["+FLOW.QUERY.EXPLAIN"])
+    state = state_as("audit-query-explainer")
+
+    query =
+      "EXPLAIN FROM runs WHERE partition_key = 'tenant:b:partition' " <>
+        "AND run_id = 'run-123' RETURN RECORD"
+
+    commands =
+      for {opcode, payload} <- flow_query_requests(query) do
+        AuditLog.reset()
+        assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
+        assert message =~ "keys mentioned"
+        assert :pong = GenServer.call(AuditLog, :ping)
+        [{_, _, :command_denied, details}] = AuditLog.get()
+        details.command
+      end
+
+    AuditLog.reset()
+
+    assert {:ok, prepared} =
+             Session.prepare_command(%{
+               "command" => "FLOW.QUERY",
+               "args" => ["FQL1", query]
+             })
+
+    assert {:error, :noperm, message} = Session.authorize_command(prepared, state)
+    assert message =~ "keys mentioned"
+    assert :pong = GenServer.call(AuditLog, :ping)
+    [{_, _, :command_denied, details}] = AuditLog.get()
+
+    assert commands ++ [details.command] == ["FLOW.QUERY", "FLOW.QUERY", "FLOW.QUERY"]
+  end
+
+  test "native sessions use the same Flow query ACL mode contract" do
+    put_query_user("session-query-executor", ["+FLOW.QUERY"])
+    put_query_user("session-query-explainer", ["+FLOW.QUERY.EXPLAIN"])
+
+    put_query_user("session-query-analyzer", [
+      "+FLOW.QUERY",
+      "+FLOW.QUERY.EXPLAIN"
+    ])
+
+    query =
+      "FROM runs WHERE partition_key = 'tenant:a:partition' " <>
+        "AND run_id = 'run-123' RETURN RECORD"
+
+    assert {:ok, explain} =
+             Session.prepare_command(%{
+               "command" => "FLOW.QUERY",
+               "args" => ["FQL1", "EXPLAIN " <> query]
+             })
+
+    assert {:ok, analyze} =
+             Session.prepare_command(%{
+               "command" => "FLOW.QUERY",
+               "args" => ["FQL1", "EXPLAIN ANALYZE " <> query]
+             })
+
+    executor = state_as("session-query-executor")
+    explainer = state_as("session-query-explainer")
+    analyzer = state_as("session-query-analyzer")
+
+    assert {:error, :noperm, message} = Session.authorize_command(explain, executor)
+    assert message =~ "flow.query.explain"
+    assert :ok = Session.authorize_command(explain, explainer)
+
+    assert {:error, :noperm, message} = Session.authorize_command(analyze, executor)
+    assert message =~ "flow.query.explain"
+
+    assert {:error, :noperm, message} = Session.authorize_command(analyze, explainer)
+    assert message =~ "flow.query'"
+
+    assert :ok = Session.authorize_command(analyze, analyzer)
+  end
+
+  test "FLOW.QUERY denies users with neither mode permission before parsing" do
+    put_query_user("query-denied", ["+PING"])
+    denied = state_as("query-denied")
+
+    for {opcode, payload} <- flow_query_requests("EXPLAIN FROM") do
+      assert {:noperm, message, _state} = Commands.execute(opcode, payload, denied)
+      assert message =~ "flow.query"
+      refute message =~ "syntax"
+    end
+  end
+
+  test "native MULTI denies FLOW.QUERY before parsing for users without query permissions" do
+    put_query_user("transaction-query-denied", ["+MULTI", "+EXEC"])
+
+    assert {:ok, "OK", state} =
+             Session.execute(
+               %{"command" => "MULTI", "args" => []},
+               session_state_as("transaction-query-denied")
+             )
+
+    assert {:noperm, message, denied_state} =
+             Session.execute(
+               %{"command" => "FLOW.QUERY", "args" => ["FQL1", "EXPLAIN FROM"]},
+               state
+             )
+
+    assert message =~ "flow.query"
+    refute message =~ "syntax"
+    assert denied_state.multi_queue == []
+  end
+
+  test "PIPELINE does not preparse FLOW.QUERY without a query permission" do
+    put_query_user("pipeline-query-denied", ["+PIPELINE"])
+    state = state_as("pipeline-query-denied")
+    parent = self()
+
+    {:module, FerricstoreServer.Native.FQLParser} =
+      Code.ensure_loaded(FerricstoreServer.Native.FQLParser)
+
+    tracer =
+      spawn(fn ->
+        receive do
+          message -> send(parent, {:fql_parser_trace, message})
+        end
+      end)
+
+    :erlang.trace(self(), true, [:call, {:tracer, tracer}])
+
+    assert 1 ==
+             :erlang.trace_pattern(
+               {FerricstoreServer.Native.FQLParser, :parse_diagnostic, 1},
+               true,
+               []
+             )
+
+    try do
+      assert {:ok, [result], _state} =
+               Commands.execute(
+                 @op_pipeline,
+                 %{
+                   "commands" => [
+                     %{
+                       "opcode" => @op_command_exec,
+                       "body" => %{
+                         "command" => "FLOW.QUERY",
+                         "args" => [
+                           "FQL1",
+                           "FROM runs WHERE partition_key = 'tenant:a:partition' " <>
+                             "AND run_id = 'run-123' RETURN RECORD"
+                         ]
+                       }
+                     }
+                   ]
+                 },
+                 state
+               )
+
+      assert result["status"] == "noperm"
+
+      refute_receive {:fql_parser_trace,
+                      {:trace, _pid, :call,
+                       {FerricstoreServer.Native.FQLParser, :parse_diagnostic, _args}}}
+    after
+      :erlang.trace_pattern(
+        {FerricstoreServer.Native.FQLParser, :parse_diagnostic, 1},
+        false,
+        []
+      )
+
+      :erlang.trace(self(), false, [:call])
+      if Process.alive?(tracer), do: Process.exit(tracer, :kill)
     end
   end
 
@@ -2893,9 +3308,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     for {opcode, payload} <- [
           {@op_flow_get, %{"id" => "tenant:a:flow", "partition_key" => "tenant:b:partition"}},
           {@op_flow_claim_due,
-           %{"type" => "tenant:a:type", "partition_key" => "tenant:b:partition"}},
-          {@op_flow_list,
-           %{"type" => "tenant:a:type", "opts" => %{"partition_key" => "tenant:b:partition"}}}
+           %{"type" => "tenant:a:type", "partition_key" => "tenant:b:partition"}}
         ] do
       assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
       assert message =~ "keys mentioned"
@@ -2970,18 +3383,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
              "worker" => "worker",
              "partition_key" => "tenant:a:direct",
              "opts" => %{"partition_key" => "tenant:b:nested"}
-           }},
-          {@op_flow_list,
-           %{
-             "type" => "tenant:a:type",
-             "partition_key" => "tenant:a:direct",
-             "opts" => %{"partition_key" => "tenant:b:nested"}
-           }},
-          {@op_flow_search,
-           %{
-             "type" => "checkout",
-             "partition_key" => "tenant:a:direct",
-             "opts" => %{"partition_key" => "tenant:b:nested"}
            }}
         ] do
       assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
@@ -3011,26 +3412,9 @@ defmodule FerricstoreServer.Native.CommandsTest do
     state = state_as("platform_scoped")
 
     for {opcode, payload} <- [
-          {@op_flow_claim_due, %{"type" => "tenant:a:type", "worker" => "worker"}},
-          {@op_flow_list, %{"type" => "tenant:a:type"}}
+          {@op_flow_claim_due, %{"type" => "tenant:a:type", "worker" => "worker"}}
         ] do
       assert {:noperm, message, _state} = Commands.execute(opcode, payload, state)
-      assert message =~ "keys mentioned"
-    end
-  end
-
-  test "typed FLOW relationship queries require unrestricted scope without a partition" do
-    put_platform_scoped_user("platform_scoped")
-    state = state_as("platform_scoped")
-
-    for {opcode, field} <- [
-          {@op_flow_by_parent, "parent_id"},
-          {@op_flow_by_root, "root_id"},
-          {@op_flow_by_correlation, "correlation_id"}
-        ] do
-      assert {:noperm, message, _state} =
-               Commands.execute(opcode, %{field => "tenant:a:selector"}, state)
-
       assert message =~ "keys mentioned"
     end
   end
@@ -3827,6 +4211,23 @@ defmodule FerricstoreServer.Native.CommandsTest do
     state(%{instance_ctx: instance_ctx})
   end
 
+  defp state_with_query_engine_as(query_engine, username) do
+    query_engine
+    |> state_with_query_engine()
+    |> Map.merge(%{
+      username: username,
+      acl_cache: ConnAuth.build_acl_cache(username),
+      require_auth: ConnAuth.user_requires_auth?(username)
+    })
+  end
+
+  defp flow_query_requests(query) do
+    [
+      {@op_flow_query, %{"version" => "FQL1", "query" => query}},
+      {@op_command_exec, %{"command" => "FLOW.QUERY", "args" => ["FQL1", query]}}
+    ]
+  end
+
   defp shared_wake_context do
     ClaimWaiters.init()
     ClaimWaiters.cleanup(self())
@@ -3950,6 +4351,14 @@ defmodule FerricstoreServer.Native.CommandsTest do
              ])
   end
 
+  defp put_query_user(username, commands) do
+    assert :ok =
+             Acl.set_user(
+               username,
+               ["on", "nopass", "-@all"] ++ commands ++ ["~tenant:a:*"]
+             )
+  end
+
   defp assert_native_get_ok(key, state) do
     assert {:ok, _payload, _state} =
              Commands.execute(@op_command_exec, %{"command" => "GET", "args" => [key]}, state)
@@ -3964,12 +4373,6 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
-
-  defp flow_record_ids(records) when is_list(records) do
-    Enum.map(records, fn record ->
-      Map.get(record, :id) || Map.get(record, "id")
-    end)
-  end
 
   defp schema_names(payload), do: Map.keys(payload.schemas)
   defp opcode_names(payload), do: Enum.map(payload.opcodes, & &1["name"])

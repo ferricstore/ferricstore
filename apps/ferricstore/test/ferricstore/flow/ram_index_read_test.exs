@@ -45,7 +45,7 @@ defmodule Ferricstore.Flow.RAMIndexReadTest do
     assert RAMIndexRead.maybe_reverse([1, 2, 3], false) == [1, 2, 3]
   end
 
-  test "FLOW.STUCK threads its count into the ordered index instead of requesting all rows" do
+  test "stuck indexed reads thread count into the ordered index instead of requesting all rows" do
     assert Code.ensure_loaded?(Ferricstore.Flow.IndexZSet)
     assert function_exported?(Ferricstore.Flow.IndexZSet, :range_by_score, 5)
     refute function_exported?(Ferricstore.Flow.IndexZSet, :range_by_score, 4)

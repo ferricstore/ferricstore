@@ -109,6 +109,29 @@ defmodule Ferricstore.Flow.Query.RequestTest do
     assert :ok = Request.validate_bound(%{request | mode: :execute})
   end
 
+  test "EXPLAIN ANALYZE is a bounded fresh execution and rejects cursors" do
+    request =
+      Request.collection(
+        :analyze,
+        [eq(:partition_key, "tenant-a"), eq(:state, "failed")],
+        [{:updated_at_ms, :desc}],
+        10,
+        :record
+      )
+
+    assert :ok = Request.validate_bound(request)
+
+    assert {:error, :query_cursor_invalid} =
+             request
+             |> Map.put(:cursor, keyword(String.duplicate("c", 32)))
+             |> Request.validate_bound()
+
+    assert :ok =
+             :analyze
+             |> Request.count([eq(:partition_key, "tenant-a")])
+             |> Request.validate_bound()
+  end
+
   test "scalar counts are partition-contained and have no row pagination envelope" do
     request =
       Request.count(:execute, [
@@ -143,9 +166,50 @@ defmodule Ferricstore.Flow.Query.RequestTest do
       )
 
     lexical = %{numeric | order_by: [{:run_id, :asc}]}
+    unordered = %{numeric | order_by: []}
 
     assert :ok = Request.validate_bound(numeric)
     assert {:error, :unsupported_query_shape} = Request.validate_bound(lexical)
+    assert {:error, :unsupported_query_shape} = Request.validate_bound(unordered)
+  end
+
+  test "cursor order validation shares the canonical query ordering contract" do
+    assert :ok = Request.validate_cursor_order([{:updated_at_ms, :desc}, {:version, :asc}])
+    assert :ok = Request.validate_cursor_order([{:event_id, :asc}])
+
+    for invalid <- [
+          [],
+          [{:run_id, :asc}],
+          [{{:attribute, "rank"}, :asc}],
+          [{:updated_at_ms, :asc}, {:updated_at_ms, :desc}],
+          [{:updated_at_ms, :sideways}]
+        ] do
+      assert {:error, _reason} = Request.validate_cursor_order(invalid)
+    end
+  end
+
+  test "dynamic metadata allows empty strings without allowing empty identity fields" do
+    metadata =
+      Request.collection(
+        :execute,
+        [eq(:partition_key, "tenant-a"), eq({:attribute, "region"}, "")],
+        [{:updated_at_ms, :asc}],
+        10,
+        :record
+      )
+
+    assert :ok = Request.validate_bound(metadata)
+
+    identity =
+      Request.collection(
+        :execute,
+        [eq(:partition_key, "tenant-a"), eq(:type, "")],
+        [{:updated_at_ms, :asc}],
+        10,
+        :record
+      )
+
+    assert {:error, :invalid_parameter_type} = Request.validate_bound(identity)
   end
 
   defp eq(field, value), do: {:eq, field, keyword(value)}

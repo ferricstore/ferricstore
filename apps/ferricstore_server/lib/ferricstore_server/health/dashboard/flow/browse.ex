@@ -1,6 +1,7 @@
 defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   @moduledoc false
 
+  alias Ferricstore.Flow.Query.Builder
   alias FerricstoreServer.Health.Dashboard.Access, as: DashboardAccess
   alias FerricstoreServer.Health.Dashboard.Flow.Fifo
   alias FerricstoreServer.Health.Dashboard.Flow.Projection
@@ -75,6 +76,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
       @flow_dashboard_sample_limit
       |> collect_flow_records_sample()
       |> DashboardAccess.filter_flow_records_for_acl(acl_username)
+      |> filter_flow_records_by_partition(filters.partition_key)
 
     available_types = flow_available_types(records)
     terminal_records = collect_flow_states_terminal_records(filters, available_types)
@@ -117,6 +119,10 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     []
     |> maybe_put_query_opt(:type, normalize_flow_type_filter(Map.get(params, "type")))
     |> maybe_put_query_opt(:state, normalize_flow_state_filter(Map.get(params, "state")))
+    |> maybe_put_query_opt(
+      :partition_key,
+      normalize_flow_partition_query(Map.get(params, "partition_key"))
+    )
     |> maybe_put_query_opt(:q, normalize_flow_name_filter(Map.get(params, "q")))
     |> maybe_put_query_opt(:range, normalize_flow_range_filter(Map.get(params, "range")))
     |> maybe_put_query_opt(
@@ -142,6 +148,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     Map.get(data, :filters, %{
       type: Map.get(data, :type_filter),
       state: Map.get(data, :state_filter),
+      partition_key: nil,
       q: Map.get(data, :name_filter),
       range: Map.get(data, :range_filter),
       from_ms: Map.get(data, :from_ms),
@@ -213,14 +220,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
   defp collect_flow_states_terminal_records(filters, available_types) do
     terminal_states = flow_states_terminal_fetch_states(filters)
 
-    if terminal_states == [] do
+    if terminal_states == [] or not is_binary(filters.partition_key) do
       []
     else
       filters
       |> flow_states_terminal_fetch_types(available_types)
       |> flow_fetch_terminal_records(
         terminal_states,
-        max(filters.limit, @flow_dashboard_sample_limit)
+        filters.limit,
+        filters.partition_key
       )
     end
   end
@@ -240,13 +248,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
 
   defp flow_states_terminal_fetch_types(_filters, available_types), do: available_types
 
-  defp flow_fetch_terminal_records(types, terminal_states, limit) when limit > 0 do
+  defp flow_fetch_terminal_records(types, terminal_states, limit, partition_key) when limit > 0 do
     types
     |> Enum.reduce_while({[], limit}, fn type, {acc, remaining} ->
       if remaining <= 0 do
         {:halt, {acc, 0}}
       else
-        records = flow_fetch_terminal_records_for_type(type, terminal_states, remaining)
+        records =
+          flow_fetch_terminal_records_for_type(type, terminal_states, remaining, partition_key)
+
         {:cont, {prepend_flow_dashboard_chunk(records, acc), max(remaining - length(records), 0)}}
       end
     end)
@@ -255,15 +265,15 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     |> Enum.take(limit)
   end
 
-  defp flow_fetch_terminal_records(_types, _terminal_states, _limit), do: []
+  defp flow_fetch_terminal_records(_types, _terminal_states, _limit, _partition_key), do: []
 
-  defp flow_fetch_terminal_records_for_type(type, terminal_states, limit) do
+  defp flow_fetch_terminal_records_for_type(type, terminal_states, limit, partition_key) do
     terminal_states
     |> Enum.reduce_while({[], limit}, fn state, {acc, remaining} ->
       if remaining <= 0 do
         {:halt, {acc, 0}}
       else
-        case flow_dashboard_terminal_records(type, state, remaining) do
+        case flow_dashboard_terminal_records(type, state, remaining, partition_key) do
           {:ok, records} ->
             {:cont,
              {prepend_flow_dashboard_chunk(records, acc), max(remaining - length(records), 0)}}
@@ -277,18 +287,25 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Browse do
     |> flatten_flow_dashboard_chunks()
   end
 
-  defp flow_dashboard_terminal_records(type, state, limit) do
-    opts = [state: state, count: limit, include_cold: true, consistent_projection: true]
-
-    case bounded_dashboard_call(
-           fn -> flow_dashboard_flow_list(type, opts) end,
-           flow_dashboard_list_fetch_timeout_ms(),
-           :terminal_records
-         ) do
-      {:ok, {:ok, records}} when is_list(records) -> {:ok, records}
-      {:ok, {:error, reason}} -> {:error, reason}
-      {:ok, other} -> {:error, {:unexpected_flow_list_result, other}}
-      {:error, reason} -> {:error, reason}
+  defp flow_dashboard_terminal_records(type, state, limit, partition_key) do
+    with {:ok, %{query: query, params: params}} <-
+           Builder.build(:terminals, %{
+             type: type,
+             state: state,
+             partition_key: partition_key,
+             limit: min(limit, 100)
+           }) do
+      case bounded_dashboard_call(
+             fn -> flow_dashboard_flow_query(query, params) end,
+             flow_dashboard_list_fetch_timeout_ms(),
+             :terminal_records
+           ) do
+        {:ok, {:ok, records}} when is_list(records) -> {:ok, records}
+        {:ok, {:ok, %{records: records}}} when is_list(records) -> {:ok, records}
+        {:ok, {:error, reason}} -> {:error, reason}
+        {:ok, other} -> {:error, {:unexpected_flow_query_result, other}}
+        {:error, reason} -> {:error, reason}
+      end
     end
   rescue
     reason -> {:error, reason}

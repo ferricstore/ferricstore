@@ -50,7 +50,7 @@ defmodule Ferricstore.Flow.Query.BinderTest do
           {:eq, :partition_key, parameter(:keyword, "tenant")},
           {:range, :updated_at_ms, parameter(:integer, "edge"), parameter(:integer, "edge")}
         ],
-        [],
+        [{:updated_at_ms, :asc}],
         10,
         :record
       )
@@ -73,7 +73,7 @@ defmodule Ferricstore.Flow.Query.BinderTest do
           {:eq, :partition_key, literal(:keyword, "tenant-a")},
           {:eq, {:attribute, "region"}, parameter(:dynamic, "region")}
         ],
-        [],
+        [{:updated_at_ms, :asc}],
         10,
         :record
       )

@@ -668,6 +668,7 @@ defmodule FerricStore.Instance do
 
   defp cleanup_instance_tables({:ok, %__MODULE__{} = ctx}) do
     Ferricstore.Store.ActiveFile.cleanup_instance(ctx)
+    Ferricstore.Flow.NativeOrderedIndex.unregister_all(ctx.name, ctx.shard_count)
 
     ctx.keydir_refs
     |> tuple_values()

@@ -86,7 +86,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
               ">secret",
               "~*",
               "-@all",
-              "+FLOW.LIST"
+              "+FLOW.QUERY"
             ])
 
           login =
@@ -117,7 +117,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
               ">secret",
               "~*",
               "-@all",
-              "+FLOW.LIST",
+              "+FLOW.QUERY",
               "+FLOW.POLICY.GET"
             ])
 
@@ -216,7 +216,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
               ">secret",
               "~*",
               "-@all",
-              "+FLOW.LIST"
+              "+FLOW.QUERY"
             ])
 
           login =
@@ -246,7 +246,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
               ">secret",
               "%W~tenant-a:*",
               "-@all",
-              "+FLOW.LIST",
+              "+FLOW.QUERY",
               "+FLOW.RETENTION_CLEANUP"
             ])
 
@@ -561,7 +561,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
               ">secret",
               "~tenant-a:*",
               "-@all",
-              "+FLOW.LIST"
+              "+FLOW.QUERY"
             ])
 
           login =
@@ -583,7 +583,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
             ])
 
           assert extract_status_code(response) == 403
-          assert extract_body(response) =~ "FLOW.LIST"
+          assert extract_body(response) =~ "FLOW.QUERY"
           assert extract_body(response) =~ "%R~tenant-b:queue"
           assert extract_body(response) =~ "read"
         end
@@ -597,7 +597,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
               ">secret",
               "~billing",
               "-@all",
-              "+FLOW.FAILURES"
+              "+FLOW.QUERY"
             ])
 
           login =
@@ -618,7 +618,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
             ])
 
           assert extract_status_code(response) == 403
-          assert extract_body(response) =~ "FLOW.FAILURES"
+          assert extract_body(response) =~ "FLOW.QUERY"
           assert extract_body(response) =~ "%R~*"
           assert extract_body(response) =~ "read"
         end
@@ -632,7 +632,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
               ">secret",
               "~tenant-a:*",
               "-@all",
-              "+FLOW.FAILURES"
+              "+FLOW.QUERY"
             ])
 
           login =
@@ -653,7 +653,7 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.AclFlowActions do
             ])
 
           assert extract_status_code(response) == 403
-          assert extract_body(response) =~ "FLOW.FAILURES"
+          assert extract_body(response) =~ "FLOW.QUERY"
           assert extract_body(response) =~ "%R~tenant-b:queue"
           assert extract_body(response) =~ "read"
         end

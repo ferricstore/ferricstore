@@ -1,0 +1,195 @@
+name: Query Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Git ref to compare against; defaults to the current commit's parent
+        required: false
+        type: string
+      rounds:
+        description: Paired benchmark rounds per revision
+        required: false
+        default: "3"
+        type: string
+  schedule:
+    - cron: "17 2 * * 0"
+
+permissions:
+  contents: read
+
+env:
+  MIX_ENV: bench
+  FERRICSTORE_BUILD_NIF: "1"
+  RUSTFLAGS: "-D warnings"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  BENCH_REGRESSION_LIMIT: "0.15"
+  BENCH_MEMORY_REGRESSION_LIMIT: "0.20"
+  BENCH_REQUIRE_COLD_CACHE: "1"
+  BENCH_WARMUP: "1"
+  BENCH_TIME: "2"
+  BENCH_MEMORY_TIME: "0.25"
+  BENCH_REDUCTION_TIME: "0"
+  BENCH_DURATION_MS: "5000"
+  BENCH_CONTENTION_DURATION_MS: "5000"
+  BENCH_CACHE_SAMPLES: "10"
+  BENCH_COLD_CACHE_SAMPLES: "5"
+
+jobs:
+  compare:
+    name: Same-host query benchmark comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      BASELINE_RESULTS: ${{ runner.temp }}/baseline-results
+      CURRENT_RESULTS: ${{ runner.temp }}/current-results
+      CRITERION_RESULTS: ${{ runner.temp }}/criterion-results
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cold-cache tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes vmtouch
+
+      - name: Prepare baseline worktree
+        id: baseline
+        shell: bash
+        env:
+          REQUESTED_BASELINE_REF: ${{ inputs.baseline_ref }}
+        run: |
+          set -euo pipefail
+          baseline_ref="${REQUESTED_BASELINE_REF:-}"
+          if [[ -z "$baseline_ref" ]]; then
+            baseline_ref="${GITHUB_SHA}^"
+          fi
+          baseline_sha="$(git rev-parse --verify --end-of-options "${baseline_ref}^{commit}")"
+          baseline_dir="$RUNNER_TEMP/ferricstore-query-baseline"
+          git worktree add --detach "$baseline_dir" "$baseline_sha"
+          echo "dir=$baseline_dir" >> "$GITHUB_OUTPUT"
+          if [[ -f "$baseline_dir/bench/flow_query_native_index_bench.exs" && -f "$baseline_dir/apps/ferricstore_server/native/native_protocol_nif/benches/fql_parser.rs" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Baseline predates the query benchmark suite; this run will establish evidence without gating."
+          fi
+
+      - name: Build current and baseline NIFs
+        shell: bash
+        env:
+          BASELINE_DIR: ${{ steps.baseline.outputs.dir }}
+          BASELINE_AVAILABLE: ${{ steps.baseline.outputs.available }}
+        run: |
+          set -euo pipefail
+
+          build_checkout() {
+            local repo="$1"
+            (
+              cd "$repo"
+              mix deps.get
+              cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+              cargo build --release --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
+              cargo build --release --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml
+              mkdir -p apps/ferricstore/priv/native apps/ferricstore_server/priv/native
+              cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/libferricstore_bitcask.so
+              cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/ferricstore_bitcask.so
+              cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/libferricstore_wal_nif.so
+              cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/ferricstore_wal_nif.so
+              cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/libnative_protocol_nif.so
+              cp apps/ferricstore_server/native/native_protocol_nif/target/release/libnative_protocol_nif.so apps/ferricstore_server/priv/native/native_protocol_nif.so
+              mix compile --warnings-as-errors
+            )
+          }
+
+          build_checkout "$GITHUB_WORKSPACE"
+          if [[ "$BASELINE_AVAILABLE" == "true" ]]; then
+            build_checkout "$BASELINE_DIR"
+          fi
+
+      - name: Run paired benchmark rounds
+        shell: bash
+        env:
+          BASELINE_DIR: ${{ steps.baseline.outputs.dir }}
+          BASELINE_AVAILABLE: ${{ steps.baseline.outputs.available }}
+          REQUESTED_ROUNDS: ${{ inputs.rounds }}
+        run: |
+          set -euo pipefail
+          rounds="${REQUESTED_ROUNDS:-3}"
+          if ! [[ "$rounds" =~ ^[1-9][0-9]*$ ]] || (( rounds > 5 )); then
+            echo "rounds must be an integer from 1 through 5" >&2
+            exit 2
+          fi
+
+          mkdir -p "$BASELINE_RESULTS" "$CURRENT_RESULTS"
+
+          run_suite() {
+            local repo="$1"
+            local output="$2"
+            local round="$3"
+            (
+              cd "$repo"
+              export BENCH_SAVE="$output/round-$round"
+              BENCH_ALLOC_ITERATIONS=10000 cargo bench --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --bench fql_allocations
+              mix run --no-start bench/fql_parser_bench.exs
+              mix run --no-start bench/fql_scheduler_bench.exs
+              mix run --no-start bench/flow_query_native_index_bench.exs
+              mix run --no-start bench/flow_query_lmdb_bench.exs
+            )
+          }
+
+          for round in $(seq 1 "$rounds"); do
+            if [[ "$BASELINE_AVAILABLE" == "true" && $((round % 2)) -eq 1 ]]; then
+              run_suite "$BASELINE_DIR" "$BASELINE_RESULTS" "$round"
+              run_suite "$GITHUB_WORKSPACE" "$CURRENT_RESULTS" "$round"
+            else
+              run_suite "$GITHUB_WORKSPACE" "$CURRENT_RESULTS" "$round"
+              if [[ "$BASELINE_AVAILABLE" == "true" ]]; then
+                run_suite "$BASELINE_DIR" "$BASELINE_RESULTS" "$round"
+              fi
+            fi
+
+            criterion_home="$CRITERION_RESULTS/round-$round"
+            if [[ "$BASELINE_AVAILABLE" == "true" ]]; then
+              (
+                cd "$BASELINE_DIR"
+                CRITERION_HOME="$criterion_home" cargo bench --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --bench fql_parser -- --warm-up-time 1 --measurement-time 2 --sample-size 30 --save-baseline baseline
+              )
+              (
+                cd "$GITHUB_WORKSPACE"
+                mix run --no-start bench/query_performance_criterion_export.exs "$criterion_home" baseline "$BASELINE_RESULTS/round-$round"
+                CRITERION_HOME="$criterion_home" cargo bench --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --bench fql_parser -- --warm-up-time 1 --measurement-time 2 --sample-size 30 --baseline baseline
+                mix run --no-start bench/query_performance_criterion_export.exs "$criterion_home" new "$CURRENT_RESULTS/round-$round"
+              )
+            else
+              (
+                cd "$GITHUB_WORKSPACE"
+                CRITERION_HOME="$criterion_home" cargo bench --manifest-path apps/ferricstore_server/native/native_protocol_nif/Cargo.toml --bench fql_parser -- --warm-up-time 1 --measurement-time 2 --sample-size 30 --save-baseline baseline
+                mix run --no-start bench/query_performance_criterion_export.exs "$criterion_home" baseline "$CURRENT_RESULTS/round-$round"
+              )
+            fi
+          done
+
+      - name: Enforce median regression budget
+        if: steps.baseline.outputs.available == 'true'
+        run: |
+          mix run --no-start bench/query_performance_compare.exs "$BASELINE_RESULTS" "$CURRENT_RESULTS"
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: query-performance-${{ github.run_id }}
+          path: |
+            ${{ env.BASELINE_RESULTS }}
+            ${{ env.CURRENT_RESULTS }}
+            ${{ env.CRITERION_RESULTS }}
+          retention-days: 30

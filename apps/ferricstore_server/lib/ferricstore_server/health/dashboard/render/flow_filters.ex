@@ -18,6 +18,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
       Map.get(data, :filters, %{
         type: Map.get(data, :type_filter),
         state: nil,
+        partition_key: nil,
         q: nil,
         range: nil,
         from_ms: nil,
@@ -28,6 +29,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
     type_filter = Map.get(filters, :type)
     state_filter = Map.get(filters, :state)
     name_filter = Map.get(filters, :q)
+    partition_key = Map.get(filters, :partition_key)
     range_filter = Map.get(filters, :range)
     available_types = Map.get(data, :available_types, [])
     available_states = Map.get(data, :available_states, [])
@@ -86,6 +88,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
         <select id="flow-state-state-filter" class="flow-search-input" name="state" title="Filter by current workflow state">
           #{state_options}
         </select>
+        <label for="flow-state-partition-filter">Partition</label>
+        <input id="flow-state-partition-filter" class="flow-search-input mono" type="search" name="partition_key" value="#{escape_attr(partition_key || "")}" placeholder="required for cold rows" title="Filter by partition and enable cold terminal queries">
         <label for="flow-state-name-filter">ID</label>
         <input id="flow-state-name-filter" class="flow-search-input mono" type="search" name="q" value="#{escape_attr(name_filter || "")}" placeholder="contains" title="Filter by Flow ID substring">
         <label for="flow-state-range-filter">Updated</label>
@@ -176,7 +180,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
   end
 
   def flow_filter_active?(filters) do
-    Enum.any?([:type, :state, :q, :range, :from_ms, :to_ms], fn key ->
+    Enum.any?([:type, :state, :partition_key, :q, :range, :from_ms, :to_ms], fn key ->
       case Map.get(filters, key) do
         nil -> false
         "" -> false
@@ -203,6 +207,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
     [
       Map.get(filters, :type) || "all types",
       Map.get(filters, :state) || "all states",
+      flow_filter_partition_label(Map.get(filters, :partition_key)),
       flow_filter_name_label(Map.get(filters, :q)),
       flow_filter_time_label(filters),
       flow_filter_limit_label(Map.get(filters, :limit))
@@ -213,6 +218,9 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowFilters do
 
   def flow_filter_name_label(nil), do: ""
   def flow_filter_name_label(query), do: "id contains #{query}"
+
+  def flow_filter_partition_label(nil), do: ""
+  def flow_filter_partition_label(partition_key), do: "partition #{partition_key}"
 
   def flow_signal_filter_active?(filters) do
     Enum.any?([:type, :signal, :q], fn key ->

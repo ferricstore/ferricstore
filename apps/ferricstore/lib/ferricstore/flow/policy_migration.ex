@@ -484,11 +484,17 @@ defmodule Ferricstore.Flow.PolicyMigration do
       with {:ok, primary_key} <- staged_backfill_primary_key(stage_key, prefix),
            {:ok, candidates} <- backfill_candidate(ctx, shard_index, primary_key) do
         candidate_bytes = :erlang.external_size(candidates)
+        next_bytes = bytes + candidate_bytes
 
-        if scanned_to != nil and bytes + candidate_bytes > max_bytes do
-          {:halt, {:ok, acc, scanned_to, bytes}}
-        else
-          {:cont, {:ok, Enum.reverse(candidates, acc), stage_key, bytes + candidate_bytes}}
+        cond do
+          next_bytes <= max_bytes ->
+            {:cont, {:ok, Enum.reverse(candidates, acc), stage_key, next_bytes}}
+
+          scanned_to == nil ->
+            {:halt, {:error, {:policy_migration_entry_too_large, candidate_bytes, max_bytes}}}
+
+          true ->
+            {:halt, {:ok, acc, scanned_to, bytes}}
         end
       else
         {:error, _reason} = error -> {:halt, error}
@@ -508,11 +514,17 @@ defmodule Ferricstore.Flow.PolicyMigration do
       case hydrate_catalog_entry(ctx, shard_index, type, entry) do
         {:ok, hydrated} ->
           entry_bytes = :erlang.external_size(hydrated)
+          next_bytes = bytes + entry_bytes
 
-          if acc != [] and bytes + entry_bytes > max_bytes do
-            {:halt, {:ok, acc, bytes, true}}
-          else
-            {:cont, {:ok, [hydrated | acc], bytes + entry_bytes, false}}
+          cond do
+            next_bytes <= max_bytes ->
+              {:cont, {:ok, [hydrated | acc], next_bytes, false}}
+
+            acc == [] ->
+              {:halt, {:error, {:policy_migration_entry_too_large, entry_bytes, max_bytes}}}
+
+            true ->
+              {:halt, {:ok, acc, bytes, true}}
           end
 
         {:error, _reason} = error ->

@@ -483,6 +483,42 @@ defmodule Ferricstore.Store.Ops.Compound do
           non_neg_integer(),
           non_neg_integer()
         ) :: [{binary(), binary()}] | ReadResult.failure()
+  def compound_scan_slice(
+        %FerricStore.Instance{} = ctx,
+        redis_key,
+        prefix,
+        start,
+        count,
+        total
+      ),
+      do: Router.compound_scan_slice(ctx, redis_key, prefix, start, count, total)
+
+  def compound_scan_slice(
+        %LocalTxStore{} = tx,
+        redis_key,
+        prefix,
+        start,
+        count,
+        total
+      ) do
+    if LocalRead.local?(tx, redis_key) do
+      shard_data_path = LocalRead.promoted_path(tx, redis_key) || tx.shard_state.shard_data_path
+
+      ShardETS.prefix_scan_entries_slice(
+        tx.shard_state,
+        prefix,
+        shard_data_path,
+        start,
+        count,
+        total
+      )
+    else
+      tx
+      |> compound_scan(redis_key, prefix)
+      |> slice_scan_results(start, count)
+    end
+  end
+
   def compound_scan_slice(store, redis_key, prefix, start, count, total) when is_map(store) do
     case store do
       %{compound_scan_slice: fun} when is_function(fun, 5) ->

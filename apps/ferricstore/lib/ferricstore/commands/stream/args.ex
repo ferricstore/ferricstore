@@ -17,7 +17,8 @@ defmodule Ferricstore.Commands.Stream.Args do
         [option | r] when is_binary(option) ->
           if String.upcase(option) == "NOMKSTREAM", do: {true, r}, else: {false, rest}
 
-        _ -> {false, rest}
+        _ ->
+          {false, rest}
       end
 
     {trim_opts, rest} =
@@ -29,7 +30,8 @@ defmodule Ferricstore.Commands.Stream.Args do
             _ -> {nil, rest}
           end
 
-        _ -> {nil, rest}
+        _ ->
+          {nil, rest}
       end
 
     case trim_opts do
@@ -208,7 +210,8 @@ defmodule Ferricstore.Commands.Stream.Args do
       {parsed, ""} when parsed >= 0 and (max_value == :infinity or parsed <= max_value) ->
         continuation.(parsed, rest)
 
-      _invalid -> {:error, "ERR value is not an integer or out of range"}
+      _invalid ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 

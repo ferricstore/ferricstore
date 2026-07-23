@@ -11,6 +11,7 @@ defmodule FerricstoreServer.Native.Codec do
   payloads and structured Flow metadata.
   """
 
+  alias Ferricstore.NativeValueCodec
   alias FerricstoreServer.Native.NIF
   alias FerricstoreServer.Native.Connection.FrameBuffer
 
@@ -61,11 +62,9 @@ defmodule FerricstoreServer.Native.Codec do
   @compact_flow_transition_many_request 0x9B
   @compact_flow_transition_many_ok_request 0x9C
   @compact_flow_value_mget_request 0x9D
-  @compact_flow_list_request 0x9F
 
   @compact_flow_claim_jobs_opcodes [0x0203]
   @compact_flow_record_opcodes [0x0202]
-  @compact_flow_record_list_opcodes [0x020E, 0x0217, 0x0218, 0x0219, 0x021A, 0x021B, 0x021D]
   @compact_kv_get_opcodes [0x0101]
   @compact_kv_mget_opcodes [0x0104, 0x020C]
   @compact_scalar_ok_list_opcodes [0x0102, 0x0105]
@@ -78,7 +77,6 @@ defmodule FerricstoreServer.Native.Codec do
   def compact_response_opcodes do
     %{
       "flow_claim_jobs_v1" => @compact_flow_claim_jobs_opcodes,
-      "flow_record_list_v1" => @compact_flow_record_list_opcodes,
       "flow_record_v1" => @compact_flow_record_opcodes,
       "kv_get_v1" => @compact_kv_get_opcodes,
       "kv_mget_v1" => @compact_kv_mget_opcodes,
@@ -815,10 +813,6 @@ defmodule FerricstoreServer.Native.Codec do
        when opcode in @compact_flow_record_opcodes,
        do: encode_compact_flow_record(value)
 
-  defp compact_response_payload(opcode, :ok, value)
-       when opcode in @compact_flow_record_list_opcodes,
-       do: encode_compact_flow_record_list(value)
-
   defp compact_response_payload(opcode, :ok, value) when opcode in @compact_kv_get_opcodes,
     do: encode_compact_kv_get(value)
 
@@ -1323,24 +1317,6 @@ defmodule FerricstoreServer.Native.Codec do
     else
       {:error, _reason} = error -> error
       _ -> {:error, "ERR native compact FLOW.VALUE.MGET payload is invalid"}
-    end
-  end
-
-  defp decode_custom_request_body(
-         0x020E,
-         <<@compact_flow_list_request, rest::binary>>
-       ) do
-    with {:ok, type, rest} <- take_compact_binary(rest),
-         {:ok, state, rest} <- take_compact_optional_binary(rest),
-         <<count::signed-64, return_mode::unsigned-8, "">> <- rest do
-      payload =
-        %{"type" => type, "count" => count}
-        |> put_optional_binary("state", state)
-        |> put_flow_list_return_mode(return_mode)
-
-      {:ok, payload}
-    else
-      _ -> {:error, "ERR native compact FLOW.LIST payload is invalid"}
     end
   end
 
@@ -2072,10 +2048,6 @@ defmodule FerricstoreServer.Native.Codec do
   defp put_return_mode(payload, 4), do: Map.put(payload, "return", "jobs_compact_state_attrs")
   defp put_return_mode(payload, _mode), do: payload
 
-  defp put_flow_list_return_mode(payload, 0), do: payload
-  defp put_flow_list_return_mode(payload, 1), do: Map.put(payload, "return", "meta")
-  defp put_flow_list_return_mode(payload, _mode), do: payload
-
   defp flow_create_many_wire_opts(type, state, now_ms, run_at_ms, independent, return_mode) do
     [type: type, state: state, now_ms: now_ms, run_at_ms: run_at_ms]
     |> maybe_wire_independent(independent)
@@ -2126,58 +2098,11 @@ defmodule FerricstoreServer.Native.Codec do
   defp put_partition_values(payload, _mode, _partitions), do: payload
 
   @spec encode_value(term()) :: binary()
-  def encode_value(nil), do: <<0>>
-  def encode_value(true), do: <<1>>
-  def encode_value(false), do: <<2>>
-
-  def encode_value(value) when is_integer(value),
-    do: <<3, value::signed-64>>
-
-  def encode_value(value) when is_binary(value) do
-    len = byte_size(value)
-    <<4, len::unsigned-32, value::binary>>
-  end
-
-  def encode_value(value) when is_atom(value),
-    do: value |> Atom.to_string() |> encode_value()
-
-  def encode_value(values) when is_list(values) do
-    body = values |> Enum.map(&encode_value/1) |> IO.iodata_to_binary()
-    <<5, length(values)::unsigned-32, body::binary>>
-  end
-
-  def encode_value(%_{} = struct),
-    do: struct |> Map.from_struct() |> encode_value()
-
-  def encode_value(values) when is_map(values) do
-    entries =
-      values
-      |> Enum.map(fn {key, value} ->
-        key = encode_key(key)
-        [<<byte_size(key)::unsigned-32>>, key, encode_value(value)]
-      end)
-      |> IO.iodata_to_binary()
-
-    <<6, map_size(values)::unsigned-32, entries::binary>>
-  end
-
-  def encode_value(value) when is_float(value),
-    do: <<7, value::float-64>>
-
-  def encode_value(value) when is_tuple(value),
-    do: value |> Tuple.to_list() |> encode_value()
-
-  def encode_value(value),
-    do: value |> inspect(limit: 50) |> encode_value()
+  defdelegate encode_value(value), to: NativeValueCodec, as: :encode
 
   @doc false
   @spec encoded_value_fits?(term(), non_neg_integer()) :: boolean()
-  def encoded_value_fits?(value, max_bytes)
-      when is_integer(max_bytes) and max_bytes >= 0 do
-    match?({:ok, _remaining}, consume_encoded_value(value, max_bytes))
-  end
-
-  def encoded_value_fits?(_value, _max_bytes), do: false
+  defdelegate encoded_value_fits?(value, max_bytes), to: NativeValueCodec, as: :fits?
 
   @spec decode_value(binary()) :: {:ok, term(), binary()} | {:error, binary()}
   def decode_value(binary) do
@@ -2474,10 +2399,6 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
-  defp encode_key(key) when is_binary(key), do: key
-  defp encode_key(key) when is_atom(key), do: Atom.to_string(key)
-  defp encode_key(key), do: to_string(key)
-
   defp enforce_response_byte_limit(:ok, value, opts) do
     case Keyword.get(opts, :max_response_bytes) do
       limit when is_integer(limit) and limit > 0 ->
@@ -2493,77 +2414,6 @@ defmodule FerricstoreServer.Native.Codec do
   end
 
   defp enforce_response_byte_limit(status, value, _opts), do: {status, value}
-
-  defp consume_encoded_value(_value, remaining) when remaining < 0, do: :error
-  defp consume_encoded_value(nil, remaining), do: consume_encoded_bytes(remaining, 1)
-
-  defp consume_encoded_value(value, remaining) when is_boolean(value),
-    do: consume_encoded_bytes(remaining, 1)
-
-  defp consume_encoded_value(value, remaining) when is_integer(value),
-    do: consume_encoded_bytes(remaining, 9)
-
-  defp consume_encoded_value(value, remaining) when is_binary(value),
-    do: consume_encoded_bytes(remaining, 5 + byte_size(value))
-
-  defp consume_encoded_value(value, remaining) when is_atom(value),
-    do: consume_encoded_value(Atom.to_string(value), remaining)
-
-  defp consume_encoded_value(value, remaining) when is_float(value),
-    do: consume_encoded_bytes(remaining, 9)
-
-  defp consume_encoded_value(%_{} = struct, remaining),
-    do: consume_encoded_value(Map.from_struct(struct), remaining)
-
-  defp consume_encoded_value(values, remaining) when is_list(values) do
-    with {:ok, remaining} <- consume_encoded_bytes(remaining, 5) do
-      Enum.reduce_while(values, {:ok, remaining}, fn value, {:ok, available} ->
-        case consume_encoded_value(value, available) do
-          {:ok, _remaining} = result -> {:cont, result}
-          :error -> {:halt, :error}
-        end
-      end)
-    end
-  end
-
-  defp consume_encoded_value(values, remaining) when is_map(values) do
-    with {:ok, remaining} <- consume_encoded_bytes(remaining, 5) do
-      Enum.reduce_while(values, {:ok, remaining}, fn {key, value}, {:ok, available} ->
-        key = encode_key(key)
-
-        with {:ok, available} <- consume_encoded_bytes(available, 4 + byte_size(key)),
-             {:ok, _remaining} = result <- consume_encoded_value(value, available) do
-          {:cont, result}
-        else
-          :error -> {:halt, :error}
-        end
-      end)
-    end
-  end
-
-  defp consume_encoded_value(value, remaining) when is_tuple(value) do
-    with {:ok, remaining} <- consume_encoded_bytes(remaining, 5) do
-      consume_encoded_tuple(value, 0, tuple_size(value), remaining)
-    end
-  end
-
-  defp consume_encoded_value(value, remaining),
-    do: value |> inspect(limit: 50) |> consume_encoded_value(remaining)
-
-  defp consume_encoded_tuple(_tuple, index, size, remaining) when index == size,
-    do: {:ok, remaining}
-
-  defp consume_encoded_tuple(tuple, index, size, remaining) do
-    case consume_encoded_value(elem(tuple, index), remaining) do
-      {:ok, remaining} -> consume_encoded_tuple(tuple, index + 1, size, remaining)
-      :error -> :error
-    end
-  end
-
-  defp consume_encoded_bytes(remaining, bytes) when bytes <= remaining,
-    do: {:ok, remaining - bytes}
-
-  defp consume_encoded_bytes(_remaining, _bytes), do: :error
 
   defp response_value(:ok, value), do: value
 

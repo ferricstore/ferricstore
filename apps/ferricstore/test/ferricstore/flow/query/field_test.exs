@@ -25,6 +25,24 @@ defmodule Ferricstore.Flow.Query.FieldTest do
     assert :erlang.system_info(:atom_count) == before_atoms
   end
 
+  test "round-trips metadata names that require bracket quoting" do
+    fields = [
+      {:attribute, "customer.region"},
+      {:attribute, "customer'] OR type = 'admin"},
+      {:state_meta, "review.v2", "ai.model"},
+      {:state_meta, "review's", "risk tier"}
+    ]
+
+    for field <- fields do
+      external = Field.external_name(field)
+      assert external =~ "["
+      assert {:ok, ^field} = Field.parse(external)
+    end
+
+    assert {:error, :unsupported_field} = Field.parse("attribute['__internal']")
+    assert {:error, :unsupported_field} = Field.parse("state_meta['review']['__internal']")
+  end
+
   test "rejects ambiguous, reserved, or oversized metadata paths" do
     assert {:error, :unsupported_field} = Field.parse("attribute")
     assert {:error, :unsupported_field} = Field.parse("attribute.__private")

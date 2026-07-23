@@ -117,6 +117,14 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
       @entry_identity_bytes
   end
 
+  @doc false
+  @spec valid_id?(term()) :: boolean()
+  def valid_id?(id), do: validate_id(id) == :ok
+
+  @doc false
+  @spec valid_version?(term()) :: boolean()
+  def valid_version?(version), do: validate_version(version) == :ok
+
   defp validate_id(id)
        when is_binary(id) and id != "" and byte_size(id) <= @max_id_bytes do
     if valid_id_bytes?(id), do: :ok, else: {:error, :invalid_index_id}

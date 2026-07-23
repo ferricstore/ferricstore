@@ -144,13 +144,17 @@ fn v2_append_ops_batch<'a>(
 }
 
 fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
+    let map_size = usize::try_from(map_size).map_err(|_| "lmdb map_size too large".to_string())?;
+    if let Some(store) = exact_lmdb_store(path, map_size)? {
+        return Ok(store);
+    }
+
     crate::fs_nif::create_dir_all_nofollow(std::path::Path::new(path))
         .map_err(|e| e.to_string())?;
     let cache_key = std::fs::canonicalize(path)
         .map_err(|e| e.to_string())?
         .to_string_lossy()
         .into_owned();
-    let map_size = usize::try_from(map_size).map_err(|_| "lmdb map_size too large".to_string())?;
     let stores = LMDB_STORES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let cell = {
         let mut guard = stores
@@ -165,7 +169,10 @@ fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
 
     let initialized = cell.get_or_init(|| initialize_lmdb_store(&cache_key, map_size));
     match initialized {
-        Ok(store) if store.map_size == map_size => Ok(Arc::clone(store)),
+        Ok(store) if store.map_size == map_size => {
+            remember_exact_lmdb_store(path, &cache_key, store)?;
+            Ok(Arc::clone(store))
+        }
         Ok(store) => Err(format!(
             "lmdb map_size mismatch for {cache_key}: cached={}, requested={map_size}; release the environment before changing map_size",
             store.map_size
@@ -182,6 +189,69 @@ fn lmdb_store(path: &str, map_size: u64) -> Result<Arc<LmdbStore>, String> {
             Err(error.clone())
         }
     }
+}
+
+fn exact_lmdb_store(path: &str, map_size: usize) -> Result<Option<Arc<LmdbStore>>, String> {
+    if !std::path::Path::new(path).is_absolute() {
+        return Ok(None);
+    }
+
+    let paths = LMDB_VALIDATED_PATHS
+        .get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+    // Release takes the write side before counting/removing stores, so keep
+    // this read guard until the weak lease has been upgraded.
+    let guard = paths
+        .read()
+        .map_err(|_| "lmdb validated path cache poisoned".to_string())?;
+    let Some(validated) = guard.get(path) else {
+        return Ok(None);
+    };
+    let cache_key = validated.cache_key.clone();
+    if let Some(store) = validated.store.upgrade() {
+        if store.map_size != map_size {
+            return Err(format!(
+                "lmdb map_size mismatch for {cache_key}: cached={}, requested={map_size}; release the environment before changing map_size",
+                store.map_size
+            ));
+        }
+        return Ok(Some(store));
+    }
+    drop(guard);
+
+    let mut guard = paths
+        .write()
+        .map_err(|_| "lmdb validated path cache poisoned".to_string())?;
+    if guard
+        .get(path)
+        .is_some_and(|validated| validated.store.strong_count() == 0)
+    {
+        guard.remove(path);
+    }
+    Ok(None)
+}
+
+fn remember_exact_lmdb_store(
+    path: &str,
+    cache_key: &str,
+    store: &Arc<LmdbStore>,
+) -> Result<(), String> {
+    if !std::path::Path::new(path).is_absolute() {
+        return Ok(());
+    }
+
+    let paths = LMDB_VALIDATED_PATHS
+        .get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+    paths
+        .write()
+        .map_err(|_| "lmdb validated path cache poisoned".to_string())?
+        .insert(
+            path.to_owned(),
+            LmdbValidatedPath {
+                cache_key: cache_key.to_owned(),
+                store: Arc::downgrade(store),
+            },
+        );
+    Ok(())
 }
 
 fn initialize_lmdb_store(cache_key: &str, map_size: usize) -> Result<Arc<LmdbStore>, String> {
@@ -224,6 +294,73 @@ fn release_lmdb_cache_entry(
     } else {
         LmdbCacheRelease::Released(usize::from(stores.remove(cache_key).is_some()))
     }
+}
+
+fn release_lmdb_store(path: &str) -> Result<LmdbCacheRelease, String> {
+    release_lmdb_store_with_hook(path, || {})
+}
+
+fn release_lmdb_store_with_hook(
+    path: &str,
+    after_cache_locks: impl FnOnce(),
+) -> Result<LmdbCacheRelease, String> {
+    // Cache lock order is validated paths then canonical stores. The open path
+    // never holds both locks, so release can exclude new leases without a cycle.
+    let paths = LMDB_VALIDATED_PATHS
+        .get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+    let mut path_guard = paths
+        .write()
+        .map_err(|_| "lmdb validated path cache poisoned".to_string())?;
+    let Some(stores) = LMDB_STORES.get() else {
+        path_guard.clear();
+        return Ok(LmdbCacheRelease::Released(0));
+    };
+    let cache_key = match path_guard.get(path) {
+        Some(validated) => validated.cache_key.clone(),
+        None => std::fs::canonicalize(path)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .into_owned(),
+    };
+    let mut store_guard = stores
+        .lock()
+        .map_err(|_| "lmdb cache poisoned".to_string())?;
+
+    after_cache_locks();
+
+    let released = release_lmdb_cache_entry(&mut store_guard, &cache_key);
+    if matches!(released, LmdbCacheRelease::Released(_)) {
+        path_guard.retain(|_path, validated| validated.cache_key != cache_key);
+    }
+    Ok(released)
+}
+
+fn release_all_lmdb_stores() -> Result<LmdbCacheRelease, String> {
+    let paths = LMDB_VALIDATED_PATHS
+        .get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+    let mut path_guard = paths
+        .write()
+        .map_err(|_| "lmdb validated path cache poisoned".to_string())?;
+    let Some(stores) = LMDB_STORES.get() else {
+        path_guard.clear();
+        return Ok(LmdbCacheRelease::Released(0));
+    };
+    let mut store_guard = stores
+        .lock()
+        .map_err(|_| "lmdb cache poisoned".to_string())?;
+    let busy = store_guard
+        .values()
+        .filter(|cell| lmdb_store_cell_busy(cell))
+        .count();
+
+    if busy > 0 {
+        return Ok(LmdbCacheRelease::Busy(busy));
+    }
+
+    let released = store_guard.len();
+    store_guard.clear();
+    path_guard.clear();
+    Ok(LmdbCacheRelease::Released(released))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -298,6 +435,29 @@ fn lmdb_get_many_bounded<'a>(
     max_bytes: u64,
     map_size: u64,
 ) -> NifResult<Term<'a>> {
+    lmdb_get_many_bounded_impl(env, path, keys, max_bytes, map_size, false)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn lmdb_get_many_prefix_bounded<'a>(
+    env: Env<'a>,
+    path: String,
+    keys: Term<'a>,
+    max_bytes: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    lmdb_get_many_bounded_impl(env, path, keys, max_bytes, map_size, true)
+}
+
+fn lmdb_get_many_bounded_impl<'a>(
+    env: Env<'a>,
+    path: String,
+    keys: Term<'a>,
+    max_bytes: u64,
+    map_size: u64,
+    allow_prefix: bool,
+) -> NifResult<Term<'a>> {
     const MAX_KEYS: usize = 4_096;
     const MAX_KEY_BYTES: usize = 8 * 1_024 * 1_024;
 
@@ -333,6 +493,7 @@ fn lmdb_get_many_bounded<'a>(
 
             let mut values = Vec::with_capacity(decoded_keys.len());
             let mut total_bytes = 0_u64;
+            let mut complete = true;
 
             for key in &decoded_keys {
                 match store.db.get(&rtxn, key.as_slice()) {
@@ -344,12 +505,22 @@ fn lmdb_get_many_bounded<'a>(
                         };
 
                         let Some(next_total) = total_bytes.checked_add(value_bytes) else {
+                            if allow_prefix && !values.is_empty() {
+                                complete = false;
+                                break;
+                            }
+
                             return Ok(
                                 (atoms::error(), atoms::batch_value_budget_exceeded()).encode(env),
                             );
                         };
 
                         if next_total > max_bytes {
+                            if allow_prefix && !values.is_empty() {
+                                complete = false;
+                                break;
+                            }
+
                             return Ok(
                                 (atoms::error(), atoms::batch_value_budget_exceeded()).encode(env),
                             );
@@ -378,7 +549,11 @@ fn lmdb_get_many_bounded<'a>(
                 }
             }
 
-            Ok((atoms::ok(), results, total_bytes).encode(env))
+            if allow_prefix {
+                Ok((atoms::ok(), results, total_bytes, complete).encode(env))
+            } else {
+                Ok((atoms::ok(), results, total_bytes).encode(env))
+            }
         }
         Err(e) => Ok((atoms::error(), e).encode(env)),
     }
@@ -486,7 +661,8 @@ fn lmdb_prefix_entries<'a>(
             };
 
             let max = usize::try_from(limit).unwrap_or(usize::MAX);
-            let mut entries = Vec::new();
+            let mut entries =
+                Vec::with_capacity(lmdb_page_capacity(max, usize::MAX));
 
             for item in iter.take(max) {
                 match item {
@@ -523,7 +699,8 @@ fn lmdb_prefix_entries_after<'a>(
             };
 
             let max = usize::try_from(limit).unwrap_or(usize::MAX);
-            let mut entries = Vec::new();
+            let mut entries =
+                Vec::with_capacity(lmdb_page_capacity(max, usize::MAX));
 
             if after_key.as_slice().is_empty() {
                 let iter = match store.db.prefix_iter(&rtxn, prefix.as_slice()) {
@@ -577,6 +754,12 @@ fn lmdb_prefix_entries_after<'a>(
     }
 }
 
+const LMDB_PAGE_PREALLOC_LIMIT: usize = 4_096;
+
+fn lmdb_page_capacity(item_cap: usize, byte_cap: usize) -> usize {
+    item_cap.min(byte_cap).min(LMDB_PAGE_PREALLOC_LIMIT)
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn lmdb_prefix_entries_after_bounded<'a>(
@@ -597,7 +780,7 @@ fn lmdb_prefix_entries_after_bounded<'a>(
 
             let item_cap = usize::try_from(max_items).unwrap_or(usize::MAX);
             let byte_cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-            let mut entries = Vec::new();
+            let mut entries = Vec::with_capacity(lmdb_page_capacity(item_cap, byte_cap));
             let mut entry_bytes = 0usize;
 
             if item_cap == 0 {
@@ -618,9 +801,14 @@ fn lmdb_prefix_entries_after_bounded<'a>(
                     match item {
                         Ok((key, value)) => {
                             let row_bytes = key.len().saturating_add(value.len());
+                            if row_bytes > byte_cap && entries.is_empty() {
+                                return Ok(
+                                    (atoms::error(), atoms::range_entry_too_large()).encode(env)
+                                );
+                            }
                             let next_bytes = entry_bytes.saturating_add(row_bytes);
 
-                            if !entries.is_empty() && next_bytes > byte_cap {
+                            if next_bytes > byte_cap {
                                 break;
                             }
 
@@ -628,10 +816,6 @@ fn lmdb_prefix_entries_after_bounded<'a>(
                             let value_term = binary_term(env, value)?;
                             entries.push((key_term, value_term).encode(env));
                             entry_bytes = next_bytes;
-
-                            if entry_bytes > byte_cap {
-                                break;
-                            }
                         }
                         Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
                     }
@@ -658,9 +842,14 @@ fn lmdb_prefix_entries_after_bounded<'a>(
                             }
 
                             let row_bytes = key.len().saturating_add(value.len());
+                            if row_bytes > byte_cap && entries.is_empty() {
+                                return Ok(
+                                    (atoms::error(), atoms::range_entry_too_large()).encode(env)
+                                );
+                            }
                             let next_bytes = entry_bytes.saturating_add(row_bytes);
 
-                            if !entries.is_empty() && next_bytes > byte_cap {
+                            if next_bytes > byte_cap {
                                 break;
                             }
 
@@ -668,10 +857,6 @@ fn lmdb_prefix_entries_after_bounded<'a>(
                             let value_term = binary_term(env, value)?;
                             entries.push((key_term, value_term).encode(env));
                             entry_bytes = next_bytes;
-
-                            if entry_bytes > byte_cap {
-                                break;
-                            }
                         }
                         Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
                     }
@@ -722,7 +907,7 @@ fn lmdb_range_entries_bounded<'a>(
 
             let item_cap = usize::try_from(max_items).unwrap_or(usize::MAX);
             let byte_cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-            let mut entries = Vec::new();
+            let mut entries = Vec::with_capacity(lmdb_page_capacity(item_cap, byte_cap));
             let mut entry_bytes = 0usize;
             let mut exhausted = true;
 
@@ -765,6 +950,194 @@ fn lmdb_range_entries_bounded<'a>(
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn lmdb_composite_range_entries_bounded<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    after_key: Binary<'a>,
+    before_key: Binary<'a>,
+    max_items: u64,
+    max_bytes: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    use sha2::{Digest, Sha256};
+
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
+            };
+            let start = if after_key.as_slice().is_empty() {
+                std::ops::Bound::Included(prefix.as_slice())
+            } else {
+                std::ops::Bound::Excluded(after_key.as_slice())
+            };
+            let end = if before_key.as_slice().is_empty() {
+                std::ops::Bound::Unbounded
+            } else {
+                std::ops::Bound::Excluded(before_key.as_slice())
+            };
+            let iter = match store.db.range(&rtxn, &(start, end)) {
+                Ok(iter) => iter,
+                Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
+            };
+            let item_cap = usize::try_from(max_items).unwrap_or(usize::MAX);
+            let byte_cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let mut entries = Vec::with_capacity(lmdb_page_capacity(item_cap, byte_cap));
+            let mut entry_bytes = 0usize;
+            let mut exhausted = true;
+            let mut hasher = Sha256::new();
+
+            for item in iter {
+                let (key, value) = match item {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
+                };
+                if !key.starts_with(prefix.as_slice()) {
+                    break;
+                }
+                if entries.len() >= item_cap {
+                    exhausted = false;
+                    break;
+                }
+                let row_bytes = key.len().saturating_add(value.len());
+                if row_bytes > byte_cap && entries.is_empty() {
+                    return Ok((atoms::error(), atoms::range_entry_too_large()).encode(env));
+                }
+                if entry_bytes.saturating_add(row_bytes) > byte_cap {
+                    exhausted = false;
+                    break;
+                }
+
+                let Some((id, state_key, record_version, expire_at_ms)) =
+                    flow_composite_codec::decode_entry(key, value, &mut hasher)
+                else {
+                    return Ok((atoms::error(), atoms::invalid_composite_entry()).encode(env));
+                };
+                let key_term = binary_term(env, key)?;
+                let id_term = binary_term(env, id)?;
+                let state_term = binary_term(env, state_key)?;
+                entries.push(
+                    (
+                        key_term,
+                        id_term,
+                        state_term,
+                        record_version,
+                        expire_at_ms,
+                        row_bytes,
+                    )
+                        .encode(env),
+                );
+                entry_bytes = entry_bytes.saturating_add(row_bytes);
+            }
+
+            Ok((atoms::ok(), entries, exhausted, entry_bytes).encode(env))
+        }
+        Err(error) => Ok((atoms::error(), error).encode(env)),
+    }
+}
+
+// Each source contributes at most `limit` rows; no later row can belong to the
+// globally smallest `limit` rows. Heap entries borrow the LMDB snapshots, so
+// candidate payloads are not cloned before the exact final byte check.
+#[rustler::nif(schedule = "DirtyIo")]
+fn lmdb_prefix_merge_entries<'a>(
+    env: Env<'a>,
+    paths: Vec<String>,
+    prefix: Binary<'a>,
+    limit: u64,
+    max_bytes: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    const MAX_PATHS: usize = 1_024;
+    const MAX_PREFIX_BYTES: usize = 511;
+    const MAX_LIMIT: u64 = 100_000;
+    const MAX_BYTES: u64 = 64 * 1_024 * 1_024;
+    if paths.is_empty()
+        || paths.len() > MAX_PATHS
+        || prefix.as_slice().is_empty()
+        || prefix.len() > MAX_PREFIX_BYTES
+        || limit > MAX_LIMIT
+        || max_bytes == 0
+        || max_bytes > MAX_BYTES
+    {
+        return Ok((atoms::error(), "invalid LMDB prefix merge").encode(env));
+    }
+
+    let cap = usize::try_from(limit).unwrap_or(usize::MAX);
+    if cap == 0 {
+        let entries: Vec<Term<'a>> = Vec::new();
+        return Ok((atoms::ok(), entries, 0usize).encode(env));
+    }
+    let byte_cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut stores = Vec::with_capacity(paths.len());
+    for path in &paths {
+        match lmdb_store(path, map_size) {
+            Ok(store) => stores.push(store),
+            Err(error) => return Ok((atoms::error(), error).encode(env)),
+        }
+    }
+    let mut read_txns = Vec::with_capacity(stores.len());
+    for store in &stores {
+        match store.env.read_txn() {
+            Ok(txn) => read_txns.push(txn),
+            Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
+        }
+    }
+
+    let mut selected: std::collections::BinaryHeap<(&[u8], usize, &[u8])> =
+        std::collections::BinaryHeap::with_capacity(cap);
+    let mut scanned = 0usize;
+
+    for (source, (store, rtxn)) in stores.iter().zip(read_txns.iter()).enumerate() {
+        let iter = match store.db.prefix_iter(rtxn, prefix.as_slice()) {
+            Ok(iter) => iter,
+            Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
+        };
+
+        for item in iter.take(cap) {
+            let (key, value) = match item {
+                Ok(entry) => entry,
+                Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
+            };
+            scanned = scanned.saturating_add(1);
+            let candidate = (key, source, value);
+            if selected.len() < cap {
+                selected.push(candidate);
+            } else if selected.peek().is_some_and(|largest| &candidate < largest) {
+                selected.pop();
+                selected.push(candidate);
+            }
+        }
+    }
+
+    let selected = selected.into_sorted_vec();
+    let selected_bytes = selected.iter().try_fold(0usize, |bytes, (key, _, value)| {
+        bytes
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .filter(|bytes| *bytes <= byte_cap)
+            .ok_or(())
+    });
+    if selected_bytes.is_err() {
+        return Ok(
+            (atoms::error(), atoms::prefix_merge_byte_budget_exceeded()).encode(env)
+        );
+    }
+
+    let entries = selected
+        .into_iter()
+        .map(|(key, source, value)| {
+            Ok(
+                (source, binary_term(env, key)?, binary_term(env, value)?).encode(env),
+            )
+        })
+        .collect::<NifResult<Vec<Term<'a>>>>()?;
+    Ok((atoms::ok(), entries, scanned).encode(env))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
 fn lmdb_prefix_entries_reverse<'a>(
     env: Env<'a>,
@@ -786,7 +1159,8 @@ fn lmdb_prefix_entries_reverse<'a>(
             };
 
             let max = usize::try_from(limit).unwrap_or(usize::MAX);
-            let mut entries = Vec::new();
+            let mut entries =
+                Vec::with_capacity(lmdb_page_capacity(max, usize::MAX));
 
             for item in iter.take(max) {
                 match item {
@@ -823,7 +1197,8 @@ fn lmdb_prefix_entries_reverse_before<'a>(
             };
 
             let max = usize::try_from(limit).unwrap_or(usize::MAX);
-            let mut entries = Vec::new();
+            let mut entries =
+                Vec::with_capacity(lmdb_page_capacity(max, usize::MAX));
 
             if before_key.as_slice().is_empty() {
                 let iter = match store.db.rev_prefix_iter(&rtxn, prefix.as_slice()) {
@@ -915,50 +1290,19 @@ fn lmdb_prefix_count<'a>(
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn lmdb_release_all<'a>(env: Env<'a>) -> NifResult<Term<'a>> {
-    let stores = match LMDB_STORES.get() {
-        Some(stores) => stores,
-        None => return Ok((atoms::ok(), 0usize).encode(env)),
-    };
-
-    let mut guard = match stores.lock() {
-        Ok(guard) => guard,
-        Err(_) => return Ok((atoms::error(), "lmdb cache poisoned").encode(env)),
-    };
-
-    let busy = guard
-        .values()
-        .filter(|cell| lmdb_store_cell_busy(cell))
-        .count();
-
-    if busy > 0 {
-        return Ok((atoms::busy(), busy).encode(env));
+    match release_all_lmdb_stores() {
+        Ok(LmdbCacheRelease::Busy(count)) => Ok((atoms::busy(), count).encode(env)),
+        Ok(LmdbCacheRelease::Released(count)) => Ok((atoms::ok(), count).encode(env)),
+        Err(error) => Ok((atoms::error(), error).encode(env)),
     }
-
-    let released = guard.len();
-    guard.clear();
-    Ok((atoms::ok(), released).encode(env))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn lmdb_release<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
-    let stores = match LMDB_STORES.get() {
-        Some(stores) => stores,
-        None => return Ok((atoms::ok(), 0usize).encode(env)),
-    };
-
-    let cache_key = match std::fs::canonicalize(&path) {
-        Ok(path) => path.to_string_lossy().into_owned(),
-        Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
-    };
-
-    let mut guard = match stores.lock() {
-        Ok(guard) => guard,
-        Err(_) => return Ok((atoms::error(), "lmdb cache poisoned").encode(env)),
-    };
-
-    match release_lmdb_cache_entry(&mut guard, &cache_key) {
-        LmdbCacheRelease::Busy(count) => Ok((atoms::busy(), count).encode(env)),
-        LmdbCacheRelease::Released(count) => Ok((atoms::ok(), count).encode(env)),
+    match release_lmdb_store(&path) {
+        Ok(LmdbCacheRelease::Busy(count)) => Ok((atoms::busy(), count).encode(env)),
+        Ok(LmdbCacheRelease::Released(count)) => Ok((atoms::ok(), count).encode(env)),
+        Err(error) => Ok((atoms::error(), error).encode(env)),
     }
 }
 

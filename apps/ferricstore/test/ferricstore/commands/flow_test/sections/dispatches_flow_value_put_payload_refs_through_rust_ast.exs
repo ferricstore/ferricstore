@@ -4,7 +4,22 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Commands.Dispatcher
+      alias Ferricstore.Flow.Query.Builder
       alias Ferricstore.Test.{MockStore, ShardHelpers}
+
+      defp flow_query_wire_args(kind, filters) do
+        {:ok, %{query: query, params: params}} = Builder.build(kind, filters)
+
+        encoded_params =
+          Enum.flat_map(params, fn {name, value} -> [name, flow_query_wire_value(value)] end)
+
+        ["FQL1", query | encoded_params]
+      end
+
+      defp flow_query_wire_value(value) when is_binary(value), do: value
+      defp flow_query_wire_value(value) when is_integer(value), do: Integer.to_string(value)
+      defp flow_query_wire_value(true), do: "true"
+      defp flow_query_wire_value(false), do: "false"
 
       test "dispatches Flow value put and payload refs through Rust AST" do
         assert %{"ref" => shared_ref} =
@@ -105,7 +120,7 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
                  )
       end
 
-      test "dispatches Flow create/get/list/history through Rust AST" do
+      test "dispatches Flow create/get/history through Rust AST" do
         id = uid("flow-command")
 
         assert "OK" =
@@ -149,9 +164,6 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
         assert %{"id" => ^id, "type" => "checkout"} =
                  Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
 
-        assert [%{"id" => ^id}] =
-                 Dispatcher.dispatch("FLOW.LIST", ["checkout", "COUNT", "10"], MockStore.make())
-
         assert [[_event_id, %{"event" => "created", "version" => "1"}]] =
                  Dispatcher.dispatch("FLOW.HISTORY", [id, "COUNT", "10"], MockStore.make())
 
@@ -189,54 +201,86 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
       test "dispatches Flow failures through Rust AST" do
         id = uid("flow-command-failures")
         type = uid("flow-command-failures-type")
+        partition = uid("flow-command-failures-partition")
 
         assert "OK" =
                  Dispatcher.dispatch(
                    "FLOW.CREATE",
-                   [id, "TYPE", type, "RUN_AT", "1000", "NOW", "1000"],
+                   [
+                     id,
+                     "TYPE",
+                     type,
+                     "PARTITION",
+                     partition,
+                     "RUN_AT",
+                     "1000",
+                     "NOW",
+                     "1000"
+                   ],
                    MockStore.make()
                  )
 
         assert [%{"id" => ^id, "lease_token" => lease_token, "fencing_token" => fencing_token}] =
                  Dispatcher.dispatch(
                    "FLOW.CLAIM_DUE",
-                   [type, "WORKER", "worker-failures", "LIMIT", "1", "NOW", "1000"],
+                   [
+                     type,
+                     "PARTITION",
+                     partition,
+                     "WORKER",
+                     "worker-failures",
+                     "LIMIT",
+                     "1",
+                     "NOW",
+                     "1000"
+                   ],
                    MockStore.make()
                  )
 
         assert "OK" =
                  Dispatcher.dispatch(
                    "FLOW.FAIL",
-                   [id, lease_token, "FENCING", Integer.to_string(fencing_token), "NOW", "1500"],
+                   [
+                     id,
+                     lease_token,
+                     "PARTITION",
+                     partition,
+                     "FENCING",
+                     Integer.to_string(fencing_token),
+                     "NOW",
+                     "1500"
+                   ],
                    MockStore.make()
                  )
 
         assert %{"id" => ^id, "state" => "failed"} =
-                 Dispatcher.dispatch("FLOW.GET", [id], MockStore.make())
+                 Dispatcher.dispatch("FLOW.GET", [id, "PARTITION", partition], MockStore.make())
 
         assert [%{"id" => ^id, "state" => "failed"}] =
                  Dispatcher.dispatch(
-                   "FLOW.FAILURES",
-                   [type, "FROM_MS", "1000", "TO_MS", "2000", "COUNT", "10"],
+                   "FLOW.QUERY",
+                   flow_query_wire_args(:failures, %{
+                     type: type,
+                     partition_key: partition,
+                     from_ms: 1_000,
+                     to_ms: 2_000,
+                     limit: 10
+                   }),
                    MockStore.make()
                  )
 
         assert [%{"id" => ^id, "state" => "failed"}] =
                  Dispatcher.dispatch(
-                   "FLOW.TERMINALS",
-                   [
-                     type,
-                     "STATE",
-                     "any",
-                     "FROM_MS",
-                     "1000",
-                     "TO_MS",
-                     "2000",
-                     "REV",
-                     "true",
-                     "COUNT",
-                     "10"
-                   ],
+                   "FLOW.QUERY",
+                   flow_query_wire_args(:terminals, %{
+                     type: type,
+                     state: "any",
+                     partition_key: partition,
+                     from_ms: 1_000,
+                     to_ms: 2_000,
+                     rev: true,
+                     limit: 10
+                   }),
                    MockStore.make()
                  )
       end
@@ -416,8 +460,12 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
 
         assert [%{"id" => ^child_a}, %{"id" => ^child_b}] =
                  Dispatcher.dispatch(
-                   "FLOW.BY_PARENT",
-                   [parent, "PARTITION", partition, "COUNT", "10"],
+                   "FLOW.QUERY",
+                   flow_query_wire_args(:by_parent, %{
+                     id: parent,
+                     partition_key: partition,
+                     limit: 10
+                   }),
                    MockStore.make()
                  )
                  |> Enum.sort_by(& &1["id"])
@@ -604,7 +652,7 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
                  Dispatcher.dispatch("FLOW.GET", [fail_id, "FULL"], MockStore.make())
       end
 
-      test "dispatches Flow lineage query commands through Rust AST" do
+      test "dispatches Flow lineage queries through Rust AST" do
         partition = uid("tenant")
         root = uid("flow-command-root")
         child = uid("flow-command-child")
@@ -650,46 +698,38 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
 
         assert [%{"id" => ^child}] =
                  Dispatcher.dispatch(
-                   "FLOW.BY_PARENT",
-                   [
-                     root,
-                     "PARTITION",
-                     partition,
-                     "COUNT",
-                     "10",
-                     "FROM_MS",
-                     "1500",
-                     "TO_MS",
-                     "2500",
-                     "REV",
-                     "true",
-                     "STATE",
-                     "queued"
-                   ],
+                   "FLOW.QUERY",
+                   flow_query_wire_args(:by_parent, %{
+                     id: root,
+                     partition_key: partition,
+                     limit: 10,
+                     from_ms: 1_500,
+                     to_ms: 2_500,
+                     rev: true,
+                     state: "queued"
+                   }),
                    MockStore.make()
                  )
 
         assert [%{"id" => ^root}, %{"id" => ^child}] =
                  Dispatcher.dispatch(
-                   "FLOW.BY_ROOT",
-                   [
-                     root,
-                     "PARTITION",
-                     partition,
-                     "COUNT",
-                     "10",
-                     "INCLUDE_COLD",
-                     "true",
-                     "CONSISTENT_PROJECTION",
-                     "false"
-                   ],
+                   "FLOW.QUERY",
+                   flow_query_wire_args(:by_root, %{
+                     id: root,
+                     partition_key: partition,
+                     limit: 10
+                   }),
                    MockStore.make()
                  )
 
         assert [%{"id" => ^root}, %{"id" => ^child}] =
                  Dispatcher.dispatch(
-                   "FLOW.BY_CORRELATION",
-                   [correlation, "PARTITION", partition, "COUNT", "10"],
+                   "FLOW.QUERY",
+                   flow_query_wire_args(:by_correlation, %{
+                     id: correlation,
+                     partition_key: partition,
+                     limit: 10
+                   }),
                    MockStore.make()
                  )
 

@@ -116,8 +116,20 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
                "200"
              ])
 
-    assert {:error, "ERR FQL1 query shape is not supported"} =
+    assert {:error, shape_error} =
              Dispatcher.prepare_raw("FLOW.QUERY", ["FQL1", "FROM runs RETURN RECORDS"])
+
+    assert shape_error =~ "ERR FQL1 query shape is not supported at line 1, column 11 (byte 11)"
+    assert shape_error =~ "HINT:"
+  end
+
+  test "FLOW.QUERY raw preparation formats positioned parser guidance" do
+    assert {:error, message} =
+             Dispatcher.prepare_raw("FLOW.QUERY", ["FQL1", "FROM runs\nWHERE @"])
+
+    assert message =~ "ERR FQL1 invalid syntax at line 2, column 7 (byte 17)"
+    assert message =~ "DETAIL:"
+    assert message =~ "HINT:"
   end
 
   test "KeyDiscovery describe keeps the command key contract" do
@@ -492,10 +504,18 @@ defmodule Ferricstore.Commands.PreparedCommandTest do
     assert policy_set.routing_keys == []
     assert PreparedCommand.cross_shard?(policy_set, fn _key -> flunk("unexpected routing") end)
 
-    assert {:ok, global_query} = Dispatcher.prepare_raw("FLOW.SEARCH", [])
-    assert global_query.acl_keys == ["*"]
-    assert global_query.routing_scope == :coordinated
-    assert global_query.routing_keys == []
+    assert {:ok, global_query} =
+             Dispatcher.prepare_raw("FLOW.QUERY", [
+               "FQL1",
+               "FROM runs WHERE run_id = @run_id RETURN RECORD",
+               "run_id",
+               "run-1"
+             ])
+
+    auto_partition = Keys.auto_partition_key("run-1")
+    assert global_query.acl_keys == [auto_partition]
+    assert global_query.routing_scope == :keys
+    assert global_query.routing_keys == [Keys.state_key("", auto_partition)]
   end
 
   @tag :prepared_multi_routing

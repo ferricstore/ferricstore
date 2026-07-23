@@ -486,6 +486,10 @@ defmodule FerricStore.Impl do
     do: Ferricstore.Flow.spawn_children(ctx, parent_id, children, opts)
 
   def flow_get(ctx, id, opts \\ []), do: Ferricstore.Flow.get(ctx, id, opts)
+
+  def flow_query(ctx, query, params \\ %{}),
+    do: Ferricstore.Flow.Query.execute_reference(ctx, "FQL1", query, params)
+
   def flow_policy_set(ctx, type, opts), do: Ferricstore.Flow.policy_set(ctx, type, opts)
   def flow_policy_get(ctx, type, opts \\ []), do: Ferricstore.Flow.policy_get(ctx, type, opts)
   def flow_claim_due(ctx, type, opts), do: Ferricstore.Flow.claim_due(ctx, type, opts)

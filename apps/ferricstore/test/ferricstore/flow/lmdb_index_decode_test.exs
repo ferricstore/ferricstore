@@ -83,6 +83,117 @@ defmodule Ferricstore.Flow.LMDBIndexDecodeTest do
     assert LMDB.get(path, key) == :not_found
   end
 
+  test "query entries atomically delete multiple expired rows and retain live rows" do
+    path = tmp_lmdb_path()
+
+    {expired_key_1, expired_value_1} =
+      LMDB.query_index_entry("parent:p1", "expired-1", 100, 10, "expired-state-1")
+
+    {live_key, live_value} =
+      LMDB.query_index_entry("parent:p1", "live", 101, 0, "live-state")
+
+    {expired_key_2, expired_value_2} =
+      LMDB.query_index_entry("parent:p1", "expired-2", 102, 10, "expired-state-2")
+
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, expired_key_1, expired_value_1},
+               {:put, live_key, live_value},
+               {:put, expired_key_2, expired_value_2}
+             ])
+
+    assert {:ok, [{"live", 101, "live-state"}]} =
+             LMDBIndexDecode.query_entries(
+               [
+                 {expired_key_1, expired_value_1},
+                 {live_key, live_value},
+                 {expired_key_2, expired_value_2}
+               ],
+               path,
+               11
+             )
+
+    assert LMDB.get(path, expired_key_1) == :not_found
+    assert {:ok, ^live_value} = LMDB.get(path, live_key)
+    assert LMDB.get(path, expired_key_2) == :not_found
+  end
+
+  test "query entries batch expired deletes and preserve live row order" do
+    {expired_key_1, expired_value_1} =
+      LMDB.query_index_entry("parent:p1", "expired-1", 100, 10, "expired-state-1")
+
+    {live_key_1, live_value_1} =
+      LMDB.query_index_entry("parent:p1", "live-1", 101, 0, "live-state-1")
+
+    {expired_key_2, expired_value_2} =
+      LMDB.query_index_entry("parent:p1", "expired-2", 102, 10, "expired-state-2")
+
+    {live_key_2, live_value_2} =
+      LMDB.query_index_entry("parent:p1", "live-2", 103, 0, "live-state-2")
+
+    parent = self()
+
+    writer = fn path, operations ->
+      send(parent, {:write_batch, path, operations})
+      :ok
+    end
+
+    assert {:ok,
+            [
+              {"live-1", 101, "live-state-1"},
+              {"live-2", 103, "live-state-2"}
+            ]} =
+             LMDBIndexDecode.__query_entries_with_writer_for_test__(
+               [
+                 {expired_key_1, expired_value_1},
+                 {live_key_1, live_value_1},
+                 {expired_key_2, expired_value_2},
+                 {live_key_2, live_value_2}
+               ],
+               "test-path",
+               11,
+               writer
+             )
+
+    assert_receive {:write_batch, "test-path",
+                    [{:delete, ^expired_key_1}, {:delete, ^expired_key_2}]}
+
+    refute_receive {:write_batch, _, _}
+  end
+
+  test "query entry decode errors do not partially clean up expired rows" do
+    {expired_key, expired_value} =
+      LMDB.query_index_entry("parent:p1", "expired", 100, 10, "expired-state")
+
+    writer = fn _path, _operations ->
+      send(self(), :unexpected_cleanup)
+      :ok
+    end
+
+    assert {:error, {:invalid_query_index_value, "bad"}} =
+             LMDBIndexDecode.__query_entries_with_writer_for_test__(
+               [{expired_key, expired_value}, {"bad", "invalid"}],
+               "test-path",
+               11,
+               writer
+             )
+
+    refute_receive :unexpected_cleanup
+  end
+
+  test "query entries propagate one batched cleanup failure" do
+    {expired_key, expired_value} =
+      LMDB.query_index_entry("parent:p1", "expired", 100, 10, "expired-state")
+
+    assert {:error, :cleanup_failed} =
+             LMDBIndexDecode.__query_entries_with_writer_for_test__(
+               [{expired_key, expired_value}],
+               "test-path",
+               11,
+               fn _path, [{:delete, ^expired_key}] -> {:error, :cleanup_failed} end
+             )
+  end
+
   test "query read decoding skips expired rows without deleting them" do
     path = tmp_lmdb_path()
 

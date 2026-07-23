@@ -24,6 +24,7 @@ defmodule Ferricstore.Flow.PolicyCommand do
     :flow_complete,
     :flow_complete_many,
     :flow_create,
+    :flow_create_with_catalog,
     :flow_create_many,
     :flow_create_pipeline_batch,
     :flow_fail,

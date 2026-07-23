@@ -4,6 +4,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   alias Ferricstore.ExpiryContext
   alias Ferricstore.Store.Shard.CompoundMemberIndex
   alias Ferricstore.Store.Shard.LogicalKeyIndex
+  alias Ferricstore.Store.Shard.NamespaceUsageIndex
   alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.Shard.ETS.Accounting
   alias Ferricstore.Store.Shard.ETS.PrefixScan
@@ -325,6 +326,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
     CompoundMemberIndex.put(compound_member_index(state), key, expire_at_ms)
     :ok = project_logical_key_put(state, key, value, expire_at_ms)
+    :ok = project_namespace_usage_put(state, key, value, expire_at_ms)
     true
   end
 
@@ -436,6 +438,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
     CompoundMemberIndex.put(compound_member_index(state), key, expire_at_ms)
     :ok = project_logical_key_put(state, key, value, expire_at_ms)
+    :ok = project_namespace_usage_put(state, key, value, expire_at_ms)
     true
   end
 
@@ -484,6 +487,7 @@ defmodule Ferricstore.Store.Shard.ETS do
         Enum.each(entries, fn {key, value, expire_at_ms} ->
           CompoundMemberIndex.put(compound_member_index(state), key, expire_at_ms)
           :ok = project_logical_key_put(state, key, value, expire_at_ms)
+          :ok = project_namespace_usage_put(state, key, value, expire_at_ms)
         end)
 
         add_keydir_binary_delta(state, binary_delta)
@@ -504,6 +508,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     :ets.delete(state.keydir, key)
     CompoundMemberIndex.delete(compound_member_index(state), key)
     :ok = project_logical_key_delete(state, key)
+    :ok = project_namespace_usage_delete(state, key)
     true
   end
 
@@ -524,6 +529,7 @@ defmodule Ferricstore.Store.Shard.ETS do
       key = elem(entry, 0)
       CompoundMemberIndex.delete(compound_member_index(state), key)
       maybe_project_logical_key_delete(state, key, update_logical_projection?)
+      :ok = project_namespace_usage_delete(state, key)
       :ok = ZSetIndex.reconcile_exact_delete(state, entry)
       restore_current_derived_indexes(state, key, update_logical_projection?)
       true
@@ -576,6 +582,8 @@ defmodule Ferricstore.Store.Shard.ETS do
           update_logical_projection?
         )
 
+        :ok = project_namespace_usage_put(state, key, value, expire_at_ms)
+
       _missing_or_invalid ->
         :ok
     end
@@ -587,6 +595,31 @@ defmodule Ferricstore.Store.Shard.ETS do
     do: project_logical_key_put(state, key, value, expire_at_ms)
 
   defp maybe_project_logical_key_put(_state, _key, _value, _expire_at_ms, false), do: :ok
+
+  defp project_namespace_usage_put(state, key, value, expire_at_ms) do
+    NamespaceUsageIndex.put(
+      namespace_usage_index(state),
+      namespace_usage_expiry(state),
+      key,
+      value,
+      expire_at_ms,
+      blob_threshold_bytes: Map.get(state, :blob_side_channel_threshold_bytes, 0)
+    )
+  end
+
+  defp project_namespace_usage_delete(state, key) do
+    NamespaceUsageIndex.delete(
+      namespace_usage_index(state),
+      namespace_usage_expiry(state),
+      key
+    )
+  end
+
+  defp namespace_usage_index(state),
+    do: Map.get(state, :namespace_usage_index) || Map.get(state, :namespace_usage_index_name)
+
+  defp namespace_usage_expiry(state),
+    do: Map.get(state, :namespace_usage_expiry) || Map.get(state, :namespace_usage_expiry_name)
 
   # -------------------------------------------------------------------
   # Hot cache threshold / value coercion

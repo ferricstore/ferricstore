@@ -48,6 +48,11 @@ defmodule Ferricstore.Flow.ReadAPITest do
     assert ReadAPI.__select_scored_candidate_for_test__(scored) == :available_candidate
   end
 
+  test "query callers may lower but cannot raise the bounded candidate scan ceiling" do
+    assert {:error, "ERR flow query scan limit is invalid"} =
+             ReadAPI.list(%{}, "jobs", query_scan_limit: 10_001)
+  end
+
   test "attribute discovery fails closed on corrupt query-index values" do
     {raw_prefix, key, _index_key} = discovery_query_key("blue")
 

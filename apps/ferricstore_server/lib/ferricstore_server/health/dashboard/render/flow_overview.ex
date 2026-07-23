@@ -134,7 +134,6 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowOverview do
     end
   end
 
-  def flow_recovery_source_command(:failures), do: "FLOW.FAILURES"
-  def flow_recovery_source_command(:stuck), do: "FLOW.STUCK"
+  def flow_recovery_source_command(source) when source in [:failures, :stuck], do: "FLOW.QUERY"
   def flow_recovery_source_command(source), do: source |> to_string() |> String.upcase()
 end

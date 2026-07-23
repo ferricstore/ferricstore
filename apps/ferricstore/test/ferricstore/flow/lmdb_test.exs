@@ -257,8 +257,12 @@ defmodule Ferricstore.Flow.LMDBUnitTest do
     on_exit(fn -> File.rm_rf!(path) end)
 
     assert :ok = LMDB.write_batch(path, [{:put, key, "entry"}])
-    assert {:ok, [{^key, "entry"}]} = LMDB.prefix_entries(path, LMDB.query_index_prefix(index_key), 1)
-    assert {:ok, [{^key, "entry"}]} = LMDB.prefix_entries(path, LMDB.query_index_raw_prefix(family), 1)
+
+    assert {:ok, [{^key, "entry"}]} =
+             LMDB.prefix_entries(path, LMDB.query_index_prefix(index_key), 1)
+
+    assert {:ok, [{^key, "entry"}]} =
+             LMDB.prefix_entries(path, LMDB.query_index_raw_prefix(family), 1)
   end
 
   test "query index family parsing ignores attribute-like text inside opaque identities" do

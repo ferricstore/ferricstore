@@ -219,6 +219,42 @@ defmodule FerricstoreServer.Health.Endpoint.AuthTest do
            ) == :ok
   end
 
+  test "governance metadata searches additionally require scoped FLOW.QUERY access" do
+    Application.put_env(:ferricstore, :protected_mode, true)
+
+    assert :ok =
+             Acl.set_user("governance-query", [
+               "on",
+               "nopass",
+               "~*",
+               "-@all",
+               "+FLOW.GOVERNANCE.OVERVIEW"
+             ])
+
+    path =
+      "/dashboard/flow/governance?meta_partition_key=tenant-a%3Apartition" <>
+        "&meta_type=checkout&meta_state=running&meta_key=risk&meta_value=high"
+
+    assert {:forbidden, {"FLOW.QUERY", [key: {"tenant-a:partition", :read}]}, reason} =
+             Auth.authorize_request(
+               "GET",
+               path,
+               {127, 0, 0, 1},
+               session_headers("governance-query")
+             )
+
+    assert String.downcase(reason) =~ "flow.query"
+    assert :ok = Acl.set_user("governance-query", ["+FLOW.QUERY"])
+
+    assert :ok =
+             Auth.authorize_request(
+               "GET",
+               path,
+               {127, 0, 0, 1},
+               session_headers("governance-query")
+             )
+  end
+
   test "dashboard collect opts include acl username when session is valid" do
     Application.put_env(:ferricstore, :protected_mode, true)
     assert :ok = Acl.set_user("alice", ["on", "nopass", "~*", "+@all"])

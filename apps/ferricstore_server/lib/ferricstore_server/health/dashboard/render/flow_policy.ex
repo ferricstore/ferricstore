@@ -74,11 +74,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
           </label>
           <label class="flow-policy-field">
             <span>Indexed attrs</span>
-            <input class="flow-search-input mono" type="text" name="indexed_attributes" value="#{escape_attr(indexed_attributes)}" autocomplete="off" placeholder="tenant, region" title="Comma-separated type-level indexed attributes used by FLOW.SEARCH">
+            <input class="flow-search-input mono" type="text" name="indexed_attributes" value="#{escape_attr(indexed_attributes)}" autocomplete="off" placeholder="tenant, region" title="Comma-separated type-level indexed attributes used by FLOW.QUERY">
           </label>
           <label class="flow-policy-field">
             <span>Indexed state meta</span>
-            <input class="flow-search-input mono" type="text" name="indexed_state_meta" value="#{escape_attr(indexed_state_meta)}" autocomplete="off" placeholder="risk_tier" title="Optional type-level state metadata key used by FLOW.SEARCH STATE_META">
+            <input class="flow-search-input mono" type="text" name="indexed_state_meta" value="#{escape_attr(indexed_state_meta)}" autocomplete="off" placeholder="risk_tier" title="Optional type-level state metadata key used by FLOW.QUERY">
           </label>
           <label class="flow-policy-field">
             <span>Max retries</span>
@@ -236,7 +236,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowPolicy do
         command: "FLOW.POLICY.SET <type> INDEXED_ATTRIBUTES <names> INDEXED_STATE_META <key>",
         scope: "Flow type",
         mutability: "read-write",
-        notes: "Configures type-level metadata indexes used by bounded FLOW.SEARCH queries."
+        notes: "Configures type-level metadata indexes used by bounded FLOW.QUERY plans."
       },
       %{
         command: "FLOW.POLICY.GET <type> [STATE <state>]",

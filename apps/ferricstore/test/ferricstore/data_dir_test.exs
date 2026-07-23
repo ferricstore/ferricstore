@@ -135,4 +135,42 @@ defmodule Ferricstore.DataDirTest do
       File.rm_rf!(root)
     end
   end
+
+  if elem(:os.type(), 0) == :unix do
+    test "ensure_layout keeps every managed storage directory private" do
+      root =
+        Path.join(System.tmp_dir!(), "data_dir_private_#{System.unique_integer([:positive])}")
+
+      try do
+        File.mkdir_p!(root)
+        File.chmod!(root, 0o755)
+
+        assert :ok = DataDir.ensure_layout!(root, 1)
+
+        private_paths = [
+          root,
+          Path.join(root, "data"),
+          Path.join([root, "data", "shard_0"]),
+          Path.join(root, "dedicated"),
+          Path.join([root, "dedicated", "shard_0"]),
+          Path.join(root, "blob"),
+          Path.join([root, "blob", "shard_0"]),
+          Path.join(root, "prob"),
+          Path.join([root, "prob", "shard_0"]),
+          Path.join(root, "waraft"),
+          Path.join([root, "waraft", "ferricstore_waraft_backend.1"]),
+          Path.join([root, "waraft", "ferricstore_waraft_backend.1", "segment_log"]),
+          Path.join(root, "registry"),
+          Path.join(root, "hints")
+        ]
+
+        for path <- private_paths do
+          assert {:ok, %{mode: mode}} = File.stat(path)
+          assert Bitwise.band(mode, 0o777) == 0o700, "expected private mode for #{path}"
+        end
+      after
+        File.rm_rf!(root)
+      end
+    end
+  end
 end

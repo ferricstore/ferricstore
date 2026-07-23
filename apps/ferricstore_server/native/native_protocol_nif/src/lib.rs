@@ -33,11 +33,12 @@ enum CompactClaimMode {
 
 #[rustler::nif]
 fn parse_fql<'a>(env: Env<'a>, query: Binary<'a>) -> NifResult<Term<'a>> {
-    match fql::parse(query.as_slice()) {
+    match fql::parse_with_diagnostic(query.as_slice()) {
         Ok(parsed) => {
             let mode = match parsed.mode {
                 fql::Mode::Execute => atoms::execute(),
                 fql::Mode::Explain => atoms::explain(),
+                fql::Mode::Analyze => atoms::analyze(),
             };
             let source = match parsed.source {
                 fql::Source::Runs => atoms::runs(),
@@ -82,22 +83,23 @@ fn parse_fql<'a>(env: Env<'a>, query: Binary<'a>) -> NifResult<Term<'a>> {
                 ],
             ))
         }
-        Err(error) => {
-            let reason = match error {
+        Err(failure) => {
+            let reason = match failure.reason {
                 fql::ParseError::InvalidParameterType => atoms::invalid_parameter_type(),
                 fql::ParseError::InvalidSyntax => atoms::invalid_syntax(),
+                fql::ParseError::QueryCursorInvalid => atoms::query_cursor_invalid(),
                 fql::ParseError::QueryTooLarge => atoms::query_too_large(),
                 fql::ParseError::UnsupportedField => atoms::unsupported_field(),
                 fql::ParseError::UnsupportedQueryShape => atoms::unsupported_query_shape(),
                 fql::ParseError::UnsupportedSource => atoms::unsupported_source(),
             };
 
-            Ok((atoms::error(), reason).encode(env))
+            Ok((atoms::error(), reason, failure.byte as u64).encode(env))
         }
     }
 }
 
-fn encode_fql_predicate<'a>(env: Env<'a>, predicate: fql::Predicate) -> NifResult<Term<'a>> {
+fn encode_fql_predicate<'a>(env: Env<'a>, predicate: fql::Predicate<'_>) -> NifResult<Term<'a>> {
     match predicate {
         fql::Predicate::Eq(field, value) => Ok((
             atoms::eq(),
@@ -141,7 +143,7 @@ fn encode_fql_predicate<'a>(env: Env<'a>, predicate: fql::Predicate) -> NifResul
     }
 }
 
-fn encode_fql_order<'a>(env: Env<'a>, order: fql::Order) -> NifResult<Term<'a>> {
+fn encode_fql_order<'a>(env: Env<'a>, order: fql::Order<'_>) -> NifResult<Term<'a>> {
     let direction = match order.direction {
         fql::Direction::Asc => atoms::asc(),
         fql::Direction::Desc => atoms::desc(),
@@ -149,11 +151,11 @@ fn encode_fql_order<'a>(env: Env<'a>, order: fql::Order) -> NifResult<Term<'a>> 
     Ok((encode_fql_field(env, order.field)?, direction).encode(env))
 }
 
-fn encode_fql_field<'a>(env: Env<'a>, field: fql::Field) -> NifResult<Binary<'a>> {
+fn encode_fql_field<'a>(env: Env<'a>, field: fql::Field<'_>) -> NifResult<Binary<'a>> {
     encode_fql_binary(env, field.external_name)
 }
 
-fn encode_fql_value<'a>(env: Env<'a>, value: fql::QueryValue) -> NifResult<Term<'a>> {
+fn encode_fql_value<'a>(env: Env<'a>, value: fql::QueryValue<'_>) -> NifResult<Term<'a>> {
     match value {
         fql::QueryValue::LiteralKeyword(value) => Ok((
             atoms::literal(),
@@ -180,10 +182,11 @@ fn encode_fql_value<'a>(env: Env<'a>, value: fql::QueryValue) -> NifResult<Term<
     }
 }
 
-fn encode_fql_binary<'a>(env: Env<'a>, value: Vec<u8>) -> NifResult<Binary<'a>> {
+fn encode_fql_binary<'a>(env: Env<'a>, value: impl AsRef<[u8]>) -> NifResult<Binary<'a>> {
+    let value = value.as_ref();
     let mut binary = OwnedBinary::new(value.len())
         .ok_or_else(|| rustler::Error::Term(Box::new("FQL value allocation failed")))?;
-    binary.as_mut_slice().copy_from_slice(&value);
+    binary.as_mut_slice().copy_from_slice(value);
 
     Ok(Binary::from_owned(binary, env))
 }
@@ -331,16 +334,20 @@ fn encode_compact_kv_mget_response_frame<'a>(
     request_id: u64,
     values: Term<'a>,
 ) -> NifResult<Term<'a>> {
-    let payload = match build_compact_kv_mget_payload(values) {
-        Some(payload) => payload,
+    let layout = match compact_kv_mget_layout(values) {
+        Some(layout) => layout,
         None => return Ok(atoms::nil().encode(env)),
     };
-
-    let frame =
-        match build_custom_ok_response_frame(opcode, lane_id, request_id, payload.as_slice()) {
+    let mut frame =
+        match allocate_custom_ok_response_frame(opcode, lane_id, request_id, layout.payload_len) {
             Some(frame) => frame,
             None => return Ok(atoms::nil().encode(env)),
         };
+    if write_compact_kv_mget_payload(&mut frame.as_mut_slice()[HEADER_SIZE + 2..], values, layout)
+        .is_none()
+    {
+        return Ok(atoms::nil().encode(env));
+    }
 
     Ok(Binary::from_owned(frame, env).encode(env))
 }
@@ -447,6 +454,123 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     ])
 }
 
+struct CompactSliceWriter<'a> {
+    bytes: &'a mut [u8],
+    offset: usize,
+}
+
+impl<'a> CompactSliceWriter<'a> {
+    fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn write(&mut self, value: &[u8]) -> Option<()> {
+        let end = self.offset.checked_add(value.len())?;
+        self.bytes.get_mut(self.offset..end)?.copy_from_slice(value);
+        self.offset = end;
+        Some(())
+    }
+
+    fn byte(&mut self, value: u8) -> Option<()> {
+        self.write(&[value])
+    }
+
+    fn binary(&mut self, value: &[u8]) -> Option<()> {
+        let len = u32::try_from(value.len()).ok()?;
+        self.write(&len.to_be_bytes())?;
+        self.write(value)
+    }
+
+    fn optional_binary(&mut self, value: Option<&[u8]>) -> Option<()> {
+        match value {
+            Some(value) => self.binary(value),
+            None => self.write(&u32::MAX.to_be_bytes()),
+        }
+    }
+
+    fn finish(self) -> Option<()> {
+        (self.offset == self.bytes.len()).then_some(())
+    }
+}
+
+struct CompactClaimJob<'a> {
+    id: Binary<'a>,
+    partition: Option<Binary<'a>>,
+    lease: Binary<'a>,
+    fencing: i64,
+    run_state: Option<Option<Binary<'a>>>,
+}
+
+impl CompactClaimJob<'_> {
+    fn mode(&self) -> CompactClaimMode {
+        if self.run_state.is_some() {
+            CompactClaimMode::State
+        } else {
+            CompactClaimMode::Base
+        }
+    }
+
+    fn encoded_len(&self) -> Option<usize> {
+        let mut len = compact_binary_len(self.id.len())?;
+        len = len.checked_add(compact_optional_binary_len(
+            self.partition.as_ref().map(|value| value.len()),
+        )?)?;
+        len = len.checked_add(compact_binary_len(self.lease.len())?)?;
+        len = len.checked_add(8)?;
+        if let Some(run_state) = self.run_state.as_ref() {
+            len = len.checked_add(compact_optional_binary_len(
+                run_state.as_ref().map(|value| value.len()),
+            )?)?;
+        }
+        Some(len)
+    }
+
+    fn write(&self, writer: &mut CompactSliceWriter<'_>) -> Option<()> {
+        writer.binary(self.id.as_slice())?;
+        writer.optional_binary(self.partition.as_ref().map(Binary::as_slice))?;
+        writer.binary(self.lease.as_slice())?;
+        writer.write(&self.fencing.to_be_bytes())?;
+        if let Some(run_state) = self.run_state.as_ref() {
+            writer.optional_binary(run_state.as_ref().map(Binary::as_slice))?;
+        }
+        Some(())
+    }
+}
+
+fn compact_binary_len(len: usize) -> Option<usize> {
+    u32::try_from(len).ok()?;
+    4usize.checked_add(len)
+}
+
+fn compact_optional_binary_len(len: Option<usize>) -> Option<usize> {
+    match len {
+        Some(len) => compact_binary_len(len),
+        None => Some(4),
+    }
+}
+
+fn decode_compact_claim_job<'a>(job: Term<'a>) -> Option<CompactClaimJob<'a>> {
+    let mut fields: ListIterator<'a> = job.decode().ok()?;
+    let id = fields.next()?.decode::<Binary<'a>>().ok()?;
+    let partition = fields.next()?.decode::<Option<Binary<'a>>>().ok()?;
+    let lease = fields.next()?.decode::<Binary<'a>>().ok()?;
+    let fencing = fields.next()?.decode::<i64>().ok()?;
+    let run_state = match fields.next() {
+        Some(value) => Some(value.decode::<Option<Binary<'a>>>().ok()?),
+        None => None,
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(CompactClaimJob {
+        id,
+        partition,
+        lease,
+        fencing,
+        run_state,
+    })
+}
+
 fn build_compact_claim_jobs_response_frame<'a>(
     opcode: u16,
     lane_id: u32,
@@ -454,53 +578,32 @@ fn build_compact_claim_jobs_response_frame<'a>(
     jobs: Term<'a>,
 ) -> Option<OwnedBinary> {
     let mut jobs_iter: ListIterator<'a> = jobs.decode().ok()?;
-    let mut payload = Vec::with_capacity(4096);
-    payload.push(COMPACT_FLOW_CLAIM_JOBS);
-    payload.extend_from_slice(&0u32.to_be_bytes());
-
+    let mut payload_len = 5usize;
     let mut count = 0u32;
     let mut mode: Option<CompactClaimMode> = None;
 
     for job in &mut jobs_iter {
-        let mut fields: ListIterator<'a> = job.decode().ok()?;
-        let id = fields.next()?.decode::<Binary<'a>>().ok()?;
-        let partition = fields.next()?.decode::<Option<Binary<'a>>>().ok()?;
-        let lease = fields.next()?.decode::<Binary<'a>>().ok()?;
-        let fencing = fields.next()?.decode::<i64>().ok()?;
-        let (run_state, job_mode) = match fields.next() {
-            Some(value) => (
-                Some(value.decode::<Option<Binary<'a>>>().ok()?),
-                CompactClaimMode::State,
-            ),
-            None => (None, CompactClaimMode::Base),
-        };
-        if fields.next().is_some() {
-            return None;
-        }
+        let job = decode_compact_claim_job(job)?;
+        let job_mode = job.mode();
         match mode {
             Some(expected) if expected != job_mode => return None,
             None => mode = Some(job_mode),
             _ => {}
         }
-
-        append_compact_binary(&mut payload, id.as_slice())?;
-        append_compact_optional_binary(
-            &mut payload,
-            partition.as_ref().map(|value| value.as_slice()),
-        )?;
-        append_compact_binary(&mut payload, lease.as_slice())?;
-        payload.extend_from_slice(&fencing.to_be_bytes());
-        if let Some(run_state) = run_state {
-            append_compact_optional_binary(
-                &mut payload,
-                run_state.as_ref().map(|value| value.as_slice()),
-            )?;
-        }
+        payload_len = payload_len.checked_add(job.encoded_len()?)?;
         count = count.checked_add(1)?;
     }
 
-    payload[1..5].copy_from_slice(&count.to_be_bytes());
-    build_custom_ok_response_frame(opcode, lane_id, request_id, &payload)
+    let mut frame = allocate_custom_ok_response_frame(opcode, lane_id, request_id, payload_len)?;
+    let mut writer = CompactSliceWriter::new(&mut frame.as_mut_slice()[HEADER_SIZE + 2..]);
+    writer.byte(COMPACT_FLOW_CLAIM_JOBS)?;
+    writer.write(&count.to_be_bytes())?;
+    let mut jobs_iter: ListIterator<'a> = jobs.decode().ok()?;
+    for job in &mut jobs_iter {
+        decode_compact_claim_job(job)?.write(&mut writer)?;
+    }
+    writer.finish()?;
+    Some(frame)
 }
 
 fn build_compact_ok_list_response_frame<'a>(
@@ -535,11 +638,25 @@ fn build_compact_kv_get_response_frame<'a>(
     value: Term<'a>,
 ) -> Option<OwnedBinary> {
     let value = value.decode::<Option<Binary<'a>>>().ok()?;
-    let payload = build_compact_kv_get_payload(value.as_ref().map(|binary| binary.as_slice()))?;
-
-    build_custom_ok_response_frame(opcode, lane_id, request_id, &payload)
+    let payload_len = match value.as_ref() {
+        Some(value) => 2usize.checked_add(compact_binary_len(value.len())?)?,
+        None => 2,
+    };
+    let mut frame = allocate_custom_ok_response_frame(opcode, lane_id, request_id, payload_len)?;
+    let mut writer = CompactSliceWriter::new(&mut frame.as_mut_slice()[HEADER_SIZE + 2..]);
+    writer.byte(COMPACT_KV_GET)?;
+    match value.as_ref() {
+        Some(value) => {
+            writer.byte(1)?;
+            writer.binary(value.as_slice())?;
+        }
+        None => writer.byte(0)?,
+    }
+    writer.finish()?;
+    Some(frame)
 }
 
+#[cfg(test)]
 fn build_compact_kv_get_payload(value: Option<&[u8]>) -> Option<Vec<u8>> {
     let mut payload = Vec::with_capacity(32);
     payload.push(COMPACT_KV_GET);
@@ -555,23 +672,38 @@ fn build_compact_kv_get_payload(value: Option<&[u8]>) -> Option<Vec<u8>> {
     Some(payload)
 }
 
-fn build_compact_kv_mget_payload<'a>(values: Term<'a>) -> Option<OwnedBinary> {
-    let mut values_iter: ListIterator<'a> = values.decode().ok()?;
-    let mut values = Vec::new();
+#[derive(Clone, Copy)]
+enum CompactMgetEncoding {
+    Fixed { value_size: u32 },
+    Variable,
+}
 
+#[derive(Clone, Copy)]
+struct CompactMgetLayout {
+    count: u32,
+    payload_len: usize,
+    encoding: CompactMgetEncoding,
+}
+
+fn compact_kv_mget_layout<'a>(values: Term<'a>) -> Option<CompactMgetLayout> {
+    let mut values_iter: ListIterator<'a> = values.decode().ok()?;
     let mut count = 0u32;
     let mut all_present = true;
     let mut fixed_size: Option<usize> = None;
     let mut total_value_bytes = 0usize;
+    let mut variable_len = 5usize;
 
     for value in &mut values_iter {
         let value = value.decode::<Option<Binary<'a>>>().ok()?;
         count = count.checked_add(1)?;
+        variable_len = variable_len.checked_add(1)?;
 
         match value {
             Some(value) => {
-                let size = value.as_slice().len();
+                let size = value.len();
+                u32::try_from(size).ok()?;
                 total_value_bytes = total_value_bytes.checked_add(size)?;
+                variable_len = variable_len.checked_add(4)?.checked_add(size)?;
 
                 if let Some(existing_size) = fixed_size {
                     if existing_size != size {
@@ -580,63 +712,74 @@ fn build_compact_kv_mget_payload<'a>(values: Term<'a>) -> Option<OwnedBinary> {
                 } else {
                     fixed_size = Some(size);
                 }
-
-                values.push(Some(value));
             }
             None => {
                 all_present = false;
-                values.push(None);
             }
         }
     }
 
     if all_present {
         let size = fixed_size.unwrap_or(0);
-        let size_u32 = u32::try_from(size).ok()?;
-        let payload_len = 9usize.checked_add(total_value_bytes)?;
-        let mut out = OwnedBinary::new(payload_len)?;
-        let out_bytes = out.as_mut_slice();
-
-        out_bytes[0] = COMPACT_KV_MGET_FIXED;
-        out_bytes[1..5].copy_from_slice(&count.to_be_bytes());
-        out_bytes[5..9].copy_from_slice(&size_u32.to_be_bytes());
-
-        let mut offset = 9usize;
-        for value in &values {
-            let value = value.as_ref()?;
-            let value_bytes = value.as_slice();
-            let end = offset.checked_add(size)?;
-            out_bytes[offset..end].copy_from_slice(value_bytes);
-            offset = end;
-        }
-
-        return Some(out);
+        return Some(CompactMgetLayout {
+            count,
+            payload_len: 9usize.checked_add(total_value_bytes)?,
+            encoding: CompactMgetEncoding::Fixed {
+                value_size: u32::try_from(size).ok()?,
+            },
+        });
     }
 
-    let payload_len = values.iter().try_fold(5usize, |acc, value| {
-        let acc = acc.checked_add(1)?;
-        match value {
-            Some(value) => acc.checked_add(4)?.checked_add(value.as_slice().len()),
-            None => Some(acc),
-        }
-    })?;
+    Some(CompactMgetLayout {
+        count,
+        payload_len: variable_len,
+        encoding: CompactMgetEncoding::Variable,
+    })
+}
 
-    let mut payload = Vec::with_capacity(payload_len);
-    payload.push(COMPACT_KV_MGET);
-    payload.extend_from_slice(&count.to_be_bytes());
+fn write_compact_kv_mget_payload<'a>(
+    output: &mut [u8],
+    values: Term<'a>,
+    layout: CompactMgetLayout,
+) -> Option<()> {
+    let mut writer = CompactSliceWriter::new(output);
+    let mut values_iter: ListIterator<'a> = values.decode().ok()?;
 
-    for value in values {
-        match value {
-            Some(value) => {
-                payload.push(1);
-                append_compact_binary(&mut payload, value.as_slice())?;
+    match layout.encoding {
+        CompactMgetEncoding::Fixed { value_size } => {
+            writer.byte(COMPACT_KV_MGET_FIXED)?;
+            writer.write(&layout.count.to_be_bytes())?;
+            writer.write(&value_size.to_be_bytes())?;
+            for value in &mut values_iter {
+                let value = value.decode::<Option<Binary<'a>>>().ok()??;
+                if value.len() != value_size as usize {
+                    return None;
+                }
+                writer.write(value.as_slice())?;
             }
-            None => payload.push(0),
+        }
+        CompactMgetEncoding::Variable => {
+            writer.byte(COMPACT_KV_MGET)?;
+            writer.write(&layout.count.to_be_bytes())?;
+            for value in &mut values_iter {
+                match value.decode::<Option<Binary<'a>>>().ok()? {
+                    Some(value) => {
+                        writer.byte(1)?;
+                        writer.binary(value.as_slice())?;
+                    }
+                    None => writer.byte(0)?,
+                }
+            }
         }
     }
 
-    let mut out = OwnedBinary::new(payload.len())?;
-    out.as_mut_slice().copy_from_slice(&payload);
+    writer.finish()
+}
+
+fn build_compact_kv_mget_payload<'a>(values: Term<'a>) -> Option<OwnedBinary> {
+    let layout = compact_kv_mget_layout(values)?;
+    let mut out = OwnedBinary::new(layout.payload_len)?;
+    write_compact_kv_mget_payload(out.as_mut_slice(), values, layout)?;
     Some(out)
 }
 
@@ -646,21 +789,12 @@ fn is_ok_binary(value: &[u8]) -> bool {
         && (value[1] == b'K' || value[1] == b'k')
 }
 
+#[cfg(test)]
 fn append_compact_binary(out: &mut Vec<u8>, value: &[u8]) -> Option<()> {
     let len = u32::try_from(value.len()).ok()?;
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(value);
     Some(())
-}
-
-fn append_compact_optional_binary(out: &mut Vec<u8>, value: Option<&[u8]>) -> Option<()> {
-    match value {
-        Some(value) => append_compact_binary(out, value),
-        None => {
-            out.extend_from_slice(&u32::MAX.to_be_bytes());
-            Some(())
-        }
-    }
 }
 
 fn build_custom_ok_response_frame(
@@ -669,20 +803,24 @@ fn build_custom_ok_response_frame(
     request_id: u64,
     payload: &[u8],
 ) -> Option<OwnedBinary> {
-    let body_len = 2usize.checked_add(payload.len())?;
+    let mut out = allocate_custom_ok_response_frame(opcode, lane_id, request_id, payload.len())?;
+    out.as_mut_slice()[HEADER_SIZE + 2..].copy_from_slice(payload);
+    Some(out)
+}
+
+fn allocate_custom_ok_response_frame(
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    payload_len: usize,
+) -> Option<OwnedBinary> {
+    let body_len = 2usize.checked_add(payload_len)?;
     if body_len > MAX_FRAME_BODY_BYTES {
         return None;
     }
-    let mut out = OwnedBinary::new(HEADER_SIZE + body_len)?;
-    write_custom_ok_response_frame(
-        out.as_mut_slice(),
-        opcode,
-        lane_id,
-        request_id,
-        body_len,
-        payload,
-    );
-
+    let frame_len = HEADER_SIZE.checked_add(body_len)?;
+    let mut out = OwnedBinary::new(frame_len)?;
+    write_custom_ok_response_header(out.as_mut_slice(), opcode, lane_id, request_id, body_len);
     Some(out)
 }
 
@@ -697,6 +835,7 @@ fn validate_frame_body_len(body_len: usize) -> NifResult<u32> {
         .map_err(|_| rustler::Error::Term(Box::new("native frame body exceeds u32 length")))
 }
 
+#[cfg(test)]
 fn write_custom_ok_response_frame(
     bytes: &mut [u8],
     opcode: u16,
@@ -704,6 +843,17 @@ fn write_custom_ok_response_frame(
     request_id: u64,
     body_len: usize,
     payload: &[u8],
+) {
+    write_custom_ok_response_header(bytes, opcode, lane_id, request_id, body_len);
+    bytes[HEADER_SIZE + 2..].copy_from_slice(payload);
+}
+
+fn write_custom_ok_response_header(
+    bytes: &mut [u8],
+    opcode: u16,
+    lane_id: u32,
+    request_id: u64,
+    body_len: usize,
 ) {
     bytes[0..4].copy_from_slice(MAGIC);
     bytes[4] = VERSION | RESPONSE_DIRECTION;
@@ -713,7 +863,6 @@ fn write_custom_ok_response_frame(
     bytes[12..20].copy_from_slice(&request_id.to_be_bytes());
     bytes[20..24].copy_from_slice(&(body_len as u32).to_be_bytes());
     bytes[24..26].copy_from_slice(&STATUS_OK.to_be_bytes());
-    bytes[26..].copy_from_slice(payload);
 }
 
 #[cfg(test)]
@@ -738,6 +887,7 @@ mod atoms {
         done,
         execute,
         explain,
+        analyze,
         point,
         collection,
         history,
@@ -760,6 +910,7 @@ mod atoms {
         desc,
         invalid_parameter_type,
         invalid_syntax,
+        query_cursor_invalid,
         query_too_large,
         unsupported_field,
         unsupported_query_shape,
@@ -916,5 +1067,38 @@ mod tests {
         assert_eq!(bytes[27], 1);
         assert_eq!(&bytes[28..32], &5u32.to_be_bytes());
         assert_eq!(&bytes[32..37], b"value");
+    }
+
+    #[test]
+    fn compact_response_builders_do_not_materialize_payload_sized_temporaries() {
+        let source = include_str!("lib.rs");
+        let claim = source
+            .split("fn build_compact_claim_jobs_response_frame")
+            .nth(1)
+            .unwrap()
+            .split("fn build_compact_ok_list_response_frame")
+            .next()
+            .unwrap();
+        let get = source
+            .split("fn build_compact_kv_get_response_frame")
+            .nth(1)
+            .unwrap()
+            .split("fn build_compact_kv_get_payload")
+            .next()
+            .unwrap();
+        let framed_mget = source
+            .split("fn encode_compact_kv_mget_response_frame")
+            .nth(1)
+            .unwrap()
+            .split("fn encode_compact_kv_mget")
+            .next()
+            .unwrap();
+
+        assert!(!claim.contains("Vec::with_capacity"));
+        assert!(!claim.contains("build_custom_ok_response_frame("));
+        assert!(!get.contains("build_compact_kv_get_payload"));
+        assert!(!get.contains("build_custom_ok_response_frame("));
+        assert!(!framed_mget.contains("build_compact_kv_mget_payload"));
+        assert!(!framed_mget.contains("build_custom_ok_response_frame("));
     }
 }

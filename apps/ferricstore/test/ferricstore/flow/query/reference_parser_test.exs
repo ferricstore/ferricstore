@@ -103,6 +103,29 @@ defmodule Ferricstore.Flow.Query.ReferenceParserTest do
                )
     end
 
+    test "parses EXPLAIN ANALYZE as a distinct fresh-execution mode" do
+      query =
+        "EXPLAIN ANALYZE FROM runs WHERE partition_key = @partition " <>
+          "AND state = 'failed' ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS"
+
+      assert {:ok,
+              %Request{
+                mode: :analyze,
+                cursor: nil,
+                limit: 10,
+                return: :record
+              }} = ReferenceParser.parse(query)
+
+      assert {:error, :invalid_syntax} =
+               ReferenceParser.parse("ANALYZE FROM runs WHERE run_id = 'run-1' RETURN RECORD")
+
+      assert {:error, :query_cursor_invalid} =
+               ReferenceParser.parse(
+                 "EXPLAIN ANALYZE FROM runs WHERE partition_key = @partition " <>
+                   "ORDER BY updated_at_ms DESC LIMIT 10 CURSOR @page RETURN RECORDS"
+               )
+    end
+
     test "parses bounded collection equality, IN, time window, order, and limit" do
       query =
         "FROM runs WHERE partition_key = @tenant " <>
@@ -170,6 +193,31 @@ defmodule Ferricstore.Flow.Query.ReferenceParserTest do
         assert {:ok, %Request{mode: :explain, predicate: {:and, [_tenant, ^expected]}}} =
                  ReferenceParser.parse(query)
       end
+    end
+
+    test "parses safely quoted metadata field segments" do
+      query =
+        "FROM runs WHERE partition_key = @tenant " <>
+          "AND state_meta['review.v2']['ai.model'] = @model " <>
+          "ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS"
+
+      assert {:ok,
+              %Request{
+                predicate:
+                  {:and,
+                   [
+                     {:eq, :partition_key, {:parameter, :keyword, "tenant"}},
+                     {:eq, {:state_meta, "review.v2", "ai.model"},
+                      {:parameter, :dynamic, "model"}}
+                   ]}
+              }} = ReferenceParser.parse(query)
+
+      assert {:ok, _request} =
+               ReferenceParser.parse(
+                 "FROM runs WHERE partition_key = @tenant " <>
+                   "AND attribute['customer''s.region'] = @region " <>
+                   "ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS"
+               )
     end
 
     test "parses a bounded scalar count without row ordering or pagination" do

@@ -3,6 +3,7 @@ defmodule Ferricstore.Raft.ServerCatalogApplyTest do
 
   alias Ferricstore.Raft.StateMachine
   alias Ferricstore.ServerCatalog
+  alias Ferricstore.Store.Shard.NamespaceUsageIndex
 
   setup do
     root = Path.join(System.tmp_dir!(), "server_catalog_#{System.unique_integer([:positive])}")
@@ -226,17 +227,165 @@ defmodule Ferricstore.Raft.ServerCatalogApplyTest do
              )
   end
 
+  test "Flow creation and a colocated catalog mutation commit in one apply", %{state: state} do
+    state = %{state | shard_index: 3}
+    attrs = flow_attrs("atomic-invocation", "tenant:atomic")
+    state_key = Ferricstore.Flow.Keys.state_key(attrs.id, attrs.partition_key)
+
+    command =
+      {:flow_create_with_catalog, state_key,
+       %{
+         namespace: "enterprise_invocations_00",
+         subject: attrs.id,
+         expected_encoded: nil,
+         expected_revision: nil,
+         value: "invocation-record",
+         max_live_entries: 10
+       }, attrs}
+
+    {state, result} =
+      apply_result(StateMachine.apply(%{index: 51, system_time: 1_000}, command, state))
+
+    assert {:ok, encoded_catalog} = result
+
+    assert [{^state_key, encoded_flow, 0, _lfu, _file_id, _offset, _size}] =
+             :ets.lookup(state.ets, state_key)
+
+    assert %{id: "atomic-invocation"} = Ferricstore.Flow.decode_record(encoded_flow)
+
+    assert {:ok, %{version: 51, value: "invocation-record"}} =
+             ServerCatalog.decode_entry(encoded_catalog)
+
+    assert {:ok, %{version: 51, value: "invocation-record"}} =
+             catalog_entry(state, "enterprise_invocations_00", attrs.id)
+  end
+
+  test "stale colocated catalog admission leaves no Flow state", %{state: state} do
+    assert {state, {:ok, _existing}} =
+             apply_result(
+               StateMachine.apply(
+                 %{index: 60},
+                 {:server_catalog_mutate, "atomic", "existing", nil, nil, "value", 10},
+                 state
+               )
+             )
+
+    attrs = flow_attrs("rejected-invocation", "tenant:atomic")
+    state_key = Ferricstore.Flow.Keys.state_key(attrs.id, attrs.partition_key)
+
+    command =
+      {:flow_create_with_catalog, state_key,
+       %{
+         namespace: "atomic",
+         subject: attrs.id,
+         expected_encoded: nil,
+         expected_revision: nil,
+         value: "invocation-record",
+         max_live_entries: 10
+       }, attrs}
+
+    {_state, result} =
+      apply_result(StateMachine.apply(%{index: 61, system_time: 1_000}, command, state))
+
+    assert {:error, :stale_server_catalog_revision} = result
+
+    assert [] = :ets.lookup(state.ets, state_key)
+    assert [] = :ets.lookup(state.ets, ServerCatalog.entry_key("atomic", attrs.id))
+  end
+
+  test "failed Flow creation rolls back its colocated catalog mutation", %{state: state} do
+    attrs = flow_attrs("duplicate-invocation", "tenant:atomic")
+    state_key = Ferricstore.Flow.Keys.state_key(attrs.id, attrs.partition_key)
+
+    assert {state, :ok} =
+             apply_result(
+               StateMachine.apply(
+                 %{index: 70, system_time: 1_000},
+                 {:flow_create, state_key, attrs},
+                 state
+               )
+             )
+
+    assert :ok =
+             NamespaceUsageIndex.rebuild_scope(
+               state.namespace_usage_index_name,
+               state.namespace_usage_expiry_name,
+               state.ets,
+               "*",
+               now_ms: 1_000
+             )
+
+    assert {:ok, baseline_usage} =
+             NamespaceUsageIndex.usage(
+               state.namespace_usage_index_name,
+               state.namespace_usage_expiry_name,
+               "*",
+               1_000
+             )
+
+    command =
+      {:flow_create_with_catalog, state_key,
+       %{
+         namespace: "atomic_rollback",
+         subject: attrs.id,
+         expected_encoded: nil,
+         expected_revision: nil,
+         value: "invocation-record",
+         max_live_entries: 10
+       }, attrs}
+
+    {_state, result} =
+      apply_result(StateMachine.apply(%{index: 71, system_time: 1_000}, command, state))
+
+    assert {:error, "ERR flow already exists"} = result
+    assert :missing = catalog_entry(state, "atomic_rollback", attrs.id)
+
+    assert [] =
+             :ets.lookup(state.ets, ServerCatalog.revision_key("atomic_rollback"))
+
+    assert [] =
+             :ets.lookup(state.ets, ServerCatalog.live_count_key("atomic_rollback"))
+
+    assert [{^state_key, encoded_flow, 0, _lfu, _file_id, _offset, _size}] =
+             :ets.lookup(state.ets, state_key)
+
+    assert %{id: "duplicate-invocation"} = Ferricstore.Flow.decode_record(encoded_flow)
+
+    assert {:ok, ^baseline_usage} =
+             NamespaceUsageIndex.usage(
+               state.namespace_usage_index_name,
+               state.namespace_usage_expiry_name,
+               "*",
+               1_000
+             )
+  end
+
   defp catalog_mutation(subject, expected, expected_revision, value, max_live_entries) do
     {:server_catalog_mutate, "acl", subject, expected, expected_revision, value, max_live_entries}
   end
 
   defp catalog_entry(state, subject) do
-    key = ServerCatalog.entry_key("acl", subject)
+    catalog_entry(state, "acl", subject)
+  end
+
+  defp catalog_entry(state, namespace, subject) do
+    key = ServerCatalog.entry_key(namespace, subject)
 
     case :ets.lookup(state.ets, key) do
       [{^key, encoded, 0, _lfu, _file_id, _offset, _size}] -> ServerCatalog.decode_entry(encoded)
       [] -> :missing
     end
+  end
+
+  defp flow_attrs(id, partition_key) do
+    %{
+      id: id,
+      type: "invocation",
+      state: "queued",
+      partition_key: partition_key,
+      now_ms: 1_000,
+      policy_reference_captured: true
+    }
   end
 
   defp apply_result({state, {:applied_at, _index, result}, _effects}), do: {state, result}

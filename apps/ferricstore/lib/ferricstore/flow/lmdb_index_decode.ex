@@ -34,27 +34,18 @@ defmodule Ferricstore.Flow.LMDBIndexDecode do
 
   def query_entries(entries, path, now_ms)
       when is_list(entries) and is_binary(path) and is_integer(now_ms) and now_ms >= 0 do
-    reduce_entries(entries, fn
-      key, value, acc ->
-        case decode_query_entry(key, value) do
-          {:ok, id, updated_at_ms, expire_at_ms, state_key}
-          when expire_at_ms <= 0 or expire_at_ms > now_ms ->
-            {:ok, [{id, updated_at_ms, state_key} | acc]}
-
-          {:ok, _id, _updated_at_ms, _expire_at_ms, _state_key} ->
-            case LMDB.write_batch(path, [{:delete, key}]) do
-              :ok -> {:ok, acc}
-              {:error, _reason} = error -> error
-            end
-
-          {:error, _reason} = error ->
-            error
-        end
-    end)
+    query_entries_with_writer(entries, path, now_ms, &LMDB.write_batch/2)
   end
 
   def query_entries(_entries, _path, _now_ms),
     do: {:error, :invalid_query_index_entries}
+
+  @doc false
+  def __query_entries_with_writer_for_test__(entries, path, now_ms, writer)
+      when is_list(entries) and is_binary(path) and is_integer(now_ms) and now_ms >= 0 and
+             is_function(writer, 2) do
+    query_entries_with_writer(entries, path, now_ms, writer)
+  end
 
   def query_entries_readonly(entries, now_ms)
       when is_list(entries) and is_integer(now_ms) and now_ms >= 0 do
@@ -153,6 +144,48 @@ defmodule Ferricstore.Flow.LMDBIndexDecode do
 
       :error ->
         {:error, {:invalid_query_index_value, key}}
+    end
+  end
+
+  defp query_entries_with_writer(entries, path, now_ms, writer) do
+    with {:ok, decoded, delete_operations} <- reduce_query_entries(entries, now_ms),
+         :ok <- write_query_deletes(path, delete_operations, writer) do
+      {:ok, decoded}
+    end
+  end
+
+  defp reduce_query_entries(entries, now_ms) do
+    entries
+    |> Enum.reduce_while({:ok, [], []}, fn
+      {key, value}, {:ok, decoded, deletes} when is_binary(key) and is_binary(value) ->
+        case decode_query_entry(key, value) do
+          {:ok, id, updated_at_ms, expire_at_ms, state_key}
+          when expire_at_ms <= 0 or expire_at_ms > now_ms ->
+            {:cont, {:ok, [{id, updated_at_ms, state_key} | decoded], deletes}}
+
+          {:ok, _id, _updated_at_ms, _expire_at_ms, _state_key} ->
+            {:cont, {:ok, decoded, [{:delete, key} | deletes]}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+        end
+
+      invalid, _acc ->
+        {:halt, {:error, {:invalid_lmdb_index_entry, invalid}}}
+    end)
+    |> case do
+      {:ok, decoded, deletes} -> {:ok, Enum.reverse(decoded), Enum.reverse(deletes)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp write_query_deletes(_path, [], _writer), do: :ok
+
+  defp write_query_deletes(path, operations, writer) do
+    case writer.(path, operations) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      invalid -> {:error, {:invalid_query_index_cleanup_result, invalid}}
     end
   end
 

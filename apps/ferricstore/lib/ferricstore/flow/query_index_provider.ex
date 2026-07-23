@@ -10,7 +10,7 @@ defmodule FerricStore.Flow.QueryIndexProvider do
 
   alias Ferricstore.Flow.Query.{RegisteredIndex, RegistrySnapshot}
 
-  @default_implementation FerricStore.Flow.QueryIndexProvider.Disabled
+  @default_implementation Ferricstore.Flow.Query.IndexProvider
 
   @callback snapshot(FerricStore.Instance.t() | map(), non_neg_integer()) ::
               {:ok, RegistrySnapshot.t()} | {:error, term()}
@@ -113,12 +113,12 @@ defmodule FerricStore.Flow.QueryIndexProvider do
   end
 
   @spec enabled?(FerricStore.Instance.t() | map()) :: boolean()
-  def enabled?(ctx), do: implementation(ctx) != @default_implementation
+  def enabled?(ctx), do: implementation(ctx) != FerricStore.Flow.QueryIndexProvider.Disabled
 
   defp implementation(%{query_index_provider: implementation}) when is_atom(implementation),
     do: implementation
 
-  defp implementation(_ctx), do: @default_implementation
+  defp implementation(_ctx), do: FerricStore.Flow.QueryIndexProvider.Disabled
 end
 
 defmodule FerricStore.Flow.QueryIndexProvider.Disabled do

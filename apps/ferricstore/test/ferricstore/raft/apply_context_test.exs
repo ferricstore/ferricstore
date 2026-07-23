@@ -403,6 +403,26 @@ defmodule Ferricstore.Raft.ApplyContextTest do
     end
   end
 
+  test "replicated metadata field versions stay inside the unsigned 64-bit contract" do
+    oversized_version = 0x1_0000_0000_0000_0000
+
+    assert_raise ArgumentError, "invalid Flow metadata apply context", fn ->
+      ApplyContext.new(
+        flow_metadata_mode: :shared,
+        flow_metadata_generation: 1,
+        flow_metadata_schema_digest: <<1::256>>,
+        flow_metadata_fields: %{
+          0x8001 => %{
+            version: oversized_version,
+            type: :uint64,
+            role: :isolation_scope,
+            required_in: :shared
+          }
+        }
+      )
+    end
+  end
+
   test "only policy-sensitive commands carry the compact replicated context" do
     context = ApplyContext.new(flow_default_history_max_events: 17)
     flow_command = {:flow_create, "state-key", %{id: "id", type: "email"}}
@@ -443,6 +463,7 @@ defmodule Ferricstore.Raft.ApplyContextTest do
       :flow_cross_terminal,
       :flow_cross_terminal_many,
       :flow_create,
+      :flow_create_with_catalog,
       :flow_create_many,
       :flow_create_pipeline_batch,
       :flow_extend_lease,

@@ -114,8 +114,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
     """
     <label class="flow-query-field">
       Partition
-      <input class="flow-search-input mono" name="partition_key" value="#{escape_attr(partition_key || "")}" placeholder="optional">
-      <span class="flow-field-help">Optional. Use it when the workflow id or index is partition-scoped.</span>
+      <input class="flow-search-input mono" name="partition_key" value="#{escape_attr(partition_key || "")}" placeholder="required for record queries">
+      <span class="flow-field-help">Required for bounded record queries; optional for history and aggregate views.</span>
     </label>
     """
   end
@@ -244,16 +244,16 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
 
   def flow_query_kind_options do
     [
-      {"list", "FLOW.LIST"},
-      {"search", "FLOW.SEARCH"},
+      {"list", "FLOW.QUERY: list"},
+      {"search", "FLOW.QUERY: metadata"},
       {"stats", "FLOW.STATS"},
-      {"terminals", "FLOW.TERMINALS"},
-      {"failures", "FLOW.FAILURES"},
-      {"stuck", "FLOW.STUCK"},
+      {"terminals", "FLOW.QUERY: terminals"},
+      {"failures", "FLOW.QUERY: failures"},
+      {"stuck", "FLOW.QUERY: expired leases"},
       {"history", "FLOW.HISTORY"},
-      {"by_parent", "FLOW.BY_PARENT"},
-      {"by_root", "FLOW.BY_ROOT"},
-      {"by_correlation", "FLOW.BY_CORRELATION"}
+      {"by_parent", "FLOW.QUERY: parent"},
+      {"by_root", "FLOW.QUERY: root"},
+      {"by_correlation", "FLOW.QUERY: correlation"}
     ]
   end
 
@@ -265,13 +265,13 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
   def flow_query_kind_docs do
     %{
       "list" => %{
-        command: "FLOW.LIST",
+        command: "FLOW.QUERY",
         purpose: "List workflows by type.",
         detail:
           "Use optional state, partition, time range, direction, and attribute filters to keep the result bounded."
       },
       "search" => %{
-        command: "FLOW.SEARCH",
+        command: "FLOW.QUERY",
         purpose: "Search policy-indexed Flow metadata.",
         detail:
           "Use indexed attribute filters and optional indexed state metadata filters. Search is bounded, projection-consistent, and payloads stay unloaded."
@@ -283,19 +283,19 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
           "Use this before fetching rows when you only need a bounded count for state or attribute filters."
       },
       "terminals" => %{
-        command: "FLOW.TERMINALS",
+        command: "FLOW.QUERY",
         purpose: "List terminal workflows for a type.",
         detail:
           "Use this to audit completed, failed, or cancelled workflow retention and terminal distribution."
       },
       "failures" => %{
-        command: "FLOW.FAILURES",
+        command: "FLOW.QUERY",
         purpose: "List failed workflows for a type.",
         detail:
           "Use this to inspect failure pressure before retrying, rewinding, or running retention cleanup."
       },
       "stuck" => %{
-        command: "FLOW.STUCK",
+        command: "FLOW.QUERY",
         purpose: "Find running workflows whose leases or progress look stale.",
         detail:
           "State is intentionally hidden here; this query is driven by type, partition, and indexed time bounds."
@@ -309,7 +309,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         id_help: "Required. The workflow whose history should be loaded."
       },
       "by_parent" => %{
-        command: "FLOW.BY_PARENT",
+        command: "FLOW.QUERY",
         purpose: "List workflows created under one parent.",
         detail: "Use this for fanout debugging when one workflow spawned many children.",
         id_label: "Parent ID",
@@ -317,7 +317,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         id_help: "Required. Matches workflows whose parent_id equals this value."
       },
       "by_root" => %{
-        command: "FLOW.BY_ROOT",
+        command: "FLOW.QUERY",
         purpose: "List workflows in one root lineage.",
         detail: "Use this to inspect the full tree that belongs to one root workflow.",
         id_label: "Root ID",
@@ -325,7 +325,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowQueryControls do
         id_help: "Required. Matches workflows whose root_id equals this value."
       },
       "by_correlation" => %{
-        command: "FLOW.BY_CORRELATION",
+        command: "FLOW.QUERY",
         purpose: "List workflows sharing one correlation id.",
         detail:
           "Use this for request, tenant, IoT fanout, or external job correlation debugging.",

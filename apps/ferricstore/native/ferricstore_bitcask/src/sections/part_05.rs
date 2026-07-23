@@ -6,9 +6,9 @@
 ///
 /// ## Scheduler contract
 ///
-/// Runs on a dirty CPU scheduler while decoding and copying the unbounded
-/// batch. CRC/record encoding and file write + fsync run on a Tokio blocking
-/// worker.
+/// Runs on a dirty CPU scheduler while measuring the bounded batch. Admission
+/// is acquired before copying its binaries; CRC/record encoding and file write
+/// + fsync run on a Tokio blocking worker.
 #[rustler::nif(schedule = "DirtyCpu")]
 #[allow(clippy::needless_pass_by_value)]
 fn v2_append_batch_async<'a>(
@@ -18,19 +18,31 @@ fn v2_append_batch_async<'a>(
     path: String,
     records: Vec<(Binary<'a>, Binary<'a>, u64)>,
 ) -> NifResult<Term<'a>> {
-    // Step 1: Copy BEAM binaries into owned Vecs before spawning to Tokio
-    // because Binary<'a> borrows from the NIF env which is destroyed when
-    // this function returns. Validation and record encoding happen in the
-    // blocking worker below so large batches do not burn normal BEAM scheduler time.
-    let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = records
-        .iter()
-        .map(|(k, v, exp)| (k.as_slice().to_vec(), v.as_slice().to_vec(), *exp))
-        .collect();
+    let input_bytes = match async_io::checked_input_bytes(
+        records
+            .iter()
+            .flat_map(|(key, value, _expire_at_ms)| [key.len(), value.len()]),
+    ) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok((atoms::error(), reason).encode(env)),
+    };
 
-    let owned_path = path;
-
-    let blocking_task = match async_io::try_spawn_blocking(move || {
-        let p = std::path::Path::new(&owned_path);
+    let blocking_task = match async_io::try_spawn_blocking_with_input(
+        input_bytes,
+        || {
+            records
+                .iter()
+                .map(|(key, value, expire_at_ms)| {
+                    (
+                        key.as_slice().to_vec(),
+                        value.as_slice().to_vec(),
+                        *expire_at_ms,
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+        move |entries| {
+        let p = std::path::Path::new(&path);
         let file_id = parse_file_id(p);
 
         match log::LogWriter::open(p, file_id) {
@@ -46,7 +58,8 @@ fn v2_append_batch_async<'a>(
             }
             Err(e) => Err(e.to_string()),
         }
-    }) {
+        },
+    ) {
         Ok(task) => task,
         Err(reason) => return Ok((atoms::error(), reason).encode(env)),
     };

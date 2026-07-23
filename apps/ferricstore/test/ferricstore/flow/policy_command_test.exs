@@ -14,6 +14,10 @@ defmodule Ferricstore.Flow.PolicyCommandTest do
   test "signal transitions are policy-sensitive commands" do
     assert PolicyCommand.requires_stamp?({:flow_signal, "state-key", %{}})
     assert PolicyCommand.requires_stamp?({:flow_signal_many, "state-key", %{records: []}})
+
+    assert PolicyCommand.requires_stamp?(
+             {:flow_create_with_catalog, "state-key", %{namespace: "invocations"}, %{}}
+           )
   end
 
   test "ordinary KV batches return the original list without consulting context" do

@@ -421,6 +421,41 @@ defmodule Ferricstore.FlowStateMetaTest do
              FerricStore.flow_policy_set(type, indexed_state_meta: ["version", "owner"])
   end
 
+  test "rejects state_meta numbers that cannot be represented by query and native codecs" do
+    assert {:error, "ERR flow state_meta integer must fit in signed 64 bits"} =
+             FerricStore.flow_create(unique_flow_id("state-meta-integer-high"),
+               type: "state-meta",
+               state: "accept",
+               partition_key: @partition,
+               state_meta: %{"number" => 0x8000_0000_0000_0000},
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:error, "ERR flow state_meta integer must fit in signed 64 bits"} =
+             FerricStore.flow_create(unique_flow_id("state-meta-integer-low"),
+               type: "state-meta",
+               state: "accept",
+               partition_key: @partition,
+               state_meta: %{"number" => -0x8000_0000_0000_0001},
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             FerricStore.flow_create(unique_flow_id("state-meta-integer-bounds"),
+               type: "state-meta",
+               state: "accept",
+               partition_key: @partition,
+               state_meta: %{
+                 "minimum" => -0x8000_0000_0000_0000,
+                 "maximum" => 0x7FFF_FFFF_FFFF_FFFF
+               },
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+  end
+
   test "state_meta update cannot grow a state beyond the entry cap" do
     type = unique_flow_id("state-meta-merge-limits")
     id = unique_flow_id("state-meta-merge-limit")

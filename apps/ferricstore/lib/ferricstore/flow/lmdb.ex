@@ -12,6 +12,8 @@ defmodule Ferricstore.Flow.LMDB do
   @max_u64 18_446_744_073_709_551_615
   @max_bounded_range_items 100_000
   @max_bounded_range_bytes 64 * 1_024 * 1_024
+  @max_prefix_merge_paths 1_024
+  @max_lmdb_key_bytes 511
   @flow_due_any_index_enabled Application.compile_env(
                                 :ferricstore,
                                 :flow_due_any_index,
@@ -181,6 +183,10 @@ defmodule Ferricstore.Flow.LMDB do
   def get_many_bounded(path, keys, max_bytes)
       when is_binary(path) and is_list(keys) and is_integer(max_bytes) and max_bytes > 0,
       do: Access.get_many_bounded(path, keys, max_bytes)
+
+  def get_many_prefix_bounded(path, keys, max_bytes)
+      when is_binary(path) and is_list(keys) and is_integer(max_bytes) and max_bytes > 0,
+      do: Access.get_many_prefix_bounded(path, keys, max_bytes)
 
   def warm(path) when is_binary(path) do
     case NIF.lmdb_get(path, <<0>>, map_size()) do
@@ -473,12 +479,159 @@ defmodule Ferricstore.Flow.LMDB do
       ),
       do: {:error, :invalid_lmdb_range}
 
+  def composite_range_entries_bounded(
+        path,
+        prefix,
+        after_key,
+        before_key,
+        max_items,
+        max_bytes
+      )
+      when is_binary(path) and is_binary(prefix) and prefix != "" and is_binary(after_key) and
+             is_binary(before_key) and is_integer(max_items) and max_items > 0 and
+             max_items <= @max_bounded_range_items and is_integer(max_bytes) and max_bytes > 0 and
+             max_bytes <= @max_bounded_range_bytes do
+    if valid_range_bound?(prefix, after_key) and valid_range_bound?(prefix, before_key) and
+         valid_range_order?(after_key, before_key) do
+      if Ferricstore.FS.dir?(path) do
+        NIF.lmdb_composite_range_entries_bounded(
+          path,
+          prefix,
+          after_key,
+          before_key,
+          max_items,
+          max_bytes,
+          map_size()
+        )
+      else
+        {:ok, [], true, 0}
+      end
+    else
+      {:error, :invalid_lmdb_range}
+    end
+  end
+
+  def composite_range_entries_bounded(
+        _path,
+        _prefix,
+        _after_key,
+        _before_key,
+        _max_items,
+        _max_bytes
+      ),
+      do: {:error, :invalid_lmdb_range}
+
+  @spec prefix_merge_entries([binary()], binary(), non_neg_integer(), pos_integer()) ::
+          {:ok, [{non_neg_integer(), binary(), binary()}], non_neg_integer()}
+          | {:error, term()}
+  def prefix_merge_entries(paths, prefix, limit, max_bytes)
+      when is_list(paths) and paths != [] and length(paths) <= @max_prefix_merge_paths and
+             is_binary(prefix) and prefix != "" and byte_size(prefix) <= @max_lmdb_key_bytes and
+             is_integer(limit) and limit >= 0 and limit <= @max_bounded_range_items and
+             is_integer(max_bytes) and max_bytes > 0 and max_bytes <= @max_bounded_range_bytes do
+    if Enum.all?(paths, &(is_binary(&1) and &1 != "")) and
+         length(paths) == length(Enum.uniq(paths)) do
+      prefix_merge_present_paths(paths, prefix, limit, max_bytes)
+    else
+      {:error, :invalid_lmdb_prefix_merge}
+    end
+  end
+
+  def prefix_merge_entries(_paths, _prefix, _limit, _max_bytes),
+    do: {:error, :invalid_lmdb_prefix_merge}
+
   defp valid_range_bound?(_prefix, ""), do: true
   defp valid_range_bound?(prefix, key), do: String.starts_with?(key, prefix)
 
   defp valid_range_order?(_after_key, ""), do: true
   defp valid_range_order?("", _before_key), do: true
   defp valid_range_order?(after_key, before_key), do: after_key < before_key
+
+  defp prefix_merge_present_paths(_paths, _prefix, 0, _max_bytes), do: {:ok, [], 0}
+
+  defp prefix_merge_present_paths(paths, prefix, limit, max_bytes) do
+    present =
+      paths
+      |> Enum.with_index()
+      |> Enum.filter(fn {path, _source} -> Ferricstore.FS.dir?(path) end)
+
+    case present do
+      [] ->
+        {:ok, [], 0}
+
+      _paths ->
+        source_indices = present |> Enum.map(&elem(&1, 1)) |> List.to_tuple()
+        native_paths = Enum.map(present, &elem(&1, 0))
+
+        native_paths
+        |> NIF.lmdb_prefix_merge_entries(prefix, limit, max_bytes, map_size())
+        |> normalize_prefix_merge_result(source_indices, prefix, limit, max_bytes)
+    end
+  end
+
+  defp normalize_prefix_merge_result(
+         {:ok, rows, scanned},
+         source_indices,
+         prefix,
+         limit,
+         max_bytes
+       )
+       when is_list(rows) and is_integer(scanned) and scanned >= 0 do
+    source_count = tuple_size(source_indices)
+
+    if length(rows) <= limit and scanned >= length(rows) and scanned <= source_count * limit do
+      normalize_prefix_merge_rows(rows, source_indices, prefix, max_bytes)
+      |> case do
+        {:ok, normalized} -> {:ok, normalized, scanned}
+        {:error, _reason} = error -> error
+      end
+    else
+      {:error, :invalid_lmdb_prefix_merge_result}
+    end
+  end
+
+  defp normalize_prefix_merge_result(
+         {:error, _reason} = error,
+         _source_indices,
+         _prefix,
+         _limit,
+         _max_bytes
+       ),
+       do: error
+
+  defp normalize_prefix_merge_result(_result, _source_indices, _prefix, _limit, _max_bytes),
+    do: {:error, :invalid_lmdb_prefix_merge_result}
+
+  defp normalize_prefix_merge_rows(rows, source_indices, prefix, max_bytes) do
+    rows
+    |> Enum.reduce_while({:ok, [], nil, 0}, fn
+      {source, key, value}, {:ok, acc, previous, bytes}
+      when is_integer(source) and source >= 0 and source < tuple_size(source_indices) and
+             is_binary(key) and is_binary(value) ->
+        original_source = elem(source_indices, source)
+        order_key = {key, original_source}
+        next_bytes = bytes + byte_size(key) + byte_size(value)
+
+        if next_bytes <= max_bytes and binary_starts_with?(key, prefix) and
+             (is_nil(previous) or previous <= order_key) do
+          {:cont, {:ok, [{original_source, key, value} | acc], order_key, next_bytes}}
+        else
+          {:halt, {:error, :invalid_lmdb_prefix_merge_result}}
+        end
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_lmdb_prefix_merge_result}}
+    end)
+    |> case do
+      {:ok, reversed, _previous, _bytes} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp binary_starts_with?(value, prefix) when byte_size(value) >= byte_size(prefix),
+    do: binary_part(value, 0, byte_size(prefix)) == prefix
+
+  defp binary_starts_with?(_value, _prefix), do: false
 
   def prefix_entries(path, prefix, limit, false), do: prefix_entries(path, prefix, limit)
 

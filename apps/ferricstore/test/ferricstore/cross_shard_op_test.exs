@@ -4,8 +4,10 @@ defmodule Ferricstore.CrossShardOpTest do
   @moduletag :global_state
 
   alias Ferricstore.Commands.Generic
+  alias Ferricstore.Commands.List, as: ListCommand
   alias Ferricstore.Commands.Set
   alias Ferricstore.CrossShardOp
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -35,6 +37,28 @@ defmodule Ferricstore.CrossShardOpTest do
     assert :ok == Generic.handle("RENAME", [source, destination], ctx)
     assert Router.get(ctx, source) == nil
     assert Router.get(ctx, destination) == "value"
+  end
+
+  test "same-shard stores expose bounded compound slices" do
+    ctx = FerricStore.Instance.get(:default)
+    {source, _destination} = ShardHelpers.keys_on_same_shard()
+
+    assert 3 == ListCommand.handle("RPUSH", [source, "a", "b", "c"], ctx)
+
+    assert [{_first_position, "a"}, {_second_position, "b"}] =
+             CrossShardOp.execute(
+               [{source, :read}],
+               fn store ->
+                 store.compound_scan_slice.(
+                   source,
+                   CompoundKey.list_prefix(source),
+                   0,
+                   2,
+                   3
+                 )
+               end,
+               instance: ctx
+             )
   end
 
   test "durable cross-group execution rejects before invoking the callback" do

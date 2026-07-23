@@ -181,10 +181,10 @@ defmodule FerricstoreServer.Native.BlockingTest do
     meta = %{request_id: make_ref()}
     assert {:ok, worker, monitor_ref} = Blocking.start_prepared(prepared, state, meta)
 
-    assert_receive {:native_blocking_outbound_overflow, ^meta, ^worker}
+    assert_receive {:native_blocking_outbound_overflow, ^meta, ^worker}, 1_000
     refute_receive {:native_blocking_response, ^meta, ^worker, _status, _value}
     refute_receive {:native_blocking_response_budgeted, ^meta, ^worker, _status, _value, _lease}
-    assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}
+    assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}, 1_000
     assert OutboundBudget.usage(counter) == 0
     assert ResourceBudget.usage(budget).outbound_bytes == 0
   end

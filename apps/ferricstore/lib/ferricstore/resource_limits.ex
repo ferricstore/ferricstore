@@ -13,6 +13,7 @@ defmodule FerricStore.ResourceLimits do
   @type amount :: non_neg_integer()
   @type command :: binary()
   @type command_args :: [term()]
+  @type command_lease :: term()
   @type limit_spec :: map()
   @type reservation :: term()
   @type result :: :ok | {:ok, term()} | {:error, term()}
@@ -27,6 +28,9 @@ defmodule FerricStore.ResourceLimits do
   @callback record_activity([binary()], keyword()) :: :ok
   @callback check_command(command(), command_args(), [binary()], keyword()) ::
               :ok | {:error, term()}
+  @callback acquire_command(command(), command_args(), [binary()], keyword()) ::
+              {:ok, command_lease()} | {:error, term()}
+  @callback release_command(command_lease(), keyword()) :: :ok
 
   @spec set_limit(scope(), limit_spec(), keyword()) :: result()
   def set_limit(scope, limit_spec, opts \\ []),
@@ -59,6 +63,16 @@ defmodule FerricStore.ResourceLimits do
   def check_command(command, args, keys, opts \\ [])
       when is_binary(command) and is_list(args) and is_list(keys),
       do: implementation(opts).check_command(command, args, keys, opts)
+
+  @spec acquire_command(command(), command_args(), [binary()], keyword()) ::
+          {:ok, command_lease()} | {:error, term()}
+  def acquire_command(command, args, keys, opts \\ [])
+      when is_binary(command) and is_list(args) and is_list(keys),
+      do: implementation(opts).acquire_command(command, args, keys, opts)
+
+  @spec release_command(command_lease(), keyword()) :: :ok
+  def release_command(lease, opts \\ []),
+    do: implementation(opts).release_command(lease, opts)
 
   @spec error_message(term()) :: binary()
   def error_message("ERR " <> _ = reason), do: reason
@@ -129,4 +143,10 @@ defmodule FerricStore.ResourceLimits.Default do
 
   @impl true
   def check_command(_command, _args, _keys, _opts), do: :ok
+
+  @impl true
+  def acquire_command(_command, _args, _keys, _opts), do: {:ok, nil}
+
+  @impl true
+  def release_command(_lease, _opts), do: :ok
 end

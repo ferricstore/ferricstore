@@ -345,7 +345,7 @@ defmodule Ferricstore.Flow.Query.LineageRead do
     do: {:error, :query_scan_budget_exceeded}
 
   defp hydrate_records(_ctx, [], _physical_partition, _descriptor, prefetched),
-    do: {:ok, [], 0, :erlang.external_size(prefetched, minor_version: 2)}
+    do: {:ok, [], 0, Ferricstore.TermMemory.bytes(prefetched)}
 
   defp hydrate_records(ctx, refs, physical_partition, descriptor, prefetched)
        when is_map(prefetched) do
@@ -357,10 +357,7 @@ defmodule Ferricstore.Flow.Query.LineageRead do
          :ok <- validate_hydrated_records(records, refs, physical_partition, descriptor),
          {:ok, projected} <- project_records(records) do
       memory_high_water_bytes =
-        :erlang.external_size(
-          {prefetched, loaded, records, projected},
-          minor_version: 2
-        )
+        Ferricstore.TermMemory.bytes({prefetched, loaded, records, projected})
 
       {:ok, projected, length(missing_ids), memory_high_water_bytes}
     else

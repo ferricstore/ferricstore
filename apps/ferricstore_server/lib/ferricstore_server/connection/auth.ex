@@ -179,6 +179,34 @@ defmodule FerricstoreServer.Connection.Auth do
     end
   end
 
+  @spec check_commands_cached(
+          map() | :full_access | :denied | nil,
+          [binary()]
+        ) :: :ok | {:error, binary(), binary()}
+  def check_commands_cached(cache, [command | _rest] = commands) when is_binary(command) do
+    case ensure_acl_projection_ready() do
+      :ok -> do_check_commands_cached(cache, commands)
+      {:error, reason} -> {:error, command, reason}
+    end
+  end
+
+  def check_commands_cached(_cache, _commands),
+    do: {:error, "ACL", "NOPERM invalid ACL command authorization request"}
+
+  @spec check_any_command_cached(
+          map() | :full_access | :denied | nil,
+          [binary()]
+        ) :: :ok | {:error, binary(), binary()}
+  def check_any_command_cached(cache, [command | _rest] = commands) when is_binary(command) do
+    case ensure_acl_projection_ready() do
+      :ok -> do_check_any_command_cached(cache, commands, command, nil)
+      {:error, reason} -> {:error, command, reason}
+    end
+  end
+
+  def check_any_command_cached(_cache, _commands),
+    do: {:error, "ACL", "NOPERM invalid ACL command authorization request"}
+
   defp do_check_command_cached(:full_access, "ACL.WHOAMI"), do: :ok
   defp do_check_command_cached(%{enabled: true}, "ACL.WHOAMI"), do: :ok
 
@@ -216,6 +244,42 @@ defmodule FerricstoreServer.Connection.Auth do
         noperm_command(cmd)
     end
   end
+
+  defp do_check_commands_cached(_cache, []), do: :ok
+
+  defp do_check_commands_cached(cache, [command | commands]) when is_binary(command) do
+    case do_check_command_cached(cache, command) do
+      :ok -> do_check_commands_cached(cache, commands)
+      {:error, reason} -> {:error, command, reason}
+    end
+  end
+
+  defp do_check_commands_cached(_cache, _commands),
+    do: {:error, "ACL", "NOPERM invalid ACL command authorization request"}
+
+  defp do_check_any_command_cached(_cache, [], first_command, first_reason),
+    do:
+      {:error, first_command, first_reason || "NOPERM invalid ACL command authorization request"}
+
+  defp do_check_any_command_cached(cache, [command | commands], first_command, first_reason)
+       when is_binary(command) do
+    case do_check_command_cached(cache, command) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        do_check_any_command_cached(
+          cache,
+          commands,
+          first_command,
+          first_reason || reason
+        )
+    end
+  end
+
+  defp do_check_any_command_cached(_cache, _commands, first_command, first_reason),
+    do:
+      {:error, first_command, first_reason || "NOPERM invalid ACL command authorization request"}
 
   @spec check_keys_cached(map() | :full_access | :denied | nil, binary(), [binary()]) ::
           :ok | {:error, binary()}
@@ -346,6 +410,31 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   def acl_command_name(cmd, _args, _ast), do: cmd
+
+  @spec acl_command_names(binary(), [binary()], term()) :: [binary()]
+  def acl_command_names(
+        "FLOW.QUERY",
+        _args,
+        {:flow_query, %Ferricstore.Flow.Query.Request{mode: :explain}}
+      ),
+      do: ["FLOW.QUERY.EXPLAIN"]
+
+  def acl_command_names(
+        "FLOW.QUERY",
+        _args,
+        {:flow_query, %Ferricstore.Flow.Query.Request{mode: :analyze}}
+      ),
+      do: ["FLOW.QUERY", "FLOW.QUERY.EXPLAIN"]
+
+  def acl_command_names(command, args, ast), do: [acl_command_name(command, args, ast)]
+
+  @spec acl_command_preflight_alternatives(binary()) :: [binary()]
+  def acl_command_preflight_alternatives(command) when is_binary(command) do
+    case String.upcase(command) do
+      "FLOW.QUERY" -> ["FLOW.QUERY", "FLOW.QUERY.EXPLAIN"]
+      _other -> []
+    end
+  end
 
   defp group_members(scope, group) do
     :pg.get_members(scope, group)

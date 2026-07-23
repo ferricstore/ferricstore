@@ -1022,6 +1022,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.AsyncApply do
         end)
       end
 
+      defp apply_single(state, {:flow_create_with_catalog, _key, catalog, attrs})
+           when is_map(catalog) and is_map(attrs) do
+        apply_flow_single_with_telemetry(state, :flow_create, attrs, fn ->
+          meta = %{index: current_ra_index() || 0}
+
+          with {:ok, encoded_catalog} <-
+                 apply_server_catalog_mutation_pending(meta, state, catalog),
+               :ok <- do_flow_create(state, attrs) do
+            {:ok, encoded_catalog}
+          end
+        end)
+      end
+
       defp apply_single(state, {:flow_governance_limit_mutate, key, attrs})
            when is_binary(key) and is_map(attrs) do
         do_flow_governance_limit_mutate(state, key, attrs)

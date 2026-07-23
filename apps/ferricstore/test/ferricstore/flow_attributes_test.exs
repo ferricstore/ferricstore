@@ -626,6 +626,38 @@ defmodule Ferricstore.FlowAttributesTest do
              )
   end
 
+  test "rejects attribute numbers that cannot be represented by query and native codecs" do
+    assert {:error, "ERR flow attribute integer must fit in signed 64 bits"} =
+             FerricStore.flow_create(unique_flow_id("attrs-integer-high"),
+               type: "attrs",
+               partition_key: @partition,
+               attributes: %{"number" => 0x8000_0000_0000_0000},
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:error, "ERR flow attribute integer must fit in signed 64 bits"} =
+             FerricStore.flow_create(unique_flow_id("attrs-integer-low"),
+               type: "attrs",
+               partition_key: @partition,
+               attributes: %{"number" => -0x8000_0000_0000_0001},
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             FerricStore.flow_create(unique_flow_id("attrs-integer-bounds"),
+               type: "attrs",
+               partition_key: @partition,
+               attributes: %{
+                 "minimum" => -0x8000_0000_0000_0000,
+                 "maximum" => 0x7FFF_FFFF_FFFF_FFFF
+               },
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+  end
+
   test "flow policy limits indexed attributes to three names" do
     type = unique_flow_id("attrs-index-policy")
 

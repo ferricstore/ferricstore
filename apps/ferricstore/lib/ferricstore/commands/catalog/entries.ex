@@ -558,24 +558,6 @@ defmodule Ferricstore.Commands.Catalog.Entries do
       summary: "Rewinds a workflow record to a previous history event."
     },
     %{
-      name: "flow.list",
-      arity: -2,
-      flags: ["readonly"],
-      first_key: 0,
-      last_key: 0,
-      step: 0,
-      summary: "Lists workflow records by type and optional state."
-    },
-    %{
-      name: "flow.search",
-      arity: -1,
-      flags: ["readonly"],
-      first_key: 0,
-      last_key: 0,
-      step: 0,
-      summary: "Searches workflow records by indexed attributes and state metadata."
-    },
-    %{
       name: "flow.query",
       arity: -3,
       flags: ["readonly"],
@@ -585,51 +567,6 @@ defmodule Ferricstore.Commands.Catalog.Entries do
       summary: "Runs a bounded versioned FQL query over workflow records."
     },
     %{
-      name: "flow.failures",
-      arity: -2,
-      flags: ["readonly"],
-      first_key: 0,
-      last_key: 0,
-      step: 0,
-      summary: "Lists failed workflow records by type and optional time range."
-    },
-    %{
-      name: "flow.terminals",
-      arity: -2,
-      flags: ["readonly"],
-      first_key: 0,
-      last_key: 0,
-      step: 0,
-      summary: "Lists terminal workflow records by type, state, and optional time range."
-    },
-    %{
-      name: "flow.by_parent",
-      arity: -2,
-      flags: ["readonly"],
-      first_key: 0,
-      last_key: 0,
-      step: 0,
-      summary: "Lists workflow records by parent flow id."
-    },
-    %{
-      name: "flow.by_root",
-      arity: -2,
-      flags: ["readonly"],
-      first_key: 0,
-      last_key: 0,
-      step: 0,
-      summary: "Lists workflow records by root flow id."
-    },
-    %{
-      name: "flow.by_correlation",
-      arity: -2,
-      flags: ["readonly"],
-      first_key: 0,
-      last_key: 0,
-      step: 0,
-      summary: "Lists workflow records by correlation id."
-    },
-    %{
       name: "flow.info",
       arity: -2,
       flags: ["readonly", "fast"],
@@ -637,15 +574,6 @@ defmodule Ferricstore.Commands.Catalog.Entries do
       last_key: 0,
       step: 0,
       summary: "Returns workflow counters for a type."
-    },
-    %{
-      name: "flow.stuck",
-      arity: -2,
-      flags: ["readonly"],
-      first_key: 0,
-      last_key: 0,
-      step: 0,
-      summary: "Lists stale running workflow records."
     },
     %{
       name: "flow.history",
@@ -797,7 +725,7 @@ defmodule Ferricstore.Commands.Catalog.Entries do
     CONFIG MODULE WAITAOF FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR FERRICSTORE.CONFIG
     FERRICSTORE.METRICS FERRICSTORE.KEY_INFO FERRICSTORE.CAPABILITIES
     FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY
-    FLOW.SEARCH FLOW.STATS FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.STEP_CONTINUE
+    FLOW.STATS FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.STEP_CONTINUE
     FLOW.START_AND_CLAIM FLOW.RUN_STEPS_MANY
     FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.GET FLOW.SCHEDULE.DELETE FLOW.SCHEDULE.FIRE_DUE
     FLOW.SCHEDULE.LIST FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME

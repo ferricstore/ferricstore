@@ -96,7 +96,16 @@ defmodule Ferricstore.Flow.HistoryRead do
           value_return
         )
       else
-        {:ok, %{events: [], has_more: false, continuation: nil, scanned_entries: 0}}
+        {:ok,
+         %{
+           events: [],
+           has_more: false,
+           continuation: nil,
+           scanned_entries: 0,
+           hydrated_records: 0,
+           duplicate_entries: 0,
+           memory_high_water_bytes: Ferricstore.TermMemory.bytes([])
+         }}
       end
     end
   end
@@ -134,7 +143,7 @@ defmodule Ferricstore.Flow.HistoryRead do
       events = Enum.take(candidate_events, limit)
       has_more = length(merged_page.refs) > limit
       continuation = if has_more, do: selected |> List.last() |> elem(0), else: nil
-      memory_high_water_bytes = :erlang.external_size(candidate_events, minor_version: 2)
+      memory_high_water_bytes = Ferricstore.TermMemory.bytes(candidate_events)
 
       {:ok,
        %{

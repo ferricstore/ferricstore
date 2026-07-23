@@ -693,3 +693,16 @@ fn eviction_preserves_higher_counts() {
     assert!(topk_query(&path, "keep_a"));
     assert!(topk_query(&path, "keep_b"));
 }
+
+#[test]
+fn async_list_allocation_is_atomic() {
+    let items = vec![b"first".to_vec(), b"second".to_vec()];
+    let mut allocations = 0;
+    let result = allocate_topk_items_with(&items, |item| {
+        allocations += 1;
+        (allocations == 1).then(|| item.to_vec())
+    });
+
+    assert_eq!(result, Err("TopK result binary allocation failed"));
+    assert_eq!(allocations, 2);
+}

@@ -174,6 +174,7 @@ defmodule FerricstoreServer.Health.Dashboard.Flow.Sample do
     %{
       type: normalize_type_filter(Keyword.get(opts, :type)),
       state: normalize_state_filter(Keyword.get(opts, :state)),
+      partition_key: normalize_partition_query(Keyword.get(opts, :partition_key)),
       q: normalize_name_filter(Keyword.get(opts, :q)),
       range: range,
       from_ms: from_ms,

@@ -33,6 +33,7 @@ defmodule Ferricstore.CrossShardOp do
     :compound_batch_get,
     :compound_batch_get_meta,
     :compound_scan,
+    :compound_scan_slice,
     :compound_count,
     :zset_score_range,
     :zset_score_range_slice,
@@ -194,6 +195,9 @@ defmodule Ferricstore.CrossShardOp do
         Router.compound_batch_delete(ctx, redis_key, compound_keys)
       end,
       compound_scan: fn redis_key, prefix -> Router.compound_scan(ctx, redis_key, prefix) end,
+      compound_scan_slice: fn redis_key, prefix, start, count, total ->
+        Router.compound_scan_slice(ctx, redis_key, prefix, start, count, total)
+      end,
       compound_count: fn redis_key, prefix -> Router.compound_count(ctx, redis_key, prefix) end,
       compound_delete_prefix: fn redis_key, prefix ->
         Router.compound_delete_prefix(ctx, redis_key, prefix)

@@ -116,6 +116,21 @@ defmodule Ferricstore.Commands.Stream.Index do
     |> Enum.map(fn {id_str, _compound_key} -> id_str end)
   end
 
+  @doc false
+  @spec count_after(binary(), ID.stream_id(), non_neg_integer() | :infinity, term()) ::
+          non_neg_integer()
+  def count_after(_stream_key, _id, 0, _store), do: 0
+
+  def count_after(stream_key, {ms, seq}, count, store)
+      when is_integer(ms) and is_integer(seq) and
+             (count == :infinity or (is_integer(count) and count > 0)) do
+    cache_key = CacheKey.build(store, stream_key)
+
+    @index_table
+    |> :ets.next({cache_key, ms, seq})
+    |> count_forward(cache_key, count, 0)
+  end
+
   @spec first_last(binary()) :: {binary(), binary()} | nil
   def first_last(stream_key), do: first_last(stream_key, nil)
 
@@ -235,6 +250,16 @@ defmodule Ferricstore.Commands.Stream.Index do
 
   defp collect(_other_key, _stream_key, _start, _end, _count, _next, acc),
     do: Enum.reverse(acc)
+
+  defp count_forward(:"$end_of_table", _stream_key, _remaining, total), do: total
+  defp count_forward(_key, _stream_key, 0, total), do: total
+
+  defp count_forward({stream_key, _ms, _seq} = key, stream_key, remaining, total) do
+    next = :ets.next(@index_table, key)
+    count_forward(next, stream_key, decrement_count(remaining), total + 1)
+  end
+
+  defp count_forward(_other_key, _stream_key, _remaining, total), do: total
 
   defp decrement_count(:infinity), do: :infinity
   defp decrement_count(count), do: count - 1

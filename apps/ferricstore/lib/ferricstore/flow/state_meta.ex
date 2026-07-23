@@ -10,6 +10,8 @@ defmodule Ferricstore.Flow.StateMeta do
   @max_value_bytes 256
   @max_total_bytes 16_384
   @max_indexed_keys 1
+  @min_i64 -0x8000_0000_0000_0000
+  @max_i64 0x7FFF_FFFF_FFFF_FFFF
 
   @type value :: binary() | integer() | float() | boolean()
   @type state_meta :: %{optional(binary()) => %{optional(binary()) => value()}}
@@ -280,13 +282,30 @@ defmodule Ferricstore.Flow.StateMeta do
     end
   end
 
-  defp normalize_value(value) when is_integer(value) or is_float(value) or is_boolean(value),
-    do: {:ok, value}
+  defp normalize_value(value)
+       when is_integer(value) and value >= @min_i64 and value <= @max_i64,
+       do: {:ok, value}
+
+  defp normalize_value(value) when is_integer(value),
+    do: {:error, "ERR flow state_meta integer must fit in signed 64 bits"}
+
+  defp normalize_value(value) when is_float(value) do
+    if finite_float?(value),
+      do: {:ok, value},
+      else: {:error, "ERR flow state_meta float must be finite"}
+  end
+
+  defp normalize_value(value) when is_boolean(value), do: {:ok, value}
 
   defp normalize_value(value) when is_atom(value) and not is_nil(value),
     do: value |> Atom.to_string() |> normalize_value()
 
   defp normalize_value(_value), do: {:error, "ERR flow state_meta value must be scalar"}
+
+  defp finite_float?(value) do
+    <<_sign::1, exponent::11, _fraction::52>> = <<value::float-big-64>>
+    exponent != 0x7FF
+  end
 
   defp validate_state_count(count) when count <= @max_states, do: :ok
   defp validate_state_count(_count), do: {:error, "ERR too many flow state_meta states"}

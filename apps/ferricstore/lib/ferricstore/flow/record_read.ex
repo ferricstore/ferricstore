@@ -325,18 +325,68 @@ defmodule Ferricstore.Flow.RecordRead do
     end
   end
 
-  def stuck_records(ctx, type, :auto, cutoff, count) do
+  def stuck_records(ctx, type, partition_key, cutoff, count, reverse? \\ false)
+
+  def stuck_records(_ctx, _type, :auto, _cutoff, _count, true),
+    do: {:error, "ERR descending stuck reads require an explicit partition"}
+
+  def stuck_records(ctx, type, :auto, cutoff, count, false) do
     RecordQuery.bounded_auto_partition_records(
       ScopeBinding.auto_partition_keys(ctx),
       count,
       false,
       fn partition_key, fetch_count ->
-        stuck_records(ctx, type, partition_key, cutoff, fetch_count)
+        stuck_records(ctx, type, partition_key, cutoff, fetch_count, false)
       end
     )
   end
 
-  def stuck_records(ctx, type, partition_key, cutoff, count) do
+  def stuck_records(ctx, type, partition_key, cutoff, count, reverse?) do
+    stuck_records_by_score(
+      ctx,
+      type,
+      partition_key,
+      "-inf",
+      Integer.to_string(cutoff),
+      count,
+      reverse?,
+      nil
+    )
+  end
+
+  @doc false
+  def stuck_records_between(
+        ctx,
+        type,
+        partition_key,
+        from_ms,
+        to_ms,
+        count,
+        reverse?,
+        boundary \\ nil
+      ) do
+    stuck_records_by_score(
+      ctx,
+      type,
+      partition_key,
+      Integer.to_string(from_ms),
+      Integer.to_string(to_ms),
+      count,
+      reverse?,
+      boundary
+    )
+  end
+
+  defp stuck_records_by_score(
+         ctx,
+         type,
+         partition_key,
+         minimum,
+         maximum,
+         count,
+         reverse?,
+         boundary
+       ) do
     index_key = Keys.inflight_index_key(type, partition_key)
 
     with :ok <- validate_key_size(index_key),
@@ -344,9 +394,11 @@ defmodule Ferricstore.Flow.RecordRead do
            IndexZSet.range_by_score(
              ctx,
              index_key,
-             "-inf",
-             Integer.to_string(cutoff),
-             count
+             minimum,
+             maximum,
+             count,
+             reverse?,
+             boundary
            ) do
       records_for_ids(ctx, ids, partition_key)
     end
@@ -443,7 +495,7 @@ defmodule Ferricstore.Flow.RecordRead do
       ram_scanned_count = length(ram_entries)
 
       ids =
-        IndexMerge.ids_from_scored_entries(
+        IndexMerge.ids_from_ordered_scored_entries(
           ram_entries,
           lmdb_entries,
           limit + 1,
@@ -488,7 +540,7 @@ defmodule Ferricstore.Flow.RecordRead do
                scan_limit
              ) do
         ids =
-          IndexMerge.ids_from_scored_entries(
+          IndexMerge.ids_from_ordered_scored_entries(
             ram_entries,
             lmdb_entries,
             count,
@@ -566,21 +618,16 @@ defmodule Ferricstore.Flow.RecordRead do
                terminal_states,
                scan_limit
              ) do
-        {:ok, (ram_ids ++ lmdb_ids) |> Enum.uniq() |> Enum.take(count)}
+        {:ok, IndexMerge.ids_from_priority_lists(ram_ids, lmdb_ids, count)}
       end
     end
   end
 
-  defp ordered_list_query?(%{
-         from_ms: nil,
-         to_ms: nil,
-         rev?: false,
-         before_id: nil,
-         terminal_only?: false
-       }),
-       do: false
-
-  defp ordered_list_query?(query), do: is_map(query)
+  defp ordered_list_query?(query) when is_map(query) do
+    Map.get(query, :from_ms) != nil or Map.get(query, :to_ms) != nil or
+      Map.get(query, :rev?, false) or Map.get(query, :after_id) != nil or
+      Map.get(query, :before_id) != nil or Map.get(query, :terminal_only?, false)
+  end
 
   defp records_for_ids(ctx, ids, partition_key) do
     RecordLoader.records_for_ids(ctx, ids, partition_key)

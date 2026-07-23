@@ -35,8 +35,8 @@ defmodule Ferricstore.BitcaskTombstonePageTest do
                {:delete, "deleted-2"}
              ])
 
-    assert {:ok, [{"deleted-1", ^deleted_1_offset, ^deleted_1_size, 0}],
-            ^second_page_offset, false} = NIF.v2_scan_tombstones_page(path, 0, 2)
+    assert {:ok, [{"deleted-1", ^deleted_1_offset, ^deleted_1_size, 0}], ^second_page_offset,
+            false} = NIF.v2_scan_tombstones_page(path, 0, 2)
 
     file_len = File.stat!(path).size
 

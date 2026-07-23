@@ -80,7 +80,7 @@ defmodule Ferricstore.Flow.Query.SourceCatalog do
     with {:ok, write_batch} <- write_batch_fun(opts),
          :ok <- validate_context(ctx, shard_index),
          path <- lmdb_path(ctx, shard_index),
-         false <- bootstrap_complete?(path),
+         {:ok, false} <- bootstrap_complete?(path),
          {:ok, cursor} <- load_bootstrap_cursor(path),
          {:ok, rows, exhausted, _range_bytes} <-
            LMDB.range_entries_bounded(
@@ -101,7 +101,7 @@ defmodule Ferricstore.Flow.Query.SourceCatalog do
          catalog_entries: length(entries)
        }}
     else
-      true -> {:ok, %{done?: true, scanned_keys: 0, catalog_entries: 0}}
+      {:ok, true} -> {:ok, %{done?: true, scanned_keys: 0, catalog_entries: 0}}
       {:error, :range_entry_too_large} -> {:error, :query_source_catalog_page_too_large}
       {:error, _reason} = error -> error
     end
@@ -213,7 +213,9 @@ defmodule Ferricstore.Flow.Query.SourceCatalog do
     |> case do
       {:ok, reversed} ->
         {:ok, reversed |> Enum.reverse() |> Enum.uniq_by(& &1.entry_key)}
-      {:error, _reason} = error -> error
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -231,12 +233,14 @@ defmodule Ferricstore.Flow.Query.SourceCatalog do
     stable_keys = Enum.map(entries, & &1.entry_key)
 
     with {:ok, current, _read_bytes} <- LMDB.get_many_bounded(path, stable_keys, max_bytes),
-         :ok <- validate_current_entries(entries, current),
-         :ok <- validate_operation_bytes(entries, max_bytes) do
+         :ok <- validate_current_entries(entries, current) do
       guarded_puts =
-        Enum.flat_map(entries, fn entry ->
+        entries
+        |> Enum.zip(current)
+        |> Enum.flat_map(fn {entry, stable_result} ->
           [
             {:compare, entry.catalog_key, entry.primary_value},
+            stable_guard_op(entry.entry_key, stable_result),
             {:put, entry.entry_key, entry.state_key}
           ]
         end)
@@ -251,7 +255,11 @@ defmodule Ferricstore.Flow.Query.SourceCatalog do
           [{:put, @bootstrap_progress_key, rows |> List.last() |> elem(0)}]
         end
 
-      write_batch.(path, guarded_puts ++ tail)
+      ops = guarded_puts ++ tail
+
+      if operation_bytes(ops) <= max_bytes,
+        do: write_batch.(path, ops),
+        else: {:error, :query_source_catalog_page_too_large}
     else
       {:error, :batch_value_budget_exceeded} -> {:error, :query_source_catalog_page_too_large}
       {:error, _reason} = error -> error
@@ -270,14 +278,13 @@ defmodule Ferricstore.Flow.Query.SourceCatalog do
   defp validate_current_entries(_entries, _current),
     do: {:error, :invalid_query_source_catalog_read}
 
-  defp validate_operation_bytes(entries, max_bytes) do
-    bytes =
-      Enum.reduce(entries, 0, fn entry, total ->
-        total + byte_size(entry.catalog_key) + byte_size(entry.primary_value) +
-          byte_size(entry.entry_key) + byte_size(entry.state_key)
-      end)
-
-    if bytes <= max_bytes, do: :ok, else: {:error, :query_source_catalog_page_too_large}
+  defp operation_bytes(ops) do
+    Enum.reduce(ops, 0, fn
+      {:put, key, value}, total -> total + byte_size(key) + byte_size(value)
+      {:compare, key, value}, total -> total + byte_size(key) + byte_size(value)
+      {:compare_missing, key}, total -> total + byte_size(key)
+      {:delete, key}, total -> total + byte_size(key)
+    end)
   end
 
   defp decode_source_rows(rows) do
@@ -293,6 +300,9 @@ defmodule Ferricstore.Flow.Query.SourceCatalog do
       {:error, _reason} = error -> error
     end
   end
+
+  defp stable_guard_op(entry_key, :not_found), do: {:compare_missing, entry_key}
+  defp stable_guard_op(entry_key, {:ok, state_key}), do: {:compare, entry_key, state_key}
 
   defp validate_owner(catalog_key, state_key)
        when is_binary(catalog_key) and is_binary(state_key) and state_key != "" and
@@ -316,9 +326,14 @@ defmodule Ferricstore.Flow.Query.SourceCatalog do
 
   defp load_bootstrap_cursor(path) do
     case LMDB.get(path, @bootstrap_progress_key) do
-      :not_found -> {:ok, ""}
-      {:ok, cursor} -> if(validate_projection_cursor(cursor), do: {:ok, cursor}, else: cursor_error())
-      {:error, _reason} = error -> error
+      :not_found ->
+        {:ok, ""}
+
+      {:ok, cursor} ->
+        if(validate_projection_cursor(cursor), do: {:ok, cursor}, else: cursor_error())
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -341,8 +356,14 @@ defmodule Ferricstore.Flow.Query.SourceCatalog do
   defp next_cursor([], cursor), do: cursor
   defp next_cursor(rows, _cursor), do: rows |> List.last() |> elem(0)
 
-  defp bootstrap_complete?(path),
-    do: LMDB.get(path, @bootstrap_complete_key) == {:ok, @bootstrap_complete_value}
+  defp bootstrap_complete?(path) do
+    case LMDB.get(path, @bootstrap_complete_key) do
+      :not_found -> {:ok, false}
+      {:ok, @bootstrap_complete_value} -> {:ok, true}
+      {:ok, _invalid} -> {:error, :corrupt_query_source_catalog_complete}
+      {:error, _reason} = error -> error
+    end
+  end
 
   defp write_batch_fun(opts) do
     case Keyword.get(opts, :write_batch_fun, &LMDB.write_batch/2) do

@@ -71,6 +71,37 @@ defmodule Ferricstore.Commands.ExtensionTest do
     def handle("GET", _args, _store), do: {:ok, "shadowed"}
   end
 
+  defmodule RetiredFlowExtension do
+    @behaviour Ferricstore.Commands.Extension
+
+    @retired ~w(
+      FLOW.LIST
+      FLOW.SEARCH
+      FLOW.TERMINALS
+      FLOW.FAILURES
+      FLOW.STUCK
+      FLOW.BY_PARENT
+      FLOW.BY_ROOT
+      FLOW.BY_CORRELATION
+    )
+
+    @impl true
+    def commands do
+      Enum.map(@retired, fn name ->
+        %{
+          name: name,
+          arity: -1,
+          flags: ["readonly"],
+          access: :read,
+          summary: "Must not restore a retired Flow command"
+        }
+      end)
+    end
+
+    @impl true
+    def handle(command, _args, _store) when command in @retired, do: {:ok, "restored"}
+  end
+
   defmodule InvalidKeysExtension do
     @behaviour Ferricstore.Commands.Extension
 
@@ -288,5 +319,31 @@ defmodule Ferricstore.Commands.ExtensionTest do
             }} = Dispatcher.prepare_raw("GET", ["k"])
 
     assert Enum.count(Catalog.names(), &(&1 == "get")) == 1
+  end
+
+  test "configured extensions cannot restore retired Flow command names" do
+    Application.put_env(:ferricstore, :command_extensions, [RetiredFlowExtension])
+
+    for command <- ~w(
+          FLOW.LIST
+          FLOW.SEARCH
+          FLOW.TERMINALS
+          FLOW.FAILURES
+          FLOW.STUCK
+          FLOW.BY_PARENT
+          FLOW.BY_ROOT
+          FLOW.BY_CORRELATION
+        ) do
+      downcase = String.downcase(command)
+      expected = "ERR unknown command '#{downcase}', with args beginning with: "
+      refute command in Ferricstore.Commands.Extension.command_names_upper()
+      refute downcase in Catalog.names()
+
+      assert {:error, ^expected} =
+               Dispatcher.prepare_raw(command, ["invoice"])
+
+      assert {:error, ^expected} =
+               Dispatcher.dispatch(command, ["invoice"], MockStore.make())
+    end
   end
 end

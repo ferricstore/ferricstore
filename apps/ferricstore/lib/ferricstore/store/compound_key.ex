@@ -536,6 +536,14 @@ defmodule Ferricstore.Store.CompoundKey do
   def extract_redis_key(<<"V:", rest::binary>>), do: extract_before_separator(rest)
   def extract_redis_key(key), do: key
 
+  @doc false
+  @spec encoded_redis_key_size(binary()) :: non_neg_integer()
+  def encoded_redis_key_size(redis_key) when is_binary(redis_key) do
+    redis_key
+    |> encode_redis_key()
+    |> byte_size()
+  end
+
   defp extract_before_separator(rest) do
     case :binary.split(rest, @separator) do
       [redis_key, _sub_key] -> decode_redis_key(redis_key)

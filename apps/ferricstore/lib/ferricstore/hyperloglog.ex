@@ -89,6 +89,10 @@ defmodule Ferricstore.HyperLogLog do
   @spec new() :: sketch()
   def new, do: :binary.copy(<<0>>, @num_registers)
 
+  @doc false
+  @spec sketch_size() :: pos_integer()
+  def sketch_size, do: @num_registers
+
   @doc """
   Adds an element to the sketch.
 

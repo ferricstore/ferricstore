@@ -20,6 +20,8 @@ defmodule Ferricstore.Store.Shard.Startup do
       alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.CompoundRevisionIndex
       alias Ferricstore.Store.Shard.LogicalKeyIndex
+      alias Ferricstore.Store.Shard.NamespaceUsageIndex
+      alias Ferricstore.Store.NamespaceUsage
       alias Ferricstore.Store.Shard.NativeOps, as: ShardNativeOps
       alias Ferricstore.Store.Shard.Reads, as: ShardReads
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
@@ -142,6 +144,11 @@ defmodule Ferricstore.Store.Shard.Startup do
             LogicalKeyIndex.table_names(instance_name, index)
 
           LogicalKeyIndex.ensure_tables!(logical_key_index, logical_key_slots)
+
+          {namespace_usage_index, namespace_usage_expiry} =
+            NamespaceUsageIndex.table_names(instance_name, index)
+
+          NamespaceUsageIndex.ensure_tables!(namespace_usage_index, namespace_usage_expiry)
           {zset_score_index, zset_score_lookup} = ZSetIndex.table_names(instance_name, index)
           ensure_zset_index_table!(zset_score_index, :ordered_set)
           ensure_zset_index_table!(zset_score_lookup, :set)
@@ -192,6 +199,28 @@ defmodule Ferricstore.Store.Shard.Startup do
               :ok -> :ok
               {:error, reason} -> throw({:shard_init_failed, reason})
             end
+          end)
+
+          profile_startup_phase(index, :namespace_usage_index_rebuild, fn ->
+            unless raft_projection_owner?(ctx) do
+              rebuild_opts = [
+                now_ms: System.system_time(:millisecond),
+                blob_threshold_bytes: BlobValue.threshold(ctx),
+                entry_bytes_fun: &NamespaceUsage.entry_bytes(ctx, &1)
+              ]
+
+              case NamespaceUsageIndex.rebuild_tracked(
+                     namespace_usage_index,
+                     namespace_usage_expiry,
+                     keydir,
+                     rebuild_opts
+                   ) do
+                :ok -> :ok
+                {:error, reason} -> throw({:shard_init_failed, reason})
+              end
+            end
+
+            :ok
           end)
 
           profile_startup_phase(index, :flow_native_index_init, fn ->
@@ -318,6 +347,9 @@ defmodule Ferricstore.Store.Shard.Startup do
              compound_revision_index: compound_revision_index,
              logical_key_index: logical_key_index,
              logical_key_slots: logical_key_slots,
+             namespace_usage_index: namespace_usage_index,
+             namespace_usage_expiry: namespace_usage_expiry,
+             blob_side_channel_threshold_bytes: BlobValue.threshold(ctx),
              zset_score_index: zset_score_index,
              zset_score_lookup: zset_score_lookup,
              flow_index: flow_index,

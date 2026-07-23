@@ -42,6 +42,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       alias Ferricstore.Store.Shard.ZSetIndex
       alias Ferricstore.Store.Shard.CompoundMemberIndex
       alias Ferricstore.Store.Shard.LogicalKeyIndex
+      alias Ferricstore.Store.Shard.NamespaceUsageIndex
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
@@ -515,6 +516,16 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
             value,
             expire_at_ms
           )
+
+        :ok =
+          NamespaceUsageIndex.put(
+            Map.get(state, :namespace_usage_index_name),
+            Map.get(state, :namespace_usage_expiry_name),
+            key,
+            value,
+            expire_at_ms,
+            blob_threshold_bytes: Map.get(state, :blob_side_channel_threshold_bytes, 0)
+          )
       end
 
       defp logical_key_index_delete(state, key) do
@@ -522,6 +533,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
           LogicalKeyIndex.delete(
             Map.get(state, :logical_key_index_name),
             Map.get(state, :logical_key_slots_name),
+            key
+          )
+
+        :ok =
+          NamespaceUsageIndex.delete(
+            Map.get(state, :namespace_usage_index_name),
+            Map.get(state, :namespace_usage_expiry_name),
             key
           )
       end

@@ -72,7 +72,7 @@ defmodule Ferricstore.Store.Shard.Reads do
           {:noreply, map()} | {:reply, {:error, binary()}, map()}
   @doc false
   def handle_get_many(keys, from, state) when is_list(keys) do
-    handle_get_many(keys, from, new_get_many_deadline(state), state)
+    handle_get_many_mode(keys, from, new_get_many_deadline(state), state, :values)
   end
 
   @spec handle_get_many([binary()], GenServer.from(), integer(), map()) ::
@@ -80,6 +80,18 @@ defmodule Ferricstore.Store.Shard.Reads do
   @doc false
   def handle_get_many(keys, from, deadline_ms, state)
       when is_list(keys) and is_integer(deadline_ms) do
+    handle_get_many_mode(keys, from, deadline_ms, state, :values)
+  end
+
+  @spec handle_get_many_entries([binary()], GenServer.from(), integer(), map()) ::
+          {:noreply, map()} | {:reply, term(), map()}
+  @doc false
+  def handle_get_many_entries(keys, from, deadline_ms, state)
+      when is_list(keys) and is_integer(deadline_ms) do
+    handle_get_many_mode(keys, from, deadline_ms, state, :entries)
+  end
+
+  defp handle_get_many_mode(keys, from, deadline_ms, state, mode) do
     cond do
       not valid_get_many_request?(keys) ->
         {:reply, {:error, "ERR invalid shard batch read request"}, state}
@@ -89,7 +101,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
       true ->
         state = flush_pending_get_many_keys(state, keys)
-        {:noreply, admit_get_many(state, from, keys, deadline_ms)}
+        {:noreply, admit_get_many(state, from, keys, deadline_ms, mode)}
     end
   end
 
@@ -183,18 +195,18 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  defp admit_get_many(state, from, keys, deadline_ms) do
+  defp admit_get_many(state, from, keys, deadline_ms, mode) do
     workers = Map.get(state, :get_many_workers, %{})
 
     cond do
       map_size(workers) < get_many_max_concurrency(state) ->
-        start_get_many_worker(state, from, keys, deadline_ms)
+        start_get_many_worker(state, from, keys, deadline_ms, mode)
 
       Map.get(state, :get_many_waiting_count, 0) < get_many_max_queued(state) ->
         waiting = Map.get(state, :get_many_waiting, :queue.new())
 
         state
-        |> Map.put(:get_many_waiting, :queue.in({from, keys, deadline_ms}, waiting))
+        |> Map.put(:get_many_waiting, :queue.in({from, keys, deadline_ms, mode}, waiting))
         |> Map.update(:get_many_waiting_count, 1, &(&1 + 1))
 
       true ->
@@ -203,7 +215,7 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  defp start_get_many_worker(state, from, keys, deadline_ms) do
+  defp start_get_many_worker(state, from, keys, deadline_ms, mode) do
     case get_many_remaining_ms(deadline_ms) do
       0 ->
         GenServer.reply(from, unavailable_get_many_values(keys))
@@ -220,7 +232,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
         {pid, monitor_ref} =
           spawn_monitor(fn ->
-            result = safe_get_many_values(keys, read_state, deadline_ms)
+            result = safe_get_many_values(keys, read_state, deadline_ms, mode)
             send(parent, {:shard_get_many_complete, job_ref, result})
           end)
 
@@ -248,7 +260,7 @@ defmodule Ferricstore.Store.Shard.Reads do
       waiting = Map.get(state, :get_many_waiting, :queue.new())
 
       case :queue.out(waiting) do
-        {{:value, {from, keys, deadline_ms}}, remaining_waiting} ->
+        {{:value, {from, keys, deadline_ms, mode}}, remaining_waiting} ->
           state =
             state
             |> Map.put(:get_many_waiting, remaining_waiting)
@@ -264,7 +276,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
             true ->
               state
-              |> start_get_many_worker(from, keys, deadline_ms)
+              |> start_get_many_worker(from, keys, deadline_ms, mode)
               |> drain_get_many_waiting()
           end
 
@@ -278,13 +290,13 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  defp safe_get_many_values(keys, state, deadline_ms) do
+  defp safe_get_many_values(keys, state, deadline_ms, mode) do
     if get_many_expired?(deadline_ms) do
       unavailable_get_many_values(keys)
     else
       result =
         try do
-          get_many_values(keys, state, deadline_ms)
+          get_many_values(keys, state, deadline_ms, mode)
         rescue
           _read_error -> @get_many_failed_error
         catch
@@ -361,16 +373,17 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  defp get_many_values([], _state, _deadline_ms), do: []
+  defp get_many_values([], _state, _deadline_ms, _mode), do: []
 
-  defp get_many_values(keys, state, deadline_ms) do
+  defp get_many_values(keys, state, deadline_ms, mode) do
     {results, file_reads, segment_reads} =
       keys
       |> Enum.with_index()
       |> Enum.reduce({%{}, [], []}, fn {key, index}, {results, file_reads, segment_reads} ->
         case ShardETS.ets_lookup(state, key, state.expiry_context) do
-          {:hit, value, _expire_at_ms} ->
-            {Map.put(results, index, value), file_reads, segment_reads}
+          {:hit, value, expire_at_ms} ->
+            {Map.put(results, index, get_many_result(value, expire_at_ms, mode)), file_reads,
+             segment_reads}
 
           :expired ->
             {Map.put(results, index, nil), file_reads, segment_reads}
@@ -396,15 +409,17 @@ defmodule Ferricstore.Store.Shard.Reads do
         end
       end)
 
-    results = read_get_many_files(state, results, Enum.reverse(file_reads), deadline_ms)
-    results = read_get_many_segments(state, results, Enum.reverse(segment_reads), deadline_ms)
+    results = read_get_many_files(state, results, Enum.reverse(file_reads), deadline_ms, mode)
+
+    results =
+      read_get_many_segments(state, results, Enum.reverse(segment_reads), deadline_ms, mode)
 
     Enum.map(0..(length(keys) - 1), &Map.get(results, &1))
   end
 
-  defp read_get_many_files(_state, results, [], _deadline_ms), do: results
+  defp read_get_many_files(_state, results, [], _deadline_ms, _mode), do: results
 
-  defp read_get_many_files(state, results, reads, deadline_ms) do
+  defp read_get_many_files(state, results, reads, deadline_ms, mode) do
     locations =
       Enum.map(reads, fn {_index, key, _exp, _fid, off, _vsize, path} ->
         {path, off, key}
@@ -423,7 +438,7 @@ defmodule Ferricstore.Store.Shard.Reads do
         Map.put(
           acc,
           index,
-          materialize_get_many_value(state, key, exp, fid, off, vsize, value, deadline_ms)
+          materialize_get_many_value(state, key, exp, fid, off, vsize, value, deadline_ms, mode)
         )
 
       {{index, _key, _exp, _fid, _off, _vsize, _path}, _error}, acc ->
@@ -431,9 +446,9 @@ defmodule Ferricstore.Store.Shard.Reads do
     end)
   end
 
-  defp read_get_many_segments(_state, results, [], _deadline_ms), do: results
+  defp read_get_many_segments(_state, results, [], _deadline_ms, _mode), do: results
 
-  defp read_get_many_segments(state, results, reads, deadline_ms) do
+  defp read_get_many_segments(state, results, reads, deadline_ms, mode) do
     reads
     |> Enum.group_by(fn {_index, _key, _exp, file_id, _off, _vsize} -> file_id end)
     |> Enum.reduce(results, fn {file_id, segment_reads}, acc ->
@@ -451,7 +466,8 @@ defmodule Ferricstore.Store.Shard.Reads do
                 off,
                 vsize,
                 encoded_value,
-                deadline_ms
+                deadline_ms,
+                mode
               )
 
             _missing_or_invalid ->
@@ -497,19 +513,35 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
-  defp materialize_get_many_value(state, key, exp, fid, off, vsize, value, deadline_ms) do
+  defp materialize_get_many_value(
+         state,
+         key,
+         exp,
+         fid,
+         off,
+         vsize,
+         value,
+         deadline_ms,
+         mode
+       ) do
     if get_many_expired?(deadline_ms) do
       :unavailable
     else
       case materialize_and_warm_cold_value(state, key, value, exp, fid, off, vsize) do
         {:ok, materialized} ->
-          if(get_many_expired?(deadline_ms), do: :unavailable, else: materialized)
+          if(get_many_expired?(deadline_ms),
+            do: :unavailable,
+            else: get_many_result(materialized, exp, mode)
+          )
 
         {:error, _reason} ->
           :unavailable
       end
     end
   end
+
+  defp get_many_result(value, _expire_at_ms, :values), do: value
+  defp get_many_result(value, expire_at_ms, :entries), do: {value, expire_at_ms}
 
   defp get_many_pread_batch(state, locations, deadline_ms) do
     case get_many_remaining_ms(deadline_ms) do

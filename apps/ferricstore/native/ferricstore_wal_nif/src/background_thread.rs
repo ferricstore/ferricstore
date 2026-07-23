@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use std::os::unix::io::AsRawFd;
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// Messages sent from NIF to background thread (flush signals only, not data).
 pub type ThreadResult = std::result::Result<(), String>;
@@ -509,9 +509,13 @@ fn open_rw_create_nofollow(path: &str) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).write(true).read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options.open(path)?;
     ensure_regular_file(&file, "WAL write target")?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
 
@@ -672,19 +676,13 @@ fn open_wal_file_fallback(path: &str, _pre_allocate_bytes: u64) -> io::Result<(F
     Ok((f, false)) // No O_DIRECT on macOS
 }
 
-/// Read bytes from file at offset (for recovery).
-pub fn pread_from_file(file: &mut File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
-    let len = validated_pread_len(file.metadata()?.len(), offset, len)?;
+/// Read an already-validated recovery range directly into its final buffer.
+pub fn pread_into_file(file: &mut File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     file.seek(SeekFrom::Start(offset))?;
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(len)
-        .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "pread allocation failed"))?;
-    buf.resize(len, 0);
-    file.read_exact(&mut buf)?;
-    Ok(buf)
+    file.read_exact(buf)
 }
 
-fn validated_pread_len(file_len: u64, offset: u64, len: u64) -> io::Result<usize> {
+pub(crate) fn validated_pread_len(file_len: u64, offset: u64, len: u64) -> io::Result<usize> {
     if len > MAX_PREAD_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

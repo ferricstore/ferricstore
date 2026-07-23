@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Query.CompositeRangeReader do
   @moduledoc false
 
   alias Ferricstore.Flow.LMDB
-  alias Ferricstore.Flow.Query.{CompositeIndex, CompositeRange}
+  alias Ferricstore.Flow.Query.CompositeRange
 
   @spec read(binary(), CompositeRange.t(), binary() | nil, pos_integer(), pos_integer()) ::
           {:ok,
@@ -20,7 +20,7 @@ defmodule Ferricstore.Flow.Query.CompositeRangeReader do
     with :ok <- CompositeRange.validate(range),
          {:ok, after_key} <- effective_after_key(range, cursor),
          {:ok, rows, exhausted, scanned_bytes} <-
-           LMDB.range_entries_bounded(
+           LMDB.composite_range_entries_bounded(
              path,
              range.prefix,
              after_key,
@@ -28,7 +28,7 @@ defmodule Ferricstore.Flow.Query.CompositeRangeReader do
              max_entries,
              max_bytes
            ),
-         {:ok, entries} <- decode_rows(rows) do
+         {:ok, entries} <- materialize_rows(rows) do
       {:ok,
        %{
          entries: entries,
@@ -56,26 +56,26 @@ defmodule Ferricstore.Flow.Query.CompositeRangeReader do
   defp effective_after_key(%CompositeRange{}, _cursor),
     do: {:error, :invalid_composite_cursor}
 
-  defp decode_rows(rows) when is_list(rows) do
+  defp materialize_rows(rows) when is_list(rows) do
     Enum.reduce_while(rows, {:ok, []}, fn
-      {key, value}, {:ok, acc} when is_binary(key) and is_binary(value) ->
-        case CompositeIndex.decode_entry_value(value) do
-          {:ok, entry} ->
-            if CompositeIndex.entry_key_matches_id?(key, entry.id),
-              do:
-                {:cont,
-                 {:ok,
-                  [
-                    entry
-                    |> Map.put(:storage_key, key)
-                    |> Map.put(:storage_bytes, byte_size(key) + byte_size(value))
-                    | acc
-                  ]}},
-              else: {:halt, {:error, :invalid_composite_entry}}
-
-          :error ->
-            {:halt, {:error, :invalid_composite_entry}}
-        end
+      {key, id, state_key, record_version, expire_at_ms, storage_bytes}, {:ok, acc}
+      when is_binary(key) and is_binary(id) and is_binary(state_key) and
+             is_integer(record_version) and record_version >= 0 and
+             is_integer(expire_at_ms) and expire_at_ms >= 0 and is_integer(storage_bytes) and
+             storage_bytes > 0 ->
+        {:cont,
+         {:ok,
+          [
+            %{
+              id: id,
+              state_key: state_key,
+              record_version: record_version,
+              expire_at_ms: expire_at_ms,
+              storage_key: key,
+              storage_bytes: storage_bytes
+            }
+            | acc
+          ]}}
 
       _invalid, _acc ->
         {:halt, {:error, :invalid_composite_entry}}

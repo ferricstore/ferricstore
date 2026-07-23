@@ -28,6 +28,15 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
     assert RouteRequirements.dashboard_route_requirement("GET", "/dashboard/flow/governance") ==
              {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}}
 
+    assert RouteRequirements.dashboard_route_requirement(
+             "GET",
+             "/dashboard/flow/governance?meta_partition_key=tenant-a%3Apartition" <>
+               "&meta_type=checkout&meta_state=running&meta_key=risk&meta_value=high"
+           ) == [
+             {"FLOW.GOVERNANCE.OVERVIEW", key: {"*", :read}},
+             {"FLOW.QUERY", key: {"tenant-a:partition", :read}}
+           ]
+
     for path <- [
           "/dashboard/prefixes",
           "/dashboard/api/prefixes"
@@ -61,12 +70,12 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
     assert RouteRequirements.dashboard_route_requirement(
              "GET",
              "/dashboard/flow/failures?partition_key=tenant-a"
-           ) == {"FLOW.FAILURES", key: {"tenant-a", :read}}
+           ) == {"FLOW.QUERY", key: {"tenant-a", :read}}
 
     assert RouteRequirements.dashboard_route_requirement(
              "GET",
              "/dashboard/flow/lineage?mode=parent&partition_key=tenant-a"
-           ) == {"FLOW.BY_PARENT", key: {"tenant-a", :read}}
+           ) == {"FLOW.QUERY", key: {"tenant-a", :read}}
 
     assert RouteRequirements.dashboard_route_requirement(
              "GET",
@@ -86,7 +95,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
     assert RouteRequirements.dashboard_route_requirement(
              "GET",
              "/dashboard/flow/failures?type=email"
-           ) == {"FLOW.FAILURES", key: {"*", :read}}
+           ) == {"FLOW.QUERY", key: {"*", :read}}
   end
 
   test "dashboard_route_requirement scopes flow detail and value requests" do
@@ -106,7 +115,7 @@ defmodule FerricstoreServer.Health.Endpoint.RouteRequirementsTest do
              {"FLOW.RECLAIM", []}
 
     assert RouteRequirements.dashboard_route_requirement("POST", "/dashboard/flow/retention") ==
-             {"FLOW.LIST", []}
+             {"FLOW.QUERY", []}
 
     assert RouteRequirements.dashboard_route_requirement("POST", "/dashboard/flow/flow-1/rewind") ==
              {"FLOW.REWIND", []}

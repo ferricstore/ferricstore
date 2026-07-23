@@ -643,7 +643,8 @@
         let path = dir.path().join("test.wal");
         std::fs::write(&path, b"hello world").unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        let data = pread_from_file(&mut file, 6, 5).unwrap();
+        let mut data = [0; 5];
+        pread_into_file(&mut file, 6, &mut data).unwrap();
         assert_eq!(&data, b"world");
     }
 
@@ -653,8 +654,29 @@
         let path = dir.path().join("test.wal");
         std::fs::write(&path, b"hello").unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        let data = pread_from_file(&mut file, 0, 5).unwrap();
+        let mut data = [0; 5];
+        pread_into_file(&mut file, 0, &mut data).unwrap();
         assert_eq!(&data, b"hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_created_wal_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.wal");
+        drop(open_rw_create_nofollow(path.to_str().unwrap()).unwrap());
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let existing = dir.path().join("existing.wal");
+        std::fs::write(&existing, b"existing").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_rw_create_nofollow(existing.to_str().unwrap()).unwrap());
+        let mode = std::fs::metadata(existing).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

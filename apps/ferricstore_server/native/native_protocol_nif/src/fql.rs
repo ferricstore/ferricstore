@@ -1,10 +1,15 @@
+use std::borrow::Cow;
+
 pub const MAX_QUERY_BYTES: usize = 16 * 1024;
-const MAX_TOKENS: usize = 256;
+pub const MAX_TOKENS: usize = 256;
+pub const MAX_PREDICATES: usize = 12;
+pub const MAX_IN_VALUES: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Execute,
     Explain,
+    Analyze,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,26 +34,26 @@ pub enum ValueType {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum QueryValue {
-    LiteralKeyword(Vec<u8>),
+pub enum QueryValue<'query> {
+    LiteralKeyword(Cow<'query, [u8]>),
     LiteralInteger(i64),
-    Parameter(ValueType, Vec<u8>),
+    Parameter(ValueType, Cow<'query, [u8]>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Field {
-    pub external_name: Vec<u8>,
+pub struct Field<'query> {
+    pub external_name: Cow<'query, [u8]>,
     kind: FieldKind,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Predicate {
-    Eq(Field, QueryValue),
-    In(Field, Vec<QueryValue>),
-    Range(Field, QueryValue, QueryValue),
-    TimeWindow(Field, QueryValue, QueryValue),
-    IsNull(Field),
-    IsMissing(Field),
+pub enum Predicate<'query> {
+    Eq(Field<'query>, QueryValue<'query>),
+    In(Field<'query>, Vec<QueryValue<'query>>),
+    Range(Field<'query>, QueryValue<'query>, QueryValue<'query>),
+    TimeWindow(Field<'query>, QueryValue<'query>, QueryValue<'query>),
+    IsNull(Field<'query>),
+    IsMissing(Field<'query>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,34 +63,47 @@ pub enum Direction {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Order {
-    pub field: Field,
+pub struct Order<'query> {
+    pub field: Field<'query>,
     pub direction: Direction,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct ParsedQuery {
+pub struct ParsedQuery<'query> {
     pub mode: Mode,
     pub source: Source,
     pub shape: Shape,
-    pub predicates: Vec<Predicate>,
-    pub order_by: Vec<Order>,
+    pub predicates: Vec<Predicate<'query>>,
+    pub order_by: Vec<Order<'query>>,
     pub limit: Option<usize>,
-    pub cursor: Option<QueryValue>,
+    pub cursor: Option<QueryValue<'query>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
     InvalidParameterType,
     InvalidSyntax,
+    QueryCursorInvalid,
     QueryTooLarge,
     UnsupportedField,
     UnsupportedQueryShape,
     UnsupportedSource,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParseFailure {
+    pub reason: ParseError,
+    pub byte: usize,
+}
+
 #[derive(Debug, PartialEq, Eq)]
-enum Token<'a> {
+struct Token<'a> {
+    kind: TokenKind<'a>,
+    start: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TokenKind<'a> {
     Word(&'a [u8]),
     String(Vec<u8>),
     Parameter(&'a [u8]),
@@ -93,6 +111,8 @@ enum Token<'a> {
     Equals,
     LeftParen,
     RightParen,
+    LeftBracket,
+    RightBracket,
     Comma,
     Semicolon,
 }
@@ -120,7 +140,7 @@ enum FieldKind {
     StateMeta,
 }
 
-impl Field {
+impl Field<'_> {
     fn value_type(&self) -> ValueType {
         match self.kind {
             FieldKind::Version
@@ -137,46 +157,136 @@ impl Field {
     }
 }
 
-pub fn parse(query: &[u8]) -> Result<ParsedQuery, ParseError> {
+#[cfg(test)]
+pub fn parse(query: &[u8]) -> Result<ParsedQuery<'_>, ParseError> {
+    parse_with_diagnostic(query).map_err(|failure| failure.reason)
+}
+
+pub fn parse_with_diagnostic(query: &[u8]) -> Result<ParsedQuery<'_>, ParseFailure> {
     if query.len() > MAX_QUERY_BYTES {
-        return Err(ParseError::QueryTooLarge);
+        return Err(ParseFailure {
+            reason: ParseError::QueryTooLarge,
+            byte: MAX_QUERY_BYTES + 1,
+        });
     }
 
     let tokens = tokenize(query)?;
     let (mode, tokens) = parse_mode(&tokens);
-    parse_query(mode, tokens)
+    parse_query(mode, tokens, query.len())
+}
+
+fn word<'query>(token: &Token<'query>) -> Option<&'query [u8]> {
+    match &token.kind {
+        TokenKind::Word(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn word_at<'query>(tokens: &[Token<'query>], index: usize) -> Option<&'query [u8]> {
+    tokens.get(index).and_then(word)
+}
+
+fn string_at<'tokens, 'query>(
+    tokens: &'tokens [Token<'query>],
+    index: usize,
+) -> Option<&'tokens Vec<u8>> {
+    match tokens.get(index).map(|token| &token.kind) {
+        Some(TokenKind::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn byte_at(tokens: &[Token<'_>], index: usize, query_len: usize) -> usize {
+    tokens
+        .get(index)
+        .map_or(query_len.saturating_add(1), |token| token.start + 1)
+}
+
+fn failure(
+    reason: ParseError,
+    tokens: &[Token<'_>],
+    index: usize,
+    query_len: usize,
+) -> ParseFailure {
+    ParseFailure {
+        reason,
+        byte: byte_at(tokens, index, query_len),
+    }
+}
+
+fn expect_kind(
+    tokens: &[Token<'_>],
+    index: usize,
+    expected: &TokenKind<'_>,
+    query_len: usize,
+) -> Result<(), ParseFailure> {
+    if tokens
+        .get(index)
+        .is_some_and(|token| &token.kind == expected)
+    {
+        Ok(())
+    } else {
+        Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            index,
+            query_len,
+        ))
+    }
 }
 
 fn parse_mode<'tokens, 'query>(
     tokens: &'tokens [Token<'query>],
 ) -> (Mode, &'tokens [Token<'query>]) {
-    match tokens.first() {
-        Some(Token::Word(word)) if keyword(word, b"EXPLAIN") => (Mode::Explain, &tokens[1..]),
-        _ => (Mode::Execute, tokens),
+    if matches!(word_at(tokens, 0), Some(word) if keyword(word, b"EXPLAIN")) {
+        if matches!(word_at(tokens, 1), Some(word) if keyword(word, b"ANALYZE")) {
+            (Mode::Analyze, &tokens[2..])
+        } else {
+            (Mode::Explain, &tokens[1..])
+        }
+    } else {
+        (Mode::Execute, tokens)
     }
 }
 
-fn parse_query(mode: Mode, tokens: &[Token<'_>]) -> Result<ParsedQuery, ParseError> {
-    match tokens {
-        [Token::Word(from), Token::Word(source), Token::Word(where_keyword), rest @ ..] => {
-            if !keyword(from, b"FROM") {
-                Err(ParseError::InvalidSyntax)
-            } else if !keyword(where_keyword, b"WHERE") {
-                Err(ParseError::UnsupportedQueryShape)
-            } else {
-                parse_predicates(mode, parse_source(source)?, rest)
-            }
-        }
-        [Token::Word(from), Token::Word(source), ..] => {
-            if !keyword(from, b"FROM") {
-                Err(ParseError::InvalidSyntax)
-            } else {
-                parse_source(source)?;
-                Err(ParseError::UnsupportedQueryShape)
-            }
-        }
-        _ => Err(ParseError::InvalidSyntax),
+fn parse_query<'query>(
+    mode: Mode,
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<ParsedQuery<'query>, ParseFailure> {
+    let from = word_at(tokens, 0)
+        .ok_or_else(|| failure(ParseError::InvalidSyntax, tokens, 0, query_len))?;
+    if !keyword(from, b"FROM") {
+        return Err(failure(ParseError::InvalidSyntax, tokens, 0, query_len));
     }
+
+    let source_token = word_at(tokens, 1)
+        .ok_or_else(|| failure(ParseError::InvalidSyntax, tokens, 1, query_len))?;
+    match word_at(tokens, 2) {
+        Some(where_keyword) if keyword(where_keyword, b"WHERE") => {}
+        Some(_) => {
+            return Err(failure(
+                ParseError::UnsupportedQueryShape,
+                tokens,
+                2,
+                query_len,
+            ));
+        }
+        None => {
+            parse_source(source_token).map_err(|reason| failure(reason, tokens, 1, query_len))?;
+            return Err(failure(
+                ParseError::UnsupportedQueryShape,
+                tokens,
+                2,
+                query_len,
+            ));
+        }
+    }
+
+    let source =
+        parse_source(source_token).map_err(|reason| failure(reason, tokens, 1, query_len))?;
+
+    parse_predicates(mode, source, &tokens[3..], query_len)
 }
 
 fn parse_source(source: &[u8]) -> Result<Source, ParseError> {
@@ -189,128 +299,219 @@ fn parse_source(source: &[u8]) -> Result<Source, ParseError> {
     }
 }
 
-fn parse_predicates(
+fn parse_predicates<'query>(
     mode: Mode,
     source: Source,
-    tokens: &[Token<'_>],
-) -> Result<ParsedQuery, ParseError> {
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<ParsedQuery<'query>, ParseFailure> {
     let mut predicates = Vec::with_capacity(4);
     let mut offset = 0;
 
     loop {
-        let (predicate, consumed) = parse_predicate(&tokens[offset..])?;
+        let (predicate, consumed) = parse_predicate(&tokens[offset..], query_len)?;
         predicates.push(predicate);
         offset += consumed;
 
         match tokens.get(offset) {
-            Some(Token::Word(word)) if keyword(word, b"AND") => offset += 1,
+            Some(token) if matches!(word(token), Some(word) if keyword(word, b"AND")) => {
+                offset += 1;
+                if predicates.len() == MAX_PREDICATES {
+                    return Err(failure(
+                        ParseError::UnsupportedQueryShape,
+                        tokens,
+                        offset,
+                        query_len,
+                    ));
+                }
+            }
             _ => break,
         }
     }
 
-    parse_tail(mode, source, predicates, &tokens[offset..])
+    parse_tail(mode, source, predicates, &tokens[offset..], query_len)
 }
 
-fn parse_predicate(tokens: &[Token<'_>]) -> Result<(Predicate, usize), ParseError> {
-    let field_name = match tokens.first() {
-        Some(Token::Word(field_name)) => *field_name,
-        _ => return Err(ParseError::UnsupportedQueryShape),
-    };
-    let field = parse_field(field_name)?;
+fn parse_predicate<'query>(
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<(Predicate<'query>, usize), ParseFailure> {
+    let (field, field_tokens) = parse_field_tokens(tokens, query_len)?;
+    let tail = &tokens[field_tokens..];
 
-    match tokens.get(1) {
-        Some(Token::Equals) => {
-            let value = parse_value(
-                tokens.get(2).ok_or(ParseError::UnsupportedQueryShape)?,
-                &field,
-            )?;
-            Ok((Predicate::Eq(field, value), 3))
+    match tail.first().map(|token| &token.kind) {
+        Some(TokenKind::Equals) => {
+            let value_token = tail
+                .get(1)
+                .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tail, 1, query_len))?;
+            let value = parse_value(value_token, &field)
+                .map_err(|reason| failure(reason, tail, 1, query_len))?;
+            Ok((Predicate::Eq(field, value), field_tokens + 2))
         }
-        Some(Token::Word(operator)) if keyword(operator, b"IN") => parse_in(field, tokens),
-        Some(Token::Word(operator)) if keyword(operator, b"IS") => parse_is(field, tokens),
-        Some(Token::Word(operator))
+        Some(TokenKind::Word(operator)) if keyword(operator, b"IN") => {
+            let (predicate, consumed) = parse_in(field, tail, query_len)?;
+            Ok((predicate, field_tokens + consumed))
+        }
+        Some(TokenKind::Word(operator)) if keyword(operator, b"IS") => {
+            let (predicate, consumed) = parse_is(field, tail, query_len)?;
+            Ok((predicate, field_tokens + consumed))
+        }
+        Some(TokenKind::Word(operator))
             if keyword(operator, b"BETWEEN") || keyword(operator, b"FROM") =>
         {
-            parse_range(field, operator, tokens)
+            let (predicate, consumed) = parse_range(field, operator, tail, query_len)?;
+            Ok((predicate, field_tokens + consumed))
         }
-        Some(Token::Word(_)) | None => Err(ParseError::UnsupportedQueryShape),
-        _ => Err(ParseError::UnsupportedQueryShape),
+        _ => Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tail,
+            0,
+            query_len,
+        )),
     }
 }
 
-fn parse_in(field: Field, tokens: &[Token<'_>]) -> Result<(Predicate, usize), ParseError> {
-    if !matches!(tokens.get(2), Some(Token::LeftParen)) {
-        return Err(ParseError::UnsupportedQueryShape);
+fn parse_in<'query>(
+    field: Field<'query>,
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<(Predicate<'query>, usize), ParseFailure> {
+    if !matches!(
+        tokens.get(1).map(|token| &token.kind),
+        Some(TokenKind::LeftParen)
+    ) {
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            1,
+            query_len,
+        ));
     }
 
     let mut values = Vec::with_capacity(4);
-    let mut offset = 3;
+    let mut offset = 2;
 
-    if matches!(tokens.get(offset), Some(Token::RightParen)) {
-        return Err(ParseError::UnsupportedQueryShape);
+    if matches!(
+        tokens.get(offset).map(|token| &token.kind),
+        Some(TokenKind::RightParen)
+    ) {
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            offset,
+            query_len,
+        ));
     }
 
     loop {
-        let value = parse_value(
-            tokens
-                .get(offset)
-                .ok_or(ParseError::UnsupportedQueryShape)?,
-            &field,
-        )?;
+        let value_token = tokens
+            .get(offset)
+            .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, offset, query_len))?;
+        let value = parse_value(value_token, &field)
+            .map_err(|reason| failure(reason, tokens, offset, query_len))?;
         values.push(value);
         offset += 1;
 
-        match (tokens.get(offset), tokens.get(offset + 1)) {
-            (Some(Token::Comma), Some(Token::RightParen)) => {
-                return Err(ParseError::UnsupportedQueryShape);
+        match (
+            tokens.get(offset).map(|token| &token.kind),
+            tokens.get(offset + 1).map(|token| &token.kind),
+        ) {
+            (Some(TokenKind::Comma), Some(TokenKind::RightParen)) => {
+                return Err(failure(
+                    ParseError::UnsupportedQueryShape,
+                    tokens,
+                    offset + 1,
+                    query_len,
+                ));
             }
-            (Some(Token::Comma), _) => offset += 1,
-            (Some(Token::RightParen), _) => {
+            (Some(TokenKind::Comma), _) => {
+                offset += 1;
+                if values.len() == MAX_IN_VALUES {
+                    return Err(failure(
+                        ParseError::UnsupportedQueryShape,
+                        tokens,
+                        offset,
+                        query_len,
+                    ));
+                }
+            }
+            (Some(TokenKind::RightParen), _) => {
                 offset += 1;
                 break;
             }
-            _ => return Err(ParseError::UnsupportedQueryShape),
+            _ => {
+                return Err(failure(
+                    ParseError::UnsupportedQueryShape,
+                    tokens,
+                    offset,
+                    query_len,
+                ));
+            }
         }
     }
 
     Ok((Predicate::In(field, values), offset))
 }
 
-fn parse_is(field: Field, tokens: &[Token<'_>]) -> Result<(Predicate, usize), ParseError> {
-    match tokens.get(2) {
-        Some(Token::Word(kind)) if keyword(kind, b"NULL") => Ok((Predicate::IsNull(field), 3)),
-        Some(Token::Word(kind)) if keyword(kind, b"MISSING") => {
-            Ok((Predicate::IsMissing(field), 3))
+fn parse_is<'query>(
+    field: Field<'query>,
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<(Predicate<'query>, usize), ParseFailure> {
+    match tokens.get(1).map(|token| &token.kind) {
+        Some(TokenKind::Word(kind)) if keyword(kind, b"NULL") => Ok((Predicate::IsNull(field), 2)),
+        Some(TokenKind::Word(kind)) if keyword(kind, b"MISSING") => {
+            Ok((Predicate::IsMissing(field), 2))
         }
-        _ => Err(ParseError::UnsupportedQueryShape),
+        _ => Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            1,
+            query_len,
+        )),
     }
 }
 
-fn parse_range(
-    field: Field,
+fn parse_range<'query>(
+    field: Field<'query>,
     operator: &[u8],
-    tokens: &[Token<'_>],
-) -> Result<(Predicate, usize), ParseError> {
-    let separator = match tokens.get(3) {
-        Some(Token::Word(separator)) => *separator,
-        _ => return Err(ParseError::UnsupportedQueryShape),
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<(Predicate<'query>, usize), ParseFailure> {
+    let separator = match word_at(tokens, 2) {
+        Some(separator) => separator,
+        None => {
+            return Err(failure(
+                ParseError::UnsupportedQueryShape,
+                tokens,
+                2,
+                query_len,
+            ));
+        }
     };
 
     let range = keyword(operator, b"BETWEEN") && keyword(separator, b"AND");
     let time_window = keyword(operator, b"FROM") && keyword(separator, b"TO");
 
     if !range && !time_window {
-        return Err(ParseError::UnsupportedQueryShape);
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            2,
+            query_len,
+        ));
     }
 
-    let lower = parse_value(
-        tokens.get(2).ok_or(ParseError::UnsupportedQueryShape)?,
-        &field,
-    )?;
-    let upper = parse_value(
-        tokens.get(4).ok_or(ParseError::UnsupportedQueryShape)?,
-        &field,
-    )?;
+    let lower_token = tokens
+        .get(1)
+        .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, 1, query_len))?;
+    let lower =
+        parse_value(lower_token, &field).map_err(|reason| failure(reason, tokens, 1, query_len))?;
+    let upper_token = tokens
+        .get(3)
+        .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, 3, query_len))?;
+    let upper =
+        parse_value(upper_token, &field).map_err(|reason| failure(reason, tokens, 3, query_len))?;
 
     let predicate = if range {
         Predicate::Range(field, lower, upper)
@@ -318,33 +519,41 @@ fn parse_range(
         Predicate::TimeWindow(field, lower, upper)
     };
 
-    Ok((predicate, 5))
+    Ok((predicate, 4))
 }
 
-fn parse_value(token: &Token<'_>, field: &Field) -> Result<QueryValue, ParseError> {
-    match token {
-        Token::String(value) => Ok(QueryValue::LiteralKeyword(value.clone())),
-        Token::Integer(raw) => parse_i64(raw)
+fn parse_value<'query>(
+    token: &Token<'query>,
+    field: &Field<'query>,
+) -> Result<QueryValue<'query>, ParseError> {
+    match &token.kind {
+        TokenKind::String(value) => Ok(QueryValue::LiteralKeyword(Cow::Owned(value.clone()))),
+        TokenKind::Integer(raw) => parse_i64(raw)
             .map(QueryValue::LiteralInteger)
             .ok_or(ParseError::InvalidParameterType),
-        Token::Parameter(name) => Ok(QueryValue::Parameter(field.value_type(), name.to_vec())),
+        TokenKind::Parameter(name) => Ok(QueryValue::Parameter(
+            field.value_type(),
+            Cow::Borrowed(*name),
+        )),
         _ => Err(ParseError::UnsupportedQueryShape),
     }
 }
 
-fn parse_tail(
+fn parse_tail<'query>(
     mode: Mode,
     source: Source,
-    predicates: Vec<Predicate>,
-    tokens: &[Token<'_>],
-) -> Result<ParsedQuery, ParseError> {
-    if let [Token::Word(return_keyword), Token::Word(return_shape), tail @ ..] = tokens {
-        if keyword(return_keyword, b"RETURN") {
-            if source == Source::Runs && keyword(return_shape, b"RECORD") && valid_terminator(tail)
-            {
-                return canonical_point(mode, predicates);
+    predicates: Vec<Predicate<'query>>,
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<ParsedQuery<'query>, ParseFailure> {
+    if matches!(word_at(tokens, 0), Some(word) if keyword(word, b"RETURN")) {
+        if let Some(return_shape) = word_at(tokens, 1) {
+            if source == Source::Runs && keyword(return_shape, b"RECORD") {
+                validate_terminator(&tokens[2..], query_len)?;
+                return canonical_point(mode, predicates, byte_at(tokens, 0, query_len));
             }
-            if source == Source::Runs && keyword(return_shape, b"COUNT") && valid_terminator(tail) {
+            if source == Source::Runs && keyword(return_shape, b"COUNT") {
+                validate_terminator(&tokens[2..], query_len)?;
                 return Ok(ParsedQuery {
                     mode,
                     source,
@@ -355,19 +564,29 @@ fn parse_tail(
                     cursor: None,
                 });
             }
-            return Err(ParseError::UnsupportedQueryShape);
         }
+
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            1,
+            query_len,
+        ));
     }
 
-    parse_collection_tail(mode, source, predicates, tokens)
+    parse_collection_tail(mode, source, predicates, tokens, query_len)
 }
 
-fn canonical_point(mode: Mode, predicates: Vec<Predicate>) -> Result<ParsedQuery, ParseError> {
+fn canonical_point<'query>(
+    mode: Mode,
+    predicates: Vec<Predicate<'query>>,
+    error_byte: usize,
+) -> Result<ParsedQuery<'query>, ParseFailure> {
     if predicates.len() == 1 {
-        let predicate = predicates
-            .into_iter()
-            .next()
-            .ok_or(ParseError::UnsupportedQueryShape)?;
+        let predicate = predicates.into_iter().next().ok_or(ParseFailure {
+            reason: ParseError::UnsupportedQueryShape,
+            byte: error_byte,
+        })?;
 
         return match predicate {
             Predicate::Eq(field, value) if field.kind == FieldKind::RunId => Ok(ParsedQuery {
@@ -379,12 +598,18 @@ fn canonical_point(mode: Mode, predicates: Vec<Predicate>) -> Result<ParsedQuery
                 limit: Some(1),
                 cursor: None,
             }),
-            _ => Err(ParseError::UnsupportedQueryShape),
+            _ => Err(ParseFailure {
+                reason: ParseError::UnsupportedQueryShape,
+                byte: error_byte,
+            }),
         };
     }
 
     if predicates.len() != 2 {
-        return Err(ParseError::UnsupportedQueryShape);
+        return Err(ParseFailure {
+            reason: ParseError::UnsupportedQueryShape,
+            byte: error_byte,
+        });
     }
 
     let mut partition = None;
@@ -398,7 +623,12 @@ fn canonical_point(mode: Mode, predicates: Vec<Predicate>) -> Result<ParsedQuery
             Predicate::Eq(field, value) if field.kind == FieldKind::RunId => {
                 run_id = Some((field, value));
             }
-            _ => return Err(ParseError::UnsupportedQueryShape),
+            _ => {
+                return Err(ParseFailure {
+                    reason: ParseError::UnsupportedQueryShape,
+                    byte: error_byte,
+                });
+            }
         }
     }
 
@@ -417,20 +647,35 @@ fn canonical_point(mode: Mode, predicates: Vec<Predicate>) -> Result<ParsedQuery
                 cursor: None,
             })
         }
-        _ => Err(ParseError::UnsupportedQueryShape),
+        _ => Err(ParseFailure {
+            reason: ParseError::UnsupportedQueryShape,
+            byte: error_byte,
+        }),
     }
 }
 
-fn parse_collection_tail(
+fn parse_collection_tail<'query>(
     mode: Mode,
     source: Source,
-    predicates: Vec<Predicate>,
-    tokens: &[Token<'_>],
-) -> Result<ParsedQuery, ParseError> {
-    if !matches!(tokens.first(), Some(Token::Word(word)) if keyword(word, b"ORDER"))
-        || !matches!(tokens.get(1), Some(Token::Word(word)) if keyword(word, b"BY"))
-    {
-        return Err(ParseError::UnsupportedQueryShape);
+    predicates: Vec<Predicate<'query>>,
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<ParsedQuery<'query>, ParseFailure> {
+    if !matches!(word_at(tokens, 0), Some(word) if keyword(word, b"ORDER")) {
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            0,
+            query_len,
+        ));
+    }
+    if !matches!(word_at(tokens, 1), Some(word) if keyword(word, b"BY")) {
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            1,
+            query_len,
+        ));
     }
 
     let mut offset = 2;
@@ -438,55 +683,113 @@ fn parse_collection_tail(
 
     loop {
         if order_by.len() >= 2 {
-            return Err(ParseError::UnsupportedQueryShape);
+            return Err(failure(
+                ParseError::UnsupportedQueryShape,
+                tokens,
+                offset,
+                query_len,
+            ));
         }
 
-        let field = match tokens.get(offset) {
-            Some(Token::Word(field)) => parse_field(field)?,
-            _ => return Err(ParseError::UnsupportedQueryShape),
-        };
-        let direction = match tokens.get(offset + 1) {
-            Some(Token::Word(direction)) if keyword(direction, b"ASC") => Direction::Asc,
-            Some(Token::Word(direction)) if keyword(direction, b"DESC") => Direction::Desc,
-            _ => return Err(ParseError::UnsupportedQueryShape),
+        let field_token = word_at(tokens, offset)
+            .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, offset, query_len))?;
+        let field = parse_field(field_token)
+            .map_err(|reason| failure(reason, tokens, offset, query_len))?;
+        let direction = match word_at(tokens, offset + 1) {
+            Some(direction) if keyword(direction, b"ASC") => Direction::Asc,
+            Some(direction) if keyword(direction, b"DESC") => Direction::Desc,
+            _ => {
+                return Err(failure(
+                    ParseError::UnsupportedQueryShape,
+                    tokens,
+                    offset + 1,
+                    query_len,
+                ));
+            }
         };
         order_by.push(Order { field, direction });
         offset += 2;
 
-        if matches!(tokens.get(offset), Some(Token::Comma)) {
+        if matches!(
+            tokens.get(offset).map(|token| &token.kind),
+            Some(TokenKind::Comma)
+        ) {
             offset += 1;
         } else {
             break;
         }
     }
 
-    if !matches!(tokens.get(offset), Some(Token::Word(word)) if keyword(word, b"LIMIT")) {
-        return Err(ParseError::UnsupportedQueryShape);
+    if !matches!(word_at(tokens, offset), Some(word) if keyword(word, b"LIMIT")) {
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            offset,
+            query_len,
+        ));
     }
-    let limit = match tokens.get(offset + 1) {
-        Some(Token::Integer(raw)) => parse_limit(raw)?,
-        _ => return Err(ParseError::UnsupportedQueryShape),
+    let limit = match tokens.get(offset + 1).map(|token| &token.kind) {
+        Some(TokenKind::Integer(raw)) => {
+            parse_limit(raw).map_err(|reason| failure(reason, tokens, offset + 1, query_len))?
+        }
+        _ => {
+            return Err(failure(
+                ParseError::UnsupportedQueryShape,
+                tokens,
+                offset + 1,
+                query_len,
+            ));
+        }
     };
     offset += 2;
 
-    let cursor = if matches!(tokens.get(offset), Some(Token::Word(word)) if keyword(word, b"CURSOR"))
-    {
-        let name = match tokens.get(offset + 1) {
-            Some(Token::Parameter(name)) => *name,
-            _ => return Err(ParseError::UnsupportedQueryShape),
+    let cursor = if matches!(word_at(tokens, offset), Some(word) if keyword(word, b"CURSOR")) {
+        if mode != Mode::Execute {
+            return Err(failure(
+                ParseError::QueryCursorInvalid,
+                tokens,
+                offset,
+                query_len,
+            ));
+        }
+
+        let name = match tokens.get(offset + 1).map(|token| &token.kind) {
+            Some(TokenKind::Parameter(name)) => *name,
+            _ => {
+                return Err(failure(
+                    ParseError::UnsupportedQueryShape,
+                    tokens,
+                    offset + 1,
+                    query_len,
+                ));
+            }
         };
         offset += 2;
-        Some(QueryValue::Parameter(ValueType::Keyword, name.to_vec()))
+        Some(QueryValue::Parameter(
+            ValueType::Keyword,
+            Cow::Borrowed(name),
+        ))
     } else {
         None
     };
 
-    if !matches!(tokens.get(offset), Some(Token::Word(word)) if keyword(word, b"RETURN"))
-        || !matches!(tokens.get(offset + 1), Some(Token::Word(word)) if keyword(word, b"RECORDS"))
-        || !valid_terminator(&tokens[offset + 2..])
-    {
-        return Err(ParseError::UnsupportedQueryShape);
+    if !matches!(word_at(tokens, offset), Some(word) if keyword(word, b"RETURN")) {
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            offset,
+            query_len,
+        ));
     }
+    if !matches!(word_at(tokens, offset + 1), Some(word) if keyword(word, b"RECORDS")) {
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            offset + 1,
+            query_len,
+        ));
+    }
+    validate_terminator(&tokens[offset + 2..], query_len)?;
 
     match source {
         Source::Runs => Ok(ParsedQuery {
@@ -498,19 +801,30 @@ fn parse_collection_tail(
             limit: Some(limit),
             cursor,
         }),
-        Source::Events => canonical_history(mode, predicates, order_by, limit, cursor),
+        Source::Events => canonical_history(
+            mode,
+            predicates,
+            order_by,
+            limit,
+            cursor,
+            byte_at(tokens, offset, query_len),
+        ),
     }
 }
 
-fn canonical_history(
+fn canonical_history<'query>(
     mode: Mode,
-    predicates: Vec<Predicate>,
-    order_by: Vec<Order>,
+    predicates: Vec<Predicate<'query>>,
+    order_by: Vec<Order<'query>>,
     limit: usize,
-    cursor: Option<QueryValue>,
-) -> Result<ParsedQuery, ParseError> {
+    cursor: Option<QueryValue<'query>>,
+    error_byte: usize,
+) -> Result<ParsedQuery<'query>, ParseFailure> {
     if order_by.len() != 1 || order_by[0].field.kind != FieldKind::EventId {
-        return Err(ParseError::UnsupportedQueryShape);
+        return Err(ParseFailure {
+            reason: ParseError::UnsupportedQueryShape,
+            byte: error_byte,
+        });
     }
 
     let mut partition_count = 0usize;
@@ -524,12 +838,20 @@ fn canonical_history(
             Predicate::Eq(field, _) if field.kind == FieldKind::RunId => {
                 run_count += 1;
             }
-            _ => return Err(ParseError::UnsupportedQueryShape),
+            _ => {
+                return Err(ParseFailure {
+                    reason: ParseError::UnsupportedQueryShape,
+                    byte: error_byte,
+                });
+            }
         }
     }
 
     if run_count != 1 || partition_count > 1 || predicates.len() != run_count + partition_count {
-        return Err(ParseError::UnsupportedQueryShape);
+        return Err(ParseFailure {
+            reason: ParseError::UnsupportedQueryShape,
+            byte: error_byte,
+        });
     }
 
     Ok(ParsedQuery {
@@ -553,11 +875,113 @@ fn parse_limit(raw: &[u8]) -> Result<usize, ParseError> {
     }
 }
 
-fn valid_terminator(tokens: &[Token<'_>]) -> bool {
-    tokens.is_empty() || matches!(tokens, [Token::Semicolon])
+fn validate_terminator(tokens: &[Token<'_>], query_len: usize) -> Result<(), ParseFailure> {
+    match tokens.first().map(|token| &token.kind) {
+        None => Ok(()),
+        Some(TokenKind::Semicolon) if tokens.len() == 1 => Ok(()),
+        Some(TokenKind::Semicolon) => Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            1,
+            query_len,
+        )),
+        _ => Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            0,
+            query_len,
+        )),
+    }
 }
 
-fn parse_field(input: &[u8]) -> Result<Field, ParseError> {
+fn parse_field_tokens<'query>(
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<(Field<'query>, usize), ParseFailure> {
+    let field_name = word_at(tokens, 0)
+        .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, 0, query_len))?;
+
+    if keyword(field_name, b"STATE_META")
+        && matches!(
+            tokens.get(1).map(|token| &token.kind),
+            Some(TokenKind::LeftBracket)
+        )
+    {
+        let state = string_at(tokens, 2)
+            .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, 2, query_len))?;
+        expect_kind(tokens, 3, &TokenKind::RightBracket, query_len)?;
+        expect_kind(tokens, 4, &TokenKind::LeftBracket, query_len)?;
+        let name = string_at(tokens, 5)
+            .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, 5, query_len))?;
+        expect_kind(tokens, 6, &TokenKind::RightBracket, query_len)?;
+
+        if !valid_state_name(state) {
+            return Err(failure(ParseError::UnsupportedField, tokens, 2, query_len));
+        }
+        if !valid_metadata_key(name) {
+            return Err(failure(ParseError::UnsupportedField, tokens, 5, query_len));
+        }
+
+        return Ok((
+            Field {
+                external_name: Cow::Owned(bracket_field(b"state_meta", &[state, name])),
+                kind: FieldKind::StateMeta,
+            },
+            7,
+        ));
+    }
+
+    if keyword(field_name, b"ATTRIBUTE")
+        && matches!(
+            tokens.get(1).map(|token| &token.kind),
+            Some(TokenKind::LeftBracket)
+        )
+    {
+        let name = string_at(tokens, 2)
+            .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, 2, query_len))?;
+        expect_kind(tokens, 3, &TokenKind::RightBracket, query_len)?;
+
+        if !valid_metadata_key(name) {
+            return Err(failure(ParseError::UnsupportedField, tokens, 2, query_len));
+        }
+
+        return Ok((
+            Field {
+                external_name: Cow::Owned(bracket_field(b"attribute", &[name])),
+                kind: FieldKind::Attribute,
+            },
+            4,
+        ));
+    }
+
+    parse_field(field_name)
+        .map(|field| (field, 1))
+        .map_err(|reason| failure(reason, tokens, 0, query_len))
+}
+
+fn bracket_field(prefix: &[u8], segments: &[&Vec<u8>]) -> Vec<u8> {
+    let extra = segments
+        .iter()
+        .map(|segment| segment.len() + 4)
+        .sum::<usize>();
+    let mut external = Vec::with_capacity(prefix.len() + extra);
+    external.extend_from_slice(prefix);
+
+    for segment in segments {
+        external.extend_from_slice(b"['");
+        for byte in segment.iter().copied() {
+            external.push(byte);
+            if byte == b'\'' {
+                external.push(byte);
+            }
+        }
+        external.extend_from_slice(b"']");
+    }
+
+    external
+}
+
+fn parse_field(input: &[u8]) -> Result<Field<'_>, ParseError> {
     let kind = if keyword(input, b"PARTITION_KEY") {
         FieldKind::PartitionKey
     } else if keyword(input, b"RUN_ID") {
@@ -597,7 +1021,7 @@ fn parse_field(input: &[u8]) -> Result<Field, ParseError> {
     };
 
     Ok(Field {
-        external_name: input.to_vec(),
+        external_name: Cow::Borrowed(input),
         kind,
     })
 }
@@ -636,6 +1060,18 @@ fn valid_metadata_name(name: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+fn valid_metadata_key(name: &[u8]) -> bool {
+    valid_quoted_name(name) && !name.starts_with(b"__")
+}
+
+fn valid_state_name(name: &[u8]) -> bool {
+    valid_quoted_name(name)
+}
+
+fn valid_quoted_name(name: &[u8]) -> bool {
+    !name.is_empty() && name.len() <= 64 && std::str::from_utf8(name).is_ok()
+}
+
 fn parse_i64(raw: &[u8]) -> Option<i64> {
     let (negative, digits) = match raw {
         [b'-', digits @ ..] if !digits.is_empty() => (true, digits),
@@ -670,7 +1106,7 @@ fn parse_i64(raw: &[u8]) -> Option<i64> {
     }
 }
 
-fn tokenize(query: &[u8]) -> Result<Vec<Token<'_>>, ParseError> {
+fn tokenize(query: &[u8]) -> Result<Vec<Token<'_>>, ParseFailure> {
     let mut tokens = Vec::with_capacity(48);
     let mut offset = 0;
 
@@ -682,58 +1118,118 @@ fn tokenize(query: &[u8]) -> Result<Vec<Token<'_>>, ParseError> {
             break;
         }
         if tokens.len() >= MAX_TOKENS {
-            return Err(ParseError::UnsupportedQueryShape);
+            return Err(ParseFailure {
+                reason: ParseError::UnsupportedQueryShape,
+                byte: offset + 1,
+            });
         }
 
+        let start_offset = offset;
         match query[offset] {
             b'=' => {
-                tokens.push(Token::Equals);
+                tokens.push(Token {
+                    kind: TokenKind::Equals,
+                    start: start_offset,
+                });
                 offset += 1;
             }
             b'(' => {
-                tokens.push(Token::LeftParen);
+                tokens.push(Token {
+                    kind: TokenKind::LeftParen,
+                    start: start_offset,
+                });
                 offset += 1;
             }
             b')' => {
-                tokens.push(Token::RightParen);
+                tokens.push(Token {
+                    kind: TokenKind::RightParen,
+                    start: start_offset,
+                });
+                offset += 1;
+            }
+            b'[' => {
+                tokens.push(Token {
+                    kind: TokenKind::LeftBracket,
+                    start: start_offset,
+                });
+                offset += 1;
+            }
+            b']' => {
+                tokens.push(Token {
+                    kind: TokenKind::RightBracket,
+                    start: start_offset,
+                });
                 offset += 1;
             }
             b',' => {
-                tokens.push(Token::Comma);
+                tokens.push(Token {
+                    kind: TokenKind::Comma,
+                    start: start_offset,
+                });
                 offset += 1;
             }
             b';' => {
-                tokens.push(Token::Semicolon);
+                tokens.push(Token {
+                    kind: TokenKind::Semicolon,
+                    start: start_offset,
+                });
                 offset += 1;
             }
             b'\'' => {
-                let (value, next_offset) = take_string(query, offset + 1)?;
-                tokens.push(Token::String(value));
+                let (value, next_offset) =
+                    take_string(query, offset + 1).map_err(|reason| ParseFailure {
+                        reason,
+                        byte: start_offset + 1,
+                    })?;
+                tokens.push(Token {
+                    kind: TokenKind::String(value),
+                    start: start_offset,
+                });
                 offset = next_offset;
             }
             b'@' => {
                 let start = offset + 1;
                 let end = take_identifier_end(query, start);
                 if end == start {
-                    return Err(ParseError::InvalidSyntax);
+                    return Err(ParseFailure {
+                        reason: ParseError::InvalidSyntax,
+                        byte: start_offset + 1,
+                    });
                 }
-                tokens.push(Token::Parameter(&query[start..end]));
+                tokens.push(Token {
+                    kind: TokenKind::Parameter(&query[start..end]),
+                    start: start_offset,
+                });
                 offset = end;
             }
             byte if byte.is_ascii_digit() || (byte == b'-' && offset + 1 < query.len()) => {
                 let end = take_integer_end(query, offset);
                 if end == offset || (end == offset + 1 && byte == b'-') {
-                    return Err(ParseError::InvalidSyntax);
+                    return Err(ParseFailure {
+                        reason: ParseError::InvalidSyntax,
+                        byte: start_offset + 1,
+                    });
                 }
-                tokens.push(Token::Integer(&query[offset..end]));
+                tokens.push(Token {
+                    kind: TokenKind::Integer(&query[offset..end]),
+                    start: start_offset,
+                });
                 offset = end;
             }
             byte if is_word_start(byte) => {
                 let end = take_identifier_end(query, offset);
-                tokens.push(Token::Word(&query[offset..end]));
+                tokens.push(Token {
+                    kind: TokenKind::Word(&query[offset..end]),
+                    start: start_offset,
+                });
                 offset = end;
             }
-            _ => return Err(ParseError::InvalidSyntax),
+            _ => {
+                return Err(ParseFailure {
+                    reason: ParseError::InvalidSyntax,
+                    byte: start_offset + 1,
+                });
+            }
         }
     }
 
@@ -820,7 +1316,7 @@ mod tests {
                     ..
                 },
                 QueryValue::Parameter(ValueType::Keyword, name)
-            ) if name == b"partition"
+            ) if name.as_ref() == b"partition"
         ));
         assert!(matches!(
             &parsed.predicates[1],
@@ -830,7 +1326,7 @@ mod tests {
                     ..
                 },
                 QueryValue::LiteralKeyword(value)
-            ) if value == b"Run''42"
+            ) if value.as_ref() == b"Run''42"
         ));
     }
 
@@ -849,7 +1345,7 @@ mod tests {
                     ..
                 },
                 QueryValue::Parameter(ValueType::Keyword, name)
-            ) if name == b"run_id"
+            ) if name.as_ref() == b"run_id"
         ));
     }
 
@@ -874,6 +1370,18 @@ mod tests {
         ));
         assert_eq!(parsed.order_by.len(), 2);
         assert_eq!(parsed.limit, Some(25));
+        assert_eq!(parsed.cursor, None);
+    }
+
+    #[test]
+    fn parses_explain_analyze_as_a_distinct_mode() {
+        let parsed = parse(
+            b"EXPLAIN ANALYZE FROM runs WHERE partition_key = @tenant ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS",
+        )
+        .expect("analyzed collection query parses");
+
+        assert_eq!(parsed.mode, Mode::Analyze);
+        assert_eq!(parsed.shape, Shape::Collection);
         assert_eq!(parsed.cursor, None);
     }
 
@@ -924,7 +1432,7 @@ mod tests {
 
         assert!(matches!(
             parsed.cursor,
-            Some(QueryValue::Parameter(ValueType::Keyword, name)) if name == b"page"
+            Some(QueryValue::Parameter(ValueType::Keyword, name)) if name.as_ref() == b"page"
         ));
 
         assert_eq!(
@@ -973,5 +1481,97 @@ mod tests {
 
         let over_tokens = "x ".repeat(MAX_TOKENS + 1).into_bytes();
         assert_eq!(parse(&over_tokens), Err(ParseError::UnsupportedQueryShape));
+    }
+
+    #[test]
+    fn enforces_predicate_budget_at_the_first_excess_predicate() {
+        let exact = predicate_query(12);
+        assert!(parse(&exact).is_ok());
+
+        let over = predicate_query(13);
+        let excess_byte = find_byte(&over, b"attribute.field12");
+        assert_eq!(
+            parse_with_diagnostic(&over),
+            Err(ParseFailure {
+                reason: ParseError::UnsupportedQueryShape,
+                byte: excess_byte,
+            })
+        );
+    }
+
+    #[test]
+    fn enforces_in_value_budget_at_the_first_excess_value() {
+        let exact = in_query(20);
+        assert!(parse(&exact).is_ok());
+
+        let over = in_query(21);
+        let excess_byte = find_byte(&over, b"'state20'");
+        assert_eq!(
+            parse_with_diagnostic(&over),
+            Err(ParseFailure {
+                reason: ParseError::UnsupportedQueryShape,
+                byte: excess_byte,
+            })
+        );
+    }
+
+    #[test]
+    fn diagnostics_report_the_actual_failure_token() {
+        let missing_tail =
+            b"FROM runs WHERE partition_key = 'p' AND attribute['customer.region'] = 'eu'";
+
+        assert_eq!(
+            parse_with_diagnostic(missing_tail),
+            Err(ParseFailure {
+                reason: ParseError::UnsupportedQueryShape,
+                byte: missing_tail.len() + 1,
+            })
+        );
+
+        let explain_cursor = b"EXPLAIN FROM runs WHERE partition_key = @tenant ORDER BY updated_at_ms DESC LIMIT 10 CURSOR @page RETURN RECORDS";
+        let cursor_byte = explain_cursor
+            .windows(b"CURSOR".len())
+            .position(|window| window == b"CURSOR")
+            .expect("cursor token exists")
+            + 1;
+
+        assert_eq!(
+            parse_with_diagnostic(explain_cursor),
+            Err(ParseFailure {
+                reason: ParseError::QueryCursorInvalid,
+                byte: cursor_byte,
+            })
+        );
+    }
+
+    fn predicate_query(predicates: usize) -> Vec<u8> {
+        let mut query = String::from("FROM runs WHERE partition_key = @partition");
+        for index in 1..predicates {
+            query.push_str(" AND attribute.field");
+            query.push_str(&index.to_string());
+            query.push_str(" = @value");
+            query.push_str(&index.to_string());
+        }
+        query.push_str(" ORDER BY updated_at_ms ASC LIMIT 25 RETURN RECORDS");
+        query.into_bytes()
+    }
+
+    fn in_query(cardinality: usize) -> Vec<u8> {
+        let values = (0..cardinality)
+            .map(|index| format!("'state{index}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "FROM runs WHERE partition_key = @partition AND state IN ({values}) ORDER BY updated_at_ms DESC LIMIT 25 RETURN RECORDS"
+        )
+        .into_bytes()
+    }
+
+    fn find_byte(query: &[u8], needle: &[u8]) -> usize {
+        query
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("needle exists")
+            + 1
     }
 }
