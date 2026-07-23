@@ -32,6 +32,7 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
 
   setup do
     # Save original config values
+    original_guard_state = :sys.get_state(MemoryGuard)
     orig_keydir_max = Application.get_env(:ferricstore, :keydir_max_ram)
     orig_hot_cache_max = Application.get_env(:ferricstore, :hot_cache_max_ram)
     orig_hot_cache_min = Application.get_env(:ferricstore, :hot_cache_min_ram)
@@ -43,7 +44,15 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
     # to avoid triggering MemoryGuard reconfigure that would override :auto max.
     Application.put_env(:ferricstore, :keydir_max_ram, @default_keydir_max_ram)
     Application.put_env(:ferricstore, :hot_cache_min_ram, 1_048_576)
-    MemoryGuard.reconfigure(%{keydir_max_ram: @default_keydir_max_ram})
+
+    assert :ok =
+             MemoryGuard.reconfigure(%{
+               max_memory_bytes: original_guard_state.max_memory_bytes,
+               keydir_max_ram: @default_keydir_max_ram,
+               hot_cache_max_ram: :auto,
+               hot_cache_min_ram: 0,
+               eviction_policy: original_guard_state.eviction_policy
+             })
 
     on_exit(fn ->
       # Restore original config
@@ -67,17 +76,25 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
 
       if orig_eviction do
         Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
+      else
+        Application.delete_env(:ferricstore, :eviction_policy)
       end
 
-      # Reconfigure MemoryGuard back to the suite-level config. test.exs uses
-      # a larger keydir budget to avoid incidental KEYDIR_FULL pressure outside
-      # this focused budget spec.
-      MemoryGuard.reconfigure(%{
-        keydir_max_ram: orig_keydir_max || @default_keydir_max_ram,
-        max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824)
-      })
+      # These tests intentionally exercise configurations whose individual
+      # fields cannot always be restored piecemeal without failing cross-field
+      # validation. Restore the exact previous GenServer snapshot.
+      MemoryGuard.stats()
+      :sys.replace_state(MemoryGuard, fn _current -> original_guard_state end)
 
       MemoryGuard.force_check()
+
+      restored_guard_state = :sys.get_state(MemoryGuard)
+      assert restored_guard_state.max_memory_bytes == original_guard_state.max_memory_bytes
+      assert restored_guard_state.keydir_max_ram == original_guard_state.keydir_max_ram
+      assert restored_guard_state.hot_cache_max_ram == original_guard_state.hot_cache_max_ram
+      assert restored_guard_state.hot_cache_min_ram == original_guard_state.hot_cache_min_ram
+      assert restored_guard_state.hot_cache_max_mode == original_guard_state.hot_cache_max_mode
+      assert restored_guard_state.eviction_policy == original_guard_state.eviction_policy
 
       # Reset atomics flags so tiny-budget MemoryGuard checks
       # don't leak KEYDIR_FULL into other tests.
