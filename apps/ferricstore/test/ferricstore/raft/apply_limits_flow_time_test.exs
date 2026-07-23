@@ -55,17 +55,7 @@ defmodule Ferricstore.Raft.ApplyLimitsFlowTimeTest do
   end
 
   test "both Flow apply wrappers enforce the replicated time invariant" do
-    source =
-      File.read!(
-        Path.expand(
-          "../../../lib/ferricstore/raft/state_machine/sections/cross_shard_dispatch.ex",
-          __DIR__
-        )
-      )
-
-    assert source
-           |> String.split("ApplyLimits.validate_flow_time(attrs, apply_now_ms())")
-           |> length() == 3
+    assert_apply_wrappers_call!(:validate_flow_time, 2)
   end
 
   test "replicated apply context bounds the total structural batch footprint" do
@@ -84,16 +74,54 @@ defmodule Ferricstore.Raft.ApplyLimitsFlowTimeTest do
   end
 
   test "both Flow apply wrappers enforce the replicated batch invariant" do
-    source =
-      File.read!(
-        Path.expand(
-          "../../../lib/ferricstore/raft/state_machine/sections/cross_shard_dispatch.ex",
-          __DIR__
-        )
-      )
+    assert_apply_wrappers_call!(:validate_flow_batch, 2)
+  end
 
-    assert source
-           |> String.split("with :ok <- ApplyLimits.validate_flow_batch(state, attrs)")
-           |> length() == 3
+  defp assert_apply_wrappers_call!(call, arity) do
+    ast =
+      Path.expand(
+        "../../../lib/ferricstore/raft/state_machine/sections/cross_shard_dispatch.ex",
+        __DIR__
+      )
+      |> File.read!()
+      |> Code.string_to_quoted!()
+
+    for {wrapper, wrapper_arity} <- [
+          {:apply_flow_pending_with_time, 5},
+          {:apply_flow_single_with_telemetry, 4}
+        ] do
+      body = function_body!(ast, wrapper, wrapper_arity)
+
+      assert count_apply_limit_calls(body, call, arity) == 1,
+             "#{wrapper}/#{wrapper_arity} must call ApplyLimits.#{call}/#{arity} exactly once"
+    end
+  end
+
+  defp function_body!(ast, name, arity) do
+    {_ast, body} =
+      Macro.prewalk(ast, nil, fn
+        {:defp, _meta, [{^name, _head_meta, args}, [do: body]]} = node, nil
+        when length(args) == arity ->
+          {node, body}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    body || flunk("could not find #{name}/#{arity}")
+  end
+
+  defp count_apply_limit_calls(ast, name, arity) do
+    {_ast, count} =
+      Macro.prewalk(ast, 0, fn
+        {{:., _, [{:__aliases__, _, [:ApplyLimits]}, ^name]}, _, args} = node, count
+        when length(args) == arity ->
+          {node, count + 1}
+
+        node, count ->
+          {node, count}
+      end)
+
+    count
   end
 end

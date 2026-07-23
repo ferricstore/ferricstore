@@ -272,6 +272,86 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
                  )
       end
 
+      @tag :flow_projection_coalescing
+      test "LMDB writer coalesces superseded Flow state projections in one flush" do
+        fixture = start_active_lmdb_projection_fixture!("coalesced-state")
+
+        queued =
+          active_lmdb_record("flow-coalesced-state", "coalesced-state", "queued",
+            partition_key: fixture.partition_key,
+            version: 1,
+            updated_at_ms: 10,
+            next_run_at_ms: 20
+          )
+
+        running = %{
+          queued
+          | state: "running",
+            version: 2,
+            updated_at_ms: 30,
+            next_run_at_ms: nil,
+            lease_owner: "worker",
+            lease_deadline_ms: 40
+        }
+
+        completed = %{
+          running
+          | state: "completed",
+            version: 3,
+            updated_at_ms: 50,
+            lease_owner: nil,
+            lease_deadline_ms: nil
+        }
+
+        state_key = Ferricstore.Flow.Keys.state_key(queued.id, queued.partition_key)
+        marker_key = "coalesced-state-marker"
+        encoded_completed = Ferricstore.Flow.encode_record(completed)
+
+        :ets.insert(
+          fixture.source_keydir,
+          {state_key, encoded_completed, 0, 0, :hot, 0, byte_size(encoded_completed)}
+        )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.enqueue(fixture.instance_name, fixture.shard_index, [
+                   {:project_flow_state, state_key, Ferricstore.Flow.encode_record(queued), 0},
+                   {:project_flow_state, state_key, Ferricstore.Flow.encode_record(running), 0},
+                   {:put, marker_key, "preserved"},
+                   {:project_flow_state, state_key, encoded_completed, 0},
+                   {:project_flow_state_from_source, state_key}
+                 ])
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+
+        assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
+        assert {:ok, ^encoded_completed} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+        assert {:ok, "preserved"} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, marker_key)
+
+        completed_index_key =
+          Ferricstore.Flow.Keys.state_index_key(
+            completed.type,
+            completed.state,
+            completed.partition_key
+          )
+
+        assert {:ok, 1} =
+                 Ferricstore.Flow.LMDB.prefix_count(
+                   fixture.lmdb_path,
+                   Ferricstore.Flow.LMDB.terminal_index_prefix(completed_index_key)
+                 )
+
+        for state <- ["queued", "running"] do
+          active_index_key =
+            Ferricstore.Flow.Keys.state_index_key(completed.type, state, completed.partition_key)
+
+          assert {:ok, 0} =
+                   Ferricstore.Flow.LMDB.prefix_count(
+                     fixture.lmdb_path,
+                     Ferricstore.Flow.LMDB.active_index_prefix(active_index_key)
+                   )
+        end
+      end
+
       test "terminal Flow state projection removes stale active LMDB rows" do
         fixture = start_active_lmdb_projection_fixture!("terminal-fast-state")
 

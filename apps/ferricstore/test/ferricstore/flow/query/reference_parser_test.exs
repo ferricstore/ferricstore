@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.ReferenceParserTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.Query.{Binder, ReferenceParser, Request}
+  alias Ferricstore.Flow.Query.{Binder, Error, Limits, ReferenceParser, Request}
   alias Ferricstore.Store.Router
 
   describe "parse/1" do
@@ -293,6 +293,63 @@ defmodule Ferricstore.Flow.Query.ReferenceParserTest do
           " AND 9 ORDER BY run_id ASC LIMIT 1 RETURN RECORDS"
 
       assert {:error, :invalid_parameter_type} = ReferenceParser.parse(query)
+    end
+  end
+
+  describe "parse_diagnostic/1" do
+    test "reports the unsupported source and field tokens after optional mode prefixes" do
+      field_query =
+        "FROM runs WHERE tenant_secret = 'x' " <>
+          "ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS"
+
+      assert {:error, %Error{reason: :unsupported_field, position: %{byte: 17, column: 17}}} =
+               ReferenceParser.parse_diagnostic(field_query)
+
+      source_query =
+        "EXPLAIN FROM jobs WHERE partition_key = 'p' " <>
+          "ORDER BY updated_at_ms DESC LIMIT 1 RETURN RECORDS"
+
+      assert {:error, %Error{reason: :unsupported_source, position: %{byte: 14, column: 14}}} =
+               ReferenceParser.parse_diagnostic(source_query)
+    end
+
+    test "reports a later unsupported field after a valid metadata predicate" do
+      query =
+        "FROM runs WHERE state_meta['queued']['priority'] = 'high' " <>
+          "AND tenant_secret = 'x' ORDER BY updated_at_ms DESC LIMIT 10 RETURN RECORDS"
+
+      {byte_offset, _length} = :binary.match(query, "tenant_secret")
+
+      assert {:error,
+              %Error{
+                reason: :unsupported_field,
+                position: %{byte: byte, line: 1, column: column}
+              }} = ReferenceParser.parse_diagnostic(query)
+
+      assert byte == byte_offset + 1
+      assert column == byte
+    end
+
+    test "reports the clause that appears where WHERE is required" do
+      assert {:error,
+              %Error{
+                reason: :unsupported_query_shape,
+                position: %{byte: 19, line: 1, column: 19}
+              }} = ReferenceParser.parse_diagnostic("EXPLAIN FROM runs RETURN RECORDS")
+    end
+
+    test "rejects oversized input without a second diagnostic scan" do
+      oversized = :binary.copy("x", Limits.max_query_bytes() + 1)
+      {:reductions, reductions_before} = :erlang.process_info(self(), :reductions)
+
+      result = ReferenceParser.parse_diagnostic(oversized)
+
+      {:reductions, reductions_after} = :erlang.process_info(self(), :reductions)
+
+      assert {:error, %Error{reason: :query_too_large, position: nil}} = result
+
+      assert reductions_after - reductions_before < 256,
+             "oversized diagnostics must stay O(1) instead of scanning the rejected query"
     end
   end
 

@@ -328,6 +328,8 @@ defmodule Ferricstore.Store.CompoundMemberCatalogLifecycleTest do
     catch
       :exit, {:noproc, _call} -> :ok
       :exit, :noproc -> :ok
+      :exit, {:shutdown, _call} -> :ok
+      :exit, :shutdown -> :ok
     end
   end
 end

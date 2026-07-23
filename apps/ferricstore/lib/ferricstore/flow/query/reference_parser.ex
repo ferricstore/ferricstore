@@ -7,7 +7,7 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
   canonicalization drift.
   """
 
-  alias Ferricstore.Flow.Query.{Field, Limits, Request}
+  alias Ferricstore.Flow.Query.{Error, Field, Limits, Request}
 
   @max_query_bytes Limits.max_query_bytes()
   @max_tokens Limits.max_query_tokens()
@@ -32,6 +32,26 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
   end
 
   def parse(_query), do: {:error, :invalid_syntax}
+
+  @doc false
+  @spec parse_diagnostic(binary()) :: {:ok, Request.t()} | {:error, Error.t()}
+  def parse_diagnostic(query) when is_binary(query) do
+    case parse(query) do
+      {:error, :query_too_large} ->
+        {:error, Error.new(:query_too_large)}
+
+      {:error, reason} ->
+        case diagnostic_byte(query, reason) do
+          byte when is_integer(byte) -> {:error, Error.diagnose(reason, query, byte)}
+          nil -> {:error, Error.new(reason)}
+        end
+
+      result ->
+        result
+    end
+  end
+
+  def parse_diagnostic(_query), do: {:error, Error.new(:invalid_syntax)}
 
   defp parse_mode([{:word, explain}, {:word, analyze} | rest]) do
     cond do
@@ -397,6 +417,312 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
   defp valid_terminator?([]), do: true
   defp valid_terminator?([:semicolon]), do: true
   defp valid_terminator?(_tail), do: false
+
+  defp diagnostic_byte(query, reason) do
+    case diagnostic_tokens(query) do
+      {:error, byte} -> byte
+      {:ok, tokens} -> diagnostic_token_byte(tokens, query, reason)
+    end
+  end
+
+  defp diagnostic_token_byte(tokens, query, :unsupported_source),
+    do: token_after_keyword_byte(tokens, "FROM") || query_end_byte(query)
+
+  defp diagnostic_token_byte(tokens, query, :unsupported_field),
+    do: unsupported_field_byte(tokens) || query_end_byte(query)
+
+  defp diagnostic_token_byte(tokens, query, :query_cursor_invalid),
+    do: keyword_token_byte(tokens, "CURSOR") || query_end_byte(query)
+
+  defp diagnostic_token_byte(tokens, query, :unsupported_query_shape) do
+    keyword_token_byte(tokens, "CURSOR") ||
+      missing_where_byte(tokens) ||
+      malformed_in_byte(tokens) ||
+      extra_terminator_byte(tokens) ||
+      oversized_limit_byte(tokens) ||
+      unexpected_predicate_tail_byte(tokens) ||
+      query_end_byte(query)
+  end
+
+  defp diagnostic_token_byte(_tokens, query, :invalid_syntax), do: query_end_byte(query)
+  defp diagnostic_token_byte(_tokens, _query, _reason), do: nil
+
+  defp token_after_keyword_byte(
+         [{{:word, word}, _byte}, {_token, byte} = next | rest],
+         keyword
+       ) do
+    if keyword?(word, keyword),
+      do: byte,
+      else: token_after_keyword_byte([next | rest], keyword)
+  end
+
+  defp token_after_keyword_byte([_token | rest], keyword),
+    do: token_after_keyword_byte(rest, keyword)
+
+  defp token_after_keyword_byte([], _keyword), do: nil
+
+  defp unsupported_field_byte(tokens) do
+    case tokens_after_keyword(tokens, "WHERE") do
+      {:ok, predicate_tokens} -> unsupported_predicate_field_byte(predicate_tokens)
+      :error -> nil
+    end
+  end
+
+  defp unsupported_predicate_field_byte([]), do: nil
+
+  defp unsupported_predicate_field_byte([{_token, field_byte} | _rest] = tokens) do
+    raw_tokens = Enum.map(tokens, &elem(&1, 0))
+
+    case parse_predicate(raw_tokens) do
+      {:error, :unsupported_field} ->
+        field_byte
+
+      {:ok, _predicate, remaining_raw_tokens} ->
+        consumed = length(raw_tokens) - length(remaining_raw_tokens)
+
+        case Enum.drop(tokens, consumed) do
+          [{{:word, and_keyword}, _byte} | rest] ->
+            if keyword?(and_keyword, "AND"),
+              do: unsupported_predicate_field_byte(rest),
+              else: nil
+
+          _tail ->
+            nil
+        end
+
+      {:error, _reason} ->
+        nil
+    end
+  end
+
+  defp tokens_after_keyword([{{:word, word}, _byte} | rest], keyword) do
+    if keyword?(word, keyword), do: {:ok, rest}, else: tokens_after_keyword(rest, keyword)
+  end
+
+  defp tokens_after_keyword([_token | rest], keyword), do: tokens_after_keyword(rest, keyword)
+  defp tokens_after_keyword([], _keyword), do: :error
+
+  defp missing_where_byte(tokens) do
+    case query_tokens(tokens) do
+      [
+        {{:word, from}, _from_byte},
+        {{:word, _source}, _source_byte},
+        {{:word, where}, _where_byte} | _rest
+      ] ->
+        if keyword?(from, "FROM") and not keyword?(where, "WHERE"),
+          do: token_byte(query_tokens(tokens), 2),
+          else: nil
+
+      _tokens ->
+        nil
+    end
+  end
+
+  defp malformed_in_byte([
+         {{:word, in_keyword}, _in_byte},
+         {:left_paren, _left_byte},
+         {:right_paren, right_byte}
+         | _rest
+       ]) do
+    if keyword?(in_keyword, "IN"), do: right_byte, else: nil
+  end
+
+  defp malformed_in_byte([{:comma, _comma_byte}, {:right_paren, right_byte} | _rest]),
+    do: right_byte
+
+  defp malformed_in_byte([_token | rest]), do: malformed_in_byte(rest)
+  defp malformed_in_byte([]), do: nil
+
+  defp extra_terminator_byte([
+         {:semicolon, _terminator_byte},
+         {_extra_token, extra_byte} | _rest
+       ]),
+       do: extra_byte
+
+  defp extra_terminator_byte([_token | rest]), do: extra_terminator_byte(rest)
+  defp extra_terminator_byte([]), do: nil
+
+  defp oversized_limit_byte([
+         {{:word, limit_keyword}, _limit_byte},
+         {{:integer, limit}, value_byte}
+         | _rest
+       ]) do
+    if keyword?(limit_keyword, "LIMIT") and limit > Limits.max_results(),
+      do: value_byte,
+      else: nil
+  end
+
+  defp oversized_limit_byte([_token | rest]), do: oversized_limit_byte(rest)
+  defp oversized_limit_byte([]), do: nil
+
+  defp unexpected_predicate_tail_byte(tokens) do
+    case tokens_after_keyword(tokens, "WHERE") do
+      {:ok, predicate_tokens} -> do_unexpected_predicate_tail_byte(predicate_tokens)
+      :error -> nil
+    end
+  end
+
+  defp do_unexpected_predicate_tail_byte([]), do: nil
+
+  defp do_unexpected_predicate_tail_byte(tokens) do
+    raw_tokens = Enum.map(tokens, &elem(&1, 0))
+
+    case parse_predicate(raw_tokens) do
+      {:ok, _predicate, remaining_raw_tokens} ->
+        consumed = length(raw_tokens) - length(remaining_raw_tokens)
+
+        case Enum.drop(tokens, consumed) do
+          [{{:word, and_keyword}, _byte} = token | rest] ->
+            if keyword?(and_keyword, "AND") do
+              do_unexpected_predicate_tail_byte(rest)
+            else
+              unexpected_tail_start_byte([token | rest])
+            end
+
+          remaining ->
+            unexpected_tail_start_byte(remaining)
+        end
+
+      {:error, _reason} ->
+        nil
+    end
+  end
+
+  defp unexpected_tail_start_byte([{{:word, word}, word_byte}, {_next_token, next_byte} | _rest]) do
+    cond do
+      keyword?(word, "RETURN") -> next_byte
+      keyword?(word, "ORDER") -> nil
+      true -> word_byte
+    end
+  end
+
+  defp unexpected_tail_start_byte([{{:word, word}, byte} | _rest]) do
+    if keyword?(word, "ORDER"), do: nil, else: byte
+  end
+
+  defp unexpected_tail_start_byte([{_token, byte} | _rest]), do: byte
+  defp unexpected_tail_start_byte([]), do: nil
+
+  defp query_tokens([{{:word, explain}, _byte}, {{:word, second}, _second_byte} | rest] = tokens) do
+    cond do
+      keyword?(explain, "EXPLAIN") and keyword?(second, "ANALYZE") -> rest
+      keyword?(explain, "EXPLAIN") -> tl(tokens)
+      true -> tokens
+    end
+  end
+
+  defp query_tokens([{{:word, explain}, _byte} | rest] = tokens) do
+    if keyword?(explain, "EXPLAIN"), do: rest, else: tokens
+  end
+
+  defp query_tokens(tokens), do: tokens
+
+  defp keyword_token_byte(tokens, keyword) do
+    Enum.find_value(tokens, fn
+      {{:word, word}, byte} -> if keyword?(word, keyword), do: byte
+      _token -> nil
+    end)
+  end
+
+  defp token_byte(tokens, index) do
+    case Enum.at(tokens, index) do
+      {_token, byte} -> byte
+      nil -> nil
+    end
+  end
+
+  defp query_end_byte(query), do: byte_size(query) + 1
+
+  defp diagnostic_tokens(query), do: diagnostic_tokens(query, 1, [])
+
+  defp diagnostic_tokens(<<>>, _byte, tokens),
+    do: {:ok, Enum.reverse(tokens)}
+
+  defp diagnostic_tokens(<<char, rest::binary>>, byte, tokens)
+       when char in [9, 10, 13, 32],
+       do: diagnostic_tokens(rest, byte + 1, tokens)
+
+  defp diagnostic_tokens(<<char, rest::binary>>, byte, tokens)
+       when char in [?=, ?(, ?), ?[, ?], ?,, ?;] do
+    diagnostic_tokens(rest, byte + 1, [{diagnostic_punctuation(char), byte} | tokens])
+  end
+
+  defp diagnostic_tokens(<<?', rest::binary>>, byte, tokens) do
+    case diagnostic_string(rest, byte + 1) do
+      {:ok, value, rest, next_byte} ->
+        diagnostic_tokens(rest, next_byte, [{{:string, value}, byte} | tokens])
+
+      :error ->
+        {:error, byte}
+    end
+  end
+
+  defp diagnostic_tokens(<<?@, rest::binary>>, byte, tokens) do
+    case take_identifier(rest) do
+      {"", _rest} ->
+        {:error, byte}
+
+      {name, remaining} ->
+        consumed = byte_size(rest) - byte_size(remaining)
+
+        diagnostic_tokens(
+          remaining,
+          byte + consumed + 1,
+          [{{:parameter, name}, byte} | tokens]
+        )
+    end
+  end
+
+  defp diagnostic_tokens(<<char, rest::binary>> = query, byte, tokens)
+       when char in ?0..?9 or (char == ?- and rest != <<>>) do
+    {number, remaining} = take_number(query, query, 0)
+
+    case parse_i64(number) do
+      result when result in [:error, :overflow] ->
+        {:error, byte}
+
+      {:ok, value} ->
+        diagnostic_tokens(
+          remaining,
+          byte + byte_size(number),
+          [{{:integer, value}, byte} | tokens]
+        )
+    end
+  end
+
+  defp diagnostic_tokens(<<char, _rest::binary>> = query, byte, tokens)
+       when char in ?A..?Z or char in ?a..?z or char == ?_ do
+    {word, remaining} = take_identifier(query)
+
+    diagnostic_tokens(
+      remaining,
+      byte + byte_size(word),
+      [{{:word, word}, byte} | tokens]
+    )
+  end
+
+  defp diagnostic_tokens(_query, byte, _tokens), do: {:error, byte}
+
+  defp diagnostic_punctuation(?=), do: :equals
+  defp diagnostic_punctuation(?(), do: :left_paren
+  defp diagnostic_punctuation(?)), do: :right_paren
+  defp diagnostic_punctuation(?[), do: :left_bracket
+  defp diagnostic_punctuation(?]), do: :right_bracket
+  defp diagnostic_punctuation(?,), do: :comma
+  defp diagnostic_punctuation(?;), do: :semicolon
+
+  defp diagnostic_string(query, byte), do: diagnostic_string(query, byte, [])
+
+  defp diagnostic_string(<<?', ?', rest::binary>>, byte, bytes),
+    do: diagnostic_string(rest, byte + 2, [?' | bytes])
+
+  defp diagnostic_string(<<?', rest::binary>>, byte, bytes),
+    do: {:ok, bytes |> Enum.reverse() |> :erlang.list_to_binary(), rest, byte + 1}
+
+  defp diagnostic_string(<<char, rest::binary>>, byte, bytes),
+    do: diagnostic_string(rest, byte + 1, [char | bytes])
+
+  defp diagnostic_string(<<>>, _byte, _bytes), do: :error
 
   defp tokenize(query), do: tokenize(query, [], 0)
 

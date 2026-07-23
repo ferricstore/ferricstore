@@ -53,12 +53,22 @@ defmodule Ferricstore.Flow.CommandScope do
     metadata = Map.get(record, :system_metadata, %{})
 
     with :ok <- validate_metadata(context, metadata),
-         {:ok, _logical_partition_key} <- StorageScope.logical_partition_key(record) do
+         :ok <- validate_partition_scope(record, metadata) do
       :ok
     else
       _invalid -> @error
     end
   end
+
+  defp validate_partition_scope(%{id: id} = record, _metadata)
+       when is_binary(id) and id != "" do
+    case record |> Map.put_new(:partition_key, nil) |> StorageScope.logical_partition_key() do
+      {:ok, _logical_partition_key} -> :ok
+      {:error, _reason} -> @error
+    end
+  end
+
+  defp validate_partition_scope(_record, _metadata), do: @error
 
   defp validate_metadata(%ApplyContext{} = context, metadata) do
     with :ok <- SystemMetadata.validate_against(metadata, context.flow_metadata_fields),

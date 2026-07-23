@@ -510,6 +510,7 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
           GenServer.stop(pid, :normal, 5_000)
         end
 
+        assert :ok = Ferricstore.Flow.LMDB.release(lmdb_path, 5_000)
         File.rm_rf!(lmdb_path)
 
         assert :ok =

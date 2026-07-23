@@ -10,6 +10,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
       require Logger
 
+      alias FerricStore.Flow.QueryIndexProvider
       alias Ferricstore.Bitcask.NIF
       alias Ferricstore.CommandTime
       alias Ferricstore.Commands.Dispatcher
@@ -1092,9 +1093,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
            )
            when is_map(record) do
         with_lmdb_mirror_shard(state, fn ->
+          projection_required? = flow_record_requires_lmdb_projection?(state, record)
+
           cond do
-            flow_record_has_indexed_attributes?(record) and is_binary(value) and
-                is_integer(expire_at_ms) ->
+            projection_required? and is_binary(value) and is_integer(expire_at_ms) ->
               queue_pending_lmdb_flow_state_projection(state_key, value, expire_at_ms)
               maybe_queue_lmdb_terminal_state_prune_after_flush(state, state_key, record)
 
@@ -1107,7 +1109,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
                   queue_pending_lmdb_projection_outbox(state_key, Map.fetch!(record, :version))
               end
 
-            flow_record_has_indexed_attributes?(record) ->
+            projection_required? ->
               queue_pending_lmdb_flow_state_projection_from_source(state_key)
 
             true ->
@@ -1123,6 +1125,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       end
 
       defp flow_record_has_indexed_attributes?(_record), do: false
+
+      defp flow_record_requires_lmdb_projection?(state, record) when is_map(record) do
+        QueryIndexProvider.enabled?(Map.get(state, :instance_ctx, %{})) or
+          flow_record_has_indexed_attributes?(record)
+      end
+
+      defp flow_record_requires_lmdb_projection?(_state, _record), do: false
 
       defp maybe_queue_lmdb_terminal_state_prune_after_flush(state, state_key, record)
            when is_binary(state_key) and is_map(record) do

@@ -87,6 +87,13 @@ defmodule Ferricstore.Flow.CommandScopeTest do
   } do
     state = %{apply_context: ApplyContext.default()}
     assert :ok = CommandScope.validate(state, %{id: "run", partition_key: "partition"})
+    assert :ok = CommandScope.validate(state, %{id: "auto-run"})
+    assert :ok = CommandScope.validate(state, %{records: [%{id: "auto-run"}]})
+
+    for invalid <- [%{}, %{id: 1}, %{id: ""}] do
+      assert {:error, "ERR invalid replicated Flow scope"} =
+               CommandScope.validate(state, %{records: [invalid]})
+    end
 
     assert {:error, "ERR invalid replicated Flow scope"} =
              CommandScope.validate(state, attrs)

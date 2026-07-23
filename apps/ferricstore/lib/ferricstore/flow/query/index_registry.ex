@@ -12,6 +12,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
     RegistrySnapshot
   }
 
+  alias Ferricstore.FS
   alias Ferricstore.TermCodec
   alias FerricStore.Flow.MetadataExtension
 
@@ -1862,9 +1863,9 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
     encoded = encode_snapshot(state)
 
     with true <- byte_size(encoded) <= @max_snapshot_bytes,
-         :ok <- File.mkdir_p(directory),
+         :ok <- FS.mkdir_p(directory),
          :ok <- write_synced(tmp_path, encoded),
-         :ok <- File.rename(tmp_path, path),
+         :ok <- FS.rename(tmp_path, path),
          :ok <- fsync_dir(directory) do
       _ = reset_journal(state)
       :ok
@@ -1873,7 +1874,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
         {:error, :query_index_registry_snapshot_too_large}
 
       {:error, _reason} = error ->
-        File.rm(tmp_path)
+        FS.rm(tmp_path)
         error
     end
   end

@@ -499,13 +499,13 @@ defmodule Ferricstore.FlowTest.Sections.FlowInternalKeysUseCompactPartitionTags 
                  ])
       end
 
-      test "pipeline_read_batch accepts Flow terminal query AST reads directly" do
+      test "pipeline_read_batch rejects removed Flow terminal query ASTs" do
         ctx = FerricStore.Instance.get(:default)
         type = uid("pipeline-read-terminal-rust-ast")
 
         assert [
-                 {:ok, []},
-                 {:ok, []}
+                 {:error, "ERR unsupported flow pipeline read command"},
+                 {:error, "ERR unsupported flow pipeline read command"}
                ] =
                  Ferricstore.Flow.pipeline_read_batch(ctx, [
                    {:flow_terminals, type, [count: 10]},

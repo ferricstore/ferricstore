@@ -554,6 +554,7 @@ defmodule Ferricstore.FlowTest do
       FerricStore.Instance.build(name,
         data_dir: data_dir,
         shard_count: 1,
+        query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled,
         max_memory_bytes: 256 * 1024 * 1024,
         keydir_max_ram: 64 * 1024 * 1024
       )

@@ -132,7 +132,7 @@ defmodule Ferricstore.Flow.Query.CursorKeyStore do
       {:ok, published_key, source}
     else
       {:error, _reason} ->
-        File.rm(tmp_path)
+        FS.rm(tmp_path)
         {:error, :query_cursor_key_unavailable}
     end
   end
@@ -140,13 +140,13 @@ defmodule Ferricstore.Flow.Query.CursorKeyStore do
   defp publish_key(tmp_path, path, directory, key) do
     case File.ln(tmp_path, path) do
       :ok ->
-        with :ok <- File.rm(tmp_path),
+        with :ok <- FS.rm(tmp_path),
              :ok <- fsync_dir(directory) do
           {:ok, key, :generated}
         end
 
       {:error, :eexist} ->
-        with :ok <- File.rm(tmp_path),
+        with :ok <- FS.rm(tmp_path),
              :ok <- fsync_dir(directory) do
           load_existing_file(path)
         end
@@ -157,11 +157,10 @@ defmodule Ferricstore.Flow.Query.CursorKeyStore do
   end
 
   defp ensure_directory(directory) do
-    existed? = File.dir?(directory)
+    existed? = FS.dir?(directory)
 
-    with :ok <- File.mkdir_p(directory),
-         :ok <- maybe_fsync_parent(directory, existed?) do
-      :ok
+    with :ok <- FS.mkdir_p(directory) do
+      maybe_fsync_parent(directory, existed?)
     end
   end
 

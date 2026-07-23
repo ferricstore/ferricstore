@@ -21,6 +21,49 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
       defp flow_query_wire_value(true), do: "true"
       defp flow_query_wire_value(false), do: "false"
 
+      defp await_flow_query(kind, filters, expected_ids) do
+        ctx = FerricStore.Instance.get(:default)
+        store = MockStore.make()
+
+        await_flow_query(
+          ctx,
+          store,
+          flow_query_wire_args(kind, filters),
+          Enum.sort(expected_ids),
+          100
+        )
+      end
+
+      defp await_flow_query(_ctx, store, [version, query | params], expected_ids, 0) do
+        explain =
+          Dispatcher.dispatch("FLOW.QUERY", [version, "EXPLAIN " <> query | params], store)
+
+        raise ExUnit.AssertionError,
+          message:
+            "Flow query projection did not expose #{inspect(expected_ids)}; plan: #{inspect(Map.take(explain, ["plan", "status", "quality"]))}"
+      end
+
+      defp await_flow_query(ctx, store, args, expected_ids, attempts) do
+        :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+        result = Dispatcher.dispatch("FLOW.QUERY", args, store)
+
+        case result do
+          %{"records" => records} when is_list(records) ->
+            ids = records |> Enum.map(& &1["id"]) |> Enum.sort()
+
+            if ids == expected_ids do
+              result
+            else
+              Process.sleep(10)
+              await_flow_query(ctx, store, args, expected_ids, attempts - 1)
+            end
+
+          _other ->
+            Process.sleep(10)
+            await_flow_query(ctx, store, args, expected_ids, attempts - 1)
+        end
+      end
+
       test "dispatches Flow value put and payload refs through Rust AST" do
         assert %{"ref" => shared_ref} =
                  Dispatcher.dispatch(
@@ -253,35 +296,43 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
                    MockStore.make()
                  )
 
-        assert %{"id" => ^id, "state" => "failed"} =
+        assert %{"id" => ^id, "state" => "failed", "updated_at_ms" => failed_at_ms} =
                  Dispatcher.dispatch("FLOW.GET", [id, "PARTITION", partition], MockStore.make())
 
-        assert [%{"id" => ^id, "state" => "failed"}] =
-                 Dispatcher.dispatch(
-                   "FLOW.QUERY",
-                   flow_query_wire_args(:failures, %{
+        assert %{
+                 "version" => "ferric.flow.query.result/v1",
+                 "page" => %{"cursor" => nil, "has_more" => false},
+                 "records" => [%{"id" => ^id, "state" => "failed"}]
+               } =
+                 await_flow_query(
+                   :failures,
+                   %{
                      type: type,
                      partition_key: partition,
-                     from_ms: 1_000,
-                     to_ms: 2_000,
+                     from_ms: max(failed_at_ms - 1, 0),
+                     to_ms: failed_at_ms + 1,
                      limit: 10
-                   }),
-                   MockStore.make()
+                   },
+                   [id]
                  )
 
-        assert [%{"id" => ^id, "state" => "failed"}] =
-                 Dispatcher.dispatch(
-                   "FLOW.QUERY",
-                   flow_query_wire_args(:terminals, %{
+        assert %{
+                 "version" => "ferric.flow.query.result/v1",
+                 "page" => %{"cursor" => nil, "has_more" => false},
+                 "records" => [%{"id" => ^id, "state" => "failed"}]
+               } =
+                 await_flow_query(
+                   :terminals,
+                   %{
                      type: type,
                      state: "any",
                      partition_key: partition,
-                     from_ms: 1_000,
-                     to_ms: 2_000,
+                     from_ms: max(failed_at_ms - 1, 0),
+                     to_ms: failed_at_ms + 1,
                      rev: true,
                      limit: 10
-                   }),
-                   MockStore.make()
+                   },
+                   [id]
                  )
       end
 
@@ -458,17 +509,23 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
         assert child_groups["fanout"]["children"][child_a] == "running"
         assert child_groups["fanout"]["children"][child_b] == "running"
 
-        assert [%{"id" => ^child_a}, %{"id" => ^child_b}] =
-                 Dispatcher.dispatch(
-                   "FLOW.QUERY",
-                   flow_query_wire_args(:by_parent, %{
+        assert %{
+                 "version" => "ferric.flow.query.result/v1",
+                 "page" => %{"cursor" => nil, "has_more" => false},
+                 "records" => children
+               } =
+                 await_flow_query(
+                   :by_parent,
+                   %{
                      id: parent,
                      partition_key: partition,
                      limit: 10
-                   }),
-                   MockStore.make()
+                   },
+                   [child_a, child_b]
                  )
-                 |> Enum.sort_by(& &1["id"])
+
+        assert [%{"id" => ^child_a}, %{"id" => ^child_b}] =
+                 Enum.sort_by(children, & &1["id"])
 
         assert %{"payload" => "payload-a"} =
                  Dispatcher.dispatch(
@@ -696,41 +753,60 @@ defmodule Ferricstore.Commands.FlowTest.Sections.DispatchesFlowValuePutPayloadRe
                    MockStore.make()
                  )
 
-        assert [%{"id" => ^child}] =
+        assert %{"id" => ^child, "updated_at_ms" => child_updated_at_ms} =
                  Dispatcher.dispatch(
-                   "FLOW.QUERY",
-                   flow_query_wire_args(:by_parent, %{
+                   "FLOW.GET",
+                   [child, "PARTITION", partition],
+                   MockStore.make()
+                 )
+
+        assert %{
+                 "version" => "ferric.flow.query.result/v1",
+                 "page" => %{"cursor" => nil, "has_more" => false},
+                 "records" => [%{"id" => ^child}]
+               } =
+                 await_flow_query(
+                   :by_parent,
+                   %{
                      id: root,
                      partition_key: partition,
                      limit: 10,
-                     from_ms: 1_500,
-                     to_ms: 2_500,
+                     from_ms: max(child_updated_at_ms - 1, 0),
+                     to_ms: child_updated_at_ms + 1,
                      rev: true,
                      state: "queued"
-                   }),
-                   MockStore.make()
+                   },
+                   [child]
                  )
 
-        assert [%{"id" => ^root}, %{"id" => ^child}] =
-                 Dispatcher.dispatch(
-                   "FLOW.QUERY",
-                   flow_query_wire_args(:by_root, %{
+        assert %{
+                 "version" => "ferric.flow.query.result/v1",
+                 "page" => %{"cursor" => nil, "has_more" => false},
+                 "records" => [%{"id" => ^root}, %{"id" => ^child}]
+               } =
+                 await_flow_query(
+                   :by_root,
+                   %{
                      id: root,
                      partition_key: partition,
                      limit: 10
-                   }),
-                   MockStore.make()
+                   },
+                   [root, child]
                  )
 
-        assert [%{"id" => ^root}, %{"id" => ^child}] =
-                 Dispatcher.dispatch(
-                   "FLOW.QUERY",
-                   flow_query_wire_args(:by_correlation, %{
+        assert %{
+                 "version" => "ferric.flow.query.result/v1",
+                 "page" => %{"cursor" => nil, "has_more" => false},
+                 "records" => [%{"id" => ^root}, %{"id" => ^child}]
+               } =
+                 await_flow_query(
+                   :by_correlation,
+                   %{
                      id: correlation,
                      partition_key: partition,
                      limit: 10
-                   }),
-                   MockStore.make()
+                   },
+                   [root, child]
                  )
 
         assert %{"queued" => 2} =

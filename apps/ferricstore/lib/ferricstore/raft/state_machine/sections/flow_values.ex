@@ -573,7 +573,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowValues do
       defp flow_put_state_record_encoded(state, key, value, expire_at_ms, record) do
         result =
           cond do
-            flow_record_has_indexed_attributes?(record) ->
+            flow_record_requires_lmdb_projection?(state, record) ->
               with :ok <- flow_put_hot(state, key, value, expire_at_ms) do
                 maybe_queue_lmdb_indexes_for_state_record(state, key, value, expire_at_ms, record)
                 maybe_queue_flow_hibernation_candidate(state, key, record, value)

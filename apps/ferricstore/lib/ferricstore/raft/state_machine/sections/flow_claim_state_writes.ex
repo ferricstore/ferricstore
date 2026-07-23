@@ -144,7 +144,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
                     maybe_queue_lmdb_policy_put(state_key, disk_val, 0)
 
-                    if flow_record_has_indexed_attributes?(next) do
+                    if flow_record_requires_lmdb_projection?(state, next) do
                       maybe_queue_lmdb_indexes_for_state_record(
                         state,
                         state_key,
@@ -220,7 +220,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
 
                     maybe_queue_lmdb_policy_put(state_key, disk_val, 0)
 
-                    if flow_record_has_indexed_attributes?(next) do
+                    if flow_record_requires_lmdb_projection?(state, next) do
                       maybe_queue_lmdb_indexes_for_state_record(
                         state,
                         state_key,
@@ -668,7 +668,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
         disk_val = to_disk_binary(stored_value)
         blob_ref? = stored_value != encoded_record
 
-        if flow_record_has_indexed_attributes?(record) do
+        if flow_record_requires_lmdb_projection?(state, record) do
           maybe_queue_lmdb_indexes_for_state_record(
             state,
             key,
@@ -730,7 +730,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimStateWrites do
         blob_ref? = stored_value != encoded_record
         lfu = LFU.initial()
 
-        if flow_record_has_indexed_attributes?(record) do
+        if flow_record_requires_lmdb_projection?(state, record) do
           maybe_queue_lmdb_indexes_for_state_record(
             state,
             key,

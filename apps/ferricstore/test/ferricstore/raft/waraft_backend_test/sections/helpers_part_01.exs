@@ -51,6 +51,7 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.HelpersPart01 do
         [
           data_dir: root,
           shard_count: Keyword.get(opts, :shard_count, 1),
+          query_index_provider: FerricStore.Flow.QueryIndexProvider.Disabled,
           max_memory_bytes: 256 * 1024 * 1024,
           keydir_max_ram: 64 * 1024 * 1024,
           hot_cache_max_value_size: 65_536,

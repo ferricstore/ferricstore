@@ -112,7 +112,7 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
       |> Code.string_to_quoted!()
 
     for {name, arity} <- [
-          {:do_batch_get, 4},
+          {:do_batch_get, 5},
           {:do_batch_get_with_file_refs, 5},
           {:compound_batch_get, 3}
         ] do
@@ -131,6 +131,11 @@ defmodule Ferricstore.Store.RouterStatsSamplingTest do
 
     assert contains_call?(bounded_body, :do_batch_get, 4),
            "do_batch_get/3 must delegate to the shared batched-read implementation"
+
+    routed_body = find_function_body!(ast, :do_batch_get, 4)
+
+    assert contains_call?(routed_body, :do_batch_get, 5),
+           "do_batch_get/4 must delegate to the shared batched-read implementation"
 
     file_ref_wrapper = find_function_body!(ast, :do_batch_get_with_file_refs, 4)
 

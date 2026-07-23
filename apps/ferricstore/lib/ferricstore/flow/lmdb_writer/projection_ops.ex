@@ -27,6 +27,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def expand_ops(state, ops) do
     with {:ok, definitions} <- query_index_definitions(state) do
       expansion_state = Map.put(state, :query_index_definitions, definitions)
+      ops = coalesce_flow_state_projections(ops)
 
       initial = %{
         ops: [],
@@ -73,6 +74,37 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       end
     end
   end
+
+  defp coalesce_flow_state_projections(ops) do
+    {coalesced, _seen} =
+      ops
+      |> Enum.reverse()
+      |> Enum.reduce({[], MapSet.new()}, fn op, {acc, seen} ->
+        case flow_state_projection_key(op) do
+          {:ok, state_key} ->
+            if MapSet.member?(seen, state_key) do
+              {acc, seen}
+            else
+              {[op | acc], MapSet.put(seen, state_key)}
+            end
+
+          :error ->
+            {[op | acc], seen}
+        end
+      end)
+
+    coalesced
+  end
+
+  defp flow_state_projection_key({:project_flow_state, state_key, _value, _expire_at_ms})
+       when is_binary(state_key),
+       do: {:ok, state_key}
+
+  defp flow_state_projection_key({:project_flow_state_from_source, state_key})
+       when is_binary(state_key),
+       do: {:ok, state_key}
+
+  defp flow_state_projection_key(_op), do: :error
 
   def expand_op(state, {:project_kv_from_source, key}, acc) when is_binary(key) do
     case read_source_value(state, key) do

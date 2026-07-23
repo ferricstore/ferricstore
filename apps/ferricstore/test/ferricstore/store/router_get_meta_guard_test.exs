@@ -28,12 +28,16 @@ defmodule Ferricstore.Store.RouterGetMetaGuardTest do
       Ferricstore.Test.SourceFiles.router_source()
       |> Code.string_to_quoted()
 
-    bodies = function_bodies(ast, :read_cold_batch_async, 2)
+    wrapper_bodies = function_bodies(ast, :read_cold_batch_async, 2)
+    implementation_bodies = function_bodies(ast, :read_cold_batch_async, 3)
 
     # Duplicate keys in MGET-style reads should collapse to one physical
     # pread, but the dedupe map walk itself must not run twice on the hot
     # cold-batch path.
-    assert count_local_calls(bodies, :dedupe_cold_batch_entries, 1) == 1,
+    assert count_local_calls(wrapper_bodies, :read_cold_batch_async, 3) == 1,
+           "expected Router cold batch wrapper to delegate to the shared implementation"
+
+    assert count_local_calls(implementation_bodies, :dedupe_cold_batch_entries, 1) == 1,
            "expected Router cold batch reads to dedupe once, not repeat the O(N) pass"
   end
 

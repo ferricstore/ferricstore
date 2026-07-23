@@ -210,7 +210,12 @@ defmodule FerricstoreServer.Native.FQLParserTest do
       {empty_in, ")"},
       {trailing_in, ")"},
       {extra_terminator, ";", 2},
-      {unterminated, "'"}
+      {unterminated, "'"},
+      {"FROM runs WHERE partition_key = 'p' OR run_id = 'two' RETURN RECORD", "OR"},
+      {"FROM events WHERE partition_key = 'p' AND run_id = 'run-123' RETURN RECORD", "RECORD"},
+      {"FROM events WHERE partition_key = 'p' RETURN COUNT", "COUNT"},
+      {"FROM runs WHERE partition_key = 'p' ORDER BY updated_at_ms ASC LIMIT 101 RETURN RECORDS",
+       "101"}
     ]
 
     for entry <- cases do
@@ -229,6 +234,7 @@ defmodule FerricstoreServer.Native.FQLParserTest do
               }} = FQLParser.parse_diagnostic(query)
 
       assert byte == marker_byte(query, marker, occurrence)
+      assert ReferenceParser.parse_diagnostic(query) == FQLParser.parse_diagnostic(query)
     end
   end
 

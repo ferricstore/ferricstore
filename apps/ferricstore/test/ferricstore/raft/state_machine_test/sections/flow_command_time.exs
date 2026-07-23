@@ -2136,7 +2136,7 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.FlowCommandTime do
               state
             )
 
-          assert_receive {:flow_lmdb_backlog, %{pending_ops: 3}, %{shard_index: ^shard_index}},
+          assert_receive {:flow_lmdb_backlog, %{pending_ops: 4}, %{shard_index: ^shard_index}},
                          500
 
           assert :ok = Ferricstore.Flow.LMDBWriter.flush(state.instance_name, shard_index)

@@ -78,6 +78,7 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
     fs_is_dir
     fs_ls
     fs_read_nofollow
+    fs_read_private_nofollow
     fs_copy_sync_nofollow
     fs_copy_replace_sync_nofollow
     fs_hard_link_replace_sync_nofollow
@@ -189,11 +190,17 @@ defmodule Ferricstore.BitcaskNifSchedulerGuardTest do
 
   test "bounded nofollow reads use dirty I/O and avoid an intermediate Vec" do
     source = File.read!(Path.join(@native_src, "fs_nif.rs"))
-    body = function_body(source, "fs_read_nofollow")
+    reader_body = function_body(source, "read_opened_file")
 
-    assert_nif_schedule(source, "fs_read_nofollow", "DirtyIo")
-    assert body =~ "OwnedBinary::new"
-    refute body =~ "read_to_end"
+    for function <- ["fs_read_nofollow", "fs_read_private_nofollow"] do
+      body = function_body(source, function)
+
+      assert_nif_schedule(source, function, "DirtyIo")
+      assert body =~ "read_opened_file"
+    end
+
+    assert reader_body =~ "OwnedBinary::new"
+    refute reader_body =~ "read_to_end"
   end
 
   test "unbounded async batch copies use dirty CPU schedulers" do
