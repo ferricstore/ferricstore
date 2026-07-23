@@ -321,15 +321,16 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
 
         partition_key = "tenant-ttl-sweep"
         flow_type = "ttl-sweep"
+        now_ms = System.os_time(:millisecond) + :timer.hours(1)
 
         assert :ok =
                  Ferricstore.Store.Router.flow_create(ctx, %{
                    id: "flow-ttl-sweep",
                    type: flow_type,
                    state: "queued",
-                   run_at_ms: 1,
+                   run_at_ms: now_ms + 1,
                    partition_key: partition_key,
-                   now_ms: 1
+                   now_ms: now_ms
                  })
 
         assert {:ok, [claimed]} =
@@ -340,7 +341,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
                    worker: "worker-ttl-sweep",
                    lease_ms: 30_000,
                    limit: 1,
-                   now_ms: 2,
+                   now_ms: now_ms + 2,
                    partition_key: partition_key
                  })
 
@@ -350,12 +351,12 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
                    lease_token: claimed.lease_token,
                    fencing_token: claimed.fencing_token,
                    ttl_ms: 20,
-                   now_ms: 3,
+                   now_ms: now_ms + 3,
                    partition_key: partition_key
                  })
 
         assert {:ok, completed} =
-                 Ferricstore.CommandTime.with_now_ms(0, fn ->
+                 Ferricstore.CommandTime.with_now_ms(now_ms + 3, fn ->
                    Ferricstore.Flow.get(ctx, claimed.id, partition_key: partition_key)
                  end)
 
@@ -402,7 +403,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
         assert {:ok, [^state_key]} =
                  Ferricstore.Flow.LMDB.expired_terminal_state_keys(
                    lmdb_path,
-                   System.os_time(:millisecond),
+                   completed.terminal_retention_until_ms,
                    100
                  )
       end
