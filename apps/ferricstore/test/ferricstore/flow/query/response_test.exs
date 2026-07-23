@@ -90,8 +90,16 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
     end
   end
 
-  test "fails closed instead of raising for an unencodable nested record value" do
-    records = [%{id: "run-1", attributes: %{"oversized" => 0x8000_0000_0000_0000}}]
+  test "encodes nested unsigned 64-bit record values" do
+    maximum = 0xFFFF_FFFF_FFFF_FFFF
+    records = [%{id: "run-1", attributes: %{"version" => maximum}}]
+
+    assert {:ok, %{records: [%{attributes: %{"version" => ^maximum}}]}} =
+             Response.build(records, false, nil, quality(), usage(1), Budget.default())
+  end
+
+  test "fails closed instead of raising for a nested integer above unsigned 64-bit" do
+    records = [%{id: "run-1", attributes: %{"oversized" => 0x1_0000_0000_0000_0000}}]
 
     assert {:error, :query_engine_failure} =
              Response.build(records, false, nil, quality(), usage(1), Budget.default())
