@@ -1,7 +1,22 @@
 defmodule FerricstoreServer.Acl.RulesTest do
   use ExUnit.Case, async: true
 
-  alias FerricstoreServer.Acl.Rules
+  alias FerricstoreServer.Acl.{CommandCategories, Rules}
+
+  test "native client connection controls are individually grantable" do
+    commands = ~w(
+      ROUTE ROUTE_BATCH SHARDS BACKPRESSURE WINDOW_UPDATE
+      SUBSCRIBE_EVENTS UNSUBSCRIBE_EVENTS
+    )
+
+    rules = ["-@all" | Enum.map(commands, &("+" <> &1))]
+
+    assert {:ok, user} = Rules.apply_rules(base_user(), rules)
+    assert user.commands == MapSet.new(commands)
+
+    assert {:ok, connection_commands} = CommandCategories.category_commands("CONNECTION")
+    assert MapSet.subset?(MapSet.new(commands), connection_commands)
+  end
 
   test "incremental SETUSER updates cannot grow retained patterns past the state limit" do
     regex = ~r/^tenant:/

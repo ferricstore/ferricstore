@@ -1021,6 +1021,40 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert range.hint in ["leader", "remote_leader", "local"]
   end
 
+  test "least-privilege native clients can bootstrap topology and event subscriptions" do
+    username = "native-bootstrap"
+
+    assert :ok =
+             Acl.set_user(username, [
+               "on",
+               "nopass",
+               "-@all",
+               "+SHARDS",
+               "+SUBSCRIBE_EVENTS",
+               "~tenant:*"
+             ])
+
+    on_exit(fn -> Acl.del_user(username) end)
+    restricted = state_as(username)
+
+    assert {:ok, %{slots: 1_024}, restricted} =
+             Commands.execute(@op_shards, %{}, restricted)
+
+    assert {:ok, %{subscribed: ["TOPOLOGY_CHANGED"]}, subscribed} =
+             Commands.execute(
+               @op_subscribe_events,
+               %{"events" => ["TOPOLOGY_CHANGED"]},
+               restricted
+             )
+
+    assert MapSet.member?(subscribed.event_subscriptions, "TOPOLOGY_CHANGED")
+
+    assert {:noperm, denied, _restricted} =
+             Commands.execute(@op_route, %{"key" => "tenant:key"}, restricted)
+
+    assert denied =~ "route"
+  end
+
   test "COMMAND_EXEC delegates through native AST parser" do
     {status, payload, _state} =
       Commands.execute(@op_command_exec, %{"command" => "PING", "args" => []}, state())

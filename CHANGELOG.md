@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.10.2 - 2026-07-23
+
+- Made the native topology and event-subscription control commands individually grantable through ACLs and the connection category, enabling least-privilege topology-aware SDK sessions without broad command permissions.
+
 ## 0.10.1 - 2026-07-23
 
 - Fixed the standalone container build to package the OSS query-index catalog required during startup.

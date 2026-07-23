@@ -61,7 +61,7 @@ A long workflow does not need to live in one codebase or one workflow runtime. O
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ghcr.io/ferricstore/ferricstore:0.10.1
+  ghcr.io/ferricstore/ferricstore:0.10.2
 ```
 
 `FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
@@ -69,7 +69,7 @@ docker run -p 6388:6388 \
 The published container image is hosted on GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/ferricstore/ferricstore:0.10.1
+docker pull ghcr.io/ferricstore/ferricstore:0.10.2
 ```
 
 Current release images are published as multi-arch images for `linux/amd64`
@@ -269,7 +269,7 @@ FerricStore can also run inside an Elixir application.
 
 ```elixir
 # mix.exs
-{:ferricstore, "~> 0.10.1"}
+{:ferricstore, "~> 0.10.2"}
 ```
 
 ```elixir

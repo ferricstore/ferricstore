@@ -107,6 +107,10 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   )
 
   @client_admin_commands ~w(CLIENT CLIENT.LIST CLIENT.KILL)
+  @native_connection_commands ~w(
+    ROUTE ROUTE_BATCH SHARDS BACKPRESSURE WINDOW_UPDATE
+    SUBSCRIBE_EVENTS UNSUBSCRIBE_EVENTS
+  )
   @acl_subcommands ~w(
     ACL.CAT ACL.DELUSER ACL.GETUSER ACL.LIST ACL.LOAD ACL.LOG ACL.SAVE ACL.SETUSER
     ACL.WHOAMI
@@ -127,7 +131,8 @@ defmodule FerricstoreServer.Acl.CommandCategories do
     CLUSTER.DEMOTE FERRICSTORE.CONFIG FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FLOW.RETENTION_CLEANUP
   )
 
-  @connection_commands ~w(AUTH HELLO QUIT RESET SANDBOX) ++ @client_connection_commands
+  @connection_commands ~w(AUTH HELLO QUIT RESET SANDBOX) ++
+                         @client_connection_commands ++ @native_connection_commands
   @transaction_commands ~w(MULTI EXEC DISCARD WATCH UNWATCH)
   @pubsub_commands ~w(PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE)
   @blocking_commands ~w(BLPOP BRPOP BLMOVE BLMPOP)

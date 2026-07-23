@@ -4,7 +4,10 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
   alias Ferricstore.Commands.{Extension, NativeAstParser}
   alias FerricstoreServer.Acl.CommandCategories
 
-  @protocol_control_commands ~w(PIPELINE)
+  @protocol_control_commands ~w(
+    PIPELINE ROUTE ROUTE_BATCH SHARDS BACKPRESSURE WINDOW_UPDATE
+    SUBSCRIBE_EVENTS UNSUBSCRIBE_EVENTS
+  )
   @authorization_only_commands ~w(FLOW.QUERY.EXPLAIN)
   @not_implemented_redis_commands ~w(DUMP MIGRATE RESTORE SHUTDOWN SORT)
   @removed_flow_collection_commands ~w(
