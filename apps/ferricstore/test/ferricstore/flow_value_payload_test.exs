@@ -329,14 +329,16 @@ defmodule Ferricstore.FlowValuePayloadTest do
   test "cancel stores inline reason payload as an owned terminal value" do
     id = unique_id("flow-value-cancel-reason")
     reason = %{code: "user_cancelled", details: String.duplicate("x", 256)}
+    now_ms = System.os_time(:millisecond)
 
     assert :ok =
              FerricStore.flow_create(id,
                type: "value-cancel-reason",
                partition_key: "tenant-retention",
                payload: %{large: String.duplicate("p", 256)},
-               retention_ttl_ms: 100,
-               run_at_ms: 1_000
+               retention_ttl_ms: 60_000,
+               run_at_ms: now_ms,
+               now_ms: now_ms
              )
 
     assert {:ok, created} = FerricStore.flow_get(id, partition_key: "tenant-retention")
@@ -345,7 +347,8 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_cancel(id,
                partition_key: "tenant-retention",
                fencing_token: created.fencing_token,
-               reason: reason
+               reason: reason,
+               now_ms: now_ms + 1
              )
 
     assert {:ok, cancelled} = FerricStore.flow_get(id, partition_key: "tenant-retention")
@@ -358,7 +361,15 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert fetched.error == reason
 
-    wait_terminal_removed!(id, "tenant-retention")
+    cleaned =
+      cleanup_until_flow_removed!(
+        id,
+        "tenant-retention",
+        cancelled.terminal_retention_until_ms + 1
+      )
+
+    assert cleaned.flows >= 1
+    assert cleaned.values >= 1
     assert {:ok, nil} = internal_get(cancelled.error_ref)
   end
 
