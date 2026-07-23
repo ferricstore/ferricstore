@@ -336,7 +336,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
                type: "value-cancel-reason",
                partition_key: "tenant-retention",
                payload: %{large: String.duplicate("p", 256)},
-               retention_ttl_ms: 60_000,
+               retention_ttl_ms: 2_000,
                run_at_ms: now_ms,
                now_ms: now_ms
              )
@@ -360,6 +360,13 @@ defmodule Ferricstore.FlowValuePayloadTest do
              FerricStore.flow_get(id, partition_key: "tenant-retention", full: true)
 
     assert fetched.error == reason
+
+    ShardHelpers.eventually(
+      fn -> Ferricstore.HLC.now_ms() >= cancelled.terminal_retention_until_ms + 1 end,
+      "cancelled terminal retention deadline should elapse",
+      1_000,
+      5
+    )
 
     cleaned =
       cleanup_until_flow_removed!(
