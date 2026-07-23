@@ -8,6 +8,18 @@ fi
 
 image="$1"
 name="${FERRICSTORE_SMOKE_CONTAINER:-ferricstore-image-smoke-$$-$RANDOM}"
+pull_attempts="${FERRICSTORE_SMOKE_PULL_ATTEMPTS:-10}"
+pull_interval_seconds="${FERRICSTORE_SMOKE_PULL_INTERVAL_SECONDS:-3}"
+
+if [[ ! "$pull_attempts" =~ ^[1-9][0-9]*$ ]]; then
+  echo "FERRICSTORE_SMOKE_PULL_ATTEMPTS must be a positive integer" >&2
+  exit 2
+fi
+
+if [[ ! "$pull_interval_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "FERRICSTORE_SMOKE_PULL_INTERVAL_SECONDS must be a non-negative number" >&2
+  exit 2
+fi
 
 cleanup() {
   local status=$?
@@ -17,6 +29,22 @@ cleanup() {
   docker rm -f "$name" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  for ((attempt = 1; attempt <= pull_attempts; attempt++)); do
+    if docker pull "$image"; then
+      break
+    fi
+
+    if [[ "$attempt" -eq "$pull_attempts" ]]; then
+      echo "failed to pull $image after $pull_attempts attempts" >&2
+      exit 1
+    fi
+
+    echo "image is not available yet; retrying pull ($attempt/$pull_attempts)" >&2
+    sleep "$pull_interval_seconds"
+  done
+fi
 
 docker rm -f "$name" >/dev/null 2>&1 || true
 docker run --detach --name "$name" \

@@ -91,6 +91,77 @@ defmodule Ferricstore.ReleaseVersionTest do
     end
   end
 
+  test "container smoke test bounds registry propagation retries" do
+    smoke = read!("scripts/smoke-docker-image.sh")
+
+    assert smoke =~ "FERRICSTORE_SMOKE_PULL_ATTEMPTS"
+    assert smoke =~ "FERRICSTORE_SMOKE_PULL_INTERVAL_SECONDS"
+    assert smoke =~ "docker image inspect"
+    assert smoke =~ "docker pull"
+  end
+
+  test "container smoke test retries remote images and skips cached images" do
+    tmp_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-smoke-test-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    fake_bin = Path.join(tmp_dir, "bin")
+    fake_docker = Path.join(fake_bin, "docker")
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_docker, """
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    case "${1:-}" in
+      image)
+        [[ "${DOCKER_IMAGE_CACHED:-0}" == "1" ]]
+        ;;
+      pull)
+        count=0
+        if [[ -f "$DOCKER_PULL_COUNT_FILE" ]]; then
+          count="$(<"$DOCKER_PULL_COUNT_FILE")"
+        fi
+        count=$((count + 1))
+        printf '%s' "$count" >"$DOCKER_PULL_COUNT_FILE"
+        [[ "$count" -ge "$DOCKER_PULL_SUCCEEDS_AT" ]]
+        ;;
+      run)
+        exit 42
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    """)
+
+    File.chmod!(fake_docker, 0o755)
+    on_exit(fn -> File.rm_rf!(tmp_dir) end)
+
+    pull_count = Path.join(tmp_dir, "remote-pulls")
+
+    assert {_, 42} =
+             run_smoke_with_fake_docker(fake_bin,
+               DOCKER_PULL_COUNT_FILE: pull_count,
+               DOCKER_PULL_SUCCEEDS_AT: "3"
+             )
+
+    assert File.read!(pull_count) == "3"
+
+    cached_pull_count = Path.join(tmp_dir, "cached-pulls")
+
+    assert {_, 42} =
+             run_smoke_with_fake_docker(fake_bin,
+               DOCKER_IMAGE_CACHED: "1",
+               DOCKER_PULL_COUNT_FILE: cached_pull_count,
+               DOCKER_PULL_SUCCEEDS_AT: "1"
+             )
+
+    refute File.exists?(cached_pull_count)
+  end
+
   test "Hex package inputs contain no removed protocol artifacts" do
     refute File.exists?(
              Path.join(
@@ -101,4 +172,23 @@ defmodule Ferricstore.ReleaseVersionTest do
   end
 
   defp read!(relative_path), do: File.read!(Path.join(@repo_root, relative_path))
+
+  defp run_smoke_with_fake_docker(fake_bin, env) do
+    env =
+      [
+        {"PATH", fake_bin <> ":" <> System.fetch_env!("PATH")},
+        {"FERRICSTORE_SMOKE_PULL_ATTEMPTS", "4"},
+        {"FERRICSTORE_SMOKE_PULL_INTERVAL_SECONDS", "0"}
+      ] ++ Enum.map(env, fn {key, value} -> {Atom.to_string(key), value} end)
+
+    System.cmd(
+      "bash",
+      [
+        Path.join(@repo_root, "scripts/smoke-docker-image.sh"),
+        "example.invalid/ferricstore:test"
+      ],
+      env: env,
+      stderr_to_stdout: true
+    )
+  end
 end
