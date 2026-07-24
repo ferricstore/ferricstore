@@ -2260,6 +2260,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
 
   defp validate_entry_lifecycle(:building, nil, nil), do: :ok
   defp validate_entry_lifecycle(:validating, %{status: :pending}, nil), do: :ok
+  defp validate_entry_lifecycle(:validating, %{status: :passed}, nil), do: :ok
   defp validate_entry_lifecycle(:active, %{status: :passed}, nil), do: :ok
 
   defp validate_entry_lifecycle(state, %{status: status}, %{status: retirement_status})

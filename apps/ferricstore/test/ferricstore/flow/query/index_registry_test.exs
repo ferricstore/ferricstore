@@ -202,6 +202,29 @@ defmodule Ferricstore.Flow.Query.IndexRegistryTest do
              IndexRegistry.build_status(server_name, index.build_id)
   end
 
+  test "restarts after validation completes but before activation", context do
+    %{ctx: ctx, server_name: server_name} = context
+    pid = start_registry!(ctx, server_name)
+    assert {:ok, %RegistrySnapshot{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+
+    complete_build!(server_name, index.build_id, ctx.shard_count)
+    complete_validation!(server_name, index.build_id, ctx.shard_count)
+
+    assert {:ok, %{state: :validating, validation: %{status: :passed}}} =
+             IndexRegistry.status(server_name, index.definition.id, index.definition.version)
+
+    GenServer.stop(pid)
+    _pid = start_registry!(ctx, server_name)
+
+    assert {:ok, %{state: :validating, validation: %{status: :passed}}} =
+             IndexRegistry.status(server_name, index.definition.id, index.definition.version)
+
+    assert :ok = IndexRegistry.activate_build(server_name, index.build_id)
+
+    assert {:ok, %{state: :active, validation: %{status: :passed}}} =
+             IndexRegistry.status(server_name, index.definition.id, index.definition.version)
+  end
+
   test "repairs an incomplete final journal frame after replaying durable progress", context do
     %{ctx: ctx, server_name: server_name} = context
     pid = start_registry!(ctx, server_name)
