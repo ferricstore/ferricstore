@@ -10,7 +10,8 @@ defmodule Ferricstore.Flow.Query.LineageExecutor do
     ExecutionResult,
     MemoryBudget,
     Plan,
-    Planner
+    Planner,
+    RecordProjection
   }
 
   @lineage_indexes %{
@@ -40,10 +41,11 @@ defmodule Ferricstore.Flow.Query.LineageExecutor do
          {:ok, page} <- read_page(ctx, request, plan, boundary, opts),
          :ok <- validate_page(page, request, plan, descriptor, boundary),
          {:ok, cursor} <- issue_cursor(ctx, request, plan, page, cursor_auth, opts),
-         usage <- usage(page, request, descriptor) do
+         {:ok, records, memory_high_water_bytes} <- project_page(page, request, plan),
+         usage <- usage(page, request, descriptor, memory_high_water_bytes) do
       {:ok,
        %ExecutionResult{
-         records: page.records,
+         records: records,
          has_more: page.has_more,
          continuation: cursor,
          usage: usage,
@@ -212,7 +214,8 @@ defmodule Ferricstore.Flow.Query.LineageExecutor do
          %{field: field, value: value, partition_key: partition_key}
        ) do
     match?({:ok, {^updated_at_ms, ^id}}, validate_boundary(updated_at_ms, id)) and
-      Map.get(record, field) == value
+      Map.get(record, field) == value and
+      RecordProjection.allowlisted_record?(record, :runs)
   end
 
   defp valid_record?(_record, _descriptor), do: false
@@ -227,6 +230,21 @@ defmodule Ferricstore.Flow.Query.LineageExecutor do
     do: records != [] and record_key(List.last(records)) == continuation
 
   defp valid_page_boundary?(_records, _has_more, _continuation), do: false
+
+  defp project_page(page, %Request{projection: :all}, %Plan{}) do
+    {:ok, page.records, page.memory_high_water_bytes}
+  end
+
+  defp project_page(page, %Request{projection: projection}, %Plan{budget: budget}) do
+    with {:ok, records} <- RecordProjection.project_records(page.records, :runs, projection) do
+      memory_high_water_bytes =
+        max(page.memory_high_water_bytes, MemoryBudget.term_bytes({page.records, records}))
+
+      if memory_high_water_bytes <= budget.executor_memory_bytes,
+        do: {:ok, records, memory_high_water_bytes},
+        else: {:error, :query_memory_budget_exceeded}
+    end
+  end
 
   defp issue_cursor(_ctx, _request, _plan, %{has_more: false}, _cursor_auth, _opts),
     do: {:ok, nil}
@@ -297,7 +315,12 @@ defmodule Ferricstore.Flow.Query.LineageExecutor do
     end
   end
 
-  defp usage(page, %Request{predicate: {:and, predicates}}, descriptor) do
+  defp usage(
+         page,
+         %Request{predicate: {:and, predicates}},
+         descriptor,
+         memory_high_water_bytes
+       ) do
     count = length(page.records)
 
     %{
@@ -310,7 +333,7 @@ defmodule Ferricstore.Flow.Query.LineageExecutor do
       duplicate_entries: page.duplicate_entries,
       result_records: count,
       response_bytes: 0,
-      memory_high_water_bytes: page.memory_high_water_bytes,
+      memory_high_water_bytes: memory_high_water_bytes,
       wall_time_us: 0
     }
   end

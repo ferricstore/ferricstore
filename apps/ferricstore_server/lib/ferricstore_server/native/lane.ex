@@ -344,6 +344,7 @@ defmodule FerricstoreServer.Native.Lane do
     Codec.encode_command_response_frames(opcode, lane_id, request_id, :busy, message,
       compression: Map.get(command_state, :compression, :none),
       compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+      compact_response_codecs: Map.get(command_state, :compact_response_codecs, MapSet.new()),
       chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
       max_response_bytes: Map.get(command_state, :max_response_bytes)
     )
@@ -472,6 +473,8 @@ defmodule FerricstoreServer.Native.Lane do
             compact_set_pipeline_result_body(frame_results),
             compression: Map.get(command_state, :compression, :none),
             compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+            compact_response_codecs:
+              Map.get(command_state, :compact_response_codecs, MapSet.new()),
             chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
             max_response_bytes: Map.get(command_state, :max_response_bytes)
           )
@@ -590,6 +593,8 @@ defmodule FerricstoreServer.Native.Lane do
             compact_pipeline_result_body(frame_results),
             compression: Map.get(command_state, :compression, :none),
             compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+            compact_response_codecs:
+              Map.get(command_state, :compact_response_codecs, MapSet.new()),
             chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
             max_response_bytes: Map.get(command_state, :max_response_bytes)
           )
@@ -692,6 +697,8 @@ defmodule FerricstoreServer.Native.Lane do
           Codec.encode_command_response_frames(@op_mget, lane_id, request_id, status, payload,
             compression: Map.get(command_state, :compression, :none),
             compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+            compact_response_codecs:
+              Map.get(command_state, :compact_response_codecs, MapSet.new()),
             chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
             max_response_bytes: Map.get(command_state, :max_response_bytes)
           )
@@ -770,6 +777,7 @@ defmodule FerricstoreServer.Native.Lane do
       Codec.encode_command_response_frames(opcode, lane_id, request_id, status, payload,
         compression: Map.get(command_state, :compression, :none),
         compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+        compact_response_codecs: Map.get(command_state, :compact_response_codecs, MapSet.new()),
         chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
         max_response_bytes: Map.get(command_state, :max_response_bytes)
       )
@@ -874,6 +882,7 @@ defmodule FerricstoreServer.Native.Lane do
       Codec.encode_command_response_frames(@op_set, lane_id, request_id, status, value,
         compression: Map.get(command_state, :compression, :none),
         compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+        compact_response_codecs: Map.get(command_state, :compact_response_codecs, MapSet.new()),
         chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
         max_response_bytes: Map.get(command_state, :max_response_bytes)
       )
@@ -1009,6 +1018,7 @@ defmodule FerricstoreServer.Native.Lane do
         Codec.encode_command_response_frames(opcode, lane_id, request_id, status, value,
           compression: Map.get(command_state, :compression, :none),
           compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+          compact_response_codecs: Map.get(command_state, :compact_response_codecs, MapSet.new()),
           chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
           max_response_bytes: Map.get(command_state, :max_response_bytes)
         )
@@ -1017,6 +1027,7 @@ defmodule FerricstoreServer.Native.Lane do
         Codec.encode_command_response_frames(opcode, lane_id, request_id, :bad_request, reason,
           compression: Map.get(command_state, :compression, :none),
           compact_flow_responses: Map.get(command_state, :compact_flow_responses, false),
+          compact_response_codecs: Map.get(command_state, :compact_response_codecs, MapSet.new()),
           chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
           max_response_bytes: Map.get(command_state, :max_response_bytes)
         )
@@ -1044,6 +1055,7 @@ defmodule FerricstoreServer.Native.Lane do
       %{"value" => value, "trace" => public_trace(trace)},
       compression: Map.get(command_state, :compression, :none),
       compact_flow_responses: false,
+      compact_response_codecs: MapSet.new(),
       chunk_bytes: Map.get(command_state, :response_chunk_bytes, 0),
       max_response_bytes: Map.get(command_state, :max_response_bytes),
       flags: @flag_trace

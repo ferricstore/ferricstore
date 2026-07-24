@@ -771,14 +771,16 @@ defmodule Ferricstore.Flow.Query.Executor do
   end
 
   defp project_and_select_native(record, index_entry, sort_key, state) do
-    with {:ok, entry, entry_bytes} <- selection_entry(record, index_entry, sort_key) do
+    with {:ok, entry, entry_bytes} <-
+           selection_entry(record, index_entry, sort_key, state.request.projection) do
       select_native(entry, entry_bytes, state)
     end
   end
 
   defp maybe_project_and_select_top_k(record, index_entry, sort_key, state) do
     if top_k_candidate?(sort_key, index_entry.id, state) do
-      with {:ok, entry, entry_bytes} <- selection_entry(record, index_entry, sort_key) do
+      with {:ok, entry, entry_bytes} <-
+             selection_entry(record, index_entry, sort_key, state.request.projection) do
         select_top_k(entry, entry_bytes, state)
       end
     else
@@ -786,9 +788,9 @@ defmodule Ferricstore.Flow.Query.Executor do
     end
   end
 
-  defp selection_entry(record, index_entry, sort_key) do
-    with {:ok, projected} <- RecordProjection.project_result({:ok, record}) do
-      entry = {sort_key, Map.fetch!(projected, :id), projected, index_entry.storage_key}
+  defp selection_entry(record, index_entry, sort_key, projection) do
+    with {:ok, projected} <- RecordProjection.project_validated(record, :runs, projection) do
+      entry = {sort_key, index_entry.id, projected, index_entry.storage_key}
       {:ok, entry, selection_size(entry)}
     end
   end

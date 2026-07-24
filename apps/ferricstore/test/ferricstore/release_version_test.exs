@@ -2,7 +2,7 @@ defmodule Ferricstore.ReleaseVersionTest do
   use ExUnit.Case, async: true
 
   @repo_root Path.expand("../../../..", __DIR__)
-  @release_version "0.10.2"
+  @release_version "0.10.3"
 
   @project_files [
     "mix.exs",
@@ -29,6 +29,14 @@ defmodule Ferricstore.ReleaseVersionTest do
       end)
 
     assert Enum.uniq(versions) == [@release_version]
+
+    nif = read!("apps/ferricstore_server/lib/ferricstore_server/native/nif.ex")
+    assert nif =~ "version = Mix.Project.config()[:version]"
+
+    assert nif =~
+             ~S(base_url: "https://github.com/ferricstore/ferricstore/releases/download/v#{version}")
+
+    assert nif =~ "version: version"
   end
 
   test "current installation docs use the release version" do

@@ -10,6 +10,7 @@ defmodule Ferricstore.Flow.Query.HistoryExecutorTest do
     Cursor,
     ExecutionResult,
     HistoryExecutor,
+    MemoryBudget,
     Planner
   }
 
@@ -95,6 +96,102 @@ defmodule Ferricstore.Flow.Query.HistoryExecutorTest do
              )
 
     assert_received {:history_before, "1001-2"}
+  end
+
+  test "projects history fields after validating the full page and continuation" do
+    request =
+      history_request("history-projection", 2)
+      |> Map.put(:projection, [:event_id, {:event_field, "event"}])
+
+    scope = MandatoryScope.dedicated()
+    {:ok, plan} = Planner.plan(request, [], mandatory_scope: scope, now_ms: @now_ms)
+
+    page_read = fn _ctx, ^request, ^scope, nil ->
+      {:ok,
+       %{
+         records: [
+           %{event_id: "1000-1", fields: %{"event" => "created", "secret" => "hidden"}}
+         ],
+         has_more: false,
+         continuation: nil,
+         scanned_entries: 1,
+         hydrated_records: 1,
+         duplicate_entries: 0,
+         memory_high_water_bytes: 1_000
+       }}
+    end
+
+    assert {:ok, %ExecutionResult{records: records}} =
+             HistoryExecutor.execute(context(), request, plan, nil,
+               page_read: page_read,
+               cursor_key: @cursor_key,
+               now_ms: @now_ms
+             )
+
+    assert records == [%{event_id: "1000-1", fields: %{"event" => "created"}}]
+  end
+
+  test "bare history returns do not reserve a duplicate output page" do
+    request = history_request("history-full-return", 1)
+    scope = MandatoryScope.dedicated()
+    {:ok, original_plan} = Planner.plan(request, [], mandatory_scope: scope, now_ms: @now_ms)
+
+    records = [
+      %{event_id: "1000-1", fields: %{"payload" => String.duplicate("x", 2_048)}}
+    ]
+
+    page_bytes = MemoryBudget.term_bytes(records)
+    plan = %{original_plan | budget: %{original_plan.budget | executor_memory_bytes: page_bytes}}
+
+    page_read = fn _ctx, ^request, ^scope, nil ->
+      {:ok,
+       %{
+         records: records,
+         has_more: false,
+         continuation: nil,
+         scanned_entries: 1,
+         hydrated_records: 1,
+         duplicate_entries: 0,
+         memory_high_water_bytes: page_bytes
+       }}
+    end
+
+    assert {:ok, %ExecutionResult{records: ^records, usage: usage}} =
+             HistoryExecutor.execute(context(), request, plan, nil,
+               page_read: page_read,
+               cursor_key: @cursor_key,
+               now_ms: @now_ms
+             )
+
+    assert usage.memory_high_water_bytes == page_bytes
+  end
+
+  test "rejects history pages containing fields outside the public result allowlist" do
+    request = history_request("history-private-field", 1)
+    scope = MandatoryScope.dedicated()
+    {:ok, plan} = Planner.plan(request, [], mandatory_scope: scope, now_ms: @now_ms)
+
+    page_read = fn _ctx, ^request, ^scope, nil ->
+      records = [Map.put(event("1000-1"), :lease_token, "must-not-leak")]
+
+      {:ok,
+       %{
+         records: records,
+         has_more: false,
+         continuation: nil,
+         scanned_entries: 1,
+         hydrated_records: 1,
+         duplicate_entries: 0,
+         memory_high_water_bytes: Ferricstore.TermMemory.bytes(records)
+       }}
+    end
+
+    assert {:error, :query_storage_inconsistent} =
+             HistoryExecutor.execute(context(), request, plan, nil,
+               page_read: page_read,
+               cursor_key: @cursor_key,
+               now_ms: @now_ms
+             )
   end
 
   test "rejects forged page accounting and malformed cursor continuations" do

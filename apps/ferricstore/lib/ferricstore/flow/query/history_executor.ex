@@ -11,7 +11,8 @@ defmodule Ferricstore.Flow.Query.HistoryExecutor do
     ExecutionResult,
     MemoryBudget,
     Plan,
-    Planner
+    Planner,
+    RecordProjection
   }
 
   @maximum_exact_integer 9_007_199_254_740_991
@@ -35,10 +36,11 @@ defmodule Ferricstore.Flow.Query.HistoryExecutor do
          {:ok, page} <- read_page(ctx, request, plan, before_event, opts),
          :ok <- validate_page(page, request, plan, before_event),
          {:ok, cursor} <- issue_cursor(ctx, request, plan, page, cursor_auth, opts),
-         usage <- usage(page, request) do
+         {:ok, records, memory_high_water_bytes} <- project_page(page, request, plan),
+         usage <- usage(page, request, memory_high_water_bytes) do
       {:ok,
        %ExecutionResult{
-         records: page.records,
+         records: records,
          has_more: page.has_more,
          continuation: cursor,
          usage: usage,
@@ -169,9 +171,11 @@ defmodule Ferricstore.Flow.Query.HistoryExecutor do
   defp validate_page(_page, _request, _plan, _before_event),
     do: {:error, :query_storage_inconsistent}
 
-  defp valid_event_record?(%{event_id: event_id, fields: fields})
+  defp valid_event_record?(%{event_id: event_id, fields: fields} = record)
        when is_binary(event_id) and is_map(fields),
-       do: match?({:ok, _event_id}, validate_event_id(event_id))
+       do:
+         RecordProjection.allowlisted_record?(record, :events) and
+           match?({:ok, _event_id}, validate_event_id(event_id))
 
   defp valid_event_record?(_record), do: false
 
@@ -198,6 +202,21 @@ defmodule Ferricstore.Flow.Query.HistoryExecutor do
        do: records != [] and Map.get(List.last(records), :event_id) == continuation
 
   defp valid_page_boundary?(_records, _has_more, _continuation, _direction), do: false
+
+  defp project_page(page, %Request{projection: :all}, %Plan{}) do
+    {:ok, page.records, page.memory_high_water_bytes}
+  end
+
+  defp project_page(page, %Request{projection: projection}, %Plan{budget: budget}) do
+    with {:ok, records} <- RecordProjection.project_records(page.records, :events, projection) do
+      memory_high_water_bytes =
+        max(page.memory_high_water_bytes, MemoryBudget.term_bytes({page.records, records}))
+
+      if memory_high_water_bytes <= budget.executor_memory_bytes,
+        do: {:ok, records, memory_high_water_bytes},
+        else: {:error, :query_memory_budget_exceeded}
+    end
+  end
 
   defp issue_cursor(_ctx, _request, _plan, %{has_more: false}, _cursor_auth, _opts),
     do: {:ok, nil}
@@ -263,7 +282,7 @@ defmodule Ferricstore.Flow.Query.HistoryExecutor do
     end
   end
 
-  defp usage(page, %Request{predicate: {:and, predicates}}) do
+  defp usage(page, %Request{predicate: {:and, predicates}}, memory_high_water_bytes) do
     count = length(page.records)
 
     %{
@@ -276,7 +295,7 @@ defmodule Ferricstore.Flow.Query.HistoryExecutor do
       duplicate_entries: page.duplicate_entries,
       result_records: count,
       response_bytes: 0,
-      memory_high_water_bytes: page.memory_high_water_bytes,
+      memory_high_water_bytes: memory_high_water_bytes,
       wall_time_us: 0
     }
   end

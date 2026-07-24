@@ -74,6 +74,7 @@ defmodule Ferricstore.Flow.Query.PlannerEngineTest do
              index_status_contract: "ferric.flow.query.indexes/v1",
              capabilities: [
                "flow_query_v1",
+               "flow_query_result_projection_v1",
                "flow_explain_v1",
                "flow_explain_analyze_v1",
                "flow_composite_index_v1",
@@ -1027,6 +1028,43 @@ defmodule Ferricstore.Flow.Query.PlannerEngineTest do
     assert all_ids == Enum.sort(all_ids)
   end
 
+  test "event history cursors bind to the canonical projection set" do
+    ctx = history_context()
+    id = "projection-cursor-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert :ok = Ferricstore.Flow.create(ctx, id, type: "query-history", now_ms: 1_000)
+
+    for signal <- ["one", "two", "three"] do
+      assert :ok = Ferricstore.Flow.signal(ctx, id, signal: signal, now_ms: 1_000)
+    end
+
+    request =
+      Request.history(:execute, [{:eq, :run_id, {:literal, :keyword, id}}], :asc, 2)
+
+    projected = %{request | projection: [:event_id, :fields]}
+
+    assert {:ok, first} = PlannerEngine.execute(ctx, projected)
+    assert first.page.has_more
+    assert Enum.all?(first.records, &(Map.keys(&1) |> Enum.sort() == [:event_id, :fields]))
+
+    reordered = %{
+      projected
+      | projection: [:fields, :event_id],
+        cursor: {:literal, :keyword, first.page.cursor}
+    }
+
+    assert {:ok, second} = PlannerEngine.execute(ctx, reordered)
+    assert length(second.records) == 2
+
+    changed = %{
+      projected
+      | projection: [:event_id],
+        cursor: {:literal, :keyword, first.page.cursor}
+    }
+
+    assert {:error, :query_cursor_invalid} = PlannerEngine.execute(ctx, changed)
+  end
+
   test "parent lineage executes as bounded authenticated tuple pages" do
     ctx = history_context()
     unique = System.unique_integer([:positive, :monotonic])
@@ -1865,12 +1903,7 @@ defmodule Ferricstore.Flow.Query.PlannerEngineTest do
     })
   end
 
-  defp query_digest(request) do
-    {request.version, request.source, request.predicate, request.order_by, request.limit,
-     request.return}
-    |> TermCodec.encode()
-    |> then(&:crypto.hash(:sha256, &1))
-  end
+  defp query_digest(request), do: Planner.query_digest(request)
 
   defp eventually(fun, attempts \\ 100)
   defp eventually(fun, 0), do: assert(fun.())

@@ -21,6 +21,10 @@ defmodule Ferricstore.Flow.Query.Usage do
   @maximum_predicates Limits.max_predicates()
   @maximum_native_integer 0x7FFF_FFFF_FFFF_FFFF
 
+  @doc false
+  @spec fields() :: [atom()]
+  def fields, do: @fields
+
   @spec valid?(term(), Budget.t(), :records | :count) :: boolean()
   def valid?(usage, %Budget{} = budget, kind)
       when is_map(usage) and kind in [:records, :count] do

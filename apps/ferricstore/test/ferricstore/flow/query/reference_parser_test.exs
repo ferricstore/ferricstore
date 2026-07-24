@@ -5,6 +5,66 @@ defmodule Ferricstore.Flow.Query.ReferenceParserTest do
   alias Ferricstore.Store.Router
 
   describe "parse/1" do
+    test "parses bounded run and history return projections" do
+      assert {:ok,
+              %Request{
+                source: :runs,
+                projection: [
+                  :run_id,
+                  :state,
+                  :attributes,
+                  :state_meta,
+                  {:attribute, "customer"},
+                  {:state_meta, "review.v2", "owner"}
+                ]
+              }} =
+               ReferenceParser.parse(
+                 "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'run-1' " <>
+                   "RETURN RECORD (run_id, state, attributes, state_meta, attribute['customer'], " <>
+                   "state_meta['review.v2']['owner'])"
+               )
+
+      assert {:ok,
+              %Request{
+                source: :events,
+                projection: [:event_id, {:event_field, "event"}, {:event_field, "worker"}]
+              }} =
+               ReferenceParser.parse(
+                 "FROM events WHERE run_id = 'run-1' ORDER BY event_id DESC LIMIT 10 " <>
+                   "RETURN RECORDS (event_id, fields['event'], fields['worker']);"
+               )
+    end
+
+    test "rejects unsafe, duplicate, empty, and oversized return projections" do
+      prefix =
+        "FROM runs WHERE partition_key = 'tenant-a' ORDER BY updated_at_ms DESC LIMIT 10 " <>
+          "RETURN RECORDS "
+
+      assert {:error, :unsupported_field} = ReferenceParser.parse(prefix <> "(lease_token)")
+      assert {:error, :unsupported_field} = ReferenceParser.parse(prefix <> "(event_id)")
+
+      assert {:error, :duplicate_projection_field} =
+               ReferenceParser.parse(prefix <> "(state, STATE)")
+
+      assert {:error, :unsupported_query_shape} = ReferenceParser.parse(prefix <> "()")
+      assert {:error, :unsupported_query_shape} = ReferenceParser.parse(prefix <> "(state,)")
+
+      fields =
+        1..(Limits.max_return_fields() + 1)
+        |> Enum.map_join(", ", &"attribute['field-#{&1}']")
+
+      assert {:error, :query_projection_limit_exceeded} =
+               ReferenceParser.parse(prefix <> "(" <> fields <> ")")
+
+      history =
+        "FROM events WHERE run_id = 'run-1' ORDER BY event_id ASC LIMIT 10 RETURN RECORDS "
+
+      assert {:error, :unsupported_field} = ReferenceParser.parse(history <> "(state)")
+
+      assert {:error, :unsupported_field} =
+               ReferenceParser.parse(history <> "(fields['__internal'])")
+    end
+
     test "parses the bounded run point-read shape" do
       assert {:ok,
               %Request{
@@ -328,6 +388,34 @@ defmodule Ferricstore.Flow.Query.ReferenceParserTest do
 
       assert byte == byte_offset + 1
       assert column == byte
+    end
+
+    test "reports unsupported and duplicate return projection fields at the rejected selector" do
+      unsupported =
+        "FROM runs WHERE run_id = 'run-1' RETURN RECORD (lease_token)"
+
+      {unsupported_offset, _length} = :binary.match(unsupported, "lease_token")
+
+      assert {:error,
+              %Error{
+                reason: :unsupported_field,
+                position: %{byte: unsupported_byte, line: 1, column: unsupported_byte}
+              }} = ReferenceParser.parse_diagnostic(unsupported)
+
+      assert unsupported_byte == unsupported_offset + 1
+
+      duplicate =
+        "FROM runs WHERE run_id = 'run-1' RETURN RECORD (state, STATE)"
+
+      {duplicate_offset, _length} = :binary.match(duplicate, "STATE")
+
+      assert {:error,
+              %Error{
+                reason: :duplicate_projection_field,
+                position: %{byte: duplicate_byte, line: 1, column: duplicate_byte}
+              }} = ReferenceParser.parse_diagnostic(duplicate)
+
+      assert duplicate_byte == duplicate_offset + 1
     end
 
     test "reports the clause that appears where WHERE is required" do

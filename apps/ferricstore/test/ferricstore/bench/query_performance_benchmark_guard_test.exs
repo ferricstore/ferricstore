@@ -48,6 +48,7 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
                            @root,
                            "bench/query_planner_projection_candidates_bench.exs"
                          )
+  @result_projection_bench Path.join(@root, "bench/query_result_projection_bench.exs")
   @native_read_candidates Path.join(
                             @root,
                             "bench/query_planner_native_read_candidates_bench.exs"
@@ -131,6 +132,8 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
     assert source =~ "QueryPerformance.benchee_options"
     assert source =~ "preflight_inputs!"
     assert source =~ "FQLPlannerContext.start!"
+    assert read!(@fql_bench) =~ "RETURN RECORDS (run_id, state, attribute['customer'])"
+    assert read!(@fql_bench) =~ "{:ok, _, _, _, _, _, _, _, _}"
   end
 
   test "scheduler benchmark measures saturation throughput and heartbeat tail latency" do
@@ -151,6 +154,9 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
       assert source =~ contract,
              "missing scheduler responsiveness contract #{inspect(contract)}"
     end
+
+    assert source =~ "RETURN RECORDS (run_id, state, attribute['customer'])"
+    assert read!(@scheduler_bench) =~ "{:ok, _, _, _, _, _, _, _, _}"
   end
 
   test "native ordered-index benchmark covers scale, paging, skew, fanout, and contention" do
@@ -459,6 +465,22 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
     end
 
     refute native =~ "lmdb_bench_"
+  end
+
+  test "result projection benchmark compares the safe fixed-index candidate" do
+    source = read!(@result_projection_bench)
+
+    for contract <- [
+          "^expected = candidate(records)",
+          "current full allowlist then sparse projection",
+          "candidate validation summary plus direct sparse projection",
+          "RecordProjection.project_result",
+          "RecordProjection.project_validated",
+          "internal_payload_ref"
+        ] do
+      assert source =~ contract,
+             "missing result projection benchmark contract #{inspect(contract)}"
+    end
   end
 
   test "Linux profiling runner records perf, flamegraph, cache, and allocator evidence" do

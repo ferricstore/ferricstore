@@ -1,7 +1,7 @@
 defmodule Ferricstore.MixProject do
   use Mix.Project
 
-  @version "0.10.2"
+  @version "0.10.3"
 
   def project do
     [
@@ -35,6 +35,7 @@ defmodule Ferricstore.MixProject do
       main: "getting-started",
       extras: [
         "../../guides/getting-started.md",
+        "../../guides/kv-store.md",
         "../../guides/embedded-mode.md",
         "../../guides/flow-elixir-sdk.md",
         "../../guides/commands.md",
@@ -46,6 +47,7 @@ defmodule Ferricstore.MixProject do
         "../../guides/best-practices.md",
         "../../docs/flow-vs-temporal-usage.md",
         "../../docs/benchmarks.md",
+        "../../docs/native-protocol.md",
         "../../docs/flow-query.md",
         "../../docs/flow-production-readiness.md",
         "../../docs/flow-retry-policy.md",

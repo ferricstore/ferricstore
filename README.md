@@ -61,7 +61,7 @@ A long workflow does not need to live in one codebase or one workflow runtime. O
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ghcr.io/ferricstore/ferricstore:0.10.2
+  ghcr.io/ferricstore/ferricstore:0.10.3
 ```
 
 `FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
@@ -69,7 +69,7 @@ docker run -p 6388:6388 \
 The published container image is hosted on GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/ferricstore/ferricstore:0.10.2
+docker pull ghcr.io/ferricstore/ferricstore:0.10.3
 ```
 
 Current release images are published as multi-arch images for `linux/amd64`
@@ -269,7 +269,7 @@ FerricStore can also run inside an Elixir application.
 
 ```elixir
 # mix.exs
-{:ferricstore, "~> 0.10.2"}
+{:ferricstore, "~> 0.10.3"}
 ```
 
 ```elixir
@@ -291,6 +291,7 @@ Start here:
 FerricFlow:
 
 - [Flow command reference](guides/commands.md) — `FLOW.*` command syntax and FerricStore command behavior.
+- [Flow query guide](docs/flow-query.md) — FQL1 syntax, result-field projection, binary results, EXPLAIN, indexes, operations, security, and tuning.
 - [Flow retry policy](docs/flow-retry-policy.md) — type/state retry policies and retry exhaustion behavior.
 - [Flow production readiness](docs/flow-production-readiness.md) — operational model, lagged projections, retention, reclaim, and production tuning.
 - [Elixir Flow SDK](guides/flow-elixir-sdk.md) — high-level embedded workflow/state-machine API over core Flow commands.

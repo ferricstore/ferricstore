@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.ErrorTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.Query.Error
+  alias Ferricstore.Flow.Query.{Error, RecordProjection}
 
   test "exposes stable bounded-execution errors with retry semantics" do
     non_retryable = [
@@ -17,7 +17,8 @@ defmodule Ferricstore.Flow.Query.ErrorTest do
       :query_concurrency_exceeded,
       :query_cursor_invalid,
       :query_cursor_expired,
-      :query_cursor_too_large
+      :query_cursor_too_large,
+      :query_projection_limit_exceeded
     ]
 
     for reason <- non_retryable do
@@ -30,6 +31,21 @@ defmodule Ferricstore.Flow.Query.ErrorTest do
 
     assert %{code: "query_cursor_invalid"} = atom_payload(:query_cursor_invalid)
     assert %{code: "query_cursor_expired"} = atom_payload(:query_cursor_expired)
+  end
+
+  test "makes bounded return projection errors actionable" do
+    duplicate = Error.diagnose(:duplicate_projection_field, "RETURN RECORD (state, STATE)", 23)
+
+    assert duplicate.detail =~ "same result field"
+    assert duplicate.hint =~ "Remove the duplicate"
+    assert duplicate.position == %{byte: 23, line: 1, column: 23}
+
+    limit = Error.diagnose(:query_projection_limit_exceeded, "RETURN RECORDS (...) ", 17)
+    payload = Error.payload(limit)
+
+    assert payload["code"] == "query_projection_limit_exceeded"
+    assert payload["context"] == %{"max_projection_fields" => 32}
+    assert payload["hint"] =~ "Select fewer fields"
   end
 
   test "maps only canonical wire messages back to their query reason" do
@@ -81,6 +97,14 @@ defmodule Ferricstore.Flow.Query.ErrorTest do
     assert "updated_at_ms" in fields
     assert "attribute.<name>" in fields
     assert "state_meta.<state>.<name>" in fields
+
+    assert payload["context"]["supported_projection_fields"] == %{
+             "events" => ["event_id", "fields", "fields['<name>']"],
+             "runs" => RecordProjection.supported_external_names(:runs)
+           }
+
+    assert "attributes" in payload["context"]["supported_projection_fields"]["runs"]
+    assert "state_meta" in payload["context"]["supported_projection_fields"]["runs"]
     refute inspect(payload) =~ "tenant_secret"
     refute inspect(payload) =~ "value-secret"
 

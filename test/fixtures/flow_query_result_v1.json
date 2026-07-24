@@ -1,0 +1,96 @@
+{
+  "codec": "flow_query_result_v1",
+  "contract": "ferric.flow.query.result/v1",
+  "tag": 160,
+  "record_fields": [
+    "id",
+    "type",
+    "state",
+    "version",
+    "priority",
+    "partition_key",
+    "created_at_ms",
+    "updated_at_ms",
+    "next_run_at_ms",
+    "lease_deadline_ms",
+    "attempts",
+    "run_state",
+    "max_active_ms",
+    "parent_flow_id",
+    "root_flow_id",
+    "correlation_id",
+    "attributes",
+    "state_meta",
+    "event_id",
+    "fields"
+  ],
+  "quality_fields": ["exactness", "freshness", "coverage", "pagination"],
+  "usage_fields": [
+    "range_seeks",
+    "range_pages",
+    "scanned_entries",
+    "scanned_bytes",
+    "hydrated_records",
+    "residual_checks",
+    "duplicate_entries",
+    "result_records",
+    "response_bytes",
+    "memory_high_water_bytes",
+    "wall_time_us"
+  ],
+  "vectors": [
+    {
+      "name": "projected_page",
+      "payload_hex": "a0000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000009f0000000000000000000000000000000000ffffffff0000000100080005040000000572756e2d3104000000066661696c656406000000010000000d696e766f6963655f746f74616c03000000000000002a",
+      "kind": "records",
+      "quality": {
+        "exactness": "authoritative",
+        "freshness": "current",
+        "coverage": "complete",
+        "pagination": "authenticated_seek"
+      },
+      "usage": {
+        "range_seeks": 0,
+        "range_pages": 0,
+        "scanned_entries": 0,
+        "scanned_bytes": 0,
+        "hydrated_records": 0,
+        "residual_checks": 0,
+        "duplicate_entries": 0,
+        "result_records": 1,
+        "response_bytes": 159,
+        "memory_high_water_bytes": 0,
+        "wall_time_us": 0
+      },
+      "page": {"has_more": false, "cursor": null},
+      "records": [
+        {"id": "run-1", "state": "failed", "fields": {"invoice_total": 42}}
+      ]
+    },
+    {
+      "name": "max_signed_count",
+      "payload_hex": "a00102010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000066000000000000000000000000000000007fffffffffffffff",
+      "kind": "count",
+      "count_decimal": "9223372036854775807",
+      "quality": {
+        "exactness": "exact",
+        "freshness": "projection_watermark",
+        "coverage": "complete",
+        "pagination": "none"
+      },
+      "usage": {
+        "range_seeks": 0,
+        "range_pages": 0,
+        "scanned_entries": 0,
+        "scanned_bytes": 0,
+        "hydrated_records": 0,
+        "residual_checks": 0,
+        "duplicate_entries": 0,
+        "result_records": 1,
+        "response_bytes": 102,
+        "memory_high_water_bytes": 0,
+        "wall_time_us": 0
+      }
+    }
+  ]
+}

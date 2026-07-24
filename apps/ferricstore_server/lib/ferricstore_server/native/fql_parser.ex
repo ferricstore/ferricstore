@@ -38,7 +38,7 @@ defmodule FerricstoreServer.Native.FQLParser do
 
   defp parse_native(query) do
     case NIF.parse_fql(query) do
-      {:ok, mode, source, shape, predicates, order_by, limit, cursor}
+      {:ok, mode, source, shape, predicates, order_by, limit, cursor, projection}
       when mode in [:execute, :explain, :analyze] and source in [:runs, :events] and
              shape in [:point, :collection, :history, :count] and
              is_list(predicates) and is_list(order_by) and
@@ -46,8 +46,18 @@ defmodule FerricstoreServer.Native.FQLParser do
         with {:ok, predicates} <- decode_predicates(predicates, []),
              {:ok, order_by} <- decode_order(order_by, []),
              {:ok, cursor} <- decode_cursor(cursor),
+             {:ok, projection} <- decode_projection(source, projection),
              {:ok, request} <-
-               build_request(mode, source, shape, predicates, order_by, limit, cursor),
+               build_request(
+                 mode,
+                 source,
+                 shape,
+                 predicates,
+                 order_by,
+                 limit,
+                 cursor,
+                 projection
+               ),
              :ok <- Request.validate_unbound(request) do
           {:ok, request}
         else
@@ -134,6 +144,49 @@ defmodule FerricstoreServer.Native.FQLParser do
 
   defp decode_cursor(_cursor), do: {:error, :invalid_syntax}
 
+  defp decode_projection(_source, nil), do: {:ok, :all}
+
+  defp decode_projection(source, fields) when is_list(fields) do
+    decode_projection_fields(source, fields, [])
+  end
+
+  defp decode_projection(_source, _fields), do: {:error, :invalid_syntax}
+
+  defp decode_projection_fields(_source, [], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp decode_projection_fields(source, [field | rest], acc) when is_binary(field) do
+    with {:ok, decoded} <- decode_projection_field(source, field) do
+      decode_projection_fields(source, rest, [decoded | acc])
+    end
+  end
+
+  defp decode_projection_fields(_source, _fields, _acc), do: {:error, :invalid_syntax}
+
+  defp decode_projection_field(:runs, "attributes"), do: {:ok, :attributes}
+  defp decode_projection_field(:runs, "state_meta"), do: {:ok, :state_meta}
+
+  defp decode_projection_field(:runs, field) do
+    with {:ok, decoded} <- Field.parse(field),
+         false <- decoded == :event_id do
+      {:ok, decoded}
+    else
+      true -> {:error, :unsupported_field}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp decode_projection_field(:events, "event_id"), do: {:ok, :event_id}
+  defp decode_projection_field(:events, "fields"), do: {:ok, :fields}
+
+  defp decode_projection_field(:events, <<"fields", brackets::binary>>) do
+    case Field.parse("attribute" <> brackets) do
+      {:ok, {:attribute, name}} -> {:ok, {:event_field, name}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp decode_projection_field(_source, _field), do: {:error, :unsupported_field}
+
   defp build_request(
          mode,
          :runs,
@@ -141,9 +194,10 @@ defmodule FerricstoreServer.Native.FQLParser do
          [{:eq, :run_id, run_id}],
          [],
          1,
-         nil
+         nil,
+         projection
        ) do
-    {:ok, Request.point_read(mode, run_id)}
+    {:ok, mode |> Request.point_read(run_id) |> Map.put(:projection, projection)}
   end
 
   defp build_request(
@@ -156,16 +210,32 @@ defmodule FerricstoreServer.Native.FQLParser do
          ],
          [],
          1,
-         nil
+         nil,
+         projection
        ) do
-    {:ok, Request.point_read(mode, partition_key, run_id)}
+    {:ok,
+     mode
+     |> Request.point_read(partition_key, run_id)
+     |> Map.put(:projection, projection)}
   end
 
-  defp build_request(mode, :runs, :collection, predicates, order_by, limit, cursor) do
-    {:ok, Request.collection(mode, predicates, order_by, limit, :record, cursor)}
+  defp build_request(
+         mode,
+         :runs,
+         :collection,
+         predicates,
+         order_by,
+         limit,
+         cursor,
+         projection
+       ) do
+    {:ok,
+     mode
+     |> Request.collection(predicates, order_by, limit, :record, cursor)
+     |> Map.put(:projection, projection)}
   end
 
-  defp build_request(mode, :runs, :count, predicates, [], nil, nil) do
+  defp build_request(mode, :runs, :count, predicates, [], nil, nil, :all) do
     {:ok, Request.count(mode, predicates)}
   end
 
@@ -176,11 +246,24 @@ defmodule FerricstoreServer.Native.FQLParser do
          predicates,
          [{:event_id, direction}],
          limit,
-         cursor
+         cursor,
+         projection
        ) do
-    {:ok, Request.history(mode, predicates, direction, limit, cursor)}
+    {:ok,
+     mode
+     |> Request.history(predicates, direction, limit, cursor)
+     |> Map.put(:projection, projection)}
   end
 
-  defp build_request(_mode, _source, _shape, _predicates, _order_by, _limit, _cursor),
-    do: {:error, :unsupported_query_shape}
+  defp build_request(
+         _mode,
+         _source,
+         _shape,
+         _predicates,
+         _order_by,
+         _limit,
+         _cursor,
+         _projection
+       ),
+       do: {:error, :unsupported_query_shape}
 end

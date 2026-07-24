@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.Explain do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.{Error, Field, MandatoryScope, Request}
+  alias Ferricstore.Flow.Query.{Error, Field, MandatoryScope, RecordProjection, Request}
   alias Ferricstore.Flow.Query.{Plan, PlannerDiagnostic, Usage}
 
   @version "ferric.flow.explain/v1"
@@ -69,8 +69,31 @@ defmodule Ferricstore.Flow.Query.Explain do
         |> Enum.map(&redacted_predicate/1)
         |> Enum.sort_by(&{&1.field, &1.operator}),
       mandatory_scope: render_mandatory_scope(plan.mandatory_scope),
+      projection: render_projection(plan, request),
       return: enum(request.return),
       limit: request.limit
+    }
+  end
+
+  defp render_projection(%Plan{path: path}, %Request{return: :count}) do
+    %{
+      fields: [],
+      application: "not_applicable",
+      index_only: path == :counter_lookup
+    }
+  end
+
+  defp render_projection(%Plan{}, %Request{projection: projection}) do
+    fields =
+      case RecordProjection.external_names(projection) do
+        :all -> "all_allowlisted_fields"
+        names -> names
+      end
+
+    %{
+      fields: fields,
+      application: "after_authoritative_recheck",
+      index_only: false
     }
   end
 

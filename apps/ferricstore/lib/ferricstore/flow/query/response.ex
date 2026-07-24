@@ -12,6 +12,10 @@ defmodule Ferricstore.Flow.Query.Response do
   @spec contract() :: binary()
   def contract, do: @contract
 
+  @doc false
+  @spec quality_fields() :: [atom()]
+  def quality_fields, do: @quality_fields
+
   @spec build([map()], boolean(), binary() | nil, map(), map(), Budget.t()) ::
           {:ok, map()} | {:error, atom()}
   def build(records, has_more, cursor, quality, usage, %Budget{} = budget)

@@ -24,6 +24,8 @@ defmodule Ferricstore.Bench.FQLScheduler do
 
     workloads = %{
       "point" => "FROM runs WHERE partition_key = @partition AND run_id = @run_id RETURN RECORD",
+      "projection" =>
+        "FROM runs WHERE partition_key = @partition AND state = 'failed' LIMIT 25 RETURN RECORDS (run_id, state, attribute['customer'])",
       "max_malformed" => "'" <> String.duplicate("x", max_bytes - 1)
     }
 
@@ -40,7 +42,7 @@ defmodule Ferricstore.Bench.FQLScheduler do
 
   defp run_case(name, query, concurrency, duration_ms, heartbeat_ms, sample_every) do
     case NIF.parse_fql(query) do
-      {:ok, _, _, _, _, _, _, _} -> :ok
+      {:ok, _, _, _, _, _, _, _, _} -> :ok
       {:error, _, _} -> :ok
       invalid -> raise "unexpected FQL NIF result: #{inspect(invalid)}"
     end

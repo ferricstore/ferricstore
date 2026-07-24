@@ -13,6 +13,7 @@ defmodule Ferricstore.Flow.Query.Limits do
   @max_generated_ranges 32
   @max_parameters 64
   @max_order_fields 2
+  @max_return_fields 32
   @max_results 100
   @min_cursor_bytes 16
   @max_cursor_bytes 4_096
@@ -36,6 +37,9 @@ defmodule Ferricstore.Flow.Query.Limits do
 
   @spec max_order_fields() :: pos_integer()
   def max_order_fields, do: @max_order_fields
+
+  @spec max_return_fields() :: pos_integer()
+  def max_return_fields, do: @max_return_fields
 
   @spec max_parameters() :: pos_integer()
   def max_parameters, do: @max_parameters

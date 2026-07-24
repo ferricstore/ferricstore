@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow.Query.Planner do
     IndexDefinition,
     MandatoryScope,
     RegisteredIndex,
+    RecordProjection,
     Request,
     Shape,
     TupleCodec
@@ -112,6 +113,7 @@ defmodule Ferricstore.Flow.Query.Planner do
       request_predicates(request) |> Enum.map(&predicate_shape/1) |> Enum.sort(),
       request.order_by,
       request.limit,
+      canonical_projection(request.projection),
       request.return
     }
 
@@ -125,7 +127,7 @@ defmodule Ferricstore.Flow.Query.Planner do
   @spec query_digest(Request.t()) :: <<_::256>>
   def query_digest(%Request{} = request) do
     {request.version, request.source, request.predicate, request.order_by, request.limit,
-     request.return}
+     canonical_projection(request.projection), request.return}
     |> TermCodec.encode()
     |> then(&:crypto.hash(:sha256, &1))
   end
@@ -1379,6 +1381,13 @@ defmodule Ferricstore.Flow.Query.Planner do
 
   defp value_shape({:literal, type, _value}), do: {:literal, type}
   defp value_shape({:parameter, type, _name}), do: {:parameter, type}
+
+  defp canonical_projection(projection) do
+    case RecordProjection.external_names(projection) do
+      :all -> :all
+      fields -> Enum.sort(fields)
+    end
+  end
 
   defp stable_term(term), do: :erlang.term_to_binary(term, minor_version: 2)
 end

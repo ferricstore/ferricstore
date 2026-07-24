@@ -1,7 +1,56 @@
 defmodule Ferricstore.Flow.Query.FixedIndexExecutorTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
-  alias Ferricstore.Flow.Query.{Budget, FixedIndexExecutor, Limits, Request}
+  alias Ferricstore.Flow.Query.{Budget, FixedIndexExecutor, Limits, RecordProjection, Request}
+  alias Ferricstore.Flow.Query
+  alias Ferricstore.Test.IsolatedInstance
+
+  test "explicit fixed-index projections skip the full allowlisted intermediate" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "fixed-projection-#{suffix}"
+    type = "invoice-#{suffix}"
+    id = "run-#{suffix}"
+
+    try do
+      assert :ok =
+               Ferricstore.Flow.create(ctx, id,
+                 type: type,
+                 state: "failed",
+                 partition_key: partition,
+                 attributes: %{"customer" => "acme", "large" => :binary.copy(<<7>>, 64)},
+                 now_ms: 1_000
+               )
+
+      query =
+        "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state " <>
+          "ORDER BY updated_at_ms ASC LIMIT 10 " <>
+          "RETURN RECORDS (run_id, state, attribute['customer'])"
+
+      assert {:ok, request} =
+               Query.prepare_reference("FQL1", query, %{
+                 "partition" => partition,
+                 "type" => type,
+                 "state" => "failed"
+               })
+
+      {result, full_projection_calls} =
+        execute_with_call_trace({RecordProjection, :project_result, 1}, fn ->
+          Query.execute(ctx, request)
+        end)
+
+      assert {:ok,
+              %{
+                records: [
+                  %{id: ^id, state: "failed", attributes: %{"customer" => "acme"}}
+                ]
+              }} = result
+
+      assert full_projection_calls == 0
+    after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
 
   test "fixed fallback bounds each synchronous candidate window to one maximum page" do
     request =
@@ -126,5 +175,44 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutorTest do
 
     assert {:error, :duplicate_predicate_value} =
              FixedIndexExecutor.execute(%{}, request.(~w(failed failed)))
+  end
+
+  defp execute_with_call_trace({module, function, arity} = mfa, execute_fun) do
+    parent = self()
+    reference = make_ref()
+
+    executor =
+      spawn(fn ->
+        receive do
+          :execute ->
+            send(parent, {reference, execute_fun.()})
+            receive do: (:stop -> :ok)
+        end
+      end)
+
+    Code.ensure_loaded!(module)
+    :erlang.trace(executor, true, [:call, {:tracer, self()}])
+    :erlang.trace_pattern(mfa, true, [:local])
+
+    try do
+      send(executor, :execute)
+      assert_receive {^reference, result}, 5_000
+      trace_reference = :erlang.trace_delivered(executor)
+      assert_receive {:trace_delivered, ^executor, ^trace_reference}, 1_000
+      {result, traced_calls(module, function, arity)}
+    after
+      :erlang.trace_pattern(mfa, false, [:local])
+      :erlang.trace(executor, false, [:call])
+      send(executor, :stop)
+    end
+  end
+
+  defp traced_calls(module, function, arity) do
+    receive do
+      {:trace, _pid, :call, {^module, ^function, args}} when length(args) == arity ->
+        1 + traced_calls(module, function, arity)
+    after
+      0 -> 0
+    end
   end
 end

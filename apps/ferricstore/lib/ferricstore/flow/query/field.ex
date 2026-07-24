@@ -123,6 +123,10 @@ defmodule Ferricstore.Flow.Query.Field do
   def metadata?({:state_meta, _state, _name}), do: true
   def metadata?(_field), do: false
 
+  @doc false
+  @spec valid_dynamic_name?(term()) :: boolean()
+  def valid_dynamic_name?(name), do: valid_metadata_key?(name)
+
   @spec external_name(t()) :: binary()
   def external_name({:attribute, name}) do
     if valid_unquoted_name?(name),

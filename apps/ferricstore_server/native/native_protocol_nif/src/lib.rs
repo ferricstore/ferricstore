@@ -68,6 +68,14 @@ fn parse_fql<'a>(env: Env<'a>, query: Binary<'a>) -> NifResult<Term<'a>> {
                 Some(limit) => (limit as u64).encode(env),
                 None => atoms::nil().encode(env),
             };
+            let projection = match parsed.projection {
+                Some(fields) => fields
+                    .into_iter()
+                    .map(|field| encode_fql_binary(env, field.external_name))
+                    .collect::<NifResult<Vec<_>>>()?
+                    .encode(env),
+                None => atoms::nil().encode(env),
+            };
 
             Ok(rustler::types::tuple::make_tuple(
                 env,
@@ -80,14 +88,19 @@ fn parse_fql<'a>(env: Env<'a>, query: Binary<'a>) -> NifResult<Term<'a>> {
                     order_by.encode(env),
                     limit,
                     cursor,
+                    projection,
                 ],
             ))
         }
         Err(failure) => {
             let reason = match failure.reason {
+                fql::ParseError::DuplicateProjectionField => atoms::duplicate_projection_field(),
                 fql::ParseError::InvalidParameterType => atoms::invalid_parameter_type(),
                 fql::ParseError::InvalidSyntax => atoms::invalid_syntax(),
                 fql::ParseError::QueryCursorInvalid => atoms::query_cursor_invalid(),
+                fql::ParseError::QueryProjectionLimitExceeded => {
+                    atoms::query_projection_limit_exceeded()
+                }
                 fql::ParseError::QueryTooLarge => atoms::query_too_large(),
                 fql::ParseError::UnsupportedField => atoms::unsupported_field(),
                 fql::ParseError::UnsupportedQueryShape => atoms::unsupported_query_shape(),
@@ -899,6 +912,7 @@ mod atoms {
         keyword,
         integer,
         dynamic,
+        duplicate_projection_field,
         eq,
         in_operator = "in",
         range,
@@ -911,6 +925,7 @@ mod atoms {
         invalid_parameter_type,
         invalid_syntax,
         query_cursor_invalid,
+        query_projection_limit_exceeded,
         query_too_large,
         unsupported_field,
         unsupported_query_shape,

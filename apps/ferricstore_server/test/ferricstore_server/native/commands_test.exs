@@ -559,6 +559,66 @@ defmodule FerricstoreServer.Native.CommandsTest do
     :ok
   end
 
+  test "STARTUP negotiates compact query result framing explicitly" do
+    assert {:ok, _payload, negotiated} =
+             Commands.execute(
+               @op_startup,
+               %{
+                 "compact_flow_responses" => true,
+                 "compact_response_codecs" => ["flow_query_result_v1"]
+               },
+               state()
+             )
+
+    assert negotiated.compact_flow_responses == true
+    assert negotiated.compact_response_codecs == MapSet.new(["flow_query_result_v1"])
+
+    assert {:ok, options, _state} = Commands.execute(@op_options, %{}, negotiated)
+    assert options.response_codecs.compact_flow_responses == true
+    assert options.response_codecs.selected_compact == ["flow_query_result_v1"]
+
+    assert options.response_codecs.compact_response_opcodes["flow_query_result_v1"] == [
+             0x0100,
+             0x0231
+           ]
+  end
+
+  test "HELLO can negotiate the same explicit compact result codecs without a second round trip" do
+    assert {:ok, payload, negotiated} =
+             Commands.execute(
+               @op_hello,
+               %{
+                 "client_name" => "ferricstore-go",
+                 "compact_flow_responses" => true,
+                 "compact_response_codecs" => ["flow_query_result_v1"]
+               },
+               state()
+             )
+
+    assert negotiated.compact_flow_responses
+    assert negotiated.compact_response_codecs == MapSet.new(["flow_query_result_v1"])
+    assert payload.capabilities.response_codecs.selected_compact == ["flow_query_result_v1"]
+  end
+
+  test "STARTUP rejects malformed, duplicate, and unsupported response codec requests" do
+    for {response_codecs, expected} <- [
+          {"flow_query_result_v1", "must be a list"},
+          {["flow_query_result_v1", "flow_query_result_v1"], "must not contain duplicates"},
+          {["future_codec_v1"], "unsupported response codec"},
+          {[1], "must contain binaries"}
+        ] do
+      assert {:bad_request, reason, unchanged} =
+               Commands.execute(
+                 @op_startup,
+                 %{"compact_response_codecs" => response_codecs},
+                 state()
+               )
+
+      assert reason =~ expected
+      assert Map.get(unchanged, :compact_response_codecs, MapSet.new()) == MapSet.new()
+    end
+  end
+
   test "OPTIONS advertises native protocol capabilities and command coverage" do
     {status, payload, _state} = Commands.execute(@op_options, %{}, state())
 
@@ -570,6 +630,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
 
     assert payload.response_codecs.compact_response_opcodes == %{
              "flow_claim_jobs_v1" => [0x0203],
+             "flow_query_result_v1" => [0x0100, 0x0231],
              "flow_record_v1" => [0x0202],
              "kv_get_v1" => [0x0101],
              "kv_mget_v1" => [0x0104, 0x020C],
@@ -618,6 +679,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
              index_status_contract: "ferric.flow.query.indexes/v1",
              capabilities: [
                "flow_query_v1",
+               "flow_query_result_projection_v1",
                "flow_explain_v1",
                "flow_explain_analyze_v1",
                "flow_composite_index_v1",
@@ -1615,6 +1677,90 @@ defmodule FerricstoreServer.Native.CommandsTest do
     end
 
     refute inspect(record) =~ "payload-secret"
+  end
+
+  test "FLOW.QUERY returns only explicitly projected run fields" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    id = "native-query-select-#{suffix}"
+    partition = "native-query-select-partition-#{suffix}"
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: "native-query-select",
+               state: "ready",
+               partition_key: partition,
+               attributes: %{"customer" => "customer-a", "secret" => "hidden"},
+               state_meta: %{"risk" => "low", "secret" => "hidden"},
+               now_ms: 1_000
+             )
+
+    query =
+      "FROM runs WHERE partition_key = @partition AND run_id = @flow_id " <>
+        "RETURN RECORD (run_id, state, attribute['customer'], state_meta['ready']['risk'])"
+
+    assert {:ok, response, _state} =
+             Commands.execute(
+               @op_flow_query,
+               %{
+                 "version" => "FQL1",
+                 "query" => query,
+                 "params" => %{"partition" => partition, "flow_id" => id}
+               },
+               state()
+             )
+
+    assert response.records == [
+             %{
+               id: id,
+               state: "ready",
+               attributes: %{"customer" => "customer-a"},
+               state_meta: %{"ready" => %{"risk" => "low"}}
+             }
+           ]
+  end
+
+  test "FLOW.QUERY returns source-specific projected history fields" do
+    suffix = System.unique_integer([:positive, :monotonic])
+    id = "native-query-history-select-#{suffix}"
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: "native-query-history-select",
+               state: "ready",
+               now_ms: 1_000
+             )
+
+    query =
+      "FROM events WHERE run_id = @flow_id ORDER BY event_id ASC LIMIT 10 " <>
+        "RETURN RECORDS (event_id, fields['event'])"
+
+    assert {:ok, response, _state} =
+             Commands.execute(
+               @op_flow_query,
+               %{
+                 "version" => "FQL1",
+                 "query" => query,
+                 "params" => %{"flow_id" => id}
+               },
+               state()
+             )
+
+    assert [%{event_id: event_id, fields: %{"event" => "created"}}] = response.records
+    assert is_binary(event_id)
+  end
+
+  test "FLOW.QUERY rejects operational fields in an explicit projection" do
+    query = "FROM runs WHERE run_id = 'run-1' RETURN RECORD (run_id, lease_token)"
+
+    assert {:bad_request, error, _state} =
+             Commands.execute(
+               @op_flow_query,
+               %{"version" => "FQL1", "query" => query},
+               state()
+             )
+
+    assert error["code"] == "unsupported_field"
+    refute inspect(error) =~ "lease_token"
   end
 
   test "FLOW.QUERY EXPLAIN is deterministic and redacts predicate values" do
@@ -4231,6 +4377,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
       stats_counter: FerricStore.Instance.get(:default).stats_counter,
       compression: :none,
       compact_flow_responses: false,
+      compact_response_codecs: MapSet.new(),
       subscribed_events: MapSet.new(),
       flow_wake_subscriptions: MapSet.new()
     }

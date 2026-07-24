@@ -70,6 +70,7 @@ by the capability manifest:
 ```text
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'order-1' RETURN RECORD"
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD" partition tenant-a flow_id order-1
+FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD (run_id, state, attributes)" partition tenant-a flow_id order-1
 FLOW.QUERY FQL1 "EXPLAIN FROM runs WHERE partition_key = @partition AND run_id = @flow_id RETURN RECORD" partition tenant-a flow_id order-1
 FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND parent_flow_id = @parent ORDER BY updated_at_ms DESC LIMIT 50 RETURN RECORDS" partition tenant-a parent checkout-root
 ```
@@ -87,11 +88,16 @@ FLOW.QUERY FQL1 "FROM runs WHERE partition_key = @partition AND type = 'order' R
 ```
 
 All editions reject unadvertised shapes and predicate or ordering combinations
-that have no bounded plan. See [Flow Query Architecture](../docs/flow-query.md)
-for the exact capability contract and mandatory bounds.
+that have no bounded plan. See the [Flow Query Guide](../docs/flow-query.md) for
+the complete FQL1, EXPLAIN, result, index, and operational reference.
 
-The returned record is a structural query projection including attributes and
-state metadata. It excludes payload/result/error refs, named values, child
+Bare record returns use a structural allowlist including attributes and state
+metadata. Add up to 32 source-specific fields after `RETURN RECORD` or
+`RETURN RECORDS` to return a sparse map, for example
+`(run_id, state, attribute['customer'])`. Projection occurs after
+authorization, authoritative recheck, ordering, and cursor derivation, so it
+reduces encoding and transfer work without weakening correctness. The
+allowlist always excludes payload/result/error refs, named values, child
 bookkeeping, and worker lease/fencing credentials.
 
 Bound the total non-terminal lifetime of a Flow with a type policy or a

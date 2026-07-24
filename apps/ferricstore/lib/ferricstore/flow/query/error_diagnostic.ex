@@ -1,18 +1,22 @@
 defmodule Ferricstore.Flow.Query.ErrorDiagnostic do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.{Error, Field}
+  alias Ferricstore.Flow.Query.{Error, Field, Limits, RecordProjection}
 
   @syntax_detail "FQL1 could not parse the query near the reported position."
   @syntax_hint "Use FROM runs|events WHERE ..., optionally prefixed by EXPLAIN or EXPLAIN ANALYZE; collection reads require ORDER BY, LIMIT, and RETURN RECORDS."
   @field_detail "The field at the reported position is not available in FQL1."
-  @field_hint "Use a supported built-in field or one of the documented metadata field forms."
+  @field_hint "Use a supported predicate field or one of the source-specific result fields in context."
   @source_detail "The source at the reported position is not available in FQL1."
   @source_hint "Use FROM runs or FROM events."
   @shape_detail "The query parsed, but its clauses do not match a supported FQL1 request shape."
   @shape_hint "Point reads require run_id, plus partition_key for explicitly partitioned runs, and RETURN RECORD. Collection reads require a partition_key predicate, integer ORDER BY, LIMIT, and RETURN RECORDS; counts use RETURN COUNT without ordering or limits. Event history requires run_id, optional partition_key, ORDER BY event_id, LIMIT, and RETURN RECORDS."
   @cursor_detail "EXPLAIN and EXPLAIN ANALYZE plan a fresh query and do not accept a pagination cursor."
   @cursor_hint "Remove CURSOR, or execute the query without an EXPLAIN prefix to resume a page."
+  @duplicate_projection_detail "The return projection names the same result field more than once."
+  @duplicate_projection_hint "Remove the duplicate field; projection order does not change the returned map."
+  @projection_limit_detail "The return projection exceeds FQL1's bounded field limit."
+  @projection_limit_hint "Select fewer fields or use bare RETURN RECORD or RETURN RECORDS for the complete allowlisted record."
 
   @spec build(atom(), binary()) :: Error.t()
   def build(reason, query) when is_atom(reason) and is_binary(query), do: build_error(reason, nil)
@@ -43,7 +47,13 @@ defmodule Ferricstore.Flow.Query.ErrorDiagnostic do
           detail: @field_detail,
           hint: @field_hint <> " Valid fields: " <> Enum.join(supported_fields, ", ") <> ".",
           position: position,
-          context: %{"supported_fields" => supported_fields}
+          context: %{
+            "supported_fields" => supported_fields,
+            "supported_projection_fields" => %{
+              "events" => RecordProjection.supported_external_names(:events),
+              "runs" => RecordProjection.supported_external_names(:runs)
+            }
+          }
         )
 
       :unsupported_source ->
@@ -66,6 +76,21 @@ defmodule Ferricstore.Flow.Query.ErrorDiagnostic do
           detail: @cursor_detail,
           hint: @cursor_hint,
           position: position
+        )
+
+      :duplicate_projection_field ->
+        Error.new(reason,
+          detail: @duplicate_projection_detail,
+          hint: @duplicate_projection_hint,
+          position: position
+        )
+
+      :query_projection_limit_exceeded ->
+        Error.new(reason,
+          detail: @projection_limit_detail,
+          hint: @projection_limit_hint,
+          position: position,
+          context: %{"max_projection_fields" => Limits.max_return_fields()}
         )
 
       _other ->

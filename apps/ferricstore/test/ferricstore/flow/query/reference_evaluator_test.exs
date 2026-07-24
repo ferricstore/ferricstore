@@ -62,6 +62,35 @@ defmodule Ferricstore.Flow.Query.ReferenceEvaluatorTest do
     assert {:ok, [%{id: "run-1"}]} = ReferenceEvaluator.execute(@records, request)
   end
 
+  test "projects selected fields only after filtering, ordering, and limiting" do
+    request =
+      Request.collection(
+        :execute,
+        [
+          {:eq, :partition_key, literal("tenant-a")},
+          {:eq, :state, literal("failed")}
+        ],
+        [{:updated_at_ms, :desc}],
+        1,
+        :record
+      )
+
+    projected = %{
+      request
+      | projection: [:run_id, :state, {:attribute, "region"}]
+    }
+
+    assert {:ok, records} = ReferenceEvaluator.execute(@records, projected)
+
+    assert records == [
+             %{
+               id: "run-3",
+               state: "failed",
+               attributes: %{"region" => "eu"}
+             }
+           ]
+  end
+
   test "time windows include the lower bound and exclude the upper bound" do
     records = [
       %{id: "lower", partition_key: "tenant-a", updated_at_ms: 100},

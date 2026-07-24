@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.10.3 - 2026-07-24
+
+- Added bounded, source-specific FQL1 result fields after `RETURN RECORD` and `RETURN RECORDS`, including whole or leaf metadata maps, sparse binary result rows, canonical cursor binding, and `plan.projection` EXPLAIN output. Projection is applied after authoritative validation and reduces result memory/encoding/transfer work without weakening scan, hydration, ACL, or budget checks.
+- Added the explicitly negotiated `flow_query_result_v1` native response codec for `FLOW.QUERY` record pages and counts, using fixed metadata, row-presence bitmaps, and typed field values while retaining lossless typed-value fallback for EXPLAIN, errors, and unknown result shapes. Clients name supported compact codecs in `HELLO` or `STARTUP`, preventing broad compact-response opt-in from enabling unknown future tags.
+- Removed the full-record intermediate from explicit fixed-index projections after a benchmark showed about 4x higher projection throughput and 2.9x lower allocation, while retaining authoritative ordering, cursor, integrity, and memory-budget checks.
+- Added a byte-for-byte compact-result golden corpus for server and SDK conformance, made the native NIF ABI derive the release version from the umbrella project, and allowed clients to ignore well-formed unknown future response codecs without weakening duplicate-opcode validation.
+
 ## 0.10.2 - 2026-07-23
 
 - Made the native topology and event-subscription control commands individually grantable through ACLs and the connection category, enabling least-privilege topology-aware SDK sessions without broad command permissions.

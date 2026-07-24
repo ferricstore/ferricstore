@@ -58,6 +58,8 @@ defmodule FerricstoreServer.Native.Commands do
   @op_startup 0x000C
 
   @max_client_name_bytes 1_024
+  @max_compact_response_codecs 32
+  @max_response_codec_name_bytes 128
   @op_window_update 0x000D
   @op_pipeline 0x000E
   @op_route_batch 0x000F
@@ -829,10 +831,22 @@ defmodule FerricstoreServer.Native.Commands do
 
   defp do_execute(@op_hello, payload, state) do
     client_name = Map.get(payload, "client_name")
+    driver_name = Map.get(payload, "driver_name")
 
     with :ok <- validate_optional_client_name(client_name, "client"),
-         {:ok, state} <- negotiate_compression(state, Map.get(payload, "compression", "none")) do
-      state = maybe_set_client_name(state, client_name)
+         :ok <- validate_optional_client_name(driver_name, "driver"),
+         {:ok, state} <- negotiate_compression(state, Map.get(payload, "compression", "none")),
+         {:ok, state} <-
+           negotiate_compact_response_codecs(
+             state,
+             Map.get(payload, "compact_response_codecs")
+           ) do
+      state =
+        state
+        |> maybe_set_client_name(client_name)
+        |> maybe_set_client_name(driver_name)
+        |> maybe_set_compact_flow_responses(Map.get(payload, "compact_flow_responses"))
+
       {:ok, hello_payload(state), state}
     else
       {:error, reason} -> {:bad_request, reason, state}
@@ -848,7 +862,12 @@ defmodule FerricstoreServer.Native.Commands do
 
     with :ok <- validate_optional_client_name(client_name, "client"),
          :ok <- validate_optional_client_name(driver_name, "driver"),
-         {:ok, state} <- negotiate_compression(state, Map.get(payload, "compression", "none")) do
+         {:ok, state} <- negotiate_compression(state, Map.get(payload, "compression", "none")),
+         {:ok, state} <-
+           negotiate_compact_response_codecs(
+             state,
+             Map.get(payload, "compact_response_codecs")
+           ) do
       state =
         state
         |> maybe_set_client_name(client_name)
@@ -2958,6 +2977,52 @@ defmodule FerricstoreServer.Native.Commands do
   defp maybe_set_compact_flow_responses(state, _value),
     do: Map.put(state, :compact_flow_responses, false)
 
+  defp negotiate_compact_response_codecs(state, nil),
+    do: {:ok, Map.put(state, :compact_response_codecs, MapSet.new())}
+
+  defp negotiate_compact_response_codecs(state, codecs)
+       when is_list(codecs) and length(codecs) <= @max_compact_response_codecs do
+    supported = Codec.compact_response_opcodes() |> Map.keys() |> MapSet.new()
+
+    with :ok <- validate_compact_response_codec_names(codecs),
+         selected = MapSet.new(codecs),
+         true <- MapSet.size(selected) == length(codecs) || {:error, :duplicates},
+         unsupported = MapSet.difference(selected, supported),
+         true <- MapSet.size(unsupported) == 0 || {:error, {:unsupported, unsupported}} do
+      {:ok, Map.put(state, :compact_response_codecs, selected)}
+    else
+      {:error, :name} ->
+        {:error,
+         "ERR native compact_response_codecs must contain binaries of 1..#{@max_response_codec_name_bytes} bytes"}
+
+      {:error, :duplicates} ->
+        {:error, "ERR native compact_response_codecs must not contain duplicates"}
+
+      {:error, {:unsupported, unsupported}} ->
+        names = unsupported |> Enum.sort() |> Enum.join(", ")
+        {:error, "ERR native unsupported response codec: #{names}"}
+    end
+  end
+
+  defp negotiate_compact_response_codecs(_state, codecs) when is_list(codecs),
+    do:
+      {:error,
+       "ERR native compact_response_codecs accepts at most #{@max_compact_response_codecs} entries"}
+
+  defp negotiate_compact_response_codecs(_state, _codecs),
+    do: {:error, "ERR native compact_response_codecs must be a list"}
+
+  defp validate_compact_response_codec_names(codecs) do
+    if Enum.all?(codecs, fn codec ->
+         is_binary(codec) and codec != "" and
+           byte_size(codec) <= @max_response_codec_name_bytes and String.valid?(codec)
+       end) do
+      :ok
+    else
+      {:error, :name}
+    end
+  end
+
   defp negotiate_compression(state, compression) when compression in ["zlib", :zlib],
     do:
       if(Application.get_env(:ferricstore, :native_request_compression_enabled, false),
@@ -3063,6 +3128,10 @@ defmodule FerricstoreServer.Native.Commands do
       response_codecs: %{
         typed_value: true,
         compact_flow_responses: Map.get(state, :compact_flow_responses, false),
+        selected_compact:
+          state
+          |> Map.get(:compact_response_codecs, MapSet.new())
+          |> Enum.sort(),
         compact_response_opcodes: compact_response_opcodes,
         supported: ["typed_value" | compact_response_opcodes |> Map.keys() |> Enum.sort()]
       },

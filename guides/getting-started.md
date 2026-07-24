@@ -21,13 +21,13 @@ FerricFlow is available in both modes. It keeps workflow or job state and histor
 docker run -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore_data:/data \
-  ghcr.io/ferricstore/ferricstore:0.10.2
+  ghcr.io/ferricstore/ferricstore:0.10.3
 ```
 
 `FERRICSTORE_PROTECTED_MODE=false` is for local development only. Use ACL/TLS/protected-mode settings for real deployments.
 
 The official container image is `ghcr.io/ferricstore/ferricstore`. The current
-release tag is `0.10.2` and is published for `linux/amd64` and `linux/arm64`.
+release tag is `0.10.3` and is published for `linux/amd64` and `linux/arm64`.
 
 Smoke test with the Python SDK:
 
@@ -118,7 +118,7 @@ Add the dependency:
 # mix.exs
 def deps do
   [
-    {:ferricstore, "~> 0.10.2"}
+    {:ferricstore, "~> 0.10.3"}
   ]
 end
 ```
@@ -163,6 +163,7 @@ _build/prod/rel/ferricstore/bin/ferricstore start
 
 - [Key-Value Store](kv-store.md) -- how the durable KV/data-structure store works.
 - [Workflow usage examples](../docs/flow-vs-temporal-usage.md) -- queues, state machines, signals, retries, fanout, and value refs.
+- [Flow Query Guide](../docs/flow-query.md) -- FQL1 queries, EXPLAIN, indexes, pagination, operations, and troubleshooting.
 - [Commands Reference](commands.md) -- command syntax and native protocol mapping.
 - [Embedded Mode](embedded-mode.md) -- direct Elixir API.
 - [Configuration](configuration.md) -- production defaults and runtime configuration.

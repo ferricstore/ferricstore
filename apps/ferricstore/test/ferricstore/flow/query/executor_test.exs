@@ -100,6 +100,39 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     assert result.usage.range_pages == 2
   end
 
+  test "projects selected fields only after authoritative filtering and ordering" do
+    definition = state_definition()
+
+    request =
+      request([eq(:state, "failed"), eq(:type, "invoice")], 2)
+      |> Map.put(:projection, [:run_id, :state, {:attribute, "customer"}])
+
+    plan = plan!(request, definition)
+
+    records = [
+      record("run-1", 140) |> Map.put(:attributes, %{"customer" => "one", "secret" => "x"}),
+      record("run-2", 130) |> Map.put(:attributes, %{"customer" => nil}),
+      record("run-3", 120, "failed", "other")
+    ]
+
+    {range_read, record_read} = storage(definition, records)
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan,
+               range_read: range_read,
+               record_read: record_read,
+               now_ms: 1_000
+             )
+
+    assert result.records == [
+             %{id: "run-1", state: "failed", attributes: %{"customer" => "one"}},
+             %{id: "run-2", state: "failed", attributes: %{"customer" => nil}}
+           ]
+
+    assert result.usage.hydrated_records == 3
+    assert result.usage.residual_checks == 3
+  end
+
   test "shared execution hydrates only the sealed physical scope and evaluates logical records" do
     scope = shared_scope(11)
     definition = shared_state_definition()
@@ -419,7 +452,7 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     {range_read, record_read} = storage(definition, records)
 
     {execution, projection_calls} =
-      execute_with_call_trace({RecordProjection, :project_result, 1}, fn ->
+      execute_with_call_trace({RecordProjection, :project_validated, 3}, fn ->
         Executor.execute(context(), 0, request, plan,
           range_read: range_read,
           record_read: record_read,
@@ -1687,12 +1720,7 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
 
   defp with_cursor(request, token), do: %{request | cursor: {:literal, :keyword, token}}
 
-  defp query_digest(request) do
-    {request.version, request.source, request.predicate, request.order_by, request.limit,
-     request.return}
-    |> TermCodec.encode()
-    |> then(&:crypto.hash(:sha256, &1))
-  end
+  defp query_digest(request), do: Planner.query_digest(request)
 
   defp collect_pages(request, definition, range_read, record_read, ids, page)
        when page < 10 do

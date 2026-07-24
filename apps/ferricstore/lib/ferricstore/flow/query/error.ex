@@ -25,6 +25,8 @@ defmodule Ferricstore.Flow.Query.Error do
         }
 
   @errors %{
+    duplicate_projection_field:
+      {"duplicate_projection_field", "ERR FQL1 return projection contains a duplicate field"},
     invalid_parameters: {"invalid_parameters", "ERR FQL1 parameters must be an object"},
     invalid_parameter_type: {"invalid_parameter_type", "ERR FQL1 parameter has an invalid type"},
     invalid_syntax: {"invalid_syntax", "ERR FQL1 invalid syntax"},
@@ -45,6 +47,8 @@ defmodule Ferricstore.Flow.Query.Error do
       {"query_no_bounded_plan", "ERR Flow query has no bounded execution plan"},
     query_projection_changed:
       {"query_projection_changed", "ERR Flow visibility projection changed during the query"},
+    query_projection_limit_exceeded:
+      {"query_projection_limit_exceeded", "ERR FQL1 return projection exceeds the field limit"},
     query_range_budget_exceeded:
       {"query_range_budget_exceeded", "ERR Flow query range budget exceeded"},
     query_response_budget_exceeded:

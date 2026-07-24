@@ -7,7 +7,7 @@ defmodule Ferricstore.Flow.Query.Request do
   field identifiers throughout the pipeline.
   """
 
-  alias Ferricstore.Flow.Query.{Field, Limits, TupleCodec}
+  alias Ferricstore.Flow.Query.{Field, Limits, RecordProjection, TupleCodec}
 
   import Bitwise
 
@@ -29,6 +29,7 @@ defmodule Ferricstore.Flow.Query.Request do
             order_by: [],
             limit: nil,
             cursor: nil,
+            projection: :all,
             return: nil
 
   @type literal_type :: :keyword | :integer | :float | :boolean | :null | :missing
@@ -51,6 +52,7 @@ defmodule Ferricstore.Flow.Query.Request do
           order_by: [{Field.t(), :asc | :desc}],
           limit: pos_integer() | nil,
           cursor: nil | value(),
+          projection: RecordProjection.projection(),
           return: :record | :count
         }
 
@@ -241,12 +243,13 @@ defmodule Ferricstore.Flow.Query.Request do
            limit: limit,
            cursor: cursor,
            return: :record
-         },
+         } = request,
          phase
        )
        when mode in @modes and direction in [:asc, :desc] and is_list(predicates) and
               is_integer(limit) and limit > 0 and limit <= @max_results do
-    with :ok <- validate_mode_cursor(mode, cursor),
+    with :ok <- RecordProjection.validate(:events, request_projection(request)),
+         :ok <- validate_mode_cursor(mode, cursor),
          :ok <- validate_history_scope(predicates, phase),
          :ok <- validate_cursor(cursor, phase) do
       :ok
@@ -262,11 +265,14 @@ defmodule Ferricstore.Flow.Query.Request do
            limit: 1,
            cursor: nil,
            return: :record
-         },
+         } = request,
          phase
        )
        when mode in @modes do
-    validate_comparison_value(:run_id, run_id, phase)
+    with :ok <- RecordProjection.validate(:runs, request_projection(request)),
+         :ok <- validate_comparison_value(:run_id, run_id, phase) do
+      :ok
+    end
   end
 
   defp validate(
@@ -283,11 +289,12 @@ defmodule Ferricstore.Flow.Query.Request do
            limit: 1,
            cursor: nil,
            return: :record
-         },
+         } = request,
          phase
        )
        when mode in @modes do
-    with :ok <- validate_comparison_value(:partition_key, partition_key, phase),
+    with :ok <- RecordProjection.validate(:runs, request_projection(request)),
+         :ok <- validate_comparison_value(:partition_key, partition_key, phase),
          :ok <- validate_comparison_value(:run_id, run_id, phase) do
       :ok
     end
@@ -301,6 +308,7 @@ defmodule Ferricstore.Flow.Query.Request do
            order_by: [],
            limit: nil,
            cursor: nil,
+           projection: :all,
            return: :count
          },
          phase
@@ -338,14 +346,15 @@ defmodule Ferricstore.Flow.Query.Request do
            limit: limit,
            cursor: cursor,
            return: :record
-         },
+         } = request,
          phase
        )
        when mode in @modes and is_list(predicates) and predicates != [] and
               length(predicates) <= @max_predicates and is_list(order_by) and order_by != [] and
               length(order_by) <= @max_order_fields and is_integer(limit) and limit > 0 and
               limit <= @max_results do
-    with :ok <- validate_mode_cursor(mode, cursor),
+    with :ok <- RecordProjection.validate(:runs, request_projection(request)),
+         :ok <- validate_mode_cursor(mode, cursor),
          :ok <- validate_predicates(predicates, phase),
          :ok <- require_tenant_scope(predicates),
          :ok <- validate_order(order_by),
@@ -355,6 +364,8 @@ defmodule Ferricstore.Flow.Query.Request do
   end
 
   defp validate(%__MODULE__{}, _phase), do: {:error, :unsupported_query_shape}
+
+  defp request_projection(%__MODULE__{projection: projection}), do: projection
 
   defp lineage_kind(:parent_flow_id), do: :parent
   defp lineage_kind(:root_flow_id), do: :root

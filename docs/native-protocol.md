@@ -108,7 +108,10 @@ rejected if decompressed bytes exceed `max_frame_bytes`.
 8 unsigned u64
 ```
 
-Response body starts with a `u16` status code followed by one typed value.
+Response body normally starts with a `u16` status code followed by one typed
+value. A response with the `0x02` custom-payload flag instead carries the status
+followed by a codec-specific tag and payload advertised by
+`OPTIONS.response_codecs`.
 
 ```text
 0 ok
@@ -119,6 +122,96 @@ Response body starts with a `u16` status code followed by one typed value.
 5 reroute
 6 bad_request
 ```
+
+### Compact Flow query results
+
+Clients opt into this codec per connection by sending
+`compact_response_codecs: ["flow_query_result_v1"]` in `HELLO` or `STARTUP`.
+The explicit codec list prevents an existing client from receiving a future
+custom tag that its broad compact-Flow switch did not anticipate. Before doing
+so, verify that
+`OPTIONS.response_codecs.compact_response_opcodes.flow_query_result_v1`
+contains the opcode the client will use. It currently advertises `0x0100`
+(`COMMAND_EXEC`) and `0x0231` (`FLOW.QUERY`).
+
+A successful `ferric.flow.query.result/v1` response then sets the custom-payload
+flag and starts, after the `u16` status, with tag `0xA0`. All integers below are
+unsigned, fixed-width, and big-endian. The result contract version is implicit
+in the advertised `flow_query_result_v1` codec name and must be reconstructed by
+the decoder.
+
+```text
+u8    tag = 0xA0
+u8    kind: 0 record page, 1 count
+u8    exactness code
+u8    freshness code
+u8    coverage code
+u8    pagination code
+u64   range_seeks
+u64   range_pages
+u64   scanned_entries
+u64   scanned_bytes
+u64   hydrated_records
+u64   residual_checks
+u64   duplicate_entries
+u64   result_records
+u64   response_bytes
+u64   memory_high_water_bytes
+u64   wall_time_us
+...   kind-specific payload
+```
+
+Quality codes are fixed for this codec version:
+
+| Field | Codes |
+| --- | --- |
+| exactness | `0 authoritative`, `1 projected_exact`, `2 exact`, `3 not_applicable` |
+| freshness | `0 current`, `1 projection_watermark`, `2 not_applicable` |
+| coverage | `0 complete`, `1 unavailable` |
+| pagination | `0 none`, `1 complete`, `2 authenticated_seek`, `3 live_seek` |
+
+Kind `0` appends a page and a fixed-schema row stream:
+
+```text
+u8    has_more: 0 or 1
+u32   cursor length; 0xFFFFFFFF means nil
+bytes cursor, when present
+u32   record count
+repeat record count times:
+  u32 presence bitmap
+  typed values for every set bit, in ascending bit order
+```
+
+The bitmap distinguishes an absent field from a present field whose typed value
+is `nil`. Its v1 positions are:
+
+| Bit | Field | Bit | Field |
+| ---: | --- | ---: | --- |
+| 0 | `id` | 10 | `attempts` |
+| 1 | `type` | 11 | `run_state` |
+| 2 | `state` | 12 | `max_active_ms` |
+| 3 | `version` | 13 | `parent_flow_id` |
+| 4 | `priority` | 14 | `root_flow_id` |
+| 5 | `partition_key` | 15 | `correlation_id` |
+| 6 | `created_at_ms` | 16 | `attributes` |
+| 7 | `updated_at_ms` | 17 | `state_meta` |
+| 8 | `next_run_at_ms` | 18 | `event_id` |
+| 9 | `lease_deadline_ms` | 19 | `fields` |
+
+Run rows use bits 0-17. History rows use `event_id` and `fields`. Kind `1`
+appends exactly one `u64` count and has no page or record stream.
+
+For the compact form, `usage.response_bytes` is the byte count from the `0xA0`
+tag through the final payload byte, before compression. It excludes the status,
+frame header, and chunk headers. The fixed-width slot makes this value
+self-consistent without recursive re-encoding.
+
+Only successful query-result envelopes use this codec. `EXPLAIN`, errors,
+unknown result fields, and non-negotiated connections retain the ordinary typed
+value representation. SDKs must therefore branch on the custom-payload flag and
+tag, not only on the command opcode. Decoders must reject unknown kinds or enum
+codes, set bitmap bits above 19, truncated lengths or typed values, inconsistent
+page metadata, counts above negotiated limits, and trailing bytes.
 
 ## Control opcodes
 
@@ -215,10 +308,16 @@ client_name
 driver_name
 events
 compression: "none" | "zlib"
+compact_flow_responses: boolean
+compact_response_codecs: list of advertised codec names
 ```
 
 `compression: "zlib"` is an opt-in server feature. The default advertised and
-accepted compression is `"none"`.
+accepted compression is `"none"`. `compact_flow_responses` defaults to `false`
+and controls only the older broad compact-Flow surface. Named codecs require
+their exact name in `compact_response_codecs`; the server rejects malformed,
+duplicate, or unsupported requests. The accepted names are returned as
+`response_codecs.selected_compact`.
 
 ## KV opcodes
 
@@ -450,7 +549,7 @@ collection shapes listed by `OPTIONS`. A point read is:
 ```text
 [EXPLAIN [ANALYZE]] FROM runs
 WHERE [partition_key = <value> AND] run_id = <value>
-RETURN RECORD[;]
+RETURN RECORD [(<run-result-field> [, ...])][;]
 ```
 
 The predicates may appear in either order. Omitting `partition_key` addresses
@@ -459,6 +558,15 @@ explicitly partitioned records require the predicate. Collection queries always
 require one partition equality, one or two integer `ORDER BY` fields, a limit
 of at most 100, and `RETURN RECORDS`. OSS executes its advertised fixed and
 composite shapes and never falls back to an unbounded record scan.
+
+`RETURN RECORD` and `RETURN RECORDS` accept at most 32 distinct result fields.
+Run selectors include the allowlisted built-ins, `attributes`, `state_meta`,
+`attribute['name']`, and `state_meta['state']['name']`. Event selectors are
+`event_id`, `fields`, and `fields['name']`. Dotted metadata syntax is also
+accepted when every segment is an unquoted identifier. Missing selected fields
+are absent, while selected fields present with null remain present with null.
+Projection order is semantically irrelevant and `RETURN COUNT` accepts no
+projection.
 
 A value is either a typed literal or a named parameter such as `@flow_id`;
 doubled single quotes escape a quote inside a string literal. Query text is
@@ -478,13 +586,18 @@ timestamps, attempts/run state, maximum active time, parent/root/correlation
 identifiers, attributes, and state metadata. It excludes payload/result/error
 and named-value references, child bookkeeping, worker/lease/fencing tokens and
 owners, parent partition keys, retention controls, and unknown future fields.
+An explicit result projection is applied only after authorization,
+authoritative hydration, predicate recheck, ordering, and cursor derivation. It
+reduces result memory/encoding/network work but is not an index-only read and
+does not reduce scan or hydration counters.
 
 Prefixing the query with `EXPLAIN` returns `ferric.flow.explain/v1`. The plan is
 deterministic and redacts literal and bound parameter values. The capability
 manifest advertises `ferric.flow.query.request/v1`,
 `ferric.flow.query.result/v1`, `ferric.flow.explain/v1`,
 `ferric.flow.query.indexes/v1`, every executable shape, and
-`flow_explain_analyze_v1`. `EXPLAIN ANALYZE` performs a fresh bounded
+`flow_query_result_projection_v1` plus `flow_explain_analyze_v1`. `EXPLAIN` reports
+the requested fields in `plan.projection` with `index_only: false`. `EXPLAIN ANALYZE` performs a fresh bounded
 execution, rejects cursors, and returns actual resource usage without records
 or count values. Providers that do not advertise that capability reject the
 analyzed shape. Query failures use fixed, value-free error codes and

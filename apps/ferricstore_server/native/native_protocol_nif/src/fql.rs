@@ -4,6 +4,7 @@ pub const MAX_QUERY_BYTES: usize = 16 * 1024;
 pub const MAX_TOKENS: usize = 256;
 pub const MAX_PREDICATES: usize = 12;
 pub const MAX_IN_VALUES: usize = 20;
+pub const MAX_RETURN_FIELDS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -69,6 +70,17 @@ pub struct Order<'query> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct ProjectionField<'query> {
+    pub external_name: Cow<'query, [u8]>,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionSegment<'query> {
+    Plain(&'query [u8]),
+    Quoted(&'query [u8]),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct ParsedQuery<'query> {
     pub mode: Mode,
     pub source: Source,
@@ -77,13 +89,16 @@ pub struct ParsedQuery<'query> {
     pub order_by: Vec<Order<'query>>,
     pub limit: Option<usize>,
     pub cursor: Option<QueryValue<'query>>,
+    pub projection: Option<Vec<ProjectionField<'query>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
+    DuplicateProjectionField,
     InvalidParameterType,
     InvalidSyntax,
     QueryCursorInvalid,
+    QueryProjectionLimitExceeded,
     QueryTooLarge,
     UnsupportedField,
     UnsupportedQueryShape,
@@ -549,8 +564,13 @@ fn parse_tail<'query>(
     if matches!(word_at(tokens, 0), Some(word) if keyword(word, b"RETURN")) {
         if let Some(return_shape) = word_at(tokens, 1) {
             if source == Source::Runs && keyword(return_shape, b"RECORD") {
-                validate_terminator(&tokens[2..], query_len)?;
-                return canonical_point(mode, predicates, byte_at(tokens, 0, query_len));
+                let projection = parse_return_projection(source, &tokens[2..], query_len)?;
+                return canonical_point(
+                    mode,
+                    predicates,
+                    projection,
+                    byte_at(tokens, 0, query_len),
+                );
             }
             if source == Source::Runs && keyword(return_shape, b"COUNT") {
                 validate_terminator(&tokens[2..], query_len)?;
@@ -562,6 +582,7 @@ fn parse_tail<'query>(
                     order_by: Vec::new(),
                     limit: None,
                     cursor: None,
+                    projection: None,
                 });
             }
         }
@@ -580,6 +601,7 @@ fn parse_tail<'query>(
 fn canonical_point<'query>(
     mode: Mode,
     predicates: Vec<Predicate<'query>>,
+    projection: Option<Vec<ProjectionField<'query>>>,
     error_byte: usize,
 ) -> Result<ParsedQuery<'query>, ParseFailure> {
     if predicates.len() == 1 {
@@ -597,6 +619,7 @@ fn canonical_point<'query>(
                 order_by: Vec::new(),
                 limit: Some(1),
                 cursor: None,
+                projection,
             }),
             _ => Err(ParseFailure {
                 reason: ParseError::UnsupportedQueryShape,
@@ -645,6 +668,7 @@ fn canonical_point<'query>(
                 order_by: Vec::new(),
                 limit: Some(1),
                 cursor: None,
+                projection,
             })
         }
         _ => Err(ParseFailure {
@@ -789,7 +813,7 @@ fn parse_collection_tail<'query>(
             query_len,
         ));
     }
-    validate_terminator(&tokens[offset + 2..], query_len)?;
+    let projection = parse_return_projection(source, &tokens[offset + 2..], query_len)?;
 
     match source {
         Source::Runs => Ok(ParsedQuery {
@@ -800,6 +824,7 @@ fn parse_collection_tail<'query>(
             order_by,
             limit: Some(limit),
             cursor,
+            projection,
         }),
         Source::Events => canonical_history(
             mode,
@@ -807,6 +832,7 @@ fn parse_collection_tail<'query>(
             order_by,
             limit,
             cursor,
+            projection,
             byte_at(tokens, offset, query_len),
         ),
     }
@@ -818,6 +844,7 @@ fn canonical_history<'query>(
     order_by: Vec<Order<'query>>,
     limit: usize,
     cursor: Option<QueryValue<'query>>,
+    projection: Option<Vec<ProjectionField<'query>>>,
     error_byte: usize,
 ) -> Result<ParsedQuery<'query>, ParseFailure> {
     if order_by.len() != 1 || order_by[0].field.kind != FieldKind::EventId {
@@ -862,7 +889,299 @@ fn canonical_history<'query>(
         order_by,
         limit: Some(limit),
         cursor,
+        projection,
     })
+}
+
+fn parse_return_projection<'query>(
+    source: Source,
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<Option<Vec<ProjectionField<'query>>>, ParseFailure> {
+    if !matches!(
+        tokens.first().map(|token| &token.kind),
+        Some(TokenKind::LeftParen)
+    ) {
+        validate_terminator(tokens, query_len)?;
+        return Ok(None);
+    }
+
+    let mut projection = Vec::with_capacity(4);
+    let mut offset = 1usize;
+
+    if matches!(
+        tokens.get(offset).map(|token| &token.kind),
+        Some(TokenKind::RightParen)
+    ) {
+        return Err(failure(
+            ParseError::UnsupportedQueryShape,
+            tokens,
+            offset,
+            query_len,
+        ));
+    }
+
+    loop {
+        if projection.len() >= MAX_RETURN_FIELDS {
+            return Err(failure(
+                ParseError::QueryProjectionLimitExceeded,
+                tokens,
+                offset,
+                query_len,
+            ));
+        }
+
+        let (field, consumed) = parse_projection_field(source, &tokens[offset..], query_len)?;
+
+        if projection
+            .iter()
+            .any(|existing| same_projection_field(existing, &field))
+        {
+            return Err(failure(
+                ParseError::DuplicateProjectionField,
+                tokens,
+                offset,
+                query_len,
+            ));
+        }
+
+        projection.push(field);
+        offset += consumed;
+
+        match tokens.get(offset).map(|token| &token.kind) {
+            Some(TokenKind::Comma) => {
+                offset += 1;
+                if matches!(
+                    tokens.get(offset).map(|token| &token.kind),
+                    Some(TokenKind::RightParen)
+                ) {
+                    return Err(failure(
+                        ParseError::UnsupportedQueryShape,
+                        tokens,
+                        offset,
+                        query_len,
+                    ));
+                }
+            }
+            Some(TokenKind::RightParen) => {
+                offset += 1;
+                validate_terminator(&tokens[offset..], query_len)?;
+                return Ok(Some(projection));
+            }
+            _ => {
+                return Err(failure(
+                    ParseError::UnsupportedQueryShape,
+                    tokens,
+                    offset,
+                    query_len,
+                ));
+            }
+        }
+    }
+}
+
+fn parse_projection_field<'query>(
+    source: Source,
+    tokens: &[Token<'query>],
+    query_len: usize,
+) -> Result<(ProjectionField<'query>, usize), ParseFailure> {
+    if source == Source::Runs {
+        if let Some(field_name) = word_at(tokens, 0) {
+            if keyword(field_name, b"ATTRIBUTES") {
+                return Ok((
+                    ProjectionField {
+                        external_name: Cow::Borrowed(&b"attributes"[..]),
+                    },
+                    1,
+                ));
+            }
+
+            if keyword(field_name, b"STATE_META")
+                && !matches!(
+                    tokens.get(1).map(|token| &token.kind),
+                    Some(TokenKind::LeftBracket)
+                )
+            {
+                return Ok((
+                    ProjectionField {
+                        external_name: Cow::Borrowed(&b"state_meta"[..]),
+                    },
+                    1,
+                ));
+            }
+        }
+
+        let (field, consumed) = parse_field_tokens(tokens, query_len)?;
+        if field.kind == FieldKind::EventId {
+            return Err(failure(ParseError::UnsupportedField, tokens, 0, query_len));
+        }
+
+        return Ok((
+            ProjectionField {
+                external_name: field.external_name,
+            },
+            consumed,
+        ));
+    }
+
+    let field_name = word_at(tokens, 0)
+        .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, 0, query_len))?;
+
+    if keyword(field_name, b"FIELDS")
+        && matches!(
+            tokens.get(1).map(|token| &token.kind),
+            Some(TokenKind::LeftBracket)
+        )
+    {
+        let name = string_at(tokens, 2)
+            .ok_or_else(|| failure(ParseError::UnsupportedQueryShape, tokens, 2, query_len))?;
+        expect_kind(tokens, 3, &TokenKind::RightBracket, query_len)?;
+        if !valid_metadata_key(name) {
+            return Err(failure(ParseError::UnsupportedField, tokens, 2, query_len));
+        }
+
+        return Ok((
+            ProjectionField {
+                external_name: Cow::Owned(bracket_field(b"fields", &[name])),
+            },
+            4,
+        ));
+    }
+
+    let external_name = if keyword(field_name, b"EVENT_ID") {
+        Cow::Borrowed(&b"event_id"[..])
+    } else if keyword(field_name, b"FIELDS") {
+        Cow::Borrowed(&b"fields"[..])
+    } else {
+        return Err(failure(ParseError::UnsupportedField, tokens, 0, query_len));
+    };
+
+    Ok((ProjectionField { external_name }, 1))
+}
+
+fn same_projection_field(left: &ProjectionField<'_>, right: &ProjectionField<'_>) -> bool {
+    let left = left.external_name.as_ref();
+    let right = right.external_name.as_ref();
+    let left_separator = left.iter().position(|byte| matches!(byte, b'.' | b'['));
+    let right_separator = right.iter().position(|byte| matches!(byte, b'.' | b'['));
+
+    match (left_separator, right_separator) {
+        (None, None) => left.eq_ignore_ascii_case(right),
+        (Some(left_at), Some(right_at)) => {
+            if !left[..left_at].eq_ignore_ascii_case(&right[..right_at]) {
+                return false;
+            }
+
+            match (
+                projection_segments(left, left_at),
+                projection_segments(right, right_at),
+            ) {
+                (Some((left_first, left_second)), Some((right_first, right_second))) => {
+                    same_projection_segment(left_first, right_first)
+                        && match (left_second, right_second) {
+                            (None, None) => true,
+                            (Some(left), Some(right)) => same_projection_segment(left, right),
+                            _ => false,
+                        }
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn projection_segments(
+    field: &[u8],
+    separator: usize,
+) -> Option<(ProjectionSegment<'_>, Option<ProjectionSegment<'_>>)> {
+    match field.get(separator) {
+        Some(b'.') => {
+            let mut parts = field.get(separator + 1..)?.split(|byte| *byte == b'.');
+            let first = parts.next()?;
+            let second = parts.next();
+
+            if first.is_empty()
+                || second.is_some_and(|segment| segment.is_empty())
+                || parts.next().is_some()
+            {
+                return None;
+            }
+
+            Some((
+                ProjectionSegment::Plain(first),
+                second.map(ProjectionSegment::Plain),
+            ))
+        }
+        Some(b'[') => {
+            let (first, offset) = quoted_projection_segment(field, separator)?;
+
+            if offset == field.len() {
+                Some((first, None))
+            } else {
+                let (second, offset) = quoted_projection_segment(field, offset)?;
+                (offset == field.len()).then_some((first, Some(second)))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn quoted_projection_segment(
+    field: &[u8],
+    offset: usize,
+) -> Option<(ProjectionSegment<'_>, usize)> {
+    if field.get(offset..offset + 2)? != b"['" {
+        return None;
+    }
+
+    let start = offset + 2;
+    let mut cursor = start;
+
+    while cursor < field.len() {
+        if field[cursor] != b'\'' {
+            cursor += 1;
+        } else if field.get(cursor + 1) == Some(&b'\'') {
+            cursor += 2;
+        } else if field.get(cursor + 1) == Some(&b']') {
+            return Some((ProjectionSegment::Quoted(&field[start..cursor]), cursor + 2));
+        } else {
+            return None;
+        }
+    }
+
+    None
+}
+
+fn same_projection_segment(left: ProjectionSegment<'_>, right: ProjectionSegment<'_>) -> bool {
+    match (left, right) {
+        (ProjectionSegment::Plain(left), ProjectionSegment::Plain(right))
+        | (ProjectionSegment::Quoted(left), ProjectionSegment::Quoted(right)) => left == right,
+        (ProjectionSegment::Plain(plain), ProjectionSegment::Quoted(quoted))
+        | (ProjectionSegment::Quoted(quoted), ProjectionSegment::Plain(plain)) => {
+            quoted_projection_segment_equals_plain(quoted, plain)
+        }
+    }
+}
+
+fn quoted_projection_segment_equals_plain(quoted: &[u8], plain: &[u8]) -> bool {
+    let mut quoted_at = 0usize;
+    let mut plain_at = 0usize;
+
+    while quoted_at < quoted.len() && plain_at < plain.len() {
+        if quoted[quoted_at] == b'\'' && quoted.get(quoted_at + 1) == Some(&b'\'') {
+            quoted_at += 1;
+        }
+
+        if quoted[quoted_at] != plain[plain_at] {
+            return false;
+        }
+
+        quoted_at += 1;
+        plain_at += 1;
+    }
+
+    quoted_at == quoted.len() && plain_at == plain.len()
 }
 
 fn parse_limit(raw: &[u8]) -> Result<usize, ParseError> {
@@ -1400,6 +1719,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_bounded_source_specific_return_projections() {
+        let runs = parse(
+            b"FROM runs WHERE run_id = @run_id RETURN RECORD (run_id, state, attributes, state_meta, attribute['customer'])",
+        )
+        .expect("run projection parses");
+
+        let run_fields = runs
+            .projection
+            .expect("projection exists")
+            .into_iter()
+            .map(|field| field.external_name.into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            run_fields,
+            vec![
+                b"run_id".to_vec(),
+                b"state".to_vec(),
+                b"attributes".to_vec(),
+                b"state_meta".to_vec(),
+                b"attribute['customer']".to_vec()
+            ]
+        );
+
+        let events = parse(
+            b"FROM events WHERE run_id = @run_id ORDER BY event_id ASC LIMIT 10 RETURN RECORDS (event_id, fields['event'])",
+        )
+        .expect("event projection parses");
+
+        let event_fields = events
+            .projection
+            .expect("projection exists")
+            .into_iter()
+            .map(|field| field.external_name.into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            event_fields,
+            vec![b"event_id".to_vec(), b"fields['event']".to_vec()]
+        );
+
+        assert_eq!(
+            parse(b"FROM runs WHERE run_id = 'run-1' RETURN RECORD (event_id)"),
+            Err(ParseError::UnsupportedField)
+        );
+        assert_eq!(
+            parse(b"FROM events WHERE run_id = 'run-1' ORDER BY event_id ASC LIMIT 1 RETURN RECORDS (state)"),
+            Err(ParseError::UnsupportedField)
+        );
+        assert_eq!(
+            parse(b"FROM runs WHERE run_id = 'run-1' RETURN RECORD (state, STATE)"),
+            Err(ParseError::DuplicateProjectionField)
+        );
+        assert_eq!(
+            parse(
+                b"FROM runs WHERE run_id = 'run-1' RETURN RECORD (attribute.customer, attribute['customer'])"
+            ),
+            Err(ParseError::DuplicateProjectionField)
+        );
+        assert_eq!(
+            parse(
+                b"FROM runs WHERE run_id = 'run-1' RETURN RECORD (state_meta.review.owner, state_meta['review']['owner'])"
+            ),
+            Err(ParseError::DuplicateProjectionField)
+        );
+    }
+
+    #[test]
     fn parses_scalar_counts_without_row_pagination() {
         let parsed = parse(
             b"EXPLAIN FROM runs WHERE partition_key = @partition AND type = 'payment' AND state = 'failed' RETURN COUNT;",
@@ -1516,6 +1903,24 @@ mod tests {
     }
 
     #[test]
+    fn enforces_return_projection_budget_at_the_first_excess_field() {
+        let exact = projection_query(MAX_RETURN_FIELDS);
+        assert!(parse(&exact).is_ok());
+
+        let over = projection_query(MAX_RETURN_FIELDS + 1);
+        let excess = format!("attribute['field-{}']", MAX_RETURN_FIELDS);
+        let excess_byte = find_byte(&over, excess.as_bytes());
+
+        assert_eq!(
+            parse_with_diagnostic(&over),
+            Err(ParseFailure {
+                reason: ParseError::QueryProjectionLimitExceeded,
+                byte: excess_byte,
+            })
+        );
+    }
+
+    #[test]
     fn diagnostics_report_the_actual_failure_token() {
         let missing_tail =
             b"FROM runs WHERE partition_key = 'p' AND attribute['customer.region'] = 'eu'";
@@ -1563,6 +1968,18 @@ mod tests {
             .join(",");
         format!(
             "FROM runs WHERE partition_key = @partition AND state IN ({values}) ORDER BY updated_at_ms DESC LIMIT 25 RETURN RECORDS"
+        )
+        .into_bytes()
+    }
+
+    fn projection_query(cardinality: usize) -> Vec<u8> {
+        let fields = (0..cardinality)
+            .map(|index| format!("attribute['field-{index}']"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "FROM runs WHERE partition_key = @partition ORDER BY updated_at_ms DESC LIMIT 25 RETURN RECORDS ({fields})"
         )
         .into_bytes()
     }

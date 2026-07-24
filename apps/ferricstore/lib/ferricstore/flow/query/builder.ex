@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.Builder do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.Field
+  alias Ferricstore.Flow.Query.{Field, RecordProjection}
 
   @maximum_exact_integer 9_007_199_254_740_991
   @minimum_i64 -9_223_372_036_854_775_808
@@ -27,6 +27,8 @@ defmodule Ferricstore.Flow.Query.Builder do
           {:ok, %{query: binary(), params: map()}}
           | {:error,
              :invalid_query_filter
+             | :duplicate_projection_field
+             | :query_projection_limit_exceeded
              | :query_filter_required
              | :query_limit_exceeded
              | :query_partition_required
@@ -40,7 +42,8 @@ defmodule Ferricstore.Flow.Query.Builder do
          {:ok, direction} <- direction(filters),
          {:ok, predicates, params, order_field} <- predicates(kind, filters),
          {:ok, predicates, params} <- time_predicate(predicates, params, filters, order_field),
-         {:ok, cursor, params} <- cursor(filters, params) do
+         {:ok, cursor, params} <- cursor(filters, params),
+         {:ok, return_clause} <- return_clause(filters) do
       predicates = ["partition_key = @partition_key" | predicates]
       params = Map.put(params, "partition_key", partition_key)
 
@@ -55,7 +58,7 @@ defmodule Ferricstore.Flow.Query.Builder do
           " LIMIT ",
           Integer.to_string(limit),
           cursor,
-          " RETURN RECORDS"
+          return_clause
         ])
 
       {:ok, %{query: query, params: params}}
@@ -308,6 +311,25 @@ defmodule Ferricstore.Flow.Query.Builder do
 
       _invalid ->
         {:error, :invalid_query_filter}
+    end
+  end
+
+  defp return_clause(filters) do
+    projection = Map.get(filters, :projection, :all)
+
+    with :ok <- RecordProjection.validate(:runs, projection) do
+      case RecordProjection.external_names(projection) do
+        :all ->
+          {:ok, " RETURN RECORDS"}
+
+        fields ->
+          {:ok,
+           IO.iodata_to_binary([
+             " RETURN RECORDS (",
+             Enum.intersperse(fields, ", "),
+             ")"
+           ])}
+      end
     end
   end
 

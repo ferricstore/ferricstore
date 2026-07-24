@@ -212,6 +212,49 @@ defmodule Ferricstore.Flow.Query.RequestTest do
     assert {:error, :invalid_parameter_type} = Request.validate_bound(identity)
   end
 
+  test "record projections are source-specific, unique, and bounded" do
+    run =
+      Request.point_read(:execute, keyword("tenant-a"), keyword("run-1"))
+      |> Map.put(:projection, [
+        :run_id,
+        :state,
+        :attributes,
+        :state_meta,
+        {:attribute, "customer"},
+        {:state_meta, "review", "owner"}
+      ])
+
+    assert :ok = Request.validate_bound(run)
+    assert {:error, :unsupported_field} = Request.validate_bound(%{run | projection: [:event_id]})
+
+    assert {:error, :duplicate_projection_field} =
+             Request.validate_bound(%{run | projection: [:state, :state]})
+
+    assert {:error, :unsupported_query_shape} =
+             Request.validate_bound(%{run | projection: []})
+
+    too_many =
+      for index <- 1..(Ferricstore.Flow.Query.Limits.max_return_fields() + 1),
+          do: {:attribute, "field-#{index}"}
+
+    assert {:error, :query_projection_limit_exceeded} =
+             Request.validate_bound(%{run | projection: too_many})
+
+    history =
+      Request.history(:execute, [eq(:run_id, "run-1")], :asc, 10)
+      |> Map.put(:projection, [:event_id, {:event_field, "event"}])
+
+    assert :ok = Request.validate_bound(history)
+
+    assert {:error, :unsupported_field} =
+             Request.validate_bound(%{history | projection: [:state]})
+
+    count = Request.count(:execute, [eq(:partition_key, "tenant-a")])
+
+    assert {:error, :unsupported_query_shape} =
+             Request.validate_bound(%{count | projection: [:state]})
+  end
+
   defp eq(field, value), do: {:eq, field, keyword(value)}
   defp keyword(value), do: {:literal, :keyword, value}
 end

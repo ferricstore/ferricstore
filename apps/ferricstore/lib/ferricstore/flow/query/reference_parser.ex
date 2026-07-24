@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
 
   @max_query_bytes Limits.max_query_bytes()
   @max_tokens Limits.max_query_tokens()
+  @max_return_fields Limits.max_return_fields()
 
   @type parse_error ::
           :invalid_syntax
@@ -265,10 +266,12 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
           |> Request.count(predicates)
           |> validate_request()
 
-        source == :runs and keyword?(shape, "RECORD") and valid_terminator?(tail) ->
-          with {:ok, point} <- canonical_point_predicates(predicates) do
+        source == :runs and keyword?(shape, "RECORD") ->
+          with {:ok, projection} <- parse_return_projection(:runs, tail),
+               {:ok, point} <- canonical_point_predicates(predicates) do
             point
             |> point_request(mode)
+            |> Map.put(:projection, projection)
             |> validate_request()
           end
 
@@ -292,20 +295,34 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
     with {:ok, order_by, tokens} <- parse_order(tokens),
          {:ok, limit, tokens} <- parse_limit(tokens),
          {:ok, cursor, tokens} <- parse_cursor(tokens),
-         :ok <- parse_records_return(tokens) do
+         {:ok, projection} <- parse_records_return(source, tokens) do
       source
-      |> collection_request(mode, predicates, order_by, limit, cursor)
+      |> collection_request(mode, predicates, order_by, limit, cursor, projection)
       |> validate_request()
     end
   end
 
-  defp collection_request(:runs, mode, predicates, order_by, limit, cursor),
-    do: Request.collection(mode, predicates, order_by, limit, :record, cursor)
+  defp collection_request(:runs, mode, predicates, order_by, limit, cursor, projection) do
+    mode
+    |> Request.collection(predicates, order_by, limit, :record, cursor)
+    |> Map.put(:projection, projection)
+  end
 
-  defp collection_request(:events, mode, predicates, [{:event_id, direction}], limit, cursor),
-    do: Request.history(mode, predicates, direction, limit, cursor)
+  defp collection_request(
+         :events,
+         mode,
+         predicates,
+         [{:event_id, direction}],
+         limit,
+         cursor,
+         projection
+       ) do
+    mode
+    |> Request.history(predicates, direction, limit, cursor)
+    |> Map.put(:projection, projection)
+  end
 
-  defp collection_request(_source, mode, predicates, order_by, limit, cursor),
+  defp collection_request(_source, mode, predicates, order_by, limit, cursor, projection),
     do: %Request{
       mode: mode,
       source: :events,
@@ -313,6 +330,7 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
       order_by: order_by,
       limit: limit,
       cursor: cursor,
+      projection: projection,
       return: :record
     }
 
@@ -380,14 +398,87 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
 
   defp parse_cursor(tokens), do: {:ok, nil, tokens}
 
-  defp parse_records_return([{:word, return_keyword}, {:word, shape} | tail]) do
-    if keyword?(return_keyword, "RETURN") and keyword?(shape, "RECORDS") and
-         valid_terminator?(tail),
-       do: :ok,
-       else: {:error, :unsupported_query_shape}
+  defp parse_records_return(source, [{:word, return_keyword}, {:word, shape} | tail]) do
+    if keyword?(return_keyword, "RETURN") and keyword?(shape, "RECORDS") do
+      parse_return_projection(source, tail)
+    else
+      {:error, :unsupported_query_shape}
+    end
   end
 
-  defp parse_records_return(_tokens), do: {:error, :unsupported_query_shape}
+  defp parse_records_return(_source, _tokens), do: {:error, :unsupported_query_shape}
+
+  defp parse_return_projection(_source, tokens) when tokens in [[], [:semicolon]], do: {:ok, :all}
+
+  defp parse_return_projection(source, [:left_paren | tokens]),
+    do: parse_projection_fields(source, tokens, [])
+
+  defp parse_return_projection(_source, _tokens), do: {:error, :unsupported_query_shape}
+
+  defp parse_projection_fields(_source, [:right_paren | _tokens], []),
+    do: {:error, :unsupported_query_shape}
+
+  defp parse_projection_fields(_source, _tokens, acc) when length(acc) >= @max_return_fields,
+    do: {:error, :query_projection_limit_exceeded}
+
+  defp parse_projection_fields(source, tokens, acc) do
+    with {:ok, field, rest} <- parse_projection_field(source, tokens) do
+      fields = [field | acc]
+
+      case rest do
+        [:comma, :right_paren | _tail] ->
+          {:error, :unsupported_query_shape}
+
+        [:comma | tail] ->
+          parse_projection_fields(source, tail, fields)
+
+        [:right_paren | tail] ->
+          if valid_terminator?(tail),
+            do: {:ok, Enum.reverse(fields)},
+            else: {:error, :unsupported_query_shape}
+
+        _invalid ->
+          {:error, :unsupported_query_shape}
+      end
+    end
+  end
+
+  defp parse_projection_field(:runs, [{:word, field} | rest] = tokens) do
+    cond do
+      keyword?(field, "ATTRIBUTES") ->
+        {:ok, :attributes, rest}
+
+      keyword?(field, "STATE_META") and not match?([:left_bracket | _tail], rest) ->
+        {:ok, :state_meta, rest}
+
+      true ->
+        parse_field_tokens(tokens)
+    end
+  end
+
+  defp parse_projection_field(:runs, tokens), do: parse_field_tokens(tokens)
+
+  defp parse_projection_field(:events, [
+         {:word, prefix},
+         :left_bracket,
+         {:string, name},
+         :right_bracket
+         | rest
+       ]) do
+    if keyword?(prefix, "FIELDS") and Field.valid_dynamic_name?(name),
+      do: {:ok, {:event_field, name}, rest},
+      else: {:error, :unsupported_field}
+  end
+
+  defp parse_projection_field(:events, [{:word, field} | rest]) do
+    cond do
+      keyword?(field, "FIELDS") -> {:ok, :fields, rest}
+      keyword?(field, "EVENT_ID") -> {:ok, :event_id, rest}
+      true -> {:error, :unsupported_field}
+    end
+  end
+
+  defp parse_projection_field(_source, _tokens), do: {:error, :unsupported_query_shape}
 
   defp canonical_point_predicates([
          {:eq, :partition_key, partition_key},
@@ -429,7 +520,14 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
     do: token_after_keyword_byte(tokens, "FROM") || query_end_byte(query)
 
   defp diagnostic_token_byte(tokens, query, :unsupported_field),
-    do: unsupported_field_byte(tokens) || query_end_byte(query)
+    do:
+      unsupported_field_byte(tokens) ||
+        projection_error_byte(tokens, :unsupported_field) ||
+        query_end_byte(query)
+
+  defp diagnostic_token_byte(tokens, query, reason)
+       when reason in [:duplicate_projection_field, :query_projection_limit_exceeded],
+       do: projection_error_byte(tokens, reason) || query_end_byte(query)
 
   defp diagnostic_token_byte(tokens, query, :query_cursor_invalid),
     do: keyword_token_byte(tokens, "CURSOR") || query_end_byte(query)
@@ -494,6 +592,64 @@ defmodule Ferricstore.Flow.Query.ReferenceParser do
         nil
     end
   end
+
+  defp projection_error_byte(tokens, reason) do
+    with {:ok, source_tokens} <- tokens_after_keyword(tokens, "FROM"),
+         [{{:word, source_name}, _source_byte} | _rest] <- source_tokens,
+         {:ok, source} <- parse_source(source_name),
+         {:ok, return_tokens} <- tokens_after_keyword(tokens, "RETURN"),
+         [{{:word, shape}, _shape_byte}, {:left_paren, _paren_byte} | fields] <- return_tokens,
+         true <- keyword?(shape, "RECORD") or keyword?(shape, "RECORDS") do
+      do_projection_error_byte(source, fields, reason, MapSet.new(), 0)
+    else
+      _invalid -> nil
+    end
+  end
+
+  defp do_projection_error_byte(
+         _source,
+         [{_token, byte} | _rest],
+         :query_projection_limit_exceeded,
+         _seen,
+         count
+       )
+       when count >= @max_return_fields,
+       do: byte
+
+  defp do_projection_error_byte(source, [{_token, byte} | _rest] = tokens, reason, seen, count) do
+    raw_tokens = Enum.map(tokens, &elem(&1, 0))
+
+    case parse_projection_field(source, raw_tokens) do
+      {:error, :unsupported_field} when reason == :unsupported_field ->
+        byte
+
+      {:ok, field, remaining_raw_tokens} ->
+        if reason == :duplicate_projection_field and MapSet.member?(seen, field) do
+          byte
+        else
+          consumed = length(raw_tokens) - length(remaining_raw_tokens)
+
+          case Enum.drop(tokens, consumed) do
+            [{:comma, _comma_byte} | rest] ->
+              do_projection_error_byte(
+                source,
+                rest,
+                reason,
+                MapSet.put(seen, field),
+                count + 1
+              )
+
+            _end ->
+              nil
+          end
+        end
+
+      _invalid ->
+        nil
+    end
+  end
+
+  defp do_projection_error_byte(_source, _tokens, _reason, _seen, _count), do: nil
 
   defp tokens_after_keyword([{{:word, word}, _byte} | rest], keyword) do
     if keyword?(word, keyword), do: {:ok, rest}, else: tokens_after_keyword(rest, keyword)

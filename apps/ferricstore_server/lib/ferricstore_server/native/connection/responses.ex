@@ -23,6 +23,7 @@ defmodule FerricstoreServer.Native.Connection.Responses do
     Codec.encode_command_response_frames(opcode, lane_id, request_id, status, value,
       compression: state.compression,
       compact_flow_responses: state.compact_flow_responses,
+      compact_response_codecs: state.compact_response_codecs,
       chunk_bytes: response_chunk_bytes(state),
       max_response_bytes: Map.get(state, :max_response_bytes)
     )

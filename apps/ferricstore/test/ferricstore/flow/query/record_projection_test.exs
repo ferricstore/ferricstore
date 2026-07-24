@@ -60,4 +60,71 @@ defmodule Ferricstore.Flow.Query.RecordProjectionTest do
     assert {:ok, nil} = RecordProjection.project_result({:ok, nil})
     assert {:error, :unavailable} = RecordProjection.project_result({:error, :unavailable})
   end
+
+  test "projects only requested run fields while preserving nested metadata shape" do
+    record = %{
+      id: "run-1",
+      state: "ready",
+      lease_token: "must-not-leak",
+      attributes: %{"customer" => nil, "region" => "eu"},
+      state_meta: %{"review" => %{"owner" => "worker-a", "secret" => "hidden"}}
+    }
+
+    projection = [
+      :run_id,
+      :state,
+      {:attribute, "customer"},
+      {:attribute, "missing"},
+      {:state_meta, "review", "owner"}
+    ]
+
+    assert {:ok,
+            %{
+              id: "run-1",
+              state: "ready",
+              attributes: %{"customer" => nil},
+              state_meta: %{"review" => %{"owner" => "worker-a"}}
+            }} = RecordProjection.project_result({:ok, record}, :runs, projection)
+  end
+
+  test "projects complete run metadata maps when explicitly requested" do
+    record = %{
+      id: "run-1",
+      attributes: %{"customer" => "acme"},
+      state_meta: %{"review" => %{"owner" => "worker-a"}},
+      lease_token: "hidden"
+    }
+
+    assert {:ok,
+            %{
+              attributes: %{"customer" => "acme"},
+              state_meta: %{"review" => %{"owner" => "worker-a"}}
+            }} =
+             RecordProjection.project_result(
+               {:ok, record},
+               :runs,
+               [:attributes, :state_meta]
+             )
+  end
+
+  test "projects bounded history fields without flattening the response contract" do
+    event = %{
+      event_id: "1000-1",
+      fields: %{"event" => "claimed", "worker" => nil, "lease_token" => "hidden"}
+    }
+
+    assert {:ok, %{event_id: "1000-1", fields: %{"event" => "claimed", "worker" => nil}}} =
+             RecordProjection.project_result(
+               {:ok, event},
+               :events,
+               [:event_id, {:event_field, "event"}, {:event_field, "worker"}]
+             )
+
+    assert {:ok, %{}} =
+             RecordProjection.project_result(
+               {:ok, event},
+               :events,
+               [{:event_field, "missing"}]
+             )
+  end
 end

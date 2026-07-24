@@ -77,19 +77,31 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
          {:ok, boundary} <- continuation(cursor_auth, plan, descriptor),
          fetch_request <- %{request | limit: request.limit + 1},
          {:ok, records} <- read(ctx, fetch_request, descriptor, boundary),
-         {:ok, projected} <- project(records),
-         :ok <- validate_candidates(projected, request, descriptor, boundary, plan),
-         page <- Enum.take(projected, request.limit),
-         has_more <- length(projected) > request.limit,
-         {:ok, cursor} <-
-           issue_cursor(ctx, request, plan, descriptor, page, has_more, cursor_auth, opts) do
+         {:ok, output} <-
+           prepare_output(
+             ctx,
+             records,
+             request,
+             plan,
+             descriptor,
+             boundary,
+             cursor_auth,
+             opts
+           ) do
       {:ok,
        %ExecutionResult{
-         records: page,
-         has_more: has_more,
-         continuation: cursor,
-         usage: usage(projected, page, plan, request),
-         quality: quality(has_more)
+         records: output.records,
+         has_more: output.has_more,
+         continuation: output.cursor,
+         usage:
+           usage(
+             output.fetched_count,
+             output.records,
+             plan,
+             request,
+             output.memory_high_water_bytes
+           ),
+         quality: quality(output.has_more)
        }}
     end
   rescue
@@ -327,6 +339,78 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
   @doc false
   def normalize_read_result_for_test(result), do: normalize_read_result(result)
 
+  defp prepare_output(
+         ctx,
+         records,
+         %Request{projection: :all} = request,
+         plan,
+         descriptor,
+         boundary,
+         cursor_auth,
+         opts
+       ) do
+    with {:ok, projected} <- project(records),
+         :ok <- validate_candidates(projected, request, descriptor, boundary, plan),
+         page <- Enum.take(projected, request.limit),
+         has_more <- length(projected) > request.limit,
+         {:ok, cursor} <-
+           issue_cursor(ctx, request, plan, descriptor, page, has_more, cursor_auth, opts),
+         {:ok, output, memory_high_water_bytes} <- project_output(projected, page, plan) do
+      {:ok,
+       %{
+         records: output,
+         has_more: has_more,
+         cursor: cursor,
+         fetched_count: length(projected),
+         memory_high_water_bytes: memory_high_water_bytes
+       }}
+    end
+  end
+
+  defp prepare_output(
+         ctx,
+         records,
+         %Request{projection: projection} = request,
+         plan,
+         descriptor,
+         boundary,
+         cursor_auth,
+         opts
+       )
+       when is_list(projection) do
+    with {:ok, keys} <- record_keys(records, descriptor),
+         :ok <- validate_candidate_keys(keys, request, boundary, descriptor.direction),
+         page_records <- Enum.take(records, request.limit),
+         page_keys <- Enum.take(keys, request.limit),
+         {:ok, output} <- RecordProjection.project_records(page_records, :runs, projection),
+         memory_high_water_bytes <- MemoryBudget.term_bytes({records, keys, output}),
+         true <- memory_high_water_bytes <= plan.budget.executor_memory_bytes,
+         has_more <- length(keys) > request.limit,
+         {:ok, cursor} <-
+           issue_cursor_key(
+             ctx,
+             request,
+             plan,
+             descriptor,
+             List.last(page_keys),
+             has_more,
+             cursor_auth,
+             opts
+           ) do
+      {:ok,
+       %{
+         records: output,
+         has_more: has_more,
+         cursor: cursor,
+         fetched_count: length(keys),
+         memory_high_water_bytes: memory_high_water_bytes
+       }}
+    else
+      false -> {:error, :query_memory_budget_exceeded}
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp project(records) do
     Enum.reduce_while(records, {:ok, []}, fn record, {:ok, acc} ->
       case RecordProjection.project_result({:ok, record}) do
@@ -338,6 +422,14 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
       {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
       {:error, _reason} = error -> error
     end
+  end
+
+  defp project_output(fetched, page, %Plan{budget: budget}) do
+    memory_high_water_bytes = MemoryBudget.term_bytes(fetched)
+
+    if memory_high_water_bytes <= budget.executor_memory_bytes,
+      do: {:ok, page, memory_high_water_bytes},
+      else: {:error, :query_memory_budget_exceeded}
   end
 
   defp validate_plan(
@@ -400,6 +492,18 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
     end
   end
 
+  defp validate_candidate_keys(keys, request, boundary, direction) do
+    ids = Enum.map(keys, &elem(&1, 1))
+
+    valid =
+      length(keys) <= request.limit + 1 and
+        keys == Enum.sort(keys, direction) and
+        length(ids) == length(Enum.uniq(ids)) and
+        valid_resume?(keys, boundary, direction)
+
+    if valid, do: :ok, else: {:error, :query_storage_inconsistent}
+  end
+
   defp record_keys(records, %{order_field: order_field}) do
     Enum.reduce_while(records, {:ok, []}, fn record, {:ok, acc} ->
       case validate_boundary(Map.get(record, order_field), Map.get(record, :id)) do
@@ -447,7 +551,81 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
        ) do
     with record when is_map(record) <- List.last(page),
          {:ok, {value, id}} <-
-           validate_boundary(Map.get(record, descriptor.order_field), Map.get(record, :id)),
+           validate_boundary(Map.get(record, descriptor.order_field), Map.get(record, :id)) do
+      issue_cursor_from_boundary(
+        ctx,
+        request,
+        plan,
+        descriptor,
+        value,
+        id,
+        cursor_auth,
+        opts
+      )
+    else
+      nil -> {:error, :query_storage_inconsistent}
+      {:error, _reason} = error -> error
+      _invalid -> {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp issue_cursor_key(
+         _ctx,
+         _request,
+         _plan,
+         _descriptor,
+         _boundary,
+         false,
+         _cursor_auth,
+         _opts
+       ),
+       do: {:ok, nil}
+
+  defp issue_cursor_key(
+         ctx,
+         request,
+         plan,
+         descriptor,
+         {value, id},
+         true,
+         cursor_auth,
+         opts
+       ) do
+    issue_cursor_from_boundary(
+      ctx,
+      request,
+      plan,
+      descriptor,
+      value,
+      id,
+      cursor_auth,
+      opts
+    )
+  end
+
+  defp issue_cursor_key(
+         _ctx,
+         _request,
+         _plan,
+         _descriptor,
+         _boundary,
+         true,
+         _cursor_auth,
+         _opts
+       ),
+       do: {:error, :query_storage_inconsistent}
+
+  defp issue_cursor_from_boundary(
+         ctx,
+         request,
+         plan,
+         descriptor,
+         value,
+         id,
+         cursor_auth,
+         opts
+       ) do
+    with {:ok, {value, id}} <- validate_boundary(value, id),
          {:ok, logical_partition} <- Ferricstore.Flow.Query.partition_key(request),
          {:ok, scope_keys} <-
            MandatoryScope.derive_keys(plan.mandatory_scope, logical_partition),
@@ -473,10 +651,6 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
         ),
         cursor_opts
       )
-    else
-      nil -> {:error, :query_storage_inconsistent}
-      {:error, _reason} = error -> error
-      _invalid -> {:error, :query_storage_inconsistent}
     end
   end
 
@@ -505,9 +679,13 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
     end
   end
 
-  defp usage(fetched, page, plan, %Request{predicate: {:and, predicates}}) do
-    fetched_count = length(fetched)
-
+  defp usage(
+         fetched_count,
+         page,
+         plan,
+         %Request{predicate: {:and, predicates}},
+         memory_high_water_bytes
+       ) do
     %{
       range_seeks: plan.estimate.range_seeks,
       range_pages: plan.estimate.range_seeks,
@@ -518,7 +696,7 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
       duplicate_entries: 0,
       result_records: length(page),
       response_bytes: 0,
-      memory_high_water_bytes: MemoryBudget.term_bytes(fetched),
+      memory_high_water_bytes: memory_high_water_bytes,
       wall_time_us: 0
     }
   end
@@ -545,21 +723,13 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
       end)
       |> Enum.sort_by(&{&1.field, &1.operator})
 
-    fingerprint =
-      :crypto.hash(
-        :sha256,
-        :erlang.term_to_binary(
-          {
-            request.source,
-            request_predicates |> Enum.map(&fingerprint_predicate/1) |> Enum.sort(),
-            request.order_by,
-            request.limit,
-            request.return
-          },
-          minor_version: 2
-        )
-      )
-      |> Base.encode16(case: :lower)
+    fingerprint = Planner.query_fingerprint(request)
+
+    projection_fields =
+      case RecordProjection.external_names(request.projection) do
+        :all -> "all_allowlisted_fields"
+        fields -> fields
+      end
 
     %{
       version: Surface.default_explain_contract(),
@@ -573,6 +743,11 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
       plan: %{
         path: descriptor |> physical_path() |> Atom.to_string(),
         fallback_reason: "none",
+        projection: %{
+          fields: projection_fields,
+          application: "after_authoritative_recheck",
+          index_only: false
+        },
         predicates: predicates,
         order: %{
           field: Atom.to_string(descriptor.order_field),
@@ -591,19 +766,6 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
   defp fixed_read_count(%{states: states}) do
     if Shape.terminal_subset?(states), do: length(states), else: 1
   end
-
-  defp fingerprint_predicate({:eq, field, value}),
-    do: {:eq, Field.external_name(field), value_shape(value)}
-
-  defp fingerprint_predicate({:in, field, values}),
-    do: {:in, Field.external_name(field), values |> Enum.map(&value_shape/1) |> Enum.sort()}
-
-  defp fingerprint_predicate({operator, field, lower, upper})
-       when operator in [:range, :time_window],
-       do: {operator, Field.external_name(field), value_shape(lower), value_shape(upper)}
-
-  defp value_shape({kind, type, _value}) when kind in [:literal, :parameter],
-    do: {kind, type}
 
   defp physical_path(%{lineage: {_field, _id}}), do: :lineage_index
   defp physical_path(%{lease_range: {_lower, _upper}}), do: :inflight_index

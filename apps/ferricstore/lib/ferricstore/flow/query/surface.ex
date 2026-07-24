@@ -47,6 +47,7 @@ defmodule Ferricstore.Flow.Query.Surface do
       index_status_contract: @index_status_contract,
       capabilities: [
         "flow_query_v1",
+        "flow_query_result_projection_v1",
         "flow_explain_v1",
         "flow_explain_analyze_v1",
         "flow_composite_index_v1",

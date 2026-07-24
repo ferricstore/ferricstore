@@ -72,6 +72,40 @@ defmodule Ferricstore.Flow.Query.BuilderTest do
              Builder.build(:search, %{filters | state_meta: {"queued", "__internal", "high"}})
   end
 
+  test "builds bounded return projections with safely quoted dynamic fields" do
+    filters = %{
+      partition_key: "tenant-a",
+      type: "invoice",
+      projection: [:run_id, :state, {:attribute, "customer.tier"}]
+    }
+
+    assert {:ok, %{query: query, params: params}} = Builder.build(:list, filters)
+
+    assert query =~
+             "RETURN RECORDS (run_id, state, attribute['customer.tier'])"
+
+    assert {:ok, request} = Query.prepare_reference("FQL1", query, params)
+    assert request.projection == [:run_id, :state, {:attribute, "customer.tier"}]
+  end
+
+  test "rejects invalid, duplicate, and oversized return projections" do
+    filters = %{partition_key: "tenant-a", type: "invoice"}
+
+    assert {:error, :unsupported_query_shape} =
+             Builder.build(:list, Map.put(filters, :projection, []))
+
+    assert {:error, :duplicate_projection_field} =
+             Builder.build(:list, Map.put(filters, :projection, [:state, :state]))
+
+    assert {:error, :unsupported_field} =
+             Builder.build(:list, Map.put(filters, :projection, [:event_id]))
+
+    too_many = Enum.map(1..33, &{:attribute, "field-#{&1}"})
+
+    assert {:error, :query_projection_limit_exceeded} =
+             Builder.build(:list, Map.put(filters, :projection, too_many))
+  end
+
   test "preserves the list default state without widening the index scan" do
     assert {:ok, %{query: query, params: params}} =
              Builder.build(:list, %{partition_key: "tenant-a", type: "invoice"})

@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Query.EngineTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Flow.{Keys, Query}
-  alias Ferricstore.Flow.Query.{Builder, Engine, Error, Limits}
+  alias Ferricstore.Flow.Query.{Builder, Engine, Error, Limits, Planner}
   alias Ferricstore.Flow.Query.{MandatoryScope, Request}
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.IsolatedInstance
@@ -229,6 +229,35 @@ defmodule Ferricstore.Flow.Query.EngineTest do
       )
 
     assert {:error, :unsupported_query_shape} = Engine.execute(%{}, request)
+  end
+
+  test "direct exact-path EXPLAIN binds canonical result projections" do
+    point =
+      Request.point_read(:explain, {:literal, :keyword, "run-123"})
+      |> Map.put(:projection, [:state, :run_id])
+
+    history =
+      Request.history(
+        :explain,
+        [{:eq, :run_id, {:literal, :keyword, "run-123"}}],
+        :asc,
+        10
+      )
+      |> Map.put(:projection, [:event_id, {:event_field, "event"}])
+
+    for {request, fields} <- [
+          {point, ["state", "run_id"]},
+          {history, ["event_id", "fields['event']"]}
+        ] do
+      assert {:ok, explain} = Engine.execute(%{}, request)
+      assert explain.query_fingerprint == Planner.query_fingerprint(request)
+
+      assert explain.plan.projection == %{
+               fields: fields,
+               application: "after_authoritative_recheck",
+               index_only: false
+             }
+    end
   end
 
   test "default query execution uses the bounded state/type index for collection reads" do

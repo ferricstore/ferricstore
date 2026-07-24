@@ -28,7 +28,7 @@ defmodule Ferricstore.Bench.FQLParserPreflight do
         {true, {:error, _native_reason}, {:error, _nif_reason, _diagnostic}} ->
           :ok
 
-        {malformed?, {:ok, request}, {:ok, _, _, _, _, _, _, _}} when malformed? != true ->
+        {malformed?, {:ok, request}, {:ok, _, _, _, _, _, _, _, _}} when malformed? != true ->
           if input[:bind?] != false do
             {:ok, _bound} = Binder.bind(request, input.params)
           end
@@ -61,6 +61,11 @@ inputs = %{
     query:
       "FROM runs WHERE partition_key = @partition AND state IN ('failed', 'completed') AND updated_at_ms FROM @from TO @until ORDER BY updated_at_ms DESC LIMIT 25 RETURN RECORDS",
     params: %{"partition" => "tenant-a", "from" => 1, "until" => 1_000_000}
+  },
+  "projection" => %{
+    query:
+      "FROM runs WHERE partition_key = @partition AND state = 'failed' ORDER BY updated_at_ms DESC LIMIT 25 RETURN RECORDS (run_id, state, attribute['customer'])",
+    params: %{"partition" => "tenant-a"}
   },
   "count" => %{
     query:

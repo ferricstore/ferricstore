@@ -42,6 +42,22 @@ defmodule Ferricstore.Flow.Query.BinderTest do
     assert :ok = Request.validate_bound(bound)
   end
 
+  test "preserves the validated return projection while binding values" do
+    request =
+      Request.collection(
+        :execute,
+        [{:eq, :partition_key, parameter(:keyword, "tenant")}],
+        [{:updated_at_ms, :asc}],
+        10,
+        :record
+      )
+      |> Map.put(:projection, [:run_id, :state, {:attribute, "customer"}])
+
+    assert {:ok, bound} = Binder.bind(request, %{"tenant" => "tenant-a"})
+    assert bound.projection == request.projection
+    assert :ok = Request.validate_bound(bound)
+  end
+
   test "binds repeated parameters once and rejects missing, unused, or mistyped values" do
     request =
       Request.collection(

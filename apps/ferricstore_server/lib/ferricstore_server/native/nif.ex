@@ -28,7 +28,7 @@ defmodule FerricstoreServer.Native.NIF do
   @spec parse_fql(binary()) ::
           {:ok, :execute | :explain | :analyze, :runs | :events,
            :point | :collection | :history | :count, [tuple()], [tuple()], pos_integer() | nil,
-           nil | tuple()}
+           nil | tuple(), nil | [binary()]}
           | {:error, atom(), pos_integer()}
   def parse_fql(_query), do: :erlang.nif_error(:nif_not_loaded)
 

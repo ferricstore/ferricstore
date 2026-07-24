@@ -78,6 +78,21 @@ defmodule Ferricstore.Flow.Query.ExplainTest do
     end
   end
 
+  test "reports the requested result projection and authoritative application stage" do
+    request =
+      request("tenant", "failed", 100, 200)
+      |> Map.put(:projection, [:run_id, :state, {:attribute, "customer"}])
+
+    assert {:ok, plan} = Planner.plan(request, [active_index()], now_ms: 1_000)
+    explain = Explain.render(plan, request)
+
+    assert explain.plan.projection == %{
+             fields: ["run_id", "state", "attribute.customer"],
+             application: "after_authoritative_recheck",
+             index_only: false
+           }
+  end
+
   test "lists alternatives deterministically without physical bounds" do
     state_index = active_index()
 

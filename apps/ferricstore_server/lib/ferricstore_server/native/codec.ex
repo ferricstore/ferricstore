@@ -11,6 +11,7 @@ defmodule FerricstoreServer.Native.Codec do
   payloads and structured Flow metadata.
   """
 
+  alias Ferricstore.Flow.Query.ResultCodec
   alias Ferricstore.NativeValueCodec
   alias FerricstoreServer.Native.NIF
   alias FerricstoreServer.Native.Connection.FrameBuffer
@@ -71,12 +72,15 @@ defmodule FerricstoreServer.Native.Codec do
   @compact_list_ok_list_opcodes [0x020F, 0x0210, 0x0212, 0x0213, 0x0214]
   @compact_ok_list_opcodes @compact_scalar_ok_list_opcodes ++ @compact_list_ok_list_opcodes
   @compact_pipeline_opcodes [0x000E]
+  @compact_flow_query_result_opcodes [0x0100, 0x0231]
+  @flow_query_result_codec "flow_query_result_v1"
   @compact_always_response_opcodes [0x000E, 0x0101, 0x0102, 0x0104, 0x0105]
 
   @doc false
   def compact_response_opcodes do
     %{
       "flow_claim_jobs_v1" => @compact_flow_claim_jobs_opcodes,
+      "flow_query_result_v1" => @compact_flow_query_result_opcodes,
       "flow_record_v1" => @compact_flow_record_opcodes,
       "kv_get_v1" => @compact_kv_get_opcodes,
       "kv_mget_v1" => @compact_kv_mget_opcodes,
@@ -217,6 +221,7 @@ defmodule FerricstoreServer.Native.Codec do
       flow_claim_jobs: @compact_flow_claim_jobs,
       ok_list: @compact_ok_list,
       integer_list: @compact_integer_list,
+      flow_query_result: ResultCodec.tag(),
       flow_record: @compact_flow_record,
       flow_record_list: @compact_flow_record_list
     }
@@ -316,6 +321,23 @@ defmodule FerricstoreServer.Native.Codec do
           keyword()
         ) :: [binary()]
   def encode_command_response_frames(opcode, lane_id, request_id, status, value, opts \\ []) do
+    case compact_flow_query_result_payload(opcode, status, value, opts) do
+      payload when is_binary(payload) ->
+        encode_bounded_compact_response_frames(
+          opcode,
+          lane_id,
+          request_id,
+          status,
+          payload,
+          opts
+        )
+
+      nil ->
+        do_encode_command_response_frames(opcode, lane_id, request_id, status, value, opts)
+    end
+  end
+
+  defp do_encode_command_response_frames(opcode, lane_id, request_id, status, value, opts) do
     {status, value} = enforce_response_byte_limit(status, value, opts)
 
     case streamed_compact_mget_frames(opcode, lane_id, request_id, status, value, opts) do
@@ -347,6 +369,47 @@ defmodule FerricstoreServer.Native.Codec do
         else
           encode_response_frames(opcode, lane_id, request_id, status, value, opts)
         end
+    end
+  end
+
+  defp compact_flow_query_result_payload(opcode, :ok, value, opts)
+       when opcode in @compact_flow_query_result_opcodes do
+    if compact_codec_selected?(opts, @flow_query_result_codec) do
+      ResultCodec.encode(value)
+    end
+  end
+
+  defp compact_flow_query_result_payload(_opcode, _status, _value, _opts), do: nil
+
+  defp compact_codec_selected?(opts, codec) do
+    case Keyword.get(opts, :compact_response_codecs) do
+      %MapSet{} = codecs -> MapSet.member?(codecs, codec)
+      codecs when is_list(codecs) -> codec in codecs
+      _missing_or_invalid -> false
+    end
+  end
+
+  defp encode_bounded_compact_response_frames(
+         opcode,
+         lane_id,
+         request_id,
+         status,
+         payload,
+         opts
+       ) do
+    case Keyword.get(opts, :max_response_bytes) do
+      limit when is_integer(limit) and limit > 0 and byte_size(payload) + 2 > limit ->
+        encode_response_frames(
+          opcode,
+          lane_id,
+          request_id,
+          :bad_request,
+          "ERR native response byte limit exceeded",
+          opts
+        )
+
+      _within_limit ->
+        encode_compact_response_frames(opcode, lane_id, request_id, status, payload, opts)
     end
   end
 

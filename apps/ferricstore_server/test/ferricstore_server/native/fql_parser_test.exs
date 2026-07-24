@@ -6,7 +6,11 @@ defmodule FerricstoreServer.Native.FQLParserTest do
 
   @golden_queries [
     "FROM runs WHERE run_id = 'run-auto' RETURN RECORD",
+    "FROM runs WHERE run_id = 'run-auto' " <>
+      "RETURN RECORD (run_id, state, attributes, state_meta, attribute['customer'])",
     "FROM events WHERE run_id = @run_id ORDER BY event_id ASC LIMIT 25 RETURN RECORDS",
+    "FROM events WHERE run_id = @run_id ORDER BY event_id ASC LIMIT 25 " <>
+      "RETURN RECORDS (event_id, fields['event'])",
     "FROM runs WHERE partition_key = @partition AND parent_flow_id = @parent " <>
       "ORDER BY updated_at_ms DESC LIMIT 25 RETURN RECORDS",
     "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'run-123' RETURN RECORD",
@@ -58,6 +62,9 @@ defmodule FerricstoreServer.Native.FQLParserTest do
       "FROM events WHERE partition_key = 'p' RETURN COUNT",
       "FROM runs WHERE partition_key = 'p' LIMIT 1 RETURN COUNT",
       "FROM runs WHERE partition_key = 'p' CURSOR @page RETURN COUNT",
+      "FROM runs WHERE run_id = 'one' RETURN RECORD (state, STATE)",
+      "FROM runs WHERE run_id = 'one' RETURN RECORD (lease_token)",
+      "FROM events WHERE run_id = 'one' ORDER BY event_id ASC LIMIT 1 RETURN RECORDS (state)",
       "EXPLAIN ANALYZE FROM runs WHERE partition_key = @partition " <>
         "ORDER BY updated_at_ms DESC LIMIT 10 CURSOR @page RETURN RECORDS"
     ]
@@ -149,7 +156,7 @@ defmodule FerricstoreServer.Native.FQLParserTest do
 
   test "Rust parser enforces the canonical predicate and IN value limits" do
     exact_predicates = predicate_query(Limits.max_predicates())
-    assert {:ok, _, _, _, _, _, _, _} = NIF.parse_fql(exact_predicates)
+    assert {:ok, _, _, _, _, _, _, _, _} = NIF.parse_fql(exact_predicates)
 
     excess_predicates = predicate_query(Limits.max_predicates() + 1)
     excess_predicate_marker = "attribute.field#{Limits.max_predicates()}"
@@ -161,7 +168,7 @@ defmodule FerricstoreServer.Native.FQLParserTest do
     assert FQLParser.parse(excess_predicates) == ReferenceParser.parse(excess_predicates)
 
     exact_values = in_query(Limits.max_in_values())
-    assert {:ok, _, _, _, _, _, _, _} = NIF.parse_fql(exact_values)
+    assert {:ok, _, _, _, _, _, _, _, _} = NIF.parse_fql(exact_values)
 
     excess_values = in_query(Limits.max_in_values() + 1)
     excess_value_marker = "'state#{Limits.max_in_values()}'"
@@ -206,6 +213,8 @@ defmodule FerricstoreServer.Native.FQLParserTest do
     cases = [
       {"FROM unknown_source WHERE run_id = 'one' RETURN RECORD", "unknown_source"},
       {"FROM runs WHERE unknown_field = 'one' RETURN COUNT", "unknown_field"},
+      {"FROM runs WHERE run_id = 'one' RETURN RECORD (lease_token)", "lease_token"},
+      {"FROM runs WHERE run_id = 'one' RETURN RECORD (state, STATE)", "STATE"},
       {"EXPLAIN ANALYZE FROM runs RETURN RECORDS", "RETURN"},
       {empty_in, ")"},
       {trailing_in, ")"},

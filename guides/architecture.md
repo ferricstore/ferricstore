@@ -10,7 +10,7 @@ client command -> shard router -> WARaft segment log -> state/apply projection -
 
 FerricStore owns the storage path itself; workflow state is not written through an external Postgres, Cassandra, or FerricStore database. The committed WARaft segment log is the durable command boundary. Committed commands are projected into per-shard ETS keydirs and native Flow indexes for the hot serving path. LMDB/history are query projections that can lag briefly.
 
-For FerricFlow, command correctness uses the current Flow state in the hot keydir/native indexes. That state is recoverable from FerricStore-managed WARaft segment/apply-projection storage. LMDB/history projection freshness affects query surfaces, not whether a Flow command committed.
+For FerricFlow, command correctness uses the current Flow state in the hot keydir/native indexes. That state is recoverable from FerricStore-managed WARaft segment/apply-projection storage. LMDB/history projection freshness affects query surfaces, not whether a Flow command committed. The [Flow Query Guide](../docs/flow-query.md) documents FQL1 planning, projection quality, and index lifecycle in detail.
 
 FerricStore is built around three boundaries: (1) the BEAM owns routing, sessions, ACL, Raft orchestration, ETS keydir state, and operational decisions, (2) Rust NIFs handle bounded binary protocol work, file I/O, and CPU-heavy primitives, with selected native resources for specialized indexes, and (3) data is stored in the tier best suited to its access pattern.
 

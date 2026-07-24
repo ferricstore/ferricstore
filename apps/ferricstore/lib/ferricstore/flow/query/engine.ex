@@ -12,23 +12,18 @@ defmodule Ferricstore.Flow.Query.Engine do
     FixedIndexExecutor,
     Limits,
     MandatoryScope,
+    Planner,
     RecordProjection,
     Request,
     Shape,
     Surface
   }
 
-  @point_fingerprint :crypto.hash(
-                       :sha256,
-                       "FQL1|runs|and(eq(partition_key,keyword:$1),eq(run_id,keyword:$2))|return:record|limit:1"
-                     )
-                     |> Base.encode16(case: :lower)
-
   @spec execute(FerricStore.Instance.t() | map(), Request.t()) ::
           {:ok, term()} | {:error, term()}
   def execute(_ctx, %Request{source: :events, mode: :explain} = request) do
     with {:ok, _partition_key, _id, direction, _limit} <- history_values(request) do
-      {:ok, history_explain(direction)}
+      {:ok, history_explain(request, direction)}
     end
   end
 
@@ -38,13 +33,13 @@ defmodule Ferricstore.Flow.Query.Engine do
       |> ExecutionContext.instance_ctx()
       |> Ferricstore.Flow.HistoryAPI.history(id, history_opts(partition_key, direction, limit))
       |> normalize_history_result()
-      |> project_history_result()
+      |> project_history_result(request.projection)
     end
   end
 
   def execute(_ctx, %Request{source: :runs, mode: :explain} = request) do
     case point_values(request) do
-      {:ok, _partition_key, _id, kind} -> {:ok, explain(kind)}
+      {:ok, _partition_key, _id, kind} -> {:ok, explain(request, kind)}
       {:error, :unsupported_query_shape} -> FixedIndexExecutor.execute(%{}, request)
     end
   end
@@ -57,7 +52,7 @@ defmodule Ferricstore.Flow.Query.Engine do
         |> Ferricstore.Flow.get(id, partition_key: partition_key)
         |> normalize_point_result()
         |> verify_point_result(partition_key, id)
-        |> RecordProjection.project_result()
+        |> then(&RecordProjection.project_result(&1, :runs, request.projection))
 
       {:error, :unsupported_query_shape} ->
         ctx
@@ -78,7 +73,7 @@ defmodule Ferricstore.Flow.Query.Engine do
       ) do
     with :ok <- MandatoryScope.validate(scope),
          {:ok, _partition_key, _id, direction, _limit} <- history_values(request) do
-      {:ok, history_explain(direction)}
+      {:ok, history_explain(request, direction)}
     end
   end
 
@@ -98,7 +93,7 @@ defmodule Ferricstore.Flow.Query.Engine do
         metadata
       )
       |> normalize_history_result()
-      |> project_history_result()
+      |> project_history_result(request.projection)
     end
   end
 
@@ -109,7 +104,7 @@ defmodule Ferricstore.Flow.Query.Engine do
       ) do
     with :ok <- MandatoryScope.validate(scope),
          {:ok, _partition_key, _id, kind} <- point_values(request) do
-      {:ok, explain(kind)}
+      {:ok, explain(request, kind)}
     end
   end
 
@@ -126,7 +121,7 @@ defmodule Ferricstore.Flow.Query.Engine do
       |> Ferricstore.Flow.get_resolved(id, [partition_key: partition_key], metadata)
       |> normalize_point_result()
       |> verify_point_result(partition_key, id)
-      |> RecordProjection.project_result()
+      |> then(&RecordProjection.project_result(&1, :runs, request.projection))
     end
   end
 
@@ -250,12 +245,17 @@ defmodule Ferricstore.Flow.Query.Engine do
   defp normalize_history_result({:error, _reason}), do: {:error, :query_storage_inconsistent}
   defp normalize_history_result(result), do: result
 
-  defp project_history_result({:ok, events}) when is_list(events) do
-    project_history_events(events)
+  defp project_history_result({:ok, events}, :all) when is_list(events),
+    do: project_history_events(events)
+
+  defp project_history_result({:ok, events}, projection) when is_list(events) do
+    with {:ok, records} <- project_history_events(events) do
+      RecordProjection.project_records(records, :events, projection)
+    end
   end
 
-  defp project_history_result({:error, _reason} = error), do: error
-  defp project_history_result(_invalid), do: {:error, :query_storage_inconsistent}
+  defp project_history_result({:error, _reason} = error, _projection), do: error
+  defp project_history_result(_invalid, _projection), do: {:error, :query_storage_inconsistent}
 
   defp project_history_events(events) when is_list(events) do
     events
@@ -302,17 +302,7 @@ defmodule Ferricstore.Flow.Query.Engine do
 
   defp verify_point_result(result, _partition_key, _id), do: result
 
-  defp explain(kind) do
-    fingerprint =
-      case kind do
-        :auto_partition ->
-          :crypto.hash(:sha256, "FQL1|runs|and(eq(run_id,keyword:$1))|return:record|limit:1")
-          |> Base.encode16(case: :lower)
-
-        :explicit_partition ->
-          @point_fingerprint
-      end
-
+  defp explain(%Request{} = request, kind) do
     ranges =
       case kind do
         :auto_partition ->
@@ -341,7 +331,7 @@ defmodule Ferricstore.Flow.Query.Engine do
 
     %{
       version: Surface.default_explain_contract(),
-      query_fingerprint: fingerprint,
+      query_fingerprint: Planner.query_fingerprint(request),
       status: "planned",
       capabilities: %{
         requested: [],
@@ -352,6 +342,7 @@ defmodule Ferricstore.Flow.Query.Engine do
         path: "primary_key",
         index: "flow_runs_primary_v1",
         fallback_reason: "none",
+        projection: projection_descriptor(request),
         ranges: ranges
       },
       estimate: %{
@@ -362,15 +353,10 @@ defmodule Ferricstore.Flow.Query.Engine do
     }
   end
 
-  defp history_explain(direction) do
+  defp history_explain(%Request{} = request, direction) do
     %{
       version: Surface.default_explain_contract(),
-      query_fingerprint:
-        :crypto.hash(
-          :sha256,
-          "FQL1|events|and(eq(run_id,keyword:$1))|order:event_id:#{direction}|return:records"
-        )
-        |> Base.encode16(case: :lower),
+      query_fingerprint: Planner.query_fingerprint(request),
       status: "planned",
       capabilities: %{
         requested: [],
@@ -381,6 +367,7 @@ defmodule Ferricstore.Flow.Query.Engine do
         path: "history",
         index: "flow_events_history_v1",
         fallback_reason: "none",
+        projection: projection_descriptor(request),
         ranges: [
           %{
             field: "run_id",
@@ -396,6 +383,20 @@ defmodule Ferricstore.Flow.Query.Engine do
         result_records: Limits.max_results(),
         groups: 0
       }
+    }
+  end
+
+  defp projection_descriptor(%Request{projection: projection}) do
+    fields =
+      case RecordProjection.external_names(projection) do
+        :all -> "all_allowlisted_fields"
+        names -> names
+      end
+
+    %{
+      fields: fields,
+      application: "after_authoritative_recheck",
+      index_only: false
     }
   end
 end

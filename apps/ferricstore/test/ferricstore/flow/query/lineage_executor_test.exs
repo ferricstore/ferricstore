@@ -9,6 +9,7 @@ defmodule Ferricstore.Flow.Query.LineageExecutorTest do
     Cursor,
     ExecutionResult,
     LineageExecutor,
+    MemoryBudget,
     Planner
   }
 
@@ -46,7 +47,7 @@ defmodule Ferricstore.Flow.Query.LineageExecutorTest do
                 scanned_entries: 6,
                 hydrated_records: 3,
                 duplicate_entries: 2,
-                memory_high_water_bytes: 1_000
+                memory_high_water_bytes: memory_high_water_bytes
               }
             }} =
              LineageExecutor.execute(context(), request, plan, nil,
@@ -54,6 +55,9 @@ defmodule Ferricstore.Flow.Query.LineageExecutorTest do
                cursor_key: @cursor_key,
                now_ms: @now_ms
              )
+
+    assert memory_high_water_bytes >= 1_000
+    assert memory_high_water_bytes <= plan.budget.executor_memory_bytes
 
     assert {:ok, scope_keys} = MandatoryScope.derive_keys(scope, "tenant-a")
 
@@ -98,6 +102,107 @@ defmodule Ferricstore.Flow.Query.LineageExecutorTest do
              )
 
     assert_received {:lineage_boundary, {1_000, "child-b"}}
+  end
+
+  test "projects lineage output after validating identity and order fields" do
+    request =
+      lineage_request(:parent_flow_id, "parent-projection", :asc, 2)
+      |> Map.put(:projection, [:state])
+
+    scope = MandatoryScope.dedicated()
+    {:ok, plan} = Planner.plan(request, [], mandatory_scope: scope, now_ms: @now_ms)
+
+    page_read = fn _ctx, ^request, ^scope, nil ->
+      {:ok,
+       %{
+         records: [
+           record("child-a", 1_000, :parent_flow_id, "parent-projection")
+           |> Map.put(:state, "ready")
+         ],
+         has_more: false,
+         continuation: nil,
+         scanned_entries: 1,
+         hydrated_records: 1,
+         duplicate_entries: 0,
+         memory_high_water_bytes: 1_000
+       }}
+    end
+
+    assert {:ok, %ExecutionResult{records: records}} =
+             LineageExecutor.execute(context(), request, plan, nil,
+               page_read: page_read,
+               cursor_key: @cursor_key,
+               now_ms: @now_ms
+             )
+
+    assert records == [%{state: "ready"}]
+  end
+
+  test "bare lineage returns do not reserve a duplicate output page" do
+    request = lineage_request(:parent_flow_id, "parent-full-return", :asc, 1)
+    scope = MandatoryScope.dedicated()
+    {:ok, original_plan} = Planner.plan(request, [], mandatory_scope: scope, now_ms: @now_ms)
+
+    records = [
+      record("child-a", 1_000, :parent_flow_id, "parent-full-return")
+      |> Map.put(:attributes, %{"payload" => String.duplicate("x", 2_048)})
+    ]
+
+    page_bytes = MemoryBudget.term_bytes(records)
+    plan = %{original_plan | budget: %{original_plan.budget | executor_memory_bytes: page_bytes}}
+
+    page_read = fn _ctx, ^request, ^scope, nil ->
+      {:ok,
+       %{
+         records: records,
+         has_more: false,
+         continuation: nil,
+         scanned_entries: 1,
+         hydrated_records: 1,
+         duplicate_entries: 0,
+         memory_high_water_bytes: page_bytes
+       }}
+    end
+
+    assert {:ok, %ExecutionResult{records: ^records, usage: usage}} =
+             LineageExecutor.execute(context(), request, plan, nil,
+               page_read: page_read,
+               cursor_key: @cursor_key,
+               now_ms: @now_ms
+             )
+
+    assert usage.memory_high_water_bytes == page_bytes
+  end
+
+  test "rejects lineage pages containing fields outside the public result allowlist" do
+    request = lineage_request(:parent_flow_id, "parent-private-field", :asc, 1)
+    scope = MandatoryScope.dedicated()
+    {:ok, plan} = Planner.plan(request, [], mandatory_scope: scope, now_ms: @now_ms)
+
+    page_read = fn _ctx, ^request, ^scope, nil ->
+      records = [
+        record("child-a", 1_000, :parent_flow_id, "parent-private-field")
+        |> Map.put(:lease_token, "must-not-leak")
+      ]
+
+      {:ok,
+       %{
+         records: records,
+         has_more: false,
+         continuation: nil,
+         scanned_entries: 1,
+         hydrated_records: 1,
+         duplicate_entries: 0,
+         memory_high_water_bytes: Ferricstore.TermMemory.bytes(records)
+       }}
+    end
+
+    assert {:error, :query_storage_inconsistent} =
+             LineageExecutor.execute(context(), request, plan, nil,
+               page_read: page_read,
+               cursor_key: @cursor_key,
+               now_ms: @now_ms
+             )
   end
 
   test "rejects forged page accounting and malformed continuation tuples" do

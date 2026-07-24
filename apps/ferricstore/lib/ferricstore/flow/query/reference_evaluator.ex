@@ -1,11 +1,14 @@
 defmodule Ferricstore.Flow.Query.ReferenceEvaluator do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.{Field, RecordOrder, Request, TupleCodec}
+  alias Ferricstore.Flow.Query.{Field, RecordOrder, RecordProjection, Request, TupleCodec}
 
   @spec execute([map()], Request.t()) ::
           {:ok, [map()]}
-          | {:error, :invalid_query_request | :unsupported_query_order_value}
+          | {:error,
+             :invalid_query_request
+             | :query_storage_inconsistent
+             | :unsupported_query_order_value}
   def execute(records, %Request{} = request) when is_list(records) do
     case Request.validate_bound(request) do
       :ok ->
@@ -13,8 +16,11 @@ defmodule Ferricstore.Flow.Query.ReferenceEvaluator do
           records
           |> Enum.filter(&matches_all?(&1, request.predicate))
 
-        with {:ok, sorted} <- RecordOrder.sort(matching, request.order_by) do
-          {:ok, Enum.take(sorted, request.limit)}
+        with {:ok, sorted} <- RecordOrder.sort(matching, request.order_by),
+             page = Enum.take(sorted, request.limit),
+             {:ok, projected} <-
+               RecordProjection.project_records(page, request.source, request.projection) do
+          {:ok, projected}
         end
 
       {:error, _reason} ->

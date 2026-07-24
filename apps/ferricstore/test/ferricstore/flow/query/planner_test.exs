@@ -1032,6 +1032,17 @@ defmodule Ferricstore.Flow.Query.PlannerTest do
     assert execute_plan.query_fingerprint == other_plan.query_fingerprint
   end
 
+  test "result projection is bound into query fingerprints and cursor digests" do
+    request = collection([eq(:partition_key, "tenant-a"), eq(:state, "failed")])
+    projected = %{request | projection: [:run_id, :state]}
+    reordered = %{request | projection: [:state, :run_id]}
+
+    refute Planner.query_fingerprint(request) == Planner.query_fingerprint(projected)
+    assert Planner.query_fingerprint(projected) == Planner.query_fingerprint(reordered)
+    refute Planner.query_digest(request) == Planner.query_digest(projected)
+    assert Planner.query_digest(projected) == Planner.query_digest(reordered)
+  end
+
   test "retains alternative evidence only for EXPLAIN modes" do
     indexes = [active_index(state_definition()), active_index(tenant_definition())]
     execute = collection([eq(:partition_key, "tenant-a"), eq(:state, "failed")])
