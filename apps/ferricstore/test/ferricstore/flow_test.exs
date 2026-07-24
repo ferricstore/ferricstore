@@ -68,6 +68,7 @@ defmodule Ferricstore.FlowTest do
   use ExUnit.Case, async: false
   @moduletag :flow
   @moduletag :global_state
+  @moduletag timeout: 120_000
 
   alias Ferricstore.Test.ShardHelpers
 

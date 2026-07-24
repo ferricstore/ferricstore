@@ -69,6 +69,23 @@ defmodule Ferricstore.CI.TestPartitionTest do
     end
   end
 
+  test "serial Flow tests own the WARaft restart timeout instead of widening CI globally" do
+    flow_test = Path.join(__DIR__, "flow_test.exs")
+    {:ok, ast} = flow_test |> File.read!() |> Code.string_to_quoted()
+
+    {_ast, timeouts} =
+      Macro.prewalk(ast, [], fn
+        {:@, _meta, [{:moduletag, _tag_meta, [[timeout: timeout]]}]} = node, timeouts
+        when is_integer(timeout) ->
+          {node, [timeout | timeouts]}
+
+        node, timeouts ->
+          {node, timeouts}
+      end)
+
+    assert Enum.any?(timeouts, &(&1 >= 120_000))
+  end
+
   defp write_test_file(root, name, line_count) do
     path = Path.join(root, "#{name}_test.exs")
     File.write!(path, String.duplicate("# test weight\n", line_count))
