@@ -10,6 +10,8 @@ All notable changes to FerricStore will be documented here.
 - Added the explicitly negotiated `flow_query_result_v1` native response codec for `FLOW.QUERY` record pages and counts, using fixed metadata, row-presence bitmaps, and typed field values while retaining lossless typed-value fallback for EXPLAIN, errors, and unknown result shapes. Clients name supported compact codecs in `HELLO` or `STARTUP`, preventing broad compact-response opt-in from enabling unknown future tags.
 - Removed the full-record intermediate from explicit fixed-index projections after a benchmark showed about 4x higher projection throughput and 2.9x lower allocation, while retaining authoritative ordering, cursor, integrity, and memory-budget checks.
 - Added a byte-for-byte compact-result golden corpus for server and SDK conformance, made the native NIF ABI derive the release version from the umbrella project, and allowed clients to ignore well-formed unknown future response codecs without weakening duplicate-opcode validation.
+- Kept native responses uncompressed when an established connection state omits optional compact-codec negotiation, while retaining fail-closed selection for malformed or unsupported codec declarations.
+- Made completed query-index validation restart-safe before atomic activation, allowing the lifecycle worker to resume a durably validated build without exposing it early or rejecting the registry snapshot.
 
 ## 0.10.2 - 2026-07-23
 
