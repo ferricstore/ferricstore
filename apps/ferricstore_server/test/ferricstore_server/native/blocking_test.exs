@@ -145,7 +145,8 @@ defmodule FerricstoreServer.Native.BlockingTest do
     assert {:ok, worker, monitor_ref} = Blocking.start_prepared(prepared, state, meta)
 
     assert_receive {:native_blocking_response_budgeted, ^meta, ^worker, :ok, [^key, ^value],
-                    %OutboundBudget{} = lease}
+                    %OutboundBudget{} = lease},
+                   1_000
 
     refute_receive {:DOWN, ^monitor_ref, :process, ^worker, _reason}
     assert OutboundBudget.usage(counter) > 0
@@ -153,7 +154,7 @@ defmodule FerricstoreServer.Native.BlockingTest do
 
     assert :ok = OutboundBudget.release(lease)
     send(worker, {:native_blocking_outbound_released, lease.resource_token})
-    assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}
+    assert_receive {:DOWN, ^monitor_ref, :process, ^worker, :normal}, 1_000
     assert OutboundBudget.usage(counter) == 0
     assert ResourceBudget.usage(budget).outbound_bytes == 0
   end

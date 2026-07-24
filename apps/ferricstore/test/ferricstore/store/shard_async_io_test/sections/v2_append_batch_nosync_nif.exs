@@ -785,6 +785,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.V2AppendBatchNosyncNif do
               index: 0,
               instance_ctx: ctx,
               checkpoint_interval_ms: 10,
+              checkpoint_idle_ms: 0,
               name: :"ck_unified_#{:erlang.unique_integer([:positive])}"
             )
 
