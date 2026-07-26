@@ -3,6 +3,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalState do
 
   alias Ferricstore.Flow
   alias Ferricstore.Flow.LMDB
+  alias Ferricstore.Flow.Query.QueryRowCodec
+  alias Ferricstore.Flow.RecordIdentity
 
   def statuses(lmdb_path, keydir, state_keys, decode_entry_fun)
       when is_binary(lmdb_path) and is_list(state_keys) and is_function(decode_entry_fun, 1) do
@@ -48,8 +50,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalState do
        when is_binary(state_key) do
     case :ets.lookup(keydir, state_key) do
       [entry] ->
-        with [{_key, _value, _expire_at_ms, record}] <- decode_entry_fun.(entry),
-             {:ok, status} <- record_status(record, state_key) do
+        with [{_key, _value, _expire_at_ms, record, _locator}] <- decode_entry_fun.(entry),
+             {:ok, status} <- authoritative_record_status(record, state_key) do
           collect_hot_statuses(
             state_keys,
             keydir,
@@ -116,11 +118,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalState do
 
   defp durable_result_status({:ok, blob}, keydir, state_key) when is_binary(blob) do
     if registry_owner?(keydir, state_key) do
-      case LMDB.decode_value(blob, 0) do
-        {:ok, value} when is_binary(value) ->
-          value
-          |> Flow.decode_record()
-          |> record_status(state_key)
+      case QueryRowCodec.decode(blob, state_key) do
+        {:ok, %{record: record}} ->
+          query_row_status(record, state_key)
 
         _invalid ->
           {:error, :invalid_durable_flow_state}
@@ -142,16 +142,32 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalState do
   defp durable_result_status(_invalid, _keydir, _state_key),
     do: {:error, :invalid_durable_flow_state_read}
 
-  defp record_status(%{id: id, state: state} = record, state_key)
+  defp authoritative_record_status(%{id: id, state: state} = record, state_key)
        when is_binary(id) and is_binary(state) do
-    if Flow.Keys.state_key(id, Map.get(record, :partition_key)) == state_key do
-      {:ok, if(LMDB.terminal_state?(state), do: :terminal, else: :active)}
+    if RecordIdentity.owns_state_key?(record, state_key) do
+      state_status(state)
     else
       {:error, :mismatched_authoritative_flow_state}
     end
   end
 
-  defp record_status(_record, _state_key), do: {:error, :invalid_authoritative_flow_state}
+  defp authoritative_record_status(_record, _state_key),
+    do: {:error, :invalid_authoritative_flow_state}
+
+  # QueryRowCodec already binds the row to the exact physical state-key hash and locator.
+  # Its public metadata intentionally contains only the logical partition for shared scopes.
+  defp query_row_status(%{id: id, state: state}, state_key)
+       when is_binary(id) and is_binary(state) do
+    case Flow.Keys.run_id_from_state_key(state_key) do
+      {:ok, ^id} -> state_status(state)
+      _invalid -> {:error, :mismatched_authoritative_flow_state}
+    end
+  end
+
+  defp query_row_status(_record, _state_key), do: {:error, :invalid_authoritative_flow_state}
+
+  defp state_status(state),
+    do: {:ok, if(LMDB.terminal_state?(state), do: :terminal, else: :active)}
 
   defp registry_owner?(keydir, state_key) do
     case Flow.Keys.registry_key_from_state_key(state_key) do

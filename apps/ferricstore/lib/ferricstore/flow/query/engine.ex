@@ -9,6 +9,7 @@ defmodule Ferricstore.Flow.Query.Engine do
 
   alias Ferricstore.Flow.Query.{
     ExecutionContext,
+    Explain,
     FixedIndexExecutor,
     Limits,
     MandatoryScope,
@@ -340,6 +341,7 @@ defmodule Ferricstore.Flow.Query.Engine do
       },
       plan: %{
         path: "primary_key",
+        record_source: "authoritative_log",
         index: "flow_runs_primary_v1",
         fallback_reason: "none",
         projection: projection_descriptor(request),
@@ -365,6 +367,7 @@ defmodule Ferricstore.Flow.Query.Engine do
       },
       plan: %{
         path: "history",
+        record_source: "authoritative_log",
         index: "flow_events_history_v1",
         fallback_reason: "none",
         projection: projection_descriptor(request),
@@ -386,17 +389,6 @@ defmodule Ferricstore.Flow.Query.Engine do
     }
   end
 
-  defp projection_descriptor(%Request{projection: projection}) do
-    fields =
-      case RecordProjection.external_names(projection) do
-        :all -> "all_allowlisted_fields"
-        names -> names
-      end
-
-    %{
-      fields: fields,
-      application: "after_authoritative_recheck",
-      index_only: false
-    }
-  end
+  defp projection_descriptor(%Request{} = request),
+    do: Explain.projection_descriptor(request, :authoritative_log)
 end

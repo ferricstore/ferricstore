@@ -95,4 +95,10 @@ defmodule Ferricstore.Flow.LMDBValueCodecTest do
                |> LMDB.decode_value_locator(10)
     end
   end
+
+  test "value locator decoding is bounded before external-term allocation" do
+    encoded = Ferricstore.TermCodec.encode({:other, String.duplicate("x", 128)})
+    assert byte_size(encoded) > 128
+    assert :error = LMDB.decode_value_locator(encoded, 10)
+  end
 end

@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   @moduledoc false
 
-  alias Ferricstore.Flow.Codec
+  alias Ferricstore.Flow.{Codec, Locator, ProjectionLocator}
   alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.BlobValue
   alias Ferricstore.Store.ColdRead
@@ -28,8 +28,15 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
       end)
 
     hot_decoded =
-      Enum.flat_map(hot, fn {key, value, expire_at_ms, _lfu, _fid, _off, _vsize} ->
-        decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx)
+      Enum.flat_map(hot, fn {key, value, expire_at_ms, _lfu, fid, off, vsize} ->
+        decode_state_record(
+          key,
+          value,
+          expire_at_ms,
+          shard_index,
+          instance_ctx,
+          {fid, off, vsize}
+        )
       end)
 
     cold_decoded =
@@ -45,7 +52,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   def read_cold_locations(locations, shard_index, instance_ctx) do
     {bitcask_locations, waraft_locations} =
       Enum.split_with(locations, fn
-        {:bitcask, _path, _off, _key, _expire_at_ms} -> true
+        {:bitcask, _path, _key, _expire_at_ms, _source_location} -> true
         _ -> false
       end)
 
@@ -54,12 +61,32 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   end
 
   def decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx) do
+    decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx, nil)
+  end
+
+  def decode_state_record(
+        key,
+        value,
+        expire_at_ms,
+        shard_index,
+        instance_ctx,
+        source_location
+      ) do
     case materialize_rebuilt_value(value, shard_index, instance_ctx) do
       {:ok, materialized_value} ->
-        case Codec.decode_record(materialized_value) do
-          %{id: id, type: type, state: state} = record
+        case decode_source_record(
+               key,
+               materialized_value,
+               expire_at_ms,
+               source_location
+             ) do
+          {:ok, %{id: id, type: type, state: state} = record, locator}
           when is_binary(id) and is_binary(type) and is_binary(state) ->
-            [{key, materialized_value, expire_at_ms, record}]
+            [{key, materialized_value, expire_at_ms, record, locator}]
+
+          {:error, reason} ->
+            observe_cold_read_error(1, reason)
+            []
 
           _ ->
             observe_cold_read_error(1, :invalid_flow_state_record)
@@ -100,15 +127,17 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   defp cold_locations(entries, shard_path) do
     Enum.flat_map(entries, fn
       {key, nil, expire_at_ms, _lfu, fid, off, vsize}
-      when is_integer(fid) and is_integer(off) and is_integer(vsize) and off >= 0 and vsize >= 0 ->
+      when is_integer(fid) and fid >= 0 and is_integer(off) and is_integer(vsize) and off >= 0 and
+             vsize >= 0 ->
         path = ShardETS.file_path(shard_path, fid)
-        [{:bitcask, path, off, key, expire_at_ms}]
+        [{:bitcask, path, key, expire_at_ms, {fid, off, vsize}}]
 
       {key, nil, expire_at_ms, _lfu, fid, off, vsize}
       when valid_waraft_segment_location(fid, off, vsize) ->
-        [{:waraft, fid, key, expire_at_ms}]
+        [{:waraft, fid, key, expire_at_ms, {fid, off, vsize}}]
 
       _entry ->
+        observe_cold_read_error(1, :source_location_unavailable)
         []
     end)
   end
@@ -117,15 +146,25 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
 
   defp read_bitcask_cold_locations(locations, shard_index, instance_ctx) do
     reads =
-      Enum.map(locations, fn {:bitcask, path, off, key, _expire_at_ms} -> {path, off, key} end)
+      Enum.map(locations, fn
+        {:bitcask, path, key, _expire_at_ms, {_fid, off, _vsize}} -> {path, off, key}
+      end)
 
     case ColdRead.pread_batch_keyed(reads, @cold_read_timeout_ms) do
       {:ok, values} ->
         locations
         |> Enum.zip(values)
         |> Enum.flat_map(fn
-          {{:bitcask, _path, _off, key, expire_at_ms}, value} when is_binary(value) ->
-            decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx)
+          {{:bitcask, _path, key, expire_at_ms, source_location}, value}
+          when is_binary(value) ->
+            decode_state_record(
+              key,
+              value,
+              expire_at_ms,
+              shard_index,
+              instance_ctx,
+              source_location
+            )
 
           _ ->
             observe_cold_read_error(1, :missing_value)
@@ -142,21 +181,35 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
 
   defp read_waraft_cold_locations(locations, shard_index, instance_ctx) do
     locations
-    |> Enum.group_by(fn {:waraft, file_id, _key, _expire_at_ms} -> file_id end)
+    |> Enum.group_by(fn {:waraft, file_id, _key, _expire_at_ms, _source_location} ->
+      file_id
+    end)
     |> Enum.flat_map(fn {file_id, grouped} ->
-      keys = Enum.map(grouped, fn {:waraft, _file_id, key, _expire_at_ms} -> key end)
+      keys =
+        Enum.map(grouped, fn {:waraft, _file_id, key, _expire_at_ms, _source_location} ->
+          key
+        end)
 
-      case WARaftSegmentReader.read_values_from_location(instance_ctx, shard_index, file_id, keys) do
-        {:ok, values_by_key} when is_map(values_by_key) ->
-          Enum.flat_map(grouped, fn {:waraft, _file_id, key, expire_at_ms} ->
-            case Map.get(values_by_key, key) do
-              value when is_binary(value) ->
-                decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx)
+      case read_physical_waraft_group(instance_ctx, shard_index, file_id, keys) do
+        {:ok, values_by_key, physical_location} when is_map(values_by_key) ->
+          Enum.flat_map(grouped, fn
+            {:waraft, _file_id, key, expire_at_ms, source_location} ->
+              case Map.get(values_by_key, key) do
+                value when is_binary(value) ->
+                  key
+                  |> decode_state_record(
+                    value,
+                    expire_at_ms,
+                    shard_index,
+                    instance_ctx,
+                    source_location
+                  )
+                  |> physicalize_decoded_rows(physical_location)
 
-              _ ->
-                observe_cold_read_error(1, :missing_waraft_value)
-                []
-            end
+                _ ->
+                  observe_cold_read_error(1, :missing_waraft_value)
+                  []
+              end
           end)
 
         {:error, reason} ->
@@ -164,6 +217,75 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
           []
       end
     end)
+  end
+
+  defp read_physical_waraft_group(instance_ctx, shard_index, file_id, keys) do
+    with :ok <- ensure_waraft_group_durable(instance_ctx, shard_index, file_id, keys),
+         {:ok, physical_location} <-
+           WARaftSegmentReader.physical_location(instance_ctx, shard_index, file_id),
+         {:ok, values_by_key} <-
+           WARaftSegmentReader.read_values_from_location(
+             instance_ctx,
+             shard_index,
+             file_id,
+             keys
+           ) do
+      {:ok, values_by_key, physical_location}
+    end
+  end
+
+  defp ensure_waraft_group_durable(
+         %{data_dir: data_dir},
+         shard_index,
+         {:waraft_apply_projection, index},
+         keys
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_integer(index) and index > 0 do
+    case WARaftSegmentReader.ensure_apply_projection_entries_durable(
+           data_dir,
+           shard_index,
+           Enum.map(keys, &{index, &1})
+         ) do
+      {:ok, _removed} -> :ok
+      {:error, reason} -> {:error, {:query_row_source_not_durable, reason}}
+    end
+  end
+
+  defp ensure_waraft_group_durable(_instance_ctx, _shard_index, _file_id, _keys), do: :ok
+
+  defp physicalize_decoded_rows(rows, {ordinal, offset, frame_size})
+       when is_integer(ordinal) and ordinal >= 0 and is_integer(offset) and offset >= 0 and
+              is_integer(frame_size) and frame_size >= 8 do
+    Enum.flat_map(rows, fn
+      {key, value, expire_at_ms, record, %Locator{} = locator} ->
+        case Locator.relocate(locator,
+               segment_generation: ordinal,
+               offset: offset,
+               frame_size: frame_size
+             ) do
+          {:ok, physical} ->
+            if Locator.hydration_ready?(physical) do
+              [{key, value, expire_at_ms, record, physical}]
+            else
+              observe_cold_read_error(1, :invalid_query_row_source_locator)
+              []
+            end
+
+          {:error, reason} ->
+            observe_cold_read_error(1, {:query_row_source_location_unavailable, reason})
+            []
+        end
+
+      _invalid ->
+        observe_cold_read_error(1, :invalid_flow_state_record)
+        []
+    end)
+  end
+
+  defp physicalize_decoded_rows(rows, _invalid_location) do
+    observe_cold_read_error(length(rows), :invalid_query_row_source_location)
+    []
   end
 
   defp observe_cold_read_error(count, reason) do
@@ -176,6 +298,16 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
       %{reason: reason}
     )
   end
+
+  defp decode_source_record(_key, materialized_value, _expire_at_ms, nil) do
+    case Codec.decode_record(materialized_value) do
+      record when is_map(record) -> {:ok, record, nil}
+      _invalid -> {:error, :invalid_flow_state_record}
+    end
+  end
+
+  defp decode_source_record(key, materialized_value, expire_at_ms, source_location),
+    do: ProjectionLocator.decode_source(key, materialized_value, expire_at_ms, source_location)
 
   defp materialize_rebuilt_value(value, shard_index, %{data_dir: data_dir} = instance_ctx)
        when is_binary(value) and is_binary(data_dir) and is_integer(shard_index) and

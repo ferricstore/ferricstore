@@ -384,23 +384,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
       end
 
       defp flow_retention_decode_lmdb_state_record(state, state_key) do
-        case Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), state_key) do
-          {:ok, blob} ->
-            flow_retention_decode_lmdb_state_value(blob)
-
-          _ ->
-            :miss
+        case flow_read_lmdb_records_including_expired(state, [state_key]) do
+          [{:ok, record}] -> {:ok, record}
+          [:miss] -> :miss
+          _invalid -> :miss
         end
       end
-
-      defp flow_retention_decode_lmdb_state_value(blob) when is_binary(blob) do
-        case Ferricstore.Flow.LMDB.decode_value(blob, 0) do
-          {:ok, value} -> flow_decode_record_blob(value)
-          _ -> :miss
-        end
-      end
-
-      defp flow_retention_decode_lmdb_state_value(_blob), do: :miss
 
       defp flow_active_timeout_expired_state_entries(_state, _now_ms, limit)
            when not is_integer(limit) or limit <= 0,
@@ -957,8 +946,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
                      FlowKeys.terminal_retention_index_key(),
                      [state_key]
                    ) do
-              maybe_queue_terminal_lmdb_index_delete(state, record)
-              queue_lmdb_metadata_index_deletes(state, record)
+              maybe_queue_terminal_lmdb_history_expire_delete(state, record)
 
               {:ok, %{flows: 1, history: history_count, values: values_count}}
             end

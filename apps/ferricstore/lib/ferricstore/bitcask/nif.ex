@@ -794,7 +794,8 @@ defmodule Ferricstore.Bitcask.NIF do
         ) ::
           {:ok,
            [
-             {binary(), binary(), binary(), non_neg_integer(), non_neg_integer(), pos_integer()}
+             {binary(), binary(), binary(), non_neg_integer(), non_neg_integer(), pos_integer(),
+              binary() | nil}
            ], boolean(), non_neg_integer()}
           | {:error, term()}
   def lmdb_composite_range_entries_bounded(

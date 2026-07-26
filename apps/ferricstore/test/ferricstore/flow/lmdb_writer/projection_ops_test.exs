@@ -1,12 +1,14 @@
 defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Flow.{Keys, Locator}
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
   alias Ferricstore.Flow.LMDB
+  alias Ferricstore.Flow.Query.{QueryRowCodec, SourceCatalog}
   alias Ferricstore.Flow.NativeOrderedIndex
   alias Ferricstore.Flow.OrderedIndex
 
-  test "flow record envelope decoding rejects non-canonical external terms" do
+  test "generic LMDB values stay opaque and do not trigger Flow state work" do
     encoded_record =
       Ferricstore.Flow.encode_record(%{
         id: "projection-flow",
@@ -41,8 +43,13 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       })
 
     envelope = Ferricstore.Flow.LMDB.encode_value(encoded_record, 0)
-    assert {:ok, %{id: "projection-flow"}} = ProjectionOps.decode_flow_record_value(envelope)
-    assert :error = ProjectionOps.decode_flow_record_value(envelope <> <<0>>)
+    path = tmp_lmdb_path("opaque_generic_value")
+
+    assert {:ok, [{:put, "ordinary-key", ^envelope}], _state} =
+             ProjectionOps.expand_ops(
+               %{path: path, terminal_count_inits: MapSet.new()},
+               [{:put, "ordinary-key", envelope}]
+             )
   end
 
   test "terminal history projection walks the native index in bounded cursor pages" do
@@ -268,7 +275,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       retention_ttl_ms: nil,
       max_active_ms: nil,
       terminal_retention_until_ms: nil,
-      partition_key: nil,
+      partition_key: "tenant-a",
       payload_ref: nil,
       parent_flow_id: nil,
       parent_partition_key: nil,
@@ -283,21 +290,44 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       child_groups: %{}
     }
 
-    envelope =
-      record
-      |> Ferricstore.Flow.encode_record()
-      |> Ferricstore.Flow.LMDB.encode_value(0)
+    state_key = Keys.state_key("projection-flow", "tenant-a")
+
+    locator =
+      Locator.new!(
+        flow_id: "projection-flow",
+        kind: :state,
+        version: 1,
+        raft_index: 7,
+        file_id: {:waraft_segment, 7},
+        offset: 0,
+        value_size: 512,
+        frame_size: 1_024,
+        segment_generation: 0,
+        checksum: :crypto.hash(:sha256, Ferricstore.Flow.encode_record(record))
+      )
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
 
     assert {:ok, %{id: "projection-flow"}} =
-             ProjectionOps.__old_projected_flow_record_result_for_test__({:ok, envelope})
+             ProjectionOps.__old_projected_flow_record_result_for_test__(
+               {:ok, query_row},
+               state_key
+             )
 
-    assert {:ok, nil} = ProjectionOps.__old_projected_flow_record_result_for_test__(:not_found)
+    assert {:ok, nil} =
+             ProjectionOps.__old_projected_flow_record_result_for_test__(:not_found, state_key)
 
     assert {:error, :invalid_projected_flow_record} =
-             ProjectionOps.__old_projected_flow_record_result_for_test__({:ok, "corrupt"})
+             ProjectionOps.__old_projected_flow_record_result_for_test__(
+               {:ok, "corrupt"},
+               state_key
+             )
 
     assert {:error, :busy} =
-             ProjectionOps.__old_projected_flow_record_result_for_test__({:error, :busy})
+             ProjectionOps.__old_projected_flow_record_result_for_test__(
+               {:error, :busy},
+               state_key
+             )
   end
 
   test "terminal count reads and repairs fail closed on corrupt or unavailable data" do
@@ -393,22 +423,36 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
     terminal_key = LMDB.terminal_index_key(state_index_key, "flow-1", 20)
     count_key = LMDB.terminal_count_key(state_index_key)
 
-    active_value =
-      active_flow_record("flow-1", type, partition_key)
-      |> Ferricstore.Flow.encode_record()
-      |> LMDB.encode_value(0)
+    active_record = active_flow_record("flow-1", type, partition_key)
 
     terminal_value =
       LMDB.encode_terminal_index_value("flow-1", 20, 0, state_key, count_key)
 
-    assert {:ok, ops, _state} =
-             ProjectionOps.expand_ops(
-               %{path: path, terminal_count_inits: MapSet.new()},
-               [
-                 {:put, state_key, active_value},
-                 {:terminal_put, terminal_key, terminal_value, state_key, count_key}
-               ]
+    acc = %{
+      ops: [],
+      counts: %{},
+      count_values: %{},
+      terminal_values: %{},
+      terminal_reverse_values: %{},
+      active_reverse_values: %{},
+      composite_projection_cache: %{},
+      pending_terminal_count_put_news: MapSet.new(),
+      terminal_count_inits: MapSet.new(),
+      terminal_atomic_write?: false,
+      op_count: 0,
+      write_group_sizes: []
+    }
+
+    acc = ProjectionOps.maybe_init_terminal_counts_for_active_record(active_record, acc)
+
+    assert {:ok, expanded} =
+             ProjectionOps.expand_path_op(
+               path,
+               {:terminal_put, terminal_key, terminal_value, state_key, count_key},
+               acc
              )
+
+    ops = Enum.reverse(expanded.ops)
 
     assert :ok = LMDB.write_batch(path, ops)
     assert {:ok, 1} = LMDB.get(path, count_key) |> decode_count_result()
@@ -626,23 +670,36 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
     assert {:ok, 1} = LMDB.get(path, count_key) |> decode_count_result()
   end
 
-  test "malformed flow state cannot be acknowledged as a successful projection" do
-    acc = %{
-      ops: [],
-      counts: %{},
-      terminal_values: %{},
-      active_reverse_values: %{},
+  test "malformed durable Flow state cannot be acknowledged as a successful projection" do
+    root = tmp_lmdb_path("malformed_source")
+    state_key = Keys.state_key("malformed-flow", "tenant-a")
+    keydir = :ets.new(:malformed_projection_source, [:set, :public])
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, 7, [
+               {state_key, "not-a-flow-record", 0}
+             ])
+
+    :ets.insert(
+      keydir,
+      {state_key, nil, 0, 0, {:waraft_apply_projection, 7}, 0, byte_size("not-a-flow-record")}
+    )
+
+    state = %{
+      path: Path.join(root, "query"),
+      shard_index: 0,
+      instance_ctx: %{data_dir: root, keydir_refs: {keydir}},
       terminal_count_inits: MapSet.new()
     }
 
-    assert {:error, :invalid_flow_state_projection} =
-             ProjectionOps.expand_flow_state_value(
-               "unused",
-               "flow-state-key",
-               "not-a-flow-record",
-               0,
-               acc
-             )
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(root, 0)
+    end)
+
+    assert {:error, :invalid_source_flow_record} =
+             ProjectionOps.expand_ops(state, [
+               {:project_flow_state_from_source, state_key, 1}
+             ])
   end
 
   test "WARaft source locators materialize blob-backed Flow records" do
@@ -689,6 +746,221 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
     assert {:ok, ^encoded_record, 0} = ProjectionOps.read_source_value(state, state_key)
   end
 
+  test "Flow projection stores compact query metadata and its durable source locator" do
+    root = tmp_lmdb_path("query_row_projection")
+    path = Path.join(root, "query")
+    keydir = :ets.new(:query_row_projection_source, [:set, :public])
+    state_key = Ferricstore.Flow.Keys.state_key("query-row-flow", "tenant-a")
+
+    record =
+      active_flow_record("query-row-flow", "jobs", "tenant-a")
+      |> Map.merge(%{
+        version: 4,
+        state: "queued",
+        state_enter_seq: 4,
+        attributes: %{"tier" => "gold"},
+        state_meta: %{"running" => %{"worker" => "worker-1"}},
+        payload_ref: "payload-must-remain-in-the-log"
+      })
+
+    encoded_record = Ferricstore.Flow.encode_record(record)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, 41, [
+               {state_key, encoded_record, 0}
+             ])
+
+    :ets.insert(
+      keydir,
+      {state_key, nil, 0, 0, {:waraft_apply_projection, 41}, 0, byte_size(encoded_record)}
+    )
+
+    state = %{
+      path: path,
+      instance_ctx: %{data_dir: root, keydir_refs: {keydir}},
+      shard_index: 0,
+      terminal_count_inits: MapSet.new()
+    }
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(root, 0)
+    end)
+
+    assert {:ok, ops, _state} =
+             ProjectionOps.expand_ops(state, [
+               {:project_flow_state_from_source, state_key, 4}
+             ])
+
+    assert {:put, ^state_key, query_row} =
+             Enum.find(ops, fn
+               {:put, ^state_key, _value} -> true
+               _other -> false
+             end)
+
+    assert {:ok, decoded} = QueryRowCodec.decode(query_row, state_key)
+    assert decoded.record.attributes == %{"tier" => "gold"}
+    assert decoded.record.state_meta == %{"running" => %{"worker" => "worker-1"}}
+    assert decoded.locator.file_id == {:waraft_apply_projection, 41}
+    assert decoded.locator.version == 4
+    assert decoded.locator.value_size == byte_size(encoded_record)
+    assert :nomatch = :binary.match(query_row, encoded_record)
+    assert :nomatch = :binary.match(query_row, "payload-must-remain-in-the-log")
+
+    catalog_key = Keys.type_catalog_member_key(record.type, state_key)
+    assert {:ok, {:put, source_key, source_value}} = SourceCatalog.put_op(catalog_key, state_key)
+    assert {:put_new, source_key, source_value} in ops
+  end
+
+  test "Flow projection makes every apply-projection source durable before returning query rows" do
+    root = tmp_lmdb_path("query_row_durable_sources")
+    path = Path.join(root, "query")
+    keydir = :ets.new(:query_row_durable_sources, [:set, :public])
+
+    sources =
+      Enum.map(1..2, fn version ->
+        id = "durable-query-row-#{version}"
+        state_key = Keys.state_key(id, "tenant-a")
+
+        record =
+          active_flow_record(id, "jobs", "tenant-a")
+          |> Map.merge(%{
+            version: version,
+            state: "queued",
+            state_enter_seq: version,
+            next_run_at_ms: 1_000 + version
+          })
+
+        encoded = Ferricstore.Flow.encode_record(record)
+        index = 50 + version
+
+        assert :ok =
+                 Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, index, [
+                   {state_key, encoded, 0}
+                 ])
+
+        :ets.insert(
+          keydir,
+          {state_key, nil, 0, 0, {:waraft_apply_projection, index}, 0, byte_size(encoded)}
+        )
+
+        %{index: index, key: state_key, record: record}
+      end)
+
+    state = %{
+      path: path,
+      instance_ctx: %{data_dir: root, keydir_refs: {keydir}},
+      shard_index: 0,
+      terminal_count_inits: MapSet.new()
+    }
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(root, 0)
+      File.rm_rf!(root)
+    end)
+
+    ops =
+      Enum.map(sources, fn source ->
+        {:project_flow_state_from_source, source.key, source.record.version}
+      end)
+
+    assert {:ok, expanded, _state} = ProjectionOps.expand_ops(state, ops)
+
+    physical_locations =
+      Map.new(sources, fn source ->
+        projection_root =
+          root
+          |> Path.join("waraft/ferricstore_waraft_backend.1")
+          |> Path.join("apply_projection_log")
+
+        assert {:ok, location} =
+                 :ferricstore_waraft_spike_segment_log.location_for_index(
+                   to_charlist(projection_root),
+                   source.index
+                 )
+
+        {source.index, location}
+      end)
+
+    locators =
+      Enum.map(sources, fn source ->
+        assert {:put, _key, query_row} =
+                 Enum.find(expanded, fn
+                   {:put, key, _value} -> key == source.key
+                   _other -> false
+                 end)
+
+        assert {:ok, %{locator: locator}} = QueryRowCodec.decode(query_row, source.key)
+
+        assert {locator.segment_generation, locator.offset, locator.frame_size} ==
+                 Map.fetch!(physical_locations, source.index)
+
+        {source.key, locator}
+      end)
+
+    _removed = Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(root, 0)
+
+    assert {:ok, hydrated} =
+             Ferricstore.Flow.RecordHydrator.read_many(
+               %{data_dir: root},
+               0,
+               locators,
+               max_bytes: 1_000_000
+             )
+
+    assert Enum.map(hydrated, &{&1.id, &1.version}) ==
+             Enum.map(sources, &{&1.record.id, &1.record.version})
+  end
+
+  test "inline Flow projection commands are rejected" do
+    path = tmp_lmdb_path("inline_without_source")
+    state_key = Ferricstore.Flow.Keys.state_key("inline-flow", "tenant-a")
+
+    encoded =
+      "inline-flow"
+      |> active_flow_record("jobs", "tenant-a")
+      |> Map.merge(%{state: "queued", state_enter_seq: 1})
+      |> Ferricstore.Flow.encode_record()
+
+    state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{keydir_refs: {:ets.new(:inline_without_source, [:set, :public])}},
+      terminal_count_inits: MapSet.new()
+    }
+
+    assert {:error, :inline_flow_projection_unsupported} =
+             ProjectionOps.expand_ops(state, [
+               {:project_flow_state, state_key, encoded, 0}
+             ])
+
+    assert {:error, :inline_flow_projection_unsupported} =
+             ProjectionOps.expand_ops(state, [
+               {:project_flow_query_state, state_key, encoded, 0}
+             ])
+  end
+
+  test "raw state-key operations cannot bypass compact source projection" do
+    path = tmp_lmdb_path("raw_state_projection")
+    state_key = Keys.state_key("raw-flow", "tenant-a")
+
+    state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: %{keydir_refs: {:ets.new(:raw_state_projection, [:set, :public])}},
+      terminal_count_inits: MapSet.new()
+    }
+
+    for op <- [
+          {:put, state_key, "full-record"},
+          {:put_new, state_key, "full-record"},
+          {:delete, state_key},
+          {:project_kv_from_source, state_key}
+        ] do
+      assert {:error, :flow_state_requires_compact_source_projection} =
+               ProjectionOps.expand_ops(state, [op])
+    end
+  end
+
   test "source pending retry configuration has a bounded combined wait budget" do
     assert ProjectionOps.__normalize_source_pending_config_for_test__("many", :slow) == {100, 1}
 
@@ -702,7 +974,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
   end
 
   test "versioned source projection waits for the expected record version" do
-    path = tmp_lmdb_path("versioned_source")
+    root = tmp_lmdb_path("versioned_source")
+    path = Path.join(root, "query")
     keydir = :ets.new(:versioned_projection_source, [:set, :public])
     state_key = Ferricstore.Flow.Keys.state_key("versioned-flow", "tenant-a")
 
@@ -716,20 +989,41 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
       |> Map.merge(%{version: 3, state: "failed", updated_at_ms: 30, next_run_at_ms: nil})
       |> Ferricstore.Flow.encode_record()
 
-    :ets.insert(keydir, {state_key, stale, 0, 0, :hot, 0, byte_size(stale)})
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, 2, [
+               {state_key, stale, 0}
+             ])
+
+    :ets.insert(
+      keydir,
+      {state_key, nil, 0, 0, {:waraft_apply_projection, 2}, 0, byte_size(stale)}
+    )
 
     updater =
       Task.async(fn ->
         Process.sleep(5)
-        :ets.insert(keydir, {state_key, current, 0, 0, :hot, 0, byte_size(current)})
+
+        :ok =
+          Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, 3, [
+            {state_key, current, 0}
+          ])
+
+        :ets.insert(
+          keydir,
+          {state_key, nil, 0, 0, {:waraft_apply_projection, 3}, 0, byte_size(current)}
+        )
       end)
 
     state = %{
       path: path,
       shard_index: 0,
-      instance_ctx: %{keydir_refs: {keydir}},
+      instance_ctx: %{data_dir: root, keydir_refs: {keydir}},
       terminal_count_inits: MapSet.new()
     }
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(root, 0)
+    end)
 
     assert {:ok, ops, _state} =
              ProjectionOps.expand_ops(state, [
@@ -738,8 +1032,12 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
 
     Task.await(updater)
     assert :ok = LMDB.write_batch(path, ops)
-    assert {:ok, wrapper} = LMDB.get(path, state_key)
-    assert {:ok, %{version: 3, state: "failed"}} = ProjectionOps.decode_flow_record_value(wrapper)
+    assert {:ok, query_row} = LMDB.get(path, state_key)
+
+    assert {:ok, %{record: %{version: 3, state: "failed"}, locator: locator}} =
+             QueryRowCodec.decode(query_row, state_key)
+
+    assert locator.file_id == {:waraft_apply_projection, 3}
   end
 
   test "coalescing preserves the highest expected source version" do
@@ -773,11 +1071,25 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
     keydir = :ets.new(:deleted_versioned_projection_source, [:set, :public])
     state_key = Ferricstore.Flow.Keys.state_key("deleted-flow", "tenant-a")
 
-    projected =
+    record =
       active_flow_record("deleted-flow", "jobs", "tenant-a")
       |> Map.merge(%{version: 3, state: "failed", updated_at_ms: 30, next_run_at_ms: nil})
-      |> Ferricstore.Flow.encode_record()
-      |> LMDB.encode_value(0)
+
+    locator =
+      Locator.new!(
+        flow_id: "deleted-flow",
+        kind: :state,
+        version: 3,
+        raft_index: 3,
+        file_id: {:waraft_apply_projection, 3},
+        offset: 0,
+        value_size: byte_size(Ferricstore.Flow.encode_record(record)),
+        frame_size: 1_024,
+        segment_generation: 0,
+        checksum: :crypto.hash(:sha256, Ferricstore.Flow.encode_record(record))
+      )
+
+    assert {:ok, projected} = QueryRowCodec.encode(state_key, record, locator, 0)
 
     assert :ok = LMDB.write_batch(path, [{:put, state_key, projected}])
     :ets.insert(keydir, {state_key, nil, 0, :flow_state_deleted, :deleted, 0, 0})

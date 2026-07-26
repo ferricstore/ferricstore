@@ -1,6 +1,8 @@
 defmodule Ferricstore.Flow.Query.IndexRegistryOverview do
   @moduledoc false
 
+  alias Ferricstore.Flow.Query.{CompositeCounter, CompositeIndex, QueryRowCodec}
+
   @build_phases [:pending, :snapshot, :backfill, :done]
   @validation_phases [:pending, :source, :index, :counter, :cleanup, :done]
   @retirement_phases [:pending, :fence, :index, :counter, :reverse, :cleanup, :done]
@@ -32,10 +34,22 @@ defmodule Ferricstore.Flow.Query.IndexRegistryOverview do
         end),
       workloads: entry.definition.workloads,
       count_prefixes: entry.definition.count_prefixes,
+      covering_fields: entry.definition.covering_fields,
+      format: storage_format(entry.definition),
       coverage: coverage,
       build: build_progress(entry.checkpoints, shard_count),
       validation: validation_progress(entry.validation, shard_count),
       retirement: retirement_progress(entry.retirement, shard_count)
+    }
+  end
+
+  defp storage_format(definition) do
+    %{
+      query_row: QueryRowCodec.format(),
+      key: CompositeIndex.key_format(),
+      entry: CompositeIndex.entry_format(definition),
+      reverse: CompositeIndex.reverse_format(),
+      counter: if(definition.count_prefixes == [], do: nil, else: CompositeCounter.format())
     }
   end
 

@@ -23,6 +23,10 @@
     location_for_index/2,
     read_disk/2,
     read_disk_at/4,
+    open_disk_reader/3,
+    read_disk_reader/4,
+    read_disk_reader_many/2,
+    close_disk_reader/1,
     reset_disk_to_position/2,
     memory_status/1,
     ensure_segment_config/1,
@@ -31,6 +35,7 @@
     write_projection_batches/2,
     write_projection_batches_sync/2,
     compact_apply_projection/3,
+    compact_apply_projection_stream/3,
     close_process_writers/1
 ]).
 
@@ -57,6 +62,8 @@
 -define(TRIM_FLOOR_FILE, "trim_floor.term").
 -define(RECORD_HEADER_SIZE, 8).
 -define(MAX_RECORD_BYTES, 1073741824).
+-define(MAX_DISK_READER_BATCH_RECORDS, 4096).
+-define(MAX_DISK_READER_BATCH_BYTES, 1073741824).
 -define(MAX_SEGMENT_METADATA_BYTES, 1048576).
 -define(REWRITE_MARKER_EXT, ".rewrite.term").
 -define(REWRITE_STAGING_PREFIX, ".rewrite.staging.").

@@ -53,6 +53,16 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
                             @root,
                             "bench/query_planner_native_read_candidates_bench.exs"
                           )
+  @covering_read_candidates Path.join(
+                              @root,
+                              "bench/query_planner_covering_index_candidates_bench.exs"
+                            )
+  @covering_write_cost Path.join(@root, "bench/query_covering_write_cost_bench.exs")
+  @storage_layout Path.join(@root, "bench/query_storage_layout_bench.exs")
+  @storage_fixture Path.join(@root, "bench/support/query_storage_fixture.exs")
+  @soak_fixture Path.join(@root, "bench/support/query_soak_fixture.exs")
+  @index_benchmark Path.join(@root, "bench/flow_query_index_bench.exs")
+  @query_soak Path.join(@root, "bench/flow_query_soak.exs")
   @test_workflow Path.join(@root, ".github/workflows/test.yml")
   @benchmark_workflow Path.join(@root, ".github/workflows/query-performance.yml")
 
@@ -458,7 +468,8 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
           "LMDB.prefix_merge_entries",
           "invalid_composite_entry",
           "true = scanned == min(shards * page, shards * 5_000)",
-          "paired native"
+          "paired native",
+          "def smoke"
         ] do
       assert native =~ contract,
              "missing native-read candidate contract #{inspect(contract)}"
@@ -481,6 +492,145 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
       assert source =~ contract,
              "missing result projection benchmark contract #{inspect(contract)}"
     end
+  end
+
+  test "covering write benchmark includes committed steady-state and migration workloads" do
+    source = read!(@covering_write_cost)
+
+    for contract <- [
+          "CompositeProjection.reconcile",
+          "LMDB.write_batch",
+          "plain v1 reconcile + LMDB commit",
+          "covering v2 reconcile + LMDB commit",
+          "upgrade dual-generation reconcile + LMDB commit"
+        ] do
+      assert source =~ contract,
+             "missing covering-write benchmark contract #{inspect(contract)}"
+    end
+  end
+
+  test "covering read benchmark compares production QueryRow hydration with zero-log reads" do
+    source = read!(@covering_read_candidates)
+
+    for contract <- [
+          "QueryStorageFixture.write!",
+          "BENCH_COVERING_RECORDS_PER_LOG_ENTRY",
+          "page_records: min(records_per_log_entry, count)",
+          "QueryRecordStore.read_many(",
+          "production index scan plus authoritative hydration",
+          "production covered projection without log reads"
+        ] do
+      assert source =~ contract,
+             "missing covering-read benchmark contract #{inspect(contract)}"
+    end
+
+    refute source =~ "LMDB.encode_value("
+    refute source =~ "LMDB.decode_value("
+    refute source =~ "Codec.decode_records("
+    refute source =~ "legacy"
+  end
+
+  test "storage layout benchmark proves equivalence and reports duplication savings" do
+    source = read!(@storage_layout)
+
+    for contract <- [
+          "QueryStorageFixture.write!",
+          "BENCH_STORAGE_RECORDS_PER_LOG_ENTRY",
+          "QueryRecordStore.read_many(",
+          "previous duplicated LMDB full-record read",
+          "production QueryRow + authoritative-log read",
+          "lmdb_logical_savings_percent",
+          "total_write_savings_percent",
+          "^previous = production",
+          ~s|:binary.copy("a", 64)|,
+          ~s|:binary.copy("m", 64)|
+        ] do
+      assert source =~ contract,
+             "missing storage-layout benchmark contract #{inspect(contract)}"
+    end
+
+    refute source =~ ":binary.copy(<<"
+  end
+
+  test "storage layout benchmark can isolate compact-row lookup and authoritative hydration" do
+    source = read!(@storage_layout)
+
+    for contract <- [
+          "BENCH_STORAGE_DIAGNOSTICS",
+          "BENCH_STORAGE_BATCH_READ_ONLY",
+          "BENCH_STORAGE_HYDRATION_ONLY",
+          "BENCH_STORAGE_CANDIDATE_READER_LANES",
+          "BENCH_STORAGE_COLD_CACHE",
+          "QueryRowStore.read_references_many(",
+          "RecordHydrator.read_many(",
+          "diagnostic compact QueryRow reference read",
+          "diagnostic authoritative-log hydration",
+          "candidate inline-record hydration",
+          "diagnostic authoritative raw batch read",
+          "production authoritative vector batch read",
+          "production physical locator batch read",
+          "candidate registry + retained-fd vector read",
+          "candidate retained-fd authoritative batch read",
+          "candidate coalesced-adjacent authoritative batch read",
+          "diagnostic locator SHA-256 validation",
+          "diagnostic authoritative record batch decode",
+          "WARaftSegmentReader.read_values_from_location(",
+          "WARaftSegmentReader.read_values_from_locations(",
+          "WARaftSegmentReader.read_physical_values(",
+          "RecordIdentity.owns_state_key?",
+          "diagnostic segment location lookup",
+          "diagnostic segment read at known location",
+          "candidate verified single-pread segment read",
+          "candidate retained-fd single-pread segment read",
+          ":ferricstore_waraft_spike_segment_log.location_for_index(",
+          ":ferricstore_waraft_spike_segment_log.read_disk_at(",
+          ":erlang.crc32(payload)",
+          ":erlang.binary_to_term(payload, [:safe, :used])",
+          "DiskReader.invalidate",
+          ~s|System.cmd("vmtouch", ["-e", path]|,
+          ~s|write_manual_metrics("query-storage-layout-cold"|,
+          "Task.async(fn -> candidate_retained_segment_read(dataset) end)",
+          "retained_segment_reader_loop",
+          ":file.pread(fd, locations)",
+          ":file.pread(fd, offset, bytes)",
+          ":ferricstore_waraft_segment_offset_registry",
+          "diagnostic_requests"
+        ] do
+      assert source =~ contract,
+             "missing storage-layout diagnostic contract #{inspect(contract)}"
+    end
+  end
+
+  test "end-to-end query benchmarks use authoritative log records and compact QueryRows" do
+    fixture = read!(@storage_fixture)
+    consumers = read!(@soak_fixture) <> read!(@index_benchmark) <> read!(@query_soak)
+
+    for contract <- [
+          "WARaftSegmentReader.put_apply_projection",
+          "ensure_apply_projection_entries_durable",
+          "WARaftSegmentReader.physical_location",
+          "RuntimeSupervisor.ensure_started()",
+          "ProjectionLocator.decode_source",
+          "QueryRowCodec.encode",
+          "SourceCatalog.put_op"
+        ] do
+      assert fixture =~ contract,
+             "missing production storage benchmark contract #{inspect(contract)}"
+    end
+
+    assert consumers =~ "QueryStorageFixture.write!"
+    refute consumers =~ "LMDB.encode_value(Codec.encode_record(record), 0)"
+
+    soak = read!(@query_soak)
+    index = read!(@index_benchmark)
+
+    assert soak =~ "QueryRecordStore.read_many("
+    assert soak =~ "QueryRowStore.read_references_many("
+    refute soak =~ "LMDB.decode_value("
+    refute soak =~ "Codec.decode_records("
+
+    assert index =~ "storage.encoded_by_key"
+    refute index =~ "Codec.encode_record(record)"
   end
 
   test "Linux profiling runner records perf, flamegraph, cache, and allocator evidence" do
@@ -510,6 +660,9 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
     assert test_workflow =~ "cargo bench --manifest-path"
     assert test_workflow =~ "--bench fql_parser --bench fql_allocations --no-run"
     assert test_workflow =~ "BENCH_ALLOC_ITERATIONS=1000"
+    assert test_workflow =~ "MIX_ENV=bench mix deps.get"
+    assert test_workflow =~ "BENCH_CANDIDATE_SECTION=smoke"
+    assert test_workflow =~ "bench/query_planner_native_read_candidates_bench.exs"
 
     assert benchmark_workflow =~ "schedule:"
     assert benchmark_workflow =~ "ubuntu-24.04"
@@ -531,6 +684,11 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
     assert benchmark_workflow =~ ~s(BENCH_HARNESS: ${{ github.workspace }})
     assert benchmark_workflow =~ ~s("$BENCH_HARNESS/bench/fql_parser_bench.exs")
     assert benchmark_workflow =~ ~s(BASELINE_RESULTS=$RUNNER_TEMP/baseline-results)
+    assert benchmark_workflow =~ "Run authoritative query storage acceptance"
+    assert benchmark_workflow =~ ~s(BENCH_STORAGE_RECORDS_PER_LOG_ENTRY: "1")
+    assert benchmark_workflow =~ ~s(BENCH_STORAGE_COLD_CACHE: "1")
+    assert benchmark_workflow =~ ~s(BENCH_PARALLEL: "16")
+    assert benchmark_workflow =~ "bench/query_storage_layout_bench.exs"
     refute benchmark_workflow =~ ~s(${{ runner.temp }})
   end
 

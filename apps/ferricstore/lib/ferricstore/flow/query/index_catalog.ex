@@ -98,8 +98,10 @@ defmodule Ferricstore.Flow.Query.IndexCatalog do
        )
        when is_list(fields) and is_list(workloads) do
     count_prefixes = Map.get(attrs, "count_prefixes", [])
+    covering_fields = Map.get(attrs, "covering_fields", [])
 
     with {:ok, fields} <- decode_fields(fields),
+         {:ok, covering_fields} <- decode_covering_fields(covering_fields),
          {:ok, definition} <-
            IndexDefinition.new(%{
              id: id,
@@ -107,6 +109,7 @@ defmodule Ferricstore.Flow.Query.IndexCatalog do
              source: :runs,
              workloads: workloads,
              count_prefixes: count_prefixes,
+             covering_fields: covering_fields,
              scope_bytes: scope_bytes,
              fields: fields
            }) do
@@ -129,6 +132,25 @@ defmodule Ferricstore.Flow.Query.IndexCatalog do
       {:error, _reason} = error -> error
     end
   end
+
+  defp decode_covering_fields(fields) when is_list(fields) do
+    Enum.reduce_while(fields, {:ok, []}, fn
+      field, {:ok, acc} when is_binary(field) ->
+        case Field.parse(field) do
+          {:ok, decoded} -> {:cont, {:ok, [decoded | acc]}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_index_covering_fields}}
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp decode_covering_fields(_fields), do: {:error, :invalid_index_covering_fields}
 
   defp decode_field(%{"name" => name, "direction" => direction, "encoding" => encoding}) do
     with {:ok, field} <- Field.parse(name),
@@ -159,10 +181,10 @@ defmodule Ferricstore.Flow.Query.IndexCatalog do
       |> Enum.map(fn definition ->
         {definition.id, definition.version, definition.source, Enum.sort(definition.workloads),
          definition.fields, definition.count_prefixes, definition.scope_bytes,
-         definition.fingerprint}
+         definition.covering_fields, definition.fingerprint}
       end)
       |> Enum.sort_by(fn {id, definition_version, _source, _workloads, _fields, _prefixes,
-                          _scope_bytes, _fingerprint} ->
+                          _scope_bytes, _covering_fields, _fingerprint} ->
         {id, definition_version}
       end)
 

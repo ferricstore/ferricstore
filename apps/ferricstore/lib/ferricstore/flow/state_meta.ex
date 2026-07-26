@@ -13,7 +13,7 @@ defmodule Ferricstore.Flow.StateMeta do
   @min_i64 -0x8000_0000_0000_0000
   @max_i64 0x7FFF_FFFF_FFFF_FFFF
 
-  @type value :: binary() | integer() | float() | boolean()
+  @type value :: nil | binary() | integer() | float() | boolean()
   @type state_meta :: %{optional(binary()) => %{optional(binary()) => value()}}
 
   def update_from_opts(opts) do
@@ -39,10 +39,17 @@ defmodule Ferricstore.Flow.StateMeta do
   end
 
   def apply_update(record, attrs) when is_map(record) and is_map(attrs) do
+    case apply_update_result(record, attrs) do
+      {:ok, updated} -> updated
+      {:error, _reason} -> record
+    end
+  end
+
+  def apply_update_result(record, attrs) when is_map(record) and is_map(attrs) do
     update = Map.get(attrs, :state_meta_update, %{})
 
     if map_size(update) == 0 do
-      record
+      {:ok, record}
     else
       state = Map.get(attrs, :state_meta_state) || logical_state(record)
 
@@ -51,12 +58,13 @@ defmodule Ferricstore.Flow.StateMeta do
            {:ok, current} <- normalize(record(record)),
            merged = Map.update(current, state, update, &Map.merge(&1, update)),
            {:ok, merged} <- normalize(merged) do
-        put_record(record, merged)
-      else
-        _ -> record
+        {:ok, put_record(record, merged)}
       end
     end
   end
+
+  def apply_update_result(_record, _attrs),
+    do: {:error, "ERR invalid flow state_meta update"}
 
   def encode_sidecar(state_meta) when is_map(state_meta) do
     case normalize(state_meta) do
@@ -87,6 +95,21 @@ defmodule Ferricstore.Flow.StateMeta do
   end
 
   def normalize(_state_meta), do: {:error, "ERR flow state_meta must be a map"}
+
+  @doc false
+  @spec valid_normalized?(term()) :: boolean()
+  def valid_normalized?(state_meta)
+      when is_map(state_meta) and map_size(state_meta) <= @max_states do
+    Enum.all?(state_meta, fn {state, meta} ->
+      valid_normalized_state?(state) and is_map(meta) and
+        map_size(meta) <= @max_entries_per_state and
+        Enum.all?(meta, fn {name, value} ->
+          valid_normalized_key?(name) and valid_normalized_value?(value)
+        end)
+    end) and encoded_size(state_meta) <= @max_total_bytes
+  end
+
+  def valid_normalized?(_state_meta), do: false
 
   def query_from_opts(opts) do
     opts
@@ -203,11 +226,15 @@ defmodule Ferricstore.Flow.StateMeta do
 
   defp matches_normalized?(state_meta, filters) do
     Enum.all?(filters, fn {state, expected_meta} ->
-      actual_meta = Map.get(state_meta, state, %{})
+      case Map.fetch(state_meta, state) do
+        {:ok, actual_meta} ->
+          Enum.all?(expected_meta, fn {name, expected} ->
+            Map.fetch(actual_meta, name) == {:ok, expected}
+          end)
 
-      Enum.all?(expected_meta, fn {name, expected} ->
-        Map.get(actual_meta, name) == expected
-      end)
+        :error ->
+          false
+      end
     end)
   end
 
@@ -248,12 +275,16 @@ defmodule Ferricstore.Flow.StateMeta do
     do: state |> Atom.to_string() |> normalize_state()
 
   defp normalize_state(state) when is_binary(state) do
-    state = String.trim(state)
+    if String.valid?(state) do
+      state = String.trim(state)
 
-    cond do
-      state == "" -> {:error, "ERR flow state_meta state must not be empty"}
-      byte_size(state) > @max_state_bytes -> {:error, "ERR flow state_meta state too large"}
-      true -> {:ok, state}
+      cond do
+        state == "" -> {:error, "ERR flow state_meta state must not be empty"}
+        byte_size(state) > @max_state_bytes -> {:error, "ERR flow state_meta state too large"}
+        true -> {:ok, state}
+      end
+    else
+      {:error, "ERR flow state_meta state must be valid UTF-8"}
     end
   end
 
@@ -262,13 +293,17 @@ defmodule Ferricstore.Flow.StateMeta do
   defp normalize_key(key) when is_atom(key), do: key |> Atom.to_string() |> normalize_key()
 
   defp normalize_key(key) when is_binary(key) do
-    key = String.trim(key)
+    if String.valid?(key) do
+      key = String.trim(key)
 
-    cond do
-      key == "" -> {:error, "ERR flow state_meta key must not be empty"}
-      byte_size(key) > @max_key_bytes -> {:error, "ERR flow state_meta key too large"}
-      String.starts_with?(key, "__") -> {:error, "ERR flow state_meta key is reserved"}
-      true -> {:ok, key}
+      cond do
+        key == "" -> {:error, "ERR flow state_meta key must not be empty"}
+        byte_size(key) > @max_key_bytes -> {:error, "ERR flow state_meta key too large"}
+        String.starts_with?(key, "__") -> {:error, "ERR flow state_meta key is reserved"}
+        true -> {:ok, key}
+      end
+    else
+      {:error, "ERR flow state_meta key must be valid UTF-8"}
     end
   end
 
@@ -296,6 +331,7 @@ defmodule Ferricstore.Flow.StateMeta do
   end
 
   defp normalize_value(value) when is_boolean(value), do: {:ok, value}
+  defp normalize_value(nil), do: {:ok, nil}
 
   defp normalize_value(value) when is_atom(value) and not is_nil(value),
     do: value |> Atom.to_string() |> normalize_value()
@@ -306,6 +342,32 @@ defmodule Ferricstore.Flow.StateMeta do
     <<_sign::1, exponent::11, _fraction::52>> = <<value::float-big-64>>
     exponent != 0x7FF
   end
+
+  defp valid_normalized_state?(state)
+       when is_binary(state) and state != "" and byte_size(state) <= @max_state_bytes do
+    String.valid?(state) and String.trim(state) == state
+  end
+
+  defp valid_normalized_state?(_state), do: false
+
+  defp valid_normalized_key?(key)
+       when is_binary(key) and key != "" and byte_size(key) <= @max_key_bytes do
+    String.valid?(key) and String.trim(key) == key and not String.starts_with?(key, "__")
+  end
+
+  defp valid_normalized_key?(_key), do: false
+
+  defp valid_normalized_value?(value)
+       when is_binary(value) and byte_size(value) <= @max_value_bytes,
+       do: true
+
+  defp valid_normalized_value?(value)
+       when is_integer(value) and value >= @min_i64 and value <= @max_i64,
+       do: true
+
+  defp valid_normalized_value?(value) when is_float(value), do: finite_float?(value)
+  defp valid_normalized_value?(value) when is_boolean(value) or is_nil(value), do: true
+  defp valid_normalized_value?(_value), do: false
 
   defp validate_state_count(count) when count <= @max_states, do: :ok
   defp validate_state_count(_count), do: {:error, "ERR too many flow state_meta states"}
@@ -337,6 +399,7 @@ defmodule Ferricstore.Flow.StateMeta do
   defp value_size(value) when is_integer(value), do: 8
   defp value_size(value) when is_float(value), do: 8
   defp value_size(value) when is_boolean(value), do: 1
+  defp value_size(nil), do: 0
 
   defp logical_state(record), do: Map.get(record, :run_state) || Map.get(record, :state)
 

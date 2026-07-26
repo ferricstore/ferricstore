@@ -975,9 +975,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
   end
 
   defp flush_ops_and_marker(state, ops, started_at) do
-    LMDBFlushCoordinator.with_shard_permit(state.instance_name, state.shard_index, fn ->
-      flush_ops_and_marker_with_permit(state, ops, started_at)
-    end)
+    case LMDBFlushCoordinator.with_shard_permit(state.instance_name, state.shard_index, fn ->
+           flush_ops_and_marker_with_permit(state, ops, started_at)
+         end) do
+      {:error, :lmdb_flush_coordinator_unavailable} ->
+        {:error, :lmdb_flush_coordinator_unavailable, state}
+
+      result ->
+        result
+    end
   end
 
   defp flush_ops_and_marker_with_permit(state, ops, started_at) do

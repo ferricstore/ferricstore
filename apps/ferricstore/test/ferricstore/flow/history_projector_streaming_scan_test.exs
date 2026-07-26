@@ -56,7 +56,7 @@ defmodule Ferricstore.Flow.HistoryProjectorStreamingScanTest do
     File.mkdir_p!(history_dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
-    expired_at_ms = System.system_time(:millisecond) - 1
+    expired_at_ms = Ferricstore.HLC.now_ms() - 1
 
     assert {:ok, [_location]} =
              NIF.v2_append_batch(history_path, [{"expired", "secret", expired_at_ms}])

@@ -1,7 +1,8 @@
 defmodule Ferricstore.Flow.Hibernation do
   @moduledoc false
 
-  alias Ferricstore.Flow.{ClaimWaiters, FifoLane, Keys, LMDB, Locator}
+  alias Ferricstore.Flow.{ClaimWaiters, FifoLane, Keys, LMDB, Locator, RecordIdentity}
+  alias Ferricstore.Flow.Query.QueryRowCodec
   alias Ferricstore.Raft.ApplyContext
 
   @default_hot_window_ms Application.compile_env(
@@ -271,7 +272,6 @@ defmodule Ferricstore.Flow.Hibernation do
     due_at_ms = Map.fetch!(record, :next_run_at_ms)
     version = Map.get(record, :version, locator.version)
     park_key = park_key(locator, record)
-    state_value = Map.get(candidate, :state_value)
 
     park =
       LMDB.encode_cold_park(locator,
@@ -284,8 +284,7 @@ defmodule Ferricstore.Flow.Hibernation do
         lease_until_ms: Map.get(record, :lease_deadline_ms),
         fencing_token: Map.get(record, :fencing_token),
         retention_at_ms: Map.get(record, :terminal_retention_until_ms),
-        value_refs_digest: value_refs_digest(Map.get(record, :value_refs, %{})),
-        state_value: if(is_binary(state_value), do: state_value)
+        value_refs_digest: value_refs_digest(Map.get(record, :value_refs, %{}))
       )
 
     due_key =
@@ -1290,22 +1289,28 @@ defmodule Ferricstore.Flow.Hibernation do
 
   def relocate_cold_row(_row, _attrs), do: {:error, :invalid_cold_row}
 
-  @spec cold_compaction_ops(promotion_row(), promotion_row()) :: {:ok, list()} | {:error, term()}
-  def cold_compaction_ops(old_row, new_row) do
+  @spec cold_compaction_ops(promotion_row(), promotion_row(), binary()) ::
+          {:ok, list()} | {:error, term()}
+  def cold_compaction_ops(old_row, new_row, query_row) when is_binary(query_row) do
     with true <- valid_promotion_row?(old_row) and valid_promotion_row?(new_row),
          %{locator: %Locator{} = old_locator, park: old_park} <- old_row,
          %{locator: %Locator{} = new_locator, park: new_park} <- new_row,
          true <- Locator.same_logical_record?(old_locator, new_locator),
-         {:ok, park_key} <- cold_compaction_park_key(old_row, new_row, new_locator) do
+         {:ok, park_key} <- cold_compaction_park_key(old_row, new_row, new_locator),
+         {:ok, state_key} <- cold_compaction_state_key(old_park, new_park),
+         {:ok, relocated_query_row} <-
+           QueryRowCodec.relocate(query_row, state_key, old_locator, new_locator) do
       old_reverse_key = LMDB.cold_by_segment_key(old_locator)
 
       {:ok,
        [
          {:compare, park_key, LMDB.encode_cold_park(old_locator, Map.delete(old_park, :locator))},
+         {:compare, state_key, query_row},
          {:compare, old_reverse_key, park_key},
          {:delete, old_reverse_key},
          {:put, LMDB.cold_by_segment_key(new_locator), park_key},
-         {:put, park_key, LMDB.encode_cold_park(new_locator, Map.delete(new_park, :locator))}
+         {:put, park_key, LMDB.encode_cold_park(new_locator, Map.delete(new_park, :locator))},
+         {:put, state_key, relocated_query_row}
        ]}
     else
       false ->
@@ -1321,6 +1326,17 @@ defmodule Ferricstore.Flow.Hibernation do
     end
   rescue
     _error -> {:error, :invalid_cold_row}
+  end
+
+  def cold_compaction_ops(_old_row, _new_row, _query_row), do: {:error, :invalid_query_row}
+
+  defp cold_compaction_state_key(old_park, new_park) do
+    old_state_key = Map.get(old_park, :state_key)
+    new_state_key = Map.get(new_park, :state_key)
+
+    if is_binary(old_state_key) and old_state_key != "" and new_state_key == old_state_key,
+      do: {:ok, old_state_key},
+      else: {:error, :state_key_mismatch}
   end
 
   defp valid_relocation_attrs?(attrs) when is_map(attrs), do: true
@@ -1566,7 +1582,7 @@ defmodule Ferricstore.Flow.Hibernation do
     hot_keys = active_projection_key_set(LMDB.active_projection_entries(record))
     cold_keys = active_projection_key_set(LMDB.active_timeout_projection_entries(record))
 
-    Ferricstore.Flow.Keys.state_key(record.id, Map.get(record, :partition_key)) == state_key and
+    RecordIdentity.owns_state_key?(record, state_key) and
       lane_entry == FifoLane.index_entry(record) and
       (actual_keys == hot_keys or actual_keys == cold_keys)
   rescue
@@ -1596,6 +1612,8 @@ defmodule Ferricstore.Flow.Hibernation do
       bounded_binary?(locator.flow_id) and
       Map.get(record, :id) == locator.flow_id and
       Map.get(record, :version) == locator.version and
+      bounded_binary?(Map.get(record, :state_key)) and
+      RecordIdentity.owns_state_key?(record, Map.get(record, :state_key)) and
       bounded_binary?(Map.get(record, :type)) and
       bounded_binary?(Map.get(record, :state)) and
       u64?(Map.get(record, :next_run_at_ms)) and

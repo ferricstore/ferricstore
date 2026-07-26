@@ -7,6 +7,8 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
   alias Ferricstore.Flow.HistoryProjector.Log
   alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.Query.QueryRowCodec
+  alias Ferricstore.Flow.RecordIdentity
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @max_exact_integer 9_007_199_254_740_991
@@ -17,9 +19,10 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
     case Log.reduce_metadata_pages(file_path, {:ok, %{}}, &accumulate_live_history_record/2) do
       {:ok, {:ok, live_records}} ->
         keydir = keydir_override || HistoryProjector.keydir(instance_ctx, shard_index)
-        {entries, locations} = recovered_history_entries(live_records, keydir, shard_data_path)
 
-        with :ok <-
+        with {:ok, {entries, locations}} <-
+               recovered_history_entries(live_records, keydir, shard_data_path),
+             :ok <-
                HistoryProjector.publish_lmdb_history_locations(
                  shard_data_path,
                  0,
@@ -111,44 +114,55 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
     do: {:error, {:invalid_history_log_record, record}}
 
   def recovered_history_entries(live_records, keydir, shard_data_path) do
-    {entries, locations, _caps} =
-      Enum.reduce(live_records, {[], [], %{}}, fn {key, {offset, value_size, expire_at_ms}},
-                                                  {entries, locations, caps} ->
+    live_records
+    |> Enum.reduce_while({:ok, [], [], %{}}, fn
+      {key, {offset, value_size, expire_at_ms}}, {:ok, entries, locations, caps} ->
         case KeyCodec.parse_history_entry_key(key) do
           {:ok, history_key, event_id, event_ms} ->
-            {history_hot_max_events, caps} =
-              recovered_history_hot_cap(history_key, keydir, shard_data_path, caps)
+            case recovered_history_hot_cap(history_key, keydir, shard_data_path, caps) do
+              {:ok, history_hot_max_events, next_caps} ->
+                entry = %{
+                  key: key,
+                  expire_at_ms: expire_at_ms,
+                  history_key: history_key,
+                  event_id: event_id,
+                  event_ms: event_ms,
+                  version: recovered_history_event_version(event_id),
+                  history_hot_max_events: history_hot_max_events
+                }
 
-            version = recovered_history_event_version(event_id)
+                {:cont, {:ok, [entry | entries], [{offset, value_size} | locations], next_caps}}
 
-            entry = %{
-              key: key,
-              expire_at_ms: expire_at_ms,
-              history_key: history_key,
-              event_id: event_id,
-              event_ms: event_ms,
-              version: version,
-              history_hot_max_events: history_hot_max_events
-            }
-
-            {[entry | entries], [{offset, value_size} | locations], caps}
+              {:error, _reason} = error ->
+                {:halt, error}
+            end
 
           :error ->
-            {entries, locations, caps}
+            {:halt, {:error, {:invalid_history_log_key, key}}}
         end
-      end)
 
-    {Enum.reverse(entries), Enum.reverse(locations)}
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_history_recovery_entry}}
+    end)
+    |> case do
+      {:ok, entries, locations, _caps} ->
+        {:ok, {Enum.reverse(entries), Enum.reverse(locations)}}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   def recovered_history_hot_cap(history_key, keydir, shard_data_path, caps) do
     case Map.fetch(caps, history_key) do
       {:ok, max_events} ->
-        {max_events, caps}
+        {:ok, max_events, caps}
 
       :error ->
-        max_events = load_history_hot_cap(history_key, keydir, shard_data_path)
-        {max_events, Map.put(caps, history_key, max_events)}
+        case load_history_hot_cap(history_key, keydir, shard_data_path) do
+          {:ok, max_events} -> {:ok, max_events, Map.put(caps, history_key, max_events)}
+          {:error, _reason} = error -> error
+        end
     end
   end
 
@@ -160,35 +174,76 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   end
 
   def load_history_hot_cap(history_key, keydir, shard_data_path) do
-    with {:ok, state_key} <- history_state_key(history_key),
-         {:ok, %{history_hot_max_events: max_events}} <-
-           load_history_state_record(state_key, keydir, shard_data_path),
-         true <- is_integer(max_events) and max_events >= 0 do
-      max_events
-    else
-      _ -> default_history_hot_max_events()
+    case history_state_key(history_key) do
+      {:ok, state_key} ->
+        case load_history_state_record(state_key, keydir, shard_data_path) do
+          {:ok, %{history_hot_max_events: max_events}}
+          when is_integer(max_events) and max_events >= 0 and max_events <= @max_exact_integer ->
+            {:ok, max_events}
+
+          :not_found ->
+            {:ok, default_history_hot_max_events()}
+
+          {:ok, _invalid} ->
+            {:error, :invalid_history_hot_cap}
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      :error ->
+        {:error, :invalid_history_key}
     end
   end
 
   def load_history_state_record(state_key, keydir, shard_data_path) do
     case HistoryProjector.safe_ets_lookup(keydir, state_key) do
       [{^state_key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size} = row] ->
-        with {:ok, value} <- keydir_row_value(shard_data_path, row) do
-          decode_flow_record(value)
+        case keydir_row_value(shard_data_path, row) do
+          {:ok, value} ->
+            case decode_flow_record(value) do
+              {:ok, record} when is_map(record) ->
+                if RecordIdentity.owns_state_key?(record, state_key),
+                  do: {:ok, record},
+                  else: {:error, :corrupt_history_state_record}
+
+              _invalid ->
+                {:error, :corrupt_history_state_record}
+            end
+
+          {:error, reason} ->
+            {:error, {:history_state_read_failed, reason}}
+
+          _invalid ->
+            {:error, :corrupt_history_state_keydir_entry}
         end
 
-      _ ->
+      [] ->
         load_lmdb_history_state_record(state_key, shard_data_path)
+
+      _invalid ->
+        {:error, :corrupt_history_state_keydir_entry}
     end
   end
 
   def load_lmdb_history_state_record(state_key, shard_data_path) do
     path = Ferricstore.Flow.LMDB.path(shard_data_path)
 
-    with {:ok, blob} <- Ferricstore.Flow.LMDB.get(path, state_key),
-         {:ok, value} <-
-           Ferricstore.Flow.LMDB.decode_value(blob, System.system_time(:millisecond)) do
-      decode_flow_record(value)
+    case Ferricstore.Flow.LMDB.get(path, state_key) do
+      {:ok, blob} when is_binary(blob) ->
+        case QueryRowCodec.decode(blob, state_key) do
+          {:ok, %{record: record}} when is_map(record) -> {:ok, record}
+          _invalid -> {:error, :corrupt_history_query_row}
+        end
+
+      :not_found ->
+        :not_found
+
+      {:error, reason} ->
+        {:error, {:history_query_row_read_failed, reason}}
+
+      _invalid ->
+        {:error, :corrupt_history_query_row}
     end
   end
 

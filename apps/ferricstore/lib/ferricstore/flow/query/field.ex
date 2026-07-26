@@ -147,22 +147,34 @@ defmodule Ferricstore.Flow.Query.Field do
   @spec fetch(map(), t()) :: {:ok, term()} | :missing
   def fetch(record, :run_id) when is_map(record), do: fetch_map(record, :id, "id")
 
-  def fetch(record, {:attribute, name}) when is_map(record) do
-    with {:ok, attributes} when is_map(attributes) <-
-           fetch_map(record, :attributes, "attributes") do
-      fetch_dynamic(attributes, name)
-    else
-      _ -> :missing
+  def fetch(record, {:attribute, name} = field) when is_map(record) do
+    case Map.fetch(record, field) do
+      {:ok, value} ->
+        {:ok, value}
+
+      :error ->
+        with {:ok, attributes} when is_map(attributes) <-
+               fetch_map(record, :attributes, "attributes") do
+          fetch_dynamic(attributes, name)
+        else
+          _ -> :missing
+        end
     end
   end
 
-  def fetch(record, {:state_meta, state, name}) when is_map(record) do
-    with {:ok, state_meta} when is_map(state_meta) <-
-           fetch_map(record, :state_meta, "state_meta"),
-         {:ok, metadata} when is_map(metadata) <- fetch_dynamic(state_meta, state) do
-      fetch_dynamic(metadata, name)
-    else
-      _ -> :missing
+  def fetch(record, {:state_meta, state, name} = field) when is_map(record) do
+    case Map.fetch(record, field) do
+      {:ok, value} ->
+        {:ok, value}
+
+      :error ->
+        with {:ok, state_meta} when is_map(state_meta) <-
+               fetch_map(record, :state_meta, "state_meta"),
+             {:ok, metadata} when is_map(metadata) <- fetch_dynamic(state_meta, state) do
+          fetch_dynamic(metadata, name)
+        else
+          _ -> :missing
+        end
     end
   end
 
@@ -243,7 +255,7 @@ defmodule Ferricstore.Flow.Query.Field do
 
   defp valid_metadata_name?(name)
        when is_binary(name) and name != "" and byte_size(name) <= @max_metadata_name_bytes do
-    String.valid?(name)
+    String.valid?(name) and String.trim(name) == name
   end
 
   defp valid_metadata_name?(_name), do: false

@@ -371,6 +371,7 @@ fn copy_record_raw(
         Ok(Some(RawCopyResult {
             offset: new_offset,
             record_size,
+            value_size: value_size as u64,
             is_tombstone,
         }))
     })();

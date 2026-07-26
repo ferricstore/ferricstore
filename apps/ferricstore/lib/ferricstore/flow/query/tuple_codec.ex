@@ -16,6 +16,7 @@ defmodule Ferricstore.Flow.Query.TupleCodec do
   @u64_mask 0xFFFF_FFFF_FFFF_FFFF
   @min_i64 -0x8000_0000_0000_0000
   @max_i64 0x7FFF_FFFF_FFFF_FFFF
+  @binary_bulk_threshold 32
 
   @type direction :: :asc | :desc
   @type value ::
@@ -83,6 +84,16 @@ defmodule Ferricstore.Flow.Query.TupleCodec do
 
   @spec compare_values(value(), value(), direction()) :: :lt | :eq | :gt
   def compare_values(left, right, direction) when direction in [:asc, :desc] do
+    case {comparison_rank(left), comparison_rank(right)} do
+      {{:ok, left_rank}, {:ok, right_rank}} ->
+        compare_ranked(left, right, left_rank, right_rank, direction)
+
+      _invalid ->
+        compare_encoded(left, right, direction)
+    end
+  end
+
+  defp compare_encoded(left, right, direction) do
     left_encoded = encode_component(left, direction)
     right_encoded = encode_component(right, direction)
 
@@ -92,6 +103,42 @@ defmodule Ferricstore.Flow.Query.TupleCodec do
       true -> :eq
     end
   end
+
+  defp compare_ranked(_left, _right, rank, rank, _direction) when rank in [0, 1, 5, 6],
+    do: :eq
+
+  defp compare_ranked(left, right, rank, rank, direction),
+    do: compare_terms(left, right, direction)
+
+  defp compare_ranked(_left, _right, left_rank, right_rank, _direction)
+       when left_rank >= 5 or right_rank >= 5,
+       do: compare_terms(left_rank, right_rank, :asc)
+
+  defp compare_ranked(_left, _right, left_rank, right_rank, direction),
+    do: compare_terms(left_rank, right_rank, direction)
+
+  defp compare_terms(left, right, :asc) when left < right, do: :lt
+  defp compare_terms(left, right, :asc) when left > right, do: :gt
+  defp compare_terms(left, right, :desc) when left < right, do: :gt
+  defp compare_terms(left, right, :desc) when left > right, do: :lt
+  defp compare_terms(_left, _right, _direction), do: :eq
+
+  defp comparison_rank(false), do: {:ok, 0}
+  defp comparison_rank(true), do: {:ok, 1}
+
+  defp comparison_rank(value)
+       when is_integer(value) and value >= @min_i64 and value <= @max_i64,
+       do: {:ok, 2}
+
+  defp comparison_rank(value) when is_float(value) do
+    <<bits::unsigned-big-64>> = <<value::float-big-64>>
+    if (bits >>> 52 &&& 0x7FF) == 0x7FF, do: :error, else: {:ok, 3}
+  end
+
+  defp comparison_rank(value) when is_binary(value), do: {:ok, 4}
+  defp comparison_rank(nil), do: {:ok, 5}
+  defp comparison_rank({:ferric_query, :missing}), do: {:ok, 6}
+  defp comparison_rank(_value), do: :error
 
   defp encode_pairs([], acc), do: {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary()}
 
@@ -151,9 +198,15 @@ defmodule Ferricstore.Flow.Query.TupleCodec do
     end
   end
 
-  defp encode_ascending(value) when is_binary(value) do
+  defp encode_ascending(value)
+       when is_binary(value) and byte_size(value) < @binary_bulk_threshold do
     escaped = for <<byte <- value>>, do: if(byte == 0, do: <<0, 0xFF>>, else: <<byte>>)
     {:ok, IO.iodata_to_binary([<<@binary_tag>>, escaped, <<0, 0>>])}
+  end
+
+  defp encode_ascending(value) when is_binary(value) do
+    escaped = :binary.replace(value, <<0>>, <<0, 0xFF>>, [:global])
+    {:ok, <<@binary_tag, escaped::binary, 0, 0>>}
   end
 
   defp encode_ascending(_value), do: {:error, :unsupported_index_value}

@@ -7,7 +7,7 @@ defmodule Ferricstore.Flow.Query.IndexCatalogTest do
     assert {:ok, first} = IndexCatalog.load()
     assert {:ok, second} = IndexCatalog.load()
 
-    assert first.version == 3
+    assert first.version == 4
     assert first.contract_version == "ferric.flow.query.index-catalog/v1"
     assert first.digest == second.digest
     assert byte_size(first.digest) == 32
@@ -30,8 +30,71 @@ defmodule Ferricstore.Flow.Query.IndexCatalogTest do
 
     assert Enum.all?(first.definitions, fn definition ->
              definition.workloads != [] and
-               "WF-SERVICE-API-001" in definition.workloads
+               "WF-SERVICE-API-001" in definition.workloads and
+               :run_id in definition.covering_fields and
+               :version in definition.covering_fields and
+               Enum.all?(definition.fields, fn {field, _direction, _encoding} ->
+                 field in definition.covering_fields
+               end)
            end)
+  end
+
+  test "loads canonical built-in and dynamic covering fields and rejects incomplete coverage" do
+    path = tmp_path()
+
+    base =
+      catalog_index("runs_by_state", "state")
+      |> Map.put("covering_fields", [
+        "version",
+        "updated_at_ms",
+        "state",
+        "partition_key",
+        "run_id"
+      ])
+
+    File.write!(path, Jason.encode!(catalog([base])))
+    on_exit(fn -> File.rm(path) end)
+
+    assert {:ok, catalog} = IndexCatalog.load(path)
+
+    assert [definition] = catalog.definitions
+
+    assert definition.covering_fields == [
+             :partition_key,
+             :run_id,
+             :state,
+             :updated_at_ms,
+             :version
+           ]
+
+    dynamic =
+      base
+      |> Map.put("covering_fields", [
+        "run_id",
+        "version",
+        "partition_key",
+        "state",
+        "updated_at_ms",
+        "attribute.tier",
+        "state_meta.queued.worker"
+      ])
+
+    File.write!(path, Jason.encode!(catalog([dynamic])))
+    assert {:ok, dynamic_catalog} = IndexCatalog.load(path)
+
+    assert hd(dynamic_catalog.definitions).covering_fields == [
+             {:attribute, "tier"},
+             :partition_key,
+             :run_id,
+             :state,
+             {:state_meta, "queued", "worker"},
+             :updated_at_ms,
+             :version
+           ]
+
+    incomplete = ["run_id", "version", "partition_key", "state"]
+    File.write!(path, Jason.encode!(catalog([Map.put(base, "covering_fields", incomplete)])))
+    assert {:error, :invalid_index_covering_fields} = IndexCatalog.load(path)
   end
 
   test "binds the frozen hidden-scope width into every physical definition" do

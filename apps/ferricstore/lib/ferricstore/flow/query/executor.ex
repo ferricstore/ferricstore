@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.Executor do
   @moduledoc false
 
-  alias Ferricstore.Flow.{Codec, Keys, LMDB}
+  alias Ferricstore.Flow.{Keys, LMDB, Locator}
   alias Ferricstore.Flow.RecordProjection, as: FlowRecordProjection
   alias Ferricstore.TermCodec
 
@@ -10,9 +10,16 @@ defmodule Ferricstore.Flow.Query.Executor do
     CompositeIndex,
     CompositeRange,
     CompositeRangeReader,
+    CoveringProjection,
+    ExecutionSource,
     IndexDefinition,
     Limits,
     MandatoryScope,
+    PageMemory,
+    QueryRecordStore,
+    QueryRow,
+    QueryRowProjection,
+    QueryRowStore,
     RecordOrder,
     RecordProjection,
     ReferenceEvaluator,
@@ -38,7 +45,6 @@ defmodule Ferricstore.Flow.Query.Executor do
   @default_page_bytes 1 * 1_024 * 1_024
   @maximum_page_bytes 8 * 1_024 * 1_024
   @seen_entry_overhead 96
-  @decoded_entry_overhead 192
   @hydrated_record_overhead 128
   @deadline_check_interval 64
   @maximum_exact_integer 9_007_199_254_740_991
@@ -77,7 +83,23 @@ defmodule Ferricstore.Flow.Query.Executor do
     page_entries = Keyword.get(opts, :page_entries, @default_page_entries)
     page_bytes = Keyword.get(opts, :page_bytes, @default_page_bytes)
     range_read = Keyword.get(opts, :range_read, &default_range_read/5)
-    record_read = Keyword.get(opts, :record_read, &default_record_read/4)
+
+    record_read =
+      Keyword.get_lazy(opts, :record_read, fn ->
+        fn path, state_keys, now_ms, max_value_bytes, timeout_ms ->
+          default_record_read(
+            ctx,
+            shard_index,
+            path,
+            state_keys,
+            now_ms,
+            max_value_bytes,
+            timeout_ms
+          )
+        end
+      end)
+
+    query_row_read = Keyword.get(opts, :query_row_read, &QueryRowStore.read_many/4)
     clock_us = Keyword.get(opts, :clock_us, fn -> System.monotonic_time(:microsecond) end)
     now_ms = Keyword.get(opts, :now_ms, System.system_time(:millisecond))
 
@@ -95,12 +117,21 @@ defmodule Ferricstore.Flow.Query.Executor do
              page_bytes,
              range_read,
              record_read,
+             query_row_read,
              clock_us,
              now_ms
            ),
          :ok <- validate_route(ctx, shard_index, scope_keys.physical_partition_key),
          :ok <- validate_plan(plan, request, logical_partition),
          {:ok, record_matcher} <- prepare_record_matcher(plan, logical_partition),
+         {:ok, prepared_residual_predicates} <-
+           prepare_residual_predicates(plan.residual_predicates),
+         covering_execution <-
+           covering_execution(request, plan),
+         query_row_allowed <- query_row_execution_enabled?(opts),
+         query_row_execution <-
+           plan.record_source == :query_row and QueryRowProjection.eligible?(request, plan) and
+             query_row_allowed,
          {:ok, cursor_seek, cursor_key} <-
            initialize_cursor(ctx, request, plan, scope_keys.query_binding, now_ms, opts),
          {:ok, start_us} <- call_clock(clock_us),
@@ -125,9 +156,15 @@ defmodule Ferricstore.Flow.Query.Executor do
            query_binding: scope_keys.query_binding,
            mandatory_scope: plan.mandatory_scope,
            record_matcher: record_matcher,
+           prepared_residual_predicates: prepared_residual_predicates,
+           prepared_residual_bytes: MemoryBudget.term_bytes(prepared_residual_predicates),
+           covering_execution: covering_execution,
+           query_row_allowed: query_row_allowed,
+           query_row_execution: query_row_execution,
            path: path,
            range_read: range_read,
            record_read: record_read,
+           query_row_read: query_row_read,
            page_entries: page_entries,
            page_bytes: page_bytes,
            clock_us: clock_us,
@@ -156,6 +193,22 @@ defmodule Ferricstore.Flow.Query.Executor do
     end
   end
 
+  defp prepare_residual_predicates(predicates) do
+    case ReferenceEvaluator.prepare(predicates) do
+      {:ok, prepared} -> {:ok, prepared}
+      {:error, _reason} -> {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp query_row_execution_enabled?(opts) do
+    not Keyword.has_key?(opts, :record_read) or Keyword.has_key?(opts, :query_row_read)
+  end
+
+  defp covering_execution(request, %Plan{record_source: :covering_index} = plan),
+    do: CoveringProjection.field_types(request, plan.definition, plan.residual_predicates)
+
+  defp covering_execution(_request, %Plan{}), do: nil
+
   defp run(state) do
     with :ok <- check_deadline(state),
          {:ok, state} <- scan_ranges(state.plan.ranges, state),
@@ -180,7 +233,7 @@ defmodule Ferricstore.Flow.Query.Executor do
          {:ok, state} <- account_counter_read(state, read, 0),
          :ok <- check_deadline(state) do
       if Enum.any?(read.expiring_counts, &(&1 > 0)) do
-        run(state)
+        state |> prepare_counter_scan_source() |> run()
       else
         with {:ok, count} <- sum_counters(read.counts) do
           state |> Map.put(:matched_count, count) |> finalize()
@@ -193,6 +246,32 @@ defmodule Ferricstore.Flow.Query.Executor do
     if length(prefixes) + state.usage.scanned_entries <= state.budget.scan_entries,
       do: :ok,
       else: {:error, :query_scan_budget_exceeded}
+  end
+
+  defp prepare_counter_scan_source(state) do
+    source =
+      ExecutionSource.classify(
+        state.request,
+        :count_scan,
+        state.plan.definition,
+        state.plan.residual_predicates
+      )
+
+    covering_execution =
+      if source == :covering_index,
+        do:
+          CoveringProjection.field_types(
+            state.request,
+            state.plan.definition,
+            state.plan.residual_predicates
+          ),
+        else: nil
+
+    %{
+      state
+      | covering_execution: covering_execution,
+        query_row_execution: source == :query_row and state.query_row_allowed
+    }
   end
 
   defp read_counters(path, definition, prefixes, max_bytes) when max_bytes > 0 do
@@ -395,8 +474,8 @@ defmodule Ferricstore.Flow.Query.Executor do
               scanned_bytes <= max_bytes do
     with :ok <- validate_entries(entries, range, cursor),
          :ok <- validate_page_cursor(entries, next_cursor, exhausted),
-         :ok <- validate_scanned_bytes(entries, scanned_bytes) do
-      {:ok, page}
+         {:ok, memory_bytes} <- validate_scanned_bytes(entries, scanned_bytes) do
+      {:ok, Map.put(page, :memory_bytes, memory_bytes)}
     end
   end
 
@@ -437,7 +516,8 @@ defmodule Ferricstore.Flow.Query.Executor do
            record_version: record_version,
            expire_at_ms: expire_at_ms,
            storage_key: storage_key,
-           storage_bytes: storage_bytes
+           storage_bytes: storage_bytes,
+           covering_record: covering_record
          },
          range,
          previous_key
@@ -449,7 +529,8 @@ defmodule Ferricstore.Flow.Query.Executor do
               expire_at_ms >= 0 and expire_at_ms <= @maximum_expire_at_ms and
               is_binary(storage_key) and byte_size(storage_key) <= @maximum_storage_key_bytes and
               is_integer(storage_bytes) and
-              storage_bytes > 0 and storage_bytes <= @maximum_page_bytes do
+              storage_bytes > 0 and storage_bytes <= @maximum_page_bytes and
+              (is_nil(covering_record) or is_map(covering_record)) do
     valid =
       storage_bytes >= byte_size(storage_key) + byte_size(id) + byte_size(state_key) and
         String.starts_with?(storage_key, range.prefix) and
@@ -464,8 +545,11 @@ defmodule Ferricstore.Flow.Query.Executor do
     do: {:error, :query_storage_inconsistent}
 
   defp validate_scanned_bytes(entries, scanned_bytes) do
-    actual_bytes = Enum.reduce(entries, 0, &(&1.storage_bytes + &2))
-    if actual_bytes == scanned_bytes, do: :ok, else: {:error, :query_storage_inconsistent}
+    {actual_bytes, memory_bytes} = PageMemory.measure(entries)
+
+    if actual_bytes == scanned_bytes,
+      do: {:ok, memory_bytes},
+      else: {:error, :query_storage_inconsistent}
   end
 
   defp account_page(state, page) do
@@ -492,20 +576,131 @@ defmodule Ferricstore.Flow.Query.Executor do
 
   defp process_entries(state, _range, _cursor, entries) do
     with {:ok, candidates, state} <- unique_candidates(entries, state),
-         {:ok, state} <- hydrate_candidates(candidates, state) do
+         {:ok, state} <- process_candidates(candidates, state) do
       {:ok, state}
     end
   end
 
+  defp process_candidates(candidates, %{covering_execution: nil} = state),
+    do: process_uncovered_candidates(candidates, state)
+
+  defp process_candidates(candidates, state) do
+    cond do
+      Enum.any?(candidates, &missing_covering_projection?/1) ->
+        {:error, :query_storage_inconsistent}
+
+      Enum.all?(candidates, &covering_candidate?/1) ->
+        process_covering_candidates(candidates, state)
+
+      true ->
+        process_uncovered_candidates(candidates, state)
+    end
+  end
+
+  defp missing_covering_projection?(%{covering_record: nil}), do: true
+  defp missing_covering_projection?(_entry), do: false
+
+  defp process_uncovered_candidates(candidates, %{query_row_execution: true} = state),
+    do: process_query_row_candidates(candidates, state)
+
+  defp process_uncovered_candidates(candidates, state), do: hydrate_candidates(candidates, state)
+
+  defp covering_candidate?(%{covering_record: record, expire_at_ms: expire_at_ms})
+       when is_map(record) and is_integer(expire_at_ms) and expire_at_ms >= 0,
+       do: true
+
+  defp covering_candidate?(_entry), do: false
+
+  defp process_covering_candidates(candidates, state) do
+    Enum.reduce_while(candidates, {:ok, state}, fn entry, {:ok, state} ->
+      with {:ok, state} <- account_deadline_work(state) do
+        cond do
+          native_complete?(state) ->
+            {:halt, {:ok, state}}
+
+          not valid_covering_entry?(entry, state) ->
+            {:halt, {:error, :query_storage_inconsistent}}
+
+          projected_entry_expired?(entry, state.now_ms) ->
+            {:cont, {:ok, state}}
+
+          true ->
+            case process_current_record(entry.covering_record, entry, state) do
+              {:ok, state} -> {:cont, {:ok, state}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+        end
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp valid_covering_entry?(entry, state) do
+    record = entry.covering_record
+
+    Map.get(record, :id) == entry.id and
+      Map.get(record, :version) == entry.record_version and
+      Map.get(record, :partition_key) == state.logical_partition and
+      valid_covering_shape?(record, state.covering_execution) and
+      CompositeIndex.entry_key_matches_record_validated?(
+        state.record_matcher,
+        record,
+        entry.storage_key
+      )
+  end
+
+  defp valid_covering_shape?(record, covering_fields) when is_map(covering_fields) do
+    Enum.all?(record, fn {field, value} ->
+      case Map.fetch(covering_fields, field) do
+        {:ok, type} -> valid_covering_value?(value, type)
+        :error -> false
+      end
+    end)
+  end
+
+  defp valid_covering_shape?(_record, _covering_fields), do: false
+
+  defp valid_covering_value?(nil, _type), do: true
+  defp valid_covering_value?(value, :integer), do: is_integer(value)
+  defp valid_covering_value?(value, :keyword), do: is_binary(value)
+
+  defp valid_covering_value?(value, :dynamic) when is_list(value),
+    do: Enum.all?(value, &valid_dynamic_covering_scalar?/1)
+
+  defp valid_covering_value?(value, :dynamic), do: valid_dynamic_covering_scalar?(value)
+  defp valid_covering_value?(_value, _type), do: false
+
+  defp valid_dynamic_covering_scalar?(value)
+       when is_nil(value) or is_boolean(value) or is_integer(value) or is_binary(value),
+       do: true
+
+  defp valid_dynamic_covering_scalar?(value) when is_float(value) do
+    <<_sign::1, exponent::unsigned-big-11, _fraction::unsigned-big-52>> =
+      <<value::float-big-64>>
+
+    exponent != 0x7FF
+  end
+
+  defp valid_dynamic_covering_scalar?(_value), do: false
+
   defp unique_candidates(entries, %{deduplicate: false} = state) do
     entries
-    |> Enum.reduce_while({:ok, []}, fn entry, {:ok, candidates} ->
-      if entry.state_key == Keys.state_key(entry.id, state.physical_partition),
-        do: {:cont, {:ok, [entry | candidates]}},
-        else: {:halt, {:error, :query_storage_inconsistent}}
+    |> Enum.reduce_while({:ok, [], state}, fn entry, {:ok, candidates, state} ->
+      with {:ok, state} <- account_deadline_work(state) do
+        cond do
+          entry.state_key != Keys.state_key(entry.id, state.physical_partition) ->
+            {:halt, {:error, :query_storage_inconsistent}}
+
+          true ->
+            {:cont, {:ok, [entry | candidates], state}}
+        end
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
     end)
     |> case do
-      {:ok, candidates} -> {:ok, Enum.reverse(candidates), state}
+      {:ok, candidates, state} -> {:ok, Enum.reverse(candidates), state}
       {:error, _reason} = error -> error
     end
   end
@@ -519,29 +714,175 @@ defmodule Ferricstore.Flow.Query.Executor do
   defp do_unique_candidates(entries, state) do
     entries
     |> Enum.reduce_while({:ok, [], state}, fn entry, {:ok, candidates, state} ->
-      cond do
-        entry.state_key != Keys.state_key(entry.id, state.physical_partition) ->
-          {:halt, {:error, :query_storage_inconsistent}}
+      with {:ok, state} <- account_deadline_work(state) do
+        cond do
+          entry.state_key != Keys.state_key(entry.id, state.physical_partition) ->
+            {:halt, {:error, :query_storage_inconsistent}}
 
-        MapSet.member?(state.seen, entry.id) ->
-          usage = %{state.usage | duplicate_entries: state.usage.duplicate_entries + 1}
-          {:cont, {:ok, candidates, %{state | usage: usage}}}
+          MapSet.member?(state.seen, entry.id) ->
+            usage = %{state.usage | duplicate_entries: state.usage.duplicate_entries + 1}
+            {:cont, {:ok, candidates, %{state | usage: usage}}}
 
-        true ->
-          seen = MapSet.put(state.seen, entry.id)
-          seen_bytes = state.seen_bytes + byte_size(entry.id) + @seen_entry_overhead
-          state = %{state | seen: seen, seen_bytes: seen_bytes}
+          true ->
+            seen = MapSet.put(state.seen, entry.id)
+            seen_bytes = state.seen_bytes + byte_size(entry.id) + @seen_entry_overhead
+            state = %{state | seen: seen, seen_bytes: seen_bytes}
 
-          if estimated_memory(state, 0) > state.budget.executor_memory_bytes do
-            {:halt, {:error, :query_memory_budget_exceeded}}
-          else
-            {:cont, {:ok, [entry | candidates], state}}
-          end
+            if estimated_memory(state, 0) > state.budget.executor_memory_bytes do
+              {:halt, {:error, :query_memory_budget_exceeded}}
+            else
+              {:cont, {:ok, [entry | candidates], state}}
+            end
+        end
+      else
+        {:error, _reason} = error -> {:halt, error}
       end
     end)
     |> case do
       {:ok, candidates, state} -> {:ok, Enum.reverse(candidates), state}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp process_query_row_candidates([], state), do: {:ok, state}
+
+  defp process_query_row_candidates(candidates, state) do
+    case read_query_rows(state, Enum.map(candidates, & &1.state_key)) do
+      {:ok, rows, complete?} ->
+        process_query_row_prefix(candidates, rows, complete?, state)
+
+      {:error, :query_row_batch_too_large} when length(candidates) > 1 ->
+        {left, right} = Enum.split(candidates, div(length(candidates), 2))
+
+        with {:ok, state} <- process_query_row_candidates(left, state) do
+          if native_complete?(state),
+            do: {:ok, state},
+            else: process_query_row_candidates(right, state)
+        end
+
+      {:error, :query_row_batch_too_large} ->
+        {:error, :query_memory_budget_exceeded}
+
+      {:error, :query_storage_inconsistent} = error ->
+        error
+
+      {:error, :query_deadline_exceeded} = error ->
+        error
+
+      {:error, _reason} ->
+        {:error, :query_storage_unavailable}
+
+      _invalid ->
+        {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp read_query_rows(state, state_keys) do
+    available_bytes = state.budget.executor_memory_bytes - estimated_memory(state, 0)
+    max_value_bytes = MemoryBudget.encoded_record_input_bytes(available_bytes)
+
+    if max_value_bytes > 0 do
+      try do
+        case state.query_row_read.(state.path, state_keys, state.now_ms, max_value_bytes) do
+          {:ok, rows, value_bytes, complete?}
+          when is_list(rows) and is_integer(value_bytes) and value_bytes >= 0 and
+                 value_bytes <= max_value_bytes and is_boolean(complete?) ->
+            with :ok <- check_deadline(state), do: {:ok, rows, complete?}
+
+          {:error, :batch_value_budget_exceeded} ->
+            {:error, :query_row_batch_too_large}
+
+          {:error, reason}
+          when reason in [
+                 :invalid_query_row,
+                 :invalid_query_row_read,
+                 :query_row_result_count_mismatch
+               ] ->
+            {:error, :query_storage_inconsistent}
+
+          {:error, _reason} = error ->
+            error
+
+          _invalid ->
+            {:error, :query_storage_inconsistent}
+        end
+      rescue
+        _error -> {:error, :query_storage_unavailable}
+      catch
+        _kind, _reason -> {:error, :query_storage_unavailable}
+      end
+    else
+      {:error, :query_row_batch_too_large}
+    end
+  end
+
+  defp process_query_row_prefix(candidates, rows, complete?, state)
+       when is_list(rows) and is_boolean(complete?) do
+    returned_count = length(rows)
+    requested_count = length(candidates)
+
+    valid_count? =
+      (complete? and returned_count == requested_count) or
+        (not complete? and returned_count > 0 and returned_count < requested_count)
+
+    if valid_count? do
+      {read_candidates, remaining_candidates} = Enum.split(candidates, returned_count)
+
+      with {:ok, pairs} <- query_row_pairs(read_candidates, rows, state),
+           {:ok, state} <- process_hydrated(pairs, state) do
+        if native_complete?(state),
+          do: {:ok, state},
+          else: process_query_row_candidates(remaining_candidates, state)
+      end
+    else
+      {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp process_query_row_prefix(_candidates, _rows, _complete?, _state),
+    do: {:error, :query_storage_inconsistent}
+
+  defp query_row_pairs(candidates, rows, state) do
+    with {:ok, expected_scope_prefix} <- MandatoryScope.single_prefix(state.mandatory_scope) do
+      candidates
+      |> Enum.zip(rows)
+      |> Enum.reduce_while({:ok, []}, fn
+        {entry, nil}, {:ok, acc} ->
+          {:cont, {:ok, [{entry, nil} | acc]}}
+
+        {entry,
+         %QueryRow{
+           state_key: state_key,
+           record: record,
+           locator: %Locator{} = locator,
+           expire_at_ms: expire_at_ms,
+           scope_prefix: scope_prefix
+         }},
+        {:ok, acc}
+        when is_map(record) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
+          valid =
+            state_key == entry.state_key and
+              state_key == Keys.state_key(entry.id, state.physical_partition) and
+              scope_prefix == expected_scope_prefix and
+              Locator.hydration_ready?(locator) and locator.flow_id == entry.id and
+              locator.version == entry.record_version and Map.get(record, :id) == entry.id and
+              Map.get(record, :version) == entry.record_version and
+              Map.get(record, :partition_key) == state.logical_partition and
+              (expire_at_ms == 0 or expire_at_ms > state.now_ms)
+
+          if valid,
+            do: {:cont, {:ok, [{entry, record} | acc]}},
+            else: {:halt, {:error, :query_storage_inconsistent}}
+
+        _invalid, _acc ->
+          {:halt, {:error, :query_storage_inconsistent}}
+      end)
+      |> case do
+        {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+        {:error, _reason} = error -> error
+      end
+    else
+      _invalid -> {:error, :query_storage_inconsistent}
     end
   end
 
@@ -586,6 +927,9 @@ defmodule Ferricstore.Flow.Query.Executor do
 
         {:error, :query_storage_inconsistent} ->
           {:error, :query_storage_inconsistent}
+
+        {:error, :query_deadline_exceeded} = error ->
+          error
 
         {:error, _reason} ->
           {:error, :query_storage_unavailable}
@@ -645,7 +989,19 @@ defmodule Ferricstore.Flow.Query.Executor do
 
     if max_value_bytes > 0 do
       try do
-        state.record_read.(state.path, state_keys, state.now_ms, max_value_bytes)
+        with {:ok, timeout_ms} <- remaining_timeout_ms(state),
+             result <-
+               call_record_read(
+                 state.record_read,
+                 state.path,
+                 state_keys,
+                 state.now_ms,
+                 max_value_bytes,
+                 timeout_ms
+               ),
+             :ok <- check_deadline(state) do
+          result
+        end
       rescue
         _error -> {:error, :query_storage_unavailable}
       catch
@@ -653,6 +1009,22 @@ defmodule Ferricstore.Flow.Query.Executor do
       end
     else
       {:error, :query_hydration_batch_too_large}
+    end
+  end
+
+  defp call_record_read(reader, path, state_keys, now_ms, max_value_bytes, timeout_ms) do
+    if is_function(reader, 5),
+      do: reader.(path, state_keys, now_ms, max_value_bytes, timeout_ms),
+      else: reader.(path, state_keys, now_ms, max_value_bytes)
+  end
+
+  defp remaining_timeout_ms(state) do
+    with {:ok, now_us} <- call_clock(state.clock_us) do
+      remaining_us = state.deadline_us - now_us
+
+      if remaining_us > 0,
+        do: {:ok, div(remaining_us + 999, 1_000)},
+        else: {:error, :query_deadline_exceeded}
     end
   end
 
@@ -673,37 +1045,41 @@ defmodule Ferricstore.Flow.Query.Executor do
     else
       pairs
       |> Enum.reduce_while({:ok, state}, fn {entry, record}, {:ok, state} ->
-        cond do
-          native_complete?(state) ->
-            {:halt, {:ok, state}}
+        with {:ok, state} <- account_deadline_work(state) do
+          cond do
+            native_complete?(state) ->
+              {:halt, {:ok, state}}
 
-          expired_projected_row_missing?(record, entry, state.now_ms) ->
-            {:cont, {:ok, state}}
+            expired_projected_row_missing?(record, entry, state.now_ms) ->
+              {:cont, {:ok, state}}
 
-          not is_map(record) ->
-            {:halt, {:error, :query_projection_changed}}
+            not is_map(record) ->
+              {:halt, {:error, :query_projection_changed}}
 
-          not matching_record_identity?(record, entry, state.physical_partition) ->
-            {:halt, {:error, :query_storage_inconsistent}}
+            not matching_record_identity?(record, entry, state) ->
+              {:halt, {:error, :query_storage_inconsistent}}
 
-          record_version(record) != entry.record_version ->
-            {:halt, {:error, :query_projection_changed}}
+            record_version(record) != entry.record_version ->
+              {:halt, {:error, :query_projection_changed}}
 
-          verify_record_scope(record, state.mandatory_scope) != :ok ->
-            {:halt, {:error, :query_storage_inconsistent}}
+            verify_execution_record_scope(record, state) != :ok ->
+              {:halt, {:error, :query_storage_inconsistent}}
 
-          not CompositeIndex.entry_key_matches_record_validated?(
-            state.record_matcher,
-            record,
-            entry.storage_key
-          ) ->
-            {:halt, {:error, :query_storage_inconsistent}}
+            not CompositeIndex.entry_key_matches_record_validated?(
+              state.record_matcher,
+              record,
+              entry.storage_key
+            ) ->
+              {:halt, {:error, :query_storage_inconsistent}}
 
-          true ->
-            case process_current_record(record, entry, state) do
-              {:ok, state} -> {:cont, {:ok, state}}
-              {:error, _reason} = error -> {:halt, error}
-            end
+            true ->
+              case process_current_record(record, entry, state) do
+                {:ok, state} -> {:cont, {:ok, state}}
+                {:error, _reason} = error -> {:halt, error}
+              end
+          end
+        else
+          {:error, _reason} = error -> {:halt, error}
         end
       end)
       |> release_hydrated()
@@ -720,7 +1096,7 @@ defmodule Ferricstore.Flow.Query.Executor do
   defp process_current_record(record, entry, state) do
     with {:ok, logical_record} <- public_record(record),
          {:ok, matched, state} <-
-           matches_all?(logical_record, state.plan.residual_predicates, state) do
+           matches_all?(logical_record, state.prepared_residual_predicates, state) do
       if matched, do: retain_match(logical_record, entry, state), else: {:ok, state}
     end
   end
@@ -731,13 +1107,12 @@ defmodule Ferricstore.Flow.Query.Executor do
   defp matches_all?(record, predicates, state) do
     Enum.reduce_while(predicates, {:ok, true, state}, fn predicate, {:ok, true, state} ->
       usage = %{state.usage | residual_checks: state.usage.residual_checks + 1}
-      checks = state.checks_since_deadline + 1
-      state = %{state | usage: usage, checks_since_deadline: checks}
+      state = %{state | usage: usage}
 
-      with :ok <- maybe_check_deadline(state, checks) do
+      with {:ok, state} <- account_deadline_work(state) do
         matched =
           try do
-            ReferenceEvaluator.matches?(record, predicate)
+            ReferenceEvaluator.matches_prepared?(record, predicate)
           rescue
             _error -> :invalid
           catch
@@ -745,8 +1120,8 @@ defmodule Ferricstore.Flow.Query.Executor do
           end
 
         case matched do
-          true -> {:cont, {:ok, true, reset_deadline_checks(state, checks)}}
-          false -> {:halt, {:ok, false, reset_deadline_checks(state, checks)}}
+          true -> {:cont, {:ok, true, state}}
+          false -> {:halt, {:ok, false, state}}
           :invalid -> {:halt, {:error, :query_storage_inconsistent}}
         end
       else
@@ -867,8 +1242,7 @@ defmodule Ferricstore.Flow.Query.Executor do
   end
 
   defp retain_page(state, page) do
-    page_memory = page.scanned_bytes + length(page.entries) * @decoded_entry_overhead
-    state = %{state | live_page_bytes: page_memory}
+    state = %{state | live_page_bytes: page.memory_bytes}
     memory = estimated_memory(state, 0)
 
     usage = %{
@@ -1013,8 +1387,14 @@ defmodule Ferricstore.Flow.Query.Executor do
       else: {:error, :query_deadline_exceeded}
   end
 
-  defp matching_record_identity?(record, entry, scope) do
-    Map.get(record, :id) == entry.id and Map.get(record, :partition_key) == scope
+  defp matching_record_identity?(record, entry, %{query_row_execution: true} = state) do
+    Map.get(record, :id) == entry.id and
+      Map.get(record, :partition_key) == state.logical_partition
+  end
+
+  defp matching_record_identity?(record, entry, state) do
+    Map.get(record, :id) == entry.id and
+      Map.get(record, :partition_key) == state.physical_partition
   end
 
   defp public_record(record) do
@@ -1055,9 +1435,17 @@ defmodule Ferricstore.Flow.Query.Executor do
     _kind, _reason -> {:error, :query_storage_inconsistent}
   end
 
+  defp verify_execution_record_scope(_record, %{query_row_execution: true}), do: :ok
+
+  defp verify_execution_record_scope(record, state),
+    do: verify_record_scope(record, state.mandatory_scope)
+
   defp expired_projected_row_missing?(record, entry, now_ms) do
-    is_nil(record) and entry.expire_at_ms > 0 and entry.expire_at_ms <= now_ms
+    is_nil(record) and projected_entry_expired?(entry, now_ms)
   end
+
+  defp projected_entry_expired?(%{expire_at_ms: expire_at_ms}, now_ms),
+    do: expire_at_ms > 0 and expire_at_ms <= now_ms
 
   defp record_version(record) do
     case Map.get(record, :version) do
@@ -1081,7 +1469,8 @@ defmodule Ferricstore.Flow.Query.Executor do
     do: byte_size(sort_key) + byte_size(id) + byte_size(storage_key) + term_size(record) + 128
 
   defp estimated_memory(state, hydrated_bytes) do
-    state.seen_bytes + state.selected_bytes + state.live_page_bytes +
+    state.prepared_residual_bytes + state.seen_bytes + state.selected_bytes +
+      state.live_page_bytes +
       state.live_hydrated_bytes + hydrated_bytes
   end
 
@@ -1101,6 +1490,15 @@ defmodule Ferricstore.Flow.Query.Executor do
     if rem(checks, @deadline_check_interval) == 0,
       do: check_deadline(state),
       else: :ok
+  end
+
+  defp account_deadline_work(state) do
+    checks = state.checks_since_deadline + 1
+    state = %{state | checks_since_deadline: checks}
+
+    with :ok <- maybe_check_deadline(state, checks) do
+      {:ok, reset_deadline_checks(state, checks)}
+    end
   end
 
   defp reset_deadline_checks(state, checks) do
@@ -1286,6 +1684,7 @@ defmodule Ferricstore.Flow.Query.Executor do
          page_bytes,
          range_read,
          record_read,
+         query_row_read,
          clock_us,
          now_ms
        ) do
@@ -1294,7 +1693,8 @@ defmodule Ferricstore.Flow.Query.Executor do
         shard_index >= 0 and shard_index < shard_count and is_integer(page_entries) and
         page_entries > 0 and page_entries <= @maximum_page_entries and is_integer(page_bytes) and
         page_bytes > 0 and page_bytes <= @maximum_page_bytes and is_function(range_read, 5) and
-        is_function(record_read, 4) and
+        (is_function(record_read, 4) or is_function(record_read, 5)) and
+        is_function(query_row_read, 4) and
         is_function(clock_us, 0) and is_integer(now_ms) and now_ms >= 0
 
     if valid, do: :ok, else: {:error, :query_engine_failure}
@@ -1307,6 +1707,7 @@ defmodule Ferricstore.Flow.Query.Executor do
          _page_bytes,
          _range_read,
          _record_read,
+         _query_row_read,
          _clock_us,
          _now_ms
        ),
@@ -1346,7 +1747,7 @@ defmodule Ferricstore.Flow.Query.Executor do
       logically_empty_request?(request) and request_within_result_budget?(request, plan.budget) and
         plan.version == 1 and plan.index_id == nil and plan.index_version == nil and
         plan.index_build_id == nil and plan.definition == nil and plan.ranges == [] and
-        plan.order == :native and
+        plan.order == :native and plan.record_source == :none and
         plan.residual_predicates == [] and
         plan.recheck_predicates == request_predicates(request) and plan.fallback_reason == :none and
         plan.query_fingerprint == Planner.query_fingerprint(request)
@@ -1362,6 +1763,7 @@ defmodule Ferricstore.Flow.Query.Executor do
     valid =
       plan.version == 1 and plan.index_id == nil and plan.index_version == nil and
         plan.index_build_id == nil and plan.definition == nil and plan.order == :none and
+        plan.record_source == :none and
         plan.recheck_predicates == request_predicates(request) and
         plan.query_fingerprint == Planner.query_fingerprint(request)
 
@@ -1396,6 +1798,14 @@ defmodule Ferricstore.Flow.Query.Executor do
          true <- plan.deduplicate == physical.deduplicate,
          true <- plan.order == physical.order,
          true <- plan.residual_predicates == physical.residual_predicates,
+         true <-
+           plan.record_source ==
+             ExecutionSource.classify(
+               request,
+               physical.path,
+               definition,
+               physical.residual_predicates
+             ),
          true <- plan.constraint_shapes == physical.constraint_shapes,
          {:ok, scope_prefix} <- MandatoryScope.single_prefix(plan.mandatory_scope),
          {:ok, physical_prefix} <-
@@ -1489,60 +1899,23 @@ defmodule Ferricstore.Flow.Query.Executor do
   defp default_range_read(path, range, cursor, max_entries, max_bytes),
     do: CompositeRangeReader.read(path, range, cursor, max_entries, max_bytes)
 
-  defp default_record_read(path, state_keys, now_ms, max_value_bytes) do
-    with {:ok, values, _value_bytes, complete?} <-
-           LMDB.get_many_prefix_bounded(path, state_keys, max_value_bytes),
-         {:ok, inputs, encoded_records} <- prepare_record_batch(values, now_ms, [], []),
-         {:ok, records} <- decode_record_batch(inputs, encoded_records) do
-      {:ok, records, complete?}
-    else
-      {:error, :batch_value_budget_exceeded} ->
-        {:error, :query_hydration_batch_too_large}
-
-      {:error, _reason} ->
-        {:error, :query_storage_unavailable}
-    end
+  defp default_record_read(
+         ctx,
+         shard_index,
+         path,
+         state_keys,
+         now_ms,
+         max_value_bytes,
+         timeout_ms
+       ) do
+    QueryRecordStore.read_many(
+      ctx,
+      shard_index,
+      path,
+      state_keys,
+      now_ms,
+      max_value_bytes,
+      timeout_ms: timeout_ms
+    )
   end
-
-  defp prepare_record_batch([], _now_ms, inputs, encoded_records),
-    do: {:ok, Enum.reverse(inputs), Enum.reverse(encoded_records)}
-
-  defp prepare_record_batch([:not_found | values], now_ms, inputs, encoded_records),
-    do: prepare_record_batch(values, now_ms, [:missing | inputs], encoded_records)
-
-  defp prepare_record_batch([{:ok, wrapper} | values], now_ms, inputs, encoded_records)
-       when is_binary(wrapper) do
-    case LMDB.decode_value(wrapper, now_ms) do
-      {:ok, encoded_record} ->
-        prepare_record_batch(values, now_ms, [:record | inputs], [
-          encoded_record | encoded_records
-        ])
-
-      :expired ->
-        prepare_record_batch(values, now_ms, [:missing | inputs], encoded_records)
-
-      :error ->
-        {:error, :query_storage_inconsistent}
-    end
-  end
-
-  defp prepare_record_batch(_invalid, _now_ms, _inputs, _encoded_records),
-    do: {:error, :query_storage_inconsistent}
-
-  defp decode_record_batch(inputs, encoded_records) do
-    records = Codec.decode_records(encoded_records)
-    restore_record_batch(inputs, records, [])
-  rescue
-    _error -> {:error, :query_storage_inconsistent}
-  end
-
-  defp restore_record_batch([], [], acc), do: {:ok, Enum.reverse(acc)}
-
-  defp restore_record_batch([:missing | inputs], records, acc),
-    do: restore_record_batch(inputs, records, [nil | acc])
-
-  defp restore_record_batch([:record | inputs], [record | records], acc) when is_map(record),
-    do: restore_record_batch(inputs, records, [record | acc])
-
-  defp restore_record_batch(_inputs, _records, _acc), do: {:error, :query_storage_inconsistent}
 end

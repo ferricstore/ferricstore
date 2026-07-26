@@ -23,6 +23,7 @@ defmodule FerricstoreServer.Native.Commands do
   alias Ferricstore.Flow.Query.ExecutionContext, as: FlowQueryExecutionContext
   alias Ferricstore.Flow.Query.Limits, as: FlowQueryLimits
   alias Ferricstore.Flow.Query.Request, as: FlowQueryRequest
+  alias Ferricstore.Flow.Query.ResultCodec, as: FlowQueryResultCodec
   alias Ferricstore.Store.{CompoundKey, ListOps, Ops, PublicationEpoch, ReadResult, Router}
   alias Ferricstore.Store.Shard.ZSetIndex
   alias Ferricstore.Store.SlotMap
@@ -1516,8 +1517,8 @@ defmodule FerricstoreServer.Native.Commands do
     with {:ok, request} <- prepared_flow_query(payload),
          {:ok, request_context} <- RequestContext.from_payload(payload, state) do
       store =
-        FlowQueryExecutionContext.attach(
-          state.instance_ctx,
+        flow_query_execution_context(
+          state,
           request_context,
           Map.get(payload, "deadline_ms")
         )
@@ -2009,7 +2010,7 @@ defmodule FerricstoreServer.Native.Commands do
          request_context,
          deadline_ms
        ) do
-    store = FlowQueryExecutionContext.attach(state.instance_ctx, request_context, deadline_ms)
+    store = flow_query_execution_context(state, request_context, deadline_ms)
 
     prepared
     |> Ferricstore.Commands.Dispatcher.execute_prepared(
@@ -2026,6 +2027,26 @@ defmodule FerricstoreServer.Native.Commands do
     store
     |> FlowQuery.execute_prepared(request)
     |> flow_query_result_to_reply(state)
+  end
+
+  defp flow_query_execution_context(state, request_context, deadline_ms) do
+    response_codec =
+      case Map.get(state, :compact_response_codecs) do
+        %MapSet{} = codecs ->
+          if MapSet.member?(codecs, FlowQueryResultCodec.name()),
+            do: :flow_query_result_v1,
+            else: :native_value
+
+        _missing_or_invalid ->
+          :native_value
+      end
+
+    FlowQueryExecutionContext.attach(
+      state.instance_ctx,
+      request_context,
+      deadline_ms,
+      response_codec
+    )
   end
 
   defp flow_query_result_to_reply(result, state) do

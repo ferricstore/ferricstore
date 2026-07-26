@@ -4,6 +4,46 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBRebuilder
+  alias Ferricstore.Flow.Locator
+
+  alias Ferricstore.Flow.Query.{
+    CompositeCounter,
+    CompositeIndex,
+    IndexDefinition,
+    QueryRowCodec,
+    RegisteredIndex,
+    RegistrySnapshot,
+    SourceCatalog
+  }
+
+  defmodule ActiveCompositeProvider do
+    @behaviour FerricStore.Flow.QueryIndexProvider
+
+    def definition do
+      IndexDefinition.new!(%{
+        id: "rebuild_state_updated",
+        version: 1,
+        count_prefixes: [1, 2],
+        fields: [
+          {:partition_key, :asc},
+          {:state, :asc},
+          {:updated_at_ms, :desc}
+        ]
+      })
+    end
+
+    @impl true
+    def snapshot(_ctx, _shard_index) do
+      {:ok,
+       RegistrySnapshot.new!(%{
+         epoch: 7,
+         catalog_version: 1,
+         indexes: [
+           RegisteredIndex.new!(definition(), :active, build_id: "rebuild-generation")
+         ]
+       })}
+    end
+  end
 
   setup do
     previous = Application.get_env(:ferricstore, :flow_lmdb_history_rebuild_page_size)
@@ -150,11 +190,12 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
     cold = active_record("cold-flow", "tenant-cold", 1)
     cold_state_key = Keys.state_key(cold.id, cold.partition_key)
     cold_reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(cold_state_key)
-    cold_encoded = Ferricstore.Flow.encode_record(cold)
+    cold_locator = locator(cold, 1)
+    assert {:ok, cold_query_row} = QueryRowCodec.encode(cold_state_key, cold, cold_locator, 0)
 
     cold_ops =
       [
-        {:put, cold_state_key, Ferricstore.Flow.LMDB.encode_value(cold_encoded, 0)}
+        {:put, cold_state_key, cold_query_row}
         | Ferricstore.Flow.LMDB.active_timeout_index_put_ops(cold_state_key, cold, 0)
       ]
 
@@ -168,7 +209,7 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
     true =
       :ets.insert(
         keydir,
-        {hot_state_key, hot_encoded, 0, 0, :hot, 0, byte_size(hot_encoded)}
+        {hot_state_key, hot_encoded, 0, 0, 2, 0, byte_size(hot_encoded)}
       )
 
     assert :ok =
@@ -184,6 +225,74 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
              )
 
     assert {:ok, ^cold_reverse} = Ferricstore.Flow.LMDB.get(lmdb_path, cold_reverse_key)
+    assert {:ok, hot_query_row} = Ferricstore.Flow.LMDB.get(lmdb_path, hot_state_key)
+
+    assert {:ok, %{record: %{id: "hot-flow"}, locator: %{file_id: 2}}} =
+             QueryRowCodec.decode(hot_query_row, hot_state_key)
+
+    assert {:ok, %{state_keys: [^hot_state_key], done?: true}} =
+             SourceCatalog.page(lmdb_path, "", 16, 1_024 * 1_024)
+  end
+
+  test "reconciliation restores active composite generations after derived LMDB loss" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_reconcile_composite_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    keydir = :ets.new(:lmdb_rebuilder_composite_keydir, [:set])
+    record = active_record("composite-flow", "tenant-composite", 17)
+    state_key = Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+
+    ctx = %{
+      name: :lmdb_rebuilder_composite,
+      query_index_provider: ActiveCompositeProvider
+    }
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    true =
+      :ets.insert(
+        keydir,
+        {state_key, encoded, 0, 0, 7, 0, byte_size(encoded)}
+      )
+
+    refute Ferricstore.Flow.LMDB.env_present?(lmdb_path)
+
+    assert :ok =
+             LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               0,
+               ctx,
+               nil,
+               nil,
+               nil,
+               nil
+             )
+
+    definition = ActiveCompositeProvider.definition()
+
+    assert {:ok, [%{key: entry_key, value: entry_value}]} =
+             CompositeIndex.entries(definition, record, state_key, 0)
+
+    assert {:ok, ^entry_value} = Ferricstore.Flow.LMDB.get(lmdb_path, entry_key)
+
+    reverse_key = CompositeIndex.reverse_key(state_key)
+    assert {:ok, reverse_value} = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
+    assert {:ok, [^entry_key]} = CompositeIndex.decode_reverse_value(reverse_value, state_key)
+
+    assert {:ok, 1} =
+             CompositeCounter.read(
+               lmdb_path,
+               definition,
+               nil,
+               [record.partition_key, record.state]
+             )
   end
 
   test "online reconciliation preserves a hot-pruned terminal projection and repairs its count" do
@@ -219,7 +328,7 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
       )
 
     reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
-    encoded = Ferricstore.Flow.encode_record(record)
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator(record, 3), 0)
 
     on_exit(fn -> File.rm_rf!(data_dir) end)
 
@@ -227,7 +336,7 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
 
     assert :ok =
              Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
-               {:put, state_key, Ferricstore.Flow.LMDB.encode_value(encoded, 0)},
+               {:put, state_key, query_row},
                {:put, terminal_key, terminal_value},
                {:put, reverse_key, terminal_key}
              ])
@@ -250,6 +359,146 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
     assert {:ok, ^terminal_value} = Ferricstore.Flow.LMDB.get(lmdb_path, terminal_key)
     assert {:ok, ^terminal_key} = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
     assert {:ok, 1} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, state_index_key)
+  end
+
+  test "online reconciliation durably pins a terminal source before pruning its keydir row" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_reconcile_terminal_pin_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    keydir = :ets.new(:lmdb_rebuilder_terminal_pin_keydir, [:set])
+    record = terminal_record("terminal-pin-flow", "partition-terminal-pin", 12)
+    state_key = Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+    index = 31
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(data_dir, 0, index, [
+               {state_key, encoded, 0}
+             ])
+
+    true =
+      :ets.insert(
+        keydir,
+        {state_key, nil, 0, 0, {:waraft_apply_projection, index}, 0, byte_size(encoded)}
+      )
+
+    assert :ok =
+             LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               0,
+               %{data_dir: data_dir},
+               nil,
+               nil,
+               nil,
+               nil,
+               prune_terminal_keydir?: true
+             )
+
+    assert [] = :ets.lookup(keydir, state_key)
+    assert {:ok, query_row} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+    assert {:ok, %{locator: locator, record: %{id: "terminal-pin-flow"}}} =
+             QueryRowCodec.decode(query_row, state_key)
+
+    assert {:ok, ^encoded} =
+             Ferricstore.Raft.WARaftSegmentReader.read_value_from_location_including_expired(
+               %{data_dir: data_dir},
+               0,
+               locator.file_id,
+               state_key
+             )
+  end
+
+  test "reconciliation locates every key in a repeated apply projection index" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore_lmdb_reconcile_repeated_projection_#{System.unique_integer([:positive])}"
+      )
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    lmdb_path = Ferricstore.Flow.LMDB.path(shard_path)
+    keydir = :ets.new(:lmdb_rebuilder_repeated_projection_keydir, [:set])
+    first = terminal_record("repeated-projection-a", "partition-repeated", 12)
+    second = terminal_record("repeated-projection-b", "partition-repeated", 12)
+    first_key = Keys.state_key(first.id, first.partition_key)
+    second_key = Keys.state_key(second.id, second.partition_key)
+    first_encoded = Ferricstore.Flow.encode_record(first)
+    second_encoded = Ferricstore.Flow.encode_record(second)
+    index = 41
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(data_dir, 0, index, [
+               {first_key, first_encoded, 0}
+             ])
+
+    assert {:ok, 1} =
+             Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(data_dir, 0)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(data_dir, 0, index, [
+               {second_key, second_encoded, 0}
+             ])
+
+    assert {:ok, 1} =
+             Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(data_dir, 0)
+
+    true =
+      :ets.insert(keydir, [
+        {first_key, nil, 0, 0, {:waraft_apply_projection, index}, 0, byte_size(first_encoded)},
+        {second_key, nil, 0, 0, {:waraft_apply_projection, index}, 0, byte_size(second_encoded)}
+      ])
+
+    assert :ok =
+             LMDBRebuilder.reconcile_shard(
+               shard_path,
+               keydir,
+               0,
+               %{data_dir: data_dir},
+               nil,
+               nil,
+               nil,
+               nil
+             )
+
+    requests =
+      Enum.map([first_key, second_key], fn state_key ->
+        assert {:ok, encoded_row} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+        assert {:ok, %{locator: locator}} = QueryRowCodec.decode(encoded_row, state_key)
+
+        %{
+          file_id: locator.file_id,
+          ordinal: locator.segment_generation,
+          offset: locator.offset,
+          frame_size: locator.frame_size,
+          key: state_key
+        }
+      end)
+
+    assert {:ok, %{^first_key => ^first_encoded, ^second_key => ^second_encoded}} =
+             Ferricstore.Raft.WARaftSegmentReader.read_physical_values(
+               %{data_dir: data_dir},
+               0,
+               requests,
+               5_000,
+               :include_expired
+             )
   end
 
   test "online reconciliation removes a stale terminal projection for cold active state" do
@@ -285,7 +534,7 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
       )
 
     reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
-    encoded = Ferricstore.Flow.encode_record(record)
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator(record, 4), 0)
 
     on_exit(fn -> File.rm_rf!(data_dir) end)
 
@@ -293,7 +542,7 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
 
     assert :ok =
              Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
-               {:put, state_key, Ferricstore.Flow.LMDB.encode_value(encoded, 0)},
+               {:put, state_key, query_row},
                {:put, terminal_key, terminal_value},
                {:put, reverse_key, terminal_key},
                {:put, count_key, Ferricstore.Flow.LMDB.encode_count(1)}
@@ -516,5 +765,19 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
         {:put, reverse_key, terminal_key}
       ]
     }
+  end
+
+  defp locator(record, file_id) do
+    Locator.new!(
+      flow_id: record.id,
+      kind: :state,
+      version: record.version,
+      raft_index: record.version,
+      file_id: file_id,
+      offset: 0,
+      value_size: 256,
+      checksum: :crypto.hash(:sha256, Ferricstore.Flow.encode_record(record)),
+      expire_at_ms: 0
+    )
   end
 end

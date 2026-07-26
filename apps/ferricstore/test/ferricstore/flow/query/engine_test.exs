@@ -254,9 +254,12 @@ defmodule Ferricstore.Flow.Query.EngineTest do
 
       assert explain.plan.projection == %{
                fields: fields,
-               application: "after_authoritative_recheck",
-               index_only: false
+               source: "authoritative_log",
+               index_only: false,
+               requires_hydration: true
              }
+
+      assert explain.plan.record_source == "authoritative_log"
     end
   end
 

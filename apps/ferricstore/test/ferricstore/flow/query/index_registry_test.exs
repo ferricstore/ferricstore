@@ -304,7 +304,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistryTest do
                written_bytes: 512
              )
 
-    assert {:ok, %{epoch: 1, catalog_version: 3, indexes: indexes}} =
+    assert {:ok, %{epoch: 1, catalog_version: 4, indexes: indexes}} =
              IndexRegistry.overview(server_name)
 
     status =
@@ -317,6 +317,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistryTest do
     refute status.queryable
     assert status.build_id == registered.build_id
     assert status.workloads == registered.definition.workloads
+    assert status.covering_fields == registered.definition.covering_fields
 
     assert status.fields ==
              Enum.map(registered.definition.fields, fn {field, direction, encoding} ->
@@ -1081,6 +1082,39 @@ defmodule Ferricstore.Flow.Query.IndexRegistryTest do
                instance_ctx: ctx,
                name: server_name
              )
+
+    assert {:error, :query_index_registry_unavailable} = IndexRegistry.snapshot(ctx, 0)
+  end
+
+  test "rejects an older beta snapshot with an actionable rebuild requirement", context do
+    %{ctx: ctx, server_name: server_name} = context
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+    pid = start_registry!(ctx, server_name)
+    GenServer.stop(pid)
+
+    path = IndexRegistry.snapshot_path(ctx)
+
+    {:ok, {tag, _version, metadata_contract, epoch, catalog_version, digest, entries}} =
+      path |> File.read!() |> TermCodec.decode()
+
+    File.write!(
+      path,
+      TermCodec.encode({
+        tag,
+        1,
+        metadata_contract,
+        epoch,
+        catalog_version,
+        digest,
+        entries
+      })
+    )
+
+    assert {:error,
+            {:query_index_registry_rebuild_required,
+             %{path: ^path, found_version: 1, expected_version: 2}}} =
+             IndexRegistry.start_link(instance_ctx: ctx, name: server_name)
 
     assert {:error, :query_index_registry_unavailable} = IndexRegistry.snapshot(ctx, 0)
   end

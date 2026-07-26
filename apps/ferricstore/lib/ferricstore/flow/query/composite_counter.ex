@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.Query.CompositeCounter do
   alias Ferricstore.TermCodec
 
   @storage_prefix "flow-composite-count:1:"
+  @format "ferric.flow.query.composite.counter/v1"
   @value_tag :flow_composite_count
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
   @max_value_bytes 2_048
@@ -28,6 +29,10 @@ defmodule Ferricstore.Flow.Query.CompositeCounter do
 
   @spec storage_prefix() :: binary()
   def storage_prefix, do: @storage_prefix
+
+  @doc false
+  @spec format() :: binary()
+  def format, do: @format
 
   @spec definition_storage_prefix(IndexDefinition.t()) :: binary()
   def definition_storage_prefix(%IndexDefinition{version: version, fingerprint: fingerprint}) do

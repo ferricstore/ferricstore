@@ -586,10 +586,11 @@ timestamps, attempts/run state, maximum active time, parent/root/correlation
 identifiers, attributes, and state metadata. It excludes payload/result/error
 and named-value references, child bookkeeping, worker/lease/fencing tokens and
 owners, parent partition keys, retention controls, and unknown future fields.
-An explicit result projection is applied only after authorization,
-authoritative hydration, predicate recheck, ordering, and cursor derivation. It
-reduces result memory/encoding/network work but is not an index-only read and
-does not reduce scan or hydration counters.
+An explicit result projection is applied only after authorization and all
+required index/scope/predicate validation. Eligible composite plans may answer
+from a bounded covering payload; other plans hydrate authoritative rows. A
+projection reduces result memory, encoding, and network work but never reduces
+the number of index entries scanned.
 
 Prefixing the query with `EXPLAIN` returns `ferric.flow.explain/v1`. The plan is
 deterministic and redacts literal and bound parameter values. The capability
@@ -597,10 +598,14 @@ manifest advertises `ferric.flow.query.request/v1`,
 `ferric.flow.query.result/v1`, `ferric.flow.explain/v1`,
 `ferric.flow.query.indexes/v1`, every executable shape, and
 `flow_query_result_projection_v1` plus `flow_explain_analyze_v1`. `EXPLAIN` reports
-the requested fields in `plan.projection` with `index_only: false`. `EXPLAIN ANALYZE` performs a fresh bounded
-execution, rejects cursors, and returns actual resource usage without records
-or count values. Providers that do not advertise that capability reject the
-analyzed shape. Query failures use fixed, value-free error codes and
+the requested fields in `plan.projection`. Its `source` is `covering_index`,
+`query_row`, `authoritative_log`, `transactional_counter`, or `not_applicable`;
+`requires_hydration` explicitly reports whether authoritative records are read.
+`EXPLAIN ANALYZE` performs a fresh bounded execution, rejects cursors, and
+returns actual resource usage without records or count values. A malformed or
+incomplete covering entry fails as inconsistent storage rather than silently
+hydrating from the log. Providers that do not advertise that capability reject
+the analyzed shape. Query failures use fixed, value-free error codes and
 messages. Parser failures additionally return a one-based byte offset plus line
 and UTF-8 character-column positions, with bounded `detail` and `hint` strings. Unsupported fields include
 a sorted `context.supported_fields` list. No-plan failures include

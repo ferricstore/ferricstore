@@ -106,7 +106,8 @@ these fields in order:
 2. `plan.path` is the expected access path and `plan.index` identifies the
    generation that will be used.
 3. `plan.projection.fields` matches the requested result fields and
-   `plan.projection.index_only` is `false`.
+   `plan.projection.source`, `index_only`, and `requires_hydration` match the
+   intended read strategy.
 4. `plan.residual_predicates` is empty or intentionally small.
 5. `plan.order` is `native` when the index should satisfy the requested order;
    `bounded_top_k` means a bounded in-memory sort is required.
@@ -241,6 +242,13 @@ ORDER BY updated_at_ms DESC
 LIMIT 100
 RETURN RECORDS
 ```
+
+`updated_at_ms` is the current run row's most recent update time. Replace it
+with `created_at_ms` to filter by creation time, and use a composite index whose
+ordered date field matches the predicate and order. Neither field means "when
+this run entered this state." Model that historical timestamp explicitly in
+`state_meta.*`, `attribute.*`, or the event stream when that distinction
+matters.
 
 Two-field ordering is legal, but it needs a matching bounded index and may use
 bounded top-K sorting when the index does not provide the complete order:
@@ -466,22 +474,31 @@ Projection has these exact result semantics:
   notation cannot name the same field twice; and
 - selector order does not affect the returned map or cursor identity.
 
-Projection is result shaping, not a covering-index promise. FerricStore still
-authorizes the complete prepared request, validates index ownership and
-generation, hydrates authoritative rows, evaluates every predicate, computes
-order/cursor keys, and enforces all budgets before hiding unrequested fields.
-It therefore does not reduce index entries scanned or authoritative records
-hydrated. It does reduce retained winner-map data on general top-K plans,
-response shaping and encoding work, response bytes, and network/client decode
-work. Fixed, history, and lineage pages may briefly hold validated full rows
-alongside projected rows, and that coexistence is charged to the executor
-memory budget.
+Projection always shapes the result and can also enable a covering composite
+index read. A plan is covering-eligible only when the active index contains
+every requested and ordering field and no residual predicate needs the full
+record. FerricStore still authorizes the complete prepared request and validates
+the index generation, physical key ownership, record identity/version,
+partition scope, field types, cursor, and every resource budget.
+
+Covering execution does not reduce index entries scanned. It avoids
+authoritative record hydration, response shaping from full records, and their
+decode/allocation cost. Cover values are validated and bounded at write time;
+an incomplete, malformed, or identity-mismatched cover is a storage-consistency
+error, not a silent authoritative fallback. QueryRow-visible projections and
+residual filters can instead use the compact metadata row with no log read.
+Full-record, payload-dependent, fixed, history, and lineage reads use
+authoritative rows. General top-K projections still reduce retained winner-map
+data, response bytes, and network/client decode work.
 
 `EXPLAIN` exposes this as `plan.projection`: `fields` is the requested list (or
-`all_allowlisted_fields`), `application` is
-`after_authoritative_recheck`, and `index_only` is `false`. Cursors authenticate
-the canonical selector set. Changing it invalidates a cursor; reordering the
-same selectors does not.
+`all_allowlisted_fields`), and `source` is `covering_index`, `query_row`,
+`authoritative_log`, `transactional_counter`, or `not_applicable`.
+`index_only: true` identifies a covering-index or transactional-counter read.
+`requires_hydration: true` identifies an authoritative-log read. `EXPLAIN
+ANALYZE` confirms actual work through `actual.hydrated_records`. Cursors
+authenticate the canonical selector set. Changing it invalidates a cursor;
+reordering the same selectors does not.
 
 ## Predicates And Values
 
@@ -836,8 +853,12 @@ number of candidate index entries, just as a SQL filter that is not an index
 condition does not narrow its scan.
 
 `plan.projection` reports result shaping independently of index constraints.
-`index_only: false` means a narrow return list must not be interpreted as fewer
-authoritative reads.
+Its `source` names the physical record source, `index_only` identifies a
+covering-index or transactional-counter plan, and `requires_hydration` states
+whether authoritative-log records must be fetched. A `query_row` source is a
+metadata-only LMDB read with no log hydration even though `index_only` is
+false. A narrow return list reduces authoritative reads only when the selected
+source changes accordingly.
 
 ### Estimates, Bounds, And Pressure
 
@@ -847,7 +868,9 @@ may consume. Compare the hard estimate with `bounds.scanned_entries` when
 deciding whether the plan is safe; compare `actual.scanned_entries` with the
 estimate when deciding whether statistics and index shape are effective.
 
-The same expected/hard distinction applies to scanned bytes and hydration.
+The same expected/hard distinction applies to scanned bytes and hydrated
+records. `estimate.hydration_bytes` estimates encoded authoritative bytes read;
+it is zero for covering, QueryRow, counter, and empty plans.
 Planner memory is enforced internally but emitted as `null` because literal
 lengths affect the value and EXPLAIN redacts literals. Executor memory is
 reported.
@@ -981,6 +1004,8 @@ digests.
 | `services.*` | All are `ready`; an unavailable worker explains stalled progress or stats. |
 | `index.state` | `active` for a selectable generation. |
 | `index.queryable` | `true` only after every shard built and validation passed. |
+| `index.format` | Exact QueryRow, key, entry, reverse, and optional counter codec contracts used by this generation. |
+| `index.covering_fields` | Built-in and dynamic query fields available for covering projections in this generation. |
 | `coverage.complete_shards/total_shards` | Equal before activation. |
 | `coverage.validation` | `passed` for an active generation. |
 | `build.current_phases` | Advances `pending -> snapshot -> backfill -> done`. |
@@ -992,6 +1017,45 @@ digests.
 
 The top-level `statistics_max_age_ms` defines freshness. Summary counts are
 aggregated and deliberately do not identify partition/scope samples.
+
+`index.format.query_row`, `key`, `entry`, `reverse`, and `counter` are opaque
+codec identities, not data values. A plain composite entry reports entry `v1`;
+an entry carrying declared cover fields reports entry `v2`; and `counter` is
+`null` when the definition has no exact count prefixes. A deployed format that
+does not match the generation requires a destructive derived-index rebuild;
+FerricStore does not decode an older beta format in place.
+
+### Beta Format Replacement
+
+This release replaces, rather than upgrades, the beta query projection. The
+shipped catalog is version `4`, its built-in index definitions are generation
+`2`, and the durable registry snapshot is version `2`. Query rows use
+`ferric.flow.query.row/v1`; covering composite values use
+`ferric.flow.query.composite.entry/v2`; compact cold-park values use version
+`2`. There is no decoder or dual-write path for the removed full-record LMDB
+state value, cold-park version `1`, registry snapshot version `1`, or generation
+`1` built-in indexes.
+
+An old registry snapshot fails startup with
+`query_index_registry_rebuild_required` and reports its path plus the found and
+expected versions. Treat that error as an offline derived-query rebuild:
+
+1. Stop every FerricStore process using the data directory and take a backup.
+2. Preserve the WARaft/Bitcask data and blob files; they contain authoritative
+   state and payload data.
+3. Remove the reported query registry snapshot and its sibling progress
+   journal, then remove the incompatible per-shard Flow LMDB query projection
+   using the deployment's normal derived-state rebuild procedure.
+4. Restart and wait for Flow LMDB reconciliation plus every catalog generation
+   to finish building and validating.
+5. Confirm `FLOW.QUERY.INDEXES` reports catalog `4`, generation `2` indexes as
+   `active`, all shards complete, and validation passed before restoring query
+   traffic.
+
+Do not delete or rewrite WARaft segment or apply-projection logs to resolve a
+query format mismatch. `FERRICSTORE.DOCTOR START REPAIR PROJECTIONS SCOPE
+FLOW_LMDB` reconciles a running, compatible projection; it does not convert an
+incompatible registry snapshot and is not a substitute for the offline step.
 
 ### Lifecycle
 
@@ -1237,6 +1301,65 @@ not replace the engine of an existing instance. Execution budgets are explicit
 data passed through the request path; Raft apply does not read mutable process
 configuration to decide query semantics.
 
+### Storage Ownership
+
+The append-only Flow/WARaft log is the sole authoritative copy of a complete
+current Flow record. LMDB does not duplicate its payload or complete encoded
+record. Each current state key has one bounded QueryRow containing:
+
+- state-key, Flow-ID, partition, type, state, and logical version identity;
+- expiry, routing, scheduling, lineage, and query-visible built-in metadata;
+- all validated `attribute.*` and `state_meta.*` values within the documented
+  metadata limits; and
+- one physical locator containing log kind/index, segment generation, frame
+  offset/size, logical value size, and a SHA-256 value checksum.
+
+The shared SourceCatalog is a durable exact-type membership projection. Its
+entry contains only the state key and is used for resumable index backfill,
+validation, and QueryRow compaction. It is not another QueryRow or record copy.
+
+A composite index value contains run identity, logical version, expiry, and
+only its explicitly declared covering fields. It never contains a physical log
+offset. Reverse rows and exact counters are generation-scoped derived data and
+are changed in the same LMDB transaction as their composite entries.
+
+### Read Classes
+
+The planner assigns one physical read class and reports it through EXPLAIN:
+
+| Class | Read path |
+| --- | --- |
+| fully index-covered | Composite key/value only; zero QueryRow and log reads. |
+| metadata-row-covered | Composite candidate plus QueryRow; zero log reads. |
+| payload hydration required | QueryRow locator plus bounded grouped physical log reads. |
+
+Full records and payload-bearing projections are hydrated in batches grouped
+by log kind and segment. Admission charges distinct physical frame bytes before
+I/O, then charges materialized blob bytes and decoded record memory. Every
+hydrated value must match locator size/checksum, Flow identity/version, and
+state-key ownership. Missing or mismatched data is never returned as a partial
+success.
+
+### Write And Compaction Ordering
+
+A projection publishes a QueryRow locator only after the authoritative log
+frame is durable. The QueryRow, fixed/composite indexes, reverse rows, counters,
+and SourceCatalog membership changes are committed atomically in LMDB.
+
+Apply-projection retention preserves every row sharing one Raft index as an
+indivisible group. Large scans spill bounded pages to temporary disk rather
+than retaining the catalog in process memory. Compaction writes retained frames
+under an exclusive disk latch, invalidates cached file descriptors around the
+atomic directory swap, and then compare-and-swaps only the centralized
+QueryRow locator using logical version and segment generation. Composite index
+entries are not rewritten when a physical frame moves.
+
+A reader that races compaction rereads the QueryRow and retries hydration once
+within the original monotonic deadline. If the location is unchanged but the
+frame moved, bounded locator repair resolves the current physical position and
+uses the same compare-and-swap contract. Deletion, version change, checksum
+failure, or a second race fails closed.
+
 ### Capability Negotiation
 
 Clients must inspect `OPTIONS.flow_query` and validate:
@@ -1286,11 +1409,12 @@ keys, insert current keys, update exact counters, and replace the reverse row
 in one LMDB transaction. Every key ends with an opaque SHA-256 run identity.
 Each range is proven to remain under its mandatory partition prefix.
 
-Execution does not trust the index as authoritative. It validates index tuple
-encoding and generation, hydrates the authoritative record, verifies physical
-key ownership/version, rechecks partition scope and every predicate, and rejects
-storage inconsistencies instead of returning a possibly wrong row. Overlapping
-ranges and multivalue expansions deduplicate before output.
+Execution validates index tuple encoding and generation, physical key
+ownership/version, partition scope, and every applicable predicate, and rejects
+storage inconsistencies instead of returning a possibly wrong row. A
+covering-eligible row is validated from its bounded typed cover; other rows are
+hydrated and rechecked against authoritative state. Overlapping ranges and
+multivalue expansions deduplicate before output.
 
 Exact counters are updated transactionally with projection keys and bind the
 complete physical prefix. The planner uses them only for fully represented,
@@ -1309,7 +1433,7 @@ SQLite, but it is not a SQL dialect.
 | Concept | PostgreSQL/SQLite | FerricStore FQL1 |
 | --- | --- | --- |
 | data model | General tables, columns, joins, expressions | Fixed `runs` and `events` domain sources |
-| projection | `SELECT` expressions/columns | Source-specific fields after `RETURN RECORD(S)`; no expressions or index-only reads |
+| projection | `SELECT` expressions/columns | Source-specific fields after `RETURN RECORD(S)`; no expressions, with bounded covering reads for eligible built-in fields |
 | scope | Query may scan a table | Collections/counts require one exact partition |
 | Boolean logic | General `AND`/`OR`/`NOT` | Conjunction (`AND`) plus bounded `IN` union |
 | aggregation | General aggregates/grouping | Exact `RETURN COUNT` only |

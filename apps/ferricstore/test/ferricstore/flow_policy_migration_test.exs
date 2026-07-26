@@ -7,8 +7,9 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
   alias Ferricstore.Flow.NativeOrderedIndex
   alias Ferricstore.Flow.PolicyMigration
   alias Ferricstore.Flow.PolicyMigrationWorker
-  alias Ferricstore.Flow.Query.SourceCatalog
+  alias Ferricstore.Flow.Query.{QueryRecordStore, QueryRowCodec, SourceCatalog}
   alias Ferricstore.Flow.RetryPolicy
+  alias Ferricstore.Flow.StorageScope
   alias Ferricstore.Store.Router
 
   @partition "policy-migration-partition"
@@ -954,6 +955,73 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
              PolicyMigration.catalog_page(ctx, shard_index, type, 1, 2, 1)
   end
 
+  test "catalog hydration binds shared records to their sealed physical scope" do
+    ctx = FerricStore.Instance.get(:default)
+    type = unique_flow_id("shared-catalog-owner")
+    id = unique_flow_id("shared-catalog-record")
+    scope = <<42::unsigned-big-64>>
+    assert {:ok, physical_partition} = StorageScope.physical_partition_key(@partition, scope)
+    state_key = Keys.state_key(id, physical_partition)
+    shard_index = Router.shard_for(ctx, state_key)
+    keydir = elem(ctx.keydir_refs, shard_index)
+    catalog_key = Keys.type_catalog_member_key(type, state_key)
+    catalog_value = PolicyMigration.encode_catalog(type, state_key, 0)
+    projection_key = Keys.policy_catalog_projection_key(type, catalog_key, 0)
+    lmdb_path = flow_lmdb_path(ctx, shard_index)
+
+    valid = %{
+      id: id,
+      type: type,
+      state: "waiting",
+      version: 1,
+      attempts: 0,
+      fencing_token: 0,
+      created_at_ms: 1,
+      updated_at_ms: 1,
+      next_run_at_ms: 1,
+      priority: 0,
+      partition_key: physical_partition,
+      root_flow_id: id,
+      state_enter_seq: 1,
+      system_metadata: scope_metadata(42)
+    }
+
+    valid_encoded = Ferricstore.Flow.encode_record(valid)
+
+    true =
+      :ets.insert(keydir, [
+        {catalog_key, catalog_value, 0, nil, 0, 0, byte_size(catalog_value)},
+        {state_key, valid_encoded, 0, nil, 0, 0, byte_size(valid_encoded)}
+      ])
+
+    assert :ok = LMDB.write_batch(lmdb_path, [{:put, projection_key, <<1>>}])
+
+    on_exit(fn ->
+      :ets.delete(keydir, catalog_key)
+      :ets.delete(keydir, state_key)
+      LMDB.write_batch(lmdb_path, [{:delete, projection_key}])
+    end)
+
+    assert {:ok, %{entries: [%{record_value: record_value}]}} =
+             PolicyMigration.catalog_page(ctx, shard_index, type, 1, 1, 1_024 * 1_024)
+
+    assert is_binary(record_value)
+
+    forged_encoded =
+      valid
+      |> Map.put(:system_metadata, scope_metadata(99))
+      |> Ferricstore.Flow.encode_record()
+
+    true =
+      :ets.insert(
+        keydir,
+        {state_key, forged_encoded, 0, nil, 0, 0, byte_size(forged_encoded)}
+      )
+
+    assert {:error, :corrupt_policy_catalog_state_record} =
+             PolicyMigration.catalog_page(ctx, shard_index, type, 1, 1, 1_024 * 1_024)
+  end
+
   test "backfill discovers a primary state that is absent from the lagged LMDB mirror" do
     ctx = FerricStore.Instance.get(:default)
     type = unique_flow_id("primary-only-source")
@@ -1046,7 +1114,37 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
     assert_eventually(fn ->
       assert [] == :ets.lookup(keydir, state_key)
       assert :ets.member(keydir, registry_key)
-      assert {:ok, _park} = LMDB.get(lmdb_path, LMDB.cold_park_key_for_state_key(state_key))
+      assert {:ok, query_row} = LMDB.get(lmdb_path, state_key)
+
+      assert {:ok, %{record: %{id: ^id}} = decoded_row} =
+               QueryRowCodec.decode(query_row, state_key)
+
+      assert {:ok, [encoded_record], true} =
+               QueryRecordStore.read_encoded_many(
+                 ctx,
+                 shard_index,
+                 lmdb_path,
+                 [state_key],
+                 now_ms,
+                 QueryRecordStore.max_input_bytes(ctx)
+               )
+
+      assert is_binary(encoded_record),
+             "cold QueryRow locator did not resolve: #{inspect(decoded_row.locator)}"
+
+      decoded_record =
+        try do
+          Ferricstore.Flow.decode_record(encoded_record)
+        rescue
+          _error ->
+            {:invalid_record, decoded_row.locator, byte_size(encoded_record),
+             binary_part(encoded_record, 0, min(byte_size(encoded_record), 32))}
+        end
+
+      assert %{id: ^id} = decoded_record
+      assert {:ok, park_blob} = LMDB.get(lmdb_path, LMDB.cold_park_key_for_state_key(state_key))
+      assert {:ok, park} = LMDB.decode_cold_park(park_blob)
+      refute Map.has_key?(park, :state_value)
     end)
 
     :ets.delete(keydir, catalog_key)
@@ -1054,7 +1152,6 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
 
     :ok =
       LMDB.write_batch(lmdb_path, [
-        {:delete, state_key},
         {:delete, catalog_key},
         {:delete, descriptor_key},
         {:delete, Keys.policy_catalog_projection_key(type, catalog_key, 0)}
@@ -1109,7 +1206,6 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
 
     :ok =
       LMDB.write_batch(lmdb_path, [
-        {:delete, state_key},
         {:delete, catalog_key},
         {:delete, descriptor_key},
         {:delete, Keys.policy_catalog_projection_key(type, catalog_key, 0)}
@@ -1157,7 +1253,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
              _other -> false
            end)
 
-    :ok = LMDB.write_batch(lmdb_path, [{:delete, park_key}])
+    :ok = LMDB.write_batch(lmdb_path, [{:delete, state_key}, {:delete, park_key}])
 
     assert {:ok, _} =
              Router.flow_policy_catalog_backfill_step(ctx, shard_index, %{
@@ -2005,6 +2101,8 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
         flunk("missing keydir row #{inspect(key)}")
     end
   end
+
+  defp scope_metadata(value), do: %{0x8001 => {1, :uint64, :isolation_scope, value}}
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
   defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)

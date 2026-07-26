@@ -23,6 +23,7 @@ mod copy_records_preserve_tombstones_tests {
         .unwrap();
 
         assert_eq!(1, results.len());
+        assert_eq!(b"live".len() as u64, results[0].1);
 
         let mut reader = log::LogReader::open(&dest).unwrap();
         let first = reader.read_at(results[0].0).unwrap().unwrap();
@@ -94,6 +95,7 @@ mod copy_records_preserve_tombstones_tests {
         )
         .unwrap();
         assert_eq!(1, copied.len());
+        assert_eq!(b"value".len() as u64, copied[0].1);
 
         let duplicate = copy_live_records_impl(
             &source,

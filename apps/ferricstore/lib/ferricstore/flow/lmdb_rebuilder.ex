@@ -8,8 +8,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   alias Ferricstore.Flow.LMDBRebuilder.ColdState
   alias Ferricstore.Flow.LMDBRebuilder.TerminalCounts
   alias Ferricstore.Flow.LMDBRebuilder.TerminalProjection
+  alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
   alias Ferricstore.Flow.PolicyMigration
+  alias Ferricstore.Flow.Query.{CompositeProjection, QueryRowCodec, SourceCatalog}
   alias Ferricstore.Flow.SharedRefBackfill
   alias Ferricstore.Store.Shard.ZSetIndex
 
@@ -50,7 +52,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                  |> ColdState.read_and_decode(shard_path, shard_index, instance_ctx)
                  |> Enum.reduce(
                    %{acc | seen: acc.seen + length(entries)},
-                   fn {_key, _value, _expire_at_ms, record}, next_acc ->
+                   fn {_key, _value, _expire_at_ms, record, _locator}, next_acc ->
                      if LMDB.terminal_state?(Map.get(record, :state)) do
                        %{next_acc | terminal: next_acc.terminal + 1}
                      else
@@ -146,7 +148,12 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     Process.put(:flow_lmdb_rebuild_cold_read_errors, 0)
 
     try do
-      with {:ok, state_entries_present?} <- state_entries_present?(keydir),
+      with {:ok, query_index_definitions} <-
+             FerricStore.Flow.QueryIndexProvider.projection_definitions(
+               instance_ctx,
+               shard_index
+             ),
+           {:ok, state_entries_present?} <- state_entries_present?(keydir),
            {:ok, marker_started?} <-
              begin_reconcile_marker(lmdb_path, state_entries_present?),
            :ok <-
@@ -171,6 +178,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                    flow_index,
                    flow_lookup,
                    prune_terminal_keydir?,
+                   query_index_definitions,
                    acc
                  )
                end
@@ -598,111 +606,88 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          flow_index,
          flow_lookup,
          prune_terminal_keydir?,
+         query_index_definitions,
          acc
        ) do
     decoded = ColdState.read_and_decode(entries, shard_path, shard_index, instance_ctx)
 
-    {ops, terminal_prunes, active_records, projection_read_errors} =
-      Enum.reduce(decoded, {[], [], [], 0}, fn
-        {key, value, expire_at_ms, record}, {ops, prunes, active, read_errors} ->
-          state_put_op = {:put, key, LMDB.encode_value(value, expire_at_ms)}
-
-          if LMDB.terminal_state?(Map.get(record, :state)) do
-            projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
-
-            index_key =
-              Flow.Keys.state_index_key(
-                record.type,
-                record.state,
-                Map.get(record, :partition_key)
-              )
-
-            count_key = LMDB.terminal_count_key(index_key)
-            updated_at_ms = Map.get(record, :updated_at_ms, 0)
-
-            terminal_key =
-              LMDB.terminal_index_key(index_key, record.id, updated_at_ms)
-
-            terminal_value =
-              LMDB.encode_terminal_index_value(
-                record.id,
-                updated_at_ms,
-                projection_expire_at_ms,
-                key,
-                count_key
-              )
-
-            terminal_expire_key = LMDB.terminal_expire_key(projection_expire_at_ms, terminal_key)
-
-            terminal_expire_value =
-              LMDB.encode_terminal_expire_value(terminal_key, key, count_key)
-
-            terminal_expire_ops =
-              if is_binary(terminal_expire_key) do
-                [{:put, terminal_expire_key, terminal_expire_value}]
-              else
-                []
-              end
-
-            reverse_key = LMDB.terminal_by_state_key_key(key)
-
-            metadata_ops =
-              TerminalProjection.query_metadata_index_ops(record, projection_expire_at_ms)
-
-            {active_delete_ops, next_read_errors} =
-              case LMDB.active_index_delete_ops_result(lmdb_path, key) do
-                {:ok, active_delete_ops} -> {active_delete_ops, read_errors}
-                {:error, _reason} -> {[], read_errors + 1}
-              end
-
-            reconcile_ops =
-              active_delete_ops ++
-                [
-                  state_put_op,
-                  {:put, reverse_key, terminal_key},
-                  {:put, terminal_key, terminal_value}
-                ] ++ terminal_expire_ops ++ metadata_ops
-
-            {
-              :lists.reverse(reconcile_ops, ops),
-              [{key, record} | prunes],
-              active,
-              next_read_errors
-            }
-          else
-            projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
-
-            attribute_ops =
-              Ferricstore.Flow.LMDBWriter.ProjectionOps.flow_attribute_query_ops(
-                record,
-                projection_expire_at_ms,
-                key
-              )
-
-            {active_ops, next_read_errors} =
-              case LMDB.active_index_delete_ops_result(lmdb_path, key) do
-                {:ok, active_delete_ops} ->
-                  {active_put_ops, _reverse_value} =
-                    LMDB.active_index_put_ops_with_reverse(
-                      key,
-                      record,
-                      projection_expire_at_ms
-                    )
-
-                  {active_delete_ops ++ active_put_ops, read_errors}
-
-                {:error, _reason} ->
-                  {[], read_errors + 1}
-              end
-
-            reconcile_ops = [state_put_op | active_ops ++ attribute_ops]
-
-            {:lists.reverse(reconcile_ops, ops), prunes, [{key, record} | active],
-             next_read_errors}
-          end
+    {ops, terminal_prunes, active_records, projected_records, projection_read_errors} =
+      Enum.reduce(decoded, {[], [], [], [], 0}, fn decoded_state, state ->
+        reconcile_decoded_state(decoded_state, lmdb_path, state)
       end)
 
-    case LMDB.write_batch(lmdb_path, Enum.reverse(ops)) do
+    composite_result =
+      rebuild_composite_projection_ops(
+        lmdb_path,
+        Enum.reverse(projected_records),
+        query_index_definitions
+      )
+
+    case composite_result do
+      {:ok, composite_ops} ->
+        finish_reconcile_batch(
+          LMDB.write_batch(lmdb_path, :lists.reverse(ops, composite_ops)),
+          entries,
+          lmdb_path,
+          keydir,
+          shard_path,
+          shard_index,
+          instance_ctx,
+          zset_score_index,
+          zset_score_lookup,
+          flow_index,
+          flow_lookup,
+          prune_terminal_keydir?,
+          terminal_prunes,
+          active_records,
+          length(decoded),
+          projection_read_errors,
+          acc
+        )
+
+      {:error, _reason} ->
+        finish_reconcile_batch(
+          {:error, :composite_projection_rebuild_failed},
+          entries,
+          lmdb_path,
+          keydir,
+          shard_path,
+          shard_index,
+          instance_ctx,
+          zset_score_index,
+          zset_score_lookup,
+          flow_index,
+          flow_lookup,
+          prune_terminal_keydir?,
+          terminal_prunes,
+          active_records,
+          length(decoded),
+          projection_read_errors,
+          acc
+        )
+    end
+  end
+
+  defp finish_reconcile_batch(
+         write_result,
+         entries,
+         lmdb_path,
+         keydir,
+         shard_path,
+         shard_index,
+         instance_ctx,
+         zset_score_index,
+         zset_score_lookup,
+         flow_index,
+         flow_lookup,
+         prune_terminal_keydir?,
+         terminal_prunes,
+         active_records,
+         decoded_count,
+         projection_read_errors,
+         acc
+       ) do
+    case write_result do
       :ok ->
         active_records = Enum.reverse(active_records)
 
@@ -739,7 +724,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         %{
           acc
           | seen: acc.seen + length(entries),
-            lmdb: acc.lmdb + length(decoded),
+            lmdb: acc.lmdb + decoded_count,
             terminal: acc.terminal + length(terminal_prunes),
             active: acc.active + length(active_records),
             lmdb_errors:
@@ -761,6 +746,186 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         }
     end
   end
+
+  defp rebuild_composite_projection_ops(_lmdb_path, _records, []), do: {:ok, []}
+
+  defp rebuild_composite_projection_ops(lmdb_path, records, definitions) do
+    state_keys = Enum.map(records, &elem(&1, 0))
+
+    with {:ok, cache} <-
+           CompositeProjection.prefetch_reverse_values(
+             lmdb_path,
+             state_keys,
+             CompositeProjection.new_cache()
+           ) do
+      Enum.reduce_while(records, {:ok, [], cache}, fn
+        {state_key, record, expire_at_ms}, {:ok, reversed_ops, cache} ->
+          case CompositeProjection.reconcile(
+                 lmdb_path,
+                 state_key,
+                 record,
+                 expire_at_ms,
+                 definitions,
+                 cache
+               ) do
+            {:ok, ops, cache} ->
+              {:cont, {:ok, :lists.reverse(ops, reversed_ops), cache}}
+
+            {:error, _reason} = error ->
+              {:halt, error}
+          end
+      end)
+      |> case do
+        {:ok, reversed_ops, _cache} -> {:ok, Enum.reverse(reversed_ops)}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  defp reconcile_decoded_state(
+         {key, _value, expire_at_ms, record, %Locator{} = locator},
+         lmdb_path,
+         state
+       ) do
+    projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
+
+    with {:ok, query_row} <- QueryRowCodec.encode(key, record, locator, projection_expire_at_ms),
+         type when is_binary(type) and type != "" <- Map.get(record, :type),
+         catalog_key <- Flow.Keys.type_catalog_member_key(type, key),
+         {:ok, {:put, source_key, source_value}} <- SourceCatalog.put_op(catalog_key, key) do
+      state_put_ops = [{:put, key, query_row}, {:put_new, source_key, source_value}]
+
+      if LMDB.terminal_state?(Map.get(record, :state)) do
+        reconcile_terminal_state(
+          key,
+          record,
+          projection_expire_at_ms,
+          state_put_ops,
+          lmdb_path,
+          state
+        )
+      else
+        reconcile_active_state(
+          key,
+          record,
+          projection_expire_at_ms,
+          state_put_ops,
+          lmdb_path,
+          state
+        )
+      end
+    else
+      _invalid -> increment_projection_read_errors(state)
+    end
+  rescue
+    ArgumentError -> increment_projection_read_errors(state)
+  end
+
+  defp reconcile_decoded_state(_invalid, _lmdb_path, state),
+    do: increment_projection_read_errors(state)
+
+  defp reconcile_terminal_state(
+         key,
+         record,
+         projection_expire_at_ms,
+         state_put_ops,
+         lmdb_path,
+         {ops, prunes, active, projected, read_errors}
+       ) do
+    index_key =
+      Flow.Keys.state_index_key(
+        record.type,
+        record.state,
+        Map.get(record, :partition_key)
+      )
+
+    count_key = LMDB.terminal_count_key(index_key)
+    updated_at_ms = Map.get(record, :updated_at_ms, 0)
+    terminal_key = LMDB.terminal_index_key(index_key, record.id, updated_at_ms)
+
+    terminal_value =
+      LMDB.encode_terminal_index_value(
+        record.id,
+        updated_at_ms,
+        projection_expire_at_ms,
+        key,
+        count_key
+      )
+
+    terminal_expire_key = LMDB.terminal_expire_key(projection_expire_at_ms, terminal_key)
+    terminal_expire_value = LMDB.encode_terminal_expire_value(terminal_key, key, count_key)
+
+    terminal_expire_ops =
+      if is_binary(terminal_expire_key),
+        do: [{:put, terminal_expire_key, terminal_expire_value}],
+        else: []
+
+    reverse_key = LMDB.terminal_by_state_key_key(key)
+    metadata_ops = TerminalProjection.query_metadata_index_ops(record, projection_expire_at_ms)
+
+    {active_delete_ops, next_read_errors} =
+      case LMDB.active_index_delete_ops_result(lmdb_path, key) do
+        {:ok, active_delete_ops} -> {active_delete_ops, read_errors}
+        {:error, _reason} -> {[], read_errors + 1}
+      end
+
+    reconcile_ops =
+      active_delete_ops ++
+        state_put_ops ++
+        [
+          {:put, reverse_key, terminal_key},
+          {:put, terminal_key, terminal_value}
+        ] ++ terminal_expire_ops ++ metadata_ops
+
+    {
+      :lists.reverse(reconcile_ops, ops),
+      [{key, record} | prunes],
+      active,
+      [{key, record, projection_expire_at_ms} | projected],
+      next_read_errors
+    }
+  end
+
+  defp reconcile_active_state(
+         key,
+         record,
+         projection_expire_at_ms,
+         state_put_ops,
+         lmdb_path,
+         {ops, prunes, active, projected, read_errors}
+       ) do
+    attribute_ops =
+      Ferricstore.Flow.LMDBWriter.ProjectionOps.flow_attribute_query_ops(
+        record,
+        projection_expire_at_ms,
+        key
+      )
+
+    {active_ops, next_read_errors} =
+      case LMDB.active_index_delete_ops_result(lmdb_path, key) do
+        {:ok, active_delete_ops} ->
+          {active_put_ops, _reverse_value} =
+            LMDB.active_index_put_ops_with_reverse(key, record, projection_expire_at_ms)
+
+          {active_delete_ops ++ active_put_ops, read_errors}
+
+        {:error, _reason} ->
+          {[], read_errors + 1}
+      end
+
+    reconcile_ops = state_put_ops ++ active_ops ++ attribute_ops
+
+    {
+      :lists.reverse(reconcile_ops, ops),
+      prunes,
+      [{key, record} | active],
+      [{key, record, projection_expire_at_ms} | projected],
+      next_read_errors
+    }
+  end
+
+  defp increment_projection_read_errors({ops, prunes, active, projected, read_errors}),
+    do: {ops, prunes, active, projected, read_errors + 1}
 
   defp initial_reconcile_stats(lmdb_path, keydir, shard_path) do
     {cleanup_op_count, scan_errors} =
@@ -1451,7 +1616,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
                shard_index,
                instance_ctx
              ) do
-          [{_key, _value, _expire_at_ms, record}] -> {:ok, record}
+          [{_key, _value, _expire_at_ms, record, _locator}] -> {:ok, record}
           _ -> :error
         end
 
@@ -1463,7 +1628,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
         |> ColdState.cold_locations_for_state(state_key, expire_at_ms, fid, off, vsize)
         |> ColdState.read_cold_locations(shard_index, instance_ctx)
         |> case do
-          [{_key, _value, _expire_at_ms, record}] -> {:ok, record}
+          [{_key, _value, _expire_at_ms, record, _locator}] -> {:ok, record}
           _ -> :error
         end
 
@@ -1474,16 +1639,25 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
 
   defp read_lmdb_rebuild_state_record(lmdb_path, state_key) do
     with {:ok, blob} <- LMDB.get(lmdb_path, state_key),
-         {:ok, value} <- LMDB.decode_value(blob, System.system_time(:millisecond)),
-         %{id: id} = record <- Flow.decode_record(value),
+         {:ok, %{record: %{id: id} = record, expire_at_ms: expire_at_ms}} <-
+           QueryRowCodec.decode(blob, state_key, System.system_time(:millisecond)),
          true <- is_binary(id) do
-      {:ok, record}
+      {:ok, restore_query_row_expiry(record, expire_at_ms)}
     else
       _ -> :error
     end
   rescue
     _ -> :error
   end
+
+  defp restore_query_row_expiry(record, expire_at_ms)
+       when is_map(record) and is_integer(expire_at_ms) and expire_at_ms > 0 do
+    if LMDB.terminal_state?(Map.get(record, :state)),
+      do: Map.put(record, :terminal_retention_until_ms, expire_at_ms),
+      else: record
+  end
+
+  defp restore_query_row_expiry(record, _expire_at_ms), do: record
 
   defp parse_flow_history_entry_key("X:" <> rest) do
     case :binary.split(rest, <<0>>) do
@@ -1613,9 +1787,9 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
          {:ok, current} <-
            prune_terminal_keydir_record(row, shard_path, shard_index, key, instance_ctx),
          ^version <- Map.get(current, :version),
-         true <- LMDB.terminal_state?(Map.get(current, :state)) do
+         true <- LMDB.terminal_state?(Map.get(current, :state)),
+         :ok <- ensure_apply_projection_row_durable(instance_ctx, shard_index, row) do
       track_binary_remove(keydir, shard_index, key, instance_ctx)
-      delete_apply_projection_cache_for_row(instance_ctx, shard_index, row)
       :ets.delete(keydir, key)
     end
 
@@ -1624,7 +1798,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     ArgumentError -> :ok
   end
 
-  defp delete_apply_projection_cache_for_row(
+  defp ensure_apply_projection_row_durable(
          %{data_dir: data_dir},
          shard_index,
          {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
@@ -1632,16 +1806,19 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        )
        when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
               is_binary(key) and is_integer(index) and index > 0 do
-    Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(data_dir, shard_index, [
-      {index, key}
-    ])
-
-    :ok
+    case Ferricstore.Raft.WARaftSegmentReader.ensure_apply_projection_entries_durable(
+           data_dir,
+           shard_index,
+           [{index, key}]
+         ) do
+      {:ok, _removed} -> :ok
+      {:error, reason} -> {:error, {:source_not_durable, reason}}
+    end
   rescue
-    _ -> :ok
+    error -> {:error, {:source_not_durable, error}}
   end
 
-  defp delete_apply_projection_cache_for_row(_instance_ctx, _shard_index, _row), do: :ok
+  defp ensure_apply_projection_row_durable(_instance_ctx, _shard_index, _row), do: :ok
 
   defp prune_terminal_keydir_record(
          {key, value, expire_at_ms, _lfu, _fid, _off, _vsize},
@@ -1652,7 +1829,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
        )
        when is_binary(value) do
     case ColdState.decode_state_record(key, value, expire_at_ms, shard_index, instance_ctx) do
-      [{^key, _materialized, _expire_at_ms, record}] -> {:ok, record}
+      [{^key, _materialized, _expire_at_ms, record, _locator}] -> {:ok, record}
       _ -> :error
     end
   end
@@ -1668,7 +1845,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     |> ColdState.cold_locations_for_state(key, expire_at_ms, fid, off, vsize)
     |> ColdState.read_cold_locations(shard_index, instance_ctx)
     |> case do
-      [{^key, _materialized, _expire_at_ms, record}] -> {:ok, record}
+      [{^key, _materialized, _expire_at_ms, record, _locator}] -> {:ok, record}
       _ -> :error
     end
   end

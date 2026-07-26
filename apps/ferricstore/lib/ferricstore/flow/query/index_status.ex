@@ -112,11 +112,23 @@ defmodule Ferricstore.Flow.Query.IndexStatus do
       "fields" => Enum.map(index.fields, &wire_field/1),
       "workloads" => index.workloads,
       "count_prefixes" => index.count_prefixes,
+      "covering_fields" => Enum.map(index.covering_fields, &Field.external_name/1),
+      "format" => wire_format(index.format),
       "coverage" => wire_coverage(index.coverage),
       "build" => wire_build(index.build),
       "validation" => wire_validation(index.validation),
       "retirement" => wire_retirement(index.retirement),
       "statistics" => wire_statistics(Map.get(statistics, {index.id, index.version}))
+    }
+  end
+
+  defp wire_format(format) do
+    %{
+      "query_row" => format.query_row,
+      "key" => format.key,
+      "entry" => format.entry,
+      "reverse" => format.reverse,
+      "counter" => format.counter
     }
   end
 

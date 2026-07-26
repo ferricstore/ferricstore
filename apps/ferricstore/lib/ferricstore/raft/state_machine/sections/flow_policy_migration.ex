@@ -943,10 +943,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowPolicyMigration do
                    flow_put_state_record(state, state_key, next)
                  end) do
             with_lmdb_mirror_shard(state, fn ->
-              queue_pending_lmdb_flow_state_projection(
+              queue_pending_lmdb_flow_state_projection_from_source(
                 state_key,
-                flow_encode(next),
-                flow_state_record_expire_at(next)
+                Map.fetch!(next, :version)
               )
             end)
 

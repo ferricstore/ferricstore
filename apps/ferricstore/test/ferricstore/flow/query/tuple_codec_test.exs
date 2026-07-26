@@ -93,6 +93,70 @@ defmodule Ferricstore.Flow.Query.TupleCodecTest do
     end
   end
 
+  test "comparison stays identical to encoded ordering at scalar boundaries" do
+    values = [
+      Field.missing(),
+      nil,
+      false,
+      true,
+      -0x8000_0000_0000_0000,
+      -1,
+      0,
+      0x7FFF_FFFF_FFFF_FFFF,
+      -100.25,
+      -0.0,
+      0.0,
+      100.25,
+      "",
+      :binary.copy("a", 31),
+      :binary.copy("a", 32),
+      :binary.copy("a", 64),
+      "prefix\0suffix"
+    ]
+
+    for direction <- [:asc, :desc], left <- values, right <- values do
+      encoded =
+        compare_binary(
+          TupleCodec.encode_component(left, direction),
+          TupleCodec.encode_component(right, direction)
+        )
+
+      assert TupleCodec.compare_values(left, right, direction) == encoded
+    end
+  end
+
+  test "direct comparison matches encoded ordering across deterministic scalar samples" do
+    binaries =
+      for length <- 0..80 do
+        offsets = if length == 0, do: [], else: 0..(length - 1)
+
+        for offset <- offsets, into: <<>> do
+          <<rem(length * 31 + offset * 17, 256)>>
+        end
+      end
+
+    values =
+      [Field.missing(), nil, false, true, -0x8000_0000_0000_0000, 0x7FFF_FFFF_FFFF_FFFF] ++
+        Enum.to_list(-25..25) ++ Enum.map(-25..25, &(&1 / 7)) ++ binaries
+
+    for direction <- [:asc, :desc],
+        {left, index} <- Enum.with_index(values),
+        right <- Enum.take_every(values, rem(index, 7) + 1) do
+      encoded =
+        compare_binary(
+          TupleCodec.encode_component(left, direction),
+          TupleCodec.encode_component(right, direction)
+        )
+
+      assert TupleCodec.compare_values(left, right, direction) == encoded
+    end
+  end
+
+  test "direct comparison preserves invalid-value rejection" do
+    assert_raise ArgumentError, fn -> TupleCodec.compare_values(1 <<< 63, 0) end
+    assert_raise ArgumentError, fn -> TupleCodec.compare_values(%{}, %{}) end
+  end
+
   test "both directions place concrete values before null and missing" do
     concrete = [false, true, -2, 0, 3, -1.5, 2.5, "", "a", "z"]
 

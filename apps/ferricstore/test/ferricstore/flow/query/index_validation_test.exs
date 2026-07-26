@@ -3,7 +3,7 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
 
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
 
-  alias Ferricstore.Flow.{Keys, LMDB}
+  alias Ferricstore.Flow.{Keys, LMDB, Locator, StorageScope, SystemMetadata}
 
   alias Ferricstore.Flow.Query.{
     BackfillSource,
@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
     CompositeIndex,
     CompositeProjection,
     IndexDefinition,
+    QueryRowCodec,
     SourceCatalog
   }
 
@@ -84,6 +85,69 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
     assert {:ok, [entry]} = CompositeIndex.entries(definition, record, state_key, 0)
     expected_value = entry.value
     assert {:ok, ^expected_value} = LMDB.get(lmdb_path(ctx), entry.key)
+  end
+
+  test "validates shared composite rows from opaque QueryRow routing scope", context do
+    %{ctx: ctx, keydir: keydir, definition: dedicated_definition} = context
+
+    definition =
+      dedicated_definition
+      |> Map.from_struct()
+      |> Map.put(:scope_bytes, 8)
+      |> IndexDefinition.new!()
+
+    metadata = %{0x8001 => {1, :uint64, :isolation_scope, 42}}
+    logical = record("shared-run", "logical-tenant", 4) |> SystemMetadata.put_record(metadata)
+    assert {:ok, physical_partition} = StorageScope.physical_partition_key(logical)
+    authoritative = Map.put(logical, :partition_key, physical_partition)
+    state_key = Keys.state_key(authoritative.id, physical_partition)
+    build_id = "shared-validation-build"
+    path = lmdb_path(ctx)
+
+    :ets.insert(keydir, {state_key, <<>>, 0, 0, 0, 0, 0})
+    catalog_key = Keys.type_catalog_member_key(authoritative.type, state_key)
+    assert {:ok, catalog_op} = SourceCatalog.put_op(catalog_key, state_key)
+    assert :ok = LMDB.write_batch(path, [catalog_op])
+    snapshot_all!(ctx, build_id)
+
+    assert {:ok, ops, _cache} =
+             CompositeProjection.reconcile(
+               path,
+               state_key,
+               authoritative,
+               0,
+               [definition],
+               CompositeProjection.new_cache()
+             )
+
+    query_row = query_row_blob!(state_key, authoritative, 0)
+    assert :ok = LMDB.write_batch(path, [{:put, state_key, query_row} | ops])
+
+    source_done =
+      finish_source_validation!(
+        ctx,
+        build_id,
+        definition,
+        IndexValidation.empty_checkpoint()
+      )
+
+    assert source_done.phase == :index
+    assert source_done.checked_records == 1
+    assert source_done.checked_entries == 1
+
+    assert {:ok, index_done} =
+             IndexValidation.step(
+               ctx,
+               0,
+               build_id,
+               [definition],
+               source_done,
+               8,
+               2 * 1_024 * 1_024
+             )
+
+    assert index_done.phase == :counter
+    assert index_done.mismatches == 0
   end
 
   test "validates each definition once per index page instead of once per row", context do
@@ -393,7 +457,7 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
                CompositeProjection.new_cache()
              )
 
-    state_blob = record |> Ferricstore.Flow.encode_record() |> LMDB.encode_value(expire_at_ms)
+    state_blob = query_row_blob!(state_key, record, expire_at_ms)
     assert :ok = LMDB.write_batch(path, [{:put, state_key, state_blob} | ops])
     assert {:ok, [entry]} = CompositeIndex.entries(definition, record, state_key, expire_at_ms)
     assert {:ok, [prefix]} = CompositeCounter.prefixes_for_key(definition, entry.key)
@@ -571,7 +635,9 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
     assert :ok = LMDB.write_batch(path, [source_catalog_op])
     snapshot_all!(ctx, build_id)
 
-    state_blob = record |> Ferricstore.Flow.encode_record() |> LMDB.encode_value(0)
+    state_blob =
+      record
+      |> then(&query_row_blob!(Keys.state_key(&1.id, &1.partition_key), &1, 0))
 
     assert {:error, :invalid_composite_record} =
              CompositeProjection.reconcile(
@@ -596,7 +662,7 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
                2 * 1_024 * 1_024
              )
 
-    assert evidence.reason == :state_key_identity_mismatch
+    assert evidence.reason == :invalid_projected_state
     refute inspect(evidence) =~ "tenant-secret"
     refute inspect(evidence) =~ "run-secret"
   end
@@ -1126,7 +1192,7 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
     snapshot_all!(ctx, build_id)
 
     path = lmdb_path(ctx)
-    state_blob = record |> Ferricstore.Flow.encode_record() |> LMDB.encode_value(0)
+    state_blob = query_row_blob!(state_key, record, 0)
 
     assert {:ok, ops, _cache} =
              CompositeProjection.reconcile(
@@ -1191,7 +1257,7 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
   defp put_projected_record!(ctx, definition, record) do
     state_key = Keys.state_key(record.id, record.partition_key)
     path = lmdb_path(ctx)
-    state_blob = record |> Ferricstore.Flow.encode_record() |> LMDB.encode_value(0)
+    state_blob = query_row_blob!(state_key, record, 0)
 
     assert {:ok, ops, _cache} =
              CompositeProjection.reconcile(
@@ -1229,6 +1295,28 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
         {:updated_at_ms, :desc, :ordered}
       ]
     )
+  end
+
+  defp query_row_blob!(state_key, record, expire_at_ms) do
+    source_index = max(record.version, 1)
+
+    locator =
+      Locator.new!(
+        flow_id: record.id,
+        kind: :state,
+        version: record.version,
+        raft_index: source_index,
+        file_id: {:waraft_apply_projection, source_index},
+        offset: 0,
+        value_size: 512,
+        checksum: :crypto.hash(:sha256, Ferricstore.Flow.encode_record(record)),
+        expire_at_ms: expire_at_ms,
+        segment_generation: 0,
+        frame_size: 1_024
+      )
+
+    assert {:ok, encoded} = QueryRowCodec.encode(state_key, record, locator, expire_at_ms)
+    encoded
   end
 
   defp record(id, tenant, version) do

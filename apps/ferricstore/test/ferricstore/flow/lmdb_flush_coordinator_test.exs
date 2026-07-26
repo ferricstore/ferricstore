@@ -84,6 +84,36 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinatorTest do
     assert :waiter_acquired_after_down = Task.await(waiter)
   end
 
+  test "a missing coordinator fails closed without executing the mutation" do
+    refute_received :unserialized_mutation
+
+    assert {:error, :lmdb_flush_coordinator_unavailable} =
+             LMDBFlushCoordinator.__with_acquired_permit_for_test__(
+               :missing,
+               {:shard, :missing, 0},
+               fn -> send(self(), :unserialized_mutation) end,
+               fn _instance_name -> nil end,
+               fn _pid, _scope -> flunk("acquire must not run without a coordinator") end
+             )
+
+    refute_received :unserialized_mutation
+  end
+
+  test "a failed acquisition fails closed without executing the mutation" do
+    coordinator = self()
+
+    assert {:error, :lmdb_flush_coordinator_unavailable} =
+             LMDBFlushCoordinator.__with_acquired_permit_for_test__(
+               :failed_acquire,
+               {:shard, :failed_acquire, 0},
+               fn -> send(self(), :unserialized_mutation) end,
+               fn _instance_name -> coordinator end,
+               fn ^coordinator, _scope -> :unavailable end
+             )
+
+    refute_received :unserialized_mutation
+  end
+
   defp unique_instance_name(suffix) do
     String.to_atom(
       "lmdb_flush_coordinator_#{suffix}_#{System.unique_integer([:positive, :monotonic])}"

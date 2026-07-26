@@ -1099,7 +1099,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
 
           cond do
             lifecycle_projection? and is_binary(value) and is_integer(expire_at_ms) ->
-              queue_pending_lmdb_flow_state_projection(state_key, value, expire_at_ms)
+              queue_pending_lmdb_flow_state_projection_from_source(
+                state_key,
+                Map.fetch!(record, :version)
+              )
+
               maybe_queue_lmdb_terminal_state_prune_after_flush(state, state_key, record)
 
             terminal? ->
@@ -1116,13 +1120,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
               end
 
             lifecycle_projection? ->
-              queue_pending_lmdb_flow_state_projection_from_source(state_key)
+              queue_pending_lmdb_flow_state_projection_from_source(
+                state_key,
+                Map.fetch!(record, :version)
+              )
 
             query_projection? ->
-              queue_pending_lmdb_flow_query_state_projection(
+              queue_pending_lmdb_flow_query_state_projection_from_source(
                 state_key,
-                value,
-                expire_at_ms
+                Map.fetch!(record, :version)
               )
 
             true ->

@@ -1,6 +1,9 @@
+Code.require_file("support/query_storage_fixture.exs", __DIR__)
+
 defmodule Ferricstore.Flow.Query.IndexBenchmark do
   alias FerricStore.Flow.MetadataExtension
-  alias Ferricstore.Flow.{Codec, Keys, LMDB}
+  alias Ferricstore.Flow.Keys
+  alias Ferricstore.Bench.QueryStorageFixture
 
   alias Ferricstore.Flow.Query.{
     CompositeBackfill,
@@ -66,11 +69,12 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
     records = records(record_count)
 
     try do
-      source_bytes = write_source_records(ctx, records)
+      storage = QueryStorageFixture.write!(ctx, records)
+      source_bytes = storage.source_bytes
       before_bytes = directory_bytes(data_dir)
 
       {backfill_us, metrics} =
-        timed(fn -> project_records(ctx, records, definition) end)
+        timed(fn -> project_records(ctx, records, definition, storage.encoded_by_key) end)
 
       after_bytes = directory_bytes(data_dir)
       request = request_for(definition.id, record_count)
@@ -106,6 +110,7 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
         },
         storage: %{
           source_logical_bytes: source_bytes,
+          query_row_logical_bytes: storage.query_row_bytes,
           index_logical_write_bytes: metrics.written_bytes,
           lmdb_file_growth_bytes: max(after_bytes - before_bytes, 0),
           lmdb_bytes_before: before_bytes,
@@ -113,38 +118,12 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
         }
       }
     after
+      QueryStorageFixture.cleanup(ctx)
       File.rm_rf!(data_dir)
     end
   end
 
-  defp write_source_records(ctx, records) do
-    path = lmdb_path(ctx)
-
-    records
-    |> Enum.chunk_every(256)
-    |> Enum.reduce(0, fn page, total_bytes ->
-      ops =
-        Enum.map(page, fn record ->
-          key = Keys.state_key(record.id, record.partition_key)
-          value = LMDB.encode_value(Codec.encode_record(record), 0)
-          {:put, key, value}
-        end)
-
-      :ok = LMDB.write_batch(path, ops)
-
-      total_bytes +
-        Enum.reduce(ops, 0, fn {:put, key, value}, bytes ->
-          bytes + byte_size(key) + byte_size(value)
-        end)
-    end)
-  end
-
-  defp project_records(ctx, records, definition) do
-    encoded_by_key =
-      Map.new(records, fn record ->
-        {Keys.state_key(record.id, record.partition_key), Codec.encode_record(record)}
-      end)
-
+  defp project_records(ctx, records, definition, encoded_by_key) do
     read_entries = fn _ctx, 0, keys ->
       {:ok,
        Enum.map(keys, fn key ->
@@ -316,12 +295,6 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
   defp rate(records, elapsed_us) when elapsed_us > 0, do: records * 1_000_000 / elapsed_us
   defp rate(_records, _elapsed_us), do: 0.0
   defp round_to(value, places), do: Float.round(value * 1.0, places)
-
-  defp lmdb_path(ctx) do
-    ctx.data_dir
-    |> Ferricstore.DataDir.shard_data_path(0)
-    |> LMDB.path()
-  end
 
   defp context(data_dir) do
     {:ok, metadata_snapshot} =

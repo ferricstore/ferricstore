@@ -1,12 +1,13 @@
 Code.require_file("support/open_loop.exs", __DIR__)
 Code.require_file("support/scheduler_metrics.exs", __DIR__)
 Code.require_file("support/query_dataset.exs", __DIR__)
+Code.require_file("support/query_storage_fixture.exs", __DIR__)
 
 defmodule Ferricstore.Flow.Query.Soak do
   @moduledoc false
 
   alias FerricStore.Flow.MetadataExtension
-  alias Ferricstore.Flow.{Codec, Keys, LMDB}
+  alias Ferricstore.Flow.{Keys, LMDB, RecordHydrator}
 
   alias Ferricstore.Flow.Query.{
     CompositeBackfill,
@@ -16,12 +17,14 @@ defmodule Ferricstore.Flow.Query.Soak do
     Field,
     IndexDefinition,
     MandatoryScope,
+    QueryRecordStore,
+    QueryRowStore,
     RegisteredIndex,
     Request
   }
 
   alias Ferricstore.Flow.Query.{Budget, Executor, IndexCatalog, Planner, Response}
-  alias Ferricstore.Bench.{OpenLoop, QueryDataset, SchedulerMetrics}
+  alias Ferricstore.Bench.{OpenLoop, QueryDataset, QueryStorageFixture, SchedulerMetrics}
 
   @cursor_key :binary.copy(<<0x6B>>, 32)
   @backfill_page_records 16
@@ -47,8 +50,9 @@ defmodule Ferricstore.Flow.Query.Soak do
     previous_scheduler_wall_time = SchedulerMetrics.enable_wall_time()
 
     try do
-      source_bytes = write_source_records(ctx, records)
-      encoded_by_key = encoded_records(records)
+      storage = QueryStorageFixture.write!(ctx, records)
+      source_bytes = storage.source_bytes
+      encoded_by_key = storage.encoded_by_key
       read_entries = read_entries_fun(encoded_by_key)
       active_indexes = Enum.map(definitions, &active_index/1)
 
@@ -147,6 +151,7 @@ defmodule Ferricstore.Flow.Query.Soak do
           catalog_digest: Base.encode16(catalog.digest, case: :lower)
         },
         source_logical_bytes: source_bytes,
+        query_row_logical_bytes: storage.query_row_bytes,
         elapsed_ms: Float.round((System.monotonic_time(:microsecond) - started_us) / 1_000, 3),
         backfills: Enum.reverse(backfills),
         capacity: capacity,
@@ -166,6 +171,7 @@ defmodule Ferricstore.Flow.Query.Soak do
         raise "query soak failed; inspect the JSON report"
       end
     after
+      QueryStorageFixture.cleanup(ctx)
       SchedulerMetrics.restore_wall_time(previous_scheduler_wall_time)
       File.rm_rf!(data_dir)
     end
@@ -244,7 +250,16 @@ defmodule Ferricstore.Flow.Query.Soak do
                cursor_key: @cursor_key,
                now_ms: 2_000_000_000_000,
                range_read: &profiled_range_read/5,
-               record_read: &profiled_record_read/4
+               record_read: fn path, state_keys, now_ms, max_value_bytes, timeout_ms ->
+                 profiled_record_read(
+                   ctx,
+                   path,
+                   state_keys,
+                   now_ms,
+                   max_value_bytes,
+                   timeout_ms
+                 )
+               end
              )
            end),
          executor_measurements <- Process.delete(@executor_measurements_key) || %{},
@@ -286,77 +301,32 @@ defmodule Ferricstore.Flow.Query.Soak do
     end)
   end
 
-  defp profiled_record_read(path, state_keys, now_ms, max_value_bytes) do
-    with {:ok, values, _value_bytes} <-
-           measure_executor_stage(:record_fetch, fn ->
-             LMDB.get_many_bounded(path, state_keys, max_value_bytes)
-           end) do
-      measure_executor_stage(:record_decode, fn ->
-        with {:ok, inputs, encoded_records} <-
-               prepare_profiled_record_batch(values, now_ms, [], []) do
-          decode_profiled_record_batch(inputs, encoded_records)
-        end
-      end)
-    else
-      {:error, :batch_value_budget_exceeded} ->
-        {:error, :query_hydration_batch_too_large}
-
-      {:error, _reason} ->
-        {:error, :query_storage_unavailable}
-    end
-  end
-
-  defp prepare_profiled_record_batch([], _now_ms, inputs, encoded_records),
-    do: {:ok, Enum.reverse(inputs), Enum.reverse(encoded_records)}
-
-  defp prepare_profiled_record_batch([:not_found | values], now_ms, inputs, encoded_records),
-    do: prepare_profiled_record_batch(values, now_ms, [:missing | inputs], encoded_records)
-
-  defp prepare_profiled_record_batch(
-         [{:ok, wrapper} | values],
+  defp profiled_record_read(
+         ctx,
+         path,
+         state_keys,
          now_ms,
-         inputs,
-         encoded_records
-       )
-       when is_binary(wrapper) do
-    case LMDB.decode_value(wrapper, now_ms) do
-      {:ok, encoded_record} ->
-        prepare_profiled_record_batch(
-          values,
-          now_ms,
-          [:record | inputs],
-          [encoded_record | encoded_records]
-        )
-
-      :expired ->
-        prepare_profiled_record_batch(values, now_ms, [:missing | inputs], encoded_records)
-
-      :error ->
-        {:error, :query_storage_inconsistent}
-    end
+         max_value_bytes,
+         timeout_ms
+       ) do
+    QueryRecordStore.read_many(ctx, 0, path, state_keys, now_ms, max_value_bytes,
+      timeout_ms: timeout_ms,
+      query_row_read: &profiled_query_row_reference_read/4,
+      hydrate: &profiled_hydrate/4
+    )
   end
 
-  defp prepare_profiled_record_batch(_invalid, _now_ms, _inputs, _encoded_records),
-    do: {:error, :query_storage_inconsistent}
-
-  defp decode_profiled_record_batch(inputs, encoded_records) do
-    records = Codec.decode_records(encoded_records)
-    restore_profiled_record_batch(inputs, records, [])
-  rescue
-    _error -> {:error, :query_storage_inconsistent}
+  defp profiled_query_row_reference_read(path, state_keys, now_ms, max_value_bytes) do
+    measure_executor_stage(:query_row_read, fn ->
+      QueryRowStore.read_references_many(path, state_keys, now_ms, max_value_bytes)
+    end)
   end
 
-  defp restore_profiled_record_batch([], [], acc), do: {:ok, Enum.reverse(acc)}
-
-  defp restore_profiled_record_batch([:missing | inputs], records, acc),
-    do: restore_profiled_record_batch(inputs, records, [nil | acc])
-
-  defp restore_profiled_record_batch([:record | inputs], [record | records], acc)
-       when is_map(record),
-       do: restore_profiled_record_batch(inputs, records, [record | acc])
-
-  defp restore_profiled_record_batch(_inputs, _records, _acc),
-    do: {:error, :query_storage_inconsistent}
+  defp profiled_hydrate(ctx, shard_index, requests, opts) do
+    measure_executor_stage(:record_hydration, fn ->
+      RecordHydrator.read_many(ctx, shard_index, requests, opts)
+    end)
+  end
 
   defp measure_executor_stage(stage, fun) do
     {elapsed_us, result} = timed(fun)
@@ -372,7 +342,10 @@ defmodule Ferricstore.Flow.Query.Soak do
   end
 
   defp exclusive_executor_measurement_us(measurements) do
-    Enum.sum_by([:range_read, :record_fetch, :record_decode], &Map.get(measurements, &1, 0))
+    Enum.sum_by(
+      [:range_read, :query_row_read, :record_hydration],
+      &Map.get(measurements, &1, 0)
+    )
   end
 
   defp verify_result(
@@ -752,12 +725,6 @@ defmodule Ferricstore.Flow.Query.Soak do
   defp rate(_count, 0), do: 0.0
   defp rate(count, duration_us), do: Float.round(count * 1_000_000 / duration_us, 2)
 
-  defp encoded_records(records) do
-    Map.new(records, fn record ->
-      {Keys.state_key(record.id, record.partition_key), Codec.encode_record(record)}
-    end)
-  end
-
   defp read_entries_fun(encoded_by_key) do
     fn _ctx, 0, keys ->
       {:ok,
@@ -768,26 +735,6 @@ defmodule Ferricstore.Flow.Query.Soak do
          end
        end)}
     end
-  end
-
-  defp write_source_records(ctx, records) do
-    records
-    |> Enum.chunk_every(256)
-    |> Enum.reduce(0, fn page, total_bytes ->
-      ops =
-        Enum.map(page, fn record ->
-          key = Keys.state_key(record.id, record.partition_key)
-          value = LMDB.encode_value(Codec.encode_record(record), 0)
-          {:put, key, value}
-        end)
-
-      :ok = LMDB.write_batch(lmdb_path(ctx), ops)
-
-      total_bytes +
-        Enum.reduce(ops, 0, fn {:put, key, value}, bytes ->
-          bytes + byte_size(key) + byte_size(value)
-        end)
-    end)
   end
 
   defp request_for("flow_runs_tenant_updated", record_count) do

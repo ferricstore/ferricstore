@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.CompositeBackfill do
   @moduledoc false
 
-  alias Ferricstore.Flow.{Keys, LMDB}
+  alias Ferricstore.Flow.{Keys, LMDB, RecordIdentity}
   alias Ferricstore.Flow.Query.{CompositeProjection, IndexDefinition, Limits}
   alias Ferricstore.Store.Router
 
@@ -133,11 +133,11 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
        })
        when is_binary(state_key) and state_key != "" and is_map(record) and
               is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_expiry do
-    case {Map.get(record, :id), Map.get(record, :partition_key), Map.get(record, :version)} do
-      {id, partition_key, version}
-      when is_binary(id) and (is_nil(partition_key) or is_binary(partition_key)) and
-             is_integer(version) and version >= 0 and version <= @max_exact_integer ->
-        if Keys.state_key(id, partition_key) == state_key,
+    case {Map.get(record, :id), Map.get(record, :version)} do
+      {id, version}
+      when is_binary(id) and is_integer(version) and version >= 0 and
+             version <= @max_exact_integer ->
+        if record_owns_state_key?(record, state_key),
           do: {:ok, :reconcile, state_key, record, expire_at_ms},
           else: {:error, :invalid_query_backfill_record}
 
@@ -303,16 +303,17 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   end
 
   defp same_record_version?(expected, current, state_key) do
-    case {Map.get(current, :id), Map.get(current, :partition_key), Map.get(current, :version)} do
-      {id, partition_key, version}
-      when is_binary(id) and (is_nil(partition_key) or is_binary(partition_key)) and
-             is_integer(version) ->
-        Keys.state_key(id, partition_key) == state_key and version == Map.get(expected, :version)
+    case Map.get(current, :version) do
+      version when is_integer(version) ->
+        record_owns_state_key?(current, state_key) and version == Map.get(expected, :version)
 
       _invalid ->
         false
     end
   end
+
+  defp record_owns_state_key?(record, state_key),
+    do: RecordIdentity.owns_state_key?(record, state_key)
 
   defp validate_context(%{data_dir: data_dir, shard_count: shard_count}, shard_index)
        when is_binary(data_dir) and data_dir != "" and is_integer(shard_count) and

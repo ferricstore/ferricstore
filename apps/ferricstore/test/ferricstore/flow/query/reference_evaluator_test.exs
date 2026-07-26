@@ -193,6 +193,57 @@ defmodule Ferricstore.Flow.Query.ReferenceEvaluatorTest do
     end
   end
 
+  test "prepared predicates preserve direct evaluation for every predicate shape" do
+    predicates = [
+      {:eq, :state, literal("failed")},
+      {:in, :priority, Enum.map(1..20, &integer/1)},
+      {:in, {:attribute, "tags"}, [literal("finance"), literal("other")]},
+      {:range, :updated_at_ms, integer(100), integer(130)},
+      {:time_window, :updated_at_ms, integer(110), integer(130)},
+      {:is, :priority, :null},
+      {:is, :priority, :missing}
+    ]
+
+    assert {:ok, prepared} = ReferenceEvaluator.prepare(predicates)
+
+    for record <- @records,
+        {predicate, prepared_predicate} <- Enum.zip(predicates, prepared) do
+      assert ReferenceEvaluator.matches_prepared?(record, prepared_predicate) ==
+               ReferenceEvaluator.matches?(record, predicate)
+    end
+  end
+
+  test "prepared IN membership keeps strict runtime types and multivalue semantics" do
+    assert {:ok, [prepared]} =
+             ReferenceEvaluator.prepare([
+               {:in, {:attribute, "values"}, [integer(1), integer(2)]}
+             ])
+
+    assert ReferenceEvaluator.matches_prepared?(%{attributes: %{"values" => [0, 2]}}, prepared)
+
+    refute ReferenceEvaluator.matches_prepared?(
+             %{attributes: %{"values" => [1.0, 2.0]}},
+             prepared
+           )
+  end
+
+  test "rejects malformed predicates during preparation" do
+    assert {:error, :invalid_query_predicate} =
+             ReferenceEvaluator.prepare([{:in, :priority, [:not_a_literal]}])
+
+    assert {:error, :invalid_query_predicate} = ReferenceEvaluator.prepare([:invalid])
+    assert {:error, :invalid_query_predicates} = ReferenceEvaluator.prepare(:invalid)
+    refute ReferenceEvaluator.matches_prepared?(%{}, :invalid)
+
+    for predicate <- [
+          {:eq, :priority, {:literal, :null, nil}},
+          {:in, :priority, [{:literal, :missing, Field.missing()}]},
+          {:range, :priority, integer(1), {:literal, :null, nil}}
+        ] do
+      assert {:error, :invalid_query_predicate} = ReferenceEvaluator.prepare([predicate])
+    end
+  end
+
   test "ordinary comparisons reject null and missing sentinels" do
     for value <- [
           {:literal, :null, nil},

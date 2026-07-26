@@ -1,8 +1,16 @@
 defmodule Ferricstore.Flow.Query.CompositeIndexTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.{Keys, StorageScope, SystemMetadata}
-  alias Ferricstore.Flow.Query.{CompositeIndex, Field, IndexDefinition, Limits}
+  alias Ferricstore.Flow.{Keys, Locator, StorageScope, SystemMetadata}
+
+  alias Ferricstore.Flow.Query.{
+    CompositeIndex,
+    Field,
+    IndexDefinition,
+    Limits,
+    QueryRowCodec
+  }
+
   alias Ferricstore.TermCodec
 
   @max_exact_integer 9_007_199_254_740_991
@@ -90,9 +98,12 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
                5_000
              )
 
-    assert entry.value ==
-             <<1, 5::unsigned-big-32, 3::unsigned-big-64, 5_000::unsigned-big-64, "run-1",
-               state_key::binary>>
+    expected_body =
+      <<5::unsigned-big-32, 3::unsigned-big-64, 5_000::unsigned-big-64, "run-1",
+        state_key::binary>>
+
+    assert <<1, checksum::unsigned-big-32, ^expected_body::binary>> = entry.value
+    assert checksum == :erlang.crc32(expected_body)
 
     old_etf =
       TermCodec.encode({:flow_composite_entry, 1, "run-1", state_key, 3, 5_000})
@@ -107,6 +118,211 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
             state_key::binary>>
         ] do
       assert :error = CompositeIndex.decode_entry_value(invalid)
+    end
+  end
+
+  test "covering definitions persist a bounded authoritative record projection", %{
+    definition: definition
+  } do
+    covering_definition =
+      definition
+      |> Map.from_struct()
+      |> Map.put(:covering_fields, [
+        :partition_key,
+        :run_id,
+        :state,
+        :type,
+        :updated_at_ms,
+        :version
+      ])
+      |> IndexDefinition.new!()
+
+    record = record("run-1", "tenant-a", 100)
+    state_key = Keys.state_key("run-1", "tenant-a")
+
+    assert {:ok, [entry]} =
+             CompositeIndex.entries(covering_definition, record, state_key, 5_000)
+
+    assert <<2, _rest::binary>> = entry.value
+
+    assert {:ok,
+            %{
+              id: "run-1",
+              state_key: ^state_key,
+              record_version: 3,
+              expire_at_ms: 5_000,
+              covering_record: %{
+                id: "run-1",
+                partition_key: "tenant-a",
+                state: "failed",
+                type: "invoice",
+                updated_at_ms: 100,
+                version: 3
+              }
+            }} = CompositeIndex.decode_entry_value(entry.value)
+
+    oversized = Map.put(record, :type, String.duplicate("t", 70_000))
+
+    assert {:error, :invalid_covering_projection} =
+             CompositeIndex.entries(covering_definition, oversized, state_key, 5_000)
+  end
+
+  test "plain and covering entry values reject single-bit corruption", %{definition: definition} do
+    record = record("run-1", "tenant-a", 100)
+    state_key = Keys.state_key("run-1", "tenant-a")
+
+    covering_definition =
+      definition
+      |> Map.from_struct()
+      |> Map.put(:covering_fields, [
+        :partition_key,
+        :run_id,
+        :type,
+        :state,
+        :updated_at_ms,
+        :version
+      ])
+      |> IndexDefinition.new!()
+
+    for entry_definition <- [definition, covering_definition] do
+      assert {:ok, [entry]} =
+               CompositeIndex.entries(entry_definition, record, state_key, 5_000)
+
+      for offset <- 0..(byte_size(entry.value) - 1) do
+        <<prefix::binary-size(offset), byte, suffix::binary>> = entry.value
+        corrupted = <<prefix::binary, Bitwise.bxor(byte, 1), suffix::binary>>
+        assert :error = CompositeIndex.decode_entry_value(corrupted)
+      end
+    end
+  end
+
+  test "covering entries preserve dynamic field identities and values", %{definition: definition} do
+    tier = {:attribute, "tier"}
+    labels = {:attribute, "labels"}
+    score = {:state_meta, "failed", "score"}
+
+    covering_definition =
+      definition
+      |> Map.from_struct()
+      |> Map.put(:fields, [
+        {:partition_key, :asc},
+        {tier, :asc},
+        {:updated_at_ms, :desc}
+      ])
+      |> Map.put(:covering_fields, [
+        :partition_key,
+        :run_id,
+        :updated_at_ms,
+        :version,
+        tier,
+        labels,
+        score
+      ])
+      |> IndexDefinition.new!()
+
+    record =
+      record("run-1", "tenant-a", 100)
+      |> Map.put(:attributes, %{"tier" => "gold", "labels" => ["urgent", "finance"]})
+      |> Map.put(:state_meta, %{"failed" => %{"score" => 1.5}})
+
+    state_key = Keys.state_key("run-1", "tenant-a")
+
+    assert {:ok, [entry]} =
+             CompositeIndex.entries(covering_definition, record, state_key, 5_000)
+
+    assert {:ok, %{covering_record: covering}} = CompositeIndex.decode_entry_value(entry.value)
+    assert covering[tier] == "gold"
+    assert covering[labels] == ["urgent", "finance"]
+    assert covering[score] == 1.5
+  end
+
+  test "dynamic index values use the authoritative scalar and attribute-list domain" do
+    for {field, namespace} <- [
+          {{:attribute, "value"}, :attribute},
+          {{:state_meta, "queued", "value"}, :state_meta}
+        ] do
+      definition =
+        IndexDefinition.new!(%{
+          id: "runs_by_dynamic_#{namespace}",
+          version: 1,
+          fields: [{:partition_key, :asc}, {field, :asc, :hashed}]
+        })
+
+      for {value, index} <-
+            Enum.with_index([
+              nil,
+              false,
+              true,
+              -0x8000_0000_0000_0000,
+              0x7FFF_FFFF_FFFF_FFFF,
+              -0.0,
+              1.5,
+              "",
+              "utf8-\u20ac\0",
+              :binary.copy("x", 256)
+            ]) do
+        id = "#{namespace}-#{index}"
+        projected = put_dynamic(record(id, "tenant-a", 100), field, value)
+
+        assert {:ok, [entry]} =
+                 CompositeIndex.entries(
+                   definition,
+                   projected,
+                   Keys.state_key(id, "tenant-a"),
+                   0
+                 )
+
+        assert {:ok, prefix} = CompositeIndex.encode_prefix(definition, ["tenant-a", value])
+        assert String.starts_with?(entry.key, prefix)
+      end
+
+      invalid_values =
+        if namespace == :attribute,
+          do: [[], ["same", "same"], ["valid", 1], Enum.map(1..17, &"value-#{&1}")],
+          else: [["not-scalar"]]
+
+      for invalid <- invalid_values ++ [:binary.copy("x", 257)] do
+        projected = put_dynamic(record("invalid", "tenant-a", 100), field, invalid)
+
+        assert {:error, :invalid_index_value_type} =
+                 CompositeIndex.entries(
+                   definition,
+                   projected,
+                   Keys.state_key("invalid", "tenant-a"),
+                   0
+                 )
+      end
+
+      assert {:error, :invalid_index_value_type} =
+               CompositeIndex.encode_prefix(definition, ["tenant-a", :binary.copy("x", 257)])
+
+      missing = record("missing-#{namespace}", "tenant-a", 100)
+      null = put_dynamic(record("null-#{namespace}", "tenant-a", 100), field, nil)
+
+      assert {:ok, [missing_entry]} =
+               CompositeIndex.entries(
+                 definition,
+                 missing,
+                 Keys.state_key("missing-#{namespace}", "tenant-a"),
+                 0
+               )
+
+      assert {:ok, [null_entry]} =
+               CompositeIndex.entries(
+                 definition,
+                 null,
+                 Keys.state_key("null-#{namespace}", "tenant-a"),
+                 0
+               )
+
+      refute missing_entry.key == null_entry.key
+
+      assert {:ok, missing_prefix} =
+               CompositeIndex.encode_prefix(definition, ["tenant-a", Field.missing()])
+
+      assert {:ok, null_prefix} = CompositeIndex.encode_prefix(definition, ["tenant-a", nil])
+      assert String.starts_with?(missing_entry.key, missing_prefix)
+      assert String.starts_with?(null_entry.key, null_prefix)
     end
   end
 
@@ -141,6 +357,26 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
 
     assert String.starts_with?(entry.key, hidden_prefix)
     refute entry.key =~ "same-logical-partition"
+
+    locator =
+      Locator.new!(
+        flow_id: scoped_record.id,
+        kind: :state,
+        version: scoped_record.version,
+        raft_index: 7,
+        file_id: {:waraft_segment, 7},
+        offset: 64,
+        value_size: 512,
+        checksum: :binary.copy(<<1>>, 32),
+        segment_generation: 0,
+        frame_size: 1_024
+      )
+
+    assert {:ok, encoded_row} = QueryRowCodec.encode(state_key, scoped_record, locator, 0)
+    assert {:ok, query_row} = QueryRowCodec.decode(encoded_row, state_key)
+
+    assert {:ok, [^entry]} =
+             CompositeIndex.entries_from_query_row(shared_definition, query_row)
 
     assert {:error, :invalid_composite_scope} =
              CompositeIndex.encode_prefix(shared_definition, ["same-logical-partition"])
@@ -213,7 +449,7 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
     assert newer.key < older.key
   end
 
-  test "a multivalue attribute emits one deduplicated entry per member" do
+  test "a canonical multivalue attribute emits one entry per member" do
     {:ok, definition} =
       IndexDefinition.new(%{
         id: "runs_by_tag_updated",
@@ -227,7 +463,7 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
 
     record =
       record("run-1", "tenant-a", 100)
-      |> Map.put(:attributes, %{"tags" => ["urgent", "finance", "urgent"]})
+      |> Map.put(:attributes, %{"tags" => ["urgent", "finance"]})
 
     assert {:ok, entries} =
              CompositeIndex.entries(
@@ -250,29 +486,49 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
            end)
   end
 
-  test "rejects too many multi-value members before materializing an oversized projection" do
+  test "bounds the cartesian fanout of multiple multivalue attributes before materialization" do
     definition =
       IndexDefinition.new!(%{
-        id: "runs_by_tag",
+        id: "runs_by_region_tag",
         version: 1,
         fields: [
           {:partition_key, :asc},
+          {{:attribute, "regions"}, :asc, :hashed},
           {{:attribute, "tags"}, :asc, :hashed},
           {:updated_at_ms, :desc}
         ]
       })
 
-    record =
+    bounded =
       record("run-1", "tenant-a", 100)
       |> Map.put(:attributes, %{
-        "tags" => Enum.map(1..129, &"tag-#{&1}")
+        "regions" => Enum.map(1..8, &"region-#{&1}"),
+        "tags" => Enum.map(1..16, &"tag-#{&1}")
+      })
+
+    assert {:ok, entries} =
+             CompositeIndex.entries(
+               definition,
+               bounded,
+               Keys.state_key("run-1", "tenant-a"),
+               0
+             )
+
+    assert length(entries) == CompositeIndex.max_entries_per_record()
+    assert length(Enum.uniq_by(entries, & &1.key)) == CompositeIndex.max_entries_per_record()
+
+    oversized =
+      record("run-2", "tenant-a", 100)
+      |> Map.put(:attributes, %{
+        "regions" => Enum.map(1..9, &"region-#{&1}"),
+        "tags" => Enum.map(1..15, &"tag-#{&1}")
       })
 
     assert {:error, :too_many_composite_entries} =
              CompositeIndex.entries(
                definition,
-               record,
-               Keys.state_key("run-1", "tenant-a"),
+               oversized,
+               Keys.state_key("run-2", "tenant-a"),
                0
              )
   end
@@ -542,4 +798,10 @@ defmodule Ferricstore.Flow.Query.CompositeIndexTest do
       updated_at_ms: updated_at_ms
     }
   end
+
+  defp put_dynamic(record, {:attribute, name}, value),
+    do: Map.put(record, :attributes, %{name => value})
+
+  defp put_dynamic(record, {:state_meta, state, name}, value),
+    do: Map.put(record, :state_meta, %{state => %{name => value}})
 end

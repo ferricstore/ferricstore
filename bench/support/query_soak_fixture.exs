@@ -1,8 +1,10 @@
+Code.require_file("query_storage_fixture.exs", __DIR__)
+
 defmodule Ferricstore.Bench.QuerySoakFixture do
   @moduledoc false
 
   alias FerricStore.Flow.MetadataExtension
-  alias Ferricstore.Flow.{Codec, Keys, LMDB}
+  alias Ferricstore.Flow.{Keys, LMDB}
 
   alias Ferricstore.Flow.Query.{
     CompositeBackfill,
@@ -10,11 +12,10 @@ defmodule Ferricstore.Bench.QuerySoakFixture do
     RegisteredIndex
   }
 
-  alias Ferricstore.Bench.QueryDataset
+  alias Ferricstore.Bench.{QueryDataset, QueryStorageFixture}
   alias Ferricstore.Flow.Query.IndexCatalog
 
   @projection_page_records 16
-  @source_page_records 256
 
   @spec prepare!(pos_integer(), keyword()) :: map()
   def prepare!(record_count, opts \\ [])
@@ -31,8 +32,9 @@ defmodule Ferricstore.Bench.QuerySoakFixture do
     try do
       {:ok, catalog} = IndexCatalog.load()
       records = QueryDataset.records(record_count)
-      source_bytes = write_source_records(ctx, records)
-      encoded_by_key = encoded_records(records)
+      storage = QueryStorageFixture.write!(ctx, records)
+      source_bytes = storage.source_bytes
+      encoded_by_key = storage.encoded_by_key
       read_entries = read_entries_fun(encoded_by_key)
 
       {projection_us, projection} =
@@ -47,6 +49,7 @@ defmodule Ferricstore.Bench.QuerySoakFixture do
         indexes: Enum.map(catalog.definitions, &active_index/1),
         records: records,
         source_bytes: source_bytes,
+        query_row_bytes: storage.query_row_bytes,
         projection: Map.put(projection, :elapsed_us, projection_us)
       }
     rescue
@@ -58,6 +61,7 @@ defmodule Ferricstore.Bench.QuerySoakFixture do
 
   @spec cleanup(map()) :: :ok
   def cleanup(%{data_dir: data_dir}) when is_binary(data_dir) do
+    QueryStorageFixture.cleanup(%{data_dir: data_dir})
     File.rm_rf!(data_dir)
     :ok
   end
@@ -82,32 +86,6 @@ defmodule Ferricstore.Bench.QuerySoakFixture do
         )
 
       merge_metrics(total, metrics)
-    end)
-  end
-
-  defp write_source_records(ctx, records) do
-    records
-    |> Enum.chunk_every(@source_page_records)
-    |> Enum.reduce(0, fn page, total_bytes ->
-      ops =
-        Enum.map(page, fn record ->
-          key = Keys.state_key(record.id, record.partition_key)
-          value = LMDB.encode_value(Codec.encode_record(record), 0)
-          {:put, key, value}
-        end)
-
-      :ok = LMDB.write_batch(lmdb_path(ctx), ops)
-
-      total_bytes +
-        Enum.reduce(ops, 0, fn {:put, key, value}, bytes ->
-          bytes + byte_size(key) + byte_size(value)
-        end)
-    end)
-  end
-
-  defp encoded_records(records) do
-    Map.new(records, fn record ->
-      {Keys.state_key(record.id, record.partition_key), Codec.encode_record(record)}
     end)
   end
 

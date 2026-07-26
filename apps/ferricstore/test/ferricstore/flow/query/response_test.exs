@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.{Flow.Query.Limits, NativeValueCodec}
-  alias Ferricstore.Flow.Query.{Budget, Response}
+  alias Ferricstore.Flow.Query.{Budget, Response, ResultCodec}
 
   test "builds one versioned page contract and accounts its complete encoded size" do
     usage = usage(1)
@@ -18,6 +18,23 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
     assert response.usage.result_records == 1
 
     assert response.usage.response_bytes == NativeValueCodec.encoded_size(response)
+  end
+
+  test "builds record responses directly from covering index rows" do
+    covered_usage = %{usage(1) | hydrated_records: 0, residual_checks: 0}
+
+    assert {:ok, response} =
+             Response.build(
+               [%{id: "run-1", state: "failed"}],
+               false,
+               nil,
+               quality(),
+               covered_usage,
+               Budget.default()
+             )
+
+    assert response.usage.result_records == 1
+    assert response.usage.hydrated_records == 0
   end
 
   test "response byte accounting is stable after writing any signed response size" do
@@ -59,6 +76,58 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
 
     assert {:error, :query_response_budget_exceeded} =
              Response.build(records, false, nil, quality(), usage(1), budget)
+  end
+
+  test "settles a negotiated compact response against its exact representation" do
+    records =
+      for index <- 1..20 do
+        %{
+          id: "run-#{index}",
+          type: "invoice",
+          state: "failed",
+          version: index,
+          partition_key: "tenant-a",
+          attributes: %{"customer" => "customer-#{index}"}
+        }
+      end
+
+    raw_response = %{
+      version: Response.contract(),
+      records: records,
+      page: %{has_more: false, cursor: nil},
+      quality: quality(),
+      usage: usage(length(records))
+    }
+
+    compact_bytes = raw_response |> ResultCodec.encode() |> byte_size()
+    generic_bytes = NativeValueCodec.encoded_size(raw_response)
+
+    assert compact_bytes < generic_bytes
+    {:ok, budget} = Budget.lower(Budget.default(), response_bytes: compact_bytes)
+
+    assert {:error, :query_response_budget_exceeded} =
+             Response.build(
+               records,
+               false,
+               nil,
+               quality(),
+               usage(length(records)),
+               budget
+             )
+
+    assert {:ok, response} =
+             Response.build(
+               records,
+               false,
+               nil,
+               quality(),
+               usage(length(records)),
+               budget,
+               :flow_query_result_v1
+             )
+
+    assert response.usage.response_bytes == compact_bytes
+    assert ResultCodec.encoded_size(response) == compact_bytes
   end
 
   test "rejects inconsistent pagination and usage metadata" do
@@ -124,6 +193,34 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
 
     assert {:ok, %{result: %{value: 0}}} =
              Response.build_count(0, quality("none"), zero_usage, Budget.default())
+  end
+
+  test "settles a compact scalar count with the compact codec size" do
+    count_usage = %{usage(0) | result_records: 1, scanned_entries: 7, hydrated_records: 7}
+
+    raw_response = %{
+      version: Response.contract(),
+      result: %{kind: "count", value: 7},
+      quality: quality("none"),
+      usage: count_usage
+    }
+
+    compact_bytes = raw_response |> ResultCodec.encode() |> byte_size()
+    generic_bytes = NativeValueCodec.encoded_size(raw_response)
+    assert compact_bytes < generic_bytes
+
+    {:ok, budget} = Budget.lower(Budget.default(), response_bytes: compact_bytes)
+
+    assert {:ok, response} =
+             Response.build_count(
+               7,
+               quality("none"),
+               count_usage,
+               budget,
+               :flow_query_result_v1
+             )
+
+    assert response.usage.response_bytes == compact_bytes
   end
 
   defp usage(result_records) do

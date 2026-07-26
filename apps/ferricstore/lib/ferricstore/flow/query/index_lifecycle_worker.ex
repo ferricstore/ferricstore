@@ -269,31 +269,17 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
   end
 
   defp run_phase(state, build_id, indexes, shard_index, %{phase: :backfill} = checkpoint) do
-    with {:ok, page} <-
-           state.page_fun.(
-             state.instance_ctx,
-             shard_index,
+    definitions = Enum.map(indexes, & &1.definition)
+
+    with {:ok, page, metrics} <-
+           read_and_project_backfill_page(
+             state,
              build_id,
-             checkpoint.cursor,
-             state.backfill_items,
-             state.max_bytes,
-             []
-           ),
-         :ok <-
-           validate_page(
-             page,
-             checkpoint.cursor,
-             state.backfill_items,
-             state.max_bytes
-           ),
-         {:ok, metrics} <-
-           state.project_fun.(
-             state.instance_ctx,
              shard_index,
-             page.records,
-             Enum.map(indexes, & &1.definition)
-           ),
-         :ok <- validate_metrics(metrics, length(page.records), state.max_bytes) do
+             checkpoint.cursor,
+             state.backfill_items,
+             definitions
+           ) do
       progress =
         checkpoint_progress(checkpoint,
           phase: if(page.done?, do: :done, else: :backfill),
@@ -331,6 +317,53 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
 
   defp run_phase(_state, _build_id, _indexes, _shard_index, _checkpoint),
     do: {:error, :invalid_query_index_checkpoint}
+
+  defp read_and_project_backfill_page(
+         state,
+         build_id,
+         shard_index,
+         cursor,
+         max_items,
+         definitions
+       ) do
+    with {:ok, page} <-
+           state.page_fun.(
+             state.instance_ctx,
+             shard_index,
+             build_id,
+             cursor,
+             max_items,
+             state.max_bytes,
+             []
+           ),
+         :ok <- validate_page(page, cursor, max_items, state.max_bytes) do
+      case state.project_fun.(state.instance_ctx, shard_index, page.records, definitions) do
+        {:ok, metrics} ->
+          with :ok <- validate_metrics(metrics, length(page.records), state.max_bytes) do
+            {:ok, page, metrics}
+          end
+
+        {:error, :query_backfill_projection_budget_exceeded}
+        when max_items > 1 and length(page.records) > 1 ->
+          next_items = max(div(min(max_items, length(page.records)) + 1, 2), 1)
+
+          read_and_project_backfill_page(
+            state,
+            build_id,
+            shard_index,
+            cursor,
+            next_items,
+            definitions
+          )
+
+        {:error, _reason} = error ->
+          error
+
+        _invalid ->
+          {:error, :invalid_query_backfill_result}
+      end
+    end
+  end
 
   defp run_validation_step(state, indexes) do
     validating = Enum.filter(indexes, &match?(%RegisteredIndex{state: :validating}, &1))

@@ -9,7 +9,7 @@ defmodule Ferricstore.Store.Router.Part06 do
       alias Ferricstore.ExpiryContext
       alias Ferricstore.HLC
       alias Ferricstore.HyperLogLog, as: HLL
-      alias Ferricstore.Flow.Locator
+      alias Ferricstore.Flow.Query.QueryRecordStore
       alias Ferricstore.Flow.RetryPolicy
       alias Ferricstore.Raft.ReplyAwaiter
       alias Ferricstore.Stats
@@ -585,8 +585,14 @@ defmodule Ferricstore.Store.Router.Part06 do
 
               is_nil(value) ->
                 case remaining do
-                  [cold_value | rest] -> {cold_value, rest}
-                  [] -> {nil, []}
+                  [:unavailable | rest] when availability_mode == :collapse_unavailable ->
+                    {nil, rest}
+
+                  [cold_value | rest] ->
+                    {cold_value, rest}
+
+                  [] ->
+                    {nil, []}
                 end
 
               value == :unavailable ->
@@ -659,7 +665,7 @@ defmodule Ferricstore.Store.Router.Part06 do
           |> Enum.group_by(fn {key, _index} -> flow_lmdb_path(ctx, key) end)
           |> Enum.reduce(%{}, fn {path, indexed_keys}, acc ->
             group_keys = Enum.map(indexed_keys, fn {key, _index} -> key end)
-            values = flow_lmdb_get_many(ctx, path, group_keys, now_ms, mode)
+            values = flow_lmdb_read_group(ctx, path, group_keys, now_ms, mode)
 
             indexed_keys
             |> Enum.zip(values)
@@ -672,14 +678,10 @@ defmodule Ferricstore.Store.Router.Part06 do
       end
 
       defp flow_get_lmdb(ctx, key, mode) do
-        path = flow_lmdb_path(ctx, key)
-
-        value =
-          path
-          |> Ferricstore.Flow.LMDB.get(key)
-          |> flow_decode_lmdb_get_result(path, key, CommandTime.now_ms(), mode)
-
-        value || flow_get_lmdb_cold_park(ctx, key, mode)
+        case flow_batch_get_lmdb(ctx, [key], mode) do
+          [value] -> value
+          _invalid -> nil
+        end
       end
 
       defp flow_lmdb_path(ctx, key) do
@@ -713,142 +715,77 @@ defmodule Ferricstore.Store.Router.Part06 do
 
       defp flow_state_expired_or_deleted?(_ctx, _key, _now_ms), do: false
 
-      defp flow_lmdb_get_many(_ctx, _path, [], _now_ms, _mode), do: []
+      defp flow_lmdb_read_group(_ctx, _path, [], _now_ms, _mode), do: []
 
-      defp flow_lmdb_get_many(ctx, path, keys, now_ms, mode) do
-        case Ferricstore.Flow.LMDB.get_many(path, keys) do
-          {:ok, results} ->
-            keys
-            |> Enum.zip(results)
-            |> Enum.map(fn {key, result} ->
-              flow_decode_lmdb_get_result(result, path, key, now_ms, mode) ||
-                flow_get_lmdb_cold_park(ctx, key, mode)
+      defp flow_lmdb_read_group(ctx, path, keys, now_ms, mode) do
+        shard_index = shard_for(ctx, hd(keys))
+
+        case flow_lmdb_read_group_pages(ctx, shard_index, path, keys, now_ms, []) do
+          {:ok, chunks} ->
+            chunks
+            |> Enum.reverse()
+            |> List.flatten()
+            |> Enum.map(fn
+              value when is_binary(value) ->
+                if flow_terminal_record_expired?(value, now_ms), do: nil, else: value
+
+              nil ->
+                nil
             end)
 
           {:error, reason} ->
             flow_observe_lmdb_read_error(mode, reason)
-
-            Enum.map(keys, fn key ->
-              value =
-                path
-                |> Ferricstore.Flow.LMDB.get(key)
-                |> flow_decode_lmdb_get_result(path, key, now_ms, mode)
-
-              value || flow_get_lmdb_cold_park(ctx, key, mode)
-            end)
+            List.duplicate(:unavailable, length(keys))
         end
       end
 
-      defp flow_get_lmdb_cold_park(ctx, key, mode) do
-        path = flow_lmdb_path(ctx, key)
-        park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key(key)
+      defp flow_lmdb_read_group_pages(_ctx, _shard_index, _path, [], _now_ms, chunks),
+        do: {:ok, chunks}
 
-        with {:ok, park_blob} <- Ferricstore.Flow.LMDB.get(path, park_key),
-             {:ok, %{locator: %Locator{kind: :state} = locator} = park} <-
-               Ferricstore.Flow.LMDB.decode_cold_park(park_blob),
-             {:ok, value} <- flow_read_cold_park_state_value(ctx, key, locator, park),
-             {:ok, record} <- flow_decode_cold_park_state(value),
-             true <- flow_locator_matches_record?(locator, record) do
-          value
-        else
-          {:error, reason} ->
-            flow_lmdb_read_error_result(mode, reason)
-
-          _ ->
-            nil
-        end
-      end
-
-      defp flow_read_state_locator_value(
-             ctx,
-             key,
-             %Locator{file_id: fid, offset: offset, value_size: value_size}
-           )
-           when valid_cold_location(fid, offset, value_size) do
-        idx = shard_for(ctx, key)
-
-        case Ferricstore.Store.ColdRead.pread_keyed(
-               cold_file_path(ctx, idx, fid),
-               offset,
-               key,
-               @cold_batch_read_timeout_ms
+      defp flow_lmdb_read_group_pages(ctx, shard_index, path, keys, now_ms, chunks) do
+        case QueryRecordStore.read_encoded_many(
+               ctx,
+               shard_index,
+               path,
+               keys,
+               now_ms,
+               @flow_lmdb_batch_encoded_bytes,
+               timeout_ms: @cold_batch_read_timeout_ms
              ) do
-          {:ok, value} when is_binary(value) -> {:ok, value}
-          {:error, reason} -> {:error, reason}
-          _ -> :not_found
-        end
-      end
+          {:ok, values, complete?} when is_list(values) and values != [] ->
+            consumed = length(values)
 
-      defp flow_read_state_locator_value(
-             ctx,
-             key,
-             %Locator{file_id: fid, offset: offset, value_size: value_size}
-           )
-           when valid_waraft_segment_location(fid, offset, value_size) do
-        idx = shard_for(ctx, key)
+            cond do
+              consumed > length(keys) ->
+                {:error, :query_storage_inconsistent}
 
-        case Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(ctx, idx, fid, key) do
-          {:ok, value} when is_binary(value) -> {:ok, value}
-          :not_found -> :not_found
-          {:error, reason} -> {:error, reason}
-        end
-      end
+              complete? and consumed == length(keys) ->
+                {:ok, [values | chunks]}
 
-      defp flow_read_state_locator_value(_ctx, _key, _locator), do: :not_found
+              not complete? and consumed < length(keys) ->
+                flow_lmdb_read_group_pages(
+                  ctx,
+                  shard_index,
+                  path,
+                  Enum.drop(keys, consumed),
+                  now_ms,
+                  [values | chunks]
+                )
 
-      defp flow_read_cold_park_state_value(ctx, key, %Locator{} = locator, park)
-           when is_map(park) do
-        case flow_read_state_locator_value(ctx, key, locator) do
-          {:ok, value} ->
-            {:ok, value}
-
-          _ ->
-            case Map.get(park, :state_value) do
-              value when is_binary(value) -> {:ok, value}
-              _ -> :not_found
-            end
-        end
-      end
-
-      defp flow_decode_cold_park_state(value) when is_binary(value) do
-        try do
-          {:ok, Ferricstore.Flow.decode_record(value)}
-        rescue
-          _ -> {:error, :decode_error}
-        end
-      end
-
-      defp flow_locator_matches_record?(%Locator{} = locator, record) do
-        Map.get(record, :id) == locator.flow_id and Map.get(record, :version) == locator.version
-      end
-
-      defp flow_decode_lmdb_get_result({:ok, blob}, path, key, now_ms, mode)
-           when is_binary(blob) do
-        case Ferricstore.Flow.LMDB.decode_value(blob, now_ms) do
-          {:ok, value} ->
-            if flow_terminal_record_expired?(value, now_ms) do
-              Ferricstore.Flow.LMDB.delete_state_artifacts(path, key)
-              nil
-            else
-              value
+              true ->
+                {:error, :query_storage_inconsistent}
             end
 
-          :expired ->
-            Ferricstore.Flow.LMDB.delete_state_artifacts(path, key)
-            nil
+          {:ok, [], true} when keys == [] ->
+            {:ok, chunks}
 
-          :error ->
-            flow_lmdb_read_error_result(mode, :decode_error)
+          {:error, reason} ->
+            {:error, reason}
+
+          _invalid ->
+            {:error, :query_storage_inconsistent}
         end
       end
-
-      defp flow_decode_lmdb_get_result(:not_found, _path, _key, _now_ms, _mode), do: nil
-
-      defp flow_decode_lmdb_get_result({:error, reason}, _path, _key, _now_ms, mode),
-        do: flow_lmdb_read_error_result(mode, reason)
-
-      defp flow_decode_lmdb_get_result(_other, _path, _key, _now_ms, mode),
-        do: flow_lmdb_read_error_result(mode, :unexpected_result)
 
       defp flow_terminal_record_expired?(value, now_ms)
            when is_binary(value) and is_integer(now_ms) do
@@ -866,11 +803,6 @@ defmodule Ferricstore.Store.Router.Part06 do
       end
 
       defp flow_terminal_record_expired?(_value, _now_ms), do: false
-
-      defp flow_lmdb_read_error_result(mode, reason) do
-        flow_observe_lmdb_read_error(mode, reason)
-        nil
-      end
 
       defp flow_observe_lmdb_read_error(mode, reason) do
         :telemetry.execute(

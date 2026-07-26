@@ -22,6 +22,66 @@ defmodule Ferricstore.FlowWriteContractTest do
     assert source =~ "defp flow_empty_named_ref_input?(nil), do: true"
   end
 
+  test "flow create rejects metadata that cannot fit its QueryRow before routing" do
+    id = "query-row-create-#{System.unique_integer([:positive])}"
+    max_metadata_bytes = Ferricstore.Flow.Query.QueryRowCodec.max_metadata_bytes()
+    expected_error = "ERR flow query metadata exceeds #{max_metadata_bytes} bytes"
+    type = :binary.copy("t", max_metadata_bytes)
+    opts = [type: type, state: "queued", partition_key: "query-row-contract", now_ms: 1_000]
+
+    assert {:error, ^expected_error} =
+             Ferricstore.Flow.MutationAttrs.create_attrs(id, opts)
+
+    assert {:error, ^expected_error} = FerricStore.flow_create(id, opts)
+
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "query-row-contract")
+  end
+
+  test "flow transition rejects an unencodable QueryRow atomically" do
+    id = "query-row-transition-#{System.unique_integer([:positive])}"
+    partition = "query-row-contract"
+    max_metadata_bytes = Ferricstore.Flow.Query.QueryRowCodec.max_metadata_bytes()
+    expected_error = "ERR flow query metadata exceeds #{max_metadata_bytes} bytes"
+    oversized_state = :binary.copy("s", max_metadata_bytes)
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: "query-row-contract",
+               state: "queued",
+               partition_key: partition,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:error, ^expected_error} =
+             FerricStore.flow_transition(id, "queued", oversized_state,
+               fencing_token: 0,
+               partition_key: partition,
+               run_at_ms: 1_001,
+               now_ms: 1_001
+             )
+
+    assert {:ok, record} = FerricStore.flow_get(id, partition_key: partition)
+    assert record.state == "queued"
+    assert record.version == 1
+  end
+
+  test "create admission reserves internal and policy projection bytes" do
+    id = "query-row-reservation-#{System.unique_integer([:positive])}"
+    max_metadata_bytes = Ferricstore.Flow.Query.QueryRowCodec.max_metadata_bytes()
+    expected_error = "ERR flow query metadata exceeds #{max_metadata_bytes} bytes"
+
+    assert {:error, ^expected_error} =
+             Ferricstore.Flow.MutationAttrs.create_attrs(id,
+               type: :binary.copy("t", max_metadata_bytes),
+               state: "queued",
+               partition_key: "query-row-contract",
+               attributes: %{"kind" => "invoice"},
+               state_meta: %{"owner" => "worker-1"},
+               now_ms: 1_000
+             )
+  end
+
   test "flow named value refs do not scan whole flow records on the no-value hot path" do
     source = Ferricstore.Test.SourceFiles.state_machine_source()
 
@@ -1455,6 +1515,20 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     refute state_machine_source =~ ":flow_shared_value_ref_acquisition_hook"
     refute state_machine_source =~ ":flow_retention_owned_write_hook"
+  end
+
+  test "cold Flow state reads use QueryRows and authoritative hydration only" do
+    state_machine_source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    assert state_machine_source =~ "QueryRowStore.read_many"
+    assert state_machine_source =~ "QueryRecordStore.read_many"
+    assert state_machine_source =~ "flow_read_lmdb_records_including_expired"
+
+    refute state_machine_source =~ ":sm_pending_lmdb_values"
+    refute state_machine_source =~ "flow_decode_lmdb_blob"
+    refute state_machine_source =~ "flow_lmdb_blob_present?"
+    refute state_machine_source =~ "Map.get(park, :state_value)"
+    refute state_machine_source =~ "Ferricstore.Flow.LMDB.decode_value(blob, apply_now_ms())"
   end
 
   test "retention cleanup ownership planning uses the bounded durable member index" do

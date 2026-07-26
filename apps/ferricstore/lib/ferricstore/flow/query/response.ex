@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Query.Response do
   @moduledoc false
 
   alias Ferricstore.{Flow.Query.Limits, NativeValueCodec}
-  alias Ferricstore.Flow.Query.{Budget, Usage}
+  alias Ferricstore.Flow.Query.{Budget, ResultCodec, Usage}
 
   @contract "ferric.flow.query.result/v1"
   @quality_fields [:coverage, :exactness, :freshness, :pagination]
@@ -18,7 +18,19 @@ defmodule Ferricstore.Flow.Query.Response do
 
   @spec build([map()], boolean(), binary() | nil, map(), map(), Budget.t()) ::
           {:ok, map()} | {:error, atom()}
-  def build(records, has_more, cursor, quality, usage, %Budget{} = budget)
+  def build(records, has_more, cursor, quality, usage, budget),
+    do: build(records, has_more, cursor, quality, usage, budget, :native_value)
+
+  @spec build(
+          [map()],
+          boolean(),
+          binary() | nil,
+          map(),
+          map(),
+          Budget.t(),
+          :native_value | :flow_query_result_v1
+        ) :: {:ok, map()} | {:error, atom()}
+  def build(records, has_more, cursor, quality, usage, %Budget{} = budget, response_codec)
       when is_list(records) and is_boolean(has_more) and is_map(quality) and is_map(usage) do
     with :ok <- validate_page(has_more, cursor),
          :ok <- validate_records(records, usage, budget),
@@ -32,16 +44,26 @@ defmodule Ferricstore.Flow.Query.Response do
         usage: usage
       }
 
-      settle_size(response, budget)
+      settle_size(response, budget, response_codec)
     end
   end
 
-  def build(_records, _has_more, _cursor, _quality, _usage, _budget),
+  def build(_records, _has_more, _cursor, _quality, _usage, _budget, _response_codec),
     do: {:error, :query_engine_failure}
 
   @spec build_count(non_neg_integer(), map(), map(), Budget.t()) ::
           {:ok, map()} | {:error, atom()}
-  def build_count(count, quality, usage, %Budget{} = budget)
+  def build_count(count, quality, usage, budget),
+    do: build_count(count, quality, usage, budget, :native_value)
+
+  @spec build_count(
+          non_neg_integer(),
+          map(),
+          map(),
+          Budget.t(),
+          :native_value | :flow_query_result_v1
+        ) :: {:ok, map()} | {:error, atom()}
+  def build_count(count, quality, usage, %Budget{} = budget, response_codec)
       when is_integer(count) and count >= 0 and count <= @maximum_count and is_map(quality) and
              is_map(usage) do
     with :ok <- validate_usage(usage, budget, :count),
@@ -52,14 +74,15 @@ defmodule Ferricstore.Flow.Query.Response do
         quality: quality,
         usage: usage
       }
-      |> settle_size(budget)
+      |> settle_size(budget, response_codec)
     end
   end
 
-  def build_count(_count, _quality, _usage, _budget), do: {:error, :query_engine_failure}
+  def build_count(_count, _quality, _usage, _budget, _response_codec),
+    do: {:error, :query_engine_failure}
 
-  defp settle_size(response, budget) do
-    with {:ok, size} <- encoded_size(response) do
+  defp settle_size(response, budget, response_codec) do
+    with {:ok, size} <- encoded_size(response, response_codec) do
       if size <= budget.response_bytes,
         do: {:ok, put_in(response.usage.response_bytes, size)},
         else: {:error, :query_response_budget_exceeded}
@@ -96,11 +119,20 @@ defmodule Ferricstore.Flow.Query.Response do
     if valid, do: :ok, else: {:error, :query_engine_failure}
   end
 
-  defp encoded_size(term) do
+  defp encoded_size(term, :native_value) do
     {:ok, NativeValueCodec.encoded_size(term)}
   rescue
     _error -> {:error, :query_engine_failure}
   catch
     _kind, _reason -> {:error, :query_engine_failure}
   end
+
+  defp encoded_size(term, :flow_query_result_v1) do
+    case ResultCodec.encoded_size(term) do
+      size when is_integer(size) and size >= 0 -> {:ok, size}
+      nil -> {:error, :query_engine_failure}
+    end
+  end
+
+  defp encoded_size(_term, _response_codec), do: {:error, :query_engine_failure}
 end

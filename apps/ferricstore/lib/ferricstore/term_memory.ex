@@ -49,11 +49,13 @@ defmodule Ferricstore.TermMemory do
   defp estimate(value) when is_map(value) do
     map_bytes = (8 + 4 * map_size(value)) * @word_size
 
-    value
-    |> Map.to_list()
-    |> Enum.reduce(map_bytes, fn {key, item}, bytes ->
-      bytes + estimate(key) + estimate(item)
-    end)
+    :maps.fold(
+      fn key, item, bytes ->
+        bytes + estimate(key) + estimate(item)
+      end,
+      map_bytes,
+      value
+    )
   end
 
   defp estimate(value),

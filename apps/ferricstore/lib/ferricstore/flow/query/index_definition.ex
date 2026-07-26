@@ -1,11 +1,12 @@
 defmodule Ferricstore.Flow.Query.IndexDefinition do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.Field
+  alias Ferricstore.Flow.Query.{CoveringCodec, Field}
 
   @storage_prefix "flow-composite-index:1:"
   @max_id_bytes 64
   @max_fields 8
+  @max_covering_fields CoveringCodec.max_fields()
   @max_workloads 16
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
   @lmdb_max_key_bytes 511
@@ -24,6 +25,7 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
     source: :runs,
     workloads: [],
     count_prefixes: [],
+    covering_fields: [],
     scope_bytes: 0
   ]
 
@@ -37,6 +39,7 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
           fingerprint: <<_::256>>,
           workloads: [binary()],
           count_prefixes: [pos_integer()],
+          covering_fields: [Field.t()],
           scope_bytes: non_neg_integer()
         }
 
@@ -53,6 +56,9 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
     count_prefixes =
       Map.get(attrs, :count_prefixes) || Map.get(attrs, "count_prefixes") || []
 
+    covering_fields =
+      Map.get(attrs, :covering_fields) || Map.get(attrs, "covering_fields") || []
+
     scope_bytes = Map.get(attrs, :scope_bytes) || Map.get(attrs, "scope_bytes") || 0
 
     with :ok <- validate_id(id),
@@ -62,9 +68,9 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
          {:ok, workloads} <- validate_workloads(workloads),
          {:ok, fields} <- validate_fields(fields),
          {:ok, count_prefixes} <- validate_count_prefixes(count_prefixes, fields),
+         {:ok, covering_fields} <- validate_covering_fields(covering_fields, fields),
          :ok <- validate_tenant_lead(fields),
          :ok <- validate_unique_fields(fields),
-         :ok <- validate_multivalue_fields(fields),
          :ok <- validate_field_encodings(fields),
          :ok <- validate_key_budget(fields, scope_bytes) do
       definition = %__MODULE__{
@@ -73,9 +79,19 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
         source: source,
         workloads: workloads,
         count_prefixes: count_prefixes,
+        covering_fields: covering_fields,
         fields: fields,
         scope_bytes: scope_bytes,
-        fingerprint: fingerprint(id, version, source, fields, count_prefixes, scope_bytes)
+        fingerprint:
+          fingerprint(
+            id,
+            version,
+            source,
+            fields,
+            count_prefixes,
+            covering_fields,
+            scope_bytes
+          )
       }
 
       {:ok, definition}
@@ -186,6 +202,25 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
   defp validate_count_prefixes(_prefixes, _fields),
     do: {:error, :invalid_index_count_prefixes}
 
+  defp validate_covering_fields([], _fields), do: {:ok, []}
+
+  defp validate_covering_fields(covering_fields, fields)
+       when is_list(covering_fields) and length(covering_fields) <= @max_covering_fields do
+    required = [:run_id, :version | Enum.map(fields, &elem(&1, 0))]
+
+    valid =
+      length(covering_fields) == length(Enum.uniq(covering_fields)) and
+        Enum.all?(covering_fields, &CoveringCodec.supported_field?/1) and
+        Enum.all?(required, &(&1 in covering_fields))
+
+    if valid,
+      do: {:ok, Enum.sort_by(covering_fields, &Field.external_name/1)},
+      else: {:error, :invalid_index_covering_fields}
+  end
+
+  defp validate_covering_fields(_covering_fields, _fields),
+    do: {:error, :invalid_index_covering_fields}
+
   defp valid_workload?(value)
        when is_binary(value) and value != "" and byte_size(value) <= 64,
        do: valid_workload_bytes?(value)
@@ -273,13 +308,6 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
       else: {:error, :duplicate_index_field}
   end
 
-  defp validate_multivalue_fields(fields) do
-    count =
-      Enum.count(fields, fn {field, _direction, _encoding} -> match?({:attribute, _}, field) end)
-
-    if count <= 1, do: :ok, else: {:error, :too_many_multivalue_fields}
-  end
-
   defp validate_key_budget(fields, scope_bytes) do
     if storage_prefix_bytes() + scope_storage_bytes(scope_bytes) + fields_max_bytes(fields) +
          @entry_identity_bytes <=
@@ -300,7 +328,15 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
   defp scope_storage_bytes(0), do: 0
   defp scope_storage_bytes(scope_bytes), do: @scope_header_bytes + scope_bytes
 
-  defp fingerprint(id, version, source, fields, count_prefixes, scope_bytes) do
+  defp fingerprint(
+         id,
+         version,
+         source,
+         fields,
+         count_prefixes,
+         covering_fields,
+         scope_bytes
+       ) do
     encoded_fields =
       Enum.map(fields, fn {field, direction, encoding} ->
         name = Field.external_name(field)
@@ -310,6 +346,21 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
       end)
 
     source_name = Atom.to_string(source)
+
+    covering_payload =
+      case covering_fields do
+        [] ->
+          []
+
+        fields ->
+          encoded =
+            Enum.map(fields, fn field ->
+              name = Field.external_name(field)
+              <<byte_size(name)::unsigned-big-16, name::binary>>
+            end)
+
+          ["ferric.flow.composite-covering/v2", <<length(fields)::unsigned-big-8>>, encoded]
+      end
 
     :crypto.hash(
       :sha256,
@@ -321,7 +372,8 @@ defmodule Ferricstore.Flow.Query.IndexDefinition do
         <<length(count_prefixes)::unsigned-big-8>>,
         Enum.map(count_prefixes, &<<&1::unsigned-big-8>>),
         <<length(fields)::unsigned-big-8>>,
-        encoded_fields
+        encoded_fields,
+        covering_payload
       ])
     )
   end

@@ -1,7 +1,8 @@
 defmodule Ferricstore.Store.CompactionJournalTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Flow.{LMDB, Locator}
+  alias Ferricstore.Flow.{Keys, LMDB, Locator}
+  alias Ferricstore.Flow.Query.QueryRowCodec
   alias Ferricstore.Store.{CompactionJournal, CompactionPlan, CompactionTombstoneCatalog}
   alias Ferricstore.Store.Shard.Lifecycle
   alias Ferricstore.TermCodec
@@ -91,7 +92,9 @@ defmodule Ferricstore.Store.CompactionJournalTest do
     shard_path: shard_path,
     lmdb_path: lmdb_path
   } do
-    {plan_path, park_key, old_locator, new_locator} = cold_plan!(shard_path, lmdb_path)
+    {plan_path, state_key, park_key, old_locator, new_locator} =
+      cold_plan!(shard_path, lmdb_path)
+
     source = Path.join(shard_path, "00000.log")
     File.write!(source, "old-segment")
     assert {:ok, transaction} = CompactionJournal.begin(shard_path, 0, plan_path)
@@ -99,13 +102,14 @@ defmodule Ferricstore.Store.CompactionJournalTest do
     File.rename!(source, transaction.backup)
     File.write!(source, "new-segment")
     assert :ok = CompactionJournal.sync_swap(transaction)
-    assert :ok = CompactionPlan.relocate_cold(plan_path, lmdb_path, :forward)
+    assert :ok = CompactionPlan.relocate_flow_locators(plan_path, lmdb_path, :forward)
     assert {:ok, %{locator: ^new_locator}} = cold_park(lmdb_path, park_key)
 
     expected_size = byte_size("old-segment")
     assert {0, ^expected_size} = Lifecycle.discover_active_file(shard_path)
     assert File.read!(source) == "old-segment"
     assert {:ok, %{locator: ^old_locator}} = cold_park(lmdb_path, park_key)
+    assert {:ok, ^old_locator} = query_locator(lmdb_path, state_key)
     refute File.exists?(transaction.plan)
   end
 
@@ -113,7 +117,9 @@ defmodule Ferricstore.Store.CompactionJournalTest do
     shard_path: shard_path,
     lmdb_path: lmdb_path
   } do
-    {plan_path, park_key, _old_locator, new_locator} = cold_plan!(shard_path, lmdb_path)
+    {plan_path, state_key, park_key, _old_locator, new_locator} =
+      cold_plan!(shard_path, lmdb_path)
+
     source = Path.join(shard_path, "00000.log")
     File.write!(source, "old-segment")
     assert {:ok, transaction} = CompactionJournal.begin(shard_path, 0, plan_path)
@@ -127,6 +133,50 @@ defmodule Ferricstore.Store.CompactionJournalTest do
     assert {0, ^expected_size} = Lifecycle.discover_active_file(shard_path)
     assert File.read!(source) == "new-segment"
     assert {:ok, %{locator: ^new_locator}} = cold_park(lmdb_path, park_key)
+    assert {:ok, ^new_locator} = query_locator(lmdb_path, state_key)
+    refute File.exists?(transaction.plan)
+  end
+
+  test "startup reverses a partially applied hot Flow locator relocation", %{
+    shard_path: shard_path,
+    lmdb_path: lmdb_path
+  } do
+    {plan_path, state_key, old_locator, new_locator} = hot_flow_plan!(shard_path, lmdb_path)
+    source = Path.join(shard_path, "00000.log")
+    File.write!(source, "old-segment")
+    assert {:ok, transaction} = CompactionJournal.begin(shard_path, 0, plan_path)
+
+    File.rename!(source, transaction.backup)
+    File.write!(source, "new-segment")
+    assert :ok = CompactionJournal.sync_swap(transaction)
+    assert :ok = CompactionPlan.relocate_flow_locators(plan_path, lmdb_path, :forward)
+    assert {:ok, ^new_locator} = query_locator(lmdb_path, state_key)
+
+    expected_size = byte_size("old-segment")
+    assert {0, ^expected_size} = Lifecycle.discover_active_file(shard_path)
+    assert File.read!(source) == "old-segment"
+    assert {:ok, ^old_locator} = query_locator(lmdb_path, state_key)
+    refute File.exists?(transaction.plan)
+  end
+
+  test "startup finishes a hot Flow locator relocation after the commit marker is durable", %{
+    shard_path: shard_path,
+    lmdb_path: lmdb_path
+  } do
+    {plan_path, state_key, _old_locator, new_locator} = hot_flow_plan!(shard_path, lmdb_path)
+    source = Path.join(shard_path, "00000.log")
+    File.write!(source, "old-segment")
+    assert {:ok, transaction} = CompactionJournal.begin(shard_path, 0, plan_path)
+
+    File.rename!(source, transaction.backup)
+    File.write!(source, "new-segment")
+    assert :ok = CompactionJournal.sync_swap(transaction)
+    assert :ok = LMDB.write_batch(lmdb_path, [CompactionJournal.marker_op(transaction)])
+
+    expected_size = byte_size("new-segment")
+    assert {0, ^expected_size} = Lifecycle.discover_active_file(shard_path)
+    assert File.read!(source) == "new-segment"
+    assert {:ok, ^new_locator} = query_locator(lmdb_path, state_key)
     refute File.exists?(transaction.plan)
   end
 
@@ -180,7 +230,7 @@ defmodule Ferricstore.Store.CompactionJournalTest do
   test "recovery rejects compressed or trailing journal terms", %{shard_path: shard_path} do
     name = "compaction_swap_0.txn"
     path = Path.join(shard_path, name)
-    term = {:ferricstore_compaction_swap, 1, 0, String.duplicate("tx", 2_048)}
+    term = {:ferricstore_compaction_swap, 2, 0, String.duplicate("tx", 2_048)}
     compressed = :erlang.term_to_binary(term, compressed: 9)
     assert <<131, 80, _::binary>> = compressed
 
@@ -188,6 +238,22 @@ defmodule Ferricstore.Store.CompactionJournalTest do
       File.write!(path, payload)
       assert {:error, {^name, :invalid_journal}} = CompactionJournal.recover_all(shard_path)
     end
+  end
+
+  test "recovery rejects the replaced beta journal format", %{shard_path: shard_path} do
+    name = "compaction_swap_0.txn"
+    path = Path.join(shard_path, name)
+    tx_id = Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    source = Path.join(shard_path, "00000.log")
+    File.write!(source, "source")
+    plan_path = empty_plan!(shard_path, 0)
+
+    File.write!(path, TermCodec.encode({:ferricstore_compaction_swap, 1, 0, tx_id}))
+
+    assert {:error, {^name, :invalid_journal}} = CompactionJournal.recover_all(shard_path)
+    assert File.read!(source) == "source"
+    assert File.exists?(path)
+    assert File.exists?(plan_path)
   end
 
   test "recovery rejects a journal whose payload targets another file", %{
@@ -199,7 +265,7 @@ defmodule Ferricstore.Store.CompactionJournalTest do
 
     File.write!(
       path,
-      TermCodec.encode({:ferricstore_compaction_swap, 1, 1, tx_id})
+      TermCodec.encode({:ferricstore_compaction_swap, 2, 1, tx_id})
     )
 
     File.write!(Path.join(shard_path, "00001.log"), "unrelated")
@@ -225,7 +291,7 @@ defmodule Ferricstore.Store.CompactionJournalTest do
 
     File.write!(
       path,
-      TermCodec.encode({:ferricstore_compaction_swap, 1, 0, "not-a-transaction-id"})
+      TermCodec.encode({:ferricstore_compaction_swap, 2, 0, "not-a-transaction-id"})
     )
 
     assert {:error, {^name, :invalid_journal}} = CompactionJournal.recover_all(shard_path)
@@ -241,7 +307,7 @@ defmodule Ferricstore.Store.CompactionJournalTest do
   end
 
   defp cold_plan!(shard_path, lmdb_path) do
-    state_key = "flow/state/flow-1"
+    state_key = Keys.state_key("flow-1", "tenant-a")
     park_key = LMDB.cold_park_key_for_state_key(state_key)
 
     old_locator =
@@ -252,34 +318,103 @@ defmodule Ferricstore.Store.CompactionJournalTest do
         raft_index: 10,
         file_id: 0,
         offset: 10,
-        value_size: 50
+        value_size: 50,
+        checksum: :binary.copy(<<1>>, 32)
       )
 
-    new_locator = Locator.relocate!(old_locator, offset: 110, value_size: 60)
+    new_locator = Locator.relocate!(old_locator, offset: 110, value_size: 50)
 
     park = %{
       locator: old_locator,
       state_key: state_key,
+      partition_key: "tenant-a",
       type: "job",
       state: "waiting",
       due_at_ms: 900_000
     }
 
+    record = %{
+      id: "flow-1",
+      version: 1,
+      type: "job",
+      state: "waiting",
+      partition_key: "tenant-a",
+      created_at_ms: 100,
+      updated_at_ms: 200,
+      next_run_at_ms: 900_000,
+      priority: 0,
+      attempts: 0
+    }
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, old_locator, 0)
+
     assert :ok =
              LMDB.write_batch(lmdb_path, [
                {:put, park_key, LMDB.encode_cold_park(old_locator, Map.delete(park, :locator))},
-               {:put, LMDB.cold_by_segment_key(old_locator), park_key}
+               {:put, LMDB.cold_by_segment_key(old_locator), park_key},
+               {:put, state_key, query_row}
              ])
 
     assert {:ok, writer} = CompactionPlan.create(shard_path, 0)
-    assert :ok = CompactionPlan.append(writer, [{:cold, state_key, 10, 110, 60, park_key, park}])
+    assert :ok = CompactionPlan.append(writer, [{:cold, state_key, 10, 110, 50, park_key, park}])
     assert {:ok, plan_path} = CompactionPlan.finish(writer)
-    {plan_path, park_key, old_locator, new_locator}
+    {plan_path, state_key, park_key, old_locator, new_locator}
+  end
+
+  defp hot_flow_plan!(shard_path, lmdb_path) do
+    state_key = Keys.state_key("hot-flow-1", "tenant-a")
+
+    old_locator =
+      Locator.new!(
+        flow_id: "hot-flow-1",
+        kind: :state,
+        version: 1,
+        raft_index: 10,
+        file_id: 0,
+        offset: 10,
+        value_size: 50,
+        checksum: :binary.copy(<<1>>, 32)
+      )
+
+    new_locator = Locator.relocate!(old_locator, offset: 110, value_size: 50)
+
+    record = %{
+      id: "hot-flow-1",
+      version: 1,
+      type: "job",
+      state: "waiting",
+      partition_key: "tenant-a",
+      created_at_ms: 100,
+      updated_at_ms: 200,
+      next_run_at_ms: 900_000,
+      priority: 0,
+      attempts: 0
+    }
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, old_locator, 0)
+    assert :ok = LMDB.write_batch(lmdb_path, [{:put, state_key, query_row}])
+
+    assert {:ok, writer} = CompactionPlan.create(shard_path, 0)
+
+    assert :ok =
+             CompactionPlan.append(writer, [
+               {:flow, state_key, 0, 10, 50, 110, 50}
+             ])
+
+    assert {:ok, plan_path} = CompactionPlan.finish(writer)
+    {plan_path, state_key, old_locator, new_locator}
   end
 
   defp cold_park(lmdb_path, park_key) do
     with {:ok, blob} <- LMDB.get(lmdb_path, park_key) do
       LMDB.decode_cold_park(blob)
+    end
+  end
+
+  defp query_locator(lmdb_path, state_key) do
+    with {:ok, query_row} <- LMDB.get(lmdb_path, state_key),
+         {:ok, %{locator: locator}} <- QueryRowCodec.decode(query_row, state_key) do
+      {:ok, locator}
     end
   end
 end

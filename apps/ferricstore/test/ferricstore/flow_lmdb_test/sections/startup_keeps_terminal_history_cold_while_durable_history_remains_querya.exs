@@ -189,6 +189,16 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
         assert {:ok, %{id: ^id, state: "completed"}} =
                  Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
 
+        assert {:ok, %{state_keys: catalog_state_keys}} =
+                 Ferricstore.Flow.Query.SourceCatalog.page(
+                   lmdb_path,
+                   "",
+                   16,
+                   1_024 * 1_024
+                 )
+
+        assert state_key in catalog_state_keys
+
         assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
         assert {:ok, 1} = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, completed_index_key)
         assert :not_found = Ferricstore.Flow.LMDB.terminal_count(lmdb_path, failed_index_key)
@@ -222,7 +232,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
         assert completed.version == 3
       end
 
-      test "mirror flow TTL removes expired LMDB state and terminal index on read" do
+      test "mirror flow TTL hides expired state without writing during reads" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
         Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -301,9 +311,17 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.StartupKeepsTerminalHistoryColdWhil
                    end
                  )
 
-        assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
-        assert :not_found = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
-        assert {:ok, 0} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
+        assert {:ok, expired_query_row} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+        assert :expired =
+                 Ferricstore.Flow.Query.QueryRowCodec.decode(
+                   expired_query_row,
+                   state_key,
+                   completed.terminal_retention_until_ms
+                 )
+
+        assert {:ok, _terminal_key} = Ferricstore.Flow.LMDB.get(lmdb_path, reverse_key)
+        assert {:ok, 1} = Ferricstore.Flow.LMDB.prefix_count(lmdb_path, terminal_prefix)
       end
 
       test "mirror flow TTL sweep removes expired terminal index without flow get" do

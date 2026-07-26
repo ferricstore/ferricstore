@@ -10,9 +10,10 @@ the quorum path and written to disk. Hot keydir/native indexes serve current
 state. LMDB/history projections are query surfaces and may lag briefly.
 
 ```text
-Raft segment/apply projection = durable Flow write path
+Raft segment/apply projection = authoritative complete Flow record
 Hot keydir/native Flow indexes = authoritative serving state
-LMDB/history = lagged query projection
+LMDB QueryRow/composite indexes = lagged bounded metadata projection + log locator
+History projection = lagged query projection
 Payload/value bytes = Flow values or blob side-channel files
 ```
 
@@ -23,6 +24,18 @@ Payload/value bytes = Flow values or blob side-channel files
 - On restart, hot indexes and projections rebuild or resume from
   FerricStore-managed Raft segment/apply-projection storage.
 - History/projection queries can be made consistent by waiting for projection catch-up when the command supports it.
+
+LMDB stores one compact QueryRow for each current Flow state. It contains
+query-visible metadata and a checked physical log locator, not the full record
+or payload. Composite indexes store only identity/version/expiry plus declared
+covering fields and never copy the locator. Covered and metadata-only queries
+therefore avoid log reads; full-record and payload projections use bounded,
+grouped log reads and validate size, checksum, identity, and logical version.
+
+Compaction relocates the central QueryRow locator with a logical-version and
+segment-generation compare-and-swap. It does not rewrite every composite
+index. A read racing that relocation retries once within its original query
+deadline and otherwise fails closed.
 
 ## Failure Model
 

@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
   use ExUnit.Case, async: true
 
   alias FerricStore.Flow.MetadataExtension
-  alias Ferricstore.Flow.{Codec, Keys, LMDB}
+  alias Ferricstore.Flow.{Codec, Keys, LMDB, Locator}
   alias Ferricstore.Flow.RecordProjection, as: FlowRecordProjection
   alias Ferricstore.Flow.StorageScope
   alias Ferricstore.TermCodec
@@ -17,7 +17,9 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     RecordProjection,
     ReferenceEvaluator,
     RegisteredIndex,
-    Request
+    Request,
+    QueryRow,
+    QueryRowCodec
   }
 
   alias Ferricstore.Flow.Query.{
@@ -25,6 +27,7 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     Cursor,
     Executor,
     MemoryBudget,
+    PageMemory,
     Plan,
     Planner,
     Response
@@ -133,6 +136,297 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     assert result.usage.residual_checks == 3
   end
 
+  test "evaluates sparse projections and residual predicates from query rows without log hydration" do
+    definition = state_definition()
+
+    request =
+      request([eq(:state, "failed"), eq(:type, "invoice")], 2)
+      |> Map.put(:projection, [
+        :run_id,
+        :state,
+        {:attribute, "customer"},
+        {:state_meta, "failed", "reason"}
+      ])
+
+    records = [
+      record("run-1", 140)
+      |> Map.put(:attributes, %{"customer" => "one"})
+      |> Map.put(:state_meta, %{"failed" => %{"reason" => "declined"}}),
+      record("run-2", 130)
+      |> Map.put(:attributes, %{"customer" => "two"})
+      |> Map.put(:state_meta, %{"failed" => %{"reason" => nil}}),
+      record("run-3", 120, "failed", "other")
+    ]
+
+    {range_read, _record_read} = storage(definition, records)
+    rows = Map.new(records, &{state_key(&1), query_row(&1)})
+
+    query_row_read = fn _path, state_keys, _now_ms, _max_bytes ->
+      selected = Enum.map(state_keys, &Map.get(rows, &1))
+      {:ok, selected, MemoryBudget.term_bytes(selected), true}
+    end
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               query_row_read: query_row_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a metadata-row-covered query must not read the authoritative log")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == [
+             %{
+               id: "run-1",
+               state: "failed",
+               attributes: %{"customer" => "one"},
+               state_meta: %{"failed" => %{"reason" => "declined"}}
+             },
+             %{
+               id: "run-2",
+               state: "failed",
+               attributes: %{"customer" => "two"},
+               state_meta: %{"failed" => %{"reason" => nil}}
+             }
+           ]
+
+    assert result.usage.hydrated_records == 0
+    assert result.usage.residual_checks == 3
+  end
+
+  test "rejects a query-row plan with a non-durable locator before log IO" do
+    definition = state_definition()
+
+    request =
+      request([eq(:state, "failed"), eq(:type, "invoice")], 1)
+      |> Map.put(:projection, [:run_id, :state])
+
+    record = record("run-invalid-locator", 140)
+    {range_read, _record_read} = storage(definition, [record])
+    row = query_row(record)
+    malformed = %{row | locator: %{row.locator | file_id: {:flow_state, 0}}}
+
+    query_row_read = fn _path, [_state_key], _now_ms, _max_bytes ->
+      {:ok, [malformed], MemoryBudget.term_bytes([malformed]), true}
+    end
+
+    assert {:error, :query_storage_inconsistent} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               query_row_read: query_row_read,
+               record_read: fn _path, _state_keys, _now_ms, _max_bytes ->
+                 flunk("a non-durable locator reached authoritative storage")
+               end,
+               now_ms: 1_000
+             )
+  end
+
+  test "keeps RETURN RECORDS on the authoritative hydration path" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 1)
+    record = record("run-1", 140)
+    {range_read, record_read} = storage(definition, [record])
+    parent = self()
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               query_row_read: fn _path, _state_keys, _now_ms, _max_bytes ->
+                 flunk("RETURN RECORDS must not use metadata rows as authoritative records")
+               end,
+               record_read: fn path, keys, now_ms, max_bytes ->
+                 send(parent, :authoritative_hydration)
+                 record_read.(path, keys, now_ms, max_bytes)
+               end,
+               now_ms: 1_000
+             )
+
+    assert_receive :authoritative_hydration
+    assert Enum.map(result.records, & &1.id) == [record.id]
+    assert result.usage.hydrated_records == 1
+  end
+
+  test "serves a covered sparse projection without primary-record hydration" do
+    definition = covering_state_definition()
+
+    request =
+      request([eq(:state, "failed")], 2)
+      |> Map.put(:projection, [:run_id, :state, :updated_at_ms])
+
+    records = [record("run-1", 140), record("run-2", 130)]
+    {range_read, _record_read} = storage(definition, records)
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a covered projection must not hydrate the primary record")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == [
+             %{id: "run-1", state: "failed", updated_at_ms: 140},
+             %{id: "run-2", state: "failed", updated_at_ms: 130}
+           ]
+
+    assert result.usage.hydrated_records == 0
+  end
+
+  test "serves covered dynamic attributes and state metadata without hydration" do
+    definition =
+      IndexDefinition.new!(%{
+        id: "flow_runs_tenant_tier_updated_covering",
+        version: 1,
+        fields: [
+          {:partition_key, :asc},
+          {{:attribute, "tier"}, :asc},
+          {:updated_at_ms, :desc}
+        ],
+        covering_fields: [
+          :partition_key,
+          :run_id,
+          :updated_at_ms,
+          :version,
+          {:attribute, "tier"},
+          {:attribute, "labels"},
+          {:state_meta, "failed", "score"}
+        ]
+      })
+
+    request =
+      request([eq({:attribute, "tier"}, "gold")], 2)
+      |> Map.put(:projection, [
+        :run_id,
+        {:attribute, "tier"},
+        {:attribute, "labels"},
+        {:state_meta, "failed", "score"}
+      ])
+
+    records = [
+      record("run-1", 140)
+      |> Map.put(:attributes, %{"tier" => "gold", "labels" => ["urgent", "finance"]})
+      |> Map.put(:state_meta, %{"failed" => %{"score" => 1.5}}),
+      record("run-2", 130)
+      |> Map.put(:attributes, %{"tier" => "gold", "labels" => ["standard"]})
+      |> Map.put(:state_meta, %{"failed" => %{"score" => nil}})
+    ]
+
+    {range_read, _record_read} = storage(definition, records)
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("covered dynamic fields must not hydrate primary records")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == [
+             %{
+               id: "run-1",
+               attributes: %{"tier" => "gold", "labels" => ["urgent", "finance"]},
+               state_meta: %{"failed" => %{"score" => 1.5}}
+             },
+             %{
+               id: "run-2",
+               attributes: %{"tier" => "gold", "labels" => ["standard"]},
+               state_meta: %{"failed" => %{"score" => nil}}
+             }
+           ]
+
+    assert result.usage.hydrated_records == 0
+  end
+
+  test "rejects a covering index row that omits its required projection" do
+    definition = covering_state_definition()
+
+    request =
+      request([eq(:state, "failed")], 1)
+      |> Map.put(:projection, [:run_id, :state])
+
+    plan = plan!(request, definition)
+    [entry] = entries(definition, record("run-1", 140))
+    malformed = %{entry | covering_record: nil}
+
+    assert {:error, :query_storage_inconsistent} =
+             Executor.execute(context(), 0, request, plan,
+               range_read: one_page_reader(hd(plan.ranges), [malformed]),
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a missing covering projection must fail before hydration")
+               end,
+               now_ms: 1_000
+             )
+  end
+
+  test "evaluates covered residual predicates without metadata or WAL hydration" do
+    definition = covering_state_definition([:type])
+
+    request =
+      request([eq(:state, "failed"), eq(:type, "invoice")], 1)
+      |> Map.put(:projection, [:run_id, :state])
+
+    records = [record("run-1", 140), record("run-2", 130, "failed", "other")]
+    {range_read, _record_read} = storage(definition, records)
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               query_row_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a covered residual predicate must not read QueryRows")
+               end,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a covered residual predicate must not hydrate WAL records")
+               end,
+               now_ms: 1_000
+             )
+
+    assert Enum.map(result.records, & &1.id) == ["run-1"]
+    assert result.usage.hydrated_records == 0
+    assert result.usage.residual_checks == 2
+  end
+
+  test "counts covering rows without primary-record hydration" do
+    definition = covering_state_definition()
+    request = count_request([eq(:state, "failed")])
+    {range_read, _record_read} = storage(definition, [record("run-1", 140), record("run-2", 130)])
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("an authoritative covering count must not hydrate primary records")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.count == 2
+    assert result.usage.hydrated_records == 0
+  end
+
+  test "rejects a covering row whose payload does not match its index identity" do
+    definition = covering_state_definition()
+
+    request =
+      request([eq(:state, "failed")], 1)
+      |> Map.put(:projection, [:run_id, :state])
+
+    plan = plan!(request, definition)
+    [entry] = entries(definition, record("run-1", 140))
+    forged = put_in(entry.covering_record.id, "other")
+
+    assert {:error, :query_storage_inconsistent} =
+             Executor.execute(context(), 0, request, plan,
+               range_read: one_page_reader(hd(plan.ranges), [forged]),
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a malformed cover must fail before hydration")
+               end,
+               now_ms: 1_000
+             )
+  end
+
   test "shared execution hydrates only the sealed physical scope and evaluates logical records" do
     scope = shared_scope(11)
     definition = shared_state_definition()
@@ -160,6 +454,106 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
              Executor.execute(context(scope), 0, request, plan,
                range_read: range_read,
                record_read: forged_read,
+               now_ms: 1_000
+             )
+  end
+
+  test "shared execution validates and serves a scope-bound covering row" do
+    scope = shared_scope(11)
+
+    definition =
+      shared_state_definition()
+      |> Map.from_struct()
+      |> Map.put(:covering_fields, [
+        :partition_key,
+        :run_id,
+        :state,
+        :updated_at_ms,
+        :version
+      ])
+      |> IndexDefinition.new!()
+
+    request =
+      request([eq(:state, "failed")], 1)
+      |> Map.put(:projection, [:run_id, :partition_key, :state])
+
+    raw = record("run-shared", 140) |> scoped_record(scope)
+    {range_read, _record_read} = storage(definition, [raw])
+
+    assert {:ok, result} =
+             Executor.execute(context(scope), 0, request, plan!(request, definition, scope),
+               range_read: range_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a scope-bound covering row must not hydrate")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == [%{id: "run-shared", partition_key: "tenant", state: "failed"}]
+    assert result.usage.hydrated_records == 0
+  end
+
+  test "shared execution serves a scope-bound query row without log hydration" do
+    scope = shared_scope(11)
+    definition = shared_state_definition()
+
+    request =
+      request([eq(:state, "failed")], 1)
+      |> Map.put(:projection, [:run_id, :partition_key, :state])
+
+    raw = record("run-shared-row", 140) |> scoped_record(scope)
+    {range_read, _record_read} = storage(definition, [raw])
+    encoded_record = Codec.encode_record(raw)
+
+    locator =
+      Locator.new!(
+        flow_id: raw.id,
+        kind: :state,
+        version: raw.version,
+        raft_index: raw.version,
+        file_id: {:waraft_apply_projection, raw.version},
+        offset: 0,
+        value_size: byte_size(encoded_record),
+        checksum: :crypto.hash(:sha256, encoded_record),
+        segment_generation: 0,
+        frame_size: 1_024
+      )
+
+    state_key = state_key(raw)
+    assert {:ok, encoded_row} = QueryRowCodec.encode(state_key, raw, locator, 0)
+    assert {:ok, row} = QueryRowCodec.decode(encoded_row, state_key)
+
+    query_row_read = fn _path, [^state_key], _now_ms, _max_bytes ->
+      {:ok, [row], MemoryBudget.term_bytes([row]), true}
+    end
+
+    assert {:ok, result} =
+             Executor.execute(context(scope), 0, request, plan!(request, definition, scope),
+               range_read: range_read,
+               query_row_read: query_row_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a scope-bound query row must not hydrate")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == [
+             %{id: "run-shared-row", partition_key: "tenant", state: "failed"}
+           ]
+
+    assert result.usage.hydrated_records == 0
+
+    forged = %{row | scope_prefix: <<22::unsigned-big-64>>}
+
+    assert {:error, :query_storage_inconsistent} =
+             Executor.execute(context(scope), 0, request, plan!(request, definition, scope),
+               range_read: range_read,
+               query_row_read: fn _path, [_key], _now_ms, _max_bytes ->
+                 {:ok, [forged], MemoryBudget.term_bytes([forged]), true}
+               end,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a forged query row must fail before hydration")
+               end,
                now_ms: 1_000
              )
   end
@@ -737,7 +1131,7 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     [entry] = entries(definition, matching)
 
     exact_working_set =
-      entry.storage_bytes + 192 +
+      PageMemory.retained_bytes([entry], entry.storage_bytes) +
         MemoryBudget.term_bytes([{entry, matching}]) + 128
 
     assert {:ok, budget} =
@@ -831,9 +1225,26 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
 
     assert {:ok, [entry]} = CompositeIndex.entries(definition, record, state_key, 500)
 
+    locator =
+      Locator.new!(
+        flow_id: record.id,
+        kind: :state,
+        version: record.version,
+        raft_index: record.version,
+        file_id: {:waraft_apply_projection, record.version},
+        offset: 0,
+        value_size: byte_size(Codec.encode_record(record)),
+        checksum: :crypto.hash(:sha256, Codec.encode_record(record)),
+        expire_at_ms: 500,
+        segment_generation: 0,
+        frame_size: 1_024
+      )
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 500)
+
     assert :ok =
              LMDB.write_batch(path, [
-               {:put, state_key, LMDB.encode_value(Codec.encode_record(record), 500)},
+               {:put, state_key, query_row},
                {:put, entry.key, entry.value},
                {:put, CompositeCounter.key(definition, range.prefix),
                 CompositeCounter.encode_value(range.prefix, 1, 1)}
@@ -846,7 +1257,42 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     assert result.usage.range_seeks == 1
     assert result.usage.range_pages == 1
     assert result.usage.scanned_entries == 2
-    assert result.usage.hydrated_records == 1
+    assert result.usage.hydrated_records == 0
+  end
+
+  test "counts live expiring rows from query metadata during counter fallback" do
+    definition = counted_state_definition()
+    request = count_request([eq(:state, "failed")])
+    assert %Plan{path: :counter_lookup, ranges: [range]} = plan = plan!(request, definition)
+    path = lmdb_path()
+    record = record("live-expiring", 100)
+    state_key = state_key(record)
+
+    assert {:ok, [entry]} = CompositeIndex.entries(definition, record, state_key, 2_000)
+
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, entry.key, entry.value},
+               {:put, CompositeCounter.key(definition, range.prefix),
+                CompositeCounter.encode_value(range.prefix, 1, 1)}
+             ])
+
+    row = %{query_row(record) | expire_at_ms: 2_000}
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan,
+               path: path,
+               query_row_read: fn ^path, [^state_key], 1_000, _max_bytes ->
+                 {:ok, [row], MemoryBudget.term_bytes([row]), true}
+               end,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("an exact metadata count fallback must not hydrate the WAL record")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.count == 1
+    assert result.usage.hydrated_records == 0
   end
 
   test "sums disjoint scalar counter ranges and rejects overflow or prefix mismatch" do
@@ -1175,6 +1621,55 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     assert result.usage.hydrated_records == 1
   end
 
+  test "serves a live expiring covering row without authoritative hydration" do
+    definition = covering_state_definition()
+
+    request =
+      request([eq(:state, "failed")], 1)
+      |> Map.put(:projection, [:run_id, :state])
+
+    plan = plan!(request, definition)
+    live = record("run-1", 100)
+    [entry] = entries(definition, live)
+    projected_expiry = %{entry | expire_at_ms: 1_001}
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan,
+               range_read: one_page_reader(hd(plan.ranges), [projected_expiry]),
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a live covering row must not read the authoritative log")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == [%{id: "run-1", state: "failed"}]
+    assert result.usage.hydrated_records == 0
+  end
+
+  test "skips an expired covering row without authoritative hydration" do
+    definition = covering_state_definition()
+
+    request =
+      request([eq(:state, "failed")], 1)
+      |> Map.put(:projection, [:run_id, :state])
+
+    plan = plan!(request, definition)
+    [entry] = entries(definition, record("run-1", 100))
+    expired = %{entry | expire_at_ms: 1_000}
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan,
+               range_read: one_page_reader(hd(plan.ranges), [expired]),
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("an expired covering row must not read the authoritative log")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == []
+    assert result.usage.hydrated_records == 0
+  end
+
   test "skips a missing row only when its projected entry is expired" do
     definition = state_definition()
     request = request([eq(:state, "failed")], 2)
@@ -1230,6 +1725,125 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
                clock_us: clock,
                now_ms: 1_000
              )
+  end
+
+  test "checks the wall deadline after a query-row read before validating its rows" do
+    definition = state_definition()
+
+    request =
+      request([eq(:state, "failed"), eq(:type, "invoice")], 1)
+      |> Map.put(:projection, [:run_id, :state])
+
+    record = record("run-query-row-deadline", 100)
+    {range_read, _record_read} = storage(definition, [record])
+    row = query_row(record)
+    malformed = %{row | state_key: state_key(record("other", 100))}
+    clock_calls = :counters.new(1, [])
+
+    clock = fn ->
+      call = :counters.get(clock_calls, 1)
+      :counters.add(clock_calls, 1, 1)
+      if call < 4, do: 0, else: 800_000
+    end
+
+    assert {:error, :query_deadline_exceeded} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               query_row_read: fn _path, [_state_key], _now_ms, _max_bytes ->
+                 {:ok, [malformed], MemoryBudget.term_bytes([malformed]), true}
+               end,
+               record_read: fn _path, _state_keys, _now_ms, _max_bytes ->
+                 flunk("a sparse projection must not hydrate the authoritative record")
+               end,
+               clock_us: clock,
+               now_ms: 1_000
+             )
+  end
+
+  test "samples the wall deadline during a large covering page" do
+    definition = covering_state_definition()
+    request = count_request([eq(:state, "failed")])
+    plan = plan!(request, definition)
+
+    page_entries =
+      1..64
+      |> Enum.map(&record("run-cover-deadline-#{&1}", &1))
+      |> Enum.flat_map(&entries(definition, &1))
+      |> Enum.sort_by(& &1.storage_key)
+
+    last = List.last(page_entries)
+    malformed_last = %{last | covering_record: Map.delete(last.covering_record, :partition_key)}
+    page_entries = List.replace_at(page_entries, -1, malformed_last)
+    clock_calls = :counters.new(1, [])
+
+    clock = fn ->
+      call = :counters.get(clock_calls, 1)
+      :counters.add(clock_calls, 1, 1)
+      if call < 4, do: 0, else: 800_000
+    end
+
+    assert {:error, :query_deadline_exceeded} =
+             Executor.execute(context(), 0, request, plan,
+               range_read: one_page_reader(hd(plan.ranges), page_entries),
+               record_read: fn _path, _state_keys, _now_ms, _max_bytes ->
+                 flunk("a covering count must not hydrate authoritative records")
+               end,
+               page_entries: 64,
+               clock_us: clock,
+               now_ms: 1_000
+             )
+  end
+
+  test "bounds authoritative reads by the remaining query deadline" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 1)
+    plan = plan!(request, definition)
+    record = record("run-1", 100)
+    {range_read, _record_read} = storage(definition, [record])
+
+    record_read = fn _path, _state_keys, _now_ms, _max_bytes, timeout_ms ->
+      assert timeout_ms in 1..124
+      {:ok, [record]}
+    end
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan,
+               range_read: range_read,
+               record_read: record_read,
+               clock_us: fn -> 0 end,
+               deadline_us: 123_001,
+               now_ms: 1_000
+             )
+
+    assert Enum.map(result.records, & &1.id) == [record.id]
+  end
+
+  test "does not start authoritative IO after the query deadline" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 1)
+    plan = plan!(request, definition)
+    {range_read, _record_read} = storage(definition, [record("run-1", 100)])
+    counter = :counters.new(1, [])
+    parent = self()
+
+    clock = fn ->
+      call = :counters.get(counter, 1)
+      :counters.add(counter, 1, 1)
+      if call < 2, do: 0, else: 800_000
+    end
+
+    assert {:error, :query_deadline_exceeded} =
+             Executor.execute(context(), 0, request, plan,
+               range_read: range_read,
+               record_read: fn _path, _state_keys, _now_ms, _max_bytes, _timeout_ms ->
+                 send(parent, :record_read)
+                 {:ok, []}
+               end,
+               clock_us: clock,
+               now_ms: 1_000
+             )
+
+    refute_receive :record_read
   end
 
   test "reports a deadline that expires during final response assembly" do
@@ -1328,6 +1942,30 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
              Executor.execute(context(), 0, request, plan,
                range_read: range_read,
                record_read: record_read,
+               now_ms: 1_000
+             )
+  end
+
+  test "rejects a decoded covering page that exceeds the executor memory budget" do
+    definition = covering_state_definition()
+    request = count_request([eq(:state, "failed")])
+    plan = plan!(request, definition)
+    matching = record("run-cover-memory", 100)
+    [entry] = entries(definition, matching)
+    legacy_page_bytes = entry.storage_bytes + 192
+
+    assert MemoryBudget.term_bytes([entry]) > legacy_page_bytes
+    assert {:ok, budget} = Budget.lower(plan.budget, executor_memory_bytes: legacy_page_bytes)
+
+    {range_read, _record_read} = storage(definition, [matching])
+
+    assert {:error, :query_memory_budget_exceeded} =
+             Executor.execute(context(), 0, request, %{plan | budget: budget},
+               range_read: range_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("an authoritative covering count must not hydrate")
+               end,
+               page_entries: 1,
                now_ms: 1_000
              )
   end
@@ -1468,7 +2106,8 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
 
     tampered_plans = [
       %{plan | version: 2},
-      %{plan | query_fingerprint: String.duplicate("0", 64)}
+      %{plan | query_fingerprint: String.duplicate("0", 64)},
+      %{plan | record_source: :query_row}
     ]
 
     for tampered <- tampered_plans do
@@ -1656,17 +2295,62 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     end
   end
 
-  test "reads real composite entries and version-matched Flow rows from LMDB" do
+  test "reads real composite entries from LMDB and authoritative Flow rows from WARaft" do
     definition = state_definition()
     request = request([eq(:state, "failed")], 2, [{:updated_at_ms, :desc}])
     plan = plan!(request, definition)
     records = [record("older", 100), record("newer", 200), record("other", 300, "running")]
-    path = lmdb_path()
+    root = lmdb_path()
+    path = Path.join(root, "query-lmdb")
+
+    source_values =
+      Enum.map(records, fn record ->
+        {state_key(record), Codec.encode_record(record), 0}
+      end)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+               root,
+               0,
+               41,
+               source_values
+             )
+
+    assert {:ok, 3} =
+             Ferricstore.Raft.WARaftSegmentReader.spill_apply_projection_cache(root, 0)
+
+    assert {:ok, {segment_generation, frame_offset, frame_size}} =
+             Ferricstore.Raft.WARaftSegmentReader.physical_location(
+               %{data_dir: root},
+               0,
+               {:waraft_apply_projection, 41}
+             )
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(root, 0)
+    end)
 
     ops =
       Enum.flat_map(records, fn record ->
         state_key = state_key(record)
-        state_op = {:put, state_key, LMDB.encode_value(Codec.encode_record(record), 0)}
+        encoded_record = Codec.encode_record(record)
+
+        locator =
+          Locator.new!(
+            flow_id: record.id,
+            kind: :state,
+            version: record.version,
+            raft_index: 41,
+            file_id: {:waraft_apply_projection, 41},
+            offset: frame_offset,
+            value_size: byte_size(encoded_record),
+            checksum: :crypto.hash(:sha256, encoded_record),
+            segment_generation: segment_generation,
+            frame_size: frame_size
+          )
+
+        assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+        state_op = {:put, state_key, query_row}
 
         index_ops =
           definition
@@ -1679,7 +2363,7 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     assert :ok = LMDB.write_batch(path, ops)
 
     assert {:ok, result} =
-             Executor.execute(context(), 0, request, plan,
+             Executor.execute(%{context() | data_dir: root}, 0, request, plan,
                path: path,
                page_entries: 3,
                now_ms: 1_000
@@ -1687,6 +2371,40 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
 
     assert Enum.map(result.records, & &1.id) == ["newer", "older"]
     assert result.usage.range_pages == 1
+  end
+
+  test "serves real covering composite entries from LMDB without primary rows" do
+    definition = covering_state_definition()
+
+    request =
+      request([eq(:state, "failed")], 2, [{:updated_at_ms, :desc}])
+      |> Map.put(:projection, [:run_id, :state, :updated_at_ms])
+
+    records = [record("older", 100), record("newer", 200)]
+    path = lmdb_path()
+
+    ops =
+      Enum.flat_map(records, fn record ->
+        definition
+        |> entries_with_values(record)
+        |> Enum.map(&{:put, &1.key, &1.value})
+      end)
+
+    assert :ok = LMDB.write_batch(path, ops)
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               path: path,
+               page_entries: 3,
+               now_ms: 1_000
+             )
+
+    assert result.records == [
+             %{id: "newer", state: "failed", updated_at_ms: 200},
+             %{id: "older", state: "failed", updated_at_ms: 100}
+           ]
+
+    assert result.usage.hydrated_records == 0
   end
 
   defp plan!(request, definition, mandatory_scope \\ MandatoryScope.dedicated()) do
@@ -1771,6 +2489,19 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     IndexDefinition.new!(%{
       id: "flow_runs_tenant_state_updated",
       version: 1,
+      fields: [
+        {:partition_key, :asc},
+        {:state, :asc},
+        {:updated_at_ms, :desc}
+      ]
+    })
+  end
+
+  defp covering_state_definition(extra_fields \\ []) do
+    IndexDefinition.new!(%{
+      id: "flow_runs_tenant_state_updated_covering",
+      version: 1,
+      covering_fields: [:partition_key, :run_id, :state, :updated_at_ms, :version | extra_fields],
       fields: [
         {:partition_key, :asc},
         {:state, :asc},
@@ -1906,6 +2637,27 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
   end
 
   defp state_key(record), do: Keys.state_key(record.id, record.partition_key)
+
+  defp query_row(record) do
+    %QueryRow{
+      state_key: state_key(record),
+      record: FlowRecordProjection.public(record),
+      locator:
+        Locator.new!(
+          flow_id: record.id,
+          kind: :state,
+          version: record.version,
+          raft_index: record.version,
+          file_id: {:waraft_apply_projection, record.version},
+          offset: 0,
+          value_size: byte_size(Codec.encode_record(record)),
+          checksum: :crypto.hash(:sha256, Codec.encode_record(record)),
+          segment_generation: 0,
+          frame_size: 1_024
+        ),
+      expire_at_ms: 0
+    }
+  end
 
   defp shared_scope(tenant_ref) do
     {:ok, snapshot} = MetadataExtension.configure(SharedScopeProvider, [])

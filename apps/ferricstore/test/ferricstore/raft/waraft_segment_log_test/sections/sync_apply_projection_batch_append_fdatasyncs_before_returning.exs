@@ -201,6 +201,50 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.SyncApplyProjectionBatc
         end
       end
 
+      test "latest physical apply projection frame contains the complete merged index" do
+        root =
+          Path.join(
+            System.tmp_dir!(),
+            "ferricstore-waraft-apply-projection-physical-merge-#{System.unique_integer([:positive])}"
+          )
+
+        projection_root = Path.join(root, "apply_projection_log")
+        File.rm_rf!(root)
+
+        try do
+          assert :ok =
+                   :ferricstore_waraft_spike_segment_log.write_projection_batches_sync(
+                     to_charlist(projection_root),
+                     [{{:raft_log_pos, 42, 7}, [{"a", "old", 0}, {"b", "2", 0}]}]
+                   )
+
+          assert :ok =
+                   :ferricstore_waraft_spike_segment_log.write_projection_batches_sync(
+                     to_charlist(projection_root),
+                     [{{:raft_log_pos, 42, 7}, [{"a", "new", 0}, {"c", "3", 0}]}]
+                   )
+
+          assert {:ok, {_ordinal, offset, encoded_size}} =
+                   :ferricstore_waraft_spike_segment_log.location_for_index(
+                     to_charlist(projection_root),
+                     42
+                   )
+
+          assert {:ok,
+                  {0,
+                   {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 42, 7},
+                    [{"a", "new", 0}, {"b", "2", 0}, {"c", "3", 0}]}}} =
+                   :ferricstore_waraft_spike_segment_log.read_disk_at(
+                     to_charlist(projection_root),
+                     42,
+                     offset,
+                     encoded_size
+                   )
+        after
+          File.rm_rf!(root)
+        end
+      end
+
       test "apply projection batch duplicate replay appends and reads merged view" do
         previous_hook = Application.get_env(:ferricstore, :waraft_segment_log_rewrite_hook)
 
@@ -249,7 +293,7 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest.Sections.SyncApplyProjectionBatc
                    {42,
                     {0,
                      {:ferricstore_segment_apply_projection_batch, {:raft_log_pos, 42, 7},
-                      [{"a", "1", 0}]}}}
+                      [{"a", "1", 0}, {"b", "2", 0}]}}}
                  ]
 
           assert {:ok,

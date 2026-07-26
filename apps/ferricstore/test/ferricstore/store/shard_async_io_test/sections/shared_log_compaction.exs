@@ -4,7 +4,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
   defmacro __using__(_opts) do
     quote do
       alias Ferricstore.Bitcask.NIF
-      alias Ferricstore.Flow.{LMDB, Locator}
+      alias Ferricstore.Flow.{Keys, LMDB, Locator, RecordHydrator}
+      alias Ferricstore.Flow.Query.QueryRowCodec
       alias Ferricstore.Store.{CompoundKey, Promotion}
       alias Ferricstore.Store.BitcaskWriter
       alias Ferricstore.Store.LFU
@@ -203,6 +204,98 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
             assert reclaimed >= old_size
             refute File.exists?(source)
             assert nil == GenServer.call(pid, {:get, key})
+          after
+            cleanup_shard(pid, ctx, dir)
+          end
+        end
+
+        test "manual compaction relocates hot Flow query rows before full-record hydration" do
+          {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+
+          try do
+            dead_key = "flow-compaction-dead"
+            state_key = Keys.state_key("flow-compaction-live", "tenant-a")
+
+            record = %{
+              id: "flow-compaction-live",
+              type: "job",
+              state: "waiting",
+              version: 1,
+              attempts: 0,
+              fencing_token: 0,
+              created_at_ms: 100,
+              updated_at_ms: 200,
+              next_run_at_ms: 900_000,
+              priority: 0,
+              ttl_ms: 60_000,
+              history_hot_max_events: 100,
+              history_max_events: 1_000,
+              retention_ttl_ms: 86_400_000,
+              max_active_ms: 300_000,
+              terminal_retention_until_ms: nil,
+              partition_key: "tenant-a",
+              payload_ref: nil,
+              parent_flow_id: nil,
+              parent_partition_key: nil,
+              root_flow_id: "flow-compaction-live",
+              correlation_id: nil,
+              result_ref: nil,
+              error_ref: nil,
+              lease_owner: nil,
+              lease_token: nil,
+              lease_deadline_ms: 0,
+              run_state: "waiting",
+              child_groups: %{}
+            }
+
+            encoded_record = Ferricstore.Flow.encode_record(record)
+            assert :ok = GenServer.call(pid, {:put, dead_key, "dead", 0})
+            assert :ok = GenServer.call(pid, {:put, state_key, encoded_record, 0})
+            assert :ok = GenServer.call(pid, :flush)
+
+            state = :sys.get_state(pid)
+
+            assert [
+                     {^state_key, _cached, 0, _lfu, 0, old_offset, value_size}
+                   ] = :ets.lookup(state.keydir, state_key)
+
+            old_locator =
+              Locator.new!(
+                flow_id: record.id,
+                kind: :state,
+                version: record.version,
+                raft_index: record.version,
+                file_id: 0,
+                offset: old_offset,
+                value_size: value_size,
+                checksum: :crypto.hash(:sha256, encoded_record)
+              )
+
+            assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, old_locator, 0)
+            lmdb_path = LMDB.path(state.shard_data_path)
+            assert :ok = LMDB.write_batch(lmdb_path, [{:put, state_key, query_row}])
+
+            assert :ok = GenServer.call(pid, {:delete, dead_key})
+            assert :ok = GenServer.call(pid, :flush)
+            assert :ok = force_rotate_active_file(pid)
+
+            assert {:ok, {1, _tombstones, _reclaimed}} =
+                     GenServer.call(pid, {:run_compaction, [0]})
+
+            assert {:ok, relocated_query_row} = LMDB.get(lmdb_path, state_key)
+
+            assert {:ok, %{locator: relocated}} =
+                     QueryRowCodec.decode(relocated_query_row, state_key)
+
+            refute relocated.offset == old_locator.offset
+            assert relocated.file_id == 0
+            assert relocated.value_size == old_locator.value_size
+
+            assert [{^state_key, _cached, 0, _lfu, 0, relocated_offset, _value_size}] =
+                     :ets.lookup(:sys.get_state(pid).keydir, state_key)
+
+            assert relocated_offset == relocated.offset
+            assert {:ok, [^record]} = RecordHydrator.read_many(ctx, 0, [{state_key, relocated}])
           after
             cleanup_shard(pid, ctx, dir)
           end
@@ -414,10 +507,12 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
             state = :sys.get_state(pid)
             source = Path.join(state.shard_data_path, "00000.log")
             lmdb_path = LMDB.path(state.shard_data_path)
-            key1 = "flow:state:catalog-page-1"
-            key2 = "flow:state:catalog-page-2"
-            value1 = "cold-state-one"
-            value2 = "cold-state-two"
+            key1 = Keys.state_key("catalog-page-1")
+            key2 = Keys.state_key("catalog-page-2")
+            record1 = shared_compaction_flow_record("catalog-page-1")
+            record2 = shared_compaction_flow_record("catalog-page-2")
+            value1 = Ferricstore.Flow.encode_record(record1)
+            value2 = Ferricstore.Flow.encode_record(record2)
 
             assert {:ok, [{offset1, _record_size1}, {offset2, _record_size2}]} =
                      NIF.v2_append_batch(source, [{key1, value1, 0}, {key2, value2, 0}])
@@ -429,7 +524,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
               raft_index: 1,
               file_id: 0,
               offset: offset1,
-              value_size: byte_size(value1)
+              value_size: byte_size(value1),
+              checksum: :crypto.hash(:sha256, value1)
             }
 
             locator2 = %Locator{
@@ -439,13 +535,16 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
               raft_index: 2,
               file_id: 0,
               offset: offset2,
-              value_size: byte_size(value2)
+              value_size: byte_size(value2),
+              checksum: :crypto.hash(:sha256, value2)
             }
 
             park_key1 = LMDB.cold_park_key_for_state_key(key1)
             park_key2 = LMDB.cold_park_key_for_state_key(key2)
             reverse_key1 = LMDB.cold_by_segment_key(locator1)
             reverse_key2 = LMDB.cold_by_segment_key(locator2)
+            assert {:ok, query_row1} = QueryRowCodec.encode(key1, record1, locator1, 0)
+            assert {:ok, query_row2} = QueryRowCodec.encode(key2, record2, locator2, 0)
 
             assert :ok =
                      LMDB.write_batch(lmdb_path, [
@@ -460,7 +559,9 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
                           due_at_ms: 900_000
                         )},
                        {:put, reverse_key1, park_key1},
-                       {:put, reverse_key2, park_key2}
+                       {:put, reverse_key2, park_key2},
+                       {:put, key1, query_row1},
+                       {:put, key2, query_row2}
                      ])
 
             parent = self()
@@ -565,8 +666,9 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
             state = :sys.get_state(pid)
             source = Path.join(state.shard_data_path, "00000.log")
             lmdb_path = LMDB.path(state.shard_data_path)
-            state_key = "flow:state:locator-publish-failure"
-            state_value = "cold-state-survives"
+            state_key = Keys.state_key("locator-publish-failure")
+            record = shared_compaction_flow_record("locator-publish-failure")
+            state_value = Ferricstore.Flow.encode_record(record)
 
             assert {:ok, [_dead, {old_offset, _record_size}]} =
                      NIF.v2_append_batch(source, [
@@ -581,7 +683,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
               raft_index: 1,
               file_id: 0,
               offset: old_offset,
-              value_size: byte_size(state_value)
+              value_size: byte_size(state_value),
+              checksum: :crypto.hash(:sha256, state_value)
             }
 
             park_key = LMDB.cold_park_key_for_state_key(state_key)
@@ -593,10 +696,13 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
                 due_at_ms: 900_000
               )
 
+            assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+
             assert :ok =
                      LMDB.write_batch(lmdb_path, [
                        {:put, park_key, encoded_park},
-                       {:put, reverse_key, park_key}
+                       {:put, reverse_key, park_key},
+                       {:put, state_key, query_row}
                      ])
 
             original = File.read!(source)
@@ -1194,6 +1300,40 @@ defmodule Ferricstore.Store.ShardAsyncIoTest.Sections.SharedLogCompaction do
             Process.flag(:trap_exit, previous_trap_exit)
           end
         end
+      end
+
+      defp shared_compaction_flow_record(id) do
+        %{
+          id: id,
+          type: "job",
+          state: "waiting",
+          version: 1,
+          attempts: 0,
+          fencing_token: 0,
+          created_at_ms: 100,
+          updated_at_ms: 200,
+          next_run_at_ms: 900_000,
+          priority: 0,
+          ttl_ms: 60_000,
+          history_hot_max_events: 100,
+          history_max_events: 1_000,
+          retention_ttl_ms: 86_400_000,
+          max_active_ms: 300_000,
+          terminal_retention_until_ms: nil,
+          partition_key: nil,
+          payload_ref: nil,
+          parent_flow_id: nil,
+          parent_partition_key: nil,
+          root_flow_id: id,
+          correlation_id: nil,
+          result_ref: nil,
+          error_ref: nil,
+          lease_owner: nil,
+          lease_token: nil,
+          lease_deadline_ms: nil,
+          run_state: "waiting",
+          child_groups: %{}
+        }
       end
     end
   end

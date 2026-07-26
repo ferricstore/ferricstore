@@ -597,6 +597,87 @@ defmodule Ferricstore.FlowAttributesTest do
              )
   end
 
+  test "rejects an attribute merge that would overflow the existing bounded record" do
+    id = unique_flow_id("attrs-merge-overflow")
+    type = unique_flow_id("attrs-merge-overflow-type")
+    attributes = Map.new(1..16, &{"k#{&1}", "v"})
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "queued",
+               partition_key: @partition,
+               attributes: attributes,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               states: ["queued"],
+               partition_key: @partition,
+               worker: "w1",
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    assert {:error, "ERR too many flow attributes"} =
+             FerricStore.flow_transition(id, "running", "processing",
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               partition_key: @partition,
+               attributes_merge: %{"overflow" => "v"},
+               run_at_ms: 1_010,
+               now_ms: 1_002
+             )
+
+    assert {:ok, record} = FerricStore.flow_get(id, partition_key: @partition)
+    assert record.state == "running"
+    assert record.version == claimed.version
+    assert record.attributes == attributes
+  end
+
+  test "explicit null attributes round trip without matching missing attributes" do
+    type = unique_flow_id("attrs-null-type")
+    null_id = unique_flow_id("attrs-null")
+    missing_id = unique_flow_id("attrs-missing")
+
+    assert :ok =
+             FerricStore.flow_create(null_id,
+               type: type,
+               state: "queued",
+               partition_key: @partition,
+               attributes: %{"nullable" => nil},
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             FerricStore.flow_create(missing_id,
+               type: type,
+               state: "queued",
+               partition_key: @partition,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, record} = FerricStore.flow_get(null_id, partition_key: @partition)
+    assert Map.fetch(record.attributes, "nullable") == {:ok, nil}
+
+    assert_eventually(fn ->
+      assert {:ok, records} =
+               FerricStore.flow_list(type,
+                 state: "queued",
+                 partition_key: @partition,
+                 attributes: %{"nullable" => nil},
+                 consistent_projection: true,
+                 count: 10
+               )
+
+      assert Enum.map(records, & &1.id) == [null_id]
+    end)
+  end
+
   test "rejects oversized attribute keys values and invalid types" do
     assert {:error, "ERR flow attribute key too large"} =
              FerricStore.flow_create(unique_flow_id("attrs-key-large"),

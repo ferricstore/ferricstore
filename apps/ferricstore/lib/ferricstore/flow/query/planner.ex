@@ -6,12 +6,14 @@ defmodule Ferricstore.Flow.Query.Planner do
   alias Ferricstore.Flow.Query.{
     CompositeIndex,
     CompositeRange,
+    ExecutionSource,
     Field,
     FixedIndexExecutor,
     IndexDefinition,
     MandatoryScope,
     RegisteredIndex,
     RecordProjection,
+    ReferenceEvaluator,
     Request,
     Shape,
     TupleCodec
@@ -28,10 +30,10 @@ defmodule Ferricstore.Flow.Query.Planner do
   }
   @default_page_entries 512
   @dedupe_entry_bytes 128
-  @decoded_entry_overhead 192
   @hydrated_record_overhead 128
   @selection_entry_overhead 256
   @counter_entry_overhead 256
+  @default_average_row_bytes 512
 
   @spec plan(Request.t(), [RegisteredIndex.t()], keyword()) ::
           {:ok, Plan.t()} | {:error, atom()}
@@ -308,7 +310,27 @@ defmodule Ferricstore.Flow.Query.Planner do
     predicates = request_predicates(request)
     stats_scope = scope_runtime.statistics_key
     stat = lookup_stats(index, stats_scope, opts)
-    estimate = estimate(request, built, stat, budget, now_ms, contract.deduplicate)
+
+    record_source =
+      ExecutionSource.classify(
+        request,
+        contract.path,
+        definition,
+        contract.residual_predicates
+      )
+
+    estimate =
+      estimate(
+        request,
+        definition,
+        built,
+        stat,
+        budget,
+        now_ms,
+        contract.deduplicate,
+        record_source,
+        contract.order
+      )
 
     with :ok <- within_budget(estimate, budget) do
       order = contract.order
@@ -318,6 +340,7 @@ defmodule Ferricstore.Flow.Query.Planner do
         {:ok,
          %Plan{
            path: contract.path,
+           record_source: record_source,
            index_id: definition.id,
            index_version: definition.version,
            index_build_id: index.build_id,
@@ -367,10 +390,13 @@ defmodule Ferricstore.Flow.Query.Planner do
       hard_scan_entries: range_count,
       hydrated_records: 0,
       hard_hydrated_records: 0,
+      metadata_rows: 0,
+      hard_metadata_rows: 0,
       result_records: 1,
       scan_bytes: hard_scan_bytes,
       hard_scan_bytes: hard_scan_bytes,
       hydration_bytes: 0,
+      metadata_bytes: 0,
       residual_checks: 0,
       sort_rows: 0,
       planner_memory_bytes: planner_memory_bytes,
@@ -385,6 +411,7 @@ defmodule Ferricstore.Flow.Query.Planner do
       {:ok,
        %Plan{
          path: :counter_lookup,
+         record_source: :transactional_counter,
          index_id: definition.id,
          index_version: definition.version,
          index_build_id: index.build_id,
@@ -650,28 +677,62 @@ defmodule Ferricstore.Flow.Query.Planner do
     end
   end
 
-  defp estimate(request, built, stat, budget, now_ms, deduplicate?) do
+  defp estimate(
+         request,
+         definition,
+         built,
+         stat,
+         budget,
+         now_ms,
+         deduplicate?,
+         record_source,
+         order
+       ) do
     {scan_entries, hard_scan_entries, estimate_source, confidence} =
       scan_estimate(built.ranges, stat, budget, now_ms)
 
     average_entry_bytes = sample_value(stat, :average_entry_bytes, 128, now_ms)
-    average_row_bytes = sample_value(stat, :average_row_bytes, 512, now_ms)
-    hydrated_records = min(scan_entries, budget.hydrated_records)
-    hard_hydrated_records = min(hard_scan_entries, budget.hydrated_records)
 
-    residual_checks =
-      hydrated_records *
-        length(residual_predicates(request_predicates(request), built.used_predicates))
+    average_row_bytes =
+      sample_value(stat, :average_row_bytes, @default_average_row_bytes, now_ms)
+
+    residual_predicates =
+      residual_predicates(request_predicates(request), built.used_predicates)
+
+    {hydrated_records, hard_hydrated_records, metadata_rows, hard_metadata_rows} =
+      source_row_estimates(
+        record_source,
+        request,
+        order,
+        residual_predicates,
+        scan_entries,
+        hard_scan_entries
+      )
+
+    evaluated_records =
+      if record_source == :covering_index and residual_predicates != [],
+        do: scan_entries,
+        else: max(hydrated_records, metadata_rows)
+
+    residual_checks = evaluated_records * length(residual_predicates)
+    prepared_residual_bytes = prepared_residual_bytes(residual_predicates, budget)
 
     scan_bytes = scan_entries * average_entry_bytes
     hard_scan_bytes = hard_scan_entries * average_entry_bytes
     hydration_bytes = hydrated_records * average_row_bytes
+    metadata_bytes = metadata_rows * average_row_bytes
     range_seeks = length(built.ranges)
     page_entries = min(hard_scan_entries, @default_page_entries)
-    page_bytes = page_entries * (average_entry_bytes + @decoded_entry_overhead)
 
-    hydration_peak_bytes =
-      min(hard_hydrated_records, page_entries) *
+    page_bytes =
+      Ferricstore.Flow.Query.PageMemory.estimated_bytes(
+        page_entries,
+        average_entry_bytes,
+        length(definition.covering_fields)
+      )
+
+    source_row_peak_bytes =
+      min(max(hard_hydrated_records, hard_metadata_rows), page_entries) *
         (average_row_bytes + @hydrated_record_overhead)
 
     planner_memory_bytes = MemoryBudget.term_bytes({request, built.ranges})
@@ -684,20 +745,76 @@ defmodule Ferricstore.Flow.Query.Planner do
       hard_scan_entries: hard_scan_entries,
       hydrated_records: hydrated_records,
       hard_hydrated_records: hard_hydrated_records,
-      result_records: result_records(request, hydrated_records),
+      metadata_rows: metadata_rows,
+      hard_metadata_rows: hard_metadata_rows,
+      result_records: result_records(request, max(evaluated_records, scan_entries)),
       scan_bytes: scan_bytes,
       hard_scan_bytes: hard_scan_bytes,
       hydration_bytes: hydration_bytes,
+      metadata_bytes: metadata_bytes,
       residual_checks: residual_checks,
+      prepared_residual_bytes: prepared_residual_bytes,
       sort_rows: 0,
       planner_memory_bytes: planner_memory_bytes,
-      memory_bytes: dedupe_bytes + page_bytes + hydration_peak_bytes,
+      memory_bytes: dedupe_bytes + page_bytes + source_row_peak_bytes + prepared_residual_bytes,
       cost:
-        range_seeks * 20 + scan_entries + hydrated_records * 4 + div(scan_bytes, 256) +
+        range_seeks * 20 + scan_entries + hydrated_records * 4 + metadata_rows * 2 +
+          div(scan_bytes, 256) +
           residual_checks,
       estimate_source: estimate_source,
       confidence: confidence
     }
+  end
+
+  defp source_row_estimates(
+         record_source,
+         request,
+         order,
+         residual_predicates,
+         scan_entries,
+         hard_scan_entries
+       ) do
+    {rows, hard_rows} =
+      fetched_row_estimates(
+        request,
+        order,
+        residual_predicates,
+        scan_entries,
+        hard_scan_entries
+      )
+
+    case record_source do
+      :authoritative_log -> {rows, hard_rows, 0, 0}
+      :query_row -> {0, 0, rows, hard_rows}
+      :covering_index -> {0, 0, 0, 0}
+    end
+  end
+
+  defp fetched_row_estimates(
+         %Request{return: :record, limit: limit},
+         :native,
+         [],
+         scan_entries,
+         hard_scan_entries
+       ) do
+    required = limit + 1
+    {min(scan_entries, required), min(hard_scan_entries, required)}
+  end
+
+  defp fetched_row_estimates(
+         %Request{},
+         _order,
+         _residual_predicates,
+         scan_entries,
+         hard_scan_entries
+       ),
+       do: {scan_entries, hard_scan_entries}
+
+  defp prepared_residual_bytes(predicates, budget) do
+    case ReferenceEvaluator.prepare(predicates) do
+      {:ok, prepared} -> MemoryBudget.term_bytes(prepared)
+      {:error, _reason} -> budget.executor_memory_bytes + 1
+    end
   end
 
   defp scan_estimate(ranges, %IndexStatistics{} = stat, budget, now_ms) do
@@ -759,8 +876,14 @@ defmodule Ferricstore.Flow.Query.Planner do
 
   defp add_order_estimate(estimate, order, limit, stat, now_ms) do
     average_entry_bytes = sample_value(stat, :average_entry_bytes, 128, now_ms)
-    average_row_bytes = sample_value(stat, :average_row_bytes, 512, now_ms)
-    retained_rows = min(estimate.hard_hydrated_records, limit + 1)
+
+    average_row_bytes =
+      sample_value(stat, :average_row_bytes, @default_average_row_bytes, now_ms)
+
+    retained_rows =
+      estimate
+      |> source_candidate_ceiling()
+      |> min(limit + 1)
 
     retained_bytes =
       retained_rows *
@@ -784,6 +907,16 @@ defmodule Ferricstore.Flow.Query.Planner do
           | memory_bytes: estimate.memory_bytes + retained_bytes
         }
     end
+  end
+
+  defp source_candidate_ceiling(estimate) do
+    max(
+      Map.get(estimate, :hard_scan_entries, 0),
+      max(
+        Map.get(estimate, :hard_hydrated_records, 0),
+        Map.get(estimate, :hard_metadata_rows, 0)
+      )
+    )
   end
 
   defp add_result_estimate(%Request{return: :count}, estimate, :none, _stat, _now_ms),
@@ -1013,6 +1146,7 @@ defmodule Ferricstore.Flow.Query.Planner do
       index_version: plan.index_version,
       index_build_id: plan.index_build_id,
       order: plan.order,
+      record_source: plan.record_source,
       range_count: length(plan.ranges),
       residual_predicate_count: length(plan.residual_predicates),
       estimate: plan.estimate,
@@ -1093,6 +1227,7 @@ defmodule Ferricstore.Flow.Query.Planner do
   defp primary_plan(request, mandatory_scope, budget, fingerprint) do
     %Plan{
       path: :primary_key,
+      record_source: :authoritative_log,
       index_id: @primary_index,
       index_version: 1,
       index_build_id: @primary_index,
@@ -1109,7 +1244,7 @@ defmodule Ferricstore.Flow.Query.Planner do
         hydrated_records: 1,
         result_records: 1,
         scan_bytes: 0,
-        hydration_bytes: 0,
+        hydration_bytes: @default_average_row_bytes,
         residual_checks: length(request_predicates(request)),
         sort_rows: 0,
         planner_memory_bytes: 0,
@@ -1133,6 +1268,7 @@ defmodule Ferricstore.Flow.Query.Planner do
 
     %Plan{
       path: :history,
+      record_source: :authoritative_log,
       index_id: @history_index,
       index_version: 1,
       index_build_id: @history_index,
@@ -1149,7 +1285,7 @@ defmodule Ferricstore.Flow.Query.Planner do
         hydrated_records: hydration_bound,
         result_records: limit,
         scan_bytes: 0,
-        hydration_bytes: 0,
+        hydration_bytes: hydration_bound * @default_average_row_bytes,
         residual_checks: hydration_bound * checks,
         sort_rows: 0,
         planner_memory_bytes: 0,
@@ -1177,6 +1313,7 @@ defmodule Ferricstore.Flow.Query.Planner do
 
     %Plan{
       path: :lineage,
+      record_source: :authoritative_log,
       index_id: index_id,
       index_version: 1,
       index_build_id: index_id,
@@ -1193,7 +1330,7 @@ defmodule Ferricstore.Flow.Query.Planner do
         hydrated_records: hydration_bound,
         result_records: limit,
         scan_bytes: 0,
-        hydration_bytes: 0,
+        hydration_bytes: hydration_bound * @default_average_row_bytes,
         residual_checks: hydration_bound * checks,
         sort_rows: 0,
         planner_memory_bytes: 0,
@@ -1217,6 +1354,7 @@ defmodule Ferricstore.Flow.Query.Planner do
 
     %Plan{
       path: :empty,
+      record_source: :none,
       ranges: [],
       order: :native,
       residual_predicates: [],
@@ -1244,7 +1382,7 @@ defmodule Ferricstore.Flow.Query.Planner do
         hard_scan_bytes: budget.scan_bytes,
         hydrated_records: fixed.scan_entries,
         hard_hydrated_records: fixed.scan_entries,
-        hydration_bytes: 0,
+        hydration_bytes: fixed.scan_entries * @default_average_row_bytes,
         result_records: request.limit,
         residual_checks: fixed.scan_entries * checks,
         sort_rows: 0,
@@ -1257,6 +1395,7 @@ defmodule Ferricstore.Flow.Query.Planner do
         {:ok,
          %Plan{
            path: :fixed_index,
+           record_source: :authoritative_log,
            index_id: fixed.index_id,
            index_version: 1,
            index_build_id: fixed.index_id,
@@ -1282,6 +1421,7 @@ defmodule Ferricstore.Flow.Query.Planner do
   defp reject_plan(request, mandatory_scope, budget, fingerprint, reason) do
     %Plan{
       path: :reject,
+      record_source: :none,
       ranges: [],
       order: :none,
       residual_predicates: request_predicates(request),
@@ -1303,9 +1443,13 @@ defmodule Ferricstore.Flow.Query.Planner do
       scan_entries: 0,
       hard_scan_entries: 0,
       hydrated_records: 0,
+      hard_hydrated_records: 0,
+      metadata_rows: 0,
+      hard_metadata_rows: 0,
       result_records: 0,
       scan_bytes: 0,
       hydration_bytes: 0,
+      metadata_bytes: 0,
       residual_checks: 0,
       sort_rows: 0,
       planner_memory_bytes: 0,

@@ -8,8 +8,10 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
       alias Ferricstore.Flow.HistoryProjector
       alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB, as: FlowLMDB
+      alias Ferricstore.Flow.Query.QueryRowCompaction
       alias Ferricstore.Raft.StateMachine
       alias Ferricstore.Raft.WARaftSegmentReader
+      alias Ferricstore.Raft.WARaftStorage.ApplyProjectionRetention
       alias Ferricstore.Store.BlobRef
       alias Ferricstore.Store.BlobStore
       alias Ferricstore.Store.BlobValue
@@ -346,6 +348,17 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
               trim_index
             ) do
           segment_projection_checkpoint_relocations(ctx, shard_index, entries, trim_index)
+        end
+
+        @doc false
+        def __compact_apply_projection_log_for_test__(
+              root_dir,
+              ctx,
+              shard_index,
+              trim_index,
+              lmdb_path
+            ) do
+          compact_apply_projection_log(root_dir, ctx, shard_index, trim_index, lmdb_path)
         end
       end
 
@@ -741,30 +754,141 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
              trim_index,
              retention_lmdb_path
            ) do
-        with {:ok, retained_batches} <-
-               collect_apply_projection_retention_batches(
-                 ctx,
-                 shard_index,
-                 trim_index,
-                 retention_lmdb_path
-               ) do
-          case :ferricstore_waraft_spike_segment_log.compact_apply_projection(
-                 root_dir
-                 |> apply_projection_root()
-                 |> to_charlist(),
-                 trim_index,
-                 retained_batches
-               ) do
-            :ok -> :ok
-            {:error, reason} -> {:error, {:compact_apply_projection_log_failed, reason}}
-            other -> {:error, {:compact_apply_projection_log_failed, other}}
+        compact_apply_projection_log(
+          root_dir,
+          ctx,
+          shard_index,
+          trim_index,
+          retention_lmdb_path,
+          [retention_lmdb_path]
+        )
+      end
+
+      defp compact_apply_projection_log(
+             root_dir,
+             ctx,
+             shard_index,
+             trim_index,
+             retention_lmdb_path,
+             relocation_lmdb_paths
+           )
+           when is_list(relocation_lmdb_paths) and relocation_lmdb_paths != [] do
+        with {:ok, retention} <- ApplyProjectionRetention.open(root_dir, trim_index) do
+          try do
+            expiry_cutoff_ms = storage_expiry_cutoff_ms()
+
+            with {:ok, retention} <-
+                   collect_apply_projection_retention(
+                     retention,
+                     ctx,
+                     shard_index,
+                     trim_index,
+                     retention_lmdb_path
+                   ),
+                 {:ok, retention} <- ApplyProjectionRetention.finish(retention),
+                 :ok <- compact_apply_projection_retention(root_dir, trim_index, retention),
+                 :ok <-
+                   relocate_query_rows_after_rewrite(
+                     ctx,
+                     shard_index,
+                     relocation_lmdb_paths,
+                     expiry_cutoff_ms
+                   ) do
+              :ok
+            else
+              {:error, reason} -> {:error, {:compact_apply_projection_log_failed, reason}}
+              other -> {:error, {:compact_apply_projection_log_failed, other}}
+            end
+          after
+            _ = ApplyProjectionRetention.cleanup(retention)
           end
+        else
+          {:error, reason} -> {:error, {:compact_apply_projection_log_failed, reason}}
+          other -> {:error, {:compact_apply_projection_log_failed, other}}
         end
       rescue
         error -> {:error, {:compact_apply_projection_log_failed, error}}
       end
 
-      defp collect_apply_projection_retention_batches(
+      defp compact_apply_projection_log(
+             _root_dir,
+             _ctx,
+             _shard_index,
+             _trim_index,
+             _retention_lmdb_path,
+             _relocation_lmdb_paths
+           ),
+           do: {:error, {:compact_apply_projection_log_failed, :invalid_relocation_lmdb_paths}}
+
+      defp relocate_query_rows_after_rewrite(
+             ctx,
+             shard_index,
+             lmdb_paths,
+             expiry_cutoff_ms
+           ) do
+        lmdb_paths
+        |> Enum.uniq()
+        |> Enum.reduce_while(:ok, fn
+          lmdb_path, :ok when is_binary(lmdb_path) and lmdb_path != "" ->
+            case QueryRowCompaction.relocate_after_rewrite(
+                   ctx,
+                   shard_index,
+                   lmdb_path,
+                   expiry_cutoff_ms
+                 ) do
+              :ok -> {:cont, :ok}
+              {:error, _reason} = error -> {:halt, error}
+            end
+
+          _invalid, :ok ->
+            {:halt, {:error, :invalid_relocation_lmdb_path}}
+        end)
+      end
+
+      defp compact_apply_projection_retention(root_dir, trim_index, retention) do
+        root = root_dir |> apply_projection_root() |> to_charlist()
+
+        case ApplyProjectionRetention.mode(retention) do
+          :memory ->
+            with {:ok, batches} <- ApplyProjectionRetention.memory_batches(retention) do
+              normalize_apply_projection_compaction_result(
+                :ferricstore_waraft_spike_segment_log.compact_apply_projection(
+                  root,
+                  trim_index,
+                  batches
+                )
+              )
+            end
+
+          :disk ->
+            page = fn cursor ->
+              ApplyProjectionRetention.page(
+                retention,
+                cursor,
+                512,
+                64 * 1_024 * 1_024
+              )
+            end
+
+            normalize_apply_projection_compaction_result(
+              :ferricstore_waraft_spike_segment_log.compact_apply_projection_stream(
+                root,
+                trim_index,
+                page
+              )
+            )
+        end
+      end
+
+      defp normalize_apply_projection_compaction_result(:ok), do: :ok
+
+      defp normalize_apply_projection_compaction_result({:error, _reason} = error), do: error
+
+      defp normalize_apply_projection_compaction_result(other),
+        do: {:error, {:invalid_apply_projection_compaction_result, other}}
+
+      defp collect_apply_projection_retention(
+             retention,
              ctx,
              shard_index,
              trim_index,
@@ -772,41 +896,41 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
            ) do
         expiry_cutoff_ms = storage_expiry_cutoff_ms()
 
-        with {:ok, keydir_entries} <-
+        with {:ok, retention} <-
                collect_apply_projection_keydir_retention(
+                 retention,
                  ctx,
                  shard_index,
                  trim_index,
                  expiry_cutoff_ms
                ),
-             {:ok, pin_entries} <-
+             {:ok, retention} <-
                collect_apply_projection_pin_retention(
+                 retention,
                  ctx,
                  shard_index,
                  trim_index,
                  retention_lmdb_path,
                  expiry_cutoff_ms
                ),
-             {:ok, entries_by_ref} <-
-               merge_apply_projection_retention_entries(keydir_entries, pin_entries) do
-          batches =
-            entries_by_ref
-            |> Enum.group_by(fn {{index, _key}, _entry} -> index end)
-            |> Enum.sort_by(fn {index, _entries} -> index end)
-            |> Enum.map(fn {index, entries} ->
-              retained_entries =
-                entries
-                |> Enum.map(fn {_ref, entry} -> entry end)
-                |> Enum.sort_by(&elem(&1, 0))
-
-              {{:raft_log_pos, index, 0}, retained_entries}
-            end)
-
-          {:ok, batches}
+             {:ok, retention} <-
+               QueryRowCompaction.stream_retention_entries(
+                 ctx,
+                 shard_index,
+                 retention_lmdb_path,
+                 trim_index,
+                 expiry_cutoff_ms,
+                 retention,
+                 fn entries, current ->
+                   ApplyProjectionRetention.put_many(current, entries)
+                 end
+               ) do
+          {:ok, retention}
         end
       end
 
       defp collect_apply_projection_keydir_retention(
+             retention,
              ctx,
              shard_index,
              trim_index,
@@ -814,7 +938,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
            ) do
         keydir = elem(ctx.keydir_refs, shard_index)
 
-        case reduce_keydir_rows_while(keydir, [], fn
+        case reduce_keydir_rows_while(keydir, retention, fn
                {key, value, expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
                 _value_size},
                acc
@@ -828,8 +952,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                           value,
                           expire_at_ms
                         ) do
-                     {:ok, entry} -> {:cont, [{{index, key}, entry} | acc]}
-                     {:error, reason} -> {:halt, {:error, reason}}
+                     {:ok, entry} ->
+                       case ApplyProjectionRetention.put(acc, {{index, key}, entry}) do
+                         {:ok, next} -> {:cont, next}
+                         {:error, reason} -> {:halt, {:error, reason}}
+                       end
+
+                     {:error, reason} ->
+                       {:halt, {:error, reason}}
                    end
                  else
                    {:cont, acc}
@@ -838,13 +968,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                _row, acc ->
                  {:cont, acc}
              end) do
-          {:ok, entries} -> {:ok, Enum.reverse(entries)}
+          {:ok, retention} -> {:ok, retention}
           :unavailable -> {:error, {:segment_keydir_unavailable, shard_index}}
           {:error, _reason} = error -> error
         end
       end
 
       defp collect_apply_projection_pin_retention(
+             retention,
              ctx,
              shard_index,
              trim_index,
@@ -857,7 +988,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
           lmdb_path,
           trim_index,
           <<>>,
-          [],
+          retention,
           expiry_cutoff_ms
         )
       end
@@ -887,7 +1018,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                    expiry_cutoff_ms
                  ) do
               {:ok, next_acc} when done? ->
-                {:ok, Enum.reverse(next_acc)}
+                {:ok, next_acc}
 
               {:ok, next_acc} ->
                 do_collect_apply_projection_pin_retention(
@@ -945,8 +1076,14 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
                        nil,
                        expire_at_ms
                      ) do
-                  {:ok, entry} -> {:cont, {:ok, [{{index, key}, entry} | entries]}}
-                  {:error, reason} -> {:halt, {:error, reason}}
+                  {:ok, entry} ->
+                    case ApplyProjectionRetention.put(entries, {{index, key}, entry}) do
+                      {:ok, next} -> {:cont, {:ok, next}}
+                      {:error, reason} -> {:halt, {:error, reason}}
+                    end
+
+                  {:error, reason} ->
+                    {:halt, {:error, reason}}
                 end
 
               :changed_or_deleted ->
@@ -1000,25 +1137,6 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.Metadata do
           {:error, reason} ->
             {:error, {:apply_projection_retention_read_failed, key, index, reason}}
         end
-      end
-
-      defp merge_apply_projection_retention_entries(left, right) do
-        Enum.reduce_while(left ++ right, {:ok, %{}}, fn
-          {ref, entry}, {:ok, acc} ->
-            case Map.fetch(acc, ref) do
-              :error ->
-                {:cont, {:ok, Map.put(acc, ref, entry)}}
-
-              {:ok, ^entry} ->
-                {:cont, {:ok, acc}}
-
-              {:ok, existing} ->
-                {:halt, {:error, {:conflicting_apply_projection_retention, ref, existing, entry}}}
-            end
-
-          invalid, _acc ->
-            {:halt, {:error, {:bad_apply_projection_retention_entry, invalid}}}
-        end)
       end
 
       defp relocate_segment_projection_keydir(_ctx, _shard_index, _projection_root, []), do: :ok

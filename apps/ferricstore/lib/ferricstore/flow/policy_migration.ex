@@ -5,6 +5,8 @@ defmodule Ferricstore.Flow.PolicyMigration do
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBMirror
+  alias Ferricstore.Flow.Query.QueryRecordStore
+  alias Ferricstore.Flow.RecordIdentity
   alias Ferricstore.Store.Router
   alias Ferricstore.TermCodec
 
@@ -590,44 +592,32 @@ defmodule Ferricstore.Flow.PolicyMigration do
   defp state_record_value_from_lmdb(ctx, shard_index, state_key) do
     path = lmdb_path(ctx, shard_index)
 
-    case LMDB.get(path, state_key) do
-      {:ok, blob} ->
-        case LMDB.decode_value(blob, System.system_time(:millisecond)) do
-          {:ok, value} when is_binary(value) -> validate_state_record_value(value, state_key)
-          :expired -> missing_state_record_value(ctx, shard_index, state_key)
-          _invalid -> {:error, :corrupt_policy_catalog_state_projection}
-        end
+    case QueryRecordStore.read_encoded_many(
+           ctx,
+           shard_index,
+           path,
+           [state_key],
+           System.system_time(:millisecond),
+           QueryRecordStore.max_input_bytes(ctx),
+           include_expired: true
+         ) do
+      {:ok, [value], true} when is_binary(value) ->
+        validate_state_record_value(value, state_key)
 
-      :not_found ->
-        state_record_value_from_cold_park(ctx, shard_index, state_key)
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  defp state_record_value_from_cold_park(ctx, shard_index, state_key) do
-    path = lmdb_path(ctx, shard_index)
-    park_key = LMDB.cold_park_key_for_state_key(state_key)
-
-    case LMDB.get(path, park_key) do
-      {:ok, park_blob} ->
-        case LMDB.decode_cold_park(park_blob) do
-          {:ok, %{state_value: value}} when is_binary(value) ->
-            validate_state_record_value(value, state_key)
-
-          {:ok, _park_without_value} ->
-            {:error, :policy_catalog_cold_state_projection_pending}
-
-          _invalid ->
-            {:error, :corrupt_policy_catalog_cold_state_projection}
-        end
-
-      :not_found ->
+      {:ok, [nil], true} ->
         missing_state_record_value(ctx, shard_index, state_key)
 
-      {:error, _reason} = error ->
-        error
+      {:error, :query_hydration_batch_too_large} ->
+        {:error, :policy_catalog_state_record_too_large}
+
+      {:error, :query_storage_inconsistent} ->
+        {:error, :corrupt_policy_catalog_state_projection}
+
+      {:error, :query_storage_unavailable} ->
+        {:error, :policy_catalog_primary_unavailable}
+
+      _invalid ->
+        {:error, :corrupt_policy_catalog_state_projection}
     end
   end
 
@@ -646,8 +636,7 @@ defmodule Ferricstore.Flow.PolicyMigration do
   defp validate_state_record_value(value, state_key) do
     record = Flow.decode_record(value)
 
-    if is_map(record) and is_binary(Map.get(record, :id)) and
-         Keys.state_key(record.id, Map.get(record, :partition_key)) == state_key do
+    if is_map(record) and RecordIdentity.owns_state_key?(record, state_key) do
       {:ok, value}
     else
       {:error, :corrupt_policy_catalog_state_record}

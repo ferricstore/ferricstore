@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.BackfillSourceTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.{Keys, LMDB, PolicyMigration}
+  alias Ferricstore.Flow.{Keys, LMDB, PolicyMigration, StorageScope}
   alias Ferricstore.Flow.Query.BackfillSource
 
   setup do
@@ -198,6 +198,37 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
              )
   end
 
+  test "binds shared source records to their sealed physical scope", %{ctx: ctx} do
+    build_id = "shared-owner"
+    scope = <<42::unsigned-big-64>>
+    assert {:ok, physical_partition} = StorageScope.physical_partition_key("tenant-a", scope)
+    state_key = Keys.state_key("candidate", physical_partition)
+    put_catalog_member!(ctx, "invoice", state_key, 0)
+    snapshot_all!(ctx, build_id, 1)
+
+    valid = %{
+      id: "candidate",
+      partition_key: physical_partition,
+      system_metadata: scope_metadata(42)
+    }
+
+    read_entries = fn _ctx, 0, [^state_key] -> {:ok, [{"encoded", 0}]} end
+
+    assert {:ok, %{records: [%{record: ^valid}]}} =
+             BackfillSource.page(ctx, 0, build_id, "", 1, 1_024,
+               read_entries_fun: read_entries,
+               decode_record_fun: fn "encoded" -> {:ok, valid} end
+             )
+
+    forged = Map.put(valid, :system_metadata, scope_metadata(99))
+
+    assert {:error, :corrupt_query_backfill_record} =
+             BackfillSource.page(ctx, 0, build_id, "", 1, 1_024,
+               read_entries_fun: read_entries,
+               decode_record_fun: fn "encoded" -> {:ok, forged} end
+             )
+  end
+
   test "rejects staging cursors that exceed the LMDB key boundary", %{ctx: ctx} do
     build_id = "bounded-cursor"
     cursor = BackfillSource.staging_prefix(build_id) <> String.duplicate("x", 512)
@@ -294,6 +325,8 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
     }
     |> Ferricstore.Flow.encode_record()
   end
+
+  defp scope_metadata(value), do: %{0x8001 => {1, :uint64, :isolation_scope, value}}
 
   defp lmdb_path(ctx) do
     ctx.data_dir

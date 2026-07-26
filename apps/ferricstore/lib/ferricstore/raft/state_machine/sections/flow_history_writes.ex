@@ -21,6 +21,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
       alias Ferricstore.Flow.Keys, as: FlowKeys
+      alias Ferricstore.Flow.Query.{QueryRecordStore, QueryRowCodec, QueryRowStore}
       alias Ferricstore.Flow.RetryPolicy
       alias Ferricstore.HLC
 
@@ -43,6 +44,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       alias Ferricstore.Store.Shard.Transaction, as: ShardTransaction
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
+
+      @flow_lmdb_hydration_batch_size 16
+      @flow_lmdb_hydration_max_bytes 1_073_741_824
+      @flow_lmdb_presence_batch_size 256
 
       defp flow_claim_after_history_put_batch(state, plans) do
         records =
@@ -603,7 +608,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
         state_key = FlowKeys.state_key(id, partition_key)
         history_key = FlowKeys.history_key(id, partition_key)
 
-        with :ok <- flow_validate_key_size(state_key),
+        with :ok <- Ferricstore.Flow.Query.QueryRowCodec.validate_record(state_key, record),
+             :ok <- flow_validate_key_size(state_key),
              :ok <- flow_validate_key_size(history_key),
              :ok <-
                flow_validate_key_size(FlowKeys.state_index_key(type, flow_state, partition_key)),
@@ -627,9 +633,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       end
 
       defp flow_validate_terminal_state_index_key(%{type: type, state: flow_state} = record) do
-        type
-        |> FlowKeys.state_index_key(flow_state, Map.get(record, :partition_key))
-        |> flow_validate_key_size()
+        partition_key = Map.get(record, :partition_key)
+
+        with :ok <- flow_validate_query_row(record) do
+          type
+          |> FlowKeys.state_index_key(flow_state, partition_key)
+          |> flow_validate_key_size()
+        end
       end
 
       defp flow_validate_claim_next_record_keys(
@@ -637,12 +647,20 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
            ) do
         partition_key = Map.get(record, :partition_key)
 
-        with :ok <-
+        with :ok <- flow_validate_query_row(record),
+             :ok <-
                flow_validate_key_size(FlowKeys.state_index_key(type, flow_state, partition_key)),
              :ok <- flow_validate_due_key(record, type, flow_state, priority, partition_key) do
           flow_validate_running_index_keys(record, type, partition_key)
         end
       end
+
+      defp flow_validate_query_row(%{id: id} = record) when is_binary(id) do
+        state_key = FlowKeys.state_key(id, Map.get(record, :partition_key))
+        Ferricstore.Flow.Query.QueryRowCodec.validate_record(state_key, record)
+      end
+
+      defp flow_validate_query_row(_record), do: {:error, "ERR invalid flow query metadata"}
 
       defp flow_validate_due_key(record, type, flow_state, priority, partition_key) do
         case Map.get(record, :next_run_at_ms) do
@@ -876,148 +894,90 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       defp flow_read_lmdb_records(_state, []), do: []
 
       defp flow_read_lmdb_records(state, keys) do
-        pending = Process.get(:sm_pending_lmdb_values, %{})
-
-        {results, lmdb_keys} =
-          keys
-          |> Enum.with_index()
-          |> Enum.reduce({%{}, []}, fn {key, idx}, {result_acc, read_acc} ->
-            if Map.has_key?(pending, key) do
-              result = flow_decode_pending_lmdb_record(pending, key)
-              {Map.put(result_acc, idx, result), read_acc}
-            else
-              {result_acc, [{idx, key} | read_acc]}
-            end
-          end)
-
-        lmdb_values =
-          flow_lmdb_get_many(
-            state,
-            lmdb_keys
-            |> Enum.reverse()
-            |> Enum.map(fn {_idx, key} -> key end)
-          )
-
-        results =
-          lmdb_keys
-          |> Enum.reverse()
-          |> Enum.zip(lmdb_values)
-          |> Enum.reduce(results, fn {{idx, _key}, result}, acc -> Map.put(acc, idx, result) end)
-
-        for idx <- 0..(length(keys) - 1)//1, do: Map.get(results, idx, :miss)
+        flow_read_lmdb_records_at(state, keys, apply_now_ms(), [])
       end
 
-      defp flow_lmdb_get_many(_state, []), do: []
+      defp flow_read_lmdb_records_including_expired(state, keys) do
+        flow_read_lmdb_records_at(state, keys, 0, include_expired: true)
+      end
 
-      defp flow_lmdb_get_many(state, keys) do
-        case Ferricstore.Flow.LMDB.get_many(flow_lmdb_record_path(state), keys) do
-          {:ok, results} ->
-            keys
-            |> Enum.zip(results)
-            |> Enum.map(fn
-              {_key, {:ok, blob}} ->
-                flow_decode_lmdb_blob(blob)
+      defp flow_read_lmdb_records_at(state, keys, now_ms, opts) do
+        ctx = instance_ctx_for_state(state)
+        do_flow_read_lmdb_records(ctx, state, keys, now_ms, opts, [])
+      end
 
-              {key, :not_found} ->
-                flow_read_lmdb_cold_park_record(state, key)
+      defp do_flow_read_lmdb_records(_ctx, _state, [], _now_ms, _opts, acc),
+        do: acc |> Enum.reverse() |> List.flatten()
 
-              {_key, {:error, _reason}} ->
-                :miss
-            end)
+      defp do_flow_read_lmdb_records(ctx, state, keys, now_ms, opts, acc) do
+        {batch, rest} = Enum.split(keys, @flow_lmdb_hydration_batch_size)
 
-          {:error, _reason} ->
-            Enum.map(keys, fn key ->
-              case Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), key) do
-                {:ok, blob} -> flow_decode_lmdb_blob(blob)
-                :not_found -> flow_read_lmdb_cold_park_record(state, key)
-                {:error, _reason} -> :miss
-              end
-            end)
+        max_input_bytes =
+          ctx
+          |> QueryRecordStore.max_input_bytes()
+          |> Kernel.*(length(batch))
+          |> min(@flow_lmdb_hydration_max_bytes)
+
+        case QueryRecordStore.read_many(
+               ctx,
+               state.shard_index,
+               flow_lmdb_record_path(state),
+               batch,
+               now_ms,
+               max_input_bytes,
+               opts
+             ) do
+          {:ok, records, true} when length(records) == length(batch) ->
+            results =
+              Enum.map(records, fn
+                record when is_map(record) -> {:ok, record}
+                nil -> :miss
+              end)
+
+            do_flow_read_lmdb_records(ctx, state, rest, now_ms, opts, [results | acc])
+
+          {:error, reason} ->
+            record_state_read_failure({:flow_query_record_read_failed, reason})
+            Enum.reverse(acc) |> List.flatten() |> Kernel.++(List.duplicate(:miss, length(keys)))
+
+          invalid ->
+            record_state_read_failure({:invalid_flow_query_record_read, invalid})
+            Enum.reverse(acc) |> List.flatten() |> Kernel.++(List.duplicate(:miss, length(keys)))
         end
       end
 
       defp flow_lmdb_records_present(_state, []), do: []
 
       defp flow_lmdb_records_present(state, keys) do
-        pending = Process.get(:sm_pending_lmdb_values, %{})
-
-        {results, lmdb_keys} =
-          keys
-          |> Enum.with_index()
-          |> Enum.reduce({%{}, []}, fn {key, idx}, {result_acc, read_acc} ->
-            if Map.has_key?(pending, key) do
-              result = flow_pending_lmdb_record_present?(pending, key)
-              {Map.put(result_acc, idx, result), read_acc}
-            else
-              {result_acc, [{idx, key} | read_acc]}
-            end
-          end)
-
-        lmdb_results =
-          flow_lmdb_get_many_present(
-            state,
-            lmdb_keys
-            |> Enum.reverse()
-            |> Enum.map(fn {_idx, key} -> key end)
-          )
-
-        results =
-          lmdb_keys
-          |> Enum.reverse()
-          |> Enum.zip(lmdb_results)
-          |> Enum.reduce(results, fn {{idx, _key}, present?}, acc ->
-            Map.put(acc, idx, present?)
-          end)
-
-        for idx <- 0..(length(keys) - 1)//1, do: Map.get(results, idx, false)
+        do_flow_lmdb_records_present(state, keys, apply_now_ms(), [])
       end
 
-      defp flow_lmdb_get_many_present(_state, []), do: []
+      defp do_flow_lmdb_records_present(_state, [], _now_ms, acc),
+        do: acc |> Enum.reverse() |> List.flatten()
 
-      defp flow_lmdb_get_many_present(state, keys) do
-        case Ferricstore.Flow.LMDB.get_many(flow_lmdb_record_path(state), keys) do
-          {:ok, results} ->
-            keys
-            |> Enum.zip(results)
-            |> Enum.map(fn
-              {_key, {:ok, blob}} ->
-                flow_lmdb_blob_present?(blob)
+      defp do_flow_lmdb_records_present(state, keys, now_ms, acc) do
+        {batch, rest} = Enum.split(keys, @flow_lmdb_presence_batch_size)
+        max_bytes = max(length(batch) * QueryRowCodec.max_encoded_bytes(), 1)
 
-              {key, :not_found} ->
-                flow_lmdb_cold_park_present?(state, key)
+        case QueryRowStore.read_many(
+               flow_lmdb_record_path(state),
+               batch,
+               now_ms,
+               max_bytes
+             ) do
+          {:ok, rows, _value_bytes, true} when length(rows) == length(batch) ->
+            present = Enum.map(rows, &(not is_nil(&1)))
+            do_flow_lmdb_records_present(state, rest, now_ms, [present | acc])
 
-              {_key, {:error, _reason}} ->
-                false
-            end)
+          {:error, reason} ->
+            record_state_read_failure({:flow_query_row_read_failed, reason})
+            Enum.reverse(acc) |> List.flatten() |> Kernel.++(List.duplicate(false, length(keys)))
 
-          {:error, _reason} ->
-            Enum.map(keys, fn key ->
-              case Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), key) do
-                {:ok, blob} -> flow_lmdb_blob_present?(blob)
-                :not_found -> flow_lmdb_cold_park_present?(state, key)
-                {:error, _reason} -> false
-              end
-            end)
+          invalid ->
+            record_state_read_failure({:invalid_flow_query_row_read, invalid})
+            Enum.reverse(acc) |> List.flatten() |> Kernel.++(List.duplicate(false, length(keys)))
         end
       end
-
-      defp flow_pending_lmdb_record_present?(pending, key) do
-        case Map.get(pending, key) do
-          {:put, blob} -> flow_lmdb_blob_present?(blob)
-          :delete -> false
-          _ -> false
-        end
-      end
-
-      defp flow_lmdb_blob_present?(blob) when is_binary(blob) do
-        case Ferricstore.Flow.LMDB.decode_value(blob, apply_now_ms()) do
-          {:ok, _value} -> true
-          :expired -> false
-          :error -> false
-        end
-      end
-
-      defp flow_lmdb_blob_present?(_blob), do: false
 
       defp flow_read_ets_record(state, key) do
         case flow_read_state_record_status(state, key) do
@@ -1072,17 +1032,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       end
 
       defp flow_read_lmdb_record(state, key) do
-        cond do
-          Map.has_key?(Process.get(:sm_pending_lmdb_values, %{}), key) ->
-            flow_decode_pending_lmdb_record(Process.get(:sm_pending_lmdb_values, %{}), key)
-
-          true ->
-            case Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), key) do
-              {:ok, blob} -> flow_decode_lmdb_blob(blob)
-              :not_found -> flow_read_lmdb_cold_park_record(state, key)
-              {:error, _reason} -> :miss
-            end
-        end
+        [result] = flow_read_lmdb_records(state, [key])
+        result
       end
     end
   end

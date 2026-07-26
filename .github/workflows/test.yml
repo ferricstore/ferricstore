@@ -125,6 +125,11 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
+      - name: Validate native query benchmark contracts
+        run: |
+          MIX_ENV=bench mix deps.get
+          MIX_ENV=bench BENCH_CANDIDATE_SECTION=smoke mix run --no-start bench/query_planner_native_read_candidates_bench.exs
+
       - name: Run Linux io_uring integration tests (required)
         env:
           FERRICSTORE_REQUIRE_IO_URING: "1"

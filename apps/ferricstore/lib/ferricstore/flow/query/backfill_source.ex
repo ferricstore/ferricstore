@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.BackfillSource do
   @moduledoc false
 
-  alias Ferricstore.Flow.{Keys, LMDB}
+  alias Ferricstore.Flow.{Keys, LMDB, RecordIdentity}
   alias Ferricstore.Flow.Query.SourceCatalog
   alias Ferricstore.Store.Router
 
@@ -452,16 +452,8 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
     _error -> {:error, :invalid_record}
   end
 
-  defp valid_record_owner?(record, state_key) do
-    case {Map.get(record, :id), Map.get(record, :partition_key)} do
-      {id, partition_key}
-      when is_binary(id) and (is_nil(partition_key) or is_binary(partition_key)) ->
-        Keys.state_key(id, partition_key) == state_key
-
-      _invalid ->
-        false
-    end
-  end
+  defp valid_record_owner?(record, state_key),
+    do: RecordIdentity.owns_state_key?(record, state_key)
 
   defp effective_page_items(ctx, max_items, max_bytes) do
     max_value_size =

@@ -1,18 +1,15 @@
 defmodule Ferricstore.Flow.Query.IndexValidation.DataPasses do
   @moduledoc false
 
-  alias Ferricstore.Flow.{Keys, LMDB}
+  alias Ferricstore.Flow.LMDB
 
   alias Ferricstore.Flow.Query.{
     CompositeCounter,
     CompositeIndex,
-    Field,
     IndexDefinition,
-    Limits
+    QueryRow,
+    QueryRowCodec
   }
-
-  alias Ferricstore.Flow.LMDBWriter.ProjectionOps
-  alias Ferricstore.TermCodec
 
   @max_read_keys 2_048
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
@@ -46,7 +43,7 @@ defmodule Ferricstore.Flow.Query.IndexValidation.DataPasses do
 
     Enum.zip([state_keys, states, reverses])
     |> Enum.reduce_while({:ok, []}, fn {state_key, state_result, reverse_result}, {:ok, acc} ->
-      with {:ok, projected} <- decode_projected_state(state_result),
+      with {:ok, projected} <- decode_projected_state(state_result, state_key),
            {:ok, reverse_keys} <- decode_reverse_result(reverse_result, state_key),
            {:ok, expected} <- expected_entries(definitions, projected, state_key) do
         candidate_reverse =
@@ -193,7 +190,8 @@ defmodule Ferricstore.Flow.Query.IndexValidation.DataPasses do
         {:error, :orphan_index_entry}
 
       state_result ->
-        with {:ok, projected} when not is_nil(projected) <- decode_projected_state(state_result),
+        with {:ok, projected} when not is_nil(projected) <-
+               decode_projected_state(state_result, decoded.state_key),
              {:ok, expected} <- expected_entries([definition], projected, decoded.state_key),
              %{value: ^value} <- Enum.find(expected, &(&1.key == key)),
              {:ok, prefixes} <- CompositeCounter.prefixes_for_validated_key(definition, key) do
@@ -572,25 +570,19 @@ defmodule Ferricstore.Flow.Query.IndexValidation.DataPasses do
   defp validate_counter_witness(_entries, _exhausted, _bytes, _prefix, _max_bytes),
     do: {:error, :invalid_query_index_validation_read}
 
-  defp decode_projected_state(:not_found), do: {:ok, nil}
+  defp decode_projected_state(:not_found, _state_key), do: {:ok, nil}
 
-  defp decode_projected_state({:ok, blob}) when is_binary(blob) do
-    with {:ok, {expire_at_ms, encoded}} <- TermCodec.decode(blob),
-         true <- is_integer(expire_at_ms) and expire_at_ms >= 0 and is_binary(encoded),
-         record when is_map(record) <- Ferricstore.Flow.decode_record(encoded) do
-      {:ok,
-       %{
-         record: record,
-         expire_at_ms: ProjectionOps.flow_state_projection_expire_at(record, expire_at_ms)
-       }}
-    else
+  defp decode_projected_state({:ok, blob}, state_key)
+       when is_binary(blob) and is_binary(state_key) do
+    case QueryRowCodec.decode(blob, state_key) do
+      {:ok, %QueryRow{} = row} -> {:ok, row}
       _invalid -> {:error, :invalid_projected_state}
     end
   rescue
     _error -> {:error, :invalid_projected_state}
   end
 
-  defp decode_projected_state(_invalid), do: {:error, :invalid_projected_state}
+  defp decode_projected_state(_invalid, _state_key), do: {:error, :invalid_projected_state}
 
   defp decode_reverse_result(:not_found, _state_key), do: {:ok, []}
 
@@ -605,46 +597,22 @@ defmodule Ferricstore.Flow.Query.IndexValidation.DataPasses do
 
   defp expected_entries(_definitions, nil, _state_key), do: {:ok, []}
 
-  defp expected_entries(definitions, projected, state_key) do
-    with :ok <- validate_projected_identity(projected.record, state_key) do
-      Enum.reduce_while(definitions, {:ok, []}, fn definition, {:ok, acc} ->
-        case CompositeIndex.entries_validated(
-               definition,
-               projected.record,
-               state_key,
-               projected.expire_at_ms
-             ) do
-          {:ok, entries} -> {:cont, {:ok, :lists.reverse(entries, acc)}}
-          {:error, :unscoped_record} -> {:cont, {:ok, acc}}
-          {:error, _reason} -> {:halt, {:error, :invalid_projected_state}}
-        end
-      end)
-      |> case do
-        {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
-        {:error, _reason} = error -> error
+  defp expected_entries(definitions, %QueryRow{state_key: state_key} = row, state_key) do
+    Enum.reduce_while(definitions, {:ok, []}, fn definition, {:ok, acc} ->
+      case CompositeIndex.entries_from_query_row_validated(definition, row) do
+        {:ok, entries} -> {:cont, {:ok, :lists.reverse(entries, acc)}}
+        {:error, :unscoped_record} -> {:cont, {:ok, acc}}
+        {:error, _reason} -> {:halt, {:error, :invalid_projected_state}}
       end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
     end
   end
 
-  defp validate_projected_identity(record, state_key) do
-    with {:ok, id} <- Field.fetch(record, :run_id),
-         true <- Limits.valid_run_id?(id),
-         {:ok, partition_key} <- projected_partition_key(record),
-         true <- is_nil(partition_key) or Limits.valid_partition_key?(partition_key),
-         true <- Keys.state_key(id, partition_key) == state_key do
-      :ok
-    else
-      _invalid -> {:error, :state_key_identity_mismatch}
-    end
-  end
-
-  defp projected_partition_key(record) do
-    case Field.fetch(record, :partition_key) do
-      :missing -> {:ok, nil}
-      {:ok, nil} -> {:ok, nil}
-      {:ok, partition_key} -> {:ok, partition_key}
-    end
-  end
+  defp expected_entries(_definitions, _projected, _state_key),
+    do: {:error, :invalid_projected_state}
 
   defp bounded_get_many(_get_many, _path, [], _max_bytes), do: {:ok, []}
 

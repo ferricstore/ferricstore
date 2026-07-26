@@ -444,10 +444,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                     lease_deadline_ms: 0
                 }
                 |> flow_put_record_value_refs(value_refs)
-                |> flow_apply_attribute_updates(attrs)
-                |> flow_stamp_terminal_retention(now_ms)
 
-              with :ok <- flow_validate_record_keys(next) do
+              with {:ok, next} <- flow_apply_attribute_updates(next, attrs),
+                   next = flow_stamp_terminal_retention(next, now_ms),
+                   :ok <- flow_validate_record_keys(next) do
                 {:ok, record, next}
               end
             end
@@ -512,9 +512,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                   next_run_at_ms: deadline_ms
               }
               |> flow_put_record_value_refs(value_refs)
-              |> flow_apply_attribute_updates(attrs)
 
-            with :ok <- flow_validate_claim_next_record_keys(next) do
+            with {:ok, next} <- flow_apply_attribute_updates(next, attrs),
+                 :ok <- flow_validate_claim_next_record_keys(next) do
               {:ok, record, next}
             end
           end
@@ -602,9 +602,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                   lease_deadline_ms: 0
               }
               |> flow_put_record_value_refs(value_refs)
-              |> flow_apply_attribute_updates(attrs)
 
-            with :ok <- flow_validate_claim_next_record_keys(next) do
+            with {:ok, next} <- flow_apply_attribute_updates(next, attrs),
+                 :ok <- flow_validate_claim_next_record_keys(next) do
               {:ok, record, next}
             end
           end
@@ -1024,13 +1024,12 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                     run_state: nil
                 }
                 |> flow_put_record_value_refs(value_refs)
-                |> flow_apply_attribute_updates(attrs)
-                |> flow_stamp_terminal_retention(now_ms)
 
-              next = flow_stamp_state_enter_seq_on_change(state, record, next)
-              next = flow_refresh_indexed_attributes(state, next)
-
-              with :ok <- flow_require_fifo_entry(state, attrs, next, false),
+              with {:ok, next} <- flow_apply_attribute_updates(next, attrs),
+                   next = flow_stamp_terminal_retention(next, now_ms),
+                   next = flow_stamp_state_enter_seq_on_change(state, record, next),
+                   next = flow_refresh_indexed_attributes(state, next),
+                   :ok <- flow_require_fifo_entry(state, attrs, next, false),
                    :ok <- flow_validate_claim_next_record_keys(next) do
                 {:ok, record, next,
                  flow_retry_history_meta(record, next, retry_policy, retry_decision)}
@@ -1269,10 +1268,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                     next_run_at_ms: nil
                 }
                 |> flow_put_record_value_refs(value_refs)
-                |> flow_apply_attribute_updates(attrs)
-                |> flow_stamp_terminal_retention(now_ms)
 
-              with :ok <- flow_validate_terminal_state_index_key(next) do
+              with {:ok, next} <- flow_apply_attribute_updates(next, attrs),
+                   next = flow_stamp_terminal_retention(next, now_ms),
+                   :ok <- flow_validate_terminal_state_index_key(next) do
                 {:ok, record, next}
               end
             end
@@ -1419,10 +1418,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
                   next_run_at_ms: nil
               }
               |> flow_put_record_value_refs(value_refs)
-              |> flow_apply_attribute_updates(attrs)
-              |> flow_stamp_terminal_retention(now_ms)
 
-            with :ok <- flow_validate_terminal_state_index_key(next) do
+            with {:ok, next} <- flow_apply_attribute_updates(next, attrs),
+                 next = flow_stamp_terminal_retention(next, now_ms),
+                 :ok <- flow_validate_terminal_state_index_key(next) do
               {:ok, record, next}
             end
           end

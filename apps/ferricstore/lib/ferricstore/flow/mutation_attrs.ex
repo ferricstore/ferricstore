@@ -1,7 +1,8 @@
 defmodule Ferricstore.Flow.MutationAttrs do
   @moduledoc false
 
-  alias Ferricstore.Flow.{Attributes, Internal, RetryPolicy, StateMeta}
+  alias Ferricstore.Flow.{Attributes, Internal, Keys, RetryPolicy, StateMeta}
+  alias Ferricstore.Flow.Query.QueryRowCodec
   alias Ferricstore.Store.Router
 
   import Ferricstore.Flow.Options,
@@ -20,6 +21,11 @@ defmodule Ferricstore.Flow.MutationAttrs do
   @default_max_batch_items 1_000
   @max_batch_items 100_000
   @max_exact_integer 9_007_199_254_740_991
+  @query_row_admission_indexed_attributes Enum.map(1..3, fn index ->
+                                            String.duplicate("a", 63) <>
+                                              Integer.to_string(index)
+                                          end)
+  @query_row_admission_indexed_state_meta String.duplicate("m", 64)
 
   def validate_opts(opts, allowed \\ []) do
     cond do
@@ -144,7 +150,9 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_attr(:now_ms, now)
         |> maybe_put_attr(:run_at_ms, run_at_ms)
 
-      {:ok, attrs}
+      with :ok <- validate_create_query_row(attrs) do
+        {:ok, attrs}
+      end
     end
   end
 
@@ -206,7 +214,9 @@ defmodule Ferricstore.Flow.MutationAttrs do
         |> maybe_put_state_meta_update_opts(initial_state, state_meta)
         |> maybe_put_attr(:now_ms, now)
 
-      {:ok, attrs}
+      with :ok <- validate_create_query_row(attrs) do
+        {:ok, attrs}
+      end
     end
   end
 
@@ -1210,4 +1220,70 @@ defmodule Ferricstore.Flow.MutationAttrs do
     |> maybe_put_attr(:state_meta_state, state)
     |> maybe_put_attr(:state_meta_update, meta)
   end
+
+  defp validate_create_query_row(%{id: id, partition_key: partition_key} = attrs) do
+    now_ms = Map.get(attrs, :now_ms, 0) || 0
+
+    record =
+      %{
+        id: id,
+        type: Map.get(attrs, :type),
+        state: Map.get(attrs, :state),
+        version: 1,
+        priority: Map.get(attrs, :priority, @default_priority),
+        partition_key: partition_key,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        next_run_at_ms: Map.get(attrs, :run_at_ms, now_ms),
+        lease_deadline_ms: 0,
+        attempts: 0,
+        run_state: Map.get(attrs, :run_state),
+        max_active_ms: Map.get(attrs, :max_active_ms),
+        state_enter_seq: 0,
+        history_max_events: 0,
+        history_hot_max_events: 0,
+        parent_flow_id: Map.get(attrs, :parent_flow_id),
+        root_flow_id: Map.get(attrs, :root_flow_id) || id,
+        correlation_id: Map.get(attrs, :correlation_id)
+      }
+      |> maybe_put_attr(:attributes, Map.get(attrs, :attributes))
+      |> maybe_put_create_state_meta(attrs)
+      |> reserve_create_projection_config()
+
+    state_key = Keys.state_key(id, partition_key)
+
+    with :ok <- validate_key_size(state_key) do
+      QueryRowCodec.validate_record(state_key, record)
+    end
+  end
+
+  defp validate_create_query_row(_attrs), do: {:error, "ERR invalid flow query metadata"}
+
+  defp maybe_put_create_state_meta(record, %{state_meta_update: update} = attrs)
+       when is_map(update) and map_size(update) > 0 do
+    state =
+      Map.get(attrs, :state_meta_state) || Map.get(attrs, :run_state) || Map.get(attrs, :state)
+
+    Map.put(record, :state_meta, %{state => update})
+  end
+
+  defp maybe_put_create_state_meta(record, _attrs), do: record
+
+  defp reserve_create_projection_config(record) do
+    record
+    |> maybe_reserve_attribute_projection_config()
+    |> maybe_reserve_state_meta_projection_config()
+  end
+
+  defp maybe_reserve_attribute_projection_config(%{attributes: attributes} = record)
+       when is_map(attributes) and map_size(attributes) > 0,
+       do: Map.put(record, :indexed_attributes, @query_row_admission_indexed_attributes)
+
+  defp maybe_reserve_attribute_projection_config(record), do: record
+
+  defp maybe_reserve_state_meta_projection_config(%{state_meta: state_meta} = record)
+       when is_map(state_meta) and map_size(state_meta) > 0,
+       do: Map.put(record, :indexed_state_meta, @query_row_admission_indexed_state_meta)
+
+  defp maybe_reserve_state_meta_projection_config(record), do: record
 end

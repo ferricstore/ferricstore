@@ -66,6 +66,7 @@ pub struct RecordMetadata {
 pub struct RawCopyResult {
     pub offset: u64,
     pub record_size: u64,
+    pub value_size: u64,
     pub is_tombstone: bool,
 }
 

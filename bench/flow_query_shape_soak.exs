@@ -93,7 +93,8 @@ defmodule Ferricstore.Flow.Query.ShapeSoak do
           index_entries: fixture.projection.written_entries,
           write_operations: fixture.projection.write_ops,
           written_bytes: fixture.projection.written_bytes,
-          source_logical_bytes: fixture.source_bytes
+          source_logical_bytes: fixture.source_bytes,
+          query_row_logical_bytes: fixture.query_row_bytes
         },
         scenarios: Enum.map(scenarios, &scenario_report/1),
         capacity: summarize(stats, target_qps),

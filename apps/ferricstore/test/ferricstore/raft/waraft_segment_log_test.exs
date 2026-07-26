@@ -136,5 +136,108 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     {:ok, Enum.reverse(entries)}
   end
 
+  test "validated disk reader reuses one segment handle for known locations" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-reader-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assert :ok =
+             :ferricstore_waraft_spike_segment_log.write_projection_batches_sync(
+               to_charlist(root),
+               [
+                 {{:raft_log_pos, 42, 0}, [{"a", "first", 0}]},
+                 {{:raft_log_pos, 43, 0}, [{"b", "second", 0}]}
+               ]
+             )
+
+    assert {:ok, {ordinal, first_offset, first_size}} =
+             :ferricstore_waraft_spike_segment_log.location_for_index(
+               to_charlist(root),
+               42
+             )
+
+    assert {:ok, {^ordinal, second_offset, second_size}} =
+             :ferricstore_waraft_spike_segment_log.location_for_index(
+               to_charlist(root),
+               43
+             )
+
+    assert {:error, {:segment_ordinal_mismatch, ^ordinal, wrong_ordinal}} =
+             :ferricstore_waraft_spike_segment_log.open_disk_reader(
+               to_charlist(root),
+               42,
+               ordinal + 1
+             )
+
+    assert wrong_ordinal == ordinal + 1
+
+    assert {:ok, reader} =
+             :ferricstore_waraft_spike_segment_log.open_disk_reader(
+               to_charlist(root),
+               42,
+               ordinal
+             )
+
+    try do
+      assert {:ok, {0, {:ferricstore_segment_apply_projection_batch, _, [{"a", "first", 0}]}}} =
+               :ferricstore_waraft_spike_segment_log.read_disk_reader(
+                 reader,
+                 42,
+                 first_offset,
+                 first_size
+               )
+
+      assert {:ok, {0, {:ferricstore_segment_apply_projection_batch, _, [{"b", "second", 0}]}}} =
+               :ferricstore_waraft_spike_segment_log.read_disk_reader(
+                 reader,
+                 43,
+                 second_offset,
+                 second_size
+               )
+
+      assert {:ok,
+              [
+                {0, {:ferricstore_segment_apply_projection_batch, _, [{"b", "second", 0}]}},
+                {0, {:ferricstore_segment_apply_projection_batch, _, [{"a", "first", 0}]}}
+              ]} =
+               :ferricstore_waraft_spike_segment_log.read_disk_reader_many(reader, [
+                 {43, second_offset, second_size},
+                 {42, first_offset, first_size}
+               ])
+
+      assert {:ok,
+              [
+                {0, {:ferricstore_segment_apply_projection_batch, _, [{"b", "second", 0}]}},
+                {0, {:ferricstore_segment_apply_projection_batch, _, [{"a", "first", 0}]}},
+                {0, {:ferricstore_segment_apply_projection_batch, _, [{"b", "second", 0}]}}
+              ]} =
+               :ferricstore_waraft_spike_segment_log.read_disk_reader_many(reader, [
+                 {43, second_offset, second_size},
+                 {42, first_offset, first_size},
+                 {43, second_offset, second_size}
+               ])
+    after
+      assert :ok = :ferricstore_waraft_spike_segment_log.close_disk_reader(reader)
+    end
+  end
+
+  test "validated disk reader coalesces adjacent frames before positional IO" do
+    source =
+      File.read!(
+        Path.expand(
+          "../../../src/ferricstore_waraft_spike_segment_log/sections/part_01.hrl",
+          __DIR__
+        )
+      )
+
+    assert source =~ "coalesce_adjacent_disk_reader_requests"
+    assert source =~ "file:pread(Fd, SpanLocations)"
+    refute source =~ "file:pread(Fd, Locations)"
+  end
+
   use Ferricstore.Raft.WARaftSegmentLogTest.Sections.DefaultSegmentSizeDoesNotRollOverDuringNormalHotBatches
 end

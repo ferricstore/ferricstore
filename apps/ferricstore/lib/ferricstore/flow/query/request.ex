@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.Query.Request do
   field identifiers throughout the pipeline.
   """
 
+  alias Ferricstore.Flow.Attributes
   alias Ferricstore.Flow.Query.{Field, Limits, RecordProjection, TupleCodec}
 
   import Bitwise
@@ -521,6 +522,14 @@ defmodule Ferricstore.Flow.Query.Request do
 
   defp validate_field_size(:run_id, value) when is_binary(value) do
     if Limits.valid_run_id?(value), do: :ok, else: {:error, :query_value_too_large}
+  end
+
+  defp validate_field_size({:attribute, _name}, value) when is_binary(value) do
+    if Attributes.valid_scalar?(value), do: :ok, else: {:error, :query_value_too_large}
+  end
+
+  defp validate_field_size({:state_meta, _state, _name}, value) when is_binary(value) do
+    if Attributes.valid_scalar?(value), do: :ok, else: {:error, :query_value_too_large}
   end
 
   defp validate_field_size(_field, value) when is_binary(value) do

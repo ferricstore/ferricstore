@@ -239,21 +239,21 @@ defmodule Ferricstore.FlowTest.Sections.FlowClaimDueDrainsHigherPrioritiesBefore
         park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key(state_key)
         assert {:ok, park_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, park_key)
 
-        assert {:ok, %{locator: locator, state_value: state_value} = park} =
+        assert {:ok, %{locator: locator} = park} =
                  Ferricstore.Flow.LMDB.decode_cold_park(park_blob)
 
-        assert is_binary(state_value)
+        refute Map.has_key?(park, :state_value)
 
-        bad_locator = %{locator | file_id: {:waraft_apply_projection, 999_999_999}}
+        assert {:ok, authoritative_value} =
+                 Ferricstore.Raft.WARaftSegmentReader.read_value_from_location_including_expired(
+                   ctx,
+                   shard_index,
+                   locator.file_id,
+                   state_key
+                 )
 
-        assert :ok =
-                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
-                   {:put, park_key,
-                    Ferricstore.Flow.LMDB.encode_cold_park(
-                      bad_locator,
-                      Map.delete(park, :locator)
-                    )}
-                 ])
+        assert %{id: ^id, version: version} = Ferricstore.Flow.decode_record(authoritative_value)
+        assert version == locator.version
 
         assert {:ok, fetched_cold} =
                  FerricStore.flow_get(id, flow_partition_opts(partition_key))

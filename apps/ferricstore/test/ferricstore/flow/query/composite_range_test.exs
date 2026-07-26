@@ -107,7 +107,7 @@ defmodule Ferricstore.Flow.Query.CompositeRangeTest do
 
     assert {:ok,
             [
-              {storage_key, "one", state_key, 1, 0, storage_bytes}
+              {storage_key, "one", state_key, 1, 0, storage_bytes, nil}
             ], true, scanned_bytes} =
              LMDB.composite_range_entries_bounded(
                path,
@@ -139,6 +139,40 @@ defmodule Ferricstore.Flow.Query.CompositeRangeTest do
                10,
                16_384
              )
+  end
+
+  test "fused LMDB range returns a validated covering record", %{path: path} do
+    definition =
+      IndexDefinition.new!(%{
+        id: "runs_by_state_updated_covering",
+        version: 1,
+        fields: [
+          {:partition_key, :asc},
+          {:state, :asc},
+          {:updated_at_ms, :desc}
+        ],
+        covering_fields: [:partition_key, :run_id, :state, :updated_at_ms, :version]
+      })
+
+    write_records!(path, definition, [record("one", "tenant-a", 100)])
+    assert {:ok, range} = CompositeRange.prefix(definition, ["tenant-a", "failed"])
+
+    assert {:ok,
+            %{
+              entries: [
+                %{
+                  id: "one",
+                  record_version: 1,
+                  covering_record: %{
+                    id: "one",
+                    partition_key: "tenant-a",
+                    state: "failed",
+                    updated_at_ms: 100,
+                    version: 1
+                  }
+                }
+              ]
+            }} = CompositeRangeReader.read(path, range, nil, 10, 16_384)
   end
 
   test "maps inclusive bounds correctly for an ascending ordered field", %{path: path} do

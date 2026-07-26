@@ -3,8 +3,9 @@ defmodule Ferricstore.Flow.HibernationTest do
   @moduletag :flow
   @moduletag :global_state
 
-  alias Ferricstore.Flow.{Hibernation, Keys, LMDB, Locator}
+  alias Ferricstore.Flow.{Hibernation, Keys, LMDB, Locator, StorageScope}
   alias Ferricstore.Flow.LMDBWriter.AfterFlush
+  alias Ferricstore.Flow.Query.QueryRowCodec
   alias Ferricstore.Raft.{ApplyContext, StateMachine}
 
   test "demotable requires far-future waiting unleased non-terminal flow" do
@@ -235,10 +236,17 @@ defmodule Ferricstore.Flow.HibernationTest do
 
   test "demotion ops include park row due row and reverse segment row" do
     ops = Hibernation.demotion_ops(candidate())
-    park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key("flow/state/tenant-1/flow-1")
+    state_key = Keys.state_key("flow-1", "tenant-1")
+    park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key(state_key)
 
     assert length(ops) >= 3
     assert Enum.any?(ops, &match?({:put, ^park_key, _value}, &1))
+
+    assert {:put, ^park_key, encoded_park} =
+             Enum.find(ops, &match?({:put, ^park_key, _value}, &1))
+
+    assert {:ok, park} = LMDB.decode_cold_park(encoded_park)
+    refute Map.has_key?(park, :state_value)
 
     assert Enum.any?(ops, fn
              {:put, key, ^park_key} -> String.starts_with?(key, "flow:due:v1:")
@@ -251,8 +259,7 @@ defmodule Ferricstore.Flow.HibernationTest do
 
     assert Enum.any?(ops, &match?({:put, _reverse_key, ^park_key}, &1))
 
-    active_reverse_key =
-      LMDB.active_by_state_key_key("flow/state/tenant-1/flow-1")
+    active_reverse_key = LMDB.active_by_state_key_key(state_key)
 
     assert {:put, ^active_reverse_key, active_reverse_value} =
              Enum.find(ops, &match?({:put, ^active_reverse_key, _value}, &1))
@@ -464,6 +471,27 @@ defmodule Ferricstore.Flow.HibernationTest do
 
     assert {:error, :active_index_reverse_owner_mismatch} =
              Hibernation.demotion_ops_result(candidate)
+  end
+
+  test "demotion binds the state key to sealed shared ownership" do
+    scope = <<42::unsigned-big-64>>
+    assert {:ok, physical_partition} = StorageScope.physical_partition_key("tenant-1", scope)
+
+    valid =
+      candidate()
+      |> put_in([:record, :partition_key], physical_partition)
+      |> put_in([:record, :state_key], Keys.state_key("flow-1", physical_partition))
+      |> put_in([:record, :system_metadata], scope_metadata(42))
+
+    assert {:ok, _ops} = Hibernation.demotion_ops_result(valid)
+
+    forged = put_in(valid, [:record, :system_metadata], scope_metadata(99))
+
+    mismatched =
+      put_in(valid, [:record, :state_key], Keys.state_key("flow-2", physical_partition))
+
+    assert {:error, :invalid_candidate} = Hibernation.demotion_ops_result(forged)
+    assert {:error, :invalid_candidate} = Hibernation.demotion_ops_result(mismatched)
   end
 
   test "Raft hibernation projection consumes the result planner with linear accumulation" do
@@ -1181,38 +1209,62 @@ defmodule Ferricstore.Flow.HibernationTest do
   end
 
   test "cold compaction relocation updates reverse segment row and park row" do
-    old_row = promotion_row()
+    old_row =
+      promotion_row()
+      |> put_in([:park, :state_key], Keys.state_key("flow-1", "tenant-1"))
+
+    state_key = old_row.park.state_key
+
+    assert {:ok, old_query_row} =
+             QueryRowCodec.encode(state_key, candidate().record, old_row.locator, 0)
 
     assert {:ok, new_row} =
              Hibernation.relocate_cold_row(old_row,
-               file_id: {:flow_state, 2},
+               file_id: 2,
                offset: 2_000,
                value_size: 300,
                segment_generation: 5
              )
 
-    assert {:ok, ops} = Hibernation.cold_compaction_ops(old_row, new_row)
+    assert {:ok, ops} =
+             Hibernation.cold_compaction_ops(old_row, new_row, old_query_row)
 
     assert {:compare, "flow:park:v1:key:abc", encoded_old_park} = Enum.at(ops, 0)
-    assert {:compare, old_reverse_key, "flow:park:v1:key:abc"} = Enum.at(ops, 1)
-    assert {:delete, ^old_reverse_key} = Enum.at(ops, 2)
-    assert {:put, new_reverse_key, "flow:park:v1:key:abc"} = Enum.at(ops, 3)
-    assert {:put, "flow:park:v1:key:abc", encoded_park} = Enum.at(ops, 4)
+    assert {:compare, ^state_key, ^old_query_row} = Enum.at(ops, 1)
+    assert {:compare, old_reverse_key, "flow:park:v1:key:abc"} = Enum.at(ops, 2)
+    assert {:delete, ^old_reverse_key} = Enum.at(ops, 3)
+    assert {:put, new_reverse_key, "flow:park:v1:key:abc"} = Enum.at(ops, 4)
+    assert {:put, "flow:park:v1:key:abc", encoded_park} = Enum.at(ops, 5)
+    assert {:put, ^state_key, relocated_query_row} = Enum.at(ops, 6)
     assert old_reverse_key != new_reverse_key
 
     assert {:ok, old_park} = Ferricstore.Flow.LMDB.decode_cold_park(encoded_old_park)
     assert old_park.locator == old_row.locator
     assert {:ok, park} = Ferricstore.Flow.LMDB.decode_cold_park(encoded_park)
     assert park.locator == new_row.locator
+    assert {:ok, %{locator: locator}} = QueryRowCodec.decode(relocated_query_row, state_key)
+    assert Locator.same_physical_record?(locator, new_row.locator)
+
+    refute Enum.any?(ops, fn op ->
+             op
+             |> Tuple.to_list()
+             |> Enum.any?(&(is_binary(&1) and String.starts_with?(&1, "flow-query-index:")))
+           end)
   end
 
   test "cold compaction refuses to update locator across logical generation" do
-    old_row = promotion_row()
+    old_row =
+      promotion_row()
+      |> put_in([:park, :state_key], Keys.state_key("flow-1", "tenant-1"))
+
     newer = %{old_row | locator: Locator.relocate!(old_row.locator, offset: 2_000)}
     newer = %{newer | locator: %{newer.locator | version: 2}}
 
+    assert {:ok, query_row} =
+             QueryRowCodec.encode(old_row.park.state_key, candidate().record, old_row.locator, 0)
+
     assert {:error, :logical_generation_mismatch} =
-             Hibernation.cold_compaction_ops(old_row, newer)
+             Hibernation.cold_compaction_ops(old_row, newer, query_row)
   end
 
   test "cold relocation and compaction reject malformed park rows without raising" do
@@ -1222,7 +1274,7 @@ defmodule Ferricstore.Flow.HibernationTest do
              Hibernation.relocate_cold_row(malformed, offset: 2_000)
 
     assert {:error, :invalid_cold_row} =
-             Hibernation.cold_compaction_ops(malformed, promotion_row())
+             Hibernation.cold_compaction_ops(malformed, promotion_row(), "not-a-query-row")
   end
 
   test "property model never makes a live flow neither hot nor cold" do
@@ -1253,17 +1305,17 @@ defmodule Ferricstore.Flow.HibernationTest do
         kind: :state,
         version: 1,
         raft_index: 10,
-        file_id: {:flow_state, 0},
+        file_id: 0,
         offset: 128,
         value_size: 256,
-        checksum: <<1>>
+        checksum: :binary.copy(<<1>>, 32)
       )
 
     %{
       locator: locator,
       record: %{
         id: "flow-1",
-        state_key: "flow/state/tenant-1/flow-1",
+        state_key: Keys.state_key("flow-1", "tenant-1"),
         type: "email",
         state: "waiting",
         run_state: "waiting",
@@ -1281,6 +1333,8 @@ defmodule Ferricstore.Flow.HibernationTest do
       }
     }
   end
+
+  defp scope_metadata(value), do: %{0x8001 => {1, :uint64, :isolation_scope, value}}
 
   defp locator(overrides) do
     defaults = [

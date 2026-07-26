@@ -2,12 +2,15 @@ defmodule Ferricstore.Flow.Query.ExecutionContext do
   @moduledoc false
 
   @enforce_keys [:instance_ctx]
-  defstruct [:instance_ctx, :deadline_ms, request_context: %{}]
+  defstruct [:instance_ctx, :deadline_ms, request_context: %{}, response_codec: :native_value]
+
+  @type response_codec :: :native_value | :flow_query_result_v1
 
   @type t :: %__MODULE__{
-          instance_ctx: FerricStore.Instance.t(),
+          instance_ctx: FerricStore.Instance.t() | map(),
           deadline_ms: pos_integer() | nil,
-          request_context: map()
+          request_context: map(),
+          response_codec: response_codec()
         }
 
   @spec attach(FerricStore.Instance.t(), map()) :: FerricStore.Instance.t() | t()
@@ -16,19 +19,31 @@ defmodule Ferricstore.Flow.Query.ExecutionContext do
 
   @spec attach(FerricStore.Instance.t(), map(), non_neg_integer() | nil) ::
           FerricStore.Instance.t() | t()
-  def attach(%FerricStore.Instance{} = instance_ctx, request_context, deadline_ms)
+  def attach(%FerricStore.Instance{} = instance_ctx, request_context, deadline_ms),
+    do: attach(instance_ctx, request_context, deadline_ms, :native_value)
+
+  @spec attach(FerricStore.Instance.t(), map(), non_neg_integer() | nil, response_codec()) ::
+          FerricStore.Instance.t() | t()
+  def attach(
+        %FerricStore.Instance{} = instance_ctx,
+        request_context,
+        deadline_ms,
+        :native_value
+      )
       when is_map(request_context) and map_size(request_context) == 0 and
              deadline_ms in [nil, 0],
       do: instance_ctx
 
-  def attach(%FerricStore.Instance{} = instance_ctx, request_context, deadline_ms)
+  def attach(%FerricStore.Instance{} = instance_ctx, request_context, deadline_ms, response_codec)
       when is_map(request_context) and
+             response_codec in [:native_value, :flow_query_result_v1] and
              (is_nil(deadline_ms) or
                 (is_integer(deadline_ms) and deadline_ms >= 0)) do
     %__MODULE__{
       instance_ctx: instance_ctx,
       request_context: request_context,
-      deadline_ms: normalize_deadline(deadline_ms)
+      deadline_ms: normalize_deadline(deadline_ms),
+      response_codec: response_codec
     }
   end
 

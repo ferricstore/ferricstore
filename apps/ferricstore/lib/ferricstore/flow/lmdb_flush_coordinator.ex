@@ -27,12 +27,29 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
   end
 
   defp with_acquired_permit(instance_name, scope, fun) do
-    case coordinator_pid(instance_name) do
-      nil ->
-        fun.()
+    with_acquired_permit(instance_name, scope, fun, &coordinator_pid/1, &acquire/2)
+  end
 
-      pid ->
-        case acquire(pid, scope) do
+  @doc false
+  def __with_acquired_permit_for_test__(
+        instance_name,
+        scope,
+        fun,
+        coordinator_pid_fun,
+        acquire_fun
+      )
+      when is_function(fun, 0) and is_function(coordinator_pid_fun, 1) and
+             is_function(acquire_fun, 2) do
+    with_acquired_permit(instance_name, scope, fun, coordinator_pid_fun, acquire_fun)
+  end
+
+  defp with_acquired_permit(instance_name, scope, fun, coordinator_pid_fun, acquire_fun) do
+    case coordinator_pid_fun.(instance_name) do
+      nil ->
+        {:error, :lmdb_flush_coordinator_unavailable}
+
+      pid when is_pid(pid) ->
+        case acquire_fun.(pid, scope) do
           {:ok, token} ->
             try do
               fun.()
@@ -41,8 +58,11 @@ defmodule Ferricstore.Flow.LMDBFlushCoordinator do
             end
 
           _other ->
-            fun.()
+            {:error, :lmdb_flush_coordinator_unavailable}
         end
+
+      _invalid ->
+        {:error, :lmdb_flush_coordinator_unavailable}
     end
   end
 

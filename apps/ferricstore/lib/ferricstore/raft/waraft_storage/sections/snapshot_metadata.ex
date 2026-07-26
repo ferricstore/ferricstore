@@ -443,13 +443,21 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
              trim_index,
              snapshot_path
            ) do
-        lmdb_path = snapshot_flow_lmdb_path(snapshot_path)
+        snapshot_lmdb_path = snapshot_flow_lmdb_path(snapshot_path)
+        live_lmdb_path = flow_lmdb_path(ctx, shard_index)
+        relocation_lmdb_paths = [live_lmdb_path, snapshot_lmdb_path]
 
         result =
-          compact_apply_projection_log(root_dir, ctx, shard_index, trim_index, lmdb_path)
+          compact_apply_projection_log(
+            root_dir,
+            ctx,
+            shard_index,
+            trim_index,
+            snapshot_lmdb_path,
+            relocation_lmdb_paths
+          )
 
-        release_result =
-          if FlowLMDB.env_present?(lmdb_path), do: FlowLMDB.release(lmdb_path), else: :ok
+        release_result = release_snapshot_compaction_lmdb_paths(relocation_lmdb_paths)
 
         case {result, release_result} do
           {result, :ok} ->
@@ -462,6 +470,40 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SnapshotMetadata do
             {:error,
              {:compact_and_release_snapshot_flow_lmdb_failed, compaction_reason, release_reason}}
         end
+      end
+
+      if Mix.env() == :test do
+        @doc false
+        def __compact_snapshot_apply_projection_log_for_test__(
+              root_dir,
+              ctx,
+              shard_index,
+              trim_index,
+              snapshot_path
+            ) do
+          compact_snapshot_apply_projection_log(
+            root_dir,
+            ctx,
+            shard_index,
+            trim_index,
+            snapshot_path
+          )
+        end
+      end
+
+      defp release_snapshot_compaction_lmdb_paths(paths) do
+        paths
+        |> Enum.uniq()
+        |> Enum.reduce(:ok, fn path, result ->
+          release_result =
+            if FlowLMDB.env_present?(path), do: FlowLMDB.release(path), else: :ok
+
+          case {result, release_result} do
+            {:ok, :ok} -> :ok
+            {{:error, _reason} = error, _next} -> error
+            {:ok, {:error, reason}} -> {:error, {path, reason}}
+          end
+        end)
       end
 
       defp snapshot_flow_lmdb_path(snapshot_path),

@@ -195,6 +195,20 @@ defmodule Ferricstore.FlowCodecTest do
     end)
   end
 
+  test "record encoders reject invalid query metadata instead of dropping it" do
+    invalid_records = [
+      Map.put(base_record(), :attributes, Map.new(1..17, &{"key-#{&1}", "value"})),
+      Map.put(base_record(), :state_meta, %{"running" => %{"nested" => %{bad: true}}})
+    ]
+
+    for record <- invalid_records,
+        encoder <- [&Flow.encode_record/1, &Flow.encode_record_elixir/1] do
+      assert_raise ArgumentError, ~r/invalid flow record query metadata/, fn ->
+        encoder.(record)
+      end
+    end
+  end
+
   test "record codec omits redundant immutable defaults from every state version" do
     record =
       base_record()

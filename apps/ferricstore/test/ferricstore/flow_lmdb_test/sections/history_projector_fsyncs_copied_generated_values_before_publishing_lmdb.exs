@@ -239,7 +239,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(instance_name, shard_index)
       end
 
-      test "LMDB writer projects Flow state from provided value without source keydir read" do
+      test "LMDB writer rejects inline Flow state without an authoritative locator" do
         fixture = start_active_lmdb_projection_fixture!("direct-state")
 
         record =
@@ -257,19 +257,10 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
                    {:project_flow_state, state_key, encoded, 0}
                  ])
 
-        assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+        assert {:error, :inline_flow_projection_unsupported} =
+                 Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
 
-        assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
-        assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
-
-        queued_state_key =
-          Ferricstore.Flow.Keys.state_index_key(record.type, record.state, record.partition_key)
-
-        assert {:ok, 1} =
-                 Ferricstore.Flow.LMDB.prefix_count(
-                   fixture.lmdb_path,
-                   Ferricstore.Flow.LMDB.active_index_prefix(queued_state_key)
-                 )
+        assert :not_found = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
       end
 
       @tag :flow_projection_coalescing
@@ -307,24 +298,32 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
         marker_key = "coalesced-state-marker"
         encoded_completed = Ferricstore.Flow.encode_record(completed)
 
-        :ets.insert(
+        put_durable_flow_source!(
+          fixture.data_dir,
+          fixture.shard_index,
           fixture.source_keydir,
-          {state_key, encoded_completed, 0, 0, :hot, 0, byte_size(encoded_completed)}
+          completed
         )
 
         assert :ok =
                  Ferricstore.Flow.LMDBWriter.enqueue(fixture.instance_name, fixture.shard_index, [
-                   {:project_flow_state, state_key, Ferricstore.Flow.encode_record(queued), 0},
-                   {:project_flow_state, state_key, Ferricstore.Flow.encode_record(running), 0},
+                   {:project_flow_state_from_source, state_key, queued.version},
+                   {:project_flow_state_from_source, state_key, running.version},
                    {:put, marker_key, "preserved"},
-                   {:project_flow_state, state_key, encoded_completed, 0},
-                   {:project_flow_state_from_source, state_key}
+                   {:project_flow_state_from_source, state_key, completed.version},
+                   {:project_flow_state_from_source, state_key, completed.version}
                  ])
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
 
-        assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
-        assert {:ok, ^encoded_completed} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+        assert_query_row_hydrates!(
+          fixture.data_dir,
+          fixture.shard_index,
+          fixture.lmdb_path,
+          state_key,
+          completed
+        )
+
         assert {:ok, "preserved"} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, marker_key)
 
         completed_index_key =
@@ -376,17 +375,28 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
                  )
 
         completed = %{active | state: "completed", version: 2, updated_at_ms: 30}
-        encoded_completed = Ferricstore.Flow.encode_record(completed)
+
+        put_durable_flow_source!(
+          fixture.data_dir,
+          fixture.shard_index,
+          fixture.source_keydir,
+          completed
+        )
 
         assert :ok =
                  Ferricstore.Flow.LMDBWriter.enqueue(fixture.instance_name, fixture.shard_index, [
-                   {:project_flow_state, state_key, encoded_completed, 0}
+                   {:project_flow_state_from_source, state_key, completed.version}
                  ])
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
 
-        assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
-        assert {:ok, ^encoded_completed} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+        assert_query_row_hydrates!(
+          fixture.data_dir,
+          fixture.shard_index,
+          fixture.lmdb_path,
+          state_key,
+          completed
+        )
 
         completed_state_key =
           Ferricstore.Flow.Keys.state_index_key(
@@ -429,12 +439,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
           )
 
         state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
-        encoded = Ferricstore.Flow.encode_record(completed)
 
-        :ets.insert(
+        put_durable_flow_source!(
+          fixture.data_dir,
+          fixture.shard_index,
           fixture.source_keydir,
-          {state_key, encoded, 0, {:flow_state_version, completed.version, 0}, :hot, 0,
-           byte_size(encoded)}
+          completed,
+          lfu: {:flow_state_version, completed.version, 0}
         )
 
         assert :ok =
@@ -446,8 +457,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
 
-        assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
-        assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+        assert_query_row_hydrates!(
+          fixture.data_dir,
+          fixture.shard_index,
+          fixture.lmdb_path,
+          state_key,
+          completed
+        )
 
         completed_state_key =
           Ferricstore.Flow.Keys.state_index_key(
@@ -475,12 +491,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
           )
 
         state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
-        encoded = Ferricstore.Flow.encode_record(completed)
 
-        :ets.insert(
+        put_durable_flow_source!(
+          fixture.data_dir,
+          fixture.shard_index,
           fixture.source_keydir,
-          {state_key, encoded, 0, {:flow_state_version, completed.version, 0}, :hot, 0,
-           byte_size(encoded)}
+          completed,
+          lfu: {:flow_state_version, completed.version, 0}
         )
 
         assert :ok =
@@ -501,8 +518,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
 
         assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
 
-        assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
-        assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+        assert_query_row_hydrates!(
+          fixture.data_dir,
+          fixture.shard_index,
+          fixture.lmdb_path,
+          state_key,
+          completed
+        )
 
         completed_state_key =
           Ferricstore.Flow.Keys.state_index_key(
@@ -532,12 +554,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
           )
 
         state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
-        encoded = Ferricstore.Flow.encode_record(record)
 
-        :ets.insert(
+        put_durable_flow_source!(
+          fixture.data_dir,
+          fixture.shard_index,
           fixture.source_keydir,
-          {state_key, encoded, 0, {:flow_state_version, record.version, 0}, :hot, 0,
-           byte_size(encoded)}
+          record,
+          lfu: {:flow_state_version, record.version, 0}
         )
 
         {flow_index, flow_lookup} =
@@ -607,8 +630,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
                    false
                  )
 
-        assert {:ok, wrapped} = Ferricstore.Flow.LMDB.get(fixture.lmdb_path, state_key)
-        assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(wrapped, 0)
+        assert_query_row_hydrates!(
+          fixture.data_dir,
+          fixture.shard_index,
+          fixture.lmdb_path,
+          state_key,
+          record
+        )
       end
 
       test "empty rebuild does not open LMDB" do
@@ -758,6 +786,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
 
         Ferricstore.DataDir.ensure_layout!(data_dir, 1)
         shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+        retention_until_ms = System.system_time(:millisecond) + 60_000
 
         record = %{
           id: "history-rebuild-failure",
@@ -768,14 +797,13 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
           fencing_token: 1,
           created_at_ms: 1_000,
           updated_at_ms: 2_000,
-          terminal_retention_until_ms: 60_000,
+          terminal_retention_until_ms: retention_until_ms,
           partition_key: "tenant-history-rebuild",
           root_flow_id: "history-rebuild-failure"
         }
 
         state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
-        encoded = Ferricstore.Flow.encode_record(record)
-        :ets.insert(keydir, {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)})
+        put_durable_flow_source!(data_dir, shard_index, keydir, record)
 
         event_id = "2000-1"
         history_key = Ferricstore.Flow.Keys.history_key(record.id, record.partition_key)
@@ -795,7 +823,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
                    shard_path,
                    keydir,
                    shard_index,
-                   nil,
+                   %{data_dir: data_dir},
                    nil,
                    nil,
                    flow_index,
@@ -842,6 +870,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
 
         Ferricstore.DataDir.ensure_layout!(data_dir, 1)
         shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
+        retention_until_ms = System.system_time(:millisecond) + 60_000
 
         record = %{
           id: "history-rebuild-expire",
@@ -852,15 +881,14 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
           fencing_token: 1,
           created_at_ms: 1_000,
           updated_at_ms: 3_000,
-          terminal_retention_until_ms: 60_000,
+          terminal_retention_until_ms: retention_until_ms,
           partition_key: "tenant-history-rebuild",
           root_flow_id: "history-rebuild-expire",
           history_max_events: 10
         }
 
         state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
-        encoded = Ferricstore.Flow.encode_record(record)
-        :ets.insert(keydir, {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)})
+        put_durable_flow_source!(data_dir, shard_index, keydir, record)
 
         history_key = Ferricstore.Flow.Keys.history_key(record.id, record.partition_key)
 
@@ -888,7 +916,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
                    shard_path,
                    keydir,
                    shard_index,
-                   nil,
+                   %{data_dir: data_dir},
                    nil,
                    nil,
                    flow_index,
@@ -984,8 +1012,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
                  )
 
         assert :atomics.get(degraded, 1) == 0
-        assert {:ok, lmdb_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
-        assert {:ok, ^encoded} = Ferricstore.Flow.LMDB.decode_value(lmdb_blob, 10)
+        assert_query_row_hydrates!(data_dir, shard_index, lmdb_path, state_key, record)
 
         state_index_key =
           Ferricstore.Flow.Keys.state_index_key(record.type, record.state, record.partition_key)

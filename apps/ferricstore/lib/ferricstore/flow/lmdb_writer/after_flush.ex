@@ -186,7 +186,7 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   end
 
   def decode_raw_flow_record(value) when is_binary(value) do
-    case ProjectionOps.flow_call(:decode_record, [value]) do
+    case Ferricstore.Flow.decode_record(value) do
       record when is_map(record) -> {:ok, record}
       _invalid -> {:error, :invalid_source_flow_record}
     end
@@ -199,9 +199,10 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
       [{^state_key, _value, _expire_at_ms, _lfu, file_id, offset, value_size} = row] ->
         if file_id == locator.file_id and offset == locator.offset and
              value_size == locator.value_size do
-          delete_apply_projection_cache_for_row(data_dir, shard_index, row)
-          :ets.delete(ets, state_key)
-          {:ok, true}
+          with :ok <- ensure_apply_projection_row_durable(data_dir, shard_index, row) do
+            :ets.delete(ets, state_key)
+            {:ok, true}
+          end
         else
           {:ok, false}
         end
@@ -320,16 +321,18 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
         {^state_key, _value, _expire_at_ms, {:flow_state_version, ^version, _lfu}, _fid, _off,
          _vsize} = row
       ] ->
-        delete_apply_projection_cache_for_row(data_dir, shard_index, row)
-        :ets.delete(ets, state_key)
-        :ok
+        with :ok <- ensure_apply_projection_row_durable(data_dir, shard_index, row) do
+          :ets.delete(ets, state_key)
+          :ok
+        end
 
       [{^state_key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize} = row] ->
         case terminal_state_row_version(data_dir, shard_index, state_key, version, row) do
           {:ok, true} ->
-            delete_apply_projection_cache_for_row(data_dir, shard_index, row)
-            :ets.delete(ets, state_key)
-            :ok
+            with :ok <- ensure_apply_projection_row_durable(data_dir, shard_index, row) do
+              :ets.delete(ets, state_key)
+              :ok
+            end
 
           {:ok, false} ->
             :ok
@@ -385,6 +388,26 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlush do
   end
 
   def delete_apply_projection_cache_for_row(_data_dir, _shard_index, _row), do: :ok
+
+  defp ensure_apply_projection_row_durable(
+         data_dir,
+         shard_index,
+         {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
+          _value_size}
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+              is_binary(key) and is_integer(index) and index > 0 do
+    case Ferricstore.Raft.WARaftSegmentReader.ensure_apply_projection_entries_durable(
+           data_dir,
+           shard_index,
+           [{index, key}]
+         ) do
+      {:ok, _removed} -> :ok
+      {:error, reason} -> {:error, {:source_not_durable, reason}}
+    end
+  end
+
+  defp ensure_apply_projection_row_durable(_data_dir, _shard_index, _row), do: :ok
 
   def flow_record_from_keydir(data_dir, shard_index, ets, state_key) do
     do_flow_record_from_keydir(

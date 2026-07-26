@@ -30,7 +30,6 @@ defmodule Ferricstore.Store.Router do
   alias Ferricstore.HyperLogLog, as: HLL
   alias Ferricstore.ErrorReasons
   alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
-  alias Ferricstore.Flow.Locator
   alias Ferricstore.Raft.ReplyAwaiter
   alias Ferricstore.Stats
 
@@ -47,6 +46,7 @@ defmodule Ferricstore.Store.Router do
   }
 
   @cold_batch_read_timeout_ms 10_000
+  @flow_lmdb_batch_encoded_bytes 16 * 1_024 * 1_024
   @cold_location_retry_attempts 8
   @cold_location_retry_sleep_ms 1
   @default_async_key_latch_timeout_ms 30_000

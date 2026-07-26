@@ -5,6 +5,7 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
     Cursor,
     CursorKeyStore,
     ExecutionResult,
+    Explain,
     Field,
     Limits,
     MandatoryScope,
@@ -725,12 +726,6 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
 
     fingerprint = Planner.query_fingerprint(request)
 
-    projection_fields =
-      case RecordProjection.external_names(request.projection) do
-        :all -> "all_allowlisted_fields"
-        fields -> fields
-      end
-
     %{
       version: Surface.default_explain_contract(),
       query_fingerprint: fingerprint,
@@ -742,12 +737,9 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutor do
       },
       plan: %{
         path: descriptor |> physical_path() |> Atom.to_string(),
+        record_source: "authoritative_log",
         fallback_reason: "none",
-        projection: %{
-          fields: projection_fields,
-          application: "after_authoritative_recheck",
-          index_only: false
-        },
+        projection: Explain.projection_descriptor(request, :authoritative_log),
         predicates: predicates,
         order: %{
           field: Atom.to_string(descriptor.order_field),

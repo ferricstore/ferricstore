@@ -38,7 +38,6 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
           ":sm_pending_writes",
           ":sm_pending_originals",
           ":sm_pending_values",
-          ":sm_pending_lmdb_values",
           ":sm_pending_lmdb_mirror_ops",
           ":sm_pending_lmdb_mirror_after_flush",
           ":sm_pending_fast_put_batch",
@@ -73,6 +72,23 @@ defmodule Ferricstore.Raft.StateMachineProcessDictGuardTest do
 
     assert publish_body =~ ":ets.delete(state.ets, key)"
     assert publish_body =~ "maybe_queue_lmdb_state_delete_after_publish(state, key)"
+  end
+
+  test "Flow deletion queues one complete source projection before tombstone removal" do
+    source = Ferricstore.Test.SourceFiles.state_machine_source()
+
+    body =
+      Ferricstore.Test.SourceFiles.private_function_source!(
+        source,
+        "queue_lmdb_state_delete_projection"
+      )
+
+    assert body =~ "{:project_flow_state_from_source, key}"
+    refute body =~ "queue_pending_lmdb_mirror_delete(key)"
+    assert body =~ "{:delete_flow_tombstone, state.ets, key}"
+
+    refute source =~ "queue_lmdb_metadata_index_deletes",
+           "fixed query-index cleanup must be derived inside the source projection transaction"
   end
 
   test "no-meta apply path clears consolidated apply process state" do

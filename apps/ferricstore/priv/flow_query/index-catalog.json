@@ -1,13 +1,14 @@
 {
-  "catalog_version": 3,
+  "catalog_version": 4,
   "contract_version": "ferric.flow.query.index-catalog/v1",
   "indexes": [
     {
       "id": "flow_runs_tenant_updated",
-      "version": 1,
+      "version": 2,
       "source": "runs",
       "workloads": ["WF-LIST-001", "WF-SERVICE-API-001", "WF-EXPORT-001"],
       "count_prefixes": [],
+      "covering_fields": ["partition_key", "run_id", "updated_at_ms", "version"],
       "fields": [
         {"name": "partition_key", "direction": "asc", "encoding": "hashed"},
         {"name": "updated_at_ms", "direction": "desc", "encoding": "ordered"}
@@ -15,10 +16,11 @@
     },
     {
       "id": "flow_runs_tenant_state_updated",
-      "version": 1,
+      "version": 2,
       "source": "runs",
       "workloads": ["WF-LIST-001", "WF-SERVICE-API-001", "WF-EXPORT-001"],
       "count_prefixes": [1, 2],
+      "covering_fields": ["partition_key", "run_id", "state", "updated_at_ms", "version"],
       "fields": [
         {"name": "partition_key", "direction": "asc", "encoding": "hashed"},
         {"name": "state", "direction": "asc", "encoding": "hashed"},
@@ -27,10 +29,11 @@
     },
     {
       "id": "flow_runs_tenant_type_updated",
-      "version": 1,
+      "version": 2,
       "source": "runs",
       "workloads": ["WF-LIST-001", "WF-SERVICE-API-001", "WF-EXPORT-001"],
       "count_prefixes": [2],
+      "covering_fields": ["partition_key", "run_id", "type", "updated_at_ms", "version"],
       "fields": [
         {"name": "partition_key", "direction": "asc", "encoding": "hashed"},
         {"name": "type", "direction": "asc", "encoding": "hashed"},
@@ -39,10 +42,11 @@
     },
     {
       "id": "flow_runs_tenant_type_state_updated",
-      "version": 1,
+      "version": 2,
       "source": "runs",
       "workloads": ["WF-LIST-001", "WF-SERVICE-API-001", "WF-EXPORT-001"],
       "count_prefixes": [3],
+      "covering_fields": ["partition_key", "run_id", "state", "type", "updated_at_ms", "version"],
       "fields": [
         {"name": "partition_key", "direction": "asc", "encoding": "hashed"},
         {"name": "type", "direction": "asc", "encoding": "hashed"},
@@ -52,10 +56,11 @@
     },
     {
       "id": "flow_runs_tenant_type_state_lease_deadline",
-      "version": 1,
+      "version": 2,
       "source": "runs",
       "workloads": ["WF-STUCK-001", "WF-SERVICE-API-001"],
       "count_prefixes": [],
+      "covering_fields": ["lease_deadline_ms", "partition_key", "run_id", "state", "type", "version"],
       "fields": [
         {"name": "partition_key", "direction": "asc", "encoding": "hashed"},
         {"name": "type", "direction": "asc", "encoding": "hashed"},

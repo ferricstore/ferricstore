@@ -7,6 +7,8 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
   @u64_decimal_zero_pad "00000000000000000000"
   @max_u64 18_446_744_073_709_551_615
   @max_batch_entries 100_000
+  @max_key_bytes 65_535
+  @max_encoded_batch_bytes 16 * 1_024 * 1_024
 
   def prefix, do: "flow-segment-value-pin:"
 
@@ -18,7 +20,11 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
       when tag in [:waraft_segment, :waraft_apply_projection] and is_integer(index) and index > 0 and
              index <= @max_u64 and is_list(entries) do
     if valid_batch_entries?(entries) do
-      TermCodec.encode({:flow_segment_value_pin_batch, 1, file_id, entries})
+      encoded = TermCodec.encode({:flow_segment_value_pin_batch, 1, file_id, entries})
+
+      if byte_size(encoded) <= @max_encoded_batch_bytes,
+        do: encoded,
+        else: raise(ArgumentError, "Flow segment pin batch exceeds encoded byte limit")
     else
       raise ArgumentError, "invalid Flow segment pin batch"
     end
@@ -55,7 +61,8 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
             {key, expire_at_ms, offset, value_size}
           end)
 
-        {:put, batch_key(file_id, batch_entries), encode_batch(file_id, batch_entries)}
+        encoded = encode_batch(file_id, batch_entries)
+        {:put, batch_key(file_id, encoded), encoded}
       end)
 
     value_ops ++ pin_ops
@@ -123,6 +130,7 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
 
   defp normalize_entry!(key, expire_at_ms, {tag, index} = file_id, offset, value_size)
        when tag in [:waraft_segment, :waraft_apply_projection] and is_binary(key) and
+              key != "" and byte_size(key) <= @max_key_bytes and
               is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 and
               is_integer(index) and index > 0 and index <= @max_u64 and is_integer(offset) and
               offset >= 0 and offset <= @max_u64 and is_integer(value_size) and value_size >= 0 and
@@ -139,10 +147,10 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
   defp normalize_entry!(_key, _expire_at_ms, _file_id, _offset, _value_size),
     do: raise(ArgumentError, "invalid Flow segment pin entry")
 
-  defp batch_key({tag, index} = file_id, entries)
+  defp batch_key({tag, index}, encoded)
        when tag in [:waraft_segment, :waraft_apply_projection] and is_integer(index) and
-              index > 0 and is_list(entries) do
-    digest = :crypto.hash(:sha256, TermCodec.encode({file_id, entries}))
+              index > 0 and is_binary(encoded) do
+    digest = :crypto.hash(:sha256, encoded)
     prefix(tag) <> pad_u64(index) <> <<0>> <> digest
   end
 
@@ -282,8 +290,10 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
 
   defp decode_entry({pin_key, blob}) when is_binary(pin_key) and is_binary(blob) do
     with {:ok, {tag, index}} <- decode_key(pin_key),
+         true <- byte_size(blob) <= @max_encoded_batch_bytes,
+         true <- pin_key == batch_key({tag, index}, blob),
          {:ok, {{^tag, ^index} = file_id, entries}} <- decode_batch_value(blob),
-         true <- pin_key == batch_key(file_id, entries) do
+         true <- file_id == {tag, index} do
       pins =
         Enum.map(entries, fn {value_key, expire_at_ms, offset, value_size} ->
           %{
@@ -322,7 +332,8 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
     end)
   end
 
-  defp decode_batch_value(blob) do
+  defp decode_batch_value(blob)
+       when is_binary(blob) and byte_size(blob) <= @max_encoded_batch_bytes do
     case TermCodec.decode(blob) do
       {:ok, {:flow_segment_value_pin_batch, 1, {tag, index} = file_id, entries}}
       when tag in [:waraft_segment, :waraft_apply_projection] and is_integer(index) and
@@ -335,6 +346,8 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
   rescue
     _ -> :error
   end
+
+  defp decode_batch_value(_blob), do: :error
 
   defp valid_batch_entries?([]), do: false
 
@@ -349,7 +362,8 @@ defmodule Ferricstore.Flow.LMDB.SegmentPins do
          [{value_key, expire_at_ms, offset, value_size} | rest],
          count
        )
-       when is_binary(value_key) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
+       when is_binary(value_key) and value_key != "" and byte_size(value_key) <= @max_key_bytes and
+              is_integer(expire_at_ms) and expire_at_ms >= 0 and
               expire_at_ms <= @max_u64 and is_integer(offset) and offset >= 0 and
               offset <= @max_u64 and is_integer(value_size) and value_size >= 0 and
               value_size <= @max_u64 do

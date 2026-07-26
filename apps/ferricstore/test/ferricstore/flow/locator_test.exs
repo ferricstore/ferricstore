@@ -40,6 +40,67 @@ defmodule Ferricstore.Flow.LocatorTest do
              )
   end
 
+  test "durable locators accept only bounded physical storage sources" do
+    max_u64 = 18_446_744_073_709_551_615
+
+    for file_id <- [
+          0,
+          max_u64,
+          {:waraft_segment, 1},
+          {:waraft_projection, 2},
+          {:waraft_apply_projection, 3}
+        ] do
+      assert Locator.durable?(locator(file_id: file_id))
+    end
+
+    for overrides <- [
+          [file_id: {:flow_state, 0}],
+          [file_id: {:flow_value, 0}],
+          [file_id: {:waraft_segment, 0}],
+          [file_id: {:waraft_apply_projection, max_u64 + 1}],
+          [file_id: {:unknown, 1}],
+          [file_id: max_u64 + 1],
+          [version: max_u64 + 1],
+          [raft_index: max_u64 + 1],
+          [offset: max_u64 + 1],
+          [value_size: max_u64 + 1],
+          [frame_size: max_u64 + 1],
+          [expire_at_ms: max_u64 + 1],
+          [segment_generation: max_u64 + 1],
+          [flow_id: String.duplicate("f", 65_536)],
+          [checksum: String.duplicate("c", 65)]
+        ] do
+      refute Locator.durable?(locator(overrides))
+    end
+  end
+
+  test "hydration-ready state locators require a non-empty value and one SHA-256 checksum" do
+    locator = locator(file_id: 3, checksum: :binary.copy(<<1>>, 32))
+
+    assert Locator.hydration_ready?(locator)
+    refute Locator.hydration_ready?(%{locator | value_size: 0})
+    refute Locator.hydration_ready?(%{locator | checksum: nil})
+    refute Locator.hydration_ready?(%{locator | checksum: :binary.copy(<<1>>, 31)})
+    refute Locator.hydration_ready?(%{locator | kind: :history})
+  end
+
+  test "WARaft hydration locators require a complete physical frame address" do
+    logical =
+      locator(
+        file_id: {:waraft_apply_projection, 31},
+        raft_index: 31,
+        segment_generation: nil,
+        frame_size: nil,
+        checksum: :binary.copy(<<1>>, 32)
+      )
+
+    refute Locator.hydration_ready?(logical)
+
+    physical = %{logical | segment_generation: 2, offset: 4_096, frame_size: 768}
+    assert Locator.hydration_ready?(physical)
+    refute Locator.hydration_ready?(%{physical | frame_size: 7})
+  end
+
   test "resolve reports invisible only when both hot and cold locators are missing" do
     hot = locator(version: 1, raft_index: 10, offset: 1)
     cold = locator(version: 1, raft_index: 10, offset: 1)
@@ -93,6 +154,7 @@ defmodule Ferricstore.Flow.LocatorTest do
         file_id: {:flow_state, 2},
         offset: 1000,
         value_size: 21,
+        frame_size: 48,
         segment_generation: 4
       )
 
@@ -101,6 +163,7 @@ defmodule Ferricstore.Flow.LocatorTest do
     assert relocated.file_id == {:flow_state, 2}
     assert relocated.offset == 1000
     assert relocated.value_size == 21
+    assert relocated.frame_size == 48
     assert relocated.segment_generation == 4
   end
 
@@ -113,6 +176,7 @@ defmodule Ferricstore.Flow.LocatorTest do
       file_id: {:flow_state, 0},
       offset: 0,
       value_size: 1,
+      frame_size: nil,
       checksum: <<0>>
     ]
 

@@ -8,6 +8,8 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.NativeOrderedIndex
+  alias Ferricstore.Flow.Query.QueryRecordStore
+  alias Ferricstore.Flow.RecordIdentity
   alias Ferricstore.Flow.RetentionCleanupMember
   alias Ferricstore.Flow.RetentionGuard
   alias Ferricstore.ServerCatalog
@@ -23,6 +25,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   @default_batch_bytes 4 * 1_024 * 1_024
   @cold_read_timeout_ms 30_000
   @default_fsync_timeout_ms 30_000
+  @maximum_hydration_bytes 1 * 1_024 * 1_024 * 1_024
   @staging_root "__ferricstore:shared-ref-backfill:v2:"
 
   defguardp valid_waraft_location(file_id, offset, value_size)
@@ -328,7 +331,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
       entries ->
         emit_read_batch(:scan_lmdb_states, entries)
-        Enum.each(entries, &process_lmdb_state_entry!(ctx, &1, progress.run_id))
+        process_lmdb_state_entries!(ctx, entries, progress.run_id)
         {cursor, _value} = List.last(entries)
 
         next = %{
@@ -760,18 +763,42 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     lmdb_write_ops_bounded!(ctx, :snapshot_keydir, ops)
   end
 
-  defp process_lmdb_state_entry!(ctx, {state_key, blob}, run_id) do
-    if flow_state_key?(state_key) do
-      encoded =
-        case lookup_primary_value!(ctx, state_key) do
-          {:ok, current} -> current
-          :not_found -> decode_lmdb_state_value!(blob, state_key)
-        end
+  defp process_lmdb_state_entries!(ctx, entries, run_id) do
+    {items, lmdb_state_keys} =
+      Enum.reduce(entries, {[], []}, fn
+        {state_key, _query_row}, {items, lmdb_state_keys} when is_binary(state_key) ->
+          if flow_state_key?(state_key) do
+            case lookup_primary_value!(ctx, state_key) do
+              {:ok, current} ->
+                record = decode_record!(state_key, current)
+                {[{:record, state_key, record} | items], lmdb_state_keys}
 
-      state_key
-      |> decode_record!(encoded)
-      |> process_record!(ctx, state_key, run_id)
-    end
+              :not_found ->
+                {[{:lmdb, state_key} | items], [state_key | lmdb_state_keys]}
+            end
+          else
+            {items, lmdb_state_keys}
+          end
+
+        _invalid, _acc ->
+          raise "shared-ref backfill encountered an invalid LMDB state row"
+      end)
+
+    records_by_key =
+      lmdb_state_keys
+      |> Enum.reverse()
+      |> read_lmdb_records!(ctx)
+      |> Map.new()
+
+    items
+    |> Enum.reverse()
+    |> Enum.each(fn
+      {:record, state_key, record} ->
+        process_record!(record, ctx, state_key, run_id)
+
+      {:lmdb, state_key} ->
+        process_record!(Map.fetch!(records_by_key, state_key), ctx, state_key, run_id)
+    end)
   end
 
   defp process_work_key!(ctx, key, run_id) do
@@ -1335,9 +1362,11 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
 
   defp lookup_lmdb_record!(ctx, state_key) do
     case lmdb_get!(ctx, state_key) do
-      {:ok, blob} ->
-        encoded = decode_lmdb_state_value!(blob, state_key)
-        {:ok, decode_record!(state_key, encoded)}
+      {:ok, _query_row} ->
+        case read_lmdb_records!([state_key], ctx) do
+          [{^state_key, record}] -> {:ok, record}
+          _invalid -> raise "shared-ref backfill failed to resolve LMDB state"
+        end
 
       :not_found ->
         :not_found
@@ -1347,13 +1376,66 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
     end
   end
 
-  defp decode_lmdb_state_value!(blob, state_key) do
-    case LMDB.decode_value(blob, 0) do
-      {:ok, encoded} when is_binary(encoded) ->
-        encoded
+  defp read_lmdb_records!([], _ctx), do: []
+
+  defp read_lmdb_records!(state_keys, ctx) when is_list(state_keys) do
+    max_input_bytes =
+      ctx.batch_bytes
+      |> max(QueryRecordStore.max_input_bytes(ctx.instance_ctx))
+      |> min(@maximum_hydration_bytes)
+
+    do_read_lmdb_records!(ctx, state_keys, max_input_bytes, [])
+  end
+
+  defp do_read_lmdb_records!(_ctx, [], _max_input_bytes, acc), do: Enum.reverse(acc)
+
+  defp do_read_lmdb_records!(ctx, state_keys, max_input_bytes, acc) do
+    case QueryRecordStore.read_many(
+           ctx.instance_ctx,
+           ctx.shard_index,
+           ctx.lmdb_path,
+           state_keys,
+           0,
+           max_input_bytes,
+           timeout_ms: @cold_read_timeout_ms
+         ) do
+      {:ok, records, complete?} when is_list(records) and records != [] ->
+        consumed = length(records)
+        consumed_keys = Enum.take(state_keys, consumed)
+
+        page =
+          consumed_keys
+          |> Enum.zip(records)
+          |> Enum.map(fn
+            {state_key, record} when is_binary(state_key) and is_map(record) ->
+              {state_key, record}
+
+            {state_key, _missing} ->
+              raise "shared-ref backfill failed to decode or hydrate LMDB QueryRow #{inspect(state_key)}"
+          end)
+
+        remaining = Enum.drop(state_keys, consumed)
+        next_acc = Enum.reverse(page, acc)
+
+        cond do
+          complete? and remaining == [] ->
+            Enum.reverse(next_acc)
+
+          not complete? and remaining != [] ->
+            do_read_lmdb_records!(ctx, remaining, max_input_bytes, next_acc)
+
+          true ->
+            raise "shared-ref backfill received an inconsistent LMDB QueryRow page"
+        end
+
+      {:ok, _records, _complete?} ->
+        raise "shared-ref backfill received an empty LMDB QueryRow page"
+
+      {:error, reason} ->
+        raise "shared-ref backfill failed to decode or hydrate LMDB QueryRows: #{inspect(reason)}"
 
       other ->
-        raise "shared-ref backfill failed to decode LMDB state #{inspect(state_key)}: #{inspect(other)}"
+        raise "shared-ref backfill LMDB QueryRow read returned #{inspect(other)}"
     end
   end
 
@@ -1376,9 +1458,7 @@ defmodule Ferricstore.Flow.SharedRefBackfill do
   end
 
   defp validate_record_key!(record, state_key) do
-    expected = Keys.state_key(Map.fetch!(record, :id), Map.get(record, :partition_key))
-
-    if expected != state_key do
+    unless RecordIdentity.owns_state_key?(record, state_key) do
       raise "shared-ref backfill state key does not match decoded record"
     end
   end

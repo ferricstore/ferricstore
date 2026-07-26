@@ -2,12 +2,20 @@ defmodule Ferricstore.Flow.LMDB.Cold do
   @moduledoc false
 
   alias Ferricstore.Flow.Locator
+  alias Ferricstore.Flow.Query.Limits
   alias Ferricstore.TermCodec
 
   @u64_decimal_zero_pad "00000000000000000000"
   @max_u64 18_446_744_073_709_551_615
   @min_i64 -9_223_372_036_854_775_808
   @max_i64 9_223_372_036_854_775_807
+  @max_encoded_bytes 384 * 1_024
+  @max_key_bytes 65_535
+  @max_run_id_bytes Limits.max_run_id_bytes()
+  @max_checksum_bytes 64
+  @value_refs_digest_bytes 32
+  @value_ref_kinds [:payload, :result, :error, :shared]
+  @park_version 2
 
   def park_key(flow_id) when is_binary(flow_id), do: "flow:park:v1:" <> flow_id
 
@@ -86,13 +94,23 @@ defmodule Ferricstore.Flow.LMDB.Cold do
       do: by_segment_prefix(file_id) <> ":" <> encode_u64(offset)
 
   def by_segment_prefix(file_id) do
-    ["flow:cold:by-segment:v1", escape_key_part(TermCodec.encode(file_id))]
-    |> Enum.join(":")
+    case Locator.storage_source(file_id) do
+      {:ok, source_tag, source_id} ->
+        ["flow:cold:by-segment:v1", escape_key_part(<<source_tag, source_id::unsigned-big-64>>)]
+        |> Enum.join(":")
+
+      :error ->
+        raise ArgumentError, "invalid Flow cold storage source"
+    end
   end
 
   def encode_park(%Locator{kind: :state} = locator, attrs)
       when is_map(attrs) or is_list(attrs) do
     attrs = Map.new(attrs)
+
+    if Map.has_key?(attrs, :state_value) do
+      raise ArgumentError, "cold park cannot embed a Flow state record"
+    end
 
     fields = %{
       locator: locator,
@@ -106,23 +124,25 @@ defmodule Ferricstore.Flow.LMDB.Cold do
       fencing_token: Map.get(attrs, :fencing_token),
       retention_at_ms: Map.get(attrs, :retention_at_ms),
       value_refs_digest: Map.get(attrs, :value_refs_digest),
-      state_value: Map.get(attrs, :state_value),
       checksum: Map.get(attrs, :checksum)
     }
 
     if valid_park_fields?(fields) do
-      TermCodec.encode({:flow_cold_park, 1, fields})
+      encode_bounded!({:flow_cold_park, @park_version, fields}, "invalid Flow cold park fields")
     else
       raise ArgumentError, "invalid Flow cold park fields"
     end
   end
 
-  def decode_park(blob) when is_binary(blob) do
+  def decode_park(blob) when is_binary(blob) and byte_size(blob) <= @max_encoded_bytes do
     case TermCodec.decode(blob) do
-      {:ok, {:flow_cold_park, 1, %{locator: %Locator{} = locator} = fields}} ->
+      {:ok, {:flow_cold_park, @park_version, %{locator: %Locator{} = locator} = fields}} ->
         if Locator.valid?(locator) and valid_park_fields?(fields), do: {:ok, fields}, else: :error
 
-      {:ok, {:flow_cold_park, 1, _invalid_fields}} ->
+      {:ok, {:flow_cold_park, @park_version, _invalid_fields}} ->
+        :error
+
+      {:ok, {:flow_cold_park, _unsupported_version, _fields}} ->
         :error
 
       {:ok, _other} ->
@@ -134,6 +154,8 @@ defmodule Ferricstore.Flow.LMDB.Cold do
   rescue
     _ -> :error
   end
+
+  def decode_park(blob) when is_binary(blob), do: :error
 
   def encode_value_locator(
         value_ref,
@@ -165,7 +187,10 @@ defmodule Ferricstore.Flow.LMDB.Cold do
     }
 
     if valid_value_locator_fields?(fields) do
-      TermCodec.encode({:flow_cold_value_locator, 1, fields})
+      encode_bounded!(
+        {:flow_cold_value_locator, 1, fields},
+        "invalid Flow cold value locator fields"
+      )
     else
       raise ArgumentError, "invalid Flow cold value locator fields"
     end
@@ -174,7 +199,8 @@ defmodule Ferricstore.Flow.LMDB.Cold do
   def encode_value_locator(_value_ref, _owner_flow_id, _owner_version, _locator, _attrs),
     do: raise(ArgumentError, "invalid Flow cold value locator fields")
 
-  def decode_value_locator(blob) when is_binary(blob) do
+  def decode_value_locator(blob)
+      when is_binary(blob) and byte_size(blob) <= @max_encoded_bytes do
     case TermCodec.decode(blob) do
       {:ok, {:flow_cold_value_locator, 1, %{locator: %Locator{} = locator} = fields}} ->
         if Locator.valid?(locator) and valid_value_locator_fields?(fields),
@@ -193,6 +219,8 @@ defmodule Ferricstore.Flow.LMDB.Cold do
   rescue
     _ -> :error
   end
+
+  def decode_value_locator(blob) when is_binary(blob), do: :error
 
   defp pad_u64(value) do
     encoded = Integer.to_string(value)
@@ -225,45 +253,52 @@ defmodule Ferricstore.Flow.LMDB.Cold do
 
   defp escape_key_part(_value), do: raise(ArgumentError, "cold index key parts must be strings")
 
-  defp valid_park_fields?(%{
-         locator: %Locator{kind: :state} = locator,
-         due_at_ms: due_at_ms,
-         type: type,
-         state: state,
-         partition_key: partition_key,
-         state_key: state_key,
-         priority: priority,
-         lease_until_ms: lease_until_ms,
-         fencing_token: fencing_token,
-         retention_at_ms: retention_at_ms,
-         value_refs_digest: value_refs_digest,
-         state_value: state_value,
-         checksum: checksum
-       }) do
-    Locator.valid?(locator) and optional_u64?(due_at_ms) and optional_nonempty_binary?(type) and
-      optional_nonempty_binary?(state) and optional_nonempty_binary?(partition_key) and
-      optional_nonempty_binary?(state_key) and signed_i64?(priority) and
+  defp valid_park_fields?(
+         %{
+           locator: %Locator{kind: :state} = locator,
+           due_at_ms: due_at_ms,
+           type: type,
+           state: state,
+           partition_key: partition_key,
+           state_key: state_key,
+           priority: priority,
+           lease_until_ms: lease_until_ms,
+           fencing_token: fencing_token,
+           retention_at_ms: retention_at_ms,
+           value_refs_digest: value_refs_digest,
+           checksum: checksum
+         } = fields
+       ) do
+    map_size(fields) == 12 and Locator.durable?(locator) and optional_u64?(due_at_ms) and
+      optional_bounded_binary?(type, @max_key_bytes) and
+      optional_bounded_binary?(state, @max_key_bytes) and
+      optional_bounded_binary?(partition_key, @max_key_bytes) and
+      optional_bounded_binary?(state_key, @max_key_bytes) and signed_i64?(priority) and
       optional_u64?(lease_until_ms) and optional_u64?(fencing_token) and
-      optional_u64?(retention_at_ms) and optional_nonempty_binary?(value_refs_digest) and
-      optional_binary?(state_value) and optional_nonempty_binary?(checksum)
+      optional_u64?(retention_at_ms) and optional_digest?(value_refs_digest) and
+      optional_bounded_binary?(checksum, @max_checksum_bytes)
   end
 
   defp valid_park_fields?(_fields), do: false
 
-  defp valid_value_locator_fields?(%{
-         value_ref: value_ref,
-         owner_flow_id: owner_flow_id,
-         owner_version: owner_version,
-         locator: %Locator{kind: :value} = locator,
-         ref_kind: ref_kind,
-         expire_at_ms: expire_at_ms,
-         checksum: checksum
-       }) do
-    Locator.valid?(locator) and nonempty_binary?(value_ref) and nonempty_binary?(owner_flow_id) and
-      u64?(owner_version) and locator.flow_id == owner_flow_id and
+  defp valid_value_locator_fields?(
+         %{
+           value_ref: value_ref,
+           owner_flow_id: owner_flow_id,
+           owner_version: owner_version,
+           locator: %Locator{kind: :value} = locator,
+           ref_kind: ref_kind,
+           expire_at_ms: expire_at_ms,
+           checksum: checksum
+         } = fields
+       ) do
+    map_size(fields) == 7 and Locator.durable?(locator) and
+      bounded_binary?(value_ref, @max_key_bytes) and
+      bounded_binary?(owner_flow_id, @max_run_id_bytes) and u64?(owner_version) and
+      locator.flow_id == owner_flow_id and
       locator.version == owner_version and
       optional_ref_kind?(ref_kind) and optional_u64?(expire_at_ms) and
-      optional_nonempty_binary?(checksum)
+      optional_bounded_binary?(checksum, @max_checksum_bytes)
   end
 
   defp valid_value_locator_fields?(_fields), do: false
@@ -272,11 +307,25 @@ defmodule Ferricstore.Flow.LMDB.Cold do
   defp optional_u64?(nil), do: true
   defp optional_u64?(value), do: u64?(value)
   defp signed_i64?(value), do: is_integer(value) and value >= @min_i64 and value <= @max_i64
-  defp nonempty_binary?(value), do: is_binary(value) and value != ""
-  defp optional_nonempty_binary?(nil), do: true
-  defp optional_nonempty_binary?(value), do: nonempty_binary?(value)
-  defp optional_binary?(nil), do: true
-  defp optional_binary?(value), do: is_binary(value)
+
+  defp bounded_binary?(value, maximum),
+    do: is_binary(value) and value != "" and byte_size(value) <= maximum
+
+  defp optional_bounded_binary?(nil, _maximum), do: true
+  defp optional_bounded_binary?(value, maximum), do: bounded_binary?(value, maximum)
+  defp optional_digest?(nil), do: true
+
+  defp optional_digest?(digest),
+    do: is_binary(digest) and byte_size(digest) == @value_refs_digest_bytes
+
   defp optional_ref_kind?(nil), do: true
-  defp optional_ref_kind?(value), do: is_atom(value) or nonempty_binary?(value)
+  defp optional_ref_kind?(value), do: value in @value_ref_kinds
+
+  defp encode_bounded!(term, error_message) do
+    encoded = TermCodec.encode(term)
+
+    if byte_size(encoded) <= @max_encoded_bytes,
+      do: encoded,
+      else: raise(ArgumentError, error_message)
+  end
 end

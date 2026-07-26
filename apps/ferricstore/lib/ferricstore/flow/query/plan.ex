@@ -8,6 +8,7 @@ defmodule Ferricstore.Flow.Query.Plan do
            only: [
              :version,
              :path,
+             :record_source,
              :index_id,
              :index_version,
              :deduplicate,
@@ -32,6 +33,7 @@ defmodule Ferricstore.Flow.Query.Plan do
   ]
   defstruct version: 1,
             path: nil,
+            record_source: :authoritative_log,
             index_id: nil,
             index_version: nil,
             index_build_id: nil,
@@ -66,6 +68,7 @@ defmodule Ferricstore.Flow.Query.Plan do
   @type t :: %__MODULE__{
           version: 1,
           path: path(),
+          record_source: Ferricstore.Flow.Query.ExecutionSource.t(),
           index_id: binary() | nil,
           index_version: pos_integer() | nil,
           index_build_id: binary() | nil,

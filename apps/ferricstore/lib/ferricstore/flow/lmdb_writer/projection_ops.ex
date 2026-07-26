@@ -2,10 +2,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Flow.Query.{CompositeProjection, Limits}
+  alias Ferricstore.Flow.{Keys, Locator, ProjectionLocator}
+  alias Ferricstore.Flow.Query.{CompositeProjection, Limits, QueryRowCodec, SourceCatalog}
   alias Ferricstore.Raft.WARaftSegmentReader
   alias Ferricstore.Store.BlobValue
-  alias Ferricstore.TermCodec
 
   @default_source_pending_retries 100
   @default_source_pending_sleep_ms 1
@@ -32,30 +32,38 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       ops = coalesce_flow_state_projections(ops)
       projection_keys = projection_prefetch_keys(ops)
 
-      initial = %{
-        ops: [],
-        counts: %{},
-        count_values: %{},
-        terminal_values: %{},
-        terminal_reverse_values: %{},
-        active_reverse_values: %{},
-        composite_projection_cache:
-          maybe_prefetch_composite_reverse_values(expansion_state, projection_keys, definitions),
-        pending_terminal_count_put_news: MapSet.new(),
-        terminal_count_inits: state.terminal_count_inits,
-        terminal_atomic_write?: false,
-        op_count: 0,
-        write_group_sizes: []
-      }
+      with {:ok, prepared_sources} <- prepare_flow_projection_sources(expansion_state, ops),
+           :ok <- ensure_prepared_sources_durable(expansion_state, prepared_sources),
+           {:ok, prepared_sources} <-
+             physicalize_prepared_sources(expansion_state, prepared_sources) do
+        expansion_state =
+          Map.put(expansion_state, :prepared_flow_projection_sources, prepared_sources)
 
-      Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
-        before_count = acc.op_count
+        initial = %{
+          ops: [],
+          counts: %{},
+          count_values: %{},
+          terminal_values: %{},
+          terminal_reverse_values: %{},
+          active_reverse_values: %{},
+          composite_projection_cache:
+            maybe_prefetch_composite_reverse_values(expansion_state, projection_keys, definitions),
+          pending_terminal_count_put_news: MapSet.new(),
+          terminal_count_inits: state.terminal_count_inits,
+          terminal_atomic_write?: false,
+          op_count: 0,
+          write_group_sizes: []
+        }
 
-        case expand_op(expansion_state, op, acc) do
-          {:ok, acc} -> {:cont, {:ok, record_write_group(acc, before_count)}}
-          {:error, _reason} = error -> {:halt, error}
-        end
-      end)
+        Enum.reduce_while(ops, {:ok, initial}, fn op, {:ok, acc} ->
+          before_count = acc.op_count
+
+          case expand_op(expansion_state, op, acc) do
+            {:ok, acc} -> {:cont, {:ok, record_write_group(acc, before_count)}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end
       |> case do
         {:ok,
          %{
@@ -67,6 +75,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
           state =
             expansion_state
             |> Map.delete(:query_index_definitions)
+            |> Map.delete(:prepared_flow_projection_sources)
             |> Map.put(:terminal_count_inits, terminal_count_inits)
             |> Map.put(:terminal_atomic_write?, terminal_atomic_write?)
             |> Map.put(:write_group_sizes, Enum.reverse(reversed_group_sizes))
@@ -82,6 +91,138 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   defp coalesce_flow_state_projections(ops) do
     winners = projection_winners(ops, 0, %{})
     retain_projection_winners(ops, winners, 0, [])
+  end
+
+  defp prepare_flow_projection_sources(state, ops) do
+    Enum.reduce_while(ops, {:ok, %{}}, fn op, {:ok, prepared} ->
+      case prepare_flow_projection_source(state, op) do
+        :skip ->
+          {:cont, {:ok, prepared}}
+
+        {:ok, state_key, result} ->
+          {:cont, {:ok, Map.put(prepared, state_key, result)}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp prepare_flow_projection_source(state, {:project_flow_state_from_source, key})
+       when is_binary(key),
+       do: prepared_source_result(key, read_source_flow(state, key))
+
+  defp prepare_flow_projection_source(state, {:project_flow_query_state_from_source, key})
+       when is_binary(key),
+       do: prepared_source_result(key, read_source_flow(state, key))
+
+  defp prepare_flow_projection_source(
+         state,
+         {:project_flow_state_from_source, key, expected_version}
+       )
+       when is_binary(key) and is_integer(expected_version) and expected_version >= 0,
+       do: prepared_source_result(key, read_source_flow_at_version(state, key, expected_version))
+
+  defp prepare_flow_projection_source(
+         state,
+         {:project_flow_query_state_from_source, key, expected_version}
+       )
+       when is_binary(key) and is_integer(expected_version) and expected_version >= 0,
+       do: prepared_source_result(key, read_source_flow_at_version(state, key, expected_version))
+
+  defp prepare_flow_projection_source(_state, _op), do: :skip
+
+  defp prepared_source_result(key, {:ok, _record, _expire_at_ms, %Locator{}} = result),
+    do: {:ok, key, result}
+
+  defp prepared_source_result(key, :not_found), do: {:ok, key, :not_found}
+  defp prepared_source_result(_key, {:error, _reason} = error), do: error
+  defp prepared_source_result(_key, _invalid), do: {:error, :invalid_source_flow_record}
+
+  defp ensure_prepared_sources_durable(state, prepared) when is_map(prepared) do
+    refs =
+      Enum.reduce(prepared, MapSet.new(), fn
+        {key, {:ok, _record, _expire_at_ms, %Locator{file_id: {:waraft_apply_projection, index}}}},
+        refs
+        when is_binary(key) and is_integer(index) and index > 0 ->
+          MapSet.put(refs, {index, key})
+
+        _other, refs ->
+          refs
+      end)
+
+    ensure_prepared_source_refs_durable(state, MapSet.to_list(refs))
+  end
+
+  defp ensure_prepared_source_refs_durable(_state, []), do: :ok
+
+  defp ensure_prepared_source_refs_durable(
+         %{instance_ctx: %{data_dir: data_dir}, shard_index: shard_index},
+         refs
+       )
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    case WARaftSegmentReader.ensure_apply_projection_entries_durable(data_dir, shard_index, refs) do
+      {:ok, _removed} -> :ok
+      {:error, reason} -> {:error, {:query_row_source_not_durable, reason}}
+    end
+  end
+
+  defp ensure_prepared_source_refs_durable(_state, _refs),
+    do: {:error, :query_row_source_context_unavailable}
+
+  defp physicalize_prepared_sources(state, prepared) when is_map(prepared) do
+    Enum.reduce_while(prepared, {:ok, %{}}, fn
+      {key, {:ok, record, expire_at_ms, %Locator{} = locator}}, {:ok, acc} ->
+        case physicalize_query_locator(state, locator) do
+          {:ok, physical} ->
+            {:cont, {:ok, Map.put(acc, key, {:ok, record, expire_at_ms, physical})}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+        end
+
+      {key, :not_found}, {:ok, acc} ->
+        {:cont, {:ok, Map.put(acc, key, :not_found)}}
+    end)
+  end
+
+  defp physicalize_query_locator(_state, %Locator{file_id: file_id} = locator)
+       when is_integer(file_id) and file_id >= 0 do
+    if Locator.hydration_ready?(locator),
+      do: {:ok, locator},
+      else: {:error, :invalid_query_row_source_locator}
+  end
+
+  defp physicalize_query_locator(
+         %{instance_ctx: ctx, shard_index: shard_index},
+         %Locator{file_id: {_kind, _index} = file_id} = locator
+       )
+       when is_map(ctx) and is_integer(shard_index) and shard_index >= 0 do
+    with {:ok, {ordinal, offset, frame_size}} <-
+           WARaftSegmentReader.physical_location(ctx, shard_index, file_id),
+         {:ok, physical} <-
+           Locator.relocate(locator,
+             segment_generation: ordinal,
+             offset: offset,
+             frame_size: frame_size
+           ),
+         true <- Locator.hydration_ready?(physical) do
+      {:ok, physical}
+    else
+      {:error, reason} -> {:error, {:query_row_source_location_unavailable, reason}}
+      _invalid -> {:error, :invalid_query_row_source_locator}
+    end
+  end
+
+  defp physicalize_query_locator(_state, _locator),
+    do: {:error, :query_row_source_context_unavailable}
+
+  defp prepared_flow_projection_source(
+         %{prepared_flow_projection_sources: prepared},
+         key
+       )
+       when is_map(prepared) and is_binary(key) do
+    Map.get(prepared, key, {:error, :prepared_source_flow_record_missing})
   end
 
   defp projection_prefetch_keys(ops),
@@ -180,38 +321,12 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   defp projection_rank({:project_flow_query_state_from_source, _state_key, expected_version}),
     do: {3, expected_version, 0}
 
-  defp projection_rank({:project_flow_state, _state_key, value, _expire_at_ms}),
-    do: inline_projection_rank(value, 1)
-
-  defp projection_rank({:project_flow_query_state, _state_key, value, _expire_at_ms}),
-    do: inline_projection_rank(value, 0)
-
-  defp inline_projection_rank(value, full_projection?) when is_binary(value) do
-    case Ferricstore.Flow.decode_record(value) do
-      %{version: version} when is_integer(version) and version >= 0 ->
-        {1, version, full_projection?}
-
-      _invalid ->
-        {2, 0, full_projection?}
-    end
-  rescue
-    _error -> {2, 0, full_projection?}
-  end
-
-  defp flow_state_projection_key({:project_flow_state, state_key, _value, _expire_at_ms})
-       when is_binary(state_key),
-       do: {:ok, state_key}
-
   defp flow_state_projection_key({:project_flow_state_from_source, state_key})
        when is_binary(state_key),
        do: {:ok, state_key}
 
   defp flow_state_projection_key({:project_flow_state_from_source, state_key, version})
        when is_binary(state_key) and is_integer(version) and version >= 0,
-       do: {:ok, state_key}
-
-  defp flow_state_projection_key({:project_flow_query_state, state_key, _value, _expire_at_ms})
-       when is_binary(state_key),
        do: {:ok, state_key}
 
   defp flow_state_projection_key({:project_flow_query_state_from_source, state_key})
@@ -225,26 +340,30 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   defp flow_state_projection_key(_op), do: :error
 
   def expand_op(state, {:project_kv_from_source, key}, acc) when is_binary(key) do
-    case read_source_value(state, key) do
-      {:ok, value, expire_at_ms} ->
-        expand_path_op(
-          state.path,
-          {:put, key, Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)},
-          acc
-        )
+    if Keys.state_key?(key) do
+      {:error, :flow_state_requires_compact_source_projection}
+    else
+      case read_source_value(state, key) do
+        {:ok, value, expire_at_ms} ->
+          expand_path_op(
+            state.path,
+            {:put, key, Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)},
+            acc
+          )
 
-      :not_found ->
-        {:ok, prepend_ops(acc, [{:delete, key}])}
+        :not_found ->
+          {:ok, prepend_ops(acc, [{:delete, key}])}
 
-      {:error, _reason} = error ->
-        error
+        {:error, _reason} = error ->
+          error
+      end
     end
   end
 
   def expand_op(state, {:project_flow_state_from_source, key}, acc) when is_binary(key) do
-    case read_source_value(state, key) do
-      {:ok, value, expire_at_ms} ->
-        expand_flow_state_value(state, key, value, expire_at_ms, acc)
+    case prepared_flow_projection_source(state, key) do
+      {:ok, record, expire_at_ms, locator} ->
+        expand_flow_state_record(state, key, record, expire_at_ms, locator, acc)
 
       :not_found ->
         expand_missing_flow_state_projection(state, key, acc)
@@ -256,9 +375,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
   def expand_op(state, {:project_flow_state_from_source, key, expected_version}, acc)
       when is_binary(key) and is_integer(expected_version) and expected_version >= 0 do
-    case read_source_value_at_version(state, key, expected_version) do
-      {:ok, value, expire_at_ms} ->
-        expand_flow_state_value(state, key, value, expire_at_ms, acc)
+    case prepared_flow_projection_source(state, key) do
+      {:ok, record, expire_at_ms, locator} ->
+        expand_flow_state_record(state, key, record, expire_at_ms, locator, acc)
 
       :not_found ->
         expand_missing_flow_state_projection(state, key, acc)
@@ -268,16 +387,14 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  def expand_op(state, {:project_flow_state, key, value, expire_at_ms}, acc)
-      when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) do
-    expand_flow_state_value(state, key, value, expire_at_ms, acc)
-  end
+  def expand_op(_state, {:project_flow_state, _key, _value, _expire_at_ms}, _acc),
+    do: {:error, :inline_flow_projection_unsupported}
 
   def expand_op(state, {:project_flow_query_state_from_source, key}, acc)
       when is_binary(key) do
-    case read_source_value(state, key) do
-      {:ok, value, expire_at_ms} ->
-        expand_flow_query_state_value(state, key, value, expire_at_ms, acc)
+    case prepared_flow_projection_source(state, key) do
+      {:ok, record, expire_at_ms, locator} ->
+        expand_flow_query_state_record(state, key, record, expire_at_ms, locator, acc)
 
       :not_found ->
         expand_missing_flow_query_state_projection(state, key, acc)
@@ -289,9 +406,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
   def expand_op(state, {:project_flow_query_state_from_source, key, expected_version}, acc)
       when is_binary(key) and is_integer(expected_version) and expected_version >= 0 do
-    case read_source_value_at_version(state, key, expected_version) do
-      {:ok, value, expire_at_ms} ->
-        expand_flow_query_state_value(state, key, value, expire_at_ms, acc)
+    case prepared_flow_projection_source(state, key) do
+      {:ok, record, expire_at_ms, locator} ->
+        expand_flow_query_state_record(state, key, record, expire_at_ms, locator, acc)
 
       :not_found ->
         expand_missing_flow_query_state_projection(state, key, acc)
@@ -301,69 +418,78 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  def expand_op(state, {:project_flow_query_state, key, value, expire_at_ms}, acc)
-      when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) do
-    expand_flow_query_state_value(state, key, value, expire_at_ms, acc)
+  def expand_op(_state, {:project_flow_query_state, _key, _value, _expire_at_ms}, _acc),
+    do: {:error, :inline_flow_projection_unsupported}
+
+  def expand_op(%{path: path}, {put_mode, key, value} = op, acc)
+      when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
+    if Keys.state_key?(key),
+      do: {:error, :flow_state_requires_compact_source_projection},
+      else: expand_path_op(path, op, acc)
+  end
+
+  def expand_op(%{path: path}, {:delete, key} = op, acc) when is_binary(key) do
+    if Keys.state_key?(key),
+      do: {:error, :flow_state_requires_compact_source_projection},
+      else: expand_path_op(path, op, acc)
   end
 
   def expand_op(%{path: path}, op, acc), do: expand_path_op(path, op, acc)
 
-  def expand_flow_state_value(%{path: path} = projection_state, key, value, expire_at_ms, acc) do
-    wrapper = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
+  defp expand_flow_state_record(
+         %{path: path} = projection_state,
+         key,
+         record,
+         source_expire_at_ms,
+         %Locator{} = locator,
+         acc
+       ) do
+    projection_expire_at_ms = flow_state_projection_expire_at(record, source_expire_at_ms)
 
-    case decode_flow_record_value(wrapper) do
-      {:ok, record} ->
-        with {:ok, acc} <- expand_path_op(path, {:put, key, wrapper}, acc) do
-          projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
-
-          expand_flow_state_projection(
-            projection_state,
-            key,
-            projection_expire_at_ms,
-            record,
-            acc
-          )
-        end
-
-      :error ->
-        {:error, :invalid_flow_state_projection}
+    with {:ok, query_row} <-
+           encode_query_row(key, record, locator, projection_expire_at_ms),
+         {:ok, query_row_ops} <- query_row_put_ops(key, query_row, record),
+         acc = maybe_init_terminal_counts_for_active_record(record, acc),
+         {:ok, acc} <- expand_path_ops(path, query_row_ops, acc) do
+      expand_flow_state_projection(
+        projection_state,
+        key,
+        projection_expire_at_ms,
+        record,
+        acc
+      )
     end
   end
 
-  def expand_flow_state_value(path, key, value, expire_at_ms, acc) when is_binary(path) do
-    expand_flow_state_value(
-      %{path: path, query_index_definitions: []},
-      key,
-      value,
-      expire_at_ms,
-      acc
-    )
-  end
-
-  defp expand_flow_query_state_value(
+  defp expand_flow_query_state_record(
          projection_state,
          key,
-         value,
-         expire_at_ms,
+         record,
+         source_expire_at_ms,
+         %Locator{} = locator,
          acc
        ) do
-    wrapper = Ferricstore.Flow.LMDB.encode_value(value, expire_at_ms)
+    projection_expire_at_ms = flow_state_projection_expire_at(record, source_expire_at_ms)
 
-    case decode_flow_record_value(wrapper) do
-      {:ok, record} ->
-        acc = prepend_ops(acc, [{:put, key, wrapper}])
-        projection_expire_at_ms = flow_state_projection_expire_at(record, expire_at_ms)
+    with {:ok, query_row} <-
+           encode_query_row(key, record, locator, projection_expire_at_ms),
+         {:ok, query_row_ops} <- query_row_put_ops(key, query_row, record) do
+      acc = prepend_ops(acc, query_row_ops)
 
-        expand_composite_projection(
-          projection_state,
-          key,
-          projection_expire_at_ms,
-          record,
-          acc
-        )
+      expand_composite_projection(
+        projection_state,
+        key,
+        projection_expire_at_ms,
+        record,
+        acc
+      )
+    end
+  end
 
-      :error ->
-        {:error, :invalid_flow_state_projection}
+  defp encode_query_row(key, record, locator, expire_at_ms) do
+    case QueryRowCodec.encode(key, record, locator, expire_at_ms) do
+      {:ok, encoded} -> {:ok, encoded}
+      :error -> {:error, :invalid_flow_query_row}
     end
   end
 
@@ -409,8 +535,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     else
       with {:ok, acc} <- maybe_expand_stale_terminal_delete(path, state_key, acc),
            {:ok, acc} <- maybe_expand_stale_active_delete(path, state_key, acc),
-           {:ok, stale_attribute_ops} <-
-             stale_attribute_query_delete_ops(path, state_key, record) do
+           {:ok, stale_fixed_query_ops} <-
+             stale_fixed_query_delete_ops(path, state_key, record) do
         {active_ops, reverse_value} =
           Ferricstore.Flow.LMDB.active_index_put_ops_with_reverse(
             state_key,
@@ -422,7 +548,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
           acc
           |> put_in([:active_reverse_values, state_key], reverse_value)
           |> prepend_ops(
-            stale_attribute_ops ++
+            stale_fixed_query_ops ++
               active_ops ++
               flow_attribute_query_ops(record, expire_at_ms, state_key)
           )
@@ -442,7 +568,9 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def expand_missing_flow_state_projection(%{path: path} = projection_state, state_key, acc) do
     with {:ok, acc} <- maybe_expand_stale_terminal_delete(path, state_key, acc),
          {:ok, acc} <- maybe_expand_stale_active_delete(path, state_key, acc),
-         acc = prepend_ops(acc, [{:delete, state_key}]) do
+         {:ok, stale_fixed_query_ops} <- stale_fixed_query_delete_ops(path, state_key, nil),
+         {:ok, query_row_ops} <- query_row_delete_ops(state_key),
+         acc = prepend_ops(acc, stale_fixed_query_ops ++ query_row_ops) do
       expand_composite_removal(projection_state, state_key, acc)
     end
   end
@@ -456,8 +584,36 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   end
 
   defp expand_missing_flow_query_state_projection(projection_state, state_key, acc) do
-    acc = prepend_ops(acc, [{:delete, state_key}])
-    expand_composite_removal(projection_state, state_key, acc)
+    with {:ok, query_row_ops} <- query_row_delete_ops(state_key) do
+      acc = prepend_ops(acc, query_row_ops)
+      expand_composite_removal(projection_state, state_key, acc)
+    end
+  end
+
+  defp query_row_put_ops(state_key, query_row, record)
+       when is_binary(state_key) and is_binary(query_row) and is_map(record) do
+    with type when is_binary(type) and type != "" <- Map.get(record, :type),
+         catalog_key <- Keys.type_catalog_member_key(type, state_key),
+         {:ok, {:put, source_key, source_value}} <- SourceCatalog.put_op(catalog_key, state_key) do
+      {:ok, [{:put, state_key, query_row}, {:put_new, source_key, source_value}]}
+    else
+      _invalid -> {:error, :invalid_query_source_catalog_entry}
+    end
+  rescue
+    ArgumentError -> {:error, :invalid_query_source_catalog_entry}
+  end
+
+  defp query_row_delete_ops(state_key) when is_binary(state_key) do
+    {:ok, [{:delete, state_key}]}
+  end
+
+  defp expand_path_ops(path, ops, acc) do
+    Enum.reduce_while(ops, {:ok, acc}, fn op, {:ok, acc} ->
+      case expand_path_op(path, op, acc) do
+        {:ok, acc} -> {:cont, {:ok, acc}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp query_index_definitions(%{instance_ctx: instance_ctx, shard_index: shard_index})
@@ -637,20 +793,37 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
   def read_source_value(state, key) do
     {pending_retries, pending_sleep_ms} = source_pending_config()
-    do_read_source_value(state, key, pending_retries, pending_sleep_ms)
+
+    state
+    |> do_read_source_entry(key, pending_retries, pending_sleep_ms)
+    |> without_source_location()
   end
 
   def read_source_value(state, key, pending_retries) do
     {pending_retries, pending_sleep_ms} =
       normalize_source_pending_config(pending_retries, source_pending_sleep_ms())
 
-    do_read_source_value(state, key, pending_retries, pending_sleep_ms)
+    state
+    |> do_read_source_entry(key, pending_retries, pending_sleep_ms)
+    |> without_source_location()
   end
 
-  defp read_source_value_at_version(state, key, expected_version) do
+  defp read_source_flow(state, key) do
     {pending_retries, pending_sleep_ms} = source_pending_config()
 
-    do_read_source_value_at_version(
+    case do_read_source_entry(state, key, pending_retries, pending_sleep_ms) do
+      {:ok, value, expire_at_ms, source_location} ->
+        located_source_flow(state, key, value, expire_at_ms, source_location)
+
+      other ->
+        other
+    end
+  end
+
+  defp read_source_flow_at_version(state, key, expected_version) do
+    {pending_retries, pending_sleep_ms} = source_pending_config()
+
+    do_read_source_flow_at_version(
       state,
       key,
       expected_version,
@@ -659,20 +832,26 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     )
   end
 
-  defp do_read_source_value_at_version(
+  defp do_read_source_flow_at_version(
          state,
          key,
          expected_version,
          pending_retries,
          pending_sleep_ms
        ) do
-    case do_read_source_value(state, key, 0, pending_sleep_ms) do
-      {:ok, value, _expire_at_ms} = result ->
-        case source_flow_record_version(value) do
-          {:ok, version} when version >= expected_version ->
-            result
+    case do_read_source_entry(state, key, 0, pending_sleep_ms) do
+      {:ok, value, expire_at_ms, source_location} ->
+        case ProjectionLocator.decode_source_at_least(
+               key,
+               value,
+               expected_version,
+               expire_at_ms,
+               source_location
+             ) do
+          {:ok, record, locator} ->
+            {:ok, record, expire_at_ms, locator}
 
-          {:ok, _stale_version} ->
+          {:stale, _version} ->
             retry_versioned_source_read(
               state,
               key,
@@ -682,8 +861,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
               :stale
             )
 
-          {:error, _reason} = error ->
-            error
+          _invalid ->
+            {:error, :invalid_source_flow_record}
         end
 
       :not_found ->
@@ -751,7 +930,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
        ) do
     Process.sleep(pending_sleep_ms)
 
-    do_read_source_value_at_version(
+    do_read_source_flow_at_version(
       state,
       key,
       expected_version,
@@ -760,23 +939,16 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     )
   end
 
-  defp source_flow_record_version(value) when is_binary(value) do
-    case Ferricstore.Flow.decode_record(value) do
-      %{version: version} when is_integer(version) and version >= 0 -> {:ok, version}
-      _invalid -> {:error, :invalid_source_flow_record_version}
-    end
-  rescue
-    _error -> {:error, :invalid_source_flow_record_version}
-  end
-
-  defp do_read_source_value(state, key, pending_retries, pending_sleep_ms) do
+  defp do_read_source_entry(state, key, pending_retries, pending_sleep_ms) do
     with keydir when not is_nil(keydir) <- source_keydir(state),
-         [{^key, cached_value, expire_at_ms, _lfu, file_id, offset, _value_size}] <-
+         [{^key, cached_value, expire_at_ms, _lfu, file_id, offset, value_size}] <-
            :ets.lookup(keydir, key) do
+      source_location = {file_id, offset, value_size}
+
       case file_id do
         :pending when pending_retries > 0 ->
           Process.sleep(pending_sleep_ms)
-          do_read_source_value(state, key, pending_retries - 1, pending_sleep_ms)
+          do_read_source_entry(state, key, pending_retries - 1, pending_sleep_ms)
 
         :pending ->
           {:error, {:source_pending, key}}
@@ -785,19 +957,29 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
           :not_found
 
         file_id when is_integer(file_id) and file_id >= 0 ->
-          read_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
+          state
+          |> read_source_location(key, cached_value, expire_at_ms, file_id, offset)
+          |> with_source_location(source_location)
 
         {:waraft_segment, _index} = file_id ->
-          read_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
+          state
+          |> read_source_location(key, cached_value, expire_at_ms, file_id, offset)
+          |> with_source_location(source_location)
 
         {kind, _index} = file_id when kind in [:waraft_projection, :waraft_apply_projection] ->
-          read_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
+          state
+          |> read_source_location(key, cached_value, expire_at_ms, file_id, offset)
+          |> with_source_location(source_location)
 
         _ when is_binary(cached_value) ->
-          source_read_result(state, {:ok, cached_value}, expire_at_ms)
+          state
+          |> source_read_result({:ok, cached_value}, expire_at_ms)
+          |> with_source_location(source_location)
 
         _ ->
-          read_source_location(state, key, cached_value, expire_at_ms, file_id, offset)
+          state
+          |> read_source_location(key, cached_value, expire_at_ms, file_id, offset)
+          |> with_source_location(source_location)
       end
     else
       [] -> :not_found
@@ -806,6 +988,23 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   rescue
     error -> {:error, {:source_read_failed, error}}
+  end
+
+  defp without_source_location({:ok, value, expire_at_ms, _source_location}),
+    do: {:ok, value, expire_at_ms}
+
+  defp without_source_location(other), do: other
+
+  defp with_source_location({:ok, value, expire_at_ms}, source_location),
+    do: {:ok, value, expire_at_ms, source_location}
+
+  defp with_source_location(other, _source_location), do: other
+
+  defp located_source_flow(_state, key, value, expire_at_ms, source_location) do
+    with {:ok, record, locator} <-
+           ProjectionLocator.decode_source(key, value, expire_at_ms, source_location) do
+      {:ok, record, expire_at_ms, locator}
+    end
   end
 
   def source_pending_retries do
@@ -1040,19 +1239,22 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       attributes: attributes,
       indexed_attributes: indexed_attributes,
       state_meta: state_meta,
-      indexed_state_meta: indexed_state_meta
+      indexed_state_meta: indexed_state_meta,
+      parent_flow_id: parent_flow_id,
+      root_flow_id: root_flow_id,
+      correlation_id: correlation_id
     }
 
     with {:ok, acc} <-
            maybe_expand_stale_terminal_delete(path, state_key, terminal_key, acc),
          {:ok, acc} <-
            expand_path_op(path, {:terminal_put, terminal_key, value, state_key, count_key}, acc),
-         {:ok, stale_attribute_ops} <-
-           stale_attribute_query_delete_ops(path, state_key, next_record) do
+         {:ok, stale_fixed_query_ops} <-
+           stale_fixed_query_delete_ops(path, state_key, next_record) do
       {:ok,
        prepend_ops(
          acc,
-         stale_attribute_ops ++
+         stale_fixed_query_ops ++
            terminal_project_metadata_ops(
              id,
              partition_key,
@@ -1120,7 +1322,6 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
   def expand_path_op(_path, {put_mode, key, value} = op, acc)
       when put_mode in [:put, :put_new] and is_binary(key) and is_binary(value) do
-    acc = maybe_init_terminal_counts_for_active_record(value, acc)
     {:ok, prepend_ops(acc, [op])}
   end
 
@@ -1242,9 +1443,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
   def expand_path_op(_path, op, acc), do: {:ok, prepend_ops(acc, [op])}
 
-  def maybe_init_terminal_counts_for_active_record(value, acc) do
-    with {:ok, record} <- decode_flow_record_value(value),
-         state when is_binary(state) <- Map.get(record, :state),
+  def maybe_init_terminal_counts_for_active_record(record, acc) when is_map(record) do
+    with state when is_binary(state) <- Map.get(record, :state),
          false <- Ferricstore.Flow.LMDB.terminal_state?(state),
          type when is_binary(type) <- Map.get(record, :type) do
       partition_key = Map.get(record, :partition_key)
@@ -1282,21 +1482,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
-  def decode_flow_record_value(value) do
-    case TermCodec.decode(value) do
-      {:ok, {_expire_at_ms, encoded_record}} when is_binary(encoded_record) ->
-        {:ok, flow_call(:decode_record, [encoded_record])}
-
-      _ ->
-        :error
-    end
-  rescue
-    _ -> :error
-  end
-
-  def flow_call(function, args) do
-    apply(Ferricstore.Flow, function, args)
-  end
+  def maybe_init_terminal_counts_for_active_record(_value, acc), do: acc
 
   def terminal_value(path, terminal_key, acc) do
     case Map.fetch(acc.terminal_values, terminal_key) do
@@ -1698,16 +1884,16 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end)
   end
 
-  def stale_attribute_query_delete_ops(path, state_key, next_record) do
+  def stale_fixed_query_delete_ops(path, state_key, next_record) do
     next_keys =
       next_record
-      |> flow_attribute_query_keys()
+      |> flow_fixed_query_keys()
       |> MapSet.new()
 
     with {:ok, old_record} <- old_projected_flow_record(path, state_key) do
       ops =
         old_record
-        |> flow_attribute_query_keys()
+        |> flow_fixed_query_keys()
         |> MapSet.new()
         |> MapSet.difference(next_keys)
         |> Enum.map(&{:delete, &1})
@@ -1719,24 +1905,25 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   def old_projected_flow_record(path, state_key) do
     path
     |> Ferricstore.Flow.LMDB.get(state_key)
-    |> old_projected_flow_record_result()
+    |> old_projected_flow_record_result(state_key)
   end
 
   @doc false
-  def __old_projected_flow_record_result_for_test__(result),
-    do: old_projected_flow_record_result(result)
+  def __old_projected_flow_record_result_for_test__(result, state_key),
+    do: old_projected_flow_record_result(result, state_key)
 
-  defp old_projected_flow_record_result({:ok, value}) when is_binary(value) do
-    case decode_flow_record_value(value) do
-      {:ok, record} -> {:ok, record}
+  defp old_projected_flow_record_result({:ok, value}, state_key)
+       when is_binary(value) and is_binary(state_key) do
+    case QueryRowCodec.decode(value, state_key) do
+      {:ok, %{record: record}} -> {:ok, record}
       :error -> {:error, :invalid_projected_flow_record}
     end
   end
 
-  defp old_projected_flow_record_result(:not_found), do: {:ok, nil}
-  defp old_projected_flow_record_result({:error, _reason} = error), do: error
+  defp old_projected_flow_record_result(:not_found, _state_key), do: {:ok, nil}
+  defp old_projected_flow_record_result({:error, _reason} = error, _state_key), do: error
 
-  defp old_projected_flow_record_result(invalid),
+  defp old_projected_flow_record_result(invalid, _state_key),
     do: {:error, {:invalid_projected_flow_read, invalid}}
 
   def flow_attribute_query_keys(nil), do: []
@@ -1752,6 +1939,31 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     |> Enum.map(fn {index_key, _id, score} ->
       Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
     end)
+  end
+
+  defp flow_fixed_query_keys(nil), do: []
+
+  defp flow_fixed_query_keys(record) do
+    flow_attribute_query_keys(record) ++ terminal_metadata_query_keys(record)
+  end
+
+  defp terminal_metadata_query_keys(record) do
+    if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+      id = Map.get(record, :id)
+      partition_key = Map.get(record, :partition_key)
+      score = Map.get(record, :updated_at_ms, 0)
+
+      id
+      |> terminal_project_metadata_index_keys(
+        partition_key,
+        Map.get(record, :parent_flow_id),
+        Map.get(record, :root_flow_id),
+        Map.get(record, :correlation_id)
+      )
+      |> Enum.map(&Ferricstore.Flow.LMDB.query_index_key(&1, id, score))
+    else
+      []
+    end
   end
 
   def terminal_project_metadata_op(

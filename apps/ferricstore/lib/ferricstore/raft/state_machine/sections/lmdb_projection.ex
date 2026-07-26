@@ -46,38 +46,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
       @flow_lmdb_max_u64 18_446_744_073_709_551_615
       alias Ferricstore.Transaction.Ast, as: TxAst
 
-      defp queue_pending_lmdb_flow_state_projection(state_key, value, expire_at_ms)
-           when is_binary(state_key) and is_binary(value) and is_integer(expire_at_ms) do
-        queue_pending_lmdb_mirror_op({:project_flow_state, state_key, value, expire_at_ms})
+      defp queue_pending_lmdb_flow_state_projection_from_source(state_key, version)
+           when is_binary(state_key) and is_integer(version) and version >= 0 do
+        queue_pending_lmdb_mirror_op({:project_flow_state_from_source, state_key, version})
         :ok
       end
 
-      defp queue_pending_lmdb_flow_state_projection(state_key, _value, _expire_at_ms)
-           when is_binary(state_key) do
-        queue_pending_lmdb_flow_state_projection_from_source(state_key)
-      end
-
-      defp queue_pending_lmdb_flow_state_projection_from_source(state_key)
-           when is_binary(state_key) do
-        queue_pending_lmdb_mirror_op({:project_flow_state_from_source, state_key})
-        :ok
-      end
-
-      defp queue_pending_lmdb_flow_query_state_projection(state_key, value, expire_at_ms)
-           when is_binary(state_key) and is_binary(value) and is_integer(expire_at_ms) do
-        queue_pending_lmdb_mirror_op({:project_flow_query_state, state_key, value, expire_at_ms})
-
-        :ok
-      end
-
-      defp queue_pending_lmdb_flow_query_state_projection(state_key, _value, _expire_at_ms)
-           when is_binary(state_key) do
-        queue_pending_lmdb_flow_query_state_projection_from_source(state_key)
-      end
-
-      defp queue_pending_lmdb_flow_query_state_projection_from_source(state_key)
-           when is_binary(state_key) do
-        queue_pending_lmdb_mirror_op({:project_flow_query_state_from_source, state_key})
+      defp queue_pending_lmdb_flow_query_state_projection_from_source(state_key, version)
+           when is_binary(state_key) and is_integer(version) and version >= 0 do
+        queue_pending_lmdb_mirror_op({:project_flow_query_state_from_source, state_key, version})
         :ok
       end
 
@@ -114,89 +91,40 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         :ok
       end
 
-      defp maybe_queue_terminal_lmdb_index_delete(state, record) do
+      defp queue_lmdb_reprojection_for_old_terminal(state, record, next) do
         with_lmdb_mirror_shard(state, fn ->
           if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-            partition_key = Map.get(record, :partition_key)
-            state_index_key = FlowKeys.state_index_key(record.type, record.state, partition_key)
-            updated_at_ms = Map.get(record, :updated_at_ms, 0)
-
-            terminal_key =
-              Ferricstore.Flow.LMDB.terminal_index_key(state_index_key, record.id, updated_at_ms)
-
-            terminal_key
-            |> queue_pending_lmdb_mirror_terminal_delete(
-              FlowKeys.state_key(record.id, Map.get(record, :partition_key)),
-              Ferricstore.Flow.LMDB.terminal_count_key(state_index_key)
+            queue_pending_lmdb_flow_state_projection_from_source(
+              FlowKeys.state_key(Map.fetch!(next, :id), Map.get(next, :partition_key)),
+              Map.fetch!(next, :version)
             )
-
-            maybe_queue_terminal_lmdb_expire_delete(record, terminal_key)
-            maybe_queue_terminal_lmdb_history_expire_delete(record)
           end
         end)
 
         :ok
       end
 
-      defp maybe_queue_terminal_lmdb_expire_delete(record, terminal_key) do
-        case Map.get(record, :terminal_retention_until_ms) do
-          expire_at_ms
-          when is_integer(expire_at_ms) and expire_at_ms > 0 and
-                 expire_at_ms <= @flow_lmdb_max_u64 ->
-            expire_at_ms
-            |> Ferricstore.Flow.LMDB.terminal_expire_key(terminal_key)
-            |> queue_pending_lmdb_mirror_delete()
-
-          _missing_or_invalid ->
-            # :terminal_delete derives the exact marker from the persisted index value.
-            :ok
-        end
-      end
-
-      defp maybe_queue_terminal_lmdb_history_expire_delete(record) do
-        partition_key = Map.get(record, :partition_key)
-        history_key = FlowKeys.history_key(Map.fetch!(record, :id), partition_key)
-
-        case Map.get(record, :terminal_retention_until_ms) do
-          expire_at_ms
-          when is_integer(expire_at_ms) and expire_at_ms > 0 and
-                 expire_at_ms <= @flow_lmdb_max_u64 ->
-            expire_at_ms
-            |> Ferricstore.Flow.LMDB.history_flow_expire_key(history_key)
-            |> queue_pending_lmdb_mirror_delete()
-
-          _missing_or_invalid ->
-            :ok
-        end
-      end
-
-      defp queue_lmdb_metadata_index_deletes(state, record) do
+      defp maybe_queue_terminal_lmdb_history_expire_delete(state, record) do
         with_lmdb_mirror_shard(state, fn ->
-          metadata_query_keys =
-            record
-            |> flow_metadata_index_entries()
-            |> Enum.map(fn {index_key, id, score} ->
-              Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
-            end)
+          if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
+            history_key =
+              FlowKeys.history_key(
+                Map.fetch!(record, :id),
+                Map.get(record, :partition_key)
+              )
 
-          attribute_query_keys =
-            record
-            |> Ferricstore.Flow.Attributes.index_entries()
-            |> Enum.map(fn {index_key, id, score} ->
-              Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
-            end)
+            case Map.get(record, :terminal_retention_until_ms) do
+              expire_at_ms
+              when is_integer(expire_at_ms) and expire_at_ms > 0 and
+                     expire_at_ms <= @flow_lmdb_max_u64 ->
+                expire_at_ms
+                |> Ferricstore.Flow.LMDB.history_flow_expire_key(history_key)
+                |> queue_pending_lmdb_mirror_delete()
 
-          state_meta_query_keys =
-            record
-            |> Ferricstore.Flow.StateMeta.index_entries()
-            |> Enum.map(fn {index_key, id, score} ->
-              Ferricstore.Flow.LMDB.query_index_key(index_key, id, score)
-            end)
-
-          (metadata_query_keys ++ attribute_query_keys ++ state_meta_query_keys)
-          |> Enum.each(fn query_key ->
-            queue_pending_lmdb_mirror_query_delete(query_key)
-          end)
+              _missing_or_invalid ->
+                :ok
+            end
+          end
         end)
 
         :ok
@@ -223,19 +151,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
         :ok
       end
 
-      defp queue_pending_lmdb_mirror_query_delete(query_key) do
-        queue_pending_lmdb_mirror_op({:query_delete, query_key})
-        :ok
-      end
-
       defp queue_pending_lmdb_mirror_delete(key) do
         queue_pending_lmdb_mirror_op({:delete, key})
-        :ok
-      end
-
-      defp queue_pending_lmdb_mirror_terminal_delete(terminal_key, state_key, count_key) do
-        op = {:terminal_delete, terminal_key, state_key, count_key}
-        queue_pending_lmdb_mirror_op(op)
         :ok
       end
 
@@ -1106,7 +1023,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       defp queue_lmdb_state_delete_projection(state, key) do
         with_lmdb_mirror_shard(state, fn ->
-          queue_pending_lmdb_mirror_delete(key)
+          queue_pending_lmdb_mirror_op({:project_flow_state_from_source, key})
           queue_pending_lmdb_mirror_after_flush({:delete_flow_tombstone, state.ets, key})
         end)
       end

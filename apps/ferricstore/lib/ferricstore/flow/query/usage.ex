@@ -54,11 +54,11 @@ defmodule Ferricstore.Flow.Query.Usage do
     usage.hydrated_records <= usage.scanned_entries and
       usage.duplicate_entries <= usage.scanned_entries and
       usage.range_pages <= usage.scanned_entries + usage.range_seeks and
-      usage.residual_checks <= usage.hydrated_records * @maximum_predicates
+      usage.residual_checks <= usage.scanned_entries * @maximum_predicates
   end
 
   defp valid_result_usage?(%{result_records: 1}, :count), do: true
-  defp valid_result_usage?(usage, :records), do: usage.result_records <= usage.hydrated_records
+  defp valid_result_usage?(usage, :records), do: usage.result_records <= usage.scanned_entries
   defp valid_result_usage?(_usage, _kind), do: false
 
   defp nonnegative_integer?(value),

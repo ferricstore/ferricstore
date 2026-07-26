@@ -19,6 +19,7 @@ defmodule Ferricstore.Flow.Query.ExplainTest do
     assert first_explain.version == "ferric.flow.explain/v1"
     assert first_explain.status == "planned"
     assert first_explain.plan.path == "ordered_range"
+    assert first_explain.plan.record_source == "authoritative_log"
 
     assert first_explain.plan.index == %{
              logical_id: "flow_runs_tenant_state_updated",
@@ -28,6 +29,9 @@ defmodule Ferricstore.Flow.Query.ExplainTest do
 
     assert first_explain.plan.range_count == 1
     assert first_explain.plan.order == "native"
+    assert first_explain.plan.projection.source == "authoritative_log"
+    assert first_explain.plan.projection.requires_hydration
+    assert first_explain.estimate.hydration_bytes > 0
 
     assert first_explain.plan.mandatory_scope == %{
              mode: "dedicated",
@@ -78,7 +82,7 @@ defmodule Ferricstore.Flow.Query.ExplainTest do
     end
   end
 
-  test "reports the requested result projection and authoritative application stage" do
+  test "reports compact metadata-row projection without log hydration" do
     request =
       request("tenant", "failed", 100, 200)
       |> Map.put(:projection, [:run_id, :state, {:attribute, "customer"}])
@@ -88,9 +92,47 @@ defmodule Ferricstore.Flow.Query.ExplainTest do
 
     assert explain.plan.projection == %{
              fields: ["run_id", "state", "attribute.customer"],
-             application: "after_authoritative_recheck",
-             index_only: false
+             source: "query_row",
+             index_only: false,
+             requires_hydration: false
            }
+
+    assert explain.plan.record_source == "query_row"
+    assert explain.estimate.hydrated_records == 0
+    assert explain.estimate.metadata_rows > 0
+  end
+
+  test "reports when a sparse projection is eligible for covering execution" do
+    request =
+      request("tenant", "failed", 100, 200)
+      |> Map.put(:projection, [:run_id, :state, :updated_at_ms])
+
+    covering_index =
+      IndexDefinition.new!(%{
+        id: "flow_runs_tenant_state_updated_covering",
+        version: 1,
+        fields: [
+          {:partition_key, :asc},
+          {:state, :asc},
+          {:updated_at_ms, :desc}
+        ],
+        covering_fields: [:partition_key, :run_id, :state, :updated_at_ms, :version]
+      })
+      |> active_index()
+
+    assert {:ok, plan} = Planner.plan(request, [covering_index], now_ms: 1_000)
+    explain = Explain.render(plan, request)
+
+    assert explain.plan.projection == %{
+             fields: ["run_id", "state", "updated_at_ms"],
+             source: "covering_index",
+             index_only: true,
+             requires_hydration: false
+           }
+
+    assert explain.plan.record_source == "covering_index"
+    assert explain.estimate.hydrated_records == 0
+    assert explain.estimate.metadata_rows == 0
   end
 
   test "lists alternatives deterministically without physical bounds" do
@@ -208,12 +250,18 @@ defmodule Ferricstore.Flow.Query.ExplainTest do
 
     assert {:ok, %Plan{path: :history} = plan} = Planner.plan(request, [], now_ms: 1_000)
 
-    assert Explain.render(plan, request).quality == %{
+    explain = Explain.render(plan, request)
+
+    assert explain.quality == %{
              exactness: "authoritative",
              freshness: "current",
              coverage: "complete",
              pagination: "authenticated_seek"
            }
+
+    assert explain.plan.projection.source == "authoritative_log"
+    assert explain.plan.projection.requires_hydration
+    assert explain.estimate.hydration_bytes > 0
   end
 
   test "describes authoritative lineage reads without projection semantics" do
@@ -231,12 +279,18 @@ defmodule Ferricstore.Flow.Query.ExplainTest do
 
     assert {:ok, %Plan{path: :lineage} = plan} = Planner.plan(request, [], now_ms: 1_000)
 
-    assert Explain.render(plan, request).quality == %{
+    explain = Explain.render(plan, request)
+
+    assert explain.quality == %{
              exactness: "authoritative",
              freshness: "current",
              coverage: "complete",
              pagination: "authenticated_seek"
            }
+
+    assert explain.plan.projection.source == "authoritative_log"
+    assert explain.plan.projection.requires_hydration
+    assert explain.estimate.hydration_bytes > 0
   end
 
   test "turns budget plan rejection into bounded remediation instead of crashing" do

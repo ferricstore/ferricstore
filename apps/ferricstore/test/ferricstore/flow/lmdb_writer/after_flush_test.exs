@@ -209,6 +209,116 @@ defmodule Ferricstore.Flow.LMDBWriter.AfterFlushTest do
     assert {:error, :source_keydir_unavailable} = AfterFlush.apply_after_flush(action)
   end
 
+  test "hibernation spills an apply projection before evicting its hot source" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-after-flush-hibernation-spill-#{System.unique_integer([:positive])}"
+      )
+
+    state_key = "flow:{flow:hibernate-spill}:state:a"
+    encoded = "authoritative-state-record"
+    index = 29
+    ets = :ets.new(:after_flush_hibernation_spill, [:set])
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(data_dir, 0, index, [
+               {state_key, encoded, 0}
+             ])
+
+    row =
+      {state_key, nil, 0, 0, {:waraft_apply_projection, index}, 0, byte_size(encoded)}
+
+    true = :ets.insert(ets, row)
+
+    locator =
+      Locator.new!(
+        flow_id: "hibernate-spill",
+        kind: :state,
+        version: 1,
+        raft_index: index,
+        file_id: {:waraft_apply_projection, index},
+        offset: 0,
+        value_size: byte_size(encoded),
+        expire_at_ms: 0
+      )
+
+    assert {:ok, true} =
+             AfterFlush.hibernate_delete_hot_state_key(data_dir, 0, ets, state_key, locator)
+
+    assert [] = :ets.lookup(ets, state_key)
+
+    assert {:ok, ^encoded} =
+             Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(
+               %{data_dir: data_dir},
+               0,
+               locator.file_id,
+               state_key
+             )
+  end
+
+  test "hibernation retains its hot source when the durability spill fails" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "ferricstore-after-flush-hibernation-spill-failure-#{System.unique_integer([:positive])}"
+      )
+
+    state_key = "flow:{flow:hibernate-spill-failure}:state:a"
+    encoded = "authoritative-state-record"
+    index = 30
+    ets = :ets.new(:after_flush_hibernation_spill_failure, [:set])
+    previous_hook = Application.get_env(:ferricstore, :waraft_apply_projection_spill_hook)
+
+    on_exit(fn ->
+      if is_nil(previous_hook) do
+        Application.delete_env(:ferricstore, :waraft_apply_projection_spill_hook)
+      else
+        Application.put_env(:ferricstore, :waraft_apply_projection_spill_hook, previous_hook)
+      end
+
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(data_dir, 0, index, [
+               {state_key, encoded, 0}
+             ])
+
+    row =
+      {state_key, nil, 0, 0, {:waraft_apply_projection, index}, 0, byte_size(encoded)}
+
+    true = :ets.insert(ets, row)
+
+    locator =
+      Locator.new!(
+        flow_id: "hibernate-spill-failure",
+        kind: :state,
+        version: 1,
+        raft_index: index,
+        file_id: {:waraft_apply_projection, index},
+        offset: 0,
+        value_size: byte_size(encoded),
+        expire_at_ms: 0
+      )
+
+    Application.put_env(:ferricstore, :waraft_apply_projection_spill_hook, fn _batches ->
+      {:error, :forced_spill_failure}
+    end)
+
+    assert {:error, {:source_not_durable, :forced_spill_failure}} =
+             AfterFlush.hibernate_delete_hot_state_key(data_dir, 0, ets, state_key, locator)
+
+    assert [^row] = :ets.lookup(ets, state_key)
+    assert Ferricstore.Raft.WARaftSegmentReader.apply_projection_cache_count(data_dir, 0) == 1
+  end
+
   test "deferred cleanup delay is bounded by the runtime timer limit" do
     assert AfterFlush.normalize_delay_ms(9_999_999_999) == 4_294_967_295
     assert AfterFlush.normalize_delay_ms(250) == 250

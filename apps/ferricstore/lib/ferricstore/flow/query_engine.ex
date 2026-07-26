@@ -123,6 +123,16 @@ defmodule FerricStore.Flow.QueryEngine do
 
   def deadline_ms(_ctx), do: nil
 
+  @doc """
+  Returns the trusted query response codec selected by the protocol boundary.
+
+  Embedded callers and contexts that do not carry a negotiated codec use the
+  typed native-value representation.
+  """
+  @spec response_codec(context()) :: ExecutionContext.response_codec()
+  def response_codec(%ExecutionContext{response_codec: response_codec}), do: response_codec
+  def response_codec(_ctx), do: :native_value
+
   @doc false
   @spec capabilities_for(module()) :: capability_manifest()
   def capabilities_for(implementation) when is_atom(implementation) do

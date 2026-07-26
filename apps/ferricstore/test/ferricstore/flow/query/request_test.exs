@@ -212,6 +212,23 @@ defmodule Ferricstore.Flow.Query.RequestTest do
     assert {:error, :invalid_parameter_type} = Request.validate_bound(identity)
   end
 
+  test "dynamic metadata literals cannot exceed the authoritative value limit" do
+    request = fn value ->
+      Request.collection(
+        :execute,
+        [eq(:partition_key, "tenant-a"), eq({:attribute, "region"}, value)],
+        [{:updated_at_ms, :asc}],
+        10,
+        :record
+      )
+    end
+
+    assert :ok = request.(:binary.copy("x", 256)) |> Request.validate_bound()
+
+    assert {:error, :query_value_too_large} =
+             request.(:binary.copy("x", 257)) |> Request.validate_bound()
+  end
+
   test "record projections are source-specific, unique, and bounded" do
     run =
       Request.point_read(:execute, keyword("tenant-a"), keyword("run-1"))

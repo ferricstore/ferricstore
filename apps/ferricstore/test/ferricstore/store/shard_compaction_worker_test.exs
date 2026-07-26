@@ -102,6 +102,31 @@ defmodule Ferricstore.Store.ShardCompactionWorkerTest do
     end
   end
 
+  test "compaction rejects a copy result that changes a live value size" do
+    {pid, ctx, dir} = start_shard()
+
+    try do
+      assert :ok = GenServer.call(pid, {:put, "live", "value", 0})
+      assert :ok = GenServer.call(pid, :flush)
+      rotate_active_file(pid)
+
+      :sys.replace_state(pid, fn state ->
+        Map.put(state, :compaction_copy_fun, fn _source, _dest, [_offset], [] ->
+          {:ok, [{0, byte_size("value") + 1}]}
+        end)
+      end)
+
+      assert {:error,
+              {:compaction_failed,
+               [{0, {:compaction_plan_failed, {:copy_result_size_mismatch, 5, 6}}}]}} =
+               GenServer.call(pid, {:run_compaction, [0]})
+
+      assert "value" == GenServer.call(pid, {:get, "live"})
+    after
+      cleanup_shard(pid, ctx, dir)
+    end
+  end
+
   test "compaction plans and copies a large segment in bounded source pages" do
     {pid, ctx, dir} = start_shard()
     parent = self()

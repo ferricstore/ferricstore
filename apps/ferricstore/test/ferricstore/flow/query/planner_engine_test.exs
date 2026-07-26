@@ -11,7 +11,8 @@ defmodule Ferricstore.Flow.Query.PlannerEngineTest do
     Field,
     IndexDefinition,
     MandatoryScope,
-    Request
+    Request,
+    ResultCodec
   }
 
   alias Ferricstore.Flow.Query.{
@@ -122,6 +123,118 @@ defmodule Ferricstore.Flow.Query.PlannerEngineTest do
       state = :sys.get_state(StatisticsWorker.server_name(ctx))
       MapSet.size(state.pending) == 1 and :queue.len(state.queue) == 1
     end)
+  end
+
+  test "settles engine usage with the trusted negotiated response codec" do
+    ctx = active_context()
+
+    execution_ctx = %ExecutionContext{
+      instance_ctx: ctx,
+      response_codec: :flow_query_result_v1
+    }
+
+    assert {:ok, response} =
+             PlannerEngine.execute(execution_ctx, collection("tenant-a", "failed"))
+
+    compact_bytes = ResultCodec.encoded_size(response)
+
+    assert response.usage.response_bytes == compact_bytes
+    assert compact_bytes < NativeValueCodec.encoded_size(response)
+  end
+
+  test "emits one bounded telemetry event after an admitted query completes" do
+    handler = "planner-engine-query-telemetry-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:ferricstore, :flow, :query, :stop],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:query_telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert {:ok, _response} =
+             PlannerEngine.execute(active_context(), collection("tenant-a", "failed"))
+
+    assert_receive {:query_telemetry, [:ferricstore, :flow, :query, :stop], measurements,
+                    metadata}
+
+    assert measurements.duration_us >= measurements.wall_time_us
+    assert measurements.scanned_entries == 0
+    assert metadata.status == :ok
+    assert metadata.mode == :execute
+    assert metadata.path == :ordered_filter
+    assert metadata.covering == :ineligible
+    refute_receive {:query_telemetry, [:ferricstore, :flow, :query, :stop], _, _}
+  end
+
+  test "releases admission before invoking synchronous telemetry handlers" do
+    ctx = active_context()
+    admission = ctx.query_admission_controller
+    handler = "planner-engine-query-release-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:ferricstore, :flow, :query, :stop],
+        fn _event, _measurements, _metadata, _config ->
+          probe = AdmissionController.acquire(admission, ctx, "telemetry-probe")
+          send(parent, {:telemetry_admission_probe, probe})
+
+          case probe do
+            {:ok, lease} -> AdmissionController.release(admission, lease)
+            {:error, _reason} -> :ok
+          end
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert {:ok, _response} = PlannerEngine.execute(ctx, collection("tenant-a", "failed"))
+    assert_receive {:telemetry_admission_probe, {:ok, _lease}}
+  end
+
+  test "emits bounded telemetry when admission rejects the query" do
+    {ctx, admission} = bare_context()
+    handler = "planner-engine-query-rejection-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:ferricstore, :flow, :query, :stop],
+        fn event, measurements, metadata, _config ->
+          send(parent, {:rejected_query_telemetry, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert {:ok, lease} = AdmissionController.acquire(admission, ctx, "tenant-a")
+
+    assert {:error, :query_concurrency_exceeded} =
+             PlannerEngine.execute(ctx, collection("tenant-a", "failed"))
+
+    assert_receive {:rejected_query_telemetry, [:ferricstore, :flow, :query, :stop], measurements,
+                    metadata}
+
+    assert measurements.scanned_entries == 0
+    assert metadata.status == :error
+    assert metadata.reason == :query_concurrency_exceeded
+    assert metadata.path == nil
+    assert metadata.index_id == nil
+    refute inspect({measurements, metadata}) =~ "tenant-a"
+    refute_receive {:rejected_query_telemetry, _, _, _}
+
+    assert :ok = AdmissionController.release(admission, lease)
   end
 
   test "static EXPLAIN does not enqueue deferred statistics I/O" do

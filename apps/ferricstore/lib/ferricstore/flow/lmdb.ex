@@ -12,8 +12,10 @@ defmodule Ferricstore.Flow.LMDB do
   @max_u64 18_446_744_073_709_551_615
   @max_bounded_range_items 100_000
   @max_bounded_range_bytes 64 * 1_024 * 1_024
+  @max_atomic_range_bytes 1_073_741_824
   @max_prefix_merge_paths 1_024
   @max_lmdb_key_bytes 511
+  @max_value_locator_bytes ValueLocator.max_encoded_bytes()
   @flow_due_any_index_enabled Application.compile_env(
                                 :ferricstore,
                                 :flow_due_any_index,
@@ -51,9 +53,8 @@ defmodule Ferricstore.Flow.LMDB do
 
   def ensure_shard_dirs(_data_dir, _shard_count), do: {:error, :badarg}
 
-  # LMDB stores Flow state as a wrapper around the already-versioned Flow record
-  # bytes: {expire_at_ms, encoded_record}. The wrapper owns TTL semantics only.
-  # Do not decode user payload here; the Flow schema gate remains centralized.
+  # Generic projections use this wrapper for opaque policy, catalog, and value bytes.
+  # Flow state keys must use QueryRowCodec through the source-backed projection path.
   def encode_value(value, expire_at_ms)
       when is_binary(value) and is_integer(expire_at_ms) and expire_at_ms >= 0 and
              expire_at_ms <= @max_u64,
@@ -62,9 +63,8 @@ defmodule Ferricstore.Flow.LMDB do
   def encode_value(_value, _expire_at_ms),
     do: raise(ArgumentError, "LMDB value fields are invalid")
 
-  # Returns the wrapped encoded Flow record when it is still live. Callers must
-  # pass the returned value through Ferricstore.Flow.decode_record/1 so the Flow
-  # schema version gate stays centralized in one place.
+  # Returns opaque wrapped bytes when they are still live. The owning projection
+  # is responsible for applying its own schema decoder.
   def decode_value(blob, now_ms)
       when is_binary(blob) and is_integer(now_ms) and now_ms >= 0 and now_ms <= @max_u64 do
     case TermCodec.decode(blob) do
@@ -93,7 +93,8 @@ defmodule Ferricstore.Flow.LMDB do
     do: ValueLocator.encode(expire_at_ms, file_id, offset, value_size)
 
   def decode_value_locator(blob, now_ms)
-      when is_binary(blob) and is_integer(now_ms) and now_ms >= 0 and now_ms <= @max_u64 do
+      when is_binary(blob) and byte_size(blob) <= @max_value_locator_bytes and is_integer(now_ms) and
+             now_ms >= 0 and now_ms <= @max_u64 do
     case TermCodec.decode(blob) do
       {:ok, {:flow_value_locator, 1, expire_at_ms, file_id, offset, value_size}}
       when is_integer(expire_at_ms) and expire_at_ms > 0 and expire_at_ms <= @max_u64 ->
@@ -479,6 +480,56 @@ defmodule Ferricstore.Flow.LMDB do
       ),
       do: {:error, :invalid_lmdb_range}
 
+  @doc false
+  def range_entries_bounded_atomic(path, prefix, after_key, before_key, max_items, max_bytes)
+      when is_binary(path) and is_binary(prefix) and prefix != "" and is_binary(after_key) and
+             is_binary(before_key) and is_integer(max_items) and max_items > 0 and
+             max_items <= @max_bounded_range_items and is_integer(max_bytes) and max_bytes > 0 and
+             max_bytes <= @max_atomic_range_bytes do
+    if valid_range_bound?(prefix, after_key) and valid_range_bound?(prefix, before_key) and
+         valid_range_order?(after_key, before_key) do
+      if Ferricstore.FS.dir?(path) do
+        NIF.lmdb_range_entries_bounded(
+          path,
+          prefix,
+          after_key,
+          before_key,
+          max_items,
+          max_bytes,
+          map_size()
+        )
+      else
+        {:ok, [], true, 0}
+      end
+    else
+      {:error, :invalid_lmdb_range}
+    end
+  end
+
+  def range_entries_bounded_atomic(
+        _path,
+        _prefix,
+        _after_key,
+        _before_key,
+        _max_items,
+        _max_bytes
+      ),
+      do: {:error, :invalid_lmdb_range}
+
+  @spec composite_range_entries_bounded(
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          pos_integer(),
+          pos_integer()
+        ) ::
+          {:ok,
+           [
+             {binary(), binary(), binary(), non_neg_integer(), non_neg_integer(), pos_integer(),
+              binary() | nil}
+           ], boolean(), non_neg_integer()}
+          | {:error, term()}
   def composite_range_entries_bounded(
         path,
         prefix,

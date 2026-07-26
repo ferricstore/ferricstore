@@ -50,7 +50,7 @@ defmodule Ferricstore.Flow.Query.IndexStatusTest do
 
     assert status["contract_version"] == "ferric.flow.query.indexes/v1"
     assert status["observed_at_ms"] == now_ms
-    assert status["registry"] == %{"catalog_version" => 3, "epoch" => 1}
+    assert status["registry"] == %{"catalog_version" => 4, "epoch" => 1}
     assert status["services"]["registry"] == "ready"
     assert status["services"]["statistics_store"] == "ready"
     assert status["services"]["lifecycle_worker"] == "unavailable"
@@ -67,6 +67,18 @@ defmodule Ferricstore.Flow.Query.IndexStatusTest do
     assert index["state"] == "building"
     refute index["queryable"]
     assert index["fields"] != []
+
+    assert index["format"] == %{
+             "counter" => "ferric.flow.query.composite.counter/v1",
+             "entry" => "ferric.flow.query.composite.entry/v2",
+             "key" => "ferric.flow.query.composite.key/v1",
+             "query_row" => "ferric.flow.query.row/v1",
+             "reverse" => "ferric.flow.query.composite.reverse/v1"
+           }
+
+    assert index["covering_fields"] ==
+             Enum.map(registered.definition.covering_fields, &to_string/1)
+
     assert index["build"]["scope"] == "catalog_build"
     assert index["build"]["current_phases"] == ["pending"]
     assert index["validation"]["scope"] == "catalog_build"

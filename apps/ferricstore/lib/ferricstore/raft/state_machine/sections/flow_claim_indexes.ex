@@ -132,7 +132,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
               |> flow_claim_metadata_index_moves(next)
               |> Enum.reduce(moves, fn move, acc -> [move | acc] end)
 
-            flow_claim_queue_old_terminal_lmdb_deletes(state, record)
+            flow_claim_queue_old_terminal_lmdb_deletes(state, record, next)
             deletes = flow_claim_old_running_index_deletes(record, deletes)
             puts = flow_claim_new_running_index_puts(next, puts)
 
@@ -530,12 +530,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
         end
       end
 
-      defp flow_claim_queue_old_terminal_lmdb_deletes(state, record) do
-        maybe_queue_terminal_lmdb_index_delete(state, record)
-
-        if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-          queue_lmdb_metadata_index_deletes(state, record)
-        end
+      defp flow_claim_queue_old_terminal_lmdb_deletes(state, record, next) do
+        queue_lmdb_reprojection_for_old_terminal(state, record, next)
+        maybe_queue_terminal_lmdb_history_expire_delete(state, record)
 
         :ok
       end
@@ -1016,7 +1013,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
       end
 
       defp flow_transition_delete_old_secondary_indexes(state, [plan]) do
-        {record, _next} = flow_claim_plan_pair(plan)
+        {record, next} = flow_claim_plan_pair(plan)
 
         cond do
           Map.get(record, :state) == "running" ->
@@ -1029,8 +1026,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
             ])
 
           Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) ->
-            maybe_queue_terminal_lmdb_index_delete(state, record)
-            queue_lmdb_metadata_index_deletes(state, record)
+            queue_lmdb_reprojection_for_old_terminal(state, record, next)
+            maybe_queue_terminal_lmdb_history_expire_delete(state, record)
 
           true ->
             :ok
@@ -1040,11 +1037,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
       end
 
       defp flow_transition_delete_old_secondary_indexes(state, plans) do
-        {terminal_records, running_deletes, _inflight_cache, _worker_cache} =
+        {terminal_plans, running_deletes, _inflight_cache, _worker_cache} =
           Enum.reduce(plans, {[], [], nil, nil}, fn plan,
-                                                    {terminal_records, running_deletes,
+                                                    {terminal_plans, running_deletes,
                                                      inflight_cache, worker_cache} ->
-            {record, _next} = flow_claim_plan_pair(plan)
+            {record, next} = flow_claim_plan_pair(plan)
 
             if Map.get(record, :state) == "running" do
               partition_key = Map.get(record, :partition_key)
@@ -1062,19 +1059,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowClaimIndexes do
                 | running_deletes
               ]
 
-              {terminal_records, running_deletes, inflight_cache, worker_cache}
+              {terminal_plans, running_deletes, inflight_cache, worker_cache}
             else
               if Ferricstore.Flow.LMDB.terminal_state?(Map.get(record, :state)) do
-                {[record | terminal_records], running_deletes, inflight_cache, worker_cache}
+                {[{record, next} | terminal_plans], running_deletes, inflight_cache, worker_cache}
               else
-                {terminal_records, running_deletes, inflight_cache, worker_cache}
+                {terminal_plans, running_deletes, inflight_cache, worker_cache}
               end
             end
           end)
 
-        Enum.each(terminal_records, fn record ->
-          maybe_queue_terminal_lmdb_index_delete(state, record)
-          queue_lmdb_metadata_index_deletes(state, record)
+        Enum.each(terminal_plans, fn {record, next} ->
+          queue_lmdb_reprojection_for_old_terminal(state, record, next)
+          maybe_queue_terminal_lmdb_history_expire_delete(state, record)
         end)
 
         flow_zset_lifecycle_index_delete_grouped(state, running_deletes)

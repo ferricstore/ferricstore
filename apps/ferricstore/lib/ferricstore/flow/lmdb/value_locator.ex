@@ -4,6 +4,10 @@ defmodule Ferricstore.Flow.LMDB.ValueLocator do
   alias Ferricstore.TermCodec
 
   @max_u64 18_446_744_073_709_551_615
+  @max_encoded_bytes 128
+
+  @spec max_encoded_bytes() :: pos_integer()
+  def max_encoded_bytes, do: @max_encoded_bytes
 
   def encode(expire_at_ms, file_id, offset, value_size)
       when is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 and
@@ -16,11 +20,11 @@ defmodule Ferricstore.Flow.LMDB.ValueLocator do
 
   defp encode_validated(expire_at_ms, file_id, offset, value_size)
        when is_integer(file_id) and file_id >= 0 and file_id <= @max_u64,
-       do: TermCodec.encode({:flow_value_locator, 1, expire_at_ms, file_id, offset, value_size})
+       do: encode_term!(expire_at_ms, file_id, offset, value_size)
 
   defp encode_validated(expire_at_ms, {:flow_history, file_id} = source, offset, value_size)
        when is_integer(file_id) and file_id >= 0 and file_id <= @max_u64,
-       do: TermCodec.encode({:flow_value_locator, 1, expire_at_ms, source, offset, value_size})
+       do: encode_term!(expire_at_ms, source, offset, value_size)
 
   defp encode_validated(
          expire_at_ms,
@@ -30,7 +34,7 @@ defmodule Ferricstore.Flow.LMDB.ValueLocator do
        )
        when tag in [:waraft_segment, :waraft_apply_projection] and is_integer(index) and
               index > 0 and index <= @max_u64,
-       do: TermCodec.encode({:flow_value_locator, 1, expire_at_ms, source, offset, value_size})
+       do: encode_term!(expire_at_ms, source, offset, value_size)
 
   defp encode_validated(_expire_at_ms, _file_id, _offset, _value_size),
     do: raise(ArgumentError, "LMDB value locator metadata is invalid")
@@ -49,4 +53,13 @@ defmodule Ferricstore.Flow.LMDB.ValueLocator do
       do: true
 
   def valid_file_id?(_file_id), do: false
+
+  defp encode_term!(expire_at_ms, source, offset, value_size) do
+    encoded =
+      TermCodec.encode({:flow_value_locator, 1, expire_at_ms, source, offset, value_size})
+
+    if byte_size(encoded) <= @max_encoded_bytes,
+      do: encoded,
+      else: raise(ArgumentError, "LMDB value locator metadata is invalid")
+  end
 end

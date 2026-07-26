@@ -2,18 +2,18 @@ defmodule Ferricstore.Flow.Query.CompositeRangeReader do
   @moduledoc false
 
   alias Ferricstore.Flow.LMDB
-  alias Ferricstore.Flow.Query.CompositeRange
+  alias Ferricstore.Flow.Query.{CompositeIndex, CompositeRange}
+
+  @type page :: %{
+          entries: [map()],
+          cursor: binary() | nil,
+          exhausted: boolean(),
+          scanned_entries: non_neg_integer(),
+          scanned_bytes: non_neg_integer()
+        }
 
   @spec read(binary(), CompositeRange.t(), binary() | nil, pos_integer(), pos_integer()) ::
-          {:ok,
-           %{
-             entries: [map()],
-             cursor: binary() | nil,
-             exhausted: boolean(),
-             scanned_entries: non_neg_integer(),
-             scanned_bytes: non_neg_integer()
-           }}
-          | {:error, atom() | term()}
+          {:ok, page()} | {:error, atom() | term()}
   def read(path, %CompositeRange{} = range, cursor, max_entries, max_bytes)
       when is_binary(path) and is_integer(max_entries) and max_entries > 0 and
              is_integer(max_bytes) and max_bytes > 0 do
@@ -58,24 +58,32 @@ defmodule Ferricstore.Flow.Query.CompositeRangeReader do
 
   defp materialize_rows(rows) when is_list(rows) do
     Enum.reduce_while(rows, {:ok, []}, fn
-      {key, id, state_key, record_version, expire_at_ms, storage_bytes}, {:ok, acc}
+      {key, id, state_key, record_version, expire_at_ms, storage_bytes, encoded_covering},
+      {:ok, acc}
       when is_binary(key) and is_binary(id) and is_binary(state_key) and
              is_integer(record_version) and record_version >= 0 and
              is_integer(expire_at_ms) and expire_at_ms >= 0 and is_integer(storage_bytes) and
              storage_bytes > 0 ->
-        {:cont,
-         {:ok,
-          [
-            %{
-              id: id,
-              state_key: state_key,
-              record_version: record_version,
-              expire_at_ms: expire_at_ms,
-              storage_key: key,
-              storage_bytes: storage_bytes
-            }
-            | acc
-          ]}}
+        case decode_covering(encoded_covering, id, record_version) do
+          {:ok, covering_record} ->
+            {:cont,
+             {:ok,
+              [
+                %{
+                  id: id,
+                  state_key: state_key,
+                  record_version: record_version,
+                  expire_at_ms: expire_at_ms,
+                  storage_key: key,
+                  storage_bytes: storage_bytes,
+                  covering_record: covering_record
+                }
+                | acc
+              ]}}
+
+          :error ->
+            {:halt, {:error, :invalid_composite_entry}}
+        end
 
       _invalid, _acc ->
         {:halt, {:error, :invalid_composite_entry}}
@@ -85,6 +93,13 @@ defmodule Ferricstore.Flow.Query.CompositeRangeReader do
       {:error, _reason} = error -> error
     end
   end
+
+  defp decode_covering(nil, _id, _record_version), do: {:ok, nil}
+
+  defp decode_covering(encoded, id, record_version) when is_binary(encoded),
+    do: CompositeIndex.decode_covering_record(encoded, id, record_version)
+
+  defp decode_covering(_encoded, _id, _record_version), do: :error
 
   defp next_cursor(_rows, true), do: nil
   defp next_cursor([], false), do: nil

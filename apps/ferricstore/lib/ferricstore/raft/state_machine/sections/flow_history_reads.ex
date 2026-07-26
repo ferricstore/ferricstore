@@ -45,28 +45,6 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
       alias Ferricstore.Store.Shard.Flush, as: ShardFlush
       alias Ferricstore.Transaction.Ast, as: TxAst
 
-      defp flow_lmdb_cold_park_present?(state, key) do
-        case flow_read_lmdb_cold_park_record(state, key) do
-          {:ok, _record} -> true
-          _ -> false
-        end
-      end
-
-      defp flow_read_lmdb_cold_park_record(state, key) do
-        park_key = Ferricstore.Flow.LMDB.cold_park_key_for_state_key(key)
-
-        with {:ok, park_blob} <- Ferricstore.Flow.LMDB.get(flow_lmdb_record_path(state), park_key),
-             {:ok, %{locator: %Locator{kind: :state} = locator} = park} <-
-               Ferricstore.Flow.LMDB.decode_cold_park(park_blob),
-             {:ok, value} <- flow_read_cold_park_state_value(state, key, locator, park),
-             record when is_map(record) <- flow_decode_hot_state_value(value),
-             true <- flow_locator_matches_record?(locator, record) do
-          {:ok, record}
-        else
-          _ -> :miss
-        end
-      end
-
       defp flow_read_state_locator_value(
              state,
              key,
@@ -98,43 +76,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryReads do
 
       defp flow_read_state_locator_value(_state, _key, _locator), do: :miss
 
-      defp flow_read_cold_park_state_value(state, key, %Locator{} = locator, park)
-           when is_map(park) do
-        case flow_read_state_locator_value(state, key, locator) do
-          {:ok, value} ->
-            {:ok, value}
-
-          _ ->
-            case Map.get(park, :state_value) do
-              value when is_binary(value) -> {:ok, value}
-              _ -> :miss
-            end
-        end
-      end
+      defp flow_read_cold_park_state_value(state, key, %Locator{} = locator, _park),
+        do: flow_read_state_locator_value(state, key, locator)
 
       defp flow_locator_matches_record?(%Locator{} = locator, record) do
         Map.get(record, :id) == locator.flow_id and Map.get(record, :version) == locator.version
-      end
-
-      defp flow_decode_pending_lmdb_record(pending, key) do
-        case Map.get(pending, key) do
-          {:put, blob} -> flow_decode_lmdb_blob(blob)
-          :delete -> :miss
-          _ -> :miss
-        end
-      end
-
-      defp flow_decode_lmdb_blob(blob) do
-        case Ferricstore.Flow.LMDB.decode_value(blob, apply_now_ms()) do
-          {:ok, value} ->
-            flow_decode_record_blob(value)
-
-          :expired ->
-            :miss
-
-          :error ->
-            :miss
-        end
       end
 
       defp flow_decode_record_blob(value) when is_binary(value) do

@@ -4,6 +4,9 @@ defmodule Ferricstore.Flow.LMDB.SegmentPinsTest do
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.TermCodec
 
+  @max_key_bytes 65_535
+  @max_encoded_batch_bytes 16 * 1_024 * 1_024
+
   setup do
     path =
       Path.join(
@@ -79,6 +82,43 @@ defmodule Ferricstore.Flow.LMDB.SegmentPinsTest do
         {"invalid", -1, {:waraft_segment, 1}, 10, 20}
       ])
     end
+
+    assert_raise ArgumentError, fn ->
+      LMDB.segment_value_pin_batch_put_ops([
+        {"", 0, {:waraft_segment, 1}, 10, 20}
+      ])
+    end
+  end
+
+  test "pin batches reject oversized keys and aggregate encoded bytes" do
+    file_id = {:waraft_segment, 1}
+
+    assert_raise ArgumentError, "invalid Flow segment pin batch", fn ->
+      LMDB.encode_segment_value_pin_batch(file_id, [
+        {String.duplicate("k", @max_key_bytes + 1), 0, 10, 20}
+      ])
+    end
+
+    entries =
+      for index <- 1..259 do
+        {String.duplicate(<<rem(index, 251) + 1>>, 65_000), 0, index, 1}
+      end
+
+    assert byte_size(TermCodec.encode({:flow_segment_value_pin_batch, 1, file_id, entries})) >
+             @max_encoded_batch_bytes
+
+    assert_raise ArgumentError, "Flow segment pin batch exceeds encoded byte limit", fn ->
+      LMDB.encode_segment_value_pin_batch(file_id, entries)
+    end
+  end
+
+  test "pin batch keys authenticate the exact persisted bytes" do
+    file_id = {:waraft_segment, 7}
+    entries = [{"value-a", 0, file_id, 10, 20}, {"value-b", 0, file_id, 30, 40}]
+    {:put, pin_key, encoded} = pin_op(entries)
+    digest = binary_part(pin_key, byte_size(pin_key) - 32, 32)
+
+    assert digest == :crypto.hash(:sha256, encoded)
   end
 
   test "future pins in one family do not hide older pins in the other family", %{path: path} do

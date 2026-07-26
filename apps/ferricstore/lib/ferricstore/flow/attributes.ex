@@ -12,7 +12,9 @@ defmodule Ferricstore.Flow.Attributes do
   @min_i64 -0x8000_0000_0000_0000
   @max_i64 0x7FFF_FFFF_FFFF_FFFF
 
-  @type attrs :: %{optional(binary()) => binary() | integer() | float() | boolean() | [binary()]}
+  @type attrs :: %{
+          optional(binary()) => nil | binary() | integer() | float() | boolean() | [binary()]
+        }
 
   def from_opts(opts) do
     opts
@@ -46,13 +48,23 @@ defmodule Ferricstore.Flow.Attributes do
   end
 
   def apply_update(record, merge, delete) when is_map(record) do
-    attrs =
-      record(record)
-      |> Map.merge(merge || %{})
-      |> Map.drop(delete || [])
-
-    put_record(record, attrs)
+    case apply_update_result(record, merge, delete) do
+      {:ok, updated} -> updated
+      {:error, _reason} -> record
+    end
   end
+
+  def apply_update_result(record, merge, delete) when is_map(record) do
+    with {:ok, current} <- normalize(Map.get(record, :attributes, %{})),
+         {:ok, merge} <- normalize(merge || %{}),
+         {:ok, delete} <- normalize_delete(delete || []),
+         {:ok, attributes} <- normalize(Map.drop(Map.merge(current, merge), delete)) do
+      {:ok, put_record(record, attributes)}
+    end
+  end
+
+  def apply_update_result(_record, _merge, _delete),
+    do: {:error, "ERR invalid flow attribute update"}
 
   def encode_sidecar(attrs) when is_map(attrs) do
     attrs
@@ -90,6 +102,38 @@ defmodule Ferricstore.Flow.Attributes do
   end
 
   def normalize(_attrs), do: {:error, "ERR flow attributes must be a map"}
+
+  @doc false
+  @spec valid_normalized?(term()) :: boolean()
+  def valid_normalized?(attrs) when is_map(attrs) and map_size(attrs) <= @max_attrs do
+    Enum.all?(attrs, fn {name, value} ->
+      valid_normalized_key?(name) and valid_normalized_value?(value)
+    end) and encoded_size(attrs) <= @max_total_bytes
+  end
+
+  def valid_normalized?(_attrs), do: false
+
+  @doc false
+  @spec valid_scalar?(term()) :: boolean()
+  def valid_scalar?(value)
+      when is_binary(value) and byte_size(value) <= @max_value_bytes,
+      do: true
+
+  def valid_scalar?(value)
+      when is_integer(value) and value >= @min_i64 and value <= @max_i64,
+      do: true
+
+  def valid_scalar?(value) when is_float(value), do: finite_float?(value)
+  def valid_scalar?(value) when is_boolean(value) or is_nil(value), do: true
+  def valid_scalar?(_value), do: false
+
+  @doc false
+  @spec valid_list?(term()) :: boolean()
+  def valid_list?(values)
+      when is_list(values) and values != [] and length(values) <= @max_list_values,
+      do: valid_unique_binary_values?(values)
+
+  def valid_list?(_values), do: false
 
   def normalize_delete(values) when values in [nil, []], do: {:ok, []}
 
@@ -205,9 +249,10 @@ defmodule Ferricstore.Flow.Attributes do
 
   defp matches_normalized?(attrs, filters) do
     Enum.all?(filters, fn {name, expected} ->
-      attrs
-      |> Map.get(name)
-      |> value_matches?(expected)
+      case Map.fetch(attrs, name) do
+        {:ok, value} -> value_matches?(value, expected)
+        :error -> false
+      end
     end)
   end
 
@@ -231,13 +276,17 @@ defmodule Ferricstore.Flow.Attributes do
   defp normalize_key(key) when is_atom(key), do: key |> Atom.to_string() |> normalize_key()
 
   defp normalize_key(key) when is_binary(key) do
-    key = String.trim(key)
+    if String.valid?(key) do
+      key = String.trim(key)
 
-    cond do
-      key == "" -> {:error, "ERR flow attribute key must not be empty"}
-      byte_size(key) > @max_key_bytes -> {:error, "ERR flow attribute key too large"}
-      String.starts_with?(key, "__") -> {:error, "ERR flow attribute key is reserved"}
-      true -> {:ok, key}
+      cond do
+        key == "" -> {:error, "ERR flow attribute key must not be empty"}
+        byte_size(key) > @max_key_bytes -> {:error, "ERR flow attribute key too large"}
+        String.starts_with?(key, "__") -> {:error, "ERR flow attribute key is reserved"}
+        true -> {:ok, key}
+      end
+    else
+      {:error, "ERR flow attribute key must be valid UTF-8"}
     end
   end
 
@@ -265,6 +314,7 @@ defmodule Ferricstore.Flow.Attributes do
   end
 
   defp normalize_value(value) when is_boolean(value), do: {:ok, value}
+  defp normalize_value(nil), do: {:ok, nil}
 
   defp normalize_value(value) when is_atom(value) and not is_nil(value),
     do: value |> Atom.to_string() |> normalize_value()
@@ -308,6 +358,24 @@ defmodule Ferricstore.Flow.Attributes do
     exponent != 0x7FF
   end
 
+  defp valid_normalized_key?(key)
+       when is_binary(key) and key != "" and byte_size(key) <= @max_key_bytes do
+    String.valid?(key) and String.trim(key) == key and not String.starts_with?(key, "__")
+  end
+
+  defp valid_normalized_key?(_key), do: false
+
+  defp valid_normalized_value?(value), do: valid_scalar?(value) or valid_list?(value)
+
+  defp valid_unique_binary_values?([]), do: true
+
+  defp valid_unique_binary_values?([value | values])
+       when is_binary(value) and byte_size(value) <= @max_value_bytes do
+    value not in values and valid_unique_binary_values?(values)
+  end
+
+  defp valid_unique_binary_values?(_values), do: false
+
   defp validate_count(count) when count <= @max_attrs, do: :ok
   defp validate_count(_count), do: {:error, "ERR too many flow attributes"}
 
@@ -337,6 +405,7 @@ defmodule Ferricstore.Flow.Attributes do
   defp value_size(value) when is_integer(value), do: 8
   defp value_size(value) when is_float(value), do: 8
   defp value_size(value) when is_boolean(value), do: 1
+  defp value_size(nil), do: 0
   defp value_size(values) when is_list(values), do: Enum.reduce(values, 0, &(&2 + byte_size(&1)))
 
   defp encode_value(value) when is_list(value), do: value
@@ -355,6 +424,7 @@ defmodule Ferricstore.Flow.Attributes do
 
   def index_value(true), do: "b:1"
   def index_value(false), do: "b:0"
+  def index_value(nil), do: "n:"
 
   def decode_index_value("s64:" <> value) do
     case Base.url_decode64(value, padding: false) do
@@ -381,6 +451,7 @@ defmodule Ferricstore.Flow.Attributes do
 
   def decode_index_value("b:1"), do: true
   def decode_index_value("b:0"), do: false
+  def decode_index_value("n:"), do: nil
   def decode_index_value(value), do: value
 
   defp normalize_score(value) when is_integer(value), do: value

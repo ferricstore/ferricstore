@@ -521,9 +521,22 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
         lmdb_path =
           ctx.data_dir |> Ferricstore.DataDir.shard_data_path(0) |> Ferricstore.Flow.LMDB.path()
 
-        assert {:ok, wrapped_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
-        assert {:ok, encoded_record} = Ferricstore.Flow.LMDB.decode_value(wrapped_blob, 3)
-        assert Ferricstore.Flow.decode_record(encoded_record).id == completed.id
+        assert {:ok, query_row} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+        assert {:ok, %{locator: locator}} =
+                 Ferricstore.Flow.Query.QueryRowCodec.decode(query_row, state_key)
+
+        assert {:ok, [hydrated_record]} =
+                 Ferricstore.Flow.RecordHydrator.read_many(
+                   ctx,
+                   0,
+                   [{state_key, locator}],
+                   max_bytes: 1_048_576,
+                   include_expired: true
+                 )
+
+        assert hydrated_record.id == completed.id
+        assert hydrated_record.state == "completed"
 
         assert {:ok, %{id: ^id, state: "completed"}} =
                  Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
@@ -631,6 +644,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
         id = "flow-command-time-lmdb"
         partition_key = "tenant-command-time-lmdb"
         state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+        base_ms = Ferricstore.CommandTime.now_ms()
+        expire_at_ms = base_ms + 2_000
 
         record = %{
           id: id,
@@ -639,8 +654,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
           version: 1,
           attempts: 0,
           fencing_token: 0,
-          created_at_ms: 1_000,
-          updated_at_ms: 1_000,
+          created_at_ms: base_ms,
+          updated_at_ms: base_ms,
           next_run_at_ms: nil,
           priority: 0,
           ttl_ms: nil,
@@ -655,31 +670,34 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
           error_ref: nil,
           lease_owner: nil,
           lease_token: nil,
-          lease_deadline_ms: 0
+          lease_deadline_ms: 0,
+          terminal_retention_until_ms: expire_at_ms
         }
 
         encoded = Ferricstore.Flow.encode_record(record)
-        wrapped = Ferricstore.Flow.LMDB.encode_value(encoded, 2_000)
+
+        [query_row_op] =
+          durable_query_row_put_ops!(ctx.data_dir, 0, [record], expire_at_ms: expire_at_ms)
 
         lmdb_path =
           ctx.data_dir
           |> Ferricstore.DataDir.shard_data_path(0)
           |> Ferricstore.Flow.LMDB.path()
 
-        assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, wrapped}])
+        assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [query_row_op])
 
         assert [^encoded] =
-                 Ferricstore.CommandTime.with_now_ms(1_500, fn ->
+                 Ferricstore.CommandTime.with_now_ms(base_ms + 1_500, fn ->
                    Ferricstore.Store.Router.flow_batch_get(ctx, [id], partition_key)
                  end)
 
         assert [nil] =
-                 Ferricstore.CommandTime.with_now_ms(2_500, fn ->
+                 Ferricstore.CommandTime.with_now_ms(base_ms + 2_500, fn ->
                    Ferricstore.Store.Router.flow_batch_get(ctx, [id], partition_key)
                  end)
       end
 
-      test "flow get fails closed on malformed LMDB mirror records" do
+      test "flow get fails closed on malformed QueryRows" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
         Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -696,20 +714,21 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
         partition_key = "tenant-malformed-lmdb"
         state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
-        wrapped = Ferricstore.Flow.LMDB.encode_value("FSF2bad", 0)
-
         lmdb_path =
           ctx.data_dir
           |> Ferricstore.DataDir.shard_data_path(0)
           |> Ferricstore.Flow.LMDB.path()
 
-        assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, wrapped}])
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+                   {:put, state_key, "not-a-query-row"}
+                 ])
 
-        assert {:error, "ERR invalid flow record"} =
+        assert {:error, "ERR storage read failed"} =
                  Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
       end
 
-      test "legacy Flow LMDB mode values are ignored" do
+      test "unsupported Flow LMDB mode values are ignored" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
         Application.put_env(:ferricstore, :flow_lmdb_mode, :write_through)
@@ -724,7 +743,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
         assert Ferricstore.Flow.LMDB.mode() == :lagged
       end
 
-      test "lagged projection flow get emits telemetry for corrupt LMDB wrapper" do
+      test "lagged projection flow get reports corrupt QueryRow storage" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
         Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -763,13 +782,14 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
         assert :ok =
                  Ferricstore.Flow.LMDB.write_batch(lmdb_path, [{:put, state_key, "not-a-term"}])
 
-        assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
+        assert {:error, "ERR storage read failed"} =
+                 Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
 
         assert_receive {:flow_lmdb_read_error, [:ferricstore, :flow, :lmdb, :read_error],
-                        %{count: 1}, %{mode: :lagged, reason: :decode_error}}
+                        %{count: 1}, %{mode: :lagged, reason: :query_storage_inconsistent}}
       end
 
-      test "lineage queries skip malformed LMDB mirror records" do
+      test "lineage queries skip malformed QueryRows" do
         old_mode = Application.get_env(:ferricstore, :flow_lmdb_mode)
 
         Application.put_env(:ferricstore, :flow_lmdb_mode, :mirror)
@@ -789,7 +809,6 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
         index_key = Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key)
         query_key = Ferricstore.Flow.LMDB.query_index_key(index_key, id, 10)
 
-        wrapped = Ferricstore.Flow.LMDB.encode_value("FSF2bad", 0)
         query_value = Ferricstore.Flow.LMDB.encode_query_index_value(index_key, id, 10, 0)
 
         lmdb_path =
@@ -799,7 +818,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
 
         assert :ok =
                  Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
-                   {:put, state_key, wrapped},
+                   {:put, state_key, "not-a-query-row"},
                    {:put, query_key, query_value}
                  ])
 
@@ -857,10 +876,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
           rewound_to_event_id: nil
         }
 
-        state_value =
-          record
-          |> Ferricstore.Flow.encode_record()
-          |> Ferricstore.Flow.LMDB.encode_value(0)
+        [query_row_op] = durable_query_row_put_ops!(ctx.data_dir, 0, [record])
 
         query_index_key =
           Ferricstore.Flow.Keys.correlation_index_key(correlation_id, partition_key)
@@ -883,7 +899,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.MirrorFlowReadsRejectStaleLmdbRecor
 
         assert :ok =
                  Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
-                   {:put, state_key, state_value},
+                   query_row_op,
                    {:put, query_key, query_value}
                  ])
 

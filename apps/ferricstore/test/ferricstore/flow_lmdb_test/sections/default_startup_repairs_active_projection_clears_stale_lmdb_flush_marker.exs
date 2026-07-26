@@ -63,12 +63,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
                    ]
                  )
 
-        encoded_completed = Ferricstore.Flow.encode_record(completed)
-
-        :ets.insert(
-          keydir,
-          {state_key, encoded_completed, 0, 0, :hot, 0, byte_size(encoded_completed)}
-        )
+        %{state_key: ^state_key} =
+          put_durable_flow_source!(data_dir, shard_index, keydir, completed)
 
         assert Ferricstore.Flow.LMDB.flush_in_progress?(lmdb_path)
 
@@ -82,7 +78,12 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
                    shard_path,
                    keydir,
                    shard_index,
-                   %{name: :default},
+                   %{
+                     name: :default,
+                     data_dir: data_dir,
+                     keydir_refs: {keydir},
+                     max_value_size: 1_048_576
+                   },
                    nil,
                    nil,
                    flow_index,
@@ -177,12 +178,8 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
 
         assert Ferricstore.Flow.LMDB.env_present?(lmdb_path)
 
-        encoded_completed = Ferricstore.Flow.encode_record(completed)
-
-        :ets.insert(
-          keydir,
-          {state_key, encoded_completed, 0, 0, :hot, 0, byte_size(encoded_completed)}
-        )
+        %{state_key: ^state_key} =
+          put_durable_flow_source!(data_dir, shard_index, keydir, completed)
 
         {flow_index, flow_lookup} =
           Ferricstore.Flow.OrderedIndex.table_names(:default, shard_index)
@@ -194,7 +191,12 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
                    shard_path,
                    keydir,
                    shard_index,
-                   %{name: :default},
+                   %{
+                     name: :default,
+                     data_dir: data_dir,
+                     keydir_refs: {keydir},
+                     max_value_size: 1_048_576
+                   },
                    nil,
                    nil,
                    flow_index,
@@ -203,8 +205,7 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.DefaultStartupRepairsActiveProjecti
                    reason: :segment_replay
                  )
 
-        assert {:ok, lmdb_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
-        assert {:ok, ^encoded_completed} = Ferricstore.Flow.LMDB.decode_value(lmdb_blob, 30)
+        assert_query_row_hydrates!(data_dir, shard_index, lmdb_path, state_key, completed)
 
         queued_state_key =
           Ferricstore.Flow.Keys.state_index_key(queued.type, queued.state, queued.partition_key)

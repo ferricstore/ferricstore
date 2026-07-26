@@ -735,19 +735,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowCreate do
       defp flow_put_record_value_refs(record, _refs), do: Map.delete(record, :value_refs)
 
       defp flow_apply_attribute_updates(record, attrs) do
-        record =
-          Ferricstore.Flow.Attributes.apply_update(
-            record,
-            Map.get(attrs, :attributes_merge, %{}),
-            Map.get(attrs, :attributes_delete, [])
-          )
-          |> StateMeta.apply_update(attrs)
+        with {:ok, record} <-
+               Ferricstore.Flow.Attributes.apply_update_result(
+                 record,
+                 Map.get(attrs, :attributes_merge, %{}),
+                 Map.get(attrs, :attributes_delete, [])
+               ),
+             {:ok, record} <- StateMeta.apply_update_result(record, attrs) do
+          updated =
+            record
+            |> flow_put_record_indexed_attributes(
+              Ferricstore.Flow.Attributes.indexed_names(record)
+            )
+            |> flow_put_record_indexed_state_meta(StateMeta.indexed_key(record))
 
-        flow_put_record_indexed_attributes(
-          record,
-          Ferricstore.Flow.Attributes.indexed_names(record)
-        )
-        |> flow_put_record_indexed_state_meta(StateMeta.indexed_key(record))
+          {:ok, updated}
+        end
       end
 
       defp flow_put_record_attributes(record, attrs) when is_map(attrs) and map_size(attrs) > 0,

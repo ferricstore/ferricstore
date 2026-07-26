@@ -1010,7 +1010,7 @@ fn lmdb_composite_range_entries_bounded<'a>(
                     break;
                 }
 
-                let Some((id, state_key, record_version, expire_at_ms)) =
+                let Some((id, state_key, record_version, expire_at_ms, covering_record)) =
                     flow_composite_codec::decode_entry(key, value, &mut hasher)
                 else {
                     return Ok((atoms::error(), atoms::invalid_composite_entry()).encode(env));
@@ -1018,6 +1018,9 @@ fn lmdb_composite_range_entries_bounded<'a>(
                 let key_term = binary_term(env, key)?;
                 let id_term = binary_term(env, id)?;
                 let state_term = binary_term(env, state_key)?;
+                let covering_term = covering_record
+                    .map(|record| binary_term(env, record))
+                    .transpose()?;
                 entries.push(
                     (
                         key_term,
@@ -1026,6 +1029,7 @@ fn lmdb_composite_range_entries_bounded<'a>(
                         record_version,
                         expire_at_ms,
                         row_bytes,
+                        covering_term,
                     )
                         .encode(env),
                 );

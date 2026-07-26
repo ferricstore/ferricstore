@@ -38,6 +38,87 @@ defmodule Ferricstore.Raft.WARaftSegmentReaderSecurityTest do
                {:waraft_segment, 0},
                ["key"]
              )
+
+    assert {:error, :invalid_location_batch} =
+             WARaftSegmentReader.read_values_from_locations(
+               %{data_dir: System.tmp_dir!()},
+               0,
+               [{{:waraft_apply_projection, 1}, []}],
+               1_000
+             )
+
+    assert {:error, :invalid_location_batch} =
+             WARaftSegmentReader.read_values_from_locations(
+               %{data_dir: System.tmp_dir!()},
+               0,
+               List.duplicate({{:waraft_apply_projection, 1}, ["key"]}, 4_097),
+               1_000
+             )
+
+    assert {:error, :invalid_location_batch} =
+             WARaftSegmentReader.read_values_from_locations(
+               %{data_dir: System.tmp_dir!()},
+               0,
+               [{{:waraft_apply_projection, 1}, List.duplicate("key", 4_097)}],
+               1_000
+             )
+
+    assert {:error, :invalid_location_batch} =
+             WARaftSegmentReader.read_values_from_locations(
+               %{data_dir: System.tmp_dir!()},
+               0,
+               [
+                 {{:waraft_apply_projection, 1}, ["same-key"]},
+                 {{:waraft_apply_projection, 2}, ["same-key"]}
+               ],
+               1_000
+             )
+  end
+
+  test "physical reads reject an aggregate unique-frame byte budget overflow before disk access" do
+    oversized_requests = [
+      %{
+        file_id: {:waraft_segment, 1},
+        ordinal: 0,
+        offset: 0,
+        frame_size: 600 * 1_024 * 1_024,
+        key: "first"
+      },
+      %{
+        file_id: {:waraft_projection, 2},
+        ordinal: 0,
+        offset: 0,
+        frame_size: 600 * 1_024 * 1_024,
+        key: "second"
+      }
+    ]
+
+    assert {:error, :physical_read_byte_budget_exceeded} =
+             WARaftSegmentReader.read_physical_values(
+               %{data_dir: "/path-that-must-not-be-read"},
+               0,
+               oversized_requests,
+               1_000,
+               :live
+             )
+  end
+
+  test "multi-location reads fail when a recorded Raft index is missing" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "waraft-missing-projection-location-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    assert {:error, :apply_projection_entry_missing_at_recorded_location} =
+             WARaftSegmentReader.read_values_from_locations(
+               %{data_dir: data_dir},
+               0,
+               [{{:waraft_apply_projection, 9_001}, ["missing"]}],
+               1_000
+             )
   end
 
   test "spilled apply projections preserve expiry semantics" do
@@ -49,7 +130,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReaderSecurityTest do
 
     index = 73
     file_id = {:waraft_apply_projection, index}
-    expired_at_ms = System.system_time(:millisecond) - 1
+    expired_at_ms = Ferricstore.HLC.now_ms() - 1
 
     on_exit(fn ->
       WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
@@ -94,6 +175,178 @@ defmodule Ferricstore.Raft.WARaftSegmentReaderSecurityTest do
                file_id,
                "expired"
              )
+
+    assert {:ok, %{"expired" => "must-stay-hidden"}} =
+             WARaftSegmentReader.read_values_from_location_including_expired(
+               %{data_dir: data_dir},
+               0,
+               file_id,
+               ["expired"],
+               10_000
+             )
+
+    assert {:ok, %{}} =
+             WARaftSegmentReader.read_values_from_locations(
+               %{data_dir: data_dir},
+               0,
+               [{file_id, ["expired"]}],
+               10_000
+             )
+
+    assert {:ok, %{"expired" => "must-stay-hidden"}} =
+             WARaftSegmentReader.read_values_from_locations_including_expired(
+               %{data_dir: data_dir},
+               0,
+               [{file_id, ["expired"]}],
+               10_000
+             )
+  end
+
+  test "multi-location reads combine latest and merged projection records" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "waraft-projection-multi-location-#{System.unique_integer([:positive])}"
+      )
+
+    first_index = 78
+    second_index = 79
+
+    on_exit(fn ->
+      WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(data_dir, 0, first_index, [
+               {"old", "old-value", 0}
+             ])
+
+    assert {:ok, 1} = WARaftSegmentReader.spill_apply_projection_cache(data_dir, 0)
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(data_dir, 0, first_index, [
+               {"new", "new-value", 0}
+             ])
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(data_dir, 0, second_index, [
+               {"other", "other-value", 0}
+             ])
+
+    assert {:ok, 2} = WARaftSegmentReader.spill_apply_projection_cache(data_dir, 0)
+
+    assert {:ok,
+            %{
+              "old" => "old-value",
+              "new" => "new-value",
+              "other" => "other-value"
+            }} =
+             WARaftSegmentReader.read_values_from_locations(
+               %{data_dir: data_dir},
+               0,
+               [
+                 {{:waraft_apply_projection, first_index}, ["old", "new"]},
+                 {{:waraft_apply_projection, second_index}, ["other"]}
+               ],
+               10_000
+             )
+  end
+
+  test "durability pin spills complete requested indexes and leaves unrelated indexes hot" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "waraft-projection-durability-pin-#{System.unique_integer([:positive])}"
+      )
+
+    pinned_index = 75
+    unrelated_index = 76
+
+    on_exit(fn ->
+      WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(data_dir, 0, pinned_index, [
+               {"pinned", "pinned-value", 0},
+               {"same-index", "same-index-value", 0}
+             ])
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(data_dir, 0, unrelated_index, [
+               {"unrelated", "unrelated-value", 0}
+             ])
+
+    assert {:ok, 2} =
+             WARaftSegmentReader.ensure_apply_projection_entries_durable(data_dir, 0, [
+               {pinned_index, "pinned"}
+             ])
+
+    assert WARaftSegmentReader.apply_projection_cache_count(data_dir, 0) == 1
+
+    assert {:ok, "pinned-value"} =
+             WARaftSegmentReader.read_value_from_location_including_expired(
+               %{data_dir: data_dir},
+               0,
+               {:waraft_apply_projection, pinned_index},
+               "pinned"
+             )
+
+    assert {:ok, "same-index-value"} =
+             WARaftSegmentReader.read_value_from_location_including_expired(
+               %{data_dir: data_dir},
+               0,
+               {:waraft_apply_projection, pinned_index},
+               "same-index"
+             )
+
+    assert {:error, {:apply_projection_entry_not_durable, ^pinned_index, "missing"}} =
+             WARaftSegmentReader.ensure_apply_projection_entries_durable(data_dir, 0, [
+               {pinned_index, "missing"}
+             ])
+
+    assert WARaftSegmentReader.apply_projection_cache_count(data_dir, 0) == 1
+  end
+
+  test "durability pin verifies every requested key with one disk read per index" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "waraft-projection-batched-durability-pin-#{System.unique_integer([:positive])}"
+      )
+
+    index = 77
+    entries = for key <- 1..128, do: {"key-#{key}", "value-#{key}", 0}
+    refs = for {key, _value, _expire_at_ms} <- entries, do: {index, key}
+    latest_reads = :atomics.new(1, signed: false)
+    merged_reads = :atomics.new(1, signed: false)
+
+    on_exit(fn ->
+      WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok = WARaftSegmentReader.put_apply_projection(data_dir, 0, index, entries)
+
+    Process.put(
+      :ferricstore_waraft_apply_projection_disk_read_hook,
+      fn _root, ^index, source ->
+        counter = if source == :latest, do: latest_reads, else: merged_reads
+        :atomics.add(counter, 1, 1)
+      end
+    )
+
+    try do
+      assert {:ok, 128} =
+               WARaftSegmentReader.ensure_apply_projection_entries_durable(data_dir, 0, refs)
+    after
+      Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
+    end
+
+    assert :atomics.get(latest_reads, 1) == 1
+    assert :atomics.get(merged_reads, 1) == 0
   end
 
   test "apply projection expiry follows the cluster-adjusted clock" do

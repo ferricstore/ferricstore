@@ -1,15 +1,31 @@
 defmodule Ferricstore.Flow.Query.CompositeIndex do
   @moduledoc false
 
-  alias Ferricstore.Flow.{Keys, StorageScope, SystemMetadata}
-  alias Ferricstore.Flow.Query.{Field, IndexDefinition, Limits, TupleCodec}
+  alias Ferricstore.Flow.{Attributes, Keys, RecordIdentity, StorageScope, SystemMetadata}
+
+  alias Ferricstore.Flow.Query.{
+    CoveringCodec,
+    Field,
+    IndexDefinition,
+    Limits,
+    QueryRow,
+    TupleCodec
+  }
+
   alias Ferricstore.TermCodec
 
   @hash_tag 0x50
   @scope_tag 0x70
   @entry_identity_tag 0x60
   @entry_identity_bytes 33
-  @entry_value_version 1
+  @plain_entry_value_version 1
+  @covering_entry_value_version 2
+  @key_format "ferric.flow.query.composite.key/v1"
+  @plain_entry_format "ferric.flow.query.composite.entry/v1"
+  @covering_entry_format "ferric.flow.query.composite.entry/v2"
+  @reverse_format "ferric.flow.query.composite.reverse/v1"
+  @max_covering_value_bytes CoveringCodec.max_encoded_bytes()
+  @max_covering_record_fields CoveringCodec.max_record_fields()
   @reverse_prefix "flow-composite-reverse:1:"
   @reverse_value_tag :flow_composite_reverse
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
@@ -18,7 +34,8 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   @lmdb_max_key_bytes 511
   @max_run_id_bytes Limits.max_run_id_bytes()
   @max_state_key_bytes Limits.max_state_key_bytes()
-  @max_entry_value_bytes @max_run_id_bytes + @max_state_key_bytes + 256
+  @max_entry_value_bytes @max_run_id_bytes + @max_state_key_bytes +
+                           @max_covering_value_bytes + 512
   @max_reverse_value_bytes @max_state_key_bytes +
                              @max_reverse_entries * (@lmdb_max_key_bytes + 5) + 1_024
 
@@ -34,6 +51,19 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
 
   @spec max_entries_per_record() :: pos_integer()
   def max_entries_per_record, do: @max_reverse_entries
+
+  @doc false
+  @spec key_format() :: binary()
+  def key_format, do: @key_format
+
+  @doc false
+  @spec entry_format(IndexDefinition.t()) :: binary()
+  def entry_format(%IndexDefinition{covering_fields: []}), do: @plain_entry_format
+  def entry_format(%IndexDefinition{}), do: @covering_entry_format
+
+  @doc false
+  @spec reverse_format() :: binary()
+  def reverse_format, do: @reverse_format
 
   @doc false
   @spec max_reverse_value_bytes() :: pos_integer()
@@ -77,11 +107,92 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
          :ok <- validate_record_owner(record, id, state_key),
          {:ok, scope_prefix} <- record_scope_prefix(definition, record),
          {:ok, projection_record} <- logical_projection_record(record),
-         {:ok, record_version} <- record_version(record),
-         {:ok, value_sets} <- field_value_sets(definition, projection_record),
+         {:ok, record_version} <- record_version(record) do
+      build_entries(
+        definition,
+        projection_record,
+        state_key,
+        expire_at_ms,
+        id,
+        record_version,
+        scope_prefix
+      )
+    end
+  end
+
+  def entries_validated(%IndexDefinition{}, record, _state_key, _expire_at_ms)
+      when is_map(record),
+      do: {:error, :invalid_composite_record}
+
+  def entries_validated(%IndexDefinition{}, _record, _state_key, _expire_at_ms),
+    do: {:error, :invalid_composite_record}
+
+  @spec entries_from_query_row(IndexDefinition.t(), QueryRow.t()) ::
+          {:ok, [entry()]} | {:error, atom()}
+  def entries_from_query_row(%IndexDefinition{} = definition, %QueryRow{} = row) do
+    with :ok <- IndexDefinition.validate(definition) do
+      entries_from_query_row_validated(definition, row)
+    end
+  end
+
+  def entries_from_query_row(%IndexDefinition{}, _row),
+    do: {:error, :invalid_composite_record}
+
+  @doc false
+  @spec entries_from_query_row_validated(IndexDefinition.t(), QueryRow.t()) ::
+          {:ok, [entry()]} | {:error, atom()}
+  def entries_from_query_row_validated(
+        %IndexDefinition{} = definition,
+        %QueryRow{
+          state_key: state_key,
+          record: record,
+          expire_at_ms: expire_at_ms,
+          scope_prefix: scope_prefix
+        }
+      )
+      when is_binary(state_key) and state_key != "" and
+             byte_size(state_key) <= @max_state_key_bytes and is_map(record) and
+             is_integer(expire_at_ms) and expire_at_ms >= 0 and expire_at_ms <= @max_u64 do
+    with {:ok, id} <- required_binary(record, :run_id),
+         :ok <- validate_query_row_owner(record, id, state_key, scope_prefix),
+         {:ok, _encoded_scope} <- encode_scope_prefix(definition, scope_prefix),
+         {:ok, record_version} <- record_version(record) do
+      build_entries(
+        definition,
+        record,
+        state_key,
+        expire_at_ms,
+        id,
+        record_version,
+        scope_prefix
+      )
+    end
+  end
+
+  def entries_from_query_row_validated(%IndexDefinition{}, _row),
+    do: {:error, :invalid_composite_record}
+
+  defp build_entries(
+         definition,
+         projection_record,
+         state_key,
+         expire_at_ms,
+         id,
+         record_version,
+         scope_prefix
+       ) do
+    with {:ok, value_sets} <- field_value_sets(definition, projection_record),
          :ok <- validate_projection_cardinality(value_sets),
          {:ok, keys} <- entry_keys(definition, scope_prefix, value_sets, id),
-         value <- encode_entry_value(id, state_key, record_version, expire_at_ms) do
+         covering_record <- covering_record(definition, projection_record, id, record_version),
+         {:ok, value} <-
+           encode_entry_value(
+             id,
+             state_key,
+             record_version,
+             expire_at_ms,
+             covering_record
+           ) do
       {:ok,
        Enum.map(keys, fn key ->
          %{
@@ -93,13 +204,6 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
        end)}
     end
   end
-
-  def entries_validated(%IndexDefinition{}, record, _state_key, _expire_at_ms)
-      when is_map(record),
-      do: {:error, :invalid_composite_record}
-
-  def entries_validated(%IndexDefinition{}, _record, _state_key, _expire_at_ms),
-    do: {:error, :invalid_composite_record}
 
   @spec encode_prefix(IndexDefinition.t(), [term()]) :: {:ok, binary()} | {:error, atom()}
   def encode_prefix(%IndexDefinition{} = definition, values) when is_list(values) do
@@ -224,9 +328,29 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   @spec decode_entry_value(binary()) :: {:ok, map()} | :error
   def decode_entry_value(blob)
       when is_binary(blob) and byte_size(blob) <= @max_entry_value_bytes do
-    with <<@entry_value_version, id_bytes::unsigned-big-32, record_version::unsigned-big-64,
-           expire_at_ms::unsigned-big-64, payload::binary>> <-
-           blob,
+    case blob do
+      <<@plain_entry_value_version, expected_checksum::unsigned-big-32, body::binary>> ->
+        if :erlang.crc32(body) == expected_checksum,
+          do: decode_plain_entry_value(body),
+          else: :error
+
+      <<@covering_entry_value_version, expected_checksum::unsigned-big-32, body::binary>> ->
+        if :erlang.crc32(body) == expected_checksum,
+          do: decode_covering_entry_value(body),
+          else: :error
+
+      _invalid ->
+        :error
+    end
+  rescue
+    _error -> :error
+  end
+
+  def decode_entry_value(_blob), do: :error
+
+  defp decode_plain_entry_value(body) do
+    with <<id_bytes::unsigned-big-32, record_version::unsigned-big-64,
+           expire_at_ms::unsigned-big-64, payload::binary>> <- body,
          true <- id_bytes > 0 and id_bytes <= @max_run_id_bytes,
          true <- id_bytes < byte_size(payload),
          <<id::binary-size(id_bytes), state_key::binary>> <- payload,
@@ -238,16 +362,40 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
          id: id,
          state_key: state_key,
          record_version: record_version,
-         expire_at_ms: expire_at_ms
+         expire_at_ms: expire_at_ms,
+         covering_record: nil
        }}
     else
       _invalid -> :error
     end
-  rescue
-    _error -> :error
   end
 
-  def decode_entry_value(_blob), do: :error
+  defp decode_covering_entry_value(body) do
+    with <<id_bytes::unsigned-big-32, state_key_bytes::unsigned-big-32,
+           record_version::unsigned-big-64, expire_at_ms::unsigned-big-64,
+           covering_bytes::unsigned-big-32, payload::binary>> <- body,
+         true <- id_bytes > 0 and id_bytes <= @max_run_id_bytes,
+         true <- state_key_bytes > 0 and state_key_bytes <= @max_state_key_bytes,
+         true <- covering_bytes > 0 and covering_bytes <= @max_covering_value_bytes,
+         true <- byte_size(payload) == id_bytes + state_key_bytes + covering_bytes,
+         <<id::binary-size(id_bytes), state_key::binary-size(state_key_bytes),
+           encoded_covering::binary-size(covering_bytes)>> <- payload,
+         true <- record_version <= @max_exact_integer,
+         {:ok, ^id} <- Keys.run_id_from_state_key(state_key),
+         {:ok, covering_record} <-
+           decode_covering_record(encoded_covering, id, record_version) do
+      {:ok,
+       %{
+         id: id,
+         state_key: state_key,
+         record_version: record_version,
+         expire_at_ms: expire_at_ms,
+         covering_record: covering_record
+       }}
+    else
+      _invalid -> :error
+    end
+  end
 
   @spec entry_key_matches_id?(binary(), binary()) :: boolean()
   def entry_key_matches_id?(key, id)
@@ -369,9 +517,26 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   defp validate_record_owner(record, id, state_key) do
     case Field.fetch(record, :partition_key) do
       {:ok, partition_key} when is_binary(partition_key) and partition_key != "" ->
-        if Keys.state_key(id, partition_key) == state_key,
+        if RecordIdentity.owns_state_key?(record, state_key) and Map.get(record, :id) == id,
           do: :ok,
           else: {:error, :invalid_composite_record}
+
+      _other ->
+        {:error, :unscoped_record}
+    end
+  end
+
+  defp validate_query_row_owner(record, id, state_key, scope_prefix) do
+    case Field.fetch(record, :partition_key) do
+      {:ok, logical_partition_key}
+      when is_binary(logical_partition_key) and logical_partition_key != "" ->
+        with {:ok, physical_partition_key} <-
+               StorageScope.physical_partition_key(logical_partition_key, scope_prefix),
+             true <- Keys.state_key(id, physical_partition_key) == state_key do
+          :ok
+        else
+          _invalid -> {:error, :invalid_composite_record}
+        end
 
       _other ->
         {:error, :unscoped_record}
@@ -419,7 +584,9 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
         {:ok, [Field.missing()]}
 
       {:ok, values} when is_list(values) ->
-        bounded_unique_values(values)
+        if Attributes.valid_list?(values),
+          do: {:ok, values},
+          else: {:error, :invalid_index_value_type}
 
       {:ok, value} ->
         {:ok, [value]}
@@ -429,30 +596,8 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
   defp projected_values(record, field) do
     case Field.fetch(record, field) do
       :missing -> {:ok, [Field.missing()]}
-      {:ok, value} when is_list(value) -> {:error, :unsupported_index_value}
+      {:ok, value} when is_list(value) -> {:error, :invalid_index_value_type}
       {:ok, value} -> {:ok, [value]}
-    end
-  end
-
-  defp bounded_unique_values([]), do: {:ok, [Field.missing()]}
-
-  defp bounded_unique_values(values) do
-    values
-    |> Enum.reduce_while({MapSet.new(), []}, fn value, {seen, acc} ->
-      cond do
-        MapSet.member?(seen, value) ->
-          {:cont, {seen, acc}}
-
-        MapSet.size(seen) >= @max_reverse_entries ->
-          {:halt, :too_many}
-
-        true ->
-          {:cont, {MapSet.put(seen, value), [value | acc]}}
-      end
-    end)
-    |> case do
-      {_seen, reversed} -> {:ok, Enum.reverse(reversed)}
-      :too_many -> {:error, :too_many_composite_entries}
     end
   end
 
@@ -621,17 +766,94 @@ defmodule Ferricstore.Flow.Query.CompositeIndex do
 
   defp validate_component_type(field, value) do
     case Field.value_type(field) do
-      :integer when is_integer(value) -> :ok
-      :keyword when is_binary(value) -> :ok
-      :dynamic -> :ok
-      _mismatch -> {:error, :invalid_index_value_type}
+      :integer when is_integer(value) ->
+        :ok
+
+      :keyword when is_binary(value) ->
+        :ok
+
+      :dynamic ->
+        if Attributes.valid_scalar?(value),
+          do: :ok,
+          else: {:error, :invalid_index_value_type}
+
+      _mismatch ->
+        {:error, :invalid_index_value_type}
     end
   end
 
-  defp encode_entry_value(id, state_key, record_version, expire_at_ms) do
-    <<@entry_value_version, byte_size(id)::unsigned-big-32, record_version::unsigned-big-64,
-      expire_at_ms::unsigned-big-64, id::binary, state_key::binary>>
+  defp covering_record(%IndexDefinition{covering_fields: []}, _record, _id, _record_version),
+    do: nil
+
+  defp covering_record(%IndexDefinition{covering_fields: fields}, record, id, record_version) do
+    Enum.reduce(fields, %{id: id, version: record_version}, fn
+      field, covering when field in [:run_id, :version] ->
+        covering
+
+      field, covering ->
+        case Field.fetch(record, field) do
+          {:ok, value} -> Map.put(covering, field, value)
+          :missing -> covering
+        end
+    end)
   end
+
+  defp encode_entry_value(id, state_key, record_version, expire_at_ms, nil) do
+    {:ok, encode_plain_entry_value(id, state_key, record_version, expire_at_ms)}
+  end
+
+  defp encode_entry_value(id, state_key, record_version, expire_at_ms, covering_record)
+       when is_map(covering_record) do
+    case CoveringCodec.encode(covering_record) do
+      {:ok, encoded} ->
+        body =
+          <<byte_size(id)::unsigned-big-32, byte_size(state_key)::unsigned-big-32,
+            record_version::unsigned-big-64, expire_at_ms::unsigned-big-64,
+            byte_size(encoded)::unsigned-big-32, id::binary, state_key::binary, encoded::binary>>
+
+        {:ok, encode_checked_entry(@covering_entry_value_version, body)}
+
+      :error ->
+        {:error, :invalid_covering_projection}
+    end
+  end
+
+  defp encode_plain_entry_value(id, state_key, record_version, expire_at_ms) do
+    body =
+      <<byte_size(id)::unsigned-big-32, record_version::unsigned-big-64,
+        expire_at_ms::unsigned-big-64, id::binary, state_key::binary>>
+
+    encode_checked_entry(@plain_entry_value_version, body)
+  end
+
+  defp encode_checked_entry(version, body),
+    do: <<version, :erlang.crc32(body)::unsigned-big-32, body::binary>>
+
+  @doc false
+  @spec decode_covering_record(binary(), binary(), non_neg_integer()) :: {:ok, map()} | :error
+  def decode_covering_record(encoded, id, record_version)
+      when is_binary(encoded) and byte_size(encoded) > 0 and
+             byte_size(encoded) <= @max_covering_value_bytes and is_binary(id) and id != "" and
+             byte_size(id) <= @max_run_id_bytes and is_integer(record_version) and
+             record_version >= 0 and record_version <= @max_exact_integer do
+    case CoveringCodec.decode(encoded, id, record_version) do
+      {:ok, record}
+      when is_map(record) and map_size(record) >= 3 and
+             map_size(record) <= @max_covering_record_fields ->
+        if CoveringCodec.valid_record?(record, id, record_version),
+          do: {:ok, record},
+          else: :error
+
+      _invalid ->
+        :error
+    end
+  rescue
+    _error -> :error
+  catch
+    _kind, _reason -> :error
+  end
+
+  def decode_covering_record(_encoded, _id, _record_version), do: :error
 
   defp valid_reverse_keys?(keys, id) when length(keys) <= @max_reverse_entries do
     keys != [] and length(keys) == length(Enum.uniq(keys)) and

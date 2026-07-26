@@ -165,6 +165,36 @@ compact_apply_projection_records(Dir, TrimIndex, Records) ->
             Error
     end.
 
+compact_apply_projection_stream_records(Dir, TrimIndex, PageFun) ->
+    case validate_segment_log_dir(Dir) of
+        ok ->
+            case recover_rewrite(Dir) of
+                ok ->
+                    case close_writers_for_dir(Dir) of
+                        ok ->
+                            case records_per_segment(Dir) of
+                                {ok, RecordsPerSegment} ->
+                                    KeepFun = fun(Index) -> Index >= TrimIndex end,
+                                    rewrite_projection_filtered_stream_atomic(
+                                        Dir,
+                                        KeepFun,
+                                        TrimIndex,
+                                        PageFun,
+                                        RecordsPerSegment
+                                    );
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
 validate_apply_projection_compaction_records([], _TrimIndex) ->
     ok;
 validate_apply_projection_compaction_records(
@@ -209,6 +239,167 @@ rewrite_projection_filtered_records_atomic(Dir, KeepFun, Records, RecordsPerSegm
         {error, _Reason} = Error ->
             _ = remove_tree(Staging),
             Error
+    end.
+
+rewrite_projection_filtered_stream_atomic(
+  Dir,
+  KeepFun,
+  TrimIndex,
+  PageFun,
+  RecordsPerSegment
+ ) ->
+    Paths = rewrite_paths(Dir),
+    Staging = maps:get(staging, Paths),
+    Backup = maps:get(backup, Paths),
+    case prepare_projection_stream_stage(
+        Staging,
+        Dir,
+        KeepFun,
+        TrimIndex,
+        PageFun,
+        RecordsPerSegment
+    ) of
+        ok ->
+            case write_rewrite_marker(Dir, Paths) of
+                ok ->
+                    case swap_rewrite_dirs(Dir, Staging, Backup) of
+                        ok ->
+                            case finish_rewrite(Dir, Backup) of
+                                ok ->
+                                    rebuild_offset_registry(Dir);
+                                {error, _Reason} = Error ->
+                                    _ = rollback_rewrite(Dir, Paths),
+                                    Error
+                            end;
+                        {error, _Reason} = Error ->
+                            _ = rollback_rewrite(Dir, Paths),
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    _ = remove_tree(Staging),
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            _ = remove_tree(Staging),
+            Error
+    end.
+
+prepare_projection_stream_stage(
+  Staging,
+  SourceDir,
+  KeepFun,
+  TrimIndex,
+  PageFun,
+  RecordsPerSegment
+ ) ->
+    case remove_tree(Staging) of
+        ok ->
+            case filelib:ensure_dir(filename:join(Staging, "dummy")) of
+                ok ->
+                    case write_segment_config(Staging, RecordsPerSegment) of
+                        ok ->
+                            case write_disk_records_with_segment_size(
+                                SourceDir,
+                                Staging,
+                                KeepFun,
+                                RecordsPerSegment
+                            ) of
+                                ok ->
+                                    case write_apply_projection_retention_stream(
+                                        Staging,
+                                        TrimIndex,
+                                        PageFun,
+                                        <<>>,
+                                        RecordsPerSegment
+                                    ) of
+                                        ok ->
+                                            case close_writers_for_dir(Staging) of
+                                                ok -> sync_dir(Staging);
+                                                {error, _Reason} = Error -> Error
+                                            end;
+                                        {error, _Reason} = Error -> Error
+                                    end;
+                                {error, _Reason} = Error -> Error
+                            end;
+                        {error, _Reason} = Error -> Error
+                    end;
+                {error, Reason} ->
+                    {error, {ensure_staging_dir, Reason}}
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+write_apply_projection_retention_stream(
+  Staging,
+  TrimIndex,
+  PageFun,
+  Cursor,
+  RecordsPerSegment
+ ) ->
+    case call_apply_projection_retention_page(PageFun, Cursor) of
+        {ok, Batches, NextCursor, Done}
+          when is_list(Batches), is_binary(NextCursor), is_boolean(Done) ->
+            case valid_apply_projection_retention_progress(
+                Batches,
+                Cursor,
+                NextCursor,
+                Done
+            ) of
+                true ->
+                    case projection_batch_records(Batches, []) of
+                        {ok, PageRecords} ->
+                            Records = normalize_projection_batch_records(PageRecords),
+                            case validate_apply_projection_compaction_records(
+                                Records,
+                                TrimIndex
+                            ) of
+                                ok ->
+                                    case write_records_with_segment_size(
+                                        Staging,
+                                        Records,
+                                        RecordsPerSegment
+                                    ) of
+                                        ok when Done =:= true ->
+                                            ok;
+                                        ok ->
+                                            write_apply_projection_retention_stream(
+                                                Staging,
+                                                TrimIndex,
+                                                PageFun,
+                                                NextCursor,
+                                                RecordsPerSegment
+                                            );
+                                        {error, _Reason} = Error ->
+                                            Error
+                                    end;
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, Reason} ->
+                            {error, {bad_apply_projection_retention_stream_page, Reason}}
+                    end;
+                false ->
+                    {error, bad_apply_projection_retention_stream_progress}
+            end;
+        {error, Reason} ->
+            {error, {apply_projection_retention_stream_failed, Reason}};
+        Other ->
+            {error, {bad_apply_projection_retention_stream_result, Other}}
+    end.
+
+valid_apply_projection_retention_progress([], _Cursor, _NextCursor, true) ->
+    true;
+valid_apply_projection_retention_progress(Batches, _Cursor, _NextCursor, true) ->
+    length(Batches) =< 1024;
+valid_apply_projection_retention_progress(Batches, Cursor, NextCursor, false) ->
+    Batches =/= [] andalso length(Batches) =< 1024 andalso NextCursor =/= Cursor.
+
+call_apply_projection_retention_page(PageFun, Cursor) ->
+    try PageFun(Cursor) of
+        Result -> Result
+    catch
+        Class:Reason -> {error, {callback_exception, Class, Reason}}
     end.
 
 prepare_rewrite_stage(Staging, Records, RecordsPerSegment) ->

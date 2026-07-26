@@ -1,7 +1,14 @@
 defmodule Ferricstore.Flow.Query.Explain do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.{Error, Field, MandatoryScope, RecordProjection, Request}
+  alias Ferricstore.Flow.Query.{
+    Error,
+    Field,
+    MandatoryScope,
+    RecordProjection,
+    Request
+  }
+
   alias Ferricstore.Flow.Query.{Plan, PlannerDiagnostic, Usage}
 
   @version "ferric.flow.explain/v1"
@@ -45,9 +52,36 @@ defmodule Ferricstore.Flow.Query.Explain do
 
   def executed(%Plan{}, %Request{}, _usage), do: {:error, :invalid_query_usage}
 
+  @doc false
+  @spec projection_descriptor(Request.t(), atom()) :: map()
+  def projection_descriptor(%Request{return: :count}, record_source) do
+    %{
+      fields: [],
+      source: projection_source(record_source),
+      index_only: record_source in [:transactional_counter, :covering_index],
+      requires_hydration: false
+    }
+  end
+
+  def projection_descriptor(%Request{projection: projection}, record_source) do
+    fields =
+      case RecordProjection.external_names(projection) do
+        :all -> "all_allowlisted_fields"
+        names -> names
+      end
+
+    %{
+      fields: fields,
+      source: projection_source(record_source),
+      index_only: record_source == :covering_index,
+      requires_hydration: record_source == :authoritative_log
+    }
+  end
+
   defp render_plan(plan, request) do
     %{
       path: enum(plan.path),
+      record_source: enum(plan.record_source),
       index: render_index(plan),
       fallback_reason: enum(plan.fallback_reason),
       range_count: length(plan.ranges),
@@ -75,27 +109,14 @@ defmodule Ferricstore.Flow.Query.Explain do
     }
   end
 
-  defp render_projection(%Plan{path: path}, %Request{return: :count}) do
-    %{
-      fields: [],
-      application: "not_applicable",
-      index_only: path == :counter_lookup
-    }
-  end
+  defp render_projection(%Plan{record_source: record_source}, %Request{} = request),
+    do: projection_descriptor(request, record_source)
 
-  defp render_projection(%Plan{}, %Request{projection: projection}) do
-    fields =
-      case RecordProjection.external_names(projection) do
-        :all -> "all_allowlisted_fields"
-        names -> names
-      end
-
-    %{
-      fields: fields,
-      application: "after_authoritative_recheck",
-      index_only: false
-    }
-  end
+  defp projection_source(:covering_index), do: "covering_index"
+  defp projection_source(:query_row), do: "query_row"
+  defp projection_source(:authoritative_log), do: "authoritative_log"
+  defp projection_source(:transactional_counter), do: "transactional_counter"
+  defp projection_source(:none), do: "not_applicable"
 
   defp render_mandatory_scope(%MandatoryScope{} = scope) do
     %{
@@ -129,6 +150,11 @@ defmodule Ferricstore.Flow.Query.Explain do
       hydrated_records: Map.get(estimate, :hydrated_records, 0),
       hard_hydrated_records:
         Map.get(estimate, :hard_hydrated_records, Map.get(estimate, :hydrated_records, 0)),
+      hydration_bytes: Map.get(estimate, :hydration_bytes, 0),
+      metadata_rows: Map.get(estimate, :metadata_rows, 0),
+      hard_metadata_rows:
+        Map.get(estimate, :hard_metadata_rows, Map.get(estimate, :metadata_rows, 0)),
+      metadata_bytes: Map.get(estimate, :metadata_bytes, 0),
       result_records: Map.get(estimate, :result_records, 0),
       residual_checks: Map.get(estimate, :residual_checks, 0),
       sort_rows: Map.get(estimate, :sort_rows, 0),
@@ -168,6 +194,7 @@ defmodule Ferricstore.Flow.Query.Explain do
     Enum.map(chosen.alternatives, fn alternative ->
       %{
         path: enum(alternative.path),
+        record_source: enum(alternative.record_source),
         index: %{
           logical_id: alternative.index_id,
           generation: alternative.index_version,

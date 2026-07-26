@@ -3,7 +3,7 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
 
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
-  alias Ferricstore.Flow.Query.{CompositeCounter, CompositeIndex, IndexDefinition}
+  alias Ferricstore.Flow.Query.{CompositeCounter, CompositeIndex, IndexDefinition, QueryRowCodec}
 
   defmodule Provider do
     @behaviour FerricStore.Flow.QueryIndexProvider
@@ -37,11 +37,18 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
         fields: [{:partition_key, :asc}, {:state, :asc}, {:updated_at_ms, :desc}]
       })
 
-    instance_ctx = %{
-      query_index_provider: Provider,
-      test_pid: self(),
-      definitions: [definition]
-    }
+    second = encoded_record("waiting", 2, 200)
+
+    instance_ctx =
+      install_sources(
+        %{
+          query_index_provider: Provider,
+          test_pid: self(),
+          definitions: [definition]
+        },
+        Path.join(path, "source"),
+        [{state_key, second, 2}]
+      )
 
     writer_state = %{
       path: path,
@@ -50,13 +57,10 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
       terminal_count_inits: MapSet.new()
     }
 
-    first = encoded_record("running", 1, 100)
-    second = encoded_record("waiting", 2, 200)
-
     assert {:ok, ops, _state} =
              ProjectionOps.expand_ops(writer_state, [
-               {:project_flow_state, state_key, first, 0},
-               {:project_flow_state, state_key, second, 0}
+               {:project_flow_state_from_source, state_key, 1},
+               {:project_flow_state_from_source, state_key, 2}
              ])
 
     assert_received {:definition_snapshot, 0}
@@ -68,10 +72,10 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
     assert {:ok, entry_blob} = LMDB.get(path, entry_key)
     assert {:ok, %{record_version: 2}} = CompositeIndex.decode_entry_value(entry_blob)
 
-    assert {:ok, wrapper} = LMDB.get(path, state_key)
+    assert {:ok, query_row} = LMDB.get(path, state_key)
 
-    assert {:ok, %{state: "waiting", version: 2}} =
-             ProjectionOps.decode_flow_record_value(wrapper)
+    assert {:ok, %{record: %{state: "waiting", version: 2}}} =
+             QueryRowCodec.decode(query_row, state_key)
   end
 
   test "disabled providers add no composite read or write operations" do
@@ -79,10 +83,18 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
     state_key = Ferricstore.Flow.Keys.state_key("run-1", "tenant-a")
     encoded = encoded_record("running", 1, 100)
 
+    instance_ctx =
+      install_sources(%{}, Path.join(path, "source"), [{state_key, encoded, 1}])
+
     assert {:ok, ops, _state} =
              ProjectionOps.expand_ops(
-               %{path: path, terminal_count_inits: MapSet.new()},
-               [{:project_flow_state, state_key, encoded, 0}]
+               %{
+                 path: path,
+                 shard_index: 0,
+                 instance_ctx: instance_ctx,
+                 terminal_count_inits: MapSet.new()
+               },
+               [{:project_flow_state_from_source, state_key, 1}]
              )
 
     refute Enum.any?(ops, fn
@@ -103,22 +115,29 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
         fields: [{:partition_key, :asc}, {:state, :asc}]
       })
 
+    encoded = encoded_record("running", 1, 100, "run-query-only")
+
+    instance_ctx =
+      install_sources(
+        %{
+          query_index_provider: Provider,
+          test_pid: self(),
+          definitions: [definition]
+        },
+        Path.join(path, "source"),
+        [{state_key, encoded, 1}]
+      )
+
     writer_state = %{
       path: path,
       shard_index: 0,
-      instance_ctx: %{
-        query_index_provider: Provider,
-        test_pid: self(),
-        definitions: [definition]
-      },
+      instance_ctx: instance_ctx,
       terminal_count_inits: MapSet.new()
     }
 
-    encoded = encoded_record("running", 1, 100, "run-query-only")
-
     assert {:ok, ops, _state} =
              ProjectionOps.expand_ops(writer_state, [
-               {:project_flow_query_state, state_key, encoded, 0}
+               {:project_flow_query_state_from_source, state_key, 1}
              ])
 
     for terminal_state <- ["completed", "failed", "cancelled"] do
@@ -144,31 +163,37 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
         fields: [{:partition_key, :asc}, {:state, :asc}, {:updated_at_ms, :desc}]
       })
 
+    terminal = encoded_record("failed", 3, 300, "run-coalesce-fence")
+
+    instance_ctx =
+      install_sources(
+        %{
+          query_index_provider: Provider,
+          test_pid: self(),
+          definitions: [definition]
+        },
+        Path.join(path, "source"),
+        [{state_key, terminal, 3}]
+      )
+
     writer_state = %{
       path: path,
       shard_index: 0,
-      instance_ctx: %{
-        query_index_provider: Provider,
-        test_pid: self(),
-        definitions: [definition]
-      },
+      instance_ctx: instance_ctx,
       terminal_count_inits: MapSet.new()
     }
 
-    terminal = encoded_record("failed", 3, 300, "run-coalesce-fence")
-    stale = encoded_record("running", 2, 200, "run-coalesce-fence")
-
     assert {:ok, ops, _state} =
              ProjectionOps.expand_ops(writer_state, [
-               {:project_flow_state, state_key, terminal, 0},
-               {:project_flow_query_state, state_key, stale, 0}
+               {:project_flow_state_from_source, state_key, 3},
+               {:project_flow_query_state_from_source, state_key, 2}
              ])
 
     assert :ok = LMDB.write_batch(path, ops)
-    assert {:ok, wrapper} = LMDB.get(path, state_key)
+    assert {:ok, query_row} = LMDB.get(path, state_key)
 
-    assert {:ok, %{state: "failed", version: 3}} =
-             ProjectionOps.decode_flow_record_value(wrapper)
+    assert {:ok, %{record: %{state: "failed", version: 3}}} =
+             QueryRowCodec.decode(query_row, state_key)
 
     assert {:ok, reverse_blob} = LMDB.get(path, CompositeIndex.reverse_key(state_key))
     assert {:ok, [entry_key]} = CompositeIndex.decode_reverse_value(reverse_blob, state_key)
@@ -188,26 +213,35 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
         fields: [{:partition_key, :asc}, {:state, :asc}]
       })
 
+    encoded = encoded_record("running", 1, 100, id)
+
+    instance_ctx =
+      install_sources(
+        %{
+          query_index_provider: Provider,
+          test_pid: self(),
+          definitions: [definition]
+        },
+        Path.join(path, "source"),
+        [{state_key, encoded, 1}]
+      )
+
     writer_state = %{
       path: path,
       shard_index: 0,
-      instance_ctx: %{
-        query_index_provider: Provider,
-        test_pid: self(),
-        definitions: [definition]
-      },
+      instance_ctx: instance_ctx,
       terminal_count_inits: MapSet.new()
     }
 
     assert {:ok, ops, _state} =
              ProjectionOps.expand_ops(writer_state, [
-               {:project_flow_state, state_key, encoded_record("running", 1, 100, id), 0}
+               {:project_flow_state_from_source, state_key, 1}
              ])
 
     assert :ok = LMDB.write_batch(path, ops)
-    assert {:ok, wrapper} = LMDB.get(path, state_key)
+    assert {:ok, query_row} = LMDB.get(path, state_key)
 
-    assert {:ok, %{id: ^id}} = ProjectionOps.decode_flow_record_value(wrapper)
+    assert {:ok, %{record: %{id: ^id}}} = QueryRowCodec.decode(query_row, state_key)
     assert {:ok, reverse_blob} = LMDB.get(path, CompositeIndex.reverse_key(state_key))
     assert {:ok, [entry_key]} = CompositeIndex.decode_reverse_value(reverse_blob, state_key)
     assert {:ok, entry_blob} = LMDB.get(path, entry_key)
@@ -246,14 +280,19 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
     [{^definition, counter_prefix}] = MapSet.to_list(prefixes)
     counter_key = CompositeCounter.key(definition, counter_prefix)
 
-    instance_ctx = %{
-      name: instance_name,
-      data_dir: data_dir,
-      shard_count: 1,
-      query_index_provider: Provider,
-      test_pid: self(),
-      definitions: [definition]
-    }
+    instance_ctx =
+      install_sources(
+        %{
+          name: instance_name,
+          data_dir: data_dir,
+          shard_count: 1,
+          query_index_provider: Provider,
+          test_pid: self(),
+          definitions: [definition]
+        },
+        data_dir,
+        [{state_key, encoded, 1}]
+      )
 
     on_exit(fn ->
       restore_env(:flow_lmdb_mode, old_mode)
@@ -274,7 +313,7 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
 
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(instance_name, 0, [
-               {:project_flow_state, state_key, encoded, 0}
+               {:project_flow_state_from_source, state_key, 1}
              ])
 
     path =
@@ -310,14 +349,22 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
         fields: [{:partition_key, :asc}, {:state, :asc}, {:updated_at_ms, :desc}]
       })
 
-    instance_ctx = %{
-      name: instance_name,
-      data_dir: data_dir,
-      shard_count: 1,
-      query_index_provider: Provider,
-      test_pid: self(),
-      definitions: [definition]
-    }
+    first = encoded_record("running", 1, 100, first_id)
+    second = encoded_record("running", 1, 100, "run-retry-b")
+
+    instance_ctx =
+      install_sources(
+        %{
+          name: instance_name,
+          data_dir: data_dir,
+          shard_count: 1,
+          query_index_provider: Provider,
+          test_pid: self(),
+          definitions: [definition]
+        },
+        data_dir,
+        [{first_key, first, 1}, {second_key, second, 1}]
+      )
 
     on_exit(fn ->
       Ferricstore.FaultInjection.clear_hook()
@@ -335,10 +382,8 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
 
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(instance_name, 0, [
-               {:project_flow_query_state, first_key, encoded_record("running", 1, 100, first_id),
-                0},
-               {:project_flow_query_state, second_key,
-                encoded_record("running", 1, 100, "run-retry-b"), 0}
+               {:project_flow_query_state_from_source, first_key, 1},
+               {:project_flow_query_state_from_source, second_key, 1}
              ])
 
     path =
@@ -392,6 +437,117 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
     assert flush_result == :ok
     assert :atomics.get(hits, 1) >= 2
     assert :not_found = LMDB.get(path, old_entry.key)
+  end
+
+  test "deleted source atomically removes every projection derived from the old query row" do
+    path = tmp_lmdb_path()
+    id = "run-delete-all-projections"
+    state_key = Ferricstore.Flow.Keys.state_key(id, "tenant-a")
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "terminal_by_tier_and_worker",
+        version: 1,
+        fields: [
+          {:partition_key, :asc},
+          {{:attribute, "tier"}, :asc},
+          {{:state_meta, "running", "worker"}, :asc},
+          {:updated_at_ms, :desc}
+        ],
+        count_prefixes: [3]
+      })
+
+    record =
+      "completed"
+      |> encoded_record(1, 100, id)
+      |> Ferricstore.Flow.decode_record()
+      |> Map.merge(%{
+        parent_flow_id: "parent-1",
+        root_flow_id: "root-1",
+        correlation_id: "correlation-1",
+        attributes: %{"tier" => "gold"},
+        indexed_attributes: ["tier"],
+        state_meta: %{"running" => %{"worker" => "worker-1"}},
+        indexed_state_meta: "worker"
+      })
+
+    encoded = Ferricstore.Flow.encode_record(record)
+
+    instance_ctx =
+      install_sources(
+        %{
+          query_index_provider: Provider,
+          test_pid: self(),
+          definitions: [definition]
+        },
+        Path.join(path, "source"),
+        [{state_key, encoded, 1}]
+      )
+
+    writer_state = %{
+      path: path,
+      shard_index: 0,
+      instance_ctx: instance_ctx,
+      terminal_count_inits: MapSet.new()
+    }
+
+    assert {:ok, [composite_entry]} = CompositeIndex.entries(definition, record, state_key, 0)
+
+    assert {:ok, prefixes} =
+             CompositeCounter.prefixes_for_keys([definition], [composite_entry.key])
+
+    [{^definition, counter_prefix}] = MapSet.to_list(prefixes)
+    counter_key = CompositeCounter.key(definition, counter_prefix)
+
+    metadata_query_keys =
+      ProjectionOps.terminal_project_metadata_index_keys(
+        id,
+        "tenant-a",
+        "parent-1",
+        "root-1",
+        "correlation-1"
+      )
+      |> Enum.map(&LMDB.query_index_key(&1, id, 100))
+
+    fixed_query_keys =
+      metadata_query_keys ++ ProjectionOps.flow_attribute_query_keys(record)
+
+    assert {:ok, initial_ops, _state} =
+             ProjectionOps.expand_ops(writer_state, [
+               {:project_flow_state_from_source, state_key, 1}
+             ])
+
+    assert :ok = LMDB.write_batch(path, initial_ops)
+
+    for key <- fixed_query_keys do
+      assert {:ok, _value} = LMDB.get(path, key)
+    end
+
+    assert {:ok, _value} = LMDB.get(path, composite_entry.key)
+    assert {:ok, _value} = LMDB.get(path, counter_key)
+
+    keydir = elem(instance_ctx.keydir_refs, 0)
+    :ets.insert(keydir, {state_key, nil, 0, :flow_state_deleted, :deleted, 0, 0})
+
+    assert {:ok, delete_ops, delete_state} =
+             ProjectionOps.expand_ops(writer_state, [
+               {:project_flow_state_from_source, state_key, 1}
+             ])
+
+    assert delete_state.write_group_sizes == [length(delete_ops)]
+    assert :ok = LMDB.write_batch(path, delete_ops)
+
+    for key <-
+          fixed_query_keys ++
+            [
+              state_key,
+              composite_entry.key,
+              CompositeIndex.reverse_key(state_key)
+            ] do
+      assert :not_found = LMDB.get(path, key)
+    end
+
+    assert :not_found = LMDB.get(path, counter_key)
   end
 
   defp composite_key?(key) do
@@ -454,6 +610,40 @@ defmodule Ferricstore.Flow.Query.CompositeProjectionIntegrationTest do
       System.tmp_dir!(),
       "ferricstore_composite_atomic_writer_#{System.unique_integer([:positive])}"
     )
+  end
+
+  defp install_sources(instance_ctx, data_dir, sources) do
+    keydir = :ets.new(:composite_projection_source, [:set, :public])
+
+    sources
+    |> Enum.group_by(fn {_state_key, _value, index} -> index end)
+    |> Enum.each(fn {index, entries} ->
+      projection_entries =
+        Enum.map(entries, fn {state_key, value, ^index} -> {state_key, value, 0} end)
+
+      assert :ok =
+               Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+                 data_dir,
+                 0,
+                 index,
+                 projection_entries
+               )
+    end)
+
+    Enum.each(sources, fn {state_key, value, index} ->
+      :ets.insert(
+        keydir,
+        {state_key, nil, 0, 0, {:waraft_apply_projection, index}, 0, byte_size(value)}
+      )
+    end)
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+    end)
+
+    instance_ctx
+    |> Map.put(:data_dir, data_dir)
+    |> Map.put(:keydir_refs, {keydir})
   end
 
   defp await_flush_without_partial_projection(path, entry_key, counter_key, timeout_ms) do

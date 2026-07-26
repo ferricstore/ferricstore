@@ -74,6 +74,79 @@ defmodule Ferricstore.Flow.Query.IndexDefinitionTest do
              IndexDefinition.new(Map.put(attrs, :count_prefixes, [4]))
   end
 
+  test "validates explicit covering fields as part of the physical fingerprint" do
+    attrs = %{
+      id: "runs_by_state_updated_covering",
+      version: 1,
+      fields: [
+        {:partition_key, :asc},
+        {:state, :asc},
+        {:updated_at_ms, :desc}
+      ],
+      covering_fields: [:updated_at_ms, :run_id, :partition_key, :version, :state]
+    }
+
+    assert {:ok, covering} = IndexDefinition.new(attrs)
+
+    assert covering.covering_fields == [
+             :partition_key,
+             :run_id,
+             :state,
+             :updated_at_ms,
+             :version
+           ]
+
+    assert {:ok, hydrated} =
+             attrs
+             |> Map.put(:covering_fields, [])
+             |> IndexDefinition.new()
+
+    refute covering.fingerprint == hydrated.fingerprint
+
+    for invalid <- [
+          [:run_id, :version, :partition_key, :state],
+          [:run_id, :version, :partition_key, :state, :updated_at_ms, :state],
+          [:run_id, :version, :partition_key, :state, :updated_at_ms, :event_id],
+          :all
+        ] do
+      assert {:error, :invalid_index_covering_fields} =
+               attrs
+               |> Map.put(:covering_fields, invalid)
+               |> IndexDefinition.new()
+    end
+  end
+
+  test "allows dynamic index and projection fields in covering definitions" do
+    attrs = %{
+      id: "runs_by_dynamic_metadata",
+      version: 1,
+      fields: [
+        {:partition_key, :asc},
+        {{:attribute, "tier"}, :asc},
+        {{:state_meta, "queued", "worker"}, :asc}
+      ],
+      covering_fields: [
+        :run_id,
+        :version,
+        :partition_key,
+        {:attribute, "tier"},
+        {:attribute, "labels"},
+        {:state_meta, "queued", "worker"}
+      ]
+    }
+
+    assert {:ok, definition} = IndexDefinition.new(attrs)
+
+    assert definition.covering_fields == [
+             {:attribute, "labels"},
+             {:attribute, "tier"},
+             :partition_key,
+             :run_id,
+             {:state_meta, "queued", "worker"},
+             :version
+           ]
+  end
+
   test "validates bounded workload identifiers without changing the physical key fingerprint" do
     base = %{
       id: "runs_by_state",
@@ -119,7 +192,7 @@ defmodule Ferricstore.Flow.Query.IndexDefinitionTest do
                fields: [{:partition_key, :asc}, {:state, :asc}, {:state, :desc}]
              })
 
-    assert {:error, :too_many_multivalue_fields} =
+    assert {:ok, fanout} =
              IndexDefinition.new(%{
                id: "fanout",
                version: 1,
@@ -129,6 +202,12 @@ defmodule Ferricstore.Flow.Query.IndexDefinitionTest do
                  {{:attribute, "tags"}, :asc}
                ]
              })
+
+    assert Enum.map(fanout.fields, &elem(&1, 0)) == [
+             :partition_key,
+             {:attribute, "region"},
+             {:attribute, "tags"}
+           ]
 
     assert {:error, :invalid_index_id} =
              IndexDefinition.new(%{

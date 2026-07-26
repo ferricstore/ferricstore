@@ -5,6 +5,7 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
 
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.Query.{MandatoryScope, Request, Shape, Surface}
+  alias Ferricstore.Flow.Query.Telemetry, as: QueryTelemetry
   alias Ferricstore.Store.Router
 
   alias Ferricstore.Flow.Query.{
@@ -33,44 +34,61 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
 
   @impl true
   def execute(ctx, %Request{} = request) do
-    instance_ctx = FerricStore.Flow.QueryEngine.instance_context(ctx)
-    budget = Budget.default()
+    started_us = System.monotonic_time(:microsecond)
 
-    with :ok <- Request.validate_bound(request),
-         {:ok, logical_partition} <- Ferricstore.Flow.Query.partition_key(request),
-         {:ok, mandatory_scope} <- bind_mandatory_scope(ctx, instance_ctx, request.source),
-         {:ok, scope_keys} <- MandatoryScope.derive_keys(mandatory_scope, logical_partition),
-         {:ok, timing} <- timing(ctx, budget),
-         {:ok, shard_index} <- route(instance_ctx, scope_keys.physical_partition_key),
-         :ok <- check_deadline(timing),
-         admission <- admission_server(instance_ctx) do
-      AdmissionController.with_permit(
-        admission,
-        instance_ctx,
-        scope_keys.admission_key,
-        budget.planner_memory_bytes,
-        fn lease ->
-          execute_admitted(
-            Map.put(instance_ctx, :query_mandatory_scope, mandatory_scope),
-            request,
-            mandatory_scope,
-            scope_keys.query_binding,
-            shard_index,
-            budget,
-            timing,
-            admission,
-            lease
-          )
-        end
-      )
-    end
-  rescue
-    _error -> {:error, :query_engine_failure}
-  catch
-    _kind, _reason -> {:error, :query_engine_failure}
+    {result, plan} =
+      try do
+        execute_query(ctx, request)
+      rescue
+        _error -> {{:error, :query_engine_failure}, nil}
+      catch
+        _kind, _reason -> {{:error, :query_engine_failure}, nil}
+      end
+
+    QueryTelemetry.observe(request, plan, started_us, result)
   end
 
   def execute(_ctx, _request), do: {:error, :unsupported_query_shape}
+
+  defp execute_query(ctx, request) do
+    instance_ctx = FerricStore.Flow.QueryEngine.instance_context(ctx)
+    budget = Budget.default()
+
+    outcome =
+      with :ok <- Request.validate_bound(request),
+           {:ok, logical_partition} <- Ferricstore.Flow.Query.partition_key(request),
+           {:ok, mandatory_scope} <- bind_mandatory_scope(ctx, instance_ctx, request.source),
+           {:ok, scope_keys} <- MandatoryScope.derive_keys(mandatory_scope, logical_partition),
+           {:ok, timing} <- timing(ctx, budget),
+           {:ok, shard_index} <- route(instance_ctx, scope_keys.physical_partition_key),
+           :ok <- check_deadline(timing),
+           admission <- admission_server(instance_ctx) do
+        AdmissionController.with_permit(
+          admission,
+          instance_ctx,
+          scope_keys.admission_key,
+          budget.planner_memory_bytes,
+          fn lease ->
+            execute_admitted(
+              Map.put(instance_ctx, :query_mandatory_scope, mandatory_scope),
+              request,
+              mandatory_scope,
+              scope_keys.query_binding,
+              shard_index,
+              budget,
+              timing,
+              admission,
+              lease
+            )
+          end
+        )
+      end
+
+    case outcome do
+      {:query_outcome, result, plan} -> {result, plan}
+      result -> {result, nil}
+    end
+  end
 
   defp execute_admitted(
          instance_ctx,
@@ -84,8 +102,7 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
          lease
        ) do
     with :ok <- check_deadline(timing),
-         {:ok, cursor_auth} <-
-           authenticate_cursor(instance_ctx, request, query_binding, timing),
+         {:ok, cursor_auth} <- authenticate_cursor(instance_ctx, request, query_binding, timing),
          {:ok, plan} <-
            build_plan(
              instance_ctx,
@@ -95,23 +112,28 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
              budget,
              timing,
              cursor_auth
-           ),
-         :ok <- resize_plan_admission(admission, lease, request, plan, budget),
-         :ok <- pin_plan_index(admission, instance_ctx, lease, plan),
-         :ok <- schedule_statistics(instance_ctx, shard_index, request, plan),
-         :ok <- check_deadline(timing) do
-      case request.mode do
-        :explain ->
-          explain = Explain.render(plan, request)
+           ) do
+      result =
+        with :ok <- resize_plan_admission(admission, lease, request, plan, budget),
+             :ok <- pin_plan_index(admission, instance_ctx, lease, plan),
+             :ok <- schedule_statistics(instance_ctx, shard_index, request, plan),
+             :ok <- check_deadline(timing) do
+          case request.mode do
+            :explain ->
+              explain = Explain.render(plan, request)
+              with :ok <- check_deadline(timing), do: {:ok, explain}
 
-          with :ok <- check_deadline(timing), do: {:ok, explain}
+            :analyze ->
+              analyze_plan(instance_ctx, request, shard_index, plan, budget, timing, cursor_auth)
 
-        :analyze ->
-          analyze_plan(instance_ctx, request, shard_index, plan, budget, timing, cursor_auth)
+            :execute ->
+              execute_plan(instance_ctx, request, shard_index, plan, budget, timing, cursor_auth)
+          end
+        end
 
-        :execute ->
-          execute_plan(instance_ctx, request, shard_index, plan, budget, timing, cursor_auth)
-      end
+      {:query_outcome, result, plan}
+    else
+      result -> {:query_outcome, result, nil}
     end
   end
 
@@ -559,7 +581,8 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
              result.continuation,
              result.quality,
              usage,
-             budget
+             budget,
+             timing.response_codec
            ),
          {:ok, finished_us} <- monotonic_now(),
          :ok <- check_deadline(finished_us, timing.deadline_us) do
@@ -572,7 +595,13 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
          :ok <- check_deadline(now_us, timing.deadline_us),
          usage <- %{result.usage | wall_time_us: max(now_us - timing.start_us, 0)},
          {:ok, response} <-
-           Response.build_count(result.count, result.quality, usage, budget),
+           Response.build_count(
+             result.count,
+             result.quality,
+             usage,
+             budget,
+             timing.response_codec
+           ),
          {:ok, finished_us} <- monotonic_now(),
          :ok <- check_deadline(finished_us, timing.deadline_us) do
       {:ok, response}
@@ -606,10 +635,17 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
     with {:ok, start_us} <- monotonic_now() do
       now_ms = System.system_time(:millisecond)
       budget_deadline_us = start_us + budget.wall_time_ms * 1_000
+      response_codec = FerricStore.Flow.QueryEngine.response_codec(ctx)
 
       case FerricStore.Flow.QueryEngine.deadline_ms(ctx) do
         nil ->
-          {:ok, %{start_us: start_us, now_ms: now_ms, deadline_us: budget_deadline_us}}
+          {:ok,
+           %{
+             start_us: start_us,
+             now_ms: now_ms,
+             deadline_us: budget_deadline_us,
+             response_codec: response_codec
+           }}
 
         deadline_ms when deadline_ms > now_ms ->
           client_deadline_us = start_us + (deadline_ms - now_ms) * 1_000
@@ -618,7 +654,8 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
            %{
              start_us: start_us,
              now_ms: now_ms,
-             deadline_us: min(client_deadline_us, budget_deadline_us)
+             deadline_us: min(client_deadline_us, budget_deadline_us),
+             response_codec: response_codec
            }}
 
         _expired ->

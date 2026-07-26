@@ -286,10 +286,10 @@ defmodule Ferricstore.Flow.Codec.Support do
       |> normalize_child_groups()
 
     refs = flow_record_value_refs(record)
-    attributes = Ferricstore.Flow.Attributes.record(record)
-    indexed_attributes = Ferricstore.Flow.Attributes.indexed_names(record)
-    state_meta = Ferricstore.Flow.StateMeta.record(record)
-    indexed_state_meta = Ferricstore.Flow.StateMeta.indexed_key(record)
+
+    {attributes, indexed_attributes, state_meta, indexed_state_meta} =
+      record_query_metadata!(record)
+
     incarnation = Map.get(record, :incarnation)
     state_enter_seq = Map.get(record, :state_enter_seq)
     governance_limit = encode_governance_limit(Map.get(record, :governance_limit))
@@ -322,6 +322,23 @@ defmodule Ferricstore.Flow.Codec.Support do
   end
 
   def record_empty_sidecar?(sidecar), do: sidecar == record_empty_sidecar()
+
+  defp record_query_metadata!(record) do
+    with {:ok, attributes} <-
+           Ferricstore.Flow.Attributes.normalize(Map.get(record, :attributes, %{})),
+         {:ok, indexed_attributes} <-
+           Ferricstore.Flow.Attributes.normalize_indexed_names(
+             Map.get(record, :indexed_attributes, [])
+           ),
+         {:ok, state_meta} <-
+           Ferricstore.Flow.StateMeta.normalize(Map.get(record, :state_meta, %{})),
+         {:ok, indexed_state_meta} <-
+           Ferricstore.Flow.StateMeta.normalize_indexed_key(Map.get(record, :indexed_state_meta)) do
+      {attributes, indexed_attributes, state_meta, indexed_state_meta}
+    else
+      _invalid -> raise ArgumentError, "invalid flow record query metadata"
+    end
+  end
 
   def split_record_sidecar(groups) when is_map(groups) do
     {encoded_refs, child_groups} = Map.pop(groups, @record_value_refs_key, %{})

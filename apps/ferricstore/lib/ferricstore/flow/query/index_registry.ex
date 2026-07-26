@@ -23,7 +23,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
   }
 
   @snapshot_tag :flow_query_index_registry
-  @snapshot_version 1
+  @snapshot_version 2
   @snapshot_relative_path "flow_query/index-registry.term"
   @max_cursor_bytes 511
   @phases [:snapshot, :backfill, :done]
@@ -503,6 +503,15 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
            reconcile_catalog(persisted, catalog, ctx.shard_count, metadata_contract) do
       {:ok, Map.put(reconciled, :catalog_keys, catalog_keys(catalog)), changed?}
     else
+      {:error, {:query_index_registry_format_mismatch, found_version, expected_version}} ->
+        {:error,
+         {:query_index_registry_rebuild_required,
+          %{
+            path: path,
+            found_version: found_version,
+            expected_version: expected_version
+          }}}
+
       {:error, {kind, _message} = reason}
       when kind in [
              :not_found,
@@ -1934,6 +1943,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
         fields: definition.fields,
         workloads: definition.workloads,
         count_prefixes: definition.count_prefixes,
+        covering_fields: definition.covering_fields,
         scope_bytes: definition.scope_bytes,
         fingerprint: definition.fingerprint
       },
@@ -1967,6 +1977,13 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
              entries: entries
            }}
         end
+
+      {:ok,
+       {@snapshot_tag, found_version, _metadata_contract, _epoch, _catalog_version,
+        _catalog_digest, _entries}}
+      when is_integer(found_version) and found_version >= 0 and found_version <= @max_u64 and
+             found_version != @snapshot_version ->
+        {:error, {:query_index_registry_format_mismatch, found_version, @snapshot_version}}
 
       _invalid ->
         {:error, {:invalid_query_index_registry_snapshot, :decode_failed}}
@@ -2050,6 +2067,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
          fields: fields,
          workloads: workloads,
          count_prefixes: count_prefixes,
+         covering_fields: covering_fields,
          scope_bytes: scope_bytes,
          fingerprint: fingerprint
        }) do
@@ -2061,6 +2079,7 @@ defmodule Ferricstore.Flow.Query.IndexRegistry do
              fields: fields,
              workloads: workloads,
              count_prefixes: count_prefixes,
+             covering_fields: covering_fields,
              scope_bytes: scope_bytes
            }),
          true <- definition.fingerprint == fingerprint do

@@ -7,7 +7,7 @@ defmodule Ferricstore.Store.CompactionJournal do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.TermCodec
 
-  @journal_version 1
+  @journal_version 2
   @journal_prefix "compaction_swap_"
   @journal_suffix ".txn"
   @max_journal_bytes 64 * 1024
@@ -68,7 +68,7 @@ defmodule Ferricstore.Store.CompactionJournal do
 
   @spec complete(transaction()) :: :ok | {:error, term()}
   def complete(%{} = transaction) do
-    with :ok <- relocate_cold(transaction, :forward),
+    with :ok <- relocate_flow_locators(transaction, :forward),
          :ok <- remove(transaction.backup),
          :ok <- fsync_dir(transaction.shard_path),
          :ok <- delete_marker(transaction),
@@ -81,7 +81,7 @@ defmodule Ferricstore.Store.CompactionJournal do
 
   @spec rollback(transaction()) :: :ok | {:error, term()}
   def rollback(%{} = transaction) do
-    with :ok <- relocate_cold(transaction, :reverse),
+    with :ok <- relocate_flow_locators(transaction, :reverse),
          :ok <- remove(transaction.source),
          :ok <- rename(transaction.backup, transaction.source),
          :ok <- fsync_dir(transaction.shard_path),
@@ -177,7 +177,7 @@ defmodule Ferricstore.Store.CompactionJournal do
   end
 
   defp restore_backup_without_source(transaction) do
-    with :ok <- relocate_cold(transaction, :reverse),
+    with :ok <- relocate_flow_locators(transaction, :reverse),
          :ok <- rename(transaction.backup, transaction.source),
          :ok <- fsync_dir(transaction.shard_path),
          :ok <- delete_marker(transaction),
@@ -198,7 +198,7 @@ defmodule Ferricstore.Store.CompactionJournal do
   end
 
   defp complete_without_backup(transaction) do
-    with :ok <- relocate_cold(transaction, :forward),
+    with :ok <- relocate_flow_locators(transaction, :forward),
          :ok <- delete_marker(transaction),
          :ok <- CompactionPlan.remove(transaction.plan),
          :ok <- remove(transaction.journal),
@@ -232,12 +232,12 @@ defmodule Ferricstore.Store.CompactionJournal do
       backup: Path.join(shard_path, "compaction_backup_#{fid}.log"),
       journal: Path.join(shard_path, "#{@journal_prefix}#{fid}#{@journal_suffix}"),
       plan: CompactionPlan.path(shard_path, fid),
-      marker_key: "ferricstore:compaction:commit:v1:" <> tx_id
+      marker_key: "ferricstore:compaction:commit:v2:" <> tx_id
     }
   end
 
-  defp relocate_cold(transaction, direction) do
-    CompactionPlan.relocate_cold(
+  defp relocate_flow_locators(transaction, direction) do
+    CompactionPlan.relocate_flow_locators(
       transaction.plan,
       LMDB.path(transaction.shard_path),
       direction

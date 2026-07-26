@@ -32,11 +32,9 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
           |> Ferricstore.DataDir.shard_data_path(0)
           |> Ferricstore.Flow.LMDB.path()
 
-        ops =
-          Enum.flat_map([{"flow-cold-old", 10}, {"flow-cold-new", 20}], fn {id, updated_at_ms} ->
-            state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
-
-            record = %{
+        records =
+          Enum.map([{"flow-cold-old", 10}, {"flow-cold-new", 20}], fn {id, updated_at_ms} ->
+            %{
               id: id,
               type: "reverse-cold-lineage",
               state: "queued",
@@ -62,24 +60,33 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.LineageIncludeColdReverseReadsNewes
               lease_deadline_ms: 0,
               rewound_to_event_id: nil
             }
+          end)
 
-            state_value =
-              record
-              |> Ferricstore.Flow.encode_record()
-              |> Ferricstore.Flow.LMDB.encode_value(0)
+        query_row_ops = durable_query_row_put_ops!(ctx.data_dir, 0, records)
 
-            query_key = Ferricstore.Flow.LMDB.query_index_key(query_index_key, id, updated_at_ms)
+        ops =
+          records
+          |> Enum.zip(query_row_ops)
+          |> Enum.flat_map(fn {record, query_row_op} ->
+            state_key = Ferricstore.Flow.Keys.state_key(record.id, partition_key)
+
+            query_key =
+              Ferricstore.Flow.LMDB.query_index_key(
+                query_index_key,
+                record.id,
+                record.updated_at_ms
+              )
 
             query_value =
               Ferricstore.Flow.LMDB.encode_query_index_value(
                 query_index_key,
-                id,
-                updated_at_ms,
+                record.id,
+                record.updated_at_ms,
                 0,
                 state_key
               )
 
-            [{:put, state_key, state_value}, {:put, query_key, query_value}]
+            [query_row_op, {:put, query_key, query_value}]
           end)
 
         assert :ok = Ferricstore.Flow.LMDB.write_batch(lmdb_path, ops)

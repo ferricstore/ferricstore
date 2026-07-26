@@ -28,12 +28,49 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
       "multishard-manual" ->
         benchmark_multishard_manual()
 
+      "smoke" ->
+        smoke()
+
       "all" ->
         benchmark_composite()
         benchmark_multishard()
 
       invalid ->
         raise ArgumentError, "unknown native read candidate section: #{inspect(invalid)}"
+    end
+  end
+
+  def smoke do
+    root = temp_root("native-contract-smoke")
+    path = Path.join(root, "index")
+    File.mkdir_p!(path)
+
+    try do
+      plain_definition = definition()
+      {plain_key, plain_value} = compact_entry(plain_definition, 1)
+      :ok = LMDB.write_batch(path, [{:put, plain_key, plain_value}])
+      plain_prefix = IndexDefinition.storage_prefix(plain_definition)
+      plain = current_compact_range(path, plain_prefix, "", "", 1)
+      ^plain = native_compact_range(path, plain_prefix, "", "", 1)
+      [{^plain_key, _id, _state_key, _version, _expiry, _storage_bytes, nil}] = plain.entries
+
+      covering_definition = covering_definition()
+      record = compact_record("run-cover-smoke", 2)
+      state_key = Keys.state_key(record.id, record.partition_key)
+      {:ok, [covering_entry]} = CompositeIndex.entries(covering_definition, record, state_key, 0)
+      :ok = LMDB.write_batch(path, [{:put, covering_entry.key, covering_entry.value}])
+      covering_prefix = IndexDefinition.storage_prefix(covering_definition)
+      covering = current_compact_range(path, covering_prefix, "", "", 1)
+      ^covering = native_compact_range(path, covering_prefix, "", "", 1)
+
+      [{_key, _id, _state_key, _version, _expiry, _storage_bytes, encoded_cover}] =
+        covering.entries
+
+      true = is_binary(encoded_cover) and encoded_cover != ""
+      :ok
+    after
+      release(path)
+      File.rm_rf!(root)
     end
   end
 
@@ -193,7 +230,7 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
     end
   end
 
-  defp decode_compact(key, value) do
+  defp decode_compact(key, value = <<1, _rest::binary>>) do
     with <<1, id_bytes::unsigned-big-32, version::unsigned-big-64, expire_at_ms::unsigned-big-64,
            payload::binary>> <- value,
          true <- id_bytes > 0 and id_bytes < byte_size(payload),
@@ -202,11 +239,32 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
          true <- byte_size(id) <= 65_535 and byte_size(state_key) <= 65_535,
          {:ok, ^id} <- Keys.run_id_from_state_key(state_key),
          true <- CompositeIndex.entry_key_matches_id?(key, id) do
-      {:ok, {key, id, state_key, version, expire_at_ms, byte_size(key) + byte_size(value)}}
+      {:ok, {key, id, state_key, version, expire_at_ms, byte_size(key) + byte_size(value), nil}}
     else
       _invalid -> :error
     end
   end
+
+  defp decode_compact(key, value = <<2, _rest::binary>>) do
+    with <<2, id_bytes::unsigned-big-32, state_bytes::unsigned-big-32, version::unsigned-big-64,
+           expire_at_ms::unsigned-big-64, covering_bytes::unsigned-big-32, payload::binary>> <-
+           value,
+         true <- id_bytes > 0 and state_bytes > 0 and covering_bytes > 0,
+         <<id::binary-size(id_bytes), state_key::binary-size(state_bytes),
+           encoded_cover::binary-size(covering_bytes)>> <- payload,
+         true <- version <= 9_007_199_254_740_991,
+         true <- byte_size(id) <= 65_535 and byte_size(state_key) <= 65_535,
+         {:ok, ^id} <- Keys.run_id_from_state_key(state_key),
+         true <- CompositeIndex.entry_key_matches_id?(key, id) do
+      {:ok,
+       {key, id, state_key, version, expire_at_ms, byte_size(key) + byte_size(value),
+        encoded_cover}}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decode_compact(_key, _value), do: :error
 
   defp benchmark_multishard do
     Enum.each([4, 8, 16], fn shards ->
@@ -388,6 +446,17 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
     {entry.key, value}
   end
 
+  defp compact_record(id, version) do
+    %{
+      id: id,
+      type: "invoice",
+      state: "queued",
+      partition_key: "tenant-benchmark",
+      updated_at_ms: version,
+      version: version
+    }
+  end
+
   defp definition do
     IndexDefinition.new!(%{
       id: "bench-native-composite",
@@ -398,6 +467,20 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
         {:state, :asc},
         {:updated_at_ms, :asc}
       ]
+    })
+  end
+
+  defp covering_definition do
+    IndexDefinition.new!(%{
+      id: "bench-native-composite-covering",
+      version: 2,
+      fields: [
+        {:partition_key, :asc},
+        {:type, :asc},
+        {:state, :asc},
+        {:updated_at_ms, :asc}
+      ],
+      covering_fields: [:partition_key, :run_id, :state, :type, :updated_at_ms, :version]
     })
   end
 

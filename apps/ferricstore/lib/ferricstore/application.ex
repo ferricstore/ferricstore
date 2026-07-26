@@ -252,6 +252,12 @@ defmodule Ferricstore.Application do
             ),
             Ferricstore.Raft.WARaftSegmentReader.TableOwner,
             Supervisor.child_spec(
+              {Registry,
+               keys: :unique, name: Ferricstore.Raft.WARaftSegmentReader.DiskReader.registry()},
+              id: Ferricstore.Raft.WARaftSegmentReader.DiskReader.registry()
+            ),
+            Ferricstore.Raft.WARaftSegmentReader.DiskReaderSupervisor,
+            Supervisor.child_spec(
               {Ferricstore.Store.ETSTableHeir,
                name: Ferricstore.Raft.WARaftBackend.SyncGate.TableHeir},
               id: Ferricstore.Raft.WARaftBackend.SyncGate.TableHeir

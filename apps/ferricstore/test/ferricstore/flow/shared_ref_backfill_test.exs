@@ -8,9 +8,12 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
   alias Ferricstore.Flow
   alias Ferricstore.Flow.Keys
   alias Ferricstore.Flow.LMDB
+  alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.NativeOrderedIndex
+  alias Ferricstore.Flow.Query.QueryRowCodec
   alias Ferricstore.Flow.RetentionGuard
   alias Ferricstore.Flow.SharedRefBackfill
+  alias Ferricstore.Flow.StorageScope
   alias Ferricstore.ServerCatalog
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
@@ -86,12 +89,47 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
     refute :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
   end
 
+  test "accepts a state record bound to its sealed shared scope", test_ctx do
+    scope = <<42::unsigned-big-64>>
+    assert {:ok, physical_partition} = StorageScope.physical_partition_key("tenant", scope)
+
+    shared =
+      record("shared-primary",
+        partition_key: physical_partition,
+        system_metadata: scope_metadata(42)
+      )
+
+    insert_record!(test_ctx, shared)
+
+    assert :ok = run!(test_ctx)
+    assert :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
+  end
+
+  test "rejects a state record whose sealed scope does not own its physical key", test_ctx do
+    scope = <<42::unsigned-big-64>>
+    assert {:ok, physical_partition} = StorageScope.physical_partition_key("tenant", scope)
+
+    forged =
+      record("forged-shared-primary",
+        partition_key: physical_partition,
+        system_metadata: scope_metadata(99)
+      )
+
+    insert_record!(test_ctx, forged)
+
+    assert_raise RuntimeError, ~r/state key does not match decoded record/, fn ->
+      run!(test_ctx)
+    end
+
+    refute :ets.member(test_ctx.keydir, Keys.shared_value_ref_backfill_key(0))
+  end
+
   test "corrupt LMDB-only state fails closed without publishing the watermark", test_ctx do
     state_key = Keys.state_key("corrupt-lmdb", "tenant")
 
     assert :ok =
              LMDB.write_batch(LMDB.path(test_ctx.shard_path), [
-               {:put, state_key, LMDB.encode_value(<<"not-a-flow-record">>, 0)}
+               {:put, state_key, <<"not-a-query-row">>}
              ])
 
     assert_raise RuntimeError, ~r/shared-ref backfill.*decode/i, fn ->
@@ -456,10 +494,7 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
     rec = record("lmdb-only-consumer", payload_ref: ref)
     state_key = Keys.state_key(rec.id, rec.partition_key)
 
-    assert :ok =
-             LMDB.write_batch(LMDB.path(test_ctx.shard_path), [
-               {:put, state_key, LMDB.encode_value(Flow.encode_record(rec), 0)}
-             ])
+    assert ^state_key = insert_lmdb_record!(test_ctx, rec)
 
     assert :ok = run!(test_ctx, batch_size: 4, batch_bytes: 2_048)
     registry_key = Keys.shared_value_ref_registry_key(rec.id, rec.partition_key)
@@ -472,10 +507,7 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
     rec = record("lmdb-member-owner", result_ref: owned_ref)
     state_key = Keys.state_key(rec.id, rec.partition_key)
 
-    assert :ok =
-             LMDB.write_batch(LMDB.path(test_ctx.shard_path), [
-               {:put, state_key, LMDB.encode_value(Flow.encode_record(rec), 0)}
-             ])
+    assert ^state_key = insert_lmdb_record!(test_ctx, rec)
 
     append_primary!(test_ctx, [{owned_ref, Flow.encode_value("result")}])
     assert :ok = run!(test_ctx, batch_size: 2, batch_bytes: 2_048)
@@ -741,16 +773,14 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
     assert source =~ "NIF.v2_append_ops_batch_nosync("
     assert source =~ "&NIF.v2_fsync_async/3"
     assert source =~ "ctx.fsync_async.(self(), correlation_id, file_path)"
+    refute source =~ "decode_lmdb_state_value!"
   end
 
   test "keydir safe fixation is released before LMDB state pages", test_ctx do
     rec = record("fixed-table-release")
     state_key = Keys.state_key(rec.id, rec.partition_key)
 
-    assert :ok =
-             LMDB.write_batch(LMDB.path(test_ctx.shard_path), [
-               {:put, state_key, LMDB.encode_value(Flow.encode_record(rec), 0)}
-             ])
+    assert ^state_key = insert_lmdb_record!(test_ctx, rec)
 
     test_pid = self()
 
@@ -907,10 +937,64 @@ defmodule Ferricstore.Flow.SharedRefBackfillTest do
 
   defp shared_ref(id), do: Keys.value_key(id, :shared, 1, "shared-owner")
 
+  defp scope_metadata(value), do: %{0x8001 => {1, :uint64, :isolation_scope, value}}
+
   defp insert_record!(test_ctx, record) do
     append_primary!(test_ctx, [
       {Keys.state_key(record.id, record.partition_key), Flow.encode_record(record)}
     ])
+  end
+
+  defp insert_lmdb_record!(test_ctx, record) do
+    state_key = Keys.state_key(record.id, record.partition_key)
+    encoded = Flow.encode_record(record)
+    index = System.unique_integer([:positive, :monotonic])
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+               test_ctx.data_dir,
+               test_ctx.shard_index,
+               index,
+               [{state_key, encoded, 0}]
+             )
+
+    assert {:ok, 1} =
+             Ferricstore.Raft.WARaftSegmentReader.ensure_apply_projection_entries_durable(
+               test_ctx.data_dir,
+               test_ctx.shard_index,
+               [{index, state_key}]
+             )
+
+    assert {:ok, {segment_generation, frame_offset, frame_size}} =
+             Ferricstore.Raft.WARaftSegmentReader.physical_location(
+               %{data_dir: test_ctx.data_dir},
+               test_ctx.shard_index,
+               {:waraft_apply_projection, index}
+             )
+
+    locator =
+      Locator.new!(
+        flow_id: record.id,
+        kind: :state,
+        version: record.version,
+        raft_index: index,
+        file_id: {:waraft_apply_projection, index},
+        offset: frame_offset,
+        value_size: byte_size(encoded),
+        checksum: :crypto.hash(:sha256, encoded),
+        expire_at_ms: 0,
+        segment_generation: segment_generation,
+        frame_size: frame_size
+      )
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+
+    assert :ok =
+             LMDB.write_batch(LMDB.path(test_ctx.shard_path), [
+               {:put, state_key, query_row}
+             ])
+
+    state_key
   end
 
   defp append_primary!(test_ctx, entries) do

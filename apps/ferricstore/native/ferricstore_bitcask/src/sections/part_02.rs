@@ -766,7 +766,7 @@ fn v2_build_hint_file_from_log<'a>(
 }
 
 /// Copy specified records from a source file to a destination file.
-/// Returns `{:ok, [{new_offset, new_size}, ...]}`.
+/// Returns `{:ok, [{new_offset, new_value_size}, ...]}`.
 ///
 /// Used by compaction to copy only live records to a new file.
 #[rustler::nif(schedule = "DirtyIo")]
@@ -808,7 +808,7 @@ fn copy_live_records_impl(
     for &offset in offsets {
         let copied = log::copy_live_record_raw_from_file(&file, &mut writer, offset)
             .map_err(|error| error.to_string())?;
-        results.push((copied.offset, copied.record_size));
+        results.push((copied.offset, copied.value_size));
     }
 
     writer.sync().map_err(|error| error.to_string())?;
@@ -817,7 +817,7 @@ fn copy_live_records_impl(
 
 /// Copy live records and tombstones into a replacement log.
 ///
-/// Returns `{:ok, [{new_offset, new_size}, ...]}` for live offsets only, in
+/// Returns `{:ok, [{new_offset, new_value_size}, ...]}` for live offsets only, in
 /// the same order as `live_offsets`. Tombstones are copied in source-offset
 /// order so replay still suppresses older values after compaction.
 #[rustler::nif(schedule = "DirtyIo")]
@@ -891,7 +891,7 @@ fn copy_records_preserve_tombstones_impl(
                             "requested live offset {offset} contained a tombstone; expected live record"
                         ));
                     }
-                    live_results.insert(offset, (copied.offset, copied.record_size));
+                    live_results.insert(offset, (copied.offset, copied.value_size));
                 } else if !copied.is_tombstone {
                     return Err(format!(
                         "requested tombstone offset {offset} contained a live record; expected tombstone"

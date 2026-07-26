@@ -421,6 +421,19 @@ defmodule FerricstoreServer.Native.CommandsTest do
     end
   end
 
+  defmodule ResponseCodecQueryEngine do
+    @behaviour FerricStore.Flow.QueryEngine
+
+    @impl true
+    def execute(ctx, request) do
+      {:ok,
+       %{
+         mode: request.mode,
+         response_codec: FerricStore.Flow.QueryEngine.response_codec(ctx)
+       }}
+    end
+  end
+
   defmodule RejectingQueryEngine do
     @behaviour FerricStore.Flow.QueryEngine
 
@@ -2063,6 +2076,28 @@ defmodule FerricstoreServer.Native.CommandsTest do
                %{"command" => "FLOW.QUERY", "args" => ["FQL1", query]},
                query_state
              )
+  end
+
+  test "FLOW.QUERY carries only the connection-negotiated result codec on both native paths" do
+    query =
+      "FROM runs WHERE partition_key = 'tenant-a' AND run_id = 'run-123' RETURN RECORD"
+
+    plain_state = state_with_query_engine(ResponseCodecQueryEngine)
+
+    compact_state =
+      Map.put(
+        plain_state,
+        :compact_response_codecs,
+        MapSet.new(["flow_query_result_v1"])
+      )
+
+    for {opcode, payload} <- flow_query_requests(query) do
+      assert {:ok, %{mode: :execute, response_codec: :native_value}, _state} =
+               Commands.execute(opcode, payload, plain_state)
+
+      assert {:ok, %{mode: :execute, response_codec: :flow_query_result_v1}, _state} =
+               Commands.execute(opcode, payload, compact_state)
+    end
   end
 
   test "FLOW.QUERY passes only trusted request context to the installed query engine" do

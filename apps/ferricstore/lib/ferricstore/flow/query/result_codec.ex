@@ -7,6 +7,7 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
   alias Ferricstore.NativeValueCodec
 
   @tag 0xA0
+  @name "flow_query_result_v1"
   @contract "ferric.flow.query.result/v1"
   @page_kind 0
   @count_kind 1
@@ -87,6 +88,10 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
   def tag, do: @tag
 
   @doc false
+  @spec name() :: binary()
+  def name, do: @name
+
+  @doc false
   @spec contract() :: binary()
   def contract, do: @contract
 
@@ -114,6 +119,18 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
     _kind, _reason -> nil
   end
 
+  @spec encoded_size(term()) :: non_neg_integer() | nil
+  def encoded_size(response) do
+    case measure_result(response) do
+      {:ok, bytes} -> bytes
+      :error -> nil
+    end
+  rescue
+    _error -> nil
+  catch
+    _kind, _reason -> nil
+  end
+
   defp encode_result(response) when is_map(response) and map_size(response) == 5,
     do: encode_page(response)
 
@@ -121,6 +138,48 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
     do: encode_count(response)
 
   defp encode_result(_response), do: :error
+
+  defp measure_result(response) when is_map(response) and map_size(response) == 5,
+    do: measure_page(response)
+
+  defp measure_result(response) when is_map(response) and map_size(response) == 4,
+    do: measure_count(response)
+
+  defp measure_result(_response), do: :error
+
+  defp measure_page(response) do
+    with {:ok, @contract} <- fetch_exact(response, :version),
+         {:ok, records} when is_list(records) <- fetch_exact(response, :records),
+         {:ok, page} when is_map(page) and map_size(page) == 2 <- fetch_exact(response, :page),
+         {:ok, quality} when is_map(quality) <- fetch_exact(response, :quality),
+         {:ok, usage} when is_map(usage) <- fetch_exact(response, :usage),
+         {:ok, _quality_payload} <- encode_quality(quality),
+         {:ok, _usage_values} <- usage_values(usage),
+         {:ok, _page_payload, page_bytes} <- encode_page_metadata(page),
+         {:ok, records_bytes} <- measure_records(records) do
+      {:ok, @common_bytes + page_bytes + 4 + records_bytes}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp measure_count(response) do
+    with {:ok, @contract} <- fetch_exact(response, :version),
+         {:ok, result} when is_map(result) and map_size(result) == 2 <-
+           fetch_exact(response, :result),
+         {:ok, "count"} <- fetch_exact(result, :kind),
+         {:ok, count}
+         when is_integer(count) and count >= 0 and count <= @maximum_native_integer <-
+           fetch_exact(result, :value),
+         {:ok, quality} when is_map(quality) <- fetch_exact(response, :quality),
+         {:ok, usage} when is_map(usage) <- fetch_exact(response, :usage),
+         {:ok, _quality_payload} <- encode_quality(quality),
+         {:ok, _usage_values} <- usage_values(usage) do
+      {:ok, @common_bytes + 8}
+    else
+      _invalid -> :error
+    end
+  end
 
   defp encode_page(response) do
     with {:ok, @contract} <- fetch_exact(response, :version),
@@ -259,6 +318,37 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
   end
 
   defp encode_records(_records), do: :error
+
+  defp measure_records(records) when length(records) <= @maximum_records do
+    Enum.reduce_while(records, {:ok, 0}, fn record, {:ok, bytes} ->
+      case measure_record(record) do
+        {:ok, record_bytes} -> {:cont, {:ok, bytes + record_bytes}}
+        :error -> {:halt, :error}
+      end
+    end)
+  end
+
+  defp measure_records(_records), do: :error
+
+  defp measure_record(record)
+       when is_map(record) and map_size(record) <= length(@record_fields) do
+    record
+    |> Enum.reduce_while({:ok, 0, 4}, fn {field, value}, {:ok, bitmap, bytes} ->
+      case record_field_index(field) do
+        {:ok, index} when band(bitmap, 1 <<< index) == 0 ->
+          {:cont, {:ok, bitmap ||| 1 <<< index, bytes + NativeValueCodec.encoded_size(value)}}
+
+        _unknown_or_duplicate ->
+          {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, _bitmap, bytes} -> {:ok, bytes}
+      :error -> :error
+    end
+  end
+
+  defp measure_record(_record), do: :error
 
   defp encode_record(record) when is_map(record) and map_size(record) <= length(@record_fields) do
     record

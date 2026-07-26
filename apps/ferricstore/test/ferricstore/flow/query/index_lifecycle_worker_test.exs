@@ -654,6 +654,96 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
     refute_receive :project
   end
 
+  test "reduces the source page until projection fits and advances the durable cursor" do
+    {ctx, registry, worker, data_dir} = test_context("adaptive_projection_page")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    parent = self()
+
+    records =
+      Enum.map(1..8, fn number ->
+        %{state_key: "state-#{number}", record: %{}, expire_at_ms: 0}
+      end)
+
+    page = fn _ctx, 0, _build_id, cursor, items, _bytes, _opts ->
+      offset =
+        if cursor == "",
+          do: 0,
+          else: cursor |> String.replace_prefix("cursor-", "") |> String.to_integer()
+
+      selected = records |> Enum.drop(offset) |> Enum.take(items)
+      next_offset = offset + length(selected)
+      send(parent, {:adaptive_page, offset, items, length(selected)})
+
+      {:ok,
+       %{
+         records: selected,
+         cursor: "cursor-#{next_offset}",
+         done?: next_offset == length(records),
+         scanned_entries: length(selected),
+         hydrated_bytes: length(selected) * 64
+       }}
+    end
+
+    project = fn _ctx, 0, selected, _definitions ->
+      send(parent, {:adaptive_project, length(selected)})
+
+      if length(selected) > 2 do
+        {:error, :query_backfill_projection_budget_exceeded}
+      else
+        {:ok,
+         %{
+           projected_records: length(selected),
+           written_entries: length(selected),
+           write_ops: length(selected),
+           written_bytes: length(selected) * 100
+         }}
+      end
+    end
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        backfill_items: 8,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, _shard, _build_id, _items, _bytes ->
+          {:ok, %{done?: true, scanned_keys: 8, staged_states: 8}}
+        end,
+        page_fun: page,
+        project_fun: project
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :backfill_progress} = IndexLifecycleWorker.run_once(worker)
+
+    assert_receive {:adaptive_page, 0, 8, 8}
+    assert_receive {:adaptive_project, 8}
+    assert_receive {:adaptive_page, 0, 4, 4}
+    assert_receive {:adaptive_project, 4}
+    assert_receive {:adaptive_page, 0, 2, 2}
+    assert_receive {:adaptive_project, 2}
+
+    assert {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+
+    assert {:ok, %{checkpoints: %{0 => checkpoint}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert checkpoint.cursor == "cursor-2"
+    assert checkpoint.scanned_records == 10
+    assert checkpoint.written_entries == 2
+
+    assert {:ok, :backfill_progress} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :backfill_progress} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :shard_complete} = IndexLifecycleWorker.run_once(worker)
+
+    assert {:ok, %{checkpoints: %{0 => complete}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert complete.phase == :done
+    assert complete.scanned_records == 16
+    assert complete.written_entries == 8
+  end
+
   test "rejects a snapshot callback that reports no progress" do
     {ctx, registry, worker, data_dir} = test_context("snapshot_stall")
     on_exit(fn -> File.rm_rf!(data_dir) end)

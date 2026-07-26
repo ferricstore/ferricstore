@@ -160,6 +160,13 @@ defmodule Ferricstore.Flow.Query.FixedIndexExecutorTest do
     assert {:ok,
             %{
               bounds: %{scan_records: 202},
+              plan: %{
+                projection: %{
+                  source: "authoritative_log",
+                  index_only: false,
+                  requires_hydration: true
+                }
+              },
               query_fingerprint: subset_fingerprint
             }} =
              FixedIndexExecutor.execute(%{}, request.(~w(failed completed)))

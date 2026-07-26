@@ -146,6 +146,7 @@ defmodule Ferricstore.Flow.LMDBTest do
     source_keydir = :ets.new(:"flow_lmdb_#{label}_source", [:set, :public])
 
     on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(data_dir, shard_index)
       if :ets.info(source_keydir) != :undefined, do: :ets.delete(source_keydir)
       File.rm_rf!(data_dir)
     end)
@@ -157,7 +158,12 @@ defmodule Ferricstore.Flow.LMDBTest do
        shard_index: shard_index,
        data_dir: data_dir,
        instance_name: instance_name,
-       instance_ctx: %{name: instance_name, keydir_refs: {source_keydir}}}
+       instance_ctx: %{
+         name: instance_name,
+         data_dir: data_dir,
+         keydir_refs: {source_keydir},
+         max_value_size: 1_048_576
+       }}
     )
 
     shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_index)
@@ -219,13 +225,13 @@ defmodule Ferricstore.Flow.LMDBTest do
   end
 
   defp project_active_lmdb_record!(fixture, record) do
-    state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
-    encoded = Ferricstore.Flow.encode_record(record)
-
-    :ets.insert(
-      fixture.source_keydir,
-      {state_key, encoded, 0, 0, :hot, 0, byte_size(encoded)}
-    )
+    %{state_key: state_key} =
+      put_durable_flow_source!(
+        fixture.data_dir,
+        fixture.shard_index,
+        fixture.source_keydir,
+        record
+      )
 
     assert :ok =
              Ferricstore.Flow.LMDBWriter.enqueue(fixture.instance_name, fixture.shard_index, [
@@ -234,6 +240,154 @@ defmodule Ferricstore.Flow.LMDBTest do
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
     state_key
+  end
+
+  defp put_durable_flow_source!(data_dir, shard_index, keydir, record, opts \\ []) do
+    [source] = put_durable_flow_sources!(data_dir, shard_index, keydir, [record], opts)
+    source
+  end
+
+  defp put_durable_flow_sources!(data_dir, shard_index, keydir, records, opts \\ []) do
+    sources = durable_flow_sources!(data_dir, shard_index, records, opts)
+    lfu = Keyword.get(opts, :lfu, 0)
+
+    Enum.each(sources, fn source ->
+      true =
+        :ets.insert(
+          keydir,
+          {source.state_key, nil, source.expire_at_ms, lfu, source.file_id, 0,
+           byte_size(source.encoded)}
+        )
+    end)
+
+    sources
+  end
+
+  defp durable_query_row_put_ops!(data_dir, shard_index, records, opts \\ []) do
+    data_dir
+    |> durable_flow_sources!(shard_index, records, opts)
+    |> query_row_put_ops_for_sources!()
+  end
+
+  defp query_row_put_ops_for_sources!(sources) do
+    sources
+    |> Enum.map(fn source ->
+      assert {:ok, decoded_record, locator} =
+               Ferricstore.Flow.ProjectionLocator.decode_source(
+                 source.state_key,
+                 source.encoded,
+                 source.expire_at_ms,
+                 {source.file_id, 0, byte_size(source.encoded)}
+               )
+
+      assert decoded_record.id == source.record.id
+      assert decoded_record.version == source.record.version
+
+      assert {:ok, {segment_generation, frame_offset, frame_size}} =
+               Ferricstore.Raft.WARaftSegmentReader.physical_location(
+                 %{data_dir: source.data_dir},
+                 source.shard_index,
+                 source.file_id
+               )
+
+      assert {:ok, locator} =
+               Ferricstore.Flow.Locator.relocate(locator,
+                 segment_generation: segment_generation,
+                 offset: frame_offset,
+                 frame_size: frame_size
+               )
+
+      assert {:ok, query_row} =
+               Ferricstore.Flow.Query.QueryRowCodec.encode(
+                 source.state_key,
+                 decoded_record,
+                 locator,
+                 source.expire_at_ms
+               )
+
+      {:put, source.state_key, query_row}
+    end)
+  end
+
+  defp durable_flow_sources!(data_dir, shard_index, records, opts) do
+    index = System.unique_integer([:positive, :monotonic])
+    file_id = {:waraft_apply_projection, index}
+
+    sources =
+      Enum.map(records, fn record ->
+        state_key = Ferricstore.Flow.Keys.state_key(record.id, record.partition_key)
+        encoded = Ferricstore.Flow.encode_record(record)
+
+        expire_at_ms =
+          Keyword.get_lazy(opts, :expire_at_ms, fn ->
+            case Map.get(record, :terminal_retention_until_ms) do
+              value when is_integer(value) and value > 0 -> value
+              _other -> 0
+            end
+          end)
+
+        %{
+          state_key: state_key,
+          record: record,
+          encoded: encoded,
+          expire_at_ms: expire_at_ms,
+          data_dir: data_dir,
+          shard_index: shard_index,
+          file_id: file_id,
+          index: index
+        }
+      end)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(
+               data_dir,
+               shard_index,
+               index,
+               Enum.map(sources, &{&1.state_key, &1.encoded, &1.expire_at_ms})
+             )
+
+    assert {:ok, count} =
+             Ferricstore.Raft.WARaftSegmentReader.ensure_apply_projection_entries_durable(
+               data_dir,
+               shard_index,
+               Enum.map(sources, &{index, &1.state_key})
+             )
+
+    assert count == length(sources)
+
+    sources
+  end
+
+  defp assert_query_row_hydrates!(
+         data_dir,
+         shard_index,
+         lmdb_path,
+         state_key,
+         record,
+         ctx_overrides \\ %{}
+       ) do
+    expected = Ferricstore.Flow.encode_record(record)
+    assert {:ok, query_row} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+    assert {:ok, %{record: metadata, locator: locator} = decoded} =
+             Ferricstore.Flow.Query.QueryRowCodec.decode(query_row, state_key)
+
+    assert metadata.id == record.id
+    assert metadata.version == record.version
+    assert metadata.type == record.type
+    assert metadata.state == record.state
+    assert metadata.partition_key == record.partition_key
+
+    assert {:ok, [^expected]} =
+             Ferricstore.Flow.RecordHydrator.read_encoded_many(
+               Map.merge(%{data_dir: data_dir, max_value_size: 1_048_576}, ctx_overrides),
+               shard_index,
+               [{state_key, locator}],
+               max_bytes: max(byte_size(expected) * 2, 1_048_576),
+               include_expired: true
+             )
+
+    decoded
   end
 
   def handle_lmdb_writer_unavailable(event, measurements, metadata, test_pid) do

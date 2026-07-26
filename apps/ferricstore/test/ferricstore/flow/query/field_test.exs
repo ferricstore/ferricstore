@@ -47,6 +47,10 @@ defmodule Ferricstore.Flow.Query.FieldTest do
     assert {:error, :unsupported_field} = Field.parse("attribute")
     assert {:error, :unsupported_field} = Field.parse("attribute.__private")
     assert {:error, :unsupported_field} = Field.parse("state_meta.running")
+    assert {:error, :unsupported_field} = Field.parse("attribute[' tier']")
+    assert {:error, :unsupported_field} = Field.parse("attribute['tier ']")
+    assert {:error, :unsupported_field} = Field.parse("state_meta[' queued']['worker']")
+    assert {:error, :unsupported_field} = Field.parse("state_meta['queued ']['worker']")
     assert {:error, :unsupported_field} = Field.parse("attribute." <> String.duplicate("x", 65))
     assert {:error, :unsupported_field} = Field.parse("unknown")
   end

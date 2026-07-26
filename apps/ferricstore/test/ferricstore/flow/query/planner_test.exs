@@ -271,6 +271,116 @@ defmodule Ferricstore.Flow.Query.PlannerTest do
     assert String.starts_with?(range.after_key, range.prefix)
   end
 
+  test "classifies compact-row and authoritative-log execution explicitly" do
+    index = active_index(state_definition())
+
+    statistics =
+      stats(index, "tenant-a", %{
+        ["tenant-a"] => 1_000,
+        ["tenant-a", "failed"] => 20
+      })
+
+    sparse =
+      collection([
+        eq(:partition_key, "tenant-a"),
+        eq(:state, "failed")
+      ])
+      |> Map.put(:projection, [:run_id, :state, :updated_at_ms])
+
+    assert {:ok, sparse_plan} =
+             Planner.plan(sparse, [index], stats: stats_lookup(statistics), now_ms: @now_ms)
+
+    assert Map.fetch!(sparse_plan, :record_source) == :query_row
+    assert sparse_plan.estimate.hydrated_records == 0
+    assert sparse_plan.estimate.hard_hydrated_records == 0
+    assert sparse_plan.estimate.metadata_rows == 20
+    assert sparse_plan.estimate.hard_metadata_rows == 26
+    assert sparse_plan.estimate.metadata_bytes > 0
+
+    assert {:ok, metadata_budget} = Budget.lower(Budget.default(), hydrated_records: 1)
+
+    assert {:ok, %Plan{record_source: :query_row}} =
+             Planner.plan(sparse, [index],
+               budget: metadata_budget,
+               stats: stats_lookup(statistics),
+               now_ms: @now_ms
+             )
+
+    full = collection([eq(:partition_key, "tenant-a"), eq(:state, "failed")])
+
+    assert {:ok, full_plan} =
+             Planner.plan(full, [index], stats: stats_lookup(statistics), now_ms: @now_ms)
+
+    assert Map.fetch!(full_plan, :record_source) == :authoritative_log
+    assert full_plan.estimate.hydrated_records == 20
+    assert full_plan.estimate.hard_hydrated_records == 26
+    assert full_plan.estimate.metadata_rows == 0
+
+    assert {:ok, insufficient_hydration} =
+             Budget.lower(Budget.default(), hydrated_records: 25)
+
+    assert {:ok, %Plan{path: :reject, fallback_reason: :hydration_budget_exceeded}} =
+             Planner.plan(full, [index],
+               budget: insufficient_hydration,
+               stats: stats_lookup(statistics),
+               now_ms: @now_ms
+             )
+  end
+
+  test "prefers a covering index when scan cardinality is otherwise equal" do
+    plain_definition =
+      IndexDefinition.new!(%{
+        id: "aaa_plain",
+        version: 1,
+        fields: [
+          {:partition_key, :asc},
+          {:state, :asc},
+          {:updated_at_ms, :desc}
+        ]
+      })
+
+    covering_definition =
+      IndexDefinition.new!(%{
+        id: "zzz_covering",
+        version: 1,
+        fields: plain_definition.fields,
+        covering_fields: [:partition_key, :run_id, :type, :state, :updated_at_ms, :version]
+      })
+
+    plain = active_index(plain_definition)
+    covering = active_index(covering_definition)
+
+    request =
+      collection([
+        eq(:partition_key, "tenant-a"),
+        eq(:state, "failed"),
+        eq(:type, "invoice")
+      ])
+      |> Map.put(:projection, [:run_id, :state, :updated_at_ms])
+
+    statistics =
+      [plain, covering]
+      |> Map.new(fn index ->
+        stat =
+          stats(index, "tenant-a", %{
+            ["tenant-a"] => 1_000,
+            ["tenant-a", "failed"] => 20
+          })
+
+        {identity(stat), stat}
+      end)
+
+    assert {:ok, plan} =
+             Planner.plan(request, [plain, covering], stats: statistics, now_ms: @now_ms)
+
+    assert plan.index_id == "zzz_covering"
+    assert Map.fetch!(plan, :record_source) == :covering_index
+    assert plan.estimate.hydrated_records == 0
+    assert plan.estimate.metadata_rows == 0
+    assert plan.estimate.scan_entries > 0
+    assert plan.estimate.residual_checks == plan.estimate.scan_entries
+  end
+
   test "plans scalar counts as bounded unordered scans with one scalar result" do
     definition =
       IndexDefinition.new!(%{
@@ -389,12 +499,17 @@ defmodule Ferricstore.Flow.Query.PlannerTest do
     assert {:ok,
             %Plan{
               path: :count_scan,
+              record_source: :query_row,
               residual_predicates: [_residual],
-              estimate: %{hydrated_records: hydrated_records, residual_checks: residual_checks}
+              estimate: %{
+                hydrated_records: 0,
+                metadata_rows: metadata_rows,
+                residual_checks: residual_checks
+              }
             }} =
              Planner.plan(residual, [active_index(definition)], now_ms: @now_ms)
 
-    assert residual_checks == hydrated_records
+    assert residual_checks == metadata_rows
   end
 
   test "does not sum multivalue IN counters that could double-count one run" do
@@ -936,6 +1051,30 @@ defmodule Ferricstore.Flow.Query.PlannerTest do
                budget: budget,
                now_ms: @now_ms
              )
+  end
+
+  test "accounts for prepared residual membership in executor memory" do
+    index = active_index(state_definition())
+    stat = stats(index, "tenant-a", %{["tenant-a", "failed"] => 500})
+
+    plan = fn values ->
+      request =
+        collection([
+          eq(:partition_key, "tenant-a"),
+          eq(:state, "failed"),
+          {:in, {:attribute, "tier"}, Enum.map(values, &keyword/1)}
+        ])
+
+      assert {:ok, %Plan{residual_predicates: [_predicate]} = plan} =
+               Planner.plan(request, [index], stats: stats_lookup(stat), now_ms: @now_ms)
+
+      plan
+    end
+
+    one_value = plan.(["tier-1"])
+    twenty_values = plan.(Enum.map(1..20, &"tier-#{&1}"))
+
+    assert twenty_values.estimate.memory_bytes > one_value.estimate.memory_bytes
   end
 
   test "an empty half-open time window returns an empty plan without a read" do

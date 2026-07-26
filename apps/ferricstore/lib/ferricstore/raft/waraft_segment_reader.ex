@@ -1,5 +1,6 @@
 defmodule Ferricstore.Raft.WARaftSegmentReader do
   alias Ferricstore.Raft.WARaftSegmentReader.CommandValues
+  alias Ferricstore.Raft.WARaftSegmentReader.DiskReader
   @moduledoc false
 
   @table_prefix "raft_log_ferricstore_waraft_backend_"
@@ -15,6 +16,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   @apply_projection_select_page_size 512
   @apply_projection_lock_retry_min_ms 1
   @apply_projection_lock_retry_max_ms 32
+  @maximum_location_batch_groups 4_096
+  @maximum_location_batch_keys 4_096
+  @maximum_physical_read_bytes 1 * 1_024 * 1_024 * 1_024
   @held_apply_projection_locks_key :ferricstore_waraft_apply_projection_held_locks
   @held_apply_projection_disk_locks_key :ferricstore_waraft_apply_projection_held_disk_locks
   @held_apply_projection_disk_read_locks_key :ferricstore_waraft_apply_projection_held_disk_read_locks
@@ -199,6 +203,409 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   def spill_apply_projection_cache(_data_dir, _shard_index, _min_entries, _min_bytes),
     do: {:ok, 0}
 
+  @doc false
+  @spec ensure_apply_projection_entries_durable(binary(), non_neg_integer(), [
+          {pos_integer(), binary()}
+        ]) :: {:ok, non_neg_integer()} | {:error, term()}
+  def ensure_apply_projection_entries_durable(data_dir, shard_index, refs)
+      when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
+             is_list(refs) do
+    with {:ok, refs} <- normalize_apply_projection_refs(refs) do
+      root = storage_root(%{data_dir: data_dir}, shard_index)
+
+      with_apply_projection_disk_lock_root(root, fn ->
+        indexes = refs |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+        projection_root = Path.join(root, @apply_projection_dir)
+
+        groups =
+          case :ets.whereis(@apply_projection_table) do
+            :undefined ->
+              []
+
+            table ->
+              table
+              |> apply_projection_cache_entries_for_indexes(root, indexes)
+              |> Enum.group_by(fn {index, _key, _value, _expire_at_ms} -> index end)
+              |> Enum.sort_by(fn {index, _entries} -> index end)
+          end
+
+        with {:ok, removed} <-
+               spill_apply_projection_groups(groups, data_dir, shard_index, projection_root),
+             :ok <- verify_apply_projection_refs_from_disk(root, refs) do
+          {:ok, removed}
+        end
+      end)
+    end
+  rescue
+    error -> {:error, {:ensure_apply_projection_entries_durable_failed, error}}
+  catch
+    kind, reason -> {:error, {:ensure_apply_projection_entries_durable_failed, {kind, reason}}}
+  end
+
+  def ensure_apply_projection_entries_durable(_data_dir, _shard_index, _refs),
+    do: {:error, :invalid_apply_projection_refs}
+
+  @doc false
+  @spec physical_location(FerricStore.Instance.t(), non_neg_integer(), term()) ::
+          {:ok, {non_neg_integer(), non_neg_integer(), pos_integer()}} | {:error, term()}
+  def physical_location(ctx, shard_index, {kind, index})
+      when is_map(ctx) and is_integer(shard_index) and shard_index >= 0 and
+             kind in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+             is_integer(index) and index > 0 do
+    root = storage_root(ctx, shard_index)
+
+    locate = fn ->
+      segment_root =
+        case kind do
+          :waraft_segment -> root
+          :waraft_projection -> Path.join(root, @projection_dir)
+          :waraft_apply_projection -> Path.join(root, @apply_projection_dir)
+        end
+
+      locate_physical_frame(segment_root, index)
+    end
+
+    if kind == :waraft_apply_projection,
+      do: with_apply_projection_disk_read_lock_root(root, locate),
+      else: locate.()
+  rescue
+    error -> {:error, {:physical_location_failed, error}}
+  catch
+    kind, reason -> {:error, {:physical_location_failed, {kind, reason}}}
+  end
+
+  def physical_location(_ctx, _shard_index, _file_id),
+    do: {:error, :invalid_waraft_location}
+
+  @doc false
+  @spec read_physical_values(
+          FerricStore.Instance.t(),
+          non_neg_integer(),
+          [map()],
+          pos_integer(),
+          :live | :include_expired
+        ) :: {:ok, %{binary() => binary()}} | {:error, term()}
+  def read_physical_values(ctx, shard_index, requests, timeout_ms, read_mode)
+      when is_map(ctx) and is_integer(shard_index) and shard_index >= 0 and is_list(requests) and
+             is_integer(timeout_ms) and timeout_ms > 0 and
+             read_mode in [:live, :include_expired] do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+
+    with :ok <- validate_physical_requests(requests),
+         false <- waraft_read_expired?(deadline_ms),
+         {:ok, values} <-
+           do_read_physical_values(ctx, shard_index, requests, read_mode, deadline_ms),
+         false <- waraft_read_expired?(deadline_ms) do
+      {:ok, values}
+    else
+      true -> {:error, :deadline_exceeded}
+      {:error, _reason} = error -> error
+    end
+  rescue
+    error -> {:error, {:physical_read_failed, error}}
+  catch
+    kind, reason -> {:error, {:physical_read_failed, {kind, reason}}}
+  end
+
+  def read_physical_values(_ctx, _shard_index, _requests, _timeout_ms, _read_mode),
+    do: {:error, :invalid_physical_read}
+
+  defp validate_physical_requests(requests) do
+    requests
+    |> Enum.reduce_while({0, 0, MapSet.new(), MapSet.new()}, fn
+      %{
+        file_id: {kind, index},
+        ordinal: ordinal,
+        offset: offset,
+        frame_size: frame_size,
+        key: key
+      },
+      {count, bytes, seen_keys, seen_frames}
+      when kind in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+             is_integer(index) and index > 0 and is_integer(ordinal) and ordinal >= 0 and
+             is_integer(offset) and offset >= 0 and is_integer(frame_size) and frame_size >= 8 and
+             is_binary(key) and key != "" and count < @maximum_location_batch_keys ->
+        frame = {{kind, index}, ordinal, offset, frame_size}
+
+        cond do
+          MapSet.member?(seen_keys, key) ->
+            {:halt, :invalid}
+
+          MapSet.member?(seen_frames, frame) ->
+            {:cont, {count + 1, bytes, MapSet.put(seen_keys, key), seen_frames}}
+
+          bytes + frame_size > @maximum_physical_read_bytes ->
+            {:halt, :byte_budget_exceeded}
+
+          true ->
+            {:cont,
+             {count + 1, bytes + frame_size, MapSet.put(seen_keys, key),
+              MapSet.put(seen_frames, frame)}}
+        end
+
+      _invalid, _acc ->
+        {:halt, :invalid}
+    end)
+    |> case do
+      :invalid -> {:error, :invalid_physical_read}
+      :byte_budget_exceeded -> {:error, :physical_read_byte_budget_exceeded}
+      {_count, _bytes, _seen_keys, _seen_frames} -> :ok
+    end
+  end
+
+  defp do_read_physical_values(ctx, shard_index, requests, read_mode, deadline_ms) do
+    requests
+    |> Enum.group_by(fn %{file_id: {kind, _index}} -> kind end)
+    |> Enum.reduce_while({:ok, %{}}, fn {kind, grouped}, {:ok, values} ->
+      case read_physical_kind(ctx, shard_index, kind, grouped, read_mode, deadline_ms) do
+        {:ok, kind_values} -> {:cont, {:ok, Map.merge(values, kind_values)}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp read_physical_kind(
+         ctx,
+         shard_index,
+         :waraft_apply_projection,
+         requests,
+         read_mode,
+         deadline_ms
+       ) do
+    root = storage_root(ctx, shard_index)
+    log_root = Path.join(root, @apply_projection_dir)
+
+    with_apply_projection_disk_read_lock_root(root, deadline_ms, fn ->
+      read_physical_frames(root, log_root, requests, read_mode, deadline_ms)
+    end)
+  end
+
+  defp read_physical_kind(ctx, shard_index, kind, requests, read_mode, deadline_ms)
+       when kind in [:waraft_segment, :waraft_projection] do
+    root = storage_root(ctx, shard_index)
+
+    log_root =
+      case kind do
+        :waraft_segment -> root
+        :waraft_projection -> Path.join(root, @projection_dir)
+      end
+
+    read_physical_frames(root, log_root, requests, read_mode, deadline_ms)
+  end
+
+  defp read_physical_frames(root, log_root, requests, read_mode, deadline_ms) do
+    frames = unique_physical_frames(requests)
+
+    locations =
+      Enum.map(frames, fn %{file_id: {_kind, index}} = frame ->
+        {index, {frame.ordinal, frame.offset, frame.frame_size}}
+      end)
+
+    with {:ok, timeout_ms} <- remaining_waraft_read_timeout(deadline_ms) do
+      case DiskReader.read_many_at(root, log_root, locations, timeout_ms) do
+        {:ok, entries} when length(entries) == length(frames) ->
+          decode_physical_frames(frames, entries, read_mode, %{})
+
+        {:ok, _entries} ->
+          {:error, :physical_read_count_mismatch}
+
+        {:error, {:segment_reader_unavailable, _reason}} ->
+          read_physical_frames_fallback_bounded(log_root, requests, read_mode, deadline_ms)
+
+        {:error, {:segment_reader_timeout, _reason}} ->
+          {:error, :deadline_exceeded}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp read_physical_frames_fallback_bounded(log_root, requests, read_mode, deadline_ms) do
+    with {:ok, timeout_ms} <- remaining_waraft_read_timeout(deadline_ms) do
+      task = Task.async(fn -> read_physical_frames_fallback(log_root, requests, read_mode) end)
+
+      case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
+        {:ok, result} -> result
+        nil -> {:error, :deadline_exceeded}
+        {:exit, reason} -> {:error, {:physical_read_fallback_failed, reason}}
+      end
+    end
+  end
+
+  defp read_physical_frames_fallback(log_root, requests, read_mode) do
+    frames = unique_physical_frames(requests)
+
+    with {:ok, entries} <- read_physical_frame_groups(log_root, frames) do
+      decode_physical_frames(frames, entries, read_mode, %{})
+    end
+  end
+
+  defp read_physical_frame_groups(_log_root, []), do: {:ok, []}
+
+  defp read_physical_frame_groups(log_root, frames) do
+    groups =
+      frames
+      |> Enum.with_index()
+      |> Enum.group_by(fn {frame, _position} -> frame.ordinal end)
+
+    groups
+    |> Enum.reduce_while({:ok, %{}}, fn
+      {_ordinal, group}, {:ok, entries} ->
+        case read_physical_frame_group(log_root, group) do
+          {:ok, group_entries} ->
+            positioned =
+              group
+              |> Enum.zip(group_entries)
+              |> Enum.reduce(entries, fn {{_frame, position}, entry}, acc ->
+                Map.put(acc, position, entry)
+              end)
+
+            {:cont, {:ok, positioned}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+        end
+    end)
+    |> case do
+      {:ok, entries} ->
+        {:ok, Enum.map(0..(length(frames) - 1), &Map.fetch!(entries, &1))}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp read_physical_frame_group(log_root, [{%{ordinal: ordinal} = first, _position} | _] = group) do
+    %{file_id: {_kind, first_index}} = first
+    root_chars = to_charlist(log_root)
+
+    case :ferricstore_waraft_spike_segment_log.open_disk_reader(
+           root_chars,
+           first_index,
+           ordinal
+         ) do
+      {:ok, reader} ->
+        try do
+          reads =
+            Enum.map(group, fn {%{file_id: {_kind, index}} = frame, _position} ->
+              {index, frame.offset, frame.frame_size}
+            end)
+
+          case :ferricstore_waraft_spike_segment_log.read_disk_reader_many(reader, reads) do
+            {:ok, entries} when length(entries) == length(group) -> {:ok, entries}
+            {:ok, _entries} -> {:error, :physical_read_count_mismatch}
+            :not_found -> {:error, :physical_segment_entry_not_found}
+            {:error, reason} -> {:error, reason}
+            invalid -> {:error, {:invalid_physical_segment_read, invalid}}
+          end
+        after
+          _ = :ferricstore_waraft_spike_segment_log.close_disk_reader(reader)
+        end
+
+      :not_found ->
+        {:error, :physical_segment_entry_not_found}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      invalid ->
+        {:error, {:invalid_physical_segment_reader, invalid}}
+    end
+  end
+
+  defp unique_physical_frames(requests) do
+    requests
+    |> Enum.group_by(fn request ->
+      {request.file_id, request.ordinal, request.offset, request.frame_size}
+    end)
+    |> Enum.map(fn {_location, grouped} ->
+      first = hd(grouped)
+      Map.put(first, :keys, Enum.map(grouped, & &1.key))
+    end)
+    |> Enum.sort_by(&{&1.ordinal, &1.offset, &1.file_id})
+  end
+
+  defp decode_physical_frames([], [], _read_mode, values), do: {:ok, values}
+
+  defp decode_physical_frames([frame | frames], [entry | entries], read_mode, values) do
+    case decode_physical_frame(frame, entry, read_mode, values) do
+      {:ok, values} -> decode_physical_frames(frames, entries, read_mode, values)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp decode_physical_frames(_frames, _entries, _read_mode, _values),
+    do: {:error, :physical_read_count_mismatch}
+
+  defp decode_physical_frame(
+         %{file_id: {:waraft_apply_projection, _index}, keys: keys},
+         entry,
+         read_mode,
+         values
+       ) do
+    projection_mode =
+      if read_mode == :live, do: {:live, CommandValues.now_ms()}, else: :include_expired
+
+    case decode_apply_projection_entry(entry) do
+      {:ok, entries} ->
+        {:ok, collect_projection_entry_values(entries, keys, values, projection_mode)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_physical_frame(
+         %{file_id: {:waraft_projection, _index}, keys: keys},
+         entry,
+         read_mode,
+         values
+       ) do
+    case entry do
+      {0, {:ferricstore_segment_projection_entry, key, value, expire_at_ms}}
+      when is_binary(key) and is_binary(value) and is_integer(expire_at_ms) ->
+        visible? = read_mode == :include_expired or CommandValues.live_expire_at?(expire_at_ms)
+
+        if visible? and key in keys,
+          do: {:ok, Map.put(values, key, value)},
+          else: {:ok, values}
+
+      _invalid ->
+        {:error, :bad_segment_projection_entry}
+    end
+  end
+
+  defp decode_physical_frame(
+         %{file_id: {:waraft_segment, _index}, keys: keys},
+         entry,
+         _read_mode,
+         values
+       ) do
+    {:ok, Map.merge(values, CommandValues.values_from_entry(entry, keys))}
+  end
+
+  defp locate_physical_frame(root, index) do
+    case :ferricstore_waraft_spike_segment_log.location_for_index(to_charlist(root), index) do
+      {:ok, {ordinal, offset, frame_size}}
+      when is_integer(ordinal) and ordinal >= 0 and is_integer(offset) and offset >= 0 and
+             is_integer(frame_size) and frame_size >= 8 ->
+        {:ok, {ordinal, offset, frame_size}}
+
+      :not_found ->
+        {:error, :segment_entry_not_found}
+
+      {:error, :enoent} ->
+        {:error, :segment_entry_not_found}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _invalid ->
+        {:error, :invalid_segment_location}
+    end
+  end
+
   @spec apply_projection_refs_before(binary(), non_neg_integer(), pos_integer()) :: [
           {pos_integer(), binary()}
         ]
@@ -346,6 +753,44 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     read_value_from_location(ctx, shard_index, file_id, key)
   end
 
+  @doc false
+  @spec read_values_from_location_including_expired(
+          FerricStore.Instance.t(),
+          non_neg_integer(),
+          term(),
+          [binary()],
+          non_neg_integer()
+        ) :: {:ok, %{binary() => binary()}} | {:error, term()}
+  def read_values_from_location_including_expired(
+        ctx,
+        shard_index,
+        file_id,
+        keys,
+        timeout_ms
+      )
+      when is_list(keys) and is_integer(timeout_ms) and timeout_ms >= 0 do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+
+    if waraft_read_expired?(deadline_ms) do
+      {:error, :deadline_exceeded}
+    else
+      result = read_values_from_location_including_expired(ctx, shard_index, file_id, keys)
+
+      if waraft_read_expired?(deadline_ms),
+        do: {:error, :deadline_exceeded},
+        else: result
+    end
+  end
+
+  def read_values_from_location_including_expired(
+        _ctx,
+        _shard_index,
+        _file_id,
+        _keys,
+        _timeout_ms
+      ),
+      do: {:error, :bad_segment_location}
+
   @spec read_values_from_location(FerricStore.Instance.t(), non_neg_integer(), term(), [
           binary()
         ]) ::
@@ -418,47 +863,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   def read_values_from_location(ctx, shard_index, {:waraft_apply_projection, index}, keys)
       when is_integer(index) and index > 0 and is_list(keys) do
     root = storage_root(ctx, shard_index)
-    read_mode = {:live, CommandValues.now_ms()}
-
-    {found, missing} =
-      keys
-      |> Enum.uniq()
-      |> Enum.reduce({%{}, []}, fn key, {found, missing} ->
-        case read_apply_projection_cache(root, index, key, read_mode) do
-          {:ok, value} -> {Map.put(found, key, value), missing}
-          :not_found -> {found, [key | missing]}
-        end
-      end)
-
-    case missing do
-      [] ->
-        {:ok, found}
-
-      [_ | _] ->
-        case read_apply_projection_latest_entries_from_disk(root, index) do
-          {:ok, entries} ->
-            found = collect_projection_entry_values(entries, missing, found, read_mode)
-            still_missing = reject_found_keys(missing, found)
-
-            if still_missing == [] do
-              {:ok, found}
-            else
-              read_apply_projection_missing_from_merged_disk(
-                root,
-                index,
-                still_missing,
-                found,
-                read_mode
-              )
-            end
-
-          :not_found ->
-            {:ok, found}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-    end
+    read_apply_projection_values_at(root, index, keys, {:live, CommandValues.now_ms()})
   end
 
   def read_values_from_location(ctx, shard_index, file_id, keys) when is_list(keys) do
@@ -471,8 +876,391 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     end)
   end
 
+  @doc false
+  @spec read_values_from_locations(
+          FerricStore.Instance.t(),
+          non_neg_integer(),
+          [{term(), [binary()]}],
+          non_neg_integer()
+        ) :: {:ok, %{binary() => binary()}} | {:error, term()}
+  def read_values_from_locations(ctx, shard_index, groups, timeout_ms)
+      when is_list(groups) and is_integer(timeout_ms) and timeout_ms >= 0 do
+    read_values_from_locations_with_mode(ctx, shard_index, groups, timeout_ms, :live)
+  end
+
+  @doc false
+  @spec read_values_from_locations_including_expired(
+          FerricStore.Instance.t(),
+          non_neg_integer(),
+          [{term(), [binary()]}],
+          non_neg_integer()
+        ) :: {:ok, %{binary() => binary()}} | {:error, term()}
+  def read_values_from_locations_including_expired(ctx, shard_index, groups, timeout_ms)
+      when is_list(groups) and is_integer(timeout_ms) and timeout_ms >= 0 do
+    read_values_from_locations_with_mode(
+      ctx,
+      shard_index,
+      groups,
+      timeout_ms,
+      :include_expired
+    )
+  end
+
+  defp read_values_from_locations_with_mode(ctx, shard_index, groups, timeout_ms, read_mode) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+
+    with :ok <- validate_location_groups(groups),
+         false <- waraft_read_expired?(deadline_ms),
+         {:ok, values} <- do_read_values_from_locations(ctx, shard_index, groups, read_mode),
+         false <- waraft_read_expired?(deadline_ms) do
+      {:ok, values}
+    else
+      true -> {:error, :deadline_exceeded}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp do_read_values_from_locations(ctx, shard_index, groups, read_mode) do
+    case Enum.all?(groups, fn
+           {{:waraft_apply_projection, index}, keys} ->
+             is_integer(index) and index > 0 and is_list(keys)
+
+           _other ->
+             false
+         end) do
+      true ->
+        projection_mode =
+          if read_mode == :live,
+            do: {:live, CommandValues.now_ms()},
+            else: :include_expired
+
+        read_apply_projection_values_many(ctx, shard_index, groups, projection_mode)
+
+      false ->
+        read_location_groups_sequential(ctx, shard_index, groups, read_mode)
+    end
+  end
+
+  defp read_location_groups_sequential(ctx, shard_index, groups, read_mode) do
+    Enum.reduce_while(groups, {:ok, %{}}, fn {file_id, keys}, {:ok, values} ->
+      result =
+        case read_mode do
+          :include_expired ->
+            read_values_from_location_including_expired(ctx, shard_index, file_id, keys)
+
+          :live ->
+            read_values_from_location(ctx, shard_index, file_id, keys)
+        end
+
+      case result do
+        {:ok, group_values} when is_map(group_values) ->
+          {:cont, {:ok, Map.merge(values, group_values)}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+
+        _invalid ->
+          {:halt, {:error, :invalid_location_batch_read}}
+      end
+    end)
+  end
+
+  defp validate_location_groups(groups),
+    do: validate_location_groups(groups, 0, 0, MapSet.new())
+
+  defp validate_location_groups([], _group_count, _key_count, _seen), do: :ok
+
+  defp validate_location_groups(
+         [{file_id, [_ | _] = keys} | groups],
+         group_count,
+         key_count,
+         seen
+       )
+       when group_count < @maximum_location_batch_groups do
+    with true <- valid_location_file_id?(file_id),
+         {:ok, next_key_count, seen} <- validate_location_keys(keys, key_count, seen) do
+      validate_location_groups(groups, group_count + 1, next_key_count, seen)
+    else
+      _invalid -> {:error, :invalid_location_batch}
+    end
+  end
+
+  defp validate_location_groups(_groups, _group_count, _key_count, _seen),
+    do: {:error, :invalid_location_batch}
+
+  defp validate_location_keys([], key_count, seen), do: {:ok, key_count, seen}
+
+  defp validate_location_keys([key | keys], key_count, seen)
+       when is_binary(key) and byte_size(key) > 0 and
+              key_count < @maximum_location_batch_keys do
+    if MapSet.member?(seen, key) do
+      {:error, :duplicate_location_key}
+    else
+      validate_location_keys(keys, key_count + 1, MapSet.put(seen, key))
+    end
+  end
+
+  defp validate_location_keys(_keys, _key_count, _seen),
+    do: {:error, :invalid_location_key}
+
+  defp valid_location_file_id?({kind, index})
+       when kind in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+              is_integer(index) and index > 0,
+       do: true
+
+  defp valid_location_file_id?(_file_id), do: false
+
+  defp read_values_from_location_including_expired(
+         ctx,
+         shard_index,
+         {:waraft_apply_projection, index},
+         keys
+       )
+       when is_integer(index) and index > 0 and is_list(keys) do
+    root = storage_root(ctx, shard_index)
+    read_apply_projection_values_at(root, index, keys, :include_expired)
+  end
+
+  defp read_values_from_location_including_expired(ctx, shard_index, file_id, keys),
+    do: read_values_from_location(ctx, shard_index, file_id, keys)
+
+  defp read_apply_projection_values_at(root, index, keys, read_mode) do
+    {found, missing} =
+      keys
+      |> Enum.uniq()
+      |> Enum.reduce({%{}, []}, fn key, {found, missing} ->
+        case read_apply_projection_cache(root, index, key, read_mode) do
+          {:ok, value} -> {Map.put(found, key, value), missing}
+          :expired -> {found, missing}
+          :not_found -> {found, [key | missing]}
+        end
+      end)
+
+    case missing do
+      [] ->
+        {:ok, found}
+
+      [_ | _] ->
+        read_apply_projection_values_from_disk(root, index, missing, found, read_mode)
+    end
+  end
+
+  defp read_apply_projection_values_many(ctx, shard_index, groups, read_mode) do
+    root = storage_root(ctx, shard_index)
+
+    {found, missing_groups} =
+      Enum.reduce(groups, {%{}, []}, fn {{:waraft_apply_projection, index}, keys},
+                                        {found, missing_groups} ->
+        {found, missing} =
+          keys
+          |> Enum.uniq()
+          |> Enum.reduce({found, []}, fn key, {found, missing} ->
+            case read_apply_projection_cache(root, index, key, read_mode) do
+              {:ok, value} -> {Map.put(found, key, value), missing}
+              :expired -> {found, missing}
+              :not_found -> {found, [key | missing]}
+            end
+          end)
+
+        case missing do
+          [] -> {found, missing_groups}
+          [_ | _] -> {found, [{index, Enum.reverse(missing)} | missing_groups]}
+        end
+      end)
+
+    case missing_groups do
+      [] ->
+        {:ok, found}
+
+      [_ | _] ->
+        missing_groups = Enum.reverse(missing_groups)
+
+        with {:ok, latest_by_index} <-
+               read_apply_projection_latest_entries_many_from_disk(root, missing_groups),
+             {:ok, found} <-
+               collect_apply_projection_batch_values(
+                 root,
+                 missing_groups,
+                 latest_by_index,
+                 found,
+                 read_mode
+               ) do
+          {:ok, found}
+        end
+    end
+  end
+
+  defp read_apply_projection_latest_entries_many_from_disk(root, groups) do
+    with_apply_projection_disk_read_lock_root(root, fn ->
+      projection_root = Path.join(root, @apply_projection_dir)
+      root_chars = to_charlist(projection_root)
+
+      Enum.each(groups, fn {index, _keys} ->
+        maybe_run_apply_projection_disk_read_hook(root, index, :latest)
+      end)
+
+      with {:ok, locations} <- locate_apply_projection_batch(root_chars, groups, []),
+           {:ok, entries} <- read_apply_projection_disk_batch(root, root_chars, locations),
+           {:ok, decoded} <- decode_apply_projection_disk_batch(locations, entries, %{}) do
+        {:ok, decoded}
+      end
+    end)
+  end
+
+  defp locate_apply_projection_batch(_root_chars, [], locations),
+    do: {:ok, Enum.reverse(locations)}
+
+  defp locate_apply_projection_batch(root_chars, [{index, _keys} | groups], locations) do
+    case :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, index) do
+      {:ok, location} ->
+        locate_apply_projection_batch(root_chars, groups, [{index, location} | locations])
+
+      :not_found ->
+        {:error, :apply_projection_entry_missing_at_recorded_location}
+
+      {:error, :enoent} ->
+        {:error, :apply_projection_entry_missing_at_recorded_location}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp read_apply_projection_disk_batch(_root, _root_chars, []), do: {:ok, []}
+
+  defp read_apply_projection_disk_batch(root, root_chars, locations) do
+    case DiskReader.read_many(root, locations) do
+      {:ok, entries} when length(entries) == length(locations) ->
+        {:ok, entries}
+
+      {:ok, _entries} ->
+        {:error, :apply_projection_batch_count_mismatch}
+
+      {:error, {:segment_reader_unavailable, _reason}} ->
+        read_apply_projection_disk_batch_fallback(root_chars, locations, [])
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp read_apply_projection_disk_batch_fallback(_root_chars, [], entries),
+    do: {:ok, Enum.reverse(entries)}
+
+  defp read_apply_projection_disk_batch_fallback(
+         root_chars,
+         [{index, {_ordinal, offset, encoded_size}} | locations],
+         entries
+       ) do
+    case :ferricstore_waraft_spike_segment_log.read_disk_at(
+           root_chars,
+           index,
+           offset,
+           encoded_size
+         ) do
+      {:ok, entry} ->
+        read_apply_projection_disk_batch_fallback(root_chars, locations, [entry | entries])
+
+      :not_found ->
+        {:error, :apply_projection_entry_missing_at_recorded_location}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_apply_projection_disk_batch([], [], decoded), do: {:ok, decoded}
+
+  defp decode_apply_projection_disk_batch(
+         [{index, _location} | locations],
+         [entry | entries],
+         decoded
+       ) do
+    case decode_apply_projection_entry(entry) do
+      {:ok, projection_entries} ->
+        decode_apply_projection_disk_batch(
+          locations,
+          entries,
+          Map.put(decoded, index, projection_entries)
+        )
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_apply_projection_disk_batch(_locations, _entries, _decoded),
+    do: {:error, :apply_projection_batch_count_mismatch}
+
+  defp collect_apply_projection_batch_values(
+         root,
+         groups,
+         latest_by_index,
+         found,
+         read_mode
+       ) do
+    Enum.reduce_while(groups, {:ok, found}, fn {index, keys}, {:ok, found} ->
+      found =
+        case Map.fetch(latest_by_index, index) do
+          {:ok, entries} -> collect_projection_entry_values(entries, keys, found, read_mode)
+          :error -> found
+        end
+
+      case reject_found_keys(keys, found) do
+        [] ->
+          {:cont, {:ok, found}}
+
+        still_missing ->
+          case read_apply_projection_missing_from_merged_disk(
+                 root,
+                 index,
+                 still_missing,
+                 found,
+                 read_mode
+               ) do
+            {:ok, next} -> {:cont, {:ok, next}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+      end
+    end)
+  end
+
+  defp read_apply_projection_values_from_disk(root, index, keys, found, read_mode) do
+    case read_apply_projection_latest_entries_from_disk(root, index) do
+      {:ok, entries} ->
+        found = collect_projection_entry_values(entries, keys, found, read_mode)
+        still_missing = reject_found_keys(keys, found)
+
+        if still_missing == [] do
+          {:ok, found}
+        else
+          read_apply_projection_missing_from_merged_disk(
+            root,
+            index,
+            still_missing,
+            found,
+            read_mode
+          )
+        end
+
+      :not_found ->
+        {:ok, found}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp waraft_read_expired?(deadline_ms),
     do: System.monotonic_time(:millisecond) >= deadline_ms
+
+  defp remaining_waraft_read_timeout(deadline_ms) when is_integer(deadline_ms) do
+    remaining_ms = deadline_ms - System.monotonic_time(:millisecond)
+
+    if remaining_ms > 0,
+      do: {:ok, remaining_ms},
+      else: {:error, :deadline_exceeded}
+  end
 
   defp read_apply_projection_missing_from_merged_disk(root, index, missing, found, read_mode) do
     case read_apply_projection_entries_from_disk(root, index) do
@@ -625,6 +1413,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       {:ok, value} ->
         {:ok, value}
 
+      :expired ->
+        :not_found
+
       :not_found ->
         read_apply_projection_value_from_disk(root, index, key, read_mode)
     end
@@ -659,7 +1450,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
           [{{^root, ^index, ^key}, value, expire_at_ms}] ->
             if CommandValues.live_expire_at?(expire_at_ms, now_ms),
               do: {:ok, value},
-              else: :not_found
+              else: :expired
 
           [] ->
             :not_found
@@ -715,10 +1506,12 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       maybe_run_apply_projection_disk_read_hook(root, index, :latest)
 
       case :ferricstore_waraft_spike_segment_log.location_for_index(root_chars, index) do
-        {:ok, {_ordinal, offset, encoded_size}} ->
-          case :ferricstore_waraft_spike_segment_log.read_disk_at(
+        {:ok, {ordinal, offset, encoded_size}} ->
+          case read_apply_projection_disk_entry(
+                 root,
                  root_chars,
                  index,
+                 ordinal,
                  offset,
                  encoded_size
                ) do
@@ -737,6 +1530,28 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
           {:error, reason}
       end
     end)
+  end
+
+  defp read_apply_projection_disk_entry(
+         root,
+         root_chars,
+         index,
+         ordinal,
+         offset,
+         encoded_size
+       ) do
+    case DiskReader.read(root, index, {ordinal, offset, encoded_size}) do
+      {:error, {:segment_reader_unavailable, _reason}} ->
+        :ferricstore_waraft_spike_segment_log.read_disk_at(
+          root_chars,
+          index,
+          offset,
+          encoded_size
+        )
+
+      result ->
+        result
+    end
   end
 
   defp decode_apply_projection_entry(
@@ -1044,6 +1859,52 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     end)
   end
 
+  defp apply_projection_cache_entries_for_indexes(table, root, indexes) do
+    if MapSet.size(indexes) == 0 do
+      []
+    else
+      Enum.flat_map(indexes, fn index ->
+        :ets.select(table, [
+          {{{root, index, :"$1"}, :"$2", :"$3"}, [], [{{index, :"$1", :"$2", :"$3"}}]}
+        ])
+      end)
+    end
+  end
+
+  defp normalize_apply_projection_refs(refs) do
+    Enum.reduce_while(refs, {:ok, MapSet.new()}, fn
+      {index, key}, {:ok, acc}
+      when is_integer(index) and index > 0 and is_binary(key) and key != "" ->
+        {:cont, {:ok, MapSet.put(acc, {index, key})}}
+
+      _invalid, _acc ->
+        {:halt, {:error, :invalid_apply_projection_refs}}
+    end)
+    |> case do
+      {:ok, refs} -> {:ok, refs |> MapSet.to_list() |> Enum.sort()}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp verify_apply_projection_refs_from_disk(root, refs) do
+    refs
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce_while(:ok, fn {index, keys}, :ok ->
+      case read_apply_projection_values_from_disk(root, index, keys, %{}, :include_expired) do
+        {:ok, values} ->
+          case Enum.find(keys, &(not Map.has_key?(values, &1))) do
+            nil -> {:cont, :ok}
+            key -> {:halt, {:error, {:apply_projection_entry_not_durable, index, key}}}
+          end
+
+        {:error, reason} ->
+          key = hd(keys)
+          {:halt, {:error, {:apply_projection_durability_check_failed, index, key, reason}}}
+      end
+    end)
+  end
+
   defp select_apply_projection_indexes(table, root, min_entries, min_bytes) do
     match_spec = [
       {{{root, :"$1", :_}, :"$2", :_}, [{:is_binary, :"$2"}], [{{:"$1", {:byte_size, :"$2"}}}]}
@@ -1233,7 +2094,13 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       @held_apply_projection_disk_locks_key,
       fn ->
         :ok = wait_for_apply_projection_disk_readers(root)
-        fun.()
+        :ok = DiskReader.invalidate(root)
+
+        try do
+          fun.()
+        after
+          :ok = DiskReader.invalidate(root)
+        end
       end
     )
   end
@@ -1244,6 +2111,18 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
       fun.()
     else
       with_apply_projection_disk_read_lock(root, fun)
+    end
+  end
+
+  defp with_apply_projection_disk_read_lock_root(root, deadline_ms, fun)
+       when is_binary(root) and is_integer(deadline_ms) and is_function(fun, 0) do
+    if apply_projection_named_lock_held?(@held_apply_projection_disk_locks_key, root) do
+      case remaining_waraft_read_timeout(deadline_ms) do
+        {:ok, _remaining_ms} -> fun.()
+        {:error, _reason} = error -> error
+      end
+    else
+      with_apply_projection_disk_read_lock(root, deadline_ms, fun)
     end
   end
 
@@ -1271,6 +2150,45 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
           fun.()
         after
           release_apply_projection_disk_read_lock(root)
+        end
+    end
+  end
+
+  defp with_apply_projection_disk_read_lock(root, deadline_ms, fun) do
+    held = Process.get(@held_apply_projection_disk_read_locks_key, %{})
+
+    case Map.get(held, root) do
+      nil ->
+        case acquire_apply_projection_disk_read_lock(root, deadline_ms) do
+          :ok ->
+            Process.put(@held_apply_projection_disk_read_locks_key, Map.put(held, root, 1))
+
+            try do
+              fun.()
+            after
+              release_apply_projection_disk_read_lock(root)
+            end
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      count when is_integer(count) and count > 0 ->
+        case remaining_waraft_read_timeout(deadline_ms) do
+          {:ok, _remaining_ms} ->
+            Process.put(
+              @held_apply_projection_disk_read_locks_key,
+              Map.put(held, root, count + 1)
+            )
+
+            try do
+              fun.()
+            after
+              release_apply_projection_disk_read_lock(root)
+            end
+
+          {:error, _reason} = error ->
+            error
         end
     end
   end
@@ -1355,48 +2273,67 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   end
 
   defp acquire_apply_projection_disk_read_lock(root),
-    do: acquire_apply_projection_disk_read_lock(root, @apply_projection_lock_retry_min_ms)
+    do:
+      acquire_apply_projection_disk_read_lock(
+        root,
+        :infinity,
+        @apply_projection_lock_retry_min_ms
+      )
 
-  defp acquire_apply_projection_disk_read_lock(root, wait_ms) do
-    table = ensure_apply_projection_table!()
-    writer_key = apply_projection_lock_key(@apply_projection_disk_lock_tag, root)
-    reader_key = apply_projection_disk_reader_key(root, self())
+  defp acquire_apply_projection_disk_read_lock(root, deadline_ms)
+       when is_integer(deadline_ms),
+       do:
+         acquire_apply_projection_disk_read_lock(
+           root,
+           deadline_ms,
+           @apply_projection_lock_retry_min_ms
+         )
 
-    case :ets.lookup(table, writer_key) do
-      [] ->
-        acquire_apply_projection_disk_read_lock_without_writer(
-          table,
-          writer_key,
-          reader_key,
-          root,
-          wait_ms
-        )
+  defp acquire_apply_projection_disk_read_lock(root, deadline_ms, wait_ms) do
+    with :ok <- validate_apply_projection_read_deadline(deadline_ms) do
+      table = ensure_apply_projection_table!()
+      writer_key = apply_projection_lock_key(@apply_projection_disk_lock_tag, root)
+      reader_key = apply_projection_disk_reader_key(root, self())
 
-      [{^writer_key, holder}] when is_pid(holder) ->
-        if Process.alive?(holder) do
-          apply_projection_lock_backoff(wait_ms)
-
-          acquire_apply_projection_disk_read_lock(
+      case :ets.lookup(table, writer_key) do
+        [] ->
+          acquire_apply_projection_disk_read_lock_without_writer(
+            table,
+            writer_key,
+            reader_key,
             root,
-            next_apply_projection_lock_backoff(wait_ms)
+            deadline_ms,
+            wait_ms
           )
-        else
-          :ets.select_delete(table, [{{writer_key, holder}, [], [true]}])
-          acquire_apply_projection_disk_read_lock(root)
-        end
 
-      _missing_or_invalid ->
-        :ets.delete(table, writer_key)
-        acquire_apply_projection_disk_read_lock(root)
+        [{^writer_key, holder}] when is_pid(holder) ->
+          if Process.alive?(holder) do
+            with :ok <- apply_projection_read_lock_backoff(deadline_ms, wait_ms) do
+              acquire_apply_projection_disk_read_lock(
+                root,
+                deadline_ms,
+                next_apply_projection_lock_backoff(wait_ms)
+              )
+            end
+          else
+            :ets.select_delete(table, [{{writer_key, holder}, [], [true]}])
+            acquire_apply_projection_disk_read_lock(root, deadline_ms, wait_ms)
+          end
+
+        _missing_or_invalid ->
+          :ets.delete(table, writer_key)
+          acquire_apply_projection_disk_read_lock(root, deadline_ms, wait_ms)
+      end
     end
   rescue
     ArgumentError ->
-      apply_projection_lock_backoff(wait_ms)
-
-      acquire_apply_projection_disk_read_lock(
-        root,
-        next_apply_projection_lock_backoff(wait_ms)
-      )
+      with :ok <- apply_projection_read_lock_backoff(deadline_ms, wait_ms) do
+        acquire_apply_projection_disk_read_lock(
+          root,
+          deadline_ms,
+          next_apply_projection_lock_backoff(wait_ms)
+        )
+      end
   end
 
   defp acquire_apply_projection_disk_read_lock_without_writer(
@@ -1404,6 +2341,7 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
          writer_key,
          reader_key,
          root,
+         deadline_ms,
          wait_ms
        ) do
     case :ets.insert_new(table, {reader_key, self()}) do
@@ -1416,26 +2354,27 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
             :ets.select_delete(table, [{{reader_key, self()}, [], [true]}])
 
             if Process.alive?(holder) do
-              apply_projection_lock_backoff(wait_ms)
-
-              acquire_apply_projection_disk_read_lock(
-                root,
-                next_apply_projection_lock_backoff(wait_ms)
-              )
+              with :ok <- apply_projection_read_lock_backoff(deadline_ms, wait_ms) do
+                acquire_apply_projection_disk_read_lock(
+                  root,
+                  deadline_ms,
+                  next_apply_projection_lock_backoff(wait_ms)
+                )
+              end
             else
               :ets.select_delete(table, [{{writer_key, holder}, [], [true]}])
-              acquire_apply_projection_disk_read_lock(root)
+              acquire_apply_projection_disk_read_lock(root, deadline_ms, wait_ms)
             end
 
           _missing_or_invalid ->
             :ets.select_delete(table, [{{reader_key, self()}, [], [true]}])
             :ets.delete(table, writer_key)
-            acquire_apply_projection_disk_read_lock(root)
+            acquire_apply_projection_disk_read_lock(root, deadline_ms, wait_ms)
         end
 
       false ->
         :ets.select_delete(table, [{{reader_key, self()}, [], [true]}])
-        acquire_apply_projection_disk_read_lock(root)
+        acquire_apply_projection_disk_read_lock(root, deadline_ms, wait_ms)
     end
   end
 
@@ -1559,6 +2498,35 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     receive do
     after
       wait_ms -> :ok
+    end
+  end
+
+  defp validate_apply_projection_read_deadline(:infinity), do: :ok
+
+  defp validate_apply_projection_read_deadline(deadline_ms) when is_integer(deadline_ms) do
+    case remaining_waraft_read_timeout(deadline_ms) do
+      {:ok, _remaining_ms} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp apply_projection_read_lock_backoff(:infinity, wait_ms),
+    do: apply_projection_lock_backoff(wait_ms)
+
+  defp apply_projection_read_lock_backoff(deadline_ms, wait_ms)
+       when is_integer(deadline_ms) do
+    case remaining_waraft_read_timeout(deadline_ms) do
+      {:ok, remaining_ms} ->
+        bounded_wait_ms = min(wait_ms, remaining_ms)
+        maybe_run_apply_projection_lock_backoff_hook(bounded_wait_ms)
+
+        receive do
+        after
+          bounded_wait_ms -> :ok
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

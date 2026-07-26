@@ -18,6 +18,7 @@ defmodule Ferricstore.Store.Shard.Compaction do
     quote do
       alias Ferricstore.Bitcask.NIF
       alias Ferricstore.Flow.Hibernation
+      alias Ferricstore.Flow.Keys, as: FlowKeys
       alias Ferricstore.Flow.LMDB
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
@@ -464,6 +465,7 @@ defmodule Ferricstore.Store.Shard.Compaction do
                  {:ok, plan_entries} <-
                    copy_compaction_page(
                      state,
+                     fid,
                      source,
                      dest,
                      live_entries,
@@ -521,7 +523,7 @@ defmodule Ferricstore.Store.Shard.Compaction do
           live_entries =
             markers
             |> Enum.flat_map(fn
-              {:hot, _key, _offset} = entry ->
+              {:hot, _key, _offset, _value_size} = entry ->
                 [entry]
 
               {:cold, candidate_index} ->
@@ -546,10 +548,10 @@ defmodule Ferricstore.Store.Shard.Compaction do
           when is_binary(key) and is_integer(offset) and offset >= 0 ->
             {:cont, {:ok, [:dead | markers], [offset | tombstones], candidates, candidate_index}}
 
-          {key, offset, _value_size, _expire_at_ms, false},
+          {key, offset, value_size, _expire_at_ms, false},
           {:ok, markers, tombstones, candidates, candidate_index}
           when is_binary(key) and is_integer(offset) and offset >= 0 ->
-            case current_hot_compaction_entry(state, key, fid, offset, now_ms) do
+            case current_hot_compaction_entry(state, key, fid, offset, value_size, now_ms) do
               {:ok, entry} ->
                 {:cont, {:ok, [entry | markers], tombstones, candidates, candidate_index}}
 
@@ -577,12 +579,12 @@ defmodule Ferricstore.Store.Shard.Compaction do
         end
       end
 
-      defp current_hot_compaction_entry(state, key, fid, offset, now_ms) do
+      defp current_hot_compaction_entry(state, key, fid, offset, value_size, now_ms) do
         case :ets.lookup(state.keydir, key) do
-          [{^key, _value, expire_at_ms, _lfu, ^fid, ^offset, _value_size}]
+          [{^key, _value, expire_at_ms, _lfu, ^fid, ^offset, ^value_size}]
           when expire_at_ms == 0 or expire_at_ms > now_ms ->
             if shared_compaction_entry?(state, key, fid, fid) do
-              {:ok, {:hot, key, offset}}
+              {:ok, {:hot, key, offset, value_size}}
             else
               :not_hot
             end
@@ -666,14 +668,14 @@ defmodule Ferricstore.Store.Shard.Compaction do
         end
       end
 
-      defp copy_compaction_page(_state, _source, _dest, [], []), do: {:ok, []}
+      defp copy_compaction_page(_state, _fid, _source, _dest, [], []), do: {:ok, []}
 
-      defp copy_compaction_page(state, source, dest, live_entries, tombstone_offsets) do
+      defp copy_compaction_page(state, fid, source, dest, live_entries, tombstone_offsets) do
         offsets = Enum.map(live_entries, &compaction_live_offset/1)
 
         case compaction_copy_records(state, source, dest, offsets, tombstone_offsets) do
           {:ok, results} when length(results) == length(live_entries) ->
-            {:ok, Enum.zip_with(live_entries, results, &compaction_plan_entry/2)}
+            build_compaction_plan_entries(fid, live_entries, results, [])
 
           {:ok, results} ->
             {:error, {:copy_result_mismatch, length(live_entries), length(results)}}
@@ -683,13 +685,51 @@ defmodule Ferricstore.Store.Shard.Compaction do
         end
       end
 
-      defp compaction_live_offset({:hot, _key, offset}), do: offset
+      defp compaction_live_offset({:hot, _key, offset, _value_size}), do: offset
       defp compaction_live_offset({:cold, _key, offset, _park_key, _park}), do: offset
 
-      defp compaction_plan_entry({:hot, key, old_offset}, {new_offset, new_size}),
-        do: {:hot, key, old_offset, new_offset, new_size}
+      defp build_compaction_plan_entries(_fid, [], [], acc),
+        do: {:ok, Enum.reverse(acc)}
+
+      defp build_compaction_plan_entries(
+             fid,
+             [entry | entries],
+             [{new_offset, actual_size} = result | results],
+             acc
+           )
+           when is_integer(new_offset) and new_offset >= 0 and is_integer(actual_size) do
+        expected_size = compaction_live_size(entry)
+
+        if actual_size == expected_size do
+          plan_entry = compaction_plan_entry(fid, entry, result)
+          build_compaction_plan_entries(fid, entries, results, [plan_entry | acc])
+        else
+          {:error, {:copy_result_size_mismatch, expected_size, actual_size}}
+        end
+      end
+
+      defp build_compaction_plan_entries(_fid, _entries, _results, _acc),
+        do: {:error, :invalid_copy_result}
+
+      defp compaction_live_size({:hot, _key, _offset, value_size}), do: value_size
+
+      defp compaction_live_size(
+             {:cold, _key, _offset, _park_key, %{locator: %Locator{value_size: value_size}}}
+           ),
+           do: value_size
 
       defp compaction_plan_entry(
+             fid,
+             {:hot, key, old_offset, old_size},
+             {new_offset, new_size}
+           ) do
+        if FlowKeys.state_key?(key),
+          do: {:flow, key, fid, old_offset, old_size, new_offset, new_size},
+          else: {:hot, key, old_offset, new_offset, new_size}
+      end
+
+      defp compaction_plan_entry(
+             _fid,
              {:cold, key, old_offset, park_key, park},
              {new_offset, new_size}
            ),
@@ -726,6 +766,22 @@ defmodule Ferricstore.Store.Shard.Compaction do
                fn page, :ok ->
                  Enum.each(page, fn
                    {:hot, key, old_offset, new_offset, _new_size} ->
+                     {expected_offset, target_offset} =
+                       case direction do
+                         :forward -> {old_offset, new_offset}
+                         :reverse -> {new_offset, old_offset}
+                       end
+
+                     _relocated? =
+                       Keydir.relocate_exact(
+                         keydir,
+                         key,
+                         fid,
+                         expected_offset,
+                         target_offset
+                       )
+
+                   {:flow, key, ^fid, old_offset, _old_size, new_offset, _new_size} ->
                      {expected_offset, target_offset} =
                        case direction do
                          :forward -> {old_offset, new_offset}
@@ -827,7 +883,7 @@ defmodule Ferricstore.Store.Shard.Compaction do
       end
 
       defp commit_compacted_locations(state, transaction) do
-        with :ok <- relocate_compacted_cold(state, transaction.plan, :forward),
+        with :ok <- relocate_compacted_flow_locators(state, transaction.plan, :forward),
              :ok <-
                update_compacted_ets_locations(
                  state.keydir,
@@ -877,8 +933,8 @@ defmodule Ferricstore.Store.Shard.Compaction do
         end
       end
 
-      defp relocate_compacted_cold(state, plan_path, direction) do
-        CompactionPlan.relocate_cold(
+      defp relocate_compacted_flow_locators(state, plan_path, direction) do
+        CompactionPlan.relocate_flow_locators(
           plan_path,
           LMDB.path(state.shard_data_path),
           direction,

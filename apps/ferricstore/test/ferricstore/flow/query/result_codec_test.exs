@@ -55,9 +55,10 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
             }
         end
 
-      assert response |> ResultCodec.encode() |> Base.encode16(case: :lower) ==
-               vector["payload_hex"],
-             vector["name"]
+      payload = ResultCodec.encode(response)
+
+      assert Base.encode16(payload, case: :lower) == vector["payload_hex"], vector["name"]
+      assert ResultCodec.encoded_size(response) == byte_size(payload), vector["name"]
     end
   end
 
@@ -144,6 +145,34 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
            >> = payload
 
     assert response_bytes == byte_size(payload)
+  end
+
+  test "measures the exact compact payload without changing response usage" do
+    responses = [
+      page_response([], false, nil),
+      page_response([%{id: "run-1", state: nil}], true, "fqc1_cursor"),
+      page_response(
+        [
+          %{
+            id: "run-2",
+            type: "invoice",
+            attributes: %{"customer" => "customer-2"},
+            state_meta: %{"ready" => %{"worker" => "worker-1"}}
+          }
+        ],
+        false,
+        nil
+      ),
+      count_response(42)
+    ]
+
+    for response <- responses do
+      original = response
+      payload = ResultCodec.encode(response)
+
+      assert ResultCodec.encoded_size(response) == byte_size(payload)
+      assert response == original
+    end
   end
 
   test "encodes history records and preserves present nil separately from missing fields" do
@@ -298,6 +327,10 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
     assert response
            |> put_in([:records], [%{id: "run-1", version: 0x1_0000_0000_0000_0000}])
            |> ResultCodec.encode() == nil
+
+    assert response
+           |> put_in([:records], [%{id: "run-1", internal_secret: "no"}])
+           |> ResultCodec.encoded_size() == nil
   end
 
   test "fails closed outside the public count, cursor, row, and usage bounds" do

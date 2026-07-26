@@ -59,6 +59,7 @@ jobs:
             echo "BASELINE_RESULTS=$RUNNER_TEMP/baseline-results"
             echo "CURRENT_RESULTS=$RUNNER_TEMP/current-results"
             echo "CRITERION_RESULTS=$RUNNER_TEMP/criterion-results"
+            echo "STORAGE_RESULTS=$RUNNER_TEMP/storage-results"
           } >> "$GITHUB_ENV"
 
       - name: Install cold-cache tooling
@@ -184,6 +185,17 @@ jobs:
             fi
           done
 
+      - name: Run authoritative query storage acceptance
+        env:
+          BENCH_SAVE: ${{ env.STORAGE_RESULTS }}
+          BENCH_STORAGE_RECORDS: "10000"
+          BENCH_STORAGE_RECORDS_PER_LOG_ENTRY: "1"
+          BENCH_STORAGE_COLD_CACHE: "1"
+          BENCH_PARALLEL: "16"
+          BENCH_MEMORY_TIME: "0"
+        run: |
+          mix run --no-start bench/query_storage_layout_bench.exs
+
       - name: Enforce median regression budget
         if: steps.baseline.outputs.available == 'true'
         run: |
@@ -198,4 +210,5 @@ jobs:
             ${{ env.BASELINE_RESULTS }}
             ${{ env.CURRENT_RESULTS }}
             ${{ env.CRITERION_RESULTS }}
+            ${{ env.STORAGE_RESULTS }}
           retention-days: 30

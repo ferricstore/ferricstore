@@ -189,7 +189,7 @@ defmodule Ferricstore.Bench.QueryWorkloadMatrix do
           0
         ),
         records,
-        :exact_match_usage
+        :exact_index_usage
       ),
       record_scenario(
         "state_union_narrow_window",
@@ -335,6 +335,7 @@ defmodule Ferricstore.Bench.QueryWorkloadMatrix do
       ranges: length(actual.ranges),
       deduplicate: actual.deduplicate,
       residual_count: length(actual.residual_predicates),
+      record_source: actual.record_source,
       fallback_reason: actual.fallback_reason
     }
 
@@ -504,6 +505,14 @@ defmodule Ferricstore.Bench.QueryWorkloadMatrix do
     }
   end
 
+  defp materialize_usage(:exact_index_usage, matching) do
+    %{
+      scanned_entries: {:eq, matching},
+      hydrated_records: {:eq, 0},
+      residual_checks: {:eq, 0}
+    }
+  end
+
   defp materialize_usage(usage, _matching), do: usage
 
   defp exact_page_usage do
@@ -574,6 +583,7 @@ defmodule Ferricstore.Bench.QueryWorkloadMatrix do
     %{
       index_id: index_id,
       path: path,
+      record_source: record_source(path),
       order: order,
       ranges: ranges,
       deduplicate: deduplicate,
@@ -581,6 +591,11 @@ defmodule Ferricstore.Bench.QueryWorkloadMatrix do
       fallback_reason: fallback
     }
   end
+
+  defp record_source(:counter_lookup), do: :transactional_counter
+  defp record_source(:count_scan), do: :covering_index
+  defp record_source(path) when path in [:empty, :reject], do: :none
+  defp record_source(_record_path), do: :authoritative_log
 
   defp collection(predicates, order_by \\ [{:updated_at_ms, :desc}]) do
     Request.collection(

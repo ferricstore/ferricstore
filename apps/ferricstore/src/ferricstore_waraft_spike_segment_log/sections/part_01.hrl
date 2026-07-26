@@ -374,6 +374,436 @@ read_disk_at(RootDir, Index, Offset, EncodedSize)
 read_disk_at(_RootDir, _Index, _Offset, _EncodedSize) ->
     {error, bad_location}.
 
+open_disk_reader(RootDir, Index, ExpectedOrdinal)
+  when is_integer(Index), Index >= 0,
+       is_integer(ExpectedOrdinal), ExpectedOrdinal >= 0 ->
+    Dir = fold_disk_segment_dir(RootDir),
+    case index_below_trim_floor(Dir, Index) of
+        true ->
+            not_found;
+        false ->
+            open_disk_reader_untrimmed(Dir, Index, ExpectedOrdinal);
+        {error, _Reason} = Error ->
+            Error
+    end;
+open_disk_reader(_RootDir, _Index, _ExpectedOrdinal) ->
+    {error, bad_disk_reader_location}.
+
+open_disk_reader_untrimmed(Dir, Index, ExpectedOrdinal) ->
+    case validate_segment_log_dir(Dir) of
+        ok ->
+            case recover_rewrite(Dir) of
+                ok ->
+                    case validate_segment_log_dir(Dir) of
+                        ok ->
+                            case existing_records_per_segment(Dir) of
+                                {ok, RecordsPerSegment} ->
+                                    open_disk_reader_file(
+                                        Dir,
+                                        Index,
+                                        ExpectedOrdinal,
+                                        RecordsPerSegment
+                                    );
+                                not_found ->
+                                    not_found;
+                                {error, _Reason} = Error ->
+                                    Error
+                            end;
+                        {error, enoent} ->
+                            not_found;
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, enoent} ->
+            not_found;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+open_disk_reader_file(Dir, Index, ExpectedOrdinal, RecordsPerSegment) ->
+    Ordinal = segment_ordinal(Index, RecordsPerSegment),
+    case Ordinal =:= ExpectedOrdinal of
+        false ->
+            {error, {segment_ordinal_mismatch, Ordinal, ExpectedOrdinal}};
+        true ->
+            Path = filename:join(Dir, segment_file_from_ordinal(Ordinal)),
+            case file:read_link_info(Path) of
+                {ok, #file_info{type = regular, size = FileBytes}} ->
+                    case open_verified_segment_file(Path, [read, raw, binary]) of
+                        {ok, Fd} ->
+                            {ok, {ferricstore_segment_disk_reader_v1, Fd, Path, FileBytes,
+                                  Ordinal, RecordsPerSegment, Dir}};
+                        {error, Reason} ->
+                            {error, {open_segment, Reason}}
+                    end;
+                {ok, #file_info{type = Type}} ->
+                    {error, {unsafe_segment_path, Path, Type}};
+                {error, enoent} ->
+                    not_found;
+                {error, Reason} ->
+                    {error, {read_segment_info, Reason}}
+            end
+    end.
+
+read_disk_reader(
+  {ferricstore_segment_disk_reader_v1, Fd, Path, FileBytes, Ordinal,
+   RecordsPerSegment, Dir},
+  Index,
+  Offset,
+  EncodedSize
+ )
+  when is_integer(Index), Index >= 0,
+       is_integer(Offset), Offset >= 0,
+       is_integer(EncodedSize), EncodedSize >= ?RECORD_HEADER_SIZE ->
+    case index_below_trim_floor(Dir, Index) of
+        true ->
+            not_found;
+        false ->
+            case segment_ordinal(Index, RecordsPerSegment) of
+                Ordinal ->
+                    Result = read_disk_record_at_fd(
+                        Fd,
+                        Path,
+                        Index,
+                        Offset,
+                        EncodedSize,
+                        FileBytes,
+                        Ordinal,
+                        RecordsPerSegment
+                    ),
+                    case Result of
+                        {error, Reason} ->
+                            emit_corrupt_segment(Path, Reason),
+                            Result;
+                        _Other ->
+                            Result
+                    end;
+                ActualOrdinal ->
+                    {error, {segment_ordinal_mismatch, ActualOrdinal, Ordinal}}
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end;
+read_disk_reader(_Reader, _Index, _Offset, _EncodedSize) ->
+    {error, bad_disk_reader_location}.
+
+read_disk_reader_many(
+  {ferricstore_segment_disk_reader_v1, Fd, Path, FileBytes, Ordinal,
+   RecordsPerSegment, Dir},
+  Requests
+ )
+  when is_list(Requests) ->
+    case logical_trim_floor_result(Dir) of
+        {ok, Floor} ->
+            case validate_disk_reader_batch(
+                Requests,
+                Floor,
+                FileBytes,
+                Ordinal,
+                RecordsPerSegment,
+                0,
+                0,
+                [],
+                []
+            ) of
+                {ok, _Locations, Validated} ->
+                    {SpanLocations, Spans} =
+                        coalesce_adjacent_disk_reader_requests(Validated),
+                    case file:pread(Fd, SpanLocations) of
+                        {ok, SpanFrames} when length(SpanFrames) =:= length(Spans) ->
+                            case decode_disk_reader_spans(
+                                SpanFrames,
+                                Spans,
+                                Path,
+                                Ordinal,
+                                RecordsPerSegment,
+                                []
+                            ) of
+                                {ok, _Entries} = Ok ->
+                                    Ok;
+                                {error, Reason} = Error ->
+                                    emit_corrupt_segment(Path, Reason),
+                                    Error
+                            end;
+                        {ok, SpanFrames} ->
+                            {error, {batch_read_count_mismatch, length(Spans), length(SpanFrames)}};
+                        {error, Reason} ->
+                            {error, {batch_pread, Reason}}
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end;
+read_disk_reader_many(_Reader, _Requests) ->
+    {error, bad_disk_reader_batch}.
+
+validate_disk_reader_batch([], _Floor, _FileBytes, _Ordinal, _RecordsPerSegment,
+                           _Count, _TotalBytes, Locations, Validated) ->
+    {ok, lists:reverse(Locations), lists:reverse(Validated)};
+validate_disk_reader_batch(_Requests, _Floor, _FileBytes, _Ordinal, _RecordsPerSegment,
+                           Count, _TotalBytes, _Locations, _Validated)
+  when Count >= ?MAX_DISK_READER_BATCH_RECORDS ->
+    {error, disk_reader_batch_record_limit_exceeded};
+validate_disk_reader_batch(
+  [{Index, Offset, EncodedSize} = Request | Rest],
+  Floor,
+  FileBytes,
+  Ordinal,
+  RecordsPerSegment,
+  Count,
+  TotalBytes,
+  Locations,
+  Validated
+ )
+  when is_integer(Index), Index >= 0,
+       is_integer(Offset), Offset >= 0,
+       is_integer(EncodedSize), EncodedSize >= ?RECORD_HEADER_SIZE,
+       EncodedSize =< ?MAX_RECORD_BYTES + ?RECORD_HEADER_SIZE ->
+    NextBytes = TotalBytes + EncodedSize,
+    case {
+        Index < Floor,
+        segment_ordinal(Index, RecordsPerSegment) =:= Ordinal,
+        Offset + EncodedSize =< FileBytes,
+        NextBytes =< ?MAX_DISK_READER_BATCH_BYTES
+    } of
+        {true, _, _, _} ->
+            {error, {record_below_trim_floor, Index, Floor}};
+        {false, false, _, _} ->
+            {error, {segment_ordinal_mismatch, segment_ordinal(Index, RecordsPerSegment), Ordinal}};
+        {false, true, false, _} ->
+            {error, {record_outside_segment, Index, Offset, EncodedSize, FileBytes}};
+        {false, true, true, false} ->
+            {error, disk_reader_batch_byte_limit_exceeded};
+        {false, true, true, true} ->
+            validate_disk_reader_batch(
+                Rest,
+                Floor,
+                FileBytes,
+                Ordinal,
+                RecordsPerSegment,
+                Count + 1,
+                NextBytes,
+                [{Offset, EncodedSize} | Locations],
+                [Request | Validated]
+            )
+    end;
+validate_disk_reader_batch(_Requests, _Floor, _FileBytes, _Ordinal, _RecordsPerSegment,
+                           _Count, _TotalBytes, _Locations, _Validated) ->
+    {error, bad_disk_reader_batch_request}.
+
+coalesce_adjacent_disk_reader_requests(Requests) ->
+    Positioned = position_disk_reader_requests(Requests, 0, []),
+    Sorted = lists:sort(fun disk_reader_request_before/2, Positioned),
+    Spans = coalesce_sorted_disk_reader_requests(Sorted, []),
+    {[{Offset, EndOffset - Offset} || {Offset, EndOffset, _Items} <- Spans], Spans}.
+
+position_disk_reader_requests([], _Position, Positioned) ->
+    Positioned;
+position_disk_reader_requests(
+  [{Index, Offset, EncodedSize} | Requests],
+  Position,
+  Positioned
+ ) ->
+    position_disk_reader_requests(
+        Requests,
+        Position + 1,
+        [{Position, Index, Offset, EncodedSize} | Positioned]
+    ).
+
+disk_reader_request_before(
+  {LeftPosition, _LeftIndex, LeftOffset, _LeftSize},
+  {RightPosition, _RightIndex, RightOffset, _RightSize}
+ ) ->
+    case LeftOffset =:= RightOffset of
+        true -> LeftPosition < RightPosition;
+        false -> LeftOffset < RightOffset
+    end.
+
+coalesce_sorted_disk_reader_requests([], Spans) ->
+    lists:reverse([
+        {Offset, EndOffset, lists:reverse(Items)}
+     || {Offset, EndOffset, Items} <- Spans
+    ]);
+coalesce_sorted_disk_reader_requests(
+  [{_Position, _Index, Offset, EncodedSize} = Request | Requests],
+  [{SpanOffset, Offset, Items} | Spans]
+ ) ->
+    coalesce_sorted_disk_reader_requests(
+        Requests,
+        [{SpanOffset, Offset + EncodedSize, [Request | Items]} | Spans]
+    );
+coalesce_sorted_disk_reader_requests(
+  [{_Position, _Index, Offset, EncodedSize} = Request | Requests],
+  Spans
+ ) ->
+    coalesce_sorted_disk_reader_requests(
+        Requests,
+        [{Offset, Offset + EncodedSize, [Request]} | Spans]
+    ).
+
+decode_disk_reader_spans([], [], _Path, _Ordinal, _RecordsPerSegment, Entries) ->
+    {ok, [Entry || {_Position, Entry} <- lists:keysort(1, Entries)]};
+decode_disk_reader_spans(
+  [SpanFrame | SpanFrames],
+  [{SpanOffset, SpanEndOffset, Requests} | Spans],
+  Path,
+  Ordinal,
+  RecordsPerSegment,
+  Entries
+ ) ->
+    SpanSize = SpanEndOffset - SpanOffset,
+    case SpanFrame of
+        Frame when is_binary(Frame), byte_size(Frame) =:= SpanSize ->
+            case decode_disk_reader_span(
+                Requests,
+                Frame,
+                SpanOffset,
+                Path,
+                Ordinal,
+                RecordsPerSegment,
+                Entries
+            ) of
+                {ok, NextEntries} ->
+                    decode_disk_reader_spans(
+                        SpanFrames,
+                        Spans,
+                        Path,
+                        Ordinal,
+                        RecordsPerSegment,
+                        NextEntries
+                    );
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        Frame when is_binary(Frame) ->
+            {error, {short_batch_span_read, SpanOffset, SpanSize, byte_size(Frame)}};
+        _Other ->
+            {error, {record_not_found, SpanOffset}}
+    end;
+decode_disk_reader_spans(_Frames, _Spans, _Path, _Ordinal, _RecordsPerSegment, _Entries) ->
+    {error, batch_read_count_mismatch}.
+
+decode_disk_reader_span([], _Frame, _SpanOffset, _Path, _Ordinal,
+                        _RecordsPerSegment, Entries) ->
+    {ok, Entries};
+decode_disk_reader_span(
+  [{Position, Index, Offset, EncodedSize} | Requests],
+  SpanFrame,
+  SpanOffset,
+  Path,
+  Ordinal,
+  RecordsPerSegment,
+  Entries
+ ) ->
+    RelativeOffset = Offset - SpanOffset,
+    Frame = binary:part(SpanFrame, RelativeOffset, EncodedSize),
+    case decode_disk_reader_frame(
+        Frame,
+        Path,
+        Index,
+        Offset,
+        EncodedSize,
+        Ordinal,
+        RecordsPerSegment
+    ) of
+        {ok, Entry} ->
+            decode_disk_reader_span(
+                Requests,
+                SpanFrame,
+                SpanOffset,
+                Path,
+                Ordinal,
+                RecordsPerSegment,
+                [{Position, Entry} | Entries]
+            );
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+decode_disk_reader_frame(
+  Frame,
+  Path,
+  WantedIndex,
+  Offset,
+  EncodedSize,
+  Ordinal,
+  RecordsPerSegment
+ )
+  when is_binary(Frame) ->
+    case Frame of
+        <<Len:32/unsigned-big, Crc:32/unsigned-big, Payload/binary>> ->
+            ExpectedSize = ?RECORD_HEADER_SIZE + Len,
+            case {
+                byte_size(Frame) =:= EncodedSize,
+                Len =< ?MAX_RECORD_BYTES,
+                ExpectedSize =:= EncodedSize,
+                byte_size(Payload) =:= Len,
+                erlang:crc32(Payload) =:= Crc
+            } of
+                {false, _, _, _, _} ->
+                    {error, {short_record_read, Offset, EncodedSize, byte_size(Frame)}};
+                {true, false, _, _, _} ->
+                    {error, {record_too_large, Offset, Len}};
+                {true, true, false, _, _} ->
+                    {error, {record_size_mismatch, Offset, EncodedSize, ExpectedSize}};
+                {true, true, true, false, _} ->
+                    {error, {short_record_read, Offset, Len, byte_size(Payload)}};
+                {true, true, true, true, false} ->
+                    {error, {crc_mismatch, Offset}};
+                {true, true, true, true, true} ->
+                    decode_disk_reader_frame_payload(
+                        Path,
+                        Payload,
+                        WantedIndex,
+                        Offset,
+                        Ordinal,
+                        RecordsPerSegment
+                    )
+            end;
+        _Other ->
+            {error, {short_record_header, Offset, byte_size(Frame)}}
+    end;
+decode_disk_reader_frame(_Frame, _Path, _WantedIndex, Offset, _EncodedSize,
+                         _Ordinal, _RecordsPerSegment) ->
+    {error, {record_not_found, Offset}}.
+
+decode_disk_reader_frame_payload(
+  Path,
+  Payload,
+  WantedIndex,
+  Offset,
+  Ordinal,
+  RecordsPerSegment
+ ) ->
+    case decode_segment_record(Path, Payload) of
+        {ok, {Index, {_Term, _Op} = Entry}} when is_integer(Index), Index >= 0 ->
+            case validate_record_segment_ordinal(Path, Index, Ordinal, RecordsPerSegment) of
+                ok when Index =:= WantedIndex ->
+                    {ok, Entry};
+                ok ->
+                    {error, {record_index_mismatch, Offset, WantedIndex, Index}};
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {ok, Other} ->
+            {error, {bad_record, Other}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+close_disk_reader(
+  {ferricstore_segment_disk_reader_v1, Fd, _Path, _FileBytes, _Ordinal,
+   _RecordsPerSegment, _Dir}
+ ) ->
+    file:close(Fd);
+close_disk_reader(_Reader) ->
+    {error, bad_disk_reader}.
+
 read_disk_at_untrimmed(Dir, Index, Offset, EncodedSize) ->
     case validate_segment_log_dir(Dir) of
         ok ->
@@ -525,15 +955,31 @@ compact_apply_projection(RootDir, TrimIndex, RetainedBatches)
 compact_apply_projection(_RootDir, TrimIndex, _RetainedBatches) ->
     {error, {bad_apply_projection_compaction_trim_index, TrimIndex}}.
 
+compact_apply_projection_stream(RootDir, TrimIndex, PageFun)
+  when is_integer(TrimIndex), TrimIndex >= 0, is_function(PageFun, 1) ->
+    Dir = fold_disk_segment_dir(RootDir),
+    case filelib:ensure_dir(filename:join(Dir, "dummy")) of
+        ok ->
+            case segment_append_kind(Dir) of
+                apply_projection ->
+                    compact_apply_projection_stream_records(Dir, TrimIndex, PageFun);
+                Kind ->
+                    {error, {not_apply_projection_log, Kind}}
+            end;
+        {error, Reason} ->
+            {error, {ensure_apply_projection_compaction_dir, Reason}}
+    end;
+compact_apply_projection_stream(_RootDir, TrimIndex, _PageFun) ->
+    {error, {bad_apply_projection_compaction_stream, TrimIndex}}.
+
 write_projection_batch_records(Dir, Records, Mode) ->
     Normalized = normalize_projection_batch_records(Records),
     case segment_append_kind(Dir) of
         apply_projection ->
-            %% Apply-projection is a runtime spill/cache log. Repeated writes for
-            %% the same Raft index are append-safe because read_disk/2 merges
-            %% duplicate batches in disk order. Keeping this path append-only
-            %% avoids multi-second overlap scans during Flow apply.
-            write_projection_records_mode(Dir, Normalized, Mode);
+            %% Every appended duplicate is a complete view of its Raft index.
+            %% Physical query-row locators may therefore address the latest
+            %% frame directly without folding older duplicates.
+            write_canonical_apply_projection_records(Dir, Normalized, Mode);
         _Other ->
             case projection_records_append_only_fast_path(Dir, Normalized) of
                 {ok, true} ->
@@ -552,6 +998,77 @@ write_projection_batch_records(Dir, Records, Mode) ->
                     Error
             end
     end.
+
+write_canonical_apply_projection_records(Dir, Records, Mode) ->
+    case projection_records_append_only_fast_path(Dir, Records) of
+        {ok, true} ->
+            write_projection_records_mode(Dir, Records, Mode);
+        {ok, false} ->
+            case existing_records_per_segment(Dir) of
+                {ok, RecordsPerSegment} ->
+                    case canonical_apply_projection_records(Dir, Records, RecordsPerSegment, []) of
+                        {ok, Canonical} -> write_projection_records_mode(Dir, Canonical, Mode);
+                        {error, _Reason} = Error -> Error
+                    end;
+                not_found ->
+                    write_projection_records_mode(Dir, Records, Mode);
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+canonical_apply_projection_records(_Dir, [], _RecordsPerSegment, Acc) ->
+    {ok, lists:reverse(Acc)};
+canonical_apply_projection_records(
+  Dir,
+  [{Index, NewEntry} | Rest],
+  RecordsPerSegment,
+  Acc
+ ) ->
+    case lookup_or_locate_offset(Dir, Index) of
+        {ok, {_Ordinal, Offset, EncodedSize}} ->
+            case read_disk_record_at(Dir, Index, Offset, EncodedSize, RecordsPerSegment) of
+                {ok, ExistingEntry} ->
+                    case merge_canonical_apply_projection_entry(ExistingEntry, NewEntry) of
+                        {ok, MergedEntry} ->
+                            canonical_apply_projection_records(
+                                Dir,
+                                Rest,
+                                RecordsPerSegment,
+                                [{Index, MergedEntry} | Acc]
+                            );
+                        {error, _Reason} = Error ->
+                            Error
+                    end;
+                not_found ->
+                    {error, {missing_apply_projection_overlap, Index}};
+                {error, _Reason} = Error ->
+                    Error
+            end;
+        not_found ->
+            canonical_apply_projection_records(
+                Dir,
+                Rest,
+                RecordsPerSegment,
+                [{Index, NewEntry} | Acc]
+            );
+        {error, _Reason} = Error ->
+            Error
+    end.
+
+merge_canonical_apply_projection_entry(
+  {0, {ferricstore_segment_apply_projection_batch, _OldPosition, OldEntries}},
+  {0, {ferricstore_segment_apply_projection_batch, NewPosition, NewEntries}}
+ ) when is_list(OldEntries), is_list(NewEntries) ->
+    {ok,
+     {0,
+      {ferricstore_segment_apply_projection_batch,
+       NewPosition,
+       merge_projection_entries(OldEntries, NewEntries)}}};
+merge_canonical_apply_projection_entry(ExistingEntry, NewEntry) ->
+    {error, {bad_apply_projection_overlap, ExistingEntry, NewEntry}}.
 
 write_projection_records_mode(Dir, Records, nosync) ->
     write_records_nosync(Dir, Records);

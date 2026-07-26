@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.LMDB
+  alias Ferricstore.Flow.{Keys, LMDB, StorageScope}
 
   alias Ferricstore.Flow.Query.{
     CompositeBackfill,
@@ -232,6 +232,77 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
              LMDB.prefix_count(lmdb_path(data_dir), IndexDefinition.storage_prefix(definition))
   end
 
+  test "backfill writes byte-identical dynamic covering entries to live derivation" do
+    data_dir = tmp_data_dir("dynamic-equivalence")
+    ctx = %{data_dir: data_dir, shard_count: 1}
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "by_region_tag_score",
+        version: 1,
+        fields: [
+          {:partition_key, :asc},
+          {{:attribute, "regions"}, :asc, :hashed},
+          {{:attribute, "tags"}, :asc, :hashed},
+          {{:state_meta, "queued", "score"}, :asc, :hashed}
+        ],
+        covering_fields: [
+          :run_id,
+          :version,
+          :partition_key,
+          {:attribute, "regions"},
+          {:attribute, "tags"},
+          {:attribute, "nullable"},
+          {:state_meta, "queued", "score"},
+          {:state_meta, "queued", "enabled"}
+        ]
+      })
+
+    projected =
+      projected_record("dynamic", 7)
+      |> put_in([:record, :attributes], %{
+        "regions" => ["eu", "us"],
+        "tags" => ["finance", "urgent"],
+        "nullable" => nil
+      })
+      |> put_in([:record, :state_meta], %{
+        "queued" => %{"score" => 1.5, "enabled" => true}
+      })
+
+    assert {:ok, expected} =
+             CompositeIndex.entries(
+               definition,
+               projected.record,
+               projected.state_key,
+               projected.expire_at_ms
+             )
+
+    assert length(expected) == 4
+
+    assert {:ok, %{projected_records: 1, written_entries: 4}} =
+             CompositeBackfill.project_page(ctx, 0, [projected], [definition],
+               read_entries_fun: fn _ctx, 0, [state_key] ->
+                 {:ok, [{encoded_record(state_key, projected.record.version), 0}]}
+               end
+             )
+
+    path = lmdb_path(data_dir)
+
+    for entry <- expected do
+      assert {:ok, value} = LMDB.get(path, entry.key)
+      assert value == entry.value
+    end
+
+    assert {:ok, %{keys: reverse_keys}} =
+             path
+             |> LMDB.get(CompositeIndex.reverse_key(projected.state_key))
+             |> then(fn {:ok, blob} ->
+               CompositeIndex.decode_reverse_state(blob, projected.state_key)
+             end)
+
+    assert Enum.sort(reverse_keys) == Enum.sort(Enum.map(expected, & &1.key))
+  end
+
   test "rejects an oversized page before allocating projection state" do
     records = List.duplicate(projected_record("one", 1), 65)
 
@@ -284,6 +355,55 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
              CompositeBackfill.project_page(ctx, 0, [record], [definition()],
                read_entries_fun: fn _ctx, 0, [state_key] when state_key == record.state_key ->
                  {:ok, [{encoded_record(state_key, record.record.version), 2_000}]}
+               end
+             )
+  end
+
+  test "shared backfill verifies the sealed owner after projection" do
+    data_dir = tmp_data_dir("shared-owner-race")
+    ctx = %{data_dir: data_dir, shard_count: 1}
+    scope = <<42::unsigned-big-64>>
+    assert {:ok, physical_partition} = StorageScope.physical_partition_key("tenant-a", scope)
+
+    projected =
+      projected_record("shared", 1)
+      |> Map.put(:state_key, Keys.state_key("shared", physical_partition))
+      |> put_in([:record, :partition_key], physical_partition)
+      |> put_in([:record, :system_metadata], scope_metadata(42))
+
+    definition =
+      IndexDefinition.new!(%{
+        id: "shared_by_updated",
+        version: 1,
+        scope_bytes: 8,
+        fields: [{:partition_key, :asc}, {:updated_at_ms, :desc}]
+      })
+
+    valid_encoded =
+      projected.state_key
+      |> encoded_record(projected.record.version)
+      |> Ferricstore.Flow.decode_record()
+      |> Map.put(:partition_key, physical_partition)
+      |> Map.put(:system_metadata, scope_metadata(42))
+      |> Ferricstore.Flow.encode_record()
+
+    assert {:ok, %{projected_records: 1}} =
+             CompositeBackfill.project_page(ctx, 0, [projected], [definition],
+               read_entries_fun: fn _ctx, 0, [state_key] when state_key == projected.state_key ->
+                 {:ok, [{valid_encoded, 0}]}
+               end
+             )
+
+    forged_encoded =
+      valid_encoded
+      |> Ferricstore.Flow.decode_record()
+      |> Map.put(:system_metadata, scope_metadata(99))
+      |> Ferricstore.Flow.encode_record()
+
+    assert {:error, :query_backfill_concurrent_change} =
+             CompositeBackfill.project_page(ctx, 0, [projected], [definition],
+               read_entries_fun: fn _ctx, 0, [state_key] when state_key == projected.state_key ->
+                 {:ok, [{forged_encoded, 0}]}
                end
              )
   end
@@ -401,6 +521,8 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
     [tag, id] = String.split(state_key, ":s:", parts: 2)
     {:ok, tag, id}
   end
+
+  defp scope_metadata(value), do: %{0x8001 => {1, :uint64, :isolation_scope, value}}
 
   defp tmp_data_dir(label) do
     data_dir =

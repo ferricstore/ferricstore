@@ -39,6 +39,27 @@ defmodule Ferricstore.Flow.Query.UsageTest do
     refute Usage.valid?(%{baseline | residual_checks: 37}, Budget.default(), :records)
   end
 
+  test "accepts covered records without inventing hydration work" do
+    covered = %{
+      usage(3)
+      | hydrated_records: 0,
+        residual_checks: 0
+    }
+
+    assert Usage.valid?(covered, Budget.default(), :records)
+    refute Usage.valid?(%{covered | result_records: 4}, Budget.default(), :records)
+  end
+
+  test "allows residual checks against metadata rows without inventing log hydration" do
+    metadata = %{
+      usage(2)
+      | hydrated_records: 0,
+        residual_checks: 3
+    }
+
+    assert Usage.valid?(metadata, Budget.default(), :records)
+  end
+
   defp usage(result_records) do
     %{
       range_seeks: 1,

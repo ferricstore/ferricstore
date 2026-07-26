@@ -27,7 +27,15 @@ Useful local runners:
 | `query_planner_core_read_candidates_bench.exs` | Durable counts, selective continuations, bounded state merge, and short-key candidates. |
 | `query_planner_composite_codec_candidates_bench.exs` | Composite entry and reverse-value codec candidates. |
 | `query_planner_projection_candidates_bench.exs` | Counter writes, exact reverse-row prefetch, and projection page-size candidates. |
+| `query_planner_covering_index_candidates_bench.exs` | Production covering-index reads versus primary-row hydration. |
+| `query_covering_write_cost_bench.exs` | Launch-catalog covering write cost and compact cover codec comparison. |
+| `query_planner_residual_candidates_bench.exs` | Direct, fetch-once, and prepared residual predicate evaluation candidates. |
+| `query_planner_intersection_candidates_bench.exs` | Single-index hydration and bounded multi-index intersection candidates. |
+| `query_result_codec_candidates_bench.exs` | Compact result-record ordering candidates across sparse and full pages. |
+| `query_tuple_codec_candidates_bench.exs` | Production tuple comparison and binary encoding versus the previous paths. |
 | `query_planner_native_read_candidates_bench.exs` | Reference-vs-production fused composite and source-aware shard reads. |
+| `apply_projection_retention_bench.exs` | Previous unbounded compaction retention versus the production hybrid spill collector. |
+| `query_storage_layout_bench.exs` | Previous duplicated-record LMDB layout versus compact QueryRow storage and authoritative-log hydration. |
 | `flow_lmdb_soak.exs` | Long-running Flow/LMDB projection soak using `ferric://`. |
 | `flow_state_lmdb_soak/` | Sectioned state-machine soak using `ferric://`. |
 
@@ -107,6 +115,10 @@ BENCH_CANDIDATE_SECTION=projection-batch BENCH_PROJECTION_BATCH_RECORDS=1,64,512
 BENCH_CANDIDATE_SECTION=composite BENCH_WARMUP=0.1 BENCH_TIME=0.75 \
   BENCH_MEMORY_TIME=0 MIX_ENV=bench mix run --no-start \
   bench/query_planner_native_read_candidates_bench.exs
+
+BENCH_STORAGE_RECORDS=10000 BENCH_STORAGE_RECORDS_PER_LOG_ENTRY=64 \
+  BENCH_WARMUP=0.1 BENCH_TIME=0.5 BENCH_MEMORY_TIME=0 \
+  MIX_ENV=bench mix run --no-start bench/query_storage_layout_bench.exs
 ```
 
 These candidate runners perform result-equivalence preflight before timing.
@@ -120,13 +132,72 @@ the Linux profiling runner below; warm macOS results are not a substitute.
 The accepted production set is intentionally narrower than the candidate set:
 compact/fused composite rows, source-aware bounded shard merge, a bounded
 k-way state merge, exact durable counts, 64-record projection pages, and
-batched reverse-row reads. Counter-operation coalescing, synchronous parallel
-shard reads, front-coded reverse writes, cached LMDB handles, and catalog
-transaction fusion did not clear the gate and remain unimplemented. Short
+batched reverse-row reads. Production covering rows avoid primary hydration for
+eligible sparse projections and counts. The native production harness measured
+2.4-7.9x read improvement across 1-100 row pages and 128-byte to 4KiB source
+records. Across all five launch indexes, compact covers added 17% logical index
+bytes and about 14.7% median projection time; the compact codec itself encoded
+1.84x and decoded 1.58x faster than the previous ETF envelope. Large decoded
+fields are detached only when needed so selected sub-binaries cannot retain an
+unaccounted 64KiB cover.
+
+Prepared residual predicates avoid repeated field lookup and use precomputed
+exact-type membership sets. A corrected production-vs-legacy paired run
+improved equality filters by 21-42%, mixed filters by 4.29x, and 20-value `IN`
+filters by 13.26-29.6x. Direct tuple comparison improved 10,000-value batches by
+4.7-8.5x in a short production-vs-legacy run. The thresholded bulk binary
+encoder remains on the per-byte path below 32 bytes and improved 32-512 byte
+inputs by roughly 1.3-12.8x without a relevant small-input regression.
+
+Counter-operation coalescing, synchronous parallel shard reads, front-coded
+reverse writes, cached LMDB handles, and catalog transaction fusion did not
+clear the gate and remain unimplemented. Short
 durable index IDs reduce storage but did not improve latency enough to justify
-the added catalog lookup. Selectivity-aware continuation remains benchmark
+the added catalog lookup. Reusing one statistics-scope digest across planner
+candidates reduced allocations slightly but did not improve 1-, 8-, or
+32-index planner latency, so the simpler per-candidate validation path remains.
+Size-aware result-field ordering improved dense rows but produced an unstable
+large sparse-page regression, so compact result encoding keeps its single sort
+path. Streaming iodata regressed the relevant 512KiB response envelope and only
+won above the product response ceiling, so compact results still flatten once
+before framing. Covering plans retain the full executor admission reservation:
+version-1 index rows, oversized cover fallbacks, and expiring rows can still
+require primary-record hydration, so a projection-sized reservation would not
+be a hard bound. Hydration batches already use a byte-bounded LMDB prefix read
+that returns the largest fitting prefix; an additional adaptive batch-size
+controller would duplicate that contract without reducing reads.
+Skipping cover decoding when a plan still required authoritative hydration
+improved stable paired medians by only 1-14% across 25- and 100-row pages with
+128-byte and 4KiB source records. It did not reproducibly clear the 15% gate,
+so the extra production reader branch was removed; the paired lower-bound
+candidate remains in `query_planner_covering_index_candidates_bench.exs`.
+Automatic multi-index intersection is also excluded: it improved sparse-overlap
+synthetic shapes but regressed 1.5-2.7x for highly correlated indexes and about
+30x when the best single index was already selective. The available statistics
+do not measure cross-index correlation, while the launch catalog already has
+the useful state/type composites, so the planner cannot choose intersection
+reliably without joint statistics.
+Selectivity-aware continuation remains benchmark
 evidence only until RAM and LMDB share a cursor contract; it is not implemented
 with offset rescans.
+
+The storage-layout benchmark includes the shared exact-type source catalog in
+both layouts. At 10,000 records and 64 records per authoritative frame, the
+compact layout reduced physical LMDB bytes by about 23.0% for sparse records,
+35.5% for typical records, and 6.0% for metadata-heavy records. Logical LMDB
+bytes fell by 27.9% and 7.36% for the typical and metadata-heavy shapes. Sparse
+logical bytes grew by 15.54% because a nearly payload-free source record is
+smaller than the query-visible metadata plus its checksum-bearing physical
+locator; allocator and page effects still made the production LMDB smaller at
+scale.
+
+Two hydration candidates remain rejected. Retaining a direct inline-record
+decode path did not reproducibly clear the 15% gate for the typical 100-row
+workload. Packing 256 instead of 64 records per authoritative frame improved
+that workload by only about 13% while materially regressing one-row sparse
+reads. A retained-descriptor reader saved only roughly 15-20 microseconds over
+the production pooled disk reader at 100 rows. Neither result justifies an
+additional read path or a larger production frame.
 
 The full native-index default includes 1K, 100K, and 1M entries, page sizes 1,
 25, 100, and 4096, forward/reverse/cursor/deep-offset reads, duplicate scores,

@@ -421,6 +421,63 @@ defmodule Ferricstore.FlowStateMetaTest do
              FerricStore.flow_policy_set(type, indexed_state_meta: ["version", "owner"])
   end
 
+  test "rejects a state_meta merge that would overflow an existing state entry" do
+    type = unique_flow_id("state-meta-merge-overflow-type")
+    id = unique_flow_id("state-meta-merge-overflow")
+    state_meta = Map.new(1..16, &{"k#{&1}", &1})
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: type,
+               state: "queued",
+               partition_key: @partition,
+               state_meta: state_meta,
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due(type,
+               states: ["queued"],
+               partition_key: @partition,
+               worker: "w1",
+               limit: 1,
+               now_ms: 1_001
+             )
+
+    assert {:error, "ERR too many flow state_meta entries"} =
+             FerricStore.flow_transition(id, "running", "queued",
+               lease_token: claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               partition_key: @partition,
+               state_meta: %{"overflow" => 17},
+               run_at_ms: 1_010,
+               now_ms: 1_002
+             )
+
+    assert {:ok, record} = FerricStore.flow_get(id, partition_key: @partition)
+    assert record.state == "running"
+    assert record.version == claimed.version
+    assert record.state_meta["queued"] == state_meta
+  end
+
+  test "explicit null state_meta values survive the durable codec" do
+    id = unique_flow_id("state-meta-null")
+
+    assert :ok =
+             FerricStore.flow_create(id,
+               type: "state-meta-null",
+               state: "queued",
+               partition_key: @partition,
+               state_meta: %{"nullable" => nil},
+               run_at_ms: 1_000,
+               now_ms: 1_000
+             )
+
+    assert {:ok, record} = FerricStore.flow_get(id, partition_key: @partition)
+    assert Map.fetch(record.state_meta["queued"], "nullable") == {:ok, nil}
+  end
+
   test "rejects state_meta numbers that cannot be represented by query and native codecs" do
     assert {:error, "ERR flow state_meta integer must fit in signed 64 bits"} =
              FerricStore.flow_create(unique_flow_id("state-meta-integer-high"),
@@ -456,7 +513,7 @@ defmodule Ferricstore.FlowStateMetaTest do
              )
   end
 
-  test "state_meta update cannot grow a state beyond the entry cap" do
+  test "state_meta update rejects growth beyond the entry cap atomically" do
     type = unique_flow_id("state-meta-merge-limits")
     id = unique_flow_id("state-meta-merge-limit")
     initial_meta = Map.new(1..16, &{"k#{&1}", &1})
@@ -480,7 +537,7 @@ defmodule Ferricstore.FlowStateMetaTest do
                now_ms: 1_001
              )
 
-    assert :ok =
+    assert {:error, "ERR too many flow state_meta entries"} =
              FerricStore.flow_transition(id, "running", "accept",
                lease_token: claimed.lease_token,
                fencing_token: claimed.fencing_token,
@@ -491,6 +548,8 @@ defmodule Ferricstore.FlowStateMetaTest do
              )
 
     assert {:ok, record} = FerricStore.flow_get(id, partition_key: @partition)
+    assert record.state == "running"
+    assert record.version == claimed.version
     assert record.state_meta["accept"] == initial_meta
   end
 
