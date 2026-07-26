@@ -35,9 +35,18 @@ defmodule Ferricstore.Flow.RecordHydrator do
   def read_stored_many(ctx, shard_index, requests, opts),
     do: do_read_many(ctx, shard_index, requests, opts, :stored)
 
+  @doc false
+  @spec read_storage_refs_many(map(), non_neg_integer(), [request()], keyword()) ::
+          {:ok, [binary() | nil]} | {:error, term()}
+  def read_storage_refs_many(ctx, shard_index, requests, opts \\ [])
+
+  def read_storage_refs_many(ctx, shard_index, requests, opts),
+    do: do_read_many(ctx, shard_index, requests, opts, :storage_ref)
+
   defp do_read_many(%{data_dir: data_dir} = ctx, shard_index, requests, opts, mode)
        when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
-              is_list(requests) and is_list(opts) and mode in [:decoded, :encoded, :stored] do
+              is_list(requests) and is_list(opts) and
+              mode in [:decoded, :encoded, :stored, :storage_ref] do
     max_bytes = Keyword.get(opts, :max_bytes, @default_max_bytes)
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
     include_expired? = Keyword.get(opts, :include_expired, false)
@@ -57,12 +66,17 @@ defmodule Ferricstore.Flow.RecordHydrator do
            read_grouped(ctx, shard_index, prepared, deadline_ms, clock_ms, include_expired?),
          :ok <- check_deadline(deadline_ms, clock_ms),
          :ok <- validate_physical_value_sizes(raw_values, prepared),
-         :ok <- admit_materialized_bytes(raw_values, ctx, max_bytes),
-         {:ok, values} <- materialize_values(raw_values, ctx, shard_index),
-         :ok <- check_deadline(deadline_ms, clock_ms),
-         :ok <- admit_actual_bytes(values, max_bytes),
-         validation_mode = if(mode == :stored, do: :encoded, else: mode),
-         {:ok, records} <- decode_and_validate(values, prepared, validation_mode),
+         {:ok, records} <-
+           finalize_values(
+             mode,
+             raw_values,
+             prepared,
+             ctx,
+             shard_index,
+             max_bytes,
+             deadline_ms,
+             clock_ms
+           ),
          :ok <- check_deadline(deadline_ms, clock_ms) do
       if mode == :stored, do: {:ok, raw_values}, else: {:ok, records}
     end
@@ -361,6 +375,70 @@ defmodule Ferricstore.Flow.RecordHydrator do
 
   defp validate_physical_value_sizes(_values, _prepared),
     do: {:error, :hydration_result_count_mismatch}
+
+  defp finalize_values(
+         :storage_ref,
+         raw_values,
+         prepared,
+         _ctx,
+         _shard_index,
+         _max_bytes,
+         _deadline_ms,
+         _clock_ms
+       ) do
+    validate_storage_refs(raw_values, prepared, [])
+  end
+
+  defp finalize_values(
+         mode,
+         raw_values,
+         prepared,
+         ctx,
+         shard_index,
+         max_bytes,
+         deadline_ms,
+         clock_ms
+       )
+       when mode in [:decoded, :encoded, :stored] do
+    with :ok <- admit_materialized_bytes(raw_values, ctx, max_bytes),
+         {:ok, values} <- materialize_values(raw_values, ctx, shard_index),
+         :ok <- check_deadline(deadline_ms, clock_ms),
+         :ok <- admit_actual_bytes(values, max_bytes),
+         validation_mode = if(mode == :stored, do: :encoded, else: mode) do
+      decode_and_validate(values, prepared, validation_mode)
+    end
+  end
+
+  defp validate_storage_refs([], [], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp validate_storage_refs([nil | values], [_request | prepared], acc),
+    do: validate_storage_refs(values, prepared, [nil | acc])
+
+  defp validate_storage_refs(
+         [stored | values],
+         [%{locator: %Locator{checksum: checksum}} | prepared],
+         acc
+       )
+       when is_binary(stored) and is_binary(checksum) and byte_size(checksum) == 32 do
+    if storage_checksum_matches?(stored, checksum) do
+      validate_storage_refs(values, prepared, [stored | acc])
+    else
+      {:error, :hydrated_record_identity_mismatch}
+    end
+  end
+
+  defp validate_storage_refs(_values, _prepared, _acc),
+    do: {:error, :hydration_result_count_mismatch}
+
+  defp storage_checksum_matches?(stored, checksum) do
+    case BlobRef.decode(stored) do
+      {:ok, %BlobRef{checksum: blob_checksum}} ->
+        :crypto.hash_equals(blob_checksum, checksum)
+
+      :error ->
+        checksum_matches?(checksum, stored)
+    end
+  end
 
   defp admit_materialized_bytes(values, ctx, max_bytes) do
     threshold = BlobValue.threshold(ctx)

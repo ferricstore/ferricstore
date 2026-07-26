@@ -20,6 +20,16 @@ defmodule Ferricstore.Flow.MutationAttrsTest do
     assert attrs.value_refs == %{reservation: "ref-1"}
   end
 
+  test "create_attrs accepts infinity while validating compact query metadata" do
+    assert {:ok, attrs} =
+             MutationAttrs.create_attrs("flow-without-active-timeout",
+               type: "email",
+               max_active_ms: :infinity
+             )
+
+    assert attrs.max_active_ms == :infinity
+  end
+
   test "transition_attrs rejects direct transition into running" do
     assert {:error, "ERR flow running state is only entered by FLOW.CLAIM_DUE"} =
              MutationAttrs.transition_attrs("flow-1", "queued", "running",

@@ -7,8 +7,10 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   alias Ferricstore.Flow.HistoryProjector.KeyCodec
   alias Ferricstore.Flow.HistoryProjector.Log
   alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.Locator
   alias Ferricstore.Flow.Query.QueryRowCodec
   alias Ferricstore.Flow.RecordIdentity
+  alias Ferricstore.Store.BlobRef
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
 
   @max_exact_integer 9_007_199_254_740_991
@@ -199,24 +201,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
   def load_history_state_record(state_key, keydir, shard_data_path) do
     case HistoryProjector.safe_ets_lookup(keydir, state_key) do
       [{^state_key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size} = row] ->
-        case keydir_row_value(shard_data_path, row) do
-          {:ok, value} ->
-            case decode_flow_record(value) do
-              {:ok, record} when is_map(record) ->
-                if RecordIdentity.owns_state_key?(record, state_key),
-                  do: {:ok, record},
-                  else: {:error, :corrupt_history_state_record}
-
-              _invalid ->
-                {:error, :corrupt_history_state_record}
-            end
-
-          {:error, reason} ->
-            {:error, {:history_state_read_failed, reason}}
-
-          _invalid ->
-            {:error, :corrupt_history_state_keydir_entry}
-        end
+        load_history_keydir_state_record(state_key, row, shard_data_path)
 
       [] ->
         load_lmdb_history_state_record(state_key, shard_data_path)
@@ -226,13 +211,167 @@ defmodule Ferricstore.Flow.HistoryProjector.Recovery do
     end
   end
 
+  defp load_history_keydir_state_record(state_key, row, shard_data_path) do
+    case keydir_row_value(shard_data_path, row) do
+      {:ok, value} ->
+        case decode_owned_flow_record(value, state_key) do
+          {:ok, record} ->
+            {:ok, record}
+
+          :error ->
+            load_indirect_history_state_record(
+              value,
+              state_key,
+              row,
+              shard_data_path,
+              {:error, :corrupt_history_state_record}
+            )
+        end
+
+      {:error, reason} ->
+        {:error, {:history_state_read_failed, reason}}
+
+      _invalid ->
+        load_indirect_history_state_record(
+          nil,
+          state_key,
+          row,
+          shard_data_path,
+          {:error, :corrupt_history_state_keydir_entry}
+        )
+    end
+  end
+
+  defp decode_owned_flow_record(value, state_key) do
+    case decode_flow_record(value) do
+      {:ok, record} when is_map(record) ->
+        if RecordIdentity.owns_state_key?(record, state_key), do: {:ok, record}, else: :error
+
+      _invalid ->
+        :error
+    end
+  end
+
+  defp load_indirect_history_state_record(
+         value,
+         state_key,
+         row,
+         shard_data_path,
+         fallback
+       ) do
+    if indirect_history_state_row?(value, row) do
+      case load_lmdb_history_query_row(state_key, shard_data_path) do
+        {:ok, query_row} ->
+          if query_row_matches_keydir?(query_row, row),
+            do: {:ok, query_row.record},
+            else: {:error, :corrupt_history_query_row_location}
+
+        :not_found ->
+          fallback
+
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      fallback
+    end
+  end
+
+  defp indirect_history_state_row?(
+         nil,
+         {_key, nil, expire_at_ms, _lfu, file_id, offset, value_size}
+       ) do
+    valid_history_keydir_location?(expire_at_ms, file_id, offset, value_size, :waraft)
+  end
+
+  defp indirect_history_state_row?(
+         value,
+         {_key, _stored, expire_at_ms, _lfu, file_id, offset, value_size}
+       )
+       when is_binary(value) do
+    BlobRef.ref?(value) and
+      valid_history_keydir_location?(expire_at_ms, file_id, offset, value_size, :any)
+  end
+
+  defp indirect_history_state_row?(_value, _row), do: false
+
+  defp valid_history_keydir_location?(expire_at_ms, file_id, offset, value_size, source)
+       when is_integer(expire_at_ms) and expire_at_ms >= 0 and
+              expire_at_ms <= @max_exact_integer and is_integer(offset) and offset >= 0 and
+              is_integer(value_size) and value_size > 0 do
+    case Locator.storage_source(file_id) do
+      {:ok, 0, _id} -> source == :any
+      {:ok, tag, _id} when tag in 1..3 -> true
+      _invalid -> false
+    end
+  end
+
+  defp valid_history_keydir_location?(
+         _expire_at_ms,
+         _file_id,
+         _offset,
+         _value_size,
+         _source
+       ),
+       do: false
+
+  defp query_row_matches_keydir?(
+         %{
+           expire_at_ms: expire_at_ms,
+           locator: %Locator{file_id: file_id, offset: offset, value_size: value_size}
+         },
+         {_key, _value, expire_at_ms, _lfu, file_id, offset, value_size}
+       ),
+       do: true
+
+  defp query_row_matches_keydir?(
+         %{
+           expire_at_ms: expire_at_ms,
+           locator: %Locator{
+             raft_index: raft_index,
+             value_size: value_size,
+             checksum: checksum
+           }
+         },
+         {_key, stored, expire_at_ms, _lfu, {source, raft_index}, _offset, value_size}
+       )
+       when source in [:waraft_segment, :waraft_projection, :waraft_apply_projection] and
+              is_integer(raft_index) and raft_index > 0 and is_integer(value_size) and
+              value_size > 0 and is_binary(checksum) and byte_size(checksum) == 32 do
+    case stored do
+      nil ->
+        true
+
+      encoded_ref when is_binary(encoded_ref) ->
+        case BlobRef.decode(encoded_ref) do
+          {:ok, %BlobRef{checksum: ref_checksum}} ->
+            :crypto.hash_equals(ref_checksum, checksum)
+
+          :error ->
+            false
+        end
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp query_row_matches_keydir?(_query_row, _row), do: false
+
   def load_lmdb_history_state_record(state_key, shard_data_path) do
+    case load_lmdb_history_query_row(state_key, shard_data_path) do
+      {:ok, %{record: record}} when is_map(record) -> {:ok, record}
+      other -> other
+    end
+  end
+
+  defp load_lmdb_history_query_row(state_key, shard_data_path) do
     path = Ferricstore.Flow.LMDB.path(shard_data_path)
 
     case Ferricstore.Flow.LMDB.get(path, state_key) do
       {:ok, blob} when is_binary(blob) ->
         case QueryRowCodec.decode(blob, state_key) do
-          {:ok, %{record: record}} when is_map(record) -> {:ok, record}
+          {:ok, %{record: record} = query_row} when is_map(record) -> {:ok, query_row}
           _invalid -> {:error, :corrupt_history_query_row}
         end
 

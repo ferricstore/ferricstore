@@ -210,8 +210,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
              source_truncated?
            ) do
         planned =
-          case flow_active_timeout_current_record(state, state_key) do
-            record when is_map(record) ->
+          case flow_retention_current_state_record(state, state_key) do
+            {:ok, record} when is_map(record) ->
               flow_retention_plan_terminal_candidate(
                 state,
                 state_key,
@@ -221,7 +221,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
                 remaining_bytes
               )
 
-            nil ->
+            :miss ->
               []
           end
 
@@ -364,6 +364,13 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
         do: {:ok, %{flows: 0, history: 0, values: 0, active_timeouts: 0}}
 
       defp flow_retention_current_state_record(state, state_key) do
+        case flow_retention_hot_state_record(state, state_key) do
+          {:ok, _record} = record -> record
+          :miss -> flow_retention_decode_lmdb_state_record(state, state_key)
+        end
+      end
+
+      defp flow_retention_hot_state_record(state, state_key) do
         case :ets.lookup(state.ets, state_key) do
           [{^state_key, value, _expire_at_ms, _lfu, fid, offset, value_size}] ->
             flow_retention_decode_state_record(state, state_key, value, fid, offset, value_size)

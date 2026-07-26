@@ -558,6 +558,45 @@ defmodule Ferricstore.Flow.RecordHydratorTest do
              RecordHydrator.read_stored_many(ctx, 0, [{state_key, locator}], max_bytes: 1_000_000)
   end
 
+  test "reads checksum-validated storage refs without materializing blob payloads" do
+    root = tmp_root("storage_ref_without_payload_read")
+    record = record("run-storage-ref", 8)
+    state_key = Keys.state_key(record.id, record.partition_key)
+    encoded = Ferricstore.Flow.encode_record(record)
+    assert {:ok, ref} = BlobStore.put(root, 0, encoded)
+    encoded_ref = BlobRef.encode!(ref)
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(root, 0, 108, [
+               {state_key, encoded_ref, 0}
+             ])
+
+    locator =
+      durable_apply_locator(root, state_key, record, 108, byte_size(encoded_ref),
+        checksum: ref.checksum
+      )
+
+    Process.put(:ferricstore_blob_store_open_read_hook, fn _path, _modes ->
+      flunk("storage-ref hydration must not open the blob payload")
+    end)
+
+    on_exit(fn -> Process.delete(:ferricstore_blob_store_open_read_hook) end)
+
+    ctx = %{data_dir: root, blob_side_channel_threshold_bytes: 64}
+
+    assert {:ok, [^encoded_ref]} =
+             RecordHydrator.read_storage_refs_many(ctx, 0, [{state_key, locator}],
+               max_bytes: 1_000_000
+             )
+
+    invalid = %{locator | checksum: :binary.copy(<<0>>, 32)}
+
+    assert {:error, :hydrated_record_identity_mismatch} =
+             RecordHydrator.read_storage_refs_many(ctx, 0, [{state_key, invalid}],
+               max_bytes: 1_000_000
+             )
+  end
+
   test "fails closed when the located record does not match key identity or generation" do
     root = tmp_root("identity")
     state_key = Keys.state_key("run-1", "tenant-a")

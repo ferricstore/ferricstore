@@ -406,6 +406,55 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
                  Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
       end
 
+      test "compact query catalog protects a long-key Flow blob without a keydir copy", %{
+        ctx: ctx,
+        keydir: keydir
+      } do
+        Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+        id = :binary.copy("long-query-catalog-id-", 30)
+        partition_key = "tenant-long-query-catalog"
+        state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
+
+        assert byte_size(state_key) > 511
+
+        assert :ok =
+                 Ferricstore.Flow.create(ctx, id,
+                   type: "blob-query-catalog",
+                   partition_key: partition_key,
+                   correlation_id: :binary.copy("c", 256),
+                   run_at_ms: 1,
+                   now_ms: 1
+                 )
+
+        assert {:ok, _encoded_ref, ref} = raw_disk_blob_ref(ctx, keydir, state_key)
+        blob_path = BlobRef.path(ctx.data_dir, 0, ref)
+        assert File.exists?(blob_path)
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(ctx.name, 0)
+
+        lmdb_path =
+          ctx.data_dir
+          |> Ferricstore.DataDir.shard_data_path(0)
+          |> Ferricstore.Flow.LMDB.path()
+
+        assert {:ok, query_row} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
+
+        assert {:ok, %{locator: locator}} =
+                 Ferricstore.Flow.Query.QueryRowCodec.decode(query_row, state_key)
+
+        assert locator.checksum == ref.checksum
+        assert [keydir_row] = :ets.lookup(keydir, state_key)
+        true = :ets.delete(keydir, state_key)
+
+        try do
+          assert {:ok, %{deleted_files: 0}} = Router.sweep_blob_garbage(ctx)
+          assert File.exists?(blob_path)
+        after
+          true = :ets.insert(keydir, keydir_row)
+          Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+        end
+      end
+
       test "Flow retention cleanup decodes terminal state stored as a blob ref", %{
         ctx: ctx,
         keydir: keydir
@@ -457,8 +506,26 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
 
         cleanup_now = completed.terminal_retention_until_ms + 1
 
+        test_pid = self()
+
+        Application.put_env(:ferricstore, :flow_retention_after_plan_hook, fn
+          :terminal, candidates ->
+            send(test_pid, {:terminal_retention_candidates, candidates})
+            :ok
+
+          _kind, _candidates ->
+            :ok
+        end)
+
+        on_exit(fn ->
+          Application.delete_env(:ferricstore, :flow_retention_after_plan_hook)
+        end)
+
         assert {:ok, cleaned} =
                  Ferricstore.Flow.retention_cleanup(ctx, limit: 10, now_ms: cleanup_now)
+
+        assert_receive {:terminal_retention_candidates,
+                        [%{record: %{id: ^id, state: "completed"}}]}
 
         assert cleaned.flows >= 1
         assert {:ok, nil} = Ferricstore.Flow.get(ctx, id, partition_key: partition_key)
@@ -526,8 +593,22 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
                  )
 
         assert {:ok, lmdb_blob} = Ferricstore.Flow.LMDB.get(lmdb_path, state_key)
-        assert {:ok, rebuilt_state} = Ferricstore.Flow.LMDB.decode_value(lmdb_blob, 10)
-        assert %{id: ^id, state: "completed"} = Ferricstore.Flow.decode_record(rebuilt_state)
+
+        assert {:ok, %{record: rebuilt_metadata, locator: locator}} =
+                 Ferricstore.Flow.Query.QueryRowCodec.decode(lmdb_blob, state_key)
+
+        assert %{id: ^id, state: "completed"} = rebuilt_metadata
+
+        assert {:ok, [rebuilt_state]} =
+                 Ferricstore.Flow.RecordHydrator.read_many(
+                   ctx,
+                   0,
+                   [{state_key, locator}],
+                   include_expired: true,
+                   now_ms: 10
+                 )
+
+        assert %{id: ^id, state: "completed"} = rebuilt_state
       end
 
       test "Ra compound batch apply persists large values as blob refs", %{

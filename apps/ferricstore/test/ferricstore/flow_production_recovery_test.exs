@@ -154,6 +154,13 @@ defmodule Ferricstore.FlowProductionRecoveryTest do
     assert ready_claim.id == ready_id
     assert ready_claim.payload == :binary.copy("ready:", 128)
 
+    missing_shards =
+      for {name, shard_index} <- Tuple.to_list(restarted_ctx.shard_names) |> Enum.with_index(),
+          not is_pid(Process.whereis(name)),
+          do: shard_index
+
+    assert missing_shards == []
+
     assert {:ok, _stats} = Router.sweep_blob_garbage(restarted_ctx)
   end
 

@@ -27,17 +27,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
         _entry -> false
       end)
 
-    hot_decoded =
-      Enum.flat_map(hot, fn {key, value, expire_at_ms, _lfu, fid, off, vsize} ->
-        decode_state_record(
-          key,
-          value,
-          expire_at_ms,
-          shard_index,
-          instance_ctx,
-          {fid, off, vsize}
-        )
-      end)
+    hot_decoded = decode_hot_entries(hot, shard_index, instance_ctx)
 
     cold_decoded =
       cold
@@ -45,6 +35,55 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
       |> read_cold_locations(shard_index, instance_ctx)
 
     hot_decoded ++ cold_decoded
+  end
+
+  defp decode_hot_entries(entries, shard_index, instance_ctx) do
+    physical_locations = hot_waraft_physical_locations(entries, shard_index, instance_ctx)
+
+    Enum.flat_map(entries, fn {key, value, expire_at_ms, _lfu, fid, off, vsize} ->
+      case Map.get(physical_locations, fid, :direct) do
+        {:ok, physical_location} ->
+          key
+          |> decode_state_record(
+            value,
+            expire_at_ms,
+            shard_index,
+            instance_ctx,
+            {fid, off, vsize}
+          )
+          |> physicalize_decoded_rows(physical_location)
+
+        {:error, reason} ->
+          observe_cold_read_error(1, {:waraft_segment_location_failed, reason})
+          []
+
+        :direct ->
+          decode_state_record(
+            key,
+            value,
+            expire_at_ms,
+            shard_index,
+            instance_ctx,
+            {fid, off, vsize}
+          )
+      end
+    end)
+  end
+
+  defp hot_waraft_physical_locations(entries, shard_index, instance_ctx) do
+    entries
+    |> Enum.reduce(%{}, fn
+      {key, _value, _expire_at_ms, _lfu, file_id, offset, value_size}, acc
+      when is_binary(key) and valid_waraft_segment_location(file_id, offset, value_size) ->
+        Map.update(acc, file_id, [key], &[key | &1])
+
+      _entry, acc ->
+        acc
+    end)
+    |> Map.new(fn {file_id, reversed_keys} ->
+      keys = Enum.reverse(reversed_keys)
+      {file_id, physical_waraft_group_location(instance_ctx, shard_index, file_id, keys)}
+    end)
   end
 
   def read_cold_locations([], _shard_index, _instance_ctx), do: []
@@ -220,9 +259,8 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
   end
 
   defp read_physical_waraft_group(instance_ctx, shard_index, file_id, keys) do
-    with :ok <- ensure_waraft_group_durable(instance_ctx, shard_index, file_id, keys),
-         {:ok, physical_location} <-
-           WARaftSegmentReader.physical_location(instance_ctx, shard_index, file_id),
+    with {:ok, physical_location} <-
+           physical_waraft_group_location(instance_ctx, shard_index, file_id, keys),
          {:ok, values_by_key} <-
            WARaftSegmentReader.read_values_from_location(
              instance_ctx,
@@ -231,6 +269,14 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
              keys
            ) do
       {:ok, values_by_key, physical_location}
+    end
+  end
+
+  defp physical_waraft_group_location(instance_ctx, shard_index, file_id, keys) do
+    with :ok <- ensure_waraft_group_durable(instance_ctx, shard_index, file_id, keys),
+         {:ok, physical_location} <-
+           WARaftSegmentReader.physical_location(instance_ctx, shard_index, file_id) do
+      {:ok, physical_location}
     end
   end
 

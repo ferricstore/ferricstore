@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
   alias Ferricstore.Flow.HistoryProjector.Storage
   alias Ferricstore.Flow.{Keys, LMDB, Locator, StorageScope}
   alias Ferricstore.Flow.Query.QueryRowCodec
+  alias Ferricstore.Store.BlobRef
 
   test "loads history routing metadata directly from a query row" do
     shard_data_path =
@@ -59,6 +60,122 @@ defmodule Ferricstore.Flow.HistoryProjector.RecoveryTest do
 
     assert {:ok, %{history_hot_max_events: 123}} =
              Recovery.load_lmdb_history_state_record(state_key, shard_data_path)
+  end
+
+  test "loads routing metadata from LMDB for a WARaft-backed keydir row" do
+    {shard_data_path, state_key, record, locator} = query_row_fixture("waraft-keydir-row")
+    on_exit(fn -> File.rm_rf!(shard_data_path) end)
+    keydir = :ets.new(:history_recovery_waraft_keydir_row, [:set])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+    assert :ok = LMDB.write_batch(LMDB.path(shard_data_path), [{:put, state_key, query_row}])
+
+    true =
+      :ets.insert(
+        keydir,
+        {state_key, nil, 0, 0, locator.file_id, locator.offset, locator.value_size}
+      )
+
+    assert {:ok, %{history_hot_max_events: 123}} =
+             Recovery.load_history_state_record(state_key, keydir, shard_data_path)
+  end
+
+  test "loads routing metadata for a cached blob ref without opening the blob" do
+    {shard_data_path, state_key, record, locator} = query_row_fixture("blob-ref-keydir-row")
+    on_exit(fn -> File.rm_rf!(shard_data_path) end)
+    keydir = :ets.new(:history_recovery_blob_ref_keydir_row, [:set])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    encoded_ref =
+      BlobRef.encode!(%BlobRef{
+        checksum: locator.checksum,
+        size: 1_024,
+        segment_id: 7,
+        offset: 11
+      })
+
+    locator = Locator.relocate!(locator, value_size: byte_size(encoded_ref))
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+    assert :ok = LMDB.write_batch(LMDB.path(shard_data_path), [{:put, state_key, query_row}])
+
+    true =
+      :ets.insert(
+        keydir,
+        {state_key, encoded_ref, 0, 0, locator.file_id, locator.offset, locator.value_size}
+      )
+
+    assert {:ok, %{history_hot_max_events: 123}} =
+             Recovery.load_history_state_record(state_key, keydir, shard_data_path)
+  end
+
+  test "rejects stale LMDB routing metadata for an indirect keydir row" do
+    {shard_data_path, state_key, record, locator} = query_row_fixture("stale-query-row")
+    on_exit(fn -> File.rm_rf!(shard_data_path) end)
+    keydir = :ets.new(:history_recovery_stale_query_row, [:set])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+    assert :ok = LMDB.write_batch(LMDB.path(shard_data_path), [{:put, state_key, query_row}])
+
+    true =
+      :ets.insert(
+        keydir,
+        {state_key, nil, 0, 0, {:waraft_segment, 10}, locator.offset, locator.value_size}
+      )
+
+    assert {:error, :corrupt_history_query_row_location} =
+             Recovery.load_history_state_record(state_key, keydir, shard_data_path)
+  end
+
+  test "accepts relocated LMDB metadata from the same WARaft generation" do
+    {shard_data_path, state_key, record, source_locator} =
+      query_row_fixture("relocated-query-row")
+
+    on_exit(fn -> File.rm_rf!(shard_data_path) end)
+    keydir = :ets.new(:history_recovery_relocated_query_row, [:set])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    relocated =
+      Locator.relocate!(source_locator,
+        file_id: 22,
+        offset: 4_096,
+        frame_size: nil,
+        segment_generation: nil
+      )
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, relocated, 0)
+    assert :ok = LMDB.write_batch(LMDB.path(shard_data_path), [{:put, state_key, query_row}])
+
+    true =
+      :ets.insert(
+        keydir,
+        {state_key, nil, 0, 0, {:waraft_apply_projection, source_locator.raft_index}, 0,
+         source_locator.value_size}
+      )
+
+    assert {:ok, %{history_hot_max_events: 123}} =
+             Recovery.load_history_state_record(state_key, keydir, shard_data_path)
+  end
+
+  test "does not mask malformed inline state with valid LMDB metadata" do
+    {shard_data_path, state_key, record, locator} = query_row_fixture("malformed-inline-row")
+    on_exit(fn -> File.rm_rf!(shard_data_path) end)
+    keydir = :ets.new(:history_recovery_malformed_inline_row, [:set])
+    on_exit(fn -> if :ets.info(keydir) != :undefined, do: :ets.delete(keydir) end)
+
+    assert {:ok, query_row} = QueryRowCodec.encode(state_key, record, locator, 0)
+    assert :ok = LMDB.write_batch(LMDB.path(shard_data_path), [{:put, state_key, query_row}])
+
+    true =
+      :ets.insert(
+        keydir,
+        {state_key, "not-a-flow-record", 0, 0, locator.file_id, locator.offset,
+         locator.value_size}
+      )
+
+    assert {:error, :corrupt_history_state_record} =
+             Recovery.load_history_state_record(state_key, keydir, shard_data_path)
   end
 
   test "history entry recovery rejects corrupt query rows instead of applying the default cap" do

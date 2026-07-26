@@ -608,8 +608,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
         state_key = FlowKeys.state_key(id, partition_key)
         history_key = FlowKeys.history_key(id, partition_key)
 
-        with :ok <- Ferricstore.Flow.Query.QueryRowCodec.validate_record(state_key, record),
-             :ok <- flow_validate_key_size(state_key),
+        with :ok <- flow_validate_key_size(state_key),
              :ok <- flow_validate_key_size(history_key),
              :ok <-
                flow_validate_key_size(FlowKeys.state_index_key(type, flow_state, partition_key)),
@@ -626,8 +625,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
                  flow_validate_shared_value_ref_locality(
                    record,
                    flow_record_shared_value_refs(record)
-                 ) do
-            flow_validate_metadata_index_keys(record, partition_key)
+                 ),
+               :ok <- flow_validate_metadata_index_keys(record, partition_key) do
+            Ferricstore.Flow.Query.QueryRowCodec.validate_record(state_key, record)
           end
         end
       end
@@ -635,10 +635,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
       defp flow_validate_terminal_state_index_key(%{type: type, state: flow_state} = record) do
         partition_key = Map.get(record, :partition_key)
 
-        with :ok <- flow_validate_query_row(record) do
-          type
-          |> FlowKeys.state_index_key(flow_state, partition_key)
-          |> flow_validate_key_size()
+        with :ok <-
+               flow_validate_key_size(FlowKeys.state_index_key(type, flow_state, partition_key)) do
+          flow_validate_query_row(record)
         end
       end
 
@@ -647,11 +646,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
            ) do
         partition_key = Map.get(record, :partition_key)
 
-        with :ok <- flow_validate_query_row(record),
-             :ok <-
+        with :ok <-
                flow_validate_key_size(FlowKeys.state_index_key(type, flow_state, partition_key)),
-             :ok <- flow_validate_due_key(record, type, flow_state, priority, partition_key) do
-          flow_validate_running_index_keys(record, type, partition_key)
+             :ok <- flow_validate_due_key(record, type, flow_state, priority, partition_key),
+             :ok <- flow_validate_running_index_keys(record, type, partition_key) do
+          flow_validate_query_row(record)
         end
       end
 
@@ -908,6 +907,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowHistoryWrites do
 
       defp do_flow_read_lmdb_records(_ctx, _state, [], _now_ms, _opts, acc),
         do: acc |> Enum.reverse() |> List.flatten()
+
+      defp do_flow_read_lmdb_records(ctx, _state, keys, _now_ms, _opts, acc)
+           when not is_map(ctx) do
+        acc
+        |> Enum.reverse()
+        |> List.flatten()
+        |> Kernel.++(List.duplicate(:miss, length(keys)))
+      end
 
       defp do_flow_read_lmdb_records(ctx, state, keys, now_ms, opts, acc) do
         {batch, rest} = Enum.split(keys, @flow_lmdb_hydration_batch_size)

@@ -2,6 +2,10 @@ defmodule Ferricstore.Store.Router.BlobGC do
   @moduledoc false
 
   @blob_ref_encoded_size Ferricstore.Store.BlobRef.encoded_size()
+  @flow_lmdb_catalog_page_items 256
+  @flow_lmdb_page_bytes 16 * 1_024 * 1_024
+  @flow_lmdb_hydration_bytes 16 * 1_024 * 1_024
+  @flow_lmdb_max_hydration_bytes 1 * 1_024 * 1_024 * 1_024
 
   def sweep_blob_garbage(ctx) do
     initial = blob_gc_empty_stats()
@@ -301,80 +305,171 @@ defmodule Ferricstore.Store.Router.BlobGC do
   end
 
   defp blob_gc_flow_lmdb_live_refs(ctx, idx, now) do
-    blob_gc_scan_flow_lmdb_refs(
+    path =
       Ferricstore.Flow.LMDB.path(
         Ferricstore.DataDir.shard_data_path(
           ctx.data_dir,
           idx
         )
-      ),
+      )
+
+    blob_gc_scan_flow_lmdb_refs(
+      ctx,
+      idx,
+      path,
       "",
       MapSet.new(),
       now
     )
   end
 
-  defp blob_gc_scan_flow_lmdb_refs(path, after_key, refs, now) do
-    page_size = blob_gc_flow_lmdb_page_size()
+  defp blob_gc_scan_flow_lmdb_refs(ctx, idx, path, cursor, refs, now) do
+    case Ferricstore.Flow.Query.SourceCatalog.page(
+           path,
+           cursor,
+           @flow_lmdb_catalog_page_items,
+           @flow_lmdb_page_bytes
+         ) do
+      {:ok, %{done?: false, state_keys: []}} ->
+        {:error, :blob_gc_flow_lmdb_catalog_made_no_progress}
 
-    case Ferricstore.Flow.LMDB.prefix_entries_after(path, "f:", after_key, page_size) do
-      {:ok, []} ->
-        {:ok, refs}
-
-      {:ok, entries} ->
-        with {:ok, refs} <- blob_gc_collect_lmdb_value_refs(entries, refs, now) do
-          {last_key, _} = List.last(entries)
-
-          case (case :erlang.<(:erlang.length(entries), page_size) do
-                  false -> :erlang.==(last_key, after_key)
-                  true -> true
-                end) do
-            false -> blob_gc_scan_flow_lmdb_refs(path, last_key, refs, now)
-            true -> {:ok, refs}
+      {:ok, page} ->
+        with {:ok, refs} <-
+               blob_gc_collect_lmdb_value_refs(ctx, idx, path, page.state_keys, refs, now) do
+          if page.done? do
+            {:ok, refs}
+          else
+            blob_gc_scan_flow_lmdb_refs(ctx, idx, path, page.cursor, refs, now)
           end
         end
 
       {:error, reason} ->
-        {:error, {:blob_gc_flow_lmdb_scan_failed, reason}}
+        {:error, {:blob_gc_flow_lmdb_catalog_failed, reason}}
     end
   end
 
-  defp blob_gc_collect_lmdb_value_refs(entries, refs, now) do
-    Enum.reduce_while(entries, {:ok, refs}, fn {key, blob}, {:ok, refs} ->
-      case blob_gc_lmdb_value_ref(blob, now) do
-        {:ok, nil} -> {:cont, {:ok, refs}}
-        {:ok, %Ferricstore.Store.BlobRef{} = ref} -> {:cont, {:ok, MapSet.put(refs, ref)}}
-        {:error, reason} -> {:halt, {:error, {:blob_gc_flow_lmdb_ref_decode_failed, key, reason}}}
-      end
-    end)
-  end
+  defp blob_gc_collect_lmdb_value_refs(_ctx, _idx, _path, [], refs, _now), do: {:ok, refs}
 
-  defp blob_gc_lmdb_value_ref(blob, now) do
-    case Ferricstore.Flow.LMDB.decode_value_locator(blob, now) do
-      {:ok, _locator} ->
-        {:ok, nil}
-
-      :expired ->
-        {:ok, nil}
-
-      :not_locator ->
-        case Ferricstore.Flow.LMDB.decode_value(blob, now) do
-          {:ok, value} -> blob_gc_decode_ref(value)
-          :expired -> {:ok, nil}
-          :error -> {:error, :invalid_value_wrapper}
+  defp blob_gc_collect_lmdb_value_refs(ctx, idx, path, state_keys, refs, now) do
+    case Ferricstore.Flow.LMDB.get_many_bounded(path, state_keys, @flow_lmdb_page_bytes) do
+      {:ok, values, _value_bytes} when length(values) == length(state_keys) ->
+        with {:ok, requests} <- blob_gc_lmdb_hydration_requests(state_keys, values, now, []),
+             {:ok, stored_values} <- blob_gc_read_storage_refs(ctx, idx, requests),
+             {:ok, refs} <- blob_gc_collect_storage_refs(requests, stored_values, refs) do
+          {:ok, refs}
         end
 
-      :error ->
-        {:error, :invalid_value_locator}
+      {:ok, values, _value_bytes} ->
+        {:error, {:blob_gc_flow_lmdb_row_count_mismatch, length(state_keys), length(values)}}
+
+      {:error, reason} ->
+        {:error, {:blob_gc_flow_lmdb_row_read_failed, reason}}
+
+      invalid ->
+        {:error, {:blob_gc_flow_lmdb_invalid_row_read, invalid}}
     end
   end
 
-  defp blob_gc_flow_lmdb_page_size() do
-    case Application.get_env(:ferricstore, :blob_gc_flow_lmdb_page_size, 1024) do
-      value when :erlang.andalso(:erlang.is_integer(value), :erlang.>(value, 0)) -> value
-      _ -> 1024
+  defp blob_gc_lmdb_hydration_requests([], [], _now, acc),
+    do: {:ok, Enum.reverse(acc)}
+
+  defp blob_gc_lmdb_hydration_requests(
+         [_state_key | state_keys],
+         [:not_found | values],
+         now,
+         acc
+       ),
+       do: blob_gc_lmdb_hydration_requests(state_keys, values, now, acc)
+
+  defp blob_gc_lmdb_hydration_requests(
+         [state_key | state_keys],
+         [{:ok, encoded} | values],
+         now,
+         acc
+       )
+       when is_binary(encoded) do
+    case Ferricstore.Flow.Query.QueryRowCodec.decode_reference(encoded, state_key, now) do
+      {:ok, %Ferricstore.Flow.Query.QueryRowReference{locator: locator}} ->
+        blob_gc_lmdb_hydration_requests(state_keys, values, now, [
+          {state_key, locator} | acc
+        ])
+
+      :expired ->
+        blob_gc_lmdb_hydration_requests(state_keys, values, now, acc)
+
+      :error ->
+        {:error, {:blob_gc_flow_lmdb_invalid_query_row, state_key}}
     end
   end
+
+  defp blob_gc_lmdb_hydration_requests(_state_keys, _values, _now, _acc),
+    do: {:error, :blob_gc_flow_lmdb_invalid_query_row_batch}
+
+  defp blob_gc_read_storage_refs(_ctx, _idx, []), do: {:ok, []}
+
+  defp blob_gc_read_storage_refs(ctx, idx, requests) do
+    max_bytes = blob_gc_storage_ref_budget(requests)
+
+    case Ferricstore.Flow.RecordHydrator.read_storage_refs_many(ctx, idx, requests,
+           max_bytes: max_bytes
+         ) do
+      {:error, :hydration_byte_budget_exceeded} when length(requests) > 1 ->
+        {left, right} = Enum.split(requests, div(length(requests), 2))
+
+        with {:ok, left_values} <- blob_gc_read_storage_refs(ctx, idx, left),
+             {:ok, right_values} <- blob_gc_read_storage_refs(ctx, idx, right) do
+          {:ok, left_values ++ right_values}
+        end
+
+      {:ok, values} when length(values) == length(requests) ->
+        {:ok, values}
+
+      {:ok, values} ->
+        {:error, {:blob_gc_flow_lmdb_hydration_count_mismatch, length(requests), length(values)}}
+
+      {:error, reason} ->
+        {:error, {:blob_gc_flow_lmdb_hydration_failed, reason}}
+
+      invalid ->
+        {:error, {:blob_gc_flow_lmdb_invalid_hydration, invalid}}
+    end
+  end
+
+  defp blob_gc_storage_ref_budget([{_state_key, %{value_size: value_size}}])
+       when is_integer(value_size) and value_size > @flow_lmdb_hydration_bytes and
+              value_size <= @flow_lmdb_max_hydration_bytes,
+       do: value_size
+
+  defp blob_gc_storage_ref_budget(_requests), do: @flow_lmdb_hydration_bytes
+
+  defp blob_gc_collect_storage_refs([], [], refs), do: {:ok, refs}
+
+  defp blob_gc_collect_storage_refs(
+         [{state_key, _locator} | requests],
+         [stored | values],
+         refs
+       )
+       when is_binary(stored) do
+    case Ferricstore.Store.BlobRef.decode(stored) do
+      {:ok, %Ferricstore.Store.BlobRef{} = ref} ->
+        blob_gc_collect_storage_refs(requests, values, MapSet.put(refs, ref))
+
+      :error ->
+        blob_gc_collect_storage_refs(requests, values, refs)
+    end
+  rescue
+    _error -> {:error, {:blob_gc_flow_lmdb_invalid_storage_ref, state_key}}
+  end
+
+  defp blob_gc_collect_storage_refs(
+         [{state_key, _locator} | _requests],
+         [nil | _values],
+         _refs
+       ),
+       do: {:error, {:blob_gc_flow_lmdb_hydration_missing, state_key}}
+
+  defp blob_gc_collect_storage_refs(_requests, _values, _refs),
+    do: {:error, :blob_gc_flow_lmdb_invalid_storage_ref_batch}
 
   defp blob_gc_entry_ref(ctx, idx, state, {key, value, exp, lfu, fid, off, size}, now)
        when :erlang.andalso(

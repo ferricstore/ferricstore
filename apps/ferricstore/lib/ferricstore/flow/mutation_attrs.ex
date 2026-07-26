@@ -1238,7 +1238,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
         lease_deadline_ms: 0,
         attempts: 0,
         run_state: Map.get(attrs, :run_state),
-        max_active_ms: Map.get(attrs, :max_active_ms),
+        max_active_ms: RetryPolicy.resolve_max_active_ms(%{}, Map.get(attrs, :max_active_ms)),
         state_enter_seq: 0,
         history_max_events: 0,
         history_hot_max_events: 0,

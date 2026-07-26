@@ -1,7 +1,7 @@
 defmodule Ferricstore.Raft.WARaftStorage.ApplyProjectionRetention do
   @moduledoc false
 
-  alias Ferricstore.Flow.LMDB
+  alias Ferricstore.{Flow.LMDB, FS}
 
   @entry_prefix <<0, "fapr:1:">>
   @format_version 1
@@ -183,7 +183,7 @@ defmodule Ferricstore.Raft.WARaftStorage.ApplyProjectionRetention do
   @spec cleanup(t()) :: :ok | {:error, term()}
   def cleanup(%__MODULE__{path: path}) do
     with :ok <- release_if_present(path),
-         {:ok, _removed} <- File.rm_rf(path) do
+         :ok <- FS.rm_rf(path) do
       :ok
     else
       {:error, reason} -> {:error, {:cleanup_apply_projection_retention_failed, reason}}
@@ -569,9 +569,9 @@ defmodule Ferricstore.Raft.WARaftStorage.ApplyProjectionRetention do
   end
 
   defp prepare_path(root, path) do
-    with :ok <- File.mkdir_p(root),
+    with :ok <- FS.mkdir_p(root),
          :ok <- release_if_present(path),
-         {:ok, _removed} <- File.rm_rf(path) do
+         :ok <- FS.rm_rf(path) do
       :ok
     else
       {:error, reason} -> {:error, {:prepare_apply_projection_retention_failed, reason}}
@@ -579,6 +579,6 @@ defmodule Ferricstore.Raft.WARaftStorage.ApplyProjectionRetention do
   end
 
   defp release_if_present(path) do
-    if File.exists?(path), do: LMDB.release(path, @release_timeout_ms), else: :ok
+    if FS.exists?(path), do: LMDB.release(path, @release_timeout_ms), else: :ok
   end
 end
