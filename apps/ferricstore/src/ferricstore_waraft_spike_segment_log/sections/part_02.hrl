@@ -537,8 +537,12 @@ acquire_record_group_file_direct(Dir, Path) ->
     Key = writer_key(Path),
     WriterDir = writer_dir_from_dir(Dir),
     case writer_registry_lookup(Registry, Key) of
-        [{Key, WriterDir, file_fd, Fd, Position}] when is_integer(Position), Position >= 0 ->
-            {ok, Fd, Position, false};
+        [{Key, WriterDir, file_fd, Fd, CachedPosition}]
+          when is_integer(CachedPosition), CachedPosition >= 0 ->
+            case current_record_group_position(Dir, Fd, CachedPosition) of
+                {ok, Position} -> {ok, Fd, Position, false};
+                {error, _Reason} = Error -> Error
+            end;
         [{Key, _Dir, Kind, Handle, _Position}] ->
             case close_writer_entry(Key, Kind, Handle) of
                 ok -> open_record_group_file_fd(Registry, Key, WriterDir, Path);
@@ -551,6 +555,17 @@ acquire_record_group_file_direct(Dir, Path) ->
             end;
         [] ->
             open_record_group_file_fd(Registry, Key, WriterDir, Path)
+    end.
+
+current_record_group_position(Dir, Fd, CachedPosition) ->
+    case segment_append_kind(Dir) of
+        Kind when Kind =:= apply_projection; Kind =:= segment_projection ->
+            case file:position(Fd, eof) of
+                {ok, Position} when is_integer(Position), Position >= 0 -> {ok, Position};
+                {error, Reason} -> {error, {position_projection_eof, Reason}}
+            end;
+        raft_log ->
+            {ok, CachedPosition}
     end.
 
 writer_registry_lookup(Registry, Key) ->

@@ -93,4 +93,38 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdStateTest do
 
     assert WARaftSegmentReader.apply_projection_cache_count(data_dir, 0) == 0
   end
+
+  test "metadata-only cleanup decodes a hot WARaft row without physical context" do
+    state_key = Keys.state_key("hot-waraft-metadata-only")
+
+    record = %{
+      id: "hot-waraft-metadata-only",
+      type: "job",
+      state: "completed",
+      version: 2,
+      attempts: 1,
+      fencing_token: 1,
+      created_at_ms: 1,
+      updated_at_ms: 2,
+      next_run_at_ms: 0,
+      priority: 0,
+      partition_key: nil,
+      root_flow_id: "hot-waraft-metadata-only"
+    }
+
+    encoded = Ferricstore.Flow.encode_record(record)
+
+    entry =
+      {state_key, encoded, 0, LFU.initial(), {:waraft_apply_projection, 17}, 0,
+       byte_size(encoded)}
+
+    Process.put(:flow_lmdb_rebuild_cold_read_errors, 0)
+    on_exit(fn -> Process.delete(:flow_lmdb_rebuild_cold_read_errors) end)
+
+    assert [{^state_key, ^encoded, 0, rebuilt, %Locator{}}] =
+             ColdState.read_and_decode([entry], System.tmp_dir!())
+
+    assert rebuilt.id == record.id
+    assert Process.get(:flow_lmdb_rebuild_cold_read_errors) == 0
+  end
 end

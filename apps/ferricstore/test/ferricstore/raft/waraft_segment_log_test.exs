@@ -136,6 +136,64 @@ defmodule Ferricstore.Raft.WARaftSegmentLogTest do
     {:ok, Enum.reverse(entries)}
   end
 
+  test "apply projection offsets survive alternating writer processes" do
+    root =
+      Path.join([
+        System.tmp_dir!(),
+        "ferricstore-waraft-segment-alternating-writers-#{System.unique_integer([:positive])}",
+        "apply_projection_log"
+      ])
+
+    on_exit(fn -> File.rm_rf!(Path.dirname(root)) end)
+
+    writer = spawn_link(fn -> projection_writer_loop(root) end)
+    on_exit(fn -> if Process.alive?(writer), do: Process.exit(writer, :kill) end)
+
+    ref = make_ref()
+    send(writer, {:write, self(), ref, 41, "first"})
+    assert_receive {^ref, 41, :ok}, 1_000
+
+    assert :ok = write_apply_projection(root, 42, "second")
+
+    send(writer, {:write, self(), ref, 43, "third"})
+    assert_receive {^ref, 43, :ok}, 1_000
+
+    assert {:ok, {_ordinal, offset, encoded_size}} =
+             :ferricstore_waraft_spike_segment_log.location_for_index(
+               to_charlist(root),
+               43
+             )
+
+    assert {:ok, {0, {:ferricstore_segment_apply_projection_batch, _, [{"key-43", "third", 0}]}}} =
+             :ferricstore_waraft_spike_segment_log.read_disk_at(
+               to_charlist(root),
+               43,
+               offset,
+               encoded_size
+             )
+
+    send(writer, :stop)
+  end
+
+  defp projection_writer_loop(root) do
+    receive do
+      {:write, reply_to, ref, index, value} ->
+        result = write_apply_projection(root, index, value)
+        send(reply_to, {ref, index, result})
+        projection_writer_loop(root)
+
+      :stop ->
+        :ok
+    end
+  end
+
+  defp write_apply_projection(root, index, value) do
+    :ferricstore_waraft_spike_segment_log.write_projection_batches_sync(
+      to_charlist(root),
+      [{{:raft_log_pos, index, 0}, [{"key-#{index}", value, 0}]}]
+    )
+  end
+
   test "validated disk reader reuses one segment handle for known locations" do
     root =
       Path.join(

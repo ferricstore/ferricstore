@@ -76,7 +76,12 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   ]
   @builtin_encoding_fields @builtin_storage_fields -- [:id, :version]
   @valid_builtin_bitmap (1 <<< length(@builtin_encoding_fields)) - 1
-  @internal_storage_fields [:state_enter_seq, :history_max_events, :history_hot_max_events]
+  @internal_storage_fields [
+    :state_enter_seq,
+    :history_max_events,
+    :history_hot_max_events,
+    :lease_owner
+  ]
   @valid_internal_flags (1 <<< length(@internal_storage_fields)) - 1
 
   @spec max_encoded_bytes() :: pos_integer()
@@ -628,17 +633,14 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
         nil ->
           {:cont, {flags, values}}
 
-        value when is_integer(value) and value >= 0 and value <= @max_u64 ->
-          case QueryRowPrimitives.encode_u64(value) do
+        value ->
+          case encode_internal_field(field, value) do
             {:ok, encoded} ->
               {:cont, {flags ||| 1 <<< index, [encoded | values]}}
 
             :error ->
               {:halt, :error}
           end
-
-        _invalid ->
-          {:halt, :error}
       end
     end)
     |> case do
@@ -655,7 +657,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
       if (flags &&& 1 <<< index) == 0 do
         {:cont, {:ok, acc, rest}}
       else
-        case QueryRowPrimitives.decode_u64(rest) do
+        case decode_internal_field(field, rest) do
           {:ok, value, tail} ->
             {:cont, {:ok, Map.put(acc, field, value), tail}}
 
@@ -671,6 +673,31 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   end
 
   defp decode_internal_fields(_encoded), do: :error
+
+  defp encode_internal_field(:lease_owner, value) when is_binary(value) do
+    case QueryRowPrimitives.encode(value, @maximum_encoded_bytes, false) do
+      {:ok, encoded, _semantic_bytes} -> {:ok, encoded}
+      :error -> :error
+    end
+  end
+
+  defp encode_internal_field(field, value)
+       when field in [:state_enter_seq, :history_max_events, :history_hot_max_events] and
+              is_integer(value) and value >= 0 and value <= @max_u64,
+       do: QueryRowPrimitives.encode_u64(value)
+
+  defp encode_internal_field(_field, _value), do: :error
+
+  defp decode_internal_field(:lease_owner, encoded) do
+    case QueryRowPrimitives.decode(encoded, @maximum_encoded_bytes, false) do
+      {:ok, value, rest, _semantic_bytes} when is_binary(value) -> {:ok, value, rest}
+      _invalid -> :error
+    end
+  end
+
+  defp decode_internal_field(field, encoded)
+       when field in [:state_enter_seq, :history_max_events, :history_hot_max_events],
+       do: QueryRowPrimitives.decode_u64(encoded)
 
   defp compact_builtin_record(record) do
     builtin_record = Map.take(record, @builtin_storage_fields)

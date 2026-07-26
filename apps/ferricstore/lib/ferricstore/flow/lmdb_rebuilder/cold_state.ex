@@ -70,6 +70,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ColdState do
     end)
   end
 
+  defp hot_waraft_physical_locations(_entries, shard_index, instance_ctx)
+       when not is_map(instance_ctx) or not is_integer(shard_index) or shard_index < 0,
+       do: %{}
+
   defp hot_waraft_physical_locations(entries, shard_index, instance_ctx) do
     entries
     |> Enum.reduce(%{}, fn

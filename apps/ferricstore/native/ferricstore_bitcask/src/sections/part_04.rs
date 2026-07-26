@@ -871,6 +871,79 @@ fn lmdb_prefix_entries_after_bounded<'a>(
 
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value)]
+fn lmdb_prefix_keys_after_bounded<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    after_key: Binary<'a>,
+    max_items: u64,
+    max_bytes: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    match lmdb_store(&path, map_size) {
+        Ok(store) => {
+            let rtxn = match store.env.read_txn() {
+                Ok(txn) => txn,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            let item_cap = usize::try_from(max_items).unwrap_or(usize::MAX);
+            let byte_cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let mut keys = Vec::with_capacity(lmdb_page_capacity(item_cap, byte_cap));
+            let mut key_bytes = 0usize;
+
+            if item_cap == 0 {
+                return Ok((atoms::ok(), keys).encode(env));
+            }
+
+            let start = if after_key.as_slice().is_empty() {
+                std::ops::Bound::Included(prefix.as_slice())
+            } else {
+                std::ops::Bound::Excluded(after_key.as_slice())
+            };
+            let iter = match store
+                .db
+                .range(&rtxn, &(start, std::ops::Bound::<&[u8]>::Unbounded))
+            {
+                Ok(iter) => iter,
+                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+            };
+
+            for item in iter {
+                if keys.len() >= item_cap {
+                    break;
+                }
+
+                let (key, _value) = match item {
+                    Ok(entry) => entry,
+                    Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                };
+
+                if !key.starts_with(prefix.as_slice()) {
+                    break;
+                }
+
+                if key.len() > byte_cap && keys.is_empty() {
+                    return Ok((atoms::error(), atoms::range_entry_too_large()).encode(env));
+                }
+
+                let next_bytes = key_bytes.saturating_add(key.len());
+                if next_bytes > byte_cap {
+                    break;
+                }
+
+                keys.push(binary_term(env, key)?.encode(env));
+                key_bytes = next_bytes;
+            }
+
+            Ok((atoms::ok(), keys).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
 fn lmdb_range_entries_bounded<'a>(
     env: Env<'a>,
     path: String,

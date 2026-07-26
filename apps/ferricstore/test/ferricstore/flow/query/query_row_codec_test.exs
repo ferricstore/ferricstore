@@ -24,6 +24,23 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
     assert decoded == record
   end
 
+  test "round trips the worker identity required to rebuild running active indexes" do
+    record =
+      record()
+      |> Map.merge(%{
+        state: "running",
+        run_state: "queued",
+        lease_owner: "worker-1",
+        lease_deadline_ms: 450
+      })
+
+    assert {:ok, encoded} = QueryRowCodec.encode(@state_key, record, locator(), 0)
+    assert {:ok, %{record: decoded}} = QueryRowCodec.decode(encoded, @state_key)
+
+    assert decoded.lease_owner == "worker-1"
+    assert LMDB.active_projection_entries(decoded) == LMDB.active_projection_entries(record)
+  end
+
   test "preserves missing, null, scalar, and multivalue metadata distinctly" do
     record =
       record()

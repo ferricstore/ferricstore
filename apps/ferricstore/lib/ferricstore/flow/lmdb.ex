@@ -445,6 +445,24 @@ defmodule Ferricstore.Flow.LMDB do
     end
   end
 
+  def prefix_keys_after_bounded(path, prefix, after_key, max_items, max_bytes)
+      when is_binary(path) and is_binary(prefix) and is_binary(after_key) and
+             is_integer(max_items) and max_items >= 0 and is_integer(max_bytes) and
+             max_bytes >= 0 do
+    if Ferricstore.FS.dir?(path) do
+      NIF.lmdb_prefix_keys_after_bounded(
+        path,
+        prefix,
+        after_key,
+        max_items,
+        max_bytes,
+        map_size()
+      )
+    else
+      {:ok, []}
+    end
+  end
+
   def range_entries_bounded(path, prefix, after_key, before_key, max_items, max_bytes)
       when is_binary(path) and is_binary(prefix) and prefix != "" and is_binary(after_key) and
              is_binary(before_key) and is_integer(max_items) and max_items > 0 and

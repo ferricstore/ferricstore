@@ -67,12 +67,14 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
                       {:waraft_apply_projection, ^applied_index}, _offset, _value_size}
                    ] = :ets.lookup(elem(restarted_ctx.keydir_refs, 0), key)
 
-            assert apply_projection_cache_contains?(
-                     root,
-                     0,
-                     applied_index,
-                     key
-                   )
+            assert {:ok, {_ordinal, _offset, frame_size}} =
+                     Ferricstore.Raft.WARaftSegmentReader.physical_location(
+                       restarted_ctx,
+                       0,
+                       {:waraft_apply_projection, applied_index}
+                     )
+
+            assert frame_size >= 8
 
             assert {:ok, recovered_value} =
                      Ferricstore.Raft.WARaftSegmentReader.read_value_from_location(

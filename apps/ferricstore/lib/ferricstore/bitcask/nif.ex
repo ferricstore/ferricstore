@@ -761,6 +761,25 @@ defmodule Ferricstore.Bitcask.NIF do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_prefix_keys_after_bounded(
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, [binary()]} | {:error, term()}
+  def lmdb_prefix_keys_after_bounded(
+        _path,
+        _prefix,
+        _after_key,
+        _max_items,
+        _max_bytes,
+        _map_size
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_range_entries_bounded(
           binary(),
           binary(),

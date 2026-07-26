@@ -51,6 +51,23 @@ defmodule Ferricstore.Flow.LMDBBoundedRangeTest do
              LMDB.range_entries_bounded(path, "idx:a:", "", "", 10, 9)
   end
 
+  test "pages prefix keys without materializing their values", %{path: path} do
+    assert :ok =
+             LMDB.write_batch(path, [
+               {:put, "flow:1", String.duplicate("x", 1_000_000)},
+               {:put, "flow:2", String.duplicate("y", 1_000_000)}
+             ])
+
+    assert {:ok, ["flow:1"]} =
+             LMDB.prefix_keys_after_bounded(path, "flow:", "", 1, 16)
+
+    assert {:ok, ["flow:2"]} =
+             LMDB.prefix_keys_after_bounded(path, "flow:", "flow:1", 1, 16)
+
+    assert {:ok, []} =
+             LMDB.prefix_keys_after_bounded(path, "flow:", "flow:2", 1, 16)
+  end
+
   test "rejects cursors and bounds outside the requested prefix", %{path: path} do
     assert {:error, :invalid_lmdb_range} =
              LMDB.range_entries_bounded(path, "idx:a:", "idx:b:1", "", 10, 100)

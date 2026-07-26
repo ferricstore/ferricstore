@@ -409,6 +409,73 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.WarmOpensEmptyShardEnvBeforeFirstUs
         assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [ref])
       end
 
+      test "blob garbage sweep follows Flow value locators projected only in LMDB" do
+        ctx =
+          Ferricstore.Test.IsolatedInstance.checkout(
+            shard_count: 1,
+            blob_side_channel_threshold_bytes: 128
+          )
+
+        Process.put(:ferricstore_blob_store_segment_gc_grace_ms, 0)
+
+        on_exit(fn ->
+          Process.delete(:ferricstore_blob_store_segment_gc_grace_ms)
+          Ferricstore.Test.IsolatedInstance.checkin(ctx)
+        end)
+
+        ref =
+          Ferricstore.Flow.Keys.value_key(
+            "flow-lmdb-locator-blob-gc",
+            :payload,
+            1,
+            "lmdb-locator-blob-gc"
+          )
+
+        payload = String.duplicate("locator-payload-", 48)
+        encoded_payload = Ferricstore.Flow.encode_value(payload)
+
+        assert {:ok, blob_ref} = Ferricstore.Store.BlobStore.put(ctx.data_dir, 0, encoded_payload)
+        encoded_blob_ref = Ferricstore.Store.BlobRef.encode!(blob_ref)
+
+        assert {:ok, {path, _offset, _size}} =
+                 Ferricstore.Store.BlobStore.file_ref(ctx.data_dir, 0, blob_ref)
+
+        shard_data_path =
+          ctx.data_dir
+          |> Ferricstore.DataDir.shard_data_path(0)
+
+        history_path = Ferricstore.Flow.HistoryProjector.history_file_path(shard_data_path, 0)
+        File.mkdir_p!(Path.dirname(history_path))
+
+        assert {:ok, [{offset, value_size}]} =
+                 Ferricstore.Flow.HistoryProjector.append_batch(history_path, [
+                   {ref, encoded_blob_ref, 0}
+                 ])
+
+        assert :ok =
+                 Ferricstore.Flow.HistoryProjector.sync_history_log_before_publish(history_path)
+
+        lmdb_path = Ferricstore.Flow.LMDB.path(shard_data_path)
+
+        assert :ok =
+                 Ferricstore.Flow.LMDB.write_batch(lmdb_path, [
+                   {:put, ref,
+                    Ferricstore.Flow.LMDB.encode_value_locator(
+                      0,
+                      {:flow_history, 0},
+                      offset,
+                      value_size
+                    )}
+                 ])
+
+        assert [] = :ets.lookup(elem(ctx.keydir_refs, 0), ref)
+        assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [ref])
+
+        assert {:ok, %{deleted_files: 0}} = Ferricstore.Store.Router.sweep_blob_garbage(ctx)
+        assert File.exists?(path)
+        assert {:ok, [^payload]} = Ferricstore.Flow.value_mget(ctx, [ref])
+      end
+
       test "value_mget batches LMDB locators that point to the same WARaft apply projection" do
         ctx = Ferricstore.Test.IsolatedInstance.checkout(shard_count: 1)
 
