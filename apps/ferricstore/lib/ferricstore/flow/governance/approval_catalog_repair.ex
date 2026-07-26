@@ -92,31 +92,44 @@ defmodule Ferricstore.Flow.Governance.ApprovalCatalogRepair do
   end
 
   defp reconcile_source(ctx, keys, source_targets) do
-    Enum.reduce_while(keys, {:ok, nil}, fn key, {:ok, last_retained} ->
-      {operation, next_last_retained} =
-        case source_targets.(key) do
-          {:ok, catalog_keys} when is_list(catalog_keys) ->
-            {ensure_catalogs_present(ctx, key, catalog_keys), key}
+    source_catalog_key = Keys.governance_catalog_key(:approval)
 
-          :missing ->
-            {Catalog.unregister_key(ctx, Keys.governance_catalog_key(:approval), key),
-             last_retained}
+    keys
+    |> Enum.reduce_while({:ok, nil, []}, fn key, {:ok, last_retained, missing_keys} ->
+      case source_targets.(key) do
+        {:ok, catalog_keys} when is_list(catalog_keys) ->
+          case ensure_catalogs_present(ctx, key, catalog_keys) do
+            :ok -> {:cont, {:ok, key, missing_keys}}
+            {:error, _reason} = error -> {:halt, error}
+          end
 
-          :skip ->
-            {:ok, key}
+        :missing ->
+          {:cont, {:ok, last_retained, [key | missing_keys]}}
 
-          {:error, _reason} = error ->
-            {error, last_retained}
+        :skip ->
+          {:cont, {:ok, key, missing_keys}}
 
-          _invalid ->
-            {{:error, "ERR flow approval catalog repair source is invalid"}, last_retained}
-        end
+        {:error, _reason} = error ->
+          {:halt, error}
 
-      case operation do
-        :ok -> {:cont, {:ok, next_last_retained}}
-        {:error, _reason} = error -> {:halt, error}
+        _invalid ->
+          {:halt, {:error, "ERR flow approval catalog repair source is invalid"}}
       end
     end)
+    |> case do
+      {:ok, last_retained, missing_keys} ->
+        missing_keys = Enum.reverse(missing_keys)
+
+        revalidate = &revalidate_source_membership(ctx, &1, source_targets)
+
+        with :ok <-
+               batch_remove_and_revalidate(ctx, source_catalog_key, missing_keys, revalidate) do
+          {:ok, last_retained}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp ensure_catalogs_present(ctx, key, catalog_keys) do
@@ -132,25 +145,97 @@ defmodule Ferricstore.Flow.Governance.ApprovalCatalogRepair do
     end)
   end
 
-  defp reconcile_target(_ctx, _target_catalog_key, [], _matcher, last_retained),
-    do: {:ok, last_retained}
+  defp reconcile_target(ctx, target_catalog_key, keys, matcher, last_retained) do
+    keys
+    |> Enum.reduce_while({:ok, last_retained, []}, fn key, {:ok, current_last, stale_keys} ->
+      case matcher.(key) do
+        true ->
+          {:cont, {:ok, key, stale_keys}}
 
-  defp reconcile_target(ctx, target_catalog_key, [key | rest], matcher, last_retained) do
-    case matcher.(key) do
-      true ->
-        reconcile_target(ctx, target_catalog_key, rest, matcher, key)
+        false ->
+          {:cont, {:ok, current_last, [key | stale_keys]}}
 
-      false ->
-        case Catalog.unregister_key(ctx, target_catalog_key, key) do
-          :ok -> reconcile_target(ctx, target_catalog_key, rest, matcher, last_retained)
+        {:error, _reason} = error ->
+          {:halt, error}
+
+        _invalid ->
+          {:halt, {:error, "ERR flow approval catalog repair matcher is invalid"}}
+      end
+    end)
+    |> case do
+      {:ok, next_last_retained, stale_keys} ->
+        stale_keys = Enum.reverse(stale_keys)
+
+        revalidate = &revalidate_target_membership(&1, matcher)
+
+        with :ok <-
+               batch_remove_and_revalidate(ctx, target_catalog_key, stale_keys, revalidate) do
+          {:ok, next_last_retained}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp batch_remove_and_revalidate(ctx, catalog_key, keys, revalidate) do
+    with :ok <- Catalog.unregister_keys(ctx, catalog_key, keys) do
+      Enum.reduce_while(keys, :ok, fn key, :ok ->
+        operation =
+          case revalidate.(key) do
+            :stale ->
+              :ok
+
+            :restore ->
+              Catalog.register_key(ctx, catalog_key, key)
+
+            {:error, _reason} = error ->
+              restore_membership_before_error(ctx, catalog_key, key, error)
+          end
+
+        case operation do
+          :ok -> {:cont, :ok}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  defp revalidate_source_membership(ctx, key, source_targets) do
+    case source_targets.(key) do
+      :missing ->
+        :stale
+
+      {:ok, catalog_keys} when is_list(catalog_keys) ->
+        case ensure_catalogs_present(ctx, key, catalog_keys) do
+          :ok -> :restore
           {:error, _reason} = error -> error
         end
+
+      :skip ->
+        :restore
 
       {:error, _reason} = error ->
         error
 
       _invalid ->
-        {:error, "ERR flow approval catalog repair matcher is invalid"}
+        {:error, "ERR flow approval catalog repair source is invalid"}
+    end
+  end
+
+  defp revalidate_target_membership(key, matcher) do
+    case matcher.(key) do
+      true -> :restore
+      false -> :stale
+      {:error, _reason} = error -> error
+      _invalid -> {:error, "ERR flow approval catalog repair matcher is invalid"}
+    end
+  end
+
+  defp restore_membership_before_error(ctx, catalog_key, key, error) do
+    case Catalog.register_key(ctx, catalog_key, key) do
+      :ok -> error
+      {:error, _reason} = restore_error -> restore_error
     end
   end
 

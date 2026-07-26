@@ -43,7 +43,26 @@ defmodule Ferricstore.Flow.Governance.Catalog do
 
   def unregister_key(ctx, catalog_key, record_key)
       when is_binary(catalog_key) and is_binary(record_key) do
-    case FerricStore.Impl.zrem(ctx, catalog_key, [record_key]) do
+    unregister_keys(ctx, catalog_key, [record_key])
+  end
+
+  def unregister_keys(ctx, catalog_key, record_keys)
+      when is_binary(catalog_key) and is_list(record_keys) and
+             length(record_keys) <= @page_size do
+    if Enum.all?(record_keys, &is_binary/1) do
+      do_unregister_keys(ctx, catalog_key, Enum.uniq(record_keys))
+    else
+      {:error, "ERR invalid flow governance catalog unregistration"}
+    end
+  end
+
+  def unregister_keys(_ctx, _catalog_key, _record_keys),
+    do: {:error, "ERR invalid flow governance catalog unregistration"}
+
+  defp do_unregister_keys(_ctx, _catalog_key, []), do: :ok
+
+  defp do_unregister_keys(ctx, catalog_key, record_keys) do
+    case FerricStore.Impl.zrem(ctx, catalog_key, record_keys) do
       {:ok, _removed} -> :ok
       {:error, _reason} = error -> error
     end

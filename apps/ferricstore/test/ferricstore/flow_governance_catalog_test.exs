@@ -395,13 +395,11 @@ defmodule Ferricstore.FlowGovernanceCatalogTest do
 
     assert added == length(dummy_keys)
 
-    first_caller = Task.async(fn -> FerricStore.flow_approval_list(scope: scope) end)
-    assert Task.await(first_caller) == {:ok, []}
+    assert FerricStore.flow_approval_list(scope: scope) == {:ok, []}
     assert is_binary(Ferricstore.Store.Router.get(ctx, progress_key))
     assert {:ok, 1} = FerricStore.Impl.zcard(ctx, target_catalog)
 
-    second_caller = Task.async(fn -> FerricStore.flow_approval_list(scope: scope) end)
-    assert {:ok, [%{id: ^approval_id}]} = Task.await(second_caller)
+    assert {:ok, [%{id: ^approval_id}]} = FerricStore.flow_approval_list(scope: scope)
     assert {:ok, "0.0"} = FerricStore.Impl.zscore(ctx, target_catalog, approval_key)
     assert {:ok, 1} = FerricStore.Impl.zcard(ctx, target_catalog)
 
@@ -414,6 +412,8 @@ defmodule Ferricstore.FlowGovernanceCatalogTest do
     refute repair_source =~ "Router.keys"
     assert repair_source =~ "Catalog.page("
     assert repair_source =~ "Catalog.page_key("
+    assert repair_source =~ "Catalog.unregister_keys("
+    refute repair_source =~ "Catalog.unregister_key("
 
     empty_scope = "approval-empty-scope-#{suffix}"
     empty_catalog = Ferricstore.Flow.Keys.governance_approval_scope_catalog_key(empty_scope)

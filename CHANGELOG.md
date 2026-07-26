@@ -11,6 +11,7 @@ All notable changes to FerricStore will be documented here.
 - Kept failed local transactional read-modify-write operations from touching LFU metadata and skipped the redundant LFU update before successful replacement writes.
 - Made a history projector that restarts with unresolved Raft work rescan its durable fsynced log before serving reads, without adding recovery scans to normal startup or work to the query hot path.
 - Retried compact query projection when a concurrent Raft update replaces its prepared source before durability, while continuing to fail closed when the live keydir still references a genuinely missing source frame.
+- Batched page-bounded approval-catalog repair removals instead of issuing up to 128 single-member writes per step, and revalidated removed memberships so concurrent approval creation or a transient validation error cannot leave a valid record uncataloged.
 
 ## 0.11.0 - 2026-07-26
 
