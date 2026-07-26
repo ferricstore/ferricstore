@@ -114,6 +114,25 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     _ -> 0
   end
 
+  def replay_recovery_required?(projector) when is_atom(projector) do
+    table = ensure_replay_reservation_registry()
+
+    case :ets.lookup(table, projector) do
+      [] ->
+        false
+
+      [{^projector, min_index, max_index, flushed_index}]
+      when is_integer(min_index) and min_index >= 0 and is_integer(max_index) and
+             max_index >= min_index and is_integer(flushed_index) and flushed_index >= 0 ->
+        flushed_index < max_index
+
+      _invalid ->
+        true
+    end
+  rescue
+    _ -> true
+  end
+
   def lookup(projector) when is_atom(projector) do
     table = ensure_pending_registry(@pending_registry)
 

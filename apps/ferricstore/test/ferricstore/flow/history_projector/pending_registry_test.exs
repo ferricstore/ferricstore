@@ -35,6 +35,27 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistryTest do
     assert PendingRegistry.replay_reservation_flushed_index(projector) == 0
   end
 
+  test "replay recovery remains required until the reserved range is flushed" do
+    projector = :history_projector_replay_recovery_test
+
+    PendingRegistry.trim_replay_reservation(projector, 1_000_000)
+    refute PendingRegistry.replay_recovery_required?(projector)
+
+    assert :ok =
+             PendingRegistry.reserve_replay_range(projector, [
+               %{ra_index: 11},
+               %{ra_index: 13}
+             ])
+
+    assert PendingRegistry.replay_recovery_required?(projector)
+    assert :ok = PendingRegistry.mark_replay_range_flushed(projector, 12)
+    assert PendingRegistry.replay_recovery_required?(projector)
+    assert :ok = PendingRegistry.mark_replay_range_flushed(projector, 13)
+    refute PendingRegistry.replay_recovery_required?(projector)
+
+    assert :ok = PendingRegistry.trim_replay_reservation(projector, 13)
+  end
+
   test "concurrent replay reservations preserve the full index range" do
     projector = :history_projector_replay_registry_concurrent_test
     PendingRegistry.trim_replay_reservation(projector, 1_000_000)

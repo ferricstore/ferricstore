@@ -200,6 +200,9 @@ defmodule Ferricstore.FlowCrashMatrixTest do
     wait_named_restart(HistoryProjector.name(FerricStore.Instance.get(:default), shard), pid)
     ShardHelpers.kill_shard_safely(shard, timeout: 45_000)
 
+    assert {:ok, %{state: "completed"}} =
+             FerricStore.flow_get(id, partition_key: partition, full: true)
+
     assert :ok = HistoryProjector.flush(FerricStore.Instance.get(:default), shard, 45_000)
 
     assert {:ok, history} =

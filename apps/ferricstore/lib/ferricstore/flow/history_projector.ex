@@ -339,8 +339,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
     instance_ctx = Keyword.get(opts, :instance_ctx)
     projector_name = name(instance_ctx, shard_index)
 
+    recover_on_init? =
+      Keyword.get(opts, :recover_on_init, true) or
+        Pending.replay_recovery_required?(projector_name)
+
     :ok =
-      if Keyword.get(opts, :recover_on_init, true) do
+      if recover_on_init? do
         recover(instance_ctx, shard_index, shard_data_path)
       else
         Recovery.prepare_recovered_history_projector(instance_ctx, shard_index, shard_data_path)
