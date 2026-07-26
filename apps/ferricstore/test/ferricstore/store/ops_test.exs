@@ -238,8 +238,10 @@ defmodule Ferricstore.Store.OpsTest do
       shard_index = Router.shard_for(ctx, key)
       keydir = :ets.new(:ops_local_tx_float_overflow, [:set, :public])
       entry = {key, "1e308", 0, LFU.initial(), 0, 0, 5}
+      previous_log_factor = :persistent_term.get(:ferricstore_lfu_log_factor, 10)
 
       try do
+        :persistent_term.put(:ferricstore_lfu_log_factor, 0)
         Process.put(:tx_pending_values, %{})
         Process.put(:tx_deleted_keys, MapSet.new())
         :ets.insert(keydir, entry)
@@ -252,6 +254,7 @@ defmodule Ferricstore.Store.OpsTest do
         assert %{} == Process.get(:tx_pending_values)
         refute_receive {:tx_pending_write, ^key, _value, _expire_at_ms}
       after
+        :persistent_term.put(:ferricstore_lfu_log_factor, previous_log_factor)
         Process.delete(:tx_pending_values)
         Process.delete(:tx_deleted_keys)
         :ets.delete(keydir)

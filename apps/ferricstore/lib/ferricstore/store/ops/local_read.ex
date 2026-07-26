@@ -779,7 +779,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
   end
 
   defp local_read_meta_for_rmw_from_ets(tx, key) do
-    case ShardETS.ets_lookup_warm_result(tx.shard_state, key) do
+    case ShardETS.ets_lookup_warm_result_for_update(tx.shard_state, key) do
       {:hit, value, exp} -> {value, exp}
       :expired -> {nil, 0}
       :miss -> {nil, 0}
@@ -789,7 +789,7 @@ defmodule Ferricstore.Store.Ops.LocalRead do
   end
 
   defp local_read_value_for_rmw_from_ets(tx, key) do
-    case ShardETS.ets_lookup_warm_result(tx.shard_state, key) do
+    case ShardETS.ets_lookup_warm_result_for_update(tx.shard_state, key) do
       {:hit, value, _exp} -> value
       :expired -> nil
       :miss -> nil

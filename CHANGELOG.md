@@ -8,6 +8,7 @@ All notable changes to FerricStore will be documented here.
 
 - Reduced native-order QueryRow page latency by reading composite entries and their metadata rows in one scope-bound LMDB snapshot. The operator keeps independent scan/value byte ceilings, conservative covered-ID and QueryRow-reference admission, exact memory accounting, a shared versioned compact-key contract, and a bounded two-stage fallback when a fused page cannot be reserved; final paired storage runs improved p50 by 6.0-48.5%, while the end-to-end 25-row query improved about 2% beyond the prepared-prefix path.
 - Reduced QueryRow and compact-result codec work without changing persisted or wire bytes. QueryRows parse their state identity once, construct the final row once, and validate skipped metadata without materializing it; prepared query decode plans retain only dynamic fields used by indexes, filters, ordering, or projection. Negotiated compact results are encoded and sized once before native framing. Metadata-heavy 100-row selective decode improved about 50% with about 38% less allocation, and exact-field decode remained about 19% faster with about 11% less allocation than materializing the full attribute section.
+- Kept failed local transactional read-modify-write operations from touching LFU metadata and skipped the redundant LFU update before successful replacement writes.
 
 ## 0.11.0 - 2026-07-26
 

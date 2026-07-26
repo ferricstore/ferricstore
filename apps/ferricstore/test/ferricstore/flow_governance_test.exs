@@ -1494,8 +1494,9 @@ defmodule Ferricstore.FlowGovernanceTest do
 
   test "budget supports repeated same-scope reserve and commit operations" do
     scope = unique_flow_id("gov-budget-same-scope")
+    operation_count = 129
 
-    Enum.each(1..300, fn i ->
+    Enum.each(1..operation_count, fn i ->
       reservation_id = "llm-step-#{i}"
 
       assert {:ok, reserved} =
@@ -1518,13 +1519,13 @@ defmodule Ferricstore.FlowGovernanceTest do
     end)
 
     assert {:ok, budget} = FerricStore.flow_budget_get(scope)
-    assert budget.used == 300
-    assert budget.reservations_count <= 128
+    assert budget.used == operation_count
+    assert budget.reservations_count == 128
 
     assert {:ok, committed} =
-             FerricStore.flow_budget_commit(scope, "llm-step-300", 1,
+             FerricStore.flow_budget_commit(scope, "llm-step-#{operation_count}", 1,
                usage: %{tokens: 1},
-               now_ms: 2_400
+               now_ms: 2_000 + operation_count
              )
 
     assert committed.status == :committed

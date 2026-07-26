@@ -246,6 +246,31 @@ defmodule Ferricstore.Store.Shard.ETS do
     end
   end
 
+  @doc false
+  @spec ets_lookup_warm_result_for_update(map(), binary()) ::
+          {:hit, term(), non_neg_integer()}
+          | :expired
+          | :miss
+          | {:error, :cold_read_failed}
+          | ReadResult.failure()
+  def ets_lookup_warm_result_for_update(state, key) do
+    expiry_context = ExpiryContext.capture()
+
+    case ets_lookup_metadata(state, key, expiry_context) do
+      {:live, {^key, value, exp, _lfu, _fid, _off, _vsize}, :hot} ->
+        {:hit, value, exp}
+
+      {:live, _entry, _location} ->
+        ets_lookup_warm_result(state, key, expiry_context)
+
+      {:error, :invalid_keydir_entry} ->
+        {:error, :cold_read_failed}
+
+      other ->
+        other
+    end
+  end
+
   @spec pending_cold?(map(), binary()) :: boolean()
   @doc false
   def pending_cold?(%{keydir: keydir} = state, key) do
