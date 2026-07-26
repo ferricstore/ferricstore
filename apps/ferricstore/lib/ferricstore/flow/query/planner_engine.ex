@@ -24,6 +24,7 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
     Plan,
     Planner,
     PlannerDiagnostic,
+    PreparedResponse,
     Response,
     StatisticsStore,
     StatisticsWorker
@@ -172,6 +173,9 @@ defmodule Ferricstore.Flow.Query.PlannerEngine do
       {:error, _reason} = error -> error
     end
   end
+
+  defp response_usage(%PreparedResponse{value: %{usage: usage}}) when is_map(usage),
+    do: {:ok, usage}
 
   defp response_usage(%{usage: usage}) when is_map(usage), do: {:ok, usage}
   defp response_usage(_response), do: {:error, :query_engine_failure}

@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.2 - 2026-07-26
+
+- Fixed `EXPLAIN ANALYZE` for clients that negotiate compact FQL results by
+  reading execution usage directly from the already-validated prepared
+  response without copying or re-encoding its payload.
+
 ## 0.11.1 - 2026-07-26
 
 - Reduced native-order QueryRow page latency by reading composite entries and their metadata rows in one scope-bound LMDB snapshot. The operator keeps independent scan/value byte ceilings, conservative covered-ID and QueryRow-reference admission, exact memory accounting, a shared versioned compact-key contract, and a bounded two-stage fallback when a fused page cannot be reserved; final paired storage runs improved p50 by 6.0-48.5%, while the end-to-end 25-row query improved about 2% beyond the prepared-prefix path.

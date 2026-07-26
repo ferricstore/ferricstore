@@ -746,6 +746,25 @@ defmodule Ferricstore.Flow.Query.PlannerEngineTest do
     refute encoded =~ ctx.data_dir
   end
 
+  test "EXPLAIN ANALYZE reads usage from compact prepared execution responses" do
+    ctx = active_context()
+
+    execution_ctx = %ExecutionContext{
+      instance_ctx: ctx,
+      response_codec: :flow_query_result_v1
+    }
+
+    request = %{collection("tenant-secret", "failed-secret") | mode: :analyze}
+
+    assert {:ok, explain} = PlannerEngine.execute(execution_ctx, request)
+    assert explain.status == "executed"
+    assert explain.actual.scanned_entries == 0
+    assert explain.actual.result_records == 0
+    assert explain.actual.response_bytes > 0
+    refute Map.has_key?(explain, :records)
+    refute Map.has_key?(explain, :page)
+  end
+
   test "EXPLAIN ANALYZE executes scalar counts without returning the count value" do
     ctx = active_context()
 
