@@ -28,6 +28,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
 
   setup_all do
     ShardHelpers.wait_shards_alive()
+    ShardHelpers.wait_default_quorum_writable()
 
     :ok
   end
