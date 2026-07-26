@@ -59,4 +59,31 @@ defmodule Ferricstore.Flow.Query.QueryRowPrimitivesTest do
     assert :error =
              QueryRowPrimitives.decode(<<5, 0x81, 0, "x">>, 256, false)
   end
+
+  test "skips canonical values without materializing them" do
+    for {value, allow_list?} <- [
+          {nil, false},
+          {false, false},
+          {true, false},
+          {-42, false},
+          {1.5, false},
+          {String.duplicate("x", 256), false},
+          {["finance", "urgent"], true}
+        ] do
+      assert {:ok, encoded, semantic_bytes} =
+               QueryRowPrimitives.encode(value, 256, allow_list?)
+
+      assert {:ok, "tail", ^semantic_bytes} =
+               QueryRowPrimitives.skip(encoded <> "tail", 256, allow_list?)
+    end
+  end
+
+  test "skip rejects malformed and noncanonical values even when their result is unused" do
+    assert :error = QueryRowPrimitives.skip(<<5, 0x81, 0, "x">>, 256, false)
+    assert :error = QueryRowPrimitives.skip(<<6, 2, 4, "same", 4, "same">>, 256, true)
+    assert :error = QueryRowPrimitives.skip(<<6, 1, 1, "x">>, 256, false)
+
+    assert :error =
+             QueryRowPrimitives.skip(<<4, 0x7FF0_0000_0000_0000::unsigned-big-64>>, 256, false)
+  end
 end

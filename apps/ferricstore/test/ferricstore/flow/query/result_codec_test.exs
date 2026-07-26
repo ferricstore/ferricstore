@@ -175,6 +175,25 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
     end
   end
 
+  test "encodes and measures a validated response in one pass" do
+    responses = [
+      page_response([], false, nil),
+      page_response([%{id: "run-1", state: nil}], true, "fqc1_cursor"),
+      count_response(42)
+    ]
+
+    for response <- responses do
+      assert {:ok, payload, bytes} = ResultCodec.encode_with_size(response)
+      assert payload == ResultCodec.encode(response)
+      assert bytes == byte_size(payload)
+      assert bytes == ResultCodec.encoded_size(response)
+    end
+
+    assert :error =
+             page_response([%{id: "run-1", internal_secret: true}], false, nil)
+             |> ResultCodec.encode_with_size()
+  end
+
   test "encodes history records and preserves present nil separately from missing fields" do
     fields = %{"event" => "transitioned", "error" => nil}
     response = page_response([%{event_id: "1000-7", fields: fields}], false, nil)

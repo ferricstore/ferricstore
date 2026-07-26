@@ -4,7 +4,6 @@ const CHECKED_PREFIX_BYTES: usize = 5;
 const PLAIN_BODY_HEADER_BYTES: usize = 20;
 const COVERING_BODY_HEADER_BYTES: usize = 28;
 const MAX_COVERING_BYTES: usize = 64 * 1024;
-const MAX_KEY_BYTES: usize = 511;
 const MAX_COMPONENT_BYTES: usize = 65_535;
 // Reserve the longest `f:{f:<43-byte digest>}:s:` state-key envelope.
 const MAX_RUN_ID_BYTES: usize = MAX_COMPONENT_BYTES - 52;
@@ -18,7 +17,7 @@ pub(crate) fn decode_entry<'a>(
     value: &'a [u8],
     hasher: &mut Sha256,
 ) -> Option<DecodedEntry<'a>> {
-    if key.len() > MAX_KEY_BYTES || value.is_empty() {
+    if key.len() > crate::LMDB_MAX_KEY_BYTES || value.is_empty() {
         return None;
     }
 

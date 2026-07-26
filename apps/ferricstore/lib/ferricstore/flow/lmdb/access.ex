@@ -2,18 +2,16 @@ defmodule Ferricstore.Flow.LMDB.Access do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Flow.Keys
+  alias Ferricstore.Flow.LMDB.PhysicalKey
 
   @max_bounded_get_keys 4_096
   @max_bounded_get_key_bytes 8 * 1_024 * 1_024
-  @max_lmdb_key_bytes 511
-  @physical_state_key_prefix <<0, "flsk:1:">>
 
   def map_size, do: Ferricstore.Flow.LMDB.map_size()
 
   def get(path, key) when is_binary(path) and is_binary(key) do
     if Ferricstore.FS.dir?(path),
-      do: NIF.lmdb_get(path, physical_key(key), map_size()),
+      do: NIF.lmdb_get(path, PhysicalKey.derive(key), map_size()),
       else: :not_found
   end
 
@@ -93,7 +91,7 @@ defmodule Ferricstore.Flow.LMDB.Access do
         keys,
         next_count,
         next_bytes,
-        compact? or compact_state_key?(key)
+        compact? or PhysicalKey.compact?(key)
       )
     else
       {:error, :batch_key_budget_exceeded}
@@ -107,7 +105,7 @@ defmodule Ferricstore.Flow.LMDB.Access do
   defp binary_key_count([], count, compact?), do: {:ok, count, compact?}
 
   defp binary_key_count([key | keys], count, compact?) when is_binary(key),
-    do: binary_key_count(keys, count + 1, compact? or compact_state_key?(key))
+    do: binary_key_count(keys, count + 1, compact? or PhysicalKey.compact?(key))
 
   defp binary_key_count(_invalid, _count, _compact?), do: {:error, :badarg}
 
@@ -241,7 +239,7 @@ defmodule Ferricstore.Flow.LMDB.Access do
   end
 
   defp physical_keys(keys, false), do: keys
-  defp physical_keys(keys, true), do: Enum.map(keys, &physical_key/1)
+  defp physical_keys(keys, true), do: Enum.map(keys, &PhysicalKey.derive/1)
 
   defp physical_ops(ops) do
     if Enum.any?(ops, &compact_op?/1) do
@@ -257,7 +255,7 @@ defmodule Ferricstore.Flow.LMDB.Access do
   defp normalize_physical_ops([op | ops], reversed, logical_keys) do
     case op_key(op) do
       {:ok, logical_key} ->
-        physical_key = physical_key(logical_key)
+        physical_key = PhysicalKey.derive(logical_key)
 
         case logical_keys do
           %{^physical_key => existing} when existing != logical_key ->
@@ -278,7 +276,7 @@ defmodule Ferricstore.Flow.LMDB.Access do
 
   defp compact_op?(op) do
     case op_key(op) do
-      {:ok, key} -> compact_state_key?(key)
+      {:ok, key} -> PhysicalKey.compact?(key)
       :error -> false
     end
   end
@@ -324,17 +322,6 @@ defmodule Ferricstore.Flow.LMDB.Access do
        do: {:error, {:compare_failed, Map.get(logical_keys, physical_key, physical_key)}}
 
   defp translate_originals(result, _logical_keys), do: result
-
-  defp physical_key(key) do
-    if compact_state_key?(key),
-      do: @physical_state_key_prefix <> :crypto.hash(:sha256, key),
-      else: key
-  end
-
-  defp compact_state_key?(key) do
-    byte_size(key) > @max_lmdb_key_bytes and
-      byte_size(key) <= Ferricstore.Store.Router.max_key_size() and Keys.state_key?(key)
-  end
 
   def prefix_entries(path, prefix, limit)
       when is_binary(path) and is_binary(prefix) and is_integer(limit) and limit >= 0 do

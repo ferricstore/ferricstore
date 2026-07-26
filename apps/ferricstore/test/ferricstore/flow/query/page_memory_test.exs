@@ -37,7 +37,14 @@ defmodule Ferricstore.Flow.Query.PageMemoryTest do
     covering = PageMemory.estimated_bytes(512, 256, 16)
 
     assert covering > plain
-    assert covering - plain == 512 * 16 * 96
+    assert covering - plain == 512 * (256 + 16 * 96 + 64)
+  end
+
+  test "fused prefetch estimate reserves a QueryRow reference for every possible entry" do
+    page = PageMemory.estimated_bytes(512, 256, 16)
+    prefetched = PageMemory.estimated_prefetched_bytes(512, 256, 16)
+
+    assert prefetched - page == 512 * 64
   end
 
   test "constant-time accounting bounds a full cover with the longest valid identity" do
@@ -80,6 +87,11 @@ defmodule Ferricstore.Flow.Query.PageMemoryTest do
       |> Map.put(:storage_bytes, byte_size(encoded.key) + byte_size(encoded.value))
 
     retained = PageMemory.retained_bytes([entry], entry.storage_bytes)
+
+    estimated =
+      PageMemory.estimated_bytes(1, entry.storage_bytes, length(definition.covering_fields))
+
     assert retained >= MemoryBudget.term_bytes([entry])
+    assert estimated >= retained
   end
 end

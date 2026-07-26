@@ -19,6 +19,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
     Field,
     Limits,
     QueryRow,
+    QueryRowDecodePlan,
     QueryRowReference,
     QueryRowPrimitives,
     RunRecordFields
@@ -141,9 +142,10 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
        )
        when is_binary(state_key) and is_map(record) and is_integer(expire_at_ms) and
               expire_at_ms >= 0 and expire_at_ms <= @max_u64 do
-    with :ok <- validate_state_key(state_key),
+    with {:ok, state_key_id} <- decode_state_key(state_key),
          :ok <- validate_scope_prefix(scope_prefix),
-         {:ok, id, version} <- validate_record_identity(record, state_key, scope_prefix),
+         {:ok, id, version} <-
+           validate_record_identity(record, state_key, scope_prefix, state_key_id),
          {:ok, encoded_metadata} <- encode_metadata(record),
          true <-
            scope_bytes(scope_prefix) + byte_size(encoded_metadata) <= @maximum_metadata_bytes do
@@ -186,20 +188,21 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
          true <- byte_size(encoded_scope) <= @maximum_scope_bytes,
          true <- byte_size(encoded_locator) <= @maximum_locator_bytes,
          true <- byte_size(encoded_metadata) <= 0xFFFF,
-         row_body =
-           IO.iodata_to_binary([
-             encoded_version,
-             encoded_expiry,
-             <<byte_size(encoded_scope)::unsigned-big-16,
-               byte_size(encoded_locator)::unsigned-big-16,
-               byte_size(encoded_metadata)::unsigned-big-16>>,
-             encoded_scope,
-             encoded_locator,
-             encoded_metadata
-           ]),
+         row_body = [
+           encoded_version,
+           encoded_expiry,
+           <<byte_size(encoded_scope)::unsigned-big-16,
+             byte_size(encoded_locator)::unsigned-big-16,
+             byte_size(encoded_metadata)::unsigned-big-16>>,
+           encoded_scope,
+           encoded_locator,
+           encoded_metadata
+         ],
+         true <-
+           byte_size(@magic) + @row_checksum_bytes + IO.iodata_length(row_body) <=
+             @maximum_encoded_bytes,
          checksum = :erlang.crc32([state_key, row_body]),
-         encoded = <<@magic::binary, checksum::unsigned-big-32, row_body::binary>>,
-         true <- byte_size(encoded) <= @maximum_encoded_bytes do
+         encoded = IO.iodata_to_binary([@magic, <<checksum::unsigned-big-32>>, row_body]) do
       {:ok, encoded}
     else
       _invalid -> :error
@@ -228,6 +231,28 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   end
 
   def decode(_encoded, _state_key, _now_ms), do: :error
+
+  @doc false
+  @spec decode_for_query(binary(), binary(), non_neg_integer(), QueryRowDecodePlan.t()) ::
+          {:ok, QueryRow.t()} | :expired | :error
+  def decode_for_query(encoded, state_key, now_ms, %QueryRowDecodePlan{} = decode_plan)
+      when is_binary(encoded) and is_binary(state_key) and is_integer(now_ms) and now_ms >= 0 and
+             now_ms <= @max_u64 do
+    if QueryRowDecodePlan.valid?(decode_plan) do
+      case decode_row(encoded, state_key, decode_plan) do
+        {:ok, %QueryRow{expire_at_ms: expire_at_ms}}
+        when expire_at_ms > 0 and expire_at_ms <= now_ms ->
+          :expired
+
+        result ->
+          result
+      end
+    else
+      :error
+    end
+  end
+
+  def decode_for_query(_encoded, _state_key, _now_ms, _decode_plan), do: :error
 
   @doc false
   @spec decode_reference(binary(), binary(), non_neg_integer()) ::
@@ -286,10 +311,12 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   def relocate(_encoded, _state_key, _expected, _relocated),
     do: {:error, :invalid_query_row}
 
-  defp decode_row(encoded, state_key)
+  defp decode_row(encoded, state_key), do: decode_row(encoded, state_key, :full)
+
+  defp decode_row(encoded, state_key, decode_plan)
        when byte_size(encoded) <= @maximum_encoded_bytes and
               byte_size(state_key) <= @maximum_state_key_bytes do
-    with :ok <- validate_state_key(state_key),
+    with {:ok, id} <- decode_state_key(state_key),
          <<@magic::binary, expected_checksum::unsigned-big-32, row_body::binary>> <- encoded,
          true <- :erlang.crc32([state_key, row_body]) == expected_checksum,
          {:ok, version, rest} <- QueryRowPrimitives.decode_u64(row_body),
@@ -304,10 +331,10 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
          <<encoded_scope::binary-size(scope_bytes), encoded_locator::binary-size(locator_bytes),
            encoded_metadata::binary-size(metadata_bytes)>> <- payload,
          {:ok, scope_prefix} <- decode_scope_prefix(encoded_scope),
-         {:ok, id} <- Keys.run_id_from_state_key(state_key),
          {:ok, locator} <- decode_locator(encoded_locator, id, version, expire_at_ms),
-         {:ok, record} <- decode_metadata(encoded_metadata, id, version),
-         {:ok, ^id, ^version} <- validate_identity(record, state_key, scope_prefix, locator) do
+         {:ok, record} <- decode_metadata(encoded_metadata, id, version, decode_plan),
+         {:ok, ^id, ^version} <-
+           validate_identity(record, state_key, scope_prefix, locator, id) do
       {:ok,
        %QueryRow{
          state_key: :binary.copy(state_key),
@@ -325,7 +352,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
     _kind, _reason -> :error
   end
 
-  defp decode_row(_encoded, _state_key), do: :error
+  defp decode_row(_encoded, _state_key, _decode_plan), do: :error
 
   defp decode_reference_row(encoded, state_key)
        when byte_size(encoded) <= @maximum_encoded_bytes and
@@ -377,21 +404,22 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
     _kind, _reason -> :error
   end
 
-  defp validate_identity(record, state_key, scope_prefix, %Locator{} = locator) do
-    with {:ok, id, version} <- validate_record_identity(record, state_key, scope_prefix),
+  defp validate_identity(record, state_key, scope_prefix, %Locator{} = locator, state_key_id) do
+    with {:ok, id, version} <-
+           validate_record_identity(record, state_key, scope_prefix, state_key_id),
          :ok <- validate_locator_identity(locator, id, version) do
       {:ok, id, version}
     end
   end
 
-  defp validate_record_identity(record, state_key, scope_prefix) do
+  defp validate_record_identity(record, state_key, scope_prefix, state_key_id) do
     with id when is_binary(id) and id != "" and byte_size(id) <= @maximum_id_bytes <-
            Map.get(record, :id),
+         true <- id == state_key_id,
          version when is_integer(version) and version >= 0 and version <= @max_u64 <-
            Map.get(record, :version),
          partition when is_nil(partition) or (is_binary(partition) and partition != "") <-
            Map.get(record, :partition_key),
-         {:ok, ^id} <- Keys.run_id_from_state_key(state_key),
          {:ok, physical_partition_key} <- physical_partition_key(partition, scope_prefix),
          true <- Keys.state_key(id, physical_partition_key) == state_key do
       {:ok, id, version}
@@ -408,10 +436,11 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   end
 
   defp validate_and_encode_metadata(state_key, record) do
-    with :ok <- validate_state_key(state_key),
+    with {:ok, state_key_id} <- decode_state_key(state_key),
          {:ok, scope_prefix} <- record_scope_prefix(record),
          {:ok, public_record} <- public_record(record),
-         {:ok, id, version} <- validate_record_identity(public_record, state_key, scope_prefix),
+         {:ok, id, version} <-
+           validate_record_identity(public_record, state_key, scope_prefix, state_key_id),
          {:ok, encoded_metadata} <- encode_metadata(public_record) do
       if scope_bytes(scope_prefix) + byte_size(encoded_metadata) <= @maximum_metadata_bytes do
         {:ok, public_record, id, version, scope_prefix, encoded_metadata}
@@ -463,16 +492,6 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   defp scope_bytes(nil), do: 0
   defp scope_bytes(scope_prefix) when is_binary(scope_prefix), do: byte_size(scope_prefix)
 
-  defp validate_state_key(state_key)
-       when state_key != "" and byte_size(state_key) <= @maximum_state_key_bytes do
-    case decode_state_key(state_key) do
-      {:ok, _id} -> :ok
-      _invalid -> :error
-    end
-  end
-
-  defp validate_state_key(_state_key), do: :error
-
   defp decode_state_key(state_key)
        when state_key != "" and byte_size(state_key) <= @maximum_state_key_bytes do
     case Keys.run_id_from_state_key(state_key) do
@@ -510,6 +529,48 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
         else: {:error, :metadata_too_large}
     end
   end
+
+  defp decode_metadata(encoded, id, version, :full), do: decode_metadata(encoded, id, version)
+
+  defp decode_metadata(
+         <<identity_flags, builtin_bytes::unsigned-big-16, internal_bytes::unsigned-big-16,
+           projection_config_bytes::unsigned-big-16, attribute_bytes::unsigned-big-16,
+           state_meta_bytes::unsigned-big-16, payload::binary>>,
+         id,
+         version,
+         %QueryRowDecodePlan{} = decode_plan
+       ) do
+    with true <- identity_flags in [0, @root_is_id_flag],
+         true <- projection_config_bytes <= @maximum_projection_config_bytes,
+         true <-
+           byte_size(payload) ==
+             builtin_bytes + internal_bytes + projection_config_bytes + attribute_bytes +
+               state_meta_bytes,
+         <<encoded_builtin::binary-size(builtin_bytes),
+           encoded_internal::binary-size(internal_bytes),
+           encoded_projection_config::binary-size(projection_config_bytes),
+           encoded_attributes::binary-size(attribute_bytes),
+           encoded_state_meta::binary-size(state_meta_bytes)>> <- payload,
+         {:ok, builtin_record} <- decode_builtin_record(encoded_builtin, id, version),
+         {:ok, _internal_fields} <- decode_internal_fields(encoded_internal),
+         {:ok, _projection_config} <- decode_projection_config(encoded_projection_config),
+         {:ok, attribute_fields} <-
+           decode_query_attributes(encoded_attributes, decode_plan.attributes),
+         {:ok, state_meta_fields} <-
+           decode_query_state_meta(encoded_state_meta, decode_plan.state_meta),
+         record =
+           builtin_record
+           |> restore_builtin_record(id, identity_flags)
+           |> Map.merge(attribute_fields)
+           |> Map.merge(state_meta_fields) do
+      {:ok, record}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decode_metadata(_encoded, _id, _version, %QueryRowDecodePlan{}), do: :error
+  defp decode_metadata(_encoded, _id, _version, _decode_plan), do: :error
 
   defp decode_metadata(
          <<identity_flags, builtin_bytes::unsigned-big-16, internal_bytes::unsigned-big-16,
@@ -795,6 +856,61 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
 
   defp decode_attributes(_encoded), do: :error
 
+  defp decode_query_attributes(encoded, :all) do
+    case decode_attributes(encoded) do
+      {:ok, attributes} -> {:ok, metadata_section(:attributes, attributes)}
+      :error -> :error
+    end
+  end
+
+  defp decode_query_attributes(encoded, :none) do
+    case validate_attributes(encoded) do
+      :ok -> {:ok, %{}}
+      :error -> :error
+    end
+  end
+
+  defp decode_query_attributes(encoded, %MapSet{} = selected) do
+    decode_selected_attributes(encoded, selected)
+  end
+
+  defp decode_query_attributes(_encoded, _selection), do: :error
+
+  defp decode_selected_attributes(<<count::unsigned-big-8, entries::binary>>, selected)
+       when count <= @maximum_attributes do
+    with {:ok, fields, <<>>, semantic_bytes} <-
+           decode_selected_dynamic_entries(
+             count,
+             entries,
+             :attribute,
+             true,
+             nil,
+             selected,
+             %{},
+             0
+           ),
+         true <- semantic_bytes <= @maximum_attribute_bytes do
+      {:ok, fields}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decode_selected_attributes(_encoded, _selected), do: :error
+
+  defp validate_attributes(<<count::unsigned-big-8, entries::binary>>)
+       when count <= @maximum_attributes do
+    with {:ok, <<>>, semantic_bytes} <-
+           validate_dynamic_entries(count, entries, :attribute, true, nil, 0),
+         true <- semantic_bytes <= @maximum_attribute_bytes do
+      :ok
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp validate_attributes(_encoded), do: :error
+
   defp encode_state_meta(state_meta)
        when is_map(state_meta) and map_size(state_meta) <= @maximum_state_meta_states do
     with true <- StateMeta.valid_normalized?(state_meta) do
@@ -854,6 +970,131 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   end
 
   defp decode_state_meta(_encoded), do: :error
+
+  defp decode_query_state_meta(encoded, :all) do
+    case decode_state_meta(encoded) do
+      {:ok, state_meta} -> {:ok, metadata_section(:state_meta, state_meta)}
+      :error -> :error
+    end
+  end
+
+  defp decode_query_state_meta(encoded, :none) do
+    case validate_state_meta(encoded) do
+      :ok -> {:ok, %{}}
+      :error -> :error
+    end
+  end
+
+  defp decode_query_state_meta(encoded, selected) when is_map(selected) do
+    decode_selected_state_meta(encoded, selected)
+  end
+
+  defp decode_query_state_meta(_encoded, _selection), do: :error
+
+  defp decode_selected_state_meta(<<count::unsigned-big-8, states::binary>>, selected)
+       when count <= @maximum_state_meta_states do
+    with {:ok, fields, <<>>, semantic_bytes} <-
+           decode_selected_state_meta_states(count, states, nil, selected, %{}, 0),
+         true <- semantic_bytes <= @maximum_state_meta_bytes do
+      {:ok, fields}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decode_selected_state_meta(_encoded, _selected), do: :error
+
+  defp decode_selected_state_meta_states(
+         0,
+         rest,
+         _previous_state,
+         _selected,
+         fields,
+         bytes
+       ),
+       do: {:ok, fields, rest, bytes}
+
+  defp decode_selected_state_meta_states(
+         count,
+         encoded,
+         previous_state,
+         selected,
+         fields,
+         bytes
+       )
+       when count > 0 do
+    with <<state_bytes::unsigned-big-8, rest::binary>> <- encoded,
+         true <- state_bytes > 0 and state_bytes <= @maximum_dynamic_name_bytes,
+         <<state::binary-size(state_bytes), entry_count::unsigned-big-8, rest::binary>> <- rest,
+         true <- entry_count <= @maximum_state_meta_entries,
+         true <- is_nil(previous_state) or state > previous_state,
+         true <- valid_dynamic_name?(state, true),
+         selected_names = Map.get(selected, state),
+         {:ok, fields, rest, entry_bytes} <-
+           decode_selected_dynamic_entries(
+             entry_count,
+             rest,
+             {:state_meta, state},
+             false,
+             nil,
+             selected_names,
+             fields,
+             0
+           ),
+         next_bytes = bytes + byte_size(state) + entry_bytes,
+         true <- next_bytes <= @maximum_state_meta_bytes do
+      decode_selected_state_meta_states(
+        count - 1,
+        rest,
+        state,
+        selected,
+        fields,
+        next_bytes
+      )
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp validate_state_meta(<<count::unsigned-big-8, states::binary>>)
+       when count <= @maximum_state_meta_states do
+    with {:ok, <<>>, semantic_bytes} <-
+           validate_state_meta_states(count, states, nil, 0),
+         true <- semantic_bytes <= @maximum_state_meta_bytes do
+      :ok
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp validate_state_meta(_encoded), do: :error
+
+  defp validate_state_meta_states(0, rest, _previous_state, bytes),
+    do: {:ok, rest, bytes}
+
+  defp validate_state_meta_states(count, encoded, previous_state, bytes) when count > 0 do
+    with <<state_bytes::unsigned-big-8, rest::binary>> <- encoded,
+         true <- state_bytes > 0 and state_bytes <= @maximum_dynamic_name_bytes,
+         <<state::binary-size(state_bytes), entry_count::unsigned-big-8, rest::binary>> <- rest,
+         true <- entry_count <= @maximum_state_meta_entries,
+         true <- is_nil(previous_state) or state > previous_state,
+         true <- valid_dynamic_name?(state, true),
+         {:ok, rest, entry_bytes} <-
+           validate_dynamic_entries(
+             entry_count,
+             rest,
+             {:state_meta, state},
+             false,
+             nil,
+             0
+           ),
+         next_bytes = bytes + byte_size(state) + entry_bytes,
+         true <- next_bytes <= @maximum_state_meta_bytes do
+      validate_state_meta_states(count - 1, rest, state, next_bytes)
+    else
+      _invalid -> :error
+    end
+  end
 
   defp decode_state_meta_states(0, rest, _previous_state, state_meta, bytes),
     do: {:ok, state_meta, rest, bytes}
@@ -953,6 +1194,131 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
         allow_list?,
         name,
         Map.put(values, name, value),
+        next_bytes
+      )
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decode_selected_dynamic_entries(
+         0,
+         rest,
+         _namespace,
+         _allow_list?,
+         _previous_name,
+         _selected,
+         fields,
+         bytes
+       ),
+       do: {:ok, fields, rest, bytes}
+
+  defp decode_selected_dynamic_entries(
+         count,
+         encoded,
+         namespace,
+         allow_list?,
+         previous_name,
+         selected,
+         fields,
+         bytes
+       )
+       when count > 0 do
+    with <<name_bytes::unsigned-big-8, rest::binary>> <- encoded,
+         true <- name_bytes > 0 and name_bytes <= @maximum_dynamic_name_bytes,
+         <<name::binary-size(name_bytes), rest::binary>> <- rest,
+         true <- is_nil(previous_name) or name > previous_name,
+         true <- valid_field?(namespace, name),
+         {:ok, fields, rest, semantic_value_bytes} <-
+           decode_selected_dynamic_value(rest, namespace, name, allow_list?, selected, fields),
+         next_bytes = bytes + byte_size(name) + semantic_value_bytes,
+         true <- next_bytes <= @maximum_state_meta_bytes do
+      decode_selected_dynamic_entries(
+        count - 1,
+        rest,
+        namespace,
+        allow_list?,
+        name,
+        selected,
+        fields,
+        next_bytes
+      )
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decode_selected_dynamic_value(
+         encoded,
+         namespace,
+         name,
+         allow_list?,
+         selected,
+         fields
+       ) do
+    if selected_dynamic_field?(selected, name) do
+      with {:ok, value, rest, semantic_bytes} <-
+             QueryRowPrimitives.decode(encoded, @maximum_dynamic_value_bytes, allow_list?),
+           true <- valid_selected_dynamic_value?(namespace, value) do
+        {:ok, Map.put(fields, selected_field(namespace, name), value), rest, semantic_bytes}
+      else
+        _invalid -> :error
+      end
+    else
+      case QueryRowPrimitives.skip(encoded, @maximum_dynamic_value_bytes, allow_list?) do
+        {:ok, rest, semantic_bytes} -> {:ok, fields, rest, semantic_bytes}
+        :error -> :error
+      end
+    end
+  end
+
+  defp valid_selected_dynamic_value?(:attribute, value),
+    do: Attributes.valid_scalar?(value) or Attributes.valid_list?(value)
+
+  defp valid_selected_dynamic_value?({:state_meta, _state}, _value), do: true
+
+  defp selected_dynamic_field?(%MapSet{} = selected, name), do: MapSet.member?(selected, name)
+  defp selected_dynamic_field?(nil, _name), do: false
+
+  defp selected_field(:attribute, name), do: {:attribute, :binary.copy(name)}
+
+  defp selected_field({:state_meta, state}, name),
+    do: {:state_meta, :binary.copy(state), :binary.copy(name)}
+
+  defp validate_dynamic_entries(
+         0,
+         rest,
+         _namespace,
+         _allow_list?,
+         _previous_name,
+         bytes
+       ),
+       do: {:ok, rest, bytes}
+
+  defp validate_dynamic_entries(
+         count,
+         encoded,
+         namespace,
+         allow_list?,
+         previous_name,
+         bytes
+       )
+       when count > 0 do
+    with <<name_bytes::unsigned-big-8, rest::binary>> <- encoded,
+         true <- name_bytes > 0 and name_bytes <= @maximum_dynamic_name_bytes,
+         <<name::binary-size(name_bytes), rest::binary>> <- rest,
+         true <- is_nil(previous_name) or name > previous_name,
+         true <- valid_field?(namespace, name),
+         {:ok, rest, semantic_value_bytes} <-
+           QueryRowPrimitives.skip(rest, @maximum_dynamic_value_bytes, allow_list?),
+         next_bytes = bytes + byte_size(name) + semantic_value_bytes,
+         true <- next_bytes <= @maximum_state_meta_bytes do
+      validate_dynamic_entries(
+        count - 1,
+        rest,
+        namespace,
+        allow_list?,
+        name,
         next_bytes
       )
     else
@@ -1138,6 +1504,9 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
 
   defp maybe_put_metadata(record, _field, metadata) when map_size(metadata) == 0, do: record
   defp maybe_put_metadata(record, field, metadata), do: Map.put(record, field, metadata)
+
+  defp metadata_section(_field, metadata) when map_size(metadata) == 0, do: %{}
+  defp metadata_section(field, metadata), do: %{field => metadata}
 
   defp maybe_put_projection_config(record, _field, value) when value in [nil, []], do: record
   defp maybe_put_projection_config(record, field, value), do: Map.put(record, field, value)

@@ -1033,6 +1033,65 @@ fn lmdb_composite_range_entries_bounded<'a>(
     max_bytes: u64,
     map_size: u64,
 ) -> NifResult<Term<'a>> {
+    lmdb_composite_range_bounded_impl::<false>(
+        env,
+        path,
+        prefix,
+        after_key,
+        before_key,
+        &[],
+        max_items,
+        max_bytes,
+        0,
+        map_size,
+    )
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn lmdb_composite_range_query_rows_bounded<'a>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    state_key_prefix: Binary<'a>,
+    after_key: Binary<'a>,
+    before_key: Binary<'a>,
+    max_items: u64,
+    max_scan_bytes: u64,
+    max_query_row_bytes: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
+    if state_key_prefix.as_slice().is_empty()
+        || state_key_prefix.as_slice().len() > LMDB_MAX_KEY_BYTES
+    {
+        return Err(rustler::Error::BadArg);
+    }
+
+    lmdb_composite_range_bounded_impl::<true>(
+        env,
+        path,
+        prefix,
+        after_key,
+        before_key,
+        state_key_prefix.as_slice(),
+        max_items,
+        max_scan_bytes,
+        max_query_row_bytes,
+        map_size,
+    )
+}
+
+fn lmdb_composite_range_bounded_impl<'a, const INCLUDE_QUERY_ROWS: bool>(
+    env: Env<'a>,
+    path: String,
+    prefix: Binary<'a>,
+    after_key: Binary<'a>,
+    before_key: Binary<'a>,
+    state_key_prefix: &[u8],
+    max_items: u64,
+    max_scan_bytes: u64,
+    max_query_row_bytes: u64,
+    map_size: u64,
+) -> NifResult<Term<'a>> {
     use sha2::{Digest, Sha256};
 
     match lmdb_store(&path, map_size) {
@@ -1056,9 +1115,12 @@ fn lmdb_composite_range_entries_bounded<'a>(
                 Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
             };
             let item_cap = usize::try_from(max_items).unwrap_or(usize::MAX);
-            let byte_cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-            let mut entries = Vec::with_capacity(lmdb_page_capacity(item_cap, byte_cap));
-            let mut entry_bytes = 0usize;
+            let scan_byte_cap = usize::try_from(max_scan_bytes).unwrap_or(usize::MAX);
+            let query_row_byte_cap =
+                usize::try_from(max_query_row_bytes).unwrap_or(usize::MAX);
+            let mut entries = Vec::with_capacity(lmdb_page_capacity(item_cap, scan_byte_cap));
+            let mut scanned_bytes = 0usize;
+            let mut query_row_bytes = 0usize;
             let mut exhausted = true;
             let mut hasher = Sha256::new();
 
@@ -1074,11 +1136,11 @@ fn lmdb_composite_range_entries_bounded<'a>(
                     exhausted = false;
                     break;
                 }
-                let row_bytes = key.len().saturating_add(value.len());
-                if row_bytes > byte_cap && entries.is_empty() {
+                let storage_bytes = key.len().saturating_add(value.len());
+                if storage_bytes > scan_byte_cap && entries.is_empty() {
                     return Ok((atoms::error(), atoms::range_entry_too_large()).encode(env));
                 }
-                if entry_bytes.saturating_add(row_bytes) > byte_cap {
+                if scanned_bytes.saturating_add(storage_bytes) > scan_byte_cap {
                     exhausted = false;
                     break;
                 }
@@ -1088,28 +1150,76 @@ fn lmdb_composite_range_entries_bounded<'a>(
                 else {
                     return Ok((atoms::error(), atoms::invalid_composite_entry()).encode(env));
                 };
+
+                if INCLUDE_QUERY_ROWS && state_key.strip_prefix(state_key_prefix) != Some(id) {
+                    return Ok((atoms::error(), atoms::invalid_composite_entry()).encode(env));
+                }
+
+                let query_row = if INCLUDE_QUERY_ROWS {
+                    let physical_state_key = flow_physical_key::physical_state_key(state_key);
+
+                    match store.db.get(&rtxn, physical_state_key.as_ref()) {
+                        Ok(row) => row,
+                        Err(error) => return Ok((atoms::error(), error.to_string()).encode(env)),
+                    }
+                } else {
+                    None
+                };
+                let value_bytes = query_row.map_or(0, <[u8]>::len);
+                let Some(next_query_row_bytes) = query_row_bytes.checked_add(value_bytes) else {
+                    return Ok(
+                        (atoms::error(), atoms::batch_value_budget_exceeded()).encode(env),
+                    );
+                };
+                if next_query_row_bytes > query_row_byte_cap {
+                    if entries.is_empty() {
+                        return Ok(
+                            (atoms::error(), atoms::batch_value_budget_exceeded()).encode(env),
+                        );
+                    }
+                    exhausted = false;
+                    break;
+                }
+
                 let key_term = binary_term(env, key)?;
                 let id_term = binary_term(env, id)?;
                 let state_term = binary_term(env, state_key)?;
                 let covering_term = covering_record
                     .map(|record| binary_term(env, record))
                     .transpose()?;
-                entries.push(
-                    (
-                        key_term,
-                        id_term,
-                        state_term,
-                        record_version,
-                        expire_at_ms,
-                        row_bytes,
-                        covering_term,
-                    )
-                        .encode(env),
-                );
-                entry_bytes = entry_bytes.saturating_add(row_bytes);
+                let composite_term = (
+                    key_term,
+                    id_term,
+                    state_term,
+                    record_version,
+                    expire_at_ms,
+                    storage_bytes,
+                    covering_term,
+                )
+                    .encode(env);
+
+                if INCLUDE_QUERY_ROWS {
+                    let query_row_term = query_row.map(|row| binary_term(env, row)).transpose()?;
+                    entries.push((composite_term, query_row_term).encode(env));
+                } else {
+                    entries.push(composite_term);
+                }
+                scanned_bytes = scanned_bytes.saturating_add(storage_bytes);
+                query_row_bytes = next_query_row_bytes;
             }
 
-            Ok((atoms::ok(), entries, exhausted, entry_bytes).encode(env))
+            if INCLUDE_QUERY_ROWS {
+                Ok((
+                    atoms::ok(),
+                    entries,
+                    exhausted,
+                    scanned_bytes,
+                    query_row_bytes,
+                )
+                    .encode(env))
+            } else {
+                Ok((atoms::ok(), entries, exhausted, scanned_bytes).encode(env))
+            }
         }
         Err(error) => Ok((atoms::error(), error).encode(env)),
     }

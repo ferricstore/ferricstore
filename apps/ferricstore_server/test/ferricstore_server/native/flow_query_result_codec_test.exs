@@ -1,7 +1,7 @@
 defmodule FerricstoreServer.Native.FlowQueryResultCodecTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.Query.ResultCodec
+  alias Ferricstore.Flow.Query.{PreparedResponse, ResultCodec}
   alias Ferricstore.NativeValueCodec
   alias FerricstoreServer.Native.Codec
 
@@ -36,6 +36,54 @@ defmodule FerricstoreServer.Native.FlowQueryResultCodecTest do
 
     assert Bitwise.band(flags, Codec.flags().custom_payload) != 0
     assert tag == ResultCodec.tag()
+  end
+
+  test "forwards a prepared bounded query payload without re-encoding its value" do
+    value = page_result(20)
+    assert {:ok, payload, bytes} = ResultCodec.encode_with_size(value)
+    value = put_in(value.usage.response_bytes, bytes)
+    assert {:ok, prepared} = PreparedResponse.new(value, payload)
+
+    [frame] =
+      Codec.encode_command_response_frames(@op_flow_query, 3, 44, :ok, prepared,
+        compact_response_codecs: @query_codecs
+      )
+
+    assert {_flags, <<0::unsigned-16, ^payload::binary>>} = response(frame, @op_flow_query)
+  end
+
+  test "fails closed instead of framing a corrupted prepared payload" do
+    value = page_result()
+    assert {:ok, payload, bytes} = ResultCodec.encode_with_size(value)
+    value = put_in(value.usage.response_bytes, bytes)
+    assert {:ok, prepared} = PreparedResponse.new(value, payload)
+    corrupted = %{prepared | payload: binary_part(payload, 0, bytes - 1)}
+
+    [frame] =
+      Codec.encode_command_response_frames(@op_flow_query, 3, 45, :ok, corrupted,
+        compact_response_codecs: @query_codecs
+      )
+
+    {flags, <<1::unsigned-16, error_payload::binary>>} = response(frame, @op_flow_query)
+    assert Bitwise.band(flags, Codec.flags().custom_payload) == 0
+
+    assert {:ok, %{"message" => "ERR invalid prepared response"}} =
+             Codec.decode_body(error_payload)
+  end
+
+  test "unwraps a prepared response when compact negotiation is unavailable" do
+    value = page_result()
+    assert {:ok, payload, bytes} = ResultCodec.encode_with_size(value)
+    value = put_in(value.usage.response_bytes, bytes)
+    assert {:ok, prepared} = PreparedResponse.new(value, payload)
+
+    [frame] = Codec.encode_command_response_frames(@op_flow_query, 3, 46, :ok, prepared)
+
+    {flags, <<0::unsigned-16, generic_payload::binary>>} = response(frame, @op_flow_query)
+    assert Bitwise.band(flags, Codec.flags().custom_payload) == 0
+
+    assert {:ok, %{"version" => "ferric.flow.query.result/v1"}} =
+             Codec.decode_body(generic_payload)
   end
 
   test "the broad compact flag cannot opt a client into an undeclared query codec" do

@@ -828,6 +828,36 @@ defmodule Ferricstore.Bitcask.NIF do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec lmdb_composite_range_query_rows_bounded(
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          pos_integer(),
+          pos_integer(),
+          pos_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok,
+           [
+             {{binary(), binary(), binary(), non_neg_integer(), non_neg_integer(), pos_integer(),
+               binary() | nil}, binary() | nil}
+           ], boolean(), non_neg_integer(), non_neg_integer()}
+          | {:error, term()}
+  def lmdb_composite_range_query_rows_bounded(
+        _path,
+        _prefix,
+        _state_key_prefix,
+        _after_key,
+        _before_key,
+        _max_items,
+        _max_scan_bytes,
+        _max_query_row_bytes,
+        _map_size
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   @spec lmdb_prefix_merge_entries(
           [binary()],
           binary(),

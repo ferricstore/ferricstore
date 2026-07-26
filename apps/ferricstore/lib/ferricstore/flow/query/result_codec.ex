@@ -109,14 +109,27 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
 
   @spec encode(term()) :: binary() | nil
   def encode(response) do
-    case encode_result(response) do
-      {:ok, payload} -> IO.iodata_to_binary(payload)
+    case encode_with_size(response) do
+      {:ok, payload, _bytes} -> payload
       :error -> nil
     end
+  end
+
+  @doc false
+  @spec encode_with_size(term()) :: {:ok, binary(), non_neg_integer()} | :error
+  def encode_with_size(response) do
+    case encode_result(response) do
+      {:ok, payload} ->
+        encoded = IO.iodata_to_binary(payload)
+        {:ok, encoded, byte_size(encoded)}
+
+      :error ->
+        :error
+    end
   rescue
-    _error -> nil
+    _error -> :error
   catch
-    _kind, _reason -> nil
+    _kind, _reason -> :error
   end
 
   @spec encoded_size(term()) :: non_neg_integer() | nil

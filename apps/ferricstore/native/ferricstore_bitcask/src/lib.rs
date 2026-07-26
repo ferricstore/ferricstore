@@ -63,6 +63,9 @@ pub mod cms;
 pub mod cuckoo;
 mod flow_composite_codec;
 pub mod flow_index;
+mod flow_physical_key;
+#[cfg(test)]
+mod flow_physical_key_contract_test;
 pub mod fs_nif;
 pub mod hint;
 pub mod io_backend;
@@ -72,6 +75,8 @@ pub mod prob_txn;
 pub mod tdigest;
 pub mod topk;
 pub mod tracking_alloc;
+
+const LMDB_MAX_KEY_BYTES: usize = 511;
 
 include!("sections/part_01.rs");
 include!("sections/part_02.rs");

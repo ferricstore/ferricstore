@@ -1,0 +1,4 @@
+# name|logical prefix|fill byte|logical bytes|expected physical key hex or direct
+direct_boundary|f:{fa:17}:s:|x|511|direct
+compact_boundary|f:{fa:17}:s:|x|512|00666c736b3a313a9c1f4ad0e3614f13d714440c08ba463dafb4994603885c26fc59913f453293f4
+compact_maximum|f:{fa:17}:s:|x|65535|00666c736b3a313a8a8612e675ba84ec3e270844a9dadd281042a3cf63ba864efa01bbcbdea6e1fd

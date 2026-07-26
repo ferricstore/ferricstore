@@ -11,7 +11,7 @@ defmodule FerricstoreServer.Native.Codec do
   payloads and structured Flow metadata.
   """
 
-  alias Ferricstore.Flow.Query.ResultCodec
+  alias Ferricstore.Flow.Query.{PreparedResponse, ResultCodec}
   alias Ferricstore.NativeValueCodec
   alias FerricstoreServer.Native.NIF
   alias FerricstoreServer.Native.Connection.FrameBuffer
@@ -337,6 +337,28 @@ defmodule FerricstoreServer.Native.Codec do
     end
   end
 
+  defp do_encode_command_response_frames(
+         opcode,
+         lane_id,
+         request_id,
+         status,
+         %PreparedResponse{value: value} = prepared,
+         opts
+       ) do
+    if PreparedResponse.valid?(prepared) do
+      do_encode_command_response_frames(opcode, lane_id, request_id, status, value, opts)
+    else
+      encode_response_frames(
+        opcode,
+        lane_id,
+        request_id,
+        :error,
+        "ERR invalid prepared response",
+        opts
+      )
+    end
+  end
+
   defp do_encode_command_response_frames(opcode, lane_id, request_id, status, value, opts) do
     {status, value} = enforce_response_byte_limit(status, value, opts)
 
@@ -370,6 +392,18 @@ defmodule FerricstoreServer.Native.Codec do
           encode_response_frames(opcode, lane_id, request_id, status, value, opts)
         end
     end
+  end
+
+  defp compact_flow_query_result_payload(
+         opcode,
+         :ok,
+         %PreparedResponse{payload: payload} = prepared,
+         opts
+       )
+       when opcode in @compact_flow_query_result_opcodes do
+    if compact_codec_selected?(opts, @flow_query_result_codec) and
+         PreparedResponse.valid?(prepared),
+       do: payload
   end
 
   defp compact_flow_query_result_payload(opcode, :ok, value, opts)

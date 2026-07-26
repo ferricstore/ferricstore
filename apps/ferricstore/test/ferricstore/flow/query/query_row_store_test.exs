@@ -2,7 +2,13 @@ defmodule Ferricstore.Flow.Query.QueryRowStoreTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Flow.{Keys, LMDB, Locator}
-  alias Ferricstore.Flow.Query.{QueryRowCodec, QueryRowReference, QueryRowStore}
+
+  alias Ferricstore.Flow.Query.{
+    QueryRowCodec,
+    QueryRowDecodePlan,
+    QueryRowReference,
+    QueryRowStore
+  }
 
   test "reads a bounded prefix of query rows and applies expiry" do
     path = tmp_path()
@@ -31,6 +37,56 @@ defmodule Ferricstore.Flow.Query.QueryRowStoreTest do
 
     assert {:error, :invalid_query_row} =
              QueryRowStore.read_many(path, [state_key], 0, 1_000)
+  end
+
+  test "decodes fused raw values with the same missing, expiry, and corruption semantics" do
+    first_key = Keys.state_key("run-1", "tenant-a")
+    second_key = Keys.state_key("run-2", "tenant-a")
+    assert {:ok, first} = QueryRowCodec.encode(first_key, record("run-1"), locator("run-1"), 0)
+
+    assert {:ok, second} =
+             QueryRowCodec.encode(second_key, record("run-2"), locator("run-2", 500), 500)
+
+    assert {:ok, [%{record: %{id: "run-1"}}, nil]} =
+             QueryRowStore.decode_many([first_key, second_key], [first, second], 1_000)
+
+    assert {:ok, [%{record: %{id: "run-1"}}, nil]} =
+             QueryRowStore.decode_many([first_key, second_key], [first, nil], 1_000)
+
+    assert {:error, :invalid_query_row} =
+             QueryRowStore.decode_many([first_key], ["corrupt"], 1_000)
+
+    assert {:error, :invalid_query_row} =
+             QueryRowStore.decode_many([first_key], [], 1_000)
+
+    assert {:error, :invalid_query_row} =
+             QueryRowStore.decode_many([first_key], [:invalid], 1_000)
+  end
+
+  test "applies one prepared query decode plan to bounded and fused rows" do
+    path = tmp_path()
+    state_key = Keys.state_key("run-1", "tenant-a")
+
+    record =
+      record("run-1")
+      |> Map.put(:attributes, %{"customer" => "c-1"})
+      |> Map.put(:state_meta, %{"waiting" => %{"worker" => "w-1"}})
+
+    assert {:ok, encoded} = QueryRowCodec.encode(state_key, record, locator("run-1"), 0)
+    assert :ok = LMDB.write_batch(path, [{:put, state_key, encoded}])
+
+    decode_plan = %QueryRowDecodePlan{attributes: :none, state_meta: :none}
+
+    assert {:ok, [%{record: bounded}], _bytes, true} =
+             QueryRowStore.read_many(path, [state_key], 0, 1_000_000, decode_plan)
+
+    refute Map.has_key?(bounded, :attributes)
+    refute Map.has_key?(bounded, :state_meta)
+
+    assert {:ok, [%{record: fused}]} =
+             QueryRowStore.decode_many([state_key], [encoded], 0, decode_plan)
+
+    assert fused == bounded
   end
 
   test "reads bounded hydration references without materializing metadata" do

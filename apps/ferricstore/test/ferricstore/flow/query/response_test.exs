@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.{Flow.Query.Limits, NativeValueCodec}
-  alias Ferricstore.Flow.Query.{Budget, Response, ResultCodec}
+  alias Ferricstore.Flow.Query.{Budget, PreparedResponse, Response, ResultCodec}
 
   test "builds one versioned page contract and accounts its complete encoded size" do
     usage = usage(1)
@@ -115,7 +115,7 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
                budget
              )
 
-    assert {:ok, response} =
+    assert {:ok, %PreparedResponse{value: response, payload: payload}} =
              Response.build(
                records,
                false,
@@ -128,6 +128,7 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
 
     assert response.usage.response_bytes == compact_bytes
     assert ResultCodec.encoded_size(response) == compact_bytes
+    assert payload == ResultCodec.encode(response)
   end
 
   test "rejects inconsistent pagination and usage metadata" do
@@ -211,7 +212,7 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
 
     {:ok, budget} = Budget.lower(Budget.default(), response_bytes: compact_bytes)
 
-    assert {:ok, response} =
+    assert {:ok, %PreparedResponse{value: response, payload: payload}} =
              Response.build_count(
                7,
                quality("none"),
@@ -221,6 +222,7 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
              )
 
     assert response.usage.response_bytes == compact_bytes
+    assert payload == ResultCodec.encode(response)
   end
 
   defp usage(result_records) do

@@ -2,7 +2,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Flow.{Codec, Keys, LMDB, Locator, StorageScope}
-  alias Ferricstore.Flow.Query.{QueryRow, QueryRowCodec}
+  alias Ferricstore.Flow.Query.{Field, QueryRow, QueryRowCodec, QueryRowDecodePlan}
 
   @state_key Keys.state_key("run-1", "tenant-a")
 
@@ -148,6 +148,15 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
     locator = locator(expire_at_ms: 9_000)
     assert {:ok, encoded} = QueryRowCodec.encode(@state_key, first, locator, 9_000)
     assert {:ok, ^encoded} = QueryRowCodec.encode(@state_key, second, locator, 9_000)
+  end
+
+  test "keeps the persisted QueryRow bytes stable while optimizing construction" do
+    assert {:ok, encoded} = QueryRowCodec.encode(@state_key, record(), locator(), 0)
+
+    assert byte_size(encoded) == 268
+
+    assert Base.encode16(:crypto.hash(:sha256, encoded), case: :lower) ==
+             "3215d2c4b601a25ec373a07fa7a0aee0901533700cf5e4ec815d18db9f871a3b"
   end
 
   test "supports every authoritative state locator source" do
@@ -311,6 +320,114 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
     end
   end
 
+  test "query decoding materializes only required public metadata sections" do
+    assert {:ok, encoded} = QueryRowCodec.encode(@state_key, record(), locator(), 0)
+
+    assert {:ok, %{record: lean}} =
+             QueryRowCodec.decode_for_query(
+               encoded,
+               @state_key,
+               0,
+               %QueryRowDecodePlan{attributes: :none, state_meta: :none}
+             )
+
+    refute Map.has_key?(lean, :attributes)
+    refute Map.has_key?(lean, :state_meta)
+    refute Map.has_key?(lean, :indexed_attributes)
+    refute Map.has_key?(lean, :indexed_state_meta)
+    refute Map.has_key?(lean, :state_enter_seq)
+
+    assert {:ok, %{record: attributes_only}} =
+             QueryRowCodec.decode_for_query(
+               encoded,
+               @state_key,
+               0,
+               %QueryRowDecodePlan{attributes: :all, state_meta: :none}
+             )
+
+    assert attributes_only.attributes == record().attributes
+    refute Map.has_key?(attributes_only, :state_meta)
+
+    assert {:ok, %{record: complete}} =
+             QueryRowCodec.decode_for_query(
+               encoded,
+               @state_key,
+               0,
+               %QueryRowDecodePlan{attributes: :all, state_meta: :all}
+             )
+
+    assert complete.attributes == record().attributes
+    assert complete.state_meta == record().state_meta
+  end
+
+  test "query decoding materializes only the selected dynamic fields" do
+    assert {:ok, encoded} = QueryRowCodec.encode(@state_key, record(), locator(), 0)
+
+    decode_plan = %QueryRowDecodePlan{
+      attributes: MapSet.new(["tier", "missing"]),
+      state_meta: %{
+        "queued" => MapSet.new(["worker"]),
+        "missing" => MapSet.new(["field"])
+      }
+    }
+
+    assert {:ok, %{record: selected}} =
+             QueryRowCodec.decode_for_query(encoded, @state_key, 0, decode_plan)
+
+    refute Map.has_key?(selected, :attributes)
+    refute Map.has_key?(selected, :state_meta)
+    assert Map.fetch(selected, {:attribute, "tier"}) == {:ok, "gold"}
+    assert Map.fetch(selected, {:state_meta, "queued", "worker"}) == {:ok, "worker-1"}
+    assert Field.fetch(selected, {:attribute, "tier"}) == {:ok, "gold"}
+    assert Field.fetch(selected, {:attribute, "missing"}) == :missing
+    assert Field.fetch(selected, {:state_meta, "queued", "worker"}) == {:ok, "worker-1"}
+    assert Field.fetch(selected, {:state_meta, "missing", "field"}) == :missing
+  end
+
+  test "query decoding validates skipped metadata instead of trusting its checksum" do
+    assert {:ok, encoded} = QueryRowCodec.encode(@state_key, record(), locator(), 0)
+    decode_plan = %QueryRowDecodePlan{attributes: :none, state_meta: :none}
+
+    invalid_attribute = corrupt_name(encoded, @state_key, "labels")
+    assert :error = QueryRowCodec.decode(invalid_attribute, @state_key)
+    assert :error = QueryRowCodec.decode_for_query(invalid_attribute, @state_key, 0, decode_plan)
+
+    invalid_state_meta = corrupt_name(encoded, @state_key, "created")
+    assert :error = QueryRowCodec.decode(invalid_state_meta, @state_key)
+    assert :error = QueryRowCodec.decode_for_query(invalid_state_meta, @state_key, 0, decode_plan)
+  end
+
+  test "query decoding rejects duplicate list values in selected and skipped attributes" do
+    record = put_in(record(), [:attributes, "labels"], ["alpha", "bravo"])
+    assert {:ok, encoded} = QueryRowCodec.encode(@state_key, record, locator(), 0)
+
+    duplicate_list =
+      encoded
+      |> :binary.replace("bravo", "alpha")
+      |> refresh_checksum(@state_key)
+
+    assert :error = QueryRowCodec.decode(duplicate_list, @state_key)
+
+    assert :error =
+             QueryRowCodec.decode_for_query(
+               duplicate_list,
+               @state_key,
+               0,
+               %QueryRowDecodePlan{
+                 attributes: MapSet.new(["labels"]),
+                 state_meta: :none
+               }
+             )
+
+    assert :error =
+             QueryRowCodec.decode_for_query(
+               duplicate_list,
+               @state_key,
+               0,
+               %QueryRowDecodePlan{attributes: :none, state_meta: :none}
+             )
+  end
+
   test "rejects oversized metadata and invalid dynamic values" do
     too_many_attributes =
       for index <- 1..17, into: %{}, do: {"key-#{index}", "value"}
@@ -471,5 +588,25 @@ defmodule Ferricstore.Flow.Query.QueryRowCodecTest do
     defaults
     |> Keyword.merge(overrides)
     |> Locator.new!()
+  end
+
+  defp corrupt_name(encoded, state_key, name) do
+    marker = <<byte_size(name), name::binary>>
+    {offset, _bytes} = :binary.match(encoded, marker)
+    name_offset = offset + 1
+
+    <<prefix::binary-size(name_offset), _name::binary-size(byte_size(name)), suffix::binary>> =
+      encoded
+
+    corrupted =
+      <<prefix::binary, 0xFF, binary_part(name, 1, byte_size(name) - 1)::binary, suffix::binary>>
+
+    refresh_checksum(corrupted, state_key)
+  end
+
+  defp refresh_checksum(encoded, state_key) do
+    <<magic::binary-size(5), _checksum::unsigned-big-32, row_body::binary>> = encoded
+    checksum = :erlang.crc32([state_key, row_body])
+    <<magic::binary, checksum::unsigned-big-32, row_body::binary>>
   end
 end

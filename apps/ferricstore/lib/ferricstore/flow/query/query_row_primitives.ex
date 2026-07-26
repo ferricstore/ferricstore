@@ -136,6 +136,49 @@ defmodule Ferricstore.Flow.Query.QueryRowPrimitives do
 
   def decode(_encoded, _maximum_binary_bytes, _allow_list?), do: :error
 
+  @doc false
+  @spec skip(binary(), pos_integer(), boolean()) ::
+          {:ok, binary(), non_neg_integer()} | :error
+  def skip(<<@nil_tag, rest::binary>>, _maximum_binary_bytes, _allow_list?),
+    do: {:ok, rest, 0}
+
+  def skip(<<@false_tag, rest::binary>>, _maximum_binary_bytes, _allow_list?),
+    do: {:ok, rest, 1}
+
+  def skip(<<@true_tag, rest::binary>>, _maximum_binary_bytes, _allow_list?),
+    do: {:ok, rest, 1}
+
+  def skip(<<@integer_tag, encoded::binary>>, _maximum_binary_bytes, _allow_list?) do
+    with {:ok, _value, rest} <- decode_u64(encoded), do: {:ok, rest, 8}
+  end
+
+  def skip(
+        <<@float_tag, bits::unsigned-big-64, rest::binary>>,
+        _maximum_binary_bytes,
+        _allow_list?
+      ) do
+    if finite_float_bits?(bits), do: {:ok, rest, 8}, else: :error
+  end
+
+  def skip(<<@binary_tag, encoded::binary>>, maximum_binary_bytes, _allow_list?)
+      when is_integer(maximum_binary_bytes) and maximum_binary_bytes > 0 do
+    with {:ok, bytes, rest} <- decode_u64(encoded),
+         true <- bytes <= maximum_binary_bytes,
+         <<_value::binary-size(bytes), tail::binary>> <- rest do
+      {:ok, tail, bytes}
+    else
+      _invalid -> :error
+    end
+  end
+
+  def skip(<<@list_tag, count, encoded::binary>>, maximum_binary_bytes, true)
+      when count > 0 and count <= @maximum_list_values and is_integer(maximum_binary_bytes) and
+             maximum_binary_bytes > 0 do
+    skip_binary_list(count, encoded, maximum_binary_bytes, MapSet.new(), 0)
+  end
+
+  def skip(_encoded, _maximum_binary_bytes, _allow_list?), do: :error
+
   defp encode_varint(value, acc) when value < 0x80,
     do: Enum.reverse([<<value>> | acc])
 
@@ -176,6 +219,27 @@ defmodule Ferricstore.Flow.Query.QueryRowPrimitives do
         tail,
         maximum_binary_bytes,
         [:binary.copy(value) | acc],
+        semantic_bytes + bytes
+      )
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp skip_binary_list(0, rest, _maximum_binary_bytes, _seen, semantic_bytes),
+    do: {:ok, rest, semantic_bytes}
+
+  defp skip_binary_list(count, encoded, maximum_binary_bytes, seen, semantic_bytes)
+       when count > 0 do
+    with {:ok, bytes, rest} <- decode_u64(encoded),
+         true <- bytes <= maximum_binary_bytes,
+         <<value::binary-size(bytes), tail::binary>> <- rest,
+         false <- MapSet.member?(seen, value) do
+      skip_binary_list(
+        count - 1,
+        tail,
+        maximum_binary_bytes,
+        MapSet.put(seen, value),
         semantic_bytes + bytes
       )
     else

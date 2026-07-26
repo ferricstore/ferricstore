@@ -19,7 +19,9 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     RegisteredIndex,
     Request,
     QueryRow,
-    QueryRowCodec
+    QueryRowCodec,
+    QueryRowDecodePlan,
+    QueryRowStore
   }
 
   alias Ferricstore.Flow.Query.{
@@ -250,6 +252,335 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
       refute Map.has_key?(record, :error_ref)
       refute Map.has_key?(record, :lease_token)
     end)
+  end
+
+  test "prepares the physical state-key prefix once for a query-row page" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 4)
+    plan = plan!(request, definition)
+    records = Enum.map(1..4, &record("run-#{&1}", 200 - &1))
+    {range_read, _record_read} = storage(definition, records)
+    rows = Map.new(records, &{state_key(&1), query_row(&1)})
+
+    query_row_read = fn _path, state_keys, _now_ms, _max_bytes ->
+      selected = Enum.map(state_keys, &Map.get(rows, &1))
+      {:ok, selected, MemoryBudget.term_bytes(selected), true}
+    end
+
+    {execution, state_key_calls} =
+      execute_with_call_trace({Keys, :state_key, 2}, fn ->
+        Executor.execute(context(), 0, request, plan,
+          range_read: range_read,
+          query_row_read: query_row_read,
+          record_read: fn _path, _keys, _now_ms, _max_bytes ->
+            flunk("a metadata-row-covered query must not read the authoritative log")
+          end,
+          now_ms: 1_000
+        )
+      end)
+
+    assert {:ok, %{records: returned}} = execution
+    assert Enum.map(returned, & &1.id) == Enum.map(records, & &1.id)
+    assert state_key_calls == 1
+  end
+
+  test "prepares and applies a selective decoder for non-fused query rows" do
+    definition = state_definition()
+
+    request =
+      request([eq(:state, "failed")], 1)
+      |> Map.put(:projection, [:run_id, :state])
+
+    record =
+      record("run-1", 140)
+      |> Map.put(:attributes, %{"customer" => "one"})
+      |> Map.put(:state_meta, %{"failed" => %{"reason" => "declined"}})
+
+    {range_read, _record_read} = storage(definition, [record])
+    state_key = state_key(record)
+    assert {:ok, encoded} = record |> query_row() |> QueryRowCodec.encode()
+
+    query_row_read = fn _path,
+                        [^state_key],
+                        now_ms,
+                        _max_bytes,
+                        %QueryRowDecodePlan{attributes: :none, state_meta: :none} = decode_plan ->
+      assert {:ok, rows} = QueryRowStore.decode_many([state_key], [encoded], now_ms, decode_plan)
+      {:ok, rows, byte_size(encoded), true}
+    end
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               query_row_read: query_row_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a metadata-row-covered query must not read the authoritative log")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == [%{id: "run-1", state: "failed"}]
+  end
+
+  test "uses exact dynamic fields for residual checks and response projection" do
+    definition = state_definition()
+
+    request =
+      request(
+        [
+          eq(:state, "failed"),
+          eq({:attribute, "customer"}, "one")
+        ],
+        1
+      )
+      |> Map.put(:projection, [
+        :run_id,
+        {:attribute, "customer"},
+        {:state_meta, "failed", "reason"}
+      ])
+
+    record =
+      record("run-1", 140)
+      |> Map.put(:attributes, %{"customer" => "one", "unused" => "not-decoded"})
+      |> Map.put(:state_meta, %{
+        "failed" => %{"reason" => "declined", "unused" => "not-decoded"}
+      })
+
+    {range_read, _record_read} = storage(definition, [record])
+    state_key = state_key(record)
+    assert {:ok, encoded} = record |> query_row() |> QueryRowCodec.encode()
+
+    query_row_read = fn _path,
+                        [^state_key],
+                        now_ms,
+                        _max_bytes,
+                        %QueryRowDecodePlan{
+                          attributes: attributes,
+                          state_meta: state_meta
+                        } = decode_plan ->
+      assert attributes == MapSet.new(["customer"])
+      assert state_meta == %{"failed" => MapSet.new(["reason"])}
+      assert {:ok, [row]} = QueryRowStore.decode_many([state_key], [encoded], now_ms, decode_plan)
+      refute Map.has_key?(row.record, :attributes)
+      refute Map.has_key?(row.record, :state_meta)
+      refute Map.has_key?(row.record, {:attribute, "unused"})
+      refute Map.has_key?(row.record, {:state_meta, "failed", "unused"})
+      {:ok, [row], byte_size(encoded), true}
+    end
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               query_row_read: query_row_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a query-row-covered query must not read the authoritative log")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == [
+             %{
+               id: "run-1",
+               attributes: %{"customer" => "one"},
+               state_meta: %{"failed" => %{"reason" => "declined"}}
+             }
+           ]
+  end
+
+  test "processes a fused composite and QueryRow page without legacy reads" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 2)
+    plan = plan!(request, definition)
+    records = [record("run-1", 140), record("run-2", 130)]
+    {fixture_range_read, _record_read} = storage(definition, records)
+    [range] = plan.ranges
+
+    assert {:ok, page} = fixture_range_read.("unused", range, nil, 3, 1_048_576)
+
+    query_row_values =
+      Enum.map(records, fn record ->
+        assert {:ok, encoded} = record |> query_row() |> QueryRowCodec.encode()
+        encoded
+      end)
+
+    query_row_bytes = Enum.sum(Enum.map(query_row_values, &byte_size/1))
+
+    fused_read = fn
+      _path, ^range, _state_key_prefix, nil, _max_entries, _max_scan_bytes, max_query_row_bytes ->
+        assert query_row_bytes <= max_query_row_bytes
+
+        {:ok,
+         Map.merge(page, %{
+           query_row_values: query_row_values,
+           query_row_bytes: query_row_bytes
+         })}
+    end
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan,
+               query_row_range_read: fused_read,
+               range_read: fn _path, _range, _cursor, _max_entries, _max_bytes ->
+                 flunk("the legacy composite range reader must not run")
+               end,
+               query_row_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("the second QueryRow lookup must not run")
+               end,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a metadata-row-covered query must not read the authoritative log")
+               end,
+               now_ms: 1_000
+             )
+
+    assert Enum.map(result.records, & &1.id) == ["run-1", "run-2"]
+    assert result.usage.hydrated_records == 0
+  end
+
+  test "falls back to bounded two-stage reads when the first fused QueryRow exceeds its budget" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 2)
+    plan = plan!(request, definition)
+    records = [record("run-1", 140), record("run-2", 130)]
+    {range_read, _record_read} = storage(definition, records)
+    rows = Map.new(records, &{state_key(&1), query_row(&1)})
+    parent = self()
+
+    fused_read = fn
+      _path, _range, _state_key_prefix, _cursor, _max_entries, _scan_bytes, _query_row_bytes ->
+        send(parent, :fused_read)
+        {:error, :batch_value_budget_exceeded}
+    end
+
+    query_row_read = fn _path, state_keys, _now_ms, _max_bytes ->
+      send(parent, :query_row_read)
+      selected = Enum.map(state_keys, &Map.get(rows, &1))
+      {:ok, selected, MemoryBudget.term_bytes(selected), true}
+    end
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan,
+               query_row_range_read: fused_read,
+               range_read: range_read,
+               query_row_read: query_row_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a metadata-row-covered query must not read the authoritative log")
+               end,
+               now_ms: 1_000
+             )
+
+    assert_receive :fused_read
+    assert_receive :query_row_read
+    assert Enum.map(result.records, & &1.id) == ["run-1", "run-2"]
+  end
+
+  test "uses the bounded legacy path when worst-case fused page memory cannot be reserved" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 1)
+    plan = plan!(request, definition)
+    {:ok, budget} = Budget.lower(plan.budget, executor_memory_bytes: 64 * 1_024)
+    plan = %{plan | budget: budget}
+    records = [record("run-1", 140)]
+    {fixture_range_read, _record_read} = storage(definition, records)
+    row = query_row(hd(records))
+    assert {:ok, encoded} = QueryRowCodec.encode(row)
+    parent = self()
+
+    range_read = fn path, range, cursor, max_entries, max_bytes ->
+      send(parent, :legacy_range_read)
+      fixture_range_read.(path, range, cursor, max_entries, max_bytes)
+    end
+
+    query_row_read = fn _path, [_state_key], _now_ms, max_bytes ->
+      send(parent, :legacy_query_row_read)
+      assert byte_size(encoded) <= max_bytes
+      {:ok, [row], byte_size(encoded), true}
+    end
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan,
+               query_row_range_read: fn
+                 _path,
+                 _range,
+                 _state_key_prefix,
+                 _cursor,
+                 _max_entries,
+                 _scan_bytes,
+                 _query_row_bytes ->
+                   flunk("the fused read must not run without a worst-case memory reservation")
+               end,
+               range_read: range_read,
+               query_row_read: query_row_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a metadata-row-covered query must not read the authoritative log")
+               end,
+               now_ms: 1_000
+             )
+
+    assert_receive :legacy_range_read
+    assert_receive :legacy_query_row_read
+    assert Enum.map(result.records, & &1.id) == ["run-1"]
+    assert result.usage.memory_high_water_bytes <= budget.executor_memory_bytes
+  end
+
+  test "rejects forged fused QueryRow byte accounting before decoding" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 1)
+    plan = plan!(request, definition)
+    record = record("run-1", 140)
+    {fixture_range_read, _record_read} = storage(definition, [record])
+    [range] = plan.ranges
+    assert {:ok, page} = fixture_range_read.("unused", range, nil, 2, 1_048_576)
+    assert {:ok, encoded} = record |> query_row() |> QueryRowCodec.encode()
+
+    fused_read = fn
+      _path, ^range, _state_key_prefix, nil, _max_entries, _scan_bytes, _query_row_bytes ->
+        {:ok,
+         Map.merge(page, %{
+           query_row_values: [encoded],
+           query_row_bytes: byte_size(encoded) - 1
+         })}
+    end
+
+    assert {:error, :query_storage_inconsistent} =
+             Executor.execute(context(), 0, request, plan,
+               query_row_range_read: fused_read,
+               range_read: fn _path, _range, _cursor, _max_entries, _max_bytes ->
+                 flunk("a forged fused response must not trigger a second transaction")
+               end,
+               query_row_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a forged fused response must not trigger QueryRow lookup")
+               end,
+               now_ms: 1_000
+             )
+  end
+
+  test "rejects malformed prefetched QueryRow bytes without a legacy retry" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 1)
+    plan = plan!(request, definition)
+    record = record("run-1", 140)
+    {fixture_range_read, _record_read} = storage(definition, [record])
+    [range] = plan.ranges
+    assert {:ok, page} = fixture_range_read.("unused", range, nil, 2, 1_048_576)
+
+    fused_read = fn
+      _path, ^range, _state_key_prefix, nil, _max_entries, _scan_bytes, _query_row_bytes ->
+        {:ok, Map.merge(page, %{query_row_values: ["corrupt"], query_row_bytes: 7})}
+    end
+
+    assert {:error, :query_storage_inconsistent} =
+             Executor.execute(context(), 0, request, plan,
+               query_row_range_read: fused_read,
+               range_read: fn _path, _range, _cursor, _max_entries, _max_bytes ->
+                 flunk("a corrupt fused row must not trigger an unpinned range retry")
+               end,
+               query_row_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a corrupt fused row must not trigger a second LMDB transaction")
+               end,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a corrupt fused row must not reach the authoritative log")
+               end,
+               now_ms: 1_000
+             )
   end
 
   test "rejects a query-row plan with a non-durable locator before log IO" do

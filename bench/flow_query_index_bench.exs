@@ -7,7 +7,9 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
 
   alias Ferricstore.Flow.Query.{
     CompositeBackfill,
+    CompositeRangeReader,
     MandatoryScope,
+    QueryRowStore,
     RegisteredIndex,
     Request
   }
@@ -82,12 +84,16 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
       active = active_index(definition)
 
       query_row = execute_query(ctx, request, active, :query_row)
+      legacy_query_row = execute_query(ctx, request, active, :legacy_query_row)
       authoritative = execute_query(ctx, request, active, :authoritative)
 
       true = query_row.records == authoritative.records
+      true = legacy_query_row.records == query_row.records
       true = query_row.record_source == :query_row
+      true = legacy_query_row.record_source == :query_row
       true = authoritative.record_source == :query_row
       true = query_row.usage.hydrated_records == 0
+      true = legacy_query_row.usage.hydrated_records == 0
       true = authoritative.usage.hydrated_records > 0
 
       if warmup > 0 do
@@ -129,13 +135,49 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
       query_row_latency = percentiles(query_row_latencies)
       authoritative_latency = percentiles(authoritative_latencies)
 
+      {legacy_query_row_latencies, fused_query_row_latencies} =
+        Enum.reduce(1..iterations, {[], []}, fn iteration, {legacy_acc, fused_acc} ->
+          {legacy_us, fused_us} =
+            if rem(iteration, 2) == 0 do
+              {legacy_us, _legacy_result} =
+                timed(fn -> execute_query(ctx, request, active, :legacy_query_row) end)
+
+              {fused_us, _fused_result} =
+                timed(fn -> execute_query(ctx, request, active, :query_row) end)
+
+              {legacy_us, fused_us}
+            else
+              {fused_us, _fused_result} =
+                timed(fn -> execute_query(ctx, request, active, :query_row) end)
+
+              {legacy_us, _legacy_result} =
+                timed(fn -> execute_query(ctx, request, active, :legacy_query_row) end)
+
+              {legacy_us, fused_us}
+            end
+
+          {[legacy_us | legacy_acc], [fused_us | fused_acc]}
+        end)
+
+      legacy_query_row_latency = percentiles(legacy_query_row_latencies)
+      fused_query_row_latency = percentiles(fused_query_row_latencies)
+
       %{
         id: definition.id,
         version: definition.version,
         read_latency_us: query_row_latency,
+        paired_fused_read_latency_us: fused_query_row_latency,
+        paired_legacy_query_row_latency_us: legacy_query_row_latency,
+        fused_query_row_speedup_p50:
+          round_to(legacy_query_row_latency.p50 / max(fused_query_row_latency.p50, 1), 2),
         authoritative_fallback_latency_us: authoritative_latency,
         query_row_speedup_p50:
           round_to(authoritative_latency.p50 / max(query_row_latency.p50, 1), 2),
+        read_memory_high_water_bytes: %{
+          fused_query_row: query_row.usage.memory_high_water_bytes,
+          legacy_query_row: legacy_query_row.usage.memory_high_water_bytes,
+          authoritative_fallback: authoritative.usage.memory_high_water_bytes
+        },
         backfill: %{
           elapsed_ms: round_to(backfill_us / 1_000, 3),
           records_per_second: round_to(rate(record_count, backfill_us), 2),
@@ -224,6 +266,13 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
   end
 
   defp read_source_opts(_ctx, :query_row), do: []
+
+  defp read_source_opts(_ctx, :legacy_query_row) do
+    [
+      range_read: &CompositeRangeReader.read/5,
+      query_row_read: &QueryRowStore.read_many/4
+    ]
+  end
 
   defp read_source_opts(ctx, :authoritative) do
     [

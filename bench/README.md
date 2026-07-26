@@ -32,6 +32,7 @@ Useful local runners:
 | `query_planner_residual_candidates_bench.exs` | Direct, fetch-once, and prepared residual predicate evaluation candidates. |
 | `query_planner_intersection_candidates_bench.exs` | Single-index hydration and bounded multi-index intersection candidates. |
 | `query_result_codec_candidates_bench.exs` | Compact result-record ordering candidates across sparse and full pages. |
+| `query_row_codec_bench.exs` | QueryRow encode/decode, batch/reference decode, and compact result encode costs by row shape and page size. |
 | `query_tuple_codec_candidates_bench.exs` | Production tuple comparison and binary encoding versus the previous paths. |
 | `query_planner_native_read_candidates_bench.exs` | Reference-vs-production fused composite and source-aware shard reads. |
 | `apply_projection_retention_bench.exs` | Previous unbounded compaction retention versus the production hybrid spill collector. |
@@ -140,6 +141,26 @@ bytes and about 14.7% median projection time; the compact codec itself encoded
 1.84x and decoded 1.58x faster than the previous ETF envelope. Large decoded
 fields are detached only when needed so selected sub-binaries cannot retain an
 unaccounted 64KiB cover.
+
+Eligible native-order metadata pages also fuse the composite scan and QueryRow
+lookup into one scope-bound LMDB read transaction. The retained paired runner
+measured 6.0-48.5% lower storage-operator p50 across 1, 25, and 100-row pages
+with 256-byte and 4KiB QueryRows. In the complete 25-row planner/executor path,
+the fused read improved p50 by about 2% beyond the separately measured
+prepared-key path; the combined change cleared 7.7% against the pre-change run.
+
+`query_row_codec_bench.exs` locks codec equivalence before measuring sparse,
+typical, and metadata-heavy rows at 1, 25, and 100-row page sizes. Paired runs
+against the exact pre-change module measured typical QueryRow decode about
+17-21% faster and encode about 8-10% faster. For metadata-heavy pages, omitting
+unused dynamic sections improved 100-row decode about 50% with about 38% less
+allocation. Selecting one attribute and one state-metadata field remained about
+19% faster with about 11% less allocation than materializing the full attribute
+section alone. Encoding a negotiated compact result once removes the separate
+measurement traversal, which accounted for about 23-30% extra work on typical
+25 and 100-row pages. Batch-decoder specialization, repeated-plan-validation
+elision, and nested metadata assembly measured below the acceptance threshold
+and were not added to the production path.
 
 Prepared residual predicates avoid repeated field lookup and use precomputed
 exact-type membership sets. A corrected production-vs-legacy paired run

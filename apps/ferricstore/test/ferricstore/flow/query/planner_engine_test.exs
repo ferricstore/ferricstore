@@ -11,6 +11,7 @@ defmodule Ferricstore.Flow.Query.PlannerEngineTest do
     Field,
     IndexDefinition,
     MandatoryScope,
+    PreparedResponse,
     Request,
     ResultCodec
   }
@@ -133,13 +134,14 @@ defmodule Ferricstore.Flow.Query.PlannerEngineTest do
       response_codec: :flow_query_result_v1
     }
 
-    assert {:ok, response} =
+    assert {:ok, %PreparedResponse{value: response, payload: payload}} =
              PlannerEngine.execute(execution_ctx, collection("tenant-a", "failed"))
 
     compact_bytes = ResultCodec.encoded_size(response)
 
     assert response.usage.response_bytes == compact_bytes
     assert compact_bytes < NativeValueCodec.encoded_size(response)
+    assert byte_size(payload) == compact_bytes
   end
 
   test "emits one bounded telemetry event after an admitted query completes" do

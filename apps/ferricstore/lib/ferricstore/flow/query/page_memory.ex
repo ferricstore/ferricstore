@@ -32,7 +32,32 @@ defmodule Ferricstore.Flow.Query.PageMemory do
              covering_field_count >= 0 do
     entry_count *
       (average_storage_bytes + @retained_entry_structure_bytes +
-         covering_field_count * @retained_covering_field_bytes)
+         estimated_covering_expansion(average_storage_bytes, covering_field_count))
+  end
+
+  @spec estimated_prefetched_bytes(non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
+          non_neg_integer()
+  def estimated_prefetched_bytes(entry_count, average_storage_bytes, covering_field_count)
+      when is_integer(entry_count) and entry_count >= 0 and is_integer(average_storage_bytes) and
+             average_storage_bytes >= 0 and is_integer(covering_field_count) and
+             covering_field_count >= 0 do
+    estimated_bytes(entry_count, average_storage_bytes, covering_field_count) +
+      prefetched_query_row_reference_bytes(entry_count)
+  end
+
+  @spec prefetched_query_row_reference_bytes(non_neg_integer()) :: non_neg_integer()
+  def prefetched_query_row_reference_bytes(entry_count)
+      when is_integer(entry_count) and entry_count >= 0,
+      do: entry_count * @retained_binary_reference_bytes
+
+  defp estimated_covering_expansion(_average_storage_bytes, 0), do: 0
+
+  # Every covered ID is encoded in the storage entry, so the aggregate storage
+  # estimate is a constant-time upper bound for the additional retained ID bytes.
+  defp estimated_covering_expansion(average_storage_bytes, covering_field_count) do
+    average_storage_bytes +
+      covering_field_count * @retained_covering_field_bytes +
+      @retained_binary_reference_bytes
   end
 
   defp covering_expansion(%{id: id, covering_record: covering_record})

@@ -590,6 +590,74 @@ defmodule Ferricstore.Flow.LMDB do
       ),
       do: {:error, :invalid_lmdb_range}
 
+  @spec composite_range_query_rows_bounded(
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          pos_integer(),
+          pos_integer(),
+          pos_integer()
+        ) ::
+          {:ok,
+           [
+             {{binary(), binary(), binary(), non_neg_integer(), non_neg_integer(), pos_integer(),
+               binary() | nil}, binary() | nil}
+           ], boolean(), non_neg_integer(), non_neg_integer()}
+          | {:error, term()}
+  def composite_range_query_rows_bounded(
+        path,
+        prefix,
+        state_key_prefix,
+        after_key,
+        before_key,
+        max_items,
+        max_scan_bytes,
+        max_query_row_bytes
+      )
+      when is_binary(path) and is_binary(prefix) and prefix != "" and
+             is_binary(state_key_prefix) and state_key_prefix != "" and
+             byte_size(state_key_prefix) <= @max_lmdb_key_bytes and is_binary(after_key) and
+             is_binary(before_key) and is_integer(max_items) and max_items > 0 and
+             max_items <= @max_bounded_range_items and is_integer(max_scan_bytes) and
+             max_scan_bytes > 0 and max_scan_bytes <= @max_bounded_range_bytes and
+             is_integer(max_query_row_bytes) and max_query_row_bytes > 0 and
+             max_query_row_bytes <= @max_bounded_range_bytes do
+    if valid_range_bound?(prefix, after_key) and valid_range_bound?(prefix, before_key) and
+         valid_range_order?(after_key, before_key) do
+      if Ferricstore.FS.dir?(path) do
+        NIF.lmdb_composite_range_query_rows_bounded(
+          path,
+          prefix,
+          state_key_prefix,
+          after_key,
+          before_key,
+          max_items,
+          max_scan_bytes,
+          max_query_row_bytes,
+          map_size()
+        )
+      else
+        {:ok, [], true, 0, 0}
+      end
+    else
+      {:error, :invalid_lmdb_range}
+    end
+  end
+
+  def composite_range_query_rows_bounded(
+        _path,
+        _prefix,
+        _state_key_prefix,
+        _after_key,
+        _before_key,
+        _max_items,
+        _max_scan_bytes,
+        _max_query_row_bytes
+      ),
+      do: {:error, :invalid_lmdb_range}
+
   @spec prefix_merge_entries([binary()], binary(), non_neg_integer(), pos_integer()) ::
           {:ok, [{non_neg_integer(), binary(), binary()}], non_neg_integer()}
           | {:error, term()}

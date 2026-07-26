@@ -18,6 +18,7 @@ defmodule Ferricstore.Flow.Query.Executor do
     PageMemory,
     QueryRecordStore,
     QueryRow,
+    QueryRowDecodePlan,
     QueryRowProjection,
     QueryRowStore,
     RecordOrder,
@@ -52,7 +53,6 @@ defmodule Ferricstore.Flow.Query.Executor do
   @maximum_storage_key_bytes 511
   @maximum_run_id_bytes Limits.max_run_id_bytes()
   @maximum_sort_key_bytes Limits.max_sort_key_bytes()
-
   @spec execute(map(), non_neg_integer(), Request.t(), Plan.t(), keyword()) ::
           {:ok, ExecutionResult.t()} | {:error, atom()}
   def execute(ctx, shard_index, request, plan, opts \\ [])
@@ -99,7 +99,11 @@ defmodule Ferricstore.Flow.Query.Executor do
         end
       end)
 
-    query_row_read = Keyword.get(opts, :query_row_read, &QueryRowStore.read_many/4)
+    query_row_read = Keyword.get(opts, :query_row_read, &QueryRowStore.read_many/5)
+
+    query_row_range_read =
+      Keyword.get(opts, :query_row_range_read, &default_query_row_range_read/7)
+
     clock_us = Keyword.get(opts, :clock_us, fn -> System.monotonic_time(:microsecond) end)
     now_ms = Keyword.get(opts, :now_ms, System.system_time(:millisecond))
 
@@ -109,6 +113,7 @@ defmodule Ferricstore.Flow.Query.Executor do
          {:ok, logical_partition} <- Ferricstore.Flow.Query.partition_key(request),
          {:ok, scope_keys} <-
            MandatoryScope.derive_keys(plan.mandatory_scope, logical_partition),
+         state_key_prefix <- Keys.state_key("", scope_keys.physical_partition_key),
          :ok <-
            validate_options(
              ctx,
@@ -118,11 +123,13 @@ defmodule Ferricstore.Flow.Query.Executor do
              range_read,
              record_read,
              query_row_read,
+             query_row_range_read,
              clock_us,
              now_ms
            ),
-         :ok <- validate_route(ctx, shard_index, scope_keys.physical_partition_key),
+         :ok <- validate_route(ctx, shard_index, state_key_prefix),
          :ok <- validate_plan(plan, request, logical_partition),
+         query_row_decode_plan <- QueryRowDecodePlan.for_query(request, plan),
          {:ok, record_matcher} <- prepare_record_matcher(plan, logical_partition),
          {:ok, prepared_residual_predicates} <-
            prepare_residual_predicates(plan.residual_predicates),
@@ -132,6 +139,8 @@ defmodule Ferricstore.Flow.Query.Executor do
          query_row_execution <-
            plan.record_source == :query_row and QueryRowProjection.eligible?(request, plan) and
              query_row_allowed,
+         fused_query_row_execution <-
+           fused_query_row_execution?(plan, opts, query_row_execution),
          {:ok, cursor_seek, cursor_key} <-
            initialize_cursor(ctx, request, plan, scope_keys.query_binding, now_ms, opts),
          {:ok, start_us} <- call_clock(clock_us),
@@ -153,6 +162,7 @@ defmodule Ferricstore.Flow.Query.Executor do
            budget: budget,
            logical_partition: logical_partition,
            physical_partition: scope_keys.physical_partition_key,
+           state_key_prefix: state_key_prefix,
            query_binding: scope_keys.query_binding,
            mandatory_scope: plan.mandatory_scope,
            record_matcher: record_matcher,
@@ -161,10 +171,13 @@ defmodule Ferricstore.Flow.Query.Executor do
            covering_execution: covering_execution,
            query_row_allowed: query_row_allowed,
            query_row_execution: query_row_execution,
+           fused_query_row_execution: fused_query_row_execution,
            path: path,
            range_read: range_read,
            record_read: record_read,
            query_row_read: query_row_read,
+           query_row_decode_plan: query_row_decode_plan,
+           query_row_range_read: query_row_range_read,
            page_entries: page_entries,
            page_bytes: page_bytes,
            clock_us: clock_us,
@@ -203,6 +216,18 @@ defmodule Ferricstore.Flow.Query.Executor do
   defp query_row_execution_enabled?(opts) do
     not Keyword.has_key?(opts, :record_read) or Keyword.has_key?(opts, :query_row_read)
   end
+
+  defp fused_query_row_execution?(
+         %Plan{order: :native, deduplicate: false},
+         opts,
+         true
+       ) do
+    Keyword.has_key?(opts, :query_row_range_read) or
+      (not Keyword.has_key?(opts, :range_read) and
+         not Keyword.has_key?(opts, :query_row_read))
+  end
+
+  defp fused_query_row_execution?(%Plan{}, _opts, _query_row_execution), do: false
 
   defp covering_execution(request, %Plan{record_source: :covering_index} = plan),
     do: CoveringProjection.field_types(request, plan.definition, plan.residual_predicates)
@@ -389,7 +414,7 @@ defmodule Ferricstore.Flow.Query.Executor do
            :ok <- check_deadline(state),
            {:ok, state} <- account_page(state, page),
            {:ok, state} <- retain_page(state, page),
-           {:ok, state} <- process_entries(state, range, cursor, page.entries) do
+           {:ok, state} <- process_entries(state, range, cursor, page) do
         state = release_page(state)
 
         cond do
@@ -435,25 +460,114 @@ defmodule Ferricstore.Flow.Query.Executor do
   defp effective_page_entries(state), do: state.page_entries
 
   defp read_page(state, range, cursor, max_entries, max_bytes) do
-    result =
-      try do
-        state.range_read.(state.path, range, cursor, max_entries, max_bytes)
-      rescue
-        _error -> {:error, :query_storage_unavailable}
-      catch
-        _kind, _reason -> {:error, :query_storage_unavailable}
+    {result, max_query_row_bytes} =
+      case prefetched_query_row_budget(state, max_entries, max_bytes) do
+        {:ok, query_row_bytes} ->
+          result =
+            call_query_row_range_read(
+              state,
+              range,
+              cursor,
+              max_entries,
+              max_bytes,
+              query_row_bytes
+            )
+
+          if match?({:error, :batch_value_budget_exceeded}, result),
+            do: {call_range_read(state, range, cursor, max_entries, max_bytes), nil},
+            else: {result, query_row_bytes}
+
+        :fallback ->
+          {call_range_read(state, range, cursor, max_entries, max_bytes), nil}
       end
 
     case result do
-      {:ok, page} -> validate_page(page, range, cursor, max_entries, max_bytes)
-      {:error, :range_entry_too_large} -> {:error, :query_scan_byte_budget_exceeded}
-      {:error, :invalid_composite_entry} -> {:error, :query_storage_inconsistent}
-      {:error, :invalid_composite_cursor} -> {:error, :query_storage_inconsistent}
-      {:error, :invalid_lmdb_range} -> {:error, :query_storage_inconsistent}
-      {:error, _reason} -> {:error, :query_storage_unavailable}
-      _invalid -> {:error, :query_storage_inconsistent}
+      {:ok, page} ->
+        validate_page(
+          page,
+          range,
+          cursor,
+          max_entries,
+          max_bytes,
+          max_query_row_bytes
+        )
+
+      {:error, :range_entry_too_large} ->
+        {:error, :query_scan_byte_budget_exceeded}
+
+      {:error, reason}
+      when reason in [
+             :invalid_composite_entry,
+             :invalid_composite_cursor,
+             :invalid_lmdb_range,
+             :invalid_query_row_read
+           ] ->
+        {:error, :query_storage_inconsistent}
+
+      {:error, _reason} ->
+        {:error, :query_storage_unavailable}
+
+      _invalid ->
+        {:error, :query_storage_inconsistent}
     end
   end
+
+  defp call_range_read(state, range, cursor, max_entries, max_bytes) do
+    try do
+      state.range_read.(state.path, range, cursor, max_entries, max_bytes)
+    rescue
+      _error -> {:error, :query_storage_unavailable}
+    catch
+      _kind, _reason -> {:error, :query_storage_unavailable}
+    end
+  end
+
+  defp call_query_row_range_read(
+         state,
+         range,
+         cursor,
+         max_entries,
+         max_scan_bytes,
+         max_query_row_bytes
+       ) do
+    try do
+      state.query_row_range_read.(
+        state.path,
+        range,
+        state.state_key_prefix,
+        cursor,
+        max_entries,
+        max_scan_bytes,
+        max_query_row_bytes
+      )
+    rescue
+      _error -> {:error, :query_storage_unavailable}
+    catch
+      _kind, _reason -> {:error, :query_storage_unavailable}
+    end
+  end
+
+  defp prefetched_query_row_budget(
+         %{fused_query_row_execution: true} = state,
+         max_entries,
+         max_scan_bytes
+       ) do
+    covering_fields = length(state.plan.definition.covering_fields)
+    average_scan_bytes = div(max_scan_bytes + max_entries - 1, max_entries)
+
+    maximum_page_bytes =
+      PageMemory.estimated_prefetched_bytes(max_entries, average_scan_bytes, covering_fields)
+
+    available_bytes =
+      state.budget.executor_memory_bytes - estimated_memory(state, 0) - maximum_page_bytes
+
+    case MemoryBudget.encoded_record_input_bytes(available_bytes) do
+      max_query_row_bytes when max_query_row_bytes > 0 -> {:ok, max_query_row_bytes}
+      _insufficient -> :fallback
+    end
+  end
+
+  defp prefetched_query_row_budget(_state, _max_entries, _max_scan_bytes), do: :fallback
 
   defp validate_page(
          %{
@@ -466,7 +580,8 @@ defmodule Ferricstore.Flow.Query.Executor do
          range,
          cursor,
          max_entries,
-         max_bytes
+         max_bytes,
+         max_query_row_bytes
        )
        when is_list(entries) and is_boolean(exhausted) and is_integer(scanned_entries) and
               is_integer(scanned_bytes) and scanned_entries >= 0 and scanned_bytes >= 0 and
@@ -474,12 +589,44 @@ defmodule Ferricstore.Flow.Query.Executor do
               scanned_bytes <= max_bytes do
     with :ok <- validate_entries(entries, range, cursor),
          :ok <- validate_page_cursor(entries, next_cursor, exhausted),
-         {:ok, memory_bytes} <- validate_scanned_bytes(entries, scanned_bytes) do
-      {:ok, Map.put(page, :memory_bytes, memory_bytes)}
+         {:ok, memory_bytes} <- validate_scanned_bytes(entries, scanned_bytes),
+         {:ok, query_row_memory_bytes} <-
+           validate_prefetched_query_rows(page, entries, max_query_row_bytes) do
+      {:ok, Map.put(page, :memory_bytes, memory_bytes + query_row_memory_bytes)}
     end
   end
 
-  defp validate_page(_page, _range, _cursor, _max_entries, _max_bytes),
+  defp validate_page(_page, _range, _cursor, _max_entries, _max_bytes, _max_query_row_bytes),
+    do: {:error, :query_storage_inconsistent}
+
+  defp validate_prefetched_query_rows(page, _entries, nil) do
+    if Map.has_key?(page, :query_row_values) or Map.has_key?(page, :query_row_bytes),
+      do: {:error, :query_storage_inconsistent},
+      else: {:ok, 0}
+  end
+
+  defp validate_prefetched_query_rows(
+         %{query_row_values: values, query_row_bytes: bytes},
+         entries,
+         max_bytes
+       )
+       when is_list(values) and length(values) == length(entries) and is_integer(bytes) and
+              bytes >= 0 and is_integer(max_bytes) and bytes <= max_bytes do
+    actual_bytes =
+      Enum.reduce_while(values, 0, fn
+        nil, total -> {:cont, total}
+        value, total when is_binary(value) -> {:cont, total + byte_size(value)}
+        _invalid, _total -> {:halt, :invalid}
+      end)
+
+    if actual_bytes == bytes do
+      {:ok, bytes + PageMemory.prefetched_query_row_reference_bytes(length(values))}
+    else
+      {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp validate_prefetched_query_rows(_page, _entries, _max_bytes),
     do: {:error, :query_storage_inconsistent}
 
   defp validate_page_cursor(_entries, nil, true), do: :ok
@@ -572,19 +719,26 @@ defmodule Ferricstore.Flow.Query.Executor do
     end
   end
 
-  defp process_entries(state, _range, _cursor, []), do: {:ok, state}
+  defp process_entries(state, _range, _cursor, %{entries: []}), do: {:ok, state}
 
-  defp process_entries(state, _range, _cursor, entries) do
+  defp process_entries(state, _range, _cursor, %{entries: entries} = page) do
     with {:ok, candidates, state} <- unique_candidates(entries, state),
-         {:ok, state} <- process_candidates(candidates, state) do
+         {:ok, state} <- process_candidates(candidates, page, state) do
       {:ok, state}
     end
   end
 
-  defp process_candidates(candidates, %{covering_execution: nil} = state),
+  defp process_candidates(
+         candidates,
+         %{query_row_values: values},
+         %{covering_execution: nil, query_row_execution: true, deduplicate: false} = state
+       ),
+       do: process_prefetched_query_row_candidates(candidates, values, state)
+
+  defp process_candidates(candidates, _page, %{covering_execution: nil} = state),
     do: process_uncovered_candidates(candidates, state)
 
-  defp process_candidates(candidates, state) do
+  defp process_candidates(candidates, _page, state) do
     cond do
       Enum.any?(candidates, &missing_covering_projection?/1) ->
         {:error, :query_storage_inconsistent}
@@ -596,6 +750,25 @@ defmodule Ferricstore.Flow.Query.Executor do
         process_uncovered_candidates(candidates, state)
     end
   end
+
+  defp process_prefetched_query_row_candidates(candidates, values, state)
+       when is_list(candidates) and is_list(values) and length(candidates) == length(values) do
+    state_keys = Enum.map(candidates, & &1.state_key)
+
+    case QueryRowStore.decode_many(
+           state_keys,
+           values,
+           state.now_ms,
+           state.query_row_decode_plan
+         ) do
+      {:ok, rows} -> process_query_row_prefix(candidates, rows, true, state)
+      {:error, :invalid_query_row} -> {:error, :query_storage_inconsistent}
+      _invalid -> {:error, :query_storage_inconsistent}
+    end
+  end
+
+  defp process_prefetched_query_row_candidates(_candidates, _values, _state),
+    do: {:error, :query_storage_inconsistent}
 
   defp missing_covering_projection?(%{covering_record: nil}), do: true
   defp missing_covering_projection?(_entry), do: false
@@ -689,7 +862,7 @@ defmodule Ferricstore.Flow.Query.Executor do
     |> Enum.reduce_while({:ok, [], state}, fn entry, {:ok, candidates, state} ->
       with {:ok, state} <- account_deadline_work(state) do
         cond do
-          entry.state_key != Keys.state_key(entry.id, state.physical_partition) ->
+          entry.state_key != state.state_key_prefix <> entry.id ->
             {:halt, {:error, :query_storage_inconsistent}}
 
           true ->
@@ -716,7 +889,7 @@ defmodule Ferricstore.Flow.Query.Executor do
     |> Enum.reduce_while({:ok, [], state}, fn entry, {:ok, candidates, state} ->
       with {:ok, state} <- account_deadline_work(state) do
         cond do
-          entry.state_key != Keys.state_key(entry.id, state.physical_partition) ->
+          entry.state_key != state.state_key_prefix <> entry.id ->
             {:halt, {:error, :query_storage_inconsistent}}
 
           MapSet.member?(state.seen, entry.id) ->
@@ -783,7 +956,14 @@ defmodule Ferricstore.Flow.Query.Executor do
 
     if max_value_bytes > 0 do
       try do
-        case state.query_row_read.(state.path, state_keys, state.now_ms, max_value_bytes) do
+        case call_query_row_read(
+               state.query_row_read,
+               state.path,
+               state_keys,
+               state.now_ms,
+               max_value_bytes,
+               state.query_row_decode_plan
+             ) do
           {:ok, rows, value_bytes, complete?}
           when is_list(rows) and is_integer(value_bytes) and value_bytes >= 0 and
                  value_bytes <= max_value_bytes and is_boolean(complete?) ->
@@ -814,6 +994,12 @@ defmodule Ferricstore.Flow.Query.Executor do
     else
       {:error, :query_row_batch_too_large}
     end
+  end
+
+  defp call_query_row_read(reader, path, state_keys, now_ms, max_value_bytes, decode_plan) do
+    if is_function(reader, 5),
+      do: reader.(path, state_keys, now_ms, max_value_bytes, decode_plan),
+      else: reader.(path, state_keys, now_ms, max_value_bytes)
   end
 
   defp process_query_row_prefix(candidates, rows, complete?, state)
@@ -862,7 +1048,6 @@ defmodule Ferricstore.Flow.Query.Executor do
         when is_map(record) and is_integer(expire_at_ms) and expire_at_ms >= 0 ->
           valid =
             state_key == entry.state_key and
-              state_key == Keys.state_key(entry.id, state.physical_partition) and
               scope_prefix == expected_scope_prefix and
               Locator.hydration_ready?(locator) and locator.flow_id == entry.id and
               locator.version == entry.record_version and Map.get(record, :id) == entry.id and
@@ -1685,6 +1870,7 @@ defmodule Ferricstore.Flow.Query.Executor do
          range_read,
          record_read,
          query_row_read,
+         query_row_range_read,
          clock_us,
          now_ms
        ) do
@@ -1694,7 +1880,8 @@ defmodule Ferricstore.Flow.Query.Executor do
         page_entries > 0 and page_entries <= @maximum_page_entries and is_integer(page_bytes) and
         page_bytes > 0 and page_bytes <= @maximum_page_bytes and is_function(range_read, 5) and
         (is_function(record_read, 4) or is_function(record_read, 5)) and
-        is_function(query_row_read, 4) and
+        (is_function(query_row_read, 4) or is_function(query_row_read, 5)) and
+        is_function(query_row_range_read, 7) and
         is_function(clock_us, 0) and is_integer(now_ms) and now_ms >= 0
 
     if valid, do: :ok, else: {:error, :query_engine_failure}
@@ -1708,13 +1895,14 @@ defmodule Ferricstore.Flow.Query.Executor do
          _range_read,
          _record_read,
          _query_row_read,
+         _query_row_range_read,
          _clock_us,
          _now_ms
        ),
        do: {:error, :query_engine_failure}
 
-  defp validate_route(ctx, shard_index, physical_partition) do
-    if Router.shard_for(ctx, Keys.state_key("", physical_partition)) == shard_index,
+  defp validate_route(ctx, shard_index, state_key_prefix) do
+    if Router.shard_for(ctx, state_key_prefix) == shard_index,
       do: :ok,
       else: {:error, :query_storage_inconsistent}
   rescue
@@ -1898,6 +2086,26 @@ defmodule Ferricstore.Flow.Query.Executor do
 
   defp default_range_read(path, range, cursor, max_entries, max_bytes),
     do: CompositeRangeReader.read(path, range, cursor, max_entries, max_bytes)
+
+  defp default_query_row_range_read(
+         path,
+         range,
+         state_key_prefix,
+         cursor,
+         max_entries,
+         max_scan_bytes,
+         max_query_row_bytes
+       ),
+       do:
+         CompositeRangeReader.read_query_rows(
+           path,
+           range,
+           state_key_prefix,
+           cursor,
+           max_entries,
+           max_scan_bytes,
+           max_query_row_bytes
+         )
 
   defp default_record_read(
          ctx,

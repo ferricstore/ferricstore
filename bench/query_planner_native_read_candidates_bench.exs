@@ -28,6 +28,9 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
       "multishard-manual" ->
         benchmark_multishard_manual()
 
+      "query-rows" ->
+        benchmark_query_rows()
+
       "smoke" ->
         smoke()
 
@@ -182,6 +185,132 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
         QueryPerformance.latency_summary(native_samples)
       )
     end)
+  end
+
+  defp benchmark_query_rows do
+    Enum.each([256, 4_096], fn query_row_bytes ->
+      definition = definition()
+      root = temp_root("native-query-rows-#{query_row_bytes}")
+      path = Path.join(root, "index")
+      File.mkdir_p!(path)
+
+      try do
+        query_row = :binary.copy(<<0x5A>>, query_row_bytes)
+
+        1..10_000
+        |> Stream.chunk_every(1_000)
+        |> Enum.each(fn indexes ->
+          ops =
+            Enum.flat_map(indexes, fn index ->
+              {key, value} = compact_entry(definition, index)
+              id = "run-#{String.pad_leading(Integer.to_string(index), 10, "0")}"
+              state_key = Keys.state_key(id, "tenant-benchmark")
+              [{:put, key, value}, {:put, state_key, query_row}]
+            end)
+
+          :ok = LMDB.write_batch(path, ops)
+        end)
+
+        prefix = IndexDefinition.storage_prefix(definition)
+
+        Enum.each([1, 25, 100], fn page ->
+          current = fn -> current_composite_query_rows(path, prefix, page) end
+          candidate = fn -> fused_composite_query_rows(path, prefix, page) end
+          expected = current.()
+          ^expected = candidate.()
+
+          Enum.each(1..50, fn _iteration ->
+            ^expected = current.()
+            ^expected = candidate.()
+          end)
+
+          samples = if page == 100, do: 300, else: 1_000
+
+          {current_samples, candidate_samples} =
+            Enum.reduce(1..samples, {[], []}, fn sample, {current_acc, candidate_acc} ->
+              :erlang.garbage_collect()
+
+              if rem(sample, 2) == 0 do
+                {current_ns, ^expected} = QueryPerformance.timed_ns(current)
+                {candidate_ns, ^expected} = QueryPerformance.timed_ns(candidate)
+                {[current_ns | current_acc], [candidate_ns | candidate_acc]}
+              else
+                {candidate_ns, ^expected} = QueryPerformance.timed_ns(candidate)
+                {current_ns, ^expected} = QueryPerformance.timed_ns(current)
+                {[current_ns | current_acc], [candidate_ns | candidate_acc]}
+              end
+            end)
+
+          current_summary = QueryPerformance.latency_summary(current_samples)
+          candidate_summary = QueryPerformance.latency_summary(candidate_samples)
+
+          QueryPerformance.print_summary(
+            "paired current composite + QueryRow/value-#{query_row_bytes}/page-#{page}",
+            current_summary
+          )
+
+          QueryPerformance.print_summary(
+            "paired fused composite + QueryRow/value-#{query_row_bytes}/page-#{page}",
+            candidate_summary
+          )
+
+          improvement =
+            1 - candidate_summary["p50_ns"] / max(current_summary["p50_ns"], 1)
+
+          IO.puts(
+            "paired fused improvement value=#{query_row_bytes} page=#{page} " <>
+              "p50_percent=#{Float.round(improvement * 100, 2)}"
+          )
+        end)
+      after
+        release(path)
+        File.rm_rf!(root)
+      end
+    end)
+  end
+
+  defp current_composite_query_rows(path, prefix, page) do
+    {:ok, entries, exhausted, scanned_bytes} =
+      LMDB.composite_range_entries_bounded(path, prefix, "", "", page, @max_bytes)
+
+    state_keys = Enum.map(entries, &elem(&1, 2))
+
+    {:ok, rows, query_row_bytes, true} =
+      LMDB.get_many_prefix_bounded(path, state_keys, @max_bytes)
+
+    query_rows =
+      Enum.map(rows, fn
+        {:ok, value} -> value
+        :not_found -> nil
+      end)
+
+    %{
+      pairs: Enum.zip(entries, query_rows),
+      exhausted: exhausted,
+      scanned_bytes: scanned_bytes,
+      query_row_bytes: query_row_bytes
+    }
+  end
+
+  defp fused_composite_query_rows(path, prefix, page) do
+    {:ok, pairs, exhausted, scanned_bytes, query_row_bytes} =
+      LMDB.composite_range_query_rows_bounded(
+        path,
+        prefix,
+        Keys.state_key("", "tenant-benchmark"),
+        "",
+        "",
+        page,
+        @max_bytes,
+        @max_bytes
+      )
+
+    %{
+      pairs: pairs,
+      exhausted: exhausted,
+      scanned_bytes: scanned_bytes,
+      query_row_bytes: query_row_bytes
+    }
   end
 
   defp current_compact_range(path, prefix, after_key, before_key, page) do
