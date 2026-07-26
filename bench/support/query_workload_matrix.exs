@@ -247,7 +247,7 @@ defmodule Ferricstore.Bench.QueryWorkloadMatrix do
         true,
         %{
           scanned_entries: {:max, 512},
-          hydrated_records: {:max, 512},
+          hydrated_records: {:eq, 0},
           range_seeks: {:eq, 1}
         }
       ),
@@ -500,7 +500,7 @@ defmodule Ferricstore.Bench.QueryWorkloadMatrix do
   defp materialize_usage(:exact_match_usage, matching) do
     %{
       scanned_entries: {:eq, matching},
-      hydrated_records: {:eq, matching},
+      hydrated_records: {:eq, 0},
       residual_checks: {:eq, 0}
     }
   end
@@ -518,7 +518,7 @@ defmodule Ferricstore.Bench.QueryWorkloadMatrix do
   defp exact_page_usage do
     %{
       scanned_entries: {:eq, @page_limit + 1},
-      hydrated_records: {:eq, @page_limit + 1},
+      hydrated_records: {:eq, 0},
       range_seeks: {:eq, 1}
     }
   end
@@ -595,7 +595,7 @@ defmodule Ferricstore.Bench.QueryWorkloadMatrix do
   defp record_source(:counter_lookup), do: :transactional_counter
   defp record_source(:count_scan), do: :covering_index
   defp record_source(path) when path in [:empty, :reject], do: :none
-  defp record_source(_record_path), do: :authoritative_log
+  defp record_source(_record_path), do: :query_row
 
   defp collection(predicates, order_by \\ [{:updated_at_ms, :desc}]) do
     Request.collection(
