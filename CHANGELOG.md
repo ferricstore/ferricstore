@@ -10,6 +10,7 @@ All notable changes to FerricStore will be documented here.
 - Reduced QueryRow and compact-result codec work without changing persisted or wire bytes. QueryRows parse their state identity once, construct the final row once, and validate skipped metadata without materializing it; prepared query decode plans retain only dynamic fields used by indexes, filters, ordering, or projection. Negotiated compact results are encoded and sized once before native framing. Metadata-heavy 100-row selective decode improved about 50% with about 38% less allocation, and exact-field decode remained about 19% faster with about 11% less allocation than materializing the full attribute section.
 - Kept failed local transactional read-modify-write operations from touching LFU metadata and skipped the redundant LFU update before successful replacement writes.
 - Made a history projector that restarts with unresolved Raft work rescan its durable fsynced log before serving reads, without adding recovery scans to normal startup or work to the query hot path.
+- Retried compact query projection when a concurrent Raft update replaces its prepared source before durability, while continuing to fail closed when the live keydir still references a genuinely missing source frame.
 
 ## 0.11.0 - 2026-07-26
 

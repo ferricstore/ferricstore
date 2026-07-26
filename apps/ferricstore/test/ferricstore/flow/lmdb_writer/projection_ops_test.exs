@@ -911,6 +911,97 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
              Enum.map(sources, &{&1.record.id, &1.record.version})
   end
 
+  test "versioned projection retries when its prepared source is replaced before durability" do
+    root = tmp_lmdb_path("query_row_source_rollover")
+    path = Path.join(root, "query")
+    keydir = :ets.new(:query_row_source_rollover, [:set, :public])
+    state_key = Keys.state_key("source-rollover", "tenant-a")
+
+    old_record =
+      active_flow_record("source-rollover", "jobs", "tenant-a")
+      |> Map.merge(%{version: 1, state: "queued", state_enter_seq: 1})
+
+    new_record =
+      old_record
+      |> Map.merge(%{version: 2, state: "ready", state_enter_seq: 2})
+
+    old_encoded = Ferricstore.Flow.encode_record(old_record)
+    new_encoded = Ferricstore.Flow.encode_record(new_record)
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, 71, [
+               {state_key, old_encoded, 0}
+             ])
+
+    :ets.insert(
+      keydir,
+      {state_key, nil, 0, 0, {:waraft_apply_projection, 71}, 0, byte_size(old_encoded)}
+    )
+
+    state = %{
+      path: path,
+      instance_ctx: %{data_dir: root, keydir_refs: {keydir}},
+      shard_index: 0,
+      terminal_count_inits: MapSet.new()
+    }
+
+    parent = self()
+
+    disk_lock =
+      Task.async(fn ->
+        Ferricstore.Raft.WARaftSegmentReader.with_apply_projection_disk_lock(root, 0, fn ->
+          send(parent, :projection_disk_locked)
+          assert_receive :release_projection_disk, 1_000
+          :ok
+        end)
+      end)
+
+    assert_receive :projection_disk_locked, 1_000
+
+    projection =
+      Task.async(fn ->
+        Process.put(:ferricstore_waraft_apply_projection_lock_backoff_hook, fn _wait_ms ->
+          send(parent, :projection_waiting_for_disk)
+        end)
+
+        ProjectionOps.expand_ops(state, [
+          {:project_flow_state_from_source, state_key, 1}
+        ])
+      end)
+
+    assert_receive :projection_waiting_for_disk, 1_000
+
+    assert :ok =
+             Ferricstore.Raft.WARaftSegmentReader.put_apply_projection(root, 0, 72, [
+               {state_key, new_encoded, 0}
+             ])
+
+    :ets.insert(
+      keydir,
+      {state_key, nil, 0, 0, {:waraft_apply_projection, 72}, 0, byte_size(new_encoded)}
+    )
+
+    assert 1 ==
+             Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(root, 0, [
+               {71, state_key}
+             ])
+
+    send(disk_lock.pid, :release_projection_disk)
+    assert :ok = Task.await(disk_lock)
+
+    assert {:ok, ops, _state} = Task.await(projection)
+    assert {:put, ^state_key, query_row} = Enum.find(ops, &match?({:put, ^state_key, _}, &1))
+
+    assert {:ok, %{record: %{version: 2, state: "ready"}, locator: locator}} =
+             QueryRowCodec.decode(query_row, state_key)
+
+    assert locator.file_id == {:waraft_apply_projection, 72}
+
+    on_exit(fn ->
+      Ferricstore.Raft.WARaftSegmentReader.clear_apply_projection_cache(root, 0)
+    end)
+  end
+
   test "inline Flow projection commands are rejected" do
     path = tmp_lmdb_path("inline_without_source")
     state_key = Ferricstore.Flow.Keys.state_key("inline-flow", "tenant-a")

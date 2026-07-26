@@ -32,8 +32,8 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       ops = coalesce_flow_state_projections(ops)
       projection_keys = projection_prefetch_keys(ops)
 
-      with {:ok, prepared_sources} <- prepare_flow_projection_sources(expansion_state, ops),
-           :ok <- ensure_prepared_sources_durable(expansion_state, prepared_sources),
+      with {:ok, prepared_sources} <-
+             prepare_durable_flow_projection_sources(expansion_state, ops),
            {:ok, prepared_sources} <-
              physicalize_prepared_sources(expansion_state, prepared_sources) do
         expansion_state =
@@ -108,6 +108,39 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end)
   end
 
+  defp prepare_durable_flow_projection_sources(state, ops) do
+    case prepare_flow_projection_sources_once(state, ops) do
+      {:error, {:query_row_source_changed, _key}} = changed ->
+        {retries, sleep_ms} = source_pending_config()
+        retry_durable_flow_projection_sources(state, ops, changed, retries, sleep_ms)
+
+      result ->
+        result
+    end
+  end
+
+  defp prepare_flow_projection_sources_once(state, ops) do
+    with {:ok, prepared} <- prepare_flow_projection_sources(state, ops),
+         :ok <- ensure_prepared_sources_durable(state, prepared) do
+      {:ok, prepared}
+    end
+  end
+
+  defp retry_durable_flow_projection_sources(_state, _ops, changed, 0, _sleep_ms),
+    do: changed
+
+  defp retry_durable_flow_projection_sources(state, ops, _changed, retries, sleep_ms) do
+    if sleep_ms > 0, do: Process.sleep(sleep_ms)
+
+    case prepare_flow_projection_sources_once(state, ops) do
+      {:error, {:query_row_source_changed, _key}} = changed ->
+        retry_durable_flow_projection_sources(state, ops, changed, retries - 1, sleep_ms)
+
+      result ->
+        result
+    end
+  end
+
   defp prepare_flow_projection_source(state, {:project_flow_state_from_source, key})
        when is_binary(key),
        do: prepared_source_result(key, read_source_flow(state, key))
@@ -157,18 +190,58 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   defp ensure_prepared_source_refs_durable(_state, []), do: :ok
 
   defp ensure_prepared_source_refs_durable(
-         %{instance_ctx: %{data_dir: data_dir}, shard_index: shard_index},
+         %{instance_ctx: %{data_dir: data_dir}, shard_index: shard_index} = state,
          refs
        )
        when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
     case WARaftSegmentReader.ensure_apply_projection_entries_durable(data_dir, shard_index, refs) do
-      {:ok, _removed} -> :ok
-      {:error, reason} -> {:error, {:query_row_source_not_durable, reason}}
+      {:ok, _removed} ->
+        :ok
+
+      {:error, {:apply_projection_entry_not_durable, index, key} = reason} ->
+        classify_missing_prepared_source(state, index, key, reason)
+
+      {:error, reason} ->
+        {:error, {:query_row_source_not_durable, reason}}
     end
   end
 
   defp ensure_prepared_source_refs_durable(_state, _refs),
     do: {:error, :query_row_source_context_unavailable}
+
+  defp classify_missing_prepared_source(state, index, key, reason) do
+    case current_prepared_source_ref(state, index, key) do
+      :changed -> {:error, {:query_row_source_changed, key}}
+      _current_or_unknown -> {:error, {:query_row_source_not_durable, reason}}
+    end
+  end
+
+  defp current_prepared_source_ref(state, index, key) do
+    case source_keydir(state) do
+      nil ->
+        :unknown
+
+      keydir ->
+        case :ets.lookup(keydir, key) do
+          [
+            {^key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, ^index}, _offset,
+             _value_size}
+          ] ->
+            :current
+
+          [{^key, _value, _expire_at_ms, _lfu, _file_id, _offset, _value_size}] ->
+            :changed
+
+          [] ->
+            :changed
+
+          _invalid ->
+            :unknown
+        end
+    end
+  rescue
+    ArgumentError -> :unknown
+  end
 
   defp physicalize_prepared_sources(state, prepared) when is_map(prepared) do
     Enum.reduce_while(prepared, {:ok, %{}}, fn
