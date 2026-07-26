@@ -564,12 +564,7 @@ defmodule Ferricstore.FlowValuePayloadTest do
 
     assert {:ok, completed} = FerricStore.flow_get(id, partition_key: "tenant-retention")
 
-    ShardHelpers.eventually(
-      fn -> Ferricstore.HLC.now_ms() > completed.terminal_retention_until_ms end,
-      "retention deadline did not elapse",
-      1_000,
-      10
-    )
+    :ok = Ferricstore.HLC.update({completed.terminal_retention_until_ms + 1, 0})
 
     assert pid = Process.whereis(Ferricstore.Flow.RetentionSweeper)
     send(pid, :sweep)
