@@ -111,12 +111,15 @@ mod tests {
 
     #[test]
     fn allocate_vec_bytes_increase() {
-        let before = allocated_bytes();
+        let before = total_allocated_bytes();
         let v: Vec<u8> = vec![0u8; 65_536]; // 64 KiB
-        let after = allocated_bytes();
+        std::hint::black_box(&v);
+        let after = total_allocated_bytes();
         assert!(
-            after > before,
-            "expected increase after Vec alloc: before={before}, after={after}"
+            after - before >= v.capacity() as u64,
+            "expected at least {} allocated bytes, got {}",
+            v.capacity(),
+            after - before
         );
         drop(v);
     }
