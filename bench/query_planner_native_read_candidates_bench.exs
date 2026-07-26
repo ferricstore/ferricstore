@@ -230,9 +230,10 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
     end
   end
 
-  defp decode_compact(key, value = <<1, _rest::binary>>) do
-    with <<1, id_bytes::unsigned-big-32, version::unsigned-big-64, expire_at_ms::unsigned-big-64,
-           payload::binary>> <- value,
+  defp decode_compact(key, value = <<1, expected_checksum::unsigned-big-32, body::binary>>) do
+    with true <- :erlang.crc32(body) == expected_checksum,
+         <<id_bytes::unsigned-big-32, version::unsigned-big-64, expire_at_ms::unsigned-big-64,
+           payload::binary>> <- body,
          true <- id_bytes > 0 and id_bytes < byte_size(payload),
          <<id::binary-size(id_bytes), state_key::binary>> <- payload,
          true <- version <= 9_007_199_254_740_991,
@@ -245,10 +246,11 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
     end
   end
 
-  defp decode_compact(key, value = <<2, _rest::binary>>) do
-    with <<2, id_bytes::unsigned-big-32, state_bytes::unsigned-big-32, version::unsigned-big-64,
+  defp decode_compact(key, value = <<2, expected_checksum::unsigned-big-32, body::binary>>) do
+    with true <- :erlang.crc32(body) == expected_checksum,
+         <<id_bytes::unsigned-big-32, state_bytes::unsigned-big-32, version::unsigned-big-64,
            expire_at_ms::unsigned-big-64, covering_bytes::unsigned-big-32, payload::binary>> <-
-           value,
+           body,
          true <- id_bytes > 0 and state_bytes > 0 and covering_bytes > 0,
          <<id::binary-size(id_bytes), state_key::binary-size(state_bytes),
            encoded_cover::binary-size(covering_bytes)>> <- payload,
@@ -439,11 +441,7 @@ defmodule Ferricstore.Bench.QueryPlannerNativeReadCandidates do
 
     {:ok, [entry]} = CompositeIndex.entries(definition, record, state_key, 0)
 
-    value =
-      <<1, byte_size(id)::unsigned-big-32, record.version::unsigned-big-64, 0::unsigned-big-64,
-        id::binary, state_key::binary>>
-
-    {entry.key, value}
+    {entry.key, entry.value}
   end
 
   defp compact_record(id, version) do
