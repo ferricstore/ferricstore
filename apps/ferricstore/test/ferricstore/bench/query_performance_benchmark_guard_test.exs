@@ -630,6 +630,11 @@ defmodule Ferricstore.Bench.QueryPerformanceBenchmarkGuardTest do
     refute soak =~ "Codec.decode_records("
 
     assert index =~ "storage.encoded_by_key"
+    assert index =~ "QueryRecordStore.read_many("
+    assert index =~ "authoritative_fallback_latency_us"
+    assert index =~ "query_row_speedup_p50"
+    assert index =~ "query_row.usage.hydrated_records == 0"
+    assert index =~ "authoritative.usage.hydrated_records > 0"
     refute index =~ "Codec.encode_record(record)"
   end
 

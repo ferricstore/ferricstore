@@ -487,9 +487,13 @@ decode/allocation cost. Cover values are validated and bounded at write time;
 an incomplete, malformed, or identity-mismatched cover is a storage-consistency
 error, not a silent authoritative fallback. QueryRow-visible projections and
 residual filters can instead use the compact metadata row with no log read.
-Full-record, payload-dependent, fixed, history, and lineage reads use
-authoritative rows. General top-K projections still reduce retained winner-map
-data, response bytes, and network/client decode work.
+General run collection reads, including bare `RETURN RECORDS`, use that row
+because it contains the complete public run-field allowlist. Point, fixed,
+history, lineage, and internal payload-dependent reads use authoritative rows.
+FQL never returns payload, result, error, named-value, lease-token, fencing, or
+retention fields; fetch a payload or named value explicitly after selecting the
+run IDs that need it. General top-K projections still reduce retained
+winner-map data, response bytes, and network/client decode work.
 
 `EXPLAIN` exposes this as `plan.projection`: `fields` is the requested list (or
 `all_allowlisted_fields`), and `source` is `covering_index`, `query_row`,
@@ -1285,7 +1289,8 @@ native envelope
   -> mandatory-scope derivation
   -> active-index snapshot and costed bounded plan
   -> cursor authentication / physical generation pin
-  -> LMDB range read + authoritative hydration + predicate recheck
+  -> LMDB range read + covering/QueryRow evaluation
+  -> bounded authoritative hydration only when the selected path requires it
   -> bounded sort/deduplication
   -> cursor issuance and versioned response settlement
 ```
@@ -1333,7 +1338,9 @@ The planner assigns one physical read class and reports it through EXPLAIN:
 | metadata-row-covered | Composite candidate plus QueryRow; zero log reads. |
 | payload hydration required | QueryRow locator plus bounded grouped physical log reads. |
 
-Full records and payload-bearing projections are hydrated in batches grouped
+Bare and explicitly projected run collection records are metadata-row-covered
+when their physical path supports QueryRow execution. Point, fixed, history,
+lineage, and internal payload-dependent records are hydrated in batches grouped
 by log kind and segment. Admission charges distinct physical frame bytes before
 I/O, then charges materialized blob bytes and decoded record memory. Every
 hydrated value must match locator size/checksum, Flow identity/version, and
@@ -1412,8 +1419,9 @@ Each range is proven to remain under its mandatory partition prefix.
 Execution validates index tuple encoding and generation, physical key
 ownership/version, partition scope, and every applicable predicate, and rejects
 storage inconsistencies instead of returning a possibly wrong row. A
-covering-eligible row is validated from its bounded typed cover; other rows are
-hydrated and rechecked against authoritative state. Overlapping ranges and
+covering-eligible row is validated from its bounded typed cover; a
+metadata-row-covered result is validated and rechecked from QueryRow; only
+authoritative paths are hydrated from the log. Overlapping ranges and
 multivalue expansions deduplicate before output.
 
 Exact counters are updated transactionally with projection keys and bind the

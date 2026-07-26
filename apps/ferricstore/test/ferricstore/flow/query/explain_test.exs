@@ -19,7 +19,7 @@ defmodule Ferricstore.Flow.Query.ExplainTest do
     assert first_explain.version == "ferric.flow.explain/v1"
     assert first_explain.status == "planned"
     assert first_explain.plan.path == "ordered_range"
-    assert first_explain.plan.record_source == "authoritative_log"
+    assert first_explain.plan.record_source == "query_row"
 
     assert first_explain.plan.index == %{
              logical_id: "flow_runs_tenant_state_updated",
@@ -29,9 +29,10 @@ defmodule Ferricstore.Flow.Query.ExplainTest do
 
     assert first_explain.plan.range_count == 1
     assert first_explain.plan.order == "native"
-    assert first_explain.plan.projection.source == "authoritative_log"
-    assert first_explain.plan.projection.requires_hydration
-    assert first_explain.estimate.hydration_bytes > 0
+    assert first_explain.plan.projection.source == "query_row"
+    refute first_explain.plan.projection.requires_hydration
+    assert first_explain.estimate.hydration_bytes == 0
+    assert first_explain.estimate.metadata_bytes > 0
 
     assert first_explain.plan.mandatory_scope == %{
              mode: "dedicated",

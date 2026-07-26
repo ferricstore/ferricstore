@@ -29,8 +29,12 @@ LMDB stores one compact QueryRow for each current Flow state. It contains
 query-visible metadata and a checked physical log locator, not the full record
 or payload. Composite indexes store only identity/version/expiry plus declared
 covering fields and never copy the locator. Covered and metadata-only queries
-therefore avoid log reads; full-record and payload projections use bounded,
-grouped log reads and validate size, checksum, identity, and logical version.
+therefore avoid log reads. Bare run collection records are metadata-only because
+QueryRow contains the full public FQL run-field allowlist. Point, fixed,
+history, lineage, and internal payload-dependent reads use bounded, grouped log
+reads and validate size, checksum, identity, and logical version. FQL does not
+return payload, result, error, named-value, lease-token, fencing, or retention
+fields.
 
 Compaction relocates the central QueryRow locator with a logical-version and
 segment-generation compare-and-swap. It does not rewrite every composite

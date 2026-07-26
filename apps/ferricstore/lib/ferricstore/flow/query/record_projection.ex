@@ -1,30 +1,11 @@
 defmodule Ferricstore.Flow.Query.RecordProjection do
   @moduledoc false
 
-  alias Ferricstore.Flow.Query.{Field, Limits}
+  alias Ferricstore.Flow.Query.{Field, Limits, RunRecordFields}
 
   # Query records are an allowlist so newly added storage/control fields never
   # become remotely visible without an explicit query-contract decision.
-  @fields [
-    :id,
-    :type,
-    :state,
-    :version,
-    :priority,
-    :partition_key,
-    :created_at_ms,
-    :updated_at_ms,
-    :next_run_at_ms,
-    :lease_deadline_ms,
-    :attempts,
-    :run_state,
-    :max_active_ms,
-    :parent_flow_id,
-    :root_flow_id,
-    :correlation_id,
-    :attributes,
-    :state_meta
-  ]
+  @fields RunRecordFields.all()
   @event_fields [:event_id, :fields]
   @field_set MapSet.new(@fields)
   @event_field_set MapSet.new(@event_fields)

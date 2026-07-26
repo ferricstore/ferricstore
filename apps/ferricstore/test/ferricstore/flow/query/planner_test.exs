@@ -271,7 +271,7 @@ defmodule Ferricstore.Flow.Query.PlannerTest do
     assert String.starts_with?(range.after_key, range.prefix)
   end
 
-  test "classifies compact-row and authoritative-log execution explicitly" do
+  test "classifies projected and bare collection records as compact-row execution" do
     index = active_index(state_definition())
 
     statistics =
@@ -311,17 +311,17 @@ defmodule Ferricstore.Flow.Query.PlannerTest do
     assert {:ok, full_plan} =
              Planner.plan(full, [index], stats: stats_lookup(statistics), now_ms: @now_ms)
 
-    assert Map.fetch!(full_plan, :record_source) == :authoritative_log
-    assert full_plan.estimate.hydrated_records == 20
-    assert full_plan.estimate.hard_hydrated_records == 26
-    assert full_plan.estimate.metadata_rows == 0
+    assert Map.fetch!(full_plan, :record_source) == :query_row
+    assert full_plan.estimate.hydrated_records == 0
+    assert full_plan.estimate.hard_hydrated_records == 0
+    assert full_plan.estimate.metadata_rows == 20
+    assert full_plan.estimate.hard_metadata_rows == 26
 
-    assert {:ok, insufficient_hydration} =
-             Budget.lower(Budget.default(), hydrated_records: 25)
+    assert {:ok, minimal_hydration} = Budget.lower(Budget.default(), hydrated_records: 1)
 
-    assert {:ok, %Plan{path: :reject, fallback_reason: :hydration_budget_exceeded}} =
+    assert {:ok, %Plan{record_source: :query_row}} =
              Planner.plan(full, [index],
-               budget: insufficient_hydration,
+               budget: minimal_hydration,
                stats: stats_lookup(statistics),
                now_ms: @now_ms
              )

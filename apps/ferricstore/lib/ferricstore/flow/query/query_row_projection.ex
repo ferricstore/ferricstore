@@ -20,12 +20,23 @@ defmodule Ferricstore.Flow.Query.QueryRowProjection do
       when path in @paths,
       do: true
 
+  def eligible?(
+        %Request{source: :runs, return: :record, projection: :all},
+        %Plan{path: path}
+      )
+      when path in @paths,
+      do: true
+
   def eligible?(%Request{} = request, %Plan{path: path}), do: eligible?(request, path)
 
   @spec eligible?(Request.t(), atom()) :: boolean()
   def eligible?(%Request{source: :runs, return: :count}, path) when path in @paths, do: true
 
   def eligible?(%Request{source: :runs, return: :record, projection: [_field | _rest]}, path)
+      when path in @paths,
+      do: true
+
+  def eligible?(%Request{source: :runs, return: :record, projection: :all}, path)
       when path in @paths,
       do: true
 

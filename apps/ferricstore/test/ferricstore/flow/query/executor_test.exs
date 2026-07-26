@@ -195,6 +195,63 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     assert result.usage.residual_checks == 3
   end
 
+  test "returns the complete bare run allowlist from query rows without log hydration" do
+    definition = state_definition()
+    request = request([eq(:state, "failed")], 2)
+
+    records = [
+      record("run-1", 140)
+      |> Map.merge(%{
+        attributes: %{"customer" => "one", "reviewed" => nil},
+        state_meta: %{"failed" => %{"reason" => "declined"}},
+        payload_ref: "payload-secret",
+        result_ref: "result-secret",
+        error_ref: "error-secret",
+        lease_token: "lease-secret"
+      }),
+      record("run-2", 130)
+      |> Map.merge(%{
+        next_run_at_ms: 500,
+        run_state: "ready",
+        root_flow_id: "run-2",
+        correlation_id: "correlation-2"
+      })
+    ]
+
+    {range_read, _record_read} = storage(definition, records)
+
+    rows =
+      Map.new(records, fn record ->
+        row = query_row(record)
+        {state_key(record), %{row | record: Map.take(row.record, RecordProjection.fields())}}
+      end)
+
+    query_row_read = fn _path, state_keys, _now_ms, _max_bytes ->
+      selected = Enum.map(state_keys, &Map.get(rows, &1))
+      {:ok, selected, MemoryBudget.term_bytes(selected), true}
+    end
+
+    assert {:ok, result} =
+             Executor.execute(context(), 0, request, plan!(request, definition),
+               range_read: range_read,
+               query_row_read: query_row_read,
+               record_read: fn _path, _keys, _now_ms, _max_bytes ->
+                 flunk("a bare metadata record must not read the authoritative log")
+               end,
+               now_ms: 1_000
+             )
+
+    assert result.records == Enum.map(records, &Map.take(&1, RecordProjection.fields()))
+    assert result.usage.hydrated_records == 0
+
+    Enum.each(result.records, fn record ->
+      refute Map.has_key?(record, :payload_ref)
+      refute Map.has_key?(record, :result_ref)
+      refute Map.has_key?(record, :error_ref)
+      refute Map.has_key?(record, :lease_token)
+    end)
+  end
+
   test "rejects a query-row plan with a non-durable locator before log IO" do
     definition = state_definition()
 
@@ -222,7 +279,7 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
              )
   end
 
-  test "keeps RETURN RECORDS on the authoritative hydration path" do
+  test "a custom authoritative reader remains an explicit query-row fallback" do
     definition = state_definition()
     request = request([eq(:state, "failed")], 1)
     record = record("run-1", 140)
@@ -232,9 +289,6 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     assert {:ok, result} =
              Executor.execute(context(), 0, request, plan!(request, definition),
                range_read: range_read,
-               query_row_read: fn _path, _state_keys, _now_ms, _max_bytes ->
-                 flunk("RETURN RECORDS must not use metadata rows as authoritative records")
-               end,
                record_read: fn path, keys, now_ms, max_bytes ->
                  send(parent, :authoritative_hydration)
                  record_read.(path, keys, now_ms, max_bytes)
@@ -2107,7 +2161,7 @@ defmodule Ferricstore.Flow.Query.ExecutorTest do
     tampered_plans = [
       %{plan | version: 2},
       %{plan | query_fingerprint: String.duplicate("0", 64)},
-      %{plan | record_source: :query_row}
+      %{plan | record_source: :authoritative_log}
     ]
 
     for tampered <- tampered_plans do

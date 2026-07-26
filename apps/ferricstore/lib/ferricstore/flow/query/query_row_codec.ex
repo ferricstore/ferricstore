@@ -7,11 +7,12 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
     Attributes,
     Keys,
     Locator,
-    RecordProjection,
     StateMeta,
     StorageScope,
     SystemMetadata
   }
+
+  alias Ferricstore.Flow.RecordProjection, as: FlowRecordProjection
 
   alias Ferricstore.Flow.Query.{
     CoveringCodec,
@@ -19,7 +20,8 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
     Limits,
     QueryRow,
     QueryRowReference,
-    QueryRowPrimitives
+    QueryRowPrimitives,
+    RunRecordFields
   }
 
   @format "ferric.flow.query.row/v1"
@@ -56,24 +58,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
                          @locator_nil_expiry_flag ||| @locator_expiry_override_flag |||
                          @locator_frame_size_flag
 
-  @builtin_storage_fields [
-    :id,
-    :version,
-    :type,
-    :state,
-    :priority,
-    :partition_key,
-    :created_at_ms,
-    :updated_at_ms,
-    :next_run_at_ms,
-    :lease_deadline_ms,
-    :attempts,
-    :run_state,
-    :max_active_ms,
-    :parent_flow_id,
-    :root_flow_id,
-    :correlation_id
-  ]
+  @builtin_storage_fields RunRecordFields.builtins()
   @builtin_encoding_fields @builtin_storage_fields -- [:id, :version]
   @valid_builtin_bitmap (1 <<< length(@builtin_encoding_fields)) - 1
   @internal_storage_fields [
@@ -382,7 +367,7 @@ defmodule Ferricstore.Flow.Query.QueryRowCodec do
   defp public_record(record) do
     public =
       record
-      |> RecordProjection.public()
+      |> FlowRecordProjection.public()
       |> Map.merge(Map.take(record, @internal_storage_fields))
 
     if is_map(public), do: {:ok, public}, else: :error

@@ -200,6 +200,36 @@ defmodule Ferricstore.Flow.Query.EngineTest do
     end
   end
 
+  defmodule StateTimeIndexProvider do
+    @behaviour FerricStore.Flow.QueryIndexProvider
+
+    @impl true
+    def snapshot(_ctx, _shard_index) do
+      definition =
+        Ferricstore.Flow.Query.IndexDefinition.new!(%{
+          id: "engine_test_runs_by_state_updated",
+          version: 1,
+          fields: [
+            {:partition_key, :asc},
+            {:state, :asc},
+            {:updated_at_ms, :desc}
+          ]
+        })
+
+      index =
+        Ferricstore.Flow.Query.RegisteredIndex.new!(definition, :active,
+          coverage: %{complete_shards: 1, total_shards: 1, validation: :passed}
+        )
+
+      {:ok,
+       Ferricstore.Flow.Query.RegistrySnapshot.new!(%{
+         epoch: 1,
+         catalog_version: 1,
+         indexes: [index]
+       })}
+    end
+  end
+
   setup do
     previous = Application.get_env(:ferricstore, FerricStore.Flow.QueryEngine)
 
@@ -299,6 +329,101 @@ defmodule Ferricstore.Flow.Query.EngineTest do
 
       assert id == "wanted-#{suffix}"
     after
+      IsolatedInstance.checkin(ctx)
+    end
+  end
+
+  test "bare state/time pages return public metadata from query rows without payload hydration" do
+    ctx = IsolatedInstance.checkout(shard_count: 1, query_index_provider: StateTimeIndexProvider)
+
+    {:ok, admission} =
+      Ferricstore.Flow.Query.AdmissionController.start_link(
+        instance_ctx: ctx,
+        index_active_fun: fn _instance, _identity -> {:ok, true} end
+      )
+
+    {:ok, cursor_keys} =
+      Ferricstore.Flow.Query.CursorKeyStore.start_link(instance_ctx: ctx)
+
+    {:ok, statistics_store} =
+      Ferricstore.Flow.Query.StatisticsStore.start_link(instance_ctx: ctx)
+
+    {:ok, statistics_worker} =
+      Ferricstore.Flow.Query.StatisticsWorker.start_link(instance_ctx: ctx)
+
+    suffix = System.unique_integer([:positive, :monotonic])
+    partition = "query-state-time-#{suffix}"
+    type = "query-state-time-type-#{suffix}"
+
+    try do
+      for {name, state, now_ms} <- [
+            {"lower", "failed", 1_000},
+            {"inside", "failed", 1_999},
+            {"upper", "failed", 2_000},
+            {"wrong-state", "queued", 1_500}
+          ] do
+        assert :ok =
+                 Ferricstore.Flow.create(ctx, "#{name}-#{suffix}",
+                   type: type,
+                   state: state,
+                   partition_key: partition,
+                   attributes: %{"name" => name, "nullable" => nil},
+                   state_meta: %{"reason" => "#{name}-reason"},
+                   payload: %{"secret" => String.duplicate(name, 128)},
+                   now_ms: now_ms
+                 )
+      end
+
+      assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count)
+
+      query =
+        "FROM runs WHERE partition_key = @partition AND state = @state " <>
+          "AND updated_at_ms FROM @from_ms TO @until_ms " <>
+          "ORDER BY updated_at_ms DESC LIMIT 100 RETURN RECORDS"
+
+      params = %{
+        "partition" => partition,
+        "state" => "failed",
+        "from_ms" => 1_000,
+        "until_ms" => 2_000
+      }
+
+      assert {:ok, request} = Query.prepare_reference("FQL1", query, params)
+      assert {:ok, %{records: records}} = Query.execute(ctx, request)
+
+      assert Enum.map(records, &{&1.id, &1.updated_at_ms}) == [
+               {"inside-#{suffix}", 1_999},
+               {"lower-#{suffix}", 1_000}
+             ]
+
+      assert Enum.map(records, & &1.attributes["name"]) == ["inside", "lower"]
+
+      assert Enum.map(records, & &1.state_meta["failed"]["reason"]) == [
+               "inside-reason",
+               "lower-reason"
+             ]
+
+      Enum.each(records, fn record ->
+        refute Map.has_key?(record, :payload)
+        refute Map.has_key?(record, :payload_ref)
+        refute Map.has_key?(record, :result_ref)
+        refute Map.has_key?(record, :error_ref)
+      end)
+
+      assert {:ok, analyze_request} =
+               Query.prepare_reference("FQL1", "EXPLAIN ANALYZE " <> query, params)
+
+      assert {:ok, analyze} = Query.execute(ctx, analyze_request)
+      assert analyze.plan.record_source == "query_row"
+      assert analyze.plan.projection.source == "query_row"
+      refute analyze.plan.projection.requires_hydration
+      assert analyze.actual.hydrated_records == 0
+    after
+      for pid <- [statistics_worker, statistics_store, cursor_keys, admission],
+          Process.alive?(pid) do
+        GenServer.stop(pid)
+      end
+
       IsolatedInstance.checkin(ctx)
     end
   end

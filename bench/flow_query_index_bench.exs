@@ -17,6 +17,7 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
     Executor,
     IndexCatalog,
     Planner,
+    QueryRecordStore,
     Response
   }
 
@@ -80,22 +81,61 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
       request = request_for(definition.id, record_count)
       active = active_index(definition)
 
+      query_row = execute_query(ctx, request, active, :query_row)
+      authoritative = execute_query(ctx, request, active, :authoritative)
+
+      true = query_row.records == authoritative.records
+      true = query_row.record_source == :query_row
+      true = authoritative.record_source == :query_row
+      true = query_row.usage.hydrated_records == 0
+      true = authoritative.usage.hydrated_records > 0
+
       if warmup > 0 do
-        for _iteration <- 1..warmup do
-          :ok = execute_query(ctx, request, active)
+        for iteration <- 1..warmup do
+          if rem(iteration, 2) == 0 do
+            _query_row = execute_query(ctx, request, active, :query_row)
+            _authoritative = execute_query(ctx, request, active, :authoritative)
+          else
+            _authoritative = execute_query(ctx, request, active, :authoritative)
+            _query_row = execute_query(ctx, request, active, :query_row)
+          end
         end
       end
 
-      latencies =
-        for _iteration <- 1..iterations do
-          {elapsed_us, :ok} = timed(fn -> execute_query(ctx, request, active) end)
-          elapsed_us
-        end
+      {query_row_latencies, authoritative_latencies} =
+        Enum.reduce(1..iterations, {[], []}, fn iteration, {query_row_acc, authoritative_acc} ->
+          {query_row_us, authoritative_us} =
+            if rem(iteration, 2) == 0 do
+              {query_row_us, _query_row_result} =
+                timed(fn -> execute_query(ctx, request, active, :query_row) end)
+
+              {authoritative_us, _authoritative_result} =
+                timed(fn -> execute_query(ctx, request, active, :authoritative) end)
+
+              {query_row_us, authoritative_us}
+            else
+              {authoritative_us, _authoritative_result} =
+                timed(fn -> execute_query(ctx, request, active, :authoritative) end)
+
+              {query_row_us, _query_row_result} =
+                timed(fn -> execute_query(ctx, request, active, :query_row) end)
+
+              {query_row_us, authoritative_us}
+            end
+
+          {[query_row_us | query_row_acc], [authoritative_us | authoritative_acc]}
+        end)
+
+      query_row_latency = percentiles(query_row_latencies)
+      authoritative_latency = percentiles(authoritative_latencies)
 
       %{
         id: definition.id,
         version: definition.version,
-        read_latency_us: percentiles(latencies),
+        read_latency_us: query_row_latency,
+        authoritative_fallback_latency_us: authoritative_latency,
+        query_row_speedup_p50:
+          round_to(authoritative_latency.p50 / max(query_row_latency.p50, 1), 2),
         backfill: %{
           elapsed_ms: round_to(backfill_us / 1_000, 3),
           records_per_second: round_to(rate(record_count, backfill_us), 2),
@@ -155,14 +195,15 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
     end)
   end
 
-  defp execute_query(ctx, request, active) do
+  defp execute_query(ctx, request, active, read_source) do
+    executor_opts =
+      [cursor_key: @cursor_key, now_ms: 2_000_000_000_000] ++
+        read_source_opts(ctx, read_source)
+
     with {:ok, plan} <- Planner.plan(request, [active], now_ms: 2_000_000_000_000),
          true <- plan.path == :ordered_range and length(plan.ranges) == 1,
          {:ok, result} <-
-           Executor.execute(ctx, 0, request, plan,
-             cursor_key: @cursor_key,
-             now_ms: 2_000_000_000_000
-           ),
+           Executor.execute(ctx, 0, request, plan, executor_opts),
          {:ok, _response} <-
            Response.build(
              result.records,
@@ -172,10 +213,24 @@ defmodule Ferricstore.Flow.Query.IndexBenchmark do
              result.usage,
              Budget.default()
            ) do
-      :ok
+      %{
+        records: result.records,
+        usage: result.usage,
+        record_source: plan.record_source
+      }
     else
       failure -> raise "query benchmark failed: #{inspect(failure)}"
     end
+  end
+
+  defp read_source_opts(_ctx, :query_row), do: []
+
+  defp read_source_opts(ctx, :authoritative) do
+    [
+      record_read: fn path, state_keys, now_ms, max_bytes ->
+        QueryRecordStore.read_many(ctx, 0, path, state_keys, now_ms, max_bytes)
+      end
+    ]
   end
 
   defp request_for("flow_runs_tenant_updated", record_count) do
