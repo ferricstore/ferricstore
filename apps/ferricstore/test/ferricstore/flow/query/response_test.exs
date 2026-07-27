@@ -9,11 +9,18 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
     records = [%{id: "run-1", partition_key: "tenant-a", state: "failed"}]
 
     assert {:ok, response} =
-             Response.build(records, true, "fqc1_cursor", quality(), usage, Budget.default())
+             Response.build(
+               records,
+               true,
+               "fqc1_cursor-token",
+               quality(),
+               usage,
+               Budget.default()
+             )
 
     assert response.version == "ferric.flow.query.result/v1"
     assert response.records == records
-    assert response.page == %{has_more: true, cursor: "fqc1_cursor"}
+    assert response.page == %{has_more: true, cursor: "fqc1_cursor-token"}
     assert response.quality == quality()
     assert response.usage.result_records == 1
 
@@ -147,6 +154,22 @@ defmodule Ferricstore.Flow.Query.ResponseTest do
 
     assert {:error, :query_engine_failure} =
              Response.build([], true, oversized_cursor, quality(), usage(0), Budget.default())
+  end
+
+  test "rejects malformed outgoing pagination cursors" do
+    for cursor <- ["fqc1_", "other_cursor_token", <<"fqc1_", 0xFF, 0xFF>>] do
+      assert {:error, :query_engine_failure} =
+               Response.build([], true, cursor, quality(), usage(0), Budget.default())
+    end
+  end
+
+  test "rejects unsupported quality values in every dimension" do
+    for field <- Response.quality_fields() do
+      invalid_quality = Map.put(quality(), field, "future_mode")
+
+      assert {:error, :query_engine_failure} =
+               Response.build([], false, nil, invalid_quality, usage(0), Budget.default())
+    end
   end
 
   test "fails closed for usage counters outside the native signed integer contract" do

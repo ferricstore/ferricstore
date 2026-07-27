@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.11.3 - 2026-07-27
+
+- Centralized the compact FQL1 result quality vocabulary and made response
+  emission fail closed for non-canonical cursor, quality, usage, count, or page
+  relationships. Valid result bytes and the negotiated wire contract remain
+  unchanged, with no added work on the query execution hot path.
+
 ## 0.11.2 - 2026-07-26
 
 - Fixed `EXPLAIN ANALYZE` for clients that negotiate compact FQL results by

@@ -15,6 +15,16 @@ defmodule Ferricstore.Flow.Query.Cursor do
   @minimum_cursor_bytes Limits.min_cursor_bytes()
   @maximum_cursor_bytes Limits.max_cursor_bytes()
 
+  @doc false
+  @spec valid_shape?(term()) :: boolean()
+  def valid_shape?(token)
+      when is_binary(token) and byte_size(token) >= @minimum_cursor_bytes and
+             byte_size(token) <= @maximum_cursor_bytes do
+    String.valid?(token) and match?(<<@prefix, _encoded::binary>>, token)
+  end
+
+  def valid_shape?(_token), do: false
+
   defmodule Claim do
     @moduledoc false
 
@@ -289,9 +299,9 @@ defmodule Ferricstore.Flow.Query.Cursor do
   defp validate_continuation(_value), do: {:error, :query_cursor_invalid}
 
   defp decode_envelope(token)
-       when is_binary(token) and byte_size(token) >= @minimum_cursor_bytes and
-              byte_size(token) <= @maximum_cursor_bytes do
+       when is_binary(token) do
     with <<@prefix, encoded::binary>> <- token,
+         true <- valid_shape?(token),
          {:ok, envelope} <- Base.url_decode64(encoded, padding: false),
          true <- Base.url_encode64(envelope, padding: false) == encoded,
          true <- byte_size(envelope) > @nonce_bytes + @tag_bytes do

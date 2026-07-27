@@ -75,7 +75,7 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
       state_meta: %{"failed" => %{"reason" => "timeout"}}
     }
 
-    response = page_response([record], true, "fqc1_cursor")
+    response = page_response([record], true, "fqc1_cursor-token")
     payload = ResultCodec.encode(response)
 
     assert is_binary(payload)
@@ -92,9 +92,9 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
              2::unsigned-64,
              3::unsigned-64,
              4::unsigned-64,
-             5::unsigned-64,
+             1::unsigned-64,
              6::unsigned-64,
-             7::unsigned-64,
+             0::unsigned-64,
              1::unsigned-64,
              response_bytes::unsigned-64,
              8::unsigned-64,
@@ -123,7 +123,7 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
       |> Enum.map(&NativeValueCodec.encode/1)
       |> IO.iodata_to_binary()
 
-    assert <<1, 11::unsigned-32, "fqc1_cursor", 1::unsigned-32, ^bitmap::unsigned-32,
+    assert <<1, 17::unsigned-32, "fqc1_cursor-token", 1::unsigned-32, ^bitmap::unsigned-32,
              ^values::binary>> = rest
   end
 
@@ -150,7 +150,7 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
   test "measures the exact compact payload without changing response usage" do
     responses = [
       page_response([], false, nil),
-      page_response([%{id: "run-1", state: nil}], true, "fqc1_cursor"),
+      page_response([%{id: "run-1", state: nil}], true, "fqc1_cursor-token"),
       page_response(
         [
           %{
@@ -178,7 +178,7 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
   test "encodes and measures a validated response in one pass" do
     responses = [
       page_response([], false, nil),
-      page_response([%{id: "run-1", state: nil}], true, "fqc1_cursor"),
+      page_response([%{id: "run-1", state: nil}], true, "fqc1_cursor-token"),
       count_response(42)
     ]
 
@@ -364,8 +364,37 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
     assert page_response([], true, String.duplicate("c", 4_097))
            |> ResultCodec.encode() == nil
 
+    for cursor <- ["fqc1_", "other_cursor_token", <<"fqc1_", 0xFF, 0xFF>>] do
+      assert page_response([], true, cursor)
+             |> ResultCodec.encode() == nil
+    end
+
     records = List.duplicate(%{id: "run"}, 101)
     assert ResultCodec.encode(page_response(records, false, nil)) == nil
+  end
+
+  test "fails closed for structurally inconsistent usage" do
+    valid =
+      page_response([], false, nil)
+      |> put_in([:usage, :hydrated_records], 0)
+      |> put_in([:usage, :duplicate_entries], 0)
+
+    for {field, value} <- [
+          hydrated_records: 4,
+          duplicate_entries: 4,
+          range_pages: 5,
+          residual_checks: 37,
+          result_records: 1
+        ] do
+      response = put_in(valid, [:usage, field], value)
+
+      assert ResultCodec.encode(response) == nil
+      assert ResultCodec.encoded_size(response) == nil
+    end
+
+    assert count_response(1)
+           |> put_in([:usage, :result_records], 0)
+           |> ResultCodec.encode() == nil
   end
 
   test "keeps representative record pages materially smaller than typed maps" do
@@ -433,11 +462,11 @@ defmodule Ferricstore.Flow.Query.ResultCodecTest do
     %{
       range_seeks: 1,
       range_pages: 2,
-      scanned_entries: 3,
+      scanned_entries: max(3, result_records),
       scanned_bytes: 4,
-      hydrated_records: 5,
+      hydrated_records: result_records,
       residual_checks: 6,
-      duplicate_entries: 7,
+      duplicate_entries: 0,
       result_records: result_records,
       response_bytes: 0,
       memory_high_water_bytes: 8,

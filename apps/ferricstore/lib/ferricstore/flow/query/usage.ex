@@ -28,11 +28,18 @@ defmodule Ferricstore.Flow.Query.Usage do
   @spec valid?(term(), Budget.t(), :records | :count) :: boolean()
   def valid?(usage, %Budget{} = budget, kind)
       when is_map(usage) and kind in [:records, :count] do
-    canonical_usage?(usage) and within_budget?(usage, budget) and internally_consistent?(usage) and
-      valid_result_usage?(usage, kind)
+    contract_valid?(usage, kind) and within_budget?(usage, budget)
   end
 
   def valid?(_usage, _budget, _kind), do: false
+
+  @doc false
+  @spec contract_valid?(term(), :records | :count) :: boolean()
+  def contract_valid?(usage, kind) when is_map(usage) and kind in [:records, :count] do
+    canonical_usage?(usage) and internally_consistent?(usage) and valid_result_usage?(usage, kind)
+  end
+
+  def contract_valid?(_usage, _kind), do: false
 
   defp canonical_usage?(usage) do
     map_size(usage) == @field_count and

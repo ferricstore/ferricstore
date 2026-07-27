@@ -1,12 +1,10 @@
 defmodule Ferricstore.Flow.Query.Response do
   @moduledoc false
 
-  alias Ferricstore.{Flow.Query.Limits, NativeValueCodec}
-  alias Ferricstore.Flow.Query.{Budget, PreparedResponse, ResultCodec, Usage}
+  alias Ferricstore.NativeValueCodec
+  alias Ferricstore.Flow.Query.{Budget, Cursor, PreparedResponse, Quality, ResultCodec, Usage}
 
   @contract "ferric.flow.query.result/v1"
-  @quality_fields [:coverage, :exactness, :freshness, :pagination]
-  @maximum_cursor_bytes Limits.max_cursor_bytes()
   @maximum_count 0x7FFF_FFFF_FFFF_FFFF
 
   @spec contract() :: binary()
@@ -14,7 +12,7 @@ defmodule Ferricstore.Flow.Query.Response do
 
   @doc false
   @spec quality_fields() :: [atom()]
-  def quality_fields, do: @quality_fields
+  def quality_fields, do: Quality.fields()
 
   @spec build([map()], boolean(), binary() | nil, map(), map(), Budget.t()) ::
           {:ok, map() | PreparedResponse.t()} | {:error, atom()}
@@ -107,8 +105,8 @@ defmodule Ferricstore.Flow.Query.Response do
   defp validate_page(false, nil), do: :ok
 
   defp validate_page(true, cursor)
-       when is_binary(cursor) and cursor != "" and byte_size(cursor) <= @maximum_cursor_bytes,
-       do: :ok
+       when is_binary(cursor),
+       do: if(Cursor.valid_shape?(cursor), do: :ok, else: {:error, :query_engine_failure})
 
   defp validate_page(_has_more, _cursor), do: {:error, :query_engine_failure}
 
@@ -124,14 +122,7 @@ defmodule Ferricstore.Flow.Query.Response do
   end
 
   defp validate_quality(quality) do
-    valid =
-      Map.keys(quality) |> Enum.sort() == Enum.sort(@quality_fields) and
-        Enum.all?(@quality_fields, fn field ->
-          value = Map.get(quality, field)
-          is_binary(value) and value != "" and byte_size(value) <= 64
-        end)
-
-    if valid, do: :ok, else: {:error, :query_engine_failure}
+    if Quality.valid?(quality), do: :ok, else: {:error, :query_engine_failure}
   end
 
   defp encoded_size(term, :native_value) do

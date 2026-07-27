@@ -3,7 +3,7 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
 
   import Bitwise
 
-  alias Ferricstore.Flow.Query.Limits
+  alias Ferricstore.Flow.Query.{Cursor, Limits, Quality, Usage}
   alias Ferricstore.NativeValueCodec
 
   @tag 0xA0
@@ -13,47 +13,11 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
   @count_kind 1
   @nil_length 0xFFFF_FFFF
   @maximum_native_integer 0x7FFF_FFFF_FFFF_FFFF
-  @maximum_cursor_bytes Limits.max_cursor_bytes()
   @maximum_records Limits.max_results()
 
-  @quality_fields [:exactness, :freshness, :coverage, :pagination]
-  @quality_codes %{
-    exactness: %{
-      "authoritative" => 0,
-      "projected_exact" => 1,
-      "exact" => 2,
-      "not_applicable" => 3
-    },
-    freshness: %{
-      "current" => 0,
-      "projection_watermark" => 1,
-      "not_applicable" => 2
-    },
-    coverage: %{
-      "complete" => 0,
-      "unavailable" => 1
-    },
-    pagination: %{
-      "none" => 0,
-      "complete" => 1,
-      "authenticated_seek" => 2,
-      "live_seek" => 3
-    }
-  }
+  @quality_fields Quality.fields()
 
-  @usage_fields [
-    :range_seeks,
-    :range_pages,
-    :scanned_entries,
-    :scanned_bytes,
-    :hydrated_records,
-    :residual_checks,
-    :duplicate_entries,
-    :result_records,
-    :response_bytes,
-    :memory_high_water_bytes,
-    :wall_time_us
-  ]
+  @usage_fields Usage.fields()
 
   @record_fields [
     :id,
@@ -167,7 +131,7 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
          {:ok, quality} when is_map(quality) <- fetch_exact(response, :quality),
          {:ok, usage} when is_map(usage) <- fetch_exact(response, :usage),
          {:ok, _quality_payload} <- encode_quality(quality),
-         {:ok, _usage_values} <- usage_values(usage),
+         {:ok, _usage_values} <- usage_values(usage, {:records, length(records)}),
          {:ok, _page_payload, page_bytes} <- encode_page_metadata(page),
          {:ok, records_bytes} <- measure_records(records) do
       {:ok, @common_bytes + page_bytes + 4 + records_bytes}
@@ -187,7 +151,7 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
          {:ok, quality} when is_map(quality) <- fetch_exact(response, :quality),
          {:ok, usage} when is_map(usage) <- fetch_exact(response, :usage),
          {:ok, _quality_payload} <- encode_quality(quality),
-         {:ok, _usage_values} <- usage_values(usage) do
+         {:ok, _usage_values} <- usage_values(usage, :count) do
       {:ok, @common_bytes + 8}
     else
       _invalid -> :error
@@ -201,7 +165,7 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
          {:ok, quality} when is_map(quality) <- fetch_exact(response, :quality),
          {:ok, usage} when is_map(usage) <- fetch_exact(response, :usage),
          {:ok, quality_payload} <- encode_quality(quality),
-         {:ok, usage_values} <- usage_values(usage),
+         {:ok, usage_values} <- usage_values(usage, {:records, length(records)}),
          {:ok, page_payload, page_bytes} <- encode_page_metadata(page),
          {:ok, records_payload, record_count, records_bytes} <- encode_records(records) do
       payload_bytes = @common_bytes + page_bytes + 4 + records_bytes
@@ -231,7 +195,7 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
          {:ok, quality} when is_map(quality) <- fetch_exact(response, :quality),
          {:ok, usage} when is_map(usage) <- fetch_exact(response, :usage),
          {:ok, quality_payload} <- encode_quality(quality),
-         {:ok, usage_values} <- usage_values(usage) do
+         {:ok, usage_values} <- usage_values(usage, :count) do
       payload_bytes = @common_bytes + 8
 
       {:ok,
@@ -246,25 +210,9 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
     end
   end
 
-  defp encode_quality(quality) when map_size(quality) == length(@quality_fields) do
-    @quality_fields
-    |> Enum.reduce_while({:ok, []}, fn field, {:ok, acc} ->
-      with {:ok, value} <- fetch_exact(quality, field),
-           code when is_integer(code) <- get_in(@quality_codes, [field, value]) do
-        {:cont, {:ok, [code | acc]}}
-      else
-        _invalid -> {:halt, :error}
-      end
-    end)
-    |> case do
-      {:ok, reversed} -> {:ok, reversed |> Enum.reverse() |> :binary.list_to_bin()}
-      :error -> :error
-    end
-  end
+  defp encode_quality(quality), do: Quality.encode(quality)
 
-  defp encode_quality(_quality), do: :error
-
-  defp usage_values(usage) when map_size(usage) == length(@usage_fields) do
+  defp usage_values(usage, shape) when map_size(usage) == length(@usage_fields) do
     @usage_fields
     |> Enum.reduce_while({:ok, []}, fn field, {:ok, acc} ->
       case fetch_exact(usage, field) do
@@ -277,12 +225,29 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
       end
     end)
     |> case do
-      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
-      :error -> :error
+      {:ok, reversed} ->
+        values = Enum.reverse(reversed)
+
+        canonical =
+          if Enum.all?(@usage_fields, &Map.has_key?(usage, &1)),
+            do: usage,
+            else: Map.new(Enum.zip(@usage_fields, values))
+
+        if usage_contract_valid?(canonical, shape), do: {:ok, values}, else: :error
+
+      :error ->
+        :error
     end
   end
 
-  defp usage_values(_usage), do: :error
+  defp usage_values(_usage, _kind), do: :error
+
+  defp usage_contract_valid?(usage, {:records, record_count})
+       when is_integer(record_count) and record_count >= 0,
+       do: Usage.contract_valid?(usage, :records) and usage.result_records == record_count
+
+  defp usage_contract_valid?(usage, :count), do: Usage.contract_valid?(usage, :count)
+  defp usage_contract_valid?(_usage, _shape), do: false
 
   defp encode_usage(values, response_bytes) do
     @usage_fields
@@ -306,9 +271,13 @@ defmodule Ferricstore.Flow.Query.ResultCodec do
     do: {:ok, <<0, @nil_length::unsigned-32>>, 5}
 
   defp encode_page_metadata(true, cursor)
-       when is_binary(cursor) and cursor != "" and byte_size(cursor) <= @maximum_cursor_bytes do
-    cursor_bytes = byte_size(cursor)
-    {:ok, [<<1, cursor_bytes::unsigned-32>>, cursor], 5 + cursor_bytes}
+       when is_binary(cursor) do
+    if Cursor.valid_shape?(cursor) do
+      cursor_bytes = byte_size(cursor)
+      {:ok, [<<1, cursor_bytes::unsigned-32>>, cursor], 5 + cursor_bytes}
+    else
+      :error
+    end
   end
 
   defp encode_page_metadata(_has_more, _cursor), do: :error
