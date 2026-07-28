@@ -422,6 +422,15 @@ defmodule Ferricstore.Raft.StateMachineTest do
     partition_key = "__ferricstore_schedule__:0"
     state_key = Ferricstore.Flow.Keys.state_key(id, partition_key)
 
+    definition = %{
+      id: "terminal-expire-guard",
+      kind: :one_shot,
+      target: %{id: "terminal-expire-target", type: "terminal-expire-target"},
+      created_at_ms: 1_000,
+      next_run_at_ms: 2_000,
+      fire_count: 0
+    }
+
     assert {_created_state, :ok} =
              StateMachine.apply(
                %{system_time: 1_000},
@@ -429,15 +438,19 @@ defmodule Ferricstore.Raft.StateMachineTest do
                 %{
                   id: id,
                   type: type,
-                  state: "completed",
+                  state: "active",
                   partition_key: partition_key,
+                  schedule_metadata:
+                    Ferricstore.Flow.Schedule.Metadata.from_definition(definition),
+                  payload: definition,
+                  run_at_ms: definition.next_run_at_ms,
                   now_ms: 1_000
                 }},
                state
              )
 
-    completed = flow_record!(state, state_key)
-    malformed = %{completed | terminal_retention_until_ms: nil}
+    created = flow_record!(state, state_key)
+    malformed = %{created | state: "completed", terminal_retention_until_ms: nil}
     encoded = Ferricstore.Flow.encode_record(malformed)
 
     :ets.insert(
@@ -459,7 +472,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
              )
 
     signaled = flow_record!(state, state_key)
-    assert signaled.version == completed.version + 1
+    assert signaled.version == created.version + 1
     assert signaled.state == "completed"
     assert is_integer(signaled.terminal_retention_until_ms)
   end
