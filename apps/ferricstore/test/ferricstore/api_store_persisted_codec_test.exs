@@ -9,7 +9,7 @@ defmodule FerricStore.API.StorePersistedCodecTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do
-    ShardHelpers.wait_shards_alive()
+    ShardHelpers.wait_default_quorum_writable()
     :ok
   end
 
