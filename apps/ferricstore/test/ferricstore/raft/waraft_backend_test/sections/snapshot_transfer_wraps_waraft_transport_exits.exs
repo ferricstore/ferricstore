@@ -772,45 +772,57 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.SnapshotTransferWrapsWaraf
           assert :ok =
                    WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
 
-          start_supervised!(
-            {Ferricstore.Flow.HistoryProjector,
-             [
-               shard_index: 0,
-               shard_data_path: shard_data_path,
-               instance_ctx: ctx,
-               recover_on_init: false
-             ]}
-          )
+          projector =
+            start_supervised!(
+              {Ferricstore.Flow.HistoryProjector,
+               [
+                 shard_index: 0,
+                 shard_data_path: shard_data_path,
+                 instance_ctx: ctx,
+                 recover_on_init: false
+               ]}
+            )
 
-          assert {:ok, {:raft_log_pos, before_index, _term}} = WARaftBackend.storage_position(0)
+          # The storage layer requests projection immediately when it observes a replay
+          # dependency, so the periodic flush interval is not a deterministic barrier.
+          assert :ok = :sys.suspend(projector)
 
-          assert :ok =
-                   Ferricstore.Flow.create(ctx, flow_id,
-                     type: flow_type,
-                     partition_key: partition,
-                     run_at_ms: 1_000,
-                     now_ms: 900
-                   )
+          try do
+            assert {:ok, {:raft_log_pos, before_index, _term}} =
+                     WARaftBackend.storage_position(0)
 
-          assert {:ok, {:raft_log_pos, applied_index, _term}} = WARaftBackend.storage_position(0)
-          projected_index = Ferricstore.Flow.HistoryProjectedIndex.read(shard_data_path)
-          storage_status = waraft_storage_status(0)
+            assert :ok =
+                     Ferricstore.Flow.create(ctx, flow_id,
+                       type: flow_type,
+                       partition_key: partition,
+                       run_at_ms: 1_000,
+                       now_ms: 900
+                     )
 
-          {:raft_log_pos, durable_index, _durable_term} =
-            Keyword.fetch!(storage_status, :durable_position)
+            assert {:ok, {:raft_log_pos, applied_index, _term}} =
+                     WARaftBackend.storage_position(0)
 
-          assert applied_index > projected_index
-          assert durable_index <= before_index
+            projected_index = Ferricstore.Flow.HistoryProjectedIndex.read(shard_data_path)
+            storage_status = waraft_storage_status(0)
 
-          assert %{position: persisted_position} = waraft_latest_storage_metadata(root, 0)
-          assert position_index(persisted_position) <= before_index
+            {:raft_log_pos, durable_index, _durable_term} =
+              Keyword.fetch!(storage_status, :durable_position)
 
-          case read_segment_projection_header(root, 0) do
-            {:ok, {{:raft_log_pos, projection_index, _term}, count}} ->
-              assert projection_index < applied_index or count == 0
+            assert applied_index > projected_index
+            assert durable_index <= before_index
 
-            :not_found ->
-              :ok
+            assert %{position: persisted_position} = waraft_latest_storage_metadata(root, 0)
+            assert position_index(persisted_position) <= before_index
+
+            case read_segment_projection_header(root, 0) do
+              {:ok, {{:raft_log_pos, projection_index, _term}, count}} ->
+                assert projection_index < applied_index or count == 0
+
+              :not_found ->
+                :ok
+            end
+          after
+            if Process.alive?(projector), do: :sys.resume(projector)
           end
         after
           restore_env(:flow_async_history, previous_async_history)
