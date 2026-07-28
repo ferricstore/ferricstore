@@ -82,11 +82,89 @@ defmodule Ferricstore.Cluster.FlowScheduleClusterTest do
              )
   end
 
+  test "overdue interval catch-up fires once after Raft leader failover" do
+    nodes = ClusterHelper.start_cluster(3, shards: @shards)
+    on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+
+    [writer | _] = nodes
+    due_at_ms = System.system_time(:millisecond) + 800
+    every_ms = 5
+    recovery_ms = due_at_ms + 10 * every_ms
+    schedule_id = unique_id("cluster-schedule-catchup")
+    target_prefix = unique_id("cluster-schedule-catchup-target")
+    target_type = unique_id("cluster-schedule-catchup-type")
+    target_partition = unique_id("cluster-schedule-catchup-partition")
+
+    assert {:ok, %{catchup_policy: :fire_once, next_run_at_ms: ^due_at_ms}} =
+             remote_schedule_create(writer.name, schedule_id,
+               kind: :interval,
+               every_ms: every_ms,
+               start_at_ms: due_at_ms,
+               now_ms: due_at_ms - 1,
+               target: [
+                 id_prefix: target_prefix,
+                 type: target_type,
+                 partition_key: target_partition,
+                 payload: "cluster-catchup"
+               ]
+             )
+
+    {_killed, remaining} = ClusterHelper.kill_leader(nodes, 0)
+    assert :ok = ClusterHelper.wait_for_leaders(remaining, @shards, timeout: 30_000)
+
+    results =
+      remaining
+      |> Task.async_stream(
+        fn node ->
+          remote_schedule_fire_due(node.name,
+            now_ms: recovery_ms,
+            worker: "cluster-catchup-scheduler-#{node.index}"
+          )
+        end,
+        max_concurrency: length(remaining),
+        timeout: 60_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, &match?({:ok, %{errors: []}}, &1))
+    assert results |> Enum.map(fn {:ok, result} -> result.fired end) |> Enum.sum() == 1
+    assert results |> Enum.map(fn {:ok, result} -> result.claimed end) |> Enum.sum() == 1
+    assert results |> Enum.map(fn {:ok, result} -> result.coalesced end) |> Enum.sum() == 10
+
+    reader = hd(remaining)
+    target_id = "#{target_prefix}:#{due_at_ms}:1"
+
+    eventually(fn ->
+      assert {:ok, target} =
+               remote_flow_get(reader.name, target_id,
+                 partition_key: target_partition,
+                 payload: true
+               )
+
+      assert target.type == target_type
+      assert target.payload == "cluster-catchup"
+
+      assert {:ok, schedule} = remote_schedule_get(reader.name, schedule_id)
+      assert schedule.fire_count == 1
+      assert schedule.coalesced_count == 10
+      assert schedule.next_run_at_ms == recovery_ms + every_ms
+    end)
+
+    assert {:ok, %{fired: 0, claimed: 0, coalesced: 0, errors: []}} =
+             remote_schedule_fire_due(reader.name,
+               now_ms: recovery_ms,
+               worker: "cluster-catchup-scheduler"
+             )
+  end
+
   defp remote_schedule_create(node_name, id, opts),
     do: :erpc.call(node_name, FerricStore, :flow_schedule_create, [id, opts], 30_000)
 
   defp remote_schedule_fire_due(node_name, opts),
     do: :erpc.call(node_name, FerricStore, :flow_schedule_fire_due, [opts], 60_000)
+
+  defp remote_schedule_get(node_name, id),
+    do: :erpc.call(node_name, FerricStore, :flow_schedule_get, [id], 30_000)
 
   defp remote_flow_get(node_name, id, opts),
     do: :erpc.call(node_name, FerricStore, :flow_get, [id, opts], 30_000)

@@ -1751,6 +1751,7 @@ defmodule Ferricstore.FlowPolicyMigrationTest do
       type: type,
       state: "accept",
       partition_key: @partition,
+      expected_version: migrated.version,
       run_at_ms: 2_000,
       now_ms: 1_100,
       policy_ref: policy_reference(policy_v1, 1),

@@ -306,6 +306,34 @@ defmodule Ferricstore.Raft.StateMachineTest do
     assert [] = :ets.lookup(ets, "old-async")
   end
 
+  test "replicated Flow state reads are ordered and do not mutate state", %{
+    state: state,
+    ets: ets
+  } do
+    key = "f:{consistent-state}:s"
+
+    record =
+      Ferricstore.Flow.Codec.encode_record(%{
+        id: "consistent-state",
+        type: "job",
+        state: "running",
+        version: 1,
+        created_at_ms: 1,
+        updated_at_ms: 1
+      })
+
+    {written_state, :ok} = StateMachine.apply(%{}, {:put, key, record, 0}, state)
+
+    assert {^written_state, {:ok, "running"}} =
+             StateMachine.apply(%{}, {:flow_consistent_state, key}, written_state)
+
+    assert {^written_state, {:ok, nil}} =
+             StateMachine.apply(%{}, {:flow_consistent_state, key <> ":missing"}, written_state)
+
+    assert [row] = :ets.lookup(ets, key)
+    assert elem(row, 0) == key
+  end
+
   @tag :invalid_batch_shape
   test "non-list batch envelopes are rejected without crashing apply", %{state: state} do
     commands = [{:batch, :not_a_list}, {:cross_shard_tx, :not_a_list}]

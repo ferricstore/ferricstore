@@ -510,6 +510,14 @@ FLOW.COMPLETE:
 FLOW.VALUE.MGET:
 {"refs": ["ref-a", "ref-b"], "max_bytes": 65536}
 
+FLOW.SCHEDULE.CREATE:
+{"id": "billing-sweep", "kind": "interval", "every_ms": 60000,
+ "catchup_policy": "fire_once",
+ "target": {"id_prefix": "billing-sweep", "type": "billing"}}
+
+FLOW.SCHEDULE.FIRE_DUE:
+{"worker": "scheduler-1", "limit": 100}
+
 FLOW.STATS:
 {"type": "email", "state": "queued", "attributes": {"tenant": "acme"}}
 
@@ -522,6 +530,33 @@ FLOW.QUERY:
 Typed `payload`, `result`, and `error` values stay binary-safe and structured at
 the protocol layer. Storage behavior is unchanged: commands still use current
 FerricFlow value/ref rules.
+
+Interval schedules default to `catchup_policy: "fire_once"`. If recovery is at
+least one complete interval after the recorded due time, the server creates one
+target, coalesces the additional elapsed occurrences in constant time, and
+sets `next_run_at_ms` to `recovery_time + every_ms`. `fire_count` counts targets
+actually created. Schedule reads additionally expose `coalesced_count`,
+`last_coalesced_count`, `last_catchup_at_ms`, and `last_planning_error`;
+`FLOW.SCHEDULE.FIRE_DUE`
+returns `coalesced` as the batch aggregate. Its `errors` entries correspond to
+claimed schedules; a failure to request a later claim wave is reported
+separately as `claim_error` after preserving completed outcomes. Catch-up is independent from
+`overlap_policy`, which only controls an active previous target. Non-interval
+schedules do not accept `catchup_policy`. The built-in server
+scheduler normally owns `FLOW.SCHEDULE.FIRE_DUE`; external callers should use
+it only for tests, administration, or an intentionally configured custom
+scheduler deployment.
+
+Recurring targets reject a fixed `id`. Their generated ID prefix comes from
+`target.id_prefix` when present and otherwise from the schedule ID. Schedule
+records may transiently report `state: "running"` while a due occurrence is
+claimed. The other states are `active`, `paused`, `completed`, `failed`, and
+`cancelled`. Bounded `fire_once` recovery is interval-only: overdue cron
+schedules advance one matching occurrence per successful automatic fire.
+If recurrence planning fails, the schedule becomes `failed` with
+`end_reason: "planning_failed"` and an actionable `last_planning_error`; target
+creation occurs only after planning succeeds. `FLOW.SCHEDULE.DELETE` returns
+`OK` and no synthetic schedule record.
 
 `FLOW.POLICY.SET` patches the current policy by default. Set `replace` to `true`
 to replace the complete snapshot, and pass a non-negative `expected_generation`

@@ -3,6 +3,8 @@ defmodule Ferricstore.Flow.PayloadReturn do
 
   import Ferricstore.Flow.Options, only: [optional_boolean: 3, optional_non_neg_integer: 3]
 
+  alias Ferricstore.Flow.{Internal, InternalLimits}
+
   @default_max_bytes 64 * 1024
 
   @spec options(keyword(), boolean()) ::
@@ -33,7 +35,10 @@ defmodule Ferricstore.Flow.PayloadReturn do
   end
 
   defp bounded_max_bytes(opts) do
-    configured_max = max_bytes()
+    configured_max =
+      if Internal.allowed?(opts),
+        do: InternalLimits.payload_return_max_bytes(),
+        else: max_bytes()
 
     with {:ok, requested_max} <-
            optional_non_neg_integer(opts, :payload_max_bytes, configured_max) do

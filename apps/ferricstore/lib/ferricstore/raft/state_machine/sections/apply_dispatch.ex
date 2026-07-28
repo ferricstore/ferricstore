@@ -2129,6 +2129,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(_meta, {:flow_consistent_state, key}, state) when is_binary(key) do
+        {state, flow_consistent_state(state, key)}
+      end
+
       def apply(meta, {:flow_start_and_claim, _key, attrs}, state) when is_map(attrs) do
         apply_flow_pending_with_time(meta, state, :flow_start_and_claim, attrs, fn ->
           do_flow_start_and_claim(state, attrs)
@@ -2707,6 +2711,24 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
       defp server_catalog_revision_version(encoded) do
         {:ok, version} = Ferricstore.ServerCatalog.decode_revision(encoded)
         version
+      end
+
+      defp flow_consistent_state(state, key) do
+        case do_get(state, key) do
+          nil ->
+            {:ok, nil}
+
+          encoded when is_binary(encoded) ->
+            case Ferricstore.Flow.Codec.decode_record_meta(encoded) do
+              %{state: flow_state} when is_binary(flow_state) -> {:ok, flow_state}
+              _invalid -> {:error, :invalid_flow_record}
+            end
+
+          _invalid ->
+            {:error, :invalid_flow_record}
+        end
+      rescue
+        _error -> {:error, :invalid_flow_record}
       end
 
       def apply(

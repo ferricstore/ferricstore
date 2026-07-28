@@ -104,6 +104,58 @@ defmodule Ferricstore.InstanceTest do
       assert status.shard_index == 0
     end
 
+    test "custom instances start isolated Flow schedulers and fire their own schedules" do
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "ferricstore_embedded_schedule_#{System.unique_integer([:positive])}"
+        )
+
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        EmbeddedFlow.stop()
+        File.rm_rf(root)
+      end)
+
+      assert {:ok, _pid} =
+               EmbeddedFlow.start_link(
+                 data_dir: root,
+                 shard_count: 1,
+                 flow_scheduler: [
+                   enabled: true,
+                   initial_delay_ms: 0,
+                   error_sleep_ms: 10,
+                   limit: 10
+                 ]
+               )
+
+      scheduler_name = :"#{EmbeddedFlow}.Flow.Scheduler"
+      scheduler_pid = Process.whereis(scheduler_name)
+
+      assert is_pid(scheduler_pid)
+      assert scheduler_pid != Process.whereis(Ferricstore.Flow.Scheduler)
+
+      now_ms = Ferricstore.CommandTime.now_ms()
+      schedule_id = "embedded-schedule"
+      target_id = "embedded-schedule-target"
+
+      assert {:ok, _schedule} =
+               EmbeddedFlow.flow_schedule_create(schedule_id,
+                 kind: :one_shot,
+                 at_ms: now_ms,
+                 now_ms: now_ms,
+                 target: [id: target_id, type: "embedded-schedule-target"]
+               )
+
+      assert eventually(fn ->
+               match?({:ok, %{id: ^target_id}}, EmbeddedFlow.flow_get(target_id))
+             end)
+
+      assert {:ok, %{state: "completed", fire_count: 1}} =
+               EmbeddedFlow.flow_schedule_get(schedule_id)
+    end
+
     test "custom instances automatically sweep overdue Flow records" do
       root =
         Path.join(

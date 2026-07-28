@@ -334,9 +334,22 @@ defmodule FerricStore.API.Flow do
   set `:overlap_policy` to `:allow`, `:skip`, `:queue_after_previous`, or
   `:fail_schedule`.
 
-  `:target` is a Flow create option list containing at least `:type`. Keep
-  schedule definitions small; large target values should be stored with
-  `flow_value_put/2` and referenced with `:payload_ref` or `:value_refs`.
+  Interval schedules use `catchup_policy: :fire_once` by default. If an
+  interval is overdue by one or more complete periods, recovery creates one
+  target, records the additional elapsed periods as coalesced, and sets
+  `next_run_at_ms` to one full interval after the recovery time. This bounded
+  calculation is constant-time and does not replay missed periods as a burst.
+  Catch-up governs scheduler downtime; `:overlap_policy` separately governs
+  what happens when the previously created target is still active.
+
+  `:target` is a Flow create option list containing at least `:type`. Recurring
+  targets reject a fixed `:id`; set `:id_prefix`, or omit it to use the
+  schedule id as the generated target prefix. Keep schedule definitions small;
+  large target values should be stored with `flow_value_put/2` and referenced
+  with `:payload_ref` or `:value_refs`.
+
+  Bounded catch-up applies only to intervals. An overdue cron schedule advances
+  one matching occurrence per successful automatic fire.
   """
   @spec flow_schedule_create(binary(), keyword()) :: {:ok, map()} | {:error, binary()}
   def flow_schedule_create(id, opts) when is_binary(id) and is_list(opts) do

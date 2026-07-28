@@ -67,6 +67,79 @@ defmodule Ferricstore.Flow.ScheduleRecoveryTest do
              FerricStore.flow_schedule_fire_due(now_ms: now_ms + 1, worker: "restart-scheduler")
   end
 
+  test "overdue interval catch-up remains bounded after application restart", %{
+    isolated_ctx: isolated
+  } do
+    due_at_ms = 15_000
+    every_ms = 100
+    recovery_ms = due_at_ms + 10 * every_ms
+    schedule_id = unique_id("schedule-catchup-restart")
+    target_prefix = unique_id("schedule-catchup-restart-target")
+    target_type = unique_id("schedule-catchup-restart-type")
+    target_partition = unique_id("schedule-catchup-restart-partition")
+
+    assert {:ok, %{catchup_policy: :fire_once, next_run_at_ms: ^due_at_ms}} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: every_ms,
+               start_at_ms: due_at_ms,
+               now_ms: due_at_ms - 1,
+               target: [
+                 id_prefix: target_prefix,
+                 type: target_type,
+                 partition_key: target_partition,
+                 payload: %{restart_catchup: true}
+               ]
+             )
+
+    Ferricstore.Application.prep_stop(nil)
+    ShardHelpers.restart_current_data_dir(isolated)
+
+    ShardHelpers.eventually(
+      fn ->
+        assert {:ok,
+                %{
+                  state: "active",
+                  catchup_policy: :fire_once,
+                  next_run_at_ms: ^due_at_ms
+                }} = FerricStore.flow_schedule_get(schedule_id)
+      end,
+      "interval schedule should remain due after full application restart",
+      300,
+      100
+    )
+
+    assert {:ok, %{claimed: 1, fired: 1, coalesced: 10, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: recovery_ms,
+               worker: "restart-catchup-scheduler"
+             )
+
+    target_id = "#{target_prefix}:#{due_at_ms}:1"
+
+    assert {:ok, %{id: ^target_id, payload: %{restart_catchup: true}}} =
+             FerricStore.flow_get(target_id,
+               partition_key: target_partition,
+               payload: true
+             )
+
+    assert {:ok,
+            %{
+              state: "active",
+              fire_count: 1,
+              coalesced_count: 10,
+              next_run_at_ms: next_run_at_ms
+            }} = FerricStore.flow_schedule_get(schedule_id)
+
+    assert next_run_at_ms == recovery_ms + every_ms
+
+    assert {:ok, %{claimed: 0, fired: 0, coalesced: 0, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: recovery_ms,
+               worker: "restart-catchup-scheduler"
+             )
+  end
+
   test "claimed schedule is reclaimable after shard leader restart" do
     now_ms = 20_000
     schedule_id = unique_id("schedule-claimed-restart")

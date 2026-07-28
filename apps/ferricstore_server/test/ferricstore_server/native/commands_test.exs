@@ -61,6 +61,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
   @op_flow_schedule_create 0x0225
   @op_flow_schedule_get 0x0226
   @op_flow_schedule_delete 0x0227
+  @op_flow_schedule_fire_due 0x0228
   @op_flow_schedule_fire 0x022A
   @op_flow_stats 0x022D
   @op_flow_query 0x0231
@@ -724,6 +725,7 @@ defmodule FerricstoreServer.Native.CommandsTest do
     assert "root_flow_id" in payload.schemas["FLOW.CREATE"]["fields"]
     refute "parent_id" in payload.schemas["FLOW.CREATE"]["fields"]
     refute "root_id" in payload.schemas["FLOW.CREATE"]["fields"]
+    assert "catchup_policy" in payload.schemas["FLOW.SCHEDULE.CREATE"]["fields"]
     assert "rev" in payload.schemas["FLOW.SCHEDULE.LIST"]["fields"]
 
     assert payload.schemas["FLOW.SIGNAL"]["required"] == ["id", "signal"]
@@ -1341,6 +1343,77 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
 
     assert started.max_active_ms == 30_000
+  end
+
+  test "native interval schedules accept the bounded catch-up policy" do
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+
+    suffix = System.unique_integer([:positive, :monotonic])
+    schedule_id = "native-catchup-schedule-#{suffix}"
+    due_at_ms = 1_000
+    every_ms = 100
+    recovery_ms = 2_050
+
+    native_state =
+      state(%{
+        instance_ctx: ctx,
+        stats_counter: ctx.stats_counter
+      })
+
+    assert {:ok, %{catchup_policy: :fire_once}, native_state} =
+             Commands.execute(
+               @op_flow_schedule_create,
+               %{
+                 "id" => schedule_id,
+                 "kind" => "interval",
+                 "start_at_ms" => due_at_ms,
+                 "every_ms" => every_ms,
+                 "now_ms" => due_at_ms - 1,
+                 "catchup_policy" => "fire_once",
+                 "target" => %{
+                   "id_prefix" => "native-catchup-target-#{suffix}",
+                   "type" => "native-catchup"
+                 }
+               },
+               native_state
+             )
+
+    assert {:ok, %{claimed: 1, fired: 1, coalesced: 10, errors: []}, native_state} =
+             Commands.execute(
+               @op_flow_schedule_fire_due,
+               %{
+                 "now_ms" => recovery_ms,
+                 "worker" => "native-catchup-scheduler"
+               },
+               native_state
+             )
+
+    assert {:ok,
+            %{
+              fire_count: 1,
+              coalesced_count: 10,
+              last_coalesced_count: 10,
+              last_catchup_at_ms: ^recovery_ms,
+              next_run_at_ms: next_run_at_ms
+            }, native_state} =
+             Commands.execute(
+               @op_flow_schedule_get,
+               %{"id" => schedule_id},
+               native_state
+             )
+
+    assert next_run_at_ms == recovery_ms + every_ms
+
+    assert {:ok, %{claimed: 0, fired: 0, coalesced: 0, errors: []}, _native_state} =
+             Commands.execute(
+               @op_flow_schedule_fire_due,
+               %{
+                 "now_ms" => recovery_ms,
+                 "worker" => "native-catchup-scheduler"
+               },
+               native_state
+             )
   end
 
   test "native FLOW.CREATE preserves canonical lineage and creation semantics" do
@@ -3896,6 +3969,42 @@ defmodule FerricstoreServer.Native.CommandsTest do
              )
 
     assert message =~ "keys mentioned"
+  end
+
+  test "scoped schedule ACLs require generated targets to use an authorized partition" do
+    assert :ok =
+             Acl.set_user("schedule_exact_scope", [
+               "on",
+               "nopass",
+               "-@all",
+               "+@read",
+               "+@write",
+               "~tenant:a:schedule",
+               "~tenant:a:target",
+               "~tenant:a:partition"
+             ])
+
+    state = state_as("schedule_exact_scope")
+
+    payload = %{
+      "id" => "tenant:a:schedule",
+      "kind" => "interval",
+      "every_ms" => 1_000,
+      "target" => %{"id_prefix" => "tenant:a:target", "type" => "scheduled"}
+    }
+
+    assert {:noperm, message, _state} =
+             Commands.execute(@op_flow_schedule_create, payload, state)
+
+    assert message =~ "generated schedule targets require an authorized partition_key"
+
+    partitioned_payload =
+      put_in(payload, ["target", "partition_key"], "tenant:a:partition")
+
+    {status, _response, _state} =
+      Commands.execute(@op_flow_schedule_create, partitioned_payload, state)
+
+    refute status == :noperm
   end
 
   test "approval ACLs ignore decoy partitions and protect requested flow scope" do

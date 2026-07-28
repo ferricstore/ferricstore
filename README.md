@@ -292,6 +292,7 @@ FerricFlow:
 
 - [Flow command reference](guides/commands.md) — `FLOW.*` command syntax and FerricStore command behavior.
 - [Flow query guide](docs/flow-query.md) — FQL1 syntax, result-field projection, binary results, EXPLAIN, indexes, operations, security, and tuning.
+- [Flow schedules](docs/flow-schedules.md) — durable one-shot, interval, and cron schedules, catch-up, overlap, and recovery semantics.
 - [Flow retry policy](docs/flow-retry-policy.md) — type/state retry policies and retry exhaustion behavior.
 - [Flow production readiness](docs/flow-production-readiness.md) — operational model, lagged projections, retention, reclaim, and production tuning.
 - [Elixir Flow SDK](guides/flow-elixir-sdk.md) — high-level embedded workflow/state-machine API over core Flow commands.

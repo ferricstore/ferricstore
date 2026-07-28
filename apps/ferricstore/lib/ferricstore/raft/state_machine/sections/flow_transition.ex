@@ -97,15 +97,68 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         end
       end
 
+      defp do_flow_schedule_replace(state, %{mode: :claim} = attrs) do
+        id = Map.fetch!(attrs, :id)
+        expected_type = Map.fetch!(attrs, :type)
+        expected_version = Map.get(attrs, :expected_version)
+        worker = Map.fetch!(attrs, :worker)
+        lease_ms = Map.fetch!(attrs, :lease_ms)
+        partition_key = Map.get(attrs, :partition_key)
+        lease_now_ms = apply_now_ms()
+
+        with {:ok, record} <- flow_require_record(state, id, partition_key),
+             :ok <- flow_require_schedule_type(record, expected_type),
+             :ok <- flow_require_schedule_version(record, expected_version),
+             :ok <- flow_require_schedule_active(record),
+             :ok <- flow_require_schedule_unleased(record, lease_now_ms) do
+          next_version = Map.fetch!(record, :version) + 1
+          next_fencing_token = Map.get(record, :fencing_token, 0) + 1
+          lease_deadline_ms = lease_now_ms + lease_ms
+
+          lease_token =
+            worker <>
+              ":" <>
+              Integer.to_string(lease_now_ms) <> ":" <> Integer.to_string(next_fencing_token)
+
+          next =
+            flow_claim_next_record(
+              record,
+              next_version,
+              next_fencing_token,
+              worker,
+              lease_token,
+              lease_deadline_ms,
+              lease_now_ms
+            )
+
+          with :ok <- flow_validate_record_keys(record),
+               :ok <- flow_validate_claim_next_record_keys(next),
+               :ok <- flow_transition_move_indexes(state, [{record, next}]),
+               :ok <-
+                 flow_put_state_record(
+                   state,
+                   FlowKeys.state_key(next.id, partition_key),
+                   next
+                 ),
+               :ok <- flow_history_put_planned(state, record, next, "claimed", lease_now_ms),
+               :ok <- flow_after_history_put(state, next) do
+            {:ok, next}
+          end
+        end
+      end
+
       defp do_flow_schedule_replace(
              state,
              %{id: id, type: expected_type, state: logical_state, run_at_ms: run_at_ms} = attrs
            ) do
         now_ms = flow_attrs_now_ms(attrs)
         partition_key = Map.get(attrs, :partition_key)
+        expected_version = Map.get(attrs, :expected_version)
 
         with {:ok, record} <- flow_require_record(state, id, partition_key),
-             :ok <- flow_require_schedule_replaceable(record, expected_type, now_ms),
+             :ok <- flow_require_schedule_type(record, expected_type),
+             :ok <- flow_require_schedule_version(record, expected_version),
+             :ok <- flow_require_schedule_unleased(record, apply_now_ms()),
              {:ok, record, next} <-
                flow_prepare_schedule_replace_existing_record(
                  record,
@@ -611,20 +664,26 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTransition do
         end
       end
 
-      defp flow_require_schedule_replaceable(nil, _expected_type, _now_ms),
+      defp flow_require_schedule_type(nil, _expected_type),
         do: {:error, "ERR flow schedule not found"}
 
-      defp flow_require_schedule_replaceable(record, expected_type, now_ms) do
-        cond do
-          Map.get(record, :type) != expected_type ->
-            {:error, "ERR flow schedule not found"}
+      defp flow_require_schedule_type(%{type: expected_type}, expected_type), do: :ok
 
-          flow_live_lease?(record, now_ms) ->
-            {:error, "ERR flow schedule is currently leased"}
+      defp flow_require_schedule_type(_record, _expected_type),
+        do: {:error, "ERR flow schedule not found"}
 
-          true ->
-            :ok
-        end
+      defp flow_require_schedule_version(%{version: expected_version}, expected_version), do: :ok
+
+      defp flow_require_schedule_version(_record, _expected_version),
+        do: {:error, "ERR flow schedule changed concurrently"}
+
+      defp flow_require_schedule_active(%{state: "active"}), do: :ok
+      defp flow_require_schedule_active(_record), do: {:error, "ERR flow schedule is not active"}
+
+      defp flow_require_schedule_unleased(record, now_ms) do
+        if flow_live_lease?(record, now_ms),
+          do: {:error, "ERR flow schedule is currently leased"},
+          else: :ok
       end
 
       defp flow_live_lease?(record, now_ms) do

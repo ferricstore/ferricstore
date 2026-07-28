@@ -92,6 +92,32 @@ config :ferricstore, :supervisor_max_restarts, {20, 10}
 config :ferricstore, :supervisor_max_restarts, {1000, 60}
 ```
 
+## Flow Scheduler
+
+The built-in scheduler is enabled by default in standalone and embedded mode.
+It claims durable schedule records through the same Raft-owned lease and
+fencing path used by other Flow work. Disabling the runner does not delete or
+pause schedules; it only stops automatic due execution until a runner is
+enabled again or an explicit `FLOW.SCHEDULE.FIRE_DUE` caller takes ownership.
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:flow_scheduler_enabled` | `boolean` | `true` | Both | Starts automatic due execution. Set `false` only for tests or a deployment with one intentionally managed custom runner. Invalid runtime values fail closed instead of starting an unintended runner. |
+| `:flow_scheduler_limit` | positive `integer` | `100` | Both | Maximum due schedules claimed per scheduler pass, capped by `:flow_max_claim_limit` (default `1_000`). This bounds command work; catch-up within each interval schedule remains O(1). |
+| `:flow_scheduler_initial_delay_ms` | non-negative `integer` | `2_000` | Both | Delay after application startup before the first due pass. Durable overdue intervals are bounded by their catch-up policy. |
+| `:flow_scheduler_error_sleep_ms` | non-negative `integer` | `1_000` | Both | Delay before retrying after an idle or failed pass. |
+
+```elixir
+config :ferricstore,
+  flow_scheduler_enabled: true,
+  flow_scheduler_limit: 100,
+  flow_scheduler_initial_delay_ms: 2_000,
+  flow_scheduler_error_sleep_ms: 1_000
+```
+
+These are startup/application settings, not `CONFIG SET` parameters. See
+[Flow Schedules](../docs/flow-schedules.md) for schedule and recovery behavior.
+
 ## Memory Management
 
 | Option | Type | Default | Applies to | Description |
@@ -770,6 +796,10 @@ These environment variables are read from `config/runtime.exs` in production (`M
 | `FERRICSTORE_HEALTH_PROBE_PORT` | `6381` | Isolated liveness/readiness probe port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Root data directory (Bitcask, WARaft segments, mmap) |
 | `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards. `0` = `System.schedulers_online()` |
+| `FERRICSTORE_FLOW_SCHEDULER_ENABLED` | `true` | Runs the built-in durable Flow schedule worker. Disable only when exactly one custom runner owns `FLOW.SCHEDULE.FIRE_DUE`. |
+| `FERRICSTORE_FLOW_SCHEDULER_LIMIT` | `100` | Positive maximum number of due schedules claimed per worker pass, capped by `:flow_max_claim_limit` (default `1_000`). |
+| `FERRICSTORE_FLOW_SCHEDULER_INITIAL_DELAY_MS` | `2000` | Non-negative startup delay before the first schedule claim. |
+| `FERRICSTORE_FLOW_SCHEDULER_ERROR_SLEEP_MS` | `1000` | Non-negative delay after an idle or failed worker pass. |
 
 ### Memory & Eviction
 

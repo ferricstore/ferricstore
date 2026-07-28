@@ -1,6 +1,61 @@
 defmodule Ferricstore.Flow.ScheduleTest do
   use Ferricstore.Test.FlowCase
 
+  defmodule ResourceLimitsProbe do
+    @behaviour FerricStore.ResourceLimits
+    @test_pid_key {__MODULE__, :test_pid}
+
+    def install(test_pid), do: :persistent_term.put(@test_pid_key, test_pid)
+    def uninstall, do: :persistent_term.erase(@test_pid_key)
+
+    @impl true
+    def set_limit(_scope, _limit_spec, _opts), do: {:error, :unsupported}
+
+    @impl true
+    def get_limit(_scope, _opts), do: {:error, :unsupported}
+
+    @impl true
+    def usage(_scope, _opts), do: {:ok, %{}}
+
+    @impl true
+    def check(_scope, _resource, _amount, _opts), do: :ok
+
+    @impl true
+    def reserve(_scope, _resource, _amount, _opts), do: {:ok, nil}
+
+    @impl true
+    def release(_reservation, _opts), do: :ok
+
+    @impl true
+    def record_activity(keys, opts) do
+      notify({:schedule_resource_activity, keys, opts})
+      :ok
+    end
+
+    @impl true
+    def check_command(_command, _args, _keys, _opts), do: :ok
+
+    @impl true
+    def acquire_command(command, args, keys, opts) do
+      lease = make_ref()
+      notify({:schedule_resource_acquire, command, args, keys, opts, lease})
+      {:ok, lease}
+    end
+
+    @impl true
+    def release_command(lease, opts) do
+      notify({:schedule_resource_release, lease, opts})
+      :ok
+    end
+
+    defp notify(message) do
+      case :persistent_term.get(@test_pid_key, nil) do
+        pid when is_pid(pid) -> send(pid, message)
+        _missing -> :ok
+      end
+    end
+  end
+
   test "delay schedule defaults are based on the cluster-adjusted clock" do
     ref = :persistent_term.get(:ferricstore_hlc_ref)
     previous = :atomics.get(ref, 1)
@@ -9,7 +64,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
       :atomics.put(:persistent_term.get(:ferricstore_hlc_ref), 1, previous)
     end)
 
-    future_ms = System.system_time(:millisecond) + 60_000
+    future_ms = System.system_time(:millisecond) + 800
     :atomics.put(ref, 1, Bitwise.bsl(future_ms, 16))
     schedule_id = unique_flow_id("schedule-hlc-delay")
 
@@ -72,6 +127,115 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     assert {:ok, %{fired: 0, claimed: 0, errors: []}} =
              FerricStore.flow_schedule_fire_due(now_ms: now_ms + 200, worker: "schedule-test")
+  end
+
+  test "scheduled targets preserve Flow create resource governance and activity" do
+    previous = Application.get_env(:ferricstore, FerricStore.ResourceLimits)
+    Application.put_env(:ferricstore, FerricStore.ResourceLimits, ResourceLimitsProbe)
+    ResourceLimitsProbe.install(self())
+
+    on_exit(fn ->
+      ResourceLimitsProbe.uninstall()
+
+      if is_nil(previous) do
+        Application.delete_env(:ferricstore, FerricStore.ResourceLimits)
+      else
+        Application.put_env(:ferricstore, FerricStore.ResourceLimits, previous)
+      end
+    end)
+
+    now_ms = 1_250
+    schedule_id = unique_flow_id("schedule-governed")
+    target_id = unique_flow_id("schedule-governed-target")
+    partition_key = unique_flow_id("schedule-governed-partition")
+    target_type = unique_flow_id("schedule-governed-type")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :one_shot,
+               at_ms: now_ms,
+               now_ms: now_ms,
+               target: [id: target_id, type: target_type, partition_key: partition_key]
+             )
+
+    assert {:ok, %{fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "governance-test")
+
+    assert_received {:schedule_resource_acquire, "FLOW.CREATE",
+                     [^target_id, ^target_type, "queued"], [^partition_key], acquire_opts, lease}
+
+    assert acquire_opts[:flow_create_count] == 1
+    assert acquire_opts[:scheduled] == true
+
+    assert_received {:schedule_resource_activity, [^partition_key], activity_opts}
+    assert activity_opts[:command_checked] == true
+    assert activity_opts[:scheduled] == true
+
+    assert_received {:schedule_resource_release, ^lease, release_opts}
+    assert release_opts[:scheduled] == true
+  end
+
+  test "fire_due drains multiple bounded claim waves without losing schedules" do
+    now_ms = 1_500
+    target_type = unique_flow_id("schedule-multi-wave-type")
+
+    schedule_targets =
+      for suffix <- 1..18 do
+        schedule_id = unique_flow_id("schedule-multi-wave-#{suffix}")
+        target_id = unique_flow_id("schedule-multi-wave-target-#{suffix}")
+
+        assert {:ok, _schedule} =
+                 FerricStore.flow_schedule_create(schedule_id,
+                   kind: :one_shot,
+                   at_ms: now_ms,
+                   now_ms: now_ms,
+                   target: [id: target_id, type: target_type]
+                 )
+
+        {schedule_id, target_id}
+      end
+
+    assert {:ok, %{claimed: 18, fired: 18, skipped: 0, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: now_ms,
+               worker: "schedule-multi-wave-test",
+               limit: 18
+             )
+
+    for {schedule_id, target_id} <- schedule_targets do
+      assert {:ok, %{state: "completed"}} = FerricStore.flow_schedule_get(schedule_id)
+      assert {:ok, %{id: ^target_id}} = FerricStore.flow_get(target_id)
+    end
+  end
+
+  test "fire_due returns after an exact full dispatch wave below the requested limit" do
+    now_ms = 1_750
+
+    for suffix <- 1..16 do
+      assert {:ok, _schedule} =
+               FerricStore.flow_schedule_create(unique_flow_id("schedule-full-wave-#{suffix}"),
+                 kind: :one_shot,
+                 at_ms: now_ms,
+                 now_ms: now_ms,
+                 target: [
+                   id: unique_flow_id("schedule-full-wave-target-#{suffix}"),
+                   type: unique_flow_id("schedule-full-wave-type")
+                 ]
+               )
+    end
+
+    task =
+      Task.async(fn ->
+        FerricStore.flow_schedule_fire_due(
+          now_ms: now_ms,
+          worker: "schedule-full-wave-test",
+          limit: 17
+        )
+      end)
+
+    result = Task.yield(task, 2_000) || Task.shutdown(task)
+
+    assert {:ok, {:ok, %{claimed: 16, fired: 16, skipped: 0, errors: []}}} = result
   end
 
   test "interval schedule reschedules without consuming retry attempts" do
@@ -179,12 +343,123 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert {:ok, %{state: "completed"}} = FerricStore.flow_schedule_get(schedule_id)
   end
 
+  test "concurrent manual fires fence before creating distinct targets" do
+    now_ms = Ferricstore.CommandTime.now_ms()
+    schedule_id = unique_flow_id("schedule-concurrent-manual")
+    target_prefix = unique_flow_id("schedule-concurrent-manual-target")
+    target_partition = unique_flow_id("schedule-concurrent-manual-partition")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               start_at_ms: now_ms + 60_000,
+               every_ms: 1_000,
+               now_ms: now_ms,
+               target: [
+                 id_prefix: target_prefix,
+                 type: unique_flow_id("schedule-concurrent-manual-type"),
+                 partition_key: target_partition
+               ]
+             )
+
+    fire_times = [now_ms + 1, now_ms + 2]
+
+    results =
+      fire_times
+      |> Task.async_stream(
+        fn fire_at_ms ->
+          FerricStore.flow_schedule_fire(schedule_id,
+            now_ms: fire_at_ms,
+            fire_at_ms: fire_at_ms
+          )
+        end,
+        max_concurrency: 2,
+        ordered: false,
+        timeout: 10_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.count(results, &match?({:ok, %{fired: 1}}, &1)) == 1
+    assert Enum.count(results, &match?({:error, _reason}, &1)) == 1
+
+    created =
+      Enum.filter(fire_times, fn fire_at_ms ->
+        target_id = "#{target_prefix}:#{fire_at_ms}:1"
+
+        match?(
+          {:ok, %{id: ^target_id}},
+          FerricStore.flow_get(target_id,
+            partition_key: target_partition
+          )
+        )
+      end)
+
+    assert length(created) == 1
+    assert {:ok, %{fire_count: 1}} = FerricStore.flow_schedule_get(schedule_id)
+  end
+
   test "recurring schedule rejects fixed target id" do
     assert {:error, "ERR recurring schedule target must use id_prefix, not id"} =
              FerricStore.flow_schedule_create(unique_flow_id("schedule-invalid"),
                kind: :interval,
                every_ms: 1_000,
                target: [id: "fixed-target", type: "scheduled"]
+             )
+  end
+
+  test "schedule target rejects ambiguous fixed and generated ids" do
+    assert {:error, "ERR flow schedule target cannot set both id and id_prefix"} =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-ambiguous-target-id"),
+               kind: :one_shot,
+               at_ms: 1_000,
+               now_ms: 0,
+               target: [id: "fixed-target", id_prefix: "generated-target", type: "scheduled"]
+             )
+  end
+
+  test "schedule creation rejects timing fields from another kind" do
+    target = [type: unique_flow_id("schedule-timing-validation-type")]
+
+    for {kind, extra, field, supported_kind} <- [
+          {:one_shot, [every_ms: 1_000], "every_ms", "interval"},
+          {:delay, [delay_ms: 1_000, cron: "* * * * *"], "cron", "cron"},
+          {:interval, [every_ms: 1_000, delay_ms: 1_000], "delay_ms", "delay"},
+          {:cron, [cron: "* * * * *", every_ms: 1_000], "every_ms", "interval"}
+        ] do
+      expected =
+        "ERR flow schedule #{field} is only supported for #{supported_kind} schedules"
+
+      assert {:error, ^expected} =
+               FerricStore.flow_schedule_create(
+                 unique_flow_id("schedule-invalid-#{kind}-timing"),
+                 [kind: kind, target: target] ++ extra
+               )
+    end
+  end
+
+  test "schedule creation rejects ambiguous absolute start timestamps" do
+    assert {:error, "ERR flow schedule cannot set both at_ms and start_at_ms"} =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-ambiguous-start"),
+               kind: :interval,
+               at_ms: 1_000,
+               start_at_ms: 2_000,
+               every_ms: 100,
+               now_ms: 0,
+               target: [type: "scheduled"]
+             )
+  end
+
+  test "overlap retry is accepted only by queue_after_previous" do
+    target = [type: unique_flow_id("schedule-overlap-retry-validation-type")]
+
+    assert {:error,
+            "ERR flow schedule overlap_retry_ms requires overlap_policy :queue_after_previous"} =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-unused-overlap-retry"),
+               kind: :interval,
+               every_ms: 100,
+               overlap_policy: :allow,
+               overlap_retry_ms: 10,
+               target: target
              )
   end
 
@@ -245,6 +520,102 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert ^error = FerricStore.flow_schedule_fire_due(invalid_opts)
   end
 
+  test "schedule APIs report invalid identifiers before storage access" do
+    invalid_id = :not_a_schedule_id
+    error = {:error, "ERR flow schedule id must be a non-empty string"}
+
+    assert ^error = FerricStore.flow_schedule_create(invalid_id, target: [type: "scheduled"])
+    assert ^error = FerricStore.flow_schedule_get(invalid_id)
+    assert ^error = FerricStore.flow_schedule_fire(invalid_id)
+    assert ^error = FerricStore.flow_schedule_pause(invalid_id)
+    assert ^error = FerricStore.flow_schedule_resume(invalid_id)
+    assert ^error = FerricStore.flow_schedule_delete(invalid_id)
+  end
+
+  test "schedule creation rejects unknown and duplicate options" do
+    target = [type: unique_flow_id("schedule-option-validation-type")]
+
+    assert {:error, "ERR unsupported flow schedule option catchup_polciy"} =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-unknown-option"),
+               kind: :interval,
+               every_ms: 1_000,
+               catchup_polciy: :fire_once,
+               target: target
+             )
+
+    assert {:error, "ERR duplicate flow schedule option kind"} =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-duplicate-option"),
+               kind: :interval,
+               kind: :cron,
+               every_ms: 1_000,
+               target: target
+             )
+  end
+
+  test "schedule creation rejects malformed, unknown, and duplicate target fields" do
+    base_opts = [kind: :one_shot, at_ms: 1_000, now_ms: 0]
+
+    assert {:error, "ERR flow schedule target must be a keyword list or map"} =
+             FerricStore.flow_schedule_create(
+               unique_flow_id("schedule-malformed-target"),
+               Keyword.put(base_opts, :target, [:not_a_pair])
+             )
+
+    assert {:error, "ERR unsupported flow schedule target field surprise"} =
+             FerricStore.flow_schedule_create(
+               unique_flow_id("schedule-unknown-target-field"),
+               Keyword.put(base_opts, :target, %{"type" => "scheduled", "surprise" => true})
+             )
+
+    assert {:error, "ERR duplicate flow schedule target field type"} =
+             FerricStore.flow_schedule_create(
+               unique_flow_id("schedule-duplicate-target-field"),
+               Keyword.put(base_opts, :target, type: "scheduled", type: "other")
+             )
+  end
+
+  test "schedule listing rejects unknown and duplicate options" do
+    assert {:error, "ERR unsupported flow schedule option surprise"} =
+             FerricStore.flow_schedule_list(surprise: true)
+
+    assert {:error, "ERR duplicate flow schedule option count"} =
+             FerricStore.flow_schedule_list(count: 1, count: 2)
+  end
+
+  test "schedule operations reject unknown and duplicate options before storage access" do
+    schedule_id = unique_flow_id("schedule-operation-options")
+
+    assert {:error, "ERR unsupported flow schedule option surprise"} =
+             FerricStore.flow_schedule_get(schedule_id, surprise: true)
+
+    assert {:error, "ERR duplicate flow schedule option payload"} =
+             FerricStore.flow_schedule_get(schedule_id, payload: true, payload: false)
+
+    operations = [
+      &FerricStore.flow_schedule_fire(schedule_id, &1),
+      &FerricStore.flow_schedule_pause(schedule_id, &1),
+      &FerricStore.flow_schedule_resume(schedule_id, &1),
+      &FerricStore.flow_schedule_delete(schedule_id, &1),
+      &FerricStore.flow_schedule_fire_due/1
+    ]
+
+    for operation <- operations do
+      assert {:error, "ERR unsupported flow schedule option surprise"} =
+               operation.(surprise: true)
+
+      assert {:error, "ERR duplicate flow schedule option now_ms"} =
+               operation.(now_ms: 1, now_ms: 2)
+    end
+  end
+
+  test "schedule listing rejects invalid states and inverted time ranges" do
+    assert {:error, message} = FerricStore.flow_schedule_list(state: "unknown")
+    assert message =~ "active, paused, running, completed, failed, cancelled, or all"
+
+    assert {:error, "ERR flow schedule from_ms must be less than or equal to to_ms"} =
+             FerricStore.flow_schedule_list(from_ms: 2, to_ms: 1)
+  end
+
   test "manual fire without a timestamp uses the current command time" do
     schedule_id = unique_flow_id("schedule-manual-default-time")
     target_prefix = unique_flow_id("schedule-manual-default-time-target")
@@ -290,6 +661,40 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert fetched.id == created.id
     assert fetched.kind == :one_shot
     assert fetched.target == created.target
+  end
+
+  test "stored schedules remain hydratable when the public payload return limit changes" do
+    previous = Application.get_env(:ferricstore, :flow_payload_return_max_bytes)
+
+    on_exit(fn ->
+      restore_env(:flow_payload_return_max_bytes, previous)
+    end)
+
+    now_ms = 3_115
+    schedule_id = unique_flow_id("schedule-immutable-hydration")
+    target_id = unique_flow_id("schedule-immutable-hydration-target")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :one_shot,
+               at_ms: now_ms,
+               now_ms: now_ms,
+               target: [
+                 id: target_id,
+                 type: unique_flow_id("schedule-immutable-hydration-type"),
+                 payload: String.duplicate("x", 128)
+               ]
+             )
+
+    Application.put_env(:ferricstore, :flow_payload_return_max_bytes, 1)
+
+    assert {:ok, %{id: ^schedule_id}} = FerricStore.flow_schedule_get(schedule_id)
+
+    assert {:ok, %{claimed: 1, fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "schedule-test")
+
+    assert {:ok, %{state: "completed"}} = FerricStore.flow_schedule_get(schedule_id)
+    assert {:ok, %{id: ^target_id}} = FerricStore.flow_get(target_id)
   end
 
   test "schedule rejects large inline target payloads" do
@@ -377,6 +782,20 @@ defmodule Ferricstore.Flow.ScheduleTest do
                ]
              )
 
+    at_ms_overflow_error =
+      {:error, "ERR flow schedule at_ms exceeds maximum #{max_exact_integer}"}
+
+    assert ^at_ms_overflow_error =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-time-overflow"),
+               kind: :one_shot,
+               at_ms: max_exact_integer + 1,
+               now_ms: 0,
+               target: [
+                 id: unique_flow_id("schedule-time-overflow-target"),
+                 type: unique_flow_id("schedule-time-overflow-type")
+               ]
+             )
+
     assert {:error, "ERR flow schedule timestamp is outside supported calendar range"} =
              FerricStore.flow_schedule_create(unique_flow_id("schedule-cron-calendar-overflow"),
                kind: :cron,
@@ -387,6 +806,55 @@ defmodule Ferricstore.Flow.ScheduleTest do
                  id_prefix: unique_flow_id("schedule-cron-calendar-overflow-target"),
                  type: unique_flow_id("schedule-cron-calendar-overflow-type")
                ]
+             )
+  end
+
+  test "cron fire at the calendar ceiling completes after emitting exactly one target" do
+    due_at_ms = 253_402_300_740_000
+    schedule_id = unique_flow_id("schedule-cron-calendar-ceiling")
+    target_prefix = unique_flow_id("schedule-cron-calendar-ceiling-target")
+    target_partition = unique_flow_id("schedule-cron-calendar-ceiling-partition")
+
+    assert {:ok, %{next_run_at_ms: ^due_at_ms}} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :cron,
+               cron: "59 23 31 DEC *",
+               start_at_ms: due_at_ms - 60_000,
+               now_ms: due_at_ms - 60_000,
+               target: [
+                 id_prefix: target_prefix,
+                 type: unique_flow_id("schedule-cron-calendar-ceiling-type"),
+                 partition_key: target_partition,
+                 payload: "calendar-ceiling"
+               ]
+             )
+
+    assert {:ok, %{claimed: 1, fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: due_at_ms,
+               worker: "schedule-calendar-ceiling-test"
+             )
+
+    target_id = "#{target_prefix}:#{due_at_ms}:1"
+
+    assert {:ok, %{id: ^target_id, payload: "calendar-ceiling"}} =
+             FerricStore.flow_get(target_id,
+               partition_key: target_partition,
+               payload: true
+             )
+
+    assert {:ok,
+            %{
+              state: "completed",
+              fire_count: 1,
+              end_reason: "timestamp_limit",
+              next_run_at_ms: nil
+            }} = FerricStore.flow_schedule_get(schedule_id)
+
+    assert {:ok, %{claimed: 0, fired: 0, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: due_at_ms,
+               worker: "schedule-calendar-ceiling-test"
              )
   end
 
@@ -416,13 +884,13 @@ defmodule Ferricstore.Flow.ScheduleTest do
                ]
              )
 
-    assert {:ok, %{fired: 0, claimed: 1, errors: [{_flow_id, reason}]}} =
+    assert {:ok, %{fired: 0, claimed: 1, errors: [{^schedule_id, reason}]}} =
              FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "schedule-test")
 
     assert reason == "ERR scheduled target id already exists with different owner"
   end
 
-  test "existing target with scheduler owner is idempotent and finishes schedule fire" do
+  test "predictable scheduler correlation cannot forge target ownership" do
     now_ms = 3_500
     schedule_id = unique_flow_id("schedule-duplicate-owned")
     target_id = unique_flow_id("schedule-owned-target")
@@ -452,8 +920,10 @@ defmodule Ferricstore.Flow.ScheduleTest do
                ]
              )
 
-    assert {:ok, %{fired: 1, claimed: 1, errors: []}} =
+    assert {:ok, %{fired: 0, claimed: 1, errors: [{^schedule_id, reason}]}} =
              FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "schedule-test")
+
+    assert reason == "ERR scheduled target id already exists with different owner"
 
     assert {:ok, target} =
              FerricStore.flow_get(target_id, partition_key: target_partition, payload: true)
@@ -462,8 +932,64 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert target.correlation_id == owner_correlation
 
     assert {:ok, fired_schedule} = FerricStore.flow_schedule_get(schedule_id)
-    assert fired_schedule.state == "completed"
-    assert fired_schedule.fire_count == 1
+    assert fired_schedule.state == "running"
+    assert fired_schedule.fire_count == 0
+  end
+
+  test "scheduler-owned target is accepted after a crash before schedule completion" do
+    now_ms = 3_600
+    schedule_id = unique_flow_id("schedule-owned-recovery")
+    target_id = unique_flow_id("schedule-owned-recovery-target")
+    target_type = unique_flow_id("schedule-owned-recovery-type")
+    target_partition = unique_flow_id("schedule-owned-recovery-partition")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :one_shot,
+               at_ms: now_ms,
+               now_ms: now_ms - 1,
+               target: [
+                 id: target_id,
+                 type: target_type,
+                 partition_key: target_partition,
+                 payload: "created-before-crash"
+               ]
+             )
+
+    ctx = FerricStore.Instance.get(:default)
+
+    assert {:ok, schedule_record} =
+             Ferricstore.Flow.get(
+               ctx,
+               Ferricstore.Flow.Schedule.flow_id(schedule_id),
+               Ferricstore.Flow.Internal.put(
+                 partition_key: schedule_partition_key(schedule_id),
+                 payload: true,
+                 payload_max_bytes: Ferricstore.Flow.InternalLimits.payload_return_max_bytes()
+               )
+             )
+
+    owner_attributes =
+      Ferricstore.Flow.Schedule.TargetOwnership.attributes(schedule_record.payload, target_id)
+
+    assert :ok =
+             FerricStore.flow_create(target_id,
+               type: target_type,
+               partition_key: target_partition,
+               correlation_id: "__ferricstore_schedule__:" <> schedule_id,
+               attributes: owner_attributes,
+               payload: "created-before-crash",
+               now_ms: now_ms
+             )
+
+    assert {:ok, %{claimed: 1, fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "schedule-test")
+
+    assert {:ok, %{state: "completed", fire_count: 1, last_target_id: ^target_id}} =
+             FerricStore.flow_schedule_get(schedule_id)
+
+    assert {:ok, %{payload: "created-before-crash"}} =
+             FerricStore.flow_get(target_id, partition_key: target_partition, payload: true)
   end
 
   test "duplicate schedule create returns already exists unless overwrite is explicit" do
@@ -547,7 +1073,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
   end
 
   test "schedule overwrite rejects a currently leased schedule" do
-    now_ms = 3_600
+    now_ms = Ferricstore.CommandTime.now_ms()
     schedule_id = unique_flow_id("schedule-overwrite-leased")
 
     assert {:ok, _schedule} =
@@ -580,11 +1106,54 @@ defmodule Ferricstore.Flow.ScheduleTest do
              FerricStore.flow_schedule_create(schedule_id,
                kind: :one_shot,
                at_ms: now_ms + 1_000,
-               now_ms: now_ms + 1,
+               now_ms: now_ms + 60_000,
                overwrite: true,
                target: [
                  id: unique_flow_id("schedule-overwrite-leased-replacement"),
                  type: unique_flow_id("schedule-overwrite-leased-replacement-type")
+               ]
+             )
+  end
+
+  test "schedule overwrite cannot expire a live lease with caller time" do
+    now_ms = Ferricstore.CommandTime.now_ms()
+    schedule_id = unique_flow_id("schedule-overwrite-forged-time")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :one_shot,
+               at_ms: now_ms,
+               now_ms: now_ms,
+               target: [
+                 id: unique_flow_id("schedule-overwrite-forged-time-target"),
+                 type: unique_flow_id("schedule-overwrite-forged-time-type")
+               ]
+             )
+
+    assert {:ok, [_claimed]} =
+             Ferricstore.Flow.claim_due(
+               FerricStore.Instance.get(:default),
+               "__ferricstore_schedule",
+               Ferricstore.Flow.Internal.put(
+                 state: "active",
+                 partition_key: :any,
+                 worker: "schedule-forged-time-test",
+                 limit: 1,
+                 lease_ms: 30_000,
+                 now_ms: now_ms,
+                 payload: true
+               )
+             )
+
+    assert {:error, "ERR flow schedule is currently leased"} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :one_shot,
+               at_ms: now_ms + 120_000,
+               now_ms: now_ms + 120_000,
+               overwrite: true,
+               target: [
+                 id: unique_flow_id("schedule-overwrite-forged-time-replacement"),
+                 type: unique_flow_id("schedule-overwrite-forged-time-replacement-type")
                ]
              )
   end
@@ -806,6 +1375,40 @@ defmodule Ferricstore.Flow.ScheduleTest do
              FerricStore.flow_schedule_list(count: 1)
   end
 
+  test "schedule list applies its candidate cap across occupied partitions" do
+    previous = Application.get_env(:ferricstore, :flow_schedule_list_scan_limit)
+
+    on_exit(fn ->
+      restore_env(:flow_schedule_list_scan_limit, previous)
+    end)
+
+    Application.put_env(:ferricstore, :flow_schedule_list_scan_limit, 2)
+    id_prefix = unique_flow_id("schedule-list-global-overflow")
+
+    schedule_ids =
+      Enum.reduce_while(0..10_000, %{}, fn suffix, ids_by_bucket ->
+        id = id_prefix <> ":" <> Integer.to_string(suffix)
+        ids_by_bucket = Map.put_new(ids_by_bucket, :erlang.phash2(id, 256), id)
+
+        if map_size(ids_by_bucket) == 3,
+          do: {:halt, Map.values(ids_by_bucket)},
+          else: {:cont, ids_by_bucket}
+      end)
+
+    for {id, at_ms} <- Enum.with_index(schedule_ids, 4_100) do
+      assert {:ok, _schedule} =
+               FerricStore.flow_schedule_create(id,
+                 kind: :one_shot,
+                 at_ms: at_ms,
+                 now_ms: 4_000,
+                 target: [id: id <> ":target", type: "schedule-list-global-overflow-target"]
+               )
+    end
+
+    assert {:error, "ERR flow schedule query candidate limit exceeded (2)"} =
+             FerricStore.flow_schedule_list(count: 1)
+  end
+
   test "schedule due ranges exclude terminal schedules without a next run" do
     now_ms = 3_975
     schedule_id = unique_flow_id("schedule-list-terminal-range")
@@ -835,15 +1438,89 @@ defmodule Ferricstore.Flow.ScheduleTest do
              )
   end
 
-  test "schedule list fails closed when a partition index is unavailable" do
+  test "schedule list fails closed when its partition catalog is unavailable" do
     ctx = %{
       name: :schedule_unavailable_test,
+      shard_count: 1,
       shard_names: {:schedule_missing_shard},
       slot_map: List.duplicate(0, 1_024) |> List.to_tuple()
     }
 
-    assert {:error, :flow_index_unavailable} =
+    assert {:error, "ERR flow schedule catalog is unavailable"} =
              Ferricstore.Flow.Schedule.list(ctx, count: 1)
+  end
+
+  test "schedule partition catalog keeps exact shared-bucket counts through retention" do
+    now_ms = 4_005
+    id_prefix = unique_flow_id("schedule-catalog-lifecycle")
+
+    {first_id, second_id, bucket} =
+      Enum.reduce_while(0..10_000, %{}, fn suffix, ids_by_bucket ->
+        id = id_prefix <> ":" <> Integer.to_string(suffix)
+        bucket = :erlang.phash2(id, 256)
+
+        case Map.fetch(ids_by_bucket, bucket) do
+          {:ok, existing_id} -> {:halt, {existing_id, id, bucket}}
+          :error -> {:cont, Map.put(ids_by_bucket, bucket, id)}
+        end
+      end)
+
+    target_type = unique_flow_id("schedule-catalog-lifecycle-target")
+
+    for id <- [first_id, second_id] do
+      assert {:ok, _schedule} =
+               FerricStore.flow_schedule_create(id,
+                 kind: :one_shot,
+                 at_ms: now_ms + 10_000,
+                 now_ms: now_ms,
+                 target: [id: id <> ":target", type: target_type]
+               )
+    end
+
+    ctx = FerricStore.Instance.get(:default)
+    partition_key = schedule_partition_key(first_id)
+
+    state_key =
+      Ferricstore.Flow.Keys.state_key(
+        Ferricstore.Flow.Schedule.flow_id(first_id),
+        partition_key
+      )
+
+    shard_index = Ferricstore.Store.Router.shard_for(ctx, state_key)
+    count_key = Ferricstore.Flow.Schedule.Catalog.count_key(bucket)
+
+    assert {:ok, <<2::unsigned-big-64>>} =
+             Ferricstore.Store.Router.read_shard_value(ctx, shard_index, count_key)
+
+    assert :ok = FerricStore.flow_schedule_delete(first_id, now_ms: now_ms + 1)
+
+    assert {:ok, %{flows: flows}} =
+             FerricStore.flow_retention_cleanup(
+               limit: 100,
+               now_ms: 9_007_199_254_740_991
+             )
+
+    assert flows >= 1
+
+    assert {:ok, <<1::unsigned-big-64>>} =
+             Ferricstore.Store.Router.read_shard_value(ctx, shard_index, count_key)
+
+    assert {:ok, schedules} = FerricStore.flow_schedule_list(count: 10)
+    assert Enum.any?(schedules, &(&1.id == second_id))
+
+    assert :ok = FerricStore.flow_schedule_delete(second_id, now_ms: now_ms + 2)
+
+    assert {:ok, %{flows: flows}} =
+             FerricStore.flow_retention_cleanup(
+               limit: 100,
+               now_ms: 9_007_199_254_740_991
+             )
+
+    assert flows >= 1
+    assert {:ok, nil} = Ferricstore.Store.Router.read_shard_value(ctx, shard_index, count_key)
+
+    assert {:ok, partition_keys} = Ferricstore.Flow.Schedule.Catalog.partition_keys(ctx)
+    refute partition_key in partition_keys
   end
 
   test "recurring schedule completes after max_fires" do
@@ -1087,6 +1764,76 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert schedule.last_overlap_target_id == "#{target_prefix}:#{now_ms}:1"
   end
 
+  test "strict overlap state reads use the replicated state-only path" do
+    ctx = FerricStore.Instance.get(:default)
+    target_id = unique_flow_id("schedule-consistent-target")
+    partition_key = unique_flow_id("schedule-consistent-partition")
+
+    assert :ok =
+             FerricStore.flow_create(target_id,
+               type: unique_flow_id("schedule-consistent-type"),
+               state: "queued",
+               partition_key: partition_key,
+               payload: :binary.copy(<<1>>, 8_192)
+             )
+
+    assert {:ok, "queued"} =
+             Ferricstore.Store.Router.flow_consistent_state(ctx, target_id, partition_key)
+
+    assert {:ok, nil} =
+             Ferricstore.Store.Router.flow_consistent_state(
+               ctx,
+               unique_flow_id("schedule-consistent-missing"),
+               partition_key
+             )
+  end
+
+  test "overlap policy allow does not depend on reading the previous target" do
+    now_ms = 4_050
+    schedule_id = unique_flow_id("schedule-overlap-allow")
+    target_prefix = unique_flow_id("schedule-overlap-allow-target")
+    target_partition = unique_flow_id("schedule-overlap-allow-partition")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 100,
+               start_at_ms: now_ms,
+               now_ms: now_ms,
+               overlap_policy: :allow,
+               target: [
+                 id_prefix: target_prefix,
+                 type: unique_flow_id("schedule-overlap-allow-type"),
+                 partition_key: target_partition
+               ]
+             )
+
+    assert {:ok, %{fired: 1, claimed: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "schedule-test")
+
+    first_target_id = "#{target_prefix}:#{now_ms}:1"
+    first_target_key = Ferricstore.Flow.Keys.state_key(first_target_id, target_partition)
+
+    assert :ok =
+             Ferricstore.Store.Router.put(
+               FerricStore.Instance.get(:default),
+               first_target_key,
+               "corrupt",
+               0
+             )
+
+    assert {:error, _reason} =
+             FerricStore.flow_get(first_target_id, partition_key: target_partition)
+
+    assert {:ok, %{fired: 1, claimed: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms + 100, worker: "schedule-test")
+
+    second_target_id = "#{target_prefix}:#{now_ms + 100}:2"
+
+    assert {:ok, %{id: ^second_target_id}} =
+             FerricStore.flow_get(second_target_id, partition_key: target_partition)
+  end
+
   test "overlap policy queue_after_previous preserves queued due occurrence" do
     now_ms = 4_300
     schedule_id = unique_flow_id("schedule-overlap-queue")
@@ -1135,6 +1882,152 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert second_target.type == target_type
   end
 
+  test "queued overlap terminates cleanly when its retry timestamp would overflow" do
+    max_exact_integer = 9_007_199_254_740_991
+    due_at_ms = max_exact_integer - 3
+    schedule_id = unique_flow_id("schedule-overlap-queue-limit")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 2,
+               start_at_ms: due_at_ms,
+               now_ms: due_at_ms,
+               overlap_policy: :queue_after_previous,
+               overlap_retry_ms: 3,
+               target: [
+                 id_prefix: unique_flow_id("schedule-overlap-queue-limit-target"),
+                 type: unique_flow_id("schedule-overlap-queue-limit-type")
+               ]
+             )
+
+    assert {:ok, %{claimed: 1, fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: due_at_ms,
+               lease_ms: 1,
+               worker: "schedule-overlap-limit-test"
+             )
+
+    assert {:ok, %{claimed: 1, fired: 0, skipped: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: max_exact_integer - 1,
+               lease_ms: 1,
+               worker: "schedule-overlap-limit-test"
+             )
+
+    assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
+    assert schedule.state == "completed"
+    assert schedule.end_reason == "timestamp_limit"
+    assert schedule.next_run_at_ms == nil
+  end
+
+  test "manual queued overlap terminates cleanly when its retry timestamp would overflow" do
+    max_exact_integer = 9_007_199_254_740_991
+    due_at_ms = max_exact_integer - 3
+    schedule_id = unique_flow_id("schedule-manual-overlap-queue-limit")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 2,
+               start_at_ms: due_at_ms,
+               now_ms: due_at_ms,
+               overlap_policy: :queue_after_previous,
+               overlap_retry_ms: 3,
+               target: [
+                 id_prefix: unique_flow_id("schedule-manual-overlap-queue-limit-target"),
+                 type: unique_flow_id("schedule-manual-overlap-queue-limit-type")
+               ]
+             )
+
+    assert {:ok, %{claimed: 1, fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: due_at_ms,
+               lease_ms: 1,
+               worker: "schedule-manual-overlap-limit-test"
+             )
+
+    assert {:ok, %{fired: 0, skipped: 1, schedule: schedule}} =
+             FerricStore.flow_schedule_fire(schedule_id,
+               fire_at_ms: max_exact_integer - 1,
+               now_ms: max_exact_integer - 1
+             )
+
+    assert schedule.state == "completed"
+    assert schedule.end_reason == "timestamp_limit"
+    assert schedule.next_run_at_ms == nil
+  end
+
+  test "manual overlap skip completes when the next occurrence passes the end bound" do
+    due_at_ms = 4_400
+    schedule_id = unique_flow_id("schedule-manual-overlap-skip-end")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 100,
+               start_at_ms: due_at_ms,
+               end_at_ms: due_at_ms + 100,
+               now_ms: due_at_ms,
+               overlap_policy: :skip,
+               target: [
+                 id_prefix: unique_flow_id("schedule-manual-overlap-skip-end-target"),
+                 type: unique_flow_id("schedule-manual-overlap-skip-end-type")
+               ]
+             )
+
+    assert {:ok, %{claimed: 1, fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(now_ms: due_at_ms, worker: "schedule-test")
+
+    assert {:ok, %{fired: 0, skipped: 1, schedule: schedule}} =
+             FerricStore.flow_schedule_fire(schedule_id,
+               fire_at_ms: due_at_ms + 100,
+               now_ms: due_at_ms + 100
+             )
+
+    assert schedule.state == "completed"
+    assert schedule.end_reason == "end_at_ms"
+    assert schedule.skipped_count == 1
+    assert schedule.next_run_at_ms == nil
+  end
+
+  test "manual overlap skip terminates cleanly at the exact timestamp limit" do
+    max_exact_integer = 9_007_199_254_740_991
+    due_at_ms = max_exact_integer - 3
+    schedule_id = unique_flow_id("schedule-manual-overlap-skip-limit")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 2,
+               start_at_ms: due_at_ms,
+               now_ms: due_at_ms,
+               overlap_policy: :skip,
+               target: [
+                 id_prefix: unique_flow_id("schedule-manual-overlap-skip-limit-target"),
+                 type: unique_flow_id("schedule-manual-overlap-skip-limit-type")
+               ]
+             )
+
+    assert {:ok, %{claimed: 1, fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: due_at_ms,
+               lease_ms: 1,
+               worker: "schedule-manual-overlap-skip-limit-test"
+             )
+
+    assert {:ok, %{fired: 0, skipped: 1, schedule: schedule}} =
+             FerricStore.flow_schedule_fire(schedule_id,
+               fire_at_ms: max_exact_integer - 1,
+               now_ms: max_exact_integer - 1
+             )
+
+    assert schedule.state == "completed"
+    assert schedule.end_reason == "timestamp_limit"
+    assert schedule.skipped_count == 1
+    assert schedule.next_run_at_ms == nil
+  end
+
   test "overlap policy fail_schedule marks recurring schedule failed" do
     now_ms = 4_500
     schedule_id = unique_flow_id("schedule-overlap-fail")
@@ -1161,6 +2054,46 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
     assert schedule.state == "failed"
+    assert schedule.end_reason == "overlap_failed"
+    assert schedule.last_overlap_target_id == "#{target_prefix}:#{now_ms}:1"
+    assert schedule.last_overlap_reason == reason
+    assert schedule.next_run_at_ms == nil
+  end
+
+  test "manual fail_schedule overlap persists the same terminal details" do
+    now_ms = 4_700
+    schedule_id = unique_flow_id("schedule-manual-overlap-fail")
+    target_prefix = unique_flow_id("schedule-manual-overlap-fail-target")
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 100,
+               start_at_ms: now_ms,
+               now_ms: now_ms,
+               overlap_policy: :fail_schedule,
+               target: [
+                 id_prefix: target_prefix,
+                 type: unique_flow_id("schedule-manual-overlap-fail-type")
+               ]
+             )
+
+    assert {:ok, %{fired: 1, claimed: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "schedule-test")
+
+    assert {:error, reason} =
+             FerricStore.flow_schedule_fire(schedule_id,
+               fire_at_ms: now_ms + 100,
+               now_ms: now_ms + 100
+             )
+
+    assert reason =~ "previous target still active"
+    assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
+    assert schedule.state == "failed"
+    assert schedule.end_reason == "overlap_failed"
+    assert schedule.last_overlap_target_id == "#{target_prefix}:#{now_ms}:1"
+    assert schedule.last_overlap_reason == reason
+    assert schedule.next_run_at_ms == nil
   end
 
   test "schedule delete cancels future schedule" do
@@ -1180,6 +2113,7 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     assert {:ok, deleted} = FerricStore.flow_schedule_get(schedule_id)
     assert deleted.state == "cancelled"
+    assert deleted.next_run_at_ms == nil
 
     assert {:ok, history} =
              FerricStore.flow_history(Ferricstore.Flow.Schedule.flow_id(schedule_id),
@@ -1204,6 +2138,146 @@ defmodule Ferricstore.Flow.ScheduleTest do
              )
   end
 
+  test "recurrence planning failures do not create orphan targets" do
+    now_ms = 5_100
+    schedule_id = unique_flow_id("schedule-plan-before-target")
+    target_prefix = unique_flow_id("schedule-plan-before-target-flow")
+
+    assert {:ok, schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :cron,
+               cron: "* * * * *",
+               start_at_ms: now_ms,
+               now_ms: now_ms,
+               target: [
+                 id_prefix: target_prefix,
+                 type: unique_flow_id("schedule-plan-before-target-type")
+               ]
+             )
+
+    due_at_ms = schedule.next_run_at_ms
+    target_id = "#{target_prefix}:#{due_at_ms}:1"
+
+    ctx = FerricStore.Instance.get(:default)
+    flow_id = Ferricstore.Flow.Schedule.flow_id(schedule_id)
+    partition_key = schedule_partition_key(schedule_id)
+
+    assert {:ok, record} =
+             Ferricstore.Flow.get(
+               ctx,
+               flow_id,
+               Ferricstore.Flow.Internal.put(
+                 partition_key: partition_key,
+                 payload: true,
+                 payload_max_bytes: Ferricstore.Flow.InternalLimits.payload_return_max_bytes()
+               )
+             )
+
+    corrupt_definition = Map.put(record.payload, :cron, "not a cron expression")
+
+    assert :ok =
+             Ferricstore.Store.Router.flow_schedule_replace(ctx, %{
+               id: flow_id,
+               type: "__ferricstore_schedule",
+               state: "active",
+               partition_key: partition_key,
+               expected_version: record.version,
+               payload: corrupt_definition,
+               run_at_ms: due_at_ms,
+               now_ms: now_ms
+             })
+
+    assert {:ok, %{claimed: 1, fired: 0, errors: [{_error_id, reason}]}} =
+             FerricStore.flow_schedule_fire_due(now_ms: due_at_ms, worker: "schedule-test")
+
+    assert reason == "ERR flow schedule cron must have 5 fields"
+    assert {:ok, nil} = FerricStore.flow_get(target_id)
+
+    assert {:ok,
+            %{
+              state: "failed",
+              end_reason: "planning_failed",
+              last_planning_error: ^reason
+            }} = FerricStore.flow_schedule_get(schedule_id)
+  end
+
+  test "recurrence planning failures terminate an overlap skip" do
+    now_ms = 5_200
+    schedule_id = unique_flow_id("schedule-overlap-skip-planning")
+    target_prefix = unique_flow_id("schedule-overlap-skip-planning-target")
+
+    assert {:ok, first} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :cron,
+               cron: "* * * * *",
+               start_at_ms: now_ms,
+               now_ms: now_ms,
+               overlap_policy: :skip,
+               target: [
+                 id_prefix: target_prefix,
+                 type: unique_flow_id("schedule-overlap-skip-planning-type")
+               ]
+             )
+
+    assert {:ok, %{claimed: 1, fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: first.next_run_at_ms,
+               worker: "schedule-test"
+             )
+
+    assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
+    due_at_ms = schedule.next_run_at_ms
+    corrupt_schedule_cron(schedule_id, due_at_ms, now_ms)
+
+    assert {:ok, %{claimed: 1, fired: 0, skipped: 0, errors: [{schedule_id, reason}]}} =
+             FerricStore.flow_schedule_fire_due(now_ms: due_at_ms, worker: "schedule-test")
+
+    assert reason == "ERR flow schedule cron must have 5 fields"
+
+    assert {:ok, %{state: "failed", end_reason: "planning_failed", last_planning_error: ^reason}} =
+             FerricStore.flow_schedule_get(schedule_id)
+  end
+
+  test "manual overlap skip persists recurrence planning failures" do
+    now_ms = 5_300
+    schedule_id = unique_flow_id("schedule-manual-skip-planning")
+    target_prefix = unique_flow_id("schedule-manual-skip-planning-target")
+
+    assert {:ok, first} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :cron,
+               cron: "* * * * *",
+               start_at_ms: now_ms,
+               now_ms: now_ms,
+               overlap_policy: :skip,
+               target: [
+                 id_prefix: target_prefix,
+                 type: unique_flow_id("schedule-manual-skip-planning-type")
+               ]
+             )
+
+    assert {:ok, %{fired: 1, claimed: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(
+               now_ms: first.next_run_at_ms,
+               worker: "schedule-test"
+             )
+
+    assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
+    due_at_ms = schedule.next_run_at_ms
+    corrupt_schedule_cron(schedule_id, due_at_ms, now_ms)
+
+    assert {:error, reason} =
+             FerricStore.flow_schedule_fire(schedule_id,
+               fire_at_ms: due_at_ms,
+               now_ms: due_at_ms
+             )
+
+    assert reason == "ERR flow schedule cron must have 5 fields"
+
+    assert {:ok, %{state: "failed", end_reason: "planning_failed", last_planning_error: ^reason}} =
+             FerricStore.flow_schedule_get(schedule_id)
+  end
+
   test "invalid cron range is rejected during schedule creation" do
     assert {:error, "ERR flow schedule cron range is invalid"} =
              FerricStore.flow_schedule_create(unique_flow_id("schedule-invalid-cron-range"),
@@ -1214,6 +2288,57 @@ defmodule Ferricstore.Flow.ScheduleTest do
                  type: "cron"
                ]
              )
+  end
+
+  test "cron fields reject empty comma elements before searching the time window" do
+    for expression <- [", * * * *", "1,,2 * * * *", "1, * * * *"] do
+      assert {:error, "ERR flow schedule cron field is invalid"} =
+               FerricStore.flow_schedule_create(unique_flow_id("schedule-invalid-cron-list"),
+                 kind: :cron,
+                 cron: expression,
+                 target: [
+                   id_prefix: unique_flow_id("schedule-invalid-cron-list-target"),
+                   type: "cron"
+                 ]
+               )
+    end
+  end
+
+  test "cron rejects impossible calendar combinations before searching minutes" do
+    assert {:error, "ERR flow schedule cron day cannot occur in the selected months"} =
+             FerricStore.flow_schedule_create(unique_flow_id("schedule-cron-impossible-date"),
+               kind: :cron,
+               cron: "0 0 31 FEB *",
+               now_ms: 0,
+               target: [
+                 id_prefix: unique_flow_id("schedule-cron-impossible-date-target"),
+                 type: unique_flow_id("schedule-cron-impossible-date-type")
+               ]
+             )
+  end
+
+  test "cron accepts leap-day schedules independently of mutable application limits" do
+    previous = Application.get_env(:ferricstore, :flow_schedule_cron_search_minutes)
+    Application.put_env(:ferricstore, :flow_schedule_cron_search_minutes, 1)
+    on_exit(fn -> restore_env(:flow_schedule_cron_search_minutes, previous) end)
+
+    schedule_id = unique_flow_id("schedule-cron-leap-century")
+    start_at_ms = DateTime.to_unix(~U[2097-03-01 00:00:00Z], :millisecond)
+    expected_run_at_ms = DateTime.to_unix(~U[2104-02-29 00:00:00Z], :millisecond)
+
+    assert {:ok, schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :cron,
+               cron: "0 0 29 FEB *",
+               start_at_ms: start_at_ms,
+               now_ms: start_at_ms,
+               target: [
+                 id_prefix: unique_flow_id("schedule-cron-leap-century-target"),
+                 type: unique_flow_id("schedule-cron-leap-century-type")
+               ]
+             )
+
+    assert schedule.next_run_at_ms == expected_run_at_ms
   end
 
   test "cron schedule supports aliases, ranges, and steps" do
@@ -1327,6 +2452,19 @@ defmodule Ferricstore.Flow.ScheduleTest do
 
     assert {:ok, after_first} = FerricStore.flow_schedule_get(schedule_id)
     assert after_first.next_run_at_ms == second_due_ms
+  end
+
+  test "cron chooses the earliest instant across multiple DST fallback wall minutes" do
+    after_ms = DateTime.to_unix(~U[2024-11-03 05:30:00Z], :millisecond)
+    expected_ms = DateTime.to_unix(~U[2024-11-03 05:31:00Z], :millisecond)
+
+    assert {:ok, ^expected_ms} =
+             Ferricstore.Flow.Schedule.Cron.next_run_at_ms(
+               "* 1 * * *",
+               after_ms,
+               "America/New_York",
+               180
+             )
   end
 
   test "due schedule is not missed after hibernation removes its hot due key" do
@@ -1479,9 +2617,135 @@ defmodule Ferricstore.Flow.ScheduleTest do
     assert second_target.payload == "cron"
   end
 
+  test "runtime bookkeeping cannot make an accepted schedule unreadable" do
+    configure_schedule_definition_limit(1_024)
+
+    now_ms = 10_000
+    schedule_id = unique_flow_id("schedule-definition-runtime-growth")
+    target_prefix = unique_flow_id("schedule-definition-runtime-growth-target")
+    target_type = unique_flow_id("schedule-definition-runtime-growth-type")
+
+    payload =
+      largest_fitting_schedule_payload(1_024, fn value ->
+        %{
+          id: schedule_id,
+          kind: :interval,
+          ownership_secret: <<0::256>>,
+          target: %{
+            id_prefix: target_prefix,
+            type: target_type,
+            state: "queued",
+            payload: value
+          },
+          created_at_ms: now_ms,
+          next_run_at_ms: now_ms,
+          fire_count: 0,
+          every_ms: 100,
+          catchup_policy: :fire_once,
+          overlap_policy: :allow
+        }
+      end)
+
+    assert {:ok, _schedule} =
+             FerricStore.flow_schedule_create(schedule_id,
+               kind: :interval,
+               every_ms: 100,
+               start_at_ms: now_ms,
+               now_ms: now_ms,
+               target: [
+                 id_prefix: target_prefix,
+                 type: target_type,
+                 payload: payload
+               ]
+             )
+
+    assert {:ok, %{claimed: 1, fired: 1, errors: []}} =
+             FerricStore.flow_schedule_fire_due(now_ms: now_ms, worker: "schedule-size-test")
+
+    assert {:ok, schedule} = FerricStore.flow_schedule_get(schedule_id)
+    assert schedule.id == schedule_id
+    assert schedule.kind == :interval
+    assert schedule.fire_count == 1
+    assert schedule.last_target_id == "#{target_prefix}:#{now_ms}:1"
+  end
+
+  test "schedule creation reserves hydration capacity for bounded runtime state" do
+    assert {:error,
+            "ERR flow schedule definition leaves insufficient room for runtime state; " <>
+              "reduce target id/id_prefix or use payload_ref/value_refs"} =
+             Ferricstore.Flow.Schedule.Limits.validate_definition(
+               %{id: "schedule", target: %{type: "target"}},
+               %{
+                 id: "schedule",
+                 target: %{type: "target"},
+                 runtime: String.duplicate("x", 1_024)
+               },
+               1_024,
+               1_024
+             )
+  end
+
   defp schedule_partition_key(id) do
     "__ferricstore_schedule__:" <> Integer.to_string(:erlang.phash2(id, 256))
   end
+
+  defp corrupt_schedule_cron(schedule_id, due_at_ms, now_ms) do
+    ctx = FerricStore.Instance.get(:default)
+    flow_id = Ferricstore.Flow.Schedule.flow_id(schedule_id)
+    partition_key = schedule_partition_key(schedule_id)
+
+    assert {:ok, record} =
+             Ferricstore.Flow.get(
+               ctx,
+               flow_id,
+               Ferricstore.Flow.Internal.put(
+                 partition_key: partition_key,
+                 payload: true,
+                 payload_max_bytes: Ferricstore.Flow.InternalLimits.payload_return_max_bytes()
+               )
+             )
+
+    assert :ok =
+             Ferricstore.Store.Router.flow_schedule_replace(ctx, %{
+               id: flow_id,
+               type: "__ferricstore_schedule",
+               state: "active",
+               partition_key: partition_key,
+               expected_version: record.version,
+               payload: Map.put(record.payload, :cron, "not a cron expression"),
+               run_at_ms: due_at_ms,
+               now_ms: now_ms
+             })
+  end
+
+  defp configure_schedule_definition_limit(definition_max_bytes) do
+    previous_definition =
+      Application.get_env(:ferricstore, :flow_schedule_definition_max_bytes)
+
+    on_exit(fn ->
+      restore_env(:flow_schedule_definition_max_bytes, previous_definition)
+    end)
+
+    Application.put_env(
+      :ferricstore,
+      :flow_schedule_definition_max_bytes,
+      definition_max_bytes
+    )
+  end
+
+  defp largest_fitting_schedule_payload(max_bytes, definition) do
+    Enum.find_value(max_bytes..0//-1, fn bytes ->
+      payload = String.duplicate("x", bytes)
+      value = definition.(payload)
+      encoded_bytes = byte_size(Ferricstore.Flow.Codec.encode_value(value))
+
+      if encoded_bytes <= max_bytes and :erlang.external_size(value) <= max_bytes,
+        do: payload
+    end)
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)
+  defp restore_env(key, value), do: Application.put_env(:ferricstore, key, value)
 
   defp resume_process(name) do
     :sys.resume(name)

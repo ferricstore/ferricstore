@@ -31,7 +31,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
     """
     <form class="flow-search" action="/dashboard/flow/schedules" method="get" aria-label="Schedule filters">
       <input class="flow-search-input mono" type="search" name="q" value="#{escape_attr(Map.get(filters, :q) || "")}" placeholder="schedule id contains..." title="Filter schedules by id substring">
-      #{schedule_select("state", Map.get(filters, :state, :all), ["all", "active", "paused", "failed", "completed", "cancelled"])}
+      #{schedule_select("state", Map.get(filters, :state, :all), ["all", "active", "paused", "running", "failed", "completed", "cancelled"])}
       #{schedule_select("kind", Map.get(filters, :kind), ["", "one_shot", "delay", "interval", "cron"])}
       <input class="flow-search-input mono" type="number" min="1" max="500" name="limit" value="#{Map.get(filters, :limit, 100)}" title="Maximum schedules to show">
       <button class="flow-search-button" type="submit">Filter</button>
@@ -42,7 +42,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
   def render_flow_schedules_table(schedules) when is_list(schedules) do
     rows =
       if schedules == [] do
-        ~s(<tr><td colspan="11" class="c-muted">No schedules matched the current filters.</td></tr>)
+        ~s(<tr><td colspan="12" class="c-muted">No schedules matched the current filters.</td></tr>)
       else
         Enum.map_join(schedules, "\n", &render_flow_schedule_row/1)
       end
@@ -60,6 +60,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
           <th>Fires</th>
           <th>Target</th>
           <th>Overlap</th>
+          <th>Catch-up</th>
           <th>End</th>
           <th>Last Target</th>
           <th>Actions</th>
@@ -97,7 +98,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
   end
 
   defp render_flow_schedule_row(%{error: reason}) do
-    ~s(<tr><td colspan="11" class="flow-alert-error">#{escape(reason)}</td></tr>)
+    ~s(<tr><td colspan="12" class="flow-alert-error">#{escape(reason)}</td></tr>)
   end
 
   defp render_flow_schedule_row(schedule) do
@@ -114,6 +115,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
       <td class="mono">#{format_number(Map.get(schedule, :fire_count, 0))}</td>
       <td class="mono">#{escape(Map.get(target, :type, "-"))}</td>
       <td>#{schedule_overlap_summary(schedule)}</td>
+      <td>#{schedule_catchup_summary(schedule)}</td>
       <td>#{schedule_end_summary(schedule)}</td>
       <td class="mono">#{escape(Map.get(schedule, :last_target_id, "-") || "-")}</td>
       <td>#{render_flow_schedule_actions(schedule)}</td>
@@ -172,6 +174,24 @@ defmodule FerricstoreServer.Health.Dashboard.Render.FlowSchedules do
       escape(policy)
     end
   end
+
+  defp schedule_catchup_summary(%{catchup_policy: policy} = schedule)
+       when not is_nil(policy) do
+    count = Map.get(schedule, :coalesced_count, 0)
+    last_count = Map.get(schedule, :last_coalesced_count, 0)
+    last_at_ms = Map.get(schedule, :last_catchup_at_ms)
+
+    details =
+      if count > 0 do
+        "#{format_number(count)} coalesced<br>last #{format_number(last_count)} at #{format_timestamp_ms_or_dash(last_at_ms)}"
+      end
+
+    if details,
+      do: "#{policy |> to_string() |> escape()}<br><span class=\"c-muted\">#{details}</span>",
+      else: policy |> to_string() |> escape()
+  end
+
+  defp schedule_catchup_summary(_schedule), do: "-"
 
   defp schedule_end_summary(schedule) do
     reason = Map.get(schedule, :end_reason)

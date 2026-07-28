@@ -567,6 +567,11 @@ defmodule Ferricstore.Flow do
   defdelegate reclaim(ctx, type, opts), to: Ferricstore.Flow.ClaimDueAPI
 
   @doc false
+  def notify_claim_waiters_after_write(result, attrs, state_key) do
+    maybe_notify_claim_waiters(result, attrs, state_key)
+  end
+
+  @doc false
   defdelegate claim_due_wait_registration(type, opts),
     to: Ferricstore.Flow.ClaimDueAPI,
     as: :wait_registration
@@ -580,26 +585,30 @@ defmodule Ferricstore.Flow do
 
   defp maybe_notify_claim_waiters({:ok, results} = result, attrs_list, state_key)
        when is_list(results) and is_list(attrs_list) do
-    notify_successful_claim_waiter_hints(results, attrs_list, state_key)
+    if ClaimWaiters.any_waiters?(),
+      do: notify_successful_claim_waiter_hints(results, attrs_list, state_key)
+
     result
   end
 
   defp maybe_notify_claim_waiters(results, attrs_list, state_key)
        when is_list(results) and is_list(attrs_list) do
-    notify_successful_claim_waiter_hints(results, attrs_list, state_key)
+    if ClaimWaiters.any_waiters?(),
+      do: notify_successful_claim_waiter_hints(results, attrs_list, state_key)
+
     results
   end
 
   defp maybe_notify_claim_waiters(result, attrs_list, state_key) when is_list(attrs_list) do
-    if flow_write_succeeded?(result) do
+    if flow_write_succeeded?(result) and ClaimWaiters.any_waiters?() do
       attrs_list
       |> Enum.reduce([], fn attrs, hints ->
-        case claim_waiter_ready_hint(attrs, state_key) do
+        case claim_waiter_hint(attrs, state_key) do
           nil -> hints
           hint -> [hint | hints]
         end
       end)
-      |> ClaimWaiters.notify_ready_many(@claim_waiter_min_wake_budget_per_ready_bucket)
+      |> notify_claim_waiter_hints()
     end
 
     result
@@ -608,7 +617,7 @@ defmodule Ferricstore.Flow do
   defp notify_successful_claim_waiter_hints(results, attrs_list, state_key) do
     case successful_claim_waiter_hints(results, attrs_list, state_key, []) do
       {:ok, hints} ->
-        ClaimWaiters.notify_ready_many(hints, @claim_waiter_min_wake_budget_per_ready_bucket)
+        notify_claim_waiter_hints(hints)
 
       :mismatch ->
         0
@@ -620,7 +629,7 @@ defmodule Ferricstore.Flow do
   defp successful_claim_waiter_hints([result | results], [attrs | attrs_list], state_key, hints) do
     hints =
       if flow_write_succeeded?(result) do
-        case claim_waiter_ready_hint(attrs, state_key) do
+        case claim_waiter_hint(attrs, state_key) do
           nil -> hints
           hint -> [hint | hints]
         end
@@ -705,16 +714,24 @@ defmodule Ferricstore.Flow do
 
   defp flow_write_succeeded?(_result), do: false
 
-  defp claim_waiter_ready_hint(attrs, state_key) do
-    if claim_ready_hint_now?(attrs) do
-      type = Map.get(attrs, :type)
-      state = claim_ready_state(attrs, state_key)
-      priority = Map.get(attrs, :priority, @default_priority)
-      partition_key = Map.get(attrs, :partition_key)
-      limit = max(Map.get(attrs, :limit, 1), 1)
+  defp claim_waiter_hint(attrs, state_key) do
+    type = Map.get(attrs, :type)
+    state = claim_ready_state(attrs, state_key)
+    priority = Map.get(attrs, :priority, @default_priority)
+    partition_key = Map.get(attrs, :partition_key)
+    limit = max(Map.get(attrs, :limit, 1), 1)
 
-      if is_binary(type) do
-        {type, state, priority, partition_key, limit}
+    if is_binary(type) do
+      case Map.get(attrs, :run_at_ms) do
+        run_at_ms when is_integer(run_at_ms) ->
+          if run_at_ms <= (Map.get(attrs, :now_ms) || now_ms()) do
+            {:ready, {type, state, priority, partition_key, limit}}
+          else
+            {:scheduled, {type, state, priority, partition_key, run_at_ms, limit}}
+          end
+
+        _run_at_ms ->
+          {:ready, {type, state, priority, partition_key, limit}}
       end
     end
   end
@@ -722,13 +739,34 @@ defmodule Ferricstore.Flow do
   defp claim_ready_state(attrs, state_key) when is_atom(state_key), do: Map.get(attrs, state_key)
   defp claim_ready_state(_attrs, state), do: state
 
-  defp claim_ready_hint_now?(attrs) do
-    now = Map.get(attrs, :now_ms) || now_ms()
+  defp notify_claim_waiter_hints(hints) do
+    {ready, scheduled} =
+      Enum.reduce(hints, {[], %{}}, fn
+        {:ready, hint}, {ready, scheduled} ->
+          {[hint | ready], scheduled}
 
-    case Map.get(attrs, :run_at_ms) do
-      run_at_ms when is_integer(run_at_ms) -> run_at_ms <= now
-      _ -> true
-    end
+        {:scheduled, hint}, {ready, scheduled} ->
+          {ready, Map.update(scheduled, hint, 1, &(&1 + 1))}
+      end)
+
+    notified =
+      ClaimWaiters.notify_ready_many(ready, @claim_waiter_min_wake_budget_per_ready_bucket)
+
+    Enum.each(scheduled, fn
+      {{type, state, priority, partition_key, run_at_ms, limit}, occurrences} ->
+        if claim_waiters_waiting_for?(type, state, priority, partition_key) do
+          ClaimWaiters.schedule_ready(
+            type,
+            state,
+            priority,
+            partition_key,
+            run_at_ms,
+            limit * occurrences
+          )
+        end
+    end)
+
+    notified
   end
 
   def extend_lease(ctx, id, lease_token, opts \\ [])

@@ -13,10 +13,14 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowSchedules do
                 %{
                   id: "campaign-daily",
                   state: "active",
-                  kind: :cron,
+                  kind: :interval,
                   next_run_at_ms: 1_700_000_000_000,
                   last_fire_at_ms: 1_699_999_000_000,
                   fire_count: 4,
+                  catchup_policy: :fire_once,
+                  coalesced_count: 5,
+                  last_catchup_at_ms: 1_699_999_500_000,
+                  last_coalesced_count: 3,
                   overlap_policy: :skip,
                   max_fires: 10,
                   target: %{type: "email"}
@@ -50,6 +54,11 @@ defmodule FerricstoreServer.Health.DashboardTest.Sections.FlowSchedules do
           assert String.contains?(html, "Delete")
           assert String.contains?(html, "Failed Schedules")
           assert String.contains?(html, "previous target still active")
+          assert String.contains?(html, "Catch-up")
+          assert String.contains?(html, "fire_once")
+          assert String.contains?(html, "5 coalesced")
+          assert String.contains?(html, "last 3")
+          assert String.contains?(html, ~s(<option value="running">running</option>))
         end
 
         test "schedules collector returns durable schedules and filters by id" do

@@ -78,6 +78,13 @@ if config_env() == :prod do
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
     health_probe_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PROBE_PORT", "6381")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),
+    flow_scheduler_enabled: boolean_env.("FERRICSTORE_FLOW_SCHEDULER_ENABLED", true),
+    flow_scheduler_limit:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_SCHEDULER_LIMIT", "100")),
+    flow_scheduler_initial_delay_ms:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_SCHEDULER_INITIAL_DELAY_MS", "2000")),
+    flow_scheduler_error_sleep_ms:
+      String.to_integer(System.get_env("FERRICSTORE_FLOW_SCHEDULER_ERROR_SLEEP_MS", "1000")),
     shard_count:
       (
         count = System.get_env("FERRICSTORE_SHARD_COUNT", "0")

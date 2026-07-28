@@ -968,6 +968,12 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
     end
   end
 
+  @doc false
+  @spec validate_claim_limit(keyword()) :: {:ok, pos_integer()} | {:error, binary()}
+  def validate_claim_limit(opts) when is_list(opts), do: optional_claim_limit(opts)
+
+  def validate_claim_limit(_opts), do: {:error, "ERR flow opts must be a keyword list"}
+
   defp optional_claim_block_ms(opts) do
     with {:ok, block_ms} <- optional_non_neg_integer(opts, :block_ms, 0) do
       if block_ms <= @max_blocking_timeout_ms do

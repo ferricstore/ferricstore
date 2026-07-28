@@ -34,6 +34,10 @@ defmodule Ferricstore.ProductionDefaultsTest do
     assert runtime_exs =~ "flow_async_history: true"
     assert runtime_exs =~ "FERRICSTORE_FLOW_RETENTION_SWEEPER_CATCHUP_BURST_LIMIT"
     assert runtime_exs =~ "FERRICSTORE_FLOW_RETENTION_SWEEPER_CATCHUP_PAUSE_MS"
+    assert runtime_exs =~ ~s(FERRICSTORE_FLOW_SCHEDULER_ENABLED", true)
+    assert runtime_exs =~ ~s(FERRICSTORE_FLOW_SCHEDULER_LIMIT", "100")
+    assert runtime_exs =~ ~s(FERRICSTORE_FLOW_SCHEDULER_INITIAL_DELAY_MS", "2000")
+    assert runtime_exs =~ ~s(FERRICSTORE_FLOW_SCHEDULER_ERROR_SLEEP_MS", "1000")
     assert runtime_exs =~ "FERRICSTORE_WARAFT_COMMIT_BATCH_ADAPTIVE"
     assert runtime_exs =~ "FERRICSTORE_WARAFT_COMMIT_BATCH_ADAPTIVE\", \"true\""
     assert runtime_exs =~ "\"6000\""

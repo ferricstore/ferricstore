@@ -51,7 +51,10 @@ data-structure commands. They are exposed through native TCP mode and the embedd
 `FLOW.CANCEL_MANY`, `FLOW.TRANSITION`, `FLOW.TRANSITION_MANY`,
 `FLOW.REWIND`, `FLOW.STATS`, `FLOW.INFO`, `FLOW.HISTORY`,
 `FLOW.POLICY.SET`, `FLOW.POLICY.GET`, `FLOW.ATTRIBUTES`,
-`FLOW.ATTRIBUTE_VALUES`, `FLOW.QUERY`, and `FLOW.RETENTION_CLEANUP`.
+`FLOW.ATTRIBUTE_VALUES`, `FLOW.QUERY`, `FLOW.RETENTION_CLEANUP`,
+`FLOW.SCHEDULE.CREATE`, `FLOW.SCHEDULE.GET`, `FLOW.SCHEDULE.LIST`,
+`FLOW.SCHEDULE.FIRE`, `FLOW.SCHEDULE.FIRE_DUE`, `FLOW.SCHEDULE.PAUSE`,
+`FLOW.SCHEDULE.RESUME`, and `FLOW.SCHEDULE.DELETE`.
 
 Flow attributes are small indexed metadata fields for query and dashboard
 filters. They are separate from payload and named value refs:
@@ -99,6 +102,47 @@ authorization, authoritative recheck, ordering, and cursor derivation, so it
 reduces encoding and transfer work without weakening correctness. The
 allowlist always excludes payload/result/error refs, named values, child
 bookkeeping, and worker lease/fencing credentials.
+
+Durable schedules create Flow targets from one-shot, delay, interval, or cron
+rules. Recurring targets cannot use a fixed target `id`; set `id_prefix` to
+choose the generated prefix, or omit it to use the schedule ID. One-shot and
+delay targets may use a fixed `id`:
+
+```text
+FLOW.SCHEDULE.CREATE billing-sweep KIND interval EVERY_MS 60000 CATCHUP_POLICY fire_once OVERLAP_POLICY queue_after_previous TARGET <typed-map>
+FLOW.SCHEDULE.GET billing-sweep
+FLOW.SCHEDULE.LIST KIND interval STATE active COUNT 100
+FLOW.SCHEDULE.PAUSE billing-sweep
+FLOW.SCHEDULE.RESUME billing-sweep
+FLOW.SCHEDULE.DELETE billing-sweep
+```
+
+`fire_once` is the default and only interval catch-up policy. When an interval
+is at least one complete period overdue, one target is created, additional
+elapsed occurrences are counted in `coalesced_count`, and the next run is one
+interval after recovery. This is an O(1) calculation and never replays a burst
+of missed work. `fire_count` counts targets actually created; coalesced
+occurrences do not consume `max_fires`.
+
+This bounded recovery rule applies only to intervals. An overdue cron schedule
+advances one matching occurrence per successful automatic fire. Use an
+interval when recovery must remain O(1) after extended downtime. A schedule is
+transiently `running` while its due occurrence is claimed; the complete state
+set is `active`, `paused`, `running`, `completed`, `failed`, and `cancelled`.
+Unknown or duplicate schedule options and create target fields are rejected.
+List state filters must use that state set or `all`, and `from_ms` cannot exceed
+`to_ms`. A planning failure persists `end_reason: planning_failed` and
+`last_planning_error` without creating a target.
+
+The built-in scheduler owns automatic due execution. `FLOW.SCHEDULE.FIRE_DUE`
+is exposed for tests, administration, or deployments that intentionally use a
+custom scheduler; its result includes `claimed`, `fired`, `skipped`,
+`coalesced`, and bounded per-schedule `errors`. A failure to request a later
+claim wave is returned separately as `claim_error`, preserving the invariant
+that every claimed schedule has exactly one fired, skipped, or error outcome.
+Do not run an unnecessary second polling loop alongside the built-in
+scheduler. See [Flow Schedules](../docs/flow-schedules.md) for timing, overlap,
+pause/resume, and recovery semantics.
 
 Bound the total non-terminal lifetime of a Flow with a type policy or a
 per-create override:

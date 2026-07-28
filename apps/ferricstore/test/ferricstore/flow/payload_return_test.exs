@@ -21,5 +21,21 @@ defmodule Ferricstore.Flow.PayloadReturnTest do
 
     assert {:error, "ERR flow payload_max_bytes exceeds maximum 8"} =
              PayloadReturn.options([payload_max_bytes: 9], true)
+
+    internal_max = Ferricstore.Flow.InternalLimits.payload_return_max_bytes()
+
+    assert {:ok, %{max_bytes: ^internal_max}} =
+             PayloadReturn.options(
+               Ferricstore.Flow.Internal.put(payload_max_bytes: internal_max),
+               true
+             )
+
+    expected_internal_error = "ERR flow payload_max_bytes exceeds maximum #{internal_max}"
+
+    assert {:error, ^expected_internal_error} =
+             PayloadReturn.options(
+               Ferricstore.Flow.Internal.put(payload_max_bytes: internal_max + 1),
+               true
+             )
   end
 end

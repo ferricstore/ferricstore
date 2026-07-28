@@ -129,6 +129,27 @@ defmodule FerricStore.Instance.Supervisor do
         ]
       end
 
+    scheduler_children =
+      if name == :default do
+        []
+      else
+        scheduler_opts =
+          opts
+          |> Keyword.get(:flow_scheduler, [])
+          |> case do
+            value when is_list(value) -> value
+            _other -> []
+          end
+          |> Keyword.merge(name: :"#{name}.Flow.Scheduler", ctx: ctx)
+
+        [
+          Supervisor.child_spec(
+            {Ferricstore.Flow.Scheduler, scheduler_opts},
+            id: :"#{name}.FlowScheduler"
+          )
+        ]
+      end
+
     policy_migration_worker_children =
       if name == :default do
         []
@@ -204,6 +225,7 @@ defmodule FerricStore.Instance.Supervisor do
           )
         ] ++
         retention_sweeper_children ++
+        scheduler_children ++
         limit_reconciler_children ++
         limit_storage_cleaner_children ++
         policy_migration_worker_children ++

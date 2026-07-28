@@ -361,6 +361,7 @@ defmodule FerricstoreServer.Native.Commands do
     "backoff" => :backoff,
     "base_ms" => :base_ms,
     "block_ms" => :block_ms,
+    "catchup_policy" => :catchup_policy,
     "children" => :children,
     "consistent_projection" => :consistent_projection,
     "correlation_id" => :correlation_id,
@@ -511,6 +512,7 @@ defmodule FerricstoreServer.Native.Commands do
     "cron" => :cron,
     "delay" => :delay,
     "exponential" => :exponential,
+    "fire_once" => :fire_once,
     "interval" => :interval,
     "linear" => :linear,
     "meta" => :meta,
@@ -2402,12 +2404,53 @@ defmodule FerricstoreServer.Native.Commands do
        when command in ["HELLO", "OPTIONS", "STARTUP", "AUTH", "COMMAND_EXEC"],
        do: :ok
 
+  defp authorize_keys(command, @op_flow_schedule_create, payload, state) do
+    case validate_generated_schedule_target_scope(state.acl_cache, payload) do
+      :ok -> authorize_command_keys(command, @op_flow_schedule_create, payload, state)
+      {:error, reason} -> authorization_denied(command, reason, state)
+    end
+  end
+
   defp authorize_keys(command, opcode, payload, state) do
+    authorize_command_keys(command, opcode, payload, state)
+  end
+
+  defp authorize_command_keys(command, opcode, payload, state) do
     case check_key_acl_cached(state.acl_cache, opcode, payload) do
       :ok -> :ok
       {:error, reason} -> authorization_denied(command, reason, state)
     end
   end
+
+  defp validate_generated_schedule_target_scope(:full_access, _payload), do: :ok
+  defp validate_generated_schedule_target_scope(%{keys: :all}, _payload), do: :ok
+
+  defp validate_generated_schedule_target_scope(_acl_cache, payload) do
+    target = payload_flow_option(payload, "target")
+
+    if generated_schedule_target?(target) and is_nil(schedule_target_partition_key(target)) do
+      {:error,
+       "NOPERM generated schedule targets require an authorized partition_key for scoped users"}
+    else
+      :ok
+    end
+  end
+
+  defp generated_schedule_target?(%{} = target),
+    do: is_nil(Map.get(target, "id") || Map.get(target, :id))
+
+  defp generated_schedule_target?(target) when is_list(target),
+    do: is_nil(Keyword.get(target, :id))
+
+  defp generated_schedule_target?(_target), do: false
+
+  defp schedule_target_partition_key(%{} = target),
+    do: Map.get(target, "partition_key") || Map.get(target, :partition_key)
+
+  defp schedule_target_partition_key(target) when is_list(target),
+    do: Keyword.get(target, :partition_key)
+
+  defp schedule_target_partition_key(_target), do: nil
 
   defp authorization_denied(command, reason, state) do
     FerricstoreServer.Acl.Protection.log_command_denied(
@@ -3703,6 +3746,7 @@ defmodule FerricstoreServer.Native.Commands do
           "timezone",
           "now_ms",
           "overwrite",
+          "catchup_policy",
           "overlap_policy",
           "overlap_retry_ms",
           "max_fires",
@@ -7875,8 +7919,9 @@ defmodule FerricstoreServer.Native.Commands do
   defp coerce_option_value(:kind, value) when is_binary(value),
     do: Map.get(@atom_values, String.downcase(value), value)
 
-  defp coerce_option_value(:overlap_policy, value) when is_binary(value),
-    do: Map.get(@atom_values, String.downcase(value), value)
+  defp coerce_option_value(key, value)
+       when key in [:catchup_policy, :overlap_policy] and is_binary(value),
+       do: Map.get(@atom_values, String.downcase(value), value)
 
   defp coerce_option_value(_key, value), do: value
 

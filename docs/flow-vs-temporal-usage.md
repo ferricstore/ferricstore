@@ -155,6 +155,31 @@ def charge(job):
 
 Retry state is durable. Workers claim the Flow again when its next due time arrives.
 
+## Durable Interval Schedules
+
+Workflow-code runtimes commonly separate missed-schedule catch-up from overlap
+handling. FerricFlow makes the same distinction. An interval schedule uses the
+bounded `:fire_once` catch-up policy, while `:overlap_policy` controls what to do
+when the previous target is still active.
+
+```elixir
+{:ok, schedule} =
+  FerricStore.flow_schedule_create("hourly-rollup",
+    kind: :interval,
+    every_ms: :timer.hours(1),
+    catchup_policy: :fire_once,
+    overlap_policy: :queue_after_previous,
+    target: [id_prefix: "hourly-rollup", type: "rollup"]
+  )
+```
+
+After scheduler downtime, FerricFlow creates one recovery target rather than
+one target per missed interval. It records the coalesced count and schedules
+the next target one complete interval after recovery. The calculation is
+constant-time, survives restart and leader failover, and does not change cron
+or retry semantics. See [Flow schedules](flow-schedules.md) for the full
+contract.
+
 ## Fanout
 
 Workflow-code shape:
