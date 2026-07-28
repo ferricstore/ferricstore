@@ -54,6 +54,9 @@ defmodule Ferricstore.Application do
     mark_starting()
 
     try do
+      # Safe external-term decoding cannot create atoms. Prime the fixed atom
+      # vocabulary from installed BEAM files before Raft replays peer commands.
+      :ok = Ferricstore.Raft.CommandAtoms.preload!()
       :ok = stop_standalone_waraft_runtime()
 
       data_dir = Application.get_env(:ferricstore, :data_dir, "data")

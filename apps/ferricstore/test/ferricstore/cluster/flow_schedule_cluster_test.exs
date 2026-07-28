@@ -43,6 +43,7 @@ defmodule Ferricstore.Cluster.FlowScheduleClusterTest do
 
     {_killed, remaining} = ClusterHelper.kill_leader(nodes, 0)
     assert :ok = ClusterHelper.wait_for_leaders(remaining, @shards, timeout: 30_000)
+    assert :ok = wait_for_schedule_dispatch(remaining, now_ms - 1)
 
     results =
       remaining
@@ -87,7 +88,7 @@ defmodule Ferricstore.Cluster.FlowScheduleClusterTest do
     on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
 
     [writer | _] = nodes
-    due_at_ms = System.system_time(:millisecond) + 800
+    due_at_ms = System.system_time(:millisecond) + 60_000
     every_ms = 5
     recovery_ms = due_at_ms + 10 * every_ms
     schedule_id = unique_id("cluster-schedule-catchup")
@@ -111,6 +112,7 @@ defmodule Ferricstore.Cluster.FlowScheduleClusterTest do
 
     {_killed, remaining} = ClusterHelper.kill_leader(nodes, 0)
     assert :ok = ClusterHelper.wait_for_leaders(remaining, @shards, timeout: 30_000)
+    assert :ok = wait_for_schedule_dispatch(remaining, due_at_ms - 1)
 
     results =
       remaining
@@ -168,6 +170,24 @@ defmodule Ferricstore.Cluster.FlowScheduleClusterTest do
 
   defp remote_flow_get(node_name, id, opts),
     do: :erpc.call(node_name, FerricStore, :flow_get, [id, opts], 30_000)
+
+  defp wait_for_schedule_dispatch(nodes, now_ms) do
+    Enum.each(nodes, fn node ->
+      eventually(
+        fn ->
+          assert {:ok, %{fired: 0, claimed: 0, errors: []}} =
+                   remote_schedule_fire_due(node.name,
+                     now_ms: now_ms,
+                     worker: "cluster-schedule-ready-#{node.index}"
+                   )
+        end,
+        300,
+        100
+      )
+    end)
+
+    :ok
+  end
 
   defp eventually(fun, attempts \\ 80, interval_ms \\ 100) do
     fun.()
